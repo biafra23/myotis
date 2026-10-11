@@ -50,8 +50,9 @@ final class SendCheck {
     static final long ACCOUNT_READ_BUDGET_MS = 2_000;
 
     /** The most such reads in flight at once; past that a send goes unchecked rather
-     *  than pile reads onto slow peers. A read holds its permit until it ends — not cut,
-     *  and bounded by the oracle's own request timeouts. */
+     *  than pile reads onto slow peers. A read holds its permit until it ends: it is not
+     *  cut, as the Rust engine cuts its at 20 s, so the bound is the oracle's own — at most
+     *  {@code SNAP_ORACLE_MAX_ATTEMPTS} (8) requests of 10 s each, up to 80 s. */
     static final int DETACHED_READS_MAX = 4;
 
     /** How old a head may be to judge a send by, in seconds: two block times plus
@@ -123,6 +124,16 @@ final class SendCheck {
         Long adoptedAgoMs(long nowMs) {
             return adoptedAtMs == null ? null : nowMs - adoptedAtMs;
         }
+    }
+
+    /**
+     * Whether a head is the attested optimistic head itself: the same number AND the same
+     * hash, both read from one optimistic update ({@code optimisticNumber},
+     * {@code optimisticHash}). Unknown on either side is no.
+     */
+    static boolean atOptimistic(long blockNumber, byte[] blockHash, long optimisticNumber, byte[] optimisticHash) {
+        return blockHash != null && optimisticHash != null && blockNumber == optimisticNumber
+                && java.util.Arrays.equals(blockHash, optimisticHash);
     }
 
     /**
@@ -270,13 +281,14 @@ final class SendCheck {
      * it first advanced; the first head after a start was never seen advancing.
      */
     static final class HeadAdvance {
-        /** The highest head seen, and when it advanced to (-1: never seen advancing). */
-        private record Seen(long blockNumber, long advancedAtMs) {}
+        /** The highest head seen, and when it advanced to — null: never seen advancing (out
+         *  of band: the monotonic clock's epoch is arbitrary, so any long may be a time). */
+        private record Seen(long blockNumber, Long advancedAtMs) {}
 
         private final AtomicReference<Seen> seen = new AtomicReference<>();
 
         void note(long blockNumber, long nowMs) {
-            seen.updateAndGet(prev -> prev == null ? new Seen(blockNumber, -1)
+            seen.updateAndGet(prev -> prev == null ? new Seen(blockNumber, null)
                     : blockNumber > prev.blockNumber() ? new Seen(blockNumber, nowMs)
                     : prev);
         }
@@ -285,7 +297,7 @@ final class SendCheck {
          *  this node saw advance last (or it never did). */
         Long adoptedAtMs(long blockNumber) {
             Seen s = seen.get();
-            return s != null && s.blockNumber() == blockNumber && s.advancedAtMs() >= 0 ? s.advancedAtMs() : null;
+            return s != null && s.blockNumber() == blockNumber ? s.advancedAtMs() : null;
         }
     }
 }

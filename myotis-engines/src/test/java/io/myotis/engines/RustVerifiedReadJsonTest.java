@@ -828,8 +828,9 @@ class RustVerifiedReadJsonTest {
     // The Rust golden twin: eljson's a_send_is_a_hash_or_geths_refusal.
 
     @Test
-    void theSendGateRefusesBeforeTheWakeWaitOrLetsTheSendAnswer() {
-        // ABI 45: check_raw_transaction_json's three shapes.
+    void theSendGateJsonIsARefusalOrLetsTheSendAnswer() {
+        // ABI 45: check_raw_transaction_json's three shapes, as sendGateRefusalOrNull
+        // reads them (its place before the wake wait is RustChainHandle's ordering).
         assertEquals("invalid raw transaction: transaction type not supported (0x0)",
                 RustChainHandle.sendGateRefusalOrNull(
                         "{\"error\":\"invalid raw transaction: transaction type not supported (0x0)\",\"code\":-32602}"));

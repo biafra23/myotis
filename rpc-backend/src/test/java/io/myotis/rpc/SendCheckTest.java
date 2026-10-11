@@ -191,6 +191,11 @@ class SendCheckTest {
         advance.note(99, 11_000);
         assertNull(advance.adoptedAtMs(99));
         assertEquals(5_000L, advance.adoptedAtMs(101));
+        // The monotonic clock's epoch is arbitrary: a negative reading is a time too.
+        SendCheck.HeadAdvance negative = new SendCheck.HeadAdvance();
+        negative.note(7, -9_000);
+        negative.note(8, -5_000);
+        assertEquals(-5_000L, negative.adoptedAtMs(8));
     }
 
     // ---- SendCheck.Checker: the orchestration, over a fake read and fake clocks ----
@@ -217,10 +222,10 @@ class SendCheckTest {
     }
 
     @Test
-    void aHeadThatAdvancesDuringTheReadStillJudgesItsSend() {
-        // The head is taken before the read with its adoption time; the warmer moving
-        // on during the read does not un-adopt it (PR review: re-reading the adoption
-        // after the read would skip every send whose read straddles a rebuild).
+    void aSlowReadIsJudgedByTheAdoptionTakenBeforeIt() {
+        // The Head, adoption time included, is taken once before the read
+        // (VerifiedRpcBackend.sendCheckHead); the verdict measures its age at the clock
+        // after the read, so time spent reading counts, but nothing re-reads the adoption.
         SendCheck.Checker c = checker(4, 1_000);
         SendCheck.Head h = head(5_000);
         assertEquals(SendCheck.PreBroadcast.doomed("nonce too low: next nonce 6, tx nonce 5"),
@@ -259,6 +264,19 @@ class SendCheckTest {
                 () -> { throw new IllegalStateException("clock"); }, monoMs::get);
         assertEquals(SendCheck.PreBroadcast.Kind.UNCHECKED, broken.check(tx(2), 1, SLOT, head(5_000),
                 () -> CompletableFuture.completedFuture(SendCheck.AccountRead.of(RICH, 6))).kind());
+    }
+
+    @Test
+    void theOptimisticHeadIsMatchedByNumberAndHashTogether() {
+        byte[] h = Bytes.repeat((byte) 0xaa, 32).toArray();
+        byte[] other = Bytes.repeat((byte) 0xbb, 32).toArray();
+        assertTrue(SendCheck.atOptimistic(100, h, 100, h.clone()));
+        // The same number on another fork, or the same hash read at another number.
+        assertFalse(SendCheck.atOptimistic(100, h, 100, other));
+        assertFalse(SendCheck.atOptimistic(99, h, 100, h));
+        // Unknown on either side is no.
+        assertFalse(SendCheck.atOptimistic(100, null, 100, h));
+        assertFalse(SendCheck.atOptimistic(100, h, 100, null));
     }
 
     @Test

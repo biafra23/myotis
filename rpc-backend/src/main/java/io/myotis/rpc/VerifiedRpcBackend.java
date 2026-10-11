@@ -2931,9 +2931,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     private SendCheck.Head sendCheckHead(RpcCallContext ctx) {
         if (ctx == null) return null;
         BeaconSyncState.OptimisticExecution opt = beaconSyncState.getOptimisticExecution();
-        boolean atOptimistic = opt != null && opt.blockHash() != null && ctx.blockHash() != null
-                && opt.blockNumber() == ctx.blockNumber()
-                && java.util.Arrays.equals(opt.blockHash(), ctx.blockHash());
+        boolean atOptimistic = opt != null
+                && SendCheck.atOptimistic(ctx.blockNumber(), ctx.blockHash(), opt.blockNumber(), opt.blockHash());
         return new SendCheck.Head(ctx.blockNumber(), ctx.beaconVerified(), atOptimistic,
                 ctx.blockCtx().timestamp(), headAdvance.adoptedAtMs(ctx.blockNumber()));
     }
