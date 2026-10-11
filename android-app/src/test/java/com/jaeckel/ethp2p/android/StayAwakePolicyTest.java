@@ -22,8 +22,9 @@ public class StayAwakePolicyTest {
     @Test
     public void chargingOfflineSleeps() {
         assertFalse(StayAwakePolicy.applies(true, true, false, false));
-        // An unmetered network without Internet (captive portal, local-only Wi-Fi) has
-        // nothing to sync over either.
+        // Pure-function pin only: on a device the active (default) network practically always
+        // carries INTERNET — a captive portal keeps it and lacks VALIDATED instead — so the live
+        // rule's "internet" input is false only with no active network at all.
         assertFalse(StayAwakePolicy.applies(true, true, false, true));
     }
 

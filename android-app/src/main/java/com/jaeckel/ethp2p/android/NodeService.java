@@ -1094,6 +1094,10 @@ public final class NodeService extends Service {
      *  on a poor network still completes first. */
     private static final long SYNC_RUN_CEILING_MS = 30 * 60_000L;
     private volatile java.util.concurrent.ScheduledExecutorService idleTicker;
+    /** {@link #stayAwakeApplies} as the previous routine idle tick saw it, so the tick can act
+     *  on the edge where the rule starts to hold again (see {@link #idleTick(long, boolean)}).
+     *  Written only by the single-threaded idle ticker. */
+    private boolean stayAwakeLastTick;
     /** The notification's current "title\ntext" content, so we re-notify only when it changes.
      *  Guarded by {@link #notifLock} for an atomic diff-and-notify across the idle ticker,
      *  boot threads, and the connectivity callback. */
@@ -1184,7 +1188,12 @@ public final class NodeService extends Service {
      *   <li><b>Charging</b> — when {@link #stayAwakeApplies} (the setting is on, the device is
      *       plugged in, <em>and</em> the active network is unmetered), skip auto-pause: neither
      *       battery nor data is a concern, stay synced. Plugged in but offline or on a metered
-     *       network still pauses (nothing to sync, or traffic the user pays for).</li>
+     *       network still pauses (nothing to sync, or traffic the user pays for). On the tick
+     *       where the rule starts to hold again — back on Wi-Fi after a cellular fallback,
+     *       plugged in again, setting switched on — a stack paused meanwhile is resumed at once
+     *       by a charging catch-up pass ({@link #startChargingCatchUp}), instead of sleeping
+     *       until the hourly {@link ChargingCatchUpWorker}'s next window, which can be most of
+     *       an hour away when that job has just run.</li>
      * </ul>
      */
     private void idleTick(long idleMs, boolean routine) {
@@ -1200,6 +1209,13 @@ public final class NodeService extends Service {
             // nothing to sync over, and on a metered one power says nothing about what the traffic
             // costs — either way the stack sleeps on the ordinary idle timer.
             boolean skipWhileCharging = routine && stayAwakeApplies(this);
+            if (routine) {
+                // The rule starts to hold again (back on Wi-Fi after a cellular fallback, plugged
+                // in again): wake what it let sleep meanwhile rather than wait up to an hour.
+                boolean startsToHold = skipWhileCharging && !stayAwakeLastTick;
+                stayAwakeLastTick = skipWhileCharging;
+                if (startsToHold && anyStackPaused()) startChargingCatchUp();
+            }
             for (Map.Entry<String, ChainHandle> e : handles.entrySet()) {
                 String n = e.getKey();
                 ChainHandle h = e.getValue();
@@ -1339,6 +1355,36 @@ public final class NodeService extends Service {
         }
     }
 
+    /** True when at least one live stack is paused. */
+    private boolean anyStackPaused() {
+        for (ChainHandle h : handles.values()) {
+            try {
+                if (h.lifecycle() == io.myotis.api.LifecycleState.PAUSED) return true;
+            } catch (Throwable ignored) {
+                // a handle that cannot answer is not one to resume
+            }
+        }
+        return false;
+    }
+
+    /** Run a charging catch-up pass now, off the idle ticker's thread: with the stay-awake rule
+     *  holding, it resumes every paused stack and leaves it running for the ticker to keep at
+     *  the head. Skipped if the rule stopped holding before the thread ran, so a network that
+     *  flapped back to metered does not get a catch-up it would pay for. */
+    private void startChargingCatchUp() {
+        android.content.Context app = getApplicationContext();
+        new Thread(() -> {
+            if (!stayAwakeApplies(app)) return;
+            LogBuffer.i(TAG, "stay awake while charging applies again; resuming paused stacks");
+            try {
+                chargingCatchUp(app, CatchUpWorker.BUDGET_MS);
+            } catch (Throwable t) {
+                LogBuffer.w(TAG, "charging catch-up failed: " + t);
+            }
+            updateNotification();
+        }, "ethp2p-charging-resume").start();
+    }
+
     /** True when the service runs at least one stack and every live stack is paused. */
     private boolean allStacksPaused() {
         boolean any = false;
@@ -1383,7 +1429,9 @@ public final class NodeService extends Service {
      * ({@code LogIndexStatus.headCaughtUp}), not just until the beacon is SYNCED.
      * Without it a phone that paused in the evening and charged all night woke up
      * thousands of blocks behind, because "stay awake while charging" only keeps a
-     * RUNNING stack from pausing — it never wakes a paused one.
+     * RUNNING stack from pausing — the idle controller wakes a paused one only on the
+     * tick where that rule starts to hold ({@link #startChargingCatchUp}), and only
+     * while the service's idle ticker runs.
      */
     public static void chargingCatchUp(android.content.Context c, long budgetMs) {
         catchUpPass(c, "charging catch-up", budgetMs,

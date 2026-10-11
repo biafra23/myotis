@@ -211,8 +211,11 @@ stack, catches up the missed committee periods (~25 KB each + a finality poll), 
 the snapshot, and pauses again. A second job (`ChargingCatchUpWorker`, hourly, only while
 charging on an unmetered network) resumes any paused stack and waits for the log index's
 head gap too, not just a SYNCED beacon: "stay awake while charging" keeps a running stack
-from pausing but never wakes a paused one, so without it a phone that paused before going
-on the charger overnight woke thousands of blocks behind. With that setting on and the
+from pausing, so without it a phone that paused before going on the charger overnight woke
+thousands of blocks behind. While the service runs, the idle controller also starts that
+pass itself on the tick where the rule starts to hold again (back on Wi-Fi after a brief
+cellular fallback, plugged in again), so a stack it paused meanwhile does not sleep until
+the job's next hourly window — up to an hour away when the job has just run. With that setting on and the
 phone plugged in on an unmetered network, either job leaves the stack it resumed running —
 the idle controller keeps it at the head until it is unplugged or the network turns
 metered; otherwise (setting off, or a metered network) the job catches up within its
