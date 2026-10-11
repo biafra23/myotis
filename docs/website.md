@@ -62,21 +62,32 @@ publish only updates the feed. The Freedom browser opens `myotis.eth` directly;
 `https://myotis.eth.limo` serves the same page to every other browser (eth.limo
 resolves Swarm content hashes as well as IPFS ones).
 
-The upload is the official `swarm-cli` (pinned in the script, fetched by `npx`),
-which also asks for the feed key's password, so the password never passes
-through the script or a command line. The script adds the checks around it:
+The upload is the official `swarm-cli`, pinned with its **whole dependency
+tree** by `scripts/swarm-cli/package-lock.json` and installed from it with
+`npm ci --ignore-scripts` on first use: it is the process the feed key's
+password is typed into, so it runs nothing the reviewed lockfile does not name.
+Use it through the script for every swarm-cli command below
+(`node scripts/publish_site_swarm.mjs cli …`), never through a bare `npx`.
+swarm-cli asks for the password itself; it never passes through the script or
+a command line. The script adds the checks around it:
 
 - `site/` matches `origin/main`: only merged, reviewed content goes live
   (override with `SWARM_ALLOW_UNMERGED=1`);
-- the batch is usable, immutable, and the same one this feed was published
-  with before (remembered in `~/.myotis/website-swarm.json`; override with
-  `SWARM_NEW_BATCH=1`, see *Keeping it alive*);
-- the feed key exists;
+- the batch is usable, immutable, and one this feed has been published with
+  before (override with `SWARM_NEW_BATCH=1`, see *Keeping it alive*);
+- the feed key exists and signs **the** feed: a different key would make a
+  different feed, which `myotis.eth` does not point at;
 - afterwards, your node serves every file of `site/`, the root included;
 - where `myotis.eth` points, read through your Myotis node on `127.0.0.1:8545`
   (or `ETH_RPC_URL`, an Ethereum mainnet RPC).
 
-It needs Node 18+ and git.
+It needs Node 18+ (with npm) and git.
+
+`scripts/site_swarm_feed.json` records the feed manifest and every batch the
+feed has been published with. `publish` writes it before uploading; **commit it
+whenever it changes** (the script says so). The ids are public anyway, and the
+record lets any checkout, on any machine, refuse a wrong key or batch and keep
+an eye on every batch the feed lives on.
 
 Publishing is manual on purpose: the feed key decides what `myotis.eth` shows,
 and it stays on your machine rather than in CI secrets. GitHub Pages keeps
@@ -87,8 +98,8 @@ deploying by itself and stays up as a mirror.
 1. **Create the feed key** and back it up. The password encrypts it on disk.
 
    ```bash
-   npx @ethersphere/swarm-cli@3.6.0 identity create myotis-website
-   npx @ethersphere/swarm-cli@3.6.0 identity export myotis-website --out-file myotis-website-feed.json
+   node scripts/publish_site_swarm.mjs cli identity create myotis-website
+   node scripts/publish_site_swarm.mjs cli identity export myotis-website --out-file myotis-website-feed.json
    ```
 
    Keep the export and its password offline. Whoever holds this key can change
@@ -99,7 +110,7 @@ deploying by itself and stays up as a mirror.
    in xBZZ and asks before it buys.
 
    ```bash
-   npx @ethersphere/swarm-cli@3.6.0 stamp create --capacity 100MB --ttl 1y --immutable --label myotis-website
+   node scripts/publish_site_swarm.mjs cli stamp create --capacity 100MB --ttl 1y --immutable --label myotis-website
    ```
 
    It must be immutable: a mutable batch that fills up overwrites its oldest
@@ -114,13 +125,15 @@ deploying by itself and stays up as a mirror.
 
    swarm-cli asks for the key's password, uploads and waits for the network
    to take the chunks; the script then waits until your node serves the new
-   files and prints the content hash to set: `bzz://<feed manifest>`.
+   files and prints the content hash to set: `bzz://<feed manifest>`. Commit
+   the now-filled `scripts/site_swarm_feed.json`.
 4. **Point `myotis.eth` at it**, once, from the wallet that manages the name:
    in the [ENS app](https://app.ens.domains/myotis.eth), *Records → Edit
    records → Content hash*, enter `bzz://<feed manifest>` and confirm the
    transaction.
 5. **Check.** `node scripts/publish_site_swarm.mjs status` reads the record
-   back and compares what Swarm serves with `site/`. Then open
+   back, checks every batch in `scripts/site_swarm_feed.json` and compares
+   what Swarm serves with `site/`. Then open
    `https://myotis.eth.limo` (eth.limo may cache the old answer for a few
    minutes) and `myotis.eth` in the Freedom browser.
 
@@ -140,13 +153,16 @@ site did not change.
 
 Swarm keeps data only while its batch is paid for. Keep **one batch for the life
 of the feed**: the feed's earlier updates are stamped with it, so let it neither
-expire nor be replaced. The script refuses a different batch than the one it
-last published with, unless `SWARM_NEW_BATCH=1`; if you ever do switch, keep the
-old batch topped up as well.
+expire nor be replaced. The script refuses a batch the feed has not used
+before, unless `SWARM_NEW_BATCH=1`; if you ever do switch, the old batch stays
+in the record, and `publish` and `status` keep warning about it, because it
+must stay topped up as well.
 
-- **Before it expires**, top it up (`npx @ethersphere/swarm-cli@3.6.0 stamp
-  topup --stamp <id> --amount <plur>`). The script warns when fewer than 30
-  days are left.
-- **Before it fills**, dilute it to a larger depth (`stamp dilute --stamp <id>
-  --depth <n>`; each extra level of depth halves the remaining lifetime, so top up after). The
-  script warns at 80 %: an immutable batch refuses uploads once full.
+- **Before it expires**, top it up (`node scripts/publish_site_swarm.mjs cli
+  stamp topup --stamp <id> --amount <plur>`). `publish` and `status` warn when
+  fewer than 30 days are left on any of the feed's batches; run `status` now
+  and then even when nothing changes.
+- **Before it fills**, dilute it to a larger depth (`… cli stamp dilute --stamp
+  <id> --depth <n>`; each extra level of depth halves the remaining lifetime,
+  so top up after). The script warns at 80 %: an immutable batch refuses
+  uploads once full.
