@@ -1,0 +1,52 @@
+# The user-facing website (site/) — published to GitHub Pages.
+#
+# site/ is a plain static page for people who USE the apps, not for developers:
+# no build step, no generator, no third-party requests. Keep it that way: the
+# same directory is meant to be uploaded unchanged to Swarm and served as
+# myotis.eth (and myotis.eth.limo for ordinary browsers) — see docs/website.md —
+# and a page that needs a build or pulls in a CDN would not survive that move.
+#
+# One-time setup, by a repository admin (this workflow cannot do it itself; the
+# GITHUB_TOKEN may deploy to Pages but not switch Pages on):
+#   Settings → Pages → Build and deployment → Source: "GitHub Actions".
+# Until then the deploy job fails with "Get Pages site failed".
+#
+# Deploys on every push to main that touches site/, and on dispatch. No
+# pull_request trigger: a PR cannot deploy (the github-pages environment only
+# accepts the default branch), and there is nothing to build that could fail.
+name: Website (GitHub Pages)
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+# One deployment at a time. A newer push queues behind a running deployment
+# instead of cancelling it, so a deploy is never cut off halfway.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Publish site/ to GitHub Pages
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4
