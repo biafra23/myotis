@@ -221,6 +221,10 @@ public class BeaconLightClient implements AutoCloseable {
      *  returning from bootstrap or committee catch-up) — the sync loop aligns the next poll to
      *  the slot only then. Written and read on the sync-loop thread only. */
     private boolean finalityPollRan;
+    /** When that finality fan-out started ({@link System#nanoTime}): the next poll keeps
+     *  Lighthouse's per-protocol quota from it ({@link BeaconChainSpec#millisUntilNextPoll}).
+     *  Sync-loop thread only. */
+    private long finalityPollStartNanos;
     private final java.util.function.Consumer<String> onPeerSuccess; // nullable; called with multiaddr on success
     private final java.util.function.Consumer<String> onPeerFailure; // nullable; called with multiaddr on failure
 
@@ -1072,8 +1076,9 @@ public class BeaconLightClient implements AutoCloseable {
                 // catch-up rounds (which return before it) keep the fixed slot pacing,
                 // like the Rust twin's catch-up sleep. pollFinalityUpdate says which.
                 Thread.sleep(finalityPollRan
-                        ? BeaconChainSpec.millisUntilNextPoll(
-                                System.currentTimeMillis(), clGenesisTime, slotSeconds, pollOffsetMs)
+                        ? BeaconChainSpec.millisUntilNextPoll(System.currentTimeMillis(),
+                                (System.nanoTime() - finalityPollStartNanos) / 1_000_000L,
+                                clGenesisTime, slotSeconds, pollOffsetMs)
                         : pollIntervalMs);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -2440,6 +2445,7 @@ public class BeaconLightClient implements AutoCloseable {
         // new server can only be found).
         final int POLL_FINALITY_FANOUT = hunting ? HUNT_POLL_FANOUT : 16;
         finalityPollRan = true; // the round below is a finality poll: the loop aligns the next
+        finalityPollStartNanos = System.nanoTime();
         // Heal a late winner from a PREVIOUS round: if its BLS verify outlasted
         // that round's 12s deadline, the store advanced but the poll thread had
         // moved on, skipping updateSyncState/persistSnapshot — and re-polling the

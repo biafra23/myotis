@@ -46,12 +46,14 @@ pub fn ws_anchor_stale(anchor_period: u64, wall_clock_period: u64, bound_periods
 }
 
 /// Where in each slot the steady-state finality poll may first fire, in basis
-/// points of the slot: a third of the way in, the attestation deadline —
-/// honest validators treat block N+1 as arrived by then, so its sync aggregate
-/// (which attests block N) is out and servers rebuild their latest update as
-/// they import it. The light-client gossip rules use the same point (an update
-/// is ignored until 1/3 of its signature slot has passed). Java twin:
-/// `BeaconChainSpec.FINALITY_POLL_DUE_BPS`.
+/// points of the slot: a third of the way in, the attestation and sync-message
+/// deadline — honest validators treat block N+1 as arrived by then, so its sync
+/// aggregate (which attests block N) is out and servers rebuild their latest
+/// update as they import it. The light-client gossip rules use the same point
+/// (an update is ignored until `get_sync_message_due_ms` into its signature
+/// slot). On Gloas networks (EIP-7732: sepolia, since 2026-10-06) both
+/// deadlines move to a quarter of the slot, so a poll at a third is just more
+/// conservative there. Java twin: `BeaconChainSpec.FINALITY_POLL_DUE_BPS`.
 const FINALITY_POLL_DUE_BPS: u64 = 3333;
 
 /// Margin past that mark, at most a tenth of the slot: a block that landed
@@ -62,7 +64,8 @@ const FINALITY_POLL_MARGIN_MS: u64 = 500;
 /// Width of the window a process's poll point is drawn from, once per run, in
 /// basis points of the slot (a quarter): a fleet of wallets spreads its polls
 /// over seconds, not milliseconds, while each wallet keeps an exact one-slot
-/// cadence and every poll still lands before two thirds of the slot.
+/// cadence. Capped so every poll lands by two thirds of the slot (on gnosis the
+/// window is 1167 ms, not a quarter's 1250).
 const FINALITY_POLL_JITTER_BPS: u64 = 2500;
 
 /// The least rest after a round before the next poll, in basis points of the
@@ -70,32 +73,64 @@ const FINALITY_POLL_JITTER_BPS: u64 = 2500;
 /// one after, rather than polling again back to back.
 const FINALITY_POLL_MIN_REST_BPS: u64 = 2500;
 
+/// The least time from one poll's start to the next one's, when a slot is
+/// longer: every round asks the same proven servers, and Lighthouse serves each
+/// light-client protocol once per 10 s (`Quota::one_every(10s)`, see
+/// `UPDATES_SERVE_COOLDOWN`). Polls on the grid are a slot apart anyway; this
+/// holds back the one after an off-grid poll (the first of a run, or one right
+/// after a committee catch-up). Kept under the slot, so it never moves a grid
+/// poll. On a shorter slot (gnosis) every grid poll is inside the quota anyway,
+/// as it was before. Java twin: `BeaconChainSpec.FINALITY_POLL_QUOTA_PACE_MS`.
+const FINALITY_POLL_QUOTA_PACE_MS: u64 = 11_000;
+
+/// The slot length the poll schedule works with, in millis: at least a second,
+/// at most a day — the configs are 12 s and 5 s, and the clamp keeps every sum
+/// and product below in range for any input.
+fn poll_slot_ms(seconds_per_slot: u64) -> u64 {
+    seconds_per_slot.clamp(1, 86_400) * 1000
+}
+
 /// Pure: this process's poll point within the slot, from `random` (any u64):
 /// the 1/3 mark plus [`FINALITY_POLL_MARGIN_MS`] plus a draw from the
-/// [`FINALITY_POLL_JITTER_BPS`] window.
+/// [`FINALITY_POLL_JITTER_BPS`] window, never past two thirds of the slot.
 fn finality_poll_offset_ms(seconds_per_slot: u64, random: u64) -> u64 {
-    let slot_ms = seconds_per_slot.max(1).saturating_mul(1000);
-    let window = slot_ms * FINALITY_POLL_JITTER_BPS / 10_000;
-    slot_ms * FINALITY_POLL_DUE_BPS / 10_000 + FINALITY_POLL_MARGIN_MS.min(slot_ms / 10) + random % (window + 1)
+    let slot_ms = poll_slot_ms(seconds_per_slot);
+    let earliest = slot_ms * FINALITY_POLL_DUE_BPS / 10_000 + FINALITY_POLL_MARGIN_MS.min(slot_ms / 10);
+    let window = (slot_ms * FINALITY_POLL_JITTER_BPS / 10_000).min((slot_ms * 2 / 3).saturating_sub(earliest));
+    earliest + random % (window + 1)
 }
 
 /// Pure: the delay from `now_ms` (unix millis) to the next poll point — a slot
 /// start plus `offset_ms` — that leaves at least [`FINALITY_POLL_MIN_REST_BPS`]
 /// of a slot of rest, so a round that overran skips ahead instead of polling
-/// again at once. Always in `(rest, rest + slot]`: a clock before genesis
-/// waits at most that long (tokio sleeps on the monotonic clock, so a longer
-/// wait could not be cut short by a later clock fix).
-pub(crate) fn delay_to_next_poll(now_ms: u64, genesis_time: u64, seconds_per_slot: u64, offset_ms: u64) -> Duration {
-    let slot_ms = seconds_per_slot.max(1).saturating_mul(1000);
+/// again at once, and, on a slot longer than [`FINALITY_POLL_QUOTA_PACE_MS`],
+/// lands at least that long after the last poll started (`since_poll_ms` ago).
+/// Always in `(wait, wait + slot]` for that least wait (at most 11 s): a clock
+/// before genesis waits at most that long (tokio sleeps on the monotonic clock,
+/// so a longer wait could not be cut short by a later clock fix).
+pub(crate) fn delay_to_next_poll(
+    now_ms: u64,
+    since_poll_ms: u64,
+    genesis_time: u64,
+    seconds_per_slot: u64,
+    offset_ms: u64,
+) -> Duration {
+    let slot_ms = poll_slot_ms(seconds_per_slot);
     let rest = slot_ms * FINALITY_POLL_MIN_REST_BPS / 10_000;
-    let from = now_ms.saturating_add(rest);
+    let quota = if slot_ms > FINALITY_POLL_QUOTA_PACE_MS {
+        FINALITY_POLL_QUOTA_PACE_MS.saturating_sub(since_poll_ms)
+    } else {
+        0
+    };
+    let wait = rest.max(quota);
+    let from = now_ms.saturating_add(wait);
     let first = genesis_time.saturating_mul(1000).saturating_add(offset_ms % slot_ms);
     let to_point = if from < first {
         (first - from).min(slot_ms)
     } else {
         slot_ms - (from - first) % slot_ms
     };
-    Duration::from_millis(rest + to_point)
+    Duration::from_millis(wait + to_point)
 }
 
 /// The wall clock in unix millis — every clock read of this module goes
@@ -589,10 +624,11 @@ impl ChainConfig {
         self.current_slot_estimate()
     }
 
-    /// How long until this process's next finality poll point
-    /// ([`delay_to_next_poll`]).
-    fn until_next_finality_poll(&self, offset_ms: u64) -> Duration {
-        delay_to_next_poll(now_unix_ms(), self.genesis_time, self.seconds_per_slot, offset_ms)
+    /// How long until this process's next finality poll point, for a poll
+    /// that started `since_poll` ago ([`delay_to_next_poll`]).
+    fn until_next_finality_poll(&self, since_poll: Duration, offset_ms: u64) -> Duration {
+        let since_poll_ms = u64::try_from(since_poll.as_millis()).unwrap_or(u64::MAX);
+        delay_to_next_poll(now_unix_ms(), since_poll_ms, self.genesis_time, self.seconds_per_slot, offset_ms)
     }
 
     /// Wall-clock slot estimate (the clock read is [`now_unix_ms`]).
@@ -2302,6 +2338,7 @@ async fn run_sync(
         }
 
         in_catchup = false; // reaching here means the committee is current
+        let poll_started = Instant::now();
         let poll =
             poll_finality(&config, &client, &mut pool, &mut processor, &mut clcache, &hunt.confirmed)
                 .await;
@@ -2328,7 +2365,7 @@ async fn run_sync(
         // third of the way in), not a fixed slot after this round: the update a
         // server holds refreshes when a block lands, so a poll that drifts
         // through the slot answers up to a slot staler than it needs to.
-        tokio::time::sleep(config.until_next_finality_poll(poll_offset_ms)).await;
+        tokio::time::sleep(config.until_next_finality_poll(poll_started.elapsed(), poll_offset_ms)).await;
     }
     // No code after the loop: the task ends via SyncHandle::stop (abort).
 }
@@ -5016,34 +5053,66 @@ mod tests {
         assert_eq!(finality_poll_offset_ms(12, 3_000), 7_499);
         assert_eq!(finality_poll_offset_ms(12, 3_001), 4_499); // wraps within the window
         assert_eq!(finality_poll_offset_ms(5, 0), 2_166); // gnosis: 1_666 + 500
-        assert_eq!(finality_poll_offset_ms(5, u64::MAX) - 2_166, u64::MAX % 1_251);
+        assert_eq!(finality_poll_offset_ms(5, u64::MAX) - 2_166, u64::MAX % 1_168);
+        assert_eq!(finality_poll_offset_ms(5, 1_167), 3_333); // gnosis window capped at 2/3
         assert_eq!(finality_poll_offset_ms(1, 0), 333 + 100); // margin capped at a tenth
-        for (sps, lo, hi) in [(12, 4_499, 7_499), (5, 2_166, 3_416)] {
-            for r in [0, 1, 999, 123_456_789, u64::MAX] {
+        for (sps, lo, hi, window) in [(12, 4_499, 7_499, 3_000), (5, 2_166, 3_333, 1_167), (1, 433, 666, 233)] {
+            for r in [0, 1, 999, 123_456_789, u64::MAX, window - 1, window] {
                 let o = finality_poll_offset_ms(sps, r);
-                assert!(o >= lo && o <= hi && o < sps * 1000 * 2 / 3 + 1_000, "{sps}/{r}: {o}");
+                assert!(o >= lo && o <= hi && o <= sps * 1000 * 2 / 3, "{sps}/{r}: {o}");
             }
+            assert_eq!(finality_poll_offset_ms(sps, window), hi, "{sps}: the window's top");
         }
-        // The delay: the next point at least a quarter slot (3 s) away.
+        // The delay: the next point at least a quarter slot (3 s) away (a poll
+        // long ago, so only the rest applies).
         let off = 4_499;
-        let d = |now| delay_to_next_poll(now, G, 12, off).as_millis() as u64;
+        let d = |now| delay_to_next_poll(now, 60_000, G, 12, off).as_millis() as u64;
         assert_eq!(d(at(100, 1_000)), 3_499); // early in the slot: this slot's point
         assert_eq!(d(at(100, 1_499)), 12_000 + 3_000); // under 3 s before it: the next one
         assert_eq!(d(at(100, 4_499)), 12_000); // on it: the next one
         assert_eq!(d(at(100, 6_000)), 10_499);
         // A round that overran into the next point skips ahead, never refires.
         assert_eq!(d(at(101, 4_000)), 12_499);
-        // Gnosis: 5 s slots, rest 1.25 s.
-        assert_eq!(delay_to_next_poll(G * 1000 + 5_000 * 7 + 500, G, 5, 2_166).as_millis(), 1_666);
-        // Before genesis: at most rest + slot; degenerate inputs never panic.
-        assert_eq!(delay_to_next_poll(0, G, 12, off).as_millis(), 15_000);
-        assert!(delay_to_next_poll(u64::MAX, G, 0, 0).as_millis() <= 1_250);
+        // Gnosis: 5 s slots, rest 1.25 s, and no quota floor (its slot is shorter).
+        assert_eq!(delay_to_next_poll(G * 1000 + 5_000 * 7 + 500, 0, G, 5, 2_166).as_millis(), 1_666);
+        // Before genesis: at most the least wait + a slot; degenerate inputs never panic.
+        assert_eq!(delay_to_next_poll(0, 60_000, G, 12, off).as_millis(), 15_000);
+        assert_eq!(delay_to_next_poll(0, 0, G, 12, off).as_millis(), 23_000);
+        assert!(delay_to_next_poll(u64::MAX, 0, G, 0, 0).as_millis() <= 1_250);
+        assert!(delay_to_next_poll(u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX).as_millis() <= 86_400_000 * 5 / 4);
+        assert!(finality_poll_offset_ms(u64::MAX, u64::MAX) <= 86_400_000 * 2 / 3);
         // Every delay leaves the rest and lands on the grid.
         for ms in (0..24_000).step_by(37) {
             let now = at(200, 0) + ms;
             let wait = d(now);
             assert!(wait > 3_000 && wait <= 15_000, "{wait}");
             assert_eq!((now + wait - G * 1000) % 12_000, off, "{ms}");
+        }
+
+        // The quota floor (Lighthouse: one request per protocol per 10 s). A poll
+        // on the grid is followed by the next point a slot later, however long
+        // its round ran, up to the 3 s rest.
+        let p = at(300, off);
+        for round in (0..9_000).step_by(250) {
+            let wait = delay_to_next_poll(p + round, round, G, 12, off).as_millis() as u64;
+            assert_eq!(p + round + wait, p + 12_000, "round {round}");
+        }
+        // An off-grid poll (the first of a run, or one right after a catch-up):
+        // the next one starts at least 11 s after it, never inside the quota.
+        // Without the floor, a poll at the slot's start would be followed 4.5 s later.
+        assert_eq!(delay_to_next_poll(at(300, 1_000), 1_000, G, 12, off).as_millis(), 15_499);
+        for start_ms in (0..12_000).step_by(37) {
+            for round in [0, 200, 1_000, 5_000, 8_000] {
+                let start = at(400, start_ms);
+                let now = start + round;
+                let wait = delay_to_next_poll(now, round, G, 12, off).as_millis() as u64;
+                let next = now + wait;
+                assert!(next - start >= 11_000, "{start_ms}+{round}: {}", next - start);
+                assert!(wait > 3_000, "{start_ms}+{round}: {wait}");
+                assert_eq!((next - G * 1000) % 12_000, off, "{start_ms}+{round}");
+                // ...and no later than the first point past the floor.
+                assert!(next - start <= (round + 3_000).max(11_000) + 12_000, "{start_ms}+{round}");
+            }
         }
     }
 

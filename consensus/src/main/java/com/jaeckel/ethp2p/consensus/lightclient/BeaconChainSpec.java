@@ -163,50 +163,69 @@ public final class BeaconChainSpec {
 
     /**
      * Where in each slot the steady-state finality poll may first fire, in basis points
-     * of the slot: a third of the way in, the attestation deadline — honest validators
-     * treat block N+1 as arrived by then, so its sync aggregate (which attests block N)
-     * is out and servers rebuild their latest update as they import it. The light-client
-     * gossip rules use the same point. Rust twin: {@code sync.rs FINALITY_POLL_DUE_BPS}.
+     * of the slot: a third of the way in, the attestation and sync-message deadline —
+     * honest validators treat block N+1 as arrived by then, so its sync aggregate (which
+     * attests block N) is out and servers rebuild their latest update as they import it.
+     * The light-client gossip rules use the same point ({@code get_sync_message_due_ms}).
+     * On Gloas networks (EIP-7732: sepolia, since 2026-10-06) both deadlines move to a
+     * quarter of the slot, so a poll at a third is just more conservative there. Rust
+     * twin: {@code sync.rs FINALITY_POLL_DUE_BPS}.
      */
     public static final int FINALITY_POLL_DUE_BPS = 3333;
     /** Margin past that mark, at most a tenth of the slot: a late block, or a slow
      *  importer, still serves the old update right at the deadline. */
     public static final long FINALITY_POLL_MARGIN_MS = 500;
     /** Width of the window a process's poll point is drawn from, once per run, in basis
-     *  points of the slot (a quarter): a fleet spreads its polls over seconds. */
+     *  points of the slot (a quarter): a fleet spreads its polls over seconds. Capped so
+     *  every poll lands by two thirds of the slot (gnosis: 1167 ms, not 1250). */
     public static final int FINALITY_POLL_JITTER_BPS = 2500;
     /** The least rest after a round before the next poll, in basis points of the slot
      *  (a quarter): a round that ran into the next point waits for the one after. */
     public static final int FINALITY_POLL_MIN_REST_BPS = 2500;
+    /** The least time from one poll's start to the next one's, when a slot is longer:
+     *  every round asks the same proven servers, and Lighthouse serves each light-client
+     *  protocol once per 10 s ({@code Quota::one_every(10s)}). Grid polls are a slot apart
+     *  anyway; this holds back the one after an off-grid poll (the first of a run, or one
+     *  right after a committee catch-up). Kept under the slot, so it never moves a grid
+     *  poll; on a shorter slot (gnosis) grid polls are inside the quota anyway, as before.
+     *  Rust twin: {@code sync.rs FINALITY_POLL_QUOTA_PACE_MS}. */
+    public static final long FINALITY_POLL_QUOTA_PACE_MS = 11_000;
 
     /**
      * This process's poll point within a slot of {@code secondsPerSlot}, from
      * {@code randomBits} (any long): the 1/3 mark plus {@link #FINALITY_POLL_MARGIN_MS}
-     * plus a draw from the {@link #FINALITY_POLL_JITTER_BPS} window. Rust twin:
-     * {@code sync.rs finality_poll_offset_ms}.
+     * plus a draw from the {@link #FINALITY_POLL_JITTER_BPS} window, never past two
+     * thirds of the slot. Rust twin: {@code sync.rs finality_poll_offset_ms}.
      */
     public static long finalityPollOffsetMillis(int secondsPerSlot, long randomBits) {
         long slotMs = Math.max(1, secondsPerSlot) * 1000L;
-        long window = slotMs * FINALITY_POLL_JITTER_BPS / 10_000;
-        return slotMs * FINALITY_POLL_DUE_BPS / 10_000
-                + Math.min(FINALITY_POLL_MARGIN_MS, slotMs / 10)
-                + Math.floorMod(randomBits, window + 1);
+        long earliest = slotMs * FINALITY_POLL_DUE_BPS / 10_000
+                + Math.min(FINALITY_POLL_MARGIN_MS, slotMs / 10);
+        long window = Math.min(slotMs * FINALITY_POLL_JITTER_BPS / 10_000,
+                Math.max(0, slotMs * 2 / 3 - earliest));
+        return earliest + Math.floorMod(randomBits, window + 1);
     }
 
     /**
      * Millis from {@code nowMillis} to the next poll point — a slot start plus
      * {@code offsetMillis} — that leaves at least {@link #FINALITY_POLL_MIN_REST_BPS} of
      * a slot of rest, so a round that overran skips ahead instead of polling again at
-     * once. Always in (rest, rest + slot]: a clock before genesis waits at most that long.
-     * Rust twin: {@code sync.rs delay_to_next_poll}.
+     * once, and, on a slot longer than {@link #FINALITY_POLL_QUOTA_PACE_MS}, lands at
+     * least that long after the last poll started ({@code sinceLastPollMillis} ago).
+     * Always in (wait, wait + slot] for that least wait (at most 11 s): a clock before
+     * genesis waits at most that long. Rust twin: {@code sync.rs delay_to_next_poll}.
      */
-    public static long millisUntilNextPoll(long nowMillis, long genesisTimeSec, int secondsPerSlot,
-                                           long offsetMillis) {
+    public static long millisUntilNextPoll(long nowMillis, long sinceLastPollMillis, long genesisTimeSec,
+                                           int secondsPerSlot, long offsetMillis) {
         long slotMs = Math.max(1, secondsPerSlot) * 1000L;
         long rest = slotMs * FINALITY_POLL_MIN_REST_BPS / 10_000;
-        long from = nowMillis + rest;
+        long quota = slotMs > FINALITY_POLL_QUOTA_PACE_MS
+                ? Math.max(0, FINALITY_POLL_QUOTA_PACE_MS - Math.max(0, sinceLastPollMillis))
+                : 0;
+        long wait = Math.max(rest, quota);
+        long from = nowMillis + wait;
         long first = genesisTimeSec * 1000L + Math.floorMod(offsetMillis, slotMs);
         long toPoint = from < first ? Math.min(first - from, slotMs) : slotMs - (from - first) % slotMs;
-        return rest + toPoint;
+        return wait + toPoint;
     }
 }
