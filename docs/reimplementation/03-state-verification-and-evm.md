@@ -86,8 +86,9 @@ Three files: `MerklePatriciaProofVerifier`, `HexPrefix`, `RlpItems`. keccak-256 
   this root" cause, call `reportRootUnavailable()` so the routing supplier deprioritizes that peer
   for this head.
 - **Batching**: coalesce an account→slots map into chunked requests (~64 path-sets each); each item
-  still verifies independently (the verifier builds a per-node hash map), collapsing a 1000-account
-  sweep from ~1000 round-trips to ~16.
+  still verifies independently (the verifier builds a per-node hash map), so a 1000-account sweep
+  goes out as ~16 concurrent chunks instead of ~1000 sequential round-trips — on the wire each
+  path-set is still its own request, so the saving is concurrency (04 §3.2).
 - **Three cache tiers**: per-call (`SyncStateView`), per-resolution in-flight dedup
   (`accountCache`), and cross-call `StateProofCache` (safe because state under a fixed root is
   immutable — a cached `(stateRoot, addr) → account` or `(storageRoot, slot) → value` is a

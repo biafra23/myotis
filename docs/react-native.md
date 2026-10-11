@@ -245,8 +245,8 @@ examples/rn-demo/                 # bare RN app used as the validation harness
 - **iOS**: the podspec vendors a prebuilt `libmyotis_engine.a` per slice
   (device + simulator — an xcframework assembly step over the existing
   `cargoBuildIosDevice`/`cargoBuildIosSim` outputs) plus
-  `myotis_engine.h`. Mirror the jniLibs strategy: **commit the prebuilt
-  binaries** (or a checked-in zip + checksum) so non-Mac contributors and
+  `myotis_engine.h`. Mirror the jniLibs strategy of the time: **commit the
+  prebuilt binaries** (or a checked-in zip + checksum) so non-Mac contributors and
   CI build without Rust/Xcode; the `myotis_init` ABI handshake is the
   stale-binary guard, exactly like `RustEngineNative.EXPECTED_ABI_VERSION`.
   On repository size: committed binaries do grow history on every engine

@@ -396,7 +396,9 @@ each run we walk the new accesses and call the oracle in batched form. The
 last two of the four iterations always run in block-on-miss mode, and we
 only return a result from a run that was handed no placeholder.
 
-[ALICE] So in the happy case it's two iterations. One sentinel, one real.
+[ALICE] So in the happy case it's two iterations, both sentinel: one that
+discovers, and one whose reads all hit the cache, so it was handed no
+placeholder and its result stands.
 
 [BOB] Two iterations, two snap round trips total. Maybe one snap round
 trip if the oracle's batched fetch covers every slot at once. ENS resolution

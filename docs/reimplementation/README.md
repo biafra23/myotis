@@ -369,7 +369,7 @@ hashes/addresses as bytes on the read API and 0x-hex strings in result records.
 | `EnginePeerCache` | EL peer cache: `add(host, port, pubkeyHex, snap)`, `recordSnapServed/Failure`, `recordConnectFailure`, `load() -> [CachedPeerInfo]`, `close()` | file (`peers-<net>.cache`) | app-private file |
 | `EngineClPeerCache` | CL peer cache: multiaddrs + failure counts + `ServedRange`/`BootstrapPeer` records + light-client verdicts | file (`cl-peers-<net>.cache`) | app-private file |
 | `DnsServers` | DNS IPs for EIP-1459 TXT lookups | null → system DNS | active-network DNS IPs |
-| `HttpGateway` | CCIP-Read transport: `request(method, url, body) -> String`, BLOCKING, throw on failure | java.net.http | HttpURLConnection / URLSession |
+| `HttpGateway` | CCIP-Read transport: `request(method, url, body) -> String`, BLOCKING, throw on failure | java.net.http | HttpURLConnection (Android; the iOS host drives no CCIP yet) |
 | `EngineLogger`, `EngineClock` | log sink + monotonic clock | null → engine defaults | platform log/clock |
 
 `CachedPeerInfo = (host, port, publicKeyHex, snap, snapQuality: CONFIRMED|UNKNOWN|DENIED)`;

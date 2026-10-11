@@ -336,7 +336,9 @@ transaction (`rust/myotis-net/src/el/send_check.rs`; Java: `SendCheck`).
 - **Java engine fallback.** If the checkpoint bootstrap fails, the Java engine seeds its sync
   state from an *unverified* finality update (`seedFromFinalityUpdate`, or a local beacon API
   in `seedFromBeaconApi`). Those roots are recorded with `blsVerified=false`, and the account
-  query's `stateRootMatch` path does not check that flag. The Rust engine has no such path.
+  query's `stateRootMatch` path does not check that flag; the operator `get-block` anchors on the
+  seeded finalized hash too, flagged only by `blsVerified=false`. The Rust engine has no such
+  path.
 - **Java engine: `stateRootMatch` skips the proof flag.** `VerifiedAccountQuery` and
   `VerifiedStorageQuery` take the fast path before they look at `peerProofValid` /
   `storageProofValid`, and the root they match is the state root of a header the peer picked

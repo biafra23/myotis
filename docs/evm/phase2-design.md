@@ -15,8 +15,9 @@ At 200 ms per round trip that's 1–2 s of unnecessary serial latency.
 > pattern), the last two of `DEFAULT_ITERATION_CAP` = 4 iterations always run
 > real, and a sentinel run that hit only the cache counts as converged; each
 > wave first goes through `SnapStateOracle.fetchBatch`, which folds it into
-> `SnapPeer.getTrieNodes` calls of up to 64 path-sets, with at most 48 prefetch
-> requests in flight; verified state is reused across calls through
+> `SnapPeer.getTrieNodes` calls of up to 64 path-sets, then through a per-item
+> pass over whatever is still missing, at most 48 requests in flight
+> (`PREFETCH_MAX_IN_FLIGHT`); verified state is reused across calls through
 > `StateProofCache`; and the sender is primed with the target when the call
 > moves value or pays for gas.
 
