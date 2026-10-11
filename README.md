@@ -128,6 +128,8 @@ Myotis runs in four app forms: the **Android app**, the **iOS app**, and the **d
 ./gradlew :android-app:installDebug
 ```
 
+The debug build is its own app, **Myotis Debug** (`com.jaeckel.ethp2p.android.debug`, amber icon), signed with the committed and therefore public debug key. It installs next to the release app, `com.jaeckel.ethp2p.android`, which is signed with the release key that CI holds; neither can update the other. Every release ships both APKs; see [docs/android-release-signing.md](docs/android-release-signing.md).
+
 The app runs the node as a foreground `NodeService` (Start/Stop in the UI). Once it reaches `SYNCED`, the JSON-RPC server is live on `127.0.0.1:8545`; point an on-device MetaMask at `http://localhost:8545` (custom network, chain id 1). The app persists the sync snapshot, the known-state-root window, and light-client-capable peers, so warm restarts reach `SYNCED` in ~10 s. minSdk 29.
 
 ### iOS

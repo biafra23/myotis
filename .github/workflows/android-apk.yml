@@ -49,8 +49,16 @@ jobs:
     permissions:
       actions: read
 
+  # Builds BOTH apps every run: the debug one (com.jaeckel.ethp2p.android.debug,
+  # public debug key) and the UNSIGNED release one (com.jaeckel.ethp2p.android).
+  # The release APK is signed only on a v* tag, by sign-release below, so the
+  # release key never meets this job's Gradle/cargo build. ci.yml's
+  # `./gradlew build -PskipRustEngine` already assembles the release variant
+  # (lintVitalRelease included) on every PR; what this job adds is the release
+  # build WITH the Rust engine, the engine-load and min-API checks on the APK
+  # that actually ships, and a signing rehearsal. Neither replaces the other.
   build:
-    name: Build debug APK
+    name: Build APKs (debug + unsigned release)
     needs: review-gate
     runs-on: ubuntu-latest
     permissions:
@@ -116,7 +124,7 @@ jobs:
         with:
           tool: cargo-ndk
 
-      # assembleDebug below already builds the engine via preBuild, but run it
+      # The assemble step below already builds the engine via preBuild, but run it
       # explicitly first so a toolchain problem fails here with a clear step name.
       # The newer-than check catches a silent skip (cargoNdkAndroid self-skips
       # only when the toolchain is incomplete — which requireAndroidRustEngine
@@ -165,10 +173,11 @@ jobs:
       # neither `assemble` nor `check`, and the emulator job below is
       # continue-on-error — without this, a broken NodeBootSmokeTest.kt could sit
       # green in CI indefinitely.
-      - name: Build debug APK (+ compile the androidTest APK)
+      - name: Build the debug + unsigned release APKs (+ compile the androidTest APK)
         run: |
           for attempt in 1 2 3; do
-            ./gradlew :android-app:assembleDebug :android-app:assembleDebugAndroidTest --stacktrace && exit 0
+            ./gradlew :android-app:assembleDebug :android-app:assembleRelease \
+              :android-app:assembleDebugAndroidTest --stacktrace && exit 0
             echo "::warning::APK build attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
             sleep 25
           done
@@ -182,39 +191,47 @@ jobs:
       # mechanism that puts these in the APK fails open (a resolution change
       # dropping an artifact, the aar losing an ABI, the jniLib merge racing the
       # extraction), and nothing else here would notice, so assert on the built
-      # artifact rather than trusting the build graph.
-      - name: Verify the APK can actually load the Rust engine
+      # artifacts rather than trusting the build graph. Both of them: the debug
+      # and the release variant merge their jniLibs separately.
+      - name: Verify both APKs can actually load the Rust engine
         run: |
           set -euo pipefail
-          apk=$(ls android-app/build/outputs/apk/debug/*.apk | head -n1)
-          # Read the listing ONCE into a variable and match against that. Piping
-          # `unzip -l` into `grep -q` looks natural but breaks under pipefail:
-          # grep exits at the first match, unzip takes SIGPIPE, and the pipeline
-          # reports failure on a perfectly good APK.
-          listing=$(unzip -l "$apk")
-          engines=$(sed -n 's#.*lib/\([^/]*\)/libmyotis_engine\.so.*#\1#p' <<< "$listing" | sort -u)
-          [ -n "$engines" ] \
-            || { echo "::error::no libmyotis_engine.so in the APK at all"; exit 1; }
-          while IFS= read -r abi; do
-            [ -n "$abi" ] || continue
-            grep -q "lib/$abi/libjnidispatch\.so" <<< "$listing" \
-              || { echo "::error::$abi ships libmyotis_engine.so with no libjnidispatch.so — JNA cannot dispatch, so the Rust engine would silently fall back to Java"; exit 1; }
-            echo "  ok: $abi has both libmyotis_engine.so and libjnidispatch.so"
-          done <<< "$engines"
+          for variant in debug release; do
+            apk=$(ls android-app/build/outputs/apk/$variant/*.apk | head -n1)
+            echo "$apk:"
+            # Read the listing ONCE into a variable and match against that. Piping
+            # `unzip -l` into `grep -q` looks natural but breaks under pipefail:
+            # grep exits at the first match, unzip takes SIGPIPE, and the pipeline
+            # reports failure on a perfectly good APK.
+            listing=$(unzip -l "$apk")
+            engines=$(sed -n 's#.*lib/\([^/]*\)/libmyotis_engine\.so.*#\1#p' <<< "$listing" | sort -u)
+            [ -n "$engines" ] \
+              || { echo "::error::no libmyotis_engine.so in $apk at all"; exit 1; }
+            while IFS= read -r abi; do
+              [ -n "$abi" ] || continue
+              grep -q "lib/$abi/libjnidispatch\.so" <<< "$listing" \
+                || { echo "::error::$apk: $abi ships libmyotis_engine.so with no libjnidispatch.so — JNA cannot dispatch, so the Rust engine would silently fall back to Java"; exit 1; }
+              echo "  ok: $abi has both libmyotis_engine.so and libjnidispatch.so"
+            done <<< "$engines"
+          done
 
       # minSdk JDK-API gate — enforcement for CLAUDE.md's "minSdk 29 JDK-API
       # budget"; the script's docstring is the full story. The platform install
       # feeds its api-versions canary: pre-36.1 databases don't record every
       # policed API (Files.readString first appears in the 36.1 database), and
-      # the script refuses to scan against a database that old (exit 2).
+      # the script refuses to scan against a database that old (exit 2). Both
+      # APKs ship, and each variant is dexed on its own, so both are scanned.
       - name: Verify minSdk JDK-API compatibility
         run: |
+          set -euo pipefail
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36.1" \
             || echo "::warning::sdkmanager could not install platforms;android-36.1 — the gate's own database canary will decide"
-          apk=$(ls android-app/build/outputs/apk/debug/*.apk | head -n1)
-          python3 scripts/check_apk_min_api.py --apk "$apk"
+          for variant in debug release; do
+            apk=$(ls android-app/build/outputs/apk/$variant/*.apk | head -n1)
+            python3 scripts/check_apk_min_api.py --apk "$apk"
+          done
 
-      - name: Upload APK
+      - name: Upload the debug APK
         uses: actions/upload-artifact@v4
         with:
           name: android-app-debug-${{ github.sha }}
@@ -227,6 +244,51 @@ jobs:
           # path must not wedge the release. (node-binding.yml has carried this
           # fix since it hit exactly that.)
           overwrite: true
+
+      # sign_release_apk.sh otherwise first runs on a hosted runner at a real
+      # tag. Rehearse it on every run with a throwaway key, so runner-image drift
+      # (which build-tools dir it picks, apksigner's --alignment-preserved,
+      # aapt2's badging format, the JDK behind apksigner) fails here instead.
+      # The throwaway pin goes in through ANDROID_RELEASE_CERT_PIN_FILE, so the
+      # committed pin is never read or touched.
+      - name: Rehearse release signing with a throwaway key
+        run: |
+          set -euo pipefail
+          t="$RUNNER_TEMP/sign-rehearsal"
+          mkdir -p "$t"
+          export REHEARSAL_PW=$(openssl rand -hex 24)
+          keytool -genkeypair -keystore "$t/k.p12" -storetype PKCS12 -alias rehearsal \
+            -keyalg RSA -keysize 2048 -validity 1 -dname "CN=Myotis signing rehearsal" \
+            -storepass:env REHEARSAL_PW >/dev/null 2>&1
+          keytool -list -v -keystore "$t/k.p12" -alias rehearsal -storepass:env REHEARSAL_PW \
+            | sed -n 's/.*SHA256: //p' > "$t/pin"
+          apk=$(ls android-app/build/outputs/apk/release/*.apk | head -n1)
+          ANDROID_RELEASE_CERT_PIN_FILE="$t/pin" \
+          ANDROID_RELEASE_KEYSTORE_BASE64="$(base64 -w0 "$t/k.p12")" \
+          ANDROID_RELEASE_KEYSTORE_PASSWORD="$REHEARSAL_PW" \
+          ANDROID_RELEASE_KEY_ALIAS=rehearsal \
+            scripts/sign_release_apk.sh "$apk" "$t/signed.apk"
+          rm -rf "$t"
+
+      # sign-release refuses a tag whose tree has no pinned release certificate,
+      # and then the tag publishes no Android APK at all. Say so on every earlier
+      # run instead, while there is still time to commit it.
+      - name: Warn when no release certificate is pinned
+        run: |
+          [ -f android-app/release-signing-cert.sha256 ] \
+            || echo "::warning title=No pinned release certificate::android-app/release-signing-cert.sha256 is missing, so a v* tag cut from this tree would publish no Android APK (docs/android-release-signing.md)"
+
+      # Only a tag needs it (sign-release below): an unsigned APK installs nowhere,
+      # so on a PR or main it would only be dead artifact storage.
+      - name: Upload the unsigned release APK
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-app-release-unsigned-${{ github.sha }}
+          path: android-app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true  # same re-run reason as the debug APK above
 
   # Boot the actual app on a minSdk (API 29) emulator. The static bytecode gate
   # (scripts/check_apk_min_api.py — the build job above runs it) proves
@@ -258,8 +320,8 @@ jobs:
     permissions:
       contents: read
     # Skip on release tags: nothing consumes this job's result there (release
-    # needs only build + version-guard), and the tagged commit already ran it on
-    # its way through main/PR.
+    # needs only build + sign-release + version-guard), and the tagged commit
+    # already ran it on its way through main/PR.
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     # The in-test deadline only bounds the test body — NOT the system-image
     # download, AVD creation, or an emulator/adb hang (the failure modes named
@@ -417,45 +479,138 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     uses: ./.github/workflows/release-version-guard.yml
 
-  # Attach the built APK to the GitHub Release for the pushed tag. Runs ONLY on
-  # `v*` tags (never on branch/PR builds), and reuses the build job's artifact
+  # Sign the release APK with the Myotis release key. The ONLY job that ever holds
+  # that key, so it is kept as small as it can be (docs/android-release-signing.md):
+  #   - the secrets live in the `android-release` ENVIRONMENT, not the repo, and
+  #     that environment's deployment rule admits v* tags only, so no PR branch,
+  #     whatever workflow it carries, can read them;
+  #   - it checks out only the signing script and the pinned certificate, and runs
+  #     apksigner from the runner's SDK: no Gradle, no plugin, no cargo build.rs
+  #     executes while the key is on disk;
+  #   - it gets a read-only token, and publishing (contents: write) is a separate
+  #     job that never sees the key.
+  # Fails closed: with no secrets, no pinned certificate, or a key that does not
+  # match the pin, nothing is signed and the release job below is skipped, so a
+  # tag publishes no Android asset at all rather than a debug-signed one.
+  # Its actions are pinned to commit SHAs, unlike the rest of the repo: the
+  # runner hands a job every secret it references when the job STARTS, so each
+  # action here runs while the key is readable from the runner process (how the
+  # tj-actions/changed-files compromise, CVE-2025-30066, took secrets from jobs
+  # that never passed them to it). A moved tag must not reach this job.
+  sign-release:
+    name: Sign the release APK
+    needs: [build, version-guard]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: android-release
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the signing script and the pinned certificate only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          sparse-checkout: |
+            scripts/sign_release_apk.sh
+            android-app/release-signing-cert.sha256
+          sparse-checkout-cone-mode: false
+          # Nothing here talks to git again: keep the token out of .git/config.
+          persist-credentials: false
+
+      - name: Download the unsigned release APK
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: android-app-release-unsigned-${{ github.sha }}
+          path: unsigned
+
+      - name: Sign with the release key and check the signer against the pin
+        env:
+          ANDROID_RELEASE_KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
+          ANDROID_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEYSTORE_PASSWORD }}
+          ANDROID_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
+          ANDROID_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apks=(unsigned/*.apk)
+          [ "${#apks[@]}" -eq 1 ] \
+            || { echo "::error::expected exactly 1 unsigned apk, found ${#apks[@]}: ${apks[*]}"; exit 1; }
+          mkdir signed
+          scripts/sign_release_apk.sh "${apks[0]}" signed/android-app-release.apk
+
+      - name: Upload the signed release APK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: android-app-release-${{ github.sha }}
+          path: signed/android-app-release.apk
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true  # same re-run reason as the build job's artifacts
+
+  # Attach both APKs to the GitHub Release for the pushed tag: the release-signed
+  # app (Myotis-<tag>-android.apk) and the debug one (Myotis-<tag>-android-debug.apk).
+  # Runs ONLY on `v*` tags (never on branch/PR builds), and reuses the artifacts
   # rather than rebuilding. The desktop-dmg workflow publishes to the SAME
   # release for the same tag; whichever job runs first creates it and the other
   # just uploads its asset — the create step below tolerates that race.
   release:
-    name: Publish APK to release
-    # version-guard carries the same `if` as this job, so it is never merely
-    # skipped underneath it — on a tag push both run, otherwise both are skipped.
-    needs: [build, version-guard]
+    name: Publish APKs to release
+    # version-guard and sign-release carry the same `if` as this job, so neither
+    # is ever merely skipped underneath it — on a tag push all three run,
+    # otherwise all three are skipped.
+    needs: [build, sign-release, version-guard]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       # gh release create/upload needs write access to Releases (repo contents).
       contents: write
     steps:
-      - name: Download APK artifact
+      - name: Download the debug APK
         uses: actions/download-artifact@v4
         with:
           name: android-app-debug-${{ github.sha }}
-          path: apk
+          path: apk/debug
 
-      - name: Rename APK to a stable, versioned asset name
+      - name: Download the signed release APK
+        uses: actions/download-artifact@v4
+        with:
+          name: android-app-release-${{ github.sha }}
+          path: apk/release
+
+      - name: Check both APKs' package ids and give them stable, versioned asset names
         run: |
-          set -eu
-          # The tag goes into the asset file name, so check its shape the way the
+          set -euo pipefail
+          # The tag goes into the asset file names, so check its shape the way the
           # dmg and deb publish jobs do. `gh release upload` reads everything
           # after a `#` in a path as the asset's label, and the version guard
           # accepts any v<version>-<suffix>, so a tag like v<version>-rc#1 would
           # otherwise create the release in the next step and then fail its upload.
           printf '%s' "${GITHUB_REF_NAME}" | grep -Eq '^v[A-Za-z0-9._-]+$' \
             || { echo "::error::'${GITHUB_REF_NAME}' is not a valid release tag (expected v<version>)"; exit 1; }
-          # Glob into an array and assert exactly one apk — a stray second file
-          # (or zero) should fail here, not silently ship an arbitrary pick.
+          # Numbered stable releases only (not rc builds or a `current` symlink).
+          build_tools=$(ls -d "$ANDROID_HOME"/build-tools/*/ \
+            | grep -E '/[0-9]+\.[0-9]+\.[0-9]+/$' | sort -V | tail -n1)
+          aapt2="${build_tools}aapt2"
           shopt -s nullglob
-          apks=(apk/*.apk)
-          [ "${#apks[@]}" -eq 1 ] \
-            || { echo "::error::expected exactly 1 apk, found ${#apks[@]}: ${apks[*]}"; exit 1; }
-          mv "${apks[0]}" "apk/Myotis-${GITHUB_REF_NAME}-android-debug.apk"
+          # variant, expected package, asset suffix. The package check is the
+          # point of shipping two APKs: the debug-signed one must never carry the
+          # release app's id, or it would install over Myotis as an update for
+          # anyone who uninstalled the release app (and a lookalike signed with the
+          # same public key could follow).
+          while read -r variant package suffix; do
+            # Glob into an array and assert exactly one apk — a stray second file
+            # (or zero) should fail here, not silently ship an arbitrary pick.
+            apks=(apk/$variant/*.apk)
+            [ "${#apks[@]}" -eq 1 ] \
+              || { echo "::error::expected exactly 1 $variant apk, found ${#apks[@]}: ${apks[*]}"; exit 1; }
+            got=$("$aapt2" dump packagename "${apks[0]}" < /dev/null)  # not the loop's stdin
+            [ "$got" = "$package" ] \
+              || { echo "::error::the $variant APK is package '$got', expected '$package'"; exit 1; }
+            mv "${apks[0]}" "apk/Myotis-${GITHUB_REF_NAME}-${suffix}.apk"
+            echo "  ok: $variant = $package -> Myotis-${GITHUB_REF_NAME}-${suffix}.apk"
+          done <<'APKS'
+          release com.jaeckel.ethp2p.android android
+          debug com.jaeckel.ethp2p.android.debug android-debug
+          APKS
 
       - name: Publish to GitHub Release
         env:
@@ -473,8 +628,24 @@ jobs:
           cat > "$notes" <<'NOTES'
           Pre-release build of the Myotis wallet apps.
 
-          **Android (`*-android-debug.apk`)** — unsigned *debug* build. Install via
-          "Install unknown apps". Not a signed release build.
+          **Android (`*-android.apk`)** — the Myotis app, signed with Myotis's own release key
+          (its certificate's SHA-256 is in `android-app/release-signing-cert.sha256` in the
+          repository). Install via "Install unknown apps" and switch that off again afterwards;
+          only ever install Myotis, and its updates, from this releases page.
+
+          **Android debug (`*-android-debug.apk`)** — a separate test app ("Myotis Debug", amber
+          icon, package `com.jaeckel.ethp2p.android.debug`), signed with the publicly known debug
+          key: anyone can build an APK that installs over it as an update, so do not rely on it for
+          a wallet you use. It installs next to the release app, but run only one of them at a time:
+          both use the same network and JSON-RPC ports.
+
+          **Coming from an older Android release?** Releases that shipped only an
+          `*-android-debug.apk` installed Myotis itself (package `com.jaeckel.ethp2p.android`)
+          signed with that public debug key. Android will not update it to the release-signed app
+          ("App not installed … conflicts with an existing package"), and while it stays installed
+          anyone's lookalike can replace it. Uninstall it first: that deletes its settings, allowed
+          websites and sync progress (Myotis holds no wallet keys or funds), and the new app
+          re-syncs on its first start.
 
           **Desktop macOS (`Myotis-v<version>-<arch>.dmg`)** — unsigned; download the dmg matching
           your Mac (arm64 for Apple Silicon, x64 for Intel). First launch:
