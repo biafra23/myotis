@@ -639,8 +639,11 @@ private fun SettingsTab(
                 onChange = { on -> stayAwakeCharging = on; settings.setStayAwakeWhileCharging(on) },
             )
             SettingsNote(
-                "On (default): while the phone is plugged in, skip idle sleep and keep the node " +
-                    "awake and synced (battery isn't a concern). Off: sleep on the same idle timer " +
+                "On (default): while the phone is plugged in on an unmetered network such as " +
+                    "home Wi-Fi, skip idle sleep and keep the node awake and synced. On mobile " +
+                    "data or a metered hotspot it sleeps on the idle timer even while charging, so " +
+                    "it does not eat into your data plan; a VPN that reports itself as metered " +
+                    "makes Wi-Fi count as metered too. Off: sleep on the same idle timer " +
                     "whether charging or not. Emergency low-memory pauses happen either way.",
             )
         }

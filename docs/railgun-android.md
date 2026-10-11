@@ -143,9 +143,11 @@ entry.
    behind the head, nothing catches it up again (*Shelf life* below).
 4. **Keep the node awake for the catch-up in step 5.** Idle sleep stops all P2P
    networking after 5 minutes without RPC or UI activity. That does not happen
-   while the phone is charging and online (**Stay awake while charging**, on by
-   default). Otherwise set **Idle sleep after (minutes, 0 = never)** to 0 until
-   the catch-up is done.
+   while the phone is charging on an unmetered network such as home Wi-Fi
+   (**Stay awake while charging**, on by default). Charging alone is not
+   enough: on mobile data or a metered hotspot the node sleeps even while
+   plugged in. In that case, or with the setting off, set **Idle sleep after
+   (minutes, 0 = never)** to 0 until the catch-up is done.
 
 ## 4. Import
 
