@@ -344,23 +344,30 @@ impl ElConfig {
     }
 }
 
-/// Why `eth_sendRawTransaction` did not send (#531).
+/// Why `eth_sendRawTransaction` did not send (#531, #360).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendError {
+    /// Not a transaction this node relays ([`tx::decode_sendable`], #360):
+    /// the bytes do not decode as one, its signature names no sender, or it
+    /// is a blob transaction. Nothing was broadcast, and no retry changes the
+    /// bytes: hosts answer the permanent JSON-RPC -32602 with the message.
+    Refused(String),
     /// The transaction can never be mined as sent: its sender cannot pay for
     /// it, or its nonce is used — judged on fresh, verified state, and nothing
     /// was broadcast. The message is geth's txpool verdict in geth's words,
     /// which wallets classify (ethers v6 and viem: `INSUFFICIENT_FUNDS`,
     /// `NONCE_EXPIRED`).
     Rejected(String),
-    /// It could not be sent now: not a transaction, no peer, the broadcast cut.
+    /// It could not be sent now: no peer, the broadcast cut.
     Unavailable(String),
 }
 
 impl std::fmt::Display for SendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SendError::Rejected(reason) | SendError::Unavailable(reason) => f.write_str(reason),
+            SendError::Refused(reason) | SendError::Rejected(reason) | SendError::Unavailable(reason) => {
+                f.write_str(reason)
+            }
         }
     }
 }
@@ -7866,21 +7873,24 @@ impl ElReader {
     /// broadcast. This is a WRITE: peers' mempools and a later verified receipt
     /// lookup are what confirm inclusion.
     ///
-    /// First, the check geth's txpool makes (#531; [`send_check`]): a
+    /// First, the bytes must BE a transaction (#360; [`tx::decode_sendable`]):
+    /// strictly decoded, with a sender its signature recovers — anything else
+    /// is [`SendError::Refused`] and never reaches a peer. Strict decoding is
+    /// also what makes the hash returned the decoded transaction's own.
+    /// Then the check geth's txpool makes (#531; [`send_check`]): a
     /// transaction its sender cannot pay for, or whose nonce is used, is
     /// [`SendError::Rejected`] in geth's words and never broadcast — no peer
     /// would keep it, and none would say so. It judges only on fresh, verified
     /// state ([`Self::pre_broadcast_check`]) and otherwise broadcasts as before.
     pub async fn send_raw_transaction(self: &Arc<Self>, raw_tx: &[u8]) -> Result<[u8; 32], SendError> {
-        // Minimal sanity only (we never sign or fully validate — peers reject a bad
-        // tx): non-empty with a plausible prefix — a legacy RLP list (>= 0xc0) or an
-        // EIP-2718 type byte (0x01..=0x7f). Avoids gossiping obvious garbage.
-        match raw_tx.first() {
-            Some(&b) if b >= 0xc0 || (0x01..=0x7f).contains(&b) => {}
-            _ => return Err(SendError::Unavailable("not a valid raw transaction".to_string())),
-        }
-        let summary = tx::decode_summary(raw_tx);
-        let verdict = self.pre_broadcast_check(summary.as_ref()).await;
+        let summary = match tx::decode_sendable(raw_tx) {
+            Ok(summary) => summary,
+            Err(reason) => {
+                tracing::info!(%reason, "transaction refused: not a transaction this node relays");
+                return Err(SendError::Refused(reason));
+            }
+        };
+        let verdict = self.pre_broadcast_check(&summary).await;
         self.send_judged(raw_tx, summary, verdict).await
     }
 
@@ -7889,7 +7899,7 @@ impl ElReader {
     async fn send_judged(
         &self,
         raw_tx: &[u8],
-        summary: Option<TxSummary>,
+        summary: TxSummary,
         verdict: PreBroadcast,
     ) -> Result<[u8; 32], SendError> {
         let hash = keccak256(raw_tx);
@@ -7928,7 +7938,7 @@ impl ElReader {
                         confirmed = sent.confirmed,
                         "tor: transaction sent over Tor"
                     );
-                    self.record_sent(hash, raw_tx, summary.as_ref(), true);
+                    self.record_sent(hash, raw_tx, &summary, true);
                     Ok(hash)
                 }
                 Err(e) => {
@@ -7979,16 +7989,16 @@ impl ElReader {
             return Err(not_broadcast("no peer accepted the transaction broadcast"));
         }
         tracing::info!(tx = %tx_hash, peers = peers.len(), "transaction broadcast");
-        self.record_sent(hash, raw_tx, summary.as_ref(), false);
+        self.record_sent(hash, raw_tx, &summary, false);
         Ok(hash)
     }
 
     /// Book a broadcast that went out (`via_tor`: over Tor) into the sent-tx
     /// state the rebroadcast, the pending nonce and the receipt scan read.
-    fn record_sent(&self, hash: [u8; 32], raw_tx: &[u8], summary: Option<&TxSummary>, via_tor: bool) {
+    fn record_sent(&self, hash: [u8; 32], raw_tx: &[u8], summary: &TxSummary, via_tor: bool) {
         // The sent-tx watch (the Java rpcSendRawTransaction tail, mirrored):
         // cache the bytes for rebroadcast, record the sender's pending nonce
-        // (best-effort — an undecodable/senderless tx is silently skipped),
+        // (the transaction decode_sendable passed, so its sender is known),
         // and start watching with the head recorded AT BROADCAST — the beacon
         // OPTIMISTIC number (the Java broadcastHead source), which the receipt
         // scan's reachback uses as its floor for our own txs.
@@ -8006,10 +8016,8 @@ impl ElReader {
             if via_tor {
                 st.last_rebroadcast = now;
             }
-            if let Some(t) = summary {
-                if let Some(from) = t.from {
-                    st.pending_nonces.record(from, t.nonce, now);
-                }
+            if let Some(from) = summary.from {
+                st.pending_nonces.record(from, summary.nonce, now);
             }
         }
         self.sent_tx_watch.lock().unwrap().watch(hash, now, broadcast_head);
@@ -8027,7 +8035,7 @@ impl ElReader {
     /// connection ([`hedged_race`]'s note) right before the broadcast wants
     /// that peer. Registered like a host request, so a pause or stop still
     /// cancels it, and at most [`send_check::DETACHED_READS_MAX`] at once.
-    async fn pre_broadcast_check(self: &Arc<Self>, tx: Option<&TxSummary>) -> PreBroadcast {
+    async fn pre_broadcast_check(self: &Arc<Self>, tx: &TxSummary) -> PreBroadcast {
         let Ok(since_epoch) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
             return PreBroadcast::Unchecked("wall clock unreadable");
         };
@@ -8066,20 +8074,18 @@ impl ElReader {
     }
 
     /// The transaction, its sender and the head a verdict would be judged at,
-    /// or why there is nothing to judge: an undecoded transaction (a blob
-    /// transaction's network form included: it wraps the blobs around the
-    /// transaction, which the summary does not read), an unrecovered sender,
-    /// another chain's transaction (peers drop it anyway, and this chain's
+    /// or why there is nothing to judge: an unrecovered sender (which
+    /// [`tx::decode_sendable`] refuses before a send gets here), another
+    /// chain's transaction (peers drop it anyway, and this chain's
     /// state says nothing about it), no head, or a head older than
     /// [`send_check::fresh_bound`] — by its proven timestamp against the wall
     /// clock, and by when this node adopted it against its own monotonic clock,
     /// so a wall clock set wrong cannot pass a stalled head as fresh.
     fn ready_to_judge<'t>(
         &self,
-        tx: Option<&'t TxSummary>,
+        tx: &'t TxSummary,
         now_unix: u64,
     ) -> Result<(&'t TxSummary, [u8; 20], HeadState), &'static str> {
-        let tx = tx.ok_or("not decoded")?;
         let from = tx.from.ok_or("sender not recovered")?;
         if tx.chain_id.is_some_and(|id| id != self.chain_id) {
             return Err("another chain's transaction");
@@ -16875,11 +16881,11 @@ mod pre_broadcast_tests {
             ..ElConfig::mainnet()
         };
         let reader = ElReader::start(key, Arc::clone(&anchor), cfg).await.expect("offline reader");
-        let tx = tx::decode_summary(&spec_tx());
-        assert_eq!(reader.ready_to_judge(tx.as_ref(), now_unix()).err(), Some("head not fresh"));
+        let tx = tx::decode_summary(&spec_tx()).expect("decodes");
+        assert_eq!(reader.ready_to_judge(&tx, now_unix()).err(), Some("head not fresh"));
         // The first live head after it is.
         anchor.update_optimistic(101, 101, [7; 32], [8; 32], now_unix() - 3);
-        assert!(reader.ready_to_judge(tx.as_ref(), now_unix()).is_ok());
+        assert!(reader.ready_to_judge(&tx, now_unix()).is_ok());
     }
 
     #[test]
@@ -16911,27 +16917,26 @@ mod pre_broadcast_tests {
     #[tokio::test]
     async fn a_send_is_judged_only_at_a_fresh_head_on_its_own_chain() {
         let now = now_unix();
-        let tx = tx::decode_summary(&spec_tx());
-        let sender = tx.as_ref().and_then(|t| t.from).expect("the spec vector's sender");
+        let tx = tx::decode_summary(&spec_tx()).expect("decodes");
+        let sender = tx.from.expect("the spec vector's sender");
         // A light client's head is normally one to two blocks old.
         let fresh = offline_reader(Some(now - 20)).await;
         assert_eq!(
-            fresh.ready_to_judge(tx.as_ref(), now).map(|(_, from, head)| (from, head.number, head.state_root)),
+            fresh.ready_to_judge(&tx, now).map(|(_, from, head)| (from, head.number, head.state_root)),
             Ok((sender, 100, [2; 32]))
         );
         let stale = offline_reader(Some(now - 60)).await;
-        assert_eq!(stale.ready_to_judge(tx.as_ref(), now).err(), Some("head not fresh"));
+        assert_eq!(stale.ready_to_judge(&tx, now).err(), Some("head not fresh"));
         let headless = offline_reader(None).await;
-        assert_eq!(headless.ready_to_judge(tx.as_ref(), now).err(), Some("no verified head yet"));
-        // Nothing to judge: an undecoded transaction, or no sender.
-        assert_eq!(fresh.ready_to_judge(None, now).err(), Some("not decoded"));
-        let senderless = tx.map(|t| TxSummary { from: None, ..t });
-        assert_eq!(fresh.ready_to_judge(senderless.as_ref(), now).err(), Some("sender not recovered"));
+        assert_eq!(headless.ready_to_judge(&tx, now).err(), Some("no verified head yet"));
+        // Nothing to judge: no sender.
+        let senderless = TxSummary { from: None, ..tx.clone() };
+        assert_eq!(fresh.ready_to_judge(&senderless, now).err(), Some("sender not recovered"));
         // Signed for Sepolia, posted to mainnet: this chain's state says
         // nothing about it.
         let key = NodeKey::from_secret_bytes(&[0x42; 32]).unwrap();
-        let sepolia = tx::decode_summary(&signed_typed(2, 11_155_111, &key));
-        assert_eq!(fresh.ready_to_judge(sepolia.as_ref(), now).err(), Some("another chain's transaction"));
+        let sepolia = tx::decode_summary(&signed_typed(2, 11_155_111, &key)).expect("decodes");
+        assert_eq!(fresh.ready_to_judge(&sepolia, now).err(), Some("another chain's transaction"));
     }
 
     #[tokio::test]
@@ -16947,19 +16952,41 @@ mod pre_broadcast_tests {
     }
 
     #[tokio::test]
+    async fn bytes_that_are_no_transaction_are_refused_before_any_peer_is_asked() {
+        // #360: one 0x00 byte used to be gossiped, and answered with its keccak.
+        let reader = offline_reader(Some(now_unix() - 5)).await;
+        assert_eq!(
+            reader.send_raw_transaction(&[0x00]).await,
+            Err(SendError::Refused("invalid raw transaction: transaction type not supported (0x0)".to_string()))
+        );
+        // A real one cut short is refused too, where it used to go on to look
+        // for a peer: the refusal is about the bytes, so no peer is needed.
+        let spec = spec_tx();
+        let truncated = &spec[..spec.len() - 1];
+        assert_eq!(
+            reader.send_raw_transaction(truncated).await,
+            Err(SendError::Refused("invalid raw transaction: malformed legacy transaction".to_string()))
+        );
+        // Neither is booked as sent: no rebroadcast, no pending nonce.
+        let mut sent = reader.sent_txs.lock().unwrap();
+        assert!(sent.bytes.get(&keccak256(&[0x00])).is_none());
+        assert!(sent.bytes.get(&keccak256(truncated)).is_none());
+    }
+
+    #[tokio::test]
     async fn a_send_goes_unchecked_while_reads_are_busy() {
         // At most DETACHED_READS_MAX detached reads at once: past that a send
         // goes out unchecked rather than pile reads onto slow peers.
         let reader = offline_reader(Some(now_unix() - 5)).await;
-        let tx = tx::decode_summary(&spec_tx());
+        let tx = tx::decode_summary(&spec_tx()).expect("decodes");
         let all = Arc::clone(&reader.send_check_permits)
             .acquire_many_owned(send_check::DETACHED_READS_MAX as u32)
             .await
             .unwrap();
-        assert_eq!(reader.pre_broadcast_check(tx.as_ref()).await, PreBroadcast::Unchecked("account reads busy"));
+        assert_eq!(reader.pre_broadcast_check(&tx).await, PreBroadcast::Unchecked("account reads busy"));
         drop(all);
         // With a permit free the read runs; offline, it finds no peer.
-        assert_eq!(reader.pre_broadcast_check(tx.as_ref()).await, PreBroadcast::Unchecked("account read failed"));
+        assert_eq!(reader.pre_broadcast_check(&tx).await, PreBroadcast::Unchecked("account read failed"));
     }
 
     #[tokio::test]
@@ -16969,13 +16996,13 @@ mod pre_broadcast_tests {
         let raw = spec_tx();
         // Refused before the broadcast is attempted ...
         assert_eq!(
-            reader.send_judged(&raw, tx::decode_summary(&raw), PreBroadcast::Doomed(reason.clone())).await,
+            reader.send_judged(&raw, tx::decode_summary(&raw).expect("decodes"), PreBroadcast::Doomed(reason.clone())).await,
             Err(SendError::Rejected(reason))
         );
         // ... while any other verdict goes on to it: here it finds no peer.
         for verdict in [PreBroadcast::Passed, PreBroadcast::Unchecked("head not fresh")] {
             assert_eq!(
-                reader.send_judged(&raw, tx::decode_summary(&raw), verdict).await,
+                reader.send_judged(&raw, tx::decode_summary(&raw).expect("decodes"), verdict).await,
                 Err(SendError::Unavailable("no peer available to broadcast the transaction".to_string()))
             );
         }
@@ -16989,11 +17016,11 @@ mod pre_broadcast_tests {
         let hash = keccak256(&raw);
         reader.sent_txs.lock().unwrap().bytes.put(hash, SentTx { raw: raw.clone(), via_tor: true });
         // Answered with its hash, without reaching for a peer to push to ...
-        assert_eq!(reader.send_judged(&raw, tx::decode_summary(&raw), PreBroadcast::Passed).await, Ok(hash));
+        assert_eq!(reader.send_judged(&raw, tx::decode_summary(&raw).expect("decodes"), PreBroadcast::Passed).await, Ok(hash));
         // ... while a clearnet-sent one goes on to the broadcast as before.
         reader.sent_txs.lock().unwrap().bytes.put(hash, SentTx { raw: raw.clone(), via_tor: false });
         assert_eq!(
-            reader.send_judged(&raw, tx::decode_summary(&raw), PreBroadcast::Passed).await,
+            reader.send_judged(&raw, tx::decode_summary(&raw).expect("decodes"), PreBroadcast::Passed).await,
             Err(SendError::Unavailable("no peer available to broadcast the transaction".to_string()))
         );
     }

@@ -9,6 +9,7 @@ import com.jaeckel.ethp2p.networking.eth.EthHandler;
 import com.jaeckel.ethp2p.networking.eth.HeaderChains;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockBodiesMessage;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
+import com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder;
 import com.jaeckel.ethp2p.networking.eth.messages.Receipt;
 import com.jaeckel.ethp2p.networking.eth.messages.TxFeeFields;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
@@ -980,6 +981,15 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
 
     @Override
     public byte[] sendRawTransaction(byte[] rawTx) {
+        // A refusal is no hash either: null, the legacy two-state view.
+        io.myotis.api.SendResult r = rpcSendRawTransaction(rawTx);
+        return r.status() == io.myotis.api.SendResult.Status.SENT ? r.txHash() : null;
+    }
+
+    @Override
+    public io.myotis.api.SendResult sendRawTransactionDetailed(byte[] rawTx) {
+        // Overridden, not inherited: the default would collapse a REFUSED send
+        // (#360) into the retryable null of "no peer took it".
         return rpcSendRawTransaction(rawTx);
     }
 
@@ -2818,18 +2828,32 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         }
     }
 
-    /** eth_sendRawTransaction: gossip the user-signed tx to peers; return its hash
-     *  (keccak256 of the raw bytes), or null if no peer took it. Myotis never signs
-     *  or originates a tx — this only relays bytes the user submitted. */
-    private byte[] rpcSendRawTransaction(byte[] rawTx) {
+    /** eth_sendRawTransaction: gossip the user-signed tx to peers; SENT with its hash
+     *  (keccak256 of the raw bytes), or UNAVAILABLE if no peer took it. Myotis never
+     *  signs or originates a tx — this only relays bytes the user submitted.
+     *
+     *  <p>Only once they are a transaction (#360, {@link EthTxDecoder#checkSendable}):
+     *  strictly decoded, with a sender its signature recovers. Anything else is REFUSED
+     *  and reaches no peer — a junk byte used to be gossiped to every peer and answered
+     *  with its keccak, a hash of nothing a wallet could ever find mined. The strict
+     *  decode is also what makes the hash returned the decoded transaction's own, and
+     *  its result feeds the pending-nonce overlay: one decode, not two. */
+    private io.myotis.api.SendResult rpcSendRawTransaction(byte[] rawTx) {
+        EthTxDecoder.SendCheck check =
+                EthTxDecoder.checkSendable(rawTx == null ? Bytes.EMPTY : Bytes.wrap(rawTx));
+        if (check.refusal() != null) {
+            log.info("[rpc] eth_sendRawTransaction refused, nothing broadcast: " + check.refusal());
+            return io.myotis.api.SendResult.refused(check.refusal());
+        }
         RLPxConnector conn = connector;
-        if (conn == null || rawTx == null || rawTx.length == 0) return null;
+        if (conn == null) return io.myotis.api.SendResult.unavailable(null);
         try {
             int sent = conn.broadcastTransaction(rawTx);
-            if (sent == 0) return null;   // no peer reached → let the router report it
+            // no peer reached → let the router report it
+            if (sent == 0) return io.myotis.api.SendResult.unavailable(null);
             byte[] txHash = Hash.keccak256(Bytes.wrap(rawTx)).toArrayUnsafe();
             sentTxCache.put(Bytes.wrap(txHash).toHexString(), rawTx.clone());
-            recordPendingNonce(rawTx);
+            recordPendingNonce(check.tx());
             // Watch for this hash to come back over gossip (propagation confirmation), and record
             // the head block at broadcast so a late receipt poll can deep-scan back to where the
             // tx could first have been mined (see locateMinedTx) instead of only the recent window.
@@ -2838,10 +2862,10 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                     broadcastHead != null ? broadcastHead : -1L);
             log.info("[rpc] eth_sendRawTransaction broadcast to " + sent
                     + " peer(s), hash=" + Bytes.wrap(txHash).toHexString());
-            return txHash;
+            return io.myotis.api.SendResult.sent(txHash);
         } catch (Exception e) {
             log.info("[rpc] eth_sendRawTransaction failed: " + unwrap(e));
-            return null;
+            return io.myotis.api.SendResult.unavailable(null);
         }
     }
 
@@ -2867,12 +2891,6 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         }
     }
 
-    /** Record the (sender, nonce) of a tx we just broadcast so a follow-up
-     *  eth_getTransactionCount("pending") from that sender reports next = nonce + 1
-     *  instead of reusing this still-pending nonce. Decodes the sender from the signed
-     *  bytes (ECDSA recovery — our own tx, no trust involved). Keeps only the highest
-     *  nonce per sender; a malformed/undecodable tx is silently skipped (we already
-     *  broadcast it — the overlay is best-effort, not a gate). */
     // ---------------------------------------------------------------------
     // TxGossipObserver: watch our own broadcast txs propagate over gossip
     // ---------------------------------------------------------------------
@@ -2895,10 +2913,13 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         }
     }
 
-    private void recordPendingNonce(byte[] rawTx) {
+    /** Record the (sender, nonce) of a tx we just broadcast so a follow-up
+     *  eth_getTransactionCount("pending") from that sender reports next = nonce + 1
+     *  instead of reusing this still-pending nonce. Takes the transaction
+     *  {@link #rpcSendRawTransaction} already decoded, sender recovered (ECDSA recovery
+     *  — our own tx, no trust involved). Keeps only the highest nonce per sender. */
+    private void recordPendingNonce(EthTxDecoder.DecodedTx t) {
         try {
-            var t = com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.decode(Bytes.wrap(rawTx));
-            if (t == null || t.from() == null) return;
             String key = t.from().toHexString().toLowerCase();
             pendingNonces.record(key, t.nonce(), clock.elapsedMillis());
             log.info("[rpc] pending-nonce: " + key + " -> " + t.nonce() + " (broadcast)");

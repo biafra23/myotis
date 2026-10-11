@@ -115,18 +115,21 @@ class RpcAccessListResult private constructor(
  * on fresh verified state, the transaction can never be mined as sent, nothing
  * was broadcast, and [detail] is geth's txpool verdict ("insufficient funds for
  * gas * price + value: …", "nonce too low: …"), served verbatim under geth's
- * -32000 so wallets classify it. UNAVAILABLE keeps the retryable -32000 path.
+ * -32000 so wallets classify it. REFUSED (#360): the bytes are no transaction
+ * the engine relays — nothing was broadcast, and [detail] says why under the
+ * PERMANENT -32602. UNAVAILABLE keeps the retryable -32000 path.
  */
 class RpcSendResult private constructor(
     val kind: Kind,
     val txHash: ByteArray?,
     val detail: String?,
 ) {
-    enum class Kind { SENT, REJECTED, UNAVAILABLE }
+    enum class Kind { SENT, REJECTED, REFUSED, UNAVAILABLE }
 
     companion object {
         fun sent(txHash: ByteArray): RpcSendResult = RpcSendResult(Kind.SENT, txHash, null)
         fun rejected(detail: String): RpcSendResult = RpcSendResult(Kind.REJECTED, null, detail)
+        fun refused(detail: String): RpcSendResult = RpcSendResult(Kind.REFUSED, null, detail)
         fun unavailable(detail: String? = null): RpcSendResult = RpcSendResult(Kind.UNAVAILABLE, null, detail)
     }
 }
@@ -217,8 +220,9 @@ interface RpcBackend {
 
     /** [sendRawTransaction] with its outcome told apart (#531): an engine that
      *  judges a send before broadcasting it refuses one that can never be mined
-     *  as sent ([RpcSendResult.Kind.REJECTED], geth's reason). The default wraps
-     *  [sendRawTransaction]: a hash is SENT, null UNAVAILABLE. */
+     *  as sent ([RpcSendResult.Kind.REJECTED], geth's reason), and bytes that
+     *  are no transaction it relays ([RpcSendResult.Kind.REFUSED], #360). The
+     *  default wraps [sendRawTransaction]: a hash is SENT, null UNAVAILABLE. */
     fun sendRawTransactionDetailed(rawTx: ByteArray): RpcSendResult {
         val hash = sendRawTransaction(rawTx)
         return if (hash == null) RpcSendResult.unavailable() else RpcSendResult.sent(hash)

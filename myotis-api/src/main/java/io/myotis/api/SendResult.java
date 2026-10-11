@@ -16,9 +16,16 @@ package io.myotis.api;
  *       which hosts serve verbatim under geth's JSON-RPC -32000 so that wallets
  *       classify it (ethers v6 and viem: {@code INSUFFICIENT_FUNDS},
  *       {@code NONCE_EXPIRED}).</li>
- *   <li>{@link Status#UNAVAILABLE} — not sent now (not a transaction, no peer,
- *       the broadcast cut); retryable, hosts keep the existing -32000 mapping.
- *       {@code detail} may carry a diagnostic reason.</li>
+ *   <li>{@link Status#REFUSED} — the bytes are no transaction this node relays
+ *       (#360): they do not decode as one under a strict reading of their type,
+ *       their signature names no sender (or carries values a peer refuses), or
+ *       it is a blob transaction. Nothing was broadcast, and no retry changes
+ *       the bytes: hosts serve the PERMANENT JSON-RPC -32602 with
+ *       {@code detail}, never the retryable -32000 a client would spin on
+ *       (CLAUDE.md: a refusal is permanent).</li>
+ *   <li>{@link Status#UNAVAILABLE} — not sent now (no peer, the broadcast
+ *       cut); retryable, hosts keep the existing -32000 mapping. {@code detail}
+ *       may carry a diagnostic reason.</li>
  * </ul>
  * <p>Flat record over FFI-portable types ({@code byte[]}, {@code String}, an
  * enum) per the engine-contract rules; {@code txHash}/{@code detail} are null
@@ -29,12 +36,14 @@ public record SendResult(Status status, byte[] txHash, String detail) {
     public SendResult {
         java.util.Objects.requireNonNull(status, "status");
         // The fields the status promises: a SENT result without its hash, or a
-        // refusal without geth's reason, would reach the router as a crash.
+        // refusal without its reason, would reach the router as a crash.
         if (status == Status.SENT) java.util.Objects.requireNonNull(txHash, "txHash");
-        if (status == Status.REJECTED) java.util.Objects.requireNonNull(detail, "detail");
+        if (status == Status.REJECTED || status == Status.REFUSED) {
+            java.util.Objects.requireNonNull(detail, "detail");
+        }
     }
 
-    public enum Status { SENT, REJECTED, UNAVAILABLE }
+    public enum Status { SENT, REJECTED, REFUSED, UNAVAILABLE }
 
     public static SendResult sent(byte[] txHash) {
         return new SendResult(Status.SENT, txHash, null);
@@ -42,6 +51,10 @@ public record SendResult(Status status, byte[] txHash, String detail) {
 
     public static SendResult rejected(String detail) {
         return new SendResult(Status.REJECTED, null, detail);
+    }
+
+    public static SendResult refused(String detail) {
+        return new SendResult(Status.REFUSED, null, detail);
     }
 
     public static SendResult unavailable(String detail) {

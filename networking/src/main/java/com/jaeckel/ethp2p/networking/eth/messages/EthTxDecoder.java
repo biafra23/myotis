@@ -57,6 +57,219 @@ public final class EthTxDecoder {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // The eth_sendRawTransaction gate (#360): only a transaction is relayed.
+    // Twin of the Rust tx::decode_sendable — same rules, same words.
+    // ---------------------------------------------------------------------
+
+    /**
+     * The refusal of a blob transaction (type 0x3) — the words the transaction-object
+     * refusals use ({@code RpcTransactionArgs}, the Rust {@code myotis_evm::tx}). Its
+     * network form wraps the blobs around the transaction, and the eth protocol forbids
+     * pushing one in a {@code Transactions} message: geth drops the peer that does.
+     */
+    public static final String BLOB_SEND_REFUSAL =
+            "blob transactions (type 0x3) are not supported by this node";
+
+    /** secp256k1's group order n: a signature's r lies in [1, n). */
+    private static final BigInteger SECP256K1_N = new BigInteger(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16);
+
+    /** floor(n / 2): the ceiling EIP-2 puts on a transaction signature's s. */
+    private static final BigInteger SECP256K1_HALF_N = SECP256K1_N.shiftRight(1);
+
+    /**
+     * Raw bytes checked for relaying: the decoded transaction, or why the bytes are
+     * not one this node relays. Exactly one of the two is non-null.
+     */
+    public record SendCheck(DecodedTx tx, String refusal) {
+        static SendCheck refused(String why) {
+            return new SendCheck(null, why);
+        }
+    }
+
+    /**
+     * Whether the bytes posted to {@code eth_sendRawTransaction} are a transaction this
+     * node relays (#360): the decoded transaction, or why not, in words the hosts serve
+     * under the permanent -32602 — no retry changes the bytes.
+     * <ul>
+     *   <li>A legacy RLP list, or an EIP-2718 type this node relays (0x1, 0x2, 0x4); a
+     *       blob transaction is refused ({@link #BLOB_SEND_REFUSAL}).</li>
+     *   <li>Its type's exact field layout, strictly encoded: canonical RLP with nothing
+     *       trailing, integers without a leading zero byte and no wider than the
+     *       decoders read them (8 bytes for chain id, nonce, gas and v, 16 for a fee,
+     *       32 for value, r and s), the access list (and a set-code transaction's
+     *       authorization list) a list, {@code to} empty or an address — and a
+     *       set-code transaction's an address. Strict, so {@code keccak256(raw)} is the
+     *       hash of the transaction decoded — the one its peers compute — and never a
+     *       hash of whatever bytes were posted.</li>
+     *   <li>Signature values a peer accepts (geth's {@code ValidateSignatureValues}): v
+     *       27, 28 or EIP-155 for a legacy transaction, yParity 0 or 1 for a typed one,
+     *       0 &lt; r &lt; n, and 0 &lt; s &le; n/2 (EIP-2).</li>
+     *   <li>A sender the signature recovers.</li>
+     * </ul>
+     * Whether the transaction can be mined — fees, nonce, balance, chain — is not
+     * judged here: that is the peers' (and, on the Rust engine, a pre-broadcast check
+     * on verified state).
+     */
+    public static SendCheck checkSendable(Bytes raw) {
+        if (raw == null || raw.isEmpty()) return SendCheck.refused("invalid raw transaction: empty");
+        int first = raw.get(0) & 0xFF;
+        Layout layout;
+        if (first >= 0xc0) {
+            layout = Layout.LEGACY;
+        } else if (first == 1) {
+            layout = Layout.TYPE_1;
+        } else if (first == 2) {
+            layout = Layout.TYPE_2;
+        } else if (first == 4) {
+            layout = Layout.TYPE_4;
+        } else if (first == 3) {
+            return SendCheck.refused(BLOB_SEND_REFUSAL);
+        } else if (first <= 0x7f) {
+            // geth's words (ErrTxTypeNotSupported), then which type.
+            return SendCheck.refused("invalid raw transaction: transaction type not supported (0x"
+                    + Integer.toHexString(first) + ")");
+        } else {
+            return SendCheck.refused(
+                    "invalid raw transaction: neither an RLP list nor an EIP-2718 typed transaction");
+        }
+        String malformed = "invalid raw transaction: malformed " + layout.kind + " transaction";
+        java.util.List<Field> fields = strictFields(layout == Layout.LEGACY ? raw : raw.slice(1));
+        if (fields == null || !layout.admits(fields)) return SendCheck.refused(malformed);
+        if (layout == Layout.TYPE_4 && fields.get(layout.to).bytes().isEmpty()) {
+            return SendCheck.refused(
+                    "invalid raw transaction: a type 0x4 transaction cannot create a contract");
+        }
+        // Read from the fields BEFORE decoding: decode() takes a typed yParity through
+        // an int, so one past it would fail there as malformed, where the Rust gate (a
+        // u64) calls it an invalid signature value.
+        int n = fields.size();
+        BigInteger v = toBig(fields.get(n - 3).bytes());
+        BigInteger r = toBig(fields.get(n - 2).bytes());
+        BigInteger s = toBig(fields.get(n - 1).bytes());
+        boolean vValid = layout == Layout.LEGACY
+                ? v.equals(BigInteger.valueOf(27)) || v.equals(BigInteger.valueOf(28))
+                        || v.compareTo(BigInteger.valueOf(35)) >= 0
+                : v.compareTo(BigInteger.ONE) <= 0;
+        boolean rValid = r.signum() > 0 && r.compareTo(SECP256K1_N) < 0;
+        boolean sValid = s.signum() > 0 && s.compareTo(SECP256K1_HALF_N) <= 0;
+        if (!(vValid && rValid && sValid)) {
+            return SendCheck.refused("invalid transaction v, r, s values");
+        }
+        DecodedTx tx = decode(raw);
+        if (tx == null) return SendCheck.refused(malformed);
+        if (tx.from() == null) {
+            return SendCheck.refused("invalid sender: the signature recovers no address");
+        }
+        return new SendCheck(tx, null);
+    }
+
+    /** One top-level field of a transaction's RLP list: a list (kept as its encoding) or bytes. */
+    private record Field(boolean list, Bytes bytes) {}
+
+    /** How deep an RLP item may sit (the top-level list at 0) — the Rust decoder's
+     *  bound ({@code myotis_core::rlp} MAX_DEPTH), so both gates refuse the same nests,
+     *  and the walk below never recurses past it. */
+    private static final int MAX_RLP_DEPTH = 32;
+
+    /**
+     * The top-level fields of {@code payload} when it is ONE canonically encoded RLP list
+     * with nothing trailing, else null. Canonical by construction: the fields are
+     * re-encoded (nested lists through {@link #strictList}, which re-encodes them too) and
+     * must give back {@code payload} byte for byte — whatever the reader tolerated.
+     */
+    private static java.util.List<Field> strictFields(Bytes payload) {
+        try {
+            if (payload.isEmpty() || (payload.get(0) & 0xFF) < 0xc0) return null;
+            java.util.List<Field> fields = RLP.decodeList(payload, r -> {
+                java.util.List<Field> out = new java.util.ArrayList<>();
+                while (!r.isComplete()) {
+                    out.add(r.nextIsList() ? new Field(true, strictList(r, 2)) : new Field(false, r.readValue()));
+                }
+                return out;
+            });
+            Bytes reencoded = RLP.encodeList(w -> fields.forEach(f -> {
+                if (f.list()) w.writeRLP(f.bytes());
+                else w.writeValue(f.bytes());
+            }));
+            return reencoded.equals(payload) ? fields : null;
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** {@link #rawList} with the nesting bounded: the canonical encoding of the list at the
+     *  reader head, whose items sit at {@code depth}; one past {@link #MAX_RLP_DEPTH} throws. */
+    private static Bytes strictList(org.apache.tuweni.rlp.RLPReader reader, int depth) {
+        java.util.List<Bytes> children = new java.util.ArrayList<>();
+        reader.readList(inner -> {
+            while (!inner.isComplete()) {
+                if (depth > MAX_RLP_DEPTH) throw new IllegalArgumentException("RLP: nesting too deep");
+                children.add(inner.nextIsList()
+                        ? strictList(inner, depth + 1)
+                        : RLP.encodeValue(inner.readValue()));
+            }
+            return null;
+        });
+        return RLP.encodeList(w -> children.forEach(w::writeRLP));
+    }
+
+    /** A relayed type's field layout, as {@link #checkSendable} holds a transaction to it. */
+    private enum Layout {
+        // [nonce, gasPrice, gas, to, value, data, v, r, s]
+        LEGACY("legacy", 3, new int[] {1}, new int[] {}),
+        // [chainId, nonce, gasPrice, gas, to, value, data, accessList, yParity, r, s]
+        TYPE_1("type 0x1", 4, new int[] {2}, new int[] {7}),
+        // [chainId, nonce, maxPriority, maxFee, gas, to, value, data, accessList, yParity, r, s]
+        TYPE_2("type 0x2", 5, new int[] {2, 3}, new int[] {8}),
+        // TYPE_2's layout + [authorizationList] before the signature
+        TYPE_4("type 0x4", 5, new int[] {2, 3}, new int[] {8, 9});
+
+        final String kind;
+        /** Where {@code to} sits; value follows it, then data. */
+        final int to;
+        final int[] fees;
+        final int[] lists;
+
+        Layout(String kind, int to, int[] fees, int[] lists) {
+            this.kind = kind;
+            this.to = to;
+            this.fees = fees;
+            this.lists = lists;
+        }
+
+        /** The exact field count, lists where the layout has them, {@code to} empty or an
+         *  address, and every integer canonical and no wider than the decoders read it. */
+        boolean admits(java.util.List<Field> fields) {
+            // Every field but the lists is bytes; all but to, value and data are scalars,
+            // plus the trailing [v, r, s].
+            int count = to + 3 + lists.length + 3;
+            if (fields.size() != count) return false;
+            for (int i = 0; i < count; i++) {
+                Field f = fields.get(i);
+                boolean isList = contains(lists, i);
+                if (f.list() != isList) return false;
+                if (isList) continue;
+                Bytes b = f.bytes();
+                if (i == to) {
+                    if (b.size() != 0 && b.size() != 20) return false;
+                    continue;
+                }
+                if (i == to + 2) continue; // data: free-form bytes
+                if (!b.isEmpty() && b.get(0) == 0) return false; // integer with a leading zero
+                int width = i >= count - 2 || i == to + 1 ? 32 : contains(fees, i) ? 16 : 8;
+                if (b.size() > width) return false;
+            }
+            return true;
+        }
+
+        private static boolean contains(int[] xs, int x) {
+            for (int y : xs) if (y == x) return true;
+            return false;
+        }
+    }
+
     // legacy: rlp([nonce, gasPrice, gasLimit, to, value, data, v, r, s])
     private static DecodedTx decodeLegacy(Bytes raw) {
         return RLP.decodeList(raw, r -> {

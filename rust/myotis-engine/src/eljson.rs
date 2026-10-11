@@ -1990,7 +1990,8 @@ mod get_logs_json_tests {
 
     #[test]
     fn a_send_is_a_hash_or_geths_refusal() {
-        // The hosts' golden twins pin the same two shapes (#531, ABI 36).
+        // The hosts' golden twins pin the same three shapes (#531, ABI 36;
+        // #360, ABI 44).
         let sent: serde_json::Value = serde_json::from_str(&super::tx_hash_json(&[0xab; 32])).unwrap();
         assert_eq!(sent["txHash"], format!("0x{}", "ab".repeat(32)));
         assert!(sent.get("status").is_none(), "the success shape predates ABI 36 and is unchanged");
@@ -1999,5 +2000,10 @@ mod get_logs_json_tests {
         assert_eq!(rejected["status"], "rejected");
         assert_eq!(rejected["reason"], reason);
         assert!(rejected.get("txHash").is_none(), "nothing was sent");
+        // Bytes that are no transaction: the permanent envelope, verbatim.
+        assert_eq!(
+            super::invalid_params_json("invalid raw transaction: transaction type not supported (0x0)"),
+            r#"{"error":"invalid raw transaction: transaction type not supported (0x0)","code":-32602}"#
+        );
     }
 }

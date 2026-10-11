@@ -1041,6 +1041,18 @@ class RpcRouterTest {
         }
     }
 
+    @Test fun sendRawTransaction_refused_isPermanent32602() {
+        // #360: bytes that are no transaction — nothing broadcast, no hash, and
+        // the PERMANENT -32602: a retry cannot change the bytes.
+        val why = "invalid raw transaction: transaction type not supported (0x0)"
+        val resp = route(sending(io.myotis.api.SendResult.refused(why)),
+            """{"jsonrpc":"2.0","id":1,"method":"eth_sendRawTransaction","params":["0x00"]}""")
+        assertEquals(-32602, errorCode(resp))
+        val error = json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject
+        assertEquals("method 'eth_sendRawTransaction' refused: $why", error["message"]!!.jsonPrimitive.content)
+        assertTrue("result" !in json.parseToJsonElement(resp).jsonObject)
+    }
+
     @Test fun sendRawTransaction_unavailable_keepsTheStrictPath() {
         val resp = route(sending(io.myotis.api.SendResult.unavailable("no peer available to broadcast the transaction")),
             """{"jsonrpc":"2.0","id":1,"method":"eth_sendRawTransaction","params":["0x02aabb"]}""")

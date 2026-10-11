@@ -729,6 +729,21 @@ fn syncing_and_send() {
     );
     assert_eq!(error(&r, "eth_sendRawTransaction", json!(["0x"])).0, -32602);
 
+    // Bytes the engine will not relay because they are no transaction (#360,
+    // ABI 44): the permanent envelope, answered -32602 with its reason.
+    let r = Router::new(Fake::new().reply(
+        "send",
+        r#"{"error":"invalid raw transaction: transaction type not supported (0x0)","code":-32602}"#,
+    ));
+    let (code, msg, _) = error(&r, "eth_sendRawTransaction", json!(["0x00"]));
+    assert_eq!(
+        (code, msg.as_str()),
+        (
+            -32602,
+            "method 'eth_sendRawTransaction' refused: invalid raw transaction: transaction type not supported (0x0)"
+        )
+    );
+
     f = Fake::new().reply("send", &format!(r#"{{"txHash":"0x{}"}}"#, "ab".repeat(32)));
     f.status = r#"{"running":true,"beaconState":"CATCHING_UP"}"#.into();
     let r = Router::new(f);

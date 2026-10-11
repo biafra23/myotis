@@ -646,7 +646,7 @@ pub unsafe extern "C" fn myotis_fee_history_json(
     ))
 }
 
-/// Gossip a signed raw tx: `{"txHash":"0x…"}`, `{"status":"rejected","reason"}` (ABI ≥ 36: refused before broadcast, nothing sent; the reason is geth's txpool verdict) or `{"error": ...}`
+/// Gossip a signed raw tx: `{"txHash":"0x…"}`, `{"status":"rejected","reason"}` (ABI ≥ 36: refused before broadcast, nothing sent; the reason is geth's txpool verdict), `{"error","code":-32602}` (ABI ≥ 44: no transaction this node relays, nothing sent) or `{"error": ...}`
 /// (`nativeSendRawTransactionJson` twin).
 ///
 /// # Safety

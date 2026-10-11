@@ -2522,18 +2522,25 @@ pub fn get_block_by_hash_json(
 
 /// `nativeSendRawTransactionJson`: gossip a signed raw transaction to peers and
 /// return `{"txHash":"0x…"}` (keccak256 of the raw tx), or `{"error": "..."}` when
-/// no peer could be reached / the input isn't a plausible tx. A WRITE — the
-/// engine never signs. Since ABI 36, `{"status":"rejected","reason":"…"}` for a
-/// transaction its sender cannot pay for or whose nonce is used, judged on
-/// fresh verified state and never broadcast (#531): the reason is geth's
-/// txpool verdict, which hosts serve verbatim under geth's -32000. `raw_hex` is
-/// the 0x-hex raw tx.
+/// no peer could be reached. A WRITE — the engine never signs. Since ABI 36,
+/// `{"status":"rejected","reason":"…"}` for a transaction its sender cannot pay
+/// for or whose nonce is used, judged on fresh verified state and never
+/// broadcast (#531): the reason is geth's txpool verdict, which hosts serve
+/// verbatim under geth's -32000. Since ABI 44, the permanent
+/// `{"error","code":-32602}` envelope ([`eljson::invalid_params_json`]) for
+/// bytes that are no transaction this node relays — undecodable, no sender, a
+/// blob transaction — never broadcast either (#360). `raw_hex` is the 0x-hex
+/// raw tx.
 pub fn send_raw_transaction_json(handle: i64, raw_hex: &str) -> String {
     let Some(raw) = parse_hex_bytes(raw_hex) else {
         return eljson::error_json("invalid raw transaction hex");
     };
-    if raw.is_empty() {
-        return eljson::error_json("empty raw transaction");
+    // Judged on the bytes alone (#360), BEFORE the engine is asked whether it
+    // is up: a paused or starting node must not turn the permanent refusal of
+    // bytes that are no transaction into a retryable "unavailable". The reader
+    // checks again (its own callers need the gate too); the decode is cheap.
+    if let Err(reason) = myotis_net::el::tx::decode_sendable(&raw) {
+        return eljson::invalid_params_json(&reason);
     }
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
@@ -2545,6 +2552,7 @@ pub fn send_raw_transaction_json(handle: i64, raw_hex: &str) -> String {
     use myotis_net::el::reader::SendError;
     match engine.rt.block_on(reader.request(async { Ok(reader.send_raw_transaction(&raw).await) })) {
         Ok(Ok(hash)) => eljson::tx_hash_json(&hash),
+        Ok(Err(SendError::Refused(reason))) => eljson::invalid_params_json(&reason),
         Ok(Err(SendError::Rejected(reason))) => eljson::send_rejected_json(&reason),
         Ok(Err(SendError::Unavailable(e))) | Err(e) => eljson::error_json(&e),
     }
@@ -5266,6 +5274,32 @@ mod log_index_json_tests {
         // kind of overcount this PR's fix closed for the single-entry case,
         // reopened the moment a second, incomplete entry exists.
         assert!(s.contains("\"blocksRemaining\":5"), "{s}");
+    }
+}
+
+#[cfg(test)]
+mod send_gate_tests {
+    use super::send_raw_transaction_json;
+
+    #[test]
+    fn bytes_that_are_no_transaction_are_refused_whatever_the_engine_state() {
+        // #360: judged on the bytes before any engine or handle is looked up —
+        // a handle that does not exist (as for a paused or starting node)
+        // still gets the permanent refusal, never a retryable "unavailable".
+        assert_eq!(
+            send_raw_transaction_json(-1, "0x00"),
+            r#"{"error":"invalid raw transaction: transaction type not supported (0x0)","code":-32602}"#
+        );
+        assert_eq!(
+            send_raw_transaction_json(-1, "0x"),
+            r#"{"error":"invalid raw transaction: empty","code":-32602}"#
+        );
+        // A real transaction gets past the gate, to the readiness checks.
+        let spec = "0xf86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a7\
+                    6400008025a028ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276a0\
+                    67cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83";
+        let out: serde_json::Value = serde_json::from_str(&send_raw_transaction_json(-1, spec)).unwrap();
+        assert!(out.get("error").is_some() && out.get("code").is_none(), "{out}");
     }
 }
 
