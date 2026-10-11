@@ -875,9 +875,72 @@ impl AppendStall {
 /// holds (gossip sightings) — see `ElReader::sent_tx_watch`.
 struct SentTxState {
     pending_nonces: crate::el::sent_tx::PendingNonceTracker,
-    /// Raw broadcast bytes by tx hash — what a rebroadcast re-pushes.
-    bytes: myotis_evm::Lru<[u8; 32], Vec<u8>>,
+    /// Our broadcasts by tx hash — what a rebroadcast re-pushes.
+    bytes: myotis_evm::Lru<[u8; 32], SentTx>,
+    /// Tor rebroadcast rounds so far: each starts that many candidate sets
+    /// into the pool ([`rotated_take`]), so it reaches peers the send and
+    /// the rounds before it did not.
+    #[cfg(feature = "tor")]
+    tor_rounds: usize,
+    /// Set while a Tor rebroadcast round runs ([`TorRebroadcastGuard`]).
+    #[cfg(feature = "tor")]
+    tor_rebroadcast_busy: Arc<std::sync::atomic::AtomicBool>,
     last_rebroadcast: std::time::Instant,
+}
+
+/// One of the wallet's own broadcasts, as a rebroadcast re-pushes it.
+#[derive(Clone)]
+struct SentTx {
+    raw: Vec<u8>,
+    /// Whether it went out over Tor: then it never leaves from the real IP
+    /// ([`rebroadcast_route`]).
+    via_tor: bool,
+}
+
+/// Which way a rebroadcast of one of our sends goes (docs/privacy-and-tor.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebroadcastRoute {
+    Tor,
+    Clearnet,
+    Skip,
+}
+
+/// Over Tor while Tor mode is on, whichever way the send first went (a
+/// clearnet send re-pushed over Tor reveals nothing new); in the clear only a
+/// send that first went in the clear. A send that went over Tor is never
+/// pushed from the real IP: after Tor mode is turned off within its watch, it
+/// is not rebroadcast at all.
+fn rebroadcast_route(tor_on: bool, sent_via_tor: bool) -> RebroadcastRoute {
+    match (tor_on, sent_via_tor) {
+        (true, _) => RebroadcastRoute::Tor,
+        (false, false) => RebroadcastRoute::Clearnet,
+        (false, true) => RebroadcastRoute::Skip,
+    }
+}
+
+/// Whether Tor mode is on (always off without the `tor` feature).
+fn tor_routing_on() -> bool {
+    #[cfg(feature = "tor")]
+    {
+        crate::el::tor::is_enabled()
+    }
+    #[cfg(not(feature = "tor"))]
+    {
+        false
+    }
+}
+
+#[cfg(test)]
+mod rebroadcast_route_tests {
+    use super::*;
+
+    #[test]
+    fn a_send_that_went_over_tor_never_leaves_from_the_real_ip() {
+        assert_eq!(rebroadcast_route(true, true), RebroadcastRoute::Tor);
+        assert_eq!(rebroadcast_route(true, false), RebroadcastRoute::Tor);
+        assert_eq!(rebroadcast_route(false, false), RebroadcastRoute::Clearnet);
+        assert_eq!(rebroadcast_route(false, true), RebroadcastRoute::Skip);
+    }
 }
 
 /// Why an unwatch is not done (see [`ElReader::unwatch_log_index`]).
@@ -1176,6 +1239,235 @@ where
     false
 }
 
+/// The first `n` of `items`, starting `offset` into them and wrapping — how
+/// successive Tor rebroadcasts walk on through the pool instead of re-pushing
+/// to the same peers.
+#[cfg(any(test, feature = "tor"))]
+fn rotated_take<T: Clone>(items: &[T], offset: usize, n: usize) -> Vec<T> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    items.iter().cycle().skip(offset % items.len()).take(n.min(items.len())).cloned().collect()
+}
+
+/// The peers a Tor read or send dials: up to [`TOR_MAX_CANDIDATES`] of the
+/// peers the clearnet pool validated, by IDENTITY only — address and node
+/// key; the dial itself is a fresh Tor stream with an ephemeral key —
+/// starting `offset` into the pool's order.
+///
+/// KNOWN LIMITATION (docs §5, §6.3): these are peers we hold a LIVE clearnet
+/// connection to, so the peer a Tor read or send reaches simultaneously sees
+/// our real IP, and can pair the two by timing and by the `myotis/<version>`
+/// client id both sessions' Hello carries — outright while it sees one Myotis
+/// node. The quarantined, aged Tor pool of §5 is the fix for the first, and
+/// replaces this one function; the second waits on the owner's choice of a
+/// Tor-side client id.
+#[cfg(feature = "tor")]
+fn tor_candidates(peers: &[Arc<ManagedPeer>], offset: usize) -> Vec<(std::net::SocketAddr, [u8; 64])> {
+    rotated_take(peers, offset, TOR_MAX_CANDIDATES)
+        .iter()
+        .map(|p| (p.addr(), p.peer_pubkey()))
+        .collect()
+}
+
+/// How a Tor broadcast went ([`tor_broadcast`]).
+#[cfg(any(test, feature = "tor"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TorBroadcast {
+    /// Peers tried.
+    tried: usize,
+    /// Whether a peer's Pong confirmed reading the push; `false` means a push
+    /// landed on a stream but no Pong came — the transaction may be out.
+    confirmed: bool,
+}
+
+/// Push `raw` over Tor (docs/privacy-and-tor.md §4) to every one of
+/// `targets` at once (from [`tor_candidates`]), each push its own Tor stream
+/// with a fresh ephemeral RLPx key, all under ONE isolation token fresh to
+/// this call: whatever circuits carry them carry nothing else — no other
+/// send, no read. Answers once the first push is confirmed by its peer's
+/// Pong ([`crate::el::eth::session::EthSession::await_pong`]); the others
+/// run on for [`TOR_BROADCAST_GRACE`] and are then cut.
+///
+/// With no Pong at all, a push that LANDED still counts — the transaction may
+/// be out, and telling the wallet it was not would invite a conflicting
+/// re-sign — so it answers unconfirmed; only when no push landed is it an
+/// error. Never a clearnet send, either way.
+#[cfg(feature = "tor")]
+async fn tor_broadcast(
+    targets: Vec<(std::net::SocketAddr, [u8; 64])>,
+    eth_cfg: &Arc<EthConfig>,
+    raw: &Arc<[u8]>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<TorBroadcast, String> {
+    let isolation = arti_client::IsolationToken::new();
+    let (eth_cfg, raw) = (Arc::clone(eth_cfg), Arc::clone(raw));
+    broadcast_pushes(targets, shutdown, move |addr, pubkey, written| {
+        let (eth_cfg, raw) = (Arc::clone(&eth_cfg), Arc::clone(&raw));
+        async move {
+            crate::el::tor::push_transaction(isolation, addr, pubkey, &eth_cfg, &raw, &written).await
+        }
+    })
+    .await
+}
+
+/// [`tor_broadcast`]'s verdict, with the push injected: `push(addr, pubkey,
+/// written)` pushes to one target and sets `written` once its frame landed.
+/// Every push runs at once, each bounded by [`TOR_PUSH_DEADLINE`]; answers
+/// confirmed at the first `Ok`, unconfirmed when none was but a push landed,
+/// and an error otherwise — "cut" when a pause or stop ended it.
+#[cfg(any(test, feature = "tor"))]
+async fn broadcast_pushes<F, Fut>(
+    targets: Vec<(std::net::SocketAddr, [u8; 64])>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    push: F,
+) -> Result<TorBroadcast, String>
+where
+    F: Fn(std::net::SocketAddr, [u8; 64], Arc<std::sync::atomic::AtomicBool>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
+    if targets.is_empty() {
+        return Err("tor: no clearnet-validated peer to push the transaction to over Tor (fail-closed)".into());
+    }
+    let tried = targets.len();
+    let written = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let last_err = Arc::new(std::sync::Mutex::new(String::new()));
+    let pushes = targets.into_iter().map(|(addr, pubkey)| {
+        let attempt = push(addr, pubkey, Arc::clone(&written));
+        let last_err = Arc::clone(&last_err);
+        async move {
+            let result = tokio::time::timeout(TOR_PUSH_DEADLINE, attempt)
+                .await
+                .unwrap_or_else(|_| Err(format!("tor push to {addr} exceeded its budget")));
+            match &result {
+                Ok(()) => tracing::debug!(peer = %addr, "tor: transaction push confirmed"),
+                Err(e) => {
+                    tracing::debug!(peer = %addr, error = %e, "tor: transaction push failed");
+                    *last_err.lock().unwrap_or_else(|p| p.into_inner()) = e.clone();
+                }
+            }
+            result
+        }
+    });
+    if first_accepted(pushes, TOR_BROADCAST_GRACE, shutdown.clone()).await {
+        return Ok(TorBroadcast { tried, confirmed: true });
+    }
+    if written.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(TorBroadcast { tried, confirmed: false });
+    }
+    if *shutdown.borrow() {
+        return Err("transaction broadcast cut: the node is pausing or stopping".to_string());
+    }
+    let last = last_err.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    Err(format!("tor: no peer took the transaction over Tor (fail-closed): {last}"))
+}
+
+#[cfg(test)]
+mod broadcast_pushes_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn targets(n: u8) -> Vec<(std::net::SocketAddr, [u8; 64])> {
+        (0..n).map(|i| (std::net::SocketAddr::from(([10, 0, 0, i], 30303)), [i; 64])).collect()
+    }
+
+    fn running() -> tokio::sync::watch::Receiver<bool> {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        std::mem::forget(tx); // the sender lives on: no shutdown
+        rx
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_first_pong_answers_confirmed() {
+        let sent = broadcast_pushes(targets(3), running(), |addr, _, written: Arc<AtomicBool>| async move {
+            written.store(true, Ordering::SeqCst);
+            if addr.port() == 30303 && addr.ip().to_string().ends_with(".1") {
+                Ok(())
+            } else {
+                std::future::pending().await
+            }
+        })
+        .await;
+        assert_eq!(sent, Ok(TorBroadcast { tried: 3, confirmed: true }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_push_that_landed_without_a_pong_still_counts_as_sent() {
+        let sent = broadcast_pushes(targets(2), running(), |_, _, written: Arc<AtomicBool>| async move {
+            written.store(true, Ordering::SeqCst);
+            Err("timed out awaiting the peer's Pong".to_string())
+        })
+        .await;
+        assert_eq!(sent, Ok(TorBroadcast { tried: 2, confirmed: false }));
+        // So does one whose Pong never came within the push budget.
+        let sent = broadcast_pushes(targets(1), running(), |_, _, written: Arc<AtomicBool>| async move {
+            written.store(true, Ordering::SeqCst);
+            std::future::pending().await
+        })
+        .await;
+        assert_eq!(sent, Ok(TorBroadcast { tried: 1, confirmed: false }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_landed_is_an_error_and_a_stop_says_it_cut_the_send() {
+        let err = broadcast_pushes(targets(2), running(), |_, _, _| async {
+            Err("tor eth handshake to 10.0.0.0:30303: refused".to_string())
+        })
+        .await
+        .unwrap_err();
+        assert!(err.contains("no peer took") && err.contains("refused"), "{err}");
+        let (_stop, stopped) = tokio::sync::watch::channel(true);
+        let err = broadcast_pushes(targets(2), stopped, |_, _, _| std::future::pending())
+            .await
+            .unwrap_err();
+        assert!(err.contains("cut"), "{err}");
+        let err = broadcast_pushes(Vec::new(), running(), |_, _, _| async { Ok(()) }).await.unwrap_err();
+        assert!(err.contains("fail-closed"), "{err}");
+    }
+}
+
+/// One Tor rebroadcast round at a time per reader (one network): a round
+/// pushes each pending send in turn and can outlast the sweep interval many
+/// times over when pushes keep failing, so a sweep that finds one still
+/// running leaves its Tor sends for the next. The flag lives in
+/// [`SentTxState`]; the guard clears it on drop. The round's last broadcast
+/// may leave pushes running on for [`TOR_BROADCAST_GRACE`] after that.
+#[cfg(feature = "tor")]
+struct TorRebroadcastGuard(Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(feature = "tor")]
+impl TorRebroadcastGuard {
+    fn claim(busy: &Arc<std::sync::atomic::AtomicBool>) -> Option<TorRebroadcastGuard> {
+        use std::sync::atomic::Ordering;
+        busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| TorRebroadcastGuard(Arc::clone(busy)))
+    }
+}
+
+#[cfg(feature = "tor")]
+impl Drop for TorRebroadcastGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod rotated_take_tests {
+    use super::rotated_take;
+
+    #[test]
+    fn walks_on_through_the_items_and_wraps() {
+        let items = [1, 2, 3, 4, 5, 6, 7];
+        assert_eq!(rotated_take(&items, 0, 5), vec![1, 2, 3, 4, 5]);
+        assert_eq!(rotated_take(&items, 5, 5), vec![6, 7, 1, 2, 3]);
+        assert_eq!(rotated_take(&items, 10, 5), vec![4, 5, 6, 7, 1]);
+        // Never more than there are, never the same item twice.
+        assert_eq!(rotated_take(&items[..3], 1, 5), vec![2, 3, 1]);
+        assert!(rotated_take::<u8>(&[], 3, 5).is_empty());
+    }
+}
+
 /// Race `make(peer)` across `peers` with hedging: start the first, and every
 /// `delay` without an answer start one more (up to [`MAX_HEDGED_ATTEMPTS`] in
 /// flight), stopping at the first result `accept` approves. A slow peer keeps
@@ -1377,6 +1669,16 @@ fn race_served_by_winner<T>(out: &RaceOutcome<T>, served: impl Fn(&T) -> bool) -
 const TOR_MAX_CANDIDATES: usize = 5;
 #[cfg(feature = "tor")]
 const TOR_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Tor broadcast bounds ([`tor_broadcast`]): one push — a fresh Tor stream,
+/// the RLPx + eth handshakes, the push and its Pong — is bounded on its own,
+/// well inside the host request budget, so the wallet's send gets an answer.
+/// Once a push is confirmed the others run on for the grace (more peers
+/// holding the transaction) and are then cut.
+#[cfg(any(test, feature = "tor"))]
+const TOR_PUSH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(any(test, feature = "tor"))]
+const TOR_BROADCAST_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// `eth_feeHistory` block-count clamp (the Java `FEE_HISTORY_MAX_BLOCKS`) —
 /// each block with reward percentiles costs a verified body + receipts fetch.
@@ -1941,6 +2243,10 @@ impl ElReader {
             sent_txs: std::sync::Mutex::new(SentTxState {
                 pending_nonces: crate::el::sent_tx::PendingNonceTracker::new(),
                 bytes: myotis_evm::Lru::new(SENT_TX_CACHE_MAX),
+                #[cfg(feature = "tor")]
+                tor_rounds: 0,
+                #[cfg(feature = "tor")]
+                tor_rebroadcast_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 last_rebroadcast: std::time::Instant::now(),
             }),
             sent_tx_watch,
@@ -5248,6 +5554,7 @@ impl ElReader {
         #[cfg(feature = "tor")]
         if crate::el::tor::is_enabled() {
             if anchor == ReadAnchor::Finalized {
+                tracing::info!("tor: account read refused — finalized reads are not routed over Tor");
                 return Err("finalized state reads are not routed over Tor (head only)".to_string());
             }
             return self.get_account_over_tor(address).await;
@@ -5693,18 +6000,15 @@ impl ElReader {
         // slow and many peers reject Tor-exit inbound, so cap the candidates AND
         // the whole read, or one balance query could hang the FFI call for minutes
         // (a bad-exit walk); fail-closed on the deadline.
-        let candidates: Vec<(std::net::SocketAddr, [u8; 64])> = self
-            .pool
-            .snap_peers()
-            .await
-            .iter()
-            .take(TOR_MAX_CANDIDATES)
-            .map(|p| (p.addr(), p.peer_pubkey()))
-            .collect();
+        let candidates = tor_candidates(&self.pool.snap_peers().await, 0);
         if candidates.is_empty() {
+            tracing::info!("tor: account read failed — no peer to dial over Tor");
             return Err("tor: no clearnet-validated snap peer to dial over Tor (fail-closed)".into());
         }
-        let deadline = tokio::time::Instant::now() + TOR_READ_DEADLINE;
+        // One log line per Tor read, served or failed — never naming the
+        // address read (the log is exportable).
+        let read_started = tokio::time::Instant::now();
+        let deadline = read_started + TOR_READ_DEADLINE;
         let mut fallback: Option<VerifiedAccount> = None;
         let mut last_err = String::new();
         for (addr, pubkey) in candidates {
@@ -5742,6 +6046,13 @@ impl ElReader {
                                 snap_elapsed,
                             );
                         }
+                        tracing::info!(
+                            peer = %addr,
+                            ms = read_started.elapsed().as_millis() as u64,
+                            verified = result.verify_method.unwrap_or("no"),
+                            reason = result.fail_reason.unwrap_or("none"),
+                            "tor: account read served over Tor"
+                        );
                         return Ok(result);
                     }
                     fallback.get_or_insert(result);
@@ -5750,9 +6061,17 @@ impl ElReader {
                 Err(_) => last_err = format!("tor dial to {addr} exceeded the read budget"),
             }
         }
-        fallback.map(Ok).unwrap_or_else(|| {
-            Err(format!("tor: all snap-peer dials failed to serve a verifiable account: {last_err}"))
-        })
+        let ms = read_started.elapsed().as_millis() as u64;
+        match fallback {
+            Some(result) => {
+                tracing::info!(ms, reason = result.fail_reason.unwrap_or("unknown"), "tor: account read over Tor unverified");
+                Ok(result)
+            }
+            None => {
+                tracing::info!(ms, error = %last_err, "tor: account read over Tor failed");
+                Err(format!("tor: all snap-peer dials failed to serve a verifiable account: {last_err}"))
+            }
+        }
     }
 
     /// One account fetch + beacon verdict over an already-connected Tor
@@ -7594,6 +7913,43 @@ impl ElReader {
             tracing::info!(tx = %tx_hash, reason, "transaction not broadcast");
             SendError::Unavailable(reason.to_string())
         };
+        // Tor mode (docs/privacy-and-tor.md §4): the broadcast leaves over Tor
+        // or not at all — never from the real IP as a fallback.
+        #[cfg(feature = "tor")]
+        if crate::el::tor::is_enabled() {
+            let targets = tor_candidates(&self.pool.snap_peers().await, 0);
+            let raw = std::sync::Arc::<[u8]>::from(raw_tx);
+            let shutdown = self.request_shutdown.subscribe();
+            return match tor_broadcast(targets, &self.eth_cfg, &raw, shutdown).await {
+                Ok(sent) => {
+                    tracing::info!(
+                        tx = %tx_hash,
+                        tried = sent.tried,
+                        confirmed = sent.confirmed,
+                        "tor: transaction sent over Tor"
+                    );
+                    self.record_sent(hash, raw_tx, summary.as_ref(), true);
+                    Ok(hash)
+                }
+                Err(e) => {
+                    // This line is the send's one log line (not_broadcast's too).
+                    tracing::info!(tx = %tx_hash, error = %e, "tor: transaction send over Tor failed");
+                    Err(SendError::Unavailable(e))
+                }
+            };
+        }
+        // A transaction that went over Tor and is re-submitted with Tor mode
+        // off (wallets re-send what stays pending) is answered with its hash
+        // and NOT pushed from the real IP: it is already out, and a clearnet
+        // push would link it to this IP after all — rebroadcast_route keeps
+        // the same promise for the engine's own rebroadcasts. Holds while its
+        // bytes are cached (SENT_TX_CACHE_MAX sends).
+        let sent_via_tor =
+            matches!(self.sent_txs.lock().unwrap().bytes.get(&hash), Some(SentTx { via_tor: true, .. }));
+        if sent_via_tor {
+            tracing::info!(tx = %tx_hash, "tor: transaction already sent over Tor; not pushed from the real IP");
+            return Ok(hash);
+        }
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
             return Err(not_broadcast("no peer available to broadcast the transaction"));
@@ -7623,6 +7979,13 @@ impl ElReader {
             return Err(not_broadcast("no peer accepted the transaction broadcast"));
         }
         tracing::info!(tx = %tx_hash, peers = peers.len(), "transaction broadcast");
+        self.record_sent(hash, raw_tx, summary.as_ref(), false);
+        Ok(hash)
+    }
+
+    /// Book a broadcast that went out (`via_tor`: over Tor) into the sent-tx
+    /// state the rebroadcast, the pending nonce and the receipt scan read.
+    fn record_sent(&self, hash: [u8; 32], raw_tx: &[u8], summary: Option<&TxSummary>, via_tor: bool) {
         // The sent-tx watch (the Java rpcSendRawTransaction tail, mirrored):
         // cache the bytes for rebroadcast, record the sender's pending nonce
         // (best-effort — an undecodable/senderless tx is silently skipped),
@@ -7636,15 +7999,20 @@ impl ElReader {
         };
         {
             let mut st = self.sent_txs.lock().unwrap();
-            st.bytes.put(hash, raw_tx.to_vec());
-            if let Some(t) = &summary {
+            st.bytes.put(hash, SentTx { raw: raw_tx.to_vec(), via_tor });
+            // A Tor send's first rebroadcast waits a full interval: the
+            // wallet's first poll would otherwise push it to a second set of
+            // peers within seconds, on a fresh circuit.
+            if via_tor {
+                st.last_rebroadcast = now;
+            }
+            if let Some(t) = summary {
                 if let Some(from) = t.from {
                     st.pending_nonces.record(from, t.nonce, now);
                 }
             }
         }
         self.sent_tx_watch.lock().unwrap().watch(hash, now, broadcast_head);
-        Ok(hash)
     }
 
     /// Judge a send before it is broadcast (#531): [`PreBroadcast::Doomed`]
@@ -7758,7 +8126,7 @@ impl ElReader {
             (watch.unseen(), dropped)
         };
         crate::el::sent_tx::log_unseen_expiries(&dropped);
-        let work: Vec<Vec<u8>> = {
+        let work: Vec<SentTx> = {
             let mut st = self.sent_txs.lock().unwrap();
             if now.saturating_duration_since(st.last_rebroadcast) < TX_REBROADCAST_INTERVAL {
                 return;
@@ -7770,17 +8138,38 @@ impl ElReader {
                 .filter_map(|h| st.bytes.get(h).cloned())
                 .collect()
         };
-        if work.is_empty() {
-            return;
+        // Each send's route: over Tor while Tor mode is on, in the clear only
+        // what first went in the clear (rebroadcast_route).
+        let tor_on = tor_routing_on();
+        let (mut clear, mut over_tor) = (Vec::new(), Vec::new());
+        for sent in work {
+            match rebroadcast_route(tor_on, sent.via_tor) {
+                RebroadcastRoute::Clearnet => clear.push(sent.raw),
+                RebroadcastRoute::Tor => over_tor.push(sent.raw),
+                RebroadcastRoute::Skip => {}
+            }
         }
+        if !clear.is_empty() {
+            self.rebroadcast_in_the_clear(clear).await;
+        }
+        #[cfg(feature = "tor")]
+        if !over_tor.is_empty() {
+            self.rebroadcast_over_tor(over_tor).await;
+        }
+        #[cfg(not(feature = "tor"))]
+        drop(over_tor);
+    }
+
+    /// The clearnet half of [`Self::maybe_rebroadcast_sent_txs`]: every pool
+    /// peer, every send. DETACHED, like the Java warmer thread: the wallet's
+    /// receipt poll carries the trigger but must never wait on the pushes — a
+    /// wedged peer (writer lock held, full send buffer) would otherwise freeze
+    /// the confirm loop. Bounded per write; peers are owned Arcs.
+    async fn rebroadcast_in_the_clear(&self, work: Vec<Vec<u8>>) {
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
             return;
         }
-        // DETACHED, like the Java warmer thread: the wallet's receipt poll
-        // carries the trigger but must never wait on the pushes — a wedged
-        // peer (writer lock held, full send buffer) would otherwise freeze
-        // the confirm loop. Bounded per write; peers are owned Arcs.
         tokio::spawn(async move {
             let count = work.len();
             for raw in work {
@@ -7790,6 +8179,38 @@ impl ElReader {
                 futures::future::join_all(sends).await;
             }
             tracing::debug!("rebroadcast {} sent tx(s) to {} peer(s)", count, peers.len());
+        });
+    }
+
+    /// The Tor half of [`Self::maybe_rebroadcast_sent_txs`]: one round at a
+    /// time ([`TorRebroadcastGuard`]), each send a [`tor_broadcast`] of its
+    /// own to the next peers in the pool ([`SentTxState::tor_rounds`]),
+    /// detached like the clearnet half.
+    #[cfg(feature = "tor")]
+    async fn rebroadcast_over_tor(&self, work: Vec<Vec<u8>>) {
+        let (guard, round) = {
+            let mut st = self.sent_txs.lock().unwrap();
+            let Some(guard) = TorRebroadcastGuard::claim(&st.tor_rebroadcast_busy) else {
+                return; // a round is still running; the next sweep retries
+            };
+            st.tor_rounds = st.tor_rounds.wrapping_add(1);
+            (guard, st.tor_rounds)
+        };
+        // Only the targets go into the task, not the pool's peer handles.
+        let targets = tor_candidates(&self.pool.snap_peers().await, round.wrapping_mul(TOR_MAX_CANDIDATES));
+        if targets.is_empty() {
+            return;
+        }
+        let (eth_cfg, shutdown) = (Arc::clone(&self.eth_cfg), self.request_shutdown.subscribe());
+        tokio::spawn(async move {
+            let _guard = guard;
+            for raw in work {
+                let raw = std::sync::Arc::<[u8]>::from(raw);
+                match tor_broadcast(targets.clone(), &eth_cfg, &raw, shutdown.clone()).await {
+                    Ok(sent) => tracing::debug!(confirmed = sent.confirmed, "rebroadcast a sent tx over Tor"),
+                    Err(e) => tracing::debug!(error = %e, "Tor rebroadcast of a sent tx failed"),
+                }
+            }
         });
     }
 
@@ -7881,7 +8302,7 @@ impl ElReader {
             Ok(v) => v,
             Err(e) => {
                 let mut st = self.sent_txs.lock().unwrap();
-                if let Some(raw) = st.bytes.get(&tx_hash) {
+                if let Some(SentTx { raw, .. }) = st.bytes.get(&tx_hash) {
                     let tx = tx::decode_summary(raw)
                         .ok_or("own sent tx cached but cannot be decoded")?;
                     return Ok(TxLookup::Pending { tx_hash, tx });
@@ -7894,7 +8315,7 @@ impl ElReader {
             // pending shape from the cached bytes (the Java sentTxCache path):
             // the wallet sees its tx exists while it awaits inclusion.
             let mut st = self.sent_txs.lock().unwrap();
-            if let Some(raw) = st.bytes.get(&tx_hash) {
+            if let Some(SentTx { raw, .. }) = st.bytes.get(&tx_hash) {
                 let tx = tx::decode_summary(raw)
                     .ok_or("own sent tx cached but cannot be decoded")?;
                 return Ok(TxLookup::Pending { tx_hash, tx });
@@ -16558,6 +16979,23 @@ mod pre_broadcast_tests {
                 Err(SendError::Unavailable("no peer available to broadcast the transaction".to_string()))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_tor_sent_transaction_is_not_pushed_in_the_clear_when_re_submitted() {
+        // Tor mode is off (no test turns it on); the offline reader has no peer.
+        let reader = offline_reader(Some(now_unix() - 5)).await;
+        let raw = spec_tx();
+        let hash = keccak256(&raw);
+        reader.sent_txs.lock().unwrap().bytes.put(hash, SentTx { raw: raw.clone(), via_tor: true });
+        // Answered with its hash, without reaching for a peer to push to ...
+        assert_eq!(reader.send_judged(&raw, tx::decode_summary(&raw), PreBroadcast::Passed).await, Ok(hash));
+        // ... while a clearnet-sent one goes on to the broadcast as before.
+        reader.sent_txs.lock().unwrap().bytes.put(hash, SentTx { raw: raw.clone(), via_tor: false });
+        assert_eq!(
+            reader.send_judged(&raw, tx::decode_summary(&raw), PreBroadcast::Passed).await,
+            Err(SendError::Unavailable("no peer available to broadcast the transaction".to_string()))
+        );
     }
 
     #[test]
