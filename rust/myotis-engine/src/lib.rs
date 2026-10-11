@@ -272,7 +272,17 @@ uniffi::setup_scaffolding!();
 ///      `IosRpcBackend` read the envelope as a REFUSED send, which the hosts
 ///      answer -32602; myotis-rpcd and the Node addon already treat the
 ///      envelope so.
-pub const ABI_VERSION: i32 = 44;
+/// v45: added check_raw_transaction_json / myotis_check_raw_transaction_json
+///      (UniFFI and the C ABI): v44's send gate on the bytes alone, with no
+///      handle — `{"ok":true}` or the same permanent envelope. Hosts call it
+///      before their readiness hold, so a starting or paused node answers bytes
+///      that are no transaction with -32602 at once, never after the hold or as
+///      a retryable "not ready": the JVM `RustChainHandle` before its wake wait,
+///      the iOS `IosRpcBackend` before its handle lookup, myotis-rpcd before
+///      its `--ready-wait` hold. An additive function —
+///      bumped so a host that calls it is never paired with an engine that
+///      lacks it.
+pub const ABI_VERSION: i32 = 45;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

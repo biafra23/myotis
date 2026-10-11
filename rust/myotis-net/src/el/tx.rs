@@ -755,7 +755,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // decode_sendable: the eth_sendRawTransaction gate (#360). The Java
-    // EthTxDecoderTest checks the same cases against checkSendable.
+    // EthTxSendCheckTest checks the same cases against checkSendable.
     // -----------------------------------------------------------------------
 
     /// The EIP-155 spec example (see eip155_spec_vector_recovers_the_sender).

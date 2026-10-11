@@ -2558,6 +2558,25 @@ pub fn send_raw_transaction_json(handle: i64, raw_hex: &str) -> String {
     }
 }
 
+/// `nativeCheckRawTransactionJson` (ABI 45): the `eth_sendRawTransaction` gate
+/// (#360) on the bytes alone — no handle, no engine, no wait. `{"ok":true}` when
+/// they are a transaction this node relays, the permanent
+/// `{"error","code":-32602}` envelope ([`eljson::invalid_params_json`]) when they
+/// are not, and `{"error": ...}` for hex that does not parse. Hosts call it
+/// BEFORE their readiness hold — the JVM `RustChainHandle` before its wake wait,
+/// the iOS backend before its handle lookup — so a starting or paused node
+/// answers bytes that are no transaction with the permanent refusal, never a
+/// retryable "not ready". [`send_raw_transaction_json`] runs the same gate.
+pub fn check_raw_transaction_json(raw_hex: &str) -> String {
+    let Some(raw) = parse_hex_bytes(raw_hex) else {
+        return eljson::error_json("invalid raw transaction hex");
+    };
+    match myotis_net::el::tx::decode_sendable(&raw) {
+        Ok(_) => r#"{"ok":true}"#.to_string(),
+        Err(reason) => eljson::invalid_params_json(&reason),
+    }
+}
+
 /// `nativeFeeEstimateJson`: verified fee suggestion (`eth_gasPrice` +
 /// `eth_maxPriorityFeePerGas`) for a running handle. Returns
 /// `{"gasPriceWei":"…","maxPriorityFeePerGasWei":"…"}` (decimal wei), or
@@ -5294,10 +5313,17 @@ mod send_gate_tests {
             send_raw_transaction_json(-1, "0x"),
             r#"{"error":"invalid raw transaction: empty","code":-32602}"#
         );
+        // The same gate, alone: no handle at all.
+        assert_eq!(
+            super::check_raw_transaction_json("0x00"),
+            r#"{"error":"invalid raw transaction: transaction type not supported (0x0)","code":-32602}"#
+        );
+        assert_eq!(super::check_raw_transaction_json("0xzz"), r#"{"error":"invalid raw transaction hex"}"#);
         // A real transaction gets past the gate, to the readiness checks.
         let spec = "0xf86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a7\
                     6400008025a028ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276a0\
                     67cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83";
+        assert_eq!(super::check_raw_transaction_json(spec), r#"{"ok":true}"#);
         let out: serde_json::Value = serde_json::from_str(&send_raw_transaction_json(-1, spec)).unwrap();
         assert!(out.get("error").is_some() && out.get("code").is_none(), "{out}");
     }

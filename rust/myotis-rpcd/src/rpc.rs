@@ -755,6 +755,13 @@ impl<E: Engine> Router<E> {
                 if raw.is_empty() {
                     return invalid("invalid argument 0: the signed transaction is empty");
                 }
+                // Bytes that are no transaction this node relays (#360) are
+                // refused on the bytes alone, BEFORE the readiness hold: a
+                // starting node, or a batch whose wait is spent, must not turn
+                // a permanent refusal into a retryable "not ready". The
+                // engine's handle-less gate (ABI 45) answers the permanent
+                // envelope engine_object maps to -32602; the send checks again.
+                engine_object(&myotis_engine::ffi::check_raw_transaction_json(hex_data(&raw)))?;
                 let o =
                     engine_object(&self.engine_ready(g)?.send_raw_transaction(&hex_data(&raw)))?;
                 // Refused before broadcast: geth's txpool verdict, verbatim under

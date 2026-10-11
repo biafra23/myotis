@@ -400,7 +400,7 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 
 ## Request ownership and cancellation
 
-This implementation targets the current engine's **ABI 44** and existing JS
+This implementation targets the current engine's **ABI 45** and existing JS
 argument/result shapes. Every signature up to ABI 31 is unchanged since ABI 25,
 ABI 32's one change is additive (an optional trailing argument), ABI 33 changes
 no signature (the executor refusals above), ABI 34 adds `estimateGasTxJson`
@@ -433,11 +433,13 @@ adds the engine's DNS-discovery switch (not wrapped here); ABI 40 adds
 `createAccessListJson`; ABI 41 adds `blockTimestamp` to the
 `requestAccountJson`, `resolveEnsJson` and `ensRecordJson` results (a key
 addition); ABI 43 adds the engine's Tor storage-directory call (not
-wrapped here, like the rest of Tor); and ABI 44 makes `sendRawTransactionJson`
+wrapped here, like the rest of Tor); ABI 44 makes `sendRawTransactionJson`
 answer the permanent `{"error","code":-32602}` for bytes that are no
 transaction the engine relays — undecodable, no sender recovered, or a blob
-transaction — where it used to broadcast them (#360): nothing was sent. It is
-not a drop-in artifact for a host pinned to ABI 22.
+transaction — where it used to broadcast them (#360): nothing was sent; and
+ABI 45 adds the engine's handle-less send gate, `check_raw_transaction_json` (not
+wrapped here: the addon has no readiness hold, so its sends reach the same
+gate at once). It is not a drop-in artifact for a host pinned to ABI 22.
 Engine failures, admission refusal, cancellation, and deadline expiry remain
 in-band JSON errors. Node-API infrastructure failures may throw/reject.
 

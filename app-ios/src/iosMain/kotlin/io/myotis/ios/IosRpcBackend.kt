@@ -351,6 +351,12 @@ class IosRpcBackend(
 
     override fun sendRawTransactionDetailed(rawTx: ByteArray): RpcSendResult {
         if (rawTx.isEmpty()) return RpcSendResult.unavailable("empty raw transaction")
+        // Bytes that are no transaction are refused on the bytes alone (ABI >= 45,
+        // #360), BEFORE the handle lookup: a node not running must not turn that
+        // permanent refusal into a retryable one (JNI parity: RustChainHandle
+        // checks before its wake wait). The send runs the same gate again.
+        runCatching { permanentRefusalOrNull(RustEngine.checkRawTransactionJson(hex(rawTx))) }
+            .getOrNull()?.let { return RpcSendResult.refused(it) }
         val handle = handleProvider() ?: return RpcSendResult.unavailable()
         val json = RustEngine.sendRawTransactionJson(handle, hex(rawTx))
         // No transaction the engine relays (ABI >= 44, #360): the permanent

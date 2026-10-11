@@ -660,6 +660,19 @@ pub unsafe extern "C" fn myotis_send_raw_transaction_json(
     into_c(crate::host::send_raw_transaction_json(handle, &raw_tx_hex))
 }
 
+/// The `eth_sendRawTransaction` gate on the bytes alone (ABI ≥ 45), no handle:
+/// `{"ok":true}`, the permanent `{"error","code":-32602}` refusal, or
+/// `{"error": ...}` for bad hex (`nativeCheckRawTransactionJson` twin). Hosts call
+/// it before their readiness hold.
+///
+/// # Safety
+/// `raw_tx_hex` must be null or a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_check_raw_transaction_json(raw_tx_hex: *const c_char) -> *mut c_char {
+    let raw_tx_hex = read_string(raw_tx_hex).unwrap_or_default();
+    into_c(crate::host::check_raw_transaction_json(&raw_tx_hex))
+}
+
 /// Release a string previously returned by any `myotis_*` function. Null is a
 /// no-op.
 ///

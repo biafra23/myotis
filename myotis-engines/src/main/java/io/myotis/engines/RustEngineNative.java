@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 44; // 44: send_raw_transaction_json refuses non-transactions (-32602); 43: set_tor_storage_dirs
+    static final int EXPECTED_ABI_VERSION = 45; // 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
 
     private static final boolean AVAILABLE = load();
 
@@ -374,6 +374,12 @@ final class RustEngineNative {
      *  (ABI 36: refused before broadcast, geth's txpool verdict) or an error object. */
     static String nativeSendRawTransactionJson(long handle, String rawTxHex) {
         return Myotis_engineKt.sendRawTransactionJson(handle, nz(rawTxHex));
+    }
+
+    /** The send gate on the bytes alone, no handle (ABI 45): {@code {"ok":true}}, the
+     *  permanent {@code {"error","code":-32602}} refusal, or an error object for bad hex. */
+    static String nativeCheckRawTransactionJson(String rawTxHex) {
+        return Myotis_engineKt.checkRawTransactionJson(nz(rawTxHex));
     }
 
     /** Verified {@code eth_getTransactionReceipt} (receipt JSON / "null" / error). */
