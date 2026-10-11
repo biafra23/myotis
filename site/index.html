@@ -320,7 +320,7 @@ footer .brand { font-size: 1rem; }
     <div class="compare">
       <div class="panel">
         <h3>The usual way</h3>
-        <div class="flow" aria-label="Your wallet asks a company server, which asks the Ethereum network">
+        <div class="flow" role="img" aria-label="Your wallet asks a company server, which asks the Ethereum network">
           <div class="node">Your wallet</div>
           <div class="arrow" aria-hidden="true">→</div>
           <div class="node">A company’s server<small>you trust its answer</small></div>
@@ -331,7 +331,7 @@ footer .brand { font-size: 1rem; }
       </div>
       <div class="panel">
         <h3>With Myotis</h3>
-        <div class="flow" aria-label="Your wallet asks Myotis on your own device, which checks answers from the Ethereum network">
+        <div class="flow" role="img" aria-label="Your wallet asks Myotis on your own device, which checks answers from the Ethereum network">
           <div class="node">Your wallet</div>
           <div class="arrow" aria-hidden="true">→</div>
           <div class="node me">Myotis<small>on your device, checks every answer</small></div>
@@ -415,7 +415,7 @@ footer .brand { font-size: 1rem; }
     <ol class="steps">
       <li>
         <h3>Download</h3>
-        <p>Open the <a href="https://github.com/biafra23/myotis/releases">Myotis releases page</a>. The newest version is at the top (for example <em>Myotis v0.1.14</em>). Click <em>Assets</em> below its notes and download the one file that fits your computer:</p>
+        <p>Open the <a href="https://github.com/biafra23/myotis/releases">Myotis releases page</a>. Find the topmost entry whose name starts with <em>Myotis v</em> — that is the newest version. Click <em>Assets</em> below its notes and download the one file that fits your computer:</p>
         <div class="files">
           <div><span class="who">Mac with Apple silicon (M1, M2, M3, M4…)</span><span class="file mono">Myotis-v…-arm64.dmg</span></div>
           <div><span class="who">Mac with an Intel processor</span><span class="file mono">Myotis-v…-x64.dmg</span></div>
@@ -456,7 +456,7 @@ footer .brand { font-size: 1rem; }
     <ol class="steps">
       <li>
         <h3>Download</h3>
-        <p>On your phone, open the <a href="https://github.com/biafra23/myotis/releases">Myotis releases page</a>. The newest version is at the top (for example <em>Myotis v0.1.14</em>). Tap <em>Assets</em> below its notes and download:</p>
+        <p>On your phone, open the <a href="https://github.com/biafra23/myotis/releases">Myotis releases page</a>. Find the topmost entry whose name starts with <em>Myotis v</em> — that is the newest version. Tap <em>Assets</em> below its notes and download:</p>
         <div class="files">
           <div><span class="who">Android phone or tablet</span><span class="file mono">Myotis-v…-android-debug.apk</span></div>
         </div>
@@ -499,23 +499,23 @@ footer .brand { font-size: 1rem; }
         <tbody>
           <tr>
             <td data-label="Network">Ethereum</td>
-            <td data-label="RPC URL"><span class="copy"><code>http://localhost:8545</code><button type="button" data-copy="http://localhost:8545" hidden>Copy</button></span></td>
+            <td data-label="RPC URL"><span class="copy"><code>http://127.0.0.1:8545</code><button type="button" data-copy="http://127.0.0.1:8545" hidden>Copy</button></span></td>
             <td data-label="Chain ID"><code>1</code></td><td data-label="Currency">ETH</td>
           </tr>
           <tr>
             <td data-label="Network">Gnosis Chain</td>
-            <td data-label="RPC URL"><span class="copy"><code>http://localhost:8546</code><button type="button" data-copy="http://localhost:8546" hidden>Copy</button></span></td>
+            <td data-label="RPC URL"><span class="copy"><code>http://127.0.0.1:8546</code><button type="button" data-copy="http://127.0.0.1:8546" hidden>Copy</button></span></td>
             <td data-label="Chain ID"><code>100</code></td><td data-label="Currency">XDAI</td>
           </tr>
           <tr>
             <td data-label="Network">Sepolia <span class="muted">(test network, play money)</span></td>
-            <td data-label="RPC URL"><span class="copy"><code>http://localhost:8547</code><button type="button" data-copy="http://localhost:8547" hidden>Copy</button></span></td>
+            <td data-label="RPC URL"><span class="copy"><code>http://127.0.0.1:8547</code><button type="button" data-copy="http://127.0.0.1:8547" hidden>Copy</button></span></td>
             <td data-label="Chain ID"><code>11155111</code></td><td data-label="Currency">SepoliaETH</td>
           </tr>
         </tbody>
       </table>
     </div>
-    <p class="fineprint" style="margin-top:10px">Only Ethereum is switched on when you install Myotis. Turn the others on under <em>Settings → Networks</em> in Myotis; each one gets its own address, so add each to your wallet separately. <code>localhost</code> means “this device”: the connection never leaves your phone or computer, and other devices cannot use it.</p>
+    <p class="fineprint" style="margin-top:10px">Only Ethereum is switched on when you install Myotis. Turn the others on under <em>Settings → Networks</em> in Myotis; each one gets its own address, so add each to your wallet separately. <code>127.0.0.1</code> is every device’s address for itself: the connection never leaves your phone or computer, and other devices cannot use it.</p>
 
     <h3 style="margin-top:36px">In MetaMask</h3>
     <ol class="steps">
@@ -525,7 +525,7 @@ footer .brand { font-size: 1rem; }
       </li>
       <li>
         <h3>Add Myotis as its RPC URL</h3>
-        <p>Open the <em>RPC URL</em> list and choose <em>Add RPC URL</em>. Enter <code>http://localhost:8545</code>, give it a name such as <em>Myotis</em>, and add it.</p>
+        <p>Open the <em>RPC URL</em> list and choose <em>Add RPC URL</em>. Enter <code>http://127.0.0.1:8545</code>, give it a name such as <em>Myotis</em>, and add it.</p>
       </li>
       <li>
         <h3>Select it and save</h3>
@@ -552,7 +552,7 @@ footer .brand { font-size: 1rem; }
     <p class="muted">A coloured bar under the header and a card with a headline tell you, at a glance, whether your wallet can rely on Myotis right now.</p>
     <ul class="lights">
       <li><span class="dot ok" aria-hidden="true"></span><p><strong>Green — Ready.</strong> Your wallet gets verified answers. A thicker, brighter green means Myotis has found plenty of helpers on the network, so even heavy wallet screens load quickly.</p></li>
-      <li><span class="dot warn" aria-hidden="true"></span><p><strong>Amber — Almost ready.</strong> Myotis has caught up and is waiting for the newest block. Your wallet may show a brief error; just wait a moment.</p></li>
+      <li><span class="dot warn" aria-hidden="true"></span><p><strong>Amber — Almost ready.</strong> Myotis has caught up and is waiting for the newest block. Your wallet may show a brief error; just wait a moment. (If you use the log index from <em>Expert mode</em>, amber can also read <em>Ready — log index catching up</em>: everything works except searches for the very latest contract events, until the index has caught up.)</p></li>
       <li><span class="dot bad" aria-hidden="true"></span><p><strong>Red — Syncing, or something needs you.</strong> Red does not always mean a problem: <em>Syncing</em> is normal while Myotis catches up, so wait. The other red headlines tell you what to do: <em>Not running</em> — tap <em>Start</em>; <em>No internet connection</em>; <em>Update required</em> — install the newest version; <em>Needs your decision</em> — see <a href="#faq-decision">this question</a>.</p></li>
       <li><span class="dot off" aria-hidden="true"></span><p><strong>Grey — Sleeping</strong> (Android). Myotis paused itself to save battery. Your wallet’s next request wakes it up.</p></li>
     </ul>
@@ -613,7 +613,7 @@ footer .brand { font-size: 1rem; }
       <summary>The status says “Needs your decision”. What now?</summary>
       <div class="answer">
         <p>Each version of Myotis ships with a trusted starting point on the chain. If that starting point is older than a safety limit — about two weeks on Ethereum, about a day and a half on Gnosis Chain — Myotis pauses instead of quietly relying on it, and asks you.</p>
-        <p>The best answer is to install the newest version, which comes with a fresh starting point. If you already have the newest version, tap <em>Review</em> and choose <em>Sync anyway</em> to continue from the older starting point. On Gnosis Chain this question is normal a day or two after each release.</p>
+        <p>The best answer is to install the newest version, which comes with a fresh starting point. If you already have the newest version, tap <em>Review</em> and choose <em>Sync anyway</em> to continue from the older starting point. On Gnosis Chain, with its short limit, this question comes up often — it is expected, not a fault.</p>
       </div>
     </details>
     <details>
@@ -666,14 +666,18 @@ footer .brand { font-size: 1rem; }
 (function () {
   if (!navigator.clipboard) return;
   document.querySelectorAll(".copy button").forEach(function (b) {
+    var label = b.textContent, timer = null;
+    function show(text) {
+      b.textContent = text;
+      clearTimeout(timer);
+      timer = setTimeout(function () { b.textContent = label; }, 1500);
+    }
     b.hidden = false;
     b.addEventListener("click", function () {
-      var text = b.getAttribute("data-copy");
-      navigator.clipboard.writeText(text).then(function () {
-        var old = b.textContent;
-        b.textContent = "Copied";
-        setTimeout(function () { b.textContent = old; }, 1500);
-      });
+      navigator.clipboard.writeText(b.getAttribute("data-copy")).then(
+        function () { show("Copied"); },
+        function () { show("Select it by hand"); }
+      );
     });
   });
 })();
