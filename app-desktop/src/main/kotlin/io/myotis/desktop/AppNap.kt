@@ -1,7 +1,5 @@
 package io.myotis.desktop
 
-import com.sun.jna.Function
-import com.sun.jna.NativeLibrary
 import com.sun.jna.Pointer
 
 /**
@@ -37,7 +35,7 @@ object AppNap {
     @Volatile
     private var activity: Pointer? = null
 
-    val isMac: Boolean get() = System.getProperty("os.name", "").lowercase().contains("mac")
+    val isMac: Boolean get() = isMacOs
 
     /** True while the process holds the activity (macOS only). */
     val active: Boolean get() = activity != null
@@ -52,14 +50,17 @@ object AppNap {
         if (activity != null) return true
         if (!isMac) return false
         return try {
-            val rt = ObjC()
-            val nsReason = rt.send(rt.cls("NSString"), "stringWithUTF8String:", reason)
-            val token: Pointer? = rt.send(
-                rt.processInfo(), "beginActivityWithOptions:reason:", USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP, nsReason,
-            )
-            if (token == null) return false
-            // The token comes back autoreleased; retain it so the activity outlives the pool.
-            rt.send(token, "retain")
+            val rt = ObjCRuntime.shared
+            val token: Pointer = rt.autoreleasePool {
+                rt.send(
+                    processInfo(rt), "beginActivityWithOptions:reason:", USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP,
+                    rt.nsString(reason),
+                )?.also {
+                    // The token comes back autoreleased; retain it, inside the pool, so the
+                    // activity outlives the pool.
+                    rt.send(it, "retain")
+                }
+            } ?: return false
             activity = token
             true
         } catch (t: Throwable) { // UnsatisfiedLinkError, a missing JNA, anything from the runtime
@@ -77,8 +78,8 @@ object AppNap {
     fun enable(): Boolean {
         val token = activity ?: return true
         return try {
-            val rt = ObjC()
-            rt.sendVoid(rt.processInfo(), "endActivity:", token)
+            val rt = ObjCRuntime.shared
+            rt.sendVoid(processInfo(rt), "endActivity:", token)
             // The activity is over from here, whatever the release below does: clear the
             // bookkeeping first, so `active` can never claim protection the OS no longer
             // gives and a later disable() begins a fresh activity (a leaked retain on a
@@ -96,29 +97,8 @@ object AppNap {
         }
     }
 
-    /** The three Objective-C runtime entry points the two calls above need. */
-    private class ObjC {
-        init {
-            // NSProcessInfo and NSString live in Foundation: load it explicitly so the
-            // classes resolve regardless of what the launch path happened to link (the
-            // jpackage launcher is a Cocoa app; a bare test JVM is not).
-            NativeLibrary.getInstance("Foundation")
-        }
-        private val objc = NativeLibrary.getInstance("objc")
-        private val objcGetClass: Function = objc.getFunction("objc_getClass")
-        private val selRegisterName: Function = objc.getFunction("sel_registerName")
-        private val objcMsgSend: Function = objc.getFunction("objc_msgSend")
-
-        fun cls(name: String): Pointer = objcGetClass.invokePointer(arrayOf(name))
-        private fun sel(name: String): Pointer = selRegisterName.invokePointer(arrayOf(name))
-        fun processInfo(): Pointer =
-            send(cls("NSProcessInfo"), "processInfo") ?: error("NSProcessInfo.processInfo returned nil")
-        fun send(receiver: Pointer, selector: String, vararg args: Any?): Pointer? =
-            objcMsgSend.invokePointer(arrayOf(receiver, sel(selector), *args))
-        fun sendVoid(receiver: Pointer, selector: String, vararg args: Any?) {
-            objcMsgSend.invokeVoid(arrayOf(receiver, sel(selector), *args))
-        }
-    }
+    private fun processInfo(rt: ObjCRuntime): Pointer =
+        rt.send(rt.cls("NSProcessInfo"), "processInfo") ?: error("NSProcessInfo.processInfo returned nil")
 
     // Lazy: the desktop logback config reads myotis.logdir when the first logger is created.
     private val log: org.slf4j.Logger by lazy { org.slf4j.LoggerFactory.getLogger(AppNap::class.java) }

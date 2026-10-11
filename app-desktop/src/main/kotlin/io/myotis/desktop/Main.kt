@@ -6,6 +6,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.window.Notification
 import androidx.compose.ui.window.Tray
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
@@ -106,8 +107,8 @@ fun main() {
         // focus, however the user got there, it opens on the Status tab.
         var statusOnFocus by remember { mutableStateOf(false) }
         var focusReturns by remember { mutableStateOf(0) }
-        // The tray icon carries the refused-web-page notifications (DesktopAlerts.kt); a
-        // desktop without a system tray (GNOME, by default) keeps them in the window.
+        // The tray icon: a Show / Quit menu, and the notification route wherever macOS's
+        // Notification Center is not (below).
         if (isTraySupported) {
             Tray(
                 icon = MyotisTrayIcon,
@@ -147,7 +148,21 @@ fun main() {
                 onDispose { window.removeWindowFocusListener(listener) }
             }
             LaunchedEffect(Unit) {
-                watchWebRefusals(controller, settings, trayState.takeIf { isTraySupported }, window) {
+                // Where a refused web page is announced (DesktopAlerts.kt): Notification Center
+                // in a packaged macOS app, the tray icon's notification on other desktops with a
+                // tray; a desktop with neither (GNOME, by default) keeps it in the window. Chosen
+                // here, once the window exists: MacNotifications must not be set up before
+                // NSApplication has finished launching. Its start() also asks for permission,
+                // which is what lists Myotis in System Settings → Notifications.
+                val notifier = when {
+                    MacNotifications.start() -> DesktopNotifier(MacNotifications::post)
+                    isTraySupported -> DesktopNotifier { title, message ->
+                        trayState.sendNotification(Notification(title, message, Notification.Type.Info))
+                        true
+                    }
+                    else -> null
+                }
+                watchWebRefusals(controller, settings, notifier, window) {
                     // Already in front: the user sees the banner if Status is open; arm
                     // only for a window the user has to come back to.
                     if (!window.isFocused) statusOnFocus = true

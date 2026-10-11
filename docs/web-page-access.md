@@ -101,7 +101,13 @@ browser, which is why the apps surface it themselves:
 - **Desktop notification**: the desktop app shows a tray icon (where the
   desktop has a system tray) and raises a native notification when a site is
   refused under *Specific sites* — Notification Center on macOS, a toast on
-  Windows. A site is announced once; it is announced again only after one of
+  Windows. On macOS the packaged app posts through UserNotifications
+  (`MacNotifications.kt`) rather than the tray, and asks for permission once
+  its window is up: macOS prompts once, and that request is what lists Myotis
+  in System Settings → Notifications. A "Don't Allow" is not asked again; turn
+  notifications on there. The banner shows whether or not Myotis is in front.
+  `:app-desktop:run` has no app bundle and keeps the tray route. A site is
+  announced once; it is announced again only after one of
   its requests was served (it was allowed) and it is then refused anew; at
   most twenty announcements per run. Desktop notifications carry no buttons,
   so it points at the app; when the Myotis window is not focused the dock
@@ -140,7 +146,7 @@ without a response, so the choice was made for us; what the page can learn is
 | engines | `ChainStack` / `RustChainHandle` own one `WebAccess` per network and hand it to `MyotisRpc.server(…)`; the policy never crosses the FFI — the listener is the shared Kotlin server on both engines. |
 | `:ui` | `Settings.webAccessMode/webAccessOrigins/supportsWebAccess`, `NodeController.applyWebAccess`, `NodeSnapshot.webOrigins`, `WebAccessScreens.kt` (section + banner — shown only where the host answers `supportsWebAccess()`, never as inert controls), `WebAccessUi` (normalize — pinned to the engine's by `WebAccessParityTest` —, merge, pending refusals). |
 | Android | `NodeService` prefs `webAccess.mode` / `webAccess.origins`, pre-start apply, `applyWebAccess`, `recentWebOrigins`, the notification. |
-| desktop | `DesktopSettings` keys `webAccess.mode` / `webAccess.origins`, pre-start apply under the served-window lock, `applyWebAccess`, snapshot rows; the tray icon, native notification and attention request (`DesktopAlerts.kt`, the once-per-site rules in `WebRefusalAlerts`). |
+| desktop | `DesktopSettings` keys `webAccess.mode` / `webAccess.origins`, pre-start apply under the served-window lock, `applyWebAccess`, snapshot rows; the tray icon, native notification and attention request (`DesktopAlerts.kt`, `MacNotifications.kt` on macOS, the once-per-site rules in `WebRefusalAlerts`). |
 | daemon | `-Dmyotis.rpc.webAccess=off\|all\|<origin>,<origin>…` (`-PwebAccess=…` on `:app:run`); no settings file, so this is its only knob. |
 | iOS | Not wired yet (follow-up from #502): `supportsWebAccess()` is false, so no section and no banner show; the listener runs the default policy (specific sites, none — web pages refused). |
 
