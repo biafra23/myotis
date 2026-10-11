@@ -81,7 +81,8 @@ and Bee gives you ten minutes. So a Bee-ready Myotis needs three extra things:
    imported into a running node or bundled into the app so it is in place at
    the first start. The seed is **unverified** when it lands (it is whatever
    the full node said); the walker later re-fetches the same span from peers
-   in the background (section 5) — which fills holes and overwrites what it
+   in the background while the walk runs (section 5; the PoC app ships with
+   it paused) — which fills holes and overwrites what it
    finds, but cannot remove a log the seed invented. The committed data set is
    `data/bee/gnosis/postagestamp-logs-47000000-48262804.jsonl.gz` (+ its
    `.meta.json`): ~39k logs, blocks 47,000,000–48,262,804, fetched
@@ -93,7 +94,8 @@ and Bee gives you ten minutes. So a Bee-ready Myotis needs three extra things:
 
 Two things that are *not* Bee-specific but were found while doing this and
 are now in every desktop build: the packaged macOS app opts out of App Nap
-(a hidden window used to throttle the process to the background scheduling
+by default (Settings → Power → *Sleep when not in focus* turns napping back
+on; a hidden window used to throttle the process to the background scheduling
 band, which stalled the RPC for seconds at a time), and the JNA stub is
 bundled so the Rust engine actually loads in an ad-hoc-signed app.
 
@@ -128,8 +130,8 @@ id and data dir (`~/.myotis-bee-poc`), so it coexists with a regular Myotis.
 The build synthesizes the seed from the committed data set, bundles it with a
 manifest (coverage, usable-until block, sha256) and the peer caches; the first
 start installs them into the data dir, enables Gnosis (only — mainnet is
-switched off) with the log index on and the PostageStamp watch entry, and
-the engine activates the seed.
+switched off) with the log index on, the PostageStamp watch entry and the
+backfill paused, and the engine activates the seed.
 
 ```bash
 # dev run (any OS)
@@ -142,17 +144,18 @@ export JAVA_HOME=/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home   # 
   -Porg.gradle.java.installations.auto-detect=false \
   -Porg.gradle.java.installations.auto-download=false \
   -Porg.gradle.java.installations.paths=$JAVA_HOME
-# → app-desktop/build/compose/binaries/main/dmg/Myotis Bee PoC-1.1.10.dmg
+# → app-desktop/build/compose/binaries/main/dmg/Myotis Bee PoC-1.1.15.dmg
 #   (jpackage rejects a 0 major, so the macOS package version is the project
-#   version with the major raised by one: 0.1.10 → 1.1.10; createDistributable
+#   version with the major raised by one: 0.1.15 → 1.1.15; createDistributable
 #   instead of packageDmg gives just the .app under …/main/app/)
 ```
 
 What `-PbeePoc` changes, so you can audit it: `app-desktop/build.gradle.kts`
 (`prepareBeePocSeed` runs the script and stages seed + manifest + caches into
-the bundle; the app name/bundle id; `-Dmyotis.beePoc=true` in the launcher) and
-`app-desktop/src/main/kotlin/io/myotis/desktop/BeePoc.kt` (the first-start
-install and settings). A build without the flag carries none of it.
+the bundle; the app name/bundle id; `-Dmyotis.beePoc=true` in the launcher),
+`app-desktop/src/main/kotlin/io/myotis/desktop/BeePoc.kt` (the flavour's
+configuration) and `PocFlavour.kt` beside it (the first-start install and
+settings, shared with the RAILGUN PoC). A build without the flag carries none of it.
 
 You do not have to build it: CI produces the same artifact on every push to
 `main`, not on PRs (`Desktop DMG (macOS)` workflow → artifact
@@ -184,7 +187,7 @@ python3 scripts/synth_logindex.py \
 ```
 
 The same seed file also works as a drop-in for the **regular desktop app**:
-enable the Gnosis log index in Settings with the watch entry above, stop the
+enable the Gnosis log index on the Index tab (Settings → Expert mode) with the watch entry above, stop the
 network, copy the file to `~/.myotis/logindex-gnosis.db`, start it — the engine
 activates a snapshot it finds there.
 
@@ -210,7 +213,8 @@ The committed set is a snapshot in time. From any Gnosis full node you trust
    (`--check` verifies an existing seed; `--manifest` writes the properties
    file the PoC app reads).
 
-The walker later re-fetches the seeded span from peers; the seed has to be
+The walker later re-fetches the seeded span from peers while the walk runs
+(section 5); the seed has to be
 *complete and honest*: a log missing from it is invisible to Bee until the
 walker reaches that block, and a log invented in it is never removed.
 
@@ -317,6 +321,15 @@ and verification, not a prerequisite: it runs at a bounded pace, it does not
 block serving, and Bee is served from the first minute regardless. A knob to
 stop the walk at a chosen block ("nothing below X is ever asked for") is a
 follow-up we intend to do; it is not tracked yet.
+
+**Status (since written):** the walk can now be switched off as a whole — the
+daemon's `logindex-backfill off` (or `-PbackfillPaused=true` at boot), the
+Index tab's *Pause backfill* switch in the apps — and the Bee PoC app ships
+with it off (`pauseBackfillByDefault`, `BeePoc.kt`): measured on 2026-09-19
+the walk did compete with head-follow for the snap pool, and Bee shut down
+(`docs/bee-rpc-service.md`, *Pausing the backfill*). While paused, the walker
+does not re-fetch the seeded span either. Stopping at a chosen block is still
+not built.
 
 Two limits to know:
 

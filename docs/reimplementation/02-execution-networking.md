@@ -12,8 +12,11 @@ Reference modules: `core/` and `networking/` (`com.jaeckel.ethp2p.core`, `…net
 > ENRRequest/ENRResponse (the Rust engine does implement the latter since #539 — it asks a
 > discovered node for its ENR to judge its chain before dialing, and answers bonded requesters);
 > it answers inbound `eth`/`snap` requests with **empty** responses (so
-> peers don't time out and disconnect). A re-implementation that also *serves* would need the
-> responder halves. For a wallet engine, client-only is correct and far simpler.
+> peers don't time out and disconnect) — except `GetBlockHeaders`, which both engines answer from a
+> small window of recent headers they hold (default 32, at most 4096; `ServedHeaderWindow`, which
+> is also the range eth/69's Status and `BlockRangeUpdate` announce) so eth/69 peers keep the
+> connection. A re-implementation that also *serves* would need the responder halves. For a
+> wallet engine, client-only is correct and far simpler.
 
 ---
 
@@ -40,8 +43,10 @@ parsed only while the RLP list has more items** (not by fork detection): `baseFe
 
 Wire form `RLP([signature, seq, k, v, …])`; `enr:`-prefixed strings are **base64url**-decoded.
 Decode skips the signature, reads `seq`, then key/value pairs (list-valued pairs like `eth2`,
-`attnets` are skipped in the generic map, re-parsed on demand). **The ENR signature is not
-verified in the discv4/discv5 decode path** (it is verified in the DNS path — see §4). Keys used:
+`attnets` are skipped in the generic map, re-parsed on demand). **The reference never verifies an
+ENR's own signature** — not in the discv4/discv5 decode path, and not for DNS-tree leaves either:
+the DNS path verifies only the tree's root signature (§4); the Rust engine's DNS walk also checks
+each leaf's signature. Keys used:
 `id, ip, tcp, udp, secp256k1` (stored **33-byte compressed**, decompressed to 64-byte on demand).
 Helpers: `eth2()` (CL `fork_digest(4) ‖ next_fork_version(4) ‖ next_fork_epoch(u64 LE)`),
 `ethForkIdHash()` (EL EIP-868 `eth` field, re-parsed from raw RLP), `toLibp2pMultiaddr()` /
@@ -152,9 +157,10 @@ own signature is verified (the `enr` crate's decoder). Leaves go through the dis
 walk's budget is seen in a different part each walk. Transport: the system resolver through
 `hickory-resolver` (already in the lock via libp2p), 2 s per lookup, one attempt; no host-supplied
 server IPs and no public fallbacks yet, so the walk runs only where a host allows it
-(`myotis_set_dns_discovery`: desktop and daemon) and never while Tor is enabled. The pool dials
-the candidates 10 per maintainer tick (10 s) while below target, re-walks every 4 min while still
-short, and nudges up to 32 of the tree's UDP endpoints into discv4 as DHT seeds.
+(`myotis_set_dns_discovery`: the JVM desktop and daemon, and `myotis-rpcd`) and never while Tor is
+enabled. The pool dials the candidates 10 per maintainer tick (10 s) while below target, re-walks
+every 4 min while still short, and nudges up to 32 of the tree's UDP endpoints into discv4 as DHT
+seeds.
 
 ---
 
@@ -355,7 +361,12 @@ messages long instead of 8; snap sorts last among the shared capabilities, so no
 1. **Fresh, per-peer state root.** Before any snap query, fetch the peer's *current* head header
    (by its `peerBestBlockHash`) and use *that* header's `stateRoot`. Peers prune state beyond ~128
    blocks, so a root from peer A is unsafe against peer B. Reject stale heads
-   (`minSensibleHeadBlock` floor).
+   (`minSensibleHeadBlock` floor). This is the reference's `get-account` path
+   (`EthHandler.requestAccountAsync`, `VerifiedAccountQuery`). Post-Merge a peer's handshake head
+   never refreshes, so the other paths ask at a beacon-anchored root instead: the Rust engine at
+   the anchor's current optimistic state root, falling back to the peer's fresh head only when the
+   peer cannot serve it (`snap_account_at_best_root` in `rust/myotis-net/src/el/reader.rs`), and
+   the Java JSON-RPC reads and EVM oracle at one shared anchored head (`VerifiedRpcBackend`).
 2. Send `GetAccountRange(reqId, freshStateRoot, accountHash, 0xff…ff, ~4 KB)`. The **full
    `[origin, 0xff…ff]` range with a small `responseBytes` cap** is deliberate: the peer returns at
    least one account **plus the complete boundary proof** regardless of the cap, so the proof is

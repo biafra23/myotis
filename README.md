@@ -20,6 +20,7 @@ There are **two interchangeable engines** behind the same zero-dependency API (`
 ## Documentation
 
 - [Architecture](docs/architecture-doc.md) — Describes the target design for how the library will obtain and cryptographically verify all Ethereum data without relying on JSON-RPC providers; not all parts are implemented yet.
+- [How Verification Works](docs/verification.md) — The chain of checks behind every answer, from the embedded checkpoint and the sync committee's signatures down to SNAP-served Merkle-Patricia proofs, with what is not verified.
 - [Benefits](docs/benefits-doc.md) — Explains why a trustless wallet matters and what risks centralized RPC providers pose to users.
 - [Implementation Status](docs/implementation-status.md) — Current implementation progress and what remains to be done.
 - [Readiness & Verified Head Age](docs/readiness-and-verified-head-age.md) — When the node counts as synced and ready to answer queries, and what the "verified head age" on the Status screen means.
@@ -882,7 +883,7 @@ Block verification (`get-block`) currently has the following limitations:
 - **Account and storage queries** (`get-account`, `get-storage`) share the 8,192-block header chain limit but are less affected in practice because they query the peer's current state (usually close to head).
 **Roadmap:**
 
-- **Pre-merge blocks**: Implement the [pre-merge historical hashes accumulator](https://github.com/ethereum/portal-network-specs/blob/master/history/history-network.md#the-header-accumulator) (EIP-2935). This is a Merkle tree over all ~15.5M pre-merge block hashes, with the root embedded as a static trust anchor. Any pre-merge block hash can be verified with an inclusion proof against this accumulator.
+- **Pre-merge blocks**: Implement the [pre-merge historical hashes accumulator](https://github.com/ethereum/portal-network-specs/blob/master/history/history-network.md#the-header-accumulator). This is a Merkle tree over all ~15.5M pre-merge block hashes, with the root embedded as a static trust anchor. Any pre-merge block hash can be verified with an inclusion proof against this accumulator.
 - **Post-merge historical blocks**: Implement the [Bellatrix-era historical roots accumulator](https://github.com/ethereum/annotated-spec/blob/master/phase0/beacon-chain.md#historical-roots). The beacon chain stores `historical_roots` (batches of 8,192 slots) and `historical_summaries` (post-Capella) that cover all post-merge execution payloads. By walking the beacon state's historical records, any post-merge block hash can be verified without an 8,192-block proximity constraint.
 
 ### Sync modes

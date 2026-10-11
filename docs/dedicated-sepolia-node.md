@@ -413,7 +413,8 @@ head.
    ./gradlew :app:run -Pnetwork=sepolia -Pargs="dial enode://<pubkey>@<PUBLIC_IP>:30303"
    ```
 
-   (Java engine only — `RustChainHandle.dialPeer` is not implemented.)
+   (Java engine only — start the daemon above with `-Pengine=java`;
+   `RustChainHandle.dialPeer` is not implemented.)
    `-Pargs=peers` must show the node READY with snap. On the server the wallet
    appears with `"trusted": true` — the cap bypass working. Without a TTY for
    `attach`, the loopback RPC answers the same question:
@@ -454,9 +455,11 @@ head.
    `light_client_updates_by_range`. Measured on this pair: connection
    established in ~235 ms, bootstrap (25,673 bytes) delivered ~272 ms later,
    Nimbus identified as `agent=nimbus` with 4 light-client protocols. For a
-   node whose multiaddr is NOT yet pinned there is no runtime mechanism to
-   seed one — edit `clPeerMultiaddrs` via the `prependLocal(...)` helper and
-   rebuild.
+   node whose multiaddr is NOT yet pinned, the Rust engine takes it for one
+   run from `MYOTIS_CL_STATIC_PEERS` (comma-separated multiaddrs; it REPLACES
+   the pinned list, `rust/myotis-net/src/sync.rs`); the Java engine has no
+   runtime mechanism — edit `clPeerMultiaddrs` (and its Rust twin
+   `SEPOLIA_STATIC_PEERS`) and rebuild.
 
    If every dial fails with `InvalidRemotePubKey`, the peer-id in the pin no
    longer matches the node: Nimbus was restarted without `--netkey-file` at
@@ -467,9 +470,10 @@ head.
 
 The EL enode and the roost CL multiaddr are pinned in `NetworkConfig.SEPOLIA`
 on both layers and in both engines: `elBootEnodes()` returns the enode (Java) /
-`ElConfig::sepolia()` seeds `boot_enodes` into the peer cache for the pool's
-warm-start dial (Rust), and the CL multiaddr is `prependLocal`-ed onto
-`clPeerMultiaddrs` so the light client tries it first.
+`ElConfig::sepolia()` carries it in `boot_enodes`, a pin the pool dials
+directly at warm start and re-dials when it needs to — not seeded into the peer
+cache (Rust), and the CL multiaddrs are `clPeerMultiaddrs` itself, roost first
+(Rust twin: `SEPOLIA_STATIC_PEERS` in `rust/myotis-net/src/sync.rs`).
 
 | layer | identity |
 |---|---|
@@ -509,14 +513,15 @@ Remaining:
 - **Drop the `ethp2p` match** from the Geth patch once all deployed wallets
   send the renamed `myotis/…` Hello client id.
 - **No CL equivalent of the EL cap bypass exists.** The Geth patch admits
-  wallets by RLPx Hello client-id; Nimbus has no such hook, and myotis does
-  not even set a libp2p agent string today (`BeaconP2PService.start()` builds
-  the host without one), so there is nothing to match on. `--max-peers=500` is
+  wallets by RLPx Hello client-id; Nimbus has no such hook. Both myotis CL
+  paths now name themselves in Identify (`myotis/<version>-java`,
+  `BeaconP2PService.AGENT_VERSION`; `myotis/<version>-rs`,
+  `rust/myotis-net/src/reqresp.rs`), so there is something to match on, but
+  nothing on the Nimbus side matches it. `--max-peers=500` is
   headroom, not a reservation: once those fill, wallets are shut out exactly
-  as at the default 160. A real bypass would need an agent string on both
-  myotis CL paths plus a Nimbus patch deferring its accept decision past
-  Identify. Cheaper alternative worth testing first: `--discv5=false` on the
-  serving node — wallets reach it by the pinned multiaddr anyway, and without
+  as at the default 160. A real bypass would need a Nimbus patch deferring
+  its accept decision past Identify. Cheaper alternative worth testing
+  first: `--discv5=false` on the serving node — wallets reach it by the pinned multiaddr anyway, and without
   a discv5 record the random-peer inflow that consumes the slots largely dries
   up (cost: the node then needs `--direct-peer` entries to follow the chain).
 - Optional: a second EL (Nethermind, halfpath/FlatDb layout) for

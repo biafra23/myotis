@@ -12,7 +12,9 @@
 > from the real IP (one that landed on a stream but got no Pong counts as
 > sent — it may be out), and one that went over Tor is never pushed from the
 > real IP again: not rebroadcast, and not re-pushed when the wallet
-> re-submits it, even after Tor is switched off.
+> re-submits it, even after Tor is switched off — for as long as the engine
+> still holds its bytes (in memory only: the network's last 256 sends,
+> `SENT_TX_CACHE_MAX`; a restart forgets which sends went over Tor).
 > Wired up on the desktop and Android hosts (iOS not yet; on Android
 > `-PtorEngine` reaches the jniLibs — see the Android bullet in
 > [§3](#3-tor-client-library-arti-in-the-rust-engine)); storage/token
@@ -78,7 +80,7 @@ sensitivity:
 | **CL light client** (finality/committee updates) | Content is public chain data, identical for every client — nothing user-specific. It does *fingerprint* the IP as running an Ethereum CL light client, with wake/sleep timing that mirrors app usage. | Low (content-benign) |
 | **Discovery** (discv4/discv5) | The IP participates in the Ethereum DHTs — i.e. runs a client. No addresses involved. | Low |
 
-> **Disclosure set widens under read hedging (clearnet).** Interactive verified reads hedge across peers to survive a silent one (`INTERACTIVE`/`HEDGE_DELAY`, myotis #320): an address-carrying read whose first peer is slower than the hedge delay discloses `keccak(address)` to up to `MAX_HEDGED_ATTEMPTS` (3) peers, not one, even when the first peer goes on to answer. Sequential rotation disclosed to a new peer only on failure; hedging discloses on slowness. This is a clearnet-only tradeoff — the Tor read path routes each address over its own circuit *before* hedging, so it is unaffected. `eth_call` and gas estimation hedge their account, storage and bytecode reads through the same race (the state oracle, `evm.rs`), so on the oracle's serial path the accounts and storage-key hashes a call touches reach up to three peers under the same condition — and those reads have no Tor path at all (see Status above), so the Tor toggle does not narrow them. Block and receipt reads are hedged too; they carry no address, but *which* blocks a send is being watched in (the Receipt tracking row above) now reaches up to three peers the same way. Accepted deliberately: the alternative (excluding address-carrying reads from hedging) would leave exactly the slow-link case this leak's worst environment — mobile/congested — stalling.
+> **Disclosure set widens under read hedging (clearnet).** Interactive verified reads hedge across peers to survive a silent one (`HEDGE_DELAY`, myotis #320): an address-carrying read whose first peer is slower than the hedge delay discloses `keccak(address)` to up to `MAX_HEDGED_ATTEMPTS` (3) peers, not one, even when the first peer goes on to answer. Sequential rotation disclosed to a new peer only on failure; hedging discloses on slowness. This is a clearnet-only tradeoff — the Tor read path routes each address over its own circuit *before* hedging, so it is unaffected. `eth_call` and gas estimation hedge their account, storage and bytecode reads through the same race (the state oracle, `evm.rs`), so on the oracle's serial path the accounts and storage-key hashes a call touches reach up to three peers under the same condition — and those reads have no Tor path at all (see Status above), so the Tor toggle does not narrow them. Block and receipt reads are hedged too; they carry no address, but *which* blocks a send is being watched in (the Receipt tracking row above) now reaches up to three peers the same way. Accepted deliberately: the alternative (excluding address-carrying reads from hedging) would leave exactly the slow-link case this leak's worst environment — mobile/congested — stalling.
 
 The design goal is therefore precise: **unlink the snap-query and tx-broadcast
 flows from the user's IP**, without breaking the trust model, and without paying
@@ -248,7 +250,8 @@ Route by sensitivity, not wholesale:
    sent (it may be out), and fails closed when none landed. Rebroadcasts
    follow the same route, one round at a time per network, each walking on to
    the next five eligible peers; a Tor send is never re-pushed in the clear, a
-   wallet's re-submit of it included. The peers are nodes of the Tor reserve,
+   wallet's re-submit of it included (while the engine still holds its
+   bytes). The peers are nodes of the Tor reserve,
    ready ten minutes after their last direct contact (status note above); Tor sessions advertise
    no listen port and the client id `myotis` without its version (§6.3).
 

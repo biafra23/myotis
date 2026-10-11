@@ -1,6 +1,8 @@
 # dApp browser & RPC interception — evaluation and design sketch
 
-Status: **evaluation, nothing built.** Written 2026-10-10 from the tree as of
+Status: **evaluation; only phase 0 (§9) is built** — as #502 (PR #605), the
+same day, in a different shape than proposed here: see §9 and
+[web-page-access.md](web-page-access.md). Written 2026-10-10 from the tree as of
 that day (the Node addon's provider table from #503, the CORS block in
 `jsonrpc-server`, the served-window and block-pin rules in the README's
 *Wallet API*), the observable behaviour of today's dApp frontend stacks, and
@@ -75,6 +77,9 @@ Facts this document rests on, with where to check them:
   Firefox and Safari apply differently, and which vary by version) stand
   between a public web page in an ordinary browser and the port. This is a
   finding on its own, independent of any browser decision (§9, phase 0).
+  *Since #502 this no longer holds: the CORS plugin is gone, and a gate in
+  front of the router serves a browser origin only under the operator's
+  policy, every page refused by default ([web-page-access.md](web-page-access.md)).*
 - **No prior discussion.** No issue in this repository mentions a dApp
   browser, WalletConnect, a signer or key custody (searched 2026-10-10).
 
@@ -147,7 +152,8 @@ purpose: the dApp *is* on the same device. Consequences:
   private-network rules. Fixing that is independent of this document (§9,
   phase 0) and leaves the extension path intact, since extension-scheme
   origins stay on the allow-list while every other origin, `null` included,
-  is refused.
+  is refused. *(Fixed since by #502 — with extension origins refused too
+  until the user allows them; §9.)*
 
 ### 4.2 Every read is a network query from the user's IP
 
@@ -162,7 +168,8 @@ drives**: it can make the user's IP query any address it likes, at any rate,
 and the peers see those queries as the user's interest. The Tor read path
 narrows this for account reads only, on the desktop and Android hosts only
 (and only in a `-PtorEngine` build); storage reads,
-`eth_call`, gas estimation and broadcast have no Tor path today.
+`eth_call` and gas estimation have no Tor path today (broadcast has had one
+since #612: `send_judged` in `rust/myotis-net/src/el/reader.rs`).
 
 ### 4.3 The read budget is shared and a dApp is not a cooperative client
 
@@ -170,9 +177,11 @@ Verified reads run on bounded workers: the Node addon gives each operation a
 90 s budget including queue wait, one running at a time
 ([`rust/myotis-node/README.md`](../rust/myotis-node/README.md)), and on the
 JVM hosts a read that arrives while the node is waking is held at most 90 s
-(`ChainStack.WAKE_WAIT_CAP_MS`, #432); the Node addon's TODO already records
-libuv-pool starvation from four concurrent worst-case reads in an Electron
-host ([TODO.md](TODO.md)). MetaMask asks for what its screens need. A dApp polls
+(`ChainStack.WAKE_WAIT_CAP_MS`, #432); the addon admits at most four
+requests per handle and refuses the rest at once with `native scheduler busy`
+(`rust/myotis-node/src/scheduler.rs` — its reads run on its own workers, off
+the libuv pool whose starvation [TODO.md](TODO.md) recorded). MetaMask asks
+for what its screens need. A dApp polls
 `eth_blockNumber` every few seconds, fires a Multicall3 `eth_call` per block
 per widget, scans logs on load, and retries on its own timeouts. Without
 per-origin quotas one page can starve the wallet's own confirm screen.
@@ -382,6 +391,13 @@ wallet's custom-network URL or a header) is the tighter follow-up if the
 owner wants one. Do not rely on the browser's private-network rules — they
 differ by browser and version. The phase 1 extension rides the same
 extension-origin allowance. A single PR into `main`.
+*Built since (#502, PR #605), differently: no automatic extension-scheme
+allowance but an operator policy — Off, Specific sites (the default, with
+none) or All sites — so an extension origin, MetaMask's included, is refused
+until the user allows it (one tap on the apps' refusal banner or
+notification; the daemon's `-Dmyotis.rpc.webAccess`); the gate also refuses
+no-cors probes and a DNS-rebinding `Host`, with a 403 before routing. No
+pairing token. [web-page-access.md](web-page-access.md) describes it.*
 
 **Phase 1 — a desktop browser extension PoC.** The body-classifying redirect
 of §6.1 as a content script plus a background worker talking to the loopback
@@ -447,7 +463,8 @@ the advantages of an embedded browser arrive. Items 3–5 are moot until item
 1. Phase 0's exact policy for browser origins on the loopback endpoint
    (an allow-list of no-`Origin` and extension-scheme origins, everything
    else refused by the server, is the proposal; a pairing token the tighter
-   option).
+   option). *Built since as #502's operator policy, default deny
+   ([web-page-access.md](web-page-access.md)).*
 2. Whether a dApp surface belongs in the myotis apps at all, or stays with
    hosts that embed the engine (§5, §9 "Not recommended").
 3. If it does: policy A or C for unservable calls (§8). B is not proposed.

@@ -17,6 +17,11 @@ system its trust anchor: `stateRoot`, `blockHash`, `blockNumber`, `baseFeePerGas
 `transactionsRoot`, `receiptsRoot`. Two states are tracked: a **finalized** header (lags ~2
 epochs) and an **optimistic** head.
 
+From **Gloas** (EIP-7732) on there is no payload header to extract: the execution branch proves
+only the EL **block hash**, and number, state root etc. come from the devp2p header whose keccak
+equals it (resolved by hash — `BeaconSyncState.noteFinalizedHash` / `resolveHeader`; see
+[`glamsterdam-plan.md`](../glamsterdam-plan.md), "The EL anchor after Gloas").
+
 ---
 
 ## 2. Dependencies and what each provides
@@ -64,18 +69,23 @@ Field order **is** the merkleization order; get it exact. Selected types (`types
 | **BeaconBlockHeader** (112 B) | `slot` u64 · `proposerIndex` u64 · `parentRoot` B32 · `stateRoot` B32 · `bodyRoot` B32 |
 | **SyncCommittee** (24624 B) | `pubkeys` Vector[BLSPubkey×48, 512] · `aggregatePubkey` B48 |
 | **SyncAggregate** (160 B) | `syncCommitteeBits` Bitvector[512] = 64 B · `syncCommitteeSignature` B96 |
-| **LightClientHeader** | `beacon` (112 inline) · `execution` (ExecutionPayloadHeader, variable) · `executionBranch` Vector[B32, **4**]. **Hardcoded Capella+** (always 4 branch nodes + a payload header; no pre-Capella Altair variant). |
-| **LightClientBootstrap** | `header` · `currentSyncCommittee` (24624) · `currentSyncCommitteeBranch` (5 **or** 6 × B32) |
-| **LightClientUpdate** | `attestedHeader` · `nextSyncCommittee` (24624) · `nextSyncCommitteeBranch` (5/6) · `finalizedHeader` · `finalityBranch` (6/7) · `syncAggregate` (160) · `signatureSlot` u64 |
-| **LightClientFinalityUpdate** | `attestedHeader` · `finalizedHeader` · `finalityBranch` (6/7) · `syncAggregate` (160) · `signatureSlot` u64 |
+| **LightClientHeader** | `beacon` (112 inline) · `execution` (ExecutionPayloadHeader, variable) · `executionBranch` Vector[B32, **4**]. **Hardcoded Capella+** before Gloas (4 branch nodes + a payload header; no pre-Capella Altair variant). **Gloas shape** (496 B, fixed): `beacon` · `executionBlockHash` B32 · `executionBranch` Vector[B32, **11**]. |
+| **LightClientBootstrap** | `header` · `currentSyncCommittee` (24624) · `currentSyncCommitteeBranch` (5 **or** 6 × B32; Gloas 11) |
+| **LightClientUpdate** | `attestedHeader` · `nextSyncCommittee` (24624) · `nextSyncCommitteeBranch` (5/6; Gloas 11) · `finalizedHeader` · `finalityBranch` (6/7; Gloas 9) · `syncAggregate` (160) · `signatureSlot` u64 |
+| **LightClientFinalityUpdate** | `attestedHeader` · `finalizedHeader` · `finalityBranch` (6/7; Gloas 9) · `syncAggregate` (160) · `signatureSlot` u64 |
 | **ExecutionPayloadHeader** | **exactly 17 merkleized fields** incl. `withdrawalsRoot` (Capella), `blobGasUsed`/`excessBlobGas` (Deneb). The 3 EIP-7685 request roots are **decoded for tolerance but EXCLUDED from merkleization** (they live in `BeaconBlockBody.execution_requests`; including them breaks bootstrap). `stateRoot`/`blockHash`/`blockNumber`/`baseFeePerGas` are the EL anchor. |
 | **ForkData** | `currentVersion` B4 · `genesisValidatorsRoot` B32 |
 | **Checkpoint** (40 B) | `epoch` u64 · `root` B32 |
 
-> **Fork inference rule:** the fork is inferred from **SSZ branch length at decode time**, never
-> from a version tag. A `currentSyncCommitteeBranch` of length 5 = pre-Electra, 6 = Electra+.
-> A `finalityBranch` of length 6 = pre-Electra, 7 = Electra+. This is why the types carry no
-> explicit fork field.
+> **Fork inference rule:** before Gloas the fork is inferred from **SSZ branch length at decode
+> time**, never from a version tag. A `currentSyncCommitteeBranch` of length 5 = pre-Electra, 6 =
+> Electra+. A `finalityBranch` of length 6 = pre-Electra, 7 = Electra+. This is why the types carry
+> no explicit fork field. **Gloas objects are decoded by fork instead** (`decodeFor(LcFork)`):
+> they are fixed-size with no offsets, so the req/resp context bytes pick the decoder
+> (`BeaconLightClient.lcForkOf`; an object of exactly the Gloas size also reads as Gloas, e.g.
+> over HTTP), and the processor's shape gate checks every header against its attested slot's fork
+> before any BLS work. A header knows only which wire shape it was decoded from
+> (`LightClientHeader.shape()`).
 
 ---
 
@@ -106,9 +116,13 @@ for i in 0..depth-1:
 return value == root
 ```
 
-`index` is the **subtree index = generalized index with the leading 1 bit stripped**. There are
-no gindex-computation helpers in the kernel — the caller supplies `(depth, index)` from the table
-in §6.
+`index` is the **subtree index = generalized index with the leading 1 bit stripped** (the
+reference passes the full gindex; the loop reads only the low `depth` bits, so that is the same).
+The caller supplies `(depth, index)` from the table in §6. The one gindex-aware helper is
+`verifyNormalizedMerkleBranch(leaf, branch, gindex, root)` (the spec's
+`is_valid_normalized_merkle_branch`): depth = floorlog2(gindex), and a longer branch is accepted
+only when its extra leading nodes are zero — how a pre-Gloas header carried in the Gloas shape
+proves its block hash.
 
 **Notable hash-tree-roots to replicate exactly:**
 - `SyncCommittee`: each 48-byte pubkey is zero-padded to 64, split into 2 chunks, merkleized
@@ -121,18 +135,26 @@ in §6.
 
 ## 6. Generalized indices (fork-dependent)
 
-Computed at runtime from the branch length. `depth` = branch length; `index` = gindex with the
-leading 1 stripped (what `verifyMerkleBranch` consumes).
+Before Gloas, computed at runtime from the branch length. `depth` = branch length; `index` =
+gindex with the leading 1 stripped (what `verifyMerkleBranch` consumes).
 
-| Branch | gindex formula | Pre-Electra (depth · gindex) | Electra+ (depth · gindex) | leaf → root |
-|---|---|---|---|---|
-| execution_payload | constant | 4 · 25 | 4 · 25 | `execution.htr()` → `beacon.bodyRoot` |
-| current_sync_committee | `(1<<depth) + 22` | 5 · 54 | 6 · 86 | `committee.htr()` → `beacon.stateRoot` |
-| next_sync_committee | `(1<<depth) + 23` | 5 · 55 | 6 · 87 | `nextCommittee.htr()` → `beacon.stateRoot` |
-| finalized_root | `((1<<(depth-1)) + 20)*2 + 1` | 6 · 105 | 7 · 169 | `finalizedHeader.beacon.htr()` → `attestedHeader.beacon.stateRoot` |
+| Branch | gindex formula | Pre-Electra (depth · gindex) | Electra/Fulu (depth · gindex) | Gloas (depth · gindex) | leaf → root |
+|---|---|---|---|---|---|
+| execution_payload | constant | 4 · 25 | 4 · 25 | 11 · 2856 (block hash) | `execution.htr()` → `beacon.bodyRoot` (Gloas: `executionBlockHash`) |
+| current_sync_committee | `(1<<depth) + 22` | 5 · 54 | 6 · 86 | 11 · 2945 | `committee.htr()` → `beacon.stateRoot` |
+| next_sync_committee | `(1<<depth) + 23` | 5 · 55 | 6 · 87 | 11 · 2946 | `nextCommittee.htr()` → `beacon.stateRoot` |
+| finalized_root | `((1<<(depth-1)) + 20)*2 + 1` | 6 · 105 | 7 · 169 | 9 · 735 | `finalizedHeader.beacon.htr()` → `attestedHeader.beacon.stateRoot` |
 
 The finalized-root gindex is `…*2 + 1` because `root` is child index 1 inside the
 `Checkpoint{epoch, root}` container at beacon-state field 20.
+
+The Gloas column is **not** derivable from a branch length (the Gloas `BeaconState` is a
+progressive container; the formulas would give 553/2070/2071): those are constants in
+`BeaconChainSpec` (`*_GLOAS`), selected by the fork of the **attested** slot (a bootstrap: its
+header's slot), as the spec's `*_gindex_at_slot` helpers do. The execution proof is selected by
+each header's **own** slot (`LightClientProcessor.verifyExecutionBranchAt`): a pre-Gloas header
+carried in the Gloas shape (a Gloas update's finalized header right after the fork) proves its
+block hash at 812, zero-padded to 11 nodes (`verifyNormalizedMerkleBranch`).
 
 ---
 
@@ -254,22 +276,30 @@ On a received `LightClientBootstrap` (over libp2p; HTTP only for debug):
                     — the single root of trust. Reject otherwise.
 2. current_sync_committee branch:
        verifyMerkleBranch(committee.htr(), branch, depth, syncCommitteeGindex(depth),
-                          header.beacon.stateRoot)            // depth 5 or 6
+                          header.beacon.stateRoot)            // depth 5 or 6 (Gloas: 11 · 2945)
 3. execution branch:
-       verifyExecutionBranch(header)                          // depth 4, gindex 25, vs beacon.bodyRoot
+       verifyHeader(header)                                   // depth 4, gindex 25, vs beacon.bodyRoot
+                                                              // (Gloas: block hash, 11 · 2856)
 4. store.initialize(header, currentSyncCommittee)
        finalized = optimistic = header;  period = computeSyncCommitteePeriod(header.slot)
 ```
 
-Bootstrap does **not** BLS-verify — the committee is proven by Merkle inclusion in the *pinned*
-header's state; the signature anchor starts on the first forward update. The checkpoint is kept
-deliberately ~1 period stale so the catch-up path is always exercised.
+Steps 2–3 are `LightClientProcessor.verifyBootstrap`, which first refuses a header whose wire
+shape is not its own slot's fork's. Bootstrap does **not** BLS-verify — the committee is proven by
+Merkle inclusion in the *pinned* header's state; the signature anchor starts on the first forward
+update. The embedded checkpoint is pinned at the finalized head when refreshed (`./gradlew
+refreshCheckpoint`, both engines) and ages from there; the catch-up path (§9.3) carries the store
+from its period to the wall clock's.
 
 ### 9.2 Forward step — finality update (`processFinalityUpdate`)
 
 ```
-1. dedup: if syncAggregate.signature == lastAppliedFinalitySig, skip
-          (avoids re-running an ~18s BLS verify every 12s poll)
+0. period gate (as in 9.3) — selects the signing committee: the current one when
+          sigPeriod == storePeriod, the held next one for storePeriod + 1, else reject;
+   shape gate — both headers in the wire shape of the ATTESTED slot's fork
+1. memo: if (syncAggregate.signature, signatureSlot) is one of the last 4 verified
+          finality updates (LRU), return "verified, no advance" without re-verifying
+          (avoids re-running an ~18s BLS verify on every once-per-slot poll)
 2. participation gate + BLS verify (SyncCommitteeVerifier):
        require popcount(syncCommitteeBits)*3 >= 512*2
        require fastAggregateVerify(participating committee pubkeys,
@@ -278,20 +308,26 @@ deliberately ~1 period stale so the catch-up path is always exercised.
 3. finality branch:
        verifyMerkleBranch(finalizedHeader.beacon.htr(), finalityBranch, depth,
                           finalizedRootGindex(depth), attestedHeader.beacon.stateRoot)
-4. EXECUTION BRANCH FOR BOTH headers (attested AND finalized) — verifyExecutionBranch(each)
+                                                              // Gloas attested slot: 9 · 735
+4. EXECUTION BRANCH FOR BOTH headers (attested AND finalized) — verifyHeader(each),
+       each by the fork of its own slot (verifyExecutionBranchAt)
        CRITICAL: the BLS signature covers only the BEACON header. The execution payload
        (EL stateRoot/blockHash) is bound to it SOLELY by this branch. Skipping it lets a peer
        pair a genuine signed beacon header with a forged execution payload.
 5. store.updateFinalized(finalizedHeader); store.updateOptimistic(attestedHeader)
 6. store.applyNextSyncCommitteeWhenPeriodChanges(oldFinalizedSlot, finalizedSlot)
+7. memoize (signature, signatureSlot)
 ```
 
 `SyncCommitteeVerifier.verify` selects the participating pubkeys from the bitvector, runs the
-2/3 gate, computes the signing root, and calls `fastAggregateVerify`.
+2/3 gate, computes the signing root, and calls `fastAggregateVerify`. The memo keys on the
+signature slot too because it is not covered by the signature: the same aggregate relabelled into
+another period must face the period gate and the next committee's keys (#423).
 
 ### 9.3 Forward step — full update (`processUpdate`, for catch-up)
 
-Adds, **before** the expensive BLS verify, the spec's `validate_light_client_update` period gate:
+Runs the spec's `validate_light_client_update` period gate **before** the expensive BLS verify
+(the finality path in 9.2 shares it — `LightClientProcessor.committeeFor`):
 
 ```
 sigPeriod = computeSyncCommitteePeriod(update.signatureSlot)
@@ -300,9 +336,10 @@ applicable iff  sigPeriod == storePeriod
 ```
 
 This is essential: a catch-up `updates_by_range` response routinely contains far-future periods,
-and an unguarded BLS verify costs 17–30 s **each** on a phone. Then it verifies the
-`next_sync_committee` branch (depth 5/6) when the update carries a next committee the store
-doesn't yet hold, and stores it.
+and an unguarded BLS verify costs 17–30 s **each** on a phone. A store holding no next committee
+also requires the update to be attested in the store's own period (its next committee is then
+the store's next). Then it verifies the `next_sync_committee` branch (depth 5/6; Gloas 11 · 2946)
+when the update carries a next committee the store doesn't yet hold, and stores it.
 
 ### 9.4 Sync-committee rotation (`LightClientStore`)
 
@@ -333,7 +370,10 @@ The store tracks `currentSyncCommitteePeriod` **separately** from the finalized 
 
 `BeaconSyncState` is lock-free for reads (an `AtomicReference` to an immutable state record) plus
 a rolling deque (cap 8192) of `(slot, executionStateRoot, blsVerified)` — the window the rest of
-the app uses to check a peer-claimed EL state root against a beacon-attested one.
+the app uses to check a peer-claimed EL state root against a beacon-attested one. From Gloas a
+header yields only a block hash: it is held as PENDING until an EL peer serves the header whose
+keccak matches (`resolveHeader`), and the gate above reads the resolved finality, so a hash no
+peer resolves drops out of SYNCED after the slack.
 
 ### 9.6 Full lifecycle (`syncLoop`)
 
@@ -365,14 +405,17 @@ Phase 2   steady-state: once per slot, just past a third of the way into it, pol
           (re-fetch a LightClientUpdate on each period boundary; see 9.4)
 ```
 
-`catchUpSyncCommittee` fetches `LightClientUpdate`s by period range from wall-clock target
-downward, up to `MAX_CATCHUP_BATCHES = 8` batches of ≤128 periods, fanning out to up to
+`catchUpSyncCommittee` fetches `LightClientUpdate`s by period range from the store's committee
+period up toward the wall-clock period, up to `MAX_CATCHUP_BATCHES = 8` batches of ≤128 periods
+per call, fanning out to up to
 `CATCHUP_FANOUT_MAX = 48` peers (proven light-client peers first, in 3 tiers); first applied
 success wins (applies hold a lock on the store).
 
 ### 9.7 Snapshot persistence (`LightClientStoreSnapshot`)
 
-Custom binary format (magic `LCSS`, version 1) persisting the verified store so a restart resumes
+Custom binary format (magic `LCSS`, version 1; version 2 — a shape tag per header — is written
+only once a Gloas-shaped header is held, so a payload-shaped store stays v1 byte-for-byte and an
+older build can still resume it) persisting the verified store so a restart resumes
 from the last verified period instead of re-bootstrapping (~10 s vs minutes). **It is bound to
 `genesisValidatorsRoot`** and is a private cache, **not a trust anchor**: a corrupt / foreign /
 older-than-checkpoint snapshot is rejected, and any bad snapshot self-corrects (the next BLS
@@ -458,7 +501,10 @@ Accept the current digest plus the prior-fork digest (eases fork-transition wind
   can initiate, not serve; deliberately not advertised in Identify).
 - Metadata responder is hardcoded (seq 0, all-zero attnets/syncnets); finality/optimistic/bootstrap
   responders are relay-cache echoes (TTL 90 s) of the last received payload; status responder
-  echoes local status without validating the peer's.
+  echoes local status without validating the peer's. (The relay cache is the Java reference's: the
+  Rust engine's wallet host answers the four `light_client_*` protocols `ResourceUnavailable` and
+  keeps `updates_by_range` outbound-only — it serves them, `updates_by_range` included, only as
+  [`rust/roost`](../../rust/roost/README.md)'s server, `reqresp.rs` `lc_responder`.)
 
 The libp2p layer never touches the verifier — it returns raw SSZ `byte[]`; `BeaconLightClient`
 decodes and verifies one layer up.
@@ -497,7 +543,8 @@ lists. See companion 03 §2 for the algorithm; the security invariant — **`sto
 4. `fastAggregateVerify` accepts a known-good sync-aggregate and rejects a 1-bit-flipped signature.
 5. 2/3 participation gate rejects a sub-threshold bitvector before BLS runs.
 6. All four branches verify with the correct fork-dependent gindices (test both pre-Electra depth
-   5/6 and Electra+ 6/7 fixtures).
+   5/6 and Electra+ 6/7 fixtures, plus the fixed Gloas indices of §6 — including a pre-Gloas
+   finalized header in the Gloas shape, block hash at 812 zero-padded to 11 nodes).
 7. `ExecutionPayloadHeader` htr matches a known value with the 3 request roots **excluded**.
 8. Period rotation: finality across a period boundary rotates current←next; a finality update with
    no held next committee after a boundary fails until a `LightClientUpdate` is fetched.
