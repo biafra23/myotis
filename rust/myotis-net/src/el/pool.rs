@@ -610,13 +610,11 @@ struct PoolInner {
     backoff: Mutex<HashMap<SocketAddr, Backoff>>,
     /// Node ids of wrong-chain peers, never dialed again this run.
     blacklist: Mutex<HashSet<[u8; 64]>>,
-    /// When each address last saw a direct dial or session from us: set when a
-    /// dial is launched and when its session ends. What Tor reads and sends
-    /// stay away from ([`PeerPool::tor_candidates`]).
-    direct_contact: std::sync::Mutex<HashMap<SocketAddr, Instant>>,
-    /// When each address was last reached over Tor ([`PeerPool::note_tor_contact`]):
-    /// the pool does not dial it directly for [`TOR_DIRECT_SEPARATION`] after.
-    tor_contact: std::sync::Mutex<HashMap<SocketAddr, Instant>>,
+    /// Peers evicted from `peers` whose sessions may still be open — a read or
+    /// a detached clearnet push can hold the `Arc` for a while. Counted as
+    /// live for Tor until closed, then stamped as a direct contact
+    /// ([`PoolInner::sweep_lingering`]).
+    lingering: std::sync::Mutex<Vec<([u8; 64], std::sync::Weak<ManagedPeer>)>>,
     /// Proven snap-capable peers, persisted for warm-start on the next run.
     cache: Mutex<ElPeerCache>,
     /// The network's pinned EL peers, `(addr, 64-byte pubkey)` — Java
@@ -700,16 +698,34 @@ struct PoolInner {
 }
 
 impl PoolInner {
-    /// Record a direct contact with `addr` now: a dial launched, a session ended.
-    fn note_direct_contact(&self, addr: SocketAddr) {
-        note_contact(&self.direct_contact, addr, Instant::now());
+    /// Evict `peer` from the Tor point of view: its session may outlive its
+    /// slot in `peers` (see `lingering`), so it is stamped now AND tracked
+    /// until it closes.
+    fn note_evicted(&self, peer: &Arc<ManagedPeer>) {
+        let node = peer.peer_pubkey();
+        note_direct_contact(node, Instant::now());
+        let mut lingering = self.lingering.lock().unwrap_or_else(|p| p.into_inner());
+        lingering.push((node, Arc::downgrade(peer)));
     }
 
-    /// Whether `addr` was reached over Tor within [`TOR_DIRECT_SEPARATION`]:
-    /// then the pool does not dial it directly.
-    fn tor_quarantined(&self, addr: SocketAddr) -> bool {
-        let map = self.tor_contact.lock().unwrap_or_else(|p| p.into_inner());
-        map.get(&addr).is_some_and(|t| within_separation(*t, Instant::now()))
+    /// The evicted peers whose sessions are still open; each one found closed
+    /// is stamped as a direct contact now (its session ended at or before now)
+    /// and dropped from the list.
+    fn sweep_lingering(&self) -> HashSet<[u8; 64]> {
+        let now = Instant::now();
+        let mut open = HashSet::new();
+        let mut lingering = self.lingering.lock().unwrap_or_else(|p| p.into_inner());
+        lingering.retain(|(node, weak)| match weak.upgrade() {
+            Some(peer) if !peer.is_closed() => {
+                open.insert(*node);
+                true
+            }
+            _ => {
+                note_direct_contact(*node, now);
+                false
+            }
+        });
+        open
     }
 
     /// Every pin the pool maintains: the network's, then the host's that add
@@ -793,8 +809,10 @@ impl PoolInner {
                             client = ?log_client_id(&p.peer.peer_hello.client_id),
                             "evicting snap peer after repeated verified-read failures — \
                              freeing the slot for a fresh candidate");
+                        if let Some(evicted) = peers.iter().find(|p| p.addr == addr) {
+                            self.note_evicted(&evicted.peer);
+                        }
                         peers.retain(|p| p.addr != addr);
-                        self.note_direct_contact(addr);
                         // NOTE the order across the next awaits: the address stays
                         // claimed in `attempted` until AFTER its backoff is
                         // recorded, so a concurrent try_dial (which checks backoff
@@ -880,8 +898,10 @@ impl PoolInner {
         let now = Instant::now();
         let mut peers = self.peers.lock().await;
         let mut freed = Vec::new();
+        let mut freed_nodes = Vec::new();
         peers.retain(|p| {
             if p.peer.is_closed() {
+                freed_nodes.push(p.peer.peer_pubkey());
                 freed.push((
                     p.addr,
                     now.saturating_duration_since(p.admitted_at),
@@ -898,8 +918,8 @@ impl PoolInner {
         if freed.is_empty() {
             return live;
         }
-        for (addr, ..) in &freed {
-            self.note_direct_contact(*addr);
+        for node in &freed_nodes {
+            note_direct_contact(*node, now);
         }
         // The wait BEFORE the claim is released — the order `record_quality`
         // documents: a dialer that finds the address unclaimed must also find
@@ -974,8 +994,8 @@ impl PoolInner {
                 return;
             };
             let client = log_client_id(&p.peer.peer_hello.client_id);
+            self.note_evicted(&p.peer);
             peers.retain(|p| p.addr != addr);
-            self.note_direct_contact(addr);
             client
         };
         tracing::info!(%addr, client = ?client, "evicting snap peer as lagging: {why}");
@@ -1259,8 +1279,7 @@ impl PeerPool {
             scarcity_cursor: std::sync::atomic::AtomicUsize::new(0),
             last_scarcity_log: Mutex::new(None),
             blacklist: Mutex::new(HashSet::new()),
-            direct_contact: std::sync::Mutex::new(HashMap::new()),
-            tor_contact: std::sync::Mutex::new(HashMap::new()),
+            lingering: std::sync::Mutex::new(Vec::new()),
             cache: Mutex::new(cache),
             boot_enodes,
             host_enodes: Mutex::new(Vec::new()),
@@ -1314,30 +1333,56 @@ impl PeerPool {
 
     /// The peers a Tor read (`snap_only`) or send may dial, best first
     /// (docs/privacy-and-tor.md §5): cached peers — identities a past session
-    /// proved — that hold no session with us now and saw no direct dial or
-    /// session from us within [`TOR_DIRECT_SEPARATION`], never a pin (dialed
-    /// directly on any shortfall) and never a wrong-chain peer. A read also
-    /// needs a snap server that has not refused to serve. Empty means the Tor
-    /// path fails closed: it never falls back to a peer that sees our IP.
+    /// proved — that hold no session with us now (pooled, being dialed, or
+    /// evicted but still open) and saw no direct dial or session from us within
+    /// [`TOR_DIRECT_SEPARATION`], by node id; never a pin (dialed directly on
+    /// any shortfall) and never a wrong-chain peer. A read also needs a snap
+    /// server that has not refused to serve. Claim the ones used with
+    /// [`Self::claim_for_tor`]. Empty means the Tor path fails closed: it never
+    /// falls back to a peer that sees our IP.
     pub async fn tor_candidates(&self, snap_only: bool) -> Vec<(SocketAddr, [u8; 64])> {
         self.inner.prune_closed().await;
         let cached = self.inner.cache.lock().await.peers();
-        let mut live = self.inner.attempted.lock().await.clone();
-        live.extend(self.inner.peers.lock().await.iter().map(|p| p.addr));
+        let mut live_addrs = self.inner.attempted.lock().await.clone();
+        let mut live_nodes = self.inner.sweep_lingering();
+        for p in self.inner.peers.lock().await.iter() {
+            live_addrs.insert(p.addr);
+            live_nodes.insert(p.peer.peer_pubkey());
+        }
         let pins: HashSet<SocketAddr> =
             self.inner.all_pins().await.into_iter().map(|(addr, _)| addr).collect();
         let blacklist = self.inner.blacklist.lock().await.clone();
-        let contact = self.inner.direct_contact.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        tor_eligible(cached, &TorExclusions { live: &live, pins: &pins, blacklist: &blacklist, contact: &contact }, snap_only, Instant::now())
+        let now = Instant::now();
+        let ex = TorExclusions {
+            live_addrs: &live_addrs,
+            live_nodes: &live_nodes,
+            pins: &pins,
+            blacklist: &blacklist,
+            recently_contacted: &|node| direct_contact_recent(node, now),
+        };
+        tor_eligible(cached, &ex, snap_only)
     }
 
-    /// Record that `addrs` are being reached over Tor now: the pool leaves each
-    /// undialed directly for [`TOR_DIRECT_SEPARATION`].
-    pub fn note_tor_contact(&self, addrs: impl IntoIterator<Item = SocketAddr>) {
+    /// Claim `targets` for a Tor read or send in contact with them until
+    /// `until`: drops any the pool claimed for a direct dial since
+    /// [`Self::tor_candidates`] ran, and quarantines the rest — the pool will
+    /// not dial them directly for [`TOR_DIRECT_SEPARATION`] after `until`.
+    /// Done under the pool's claim lock, the one a direct dial's claim takes,
+    /// so the two can never both reach the same node.
+    pub async fn claim_for_tor(
+        &self,
+        targets: Vec<(SocketAddr, [u8; 64])>,
+        until: Instant,
+    ) -> Vec<(SocketAddr, [u8; 64])> {
+        let attempted = self.inner.attempted.lock().await;
         let now = Instant::now();
-        for addr in addrs {
-            note_contact(&self.inner.tor_contact, addr, now);
-        }
+        let kept: Vec<_> = targets
+            .into_iter()
+            .filter(|(addr, node)| !attempted.contains(addr) && !direct_contact_recent(*node, now))
+            .collect();
+        note_tor_contact_until(kept.iter().map(|(_, node)| *node), until);
+        drop(attempted);
+        kept
     }
 
     /// Count of live snap peers (prunes closed peers first).
@@ -1620,48 +1665,97 @@ async fn anchor_resolver_loop(inner: Arc<PoolInner>, anchor: Arc<ExecAnchor>) {
     }
 }
 
-/// Dial cached snap peers first (warm start), then consume the discv4 candidate
-/// stream — both through the same eligibility + concurrency-capped dial path.
-/// Whether a contact at `at` is still inside [`TOR_DIRECT_SEPARATION`] at `now`.
+/// Whether a contact at `at` is still inside [`TOR_DIRECT_SEPARATION`] at `now`
+/// (a contact stamped into the future — a Tor operation's end — counts as now).
 fn within_separation(at: Instant, now: Instant) -> bool {
     now.saturating_duration_since(at) < TOR_DIRECT_SEPARATION
 }
 
-/// Record a contact with `addr` at `now`, dropping entries past the separation
-/// window once the map grows, so it stays bounded by recent contacts.
-fn note_contact(map: &std::sync::Mutex<HashMap<SocketAddr, Instant>>, addr: SocketAddr, now: Instant) {
-    let mut map = map.lock().unwrap_or_else(|p| p.into_inner());
-    if map.len() >= 256 {
-        map.retain(|_, at| within_separation(*at, now));
+/// When each node (by id) last had a contact of one kind with us. Process-wide,
+/// not per pool, so a pool restart (a network paused and resumed, an engine
+/// switch) keeps it; a process restart forgets it (docs/privacy-and-tor.md §5).
+#[derive(Default)]
+struct ContactLog {
+    at: HashMap<[u8; 64], Instant>,
+    last_prune: Option<Instant>,
+}
+
+impl ContactLog {
+    /// Record a contact with `node` lasting until `until` (now, or a Tor
+    /// operation's deadline); an earlier stamp never replaces a later one.
+    /// Entries past the window are dropped at most once a minute.
+    fn note(&mut self, node: [u8; 64], until: Instant, now: Instant) {
+        if self.last_prune.is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_secs(60)) {
+            self.at.retain(|_, at| within_separation(*at, now));
+            self.last_prune = Some(now);
+        }
+        let entry = self.at.entry(node).or_insert(until);
+        if *entry < until {
+            *entry = until;
+        }
     }
-    map.insert(addr, now);
+
+    fn recent(&self, node: [u8; 64], now: Instant) -> bool {
+        self.at.get(&node).is_some_and(|at| within_separation(*at, now))
+    }
+}
+
+/// Direct (clearnet) dials and sessions, stamped by the pool.
+static DIRECT_CONTACT: std::sync::LazyLock<std::sync::Mutex<ContactLog>> =
+    std::sync::LazyLock::new(Default::default);
+/// Tor reads and sends, stamped by [`PeerPool::claim_for_tor`] and
+/// [`note_tor_contact_until`].
+static TOR_CONTACT: std::sync::LazyLock<std::sync::Mutex<ContactLog>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn note_direct_contact(node: [u8; 64], now: Instant) {
+    DIRECT_CONTACT.lock().unwrap_or_else(|p| p.into_inner()).note(node, now, now);
+}
+
+fn direct_contact_recent(node: [u8; 64], now: Instant) -> bool {
+    DIRECT_CONTACT.lock().unwrap_or_else(|p| p.into_inner()).recent(node, now)
+}
+
+/// Whether `node` was reached over Tor within [`TOR_DIRECT_SEPARATION`]: then
+/// the pool does not dial it directly.
+fn tor_quarantined(node: [u8; 64], now: Instant) -> bool {
+    TOR_CONTACT.lock().unwrap_or_else(|p| p.into_inner()).recent(node, now)
+}
+
+/// Record that `nodes` are in contact with us over Tor until `until` — for a
+/// Tor operation still running past its claim (a rebroadcast round pushing one
+/// pending send after another). [`PeerPool::claim_for_tor`] stamps the claim.
+pub fn note_tor_contact_until(nodes: impl IntoIterator<Item = [u8; 64]>, until: Instant) {
+    let now = Instant::now();
+    let mut log = TOR_CONTACT.lock().unwrap_or_else(|p| p.into_inner());
+    for node in nodes {
+        log.note(node, until, now);
+    }
 }
 
 /// What a Tor read or send must stay away from ([`PeerPool::tor_candidates`]).
 struct TorExclusions<'a> {
-    /// In flight or connected.
-    live: &'a HashSet<SocketAddr>,
+    /// In flight or connected, by address.
+    live_addrs: &'a HashSet<SocketAddr>,
+    /// Pooled or evicted-but-open sessions, by node id.
+    live_nodes: &'a HashSet<[u8; 64]>,
     pins: &'a HashSet<SocketAddr>,
     blacklist: &'a HashSet<[u8; 64]>,
-    /// Last direct dial or session end per address.
-    contact: &'a HashMap<SocketAddr, Instant>,
+    /// A direct dial or session within the separation window, by node id.
+    recently_contacted: &'a dyn Fn([u8; 64]) -> bool,
 }
 
-/// Pure: the cached peers a Tor read (`snap_only`) or send may dial at `now`,
-/// in the cache's order (snap quality first).
-fn tor_eligible(
-    cached: Vec<CachedElPeer>,
-    ex: &TorExclusions<'_>,
-    snap_only: bool,
-    now: Instant,
-) -> Vec<(SocketAddr, [u8; 64])> {
+/// Pure: the cached peers a Tor read (`snap_only`) or send may dial, in the
+/// cache's order (snap quality first).
+fn tor_eligible(cached: Vec<CachedElPeer>, ex: &TorExclusions<'_>, snap_only: bool) -> Vec<(SocketAddr, [u8; 64])> {
     cached
         .into_iter()
         .filter(|c| {
-            !ex.live.contains(&c.addr)
+            !ex.live_addrs.contains(&c.addr)
+                && !ex.live_nodes.contains(&c.pubkey)
                 && !ex.pins.contains(&c.addr)
                 && !ex.blacklist.contains(&c.pubkey)
-                && ex.contact.get(&c.addr).is_none_or(|at| !within_separation(*at, now))
+                && !(ex.recently_contacted)(c.pubkey)
                 && (!snap_only || (c.snap && c.quality != SnapQuality::Denied))
         })
         .map(|c| (c.addr, c.pubkey))
@@ -1673,56 +1767,67 @@ mod tor_eligible_tests {
     use super::*;
 
     fn peer(port: u16, snap: bool, quality: SnapQuality) -> CachedElPeer {
-        CachedElPeer {
-            addr: SocketAddr::from(([10, 0, 0, 1], port)),
-            pubkey: [port as u8; 64],
-            snap,
-            quality,
-        }
+        CachedElPeer { addr: SocketAddr::from(([10, 0, 0, 1], port)), pubkey: [port as u8; 64], snap, quality }
     }
 
     #[test]
-    fn only_peers_without_recent_direct_contact_are_eligible() {
-        let now = Instant::now();
+    fn only_peers_without_a_direct_connection_are_eligible() {
         let fresh = peer(1, true, SnapQuality::Confirmed); // never contacted
-        let live = peer(2, true, SnapQuality::Confirmed); // connected now
+        let live = peer(2, true, SnapQuality::Confirmed); // connected now, by address
         let pin = peer(3, true, SnapQuality::Confirmed);
         let banned = peer(4, true, SnapQuality::Confirmed); // wrong chain
-        let recent = peer(5, true, SnapQuality::Confirmed); // dialed 9 min ago
-        let aged = peer(6, true, SnapQuality::Unknown); // session ended 11 min ago
+        let recent = peer(5, true, SnapQuality::Confirmed); // dialed lately (by node id)
+        let lingering = peer(6, true, SnapQuality::Unknown); // evicted, session still open
         let refused = peer(7, true, SnapQuality::Denied); // refused to serve snap
         let plain = peer(8, false, SnapQuality::Unknown); // not a snap peer
-        let all = vec![fresh.clone(), live.clone(), pin.clone(), banned.clone(), recent.clone(), aged.clone(), refused.clone(), plain.clone()];
-        let live_set = HashSet::from([live.addr]);
+        let all = vec![
+            fresh.clone(), live.clone(), pin.clone(), banned.clone(),
+            recent.clone(), lingering.clone(), refused.clone(), plain.clone(),
+        ];
+        let live_addrs = HashSet::from([live.addr]);
+        let live_nodes = HashSet::from([lingering.pubkey]);
         let pins = HashSet::from([pin.addr]);
         let blacklist = HashSet::from([banned.pubkey]);
-        let contact = HashMap::from([
-            (recent.addr, now - Duration::from_secs(9 * 60)),
-            (aged.addr, now - Duration::from_secs(11 * 60)),
-        ]);
-        let ex = TorExclusions { live: &live_set, pins: &pins, blacklist: &blacklist, contact: &contact };
+        let recent_node = recent.pubkey;
+        let recently_contacted = move |node: [u8; 64]| node == recent_node;
+        let ex = TorExclusions {
+            live_addrs: &live_addrs,
+            live_nodes: &live_nodes,
+            pins: &pins,
+            blacklist: &blacklist,
+            recently_contacted: &recently_contacted,
+        };
         let addrs = |v: Vec<(SocketAddr, [u8; 64])>| v.into_iter().map(|(a, _)| a).collect::<Vec<_>>();
         // A read needs a snap server that has not refused.
-        assert_eq!(addrs(tor_eligible(all.clone(), &ex, true, now)), vec![fresh.addr, aged.addr]);
+        assert_eq!(addrs(tor_eligible(all.clone(), &ex, true)), vec![fresh.addr]);
         // A send takes any eth peer.
-        assert_eq!(
-            addrs(tor_eligible(all, &ex, false, now)),
-            vec![fresh.addr, aged.addr, refused.addr, plain.addr]
-        );
+        assert_eq!(addrs(tor_eligible(all, &ex, false)), vec![fresh.addr, refused.addr, plain.addr]);
     }
 
     #[test]
-    fn the_separation_window_runs_both_ways() {
-        let now = Instant::now();
-        assert!(within_separation(now - Duration::from_secs(599), now));
-        assert!(!within_separation(now - TOR_DIRECT_SEPARATION, now));
-        let map = std::sync::Mutex::new(HashMap::new());
-        let a = SocketAddr::from(([10, 0, 0, 1], 1));
-        note_contact(&map, a, now);
-        assert!(map.lock().unwrap().get(&a).is_some_and(|at| within_separation(*at, now)));
+    fn a_contact_counts_for_ten_minutes_from_its_end() {
+        // Offsets from a later instant: never `Instant::now() - …`, which
+        // underflows on a host whose monotonic clock is younger than the span.
+        let base = Instant::now() + Duration::from_secs(3600);
+        let node = [9u8; 64];
+        let mut log = ContactLog::default();
+        log.note(node, base, base);
+        assert!(log.recent(node, base + Duration::from_secs(599)));
+        assert!(!log.recent(node, base + TOR_DIRECT_SEPARATION));
+        // A Tor operation stamped to its deadline: the window runs from there,
+        // and an earlier stamp never shortens it.
+        log.note(node, base + Duration::from_secs(80), base);
+        log.note(node, base + Duration::from_secs(10), base);
+        assert!(log.recent(node, base + Duration::from_secs(80 + 599)));
+        assert!(!log.recent(node, base + Duration::from_secs(80) + TOR_DIRECT_SEPARATION));
+        // Expired entries are pruned on a later note.
+        log.note([1u8; 64], base + Duration::from_secs(3600), base + Duration::from_secs(3600));
+        assert!(!log.at.contains_key(&node));
     }
 }
 
+/// Dial cached snap peers first (warm start), then consume the discv4 candidate
+/// stream — both through the same eligibility + concurrency-capped dial path.
 async fn dialer_loop(inner: Arc<PoolInner>, mut rx: mpsc::Receiver<TableEntry>) {
     // Warm start: the network's PINNED boot enodes first, then proven snap peers
     // from the cache, snap-quality first (Confirmed → Unknown → Denied).
@@ -1818,10 +1923,6 @@ async fn try_dial_verdict(
     if inner.blacklist.lock().await.contains(&pubkey) {
         return DialVerdict::Skipped;
     }
-    // Reached over Tor lately: a direct dial now could pair the two by timing.
-    if inner.tor_quarantined(addr) {
-        return DialVerdict::Skipped;
-    }
     // Backoff: skip while cooling off — for a window the pool's shortfall may
     // have shortened (`Backoff::blocks`, #539) — and drop the entry once it no
     // longer blocks so the map doesn't grow unbounded. The live count is read
@@ -1836,12 +1937,20 @@ async fn try_dial_verdict(
             backoff.remove(&addr);
         }
     }
-    // Claim the address (bounded), or skip if in-flight/connected already.
+    // Claim the address (bounded), or skip if in-flight/connected already —
+    // or if the node was reached over Tor lately: a direct dial now could pair
+    // the two by timing. The check and the direct-contact stamp happen under
+    // the claim lock, the one `PeerPool::claim_for_tor` takes, so a Tor claim
+    // and a direct dial of the same node can never both go ahead.
     {
         let mut attempted = inner.attempted.lock().await;
-        if attempted.len() >= inner.pool_cfg.max_attempted || !attempted.insert(addr) {
+        if tor_quarantined(pubkey, Instant::now())
+            || attempted.len() >= inner.pool_cfg.max_attempted
+            || !attempted.insert(addr)
+        {
             return DialVerdict::Skipped;
         }
+        note_direct_contact(pubkey, Instant::now());
     }
     // Bound concurrency: acquire a dial permit (waits when saturated), then dial
     // in a task that releases it when done.
@@ -1849,10 +1958,13 @@ async fn try_dial_verdict(
         inner.attempted.lock().await.remove(&addr);
         return DialVerdict::Shutdown;
     };
-    inner.note_direct_contact(addr);
     let inner2 = Arc::clone(inner);
     inner.tasks.spawn(async move {
         inner2.dial_one(addr, pubkey).await;
+        // A dial that did not end in the pool (refused, wrong chain, lagging)
+        // talked to the peer until now; a pooled one is live and stamped again
+        // when its session ends.
+        note_direct_contact(pubkey, Instant::now());
         drop(permit);
     });
     DialVerdict::Dialed
@@ -2683,6 +2795,22 @@ mod tests {
         /// A loopback address nothing listens on: a dial fails at TCP at once.
         fn dead(port: u16) -> SocketAddr {
             SocketAddr::from(([127, 0, 0, 1], port))
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_tor_claim_and_a_direct_dial_never_reach_the_same_node() {
+            let pool = fixture(b"tor-claim");
+            let until = Instant::now() + Duration::from_secs(80);
+            // Claimed for Tor: the pool will not dial that node directly, at any
+            // of its addresses.
+            let tor_node = [0x71u8; 64];
+            let kept = pool.claim_for_tor(vec![(dead(11), tor_node)], until).await;
+            assert_eq!(kept, vec![(dead(11), tor_node)]);
+            assert!(matches!(try_dial_verdict(&pool.inner, dead(12), tor_node).await, DialVerdict::Skipped));
+            // Dialed directly: a Tor claim of that node drops it, at any address.
+            let direct_node = [0x72u8; 64];
+            assert!(matches!(try_dial_verdict(&pool.inner, dead(13), direct_node).await, DialVerdict::Dialed));
+            assert!(pool.claim_for_tor(vec![(dead(14), direct_node)], until).await.is_empty());
         }
 
         #[tokio::test(start_paused = true)]

@@ -24,15 +24,18 @@
 > query follows the Tor toggle and only the content-addressed bytecode fetch
 > stays clearnet. Tor reads and sends go only to cached peers — identities a
 > past session proved — that hold no direct session with us and saw no direct
-> dial or session from us in the last ten minutes, never a pin; the pool then
-> leaves each peer it reached over Tor undialed directly for ten minutes; with
-> no such peer the read or send fails closed (`PeerPool::tor_candidates`,
-> `TOR_DIRECT_SEPARATION`). Tor-side Hellos name the software without its
-> version (`myotis`, §6.3). That is a first step toward §5, not the design:
-> no days-long randomized quarantine, no batch rotation, separation state
-> lives for one pool run, discovery's UDP pings still reach many nodes from
-> the real IP, and an operator running many nodes can pool what they see —
-> a network-privacy win, not yet the full §5 unlinkability. The runnable proof
+> dial or session from us in the last ten minutes (by node id, so a node at a
+> new address counts too), never a pin; the pool then leaves each node it
+> reached over Tor undialed directly until ten minutes past the Tor
+> operation's end, claimed under the same lock as a direct dial; with no such
+> peer the read or send fails closed (`PeerPool::tor_candidates` /
+> `claim_for_tor`, `TOR_DIRECT_SEPARATION`). Tor-side Hellos name the software
+> without its version (`myotis`, §6.3). That is a first step toward §5, not
+> the design: no days-long randomized quarantine, no batch rotation, the
+> separation record lives for one process (a restarted app forgets it),
+> discovery's UDP pings still reach many nodes from the real IP, and an
+> operator running many nodes can pool what they see — a network-privacy win,
+> not yet the full §5 unlinkability. The runnable proof
 > of concept
 > (`rust/tor-poc`, see [§9](#9-proof-of-concept--what-was-validated)) validated
 > the transport against live mainnet and its measurements are folded back in

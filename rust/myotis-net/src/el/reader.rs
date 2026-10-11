@@ -5993,15 +5993,22 @@ impl ElReader {
         // real IP or our persistent node key.
         //
         // Only peers that see no direct session from us (docs §5,
-        // `PeerPool::tor_candidates`): a peer holding both could pair them. Each
-        // one dialed is then left undialed directly for ten minutes. None →
-        // fail closed, never a peer that sees our IP.
+        // `PeerPool::tor_candidates`): a peer holding both could pair them. All
+        // of them are claimed up front, for the whole read: the pool then
+        // leaves them undialed directly until ten minutes past its deadline.
+        // None → fail closed, never a peer that sees our IP.
         //
         // Bound the fan-out: each Tor dial is
         // slow and many peers reject Tor-exit inbound, so cap the candidates AND
         // the whole read, or one balance query could hang the FFI call for minutes
         // (a bad-exit walk); fail-closed on the deadline.
-        let candidates = tor_candidates(&self.pool.tor_candidates(true).await, 0);
+        let candidates = self
+            .pool
+            .claim_for_tor(
+                tor_candidates(&self.pool.tor_candidates(true).await, 0),
+                tokio::time::Instant::now() + TOR_READ_DEADLINE,
+            )
+            .await;
         if candidates.is_empty() {
             tracing::info!("tor: account read failed — no peer without a recent direct connection");
             return Err(NO_TOR_PEER.into());
@@ -6019,7 +6026,6 @@ impl ElReader {
                 break;
             }
             // Bound each candidate's whole dial+read by the remaining budget.
-            self.pool.note_tor_contact([addr]);
             let attempt = async {
                 let mut session =
                     crate::el::tor::open_snap_session(&address, addr, pubkey, &self.eth_cfg).await?;
@@ -7919,8 +7925,15 @@ impl ElReader {
         // or not at all — never from the real IP as a fallback.
         #[cfg(feature = "tor")]
         if crate::el::tor::is_enabled() {
-            let targets = tor_candidates(&self.pool.tor_candidates(false).await, 0);
-            self.pool.note_tor_contact(targets.iter().map(|(addr, _)| *addr));
+            // Claimed for the push and its grace: the pool leaves them undialed
+            // directly until ten minutes past both.
+            let targets = self
+                .pool
+                .claim_for_tor(
+                    tor_candidates(&self.pool.tor_candidates(false).await, 0),
+                    tokio::time::Instant::now() + TOR_PUSH_DEADLINE + TOR_BROADCAST_GRACE,
+                )
+                .await;
             let raw = std::sync::Arc::<[u8]>::from(raw_tx);
             let shutdown = self.request_shutdown.subscribe();
             return match tor_broadcast(targets, &self.eth_cfg, &raw, shutdown).await {
@@ -8201,8 +8214,13 @@ impl ElReader {
         };
         // Only the targets go into the task, not the pool's peer handles.
         let eligible = self.pool.tor_candidates(false).await;
-        let targets = tor_candidates(&eligible, round.wrapping_mul(TOR_MAX_CANDIDATES));
-        self.pool.note_tor_contact(targets.iter().map(|(addr, _)| *addr));
+        let targets = self
+            .pool
+            .claim_for_tor(
+                tor_candidates(&eligible, round.wrapping_mul(TOR_MAX_CANDIDATES)),
+                tokio::time::Instant::now() + TOR_PUSH_DEADLINE + TOR_BROADCAST_GRACE,
+            )
+            .await;
         if targets.is_empty() {
             return;
         }
@@ -8210,6 +8228,13 @@ impl ElReader {
         tokio::spawn(async move {
             let _guard = guard;
             for raw in work {
+                // Each push can outlast the claim: the round pushes one pending
+                // send after another, so keep the targets quarantined to past
+                // this one's end.
+                crate::el::pool::note_tor_contact_until(
+                    targets.iter().map(|(_, node)| *node),
+                    tokio::time::Instant::now() + TOR_PUSH_DEADLINE + TOR_BROADCAST_GRACE,
+                );
                 let raw = std::sync::Arc::<[u8]>::from(raw);
                 match tor_broadcast(targets.clone(), &eth_cfg, &raw, shutdown.clone()).await {
                     Ok(sent) => tracing::debug!(confirmed = sent.confirmed, "rebroadcast a sent tx over Tor"),
