@@ -66,7 +66,8 @@ release name.
    **Back it up offline**, with its password, in at least two places. A lost key
    cannot be replaced: every installed copy would have to be uninstalled (losing
    its data) to move to a new key. A leaked key lets anyone ship "updates".
-   Never commit it; `*.p12` / `*.jks` belong outside the checkout.
+   Never commit it. `.gitignore` refuses `*.p12` / `*.jks` as a backstop, but run
+   this outside the checkout anyway.
 
 2. **Create the environment**, restricted to v* tags:
 
@@ -139,12 +140,13 @@ one, as it would under a new id.
 
 `./gradlew :android-app:installDebug` installs **Myotis Debug** (the `.debug`
 package) next to a release install. `assembleRelease` gives the unsigned APK. To
-sign it yourself, run the CI script with the same variables:
+sign it yourself, run the CI script with the same variables. `read -s` keeps the
+password out of your shell history:
 
 ```bash
+read -rs ANDROID_RELEASE_KEYSTORE_PASSWORD && export ANDROID_RELEASE_KEYSTORE_PASSWORD
 ANDROID_RELEASE_KEYSTORE_BASE64="$(base64 -i myotis-release.p12)" \
 ANDROID_RELEASE_KEY_ALIAS=myotis-release \
-ANDROID_RELEASE_KEYSTORE_PASSWORD=… \
   scripts/sign_release_apk.sh android-app/build/outputs/apk/release/android-app-release-unsigned.apk Myotis.apk
 ```
 

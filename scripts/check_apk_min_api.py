@@ -244,13 +244,17 @@ class DexModel:
         an unresolved reference is still reported, never dropped.
         """
         def callers(site, chain):
-            """The non-synthetic classes that reach `site`; `chain` = sites on the path."""
+            """The classes that reach `site`; `chain` = sites on the path."""
             out = set()
             for caller in self.synthetic_callers.get(site, ()):
                 if not SYNTHETIC_RE.search(caller[0]):
                     out.add(caller[0])
                 elif caller not in chain:
-                    out |= callers(caller, chain | {caller})
+                    # A synthetic caller nobody calls directly (a lambda body,
+                    # reached by interface dispatch) is itself the best name:
+                    # D8 names a lambda after the class that wrote it, while a
+                    # shared stub borrows an arbitrary one.
+                    out |= callers(caller, chain | {caller}) or {caller[0]}
             return out
 
         for site, refs in self.synthetic_refs.items():

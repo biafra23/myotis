@@ -121,12 +121,14 @@ fi
 # --- prove it ------------------------------------------------------------------------
 report=$("$apksigner" verify --verbose --print-certs "$out") \
   || { rm -f "$out"; die "the signed APK does not verify"; }
-signers=$(sed -n 's/^Signer #[0-9]* certificate SHA-256 digest: *\([0-9a-f]*\)$/\1/p' <<< "$report" | sort -u)
+# EVERY signer line, not just `Signer #N`: v3.1 and rotation-lineage signers print
+# as `Signer (minSdkVersion=…, maxSdkVersion=…) certificate SHA-256 digest: …`.
+signers=$(sed -n 's/^Signer.* certificate SHA-256 digest: *\([0-9a-f]*\)$/\1/p' <<< "$report" | sort -u)
 if [ "$signers" != "$pin" ]; then
   rm -f "$out"
   die "signed with [$(tr '\n' ' ' <<< "$signers")] but the pinned release certificate is $pin — wrong keystore in the secrets, or a stale pin"
 fi
 grep -Eq '^Verified using v(2|3) scheme .*: true$' <<< "$report" \
   || { rm -f "$out"; die "no v2 or v3 signature on the result"; }
-grep -E '^(Verified using|Signer #1 certificate (DN|SHA-256))' <<< "$report"
+grep -E '^(Verified using|Signer.* certificate (DN|SHA-256))' <<< "$report" || true  # log only
 echo "signed: $out"
