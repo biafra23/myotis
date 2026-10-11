@@ -60,8 +60,9 @@ So a verifiable bundle for a watch set W over blocks [a, b] is, necessarily:
    transactions: the receipts show no watched log, so there is no hash to
    fill in. The body is a presence witness, never an absence one.
 
-That is byte-for-byte what the walker fetches from peers today (minus the
-bodies of false-positive blocks). The bundle changes the **transport**, not
+That is byte-for-byte what the walker fetches from peers today (receipts
+first since #544, so it skips the bodies of false-positive blocks too, unless
+`BodyPolicy` asks for bodies with the receipts on a dense watch-list). The bundle changes the **transport**, not
 the data or the verification, which `architecture-doc.md` (§"Block data via
 IPFS or other storage") already sanctions: block data may come from IPFS, a
 CDN, a centralized API, or a USB stick, because it is verified against

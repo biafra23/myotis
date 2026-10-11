@@ -6,7 +6,13 @@ merge blockers; each should either be fixed or consciously dropped.
 
 ## From PR #261 — Node.js binding
 
-- [ ] **libuv thread-pool starvation.** Every verified read runs on Node's
+- [x] **libuv thread-pool starvation.** Done, close to the longer-term option
+  below: verified reads run on the addon's own native workers (two per Node
+  environment, at most eight per process) and complete their Promises through
+  a Node-API threadsafe function, never a libuv work item; a saturated
+  scheduler refuses at once with `native scheduler busy`
+  (`rust/myotis-node/src/scheduler.rs`, the binding README). As raised: every
+  verified read ran on Node's
   shared libuv pool (default `UV_THREADPOOL_SIZE=4`). Four concurrent ~90 s
   worst-case reads block ALL of the host's `fs`/`dns`/`zlib`/`crypto` work —
   a real hazard in an Electron host that also runs IPFS/Swarm nodes.
@@ -80,8 +86,11 @@ complete on its own.
   (owner's decision 2026-09-24: Rust now, Java stays on #366): ABI 32, the
   three state reads take the selector, a finalized proof is verified at the
   finalized state root with no fallback, results carry `anchor`.
-  - [ ] **Java engine**: `VerifiedRpcBackend` still maps `finalized` to the
-    head for the state reads, `eth_call` and the block reads — #366 item 5.
+  - [ ] **Java engine**: still does not apply `finalized` — #366 item 5.
+    Since #366 it no longer answers the tag from the head: the router refuses
+    it with `-32602` on an engine whose `supportsFinalizedTag()` is false
+    (`RpcRouter.parseSelector`), and `VerifiedRpcBackend` refuses it for
+    `eth_call` / `eth_estimateGas` (`javaEngineRefusal`).
 - [x] **`Behind` peers in a race another peer won** — dropped consciously
   (owner's decision 2026-09-24): the ladder ranks such a peer last, the
   maintainer evicts it within a tick, and an unwitnessed strike never

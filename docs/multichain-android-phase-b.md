@@ -6,7 +6,9 @@ every enabled network (mainnet, Gnosis, Sepolia) in one foreground service with
 a per-network UI — today through the engine API (`MyotisEngine.create(...)` per
 network, `hostedNetworks()`, on either engine) rather than the
 `Map<String,ChainStack>` this document sketches, which is what the Java engine
-does internally. Class and line references below are as of the plan. The text
+does internally — and the per-network screens of Step 9 are the shared Compose
+Multiplatform `NodeScreen` (`:ui`, also the desktop's), which `MainActivity`
+only hosts. Class and line references below are as of the plan. The text
 that follows is the original plan, unchanged.
 
 The Phase B *foundation* was on the `feat/multichain-android` branch and compiled:

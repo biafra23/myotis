@@ -5,13 +5,14 @@ wildcards, and ERC-3668 CCIP-Read. The resolver runs the ENS contracts
 inside the local EVM (see `../evm/`); cross-cutting trust and architecture
 notes live in `../architecture-doc.md`. These are the **Java engine's**
 (`myotis-ens`) design documents; the **Rust engine** resolves ENS the same way
-over its own EVM (`rust/myotis-net/src/el`, `resolve_ens_json` /
+over its own EVM (the walk in `rust/myotis-evm/src/ens`, driven from
+`rust/myotis-net/src/el`, `resolve_ens_json` /
 `ens_record_json` in `rust/myotis-engine/src/host.rs`), with the same record
 types, CCIP-Read, and the forward-verified reverse lookup that names log-index
 entries.
 
 | Document | Scope |
 |----------|-------|
-| [phase3-design.md](phase3-design.md) | Phase 3 — forward + reverse ENS resolution against the Universal Resolver via the local EVM. |
+| [phase3-design.md](phase3-design.md) | Phase 3 — forward + reverse ENS resolution, step by step through the Registry and the name's resolver, via the local EVM. |
 | [phase4-design.md](phase4-design.md) | Phase 4 — CCIP-Read (ERC-3668). Off-chain lookup handler that decorates the EVM executor. |
 | [resolution-podcast.md](resolution-podcast.md) | Two-speaker walkthrough of how `resolve-ens vitalik.eth` works end-to-end. |

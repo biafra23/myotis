@@ -57,7 +57,11 @@ The engine-internal check is gates 1 + 3, plus the stack actually running
 cannot be built or refreshed without snap peers. On the Rust engine there is no
 separate head context (see the age measurement below), so the check is gates
 1 + 2 with `snapServingPeers > 0` standing in for gate 3: a pooled peer whose
-head is behind ours satisfies neither.
+head is behind ours satisfies neither. (This is the predicate the wake gate holds
+a warming request on, so both engines also answer "attempt the read now" for a
+running stack parked in `STALE_ANCHOR` — and the Rust handle for one running
+without an EL reader — because waiting cannot fix either; the read then fails at
+once with the specific refusal.)
 
 ## Beacon sync states
 
@@ -99,8 +103,8 @@ The measurement differs per engine:
 - **Java engine**: milliseconds since the anchored RPC head context was last
   successfully **rebuilt**. A background warmer rebuilds it every ~5 s while
   peers cooperate, so a healthy node hovers in the low seconds. The clock is
-  monotonic (`System.nanoTime` / `SystemClock.elapsedRealtime`), so device sleep
-  or clock changes don't corrupt it.
+  monotonic (`System.nanoTime`, through `RpcClock.monotonic()` on every host,
+  Android included), so wall-clock changes don't corrupt it.
 - **Rust engine**: milliseconds since the optimistic head **block number last
   advanced** — a new block roughly every 12 s (mainnet) resets it to 0. If the
   engine is not currently serveable (not SYNCED, no head, or no *serving* snap
@@ -163,7 +167,7 @@ beacon side is unsynced (any values shown then are peer-claimed, not verified).
 ### Daemon (IPC / CLI)
 
 ```bash
-./gradlew :app:run -Pargs=beacon-status   # "state": "SYNCING" | "CATCHING_UP" | "SYNCED"
+./gradlew :app:run -Pargs=beacon-status   # "state": "SYNCING" | "CATCHING_UP" | "SYNCED" | "STALE_ANCHOR"
 ./gradlew :app:run -Pargs=status          # lifecycle, peer counts incl. snapPeers
 ./gradlew :app:run -Pargs="get-account 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 ```

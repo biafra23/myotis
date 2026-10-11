@@ -14,7 +14,7 @@ Both engines implement it with the identical JSON shape (schema 1):
 |---|---|---|
 | `ChainHandle.readStatsJson()` | `ChainStack.readStats()` | `read_stats_json` (UniFFI, C ABI `myotis_read_stats_json`) |
 | daemon IPC | `./gradlew :app:run -Pargs=read-stats` | same |
-| Status tab (desktop, Android, iOS) | the `Reads` / `Cacheable` / `Stale ≤60s ok` rows (`ui/.../ReadStatsStatus.kt`), shown once a fetch was observed | same |
+| Status tab, Expert mode (desktop, Android, iOS) | the `Reads` / `Cacheable` / `Stale ≤60s ok` rows (`ui/.../ReadStatsStatus.kt`), shown once a fetch was observed | same |
 | log line | — | `[read-stats] …` every 5 min while reads flow (the tracing ring hosts drain) |
 
 Reset on process start; survives pause/resume on both engines (the Java
@@ -95,8 +95,8 @@ Bytecode is content-addressed (`keccak(code) == codeHash`), so every code
 
 - **`storage.sameStorageRoot / storage.repeats` high** → a storage-root-keyed
   cache pays. The Java engine has one (`StateProofCache`); the Rust engine's
-  twin (`rust/myotis-evm/src/cache.rs`) still keys by world root and is reset
-  every slot — the known parity gap in
+  twin (`rust/myotis-evm/src/cache.rs`) still keys by world root, so a new
+  block's root never hits what the last block cached — the known parity gap in
   `docs/reimplementation/06-rust-phase-notes.md`. A high number on a Rust
   session is that gap, measured.
 - **`sameStateRoot` non-zero on the Rust engine** → the direct read path

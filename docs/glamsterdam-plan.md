@@ -1,7 +1,7 @@
 # Glamsterdam readiness plan (Gloas + Amsterdam)
 
-Status: IMPLEMENTED FOR SEPOLIA, awaiting the fork — written 2026-08-19;
-updated 2026-10-06 (A.2 CL signals). Sepolia's date and parameters are decided; A.2's EL
+Status: IMPLEMENTED FOR SEPOLIA; Sepolia forked 2026-10-06 — written 2026-08-19;
+updated 2026-10-06 (A.2 CL signals). Sepolia's date and parameters were decided; A.2's EL
 detector shipped in #491, and #501 (merged 2026-09-26) landed the rest on
 `main`: A.1 (Sepolia schedule + time-gated fork id, both engines), B.0 (the
 pinned delta below), B.1–B.3 (the Gloas light client in both engines —
@@ -12,7 +12,12 @@ the Rust engine, refused with a permanent `-32602` by the Java engine's Besu
 26.4). Still open: B.5 (eth/70–71), the mainnet and Gnosis schedule entries
 once their forks are announced, A.3's inertness check on the live fork, and the
 "Known limitations after review" list. Dates without a decision are projections
-and move whenever testing finds something.
+and move whenever testing finds something. Since the fork: Lighthouse serves no
+Gloas light-client data (sigp/lighthouse#9587), so the Sepolia CL pins are roost
+and zbox's Nimbus only (`NetworkConfig` SEPOLIA, mirrored in
+`rust/myotis-net/src/sync.rs`); a Rust-engine wallet reached SYNCED on post-fork
+Sepolia from that Nimbus (2026-10-08/09); and B.4's fee-history path needed the
+Amsterdam gas-accounting fix described there (#578).
 Sources of truth to re-check while executing: `ethereum/consensus-specs`
 (`specs/gloas/light-client/`), the EF fork announcement blog posts (they carry
 the final epochs, timestamps and fork versions per network), and a fork
@@ -248,8 +253,9 @@ verification), but the liveness failure is mute.
   then more sources, then the EL's. `JavaChainHandle.upgradeAdvisory(el, cl)`;
   Rust `host::status_json` over the handle's `fork_watches` and
   `cl_fork_watches` (both handle-owned, both survive pause/resume).
-- *Not done:* the req/resp context bytes (still dropped at every call site)
-  — the Status digest covers the same peers; `nfd` (not needed: the ENR's
+- *Not done:* the req/resp context bytes as evidence (since B.3 they reach the
+  light-client decode sites, but the watch does not read them) — the Status
+  digest covers the same peers; `nfd` (not needed: the ENR's
   `next_fork_version` is the version, `fork_digest` the proof).
 
 **Still open**
@@ -406,8 +412,9 @@ the chosen consensus-spec-tests version for vectors.
   the decoded object against its attested slot. Gloas-vs-pre-Gloas sizes do
   not collide for LC objects, but they do for `BeaconBlockBody` (B.0), and
   gindices cannot be derived from lengths at all, so sniffing is at its limit.
-- `BeaconP2PService` drops the context bytes today; plumbing them to the
-  decode sites is part of B.3.
+- `BeaconP2PService` dropped the context bytes; plumbing them to the decode
+  sites was part of B.3 and is done (the `request*WithContext` calls return a
+  `ContextPayload` with the digest).
 
 ### B.2 Rust twin (`rust/myotis-consensus/`) + golden corpus
 
@@ -434,10 +441,14 @@ no pre-Gloas object has, so a later blob-parameter fork's digest (one the
 single-BPO config does not compute) still reads as Gloas; Java twin
 `BeaconLightClient.lcForkOf`. Gossip topic re-subscription at
 the boundary (Java; the Rust engine consumes no LC gossip), req/resp context
-handling. `rust/roost/src/forks.rs` is the in-repo model for the shape of this.
+handling. (Not done: the Java topics keep the digest they were subscribed
+under — a known TODO in `BeaconP2PService.subscribeLightClientGossipTopics`,
+inert while topic subscription stays off by default and observation-only.)
+`rust/roost/src/forks.rs` is the in-repo model for the shape of this.
 The Java chain fill (`fillChainStateRoots`, the one `BeaconBlockBody`
 consumer) must stop at Gloas slots: a Gloas body carries no payload and no
-state root, and its 396-byte fixed part is read as Electra.
+state root, and its 396-byte fixed part is read as Electra. (It does: it
+returns at once when the attested slot is Gloas.)
 
 ### The EL anchor after Gloas (both engines)
 

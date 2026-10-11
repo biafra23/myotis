@@ -7,6 +7,11 @@ each line to a different voice.
 - **ALICE**: host, asks the questions.
 - **BOB**: engineer, explains.
 
+The walkthrough follows the **Java engine** (`-Pengine=java`). The default
+Rust engine resolves names the same way over its own EVM
+(`rust/myotis-evm/src/ens`, revm), and the daemon reaches either one through
+the engine API.
+
 ---
 
 ## Cold open: the problem
@@ -84,8 +89,11 @@ namespace. Myotis does a lowercase pass; full UTS-46 is a bigger lift.
 
 [BOB] Rejected. The DNS encoder downstream — we'll get to that — has to
 emit a length-prefixed wire form, and zero-length labels mean different
-things in DNS than in ENS. We strip a trailing dot for FQDN tolerance, but
-empty middle or leading labels are an error.
+things in DNS than in ENS. The encoder strips a trailing dot for FQDN
+tolerance, but empty middle or leading labels are an error. Namehash
+doesn't strip it, though — it hashes it as an empty label — so
+"vitalik dot eth dot" lands on a node nobody serves and comes back as no
+record.
 
 [ALICE] OK, so now I have a 32-byte node ID. What do I do with it?
 
@@ -94,11 +102,11 @@ empty middle or leading labels are an error.
 ## Section 2: the registry, the resolver, and the legacy path
 
 [BOB] Classic ENS — pre-2022 — has two contracts. The Registry, at
-zero-x-zero-zero zero-zero zero-zero zero-zero zero-zero zero-zero zero-zero
-zero-zero zero-zero zero-zero zero-zero zero-zero zero-zero zero-zero zero-c-2
-e-three-c-9-7. That contract maps namehash to "owner address" and "resolver
-address." It's a registry — it doesn't know what the address is for the
-name, it just knows which contract you're supposed to ask.
+zero-x, eleven zeroes, then C-two-E-zero-seven-four-e-C-six-nine
+A-zero-d-F-b-two-nine-nine-seven B-A-six-C-seven-d-two-e-one-e. That
+contract maps namehash to "owner address" and "resolver address." It's a
+registry — it doesn't know what the address is for the name, it just
+knows which contract you're supposed to ask.
 
 [ALICE] So step one: ask the Registry, get the resolver's address.
 
@@ -190,11 +198,19 @@ called `addr` directly.
 [ALICE] So the file `myotis-ens/src/main/java/io/myotis/ens/EnsResolver.java`
 just calls that one method.
 
-[BOB] Exactly that. The whole forward-resolution `resolveAddress` method
-fits in about thirty lines once you strip the comments. Build the DNS
-wire-name. Build the inner `addr(bytes32)` calldata. Wrap it in a
-`resolve(bytes, bytes)` outer call. Send it as a view call. Decode the
-result.
+[BOB] No — it does the parent-walk itself. The Universal Resolver routes
+offchain names through a shared batch gateway, like `ccip-v2.ens.xyz`, and
+we don't want a third-party relay in the path. So `EnsResolver` asks the
+registry for the full name's resolver, then each parent's, until one is
+set, and caches what it finds for five minutes. It asks that resolver
+`supportsInterface` for the ENSIP-10 interface id, zero-x-nine-zero-six-one
+b-nine-two-three. If yes, it builds the DNS wire-name and the inner
+`addr(bytes32)` calldata, wraps them in a `resolve(bytes, bytes)` call, and
+sends that to the resolver directly. If it's a legacy resolver for the
+exact name, it just calls `addr(bytes32)`. Each of those is a view call;
+then it decodes the result. An offchain name's lookup then points at the
+resolver's own gateway. The Universal Resolver's address is still pinned
+in `EnsAddresses`, but nothing calls it.
 
 [ALICE] But "view call" is doing a lot of work in that sentence.
 
@@ -248,9 +264,11 @@ answer.
 
 [BOB] If the URL template contains the placeholder `{data}` you do a GET
 with substitutions; otherwise you POST with a JSON body of `{"sender":
-"zero-x...", "data": "zero-x..."}`. The wallet tries the first URL, on
-HTTP error or 4xx falls through to the next. Five hundred errors are
-treated as transient and retried. The spec is in section six of ERC-3668.
+"zero-x...", "data": "zero-x..."}`. The wallet tries the URLs in order, one
+at a time; any failure — a transport error, a non-2xx status, a body
+without a `data` field, or one carrying a gateway `HttpError` — moves it on
+to the next. It never retries the same URL. The spec is in section six of
+ERC-3668.
 
 [ALICE] And the recursion.
 
@@ -269,22 +287,23 @@ You said earlier there's a stack of executors. Walk me through it.
 
 [BOB] Three layers. Inside-out: `DefaultEvmExecutor`, then
 `PrefetchingEvmExecutor`, then `CcipReadEvmExecutor`. They all implement
-the same `EvmExecutor` interface — which has just two methods,
-`callView` and `estimateGas` — and they decorate one another. The wallet
+the same `EvmExecutor` interface — `callView`, `callTx` and
+`estimateGas` — and they decorate one another. The wallet
 constructs them like nesting dolls.
 
 [ALICE] So at the bottom, `DefaultEvmExecutor`.
 
 [BOB] That's the one that actually runs Besu's EVM. Hyperledger Besu's
-EVM module — `org.hyperledger.besu:evm:24.12.2` — exposes a `WorldUpdater`
+EVM module — `org.hyperledger.besu:besu-evm:26.4.0` — exposes a `WorldUpdater`
 interface that any client can implement. We implement it. Our
 implementation is `SnapWorldUpdater`, and it's backed by a per-call cache
 called `SyncStateView` that talks to a `SnapStateOracle` underneath.
 
 [ALICE] So when the EVM does an SLOAD…
 
-[BOB] It calls into `SnapWorldUpdater.getStorageValue(account, slot)`,
-which calls `SyncStateView.storageAt(...)`, which checks its cache, and
+[BOB] It calls `getStorageValue(slot)` on the `SnapAccount` that
+`SnapWorldUpdater` handed it, which calls `SyncStateView.storage(address,
+slot)`, which checks its cache, and
 on a miss calls `SnapStateOracle.fetchStorage(stateRoot, account, slot)`,
 which talks to a real peer over snap, gets the value plus a proof, runs
 the proof through `MerklePatriciaProofVerifier` in the core module, and
@@ -320,15 +339,15 @@ without actually running the EVM.
 you need until you run, but you can't run until you have the state. The
 solution is the convergence loop. Run the EVM once with whatever state
 you have, observe what state was accessed, fetch all that state in
-parallel, then run again. Repeat until two consecutive runs produce the
-same result. That's "convergence."
+parallel, then run again. Repeat until a run touches nothing it hadn't
+already seen. That's "convergence."
 
 [ALICE] How do you run before you have the state?
 
 [BOB] This is where sentinel-return comes in. There are two flavours of
 this. The original design was called trace-based — you wrap Besu's EVM
-with an `OperationTracer` that records every storage access into a
-`ConvergenceTracker`, and on a miss the EVM blocks waiting for the value.
+with an `OperationTracer` that records every storage access into an
+`AccessTracker`, and on a miss the EVM blocks waiting for the value.
 That ends up being mostly synchronous, because the EVM is sequential and
 has to wait for the value to make a control-flow decision.
 
@@ -371,14 +390,18 @@ itself.
 [BOB] The convergence loop is `PrefetchingEvmExecutor.callView`. The
 sentinel-return wiring is in `SyncStateView` — there's a flag that
 toggles between "block on miss" and "return zero on miss, record access."
-First iteration runs in sentinel mode. After the run we walk the access
-set and call the oracle once in batched form. Subsequent iterations run
-in block-on-miss mode but the cache is hot, so they don't actually block.
+Sentinel mode stays on for as long as a run keeps discovering new
+accesses, so a multi-hop pattern gets one parallel fetch per hop; after
+each run we walk the new accesses and call the oracle in batched form. The
+last two of the four iterations always run in block-on-miss mode, and we
+only return a result from a run that was handed no placeholder.
 
-[ALICE] So in the happy case it's two iterations. One sentinel, one real.
+[ALICE] So in the happy case it's two iterations, both sentinel: one that
+discovers, and one whose reads all hit the cache, so it was handed no
+placeholder and its result stands.
 
 [BOB] Two iterations, two snap round trips total. Maybe one snap round
-trip if all the slots fit in a single GetStorageRanges. ENS resolution
+trip if the oracle's batched fetch covers every slot at once. ENS resolution
 usually converges in two.
 
 ---
@@ -411,9 +434,10 @@ The parser is in `myotis-evm/src/main/java/io/myotis/evm/ccipread/OffchainLookup
 interface. The interface is intentionally tiny — one method, "send a
 GET or POST to a URL, return the body as a string, async." That keeps
 `myotis-evm` free of any HTTP-client dependency. The wallet integration
-provides the transport. On the daemon side, the new `JavaHttpCcipGateway`
-inside `CommandHandler` uses Java's built-in `java.net.http.HttpClient`.
-On Android we'll use Ktor, because java-dot-net-dot-http isn't available
+provides the transport. On the daemon and the desktop app,
+`JavaHttpCcipGateway`, in app's `rpc` package, uses Java's built-in
+`java.net.http.HttpClient`. Android ships `AndroidCcipGateway` over
+`HttpURLConnection` instead, because java-dot-net-dot-http isn't available
 below API 33.
 
 [ALICE] Why is the decorator on the outside, not in the middle.
@@ -426,12 +450,12 @@ call's revert payload. If you put CcipRead inside Prefetching, the
 prefetcher would see "the call reverted" and either bail out or retry,
 neither of which is right.
 
-[ALICE] So execution flow on a CCIP-Read name. The wallet calls
-universalResolver-dot-resolve. Universal Resolver dispatches to a Coinbase
-adapter. Adapter reverts with OffchainLookup. We catch that. We fetch from
-Coinbase's URL. We re-enter the EVM with the resolver's callback selector
-plus the response plus the extraData. The callback verifies the
-signature, returns the address, we decode.
+[ALICE] So execution flow on a CCIP-Read name. The wallet walks the
+registry to the name's Coinbase resolver and calls its `resolve`
+directly. The resolver reverts with OffchainLookup. We catch that. We
+fetch from Coinbase's URL. We re-enter the EVM with the resolver's
+callback selector plus the response plus the extraData. The callback
+verifies the signature, returns the address, we decode.
 
 [BOB] That's the whole dance. And the prefetcher still works underneath
 the second call — the callback re-enters the same decorator, so
@@ -461,8 +485,9 @@ slot)`, and `fetchBytecode(codeHash)`.
 
 [BOB] We send a `GetAccountRange` snap-protocol message to the peer with
 a single-account range — actually, GetAccountRange requires a hash range,
-so we set both the start and limit to the keccak of the address, which
-covers exactly one slot. The peer responds with `AccountRange`, which
+so we start it at the keccak of the address, leave the limit at the top of
+the keyspace, and cap the response at four kilobytes, so only the first
+account or so comes back. The peer responds with `AccountRange`, which
 contains the matching account if it exists, plus a Merkle Patricia proof
 that anchors the result back to `stateRoot`.
 
@@ -493,15 +518,16 @@ malformed."
 About 150 lines of Java. Hand-rolled, because the Tuweni Merkle Trie
 artifact didn't resolve from the ConsenSys Maven repo at the time we
 needed it. Pure functional verifier — input is the expected root, the
-key, and the proof list; output is the value bytes or null. No external
-dependencies beyond Bytes and RLP.
+key, and the proof list; output is found-with-a-value, absent, or
+invalid. No external dependencies beyond Bytes and RLP.
 
 [ALICE] And on a verification failure.
 
-[BOB] We mark that peer's snap as failed, throw
-`EvmExecutionError.InvalidProof`, and either fall through to the next
-peer or surface to the user. The retry budget is in
-`SnapBackedStateOracle` — three peers by default.
+[BOB] We report that peer as unable to serve this root, so the peer
+supplier rotates away from it, throw `EvmExecutionError.InvalidProof`, and
+either fall through to the next peer or surface to the user. The retry
+budget is in `SnapBackedStateOracle` — three peers by default, and the
+verified backend the ENS path runs on gives it eight.
 
 [ALICE] What about bytecode.
 
@@ -528,37 +554,41 @@ the global state root. So a single SLOAD is actually two layered proofs.
 and that comes from a header that was either consensus-verified — sync
 committee signature on a beacon block whose body commits to that
 execution header — or transitively from a header chain anchored to a
-consensus-verified one.
+consensus-verified one. The one exception is the Java engine's peer-head
+fallback, which is the next topic.
 
 ---
 
-## Section 10: BlockContext, and why we use the chain head
+## Section 10: BlockContext — the finalized root, and the chain-head fallback
 
-[ALICE] You mentioned earlier that for the daemon ENS command, we use the
-peer's chain head, not the beacon-finalized header. Why.
+[ALICE] Which state root does the daemon's ENS command run against? The
+beacon-finalized header, or the peer's chain head?
 
-[BOB] Practical constraint. Peers prune state. Geth, Besu, Erigon — they
+[BOB] The finalized one first — that's the default root mode, `AUTO`. But
+there's a practical constraint. Peers prune state. Geth, Besu, Erigon — they
 all default to keeping roughly 128 blocks of state for snap-serving
 purposes. After that the state for old blocks is no longer reachable.
 Beacon finality is twelve and a half minutes — sixty-four slots of twelve
 seconds. That's around fifty-eight blocks of execution lag, which is
-inside the pruning window most of the time, but not always. And every
-beacon-state-root also needs a forward-fetched header chain to map back
-to an execution-state-root, which adds latency.
+inside the pruning window most of the time, but not always. And since
+Gloas the light-client header proves only the execution block's hash, so
+we first have to resolve the execution header that hashes to it, which
+adds latency.
 
 [ALICE] So if you ask for the finalized state, the peer will often say
 "sorry, pruned."
 
-[BOB] And then you fall through to another peer, and another. It works
-eventually, but it's slow and unreliable. The chain-head root, on the
-other hand, is by definition fresh — the peer just told us about it via
-the eth Status message — and it's the root they're actively serving snap
-requests against.
+[BOB] So we probe every snap peer for one that still serves the finalized
+root and pin that one. If none does, or the finalized state has no record
+for the name, the Java engine falls back to a peer's chain head. That root
+is by definition fresh — we ask each peer for its current head header —
+and it's the root they're actively serving snap requests against.
 
 [ALICE] But the chain head isn't beacon-verified.
 
-[BOB] No. It's whatever the peer claims. So in principle a hostile peer
-could feed us a forged head that points at fake state. The mitigation is
+[BOB] No. It's whatever the peer claims, so that answer comes back with
+`beaconVerified: false`. So in principle a hostile peer could feed us a
+forged head that points at fake state. The mitigation is
 that everything underneath still verifies against the head's state root.
 A hostile peer would have to forge consistent MPT proofs for every slot
 we read, which means producing a state trie whose root matches the head
@@ -578,22 +608,24 @@ returned address back to a name and check it points at "vitalik dot eth"
 forward and reverse use independent state roots. Truly trustless ENS
 resolution requires anchoring the head against beacon finality.
 
-[ALICE] And we don't do that yet.
+[ALICE] Which is what the finalized root gives you.
 
-[BOB] We don't do it in the daemon resolve-ens command yet. Phase 0
-through 4 of the EVM module is the building blocks; the wallet
-integration is where head-anchoring lives. That's the missing layer for
-production.
+[BOB] Right. A finalized answer runs against a root that a
+sync-committee-signed header commits to, so it comes back
+`beaconVerified: true`, and the peer-head fallback only runs when the
+finalized attempt found nothing or couldn't be served. The Rust engine,
+the default, has no peer-claimed fallback at all: its fallback is the
+beacon-anchored optimistic head.
 
-[ALICE] OK so for now the daemon's resolve-ens is "approximately right
-when the peer is honest." Useful as a smoke test.
+[ALICE] So the flag is what a caller has to look at.
 
-[BOB] Useful as a smoke test, useful as a developer tool, not yet useful
-as a wallet primitive. The point of the command is to prove the EVM stack
-works against real network state — the resolution has to traverse
-Universal Resolver, the registry, a real resolver contract, and possibly
-a CCIP-Read gateway, all using state served from a real peer. If that
-works, the EVM module is correct. Anchoring is a thin layer on top.
+[BOB] Right — `true` means the finalized root. A `false` is a peer-claimed
+head on the Java engine, and on the Rust engine the beacon-anchored
+optimistic head: anchored, just not final. The
+command is also the smoke test for the whole EVM stack against real
+network state — the resolution has to traverse the registry, a real
+resolver contract, and possibly a CCIP-Read gateway, all using state
+served from a real peer. If that works, the EVM module is correct.
 
 ---
 
@@ -607,55 +639,64 @@ what happens inside CommandHandler.
 
 [BOB] First, dispatch. The IPC server hands the JSON line to
 `CommandHandler.handle`, which switches on `cmd` and calls
-`handleResolveEns`.
+`handleResolveEns`. That calls `resolveAddress(name, EnsRoot.AUTO)` on the
+engine API's `EnsApi` — the daemon only talks to the engine contract. On
+the Java engine, `JavaEnsApi` hands it to `VerifiedRpcBackend.resolveEns`
+in rpc-backend, which runs the finalized attempt and, if needed, the
+peer-head one, each through the steps below.
 
 [ALICE] Step one inside that method.
 
 [BOB] Pick a snap-capable peer. We call
-`connector.activeSnapHandlers()` — which is the new accessor I added —
-and that returns a snapshot of all `EthHandler`s that are READY, have
-negotiated snap-slash-one, and aren't flagged as snap-serving-failed. We
-take the first one. There's no fancy load-balancing — the
-`SnapBackedStateOracle` will rotate to the next on `InvalidProof` or IO
-failure, so this is a "first attempt, oracle handles fallback" design.
+`connector.activeSnapHandlers()`, which returns a snapshot of all
+`EthHandler`s that are READY, have negotiated snap, and aren't flagged as
+snap-serving-failed. We probe them concurrently and pin the first one that
+actually serves the root we want. After that the oracle's peer supplier
+rotates across the peers proven to serve that root, and moves on from one
+that fails with `InvalidProof` or an IO error.
 
 [ALICE] Step two.
 
-[BOB] Build the BlockContext. We grab `connector.getChainHead()` for the
-latest known block number. Then we call `connector.requestBlockHeaders`
-with that block number and count one. The peer returns a single
-`BlockHeader` record. From it we extract the state root, block number,
+[BOB] Build the BlockContext. For the finalized root, the header comes
+from the light client: the beacon-finalized execution payload header, or
+after Gloas the execution header that hashes to the proven block hash. For
+the peer-head fallback, it's the fresh head header the pinned peer sent.
+From it we extract the state root, block number,
 timestamp, base fee, prev-randao, gas limit, beneficiary — that becomes
 the EVM's `block.coinbase` — and we get the chain ID from
-`connector.getNetwork().networkId()`. All seven get plugged into a
+`connector.getNetwork().networkId()`. All eight get plugged into a
 `BlockContext` constructor.
 
 [ALICE] Step three.
 
 [BOB] Wrap the EthHandler as a SnapPeer. There's a small adapter,
-`EthHandlerSnapPeer` in `app/src/main/java/com/jaeckel/ethp2p/app/snap/EthHandlerSnapPeer.java`,
+`EthHandlerSnapPeer` in `rpc-backend/src/main/java/io/myotis/rpc/snap/EthHandlerSnapPeer.java`,
 that translates between the SnapPeer interface — which lives in
 myotis-evm and only knows about `getTrieNodes` and `getByteCodes` — and
-the EthHandler's request methods. The reason it lives in app and not in
-myotis-evm is that myotis-evm doesn't depend on networking. Adapter sits
-at the seam.
+the EthHandler's request methods: `GetAccountRange` and `GetStorageRanges`
+for the proofs, `GetByteCodes` for code. The reason it lives in
+rpc-backend and not in myotis-evm is that myotis-evm doesn't depend on
+networking. Adapter sits at the seam.
 
 [ALICE] Step four, build the executor.
 
 [BOB] Construct from inside out. `SnapBackedStateOracle` takes a supplier
-that returns a SnapPeer plus a BytecodeCache. `DefaultEvmExecutor` takes
-the oracle plus its own bytecode cache plus a single-thread executor for
-the EVM run. Then `PrefetchingEvmExecutor` wraps that. Then a
-`CcipReadHandler` constructed against the `JavaHttpCcipGateway`. Then
+that returns a SnapPeer, a BytecodeCache, and the cross-call proof cache.
+`DefaultEvmExecutor` takes the oracle plus the bytecode cache plus the
+backend's shared EVM thread pool. Then `PrefetchingEvmExecutor` wraps that.
+Then a `CcipReadHandler` constructed against the host's gateway — the
+`JavaHttpCcipGateway` on the daemon. Then
 `CcipReadEvmExecutor` wraps the prefetching executor with the handler.
 Five lines of constructor calls.
 
 [ALICE] Step five.
 
-[BOB] Construct an `EnsResolver` against that executor. Call
-`resolveAddress(name, blockContext)`. The resolver builds the namehash,
-the DNS encoding, the inner `addr` calldata, the outer `resolve` calldata,
-and calls `executor.callView(universalResolver, calldata, blockContext)`.
+[BOB] `EnsResolver.forChainId` builds a resolver against that executor
+with the chain's pinned registry. Call `resolveAddress(name,
+blockContext)`. The resolver builds the namehash and the inner `addr`
+calldata, walks the registry to the name's resolver, and calls
+`executor.callView(resolver, calldata, blockContext)` — with the calldata
+wrapped in `resolve(dnsName, data)` if it's an ENSIP-10 resolver.
 
 [ALICE] And then everything we just discussed kicks in. CcipReadEvmExecutor
 sees the call. Forwards to PrefetchingEvmExecutor. PrefetchingEvmExecutor
@@ -666,9 +707,11 @@ fetches from the gateway, re-enters with the callback calldata, recurses
 into PrefetchingEvmExecutor again.
 
 [BOB] Right. And eventually `resolveAddress` returns an
-`Optional<Address>`. We block on it with a sixty-second timeout — this is
-inside a request-handler thread, blocking is fine — and serialise the
-result as JSON.
+`Optional<Address>`. Each attempt gets a sixty-second timeout, and the
+engine API blocks on the whole finalized-then-head ladder for up to a
+hundred and fifty — this is inside a request-handler thread, blocking is
+fine — and `CommandHandler` serialises the result as JSON, with a
+`beaconVerified` flag.
 
 [ALICE] What about the timeout.
 
@@ -679,8 +722,8 @@ on the second snap-fetch convergence iteration.
 
 [ALICE] And shutdown.
 
-[BOB] The single-thread executor we constructed for the EVM run gets
-shut down in a `finally` block, so we don't leak threads. The
+[BOB] Nothing per resolution to shut down: the EVM runs on the
+backend's shared pool, which lives as long as the node. The
 `JavaHttpCcipGateway` reuses a static HttpClient — its lifetime is the
 JVM's, no explicit shutdown.
 
@@ -704,15 +747,17 @@ Env-gated — they only run if `MYOTIS_MAINNET=1` and a few other
 environment variables are set, including `MYOTIS_INTEGRATION_PEER_ENODE`,
 a recent `MYOTIS_INTEGRATION_STATE_ROOT`, and so on. They connect to a
 real mainnet peer, run a real resolution against a real state root, and
-compare against a known reference value. There's an ENS-resolution IT,
-a gas-estimation IT, a call-view IT.
+compare against a known reference value. There's a gas-estimation IT and
+a call-view IT there, and an ENS-resolution IT in myotis-ens's own
+`src/integrationTest`.
 
-[ALICE] You said those don't run yet.
+[ALICE] Do those actually run?
 
-[BOB] They have a `connectToMainnetPeer` stub that throws
-`UnsupportedOperationException` because the bootstrap code hasn't been
-extracted from `Main.main` yet. Once that's done, the integration tests
-run end-to-end against mainnet.
+[BOB] They do, once you supply the environment. They used to have a
+`connectToMainnetPeer` stub that threw `UnsupportedOperationException`;
+Phase 5 added `MainnetPeerBootstrap`, in app's `testing` package, which
+dials a single peer from inside a test, so the integration tests run
+end-to-end against mainnet.
 
 [ALICE] Tier three.
 
@@ -720,9 +765,9 @@ run end-to-end against mainnet.
 You run the daemon, run `resolve-ens vitalik dot eth`, eyeball the
 result. It's a smoke test for the integration of all the layers in a
 real running process. The reason this matters is that the unit tests use
-a fixture oracle, the integration tests are gated and not yet wired up,
-and there was previously no way to actually exercise the whole stack
-against live state. Now there is.
+a fixture oracle, and the integration tests are gated and need an
+operator to supply a peer and a state root. The daemon command
+exercises the whole stack against live state with nothing to set up.
 
 ---
 
@@ -761,8 +806,8 @@ right and it works against the old path.
 
 [ALICE] Is reverse exposed in the daemon?
 
-[BOB] Not yet. Same shape as forward — it'd be a `reverse-ens` IPC
-command. Five lines of glue.
+[BOB] Yes — `reverse-ens` with an address. Same shape as forward, and it
+also answers with a `beaconVerified` flag.
 
 ---
 
@@ -791,20 +836,23 @@ networking.
 
 [BOB] Because myotis-evm has to be Android-friendly. It's the wallet's
 local EVM machinery, and the Android module consumes it directly. The
-networking module pulls in Tuweni, Netty, BouncyCastle, libp2p, eventually
-discv5 — all the wire-protocol stuff. The Android consumer doesn't want
+networking module pulls in Tuweni, Netty, BouncyCastle, the discv5
+library — all the wire-protocol stuff. The Android consumer doesn't want
 that on the classpath unless it's running its own peer. So myotis-evm
 defines a tiny pluggable interface, and the wallet supplies the transport.
-The daemon supplies an EthHandler-backed implementation. A future
-Android wallet might supply, I don't know, a remote-light-client-backed
-implementation that pulls state from a service running on the phone or
-on a server it trusts.
+The Java engine supplies an EthHandler-backed implementation — on the
+daemon, the desktop app and Android alike, since the Android app runs its
+own peers. Something else could plug in the same way — I don't know, a
+remote-light-client-backed implementation that pulls state from a service
+running on the phone or on a server it trusts.
 
 [ALICE] Same shape as the CcipGateway interface.
 
 [BOB] Same idea. myotis-evm doesn't import HttpClient. CcipGateway is one
-method. JavaHttpCcipGateway lives in app. A future Android wallet would
-ship a Ktor-backed implementation. Decoupling cost: minor; future-proofing
+method. JavaHttpCcipGateway lives in app. Android ships
+`AndroidCcipGateway` over `HttpURLConnection` — not the Ktor that the
+project's CLAUDE dot md asks for, a deviation the `CcipGateway` Javadoc
+records. Decoupling cost: minor; future-proofing
 benefit: you can target Kotlin Multiplatform without ripping out the
 core.
 
@@ -815,9 +863,10 @@ networking — Besu's EVM jar publishes module metadata that says "JVM-21
 floor," and the discv5 library similarly. Long-term direction is a
 Kotlin migration to enable Compose Multiplatform consumers. New code can
 land in Java where it lowers risk; the public API is the constraint.
-That's why none of the public APIs in myotis-evm leak
-`CompletableFuture` types that wouldn't translate cleanly to suspending
-functions in Kotlin.
+myotis-evm's own API does return `CompletableFuture` — Kotlin callers wrap
+it with `await` — but the hosts never see it: they consume the engine
+contract in myotis-api, which is blocking and FFI-portable, so it
+translates cleanly to Kotlin and to the Rust engine alike.
 
 [ALICE] Last question. Why hand-roll the MPT verifier? Why not use
 Besu's?
@@ -826,8 +875,8 @@ Besu's?
 worldstate machinery — pulling it out cleanly would have meant taking a
 much bigger dependency surface. And the verifier is small. A hundred and
 fifty lines of pure functional Java that takes a root, a key, and a
-proof list, and either returns a value or null. It's testable in
-isolation, and it's easier to audit than a transitive dep. There's a
+proof list, and answers found-with-a-value, absent, or invalid. It's
+testable in isolation, and it's easier to audit than a transitive dep. There's a
 cost — duplication — but the maintenance burden has been low so far.
 
 ---
@@ -835,23 +884,25 @@ cost — duplication — but the maintenance burden has been low so far.
 ## Closing
 
 [ALICE] OK so to summarise. ENS resolution in Myotis is: namehash the
-name, DNS-encode the name, build calldata for `addr` wrapped in a
-`resolve` outer call, send it as a view call to the Universal Resolver.
+name, walk the registry to its resolver, and send `addr` to that resolver
+as a view call — wrapped in a `resolve` call with the DNS-encoded name if
+it's an ENSIP-10 resolver.
 The view call goes through three decorator layers — CcipRead handles
 off-chain lookups, Prefetching does the convergence loop to batch state
 fetches, and Default actually runs Besu. Default reads state via a
 SnapStateOracle that turns each EVM read into a snap-protocol fetch,
 verified with a Merkle Patricia proof against a state root pinned in the
-BlockContext. The state root comes from the peer's chain-head header for
-now, with beacon-anchoring as future work. The whole thing is glued
-together by the daemon's resolve-ens IPC command, which runs the stack
-once per resolution against a snap-capable peer.
+BlockContext. The state root is the beacon-finalized one first, with a
+peer's chain head as the fallback, and the answer says which it got. The
+whole thing sits behind the engine API, which the daemon's resolve-ens IPC
+command calls; the stack is built once per resolution attempt against a
+snap-capable peer.
 
 [BOB] That's the picture. The interesting work is in the decorator stack
 and the convergence loop. Everything else is plumbing. And the plumbing
 is mostly small pluggable interfaces — SnapPeer, CcipGateway,
-SnapStateOracle — so the same code can run on the daemon today and on an
-Android wallet later, with different transports underneath.
+SnapStateOracle — so the same code runs on the daemon, the desktop app
+and the Android wallet, with different transports underneath.
 
 [ALICE] Thanks Bob.
 

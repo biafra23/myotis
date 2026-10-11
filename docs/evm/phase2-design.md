@@ -8,6 +8,19 @@ At 200 ms per round trip that's 1–2 s of unnecessary serial latency.
 > **Goal:** reduce p50 latency to under 1 s on the benchmark corpus by
 > parallelising state fetches.
 
+> **Status (as built):** shipped on the Java engine as the sentinel-return
+> loop below (`myotis-evm/src/main/java/io/myotis/evm/PrefetchingEvmExecutor.java`),
+> since changed in four ways: sentinel mode stays on for as long as each run
+> still discovers new accesses (one parallel wave per hop of a multi-hop
+> pattern), the last two of `DEFAULT_ITERATION_CAP` = 4 iterations always run
+> real, and a sentinel run that hit only the cache counts as converged; each
+> wave first goes through `SnapStateOracle.fetchBatch`, which folds it into
+> `SnapPeer.getTrieNodes` calls of up to 64 path-sets, then through a per-item
+> pass over whatever is still missing, at most 48 requests in flight
+> (`PREFETCH_MAX_IN_FLIGHT`); verified state is reused across calls through
+> `StateProofCache`; and the sender is primed with the target when the call
+> moves value or pays for gas.
+
 ## Acceptance criteria (from the original plan)
 
 - All benchmark cases converge in ≤ 3 iterations.

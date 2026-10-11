@@ -6,6 +6,22 @@
 > Android/iOS (React Native app), and optionally WASM. Retrofitting any of these later is
 > far more expensive than respecting them from the first commit.
 
+> **Status (2026-10-11):** guidance, followed in part; `docs/myotis-integration.md`
+> is not in this repository. The workspace (`rust/Cargo.toml`) took another
+> layout than §2: the sans-I/O crates are `myotis-core`, `myotis-consensus`,
+> `myotis-wire` (no_std wire codecs) and `myotis-evm` (ENS included,
+> `src/ens/`); sockets and the tokio runtime live in `myotis-net`, which
+> `myotis-engine` (UniFFI + C ABI) links together with tokio, so §1's rule holds
+> for those four only and §1's transport/storage/clock/spawner traits do not
+> exist. No `shell-*`, `myotis-jsonrpc` or `myotis-cli` crates: the hosts'
+> JSON-RPC dispatch is the Kotlin `:jsonrpc-server`, the headless one
+> `rust/myotis-rpcd`. §8 exists as `cargoCheckWasm` (core, consensus, wire;
+> self-skips without the wasm32 target, as in CI) and the no_std canary
+> (`cargoBuildNoStd`, `.github/workflows/no-std-canary.yml`); no `cargo deny`.
+> `blst` builds without `portable`; `ring` comes in through `myotis-net`'s
+> libp2p. §7's host-supplied checkpoint is `myotis_create_with_checkpoint`
+> (C ABI only, #441).
+
 ## Target matrix the engine must serve
 
 | Target | Packaging | Sockets | Threads | Filesystem | Lifecycle |

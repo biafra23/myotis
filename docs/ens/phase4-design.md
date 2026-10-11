@@ -11,6 +11,25 @@ ERC-3668.
 > deliberately out of scope (the plan calls for a narrow surface — only
 > `callView` and `estimateGas`).
 
+> **Status (as built):** CCIP-Read shipped on the Java engine as the
+> `CcipReadEvmExecutor` decorator and `CcipGateway`-based handler below, with
+> three deviations. `EnsResolver` does **not** use the Universal Resolver: it
+> walks the Registry itself (exact node, then each parent), checks the
+> resolver's ENSIP-10 `supportsInterface(0x9061b923)`, and calls
+> `resolve(bytes,bytes)` on it directly (or the record method on a legacy
+> resolver), so an offchain name's `OffchainLookup` points at the resolver's
+> own gateway instead of a shared batch gateway such as `ccip-v2.ens.xyz`
+> (`myotis-ens/src/main/java/io/myotis/ens/EnsResolver.java`; the UR
+> addresses stay pinned in `EnsAddresses`, unused). There is no Ktor
+> gateway: the daemon and desktop use `JavaHttpCcipGateway` (`java.net.http`,
+> `app/src/main/java/com/jaeckel/ethp2p/app/rpc/`) and Android uses
+> `AndroidCcipGateway` (`HttpURLConnection`), both behind the engine API's
+> `HttpGateway` port (`PortBridges.toCcipGateway`). And generic `eth_call` is
+> now served over JSON-RPC; on the Java engine it runs through the same
+> `CcipReadEvmExecutor` (`rpc-backend`'s `VerifiedRpcBackend`). The Rust
+> engine reports an offchain answer to its host, which drives the gateway
+> round (`myotis-engines/src/main/java/io/myotis/engines/CcipDriver.java`).
+
 ## Acceptance criteria (from the original plan)
 
 - CCIP-Read handler with URL template substitution and GET/POST routing.
@@ -142,7 +161,7 @@ CCIP-Read gateways necessarily learn:
 - The queried name (because the request includes its callData).
 - Approximate request timing.
 
-Documenting this on `EvmExecutor.callView` and on `CcipReadHandler` so
-consumers understand the trade-off before turning on resolution for
-gateway-based names. Tor routing is a separate piece of work tracked
-in the wallet's privacy roadmap.
+Documented in `CcipReadHandler`'s Javadoc (`EvmExecutor.callView` only
+points at the decorator) so consumers understand the trade-off before
+turning on resolution for gateway-based names. Tor routing is a separate
+piece of work tracked in the wallet's privacy roadmap.

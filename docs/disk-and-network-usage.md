@@ -15,7 +15,11 @@ creating and sending a transaction.
 fan-outs, response caps) is taken from the code, with file references. Wire-volume
 figures are arithmetic on top of those constants plus a few **chain-level assumptions**
 (marked below) — average mainnet transaction rate, block body size, etc. Treat the
-byte totals as sizing estimates, not measurements.
+byte totals as sizing estimates, not measurements. Most constants cited are the **Java
+engine's** (`BeaconLightClient`, `VerifiedRpcBackend`, `ChainStack`); the Rust engine — the
+default — tunes some differently (its EL pool, for one, holds 8 snap peers, not 32:
+`PoolConfig::default` in `rust/myotis-net/src/el/pool.rs`, and the hosts' target knob is a
+no-op there), so its per-minute figures differ from the ones derived here.
 
 **Scope: only what a synced, wallet-serving client actually uses today.** Three features
 are deliberately **not** counted in the budget below: the **historical accumulators**
@@ -69,14 +73,15 @@ Chain-level assumptions used throughout (2025/26 ballparks):
 
 Myotis is a light client in the strictest sense: **no chain data is persisted** (the
 opt-in log index excluded, see the scope note above). There is no header database, no
-block store, no state database — no LevelDB/RocksDB/SQLite anywhere in the tree. Headers live in a small in-memory window (§1.3); state is fetched
-as snap/1 proofs on demand and cached only in bounded in-memory LRUs
+block store, no state database — no LevelDB/RocksDB/SQLite anywhere in the tree (the one
+SQLite is Arti's directory cache, linked only into `-PtorEngine` builds). Headers live in a small in-memory window (§1.3); state is fetched
+as snap proofs on demand and cached only in bounded in-memory LRUs
 (`myotis-evm/.../StateProofCache.java`, `rpc-backend/.../VerifiedResultCache.java`).
 
 Everything persisted is a handful of flat files, one set **per network** (mainnet uses
 the bare name; other networks get a `-<network>` suffix, e.g. `peers-gnosis.cache`).
 Both engines (Java and Rust) read and write the **same files in byte-identical formats**,
-so switching engines keeps the caches.
+so switching engines keeps the caches (the rows below mark the files only one engine keeps).
 
 Where the files live:
 
@@ -84,18 +89,19 @@ Where the files live:
 |---|---|
 | Daemon (`app`) | working directory (`Main.java`) |
 | Desktop app | `~/.myotis/` (`app-desktop/.../Main.kt`) |
-| Android | `getFilesDir()` (`NodeService.java`) |
+| Android | `getCacheDir()` for the snapshot and peer caches (and the Rust engine's `dataDir`), so "Clear cache" wipes them; `getFilesDir()` for the node key and the query history (`NodeService.java`) |
 | iOS | app sandbox for the Rust engine's cache files; settings & query history in `NSUserDefaults` (`IosSettings.kt`, `IosQueryHistory.kt`) |
 
 ### 1.1 The files, per network
 
 | File | Contents | Size |
 |---|---|---|
-| `sync-state<suffix>.snapshot` | Beacon light-client store: finalized + optimistic headers, current **and** next sync committee (2 × 512 BLS pubkeys ≈ 48 KB), period/slots. Binary "LCSS" v1 (`consensus/.../lightclient/LightClientStoreSnapshot.java`, Rust twin `rust/myotis-consensus/src/snapshot.rs`). Overwritten in place; bound to the chain by genesis-validators-root. | **~50 KB** (~26 KB when the next committee isn't held yet) |
-| `sync-state<suffix>.snapshot.roots` | Recent state-root window sidecar, ≤ 64 entries × 41 B — lets a resume skip re-accumulating roots. | ≤ ~2.6 KB |
-| `peers<suffix>.cache` | EL peer cache: one TSV line per peer — `ip⇥port⇥pubkey(0x+128 hex)⇥snapFlag[⇥snapok\|snapbad]` (`app/.../PeerCache.java`, `rust/myotis-net/src/el/peercache.rs`). **No entry cap**; failed snap-servers are deprioritized (`snapbad`), not evicted for that — the one eviction is 50 consecutive connect failures (both engines). | ~150 B/peer → tens–hundreds of KB after weeks |
+| `sync-state<suffix>.snapshot` | Beacon light-client store: finalized + optimistic headers, current **and** next sync committee (2 × 512 BLS pubkeys ≈ 48 KB), period/slots. Binary "LCSS" v1, or v2 once a held header has the Gloas shape (`consensus/.../lightclient/LightClientStoreSnapshot.java`, Rust twin `rust/myotis-consensus/src/snapshot.rs`). Overwritten in place; bound to the chain by genesis-validators-root. | **~50 KB** (~26 KB when the next committee isn't held yet) |
+| `sync-state<suffix>.snapshot.roots` | Recent state-root window sidecar, ≤ 64 entries × 41 B — lets a resume skip re-accumulating roots. **Java engine only** (`BeaconLightClient`); the Rust engine neither reads nor writes it and leaves it in place. | ≤ ~2.6 KB |
+| `peers<suffix>.cache` | EL peer cache: one TSV line per peer — `ip⇥port⇥pubkey(0x+128 hex)⇥snapFlag[⇥snapok\|snapbad][⇥fails=N]` (`app/.../PeerCache.java`, `rust/myotis-net/src/el/peercache.rs`). **No entry cap**; failed snap-servers are deprioritized (`snapbad`), not evicted for that — the one eviction is 50 consecutive connect failures (both engines). | ~150 B/peer → tens–hundreds of KB after weeks |
 | `cl-peers<suffix>.cache` | CL peer cache: `multiaddr[⇥periodRange][⇥b<period>][⇥lc\|nolc]` (`app/.../CLPeerCache.java`, `rust/myotis-net/src/clcache.rs`). Self-pruning: 3 consecutive failures evict the peer. | ~100 B/peer → a few–tens of KB |
-| `nodekey<suffix>.hex` | secp256k1 node identity, `0x` + 64 hex chars. | 66 B |
+| `nodekey<suffix>.hex` | secp256k1 node identity, `0x` + 64 hex chars. **Java engine only** — the Rust engine generates a fresh node key on every start and never reads or writes this file. | 66 B |
+| `peers-tor<suffix>.cache` | **Rust engine, `-PtorEngine` builds only**: the Tor reserve — verified peers moved out of the EL cache for Tor reads and sends, the EL cache's line format plus `torfails=N` / `direct=<ms>` (`rust/myotis-net/src/el/torreserve.rs`). Arti also keeps its own state and directory cache (Android: under `noBackupFilesDir` / `cacheDir`; desktop: Arti's default directories). | ≤ 24 peers → a few KB (Arti's cache not sized here) |
 
 Global (not per network):
 
@@ -113,8 +119,10 @@ cache-purge action deletes the caches and the snapshot.
 
 - **Headers/blocks**: nothing. The trust anchor is the beacon light client, so the EL
   side re-fetches and re-verifies headers on demand.
-- **State/proofs/bytecode**: in-memory bounded LRUs only, keyed by state root — the
-  root changes every slot, so persisting them would buy almost nothing.
+- **State/proofs/bytecode**: in-memory bounded LRUs only. State is keyed by state root (the
+  Java engine keys storage slots by the account's storage root) — the root changes every
+  slot, so persisting it would buy almost nothing; bytecode, keyed by code hash, is not
+  persisted either.
   Nothing beyond logging config ships in `src/main/resources` — no data blobs.
   (The historical accumulators will add embedded data here once implemented — out of
   scope for now, see the scope note at the top.)
@@ -133,10 +141,11 @@ most recent headers in RAM to answer peers' `GetBlockHeaders`: default **32** he
 ### 2.1 Cold start (first run, or stale checkpoint)
 
 1. **Discovery warm-up** — discv4/discv5 bootnodes plus an EIP-1459 DNS ENR-tree walk
-   (mainnet): tens of KB of UDP + DNS TXT.
+   (mainnet and Sepolia; on the Rust engine only on desktop and daemon hosts): tens of KB of
+   UDP + DNS TXT.
 2. **EL dial wave** — RLPx ECIES handshake + Hello + Status is ~1.5–2 KB per peer;
    the stack dials aggressively (up to hundreds of attempts) until it holds its
-   snap-peer target (default 32): a few hundred KB.
+   snap-peer target (default 32 on the Java engine, 8 on the Rust engine): a few hundred KB.
 3. **CL bootstrap** — `LightClientBootstrap` ≈ **25 KB** (SSZ; it carries a full
    512-pubkey sync committee), verified against the embedded checkpoint root.
 4. **Committee catch-up** — one `LightClientUpdate` ≈ **25 KB per sync-committee period**
@@ -176,7 +185,7 @@ never sleeps (daemon, desktop) runs them 1440×/day.
 
 | Term | Mechanism | Estimate/min awake |
 |---|---|---|
-| **Inbound mempool gossip** (received and dropped) | Full nodes push `Transactions` (0x12) / `NewPooledTransactionHashes` (0x18) to every peer; Myotis never asks for them and discards them on the event loop unless watching its own send (`EthHandler.java`, `TxGossipObserver`). Cost is unavoidable per open eth connection: ~38 B announcement/tx/peer + full bodies from the subset of peers that picked us for full forwarding. | **~1–3.5 MB** at the default 32-peer target (≈ 35–110 KB per peer) |
+| **Inbound mempool gossip** (received and dropped) | Full nodes push `Transactions` (0x12) / `NewPooledTransactionHashes` (0x18) to every peer; Myotis never asks for them and discards them on the event loop unless watching its own send (`EthHandler.java`, `TxGossipObserver`). Cost is unavoidable per open eth connection: ~38 B announcement/tx/peer + full bodies from the subset of peers that picked us for full forwarding. | **~1–3.5 MB** at the Java engine's default 32-peer target (≈ 35–110 KB per peer) |
 | **Fee/head warming** (hosts serving the wallet API) | The head warmer rebuilds the verified head (~1 header / 5 s) and keeps the fee snapshot fresh: **3 block bodies every ~12 s** for the tip median (`VerifiedRpcBackend`: `FEE_SNAPSHOT_REFRESH_MS`/`TIP_CACHE_TTL_MS` = 12 s, `TIP_SUGGEST_BLOCKS` = 3, bodies not cached across refreshes) — ~15 bodies/min | **~1–1.7 MB** |
 | **CL finality polling** | Parallel fan-out of `light_client_finality_update` req/resp to **16 peers every slot** (12 s → 5 rounds/min, each fired just past a third of the way into the slot), first verified win; losers' responses still arrive (~1.5–2 KB each) (`BeaconLightClient.pollFinalityUpdate`) | **~20–140 KB** (depends on how many of the 16 respond) |
 | **Discovery upkeep** | discv4 refresh every 15 s (ping/pong/findnode ~150–170 B, inbound `NEIGHBORS` ≤ 1.3 KB) + discv5 poll every 15 s + inbound DHT traffic from other nodes | **~35–175 KB** |
@@ -360,7 +369,7 @@ wallet's confirm screen needs, the broadcast, and confirmation tracking.
 | Phase | What happens | Wire cost |
 |---|---|---|
 | **Gating reads** | nonce (`eth_getTransactionCount`) + balance: one snap proof each; fees: warm snapshot (≈ 0 marginal); gas estimate: plain ETH transfer short-circuits to 21000 (0 bytes); an ERC-20 transfer runs the EVM — token account + bytecode + 1–3 slots | **~10 KB** (ETH transfer) / **~50–150 KB** (ERC-20, first time at a given state root) |
-| **Broadcast** | The signed raw tx (~110–200 B) is sent as a full `Transactions` (0x12) message to **every READY peer** (~32), fire-and-forget (`RLPxConnector.broadcastTransaction`) | **~5 KB** out |
+| **Broadcast** | The signed raw tx (~110–200 B) is sent as a full `Transactions` (0x12) message to **every READY peer** (~32 on the Java engine; the Rust engine sends to its snap peers), fire-and-forget (`RLPxConnector.broadcastTransaction`) | **~5 KB** out |
 | **Re-broadcast** | Still-pending own txs re-pushed every **20 s** (`TX_REBROADCAST_INTERVAL_MS`) until gossip echoes the hash back (propagation confirmed) — typically 1–3 rounds | ~5 KB/round |
 | **Confirmation tracking** | `eth_getTransactionReceipt` polling scans beacon-anchored blocks for the tx: first poll looks back **8 blocks** (bodies verified against `transactionsRoot`), then ~1 new body per block (12 s) until mined; receipts fetched **only for the matched block** and verified against `receiptsRoot` (`VerifiedRpcBackend.locateMinedTx`, `RECEIPT_INITIAL_LOOKBACK_BLOCKS` = 8, per-poll cap 128) | ~8–12 bodies × ~100 KB + ~80 KB receipts ≈ **~1–2 MB** |
 
@@ -375,7 +384,7 @@ order of magnitude.
 
 | Knob | Default | Effect |
 |---|---|---|
-| Target snap peers (`ChainStack.setTargetSnapPeers`, Settings) | 32 | Mempool-gossip inbound scales ~linearly with connected eth peers — the #1 lever. |
+| Target snap peers (`ChainStack.setTargetSnapPeers`, Settings) | 32 (Java engine; a no-op on the Rust engine, whose pool holds 8) | Mempool-gossip inbound scales ~linearly with connected eth peers — the #1 lever. |
 | Served-block window (`setServedBlockWindow`) | 32 (max 4096) | RAM (~500 B/header) and what we serve peers; not a big wire term. |
 | Idle pause (Android Settings) | 5 min | Everything → 0 while asleep. |
 | Stay awake while charging (Android Settings) | on | Skips the idle pause while plugged in on an unmetered network; on a metered one the stack sleeps on the idle timer even while charging. |

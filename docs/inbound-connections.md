@@ -4,7 +4,8 @@ Status: **design only, not scheduled**. This document records why accepting
 inbound RLPx connections matters for Myotis, whether it can work at all on the
 networks our users actually sit behind (home router, mobile, Starlink), and
 what the implementation would look like in both engines. Nothing here is
-implemented; the gap analysis cites the code as of 2026-08-03 (post #276/#277/#278).
+implemented beyond the Rust engine's address-less ENRRequest answers (#539,
+Gap D); the gap analysis cites the code as of 2026-08-03 (post #276/#277/#278).
 
 ---
 
@@ -131,14 +132,16 @@ Both engines implement only the initiator role:
   recovery exists under `rlpx/` today). `deriveSecrets()` hashes
   `remoteNonce ‖ localNonce`, which is only correct for the initiator (the
   spec fixes `recipient-nonce ‖ initiator-nonce`).
-- Rust `rust/myotis-net/src/el/rlpx/handshake.rs` — `pub struct Initiator`
-  only; its own test comments note the same initiator-centric nonce order.
+- Rust `rust/myotis-wire/src/rlpx/handshake.rs` (moved out of `myotis-net`
+  by #505, re-exported at its old `el/rlpx/handshake.rs` path) — `pub struct
+  Initiator` only; its own test comments note the same initiator-centric
+  nonce order.
 
 What already exists and is reusable:
 
 - The ECIES primitives are role-agnostic: Java `EciesCodec.decrypt(...)`
   already handles the size-prefix AAD an inbound auth needs; Rust
-  `ecies.rs::decrypt` likewise.
+  `myotis-wire`'s `rlpx/ecies.rs::decrypt` likewise.
 - `HandshakeRoundTripTest.java` hand-rolls the entire responder inline
   (decrypt auth, build ack, swap nonces/wires into `SessionSecrets`) — it is
   the executable spec for a production `RecipientHandshake` and becomes a
@@ -169,7 +172,7 @@ the JVM merely fails softer). Cross-referenced from the §5 DoS bullet.
 ### Gap B — a TCP listener
 
 There is no EL server socket in either engine (no Netty `ServerBootstrap`
-anywhere; the only Rust `TcpListener::bind` is inside a test). Precedents:
+anywhere; the Rust `TcpListener::bind` calls are all inside tests). Precedents:
 
 - `app/.../DaemonServer.java` — accept-loop structure (Unix domain socket).
 - The CL side already listens: `consensus/.../BeaconP2PService.java` binds
@@ -225,8 +228,9 @@ Today we advertise almost nothing, and what we advertise is wrong:
 
 - The discv4 Ping `from` endpoint carries IP `0.0.0.0` (our wildcard bind)
   with `tcp = udp = elPort`.
-- We never build or sign our own ENR (`core/.../Enr.java` is decode-only; the
-  Rust CL discv5 record is built with a throwaway key and no address fields).
+- We never build or sign an ENR carrying our address (`core/.../Enr.java` is
+  decode-only; the Rust CL discv5 record is built with a throwaway key and no
+  address fields, and the Rust EL record of the next bullet has none either).
 - We answer no FindNode — a deliberate "client-only" stance, documented in
   `rust/.../el/discv4.rs`. Since #539 the Rust engine does answer ENRRequest,
   but only from a node whose pong it holds, under the same per-IP rate limit

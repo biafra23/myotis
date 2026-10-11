@@ -7,10 +7,10 @@
 Reference modules: `myotis-evm/` (`io.myotis.evm`) and `myotis-ens/` (`io.myotis.ens`); the MPT
 verifier lives in `core/` (`com.jaeckel.ethp2p.core.trie`).
 
-> **Biggest single port:** the EVM. The reference embeds **Hyperledger Besu's standalone `evm`
-> module**. Replace it with **revm** (Rust) or **go-ethereum `core/vm`** (Go). Everything in the
-> `world` package is an adapter to Besu's `WorldUpdater` SPI — re-target it to revm's
-> `Database`/`DatabaseRef` trait or geth's `vm.StateDB`.
+> **Biggest single port:** the EVM. The reference embeds **Hyperledger Besu's standalone EVM
+> module** (`org.hyperledger.besu:besu-evm`). Replace it with **revm** (Rust) or **go-ethereum
+> `core/vm`** (Go). Everything in the `world` package is an adapter to Besu's `WorldUpdater`
+> SPI — re-target it to revm's `Database`/`DatabaseRef` trait or geth's `vm.StateDB`.
 
 ---
 
@@ -67,7 +67,9 @@ Three files: `MerklePatriciaProofVerifier`, `HexPrefix`, `RlpItems`. keccak-256 
   routes account-only requests to `GetAccountRange` and storage requests to `GetStorageRanges`
   (both return proofs), **not** to snap `GetTrieNodes`.
 - `BytecodeCache` (codeHash → code; immutable forever, cross-session-safe).
-- `StateProofCache` (cross-call, keyed by `stateRoot`).
+- `StateProofCache` (cross-call; accounts keyed by world `stateRoot`, storage slots by the
+  account's proven `storageRoot`, so an unchanged contract's slots survive head advances — the
+  Rust twin still keys storage by world root).
 
 ### 3.2 `SnapBackedStateOracle` — verify-on-fetch
 
@@ -84,11 +86,13 @@ Three files: `MerklePatriciaProofVerifier`, `HexPrefix`, `RlpItems`. keccak-256 
   this root" cause, call `reportRootUnavailable()` so the routing supplier deprioritizes that peer
   for this head.
 - **Batching**: coalesce an account→slots map into chunked requests (~64 path-sets each); each item
-  still verifies independently (the verifier builds a per-node hash map), collapsing a 1000-account
-  sweep from ~1000 round-trips to ~16.
+  still verifies independently (the verifier builds a per-node hash map), so a 1000-account sweep
+  goes out as ~16 concurrent chunks instead of ~1000 sequential round-trips — on the wire each
+  path-set is still its own request, so the saving is concurrency (04 §3.2).
 - **Three cache tiers**: per-call (`SyncStateView`), per-resolution in-flight dedup
-  (`accountCache`), and cross-call `StateProofCache` (safe because state at a fixed `stateRoot` is
-  immutable — a cached `(stateRoot, addr, slot) → value` is a cryptographic fact, not peer-trusted).
+  (`accountCache`), and cross-call `StateProofCache` (safe because state under a fixed root is
+  immutable — a cached `(stateRoot, addr) → account` or `(storageRoot, slot) → value` is a
+  cryptographic fact, not peer-trusted).
 
 ### 3.3 Sync↔async bridge (`SyncStateView`)
 
@@ -115,6 +119,10 @@ The EVM is synchronous; the oracle is async. The bridge has three modes:
   that gates on `msg.sender` (every ERC-20 `transfer`/`approve`, most dapp calls) reverts under a
   zero sender (e.g. USDC "transfer from the zero address"), so a confirm-screen simulation that
   carries a `from` must thread it through — running `eth_call` as the zero address is a real bug.
+- `EvmExecutor.callTx(UnsignedTransaction, BlockContext) -> future<bytes>` — the
+  transaction-object form `eth_call` uses when the call carries `gas` or fee fields (#509): the
+  limit bounds the call, a fee is checked against the base fee and the sender's balance and charged
+  before the run, with geth's errors.
 - `EvmExecutor.estimateGas(UnsignedTransaction, BlockContext) -> future<long>`.
 - `Address` is a dedicated 20-byte type (deliberately **not** Besu's, to keep the EVM engine out of
   the public API — do the same in a port so the engine is swappable).
@@ -146,8 +154,12 @@ CcipReadEvmExecutor( PrefetchingEvmExecutor( DefaultEvmExecutor( SnapBackedState
 - Child `WorldUpdater` so commits/reverts don't pollute the read-through cache.
 - **Sender**: zero address for anonymous view calls (ENS reads), but `eth_call` threads the
   caller's real `from` and `value` through the sender/value-aware overload (§4.1) — a zero sender
-  reverts any `msg.sender`-gated contract. `gasPrice = 0`; `isStatic = true`.
-- `initialGas = 30,000,000` (`DEFAULT_GAS_LIMIT`).
+  reverts any `msg.sender`-gated contract. `gasPrice = 0` for a fee-less call (under `callTx` a fee
+  is charged first and `GASPRICE` reads the effective price); `isStatic = false` — a non-static
+  message call as in geth, so a `transfer`/`approve` simulation may `SSTORE` into the discarded child
+  updater.
+- `initialGas = 30,000,000` (`DEFAULT_GAS_LIMIT`) for a plain call; under `callTx`, the caller's
+  `gas` (capped there) minus the intrinsic cost.
 - **EIP-7702 delegation**: if the target's code is exactly 23 bytes and starts with `0xef0100`,
   follow the designator **one hop** (chains are not followed — that correctly yields invalid-opcode).
 - **BLOCKHASH is deliberately unsupported** (no verified block-hash provider) — fail fast rather
@@ -159,7 +171,9 @@ CcipReadEvmExecutor( PrefetchingEvmExecutor( DefaultEvmExecutor( SnapBackedState
 ### 4.4 Gas estimation (replicate exactly)
 
 - Intrinsic gas (Yellow Paper App. G): `21000 + 4·zeroBytes + 16·nonzeroBytes` (EIP-2028).
-  **EIP-2930 access lists and EIP-3860 init-code are not modeled; contract creation is unsupported.**
+  **EIP-2930 access lists and EIP-3860 init-code are not modeled; contract creation is unsupported**
+  (the reference refuses such requests with `-32602`; the Rust engine models all three —
+  `myotis_evm::tx::TxRequest`).
 - Run at the ceiling with `initialGas = ceiling - intrinsic`, `isStatic = false` (so SSTORE
   meters/refunds), real `value`, real `from` (debited `gasLimit × effective price`, as geth's
   `buyGas`).
@@ -177,13 +191,17 @@ CcipReadEvmExecutor( PrefetchingEvmExecutor( DefaultEvmExecutor( SnapBackedState
 - The JSON-RPC `eth_estimateGas` short-circuits a plain value transfer to a code-less account to
   exactly `21000` (no EVM run, no buffer).
 
-### 4.5 Fork schedule (mainnet, hardcoded — parameterize per chain if needed)
+### 4.5 Fork schedule (per chain, hardcoded)
 
-The reference hardcodes mainnet boundaries: pre-Merge **by block number** (London 12,965,000,
-Paris 15,537,394), post-Merge **by timestamp** (Shanghai 1,681,338,455, Cancun 1,710,338,135,
-Prague 1,746,612,311); **throws below London**. Notable: Shanghai uses Istanbul precompiles (KZG
-point-eval is post-Shanghai). A port replicates this table and maps it to the engine's spec id
-(revm `SpecId`, geth chain config); parameterize per chain if Gnosis EVM execution is required.
+The reference (`EvmFactory`) keys the fork per chain id — mainnet, Sepolia and Gnosis; any other
+chain fails closed. Mainnet: pre-Merge **by block number** (London 12,965,000, Paris 15,537,394),
+post-Merge **by timestamp** (Shanghai 1,681,338,455, Cancun 1,710,338,135, Prague 1,746,612,311,
+Osaka 1,764,798,551); **throws below London**. Sepolia and Gnosis: by timestamp only, from
+Shanghai; **throw below it**. Sepolia's Amsterdam (1,791,294,816) is **refused** by the reference
+(Besu 26.4 cannot price it) and served by the Rust engine's revm. Notable: Shanghai uses Istanbul
+precompiles (KZG point-eval is post-Shanghai). A port replicates this table and maps it to the
+engine's spec id (revm `SpecId`, geth chain config) — the Rust twin is `spec_for` in
+`rust/myotis-evm/src/fork.rs`.
 
 ### 4.6 WorldUpdater journal notes
 
@@ -223,7 +241,8 @@ contains `{data}`** (request fits in the URL), else **POST** with body `{"sender
 ERC-7884 `HttpError(uint16,string)` selector (`0xca7a4e75`) even in a 200 body and treat it as a
 gateway failure (gateways wrap upstream 429/5xx this way). All URLs failing → `CcipGatewayFailed`.
 
-The transport is the injected **`CcipGateway`** interface (`request(method, url, body) -> bytes`) —
+The transport is the injected **`CcipGateway`** interface (`request(method, url, body) -> future<String>`,
+the response body; hosts implement the engine API's `HttpGateway` port, adapted to it) —
 so the EVM module has **no HTTP dependency**. Hosts supply it (desktop: native HTTP client; mobile:
 platform HTTP client). Needs GET+POST, a deadline on the whole request (~15 s: a per-read timeout
 never ends a body sent a byte at a time) and a bounded response size (~1 MiB; both host gateways cap
@@ -292,7 +311,9 @@ only if it returns the original address).
 
 ### 7.5 Network coverage
 
-ENS is pinned for **mainnet (1)** and **sepolia (11155111)** only (Holesky retired). The factory
+ENS is pinned for **mainnet (1)** and **sepolia (11155111)** only (`forChainId` still carries
+Holesky's 17000 addresses — dead code since the network was retired and dropped from
+`NetworkConfig`). The factory
 keys on chain id and throws for chains without canonical ENS (e.g. Gnosis) — `NetworkConfig.hasEns()`
 gates the UI. Keep ENS off `NetworkConfig` so the ENS module doesn't depend on the networking stack.
 
@@ -302,11 +323,11 @@ gates the UI. Keep ENS off `NetworkConfig` so the ENS module doesn't depend on t
 
 | Concern | Reference | Rust | Go |
 |---|---|---|---|
-| EVM | Besu `evm` | `revm` | go-ethereum `core/vm` |
+| EVM | Besu `besu-evm` | `revm` | go-ethereum `core/vm` |
 | MPT proof verify | hand-rolled (`core/trie`) | port by hand / `alloy-trie` (re-validate) | port by hand / geth `trie` |
 | ABI | hand-rolled | `alloy`/`ethabi` or hand-rolled | geth `accounts/abi` or hand-rolled |
 | keccak / RLP / uint256 | Tuweni + BouncyCastle | `tiny-keccak`,`alloy-rlp`,`ruint` | geth `crypto`/`rlp`, `holiman/uint256` |
-| HTTP (CCIP) | injected `CcipGateway` (java.net.http / platform) | `reqwest` (behind the port) | `net/http` (behind the port) |
+| HTTP (CCIP) | injected `CcipGateway` (java.net.http / platform) | `reqwest` (behind the port) — the Rust engine instead returns the gateway tuple to the host, which drives the HTTP round and re-enters via `ccipCallback` | `net/http` (behind the port) |
 
 **Port priority**: (1) MPT verifier — security-critical, small; (2) the `world`/oracle adapter to
 your EVM's state trait; (3) the EVM fork table + view-call/estimate frame setup; (4) CCIP-Read + ENS

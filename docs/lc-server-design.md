@@ -80,7 +80,10 @@ One asymmetry between our own engines: the **Java** CL also calls
 `BeaconLightClient.fillChainStateRoots`, purely to extract execution state
 roots. The **Rust** engine never requests blocks — it takes the execution state
 root from the LC header's `execution` field, verified against the block body
-root via `execution_branch` (`myotis-consensus/src/store.rs:157`). So this is a
+root via `execution_branch` (`myotis-consensus/src/store.rs`,
+`verify_execution_branch_at`; from Gloas the header proves only the block hash,
+and the state root comes from the EL header fetched by that hash,
+`myotis-net/src/el/anchor.rs`). So this is a
 Java-engine wart to fix on our side, not a requirement on the server. Until it
 is fixed, either proxy a bounded block window or accept that Java-engine hosts
 still need a full CL for that one call.
@@ -128,7 +131,9 @@ wallet receiving it, and a relay can withhold but not forge. That is a genuinely
 different situation from an EL RPC fallback, which is what the rule was written
 against.
 
-The amendment, as it now reads in CLAUDE.md's **Data sources** section:
+The amendment as proposed here (CLAUDE.md's **Data sources** section words the
+adopted rule as its own "Carve-out for myotis-operated serving infrastructure",
+naming `roost`):
 
 > …for a wallet; myotis-operated relay infrastructure may source *self-verifying*
 > consensus objects (LC bootstrap/updates) from a local beacon node over loopback
@@ -433,12 +438,15 @@ block it anchors to (looked up by root, since a pinned checkpoint can sit many
 epochs behind head); the per-slot objects are stamped for head, which they track
 to within a slot or two. `roost probe` checks the computed digest against the one
 the upstream framed on the wire — verified equal on sepolia at `0x74d01459`, and
-`myotis-net`'s pinned mainnet values (`0x82FAE541` base, `0x8C9F62FE` with BPO2)
+`myotis-wire`'s pinned mainnet values (`0x82FAE541` base, `0x8C9F62FE` with BPO2)
 are reached through the same selection in unit tests.
 
 The blast radius of getting this wrong is asymmetric and worth knowing: myotis'
-own decoder skips the context bytes (`codec.rs`: "the payload's own fork sniffing
-governs decode"), so our wallets tolerate a stale digest. Every other CL — which
+own decoders read the context bytes only to recognise the Gloas format, and an
+object of exactly the Gloas size reads as Gloas whatever its digest
+(`ChainConfig::lc_fork_of_chunk`; Java `BeaconLightClient.lcForkOf`) — pre-Gloas
+objects are still told apart by their own shape — so our wallets tolerate a
+stale digest. Every other CL — which
 §Capacity expects to dial us once the ENR is published — dispatches
 deserialization on it and does not.
 
@@ -575,7 +583,9 @@ Ordered so nothing regresses:
 2. Build the server. Verify a wallet can bootstrap and stay synced from it
    alone, with Nimbus's pinned multiaddr removed from the client config.
    **Validate on both engines and say which is which** — `myotis.engine`
-   defaults to *java*, so "a wallet" is ambiguous exactly where it matters.
+   defaulted to *java* when this was written (it is *auto*, Rust-first, since),
+   so "a wallet" is ambiguous exactly where it matters. Status: Rust engine
+   verified on sepolia from roost alone; Java engine untested (roost README).
 
 3. **Settle the Java `beacon_blocks_by_range` gap explicitly.** Without this step
    the choice gets made by omission: step 2 can pass on the Rust engine while
@@ -596,8 +606,8 @@ Ordered so nothing regresses:
      "proxy blocks" option entirely; or
    - **Fix `fillChainStateRoots`** to take the execution state root from the LC
      header's `execution` field, as the Rust engine already does
-     (`myotis-consensus/src/store.rs:157`). Removes the asymmetry permanently and
-     is where this document's own analysis points.
+     (`myotis-consensus/src/store.rs`, `verify_execution_branch_at`). Removes
+     the asymmetry permanently and is where this document's own analysis points.
 
    Note what proxying blocks would cost, if it is ever revisited: §Capacity rests
    on "every client receives the same cached bytes". A block range is per-wallet

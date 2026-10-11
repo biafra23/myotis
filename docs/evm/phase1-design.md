@@ -8,6 +8,20 @@ trusted `stateRoot`.
 > **Scope:** correctness, not speed. One synchronous round trip per SLOAD
 > is acceptable in Phase 1 (1–5 s per call). Phase 2 adds prefetching.
 
+> **Status (as built):** shipped on the Java engine. Two things changed
+> after this record: the mainnet ITs now dial a real peer through
+> `MainnetPeerBootstrap`
+> (`app/src/main/java/com/jaeckel/ethp2p/app/testing/MainnetPeerBootstrap.java`,
+> added in Phase 5), so the `connectToMainnetPeer()` gate below is closed;
+> and the `EthHandlerSnapPeer` adapters
+> (`app/src/main/java/com/jaeckel/ethp2p/app/snap/`,
+> `rpc-backend/src/main/java/io/myotis/rpc/snap/`) answer
+> `SnapPeer.getTrieNodes` with a single-account `GetAccountRange` or
+> single-slot `GetStorageRanges` request per path, not with `GetTrieNodes`:
+> a `GetTrieNodes` reply carries only the node at the requested path, not
+> the root-to-leaf proof the verifier descends (see
+> `EthHandler.requestAccountByHashAsync`).
+
 ## Acceptance criteria (from the original plan)
 
 - `DefaultEvmExecutor.callView` works end-to-end against mainnet.
@@ -33,10 +47,14 @@ needs. For per-account lookups Phase 1 needs the lower-bandwidth pair:
 
 | Code | Name             | Purpose |
 |------|------------------|---------|
-| 0x26 | `GetTrieNodes`   | Request specific trie nodes by `(account, path)` pairs. |
-| 0x27 | `TrieNodes`      | Response with the requested nodes. |
-| 0x24 | `GetByteCodes`   | Request bytecode by code hash. |
-| 0x25 | `ByteCodes`      | Response with concatenated bytecodes. |
+| 0x27 | `GetTrieNodes`   | Request specific trie nodes by `(account, path)` pairs. |
+| 0x28 | `TrieNodes`      | Response with the requested nodes. |
+| 0x25 | `GetByteCodes`   | Request bytecode by code hash. |
+| 0x26 | `ByteCodes`      | Response with concatenated bytecodes. |
+
+(Absolute codes with snap at base 0x21, i.e. on an eth/66–68 session. Snap's codes are
+relative to the negotiated base — 0x10 + the eth protocol length — so on eth/69 (base 0x22)
+each is one higher: `EthHandler.snapBaseFor`.)
 
 Encoders / decoders + RLP roundtrip tests. No protocol wiring yet.
 
@@ -206,7 +224,10 @@ criterion is reachable as soon as the bootstrap helper exists.
   a 128 KB range. We may discover that mainnet peers serve `GetTrieNodes`
   inconsistently and need to fall back to `GetAccountRange` with a tight
   hash window. Decide when commit 3 hits real peers.
-- **Threading model.** Phase 0 uses `Runnable::run` in the no-arg ctor and
+  Settled: `GetAccountRange` / `GetStorageRanges` keyed on the account
+  (and slot) hash, because `GetTrieNodes` does not return the proof path
+  after all — see the status note at the top.
+- **Threading model.** Phase 0 uses `Runnable::run` in the one-arg ctor and
   documents that production callers must pass a worker pool. Phase 1's
   oracle blocks on real network IO; the executor must run on a non-UI
   thread. Concrete recommendation lands in commit 4.
