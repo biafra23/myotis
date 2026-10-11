@@ -13,7 +13,9 @@
 > sent — it may be out), and one that went over Tor is never pushed from the
 > real IP again: not rebroadcast, and not re-pushed when the wallet
 > re-submits it, even after Tor is switched off.
-> Wired up on the desktop host only today; storage/token
+> Wired up on the desktop and Android hosts (iOS not yet; on Android
+> `-PtorEngine` reaches the jniLibs — see the Android bullet in
+> [§3](#3-tor-client-library-arti-in-the-rust-engine)); storage/token
 > reads, `eth_call`/gas estimation (a plain transfer's included: the hosts no
 > longer pre-check its recipient through `get_code`, the engine's state oracle
 > reads it), receipt polling, the CL fetch, and discovery
@@ -120,7 +122,39 @@ embeddable as a plain library) inside the **Rust engine** — and only there:
   Android as jniLibs (`cargoNdkAndroid`); Arti compiles for the same NDK
   targets and embeds in the engine, so the Android host needs no separate Tor
   integration (no bundled daemon, no Orbot dependency). Likewise iOS, where the
-  Rust engine is the only engine.
+  Rust engine is the only engine (not wired yet). **Shipped on Android behind
+  `-PtorEngine`** (`./gradlew :android-app:assembleDebug -PtorEngine`, which
+  sets `MYOTIS_TOR_ENGINE=1` for `rust/build-android.sh`), with three
+  Android-only differences:
+  - *TLS backend.* Off Android Arti runs on native-tls; on Android that means
+    OpenSSL, which the NDK does not ship, so the Android jniLibs take Arti's
+    rustls backend with the **ring** provider — already linked there through
+    libp2p-quic — and `el/tor.rs` installs it as the process default before
+    the first bootstrap (Arti's rustls backend panics without one). The two
+    are separate per-target dependency tables in `myotis-net/Cargo.toml`
+    because tor-rtcompat silently prefers native-tls when both are on.
+  - *SQLite is bundled* (`arti-client/static-sqlite`) for Arti's directory
+    cache: the NDK has no libsqlite3 to link and apps may not load the
+    platform's.
+  - *Storage directories are named by the host.* Arti's defaults derive from
+    `$HOME`, which an app process has no usable value for, so the engine
+    refuses an unconfigured Android bootstrap; `NodeService.applyTorMode`
+    names `noBackupFilesDir/arti/state` (guard state — never backed up) and
+    `cacheDir/arti` (the re-downloadable directory cache) through
+    `Tor.configureStorage` → `set_tor_storage_dirs` (ABI 43) before it turns
+    routing on. The directories cannot move once a bootstrap holds them; a
+    different pair after that is refused, not ignored.
+
+  Checked at build level so far (both ABIs cross-compile; the engine's only
+  NEEDED libraries stay libc/libm/libdl); an on-device bootstrap has not been
+  observed yet.
+
+  Arti adds ~9.3 MB per ABI to `libmyotis_engine.so` (arm64-v8a 15.4 →
+  24.8 MB, measured 2026-10-10), stored uncompressed in the APK, so — as on
+  desktop — no CI or release build passes the flag. The Settings row appears
+  only in a build that did: `supportsTor` reads `BuildConfig.TOR_ENGINE` first,
+  so a Tor-less APK never loads the engine library just to learn it cannot
+  route, and a Tor build confirms it with the loaded library.
 - **The Java engine gets no Tor mode for now.** A Java path would mean bundling
   a Tor daemon and driving it over SOCKS — deliberately out of scope; hosts
   that want private mode select the Rust engine (`myotis.engine=rust`). This
@@ -533,4 +567,7 @@ Re-evaluate when any of these becomes true:
   (`send_judged`, `tor_broadcast`, `rebroadcast_route`),
   `rust/myotis-net/src/el/tor.rs` (`push_transaction`)
 - DNS ENR trees: `networking/dns/DnsEnrResolver`, `NetworkConfig.elEnrTreeUrls`
+- Tor transport + Arti setup: `rust/myotis-net/src/el/tor.rs`; host seams:
+  `myotis-engines/.../Tor.java`, desktop `DesktopNode.applyTorMode`, Android
+  `NodeService.applyTorMode`
 - Hello clientId: `networking/.../HelloMessage.java`

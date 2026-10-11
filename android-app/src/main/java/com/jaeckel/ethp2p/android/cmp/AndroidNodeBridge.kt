@@ -178,6 +178,14 @@ class AndroidNodeController(
     }
     override fun applyBlsBackend() { NodeService.applyBlsBackend(appContext) }
     override fun applyEngineChoice() { NodeService.applyEngineChoice(appContext) }
+    override fun applyTorMode() { NodeService.applyTorMode(appContext) }
+
+    // Only a -PtorEngine APK links Arti into libmyotis_engine.so (docs/privacy-and-tor.md).
+    // Every other APK answers from BuildConfig and never loads the engine library on this
+    // (main) thread just to learn that; a Tor build confirms it with the loaded library.
+    // Cached — the answer cannot change within a process, and the Settings row reads it
+    // on every recomposition.
+    override val supportsTor: Boolean by lazy { NodeService.torSupported() }
     override fun clearCaches(network: String) { serviceProvider()?.clearCaches(network) }
     override fun resetSyncState(network: String) { serviceProvider()?.resetSyncState(network) }
 
@@ -284,6 +292,25 @@ class AndroidNetworkStatus(private val ctx: Context) : NetworkStatus {
     }.distinctUntilChanged()
 }
 
+/**
+ * Tor routing state for the Status row (docs/privacy-and-tor.md), or null when it
+ * doesn't apply — the desktop's `torModeFor`: Tor is a Rust-engine-only capability, and
+ * a build without `-PtorEngine` reports no support (status bit0 clear). Otherwise "off"
+ * (supported but disabled), "on" (enabled, circuit still bootstrapping), "active"
+ * (circuit ready). A Tor-less APK answers from BuildConfig, as `supportsTor` does,
+ * without a native call per network on every poll.
+ */
+private fun torModeFor(engineKind: String?): String? {
+    if (!com.jaeckel.ethp2p.android.BuildConfig.TOR_ENGINE || engineKind != "rust") return null
+    val st = io.myotis.engines.Tor.status()
+    if (st and 1 == 0) return null
+    return when {
+        st and 2 == 0 -> "off"
+        st and 4 != 0 -> "active"
+        else -> "on"
+    }
+}
+
 /** Map the Java `NodeService.Snapshot` record into the shared Kotlin model. */
 private fun NodeService.Snapshot.toModel(): NodeSnapshot = NodeSnapshot(
     running = running(),
@@ -329,6 +356,7 @@ private fun NodeService.Snapshot.toModel(): NodeSnapshot = NodeSnapshot(
     elHunting = elHunting(),
     rpcPort = rpcPort(),
     rpcServing = rpcServing(),
+    tor = torModeFor(io.myotis.engines.Engines.engineKindFor(network())),
     wsBoundPeriods = wsBoundPeriods(),
     upgrade = upgradeAdvisory()?.let {
         UpgradeNotice(it.phase().name, it.activationTime(), it.forkId(), it.observedPeers())
@@ -375,6 +403,8 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun setNativeBlsEnabled(v: Boolean) = NodeService.setNativeBlsEnabled(ctx, v)
     override fun preferJavaEngine(): Boolean = NodeService.preferJavaEngine(ctx)
     override fun setPreferJavaEngine(v: Boolean) = NodeService.setPreferJavaEngine(ctx, v)
+    override fun torEnabled(): Boolean = NodeService.torEnabled(ctx)
+    override fun setTorEnabled(v: Boolean) = NodeService.setTorEnabled(ctx, v)
     override fun javaEngineUnavailableReason(): String? = NodeService.javaEngineUnavailableReason()
 
     override fun idlePauseMinutes(): Int = NodeService.idlePauseMinutes(ctx)

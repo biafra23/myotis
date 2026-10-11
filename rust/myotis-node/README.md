@@ -400,7 +400,7 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 
 ## Request ownership and cancellation
 
-This implementation targets the current engine's **ABI 42** and existing JS
+This implementation targets the current engine's **ABI 43** and existing JS
 argument/result shapes. Every signature up to ABI 31 is unchanged since ABI 25,
 ABI 32's one change is additive (an optional trailing argument), ABI 33 changes
 no signature (the executor refusals above), ABI 34 adds `estimateGasTxJson`
@@ -430,9 +430,11 @@ ABI 38 adds the `snap2ServingPeers` status key — the part of
 `snapServingPeers` connected over snap/2 (EIP-8189), informational only (a
 key addition — older readers ignore it, and nothing should gate on it); ABI 39
 adds the engine's DNS-discovery switch (not wrapped here); ABI 40 adds
-`createAccessListJson`; and ABI 41 adds `blockTimestamp` to the
+`createAccessListJson`; ABI 41 adds `blockTimestamp` to the
 `requestAccountJson`, `resolveEnsJson` and `ensRecordJson` results (a key
-addition). It is not a drop-in artifact for a host pinned to ABI 22.
+addition); and ABI 43 adds the engine's Tor storage-directory call (not
+wrapped here, like the rest of Tor). It is not a drop-in artifact for a host
+pinned to ABI 22.
 Engine failures, admission refusal, cancellation, and deadline expiry remain
 in-band JSON errors. Node-API infrastructure failures may throw/reject.
 

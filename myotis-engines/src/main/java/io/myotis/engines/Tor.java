@@ -85,6 +85,38 @@ public final class Tor {
     }
 
     /**
+     * Name the absolute directories the embedded Tor client keeps its state and its
+     * directory cache in. Android must call this before {@link #select(boolean)
+     * select(true)}: Arti's default directories derive from {@code $HOME}, which an
+     * app process has no usable value for, so the engine refuses an unconfigured
+     * Android bootstrap (reads routed over Tor then fail closed). Elsewhere it is
+     * optional — unset keeps Arti's platform defaults. Returns true iff the engine
+     * will use exactly these; false when the Rust engine is unavailable, the build
+     * has no Tor support, a path is relative, or a bootstrap already holds a
+     * different pair (the directories cannot move within a process).
+     */
+    public static synchronized boolean configureStorage(String stateDir, String cacheDir) {
+        if (!RustMyotisEngine.isAvailable()) {
+            log.info("[tor] storage directories not set: the Rust engine is unavailable");
+            return false;
+        }
+        try {
+            boolean applied = RustEngineNative.nativeSetTorStorageDirs(stateDir, cacheDir);
+            if (applied) {
+                log.info("[tor] storage: state {}, cache {}", stateDir, cacheDir);
+            } else {
+                log.warn("[tor] storage directories refused (state {}, cache {}): Tor-less "
+                        + "build, relative path, or a bootstrap already holds others",
+                        stateDir, cacheDir);
+            }
+            return applied;
+        } catch (Throwable t) {
+            log.warn("[tor] nativeSetTorStorageDirs failed: {}", t.toString());
+            return false;
+        }
+    }
+
+    /**
      * Status bitmask for the host's Status view: bit0 compiled-in, bit1 enabled,
      * bit2 bootstrapped (a Tor circuit is ready). {@code 0} = this build has no
      * Tor support (Java engine, or a Rust build without {@code --features tor}).

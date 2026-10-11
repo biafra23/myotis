@@ -139,7 +139,7 @@ Key Gradle modules:
   engine (`Engines`), and Tor verified-read routing (`Tor` —
   docs/privacy-and-tor.md; Rust-engine-only, gated behind the Rust-engine
   toggle, and behind the `-PtorEngine` build flag that links Arti into the host
-  dylib), the Rust log drain (`Engines.drainRustLogs` —
+  dylib and the Android jniLibs), the Rust log drain (`Engines.drainRustLogs` —
   hosts pump the engine's tracing ring into their log pipeline), and the Status
   screen's per-network engine badge (`Engines.engineKindFor`) — internal
   seams, deliberately not on the API; and `:app`'s

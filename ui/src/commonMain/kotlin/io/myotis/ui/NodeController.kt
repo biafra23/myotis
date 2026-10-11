@@ -89,9 +89,10 @@ interface NodeController {
      * Re-apply Tor verified-read routing to the process-global selector after
      * [Settings.setTorEnabled] flips the preference (docs/privacy-and-tor.md). Tor is an
      * experimental capability of the Rust engine only, so hosts that don't support it
-     * (Android/iOS for now) keep the default no-op; the desktop actual pushes the flag to
-     * `Tor.select`. Like the engine toggle it is NOT live: it applies to networks
-     * (re)started afterwards.
+     * (iOS for now) keep the default no-op; the desktop and Android actuals push the flag
+     * to `Tor.select` (Android names Arti's storage directories first). Unlike the engine
+     * toggle it is LIVE: the engine checks the flag per read, so the next read of an
+     * already-running Rust-engine network follows it.
      */
     fun applyTorMode() {}
 
@@ -116,11 +117,12 @@ interface NodeController {
     /**
      * Whether this host can actually route reads over Tor — the Settings row is
      * shown only when true (the [canImportLogIndex] precedent). Default false:
-     * Android/iOS implement none of the Tor seams ([Settings.torEnabled] drops
-     * the write, [applyTorMode] is a no-op), and a privacy toggle that flips ON
+     * iOS implements none of the Tor seams ([Settings.torEnabled] drops the
+     * write, [applyTorMode] is a no-op), and a privacy toggle that flips ON
      * while reads keep leaving from the real IP would be accepted-and-ignored —
-     * the exact failure mode the trust rules forbid. The desktop actual answers
-     * from the loaded engine build (only a `-PtorEngine` dylib links Arti).
+     * the exact failure mode the trust rules forbid. The desktop and Android
+     * actuals answer from the loaded engine build (only a `-PtorEngine` build
+     * links Arti into the dylib / the jniLibs).
      */
     val supportsTor: Boolean get() = false
 
@@ -359,8 +361,9 @@ interface Settings {
     /**
      * true = route verified reads over Tor (docs/privacy-and-tor.md) — experimental, and
      * Rust-engine-only (Arti is embedded in the Rust engine). Default false. Hosts that
-     * can't support it keep the default no-op getter/setter so Android/iOS still compile;
-     * the desktop actual persists it and [NodeController.applyTorMode] pushes it down.
+     * can't support it keep the default no-op getter/setter so iOS still compiles; the
+     * desktop and Android actuals persist it and [NodeController.applyTorMode] pushes it
+     * down.
      */
     fun torEnabled(): Boolean = false
     fun setTorEnabled(v: Boolean) {}

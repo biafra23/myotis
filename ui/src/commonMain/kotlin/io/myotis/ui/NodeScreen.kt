@@ -2461,7 +2461,7 @@ private object StatusHelp {
         "(~64–96 blocks on mainnet) on a healthy node."
     const val LOG_INDEX = "Log index backfill progress, e.g. \"12,041 logs · " +
         "5,594,611–8,461,900\", or \"backfilling\". Shown only when the log index feature applies."
-    const val TOR = "Desktop only, and only with the Rust engine on a -PtorEngine build. " +
+    const val TOR = "Desktop and Android, and only with the Rust engine on a -PtorEngine build. " +
         "Scope: account (balance/nonce) reads and the broadcast of your transactions route over " +
         "Tor today — storage/token reads, eth_call/gas estimation, receipt polling, the CL " +
         "fetch, and discovery still leave from your real IP. The Logs tab shows one \"tor:\" " +
