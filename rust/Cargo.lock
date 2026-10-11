@@ -3794,6 +3794,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "libp2p-mplex"
+version = "0.43.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95a4019ba30c4e42b776113e9778071691fe3f34bf23b6b3bf0dfcf29d801f3d"
+dependencies = [
+ "asynchronous-codec",
+ "bytes",
+ "futures",
+ "libp2p-core",
+ "libp2p-identity",
+ "nohash-hasher",
+ "parking_lot",
+ "rand 0.8.6",
+ "smallvec",
+ "tracing",
+ "unsigned-varint 0.8.0",
+]
+
+[[package]]
 name = "libp2p-noise"
 version = "0.46.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3969,6 +3988,7 @@ version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
 dependencies = [
+ "cc",
  "pkg-config",
  "vcpkg",
 ]
@@ -4161,7 +4181,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-bls"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "blst",
  "jni",
@@ -4169,7 +4189,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-consensus"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "blst",
  "myotis-bls",
@@ -4179,7 +4199,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-core"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "k256",
  "sha2 0.10.9",
@@ -4188,7 +4208,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-engine"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "myotis-consensus",
  "myotis-core",
@@ -4204,7 +4224,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-evm"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "myotis-core",
  "revm",
@@ -4213,30 +4233,26 @@ dependencies = [
 
 [[package]]
 name = "myotis-net"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
- "aes",
  "alloy-rlp",
  "arti-client",
  "async-trait",
- "cipher",
- "ctr",
  "discv5",
  "futures",
  "getrandom 0.2.17",
  "hickory-resolver",
- "hmac",
  "libp2p",
+ "libp2p-mplex",
  "myotis-consensus",
  "myotis-core",
  "myotis-evm",
  "myotis-net",
+ "myotis-wire",
+ "rustls",
  "serde_json",
- "sha2 0.10.9",
- "sha3 0.10.9",
  "snap",
  "socket2 0.5.10",
- "subtle",
  "tokio",
  "tor-rtcompat",
  "tracing",
@@ -4245,7 +4261,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-node"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "myotis-engine",
  "napi",
@@ -4256,7 +4272,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-rpcd"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "clap",
  "myotis-engine",
@@ -4264,6 +4280,23 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "tiny_http",
+]
+
+[[package]]
+name = "myotis-wire"
+version = "0.1.15"
+dependencies = [
+ "aes",
+ "cipher",
+ "ctr",
+ "hmac",
+ "myotis-consensus",
+ "myotis-core",
+ "sha2 0.10.9",
+ "sha3 0.10.9",
+ "snap",
+ "subtle",
+ "tracing",
 ]
 
 [[package]]
@@ -5958,6 +5991,7 @@ version = "0.23.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -7929,11 +7963,15 @@ dependencies = [
  "dyn-clone",
  "educe 0.4.23",
  "futures",
+ "futures-rustls",
  "hex",
  "libc",
  "native-tls",
  "paste",
  "pin-project",
+ "rustls",
+ "rustls-pki-types",
+ "rustls-webpki",
  "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
@@ -8335,6 +8373,10 @@ name = "unsigned-varint"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eb066959b24b5196ae73cb057f45598450d2c5f71460e98c49b738086eff9c06"
+dependencies = [
+ "asynchronous-codec",
+ "bytes",
+]
 
 [[package]]
 name = "untrusted"

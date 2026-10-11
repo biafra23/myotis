@@ -4,7 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 /**
- * The cache-file counters behind the Status "CL cache" / "EL cache" rows —
+ * The cache-file counters behind the Status tab's "Cache" rows (EL and CL groups) —
  * parse the exact token formats the Java AND Rust engines write (the files are
  * the shared cross-engine truth, so these counts must be format-accurate).
  * Ported verbatim from the retired android-app CacheFileStatsTest when the

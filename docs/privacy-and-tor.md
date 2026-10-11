@@ -3,19 +3,30 @@
 > **Status: the core transport path is in production, feature-gated and
 > experimental.** `-PtorEngine` links Arti into the Rust engine
 > (`rust/myotis-net/src/el/tor.rs`), and a Settings toggle routes **account
-> (balance/nonce) reads** — the single routing switch sits in
-> `get_account` (`reader.rs`) — over per-address isolated circuits with
-> ephemeral RLPx keys. Wired up on the desktop host only today; storage/token
+> (balance/nonce) reads** — the routing switch sits in `get_account`
+> (`reader.rs`) — over per-address isolated circuits with ephemeral RLPx
+> keys, and **the broadcast of the wallet's own transactions** — the switch
+> sits in `send_judged`; `tor_broadcast` — under a fresh isolation token per
+> send (its circuits carry nothing else), each push confirmed by its peer's
+> Pong, failing closed: a send no peer took over Tor is refused, never sent
+> from the real IP (one that landed on a stream but got no Pong counts as
+> sent — it may be out), and one that went over Tor is never pushed from the
+> real IP again: not rebroadcast, and not re-pushed when the wallet
+> re-submits it, even after Tor is switched off.
+> Wired up on the desktop and Android hosts (iOS not yet; on Android
+> `-PtorEngine` reaches the jniLibs — see the Android bullet in
+> [§3](#3-tor-client-library-arti-in-the-rust-engine)); storage/token
 > reads, `eth_call`/gas estimation (a plain transfer's included: the hosts no
 > longer pre-check its recipient through `get_code`, the engine's state oracle
-> reads it), tx broadcast, the CL fetch, and discovery
+> reads it), receipt polling, the CL fetch, and discovery
 > still use the real IP, while contract-code reads are a hybrid: `get_code`
 > anchors through the same `get_account`, so its address-carrying account
 > query follows the Tor toggle and only the content-addressed bytecode fetch
 > stays clearnet. And the shipped path reuses the live
 > clearnet-validated peer pool — no quarantine/aging yet — so the peer serving
-> a Tor read simultaneously holds a clearnet connection from the user's real
-> IP and could pair the two by timing (`reader.rs`'s own KNOWN LIMITATION): a
+> a Tor read or receiving a Tor send simultaneously holds a clearnet connection from the user's real
+> IP and can pair the two by timing and by the `myotis/<version>` client id
+> both sessions' Hello carries (§6.3; `reader.rs`'s own KNOWN LIMITATION): a
 > network-privacy win, not yet the full §5 unlinkability. The runnable proof
 > of concept
 > (`rust/tor-poc`, see [§9](#9-proof-of-concept--what-was-validated)) validated
@@ -58,6 +69,7 @@ Tor carries **TCP streams only**. Myotis' transports:
 |---|---|---|
 | RLPx / eth / snap (port 30303) | TCP | Yes (Arti data stream) |
 | CL libp2p req/resp (port 9000) | TCP | Yes — but content-benign, may not need it |
+| CL libp2p req/resp over QUIC (`/udp/<port>/quic-v1`; the Rust engine listens on an ephemeral UDP port and dials a peer's QUIC address when its TCP dial fails) | UDP | **No** — if CL traffic is ever routed over Tor, QUIC has to be off for it (`HostConfig.listen_quic = None`, no QUIC dial), or a peer whose TCP dial fails under Tor is reached in the clear |
 | discv4 (EL discovery) | UDP | **No** |
 | discv5 (CL discovery) | UDP | **No** |
 | EIP-1459 ENR trees | DNS TXT (dnsjava; hickory in the Rust engine) | Not directly; needs DoH over a Tor stream. The Rust engine's walk is **skipped while Tor is enabled** (#539): a system-resolver query for `all.mainnet.ethdisco.net` tells the local resolver which network this node is on |
@@ -110,7 +122,39 @@ embeddable as a plain library) inside the **Rust engine** — and only there:
   Android as jniLibs (`cargoNdkAndroid`); Arti compiles for the same NDK
   targets and embeds in the engine, so the Android host needs no separate Tor
   integration (no bundled daemon, no Orbot dependency). Likewise iOS, where the
-  Rust engine is the only engine.
+  Rust engine is the only engine (not wired yet). **Shipped on Android behind
+  `-PtorEngine`** (`./gradlew :android-app:assembleDebug -PtorEngine`, which
+  sets `MYOTIS_TOR_ENGINE=1` for `rust/build-android.sh`), with three
+  Android-only differences:
+  - *TLS backend.* Off Android Arti runs on native-tls; on Android that means
+    OpenSSL, which the NDK does not ship, so the Android jniLibs take Arti's
+    rustls backend with the **ring** provider — already linked there through
+    libp2p-quic — and `el/tor.rs` installs it as the process default before
+    the first bootstrap (Arti's rustls backend panics without one). The two
+    are separate per-target dependency tables in `myotis-net/Cargo.toml`
+    because tor-rtcompat silently prefers native-tls when both are on.
+  - *SQLite is bundled* (`arti-client/static-sqlite`) for Arti's directory
+    cache: the NDK has no libsqlite3 to link and apps may not load the
+    platform's.
+  - *Storage directories are named by the host.* Arti's defaults derive from
+    `$HOME`, which an app process has no usable value for, so the engine
+    refuses an unconfigured Android bootstrap; `NodeService.applyTorMode`
+    names `noBackupFilesDir/arti/state` (guard state — never backed up) and
+    `cacheDir/arti` (the re-downloadable directory cache) through
+    `Tor.configureStorage` → `set_tor_storage_dirs` (ABI 43) before it turns
+    routing on. The directories cannot move once a bootstrap holds them; a
+    different pair after that is refused, not ignored.
+
+  Checked at build level so far (both ABIs cross-compile; the engine's only
+  NEEDED libraries stay libc/libm/libdl); an on-device bootstrap has not been
+  observed yet.
+
+  Arti adds ~9.3 MB per ABI to `libmyotis_engine.so` (arm64-v8a 15.4 →
+  24.8 MB, measured 2026-10-10), stored uncompressed in the APK, so — as on
+  desktop — no CI or release build passes the flag. The Settings row appears
+  only in a build that did: `supportsTor` reads `BuildConfig.TOR_ENGINE` first,
+  so a Tor-less APK never loads the engine library just to learn it cannot
+  route, and a Tor build confirms it with the loaded library.
 - **The Java engine gets no Tor mode for now.** A Java path would mean bundling
   a Tor daemon and driving it over SOCKS — deliberately out of scope; hosts
   that want private mode select the Rust engine (`myotis.engine=rust`). This
@@ -174,7 +218,16 @@ Route by sensitivity, not wholesale:
 4. **Real snap queries** for the user's addresses — per-address circuit
    isolation (§3) and **ephemeral RLPx node keys** (§6.1).
 5. **Transaction broadcast** — over Tor to the proven peer pool; zero trust cost
-   by construction.
+   by construction. **Shipped:** up to five pool peers at once under one
+   isolation token fresh to the send, each push a fresh RLPx identity
+   confirmed by the peer's Pong (`EthSession::await_pong`); the send answers
+   at the first confirmed push, counts a push that landed without a Pong as
+   sent (it may be out), and fails closed when none landed. Rebroadcasts
+   follow the same route, one round at a time per network, each walking on to
+   the next five pool peers; a Tor send is never re-pushed in the clear, a
+   wallet's re-submit of it included. Tor sessions advertise no listen port;
+   they still send the `myotis/<version>` client id (§6.3 — the choice of a
+   Tor-side id is open).
 
 ## 5. The quarantined peer pool (delayed use)
 
@@ -340,6 +393,10 @@ and for not shipping a unique clientId on the Tor path.
 6. **Tx broadcast fan-out over Tor** — one circuit to a few aged peers, or
    several isolated circuits to disjoint peer subsets (stronger against a
    listening peer, more circuit builds)?
+   > **Shipped as:** one isolation token per send (its circuits carry no
+   > other send and no read), up to five pool peers; each rebroadcast round
+   > walks on to the next five. The peers are not aged yet (§5), so the
+   > stronger options remain open.
 7. **Mobile cost** — the embedded Arti client keeps a
    guard connection alive; interaction with idle-pause and battery needs design
    (probably: Tor client lifecycle == stack awake lifecycle).
@@ -464,9 +521,10 @@ Run *underneath* Myotis by the user, a system VPN covers, with zero Myotis
 code, everything the embedded Tor path does not:
 
 - **The UDP surfaces** — discv4/discv5 discovery can never cross Tor (§2).
-- **Every not-yet-routed flow** — storage/token reads, `eth_call`, tx
-  broadcast, the CL fetch, and the host-side HTTP/DNS surfaces (DNS ENR walk,
-  CCIP-Read, the tx-history debug fetch) — on both engines.
+- **Every not-yet-routed flow** — storage/token reads, `eth_call`, receipt
+  polling, the CL fetch, and the host-side HTTP/DNS surfaces (DNS ENR walk,
+  CCIP-Read, the tx-history debug fetch) — on both engines, plus the tx
+  broadcast whenever Tor mode is off.
 - **A path around §8.9.** Synced peers drop Tor exits because the whole Tor
   network arrives from one small, saturated, widely blocklisted set of exit
   IPs. Gnosis VPN's exits are today ordinary, low-traffic addresses that
@@ -505,6 +563,11 @@ Re-evaluate when any of these becomes true:
 - snap request shapes: `networking/.../eth/EthHandler.java`
   (`SNAP_RESPONSE_BYTES`, GetAccountRange/GetStorageRanges senders)
 - Tx broadcast: `networking/.../rlpx/RLPxConnector.java`
-  (`broadcastTransaction`)
+  (`broadcastTransaction`); Rust: `rust/myotis-net/src/el/reader.rs`
+  (`send_judged`, `tor_broadcast`, `rebroadcast_route`),
+  `rust/myotis-net/src/el/tor.rs` (`push_transaction`)
 - DNS ENR trees: `networking/dns/DnsEnrResolver`, `NetworkConfig.elEnrTreeUrls`
+- Tor transport + Arti setup: `rust/myotis-net/src/el/tor.rs`; host seams:
+  `myotis-engines/.../Tor.java`, desktop `DesktopNode.applyTorMode`, Android
+  `NodeService.applyTorMode`
 - Hello clientId: `networking/.../HelloMessage.java`

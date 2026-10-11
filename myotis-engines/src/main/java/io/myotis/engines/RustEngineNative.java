@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 39; // 39: set_dns_discovery (the EIP-1459 DNS discovery switch, #539)
+    static final int EXPECTED_ABI_VERSION = 43; // 43: set_tor_storage_dirs; 42: ens_record_json method "ownership" (ENS registrant/manager/expiry)
 
     private static final boolean AVAILABLE = load();
 
@@ -187,6 +187,17 @@ final class RustEngineNative {
     }
 
     /**
+     * Name the absolute directories the embedded Tor client keeps its state and
+     * directory cache in (required on Android before the first Tor read). True iff
+     * the client will use exactly these; false for a relative path, a different pair
+     * once a bootstrap holds its directories, or a Tor-less library.
+     */
+    static boolean nativeSetTorStorageDirs(String stateDir, String cacheDir) {
+        // nz(): null or malformed UTF-16 becomes "", which the engine refuses (not absolute).
+        return Myotis_engineKt.setTorStorageDirs(nz(stateDir), nz(cacheDir));
+    }
+
+    /**
      * Allow or forbid EIP-1459 DNS discovery — the EL node lists, walked over the
      * system resolver (#539) — for every network this process runs. Off until a
      * host switches it on; never used while Tor is enabled. Returns the state now
@@ -325,6 +336,17 @@ final class RustEngineNative {
      */
     static String nativeEthCallTxJson(long handle, String tx, String block, String stateOverrides) {
         return Myotis_engineKt.ethCallTxJson(handle, nz(tx), nz(block), nz(stateOverrides));
+    }
+
+    /**
+     * Verified {@code eth_createAccessList} for the FULL transaction object (ABI
+     * >= 40) — the arguments of {@link #nativeEstimateGasTxJson}. The list the
+     * transaction touches with the gas the run made with it used, and that run's
+     * own revert or halt next to them; every field is applied or the request
+     * refused (-32602).
+     */
+    static String nativeCreateAccessListJson(long handle, String tx, String block, String stateOverrides) {
+        return Myotis_engineKt.createAccessListJson(handle, nz(tx), nz(block), nz(stateOverrides));
     }
 
     /** Verified ENS forward resolution (name → address record), as JSON. */

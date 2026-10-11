@@ -12,8 +12,27 @@
 //! supermajority. Use this to answer "is the data out there at all", not "is
 //! this peer honest".
 //!
+//! What it does check is what the catch-up refuses before any BLS work, so an
+//! answer a wallet throws away on sight never counts as serving: an update
+//! attested outside the asked period is `wrong-period`, and one whose headers
+//! are not in the wire shape of its attested slot's fork
+//! (`LightClientProcessor::update_shape_ok` — a pre-Gloas-shaped update for a
+//! Gloas slot, say) is `wrong-fork-shape`. An error answer is filed by its
+//! result code (`server-error`, `resource-unavailable`, `invalid-request`) and
+//! its message listed under ERROR ANSWERS; an answer with no chunk at all —
+//! what a server without the update sends, though a server that closes the
+//! stream unanswered looks the same — is `answered-empty`; only bytes that do
+//! not decode are `undecodable`. Every answer is also
+//! counted under the client its Identify named (BY CLIENT), which is what tells
+//! a client-wide failure — one release refusing a fork's periods — from
+//! scattered sick nodes.
+//!
 //! Written for the mainnet period-1840 stall (2026-09-01), where one server's
-//! stored update had 113/512 and wallets could not advance past it.
+//! stored update had 113/512 and wallets could not advance past it; the
+//! error/shape/client split for Sepolia's Gloas fork (2026-10-06), where the
+//! Lighthouse v8.3.0-rc.0 servers answered period 1379 with
+//! `ServerError: Database error` (later periods empty) and an "undecodable"
+//! bucket hid that.
 //!
 //! The PINNED peers (`ChainConfig::static_peers`) are asked first, ONE AT A
 //! TIME, before any crawl probe is in flight, and each gets its own line: its
@@ -25,10 +44,22 @@
 //! undecodable answers (2026-09-13; reqresp keys its outbound bookkeeping by
 //! request id alone, and libp2p issues those ids per protocol). The crawl
 //! itself stays concurrent, so read its negative buckets with that in mind.
+//! A peer that closes or fails the dial with no Identify is often one with no
+//! stream muxer in common: every Nimbus and Lodestar node, which speak only
+//! mplex on TCP, against a build without #576, whose host offered only yamux.
+//! From such a build a large bucket of those is unmeasured, not dead.
 //! A pin that fails its first ask gets one more, 11 s later: a busy public
 //! node closes on a full peer table and answers the next ask, so a single
 //! failure is not grounds to prune. Only `updates_by_range` is asked, so a
 //! `no-updates-protocol` peer may still serve bootstraps and finality updates.
+//!
+//! `PERIOD` defaults to the current wall-clock period. A setting that is set but
+//! malformed (`NET`, `PERIOD`, `CRAWL_SECS`, `PROBES`) stops the census rather
+//! than falling back to a default: a census of the wrong period reads exactly
+//! like one of the right period. Like `live_pins_alive`,
+//! the result is only as good as the host it runs from (CLAUDE.md, release step
+//! 3): the `cold-start regression` workflow's `census` scope runs this from a
+//! GitHub-hosted runner.
 //!
 //! ```bash
 //! NET=mainnet PERIOD=1840 CRAWL_SECS=300 RUST_LOG=info \
@@ -37,8 +68,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
+use myotis_consensus::store::headers_in_attested_forks_shape;
 use myotis_consensus::types::LightClientUpdate;
 use myotis_net::codec;
 use myotis_net::discovery::{self, DiscoveryConfig};
@@ -57,10 +89,25 @@ const PIN_RETRY_BACKOFF: Duration = Duration::from_secs(11);
 /// One probed peer's verdict.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Verdict {
-    /// Served a decodable update: (participants, attested slot).
+    /// Served an update for the asked period, in its attested slot's wire
+    /// shape: (participants, attested slot).
     Serves(u64, u64),
-    /// Responded, but the frame/SSZ didn't decode (error response or garbage).
-    RespondedUndecodable,
+    /// Served a decodable update attested OUTSIDE the asked period (its
+    /// attested slot) — a server whose light-client data stopped at an earlier
+    /// period, say, answering with the last update it has.
+    WrongPeriod(u64),
+    /// Served an update for the asked period whose headers are not in the wire
+    /// shape of its attested slot's fork (its attested slot); the processor
+    /// refuses it before any BLS work.
+    WrongShape(u64),
+    /// Answered with an error chunk: (result code, the server's message).
+    Error(u8, String),
+    /// Answered with no chunk at all — what a server without the update
+    /// sends, and also what a server that closes the stream unanswered looks
+    /// like: the wire does not tell the two apart.
+    Empty,
+    /// Answered with a success code, but the frame/SSZ didn't decode.
+    Undecodable,
     /// Connected, but doesn't speak `light_client_updates_by_range`. It may
     /// still serve the other light-client protocols (bootstrap, finality).
     Unsupported,
@@ -75,7 +122,11 @@ fn bucket(verdict: &Verdict, need: u64) -> &'static str {
     match verdict {
         Verdict::Serves(bits, _) if *bits >= need => "claims-supermajority",
         Verdict::Serves(..) => "below-2/3-bar",
-        Verdict::RespondedUndecodable => "responded-undecodable",
+        Verdict::WrongPeriod(_) => "wrong-period",
+        Verdict::WrongShape(_) => "wrong-fork-shape",
+        Verdict::Error(code, _) => error_bucket(*code),
+        Verdict::Empty => "answered-empty",
+        Verdict::Undecodable => "undecodable",
         Verdict::Unsupported => "no-updates-protocol",
         Verdict::DialFail => "dial-fail",
         Verdict::Timeout => "timeout",
@@ -84,11 +135,81 @@ fn bucket(verdict: &Verdict, need: u64) -> &'static str {
     }
 }
 
+/// The bucket of an error answer with result code `code`.
+fn error_bucket(code: u8) -> &'static str {
+    match code {
+        codec::RESULT_INVALID_REQUEST => "invalid-request",
+        codec::RESULT_SERVER_ERROR => "server-error",
+        codec::RESULT_RESOURCE_UNAVAILABLE => "resource-unavailable",
+        _ => "unknown-error-code",
+    }
+}
+
+/// An error answer's bucket, with its code where the bucket does not name it
+/// (a client's own codes, Lighthouse's rate limiting among them).
+fn error_name(code: u8) -> String {
+    match error_bucket(code) {
+        "unknown-error-code" => format!("unknown-error-code {code}"),
+        named => named.to_string(),
+    }
+}
+
+/// A verdict with its particulars, for the per-peer lines.
+fn describe(verdict: &Verdict, need: u64, slots_per_period: u64) -> String {
+    let name = bucket(verdict, need);
+    match verdict {
+        Verdict::Serves(bits, slot) => format!("{name} {bits}/512 @slot {slot}"),
+        Verdict::WrongPeriod(slot) | Verdict::WrongShape(slot) => {
+            format!("{name} (attested slot {slot}, period {})", slot / slots_per_period)
+        }
+        Verdict::Error(code, msg) if msg.is_empty() => error_name(*code),
+        Verdict::Error(code, msg) => format!("{} {msg:?}", error_name(*code)),
+        _ => name.to_string(),
+    }
+}
+
+/// Read an `updates_by_range(period, 1)` answer the way the catch-up does, up
+/// to its BLS check (see SCOPE).
+fn classify(config: &ChainConfig, period: u64, raw: &[u8]) -> Verdict {
+    if raw.is_empty() {
+        return Verdict::Empty;
+    }
+    if let Some((code, msg)) = codec::leading_error(raw) {
+        return Verdict::Error(code, msg);
+    }
+    let Ok(chunks) = codec::decode_multi_chunk_response_with_digests(raw, 1) else {
+        return Verdict::Undecodable;
+    };
+    let Some((digest, chunk)) = chunks.into_iter().next().filter(|(_, c)| !c.is_empty()) else {
+        return Verdict::Undecodable;
+    };
+    // Decoded by its context bytes and size, as the wallet does (Gloas).
+    let fork = config.lc_fork_of_chunk(&digest, chunk.len(), LightClientUpdate::GLOAS_SIZE);
+    let Ok(update) = LightClientUpdate::decode_for(fork, &chunk) else {
+        return Verdict::Undecodable;
+    };
+    let slot = update.attested_header.beacon.slot;
+    if slot / config.slots_per_period() != period {
+        return Verdict::WrongPeriod(slot);
+    }
+    // The processor's first gate, the same function: both headers in the shape
+    // of the ATTESTED slot's fork.
+    if !headers_in_attested_forks_shape(
+        &config.fork_schedule,
+        &update.attested_header,
+        &update.finalized_header,
+    ) {
+        return Verdict::WrongShape(slot);
+    }
+    Verdict::Serves(update.sync_aggregate.count_participants() as u64, slot)
+}
+
 /// Ask one peer for `updates_by_range(period, 1)` — `wire` is that request —
 /// and classify the answer. Returns the verdict and how long it took.
 async fn probe(
     config: &ChainConfig,
     client: &reqresp::ReqRespClient,
+    period: u64,
     peer_id: libp2p::PeerId,
     addr: libp2p::Multiaddr,
     wire: Vec<u8>,
@@ -106,29 +227,7 @@ async fn probe(
         Ok(Err(RequestError::Timeout)) => Verdict::Timeout,
         Ok(Err(RequestError::ConnectionClosed)) => Verdict::ConnectionClosed,
         Ok(Err(_)) => Verdict::Io,
-        Ok(Ok(raw)) => match codec::decode_multi_chunk_response_with_digests(&raw, 1) {
-            Ok(chunks) => match chunks.into_iter().next() {
-                // Decoded by its context bytes and size, as the wallet does (Gloas).
-                Some((digest, c)) if !c.is_empty() => {
-                    let fork =
-                        config.lc_fork_of_chunk(&digest, c.len(), LightClientUpdate::GLOAS_SIZE);
-                    match LightClientUpdate::decode_for(fork, &c) {
-                        Ok(u) => {
-                            let bits: u64 = u
-                                .sync_aggregate
-                                .sync_committee_bits
-                                .iter()
-                                .map(|b| b.count_ones() as u64)
-                                .sum();
-                            Verdict::Serves(bits, u.attested_header.beacon.slot)
-                        }
-                        Err(_) => Verdict::RespondedUndecodable,
-                    }
-                }
-                _ => Verdict::RespondedUndecodable,
-            },
-            Err(_) => Verdict::RespondedUndecodable,
-        },
+        Ok(Ok(raw)) => classify(config, period, &raw),
     };
     (verdict, started.elapsed().as_secs_f64())
 }
@@ -148,24 +247,61 @@ fn split_pin(pin: &str) -> Option<(libp2p::PeerId, libp2p::Multiaddr)> {
     Some((peer?, addr))
 }
 
-/// Record `peer`'s Identify agent and whether it advertises updates_by_range.
-/// Identify can land just after a fast failure, and a closing connection takes
-/// its metadata with it, so poll briefly right after the probe.
-async fn note_pin_agent(
+/// `peer`'s Identify agent and whether it advertises updates_by_range; `None`
+/// when Identify never arrived. Identify can land just after a fast failure,
+/// and a closing connection takes its metadata with it, so poll briefly right
+/// after the probe.
+async fn identify(
     client: &reqresp::ReqRespClient,
     peer: libp2p::PeerId,
-    agents: &mut HashMap<String, (String, bool)>,
-) {
+) -> Option<(String, bool)> {
     for attempt in 0..5 {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
         let meta = client.catchup_peer_meta().await;
         if let Some(agent) = meta.agents.get(&peer) {
-            agents.insert(peer.to_string(), (agent.clone(), meta.lc_servers.contains(&peer)));
-            return;
+            return Some((agent.clone(), meta.lc_servers.contains(&peer)));
         }
     }
+    None
+}
+
+/// The client and version an Identify agent names
+/// (`Lighthouse/v8.3.0-rc.0-4920af7/x86_64-linux` -> `Lighthouse/v8.3.0-rc.0-4920af7`),
+/// `-` when Identify never arrived.
+fn client_of(identify: &Option<(String, bool)>) -> String {
+    match identify {
+        Some((agent, _)) => agent.splitn(3, '/').take(2).collect::<Vec<_>>().join("/"),
+        None => "-".to_string(),
+    }
+}
+
+/// Error answers: (result code, the server's message) -> client -> count.
+type ErrorTally = HashMap<(u8, String), HashMap<String, usize>>;
+
+/// A numeric setting from the environment: unset or empty takes `default`,
+/// anything else must parse — never a silent fallback (see the header).
+fn env_number<T: std::str::FromStr>(name: &str, default: T) -> T {
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => default,
+        Ok(v) if v.trim().is_empty() => default,
+        Ok(v) => v
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("{name}={v:?} is not a number; unset it for the default")),
+        Err(e) => panic!("{name}: {e}"),
+    }
+}
+
+/// One probed peer.
+struct Probed {
+    peer: String,
+    addr: String,
+    verdict: Verdict,
+    secs: f64,
+    /// Identify agent and whether it advertises updates_by_range.
+    identify: Option<(String, bool)>,
 }
 
 #[tokio::main]
@@ -177,43 +313,33 @@ async fn main() {
         )
         .init();
 
-    let net = std::env::var("NET").unwrap_or_else(|_| "sepolia".into());
-    let config = match net.as_str() {
+    let config = match std::env::var("NET").unwrap_or_default().trim() {
+        "" | "sepolia" => ChainConfig::sepolia(),
         "mainnet" => ChainConfig::mainnet(),
         "gnosis" => ChainConfig::gnosis(),
-        _ => ChainConfig::sepolia(),
+        other => panic!("unknown NET {other:?} (want mainnet, sepolia or gnosis)"),
     };
-    let crawl_secs: u64 = std::env::var("CRAWL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(420);
-    let concurrency: usize = std::env::var("PROBES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(24);
-    let period: u64 = std::env::var("PERIOD")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1840);
+    let crawl_secs: u64 = env_number("CRAWL_SECS", 420);
+    let concurrency: usize = env_number("PROBES", 24);
+    let wall_period = config.wall_clock_period();
+    let period: u64 = env_number("PERIOD", wall_period);
+    let spp = config.slots_per_period();
     // A light client requires a 2/3 supermajority of the 512-member committee.
     let need = 512u64 * 2 / 3 + 1;
 
-    let wall_slot = |cfg: &ChainConfig| -> u64 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        now.saturating_sub(cfg.genesis_time) / cfg.seconds_per_slot.max(1)
-    };
-
     println!(
-        "== period census: net={} period={} need>={}/512 crawl={}s probes={} wall_slot={} ==",
+        "== period census: net={} period={} (slots {}..{}, {:?} wire shape; wall period {}) \
+         need>={}/512 crawl={}s probes={} wall_slot={} ==",
         config.name,
         period,
+        period * spp,
+        (period + 1) * spp - 1,
+        config.fork_schedule.lc_fork_at_slot(period * spp),
+        wall_period,
         need,
         crawl_secs,
         concurrency,
-        wall_slot(&config)
+        config.wall_clock_slot()
     );
 
     // Same pre-bootstrap Status the sync loop serves (checkpoint anchors).
@@ -245,7 +371,7 @@ async fn main() {
     .await
     .expect("discv5");
 
-    let (res_tx, mut res_rx) = mpsc::channel::<(String, String, Verdict, f64)>(1024);
+    let (res_tx, mut res_rx) = mpsc::channel::<Probed>(1024);
     let sem = Arc::new(Semaphore::new(concurrency));
     let mut seen: HashSet<String> = HashSet::new();
     let mut spawned = 0usize;
@@ -253,15 +379,13 @@ async fn main() {
     // updates_by_range request body: SSZ (start_period u64 LE, count u64 LE).
     let finality_wire: Vec<u8> = codec::encode_updates_by_range_request(period, 1);
 
-    let mut results: Vec<(String, String, Verdict, f64)> = Vec::new();
+    let mut results: Vec<Probed> = Vec::new();
 
     // The pinned peers first, one at a time, before any crawl probe is in
     // flight (see the header). Remembered in config order for the per-pin
     // report; an empty id marks a pin that did not parse. Discovery fills its
     // channel meanwhile, and the crawl's clock starts only after this.
     let mut pins: Vec<(String, String)> = Vec::new();
-    // Pin peer id -> (Identify agent, advertises updates_by_range).
-    let mut pin_agents: HashMap<String, (String, bool)> = HashMap::new();
     // Pin peer id -> the verdict of its first ask, when a second one followed.
     let mut pin_first_asks: HashMap<String, Verdict> = HashMap::new();
     for pin in &config.static_peers {
@@ -275,45 +399,39 @@ async fn main() {
             continue; // the same id pinned twice: its first answer stands
         }
         spawned += 1;
-        let mut ask = probe(
-            &config,
-            &client,
-            peer_id,
-            addr.clone(),
-            finality_wire.clone(),
-        )
-        .await;
+        let mut ask = probe(&config, &client, period, peer_id, addr.clone(), finality_wire.clone())
+            .await;
+        let mut agent = None;
         if ask.0 != Verdict::DialFail {
-            note_pin_agent(&client, peer_id, &mut pin_agents).await;
+            agent = identify(&client, peer_id).await;
         }
         if matches!(ask.0, Verdict::Serves(..)) {
-            println!("  pin {addr}: {}", bucket(&ask.0, need));
+            println!("  pin {addr}: {}", describe(&ask.0, need, spp));
         } else {
             tokio::time::sleep(PIN_RETRY_BACKOFF).await;
-            let retry = probe(
-                &config,
-                &client,
-                peer_id,
-                addr.clone(),
-                finality_wire.clone(),
-            )
-            .await;
+            let retry =
+                probe(&config, &client, period, peer_id, addr.clone(), finality_wire.clone())
+                    .await;
             let first = std::mem::replace(&mut ask, retry);
-            if ask.0 != Verdict::DialFail && !pin_agents.contains_key(&key) {
-                note_pin_agent(&client, peer_id, &mut pin_agents).await;
+            if ask.0 != Verdict::DialFail && agent.is_none() {
+                agent = identify(&client, peer_id).await;
             }
-            println!("  pin {addr}: {}, then {}", bucket(&first.0, need), bucket(&ask.0, need));
+            println!(
+                "  pin {addr}: {}, then {}",
+                describe(&first.0, need, spp),
+                describe(&ask.0, need, spp)
+            );
             pin_first_asks.insert(key.clone(), first.0);
         }
         let (verdict, secs) = ask;
-        results.push((key, addr.to_string(), verdict, secs));
+        results.push(Probed { peer: key, addr: addr.to_string(), verdict, secs, identify: agent });
     }
 
     let deadline = Instant::now() + Duration::from_secs(crawl_secs);
     let spawn_probe = |peer_id: libp2p::PeerId,
-                           addr: libp2p::Multiaddr,
-                           seen: &mut HashSet<String>,
-                           spawned: &mut usize| {
+                       addr: libp2p::Multiaddr,
+                       seen: &mut HashSet<String>,
+                       spawned: &mut usize| {
         let key = peer_id.to_string();
         if !seen.insert(key) {
             return;
@@ -325,9 +443,25 @@ async fn main() {
         let wire = finality_wire.clone();
         let config = config.clone();
         tokio::spawn(async move {
-            let _permit = sem.acquire_owned().await.expect("semaphore");
-            let (verdict, secs) = probe(&config, &client, peer_id, addr.clone(), wire).await;
-            let _ = res_tx.send((peer_id.to_string(), addr.to_string(), verdict, secs)).await;
+            let permit = sem.acquire_owned().await.expect("semaphore");
+            let (verdict, secs) =
+                probe(&config, &client, period, peer_id, addr.clone(), wire).await;
+            // The probe slot is free again; Identify only needs the swarm.
+            drop(permit);
+            let agent = if verdict == Verdict::DialFail {
+                None
+            } else {
+                identify(&client, peer_id).await
+            };
+            let _ = res_tx
+                .send(Probed {
+                    peer: peer_id.to_string(),
+                    addr: addr.to_string(),
+                    verdict,
+                    secs,
+                    identify: agent,
+                })
+                .await;
         });
     };
 
@@ -354,9 +488,8 @@ async fn main() {
     // Drain in-flight probes (up to 30 s more).
     let drain_until = Instant::now() + Duration::from_secs(30);
     while results.len() < spawned && Instant::now() < drain_until {
-        match tokio::time::timeout(Duration::from_secs(1), res_rx.recv()).await {
-            Ok(Some(r)) => results.push(r),
-            _ => {}
+        if let Ok(Some(r)) = tokio::time::timeout(Duration::from_secs(1), res_rx.recv()).await {
+            results.push(r);
         }
     }
     disc_task.abort();
@@ -364,17 +497,40 @@ async fn main() {
     // Identify-advertised LC servers (protocol list), independent of probe outcome.
     let identify_lc = client.lc_update_servers().await;
 
-    let ws = wall_slot(&config);
     let mut histogram: HashMap<&'static str, usize> = HashMap::new();
-    let mut servers: Vec<(String, String, u64, u64, f64)> = Vec::new();
-    for (peer, addr, verdict, secs) in &results {
-        if let Verdict::Serves(bits, slot) = verdict {
-            servers.push((peer.clone(), addr.clone(), *bits, *slot, *secs));
+    // Client -> (answers, bucket -> count).
+    let mut by_client: HashMap<String, (usize, HashMap<&'static str, usize>)> = HashMap::new();
+    let mut errors: ErrorTally = HashMap::new();
+    let mut servers: Vec<&Probed> = Vec::new();
+    let mut refused: Vec<&Probed> = Vec::new();
+    for r in &results {
+        let b = bucket(&r.verdict, need);
+        *histogram.entry(b).or_insert(0) += 1;
+        let client_name = client_of(&r.identify);
+        let entry = by_client.entry(client_name.clone()).or_default();
+        entry.0 += 1;
+        *entry.1.entry(b).or_insert(0) += 1;
+        match &r.verdict {
+            Verdict::Serves(..) => servers.push(r),
+            Verdict::WrongPeriod(_) | Verdict::WrongShape(_) => refused.push(r),
+            Verdict::Error(code, msg) => {
+                *errors
+                    .entry((*code, msg.clone()))
+                    .or_default()
+                    .entry(client_name)
+                    .or_insert(0) += 1;
+            }
+            _ => {}
         }
-        *histogram.entry(bucket(verdict, need)).or_insert(0) += 1;
     }
+    // "count  name: a, b" lines, largest first.
+    let tally = |counts: &HashMap<String, usize>| -> String {
+        let mut v: Vec<_> = counts.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        v.iter().map(|(k, n)| format!("{k} x{n}")).collect::<Vec<_>>().join(", ")
+    };
 
-    println!("\n== census: net={} ==", config.name);
+    println!("\n== census: net={} period={} ==", config.name, period);
     println!(
         "discovered fork-matched: {} (discv5 table {}), probed: {}",
         spawned,
@@ -382,13 +538,37 @@ async fn main() {
         results.len()
     );
     let mut buckets: Vec<_> = histogram.into_iter().collect();
-    buckets.sort_by(|a, b| b.1.cmp(&a.1));
+    buckets.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
     for (bucket, n) in buckets {
         println!("  {bucket:>22}: {n}");
     }
     println!("identify-advertised LC protocol: {}", identify_lc.len());
-    let _ = ws;
-    let supermajority = servers.iter().filter(|s| s.2 >= need).count();
+
+    println!("\nBY CLIENT (Identify agent; '-' = Identify never arrived):");
+    let mut clients: Vec<_> = by_client.into_iter().collect();
+    clients.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(&b.0)));
+    for (name, (n, verdicts)) in &clients {
+        let verdicts: HashMap<String, usize> =
+            verdicts.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        println!("  {n:>4}  {name}: {}", tally(&verdicts));
+    }
+
+    if !errors.is_empty() {
+        println!("\nERROR ANSWERS (result code, the server's message, count, clients):");
+        let mut errors: Vec<_> = errors
+            .into_iter()
+            .map(|(answer, clients)| (clients.values().sum::<usize>(), answer, clients))
+            .collect();
+        errors.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (n, (code, msg), clients) in &errors {
+            println!("  {n:>4}  {} {msg:?}  [{}]", error_name(*code), tally(clients));
+        }
+    }
+
+    let supermajority = servers
+        .iter()
+        .filter(|s| matches!(s.verdict, Verdict::Serves(bits, _) if bits >= need))
+        .count();
     println!(
         "\nANSWERS FOR PERIOD {} ({} total, {} claim >= 2/3, {} below the bar):",
         period,
@@ -396,13 +576,38 @@ async fn main() {
         supermajority,
         servers.len() - supermajority
     );
-    servers.sort_by(|a, b| b.2.cmp(&a.2));
-    for (peer, addr, bits, slot, secs) in &servers {
-        let offset = slot.saturating_sub(period * 8192);
-        let mark = if *bits >= need { ">=2/3" } else { "WEAK " };
+    let participants = |p: &Probed| match p.verdict {
+        Verdict::Serves(bits, _) => bits,
+        _ => 0,
+    };
+    servers.sort_by_key(|s| std::cmp::Reverse(participants(s)));
+    for s in &servers {
+        let Verdict::Serves(bits, slot) = s.verdict else { continue };
+        let offset = slot.saturating_sub(period * spp);
+        let mark = if bits >= need { ">=2/3" } else { "WEAK " };
         println!(
-            "  [{mark}] {bits:>3}/512  attested slot {slot} (offset {offset})  rtt={secs:.1}s  {addr}/p2p/{peer}"
+            "  [{mark}] {bits:>3}/512  attested slot {slot} (offset {offset})  rtt={:.1}s  \
+             client={}  {}/p2p/{}",
+            s.secs,
+            client_of(&s.identify),
+            s.addr,
+            s.peer
         );
+    }
+    if !refused.is_empty() {
+        println!(
+            "\nREFUSED ON SIGHT ({} — the catch-up drops these before any BLS work):",
+            refused.len()
+        );
+        for r in &refused {
+            println!(
+                "  {}  client={}  {}/p2p/{}",
+                describe(&r.verdict, need, spp),
+                client_of(&r.identify),
+                r.addr,
+                r.peer
+            );
+        }
     }
     println!(
         "\nPINNED PEERS ({} configured, in config order, each probed alone and asked again \
@@ -411,25 +616,23 @@ async fn main() {
         pins.len()
     );
     for (id, pin) in &pins {
+        let probed = results.iter().find(|r| r.peer == *id);
         let what = if id.is_empty() {
             "unparseable".to_string()
         } else {
-            match results.iter().find(|r| r.0 == *id).map(|r| &r.2) {
-                Some(v @ Verdict::Serves(bits, slot)) => {
-                    format!("{} {bits}/512 @slot {slot}", bucket(v, need))
-                }
-                Some(v) => bucket(v, need).to_string(),
+            match probed {
+                Some(r) => describe(&r.verdict, need, spp),
                 None => "no verdict".to_string(),
             }
         };
-        let (agent, advertises) = match pin_agents.get(id) {
+        let (agent, advertises) = match probed.and_then(|r| r.identify.as_ref()) {
             Some((agent, lc)) => (agent.as_str(), if *lc { "yes" } else { "no" }),
             None => ("-", "-"),
         };
         // A second ask is shown with the first answer it overrode.
         let first = pin_first_asks
             .get(id)
-            .map(|v| format!("  (first ask: {})", bucket(v, need)))
+            .map(|v| format!("  (first ask: {})", describe(v, need, spp)))
             .unwrap_or_default();
         println!("  {what:<44} lc-updates={advertises:<3} agent={agent}{first}\n      {pin}");
     }

@@ -79,6 +79,37 @@ class RpcEstimateResult private constructor(
 }
 
 /**
+ * `io.myotis.api.AccessListResult`'s pure-Kotlin mirror: the outcome of a
+ * verified `eth_createAccessList`. OK carries the list as the JSON-RPC result
+ * carries it ([accessListJson]: `[{"address","storageKeys":[…]}]`), the gas the
+ * run made with it used ([gasUsed]) and — when that run itself failed — geth's
+ * `error` NEXT TO them ([vmError]: "execution reverted", with [revertData] for
+ * the reason the router appends as it does for a code-3 revert, or the halt),
+ * never a code-3 error. UNAVAILABLE keeps the retryable -32000 path; REFUSED
+ * is permanent (-32602); INFEASIBLE is geth's -32000 in geth's words (the
+ * request cannot run within the caller's gas, fee cap or funds), as for
+ * [RpcCallResult].
+ */
+class RpcAccessListResult private constructor(
+    val kind: Kind,
+    val accessListJson: String?,
+    val gasUsed: Long?,
+    val vmError: String?,
+    val revertData: ByteArray?,
+    val detail: String?,
+) {
+    enum class Kind { OK, UNAVAILABLE, REFUSED, INFEASIBLE }
+
+    companion object {
+        fun ok(accessListJson: String, gasUsed: Long, vmError: String? = null, revertData: ByteArray? = null) =
+            RpcAccessListResult(Kind.OK, accessListJson, gasUsed, vmError, revertData, null)
+        fun unavailable(detail: String? = null) = RpcAccessListResult(Kind.UNAVAILABLE, null, null, null, null, detail)
+        fun refused(detail: String) = RpcAccessListResult(Kind.REFUSED, null, null, null, null, detail)
+        fun infeasible(detail: String) = RpcAccessListResult(Kind.INFEASIBLE, null, null, null, null, detail)
+    }
+}
+
+/**
  * `io.myotis.api.SendResult`'s pure-Kotlin mirror: the outcome of a detailed
  * `eth_sendRawTransaction` (#531). REJECTED is an answer, not a failure: judged
  * on fresh verified state, the transaction can never be mined as sent, nothing
@@ -282,6 +313,32 @@ interface RpcBackend {
         stateOverridesJson: String?,
     ): RpcCallResult = RpcCallResult.refused(
         "this engine does not apply the transaction object's gas, fee or list fields to eth_call",
+    )
+
+    /**
+     * Whether this backend builds access lists (`eth_createAccessList`,
+     * [createAccessList]). Consulted BEFORE dispatch, as [supportsContractCreation]:
+     * on a backend that does not, the router refuses (-32602) instead of waking
+     * an engine to be refused — and the refusal reads as permanent, which it is.
+     */
+    fun supportsAccessListCreation(): Boolean = false
+
+    /**
+     * `eth_createAccessList` for the full transaction object at [block], with a
+     * state override when [stateOverridesJson] is non-null (only asked of a
+     * backend whose [supportsStateOverrides] is true): the EIP-2930 access list
+     * the transaction touches, built as geth builds it, with the gas the run
+     * made with it used and that run's own revert or halt next to them
+     * ([RpcAccessListResult]). The request is checked as [callTx] checks it.
+     *
+     * Default: REFUSED — a backend that builds no access lists.
+     */
+    fun createAccessList(
+        tx: RpcTransactionArgs,
+        block: String,
+        stateOverridesJson: String?,
+    ): RpcAccessListResult = RpcAccessListResult.refused(
+        "this engine does not build access lists (eth_createAccessList)",
     )
 }
 

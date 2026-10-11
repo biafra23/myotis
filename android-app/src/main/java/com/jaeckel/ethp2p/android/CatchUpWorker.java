@@ -19,7 +19,7 @@ import androidx.work.WorkerParameters;
 public final class CatchUpWorker extends Worker {
 
     /** WorkManager stops workers at ~10 min; leave margin for the final pause+persist. */
-    private static final long BUDGET_MS = 8 * 60_000L;
+    static final long BUDGET_MS = 8 * 60_000L;
 
     public CatchUpWorker(@NonNull Context context, @NonNull WorkerParameters params) {
         super(context, params);
@@ -30,7 +30,7 @@ public final class CatchUpWorker extends Worker {
     public Result doWork() {
         if (!NodeService.isRunning()) return Result.success();
         try {
-            NodeService.dailyCatchUp(BUDGET_MS);
+            NodeService.dailyCatchUp(getApplicationContext(), BUDGET_MS);
         } catch (Throwable t) {
             // Maintenance must never crash the process; the next daily run retries.
             return Result.success();

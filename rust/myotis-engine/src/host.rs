@@ -222,6 +222,21 @@ pub fn set_tor_enabled(on: bool) -> bool {
     }
 }
 
+/// `nativeSetTorStorageDirs`: where the embedded Arti client keeps its state and
+/// directory cache (`myotis_net::el::tor::set_storage_dirs` has the rules).
+/// `false` — refused — when this build has no Tor support.
+pub fn set_tor_storage_dirs(state_dir: &str, cache_dir: &str) -> bool {
+    #[cfg(feature = "tor")]
+    {
+        myotis_net::el::tor::set_storage_dirs(state_dir, cache_dir)
+    }
+    #[cfg(not(feature = "tor"))]
+    {
+        let _ = (state_dir, cache_dir);
+        false
+    }
+}
+
 /// `nativeTorStatus`: a small bitmask for the host's Status view —
 /// bit0 compiled-in, bit1 enabled, bit2 bootstrapped (circuit ready). `0` means
 /// this build has no Tor support at all.
@@ -1902,7 +1917,7 @@ pub fn resolve_ens_json(handle: i64, name: &str) -> String {
 ///
 /// ```json
 /// {"method":"text","name":"a.eth","key":"url","root":"auto"}
-/// {"method":"addr"|"contenthash"|"pubkey","name":"a.eth","root":"finalized"}
+/// {"method":"addr"|"contenthash"|"ownership"|"pubkey","name":"a.eth","root":"finalized"}
 /// {"method":"multicoin","name":"a.eth","coinType":0}
 /// {"method":"abi","name":"a.eth","contentTypes":15}
 /// {"method":"dnsRecord","name":"a.eth","dnsName":"a.eth","resource":1}
@@ -2100,6 +2115,31 @@ pub fn eth_call_tx_json(handle: i64, tx_json: &str, block: &str, overrides_json:
     };
     match engine.rt.block_on(async { reader.eth_call_tx(anchor, tx, chain_id, overrides).await }) {
         Ok(answer) => eljson::call_json(&answer),
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
+/// `nativeCreateAccessListJson` (ABI ≥ 40): verified `eth_createAccessList`
+/// for the FULL JSON-RPC transaction object — the same `tx_json`, `block` and
+/// `overrides_json` as [`estimate_gas_tx_json`], the request checked as
+/// [`eth_call_tx_json`] checks it, every field applied or the request refused
+/// with the permanent `{"error","code":-32602}` envelope. Otherwise the access
+/// list JSON ([`eljson::access_list_json`]: the list the transaction touches,
+/// built as geth builds it, with the gas the run made with it used and that
+/// run's own revert or halt next to the list; `infeasible` for a request that
+/// cannot run within the caller's gas, fee cap or funds) or a retryable
+/// `{"error": "..."}`.
+pub fn create_access_list_json(handle: i64, tx_json: &str, block: &str, overrides_json: &str) -> String {
+    let (tx, selector, overrides) = match parse_tx_args(tx_json, block, overrides_json) {
+        Ok(parsed) => parsed,
+        Err(json) => return json,
+    };
+    let (engine, reader, chain_id, anchor) = match tx_target(handle, &tx, selector) {
+        Ok(target) => target,
+        Err(json) => return json,
+    };
+    match engine.rt.block_on(async { reader.create_access_list(anchor, tx, chain_id, overrides).await }) {
+        Ok(answer) => eljson::access_list_json(&answer),
         Err(e) => eljson::error_json(&e),
     }
 }
@@ -2829,6 +2869,7 @@ fn parse_ens_query(query_method: &str, params: &serde_json::Value) -> Result<Ens
     Ok(match query_method {
         "addr" => EnsQuery::Addr { name: name_field("name")? },
         "contenthash" => EnsQuery::Contenthash { name: name_field("name")? },
+        "ownership" => EnsQuery::Ownership { name: name_field("name")? },
         "pubkey" => EnsQuery::Pubkey { name: name_field("name")? },
         "text" => {
             let name = name_field("name")?;
@@ -3306,6 +3347,32 @@ mod tests {
         assert_eq!(earliest["code"], eljson::INVALID_PARAMS);
     }
 
+    /// The access-list entry point shares the request checks (ABI 40): the
+    /// same refusals, before the handle, in the same words.
+    #[test]
+    fn create_access_list_json_refuses_bad_requests_before_the_handle() {
+        let to = r#""to":"0x2222222222222222222222222222222222222222""#;
+        assert_invalid_params(
+            &create_access_list_json(i64::MIN, &format!(r#"{{{to},"type":"0x4"}}"#), "", ""),
+            "requires an authorizationList",
+        );
+        assert_invalid_params(&create_access_list_json(i64::MIN, "not json", "", ""), "invalid transaction object");
+        assert_invalid_params(&create_access_list_json(i64::MIN, &format!("{{{to}}}"), "", "[]"), "state override");
+        let hash: serde_json::Value = serde_json::from_str(&create_access_list_json(
+            i64::MIN,
+            &format!("{{{to}}}"),
+            &format!("0x{}", "ab".repeat(32)),
+            "",
+        ))
+        .unwrap();
+        assert_eq!(hash["code"], eljson::INVALID_PARAMS);
+        // A well-formed request reaches the handle, which does not exist here.
+        let none: serde_json::Value =
+            serde_json::from_str(&create_access_list_json(i64::MIN, &format!("{{{to}}}"), "latest", "")).unwrap();
+        assert!(none["error"].is_string(), "{none}");
+        assert!(none.get("code").is_none(), "retryable, not permanent: {none}");
+    }
+
     #[test]
     fn fee_history_outer_failure_preserves_stale_cache_policy() {
         use myotis_net::el::reader::FeeHistoryError;
@@ -3611,6 +3678,7 @@ mod tests {
         // decodes an address answer with pubkey semantics (a real regression).
         assert!(matches!(q("addr", "").unwrap(), EnsQuery::Addr { .. }));
         assert!(matches!(q("contenthash", "").unwrap(), EnsQuery::Contenthash { .. }));
+        assert!(matches!(q("ownership", "").unwrap(), EnsQuery::Ownership { .. }));
         assert!(matches!(q("pubkey", "").unwrap(), EnsQuery::Pubkey { .. }));
         assert!(matches!(q("text", r#","key":"url""#).unwrap(), EnsQuery::Text { .. }));
         assert!(matches!(q("multicoin", r#","coinType":60"#).unwrap(), EnsQuery::Multicoin { coin_type: 60, .. }));

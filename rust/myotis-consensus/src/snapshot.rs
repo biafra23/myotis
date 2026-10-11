@@ -27,6 +27,8 @@
 //! corrupt/foreign/old snapshot decodes to `None` and the caller falls back to
 //! the checkpoint. Panic-free by construction (checked reads, no indexing).
 
+#[allow(unused_imports)]
+use alloc::{boxed::Box, format, string::{String, ToString}, vec, vec::Vec};
 use crate::spec::GLOAS_EXECUTION_BRANCH_LEN;
 use crate::types::{
     BeaconBlockHeader, ExecutionPayloadHeader, HeaderExecution, LightClientHeader, SyncCommittee,

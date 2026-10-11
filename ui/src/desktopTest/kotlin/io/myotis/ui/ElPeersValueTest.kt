@@ -4,7 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 /**
- * The Status tab's "EL peers" value: the snap/2 share of the serving pool goes
+ * The Status tab's EL "Peers" value: the snap/2 share of the serving pool goes
  * in parentheses after the serving count, and only when there is one.
  */
 class ElPeersValueTest {

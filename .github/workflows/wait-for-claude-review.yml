@@ -37,12 +37,16 @@
 # this file failing to load (a YAML error, a rename without its callers): the
 # three callers then fail at startup, builds and tag release uploads included,
 # as with any broken workflow file. A PR that does that goes red on
-# android-apk and desktop-dmg, which run on every PR, before it can merge.
+# android-apk and desktop-dmg, which run on every PR into main, before it can
+# merge.
 #
-# NEVER GIVE THE CALLER'S JOB AN `if:`. When a job is skipped, GitHub skips
-# every job in the `needs:` chain after it, so a gate skipped on pushes would
-# silently skip the builds, the emulator smoke and, on a tag, the release
-# uploads. It runs on every event and decides here, in the script.
+# THE CALLER'S JOB MAY CARRY AN `if:` ONLY IF IT IS TRUE ON EVERY EVENT BUT
+# pull_request. When a job is skipped, GitHub skips every job in the `needs:`
+# chain after it, so a gate skipped on a push or a tag would silently skip the
+# builds, the emulator smoke and the release uploads. The callers' `if` tests
+# the PR's base branch and nothing else (a PR into a feature branch skips the
+# artifact builds — #582, CLAUDE.md "Multi-PR plans"); for every other event
+# the gate runs, and decides here, in the script.
 #
 # THE TRADE-OFF. A PR's first builds report one review later (the 40 reviews
 # before this file took 4 to 40 minutes, median 11), and the callers cancel a

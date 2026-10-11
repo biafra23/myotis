@@ -1,6 +1,6 @@
 package com.jaeckel.ethp2p.networking.eth.messages;
 
-import com.jaeckel.ethp2p.networking.BuildInfo;
+import com.jaeckel.ethp2p.core.BuildInfo;
 import org.apache.tuweni.bytes.Bytes;
 import org.apache.tuweni.rlp.RLP;
 
@@ -37,8 +37,8 @@ public final class HelloMessage {
     public static byte[] encode(Bytes nodePublicKey, int tcpPort) {
         return RLP.encodeList(writer -> {
             writer.writeInt(PROTOCOL_VERSION);
-            // Generated from the Gradle release version (:networking's
-            // generateNetworkingBuildInfo), the way the Rust engine derives its
+            // Generated from the Gradle release version (:core's
+            // generateCoreBuildInfo), the way the Rust engine derives its
             // Hello client id from CARGO_PKG_VERSION — the two agree by
             // construction, and the release sweep has no literal to forget here.
             // Dedicated myotis-serving nodes admit peers by matching "myotis".

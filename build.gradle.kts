@@ -56,7 +56,7 @@ plugins {
 
 allprojects {
     group = "com.jaeckel.ethp2p"
-    version = "0.1.14-SNAPSHOT"
+    version = "0.1.15-SNAPSHOT"
 }
 
 // The release version — project.version minus the -SNAPSHOT suffix — and the
@@ -498,14 +498,28 @@ val rustReleaseDir = if (rustTargetTriple != null) {
 extra["rustReleaseDir"] = rustReleaseDir
 extra["rustEngineLibName"] = hostLibNames.last() // lib?myotis_engine.{dylib,so,dll}
 
-// Opt-in Tor support in the host engine dylib (docs/privacy-and-tor.md): builds
-// myotis-engine with `--features tor`, pulling the Arti tree into the host lib so
-// the desktop/daemon can offer the runtime Settings toggle. OFF by default so CI
-// and the daemon build stay Arti-free. Presence-based, like a typical opt-in flag
-// (a bare `-PtorEngine` sets the property to "", so use hasProperty); build a
-// Tor-capable desktop app with `./gradlew :app-desktop:run -PtorEngine`.
-val torEngine = project.hasProperty("torEngine")
-        && (project.property("torEngine") as? String).let { it.isNullOrBlank() || it.toBoolean() }
+// Opt-in Tor support in the engine (docs/privacy-and-tor.md): builds
+// myotis-engine with `--features tor`, pulling the Arti tree into the host lib
+// (cargoBuildHost) and the Android jniLibs (cargoNdkAndroid) so the desktop and
+// Android apps can offer the runtime Settings toggle. OFF by default so CI, the
+// daemon and the released artifacts stay Arti-free. Presence-based, like a
+// typical opt-in flag (a bare `-PtorEngine` sets the property to "", so use
+// hasProperty); build a Tor-capable desktop app with
+// `./gradlew :app-desktop:run -PtorEngine`, an Android one with
+// `./gradlew :android-app:assembleDebug -PtorEngine`. Truthy (true/1/yes/on)
+// and false-y (false/0/no/off) spellings are both read; anything else fails the
+// build rather than quietly producing a Tor-less artifact.
+val torEngine = project.hasProperty("torEngine") &&
+    (project.property("torEngine") as? String).let {
+        when (it?.trim()?.lowercase()) {
+            null, "", "true", "1", "yes", "on" -> true
+            "false", "0", "no", "off" -> false
+            else -> throw GradleException("-PtorEngine=$it: expected true/false (or a bare -PtorEngine)")
+        }
+    }
+// :android-app bakes it into BuildConfig.TOR_ENGINE, so a Tor-less APK never
+// has to load the engine library just to learn it cannot route over Tor.
+extra["torEngine"] = torEngine
 
 tasks.register<Exec>("cargoBuildHost") {
     group = "rust"
@@ -650,13 +664,13 @@ val wasmTargetInstalled = "wasm32-unknown-unknown" in installedRustupTargets
 val clangAvailable = rustAvailable && probeTool("clang", "--version").isNotEmpty()
 val cargoCheckWasm = tasks.register<Exec>("cargoCheckWasm") {
     group = "rust"
-    description = "cargo check -p myotis-consensus -p myotis-core for wasm32-unknown-unknown — the sans-I/O canary (self-skips without cargo + the rustup wasm32 target + clang)"
+    description = "cargo check -p myotis-consensus -p myotis-core -p myotis-wire for wasm32-unknown-unknown — the sans-I/O canary (self-skips without cargo + the rustup wasm32 target + clang)"
     onlyIf { rustAvailable && wasmTargetInstalled && clangAvailable }
     workingDir = file("rust")
     rustToolchainPath?.let { environment("PATH", it) }
     commandLine(
         rustTool("cargo"), "check", "--target", "wasm32-unknown-unknown",
-        "-p", "myotis-consensus", "-p", "myotis-core",
+        "-p", "myotis-consensus", "-p", "myotis-core", "-p", "myotis-wire",
     )
     // No declared outputs, same rationale as cargoTest: cargo's own
     // incrementalism makes a no-change rerun cheap.
@@ -676,13 +690,13 @@ tasks.named("check") { dependsOn(cargoCheckWasm) }
 val noStdTargetInstalled = "x86_64-unknown-none" in installedRustupTargets
 val cargoBuildNoStd = tasks.register<Exec>("cargoBuildNoStd") {
     group = "rust"
-    description = "cargo build -p myotis-core --no-default-features for x86_64-unknown-none — the no_std canary (self-skips without cargo + the rustup target)"
+    description = "cargo build -p myotis-core -p myotis-wire --no-default-features for x86_64-unknown-none — the no_std canary (self-skips without cargo + the rustup target)"
     onlyIf { rustAvailable && noStdTargetInstalled }
     workingDir = file("rust")
     rustToolchainPath?.let { environment("PATH", it) }
     commandLine(
         rustTool("cargo"), "build", "--target", "x86_64-unknown-none",
-        "-p", "myotis-core", "--no-default-features",
+        "-p", "myotis-core", "-p", "myotis-wire", "--no-default-features",
     )
     // No declared outputs, same rationale as cargoTest.
 }
@@ -720,6 +734,10 @@ tasks.register<Exec>("cargoNdkAndroid") {
     workingDir = file("rust")
     rustToolchainPath?.let { environment("PATH", it) }
     androidNdkDir?.let { environment("ANDROID_NDK_HOME", it.absolutePath) }
+    // -PtorEngine links Arti into the Android engine too (build-android.sh reads
+    // the variable; docs/privacy-and-tor.md). Set either way, so a value
+    // inherited from the developer's shell cannot flip the build behind the flag.
+    environment("MYOTIS_TOR_ENGINE", if (torEngine) "1" else "0")
     // Windows can't exec a .sh directly (CreateProcess error=193); route it
     // through bash there (Git for Windows ships one alongside git itself).
     if (isWindowsHost) {
@@ -734,6 +752,8 @@ tasks.register<Exec>("cargoNdkAndroid") {
     inputs.property("cargoVersion", cargoVersion)
     inputs.property("cargoNdkVersion", cargoNdkVersion)
     inputs.property("ndkDir", androidNdkDir?.absolutePath ?: "")
+    // The Tor feature flips the libs' contents, so it must key UP-TO-DATE too.
+    inputs.property("torEngine", torEngine)
     outputs.files(
         file("android-app/src/main/jniLibs/arm64-v8a/libmyotis_bls.so"),
         file("android-app/src/main/jniLibs/x86_64/libmyotis_bls.so"),

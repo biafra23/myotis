@@ -75,6 +75,14 @@ public final class EnsResolver {
             FunctionSignature.of("ABI(bytes32,uint256)");
     private static final FunctionSignature DNS_RECORD =
             FunctionSignature.of("dnsRecord(bytes32,bytes,uint16)");
+    private static final FunctionSignature OWNER =
+            FunctionSignature.of("owner(bytes32)");
+    private static final FunctionSignature OWNER_OF =
+            FunctionSignature.of("ownerOf(uint256)");
+    private static final FunctionSignature NAME_EXPIRES =
+            FunctionSignature.of("nameExpires(uint256)");
+    private static final FunctionSignature GRACE_PERIOD =
+            FunctionSignature.of("GRACE_PERIOD()");
     private static final FunctionSignature INTERFACE_IMPLEMENTER =
             FunctionSignature.of("interfaceImplementer(bytes32,bytes4)");
     private static final FunctionSignature RESOLVER =
@@ -87,20 +95,35 @@ public final class EnsResolver {
     private final EvmExecutor executor;
     private final Address registry;
     private final Address universalResolver;
+    /** The {@code .eth} registrar and the NameWrapper for {@link #resolveOwnership};
+     *  null = not known for this chain (ownership then stops at the registry). */
+    private final Address baseRegistrar;
+    private final Address nameWrapper;
 
     /** Default constructor: mainnet Registry + Universal Resolver. */
     public EnsResolver(EvmExecutor executor) {
-        this(executor, EnsAddresses.MAINNET_REGISTRY, EnsAddresses.MAINNET_UNIVERSAL_RESOLVER);
+        this(executor, EnsAddresses.MAINNET_REGISTRY, EnsAddresses.MAINNET_UNIVERSAL_RESOLVER,
+                EnsAddresses.BASE_REGISTRAR, EnsAddresses.MAINNET_NAME_WRAPPER);
     }
 
     /**
      * Construct against non-default contract addresses. Useful for
-     * testnets and for unit tests that mock the resolver chain.
+     * testnets and for unit tests that mock the resolver chain. The {@code .eth}
+     * registrar is one address on every ENS chain; the NameWrapper is not known here
+     * (a wrapped name's holders then read as the wrapper contract itself).
      */
     public EnsResolver(EvmExecutor executor, Address registry, Address universalResolver) {
+        this(executor, registry, universalResolver, EnsAddresses.BASE_REGISTRAR, null);
+    }
+
+    /** With the chain's {@code .eth} registrar and NameWrapper, for {@link #resolveOwnership}. */
+    public EnsResolver(EvmExecutor executor, Address registry, Address universalResolver,
+                       Address baseRegistrar, Address nameWrapper) {
         this.executor = executor;
         this.registry = registry;
         this.universalResolver = universalResolver;
+        this.baseRegistrar = baseRegistrar;
+        this.nameWrapper = nameWrapper;
     }
 
     /**
@@ -128,15 +151,18 @@ public final class EnsResolver {
         // silently pick the mainnet contracts. Compare on the long.
         if (chainId == 1L) {
             return new EnsResolver(executor,
-                    EnsAddresses.MAINNET_REGISTRY, EnsAddresses.MAINNET_UNIVERSAL_RESOLVER);
+                    EnsAddresses.MAINNET_REGISTRY, EnsAddresses.MAINNET_UNIVERSAL_RESOLVER,
+                    EnsAddresses.BASE_REGISTRAR, EnsAddresses.MAINNET_NAME_WRAPPER);
         }
         if (chainId == 11155111L) {
             return new EnsResolver(executor,
-                    EnsAddresses.SEPOLIA_REGISTRY, EnsAddresses.SEPOLIA_UNIVERSAL_RESOLVER);
+                    EnsAddresses.SEPOLIA_REGISTRY, EnsAddresses.SEPOLIA_UNIVERSAL_RESOLVER,
+                    EnsAddresses.BASE_REGISTRAR, EnsAddresses.SEPOLIA_NAME_WRAPPER);
         }
         if (chainId == 17000L) {
             return new EnsResolver(executor,
-                    EnsAddresses.HOLESKY_REGISTRY, EnsAddresses.HOLESKY_UNIVERSAL_RESOLVER);
+                    EnsAddresses.HOLESKY_REGISTRY, EnsAddresses.HOLESKY_UNIVERSAL_RESOLVER,
+                    EnsAddresses.BASE_REGISTRAR, null);
         }
         throw new IllegalArgumentException("ENS not pinned for chain id " + chainId);
     }
@@ -302,6 +328,111 @@ public final class EnsResolver {
     }
 
     // ---- Universal-Resolver dispatch helper -------------------------------
+
+    /** Who holds a name; see {@link #resolveOwnership}. {@code expiresAt} / {@code gracePeriod}
+     *  are -1 where there is no registrar entry (a subname, an unregistered name). */
+    public record Ownership(Address registrant, Address manager, boolean wrapped,
+                            Address resolver, long expiresAt, long gracePeriod) {}
+
+    /**
+     * Who holds {@code name}: the registry's {@code owner(node)} and {@code resolver(node)},
+     * then for a {@code .eth} second-level name the BaseRegistrar's {@code ownerOf},
+     * {@code nameExpires} and {@code GRACE_PERIOD}, each unwrapped through the chain's
+     * NameWrapper where it is the holder. Empty = nothing on chain for the name (no
+     * registry owner or resolver, no registrar token, no expiry). A reverting
+     * {@code ownerOf} (an expired or never registered token) is "no registrant", never a
+     * failure; any other failure propagates. The name is validated and hashed exactly as
+     * the record reads validate and hash it ({@link DnsEncoder#encode}, {@link Namehash#of}),
+     * so this read and the record reads of one input answer about the same node. Rust
+     * twin: {@code resolve_ownership}.
+     */
+    public CompletableFuture<Optional<Ownership>> resolveOwnership(String name, BlockContext ctx) {
+        // The record reads' own validation (an empty label, more than one trailing dot)
+        // and their node: Namehash.of lowercases as it hashes and keeps a trailing dot as
+        // an empty label — so "x.eth." is the three-label node the records look at, not
+        // the 2LD's, and the registrar is asked only for a two-label .eth name.
+        try {
+            DnsEncoder.encode(name);
+        } catch (IllegalArgumentException e) {
+            return com.jaeckel.ethp2p.core.concurrent.Futures.failedFuture(e);
+        }
+        String[] labels = name.toLowerCase(java.util.Locale.ROOT).split("\\.", -1);
+        byte[] node = Namehash.of(name);
+        if (baseRegistrar == null) {
+            return com.jaeckel.ethp2p.core.concurrent.Futures.failedFuture(
+                    new IllegalStateException("the .eth registrar is not pinned for this chain"));
+        }
+        boolean secondLevelEth = labels.length == 2 && labels[1].equals("eth");
+        byte[] labelHash = secondLevelEth ? Namehash.labelhash(labels[0]) : null;
+
+        CompletableFuture<Optional<Address>> owner =
+                callAddress(registry, AbiEncoder.encodeCall(OWNER, AbiEncoder.bytes32(node)), ctx);
+        CompletableFuture<Optional<Address>> resolver =
+                callAddress(registry, AbiEncoder.encodeCall(RESOLVER, AbiEncoder.bytes32(node)), ctx);
+        CompletableFuture<Optional<Address>> tokenOwner = secondLevelEth
+                ? callAddress(baseRegistrar, AbiEncoder.encodeCall(OWNER_OF, AbiEncoder.bytes32(labelHash)), ctx)
+                : CompletableFuture.completedFuture(Optional.empty());
+        CompletableFuture<Optional<Long>> expires = secondLevelEth
+                ? callUint(baseRegistrar, AbiEncoder.encodeCall(NAME_EXPIRES, AbiEncoder.bytes32(labelHash)), ctx)
+                : CompletableFuture.completedFuture(Optional.empty());
+        CompletableFuture<Optional<Long>> grace = expires.thenCompose(e -> e.isPresent()
+                ? callUint(baseRegistrar, AbiEncoder.encodeCall(GRACE_PERIOD), ctx)
+                : CompletableFuture.completedFuture(Optional.empty()));
+        CompletableFuture<Optional<Address>> manager = owner.thenCompose(o -> {
+            boolean wrapped = o.isPresent() && nameWrapper != null && o.get().equals(nameWrapper);
+            return wrapped
+                    ? callAddress(nameWrapper, AbiEncoder.encodeCall(OWNER_OF, AbiEncoder.bytes32(node)), ctx)
+                    : CompletableFuture.completedFuture(o);
+        });
+
+        return CompletableFuture.allOf(owner, resolver, tokenOwner, expires, grace, manager)
+                .thenApply(v -> {
+                    Optional<Address> o = owner.join();
+                    boolean wrapped = o.isPresent() && nameWrapper != null && o.get().equals(nameWrapper);
+                    Optional<Address> t = tokenOwner.join();
+                    Optional<Address> registrant =
+                            (t.isPresent() && nameWrapper != null && t.get().equals(nameWrapper))
+                                    ? manager.join() : t;
+                    Optional<Long> exp = expires.join();
+                    if (o.isEmpty() && resolver.join().isEmpty() && registrant.isEmpty() && exp.isEmpty()) {
+                        return Optional.empty();
+                    }
+                    return Optional.of(new Ownership(
+                            registrant.orElse(null), manager.join().orElse(null), wrapped,
+                            resolver.join().orElse(null),
+                            exp.orElse(-1L), grace.join().orElse(-1L)));
+                });
+    }
+
+    /** One {@code address}-returning view: the zero address and a revert are both empty;
+     *  any other failure propagates (a well-formed wrong answer is worse than none). */
+    private CompletableFuture<Optional<Address>> callAddress(Address target, byte[] calldata, BlockContext ctx) {
+        return executor.callView(target, calldata, ctx).handle((res, err) -> {
+            if (err == null) return decodeAddressOrEmpty(res);
+            if (isRevert(err)) return Optional.<Address>empty();
+            throw new CompletionException(unwrap(err));
+        });
+    }
+
+    /** One {@code uint256}-returning view that must fit a {@code long}; zero and a revert are empty. */
+    private CompletableFuture<Optional<Long>> callUint(Address target, byte[] calldata, BlockContext ctx) {
+        return executor.callView(target, calldata, ctx).handle((res, err) -> {
+            if (err == null) return decodeUintOrEmpty(res);
+            if (isRevert(err)) return Optional.<Long>empty();
+            throw new CompletionException(unwrap(err));
+        });
+    }
+
+    private static Optional<Long> decodeUintOrEmpty(byte[] result) {
+        if (result == null || result.length < 32) return Optional.empty();
+        for (int i = 0; i < 24; i++) {
+            if (result[i] != 0) return Optional.empty();   // above Long.MAX_VALUE: unusable here
+        }
+        long v = 0;
+        for (int i = 24; i < 32; i++) v = (v << 8) | (result[i] & 0xff);
+        if (v < 0) return Optional.empty();
+        return v == 0 ? Optional.empty() : Optional.of(v);
+    }
 
     /**
      * Wrap {@code innerCall} in a UR {@code resolve(bytes,bytes)} call,

@@ -4,9 +4,13 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 // On Kotlin/Native, Dispatchers.IO is an extension property — this import is load-bearing.
 import kotlinx.coroutines.IO
+import platform.Foundation.NSDate
+import platform.Foundation.timeIntervalSince1970
 import kotlin.concurrent.Volatile
 
 internal actual val rpcIoDispatcher: CoroutineDispatcher = Dispatchers.IO
+
+internal actual fun rpcEpochMillis(): Long = (NSDate().timeIntervalSince1970 * 1000.0).toLong()
 
 /**
  * iOS log routing: there is no slf4j here, so hosts point [sink] at their log

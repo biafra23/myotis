@@ -120,6 +120,18 @@ impl Engine for Fake {
         }
         canned
     }
+    fn create_access_list(&self, tx: &str, b: &str, o: &str) -> String {
+        let canned = self.get("access_list", format!("{tx}|{b}|{o}"));
+        if self.tx_through_engine {
+            return myotis_engine::ffi::create_access_list_json(
+                i64::MIN,
+                tx.into(),
+                b.into(),
+                o.into(),
+            );
+        }
+        canned
+    }
     fn block_by_number(&self, t: &str, f: bool) -> String {
         self.get("block", format!("{t},{f}"))
     }
@@ -546,6 +558,59 @@ fn estimate_gas() {
         error(&r, "eth_estimateGas", json!([{"to": TOKEN}])).0,
         -32000
     );
+}
+
+/// `eth_createAccessList` (ABI 40): geth's result shape, the list and the gas
+/// as a quantity; a reverting run keeps its list, its error decoded next to
+/// it; the engine's refusals and non-answers map as the estimate's do.
+#[test]
+fn create_access_list() {
+    let ok = r#"{"status":"ok","accessList":[{"address":"0x2222222222222222222222222222222222222222","storageKeys":["0x0000000000000000000000000000000000000000000000000000000000000001"]}],"gasUsed":32437,"blockNumber":1000,"verified":false}"#;
+    let r = Router::new(Fake::new().reply("access_list", ok));
+    let v = result(&r, "eth_createAccessList", json!([{"from": ADDR, "to": TOKEN, "gas": "0x7a120"}, "latest"]));
+    assert_eq!(v["gasUsed"], "0x7eb5");
+    assert_eq!(v["accessList"][0]["address"], "0x2222222222222222222222222222222222222222");
+    assert_eq!(v["accessList"][0]["storageKeys"].as_array().map(Vec::len), Some(1));
+    assert!(v.get("error").is_none(), "{v}");
+    // The canonical object and the selector reach the engine, the gas applied.
+    assert!(calls(&r)[0].starts_with("access_list(") && calls(&r)[0].contains(r#""gas":"0x7a120""#) && calls(&r)[0].ends_with("|latest|)"), "{:?}", calls(&r));
+    // A state override is applied, as for the estimate.
+    let r = Router::new(Fake::new().reply("access_list", ok));
+    result(&r, "eth_createAccessList", json!([{"to": TOKEN}, "latest", {TOKEN: {"balance": "0x1"}}]));
+    assert!(calls(&r)[0].contains(r#"|latest|{"#), "{:?}", calls(&r));
+    // A fourth argument is one too many (geth's rule; block overrides are
+    // never applied).
+    let r = Router::new(Fake::new().reply("access_list", ok));
+    assert_eq!(error(&r, "eth_createAccessList", json!([{"to": TOKEN}, "latest", null, {}])).0, -32602);
+
+    // The run's own revert rides next to the list — never a code-3 error —
+    // with the reason decoded as the code-3 error decodes it.
+    let reverted = r#"{"status":"ok","accessList":[],"gasUsed":23105,"vmError":"execution reverted","revertDataHex":"0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000003626164000000000000000000000000000000000000000000000000000000000000","blockNumber":1000,"verified":false}"#;
+    let r = Router::new(Fake::new().reply("access_list", reverted));
+    let v = result(&r, "eth_createAccessList", json!([{"to": TOKEN}]));
+    assert_eq!(v["error"], "execution reverted: bad");
+    assert_eq!(v["gasUsed"], "0x5a41");
+    let halted = r#"{"status":"ok","accessList":[],"gasUsed":100000,"vmError":"out of gas","blockNumber":1000,"verified":false}"#;
+    let r = Router::new(Fake::new().reply("access_list", halted));
+    assert_eq!(result(&r, "eth_createAccessList", json!([{"to": TOKEN}]))["error"], "out of gas");
+
+    let r = Router::new(Fake::new().reply(
+        "access_list",
+        r#"{"status":"infeasible","reason":"err: intrinsic gas too low: have 21000, want 21064 (supplied gas 21000)"}"#,
+    ));
+    let (code, msg, _) = error(&r, "eth_createAccessList", json!([{"to": TOKEN, "gas": "0x5208"}]));
+    assert_eq!((code, msg.starts_with("err: intrinsic gas too low")), (-32000, true), "{msg}");
+    let r = Router::new(Fake::new().reply("access_list", r#"{"status":"unavailable","reason":"no peer"}"#));
+    assert_eq!(error(&r, "eth_createAccessList", json!([{"to": TOKEN}])).0, -32000);
+    let r = Router::new(Fake::new().reply("access_list", r#"{"error":"no slot number","code":-32602}"#));
+    assert_eq!(error(&r, "eth_createAccessList", json!([{"to": TOKEN}])).0, -32602);
+    // A contradictory object is refused by the engine's own request checks.
+    let mut f = Fake::new();
+    f.tx_through_engine = true;
+    let r = Router::new(f);
+    let (code, msg, _) = error(&r, "eth_createAccessList", json!([{"to": TOKEN, "type": "0x4"}]));
+    assert_eq!(code, -32602, "{msg}");
+    assert!(msg.contains("requires an authorizationList"), "{msg}");
 }
 
 #[test]

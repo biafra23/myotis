@@ -48,6 +48,9 @@ JSON.parse(myotis.statusJson(h));   // { beaconState, peerCount, snapPeers, snap
 // Verified reads run on bounded Myotis workers, with a 90 s operation budget
 // including queue wait. Cancellation drains native work before completion:
 const acct = JSON.parse(await myotis.requestAccountJson(h, '0xd8dA…6045'));
+// acct.blockTimestamp (ABI >= 41): blockNumber's own timestamp, unix seconds,
+// when the engine proved it (the read ran against the beacon-attested block),
+// else null. resolveEnsJson / ensRecordJson results carry it too.
 // ...or at the beacon-finalized block (ABI >= 32; a number near the head also works):
 const fin = JSON.parse(await myotis.requestAccountJson(h, '0xd8dA…6045', 'finalized'));
 const ens = JSON.parse(await myotis.resolveEnsJson(h, 'vitalik.eth'));
@@ -81,6 +84,7 @@ unknown handle gets the usual
 | `eth_call` | `ethCallJson(h, from, to, data, value, block)`, `ethCallTxJson(h, txJson, block, overrides)` |
 | `eth_call` with a state override | `ethCallOverridesJson(h, from, to, data, value, block, overridesJson)`, or `ethCallTxJson` |
 | `eth_estimateGas` | `estimateGasJson(h, from, to, data, value)`, `estimateGasTxJson(h, txJson, block, overrides)` |
+| `eth_createAccessList` | `createAccessListJson(h, txJson, block, overrides)`: serve `{accessList, gasUsed: '0x…'}` from `status: "ok"`, and its `vmError` as geth's `error` next to them when present |
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas` | `feeEstimateJson(h)` |
 | `eth_feeHistory` | `feeHistoryJson(h, blockCount, newestBlock, percentilesJson?)` |
 | `eth_getBlockByNumber` | `getBlockByNumberJson(h, blockTag, fullTransactions?)` |
@@ -396,7 +400,7 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 
 ## Request ownership and cancellation
 
-This implementation targets the current engine's **ABI 38** and existing JS
+This implementation targets the current engine's **ABI 43** and existing JS
 argument/result shapes. Every signature up to ABI 31 is unchanged since ABI 25,
 ABI 32's one change is additive (an optional trailing argument), ABI 33 changes
 no signature (the executor refusals above), ABI 34 adds `estimateGasTxJson`
@@ -424,8 +428,13 @@ caller that reads only `txHash` and `error` must handle it; ABI 37 gives
 log-index example above; a config without the key behaves as before); and
 ABI 38 adds the `snap2ServingPeers` status key — the part of
 `snapServingPeers` connected over snap/2 (EIP-8189), informational only (a
-key addition — older readers ignore it, and nothing should gate on it). It is
-not a drop-in artifact for a host pinned to ABI 22.
+key addition — older readers ignore it, and nothing should gate on it); ABI 39
+adds the engine's DNS-discovery switch (not wrapped here); ABI 40 adds
+`createAccessListJson`; ABI 41 adds `blockTimestamp` to the
+`requestAccountJson`, `resolveEnsJson` and `ensRecordJson` results (a key
+addition); and ABI 43 adds the engine's Tor storage-directory call (not
+wrapped here, like the rest of Tor). It is not a drop-in artifact for a host
+pinned to ABI 22.
 Engine failures, admission refusal, cancellation, and deadline expiry remain
 in-band JSON errors. Node-API infrastructure failures may throw/reject.
 
@@ -514,10 +523,14 @@ fee-history cancellation/expiry follows the existing stale-cache policy: only
 the same request signature within the cache age limit may be served, and an
 explicit invalid-request rejection never uses stale data.
 
-The global EVM cap deliberately refuses an additional execution immediately
-with `native execution busy`, including C/JNI/UniFFI callers and appender ENS
-lookups. It does not add semaphore waiters. Hosts should bound their own queue
-and retry busy verified reads within their own request deadline. Node's one
+The global EVM cap admits eight native executions at once. A call that finds
+every slot taken waits its turn — FIFO, for at most 5 s, and only while its
+own operation is live — and is refused with `native execution busy` when the
+wait runs out, or at once when 32 calls are already waiting; this applies to
+C/JNI/UniFFI callers and appender ENS lookups alike. The blocking pool itself
+never queues: a job reaches it only with a slot in hand. Hosts should still
+bound their own queue and retry busy verified reads within their own request
+deadline. Node's one
 executing request per handle is intentional: a slow ENS call delays queued
 calls on the same chain, while another chain can execute concurrently. The
 ABI 25+ migration must account for the four queued/executing requests per

@@ -20,6 +20,7 @@ on:
     paths:
       - "rust/roost/**"
       - "rust/myotis-net/**"
+      - "rust/myotis-wire/**"
       - "rust/myotis-consensus/**"
       - "rust/myotis-core/**"
       - "rust/myotis-evm/**"
@@ -28,6 +29,7 @@ on:
     paths:
       - "rust/roost/**"
       - "rust/myotis-net/**"
+      - "rust/myotis-wire/**"
       - "rust/myotis-consensus/**"
       - "rust/myotis-core/**"
       - "rust/myotis-evm/**"

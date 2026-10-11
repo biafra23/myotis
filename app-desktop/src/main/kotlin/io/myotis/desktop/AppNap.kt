@@ -1,10 +1,9 @@
 package io.myotis.desktop
 
-import com.sun.jna.NativeLibrary
 import com.sun.jna.Pointer
 
 /**
- * Keeps macOS App Nap off for the life of the process.
+ * Keeps macOS App Nap off while the user has not opted into it.
  *
  * The desktop app serves JSON-RPC on localhost to OTHER processes (Bee, a wallet), and
  * macOS naps a GUI app whose window is hidden or fully covered: every thread drops to
@@ -14,22 +13,29 @@ import com.sun.jna.Pointer
  * (docs/bee-rpc-service.md, 2026-09-16). The `NSAppSleepDisabled` Info.plist key is
  * ignored by current macOS (measured on 15.7: a bundle carrying it naps exactly like
  * one without), so this uses Apple's in-process mechanism instead — an NSProcessInfo
- * activity held for the process lifetime — through JNA's Objective-C runtime calls.
- * Being in-process it also covers `:app-desktop:run` dev runs, which are a plain
- * `java` process with no bundle of their own.
+ * activity held for as long as napping is not allowed — through JNA's Objective-C
+ * runtime calls. Being in-process it also covers `:app-desktop:run` dev runs, which are
+ * a plain `java` process with no bundle of their own.
+ *
+ * Settings → Power → "Sleep when not in focus" is the opt-in: [disable] begins the
+ * activity, [enable] ends it, and the desktop controller re-applies the persisted choice
+ * at start and on every flip ([io.myotis.ui.NodeController.applyAppNap]).
  */
 object AppNap {
+    /** The reason macOS shows for the activity (`pmset -g assertions` and friends). */
+    const val REASON = "Myotis serves JSON-RPC on localhost"
+
     /**
      * NSActivityUserInitiatedAllowingIdleSystemSleep: the user-initiated class that
      * suspends App Nap, minus the bit that would keep the Mac from sleeping.
      */
     private const val USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP = 0x00EFFFFFL
 
-    /** The activity token, retained and held forever so the activity never ends. */
+    /** The activity token, retained for as long as the activity is held. */
     @Volatile
     private var activity: Pointer? = null
 
-    val isMac: Boolean get() = System.getProperty("os.name", "").lowercase().contains("mac")
+    val isMac: Boolean get() = isMacOs
 
     /** True while the process holds the activity (macOS only). */
     val active: Boolean get() = activity != null
@@ -44,24 +50,17 @@ object AppNap {
         if (activity != null) return true
         if (!isMac) return false
         return try {
-            // NSProcessInfo and NSString live in Foundation: load it explicitly so the
-            // classes resolve regardless of what the launch path happened to link (the
-            // jpackage launcher is a Cocoa app; a bare test JVM is not).
-            NativeLibrary.getInstance("Foundation")
-            val objc = NativeLibrary.getInstance("objc")
-            val objcGetClass = objc.getFunction("objc_getClass")
-            val selRegisterName = objc.getFunction("sel_registerName")
-            val objcMsgSend = objc.getFunction("objc_msgSend")
-            fun cls(name: String): Pointer = objcGetClass.invokePointer(arrayOf(name))
-            fun sel(name: String): Pointer = selRegisterName.invokePointer(arrayOf(name))
-            val processInfo = objcMsgSend.invokePointer(arrayOf(cls("NSProcessInfo"), sel("processInfo")))
-            val nsReason = objcMsgSend.invokePointer(arrayOf(cls("NSString"), sel("stringWithUTF8String:"), reason))
-            val token: Pointer? = objcMsgSend.invokePointer(
-                arrayOf(processInfo, sel("beginActivityWithOptions:reason:"), USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP, nsReason),
-            )
-            if (token == null) return false
-            // The token comes back autoreleased; retain it so the activity outlives the pool.
-            objcMsgSend.invokePointer(arrayOf(token, sel("retain")))
+            val rt = ObjCRuntime.shared
+            val token: Pointer = rt.autoreleasePool {
+                rt.send(
+                    processInfo(rt), "beginActivityWithOptions:reason:", USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP,
+                    rt.nsString(reason),
+                )?.also {
+                    // The token comes back autoreleased; retain it, inside the pool, so the
+                    // activity outlives the pool.
+                    rt.send(it, "retain")
+                }
+            } ?: return false
             activity = token
             true
         } catch (t: Throwable) { // UnsatisfiedLinkError, a missing JNA, anything from the runtime
@@ -69,6 +68,37 @@ object AppNap {
             false
         }
     }
+
+    /**
+     * Ends the activity if one is held (idempotent) and returns whether the process
+     * now holds none — i.e. whether macOS may nap it. Never throws: on failure the
+     * activity stays held, which is the safe side, and the caller logs that.
+     */
+    @Synchronized
+    fun enable(): Boolean {
+        val token = activity ?: return true
+        return try {
+            val rt = ObjCRuntime.shared
+            rt.sendVoid(processInfo(rt), "endActivity:", token)
+            // The activity is over from here, whatever the release below does: clear the
+            // bookkeeping first, so `active` can never claim protection the OS no longer
+            // gives and a later disable() begins a fresh activity (a leaked retain on a
+            // failed release is the lesser evil).
+            activity = null
+            rt.sendVoid(token, "release") // balances the retain in disable()
+            true
+        } catch (t: Throwable) {
+            if (activity != null) {
+                log.warn("App Nap could not be re-enabled — the no-nap activity stays held: {}", t.toString())
+            } else {
+                log.warn("App Nap re-enabled, but the activity token could not be released: {}", t.toString())
+            }
+            false
+        }
+    }
+
+    private fun processInfo(rt: ObjCRuntime): Pointer =
+        rt.send(rt.cls("NSProcessInfo"), "processInfo") ?: error("NSProcessInfo.processInfo returned nil")
 
     // Lazy: the desktop logback config reads myotis.logdir when the first logger is created.
     private val log: org.slf4j.Logger by lazy { org.slf4j.LoggerFactory.getLogger(AppNap::class.java) }

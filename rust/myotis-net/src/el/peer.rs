@@ -844,43 +844,32 @@ impl ManagedPeer {
         use crate::el::verify::{ladder_precheck, LadderStep};
         match ladder_precheck(Some(state_root), proof_valid, block_number, anchor) {
             LadderStep::Done(verdict) => verdict,
-            LadderStep::NeedHeaderChain {
-                finalized_block,
-                peer_block,
-                beacon_block_hash,
-                finalized_slot,
-            } => {
-                self.header_chain_verdict(
-                    finalized_block,
-                    peer_block,
-                    &beacon_block_hash,
-                    state_root,
-                    finalized_slot,
-                )
-                .await
+            LadderStep::NeedHeaderChain { peer_block, anchor_block, anchor_hash, anchor_slot } => {
+                self.header_chain_verdict(peer_block, anchor_block, &anchor_hash, state_root, anchor_slot)
+                    .await
             }
         }
     }
 
-    /// Fetch `[finalized_block ..= peer_block]` and run the header-chain verdict
-    /// against the beacon-anchored block hash. `headerChainError` on transport
+    /// Fetch `[peer_block ..= anchor_block]` and run the header-chain verdict
+    /// against the attested anchor's block hash. `headerChainError` on transport
     /// failure, `headerChainInvalid` on a short/over-long/out-of-range response
     /// (matching the Java ladder). A single request, so it only spans a gap the
     /// peer serves in one response — a multi-thousand-block gap truncates and
     /// fails closed (batched fetch lands in a later A7b sub-PR).
     async fn header_chain_verdict(
         &self,
-        finalized_block: u64,
         peer_block: u64,
-        beacon_block_hash: &[u8; 32],
+        anchor_block: u64,
+        anchor_hash: &[u8; 32],
         peer_state_root: &[u8; 32],
-        finalized_slot: i64,
+        anchor_slot: i64,
     ) -> Verdict {
         use crate::el::verify::{header_chain_verdict, ChainHeader, MAX_HEADER_CHAIN_GAP};
-        // `ladder_precheck` only reaches here with peer_block > finalized_block,
+        // `ladder_precheck` only reaches here with peer_block <= anchor_block,
         // but guard the subtraction anyway — under panic="abort" an underflow
         // would kill the process, so fail the verdict closed instead.
-        let total = match peer_block.checked_sub(finalized_block) {
+        let total = match anchor_block.checked_sub(peer_block) {
             Some(diff) => diff + 1,
             None => {
                 return Verdict {
@@ -889,15 +878,14 @@ impl ManagedPeer {
                 }
             }
         };
-        // Java's verifyHeaderChainBatched re-guard: total in [2, MAX].
-        if total < 2 || total > MAX_HEADER_CHAIN_GAP {
+        if total > MAX_HEADER_CHAIN_GAP {
             return Verdict {
                 fail_reason: Some("headerChainInvalid"),
                 ..Verdict::default()
             };
         }
         let headers = match self
-            .get_block_headers_by_number(finalized_block, total, 0, false)
+            .get_block_headers_by_number(peer_block, total, 0, false)
             .await
         {
             Ok(h) => h,
@@ -918,7 +906,7 @@ impl ManagedPeer {
                 ..Verdict::default()
             };
         }
-        header_chain_verdict(&chain, beacon_block_hash, peer_state_root, finalized_slot)
+        header_chain_verdict(&chain, anchor_hash, peer_state_root, anchor_slot)
     }
 }
 

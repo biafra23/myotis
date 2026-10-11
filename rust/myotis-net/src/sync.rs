@@ -239,11 +239,11 @@ impl ChainConfig {
             // `./gradlew refreshCheckpoint` rewrites both from one fetch, and
             // `java_and_rust_checkpoints_agree` fails if they ever diverge.
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized mainnet block root (slot 15373376, 2026-10-06, period 1876)
+            // trusted checkpoint: recent finalized mainnet block root (slot 15394688, 2026-10-09, period 1879)
             checkpoint_root: hex32(
-                "d590bf3ac2b3010fddda48ecd5d72bc923a43af0751ab7e8fb20b8038cdbe503",
+                "3c65d22e715e662bad37f43374ce1b944ff9078617e6cd95eb8f88b2cd485b2b",
             ),
-            checkpoint_slot: 15_373_376,
+            checkpoint_slot: 15_394_688,
             // @checkpoint:mainnet:end
             static_peers: MAINNET_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: MAINNET_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
@@ -305,11 +305,11 @@ impl ChainConfig {
             // serving node's trustedNodeSync point, or that node cannot answer
             // the bootstrap for it (docs/dedicated-sepolia-node.md §5).
             // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized sepolia block root (slot 11297568, 2026-10-06, period 1379)
+            // trusted checkpoint: recent finalized sepolia block root (slot 11319040, 2026-10-09, period 1381)
             checkpoint_root: hex32(
-                "2008fe0e6bc957261f85619221fc91befe6802a647d30bf9e408df3ad89ada9c",
+                "90bb35755de105925bef3875c65645817625cf69f65a3eb5048750a6709c7c4e",
             ),
-            checkpoint_slot: 11_297_568,
+            checkpoint_slot: 11_319_040,
             // @checkpoint:sepolia:end
             static_peers: SEPOLIA_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: SEPOLIA_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
@@ -375,11 +375,11 @@ impl ChainConfig {
             // anything older than a few periods anyway — and use `-Pperiod=<n>`
             // only to pin a retained state for testing, never one below the floor.
             // @checkpoint:gnosis:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized gnosis block root (slot 30462400, 2026-10-06, period 3718)
+            // trusted checkpoint: recent finalized gnosis block root (slot 30513552, 2026-10-09, period 3724)
             checkpoint_root: hex32(
-                "7a49f27ccca8ff682c49ab7979654e5b33e2abbadbf43550cfb151ae196715eb",
+                "a68918716e413f19655d4c8e4c35b46351b6f566a3123aeb30ecb35c04f09f3c",
             ),
-            checkpoint_slot: 30_462_400,
+            checkpoint_slot: 30_513_552,
             // @checkpoint:gnosis:end
             static_peers: GNOSIS_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: GNOSIS_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
@@ -560,15 +560,21 @@ fn hex32(s: &str) -> [u8; 32] {
 /// `sepolia_config_matches_networkconfig_java` pins this side, and the Java
 /// `NetworkConfigGnosisTest` pins that one).
 ///
-/// First is roost, the dedicated light-client server. The per-entry comments below
-/// carry the reasoning and each entry's own stability caveat.
+/// Two pins since 2026-10-09: roost, the dedicated light-client server,
+/// first, and zbox's Nimbus second (re-pinned once #576 let either engine
+/// hold a Nimbus connection — see its entry at the end of the list), so a
+/// roost fault degrades to a working Gloas server. That is AT release check
+/// 3a's two-pin floor, not above it: since the Gloas fork no public
+/// census-verified server serves Gloas-era light-client data to put third
+/// (the dropped Lighthouse entries below serve none).
 const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // roost, the dedicated light-client server (rust/roost, docs/lc-server-design.md).
     // FIRST on purpose: it exists because a general-purpose beacon node is
     // structurally bad at serving wallets — one connection semaphore shared
     // between inbound and outbound, and a trimmer that drops light clients
-    // first. The census-verified public servers below it are the fallback,
-    // so a roost fault degrades to working peers rather than to nothing.
+    // first. Census-verified public servers belong below it as the fallback,
+    // so that a roost fault degrades to working peers rather than to nothing;
+    // since the Gloas fork there is none to put there.
     //
     // Its peer id comes from /data/roost/sepolia.key and is stable across
     // restarts by construction — roost has no mode in which it mints a
@@ -577,57 +583,84 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // The address is the netcup relay (see the ADDRESS note above); ENR
     // publication (design §7) is what removes the need to pin at all.
     "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
-    // Public sepolia LC servers, census-verified 2026-09-11: each answered
-    // light_client_bootstrap for the THEN-pinned root AND
-    // updates_by_range(1356,1) from a fresh peer id, all Lighthouse v8.2.2 (so
-    // the catch-up asks them for one period at a time — see
-    // agent_serves_one_period).
+    // Dropped 2026-10-07: 65.109.144.95 and 198.13.138.237, both Lighthouse
+    // v8.3.0-rc.0. Census-verified public servers from 2026-09-11 (each served
+    // the then-pinned bootstrap and updates_by_range(1356,1)), and every
+    // release run from 2026-09-12 to 2026-09-24 found every Sepolia pin
+    // serving. Then the Gloas fork: Lighthouse's light-client server produces
+    // nothing for a Gloas block (sigp/lighthouse#9587; its fix PRs #9732 and
+    // #9790 are unmerged, and no release carries them), so neither serves the
+    // bootstrap a v0.1.14 install starts from (ResourceUnavailable, "Sync
+    // committee branch for block root 0x2008fe0e… not found") nor any Gloas
+    // period's update — updates_by_range(1379) answers ServerError "Database
+    // error", because the update Lighthouse stored under 1379 is the last
+    // Fulu one (it keys updates by their signature slot's period) and does not
+    // decode as Gloas — and their finality update froze at the last pre-fork
+    // one. A pin is exempt from eviction and keeps a targeted discovery
+    // lookup, so a pin that serves nothing a post-fork wallet can use costs
+    // every Sepolia wallet a pool slot and a lookup for nothing.
     //
-    // Re-verified 2026-09-12 at period 1357, the anchor then embedded, by the
-    // release's live_pins_alive run on a clean CI host: 4 of 4 pins, roost
-    // included, served a bootstrap for that root and a period of updates.
-    // Re-verified 2026-09-13 against the then-shipped period-1358 anchor:
-    // live_pins_alive run 34776027257, 4 of 4 again.
-    // Re-verified 2026-09-16 against the then-shipped period-1361 anchor:
-    // live_pins_alive run 35065049320 on a GitHub-hosted runner, 4 of 4
-    // again; the bootnodes seeded discv5 (20 entries, SYNCED), and a cold start
-    // from the recorded period-1323 anchor reached SYNCED in 55 s.
-    // Re-verified 2026-09-21 against the then-shipped period-1365 anchor:
-    // live_pins_alive run 35616060242 on a GitHub-hosted runner, 4 of 4
-    // again; the bootnodes seeded discv5 (20 entries, SYNCED), and a cold start
-    // from the recorded period-1323 anchor (42 periods behind) reached SYNCED
-    // in 21 s.
-    // Re-verified 2026-09-24 against the anchor v0.1.12 shipped (period
-    // 1368): live_pins_alive run 35989152817 on a GitHub-hosted runner, 4 of 4
-    // again; the bootnodes seeded discv5 (23 entries, SYNCED), and a cold start
-    // from the recorded period-1323 anchor (45 periods behind) reached SYNCED
-    // in 55 s.
-    // 2026-10-06, Glamsterdam day, against the anchor v0.1.14 ships (period
-    // 1379, the first past the Gloas fork): live_pins_alive run 37500521280
-    // on a GitHub-hosted runner, 1 of 4 — only roost. Both Lighthouse pins
-    // (v8.3.0-rc.0) answered ResourceUnavailable for a Gloas-era bootstrap
-    // root and serve pre-fork-shaped updates for period 1379 (their
-    // light-client server stopped at the fork), and 138.201.192.180 closed
-    // the connection from the runner, the dev Mac and the census crawl:
-    // pruned. A period-1379 census of the DHT (91 fork-matched peers: 33
-    // undecodable, 24 dial failures, 21 closed, 12 without the protocol)
-    // found roost the ONLY server of a Gloas-era update (443/512); the
-    // public Lodestar node (65.21.93.60) serves Gloas over REST but closes
-    // inbound libp2p connections. Below the two-pin floor until a second
-    // Gloas-capable server exists — the owner's call.
-    // Re-run it after every checkpoint refresh — a census against
-    // a superseded root says nothing about the anchor a fresh install actually
-    // starts from, which is the #422 shape: every check green while no pinned
-    // server can answer for the root being shipped.
+    // Evidence: v0.1.14's live_pins_alive run 37500521280 (2026-10-06, 1 of 4
+    // pins served the period-1379 anchor: roost; 138.201.192.180 was pruned
+    // then). examples/period_census.rs at period 1379 on 2026-10-07, from zbox
+    // (170 fork-matched peers: 41 Lighthouse v8.3.0-rc.0 answering ServerError
+    // "Database error", 7 answering empty, 17 Prysm without the protocol, roost
+    // the only server, 443/512) and from a GitHub-hosted runner (run
+    // 37642715259, 218 peers: 63 Lighthouse v8.3.0-rc.0 answering ServerError
+    // "Database error" — both pins among them — 13 answering empty, 13 Prysm
+    // and 1 Grandine without the protocol, roost again the only server). Both
+    // censuses also met 100+ peers that closed or refused the connection
+    // before Identify. Many of those were most likely Nimbus or Lodestar
+    // nodes: both speak only mplex on TCP, and the census's host offered only
+    // yamux (#576), so no stream ever opened. "roost the only server" is what
+    // a yamux-only build could see, not who serves — the Lighthouse verdicts
+    // above stand on their own.
     //
-    // They replace
-    // two dead pins: the zbox Nimbus behind the relay (9104: TCP accepts, the
-    // libp2p handshake times out — the tunnel's far end is not answering) and
-    // 18.185.193.198 (TCP timeout for days). A dead pin is not free: with
-    // roost sepolia switched off as well, the bootstrap fan-out spent 82
-    // rounds on three unreachable pins while a wallet sat in SYNCING.
-    "/ip4/65.109.144.95/tcp/9000/p2p/16Uiu2HAkwKbnJCnfFsNGjGd5TURbXyNBdTWoVZjw8jqiCEf47gc2",
-    "/ip4/198.13.138.237/tcp/9000/p2p/16Uiu2HAmMb2mLN12B5vnJGv2LMuXxKsAiKQ8yTdy5gSJY1zKgE5f",
+    // Re-add one (or pin anything else) only once a census shows it serving
+    // Gloas periods AND live_pins_alive, which now asks for the current
+    // period too, passes it. On nodes that ran rc.0 across the fork, expect
+    // period 1379 to stay broken even after a Lighthouse release with Gloas
+    // support, since the entry stored under 1379 is the Fulu-format one.
+    //
+    // The public Lodestar node (65.21.93.60) closing inbound connections
+    // (2026-10-06) may be the muxer mismatch #576 fixed — Lodestar also
+    // speaks only mplex on TCP — and was not re-checked; whether Lodestar
+    // serves Gloas light-client data over libp2p is unchecked too.
+    //
+    // zbox's own Nimbus (v26.9.1, --light-client-data-serve, --netkey-file so
+    // the peer id survives restarts), behind the same relay on 9104.
+    // Re-pinned 2026-10-09 (#566 option 3). Dropped in September as "the
+    // libp2p handshake times out", which was ours: the Rust host offered only
+    // yamux where Nimbus speaks only mplex, and neither engine answered what
+    // its peer loop asks of a new peer (metadata/3, then beacon_blocks_by_root,
+    // data_column_sidecars_by_root and execution_payload_envelopes_by_root —
+    // a protocol the peer does not offer ends that loop). #576 fixed all of
+    // it, and a Rust-engine wallet synced Sepolia from this node alone
+    // (SYNCED, 2026-10-08/09). Two caveats, both Nimbus's: its unit runs
+    // --max-peers=25, so while it is full the connection is reset during the
+    // noise handshake and a pinned wallet gets in only as peers churn (a 12 s
+    // retry caught a slot within minutes); and its peer loop scores our empty
+    // by-root answers down, so one connection lasts minutes, not hours, with
+    // updates flowing between reconnects. SECOND on purpose: roost serves
+    // without either caveat.
+    //
+    // Release check for v0.1.15 (2026-10-09), anchor period 1381. The first
+    // refresh, slot 11318880, was served by neither pin: roost answered
+    // ResourceUnavailable after both retries and this Nimbus "LC bootstrap
+    // unavailable", while its Status showed it at head and finalized past
+    // that epoch (run 37955468942, second attempt; cause unconfirmed). The
+    // next finalized checkpoint, slot 11319040, is what ships. Its run
+    // 37959717559: first attempt 1 of 2 (roost's transport handshake timed
+    // out, as zbox pins did on and off that afternoon), second attempt 2 of 2,
+    // bootstrap and the period-1381 update verified from both, and the
+    // bootnodes seeded discv5 (23 entries). The cold start with every pin
+    // unreachable found this Nimbus through discovery at its relay address,
+    // bootstrapped from it in under two minutes and applied advancing finality
+    // from it and roost, but stayed CATCHING_UP for its 900 s budget: since
+    // Gloas, SYNCED also waits for the finalized execution header
+    // (`feed_exec_anchor`), which only the EL peer pool resolves, and
+    // live_cold_start runs the CL sync alone. The old-anchor walk did not run.
+    "/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
 ];
 
 /// Sepolia CL discv5 bootstrap ENRs (Java `NetworkConfig.SEPOLIA.clDiscv5Bootnodes` —
@@ -716,6 +749,14 @@ const GNOSIS_STATIC_PEERS: &[&str] = &[
     // SYNCED), a cold start with every pin unreachable reached SYNCED in
     // 30 s, and one from the recorded period-3596 anchor (122 periods
     // behind) in 90 s.
+    // Re-verified 2026-10-09 against the anchor v0.1.15 ships (period 3724):
+    // live_pins_alive run 37955473231 on a GitHub-hosted runner, 7 of 8 —
+    // every public pin served; roost (9108) timed out in the transport
+    // handshake (zbox's uplink, see MAINNET_STATIC_PEERS), then served the
+    // old-anchor walk's 116 periods 23 s later in the same job. The bootnodes
+    // seeded discv5 (24 entries), a cold start with every pin unreachable
+    // reached SYNCED in 35 s, and one from the recorded period-3596 anchor
+    // (128 periods behind) in 35 s.
     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
@@ -854,6 +895,19 @@ const MAINNET_STATIC_PEERS: &[&str] = &[
     // bootnodes seeded discv5 (32 entries, SYNCED), a cold start with every
     // pin unreachable reached SYNCED in 25 s, and one from the recorded
     // period-1825 anchor (51 periods behind) in 35 s.
+    // Re-verified 2026-10-09 against the anchor v0.1.15 ships (period 1879):
+    // live_pins_alive run 37955464357 on a GitHub-hosted runner, 2 of 5 —
+    // exactly the floor. 84.112.35.112 and 54.201.148.177 served;
+    // 57.129.130.18 closed the connection from the runner again (its second
+    // close in a row) and so did 91.189.182.90; roost (9109) timed out in the
+    // transport handshake. Every zbox pin failed the same way in the first
+    // run of each network that afternoon (Sepolia's two also from a
+    // residential address) while the relay accepted TCP and answered
+    // multistream, and later runs reached them: a slow path to zbox behind
+    // the relay, not a dead server and not this list.
+    // The bootnodes seeded discv5 (34 entries), a cold start with every pin
+    // unreachable reached SYNCED in 30 s, and one from the recorded
+    // period-1825 anchor (54 periods behind) in 15 s.
     "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
     "/ip4/84.112.35.112/tcp/9000/p2p/16Uiu2HAm6YkLaGLMH1Q9caGi4A2WctHPhENumfQMJXVCMVpc7GQY",
     "/ip4/91.189.182.90/tcp/9000/p2p/16Uiu2HAmJJUAs17wxW1i4HM5Fce1zYPCvvavxsYorWr4EQVx1Ui8",
@@ -947,8 +1001,8 @@ pub struct SyncStatus {
     pub period: u64,
     pub peer_count: usize,
     /// Distinct peers that successfully served a light-client response
-    /// (bootstrap / updates / finality) in the last 60 s — the UI's "CL peers
-    /// served N/min" health signal (Java `BeaconStatus.servedPeersLastMinute`).
+    /// (bootstrap / updates / finality) in the last 60 s — the UI's CL "served
+    /// N/min" health signal (Java `BeaconStatus.servedPeersLastMinute`).
     pub served_peers_last_min: usize,
     /// TOTAL entries in the discv5 routing table, including Disconnected
     /// ones (the UI's "Discv5 peers" row) — deliberately not the connected
@@ -1105,7 +1159,49 @@ impl SyncHandle {
 #[derive(Clone)]
 struct Peer {
     id: PeerId,
+    /// The TCP address — also the peer's identity in the shared cache
+    /// (`{addr}/p2p/{id}`), so it never changes shape when QUIC is learned.
     addr: Multiaddr,
+    /// `/ip4/<ip>/udp/<port>/quic-v1` from the peer's ENR `quic` field, when
+    /// it advertises one. Never a cache key; dialed after `addr` — see
+    /// [`Peer::dial_addrs`] for the order and why.
+    quic: Option<Multiaddr>,
+}
+
+impl Peer {
+    /// Every address to dial, in the order `ReqRespClient::request_raw_at`
+    /// tries them: TCP first, QUIC only when the TCP dial itself fails.
+    ///
+    /// The spec calls QUIC the primary transport; the fallback is for a peer
+    /// whose TCP port is closed or filtered while its QUIC one answers. (A
+    /// client that drops TCP altogether publishes no `tcp` field, and
+    /// `discovery::filter_candidate` admits no such record — a candidate needs
+    /// a TCP endpoint — so it would have to be pinned by its QUIC multiaddr,
+    /// which `parse_static_peer` accepts as the address.) It is not tried
+    /// first because, measured against Nimbus v26.9.1 (lsquic) on 2026-10-09,
+    /// a QUIC connection answered a handful of streams and then every further
+    /// stream open hung until Nimbus aborted the connection ~70 s later
+    /// ("connection timed out due to lack of progress"); the same node over
+    /// TCP served for as long as it was asked. Until that is understood, the
+    /// connection this node OPENS to a peer must be the TCP one.
+    ///
+    /// That is all the order governs. A request goes over whichever
+    /// connection to the peer already exists — libp2p's request-response
+    /// hands it to any established connection and offers no way to pick one
+    /// by transport — so once a QUIC connection is up, whether this node
+    /// dialed it after a failed TCP dial or a peer opened it inbound to the
+    /// wallet's ephemeral QUIC listener, requests ride it until it closes.
+    /// Closing a QUIC connection once TCP is dialable again, or not listening
+    /// on QUIC in the wallet, would close that gap; neither is done yet
+    /// (docs/TODO.md, #566 entry).
+    fn dial_addrs(&self) -> Vec<Multiaddr> {
+        let mut addrs = Vec::with_capacity(2);
+        addrs.push(self.addr.clone());
+        if let Some(quic) = &self.quic {
+            addrs.push(quic.clone());
+        }
+        addrs
+    }
 }
 
 struct PeerPool {
@@ -1430,8 +1526,29 @@ impl PeerPool {
         self.cooldown_until.get(id).is_none_or(|until| *until <= Instant::now())
     }
 
+    /// Add a peer from a source that knows nothing about QUIC — a config pin
+    /// or the shared cache replay. Leaves an already-pooled peer's QUIC
+    /// address as it is.
     fn add(&mut self, id: PeerId, addr: Multiaddr) {
+        self.add_inner(id, addr, None, false);
+    }
+
+    /// Add a peer from its ENR, QUIC address included. For an already-pooled
+    /// peer the QUIC address is REPLACED by what the record says now —
+    /// learned, moved to another port, or dropped (`None`) when the operator
+    /// turned QUIC off — including for a pinned static peer discovered again
+    /// with its record. Never a cache key, so no identity changes.
+    fn add_with_quic(&mut self, id: PeerId, addr: Multiaddr, quic: Option<Multiaddr>) {
+        self.add_inner(id, addr, quic, true);
+    }
+
+    fn add_inner(&mut self, id: PeerId, addr: Multiaddr, quic: Option<Multiaddr>, from_record: bool) {
         if self.known.contains(&id) {
+            if from_record {
+                if let Some(p) = self.peers.iter_mut().find(|p| p.id == id) {
+                    p.quic = quic;
+                }
+            }
             // Already pooled. Refresh a pinned static peer's address in place:
             // it is un-evictable, so removal-then-rediscovery (the path an
             // ordinary peer self-heals an IP change through) never runs for it.
@@ -1473,7 +1590,7 @@ impl PeerPool {
             return;
         }
         self.known.insert(id);
-        self.peers.push(Peer { id, addr });
+        self.peers.push(Peer { id, addr, quic });
     }
 
     /// Whether `id` is a pinned static (config) peer.
@@ -1701,7 +1818,9 @@ fn parse_static_peer(multiaddr: &str) -> Option<Peer> {
             base.push(proto);
         }
     }
-    Some(Peer { id: peer_id?, addr: base })
+    // A pin in `/udp/<port>/quic-v1` form is simply the address; nothing to
+    // learn beside it.
+    Some(Peer { id: peer_id?, addr: base, quic: None })
 }
 
 // -------------------------------------------------------------------------
@@ -2184,7 +2303,7 @@ fn persist_snapshot(
 
 fn drain_discovered(rx: &mut mpsc::Receiver<discovery::DiscoveredPeer>, pool: &mut PeerPool) {
     while let Ok(p) = rx.try_recv() {
-        pool.add(p.peer_id, p.addr);
+        pool.add_with_quic(p.peer_id, p.addr, p.quic);
     }
 }
 
@@ -2218,9 +2337,9 @@ async fn try_bootstrap(
     for peer in &peers {
         let client = client.clone();
         let wire = wire.clone();
-        let (id, addr) = (peer.id, peer.addr.clone());
+        let (id, addrs) = (peer.id, peer.dial_addrs());
         futures.push(async move {
-            let res = client.request_raw(id, addr, protocols::BOOTSTRAP, wire).await;
+            let res = client.request_raw_at(id, addrs, protocols::BOOTSTRAP, wire).await;
             (id, res)
         });
     }
@@ -2280,7 +2399,7 @@ async fn try_bootstrap(
         let header_root = bootstrap.header.beacon.hash_tree_root();
         if header_root != config.checkpoint_root {
             fail(pool, &mut round_failures, peer);
-            tracing::warn!(peer = %peer, got = %hex_str(&header_root),
+            tracing::warn!(peer = %peer, client = ?client.client_of(&peer), got = %hex_str(&header_root),
                 "bootstrap rejected: header root does not match checkpoint");
             continue;
         }
@@ -2299,7 +2418,8 @@ async fn try_bootstrap(
             if spec::compute_sync_committee_period_with(header_slot, spp)
                 != spec::compute_sync_committee_period_with(config.checkpoint_slot, spp)
             {
-                tracing::warn!(peer = %peer, header_slot, configured = config.checkpoint_slot,
+                tracing::warn!(peer = %peer, client = ?client.client_of(&peer), header_slot,
+                    configured = config.checkpoint_slot,
                     "bootstrap: verified header lies in a DIFFERENT sync-committee period than \
                      the configured checkpoint slot — the anchor period is wrong; persistence \
                      and snapshot resume will be off until the store passes the claimed period");
@@ -2313,8 +2433,8 @@ async fn try_bootstrap(
         // execution branch — each at the gindex of the header's fork.
         if let Err(reason) = processor.verify_bootstrap(&bootstrap) {
             fail(pool, &mut round_failures, peer);
-            tracing::warn!(peer = %peer, %reason, slot = bootstrap.header.beacon.slot,
-                "bootstrap rejected");
+            tracing::warn!(peer = %peer, client = ?client.client_of(&peer), %reason,
+                slot = bootstrap.header.beacon.slot, "bootstrap rejected");
             continue;
         }
 
@@ -2329,8 +2449,9 @@ async fn try_bootstrap(
                 processor.store.current_period(),
             );
         }
-        tracing::info!(peer = %peer, slot = bootstrap.header.beacon.slot,
-            period = processor.store.current_period(), "bootstrap verified and applied");
+        tracing::info!(peer = %peer, client = ?client.client_of(&peer),
+            slot = bootstrap.header.beacon.slot, period = processor.store.current_period(),
+            "bootstrap verified and applied");
         return true; // round has a winner — buffered strikes are discarded
     }
     for addr in &round_failures {
@@ -2900,7 +3021,7 @@ async fn catch_up(
                 let client = client.clone();
                 in_flight.push(Box::pin(async move {
                     let res = client
-                        .request_raw(peer.id, peer.addr.clone(), protocols::UPDATES_BY_RANGE, wire)
+                        .request_raw_at(peer.id, peer.dial_addrs(), protocols::UPDATES_BY_RANGE, wire)
                         .await;
                     (peer, single, from, count, res)
                 }));
@@ -3071,8 +3192,8 @@ async fn catch_up(
                 "updates_by_range returned no chunks");
             continue;
         }
-        tracing::info!(peer = %peer.id, sub_from, sub_count, served, raw_len = raw.len(),
-            "updates_by_range served");
+        tracing::info!(peer = %peer.id, client = ?client.client_of(&peer.id),
+            sub_from, sub_count, served, raw_len = raw.len(), "updates_by_range served");
         // A peer that answered DOES serve the protocol, so reverse any stale
         // nolc verdict — that part is factual. But it is NOT yet "proven":
         // mark_proven also grants the preferred tier and wipes fail_counts,
@@ -3123,7 +3244,7 @@ async fn catch_up(
                 if let Some(id) = pool.id_for_key(bad) {
                     pool.note_verify_reject(id);
                     clcache.mark_failure(bad);
-                    tracing::warn!(peer = %bad, period = before_period,
+                    tracing::warn!(peer = %bad, client = ?client.client_of(&id), period = before_period,
                         "catch-up: update failed verification — peer penalised, \
                          will try another next ask");
                 }
@@ -3178,7 +3299,8 @@ async fn catch_up(
         // promoted to the batch tier (it would lead selection and silence
         // the throughput hunt).
         if !single && from_this_response >= 2 && pool.mark_batch_server(peer.id) {
-            tracing::info!(peer = %peer.id, periods = from_this_response,
+            tracing::info!(peer = %peer.id, client = ?client.client_of(&peer.id),
+                periods = from_this_response,
                 "catch-up: batch-capable LC server confirmed — preferred from now on");
         }
         hunt.release_throughput(pool, wall_period, processor.store.current_period());
@@ -3420,7 +3542,7 @@ async fn poll_finality(
                 // half-close (the empty Vec is the reqresp layer's "write
                 // nothing" contract).
                 let res = client
-                    .request_raw(peer.id, peer.addr.clone(), protocols::FINALITY_UPDATE, Vec::new())
+                    .request_raw_at(peer.id, peer.dial_addrs(), protocols::FINALITY_UPDATE, Vec::new())
                     .await;
                 (peer, res)
             }
@@ -3480,7 +3602,7 @@ async fn poll_finality(
                     pool.mark_proven(peer.id);
                     pool.note_served(peer.id);
                     clcache.note_success(&format!("{}/p2p/{}", peer.addr, peer.id));
-                    tracing::info!(peer = %peer.id,
+                    tracing::info!(peer = %peer.id, client = ?client.client_of(&peer.id),
                         finalized_slot = processor.store.finalized_slot(),
                         optimistic_slot = processor.store.optimistic_slot(),
                         period = processor.store.current_period(),
@@ -3577,7 +3699,7 @@ async fn hunt_round(
             let client = client.clone();
             async move {
                 let res = client
-                    .request_raw(peer.id, peer.addr.clone(), protocols::FINALITY_UPDATE, Vec::new())
+                    .request_raw_at(peer.id, peer.dial_addrs(), protocols::FINALITY_UPDATE, Vec::new())
                     .await;
                 (peer, res)
             }
@@ -3657,7 +3779,7 @@ async fn hunt_round(
                     pool.note_served(peer.id);
                     clcache.note_success(&addr);
                     applied = true;
-                    tracing::info!(peer = %peer.id,
+                    tracing::info!(peer = %peer.id, client = ?client.client_of(&peer.id),
                         finalized_slot = processor.store.finalized_slot(),
                         "LC hunt: finality update applied from new server");
                 }
@@ -3716,9 +3838,9 @@ fn refresh_local_status(
 /// Feed the EL execution anchor from the verified beacon store — the CL→EL
 /// trust bridge (twin of the Java `BeaconSyncState.updateFinalizedExecution` /
 /// `updateOptimisticExecution`). The finalized payload is what `is_synced()`
-/// derives from and what the header-chain walk anchors against; the optimistic
-/// payload gives the freshest attested head. Both also seed the `stateRootMatch`
-/// window. Guarded on a non-zero block hash so a pre-merge / absent execution
+/// derives from and the freshness floor of a header-chain walk; the optimistic
+/// payload gives the freshest attested head, the block hash that walk anchors
+/// against. Both also seed the `stateRootMatch` window. Guarded on a non-zero block hash so a pre-merge / absent execution
 /// header never registers a zero state root as "synced".
 fn update_exec_anchor(store: &LightClientStore, anchor: &ExecAnchor) {
     // Label each execution payload with ITS block's slot (`beacon.slot`), read
@@ -3739,6 +3861,7 @@ fn update_exec_anchor(store: &LightClientStore, anchor: &ExecAnchor) {
                     e.state_root,
                     e.block_number,
                     e.block_hash,
+                    e.timestamp,
                 );
             }
             HeaderExecution::BlockHash(hash) if *hash != [0u8; 32] => {
@@ -4158,10 +4281,10 @@ mod tests {
         assert_eq!(c.fork_schedule.version_for_signature_slot(13_164_544), [5, 0, 0, 0]);
         assert_eq!(c.fork_schedule.version_for_signature_slot(13_164_545), [6, 0, 0, 0]);
         // @checkpoint:mainnet:test:begin — managed by `./gradlew refreshCheckpoint`
-        assert_eq!(c.checkpoint_slot, 15_373_376);
+        assert_eq!(c.checkpoint_slot, 15_394_688);
         assert_eq!(
             hex_str(&c.checkpoint_root),
-            "d590bf3ac2b3010fddda48ecd5d72bc923a43af0751ab7e8fb20b8038cdbe503"
+            "3c65d22e715e662bad37f43374ce1b944ff9078617e6cd95eb8f88b2cd485b2b"
         );
         // @checkpoint:mainnet:test:end
         assert_eq!(
@@ -4307,10 +4430,10 @@ mod tests {
         assert_eq!(sig(11_296_768), [0x90, 0x00, 0x00, 0x75]);
         assert_eq!(sig(11_296_769), [0x90, 0x00, 0x00, 0x76]);
         // @checkpoint:sepolia:test:begin — managed by `./gradlew refreshCheckpoint`
-        assert_eq!(c.checkpoint_slot, 11_297_568);
+        assert_eq!(c.checkpoint_slot, 11_319_040);
         assert_eq!(
             hex_str(&c.checkpoint_root),
-            "2008fe0e6bc957261f85619221fc91befe6802a647d30bf9e408df3ad89ada9c"
+            "90bb35755de105925bef3875c65645817625cf69f65a3eb5048750a6709c7c4e"
         );
         // @checkpoint:sepolia:test:end
         assert_eq!(
@@ -4379,11 +4502,10 @@ mod tests {
             c.static_peers,
             vec![
                 "/ip4/188.68.32.16/tcp/9105/p2p/16Uiu2HAkyDsNGDq5pbFCqdKTcJxp4Rd5caoy1Xe2KJVtyc94M8S5",
-                "/ip4/65.109.144.95/tcp/9000/p2p/16Uiu2HAkwKbnJCnfFsNGjGd5TURbXyNBdTWoVZjw8jqiCEf47gc2",
-                "/ip4/198.13.138.237/tcp/9000/p2p/16Uiu2HAmMb2mLN12B5vnJGv2LMuXxKsAiKQ8yTdy5gSJY1zKgE5f",
+                "/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
             ],
-            "roost first (the dedicated LC server), then the census-verified public \
-             servers — same list, order AND addresses as the Java \
+            "roost first (the dedicated LC server), zbox's Nimbus second (re-pinned with \
+             #576 in) — same list, order AND addresses as the Java \
              NetworkConfig.SEPOLIA.clPeerMultiaddrs"
         );
         // A malformed pin would otherwise reach run_sync and surface only as a
@@ -4425,10 +4547,10 @@ mod tests {
         assert_eq!(c.fork_schedule.version_for_signature_slot(27_435_008), [0x05, 0, 0, 0x64]);
         assert_eq!(c.fork_schedule.version_for_signature_slot(27_435_009), [0x06, 0, 0, 0x64]);
         // @checkpoint:gnosis:test:begin — managed by `./gradlew refreshCheckpoint`
-        assert_eq!(c.checkpoint_slot, 30_462_400);
+        assert_eq!(c.checkpoint_slot, 30_513_552);
         assert_eq!(
             hex_str(&c.checkpoint_root),
-            "7a49f27ccca8ff682c49ab7979654e5b33e2abbadbf43550cfb151ae196715eb"
+            "a68918716e413f19655d4c8e4c35b46351b6f566a3123aeb30ecb35c04f09f3c"
         );
         // @checkpoint:gnosis:test:end
         assert_eq!(
@@ -4668,6 +4790,57 @@ mod tests {
                 c.name
             );
         }
+    }
+
+    /// The pool's half of QUIC: a peer's QUIC address is learned from its
+    /// record in place, dialed AFTER the TCP one (see `Peer::dial_addrs` for
+    /// why not first), follows the record (moved or dropped when the operator
+    /// changes it) and is not touched by the sources that know nothing about
+    /// it (a pin, the cache replay). The TCP address stays the peer's
+    /// identity throughout — a name pin is never replaced.
+    #[test]
+    fn a_peer_dials_tcp_then_its_quic_address_and_follows_its_record() {
+        let mut pool = PeerPool::new();
+        let id = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+        let tcp: Multiaddr = "/ip4/10.0.0.1/tcp/9000".parse().unwrap();
+        let quic: Multiaddr = "/ip4/10.0.0.1/udp/9001/quic-v1".parse().unwrap();
+        let dial = |pool: &PeerPool, id: &PeerId| {
+            pool.peers.iter().find(|p| p.id == *id).expect("pooled").dial_addrs()
+        };
+
+        // From the cache or a pin: TCP only.
+        pool.add(id, tcp.clone());
+        assert_eq!(dial(&pool, &id), vec![tcp.clone()]);
+        // Its record arrives with a QUIC port: learned in place, dialed after TCP.
+        pool.add_with_quic(id, tcp.clone(), Some(quic.clone()));
+        assert_eq!(dial(&pool, &id), vec![tcp.clone(), quic.clone()]);
+        assert_eq!(pool.len(), 1, "learning an address never duplicates the peer");
+        // A cache replay knows nothing about QUIC and must not forget it…
+        pool.add(id, tcp.clone());
+        assert_eq!(dial(&pool, &id), vec![tcp.clone(), quic.clone()]);
+        // …the record moving the port replaces it…
+        let moved: Multiaddr = "/ip4/10.0.0.1/udp/9002/quic-v1".parse().unwrap();
+        pool.add_with_quic(id, tcp.clone(), Some(moved.clone()));
+        assert_eq!(dial(&pool, &id), vec![tcp.clone(), moved]);
+        // …and the record dropping the field (QUIC turned off) forgets it.
+        pool.add_with_quic(id, tcp.clone(), None);
+        assert_eq!(dial(&pool, &id), vec![tcp.clone()]);
+
+        // A name-pinned static peer keeps its name (#348) and still learns QUIC.
+        let pinned = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+        let name: Multiaddr = "/dns4/roost.example/tcp/9105".parse().unwrap();
+        pool.add_static(pinned, name.clone());
+        pool.add_with_quic(
+            pinned,
+            "/ip4/10.0.0.2/tcp/9105".parse().unwrap(),
+            Some("/ip4/10.0.0.2/udp/9105/quic-v1".parse().unwrap()),
+        );
+        let p = pool.peers.iter().find(|p| p.id == pinned).unwrap();
+        assert_eq!(p.addr, name, "a name pin is never replaced by a numeric snapshot");
+        assert_eq!(
+            p.dial_addrs().iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            vec![name.to_string(), "/ip4/10.0.0.2/udp/9105/quic-v1".to_string()]
+        );
     }
 
     #[test]

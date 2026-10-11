@@ -9,6 +9,8 @@
 //! fork of the object's slot — the req/resp context bytes. `decode_for(LcFork,
 //! ..)` dispatches on it; the pre-Gloas `decode` paths are unchanged.
 
+#[allow(unused_imports)]
+use alloc::{boxed::Box, format, string::{String, ToString}, vec, vec::Vec};
 use crate::fork::LcFork;
 use crate::spec;
 use crate::ssz::{self, Root};
@@ -16,11 +18,12 @@ use crate::ssz::{self, Root};
 #[derive(Debug, PartialEq, Eq)]
 pub struct SszError(pub String);
 
-impl std::fmt::Display for SszError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for SszError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
+#[cfg(feature = "std")]
 impl std::error::Error for SszError {}
 
 fn err<T>(msg: impl Into<String>) -> Result<T, SszError> {
@@ -138,8 +141,8 @@ impl SyncCommittee {
     }
 }
 
-impl std::fmt::Debug for SyncCommittee {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for SyncCommittee {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "SyncCommittee(512 pubkeys)")
     }
 }

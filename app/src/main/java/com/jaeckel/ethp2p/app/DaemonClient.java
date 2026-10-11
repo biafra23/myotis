@@ -132,6 +132,11 @@ public class DaemonClient {
                     "Usage: resolve-ens-contenthash <name.eth>");
                 yield "{\"cmd\":\"resolve-ens-contenthash\",\"name\":\"" + esc(args[1]) + "\"}";
             }
+            case "resolve-ens-ownership" -> {
+                if (args.length < 2) throw new IllegalArgumentException(
+                    "Usage: resolve-ens-ownership <name.eth>");
+                yield "{\"cmd\":\"resolve-ens-ownership\",\"name\":\"" + esc(args[1]) + "\"}";
+            }
             case "resolve-ens-addr-coin" -> {
                 if (args.length < 3) throw new IllegalArgumentException(
                     "Usage: resolve-ens-addr-coin <name.eth> <coinType>");

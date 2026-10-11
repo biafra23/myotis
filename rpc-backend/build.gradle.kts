@@ -46,6 +46,8 @@ dependencies {
 
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)
+    // Header fixtures for ProvenHeadTest are built as RLP.
+    testImplementation(libs.tuweni.rlp)
     testRuntimeOnly(libs.logback.classic)
 }
 

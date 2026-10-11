@@ -6,6 +6,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -19,18 +20,28 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
@@ -55,34 +66,39 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.progressBarRangeInfo
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.async
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.time.Clock
 import kotlin.time.Instant
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
-
-// Verified head older than this reads as "warming up" (amber) — wallet calls would -32000 until a
-// fresh servable head exists. Matches the old Android ReadinessStrip threshold.
-private const val READY_HEAD_WARM_MS = 45_000L
 
 /** Default [NetworkStatus] for hosts with no connectivity concept (Desktop): always online. */
 private object AlwaysOnline : NetworkStatus {
@@ -97,10 +113,13 @@ private object NoQueryHistory : QueryHistory {
 }
 
 /**
- * The shared Myotis screen — identical on Android and Desktop. A tab host over the per-network
- * [NodeController]/[Settings]/[LogSource] seam (Status / Query / Logs / Settings). [netStatus]
- * drives the offline banner and [onOpenNetworkSettings] opens the platform's network settings;
- * both default to the always-online / no-op behavior desktop wants.
+ * The shared Myotis screen — identical on Android, Desktop and iOS. A tab host over the
+ * per-network [NodeController]/[Settings]/[LogSource] seam: Status / Query / Settings, plus
+ * Logs and Index under [Settings.expertMode]. A phone-width window gets a bottom navigation
+ * bar, a wider one the tab row under the header. [netStatus] feeds the readiness ladder
+ * (the strip's and the status card's offline rung, and the Start gate) and
+ * [onOpenNetworkSettings] opens the platform's network settings; both default to the
+ * always-online / no-op behavior desktop wants.
  */
 @Composable
 fun NodeScreen(
@@ -110,6 +129,10 @@ fun NodeScreen(
     netStatus: NetworkStatus = AlwaysOnline,
     onOpenNetworkSettings: () -> Unit = {},
     history: QueryHistory = NoQueryHistory,
+    // Bumped by the host to bring the Status tab forward: the desktop does when the user
+    // clicks a refused-web-page notification, so the banner with Allow is on screen.
+    // 0 (the default) never switches.
+    statusRequests: Int = 0,
 ) {
     // remember(controller): snapshots() returns a fresh Flow each call, so collecting it
     // directly would re-subscribe on every recomposition. Retain it across recompositions.
@@ -118,25 +141,50 @@ fun NodeScreen(
     val onlineFlow = remember(netStatus) { netStatus.online() }
     val online by onlineFlow.collectAsState(initial = true)
     // The Index tab is the log-index feature's home — where contracts are added,
-    // snapshots imported, and progress read — so it shows whenever the engine choice
-    // can serve the feature (anything but a forced Java engine; the log index is
-    // Rust-engine-only), OR while any live engine reports an enabled index: an
-    // imported/dropped-in snapshot activates engine-side without any Settings flag
-    // ever having been touched, and hiding a running index would leave its progress
-    // unreachable. Settings are plain reads, so the toggles that change them bump
-    // logIndexRev; the engine side re-derives from `snapshots`.
+    // snapshots imported, and progress read — so, within Expert mode, it shows
+    // whenever the engine choice can serve the feature (anything but a forced Java
+    // engine; the log index is Rust-engine-only), OR while any live engine reports an
+    // enabled index: an imported/dropped-in snapshot activates engine-side without any
+    // Settings flag ever having been touched, and hiding a running index from an
+    // expert would leave its controls unreachable. Normal mode hides the tab in
+    // every case (the Expert switch's note names it); there the index shows as the
+    // readiness strip's catch-up line and the Status tab's Log index tile, and the
+    // PoC flavours that ship a seeded index first-start in Expert mode. Settings are
+    // plain reads, so the toggles that change them bump logIndexRev; the engine side
+    // re-derives from `snapshots`.
     var logIndexRev by remember { mutableStateOf(0) }
     val showIndexTab = remember(logIndexRev, snapshots) {
         !settings.preferJavaEngine() ||
             snapshots.values.any { it.logIndexJson?.contains("\"enabled\":true") == true }
     }
-    val tabs = remember(showIndexTab) {
-        if (showIndexTab) listOf("Status", "Query", "Logs", "Index", "Settings")
-        else listOf("Status", "Query", "Logs", "Settings")
+    // Expert mode is a plain settings read like the engine preference above: the
+    // Settings switch bumps expertRev so the tab set re-derives immediately.
+    var expertRev by remember { mutableStateOf(0) }
+    val expert = remember(expertRev) { settings.expertMode() }
+    // Web page access (#502): one live holder of the persisted policy, shared by the
+    // Status tab's refusal banner and the Settings section so an Allow on either is
+    // visible on both at once (the `when` below disposes a tab's own remembers).
+    val webAccess = remember(controller, settings) { WebAccessFields(settings, controller) }
+    // A host may change the policy outside this screen (Android's notification Allow):
+    // pick that up on the snapshot cadence so the screen never writes a stale list back.
+    LaunchedEffect(snapshots) { webAccess.refresh() }
+    // Normal mode is the three screens a wallet user needs; Expert mode adds the Logs
+    // tab and — under the rule above — the Index tab.
+    val tabs = remember(expert, showIndexTab) {
+        buildList {
+            add("Status")
+            add("Query")
+            if (expert) {
+                add("Logs")
+                if (showIndexTab) add("Index")
+            }
+            add("Settings")
+        }
     }
     // Selection is the tab's LABEL, not its position — positions shift when Index
     // appears/disappears. A selection whose tab just vanished falls back to Status.
     var tabLabel by remember { mutableStateOf("Status") }
+    LaunchedEffect(statusRequests) { if (statusRequests > 0) tabLabel = "Status" }
     val tab = tabs.indexOf(tabLabel).coerceAtLeast(0)
     // The fallback also RESETS the stale label: without this, a selection stuck on a
     // vanished tab would silently jump back to it if a future change ever flipped the
@@ -179,7 +227,37 @@ fun NodeScreen(
     val colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()
     MaterialTheme(colorScheme = colorScheme) {
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-            Column(Modifier.fillMaxSize().padding(16.dp)) {
+            // Stale-anchor consent. The engines park fail-closed (beaconState
+            // STALE_ANCHOR) when a network's sync anchor is older than the
+            // weak-subjectivity bound; this dialog is the "ask the user" half of
+            // that contract. Dismissals are remembered only WHILE the network
+            // stays parked, so a later, separate park asks again.
+            var staleDismissed by remember { mutableStateOf(setOf<String>()) }
+            staleDismissed = staleDismissed.filterTo(mutableSetOf()) {
+                snapshots[it]?.beaconState == "STALE_ANCHOR"
+            }
+            val staleNet = snapshots.entries.firstOrNull {
+                it.value.beaconState == "STALE_ANCHOR" && it.key !in staleDismissed
+            }?.key
+            val staleSnap = staleNet?.let { snapshots[it] }
+            if (staleNet != null && staleSnap != null) {
+                StaleAnchorDialog(
+                    network = staleNet,
+                    s = staleSnap,
+                    onAccept = {
+                        controller.acceptStaleAnchor(staleNet)
+                        staleDismissed = staleDismissed + staleNet
+                    },
+                    onDismiss = { staleDismissed = staleDismissed + staleNet },
+                )
+            }
+
+            // The one ladder the strip and the Status tab's card both paint.
+            val readiness = readinessOf(current, settings.deepPoolThreshold(), logIndexCatchUps[network], online)
+
+            // The header and the tab content are the same in both layouts below; only
+            // where the tab switcher sits differs.
+            val header: @Composable () -> Unit = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     // Title + version stacked: the version is the first thing to ask for in
                     // a bug report, so it's on screen everywhere rather than buried in an
@@ -204,59 +282,74 @@ fun NodeScreen(
                 }
                 Spacer(Modifier.height(8.dp))
                 // Readiness traffic-light strip: the wallet's "safe to transact" signal for the
-                // selected chain. Uses the configurable deep-pool threshold from Settings.
-                ReadinessStrip(
-                    current,
-                    settings.deepPoolThreshold(),
-                    logIndexCatchUps[network],
-                )
-
-                // Stale-anchor consent. The engines park fail-closed (beaconState
-                // STALE_ANCHOR) when a network's sync anchor is older than the
-                // weak-subjectivity bound; this dialog is the "ask the user" half of
-                // that contract. Dismissals are remembered only WHILE the network
-                // stays parked, so a later, separate park asks again.
-                var staleDismissed by remember { mutableStateOf(setOf<String>()) }
-                staleDismissed = staleDismissed.filterTo(mutableSetOf()) {
-                    snapshots[it]?.beaconState == "STALE_ANCHOR"
-                }
-                val staleNet = snapshots.entries.firstOrNull {
-                    it.value.beaconState == "STALE_ANCHOR" && it.key !in staleDismissed
-                }?.key
-                val staleSnap = staleNet?.let { snapshots[it] }
-                if (staleNet != null && staleSnap != null) {
-                    StaleAnchorDialog(
-                        network = staleNet,
-                        s = staleSnap,
-                        onAccept = {
-                            controller.acceptStaleAnchor(staleNet)
-                            staleDismissed = staleDismissed + staleNet
-                        },
-                        onDismiss = { staleDismissed = staleDismissed + staleNet },
-                    )
-                }
+                // selected chain.
+                ReadinessStrip(readiness, logIndexCatchUps[network])
                 Spacer(Modifier.height(12.dp))
-
-                TabRow(selectedTabIndex = tab) {
-                    tabs.forEachIndexed { i, label ->
-                        Tab(selected = tab == i, onClick = { tabLabel = label }, text = { Text(label) })
-                    }
-                }
-                Spacer(Modifier.height(16.dp))
-
+            }
+            val content: @Composable () -> Unit = {
                 when (tabs[tab]) {
-                    "Status" -> StatusTab(controller, settings, current, network, online, onOpenNetworkSettings)
-                    "Query" -> QueryTab(controller, settings, current, network, history)
+                    "Status" -> StatusTab(
+                        controller, settings, current, network, online, onOpenNetworkSettings,
+                        expert = expert, readiness = readiness, catchUp = logIndexCatchUps[network],
+                        // The card's "Review" re-asks a dismissed stale-anchor question.
+                        onReviewStaleAnchor = { staleDismissed = staleDismissed - network },
+                        webAccess = webAccess, snapshots = snapshots,
+                    )
+                    "Query" -> QueryTab(controller, settings, current, network, history, expert)
                     "Logs" -> LogsTab(logs, logFilter, onFilterChange = { logFilter = it })
                     "Index" -> IndexTab(controller, settings, current, network,
                         onLogIndexChanged = { logIndexRev++ })
-                    "Settings" -> SettingsTab(controller, settings, snapshots,
-                        onEnabledChanged = { enabledRev++ }, onLogIndexChanged = { logIndexRev++ })
+                    "Settings" -> SettingsTab(controller, settings, snapshots, webAccess, expert = expert,
+                        onEnabledChanged = { enabledRev++ }, onLogIndexChanged = { logIndexRev++ },
+                        onExpertChanged = { expertRev++ })
+                }
+            }
+
+            // A phone-width window gets a bottom navigation bar — within the thumb's reach,
+            // icons and labels; a wider one keeps the tab row under the header. Both are
+            // selectable nodes carrying the tab's label, so tests and screen readers see the
+            // same tabs either way.
+            BoxWithConstraints(Modifier.fillMaxSize()) {
+                if (maxWidth < COMPACT_WIDTH) {
+                    Scaffold(
+                        containerColor = MaterialTheme.colorScheme.background,
+                        bottomBar = {
+                            NavigationBar {
+                                tabs.forEachIndexed { i, label ->
+                                    NavigationBarItem(
+                                        selected = tab == i,
+                                        onClick = { tabLabel = label },
+                                        icon = { Icon(NavIcons.of(label), contentDescription = null) },
+                                        label = { Text(label) },
+                                    )
+                                }
+                            }
+                        },
+                    ) { inner ->
+                        Column(Modifier.fillMaxSize().padding(inner).padding(16.dp)) {
+                            header()
+                            content()
+                        }
+                    }
+                } else {
+                    Column(Modifier.fillMaxSize().padding(16.dp)) {
+                        header()
+                        TabRow(selectedTabIndex = tab) {
+                            tabs.forEachIndexed { i, label ->
+                                Tab(selected = tab == i, onClick = { tabLabel = label }, text = { Text(label) })
+                            }
+                        }
+                        Spacer(Modifier.height(16.dp))
+                        content()
+                    }
                 }
             }
         }
     }
 }
+
+/** Below this width the tab switcher is a bottom navigation bar (a phone); at or above it, a tab row. */
+internal val COMPACT_WIDTH = 600.dp
 
 /** Horizontally-scrolling chips over the enabled chains — picks the chain Status + Query act on. */
 @Composable
@@ -296,45 +389,26 @@ private fun NetworkChips(
  * by color/thickness alone.
  */
 @Composable
-internal fun ReadinessStrip(s: NodeSnapshot?, deepPoolThreshold: Int, catchUp: CatchUpProgress? = null) {
-    // Ranked below every red/amber node state (those explain the index's lag too, and fixing
-    // them comes first) and above both greens: a node whose index refuses head queries is
-    // not "ready", however deep its peer pool.
-    val indexCatchingUp = catchUp != null && s != null && s.running && s.lifecycle != "PAUSED" &&
-        !upgradeCutOff(s) && s.beaconState == "SYNCED" && s.verifiedHeadAgeMs <= READY_HEAD_WARM_MS
-    val (color, height, label) = when {
-        s != null && s.lifecycle == "PAUSED" ->
-            Triple(Color(0xFF78909C), 3.dp,
-                if (s.upgrade == null) "Node readiness: sleeping — a request wakes it"
-                else "Node readiness: sleeping — peers report a network upgrade this version doesn't support")
-        s == null || !s.running ->
-            Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not running")
-        // An unsupported upgrade the node's own state corroborates outranks a stale-anchor
-        // park: updating the app fixes both (a new build ships a fresh checkpoint too),
-        // while consenting to the old anchor cannot make this build follow the fork.
-        upgradeCutOff(s) ->
-            Triple(Color(0xFFD32F2F), 3.dp,
-                "Node readiness: not verifying — peers report a network upgrade this version doesn't support; update the app")
-        s.beaconState == "STALE_ANCHOR" ->
-            Triple(Color(0xFFD32F2F), 3.dp,
-                "Node readiness: sync anchor too old — paused awaiting your consent")
-        s.beaconState != "SYNCED" ->
-            Triple(Color(0xFFD32F2F), 3.dp, "Node readiness: not synced")
-        s.verifiedHeadAgeMs > READY_HEAD_WARM_MS ->
-            Triple(Color(0xFFF9A825), 3.dp, "Node readiness: warming up, not ready to transact")
-        indexCatchingUp && catchUp != null ->
-            Triple(Color(0xFFF9A825), 6.dp,
-                "Node readiness: ${LogIndexStatus.catchUpLine(catchUp)}; " +
-                    "eth_getLogs near the head is refused" +
-                    if (catchUp.stalled) "" else " until it has caught up")
-        s.snapServingPeers >= deepPoolThreshold ->
-            Triple(Color(0xFF00E676), 6.dp,
-                "Node readiness: fully ready — deep peer pool, heavy confirm screens will load")
-        else ->
-            Triple(Color(0xFF2E7D32), 3.dp,
-                "Node readiness: ready for simple reads; peer pool still filling for heavy confirm screens")
+internal fun ReadinessStrip(
+    s: NodeSnapshot?,
+    deepPoolThreshold: Int,
+    catchUp: CatchUpProgress? = null,
+    online: Boolean = true,
+) = ReadinessStrip(readinessOf(s, deepPoolThreshold, catchUp, online), catchUp)
+
+/** The strip over a ladder rung already computed — [NodeScreen] shares one with the status card. */
+@Composable
+internal fun ReadinessStrip(r: Readiness, catchUp: CatchUpProgress?) {
+    // One ladder for every readiness surface (Readiness.kt); the strip only paints it.
+    val color = StatusColors.of(r.level)
+    // The two rungs past "ready" are drawn thicker: the deep pool, and the index
+    // catch-up whose strip doubles as its progress bar.
+    val height = when (r.level) {
+        ReadinessLevel.INDEX_CATCHING_UP, ReadinessLevel.FULLY_READY -> 6.dp
+        else -> 3.dp
     }
-    if (indexCatchingUp && catchUp != null) {
+    val label = r.a11yLabel
+    if (r.level == ReadinessLevel.INDEX_CATCHING_UP && catchUp != null) {
         // The strip itself becomes the progress bar, with the gap spelled out beneath it.
         // One semantics node carrying both the label and, while it moves, the bar's value.
         Column(
@@ -436,22 +510,31 @@ private fun ConsensusUnsyncedBanner(beaconState: String) {
 
 /**
  * Settings: enable/disable each network (each runs concurrently as its own node with its own
- * JSON-RPC port) and tune the shared snap/readiness/BLS/freshness knobs. Toggles that affect
- * a running stack apply live; RPC-port edits are deferred to Save and reboot only the changed
- * chain. Mirrors the Android SettingsScreen over the [Settings]/[NodeController] seam.
+ * JSON-RPC port), decide which web pages may use the node ([WebAccessSection]), and tune
+ * the shared snap/readiness/BLS/freshness knobs. Toggles that affect a running stack
+ * apply live; RPC-port edits are deferred to Save and reboot only the changed chain.
+ * Mirrors the Android SettingsScreen over the [Settings]/[NodeController] seam.
  */
 @Composable
 private fun SettingsTab(
     controller: NodeController,
     settings: Settings,
     snapshots: Map<String, NodeSnapshot>,
+    // The live web-page policy, hoisted in NodeScreen (shared with the Status banner).
+    webAccess: WebAccessFields,
     // Notifies the screen that the persisted enabled set changed, so the network
     // chips (derived from settings, not snapshot state) re-derive immediately.
     onEnabledChanged: () -> Unit = {},
+    // Whether Expert mode is on (re-read by NodeScreen on every flip): shows the
+    // node-tuning section below the Power and Expert-mode rows.
+    expert: Boolean = false,
     // Notifies the screen that the Kohaku log-index effective state changed (the
     // per-network flags or the Rust engine it depends on), so the Index tab's
     // visibility re-derives immediately.
     onLogIndexChanged: () -> Unit = {},
+    // Notifies the screen that Expert mode flipped, so the tab set and this tab's
+    // sections re-derive immediately.
+    onExpertChanged: () -> Unit = {},
 ) {
     val networks = remember { settings.allNetworks() }
     // Per-network enabled toggle + RPC-port text, seeded from persisted settings. Toggling a
@@ -466,100 +549,70 @@ private fun SettingsTab(
             networks.forEach { put(it, settings.rpcPortFor(it).toString()) }
         }
     }
-    var snapTarget by remember { mutableStateOf(settings.snapTarget().toString()) }
-    var servedWindow by remember { mutableStateOf(settings.servedBlockWindow().toString()) }
-    var wsBound by remember { mutableStateOf(settings.wsBoundPeriods().toString()) }
-    var deepPool by remember { mutableStateOf(settings.deepPoolThreshold().toString()) }
+    // The Expert-mode tuning fields live here, not in NodeTuning: Save persists the text
+    // fields, and the section comes and goes with the Expert switch while the tab stays.
+    val tuning = remember { TuningFields(settings) }
     var idlePause by remember { mutableStateOf(settings.idlePauseMinutes().toString()) }
     var stayAwakeCharging by remember { mutableStateOf(settings.stayAwakeWhileCharging()) }
-    var strictFreshness by remember { mutableStateOf(settings.strictStateFreshness()) }
-    var nativeBls by remember { mutableStateOf(settings.nativeBlsEnabled()) }
-    var preferJava by remember { mutableStateOf(settings.preferJavaEngine()) }
-    var torRouting by remember { mutableStateOf(settings.torEnabled()) }
+    var allowNap by remember { mutableStateOf(settings.allowAppNap()) }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        Text("Networks", style = MaterialTheme.typography.titleMedium)
-        Text(
-            "Toggle a chain to run it. Each enabled chain runs concurrently as its own node " +
-                "with its own JSON-RPC port — add each port to MetaMask as a separate RPC URL.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        SettingsSection("Networks")
+        SettingsNote(
+            "Turn a chain on to run it. Each chain runs as its own node with its own JSON-RPC " +
+                "port — add each port to your wallet as a separate RPC URL. Save applies a " +
+                "port change by restarting that chain.",
         )
         networks.forEach { id ->
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Row(
-                    Modifier.fillMaxWidth().padding(top = 4.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(settings.displayName(id))
-                    Switch(
-                        checked = enabled[id] == true,
-                        onCheckedChange = { on ->
-                            enabled[id] = on
-                            settings.setNetworkEnabled(id, on)
-                            if (on) controller.enableNetwork(id) else controller.disableNetwork(id)
-                            onEnabledChanged()
-                        },
-                    )
-                }
-                OutlinedTextField(
-                    value = rpcPorts[id] ?: "",
-                    onValueChange = { rpcPorts[id] = it.filter(Char::isDigit).take(5) },
-                    label = { Text("JSON-RPC port (default ${settings.defaultRpcPort(id)})") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
+            NetworkCard(
+                name = settings.displayName(id),
+                enabled = enabled[id] == true,
+                port = rpcPorts[id] ?: "",
+                portLabel = "JSON-RPC port (default ${settings.defaultRpcPort(id)})",
+                onEnabled = { on ->
+                    enabled[id] = on
+                    settings.setNetworkEnabled(id, on)
+                    if (on) controller.enableNetwork(id) else controller.disableNetwork(id)
+                    onEnabledChanged()
+                },
+                onPort = { rpcPorts[id] = it.filter(Char::isDigit).take(5) },
+            )
         }
 
-        HorizontalDivider()
+        // Web page access (#502): in both modes — it is the privacy setting a wallet user
+        // needs when a site they use wants the node, and the recent list is where a
+        // refused page is allowed. Applies live, outside Save. Only where the host
+        // persists and pushes it (supportsWebAccess), never as an inert control.
+        if (settings.supportsWebAccess()) {
+            HorizontalDivider()
+            WebAccessSection(webAccess, snapshots)
+        }
 
-        Text("Node tuning", style = MaterialTheme.typography.titleMedium)
-        OutlinedTextField(
-            value = snapTarget,
-            onValueChange = { snapTarget = it.filter(Char::isDigit).take(3) },
-            label = { Text("Snap-peer target (default 32)") },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = servedWindow,
-            onValueChange = { servedWindow = it.filter(Char::isDigit).take(4) },
-            label = { Text("Served-block window (eth/69, default 32)") },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = deepPool,
-            onValueChange = { deepPool = it.filter(Char::isDigit).take(3) },
-            label = { Text("Readiness \"deep pool\" threshold (default 16)") },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = wsBound,
-            onValueChange = { wsBound = it.filter(Char::isDigit).take(4) },
-            label = { Text("Weak-subjectivity bound in periods (0 = network default)") },
-            supportingText = {
-                Text(
-                    "How old the sync anchor may be before the node refuses to sync and " +
-                        "asks for consent (mainnet default 13 periods ≈ two weeks). Raising " +
-                        "it weakens the long-range-attack protection — leave 0 unless you " +
-                        "know why.",
-                )
-            },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            modifier = Modifier.fillMaxWidth(),
-        )
+        // Power: the rows that trade responsiveness for battery or CPU, one per host that
+        // has such a knob — macOS App Nap, Android's idle controller. Linux has neither
+        // (no per-app throttling of unfocused windows, no idle controller), so the section
+        // is simply absent there.
+        if (settings.supportsAppNap() || settings.supportsIdleSleep()) {
+            HorizontalDivider()
+            SettingsSection("Power")
+        }
+        if (settings.supportsAppNap()) {
+            // Applies live — the controller begins or ends the no-nap activity at once.
+            SwitchRow(
+                label = "Sleep when not in focus",
+                checked = allowNap,
+                onChange = { on -> allowNap = on; settings.setAllowAppNap(on); controller.applyAppNap() },
+            )
+            SettingsNote(
+                "Off (default): Myotis stays fully awake while its window is hidden or covered, " +
+                    "so wallets on this Mac keep getting prompt answers. On: macOS may slow Myotis " +
+                    "down when it is not in focus (App Nap) — saves power, but a wallet's first " +
+                    "request after a while can stall for seconds. Applies immediately.",
+            )
+        }
         // Idle-sleep is only meaningful on a host that actually runs the idle controller
         // (Android). On desktop (no controller) the setting is a no-op, so don't surface a
         // battery-saving toggle that can't take effect.
@@ -572,14 +625,12 @@ private fun SettingsTab(
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 modifier = Modifier.fillMaxWidth(),
             )
-            Text(
+            SettingsNote(
                 "After this many minutes without a wallet request or query, the node goes to " +
                     "sleep: all P2P networking stops (saving battery) while the JSON-RPC port keeps " +
                     "listening. The first request wakes it — expect that call to take a little longer. " +
                     "On a fresh start it runs through to SYNCED before the first sleep, as long as it " +
                     "has a network to sync over.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             // Applies live — the idle tick reads it each pass.
             SwitchRow(
@@ -587,139 +638,57 @@ private fun SettingsTab(
                 checked = stayAwakeCharging,
                 onChange = { on -> stayAwakeCharging = on; settings.setStayAwakeWhileCharging(on) },
             )
-            Text(
+            SettingsNote(
                 "On (default): while the phone is plugged in, skip idle sleep and keep the node " +
                     "awake and synced (battery isn't a concern). Off: sleep on the same idle timer " +
                     "whether charging or not. Emergency low-memory pauses happen either way.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
 
-        // Strict freshness is the default; the switch exposes the RELAXED (opt-in) state, so the
-        // checked value is the negation. Persisted immediately; applies on the next node restart.
+        HorizontalDivider()
+        // Persisted at once; NodeScreen re-reads it and re-derives the tab set.
         SwitchRow(
-            label = "Relaxed state freshness",
-            checked = !strictFreshness,
-            onChange = { relaxed -> strictFreshness = !relaxed; settings.setStrictStateFreshness(!relaxed) },
+            label = "Expert mode",
+            checked = expert,
+            onChange = { on -> settings.setExpertMode(on); onExpertChanged() },
         )
-        Text(
-            "Off (default, recommended): strict 2-minute freshness — fee calc / eth_call " +
-                "fast-fail when no fresh servable root exists, and the wallet retries. " +
-                "On (opt-in, experimental): serve a slightly older verified root — but if " +
-                "it isn't fully servable this can HANG the confirm screen for up to 2 min " +
-                "instead of failing fast. Applies on the next node (re)start.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        SettingsNote(
+            "On: the Logs and Index tabs, every status row with its maintenance actions, and " +
+                "the node-tuning settings below. Off (default): the three screens a wallet needs.",
         )
 
-        // Native BLS applies immediately — flips the process-global backend live.
-        SwitchRow(
-            label = "Native BLS acceleration",
-            checked = nativeBls,
-            onChange = { on -> nativeBls = on; settings.setNativeBlsEnabled(on); controller.applyBlsBackend() },
-        )
-        Text(
-            "On (default): use the bundled native blst library for sync-committee BLS " +
-                "verification (much faster than pure-Java). Off: force the pure-Java Milagro path — " +
-                "slower, but useful if the native library fails to load. Applies immediately.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-
-        // Engine choice applies per network (re)start — running networks keep their engine.
-        // A host that cannot run the Java engine at all (Android below API 33) shows why
-        // instead of a toggle it would refuse to honour.
-        val javaUnavailable = remember { settings.javaEngineUnavailableReason() }
-        if (javaUnavailable != null) {
-            Text("Engine: Rust only")
-            Text(
-                javaUnavailable,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        } else {
-            SwitchRow(
-                label = "Prefer Java engine",
-                checked = preferJava,
-                onChange = { on ->
-                    preferJava = on; settings.setPreferJavaEngine(on); controller.applyEngineChoice()
-                    onLogIndexChanged()
-                },
-            )
-            Text(
-                "Off (default): the Rust engine runs each network where it can serve, " +
-                    "falling back to the Java engine otherwise. The Rust engine is the " +
-                    "primary engine — the log index (Index tab) and Tor routing run on it " +
-                    "only. On: force the original Java engine everywhere, giving up those " +
-                    "features — currently the only way to use the Query tab's " +
-                    "transaction-history scan (mainnet, Java engine only). Applies when a " +
-                    "network is (re)started, not to already-running networks. On hosts with " +
-                    "an idle controller (Android) both engines idle-sleep; the Status screen's " +
-                    "Sleep row shows it per network.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+        if (expert) {
+            HorizontalDivider()
+            NodeTuning(controller, settings, tuning, onLogIndexChanged)
         }
-
-        // Tor routing — shown only on hosts that can actually route over Tor
-        // (controller.supportsTor; a privacy switch that flips ON while reads keep
-        // leaving from the real IP would be accepted-and-ignored). Where shown, the
-        // row is disabled while the Java engine is forced above.
-        if (controller.supportsTor) {
-            SwitchRow(
-                label = "Route reads over Tor (experimental)",
-                checked = torRouting && !preferJava,
-                enabled = !preferJava,
-                onChange = { on -> torRouting = on; settings.setTorEnabled(on); controller.applyTorMode() },
-            )
-            Text(
-                if (preferJava) {
-                    "Turn off “Prefer Java engine” first — Tor routing is built into the Rust engine only."
-                } else {
-                    "Off (default): reads use the peer pool directly from your IP. On: route " +
-                        "account/balance reads over the Tor network (embedded Arti) so snap peers see " +
-                        "a Tor exit, not your IP — each address gets its own isolated circuit and a " +
-                        "fresh node identity. SCOPE: only account (balance/nonce) reads route over Tor " +
-                        "today; token-balance (storage), contract code, and eth_call/gas-estimation " +
-                        "still use your real IP — full coverage is a follow-up. HEADS-UP: earlier tests " +
-                        "were not very successful — many peers reject Tor exit IPs and :30303 exit " +
-                        "coverage is patchy, so reads can be slow (seconds to tens of seconds) or " +
-                        "fail-closed while this is on. Takes effect immediately — the next read on a " +
-                        "running Rust-engine network routes over Tor (no restart needed)."
-                },
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-        Text(
-            "An RPC-port change reboots that chain; the snap-peer target and served-block " +
-                "window apply live to every running chain, and the readiness threshold persists " +
-                "for the next check.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
         Button(
             onClick = {
-                val snap = snapTarget.toIntOrNull() ?: 32
-                val window = servedWindow.toIntOrNull() ?: 32
-                val deep = deepPool.toIntOrNull() ?: 16
-                // Blank/invalid keeps the CURRENT value (0 would silently restore the
-                // default bound — a security knob must not change on a stray edit).
-                val ws = wsBound.toIntOrNull() ?: settings.wsBoundPeriods()
-                settings.setSnapTarget(snap)          // persist
-                settings.setServedBlockWindow(window) // persist
-                settings.setDeepPool(deep)            // persist (read at readiness-check time)
-                settings.setWsBoundPeriods(ws)        // persist
+                // Save writes only what the current mode shows. `tuning` outlives an Expert
+                // flip-off (the tab stays composed), so an edit typed in Expert mode and never
+                // saved would otherwise be persisted — and live-applied — by a normal-mode
+                // Save with no field on screen showing it; for the weak-subjectivity bound
+                // that is a security knob widened invisibly.
+                if (expert) {
+                    val snap = tuning.snapTarget.toIntOrNull() ?: 32
+                    val window = tuning.servedWindow.toIntOrNull() ?: 32
+                    val deep = tuning.deepPool.toIntOrNull() ?: 16
+                    // Blank/invalid keeps the CURRENT value (0 would silently restore the
+                    // default bound — a security knob must not change on a stray edit).
+                    val ws = tuning.wsBound.toIntOrNull() ?: settings.wsBoundPeriods()
+                    settings.setSnapTarget(snap)          // persist
+                    settings.setServedBlockWindow(window) // persist
+                    settings.setDeepPool(deep)            // persist (read at readiness-check time)
+                    settings.setWsBoundPeriods(ws)        // persist
+                    controller.setTargetSnapPeers(snap)   // live-apply to running stacks
+                    controller.setServedBlockWindow(window) // live-apply to running stacks
+                    controller.setWsBoundPeriods(ws)      // live-apply (a STALE_ANCHOR park re-evaluates)
+                }
                 // Idle sleep: persisted only on hosts that run the controller; the tick reads it
                 // live. Blank/invalid input keeps the CURRENT value rather than silently enabling
                 // sleep (the label says "0 = never"), so a stray edit can't turn it on by accident.
                 if (settings.supportsIdleSleep()) {
                     settings.setIdlePauseMinutes(idlePause.toIntOrNull() ?: settings.idlePauseMinutes())
                 }
-                controller.setTargetSnapPeers(snap)   // live-apply to running stacks
-                controller.setServedBlockWindow(window) // live-apply to running stacks
-                controller.setWsBoundPeriods(ws)      // live-apply (a STALE_ANCHOR park re-evaluates)
                 networks.forEach { id ->
                     // Compare the EFFECTIVE (post-clamp) persisted port before vs after, not the
                     // raw typed value: setRpcPort clamps out-of-range input to the network default,
@@ -738,16 +707,190 @@ private fun SettingsTab(
     }
 }
 
-/** A label + right-aligned [Switch] row — the repeated toggle layout in [SettingsTab]. */
+/**
+ * The Expert-mode tuning fields of [SettingsTab], seeded from [Settings] once per tab
+ * composition. The text fields are persisted by the Save button; the switches write
+ * through as they flip and are mirrored here for the UI.
+ */
+private class TuningFields(settings: Settings) {
+    var snapTarget by mutableStateOf(settings.snapTarget().toString())
+    var servedWindow by mutableStateOf(settings.servedBlockWindow().toString())
+    var deepPool by mutableStateOf(settings.deepPoolThreshold().toString())
+    var wsBound by mutableStateOf(settings.wsBoundPeriods().toString())
+    var strictFreshness by mutableStateOf(settings.strictStateFreshness())
+    var nativeBls by mutableStateOf(settings.nativeBlsEnabled())
+    var preferJava by mutableStateOf(settings.preferJavaEngine())
+    var torRouting by mutableStateOf(settings.torEnabled())
+}
+
+/**
+ * The Expert-mode "Node tuning" section of [SettingsTab]: the knobs that shape how the
+ * node syncs and serves, over the tab's [TuningFields].
+ */
 @Composable
-private fun SwitchRow(
+private fun NodeTuning(
+    controller: NodeController,
+    settings: Settings,
+    f: TuningFields,
+    onLogIndexChanged: () -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        SettingsSection("Node tuning")
+        OutlinedTextField(
+            value = f.snapTarget,
+            onValueChange = { f.snapTarget = it.filter(Char::isDigit).take(3) },
+            label = { Text("Snap-peer target (default 32)") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = f.servedWindow,
+            onValueChange = { f.servedWindow = it.filter(Char::isDigit).take(4) },
+            label = { Text("Served-block window (eth/69, default 32)") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = f.deepPool,
+            onValueChange = { f.deepPool = it.filter(Char::isDigit).take(3) },
+            label = { Text("Readiness \"deep pool\" threshold (default 16)") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = f.wsBound,
+            onValueChange = { f.wsBound = it.filter(Char::isDigit).take(4) },
+            label = { Text("Weak-subjectivity bound in periods (0 = network default)") },
+            supportingText = {
+                Text(
+                    "How old the sync anchor may be before the node refuses to sync and " +
+                        "asks for consent (mainnet default 13 periods ≈ two weeks). Raising " +
+                        "it weakens the long-range-attack protection — leave 0 unless you " +
+                        "know why.",
+                )
+            },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        // Strict freshness is the default; the switch exposes the RELAXED (opt-in) state, so the
+        // checked value is the negation. Persisted immediately; applies on the next node restart.
+        SwitchRow(
+            label = "Relaxed state freshness",
+            checked = !f.strictFreshness,
+            onChange = { relaxed -> f.strictFreshness = !relaxed; settings.setStrictStateFreshness(!relaxed) },
+        )
+        SettingsNote(
+            "Off (default, recommended): strict 2-minute freshness — fee calc / eth_call " +
+                "fast-fail when no fresh servable root exists, and the wallet retries. " +
+                "On (opt-in, experimental): serve a slightly older verified root — but if " +
+                "it isn't fully servable this can HANG the confirm screen for up to 2 min " +
+                "instead of failing fast. Applies on the next node (re)start.",
+        )
+
+        // Native BLS applies immediately — flips the process-global backend live.
+        SwitchRow(
+            label = "Native BLS acceleration",
+            checked = f.nativeBls,
+            onChange = { on -> f.nativeBls = on; settings.setNativeBlsEnabled(on); controller.applyBlsBackend() },
+        )
+        SettingsNote(
+            "On (default): use the bundled native blst library for sync-committee BLS " +
+                "verification (much faster than pure-Java). Off: force the pure-Java Milagro path — " +
+                "slower, but useful if the native library fails to load. Applies immediately.",
+        )
+
+        // Engine choice applies per network (re)start — running networks keep their engine.
+        // A host that cannot run the Java engine at all (Android below API 33) shows why
+        // instead of a toggle it would refuse to honour.
+        val javaUnavailable = remember { settings.javaEngineUnavailableReason() }
+        if (javaUnavailable != null) {
+            Text("Engine: Rust only")
+            SettingsNote(
+                javaUnavailable,
+            )
+        } else {
+            SwitchRow(
+                label = "Prefer Java engine",
+                checked = f.preferJava,
+                onChange = { on ->
+                    f.preferJava = on; settings.setPreferJavaEngine(on); controller.applyEngineChoice()
+                    onLogIndexChanged()
+                },
+            )
+            SettingsNote(
+                "Off (default): the Rust engine runs each network where it can serve, " +
+                    "falling back to the Java engine otherwise. The Rust engine is the " +
+                    "primary engine — the log index (Index tab) and Tor routing run on it " +
+                    "only. On: force the original Java engine everywhere, giving up those " +
+                    "features — currently the only way to use the Query tab's " +
+                    "transaction-history scan (mainnet, Java engine only). Applies when a " +
+                    "network is (re)started, not to already-running networks. On hosts with " +
+                    "an idle controller (Android) both engines idle-sleep; the Status screen's " +
+                    "Sleep row shows it per network.",
+            )
+        }
+
+        // Tor routing — shown only on hosts that can actually route over Tor
+        // (controller.supportsTor; a privacy switch that flips ON while reads keep
+        // leaving from the real IP would be accepted-and-ignored). Where shown, the
+        // row is disabled while the Java engine is forced above.
+        if (controller.supportsTor) {
+            SwitchRow(
+                label = "Route reads and sends over Tor (experimental)",
+                checked = f.torRouting && !f.preferJava,
+                enabled = !f.preferJava,
+                onChange = { on -> f.torRouting = on; settings.setTorEnabled(on); controller.applyTorMode() },
+            )
+            SettingsNote(
+                if (f.preferJava) {
+                    "Turn off “Prefer Java engine” first — Tor routing is built into the Rust engine only."
+                } else {
+                    "Off (default): reads and sends use the peer pool directly from your IP. On: " +
+                        "route account/balance reads and the broadcast of your transactions over the Tor " +
+                        "network (embedded Arti) so peers see a Tor exit, not your IP (though a peer you " +
+                        "also reach directly can tell both are a Myotis node) — each address, " +
+                        "and each send, gets its own isolated circuits and a fresh node identity. SCOPE: " +
+                        "only account (balance/nonce) reads and transaction sends route over Tor today; " +
+                        "token-balance (storage), contract code, eth_call/gas-estimation and the receipt " +
+                        "polling after a send still use your real IP — full coverage is a follow-up. " +
+                        "HEADS-UP: earlier tests were not very successful — many peers reject Tor exit " +
+                        "IPs and :30303 exit coverage is patchy, so reads and sends can be slow (seconds " +
+                        "to tens of seconds) or fail-closed while this is on: a send that no peer " +
+                        "takes over Tor fails — it never falls back to your IP. Takes effect " +
+                        "immediately — the next read or send on a running Rust-engine network routes " +
+                        "over Tor (no restart needed)."
+                },
+            )
+        }
+        SettingsNote(
+            "Save applies the snap-peer target and served-block window live to every running " +
+                "chain; the readiness threshold persists for the next check.",
+        )
+    }
+}
+
+/**
+ * A label + right-aligned [Switch] row — the repeated toggle layout in [SettingsTab].
+ * The ROW is the toggleable (the switch itself has no handler), so a screen reader
+ * announces one named switch — "Expert mode, on" — instead of a label and an unnamed
+ * toggle side by side, and the whole row is the tap target.
+ */
+@Composable
+internal fun SwitchRow(
     label: String,
     checked: Boolean,
     enabled: Boolean = true,
     onChange: (Boolean) -> Unit,
 ) {
     Row(
-        Modifier.fillMaxWidth().padding(top = 4.dp),
+        Modifier
+            .fillMaxWidth()
+            .toggleable(value = checked, enabled = enabled, role = Role.Switch, onValueChange = onChange)
+            .padding(top = 4.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -755,10 +898,16 @@ private fun SwitchRow(
             label,
             color = if (enabled) Color.Unspecified else MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        Switch(checked = checked, enabled = enabled, onCheckedChange = onChange)
+        Switch(checked = checked, enabled = enabled, onCheckedChange = null)
     }
 }
 
+/**
+ * The Status tab. Both modes open with the readiness card ([StatusHero]) and its
+ * actions, then the banners every user needs (a network upgrade, a refused web page).
+ * Normal mode follows with the vitals tiles and nothing else; Expert mode with the
+ * hunt banner, the full rows, the maintenance actions and the READY peers.
+ */
 @Composable
 private fun StatusTab(
     controller: NodeController,
@@ -767,49 +916,78 @@ private fun StatusTab(
     primary: String,
     online: Boolean,
     onOpenNetworkSettings: () -> Unit,
+    expert: Boolean,
+    readiness: Readiness,
+    // The log index's head catch-up as the ladder saw it, so the tile agrees with the card.
+    catchUp: CatchUpProgress?,
+    onReviewStaleAnchor: () -> Unit,
+    // The live web-page policy (hoisted in NodeScreen) and EVERY network's snapshot:
+    // a page refused on another chain's port is still a page that wants in.
+    webAccess: WebAccessFields,
+    snapshots: Map<String, NodeSnapshot>,
 ) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-        if (!online) {
-            OfflineBanner(onOpenNetworkSettings)
+        // A snapshot for `primary` exists only while its stack is registered (running or
+        // mid-boot): Start shows while it is down, Stop while it is up. Start/Stop are
+        // RUNTIME-only (startNetwork/stopNetwork) — deliberately decoupled from the
+        // Settings enable switches, so stopping a chain here does not flip its switch
+        // off. The one exception: Start on a chain that isn't enabled at all (e.g. fresh
+        // install, nothing on) goes through enableNetwork so a cold host has an enabled
+        // set to boot.
+        val primaryActive = snap != null
+        StatusHero(readiness, help = { HelpButton("Readiness", StatusHelp.READINESS) }) {
+            // Offline: the fix is outside the app, so offer the door to it — whatever rung
+            // leads (a sleeping stack outranks offline on the card, and still needs the door
+            // before a wake can succeed).
+            if (!online) Button(onClick = onOpenNetworkSettings) { Text("Open network settings") }
+            // Parked on the user's consent: bring the dismissed dialog back.
+            if (readiness.level == ReadinessLevel.NEEDS_DECISION) {
+                Button(onClick = onReviewStaleAnchor) { Text("Review") }
+            }
+            if (primaryActive) {
+                OutlinedButton(onClick = { controller.stopNetwork(primary) }) { Text("Stop") }
+            } else {
+                Button(
+                    onClick = {
+                        if (settings.isNetworkEnabled(primary)) controller.startNetwork(primary)
+                        else controller.enableNetwork(primary)
+                    },
+                    // Don't offer Start while offline — discovery can't reach any peer.
+                    enabled = online,
+                ) { Text("Start $primary") }
+            }
+            if (expert) HelpButton("Start / Stop", StatusHelp.START_STOP)
+        }
+        Spacer(Modifier.height(16.dp))
+
+        snap?.upgrade?.let {
+            UpgradeBanner(it, cutOff = upgradeCutOff(snap))
             Spacer(Modifier.height(16.dp))
         }
 
-        if (snap == null) {
-            Text("Node stopped — no data for $primary")
-        } else {
-            snap.upgrade?.let {
-                UpgradeBanner(it, cutOff = upgradeCutOff(snap))
-                Spacer(Modifier.height(16.dp))
-            }
+        // A refused web page (#502), in both modes: the browser gives the page no reason
+        // for the failure, so this banner is the one place the user can learn a site
+        // wants in — and allow it for every request from then on, or wave it away.
+        val webRows = remember(snapshots) { WebAccessUi.merge(snapshots.values.map { it.webOrigins }) }
+        val pendingRefusals = if (settings.supportsWebAccess()) webAccess.pendingRefusals(webRows) else emptyList()
+        if (pendingRefusals.isNotEmpty()) {
+            WebAccessBanner(
+                pendingRefusals,
+                onAllow = { webAccess.allow(it) },
+                onDismiss = { webAccess.dismiss(it) },
+            )
+            Spacer(Modifier.height(16.dp))
+        }
+
+        if (!expert) {
+            VitalsGrid(vitalsOf(snap, settings.deepPoolThreshold(), catchUp))
+            return@Column
+        }
+
+        if (snap != null) {
             HuntBanner(snap)
             SyncProgressBar(snap)
             StatusView(snap, hostSleeps = settings.supportsIdleSleep())
-        }
-
-        Spacer(Modifier.height(16.dp))
-        // A snapshot for `primary` exists only while its stack is registered (running or
-        // mid-boot): Start disabled once up, Stop only while it is. Start/Stop here are
-        // RUNTIME-only (startNetwork/stopNetwork) — deliberately decoupled from the
-        // Settings enable switches, so stopping a chain from Status does not flip its
-        // switch off. The one exception: Start on a chain that isn't enabled at all
-        // (e.g. fresh install, nothing on) goes through enableNetwork so a cold host
-        // has an enabled set to boot.
-        val primaryActive = snap != null
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Button(
-                onClick = {
-                    if (settings.isNetworkEnabled(primary)) controller.startNetwork(primary)
-                    else controller.enableNetwork(primary)
-                },
-                // Don't offer Start while offline — discovery can't reach any peer.
-                enabled = !primaryActive && online,
-            ) { Text("Start $primary") }
-            Spacer(Modifier.width(8.dp))
-            OutlinedButton(
-                onClick = { controller.stopNetwork(primary) },
-                enabled = primaryActive,
-            ) { Text("Stop") }
-            HelpButton("Start / Stop", StatusHelp.START_STOP)
         }
 
         Spacer(Modifier.height(16.dp))
@@ -906,7 +1084,7 @@ private fun HuntBanner(s: NodeSnapshot) {
     Text(
         "Hunting for ${targets.joinToString(" and ")}…",
         style = MaterialTheme.typography.bodySmall,
-        color = Color(0xFFF9A825), // amber — same signal family as "warming up"
+        color = StatusColors.Amber, // same signal family as "warming up"
         modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)
             .semantics { contentDescription = "LC hunt active: searching for light-client servers" },
     )
@@ -976,15 +1154,6 @@ private fun PeerRowView(p: PeerRow) {
 }
 
 /**
- * An ACTIVE upgrade advisory that the node's OWN verified state corroborates: the beacon
- * feed is not SYNCED, or its verified head has gone stale. The advisory is unverified peer
- * data, so on its own it never turns readiness red or claims the node stopped verifying —
- * a SYNCED, fresh node is verifying, whatever peers say.
- */
-private fun upgradeCutOff(s: NodeSnapshot): Boolean =
-    s.upgrade?.active == true && (s.beaconState != "SYNCED" || s.verifiedHeadAgeMs > READY_HEAD_WARM_MS)
-
-/**
  * Upgrade banner (Status + Query): peers announce — or report already activated — a network
  * upgrade this build doesn't support. SCHEDULED is a heads-up with the date. ACTIVE is an
  * alarm only when [cutOff] (the node's own verified state agrees it stopped verifying);
@@ -1044,33 +1213,6 @@ private fun UpgradeBanner(u: UpgradeNotice, cutOff: Boolean) {
     }
 }
 
-/** Shown at the top of Status when the device has no connectivity. */
-@Composable
-private fun OfflineBanner(onOpenNetworkSettings: () -> Unit) {
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .background(MaterialTheme.colorScheme.errorContainer)
-            .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        Text(
-            "No internet connection",
-            style = MaterialTheme.typography.titleSmall,
-            color = MaterialTheme.colorScheme.onErrorContainer,
-        )
-        Text(
-            "The node needs internet access to discover and connect to peers. " +
-                "Enable Wi-Fi or mobile data to continue.",
-            fontSize = 13.sp,
-            color = MaterialTheme.colorScheme.onErrorContainer,
-        )
-        Button(onClick = onOpenNetworkSettings, modifier = Modifier.fillMaxWidth()) {
-            Text("Open network settings")
-        }
-    }
-}
-
 @Composable
 private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
     val tz = remember { TimeZone.currentSystemDefault() }
@@ -1094,7 +1236,7 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
             StatusRow(
                 "Tor",
                 when (mode) {
-                    "active" -> "routing reads (circuit ready)"
+                    "active" -> "routing reads and sends (circuit ready)"
                     "on" -> "on — circuit bootstrapping…"
                     "off" -> "off"
                     else -> mode
@@ -1103,38 +1245,41 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
                 color = if (mode == "active") MaterialTheme.colorScheme.primary else null,
             )
         }
-        StatusRow(
-            "CL peers",
-            "served ${s.clServedPeersLastMin}/min, con ${s.clConnectedPeers}",
-            help = StatusHelp.CL_PEERS,
-        )
-        // Same total-first shape as the cache rows (the pool holds only ready
+        // Peer rows, grouped by layer so a reader never has to know which of
+        // "Discovered" (discv4) and "Discv5 peers" is which side. Each group's
+        // header carries the two numbers people scan for — live peers and the
+        // on-disk cache total — and the rows underneath keep their full values
+        // and help texts. The rows that occur in both groups ("Peers", "Cache")
+        // pass the qualified name as the help dialog's title, since the dialog
+        // stands alone without the header above it.
+        //
+        // EL — the devp2p side: the snap pool, its peer cache, what EL peers
+        // ask US for, and the discv4 table / dial backoff / wrong-chain lists
+        // (all EL by their help texts).
+        PeerGroupHeader(peerGroupTitle("EL", elPeersPhrase(s.readyPeers), s.elCachedPeers))
+        // Same total-first shape as the cache row (the pool holds only ready
         // peers, so the total IS the ready count).
         StatusRow(
-            "EL peers",
+            "Peers",
             elPeersValue(s.readyPeers, s.snapPeers, s.snapServingPeers, s.snap2ServingPeers),
             help = StatusHelp.EL_PEERS,
+            title = "EL peers",
         )
         // Cache rows: confirmed-server counts predict how fast the NEXT cold
         // start finds servers — the cache learning is visible live. One icon
-        // vocabulary for both rows, sized for phone-width screens:
-        // ✓ confirmed server (CL: proven LC · EL: snap-ok), ✕ confirmed not
-        // (nolc / snap-bad), ? untried.
+        // vocabulary for both groups, sized for phone-width screens:
+        // ✓ confirmed server (EL: snap-ok · CL: proven LC), ✕ confirmed not
+        // (snap-bad / nolc), ? untried.
         // The derived untried bucket can't go negative from ONE CacheFileStats
         // parse (buckets are mutually exclusive per line), but coerce anyway so
         // a future host feeding these fields from another source can't render
         // "?-3".
         StatusRow(
-            "CL cache",
-            "${s.clCachedPeers} · ✓${s.clCachedProven} ✕${s.clCachedNolc} " +
-                "?${(s.clCachedPeers - s.clCachedProven - s.clCachedNolc).coerceAtLeast(0)}",
-            help = StatusHelp.CL_CACHE,
-        )
-        StatusRow(
-            "EL cache",
+            "Cache",
             "${s.elCachedPeers} · ✓${s.elCachedSnapOk} ✕${s.elCachedSnapBad} " +
                 "?${(s.elCachedPeers - s.elCachedSnapOk - s.elCachedSnapBad).coerceAtLeast(0)}",
             help = StatusHelp.EL_CACHE,
+            title = "EL cache",
         )
         // What peers ask US for: demand for our served headers/blocks, and how often we
         // could answer. Bodies-served stays 0 (light client; prompt empty replies).
@@ -1148,24 +1293,48 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
             "${s.peerBodyRequests} · served ${s.peerBodyRequestsServed}",
             help = StatusHelp.BLK_ASKS,
         )
+        StatusRow("Discovered", s.discoveredPeers.toString(), help = StatusHelp.DISCOVERED)
+        StatusRow("In backoff", s.backedOffPeers.toString(), help = StatusHelp.IN_BACKOFF)
+        StatusRow("Blacklisted", s.blacklistedPeers.toString(), help = StatusHelp.BLACKLISTED)
+
+        // CL — the libp2p side: light-client servers, their cache, the discv5
+        // table. The header shows "served N/min" rather than a connection
+        // count: CL connections are short-lived, so "con" is usually 0 and
+        // says nothing about whether the node is being served.
+        PeerGroupHeader(peerGroupTitle("CL", "served ${s.clServedPeersLastMin}/min", s.clCachedPeers))
+        StatusRow(
+            "Peers",
+            "served ${s.clServedPeersLastMin}/min, con ${s.clConnectedPeers}",
+            help = StatusHelp.CL_PEERS,
+            title = "CL peers",
+        )
+        StatusRow(
+            "Cache",
+            "${s.clCachedPeers} · ✓${s.clCachedProven} ✕${s.clCachedNolc} " +
+                "?${(s.clCachedPeers - s.clCachedProven - s.clCachedNolc).coerceAtLeast(0)}",
+            help = StatusHelp.CL_CACHE,
+            title = "CL cache",
+        )
+        StatusRow("Discv5 peers", s.discv5Peers.toString(), help = StatusHelp.DISCV5_PEERS)
+        // Close the CL group the way the headers open theirs, whether or not
+        // the Reads rows follow.
+        Spacer(Modifier.height(8.dp))
+
         // The read-fetch shadow cache (docs/read-stats.md): verified state
         // fetches this run, the share a sound cache keying would have served
         // (storage-root keyed slots, per-block accounts, content-addressed
         // code) with the storage time it would have saved, and how often a
         // value up to a minute old would still have been right. Rows appear
         // once the engine has observed a fetch; hidden on hosts that don't
-        // feed the JSON.
+        // feed the JSON. Not a peer group: these are about OUR reads.
         s.readStatsJson?.let(ReadStatsStatus::parse)?.takeIf(ReadStatsStatus::hasReads)?.let { rs ->
             StatusRow("Reads", ReadStatsStatus.fetchesLine(rs), help = StatusHelp.READS)
             StatusRow("Cacheable", ReadStatsStatus.cacheableLine(rs), help = StatusHelp.CACHEABLE)
             ReadStatsStatus.staleLine(rs)?.let {
                 StatusRow("Stale ≤60s ok", it, help = StatusHelp.STALE_OK)
             }
+            Spacer(Modifier.height(8.dp))
         }
-        StatusRow("Discovered", s.discoveredPeers.toString(), help = StatusHelp.DISCOVERED)
-        StatusRow("Discv5 peers", s.discv5Peers.toString(), help = StatusHelp.DISCV5_PEERS)
-        StatusRow("In backoff", s.backedOffPeers.toString(), help = StatusHelp.IN_BACKOFF)
-        StatusRow("Blacklisted", s.blacklistedPeers.toString(), help = StatusHelp.BLACKLISTED)
         // JSON-RPC listener: where a same-device client reaches this network's
         // verified endpoint — or why it can't (port squatted / bind failed).
         if (s.rpcPort > 0) {
@@ -1235,6 +1404,8 @@ private fun QueryTab(
     snap: NodeSnapshot?,
     network: String,
     history: QueryHistory,
+    // Expert mode opens the result card's raw rows by default.
+    expert: Boolean = false,
 ) {
     val scope = rememberCoroutineScope()
     val running = snap?.running == true
@@ -1246,11 +1417,21 @@ private fun QueryTab(
     var loadingMsg by remember(network) { mutableStateOf("Querying…") }
     var account by remember(network) { mutableStateOf<AccountResult?>(null) }
     var ens by remember(network) { mutableStateOf<EnsResult?>(null) }
+    var ensProfile by remember(network) { mutableStateOf<EnsProfile?>(null) }
+    var ensProfileError by remember(network) { mutableStateOf<String?>(null) }
+    var ensProfileLoading by remember(network) { mutableStateOf(false) }
+    var ensOwnership by remember(network) { mutableStateOf<EnsOwnership?>(null) }
+    // Both record reads came back (a host without an actual answers null, which counts).
+    var ensRecordsRead by remember(network) { mutableStateOf(false) }
+    // The on-demand records read in flight, so a new lookup cancels it and a superseded
+    // job never writes into the card of a later name (the scanJob pattern below).
+    var ensRecordsJob by remember(network) { mutableStateOf<Job?>(null) }
     var error by remember(network) { mutableStateOf<String?>(null) }
     // History is global (all chains); re-read the local snapshot after each add/clear. Start empty
     // and load off the main thread (entries() reads a file) so composition never blocks on disk.
+    // Keyed on `network` like the state it fills: a chain switch resets the list, so reload it.
     var historyList by remember(network) { mutableStateOf<List<QueryHistoryEntry>>(emptyList()) }
-    LaunchedEffect(Unit) { historyList = withContext(Dispatchers.Default) { history.entries() } }
+    LaunchedEffect(network) { historyList = withContext(Dispatchers.Default) { history.entries() } }
 
     // --- Transaction-history scan state (TrueBlocks index; desktop-mainnet-only hosts). ---
     // Keys arrive in stream order (newest chunk first); a null row = placeholder still
@@ -1317,6 +1498,8 @@ private fun QueryTab(
         if (q.isEmpty() || loading) return
         input = q
         loading = true; error = null; account = null; ens = null
+        ensRecordsJob?.cancel(); ensRecordsJob = null
+        ensProfile = null; ensProfileError = null; ensProfileLoading = false; ensOwnership = null; ensRecordsRead = false
         scope.launch {
             try {
                 if (looksLikeEnsName(q)) {
@@ -1378,6 +1561,9 @@ private fun QueryTab(
             label = { Text(if (ensCapable) "Address (0x…) or ENS name" else "Address (0x…)") },
             singleLine = true,
             enabled = !loading,
+            // The keyboard's search key runs the lookup, like the button below.
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+            keyboardActions = KeyboardActions(onSearch = { if (running) run(input) }),
             modifier = Modifier.fillMaxWidth(),
         )
         if (!ensCapable) {
@@ -1397,8 +1583,49 @@ private fun QueryTab(
         Spacer(Modifier.height(16.dp))
 
         // The resolved-ENS panel stays visible while the account verifies (and even if it fails).
-        ens?.let {
-            EnsResultView(it)
+        ens?.let { e ->
+            EnsResultView(
+                e, ensProfile, ensProfileError, ensProfileLoading, ensOwnership, ensRecordsRead,
+                // The records beyond the address and who holds the name, on demand and
+                // side by side — a name without an address can still carry both. Their
+                // failures show on the card, never as the query's error.
+                onReadRecords = {
+                    ensRecordsJob?.cancel()
+                    ensProfileLoading = true; ensProfileError = null; ensOwnership = null; ensRecordsRead = false
+                    // Started lazily so the ownership check below sees THIS job even when the
+                    // host answers without suspending (a dispatcher that runs it inline).
+                    val job = scope.launch(start = CoroutineStart.LAZY) {
+                        // A later lookup or click cancelled and replaced this job; only the
+                        // job the card still owns may fill it.
+                        val mine = { ensRecordsJob === coroutineContext[Job] }
+                        try {
+                            coroutineScope {
+                                val records = async { runCatching { controller.resolveEnsProfile(network, e.name) } }
+                                val holder = async { runCatching { controller.resolveEnsOwnership(network, e.name) } }
+                                records.await()
+                                    .onSuccess { if (mine()) ensProfile = it }
+                                    .onFailure {
+                                        if (it is CancellationException) throw it
+                                        if (mine()) ensProfileError = it.message ?: it.toString()
+                                    }
+                                holder.await()
+                                    .onSuccess { if (mine()) ensOwnership = it }
+                                    .onFailure {
+                                        if (it is CancellationException) throw it
+                                        if (mine()) {
+                                            ensOwnership = EnsOwnership(e.name, null, null, false, null, -1, -1, -1, false, it.message ?: it.toString())
+                                        }
+                                    }
+                            }
+                            if (mine()) ensRecordsRead = true
+                        } finally {
+                            if (mine()) ensProfileLoading = false
+                        }
+                    }
+                    ensRecordsJob = job
+                    job.start()
+                },
+            )
             Spacer(Modifier.height(12.dp))
         }
         when {
@@ -1408,7 +1635,7 @@ private fun QueryTab(
                 Text(loadingMsg)
             }
             error != null -> Text("Error: $error", color = MaterialTheme.colorScheme.error)
-            account != null -> AccountResultView(account!!)
+            account != null -> AccountResultView(account!!, nativeCurrencySymbol(network), expert)
         }
 
         // Transaction-history add-on (TrueBlocks Unchained Index): shown once an account
@@ -1491,7 +1718,7 @@ private fun QueryTab(
             }
         }
 
-        // Recent-query history: tap a row to re-run it (uses the stored input, not the label).
+        // Recent-query history: tap a card to re-run it (uses the stored input, not the label).
         if (historyList.isNotEmpty()) {
             Spacer(Modifier.height(20.dp))
             Row(
@@ -1508,33 +1735,81 @@ private fun QueryTab(
                     }
                 }) { Text("Clear") }
             }
-            historyList.forEach { e -> QueryHistoryRow(e, enabled = !loading, onClick = { run(e.input) }) }
+            // One card per past query, spaced apart. The ages tick: re-read the clock every
+            // 30 s, so a tab left open does not keep saying "just now".
+            var now by remember { mutableStateOf(nowEpochMillis()) }
+            LaunchedEffect(historyList) {
+                while (true) {
+                    now = nowEpochMillis()
+                    delay(30_000)
+                }
+            }
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                historyList.forEach { e ->
+                    // Same gate as Look up: a stopped node cannot answer a re-run either.
+                    QueryHistoryCard(e, nowMillis = now, enabled = running && !loading, onClick = { run(e.input) })
+                }
+            }
         }
     }
 }
 
-/** One tappable past-query row: the stored input, with the resolved label beneath when present. */
+/**
+ * One past query as a tappable card: the stored input, the resolved address beneath it
+ * when there is one (an ENS lookup), and how long ago it ran. Tapping re-runs the
+ * stored input, not the label.
+ */
 @Composable
-private fun QueryHistoryRow(e: QueryHistoryEntry, enabled: Boolean, onClick: () -> Unit) {
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .clickable(enabled = enabled, onClick = onClick)
-            .padding(vertical = 6.dp),
+private fun QueryHistoryCard(e: QueryHistoryEntry, nowMillis: Long, enabled: Boolean, onClick: () -> Unit) {
+    OutlinedCard(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = Modifier.fillMaxWidth().semantics { role = Role.Button },
     ) {
-        Text(
-            e.input,
-            fontFamily = FontFamily.Monospace, fontSize = 13.sp,
-            maxLines = 1, overflow = TextOverflow.Ellipsis,
-        )
-        if (e.label.isNotEmpty()) {
+        // A disabled card dims its content colour; the secondary lines follow it then rather than
+        // keep their own, so the whole card reads as disabled.
+        val secondary = if (enabled) MaterialTheme.colorScheme.onSurfaceVariant else LocalContentColor.current
+        Row(
+            Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    e.input,
+                    fontFamily = FontFamily.Monospace, fontSize = 13.sp,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                )
+                if (e.label.isNotEmpty()) {
+                    Text(
+                        e.label,
+                        fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+                        color = secondary,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            Spacer(Modifier.width(12.dp))
             Text(
-                e.label,
-                fontFamily = FontFamily.Monospace, fontSize = 11.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                historyAge(e.timestampMillis, nowMillis),
+                style = MaterialTheme.typography.labelSmall,
+                color = secondary,
             )
         }
+    }
+}
+
+/** The wall clock in epoch milliseconds; kotlin.time's Clock is @ExperimentalTime in the 2.2 stdlib. */
+@OptIn(kotlin.time.ExperimentalTime::class)
+private fun nowEpochMillis(): Long = Clock.System.now().toEpochMilliseconds()
+
+/** How long ago a past query ran, for its card: "just now", "5 min ago", "3 h ago", "2 d ago". */
+internal fun historyAge(thenMillis: Long, nowMillis: Long): String {
+    val sec = ((nowMillis - thenMillis) / 1000).coerceAtLeast(0)
+    return when {
+        sec < 60 -> "just now"
+        sec < 3_600 -> "${sec / 60} min ago"
+        sec < 86_400 -> "${sec / 3_600} h ago"
+        else -> "${sec / 86_400} d ago"
     }
 }
 
@@ -1599,7 +1874,7 @@ private fun TxScanInfoCaption(info: TxScanEvent.Started) {
         style = MaterialTheme.typography.bodySmall,
         // Amber when the CID didn't come from the live contract read (cached/hardcoded),
         // or when staleness can't be judged (no verified head to compare against).
-        color = if (degradedSource || info.headBlock == null) Color(0xFFF9A825)
+        color = if (degradedSource || info.headBlock == null) StatusColors.Amber
         else MaterialTheme.colorScheme.onSurfaceVariant,
     )
 }
@@ -1688,54 +1963,168 @@ private fun looksLikeEnsName(input: String): Boolean {
     return !s.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
 }
 
+/**
+ * A verified account, balance first: the address, the balance in the chain's native
+ * [currency] (or that there is no account yet), a verification badge, the two numbers
+ * a wallet user looks for, and the raw rows behind "Show raw details" — open from the
+ * start under [expert].
+ */
 @Composable
-private fun AccountResultView(a: AccountResult) {
+private fun AccountResultView(a: AccountResult, currency: String?, expert: Boolean) {
     val clipboard = LocalClipboardManager.current
+    var showRaw by remember(expert) { mutableStateOf(expert) }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    a.address,
+                    Modifier.weight(1f),
+                    fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.width(8.dp))
+                // One-tap copy of the FULL result (untruncated hex), for pasting into a block explorer.
+                OutlinedButton(onClick = { clipboard.setText(AnnotatedString(formatAccountResult(a, currency))) }) {
+                    Text("Copy")
+                }
+            }
+            // The numbers below are a peer's claim until the beacon chain vouches for them:
+            // an unverified result leads with the red pill and shows the balance muted, so
+            // the headline figure never looks more authoritative than it is.
+            val verified = a.beaconChainVerified
+            if (!verified) VerificationBadge(a)
+            if (a.exists) {
+                Column {
+                    // On mainnet the verified caption reads "Balance (ETH)" verbatim: the iOS
+                    // UI test (QueryFlowTests) waits for it.
+                    Text(
+                        if (verified) balanceCaption(currency) else "${balanceCaption(currency)} — unverified peer claim",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        formatNative(a.balanceWei),
+                        style = MaterialTheme.typography.headlineMedium,
+                        color = if (verified) Color.Unspecified else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else {
+                // Non-existence is a claim too — a peer hiding a balance would make exactly this one.
+                Text(
+                    if (verified) "No account at this address yet"
+                    else "No account at this address yet — unverified peer claim",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = if (verified) Color.Unspecified else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    if (verified) "Nothing has been sent to it on this chain, so there is no balance to show."
+                    else "A peer reports nothing has been sent to it; the node could not verify that yet.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (verified) VerificationBadge(a)
+            Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                // The nonce, in a wallet user's words — a contract's counts its creations.
+                // Muted with the balance while the result is a claim.
+                if (a.exists) ResultStat("Transactions sent (nonce)", a.nonce.toString(), muted = !verified)
+                // The block's age beneath its number, when the engine proved the
+                // block's timestamp (it does for a verified read of the attested block).
+                ResultStat(
+                    "Block", a.blockNumber.toString(), muted = !verified,
+                    detail = rememberBlockAge(a.blockTimestamp),
+                )
+            }
+            TextButton(onClick = { showRaw = !showRaw }) {
+                Text(if (showRaw) "Hide raw details" else "Show raw details")
+            }
+            if (showRaw) {
+                StatusRow("Address", a.address)
+                StatusRow("Exists", a.exists.toString())
+                if (a.exists) {
+                    StatusRow("Balance (wei)", a.balanceWei ?: "—")
+                    StatusRow("Nonce", a.nonce.toString())
+                    StatusRow("Storage root", a.storageRootHex ?: "—")
+                    StatusRow("Code hash", a.codeHashHex ?: "—")
+                }
+                StatusRow("Block", a.blockNumber.toString())
+                StatusRow("Proof valid", a.peerProofValid.toString())
+                // The verification verdict is the pill above; the raw rows don't repeat it.
+            }
+        }
+    }
+}
+
+/** A small labelled number on the result card; [muted] while the result is only a peer's claim. */
+@Composable
+private fun ResultStat(label: String, value: String, muted: Boolean, detail: String? = null) {
     Column {
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text("Result", style = MaterialTheme.typography.titleSmall)
-            // One-tap copy of the FULL result (untruncated hex), for pasting into a block explorer.
-            OutlinedButton(onClick = { clipboard.setText(AnnotatedString(formatAccountResult(a))) }) {
-                Text("Copy")
-            }
+        Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(
+            value,
+            style = MaterialTheme.typography.titleMedium,
+            color = if (muted) MaterialTheme.colorScheme.onSurfaceVariant else Color.Unspecified,
+        )
+        // A small line beneath the value, e.g. a block's age.
+        detail?.let {
+            Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        StatusRow("Address", a.address)
-        StatusRow("Exists", a.exists.toString())
-        if (a.exists) {
-            StatusRow("Balance (ETH)", formatEth(a.balanceWei))
-            StatusRow("Balance (wei)", a.balanceWei ?: "—")
-            StatusRow("Nonce", a.nonce.toString())
-            StatusRow("Storage root", a.storageRootHex ?: "—")
-            StatusRow("Code hash", a.codeHashHex ?: "—")
-        }
-        StatusRow("Block", a.blockNumber.toString())
-        StatusRow("Proof valid", a.peerProofValid.toString())
-        val badge = if (a.beaconChainVerified) {
-            buildString {
-                append("✓ ")
-                append(a.verifyMethod ?: "verified")
-                if (a.blsVerified) append(" (BLS)")
-            }
-        } else {
-            "✗ ${a.failReason ?: "unverified"}"
-        }
-        StatusRow(
-            "Verification",
-            badge,
-            color = if (a.beaconChainVerified) MaterialTheme.colorScheme.primary
-            else MaterialTheme.colorScheme.error,
+    }
+}
+
+/**
+ * The result's verification as a pill: green "Verified" with the method (and BLS when
+ * the match was signed), red "Unverified" with the ladder's fail reason. Nothing here
+ * is served unverified — a red pill leads the card and says a peer's claim could not be
+ * tied to the beacon chain, and the muted numbers below it are that claim.
+ */
+@Composable
+private fun VerificationBadge(a: AccountResult) {
+    val ok = a.beaconChainVerified
+    val color = if (ok) StatusColors.Green else StatusColors.Red
+    val text = if (ok) {
+        "✓ Verified" + (a.verifyMethod?.let { " · $it" } ?: "") + (if (a.blsVerified) " · BLS" else "")
+    } else {
+        "✗ Unverified · ${a.failReason ?: "unknown"}"
+    }
+    Surface(shape = RoundedCornerShape(50), color = color.copy(alpha = 0.15f)) {
+        Text(
+            text,
+            Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+            style = MaterialTheme.typography.labelLarge,
+            color = color,
         )
     }
 }
 
-/** Wei (decimal string) → ETH with 6 dp, truncated toward zero. Pure-Kotlin (commonMain has no
+/**
+ * The native currency a chain's balances are counted in, as a wallet shows it: xDAI on
+ * Gnosis Chain, ETH on mainnet and Sepolia (Sepolia's is test ether). Null for a network
+ * this table does not know, and the card then names no unit: a network added later reads
+ * "Balance" until it is listed here, never a wrong symbol. Every listed chain has 18
+ * decimals, which is what [formatNative] assumes; check that before listing a new one.
+ */
+internal fun nativeCurrencySymbol(network: String): String? = when (network) {
+    "mainnet", "sepolia" -> "ETH"
+    "gnosis" -> "xDAI"
+    else -> null
+}
+
+/** The balance caption: "Balance (ETH)", or just "Balance" when the unit is unknown. */
+internal fun balanceCaption(currency: String?): String =
+    if (currency != null) "Balance ($currency)" else "Balance"
+
+
+/** Wei (decimal string) → the native currency with 6 dp, truncated toward zero; 18 decimals
+ *  on every supported chain ([nativeCurrencySymbol]). Pure-Kotlin (commonMain has no
  *  java.math.BigDecimal): pad to ≥19 digits, split at the 18th from the right. Non-numeric input
  *  passes through unchanged. */
-private fun formatEth(weiDecimal: String?): String {
+private fun formatNative(weiDecimal: String?): String {
     if (weiDecimal == null) return "—"
     val neg = weiDecimal.startsWith("-")
     val digits = weiDecimal.trimStart('-')
@@ -1747,11 +2136,11 @@ private fun formatEth(weiDecimal: String?): String {
 }
 
 /** Full plaintext dump of an account result for the clipboard (untruncated hex). */
-private fun formatAccountResult(a: AccountResult): String = buildString {
+private fun formatAccountResult(a: AccountResult, currency: String?): String = buildString {
     appendLine("address: ${a.address}")
     appendLine("exists: ${a.exists}")
     if (a.exists) {
-        appendLine("balance (ETH): ${formatEth(a.balanceWei)}")
+        appendLine((if (currency != null) "balance ($currency)" else "balance") + ": ${formatNative(a.balanceWei)}")
         appendLine("balance (wei): ${a.balanceWei ?: "—"}")
         appendLine("nonce: ${a.nonce}")
         a.storageRootHex?.let { appendLine("storageRoot: $it") }
@@ -1771,8 +2160,19 @@ private fun formatAccountResult(a: AccountResult): String = buildString {
 }
 
 @Composable
-private fun EnsResultView(e: EnsResult) {
+private fun EnsResultView(
+    e: EnsResult,
+    profile: EnsProfile?,
+    profileError: String?,
+    profileLoading: Boolean,
+    ownership: EnsOwnership?,
+    recordsRead: Boolean,
+    onReadRecords: () -> Unit,
+) {
     val clipboard = LocalClipboardManager.current
+    val uriHandler = LocalUriHandler.current
+    val tz = remember { TimeZone.currentSystemDefault() }
+    var gatewayNote by remember(e.name) { mutableStateOf<String?>(null) }
     Column {
         Row(
             Modifier.fillMaxWidth(),
@@ -1786,7 +2186,16 @@ private fun EnsResultView(e: EnsResult) {
         }
         StatusRow("Name", e.name)
         StatusRow("Address", e.addressHex ?: "—")
-        StatusRow("Block", if (e.blockNumber >= 0) e.blockNumber.toString() else "—")
+        // The block's age next to its number, from the verified header the resolution ran against.
+        val age = rememberBlockAge(e.blockTimestamp)
+        StatusRow(
+            "Block",
+            when {
+                e.blockNumber < 0 -> "—"
+                age != null -> "${e.blockNumber} · $age"
+                else -> e.blockNumber.toString()
+            },
+        )
         StatusRow(
             "Verified",
             if (e.verified) "✓ finalized" else "unverified (peer head)",
@@ -1795,13 +2204,144 @@ private fun EnsResultView(e: EnsResult) {
         if (e.error != null) {
             StatusRow("Error", e.error, color = MaterialTheme.colorScheme.error)
         }
+        // The records beyond the address, on demand: the contenthash decoded (ipfs://, ipns://,
+        // bzz://) with a gateway link labelled for what it is — a third party, off the verified
+        // path — and the text records as key: value, selectable and never cut short; a record
+        // read from the peer head says so. One failure shared by every record is one line.
+        // Offered until both reads came back clean — a failed read keeps it, as the retry;
+        // a host without one of the actuals answers null, which is a read that came back.
+        val readable = !recordsRead || profileError != null || ownership?.error != null
+        if (e.error == null && readable) {
+            Spacer(Modifier.height(4.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedButton(enabled = !profileLoading, onClick = onReadRecords) { Text("Read records") }
+                Spacer(Modifier.width(8.dp))
+                if (profileLoading) {
+                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Reading records…", style = MaterialTheme.typography.bodySmall)
+                } else {
+                    HelpButton(
+                        "ENS records",
+                        "Reads who holds the name (registrant, manager, resolver, expiry and grace " +
+                            "period — the registry and the .eth registrar, seen through the NameWrapper), " +
+                            "the name's contenthash (ENSIP-7 — an IPFS, IPNS or Swarm pointer) and its " +
+                            "common text records (avatar, description, url, email, com.twitter, " +
+                            "com.github, org.telegram, com.discord), each verified against finalized " +
+                            "state where possible — a record served from the peer head is marked as " +
+                            "such. Every record is its own resolution, so this costs more than the " +
+                            "address lookup.",
+                    )
+                }
+            }
+        }
+        // Who holds the name: the registrant (the .eth token owner), the manager (the
+        // registry owner, who sets records and subnames), the resolver, and the term —
+        // with the grace period spelled out, since an expired name in it is still the
+        // registrant's to renew and nobody else's to register.
+        ownership?.let { o ->
+            when {
+                o.error != null -> StatusRow("Ownership", o.error, color = MaterialTheme.colorScheme.error)
+                // Under the default root a clean absence is answered from the peer head
+                // (a finalized "nothing" is retried there), so it carries the same caveat.
+                !o.known -> Column {
+                    Text("Nothing on chain for this name.", style = MaterialTheme.typography.labelSmall)
+                    if (!o.verified) Text("Ownership read from the peer head.", style = MaterialTheme.typography.labelSmall)
+                }
+                else -> SelectionContainer {
+                    Column {
+                        val style = MaterialTheme.typography.bodySmall
+                        o.registrantHex?.let { Text("Registrant: $it", style = style) }
+                        o.managerHex?.let { Text("Manager: $it" + if (o.wrapped) " (wrapped)" else "", style = style) }
+                        o.resolverHex?.let { Text("Resolver: $it", style = style) }
+                        if (o.expiresAt >= 0) {
+                            Text(ensExpiryLine(o.expiresAt, o.gracePeriodSeconds, nowSeconds(), tz), style = style)
+                        }
+                        if (!o.verified) Text("Ownership read from the peer head.", style = style)
+                    }
+                }
+            }
+        }
+        profile?.let { p ->
+            val peerHead = " (peer head)"
+            val common = p.records.map { it.error }.distinct().singleOrNull()
+            if (common != null && p.records.all { it.value == null }) {
+                StatusRow("Records", common, color = MaterialTheme.colorScheme.error)
+                return@let
+            }
+            val content = p.records.firstOrNull { it.key == ENS_CONTENTHASH_KEY }
+            val contentHex = content?.value
+            if (contentHex != null) {
+                val link = decodeContenthash(contentHex)
+                SelectionContainer {
+                    Text(
+                        "Content: " + (link?.uri ?: "undecoded $contentHex") + if (content.verified) "" else peerHead,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedButton(onClick = { clipboard.setText(AnnotatedString(link?.uri ?: contentHex)) }) {
+                        Text(if (link != null) "Copy link" else "Copy hex")
+                    }
+                    val gateway = ensGatewayUrl(e.name)
+                    if (link != null && gateway != null) {
+                        OutlinedButton(onClick = {
+                            // A browser launch can throw (no handler for https on this host);
+                            // the link on the clipboard is the fallback, said in one line.
+                            runCatching { uriHandler.openUri(gateway) }.onFailure {
+                                clipboard.setText(AnnotatedString(gateway))
+                                gatewayNote = "Could not open a browser — $gateway is on the clipboard."
+                            }
+                        }) { Text("Open via eth.limo") }
+                        HelpButton(
+                            "eth.limo",
+                            "Opens $gateway — eth.limo is a THIRD-PARTY gateway that resolves the name " +
+                                "itself and serves the content over HTTPS. What the browser shows is " +
+                                "not verified by this node: compare it with the content link above, " +
+                                "which is.",
+                        )
+                    }
+                }
+                gatewayNote?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error) }
+            } else if (content?.error != null) {
+                StatusRow("Content", content.error, color = MaterialTheme.colorScheme.error)
+            }
+            val texts = p.records.filter { it.key != ENS_CONTENTHASH_KEY && (it.value != null || it.error != null) }
+            if (texts.isNotEmpty()) {
+                SelectionContainer {
+                    Column {
+                        texts.forEach { r ->
+                            val v = r.value
+                            if (v != null) {
+                                Text("${r.key}: $v" + if (r.verified) "" else peerHead, style = MaterialTheme.typography.bodySmall)
+                            } else {
+                                Text("${r.key}: ${r.error}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                            }
+                        }
+                    }
+                }
+            }
+            if (contentHex == null && content?.error == null && texts.isEmpty()) {
+                Text("No records beyond the address.", style = MaterialTheme.typography.labelSmall)
+            }
+        }
+        profileError?.let { StatusRow("Records", it, color = MaterialTheme.colorScheme.error) }
     }
 }
 
 /** A Status-tab row: label, value, and — when [help] is given — a "ⓘ" hint. Nothing else
- *  in a row is interactive, so the whole row is the tap target for the explanation. */
+ *  in a row is interactive, so the whole row is the tap target for the explanation. The
+ *  help dialog is titled [title], which defaults to the row's own label; a row whose
+ *  label is only meaningful under its group header ("Peers" under "EL · …") passes the
+ *  qualified name so the dialog can stand on its own. */
 @Composable
-private fun StatusRow(key: String, value: String, help: String? = null, color: Color? = null) {
+private fun StatusRow(
+    key: String,
+    value: String,
+    help: String? = null,
+    color: Color? = null,
+    title: String = key,
+) {
     var showHelp by remember { mutableStateOf(false) }
     // The row's own text names it for screen readers; the click label names the action.
     val tappable = if (help == null) Modifier else Modifier.clickable(
@@ -1812,7 +2352,16 @@ private fun StatusRow(key: String, value: String, help: String? = null, color: C
         Row(Modifier.width(160.dp)) {
             // weight(1f) reserves the badge's own width first, so a long label truncates
             // instead of the two overflowing the 160dp column into the value's Text.
-            Text(key, Modifier.weight(1f, fill = false), maxLines = 1, overflow = TextOverflow.Ellipsis)
+            // A row whose label repeats across groups ("Peers") is announced by its
+            // qualified title, so a screen reader hears the layer the eye gets
+            // from the header above.
+            val named = if (title == key) Modifier else Modifier.semantics { contentDescription = title }
+            Text(
+                key,
+                Modifier.weight(1f, fill = false).then(named),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
             if (help != null) HelpGlyph(Modifier.padding(start = 4.dp))
         }
         Text(
@@ -1822,7 +2371,7 @@ private fun StatusRow(key: String, value: String, help: String? = null, color: C
             overflow = TextOverflow.Ellipsis,
         )
     }
-    if (showHelp && help != null) HelpDialog(key, help) { showHelp = false }
+    if (showHelp && help != null) HelpDialog(title, help) { showHelp = false }
 }
 
 /** A standalone "ⓘ" for items whose own tap is already an action (the buttons). */
@@ -1860,7 +2409,31 @@ private fun HelpDialog(title: String, help: String, onDismiss: () -> Unit) {
 }
 
 /**
- * The "EL peers" row's value: `ready · snap M · serving K`, with the number of
+ * A peer group's header on the Status tab: `EL · 12 peers · 96 cache` /
+ * `CL · served 2/min · 3 cache`. [peers] is the group's live-peer phrase as
+ * the caller words it (the EL side counts ready pool peers — [elPeersPhrase] —
+ * the CL side counts servers that answered in the last minute), [cache] the
+ * on-disk peer-cache total — the same number the group's Cache row starts with.
+ */
+internal fun peerGroupTitle(layer: String, peers: String, cache: Int): String =
+    "$layer · $peers · $cache cache"
+
+/** The EL header's peer phrase: `12 peers`, `0 peers` — and `1 peer`, a common
+ *  state on phones (snap target 3, pools often at 1–2). */
+internal fun elPeersPhrase(ready: Int): String = "$ready ${if (ready == 1) "peer" else "peers"}"
+
+/** The header above a Status-tab peer group (see [peerGroupTitle]). A semantics
+ *  heading, so a screen-reader user exploring the rows underneath — which say
+ *  just "Peers" / "Cache" — can navigate by headings to learn the layer. */
+@Composable
+private fun PeerGroupHeader(title: String) {
+    Spacer(Modifier.height(8.dp))
+    Text(title, Modifier.semantics { heading() }, style = MaterialTheme.typography.titleSmall)
+    Spacer(Modifier.height(2.dp))
+}
+
+/**
+ * The EL group's "Peers" row value: `ready · snap M · serving K`, with the number of
  * serving peers connected over snap/2 (EIP-8189) in parentheses after K —
  * "serving 8 (3)". No parentheses while none of them is on snap/2, so a pool that
  * is all snap/1 reads exactly as it did before snap/2 existed.
@@ -1888,10 +2461,11 @@ private object StatusHelp {
         "(~64–96 blocks on mainnet) on a healthy node."
     const val LOG_INDEX = "Log index backfill progress, e.g. \"12,041 logs · " +
         "5,594,611–8,461,900\", or \"backfilling\". Shown only when the log index feature applies."
-    const val TOR = "Desktop only, and only with the Rust engine on a -PtorEngine build. " +
-        "Scope: only account (balance/nonce) reads route over Tor today — storage/token reads, " +
-        "eth_call/gas estimation, tx broadcast, the CL fetch, and discovery still leave from " +
-        "your real IP."
+    const val TOR = "Desktop and Android, and only with the Rust engine on a -PtorEngine build. " +
+        "Scope: account (balance/nonce) reads and the broadcast of your transactions route over " +
+        "Tor today — storage/token reads, eth_call/gas estimation, receipt polling, the CL " +
+        "fetch, and discovery still leave from your real IP. The Logs tab shows one \"tor:\" " +
+        "line per read and per send."
     const val CL_PEERS = "\"served N/min\" = distinct peers that answered a light-client " +
         "request in the last 60s. \"con N\" = currently-connected CL peers — usually near 0, " +
         "since connections are short-lived."
@@ -1942,6 +2516,16 @@ private object StatusHelp {
         "app-open wakes don't count). \"slept\" is the most recent time it went to sleep — " +
         "which can be AFTER this wake, if it's asleep again now."
 
+    const val READINESS = "The card's headline is the readiness ladder, worst first: Sleeping → " +
+        "No internet connection → Not running → Update required → Needs your decision → Syncing → " +
+        "Almost ready → Ready. \"Ready\" means verified reads are being served; the strip above " +
+        "turns bright green once the peer pool is deep enough for heavy wallet screens too. " +
+        "\"Ready — log index catching up\" means reads work but log queries near the head are " +
+        "refused until the index has caught up. The tiles: Execution peers = peers that can " +
+        "answer a read right now, of all connected; Consensus = the beacon light client's state " +
+        "and how many servers answered in the last minute; Verified head = how old the head your " +
+        "answers come from is (fresh under 45 s); Log index (if enabled) = whether it serves at " +
+        "the head — an incomplete history is noted, but does not affect readiness."
     const val START_STOP = "Runtime-only start/stop — independent of the network's enabled " +
         "switch in Settings. Exception: starting a disabled network also enables it, so a " +
         "cold host has something to boot next time."
@@ -1957,7 +2541,8 @@ private object StatusHelp {
 /**
  * Live log viewer over [LogSource]: poll the cheap version counter and re-snapshot only on
  * change; filter by substring on tag/message; auto-follow the tail unless the user scrolls up;
- * copy the visible lines or clear the ring. Mirrors the Android Logs tab.
+ * copy the newest visible lines that fit [LOG_COPY_BUDGET_CHARS] ([copyNewest]), save the whole
+ * log through the host ([LogSource.saveLog]), or clear the ring. Mirrors the Android Logs tab.
  */
 @Composable
 private fun LogsTab(logs: LogSource, filter: String, onFilterChange: (String) -> Unit) {
@@ -1968,6 +2553,10 @@ private fun LogsTab(logs: LogSource, filter: String, onFilterChange: (String) ->
     var shown by remember { mutableStateOf<List<LogLine>>(emptyList()) }
     var lastVersion by remember { mutableStateOf(-1L) }
     var level by remember(logs) { mutableStateOf(logs.level()) }
+    // One line under the buttons about the last Copy / Save: what the copy holds (and that it
+    // was cut), or where the host put the file.
+    var exportNote by remember { mutableStateOf<String?>(null) }
+    var saving by remember { mutableStateOf(false) }
 
     // Poll the cheap version counter; the O(n) snapshot of up to 50k lines runs off the main
     // thread so it can't jank the UI.
@@ -2067,15 +2656,49 @@ private fun LogsTab(logs: LogSource, filter: String, onFilterChange: (String) ->
             Spacer(Modifier.width(8.dp))
             OutlinedButton(onClick = {
                 scope.launch {
-                    // Formatting up to 50k lines also goes off the main thread.
-                    val text = withContext(Dispatchers.Default) { formatLogs(shown, tz) }
-                    clipboard.setText(AnnotatedString(text))
+                    // Formatting goes off the main thread. The copy is the NEWEST shown lines
+                    // that fit the budget, behind a note when it had to cut — a paste of the
+                    // whole ring loses its tail wherever it lands (see LOG_COPY_BUDGET_CHARS).
+                    val copy = withContext(Dispatchers.Default) { copyNewest(shown, tz, logs.canSaveLog) }
+                    clipboard.setText(AnnotatedString(copy.text))
+                    exportNote = copy.status()
                 }
             }) { Text("Copy") }
+            if (logs.canSaveLog) {
+                Spacer(Modifier.width(4.dp))
+                // The whole log, through the host: its on-disk file where it keeps one, else
+                // the unfiltered ring, streamed. The ring is snapshotted when the host writes,
+                // not at the click: nothing big is held while the host's picker is open, and
+                // the file holds what was logged up to the write. The host answers with one
+                // line, maybe from a worker thread; a host that throws instead is reported the
+                // same way, so the button never stays disabled. The label stays put while
+                // disabled — a wider "Saving…" would reflow the row at phone width.
+                OutlinedButton(
+                    enabled = !saving,
+                    onClick = {
+                        saving = true
+                        exportNote = null
+                        val started = runCatching {
+                            logs.saveLog(
+                                suggestedLogFileName(tz),
+                                { sink -> formatLogsTo(sink, logs.snapshot(), tz) },
+                            ) { line ->
+                                exportNote = line
+                                saving = false
+                            }
+                        }.getOrElse {
+                            exportNote = "Save failed: ${it.message ?: it::class.simpleName}"
+                            false
+                        }
+                        if (!started) saving = false
+                    },
+                ) { Text("Save…") }
+            }
             Spacer(Modifier.width(4.dp))
             // Clearing empties the ring — tail-follow the fresh lines that come after.
             OutlinedButton(onClick = { logs.clear(); follow = true }) { Text("Clear") }
         }
+        exportNote?.let { Text(it, style = MaterialTheme.typography.labelSmall) }
         Spacer(Modifier.height(4.dp))
         // Capture level: lower it (e.g. DEBUG) to surface the chatty wire / peer-churn lines,
         // raise it to quiet the log. Applies to capture (logs.setLevel) AND hides already-captured
@@ -2138,13 +2761,6 @@ private fun logLevelRank(c: Char): Int = when (c) {
     else -> 0   // 'D' and 'V'
 }
 
-private fun formatLogs(lines: List<LogLine>, tz: TimeZone): String = buildString {
-    for (l in lines) {
-        append(formatLogTime(l.timestampMillis, tz)).append(' ').append(l.level)
-        append(' ').append(l.tag).append(": ").append(l.message).append('\n')
-    }
-}
-
 /** Compact elapsed duration: "45s" / "3m 12s" / "1h 3m". */
 private fun formatDuration(ms: Long): String {
     val totalSec = ms / 1000
@@ -2164,17 +2780,9 @@ private fun formatDuration(ms: Long): String {
 private fun formatDateTime(ms: Long, tz: TimeZone): String =
     Instant.fromEpochMilliseconds(ms).toLocalDateTime(tz).toString().take(16).replace('T', ' ')
 
-/** HH:mm:ss.SSS in [tz] (matches the logback console/file pattern). */
-// kotlin.time.Instant (used by kotlinx-datetime 0.7.x on every target) is still
-// @ExperimentalTime in the 2.2 stdlib.
+/** Wall-clock seconds, for a term's "in N days" on the ENS card. */
 @OptIn(kotlin.time.ExperimentalTime::class)
-private fun formatLogTime(ms: Long, tz: TimeZone): String {
-    val dt = Instant.fromEpochMilliseconds(ms).toLocalDateTime(tz)
-    fun p2(n: Int) = n.toString().padStart(2, '0')
-    fun p3(n: Int) = n.toString().padStart(3, '0')
-    return "${p2(dt.hour)}:${p2(dt.minute)}:${p2(dt.second)}.${p3(dt.nanosecond / 1_000_000)}"
-}
-
+private fun nowSeconds(): Long = kotlin.time.Clock.System.now().epochSeconds
 
 /** The confirm button of the Index tab's remove dialog — every row's own button reads "Remove" too. */
 internal const val INDEX_REMOVE_CONFIRM_TAG = "index-remove-confirm"

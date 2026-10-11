@@ -37,6 +37,33 @@ const REGISTRY: [u8; 20] = [
 /// `IExtendedResolver` (ENSIP-10 wildcard) ERC-165 interface id.
 const EXTENDED_RESOLVER_INTERFACE_ID: [u8; 4] = [0x90, 0x61, 0xb9, 0x23];
 
+/// The `.eth` BaseRegistrar (ERC-721 of the second-level names), the same
+/// address on mainnet and Sepolia (verified against both chains' `ens()`):
+/// `0x57f1887a8BF19b14fC0dF6Fd9B2acc9Af147eA85`.
+const BASE_REGISTRAR: [u8; 20] = [
+    0x57, 0xf1, 0x88, 0x7a, 0x8b, 0xf1, 0x9b, 0x14, 0xfc, 0x0d, 0xf6, 0xfd, 0x9b, 0x2a, 0xcc, 0x9a,
+    0xf1, 0x47, 0xea, 0x85,
+];
+
+/// The NameWrapper per chain — the ERC-1155 a wrapped name's registry owner
+/// points at; its `ownerOf(uint256(node))` is the user behind it. Verified by
+/// each contract's `ens()` / `registrar()` answers. None on a chain without one.
+/// Mainnet `0xD4416b13d2b3a9aBae7AcD5D6C2BbDBE25686401`, Sepolia
+/// `0x0635513f179D50A207757E05759CbD106d7dFcE8`.
+fn name_wrapper(chain_id: u64) -> Option<[u8; 20]> {
+    match chain_id {
+        1 => Some([
+            0xd4, 0x41, 0x6b, 0x13, 0xd2, 0xb3, 0xa9, 0xab, 0xae, 0x7a, 0xcd, 0x5d, 0x6c, 0x2b,
+            0xbd, 0xbe, 0x25, 0x68, 0x64, 0x01,
+        ]),
+        11155111 => Some([
+            0x06, 0x35, 0x51, 0x3f, 0x17, 0x9d, 0x50, 0xa2, 0x07, 0x75, 0x7e, 0x05, 0x75, 0x9c,
+            0xbd, 0x10, 0x6d, 0x7d, 0xfc, 0xe8,
+        ]),
+        _ => None,
+    }
+}
+
 /// The ERC-3668 `OffchainLookup(address,string[],bytes,bytes4,bytes)` revert
 /// selector — an offchain (CCIP-Read) name announcing itself.
 const OFFCHAIN_LOOKUP_SELECTOR: [u8; 4] = [0x55, 0x6f, 0x18, 0x30];
@@ -101,6 +128,30 @@ impl std::fmt::Display for EnsError {
 
 impl std::error::Error for EnsError {}
 
+/// Who holds a name and for how long — the registry and, for a `.eth`
+/// second-level name, the BaseRegistrar, read directly (no resolver involved).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnsOwnership {
+    /// The `.eth` registrant: the BaseRegistrar's token owner, seen through the
+    /// NameWrapper when it holds the token. None for a subname, an unregistered
+    /// name, or an expired one (`ownerOf` reverts from the expiry on, grace
+    /// period included).
+    pub registrant: Option<[u8; 20]>,
+    /// The manager: the registry owner, seen through the NameWrapper when the
+    /// name is wrapped. None when the registry holds no owner.
+    pub manager: Option<[u8; 20]>,
+    /// The registry owner is this chain's NameWrapper.
+    pub wrapped: bool,
+    /// The registry's resolver for the exact name (no parent walk), if any.
+    pub resolver: Option<[u8; 20]>,
+    /// `nameExpires` (unix seconds) for a `.eth` second-level name; None for a
+    /// subname or an unregistered name.
+    pub expires_at: Option<u64>,
+    /// The registrar's `GRACE_PERIOD` (seconds past `expires_at` in which only
+    /// the registrant may renew), read alongside `expires_at`.
+    pub grace_period: Option<u64>,
+}
+
 /// The verified-`eth_call` capability the resolver reads through. Implemented for
 /// the real [`EvmExecutor`] via [`ExecutorCaller`]; mocked in tests.
 pub trait EthCaller {
@@ -145,6 +196,97 @@ pub fn resolve_address(
     // than the Java decoder (a dirty upper-12-byte word → None rather than
     // slicing the trailing 20) — deliberately fail-safe for a fund-destination.
     Ok(decode_address_answer(&raw))
+}
+
+/// Read who holds `name`: the registry's `owner(node)` and `resolver(node)`,
+/// then for a `.eth` second-level name the BaseRegistrar's `ownerOf`,
+/// `nameExpires` and `GRACE_PERIOD`, each unwrapped through this chain's
+/// NameWrapper where it is the holder. `Ok(None)` = nothing on chain for the
+/// name (no registry owner or resolver, no registrar token, no expiry). A
+/// reverting `ownerOf` (an expired or never registered token) is "no
+/// registrant", never an error. The name is validated and hashed exactly as the
+/// record reads validate and hash it (`dns_encode`, `namehash`), so this read
+/// and the record reads of one input answer about the same node.
+/// On a chain without a known NameWrapper a wrapped name's holders read as the
+/// wrapper contract itself and `wrapped` stays false — the chain's own answer.
+pub fn resolve_ownership(
+    caller: &dyn EthCaller,
+    name: &str,
+    chain_id: u64,
+) -> Result<Option<EnsOwnership>, EnsError> {
+    // The record reads' own validation (an empty label, more than one trailing dot)
+    // and their node: namehash lowercases as it hashes, and keeps a trailing dot as
+    // an empty label — so "x.eth." is the three-label node the records look at, not
+    // the 2LD's, and the registrar is asked only for a two-label .eth name.
+    dns_encode(name)?;
+    let lower = name.to_lowercase();
+    let labels: Vec<&str> = lower.split('.').collect();
+    let node = namehash(name);
+    let wrapper = name_wrapper(chain_id);
+
+    let owner = call_address(caller, REGISTRY, &abi::encode_call_bytes32("owner(bytes32)", &node))?;
+    let resolver =
+        call_address(caller, REGISTRY, &abi::encode_call_bytes32("resolver(bytes32)", &node))?;
+    let wrapped = matches!((owner, wrapper), (Some(o), Some(w)) if o == w);
+    let manager = match (wrapped, wrapper) {
+        (true, Some(w)) => {
+            call_address(caller, w, &abi::encode_call_bytes32("ownerOf(uint256)", &node))?
+        }
+        _ => owner,
+    };
+
+    let (registrant, expires_at, grace_period) = if labels.len() == 2 && labels[1] == "eth" {
+        let label_hash = myotis_core::keccak::keccak256(labels[0].as_bytes());
+        let token_owner = call_address(
+            caller,
+            BASE_REGISTRAR,
+            &abi::encode_call_bytes32("ownerOf(uint256)", &label_hash),
+        )?;
+        let registrant = match (token_owner, wrapper) {
+            (Some(t), Some(w)) if t == w => manager,
+            (other, _) => other,
+        };
+        let expires = call_u64(
+            caller,
+            BASE_REGISTRAR,
+            &abi::encode_call_bytes32("nameExpires(uint256)", &label_hash),
+        )?
+        .filter(|e| *e > 0);
+        let grace = match expires {
+            Some(_) => call_u64(caller, BASE_REGISTRAR, &abi::encode_call_no_args("GRACE_PERIOD()"))?,
+            None => None,
+        };
+        (registrant, expires, grace)
+    } else {
+        (None, None, None)
+    };
+
+    if owner.is_none() && resolver.is_none() && registrant.is_none() && expires_at.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(EnsOwnership { registrant, manager, wrapped, resolver, expires_at, grace_period }))
+}
+
+/// One `address`-returning view: the zero address and a revert are both "none".
+fn call_address(
+    caller: &dyn EthCaller,
+    target: [u8; 20],
+    call: &[u8],
+) -> Result<Option<[u8; 20]>, EnsError> {
+    match caller.eth_call(target, call) {
+        Ok(out) => Ok(abi::decode_address(&out).filter(|a| a != &[0u8; 20])),
+        Err(EvmError::Reverted { .. }) => Ok(None),
+        Err(e) => Err(EnsError::Call(e)),
+    }
+}
+
+/// One `uint256`-returning view that must fit a `u64`; a revert is "none".
+fn call_u64(caller: &dyn EthCaller, target: [u8; 20], call: &[u8]) -> Result<Option<u64>, EnsError> {
+    match caller.eth_call(target, call) {
+        Ok(out) => Ok(abi::decode_u64(&out)),
+        Err(EvmError::Reverted { .. }) => Ok(None),
+        Err(e) => Err(EnsError::Call(e)),
+    }
 }
 
 /// Resolve a `text(bytes32,string)` record. `Ok(None)` = no record (absent
@@ -1094,5 +1236,137 @@ mod tests {
             reverse_name([0xd8; 20]),
             format!("{}.addr.reverse", "d8".repeat(20))
         );
+    }
+
+    // ---- ownership ----
+
+    const USER: [u8; 20] = [0x51; 20];
+    const WRAPPER_MAINNET: [u8; 20] = [
+        0xd4, 0x41, 0x6b, 0x13, 0xd2, 0xb3, 0xa9, 0xab, 0xae, 0x7a, 0xcd, 0x5d, 0x6c, 0x2b, 0xbd,
+        0xbe, 0x25, 0x68, 0x64, 0x01,
+    ];
+
+    fn u64_word(v: u64) -> Vec<u8> {
+        let mut w = vec![0u8; 32];
+        w[24..].copy_from_slice(&v.to_be_bytes());
+        w
+    }
+
+    /// The registry's owner/resolver answers for every node, plus the registrar's
+    /// `ownerOf` / `nameExpires` / `GRACE_PERIOD` as given (`ownerOf` None = revert).
+    fn ownership_caller(
+        owner: [u8; 20],
+        token_owner: Option<[u8; 20]>,
+        expires: u64,
+    ) -> MockCaller {
+        ownership_caller_with_resolver(owner, RESOLVER, token_owner, expires)
+    }
+
+    fn ownership_caller_with_resolver(
+        owner: [u8; 20],
+        resolver: [u8; 20],
+        token_owner: Option<[u8; 20]>,
+        expires: u64,
+    ) -> MockCaller {
+        let owner_sel = abi::selector("owner(bytes32)");
+        let resolver_sel = abi::selector("resolver(bytes32)");
+        let owner_of_sel = abi::selector("ownerOf(uint256)");
+        let expires_sel = abi::selector("nameExpires(uint256)");
+        let grace_sel = abi::selector("GRACE_PERIOD()");
+        MockCaller::new()
+            .on(move |t, cd| (t == REGISTRY && sel(cd) == owner_sel).then(|| Ok(addr_word(owner))))
+            .on(move |t, cd| (t == REGISTRY && sel(cd) == resolver_sel).then(|| Ok(addr_word(resolver))))
+            .on(move |t, cd| {
+                (t == BASE_REGISTRAR && sel(cd) == owner_of_sel)
+                    .then(|| token_owner.map(addr_word).ok_or(EvmError::Reverted { data: vec![] }))
+            })
+            .on(move |t, cd| (t == BASE_REGISTRAR && sel(cd) == expires_sel).then(|| Ok(u64_word(expires))))
+            .on(move |t, cd| (t == BASE_REGISTRAR && sel(cd) == grace_sel).then(|| Ok(u64_word(7_776_000))))
+            // The NameWrapper's ownerOf(uint256(node)) → the user behind a wrapped name.
+            .on(move |t, cd| (t == WRAPPER_MAINNET && sel(cd) == owner_of_sel).then(|| Ok(addr_word(USER))))
+    }
+
+    #[test]
+    fn ownership_of_an_unwrapped_eth_name() {
+        let caller = ownership_caller(USER, Some(USER), 1_823_155_031);
+        let o = resolve_ownership(&caller, "Myotis.eth", 1).unwrap().unwrap();
+        assert_eq!(o.registrant, Some(USER));
+        assert_eq!(o.manager, Some(USER));
+        assert!(!o.wrapped);
+        assert_eq!(o.resolver, Some(RESOLVER));
+        assert_eq!(o.expires_at, Some(1_823_155_031));
+        assert_eq!(o.grace_period, Some(7_776_000));
+    }
+
+    #[test]
+    fn ownership_of_a_wrapped_eth_name_is_seen_through_the_wrapper() {
+        // Registry owner and registrar token owner are both the NameWrapper; the
+        // wrapper's own ownerOf(node) names the user.
+        let caller = ownership_caller(WRAPPER_MAINNET, Some(WRAPPER_MAINNET), 1_823_155_031);
+        let o = resolve_ownership(&caller, "myotis.eth", 1).unwrap().unwrap();
+        assert!(o.wrapped);
+        assert_eq!(o.manager, Some(USER));
+        assert_eq!(o.registrant, Some(USER));
+        // On a chain without a known wrapper the same answers are taken as they are.
+        let o = resolve_ownership(&caller, "myotis.eth", 17000).unwrap().unwrap();
+        assert!(!o.wrapped);
+        assert_eq!(o.manager, Some(WRAPPER_MAINNET));
+        assert_eq!(o.registrant, Some(WRAPPER_MAINNET));
+    }
+
+    #[test]
+    fn a_subname_has_a_manager_but_no_registrar_entry() {
+        let caller = ownership_caller(USER, Some(USER), 1_823_155_031);
+        let o = resolve_ownership(&caller, "sub.myotis.eth", 1).unwrap().unwrap();
+        assert_eq!(o.manager, Some(USER));
+        assert_eq!(o.registrant, None);
+        assert_eq!(o.expires_at, None);
+        assert_eq!(o.grace_period, None);
+        // Only the registry was asked: owner + resolver.
+        assert_eq!(*caller.calls.borrow(), 2);
+    }
+
+    #[test]
+    fn an_expired_name_in_its_grace_period_keeps_its_expiry_but_no_registrant() {
+        // ownerOf reverts from the expiry on; the registry still lists the old owner.
+        let caller = ownership_caller(USER, None, 1_700_000_000);
+        let o = resolve_ownership(&caller, "myotis.eth", 1).unwrap().unwrap();
+        assert_eq!(o.registrant, None);
+        assert_eq!(o.manager, Some(USER));
+        assert_eq!(o.expires_at, Some(1_700_000_000));
+        assert_eq!(o.grace_period, Some(7_776_000));
+    }
+
+    #[test]
+    fn an_unregistered_name_is_none_and_a_malformed_name_an_error() {
+        let caller = ownership_caller_with_resolver([0u8; 20], [0u8; 20], None, 0);
+        assert_eq!(resolve_ownership(&caller, "nobody-has-this.eth", 1).unwrap(), None);
+        // What the record reads reject (dns_encode), this rejects.
+        assert!(matches!(resolve_ownership(&caller, "x..eth", 1), Err(EnsError::InvalidName(_))));
+        assert!(matches!(resolve_ownership(&caller, ".eth", 1), Err(EnsError::InvalidName(_))));
+        assert!(matches!(resolve_ownership(&caller, "x.eth..", 1), Err(EnsError::InvalidName(_))));
+    }
+
+    #[test]
+    fn a_name_whose_owner_was_burned_but_keeps_a_resolver_is_on_chain() {
+        // setOwner(node, 0) after setting the resolver — immutable records: the
+        // records still resolve, so "nothing on chain" would contradict them.
+        let caller = ownership_caller([0u8; 20], None, 0);
+        let o = resolve_ownership(&caller, "fixed.myotis.eth", 1).unwrap().unwrap();
+        assert_eq!(o.manager, None);
+        assert_eq!(o.registrant, None);
+        assert_eq!(o.resolver, Some(RESOLVER));
+        assert_eq!(o.expires_at, None);
+    }
+
+    #[test]
+    fn a_trailing_dot_is_the_records_three_label_node_not_the_2ld() {
+        // namehash("myotis.eth.") keeps the empty label, as the record reads do, so
+        // the registrar (two-label .eth names only) is not asked.
+        let caller = ownership_caller(USER, Some(USER), 1_823_155_031);
+        let o = resolve_ownership(&caller, "myotis.eth.", 1).unwrap().unwrap();
+        assert_eq!(o.registrant, None);
+        assert_eq!(o.expires_at, None);
+        assert_eq!(*caller.calls.borrow(), 2);
     }
 }

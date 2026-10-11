@@ -23,8 +23,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class PinnedNodeIdDerivationTest {
 
-    /** (pinned libp2p peer id, the ENR that node published on 2026-09-06 from behind the netcup relay). */
-    private static final String[][] ROOST_VECTORS = {
+    /**
+     * (pinned libp2p peer id, the ENR that node published from behind the netcup
+     * relay): the three roosts on 2026-09-06, and zbox's Sepolia Nimbus on
+     * 2026-10-09 — pinned again by then, so its targeted lookup matters too.
+     */
+    private static final String[][] PIN_VECTORS = {
+        { // sepolia, zbox's Nimbus v26.9.1: tcp 9104, quic 9001, cgc 4
+            "16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
+            "enr:-Mi4QLzAB7ygmO5xbfcHYrY9dgOQH9qRLMiJyFhma6VMHVrHHJfEpekRAXlpprYesWtJErn-64LmKrCJVgDQTBFCB8gDh2F0dG5ldHOIAIABAAAAAACDY2djBIRldGgykGaebBGQAAB2__________-CaWSCdjSCaXCEvEQgEINuZmSEAAAAAIRxdWljgiMpiXNlY3AyNTZrMaECELjyr6TBb-b-kUs_Z1JmJ5eLH1_DMQM3V9Y10gqt83GDdGNwgiOQg3VkcIIjkA"
+        },
         { // mainnet, tcp 9109
             "16Uiu2HAmAj4D6YGK1kvVL2ZtnoCjp3hdz3j6QLCNh6afhSuwYjLC",
             "enr:-KG4QKUnChEU8InNkAxOj6e_KZzebsvUQYJ850DJaEQAygKJb_8Y2Mv5IxDEOacUs0pkVctDN1f8CjrCfG7Vf2leulkIhGV0aDKQjJ9i_gYAAAD__________4JpZIJ2NIJpcIS8RCAQiXNlY3AyNTZrMaEC41NP_bzrL7-rq6KmsQIeTl2Nw9yvIlgEvz-Pjz2dwTmDdGNwgiOVg3VkcIIjlQ"
@@ -41,15 +49,15 @@ class PinnedNodeIdDerivationTest {
 
     @Test
     void derivedNodeIdMatchesThePublishedRecord() {
-        for (String[] vector : ROOST_VECTORS) {
+        for (String[] vector : PIN_VECTORS) {
             String peerId = vector[0];
             NodeRecord published = NodeRecordFactory.DEFAULT.fromEnr(vector[1]);
             Optional<Bytes> derived = Enr.nodeIdForPeerId(peerId);
             assertTrue(derived.isPresent(), peerId + ": derivation must succeed");
             assertEquals(published.getNodeId(), derived.get(),
                     peerId + ": derived discv5 node id != the published record's — "
-                    + "either the derivation drifted from the Rust twin or roost split "
-                    + "its libp2p and discv5 keys");
+                    + "either the derivation drifted from the Rust twin or the pinned "
+                    + "node split its libp2p and discv5 keys");
         }
     }
 

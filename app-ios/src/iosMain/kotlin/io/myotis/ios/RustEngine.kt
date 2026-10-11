@@ -4,6 +4,7 @@ import io.myotis.engine.capi.MYOTIS_ABI_VERSION
 import io.myotis.engine.capi.myotis_available_networks_json
 import io.myotis.engine.capi.myotis_canonical_network_name
 import io.myotis.engine.capi.myotis_create
+import io.myotis.engine.capi.myotis_create_access_list_json
 import io.myotis.engine.capi.myotis_drain_logs
 import io.myotis.engine.capi.myotis_ens_record_json
 import io.myotis.engine.capi.myotis_estimate_gas_json
@@ -250,6 +251,15 @@ object RustEngine {
      *  caller's gas, fee cap or funds is `{"status":"infeasible","reason"}`. */
     fun ethCallTxJson(handle: Long, txJson: String, block: String, stateOverrides: String): String =
         jsonCall { myotis_eth_call_tx_json(handle, txJson, block, stateOverrides) }
+
+    /** `eth_createAccessList` for the FULL transaction object (ABI >= 40): the
+     *  arguments of [estimateGasTxJson], the request checked as [ethCallTxJson]
+     *  checks it. The list the transaction touches with the gas the run made
+     *  with it used, and that run's own revert or halt next to them (`vmError`);
+     *  every field applied or the request refused with the permanent -32602
+     *  envelope. */
+    fun createAccessListJson(handle: Long, txJson: String, block: String, stateOverrides: String): String =
+        jsonCall { myotis_create_access_list_json(handle, txJson, block, stateOverrides) }
 
     fun getBlockByNumberJson(handle: Long, blockTag: String, fullTransactions: Boolean): String =
         jsonCall { myotis_get_block_by_number_json(handle, blockTag, fullTransactions) }

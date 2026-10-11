@@ -158,20 +158,66 @@ impl GasOutcome {
     }
 }
 
+/// The outcome of an `eth_createAccessList`
+/// ([`ElReader::create_access_list`](crate::el::reader::ElReader)): the list,
+/// with the gas the run made with it used and that run's own failure — geth
+/// reports a revert or a halt next to the list, not instead of it — or why
+/// there is none, mapped exactly as [`CallOutcome::from_executor`] maps the
+/// call's. No `Revert` variant: a run that reverts still has a list.
+#[derive(Debug)]
+pub enum AccessListOutcome {
+    /// The list was built ([`myotis_evm::CreatedAccessList`]).
+    Created(myotis_evm::CreatedAccessList),
+    /// No list right now (state unavailable, a list that would not settle).
+    /// The string is diagnostic.
+    Unavailable(String),
+    /// Never answerable on this build — permanent, as [`CallOutcome::Refused`].
+    Refused(String),
+    /// The request cannot run within the caller's own limits — its `gas`, its
+    /// fee cap against the base fee, the funds its fee needs — as
+    /// [`CallOutcome::Infeasible`]: geth's -32000 answer in geth's words.
+    Infeasible(String),
+}
+
+impl AccessListOutcome {
+    /// The executor's verdict, mapped as [`CallOutcome::from_executor`].
+    pub fn from_executor(
+        joined: Result<myotis_evm::CreatedAccessList, EvmError>,
+    ) -> AccessListOutcome {
+        match joined {
+            Ok(created) => AccessListOutcome::Created(created),
+            Err(e) if e.is_refusal() => AccessListOutcome::Refused(e.to_string()),
+            Err(e) if e.is_infeasible() => AccessListOutcome::Infeasible(e.to_string()),
+            Err(e) => AccessListOutcome::Unavailable(e.to_string()),
+        }
+    }
+}
+
+/// An access list's outcome plus the block it ran against, as [`CallAnswer`].
+#[derive(Debug)]
+pub struct AccessListAnswer {
+    pub outcome: AccessListOutcome,
+    pub block_number: u64,
+    /// Ran against the beacon-FINALIZED block.
+    pub finalized: bool,
+}
+
 /// The outcome of an ENS forward resolution. `block_number` is the verified head
-/// the resolution ran against. A hard failure (state unavailable, invalid name)
-/// travels the `Err(String)` channel instead, like the other reads.
+/// the resolution ran against, and `block_timestamp` that block's own timestamp
+/// (unix seconds) from the same verified header. A hard failure (state
+/// unavailable, invalid name) travels the `Err(String)` channel instead, like
+/// the other reads.
 #[derive(Debug, Clone)]
 pub enum EnsOutcome {
     /// The name resolved to this address record.
-    Resolved { address: [u8; 20], block_number: u64 },
+    Resolved { address: [u8; 20], block_number: u64, block_timestamp: u64 },
     /// Successfully determined that the name has NO address record (absent name,
     /// zero-address record, or a non-wildcard ancestor resolver).
-    NoRecord { block_number: u64 },
+    NoRecord { block_number: u64, block_timestamp: u64 },
     /// The name resolves OFFCHAIN (ERC-3668 `OffchainLookup`) — the record exists
     /// but needs a CCIP-Read gateway, which this engine doesn't drive yet
     /// (EL-C-5-3). Distinguishable from `NoRecord` by design.
-    Offchain { block_number: u64 },
+    Offchain { block_number: u64, block_timestamp: u64 },
 }
 
 /// Which state root an ENS query resolves against (the Java `EnsRoot` twin —
@@ -212,6 +258,9 @@ pub enum EnsQuery {
     Interface { name: String, interface_id: [u8; 4] },
     /// Reverse `address → name`, forward-verified.
     Reverse { address: [u8; 20] },
+    /// Who holds the name: registry owner/resolver and, for a `.eth` second-level
+    /// name, the registrar's registrant and expiry (`myotis_evm::resolve_ownership`).
+    Ownership { name: String },
 }
 
 /// A resolved record value, shaped per query type.
@@ -229,17 +278,20 @@ pub enum EnsRecordValue {
     Abi { content_type: u64, data: Vec<u8> },
     /// `Reverse` answers (the forward-verified primary name).
     Name(String),
+    /// `Ownership` answers.
+    Ownership(myotis_evm::EnsOwnership),
 }
 
 /// The outcome of an [`EnsQuery`]. `verified` = the resolution ran against the
 /// beacon-FINALIZED root (the API's meaning of "verified"); the optimistic-head
-/// path reports `false`.
+/// path reports `false`. `block_timestamp` is the block's own timestamp (unix
+/// seconds) from the verified header the query ran against, on either root.
 #[derive(Debug, Clone)]
 pub enum EnsQueryOutcome {
     /// The record resolved to this value.
-    Value { value: EnsRecordValue, block_number: u64, verified: bool },
+    Value { value: EnsRecordValue, block_number: u64, block_timestamp: u64, verified: bool },
     /// Successfully determined there is no record.
-    NoRecord { block_number: u64, verified: bool },
+    NoRecord { block_number: u64, block_timestamp: u64, verified: bool },
     /// The record resolves OFFCHAIN (ERC-3668): the host must drive a CCIP-Read
     /// gateway round with the carried tuple, then re-enter via the callback
     /// (`method:"ccipCallback"`). `lookup` is `None` when the revert's tuple was
@@ -247,6 +299,7 @@ pub enum EnsQueryOutcome {
     /// revert came from inside the ENSIP-10 `resolve()` wrap.
     Offchain {
         block_number: u64,
+        block_timestamp: u64,
         verified: bool,
         lookup: Option<Box<myotis_evm::OffchainLookup>>,
         wrapped: bool,

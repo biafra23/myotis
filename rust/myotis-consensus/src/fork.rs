@@ -30,6 +30,8 @@
 //! `/eth/v1/config/fork_schedule` exposes the same data and is the reference
 //! for the pinned lists in `myotis-net`'s `ChainConfig` constructors.
 
+#[allow(unused_imports)]
+use alloc::{boxed::Box, format, string::{String, ToString}, vec, vec::Vec};
 use crate::spec;
 
 /// The light-client wire format of a slot's objects.

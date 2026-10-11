@@ -126,6 +126,9 @@ class IosSettings : Settings {
     override fun setLogIndexWatchJson(network: String, json: String) =
         defaults.setObject(json, "$K_LOG_INDEX_WATCH_PREFIX$network")
 
+    override fun expertMode(): Boolean = getBool(K_EXPERT_MODE, false)
+    override fun setExpertMode(v: Boolean) = defaults.setBool(v, K_EXPERT_MODE)
+
     // blst is statically linked into the engine — there is nothing to toggle.
     override fun nativeBlsEnabled(): Boolean = true
     override fun setNativeBlsEnabled(v: Boolean) {}
@@ -148,5 +151,6 @@ class IosSettings : Settings {
         const val K_WS_BOUND = "wsBoundPeriods"
         const val K_DEEP = "deepPool"
         const val K_STRICT = "strictStateFreshness"
+        const val K_EXPERT_MODE = "expertMode"
     }
 }

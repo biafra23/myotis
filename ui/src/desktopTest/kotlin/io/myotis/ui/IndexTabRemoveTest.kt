@@ -36,7 +36,7 @@ class IndexTabRemoveTest {
     private class IndexSettings(
         var watchJson: String,
         private var enabled: Boolean = true,
-    ) : Settings by FakeSettings() {
+    ) : Settings by FakeSettings(expert = true) {
         private var configured = enabled
         var maxSpeed = false
         var backfillPaused = false

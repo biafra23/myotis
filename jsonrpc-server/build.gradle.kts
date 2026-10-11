@@ -36,7 +36,6 @@ kotlin {
             // HTTP server (endpoint) + client (upstream proxy).
             implementation(libs.ktor.server.core)
             implementation(libs.ktor.server.cio)
-            implementation(libs.ktor.server.cors)
             implementation(libs.ktor.client.core)
             implementation(libs.ktor.client.cio)
 

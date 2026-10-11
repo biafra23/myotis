@@ -12,9 +12,10 @@ name: iOS Framework (MyotisKit)
 # Kotlin :app-ios module, so this is the ONLY automated check that does: a
 # break in IosRpcBackend or a drift in the engine's C ABI header would
 # otherwise sail through green until someone built the app on a Mac (which is
-# why the revert PRs each needed a manual compileKotlinIos* run). The PR/main
-# leg is that safety net; the tag leg publishes the xcframework to the same
-# pre-release the sibling asset workflows populate.
+# why the revert PRs each needed a manual compileKotlinIos* run). The leg on
+# pushes to main and on PRs INTO main is that safety net (a PR into a feature
+# branch skips it — see the review-gate job); the tag leg publishes the
+# xcframework to the same pre-release the sibling asset workflows populate.
 
 on:
   # Scope push to main + release tags so a branch push that also has an open PR
@@ -39,19 +40,40 @@ on:
       - '.github/workflows/ios-framework.yml'
   pull_request:
     paths: *fw_paths
+  # On demand for a branch the PR job skips (a part PR into a feature branch —
+  # see the review-gate job below).
+  workflow_dispatch:
 
+# Cancel a superseded run per ref. The event is part of the group because a
+# dispatch shares refs with push runs (the Actions UI offers main and the
+# tags): without it, a dispatch on main cancels an in-flight merge-to-main
+# run, and one on a v* tag cancels that tag's run mid-release-upload — the
+# scenario desktop-linux-deb.yml and node-binding.yml key the event in for. A
+# dispatch on a v* tag is the release-republish path, as in node-binding.yml.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   # Holds the build until this PR's Claude review has finished, so the macOS
   # runner does not build a commit the review might still ask to change. It
   # passes straight through on every other event — see
-  # wait-for-claude-review.yml, which also says why this job must never get
-  # an `if:`.
+  # wait-for-claude-review.yml.
   review-gate:
     name: Review gate
+    # Skipped on a PR whose base is not main (owner ruling, 2026-10-09): a part
+    # PR of a multi-PR plan targets its feature branch, and a macOS runner leg
+    # per part costs more than it tells; the final feature → main PR builds
+    # it. Everything below needs this job, so the build is skipped with it (a
+    # dependent job is skipped when a needed job was, unless its `if` uses
+    # always()) — and on a tag the release uploads would be. So an `if:` on
+    # this job MUST be true on every non-pull_request event (push to main, v*
+    # tags, dispatch); the only safe test is the PR's base branch, which is all
+    # this one does. The release jobs only run on tags. A part that touches the
+    # engine's C ABI or the iOS triples can run this on demand from the
+    # Actions tab (workflow_dispatch) — this is the ONLY check that compiles
+    # :app-ios, see the header.
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
     uses: ./.github/workflows/wait-for-claude-review.yml
     permissions:
       actions: read

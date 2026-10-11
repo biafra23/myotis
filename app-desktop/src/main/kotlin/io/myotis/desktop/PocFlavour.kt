@@ -279,6 +279,10 @@ open class PocFlavour(
         if (todo.isEmpty()) return
         if (firstStart) {
             for (other in OTHER_NETWORKS) if (seedFor(other) == null) settings.setNetworkEnabled(other, false)
+            // A PoC exists to show its seeded index, and the Index tab is Expert-mode only:
+            // first-start in Expert mode so the demo machine sees it without a hunt through
+            // Settings. The user can switch it off; later starts leave the choice alone.
+            settings.setExpertMode(true)
         }
         for (seed in todo) {
             if (seed.enableOnFirstStart) settings.setNetworkEnabled(seed.network, true)

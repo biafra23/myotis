@@ -23,6 +23,7 @@ import com.jaeckel.ethp2p.android.cmp.AndroidNetworkStatus
 import com.jaeckel.ethp2p.android.cmp.AndroidNodeController
 import com.jaeckel.ethp2p.android.cmp.AndroidQueryHistoryAdapter
 import com.jaeckel.ethp2p.android.cmp.AndroidSettings
+import io.myotis.ui.LOG_SAVE_CAUTION
 import io.myotis.ui.NodeScreen
 
 /**
@@ -32,6 +33,12 @@ import io.myotis.ui.NodeScreen
  * in `:ui` — none here — so there is zero UI duplication between Android and Desktop.
  */
 class MainActivity : ComponentActivity() {
+    private companion object {
+        /** The Logs-tab save waiting for the SAF picker (see createDocumentLauncher). */
+        @Volatile
+        var pendingLogSave: ((android.net.Uri?) -> Unit)? = null
+    }
+
 
     // Exposed to Compose via a state holder so recomposition sees bind/unbind.
     private val boundServiceState = mutableStateOf<NodeService?>(null)
@@ -52,6 +59,26 @@ class MainActivity : ComponentActivity() {
     ) { uris ->
         pendingFilePick?.invoke(uris ?: emptyList())
         pendingFilePick = null
+    }
+
+    // Logs-tab Save…: the SAF create-document picker's result lands in the callback the
+    // shared UI's Save action registered (one save in flight at a time — the picker is modal).
+    // The callback lives in the companion, not the instance: a rotation while the picker is
+    // open recreates the Activity, and the result then reaches the NEW instance's launcher,
+    // so the write still lands. The result LINE does not: it goes to the Logs tab that was
+    // composed before the rotation and is gone, so after a rotation the file is the only
+    // feedback — a known gap, kept rather than a process-wide result holder for a rare case.
+    // After a process death nothing is pending any more, and the document SAF already
+    // created would stay empty — so it is deleted rather than handed over as a saved log.
+    private val createDocumentLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri ->
+        val pending = pendingLogSave
+        pendingLogSave = null
+        when {
+            pending != null -> pending(uri)
+            uri != null -> runCatching { android.provider.DocumentsContract.deleteDocument(contentResolver, uri) }
+        }
     }
 
     private val connection = object : ServiceConnection {
@@ -90,7 +117,32 @@ class MainActivity : ComponentActivity() {
                 )
             }
             val settings = remember { AndroidSettings(applicationContext) }
-            val logs = remember { AndroidLogSource() }
+            val logs = remember {
+                AndroidLogSource(saveTo = { name, write, onResult ->
+                    pendingLogSave = { uri ->
+                        if (uri == null) {
+                            onResult("Save cancelled.")
+                        } else {
+                            // Rendering up to 50k lines and the write stay off the main thread;
+                            // "wt" truncates — plain "w" may not on every provider.
+                            Thread({
+                                onResult(runCatching {
+                                    val out = contentResolver.openOutputStream(uri, "wt")
+                                        ?: error("could not open the picked document")
+                                    out.bufferedWriter().use { write(it) }
+                                    "Saved the log to ${uri.lastPathSegment ?: uri}. $LOG_SAVE_CAUTION"
+                                }.getOrElse { "Save failed: ${it.message ?: it::class.java.simpleName}" })
+                            }, "myotis-log-save").start()
+                        }
+                    }
+                    try {
+                        createDocumentLauncher.launch(name)
+                    } catch (e: android.content.ActivityNotFoundException) {
+                        pendingLogSave = null
+                        onResult("Save failed: no document picker on this device.")
+                    }
+                })
+            }
             val netStatus = remember { AndroidNetworkStatus(applicationContext) }
             // Same filesDir/query-history.tsv the app already used → retains stored queries.
             val history = remember { AndroidQueryHistoryAdapter(applicationContext) }

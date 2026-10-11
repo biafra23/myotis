@@ -43,6 +43,16 @@ public final class EnsAddresses {
     public static final Address MAINNET_UNIVERSAL_RESOLVER =
             Address.fromHex("0xce01f8eee7E479C928F8919abD53E553a36CeF67");
 
+    /** The {@code .eth} BaseRegistrar (ERC-721 of the second-level names) — the same
+     *  address on mainnet and Sepolia (verified against both chains' {@code ens()}). */
+    public static final Address BASE_REGISTRAR =
+            Address.fromHex("0x57f1887a8BF19b14fC0dF6Fd9B2acc9Af147eA85");
+
+    /** The NameWrapper a wrapped name's registry owner points at; its
+     *  {@code ownerOf(uint256(node))} is the user behind it. */
+    public static final Address MAINNET_NAME_WRAPPER =
+            Address.fromHex("0xD4416b13d2b3a9aBae7AcD5D6C2BbDBE25686401");
+
     // ---- Sepolia (chainId 11155111) --------------------------------------
 
     /**
@@ -55,6 +65,9 @@ public final class EnsAddresses {
     /** Sepolia Universal Resolver. */
     public static final Address SEPOLIA_UNIVERSAL_RESOLVER =
             Address.fromHex("0x3c85752a5d47DD09D677C645Ff2A938B38fbFEbA");
+
+    public static final Address SEPOLIA_NAME_WRAPPER =
+            Address.fromHex("0x0635513f179D50A207757E05759CbD106d7dFcE8");
 
     // ---- Holesky (chainId 17000) -----------------------------------------
 

@@ -114,6 +114,9 @@ android {
         versionCode = derivedVersionCode // see derivedVersionCode above
         versionName = releaseVersion
         buildConfigField("String", "RPC_UPSTREAM", "\"$rpcUpstream\"")
+        // -PtorEngine (root build.gradle.kts): whether these jniLibs were built with
+        // Arti. Lets a Tor-less APK answer "no Tor" without loading the engine library.
+        buildConfigField("boolean", "TOR_ENGINE", (rootProject.extra["torEngine"] as Boolean).toString())
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 

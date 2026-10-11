@@ -22,6 +22,20 @@ public record MetadataMessage(long seqNumber, byte[] attnets, byte[] syncnets) {
 
     public static final int SSZ_SIZE = 17;
 
+    /** v3 ({@code /req/metadata/3}, Fulu): v2 plus {@code custody_group_count} uint64. */
+    public static final int SSZ_SIZE_V3 = SSZ_SIZE + 8;
+
+    /**
+     * The {@code custody_group_count} advertised in v3: {@code CUSTODY_REQUIREMENT}
+     * (4 on mainnet, Sepolia and Gnosis) rather than the honest 0. The Fulu p2p
+     * spec lets clients "reject peers with a value less than CUSTODY_REQUIREMENT",
+     * and Lighthouse does (goodbye with reason Fault, which bans). The minimum
+     * changes nothing about how peers treat us: a peer that only got our v2
+     * metadata assumed exactly this value. Same constant as the Rust engine's
+     * {@code status::CUSTODY_GROUP_COUNT}.
+     */
+    public static final long CUSTODY_GROUP_COUNT = 4L;
+
     public MetadataMessage {
         if (attnets == null || attnets.length != 8)
             throw new IllegalArgumentException("attnets must be 8 bytes (Bitvector[64])");
@@ -39,6 +53,14 @@ public record MetadataMessage(long seqNumber, byte[] attnets, byte[] syncnets) {
         buf.putLong(seqNumber);
         buf.put(attnets);
         buf.put(syncnets);
+        return buf.array();
+    }
+
+    /** v3 encoding: {@link #encode()} followed by {@link #CUSTODY_GROUP_COUNT}. */
+    public byte[] encodeV3() {
+        ByteBuffer buf = ByteBuffer.allocate(SSZ_SIZE_V3).order(ByteOrder.LITTLE_ENDIAN);
+        buf.put(encode());
+        buf.putLong(CUSTODY_GROUP_COUNT);
         return buf.array();
     }
 

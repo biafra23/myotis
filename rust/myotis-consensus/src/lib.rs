@@ -12,6 +12,10 @@
 //! This is a pure-Rust library crate — no JNI here; the JVM boundary lives in
 //! `myotis-engine`.
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
 pub mod fork;
 pub mod snapshot;
 pub mod spec;

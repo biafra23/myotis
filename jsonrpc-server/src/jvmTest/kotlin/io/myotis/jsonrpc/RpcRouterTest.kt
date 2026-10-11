@@ -514,6 +514,16 @@ class RpcRouterTest {
             lastTx = tx; lastTxBlock = block; lastTxOverrides = stateOverridesJson
             return txCall ?: super.callTx(tx, block, stateOverridesJson)
         }
+        /** Whether this fake builds access lists (the Rust engine does; the Java engine does not). */
+        var buildsLists: Boolean = false
+        override fun supportsAccessListCreation(): Boolean = buildsLists
+        /** When set, createAccessList answers this (else the interface default). */
+        var accessList: io.myotis.api.AccessListResult? = null
+        override fun createAccessList(tx: io.myotis.api.TransactionArgs, block: String,
+                                      stateOverridesJson: String?): io.myotis.api.AccessListResult {
+            lastTx = tx; lastTxBlock = block; lastTxOverrides = stateOverridesJson
+            return accessList ?: super.createAccessList(tx, block, stateOverridesJson)
+        }
         override fun estimateGas(from: ByteArray?, to: ByteArray?, data: ByteArray?,
                                  valueWei: String?): Long? {
             lastEstFrom = from; lastEstTo = to; lastEstData = data
@@ -533,6 +543,170 @@ class RpcRouterTest {
 
     private fun errorCode(resp: String): Int =
         json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject["code"]!!.jsonPrimitive.content.toInt()
+
+    private fun errorMessageOf(resp: String): String =
+        json.parseToJsonElement(resp).jsonObject["error"]!!.jsonObject["message"]!!.jsonPrimitive.content
+
+    // ---- eth_createAccessList ----------------------------------------------
+
+    private val accessListRequest = """{"jsonrpc":"2.0","id":1,"method":"eth_createAccessList",
+        "params":[{"from":"0x1111111111111111111111111111111111111111",
+                   "to":"0x2222222222222222222222222222222222222222",
+                   "data":"0x3e12cc2e","gas":"0x7a120"},
+                  "0x100"]}"""
+
+    private val oneEntryList = """[{"address":"0x3333333333333333333333333333333333333333","storageKeys":["0x${"00".repeat(31)}01"]}]"""
+
+    /** A Solidity `Error(string)` revert payload for [reason]. */
+    private fun errorStringPayload(reason: String): ByteArray {
+        val text = reason.encodeToByteArray()
+        val padded = ByteArray((text.size + 31) / 32 * 32).also { text.copyInto(it) }
+        fun word(v: Int) = ByteArray(32).also { it[31] = v.toByte() }
+        return byteArrayOf(0x08, 0xc3.toByte(), 0x79, 0xa0.toByte()) + word(32) + word(text.size) + padded
+    }
+
+    /** geth's result shape: the list verbatim, the gas as a quantity, no
+     *  `error` for a run that succeeded — the whole transaction object and the
+     *  block forwarded to the engine. */
+    @Test fun createAccessList_servesGethsResultShape() {
+        val b = FakeBackend().apply {
+            buildsLists = true
+            accessList = io.myotis.api.AccessListResult.ok(oneEntryList, 32_437L, null, null)
+        }
+        val resp = route(b, accessListRequest)
+        val result = json.parseToJsonElement(resp).jsonObject["result"]!!.jsonObject
+        assertEquals(json.parseToJsonElement(oneEntryList), result["accessList"])
+        assertEquals("0x7eb5", result["gasUsed"]!!.jsonPrimitive.content)
+        assertNull(result["error"])
+        val tx = b.lastTx!!
+        assertEquals(500_000L, tx.gas())
+        assertEquals("0x3e12cc2e", tx.data().toHex())
+        assertEquals("0x100", b.lastTxBlock)
+        assertNull(b.lastTxOverrides)
+        assertTrue(tx.json().contains("\"gas\":\"0x7a120\""), tx.json())
+    }
+
+    /** The run's own failure is geth's `error` NEXT TO the list, never a
+     *  code-3 error: a wallet still gets the list for a transaction it is
+     *  about to learn fails, the revert reason decoded as the code-3 error
+     *  decodes it. */
+    @Test fun createAccessList_theRunsFailureRidesNextToTheList() {
+        val b = FakeBackend().apply {
+            buildsLists = true
+            accessList = io.myotis.api.AccessListResult.ok(
+                oneEntryList, 23_105L, "execution reverted", errorStringPayload("bad"))
+        }
+        val result = json.parseToJsonElement(route(b, accessListRequest)).jsonObject["result"]!!.jsonObject
+        assertEquals("execution reverted: bad", result["error"]!!.jsonPrimitive.content)
+        assertEquals("0x5a41", result["gasUsed"]!!.jsonPrimitive.content)
+        assertEquals(1, result["accessList"]!!.jsonArray.size)
+        b.accessList = io.myotis.api.AccessListResult.ok("[]", 100_000L, "out of gas", null)
+        val halted = json.parseToJsonElement(route(b, accessListRequest)).jsonObject["result"]!!.jsonObject
+        assertEquals("out of gas", halted["error"]!!.jsonPrimitive.content)
+        assertEquals(0, halted["accessList"]!!.jsonArray.size)
+    }
+
+    /** An engine that builds no lists (the Java engine) is refused for good,
+     *  before it is asked — -32602, never the retryable -32000 a wallet would
+     *  spin on, and never a question the engine is woken to refuse. */
+    @Test fun createAccessList_anEngineThatBuildsNoLists_isRefusedPermanentlyBeforeDispatch() {
+        val b = FakeBackend()   // buildsLists = false: the interface default
+        val resp = route(b, accessListRequest)
+        assertEquals(-32602, errorCode(resp))
+        assertTrue(errorMessageOf(resp).contains("eth_createAccessList"), errorMessageOf(resp))
+        assertNull(b.lastTx, "the engine must not be asked")
+        // The method's own refusal, ahead of any field's: a creation or a list
+        // the Java engine would refuse too is not what to fix here.
+        val creation = route(FakeBackend(serveCreation = false), """{"jsonrpc":"2.0","id":1,
+            "method":"eth_createAccessList","params":[{"data":"0x6000"}]}""")
+        assertEquals(-32602, errorCode(creation))
+        assertTrue(errorMessageOf(creation).contains("builds no access lists"), errorMessageOf(creation))
+    }
+
+    /** The engine's own verdicts map as eth_call's: infeasible is geth's
+     *  -32000 in geth's words, a refusal -32602, no answer the retryable -32000. */
+    @Test fun createAccessList_engineVerdictsMapAsTheCallsDo() {
+        val b = FakeBackend().apply {
+            buildsLists = true
+            accessList = io.myotis.api.AccessListResult.infeasible(
+                "err: intrinsic gas too low: have 21000, want 21064 (supplied gas 21000)")
+        }
+        val infeasible = route(b, accessListRequest)
+        assertEquals(-32000, errorCode(infeasible))
+        assertTrue(errorMessageOf(infeasible).startsWith("err: intrinsic gas too low"), errorMessageOf(infeasible))
+        b.accessList = io.myotis.api.AccessListResult.refused("block 0x10 is an Amsterdam block without a slot number")
+        val refused = route(b, accessListRequest)
+        assertEquals(-32602, errorCode(refused))
+        assertTrue(errorMessageOf(refused).contains("Amsterdam"), errorMessageOf(refused))
+        // No list right now: -32000 carrying the engine's reason when it gave
+        // one — the not-settled answer is actionable, and the generic "no peer
+        // / not synced" would misdescribe it — the generic text otherwise.
+        b.accessList = io.myotis.api.AccessListResult.unavailable(
+            "the access list did not settle within 10 runs of the transaction")
+        val unsettled = route(b, accessListRequest)
+        assertEquals(-32000, errorCode(unsettled))
+        assertTrue(errorMessageOf(unsettled).contains("did not settle within 10 runs"), errorMessageOf(unsettled))
+        b.accessList = io.myotis.api.AccessListResult.unavailable(null)
+        val bare = route(b, accessListRequest)
+        assertEquals(-32000, errorCode(bare))
+        assertTrue(errorMessageOf(bare).contains("no peer / not synced"), errorMessageOf(bare))
+    }
+
+    /** A state override (params[2]) is applied where the backend can, refused
+     *  where it cannot, and a fourth argument is one too many — geth's rule,
+     *  and the block override it would carry is never applied. */
+    @Test fun createAccessList_appliesOrRefusesTheOverride_andTakesThreeArguments() {
+        val override = """{"0x2222222222222222222222222222222222222222":{"balance":"0x1"}}"""
+        fun withParams(params: String) =
+            """{"jsonrpc":"2.0","id":1,"method":"eth_createAccessList","params":[$params]}"""
+        val txObj = """{"to":"0x2222222222222222222222222222222222222222"}"""
+        val able = FakeBackend(applyOverrides = true).apply {
+            buildsLists = true
+            accessList = io.myotis.api.AccessListResult.ok("[]", 21_000L, null, null)
+        }
+        val served = route(able, withParams("$txObj,\"latest\",$override"))
+        assertEquals("0x5208", json.parseToJsonElement(served).jsonObject["result"]!!.jsonObject["gasUsed"]!!.jsonPrimitive.content)
+        assertEquals(json.parseToJsonElement(override), json.parseToJsonElement(able.lastTxOverrides!!))
+        val unable = FakeBackend().apply {
+            buildsLists = true
+            accessList = io.myotis.api.AccessListResult.ok("[]", 21_000L, null, null)
+        }
+        val refused = route(unable, withParams("$txObj,\"latest\",$override"))
+        assertEquals(-32602, errorCode(refused))
+        assertTrue(errorMessageOf(refused).contains("override"), errorMessageOf(refused))
+        assertNull(unable.lastTx)
+        val tooMany = route(able, withParams("$txObj,\"latest\",null,{}"))
+        assertEquals(-32602, errorCode(tooMany))
+        assertTrue(errorMessageOf(tooMany).contains("too many arguments, want at most 3"), errorMessageOf(tooMany))
+    }
+
+    /** The request is eth_call's: a contradictory object is refused with its
+     *  reason, creation only where the engine serves it. */
+    @Test fun createAccessList_refusesWhatTheCallRefuses() {
+        val b = FakeBackend().apply {
+            buildsLists = true
+            accessList = io.myotis.api.AccessListResult.ok("[]", 21_000L, null, null)
+        }
+        val contradictory = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_createAccessList",
+            "params":[{"to":"0x2222222222222222222222222222222222222222","type":"0x4"}]}""")
+        assertEquals(-32602, errorCode(contradictory))
+        assertTrue(errorMessageOf(contradictory).contains("authorizationList"), errorMessageOf(contradictory))
+        assertNull(b.lastTx)
+        val noCreation = FakeBackend(serveCreation = false).apply {
+            buildsLists = true
+            accessList = io.myotis.api.AccessListResult.ok("[]", 53_000L, null, null)
+        }
+        val creation = route(noCreation, """{"jsonrpc":"2.0","id":1,"method":"eth_createAccessList",
+            "params":[{"data":"0x6000"}]}""")
+        assertEquals(-32602, errorCode(creation))
+        assertTrue(errorMessageOf(creation).contains("contract creation"), errorMessageOf(creation))
+        assertNull(noCreation.lastTx)
+        // Where it is served, the init code reaches the engine with no `to`.
+        val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"eth_createAccessList",
+            "params":[{"data":"0x6000"}]}""")
+        assertEquals("0x5208", json.parseToJsonElement(resp).jsonObject["result"]!!.jsonObject["gasUsed"]!!.jsonPrimitive.content)
+        assertNull(b.lastTx!!.to())
+    }
 
     @Test fun ethCall_encodesResultAsData_andDecodesToAndData() {
         val b = FakeBackend(callResult = byteArrayOf(0, 6))

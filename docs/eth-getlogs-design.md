@@ -575,7 +575,7 @@ post-create call rather than a `create_handle` signature break:
   "fromBlock": n, "topic0s": ["0x…", …]? }, …], "unwatch": ["0x…", …]? }`.
   Watch lists live host-side as data, not in the engine — originally a
   built-in preset (the kohaku contract set per network), since 2026-08-20 the
-  user's own entries (`LogIndexWatch`, entered on the Index tab and persisted
+  user's own entries (`LogIndexWatch`, entered on the Index tab (Settings → Expert mode) and persisted
   per network). `watch` is additive and `unwatch` is the unsubscribe — see
   §Import, *Unsubscribe*.
 - Hosts: `NodeController` gains logIndex getters/setters next to

@@ -4,7 +4,7 @@ How to load the RAILGUN PoC seed ([railgun-poc.md](railgun-poc.md)) into the
 Android app's log index. Afterwards a wallet on the same phone can scan
 RAILGUN's history through Myotis's JSON-RPC on `127.0.0.1`. Android has no
 RAILGUN flavour like the desktop dmg. This guide uses the generic
-**Import log-index snapshot…** button on the Index tab, which takes any portable
+**Import log-index snapshot…** button on the Index tab (Settings → Expert mode), which takes any portable
 MLIX snapshot. A seed framed by `scripts/synth_logindex.py` is one, and the Rust
 test `synth_logindex_script_frame_is_importable` (`el/logindex.rs`) checks that
 the portable loader accepts it.

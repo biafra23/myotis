@@ -105,6 +105,12 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
 
     @Override public void setWsBoundPeriods(long periods) { stack.setWsBoundPeriods(periods); }
 
+    @Override public io.myotis.api.WebAccessPolicy setWebAccessPolicy(io.myotis.api.WebAccessPolicy policy) {
+        return stack.setWebAccessPolicy(policy);
+    }
+
+    @Override public List<io.myotis.api.WebOrigin> recentWebOrigins() { return stack.recentWebOrigins(); }
+
     @Override public void acceptStaleAnchor() { stack.acceptStaleAnchor(); }
 
     @Override

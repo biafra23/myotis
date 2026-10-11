@@ -541,6 +541,38 @@ val prepareRailgunPocSeed = tasks.register("prepareRailgunPocSeed") {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The macOS app icon: the ANDROID launcher icon, rendered onto Apple's icon grid.
+// scripts/gen_mac_icon.java reads the Android launcher icon's committed resources
+// (the bat foreground vector and its background colour, both generated from
+// assets/myotis_logo.svg by scripts/gen_android_icons.py) and writes an .icns, so
+// the dmg and the APK carry the same icon by construction and nothing binary is
+// committed. Plain JDK in single-file source mode on the JDK 21 toolchain, headless
+// so the render never touches the window server. Without it jpackage ships its
+// default Java icon. The deb keeps jpackage's default: only macOS is wired.
+// ---------------------------------------------------------------------------
+val macIcon = layout.buildDirectory.file("generated/mac-icon/Myotis.icns")
+val generateMacIcon = tasks.register<Exec>("generateMacIcon") {
+    group = "build"
+    description = "Render the macOS app icon (.icns) from the Android launcher icon resources"
+    val script = rootProject.file("scripts/gen_mac_icon.java")
+    val res = rootProject.file("android-app/src/main/res")
+    val foreground = res.resolve("drawable/ic_launcher_foreground.xml")
+    val background = res.resolve("values/ic_launcher_background.xml")
+    inputs.files(script, foreground, background)
+        .withPropertyName("iconSources")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+    outputs.file(macIcon).withPropertyName("icns")
+    executable = javaToolchains.launcherFor {
+        languageVersion.set(JavaLanguageVersion.of(21))
+    }.get().executablePath.asFile.absolutePath
+    args(
+        "-Djava.awt.headless=true", script.absolutePath,
+        foreground.absolutePath, background.absolutePath, macIcon.get().asFile.absolutePath,
+    )
+}
+val isMacHost = composeOsArchDir.startsWith("macos")
+
 // Compose's own internal prepareAppResources task copies appResourcesRootDir
 // into the image — our staging must run before IT (depending only on the
 // package*/createDistributable* umbrella tasks is too late: the internal copy
@@ -556,6 +588,8 @@ tasks.configureEach {
         dependsOn(prepareRustAppResources)
         dependsOn(prepareJnaBootLib)
         dependsOn(prepareBeePocSeed, prepareRailgunPocSeed)
+        // The app icon jpackage bakes into the macOS bundle (iconFile below).
+        if (isMacHost) dependsOn(generateMacIcon)
         // Compose's jpackage tasks do NOT track the app-resources CONTENT as
         // an input: after a Rust-only change, prepareRustAppResources and
         // Compose's own prepareAppResources both re-run, yet
@@ -628,6 +662,12 @@ compose.desktop {
             // runtime that can actually load Netty / Besu / jvm-libp2p / BouncyCastle.
             includeAllModules = true
             macOS {
+                // Generated at package time from the Android launcher icon (generateMacIcon).
+                // A plain file location, not a value mapped from the task: on macOS Compose's
+                // run task reads it at configuration time into -Xdock:icon=, before any task
+                // has run. The packaging tasks get their edge from the name match above, run
+                // from the JavaExec block below.
+                iconFile.set(macIcon)
                 bundleID = when {
                     beePoc -> "io.myotis.desktop.beepoc"
                     railgunPoc -> "io.myotis.desktop.railgunpoc"
@@ -650,6 +690,8 @@ compose.desktop {
 // without the Rust engine until the packaging PR.
 tasks.withType<JavaExec>().matching { it.name == "run" || it.name == "syncSmoke" }.configureEach {
     dependsOn(rootProject.tasks.named("cargoBuildHost"))
+    // Compose's run passes the macOS icon as -Xdock:icon=<file>: a string, so no task edge.
+    if (isMacHost && name == "run") dependsOn(generateMacIcon)
     // -Pengine=java|rust|auto → -Dmyotis.engine (same knob as :app run).
     (project.findProperty("engine") as String?)?.let { systemProperty("myotis.engine", it) }
     // -Ptor=true → -Dmyotis.tor (dev knob to force Tor routing on at boot; needs the

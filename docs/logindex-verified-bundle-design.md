@@ -499,7 +499,7 @@ are there so that is visible.
    measure import time and checkpoint cost on a laptop and a phone; then the
    full PostageStamp history and the first top-up chunk.
 4. **Hosts.** Pickers on desktop/Android/iOS with the copy-in and free-space
-   check; the Index tab shows bundle coverage and consumed chunks.
+   check; the Index tab (Settings → Expert mode) shows bundle coverage and consumed chunks.
 5. **Follow-ups**, each its own issue when reached: wider file-served
    batches than `BATCH`; in-app download from a manifest URL (if ruled in);
    the `historical_summaries` accumulator so chunks anchor without the walk

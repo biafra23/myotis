@@ -18,7 +18,7 @@ import org.junit.Test
  */
 class JavaEngineAvailabilityTest {
 
-    private class EngineSettings(private val reason: String?) : Settings by FakeSettings() {
+    private class EngineSettings(private val reason: String?) : Settings by FakeSettings(expert = true) {
         override fun javaEngineUnavailableReason(): String? = reason
     }
 

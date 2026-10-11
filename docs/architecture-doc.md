@@ -382,7 +382,7 @@ A host-agnostic router (`jsonrpc-server`, Kotlin Multiplatform/Ktor) maps the Et
 | Method(s) | Verification basis |
 |---|---|
 | `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt` | snap/1 Merkle-Patricia proof against a beacon-anchored `stateRoot` (Section 5) |
-| `eth_call`, `eth_estimateGas` | local EVM over proof-served state (Sections 8–9) |
+| `eth_call`, `eth_estimateGas`, `eth_createAccessList` (Rust engine) | local EVM over proof-served state (Sections 8–9) |
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory` | base fee from verified headers; tips from bodies/receipts verified against `transactionsRoot`/`receiptsRoot` (Section 8) |
 | `eth_getBlockByNumber`/`ByHash` and the block-derived reads (transaction counts, transactions by index, uncle counts/uncles), `eth_getTransactionReceipt`, `eth_getBlockReceipts`, `eth_getTransactionByHash` | header window anchored to the beacon head; bodies/receipts verified against `transactionsRoot`/`receiptsRoot` (Sections 4, 7) |
 | `eth_getLogs` | the opt-in log index — every log verified against `receiptsRoot`; an uncovered range is an error, never `[]` (Rust engine) |

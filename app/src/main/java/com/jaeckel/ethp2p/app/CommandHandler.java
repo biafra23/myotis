@@ -13,6 +13,7 @@ import io.myotis.api.EngineException;
 import io.myotis.api.EnsAbiResult;
 import io.myotis.api.EnsApi;
 import io.myotis.api.EnsContenthashResult;
+import io.myotis.api.EnsOwnershipResult;
 import io.myotis.api.EnsDnsRecordResult;
 import io.myotis.api.EnsInterfaceResult;
 import io.myotis.api.EnsMultiCoinResult;
@@ -85,6 +86,7 @@ public class CommandHandler {
                 case "reverse-ens"             -> handleReverseEns(jsonLine);
                 case "resolve-ens-text"        -> handleResolveEnsText(jsonLine);
                 case "resolve-ens-contenthash" -> handleResolveEnsContenthash(jsonLine);
+                case "resolve-ens-ownership"   -> handleResolveEnsOwnership(jsonLine);
                 case "resolve-ens-addr-coin"   -> handleResolveEnsAddrCoin(jsonLine);
                 case "resolve-ens-pubkey"      -> handleResolveEnsPubkey(jsonLine);
                 case "resolve-ens-abi"         -> handleResolveEnsAbi(jsonLine);
@@ -703,6 +705,28 @@ public class CommandHandler {
                     + ",\"blockNumber\":" + r.blockNumber();
             if (r.contenthashHex() == null) return head + ",\"resolved\":false}";
             return head + ",\"resolved\":true,\"contenthash\":\"" + r.contenthashHex() + "\"}";
+        } catch (EngineException | IllegalStateException e) {
+            return jsonError(e.getMessage());
+        }
+    }
+
+    private String handleResolveEnsOwnership(String jsonLine) {
+        String name = extractString(jsonLine, "name");
+        try {
+            EnsOwnershipResult r = ens().resolveOwnership(name);
+            if (r.error() != null) return jsonError(r.error());
+            StringBuilder sb = new StringBuilder("{\"ok\":true")
+                    .append(",\"name\":\"").append(escapeJson(name)).append('"')
+                    .append(",\"blockNumber\":").append(r.blockNumber())
+                    .append(",\"verified\":").append(r.verified());
+            if (r.registrantHex() != null) sb.append(",\"registrant\":\"").append(r.registrantHex()).append('"');
+            if (r.managerHex() != null) sb.append(",\"manager\":\"").append(r.managerHex()).append('"');
+            sb.append(",\"wrapped\":").append(r.wrapped());
+            if (r.resolverHex() != null) sb.append(",\"resolver\":\"").append(r.resolverHex()).append('"');
+            if (r.expiresAt() >= 0) sb.append(",\"expiresAt\":").append(r.expiresAt());
+            // -1 = the registrar's GRACE_PERIOD() was unanswered; the field is seconds or absent.
+            if (r.gracePeriodSeconds() >= 0) sb.append(",\"gracePeriodSeconds\":").append(r.gracePeriodSeconds());
+            return sb.append('}').toString();
         } catch (EngineException | IllegalStateException e) {
             return jsonError(e.getMessage());
         }

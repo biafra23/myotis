@@ -89,20 +89,40 @@ interface NodeController {
      * Re-apply Tor verified-read routing to the process-global selector after
      * [Settings.setTorEnabled] flips the preference (docs/privacy-and-tor.md). Tor is an
      * experimental capability of the Rust engine only, so hosts that don't support it
-     * (Android/iOS for now) keep the default no-op; the desktop actual pushes the flag to
-     * `Tor.select`. Like the engine toggle it is NOT live: it applies to networks
-     * (re)started afterwards.
+     * (iOS for now) keep the default no-op; the desktop and Android actuals push the flag
+     * to `Tor.select` (Android names Arti's storage directories first). Unlike the engine
+     * toggle it is LIVE: the engine checks the flag per read, so the next read of an
+     * already-running Rust-engine network follows it.
      */
     fun applyTorMode() {}
 
     /**
+     * Push the persisted web-page access policy ([Settings.webAccessMode] +
+     * [Settings.webAccessOrigins]) down to every running network's JSON-RPC listener
+     * (#502). Live: the next request is judged by it, no restart. Hosts also apply it
+     * before each network's start, so a listener never serves its first request under
+     * a stale policy. Default no-op keeps hosts without the seam (iOS, for now)
+     * compiling — there the engine runs its default policy (specific sites, none).
+     */
+    fun applyWebAccess() {}
+
+    /**
+     * Re-apply [Settings.allowAppNap] to the process after the Settings row flips it:
+     * on macOS the desktop host begins or ends the NSProcessInfo activity that keeps
+     * App Nap off (AppNap.kt). Live, like the BLS toggle. Default no-op for hosts
+     * without App Nap ([Settings.supportsAppNap] is false there, so the row never shows).
+     */
+    fun applyAppNap() {}
+
+    /**
      * Whether this host can actually route reads over Tor — the Settings row is
      * shown only when true (the [canImportLogIndex] precedent). Default false:
-     * Android/iOS implement none of the Tor seams ([Settings.torEnabled] drops
-     * the write, [applyTorMode] is a no-op), and a privacy toggle that flips ON
+     * iOS implements none of the Tor seams ([Settings.torEnabled] drops the
+     * write, [applyTorMode] is a no-op), and a privacy toggle that flips ON
      * while reads keep leaving from the real IP would be accepted-and-ignored —
-     * the exact failure mode the trust rules forbid. The desktop actual answers
-     * from the loaded engine build (only a `-PtorEngine` dylib links Arti).
+     * the exact failure mode the trust rules forbid. The desktop and Android
+     * actuals answer from the loaded engine build (only a `-PtorEngine` build
+     * links Arti into the dylib / the jniLibs).
      */
     val supportsTor: Boolean get() = false
 
@@ -169,6 +189,28 @@ interface NodeController {
     suspend fun resolveEns(network: String, name: String): EnsResult
 
     /**
+     * The ENS profile beyond the address: the contenthash (ENSIP-7, under
+     * [ENS_CONTENTHASH_KEY]) and the ENSIP-5 text records in [ENS_PROFILE_KEYS], each read
+     * on its own through the engine's ENS API at its fixed policy for records (finalized
+     * state first, the peer head only when finality holds no record — independent of any
+     * root knob a host offers for the ADDRESS read), through [readEnsProfile], so one
+     * record's failure never hides the others. Read on demand (the card's "Read records"),
+     * not with every lookup: an absent record costs a second resolution at the head, and
+     * most names set few of the keys. Null when this host has no actual (the card shows
+     * the address only). A record the name lacks is a null value without error; one that
+     * could not be read carries its error.
+     */
+    suspend fun resolveEnsProfile(network: String, name: String): EnsProfile? = null
+
+    /**
+     * Who holds [name] and until when — the registry's owner and resolver and, for a
+     * `.eth` second-level name, the registrar's registrant, expiry and grace period,
+     * seen through the NameWrapper (the engine API's `resolveOwnership`, finalized
+     * first). Read on demand with the records. Null when this host has no actual.
+     */
+    suspend fun resolveEnsOwnership(network: String, name: String): EnsOwnership? = null
+
+    /**
      * Whether [transactionHistory] works for [network] on this host. Desktop-mainnet-only
      * today (the TrueBlocks scan needs the JVM Java engine's internals); the defaults keep
      * Android/iOS compiling and hide the Query-tab section there.
@@ -202,16 +244,60 @@ data class AccountResult(
     val matchedBeaconSlot: Long,     // -1 when not matched
     val verifyMethod: String?,       // "stateRootMatch" / "headerChain" / null
     val failReason: String?,         // null when verified
+    /** [blockNumber]'s own timestamp, unix seconds, when the engine PROVED it (the read
+     *  ran against the beacon-attested block); -1 when none. The UI shows its age. */
+    val blockTimestamp: Long = -1,
 )
 
-/** ENS resolution result. Mirrors `io.myotis.rpc.EnsResolution`. */
+/** ENS resolution result. Mirrors `io.myotis.api.EnsResolutionResult`. */
 data class EnsResult(
     val name: String,
     val addressHex: String?,         // null when unresolved/errored
     val blockNumber: Long,           // -1 when none
     val verified: Boolean,           // true iff beacon-verified finalized state
     val error: String?,              // null on success
+    /** [blockNumber]'s own timestamp, unix seconds, from the verified header the
+     *  resolution ran against; -1 when none. The UI shows its age. */
+    val blockTimestamp: Long = -1,
 )
+
+/** One ENS record beyond the address: a text record under its ENSIP-5 key, or the
+ *  contenthash under [ENS_CONTENTHASH_KEY] (0x-prefixed multicodec bytes). */
+data class EnsRecord(
+    val key: String,
+    val value: String?,              // null = the name has no such record (when error is null)
+    val blockNumber: Long,           // -1 when none
+    val verified: Boolean,           // true iff beacon-verified finalized state
+    val error: String?,              // null unless the read itself failed
+)
+
+/** The records [NodeController.resolveEnsProfile] read for [name]. */
+data class EnsProfile(val name: String, val records: List<EnsRecord>)
+
+/**
+ * Who holds an ENS name and until when ([NodeController.resolveEnsOwnership]). A null
+ * address is "none": no registrant for a subname, an unregistered or an expired name
+ * (the registrar's `ownerOf` reverts from the expiry on, grace period included); no
+ * manager when the registry holds no owner. [expiresAt] and [gracePeriodSeconds] are
+ * -1 where there is no registrar entry. [error] null with nothing set = nothing on chain.
+ */
+data class EnsOwnership(
+    val name: String,
+    val registrantHex: String?,
+    val managerHex: String?,
+    val wrapped: Boolean,            // the registry owner is the chain's NameWrapper
+    val resolverHex: String?,
+    val expiresAt: Long,             // unix seconds; -1 when none
+    val gracePeriodSeconds: Long,    // -1 when none
+    val blockNumber: Long,           // -1 when none
+    val verified: Boolean,           // true iff beacon-verified finalized state
+    val error: String?,              // null unless the read itself failed
+) {
+    /** Something is on chain for the name — a holder, a resolver or an expiry. Whether a `.eth`
+     *  name is TAKEN is a question of time ([expiresAt] + [gracePeriodSeconds] against the clock). */
+    val known: Boolean get() =
+        registrantHex != null || managerHex != null || resolverHex != null || expiresAt >= 0
+}
 
 /** Persisted per-network + shared settings, abstracted from Android SharedPreferences. */
 interface Settings {
@@ -275,11 +361,36 @@ interface Settings {
     /**
      * true = route verified reads over Tor (docs/privacy-and-tor.md) — experimental, and
      * Rust-engine-only (Arti is embedded in the Rust engine). Default false. Hosts that
-     * can't support it keep the default no-op getter/setter so Android/iOS still compile;
-     * the desktop actual persists it and [NodeController.applyTorMode] pushes it down.
+     * can't support it keep the default no-op getter/setter so iOS still compiles; the
+     * desktop and Android actuals persist it and [NodeController.applyTorMode] pushes it
+     * down.
      */
     fun torEnabled(): Boolean = false
     fun setTorEnabled(v: Boolean) {}
+
+    /**
+     * Web page access (#502): which browser origins may use the JSON-RPC listeners —
+     * one policy for every network (the user trusts a site, not a site-per-chain).
+     * Default [WebAccessMode.ALLOWLIST] with no entries, i.e. every web page is
+     * refused until allowed; native wallets are never affected. Hosts persist it and
+     * [NodeController.applyWebAccess] pushes it to the running listeners. Defaults
+     * keep hosts without the seam compiling (iOS, for now).
+     */
+    fun webAccessMode(): WebAccessMode = WebAccessMode.ALLOWLIST
+    fun setWebAccessMode(mode: WebAccessMode) {}
+
+    /** The sites [WebAccessMode.ALLOWLIST] admits, as [WebAccessUi.normalize]d origins. */
+    fun webAccessOrigins(): List<String> = emptyList()
+    fun setWebAccessOrigins(origins: List<String>) {}
+
+    /**
+     * Whether this host persists the policy AND pushes it to its listeners — the Web page
+     * access section and the Status tab's refusal banner show only then (the
+     * [supportsIdleSleep]/[supportsAppNap] precedent): a control whose writes the host
+     * drops would be accepted-and-ignored. Default false; iOS is the host without the
+     * seam for now, and its listener runs the engine default (specific sites, none).
+     */
+    fun supportsWebAccess(): Boolean = false
 
     /** Opt-in eth_getLogs watch-list index, per network. Defaults keep hosts
      *  without the feature compiling; the host actuals persist it and
@@ -354,6 +465,28 @@ interface Settings {
      * battery-saving toggle there would imply a feature that can't take effect. Default false.
      */
     fun supportsIdleSleep(): Boolean = false
+
+    /**
+     * Expert mode: the Logs and Index tabs, the full Status rows and maintenance
+     * actions, and the advanced settings. Off by default — the normal screens are
+     * Status / Query / Settings. Deliberately NOT defaulted: every host persists it,
+     * because a switch that silently forgets its value on restart is the
+     * accepted-and-ignored failure this seam avoids elsewhere.
+     */
+    fun expertMode(): Boolean
+    fun setExpertMode(v: Boolean)
+
+    /**
+     * macOS App Nap opt-in (desktop only). false (default) = the process holds an
+     * NSProcessInfo activity so RPC never stalls while the window is hidden — today's
+     * behaviour; true = let macOS nap the app when it is not in focus. Defaults keep
+     * hosts without App Nap compiling; [NodeController.applyAppNap] pushes a change.
+     */
+    fun allowAppNap(): Boolean = false
+    fun setAllowAppNap(v: Boolean) {}
+
+    /** True only where [allowAppNap] can take effect (macOS desktop); the Power row shows only then. */
+    fun supportsAppNap(): Boolean = false
 }
 
 /** Device network connectivity, as an observable stream so the UI can react to changes. */
@@ -449,6 +582,10 @@ data class NodeSnapshot(
     // this build doesn't support (the API's UpgradeAdvisory; the EL detector is
     // Sepolia-only for now, the CL one runs everywhere). null = nothing detected.
     val upgrade: UpgradeNotice? = null,
+    // Web origins that tried this network's JSON-RPC listener this run (#502), most
+    // recent first — the Settings tab's "recent web pages" list and the Status tab's
+    // refusal banner. Empty when the host doesn't report it.
+    val webOrigins: List<WebOriginRow> = emptyList(),
 )
 
 /**

@@ -41,9 +41,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Foreground service that runs the ethp2p node — a stripped-down port of
- * {@code Main.runDaemon}: discv4 discovery + RLPx connector, no IPC, no beacon
- * client. Enough to verify peer discovery and handshakes work on Android.
+ * Foreground service that hosts the Myotis node on Android: one engine stack per enabled
+ * network (beacon light client, execution-layer peers, the loopback JSON-RPC listener),
+ * reached through the {@code :myotis-api} contract, with one documented exemption (CLAUDE.md:
+ * the TrueBlocks transaction-history scan, {@link #txHistoryService}, which takes the Java
+ * engine's raw connector via {@code debugStack}) — plus the host-side concerns around it:
+ * the ongoing notification, idle sleep and wake-on-request, the background catch-up passes,
+ * and the settings the Compose UI shares.
  */
 public final class NodeService extends Service {
 
@@ -130,8 +134,12 @@ public final class NodeService extends Service {
     private static final String K_STRICT_FRESHNESS = "strictStateFreshness";
     private static final String K_NATIVE_BLS = "nativeBls";
     private static final String K_PREFER_JAVA = "engine.preferJava";
+    private static final String K_TOR_ROUTING = "tor.routing";
     private static final String K_IDLE_PAUSE_MIN = "idlePauseMinutes";
     private static final String K_STAY_AWAKE_CHARGING = "stayAwakeWhileCharging";
+    private static final String K_EXPERT_MODE = "expertMode";
+    private static final String K_WEB_ACCESS_MODE = "webAccess.mode";
+    private static final String K_WEB_ACCESS_ORIGINS = "webAccess.origins";
     public static final int DEFAULT_IDLE_PAUSE_MIN = 5;
     public static final int DEFAULT_RPC_PORT = 8545;
     // Gnosis defaults to a distinct port so both networks can be added to MetaMask
@@ -538,6 +546,53 @@ public final class NodeService extends Service {
     public static void setStayAwakeWhileCharging(android.content.Context c, boolean v) {
         prefs(c).edit().putBoolean(K_STAY_AWAKE_CHARGING, v).apply();
     }
+    /** Expert mode (Logs/Index tabs, full Status rows, advanced settings). Off by default. */
+    public static boolean expertMode(android.content.Context c) {
+        return prefs(c).getBoolean(K_EXPERT_MODE, false);
+    }
+    public static void setExpertMode(android.content.Context c, boolean v) {
+        prefs(c).edit().putBoolean(K_EXPERT_MODE, v).apply();
+    }
+    /** Web page access (#502): which browser origins may use the JSON-RPC listeners, as an
+     *  {@link io.myotis.api.WebAccessMode} name. Default ALLOWLIST with no sites — every web
+     *  page refused until allowed; an unknown stored value (another build's) reads as that. */
+    public static String webAccessMode(android.content.Context c) {
+        String v = prefs(c).getString(K_WEB_ACCESS_MODE, io.myotis.api.WebAccessMode.ALLOWLIST.name());
+        try {
+            return io.myotis.api.WebAccessMode.valueOf(v).name();
+        } catch (IllegalArgumentException e) {
+            return io.myotis.api.WebAccessMode.ALLOWLIST.name();
+        }
+    }
+    public static void setWebAccessMode(android.content.Context c, String mode) {
+        prefs(c).edit().putString(K_WEB_ACCESS_MODE, io.myotis.api.WebAccessMode.valueOf(mode).name()).apply();
+    }
+    /** The allowed sites, in the order added (newline-separated in the pref: an origin never
+     *  holds one). The UI stores them normalized; the engine normalizes again regardless. */
+    public static List<String> webAccessOrigins(android.content.Context c) {
+        String v = prefs(c).getString(K_WEB_ACCESS_ORIGINS, "");
+        List<String> out = new ArrayList<>();
+        for (String o : v.split("\n")) {
+            String t = o.trim();
+            if (!t.isEmpty() && !out.contains(t)) out.add(t);
+        }
+        return out;
+    }
+    public static void setWebAccessOrigins(android.content.Context c, List<String> origins) {
+        StringBuilder sb = new StringBuilder();
+        for (String o : origins) {
+            String t = o == null ? "" : o.trim();
+            if (t.isEmpty() || t.indexOf('\n') >= 0) continue;
+            if (sb.length() > 0) sb.append('\n');
+            sb.append(t);
+        }
+        prefs(c).edit().putString(K_WEB_ACCESS_ORIGINS, sb.toString()).apply();
+    }
+    /** The policy the engine is handed, from the prefs. */
+    public static io.myotis.api.WebAccessPolicy webAccessPolicy(android.content.Context c) {
+        return new io.myotis.api.WebAccessPolicy(
+                io.myotis.api.WebAccessMode.valueOf(webAccessMode(c)), webAccessOrigins(c));
+    }
     /** Whether RPC state reads use the strict 2-min head-staleness bound. Default true
      *  (strict). Relaxing it (toggle OFF strict / ON "relaxed") lets eth_call / balance /
      *  estimateGas serve an older root — but that *backfired* into 120-s confirm-screen
@@ -620,6 +675,78 @@ public final class NodeService extends Service {
         io.myotis.engines.Engines.select(choice);
         return choice;
     }
+    /** Settings toggle: route account (balance/nonce) reads over Tor (docs/privacy-and-tor.md).
+     *  Default off. Experimental and Rust-engine-only, and only a {@code -PtorEngine} build can
+     *  honour it ({@link #torSupported}) — the Settings row is shown only there, so a Tor-less
+     *  build never offers a privacy switch it would ignore. Applied by {@link #applyTorMode}. */
+    public static boolean torEnabled(android.content.Context c) {
+        return prefs(c).getBoolean(K_TOR_ROUTING, false);
+    }
+    public static void setTorEnabled(android.content.Context c, boolean v) {
+        prefs(c).edit().putBoolean(K_TOR_ROUTING, v).apply();
+    }
+    /** Whether this build can route over Tor at all: an APK built with {@code -PtorEngine}
+     *  ({@link BuildConfig#TOR_ENGINE}) whose loaded engine library confirms it. Every other
+     *  APK answers false without touching the native library. Constant for the process. */
+    public static boolean torSupported() {
+        return BuildConfig.TOR_ENGINE && io.myotis.engines.Tor.supported();
+    }
+    /** Arti's state directory (guard selection — never backed up: it describes this device's
+     *  path into Tor) and its directory cache (re-downloadable, so the system may reclaim it).
+     *  Both app-private. Named explicitly because Arti's defaults derive from {@code $HOME},
+     *  which an app process has no usable value for — the engine refuses to bootstrap without. */
+    static java.io.File torStateDir(android.content.Context c) {
+        return new java.io.File(c.getNoBackupFilesDir(), "arti/state");
+    }
+    static java.io.File torCacheDir(android.content.Context c) {
+        return new java.io.File(c.getCacheDir(), "arti");
+    }
+    /** Serializes {@link #applyTorMode}'s read-the-pref-then-push: it runs on boot workers
+     *  and on the UI thread (the Settings switch), and an older value pushed after a newer
+     *  one would leave reads on the clearnet pool while the switch shows ON. */
+    private static final Object TOR_APPLY_LOCK = new Object();
+
+    /** Push the Tor setting to the process-global Rust-engine flag. LIVE, unlike the engine
+     *  choice: the engine checks the flag per read, so the next account read of a running
+     *  Rust-engine network routes over Tor (or stops doing so) with no restart. Turning it on
+     *  names Arti's directories first; an OFF that never followed an ON stays a no-op that
+     *  does not load the native library ({@code Tor.select}). Re-applied on each boot of a
+     *  network the Rust engine may host (not under a forced Java engine, which has no Tor
+     *  path), because the flag lives in the native library and so starts off in every new
+     *  process.
+     *  Returns the verdict for the boot log: {@code off}, {@code on}, {@code unsupported}
+     *  (ON in Settings, but no Tor in this build — a pref left over from a {@code -PtorEngine}
+     *  install, whose Settings row this build hides; like the desktop with a Tor-less dylib,
+     *  reads stay on the clearnet pool because this engine has no Tor path to refuse with),
+     *  or {@code storage refused} (ON, but Arti cannot bootstrap: reads routed over Tor fail
+     *  closed — never quietly fall back to the clearnet pool). */
+    public static String applyTorMode(android.content.Context c) {
+        synchronized (TOR_APPLY_LOCK) {
+            boolean on = torEnabled(c);
+            if (!on) {
+                io.myotis.engines.Tor.select(false);
+                return "off";
+            }
+            if (!torSupported()) {
+                LogBuffer.w(TAG, "Tor routing is ON in Settings but this build has no Tor "
+                        + "support (needs an APK built with -PtorEngine, with the Rust engine): "
+                        + "account reads use the clearnet peer pool");
+                return "unsupported"; // nothing to push: no Tor path exists in this engine
+            }
+            boolean stored = io.myotis.engines.Tor.configureStorage(
+                    torStateDir(c).getAbsolutePath(), torCacheDir(c).getAbsolutePath());
+            if (!stored) {
+                LogBuffer.w(TAG, "Tor storage directories refused: reads routed over Tor "
+                        + "will fail closed");
+            }
+            if (!io.myotis.engines.Tor.select(true)) {
+                // torSupported() said yes a moment ago; only a failing native call lands here.
+                LogBuffer.w(TAG, "Tor routing could not be pushed to the engine");
+                return "unsupported";
+            }
+            return stored ? "on" : "storage refused";
+        }
+    }
     /** Whether this device's ART can run the Java engine at all (see {@link EngineGate}). */
     public static boolean javaEngineSupported() {
         return EngineGate.javaEngineSupported(android.os.Build.VERSION.SDK_INT);
@@ -656,6 +783,45 @@ public final class NodeService extends Service {
         // Same monitor as buildAndStart's read-apply-publish: see the comment there.
         synchronized (handles) {
             for (ChainHandle h : handles.values()) h.setWsBoundPeriods(c);
+        }
+    }
+
+    /** Live-apply the persisted web-page policy (#502) to every live listener. Callers
+     *  persist first (the Settings section, the notification's Allow), then call this —
+     *  same monitor as the boot path's pre-start apply, so a change landing mid-boot is
+     *  either seen there or reaches the handle here. */
+    public void applyWebAccess() {
+        synchronized (handles) {
+            for (ChainHandle h : handles.values()) applyWebAccessTo(h);
+        }
+    }
+
+    /** Hand {@code h} the persisted policy and log it if the engine dropped an entry: the
+     *  UI only stores normalized origins, so a difference means a corrupt pref — logged,
+     *  never silently applied as something else (CLAUDE.md, Trust). Caller holds the
+     *  handles monitor. */
+    private void applyWebAccessTo(ChainHandle h) {
+        io.myotis.api.WebAccessPolicy asked = webAccessPolicy(this);
+        io.myotis.api.WebAccessPolicy applied = h.setWebAccessPolicy(asked);
+        // Per-entry lists on both sides: only a dropped entry makes them differ.
+        if (applied.origins().size() != asked.origins().size()) {
+            LogBuffer.w(TAG, "web page access: not every allowed site is an origin — asked "
+                    + asked.origins() + ", applying " + applied.origins());
+        }
+    }
+
+    /** The web origins that tried a RUNNING network's listener this run, most recent
+     *  first; empty when the network isn't hosted. In memory only (browsing history). */
+    public List<io.myotis.api.WebOrigin> recentWebOrigins(String network) {
+        ChainHandle handle;
+        synchronized (handles) {
+            handle = handles.get(canonicalNetwork(network));
+        }
+        if (handle == null) return List.of();
+        try {
+            return handle.recentWebOrigins();
+        } catch (RuntimeException e) {
+            return List.of();
         }
     }
 
@@ -1100,12 +1266,18 @@ public final class NodeService extends Service {
      *  "synced + warm head" bar the daily catch-up waits for before pausing again. */
     private static boolean isSyncedWarm(ChainHandle h) {
         try {
-            StatusSnapshot s = h.status();
-            return s.beaconState() == BeaconState.SYNCED
-                    && s.verifiedHeadAgeMs() != Long.MAX_VALUE;
+            return syncedWarmOrThrow(h);
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    /** {@link #isSyncedWarm} for the background passes, which stop waiting on a
+     *  stack whose status() throws instead of reading it as "not yet". */
+    private static boolean syncedWarmOrThrow(ChainHandle h) {
+        StatusSnapshot s = h.status();
+        return s.beaconState() == BeaconState.SYNCED
+                && s.verifiedHeadAgeMs() != Long.MAX_VALUE;
     }
 
     /** True once a still-unsynced stack has been running past {@link #SYNC_RUN_CEILING_MS}, measured
@@ -1123,8 +1295,13 @@ public final class NodeService extends Service {
      *  can't be read, so a transient query error doesn't wrongly let the idle tick pause a
      *  still-syncing stack. */
     private boolean networkAvailable() {
+        return networkAvailable(this);
+    }
+
+    /** {@link #networkAvailable()} for callers without a service instance (the workers). */
+    static boolean networkAvailable(android.content.Context c) {
         try {
-            ConnectivityManager cm = getSystemService(ConnectivityManager.class);
+            ConnectivityManager cm = c.getSystemService(ConnectivityManager.class);
             if (cm == null) return true;
             Network net = cm.getActiveNetwork();
             if (net == null) return false;
@@ -1142,8 +1319,13 @@ public final class NodeService extends Service {
      *  when plugged in but momentarily discharging under load. Fail-safe to false so a read error
      *  never blocks a pause. */
     private boolean isCharging() {
+        return isCharging(this);
+    }
+
+    /** {@link #isCharging()} for callers without a service instance (the workers). */
+    static boolean isCharging(android.content.Context c) {
         try {
-            android.content.Intent i = registerReceiver(null,
+            android.content.Intent i = c.registerReceiver(null,
                     new android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED));
             if (i != null
                     && i.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0) != 0) {
@@ -1153,7 +1335,7 @@ public final class NodeService extends Service {
             // fall through to the charge-state check
         }
         try {
-            android.os.BatteryManager bm = getSystemService(android.os.BatteryManager.class);
+            android.os.BatteryManager bm = c.getSystemService(android.os.BatteryManager.class);
             return bm != null && bm.isCharging();
         } catch (Throwable t) {
             return false;
@@ -1178,7 +1360,9 @@ public final class NodeService extends Service {
      * The daily maintenance pass ({@link CatchUpWorker}): for each idle-PAUSED stack,
      * resume, wait until the beacon client is SYNCED and the verified head is warm (or
      * the per-network budget slice runs out), and pause again — but only if no real
-     * activity arrived meanwhile (then the idle controller owns the stack again).
+     * activity arrived meanwhile and "stay awake while charging" does not apply on an
+     * unmetered network (then the idle controller owns the stack again; see
+     * {@link #catchUpPass}).
      *
      * <p>Two distinct clocks, deliberately: the worker never touches the ENGINE's
      * activity clock ({@code lastActivityEpochMillis}), so the "did real activity
@@ -1191,36 +1375,139 @@ public final class NodeService extends Service {
      * <p>Static: the Worker has no binder; ENGINE / BOOT_LOCKS / the idle stamps are
      * all process-global.
      */
-    public static void dailyCatchUp(long budgetMs) {
-        List<String> hosted = ENGINE.hostedNetworks();
-        if (hosted.isEmpty()) return;
-        long sliceMs = Math.max(30_000L, budgetMs / hosted.size());
-        for (String n : hosted) {
+    public static void dailyCatchUp(android.content.Context c, long budgetMs) {
+        catchUpPass(c, "daily catch-up", budgetMs, NodeService::syncedWarmOrThrow);
+    }
+
+    /**
+     * The charging + unmetered pass ({@link ChargingCatchUpWorker}): the daily pass's
+     * resume → wait → pause, but the wait also covers the LOG INDEX — it lasts until
+     * head-follow has closed the gap the paused hours opened
+     * ({@code LogIndexStatus.headCaughtUp}), not just until the beacon is SYNCED.
+     * Without it a phone that paused in the evening and charged all night woke up
+     * thousands of blocks behind, because "stay awake while charging" only keeps a
+     * RUNNING stack from pausing — it never wakes a paused one.
+     */
+    public static void chargingCatchUp(android.content.Context c, long budgetMs) {
+        catchUpPass(c, "charging catch-up", budgetMs,
+                h -> syncedWarmOrThrow(h) && logIndexAtHead(h));
+    }
+
+    /** The log index has nothing left for head-follow to close (or no index at all). Only a
+     *  handle that THROWS ends the wait early; an engine that answers an error envelope (the
+     *  Rust probe does, rather than throw) reads as not caught up, so the wait runs out its
+     *  slice — bounded, and the pass then pauses as usual. */
+    private static boolean logIndexAtHead(ChainHandle h) {
+        return io.myotis.ui.LogIndexStatus.headCaughtUp(h.logIndexStatusJson());
+    }
+
+    /** Whether a background pass leaves the stack it resumed running: the idle controller's
+     *  "stay awake while charging" rule (setting on, plugged in, network up — while it holds
+     *  the idle ticker never pauses a RUNNING stack, so a pass must not either), narrowed to
+     *  an UNMETERED network. A pass starts without user interaction, and the daily one only
+     *  needs a connection, so on a charging phone on cellular it would otherwise turn its
+     *  bounded catch-up into a run that lasts until unplugged; there it resumes, catches up
+     *  and pauses like any other pass. */
+    private static boolean leaveAwakeAfterPass(android.content.Context c) {
+        return stayAwakeWhileCharging(c) && isCharging(c) && networkAvailable(c)
+                && activeNetworkUnmetered(c);
+    }
+
+    /** True when the active network is unmetered. Fail-safe to false (metered), so a read
+     *  error ends a background pass with a pause rather than an unbounded run. */
+    private static boolean activeNetworkUnmetered(android.content.Context c) {
+        try {
+            ConnectivityManager cm = c.getSystemService(ConnectivityManager.class);
+            return cm != null && !cm.isActiveNetworkMetered();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** Held for the whole of a background pass. The daily and the charging workers are
+     *  separate unique works whose constraints overlap on a charging phone on Wi-Fi; two
+     *  interleaved passes would pause each other's stacks mid-wait (the daily bar is met
+     *  first) and misread each other's activity baseline. The later pass skips instead —
+     *  waiting for the lock would eat into its own WorkManager time limit. */
+    private static final AtomicBoolean CATCH_UP_PASS_RUNNING = new AtomicBoolean(false);
+
+    /** Below this much remaining pass budget a resume is not worth starting: it would be
+     *  paused again before it had time to sync anything. Also the per-stack floor. */
+    private static final long MIN_SLICE_MS = 30_000L;
+
+    /**
+     * Shared body of the background passes. For each idle-PAUSED stack: resume it, then
+     * <ul>
+     *   <li>if {@link #leaveAwakeAfterPass} — leave it running. The idle controller now keeps
+     *       it awake and following the head while the device stays plugged in, and pauses
+     *       it on the ordinary idle rules once unplugged; pausing it here would undo the
+     *       user's setting until the next pass;</li>
+     *   <li>otherwise wait until {@code caughtUp} holds (or its budget slice runs out, or
+     *       it throws — a stack that cannot report status is not worth the rest of the
+     *       slice), and pause again unless real activity arrived meanwhile.</li>
+     * </ul>
+     * The slices share one pass deadline: a stack that catches up early hands its unused
+     * time to the stacks after it, and no slice runs past the deadline.
+     */
+    private static void catchUpPass(android.content.Context c, String label, long budgetMs,
+                                    java.util.function.Predicate<ChainHandle> caughtUp) {
+        if (!CATCH_UP_PASS_RUNNING.compareAndSet(false, true)) {
+            LogBuffer.i(TAG, label + ": another catch-up pass is running; skipping this one");
+            return;
+        }
+        try {
+            runCatchUpPass(c, label, budgetMs, caughtUp);
+        } finally {
+            CATCH_UP_PASS_RUNNING.set(false);
+        }
+    }
+
+    private static void runCatchUpPass(android.content.Context c, String label, long budgetMs,
+                                       java.util.function.Predicate<ChainHandle> caughtUp) {
+        List<String> paused = new ArrayList<>();
+        for (String n : ENGINE.hostedNetworks()) {
+            ChainHandle h = ENGINE.get(n);
+            if (h != null && h.lifecycle() == io.myotis.api.LifecycleState.PAUSED) paused.add(n);
+        }
+        // Monotonic deadlines (nanoTime, overflow-safe compare) so an NTP/wall-clock
+        // step can't cut the pass short or hang it.
+        long passEndNano = System.nanoTime() + budgetMs * 1_000_000L;
+        for (int i = 0; i < paused.size(); i++) {
+            String n = paused.get(i);
             ChainHandle h = ENGINE.get(n);
             if (h == null || h.lifecycle() != io.myotis.api.LifecycleState.PAUSED) continue;
+            boolean stayAwake = leaveAwakeAfterPass(c);
+            long remainingMs = (passEndNano - System.nanoTime()) / 1_000_000L;
+            if (!stayAwake && remainingMs < MIN_SLICE_MS) {
+                LogBuffer.i(TAG, label + ": budget spent; leaving the remaining stacks paused");
+                return;
+            }
+            long sliceMs = Math.min(remainingMs,
+                    Math.max(MIN_SLICE_MS, remainingMs / (paused.size() - i)));
             long activityBefore = h.lastActivityEpochMillis();
-            LogBuffer.i(TAG, "[" + n + "] daily catch-up: resuming");
+            LogBuffer.i(TAG, "[" + n + "] " + label + ": resuming");
             boolean resumed;
             synchronized (bootLock(n)) {
+                // Re-check under the lock, like every other wake path: a stop or a disable
+                // may have raced the worker, and must not get its stack restarted.
+                if (!RUNNING.get() || ENGINE.get(n) != h || !isNetworkEnabled(c, n)) continue;
                 // Hold the grace stamp BEFORE resume returns RUNNING, so the idle ticker
                 // can't pause the stack in the window between resume() and the loop.
                 lastResumeMs.put(n, System.currentTimeMillis());
                 resumed = h.resume(io.myotis.api.WakeReason.CATCH_UP);
             }
-            if (!resumed) continue; // stays paused; next daily run retries
-            // Monotonic deadline (nanoTime, overflow-safe compare) so an NTP/wall-clock
-            // step can't cut the pass short or hang it.
+            if (!resumed) continue; // stays paused; the next run retries
+            if (stayAwake) {
+                LogBuffer.i(TAG, "[" + n + "] " + label + ": charging; staying awake");
+                continue;
+            }
             long deadlineNano = System.nanoTime() + sliceMs * 1_000_000L;
             while (System.nanoTime() - deadlineNano < 0) {
                 // Refresh the grace stamp each iteration: keeps now-lastResumeMs well under
                 // any idle window (min 60s) so the 30s idle ticker never pauses us mid-pass.
                 lastResumeMs.put(n, System.currentTimeMillis());
                 try {
-                    StatusSnapshot s = h.status();
-                    if (s.beaconState() == BeaconState.SYNCED
-                            && s.verifiedHeadAgeMs() != Long.MAX_VALUE) {
-                        break;
-                    }
+                    if (caughtUp.test(h)) break;
                     Thread.sleep(5_000);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -1229,16 +1516,18 @@ public final class NodeService extends Service {
                     break;
                 }
             }
-            // Real user/RPC activity arrived mid-catch-up → leave the stack to the
-            // idle controller; otherwise go straight back to sleep (pause persists
-            // the freshly-caught-up snapshot).
-            if (h.lastActivityEpochMillis() == activityBefore) {
+            // Real user/RPC activity arrived mid-catch-up, or the device went on the charger
+            // meanwhile → leave the stack to the idle controller; otherwise go straight back
+            // to sleep (pause persists the freshly-caught-up snapshot).
+            if (h.lastActivityEpochMillis() != activityBefore) {
+                LogBuffer.i(TAG, "[" + n + "] " + label + ": activity arrived; staying awake");
+            } else if (leaveAwakeAfterPass(c)) {
+                LogBuffer.i(TAG, "[" + n + "] " + label + ": charging; staying awake");
+            } else {
                 synchronized (bootLock(n)) {
                     try { h.pause(); } catch (Throwable ignored) {}
                 }
-                LogBuffer.i(TAG, "[" + n + "] daily catch-up done; paused again");
-            } else {
-                LogBuffer.i(TAG, "[" + n + "] daily catch-up: activity arrived; staying awake");
+                LogBuffer.i(TAG, "[" + n + "] " + label + " done; paused again");
             }
         }
     }
@@ -1271,14 +1560,14 @@ public final class NodeService extends Service {
      */
     private String[] notificationText() {
         if (allStacksPaused()) {
-            return new String[]{"ethp2p node sleeping", "Networking off — a wallet request wakes it"};
+            return new String[]{"Myotis node sleeping", "Networking off — a wallet request wakes it"};
         }
         if (!networkAvailable()) {
             // Actively meant to be running, but the device has no connectivity — surface it: the
             // node can't discover peers or sync until a network returns.
-            return new String[]{"ethp2p node running", "No network connection"};
+            return new String[]{"Myotis node running", "No network connection"};
         }
-        return new String[]{"ethp2p node running", readinessSummary()};
+        return new String[]{"Myotis node running", readinessSummary()};
     }
 
     /** Per-network readiness on one line, e.g. {@code "mainnet ready · gnosis syncing"}; sorted by
@@ -1474,7 +1763,8 @@ public final class NodeService extends Service {
             boolean blsVerified,             // beacon match was BLS-signed (vs. unverified header)
             long matchedBeaconSlot,          // -1 when not matched
             String verifyMethod,             // "stateRootMatch" or null
-            String failReason                // null when verified
+            String failReason,               // null when verified
+            long blockTimestamp              // blockNumber's proven timestamp (unix s); -1 when none
     ) {}
 
     @Override
@@ -1489,15 +1779,13 @@ public final class NodeService extends Service {
      * <p>Two verification methods, mirroring the JVM daemon
      * ({@code CommandHandler#buildVerificationJson} for {@code get-account}):
      * <ul>
-     *   <li><b>headerChain</b> (load-bearing path) — fetch the contiguous
-     *       header range {@code [finalizedBlock .. peerBlock]} via eth/68
-     *       from the same peer that served the proof, verify the
-     *       parent-hash chain, and require the first header's stateRoot
-     *       to equal the BLC-finalized execution stateRoot and the last
-     *       header's stateRoot to equal the peer-reported stateRoot. This
-     *       is what succeeds in normal operation, because snap peers serve
-     *       proofs at their head while the BLC's attested-root window
-     *       trails finalized + a few recent optimistic slots.</li>
+     *   <li><b>headerChain</b> — fetch the contiguous header range
+     *       {@code [peerBlock .. optimisticHead]}, verify the parent-hash
+     *       chain, and require the last header to hash to the BLC's attested
+     *       optimistic block hash and the first header's stateRoot to equal
+     *       the peer-reported stateRoot (trust flows only down from an
+     *       attested hash). The engine runs this ladder; see
+     *       {@code VerifiedAccountQuery} / the Rust {@code el::verify}.</li>
      *   <li><b>stateRootMatch</b> (fast-path shortcut) — if the peer's
      *       reported stateRoot happens to be one the BLC has already
      *       attested ({@code BeaconSyncState.findStateRoot}), skip the
@@ -1602,7 +1890,8 @@ public final class NodeService extends Service {
                 r.address(), r.exists(), r.nonce(), r.balanceWei(),
                 r.storageRootHex(), r.codeHashHex(), r.blockNumber(),
                 r.peerStateRootHex(), r.peerProofValid(), r.beaconChainVerified(),
-                r.blsVerified(), r.matchedBeaconSlot(), r.verifyMethod(), r.failReason());
+                r.blsVerified(), r.matchedBeaconSlot(), r.verifyMethod(), r.failReason(),
+                r.blockTimestamp());
     }
 
     // ---------------------------------------------------------------------
@@ -1645,7 +1934,14 @@ public final class NodeService extends Service {
      * cryptographically anchored; false in PEER_HEAD mode (peer-claimed mapping).
      */
     public record EnsResolution(String name, String addressHex, long blockNumber,
-                                boolean beaconVerified, String error) {}
+                                boolean beaconVerified, String error,
+                                long blockTimestamp /* unix s, verified header; -1 when none */) {}
+
+    /** One ENS record beyond the address ({@link #resolveEnsRecord}): a text record under
+     *  its key, or the contenthash under the key {@code contenthash} (0x multicodec hex).
+     *  value null + error null = the name has no such record. */
+    public record EnsRecordAnswer(String key, String value, long blockNumber,
+                                  boolean beaconVerified, String error) {}
 
     /**
      * Which state ENS resolution runs against. Defaults to AUTO (beacon-verified
@@ -1687,13 +1983,13 @@ public final class NodeService extends Service {
         // a chain that can't have them; the UI also hides the ENS path there.
         if (!networkInfo(n).hasEns()) {
             return CompletableFuture.completedFuture(new EnsResolution(
-                    trimmed, null, -1, false, "ENS is not available on " + n));
+                    trimmed, null, -1, false, "ENS is not available on " + n, -1));
         }
         ChainHandle handle = handles.get(n);
         io.myotis.api.EnsApi ens = handle != null ? handle.ens() : null;
         if (!RUNNING.get() || ens == null) {
             return CompletableFuture.completedFuture(
-                    new EnsResolution(trimmed, null, -1, false, "node not running on " + n));
+                    new EnsResolution(trimmed, null, -1, false, "node not running on " + n, -1));
         }
         // Delegate to the engine's shared resolution machinery (one AUTO → FINALIZED →
         // PEER_HEAD policy for daemon + desktop + Android). The engine call is blocking —
@@ -1703,10 +1999,76 @@ public final class NodeService extends Service {
         return CompletableFuture.supplyAsync(() -> {
             EnsResolutionResult r = ens.resolveAddress(trimmed, root);
             return new EnsResolution(r.name(), r.addressHex(), r.blockNumber(),
-                    r.verified(), r.error());
+                    r.verified(), r.error(), r.blockTimestamp());
         }, QUERY_POOL);
     }
 
+
+    /**
+     * One record of {@code name} beyond the address — the contenthash for the key
+     * {@code contenthash}, else the ENSIP-5 text record under {@code key} — through the
+     * engine's ENS API on the query pool, like {@link #resolveEns}. Never throws: a read
+     * that failed answers with its error in the record.
+     */
+    public CompletableFuture<EnsRecordAnswer> resolveEnsRecord(String network, String name, String key) {
+        noteUiActivity();
+        final String trimmed = name == null ? "" : name.trim();
+        final String n = canonicalNetwork(network);
+        if (!networkInfo(n).hasEns()) {
+            return CompletableFuture.completedFuture(
+                    new EnsRecordAnswer(key, null, -1, false, "ENS is not available on " + n));
+        }
+        ChainHandle handle = handles.get(n);
+        io.myotis.api.EnsApi ens = handle != null ? handle.ens() : null;
+        if (!RUNNING.get() || ens == null) {
+            return CompletableFuture.completedFuture(
+                    new EnsRecordAnswer(key, null, -1, false, "node not running on " + n));
+        }
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                if ("contenthash".equals(key)) {
+                    var r = ens.resolveContenthash(trimmed);
+                    return new EnsRecordAnswer(key, r.contenthashHex(), r.blockNumber(), r.verified(), r.error());
+                }
+                var r = ens.resolveText(trimmed, key);
+                return new EnsRecordAnswer(key, r.value(), r.blockNumber(), r.verified(), r.error());
+            } catch (RuntimeException e) {
+                // The Java engine's adapter throws for a stopped / not-woken node where the
+                // Rust adapter folds that into error(); fold it here so the answer is uniform.
+                return new EnsRecordAnswer(key, null, -1, false,
+                        e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
+            }
+        }, QUERY_POOL);
+    }
+
+    /**
+     * Who holds {@code name} (the engine API's {@code resolveOwnership}) on the query
+     * pool, like {@link #resolveEns}. Never throws: a failed read answers with its
+     * error in the record.
+     */
+    public CompletableFuture<io.myotis.api.EnsOwnershipResult> resolveEnsOwnership(String network, String name) {
+        noteUiActivity();
+        final String trimmed = name == null ? "" : name.trim();
+        final String n = canonicalNetwork(network);
+        if (!networkInfo(n).hasEns()) {
+            return CompletableFuture.completedFuture(new io.myotis.api.EnsOwnershipResult(
+                    trimmed, null, null, false, null, -1, -1, -1, -1, false, "ENS is not available on " + n));
+        }
+        ChainHandle handle = handles.get(n);
+        io.myotis.api.EnsApi ens = handle != null ? handle.ens() : null;
+        if (!RUNNING.get() || ens == null) {
+            return CompletableFuture.completedFuture(new io.myotis.api.EnsOwnershipResult(
+                    trimmed, null, null, false, null, -1, -1, -1, -1, false, "node not running on " + n));
+        }
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return ens.resolveOwnership(trimmed);
+            } catch (RuntimeException e) {
+                return new io.myotis.api.EnsOwnershipResult(trimmed, null, null, false, null, -1, -1, -1, -1, false,
+                        e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
+            }
+        }, QUERY_POOL);
+    }
 
     /** DNS server IPs for the active network, for EIP-1459 ENR-tree TXT lookups.
      *  dnsjava has no system resolver config on Android, so we feed it these
@@ -1751,6 +2113,16 @@ public final class NodeService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // The refusal notification's Allow (#502) arrives as a start command on the
+        // running service: persist + apply, and never treat it as a node start. A
+        // service that is NOT running (its notifications are dropped at shutdown, so
+        // this is the rare stale tap) persists the site and goes away again.
+        if (intent != null && ACTION_ALLOW_WEB_ORIGIN.equals(intent.getAction())) {
+            allowWebOrigin(intent.getStringExtra(EXTRA_WEB_ORIGIN),
+                    intent.getIntExtra(EXTRA_WEB_NOTIFICATION_ID, -1));
+            if (!RUNNING.get()) stopSelf(startId);
+            return START_NOT_STICKY;
+        }
         // The system may redeliver onStartCommand (e.g. repeated taps, or a
         // restart race with stopService). Guard so we don't boot two copies
         // of the node racing for the same UDP/TCP ports.
@@ -1774,6 +2146,7 @@ public final class NodeService extends Service {
         startForeground(NOTIFICATION_ID, buildNotification(tt0[0], tt0[1]),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
         startIdleTicker();
+        startWebRefusalPoll();
         registerNotifNetworkCallback();
 
         // Boot every enabled network as its own stack (Step 9). Each Netty/libp2p boot is
@@ -1805,11 +2178,20 @@ public final class NodeService extends Service {
             // Same idea for the engine choice: the Settings toggle also applies it on flip,
             // re-applying here makes a freshly (re)started network honor the current setting.
             String engineChoice = applyEngineChoice(this);
+            // And the Tor flag (process-global and live; see applyTorMode) — but only for a
+            // network the Rust engine may host: a Java-engine network has no Tor path, so
+            // pushing (and loading the native library to push) would only make this line
+            // claim routing that cannot happen. A Rust network already running keeps the
+            // flag its own boot or the Settings switch pushed.
+            String torMode = "java".equals(engineChoice)
+                    ? "n/a (java engine has no Tor path)"
+                    : applyTorMode(this);
             LogBuffer.i(TAG, "[" + n + "] booting (snap target " + snapTarget(this)
                     + ", rpc port " + rpcPort
                     + ", state-freshness " + (strictStateFreshness(this) ? "strict" : "relaxed")
                     + ", bls " + blsChoice
                     + ", engine " + engineChoice
+                    + ", tor " + torMode
                     + (javaEngineSupported() ? "" : " (Java engine needs API "
                             + EngineGate.JAVA_ENGINE_MIN_SDK + "+, no fallback)")
                     + ")");
@@ -1912,6 +2294,9 @@ public final class NodeService extends Service {
                     // Weak-subjectivity bound override rides the same pre-start apply
                     // + monitor: the cold-start gate must judge with it.
                     handle.setWsBoundPeriods(wsBoundPeriods(this));
+                    // Web page access (#502) too: the listener's first request must be
+                    // judged by the persisted policy, never the engine default.
+                    applyWebAccessTo(handle);
                     handles.put(n, handle);
                 }
 
@@ -2083,6 +2468,8 @@ public final class NodeService extends Service {
         cachedClCounts.clear();
         elCaches.clear();
         clCaches.clear();
+        stopWebRefusalPoll();
+        cancelWebRefusalNotifications();
         // Safe to clear: a Stop->Start just re-runs the SYNCED-once gate until the restarted
         // stack re-observes SYNCED — fast off the warm store, no freeze. stackStartMs is
         // deliberately NOT cleared here (it's static, per-network, and owned by boots): a
@@ -2415,21 +2802,262 @@ public final class NodeService extends Service {
         super.onDestroy();
     }
 
+    // ----- Web page refusals (#502): one notification per refused page, with Allow -----
+
+    /** Its own channel, HIGH importance: a refusal is a question for the user, and it
+     *  arrives while they are looking at the page that was refused — so it must peek
+     *  as a heads-up banner over the browser, Allow button included, not land silently
+     *  in the shade (the default-importance first cut did, and was missed). An overlay
+     *  over other apps would need the "display over other apps" permission, which
+     *  Android and Play discourage; a heads-up notification is the sanctioned way to
+     *  put a question on top of another app. A channel's importance is frozen when it
+     *  is first created, so the id carries a suffix: devices that already saw the
+     *  original channel get this one fresh, and the original is deleted. */
+    private static final String WEB_CHANNEL_ID = "ethp2p_web_access_alert";
+    /** The first cut's channel (default importance), removed once seen. */
+    private static final String LEGACY_WEB_CHANNEL_ID = "ethp2p_web_access";
+    /** Notification ids above the foreground one; one per refused origin this run. */
+    private static final int WEB_NOTIFICATION_BASE = 1000;
+    static final String ACTION_ALLOW_WEB_ORIGIN = "com.jaeckel.ethp2p.android.ALLOW_WEB_ORIGIN";
+    static final String EXTRA_WEB_ORIGIN = "origin";
+    /** The notification the Allow came from, so a tap that reaches a FRESH process (the
+     *  old one died, its notifications outlived it in the system) still clears it —
+     *  the new process's {@link #webNotified} knows nothing of it. */
+    static final String EXTRA_WEB_NOTIFICATION_ID = "notificationId";
+    /** How often the live listeners' recent-origins lists are checked for a new refusal —
+     *  a cheap in-memory read per network; the engine surface is a getter by design. */
+    private static final long WEB_REFUSAL_POLL_MS = 5_000;
+    /** Origins notified this run → their notification id: never twice for the same page,
+     *  however often it retries — until it is allowed (from the notification, the app or a
+     *  sighting the policy admitted), after which a fresh refusal is news again. Bounded by
+     *  {@link #WEB_NOTIFICATIONS_PER_RUN}: a local client rotating fake origins (the gate
+     *  lists only well-formed ones, but a native client can send any) must not churn a
+     *  notification per poll nor grow this map; past the cap nothing more is notified this
+     *  run, while the Status banner and the recent list keep showing everything. */
+    private final Map<String, Integer> webNotified = new ConcurrentHashMap<>();
+    /** Distinct origins notified per run at most; a real user never sees twenty sites refused. */
+    private static final int WEB_NOTIFICATIONS_PER_RUN = 20;
+    private volatile boolean webNotificationCapLogged;
+    /** The next notification id; ids are never reused within a run, so a re-armed origin's
+     *  new notification cannot collide with a stale one the user left on screen. */
+    private final java.util.concurrent.atomic.AtomicInteger webNotificationIds =
+            new java.util.concurrent.atomic.AtomicInteger(WEB_NOTIFICATION_BASE);
+    private volatile java.util.concurrent.ScheduledExecutorService webRefusalPoll;
+
+    private void startWebRefusalPoll() {
+        if (webRefusalPoll != null) return;
+        ensureWebRefusalChannel();
+        java.util.concurrent.ScheduledExecutorService ex =
+                Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "ethp2p-web-access");
+                    t.setDaemon(true);
+                    return t;
+                });
+        ex.scheduleWithFixedDelay(this::notifyWebRefusals,
+                WEB_REFUSAL_POLL_MS, WEB_REFUSAL_POLL_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        webRefusalPoll = ex;
+    }
+
+    private void stopWebRefusalPoll() {
+        java.util.concurrent.ScheduledExecutorService ex = webRefusalPoll;
+        if (ex != null) {
+            ex.shutdownNow();
+            webRefusalPoll = null;
+        }
+    }
+
+    /**
+     * One pass: every origin a live listener refused that the CURRENT policy still does
+     * not admit, and that was not notified yet, gets a notification. Nothing under Off
+     * (the user said no web pages — a refusal is the setting working) and nothing for
+     * the opaque origin {@code null}, which Allow could not admit. Guarded: a throw
+     * would silently end the schedule.
+     */
+    private void notifyWebRefusals() {
+        try {
+            io.myotis.api.WebAccessPolicy policy = webAccessPolicy(this);
+            if (policy.mode() != io.myotis.api.WebAccessMode.ALLOWLIST) return;
+            NotificationManager nm = getSystemService(NotificationManager.class);
+            List<ChainHandle> live;
+            synchronized (handles) {
+                live = new ArrayList<>(handles.values());
+            }
+            // Every listener's list folded into ONE entry per origin, the newest sighting
+            // winning (the UI's WebAccessUi.merge does the same). Each listener keeps its
+            // own list, so a page served on one network under a wider policy and refused
+            // on another since would be both "allowed" (stale) and "refused" (fresh);
+            // judged per listener, the stale entry would cancel and re-arm what the fresh
+            // refusal had just posted — a banner every pass. Judged once, the fresh
+            // refusal wins.
+            Map<String, io.myotis.api.WebOrigin> newest = new java.util.HashMap<>();
+            for (ChainHandle h : live) {
+                for (io.myotis.api.WebOrigin o : h.recentWebOrigins()) {
+                    io.myotis.api.WebOrigin prev = newest.get(o.origin());
+                    if (prev == null || o.lastSeenEpochMillis() >= prev.lastSeenEpochMillis()) {
+                        newest.put(o.origin(), o);
+                    }
+                }
+            }
+            for (io.myotis.api.WebOrigin o : newest.values()) {
+                String origin = o.origin();
+                if (o.lastAllowed() || policy.origins().contains(origin)) {
+                    // Allowed since (from the app, or served): the question is answered,
+                    // so its notification goes, and the origin is re-armed so a later
+                    // refusal — the user removed the site again — is notified afresh.
+                    Integer answered = webNotified.remove(origin);
+                    if (answered != null && nm != null) nm.cancel(answered);
+                    continue;
+                }
+                if ("null".equals(origin) || webNotified.containsKey(origin)) continue;
+                if (webNotified.size() >= WEB_NOTIFICATIONS_PER_RUN) {
+                    if (!webNotificationCapLogged) {
+                        webNotificationCapLogged = true;
+                        LogBuffer.w(TAG, "web page refusals: " + WEB_NOTIFICATIONS_PER_RUN
+                                + " origins notified this run, no more notifications until restart "
+                                + "(the Status screen still lists them)");
+                    }
+                    continue;
+                }
+                int id = webNotificationIds.getAndIncrement();
+                webNotified.put(origin, id);
+                postWebRefusalNotification(id, origin);
+            }
+        } catch (Throwable t) {
+            LogBuffer.w(TAG, "web refusal notification failed: " + t);
+        }
+    }
+
+    /**
+     * The refusal channel, created once per service start (beside the foreground one):
+     * HIGH importance, so a refusal peeks over the browser — unless the user had quieted
+     * or blocked the first cut's channel, whose importance is carried over: an app may
+     * pick any importance when it CREATES a channel and only lower it afterwards (on an
+     * existing id, createNotificationChannel rewrites name and description and can lower
+     * importance, never raise it — which is why the id changed), so this is the one
+     * moment a prior opt-out can be honoured. The first cut's channel is then deleted,
+     * so it does not linger in system settings beside this one.
+     */
+    private void ensureWebRefusalChannel() {
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        if (nm == null) return;
+        int importance = NotificationManager.IMPORTANCE_HIGH;
+        NotificationChannel legacy = nm.getNotificationChannel(LEGACY_WEB_CHANNEL_ID);
+        if (legacy != null) {
+            if (legacy.getImportance() < NotificationManager.IMPORTANCE_DEFAULT) {
+                importance = legacy.getImportance();   // quieted or blocked: keep it so
+            }
+            nm.deleteNotificationChannel(LEGACY_WEB_CHANNEL_ID);
+        }
+        NotificationChannel channel = new NotificationChannel(WEB_CHANNEL_ID, "Web page access", importance);
+        channel.setDescription("A web page tried to use the node and was refused. "
+                + "Allow lets it in; the Status screen shows the same.");
+        nm.createNotificationChannel(channel);
+    }
+
+    private void postWebRefusalNotification(int id, String origin) {
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        if (nm == null) return;
+        Intent allow = new Intent(this, NodeService.class)
+                .setAction(ACTION_ALLOW_WEB_ORIGIN)
+                .putExtra(EXTRA_WEB_ORIGIN, origin)
+                .putExtra(EXTRA_WEB_NOTIFICATION_ID, id);
+        // The request code is the notification id, so each origin's Allow is its own
+        // PendingIntent (equal intents with different extras would otherwise collapse).
+        android.app.PendingIntent allowIntent = android.app.PendingIntent.getService(this, id, allow,
+                android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT);
+        android.app.PendingIntent open = android.app.PendingIntent.getActivity(this, 0,
+                new Intent(this, MainActivity.class), android.app.PendingIntent.FLAG_IMMUTABLE);
+        String text = origin + " tried to use the node and was refused. Allow it only if you "
+                + "trust that site: it can then read balances and run calls through your node. "
+                + "The app's Status screen and Settings → Web page access show the same.";
+        // Allow grants a site access to the node: never from a locked phone. Android 12+
+        // asks for the unlock before firing the action; below that the notification is
+        // kept off the lock screen altogether (a "show sensitive content" lock screen
+        // would otherwise show the button to whoever holds the phone).
+        Notification.Action.Builder allowAction = new Notification.Action.Builder(null, "Allow", allowIntent);
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+            allowAction.setAuthenticationRequired(true);
+        }
+        Notification.Builder b = new Notification.Builder(this, WEB_CHANNEL_ID)
+                .setContentTitle("A web page was refused")
+                .setContentText(origin + " tried to use the node")
+                .setStyle(new Notification.BigTextStyle().bigText(text))
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentIntent(open)
+                // No auto-cancel: a stray tap on the banner's body opens the app but leaves
+                // the question, Allow included, in the shade. Allow (here or in the app)
+                // cancels it by id, shutdown drops it, a swipe dismisses it.
+                .addAction(allowAction.build());
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.S) {
+            b.setVisibility(Notification.VISIBILITY_SECRET);
+        }
+        nm.notify(id, b.build());
+        // nm.notify is a silent no-op when Myotis may not post notifications (an
+        // auto-started app never asked for the permission on Android 13+) and a channel
+        // turned down never peeks: say which, or "notified" would reproduce the missed
+        // banner this channel exists to fix, undiagnosably. The Status screen shows the
+        // refusal either way.
+        NotificationChannel channel = nm.getNotificationChannel(WEB_CHANNEL_ID);
+        if (!nm.areNotificationsEnabled()) {
+            LogBuffer.w(TAG, "web page refused: " + origin + " — notifications are off for Myotis, "
+                    + "so no banner; the Status screen shows it");
+        } else if (channel != null && channel.getImportance() < NotificationManager.IMPORTANCE_HIGH) {
+            LogBuffer.w(TAG, "web page refused: " + origin + " — the Web page access notification "
+                    + "channel is set below High, so no banner; the Status screen shows it");
+        } else {
+            LogBuffer.i(TAG, "web page refused, notified: " + origin);
+        }
+    }
+
+    /** The notification's Allow: persist the site, apply live, drop the notification — by
+     *  the id the intent carries ({@code notificationId}, {@code -1} when absent) as well
+     *  as the one this process posted, since a tap can reach a fresh process. The mode is
+     *  left alone — a refusal is notified only under Specific sites, and Off must not be
+     *  widened from a notification tap. */
+    private void allowWebOrigin(String origin, int notificationId) {
+        if (origin == null || origin.isBlank()) return;
+        List<String> list = new ArrayList<>(webAccessOrigins(this));
+        if (!list.contains(origin)) {
+            list.add(origin);
+            setWebAccessOrigins(this, list);
+        }
+        applyWebAccess();
+        Integer posted = webNotified.remove(origin);
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        if (nm != null) {
+            if (posted != null) nm.cancel(posted);
+            if (notificationId >= 0) nm.cancel(notificationId);
+        }
+        LogBuffer.i(TAG, "web page allowed from its notification: " + origin);
+    }
+
+    private void cancelWebRefusalNotifications() {
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        if (nm != null) {
+            for (int id : webNotified.values()) nm.cancel(id);
+        }
+        webNotified.clear();
+    }
+
     private Notification buildNotification(String title, String text) {
         // Guard the channel creation like updateNotification() treats the manager as nullable —
         // this also runs on the startForeground() path, which isn't wrapped in try/catch, so a
         // (practically impossible) null manager must not NPE the service start.
         NotificationManager nm = getSystemService(NotificationManager.class);
         if (nm != null) {
+            // The channel ID is the pre-rename "ethp2p_node" on purpose: a channel is keyed by
+            // ID in the system's notification settings, so renaming it would leave existing
+            // installs with an orphaned, muted-or-not "ethp2p node" entry beside the new one.
+            // Only the user-visible name moves to the product name.
             NotificationChannel channel = new NotificationChannel(
-                    CHANNEL_ID, "ethp2p node",
+                    CHANNEL_ID, "Myotis node",
                     NotificationManager.IMPORTANCE_LOW);
             nm.createNotificationChannel(channel);
         }
         return new Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle(title)
                 .setContentText(text)
-                .setSmallIcon(android.R.drawable.stat_sys_download)
+                .setSmallIcon(R.drawable.ic_stat_myotis)
                 .setOngoing(true)
                 .build();
     }

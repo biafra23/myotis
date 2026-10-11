@@ -217,7 +217,50 @@ uniffi::setup_scaffolding!();
 ///      with an engine that silently lacks it. The JVM desktop and daemon
 ///      (`RustMyotisEngine.create`, when the host passes no DnsServers port)
 ///      and myotis-rpcd call it; iOS and the Node addon do not yet.
-pub const ABI_VERSION: i32 = 39;
+/// v40: added create_access_list_json (UniFFI, the C ABI and Node):
+///      eth_createAccessList for the FULL JSON-RPC transaction object — the
+///      EIP-2930 access list the transaction touches, built as geth builds it
+///      (traced with geth's exclusions, then confirmed with the list applied
+///      until it stops changing), with the gas the run made with it used and
+///      that run's own revert or halt NEXT TO the list, as geth's result
+///      carries it (`{"status":"ok","accessList","gasUsed"[,"vmError"
+///      [,"revertDataHex"]]}` — `vmError`, since a top-level `error` is the
+///      engine's failure envelope); the request checked as eth_call_tx_json checks
+///      it, so `infeasible`, the permanent envelope and the block selector
+///      behave as there. The JVM `RustEngineNative` wrappers, the Node addon
+///      and the iOS wrapper moved with it.
+/// v41: "blockTimestamp" (unix seconds) on the verified-read shapes that name
+///      the block a wallet sees: the account read (`AccountProofResult`) carries
+///      it only when PROVEN — the read ran against the beacon-attested
+///      optimistic or finalized block (its payload header, or after Gloas the
+///      header whose keccak is the attested hash, carries the timestamp) and
+///      the verdict holds — else null; the ENS forward
+///      and record shapes always carry it, from the verified header the
+///      resolution ran against. A payload extension, no signature change —
+///      bumped, as v38 was, so a host that shows the block's age is never
+///      paired with an engine that cannot report it. `RustChainHandle`,
+///      `RustEnsApi` and the iOS wrapper read it.
+/// v42: ens_record_json gained the method "ownership" — the registry's owner and
+///      resolver, and for a .eth second-level name the registrar's registrant,
+///      expiry and grace period, seen through the NameWrapper (status ok carries
+///      registrantHex / managerHex / wrapped / resolverHex / expiresAt /
+///      gracePeriodSeconds, absent parts left out). A payload extension, no
+///      signature change: an older engine answers "unknown ens method".
+/// v43: added set_tor_storage_dirs / myotis_set_tor_storage_dirs (UniFFI and
+///      the C ABI): the absolute directories the embedded Arti client keeps its
+///      state and directory cache in, named before the first Tor read. Android
+///      requires it — Arti's default directories derive from `$HOME` there, so
+///      an unconfigured bootstrap is refused — and it is how a `-PtorEngine`
+///      Android build becomes able to route at all (the Android jniLibs run
+///      Arti on rustls with the ring provider, see myotis-net's Cargo.toml).
+///      Elsewhere unset keeps Arti's platform defaults. True iff the client
+///      will use exactly these: a different pair once a bootstrap holds its
+///      directories, a relative path, or a Tor-less build answers false. An
+///      additive function — bumped so a host that names the directories is
+///      never paired with an engine that silently lacks the call. The Android
+///      host calls it (`Tor.configureStorage`); desktop, iOS and the Node
+///      addon do not.
+pub const ABI_VERSION: i32 = 43;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

@@ -139,7 +139,7 @@ Key Gradle modules:
   engine (`Engines`), and Tor verified-read routing (`Tor` —
   docs/privacy-and-tor.md; Rust-engine-only, gated behind the Rust-engine
   toggle, and behind the `-PtorEngine` build flag that links Arti into the host
-  dylib), the Rust log drain (`Engines.drainRustLogs` —
+  dylib and the Android jniLibs), the Rust log drain (`Engines.drainRustLogs` —
   hosts pump the engine's tracing ring into their log pipeline), and the Status
   screen's per-network engine badge (`Engines.engineKindFor`) — internal
   seams, deliberately not on the API; and `:app`'s
@@ -158,11 +158,22 @@ step skipped and none treated as optional or "only if asked"**:
 2. **Review** — run the internal code review on the diff (the `code-review`
    skill / `/code-review`) and address what it finds before going further.
 3. **PR** — open a pull request. This is the default next step after review, not
-   a separate request the user has to make. (Follow the PR-template and
-   attribution rules below.) Its base is `main` for a single-PR work item, and
-   the feature branch for a part of a multi-PR plan (next section).
-4. **Wait for review comments** — subscribe to the PR and wait for CI + review
-   feedback (`subscribe_pr_activity`); do not consider the task done at "pushed".
+   a separate request the user has to make. (Follow the PR-description rules
+   below: English, the session link as the last line.) Its base is `main` for a
+   single-PR work item, and the feature branch for a part of a multi-PR plan
+   (next section).
+4. **Wait for review comments** — and make sure they REACH you. In the desktop
+   app, immediately after `gh pr create` returns, switch the app's PR monitor
+   on for that PR: `mcp__ccd_pr__set_monitor` with the PR's URL, `auto_fix:
+   true`, `address_comments: true`. It is PER PR and OFF by default — the app
+   has no global switch — so a PR opened without this call never wakes the
+   session for its review comments or CI failures, and the owner ends up
+   typing "please address the comment" for each one (owner ruling,
+   2026-10-09, after a day of exactly that; a memory note had not made it
+   stick, which is why it is here, in the step every PR goes through).
+   Elsewhere, use whatever the host offers to watch a PR
+   (`subscribe_pr_activity`). Then wait for CI + review feedback; do not
+   consider the task done at "pushed".
 5. **Address the PR comments** — drive the PR to green and answer every review
    comment per the rules below, then keep watching until it is merged or closed.
    **MERGING IS THE OWNER'S ACTION — NEVER MERGE A PR YOURSELF** (owner ruling,
@@ -176,6 +187,30 @@ Short form: **code → review → PR → wait for review comments → address th
 Do not stop at "pushed" and do not ask whether to open the PR or run the review —
 they are part of the work item. The only time to skip the PR is when the user
 explicitly says not to open one.
+
+### The session title carries the issue and the PR number
+
+The session renames ITSELF (`mcp__ccd_session_mgmt__set_session_title`,
+`session_id: "self"`) at two moments, without being asked, keeping the rest of
+its title (owner's request, 2026-10-09):
+
+- `IS#<n>: <title>` the moment the work item is identified as issue n — the
+  user names it, or the task is to fix it. Several issues: the one the PR will
+  close.
+- `PR#<n>: <title>` right after `gh pr create` returns the number. The PR prefix
+  REPLACES the issue prefix — the PR is the later, more specific handle, and
+  the issue number is in the PR body. A multi-PR plan carries the part PR
+  currently being driven; the earlier parts are the other PRs based on
+  `feature/<topic>` (next section).
+
+Why: the desktop app shows one session per sidebar row, and the owner finds a
+row by the number of its GitHub thread. A title the owner typed makes the app
+ask them to approve the rename (an app-generated one is replaced silently) —
+ask anyway, that is the point. Bypass-permissions mode renames without asking;
+an unattended session (scheduled, remote-triggered) is declined — a decline is
+fine, say so in the report, do not retry. A subagent cannot rename the session
+it runs in; the main session does it. Outside the desktop app (a plain `claude`
+terminal, CI) there is no session title and this rule is inapplicable.
 
 ### Multi-PR plans land through a feature branch, never piece by piece on `main`
 
@@ -229,9 +264,22 @@ tag cut from its head at any moment must not ship half a feature. So a work item
    never by rebase or force-push (open part PRs are based on it), whenever
    `main` moves in a way the feature has to absorb. A merge that went through
    **cleanly** may be pushed straight to the feature branch: it adds nothing
-   `main` doesn't already carry, and it is the ONLY direct push this rule allows.
-   A merge that needed **conflict resolution** goes through a PR into the
-   feature branch like a part, because the resolution is new code. Build and
+   `main` doesn't already carry. "Cleanly" means more than "no conflict
+   markers": a textually clean merge of two changes to the same file can still
+   fail to compile (#587: `main` gave a constructor a fourth argument, the
+   feature's test helper still passed three), so build the merged tree and run
+   the affected tests locally BEFORE pushing it. This is the only direct push
+   THIS STEP allows, and the restriction is on how `main` reaches the feature
+   branch — a merge, never a rebase or force-push; a resolution reviewed — not
+   on the feature branch in general: the final PR's review fixes are pushed
+   straight to it (step 5).
+   A merge that needed **conflict resolution** — or that compiles or passes
+   its affected tests only with a change, which is the same thing — goes
+   through a PR into the feature
+   branch like a part, because the resolution is new code — and, like
+   a part, it gets no artifact build (the exception below): a resolution in
+   `rust/` or a host module is cross-compiled only at the final PR unless the
+   merge PR dispatches the APK / dmg / iOS workflow on its branch. Build and
    Test (`ci.yml`) and nearly every other push trigger fire only on `main`
    (path-filtered `roost.yml` is the exception), so a clean merge is first
    fully tested on the next PR into or out of the feature branch — when a part
@@ -243,10 +291,18 @@ tag cut from its head at any moment must not ship half a feature. So a work item
    final PR `feature/<topic>` → `main`. It is an ordinary PR under the workflow
    above — internal review of the whole combined diff, CI, reviewer comments,
    "ready to merge" — and the merge into `main` is the owner's. Its description
-   links every part PR. Its review is the real gate, not a formality over parts
-   already reviewed: `claude-review` reads its prompt and `CLAUDE.md` from the
-   PR's base, so part PRs were reviewed under the feature branch's copies, and
-   this is the one PR held to `main`'s (see the header of `claude-review.yml`).
+   links every part PR. **Its review comments are fixed on `feature/<topic>`
+   itself** (step 4's exception for a bug in code `main` also carries aside):
+   commit on the feature branch, push, answer each thread with the
+   commit — exactly as on any PR's own branch — and NEVER through another part
+   PR (owner ruling, 2026-10-09: #590 did that for #588's review and only added
+   a merge-ordering trap, the final PR being mergeable without its own fixes).
+   The final PR's review and CI cover what lands on the branch; the clean-merge
+   sentence in step 4 does not forbid this push. Its review is the real gate,
+   not a formality over parts already reviewed: `claude-review` reads its
+   prompt and `CLAUDE.md` from the PR's base, so part PRs were reviewed under
+   the feature branch's copies, and this is the one PR held to `main`'s (see
+   the header of `claude-review.yml`).
 
 A **single-PR** fix or plan still targets `main` directly; none of the above
 applies. If a single-PR task grows a second PR before its first has merged,
@@ -258,7 +314,20 @@ Releases are unaffected: the release PR is a single PR against `main`, and
 whatever is still on a feature branch is simply not in that release. This rests
 on the PR workflows' `pull_request` triggers being unscoped (any base branch —
 see the comments in `ci.yml`, `android-apk.yml` and siblings), which is what
-gives part PRs full CI and the Claude review; do not narrow them to `main`.
+gives part PRs the tests, clippy, the lockfile check and the Claude review; do
+not narrow them to `main`. **The artifact builds are the exception** (owner
+ruling, 2026-10-09): the Android APK + emulator smoke, the macOS dmg and the
+iOS framework skip a PR whose base is not `main` (a job-level `if` in those
+workflows — the checks show as skipped, not absent), because a packaging leg
+per part costs more than it tells; the final `feature/<topic>` → `main` PR
+builds everything, and a part that touches what those legs alone check (the
+Rust engine's Android/iOS cross-compiles, the engine's C ABI, the minSdk-29
+budget — `check_apk_min_api.py` runs only in the APK workflow) can dispatch
+the workflow on its branch from the Actions tab. A PR retargeted to `main`
+after it was opened keeps its skipped checks — a base change is an `edited`
+event, which these workflows do not run on — so push a commit or dispatch the
+three workflows before it merges, or the first artifact build of that head is
+the post-merge run on `main`.
 
 ## Releases — ask before cutting one
 
@@ -351,13 +420,18 @@ asset workflow and a stronger action than the merge this file already forbids.
    the one whose OUTPUT you read rather than just its exit code. It asks every
    pinned CL peer for a `light_client_bootstrap` at this build's own embedded
    anchor and applies the SAME acceptance the production path does (checkpoint
-   pin plus both Merkle branches), then asks for one period of
-   `updates_by_range` — so a pin counts as alive only if a fresh install would
-   accept what it serves AND could catch up from it. Then it checks the
+   pin plus both Merkle branches), then asks for the anchor's period of
+   `updates_by_range` and runs it through the production processor, and — once
+   the chain has left that period — for the current period's, which must be
+   attested in it, in its fork's wire shape and above the 2/3 bar. So a pin
+   counts as alive only if a fresh install would accept what it serves AND
+   could follow the chain from it: an anchor embedded before a server stopped
+   (Sepolia's Lighthouse pins at the Gloas fork) no longer hides that. Then it checks the
    bootnodes can seed discv5 at all. It gates on a FLOOR (at least two pins serving), not a clean
    sweep, because these are third-party hosts and demanding perfection makes a
    check people skip. Individual dead pins are a re-census signal
-   (`examples/period_census.rs`), not automatically a blocker.
+   (`examples/period_census.rs`; the workflow's `census` scope runs it from a
+   clean runner), not automatically a blocker.
 
    **Caveat that will bite you: the result is only as good as the host.** A
    Lighthouse node that has banned your IP reports as `dial failed` while being
@@ -435,7 +509,7 @@ demo machine pulls, so nothing waits for a release; a PR build would only add a
 macOS runner leg per push, because a change that breaks a bundle without
 failing a test is next to impossible — what a bundle adds over the standard app
 (a seed, its manifest, warm peer caches) are build inputs, not code paths, and
-the standard dmg leg already proves jpackage on every PR. A bundle-only
+the standard dmg leg already proves jpackage on every PR into `main`. A bundle-only
 regression therefore surfaces on the next `main` run, where it is a hard gate.
 A bundle whose seed lives OUTSIDE the tree (RAILGUN's, on the `railgun-seed`
 release) also takes `workflow_dispatch`, so a refreshed seed can be rebuilt
@@ -488,6 +562,20 @@ that produced this note.
   description makes a change unreviewable for part of that audience. Talking to
   the owner in German is fine and unaffected; the moment it lands on GitHub it
   is English.
+- **Every PR description ends with its session links — the opening session's
+  link first, each session that later takes the PR over appended below — and
+  never with the "🤖 Generated with Claude Code" footer** (owner's ruling,
+  2026-10-09: the owner opens the session from the PR to continue the work;
+  the footer leads to a product page). The harness asks for that footer
+  on every PR; this rule overrides it, as the harness says a repo rule may.
+  The link is the `link` field of `mcp__ccd_session_mgmt__get_session`
+  (`session_id: "self"`). A claude.ai/code session's
+  `https://claude.ai/code/session_…` is clickable on GitHub; the desktop app's
+  `claude://claude.ai/…/local_…` is NOT (GitHub neither autolinks custom
+  schemes nor keeps them in an href), so write it as a code span for
+  copy-paste. No `link` reported (app links off for the organization), or no
+  session-mgmt tool on this host at all (a plain `claude` terminal, CI): say so
+  in that line. Commit messages keep their `Co-Authored-By` trailer.
 - **ALWAYS respond to every review comment, individually, on its own thread.**
   One comment, one reply. A single bulk PR-level summary is not a substitute —
   it may be posted *in addition*, but a reviewer must be able to see the
@@ -522,6 +610,13 @@ that produced this note.
   `gh api repos/<owner>/<repo>/pulls/<n>/comments --jq '.[].id'`. For bodies
   containing backticks or quotes, prefer `--raw-field body="$(cat <<'EOF' … EOF)"`
   over `-f`.
+- **Fix review comments on the PR's own branch**, whatever that branch is: a
+  single-PR branch, a part branch, or `feature/<topic>` itself for the final
+  PR of a multi-PR plan. A separate PR for fixes to the PR's own diff is never
+  the answer (owner ruling, 2026-10-09, after #590) — it delays the PR under
+  review and lets it merge without its fixes. (A comment that finds a bug in
+  code `main` also carries is the one exception, and it is step 4 of the
+  multi-PR rule above: that fix is its own single PR into `main`.)
 - **Drive CI to green.** Do not leave a PR on a red or pending check without
   either pushing a fix or stating the blocker explicitly.
 - **Never merge a PR yourself** — not with `gh pr merge`, not by enabling
@@ -554,7 +649,10 @@ that produced this note.
   don't import the `:core` helpers — they inline the few lines instead (hosts
   talk only to `:myotis-api`). The ENFORCEMENT is
   `scripts/check_apk_min_api.py`, run by the android-apk workflow against the
-  built APK's dex — the post-desugaring ground truth. It also resolves calls
+  built APK's dex — the post-desugaring ground truth — on pushes to `main`, on
+  PRs into `main` and on dispatch; a part PR into a feature branch does not
+  build the APK (see the multi-PR section), so for a feature plan this check
+  first runs at the final PR unless a part dispatches the workflow. It also resolves calls
   that reach a JDK method through a third-party subclass, which lint-style
   source checks and a naive api-versions.xml lookup both miss (that is exactly
   how `SnappyFramedInputStream.readAllBytes()` once slipped through), plus

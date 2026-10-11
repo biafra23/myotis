@@ -153,6 +153,32 @@ pub extern "C" fn myotis_tor_status() -> i32 {
     crate::host::tor_status()
 }
 
+/// Name the Tor client's state and cache directories (`set_tor_storage_dirs`
+/// twin): absolute paths, before the first Tor read. False for a null,
+/// non-UTF-8 or relative path, a different pair once a bootstrap holds its
+/// directories, or a Tor-less build. Decoded strictly, unlike `read_string`:
+/// a lossily repaired path names a directory the caller never asked for.
+///
+/// # Safety
+/// `state_dir` and `cache_dir` must each be null or a valid null-terminated C
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_set_tor_storage_dirs(
+    state_dir: *const c_char,
+    cache_dir: *const c_char,
+) -> bool {
+    unsafe fn path<'a>(p: *const c_char) -> Option<&'a str> {
+        if p.is_null() {
+            return None;
+        }
+        CStr::from_ptr(p).to_str().ok()
+    }
+    match (path(state_dir), path(cache_dir)) {
+        (Some(state), Some(cache)) => crate::host::set_tor_storage_dirs(state, cache),
+        _ => false,
+    }
+}
+
 /// Allow or forbid EIP-1459 DNS discovery (`set_dns_discovery` twin): the EL
 /// node lists, walked over the system resolver. Off until a host switches it
 /// on; never used while Tor is enabled. Returns the state now in force.
@@ -436,6 +462,26 @@ pub unsafe extern "C" fn myotis_eth_call_tx_json(
     let block = read_string(block).unwrap_or_default();
     let state_overrides = read_string(state_overrides).unwrap_or_default();
     into_c(crate::host::eth_call_tx_json(handle, &tx, &block, &state_overrides))
+}
+
+/// Verified `eth_createAccessList` for the full JSON-RPC transaction object
+/// (`nativeCreateAccessListJson` twin, ABI ≥ 40): the arguments of
+/// [`myotis_estimate_gas_tx_json`]. A NULL `tx` reads as empty, which is
+/// refused (not an object) — never traced as some default transaction.
+///
+/// # Safety
+/// All pointer params must be null or valid null-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_create_access_list_json(
+    handle: i64,
+    tx: *const c_char,
+    block: *const c_char,
+    state_overrides: *const c_char,
+) -> *mut c_char {
+    let tx = read_string(tx).unwrap_or_default();
+    let block = read_string(block).unwrap_or_default();
+    let state_overrides = read_string(state_overrides).unwrap_or_default();
+    into_c(crate::host::create_access_list_json(handle, &tx, &block, &state_overrides))
 }
 
 /// Verified ENS forward resolution (`nativeResolveEnsJson` twin).
@@ -732,6 +778,12 @@ mod tests {
         // for an unknown handle.
         assert!(!unsafe { myotis_set_boot_enodes(0, std::ptr::null()) });
         assert!(!unsafe { myotis_set_boot_enodes(i64::MIN, c"[]".as_ptr()) });
+        // NULL or non-UTF-8 Tor storage directories are refused in every build,
+        // Tor or not — never repaired into a path the caller did not name.
+        assert!(!unsafe { myotis_set_tor_storage_dirs(std::ptr::null(), c"/cache".as_ptr()) });
+        assert!(!unsafe { myotis_set_tor_storage_dirs(c"/state".as_ptr(), std::ptr::null()) });
+        let bad = [b'/', 0xff, 0];
+        assert!(!unsafe { myotis_set_tor_storage_dirs(bad.as_ptr().cast(), c"/cache".as_ptr()) });
     }
 
     /// How a host's seed pins cross the C ABI (ABI 31): the push is applied or

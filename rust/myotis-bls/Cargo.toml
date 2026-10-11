@@ -15,8 +15,10 @@ crate-type = ["cdylib", "rlib"]
 [features]
 # The JNI shim is only wanted in the cdylib the JVM loads; pure-Rust consumers
 # (myotis-consensus) depend with default-features = false.
-default = ["jni"]
-jni = ["dep:jni"]
+default = ["jni", "std"]
+jni = ["dep:jni", "std"]
+# Off only for no_std hosts (firmware): myotis-consensus forwards its own `std`.
+std = []
 
 [dependencies]
 # Supranational blst: the BLS12-381 lib every major Ethereum CL client ships (C + asm).
