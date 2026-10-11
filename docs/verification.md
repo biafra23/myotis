@@ -108,8 +108,9 @@ same way and never fetched at runtime.
   apps' dialog) or raises the bound. The check runs on entry, before every re-bootstrap and
   continuously while running.
 - **A host-supplied anchor.** An embedder can start the Rust engine from its own root
-  (`myotis_create_with_checkpoint` in the C ABI, also exposed by the Node addon). It is
-  verified exactly like the embedded one, and the data directory is bound to it.
+  (`myotis_create_with_checkpoint` in the C ABI, also exposed by the Node addon). That root
+  *replaces* the trust anchor — the engine does not authenticate it — and everything after it is
+  verified exactly as from the embedded one; the data directory is bound to it.
 - **Restarts.** The verified store is persisted as an `LCSS` snapshot that both engines read
   and write. A snapshot is used only if it is newer than the checkpoint, and it is *not*
   re-verified on load: it is on probation until one update verifies against its committee,
@@ -280,8 +281,9 @@ wallet-facing reads verify with `core`'s `MerklePatriciaProofVerifier` (through
   (key = `RLP(index)`) and the root must equal the header's `transactionsRoot`.
 - **Receipts** — rebuilt the same way against `receiptsRoot`; their count must match the
   verified body. eth/69 peers send receipts without a bloom, so Myotis recomputes it.
-- **Logs** (`eth_getLogs`, Rust engine) come from the opt-in log index, whose every log was
-  checked against `receiptsRoot`; ranges outside its coverage are refused. See
+- **Logs** (`eth_getLogs`, Rust engine) come from the opt-in log index. Every log the node walked
+  itself was checked against `receiptsRoot`; a span imported from a seed was not, and
+  `eth_getLogs` cannot yet tell the two apart (§11). Ranges outside its coverage are refused. See
   [eth-getlogs-design.md](eth-getlogs-design.md).
 
 ## 9. Contract calls and gas estimation

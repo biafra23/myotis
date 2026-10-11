@@ -364,8 +364,9 @@ messages long instead of 8; snap sorts last among the shared capabilities, so no
    (`minSensibleHeadBlock` floor). This is the reference's `get-account` path
    (`EthHandler.requestAccountAsync`, `VerifiedAccountQuery`). Post-Merge a peer's handshake head
    never refreshes, so the other paths ask at a beacon-anchored root instead: the Rust engine at
-   the anchor's current optimistic state root, falling back to the peer's fresh head only when the
-   peer cannot serve it (`snap_account_at_best_root` in `rust/myotis-net/src/el/reader.rs`), and
+   the anchor's current optimistic state root, falling back to the peer's fresh head when the
+   anchor has no head yet or the peer cannot prove at that root (`snap_account_at_best_root` in
+   `rust/myotis-net/src/el/reader.rs`), and
    the Java JSON-RPC reads and EVM oracle at one shared anchored head (`VerifiedRpcBackend`).
 2. Send `GetAccountRange(reqId, freshStateRoot, accountHash, 0xff…ff, ~4 KB)`. The **full
    `[origin, 0xff…ff]` range with a small `responseBytes` cap** is deliberate: the peer returns at

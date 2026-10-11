@@ -502,9 +502,10 @@ Accept the current digest plus the prior-fork digest (eases fork-transition wind
 - Metadata responder is hardcoded (seq 0, all-zero attnets/syncnets); finality/optimistic/bootstrap
   responders are relay-cache echoes (TTL 90 s) of the last received payload; status responder
   echoes local status without validating the peer's. (The relay cache is the Java reference's: the
-  Rust engine's wallet host answers the four `light_client_*` protocols `ResourceUnavailable` and
-  keeps `updates_by_range` outbound-only — it serves them, `updates_by_range` included, only as
-  [`rust/roost`](../../rust/roost/README.md)'s server, `reqresp.rs` `lc_responder`.)
+  Rust engine's wallet host answers `bootstrap`, `finality_update` and `optimistic_update` with
+  `ResourceUnavailable` and registers `updates_by_range` outbound-only — it serves all four only as
+  [`rust/roost`](../../rust/roost/README.md)'s server, through `ReqRespConfig.lc_responder` in
+  `rust/myotis-net/src/reqresp.rs`.)
 
 The libp2p layer never touches the verifier — it returns raw SSZ `byte[]`; `BeaconLightClient`
 decodes and verifies one layer up.
