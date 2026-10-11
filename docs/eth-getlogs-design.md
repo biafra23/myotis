@@ -662,7 +662,7 @@ router/API changes in this design already accommodate it.
    index): the daemon's `peers` IPC command reads the engine-routed
    `ChainHandle`, and `RustChainHandle` stubs both `discoveredPeers()` and
    `connectedPeers()` to an empty list — so on a `-Pengine=rust` daemon it
-   always answers `{"ok":true,"count":0,"peers":[]}` while the Rust pool is in fact
+   always answers `{"ok":true,"count":0,"peers":[],"connected":[]}` while the Rust pool is in fact
    serving a dozen peers. That is the shape
    this document warns about everywhere else — an empty result that reads as
    "none exist" when it means "not measured here" — and it cost real time
