@@ -361,7 +361,7 @@ Phase 0b  awaitAnchorFreshness(anchor) — the WEAK-SUBJECTIVITY GATE, on EVERY 
           committees when peers return. A port MUST replicate all three layers.
 Phase 1   tryResumeFromSnapshot()  →  preConnectAndIdentify()  →  bootstrap() if not resumed
 Phase 1b  catchUpSyncCommittee()   +  fill the chain-state-root window from any peer
-Phase 2   steady-state: every secondsPerSlot, pollFinalityUpdate()
+Phase 2   steady-state: once per slot, just past a third of the way into it, pollFinalityUpdate()
           (re-fetch a LightClientUpdate on each period boundary; see 9.4)
 ```
 
