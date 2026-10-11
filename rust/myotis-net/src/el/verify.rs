@@ -104,8 +104,9 @@ pub fn ladder_precheck(
     // for what a proof proves under it, never for a value no proof proved, so a
     // matching root with a bad proof falls through to `peerProofInvalid`.
     // Today's Rust callers verify before anchoring and always pass `true`; the
-    // gate keeps this tree identical to `VerifiedAccountQuery.verify`, where a
-    // failed proof did reach the fast path, and holds for any future caller.
+    // gate keeps this tree identical to `VerifiedAccountQuery.verify` (the same
+    // gate now applies there; a failed proof used to reach its fast path) and
+    // holds for any future caller.
     if peer_proof_valid {
         if let Some(root) = peer_state_root {
             if let Some(m) = anchor.find_state_root(root) {

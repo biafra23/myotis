@@ -115,12 +115,21 @@ public final class VerifiedStorageQuery {
         }
         Bytes32 storageRoot = Bytes32.wrap(verifiedAccount.storageRoot());
 
-        // Step 2: fetch the slot at the SAME peer state root for consistency.
-        long slotStarted = System.nanoTime();
-        StorageRangesMessage.DecodeResult storageResult =
-                connector.requestStorage(contractAddress, storageKeyHash, snapStateRoot)
-                        .get(30, TimeUnit.SECONDS);
-        long slotElapsedNanos = System.nanoTime() - slotStarted;
+        // Step 2: fetch the slot at the SAME peer state root for consistency — unless the
+        // account has no storage at all: its proven leaf already says every slot is zero, so
+        // there is no round trip and no slot fact for the shadow cache (as in the Rust engine
+        // and the EVM oracle). verifySlot answers the empty trie with a valid zero.
+        boolean noStorage = MerklePatriciaProofVerifier.EMPTY_TRIE_ROOT.equals(storageRoot);
+        StorageRangesMessage.DecodeResult storageResult;
+        long slotElapsedNanos = 0;
+        if (noStorage) {
+            storageResult = new StorageRangesMessage.DecodeResult(0, List.of(), List.of());
+        } else {
+            long slotStarted = System.nanoTime();
+            storageResult = connector.requestStorage(contractAddress, storageKeyHash, snapStateRoot)
+                    .get(30, TimeUnit.SECONDS);
+            slotElapsedNanos = System.nanoTime() - slotStarted;
+        }
 
         List<String> proofHex = storageResult.proof().stream().map(Bytes::toHexString).toList();
 
@@ -217,7 +226,7 @@ public final class VerifiedStorageQuery {
                             account.nonce(), account.balance(), storageRoot,
                             Bytes32.wrap(verifiedAccount.codeHash())),
                     accountElapsedNanos);
-            if (storageProofValid) {
+            if (storageProofValid && !noStorage) {
                 // A proven-absent slot is zero.
                 readStats.observeStorage(contractAddress.toArrayUnsafe(), storageSlotKey,
                         usedStateRoot.toArrayUnsafe(), storageRoot.toArrayUnsafe(), slotProof.value(),

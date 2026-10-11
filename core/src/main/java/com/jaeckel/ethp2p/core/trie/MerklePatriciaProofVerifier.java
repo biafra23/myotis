@@ -61,34 +61,41 @@ public final class MerklePatriciaProofVerifier {
 
     /**
      * The integer a storage-trie leaf holds. Storage leaves store {@code rlp(trimmed uint256)},
-     * so the value of a {@link Result.Found} from a storage proof is an RLP string whose payload
-     * is the big-endian integer; an empty value or payload is zero. One decoder for every
-     * reader of storage proofs, so they cannot disagree on what a leaf says.
+     * so the value of a {@link Result.Found} from a storage proof is one canonical RLP string
+     * whose payload is the minimal big-endian integer ({@code 0x80}, the empty string, is
+     * zero). One decoder for every reader of storage proofs, so they cannot disagree on what
+     * a leaf says; as strict as the Rust twin {@code myotis_core::trie::decode_storage_leaf}.
      *
-     * @throws IllegalArgumentException if the RLP header claims more bytes than {@code leafValue}
-     *                                  holds
+     * @throws IllegalArgumentException unless {@code leafValue} is exactly one canonical RLP
+     *                                  string of at most 32 bytes with no leading zero byte
      */
     public static BigInteger storageInteger(Bytes leafValue) {
-        if (leafValue.isEmpty()) return BigInteger.ZERO;
+        if (leafValue.isEmpty()) throw new IllegalArgumentException("empty storage value");
         int first = leafValue.get(0) & 0xff;
-        Bytes raw;
+        Bytes payload;
         if (first < 0x80) {
-            raw = leafValue;                     // a single byte is its own encoding
+            // A single byte below 0x80 is its own encoding — and must be the whole value.
+            if (leafValue.size() != 1) {
+                throw new IllegalArgumentException("trailing bytes after storage value");
+            }
+            payload = leafValue;
         } else if (first <= 0xb7) {
-            int len = first - 0x80;              // short string
-            if (1 + len > leafValue.size()) {
-                throw new IllegalArgumentException("storage value shorter than its RLP header");
+            int len = first - 0x80;
+            if (1 + len != leafValue.size()) {
+                throw new IllegalArgumentException("storage value length does not match its header");
             }
-            raw = leafValue.slice(1, len);
+            payload = leafValue.slice(1, len);
+            if (len == 1 && (payload.get(0) & 0xff) < 0x80) {
+                throw new IllegalArgumentException("non-canonical single-byte storage value");
+            }
         } else {
-            // Long string: never a uint256, but read it rather than misparse it.
-            int lenLen = first - 0xb7;
-            if (1 + lenLen > leafValue.size()) {
-                throw new IllegalArgumentException("storage value shorter than its RLP header");
-            }
-            raw = leafValue.slice(1 + lenLen);
+            // A long string (> 55 bytes) or a list: never a uint256.
+            throw new IllegalArgumentException("storage value is not a short RLP string");
         }
-        return raw.isEmpty() ? BigInteger.ZERO : new BigInteger(1, raw.toArrayUnsafe());
+        if (payload.size() > 32 || (!payload.isEmpty() && payload.get(0) == 0)) {
+            throw new IllegalArgumentException("storage value is not a canonical uint256");
+        }
+        return payload.isEmpty() ? BigInteger.ZERO : new BigInteger(1, payload.toArrayUnsafe());
     }
 
     /**
