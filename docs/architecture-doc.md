@@ -68,10 +68,12 @@ Peer discovery uses **discv5** (the consensus layer's discovery protocol), which
 
 ## 2. Verifying Historical Blocks — Trusted Accumulator Snapshots
 
-> **Status: designed, not built.** Today both engines verify a block only by walking the
-> parent-hash chain from the beacon-attested block, at most 8,192 blocks away; older blocks
-> fail with `headerChainGapTooLarge` (the Java engine's block query names pre-Merge blocks
-> `preMergeBlock`). Nothing in this section exists in code yet.
+> **Status: designed, not built.** Today a block is verified only by walking the parent-hash
+> chain down from a beacon-attested block: the JSON-RPC block and receipt reads of both engines
+> reach at most 512 blocks back, the Java engine's operator `get-block` at most 8,192 (older
+> blocks fail with `headerChainGapTooLarge`, pre-Merge blocks with `preMergeBlock`), and the Rust
+> log index walks further only block by block, down to a watched contract's deployment. Nothing
+> in this section exists in code yet.
 
 ### The Problem
 

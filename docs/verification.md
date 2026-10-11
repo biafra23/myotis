@@ -258,7 +258,8 @@ and ignores the range entries the peer lists next to it:
   `codeHash` are decoded strictly from **that leaf**, never from the peer's own listing.
 - **Absent** — a valid exclusion proof: the account is reported empty, the slot as zero.
 - **Invalid** — a missing node, malformed RLP, a cycle, or an empty proof for a non-empty
-  root. Nothing is served from that peer; the read is retried elsewhere.
+  root. Nothing from that answer is used: on a head read the same peer gets one more try at its
+  own head (verified by `headerChain`, §6) before it is struck, and the hedged race moves on.
 
 Storage proofs are anchored at the account's proven `storageRoot`, so a peer cannot
 substitute another contract's storage. An empty storage root answers zero and an empty code
@@ -285,11 +286,12 @@ wallet-facing reads verify with `core`'s `MerklePatriciaProofVerifier` (through
 
 ## 9. Contract calls and gas estimation
 
-`eth_call`, `eth_estimateGas` and `eth_createAccessList` run a local EVM (revm in the Rust
-engine, Besu in the Java engine) whose database is the proof-verified state above: every
-account, storage slot and bytecode the execution touches is fetched over snap and verified
-against the block's state root before the EVM sees it (`rust/myotis-evm/src/database.rs`,
-`PoolOracle` in `rust/myotis-net/src/el/evm.rs`). A prefetch loop batches those reads. If
+`eth_call` and `eth_estimateGas` (and, on the Rust engine only, `eth_createAccessList`) run a
+local EVM (revm in the Rust engine, Besu in the Java engine) whose database is the
+proof-verified state above: every account, storage slot and bytecode the execution touches is
+fetched over snap and verified against the block's state root before the EVM sees it
+(`rust/myotis-evm/src/database.rs`, `PoolOracle` in `rust/myotis-net/src/el/evm.rs`). A
+prefetch loop batches those reads. If
 some value cannot be proven, the call fails as retryable — it never runs on a guessed value.
 The proof cache is keyed by the root a value was proven against, so a value is never
 reused under a root it was not proven for.
@@ -319,9 +321,10 @@ transaction (`rust/myotis-net/src/el/send_check.rs`; Java: `SendCheck`).
   sync-committee chain alone.
 - **The clock.** The weak-subjectivity gate and the `SYNCED` check read the device clock.
 - **Simplifications against the light-client spec.** Neither engine implements the spec's
-  `best_valid_update` / forced update after `UPDATE_TIMEOUT`; after catching up, the Rust store
-  also rotates to the already-proven next committee when the wall clock has passed the
-  period.
+  `best_valid_update` / forced update after `UPDATE_TIMEOUT`; during catch-up both stores also
+  rotate to the already-proven next committee when the wall clock has passed the period
+  (`force_rotate_if_past_period` / `LightClientStore.forceRotateIfPastPeriod`), and both adopt a
+  next committee from the attested state without requiring finality in the store's period.
 - **Documented carve-outs.** The light-client server [roost](lc-server-design.md) relays
   self-verifying objects from a local beacon node (wallets verify them exactly as above; a
   relay can withhold but not forge). A [seeded log history](seeded-log-histories.md) is
