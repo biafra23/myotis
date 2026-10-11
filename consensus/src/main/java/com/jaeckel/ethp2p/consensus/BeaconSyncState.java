@@ -268,8 +268,9 @@ public class BeaconSyncState {
     }
 
     /**
-     * The block hashes waiting for their header — the pending finality first (what the
-     * header-chain walk anchors on), then the pending optimistic head; one entry when both
+     * The block hashes waiting for their header — the pending finality first (what
+     * finalized reads and the block query's lower walks anchor on), then the pending
+     * optimistic head (what the account/storage walks anchor on); one entry when both
      * name the same block. Fresh copies.
      */
     public List<byte[]> pendingHashes() {
@@ -376,6 +377,27 @@ public class BeaconSyncState {
         InnerState s = state.get();
         return new FinalizedExecution(
                 s.executionBlockNumber(), s.executionStateRoot(), s.executionBlockHash());
+    }
+
+    /**
+     * The optimistic (attested) execution head's block number and block hash, read together,
+     * and the light client's latest optimistic slot ({@link #getOptimisticSlot()}) from the
+     * same read — reported as a walk's {@code matchedBeaconSlot}, it is not necessarily the
+     * slot that attested this block (a finality update moves it on its own).
+     * {@code blockHash} is null until an optimistic update lands.
+     */
+    public record OptimisticExecution(long slot, long blockNumber, byte[] blockHash) {}
+
+    /**
+     * Returns the optimistic execution head from one atomic read — the anchor a verified read's
+     * header-chain walk ends at when the peer's block is above finality
+     * ({@code VerifiedAccountQuery.walkAnchor}). As with {@link #getFinalizedExecution()}, the
+     * number and the hash must come from the same update, or a peer's correct header fails.
+     */
+    public OptimisticExecution getOptimisticExecution() {
+        InnerState s = state.get();
+        return new OptimisticExecution(
+                s.optimisticSlot(), s.optimisticBlockNumber(), s.optimisticBlockHash());
     }
 
     /**

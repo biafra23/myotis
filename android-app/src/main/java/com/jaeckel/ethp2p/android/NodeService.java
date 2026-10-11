@@ -1706,15 +1706,13 @@ public final class NodeService extends Service {
      * <p>Two verification methods, mirroring the JVM daemon
      * ({@code CommandHandler#buildVerificationJson} for {@code get-account}):
      * <ul>
-     *   <li><b>headerChain</b> (load-bearing path) — fetch the contiguous
-     *       header range {@code [finalizedBlock .. peerBlock]} via eth/68
-     *       from the same peer that served the proof, verify the
-     *       parent-hash chain, and require the first header's stateRoot
-     *       to equal the BLC-finalized execution stateRoot and the last
-     *       header's stateRoot to equal the peer-reported stateRoot. This
-     *       is what succeeds in normal operation, because snap peers serve
-     *       proofs at their head while the BLC's attested-root window
-     *       trails finalized + a few recent optimistic slots.</li>
+     *   <li><b>headerChain</b> — fetch the contiguous header range
+     *       {@code [peerBlock .. optimisticHead]}, verify the parent-hash
+     *       chain, and require the last header to hash to the BLC's attested
+     *       optimistic block hash and the first header's stateRoot to equal
+     *       the peer-reported stateRoot (trust flows only down from an
+     *       attested hash). The engine runs this ladder; see
+     *       {@code VerifiedAccountQuery} / the Rust {@code el::verify}.</li>
      *   <li><b>stateRootMatch</b> (fast-path shortcut) — if the peer's
      *       reported stateRoot happens to be one the BLC has already
      *       attested ({@code BeaconSyncState.findStateRoot}), skip the

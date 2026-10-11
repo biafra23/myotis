@@ -3838,9 +3838,9 @@ fn refresh_local_status(
 /// Feed the EL execution anchor from the verified beacon store — the CL→EL
 /// trust bridge (twin of the Java `BeaconSyncState.updateFinalizedExecution` /
 /// `updateOptimisticExecution`). The finalized payload is what `is_synced()`
-/// derives from and what the header-chain walk anchors against; the optimistic
-/// payload gives the freshest attested head. Both also seed the `stateRootMatch`
-/// window. Guarded on a non-zero block hash so a pre-merge / absent execution
+/// derives from and the freshness floor of a header-chain walk; the optimistic
+/// payload gives the freshest attested head, the block hash that walk anchors
+/// against. Both also seed the `stateRootMatch` window. Guarded on a non-zero block hash so a pre-merge / absent execution
 /// header never registers a zero state root as "synced".
 fn update_exec_anchor(store: &LightClientStore, anchor: &ExecAnchor) {
     // Label each execution payload with ITS block's slot (`beacon.slot`), read

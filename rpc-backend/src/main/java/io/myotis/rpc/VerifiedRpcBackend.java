@@ -6,6 +6,7 @@ import com.jaeckel.ethp2p.consensus.proof.OrderedTrieRoot;
 import com.jaeckel.ethp2p.core.concurrent.Futures;
 import com.jaeckel.ethp2p.core.types.BlockHeader;
 import com.jaeckel.ethp2p.networking.eth.EthHandler;
+import com.jaeckel.ethp2p.networking.eth.HeaderChains;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockBodiesMessage;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
 import com.jaeckel.ethp2p.networking.eth.messages.Receipt;
@@ -34,7 +35,8 @@ import java.util.concurrent.TimeUnit;
  * wiring, fee derivation, the per-pinned-block frozen context) lives once.
  *
  * <p>All read paths are cryptographically verified: head contexts are anchored
- * to the beacon-finalized root via headerChain, bodies/receipts are checked
+ * by the headerChain walk down from the light client's optimistic head (or are the
+ * beacon-finalized payload itself), bodies/receipts are checked
  * against transactionsRoot/receiptsRoot, accounts/storage against the anchored
  * stateRoot. A method that cannot be answered verified returns null so the
  * router errors (strict mode) — peer data is never trusted unverified.
@@ -59,13 +61,13 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     // Constants (ported from NodeService's RPC region)
     // ---------------------------------------------------------------------
 
-    // Same bound the JVM daemon uses (CommandHandler.MAX_HEADER_CHAIN_GAP).
-    // Caps how many headers we'll fetch to bridge from the beacon-finalized
-    // block to the peer's head — i.e. the maximum gap the headerChain
-    // verification path will tolerate. In normal operation the gap is small
-    // (snap peers track head, BLC finality lags by ~12.8 minutes ≈ 64 blocks),
-    // but the bound has to cover catch-up after a long offline period (e.g. a
-    // phone waking from doze).
+    // Same bound as VerifiedAccountQuery.MAX_HEADER_CHAIN_GAP. Caps how many
+    // headers we'll fetch to bridge from the peer's head up to the light
+    // client's optimistic head — i.e. the maximum gap the headerChain
+    // verification path will tolerate. In normal operation the gap is a few
+    // blocks at most (the probe window ends at the optimistic head), but the
+    // bound has to cover catch-up after a long offline period (e.g. a phone
+    // waking from doze).
     private static final int MAX_HEADER_CHAIN_GAP = 8192;
     private static final long HEADER_CHAIN_TIMEOUT_SEC = 60;
     // tx lookup (eth_getTransactionReceipt / eth_getTransactionByHash) scans beacon-anchored
@@ -596,13 +598,17 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     // ---------------------------------------------------------------------
 
     /** The verified head context every read/call runs against: the EVM/ENS stack
-     *  pinned to one (beacon-anchorable) state root. */
+     *  pinned to one (beacon-anchorable) state root. {@code blockHash} is the context
+     *  block's hash, proven against the beacon light client whenever
+     *  {@code beaconVerified} — the anchor its header windows hash-link to
+     *  ({@link #headerAnchor}); null on a not-yet-anchored head. */
     private record RpcCallContext(io.myotis.ens.EnsResolver resolver,
                                   io.myotis.evm.BlockContext blockCtx,
                                   long blockNumber,
                                   boolean beaconVerified,
                                   io.myotis.evm.CcipReadEvmExecutor offchainExecutor,
-                                  io.myotis.evm.world.SnapBackedStateOracle oracle) {}
+                                  io.myotis.evm.world.SnapBackedStateOracle oracle,
+                                  byte[] blockHash) {}
 
     /** A snap peer paired with the fresh head it both reported and snap-serves. */
     private record PeerHead(EthHandler peer, BlockHeader header) {}
@@ -1375,7 +1381,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     /**
      * The shared beacon-anchored head context for "latest"-ish reads, or null
      * (→ router errors, logged). Every verified RPC read/call resolves the head
-     * HERE so the head is anchored to the beacon-finalized root once per {@link
+     * HERE so the head is anchored to the beacon light client once per {@link
      * #RPC_HEAD_TTL_MS} window and reused — instead of each call independently
      * re-fetching a head + re-running the headerChain anchor (the slow, fragile
      * step that produced the high fallback rate). The context's stateRoot
@@ -1558,8 +1564,9 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     }
 
     /** Build (or reuse within {@link #RPC_HEAD_TTL_MS}) a snap-peer head context
-     *  whose state root is anchored back to the beacon-finalized root, so reads +
-     *  EVM calls run against cryptographically-verified state. Blocking. */
+     *  whose header is proven by the walk down from the light client's optimistic
+     *  head (or the beacon-finalized payload itself), so reads + EVM calls run
+     *  against cryptographically-verified state. Blocking. */
     /** Full-budget variant for the background warmer. */
     private RpcCallContext verifiedHeadCallContext() throws Exception {
         return verifiedHeadCallContext(RPC_ACCOUNT_TIMEOUT_SEC * 1000L, TimeUnit.MILLISECONDS);
@@ -1640,24 +1647,29 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
 
     /**
      * Build a fully beacon-verified head context, preferring the freshest
-     * snap-servable head (PEER_HEAD, anchored to finalized via headerChain) and
+     * snap-servable head at or below the light client's optimistic head (PEER_HEAD,
+     * proven by the header walk down from the optimistic head's attested hash) and
      * falling back to the beacon-finalized root (verified directly by the light
-     * client, ~12 min stale) when no peer serves a fresh head. Both paths are
+     * client, ~12 min stale) when no peer serves such a head. Both paths are
      * cryptographically anchored to the beacon chain — so under poor snap
      * conditions reads stay verified (just staler) instead of all erroring.
      */
     private RpcCallContext buildAnchoredHead() throws Exception {
         try {
             RpcCallContext ctx = prepareEnsCall(io.myotis.ens.EnsResolutionRoot.PEER_HEAD);
-            if (anchorHeadToBeacon(ctx.blockNumber(), ctx.blockCtx().stateRoot())) {
-                // anchorHeadToBeacon ran the full headerChain verify from beacon-finalized
-                // to this head, so it IS cryptographically anchored now — but prepareEnsCall
-                // initialized the PEER_HEAD flag to false. Reflect the verification in the
-                // returned context so beaconVerified() is true (eth_getBlockByNumber /
-                // eth_getTransactionReceipt gate on it; without this they reject the freshly
-                // anchored head and only the finalized fallback ever passed).
-                return new RpcCallContext(ctx.resolver(), ctx.blockCtx(), ctx.blockNumber(),
-                        true, ctx.offchainExecutor(), ctx.oracle());
+            BlockHeadersMessage.VerifiedHeader proven =
+                    anchorHeadToBeacon(ctx.blockNumber(), ctx.blockCtx().stateRoot());
+            if (proven != null) {
+                // The walk proved the head's WHOLE header, so rebuild the block context
+                // from it: the probed header was the peer's word for every field but the
+                // state root the walk matched (timestamp, base fee, coinbase, prevRandao,
+                // gas limit — all of which an eth_call can read). prepareEnsCall left the
+                // PEER_HEAD context unverified; mark it verified now (eth_getBlockByNumber /
+                // eth_getTransactionReceipt gate on it) and carry the proven hash its header
+                // windows anchor to.
+                return new RpcCallContext(ctx.resolver(),
+                        blockContextOf(proven.header(), connector), ctx.blockNumber(),
+                        true, ctx.offchainExecutor(), ctx.oracle(), proven.hash().toArray());
             }
             log.info("[rpc] fresh head not beacon-anchored (block #"
                     + ctx.blockNumber() + "); falling back to finalized");
@@ -1717,25 +1729,59 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         }
     }
 
-    /** True iff {@code peerStateRoot} at {@code peerBlock} chains back to the
-     *  beacon-finalized execution root (same headerChain method as get-account). The
-     *  finalized (number, root) pair is BeaconSyncState's — one atomic read — so it holds
-     *  before and after Gloas (where the light-client header proves only a block hash and
-     *  the pair appears once the EL header behind it is resolved). */
-    private boolean anchorHeadToBeacon(long peerBlock, byte[] peerStateRoot) throws Exception {
-        BeaconLightClient blc = beaconLightClient;
+    /** The head's header, proven, iff the header at {@code peerBlock} carries
+     *  {@code peerStateRoot} and hash-links UP to the light client's optimistic head
+     *  ({@link HeaderChains#anchoredAtTop}: trust flows down from an attested hash only);
+     *  else null. The optimistic head's (number, hash) pair is one atomic read, so it
+     *  holds before and after Gloas (where the light-client header proves only a block
+     *  hash). A head above the optimistic head has nothing attested above it yet: null. */
+    private BlockHeadersMessage.VerifiedHeader anchorHeadToBeacon(long peerBlock, byte[] peerStateRoot)
+            throws Exception {
         RLPxConnector conn = connector;
-        if (blc == null || conn == null) return false;
-        if (blc.getStore().getFinalizedHeader() == null) return false;
-        BeaconSyncState.FinalizedExecution fin = beaconSyncState.getFinalizedExecution();
-        if (fin.stateRoot() == null) return false; // Gloas finality not resolved yet
-        if (fin.blockNumber() == peerBlock) {
-            // Head is exactly the finalized block — roots must match directly.
-            return java.util.Arrays.equals(fin.stateRoot(), peerStateRoot);
+        if (conn == null) return null;
+        BeaconSyncState.OptimisticExecution opt = beaconSyncState.getOptimisticExecution();
+        if (opt.blockHash() == null || opt.blockNumber() <= 0) return null;
+        long total = opt.blockNumber() - peerBlock + 1;
+        if (total < 1 || total > MAX_HEADER_CHAIN_GAP) {
+            log.info("[verify] head #" + peerBlock + " outside the walk to optimistic #"
+                    + opt.blockNumber());
+            return null;
         }
-        return verifyHeaderChainBatched(conn, fin.blockNumber(), peerBlock,
-                fin.stateRoot(), peerStateRoot)
+        List<BlockHeadersMessage.VerifiedHeader> window = Futures.orTimeout(
+                        conn.requestBlockHeadersBatched(peerBlock, (int) total),
+                        HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
                 .get(HEADER_CHAIN_TIMEOUT_SEC + 5, TimeUnit.SECONDS);
+        BlockHeadersMessage.VerifiedHeader head = provenHead(window, total, opt.blockHash(), peerStateRoot);
+        if (head == null) {
+            log.info("[verify] head #" + peerBlock + " did not anchor at optimistic #"
+                    + opt.blockNumber());
+        }
+        return head;
+    }
+
+    /** The window's first header, proven, iff {@code window} — fetched as
+     *  {@code [head .. optimistic]} — has exactly {@code total} headers, hash-links up to
+     *  {@code topHash} ({@link HeaderChains#anchoredAtTop}), and its first header carries
+     *  {@code peerStateRoot}; else null. Pure, for {@link #anchorHeadToBeacon}. */
+    static BlockHeadersMessage.VerifiedHeader provenHead(List<BlockHeadersMessage.VerifiedHeader> window,
+                                                         long total, byte[] topHash, byte[] peerStateRoot) {
+        if (window.size() != total || !HeaderChains.anchoredAtTop(window, topHash)) return null;
+        BlockHeadersMessage.VerifiedHeader head = window.get(0);
+        return java.util.Arrays.equals(head.header().stateRoot.toArrayUnsafe(), peerStateRoot) ? head : null;
+    }
+
+    /** The EVM block context of {@code header} (a header proven by hash, or a peer's head
+     *  still to be proven — the caller says which). */
+    private static io.myotis.evm.BlockContext blockContextOf(BlockHeader header, RLPxConnector conn) {
+        return new io.myotis.evm.BlockContext(
+                header.stateRoot.toArrayUnsafe(),
+                header.number,
+                header.timestamp,
+                header.baseFeePerGas,
+                io.myotis.evm.Address.of(header.beneficiary.toArrayUnsafe()),
+                header.mixHashOrPrevRandao.toArrayUnsafe(),
+                java.math.BigInteger.valueOf(conn.getNetwork().networkId()),
+                header.gasLimit);
     }
 
     /**
@@ -1758,6 +1804,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         io.myotis.evm.BlockContext blockCtx;
         long blockNumber;
         boolean verified;
+        byte[] blockHash;
         EthHandler pinned;
 
         if (root == io.myotis.ens.EnsResolutionRoot.FINALIZED) {
@@ -1792,6 +1839,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                         java.math.BigInteger.valueOf(conn.getNetwork().networkId()),
                         exec.gasLimit());
                 blockNumber = exec.blockNumber();
+                blockHash = exec.blockHash();
             } else {
                 // Gloas: the light-client header proves only the execution block hash; the
                 // EL header that hashes to it — resolved by BeaconSyncState, every field
@@ -1802,21 +1850,21 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                     throw new IllegalStateException(
                             "beacon-finalized execution header not resolved yet (Gloas: only its hash is proven)");
                 }
+                // The proven hash it resolved to, from a second read: a finality that moved
+                // between the two would pair this header with another block's hash.
+                BeaconSyncState.FinalizedExecution finExec = beaconSyncState.getFinalizedExecution();
+                if (finExec.blockNumber() != el.number || finExec.stateRoot() == null
+                        || !java.util.Arrays.equals(finExec.stateRoot(), el.stateRoot.toArrayUnsafe())) {
+                    throw new IllegalStateException("beacon finality moved while reading it; retry");
+                }
                 pinned = firstPeerServing(snapPeers, el.stateRoot);
                 if (pinned == null) {
                     throw new IllegalStateException(
                             "no snap peer retains the beacon-finalized state (block #" + el.number + ")");
                 }
-                blockCtx = new io.myotis.evm.BlockContext(
-                        el.stateRoot.toArrayUnsafe(),
-                        el.number,
-                        el.timestamp,
-                        el.baseFeePerGas,
-                        io.myotis.evm.Address.of(el.beneficiary.toArrayUnsafe()),
-                        el.mixHashOrPrevRandao.toArrayUnsafe(),
-                        java.math.BigInteger.valueOf(conn.getNetwork().networkId()),
-                        el.gasLimit);
+                blockCtx = blockContextOf(el, conn);
                 blockNumber = el.number;
+                blockHash = finExec.blockHash();
             }
             verified = true;
         } else {
@@ -1828,8 +1876,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             // both is pinned for the whole context (one consistent root).
             final long minHead = conn.getNetwork().minSensibleHeadBlock();
             // Live staleness floor: a peer whose head is BEHIND the beacon-finalized
-            // exec block can never anchor (anchorHeadToBeacon verifies the chain
-            // finalized→head, and finality has already passed it) — yet such a peer
+            // exec block is too stale to serve from — yet such a peer
             // happily snap-serves its frozen root and can win the probe race below,
             // forcing every build into the finalized fallback while fresh-headed
             // peers sit connected. Observed on-device: two peers frozen at the same
@@ -1851,18 +1898,19 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             }
             final long headFloor = Math.max(minHead, finalizedFloor);
             // When we have a beacon finalized anchor, probe each peer for its LIVE head by
-            // NUMBER (forward window from the finalized block — which every fresh peer holds)
-            // instead of its frozen connect-time Status hash. The Status hash never advances,
-            // so a long-lived peer's "fresh head" drifts below headFloor as the chain moves and
-            // starves GREEN once the LC is synced (acute on chains with few, sticky snap peers
-            // like Gnosis). Window spans finalized→head so the result lands at/just above the
-            // beacon-verified head; cap it so the response stays small on mobile links.
-            final boolean byNumberProbe = finalizedFloor > 0;
+            // NUMBER (a forward window — which every fresh peer holds) instead of its frozen
+            // connect-time Status hash. The Status hash never advances, so a long-lived peer's
+            // "fresh head" drifts below headFloor as the chain moves and starves GREEN once the
+            // LC is synced (acute on chains with few, sticky snap peers like Gnosis). The
+            // window runs from finality and never past the optimistic head: anchorHeadToBeacon
+            // can prove a head only at or below it (the walk runs up to its attested hash), so
+            // a peer's tip past it would only fall back to finalized. Capped so the response
+            // stays small on mobile links (a head the cap leaves below the optimistic head
+            // still anchors, by a longer walk).
+            final boolean byNumberProbe = finalizedFloor > 0 && optimisticHeadNum >= finalizedFloor;
             final long probeFrom = finalizedFloor;
             final int probeWindow = byNumberProbe
-                    ? (int) Math.max(16, Math.min(256,
-                        (optimisticHeadNum > finalizedFloor ? optimisticHeadNum - finalizedFloor : 0) + 16))
-                    : 0;
+                    ? (int) Math.min(256, optimisticHeadNum - finalizedFloor + 1) : 0;
             // Probe every ready snap peer CONCURRENTLY — fetch its fresh head, then
             // probe that it snap-serves that head root — and award the FIRST to
             // qualify. The old serial walk paid each unresponsive peer's timeout in
@@ -1904,17 +1952,11 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             }
             EthHandler headPeer = chosen.peer();
             BlockHeader header = chosen.header();
-            blockCtx = new io.myotis.evm.BlockContext(
-                    header.stateRoot.toArrayUnsafe(),
-                    header.number,
-                    header.timestamp,
-                    header.baseFeePerGas,
-                    io.myotis.evm.Address.of(header.beneficiary.toArrayUnsafe()),
-                    header.mixHashOrPrevRandao.toArrayUnsafe(),
-                    java.math.BigInteger.valueOf(conn.getNetwork().networkId()),
-                    header.gasLimit);
+            // The peer's word until buildAnchoredHead proves the header and rebuilds this.
+            blockCtx = blockContextOf(header, conn);
             blockNumber = header.number;
             verified = false;
+            blockHash = null;
             pinned = headPeer;
         }
 
@@ -2042,7 +2084,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         } catch (IllegalArgumentException noEns) {
             resolver = null;
         }
-        return new RpcCallContext(resolver, blockCtx, blockNumber, verified, executor, oracle);
+        return new RpcCallContext(resolver, blockCtx, blockNumber, verified, executor, oracle, blockHash);
     }
 
     /** First ready snap peer that returns a non-empty account proof at {@code root},
@@ -3417,17 +3459,16 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      * returning the "null" literal for 96% of polls (778 of 806), stalling tx
      * tracking and the confirm screen. The beacon OPTIMISTIC payload is itself a
      * light-client-verified anchor at/past the pin — re-anchor on it (its exec
-     * blockHash, via windowAnchoredToHash) and serve fully verified. Returns null
+     * blockHash, via HeaderChains.anchoredAtTop) and serve fully verified. Returns null
      * only when the pin is past even the optimistic number — genuinely
      * future/unknown, the caller's eth "null". Shared by every by-number serve
      * (blocks, block receipts) so the tuned rule can never diverge between them.
      * beaconSyncState is non-null (constructor requireNonNull).
      */
     private HeaderAnchor reAnchorForPin(long target) {
-        long optimisticNum = beaconSyncState.getOptimisticBlockNumber();
-        byte[] optimisticHash = beaconSyncState.getOptimisticBlockHash();
-        if (optimisticNum >= target && optimisticHash != null) {
-            return new HeaderAnchor(optimisticNum, null, optimisticHash);
+        BeaconSyncState.OptimisticExecution opt = beaconSyncState.getOptimisticExecution();
+        if (opt.blockNumber() >= target && opt.blockHash() != null) {
+            return new HeaderAnchor(opt.blockNumber(), opt.blockHash());
         }
         return null;
     }
@@ -3633,41 +3674,14 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     // Header anchoring (headers-only verified serving)
     // ---------------------------------------------------------------------
 
-    /** The contiguous header window [start..head] is valid iff its last header is the
-     *  beacon-verified head (stateRoot match) and each header hash-links to the next. */
-    private static boolean windowAnchoredToHead(List<BlockHeadersMessage.VerifiedHeader> window,
-                                                byte[] headStateRoot) {
-        if (window.isEmpty()) return false;
-        BlockHeader last = window.get(window.size() - 1).header();
-        if (!java.util.Arrays.equals(last.stateRoot.toArrayUnsafe(), headStateRoot)) return false;
-        return windowHashLinked(window);
-    }
-
-    /** Like {@link #windowAnchoredToHead} but anchored by the head's block HASH —
-     *  used with the beacon optimistic anchor, whose exec blockHash is what the
-     *  light client verified. */
-    private static boolean windowAnchoredToHash(List<BlockHeadersMessage.VerifiedHeader> window,
-                                                byte[] headBlockHash) {
-        if (window.isEmpty()) return false;
-        if (!java.util.Arrays.equals(
-                window.get(window.size() - 1).hash().toArrayUnsafe(), headBlockHash)) return false;
-        return windowHashLinked(window);
-    }
-
-    private static boolean windowHashLinked(List<BlockHeadersMessage.VerifiedHeader> window) {
-        for (int i = 0; i < window.size() - 1; i++) {
-            if (!window.get(i).hash().equals(window.get(i + 1).header().parentHash)) return false;
-        }
-        return true;
-    }
-
-    /** A beacon-verified header anchor: block {@code number} plus either the head's
-     *  {@code stateRoot} (snap-built head) or its block {@code hash} (beacon optimistic
-     *  exec payload) — exactly one is non-null. */
-    private record HeaderAnchor(long number, byte[] stateRoot, byte[] blockHash) {
+    /** A beacon-verified header anchor: block {@code number} and its proven block
+     *  {@code hash} — a head context's (proven by the walk down from the optimistic head, or
+     *  the finalized payload's own) or the beacon optimistic payload's. A header window
+     *  anchors iff it hash-links up to that hash ({@link HeaderChains#anchoredAtTop}); a
+     *  state root is no anchor, since a peer can copy a public root into a made-up header. */
+    private record HeaderAnchor(long number, byte[] blockHash) {
         boolean anchors(List<BlockHeadersMessage.VerifiedHeader> window) {
-            return stateRoot != null ? windowAnchoredToHead(window, stateRoot)
-                                     : windowAnchoredToHash(window, blockHash);
+            return HeaderChains.anchoredAtTop(window, blockHash);
         }
     }
 
@@ -3687,13 +3701,13 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         // long stale window (a stale head still anchors a fetched header window).
         if (c != null && !c.activeSnapHandlers().isEmpty()) {
             RpcCallContext ctx = anchoredHeadOrWait(RPC_HEAD_SERVE_STALE_MAX_MS, false);
-            if (ctx != null && ctx.beaconVerified()) {
-                return new HeaderAnchor(ctx.blockNumber(), ctx.blockCtx().stateRoot(), null);
+            if (ctx != null && ctx.beaconVerified() && ctx.blockHash() != null) {
+                return new HeaderAnchor(ctx.blockNumber(), ctx.blockHash());
             }
         }
         // Stale-but-verified fallback BEFORE the optimistic head. A recently-built
         // anchored head is a block we actually verified and can re-anchor a header
-        // window against (by stateRoot); the beacon OPTIMISTIC head below is a newer
+        // window against (by its proven hash); the beacon OPTIMISTIC head below is a newer
         // block with no snap-servable state, so a header window fetched + verified
         // against it returns null and the caller hard-errors. During the transient
         // snap-peer gaps this node sees (head momentarily un-rebuildable), that turned
@@ -3703,78 +3717,15 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         // verified-but-slightly-stale data through the gap (same contract as the head
         // context's own stale-serve and the gasPrice/maxPriorityFee FeeSnapshot path).
         HeadWithTimestamp good = lastGoodHead.get();
-        if (good != null && good.head().beaconVerified()
+        if (good != null && good.head().beaconVerified() && good.head().blockHash() != null
                 && clock.elapsedMillis() - good.builtAtMs() < RPC_HEAD_SERVE_STALE_MAX_MS) {
-            return new HeaderAnchor(good.head().blockNumber(),
-                    good.head().blockCtx().stateRoot(), null);
+            return new HeaderAnchor(good.head().blockNumber(), good.head().blockHash());
         }
         BeaconSyncState bss = beaconSyncState;
         if (bss == null) return null;
-        long n = bss.getOptimisticBlockNumber();
-        byte[] h = bss.getOptimisticBlockHash();
-        if (n <= 0 || h == null) return null;
-        return new HeaderAnchor(n, null, h);
-    }
-
-    /**
-     * Fetch headers in a single batch and verify the chain end-to-end.
-     * Returns a future that completes with {@code true} iff:
-     * <ul>
-     *   <li>the first header's stateRoot equals the beacon-finalized root,</li>
-     *   <li>the last header's stateRoot equals the peer's reported root,</li>
-     *   <li>and every header's hash equals the next header's parentHash.</li>
-     * </ul>
-     */
-    private CompletableFuture<Boolean> verifyHeaderChainBatched(
-            RLPxConnector conn, long finalizedBlock, long peerBlock,
-            byte[] beaconStateRoot, byte[] peerStateRoot) {
-        long totalLong = peerBlock - finalizedBlock + 1;
-        if (totalLong < 2 || totalLong > MAX_HEADER_CHAIN_GAP) {
-            log.info("[verify] headerChain gap " + totalLong
-                    + " out of range [2, " + MAX_HEADER_CHAIN_GAP + "]");
-            return CompletableFuture.completedFuture(false);
-        }
-        int total = (int) totalLong;
-        log.info("[verify] Fetching " + total + " headers from #"
-                + finalizedBlock + " to #" + peerBlock);
-        return Futures.orTimeout(conn.requestBlockHeadersBatched(finalizedBlock, total),
-                        HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
-                .thenApply(headers -> {
-                    boolean valid = verifyHeaderChain(headers, beaconStateRoot, peerStateRoot);
-                    log.info("[verify] Full header chain (" + headers.size()
-                            + " blocks) valid: " + valid);
-                    return valid;
-                });
-    }
-
-    /**
-     * Pure verification of a contiguous header range. Identical algorithm to
-     * {@code CommandHandler#verifyHeaderChain} in the JVM daemon.
-     */
-    private boolean verifyHeaderChain(List<BlockHeadersMessage.VerifiedHeader> headers,
-                                      byte[] expectedFirstStateRoot,
-                                      byte[] expectedLastStateRoot) {
-        if (headers.isEmpty()) return false;
-
-        byte[] firstStateRoot = headers.get(0).header().stateRoot.toArrayUnsafe();
-        if (!java.util.Arrays.equals(firstStateRoot, expectedFirstStateRoot)) return false;
-
-        byte[] lastStateRoot = headers.get(headers.size() - 1).header().stateRoot.toArrayUnsafe();
-        if (!java.util.Arrays.equals(lastStateRoot, expectedLastStateRoot)) return false;
-
-        for (int i = 0; i < headers.size() - 1; i++) {
-            Bytes32 currentHash = headers.get(i).hash();
-            Bytes32 nextParent = headers.get(i + 1).header().parentHash;
-            if (!currentHash.equals(nextParent)) {
-                log.info("[verify] hash chain break at index " + i
-                        + ": block #" + headers.get(i).header().number
-                        + " hash=" + currentHash.toShortHexString()
-                        + " != block #" + headers.get(i + 1).header().number
-                        + " parentHash=" + nextParent.toShortHexString());
-                return false;
-            }
-        }
-        return true;
+        BeaconSyncState.OptimisticExecution opt = bss.getOptimisticExecution();
+        if (opt.blockNumber() <= 0 || opt.blockHash() == null) return null;
+        return new HeaderAnchor(opt.blockNumber(), opt.blockHash());
     }
 
     /** Fetch the beacon-anchored header window [head-count+1 .. head]; null if it
