@@ -1,0 +1,682 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Myotis — Ethereum, verified on your own device</title>
+<meta name="description" content="Myotis is a free app for your computer or Android phone that checks everything your Ethereum wallet shows you, straight from the network — no company server in between.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#FAF9F6" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#111117" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<!-- Link previews (chat apps, social sites) need an absolute image URL; the
+     card is the repo's social preview, so it does not depend on which host
+     serves this page. -->
+<meta property="og:type" content="website">
+<meta property="og:title" content="Myotis — Ethereum, verified on your own device">
+<meta property="og:description" content="A free app that checks everything your Ethereum wallet shows you, straight from the network — no company server in between.">
+<meta property="og:image" content="https://raw.githubusercontent.com/biafra23/myotis/main/assets/social-preview.png">
+<meta name="twitter:card" content="summary_large_image">
+<!--
+  Rules for this page (docs/website.md): no build step, no third-party
+  requests, relative links only. It is served from GitHub Pages under
+  /myotis/ and is meant to move unchanged to Swarm (myotis.eth).
+-->
+<style>
+:root {
+  --bg: #FAF9F6;
+  --bg-alt: #F1F0EB;
+  --surface: #FFFFFF;
+  --ink: #1A1A24;
+  --muted: #55556A;
+  --line: #E2E0D9;
+  --accent: #4338CA;
+  --accent-hover: #3730A3;
+  --accent-ink: #FFFFFF;
+  --accent-soft: #ECEDFD;
+  --code-bg: #ECEBE5;
+  --ok: #2E7D32;
+  --warn: #F9A825;
+  --bad: #D32F2F;
+  --off: #78909C;
+  --radius: 14px;
+  --shadow: 0 1px 2px rgba(26, 26, 36, .06), 0 4px 16px rgba(26, 26, 36, .05);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111117;
+    --bg-alt: #16161E;
+    --surface: #1C1C26;
+    --ink: #EDEDF3;
+    --muted: #A6A6BA;
+    --line: #2D2D3A;
+    --accent: #A5B4FC;
+    --accent-hover: #C7D2FE;
+    --accent-ink: #15153A;
+    --accent-soft: #24244A;
+    --code-bg: #262633;
+    --ok: #4CAF50;
+    --shadow: none;
+  }
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 72px; -webkit-text-size-adjust: 100%; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 17px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+a { color: var(--accent); text-underline-offset: 2px; }
+a:hover { color: var(--accent-hover); }
+h1, h2, h3 { line-height: 1.2; letter-spacing: -0.015em; margin: 0 0 .5em; }
+h2 { font-size: clamp(1.6rem, 1.2rem + 1.6vw, 2.2rem); }
+h3 { font-size: 1.15rem; }
+p { margin: 0 0 1em; }
+code, .mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: .9em;
+}
+code { background: var(--code-bg); padding: .1em .35em; border-radius: 5px; overflow-wrap: anywhere; }
+.wrap { max-width: 1080px; margin: 0 auto; padding: 0 20px; }
+.narrow > * { max-width: 760px; }
+.muted { color: var(--muted); }
+.skip { position: absolute; left: -999px; }
+.skip:focus { left: 16px; top: 12px; z-index: 10; background: var(--surface); padding: 8px 12px; border-radius: 8px; }
+
+/* Header */
+.top {
+  position: sticky; top: 0; z-index: 5;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: saturate(1.4) blur(10px);
+  -webkit-backdrop-filter: saturate(1.4) blur(10px);
+  border-bottom: 1px solid var(--line);
+}
+.top .wrap { display: flex; align-items: center; gap: 16px; height: 60px; }
+.brand { display: flex; align-items: center; gap: 10px; color: var(--ink); text-decoration: none; font-weight: 700; font-size: 1.1rem; letter-spacing: .02em; }
+.brand svg { width: 40px; height: 26px; }
+.top nav { margin-left: auto; display: flex; gap: 4px; align-items: center; }
+.top nav a { color: var(--muted); text-decoration: none; font-size: .95rem; padding: 6px 10px; border-radius: 8px; }
+.top nav a:hover { color: var(--ink); background: var(--bg-alt); }
+.top nav a.cta { color: var(--accent-ink); background: var(--accent); font-weight: 600; }
+.top nav a.cta:hover { background: var(--accent-hover); }
+@media (max-width: 760px) { .top nav a:not(.cta) { display: none; } }
+
+/* Hero */
+.hero { padding: 72px 0 64px; }
+.hero .wrap { display: grid; grid-template-columns: 1.25fr 1fr; gap: 40px; align-items: center; }
+.eyebrow { display: inline-block; font-size: .85rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin-bottom: 14px; }
+.hero h1 { font-size: clamp(2.2rem, 1.4rem + 3.4vw, 3.6rem); letter-spacing: -0.03em; }
+.lead { font-size: 1.2rem; color: var(--muted); max-width: 36em; }
+.hero-art { display: flex; justify-content: center; }
+.hero-art svg { width: 100%; max-width: 400px; height: auto; color: var(--ink); }
+.buttons { display: flex; flex-wrap: wrap; gap: 12px; margin: 28px 0 18px; }
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 12px 20px; border-radius: 999px; font-weight: 600; text-decoration: none;
+  border: 1px solid var(--line); color: var(--ink); background: var(--surface);
+}
+.btn:hover { border-color: var(--muted); color: var(--ink); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.btn.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: var(--accent-ink); }
+.fineprint { font-size: .92rem; color: var(--muted); }
+@media (max-width: 820px) {
+  .hero { padding: 40px 0 48px; }
+  .hero .wrap { grid-template-columns: 1fr; }
+  .hero-art { order: -1; }
+  .hero-art svg { max-width: 220px; }
+}
+
+/* Sections */
+section { padding: 72px 0; }
+section.alt { background: var(--bg-alt); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.section-intro { max-width: 46em; margin-bottom: 32px; }
+.section-intro p { color: var(--muted); font-size: 1.08rem; }
+@media (max-width: 640px) { section { padding: 52px 0; } }
+
+.callout {
+  border: 1px solid var(--line); border-left: 4px solid var(--accent);
+  background: var(--surface); border-radius: 10px; padding: 16px 20px; margin: 24px 0;
+}
+.callout p:last-child { margin-bottom: 0; }
+.callout.warn { border-left-color: var(--warn); }
+
+/* Comparison */
+.compare { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 28px; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 22px; box-shadow: var(--shadow); }
+.panel h3 { display: flex; align-items: center; gap: 10px; }
+.flow { display: flex; align-items: stretch; gap: 8px; margin: 16px 0 12px; }
+.flow .node {
+  flex: 1; text-align: center; padding: 12px 6px; border-radius: 10px;
+  background: var(--bg-alt); border: 1px solid var(--line); font-size: .92rem; font-weight: 600;
+  display: flex; flex-direction: column; justify-content: center;
+}
+.flow .node small { display: block; font-weight: 400; color: var(--muted); font-size: .8rem; margin-top: 2px; }
+.flow .node.me { background: var(--accent-soft); border-color: var(--accent); }
+.flow .arrow { align-self: center; color: var(--muted); font-size: 1.2rem; }
+@media (max-width: 820px) { .compare { grid-template-columns: 1fr; } }
+@media (max-width: 420px) {
+  .flow { flex-direction: column; }
+  .flow .arrow { transform: rotate(90deg); }
+}
+
+/* Cards */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 18px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 22px; box-shadow: var(--shadow); }
+.card .icon { width: 40px; height: 40px; border-radius: 10px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent); margin-bottom: 14px; }
+.card .icon svg { width: 22px; height: 22px; }
+.card p { color: var(--muted); margin: 0; }
+
+/* Platform chooser */
+.platforms { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 18px; }
+.platform { display: block; text-decoration: none; color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 22px; box-shadow: var(--shadow); }
+a.platform:hover { border-color: var(--accent); color: var(--ink); }
+.platform h3 { margin-bottom: .3em; }
+.platform p { color: var(--muted); margin: 0; font-size: .95rem; }
+.platform.soon { background: transparent; box-shadow: none; border-style: dashed; }
+
+/* Steps */
+.steps { list-style: none; counter-reset: step; padding: 0; margin: 0; }
+.steps > li { counter-increment: step; position: relative; padding: 0 0 28px 60px; }
+.steps > li::before {
+  content: counter(step);
+  position: absolute; left: 0; top: -2px; width: 40px; height: 40px; border-radius: 50%;
+  display: grid; place-items: center; font-weight: 700;
+  background: var(--accent); color: var(--accent-ink);
+}
+.steps > li::after { content: ""; position: absolute; left: 19px; top: 44px; bottom: 6px; width: 2px; background: var(--line); }
+.steps > li:last-child { padding-bottom: 0; }
+@media (max-width: 480px) { .steps > li { padding-left: 52px; } }
+.steps > li:last-child::after { display: none; }
+.steps h3 { margin-bottom: .35em; padding-top: 6px; }
+.steps p, .steps li li { color: var(--muted); }
+.steps ul { padding-left: 1.2em; margin: 0 0 1em; }
+.steps li li { margin-bottom: .35em; }
+.steps strong, .steps em { color: var(--ink); }
+
+/* File list */
+.files { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--surface); margin: 8px 0 14px; }
+.files div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 16px; padding: 10px 14px; border-top: 1px solid var(--line); }
+.files div:first-child { border-top: 0; }
+.files .who { color: var(--ink); font-weight: 600; }
+.files .file { color: var(--muted); }
+
+/* Tables */
+.table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+table { border-collapse: collapse; width: 100%; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; font-size: .95rem; }
+th, td { text-align: left; padding: 10px 14px; border-top: 1px solid var(--line); vertical-align: top; }
+thead th { border-top: 0; background: var(--bg-alt); font-size: .85rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+td code { white-space: nowrap; }
+/* Phones: one card per network instead of a table that scrolls sideways
+   and hides the chain id. */
+@media (max-width: 600px) {
+  table.stack, .stack tbody, .stack tr, .stack td { display: block; width: 100%; }
+  .stack thead { display: none; }
+  table.stack { border: 0; background: transparent; }
+  .stack tr { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; margin-bottom: 10px; padding: 6px 0; }
+  .stack td { border: 0; padding: 6px 14px; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; }
+  .stack td::before { content: attr(data-label); flex: 0 0 76px; font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  .stack td:first-child { font-weight: 600; }
+}
+
+/* Copy field */
+.copy { display: inline-flex; align-items: center; gap: 6px; }
+.copy button {
+  font: inherit; font-size: .8rem; font-weight: 600; cursor: pointer;
+  border: 1px solid var(--line); background: var(--surface); color: var(--muted);
+  border-radius: 6px; padding: 2px 8px;
+}
+.copy button:hover { color: var(--ink); border-color: var(--muted); }
+.copy button[hidden] { display: none; }
+
+/* Status lights */
+.lights { display: grid; gap: 12px; margin: 0; padding: 0; list-style: none; }
+.lights li { display: grid; grid-template-columns: 20px 1fr; gap: 12px; align-items: start; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+.dot { width: 14px; height: 14px; border-radius: 50%; margin-top: 6px; }
+.dot.ok { background: var(--ok); }
+.dot.warn { background: var(--warn); }
+.dot.bad { background: var(--bad); }
+.dot.off { background: var(--off); }
+.lights p { margin: 0; color: var(--muted); }
+.lights strong { color: var(--ink); }
+
+/* FAQ */
+.faq details { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; margin-bottom: 10px; }
+.faq summary { cursor: pointer; padding: 16px 20px; font-weight: 600; list-style: none; position: relative; padding-right: 48px; }
+.faq summary::-webkit-details-marker { display: none; }
+.faq summary::after { content: "+"; position: absolute; right: 20px; top: 50%; transform: translateY(-50%); font-size: 1.4rem; color: var(--muted); font-weight: 400; }
+.faq details[open] summary::after { content: "–"; }
+.faq .answer { padding: 0 20px 6px; color: var(--muted); }
+
+/* Footer */
+footer { padding: 40px 0 56px; border-top: 1px solid var(--line); color: var(--muted); font-size: .95rem; }
+footer .wrap { display: flex; flex-wrap: wrap; gap: 12px 28px; align-items: center; justify-content: space-between; }
+footer a { color: var(--muted); }
+footer .brand { font-size: 1rem; }
+</style>
+</head>
+<body>
+<!-- The bat from assets/myotis_logo.svg (paths copied verbatim), drawn in the
+     text colour so it follows light and dark mode. Defined once, used twice. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="bat" viewBox="300 144 426 270">
+    <path fill="currentColor" d="M438.817169,297.180237 C429.556549,290.816010 419.541016,287.340820 408.883575,285.715485 C405.515228,285.201874 404.384308,284.298492 404.437286,280.420868 C404.828156,251.798706 389.219147,228.950226 359.844391,224.286209 C356.753998,223.795532 355.565186,222.624039 355.883972,219.385330 C358.281586,195.027374 349.531433,179.742599 327.454224,169.445709 C326.707275,169.097336 325.887817,168.847610 325.697845,167.880768 C351.199127,154.357071 450.123535,174.479462 472.371704,198.482864 C442.196136,208.355011 422.777161,228.150192 415.593170,259.084381 C428.237701,231.344666 448.526520,212.522827 478.603058,204.167679 C479.756439,208.776138 478.356659,212.494308 477.992218,216.172455 C475.729980,239.004379 482.009247,259.335205 495.507233,277.589020 C503.998749,289.072449 514.853760,298.213440 525.678284,307.371063 C531.174683,312.021088 535.177063,317.445099 535.423584,325.166595 C535.685181,333.358185 531.713501,338.873657 525.055786,342.614105 C518.821472,346.116638 512.269470,349.053131 505.862091,352.248322 C490.925812,359.696686 477.434937,368.961609 467.555054,382.759583 C467.069092,383.438293 466.595306,384.149689 465.074249,383.864502 C471.847656,350.482971 468.572052,319.929047 438.817169,297.180237 z"/>
+    <path fill="currentColor" d="M505.968994,359.877625 C514.205688,355.443115 522.839172,352.621918 530.289307,347.429504 C545.164124,337.062469 547.155518,319.718231 534.606384,306.609039 C530.128479,301.931305 525.036621,297.833435 520.151123,293.555298 C503.635284,279.093018 490.404022,262.572937 486.189270,240.258102 C484.124786,229.327652 483.834229,218.408722 486.428314,207.567154 C487.674805,202.357605 486.869507,198.908112 482.035675,195.450058 C457.319061,177.768250 429.894012,166.816803 400.187103,161.297287 C369.021027,155.506699 337.918549,156.536804 306.905853,162.651749 C305.551697,162.918762 304.104919,163.880997 302.855438,162.401886 C302.965118,160.998962 304.080811,160.913666 304.992798,160.599182 C337.899719,149.251221 371.504730,144.665115 406.241272,149.411194 C442.227539,154.328033 474.462128,167.895798 503.244293,189.965408 C506.741272,192.646790 507.912842,194.941589 506.402740,199.531052 C494.871887,234.575348 510.559509,269.819946 545.319397,287.598419 C552.000488,291.015594 558.954224,293.753601 566.549988,295.403259 C567.106201,293.410461 565.706726,292.195709 565.104370,290.778931 C558.588013,275.452637 557.882751,260.054932 565.371521,244.931427 C572.486877,230.561981 585.509094,228.020844 597.889221,238.207550 C608.609070,247.028152 613.955322,258.874451 616.193542,272.195129 C616.891235,276.347382 618.213379,278.638031 622.541138,279.683777 C633.589417,282.353302 642.020447,288.891235 647.851257,298.622345 C650.211365,302.561035 652.973633,306.021484 656.899292,308.429901 C660.638306,310.723816 660.921814,313.825562 659.244202,317.474243 C654.907654,326.905731 647.253906,331.547760 637.174133,332.166534 C622.369812,333.075256 610.381653,339.471466 600.544739,350.265472 C582.925842,369.598602 560.753235,379.069519 534.978027,381.484894 C521.444092,382.753174 507.765839,383.498596 494.789642,388.498749 C482.791473,393.121948 472.065430,399.546539 462.959290,408.649445 C461.960388,409.647919 461.225250,411.184540 458.408386,410.843201 C468.435028,388.177704 483.880524,371.241760 505.968994,359.877625 M602.661865,265.947418 C599.730530,258.820374 596.349426,252.003387 589.989868,247.184723 C583.559326,242.312332 579.789795,243.002197 576.050476,250.090302 C568.261658,264.854492 569.855530,291.498932 593.563416,302.654968 C596.549622,304.060181 597.695068,302.678436 599.162659,300.603363 C606.681396,289.972015 606.067383,278.487915 602.661865,265.947418 z"/>
+    <path fill="currentColor" d="M590.078979,189.028046 C630.317566,161.153687 674.804016,148.668564 723.426208,149.197998 C671.727600,166.422775 634.255615,197.963303 618.926025,251.825668 C615.848206,251.367844 615.536682,248.874329 614.492554,247.131592 C609.052551,238.051743 602.205933,230.466873 592.030579,226.707596 C580.904114,222.596939 570.388306,225.909088 563.173706,235.316162 C553.260986,248.241333 551.668457,262.936737 553.826111,278.458221 C553.962952,279.442139 554.225525,280.410095 554.331665,281.396027 C554.381409,281.858429 554.197815,282.345978 554.128723,282.768677 C552.660217,283.954193 551.514526,282.876465 550.401672,282.336914 C542.089050,278.306427 534.747742,272.925995 528.049805,266.560822 C525.177246,263.831024 525.332947,261.538361 527.222473,258.289215 C543.193848,230.825638 563.677185,207.493912 590.078979,189.028046 z"/>
+    <path fill="currentColor" d="M653.549438,271.386871 C655.182617,265.384674 655.129089,259.789154 653.307373,254.272751 C652.540955,251.951828 652.077393,249.042023 649.218567,248.445190 C646.145142,247.803589 644.358215,250.299377 642.753052,252.371124 C638.380920,258.013947 635.610840,264.342804 635.179321,271.575043 C635.081848,273.208466 635.342834,274.928467 634.119202,276.624084 C630.794861,276.884216 628.015503,274.712646 624.890015,273.873505 C623.235535,273.429291 622.780273,271.918274 623.040222,270.235901 C624.844360,258.559113 628.950378,247.998764 638.298950,240.220428 C647.220459,232.797455 656.388489,234.630951 662.007690,244.722763 C670.060730,259.185699 666.260742,282.722595 654.067261,293.773865 C653.724670,294.084351 653.192505,294.185547 652.335327,294.569550 C650.466248,292.121979 648.574585,289.649597 646.688293,287.173096 C645.496277,285.608185 646.387878,284.402649 647.350342,283.172150 C650.042053,279.730682 652.098755,275.942322 653.549438,271.386871 z"/>
+  </symbol>
+</svg>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="#top" aria-label="Myotis — back to top">
+      <svg aria-hidden="true"><use href="#bat"/></svg>
+      myotis
+    </a>
+    <nav aria-label="Sections">
+      <a href="#what">What it is</a>
+      <a href="#why">Why</a>
+      <a href="#desktop">Desktop</a>
+      <a href="#android">Android</a>
+      <a href="#wallet">Connect a wallet</a>
+      <a href="#faq">FAQ</a>
+      <a class="cta" href="#get">Get Myotis</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+<div class="hero" id="top">
+  <div class="wrap">
+    <div>
+      <span class="eyebrow">Free &amp; open source · Desktop · Android</span>
+      <h1>Ethereum, verified on your own device.</h1>
+      <p class="lead">Myotis is an app that runs next to your wallet. It talks to the Ethereum network directly and checks every answer with cryptography — so the balance your wallet shows comes from the network itself, not from some company's server.</p>
+      <div class="buttons">
+        <a class="btn primary" href="#get">Get Myotis</a>
+        <a class="btn" href="#what">How does it work?</a>
+      </div>
+      <p class="fineprint">Myotis never holds your keys or your money. It is young software, under active development — try it with small amounts first.</p>
+    </div>
+    <div class="hero-art">
+      <svg role="img" aria-label="The Myotis bat logo"><use href="#bat"/></svg>
+    </div>
+  </div>
+</div>
+
+<section class="alt" id="what">
+  <div class="wrap">
+    <div class="section-intro">
+      <h2>What is Myotis?</h2>
+      <p>When you open a wallet such as MetaMask and look at your balance, the wallet does not look at Ethereum itself. It asks a server run by a company — “what is this address’s balance?” — and shows you whatever comes back. You have no way to check that answer, and that company sees every address you look at, every time, together with your internet address.</p>
+      <p>Myotis replaces that server with one that runs on <em>your</em> phone or computer. It joins the Ethereum network like any other participant, fetches just the small pieces your wallet asks about, and checks each one against proofs signed by the network itself. Your wallet keeps working exactly as before — you just point it at Myotis instead of the company.</p>
+    </div>
+
+    <div class="compare">
+      <div class="panel">
+        <h3>The usual way</h3>
+        <div class="flow" aria-label="Your wallet asks a company server, which asks the Ethereum network">
+          <div class="node">Your wallet</div>
+          <div class="arrow" aria-hidden="true">→</div>
+          <div class="node">A company’s server<small>you trust its answer</small></div>
+          <div class="arrow" aria-hidden="true">→</div>
+          <div class="node">Ethereum</div>
+        </div>
+        <p class="muted">One company answers every question, sees every address you check, and can be wrong, switched off, or pressured into blocking you.</p>
+      </div>
+      <div class="panel">
+        <h3>With Myotis</h3>
+        <div class="flow" aria-label="Your wallet asks Myotis on your own device, which checks answers from the Ethereum network">
+          <div class="node">Your wallet</div>
+          <div class="arrow" aria-hidden="true">→</div>
+          <div class="node me">Myotis<small>on your device, checks every answer</small></div>
+          <div class="arrow" aria-hidden="true">→</div>
+          <div class="node">Ethereum<small>thousands of computers</small></div>
+        </div>
+        <p class="muted">Answers come from the network and are proven before your wallet sees them. If something cannot be proven, Myotis says so instead of guessing.</p>
+      </div>
+    </div>
+
+    <div class="callout">
+      <p><strong>Myotis is not a wallet.</strong> It has no keys, no seed phrase and no money of yours. You keep using your own wallet to sign and send. Myotis is the part that tells your wallet what is true on the blockchain, and hands your signed transactions to the network.</p>
+    </div>
+  </div>
+</section>
+
+<section id="why">
+  <div class="wrap">
+    <div class="section-intro">
+      <h2>Why it matters</h2>
+      <p>Ethereum was built so that nobody has to be trusted. Myotis brings that back to the everyday part — looking at your money and sending it.</p>
+    </div>
+    <div class="cards">
+      <div class="card">
+        <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.5-3 7.7-7 9-4-1.3-7-4.5-7-9V6l7-3z"/><path d="M9 12l2 2 4-4"/></svg></div>
+        <h3>Nobody can lie to you</h3>
+        <p>Every balance and every result is checked with cryptography before your wallet sees it. A made-up answer simply fails the check.</p>
+      </div>
+      <div class="card">
+        <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg></div>
+        <h3>No gatekeeper</h3>
+        <p>No account, no sign-up, no terms of service. No company can block you, switch you off, or go down and take your wallet with it.</p>
+      </div>
+      <div class="card">
+        <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="7" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><circle cx="19" cy="15" r="1.5"/><circle cx="5" cy="16" r="1.5"/><path d="M8 7.5l8-1M7 8.5l4 8M17 7.5l-4 9M13.8 17.4l3.8-1.8M10 17.5l-3.6-1"/></svg></div>
+        <h3>No one collects it all</h3>
+        <p>Instead of one company seeing everything you look at, Myotis spreads its questions across many independent computers, so no single one builds up the full picture.</p>
+      </div>
+      <div class="card">
+        <div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6l-6 6 6 6M16 6l6 6-6 6"/></svg></div>
+        <h3>Free and open</h3>
+        <p>Myotis costs nothing and its code is public, under the Apache 2.0 licence. Anyone can read it, check it and build on it.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="alt" id="get">
+  <div class="wrap">
+    <div class="section-intro">
+      <h2>Get Myotis</h2>
+      <p>Pick your device. Each guide takes you from download to a wallet that reads verified data.</p>
+    </div>
+    <div class="platforms">
+      <a class="platform" href="#desktop">
+        <h3>Mac</h3>
+        <p>macOS on Apple silicon (M1 and newer) or Intel.</p>
+      </a>
+      <a class="platform" href="#desktop">
+        <h3>Linux</h3>
+        <p>Debian, Ubuntu and their relatives, on 64-bit PCs or ARM.</p>
+      </a>
+      <a class="platform" href="#android">
+        <h3>Android</h3>
+        <p>Android 10 or newer.</p>
+      </a>
+      <div class="platform soon">
+        <h3>Windows &amp; iPhone</h3>
+        <p>Not yet. See the <a href="#faq-other">questions below</a>.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="desktop">
+  <div class="wrap narrow">
+    <div class="section-intro">
+      <h2>Desktop: Mac and Linux</h2>
+      <p>Myotis runs as a normal app on your computer. Your browser wallet — for example the MetaMask extension — then reads from it.</p>
+    </div>
+    <ol class="steps">
+      <li>
+        <h3>Download</h3>
+        <p>Open the <a href="https://github.com/biafra23/myotis/releases">Myotis releases page</a>. The newest version is at the top (for example <em>Myotis v0.1.14</em>). Click <em>Assets</em> below its notes and download the one file that fits your computer:</p>
+        <div class="files">
+          <div><span class="who">Mac with Apple silicon (M1, M2, M3, M4…)</span><span class="file mono">Myotis-v…-arm64.dmg</span></div>
+          <div><span class="who">Mac with an Intel processor</span><span class="file mono">Myotis-v…-x64.dmg</span></div>
+          <div><span class="who">Linux PC (most computers)</span><span class="file mono">Myotis-v…-x64.deb</span></div>
+          <div><span class="who">Linux on ARM</span><span class="file mono">Myotis-v…-arm64.deb</span></div>
+        </div>
+        <p>Not sure which Mac you have? Apple menu → <em>About This Mac</em>: it says <em>Chip: Apple M…</em> or <em>Processor: Intel</em>. Ignore every other file on the page — files with <em>bee-poc</em> or <em>railgun-poc</em> in the name are demos, the rest are for developers.</p>
+      </li>
+      <li>
+        <h3>Install</h3>
+        <p><strong>Mac:</strong> open the downloaded <code>.dmg</code> and drag <em>Myotis</em> into <em>Applications</em>.</p>
+        <p>The first time you open it, macOS refuses with a warning that Apple could not check the app. That is because Myotis is not yet registered (“notarised”) with Apple. To open it anyway — you only need to do this once:</p>
+        <ul>
+          <li><strong>macOS 15 (Sequoia) and newer:</strong> try to open Myotis once and close the warning. Open <em>System Settings → Privacy &amp; Security</em>, scroll down to the note about Myotis, click <em>Open Anyway</em> and confirm.</li>
+          <li><strong>Older macOS:</strong> in <em>Applications</em>, right-click (or Control-click) Myotis, choose <em>Open</em>, then <em>Open</em> again.</li>
+        </ul>
+        <p><strong>Linux:</strong> double-click the <code>.deb</code> to install it with your software centre, or run <code>sudo apt install ./Myotis-v…-x64.deb</code> in a terminal, from the folder you downloaded it to.</p>
+      </li>
+      <li>
+        <h3>Start Myotis and let it catch up</h3>
+        <p>Open Myotis. It connects to Ethereum by itself, and the <em>Status</em> tab shows how far it has got. The very first start takes a few minutes; after that it is ready in about ten seconds. Wait until it says <strong>Ready</strong> with a green bar — <a href="#status">what the colours mean</a>.</p>
+        <p>Keep Myotis open while you use your wallet; minimising the window is fine. <strong>Closing the window quits Myotis</strong>, and your wallet loses its connection until you start it again.</p>
+      </li>
+      <li>
+        <h3>Connect your wallet</h3>
+        <p>Point your wallet at Myotis — see <a href="#wallet">Connect your wallet</a> below. A browser extension wallet such as MetaMask needs one extra click in Myotis the first time: <a href="#web-access">allowing it</a>.</p>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section class="alt" id="android">
+  <div class="wrap narrow">
+    <div class="section-intro">
+      <h2>Android</h2>
+      <p>Myotis runs in the background on your phone while a wallet app such as MetaMask reads from it. It is not in the Play Store yet, so you install it directly.</p>
+    </div>
+    <ol class="steps">
+      <li>
+        <h3>Download</h3>
+        <p>On your phone, open the <a href="https://github.com/biafra23/myotis/releases">Myotis releases page</a>. The newest version is at the top (for example <em>Myotis v0.1.14</em>). Tap <em>Assets</em> below its notes and download:</p>
+        <div class="files">
+          <div><span class="who">Android phone or tablet</span><span class="file mono">Myotis-v…-android-debug.apk</span></div>
+        </div>
+        <p>It is about 110 MB, so Wi-Fi is a good idea. You need Android 10 or newer on a 64-bit device — practically every phone from the last several years.</p>
+      </li>
+      <li>
+        <h3>Install</h3>
+        <p>Open the downloaded file. Android asks whether your browser may install apps: allow <em>Install unknown apps</em> for it, go back and tap <em>Install</em>. If Google Play Protect warns about an unknown app, choose <em>More details → Install anyway</em>.</p>
+        <p>These warnings appear because the app comes straight from the project rather than from the Play Store, and because it is a test (“debug”) build — <a href="#faq-warnings">more about that</a>.</p>
+      </li>
+      <li>
+        <h3>Open Myotis and let it catch up</h3>
+        <p>Myotis starts by itself when you open it. A notification, <em>Myotis node running</em>, stays visible while it works — that is how Android lets it keep running in the background while you switch to your wallet. If you tap <em>Start</em> yourself, Android may ask whether Myotis may show notifications; allowing it keeps you informed.</p>
+        <p>The very first start takes a few minutes; after that it is ready in about ten seconds. Wait until the <em>Status</em> tab says <strong>Ready</strong> with a green bar — <a href="#status">what the colours mean</a>.</p>
+      </li>
+      <li>
+        <h3>Connect your wallet</h3>
+        <p>Point MetaMask on the same phone at Myotis — see <a href="#wallet">Connect your wallet</a> below. Wallet apps work straight away; nothing needs allowing.</p>
+      </li>
+      <li>
+        <h3>Good to know: Myotis sleeps to save battery</h3>
+        <p>After five minutes without wallet requests, Myotis goes to sleep: the status turns grey and says <em>Sleeping</em>, and it stops using the network. As soon as your wallet asks something, it wakes up by itself — the first answer just takes a few seconds longer. While the phone is plugged in and online, it stays awake. You can change both under <em>Settings → Power</em> (<em>Idle sleep after</em> and <em>Stay awake while charging</em>), and stop Myotis completely with <em>Stop</em> on the Status tab.</p>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section id="wallet">
+  <div class="wrap narrow">
+    <div class="section-intro">
+      <h2>Connect your wallet</h2>
+      <p>Myotis offers your wallet the same kind of connection it normally gets from a company — just at a local address on your own device. Any wallet that lets you set a custom “RPC URL” can use it. Here is how with MetaMask.</p>
+    </div>
+    <h3>The values to enter</h3>
+    <div class="table-scroll">
+      <table class="stack">
+        <thead>
+          <tr><th>Network</th><th>RPC URL</th><th>Chain ID</th><th>Currency</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td data-label="Network">Ethereum</td>
+            <td data-label="RPC URL"><span class="copy"><code>http://localhost:8545</code><button type="button" data-copy="http://localhost:8545" hidden>Copy</button></span></td>
+            <td data-label="Chain ID"><code>1</code></td><td data-label="Currency">ETH</td>
+          </tr>
+          <tr>
+            <td data-label="Network">Gnosis Chain</td>
+            <td data-label="RPC URL"><span class="copy"><code>http://localhost:8546</code><button type="button" data-copy="http://localhost:8546" hidden>Copy</button></span></td>
+            <td data-label="Chain ID"><code>100</code></td><td data-label="Currency">XDAI</td>
+          </tr>
+          <tr>
+            <td data-label="Network">Sepolia <span class="muted">(test network, play money)</span></td>
+            <td data-label="RPC URL"><span class="copy"><code>http://localhost:8547</code><button type="button" data-copy="http://localhost:8547" hidden>Copy</button></span></td>
+            <td data-label="Chain ID"><code>11155111</code></td><td data-label="Currency">SepoliaETH</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="fineprint" style="margin-top:10px">Only Ethereum is switched on when you install Myotis. Turn the others on under <em>Settings → Networks</em> in Myotis; each one gets its own address, so add each to your wallet separately. <code>localhost</code> means “this device”: the connection never leaves your phone or computer, and other devices cannot use it.</p>
+
+    <h3 style="margin-top:36px">In MetaMask</h3>
+    <ol class="steps">
+      <li>
+        <h3>Open the network’s settings</h3>
+        <p>In MetaMask, open the network list, find <em>Ethereum Mainnet</em> and choose <em>Edit</em>. (On the phone: <em>Settings → Networks → Ethereum Mainnet</em>.)</p>
+      </li>
+      <li>
+        <h3>Add Myotis as its RPC URL</h3>
+        <p>Open the <em>RPC URL</em> list and choose <em>Add RPC URL</em>. Enter <code>http://localhost:8545</code>, give it a name such as <em>Myotis</em>, and add it.</p>
+      </li>
+      <li>
+        <h3>Select it and save</h3>
+        <p>Make sure <em>Myotis</em> is the selected RPC URL, then save. Your balance now comes from Myotis. To switch back at any time, select MetaMask’s original entry again.</p>
+      </li>
+    </ol>
+    <p class="fineprint">MetaMask’s menus move a little between versions. If you cannot find <em>Add RPC URL</em>, look for <em>Add network → Add a network manually</em> and enter the values from the table. Other wallets work the same way, as long as they let you set a custom RPC URL.</p>
+
+    <div class="callout" id="web-access">
+      <p><strong>Using the MetaMask browser extension? Allow it once.</strong> To protect you, Myotis refuses web pages by default — otherwise any website open in your browser could quietly use it. A browser extension counts as a web page too. The first time MetaMask connects, Myotis shows <em>A web page was refused</em> on its Status screen and as a notification, naming <em>MetaMask (Chrome extension)</em>. Click <strong>Allow</strong>. Only allow names you recognise; the list lives under <em>Settings → Web page access</em>.</p>
+      <p>Wallet apps on your phone, such as MetaMask Mobile, are not web pages and work right away.</p>
+    </div>
+  </div>
+</section>
+
+<section class="alt" id="status">
+  <div class="wrap narrow">
+    <div class="section-intro">
+      <h2>Inside the app</h2>
+      <p>Myotis has three tabs: <em>Status</em>, <em>Query</em> and <em>Settings</em>. On a phone they sit at the bottom of the screen, on a computer along the top. The chips next to the name show which networks are running.</p>
+    </div>
+
+    <h3>Status: is it ready?</h3>
+    <p class="muted">A coloured bar under the header and a card with a headline tell you, at a glance, whether your wallet can rely on Myotis right now.</p>
+    <ul class="lights">
+      <li><span class="dot ok" aria-hidden="true"></span><p><strong>Green — Ready.</strong> Your wallet gets verified answers. A thicker, brighter green means Myotis has found plenty of helpers on the network, so even heavy wallet screens load quickly.</p></li>
+      <li><span class="dot warn" aria-hidden="true"></span><p><strong>Amber — Almost ready.</strong> Myotis has caught up and is waiting for the newest block. Your wallet may show a brief error; just wait a moment.</p></li>
+      <li><span class="dot bad" aria-hidden="true"></span><p><strong>Red — Syncing, or something needs you.</strong> Red does not always mean a problem: <em>Syncing</em> is normal while Myotis catches up, so wait. The other red headlines tell you what to do: <em>Not running</em> — tap <em>Start</em>; <em>No internet connection</em>; <em>Update required</em> — install the newest version; <em>Needs your decision</em> — see <a href="#faq-decision">this question</a>.</p></li>
+      <li><span class="dot off" aria-hidden="true"></span><p><strong>Grey — Sleeping</strong> (Android). Myotis paused itself to save battery. Your wallet’s next request wakes it up.</p></li>
+    </ul>
+
+    <h3 style="margin-top:36px">Query: check an address yourself</h3>
+    <p class="muted">Type an address (<code>0x…</code>) or an ENS name such as <code>vitalik.eth</code> and tap <em>Look up</em>. Myotis shows the balance with a <strong>✓ Verified</strong> badge once it has checked it — a quick way to see Myotis at work without any wallet.</p>
+
+    <h3 style="margin-top:36px">Settings</h3>
+    <p class="muted"><em>Networks</em> switches Ethereum, Gnosis Chain and Sepolia on and off. <em>Web page access</em> decides which websites and browser extensions may use Myotis. On Android, <em>Power</em> controls the battery-saving sleep. Everything else sits behind <em>Expert mode</em> — you will not need it for everyday use.</p>
+  </div>
+</section>
+
+<section id="faq" class="faq">
+  <div class="wrap narrow">
+    <div class="section-intro">
+      <h2>Questions</h2>
+    </div>
+    <details>
+      <summary>Can Myotis touch my money?</summary>
+      <div class="answer">
+        <p>No. Myotis has no keys and no seed phrase, so it cannot sign anything or move funds. Your wallet signs your transactions; Myotis only passes on what your wallet has already signed, to the Ethereum network.</p>
+      </div>
+    </details>
+    <details>
+      <summary>What does “verified” actually mean?</summary>
+      <div class="answer">
+        <p>Ethereum’s validators — the computers that secure the network — continuously sign off on the latest state of the chain. Myotis checks those signatures, and then checks that every answer it receives matches what was signed, using the proofs that come with it. A computer that made up a balance could not produce a matching proof, so Myotis would reject it.</p>
+        <p>If an answer cannot be proven, Myotis tells your wallet so, rather than passing on something it could not check.</p>
+      </div>
+    </details>
+    <details>
+      <summary>How long does it take to get going?</summary>
+      <div class="answer">
+        <p>The very first start takes a few minutes. After that, Myotis is ready in about ten seconds. If it has been switched off for a long time, it needs a little longer to catch up — the Status tab shows the progress.</p>
+      </div>
+    </details>
+    <details>
+      <summary>How much storage and internet data does it use?</summary>
+      <div class="answer">
+        <p><strong>Storage: almost none.</strong> Myotis does not download the blockchain — it keeps well under 1 MB per network.</p>
+        <p><strong>Data:</strong> up to about 10 MB to get started. While it is awake, it uses roughly 2 to 6 MB per minute to stay up to date. On a phone it sleeps when not in use, so it uses very little; a computer keeps it awake all the time, which can add up to several gigabytes a day — no problem on home internet, but worth knowing on a metered connection. Sending a transaction costs about 1 to 2 MB.</p>
+      </div>
+    </details>
+    <details>
+      <summary>Will it drain my phone’s battery?</summary>
+      <div class="answer">
+        <p>Myotis sleeps after five minutes without wallet requests and wakes up when your wallet needs it, so it stays out of the way most of the time. You can shorten or lengthen that under <em>Settings → Power</em>, or tap <em>Stop</em> on the Status tab when you do not need it at all.</p>
+      </div>
+    </details>
+    <details id="faq-warnings">
+      <summary>Why do my phone and my Mac warn me about the app?</summary>
+      <div class="answer">
+        <p>Because Myotis is not distributed through the Play Store or registered with Apple yet. Both systems warn about any app that comes from elsewhere. On Android, the file is also a test (“debug”) build. The app is free and its full source code is public, so anyone can check what it does.</p>
+        <p>To be safe, only download Myotis from its official page: <a href="https://github.com/biafra23/myotis/releases">github.com/biafra23/myotis/releases</a>.</p>
+      </div>
+    </details>
+    <details id="faq-decision">
+      <summary>The status says “Needs your decision”. What now?</summary>
+      <div class="answer">
+        <p>Each version of Myotis ships with a trusted starting point on the chain. If that starting point is older than a safety limit — about two weeks on Ethereum, about a day and a half on Gnosis Chain — Myotis pauses instead of quietly relying on it, and asks you.</p>
+        <p>The best answer is to install the newest version, which comes with a fresh starting point. If you already have the newest version, tap <em>Review</em> and choose <em>Sync anyway</em> to continue from the older starting point. On Gnosis Chain this question is normal a day or two after each release.</p>
+      </div>
+    </details>
+    <details>
+      <summary>Which networks does Myotis support?</summary>
+      <div class="answer">
+        <p>Ethereum (switched on from the start), Gnosis Chain, and the Sepolia test network, which uses play money and is mainly for developers. Switch them on under <em>Settings → Networks</em>.</p>
+      </div>
+    </details>
+    <details>
+      <summary>Does my wallet stop talking to companies altogether?</summary>
+      <div class="answer">
+        <p>Not entirely. Myotis replaces the connection your wallet uses to read the blockchain and to send transactions — balances, token amounts, fees, the confirmation screen. Many wallets also use their own services for extras such as prices, token lists or an activity history; those are settings in your wallet, not in Myotis.</p>
+      </div>
+    </details>
+    <details>
+      <summary>Can I use Myotis on my computer from a wallet on my phone?</summary>
+      <div class="answer">
+        <p>No — on purpose. Myotis only answers wallets on the same device, so nobody else on your network can use it. Run Myotis on each device where you use a wallet.</p>
+      </div>
+    </details>
+    <details id="faq-other">
+      <summary>Is there a Windows or iPhone version?</summary>
+      <div class="answer">
+        <p><strong>Windows:</strong> not yet.</p>
+        <p><strong>iPhone:</strong> not as an app you can install. iOS pauses apps that are in the background, so a separate wallet could not rely on Myotis there. The way forward on iPhone is wallets that build Myotis in directly — the building blocks for that already exist.</p>
+      </div>
+    </details>
+    <details>
+      <summary>Is Myotis finished?</summary>
+      <div class="answer">
+        <p>No. It works end to end — reading balances, preparing and sending real transactions — but it is young software under active development. Try it with small amounts first, keep your wallet’s recovery phrase safe as always, and please <a href="https://github.com/biafra23/myotis/issues">report anything that goes wrong</a>.</p>
+      </div>
+    </details>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <a class="brand" href="#top"><svg aria-hidden="true" style="width:32px;height:21px"><use href="#bat"/></svg> myotis</a>
+    <span>Free and open source · Apache 2.0 · <a href="https://github.com/biafra23/myotis">Source code on GitHub</a> · <a href="https://github.com/biafra23/myotis/releases">Releases</a> · <a href="https://github.com/biafra23/myotis/issues">Report a problem</a></span>
+  </div>
+</footer>
+
+<script>
+// Copy buttons: progressive enhancement. Without the Clipboard API (an
+// insecure context, an old browser) the buttons stay hidden and the text can
+// be selected by hand.
+(function () {
+  if (!navigator.clipboard) return;
+  document.querySelectorAll(".copy button").forEach(function (b) {
+    b.hidden = false;
+    b.addEventListener("click", function () {
+      var text = b.getAttribute("data-copy");
+      navigator.clipboard.writeText(text).then(function () {
+        var old = b.textContent;
+        b.textContent = "Copied";
+        setTimeout(function () { b.textContent = old; }, 1500);
+      });
+    });
+  });
+})();
+</script>
+</body>
+</html>
