@@ -332,6 +332,13 @@ transaction (`rust/myotis-net/src/el/send_check.rs`; Java: `SendCheck`).
   state from an *unverified* finality update (`seedFromFinalityUpdate`, or a local beacon API
   in `seedFromBeaconApi`). Those roots are recorded with `blsVerified=false`, and the account
   query's `stateRootMatch` path does not check that flag. The Rust engine has no such path.
+- **Java engine: `stateRootMatch` skips the proof flag.** `VerifiedAccountQuery` and
+  `VerifiedStorageQuery` take the fast path before they look at `peerProofValid` /
+  `storageProofValid`, and the root they match is the state root of a header the peer picked
+  (its own best block). A peer whose header names a state root in the window is therefore
+  reported `beaconChainVerified` even when its Merkle proof failed — on any Java run, not only
+  after a seed — and the apps' Query card shows such a result as verified. The Rust engine
+  verifies every proof before its ladder runs.
 
 ## 12. Where to look in the code
 
