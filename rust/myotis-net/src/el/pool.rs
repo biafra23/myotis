@@ -708,6 +708,15 @@ impl PoolInner {
         lingering.push((node, Arc::downgrade(peer)));
     }
 
+    /// Stamp every tracked evicted peer as a direct contact at `now` and stop
+    /// tracking them — the pool is going away, and with it the list.
+    fn stamp_lingering(&self, now: Instant) {
+        let mut lingering = self.lingering.lock().unwrap_or_else(|p| p.into_inner());
+        for (node, _) in lingering.drain(..) {
+            note_direct_contact(node, now);
+        }
+    }
+
     /// The evicted peers whose sessions are still open; each one found closed
     /// is stamped as a direct contact now (its session ended at or before now)
     /// and dropped from the list.
@@ -1604,13 +1613,32 @@ impl PeerPool {
         self.inner.cache.lock().await.flush();
         let mut peers = self.inner.peers.lock().await;
         for peer in peers.iter() { peer.peer.close().await; }
+        // Their direct sessions end here: stamp them, and every evicted one
+        // still tracked, so a resumed pool's Tor path keeps clear of them for
+        // the full window (the records outlive this pool; its lists do not).
+        let now = Instant::now();
+        for peer in peers.iter() {
+            note_direct_contact(peer.peer.peer_pubkey(), now);
+        }
         peers.clear();
+        drop(peers);
+        self.inner.stamp_lingering(now);
     }
 }
 
 impl Drop for PeerPool {
     fn drop(&mut self) {
         self.inner.tasks.abort();
+        // A pool dropped without `stop`: its sessions close as their `Arc`s
+        // drop, so stamp them now, as `stop` does (best effort: a locked set
+        // is skipped rather than awaited in a destructor).
+        let now = Instant::now();
+        if let Ok(peers) = self.inner.peers.try_lock() {
+            for peer in peers.iter() {
+                note_direct_contact(peer.peer.peer_pubkey(), now);
+            }
+        }
+        self.inner.stamp_lingering(now);
     }
 }
 
@@ -1707,6 +1735,16 @@ static DIRECT_CONTACT: std::sync::LazyLock<std::sync::Mutex<ContactLog>> =
 /// [`note_tor_contact_until`].
 static TOR_CONTACT: std::sync::LazyLock<std::sync::Mutex<ContactLog>> =
     std::sync::LazyLock::new(Default::default);
+
+/// Stamps a direct contact with its node when dropped: owned by a dial's task,
+/// so a dial cut short by an abort is stamped too.
+struct DirectContactOnDrop([u8; 64]);
+
+impl Drop for DirectContactOnDrop {
+    fn drop(&mut self) {
+        note_direct_contact(self.0, Instant::now());
+    }
+}
 
 fn note_direct_contact(node: [u8; 64], now: Instant) {
     DIRECT_CONTACT.lock().unwrap_or_else(|p| p.into_inner()).note(node, now, now);
@@ -1960,11 +1998,12 @@ async fn try_dial_verdict(
     };
     let inner2 = Arc::clone(inner);
     inner.tasks.spawn(async move {
+        // When the dial ends — returned, or aborted by a pool stop — the peer
+        // saw us until then: a dial that did not end in the pool (refused,
+        // wrong chain, lagging) is stamped here; a pooled one is live and
+        // stamped again when its session ends.
+        let _stamp = DirectContactOnDrop(pubkey);
         inner2.dial_one(addr, pubkey).await;
-        // A dial that did not end in the pool (refused, wrong chain, lagging)
-        // talked to the peer until now; a pooled one is live and stamped again
-        // when its session ends.
-        note_direct_contact(pubkey, Instant::now());
         drop(permit);
     });
     DialVerdict::Dialed
@@ -2795,6 +2834,29 @@ mod tests {
         /// A loopback address nothing listens on: a dial fails at TCP at once.
         fn dead(port: u16) -> SocketAddr {
             SocketAddr::from(([127, 0, 0, 1], port))
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_pool_stop_and_an_aborted_dial_stamp_their_direct_contacts() {
+            // A dial cut short by an abort stamps its node when the task drops.
+            let dialed = [0x73u8; 64];
+            let task = tokio::spawn(async move {
+                let _stamp = DirectContactOnDrop(dialed);
+                std::future::pending::<()>().await
+            });
+            tokio::task::yield_now().await;
+            tokio::time::advance(TOR_DIRECT_SEPARATION + Duration::from_secs(1)).await;
+            assert!(!direct_contact_recent(dialed, Instant::now()));
+            task.abort();
+            let _ = task.await;
+            assert!(direct_contact_recent(dialed, Instant::now()));
+            // A stop stamps the evicted sessions it still tracked.
+            let pool = fixture(b"tor-stop");
+            let evicted = [0x74u8; 64];
+            pool.inner.lingering.lock().unwrap().push((evicted, std::sync::Weak::new()));
+            pool.stop().await;
+            assert!(direct_contact_recent(evicted, Instant::now()));
+            assert!(pool.inner.lingering.lock().unwrap().is_empty());
         }
 
         #[tokio::test(start_paused = true)]
