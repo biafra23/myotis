@@ -698,10 +698,12 @@ compose.desktop {
                     else -> "15d1f394-905a-449a-bbdb-7afc2d780555"
                 }
                 // Per-user: installs under %LOCALAPPDATA%\<packageName> with no UAC prompt,
-                // like the data dir (~/.myotis) the app writes to anyway. No dirChooser: a
-                // per-user install never elevates, so a folder like Program Files that the
-                // user could pick there would only fail the install.
+                // like the data dir (~/.myotis) the app writes to anyway. No install-folder
+                // page (Compose turns it ON by default): a per-user install never elevates,
+                // so a folder like Program Files that the user could pick there would only
+                // fail the install.
                 perUserInstall = true
+                dirChooser = false
                 // A Start menu entry in a "Myotis" folder (jpackage's default group is
                 // "Unknown"), shared by the flavours, plus a desktop shortcut.
                 menu = true

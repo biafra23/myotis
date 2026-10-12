@@ -302,7 +302,10 @@ jobs:
               if ($app.HasExited) { Fail "Myotis exited (code $($app.ExitCode)) before serving JSON-RPC" }
               try {
                 $chainId = (Invoke-RestMethod -Uri 'http://127.0.0.1:8545' -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 10).result
-              } catch { Start-Sleep -Seconds 3 }
+              } catch { }
+              # Paced on "no answer yet", not only on a refused connection: a
+              # JSON-RPC error body (HTTP 200, no result) must not spin the loop.
+              if (-not $chainId) { Start-Sleep -Seconds 3 }
             }
             if ($chainId -ne '0x1') { Fail "eth_chainId on 127.0.0.1:8545 answered '$chainId' within 240s, expected 0x1" }
             Write-Output "OK: JSON-RPC on 127.0.0.1:8545 answers eth_chainId=$chainId"
