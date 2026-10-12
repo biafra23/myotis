@@ -200,9 +200,11 @@ jobs:
 
           $msi = (Resolve-Path "$env:MSI_DIR/Myotis-x64.msi").Path
           $ex = Join-Path $env:RUNNER_TEMP 'msi-extract'
+          # The extract's log goes where the smoke step's logs go, so it is uploaded on failure too.
+          $smoke = (New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP 'msi-smoke')).FullName
           $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
-            '/a', "`"$msi`"", '/qn', "TARGETDIR=`"$ex`"", '/l*v', "`"$env:RUNNER_TEMP\msi-extract.log`"")
-          if ($p.ExitCode -ne 0) { Fail "administrative extract (msiexec /a) exited $($p.ExitCode)" }
+            '/a', "`"$msi`"", '/qn', "TARGETDIR=`"$ex`"", '/l*v', "`"$smoke\msi-extract.log`"")
+          if ($p.ExitCode -ne 0) { Fail "administrative extract (msiexec /a) exited $($p.ExitCode) (msi-extract.log is in the smoke artifact)" }
 
           $installer = New-Object -ComObject WindowsInstaller.Installer
           $version = Get-MsiProperty $installer $msi 'ProductVersion'
