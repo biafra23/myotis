@@ -176,6 +176,8 @@ Build a native installer for the host OS with jpackage. **jpackage is host-OS-bo
 ./gradlew :app-desktop:runDistributable
 ```
 
+On macOS, `:app-desktop:run` is a plain `java` process with no app bundle: the menu bar carries the app's name, but Cmd-Tab still lists it as "java" (macOS names a bundle-less process after its executable), and notifications go through the tray icon. `runDistributable` runs the real bundle, which carries the app's name, icon and notifications everywhere.
+
 The bundle embeds a full Java 21 runtime (the `:networking`/`:myotis-evm` backend ships Java-21 classes and reaches JDK modules reflectively, so the whole module graph is included). Packaged builds (dmg/deb/`runDistributable`) **bundle the Rust engine** as an app resource — packaging fails loudly if cargo isn't available, so an installed app can always switch engines. Logs roll under `~/.myotis/logs`; the app's log level comes from the `myotis.log.level` JVM system property (default `INFO`). Each JSON-RPC call gets a one-line summary at `INFO`; the request/response bodies (size-capped, **unredacted: they include addresses and signed transactions**) are logged only at `DEBUG` — pick DEBUG on the Logs-tab chip, or launch with `myotis.log.rpc.level=DEBUG`. Note that a `-D` flag on a `./gradlew :app-desktop:run` command line reaches the Gradle JVM, not the app — for a packaged app, edit the `java-options` in the bundle's generated `Myotis.cfg`.
 
 ### Embedding: Node.js / Electron

@@ -171,6 +171,14 @@ if (beePoc && railgunPoc) {
     throw GradleException("-PbeePoc and -PrailgunPoc are mutually exclusive — build one flavour at a time")
 }
 
+// The app's name: the bundle's (packageName below) and the macOS menu bar's in a dev run
+// (apple.awt.application.name, on the run task below).
+val appName: String = when {
+    beePoc -> "Myotis Bee PoC"
+    railgunPoc -> "Myotis RAILGUN PoC"
+    else -> "Myotis"
+}
+
 /** The active flavour's staging root name and the seed files only it may ship. */
 val pocFlavourName: String? = when {
     beePoc -> "beePoc"
@@ -643,11 +651,7 @@ compose.desktop {
             targetFormats(TargetFormat.Dmg, TargetFormat.Deb)
             // The Bee PoC flavour is a separate app (own name, own bundle id, own
             // data dir — see BeePoc.kt) so it coexists with a regular install.
-            packageName = when {
-                beePoc -> "Myotis Bee PoC"
-                railgunPoc -> "Myotis RAILGUN PoC"
-                else -> "Myotis"
-            }
+            packageName = appName
             // Applies to the dmg (and a future msi); the deb overrides it below.
             // See macOsPackageVersion at the top of this file for the +1-major rule.
             packageVersion = macOsPackageVersion
@@ -692,6 +696,12 @@ tasks.withType<JavaExec>().matching { it.name == "run" || it.name == "syncSmoke"
     dependsOn(rootProject.tasks.named("cargoBuildHost"))
     // Compose's run passes the macOS icon as -Xdock:icon=<file>: a string, so no task edge.
     if (isMacHost && name == "run") dependsOn(generateMacIcon)
+    // Compose names only the packaged app (-Xdock:name), so the macOS menu bar named a dev run
+    // after its main class ("MainKt"), the launcher's default for this property when it is
+    // unset. A system property, as Compose's run configuration assigns jvmArgs wholesale.
+    // Cmd-Tab still says "java": macOS names a bundle-less process after its executable, and
+    // JavaExec always runs the toolchain's own `java`. runDistributable runs the real bundle.
+    if (isMacHost && name == "run") systemProperty("apple.awt.application.name", appName)
     // -Pengine=java|rust|auto → -Dmyotis.engine (same knob as :app run).
     (project.findProperty("engine") as String?)?.let { systemProperty("myotis.engine", it) }
     // -Ptor=true → -Dmyotis.tor (dev knob to force Tor routing on at boot; needs the
