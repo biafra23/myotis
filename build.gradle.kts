@@ -532,10 +532,13 @@ tasks.register<Exec>("cargoBuildHost") {
             addAll(listOf(rustTool("cargo"), "build", "--release", "--workspace"))
             // myotis-rpcd (the standalone daemon) waits for SIGINT/SIGTERM through
             // signal_hook::iterator, which does not exist on Windows, so it cannot
-            // build there. No JVM host or package needs it (they load the engine
-            // and BLS libraries), so on Windows the rest of the workspace builds
-            // without it; the Windows msi (desktop-windows-msi.yml) depends on that.
-            if (isWindowsHost) addAll(listOf("--exclude", "myotis-rpcd"))
+            // build for a Windows target. No JVM host or package needs it (they load
+            // the engine and BLS libraries), so for Windows the rest of the workspace
+            // builds without it; the Windows msi (desktop-windows-msi.yml) depends on
+            // that. Keyed on the TARGET, which is the host unless -PrustTarget says.
+            if (rustTargetTriple?.contains("windows") ?: isWindowsHost) {
+                addAll(listOf("--exclude", "myotis-rpcd"))
+            }
             // Enable Tor only on the engine crate (package/feature form — a bare
             // `--features tor` with `--workspace` would try every member).
             if (torEngine) addAll(listOf("--features", "myotis-engine/tor"))
@@ -589,15 +592,19 @@ tasks.register<Exec>("uniffiGenerateKotlin") {
         val unmasked = Regex("""if \(lib\.(\w+_checksum_\w+)\(\) != (\d+)\)""")
         val text = bindingsFile.readText()
         val count = unmasked.findAll(text).count()
-        check(count > 0) {
-            "uniffiGenerateKotlin: no unmasked checksum comparisons in $bindingsFile — " +
+        val masked = unmasked.replace(text) { m ->
+            "if ((lib.${m.groupValues[1]}() and 0xFFFF) != ${m.groupValues[2]})"
+        }
+        // Every declared checksum function must have exactly one comparison, and it
+        // must now be masked: a partly changed output shape must not pass as success.
+        val declared = Regex("""fun \w+_checksum_\w+\(""").findAll(masked).count()
+        val leftover = Regex("""_checksum_\w+\(\)\s*!=""").findAll(masked).count()
+        check(count > 0 && count == declared && leftover == 0) {
+            "uniffiGenerateKotlin: $count checksum comparisons rewritten, $declared checksum " +
+                "functions declared, $leftover comparisons left unmasked in $bindingsFile — " +
                 "UniFFI's output changed; check whether it still reads u16 checksums as Int"
         }
-        bindingsFile.writeText(
-            unmasked.replace(text) { m ->
-                "if ((lib.${m.groupValues[1]}() and 0xFFFF) != ${m.groupValues[2]})"
-            }
-        )
+        bindingsFile.writeText(masked)
         logger.lifecycle("uniffiGenerateKotlin: masked $count checksum comparisons to 16 bits")
     }
 }

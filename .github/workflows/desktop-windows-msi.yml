@@ -36,6 +36,8 @@ on:
       - "app-desktop/src/main/kotlin/io/myotis/desktop/Main.kt"
       - "app-desktop/src/main/resources/logback-desktop.xml"
       - "myotis-engines/src/main/java/io/myotis/engines/RustEngineNative.java"
+      # The committed UniFFI bindings: the verify step checks the engine against them.
+      - "myotis-engines/src/main/kotlin/uniffi/**"
       - "build.gradle.kts"
       - "gradle/libs.versions.toml"
   # Any branch, on demand from the Actions tab.
@@ -259,7 +261,10 @@ jobs:
           $got = [UniffiProbe]::Call($lib, 'ffi_myotis_engine_uniffi_contract_version')
           Write-Output "UniFFI contract version: bindings $contract, engine $got"
           $checks = [regex]::Matches($kt, 'lib\.(uniffi_myotis_engine_checksum_\w+)\(\) and 0xFFFF\) != (\d+)\)')
-          if ($checks.Count -eq 0) { Fail 'found no masked UniFFI checksum checks in the committed bindings' }
+          $declared = [regex]::Matches($kt, 'fun uniffi_myotis_engine_checksum_\w+\(').Count
+          if ($checks.Count -eq 0 -or $checks.Count -ne $declared) {
+            Fail "the committed bindings declare $declared checksum functions but carry $($checks.Count) masked checks"
+          }
           $bad = 0
           foreach ($c in $checks) {
             $raw = [UniffiProbe]::Call($lib, $c.Groups[1].Value)
@@ -317,6 +322,8 @@ jobs:
           Write-Output "OK: installed per user at $exe, with Start menu and desktop shortcuts"
 
           $app = Start-Process -FilePath $exe -PassThru
+          # Without a handle taken while it runs, ExitCode reads empty once it has exited.
+          $null = $app.Handle
           try {
             # 1. The bundled Rust engine loads (RustEngineNative logs this once,
             #    at the engine choice Main.kt applies before the first start).
@@ -366,7 +373,8 @@ jobs:
               $bmp.Save((Join-Path $env:SMOKE_DIR 'screenshot.png'))
             } catch { Write-Output "::warning::no desktop screenshot: $($_.Exception.Message)" }
           } finally {
-            if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force; $app.WaitForExit(30000) | Out-Null }
+            # It may exit on its own between the check and the stop.
+            if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue; $app.WaitForExit(30000) | Out-Null }
             if (Test-Path $log) {
               Copy-Item $log $env:SMOKE_DIR
               # Into the job log too, so a failure reads without downloading the artifact.
@@ -394,12 +402,16 @@ jobs:
           retention-days: 14
           overwrite: true
 
+      # Also when the verify or smoke step failed, so a failing installer can be
+      # tried on a real Windows machine or VM; a red run marks it as one.
       - name: Upload MSI
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: myotis-desktop-msi-x64-${{ github.sha }}
           path: ${{ env.MSI_DIR }}/Myotis-x64.msi
-          if-no-files-found: error
+          # Missing is an error on a green run; after a failed build there is none.
+          if-no-files-found: ${{ job.status == 'success' && 'error' || 'ignore' }}
           retention-days: 30
           # Artifacts are immutable per run; a re-run would 409 without this
           # (the same fix the dmg and deb workflows carry).
