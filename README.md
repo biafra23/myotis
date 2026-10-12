@@ -160,7 +160,9 @@ On iOS the app form is a development host more than an integration point: iOS su
 ./gradlew :app-desktop:run -Pengine=java
 ```
 
-Build a native installer for the host OS with jpackage. **jpackage is host-OS-bound**: the `.dmg` can only be produced on macOS and the `.deb` only on Linux (CI builds each on its matching runner — `desktop-dmg.yml` / `desktop-linux-deb.yml`); locally you get the format for your OS. Only macOS and Linux formats are configured today — Windows packaging (`.msi`) isn't enabled yet, so these tasks fail on a Windows host.
+Build a native installer for the host OS with jpackage. **jpackage is host-OS-bound**: the `.dmg` can only be produced on macOS, the `.deb` only on Linux and the `.msi` only on Windows (CI builds each on its matching runner — `desktop-dmg.yml` / `desktop-linux-deb.yml` / `desktop-windows-msi.yml`); locally you get the format for your OS. The `.msi` additionally needs [WiX Toolset 3](https://github.com/wixtoolset/wix3/releases) (`candle.exe`/`light.exe`) on the `PATH` — JDK 21's jpackage drives WiX 3, not WiX 4+.
+
+The Windows installer is x64-only and is **not attached to releases yet**: CI installs, launches and uninstalls it on a Windows runner, but it has not been tried on a real Windows machine. Pushes to `main` upload it as a workflow artifact (`myotis-desktop-msi-x64-<sha>`), and the workflow can be dispatched from the Actions tab for any branch. It installs per user (no admin prompt) under `%LOCALAPPDATA%\Myotis`; Windows 11 on ARM, including a Windows VM on an Apple Silicon Mac, runs it through its x64 emulation. A newer version installs over an older one, but Windows Installer treats two builds of the *same* version (say, two `main` commits between releases) as one product, so uninstall the earlier build (Settings → Apps) before installing the next.
 
 ```bash
 # macOS → build a .dmg  (output under app-desktop/build/compose/binaries/main/dmg/)
@@ -168,6 +170,9 @@ Build a native installer for the host OS with jpackage. **jpackage is host-OS-bo
 
 # Linux → build a .deb  (output under app-desktop/build/compose/binaries/main/deb/)
 ./gradlew :app-desktop:packageDeb
+
+# Windows → build an .msi  (output under app-desktop/build/compose/binaries/main/msi/; needs WiX 3)
+./gradlew :app-desktop:packageMsi
 
 # Or just the right format for whatever OS you're on
 ./gradlew :app-desktop:packageDistributionForCurrentOS
@@ -178,7 +183,7 @@ Build a native installer for the host OS with jpackage. **jpackage is host-OS-bo
 
 On macOS, `:app-desktop:run` is a plain `java` process with no app bundle: the menu bar carries the app's name, but Cmd-Tab still lists it as "java" (macOS names a bundle-less process after its executable), and notifications go through the tray icon. `runDistributable` runs the real bundle, which carries the app's name, icon and notifications everywhere.
 
-The bundle embeds a full Java 21 runtime (the `:networking`/`:myotis-evm` backend ships Java-21 classes and reaches JDK modules reflectively, so the whole module graph is included). Packaged builds (dmg/deb/`runDistributable`) **bundle the Rust engine** as an app resource — packaging fails loudly if cargo isn't available, so an installed app can always switch engines. Logs roll under `~/.myotis/logs`; the app's log level comes from the `myotis.log.level` JVM system property (default `INFO`). Each JSON-RPC call gets a one-line summary at `INFO`; the request/response bodies (size-capped, **unredacted: they include addresses and signed transactions**) are logged only at `DEBUG` — pick DEBUG on the Logs-tab chip, or launch with `myotis.log.rpc.level=DEBUG`. Note that a `-D` flag on a `./gradlew :app-desktop:run` command line reaches the Gradle JVM, not the app — for a packaged app, edit the `java-options` in the bundle's generated `Myotis.cfg`.
+The bundle embeds a full Java 21 runtime (the `:networking`/`:myotis-evm` backend ships Java-21 classes and reaches JDK modules reflectively, so the whole module graph is included). Packaged builds (dmg/deb/msi/`runDistributable`) **bundle the Rust engine** as an app resource — packaging fails loudly if cargo isn't available, so an installed app can always switch engines. Logs roll under `~/.myotis/logs`; the app's log level comes from the `myotis.log.level` JVM system property (default `INFO`). Each JSON-RPC call gets a one-line summary at `INFO`; the request/response bodies (size-capped, **unredacted: they include addresses and signed transactions**) are logged only at `DEBUG` — pick DEBUG on the Logs-tab chip, or launch with `myotis.log.rpc.level=DEBUG`. Note that a `-D` flag on a `./gradlew :app-desktop:run` command line reaches the Gradle JVM, not the app — for a packaged app, edit the `java-options` in the bundle's generated `Myotis.cfg`.
 
 ### Embedding: Node.js / Electron
 

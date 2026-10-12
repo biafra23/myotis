@@ -13,9 +13,9 @@
 #     build:
 #       needs: review-gate
 #
-# Callers: android-apk, desktop-dmg, ios-framework. Build and Test (ci.yml) and
-# the other Linux checks stay ungated on purpose: they are the test signal, and
-# holding them for the review would only delay it.
+# Callers: android-apk, desktop-dmg, desktop-windows-msi, ios-framework. Build
+# and Test (ci.yml) and the other Linux checks stay ungated on purpose: they are
+# the test signal, and holding them for the review would only delay it.
 #
 # WHEN IT WAITS. For a same-repo, non-draft PR (the ones claude-review.yml's job
 # `if:` reviews), while a claude-review run of the PR's branch that started in
@@ -35,7 +35,7 @@
 # (runner lost, timed out) does not stop the jobs that need it. A cancelled
 # gate still cancels them, as a cancelled run should. What it cannot cover is
 # this file failing to load (a YAML error, a rename without its callers): the
-# three callers then fail at startup, builds and tag release uploads included,
+# callers then fail at startup, builds and tag release uploads included,
 # as with any broken workflow file. A PR that does that goes red on
 # android-apk and desktop-dmg, which run on every PR into main, before it can
 # merge.
