@@ -260,10 +260,14 @@ const READS = {
 // the engine produces, so a read that gets it reached the engine. The log
 // index's calls word it as its callers check it.
 const NOT_STARTED = { error: 'handle not started' };
-const SIGNED_TX = '0x02f8710107847735940084820ad2e88252089476273bad5c07e97cb91d810094b9cbcad15b45de87021dfa95a9c67c80c001a0febe04c90163fb78037e68925ca70a0d1ac1315c10b0373b96590b8cf2e81db8a059a652dbad354a753a1ede26072b01bfda95b023c03f25a766c243aee74f670a';
 const NOT_RUNNING = { error: 'node is not running' };
 const notStartedFor = (name) => (['getLogsJson', 'importLogIndexFiles'].includes(name) ? NOT_RUNNING : NOT_STARTED);
 const invalid = (error) => ({ error, code: -32602 });
+// A complete signed transaction, for a send that must reach the engine: a
+// mainnet type-2 transfer already mined (tools/mm-replay/sessions/
+// metamask-send-mainnet.jsonl, tx 0x4c694f62…). Used only on handles that are
+// never started, so it is never broadcast.
+const SIGNED_TX = '0x02f8710107847735940084820ad2e88252089476273bad5c07e97cb91d810094b9cbcad15b45de87021dfa95a9c67c80c001a0febe04c90163fb78037e68925ca70a0d1ac1315c10b0373b96590b8cf2e81db8a059a652dbad354a753a1ede26072b01bfda95b023c03f25a766c243aee74f670a';
 
 async function withCreatedHandle(fn) {
   const base = mkdtempSync(join(tmpdir(), 'myotis-addon-api-'));
