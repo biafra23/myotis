@@ -23,8 +23,7 @@ privacy. The open decisions are listed at the end; they are the owner's.
 - **Trust is unchanged.** A proof verifies against the sync-committee-signed
   state root the wallet already holds. The server can withhold or answer at an
   older (still verified) block, not forge, and verifies nothing itself — the
-  same posture as roost. One Java query path does not yet hold to this
-  ([§The proofs: trust](#the-proofs-trust)).
+  same posture as roost ([§The proofs: trust](#the-proofs-trust)).
 - **Privacy is the real new cost.** Roost sends everyone the same bytes and
   learns nothing about a wallet's addresses. A snap server learns which
   addresses each wallet holds and, by timing, which belong together. Tor (an
@@ -81,20 +80,16 @@ Two consequences that shape everything below:
 - **The verifiers consume the proof, not the range — with one exception.**
   The Rust engine's
   `verify_account` / `verify_storage` (`rust/myotis-wire/src/snap/fetch.rs:77-112`)
-  and the Java EVM oracle (`SnapBackedStateOracle.java:599,625`) read only the
+  and the Java EVM oracle (`SnapBackedStateOracle.java:600,626`) read only the
   proof nodes. The Java operator queries additionally read the requested
-  account's slim entry from the list (`VerifiedAccountQuery.java:160`,
-  `VerifiedStorageQuery.java:93`, which throws when it is missing), so any
-  response must still carry that one entry. The account's nonce and balance
-  are checked against the proven leaf (`verifyAndExtractAccount`). **The slot
-  value is not:** `VerifiedStorageQuery` reports the value from the peer's
-  slot list (`found.slotValue()`) and only checks that *some* leaf proves
-  (`storageProofValid = leafValue != null`), so a peer can pair an honest
-  proof with a forged value on the Java `get-storage` path. A proven-absent
-  slot also reads there as an invalid proof. That is a trust gap in code
-  `main` carries, for its own fix PR; until it lands, the Java operator storage
-  query relies on the range's value, and a front wallets pin would concentrate
-  that exposure.
+  account's slim entry from the list (`VerifiedAccountQuery.java:163`,
+  `VerifiedStorageQuery.java:97`, which throws when it is missing), so a
+  response for an existing account must still carry that one entry. The list
+  is checked against the proof, never trusted over it (since #626): the
+  account's nonce and balance must match the proven leaf, a list that omits an
+  account the proof shows is refused (only an exclusion proof answers without
+  an entry), and `get-storage` reports the slot value from the proven leaf,
+  refusing a list value that disagrees.
 
 ## Measured: what a proof weighs and how long it lives
 
@@ -328,9 +323,7 @@ The posture is roost's, and so is the argument for it:
   sync-committee-signed light-client header; the wallet holds it before it
   asks. A wrong value fails the Merkle check; a proof for a different root
   fails it too; an exclusion proof is checked the same way as an inclusion
-  proof. (Except on the Java `get-storage` path, which reports the range's
-  slot value without comparing it to the proven leaf — see [§What a wallet
-  asks for](#what-a-wallet-asks-for); the fix is its own PR.)
+  proof.
 - **"Older" is bounded by finality.** Neither engine insists on the
   optimistic root. A Rust read that the anchor root cannot serve falls back to
   the peer's handshake head (`reader.rs`, `fresh_head`), and the ladder accepts
