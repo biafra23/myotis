@@ -328,7 +328,13 @@ jobs:
             } catch { Write-Output "::warning::no desktop screenshot: $($_.Exception.Message)" }
           } finally {
             if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force; $app.WaitForExit(30000) | Out-Null }
-            if (Test-Path $log) { Copy-Item $log $env:SMOKE_DIR }
+            if (Test-Path $log) {
+              Copy-Item $log $env:SMOKE_DIR
+              # Into the job log too, so a failure reads without downloading the artifact.
+              Write-Output '::group::myotis.log (last 200 lines)'
+              Get-Content -Path $log -Tail 200 | ForEach-Object { Write-Output $_ }
+              Write-Output '::endgroup::'
+            }
           }
 
           $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
