@@ -6,7 +6,12 @@ The seam, the native Rust crate, the timing/compare mechanism, and the Android b
 all done, verified and on `main` (the apps expose the backend choice as a Settings
 toggle, `BlsBackends`). Note that this is the **Java engine's** BLS path: the Rust
 engine — the default engine today — verifies with `blst` natively and needs none of
-the seam. Summary first; the original evaluation follows.
+the seam. Summary first; the original evaluation follows. Against its plan: route B
+was taken, but with a hand-written `jni` shim instead of UniFFI and a Gradle `Exec`
+task (`cargoNdkAndroid` → `rust/build-android.sh`) instead of `rust-android-gradle`;
+the backend is `NativeBlsBackend`, not the proposed `AndroidBlstBackend`; jblst never
+shipped (`JblstBlsBackend` stays a test-only benchmark backend); and Milagro is kept as
+the fallback `auto` drops to when the native library is absent, not dropped.
 
 **What's wired**
 - `BlsBackend` seam + `BlsBackends.active()` (selects via `-Dmyotis.bls.backend=auto|milagro|native|compare`),
@@ -23,8 +28,10 @@ the seam. Summary first; the original evaluation follows.
   APK); compare mode is an explicit opt-in (-Dmyotis.bls.backend=compare) — it was briefly the debuggable default, but 10-16 s of Milagro per update froze on-device catch-up (Pixel 7, 2026-07-06).
 - `rust/` is a Cargo **workspace** (myotis-bls + the growing Rust engine crates); Gradle
   drives it via `cargoBuildHost` / `cargoTest` / `cargoNdkAndroid` (root build file), all
-  optional — without cargo on the machine they self-skip and the pure-Java build is
-  untouched. Host artifacts land in `rust/target/release/`.
+  optional for the JVM hosts — without cargo on the machine they self-skip and the pure-Java
+  build is untouched. `:android-app` is the exception: its `preBuild` fails without the
+  Android Rust toolchain unless `-PskipRustEngine` is passed. Host artifacts land in
+  `rust/target/release/`.
 
 **Measured — `BlsBackendBenchmark`, real 511-pubkey mainnet aggregate, x86-64 desktop:**
 | backend | cold (ms) | warm (ms/op) |

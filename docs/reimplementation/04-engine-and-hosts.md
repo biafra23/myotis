@@ -47,7 +47,7 @@ Constructed with everything platform-specific **injected**:
 
 ```
 ChainStack(NetworkConfig network, ChainPorts ports, NodeKey nodeKey,
-           PeerCache peerCache, ClPeerCache clPeerCache, CcipGateway ccipGateway,
+           PeerCachePort peerCache, ClPeerCachePort clPeerCache, CcipGateway ccipGateway,
            Path syncSnapshotFile)
 ```
 
@@ -70,7 +70,8 @@ snap-peer maintainer.
 ```
 1. EIP-1459 DNS discovery (EL + CL trees), concurrent, 10s deadline; seed the maintainer's pool.
 2. RLPx connector; then immediate dials: cached peers (snap-quality-ordered),
-   DNS-direct enodes (≤50), static enodes (chains with no DNS tree, e.g. Gnosis).
+   DNS-direct enodes (≤50), static enodes (chains with no DNS tree, e.g. Gnosis, and
+   Sepolia's dedicated serving node).
 3. discv4.start(elPort)  — EL is ESSENTIAL: a bind failure throws and fails the stack.
 4. BeaconSyncState; then discv5 (CL discovery — NON-essential: a failure logs and continues)
    + BeaconLightClient (checkpoint root/slot, fork version, gvr, CL-peer-cache wiring via
@@ -106,7 +107,8 @@ traits/callback interfaces exactly as written there):
 
 - `NodeKeyStore`: `load(networkName) -> bytes32?`, `store(networkName, bytes32)`.
 - `EnginePeerCache`: `add(host, port, pubkeyHex, snap)`, `recordSnapServed(host, port)`,
-  `recordSnapFailure(host, port)`, `load() -> [CachedPeerInfo]`, `close()`.
+  `recordSnapFailure(host, port)`, `recordConnectFailure(host, port)` (default no-op),
+  `load() -> [CachedPeerInfo]`, `close()`.
 - `EngineClPeerCache`: `load() -> [multiaddr]`, `add`, `markFailure`,
   `servedRanges() -> [ServedRange(multiaddr, low, high)]`, `recordServed`,
   `bootstrapPeers() -> [BootstrapPeer(multiaddr, period)]`, `recordBootstrap`,
@@ -132,8 +134,8 @@ traits/callback interfaces exactly as written there):
 
 The single verified implementation of the eth_* contract, shared by every host. Constructed from
 the live `(connector, beaconLightClient, beaconSyncState, ccipGateway, logger, clock,
-snapQualitySink)`; it never closes the injected components. `start()` spins a head-warmer and
-registers as a tx-gossip observer; `close()` stops its own pools.
+snapQualitySink, readStats)`; it never closes the injected components. `start()` spins a
+head-warmer and registers as a tx-gossip observer; `close()` stops its own pools.
 
 ### 2.1 The verified-read pipeline (the engine's core algorithm)
 
@@ -141,21 +143,27 @@ It builds an **anchored head context** (reused for ~12 s) and constructs the EVM
 call:
 
 ```
-PrefetchingEvmExecutor
+CcipReadEvmExecutor (the CCIP-Read decorator)
+  → PrefetchingEvmExecutor
   → DefaultEvmExecutor(oracle, bytecodeCache, evmPool)
       → SnapBackedStateOracle(peerSupplier, bytecodeCache, maxAttempts=8, stateProofCache)
           → EthHandlerSnapPeer (rotates across the connector's active snap handlers)
               → EthHandler (devp2p snap/1: GetAccountRange / GetStorageRanges)
 ```
 
-**Head anchoring** ties a peer-served header to the beacon chain via `stateRootMatch` or the
-`headerChain` walk (parent-hash chain from the beacon-attested block hash, ≤ 8192 blocks); bodies
-/receipts are checked against `transactionsRoot`/`receiptsRoot`; accounts/storage against the
-anchored `stateRoot`. The peer supplier prefers proven `rootServed` peers, falls back to the probed
-peer then round-robin, skipping `rootDenied`; each served/denied event feeds the `SnapQualitySink`.
+**Head anchoring** ties a peer-served header to the beacon chain via the `headerChain` walk
+(parent-hash chain down from the light client's attested optimistic-head block hash, ≤ 8192
+blocks), which proves the head's whole header — the block context is rebuilt from it and carries
+its proven hash for later header windows; with no such head it falls back to the beacon-finalized
+root (no `stateRootMatch` shortcut on this path — the operator account/storage queries keep
+theirs; before #611 the walk ran UP from the finalized block). Bodies/receipts are checked
+against `transactionsRoot`/`receiptsRoot`; accounts/storage against the anchored `stateRoot`.
+The peer supplier prefers proven `rootServed` peers, falls back to the probed peer then
+round-robin, skipping `rootDenied`; each served/denied event feeds the `SnapQualitySink`.
 
-**Staleness gates** (sample): call timeout 120 s; state-head max-stale 120 s; **nonce serve-stale is
-tighter** (it's what the wallet signs against); block-number tolerances for "near-head" pins.
+**Staleness gates** (sample): call timeout 120 s; state-head max-stale 120 s; **nonce serve-stale
+120 s, far tighter than the ~13 min header-only serve-stale horizon** (it's what the wallet signs
+against); block-number tolerances for "near-head" pins (64 below, 16 above).
 
 ### 2.2 Method catalog
 
@@ -228,13 +236,17 @@ blocking — same latency as baseline, never wrong.
 Each prefetch wave is **coalesced**, not issued slot-by-slot:
 
 - An `account → {slots}` map is split into chunks of **`BATCH_PATHSET_CHUNK = 64` path-sets per
-  request**, issued **in parallel** (`allOf`).
+  chunk**, issued **in parallel** (`allOf`).
 - Every item is **verified independently** from the one combined node set the peer returns (the MPT
   verifier builds a `keccak256(node) → node` map, so each account/slot descends from the root on its
   own). A forged/incomplete proof for *any* item fails that item's verify and **rotates the whole
   chunk to another peer**; best-effort overall (an unverifiable chunk is left uncached and the
   per-item path re-fetches it).
-- Net effect: a ~1000-account sweep collapses from ~1000 round-trips to **~16**.
+- Net effect: a ~1000-account sweep goes out as **~16 concurrent chunks** instead of ~1000
+  sequential round-trips. On the wire a chunk is not one message: `EthHandlerSnapPeer` serves
+  each path-set as its own `GetAccountRange`/`GetStorageRanges` request (only those carry a full
+  proof — README §11.12), so the chunk is the unit of peer pinning, verification and rotation,
+  and the saving is concurrency.
 
 ### 3.3 Peer fan-out bounding
 
@@ -259,9 +271,12 @@ jumbo multicall from starving the small interactive calls a wallet blocks on (no
   OOG / timeout — **just never using more than its share of peers at once** — so a concurrent
   balance/nonce/fee read still gets through.
 - **Caches make repeats free**, at three levels. (1) The cross-call **`StateProofCache`** (LRU,
-  `STATE_PROOF_CACHE_MAX = 65536`) caches proof-verified `(stateRoot, addr, slot) → value` —
-  a *cryptographic fact*, so reuse is safe. (2) The forever-valid **`BytecodeCache`** (keyed by
-  `codeHash`). (3) A **`VerifiedResultCache`** caches whole *verified results* — `eth_call` return
+  `STATE_PROOF_CACHE_MAX = 65536` per kind) caches proof-verified accounts as
+  `(stateRoot, addr) → account` and slots as `(storageRoot, slot) → value` — keyed by the root
+  each proof anchors at, so an unchanged contract's slots carry over across head advances; a
+  *cryptographic fact*, so reuse is safe. (The Rust twin, `rust/myotis-evm/src/cache.rs`, still
+  keys slots by `(stateRoot, addr, slot)` — 06, carried findings.) (2) The forever-valid
+  **`BytecodeCache`** (keyed by `codeHash`). (3) A **`VerifiedResultCache`** caches whole *verified results* — `eth_call` return
   bytes and `estimateGas` values — keyed by the anchored block (`block:from:to:value:keccak(calldata)`
   for calls, plus gas and fees for a transaction object; `block:from:to:keccak(data):value:gas:fees`
   for estimates), where `block` is the state root and every block input the EVM reads: number,
@@ -308,8 +323,10 @@ A standard Ethereum JSON-RPC HTTP endpoint so **unmodified wallets work**. Refer
   refused in every mode; native clients (neither header) are untouched. The policy is set
   per handle (`ChainHandle.setWebAccessPolicy`, live) and the origins that tried are read
   back (`recentWebOrigins`) for the apps' allow-from-the-list flow.
-- **Backend SPI**: the server depends only on a `MyotisRpcBackend` interface (the verified backend
-  implements it) — clean inversion so the server stays host-agnostic.
+- **Backend SPI**: the server depends only on an `RpcBackend` interface — a pure-Kotlin mirror of
+  `VerifiedReads` (commonMain), which the JVM hosts satisfy by wrapping either engine's
+  `VerifiedReads` (`VerifiedReadsBackend`) and the iOS host over the Rust C ABI — clean inversion
+  so the server stays host-agnostic. (It was `MyotisRpcBackend`, since deleted.)
 - **Routing**: handle single requests and JSON-RPC 2.0 **batch arrays** (each element gets its own
   result/error). For each method, call the backend; if it returns non-null → return it; else in
   **strict mode** (production) return `-32000` (known method, can't serve verified now) or `-32601`
@@ -321,11 +338,17 @@ A standard Ethereum JSON-RPC HTTP endpoint so **unmodified wallets work**. Refer
 - **Encoding**: minimal hex quantities (`0x0`), allocation-light hex data (some results, e.g.
   `eth_getCode`, are large). Blocking backend calls dispatched to an IO pool.
 
-Methods served (the verified set): `eth_chainId`, `net_version`, `web3_clientVersion`,
-`eth_blockNumber`, `eth_call`, `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`,
-`eth_getStorageAt`, `eth_sendRawTransaction`, `eth_getTransactionReceipt`,
-`eth_getTransactionByHash`, `eth_getBlockByNumber`, `eth_getBlockByHash`, `eth_gasPrice`,
-`eth_maxPriorityFeePerGas`, `eth_feeHistory`, `eth_estimateGas`, `eth_createAccessList` (Rust engine).
+Methods served (the verified set — `VERIFIED_ARITY` in `RpcRouter.kt`): `eth_chainId`,
+`net_version`, `web3_clientVersion`, `eth_syncing`, `eth_blockNumber`, `eth_call`,
+`eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`,
+`eth_sendRawTransaction`, `eth_getTransactionReceipt`, `eth_getTransactionByHash`,
+`eth_getBlockByNumber`, `eth_getBlockByHash`, `eth_getBlockReceipts`, `eth_gasPrice`,
+`eth_maxPriorityFeePerGas`, `eth_feeHistory`, `eth_estimateGas`, `eth_createAccessList` (Rust
+engine), `eth_getLogs` (Rust engine, from its opt-in log index), and the router-only compat set
+`eth_accounts`, `net_listening`, `net_peerCount`, `web3_sha3`,
+`eth_getBlockTransactionCountBy{Number,Hash}`, `eth_getTransactionByBlock{Number,Hash}AndIndex`,
+`eth_getUncleCountBy{BlockNumber,BlockHash}`, `eth_getUncleByBlock{Number,Hash}AndIndex`. Local
+`myotis_*` methods (status, beacon status, pause/wakeup, coverage) bypass the verified backend.
 
 ---
 
@@ -334,17 +357,19 @@ Methods served (the verified set): `eth_chainId`, `net_version`, `web3_clientVer
 The desktop host: a long-running daemon plus a CLI that sends it commands. **In scope** for the
 re-implementation as the reference desktop host (mobile hosts replace this with direct FFI calls).
 
-### 4.1 Daemon vs client mode
+### 5.1 Daemon vs client mode
 
 - Parse `--network <csv>` (host several networks in one process), `--port`, and a
   remaining command.
 - A command token + a *running* daemon → **client mode**: connect to the network's socket, send one
   JSON line, print responses, exit.
-- No command → **daemon mode**: build & start a `ChainStack` per `--network` into a `NodeRegistry`,
-  start an IPC server per network, block on a shared stop-latch.
+- No command → **daemon mode**: build & start a `ChainStack` per `--network` into a `NodeRegistry`
+  (today: a `ChainHandle` per network from `Engines.engine()`, the Rust or the Java engine),
+  start an IPC server per network, block on a shared stop-latch. (`purge-cache` is handled
+  before either mode: it deletes the network's cache files, daemon or not.)
 - "Is a daemon running?" = try to connect the socket; else try to take the lock file.
 
-### 4.2 IPC transport & protocol
+### 5.2 IPC transport & protocol
 
 - **Unix-domain socket** per network (`/tmp/ethp2p[-<net>].sock`, override via env). Accept loop +
   per-connection handler on lightweight threads (reference: Java virtual threads). **Line-delimited
@@ -355,7 +380,7 @@ re-implementation as the reference desktop host (mobile hosts replace this with 
 - The reference hand-rolls flat-JSON extraction (no JSON lib) — a port should just use a JSON
   library.
 
-### 4.3 IPC command catalog (abridged)
+### 5.3 IPC command catalog (abridged)
 
 | Command | Args | Response (key fields) |
 |---|---|---|
@@ -371,17 +396,30 @@ re-implementation as the reference desktop host (mobile hosts replace this with 
 | `beacon-status` | — | `state, currentPeriod, targetPeriod, finalizedSlot, optimisticSlot, executionStateRoot, executionBlockNumber, peers[…]` |
 | `stop` | — | trips the stop-latch (whole process) |
 
-The integration tests key off `beacon-status` → `"state":"SYNCED"`, then `get-account` /
-`get-storage` returning `"verifyMethod":"headerChain"`.
+Not in the table: `reverse-ens`, `pause` / `resume` (idle sleep), `accept-stale-anchor` (the
+weak-subjectivity consent), `read-stats`, and the log-index family (`logindex-status`,
+`logindex-backfill`, `import-logindex`, `export-logindex`, `build-logindex`) —
+`app/.../CommandHandler.java`. On the Rust engine `get-headers`, `get-block` and `dial` answer
+an error (Java-engine operator queries), and `get-transactions` is Java-engine + mainnet only.
 
-### 4.4 Verification metadata (the trust model, surfaced)
+The integration tests key off `beacon-status` → `"state":"SYNCED"`, then `get-account` /
+`get-storage` returning `"verifyMethod":"headerChain"` — on the Java engine; the Rust engine
+reads at the attested head's root and so normally answers `"stateRootMatch"` (README §3).
+
+### 5.4 Verification metadata (the trust model, surfaced)
 
 `get-account`/`get-storage`/`get-block` compute and return how the answer was anchored:
 **`stateRootMatch`** (the header's `stateRoot` equals a beacon-attested root) or **`headerChain`**
-(walk parent hashes from the beacon-attested block hash to the target, bounded by 8192 blocks;
-pre-Merge blocks below 15,537,394 are unverifiable → `failReason:"preMergeBlock"`). Account/storage
-proofs are MPT-verified against the peer's state root, and `storageRoot`/`codeHash` are taken from
-the **proof-verified leaf**, never the peer's slim body.
+(walk parent hashes down from a beacon-attested block hash to the target, bounded by 8192 blocks
+— for state, from the optimistic head, the target above finality). `get-block` is `headerChain`
+only: it proves the reported header itself by hash, on a window topped by the finalized block or
+the optimistic head (its state-root fast path went in #611), and answers
+`failReason:"preMergeBlock"` below 15,537,394 — mainnet's Merge block, applied on every network.
+Account/storage proofs are MPT-verified against the peer's state root. A re-implementation must take
+`storageRoot`/`codeHash` and the slot value only from the **proof-verified leaf**; the reference
+falls short there: a failed account proof on its `stateRootMatch` fast path still answers with the
+peer's slim body, and `get-storage` prints the peer-listed slot value rather than the proven leaf
+(`VerifiedAccountQuery.java`, `VerifiedStorageQuery.java`).
 
 ---
 
@@ -391,15 +429,21 @@ See [README §9](README.md#9-persistence--storage) for the table. The reference 
 relative to the working directory (no database); each is reconstructible and abstracted behind a
 port:
 
-- **EL peer cache** (`peers-<net>.cache`): TSV `ip⇥port⇥pubkeyHex⇥snap(1/0)[⇥snapok/snapbad]`;
+- **EL peer cache** (`peers-<net>.cache`): TSV
+  `ip⇥port⇥pubkeyHex⇥snap(1/0)[⇥snapok/snapbad][⇥fails=N]`;
   insertion-ordered, in-memory authoritative + async single-thread disk writer; `add` appends a
   line, quality changes trigger a rewrite; 3 consecutive snap failures → DENIED (deprioritized,
-  never evicted).
+  never evicted for serve failures); consecutive TCP dial failures (`fails=N`) demote a peer at 5
+  and evict it at 50 — the only eviction path.
 - **CL peer cache** (`cl-peers-<net>.cache`): multiaddrs + failure counts (threshold 3) + served
   period ranges + bootstrap periods + light-client confirmed/denied verdicts.
 - **Sync snapshot** (`sync-state-<net>.snapshot` + `.roots` sidecar): the verified light-client
   store, bound to gvr (a cache, not a trust anchor — see companion 01 §9.7).
 - **Node key** (`nodekey-<net>.hex`): 32-byte secp256k1 secret.
+
+Mainnet's files drop the `-<net>` suffix (`peers.cache`, `nodekey.hex`, …). The Rust engine reads
+and writes the same peer-cache and snapshot files under `EngineConfig.dataDir` — not the `.roots`
+sidecar (Java-only; the Rust engine leaves it in place) and not the node key (generated per start).
 
 ---
 
@@ -426,8 +470,9 @@ port:
 
 To add a host (desktop, Android, iOS) on top of a re-implemented engine:
 
-1. Implement the **ports**: peer cache, CL peer cache, DNS server provider, CCIP gateway, snap
-   quality sink, logger, clock, and key storage — using the platform's filesystem/HTTP/keystore.
+1. Implement the **ports**: peer cache, CL peer cache, DNS servers, HTTP gateway (CCIP-Read),
+   logger, clock, and key storage — using the platform's filesystem/HTTP/keystore (snap-quality
+   persistence rides the peer cache, §1.4).
 2. Build a `NodeRegistry`; for each enabled network, construct a `ChainStack` with those ports and
    `start()` it.
 3. Pick a surface:
@@ -438,4 +483,6 @@ To add a host (desktop, Android, iOS) on top of a re-implemented engine:
    stop-latch/daemon on desktop), scheduling sync into shared wake windows on mobile to save battery.
 
 The engine code (`node-core` + `rpc-backend` + the protocol modules) is **identical across all three
-hosts** — that is the whole point of the boundary.
+hosts** — that is the whole point of the boundary. (As built: the JVM hosts — daemon, desktop,
+Android — run either engine behind `:myotis-api`; the iOS host, which has no JVM, runs the Rust
+engine alone.)

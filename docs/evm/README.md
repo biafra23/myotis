@@ -7,7 +7,8 @@ The **Rust engine** (the default engine) has its own EVM, `rust/myotis-evm`
 is where `eth_call`/`eth_estimateGas` run on most installs today; its design
 lives in `../reimplementation/03-state-verification-and-evm.md` and
 `../reimplementation/07-el-implementation-plan.md`. The phase documents below
-are the Java engine's history and are kept as written. For cross-cutting
+are the Java engine's history and are kept as written, with status notes where
+the code has since moved on. For cross-cutting
 documentation see `../architecture-doc.md` and `../implementation-status.md`.
 
 | Document | Scope |

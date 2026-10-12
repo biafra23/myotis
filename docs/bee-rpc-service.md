@@ -189,7 +189,7 @@ its deployment block:
   the app itself being starved of CPU on a loaded host, and a later relaunch
   on the bundled warm caches still showed 5–60 s gaps before connections were
   even accepted until App Nap was switched off — after which the same host,
-  same minute, answered in 16–144 ms. The bundle now opts out of App Nap.
+  same minute, answered in 16–144 ms. The app now opts out of App Nap by default.
 
 ## Demo only: seeding from a full node (not for production)
 
@@ -316,7 +316,7 @@ differs, and only the middle one is a default anyone can rely on:
   index on for that network in the Index tab and the push follows.
 
 Across a pause/resume the engine re-applies the host's last pushed value
-(`Engine::log_index_backfill_paused`): a pause drops the EL reader, so the index
+(`EngineState::log_index_runtime_bits`, `host.rs`): a pause drops the EL reader, so the index
 comes back off disk knowing none of the runtime bits, and no host re-pushes on
 resume. Android's idle pause is the common case, in both directions — a walk the
 host asked for survives it, and so does a pause.
@@ -369,7 +369,7 @@ with the seed above bundled inside:
   PoC-only failure never blocks the standard dmgs, and the release simply
   lacks the PoC in that case. Mind the shelf life: a release older than ~29
   days carries a PoC whose seed no longer catches up.
-- **First start** (`BeePoc.kt`): the app copies the seed into its data dir —
+- **First start** (`BeePoc.kt`, on the machinery in `PocFlavour.kt`): the app copies the seed into its data dir —
   when no index file exists there yet, or when the bundled seed is newer than
   the one this flavour installed before (a rebuilt app after the shelf life;
   an index the flavour did not install is never touched), and only if the
@@ -438,9 +438,10 @@ that took seven minutes instead of thirty seconds, and Bee's 10-minute postage
 stall. Measured 2026-09-16, same host, same minute: napped, 25 of 40
 `eth_blockNumber` probes took over a second (up to 18 s); un-napped, 0 of 30
 (16–144 ms). The app therefore holds an `NSProcessInfo` activity
-(`NSActivityUserInitiatedAllowingIdleSystemSleep`) for its whole lifetime
-(`AppNap.kt`, through JNA's Objective-C runtime calls) and logs the outcome as
-the first line of every start; being in-process this covers `:app-desktop:run`
+(`NSActivityUserInitiatedAllowingIdleSystemSleep`) for as long as Settings →
+Power → *Sleep when not in focus* is off, the default (`AppNap.kt`, through
+JNA's Objective-C runtime calls), and logs the outcome among the first lines
+of every start; being in-process this covers `:app-desktop:run`
 dev runs too. Measured the same way: with the activity held, two minutes
 hidden left every thread at `28`–`31`, never `4`. Two things it deliberately does not do: keep the Mac awake (a
 closed lid or the idle-sleep timer still stops everything — `caffeinate` or the

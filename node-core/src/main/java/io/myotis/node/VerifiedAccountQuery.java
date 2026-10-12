@@ -3,6 +3,7 @@ package io.myotis.node;
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
 import com.jaeckel.ethp2p.core.concurrent.Futures;
 import com.jaeckel.ethp2p.consensus.proof.MerklePatriciaVerifier;
+import com.jaeckel.ethp2p.core.trie.MerklePatriciaProofVerifier;
 import com.jaeckel.ethp2p.networking.eth.HeaderChains;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
@@ -110,14 +111,17 @@ public final class VerifiedAccountQuery {
      * nonce/balance honest) and are null when the leaf proof didn't verify; callers needing the
      * peer-claimed slim values must fall back explicitly.
      *
-     * @param peerProofValid        proof verifies against the peer's own stateRoot (necessary,
-     *                              not sufficient for trust)
+     * @param peerProofValid        proof verifies against the peer's own stateRoot and agrees
+     *                              with the slim entry — or, without an entry, proves the
+     *                              address absent (necessary, not sufficient for trust)
      * @param verifiedStorageRootHex storage root from the proof-verified leaf, or null
      * @param verifiedCodeHashHex   code hash from the proof-verified leaf, or null
      * @param beaconChainVerified   the peer's stateRoot ties to a beacon-attested root
      * @param blsVerified           the beacon match was BLS-signed
      * @param matchedSlot           slot of the matching attestation; -1 when none
-     * @param verifyMethod          "stateRootMatch" / "headerChain" / null
+     * @param verifyMethod          "stateRootMatch" / "headerChain" / null; set only when
+     *                              {@code peerProofValid} (an attested root vouches for what a
+     *                              proof proves, not for an unproven slim body)
      * @param failReason            null when verified
      */
     public record Verification(
@@ -229,9 +233,10 @@ public final class VerifiedAccountQuery {
             final AccountRangeMessage.AccountData foundFinal = found;
             return verify(result, address, foundFinal, bssFinal, conn).thenApply(v -> {
                 // Shadow-cache bookkeeping for the VERIFIED answer only: the leaf
-                // proof must have verified (verifyMethod alone is not enough — the
-                // stateRootMatch fast path does not consult peerProofValid, and
-                // the hex fields below then fall back to the peer's slim body).
+                // proof verified (or proved the address absent) and the root is
+                // anchored. verifyMethod implies peerProofValid (the fast path's
+                // stateRootMatch gate and the ladder both require it); both are
+                // checked so neither alone has to carry that invariant.
                 if (readStats != null && v.peerProofValid() && v.verifyMethod() != null
                         && result.stateRoot() != null) {
                     var fact = foundFinal == null
@@ -329,7 +334,15 @@ public final class VerifiedAccountQuery {
         String balance = found != null ? found.balance().toString() : null;
 
         Scratch v = new Scratch();
-        if (result.stateRoot() != null && !result.proof().isEmpty()) {
+        if (result.stateRoot() != null && found == null) {
+            // No slim entry for the address. verifyAndExtractAccount only compares nonce/balance
+            // against an entry, so here it would accept ANY leaf — an account the peer withheld
+            // while its proof shows it exists, reported as absent. Without an entry the only
+            // valid answer is a proven absence (an exclusion proof).
+            v.peerProofValid = MerklePatriciaProofVerifier.verify(
+                    result.stateRoot(), Hash.keccak256(address).toArrayUnsafe(), result.proof())
+                    instanceof MerklePatriciaProofVerifier.Result.Absent;
+        } else if (result.stateRoot() != null && !result.proof().isEmpty()) {
             List<byte[]> proofBytes = new ArrayList<>(result.proof().size());
             for (Bytes b : result.proof()) proofBytes.add(b.toArrayUnsafe());
             // verifyAndExtractAccount returns the storageRoot/codeHash from the proof-verified
@@ -343,10 +356,10 @@ public final class VerifiedAccountQuery {
         }
 
         // Fast-path shortcut: if the BLC has already attested the peer's exact stateRoot, we're
-        // done — no header fetch needed. Rare, but free to check.
+        // done — no header fetch needed. Only for a proof that verified: see stateRootMatch.
         if (bss != null && result.stateRoot() != null) {
             BeaconSyncState.SlottedStateRoot match =
-                    bss.findStateRoot(result.stateRoot().toArrayUnsafe());
+                    stateRootMatch(bss, result.stateRoot(), v.peerProofValid);
             if (match != null) {
                 v.beaconChainVerified = true;
                 v.matchedSlot = match.slot();
@@ -421,10 +434,10 @@ public final class VerifiedAccountQuery {
         String balance = found != null ? found.balance().toString() : null;
         // storageRoot/codeHash come from the proof-verified leaf when we have it, so they're
         // cryptographically anchored rather than peer-claimed. Fall back to the slim (peer-claimed)
-        // body only when the leaf proof didn't verify (verifiedStorageRootHex == null). Note this
-        // is gated on peerProofValid, NOT beaconChainVerified: the beacon stateRootMatch fast-path
-        // can set beaconChainVerified=true even when the leaf proof didn't verify, so it is not a
-        // proxy for "we have a proof-verified leaf".
+        // body only when the leaf proof didn't verify (verifiedStorageRootHex == null) — such a
+        // result never carries a verifyMethod: both the stateRootMatch fast path and the
+        // headerChain ladder require peerProofValid. A proven-absent address has no leaf (and
+        // no slim entry), so both fields are null for it.
         String storageRootHex = v.verifiedStorageRootHex() != null
                 ? v.verifiedStorageRootHex()
                 : (found != null ? found.storageRoot().toHexString() : null);
@@ -446,6 +459,20 @@ public final class VerifiedAccountQuery {
                 v.matchedSlot(),
                 v.verifyMethod(),
                 v.failReason());
+    }
+
+    /**
+     * The beacon match that lets a verified read skip the header-chain walk, or null. A read
+     * takes it only when its proof verified against {@code stateRoot}: an attested root vouches
+     * for what a proof proves under it, never for a value no proof proved — so a matching root
+     * with a bad or missing proof falls through to {@code peerProofInvalid}. Shared with
+     * {@link VerifiedStorageQuery}; twin of the Rust {@code el::verify::ladder_precheck} fast
+     * path.
+     */
+    static BeaconSyncState.SlottedStateRoot stateRootMatch(
+            BeaconSyncState bss, Bytes32 stateRoot, boolean proofValid) {
+        if (!proofValid || bss == null || stateRoot == null) return null;
+        return bss.findStateRoot(stateRoot.toArrayUnsafe());
     }
 
     /** The attested block a header-chain walk ends at, and the beacon slot that attested it. */

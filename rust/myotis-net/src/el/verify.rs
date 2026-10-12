@@ -99,14 +99,23 @@ pub fn ladder_precheck(
     peer_block_number: i64,
     anchor: &ExecAnchor,
 ) -> LadderStep {
-    // Fast path: the BLC has already attested the peer's exact state root.
-    if let Some(root) = peer_state_root {
-        if let Some(m) = anchor.find_state_root(root) {
-            return LadderStep::Done(Verdict::verified(
-                "stateRootMatch",
-                m.slot as i64,
-                m.bls_verified,
-            ));
+    // Fast path: the BLC has already attested the peer's exact state root —
+    // taken only when the proof verified against it. An attested root vouches
+    // for what a proof proves under it, never for a value no proof proved, so a
+    // matching root with a bad proof falls through to `peerProofInvalid`.
+    // Today's Rust callers verify before anchoring and always pass `true`; the
+    // gate keeps this tree identical to `VerifiedAccountQuery.verify` (the same
+    // gate now applies there; a failed proof used to reach its fast path) and
+    // holds for any future caller.
+    if peer_proof_valid {
+        if let Some(root) = peer_state_root {
+            if let Some(m) = anchor.find_state_root(root) {
+                return LadderStep::Done(Verdict::verified(
+                    "stateRootMatch",
+                    m.slot as i64,
+                    m.bls_verified,
+                ));
+            }
         }
     }
 
@@ -350,6 +359,18 @@ mod tests {
             }
             _ => panic!("expected stateRootMatch"),
         }
+    }
+
+    #[test]
+    fn state_root_match_needs_a_valid_proof() {
+        // An attested root must not lend its verdict to a proof that failed
+        // against it (the Java get-storage/get-account fast-path gap).
+        let anchor = ExecAnchor::new();
+        anchor.record_state_root(50, root(7), true);
+        assert_eq!(
+            fail(ladder_precheck(Some(&root(7)), false, 123, &anchor)),
+            Some("peerProofInvalid")
+        );
     }
 
     #[test]

@@ -31,6 +31,41 @@ class MerklePatriciaProofVerifierTest {
         }
     }
 
+    // ---- Storage leaf values ------------------------------------------------
+
+    @Test
+    void storageIntegerReadsTheRlpOfATrimmedUint() {
+        // Storage leaves hold rlp(trimmed uint256): 0x80 (the empty string) is zero, a byte
+        // below 0x80 is itself, longer values carry a short-string header.
+        assertEquals(java.math.BigInteger.ZERO,
+                MerklePatriciaProofVerifier.storageInteger(Bytes.fromHexString("0x80")));
+        assertEquals(java.math.BigInteger.valueOf(0x7f),
+                MerklePatriciaProofVerifier.storageInteger(Bytes.fromHexString("0x7f")));
+        assertEquals(java.math.BigInteger.valueOf(0x80),
+                MerklePatriciaProofVerifier.storageInteger(Bytes.fromHexString("0x8180")));
+        assertEquals(new java.math.BigInteger("0102030405", 16),
+                MerklePatriciaProofVerifier.storageInteger(Bytes.fromHexString("0x850102030405")));
+    }
+
+    @Test
+    void storageIntegerRefusesWhatTheRustTwinRefuses() {
+        // Same refusals as myotis_core::trie::decode_storage_leaf, so the engines cannot read
+        // one leaf two ways.
+        for (String bad : List.of(
+                "0x",            // empty
+                "0x850102",      // truncated
+                "0x820005",      // leading zero
+                "0x0102",        // trailing bytes after a single byte
+                "0x8105ff",      // trailing bytes after a string
+                "0x8105",        // non-canonical: a byte below 0x80 wrapped in a header
+                "0xb8ff01",      // long string
+                "0xc180",        // a list
+                "0xa1" + "01".repeat(33))) { // 33 bytes: wider than a uint256
+            org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                    () -> MerklePatriciaProofVerifier.storageInteger(Bytes.fromHexString(bad)), bad);
+        }
+    }
+
     // ---- Single-leaf trie --------------------------------------------------
 
     @Test

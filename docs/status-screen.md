@@ -21,8 +21,9 @@ switch which chain's snapshot is shown — with one exception: the stale-anchor
 dialog (below) can pop up for *any* parked network, selected or not.
 
 Host coverage isn't uniform: iOS never fills the READY peers list or the
-Sleep/Last woke fields (idle-sleep metrics aren't wired there yet), and the
-Tor row is desktop and Android only (see that row below).
+Sleep/Last woke fields (idle-sleep metrics aren't wired there yet), the
+Tor row is desktop and Android only (see that row below), and Android never
+fills the Log index row (its Log index tile and Index tab still show).
 
 The app shows a condensed version of this explanation in place: the card has an
 "ⓘ" ("Readiness") in both modes; in Expert mode rows marked "ⓘ" open it in a
@@ -45,10 +46,10 @@ action the state calls for. It paints the same ladder as the strip
 |---|---|---|
 | **Sleeping** (grey) | idle-paused (`lifecycle == PAUSED`) | networking is off to save battery; a wallet request wakes it. Names a reported network upgrade if peers announced one. Outranks "No internet connection": nothing is failing while asleep. |
 | **No internet connection** (red) | the host reports no connectivity | *Open network settings* button; Start is refused meanwhile. |
-| **Not running** (red) | no stack registered | *Start `<network>`* button. |
+| **Not running** (red) | no stack registered, or one that is not running (mid-boot or mid-teardown) | *Start `<network>`* button; a registered stack instead reads "Starting or stopping — give it a moment." with *Stop*. |
 | **Update required** (red) | an ACTIVE upgrade advisory the node's own state corroborates (not SYNCED, or stale head) | update the app. |
 | **Needs your decision** (red) | parked in `STALE_ANCHOR` | how many periods old the anchor is (and the bound, where the host reports it); a *Review* button re-opens the consent dialog after it was dismissed. |
-| **Syncing** (red) | beacon not `SYNCED` | the sync bar's wording: "Starting the light client…" (Android's `STARTING`-as-`STOPPED`), "Bootstrapping the light client…", "Catching up sync committees — period *c* of *t*." with a determinate bar, or "Finishing sync…"; "Looking for light-client servers…" while hunting. |
+| **Syncing** (red) | beacon not `SYNCED` | the sync bar's wording: "Starting the light client…" (`STARTING`, or Android's `STARTING`-as-`STOPPED`), "Bootstrapping the light client…", "Catching up sync committees — period *c* of *t*." with a determinate bar, or "Finishing sync…"; "Looking for light-client servers…" while hunting. |
 | **Almost ready** (amber) | `SYNCED` but no verified head, or one older than 45 s | waiting for the first / a fresh verified head; "Looking for snap peers…" while hunting. |
 | **Ready — log index catching up** / **too far behind** (amber) | ready, but an enabled log index is in a tracked catch-up (a gap that reached 32 blocks and is not yet back within the 4-block serving slack) | the catch-up line and, unless stalled, its bar — `eth_getLogs` near the head is refused until it has caught up. |
 | **Ready** (green, bright green when the pool is deep) | verified reads are served | the verified head's age, and whether the peer pool is deep enough for heavy wallet screens (the deep-pool threshold in Settings). |
@@ -71,8 +72,8 @@ shows `—` and no dot) and one line of detail. All come from `vitalsOf` in
 | **Verified head** | the verified head's age (`4 s`, `2 min`), `None yet`, or `—` | `fresh` (≤ 45 s), `stale — waiting for a fresh head`, `waiting for a peer that can answer`, `waiting for sync`, or `paused — needs your decision` | green when fresh, amber when stale or missing on a synced node, no dot while not synced |
 | **Log index** (only when the engine reports an enabled index) | `Up to date` (within the 4-block serving slack), `Trailing` (past the slack but short of a catch-up — green, like the strip, with the gap named and a note that queries at the very head wait), `Behind head` / `Too far behind` (a tracked catch-up — the card's amber rung), `Starting` (no block covered yet), `Nothing watched` | the head gap, then the history: `history complete`, `history paused · N blocks unindexed`, or `history incomplete · <ETA or blocks left>` | follows the HEAD side only, and agrees with the card: amber exactly while the ladder's catch-up rung is up. An incomplete or paused history is said in the detail and never changes the tone, because it does not affect what the node can answer at the head |
 
-While the stack is down every tile reads `—`; while it sleeps, `—` with
-"sleeping". The index tile also disappears whenever the status probe answers an
+While the stack is down the first three tiles read `—` and the index tile is
+hidden; while it sleeps, `—` with "sleeping". The index tile also disappears whenever the status probe answers an
 error envelope (a paused or still-starting handle).
 
 ## Readiness strip
@@ -139,7 +140,7 @@ network is stopped). The card carries the same progress in both modes:
   decision.
 - **Bootstrapping** (state not yet `CATCHING_UP`) — indeterminate bar,
   "Bootstrapping light client…". Desktop/iOS only: Android maps `STARTING` to
-  `STOPPED` (see the Beacon row above), and the bar's own early-return on
+  `STOPPED` (see the Beacon row below), and the bar's own early-return on
   `STOPPED` means it never shows this phase there.
 - **`CATCHING_UP`**, start period known — determinate bar, "Catching up sync
   committees — period *current* / *target*" (or "Finishing sync…" once
@@ -157,7 +158,7 @@ In on-screen order. "Row" is the literal left-hand text label.
 | **State** | Stack lifecycle: `Sleeping (wakes on request)` (idle-paused — networking off, RPC still listening), `Running`, or `Stopped`. |
 | **Beacon** | The beacon light client's sync state: `STARTING` (shown as `STOPPED` on Android, where the sync bar is then hidden too — see below), `SYNCING`, `CATCHING_UP`, `SYNCED`, or `STALE_ANCHOR`. Full definitions in `docs/readiness-and-verified-head-age.md` §Beacon sync states. This is the trust-anchor side of readiness — a node can be here `SYNCED` yet still not `readyForReads` (see Head age below). |
 | **EL block** | The execution-layer block number of the latest beacon-*finalized* payload (`StatusSnapshot.executionBlockNumber`) — not the optimistic head that `eth_blockNumber` reports. On a healthy node it trails the chain head by about two epochs (~64–96 blocks on mainnet). |
-| **Log index** | Only shown when the log index feature applies. A short progress string, e.g. `12,041 logs · 5,594,611–8,461,900`, or `backfilling`. See `docs/eth-getlogs-design.md` / `docs/logindex-verified-bundle-design.md`; the Index tab has the full detail view for this feature. |
+| **Log index** | Desktop and iOS fill it for every chain the engine hosts — the Java engine and a disabled index included, which read `enabled — waiting for engine` (what `LogIndexStatus.format` makes of `{"enabled":false}` or an `{"error":…}`); never on Android (that host does not fill it). Otherwise a short progress string, e.g. `12041 logs — blocks 5594611–8461900`, `… — backfilling (…)`, or `… — backfill starting`. See `docs/eth-getlogs-design.md` / `docs/logindex-verified-bundle-design.md`; the Index tab has the full detail view for this feature. |
 | **Tor** | Desktop and Android only, and only when applicable (Rust engine + a `-PtorEngine` build; see `docs/privacy-and-tor.md`) — iOS never populates this row. `off` = supported but disabled; `on — circuit bootstrapping…` = enabled, circuit not ready yet; `routing reads and sends (circuit ready)` = enabled and a Tor circuit is ready (highlighted in the theme's primary color). **Scope: account (balance/nonce) reads and the broadcast of the wallet's own transactions route over Tor today** — token/storage reads, `eth_call`/gas estimation, receipt polling, the CL fetch, and discovery still leave from your real IP; full coverage is a follow-up. The Logs tab shows one `tor:` line per Tor read and per Tor send. |
 | **EL · N peers · M cache** | *Group header, not a row:* the execution-layer (devp2p) peer rows follow it. `N` = ready peers in the snap pool (the first number of the Peers row below), `M` = the on-disk EL peer-cache total (the first number of the Cache row below). |
 | **Peers** (EL) | Execution-layer pool: `N` ready peers total, of which `snap M` negotiated the snap capability (snap/1 or snap/2), and `serving K` are in the pool actually able to answer a read right now (near the current head, not benched after a failed read). A number in parentheses after it — `serving 8 (3)` — is how many of those serving peers are connected over snap/2; no parentheses means all of them are on snap/1. Reads work the same on both versions. Reads gate on `serving`, not `snap` — right after reaching `SYNCED` a cold pool can be full of peers that are themselves still syncing (#465), which keeps `snap` positive for hours while every read fails. The help dialog is titled "EL peers". |
@@ -189,7 +190,9 @@ In on-screen order. "Row" is the literal left-hand text label.
   cold host ends up with an enabled set to boot from. Start is also disabled
   while offline (discovery has nothing to reach).
 - **Clear peer caches** (Expert mode, below the rows) — wipes the on-disk peer caches through the engine
-  (so a live stack can't write the old peers back) — gives discovery a fresh
+  (on the Java engine, so a live stack can't write the old peers back; the
+  Rust engine exports no clear, so the host deletes its cache files, which
+  sticks only while stopped — `RustChainHandle.clearPeerState`) — gives discovery a fresh
   slate. Only enabled while the network is stopped, making an accidental
   click on a running node unlikely — the gate follows a 2 s snapshot poll, so
   it's a guard rail, not a hard lock (and briefly stale on Android just after

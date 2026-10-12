@@ -20,6 +20,7 @@ There are **two interchangeable engines** behind the same zero-dependency API (`
 ## Documentation
 
 - [Architecture](docs/architecture-doc.md) — Describes the target design for how the library will obtain and cryptographically verify all Ethereum data without relying on JSON-RPC providers; not all parts are implemented yet.
+- [How Verification Works](docs/verification.md) — The chain of checks behind every answer, from the embedded checkpoint and the sync committee's signatures down to SNAP-served Merkle-Patricia proofs, with what is not verified.
 - [Benefits](docs/benefits-doc.md) — Explains why a trustless wallet matters and what risks centralized RPC providers pose to users.
 - [Implementation Status](docs/implementation-status.md) — Current implementation progress and what remains to be done.
 - [Readiness & Verified Head Age](docs/readiness-and-verified-head-age.md) — When the node counts as synced and ready to answer queries, and what the "verified head age" on the Status screen means.
@@ -32,6 +33,7 @@ There are **two interchangeable engines** behind the same zero-dependency API (`
 - [Glamsterdam readiness](docs/glamsterdam-plan.md) — How the Gloas light client and the Amsterdam EVM are handled (live on Sepolia since the 2026-10-06 fork; mainnet and Gnosis have no date yet).
 - [Dedicated light-client server](docs/lc-server-design.md) — The design behind [`rust/roost`](rust/roost/README.md), the light-client server that keeps a free slot for wallets.
 - [A dedicated snap server?](docs/snap-server-design.md) — Analysis (nothing built): whether snap state reads can be served to thousands of wallets the way roost serves the light client — measured proof sizes and lifetimes, a front for a full node instead of a cache, unchanged trust, and the privacy cost of one operator seeing every wallet's addresses (onion service vs. Tor exit).
+- [Onion services on wallets](docs/wallet-onion-services.md) — Analysis (nothing built): wallets serving each other light-client data through Tor onion services — reachability behind CGNAT without an IP, why it does not help snap, and why myotis's Ethereum-facing peer ids must stay secp256k1 while an overlay identity can be ed25519 (and then a peer id is an onion address).
 - [Base (L2) evaluation](docs/base-l2-evaluation.md) — Whether and how Base could be supported under the trust model: no sync committee, so the only anchor is Base's proposals on mainnet (TEE-attested, 32–52 min old, no ZK proofs posted in practice), the weaker evidence available before one lands, the RPC landscape, and the cost of proving sequencing from L1 blob data.
 - [dApp browser & RPC interception](docs/dapp-browser-design.md) — Whether the apps should embed a dApp browser (a dApp is only usable with a signer, and Myotis holds no keys), what a dApp's own RPC traffic looks like, how an embedded browser or an extension could redirect it to the engine, what the engine cannot serve of it, and the recommended path (an extension PoC first, a read-only viewer on mobile at most). Postponed by the owner on 2026-10-10: the Freedom browser's integration is good enough for now.
 - Integrations and proofs of concept: [Bee (Swarm) on Myotis](docs/bee-rpc-service.md) ([short version](docs/bee-node-from-source.md)), the [RAILGUN PoC build](docs/railgun-poc.md) (and [its seed on Android](docs/railgun-android.md)), [React Native](docs/react-native.md) (design), [inbound connections](docs/inbound-connections.md) (design), [multichain](docs/multichain-design.md).
@@ -175,6 +177,8 @@ Build a native installer for the host OS with jpackage. **jpackage is host-OS-bo
 # Run the packaged app straight out of the build dir (no installer step)
 ./gradlew :app-desktop:runDistributable
 ```
+
+On macOS, `:app-desktop:run` is a plain `java` process with no app bundle: the menu bar carries the app's name, but Cmd-Tab still lists it as "java" (macOS names a bundle-less process after its executable), and notifications go through the tray icon. `runDistributable` runs the real bundle, which carries the app's name, icon and notifications everywhere.
 
 The bundle embeds a full Java 21 runtime (the `:networking`/`:myotis-evm` backend ships Java-21 classes and reaches JDK modules reflectively, so the whole module graph is included). Packaged builds (dmg/deb/`runDistributable`) **bundle the Rust engine** as an app resource — packaging fails loudly if cargo isn't available, so an installed app can always switch engines. Logs roll under `~/.myotis/logs`; the app's log level comes from the `myotis.log.level` JVM system property (default `INFO`). Each JSON-RPC call gets a one-line summary at `INFO`; the request/response bodies (size-capped, **unredacted: they include addresses and signed transactions**) are logged only at `DEBUG` — pick DEBUG on the Logs-tab chip, or launch with `myotis.log.rpc.level=DEBUG`. Note that a `-D` flag on a `./gradlew :app-desktop:run` command line reaches the Gradle JVM, not the app — for a packaged app, edit the `java-options` in the bundle's generated `Myotis.cfg`.
 
@@ -883,7 +887,7 @@ Block verification (`get-block`) currently has the following limitations:
 - **Account and storage queries** (`get-account`, `get-storage`) share the 8,192-block header chain limit but are less affected in practice because they query the peer's current state (usually close to head).
 **Roadmap:**
 
-- **Pre-merge blocks**: Implement the [pre-merge historical hashes accumulator](https://github.com/ethereum/portal-network-specs/blob/master/history/history-network.md#the-header-accumulator) (EIP-2935). This is a Merkle tree over all ~15.5M pre-merge block hashes, with the root embedded as a static trust anchor. Any pre-merge block hash can be verified with an inclusion proof against this accumulator.
+- **Pre-merge blocks**: Implement the [pre-merge historical hashes accumulator](https://github.com/ethereum/portal-network-specs/blob/master/history/history-network.md#the-header-accumulator). This is a Merkle tree over all ~15.5M pre-merge block hashes, with the root embedded as a static trust anchor. Any pre-merge block hash can be verified with an inclusion proof against this accumulator.
 - **Post-merge historical blocks**: Implement the [Bellatrix-era historical roots accumulator](https://github.com/ethereum/annotated-spec/blob/master/phase0/beacon-chain.md#historical-roots). The beacon chain stores `historical_roots` (batches of 8,192 slots) and `historical_summaries` (post-Capella) that cover all post-merge execution payloads. By walking the beacon state's historical records, any post-merge block hash can be verified without an 8,192-block proximity constraint.
 
 ### Sync modes

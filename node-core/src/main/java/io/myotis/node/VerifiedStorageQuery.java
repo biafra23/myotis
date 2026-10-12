@@ -2,6 +2,7 @@ package io.myotis.node;
 
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
 import com.jaeckel.ethp2p.consensus.proof.MerklePatriciaVerifier;
+import com.jaeckel.ethp2p.core.trie.MerklePatriciaProofVerifier;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
 import com.jaeckel.ethp2p.networking.snap.messages.AccountRangeMessage;
 import com.jaeckel.ethp2p.networking.snap.messages.StorageRangesMessage;
@@ -12,6 +13,7 @@ import org.apache.tuweni.crypto.Hash;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.math.BigInteger;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
@@ -25,7 +27,9 @@ import java.util.concurrent.TimeUnit;
  *   <li>Take {@code storageRoot} from the PROOF-VERIFIED account leaf, never the peer's
  *       slim body — a peer could otherwise forge storageRoot (keeping nonce/balance
  *       honest) plus a matching storage proof and fabricate a "verified" slot value.</li>
- *   <li>Fetch + MPT-verify the slot against that storageRoot.</li>
+ *   <li>Fetch + MPT-verify the slot against that storageRoot. The reported value is the
+ *       PROOF's ({@link #verifySlot}) — a peer's slot list that disagrees with its own proof
+ *       invalidates the answer — and a proven-absent slot is a valid zero.</li>
  *   <li>Anchor the account's state root to the beacon chain: stateRootMatch fast-path,
  *       else the BLS-attested headerChain walk (shared with {@link VerifiedAccountQuery}).</li>
  * </ol>
@@ -111,27 +115,28 @@ public final class VerifiedStorageQuery {
         }
         Bytes32 storageRoot = Bytes32.wrap(verifiedAccount.storageRoot());
 
-        // Step 2: fetch the slot at the SAME peer state root for consistency.
-        long slotStarted = System.nanoTime();
-        StorageRangesMessage.DecodeResult storageResult =
-                connector.requestStorage(contractAddress, storageKeyHash, snapStateRoot)
-                        .get(30, TimeUnit.SECONDS);
-        long slotElapsedNanos = System.nanoTime() - slotStarted;
-        StorageRangesMessage.StorageData found = storageResult.slots().stream()
-                .filter(s -> s.slotHash().equals(storageKeyHash))
-                .findFirst().orElse(null);
+        // Step 2: fetch the slot at the SAME peer state root for consistency — unless the
+        // account has no storage at all: its proven leaf already says every slot is zero, so
+        // there is no round trip and no slot fact for the shadow cache (as in the Rust engine
+        // and the EVM oracle). verifySlot answers the empty trie with a valid zero.
+        boolean noStorage = MerklePatriciaProofVerifier.EMPTY_TRIE_ROOT.equals(storageRoot);
+        StorageRangesMessage.DecodeResult storageResult;
+        long slotElapsedNanos = 0;
+        if (noStorage) {
+            storageResult = new StorageRangesMessage.DecodeResult(0, List.of(), List.of());
+        } else {
+            long slotStarted = System.nanoTime();
+            storageResult = connector.requestStorage(contractAddress, storageKeyHash, snapStateRoot)
+                    .get(30, TimeUnit.SECONDS);
+            slotElapsedNanos = System.nanoTime() - slotStarted;
+        }
 
         List<String> proofHex = storageResult.proof().stream().map(Bytes::toHexString).toList();
 
-        // Step 3: verify the storage proof against the proof-verified storageRoot.
-        boolean storageProofValid = false;
-        if (!storageResult.proof().isEmpty()) {
-            List<byte[]> proofBytes = storageResult.proof().stream()
-                    .map(Bytes::toArrayUnsafe).toList();
-            byte[] leafValue = MerklePatriciaVerifier.verifyStorageProof(
-                    storageRoot.toArrayUnsafe(), storageSlotKey, proofBytes);
-            storageProofValid = (leafValue != null);
-        }
+        // Step 3: verify the slot against the proof-verified storageRoot. The VALUE is the
+        // proof's, never the peer's slot list (see verifySlot).
+        SlotProof slotProof = verifySlot(storageRoot, storageKeyHash, storageResult);
+        boolean storageProofValid = slotProof.valid();
 
         // Step 4: anchor the account's state root to the beacon chain — stateRootMatch
         // fast-path, then the same failure ladder + headerChain walk as get-account.
@@ -142,8 +147,9 @@ public final class VerifiedStorageQuery {
         String failReason = null;
         Bytes32 usedStateRoot = accountResult.stateRoot();
         if (usedStateRoot != null) {
-            BeaconSyncState.SlottedStateRoot match =
-                    beaconSyncState.findStateRoot(usedStateRoot.toArrayUnsafe());
+            // The account proof verified in step 1; the slot's must have too.
+            BeaconSyncState.SlottedStateRoot match = VerifiedAccountQuery.stateRootMatch(
+                    beaconSyncState, usedStateRoot, storageProofValid);
             if (match != null) {
                 beaconChainVerified = true;
                 matchedSlot = match.slot();
@@ -200,30 +206,30 @@ public final class VerifiedStorageQuery {
             }
         }
 
-        String valueHex = found != null ? found.slotValue().toHexString() : null;
-        String valueDecimal = null;
-        if (found != null && !found.slotValue().isEmpty()) {
-            valueDecimal = new java.math.BigInteger(1, found.slotValue().toArrayUnsafe()).toString();
-        }
+        // Only a proven value is ever reported: a slot the proof does not show holding a value
+        // (proven absent/zero, or the proof failed) has none here; storageProofValid and
+        // failReason say which.
+        String valueHex = slotProof.exists()
+                ? Bytes.wrap(slotProof.value().toByteArray()).trimLeadingZeros().toHexString()
+                : null;
+        String valueDecimal = slotProof.exists() ? slotProof.value().toString() : null;
 
         // Shadow-cache bookkeeping for the VERIFIED answer only. The account
-        // proof verified above (step 1 throws otherwise); it counts once the
-        // state root is beacon-anchored. The slot additionally needs its own
-        // proof to have held — `verifyMethod` alone is not enough, the
-        // stateRootMatch fast path above does not consult storageProofValid —
-        // because an unproven peer value is not a fact a cache could have served.
+        // proof verified above (step 1 throws otherwise), and a verifyMethod
+        // now implies the slot proof held too: neither the stateRootMatch fast
+        // path nor the headerChain ladder anchors a failed slot proof. The
+        // inner check keeps that explicit — an unproven peer value is not a
+        // fact a cache could have served.
         if (verifyMethod != null && usedStateRoot != null) {
             readStats.observeAccount(contractAddress.toArrayUnsafe(), usedStateRoot.toArrayUnsafe(),
                     new io.myotis.evm.world.ReadStats.AccountFact(
                             account.nonce(), account.balance(), storageRoot,
                             Bytes32.wrap(verifiedAccount.codeHash())),
                     accountElapsedNanos);
-            if (storageProofValid) {
-                java.math.BigInteger value = found != null && !found.slotValue().isEmpty()
-                        ? new java.math.BigInteger(1, found.slotValue().toArrayUnsafe())
-                        : java.math.BigInteger.ZERO;
+            if (storageProofValid && !noStorage) {
+                // A proven-absent slot is zero.
                 readStats.observeStorage(contractAddress.toArrayUnsafe(), storageSlotKey,
-                        usedStateRoot.toArrayUnsafe(), storageRoot.toArrayUnsafe(), value,
+                        usedStateRoot.toArrayUnsafe(), storageRoot.toArrayUnsafe(), slotProof.value(),
                         slotElapsedNanos);
             }
         }
@@ -234,7 +240,7 @@ public final class VerifiedStorageQuery {
                 holderEcho,
                 "0x" + Bytes.wrap(storageSlotKey).toUnprefixedHexString(),
                 storageKeyHash.toHexString(),
-                found != null,
+                slotProof.exists(),
                 valueHex,
                 valueDecimal,
                 storageResult.slots().size(),
@@ -256,6 +262,56 @@ public final class VerifiedStorageQuery {
                 beaconSyncState.getFinalizedSlot(),
                 beaconSyncState.getOptimisticSlot(),
                 VerifiedAccountQuery.MAX_HEADER_CHAIN_GAP);
+    }
+
+    /**
+     * A storage slot's verdict, read from the proof alone.
+     *
+     * @param valid  the proof verifies against the storage root (showing the slot's value, or
+     *               proving it absent) and the peer's slot list does not contradict it
+     * @param value  the proven value — zero for a proven-absent slot (a zero slot is pruned
+     *               from the trie) — or null when not {@code valid}
+     */
+    record SlotProof(boolean valid, BigInteger value) {
+        static final SlotProof INVALID = new SlotProof(false, null);
+
+        /** The proof shows the slot holding a value: valid and non-zero (Rust's {@code found}). */
+        boolean exists() {
+            return valid && value.signum() != 0;
+        }
+    }
+
+    /**
+     * Verify one slot of a {@code StorageRanges} response against {@code storageRoot}, the
+     * account's proof-verified storage root. The value comes from the proof — the peer's slot
+     * list is only its claim, so a list entry for this key that disagrees with the proof makes
+     * the whole answer invalid rather than one side winning. An entry the list omits does not:
+     * the proof alone answers the query. A proven absence (an exclusion proof, or no proof
+     * against the empty-trie root) is a valid answer of zero.
+     */
+    static SlotProof verifySlot(Bytes32 storageRoot, Bytes32 storageKeyHash,
+                                StorageRangesMessage.DecodeResult response) {
+        MerklePatriciaProofVerifier.Result result = MerklePatriciaProofVerifier.verify(
+                storageRoot, storageKeyHash.toArrayUnsafe(), response.proof());
+        if (result instanceof MerklePatriciaProofVerifier.Result.Invalid) {
+            return SlotProof.INVALID;
+        }
+        BigInteger proven;
+        try {
+            proven = result instanceof MerklePatriciaProofVerifier.Result.Found found
+                    ? MerklePatriciaProofVerifier.storageInteger(found.value())
+                    : BigInteger.ZERO;
+        } catch (IllegalArgumentException e) {
+            return SlotProof.INVALID;
+        }
+        for (StorageRangesMessage.StorageData entry : response.slots()) {
+            // Compared as numbers: the list's encoding is the peer's, the value is not.
+            if (entry.slotHash().equals(storageKeyHash)
+                    && !new BigInteger(1, entry.slotValue().toArrayUnsafe()).equals(proven)) {
+                return SlotProof.INVALID;
+            }
+        }
+        return new SlotProof(true, proven);
     }
 
     /** uint64 → 8 big-endian bytes at {@code offset}..{@code offset+7}. */

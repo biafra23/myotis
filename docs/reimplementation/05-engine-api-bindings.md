@@ -20,7 +20,10 @@
   structs), `List<record>` ⇄ `Vec<struct>`. No `BigInteger` (wei = decimal strings),
   no `CompletableFuture`, no `InetSocketAddress`/`Path` (host:port pairs / path strings).
 - **Three-tier error model** that needs no exception marshalling:
-  1. `VerifiedReads` returns `null` (`Option::None`) = "cannot answer verified";
+  1. `VerifiedReads` returns `null` (`Option::None`) = "cannot answer verified" (its
+     detailed variants — `callDetailed`, `callTx`, `estimateGasDetailed`, `estimateGasTx`,
+     `sendRawTransactionDetailed`, `createAccessList` — return a flat result record with a
+     `Status` enum instead);
   2. verification queries return flat records with `failReason`/`error` strings;
   3. only programmer/state errors throw — one type, `EngineException`, which UniFFI
      models as a single flat `Error` enum.
@@ -38,8 +41,9 @@
 > (`rust/testdata/networks_catalog.json` ⇄ `catalog::tests` ⇄ `NetworksJsonGoldenTest`),
 > so the "cargo strictly optional" requirement holds for the JVM hosts: the committed
 > bindings need no bindgen step, and UniFFI's per-function checksums replace the old
-> hand-rolled ABI probe. The non-JVM hosts — the iOS app (`:app-ios`, Kotlin/Native
-> cinterop) and the Node.js addon (`rust/myotis-node`, napi-rs) — consume the same
+> hand-rolled ABI probe as the stale-library guard (`RustEngineNative` keeps the coarse
+> `ABI_VERSION` handshake as a second check). The non-JVM hosts — the iOS app (`:app-ios`,
+> Kotlin/Native cinterop) and the Node.js addon (`rust/myotis-node`, napi-rs) — consume the same
 > engine over its plain C ABI (`rust/myotis-engine/src/capi.rs`,
 > `rust/include/myotis_engine.h`), gated on the header's `MYOTIS_ABI_VERSION`. The
 > typed-record UniFFI mapping below remains the reference path if the JSON transport
@@ -49,7 +53,8 @@
 > shared BLS fixture files, and `rust/testdata/lc/mainnet/` holds a live-captured
 > light-client corpus (bootstrap → 18-update catch-up chain → finality, plus
 > negatives) whose verdicts `expected.txt` records — replayed and asserted by the
-> Java `LcVectorConformanceTest`, to be reproduced by the Rust LC (PRs 4–6). Capture
+> Java `LcVectorConformanceTest` and reproduced by the Rust LC
+> (`rust/myotis-consensus/tests/lc_conformance.rs`). Capture
 > tooling: `./gradlew :app:run -Plcdump=<dir>`; regenerate verdicts with
 > `-Dmyotis.lc.writeExpected=true`.
 
@@ -59,9 +64,10 @@
 |---|---|---|
 | `MyotisEngine` | `interface` (object) | `struct RustEngine` behind `Arc`, constructor exported as the factory the host names once |
 | `ChainHandle` | `interface` (object) | per-network handle owning the tokio runtime pieces |
-| `EngineConfig`, `NetworkInfo`, `StatusSnapshot`, `BeaconStatus`, `PeerInfo`, `ConnectedPeer`, `DiscoveredPeer`, `ClPeerInfo`, `AccountProofResult`, `StorageProofResult`, `HeaderInfo`, `HeadersResult`, `BlockResult`, `DialResult`, `EnsResolutionResult` + the `Ens*Result` family, `ports.CachedPeerInfo`, `ports.ServedRange`, `ports.BootstrapPeer` | `dictionary` | plain `struct`s (all fields by value) |
-| `SyncState`, `BeaconState`, `EnsRoot`, `ports.SnapQuality`, `ports.HttpGateway.Method` | `enum` | fieldless enums |
+| `EngineConfig`, `NetworkInfo`, `StatusSnapshot`, `BeaconStatus`, `PeerInfo`, `ConnectedPeer`, `DiscoveredPeer`, `ClPeerInfo`, `AccountProofResult`, `StorageProofResult`, `HeaderInfo`, `HeadersResult`, `BlockResult`, `DialResult`, `EnsResolutionResult` + the `Ens*Result` family, `CallResult`, `EstimateResult`, `SendResult`, `AccessListResult`, `TransactionArgs`, `UpgradeAdvisory`, `WebAccessPolicy`, `WebOrigin`, `ports.CachedPeerInfo`, `ports.ServedRange`, `ports.BootstrapPeer` | `dictionary` | plain `struct`s (all fields by value) |
+| `SyncState`, `BeaconState`, `EnsRoot`, `LifecycleState`, `UpgradePhase`, `WebAccessMode`, the result records' `Status` enums, `ports.SnapQuality`, `ports.HttpGateway.Method` | `enum` | fieldless enums |
 | `VerifiedReads`, `EnsApi` | `interface` (object returned by the handle) | sub-objects borrowing the handle's internals |
+| `NodeStatusReads`, `NodeLifecycle` (narrow seams the JSON-RPC server consumes; implemented per network, by the handle or its stack) | `interface` (object) | traits on the per-network handle |
 | `ports.NodeKeyStore`, `ports.EnginePeerCache`, `ports.EngineClPeerCache`, `ports.DnsServers`, `ports.HttpGateway`, `ports.EngineLogger`, `ports.EngineClock` | **callback interface** (foreign trait) | `Box<dyn Trait + Send + Sync>` handed into the engine at `create()` |
 | `EngineException` | `[Error]` enum (single `Message(String)` variant) | `thiserror` enum |
 | `EnginePorts` (the bundle record) | `dictionary` of callback-interface handles | struct of trait objects |
@@ -92,6 +98,15 @@ makes the blocking call on the thread that called the `EnsApi` and re-enters via
 - **Desktop**: use the crate directly from the JVM via JNI/UniFFI-Kotlin, or ship the
   Rust daemon binary with the same UDS JSON-lines IPC.
 
+> *As built:* Android bundles `libmyotis_engine.so` (arm64-v8a, x86_64 — `cargoNdkAndroid` /
+> `rust/build-android.sh`) straight into the APK's jniLibs, no `.aar`; the UniFFI Kotlin is
+> committed in `:myotis-engines`, whose `RustMyotisEngine` is the adapter onto `io.myotis.api`.
+> iOS took the plain C ABI instead of UniFFI Swift: `:app-ios` (Kotlin/Native cinterop; the
+> `MyotisKit` framework absorbs `libmyotis_engine.a`) for the app, and
+> `rust/build-xcframework.sh` (`MyotisEngine.xcframework`) for Swift hosts. Desktop loads the
+> library through the same UniFFI Kotlin over JNA; the standalone Rust daemon,
+> `rust/myotis-rpcd`, serves JSON-RPC over HTTP rather than the UDS IPC.
+
 **No Java→Kotlin conversion debt exists**: everything currently Java is either the
 engine (replaced by Rust), a platform-specific host shell (stays on its platform), or a
 port implementation (rewritten natively per platform by design).
@@ -114,6 +129,16 @@ a single `dataDir` string in `EngineConfig`:
 `NodeKeyStore` should stay a port (key custody is a genuine platform concern —
 Keychain/keystore vs files), as should `HttpGateway` (TLS stacks are platform-owned)
 and `DnsServers` (mobile resolver quirk).
+
+> *Status (as built):* half of this landed. `EngineConfig` gained `dataDir`, and the Rust
+> engine owns its persistence there — `sync-state`, `cl-peers` and `peers` files in the Java
+> formats, plus its log index (`rust/myotis-engine/src/host.rs`) — ignoring the two cache
+> ports. The ports were not removed: they remain on `EnginePorts` for the Java engine. The
+> Rust engine also ignores `NodeKeyStore` (a fresh node key per start) and the logger/clock;
+> `HttpGateway` is driven by the host's `CcipDriver`, and a supplied `DnsServers` only turns its
+> DNS discovery off (it has no engine-side server-IP path yet). No engine-side cache clear
+> exists: `clearPeerState()` resets the Java engine's live dial state (a no-op on the Rust
+> engine), and hosts delete the cache files themselves.
 
 ## 5. Conformance checklist for a replacement engine
 

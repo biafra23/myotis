@@ -182,10 +182,11 @@ Rust engine's number exactly.
 `EvmExecutor.estimateGas(UnsignedTransaction tx, BlockContext ctx)` —
 already declared in Phase 0 as a default-throwing method. Phase 5
 overrides it in `DefaultEvmExecutor` with the real implementation.
-`PrefetchingEvmExecutor` and `CcipReadEvmExecutor` inherit the default
-unless they want to wrap (Phase 5.1: have the prefetcher run estimation
-inside the convergence loop too, so the access list is warmed before
-the run at the ceiling; defer until benchmark numbers say it matters).
+`PrefetchingEvmExecutor` and `CcipReadEvmExecutor` override it to pass the
+call straight through to their delegate (Phase 5.1: have the prefetcher
+run estimation inside the convergence loop too, so the access list is
+warmed before the run at the ceiling; defer until benchmark numbers say it
+matters).
 
 ### Wallet integration
 
@@ -194,6 +195,11 @@ The plan calls for `myotis-tx-builder` to switch from fixed limits to
 daemon CLI but not a transaction builder. The integration point is
 deferred to whenever the wallet team adds the tx-builder module; this
 phase ships the `estimateGas` API ready for it.
+
+**Status:** no `myotis-tx-builder` module was added. Wallets reach the
+estimate through the node's JSON-RPC `eth_estimateGas` (`jsonrpc-server`'s
+`RpcRouter`; on the Java engine, `VerifiedRpcBackend.estimateGasTx` in
+`rpc-backend`).
 
 ## What shipped
 
