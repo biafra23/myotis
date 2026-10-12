@@ -14,8 +14,14 @@ import java.util.List;
  * @param storageKeyHex         the actual storage key queried (0x-hex; for a holder,
  *                              keccak256(holder ‖ slot))
  * @param storageKeyHashHex     keccak256(storageKey) — the snap trie key
- * @param exists                whether the slot was present in the peer's response
- * @param valueHex              slot value (0x-hex), or null when {@code !exists}
+ * @param exists                the storage proof shows the slot holding a non-zero value.
+ *                              A zero slot is pruned from the trie, so a proven-absent slot
+ *                              reads {@code exists=false} with {@code storageProofValid=true}
+ *                              — the Rust engine's {@code found}. When the proof fails,
+ *                              {@code exists=false} with {@code storageProofValid=false}:
+ *                              nothing was proven, and {@code failReason} says so
+ * @param valueHex              the PROVEN slot value (0x-hex) — never the peer's slot list —
+ *                              or null when {@code !exists}
  * @param valueDecimal          slot value as a decimal string, or null
  * @param slotsReturned         slots the peer returned (diagnostic when {@code !exists})
  * @param storageRootHex        the account's proof-verified storage root

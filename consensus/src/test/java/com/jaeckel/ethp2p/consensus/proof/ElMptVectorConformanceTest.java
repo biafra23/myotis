@@ -123,9 +123,9 @@ class ElMptVectorConformanceTest {
                         });
                     }
                     if (base.contains("storage-leaf")) {
-                        Bytes slot = RLP.decodeValue(found.value());
+                        // The production decoder, pinned against the Rust decode_storage_leaf.
                         actual.put(k + ".storage.value",
-                                slot.isEmpty() ? "0" : new BigInteger(1, slot.toArrayUnsafe()).toString(16));
+                                MerklePatriciaProofVerifier.storageInteger(found.value()).toString(16));
                     }
                 } else if (r instanceof Result.Absent) {
                     actual.put(k + ".result", "absent");
