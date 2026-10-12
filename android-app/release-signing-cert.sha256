@@ -1,0 +1,5 @@
+# SHA-256 of the Myotis release-signing certificate (alias myotis-release,
+# CN=Myotis, RSA 4096), lowercase and without colons — the form
+# `apksigner verify --print-certs` prints, so a download can be checked by eye.
+# The sign-release job refuses any signer but this one (docs/android-release-signing.md).
+45d4fbe95a9c823ced282a903bf7f2c2fc6368b8f2b1397425c06a7124630485
