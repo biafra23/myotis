@@ -234,6 +234,45 @@ jobs:
           }
           Write-Output "OK: x64 msi $version carries an x64 launcher, JVM, Rust engine and JNA stub, and no PoC seed"
 
+          # The bundled engine must pass the integrity checks the committed UniFFI
+          # bindings run when they load it (myotis-engines' myotis_engine.kt): the
+          # contract version and every API checksum. A mismatch makes the app fall
+          # back to the Java engine silently, and the dmg/deb legs never load the
+          # library at all. Each checksum is read the way the bindings read it (a
+          # 32-bit return) and compared on its low 16 bits, as the bindings do since
+          # uniffiGenerateKotlin masks them: the upper bits are not part of a u16
+          # return and are not zero on every build.
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class UniffiProbe {
+              [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate uint Fn();
+              public static uint Call(IntPtr lib, string name) {
+                  return Marshal.GetDelegateForFunctionPointer<Fn>(NativeLibrary.GetExport(lib, name))();
+              }
+          }
+          '@
+          $dll = (Get-ChildItem -Path $ex -Recurse -File -Filter 'myotis_engine.dll')[0].FullName
+          $lib = [System.Runtime.InteropServices.NativeLibrary]::Load($dll)
+          $kt = Get-Content -Raw 'myotis-engines/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt'
+          $contract = [regex]::Match($kt, 'val bindings_contract_version = (\d+)').Groups[1].Value
+          $got = [UniffiProbe]::Call($lib, 'ffi_myotis_engine_uniffi_contract_version')
+          Write-Output "UniFFI contract version: bindings $contract, engine $got"
+          $checks = [regex]::Matches($kt, 'lib\.(uniffi_myotis_engine_checksum_\w+)\(\) and 0xFFFF\) != (\d+)\)')
+          if ($checks.Count -eq 0) { Fail 'found no masked UniFFI checksum checks in the committed bindings' }
+          $bad = 0
+          foreach ($c in $checks) {
+            $raw = [UniffiProbe]::Call($lib, $c.Groups[1].Value)
+            if (($raw -band 0xFFFF) -ne [uint32]$c.Groups[2].Value) {
+              $bad++
+              Write-Output ("checksum mismatch {0}: bindings {1}, engine 0x{2:X8} (low 16 bits {3})" -f $c.Groups[1].Value, $c.Groups[2].Value, $raw, ($raw -band 0xFFFF))
+            }
+          }
+          if ("$got" -ne $contract -or $bad -gt 0) {
+            Fail "the bundled engine fails the committed bindings' UniFFI checks ($bad of $($checks.Count) checksums differ; contract $got vs $contract)"
+          }
+          Write-Output "OK: the bundled engine passes the bindings' UniFFI contract check and all $($checks.Count) checksums"
+
       # Install the msi the way a user would (per user, no admin prompt), start
       # the installed app and require, from its own log and its own RPC port,
       # that it loaded the bundled Rust engine and serves JSON-RPC; then that it

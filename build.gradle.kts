@@ -573,10 +573,33 @@ tasks.register<Exec>("uniffiGenerateKotlin") {
     )
     inputs.files(rustSources).withPathSensitivity(PathSensitivity.RELATIVE)
     inputs.property("cargoVersion", cargoVersion)
-    outputs.files(
-        project(":myotis-engines").projectDir
-            .resolve("src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt")
-    )
+    val bindingsFile = project(":myotis-engines").projectDir
+        .resolve("src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt")
+    outputs.files(bindingsFile)
+    // UniFFI 0.32's Kotlin generator reads each u16 API checksum through a 32-bit
+    // `Int` (JNA direct mapping) and compares it UNMASKED, so the integrity check
+    // passes only while the native side happens to leave the upper 16 bits zero —
+    // which the x86-64 ABIs do not promise. A debug Linux build returns 0x5DB5166E
+    // for checksum 5742 (0x166E), and the Windows msi's engine failed every check,
+    // so the app fell back to the Java engine (desktop-windows-msi.yml). The checksum
+    // is the low 16 bits, so compare those. Applied here, at generation, because the
+    // APK workflow regenerates the committed file and fails on any drift. Fail-loud:
+    // a UniFFI upgrade that changes this output shape must be looked at, not skipped.
+    doLast {
+        val unmasked = Regex("""if \(lib\.(\w+_checksum_\w+)\(\) != (\d+)\)""")
+        val text = bindingsFile.readText()
+        val count = unmasked.findAll(text).count()
+        check(count > 0) {
+            "uniffiGenerateKotlin: no unmasked checksum comparisons in $bindingsFile — " +
+                "UniFFI's output changed; check whether it still reads u16 checksums as Int"
+        }
+        bindingsFile.writeText(
+            unmasked.replace(text) { m ->
+                "if ((lib.${m.groupValues[1]}() and 0xFFFF) != ${m.groupValues[2]})"
+            }
+        )
+        logger.lifecycle("uniffiGenerateKotlin: masked $count checksum comparisons to 16 bits")
+    }
 }
 
 val cargoTest = tasks.register<Exec>("cargoTest") {
