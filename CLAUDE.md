@@ -335,7 +335,8 @@ the post-merge run on `main`.
 When the user asks for a release (a `v*` tag, a version bump, "cut a release"),
 **ask these three questions first and act only on what they choose** (owner
 rulings, 2026-09-02 and 2026-09-11), then **move the version pins — step 4
-below, mandatory, never asked about** (owner ruling, 2026-09-24). Everything a
+below, mandatory, never asked about** (owner ruling, 2026-09-24) — and
+**refresh the PoC seeds, step 5, mandatory too** (2026-10-13). Everything a
 release needs goes into ONE release PR. **The tag is the owner's action**: after
 the merge the owner pushes it, or explicitly asks for it to be pushed — never
 push a `v*` tag on your own initiative, it is the publish trigger for every
@@ -499,6 +500,32 @@ asset workflow and a stronger action than the merge this file already forbids.
    that slipped past both would ship a Rust engine whose devp2p and libp2p agent
    strings advertise the previous release. The macOS dmg version is derived
    (major + 1) and needs no edit.
+
+5. **Refresh the PoC log-index seeds. MANDATORY — not a question, and part of
+   the SAME release PR** (owner's request, 2026-10-13). Each seed is usable for
+   500,000 blocks above its top (`MAX_GAP`): ~29 days on Gnosis, ~69 on mainnet
+   and Sepolia. A release built on an older one ships a PoC that starts far
+   behind and, past the limit, never catches up: before this step, a Bee PoC
+   build started ~365,000 blocks behind. One command, on zbox, when the release
+   PR is otherwise ready (the shelf life runs from the fetch):
+
+   ```bash
+   scripts/refresh_poc_seeds.py
+   ```
+
+   It tops up all three incrementally — only the blocks above each seed's top,
+   fetched from zbox's geths to `finalized` and appended — and checks each
+   result frames the way the build frames it. The **Bee** seed is rewritten in
+   `data/bee/gnosis/`: commit it in the release PR. The two **RAILGUN** seeds
+   are published straight to the `railgun-seed` release (a safe swap; the old
+   asset stays until the new one is verified), which the tag's `railgun-dmg`
+   build downloads, so they are done before the tag with nothing to commit.
+   Why not a workflow: zbox's nodes are the seeds' only source, and no GitHub
+   runner can reach them. The reminder is one: on a PR that changes the root
+   `version`, the `PoC seeds` check (`poc-seeds.yml`) stays red until every
+   seed was fetched within 72 hours — re-run it by hand after the RAILGUN
+   publish, which makes no commit. Details: docs/railgun-poc.md (*Refreshing the seed*),
+   docs/bee-rpc-service.md (*seeding from a full node*).
 
 ## Demo bundles build on merge to `main`, never on PRs
 

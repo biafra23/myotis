@@ -1,0 +1,70 @@
+# The release PR's reminder to refresh the PoC log-index seeds (CLAUDE.md,
+# Releases, step 5; owner's request, 2026-10-13).
+#
+# A seed stops catching up 500,000 blocks above its top — ~29 days on Gnosis,
+# ~69 on mainnet and Sepolia — and nothing about a release otherwise shows how
+# old the seeds it bundles are: v0.1.15 shipped a Bee PoC whose seed was four
+# weeks old and ~480,000 blocks behind. So on a RELEASE PR, one that changes the
+# root `version`, this check is red until every seed was fetched within the last
+# 72 hours: the Bee seed by its committed meta's `fetchedAtUtc`, the two RAILGUN
+# seeds by when their archives were uploaded to the `railgun-seed` release. Any
+# other PR passes it without looking.
+#
+# The fix is one command on zbox, `scripts/refresh_poc_seeds.py`, whose nodes
+# are the seeds' only source. Its Bee half is a commit in the release PR, which
+# re-runs this check; its RAILGUN half goes to the release with no commit, so
+# re-run the check by hand after it. Read-only: no node, no secret beyond the
+# default token reading a public release.
+name: PoC seeds
+
+on:
+  # Unscoped base, like the other PR workflows. For a pull_request, the paths
+  # filter is evaluated against the whole PR diff, so a release PR — which always
+  # changes build.gradle.kts — runs it on every push.
+  pull_request:
+    paths:
+      - "build.gradle.kts"
+      - "data/bee/gnosis/**"
+      - "scripts/refresh_poc_seeds.py"
+      - ".github/workflows/poc-seeds.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fresh:
+    name: PoC seeds refreshed for this release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Is this a release PR?
+        id: release
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -eu
+          version() { sed -nE 's/^[[:space:]]*version = "([^"]+)".*/\1/p' | head -n1; }
+          git fetch --quiet --depth=1 origin "$BASE_REF"
+          base=$(git show FETCH_HEAD:build.gradle.kts | version)
+          head=$(version < build.gradle.kts)
+          [ -n "$base" ] && [ -n "$head" ] \
+            || { echo "::error::cannot read the root version (base '$base', head '$head')"; exit 1; }
+          if [ "$base" = "$head" ]; then
+            echo "version $head unchanged: not a release PR, nothing to check"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "version $base -> $head: a release PR"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Seeds fetched within 72 hours
+        if: steps.release.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: python3 scripts/refresh_poc_seeds.py --check-fresh 72 --github-repo "$REPO"

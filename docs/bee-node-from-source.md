@@ -84,9 +84,10 @@ and Bee gives you ten minutes. So a Bee-ready Myotis needs three extra things:
    in the background while the walk runs (section 5; the PoC app ships with
    it paused) — which fills holes and overwrites what it
    finds, but cannot remove a log the seed invented. The committed data set is
-   `data/bee/gnosis/postagestamp-logs-47000000-48262804.jsonl.gz` (+ its
-   `.meta.json`): ~39k logs, blocks 47,000,000–48,262,804, fetched
-   2026-09-15 from a geth full node.
+   `data/bee/gnosis/postagestamp-logs-47000000-<top>.jsonl.gz` (+ its
+   `.meta.json`, which names the range and log count): blocks from
+   47,000,000 up, fetched from a geth full node and topped up to that node's
+   finalized block for every release (docs/bee-rpc-service.md).
 3. **Warm peer caches**, because a cold peer pool on Gnosis can starve the
    head-following machinery for long enough to trip Bee's 10-minute rule
    (`data/bee/gnosis/peers-gnosis.cache`, `cl-peers-gnosis.cache`: public
@@ -171,8 +172,8 @@ own full node as the seed source.
 ```bash
 # 1. synthesize a seed from the committed data set (or your own, see below)
 python3 scripts/synth_logindex.py \
-  --meta data/bee/gnosis/postagestamp-logs-47000000-48262804.meta.json \
-  --logs data/bee/gnosis/postagestamp-logs-47000000-48262804.jsonl.gz \
+  --meta data/bee/gnosis/postagestamp-logs-47000000-*.meta.json \
+  --logs data/bee/gnosis/postagestamp-logs-47000000-*.jsonl.gz \
   --watch 0x45a1502382541Cd610CC9068e88727426b696293:31305656 \
   --out /tmp/bee-logindex-gnosis-seed.db
 

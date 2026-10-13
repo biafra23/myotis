@@ -282,28 +282,44 @@ dmg is roughly 110 MB larger than the standard one for them.
 
 ### Refreshing the seed
 
-Each seed's shelf life is ~69 days (500,000 blocks, `MAX_GAP`). To refresh one,
-run its fetch again (*Building the seed* above), then replace both of its assets
-and rebuild. Fetch into a **fresh directory** rather than over the previous one:
-the old meta would otherwise sit beside the new one, which the build refuses, and
-the old fetch is what you roll back to.
+Each seed's shelf life is ~69 days (500,000 blocks, `MAX_GAP`), and **every
+release refreshes both** (CLAUDE.md, *Releases*, step 5), on zbox, whose geths
+are the seeds' source:
 
 ```bash
-# mainnet
-cd "$SEED" && tar -czf railgun-seed.tar.gz railgun-logs.jsonl railgun-logs-*.meta.json
-sha256sum railgun-seed.tar.gz > railgun-seed.tar.gz.sha256
-gh release upload railgun-seed railgun-seed.tar.gz railgun-seed.tar.gz.sha256 --clobber
-# Sepolia: the same, as railgun-seed-sepolia.tar.gz and its .sha256
-gh workflow run railgun-dmg.yml
+scripts/refresh_poc_seeds.py                          # both, plus the Bee PoC's seed
+scripts/refresh_poc_seeds.py --seed railgun-mainnet   # one
+scripts/refresh_poc_seeds.py --no-publish             # everything but the upload
+gh workflow run railgun-dmg.yml                       # refresh main's artifact too
 ```
 
-`--clobber` deletes each old asset before its replacement finishes uploading, so a
-build that fetches in between fails. Over a slow link, upload under a temporary
-name, then delete the old asset and rename the new one
-(`gh api -X PATCH repos/<owner>/<repo>/releases/assets/<id> -f name=…`).
+The refresh is incremental. It starts from the **published** archive — a local
+copy under `~/myotis-node/poc-seeds/<seed>/` when its sha256 matches GitHub's
+digest of the asset, a download otherwise — and fetches only the blocks between
+its top and the node's `finalized` block: 16 seconds for twelve days of mainnet
+(2026-10-13), where the full fetch takes 36 minutes. Finalized history cannot
+change, so the old logs are kept as they are and the new ones appended; before
+it does, the node must agree with the seed's top block hash, i.e. be on the
+chain the seed was fetched from. The result is framed with the build's own
+arguments and checked to claim exactly the combined range and log count.
 
-The archive may hold the files flat or under a directory; the build locates the
-`*.meta.json` inside it either way, and refuses an archive holding more than one.
+Then it uploads each archive and its sidecar under a temporary `.new` name,
+checks both against GitHub's own digest of what arrived, and only then deletes
+the old asset and renames the new one. A plain `--clobber` would delete the old
+asset first, and over zbox's slow uplink the release would lack an archive for
+minutes, failing every build that started meanwhile. The archive and its
+sidecar still swap one after the other, so a run that dies between the two
+leaves a mismatched pair and every build red. Each run therefore first checks
+that the published sidecar names the published archive's digest and finishes
+the swap if it does not, even when there are no new blocks to publish. The range line in the
+release body is rewritten to match. The archive it replaced stays in
+`~/myotis-node/poc-seeds/<seed>/previous/` until the next run, as the rollback.
+
+To fetch a seed from scratch instead, follow *Building the seed* above into a
+**fresh directory** (the old meta would otherwise sit beside the new one, which
+the build refuses), then pack it the same way: the archive holds
+`railgun-logs.jsonl` and its one `*.meta.json`, flat or under a directory; the
+build locates the meta either way and refuses an archive holding more than one.
 
 ### Overrides
 
