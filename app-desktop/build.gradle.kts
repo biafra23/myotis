@@ -320,8 +320,10 @@ val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
     group = "build"
     description = "Synthesize the Bee PoC Gnosis log-index seed from data/bee/gnosis and stage it, with the warm peer caches, into Compose appResources (-PbeePoc only)"
     onlyIf { beePoc }
-    val meta = rootProject.file("data/bee/gnosis/postagestamp-logs-47000000-48262804.meta.json")
-    val logs = rootProject.file("data/bee/gnosis/postagestamp-logs-47000000-48262804.jsonl.gz")
+    // The fetch is found by shape, not by a pinned name: the range is in the name, and
+    // every release's scripts/refresh_poc_seeds.py run replaces the pair with a longer one.
+    val dataDir = rootProject.file("data/bee/gnosis")
+    val fetch = fileTree(dataDir) { include("*.meta.json", "*.jsonl.gz") }
     val script = rootProject.file("scripts/synth_logindex.py")
     val seed = pocSeedDir.map { it.file("logindex-gnosis.db") }
     val manifest = pocSeedDir.map { it.file("bee-poc-seed.properties") }
@@ -331,13 +333,22 @@ val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
     // index stopped following the head and Bee's stall rule shut it down.
     val peerCaches = listOf("peers-gnosis.cache", "cl-peers-gnosis.cache")
     val cacheSources = peerCaches.map { rootProject.file("data/bee/gnosis/$it") }
-    inputs.files(meta, logs, script, cacheSources)
+    inputs.files(fetch, script, cacheSources)
     // Same reason as the RAILGUN task: the watch assertion is not a file and the
     // build script is not a task input, so without this a corrected deployment block
     // would leave the task UP-TO-DATE and ship the previous frame.
     inputs.property("watch", beePocWatch)
     outputs.files(seed, manifest, peerCaches.map { n -> pocSeedDir.map { it.file(n) } })
     doLast {
+        // Two pairs would be ambiguous (a refresh interrupted between writing the new pair
+        // and removing the old one leaves exactly that), so refuse rather than guess.
+        val metas = dataDir.listFiles { f: File -> f.name.endsWith(".meta.json") }?.sorted().orEmpty()
+        check(metas.size == 1) {
+            "bee-poc: expected exactly one *.meta.json in $dataDir, found ${metas.size} ${metas.map { it.name }}"
+        }
+        val meta = metas.single()
+        val logs = dataDir.resolve(meta.name.removeSuffix(".meta.json") + ".jsonl.gz")
+        check(logs.isFile) { "bee-poc: no ${logs.name} beside $meta" }
         pocSeedDir.get().asFile.mkdirs()
         cacheSources.forEach { src ->
             check(src.isFile && src.length() > 0) { "bee-poc: warm peer cache missing or empty: $src" }

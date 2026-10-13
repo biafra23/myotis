@@ -211,9 +211,10 @@ script checks against (chain id, genesis, address, range, sha256 — see the
 committed example), then frame and import:
 
 ```bash
+# the committed pair is named for its range, which every refresh moves
 scripts/synth_logindex.py \
-    --meta data/bee/gnosis/postagestamp-logs-47000000-48262804.meta.json \
-    --logs data/bee/gnosis/postagestamp-logs-47000000-48262804.jsonl.gz \
+    --meta data/bee/gnosis/postagestamp-logs-47000000-*.meta.json \
+    --logs data/bee/gnosis/postagestamp-logs-47000000-*.jsonl.gz \
     --watch 0x45a1502382541Cd610CC9068e88727426b696293:31305656 \
     --out /tmp/bee-logindex-gnosis-seed.db
 ./gradlew :app:run -Pnetwork=gnosis -Pargs="import-logindex /tmp/bee-logindex-gnosis-seed.db"
@@ -237,8 +238,9 @@ What the frame claims, and what stays honest:
   at most that much above a file's top (`MAX_GAP`, el/reader.rs); a seed
   older than that imports fine and then never catches up, and Bee's pages
   above it stay `-32000` until its 10-minute stall timeout stops it. The
-  committed data set tops out at 48,262,804, i.e. it is usable until about
-  block 48,762,804 (~2026-10-14); after that, re-fetch.
+  committed data set is usable until its meta's `toBlock` + 500,000 (minus
+  the 128-block margin the build frames with); every release refreshes it
+  (below).
 - **Fresh index, or re-seed from the same low.** `LogIndex::merge` clamps
   coverage to the lowest high among the sources and drops a span that does
   not reach it: importing the seed into an index whose own coverage tops out
@@ -247,10 +249,20 @@ What the frame claims, and what stays honest:
   top.
 - The seed is one address, not the four-contract index above.
 
-The committed data set (`data/bee/gnosis/`, 2026-09-15, zbox's Gnosis geth,
-47,000,000–48,262,804, 39,225 logs, 3.2 MB gzipped) is a one-off demo
-artifact. Do not refresh it in git — the rule in the next section applies to
-any recurring data set.
+The committed data set (`data/bee/gnosis/`, zbox's Gnosis geth, from
+47,000,000 to the `toBlock` its `.meta.json` names) is a demo artefact that
+**every release refreshes**, with `scripts/refresh_poc_seeds.py` on zbox
+(CLAUDE.md, *Releases*, step 5). Before that it was a one-off fetch (2026-09-15),
+and by October a Bee PoC build started ~365,000 blocks behind the head, three
+quarters of the way to the bridge's limit. The refresh is
+incremental: it fetches only the blocks above the seed's top and appends their
+logs to the `.jsonl.gz` as one more gzip **member**. Every byte already
+committed stays as it is, so git stores each refresh as a delta about the size
+of its new logs (measured: a 3.2 MB seed plus a 0.95 MB member packs to
+4.0 MiB, the same as the two parts), rather than as another full copy of a file
+that only grows. The low edge never moves, so the merge rule above holds for
+every refresh. The pair is renamed for its new range; the build finds it by
+shape and refuses a directory holding two.
 
 ## Pausing the backfill
 
