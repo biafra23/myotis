@@ -24,4 +24,6 @@ clap = { version = "4", default-features = false, features = ["std", "derive", "
 # verified head), so a fixed worker pool over a synchronous server is the whole
 # design — see main.rs. No async stack is linked for it.
 tiny_http = "0.12"
+# The `iterator` module exists only off Windows; main.rs waits on it under
+# cfg(unix) and polls `signal_hook::flag` on Windows, which needs no feature.
 signal-hook = { version = "0.4", default-features = false, features = ["iterator"] }

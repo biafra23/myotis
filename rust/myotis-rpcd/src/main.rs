@@ -24,7 +24,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use myotis_engine::ffi;
-use signal_hook::consts::{SIGINT, SIGTERM};
 
 use engine::FfiEngine;
 use rpc::Router;
@@ -304,9 +303,7 @@ fn run(args: Args) -> Result<(), String> {
     // Graceful stop: stop accepting, shut the engine handle down (it persists
     // its sync state), flush the log ring. Workers still blocked in an engine
     // read are not waited for; the handle they hold is gone.
-    let mut signals =
-        signal_hook::iterator::Signals::new([SIGINT, SIGTERM]).map_err(|e| e.to_string())?;
-    if let Some(sig) = signals.forever().next() {
+    if let Some(sig) = wait_for_stop_signal()? {
         eprintln!("myotis-rpcd: signal {sig}, stopping");
     }
     for _ in 0..receivers {
@@ -316,6 +313,38 @@ fn run(args: Args) -> Result<(), String> {
     stopping.store(true, Ordering::SeqCst);
     print_engine_logs();
     Ok(())
+}
+
+/// Block until a stop is requested; the signal's number (`None`: the
+/// iterator closed without one). Unix: SIGINT or SIGTERM, through
+/// signal-hook's self-pipe iterator.
+#[cfg(unix)]
+fn wait_for_stop_signal() -> Result<Option<i32>, String> {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    let mut signals =
+        signal_hook::iterator::Signals::new([SIGINT, SIGTERM]).map_err(|e| e.to_string())?;
+    Ok(signals.forever().next())
+}
+
+/// Windows has no signal iterator (signal-hook builds it only off Windows):
+/// the C runtime raises SIGINT for Ctrl-C and SIGBREAK for Ctrl-Break, and
+/// SIGTERM can be raised in-process, so each records its number in a flag the
+/// main thread polls. Shutdown is no more prompt than that needs to be.
+#[cfg(windows)]
+fn wait_for_stop_signal() -> Result<Option<i32>, String> {
+    use signal_hook::consts::{SIGBREAK, SIGINT, SIGTERM};
+    use std::sync::atomic::AtomicUsize;
+    let caught = Arc::new(AtomicUsize::new(0));
+    for sig in [SIGINT, SIGTERM, SIGBREAK] {
+        signal_hook::flag::register_usize(sig, caught.clone(), sig as usize)
+            .map_err(|e| e.to_string())?;
+    }
+    loop {
+        match caught.load(Ordering::SeqCst) {
+            0 => std::thread::sleep(Duration::from_millis(100)),
+            sig => return Ok(Some(sig as i32)),
+        }
+    }
 }
 
 /// Stops a created engine handle when dropped.

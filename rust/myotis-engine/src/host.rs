@@ -3518,15 +3518,24 @@ mod tests {
         let marker = dir.join("sync-anchor.json");
         assert!(marker.is_file(), "the anchor marker must be written on first use");
         assert_eq!(read_anchor_marker(&marker), Ok(Some((parse_hex_fixed::<32>(root).unwrap(), slot))));
-        {
+        // Copied out so the asserts run with the map lock released: a failure
+        // under it would poison the shared engine for every later test.
+        let (cfg_root, cfg_slot, cfg_snapshot) = {
             let map = engine().unwrap().handles.lock().unwrap();
-            let ChainEntry::Created(cfg) = map.get(&id).expect("handle registered") else {
-                panic!("fresh handle must be Created");
+            let Some(ChainEntry::Created(cfg)) = map.get(&id) else {
+                drop(map);
+                panic!("fresh handle must be registered as Created");
             };
-            assert_eq!(cfg.checkpoint_root, parse_hex_fixed::<32>(root).unwrap());
-            assert_eq!(cfg.checkpoint_slot, slot);
-            assert_eq!(cfg.snapshot_path.as_deref(), Some(dir.join("sync-state.snapshot").as_path()));
-        }
+            (cfg.checkpoint_root, cfg.checkpoint_slot, cfg.snapshot_path.clone())
+        };
+        assert_eq!(cfg_root, parse_hex_fixed::<32>(root).unwrap());
+        assert_eq!(cfg_slot, slot);
+        // The engine binds the directory's canonical path (`bind_persistence`
+        // comment: identity, not spelling), which differs from temp_dir()'s
+        // spelling on Windows (`\\?\` prefix, 8.3 short names) and macOS
+        // (/var → /private/var).
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        assert_eq!(cfg_snapshot, Some(canonical.join("sync-state.snapshot")));
         // While that handle is alive the directory is in use: a second binding —
         // even the same anchor — is refused before any marker work.
         assert_eq!(create_with_checkpoint("mainnet", d, root, slot), CREATE_FAILED);
