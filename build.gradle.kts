@@ -530,15 +530,6 @@ tasks.register<Exec>("cargoBuildHost") {
     commandLine(
         buildList {
             addAll(listOf(rustTool("cargo"), "build", "--release", "--workspace"))
-            // myotis-rpcd (the standalone daemon) waits for SIGINT/SIGTERM through
-            // signal_hook::iterator, which does not exist on Windows, so it cannot
-            // build for a Windows target. No JVM host or package needs it (they load
-            // the engine and BLS libraries), so for Windows the rest of the workspace
-            // builds without it; the Windows msi (desktop-windows-msi.yml) depends on
-            // that. Keyed on the TARGET, which is the host unless -PrustTarget says.
-            if (rustTargetTriple?.contains("windows") ?: isWindowsHost) {
-                addAll(listOf("--exclude", "myotis-rpcd"))
-            }
             // Enable Tor only on the engine crate (package/feature form — a bare
             // `--features tor` with `--workspace` would try every member).
             if (torEngine) addAll(listOf("--features", "myotis-engine/tor"))
