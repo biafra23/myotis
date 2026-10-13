@@ -262,7 +262,7 @@ val prepareJnaBootLib = tasks.register("prepareJnaBootLib") {
     val (entry, stagedName) = when (osPart) {
         "macos" -> (if (daemonArm) "com/sun/jna/darwin-aarch64/libjnidispatch.jnilib" else "com/sun/jna/darwin-x86-64/libjnidispatch.jnilib") to "libjnidispatch.dylib"
         "linux" -> (if (daemonArm) "com/sun/jna/linux-aarch64/libjnidispatch.so" else "com/sun/jna/linux-x86-64/libjnidispatch.so") to "libjnidispatch.so"
-        "windows" -> "com/sun/jna/win32-x86-64/jnidispatch.dll" to "jnidispatch.dll"
+        "windows" -> (if (daemonArm) "com/sun/jna/win32-aarch64/jnidispatch.dll" else "com/sun/jna/win32-x86-64/jnidispatch.dll") to "jnidispatch.dll"
         else -> error("no JNA native stub mapping for $composeOsArchDir")
     }
     val staged = destDir.map { it.file(stagedName) }
@@ -645,14 +645,15 @@ compose.desktop {
             // The staged Rust engine lib (see prepareRustAppResources above).
             appResourcesRootDir.set(rustAppResourcesRoot)
             // jpackage is host-OS-bound: the .dmg can only be produced on macOS, the .deb only
-            // on Linux. CI builds each on its matching runner (desktop-dmg.yml /
-            // desktop-linux-deb.yml); locally you get the format for your OS. Msi when a
-            // Windows host exists.
-            targetFormats(TargetFormat.Dmg, TargetFormat.Deb)
+            // on Linux, the .msi only on Windows (and only with WiX 3 on the PATH: JDK 21's
+            // jpackage drives candle/light). CI builds each on its matching runner
+            // (desktop-dmg.yml / desktop-linux-deb.yml / desktop-windows-msi.yml); locally
+            // you get the format for your OS.
+            targetFormats(TargetFormat.Dmg, TargetFormat.Deb, TargetFormat.Msi)
             // The Bee PoC flavour is a separate app (own name, own bundle id, own
             // data dir — see BeePoc.kt) so it coexists with a regular install.
             packageName = appName
-            // Applies to the dmg (and a future msi); the deb overrides it below.
+            // Applies to the dmg; the deb and the msi override it below.
             // See macOsPackageVersion at the top of this file for the +1-major rule.
             packageVersion = macOsPackageVersion
             // jpackage builds the deb's Maintainer field as "<vendor> <debMaintainer>",
@@ -683,6 +684,33 @@ compose.desktop {
                 // start at 0 — so Linux carries the app's honest version.
                 packageVersion = releaseVersion
                 debMaintainer = "dirk@jaeckel.com"
+            }
+            windows {
+                // MSI versions may start at 0 too (MAJOR and MINOR up to 255, BUILD up to
+                // 65535), so Windows carries the honest version like the deb.
+                packageVersion = releaseVersion
+                // Windows Installer recognises a newer msi as an UPGRADE of an installed one
+                // only through this code, so it must never change for a flavour. Each flavour
+                // is a separate app (see bundleID above), so each has its own.
+                upgradeUuid = when {
+                    beePoc -> "c65ad8ab-cde2-4113-92bf-18dd1d577ac8"
+                    railgunPoc -> "55b946b0-ea27-499a-856f-b5f87346f82a"
+                    else -> "15d1f394-905a-449a-bbdb-7afc2d780555"
+                }
+                // Per-user: installs under %LOCALAPPDATA%\<packageName> with no UAC prompt,
+                // like the data dir (~/.myotis) the app writes to anyway. No install-folder
+                // page (Compose turns it ON by default): a per-user install never elevates,
+                // so a folder like Program Files that the user could pick there would only
+                // fail the install.
+                perUserInstall = true
+                dirChooser = false
+                // A Start menu entry in a "Myotis" folder (jpackage's default group is
+                // "Unknown"), shared by the flavours, plus a desktop shortcut.
+                menu = true
+                menuGroup = "Myotis"
+                shortcut = true
+                // No iconFile yet: the msi ships jpackage's default icon, as the deb does
+                // (generateMacIcon writes only the macOS .icns).
             }
         }
     }

@@ -1,0 +1,418 @@
+name: Desktop MSI (Windows)
+
+# The Windows installer: an x64 .msi that jpackage builds with WiX 3 on a
+# Windows runner, then installs, launches and uninstalls there as a smoke test.
+#
+# NOT attached to releases yet. The runner proves the msi installs per user,
+# starts, loads the bundled Rust engine, serves JSON-RPC and uninstalls cleanly.
+# It does not prove the app syncs from a home connection: the Windows addon
+# smoke found peers over UDP but held no TCP connections from Azure
+# (docs/TODO.md, `smoke-windows`). Download the msi from the run's artifacts;
+# adding it to a release job (and to the release notes the sibling workflows
+# write) is a follow-up once it has been tried on a real Windows machine.
+#
+# x64 only. Windows 11 on ARM runs it through its x64 emulation (Prism), which
+# is also how a Windows VM on an Apple Silicon Mac runs it. A native arm64 msi
+# would need the windows-11-arm runner, an arm64 JDK and the
+# aarch64-pc-windows-msvc engine; prepareJnaBootLib already maps that stub.
+
+on:
+  push:
+    branches: [ "main" ]
+  # Path-filtered, unlike the dmg. A Windows packaging leg on every PR would
+  # cost more than it tells (the reason desktop-linux-deb.yml has no PR trigger
+  # at all), but a change to the packaging, or to what the smoke below reads
+  # (the engine loader's log line, the log file's location), should prove the
+  # msi before it merges. rust/** is deliberately not here: no PR compiles the
+  # engine for Windows today (node-binding.yml's Windows leg runs on main), and
+  # this leg on every Rust PR would be the deb's queue problem again. Base
+  # branches stay unscoped (CLAUDE.md, "Multi-PR plans"); the review gate's
+  # `if` below skips a PR whose base is not main, as for the other artifact
+  # builds.
+  pull_request:
+    paths:
+      - ".github/workflows/desktop-windows-msi.yml"
+      - "app-desktop/build.gradle.kts"
+      - "app-desktop/src/main/kotlin/io/myotis/desktop/Main.kt"
+      - "app-desktop/src/main/resources/logback-desktop.xml"
+      - "myotis-engines/src/main/java/io/myotis/engines/RustEngineNative.java"
+      # The committed UniFFI bindings: the verify step checks the engine against them.
+      - "myotis-engines/src/main/kotlin/uniffi/**"
+      - "build.gradle.kts"
+      - "gradle/libs.versions.toml"
+  # Any branch, on demand from the Actions tab.
+  workflow_dispatch:
+
+# Cancel a superseded run when new commits land on the same branch/PR. The
+# event is part of the group so a dispatch on main does not cancel an
+# in-flight merge-to-main run (same reasoning as desktop-dmg.yml).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Holds the build until this PR's Claude review has finished, like the dmg
+  # and APK builds (see wait-for-claude-review.yml). Its `if:` must stay true
+  # on every non-pull_request event: skipping it skips the build too.
+  review-gate:
+    name: Review gate
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
+    uses: ./.github/workflows/wait-for-claude-review.yml
+    permissions:
+      actions: read
+
+  build:
+    needs: review-gate
+    name: Build Windows .msi (x64)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      MSI_DIR: app-desktop/build/compose/binaries/main/msi
+
+    steps:
+      # Git for Windows checks text files out with CRLF by default. The bash
+      # steps below run ./gradlew, whose shebang line would then end in \r,
+      # and the packaged app should carry the same bytes as the dmg and deb.
+      - name: Check out with LF line endings
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history: :ui stamps the app's on-screen version from the
+          # nearest v* tag (see desktop-dmg.yml for the details).
+          fetch-depth: 0
+
+      - name: Set up JDK 21 (x64)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          architecture: x64
+
+      # The packaged app bundles the Rust engine (appResources): build it from
+      # source here. prepareRustAppResources fails the build if the lib is
+      # missing, so this step is REQUIRED, not optional.
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      # JDK 21's jpackage builds an msi with WiX 3 (candle.exe + light.exe on
+      # the PATH); WiX 4+ support arrived in a later jpackage. Installed from
+      # the pinned upstream zip rather than relying on the runner image, whose
+      # tool list changes between Windows Server versions.
+      - name: Install WiX Toolset 3.14
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip'
+          $sha = '6ac824e1642d6f7277d0ed7ea09411a508f6116ba6fae0aa5f2c7daa2ff43d31'
+          $zip = Join-Path $env:RUNNER_TEMP 'wix314-binaries.zip'
+          $dir = Join-Path $env:RUNNER_TEMP 'wix314'
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $got = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
+          if ($got -ne $sha) {
+            Write-Output "::error::wix314-binaries.zip has sha256 $got, expected $sha"
+            exit 1
+          }
+          Expand-Archive -Path $zip -DestinationPath $dir
+          Add-Content -Path $env:GITHUB_PATH -Value $dir
+          Write-Output "WiX candle.exe $((Get-Item (Join-Path $dir 'candle.exe')).VersionInfo.FileVersion) at $dir"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # Compose Desktop's packageMsi wraps jpackage (jlink'd JRE + app → .msi).
+      # The Gradle toolchain is pinned to the JDK setup-java installed, as in
+      # the dmg workflow, so the bundled runtime is that x64 JDK and not one of
+      # the image's preinstalled ones. NON-minified, unsigned (SmartScreen
+      # warns on first run). Retry to ride out transient repo-resolution blips.
+      # The release version the msi must declare is recorded for the verify
+      # step, from the same query the release tag guard makes.
+      - name: Build Windows .msi (x64)
+        run: |
+          GRADLE_ARGS=(
+            -Porg.gradle.java.installations.auto-detect=false
+            -Porg.gradle.java.installations.auto-download=false
+            "-Porg.gradle.java.installations.paths=$JAVA_HOME"
+          )
+          built=
+          for attempt in 1 2 3; do
+            if ./gradlew :app-desktop:packageMsi --stacktrace "${GRADLE_ARGS[@]}"; then built=1; break; fi
+            echo "::warning::MSI build attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
+            sleep 25
+          done
+          [ -n "$built" ] || { echo "::error::MSI build failed after 3 attempts"; exit 1; }
+          version=$(./gradlew -q :printReleaseVersion "${GRADLE_ARGS[@]}" | tr -d '\r' | sed -n 's/^releaseVersion=//p')
+          printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::could not read the release version (got '$version')"; exit 1; }
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+
+      # Compose names the output Myotis-<packageVersion>.msi; rename it to the
+      # arch-tagged name, like the dmgs and debs. Exactly one, or fail: two
+      # differently versioned leftovers must not ship an arbitrary pick.
+      - name: Tag .msi with architecture
+        run: |
+          set -eu
+          shopt -s nullglob
+          msis=("$MSI_DIR"/*.msi)
+          [ "${#msis[@]}" -eq 1 ] \
+            || { echo "::error::expected exactly 1 msi, found ${#msis[@]}: ${msis[*]}"; exit 1; }
+          mv "${msis[0]}" "$MSI_DIR/Myotis-x64.msi"
+
+      # The build goes green on "BUILD SUCCESSFUL" alone, so check what the msi
+      # actually carries: an administrative install unpacks it without
+      # installing. The launcher, the bundled JVM, the Rust engine and JNA's
+      # stub must all be x64 PE images (a wrong-arch engine leaves the engine
+      # toggle dead, invisible to a launcher check), the regular build must not
+      # carry a PoC seed, and the Property table must hold the honest version
+      # and the pinned upgrade code (without it, a newer msi installs beside
+      # the old one instead of upgrading it).
+      - name: Verify .msi contents
+        shell: pwsh
+        run: |
+          function Fail([string]$msg) { Write-Output "::error::$msg"; exit 1 }
+          function Get-PeMachine([string]$path) {
+            $fs = [System.IO.File]::OpenRead($path)
+            try {
+              $br = [System.IO.BinaryReader]::new($fs)
+              [void]$fs.Seek(0x3C, 'Begin')
+              [void]$fs.Seek($br.ReadInt32(), 'Begin')
+              if ($br.ReadUInt32() -ne 0x00004550) { Fail "$path is not a PE image" }
+              return $br.ReadUInt16()
+            } finally { $fs.Dispose() }
+          }
+          function Get-MsiProperty($installer, [string]$msi, [string]$name) {
+            $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($msi, 0))
+            $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @("SELECT Value FROM Property WHERE Property='$name'"))
+            [void]$view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+            $rec = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+            if ($null -eq $rec) { return $null }
+            return $rec.GetType().InvokeMember('StringData', 'GetProperty', $null, $rec, @(1))
+          }
+
+          $msi = (Resolve-Path "$env:MSI_DIR/Myotis-x64.msi").Path
+          $ex = Join-Path $env:RUNNER_TEMP 'msi-extract'
+          # The extract's log goes where the smoke step's logs go, so it is uploaded on failure too.
+          $smoke = (New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP 'msi-smoke')).FullName
+          $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+            '/a', "`"$msi`"", '/qn', "TARGETDIR=`"$ex`"", '/l*v', "`"$smoke\msi-extract.log`"")
+          if ($p.ExitCode -ne 0) { Fail "administrative extract (msiexec /a) exited $($p.ExitCode) (msi-extract.log is in the smoke artifact)" }
+
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $version = Get-MsiProperty $installer $msi 'ProductVersion'
+          $upgrade = Get-MsiProperty $installer $msi 'UpgradeCode'
+          Write-Output "ProductVersion=$version UpgradeCode=$upgrade"
+          if ($version -ne $env:RELEASE_VERSION) { Fail "msi ProductVersion '$version' is not the release version '$env:RELEASE_VERSION'" }
+          # The regular flavour's code from app-desktop/build.gradle.kts (`windows { upgradeUuid }`),
+          # copied here ON PURPOSE: that value must never change, and a second copy makes a change
+          # fail here instead of silently orphaning every installed msi. WiX stores it braced and
+          # upper-case, and -ne compares case-insensitively.
+          if ("$upgrade".Trim('{', '}') -ne '15d1f394-905a-449a-bbdb-7afc2d780555') { Fail "msi UpgradeCode '$upgrade' is not the pinned one" }
+
+          foreach ($name in 'Myotis.exe', 'jvm.dll', 'myotis_engine.dll', 'jnidispatch.dll') {
+            $hits = @(Get-ChildItem -Path $ex -Recurse -File -Filter $name)
+            if ($hits.Count -ne 1) { Fail "expected exactly one $name in the msi, found $($hits.Count)" }
+            $machine = Get-PeMachine $hits[0].FullName
+            Write-Output ("{0}: PE machine 0x{1:X4} ({2})" -f $name, $machine, $hits[0].FullName.Substring($ex.Length))
+            if ($machine -ne 0x8664) { Fail ("{0} is PE machine 0x{1:X4}, not x64 (0x8664)" -f $name, $machine) }
+          }
+          # Parity with the dmg check: only a -PbeePoc / -PrailgunPoc build may
+          # ship a PoC seed, its manifest or its warm peer caches.
+          foreach ($name in 'logindex-gnosis.db', 'logindex.db', 'logindex-sepolia.db', 'bee-poc-seed.properties',
+                            'railgun-poc-seed.properties', 'railgun-poc-seed-sepolia.properties',
+                            'peers-gnosis.cache', 'cl-peers-gnosis.cache') {
+            $stray = @(Get-ChildItem -Path $ex -Recurse -File -Filter $name)
+            if ($stray.Count -ne 0) { Fail "the standard msi carries the PoC file $($stray[0].FullName)" }
+          }
+          Write-Output "OK: x64 msi $version carries an x64 launcher, JVM, Rust engine and JNA stub, and no PoC seed"
+
+          # The bundled engine must pass the integrity checks the committed UniFFI
+          # bindings run when they load it (myotis-engines' myotis_engine.kt): the
+          # contract version and every API checksum. A mismatch makes the app fall
+          # back to the Java engine silently, and the dmg/deb legs never load the
+          # library at all. Each checksum is read the way the bindings read it (a
+          # 32-bit return) and compared on its low 16 bits, as the bindings do since
+          # uniffiGenerateKotlin masks them: the upper bits are not part of a u16
+          # return and are not zero on every build.
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class UniffiProbe {
+              [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate uint Fn();
+              public static uint Call(IntPtr lib, string name) {
+                  return Marshal.GetDelegateForFunctionPointer<Fn>(NativeLibrary.GetExport(lib, name))();
+              }
+          }
+          '@
+          $dll = (Get-ChildItem -Path $ex -Recurse -File -Filter 'myotis_engine.dll')[0].FullName
+          $lib = [System.Runtime.InteropServices.NativeLibrary]::Load($dll)
+          $kt = Get-Content -Raw 'myotis-engines/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt'
+          $contract = [regex]::Match($kt, 'val bindings_contract_version = (\d+)').Groups[1].Value
+          $got = [UniffiProbe]::Call($lib, 'ffi_myotis_engine_uniffi_contract_version')
+          Write-Output "UniFFI contract version: bindings $contract, engine $got"
+          $checks = [regex]::Matches($kt, 'lib\.(uniffi_myotis_engine_checksum_\w+)\(\) and 0xFFFF\) != (\d+)\)')
+          $declared = [regex]::Matches($kt, 'fun uniffi_myotis_engine_checksum_\w+\(').Count
+          if ($checks.Count -eq 0 -or $checks.Count -ne $declared) {
+            Fail "the committed bindings declare $declared checksum functions but carry $($checks.Count) masked checks"
+          }
+          $bad = 0
+          foreach ($c in $checks) {
+            $raw = [UniffiProbe]::Call($lib, $c.Groups[1].Value)
+            if (($raw -band 0xFFFF) -ne [uint32]$c.Groups[2].Value) {
+              $bad++
+              Write-Output ("checksum mismatch {0}: bindings {1}, engine 0x{2:X8} (low 16 bits {3})" -f $c.Groups[1].Value, $c.Groups[2].Value, $raw, ($raw -band 0xFFFF))
+            }
+          }
+          if ("$got" -ne $contract -or $bad -gt 0) {
+            Fail "the bundled engine fails the committed bindings' UniFFI checks ($bad of $($checks.Count) checksums differ; contract $got vs $contract)"
+          }
+          Write-Output "OK: the bundled engine passes the bindings' UniFFI contract check and all $($checks.Count) checksums"
+
+      # Install the msi the way a user would (per user, no admin prompt), start
+      # the installed app and require, from its own log and its own RPC port,
+      # that it loaded the bundled Rust engine and serves JSON-RPC; then that it
+      # is still running, and that it uninstalls cleanly. A fresh runner has no
+      # ~/.myotis, so this is a first start on the default settings: mainnet,
+      # served on 127.0.0.1:8545. The runner cannot tell whether it SYNCS (see
+      # the header), so nothing here waits for that.
+      - name: Install, launch and uninstall smoke
+        shell: pwsh
+        run: |
+          function Fail([string]$msg) { Write-Output "::error::$msg"; exit 1 }
+          # Collected for upload by the next step (same path there).
+          $env:SMOKE_DIR = Join-Path $env:RUNNER_TEMP 'msi-smoke'
+          New-Item -ItemType Directory -Force -Path $env:SMOKE_DIR | Out-Null
+          $msi = (Resolve-Path "$env:MSI_DIR/Myotis-x64.msi").Path
+          $dataDir = Join-Path $env:USERPROFILE '.myotis'
+          $log = Join-Path $dataDir 'logs\myotis.log'
+          # perUserInstall puts the app in %LOCALAPPDATA%\<packageName> (no admin
+          # prompt); menuGroup and shortcut add the two links. All three must be
+          # absent before the install, so finding them afterwards proves this msi
+          # put them there.
+          $exe = Join-Path $env:LOCALAPPDATA 'Myotis\Myotis.exe'
+          $menuLink = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Myotis\Myotis.lnk'
+          $desktopLink = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Myotis.lnk'
+          foreach ($f in $dataDir, $exe, $menuLink, $desktopLink) {
+            if (Test-Path $f) { Fail "$f exists before the install — not a fresh runner" }
+          }
+
+          $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+            '/i', "`"$msi`"", '/qn', '/l*v', "`"$env:SMOKE_DIR\install.log`"")
+          if ($p.ExitCode -ne 0) { Fail "msiexec /i exited $($p.ExitCode) (install.log is in the smoke artifact)" }
+
+          foreach ($f in $exe, $menuLink, $desktopLink) {
+            if (-not (Test-Path $f)) {
+              # Say where things did land, so a layout change is a one-run fix.
+              Get-ChildItem -Path $env:LOCALAPPDATA, $env:ProgramFiles, "$env:APPDATA\Microsoft\Windows\Start Menu",
+                  ([Environment]::GetFolderPath('Desktop')) -Include 'Myotis.exe', 'Myotis*.lnk' -Recurse -Depth 4 -File -ErrorAction SilentlyContinue |
+                ForEach-Object { Write-Output "found: $($_.FullName)" }
+              Fail "the install did not create $f"
+            }
+          }
+          Write-Output "OK: installed per user at $exe, with Start menu and desktop shortcuts"
+
+          $app = Start-Process -FilePath $exe -PassThru
+          # Without a handle taken while it runs, ExitCode reads empty once it has exited.
+          $null = $app.Handle
+          try {
+            # 1. The bundled Rust engine loads (RustEngineNative logs this once,
+            #    at the engine choice Main.kt applies before the first start).
+            $deadline = (Get-Date).AddSeconds(240)
+            $loaded = $false
+            while ((Get-Date) -lt $deadline) {
+              if ($app.HasExited) { Fail "Myotis exited (code $($app.ExitCode)) before loading the Rust engine" }
+              $text = $null
+              try { $text = Get-Content -Raw -Path $log -ErrorAction Stop } catch { }
+              if ($text -match 'libmyotis_engine loaded via UniFFI') { $loaded = $true; break }
+              if ($text -match 'libmyotis_engine (not loaded|failed UniFFI validation)|ABI \d+ != expected') {
+                Fail "the installed app did not load its bundled Rust engine (see myotis.log in the smoke artifact)"
+              }
+              Start-Sleep -Seconds 2
+            }
+            if (-not $loaded) { Fail "no 'libmyotis_engine loaded' line in $log within 240s" }
+            Write-Output "OK: the installed app loaded its bundled Rust engine"
+
+            # 2. JSON-RPC answers on the default mainnet port.
+            $body = '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
+            $deadline = (Get-Date).AddSeconds(240)
+            $chainId = $null
+            while ((Get-Date) -lt $deadline -and -not $chainId) {
+              if ($app.HasExited) { Fail "Myotis exited (code $($app.ExitCode)) before serving JSON-RPC" }
+              try {
+                $chainId = (Invoke-RestMethod -Uri 'http://127.0.0.1:8545' -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 10).result
+              } catch { }
+              # Paced on "no answer yet", not only on a refused connection: a
+              # JSON-RPC error body (HTTP 200, no result) must not spin the loop.
+              if (-not $chainId) { Start-Sleep -Seconds 3 }
+            }
+            if ($chainId -ne '0x1') { Fail "eth_chainId on 127.0.0.1:8545 answered '$chainId' within 240s, expected 0x1" }
+            Write-Output "OK: JSON-RPC on 127.0.0.1:8545 answers eth_chainId=$chainId"
+
+            # 3. Still running a while later: a window or tray failure that
+            #    kills the process after boot shows up here.
+            Start-Sleep -Seconds 30
+            if ($app.HasExited) { Fail "Myotis exited (code $($app.ExitCode)) within 30s of serving JSON-RPC" }
+            Write-Output "OK: still running 30s later"
+
+            # Best effort: what the desktop shows, for a human to look at.
+            try {
+              Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+              $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+              $bmp = [System.Drawing.Bitmap]::new($b.Width, $b.Height)
+              [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+              $bmp.Save((Join-Path $env:SMOKE_DIR 'screenshot.png'))
+            } catch { Write-Output "::warning::no desktop screenshot: $($_.Exception.Message)" }
+          } finally {
+            # It may exit on its own between the check and the stop.
+            if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue; $app.WaitForExit(30000) | Out-Null }
+            if (Test-Path $log) {
+              Copy-Item $log $env:SMOKE_DIR
+              # Into the job log too, so a failure reads without downloading the artifact.
+              Write-Output '::group::myotis.log (last 200 lines)'
+              Get-Content -Path $log -Tail 200 | ForEach-Object { Write-Output $_ }
+              Write-Output '::endgroup::'
+            }
+          }
+
+          $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+            '/x', "`"$msi`"", '/qn', '/l*v', "`"$env:SMOKE_DIR\uninstall.log`"")
+          if ($p.ExitCode -ne 0) { Fail "msiexec /x exited $($p.ExitCode) (uninstall.log is in the smoke artifact)" }
+          foreach ($f in $exe, $menuLink, $desktopLink) {
+            if (Test-Path $f) { Fail "$f is still there after the uninstall" }
+          }
+          Write-Output "OK: installed, ran and uninstalled cleanly"
+
+      - name: Upload smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: myotis-desktop-msi-smoke-x64-${{ github.sha }}
+          path: ${{ runner.temp }}/msi-smoke
+          if-no-files-found: ignore
+          retention-days: 14
+          overwrite: true
+
+      # Also when the verify or smoke step failed, so a failing installer can be
+      # tried on a real Windows machine or VM; a red run marks it as one.
+      - name: Upload MSI
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: myotis-desktop-msi-x64-${{ github.sha }}
+          path: ${{ env.MSI_DIR }}/Myotis-x64.msi
+          # Missing is an error on a green run; after a failed build there is none.
+          if-no-files-found: ${{ job.status == 'success' && 'error' || 'ignore' }}
+          retention-days: 30
+          # Artifacts are immutable per run; a re-run would 409 without this
+          # (the same fix the dmg and deb workflows carry).
+          overwrite: true

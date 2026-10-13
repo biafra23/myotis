@@ -87,11 +87,16 @@ final class RustEngineNative {
             return false;
         } catch (Throwable t) {
             // Library FOUND but failed UniFFI's contract/checksum validation (stale or
-            // reshaped .so) — louder than the missing-library case on purpose.
+            // reshaped .so) — louder than the missing-library case on purpose. The
+            // bindings run those checks in a static initializer, so what arrives here is
+            // usually an ExceptionInInitializerError that says nothing by itself: name its
+            // cause, and log the trace (the trailing throwable) for anything else.
+            Throwable reason = t instanceof ExceptionInInitializerError && t.getCause() != null
+                    ? t.getCause() : t;
             log.warn("[engines] libmyotis_engine failed UniFFI validation ({}); "
                     + "Rust engine unavailable — rebuild the library (cargoBuildHost / "
                     + "cargoNdkAndroid) or regenerate the bindings (uniffiGenerateKotlin)",
-                    t.toString());
+                    reason.toString(), t);
             return false;
         }
         log.info("[engines] libmyotis_engine loaded via UniFFI (ABI {})", EXPECTED_ABI_VERSION);

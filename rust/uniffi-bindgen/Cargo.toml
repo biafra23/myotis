@@ -10,7 +10,11 @@ publish = false
 # The standard UniFFI pattern: a tiny workspace-local bin wrapping the bindgen
 # CLI, so binding generation is pinned to the exact uniffi version the engine
 # links against (a version skew between scaffolding and generator is a build
-# error by design). Run via the root Gradle task `uniffiGenerateKotlin`, or:
+# error by design). Regenerate the COMMITTED Kotlin bindings only through the
+# root Gradle task `uniffiGenerateKotlin`: it also masks the generated u16
+# checksum comparisons to 16 bits (see the task), which a direct run does not do,
+# and the APK workflow's drift check fails on unmasked bindings. A direct run is
+# for inspecting output:
 #   cargo run -p uniffi-bindgen -- generate \
 #     --library target/release/libmyotis_engine.so --language kotlin --out-dir <dir>
 
