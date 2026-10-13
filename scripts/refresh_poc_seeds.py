@@ -99,6 +99,11 @@ SEEDS = {s.name: s for s in (
 )}
 
 
+# What this run has finished so far, one entry per seed — printed again when a later
+# seed stops the run, so a failure message never hides what was already replaced.
+DONE = []
+
+
 def die(msg):
     raise SystemExit(f"refresh_poc_seeds: {msg}")
 
@@ -176,8 +181,7 @@ def run(cmd, capture=False, hide=None):
     else:
         r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE if capture else None)
     if r.returncode != 0:
-        die(f"{Path(cmd[1]).name if cmd[0] == sys.executable else cmd[0]} failed (exit {r.returncode}); "
-            f"nothing was replaced")
+        die(f"{Path(cmd[1]).name if cmd[0] == sys.executable else cmd[0]} failed (exit {r.returncode})")
     return r.stdout
 
 
@@ -414,7 +418,7 @@ def refresh(seed, cur, url, state):
     now_final = finalized(url)
     if now_final < target:
         die(f"{seed.name}: the node's finalized block is now {now_final:,}, below the {target:,} this delta "
-            f"was fetched to — its beacon client has fallen behind. Nothing was replaced and the fetched "
+            f"was fetched to — its beacon client has fallen behind. This seed is unchanged and its fetched "
             f"blocks are kept: run again once the node is synced")
 
     say(f"{seed.name}: {added:,} new logs; building the combined seed")
@@ -632,14 +636,14 @@ def main():
         if not repo:
             die("cannot tell which GitHub repository holds the railgun-seed release; pass --github-repo")
 
-    summary, published = [], False
+    published = False
     for seed in chosen:
         print(flush=True)
         cur = current_from_release(seed, repo, state, not args.no_publish) if seed.asset else current_from_tree(seed)
         check_current(seed, cur)
         r = refresh(seed, cur, rpcs[seed.network], state)
         if r is None:
-            summary.append(f"{seed.name}: unchanged at {cur.meta['toBlock']:,}")
+            DONE.append(f"{seed.name}: unchanged at {cur.meta['toBlock']:,}")
             continue
         old_top, m = cur.meta["toBlock"], r["meta"]
         line = (f"{seed.name}: {old_top:,} -> {m['toBlock']:,} (+{m['toBlock'] - old_top:,} blocks, "
@@ -661,9 +665,9 @@ def main():
         line += f"\n    framed index (importable in the app's Index tab): {r['framed']}"
         for f in (r["delta"], r["progress"]):
             f.unlink(missing_ok=True)
-        summary.append(line)
+        DONE.append(line)
 
-    print("\n" + "\n".join(summary))
+    print("\n" + "\n".join(DONE))
     if published:
         print("\nA tag's railgun-dmg build picks the new assets up; to refresh main's artifact now:\n"
               "    gh workflow run railgun-dmg.yml")
@@ -671,8 +675,15 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.version_info < (3, 9):
+        sys.exit("refresh_poc_seeds: needs Python 3.9 or newer")
     try:
         sys.exit(main())
-    except KeyboardInterrupt:
-        sys.exit("\nrefresh_poc_seeds: interrupted; run it again to resume (it also finishes a release "
-                 "swap the interruption cut short)")
+    except (SystemExit, KeyboardInterrupt) as e:
+        if isinstance(e, SystemExit) and not isinstance(e.code, str):
+            raise  # success, or argparse's own usage error
+        print("\nrefresh_poc_seeds: interrupted" if isinstance(e, KeyboardInterrupt) else e.code, file=sys.stderr)
+        if DONE:
+            print("Finished before it stopped, and kept:\n" + "\n".join(DONE), file=sys.stderr)
+        sys.exit("Run it again to resume. It continues each delta fetch, and first finishes a release "
+                 "swap the stop cut short.")
