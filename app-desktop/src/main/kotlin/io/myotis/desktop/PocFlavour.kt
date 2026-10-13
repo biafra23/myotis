@@ -80,9 +80,12 @@ class PocSeed(
  * unless the packaged app carries that flavour's `-D` property.
  *
  * DEBUG / DEMO artefact, not a production path: a seed is a full node's `eth_getLogs`
- * output framed by `scripts/synth_logindex.py`, unverified until the walker re-fetches it,
- * and it expires ~500,000 blocks after its fetch — the manifest carries the block it is
- * usable until.
+ * output framed by `scripts/synth_logindex.py`, and the engine serves it as it came. Nothing
+ * re-checks it on load, and only the backfill walk ever passes through it — which happens
+ * only while some watched contract's coverage stops short of its deployment block and the
+ * walk is switched on, and even then adds the logs it verifies without removing any the
+ * seed invented (see [seededIndexNotice]). It expires ~500,000 blocks after its fetch —
+ * the manifest carries the block it is usable until.
  *
  * @param prop the system property the packaged app sets to select this flavour
  * @param label how the flavour names itself in logs and in the Index tab
@@ -327,9 +330,36 @@ open class PocFlavour(
         val high = props.getProperty("coveredHigh") ?: return null
         val until = props.getProperty("usableUntilBlock") ?: return null
         val logs = props.getProperty("logs") ?: "?"
-        return "$label seed: $logs ${seed.seedSubject}, blocks $low–$high, from ${seed.seedSource} — " +
-            "unverified until the walker re-fetches them (the live coverage below grows from there); " +
-            "usable until about block $until, after which a rebuilt app re-seeds."
+        return "$label seed: $logs ${seed.seedSubject}, blocks $low–$high, from ${seed.seedSource} " +
+            "(the live coverage below grows from there) — ${seedTrust(seed, low)}. " +
+            "Usable until about block $until, after which a rebuilt app re-seeds."
+    }
+
+    /**
+     * What becomes of the seeded span, for [seededIndexNotice]. A seed ships no walk cursor,
+     * so the index serves it exactly as fetched and never re-checks it on load
+     * (`import_log_index` / `LogIndex::merge` in `rust/myotis-net`). The one thing that can
+     * revisit it is the downward backfill walk: the appender seeds the walk's trust edge
+     * above the seed, so a walk that still has blocks to cover below it descends THROUGH the
+     * seeded span first, verifying each block and adding what it finds — but it never
+     * removes a log, so one the seed invented stays. A seed that reaches its contract's
+     * deployment block leaves the walk nothing to cover below it, so (with no other watch
+     * entry still short of its own deployment) nothing passes through it.
+     */
+    private fun seedTrust(seed: PocSeed, coveredLow: String): String {
+        val complete = coveredLow.toLongOrNull()?.let { it <= seed.watchDeployBlock } == true
+        return when {
+            complete ->
+                "unverified: served as fetched and not re-checked, since it reaches the " +
+                    "contract's deployment and leaves the backfill walk nothing to cover below it"
+            pauseBackfillByDefault ->
+                "unverified: served as fetched; only the backfill walk re-checks it, on its way " +
+                    "down, and that walk starts switched off in this flavour — even it never " +
+                    "removes a log the seed invented"
+            else ->
+                "unverified: served as fetched; only the backfill walk re-checks it, on its way " +
+                    "down, and even it never removes a log the seed invented"
+        }
     }
 
     private val logTag: String get() = prop.substringAfterLast('.')

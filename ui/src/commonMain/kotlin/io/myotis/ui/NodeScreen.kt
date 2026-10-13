@@ -2465,8 +2465,12 @@ private object StatusHelp {
     const val EL_BLOCK = "Block number of the latest beacon-finalized execution payload — not " +
         "the optimistic head eth_blockNumber uses. Trails the chain head by about two epochs " +
         "(~64–96 blocks on mainnet) on a healthy node."
-    const val LOG_INDEX = "Log index backfill progress, e.g. \"12,041 logs · " +
-        "5,594,611–8,461,900\", or \"backfilling\". Shown only when the log index feature applies."
+    const val LOG_INDEX = "Desktop and iOS, for every chain. The eth_getLogs index: e.g. " +
+        "\"12041 logs — blocks 5594611–8461900\" (the range every watched contract is indexed " +
+        "over), \"… — backfilling (…)\" while contracts are at different depths, or \"… — " +
+        "backfill starting\". \"off\" = no index switched on (always so on the Java engine, " +
+        "which has none); \"unavailable\" = the chain is asleep (idle-paused) or still " +
+        "starting, with the engine's reason. The Index tab has the detail."
     const val TOR = "Desktop and Android, and only with the Rust engine on a -PtorEngine build. " +
         "Scope: account (balance/nonce) reads and the broadcast of your transactions route over " +
         "Tor today — storage/token reads, eth_call/gas estimation, receipt polling, the CL " +

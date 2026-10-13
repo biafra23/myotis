@@ -115,14 +115,14 @@ interface NodeController {
     fun applyAppNap() {}
 
     /**
-     * Whether this host can actually route reads over Tor — the Settings row is
-     * shown only when true (the [canImportLogIndex] precedent). Default false:
-     * iOS implements none of the Tor seams ([Settings.torEnabled] drops the
-     * write, [applyTorMode] is a no-op), and a privacy toggle that flips ON
-     * while reads keep leaving from the real IP would be accepted-and-ignored —
-     * the exact failure mode the trust rules forbid. The desktop and Android
-     * actuals answer from the loaded engine build (only a `-PtorEngine` build
-     * links Arti into the dylib / the jniLibs).
+     * Whether this host can actually route reads and sends over Tor — the
+     * Settings row is shown only when true (the [canImportLogIndex] precedent).
+     * Default false: iOS implements none of the Tor seams ([Settings.torEnabled]
+     * drops the write, [applyTorMode] is a no-op), and a privacy toggle that
+     * flips ON while reads and sends keep leaving from the real IP would be
+     * accepted-and-ignored — the exact failure mode the trust rules forbid.
+     * The desktop and Android actuals answer from the loaded engine build (only
+     * a `-PtorEngine` build links Arti into the dylib / the jniLibs).
      */
     val supportsTor: Boolean get() = false
 
@@ -359,11 +359,11 @@ interface Settings {
     fun javaEngineUnavailableReason(): String? = null
 
     /**
-     * true = route verified reads over Tor (docs/privacy-and-tor.md) — experimental, and
-     * Rust-engine-only (Arti is embedded in the Rust engine). Default false. Hosts that
-     * can't support it keep the default no-op getter/setter so iOS still compiles; the
-     * desktop and Android actuals persist it and [NodeController.applyTorMode] pushes it
-     * down.
+     * true = route account reads and the wallet's own transaction broadcasts over
+     * Tor (docs/privacy-and-tor.md) — experimental, and Rust-engine-only (Arti is
+     * embedded in the Rust engine). Default false. Hosts that can't support it
+     * keep the default no-op getter/setter so iOS still compiles; the desktop and
+     * Android actuals persist it and [NodeController.applyTorMode] pushes it down.
      */
     fun torEnabled(): Boolean = false
     fun setTorEnabled(v: Boolean) {}
@@ -560,13 +560,16 @@ data class NodeSnapshot(
                                        // aggressively discovering/probing for new ones
     val elHunting: Boolean = false,    // EL hunt engaged: snap serving pool empty past the
                                        // stall window, emergency re-dials running
-    // Tor verified-read routing (docs/privacy-and-tor.md), Status "Tor" row.
+    // Tor routing of reads and sends (docs/privacy-and-tor.md), Status "Tor" row.
     // null = not applicable (Java engine / build without Tor support); otherwise
     // "off" (supported, disabled), "on" (enabled, circuit still bootstrapping),
-    // or "active" (enabled AND a Tor circuit is ready — reads route over Tor).
+    // or "active" (enabled AND a Tor circuit is ready — reads and sends route over Tor).
     val tor: String? = null,
-    // null = log index not applicable/configured; otherwise a short progress
-    // string, e.g. "12,041 logs · 5,594,611–8,461,900" or "backfilling".
+    // Status "Log index" row: LogIndexStatus.format of the engine's status JSON,
+    // e.g. "12041 logs — blocks 5594611–8461900", "… — backfilling (…)", "off"
+    // (no index, or the Java engine) or "unavailable — <reason>". null = the host
+    // did not fetch it: Android never fills it, and desktop/iOS leave it null
+    // only when the status fetch itself failed.
     val logIndex: String? = null,
     // Raw engine status JSON for the Index tab (null when the feature is off
     // or the engine is unavailable); parsed via [LogIndexStatus.parse].

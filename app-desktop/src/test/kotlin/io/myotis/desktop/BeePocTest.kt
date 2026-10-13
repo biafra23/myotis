@@ -310,6 +310,9 @@ class BeePocTest {
         assertTrue(notice.contains("47000000–48262676"), notice)
         assertTrue(notice.contains("48762676"), notice)
         assertTrue(notice.contains("39213"), notice)
+        // The seed stops above the contract's deployment, so only the backfill walk could
+        // re-check it — and that walk starts off here. The notice must say both.
+        assertTrue(notice.contains("unverified") && notice.contains("switched off"), notice)
         assertNull(BeePoc.seededIndexNotice(data, "mainnet"))
     }
 }

@@ -28,9 +28,11 @@ package io.myotis.desktop
  * than the contention fix it is for Bee.
  *
  * This is a DEBUG / DEMO artefact, not a production path: each seed is a full node's
- * `eth_getLogs` output framed by `scripts/synth_logindex.py`, unverified until the walker
- * re-fetches it (docs/railgun-poc.md), and it expires ~500,000 blocks (~69 days on either
- * network) after its fetch — the manifest carries the block it is usable until.
+ * `eth_getLogs` output framed by `scripts/synth_logindex.py`, served unverified
+ * (docs/railgun-poc.md) — and, being complete, never re-checked: the walk that could pass
+ * through it has nothing to cover below it ([PocFlavour.seededIndexNotice]). It expires
+ * ~500,000 blocks (~69 days on either network) after its fetch — the manifest carries the
+ * block it is usable until.
  *
  * Everything here is a no-op unless the packaged app carries `-Dmyotis.railgunPoc=true`
  * (the Gradle property adds it to the bundle's JVM args and to the dev `run` task).

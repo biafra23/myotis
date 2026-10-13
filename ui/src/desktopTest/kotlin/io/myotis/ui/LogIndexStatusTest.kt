@@ -148,6 +148,24 @@ class LogIndexStatusTest {
     }
 
     @Test
+    fun formatNamesDisabledAndErrorAnswersInsteadOfCallingThemEnabled() {
+        // Desktop and iOS fill the Status row for every chain, so these shapes reach
+        // format() on every Java-engine chain and every chain without an index.
+        assertEquals("off", LogIndexStatus.format("{\"enabled\":false,\"logCount\":0,\"entries\":[]}"))
+        assertEquals(
+            "unavailable \u2014 handle is paused",
+            LogIndexStatus.format("{\"error\":\"handle is paused\"}"),
+        )
+        assertEquals("unavailable", LogIndexStatus.format("{}"))
+        // The enabled path keeps its progress line, in the shape StatusHelp quotes.
+        assertEquals("42 logs \u2014 backfilling (entries at different depths)", LogIndexStatus.format(withSpans))
+        val oneEntry = "{\"enabled\":true,\"logCount\":12041,\"entries\":[{\"address\":" +
+            "\"0x4e69fd587118dfb64957d18654e3894118e9b1bf\",\"fromBlock\":5594611," +
+            "\"coveredLow\":5594611,\"coveredHigh\":8461900}]}"
+        assertEquals("12041 logs \u2014 blocks 5594611\u20138461900", LogIndexStatus.format(oneEntry))
+    }
+
+    @Test
     fun disabled_and_error_shapes_parse_as_disabled() {
         assertEquals(false, LogIndexStatus.parse("{\"enabled\":false,\"logCount\":0,\"entries\":[]}").enabled)
         assertEquals(false, LogIndexStatus.parse("{\"error\":\"node is not running\"}").enabled)

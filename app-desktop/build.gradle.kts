@@ -303,9 +303,10 @@ val prepareJnaBootLib = tasks.register("prepareJnaBootLib") {
 // at build time from the committed data set by scripts/synth_logindex.py and
 // staged into appResources/common/ (Compose flattens common/ next to the
 // os-arch dir) beside a manifest — coverage, expiry, sha256 — that the app
-// checks before installing it. DEBUG/DEMO artefact: RPC-sourced data,
-// unverified until the walker re-fetches it, expiring ~500,000 Gnosis blocks
-// (~29 days) after its fetch. Only runs for -PbeePoc; the flavour-specific
+// checks before installing it. DEBUG/DEMO artefact: RPC-sourced data, served
+// unverified — only the backfill walk (shipped paused) would re-check it, and
+// even that never removes a log the seed added — expiring ~500,000 Gnosis
+// blocks (~29 days) after its fetch. Only runs for -PbeePoc; the flavour-specific
 // resources root above keeps a regular build from ever shipping the seed.
 // ---------------------------------------------------------------------------
 // Compose flattens appResources/common/ next to the os-arch dir; both
@@ -373,7 +374,7 @@ val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
 // this app instead of a public RPC provider (RailgunPoc.kt; docs/railgun-poc.md).
 //
 // The seed data is NOT committed, unlike the Bee flavour's. The Bee set is a
-// 58 MB gzip of ~39k logs; RAILGUN's mainnet one is ~438k logs over 11.4M blocks
+// 3.2 MB gzip (24 MB raw) of ~39k logs; RAILGUN's mainnet one is ~438k logs over 11.4M blocks
 // — 589 MB raw, and a git object nobody wants in a clone. So this task reads each
 // network's fetch from a directory given by a property — -PrailgunSeedDir for
 // mainnet (default ~/myotis-node/railgun), -PrailgunSepoliaSeedDir for Sepolia
