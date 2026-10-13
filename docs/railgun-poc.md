@@ -307,7 +307,11 @@ Then it uploads each archive and its sidecar under a temporary `.new` name,
 checks both against GitHub's own digest of what arrived, and only then deletes
 the old asset and renames the new one. A plain `--clobber` would delete the old
 asset first, and over zbox's slow uplink the release would lack an archive for
-minutes, failing every build that started meanwhile. The range line in the
+minutes, failing every build that started meanwhile. The archive and its
+sidecar still swap one after the other, so a run that dies between the two
+leaves a mismatched pair and every build red. Each run therefore first checks
+that the published sidecar names the published archive's digest and finishes
+the swap if it does not, even when there are no new blocks to publish. The range line in the
 release body is rewritten to match. The archive it replaced stays in
 `~/myotis-node/poc-seeds/<seed>/previous/` until the next run, as the rollback.
 

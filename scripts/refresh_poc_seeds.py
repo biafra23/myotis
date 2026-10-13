@@ -205,6 +205,15 @@ def asset_sha256(a):
     return d.removeprefix("sha256:") if d.startswith("sha256:") else None
 
 
+def asset_text(repo, a):
+    """A small asset's content (a sidecar), straight from the API."""
+    r = subprocess.run(["gh", "api", "-H", "Accept: application/octet-stream",
+                        f"repos/{repo}/releases/assets/{a['id']}"], text=True, capture_output=True)
+    if r.returncode != 0:
+        die(f"cannot read the asset {a['name']}: {r.stderr.strip()}")
+    return r.stdout
+
+
 # --------------------------------------------------------------------------- current seed
 
 
@@ -231,29 +240,72 @@ def current_from_tree(seed):
     return Current(json.loads(meta_path.read_text()), meta_path, logs)
 
 
-def finish_swap(seed, repo, rel):
-    """A run that died between deleting an old asset and renaming its replacement leaves
-    only `<name>.new`, which was verified against the local file BEFORE the delete
-    (publish). Finish the rename rather than leave the release without the asset."""
-    for name in (seed.asset, f"{seed.asset}.sha256"):
-        pending = asset_named(rel, f"{name}.new")
-        if asset_named(rel, name) is None and pending is not None:
-            say(f"{seed.name}: finishing an interrupted swap: {name}.new -> {name}")
-            gh_api(repo, "PATCH", f"releases/assets/{pending['id']}", {"name": name})
-            rel = release(repo)
-    return rel
+def reconcile(seed, repo, rel, repair):
+    """Make the published archive and its sidecar a matching PAIR again, on every run and
+    before anything else — including before a run that finds no new blocks reports the
+    seed unchanged. publish() swaps the two one after the other (delete the old asset,
+    rename `<name>.new`), so a run that dies in between leaves the release serving an
+    archive without its sidecar, or the new archive beside the OLD sidecar: every
+    railgun-dmg build then fails its checksum step until this is repaired.
 
+    A `<name>.new` was verified against GitHub's digest before any old asset was deleted,
+    so finishing its rename is safe; the sidecar is judged by its CONTENT, the archive
+    digest it names, not by which names exist. Without `repair` (--no-publish) a broken
+    pair is reported, not touched."""
 
-def current_from_release(seed, repo, state):
-    """The published archive, from the local copy when it is byte-identical to the asset."""
-    a = asset_named(finish_swap(seed, repo, release(repo)), seed.asset)
-    if a is None:
+    def fix(what):
+        if not repair:
+            die(f"{seed.name}: the {RELEASE_TAG} release was left mid-swap ({what}); every railgun-dmg "
+                f"build fails until it is repaired. Run without --no-publish to finish the swap")
+        say(f"{seed.name}: finishing an interrupted swap: {what}")
+
+    sidecar = f"{seed.asset}.sha256"
+    archive, pending = asset_named(rel, seed.asset), asset_named(rel, f"{seed.asset}.new")
+    if archive is None and pending is not None:
+        fix(f"{seed.asset}.new -> {seed.asset}")
+        gh_api(repo, "PATCH", f"releases/assets/{pending['id']}", {"name": seed.asset})
+        rel = release(repo)
+        archive = asset_named(rel, seed.asset)
+    if archive is None:
         die(f"{seed.name}: the {RELEASE_TAG} release has no {seed.asset}")
-    want = asset_sha256(a)
+    want = asset_sha256(archive)
     if want is None:
         die(f"{seed.name}: GitHub reports no digest for {seed.asset}; cannot tell whether a local copy is current")
+
+    def names_archive(a):
+        return a is not None and asset_text(repo, a).split()[:1] == [want]
+
+    if not names_archive(asset_named(rel, sidecar)):
+        candidate = asset_named(rel, f"{sidecar}.new")
+        if not names_archive(candidate):
+            die(f"{seed.name}: no sidecar on the {RELEASE_TAG} release names {seed.asset}'s sha256 {want}, so "
+                f"every railgun-dmg build fails its checksum step. Upload one as {sidecar} "
+                f"(`echo '{want}  {seed.asset}'`), or rerun once the node has new finalized blocks")
+        fix(f"{sidecar}.new -> {sidecar}")
+        old = asset_named(rel, sidecar)
+        if old:
+            gh_api(repo, "DELETE", f"releases/assets/{old['id']}")
+        gh_api(repo, "PATCH", f"releases/assets/{candidate['id']}", {"name": sidecar})
+        rel = release(repo)
+    # The pair is whole: whatever `.new` is left is an upload no swap will use.
+    for name in (seed.asset, sidecar):
+        stale = asset_named(rel, f"{name}.new")
+        if stale and repair:
+            gh_api(repo, "DELETE", f"releases/assets/{stale['id']}")
+            print(f"    removed the leftover {name}.new")
+    return archive
+
+
+def current_from_release(seed, repo, state, repair):
+    """The published archive, from the local copy when it is byte-identical to the asset."""
+    a = reconcile(seed, repo, release(repo), repair)
+    want = asset_sha256(a)
     home = state / seed.name
     cache = home / seed.asset
+    # A run that died after its swap leaves the archive it published in the work dir.
+    built = home / "work" / "new" / seed.asset
+    if not (cache.is_file() and sha256_file(cache) == want) and built.is_file() and sha256_file(built) == want:
+        keep_published(seed, state, built)
     if cache.is_file() and sha256_file(cache) == want:
         print(f"    the published {seed.asset} is the local copy {cache}")
     else:
@@ -505,7 +557,7 @@ def publish(seed, repo, archive, sidecar, meta):
         fresh[name] = a
     # The swap: a few seconds in which a build that fetches the archive and then the
     # sidecar can see a mismatched pair. It fails its checksum check loudly; never silently.
-    # A run that dies between a delete and its rename is finished by the next run (finish_swap).
+    # A run that dies between a delete and its rename is finished by the next run (reconcile).
     for _, name in pairs:
         old = asset_named(rel, name)
         if old:
@@ -583,7 +635,7 @@ def main():
     summary, published = [], False
     for seed in chosen:
         print(flush=True)
-        cur = current_from_release(seed, repo, state) if seed.asset else current_from_tree(seed)
+        cur = current_from_release(seed, repo, state, not args.no_publish) if seed.asset else current_from_tree(seed)
         check_current(seed, cur)
         r = refresh(seed, cur, rpcs[seed.network], state)
         if r is None:
@@ -622,4 +674,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        sys.exit("\nrefresh_poc_seeds: interrupted; run it again to resume (nothing was replaced)")
+        sys.exit("\nrefresh_poc_seeds: interrupted; run it again to resume (it also finishes a release "
+                 "swap the interruption cut short)")
