@@ -521,7 +521,10 @@ asset workflow and a stronger action than the merge this file already forbids.
    asset stays until the new one is verified), which the tag's `railgun-dmg`
    build downloads, so they are done before the tag with nothing to commit.
    Why not a workflow: zbox's nodes are the seeds' only source, and no GitHub
-   runner can reach them. Details: docs/railgun-poc.md (*Refreshing the seed*),
+   runner can reach them. The reminder is one: on a PR that changes the root
+   `version`, the `PoC seeds` check (`poc-seeds.yml`) stays red until every
+   seed was fetched within 72 hours — re-run it by hand after the RAILGUN
+   publish, which makes no commit. Details: docs/railgun-poc.md (*Refreshing the seed*),
    docs/bee-rpc-service.md (*seeding from a full node*).
 
 ## Demo bundles build on merge to `main`, never on PRs

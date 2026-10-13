@@ -19,6 +19,8 @@ Every release ships the Bee PoC and RAILGUN PoC dmgs, and a seed is usable for
     scripts/refresh_poc_seeds.py                     # all three
     scripts/refresh_poc_seeds.py --seed bee-gnosis   # just one (repeatable)
     scripts/refresh_poc_seeds.py --no-publish        # build the RAILGUN archives, leave the release alone
+    scripts/refresh_poc_seeds.py --check-fresh 72    # only report each seed's age; exit 1 past 72 h
+                                                     # (the release PR's CI check, poc-seeds.yml)
 
 INCREMENTAL. Finalized history cannot change, so a refresh fetches only the
 blocks above a seed's current top and appends their logs; the low edge never
@@ -58,6 +60,7 @@ import tarfile
 import time
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -594,7 +597,50 @@ def keep_published(seed, state, archive):
     shutil.rmtree(home / "current", ignore_errors=True)
 
 
+# --------------------------------------------------------------------------- age check
+
+
+def check_fresh(max_hours, repo):
+    """Report when each seed was fetched; 1 when any is older than max_hours. The release
+    PR's reminder (poc-seeds.yml): read-only, needs neither a node nor zbox."""
+    now = datetime.now(timezone.utc)
+    rel, stale = None, []
+    for seed in SEEDS.values():
+        if seed.asset is None:
+            meta = json.loads(single_meta(BEE_DIR, seed.name).read_text())
+            when, where = meta["fetchedAtUtc"], f"{BEE_DIR.relative_to(REPO)}/"
+        else:
+            rel = rel or release(repo)
+            a = asset_named(rel, seed.asset)
+            if a is None:
+                die(f"the {RELEASE_TAG} release has no {seed.asset}")
+            # Uploaded by the run that fetched it, minutes after the fetch.
+            when, where = a["created_at"], f"{seed.asset} on the {RELEASE_TAG} release"
+        hours = (now - datetime.fromisoformat(when.replace("Z", "+00:00"))).total_seconds() / 3600
+        print(f"{seed.name}: fetched {when}, {hours:.0f} h ago ({where})")
+        if hours > max_hours:
+            stale.append(f"{seed.name} was fetched {hours / 24:.1f} days ago")
+    if stale:
+        prefix = "::error::" if os.environ.get("GITHUB_ACTIONS") else ""
+        for line in stale:
+            print(f"{prefix}{line}, more than {max_hours} h before this release")
+        print(f"{prefix}Refresh the PoC seeds for this release: on zbox, scripts/refresh_poc_seeds.py "
+              f"(CLAUDE.md, Releases, step 5). Commit data/bee/gnosis/ in the release PR; the RAILGUN "
+              f"seeds go to the {RELEASE_TAG} release with no commit, so re-run this check afterwards.")
+        return 1
+    print(f"all seeds fetched within {max_hours} h")
+    return 0
+
+
 # --------------------------------------------------------------------------- main
+
+
+def github_repo():
+    repo = subprocess.run(["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+                          cwd=REPO, text=True, capture_output=True).stdout.strip()
+    if not repo:
+        die("cannot tell which GitHub repository holds the railgun-seed release; pass --github-repo")
+    return repo
 
 
 def main():
@@ -611,6 +657,8 @@ def main():
                          "(default %(default)s; put a copy of a published archive at "
                          "<state-dir>/<seed>/<asset> to skip its download)")
     ap.add_argument("--github-repo", help="OWNER/REPO holding the railgun-seed release (default: this checkout's)")
+    ap.add_argument("--check-fresh", type=float, metavar="HOURS",
+                    help="change nothing: report each seed's age and exit 1 if any is older than HOURS")
     args = ap.parse_args()
 
     rpcs = {s.network: s.rpc for s in SEEDS.values()}
@@ -620,6 +668,8 @@ def main():
             die(f"--rpc expects NETWORK=URL with NETWORK one of {sorted(rpcs)}, got {spec!r}")
         rpcs[net] = url
     chosen = [SEEDS[n] for n in SEEDS if n in (args.seed or SEEDS)]
+    if args.check_fresh is not None:
+        return check_fresh(args.check_fresh, args.github_repo or github_repo())
     state = Path(args.state_dir).expanduser()
     state.mkdir(parents=True, exist_ok=True)
     lock = open(state / ".lock", "w")
@@ -630,11 +680,7 @@ def main():
 
     repo = None
     if any(s.asset for s in chosen):
-        repo = args.github_repo or subprocess.run(
-            ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
-            cwd=REPO, text=True, capture_output=True).stdout.strip()
-        if not repo:
-            die("cannot tell which GitHub repository holds the railgun-seed release; pass --github-repo")
+        repo = args.github_repo or github_repo()
 
     published = False
     for seed in chosen:
