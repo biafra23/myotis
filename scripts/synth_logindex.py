@@ -61,10 +61,11 @@ Layout (all integers little-endian; see logindex.rs ``serialize_impl``):
   u64 n_logs | per log: u64 block, 32B block_hash, 32B tx_hash, u32 tx_index,
     u32 log_index, 20B address, u32 n_topics, 32B each, u32 data_len + data
 
-Example (the committed Bee demo seed):
+Example (the committed Bee demo seed; its name carries its range, which each
+release's scripts/refresh_poc_seeds.py run moves):
   scripts/synth_logindex.py \
-      --meta data/bee/gnosis/postagestamp-logs-47000000-48262804.meta.json \
-      --logs data/bee/gnosis/postagestamp-logs-47000000-48262804.jsonl.gz \
+      --meta data/bee/gnosis/postagestamp-logs-47000000-*.meta.json \
+      --logs data/bee/gnosis/postagestamp-logs-47000000-*.jsonl.gz \
       --watch 0x45a1502382541Cd610CC9068e88727426b696293:31305656 \
       --out /tmp/bee-logindex-gnosis-seed.db
   ./gradlew :app:run -Pnetwork=gnosis -Pargs="import-logindex /tmp/bee-logindex-gnosis-seed.db"
