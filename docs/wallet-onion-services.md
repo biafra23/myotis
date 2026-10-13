@@ -35,7 +35,9 @@ different). The open decisions at the end are the owner's.
   peer id converts to an onion address and back offline — verified below.
 - **Finding peers stays open.** v3 onion addresses cannot be enumerated, and
   discv5 is UDP, which Tor does not carry. Something has to tell wallets which
-  onions exist.
+  onions exist. Discovery cannot tell whether a wallet is awake either; inside
+  Tor the dial itself is the ping, provided wallets stop their service before
+  they pause.
 
 ## What an onion service solves
 
@@ -162,6 +164,88 @@ is good for privacy and means discovery must be built:
   its own owner decision.
 - **A DHT over Tor.** Possible; every lookup step costs a rendezvous of
   seconds. Not worth it at the scale a wallet overlay would have.
+
+### Is it awake? Not through discovery
+
+A tempting shortcut: derive the onion address from a wallet's peer id, ping
+that peer id over discovery, recognise a myotis node by its ENR answer, and,
+having just seen it answer, dial its onion. Each step fails for its own
+reason:
+
+- **The discovery id is not the overlay key.** discv4 and discv5 ids are
+  secp256k1 (*The ones Ethereum sees*); an onion address is an ed25519 key,
+  and neither derives from the other. The link would have to be published,
+  as an onion entry in the ENR, and that ties the onion to the IP the record
+  is published from — exactly what *And it must be a separate identity*
+  forbids. Nor is the id a stable handle on every engine: the Rust engine
+  generates its discovery keys at every start, while the Java engine
+  persists its node key (`loadOrCreateKey`) and uses it for discv5 too. A
+  stable id still has to be resolved to an endpoint, which is where the next
+  point bites.
+- **A ping goes to an endpoint, not to an id.** A discv4 Ping or a discv5
+  PING is a UDP datagram to an IP and port; the id only authenticates the
+  reply. A wallet's records start without a usable endpoint: the Rust discv4
+  record holds its key and the `eth` entry, nothing else (`local_enr_rlp`,
+  `el/enrfilter.rs`); the Rust discv5 record starts with no address
+  (`spawn`, `discovery.rs`), the Java one with `0.0.0.0` and its UDP port
+  (`DiscV5Service`). discv5's address voting can later fill in the external
+  address that peers' PONGs report back, but for a phone that is its
+  carrier's CGNAT, which passes UDP only from hosts the phone has itself just
+  sent to. Another wallet cannot originate the ping — the same wall
+  `inbound-connections.md` §2 describes for TCP. (A desktop behind a home
+  router may well be pingable, but there the onion is for hiding the IP,
+  which a ping by IP has already given away.)
+- **On discv4 a wallet hands its record only to nodes it contacted.** Both
+  engines are discv4 clients that never answer FindNode. The Rust engine
+  answers an ENRRequest only from a node whose pong it holds, i.e. one it
+  pinged first (`handle_enr_request`, `el/discv4.rs`). The Java engine
+  answers none (`DiscV4Handler` handles Ping, Pong and Neighbors only).
+- **A myotis marker tells everyone.** Discovery records are public and
+  crawled continuously. Today discovery shows only that an IP runs an
+  Ethereum client, and involves none of the user's addresses
+  (`privacy-and-tor.md` §1 rates it low). A myotis entry would label that IP
+  as a myotis wallet — a far smaller crowd — for every crawler. An onion
+  entry would add the overlay identity. Tor mode does not help, because
+  discovery stays clearnet there (`privacy-and-tor.md` §4).
+- **A pong is a moment, not a window.** Even a ping that arrives proves only
+  that the stack was up when it answered. The Android host idle-pauses five
+  minutes after the last request (*Phones are asleep*), and a pong says
+  nothing about whether the onion service is published yet.
+
+Discovery tables cannot answer the question either. Their entries are
+remembered nodes, not connections. sigp `discv5` 0.11, which the Rust engine
+uses, answers a FINDNODE from its buckets without checking liveness
+(`send_nodes_response`) and re-pings each entry every 300 s by default. A
+geth discv4 table likewise keeps a node until re-pings, which come round at
+random intervals, fail. An entry therefore means "answered within the last
+round", minutes old at best. A record's `seq` rises only when its content
+changes, so a fresh record is not a fresh node either.
+
+The two useful halves of the shortcut — "is this a myotis wallet?" and "is
+it awake now?" — both have equivalents inside Tor that never touch the
+clearnet:
+
+| Discovery idea | Inside Tor | What it tells | Cost |
+|---|---|---|---|
+| "a myotis node" from its ENR | the onion address, learned only from the overlay (seeds, peer exchange) | everything the overlay hands out is a myotis wallet, by construction | nothing public |
+| a fresh record or table entry | the service's descriptor on the HSDirs, fetched with the address | the service published within the descriptor's lifetime: 3 h in C tor (`HS_DESC_DEFAULT_LIFETIME`) and in Arti since 1.2.0 (`IPT_PUBLISH_CERTAIN`, `tor-hsservice/src/ipt_mgr.rs`, checked at arti 2.4.0 and 2.7.0; Arti 1.1.x used 30 min and 12 h). The format allows 30 min–12 h (`descriptor-lifetime`). A stopped service's descriptor is not withdrawn; it expires | one HSDir fetch. Anyone holding the address learns the same (the presence leak under *And it must be a separate identity*) |
+| ping / pong | the dial itself: INTRODUCE1 through an introduction point, then the rendezvous | a completed rendezvous means awake. `NOT_RECOGNIZED` ("does not have a live circuit from the identified service", Arti's `IntroduceAckStatus`) speaks for one intro point only — a service that just rebuilt its circuits gets it from the old ones, and Arti retries it after waiting. From every intro point of a freshly fetched descriptor, it means gone | an intro and a rendezvous circuit, seconds. So don't probe separately: dial when there is something to fetch, and treat a dial that fails at every intro point of a fresh descriptor as the answer |
+| neighbours seen recently | peer-exchange entries carrying when that wallet last served, signed by its overlay key | which onions to try first | the same presence timeline, now shared with the overlay rather than with whoever holds the address |
+
+**For the dial to be an honest ping, a wallet must stop its service before it
+pauses.** A frozen process's TCP connections live on in the kernel, which
+keeps acknowledging what the first relay sends, so its introduction
+circuits look alive to the intro points until the path breaks (a network
+switch or an expired NAT mapping, then minutes of TCP retransmission) or the
+process is killed. On the charger, the serving window, Doze does not apply,
+so that can be a long time. Until then the intro points relay INTRODUCE2 and
+answer SUCCESS, and every dialer waits out its rendezvous timeout instead of
+getting `NOT_RECOGNIZED` at once. Stopping the service closes those
+circuits. The host has a chance to do that at both pause points it
+controls: on Android the idle-pause is myotis's own decision, and iOS gives
+an app a few seconds when it moves to the background. Only a freeze the
+host gets no notice of still leaves dialers with that timeout, for as long
+as the freeze lasts.
 
 ## Identity: can myotis peer ids be ed25519?
 
@@ -293,7 +377,8 @@ roost and the public CL and EL peers.
    since the pin (see *What a wallet can serve*) — and feed them to
    `LcResponder`; useful even without Tor.
 3. **Android, opt-in, in the charging-on-unmetered window**, with the idle
-   cost from step 1 in hand.
+   cost from step 1 in hand, stopping the service before every idle-pause
+   (*Is it awake?*).
 4. **Discovery by seeds plus peer exchange**, once the owner has decided who
    runs the seed and what it may see (*Open decisions*).
 
