@@ -135,16 +135,21 @@ fn encode_bytes_args(args: &[&[u8]]) -> Vec<u8> {
 /// value exceeds [`MAX_INDEX`] (so a huge offset/length can't drive an OOB read or
 /// allocation).
 fn read_index(data: &[u8], pos: usize) -> Option<usize> {
-    let word = data.get(pos..pos.checked_add(32)?)?;
-    // High 24 bytes must be zero for the value to fit a sane index.
-    if word[..24].iter().any(|&b| b != 0) {
-        return None;
-    }
     // Bound-check in the u64 domain BEFORE casting: on a 32-bit target
     // (armeabi-v7a Android), `as usize` would truncate — e.g. 2^32 → 0 — and
     // silently bypass the MAX_INDEX guard.
-    let v = u64::from_be_bytes(word[24..32].try_into().ok()?);
+    let v = word_u64(data, pos)?;
     (v <= MAX_INDEX as u64).then_some(v as usize)
+}
+
+/// The 32-byte word at [`pos`] as a `u64`: `None` when the data is short or the
+/// high 24 bytes are not zero (a value no index or timestamp here can use).
+fn word_u64(data: &[u8], pos: usize) -> Option<u64> {
+    let word = data.get(pos..pos.checked_add(32)?)?;
+    if word[..24].iter().any(|&b| b != 0) {
+        return None;
+    }
+    Some(u64::from_be_bytes(word[24..32].try_into().ok()?))
 }
 
 /// Decode a 20-byte address from the first 32-byte word of `data` (left-padded).
@@ -159,6 +164,17 @@ pub fn decode_address(data: &[u8]) -> Option<[u8; 20]> {
     let mut addr = [0u8; 20];
     addr.copy_from_slice(&word[12..32]);
     Some(addr)
+}
+
+/// A `uint256` return that fits a `u64`: the first word, `None` when it is
+/// short or above `u64::MAX` (an on-chain value no caller here can use).
+pub fn decode_u64(data: &[u8]) -> Option<u64> {
+    word_u64(data, 0)
+}
+
+/// A call without arguments: the selector alone (`GRACE_PERIOD()`).
+pub fn encode_call_no_args(signature: &str) -> Vec<u8> {
+    selector(signature).to_vec()
 }
 
 /// Decode a `bool` from the first word of `data`. Solidity's bool convention is

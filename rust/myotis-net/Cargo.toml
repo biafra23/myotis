@@ -60,16 +60,37 @@ getrandom = "=0.2.17"
 # RLPx's crypto (ECIES, the frame codec's AES/HMAC/Keccak, constant-time MAC
 # compare) moved to myotis-wire with the code that uses it (#505).
 
-# Tor (docs/privacy-and-tor.md) — OPTIONAL, off by default. Only a host that
-# builds with `--features tor` (today: the desktop engine dylib) pulls the Arti
-# dependency tree; the Android/iOS/daemon builds are byte-for-byte unaffected.
-# native-tls avoids the rustls 0.23 process-wide CryptoProvider dance (macOS
-# Security.framework), matching the tor-poc crate.
+# Tor (docs/privacy-and-tor.md) — OPTIONAL, off by default. Only a build with
+# `--features tor` (`-PtorEngine`: the desktop engine dylib, the Android
+# jniLibs) pulls the Arti dependency tree; the iOS/daemon builds and every
+# build without the flag are byte-for-byte unaffected.
+#
+# Arti's TLS backend is chosen per target. Off Android it is native-tls, which
+# avoids the rustls 0.23 process-wide CryptoProvider dance (macOS
+# Security.framework), matching the tor-poc crate. On Android native-tls means
+# OpenSSL, which the NDK does not ship; rustls with the ring provider is already
+# in that tree through libp2p-quic, so Android takes it instead and `el/tor.rs`
+# installs the provider before the first bootstrap. Two tables rather than one
+# plus a feature, because tor-rtcompat silently prefers native-tls whenever both
+# are on. `static-sqlite` (Android only) bundles SQLite for Arti's directory
+# cache: the NDK has no libsqlite3 to link and apps may not load the platform's.
+[target.'cfg(not(target_os = "android"))'.dependencies]
 arti-client = { version = "0.44", default-features = false, features = ["tokio", "native-tls"], optional = true }
 tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio", "native-tls"], optional = true }
 
+[target.'cfg(target_os = "android")'.dependencies]
+arti-client = { version = "0.44", default-features = false, features = ["tokio", "rustls", "static-sqlite"], optional = true }
+tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio", "rustls"], optional = true }
+# Must stay the rustls tor-rtcompat links: install_default() (el/tor.rs) writes
+# THIS crate's process-default static, so a second rustls version would leave
+# Arti's copy without a provider — and its RustlsProvider::new panics (an abort
+# under the workspace profile) on the first Tor read. After an Arti bump, check
+# that `cargo tree --target aarch64-linux-android -p myotis-net --features tor
+# -i rustls` still resolves (it errors out when there are two versions).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+
 [features]
-tor = ["dep:arti-client", "dep:tor-rtcompat"]
+tor = ["dep:arti-client", "dep:tor-rtcompat", "dep:rustls"]
 # The EVM fixture recorder's seam (`ElReader::head_evm_oracle`) and
 # myotis-evm's recorded-world files, for examples/record_shield_fixture.rs.
 # Test tooling: on only through this crate's own dev-dependency below.

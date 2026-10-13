@@ -7,6 +7,7 @@ import io.myotis.api.EnsContenthashResult;
 import io.myotis.api.EnsDnsRecordResult;
 import io.myotis.api.EnsInterfaceResult;
 import io.myotis.api.EnsMultiCoinResult;
+import io.myotis.api.EnsOwnershipResult;
 import io.myotis.api.EnsPubkeyResult;
 import io.myotis.api.EnsResolutionResult;
 import io.myotis.api.EnsRoot;
@@ -114,6 +115,24 @@ final class JavaEnsApi implements EnsApi {
                 backend().resolveEnsContenthash(name, io.myotis.ens.EnsResolutionRoot.AUTO));
         return new EnsContenthashResult(name, hexOrNull(r.value()),
                 r.blockNumber(), r.verified(), r.error());
+    }
+
+    @Override
+    public EnsOwnershipResult resolveOwnership(String name) {
+        VerifiedRpcBackend.EnsRecord<io.myotis.ens.EnsResolver.Ownership> r = await(
+                backend().resolveEnsOwnership(name, io.myotis.ens.EnsResolutionRoot.AUTO));
+        io.myotis.ens.EnsResolver.Ownership o = r.value();
+        if (o == null) {
+            return new EnsOwnershipResult(name, null, null, false, null, -1, -1,
+                    r.blockNumber(), -1, r.verified(), r.error());
+        }
+        return new EnsOwnershipResult(name,
+                o.registrant() == null ? null : o.registrant().toHex(),
+                o.manager() == null ? null : o.manager().toHex(),
+                o.wrapped(),
+                o.resolver() == null ? null : o.resolver().toHex(),
+                o.expiresAt(), o.gracePeriod(),
+                r.blockNumber(), -1, r.verified(), r.error());
     }
 
     @Override

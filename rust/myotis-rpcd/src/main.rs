@@ -14,6 +14,7 @@ mod engine;
 mod http;
 mod quantity;
 mod rpc;
+mod seeds;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -23,7 +24,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use myotis_engine::ffi;
-use signal_hook::consts::{SIGINT, SIGTERM};
 
 use engine::FfiEngine;
 use rpc::Router;
@@ -115,11 +115,25 @@ struct Args {
     /// The slot of the block whose root is --checkpoint-root.
     #[arg(long, value_name = "SLOT", requires = "checkpoint_root")]
     checkpoint_slot: Option<u64>,
+    /// EL peers to dial as soon as the engine starts, without waiting for
+    /// discovery: a comma-separated list of enode:// URLs, or @FILE with one
+    /// per line (# comments allowed). For servers known to answer snap, so a
+    /// cold start does not wait for discovery to find one. They are dialed
+    /// alongside the peer cache, not strictly before it. The engine applies
+    /// the list or refuses it as a whole (at most 64 entries, IP addresses
+    /// only).
+    #[arg(long, value_name = "ENODES|@FILE")]
+    boot_enodes: Option<String>,
 }
 
 fn main() {
     let args = Args::parse();
     if let Err(e) = run(args) {
+        // The log drain only runs once the engine has started, so whatever
+        // the engine logged on the way to this error (a refused create or
+        // start, and the stop() the handle's guard ran as run() returned) is
+        // still in its ring: print it, then the error last.
+        print_engine_logs();
         eprintln!("myotis-rpcd: {e}");
         std::process::exit(1);
     }
@@ -179,6 +193,7 @@ fn run(args: Args) -> Result<(), String> {
         ),
         None => None,
     };
+    let boot_enodes = args.boot_enodes.as_deref().map(seeds::load).transpose()?;
     let vhosts = http::VHosts::new(args.http_vhosts.as_deref(), listen);
 
     // Bind before starting the engine, so a taken port fails in milliseconds.
@@ -244,6 +259,12 @@ fn run(args: Args) -> Result<(), String> {
         ffi::accept_stale_anchor(handle);
         eprintln!("myotis-rpcd: --accept-stale-anchor: a stale trust anchor will be synced from (this run)");
     }
+    if let Some(urls) = &boot_enodes {
+        // Flush the ring first, so the lines push() drains are its own.
+        print_engine_logs();
+        seeds::push(handle, urls)?;
+        eprintln!("myotis-rpcd: {} boot enode(s) pinned", urls.len());
+    }
     if !ffi::start_handle(handle) {
         return Err("engine failed to start".into());
     }
@@ -282,9 +303,7 @@ fn run(args: Args) -> Result<(), String> {
     // Graceful stop: stop accepting, shut the engine handle down (it persists
     // its sync state), flush the log ring. Workers still blocked in an engine
     // read are not waited for; the handle they hold is gone.
-    let mut signals =
-        signal_hook::iterator::Signals::new([SIGINT, SIGTERM]).map_err(|e| e.to_string())?;
-    if let Some(sig) = signals.forever().next() {
+    if let Some(sig) = wait_for_stop_signal()? {
         eprintln!("myotis-rpcd: signal {sig}, stopping");
     }
     for _ in 0..receivers {
@@ -294,6 +313,38 @@ fn run(args: Args) -> Result<(), String> {
     stopping.store(true, Ordering::SeqCst);
     print_engine_logs();
     Ok(())
+}
+
+/// Block until a stop is requested; the signal's number (`None`: the
+/// iterator closed without one). Unix: SIGINT or SIGTERM, through
+/// signal-hook's self-pipe iterator.
+#[cfg(unix)]
+fn wait_for_stop_signal() -> Result<Option<i32>, String> {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    let mut signals =
+        signal_hook::iterator::Signals::new([SIGINT, SIGTERM]).map_err(|e| e.to_string())?;
+    Ok(signals.forever().next())
+}
+
+/// Windows has no signal iterator (signal-hook builds it only off Windows):
+/// the C runtime raises SIGINT for Ctrl-C and SIGBREAK for Ctrl-Break, and
+/// SIGTERM can be raised in-process, so each records its number in a flag the
+/// main thread polls. Shutdown is no more prompt than that needs to be.
+#[cfg(windows)]
+fn wait_for_stop_signal() -> Result<Option<i32>, String> {
+    use signal_hook::consts::{SIGBREAK, SIGINT, SIGTERM};
+    use std::sync::atomic::AtomicUsize;
+    let caught = Arc::new(AtomicUsize::new(0));
+    for sig in [SIGINT, SIGTERM, SIGBREAK] {
+        signal_hook::flag::register_usize(sig, caught.clone(), sig as usize)
+            .map_err(|e| e.to_string())?;
+    }
+    loop {
+        match caught.load(Ordering::SeqCst) {
+            0 => std::thread::sleep(Duration::from_millis(100)),
+            sig => return Ok(Some(sig as i32)),
+        }
+    }
 }
 
 /// Stops a created engine handle when dropped.

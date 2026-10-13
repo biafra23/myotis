@@ -193,6 +193,7 @@ class BeePocTest {
         assertTrue(settings.logIndexEnabled("gnosis"))
         assertTrue(settings.logIndexConfigured("gnosis"))
         assertTrue(settings.logIndexBackfillPaused("gnosis"), "the walk is off from the first start")
+        assertTrue(settings.expertMode(), "the Index tab is Expert-mode only: a PoC first-starts there")
         assertEquals(
             listOf(LogIndexWatch.Entry(gnosis.watchAddress, gnosis.watchDeployBlock)),
             LogIndexWatch.parse(settings.logIndexWatchJson("gnosis")),
@@ -201,6 +202,7 @@ class BeePocTest {
         val again = DesktopSettings(nets, dir.resolve("settings.properties"))
         assertEquals(listOf("gnosis"), again.enabledNetworks())
         assertTrue(again.logIndexEnabled("gnosis"))
+        assertTrue(again.expertMode())
         assertEquals(
             listOf(LogIndexWatch.Entry(gnosis.watchAddress, gnosis.watchDeployBlock)),
             LogIndexWatch.parse(again.logIndexWatchJson("gnosis")),
@@ -214,6 +216,7 @@ class BeePocTest {
         BeePoc.applyFirstStartSettings(settings, firstStart = false)
         assertEquals(listOf("mainnet"), settings.enabledNetworks())
         assertFalse(settings.logIndexConfigured("gnosis"))
+        assertFalse(settings.expertMode(), "a later start never flips Expert mode back on")
     }
 
     // -- the backfill OFF switch (the flavour's whole premise) -----------------
@@ -307,6 +310,29 @@ class BeePocTest {
         assertTrue(notice.contains("47000000–48262676"), notice)
         assertTrue(notice.contains("48762676"), notice)
         assertTrue(notice.contains("39213"), notice)
+        // The seed stops above the contract's deployment, so only the backfill walk could
+        // re-check it — and that walk starts off here. The notice must say both.
+        assertTrue(notice.contains("unverified") && notice.contains("switched off"), notice)
         assertNull(BeePoc.seededIndexNotice(data, "mainnet"))
+    }
+
+    @Test
+    fun `a flavour whose walk starts on does not claim it starts off`(@TempDir dir: Path) {
+        // Same seed, but a flavour that leaves the backfill walk running: the notice still
+        // says the seed is unverified and that the walk never removes an invented log, and
+        // drops the "switched off" clause, which would be false here.
+        val walking = PocFlavour(
+            prop = "myotis.test.walkingPoc",
+            label = "Walking PoC",
+            dataDirName = ".myotis-walking-poc",
+            seeds = BeePoc.seeds,
+            pauseBackfillByDefault = false,
+        )
+        val res = stageBundle(dir, "MLIX-fake-seed".toByteArray())
+        val data = dir.resolve("data")
+        assertEquals(SeedOutcome.INSTALLED, walking.installSeedsIfAbsent(res, data).getValue("gnosis"))
+        val notice = walking.seededIndexNotice(data, "gnosis")!!
+        assertTrue(notice.contains("unverified") && notice.contains("never removes"), notice)
+        assertFalse(notice.contains("switched off"), notice)
     }
 }

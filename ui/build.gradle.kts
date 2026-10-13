@@ -191,6 +191,9 @@ kotlin {
         // state lifetimes (e.g. the Logs-tab filter surviving tab switches) live here.
         val desktopTest by getting {
             dependencies {
+                // WebAccessParityTest pins the UI's origin normalizer to the engine's
+                // (test-only: the screens themselves never see the engine).
+                implementation(project(":jsonrpc-server"))
                 implementation(compose.desktop.uiTestJUnit4)
                 implementation(compose.desktop.currentOs)
             }

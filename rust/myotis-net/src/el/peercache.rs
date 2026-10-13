@@ -308,6 +308,48 @@ impl ElPeerCache {
         out
     }
 
+    /// How many cached peers are snap servers [`peers`](Self::peers) would not
+    /// report as denied — the Tor reserve's share is taken of these — counted
+    /// without building the list.
+    pub(crate) fn verified_count(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|e| e.snap && e.quality != SnapQuality::Denied && e.fails < CONNECT_FAILURE_DEMOTE)
+            .count()
+    }
+
+    /// The file this cache persists to (`None` when disabled).
+    pub(crate) fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
+    }
+
+    /// Take the peer at `addr` out of the cache (it moves to the Tor reserve,
+    /// `el::torreserve`), as [`peers`](Self::peers) would report it but with
+    /// its stored verdict.
+    pub(crate) fn remove(&mut self, addr: SocketAddr) -> Option<CachedElPeer> {
+        let k = addr_key(addr);
+        let e = self.entries.remove(&k)?;
+        self.failures.remove(&k);
+        self.dirty = true;
+        Some(CachedElPeer { addr, pubkey: parse_pubkey(&e.pubkey_hex)?, snap: e.snap, quality: e.quality })
+    }
+
+    /// Put back a peer the Tor reserve released, keeping its verdict; its
+    /// connect-failure streak starts over (it was reachable when it moved
+    /// out, and the reserve's failures were Tor's).
+    pub(crate) fn restore(&mut self, peer: &CachedElPeer) {
+        if self.path.is_none() {
+            return;
+        }
+        let k = addr_key(peer.addr);
+        self.failures.remove(&k);
+        self.entries.insert(
+            k,
+            Entry { pubkey_hex: pubkey_hex(&peer.pubkey), snap: peer.snap, quality: peer.quality, fails: 0 },
+        );
+        self.dirty = true;
+    }
+
     /// The STORED snap verdict on one cached peer, or `None` when the address
     /// is not cached. Deliberately without the connect-failure demotion
     /// [`peers`](Self::peers) applies: that demotion orders DIALS by recent
@@ -516,18 +558,18 @@ const SEP_CH: char = '\t';
 /// an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) keys as the plain v4, so a
 /// node discv4 hands the pool under both spellings holds one entry. The
 /// rendered IP reads back through [`parse_key`] unchanged.
-fn key(ip: IpAddr, port: u16) -> String {
+pub(crate) fn key(ip: IpAddr, port: u16) -> String {
     format!("{}{SEP_CH}{port}", ip.to_canonical())
 }
 
 /// `ip\tport` key from a socket address (the mutate path): [`key`] on its parts.
-fn addr_key(addr: SocketAddr) -> String {
+pub(crate) fn addr_key(addr: SocketAddr) -> String {
     key(addr.ip(), addr.port())
 }
 
 /// Recover a socket address from an `ip\tport` key. `None` if either side is
 /// unparseable (a corrupt entry is skipped rather than crashing).
-fn parse_key(k: &str) -> Option<SocketAddr> {
+pub(crate) fn parse_key(k: &str) -> Option<SocketAddr> {
     let (ip, port) = k.split_once(SEP_CH)?;
     let ip: std::net::IpAddr = ip.parse().ok()?;
     let port: u16 = port.parse().ok()?;
@@ -535,7 +577,7 @@ fn parse_key(k: &str) -> Option<SocketAddr> {
 }
 
 /// A 64-byte node id as `0x`-prefixed lowercase hex (Java `Bytes.toHexString`).
-fn pubkey_hex(pubkey: &[u8; 64]) -> String {
+pub(crate) fn pubkey_hex(pubkey: &[u8; 64]) -> String {
     let mut s = String::with_capacity(2 + 128);
     s.push_str("0x");
     for b in pubkey {

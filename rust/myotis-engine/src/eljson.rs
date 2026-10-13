@@ -8,8 +8,10 @@
 //! serializes `{"error": "..."}`, which the Java side raises as an
 //! `EngineException`.
 
+use myotis_evm::EvmError;
 use myotis_net::el::evm::{
-    CallAnswer, CallOutcome, EnsOutcome, EnsQueryOutcome, EnsRecordValue, GasOutcome,
+    AccessListAnswer, AccessListOutcome, CallAnswer, CallOutcome, EnsOutcome, EnsQueryOutcome,
+    EnsRecordValue, GasOutcome,
 };
 use myotis_net::el::reader::{
     FeeEstimate, FeeHistory, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedReceipt,
@@ -79,6 +81,13 @@ pub fn account_json(
     obj.insert("storageRootHex".into(), hex0x(&a.storage_root).into());
     obj.insert("codeHashHex".into(), hex0x(&a.code_hash).into());
     obj.insert("blockNumber".into(), json_u64(a.block_number));
+    // ABI ≥ 41: that block's own timestamp (unix seconds) when it is PROVEN —
+    // the read ran against the beacon-attested block and its verdict holds —
+    // else null. Never from a header no attestation pins.
+    obj.insert(
+        "blockTimestamp".into(),
+        a.block_timestamp.map(json_u64).unwrap_or(serde_json::Value::Null),
+    );
     obj.insert("peerStateRootHex".into(), hex0x(&a.peer_state_root).into());
     obj.insert("peerProofValid".into(), a.peer_proof_valid.into());
     obj.insert("beaconChainVerified".into(), a.beacon_chain_verified.into());
@@ -615,47 +624,62 @@ pub fn call_json(answer: &CallAnswer) -> String {
     serde_json::Value::Object(obj).to_string()
 }
 
-/// ENS forward-resolution result: `{"status":"ok","addressHex":"0x…","blockNumber":N}`,
-/// `{"status":"noRecord","blockNumber":N}` (successfully determined absent — the
-/// Java side maps it to addressHex null + error null, the API's "no record"
-/// convention), or `{"status":"offchain","blockNumber":N}` (ERC-3668 name; the
-/// Java side sets a descriptive error — the record exists but needs CCIP-Read).
+/// ENS forward-resolution result: `{"status":"ok","addressHex":"0x…","blockNumber":N,"blockTimestamp":T}`,
+/// `{"status":"noRecord","blockNumber":N,"blockTimestamp":T}` (successfully
+/// determined absent — the Java side maps it to addressHex null + error null,
+/// the API's "no record" convention), or
+/// `{"status":"offchain","blockNumber":N,"blockTimestamp":T}` (ERC-3668 name;
+/// the Java side sets a descriptive error — the record exists but needs
+/// CCIP-Read). `blockTimestamp` (ABI ≥ 41) is the block's own timestamp, unix
+/// seconds, from the verified header the resolution ran against — always a
+/// number, because a resolution runs only over a verified header. A shape where
+/// an unproven block is reachable carries null instead, as the account shape
+/// does; do not copy the always-a-number convention to one.
 pub fn ens_json(outcome: &EnsOutcome) -> String {
     let mut obj = serde_json::Map::new();
     match outcome {
-        EnsOutcome::Resolved { address, block_number } => {
+        EnsOutcome::Resolved { address, block_number, block_timestamp } => {
             obj.insert("status".into(), "ok".into());
             obj.insert("addressHex".into(), hex0x_var(address).into());
             obj.insert("blockNumber".into(), json_u64(*block_number));
+            obj.insert("blockTimestamp".into(), json_u64(*block_timestamp));
         }
-        EnsOutcome::NoRecord { block_number } => {
+        EnsOutcome::NoRecord { block_number, block_timestamp } => {
             obj.insert("status".into(), "noRecord".into());
             obj.insert("blockNumber".into(), json_u64(*block_number));
+            obj.insert("blockTimestamp".into(), json_u64(*block_timestamp));
         }
-        EnsOutcome::Offchain { block_number } => {
+        EnsOutcome::Offchain { block_number, block_timestamp } => {
             obj.insert("status".into(), "offchain".into());
             obj.insert("blockNumber".into(), json_u64(*block_number));
+            obj.insert("blockTimestamp".into(), json_u64(*block_timestamp));
         }
     }
     serde_json::Value::Object(obj).to_string()
 }
 
 /// ENS record-query result (EL-C-5-2, all record types + reverse). Shapes:
-/// - `{"status":"ok","blockNumber":N,"verified":b, <value keys>}` where the
+/// - `{"status":"ok","blockNumber":N,"blockTimestamp":T,"verified":b, <value keys>}` where the
 ///   value keys are per record type: `addressHex` (addr / interfaceImplementer),
 ///   `value` (text), `dataHex` (contenthash / multicoin / dnsRecord),
-///   `pubkeyXHex`+`pubkeyYHex` (pubkey), `contentType`+`dataHex` (ABI), or
-///   `name` (reverse).
-/// - `{"status":"noRecord","blockNumber":N,"verified":b}`
-/// - `{"status":"offchain","blockNumber":N,"verified":b}`
+///   `pubkeyXHex`+`pubkeyYHex` (pubkey), `contentType`+`dataHex` (ABI),
+///   `name` (reverse), or — ABI ≥ 42, the one shape with OPTIONAL keys —
+///   `registrantHex` / `managerHex` / `wrapped` / `resolverHex` / `expiresAt` /
+///   `gracePeriodSeconds` (ownership; only `wrapped` is always present, an
+///   absent part is left out rather than null).
+/// - `{"status":"noRecord","blockNumber":N,"blockTimestamp":T,"verified":b}`
+/// - `{"status":"offchain","blockNumber":N,"blockTimestamp":T,"verified":b}`
 ///
 /// `verified` = the resolution ran against the beacon-FINALIZED root.
+/// `blockTimestamp` (ABI ≥ 41) = the block's own timestamp, unix seconds, from
+/// the verified header the query ran against, on either root.
 pub fn ens_record_json(outcome: &EnsQueryOutcome) -> String {
     let mut obj = serde_json::Map::new();
     match outcome {
-        EnsQueryOutcome::Value { value, block_number, verified } => {
+        EnsQueryOutcome::Value { value, block_number, block_timestamp, verified } => {
             obj.insert("status".into(), "ok".into());
             obj.insert("blockNumber".into(), json_u64(*block_number));
+            obj.insert("blockTimestamp".into(), json_u64(*block_timestamp));
             obj.insert("verified".into(), (*verified).into());
             match value {
                 EnsRecordValue::Address(a) => {
@@ -678,16 +702,39 @@ pub fn ens_record_json(outcome: &EnsQueryOutcome) -> String {
                 EnsRecordValue::Name(n) => {
                     obj.insert("name".into(), n.as_str().into());
                 }
+                // ABI ≥ 42: who holds the name. Absent parts are left out, not
+                // null: a subname has no registrar entry, an expired name no
+                // registrant, an unknown chain no wrapper.
+                EnsRecordValue::Ownership(o) => {
+                    if let Some(a) = o.registrant {
+                        obj.insert("registrantHex".into(), hex0x_var(&a).into());
+                    }
+                    if let Some(a) = o.manager {
+                        obj.insert("managerHex".into(), hex0x_var(&a).into());
+                    }
+                    obj.insert("wrapped".into(), o.wrapped.into());
+                    if let Some(a) = o.resolver {
+                        obj.insert("resolverHex".into(), hex0x_var(&a).into());
+                    }
+                    if let Some(e) = o.expires_at {
+                        obj.insert("expiresAt".into(), json_u64(e));
+                    }
+                    if let Some(g) = o.grace_period {
+                        obj.insert("gracePeriodSeconds".into(), json_u64(g));
+                    }
+                }
             }
         }
-        EnsQueryOutcome::NoRecord { block_number, verified } => {
+        EnsQueryOutcome::NoRecord { block_number, block_timestamp, verified } => {
             obj.insert("status".into(), "noRecord".into());
             obj.insert("blockNumber".into(), json_u64(*block_number));
+            obj.insert("blockTimestamp".into(), json_u64(*block_timestamp));
             obj.insert("verified".into(), (*verified).into());
         }
-        EnsQueryOutcome::Offchain { block_number, verified, lookup, wrapped } => {
+        EnsQueryOutcome::Offchain { block_number, block_timestamp, verified, lookup, wrapped } => {
             obj.insert("status".into(), "offchain".into());
             obj.insert("blockNumber".into(), json_u64(*block_number));
+            obj.insert("blockTimestamp".into(), json_u64(*block_timestamp));
             obj.insert("verified".into(), (*verified).into());
             obj.insert("wrapped".into(), (*wrapped).into());
             // The gateway tuple, when the revert body parsed — the host drives
@@ -709,6 +756,67 @@ pub fn ens_record_json(outcome: &EnsQueryOutcome) -> String {
             }
         }
     }
+    serde_json::Value::Object(obj).to_string()
+}
+
+/// Serialize an `eth_createAccessList` answer (ABI ≥ 40):
+/// `{"status":"ok","accessList":[{"address","storageKeys":[…]}],"gasUsed":N}`
+/// — the list sorted by address and key, `gasUsed` what the run made with it
+/// used — plus `"vmError"` when that run itself failed: geth's `error` field,
+/// next to the list rather than instead of it, `"execution reverted"` (with
+/// `"revertDataHex"`, the raw payload, so a host appends the decoded reason as
+/// it does for a code-3 revert) or the halt (`"out of gas"`, …). Not `error`:
+/// a top-level `error` is the engine's failure envelope on every host |
+/// `{"status":"unavailable","reason"}` (retryable) |
+/// `{"status":"infeasible","reason"}` (the request cannot run within the
+/// caller's gas, fee cap or funds: geth's -32000 answer, served verbatim) |
+/// the permanent `{"error","code":-32602}` envelope for an executor refusal.
+/// Every status names the block it ran against (`blockNumber`, `verified`),
+/// as [`call_json`] does.
+pub fn access_list_json(answer: &AccessListAnswer) -> String {
+    let mut obj = serde_json::Map::new();
+    match &answer.outcome {
+        AccessListOutcome::Refused(reason) => return invalid_params_json(reason),
+        AccessListOutcome::Created(created) => {
+            obj.insert("status".into(), "ok".into());
+            let items = created
+                .access_list
+                .iter()
+                .map(|item| {
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("address".into(), hex0x_var(&item.address).into());
+                    entry.insert(
+                        "storageKeys".into(),
+                        serde_json::Value::Array(item.storage_keys.iter().map(|key| hex0x(key).into()).collect()),
+                    );
+                    serde_json::Value::Object(entry)
+                })
+                .collect();
+            obj.insert("accessList".into(), serde_json::Value::Array(items));
+            obj.insert("gasUsed".into(), json_u64(created.gas_used));
+            match &created.error {
+                None => {}
+                Some(EvmError::Reverted { data }) => {
+                    obj.insert("vmError".into(), "execution reverted".into());
+                    obj.insert("revertDataHex".into(), hex0x_var(data).into());
+                }
+                Some(halt) => {
+                    obj.insert("vmError".into(), halt.to_string().into());
+                }
+            }
+        }
+        AccessListOutcome::Unavailable(reason) => {
+            obj.insert("status".into(), "unavailable".into());
+            obj.insert("reason".into(), reason.as_str().into());
+        }
+        AccessListOutcome::Infeasible(reason) => {
+            obj.insert("status".into(), "infeasible".into());
+            obj.insert("reason".into(), reason.as_str().into());
+        }
+    }
+    obj.insert("blockNumber".into(), json_u64(answer.block_number));
+    let ran = !matches!(answer.outcome, AccessListOutcome::Unavailable(_));
+    obj.insert("verified".into(), (answer.finalized && ran).into());
     serde_json::Value::Object(obj).to_string()
 }
 
@@ -865,6 +973,7 @@ mod tests {
             storage_root: [0x33; 32],
             code_hash: [0x44; 32],
             block_number: 21_000_000,
+            block_timestamp: Some(1_700_000_000),
             peer_state_root: [0x55; 32],
             peer_proof_valid: true,
             beacon_chain_verified: true,
@@ -890,6 +999,8 @@ mod tests {
         assert_eq!(v["storageRootHex"], hex0x(&[0x33; 32]));
         assert_eq!(v["codeHashHex"], hex0x(&[0x44; 32]));
         assert_eq!(v["blockNumber"], 21_000_000);
+        // ABI >= 41: the proven block timestamp, or null when none is proven.
+        assert_eq!(v["blockTimestamp"], 1_700_000_000);
         assert_eq!(v["peerStateRootHex"], hex0x(&[0x55; 32]));
         assert_eq!(v["peerProofValid"], true);
         assert_eq!(v["beaconChainVerified"], true);
@@ -910,6 +1021,12 @@ mod tests {
         let json = account_json("0xabc", &fin, 1777, 1795);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["anchor"], "finalized");
+        // No attested timestamp (a peer-head read): the key is there, as null.
+        let unproven = VerifiedAccount { block_timestamp: None, ..sample_account() };
+        let v: serde_json::Value =
+            serde_json::from_str(&account_json("0xabc", &unproven, 1777, 1795)).unwrap();
+        assert!(v.as_object().unwrap().contains_key("blockTimestamp"));
+        assert_eq!(v["blockTimestamp"], serde_json::Value::Null);
     }
 
     #[test]
@@ -1063,6 +1180,82 @@ mod tests {
         assert_eq!(un["blockNumber"], 20_999_936);
     }
 
+    /// The `eth_createAccessList` shape the hosts parse (ABI 40): the list
+    /// with its gas, the run's own failure next to it, the block it ran
+    /// against; and the four non-answers exactly as `call_json` serves them.
+    #[test]
+    fn access_list_json_shapes() {
+        use myotis_evm::tx::AccessListItem;
+        use myotis_evm::CreatedAccessList;
+        let answer = |outcome: AccessListOutcome, finalized: bool| AccessListAnswer {
+            outcome,
+            block_number: 21_000_000,
+            finalized,
+        };
+        let list = vec![
+            AccessListItem { address: [0x11; 20], storage_keys: vec![[0u8; 32], [0x01; 32]] },
+            AccessListItem { address: [0x22; 20], storage_keys: vec![] },
+        ];
+        let ok: serde_json::Value = serde_json::from_str(&access_list_json(&answer(
+            AccessListOutcome::Created(CreatedAccessList { access_list: list.clone(), gas_used: 32_437, error: None }),
+            false,
+        )))
+        .unwrap();
+        assert_eq!(ok["status"], "ok");
+        assert_eq!(ok["gasUsed"], 32_437);
+        assert_eq!(ok["accessList"][0]["address"], "0x1111111111111111111111111111111111111111");
+        assert_eq!(ok["accessList"][0]["storageKeys"][0], format!("0x{}", "00".repeat(32)));
+        assert_eq!(ok["accessList"][0]["storageKeys"][1], format!("0x{}", "01".repeat(32)));
+        assert_eq!(ok["accessList"][1]["address"], "0x2222222222222222222222222222222222222222");
+        assert_eq!(ok["accessList"][1]["storageKeys"].as_array().map(Vec::len), Some(0));
+        assert!(ok.get("vmError").is_none(), "{ok}");
+        assert_eq!(ok["blockNumber"], 21_000_000);
+        assert_eq!(ok["verified"], false);
+
+        // A revert rides next to the list: geth's `error` as `vmError` (a
+        // top-level `error` is the engine's failure envelope), plus the
+        // payload for the host's reason decoding.
+        let reverted: serde_json::Value = serde_json::from_str(&access_list_json(&answer(
+            AccessListOutcome::Created(CreatedAccessList {
+                access_list: list.clone(),
+                gas_used: 23_105,
+                error: Some(EvmError::Reverted { data: vec![0x08, 0xc3, 0x79, 0xa0] }),
+            }),
+            true,
+        )))
+        .unwrap();
+        assert_eq!(reverted["status"], "ok");
+        assert_eq!(reverted["vmError"], "execution reverted");
+        assert!(reverted.get("error").is_none(), "{reverted}");
+        assert_eq!(reverted["revertDataHex"], "0x08c379a0");
+        assert_eq!(reverted["accessList"].as_array().map(Vec::len), Some(2));
+        assert_eq!(reverted["verified"], true);
+        let halted: serde_json::Value = serde_json::from_str(&access_list_json(&answer(
+            AccessListOutcome::Created(CreatedAccessList { access_list: vec![], gas_used: 100_000, error: Some(EvmError::OutOfGas) }),
+            false,
+        )))
+        .unwrap();
+        assert_eq!(halted["vmError"], "out of gas");
+        assert!(halted.get("revertDataHex").is_none(), "{halted}");
+
+        let un: serde_json::Value =
+            serde_json::from_str(&access_list_json(&answer(AccessListOutcome::Unavailable("no peer".into()), true))).unwrap();
+        assert_eq!(un["status"], "unavailable");
+        assert_eq!(un["reason"], "no peer");
+        assert_eq!(un["verified"], false, "an unavailable answer ran nowhere");
+        let inf: serde_json::Value = serde_json::from_str(&access_list_json(&answer(
+            AccessListOutcome::Infeasible("err: intrinsic gas too low: have 21000, want 21064 (supplied gas 21000)".into()),
+            false,
+        )))
+        .unwrap();
+        assert_eq!(inf["status"], "infeasible");
+        assert!(inf["reason"].as_str().unwrap().starts_with("err: intrinsic gas too low"));
+        let refused: serde_json::Value =
+            serde_json::from_str(&access_list_json(&answer(AccessListOutcome::Refused("no slot number".into()), false))).unwrap();
+        assert_eq!(refused["error"], "no slot number");
+        assert_eq!(refused["code"], INVALID_PARAMS);
+    }
+
     #[test]
     fn estimate_json_shapes() {
         let ok: serde_json::Value =
@@ -1120,22 +1313,30 @@ mod tests {
         let ok: serde_json::Value = serde_json::from_str(&ens_json(&EnsOutcome::Resolved {
             address: [0xd8; 20],
             block_number: 21_000_010,
+            block_timestamp: 1_700_000_120,
         }))
         .unwrap();
         assert_eq!(ok["status"], "ok");
         assert_eq!(ok["addressHex"], "0xd8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8");
         assert_eq!(ok["blockNumber"], 21_000_010);
+        assert_eq!(ok["blockTimestamp"], 1_700_000_120);
 
-        let none: serde_json::Value =
-            serde_json::from_str(&ens_json(&EnsOutcome::NoRecord { block_number: 21_000_010 }))
-                .unwrap();
+        let none: serde_json::Value = serde_json::from_str(&ens_json(&EnsOutcome::NoRecord {
+            block_number: 21_000_010,
+            block_timestamp: 1_700_000_120,
+        }))
+        .unwrap();
         assert_eq!(none["status"], "noRecord");
+        assert_eq!(none["blockTimestamp"], 1_700_000_120);
         assert!(none.get("addressHex").is_none());
 
-        let off: serde_json::Value =
-            serde_json::from_str(&ens_json(&EnsOutcome::Offchain { block_number: 21_000_010 }))
-                .unwrap();
+        let off: serde_json::Value = serde_json::from_str(&ens_json(&EnsOutcome::Offchain {
+            block_number: 21_000_010,
+            block_timestamp: 1_700_000_120,
+        }))
+        .unwrap();
         assert_eq!(off["status"], "offchain");
+        assert_eq!(off["blockTimestamp"], 1_700_000_120);
     }
 
     #[test]
@@ -1146,6 +1347,7 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&ens_record_json(&EnsQueryOutcome::Value {
                 value,
                 block_number: 21_000_010,
+                block_timestamp: 1_700_000_120,
                 verified: true,
             }))
             .unwrap()
@@ -1155,6 +1357,7 @@ mod tests {
         assert_eq!(addr["status"], "ok");
         assert_eq!(addr["addressHex"], "0xd8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8");
         assert_eq!(addr["blockNumber"], 21_000_010);
+        assert_eq!(addr["blockTimestamp"], 1_700_000_120);
         assert_eq!(addr["verified"], true);
 
         let text = v(EnsRecordValue::Text("https://vitalik.ca".into()));
@@ -1175,15 +1378,16 @@ mod tests {
         assert_eq!(name["name"], "vitalik.eth");
 
         let none: serde_json::Value = serde_json::from_str(&ens_record_json(
-            &EnsQueryOutcome::NoRecord { block_number: 21_000_010, verified: false },
+            &EnsQueryOutcome::NoRecord { block_number: 21_000_010, block_timestamp: 1_700_000_120, verified: false },
         ))
         .unwrap();
         assert_eq!(none["status"], "noRecord");
+        assert_eq!(none["blockTimestamp"], 1_700_000_120);
         assert_eq!(none["verified"], false);
         assert!(none.get("dataHex").is_none());
 
         let off: serde_json::Value = serde_json::from_str(&ens_record_json(
-            &EnsQueryOutcome::Offchain { block_number: 21_000_010, verified: false, lookup: None, wrapped: false },
+            &EnsQueryOutcome::Offchain { block_number: 21_000_010, block_timestamp: 1_700_000_120, verified: false, lookup: None, wrapped: false },
         ))
         .unwrap();
         assert_eq!(off["status"], "offchain");
@@ -1195,6 +1399,7 @@ mod tests {
         let full: serde_json::Value = serde_json::from_str(&ens_record_json(
             &EnsQueryOutcome::Offchain {
                 block_number: 21_000_010,
+                block_timestamp: 1_700_000_120,
                 verified: true,
                 lookup: Some(Box::new(myotis_evm::OffchainLookup {
                     sender: [0x5E; 20],
@@ -1214,6 +1419,47 @@ mod tests {
         assert_eq!(full["extraDataHex"], "0xeeeeee");
         assert_eq!(full["wrapped"], true);
         assert_eq!(full["verified"], true);
+        // ABI 42: the ownership answer; absent parts are left out.
+        let own: serde_json::Value = serde_json::from_str(&ens_record_json(&EnsQueryOutcome::Value {
+            value: EnsRecordValue::Ownership(myotis_evm::EnsOwnership {
+                registrant: Some([0x51; 20]),
+                manager: Some([0x51; 20]),
+                wrapped: false,
+                resolver: Some([0x23; 20]),
+                expires_at: Some(1_823_155_031),
+                grace_period: Some(7_776_000),
+            }),
+            block_number: 21_000_010,
+            block_timestamp: 1_760_000_000,
+            verified: true,
+        }))
+        .unwrap();
+        assert_eq!(own["status"], "ok");
+        assert_eq!(own["blockNumber"], 21_000_010u64);
+        assert_eq!(own["blockTimestamp"], 1_760_000_000u64);
+        assert_eq!(own["registrantHex"], format!("0x{}", "51".repeat(20)));
+        assert_eq!(own["managerHex"], format!("0x{}", "51".repeat(20)));
+        assert_eq!(own["wrapped"], false);
+        assert_eq!(own["resolverHex"], format!("0x{}", "23".repeat(20)));
+        assert_eq!(own["expiresAt"], 1_823_155_031u64);
+        assert_eq!(own["gracePeriodSeconds"], 7_776_000u64);
+        let sub: serde_json::Value = serde_json::from_str(&ens_record_json(&EnsQueryOutcome::Value {
+            value: EnsRecordValue::Ownership(myotis_evm::EnsOwnership {
+                registrant: None,
+                manager: Some([0x51; 20]),
+                wrapped: true,
+                resolver: None,
+                expires_at: None,
+                grace_period: None,
+            }),
+            block_number: 21_000_010,
+            block_timestamp: 1_760_000_000,
+            verified: false,
+        }))
+        .unwrap();
+        assert!(sub.get("registrantHex").is_none());
+        assert!(sub.get("expiresAt").is_none());
+        assert_eq!(sub["wrapped"], true);
     }
 
     fn sample_code() -> VerifiedCode {
@@ -1744,7 +1990,8 @@ mod get_logs_json_tests {
 
     #[test]
     fn a_send_is_a_hash_or_geths_refusal() {
-        // The hosts' golden twins pin the same two shapes (#531, ABI 36).
+        // The hosts' golden twins pin the same three shapes (#531, ABI 36;
+        // #360, ABI 44).
         let sent: serde_json::Value = serde_json::from_str(&super::tx_hash_json(&[0xab; 32])).unwrap();
         assert_eq!(sent["txHash"], format!("0x{}", "ab".repeat(32)));
         assert!(sent.get("status").is_none(), "the success shape predates ABI 36 and is unchanged");
@@ -1753,5 +2000,10 @@ mod get_logs_json_tests {
         assert_eq!(rejected["status"], "rejected");
         assert_eq!(rejected["reason"], reason);
         assert!(rejected.get("txHash").is_none(), "nothing was sent");
+        // Bytes that are no transaction: the permanent envelope, verbatim.
+        assert_eq!(
+            super::invalid_params_json("invalid raw transaction: transaction type not supported (0x0)"),
+            r#"{"error":"invalid raw transaction: transaction type not supported (0x0)","code":-32602}"#
+        );
     }
 }

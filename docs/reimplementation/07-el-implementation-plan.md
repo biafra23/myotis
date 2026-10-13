@@ -7,9 +7,17 @@
 > strategy, and the PR-by-PR breakdown with exit criteria. Update it as PRs land (mark each
 > PR's status inline), the same way 06 is updated.
 
-## Status (2026-07-06)
+## Status
 
-Plan written; no EL Rust code exists yet. The workspace (`rust/`) is CL-only: `myotis-bls`
+**At HEAD (2026-10):** executed. Milestones A–C and the multichain follow-ups landed (inline
+notes below); the Rust engine is the default engine on mainnet, Sepolia and Gnosis. Where the
+build departed from this plan: the JVM boundary moved from hand-JNI to UniFFI + JSON with one
+export per method (decision 4 and "JNI surface growth" below); the wire codecs were split out
+of `myotis-net` into the sans-I/O `myotis-wire` crate; EL-C-3-3 was not built; and the
+JSON-RPC daemon (`rust/myotis-rpcd`) and `eth_getLogs` (the log index) were added beyond scope.
+
+**2026-07-06 (the starting point):** Plan written; no EL Rust code exists yet. The workspace
+(`rust/`) is CL-only: `myotis-bls`
 (blst verify), `myotis-consensus` (sans-I/O SSZ/light-client verification), `myotis-net`
 (tokio + libp2p + discv5, the CL sync loop), `myotis-engine` (hand-JNI shell, `ABI_VERSION 2`,
 mainnet-only). There is **no** RLP codec (beyond a 10-line ENR field helper in
@@ -36,7 +44,9 @@ serving/responder halves beyond empty snap/eth responses; `eth_getLogs` / `eth_s
 pooled-tx gossip and blob sidecars; EIP-4444 history fallbacks; Portal (dead); pre-Merge /
 deep-historical accumulators (post-A follow-up, tracked in README §10). The JSON-RPC HTTP
 server and IPC daemon remain **host** surfaces consuming `VerifiedReads` — they are not
-reimplemented in Rust in this phase.
+reimplemented in Rust in this phase. *(Later, beyond this scope: `eth_getLogs` from the Rust
+engine's opt-in log index — docs/eth-getlogs-design.md — and `rust/myotis-rpcd`, a standalone
+Rust JSON-RPC daemon; the JVM hosts keep `:jsonrpc-server` and the IPC daemon.)*
 
 **Client/dialer-only** stays the rule: we dial, we never listen; inbound eth/snap requests get
 empty responses so peers don't disconnect (doc 02 §9.11).
@@ -74,15 +84,24 @@ empty responses so peers don't disconnect (doc 02 §9.11).
    mirrors the CL precedent (pure `codec.rs` beside tokio `reqresp.rs`): codecs and protocol
    state machines are pure functions/structs unit-testable without I/O; only the
    dialer/UDP-service layers touch tokio. Primitives + verification go in a NEW sans-I/O
-   **`myotis-core`** crate (guidelines §2 layout).
+   **`myotis-core`** crate (guidelines §2 layout). *Status:* the pure codecs later moved into
+   their own sans-I/O crate, `myotis-wire` (`no_std` + `alloc`: discv4, RLPx, eth, snap and the
+   eth2 req/resp codec), which `myotis-net` re-exports at the old `el/` paths.
 4. **JNI stays hand-rolled + JSON** (doc 05 status note). Milestone A adds a handful of
    operator-query natives; milestone B deliberately routes the whole `VerifiedReads` surface
    through **one generic dispatch native** (`nativeVerifiedReadJson(handle, method,
    paramsJson)`) per guidelines §5 ("one RPC dispatch layer, many fronts") so the native
-   surface stops growing per-method.
+   surface stops growing per-method. *Superseded:* the boundary became UniFFI + JSON (user
+   decision, 2026-07 — [06](06-rust-phase-notes.md)), and the generic dispatch was not built:
+   every read has its own `#[uniffi::export]` in `rust/myotis-engine/src/ffi.rs`
+   (`get_block_by_number_json`, `fee_history_json`, …); only ENS kept one dispatch
+   (`ens_record_json`).
 5. **Fork id stays pinned per network** (as Java does; README §6). Implementing real EIP-2124
    CRC32 with `forkNext` is a forward-compat TODO noted for the phase that adds the rewrite
-   tooling (doc 06 gap #3 covers the same "pinned constant needs tooling" family).
+   tooling (doc 06 gap #3 covers the same "pinned constant needs tooling" family). *Status:* the
+   hash stays pinned, `forkNext` is pinned beside it, and past `forkNext` both engines announce
+   the CRC32 successor of the pin (`myotis-core/src/forkid.rs` `fork_id_at`, Java
+   `NetworkConfig.forkIdAt`).
 
 ## Crate layout after the EL phase
 
@@ -99,7 +118,10 @@ myotis-evm    NEW  (milestone C) revm behind a StateOracle trait, sans-I/O
 ```
 
 Dependency direction stays one-way: `engine → net → {consensus → bls, core}` (core depends on
-nothing in-workspace). `myotis-core` joins the wasm32 canary (`cargoCheckWasm`) — it must never
+nothing in-workspace). *As built:* add `myotis-wire` (the sans-I/O wire codecs, between `net`
+and `core`; `net` also depends on `myotis-evm`), and the host-facing members `myotis-node`
+(napi-rs, over the C ABI), `myotis-rpcd` (JSON-RPC daemon) and `uniffi-bindgen`
+(`rust/Cargo.toml`). `myotis-core` joins the wasm32 canary (`cargoCheckWasm`) — it must never
 grow a tokio/socket/fs/clock dependency; entropy via `getrandom` only (guidelines §1).
 
 ### New dependencies (exact-pinned like the rest of the workspace)
@@ -116,6 +138,10 @@ grow a tokio/socket/fs/clock dependency; entropy via `getrandom` only (guideline
 
 Banned as before: `ring`, full `alloy`, anything with mandatory platform asm or a C build that
 breaks cargo-ndk/wasm32. `snap` (snappy) and `sha2` are already in-tree.
+
+*As landed:* EL-A1 chose the thin hand codec over `alloy-rlp` (`myotis-core/src/rlp.rs`);
+`alloy-rlp` entered later, in `myotis-net` only, as the ENR codec behind the discv4 fork-id
+filter (#539). revm is now `=43.0.3`.
 
 ## Conformance corpus strategy
 
@@ -135,6 +161,12 @@ Live capture tooling: a `-Peldump=<dir>` daemon flag (analogous to `-Plcdump`) c
 mainnet proofs/messages for the mpt/snap corpora. Carried caveat from the LC corpus applies
 here too: negatives don't yet pin the *rejection reason*, only the verdict — same open item.
 
+*As landed:* the header and ENR vectors live in `el/core/` (there is no `el/rlp/`), and
+`el/verify/` (the header-chain verdicts and `verifyMethod`/`failReason` token set; vector 003 is
+the #611 made-up-child forgery) and `el/fork_watch/` were added. The Java
+`El*VectorConformanceTest` classes write the `expected.txt` files
+(`-Dmyotis.el.writeExpected=true`); no `-Peldump` flag was built.
+
 ## The CL→EL anchor (`ExecAnchor`)
 
 Rust twin of Java's `BeaconSyncState` (the single hand-off object, consensus → execution):
@@ -150,7 +182,24 @@ Rust twin of Java's `BeaconSyncState` (the single hand-off object, consensus →
 - Lives in `myotis-net` (it is I/O-adjacent state, not verification logic); `myotis-consensus`
   stays untouched.
 
+*As built* (`myotis-net/src/el/anchor.rs`): a `Mutex`-guarded shared struct read by the query
+path (no `watch` channel; a `tokio::sync::Notify` wakes the pool's resolver), with the
+`stateRootMatch` window as planned. The `headerChain` anchor is the optimistic head's attested
+block hash (`optimistic_anchor`) — the TOP of the walk since #611. From Gloas the CL can only
+note a pending block hash (`note_finalized_hash` / `note_optimistic_hash`); the EL pool fetches
+that header and the anchor adopts it iff its keccak is the hash (`resolve_header`).
+
 ## JNI surface growth
+
+> *Superseded (as built):* after the 2026-07 switch to UniFFI + JSON
+> ([06](06-rust-phase-notes.md)) the surface is one `#[uniffi::export]` fn per operation in `rust/myotis-engine/src/ffi.rs`,
+> reached through `RustEngineNative`'s static `native*` delegators, with the coarse `ABI_VERSION`
+> (45 at HEAD) still bumped on every change. Of the milestone-A natives below only the
+> account and storage queries were built (`request_account_json`, `get_storage_proof_json`):
+> the Rust handle throws for `getHeaders`/`getBlockVerified`/`dialPeer` and treats
+> `setTargetSnapPeers`/`clearPeerState` as no-ops (it sizes its own pool —
+> `myotis-engines/.../RustChainHandle.java`). The milestone-B dispatch native was not built
+> (decision 4). The JSON golden-pin and input-validation rules below still hold.
 
 All natives remain `Java_io_myotis_engines_RustEngineNative_*`, panic-free by construction
 (workspace `panic="abort"`), compound values as JSON golden-pinned on both sides, `ABI_VERSION`
@@ -284,9 +333,12 @@ Every PR: cut from up-to-date `rust-engine`, no-context review before opening, t
   `Invalid`/timeout + root-unavailable marking across the connector's active peers.
 - `ExecAnchor` (above) fed from `sync.rs`; verified query ladders ported from
   `VerifiedAccountQuery`/`VerifiedStorageQuery`/`HeaderQuery`: proof-vs-peer-root →
-  `stateRootMatch` (window lookup) → `headerChain` (walk `[finalized … peer head]`, every
-  link `keccak256(RLP)`-pinned, ends matched to the beacon anchor, gap ≤ 8192,
-  `headerChainGapTooLarge`/`preMergeBlock`/`beaconNotSynced` tokens exact).
+  `stateRootMatch` (window lookup) → `headerChain` (walk `[peer head … optimistic head]`,
+  every link `keccak256(RLP)`-pinned, the TOP matched to the attested block hash — the
+  plan once said `[finalized … peer head]`, the upward walk fixed in #611 — gap ≤ 8192,
+  `headerChainGapTooLarge`/`preMergeBlock`/`beaconNotSynced` tokens exact). *(As built,
+  `preMergeBlock` stayed Java-only: it belongs to `get-block`, which the Rust engine does not
+  serve.)*
 - JNI natives (list above) + `RustChainHandle`/`RustEngineNative` plumbing on the Java side +
   status JSON extension; goldens for every new JSON shape; `ABI_VERSION` bump.
 - Exit — **the integration gate, on mainnet with `-Pengine=rust`**:
@@ -310,12 +362,18 @@ Every PR: cut from up-to-date `rust-engine`, no-context review before opening, t
   start. Write path mirrors the Java cache's discipline (doc 04 §6): in-memory map is
   authoritative, disk writes are batched/coalesced through a single async writer task —
   never a synchronous per-item file rewrite on the dial/serve path. Coordinate the on-disk
-  layout with the `rust/persistence` branch's dataDir conventions.
+  layout with the `rust/persistence` branch's dataDir conventions. *Status: landed —
+  `el/peercache.rs` reads and writes the Java `peers[-net].cache` file and format under
+  `dataDir` (in-memory authoritative; `flush` rewrites the file only when dirty), with the
+  later `fails=N` reachability streak (demote at 5, evict at 50 — the only eviction path).*
 - Snap-peer maintainer loop (10 s, `activeSnapPeers >= target`, doc 04 §1.1 tunables) wired
-  to `nativeSetTargetSnapPeers`; DNS pool as its discv4-independent dial source.
+  to `nativeSetTargetSnapPeers`; DNS pool as its discv4-independent dial source. *Status: no
+  host knob — the Rust pool sizes itself (`PoolConfig`, target 8 snap peers, `el/pool.rs`), and
+  `setTargetSnapPeers` is a no-op on the Rust handle.*
 - `build-android.sh` / jniLibs refresh; `sync_bench.sh` re-run now that `-Pengine=rust`
   carries an EL (updates [benchmarks.md](benchmarks.md) — the footprint scope-caveat from the
-  v1 numbers finally closes).
+  v1 numbers finally closes). *Status: the jniLibs are built from source on every Android build
+  (`cargoNdkAndroid`; no `.so` is committed); benchmarks.md still holds only the v1 numbers.*
 - Exit: with an empty discv4 table and DNS as the only discovery source, the daemon still
   reaches the A7 gate (the NAT'd/mobile dial path works); a restart re-dials cached snap
   peers before any discovery round-trip; refreshed benchmark numbers recorded in
@@ -409,6 +467,8 @@ Spec: README §5.3, doc 04 §2. Highlights per PR-sized chunk:
    TTL-bounded, the single un-proven value (README §2).
 4. **The generic dispatch native** + tri-state null convention end-to-end + conformance vs the
    Java `RpcRouterTest` wire shapes, so the JSON-RPC host serves identically from either engine.
+   *Status: no generic native — one UniFFI export per method (decision 4); the per-method JSON
+   shapes are golden-pinned on both sides (`eljson.rs` ↔ `RustVerifiedReadJsonTest`).*
 
 Milestone-B gate: the JSON-RPC server backed by the Rust engine returns wire-identical
 responses to the Java engine for the full verified method set (`RpcRouterTest`-shape
@@ -430,7 +490,8 @@ Spec: doc 03 §§3–7, doc 04 §3. New crate `myotis-evm` (sans-I/O; revm gated
      read: per-call view → cross-call `StateProofCache` → oracle); `StateProofCache`
      (Noop + bounded-LRU `InMemory`) and `BytecodeCache` (Noop + forever `InMemory`), both
      SPIs. Validated by a real revm `transact` of an SLOAD-return contract through the adapter.
-     Decisions: **revm `=41.0.0`, `default-features=false, features=["std"]`** — drops the
+     Decisions: **revm `=41.0.0` (since bumped to `=43.0.3`), `default-features=false,
+     features=["std"]`** — drops the
      C precompile backends (c-kzg/libsecp256k1/blst) for revm's pure-Rust fallbacks, so
      `cargo tree -p myotis-evm` COMPILES only k256 for crypto (`cargo tree -i c-kzg` /
      `-i secp256k1-sys` print "nothing to print" — no C toolchain invoked, cargo-ndk/
@@ -562,7 +623,10 @@ Java engine's.
   misses → the sentinel run IS the answer); sentinel reverts tolerated; last two
   iterations always real; real-run reverts propagate (they're the answer); cap 4 →
   fail-closed `IterationLimitExceeded` (pinned by the cap=1 twin of Java's
-  `iterationCapOfOneAlwaysExceeds`). `estimateGas` bypasses the loop (Java parity).
+  `iterationCapOfOneAlwaysExceeds`; the Rust cap is 12 since #532 —
+  `PREFETCH_ITERATION_CAP`, `myotis-evm/src/executor.rs`). `estimateGas` bypassed the loop
+  (Java parity) until #532; the Rust estimate now converges like every call path, while the Java
+  `PrefetchingEvmExecutor.estimateGas` still bypasses it.
   The wave rides `SnapStateOracle::prefetch_batch` (default no-op for fixtures):
   `PoolOracle` chunks 64 path-sets (Java `BATCH_PATHSET_CHUNK` — here rotation
   granularity, NOT message coalescing: this transport sends one request per
@@ -576,6 +640,10 @@ Java engine's.
   content-addressed.
   *Still deferred (EL-C-3-3):* lanes (heavy/small + the SnapLaneGate semaphore),
   in-flight dedup for concurrent calls, the whole-result RPC cache.
+- *Status at HEAD:* EL-C-3-3 was never built — `rust/` has no lane split, lane gate,
+  cross-call in-flight dedup of `eth_call`s or whole-result cache (all Java-only, in
+  `VerifiedRpcBackend`); the Rust read path does hedge state fetches across peers
+  (`myotis-net/src/el/reader.rs`).
 
 ## Multichain (post-Milestone-C)
 

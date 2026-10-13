@@ -19,7 +19,18 @@ Coverage that source-level checks miss:
     checkcast/instanceof/const-class/new-instance type refs — which crash at
     class load/use even when no individual member is new; a member ref's OWNER
     class is checked too (a since-34 class can inherit a since-1 member);
-  * everything in third-party bytecode, which no source lint ever sees.
+  * everything in third-party bytecode, which no source lint ever sees;
+  * calls D8 moved into a shared SYNTHETIC class. In a release build D8 outlines
+    every call to an API above minSdk into a `$$ExternalSyntheticApiModelOutline<n>`
+    stub (backports and lambdas get `$$ExternalSynthetic…` classes too), and it
+    shares those classes across the whole app under the name of ONE context
+    class: Caffeine's findVarHandle sits in a stub named after Besu's evm.Code,
+    and a lambda D8 found identical in two libraries carries just one of their
+    names. Taken at face value the allowlist would no longer match, and a
+    first-party call could hide behind a third-party name. References made inside
+    such a class are charged to the classes behind it instead: a method's callers,
+    or for a lambda body every class that uses the lambda (through chains of
+    synthetics too); only a synthetic nothing reaches stays its own referrer.
 
 This is the enforcement for the "minSdk 29 JDK-API budget" rule in CLAUDE.md.
 Known third-party residue lives in the allowlist next to this script, each
@@ -191,6 +202,13 @@ DEF_NAME_RE = re.compile(r"^\s+name\s+:\s+'([^']+)'")
 DEF_TYPE_RE = re.compile(r"^\s+type\s+:\s+'([^']+)'")
 MEMBER_RE = re.compile(r" L([\w/$\-]+);\.([\w$<>-]+):(\S+?)(?:;)?\s*//\s*(method|field)@")
 TYPE_RE = re.compile(r" \[*L([\w/$\-]+);\s*//\s*type@")
+# The header dexdump -d prints above each method's code:
+#   2ae0c4:            |[2ae0c4] com.example.Foo.bar:(Ljava/lang/Class;)Ljava/lang/Object;
+# (an instruction line has hex code units after the address, never "|[" there).
+METHOD_HDR_RE = re.compile(r"^[0-9a-f]+:\s+\|\[[0-9a-f]+\] \S+\.([\w$<>\-]+):(\(\S*)$")
+# D8's synthetic classes (API outlines, backports, lambdas, …); in release mode
+# they are shared app-wide under one context class's name — see the docstring.
+SYNTHETIC_RE = re.compile(r"\$\$ExternalSynthetic[A-Za-z]+\d+$")
 
 
 class DexModel:
@@ -199,6 +217,12 @@ class DexModel:
         self.defined = defaultdict(set)   # class -> {"name:type", ...}
         self.defined_names = defaultdict(set)  # class -> {field/method name, ...}
         self.refs = set()         # (referrer, owner, member, kind); kind "class" => member ""
+        # References made INSIDE a D8 synthetic class, per method, charged to its
+        # callers by resolve_synthetics(): (class, method) -> {(owner, member, kind)}
+        self.synthetic_refs = defaultdict(set)
+        # (synthetic class, method) -> {(caller class, caller method)}
+        self.synthetic_callers = defaultdict(set)
+        self.method_headers = 0   # METHOD_HDR_RE matches; 0 = header format drift
 
     def merge(self, other):
         self.supers.update(other.supers)
@@ -207,6 +231,47 @@ class DexModel:
         for k, v in other.defined_names.items():
             self.defined_names[k] |= v
         self.refs |= other.refs
+        for k, v in other.synthetic_refs.items():
+            self.synthetic_refs[k] |= v
+        for k, v in other.synthetic_callers.items():
+            self.synthetic_callers[k] |= v
+        self.method_headers += other.method_headers
+
+    def resolve_synthetics(self):
+        """Charge each synthetic class's references to the real classes behind it.
+
+        Runs on the MERGED model: a stub and its callers may sit in different dex
+        files. A synthetic method's origins are its callers. A method nobody calls
+        by name (a lambda body, reached by interface dispatch) takes the classes
+        that use its class at all instead: new-instance, <init>, an INSTANCE sget.
+        Release-mode D8 shares lambdas across unrelated classes too, so the
+        lambda's own name proves nothing either. Chains of synthetics are followed
+        with a cycle guard; only a synthetic nothing reaches keeps itself as the
+        referrer, so an unresolved reference is still reported, never dropped.
+        """
+        users = defaultdict(set)   # synthetic class -> {(user class, user method | None)}
+        for referrer, owner, _member, _kind in self.refs:
+            if SYNTHETIC_RE.search(owner):
+                users[owner].add((referrer, None))
+        for (cls, method), refs in self.synthetic_refs.items():
+            for owner, _member, _kind in refs:
+                if owner != cls and SYNTHETIC_RE.search(owner):
+                    users[owner].add((cls, method))
+
+        def origins(site, chain):
+            """The non-synthetic classes behind `site`; `chain` = sites on the path."""
+            out = set()
+            for via in self.synthetic_callers.get(site) or users.get(site[0], ()):
+                if not SYNTHETIC_RE.search(via[0]):
+                    out.add(via[0])
+                elif via not in chain:
+                    out |= origins(via, chain | {via})
+            return out
+
+        for site, refs in self.synthetic_refs.items():
+            for referrer in origins(site, frozenset({site})) or {site[0]}:
+                for owner, member, kind in refs:
+                    self.refs.add((referrer, owner, member, kind))
 
 
 def parse_dexdump(dexdump, dex_path):
@@ -214,8 +279,17 @@ def parse_dexdump(dexdump, dex_path):
     proc = subprocess.Popen([dexdump, "-d", dex_path], stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, errors="replace")
     cur = "?"
+    cur_method = "?"
+    cur_synthetic = False
     in_ifaces = False
     pending_name = None
+
+    def add_ref(owner, member, kind):
+        if cur_synthetic:
+            model.synthetic_refs[cur, cur_method].add((owner, member, kind))
+        else:
+            model.refs.add((cur, owner, member, kind))
+
     for line in proc.stdout:
         # Hot path first: the overwhelming majority of lines are instructions,
         # and only member/type refs among them matter.
@@ -228,24 +302,41 @@ def parse_dexdump(dexdump, dex_path):
                     # have eaten a trailing ';' of an object(-array) return type.
                     ret = desc.split(")")[-1]
                     member = name + desc + (";" if ret.lstrip("[").startswith("L") else "")
+                    if SYNTHETIC_RE.search(owner):
+                        model.synthetic_callers[owner, member].add((cur, cur_method))
                 else:
                     member = name
-                model.refs.add((cur, owner, member, kind))
+                add_ref(owner, member, kind)
                 continue
             m = TYPE_RE.search(line)
             if m:
-                model.refs.add((cur, m.group(1), "", "class"))
+                add_ref(m.group(1), "", "class")
+                continue
+        if "|[" in line:
+            m = METHOD_HDR_RE.match(line)
+            if m:
+                # Same spelling as a call site's member above: name + full descriptor.
+                cur_method = m.group(1) + m.group(2)
+                model.method_headers += 1
                 continue
         if "Class descriptor" in line:
             m = CLASS_RE.search(line)
             if m:
                 cur, in_ifaces, pending_name = m.group(1), False, None
+                cur_method, cur_synthetic = "?", bool(SYNTHETIC_RE.search(cur))
                 model.supers.setdefault(cur, [])
                 continue
+        # A synthetic class's own extends/implements is charged like its other
+        # references: as a type ref of site (cur, "?"), which no one calls by
+        # name, so it goes to the class's users (main() skips synthetics in its
+        # class-level loop). model.supers keeps it either way: java_ancestors
+        # walks it.
         if "Superclass" in line:
             m = SUPER_RE.search(line)
             if m:
                 model.supers[cur] = [m.group(1)] + model.supers.get(cur, [])
+                if cur_synthetic:
+                    add_ref(m.group(1), "", "class")
                 continue
         if "Interfaces" in line and "-" in line:
             in_ifaces = True
@@ -254,6 +345,8 @@ def parse_dexdump(dexdump, dex_path):
             m = IFACE_RE.match(line)
             if m:
                 model.supers.setdefault(cur, []).append(m.group(1))
+                if cur_synthetic:
+                    add_ref(m.group(1), "", "class")
                 continue
             in_ifaces = False
         m = DEF_NAME_RE.match(line)
@@ -407,6 +500,12 @@ def main():
     if not model.refs or not model.supers:
         die("dexdump produced no usable output for any dex in the APK — "
             "output format drift? (the gate refuses to pass vacuously)")
+    if not model.method_headers:
+        # Without them no synthetic stub can be traced to its callers, and every
+        # outlined call would be charged to whatever class lends the stub its name.
+        die("dexdump printed no method headers the gate can parse (METHOD_HDR_RE) — "
+            "output format drift? (synthetic classes could not be attributed)")
+    model.resolve_synthetics()
 
     def class_since(cn):
         info = classes.get(cn)
@@ -418,7 +517,10 @@ def main():
         violations[(referrer, target)] = max(since, violations.get((referrer, target), 0))
 
     # Class-level: extends/implements of java.* types crash at class load.
+    # Synthetic classes' supertypes went through resolve_synthetics instead.
     for cls, supers in model.supers.items():
+        if SYNTHETIC_RE.search(cls):
+            continue
         for sup in supers:
             if sup.startswith(("java/", "javax/")):
                 s = class_since(sup)

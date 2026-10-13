@@ -11,6 +11,15 @@ feature: forward and reverse ENS resolution for classic, on-chain names.
 > handles classic names directly; the Universal Resolver path Phase 4
 > introduces is what unifies CCIP-Read.
 
+> **Status (as built):** shipped (`myotis-ens/src/main/java/io/myotis/ens/EnsResolver.java`),
+> and the hosts resolve through it behind the engine API
+> (`VerifiedRpcBackend.resolveEns` on the Java engine). The forward path
+> does not use the Universal Resolver today: it walks the Registry itself
+> (exact node, then each parent, for ENSIP-10 wildcards) and calls the
+> resolver directly — see the status note in
+> [phase4-design.md](phase4-design.md). Reverse resolution is the
+> step-by-step ENSIP-3 path below. `Namehash` stayed in `:myotis-evm`.
+
 ## Acceptance criteria (from the original plan)
 
 - `myotis-ens` module compiles and tests pass.

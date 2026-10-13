@@ -3,26 +3,63 @@
 > **Status: the core transport path is in production, feature-gated and
 > experimental.** `-PtorEngine` links Arti into the Rust engine
 > (`rust/myotis-net/src/el/tor.rs`), and a Settings toggle routes **account
-> (balance/nonce) reads** — the single routing switch sits in
-> `get_account` (`reader.rs`) — over per-address isolated circuits with
-> ephemeral RLPx keys. Wired up on the desktop host only today; storage/token
+> (balance/nonce) reads** — the routing switch sits in `get_account`
+> (`reader.rs`) — over per-address isolated circuits with ephemeral RLPx
+> keys, and **the broadcast of the wallet's own transactions** — the switch
+> sits in `send_judged`; `tor_broadcast` — under a fresh isolation token per
+> send (its circuits carry nothing else), each push confirmed by its peer's
+> Pong, failing closed: a send no peer took over Tor is refused, never sent
+> from the real IP (one that landed on a stream but got no Pong counts as
+> sent — it may be out), and one that went over Tor is never pushed from the
+> real IP again: not rebroadcast, and not re-pushed when the wallet
+> re-submits it, even after Tor is switched off — for as long as the engine
+> still holds its bytes (in memory only, per network: the last 256 sends,
+> `SENT_TX_CACHE_MAX`; a restart, a stop or a pause — Android's idle pause
+> after 5 minutes included — forgets which sends went over Tor).
+> Wired up on the desktop and Android hosts (iOS not yet; on Android
+> `-PtorEngine` reaches the jniLibs — see the Android bullet in
+> [§3](#3-tor-client-library-arti-in-the-rust-engine)); storage/token
 > reads, `eth_call`/gas estimation (a plain transfer's included: the hosts no
 > longer pre-check its recipient through `get_code`, the engine's state oracle
-> reads it), tx broadcast, the CL fetch, and discovery
+> reads it), receipt polling, the CL fetch, and discovery
 > still use the real IP, while contract-code reads are a hybrid: `get_code`
 > anchors through the same `get_account`, so its address-carrying account
 > query follows the Tor toggle and only the content-addressed bytecode fetch
-> stays clearnet. And the shipped path reuses the live
-> clearnet-validated peer pool — no quarantine/aging yet — so the peer serving
-> a Tor read simultaneously holds a clearnet connection from the user's real
-> IP and could pair the two by timing (`reader.rs`'s own KNOWN LIMITATION): a
-> network-privacy win, not yet the full §5 unlinkability. The runnable proof
+> stays clearnet. Tor reads and sends go only to the **Tor reserve**
+> (`el::torreserve`, the `peers-tor[-net].cache` sidecar of §5): verified
+> snap servers moved out of the peer cache — about a third of them, at most
+> 24, in a per-process random order, never a pin — while Tor mode is on. The
+> pool never dials a reserved node directly again, with Tor on or off and
+> across restarts, so the reserve's nodes see this wallet only over Tor. A
+> node is ready for Tor ten minutes after its last direct contact, saved with
+> it in the file (no earlier than the process start for a node this process
+> never saw: the run before may have just dialed it). Tor results keep the
+> file current: a verified read confirms a node; three Tor dials in a row
+> that it refuses (the exit reports the peer's side failing — never a local
+> or circuit failure) send it back to the peer cache, and this process does
+> not take it again; a reserve over its share — the cache shrank — hands its
+> weakest nodes back, Tor on or off. Among equally good nodes each read draws
+> a fresh order, so reads spread over the reserve. Both directions are also guarded
+> in-process by node id: a node reached over Tor is left undialed directly
+> until ten minutes past the Tor operation's end, claimed under the same lock
+> as a direct dial; with no ready node the read or send fails closed
+> (`PeerPool::tor_candidates` / `claim_for_tor`, `TOR_DIRECT_SEPARATION`).
+> Tor-side Hellos name the software without its version (`myotis`, §6.3).
+> That is a first step toward §5, not the design: no days-long randomized
+> quarantine, no batch rotation, discovery's UDP pings still reach many nodes
+> from the real IP, the Java engine (no Tor mode) shares the peer cache but
+> not the reserve — a node it dials while reserved leaves the reserve on the
+> Rust engine's next start — an operator running many nodes can pool what
+> they see, and a host without a data directory has no reserve, so Tor always
+> fails closed there — a network-privacy win, not yet the full §5
+> unlinkability. The runnable proof
 > of concept
 > (`rust/tor-poc`, see [§9](#9-proof-of-concept--what-was-validated)) validated
 > the transport against live mainnet and its measurements are folded back in
-> below (marked **PoC:**). The quarantined peer pool, multi-source promotion,
-> and request-shape hardening remain unimplemented proposals — everything about
-> them is design, not shipped behavior.
+> below (marked **PoC:**). The full quarantined peer pool, multi-source
+> promotion, and request-shape hardening remain unimplemented proposals —
+> everything about them beyond the ten-minute separation above is design, not
+> shipped behavior.
 
 Companion docs: [Disk & Network Usage](disk-and-network-usage.md) (traffic volumes
 this design would route), [Optimisations & Limitations](../OPTIMISATIONS_AND_LIMITATIONS.md)
@@ -44,7 +81,7 @@ sensitivity:
 | **CL light client** (finality/committee updates) | Content is public chain data, identical for every client — nothing user-specific. It does *fingerprint* the IP as running an Ethereum CL light client, with wake/sleep timing that mirrors app usage. | Low (content-benign) |
 | **Discovery** (discv4/discv5) | The IP participates in the Ethereum DHTs — i.e. runs a client. No addresses involved. | Low |
 
-> **Disclosure set widens under read hedging (clearnet).** Interactive verified reads hedge across peers to survive a silent one (`INTERACTIVE`/`HEDGE_DELAY`, myotis #320): an address-carrying read whose first peer is slower than the hedge delay discloses `keccak(address)` to up to `MAX_HEDGED_ATTEMPTS` (3) peers, not one, even when the first peer goes on to answer. Sequential rotation disclosed to a new peer only on failure; hedging discloses on slowness. This is a clearnet-only tradeoff — the Tor read path routes each address over its own circuit *before* hedging, so it is unaffected. `eth_call` and gas estimation hedge their account, storage and bytecode reads through the same race (the state oracle, `evm.rs`), so on the oracle's serial path the accounts and storage-key hashes a call touches reach up to three peers under the same condition — and those reads have no Tor path at all (see Status above), so the Tor toggle does not narrow them. Block and receipt reads are hedged too; they carry no address, but *which* blocks a send is being watched in (the Receipt tracking row above) now reaches up to three peers the same way. Accepted deliberately: the alternative (excluding address-carrying reads from hedging) would leave exactly the slow-link case this leak's worst environment — mobile/congested — stalling.
+> **Disclosure set widens under read hedging (clearnet).** Interactive verified reads hedge across peers to survive a silent one (`HEDGE_DELAY`, myotis #320): an address-carrying read whose first peer is slower than the hedge delay discloses `keccak(address)` to up to `MAX_HEDGED_ATTEMPTS` (3) peers, not one, even when the first peer goes on to answer. Sequential rotation disclosed to a new peer only on failure; hedging discloses on slowness. This is a clearnet-only tradeoff — the Tor read path routes each address over its own circuit *before* hedging, so it is unaffected. `eth_call` and gas estimation hedge their account, storage and bytecode reads through the same race (the state oracle, `evm.rs`), so on the oracle's serial path the accounts and storage-key hashes a call touches reach up to three peers under the same condition — and those reads have no Tor path at all (see Status above), so the Tor toggle does not narrow them. Block and receipt reads are hedged too; they carry no address, but *which* blocks a send is being watched in (the Receipt tracking row above) now reaches up to three peers the same way. Accepted deliberately: the alternative (excluding address-carrying reads from hedging) would leave exactly the slow-link case this leak's worst environment — mobile/congested — stalling.
 
 The design goal is therefore precise: **unlink the snap-query and tx-broadcast
 flows from the user's IP**, without breaking the trust model, and without paying
@@ -111,7 +148,39 @@ embeddable as a plain library) inside the **Rust engine** — and only there:
   Android as jniLibs (`cargoNdkAndroid`); Arti compiles for the same NDK
   targets and embeds in the engine, so the Android host needs no separate Tor
   integration (no bundled daemon, no Orbot dependency). Likewise iOS, where the
-  Rust engine is the only engine.
+  Rust engine is the only engine (not wired yet). **Shipped on Android behind
+  `-PtorEngine`** (`./gradlew :android-app:assembleDebug -PtorEngine`, which
+  sets `MYOTIS_TOR_ENGINE=1` for `rust/build-android.sh`), with three
+  Android-only differences:
+  - *TLS backend.* Off Android Arti runs on native-tls; on Android that means
+    OpenSSL, which the NDK does not ship, so the Android jniLibs take Arti's
+    rustls backend with the **ring** provider — already linked there through
+    libp2p-quic — and `el/tor.rs` installs it as the process default before
+    the first bootstrap (Arti's rustls backend panics without one). The two
+    are separate per-target dependency tables in `myotis-net/Cargo.toml`
+    because tor-rtcompat silently prefers native-tls when both are on.
+  - *SQLite is bundled* (`arti-client/static-sqlite`) for Arti's directory
+    cache: the NDK has no libsqlite3 to link and apps may not load the
+    platform's.
+  - *Storage directories are named by the host.* Arti's defaults derive from
+    `$HOME`, which an app process has no usable value for, so the engine
+    refuses an unconfigured Android bootstrap; `NodeService.applyTorMode`
+    names `noBackupFilesDir/arti/state` (guard state — never backed up) and
+    `cacheDir/arti` (the re-downloadable directory cache) through
+    `Tor.configureStorage` → `set_tor_storage_dirs` (ABI 43) before it turns
+    routing on. The directories cannot move once a bootstrap holds them; a
+    different pair after that is refused, not ignored.
+
+  Checked at build level so far (both ABIs cross-compile; the engine's only
+  NEEDED libraries stay libc/libm/libdl); an on-device bootstrap has not been
+  observed yet.
+
+  Arti adds ~9.3 MB per ABI to `libmyotis_engine.so` (arm64-v8a 15.4 →
+  24.8 MB, measured 2026-10-10), stored uncompressed in the APK, so — as on
+  desktop — no CI or release build passes the flag. The Settings row appears
+  only in a build that did: `supportsTor` reads `BuildConfig.TOR_ENGINE` first,
+  so a Tor-less APK never loads the engine library just to learn it cannot
+  route, and a Tor build confirms it with the loaded library.
 - **The Java engine gets no Tor mode for now.** A Java path would mean bundling
   a Tor daemon and driving it over SOCKS — deliberately out of scope; hosts
   that want private mode select the Rust engine (`myotis.engine=rust`). This
@@ -175,7 +244,18 @@ Route by sensitivity, not wholesale:
 4. **Real snap queries** for the user's addresses — per-address circuit
    isolation (§3) and **ephemeral RLPx node keys** (§6.1).
 5. **Transaction broadcast** — over Tor to the proven peer pool; zero trust cost
-   by construction.
+   by construction. **Shipped:** up to five pool peers at once under one
+   isolation token fresh to the send, each push a fresh RLPx identity
+   confirmed by the peer's Pong (`EthSession::await_pong`); the send answers
+   at the first confirmed push, counts a push that landed without a Pong as
+   sent (it may be out), and fails closed when none landed. Rebroadcasts
+   follow the same route, one round at a time per network, each walking on to
+   the next five eligible peers; a Tor send is never re-pushed in the clear, a
+   wallet's re-submit of it included (while the engine still holds its
+   bytes: in memory only, forgotten on a restart, a stop or a pause — see the
+   status note above). The peers are nodes of the Tor reserve,
+   ready ten minutes after their last direct contact (status note above); Tor sessions advertise
+   no listen port and the client id `myotis` without its version (§6.3).
 
 ## 5. The quarantined peer pool (delayed use)
 
@@ -259,6 +339,14 @@ Design rules:
   `snapok` preference. (Entries whose peer disappears from `peers.cache` are
   pruned; a missing sidecar just means an empty Tor pool — fail closed, §5.)
 
+  > **Shipped (a first step):** the sidecar exists as `peers-tor[-net].cache`
+  > (`el::torreserve`), but holds the reserved nodes themselves rather than
+  > metadata joined against `peers.cache`: a reserved node moves out of the
+  > shared cache, so neither the direct pool nor a Java-side rewrite sees it,
+  > and its `lastClearnetContact` is the `direct=` column. The threshold is a
+  > fixed ten minutes, not a randomized days-long one, and there are no
+  > discovery-source confirmations yet (status note at the top).
+
 ## 6. Attacks the delay does NOT stop (each needs its own fix)
 
 The aging window defeats **timing correlation** — with days in between and
@@ -299,6 +387,11 @@ anonymity set prevents pairing *which* instance. With very few users, the
 correlation is strong regardless of delay. Structural today; dissolves with
 adoption. It argues for making Tor-side request shapes as generic as practical,
 and for not shipping a unique clientId on the Tor path.
+
+> **Shipped:** the Tor-side Hello says `myotis`, without the version
+> (`el::tor::TOR_CLIENT_ID`), so a peer cannot match a Tor session to a direct
+> one by version; it still names the software (an owner's choice over
+> borrowing another client's id), and the request shapes are unchanged.
 
 ## 7. What each mechanism buys — summary
 
@@ -341,6 +434,11 @@ and for not shipping a unique clientId on the Tor path.
 6. **Tx broadcast fan-out over Tor** — one circuit to a few aged peers, or
    several isolated circuits to disjoint peer subsets (stronger against a
    listening peer, more circuit builds)?
+   > **Shipped as:** one isolation token per send (its circuits carry no
+   > other send and no read), up to five nodes of the Tor reserve (no direct
+   > contact for ten minutes, never dialed directly again); each rebroadcast
+   > round walks on to the next five. The
+   > days-long aging of §5 is not built, so the stronger options remain open.
 7. **Mobile cost** — the embedded Arti client keeps a
    guard connection alive; interaction with idle-pause and battery needs design
    (probably: Tor client lifecycle == stack awake lifecycle).
@@ -377,7 +475,8 @@ against live mainnet. See `rust/tor-poc/README.md` for how to run it.
   balance for `d8dA…6045` against a synced peer's head state root).
 
 **Deliberately out of scope (still proposals):** the quarantined peer pool and
-its aging window (§5), the `peers-tor` sidecar, multi-source popularity
+its aging window (§5; a first step, the `peers-tor` reserve, has shipped since),
+multi-source popularity
 promotion (§6.2), generic request-shape hardening (§6.3), tx-broadcast fan-out
 (§8.6), and — importantly — **the beacon-anchored trust root**: the PoC anchors
 the snap proof to the peer's *own claimed* fresh head, not the sync-committee
@@ -465,9 +564,10 @@ Run *underneath* Myotis by the user, a system VPN covers, with zero Myotis
 code, everything the embedded Tor path does not:
 
 - **The UDP surfaces** — discv4/discv5 discovery can never cross Tor (§2).
-- **Every not-yet-routed flow** — storage/token reads, `eth_call`, tx
-  broadcast, the CL fetch, and the host-side HTTP/DNS surfaces (DNS ENR walk,
-  CCIP-Read, the tx-history debug fetch) — on both engines.
+- **Every not-yet-routed flow** — storage/token reads, `eth_call`, receipt
+  polling, the CL fetch, and the host-side HTTP/DNS surfaces (DNS ENR walk,
+  CCIP-Read, the tx-history debug fetch) — on both engines, plus the tx
+  broadcast whenever Tor mode is off.
 - **A path around §8.9.** Synced peers drop Tor exits because the whole Tor
   network arrives from one small, saturated, widely blocklisted set of exit
   IPs. Gnosis VPN's exits are today ordinary, low-traffic addresses that
@@ -506,6 +606,11 @@ Re-evaluate when any of these becomes true:
 - snap request shapes: `networking/.../eth/EthHandler.java`
   (`SNAP_RESPONSE_BYTES`, GetAccountRange/GetStorageRanges senders)
 - Tx broadcast: `networking/.../rlpx/RLPxConnector.java`
-  (`broadcastTransaction`)
+  (`broadcastTransaction`); Rust: `rust/myotis-net/src/el/reader.rs`
+  (`send_judged`, `tor_broadcast`, `rebroadcast_route`),
+  `rust/myotis-net/src/el/tor.rs` (`push_transaction`)
 - DNS ENR trees: `networking/dns/DnsEnrResolver`, `NetworkConfig.elEnrTreeUrls`
+- Tor transport + Arti setup: `rust/myotis-net/src/el/tor.rs`; host seams:
+  `myotis-engines/.../Tor.java`, desktop `DesktopNode.applyTorMode`, Android
+  `NodeService.applyTorMode`
 - Hello clientId: `networking/.../HelloMessage.java`

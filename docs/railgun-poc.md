@@ -86,7 +86,7 @@ out of coverage, and under this flavour's paused backfill
 but not free. The direction that corrupts is the other one: a `from_block`
 *above* the real deployment turns the history below it into plausible empty
 answers (`LogIndex::query` clamps its coverage check to `from_block`,
-`el/logindex.rs:563`), which is why `synth_logindex.py` refuses a deployment
+`el/logindex.rs:627`), which is why `synth_logindex.py` refuses a deployment
 block above the fetch's low edge.
 
 **On Sepolia the SDK and the chain disagree, and the chain decides.** The proxy
@@ -108,7 +108,7 @@ deployment.
 
 ## Building the seed
 
-The data is **not committed**. The Bee flavour's set is a 58 MB gzip of ~39k
+The data is **not committed**. The Bee flavour's set is a 3.2 MB gzip of ~39k
 logs; the mainnet one here is ~438k logs and 589 MB raw, which does not belong in
 a clone. Fetch each once, onto a host with synced nodes, and point the build at
 them. Mainnet's range starts before the Merge (block 15,537,394), so its node must
@@ -201,8 +201,8 @@ usable until; rebuild the app with a fresh fetch after that.
   switches the log index on, stores the seed's watch entry and **pins the RPC
   port: 8555 for mainnet, 8557 for Sepolia**. **Sepolia itself stays off**
   (owner's decision, #530: a second network runs a second beacon light client and
-  EL peer pool, which a mainnet-only demo should not pay for). Switch it on on the
-  Network screen and it comes up with its seeded index. Point the wallet at
+  EL peer pool, which a mainnet-only demo should not pay for). Switch it on under
+  Settings → Networks and it comes up with its seeded index. Point the wallet at
   `http://127.0.0.1:8555`, or `http://127.0.0.1:8557` once Sepolia is on; each
   serves as soon as its beacon sync reaches `SYNCED`.
 - Each network is configured exactly once. An install whose first start predates

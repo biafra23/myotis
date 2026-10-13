@@ -120,6 +120,18 @@ impl Engine for Fake {
         }
         canned
     }
+    fn create_access_list(&self, tx: &str, b: &str, o: &str) -> String {
+        let canned = self.get("access_list", format!("{tx}|{b}|{o}"));
+        if self.tx_through_engine {
+            return myotis_engine::ffi::create_access_list_json(
+                i64::MIN,
+                tx.into(),
+                b.into(),
+                o.into(),
+            );
+        }
+        canned
+    }
     fn block_by_number(&self, t: &str, f: bool) -> String {
         self.get("block", format!("{t},{f}"))
     }
@@ -548,6 +560,59 @@ fn estimate_gas() {
     );
 }
 
+/// `eth_createAccessList` (ABI 40): geth's result shape, the list and the gas
+/// as a quantity; a reverting run keeps its list, its error decoded next to
+/// it; the engine's refusals and non-answers map as the estimate's do.
+#[test]
+fn create_access_list() {
+    let ok = r#"{"status":"ok","accessList":[{"address":"0x2222222222222222222222222222222222222222","storageKeys":["0x0000000000000000000000000000000000000000000000000000000000000001"]}],"gasUsed":32437,"blockNumber":1000,"verified":false}"#;
+    let r = Router::new(Fake::new().reply("access_list", ok));
+    let v = result(&r, "eth_createAccessList", json!([{"from": ADDR, "to": TOKEN, "gas": "0x7a120"}, "latest"]));
+    assert_eq!(v["gasUsed"], "0x7eb5");
+    assert_eq!(v["accessList"][0]["address"], "0x2222222222222222222222222222222222222222");
+    assert_eq!(v["accessList"][0]["storageKeys"].as_array().map(Vec::len), Some(1));
+    assert!(v.get("error").is_none(), "{v}");
+    // The canonical object and the selector reach the engine, the gas applied.
+    assert!(calls(&r)[0].starts_with("access_list(") && calls(&r)[0].contains(r#""gas":"0x7a120""#) && calls(&r)[0].ends_with("|latest|)"), "{:?}", calls(&r));
+    // A state override is applied, as for the estimate.
+    let r = Router::new(Fake::new().reply("access_list", ok));
+    result(&r, "eth_createAccessList", json!([{"to": TOKEN}, "latest", {TOKEN: {"balance": "0x1"}}]));
+    assert!(calls(&r)[0].contains(r#"|latest|{"#), "{:?}", calls(&r));
+    // A fourth argument is one too many (geth's rule; block overrides are
+    // never applied).
+    let r = Router::new(Fake::new().reply("access_list", ok));
+    assert_eq!(error(&r, "eth_createAccessList", json!([{"to": TOKEN}, "latest", null, {}])).0, -32602);
+
+    // The run's own revert rides next to the list — never a code-3 error —
+    // with the reason decoded as the code-3 error decodes it.
+    let reverted = r#"{"status":"ok","accessList":[],"gasUsed":23105,"vmError":"execution reverted","revertDataHex":"0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000003626164000000000000000000000000000000000000000000000000000000000000","blockNumber":1000,"verified":false}"#;
+    let r = Router::new(Fake::new().reply("access_list", reverted));
+    let v = result(&r, "eth_createAccessList", json!([{"to": TOKEN}]));
+    assert_eq!(v["error"], "execution reverted: bad");
+    assert_eq!(v["gasUsed"], "0x5a41");
+    let halted = r#"{"status":"ok","accessList":[],"gasUsed":100000,"vmError":"out of gas","blockNumber":1000,"verified":false}"#;
+    let r = Router::new(Fake::new().reply("access_list", halted));
+    assert_eq!(result(&r, "eth_createAccessList", json!([{"to": TOKEN}]))["error"], "out of gas");
+
+    let r = Router::new(Fake::new().reply(
+        "access_list",
+        r#"{"status":"infeasible","reason":"err: intrinsic gas too low: have 21000, want 21064 (supplied gas 21000)"}"#,
+    ));
+    let (code, msg, _) = error(&r, "eth_createAccessList", json!([{"to": TOKEN, "gas": "0x5208"}]));
+    assert_eq!((code, msg.starts_with("err: intrinsic gas too low")), (-32000, true), "{msg}");
+    let r = Router::new(Fake::new().reply("access_list", r#"{"status":"unavailable","reason":"no peer"}"#));
+    assert_eq!(error(&r, "eth_createAccessList", json!([{"to": TOKEN}])).0, -32000);
+    let r = Router::new(Fake::new().reply("access_list", r#"{"error":"no slot number","code":-32602}"#));
+    assert_eq!(error(&r, "eth_createAccessList", json!([{"to": TOKEN}])).0, -32602);
+    // A contradictory object is refused by the engine's own request checks.
+    let mut f = Fake::new();
+    f.tx_through_engine = true;
+    let r = Router::new(f);
+    let (code, msg, _) = error(&r, "eth_createAccessList", json!([{"to": TOKEN, "type": "0x4"}]));
+    assert_eq!(code, -32602, "{msg}");
+    assert!(msg.contains("requires an authorizationList"), "{msg}");
+}
+
 #[test]
 fn fees() {
     let r = Router::new(
@@ -649,6 +714,12 @@ fn get_logs() {
     assert_eq!(error(&r, "eth_getLogs", json!([])).0, -32602);
 }
 
+/// The EIP-155 spec transaction (chainId 1, nonce 9): bytes the send gate
+/// passes, so a send reaches the engine.
+const SPEC_TX: &str = "0xf86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a7\
+                       6400008025a028ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276a0\
+                       67cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83";
+
 #[test]
 fn syncing_and_send() {
     let mut f = Fake::new().reply(
@@ -657,18 +728,33 @@ fn syncing_and_send() {
     );
     let r = Router::new(f);
     assert_eq!(result(&r, "eth_syncing", json!([])), false);
-    let (code, msg, _) = error(&r, "eth_sendRawTransaction", json!(["0x02f8"]));
+    let (code, msg, _) = error(&r, "eth_sendRawTransaction", json!([SPEC_TX]));
     assert_eq!(
         (code, msg.as_str()),
         (-32000, "nonce too low: next nonce 5, tx nonce 4")
     );
     assert_eq!(error(&r, "eth_sendRawTransaction", json!(["0x"])).0, -32602);
 
+    // The engine's own refusal of bytes it will not relay (#360, ABI 44): the
+    // permanent envelope, answered -32602 with its reason.
+    let r = Router::new(Fake::new().reply(
+        "send",
+        r#"{"error":"invalid sender: the signature recovers no address","code":-32602}"#,
+    ));
+    let (code, msg, _) = error(&r, "eth_sendRawTransaction", json!([SPEC_TX]));
+    assert_eq!(
+        (code, msg.as_str()),
+        (
+            -32602,
+            "method 'eth_sendRawTransaction' refused: invalid sender: the signature recovers no address"
+        )
+    );
+
     f = Fake::new().reply("send", &format!(r#"{{"txHash":"0x{}"}}"#, "ab".repeat(32)));
     f.status = r#"{"running":true,"beaconState":"CATCHING_UP"}"#.into();
     let r = Router::new(f);
     assert_eq!(
-        result(&r, "eth_sendRawTransaction", json!(["0x02f8"])),
+        result(&r, "eth_sendRawTransaction", json!([SPEC_TX])),
         format!("0x{}", "ab".repeat(32))
     );
     assert_eq!(result(&r, "eth_syncing", json!([]))["highestBlock"], "0x0");
@@ -880,6 +966,37 @@ fn non_blocking_methods_and_bad_params_never_wait() {
     assert_eq!(error(&r, "eth_getBalance", json!(["0x12"])).0, -32602);
     assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
     assert!(calls(&r).is_empty());
+}
+
+#[test]
+fn bytes_that_are_no_transaction_are_refused_before_the_readiness_hold() {
+    // #360: judged on the bytes alone — no hold, no engine call, and the
+    // permanent -32602 in the engine's words, even in a batch whose wait is
+    // already spent.
+    let r = unready(Duration::from_secs(30));
+    let t0 = Instant::now();
+    let (code, msg, _) = error(&r, "eth_sendRawTransaction", json!(["0x00"]));
+    assert_eq!(
+        (code, msg.as_str()),
+        (
+            -32602,
+            "method 'eth_sendRawTransaction' refused: invalid raw transaction: transaction type not supported (0x0)"
+        )
+    );
+    assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+    assert!(calls(&r).is_empty(), "{:?}", calls(&r));
+    let r = unready(Duration::from_millis(300));
+    let body = format!(
+        r#"[{{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["{ADDR}","latest"]}},
+            {{"jsonrpc":"2.0","id":2,"method":"eth_sendRawTransaction","params":["0x02c0"]}}]"#
+    );
+    let v: Value = serde_json::from_str(&r.handle(&body).unwrap()).unwrap();
+    let send = &v.as_array().unwrap()[1];
+    assert_eq!(send["error"]["code"], -32602, "{send}");
+    assert_eq!(
+        send["error"]["message"],
+        "method 'eth_sendRawTransaction' refused: invalid raw transaction: malformed type 0x2 transaction"
+    );
 }
 
 #[test]

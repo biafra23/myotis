@@ -38,6 +38,10 @@ read on the correct path).
 
 Document the chosen path in Phase 2's PR.
 
+**Status:** Phase 2 settled it the other way — sentinel-return, with the
+tracer kept to record the access list (`PrefetchingEvmExecutor`; see
+[phase2-design.md](phase2-design.md) for why).
+
 ## Open question 2 — Persistent bytecode cache layout
 
 Deferred. The Phase 0 `BytecodeCache.inMemory()` is intentional: it works
@@ -53,6 +57,10 @@ A separate file-based cache (e.g. content-addressed under
 `$cacheDir/bytecode/<first-2-hex-bytes>/<full-hash>`) is also viable and
 avoids large-blob churn in SQLite. Decision to be made when the wallet
 team integrates this module.
+
+**Status:** still open. Both engines keep verified bytecode in memory only
+(`BytecodeCache.inMemory()` in `rpc-backend`'s `VerifiedRpcBackend`;
+`InMemoryBytecodeCache` in `rust/myotis-net/src/el/reader.rs`).
 
 ## Open question 3 — CCIP-Read gateway selection strategy
 
@@ -78,8 +86,8 @@ re-resolve `name` forward and confirm the resulting address matches the
 original `addr`. Without that step, anyone can claim any name in their
 reverse record without proof of ownership.
 
-Phase 3's `EnsResolver.resolveName` will perform this verification and
-return `null` if the round-trip mismatches.
+Phase 3's `EnsResolver.resolveName` performs this verification and
+returns `Optional.empty()` if the round-trip mismatches.
 
 ## Plan deviation — module language for ENS
 
@@ -87,3 +95,7 @@ The plan separates `myotis-ens` into its own Gradle module that depends on
 `myotis-evm`. To avoid a half-empty module, the Phase 0 / pre-Phase-3
 `Namehash` helper lives in `io.myotis.evm.ens` for now. Phase 3 relocates
 it without API impact; only the package import changes.
+
+**Status:** Phase 3 kept it in `:myotis-evm` (`io.myotis.evm.ens.Namehash`)
+rather than create a `:myotis-evm` → `:myotis-ens` dependency; see
+[phase3-design.md](../ens/phase3-design.md).

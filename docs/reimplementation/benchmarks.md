@@ -5,6 +5,11 @@
 > (one command, re-runnable). **These are PRELIMINARY v1 numbers** — read the caveats
 > before drawing conclusions; a clean multi-run pass is recommended before the final
 > EL-phase decision.
+>
+> *Status:* a dated record — no later run is recorded here. The Rust engine measured below is
+> the CL-only R1 over hand-JNI; it has since gained the full EL, its persistence under `dataDir`
+> (confound 2's missing peer cache — [06](06-rust-phase-notes.md) gap #1) and a UniFFI
+> boundary, so its numbers do not describe the Rust engine at HEAD.
 
 ## Correctness (the part that is NOT preliminary)
 

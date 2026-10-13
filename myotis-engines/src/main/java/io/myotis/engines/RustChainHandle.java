@@ -81,6 +81,10 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     private final RustVerifiedReads verifiedReads = new RustVerifiedReads(this);
     /** The running JSON-RPC server, or null when disabled / not started. */
     private volatile io.myotis.jsonrpc.MyotisRpcServer rpcServer;
+    /** The listener's web-page gate (#502) — the policy the host installs and the
+     *  recent-origins list, owned by the handle so they work before the server
+     *  exists and after it stopped (ChainStack parity). */
+    private final io.myotis.jsonrpc.WebAccess webAccess = new io.myotis.jsonrpc.WebAccess();
 
     /** Monotonic time (ns) the current run's start() was ENTERED — uptime counts the native
      *  boot itself, not just the time since it finished; drives {@link #uptimeSeconds()}.
@@ -408,7 +412,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                 probe.bind(new java.net.InetSocketAddress("127.0.0.1", rpcPort));
             }
             io.myotis.jsonrpc.MyotisRpcServer server =
-                    io.myotis.jsonrpc.MyotisRpc.server(rpcPort, null, "127.0.0.1", verifiedReads, this, this);
+                    io.myotis.jsonrpc.MyotisRpc.server(rpcPort, null, "127.0.0.1", verifiedReads, this, this,
+                            webAccess);
             server.start();
             this.rpcServer = server;
             log.info("[{}] JSON-RPC listening on http://127.0.0.1:{} (verified, strict)",
@@ -778,6 +783,19 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     }
 
     @Override
+    public io.myotis.api.WebAccessPolicy setWebAccessPolicy(io.myotis.api.WebAccessPolicy policy) {
+        // The listener is the shared Kotlin server on both engines, so the policy
+        // never crosses the FFI: it lands on the gate this handle owns — live, and
+        // before start() too (hosts set it between create() and start()).
+        return io.myotis.jsonrpc.WebAccessApi.apply(webAccess, policy);
+    }
+
+    @Override
+    public List<io.myotis.api.WebOrigin> recentWebOrigins() {
+        return io.myotis.jsonrpc.WebAccessApi.recent(webAccess);
+    }
+
+    @Override
     public void acceptStaleAnchor() {
         if (!RustEngineNative.nativeAcceptStaleAnchor(handle)) {
             log.warn("[engines] acceptStaleAnchor dropped: unknown handle {}", handle);
@@ -830,7 +848,9 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                 o.getLong("finalizedPeriod", 0L),
                 o.getLong("wallClockPeriod", 0L),
                 o.getLong("finalizedBlockNumber", 0L),
-                o.getLong("optimisticBlockNumber", 0L));
+                o.getLong("optimisticBlockNumber", 0L),
+                // ABI >= 41: the proven block timestamp, null when none is proven.
+                longOrMinusOne(o, "blockTimestamp"));
         } catch (RuntimeException e) {
             // A type-mismatched field (Rust-side shape drift) surfaces as an
             // EngineException, never a raw UnsupportedOperationException.
@@ -1024,6 +1044,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                 throw new EngineException("resolve-ens JSON: missing blockNumber");
             }
             long block = bn.asLong();
+            long blockTimestamp = longOrMinusOne(o, "blockTimestamp");
             // verified=false: the resolution IS proof-verified against the
             // beacon-anchored optimistic head, but "verified" in this API means a
             // beacon-FINALIZED root (see RustEnsApi) — don't overclaim.
@@ -1038,14 +1059,14 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                         throw new EngineException(
                                 "resolve-ens JSON: status=ok without an addressHex");
                     }
-                    yield new EnsResolutionResult(name, addressHex, block, false, null);
+                    yield new EnsResolutionResult(name, addressHex, block, false, null, blockTimestamp);
                 }
                 // API convention: addressHex==null && error==null is a SUCCESSFUL
                 // "name has no record".
-                case "noRecord" -> new EnsResolutionResult(name, null, block, false, null);
+                case "noRecord" -> new EnsResolutionResult(name, null, block, false, null, blockTimestamp);
                 case "offchain" -> new EnsResolutionResult(name, null, block, false,
                         "name resolves offchain (ERC-3668); CCIP-Read not yet supported"
-                        + " on the rust engine");
+                        + " on the rust engine", blockTimestamp);
                 default -> throw new EngineException(
                         "resolve-ens JSON: unknown status '" + status + "'");
             };
@@ -1089,6 +1110,63 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
             String txJson, String block, String stateOverridesJson) {
         return estimateGasDetailedFromJson(gated(() -> RustEngineNative.nativeEstimateGasTxJson(
                 handle, txJson, block, stateOverridesJson)));
+    }
+
+    /**
+     * One verified {@code eth_createAccessList} for the full transaction object
+     * (ABI 40): the arguments of {@link #estimateGasTxVerifiedDetailed}. Throws
+     * {@link EngineException} on a transport / not-running failure.
+     */
+    io.myotis.api.AccessListResult createAccessListVerified(String txJson, String block, String stateOverridesJson) {
+        return accessListFromJson(gated(() -> RustEngineNative.nativeCreateAccessListJson(
+                handle, txJson, block, stateOverridesJson)));
+    }
+
+    /** Package-private test seam: access-list JSON (ABI 40) → the engine's
+     *  outcome. The Rust side emits {@code {"status":"ok","accessList":[…],
+     *  "gasUsed":N}} — plus {@code vmError} (and {@code revertDataHex} for a
+     *  revert) when the run itself failed, which geth reports NEXT TO the list
+     *  as its {@code error}; it is not a top-level {@code error}, the engine's
+     *  failure envelope — / {@code {"status":"unavailable","reason"}} /
+     *  {@code {"status":"infeasible","reason"}}. The permanent {@code {"error",
+     *  "code":-32602}} envelope is REFUSED and a plain {@code {"error"}} throws,
+     *  as for {@link #callDetailedFromJson}; an {@code ok} without its list or
+     *  gas is shape drift and fails closed. */
+    static io.myotis.api.AccessListResult accessListFromJson(String json) {
+        JsonObject o = parseJsonObject(json, "createAccessList");
+        String refusal = permanentRefusalOrNull(o);
+        if (refusal != null) return io.myotis.api.AccessListResult.refused(refusal);
+        throwIfError(o);
+        try {
+            String status = stringOrNull(o, "status");
+            if ("ok".equals(status)) {
+                var list = o.get("accessList");
+                if (list == null || !list.isArray()) {
+                    throw new EngineException("createAccessList JSON: status=ok without an accessList array");
+                }
+                var gasUsed = o.get("gasUsed");
+                if (gasUsed == null || !gasUsed.isNumber()) {
+                    throw new EngineException("createAccessList JSON: status=ok without a numeric gasUsed");
+                }
+                String payload = stringOrNull(o, "revertDataHex");
+                return io.myotis.api.AccessListResult.ok(
+                        list.toString(), gasUsed.asLong(), stringOrNull(o, "vmError"),
+                        payload == null ? null : hexToBytes(payload));
+            }
+            if ("infeasible".equals(status)) {
+                String reason = stringOrNull(o, "reason");
+                if (reason == null || reason.isBlank()) {
+                    throw new EngineException("createAccessList JSON: status=infeasible without a reason");
+                }
+                return io.myotis.api.AccessListResult.infeasible(reason);
+            }
+            return io.myotis.api.AccessListResult.unavailable(stringOrNull(o, "reason"));
+        } catch (EngineException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            throw new EngineException(
+                    "malformed createAccessList JSON from the Rust engine: " + e.getMessage(), e);
+        }
     }
 
     /** Package-private test seam: estimateGas JSON → the engine's three-way outcome.
@@ -1431,24 +1509,46 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      * Gossip a signed raw transaction: its 32-byte hash as
      * {@link io.myotis.api.SendResult.Status#SENT}, or (ABI 36, #531)
      * {@link io.myotis.api.SendResult.Status#REJECTED} with geth's reason for
-     * one the engine refused before broadcasting it. Throws
-     * {@link EngineException} when no peer could be reached / the input isn't
-     * a plausible tx. {@code rawTxHex} is the 0x-hex raw transaction.
+     * one the engine refused before broadcasting it, or (ABI 44, #360)
+     * {@link io.myotis.api.SendResult.Status#REFUSED} for bytes that are no
+     * transaction it relays. Throws {@link EngineException} when no peer could
+     * be reached. {@code rawTxHex} is the 0x-hex raw transaction.
      */
     io.myotis.api.SendResult sendRawTransactionDetailedVerified(String rawTxHex) {
+        // Bytes that are no transaction are refused on the bytes alone (ABI 45, #360),
+        // BEFORE the wake wait: a paused or starting node must not hold that permanent
+        // refusal, or turn it into a retryable one when the resume fails. The send
+        // runs the same gate again.
+        String refusal = sendGateRefusalOrNull(RustEngineNative.nativeCheckRawTransactionJson(rawTxHex));
+        if (refusal != null) return io.myotis.api.SendResult.refused(refusal);
         return sendResultFromJson(
                 gated(() -> RustEngineNative.nativeSendRawTransactionJson(handle, rawTxHex)));
+    }
+
+    /** Package-private test seam: the send gate's JSON → its refusal, or null when the
+     *  bytes may be sent ({@code {"ok":true}}) or the answer is no refusal (bad hex,
+     *  shape drift) — the send itself then answers. */
+    static String sendGateRefusalOrNull(String json) {
+        try {
+            return permanentRefusalOrNull(parseJsonObject(json, "checkRawTransaction"));
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     /**
      * Package-private test seam: send-tx JSON → its outcome.
      * {@code {"status":"rejected","reason"}} is the engine's answer (geth's
-     * txpool verdict, nothing broadcast); otherwise the hash, as
-     * {@link #txHashFromJson} reads it (throwing on an error or a malformed
-     * payload).
+     * txpool verdict, nothing broadcast); the permanent
+     * {@code {"error","code":-32602}} envelope is REFUSED (ABI 44: no
+     * transaction the engine relays, nothing broadcast); otherwise the hash, as
+     * {@link #txHashFromJson} reads it (throwing on a plain error or a
+     * malformed payload).
      */
     static io.myotis.api.SendResult sendResultFromJson(String json) {
         JsonObject o = parseJsonObject(json, "sendRawTransaction");
+        String refusal = permanentRefusalOrNull(o);
+        if (refusal != null) return io.myotis.api.SendResult.refused(refusal);
         if ("rejected".equals(stringOrNull(o, "status"))) {
             String reason = stringOrNull(o, "reason");
             // Fail closed on a reason-less refusal: the wallet would be told
@@ -1618,6 +1718,17 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     private static String stringOrNull(JsonObject o, String key) {
         var v = o.get(key);
         return (v == null || v.isNull()) ? null : v.asString();
+    }
+
+    /**
+     * A JSON number field that may be null or absent, as a long; -1 when it is.
+     * A present non-number throws, caught by the field-mapping try/catch as an
+     * {@link EngineException}. Package-private: {@link RustEnsApi} reads the same
+     * optional field.
+     */
+    static long longOrMinusOne(JsonObject o, String key) {
+        var v = o.get(key);
+        return (v == null || v.isNull()) ? -1L : v.asLong();
     }
 
     /**

@@ -1,0 +1,8 @@
+{
+  "name": "myotis-swarm-cli",
+  "private": true,
+  "description": "swarm-cli for scripts/publish_site_swarm.mjs, pinned with its whole dependency tree by package-lock.json; installed with npm ci --ignore-scripts",
+  "dependencies": {
+    "@ethersphere/swarm-cli": "3.6.0"
+  }
+}

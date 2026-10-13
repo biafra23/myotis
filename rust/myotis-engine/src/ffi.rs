@@ -87,6 +87,17 @@ pub fn tor_status() -> i32 {
     crate::host::tor_status()
 }
 
+/// Name the absolute directories the embedded Tor client keeps its state and
+/// its directory cache in. Required on Android before the first Tor read (Arti's
+/// defaults derive from `$HOME`); elsewhere unset means Arti's platform
+/// defaults. True iff the client will use exactly these: a different pair once
+/// a bootstrap holds its directories, a relative path, or a Tor-less build
+/// answers false. Process-global, not per-handle.
+#[uniffi::export]
+pub fn set_tor_storage_dirs(state_dir: String, cache_dir: String) -> bool {
+    crate::host::set_tor_storage_dirs(&state_dir, &cache_dir)
+}
+
 /// Allow or forbid EIP-1459 DNS discovery — the EL node lists, walked over the
 /// system resolver (#539) — for every network this process runs. Off until a
 /// host switches it on; never used while Tor is enabled. Returns the state now
@@ -268,6 +279,18 @@ pub fn eth_call_tx_json(handle: i64, tx: String, block: String, state_overrides:
     crate::host::eth_call_tx_json(handle, &tx, &block, &state_overrides)
 }
 
+/// Verified `eth_createAccessList` for the FULL JSON-RPC transaction object
+/// (ABI ≥ 40): the same `tx`, `block` and `state_overrides` as
+/// [`estimate_gas_tx_json`] — the EIP-2930 access list the transaction
+/// touches, built as geth builds it, with the gas the run made with it used
+/// and that run's own revert or halt next to the list; every field applied as
+/// [`eth_call_tx_json`] applies it, or the request refused with the permanent
+/// `{"error","code":-32602}` envelope.
+#[uniffi::export]
+pub fn create_access_list_json(handle: i64, tx: String, block: String, state_overrides: String) -> String {
+    crate::host::create_access_list_json(handle, &tx, &block, &state_overrides)
+}
+
 /// Verified ENS forward resolution (name → address record).
 #[uniffi::export]
 pub fn resolve_ens_json(handle: i64, name: String) -> String {
@@ -298,6 +321,12 @@ pub fn fee_estimate_json(handle: i64) -> String {
 #[uniffi::export]
 pub fn send_raw_transaction_json(handle: i64, raw_tx_hex: String) -> String {
     crate::host::send_raw_transaction_json(handle, &raw_tx_hex)
+}
+
+/// The `eth_sendRawTransaction` gate on the bytes alone (ABI ≥ 45), no handle: `{"ok":true}`, the permanent `{"error","code":-32602}` refusal, or `{"error": ...}` for bad hex. Hosts call it before their readiness hold.
+#[uniffi::export]
+pub fn check_raw_transaction_json(raw_tx_hex: String) -> String {
+    crate::host::check_raw_transaction_json(&raw_tx_hex)
 }
 
 /// Verified `eth_getTransactionReceipt`. Returns the receipt JSON, the literal

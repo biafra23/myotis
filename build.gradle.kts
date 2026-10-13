@@ -56,7 +56,7 @@ plugins {
 
 allprojects {
     group = "com.jaeckel.ethp2p"
-    version = "0.1.14-SNAPSHOT"
+    version = "0.1.15-SNAPSHOT"
 }
 
 // The release version — project.version minus the -SNAPSHOT suffix — and the
@@ -498,14 +498,28 @@ val rustReleaseDir = if (rustTargetTriple != null) {
 extra["rustReleaseDir"] = rustReleaseDir
 extra["rustEngineLibName"] = hostLibNames.last() // lib?myotis_engine.{dylib,so,dll}
 
-// Opt-in Tor support in the host engine dylib (docs/privacy-and-tor.md): builds
-// myotis-engine with `--features tor`, pulling the Arti tree into the host lib so
-// the desktop/daemon can offer the runtime Settings toggle. OFF by default so CI
-// and the daemon build stay Arti-free. Presence-based, like a typical opt-in flag
-// (a bare `-PtorEngine` sets the property to "", so use hasProperty); build a
-// Tor-capable desktop app with `./gradlew :app-desktop:run -PtorEngine`.
-val torEngine = project.hasProperty("torEngine")
-        && (project.property("torEngine") as? String).let { it.isNullOrBlank() || it.toBoolean() }
+// Opt-in Tor support in the engine (docs/privacy-and-tor.md): builds
+// myotis-engine with `--features tor`, pulling the Arti tree into the host lib
+// (cargoBuildHost) and the Android jniLibs (cargoNdkAndroid) so the desktop and
+// Android apps can offer the runtime Settings toggle. OFF by default so CI, the
+// daemon and the released artifacts stay Arti-free. Presence-based, like a
+// typical opt-in flag (a bare `-PtorEngine` sets the property to "", so use
+// hasProperty); build a Tor-capable desktop app with
+// `./gradlew :app-desktop:run -PtorEngine`, an Android one with
+// `./gradlew :android-app:assembleDebug -PtorEngine`. Truthy (true/1/yes/on)
+// and false-y (false/0/no/off) spellings are both read; anything else fails the
+// build rather than quietly producing a Tor-less artifact.
+val torEngine = project.hasProperty("torEngine") &&
+    (project.property("torEngine") as? String).let {
+        when (it?.trim()?.lowercase()) {
+            null, "", "true", "1", "yes", "on" -> true
+            "false", "0", "no", "off" -> false
+            else -> throw GradleException("-PtorEngine=$it: expected true/false (or a bare -PtorEngine)")
+        }
+    }
+// :android-app bakes it into BuildConfig.TOR_ENGINE, so a Tor-less APK never
+// has to load the engine library just to learn it cannot route over Tor.
+extra["torEngine"] = torEngine
 
 tasks.register<Exec>("cargoBuildHost") {
     group = "rust"
@@ -553,10 +567,37 @@ tasks.register<Exec>("uniffiGenerateKotlin") {
     )
     inputs.files(rustSources).withPathSensitivity(PathSensitivity.RELATIVE)
     inputs.property("cargoVersion", cargoVersion)
-    outputs.files(
-        project(":myotis-engines").projectDir
-            .resolve("src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt")
-    )
+    val bindingsFile = project(":myotis-engines").projectDir
+        .resolve("src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt")
+    outputs.files(bindingsFile)
+    // UniFFI 0.32's Kotlin generator reads each u16 API checksum through a 32-bit
+    // `Int` (JNA direct mapping) and compares it UNMASKED, so the integrity check
+    // passes only while the native side happens to leave the upper 16 bits zero —
+    // which the x86-64 ABIs do not promise. A debug Linux build returns 0x5DB5166E
+    // for checksum 5742 (0x166E), and the Windows msi's engine failed every check,
+    // so the app fell back to the Java engine (desktop-windows-msi.yml). The checksum
+    // is the low 16 bits, so compare those. Applied here, at generation, because the
+    // APK workflow regenerates the committed file and fails on any drift. Fail-loud:
+    // a UniFFI upgrade that changes this output shape must be looked at, not skipped.
+    doLast {
+        val unmasked = Regex("""if \(lib\.(\w+_checksum_\w+)\(\) != (\d+)\)""")
+        val text = bindingsFile.readText()
+        val count = unmasked.findAll(text).count()
+        val masked = unmasked.replace(text) { m ->
+            "if ((lib.${m.groupValues[1]}() and 0xFFFF) != ${m.groupValues[2]})"
+        }
+        // Every declared checksum function must have exactly one comparison, and it
+        // must now be masked: a partly changed output shape must not pass as success.
+        val declared = Regex("""fun \w+_checksum_\w+\(""").findAll(masked).count()
+        val leftover = Regex("""_checksum_\w+\(\)\s*!=""").findAll(masked).count()
+        check(count > 0 && count == declared && leftover == 0) {
+            "uniffiGenerateKotlin: $count checksum comparisons rewritten, $declared checksum " +
+                "functions declared, $leftover comparisons left unmasked in $bindingsFile — " +
+                "UniFFI's output changed; check whether it still reads u16 checksums as Int"
+        }
+        bindingsFile.writeText(masked)
+        logger.lifecycle("uniffiGenerateKotlin: masked $count checksum comparisons to 16 bits")
+    }
 }
 
 val cargoTest = tasks.register<Exec>("cargoTest") {
@@ -720,6 +761,10 @@ tasks.register<Exec>("cargoNdkAndroid") {
     workingDir = file("rust")
     rustToolchainPath?.let { environment("PATH", it) }
     androidNdkDir?.let { environment("ANDROID_NDK_HOME", it.absolutePath) }
+    // -PtorEngine links Arti into the Android engine too (build-android.sh reads
+    // the variable; docs/privacy-and-tor.md). Set either way, so a value
+    // inherited from the developer's shell cannot flip the build behind the flag.
+    environment("MYOTIS_TOR_ENGINE", if (torEngine) "1" else "0")
     // Windows can't exec a .sh directly (CreateProcess error=193); route it
     // through bash there (Git for Windows ships one alongside git itself).
     if (isWindowsHost) {
@@ -734,6 +779,8 @@ tasks.register<Exec>("cargoNdkAndroid") {
     inputs.property("cargoVersion", cargoVersion)
     inputs.property("cargoNdkVersion", cargoNdkVersion)
     inputs.property("ndkDir", androidNdkDir?.absolutePath ?: "")
+    // The Tor feature flips the libs' contents, so it must key UP-TO-DATE too.
+    inputs.property("torEngine", torEngine)
     outputs.files(
         file("android-app/src/main/jniLibs/arm64-v8a/libmyotis_bls.so"),
         file("android-app/src/main/jniLibs/x86_64/libmyotis_bls.so"),

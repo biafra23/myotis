@@ -6,6 +6,12 @@ build/
 # Android — local SDK path, per-dev only
 local.properties
 
+# Signing keys. The release key lives only in the android-release environment's
+# secrets (docs/android-release-signing.md); the debug keystore is committed on
+# purpose and tracked, which an ignore rule does not undo.
+*.p12
+*.jks
+
 # Compiled class files
 *.class
 

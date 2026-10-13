@@ -38,7 +38,7 @@ class StatusPeerGroupsTest {
 
     @Test
     fun `headers carry the group's peers and cache, and the rows sit under their layer`() {
-        rule.setContent { NodeScreen(controller = Running(), settings = FakeSettings(), logs = NoLogs) }
+        rule.setContent { NodeScreen(controller = Running(), settings = FakeSettings(expert = true), logs = NoLogs) }
         pumpFrames()
         // readyPeers = 3, elCachedPeers = 20; clServedPeersLastMin = 2, clCachedPeers = 10.
         val el = top("EL · 3 peers · 20 cache")
@@ -53,7 +53,7 @@ class StatusPeerGroupsTest {
 
     @Test
     fun `screen readers get the layer too - headers are headings, repeated rows are named`() {
-        rule.setContent { NodeScreen(controller = Running(), settings = FakeSettings(), logs = NoLogs) }
+        rule.setContent { NodeScreen(controller = Running(), settings = FakeSettings(expert = true), logs = NoLogs) }
         pumpFrames()
         val heading = SemanticsMatcher.keyIsDefined(SemanticsProperties.Heading)
         rule.onNodeWithText("EL · 3 peers · 20 cache").assert(heading)
@@ -67,7 +67,7 @@ class StatusPeerGroupsTest {
 
     @Test
     fun `the EL Peers row's help is titled by its layer, not by the bare label`() {
-        rule.setContent { NodeScreen(controller = Running(), settings = FakeSettings(), logs = NoLogs) }
+        rule.setContent { NodeScreen(controller = Running(), settings = FakeSettings(expert = true), logs = NoLogs) }
         pumpFrames()
         // Two rows are labelled "Peers"; the first on screen is the EL group's.
         rule.onAllNodesWithText("Peers")[0].performScrollTo().performClick()

@@ -12,7 +12,8 @@ package io.myotis.api.ports;
  * @param httpGateway CCIP-Read (ERC-3668) HTTP transport (required where ENS/EVM
  *                    features are used; null disables off-chain resolution)
  * @param logger      engine log sink; null → the engine's default logger
- * @param clock       monotonic clock; null → the engine's monotonic default
+ * @param clock       monotonic clock; not read by either engine yet (see
+ *                    {@link EngineClock}) — every host passes null
  */
 public record EnginePorts(
         NodeKeyStore keyStore,

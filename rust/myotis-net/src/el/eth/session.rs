@@ -19,7 +19,7 @@ use myotis_core::rlp::{self, Item};
 
 use crate::el::rlpx::frame::MAX_CONTROL_MSG_SIZE;
 use crate::el::rlpx::transport::{
-    decode_hello, encode_hello, Hello, RlpxConnection, P2P_DISCONNECT, P2P_HELLO, P2P_PING, P2P_PONG,
+    decode_hello, encode_hello_as, Hello, RlpxConnection, CLIENT_ID, P2P_DISCONNECT, P2P_HELLO, P2P_PING, P2P_PONG,
 };
 
 use super::messages::{self, Status};
@@ -38,6 +38,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// literal, and tor-poc sits outside the workspace, so CI never compiles it —
 /// update it too, then run `cargo check --manifest-path tor-poc/Cargo.toml`
 /// from `rust/`.
+#[derive(Clone)]
 pub struct EthConfig {
     pub network_id: u64,
     pub genesis_hash: [u8; 32],
@@ -93,14 +94,26 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
     /// exchange Status, and gate on network id + genesis. `local_pubkey` is our
     /// node id (64-byte). The whole handshake is bounded by a 30 s timeout.
     pub async fn handshake(
-        mut conn: RlpxConnection<S>,
+        conn: RlpxConnection<S>,
         local_pubkey: &[u8; 64],
         cfg: &EthConfig,
         served_range: Option<(u64, u64, [u8; 32])>,
     ) -> Result<EthSession<S>, String> {
+        Self::handshake_as(conn, local_pubkey, cfg, served_range, CLIENT_ID).await
+    }
+
+    /// [`Self::handshake`] with our Hello advertising `client_id` — the Tor
+    /// path's names the software without its version (`el::tor`).
+    pub async fn handshake_as(
+        mut conn: RlpxConnection<S>,
+        local_pubkey: &[u8; 64],
+        cfg: &EthConfig,
+        served_range: Option<(u64, u64, [u8; 32])>,
+        client_id: &str,
+    ) -> Result<EthSession<S>, String> {
         let fut = async {
             // Send our Hello first (Java sends on RLPX_READY).
-            conn.send(P2P_HELLO, &encode_hello(local_pubkey, cfg.listen_port))
+            conn.send(P2P_HELLO, &encode_hello_as(local_pubkey, cfg.listen_port, client_id))
                 .await?;
 
             // The peer's first framed message must be Hello (or Disconnect).
@@ -306,6 +319,46 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
         self.conn.peer_pubkey()
     }
 
+    /// Push one raw transaction to the peer (the eth `Transactions` message),
+    /// bounded by the frame-write timeout. A landed write proves the frame
+    /// left this side, not that the peer read it — [`Self::await_pong`] does.
+    pub async fn send_transaction(&mut self, raw_tx: &[u8]) -> Result<(), String> {
+        self.conn
+            .send(messages::TRANSACTIONS, &messages::encode_transactions(raw_tx))
+            .await
+    }
+
+    /// Wait until the peer has READ everything sent before: a p2p Ping, then
+    /// the peer's Pong — frames are read in order, so the Pong proves the
+    /// earlier ones were taken off the wire. A flushed write proves less on a
+    /// Tor `DataStream`, whose flush hands the cells to the circuit long before
+    /// an exit delivers them (`el::tor::push_transaction`). Frames before the
+    /// Pong are skipped (gossip, requests we do not serve), a Ping is
+    /// answered, a Disconnect fails. The Ping's write is bounded by the
+    /// frame-write timeout, the wait by the request timeout.
+    pub async fn await_pong(&mut self) -> Result<(), String> {
+        // Ping body is an empty RLP list.
+        self.conn.send(P2P_PING, &[0xc0]).await?;
+        let wait = async {
+            loop {
+                let frame = recv_answering_ping(&mut self.conn).await?;
+                match frame.message_code {
+                    P2P_PONG => return Ok(()),
+                    P2P_DISCONNECT => {
+                        return Err(format!(
+                            "peer disconnected before its Pong: {}",
+                            describe_disconnect(&frame.payload)
+                        ))
+                    }
+                    _ => {}
+                }
+            }
+        };
+        tokio::time::timeout(REQUEST_TIMEOUT, wait)
+            .await
+            .map_err(|_| "timed out awaiting the peer's Pong".to_string())?
+    }
+
     /// Consume the negotiated session, handing the framed connection and the
     /// negotiated metadata to the [`ManagedPeer`](crate::el::peer::ManagedPeer)
     /// actor, which drives it from a background read loop.
@@ -395,39 +448,30 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
             .ok_or_else(|| "no returned bytecode matched the requested hash".to_string())
     }
 
-    /// Fetch the contiguous header range `[finalized_block ..= peer_block]` and
-    /// run the header-chain verdict against the beacon-anchored root. Returns
-    /// `headerChainError` on a transport failure and `headerChainInvalid` on a
-    /// short/over-long/out-of-range response (matching the Java ladder).
-    ///
-    /// **A7b:** this is a SINGLE request, so it only spans a gap the peer serves
-    /// in one response (~1024 headers on geth) — fine for a typical finalized
-    /// gap (~2 epochs, tens–low-hundreds of blocks). A stale-finalized peer with
-    /// a multi-thousand-block gap truncates the response → `chain.len() != total`
-    /// → `headerChainInvalid` (fail-closed, never a partial-chain trust). Batched
-    /// fetching for large gaps lands in the A7b connection layer.
+    /// Fetch `[peer_block ..= anchor_block]` and run the header-chain verdict
+    /// against the attested anchor's block hash (the twin of the pooled
+    /// peer's, for a one-shot session).
     async fn header_chain_verdict(
         &mut self,
-        finalized_block: u64,
         peer_block: u64,
-        beacon_block_hash: &[u8; 32],
+        anchor_block: u64,
+        anchor_hash: &[u8; 32],
         peer_state_root: &[u8; 32],
-        finalized_slot: i64,
+        anchor_slot: i64,
     ) -> crate::el::verify::Verdict {
         use crate::el::verify::{header_chain_verdict, ChainHeader, Verdict, MAX_HEADER_CHAIN_GAP};
-        let total = peer_block - finalized_block + 1;
-        // Match Java's verifyHeaderChainBatched re-guard: total in [2, MAX].
-        // (The precheck admits gap == MAX, i.e. total == MAX+1; Java rejects it
-        // here — keep that exact boundary.)
-        if total < 2 || total > MAX_HEADER_CHAIN_GAP {
-            return Verdict {
-                fail_reason: Some("headerChainInvalid"),
-                ..Verdict::default()
-            };
-        }
-        // Fetch ascending from the finalized block (skip=0, reverse=false).
+        let total = match anchor_block.checked_sub(peer_block) {
+            Some(diff) if diff < MAX_HEADER_CHAIN_GAP => diff + 1,
+            _ => {
+                return Verdict {
+                    fail_reason: Some("headerChainInvalid"),
+                    ..Verdict::default()
+                }
+            }
+        };
+        // Fetch ascending from the peer's block up to the anchor (skip=0, reverse=false).
         let headers = match self
-            .get_block_headers_by_number(finalized_block, total, 0, false)
+            .get_block_headers_by_number(peer_block, total, 0, false)
             .await
         {
             Ok(h) => h,
@@ -449,7 +493,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
                 ..Verdict::default()
             };
         }
-        header_chain_verdict(&chain, beacon_block_hash, peer_state_root, finalized_slot)
+        header_chain_verdict(&chain, anchor_hash, peer_state_root, anchor_slot)
     }
 
     /// Anchor a peer-served `state_root` (for `block_number`) to the beacon
@@ -467,20 +511,9 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
         use crate::el::verify::{ladder_precheck, LadderStep};
         match ladder_precheck(Some(state_root), proof_valid, block_number, anchor) {
             LadderStep::Done(verdict) => verdict,
-            LadderStep::NeedHeaderChain {
-                finalized_block,
-                peer_block,
-                beacon_block_hash,
-                finalized_slot,
-            } => {
-                self.header_chain_verdict(
-                    finalized_block,
-                    peer_block,
-                    &beacon_block_hash,
-                    state_root,
-                    finalized_slot,
-                )
-                .await
+            LadderStep::NeedHeaderChain { peer_block, anchor_block, anchor_hash, anchor_slot } => {
+                self.header_chain_verdict(peer_block, anchor_block, &anchor_hash, state_root, anchor_slot)
+                    .await
             }
         }
     }
@@ -588,7 +621,7 @@ fn hex4(b: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::el::rlpx::handshake::SessionSecrets;
-    use crate::el::rlpx::transport::Capability;
+    use crate::el::rlpx::transport::{encode_hello, Capability};
     use tokio::io::DuplexStream;
 
     fn hello_with(caps: Vec<(&str, u64)>) -> Hello {
@@ -805,5 +838,92 @@ mod tests {
         let err = outcome.unwrap_err();
         assert!(err.starts_with("peer disconnected after our Status"), "{err}");
         assert!(crate::el::pool::is_busy_disconnect(&err), "{err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_as_advertises_the_client_id_it_is_given() {
+        for (client_id, want) in [(None, CLIENT_ID), (Some("myotis"), "myotis")] {
+            let (ours, mut peer) = framed_pair();
+            let peer_side = tokio::spawn(async move {
+                let hello = peer.recv().await.unwrap();
+                assert_eq!(hello.message_code, P2P_HELLO);
+                peer.send(P2P_HELLO, &encode_hello(&[2; 64], 30303)).await.unwrap();
+                assert_eq!(peer.recv().await.unwrap().message_code, messages::STATUS);
+                let status = messages::encode_status69(69, NETWORK_ID, &GENESIS, &[0x22; 32], &FORK_HASH, 0, 0, 100);
+                peer.send(messages::STATUS, &status).await.unwrap();
+                decode_hello(&hello.payload).unwrap().client_id
+            });
+            let session = match client_id {
+                None => EthSession::handshake(ours, &[1; 64], &test_config(), None).await,
+                Some(id) => EthSession::handshake_as(ours, &[1; 64], &test_config(), None, id).await,
+            };
+            session.expect("handshake completes");
+            assert_eq!(peer_side.await.unwrap(), want);
+        }
+    }
+
+    // --- A transaction push and its Pong, against a scripted READY peer.
+
+    /// Run our handshake against a peer that completes it, then reads our push
+    /// and answers with `script`. Returns our push outcome and the codes of
+    /// every frame we sent after the handshake.
+    async fn push_against(script: Vec<(u64, Vec<u8>)>) -> (Result<(), String>, Vec<u64>) {
+        let (ours, mut peer) = framed_pair();
+        let peer_side = tokio::spawn(async move {
+            assert_eq!(peer.recv().await.unwrap().message_code, P2P_HELLO);
+            peer.send(P2P_HELLO, &encode_hello(&[2; 64], 30303)).await.unwrap();
+            assert_eq!(peer.recv().await.unwrap().message_code, messages::STATUS);
+            let status = messages::encode_status69(69, NETWORK_ID, &GENESIS, &[0x22; 32], &FORK_HASH, 0, 0, 100);
+            peer.send(messages::STATUS, &status).await.unwrap();
+            let mut received = Vec::new();
+            // The push and its Ping arrive first, in that order.
+            for _ in 0..2 {
+                received.push(peer.recv().await.unwrap().message_code);
+            }
+            for (code, body) in script {
+                peer.send(code, &body).await.unwrap();
+            }
+            while let Ok(frame) = peer.recv().await {
+                received.push(frame.message_code);
+            }
+            received
+        });
+        let mut session = EthSession::handshake(ours, &[1; 64], &test_config(), None)
+            .await
+            .expect("handshake completes");
+        let outcome = match session.send_transaction(&[0x02, 0xc0]).await {
+            Ok(()) => session.await_pong().await,
+            Err(e) => Err(e),
+        };
+        drop(session); // ends the peer's loop
+        (outcome, peer_side.await.unwrap())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pushed_transaction_is_confirmed_by_the_pong_that_follows_it() {
+        let (outcome, received) = push_against(vec![(P2P_PONG, vec![0xc0])]).await;
+        outcome.expect("the Pong confirms the push");
+        assert_eq!(received, vec![messages::TRANSACTIONS, P2P_PING]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gossip_is_skipped_and_a_ping_answered_until_the_pong() {
+        let (outcome, received) = push_against(vec![
+            (messages::NEW_POOLED_TRANSACTION_HASHES, vec![0xc0]),
+            (P2P_PING, vec![0xc0]),
+            (P2P_PONG, vec![0xc0]),
+        ])
+        .await;
+        outcome.expect("the Pong still confirms the push");
+        assert_eq!(received, vec![messages::TRANSACTIONS, P2P_PING, P2P_PONG]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disconnect_or_silence_is_no_confirmation() {
+        let (outcome, _) = push_against(vec![(P2P_DISCONNECT, vec![0xc1, 0x04])]).await;
+        let err = outcome.unwrap_err();
+        assert!(err.contains("reason=4"), "{err}");
+        let (outcome, _) = push_against(vec![]).await;
+        assert!(outcome.unwrap_err().contains("Pong"), "silence times out");
     }
 }

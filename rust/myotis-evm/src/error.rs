@@ -108,6 +108,12 @@ pub enum EvmError {
     /// the state transition's error as `err: {error} (supplied gas {gas})`, and
     /// so do we ([`EvmError::is_infeasible`]).
     CallFailed { supplied_gas: u64, error: Box<EvmError> },
+    /// `eth_createAccessList` ran the transaction `rounds` times and the list
+    /// it touched kept changing (a contract that branches on `gasleft()`
+    /// differently each time its slots are pre-warmed). Retryable: the next
+    /// block's state may settle it, and no list is better than one the run
+    /// did not confirm.
+    AccessListNotSettled { rounds: usize },
 }
 
 impl EvmError {
@@ -180,6 +186,7 @@ impl EvmError {
             EvmError::FailedWithGas { error, .. } | EvmError::CallFailed { error, .. } => error.kind(),
             EvmError::RequiredBalanceOverflow { .. } => "required balance overflow",
             EvmError::CallBudgetExceeded { .. } => "call budget exceeded",
+            EvmError::AccessListNotSettled { .. } => "access list not settled",
         }
     }
 }
@@ -254,6 +261,9 @@ impl std::fmt::Display for EvmError {
             ),
             EvmError::CallFailed { supplied_gas, error } => {
                 write!(f, "err: {error} (supplied gas {supplied_gas})")
+            }
+            EvmError::AccessListNotSettled { rounds } => {
+                write!(f, "the access list did not settle within {rounds} runs of the transaction")
             }
         }
     }

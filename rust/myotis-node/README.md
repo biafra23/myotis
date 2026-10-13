@@ -48,6 +48,9 @@ JSON.parse(myotis.statusJson(h));   // { beaconState, peerCount, snapPeers, snap
 // Verified reads run on bounded Myotis workers, with a 90 s operation budget
 // including queue wait. Cancellation drains native work before completion:
 const acct = JSON.parse(await myotis.requestAccountJson(h, '0xd8dA…6045'));
+// acct.blockTimestamp (ABI >= 41): blockNumber's own timestamp, unix seconds,
+// when the engine proved it (the read ran against the beacon-attested block),
+// else null. resolveEnsJson / ensRecordJson results carry it too.
 // ...or at the beacon-finalized block (ABI >= 32; a number near the head also works):
 const fin = JSON.parse(await myotis.requestAccountJson(h, '0xd8dA…6045', 'finalized'));
 const ens = JSON.parse(await myotis.resolveEnsJson(h, 'vitalik.eth'));
@@ -81,6 +84,7 @@ unknown handle gets the usual
 | `eth_call` | `ethCallJson(h, from, to, data, value, block)`, `ethCallTxJson(h, txJson, block, overrides)` |
 | `eth_call` with a state override | `ethCallOverridesJson(h, from, to, data, value, block, overridesJson)`, or `ethCallTxJson` |
 | `eth_estimateGas` | `estimateGasJson(h, from, to, data, value)`, `estimateGasTxJson(h, txJson, block, overrides)` |
+| `eth_createAccessList` | `createAccessListJson(h, txJson, block, overrides)`: serve `{accessList, gasUsed: '0x…'}` from `status: "ok"`, and its `vmError` as geth's `error` next to them when present |
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas` | `feeEstimateJson(h)` |
 | `eth_feeHistory` | `feeHistoryJson(h, blockCount, newestBlock, percentilesJson?)` |
 | `eth_getBlockByNumber` | `getBlockByNumberJson(h, blockTag, fullTransactions?)` |
@@ -276,7 +280,9 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   first call on a directory records the anchor in `sync-anchor[-net].json`
   next to the snapshot; a later call with the **same root and slot resumes**
   that generation under the normal rules (a snapshot strictly newer than the
-  checkpoint is restored and re-verified, otherwise it bootstraps again), so a
+  checkpoint is restored without re-verifying what it holds and stays on probation until
+  an update verifies against it — eight rejects in a row discard it and
+  re-bootstrap from the checkpoint; otherwise it bootstraps again), so a
   restart never reverts to the embedded anchor and needs no extra flag. Any
   other root/slot, a directory that already holds a snapshot from the embedded
   anchor, or a plain `create()` on a marked directory returns **-3**
@@ -396,7 +402,7 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
 
 ## Request ownership and cancellation
 
-This implementation targets the current engine's **ABI 38** and existing JS
+This implementation targets the current engine's **ABI 45** and existing JS
 argument/result shapes. Every signature up to ABI 31 is unchanged since ABI 25,
 ABI 32's one change is additive (an optional trailing argument), ABI 33 changes
 no signature (the executor refusals above), ABI 34 adds `estimateGasTxJson`
@@ -424,8 +430,18 @@ caller that reads only `txHash` and `error` must handle it; ABI 37 gives
 log-index example above; a config without the key behaves as before); and
 ABI 38 adds the `snap2ServingPeers` status key — the part of
 `snapServingPeers` connected over snap/2 (EIP-8189), informational only (a
-key addition — older readers ignore it, and nothing should gate on it). It is
-not a drop-in artifact for a host pinned to ABI 22.
+key addition — older readers ignore it, and nothing should gate on it); ABI 39
+adds the engine's DNS-discovery switch (not wrapped here); ABI 40 adds
+`createAccessListJson`; ABI 41 adds `blockTimestamp` to the
+`requestAccountJson`, `resolveEnsJson` and `ensRecordJson` results (a key
+addition); ABI 43 adds the engine's Tor storage-directory call (not
+wrapped here, like the rest of Tor); ABI 44 makes `sendRawTransactionJson`
+answer the permanent `{"error","code":-32602}` for bytes that are no
+transaction the engine relays — undecodable, no sender recovered, or a blob
+transaction — where it used to broadcast them (#360): nothing was sent; and
+ABI 45 adds the engine's handle-less send gate, `check_raw_transaction_json` (not
+wrapped here: the addon has no readiness hold, so its sends reach the same
+gate at once). It is not a drop-in artifact for a host pinned to ABI 22.
 Engine failures, admission refusal, cancellation, and deadline expiry remain
 in-band JSON errors. Node-API infrastructure failures may throw/reject.
 

@@ -3988,6 +3988,7 @@ version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
 dependencies = [
+ "cc",
  "pkg-config",
  "vcpkg",
 ]
@@ -4180,7 +4181,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-bls"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "blst",
  "jni",
@@ -4188,7 +4189,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-consensus"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "blst",
  "myotis-bls",
@@ -4198,7 +4199,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-core"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "k256",
  "sha2 0.10.9",
@@ -4207,7 +4208,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-engine"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "myotis-consensus",
  "myotis-core",
@@ -4223,7 +4224,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-evm"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "myotis-core",
  "revm",
@@ -4232,7 +4233,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-net"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "alloy-rlp",
  "arti-client",
@@ -4248,6 +4249,7 @@ dependencies = [
  "myotis-evm",
  "myotis-net",
  "myotis-wire",
+ "rustls",
  "serde_json",
  "snap",
  "socket2 0.5.10",
@@ -4259,7 +4261,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-node"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "myotis-engine",
  "napi",
@@ -4270,7 +4272,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-rpcd"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "clap",
  "myotis-engine",
@@ -4282,7 +4284,7 @@ dependencies = [
 
 [[package]]
 name = "myotis-wire"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "aes",
  "cipher",
@@ -5989,6 +5991,7 @@ version = "0.23.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -7960,11 +7963,15 @@ dependencies = [
  "dyn-clone",
  "educe 0.4.23",
  "futures",
+ "futures-rustls",
  "hex",
  "libc",
  "native-tls",
  "paste",
  "pin-project",
+ "rustls",
+ "rustls-pki-types",
+ "rustls-webpki",
  "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",

@@ -3,7 +3,12 @@ package io.myotis.ios
 import io.myotis.jsonrpc.MyotisRpcServer
 import io.myotis.ui.AccountResult
 import io.myotis.ui.CacheFileStats
+import io.myotis.ui.ENS_CONTENTHASH_KEY
+import io.myotis.ui.EnsOwnership
+import io.myotis.ui.EnsProfile
+import io.myotis.ui.EnsRecord
 import io.myotis.ui.EnsResult
+import io.myotis.ui.readEnsProfile
 import io.myotis.ui.NodeController
 import io.myotis.ui.NodeSnapshot
 import io.myotis.ui.Settings
@@ -447,7 +452,76 @@ class IosNodeController(
             matchedBeaconSlot = o.engineLong("matchedBeaconSlot", -1L),
             verifyMethod = o.engineString("verifyMethod"),
             failReason = o.engineString("failReason"),
+            // ABI 41: the proven block timestamp; null (none proven) reads as -1.
+            blockTimestamp = o.engineLong("blockTimestamp", -1L),
         )
+    }
+
+    // One engine call per record over the same record dispatch as resolveEns; readEnsProfile
+    // fans out and folds a call that threw into that record's error.
+    override suspend fun resolveEnsProfile(network: String, name: String): EnsProfile {
+        val handle = handleOrThrow(network)
+        if (!settings.hasEns(canonical(network))) {
+            throw IllegalStateException("ENS is not available on $network")
+        }
+        return readEnsProfile(name) { key -> withContext(Dispatchers.IO) { ensRecord(handle, name.trim(), key) } }
+    }
+
+    // The "ownership" method of the same record dispatch (engine ABI ≥ 42): absent
+    // parts are left out of the JSON, so every field reads as optional here.
+    override suspend fun resolveEnsOwnership(network: String, name: String): EnsOwnership {
+        val handle = handleOrThrow(network)
+        if (!settings.hasEns(canonical(network))) {
+            throw IllegalStateException("ENS is not available on $network")
+        }
+        val n = name.trim()
+        val params = JsonObject(
+            mapOf("method" to JsonPrimitive("ownership"), "name" to JsonPrimitive(n))
+        ).toString()
+        val o = withContext(Dispatchers.IO) { parseOrThrow(RustEngine.ensRecordJson(handle, params), "ENS ownership") }
+        val blockNumber = o.engineLong("blockNumber", -1L)
+        val verified = o.engineBoolean("verified")
+        return when (o.engineString("status")) {
+            "ok" -> EnsOwnership(
+                n, o.engineString("registrantHex"), o.engineString("managerHex"), o.engineBoolean("wrapped"),
+                o.engineString("resolverHex"), o.engineLong("expiresAt", -1L), o.engineLong("gracePeriodSeconds", -1L),
+                blockNumber, verified, null,
+            )
+            "noRecord" -> EnsOwnership(n, null, null, false, null, -1L, -1L, blockNumber, verified, null)
+            // Unreachable for ownership (its reads never go off-chain); mapped as the record
+            // parse above maps it, so a shape the engine owns never reads differently here.
+            "offchain" -> EnsOwnership(
+                n, null, null, false, null, -1L, -1L, blockNumber, verified,
+                "resolves off-chain (CCIP-Read), which this app doesn't support yet",
+            )
+            else -> EnsOwnership(n, null, null, false, null, -1L, -1L, blockNumber, verified, "unexpected resolver reply")
+        }
+    }
+
+    private fun ensRecord(handle: Long, name: String, key: String): EnsRecord {
+        val contenthash = key == ENS_CONTENTHASH_KEY
+        val params = JsonObject(
+            buildMap {
+                put("method", JsonPrimitive(if (contenthash) "contenthash" else "text"))
+                put("name", JsonPrimitive(name))
+                if (!contenthash) put("key", JsonPrimitive(key))
+            }
+        ).toString()
+        val o = runCatching { parseOrThrow(RustEngine.ensRecordJson(handle, params), "ENS record") }
+            .getOrElse { return EnsRecord(key, null, -1L, false, it.message ?: "ENS record read failed") }
+        val blockNumber = o.engineLong("blockNumber", -1L)
+        val verified = o.engineBoolean("verified")
+        return when (o.engineString("status")) {
+            "ok" -> o.engineString(if (contenthash) "dataHex" else "value")
+                ?.let { EnsRecord(key, it, blockNumber, verified, null) }
+                ?: EnsRecord(key, null, blockNumber, verified, "malformed resolver reply (ok without value)")
+            "noRecord" -> EnsRecord(key, null, blockNumber, verified, null)
+            "offchain" -> EnsRecord(
+                key, null, blockNumber, verified,
+                "resolves off-chain (CCIP-Read), which this app doesn't support yet",
+            )
+            else -> EnsRecord(key, null, blockNumber, verified, "unexpected resolver reply")
+        }
     }
 
     override suspend fun resolveEns(network: String, name: String): EnsResult {
@@ -468,19 +542,21 @@ class IosNodeController(
         val o = parseOrThrow(json, "ENS resolution")
         val blockNumber = o.engineLong("blockNumber", -1L)
         val verified = o.engineBoolean("verified")
+        val blockTimestamp = o.engineLong("blockTimestamp", -1L)
         return when (o.engineString("status")) {
             // status ok MUST carry the address — a missing addressHex is shape
             // drift, and mapping it to (address null, error null) would render
             // as the authoritative "no record" answer. Fail closed instead,
             // like RustEnsApi's Parsed.requireString does over JNI.
             "ok" -> o.engineString("addressHex")
-                ?.let { EnsResult(name, it, blockNumber, verified, null) }
+                ?.let { EnsResult(name, it, blockNumber, verified, null, blockTimestamp) }
                 ?: EnsResult(name, null, blockNumber, verified, "malformed resolver reply (ok without addressHex)")
             // Successfully determined absent — the API's "no record" convention.
-            "noRecord" -> EnsResult(name, null, blockNumber, verified, null)
+            "noRecord" -> EnsResult(name, null, blockNumber, verified, null, blockTimestamp)
             "offchain" -> EnsResult(
                 name, null, blockNumber, verified,
                 "$name resolves off-chain (CCIP-Read), which this app doesn't support yet",
+                blockTimestamp,
             )
             else -> EnsResult(name, null, blockNumber, verified, "unexpected resolver reply")
         }

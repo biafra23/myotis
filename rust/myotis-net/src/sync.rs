@@ -3,7 +3,7 @@
 //! `BeaconLightClient.syncLoop`: bootstrap from the embedded checkpoint,
 //! catch the sync committee up to the wall-clock period via
 //! `light_client_updates_by_range`, then poll `light_client_finality_update`
-//! every slot.
+//! once per slot, just past a third of the way into it ([`delay_to_next_poll`]).
 //!
 //! CLOCK POLICY: this module is the only place wall-clock time is read. Slot
 //! estimates are computed here and passed into the consensus crate as plain
@@ -43,6 +43,101 @@ use crate::status::{fork_digest, fork_digest_bpo, StatusMessage};
 /// threat model.
 pub fn ws_anchor_stale(anchor_period: u64, wall_clock_period: u64, bound_periods: u64) -> bool {
     wall_clock_period.saturating_sub(anchor_period) > bound_periods
+}
+
+/// Where in each slot the steady-state finality poll may first fire, in basis
+/// points of the slot: a third of the way in, the attestation and sync-message
+/// deadline — honest validators treat block N+1 as arrived by then, so its sync
+/// aggregate (which attests block N) is out and servers rebuild their latest
+/// update as they import it. The light-client gossip rules use the same point
+/// (an update is ignored until `get_sync_message_due_ms` into its signature
+/// slot). On Gloas networks (EIP-7732: sepolia, since 2026-10-06) both
+/// deadlines move to a quarter of the slot, so a poll at a third is just more
+/// conservative there. Java twin: `BeaconChainSpec.FINALITY_POLL_DUE_BPS`.
+const FINALITY_POLL_DUE_BPS: u64 = 3333;
+
+/// Margin past that mark, at most a tenth of the slot: a block that landed
+/// late, or a server that is slow to import, still serves the old update
+/// right at the deadline.
+const FINALITY_POLL_MARGIN_MS: u64 = 500;
+
+/// Width of the window a process's poll point is drawn from, once per run, in
+/// basis points of the slot (a quarter): a fleet of wallets spreads its polls
+/// over seconds, not milliseconds, while each wallet keeps an exact one-slot
+/// cadence. Capped so every poll lands by two thirds of the slot (on gnosis the
+/// window is 1167 ms, not a quarter's 1250).
+const FINALITY_POLL_JITTER_BPS: u64 = 2500;
+
+/// The least rest after a round before the next poll, in basis points of the
+/// slot (a quarter): a round that ran into the next poll point waits for the
+/// one after, rather than polling again back to back.
+const FINALITY_POLL_MIN_REST_BPS: u64 = 2500;
+
+/// The least time from one poll's start to the next one's, when a slot is
+/// longer: every round asks the same proven servers, and Lighthouse serves each
+/// light-client protocol once per 10 s (`Quota::one_every(10s)`, see
+/// `UPDATES_SERVE_COOLDOWN`). Polls on the grid are a slot apart anyway; this
+/// holds back the one after an off-grid poll (the first of a run, or one right
+/// after a committee catch-up). Kept under the slot, so it never moves a grid
+/// poll. On a shorter slot (gnosis) every grid poll is inside the quota anyway,
+/// as it was before. Java twin: `BeaconChainSpec.FINALITY_POLL_QUOTA_PACE_MS`.
+const FINALITY_POLL_QUOTA_PACE_MS: u64 = 11_000;
+
+/// The slot length the poll schedule works with, in millis: at least a second,
+/// at most a day — the configs are 12 s and 5 s, and the clamp keeps every sum
+/// and product below in range for any input.
+fn poll_slot_ms(seconds_per_slot: u64) -> u64 {
+    seconds_per_slot.clamp(1, 86_400) * 1000
+}
+
+/// Pure: this process's poll point within the slot, from `random` (any u64):
+/// the 1/3 mark plus [`FINALITY_POLL_MARGIN_MS`] plus a draw from the
+/// [`FINALITY_POLL_JITTER_BPS`] window, never past two thirds of the slot.
+fn finality_poll_offset_ms(seconds_per_slot: u64, random: u64) -> u64 {
+    let slot_ms = poll_slot_ms(seconds_per_slot);
+    let earliest = slot_ms * FINALITY_POLL_DUE_BPS / 10_000 + FINALITY_POLL_MARGIN_MS.min(slot_ms / 10);
+    let window = (slot_ms * FINALITY_POLL_JITTER_BPS / 10_000).min((slot_ms * 2 / 3).saturating_sub(earliest));
+    earliest + random % (window + 1)
+}
+
+/// Pure: the delay from `now_ms` (unix millis) to the next poll point — a slot
+/// start plus `offset_ms` — that leaves at least [`FINALITY_POLL_MIN_REST_BPS`]
+/// of a slot of rest, so a round that overran skips ahead instead of polling
+/// again at once, and, on a slot longer than [`FINALITY_POLL_QUOTA_PACE_MS`],
+/// lands at least that long after the last poll started (`since_poll_ms` ago).
+/// Always in `(wait, wait + slot]` for that least wait (at most 11 s): a clock
+/// before genesis waits at most that long (tokio sleeps on the monotonic clock,
+/// so a longer wait could not be cut short by a later clock fix).
+pub(crate) fn delay_to_next_poll(
+    now_ms: u64,
+    since_poll_ms: u64,
+    genesis_time: u64,
+    seconds_per_slot: u64,
+    offset_ms: u64,
+) -> Duration {
+    let slot_ms = poll_slot_ms(seconds_per_slot);
+    let rest = slot_ms * FINALITY_POLL_MIN_REST_BPS / 10_000;
+    let quota = if slot_ms > FINALITY_POLL_QUOTA_PACE_MS {
+        FINALITY_POLL_QUOTA_PACE_MS.saturating_sub(since_poll_ms)
+    } else {
+        0
+    };
+    let wait = rest.max(quota);
+    let from = now_ms.saturating_add(wait);
+    let first = genesis_time.saturating_mul(1000).saturating_add(offset_ms % slot_ms);
+    let to_point = if from < first {
+        (first - from).min(slot_ms)
+    } else {
+        slot_ms - (from - first) % slot_ms
+    };
+    Duration::from_millis(wait + to_point)
+}
+
+/// The wall clock in unix millis — every clock read of this module goes
+/// through here (CLOCK POLICY above).
+fn now_unix_ms() -> u64 {
+    let ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_millis();
+    u64::try_from(ms).unwrap_or(u64::MAX)
 }
 
 /// Live weak-subjectivity knobs, shared between the host FFI and the running
@@ -239,11 +334,11 @@ impl ChainConfig {
             // `./gradlew refreshCheckpoint` rewrites both from one fetch, and
             // `java_and_rust_checkpoints_agree` fails if they ever diverge.
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized mainnet block root (slot 15373376, 2026-10-06, period 1876)
+            // trusted checkpoint: recent finalized mainnet block root (slot 15394688, 2026-10-09, period 1879)
             checkpoint_root: hex32(
-                "d590bf3ac2b3010fddda48ecd5d72bc923a43af0751ab7e8fb20b8038cdbe503",
+                "3c65d22e715e662bad37f43374ce1b944ff9078617e6cd95eb8f88b2cd485b2b",
             ),
-            checkpoint_slot: 15_373_376,
+            checkpoint_slot: 15_394_688,
             // @checkpoint:mainnet:end
             static_peers: MAINNET_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: MAINNET_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
@@ -305,11 +400,11 @@ impl ChainConfig {
             // serving node's trustedNodeSync point, or that node cannot answer
             // the bootstrap for it (docs/dedicated-sepolia-node.md §5).
             // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized sepolia block root (slot 11297568, 2026-10-06, period 1379)
+            // trusted checkpoint: recent finalized sepolia block root (slot 11319040, 2026-10-09, period 1381)
             checkpoint_root: hex32(
-                "2008fe0e6bc957261f85619221fc91befe6802a647d30bf9e408df3ad89ada9c",
+                "90bb35755de105925bef3875c65645817625cf69f65a3eb5048750a6709c7c4e",
             ),
-            checkpoint_slot: 11_297_568,
+            checkpoint_slot: 11_319_040,
             // @checkpoint:sepolia:end
             static_peers: SEPOLIA_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: SEPOLIA_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
@@ -375,11 +470,11 @@ impl ChainConfig {
             // anything older than a few periods anyway — and use `-Pperiod=<n>`
             // only to pin a retained state for testing, never one below the floor.
             // @checkpoint:gnosis:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized gnosis block root (slot 30462400, 2026-10-06, period 3718)
+            // trusted checkpoint: recent finalized gnosis block root (slot 30513552, 2026-10-09, period 3724)
             checkpoint_root: hex32(
-                "7a49f27ccca8ff682c49ab7979654e5b33e2abbadbf43550cfb151ae196715eb",
+                "a68918716e413f19655d4c8e4c35b46351b6f566a3123aeb30ecb35c04f09f3c",
             ),
-            checkpoint_slot: 30_462_400,
+            checkpoint_slot: 30_513_552,
             // @checkpoint:gnosis:end
             static_peers: GNOSIS_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: GNOSIS_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
@@ -529,12 +624,16 @@ impl ChainConfig {
         self.current_slot_estimate()
     }
 
-    /// Wall-clock slot estimate — THE clock read of this crate.
+    /// How long until this process's next finality poll point, for a poll
+    /// that started `since_poll` ago ([`delay_to_next_poll`]).
+    fn until_next_finality_poll(&self, since_poll: Duration, offset_ms: u64) -> Duration {
+        let since_poll_ms = u64::try_from(since_poll.as_millis()).unwrap_or(u64::MAX);
+        delay_to_next_poll(now_unix_ms(), since_poll_ms, self.genesis_time, self.seconds_per_slot, offset_ms)
+    }
+
+    /// Wall-clock slot estimate (the clock read is [`now_unix_ms`]).
     fn current_slot_estimate(&self) -> u64 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs();
+        let now = now_unix_ms() / 1000;
         now.saturating_sub(self.genesis_time) / self.seconds_per_slot.max(1)
     }
 }
@@ -643,6 +742,23 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // by-root answers down, so one connection lasts minutes, not hours, with
     // updates flowing between reconnects. SECOND on purpose: roost serves
     // without either caveat.
+    //
+    // Release check for v0.1.15 (2026-10-09), anchor period 1381. The first
+    // refresh, slot 11318880, was served by neither pin: roost answered
+    // ResourceUnavailable after both retries and this Nimbus "LC bootstrap
+    // unavailable", while its Status showed it at head and finalized past
+    // that epoch (run 37955468942, second attempt; cause unconfirmed). The
+    // next finalized checkpoint, slot 11319040, is what ships. Its run
+    // 37959717559: first attempt 1 of 2 (roost's transport handshake timed
+    // out, as zbox pins did on and off that afternoon), second attempt 2 of 2,
+    // bootstrap and the period-1381 update verified from both, and the
+    // bootnodes seeded discv5 (23 entries). The cold start with every pin
+    // unreachable found this Nimbus through discovery at its relay address,
+    // bootstrapped from it in under two minutes and applied advancing finality
+    // from it and roost, but stayed CATCHING_UP for its 900 s budget: since
+    // Gloas, SYNCED also waits for the finalized execution header
+    // (`feed_exec_anchor`), which only the EL peer pool resolves, and
+    // live_cold_start runs the CL sync alone. The old-anchor walk did not run.
     "/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
 ];
 
@@ -732,6 +848,14 @@ const GNOSIS_STATIC_PEERS: &[&str] = &[
     // SYNCED), a cold start with every pin unreachable reached SYNCED in
     // 30 s, and one from the recorded period-3596 anchor (122 periods
     // behind) in 90 s.
+    // Re-verified 2026-10-09 against the anchor v0.1.15 ships (period 3724):
+    // live_pins_alive run 37955473231 on a GitHub-hosted runner, 7 of 8 —
+    // every public pin served; roost (9108) timed out in the transport
+    // handshake (zbox's uplink, see MAINNET_STATIC_PEERS), then served the
+    // old-anchor walk's 116 periods 23 s later in the same job. The bootnodes
+    // seeded discv5 (24 entries), a cold start with every pin unreachable
+    // reached SYNCED in 35 s, and one from the recorded period-3596 anchor
+    // (128 periods behind) in 35 s.
     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
@@ -870,6 +994,19 @@ const MAINNET_STATIC_PEERS: &[&str] = &[
     // bootnodes seeded discv5 (32 entries, SYNCED), a cold start with every
     // pin unreachable reached SYNCED in 25 s, and one from the recorded
     // period-1825 anchor (51 periods behind) in 35 s.
+    // Re-verified 2026-10-09 against the anchor v0.1.15 ships (period 1879):
+    // live_pins_alive run 37955464357 on a GitHub-hosted runner, 2 of 5 —
+    // exactly the floor. 84.112.35.112 and 54.201.148.177 served;
+    // 57.129.130.18 closed the connection from the runner again (its second
+    // close in a row) and so did 91.189.182.90; roost (9109) timed out in the
+    // transport handshake. Every zbox pin failed the same way in the first
+    // run of each network that afternoon (Sepolia's two also from a
+    // residential address) while the relay accepted TCP and answered
+    // multistream, and later runs reached them: a slow path to zbox behind
+    // the relay, not a dead server and not this list.
+    // The bootnodes seeded discv5 (34 entries), a cold start with every pin
+    // unreachable reached SYNCED in 30 s, and one from the recorded
+    // period-1825 anchor (54 periods behind) in 15 s.
     "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
     "/ip4/84.112.35.112/tcp/9000/p2p/16Uiu2HAm6YkLaGLMH1Q9caGi4A2WctHPhENumfQMJXVCMVpc7GQY",
     "/ip4/91.189.182.90/tcp/9000/p2p/16Uiu2HAmJJUAs17wxW1i4HM5Fce1zYPCvvavxsYorWr4EQVx1Ui8",
@@ -1994,6 +2131,13 @@ async fn run_sync(
     let mut last_progress = Instant::now();
     let mut last_seen_progress = (0u64, 0u64);
 
+    // Where in each slot the steady-state finality poll fires (drawn once per run).
+    let poll_offset_ms = {
+        let mut b = [0u8; 8];
+        let random = getrandom::getrandom(&mut b).map(|()| u64::from_le_bytes(b)).unwrap_or(0);
+        finality_poll_offset_ms(config.seconds_per_slot, random)
+    };
+
     // One loop for all phases: bootstrap (when the store isn't initialized —
     // fresh start OR after a poisoned resume was discarded), catch-up when
     // behind, finality polling in steady state.
@@ -2194,6 +2338,7 @@ async fn run_sync(
         }
 
         in_catchup = false; // reaching here means the committee is current
+        let poll_started = Instant::now();
         let poll =
             poll_finality(&config, &client, &mut pool, &mut processor, &mut clcache, &hunt.confirmed)
                 .await;
@@ -2216,7 +2361,11 @@ async fn run_sync(
         refresh_local_status(&config, &processor, &local_status);
         publish_status(&config, &client, &processor, &pool, &status_tx, &anchor, hunt.hunting).await;
 
-        tokio::time::sleep(Duration::from_secs(config.seconds_per_slot)).await;
+        // The next poll at this process's point in the next slot (just past a
+        // third of the way in), not a fixed slot after this round: the update a
+        // server holds refreshes when a block lands, so a poll that drifts
+        // through the slot answers up to a slot staler than it needs to.
+        tokio::time::sleep(config.until_next_finality_poll(poll_started.elapsed(), poll_offset_ms)).await;
     }
     // No code after the loop: the task ends via SyncHandle::stop (abort).
 }
@@ -2255,7 +2404,7 @@ fn persist_snapshot(
             tracing::info!(period, bytes = bytes.len(), "persisted sync-state snapshot");
         }
         // Give up until the NEXT period advance either way: a failing disk
-        // (full/read-only) would otherwise be retried every ~12 s poll cycle
+        // (full/read-only) would otherwise be retried every poll cycle (one per slot)
         // — repeated blocking I/O plus log spam — for a best-effort cache.
         Err(e) => tracing::warn!(error = %e,
             "snapshot write failed — retrying on the next period advance"),
@@ -3800,9 +3949,9 @@ fn refresh_local_status(
 /// Feed the EL execution anchor from the verified beacon store — the CL→EL
 /// trust bridge (twin of the Java `BeaconSyncState.updateFinalizedExecution` /
 /// `updateOptimisticExecution`). The finalized payload is what `is_synced()`
-/// derives from and what the header-chain walk anchors against; the optimistic
-/// payload gives the freshest attested head. Both also seed the `stateRootMatch`
-/// window. Guarded on a non-zero block hash so a pre-merge / absent execution
+/// derives from and the freshness floor of a header-chain walk; the optimistic
+/// payload gives the freshest attested head, the block hash that walk anchors
+/// against. Both also seed the `stateRootMatch` window. Guarded on a non-zero block hash so a pre-merge / absent execution
 /// header never registers a zero state root as "synced".
 fn update_exec_anchor(store: &LightClientStore, anchor: &ExecAnchor) {
     // Label each execution payload with ITS block's slot (`beacon.slot`), read
@@ -3823,6 +3972,7 @@ fn update_exec_anchor(store: &LightClientStore, anchor: &ExecAnchor) {
                     e.state_root,
                     e.block_number,
                     e.block_hash,
+                    e.timestamp,
                 );
             }
             HeaderExecution::BlockHash(hash) if *hash != [0u8; 32] => {
@@ -4242,10 +4392,10 @@ mod tests {
         assert_eq!(c.fork_schedule.version_for_signature_slot(13_164_544), [5, 0, 0, 0]);
         assert_eq!(c.fork_schedule.version_for_signature_slot(13_164_545), [6, 0, 0, 0]);
         // @checkpoint:mainnet:test:begin — managed by `./gradlew refreshCheckpoint`
-        assert_eq!(c.checkpoint_slot, 15_373_376);
+        assert_eq!(c.checkpoint_slot, 15_394_688);
         assert_eq!(
             hex_str(&c.checkpoint_root),
-            "d590bf3ac2b3010fddda48ecd5d72bc923a43af0751ab7e8fb20b8038cdbe503"
+            "3c65d22e715e662bad37f43374ce1b944ff9078617e6cd95eb8f88b2cd485b2b"
         );
         // @checkpoint:mainnet:test:end
         assert_eq!(
@@ -4391,10 +4541,10 @@ mod tests {
         assert_eq!(sig(11_296_768), [0x90, 0x00, 0x00, 0x75]);
         assert_eq!(sig(11_296_769), [0x90, 0x00, 0x00, 0x76]);
         // @checkpoint:sepolia:test:begin — managed by `./gradlew refreshCheckpoint`
-        assert_eq!(c.checkpoint_slot, 11_297_568);
+        assert_eq!(c.checkpoint_slot, 11_319_040);
         assert_eq!(
             hex_str(&c.checkpoint_root),
-            "2008fe0e6bc957261f85619221fc91befe6802a647d30bf9e408df3ad89ada9c"
+            "90bb35755de105925bef3875c65645817625cf69f65a3eb5048750a6709c7c4e"
         );
         // @checkpoint:sepolia:test:end
         assert_eq!(
@@ -4508,10 +4658,10 @@ mod tests {
         assert_eq!(c.fork_schedule.version_for_signature_slot(27_435_008), [0x05, 0, 0, 0x64]);
         assert_eq!(c.fork_schedule.version_for_signature_slot(27_435_009), [0x06, 0, 0, 0x64]);
         // @checkpoint:gnosis:test:begin — managed by `./gradlew refreshCheckpoint`
-        assert_eq!(c.checkpoint_slot, 30_462_400);
+        assert_eq!(c.checkpoint_slot, 30_513_552);
         assert_eq!(
             hex_str(&c.checkpoint_root),
-            "7a49f27ccca8ff682c49ab7979654e5b33e2abbadbf43550cfb151ae196715eb"
+            "a68918716e413f19655d4c8e4c35b46351b6f566a3123aeb30ecb35c04f09f3c"
         );
         // @checkpoint:gnosis:test:end
         assert_eq!(
@@ -4892,6 +5042,78 @@ mod tests {
             probed.insert(*id, now);
         }
         assert!(pool.explore_candidates(5, &probed, HUNT_REPROBE).is_empty());
+    }
+
+    #[test]
+    fn the_finality_poll_fires_just_past_a_third_into_every_slot() {
+        const G: u64 = 1_606_824_023; // mainnet genesis (s)
+        let at = |slot: u64, ms: u64| G * 1000 + slot * 12_000 + ms;
+        // The poll point: the 1/3 mark + 500 ms margin + a draw from a quarter slot.
+        assert_eq!(finality_poll_offset_ms(12, 0), 4_499);
+        assert_eq!(finality_poll_offset_ms(12, 3_000), 7_499);
+        assert_eq!(finality_poll_offset_ms(12, 3_001), 4_499); // wraps within the window
+        assert_eq!(finality_poll_offset_ms(5, 0), 2_166); // gnosis: 1_666 + 500
+        assert_eq!(finality_poll_offset_ms(5, u64::MAX) - 2_166, u64::MAX % 1_168);
+        assert_eq!(finality_poll_offset_ms(5, 1_167), 3_333); // gnosis window capped at 2/3
+        assert_eq!(finality_poll_offset_ms(1, 0), 333 + 100); // margin capped at a tenth
+        for (sps, lo, hi, window) in [(12, 4_499, 7_499, 3_000), (5, 2_166, 3_333, 1_167), (1, 433, 666, 233)] {
+            for r in [0, 1, 999, 123_456_789, u64::MAX, window - 1, window] {
+                let o = finality_poll_offset_ms(sps, r);
+                assert!(o >= lo && o <= hi && o <= sps * 1000 * 2 / 3, "{sps}/{r}: {o}");
+            }
+            assert_eq!(finality_poll_offset_ms(sps, window), hi, "{sps}: the window's top");
+        }
+        // The delay: the next point at least a quarter slot (3 s) away (a poll
+        // long ago, so only the rest applies).
+        let off = 4_499;
+        let d = |now| delay_to_next_poll(now, 60_000, G, 12, off).as_millis() as u64;
+        assert_eq!(d(at(100, 1_000)), 3_499); // early in the slot: this slot's point
+        assert_eq!(d(at(100, 1_499)), 12_000 + 3_000); // under 3 s before it: the next one
+        assert_eq!(d(at(100, 4_499)), 12_000); // on it: the next one
+        assert_eq!(d(at(100, 6_000)), 10_499);
+        // A round that overran into the next point skips ahead, never refires.
+        assert_eq!(d(at(101, 4_000)), 12_499);
+        // Gnosis: 5 s slots, rest 1.25 s, and no quota floor (its slot is shorter).
+        assert_eq!(delay_to_next_poll(G * 1000 + 5_000 * 7 + 500, 0, G, 5, 2_166).as_millis(), 1_666);
+        // Before genesis: at most the least wait + a slot; degenerate inputs never panic.
+        assert_eq!(delay_to_next_poll(0, 60_000, G, 12, off).as_millis(), 15_000);
+        assert_eq!(delay_to_next_poll(0, 0, G, 12, off).as_millis(), 23_000);
+        assert!(delay_to_next_poll(u64::MAX, 0, G, 0, 0).as_millis() <= 1_250);
+        assert!(delay_to_next_poll(u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX).as_millis() <= 86_400_000 * 5 / 4);
+        assert!(finality_poll_offset_ms(u64::MAX, u64::MAX) <= 86_400_000 * 2 / 3);
+        // Every delay leaves the rest and lands on the grid.
+        for ms in (0..24_000).step_by(37) {
+            let now = at(200, 0) + ms;
+            let wait = d(now);
+            assert!(wait > 3_000 && wait <= 15_000, "{wait}");
+            assert_eq!((now + wait - G * 1000) % 12_000, off, "{ms}");
+        }
+
+        // The quota floor (Lighthouse: one request per protocol per 10 s). A poll
+        // on the grid is followed by the next point a slot later, however long
+        // its round ran, up to the 3 s rest.
+        let p = at(300, off);
+        for round in (0..9_000).step_by(250) {
+            let wait = delay_to_next_poll(p + round, round, G, 12, off).as_millis() as u64;
+            assert_eq!(p + round + wait, p + 12_000, "round {round}");
+        }
+        // An off-grid poll (the first of a run, or one right after a catch-up):
+        // the next one starts at least 11 s after it, never inside the quota.
+        // Without the floor, a poll at the slot's start would be followed 4.5 s later.
+        assert_eq!(delay_to_next_poll(at(300, 1_000), 1_000, G, 12, off).as_millis(), 15_499);
+        for start_ms in (0..12_000).step_by(37) {
+            for round in [0, 200, 1_000, 5_000, 8_000] {
+                let start = at(400, start_ms);
+                let now = start + round;
+                let wait = delay_to_next_poll(now, round, G, 12, off).as_millis() as u64;
+                let next = now + wait;
+                assert!(next - start >= 11_000, "{start_ms}+{round}: {}", next - start);
+                assert!(wait > 3_000, "{start_ms}+{round}: {wait}");
+                assert_eq!((next - G * 1000) % 12_000, off, "{start_ms}+{round}");
+                // ...and no later than the first point past the floor.
+                assert!(next - start <= (round + 3_000).max(11_000) + 12_000, "{start_ms}+{round}");
+            }
+        }
     }
 
     #[test]

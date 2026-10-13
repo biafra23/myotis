@@ -3,26 +3,24 @@ package io.myotis.ui
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isSelectable
-import androidx.compose.ui.test.isToggleable
 import androidx.compose.ui.test.junit4.createComposeRule
-import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
-import androidx.compose.ui.test.performScrollTo
 import org.junit.Rule
 import org.junit.Test
 
 /**
  * Pins the Index tab's visibility rule: the tab is the log-index feature's home
- * (contracts are added and snapshots imported THERE), so it shows whenever the
- * engine choice can serve the feature — anything but a forced Java engine, the
- * log index being Rust-engine-only — and reacts live to the Settings toggle.
+ * (contracts are added and snapshots imported THERE), so under Expert mode it shows
+ * whenever the engine choice can serve the feature — anything but a forced Java
+ * engine, the log index being Rust-engine-only — and reacts live to the Settings
+ * toggle. (Expert mode itself is ExpertModeTabsTest's subject.)
  */
 class IndexTabVisibilityTest {
 
     /** [FakeSettings] with the knob the visibility rule reads made real. */
     private class IndexSettings(
         private var preferJava: Boolean = false,
-    ) : Settings by FakeSettings() {
+    ) : Settings by FakeSettings(expert = true) {
         private val logIndex = mutableMapOf<String, Boolean>()
         private val watch = mutableMapOf<String, String>()
         override fun preferJavaEngine(): Boolean = preferJava
@@ -39,7 +37,7 @@ class IndexTabVisibilityTest {
     @Test
     fun indexTabVisibleByDefault() {
         // auto is the default engine choice, so the feature's home is reachable
-        // out of the box — that is where a user discovers it.
+        // as soon as Expert mode is on — that is where a user discovers it.
         show(IndexSettings())
         tab("Settings").assertIsDisplayed()
         tab("Index").assertIsDisplayed()
@@ -59,7 +57,7 @@ class IndexTabVisibilityTest {
         tab("Index").assertIsDisplayed()
 
         tab("Settings").performClick()
-        toggle("Prefer Java engine")
+        rule.toggleSwitchBeside("Prefer Java engine")
         tab("Index").assertDoesNotExist()
     }
 
@@ -69,7 +67,7 @@ class IndexTabVisibilityTest {
         tab("Index").assertDoesNotExist()
 
         tab("Settings").performClick()
-        toggle("Prefer Java engine")
+        rule.toggleSwitchBeside("Prefer Java engine")
         tab("Index").assertIsDisplayed()
     }
 
@@ -81,22 +79,6 @@ class IndexTabVisibilityTest {
 
     /** The tab bar's tabs are the only selectable nodes on the screen. */
     private fun tab(label: String) = rule.onNode(isSelectable() and hasText(label))
-
-    /**
-     * Click the SwitchRow switch sitting beside [label] (scrolling it into view
-     * first). Every switch in a tab is a semantics SIBLING of every label (the
-     * Rows aren't semantic boundaries), so the pairing goes by vertical overlap.
-     */
-    private fun toggle(label: String) {
-        val labelBounds =
-            rule.onNodeWithText(label).performScrollTo().fetchSemanticsNode().boundsInRoot
-        val switches = rule.onAllNodes(isToggleable())
-        val beside = switches.fetchSemanticsNodes().indexOfFirst {
-            it.boundsInRoot.top < labelBounds.bottom && it.boundsInRoot.bottom > labelBounds.top
-        }
-        check(beside >= 0) { "no switch beside '$label'" }
-        switches[beside].performClick()
-    }
 
     private class FakeLogs : LogSource {
         override fun version(): Long = 0L

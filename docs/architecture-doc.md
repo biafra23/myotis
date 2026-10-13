@@ -4,9 +4,9 @@
 
 This document describes how a trustless Ethereum wallet library obtains and verifies all data necessary to display account balances, transaction history, and token holdings — without relying on JSON-RPC providers for correctness. The library participates directly in Ethereum's peer-to-peer networks and verifies all data cryptographically against trusted roots.
 
-The trust model: the only external trust assumption is the sync committee mechanism (≥2/3 of a 512-validator subset is honest). Everything else is verified locally via Merkle proofs, signatures, or accumulator commitments.
+The trust model: the only external trust assumption is the sync committee mechanism (≥2/3 of a 512-validator subset is honest). Everything else is verified locally via Merkle proofs, signatures, or accumulator commitments. For a walkthrough of the checks as the code runs them today, see [How Verification Works](verification.md).
 
-> **Implementation status (where the design meets reality):** The verification pipeline below is realized end-to-end — twice: by the original **Java engine** and by the **Rust engine** (`rust/`), which is the default engine today; both sit behind the same engine contract (`:myotis-api`) — and surfaced to wallets as a **verified JSON-RPC endpoint** (Section 10) on Android, iOS, the desktop app and the desktop daemon, and to embedders as a library (Node.js addon, iOS framework). An unmodified MetaMask pointed at the node reads balances, simulates calls, estimates gas, suggests fees, and **broadcasts a real transaction**, all from locally verified data — no trusted RPC provider. The parts of this document that are still aspirational (historical accumulators, TrueBlocks completeness proofs, background-sync scheduling) are called out in [Implementation Status](implementation-status.md); the data-acquisition and verification core is built. Where this document names a Java class (`DefaultEvmExecutor`, `CcipReadEvmExecutor`, …) it describes the Java engine; the Rust engine implements the same design with its own types (`rust/myotis-evm`, `rust/myotis-net/src/el`).
+> **Implementation status (where the design meets reality):** The verification pipeline below is realized end-to-end — twice: by the original **Java engine** and by the **Rust engine** (`rust/`), which is the default engine today; both sit behind the same engine contract (`:myotis-api`) — and surfaced to wallets as a **verified JSON-RPC endpoint** (Section 10) on Android, iOS, the desktop app and the desktop daemon, and to embedders as a library (Node.js addon, iOS framework). An unmodified MetaMask pointed at the node reads balances, simulates calls, estimates gas, suggests fees, and **broadcasts a real transaction**, all from locally verified data — no trusted RPC provider. The parts of this document that are still aspirational (historical accumulators, TrueBlocks completeness proofs, the background-sync strategy beyond Android's catch-up jobs) are called out in [Implementation Status](implementation-status.md); the data-acquisition and verification core is built. Where this document names a Java class (`DefaultEvmExecutor`, `CcipReadEvmExecutor`, …) it describes the Java engine; the Rust engine implements the same design with its own types (`rust/myotis-evm`, `rust/myotis-net/src/el`).
 
 ### Data the Wallet Needs
 
@@ -42,7 +42,7 @@ The Ethereum beacon chain designates a randomly selected subset of 512 validator
 
 ### What We Extract
 
-From the verified beacon block header, we obtain the `ExecutionPayloadHeader` via a Merkle proof against the beacon state root. This gives us:
+From the verified beacon block header, we obtain the `ExecutionPayloadHeader` via a Merkle proof against the beacon block's `body_root` (generalized index 25, depth 4 — `EXECUTION_PAYLOAD_GINDEX` in `rust/myotis-consensus/src/spec.rs` and the Java `BeaconChainSpec`). From Gloas on (on Sepolia since epoch 353,024; mainnet and Gnosis have no date yet) the block body carries a payload bid instead, so the header proves only an execution block hash (gindex 2856), and the number and state root come from the EL header fetched by that hash and checked against it ([glamsterdam-plan.md](glamsterdam-plan.md)). This gives us:
 
 - `stateRoot` — commitment to the entire Ethereum state at this block
 - `blockHash` — the execution block hash
@@ -60,16 +60,20 @@ Sync committee data is obtained via **libp2p** (the consensus layer p2p network)
 - `LightClientFinalityUpdate` — finality notifications
 - `LightClientOptimisticUpdate` — latest head tracking
 
-Peer discovery uses **discv5** (the consensus layer's discovery protocol), which operates over UDP and uses a Kademlia DHT. ENRs (Ethereum Node Records) advertise the node's capabilities, so we can find peers that serve light client data.
+(Both engines register all four but request only the first three; the optimistic head they track is the attested header of the finality updates they poll — see [Implementation Status](implementation-status.md) §1.)
+
+Peer discovery uses **discv5** (the consensus layer's discovery protocol), which operates over UDP and uses a Kademlia DHT. ENRs (Ethereum Node Records) carry the node's `eth2` fork digest, so we can find peers on our chain; whether a peer actually serves light client data shows only after connecting (its libp2p Identify protocol list, then its answers), and the CL peer cache remembers it.
 
 ---
 
 ## 2. Verifying Historical Blocks — Trusted Accumulator Snapshots
 
-> **Status: designed, not built.** Today both engines verify a block only by walking the
-> parent-hash chain from the beacon-attested block, at most 8,192 blocks away; older blocks
-> fail with `headerChainGapTooLarge` and pre-Merge blocks with `preMergeBlock`. Nothing in
-> this section exists in code yet.
+> **Status: designed, not built.** Today a block is verified only by walking the parent-hash
+> chain down from a beacon-attested block: the JSON-RPC block and receipt reads of both engines
+> reach at most 512 blocks back, the Java engine's operator `get-block` at most 8,192 (older
+> blocks fail with `headerChainGapTooLarge`, pre-Merge blocks with `preMergeBlock`), and the Rust
+> log index walks further only block by block, down to a watched contract's deployment. Nothing
+> in this section exists in code yet.
 
 ### The Problem
 
@@ -101,6 +105,15 @@ Blocks before the Merge (September 2022) are not committed to by the beacon chai
 ---
 
 ## 3. Transaction History — TrueBlocks via IPFS
+
+> **Status: built only as a debug-only, unverified scan** (Java engine, mainnet: `TxHistoryService`
+> in `:tx-history`, behind the daemon's `get-transactions` and the desktop and Android Query tabs).
+> The manifest CID is read from the on-chain UnchainedIndex contract through a verified `eth_call`;
+> blooms and chunks come from an IPFS HTTP gateway only (no IPFS p2p), checked against the
+> manifest's sizes and by parsing but not re-hashed against their CIDs (`UnchainedIndexStore`);
+> transactions are not verified against `transactionsRoot` on this path, and there is no balance
+> reconciliation. Upstream publishing appears stalled about a year behind the head. Details:
+> [Implementation Status](implementation-status.md) §3.
 
 ### The Problem
 
@@ -149,7 +162,7 @@ We participate in the **execution layer p2p network (devp2p)** using the `eth` p
 
 ### Verification
 
-Each piece of data is verified against commitments in the block header (which we've already verified via sync committees or the historical accumulator):
+Each piece of data is verified against commitments in the block header (which we've already verified via sync committees or — once built, §2 — the historical accumulator):
 
 1. **Block header**: The header hash must match the `blockHash` from the verified beacon block execution payload.
 2. **Transactions**: The transaction list is Merkleized into a trie. The root of this trie must match the `transactionsRoot` in the verified header. Each individual transaction can be proven via a Merkle proof against this root.
@@ -187,17 +200,11 @@ The wallet participates in the execution layer p2p network and negotiates the **
 
 Use `GetAccountRange` to request accounts from the state trie:
 
-- **Parameters**: `rootHash` (the verified `stateRoot`), `startingHash` (set to `keccak256(address)` or slightly before), `limitHash` (set to just after `keccak256(address)`), `responseBytes` (byte cap).
-- **Response**: A list of accounts in the requested range, plus **Merkle proofs** for the range boundaries.
+- **Parameters**: `rootHash` (the verified `stateRoot`), `startingHash` (set to `keccak256(address)`), `limitHash` (`0xff…ff` — the full range), `responseBytes` (byte cap, 4 KiB in both engines).
+- **Response**: A list of accounts in the requested range, plus **Merkle proofs** for the range boundaries. The peer returns at least the first account and the complete boundary proof whatever the cap, so the small cap keeps the discarded neighbours to a few KB without ever truncating the proof.
 - Each account record contains: `nonce`, `balance`, `storageRoot`, `codeHash`.
 
-Alternatively, use `GetTrieNodes` to request specific trie nodes by path:
-
-- Compute the path as the nibbles of `keccak256(address)`.
-- Request the trie nodes along that path from root to leaf.
-- Assemble the Merkle proof locally from the returned nodes.
-
-`GetTrieNodes` may be preferable for single-account lookups as it avoids returning unnecessary neighboring accounts and resembles normal trie healing traffic.
+Neither engine uses `GetTrieNodes` (once considered as an alternative for single-account lookups): the range messages return the complete root-to-leaf proof in one answer, and snap/2 (EIP-8189) removed `GetTrieNodes`. Both engines route every state read through `GetAccountRange` / `GetStorageRanges` (see [Implementation Status](implementation-status.md) §5).
 
 #### For ERC-20 Token Balances
 
@@ -205,11 +212,11 @@ ERC-20 balances are stored in the **storage trie** of the token contract. This r
 
 1. **Account proof**: Prove the token contract's account exists in the state trie (as above). This gives us the contract's `storageRoot`.
 2. **Storage proof**: Use `GetStorageRanges` to request storage slots from the contract's storage trie:
-   - **Parameters**: `rootHash` (the `stateRoot`), `accounts` (the contract address hash), `origin`/`limit` (narrow range around the target storage slot hash), `responseBytes`.
+   - **Parameters**: `rootHash` (the `stateRoot`), `accounts` (the contract address hash), `origin`/`limit` (`origin` = the target storage slot hash, `limit` = `0xff…ff`, as for accounts), `responseBytes` (the same 4 KiB cap).
    - **Response**: Storage slot data plus Merkle proofs.
    - For standard ERC-20 contracts, the balance of address `A` is stored at slot `keccak256(abi.encode(A, uint256(slot)))`, where `slot` is typically 0 or 1 (the position of the `balanceOf` mapping in the contract's storage layout). The exact slot depends on the contract — it must be determined per token contract (known for major tokens, discoverable via storage layout metadata for verified contracts). Note that contracts written in Vyper (used by protocols like Curve Finance) use a different hashing formulation for storage mappings than Solidity. A robust implementation will need to distinguish between Solidity and Vyper contracts to compute storage slots correctly.
 
-Alternatively, `GetTrieNodes` can be used here as well, requesting specific paths within the storage trie.
+As for accounts, the code does not use `GetTrieNodes` here: storage slots are fetched with `GetStorageRanges` and verified against the contract's proven `storageRoot`.
 
 **NFTs (ERC-721 / ERC-1155)** work identically — ownership and balance data are stored in contract storage mappings with different slot layouts but the same proof mechanism. NFT metadata (images, names) is typically fetched from IPFS or HTTP URLs referenced in the contract's `tokenURI` storage; this is untrusted display data that does not affect verified ownership.
 
@@ -223,7 +230,7 @@ All SNAP responses include Merkle proofs that are verified locally against the t
 
 ### Peer Discovery for SNAP
 
-SNAP-capable peers are discovered through the same mechanisms as `eth` peers (discv4, DNS discovery). Nodes advertise SNAP support in their ENR records (the `"snap"` key). The wallet filters discovered peers for those advertising SNAP capability and maintains a local cache of responsive SNAP peers.
+SNAP-capable peers are discovered through the same mechanisms as `eth` peers (discv4, DNS discovery). Nodes may advertise SNAP support in their ENR records (the `"snap"` key), but neither engine reads it: a peer's `snap` version is learned from its RLPx Hello capabilities after the dial (an ENR is pre-filtered only by its `eth` fork id). The wallet keeps the peers that negotiated `snap` and maintains a local cache of responsive SNAP peers.
 
 For a wallet with a handful of addresses, the total SNAP traffic per session is minimal — perhaps 5-20 requests at app launch. This is negligible load on serving peers.
 
@@ -241,7 +248,7 @@ Direct storage reads against the registry and resolver contracts work for vanill
 
 The wallet's resolver (`EnsResolver` on the Java engine, its twin in the Rust engine) discovers the name's resolver through the **ENS Registry** — an ENSIP-10 walk: the exact node, then each parent until a resolver is set — and calls that resolver **directly**: `resolve(bytes name, bytes data)` on an ENSIP-10 (wildcard / off-chain) resolver, or the record method itself on a legacy resolver. There is deliberately no Universal Resolver and no shared CCIP batch gateway (such as `ccip-v2.ens.xyz`) in the path: an off-chain name's ERC-3668 `OffchainLookup` points at the resolver's own gateway, so no third party relays the request. `OffchainLookup` reverts surface at the call boundary, where a higher-level decorator fetches the off-chain response transparently.
 
-The call runs entirely inside the local EVM. State reads (account fields, storage slots, contract bytecode) are served by a state oracle that fetches them on demand via the snap/1 protocol and verifies every response with a Merkle-Patricia proof against the `stateRoot` from a verified block header.
+The call runs entirely inside the local EVM. State reads (account fields, storage slots, contract bytecode) are served by a state oracle that fetches them on demand via the snap protocol (snap/1 or snap/2) and verifies every response with a Merkle-Patricia proof against the `stateRoot` from a verified block header.
 
 Supported record types — every one goes through the same Registry-walk + direct-resolver dispatch, so wildcard + CCIP-Read work identically for all of them:
 
@@ -276,7 +283,7 @@ Verifiability is a property of the dispatch path (a direct resolver call via the
 - **State reads**: every account field and storage slot accessed during execution is verified by a Merkle-Patricia proof against the `stateRoot` of a verified block header. A peer cannot lie about state without producing a forged proof.
 - **Contract bytecode**: bytecode fetched via `GetByteCodes` is verified by checking that its keccak256 matches the `codeHash` field of the (proof-verified) account record.
 - **CCIP-Read gateways**: trusted only for *availability*. The resolver's callback validates the gateway's response on-chain — typically by checking a signer's signature against trusted-signers stored on-chain. If the gateway lies, the callback reverts and resolution fails cleanly.
-- **Block header**: as elsewhere, anchored to the beacon chain via sync committee BLS signatures and the historical accumulator.
+- **Block header**: as elsewhere, anchored to the beacon chain via sync committee BLS signatures (and, once built, the historical accumulator — §2).
 
 The "interpretation" of returned bytes is a separate concern from verification: we verify that a `contenthash` value is the exact bytes the resolver returned, not that the IPFS hash inside resolves to live content; we verify a multi-coin BTC address is what the resolver stored, not that the bytes form a valid Bitcoin script. Sanity-decoding the value is the caller's responsibility.
 
@@ -338,7 +345,7 @@ Some wallet operations cannot be answered by simple state lookups. ENS resolutio
 
 ### How It Works
 
-The wallet embeds a local EVM that runs against a state oracle fetching account fields, storage slots, and contract bytecode on demand from snap/1 peers, verifying every response with a Merkle-Patricia proof against a verified `stateRoot`. The **Rust engine** builds it on **revm** (`rust/myotis-evm`, behind a `SnapStateOracle` trait; it also tracks the EVM forks first — Amsterdam is served there and refused by the Java engine's Besu); the **Java engine** builds it on Hyperledger Besu's standalone `org.hyperledger.besu:evm` module (`myotis-evm`). The rest of this section describes the Java engine's executor stack; the Rust engine implements the same speculative-prefetch and CCIP-Read design in its own executor.
+The wallet embeds a local EVM that runs against a state oracle fetching account fields, storage slots, and contract bytecode on demand from snap peers, verifying every response with a Merkle-Patricia proof against a verified `stateRoot`. The **Rust engine** builds it on **revm** (`rust/myotis-evm`, behind a `SnapStateOracle` trait; it also tracks the EVM forks first — Amsterdam is served there and refused by the Java engine's Besu); the **Java engine** builds it on Hyperledger Besu's standalone `org.hyperledger.besu:besu-evm` module (`myotis-evm`). The rest of this section describes the Java engine's executor stack; the Rust engine implements the same speculative-prefetch and CCIP-Read design in its own executor.
 
 Execution is structured as a stack of decorators around a base `EvmExecutor`:
 
@@ -357,10 +364,10 @@ Identical to the SNAP / state-data trust model:
 
 ### Current Use Cases
 
-- **ENS resolution** (`resolve-ens` and the seven `resolve-ens-*` variants): full forward resolution, including ENSIP-10 wildcard names and ERC-3668 off-chain records.
+- **ENS resolution** (`resolve-ens` and the eight `resolve-ens-*` variants, `resolve-ens-ownership` among them): full forward resolution, including ENSIP-10 wildcard names and ERC-3668 off-chain records.
 - **Reverse ENS lookup**: address → name with mandatory forward-verification round-trip.
 - **Gas estimation** (`DefaultEvmExecutor.estimateGas` / the Rust `EvmExecutor::estimate_tx`): geth's search for the lowest gas limit at which the transaction succeeds, + 15% safety buffer. Acceptance corpus (ETH→EOA / ETH→contract / ERC-20 / ERC-721 / Uniswap V3) cross-checks against `eth_estimateGas` within 5%; an Anvil-fork broadcast test additionally confirms the estimate is sufficient on the wire (`gasUsed <= localEstimate`). Served over JSON-RPC as `eth_estimateGas` (Section 10) and validated on-device against MetaMask's send flow.
-- **`eth_call` view calls**: arbitrary contract reads (ERC-20 metadata, balances, multicall aggregations) are served via `eth_call` (Section 10). A multi-hop speculative-prefetch loop (`PrefetchingEvmExecutor`) batches the SLOAD round-trips so a many-token balance sweep resolves in a couple of network waves instead of one round-trip per slot. The call object's `block` argument is applied (a number within a small window of the verified head, or `latest`/`finalized`; anything else is refused rather than answered from the head), and a revert reaches the wallet as JSON-RPC error `3` with the revert payload. The rest of the transaction object is applied as geth applies it — `gas` as the call's limit, the fee fields, and on the Rust engine the access and authorization lists — or refused with `-32602` (#509).
+- **`eth_call` view calls**: arbitrary contract reads (ERC-20 metadata, balances, multicall aggregations) are served via `eth_call` (Section 10). A multi-hop speculative-prefetch loop (`PrefetchingEvmExecutor`) batches the SLOAD round-trips so a many-token balance sweep resolves in a couple of network waves instead of one round-trip per slot. The call object's `block` argument is applied (a number within a small window of the verified head, `latest`/`pending`, or `finalized` on the Rust engine; anything else is refused rather than answered from the head), and a revert reaches the wallet as JSON-RPC error `3` with the revert payload. The rest of the transaction object is applied as geth applies it — `gas` as the call's limit, the fee fields, and on the Rust engine the access and authorization lists — or refused with `-32602` (#509).
 - **The log index** (`eth_getLogs`, Rust engine): not an EVM use case but the same trust model — an opt-in, per-network index of chosen contracts' logs, each verified against `receiptsRoot`, walked back to the contract's deployment block and kept current at the head; see [eth-getlogs-design.md](eth-getlogs-design.md).
 
 ### Future Use Cases
@@ -381,11 +388,11 @@ A host-agnostic router (`jsonrpc-server`, Kotlin Multiplatform/Ktor) maps the Et
 
 | Method(s) | Verification basis |
 |---|---|
-| `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt` | snap/1 Merkle-Patricia proof against a beacon-anchored `stateRoot` (Section 5) |
-| `eth_call`, `eth_estimateGas` | local EVM over proof-served state (Sections 8–9) |
+| `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt` | snap Merkle-Patricia proof against a beacon-anchored `stateRoot` (Section 5) |
+| `eth_call`, `eth_estimateGas`, `eth_createAccessList` (Rust engine) | local EVM over proof-served state (Sections 8–9) |
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory` | base fee from verified headers; tips from bodies/receipts verified against `transactionsRoot`/`receiptsRoot` (Section 8) |
 | `eth_getBlockByNumber`/`ByHash` and the block-derived reads (transaction counts, transactions by index, uncle counts/uncles), `eth_getTransactionReceipt`, `eth_getBlockReceipts`, `eth_getTransactionByHash` | header window anchored to the beacon head; bodies/receipts verified against `transactionsRoot`/`receiptsRoot` (Sections 4, 7) |
-| `eth_getLogs` | the opt-in log index — every log verified against `receiptsRoot`; an uncovered range is an error, never `[]` (Rust engine) |
+| `eth_getLogs` | the opt-in log index — every log verified against `receiptsRoot`; an uncovered range is an error, never `[]` (Rust engine; not yet wired on the iOS host) |
 | `eth_sendRawTransaction` | devp2p transaction gossip (Section 7) |
 | `eth_chainId`, `net_version`, `eth_blockNumber`, `eth_syncing`, `eth_accounts`, `net_listening`, `net_peerCount`, `web3_clientVersion`, `web3_sha3` | config, the beacon light client's own state, or local computation — no peer data |
 
@@ -410,10 +417,12 @@ The entire stack — devp2p, libp2p, light client, local EVM, and this JSON-RPC 
    └─→ Verified recent beacon block header
        └─→ Execution payload: stateRoot, blockHash, baseFeePerGas
 
-2. TRUEBLOCKS INDEX (IPFS, HTTP gateway fallback)
+2. TRUEBLOCKS INDEX (IPFS, HTTP gateway fallback; built only as a
+                      debug-only scan — §3)
    └─→ List of (blockNumber, txIndex) for user's addresses
 
-3. HISTORICAL VERIFICATION (accumulator snapshot + sync committees)
+3. HISTORICAL VERIFICATION (accumulator snapshot + sync committees;
+                             designed, not built — §2)
    └─→ Verified block headers for all historical blocks of interest
 
 4. BLOCK DATA (devp2p eth protocol)
@@ -452,11 +461,11 @@ The entire stack — devp2p, libp2p, light client, local EVM, and this JSON-RPC 
 | devp2p    | eth      | Block headers/bodies, tx gossip, receipts   |
 | devp2p    | snap     | Account state, storage proofs, bytecode     |
 | HTTPS     | CCIP-Read gateway | Off-chain ENS records (ERC-3668)   |
-| HTTPS     | IPFS gateway (content-addressed, CID-checked) | TrueBlocks index chunks (debug-only history scan, Java engine) |
+| HTTPS     | IPFS gateway (size- and parse-checked; CIDs not re-hashed) | TrueBlocks index chunks (debug-only history scan, Java engine) |
 | discv5    | UDP DHT  | Consensus layer peer discovery              |
 | discv4    | UDP DHT  | Execution layer peer discovery              |
 | DNS       | TXT      | Bootstrap peer lists (EIP-1459; Java engine everywhere, Rust engine on desktop and daemon hosts, never under Tor — #539) |
-| Tor       | Arti, optional (`-PtorEngine`, Rust engine) | Account reads over isolated circuits — see [privacy-and-tor.md](privacy-and-tor.md) |
+| Tor       | Arti, optional (`-PtorEngine`, Rust engine) | Account reads and the wallet's own transaction broadcasts over isolated circuits — see [privacy-and-tor.md](privacy-and-tor.md) |
 | HTTP      | JSON-RPC | Verified wallet API served to MetaMask (strict, no proxy) |
 
 ### Trust Assumptions
@@ -466,7 +475,7 @@ The entire stack — devp2p, libp2p, light client, local EVM, and this JSON-RPC 
 | Sync committees     | ≥2/3 of 512 randomly selected validators are honest               |
 | SNAP peers          | Completeness only — correctness verified via Merkle proofs    |
 | devp2p peers        | Completeness only — block data verified against header roots  |
-| TrueBlocks / IPFS   | Integrity verified via CID — but completeness is unverifiable; mitigated by balance reconciliation |
+| TrueBlocks / IPFS   | Integrity verified via CID — but completeness is unverifiable; mitigated by balance reconciliation (design; the debug-only scan built today checks sizes and parsing, not CIDs, and has no reconciliation — §3) |
 | Accumulator snapshot (designed, not built) | One-time trust at build/distribution time                        |
 | Transaction gossip   | Availability only — need multiple peers to mitigate censorship   |
 | Local EVM           | Same as SNAP peers — every state read backed by Merkle proof; bytecode verified by `codeHash`     |
@@ -487,6 +496,8 @@ Some components described above could be replaced by alternative approaches:
 ---
 
 ## Resource Constraints — Mobile Mitigation
+
+> **Status (Android): built in part.** WorkManager runs `CatchUpWorker` about daily on any network and `ChargingCatchUpWorker` hourly while charging on an unmetered network; each resumes the paused network stacks, catches the light client (the charging pass also the log index's head gap) up within an 8-minute budget and pauses them again, unless "stay awake while charging" keeps them running. A running stack idle-pauses after 5 minutes without a wallet request, not when the app goes to the background. Background pre-fetching of account state and TrueBlocks chunks, and the bloom-filter gap scan, are not built. See [disk-and-network-usage.md](disk-and-network-usage.md) §3.3.
 
 Maintaining p2p connections, syncing headers, and fetching state data has non-trivial battery and bandwidth costs on mobile devices. The following strategy mitigates this:
 

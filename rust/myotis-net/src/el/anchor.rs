@@ -1,6 +1,7 @@
 //! The CL→EL execution anchor (EL-A7), twin of the Java
 //! `consensus.BeaconSyncState` — the SOLE trust hand-off from the beacon light
-//! client to the execution layer (docs/reimplementation/04 §3, README §3).
+//! client to the execution layer (docs/reimplementation/07, *The CL→EL anchor
+//! (`ExecAnchor`)*; README §3; docs/verification.md).
 //!
 //! Holds the beacon-verified execution anchor: the finalized execution
 //! `{block_number, block_hash, state_root, slot}`, the optimistic (attested)
@@ -57,6 +58,10 @@ pub struct FinalizedExecution {
     pub block_number: u64,
     pub state_root: [u8; 32],
     pub block_hash: [u8; 32],
+    /// The block's own timestamp (unix seconds), proven with it: the
+    /// light-client payload header carries it, and a resolved Gloas header is
+    /// the one that hashes to `block_hash`. 0 when unknown.
+    pub timestamp: u64,
 }
 
 /// The optimistic execution head as [`ExecAnchor::optimistic_head_state`]
@@ -80,6 +85,9 @@ struct Inner {
     execution_state_root: Option<[u8; 32]>,
     execution_block_number: u64,
     execution_block_hash: Option<[u8; 32]>,
+    /// The finalized execution block's own timestamp (unix seconds), proven
+    /// with it, as for the optimistic head below. 0 until known.
+    execution_timestamp: u64,
     optimistic_slot: u64,
     optimistic_block_number: u64,
     optimistic_block_hash: Option<[u8; 32]>,
@@ -131,8 +139,9 @@ impl ExecAnchor {
         ExecAnchor::default()
     }
 
-    /// Record a finalized update (on every beacon finality step). Also appends
-    /// the finalized `(slot, state_root)` to the fast-path window as
+    /// Record a finalized update (on every beacon finality step), with the
+    /// execution block's timestamp from the same proven payload header. Also
+    /// appends the finalized `(slot, state_root)` to the fast-path window as
     /// BLS-verified.
     pub fn update_finalized(
         &self,
@@ -140,6 +149,7 @@ impl ExecAnchor {
         execution_state_root: [u8; 32],
         execution_block_number: u64,
         execution_block_hash: [u8; 32],
+        execution_timestamp: u64,
     ) {
         let mut inner = self.inner.lock().expect("anchor mutex");
         set_finalized(
@@ -148,6 +158,7 @@ impl ExecAnchor {
             execution_state_root,
             execution_block_number,
             execution_block_hash,
+            execution_timestamp,
         );
     }
 
@@ -229,7 +240,8 @@ impl ExecAnchor {
     }
 
     /// The block hashes waiting for their header — the pending finality first
-    /// (what the header-chain walk anchors on), then the pending optimistic head.
+    /// (what finalized reads anchor on), then the pending optimistic head (what
+    /// the header-chain walk anchors on).
     pub fn pending_hashes(&self) -> Vec<[u8; 32]> {
         let inner = self.inner.lock().expect("anchor mutex");
         let mut out = Vec::with_capacity(2);
@@ -267,7 +279,7 @@ impl ExecAnchor {
         let mut adopted = false;
         if let Some((slot, pending)) = inner.pending_finalized {
             if pending == hash {
-                set_finalized(&mut inner, slot, root, number, hash);
+                set_finalized(&mut inner, slot, root, number, hash, timestamp);
                 inner.pending_finalized = None;
                 adopted = true;
             }
@@ -366,17 +378,30 @@ impl ExecAnchor {
             .map(|hash| (inner.optimistic_block_number, hash))
     }
 
-    /// The optimistic execution `(block_number, state_root)` read atomically —
-    /// the CURRENT beacon-attested head state, at most a couple of slots old.
-    /// `None` until the first optimistic update lands. This is the root snap
-    /// queries should prefer: it is BLS-verified and recent enough that every
-    /// honest synced peer still retains it in its snap serve window (unlike a
-    /// peer's handshake-time head, which post-merge never refreshes).
-    pub fn optimistic_execution(&self) -> Option<(u64, [u8; 32])> {
+    /// [`Self::optimistic_head`] with the beacon slot that attested it,
+    /// `(block_number, block_hash, slot)` under ONE lock — the anchor a
+    /// verified read's header-chain walk ends at (`verify::ladder_precheck`),
+    /// which reports the slot as the read's `matchedBeaconSlot`.
+    pub fn optimistic_anchor(&self) -> Option<(u64, [u8; 32], u64)> {
+        let inner = self.inner.lock().expect("anchor mutex");
+        inner
+            .optimistic_block_hash
+            .filter(|_| inner.optimistic_block_number > 0)
+            .map(|hash| (inner.optimistic_block_number, hash, inner.optimistic_slot))
+    }
+
+    /// The optimistic execution `(block_number, state_root, timestamp)` read
+    /// atomically — the CURRENT beacon-attested head state, at most a couple of
+    /// slots old, and the block's own timestamp proven with it (0 while
+    /// unknown). `None` until the first optimistic update lands. This is the
+    /// root snap queries should prefer: it is BLS-verified and recent enough
+    /// that every honest synced peer still retains it in its snap serve window
+    /// (unlike a peer's handshake-time head, which post-merge never refreshes).
+    pub fn optimistic_execution(&self) -> Option<(u64, [u8; 32], u64)> {
         let inner = self.inner.lock().expect("anchor mutex");
         inner
             .optimistic_state_root
-            .map(|root| (inner.optimistic_block_number, root))
+            .map(|root| (inner.optimistic_block_number, root, inner.optimistic_timestamp))
     }
 
     /// The optimistic execution head as a send is judged by (#531), read
@@ -419,11 +444,19 @@ fn is_current(inner: &Inner) -> bool {
     inner.finality_current && inner.pending_finalized.is_none()
 }
 
-fn set_finalized(inner: &mut Inner, slot: u64, state_root: [u8; 32], number: u64, hash: [u8; 32]) {
+fn set_finalized(
+    inner: &mut Inner,
+    slot: u64,
+    state_root: [u8; 32],
+    number: u64,
+    hash: [u8; 32],
+    timestamp: u64,
+) {
     inner.finalized_slot = slot;
     inner.execution_state_root = Some(state_root);
     inner.execution_block_number = number;
     inner.execution_block_hash = Some(hash);
+    inner.execution_timestamp = timestamp;
     push_root(&mut inner.known_roots, slot, state_root, true);
 }
 
@@ -462,6 +495,7 @@ fn finalized_of(inner: &Inner) -> Option<FinalizedExecution> {
             block_number: inner.execution_block_number,
             state_root,
             block_hash,
+            timestamp: inner.execution_timestamp,
         }),
         _ => None,
     }
@@ -516,11 +550,13 @@ mod tests {
         assert_eq!(anchor.finalized_execution(), None);
         assert!(!anchor.is_synced());
 
-        anchor.update_finalized(100, root(1), 21_000_000, root(0xf1));
+        anchor.update_finalized(100, root(1), 21_000_000, root(0xf1), 1_699_999_000);
         assert!(anchor.is_synced()); // derived: a finalized exec root landed
         let fin = anchor.finalized_execution().unwrap();
         assert_eq!(fin.block_number, 21_000_000);
         assert_eq!(fin.state_root, root(1));
+        // The finalized block's own proven timestamp travels with it.
+        assert_eq!(fin.timestamp, 1_699_999_000);
         assert_eq!(anchor.finalized_slot(), 100);
 
         assert_eq!(anchor.optimistic_head(), None); // no optimistic update yet
@@ -533,7 +569,7 @@ mod tests {
         assert_eq!(anchor.optimistic_block_number(), 21_000_005);
         assert_eq!(anchor.optimistic_head(), Some((21_000_005, root(0xf2))));
         // The atomic (number, root) pair snap queries prefer (issue #355).
-        assert_eq!(anchor.optimistic_execution(), Some((21_000_005, root(2))));
+        assert_eq!(anchor.optimistic_execution(), Some((21_000_005, root(2), 1_700_000_000)));
 
         // Both roots are in the fast-path window.
         assert!(anchor.find_state_root(&root(1)).is_some());
@@ -546,7 +582,7 @@ mod tests {
         let anchor = ExecAnchor::new();
         assert!(!anchor.finality_is_current());
         // A finalized root landing (e.g. a restored snapshot) is not currency.
-        anchor.update_finalized(100, root(1), 21_000_000, root(0xf1));
+        anchor.update_finalized(100, root(1), 21_000_000, root(0xf1), 0);
         assert!(anchor.is_synced());
         assert!(!anchor.finality_is_current());
         anchor.set_finality_current(true);
@@ -560,7 +596,7 @@ mod tests {
     fn finality_and_its_currency_read_as_one_pair() {
         let anchor = ExecAnchor::new();
         assert_eq!(anchor.finalized_execution_with_currency(), (None, false));
-        anchor.update_finalized(100, root(1), 21_000_000, root(0xf1));
+        anchor.update_finalized(100, root(1), 21_000_000, root(0xf1), 0);
         anchor.set_finality_current(true);
         let (fin, current) = anchor.finalized_execution_with_currency();
         assert_eq!(fin, anchor.finalized_execution());
@@ -772,15 +808,16 @@ mod tests {
         assert_eq!(anchor.pending_hashes(), vec![h.hash], "fetched once");
         assert!(anchor.resolve_header(&h));
         assert_eq!(anchor.optimistic_head(), Some((9, h.hash)));
-        assert_eq!(anchor.optimistic_execution(), Some((9, root(9))));
+        assert_eq!(anchor.optimistic_execution().map(|(n, r, _)| (n, r)), Some((9, root(9))));
         // A Gloas head's age is its resolved header's own timestamp (#531).
         assert_eq!(
             anchor.optimistic_head_state().map(|h| (h.number, h.state_root, h.timestamp)),
             Some((9, root(9), 1_700_000_108))
         );
+        // The finalized twin carries the same resolved header's timestamp.
         assert_eq!(
-            anchor.finalized_execution().map(|f| f.block_number),
-            Some(9)
+            anchor.finalized_execution().map(|f| (f.block_number, f.timestamp)),
+            Some((9, 1_700_000_108))
         );
     }
 

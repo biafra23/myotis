@@ -23,7 +23,8 @@ package io.myotis.api;
  * @param beaconChainVerified the block ties to a beacon-attested root/hash
  * @param blsVerified         the beacon match was BLS-signed
  * @param matchedBeaconSlot   slot of the matching attestation; -1 if none
- * @param verifyMethod        "stateRootMatch" / "headerChain" / null
+ * @param verifyMethod        "headerChain" / null (engines before the header-walk fix also
+ *                            reported "stateRootMatch")
  * @param failReason          null when verified; otherwise a stable reason token
  * @param error               null when the fetch succeeded; otherwise the fetch
  *                            failure message (all other fields are zero/null then)

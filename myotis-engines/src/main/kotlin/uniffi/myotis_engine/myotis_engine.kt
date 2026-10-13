@@ -678,6 +678,10 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_canonical_network_name(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_check_raw_transaction_json(
+    ): Int
+    external fun uniffi_myotis_engine_checksum_func_create_access_list_json(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_create_handle(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_drain_logs(
@@ -746,6 +750,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_set_tor_enabled(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_set_tor_storage_dirs(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_set_ws_bound_periods(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_start_handle(
@@ -774,6 +780,10 @@ internal object UniffiLib {
     external fun uniffi_myotis_engine_fn_func_available_networks_json(uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_canonical_network_name(`nameOrAlias`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_check_raw_transaction_json(`rawTxHex`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_create_access_list_json(`handle`: Long,`tx`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,`stateOverrides`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_create_handle(`network`: RustBuffer.ByValue,`dataDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
@@ -842,6 +852,8 @@ internal object UniffiLib {
     external fun uniffi_myotis_engine_fn_func_set_served_block_window(`handle`: Long,`blocks`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_myotis_engine_fn_func_set_tor_enabled(`on`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
+    external fun uniffi_myotis_engine_fn_func_set_tor_storage_dirs(`stateDir`: RustBuffer.ByValue,`cacheDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_myotis_engine_fn_func_set_ws_bound_periods(`handle`: Long,`periods`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
@@ -972,130 +984,139 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
-    if (lib.uniffi_myotis_engine_checksum_func_accept_stale_anchor() != 5742) {
+    if ((lib.uniffi_myotis_engine_checksum_func_accept_stale_anchor() and 0xFFFF) != 5742) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_available_networks_json() != 49639) {
+    if ((lib.uniffi_myotis_engine_checksum_func_available_networks_json() and 0xFFFF) != 49639) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_canonical_network_name() != 21726) {
+    if ((lib.uniffi_myotis_engine_checksum_func_canonical_network_name() and 0xFFFF) != 21726) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_create_handle() != 44197) {
+    if ((lib.uniffi_myotis_engine_checksum_func_check_raw_transaction_json() and 0xFFFF) != 60260) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_drain_logs() != 44503) {
+    if ((lib.uniffi_myotis_engine_checksum_func_create_access_list_json() and 0xFFFF) != 41557) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_engine_init() != 41182) {
+    if ((lib.uniffi_myotis_engine_checksum_func_create_handle() and 0xFFFF) != 44197) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_ens_record_json() != 7888) {
+    if ((lib.uniffi_myotis_engine_checksum_func_drain_logs() and 0xFFFF) != 44503) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_estimate_gas_json() != 21056) {
+    if ((lib.uniffi_myotis_engine_checksum_func_engine_init() and 0xFFFF) != 41182) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_estimate_gas_tx_json() != 33818) {
+    if ((lib.uniffi_myotis_engine_checksum_func_ens_record_json() and 0xFFFF) != 7888) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_eth_call_json() != 58294) {
+    if ((lib.uniffi_myotis_engine_checksum_func_estimate_gas_json() and 0xFFFF) != 21056) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_eth_call_overrides_json() != 2974) {
+    if ((lib.uniffi_myotis_engine_checksum_func_estimate_gas_tx_json() and 0xFFFF) != 33818) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_eth_call_tx_json() != 32426) {
+    if ((lib.uniffi_myotis_engine_checksum_func_eth_call_json() and 0xFFFF) != 58294) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_export_log_index() != 2966) {
+    if ((lib.uniffi_myotis_engine_checksum_func_eth_call_overrides_json() and 0xFFFF) != 2974) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_fee_estimate_json() != 39989) {
+    if ((lib.uniffi_myotis_engine_checksum_func_eth_call_tx_json() and 0xFFFF) != 32426) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_fee_history_json() != 17955) {
+    if ((lib.uniffi_myotis_engine_checksum_func_export_log_index() and 0xFFFF) != 2966) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_get_block_by_hash_json() != 52442) {
+    if ((lib.uniffi_myotis_engine_checksum_func_fee_estimate_json() and 0xFFFF) != 39989) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_get_block_by_number_json() != 42616) {
+    if ((lib.uniffi_myotis_engine_checksum_func_fee_history_json() and 0xFFFF) != 17955) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_get_block_receipts_json() != 43710) {
+    if ((lib.uniffi_myotis_engine_checksum_func_get_block_by_hash_json() and 0xFFFF) != 52442) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_get_code_json() != 46545) {
+    if ((lib.uniffi_myotis_engine_checksum_func_get_block_by_number_json() and 0xFFFF) != 42616) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_get_logs_json() != 29899) {
+    if ((lib.uniffi_myotis_engine_checksum_func_get_block_receipts_json() and 0xFFFF) != 43710) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_get_storage_at_json() != 41050) {
+    if ((lib.uniffi_myotis_engine_checksum_func_get_code_json() and 0xFFFF) != 46545) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_get_storage_proof_json() != 41815) {
+    if ((lib.uniffi_myotis_engine_checksum_func_get_logs_json() and 0xFFFF) != 29899) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_get_transaction_by_hash_json() != 64104) {
+    if ((lib.uniffi_myotis_engine_checksum_func_get_storage_at_json() and 0xFFFF) != 41050) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_get_transaction_receipt_json() != 56168) {
+    if ((lib.uniffi_myotis_engine_checksum_func_get_storage_proof_json() and 0xFFFF) != 41815) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_import_log_index_files() != 14078) {
+    if ((lib.uniffi_myotis_engine_checksum_func_get_transaction_by_hash_json() and 0xFFFF) != 64104) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_log_index_status_json() != 7764) {
+    if ((lib.uniffi_myotis_engine_checksum_func_get_transaction_receipt_json() and 0xFFFF) != 56168) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_pause_handle() != 51434) {
+    if ((lib.uniffi_myotis_engine_checksum_func_import_log_index_files() and 0xFFFF) != 14078) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_pending_nonce_overlay() != 21732) {
+    if ((lib.uniffi_myotis_engine_checksum_func_log_index_status_json() and 0xFFFF) != 7764) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_read_stats_json() != 19147) {
+    if ((lib.uniffi_myotis_engine_checksum_func_pause_handle() and 0xFFFF) != 51434) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_request_account_json() != 48343) {
+    if ((lib.uniffi_myotis_engine_checksum_func_pending_nonce_overlay() and 0xFFFF) != 21732) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_resolve_ens_json() != 48380) {
+    if ((lib.uniffi_myotis_engine_checksum_func_read_stats_json() and 0xFFFF) != 19147) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_resume_handle() != 4974) {
+    if ((lib.uniffi_myotis_engine_checksum_func_request_account_json() and 0xFFFF) != 48343) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_send_raw_transaction_json() != 13582) {
+    if ((lib.uniffi_myotis_engine_checksum_func_resolve_ens_json() and 0xFFFF) != 48380) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_set_dns_discovery() != 13006) {
+    if ((lib.uniffi_myotis_engine_checksum_func_resume_handle() and 0xFFFF) != 4974) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_set_log_index_config() != 49994) {
+    if ((lib.uniffi_myotis_engine_checksum_func_send_raw_transaction_json() and 0xFFFF) != 13582) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_set_served_block_window() != 15483) {
+    if ((lib.uniffi_myotis_engine_checksum_func_set_dns_discovery() and 0xFFFF) != 13006) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_set_tor_enabled() != 16704) {
+    if ((lib.uniffi_myotis_engine_checksum_func_set_log_index_config() and 0xFFFF) != 49994) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_set_ws_bound_periods() != 6098) {
+    if ((lib.uniffi_myotis_engine_checksum_func_set_served_block_window() and 0xFFFF) != 15483) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_start_handle() != 14110) {
+    if ((lib.uniffi_myotis_engine_checksum_func_set_tor_enabled() and 0xFFFF) != 16704) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_status_json() != 5098) {
+    if ((lib.uniffi_myotis_engine_checksum_func_set_tor_storage_dirs() and 0xFFFF) != 46410) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_stop_handle() != 52697) {
+    if ((lib.uniffi_myotis_engine_checksum_func_set_ws_bound_periods() and 0xFFFF) != 6098) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_myotis_engine_checksum_func_tor_status() != 43413) {
+    if ((lib.uniffi_myotis_engine_checksum_func_start_handle() and 0xFFFF) != 14110) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_myotis_engine_checksum_func_status_json() and 0xFFFF) != 5098) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_myotis_engine_checksum_func_stop_handle() and 0xFFFF) != 52697) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_myotis_engine_checksum_func_tor_status() and 0xFFFF) != 43413) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1387,6 +1408,43 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     
         
         FfiConverterString.lower(`nameOrAlias`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * The `eth_sendRawTransaction` gate on the bytes alone (ABI ≥ 45), no handle: `{"ok":true}`, the permanent `{"error","code":-32602}` refusal, or `{"error": ...}` for bad hex. Hosts call it before their readiness hold.
+         */ fun `checkRawTransactionJson`(`rawTxHex`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_check_raw_transaction_json(
+    
+        
+        FfiConverterString.lower(`rawTxHex`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Verified `eth_createAccessList` for the FULL JSON-RPC transaction object
+         * (ABI ≥ 40): the same `tx`, `block` and `state_overrides` as
+         * [`estimate_gas_tx_json`] — the EIP-2930 access list the transaction
+         * touches, built as geth builds it, with the gas the run made with it used
+         * and that run's own revert or halt next to the list; every field applied as
+         * [`eth_call_tx_json`] applies it, or the request refused with the permanent
+         * `{"error","code":-32602}` envelope.
+         */ fun `createAccessListJson`(`handle`: kotlin.Long, `tx`: kotlin.String, `block`: kotlin.String, `stateOverrides`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_create_access_list_json(
+    
+        
+        FfiConverterLong.lower(`handle`),
+        FfiConverterString.lower(`tx`),
+        FfiConverterString.lower(`block`),
+        FfiConverterString.lower(`stateOverrides`),_status)
 }
     )
     }
@@ -1972,6 +2030,26 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     
         
         FfiConverterBoolean.lower(`on`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Name the absolute directories the embedded Tor client keeps its state and
+         * its directory cache in. Required on Android before the first Tor read (Arti's
+         * defaults derive from `$HOME`); elsewhere unset means Arti's platform
+         * defaults. True iff the client will use exactly these: a different pair once
+         * a bootstrap holds its directories, a relative path, or a Tor-less build
+         * answers false. Process-global, not per-handle.
+         */ fun `setTorStorageDirs`(`stateDir`: kotlin.String, `cacheDir`: kotlin.String): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_set_tor_storage_dirs(
+    
+        
+        FfiConverterString.lower(`stateDir`),
+        FfiConverterString.lower(`cacheDir`),_status)
 }
     )
     }

@@ -5,8 +5,9 @@ generic build/import/export on `feat/logindex-import` — see §Import below).
 Scope decision (2026-08-01): **iteration 1 sources everything from EL/CL peers**;
 scope extension (2026-08-14): the index is **generic** — any address set can be
 indexed (`build-logindex`), exported as a portable snapshot, and imported on
-any host of the same chain. The feature is **opt-in** per network; the shipped
-**watch-list** preset (kohaku's privacy contracts) is one config among many.
+any host of the same chain. The feature is **opt-in** per network; the
+**watch-list** is the user's own (the original kohaku preset was retired
+2026-08-20 — §Kohaku preset).
 
 ## Why
 
@@ -28,15 +29,16 @@ head.
 Nothing new is trusted. Every log served passes the existing gates:
 
 - Headers become trusted only via the beacon anchor + parent-hash chaining
-  (same rule as `fetch_anchored_window`, `el/reader.rs:2350`, generalized to a
+  (same rule as `fetch_anchored_window`, `el/reader.rs:9121`, generalized to a
   descending walk of unbounded depth).
 - Receipts are fetched by (trusted) block hash and verified against the
-  trusted header's `receiptsRoot` (`verify_block_receipts`, `el/reader.rs:2430`)
+  trusted header's `receiptsRoot` (`verify_block_receipts`, `el/reader.rs:9277`)
   before any log is extracted.
 - The header's `logsBloom` is used only as a *skip* heuristic: a non-match is a
   definitive "no watched logs here" (bloom has no false negatives); a match
-  still requires receipt verification. Bloom checking reuses
-  `myotis_core::bloom::accrue` (`myotis-core/src/bloom.rs:18`).
+  still requires receipt verification. Bloom checking is
+  `myotis_core::bloom::may_contain` (`myotis-core/src/bloom.rs:32`), the probe
+  twin of `accrue`.
 - **Coverage honesty (the load-bearing correctness rule):** `eth_getLogs`
   answers only when the requested range × addresses lies inside indexed
   coverage; anything else is a hard error (strict `-32000` retryable while
@@ -47,16 +49,19 @@ Nothing new is trusted. Every log served passes the existing gates:
 
 All I/O-bearing code lives in `myotis-net` (the tokio/fs shell); `myotis-core`
 stays sans-I/O; `myotis-engine` adds only JSON + thin FFI delegation — per
-`docs/myotis-rust-engine-guidelines.md` (§1 wasm canary, §9 no globals).
+`docs/myotis-rust-engine-guidelines.md` (§1 sans-I/O core, §8 wasm canary, §9 no globals).
 
-New module: `rust/myotis-net/src/el/logindex/`.
+New module: `rust/myotis-net/src/el/logindex/`. (As built it is the single
+file `rust/myotis-net/src/el/logindex.rs` — types, coverage, query, the MLIX
+format, merge; the appender, walker and head bridge live on `ElReader` in
+`el/reader.rs`.)
 
 ### 1. Store (`logindex/store.rs`)
 
 Per-network file under `dataDir`, following the suffix rule of
-`host::create` (`myotis-engine/src/host.rs:149`): `logindex.db` /
+`host::create` (`myotis-engine/src/host.rs:279`): `logindex.db` /
 `logindex-sepolia.db`. In-memory authoritative state + atomic persistence
-(temp-file + rename, the `persist_snapshot` pattern, `sync.rs:1114`),
+(temp-file + rename, the `persist_snapshot` pattern, `sync.rs:2384`),
 checkpointed after each backfill batch and periodically at head. Contents:
 
 - config echo: watch-list (address, from_block) entries + config hash — a
@@ -65,7 +70,7 @@ checkpointed after each backfill batch and periodically at head. Contents:
   the backfill cursor (lowest verified header hash + number of the walk);
 - logs: matching logs as stored tuples
   (block_number, block_hash, tx_hash, tx_index, log_index, address, topics,
-  data) — the fields `eljson.rs:317` already emits per log;
+  data) — the fields `eljson.rs:362` already emits per log;
 - format: versioned framed blob; unknown version ⇒ discard and re-index
   (an index is derived data, never correctness-critical state).
 
@@ -246,15 +251,20 @@ too.
 ### 2. Head-follow appender (forward, cheap, always-on while enabled)
 
 A tokio task owned by `ElReader` (so `ElReader::stop`/pause aborts it —
-lifecycle rule from `SyncHandle::stop`, `sync.rs:461`). It polls
-`anchor.optimistic_block_number()` (`el/anchor.rs:154`; no head-advance
+lifecycle rule from `SyncHandle::stop`, `sync.rs:1243`). It polls
+`anchor.optimistic_block_number()` (`el/anchor.rs:363`; no head-advance
 callback exists today — polling at block cadence is fine, a `watch` channel is
 a later nicety). For each newly anchored block: bloom-check the header; on
 match run the existing whole-block verified path (`block_receipts_from`,
-`el/reader.rs:1940`), extract watched logs, append, advance coverage `high`.
+`el/reader.rs:8556`), extract watched logs, append, advance coverage `high`.
+(As built, on a 6 s tick: up to finality a per-block path fetches every
+block's receipts through `block_receipts_at` with no bloom skip, up to 16
+blocks a tick; above finality the optimistic tail, and for a gap past
+`APPEND_WINDOW` (128) or a stalled per-block path the head bridge, bloom-filter and go through the
+receipts-first `fetch_candidate_logs` — §3, *What a candidate costs*.)
 
-Reorg rule mirrors the tx-scan cursor (`el/reader.rs:2017`): below
-`finalized_block_number()` (`el/reader.rs:649`) entries are immutable; above
+Reorg rule mirrors the tx-scan cursor (`TxScanState`, `el/reader.rs:1039`): below
+`finalized_block_number()` (`el/reader.rs:5540`) entries are immutable; above
 it, on hash mismatch rewind coverage to the fork point and drop the orphaned
 logs (iteration 1 drops rather than emits `removed:true`, since only
 finalized-or-reconfirmed data is served — see Serving).
@@ -264,13 +274,13 @@ finalized-or-reconfirmed data is served — see Serving).
 From the first anchored block downward to `min(watch.from_block)`:
 
 1. Fetch headers descending in batches (`get_block_headers_by_number` with
-   `reverse`, up to 1024/req — `el/peer.rs:240`); verify each batch by
+   `reverse`, up to 1024/req — `el/peer.rs:636`); verify each batch by
    parent-hash chaining into the already-trusted lower edge (the
    `fetch_anchored_window` invariant generalized: the walk's trust root is the
    anchored head, extended downward hash-by-hash).
 2. Per verified header: bloom-check against the watch-list (addresses +
    optional topic0s). Non-match ⇒ record coverage and discard the header.
-3. Match ⇒ `get_receipts([hash])` (`el/peer.rs:325`) + `verify_block_receipts`;
+3. Match ⇒ `get_receipts([hash])` (`el/peer.rs:742`) + `verify_block_receipts`;
    extract matching logs; store. The block's body is fetched only when its
    receipts turn out to hold a watched log (see *What a candidate costs*).
 4. Checkpoint cursor + coverage after each batch; restart is idempotent from
@@ -546,7 +556,11 @@ descends. Bridge design: anchor a fresh chained window at the new finalized
 head, walk down to the old high edge, then resume appending — absorbable by
 the single-span coverage model without a second cursor as long as the bridge
 completes before the high edge advances. Until it lands, the append-side warn
-says plainly that coverage above the edge stays frozen.
+says plainly that coverage above the edge stays frozen. *Status: landed as the
+head bridge (`log_index_bridge_step` / `BridgePlan`, `el/reader.rs`): it
+descends from the finalized block to the edge and ascends applying blocks,
+for gaps up to `BRIDGE_MAX_GAP` (500,000 blocks from finality); beyond that
+coverage still holds.*
 
 ### 4. Serving (`getLogs`)
 
@@ -556,36 +570,45 @@ the shapes kohaku's sync actually sends (batched consecutive ranges plus wide
 historical ranges). Answer from the store when the full requested range is
 inside coverage for every requested address **and** at-or-below the last
 reconfirmed head; else `{"error": …}` → strict `-32000`. Output reuses the
-per-log JSON of `receipt_json` (`eljson.rs:313-341`, factored into a shared
+per-log JSON of `receipt_json` (`eljson.rs:303-393`, factored into a shared
 `log_json`), wrapped in an array; golden tests pin the shape on both sides.
+(As built: `eljson::get_logs_json` writes the same per-log shape itself,
+golden-pinned against `receipt_json`'s; the filter also takes `earliest` and
+`pending` (= `latest`), and refuses `safe`, `blockHash` and a malformed filter
+with the permanent `-32602` — `parse_get_logs_filter`, `myotis-engine/src/host.rs`.)
 
 ### 5. Config & opt-in plumbing
 
 There is no existing config channel into the Rust engine beyond
-(network, dataDir) (`RustMyotisEngine.java:121` → `ffi.rs:61`), and
-`servedBlockWindow` never crosses the FFI — so the watch-list gets a dedicated
+(network, dataDir) (`RustMyotisEngine.java:138` → `ffi.rs:65`), and
+`servedBlockWindow` never crosses the FFI (true at ABI v21; v22 then added
+`set_served_block_window` the same post-create way) — so the watch-list gets a dedicated
 post-create call rather than a `create_handle` signature break:
 
 - FFI: `set_log_index_config(handle, config_json) -> bool`,
   `log_index_status_json(handle) -> String`,
   `get_logs_json(handle, filter_json) -> String` — UniFFI (`ffi.rs`) + C ABI
   (`capi.rs` + `rust/include/myotis_engine.h`), `ABI_VERSION` bump with a
-  changelog line (`lib.rs:34`).
-- Config JSON: `{ "enabled": bool, "watch": [{"address": "0x…",
-  "fromBlock": n, "topic0s": ["0x…", …]? }, …], "unwatch": ["0x…", …]? }`.
+  changelog line (`lib.rs:285`).
+- Config JSON: `{ "enabled": bool, "maxSpeed": bool?, "backfillPaused": bool?,
+  "watch": [{"address": "0x…", "fromBlock": n, "topic0s": ["0x…", …]?,
+  "name": "…"? }, …], "unwatch": ["0x…", …]? }`.
   Watch lists live host-side as data, not in the engine — originally a
   built-in preset (the kohaku contract set per network), since 2026-08-20 the
-  user's own entries (`LogIndexWatch`, entered on the Index tab and persisted
+  user's own entries (`LogIndexWatch`, entered on the Index tab (Settings → Expert mode) and persisted
   per network). `watch` is additive and `unwatch` is the unsubscribe — see
   §Import, *Unsubscribe*.
-- Hosts: `NodeController` gains logIndex getters/setters next to
-  `servedBlockWindow` (`ui/.../NodeController.kt:158`); persisted by each
+- Hosts: the `Settings` seam gains logIndex getters/setters next to
+  `servedBlockWindow` (`ui/.../NodeController.kt:315`); persisted by each
   host's `Settings` actual; applied on (re)start via `RustChainHandle` right
   after create. UI: an opt-in toggle + progress row (coverage low edge vs
-  target, blocks/sec) on the network card.
-- Router: `eth_getLogs` added to `VERIFIED_METHODS` (`RpcRouter.kt:43`) and
+  target, blocks/sec) on the network card. (As built: the Index tab, in
+  Expert mode, plus the Status tab's Log index tile and row —
+  docs/status-screen.md.)
+- Router: `eth_getLogs` added to `VERIFIED_METHODS` (`RpcRouter.kt:48`, the
+  `VERIFIED_ARITY` table it derives from) and
   `tryVerified`, backed by a new `RpcBackend.getLogs(filterJson)`; tri-state
-  string convention like `getBlockReceipts` (`VerifiedReads.java:76`).
+  string convention like `getBlockReceipts` (`VerifiedReads.java:211`).
 
 ### Kohaku preset (RETIRED 2026-08-20 — now migration seed data)
 
@@ -639,7 +662,7 @@ router/API changes in this design already accommodate it.
    index): the daemon's `peers` IPC command reads the engine-routed
    `ChainHandle`, and `RustChainHandle` stubs both `discoveredPeers()` and
    `connectedPeers()` to an empty list — so on a `-Pengine=rust` daemon it
-   always answers `{"count":0,"peers":[]}` while the Rust pool is in fact
+   always answers `{"ok":true,"count":0,"peers":[],"connected":[]}` while the Rust pool is in fact
    serving a dozen peers. That is the shape
    this document warns about everywhere else — an empty result that reads as
    "none exist" when it means "not measured here" — and it cost real time
@@ -795,7 +818,7 @@ merged high back in time. Lifting the canonical-shape constraint (true
 per-entry frontiers) is the tracked follow-up that would make merges lossless;
 it needs append/bridge machinery per entry.
 
-**Additive config (behavior change in v23):** `set_log_index_config` unions
+**Additive config (behavior change in v24):** `set_log_index_config` unions
 the pushed config's `watch` with the already-subscribed set (live index, or on
 boot the portable snapshot's own watch-table). Without this, every host
 restart's preset push would fingerprint-mismatch an imported index into a full
@@ -811,8 +834,9 @@ includes its restriction, nothing is mergeable.
 which contracts' logs are available — and they are resolved IN THE IMPORTING
 WALLET, not at generation (owner's call, 2026-08-14: the generator writes
 unnamed entries). A naming pass inside the appender task resolves one
-unnamed address per tick (forward-verified `EnsQuery::Reverse` against the
-Auto root ladder, 30s-bounded, ≤3 attempts each) and fills ONLY empty
+unnamed address every fifth tick, ~30 s (forward-verified `EnsQuery::Reverse`
+against the Auto root ladder, 8 s-bounded, ≤3 attempts each, ~10 min apart;
+`log_index_name_tick`) and fills ONLY empty
 names — a host-pushed preset label outranks a late lookup, and a name that
 cannot resolve just stays an address. Names are excluded from the config
 fingerprint: renaming never costs a re-index.

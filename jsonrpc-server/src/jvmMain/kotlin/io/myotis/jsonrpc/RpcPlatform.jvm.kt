@@ -7,6 +7,8 @@ import java.io.File
 
 internal actual val rpcIoDispatcher: CoroutineDispatcher = Dispatchers.IO
 
+internal actual fun rpcEpochMillis(): Long = System.currentTimeMillis()
+
 internal actual fun rpcLogInfo(logger: String, message: String) {
     LoggerFactory.getLogger(logger).info(message)
 }

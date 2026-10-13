@@ -13,9 +13,12 @@ package io.myotis.desktop
  * not start cold either.
  *
  * This is a DEBUG / DEMO artefact, not a production path: the seed is a full node's
- * `eth_getLogs` output framed by `scripts/synth_logindex.py`, unverified until the walker
- * re-fetches it (docs/bee-rpc-service.md, *Demo only*), and it expires ~500,000 Gnosis
- * blocks (~29 days) after its fetch — the manifest carries the block it is usable until.
+ * `eth_getLogs` output framed by `scripts/synth_logindex.py`, served unverified
+ * (docs/bee-rpc-service.md, *Demo only*). Only the backfill walk re-checks it, on its way
+ * down to the contract's deployment, and this flavour ships with that walk switched off;
+ * even a walk switched on never removes a log the seed invented
+ * ([PocFlavour.seededIndexNotice]). It expires ~500,000 Gnosis blocks (~29 days) after its
+ * fetch — the manifest carries the block it is usable until.
  *
  * Everything here is a no-op unless the packaged app carries `-Dmyotis.beePoc=true`
  * (the Gradle property adds it to the bundle's JVM args and to the dev `run` task).

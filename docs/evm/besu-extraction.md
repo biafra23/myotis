@@ -8,10 +8,14 @@ when chasing classpath conflicts.
 
 ```
 groupId    = org.hyperledger.besu
-artifactId = evm
-version    = 24.12.2 (pinned in gradle/libs.versions.toml as `besu`)
+artifactId = besu-evm (named `evm` before 25.7)
+version    = 26.4.0 (pinned in gradle/libs.versions.toml as `besu`)
 repo       = https://hyperledger.jfrog.io/artifactory/besu-maven
 ```
+
+`:android-app` swaps `besu-evm` (and `besu-crypto-algorithms`) for the
+ART-patched `biafra23/besu` fork (`26.4.0-android.1`; see
+`besu-android-fork/README.md`), so a bump also means rebasing that fork.
 
 `besu-datatypes` is also pulled directly so the `Address`/`Hash`/`Wei` value
 types are explicit on the classpath rather than transitive — when those types
@@ -19,6 +23,13 @@ appear in our internal API surface (e.g. `BlockContextValues`) we want a
 deterministic version match.
 
 ## What `org.hyperledger.besu:evm:24.12.2` pulls in
+
+> **Status:** audited at 24.12.2 and not redone for 26.4.0. What the build
+> records for 26.4.0 (`myotis-evm/build.gradle.kts`, root `build.gradle.kts`):
+> Tuweni 2.7.2, Caffeine, Guava, JNA, besu-native and jc-kzg arrive
+> transitively; Besu logs against `log4j-api`, which `:myotis-evm` routes into
+> slf4j/Logback through `log4j-to-slf4j`, while `log4j-core` and the log4j
+> slf4j providers are excluded repo-wide.
 
 The artifact's POM imports `org.hyperledger.besu:bom:24.12.2`, which in turn
 pins (without forcing) a large surface of transitive deps:
@@ -72,7 +83,8 @@ The right entry point is `AbstractMessageProcessor.process()`, which walks
 the state machine:
 `NOT_STARTED → CODE_EXECUTING (via subclass start) → runToHalt → CODE_SUCCESS/REVERT/HALT → COMPLETED_*`.
 
-We loop on `process()` until the frame reaches a `COMPLETED_*` state to
+We call `process()` on the top of the frame's message-frame stack until the
+stack drains (leaving the outer frame in a `COMPLETED_*` state), to
 correctly handle CALL/CREATE child frames, which suspend the parent at
 `CODE_SUSPENDED` and require re-entry. (Today's Phase 0 test bytecode does
 not exercise that path; Phase 2 will, against real ERC-20 contracts.)
@@ -81,10 +93,12 @@ not exercise that path; Phase 2 will, against real ERC-20 contracts.)
 
 `EvmFactory.buildForBlock(BlockContext)` selects between London / Paris
 (post-merge, block-keyed) / Shanghai / Cancun / Prague / Osaka (timestamp-keyed)
-using each hosted chain's own published transition values (per-chain cascades; unknown chain ids fail closed). Pre-London is intentionally
-unsupported — the wallet only operates on recent finalised heads. Add a
-test per fork transition (one block before, one block after) before any
-upgrade.
+using each hosted chain's own published transition values (per-chain cascades; unknown chain ids fail closed).
+Amsterdam is refused, not built: Sepolia blocks from `SEPOLIA_AMSTERDAM_TIME`
+fail with `UnsupportedFork` (Besu 26.4 cannot price them; the Rust engine
+serves them). Pre-London is intentionally unsupported — the wallet only
+operates on recent finalised heads. Add a test per fork transition (one
+block before, one block after) before any upgrade.
 
 Precompile sets are paired with the fork:
 

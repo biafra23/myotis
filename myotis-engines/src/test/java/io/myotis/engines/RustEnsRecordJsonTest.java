@@ -19,19 +19,22 @@ class RustEnsRecordJsonTest {
     private static final String ADDR40 = "0x" + "d8".repeat(20);
 
     private static String ok(String valueFields) {
-        return "{\"status\":\"ok\",\"blockNumber\":21000010,\"verified\":true," + valueFields + "}";
+        return "{\"status\":\"ok\",\"blockNumber\":21000010,\"blockTimestamp\":1700000120,"
+                + "\"verified\":true," + valueFields + "}";
     }
 
     private static final String NO_RECORD =
-            "{\"status\":\"noRecord\",\"blockNumber\":21000010,\"verified\":false}";
+            "{\"status\":\"noRecord\",\"blockNumber\":21000010,\"blockTimestamp\":1700000120,\"verified\":false}";
     private static final String OFFCHAIN =
-            "{\"status\":\"offchain\",\"blockNumber\":21000010,\"verified\":false}";
+            "{\"status\":\"offchain\",\"blockNumber\":21000010,\"blockTimestamp\":1700000120,\"verified\":false}";
 
     @Test
     void addressOkNoRecordAndOffchain() {
         var okR = RustEnsApi.addressFromJson("vitalik.eth", ok("\"addressHex\":\"" + ADDR40 + "\""));
         assertEquals(ADDR40, okR.addressHex());
         assertEquals(21000010, okR.blockNumber());
+        // ABI 41: the block's timestamp from the verified header it ran against.
+        assertEquals(1700000120L, okR.blockTimestamp());
         assertTrue(okR.verified());
         assertNull(okR.error());
 
@@ -39,6 +42,7 @@ class RustEnsRecordJsonTest {
         assertNull(none.addressHex());
         assertNull(none.error()); // successful "no record"
         assertFalse(none.verified());
+        assertEquals(1700000120L, none.blockTimestamp());
 
         var off = RustEnsApi.addressFromJson("cb.id", OFFCHAIN);
         assertNull(off.addressHex());
@@ -50,6 +54,7 @@ class RustEnsRecordJsonTest {
         var r = RustEnsApi.reverseFromJson(ADDR40, ok("\"name\":\"vitalik.eth\""));
         assertEquals("vitalik.eth", r.name());
         assertEquals(ADDR40, r.addressHex());
+        assertEquals(1700000120L, r.blockTimestamp());
         assertTrue(r.verified());
         // Empty record / failed forward-verify / no reverse resolver are ONE
         // shape: noRecord with a null name and NO error (Java parity).
@@ -67,6 +72,41 @@ class RustEnsRecordJsonTest {
         var none = RustEnsApi.textFromJson("vitalik.eth", "url", NO_RECORD);
         assertNull(none.value());
         assertNull(none.error());
+    }
+
+    @Test
+    void ownershipOkSubnameAndNoRecord() {
+        var full = RustEnsApi.ownershipFromJson("myotis.eth", ok(
+                "\"registrantHex\":\"" + ADDR40 + "\",\"managerHex\":\"" + ADDR40 + "\",\"wrapped\":false,"
+                + "\"resolverHex\":\"0x" + "23".repeat(20) + "\",\"expiresAt\":1823155031,"
+                + "\"gracePeriodSeconds\":7776000"));
+        assertEquals(ADDR40, full.registrantHex());
+        assertEquals(ADDR40, full.managerHex());
+        assertFalse(full.wrapped());
+        assertEquals("0x" + "23".repeat(20), full.resolverHex());
+        assertEquals(1823155031L, full.expiresAt());
+        assertEquals(7776000L, full.gracePeriodSeconds());
+        assertEquals(21000010, full.blockNumber());
+        assertEquals(1700000120L, full.blockTimestamp());
+        assertTrue(full.verified());
+        assertNull(full.error());
+        // A wrapped subname: no registrar part, the absent fields left out of the JSON.
+        var sub = RustEnsApi.ownershipFromJson("sub.myotis.eth", ok(
+                "\"managerHex\":\"" + ADDR40 + "\",\"wrapped\":true"));
+        assertNull(sub.registrantHex());
+        assertEquals(ADDR40, sub.managerHex());
+        assertTrue(sub.wrapped());
+        assertNull(sub.resolverHex());
+        assertEquals(-1L, sub.expiresAt());
+        assertEquals(-1L, sub.gracePeriodSeconds());
+        var none = RustEnsApi.ownershipFromJson("nobody.eth", NO_RECORD);
+        assertNull(none.managerHex());
+        assertEquals(-1L, none.expiresAt());
+        assertEquals(1700000120L, none.blockTimestamp());
+        assertNull(none.error());
+        // The mandatory boolean missing is shape drift, fail closed.
+        assertThrows(EngineException.class,
+                () -> RustEnsApi.ownershipFromJson("x.eth", ok("\"managerHex\":\"" + ADDR40 + "\"")));
     }
 
     @Test

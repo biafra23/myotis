@@ -52,7 +52,7 @@ Myotis is a wallet engine for a trustless Ethereum wallet — it runs as an Andr
 
 ## What This Library Does Differently
 
-Rather than querying a centralised server, this library connects directly to the Ethereum peer-to-peer network and retrieves and **verifies** all data cryptographically. (The rest of this section is written as the design intent; the parts still ahead of the implementation are the transaction-history index and its balance reconciliation, and Tor routing beyond account reads.)
+Rather than querying a centralised server, this library connects directly to the Ethereum peer-to-peer network and retrieves and **verifies** all data cryptographically. (The rest of this section is written as the design intent. Built today: proven balances and token holdings, sync-committee consensus tracking, and direct broadcast to peers. Still ahead of the implementation: the verified transaction-history index and its balance reconciliation (only a debug-only, unverified scan exists), address-range obfuscation of balance queries (each query still names the exact account hash), and Tor routing beyond account reads and the wallet's own transaction broadcasts.)
 
 **Balances will be proven, not reported.** The library will fetch ETH balances and ERC-20 token holdings with cryptographic proofs that link the data back to a trusted chain state. If the data does not match the proof, it will be rejected. No server will be able to fabricate a balance that passes verification.
 

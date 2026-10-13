@@ -14,11 +14,12 @@ license = "MIT OR Apache-2.0"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# Tor verified-read routing (docs/privacy-and-tor.md) — OFF by default. The host
-# dylib build (`cargoBuildHost -PtorEngine`) enables it so the desktop/daemon can
-# offer the Settings toggle; Android/iOS builds do NOT, so the Arti tree never
-# crosses to mobile. The `set_tor_enabled`/`tor_status` FFI functions exist either
-# way (they no-op / report "not compiled" without this feature).
+# Tor verified-read routing (docs/privacy-and-tor.md) — OFF by default. `-PtorEngine`
+# enables it in the host dylib (`cargoBuildHost`) and the Android jniLibs
+# (`cargoNdkAndroid`, via build-android.sh's MYOTIS_TOR_ENGINE) so the desktop and
+# Android apps can offer the Settings toggle; iOS builds never do. The
+# `set_tor_enabled`/`tor_status`/`set_tor_storage_dirs` FFI functions exist either
+# way (they no-op / report "not compiled" / refuse without this feature).
 tor = ["myotis-net/tor"]
 
 [dependencies]

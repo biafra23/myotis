@@ -5,7 +5,7 @@
 > Lighthouse from banning the wallet as a peer that fails gossipsub negotiation
 > (the 12-hour ban behind #422, which stalled cold starts). Subscribing to the two
 > light-client topics as planned below — real-time finality/optimistic push in
-> place of the 12 s poll — is still not built, and the code sketch below predates
+> place of the once-per-slot poll — is still not built, and the code sketch below predates
 > the Rust engine (it targets the Java `BeaconP2PService` only).
 
 Goal: become a spec-compliant mesh peer on the two light-client gossipsub topics, so

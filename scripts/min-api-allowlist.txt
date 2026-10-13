@@ -15,6 +15,9 @@
 
 # desugar_jdk_libs' own j$ wrappers bridge to the platform Flow only on devices
 # that have it (API 30+) — self-guarded by construction. [guarded]
+# The RELEASE APK's scan reports these ten as stale: L8 shrinks the desugared
+# library to what the app uses in a release build, and nothing uses the Flow
+# wrappers. The DEBUG APK keeps the whole library and matches them — keep them.
 j$/ java/util/concurrent/Flow$Publisher#subscribe(Ljava/util/concurrent/Flow$Subscriber;)V
 j$/ java/util/concurrent/Flow$Subscriber#onComplete()V
 j$/ java/util/concurrent/Flow$Subscriber#onError(Ljava/lang/Throwable;)V

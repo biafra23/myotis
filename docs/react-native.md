@@ -11,8 +11,10 @@ now live in `:app-ios` (the `MyotisKit` Kotlin/Native framework), `ios-app/`
 13/14 quoted in the drift table — gate on the header's current
 `MYOTIS_ABI_VERSION`), and releases ship `MyotisEngine.xcframework` for
 Swift hosts. Read the "P0 — land `feat/ios-target`" items as done and the
-iOS effort estimates as reduced accordingly; the Android side of the plan is
-unchanged.
+iOS effort estimates as reduced accordingly — the matching *Gaps* rows too:
+the header carries `myotis_get_transaction_receipt_json`, and `capi.rs` has
+extern-"C" round-trip tests that `cargoTest` runs on Linux CI; the Android
+side of the plan is unchanged.
 
 ## Goal & constraints
 
@@ -48,7 +50,8 @@ The integration builds on three assets:
    `Rust*JsonTest` suite).
 
 2. **iOS: the seam exists on `feat/ios-target`.** That branch contains:
-   - `rust/myotis-engine/src/capi.rs` — a plain C ABI beside the JNI shim,
+   - `rust/myotis-engine/src/capi.rs` — a plain C ABI beside the JVM shim
+     (`ffi.rs`, UniFFI since the 2026-07 swap),
      1:1 over the same `host.rs`: JSON strings + scalars in/out, errors as
      sentinels (negative handle ids, `false`, `{"error":...}`), every
      returned `char*` released via `myotis_string_free`. **No callbacks** —
@@ -74,7 +77,8 @@ The known drift: the `feat/ios-target` C ABI was written against engine
 ABI **13**; `main` is at **14**. `capi.rs`/`myotis_engine.h` lack
 `myotis_get_transaction_receipt_json` and their handshake expectation needs
 the bump. Per the lockstep rule
-(docs/reimplementation/05-engine-api-bindings.md), every future ABI
+(the preamble of `rust/include/myotis_engine.h`; `capi.rs`'s
+`header_pins_the_current_abi_version` test pins the version), every future ABI
 bump must update **both shims and the C header together**.
 
 ## Decisions
@@ -241,13 +245,16 @@ examples/rn-demo/                 # bare RN app used as the validation harness
 - **iOS**: the podspec vendors a prebuilt `libmyotis_engine.a` per slice
   (device + simulator — an xcframework assembly step over the existing
   `cargoBuildIosDevice`/`cargoBuildIosSim` outputs) plus
-  `myotis_engine.h`. Mirror the jniLibs strategy: **commit the prebuilt
-  binaries** (or a checked-in zip + checksum) so non-Mac contributors and
+  `myotis_engine.h`. Mirror the jniLibs strategy of the time: **commit the
+  prebuilt binaries** (or a checked-in zip + checksum) so non-Mac contributors and
   CI build without Rust/Xcode; the `myotis_init` ABI handshake is the
   stale-binary guard, exactly like `RustEngineNative.EXPECTED_ABI_VERSION`.
   On repository size: committed binaries do grow history on every engine
-  update — this is the repo's deliberate, existing trade-off (the Android
-  `.so`s are committed today for the same no-toolchain reason), and RN
+  update — this was the repo's deliberate trade-off when written (the Android
+  `.so`s were then committed for the same no-toolchain reason; they no longer
+  are — see the note under *What already exists* — and releases now publish
+  `MyotisEngine.xcframework.zip` with its `.sha256`, `ios-xcframework.yml` —
+  the release assets the escalation path below would fetch), and RN
   *consumers* are unaffected either way, since the published npm tarball
   ships the binaries and never touches git history. If growth becomes a
   problem, the named escalation path is prebuilt archives on GitHub
@@ -262,7 +269,7 @@ examples/rn-demo/                 # bare RN app used as the validation harness
 | C ABI is at engine ABI 13, `main` at 14 | `feat/ios-target` | Rebase/merge onto `main`; add `myotis_get_transaction_receipt_json` to `capi.rs` + header; bump the handshake expectation. Land the branch — it is the foundation of everything iOS. |
 | CCIP-Read unsupported off-JVM | `IosNodeController.resolveEns` returns "doesn't support yet" for `status:"offchain"` | Port `CcipDriver.java` (round cap, `{sender}`/`{data}` URL templates, GET/POST, re-entry via `method:"ccipCallback"`) to the RN Swift layer using URLSession. `:app-ios` can adopt the same later (Ktor-Darwin is the Kotlin option per the CLAUDE.md HTTP policy). |
 | `getHeaders` / `getBlockVerified` / `dialPeer` throw | `RustChainHandle.java` | Parallel track in the Rust engine (ABI bump, both shims + C header in lockstep). TS API marks them experimental until landed. |
-| `eth_getLogs` / subscriptions | both engines | Out of scope for this roadmap; document in the RN README. |
+| `eth_getLogs` / subscriptions | both engines (since written, the Rust engine serves `eth_getLogs` from its opt-in log index — `VerifiedReads.getLogs`, `myotis_get_logs_json`; subscriptions remain absent in both) | Out of scope for this roadmap; document in the RN README. |
 | C ABI untested on Linux CI | `capi.rs` | Add extern-"C" round-trip `cargo test`s (callable on any host target) so the RN-critical seam is CI-covered without a Mac. |
 | Pause latency bound | engine | Timing assertion that `nativePause`/`myotis_pause` fits the iOS ~30 s background grace window. |
 | `NodeService` logic locked inside `android-app` | `NodeService.java` | Optional extraction of `:myotis-host-android` when P1 starts, so the service logic isn't copy-pasted. |
@@ -295,7 +302,8 @@ path is P0 → P2 → P3, with P1 parallel.
 
 ## Reference files
 
-- `rust/myotis-engine/src/lib.rs` (`ABI_VERSION`, `jni_shim`),
+- `rust/myotis-engine/src/lib.rs` (`ABI_VERSION`), `src/ffi.rs` (the UniFFI
+  JVM shim that replaced `jni_shim`),
   `src/host.rs` (the binding-neutral surface both shims share),
   `src/capi.rs` + `rust/include/myotis_engine.h` *(feat/ios-target)*
 - `myotis-engines/src/main/java/io/myotis/engines/` —
@@ -304,7 +312,8 @@ path is P0 → P2 → P3, with P1 parallel.
 - `app-ios/src/iosMain/kotlin/io/myotis/ios/RustEngine.kt`,
   `IosNodeController.kt` *(feat/ios-target)*
 - `android-app/src/main/java/com/jaeckel/ethp2p/android/NodeService.java`
-  (lifecycle playbook), `android-app/build.gradle.kts` (jniLibs fallback)
-- `docs/reimplementation/05-engine-api-bindings.md` (binding decisions,
-  lockstep rule), `docs/myotis-rust-engine-guidelines.md` (target matrix —
+  (lifecycle playbook), `android-app/build.gradle.kts` (builds the jniLibs
+  from source; `-PskipRustEngine` opts out — no committed fallback any more)
+- `docs/reimplementation/05-engine-api-bindings.md` (binding decisions; the
+  lockstep rule is in the C header's preamble), `docs/myotis-rust-engine-guidelines.md` (target matrix —
   explicitly lists a React Native app as an intended consumer)

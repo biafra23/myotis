@@ -217,6 +217,14 @@ public class BeaconLightClient implements AutoCloseable {
     }
     private final byte[] genesisValidatorsRoot; // 32-byte genesis validators root
     private final long clGenesisTime;         // beacon chain genesis time (seconds since epoch)
+    /** Whether the last {@link #pollFinalityUpdate} reached its finality fan-out (rather than
+     *  returning from bootstrap or committee catch-up) — the sync loop aligns the next poll to
+     *  the slot only then. Written and read on the sync-loop thread only. */
+    private boolean finalityPollRan;
+    /** When that finality fan-out started ({@link System#nanoTime}): the next poll keeps
+     *  Lighthouse's per-protocol quota from it ({@link BeaconChainSpec#millisUntilNextPoll}).
+     *  Sync-loop thread only. */
+    private long finalityPollStartNanos;
     private final java.util.function.Consumer<String> onPeerSuccess; // nullable; called with multiaddr on success
     private final java.util.function.Consumer<String> onPeerFailure; // nullable; called with multiaddr on failure
 
@@ -576,7 +584,7 @@ public class BeaconLightClient implements AutoCloseable {
     /** (newestSlot, count) of the last sidecar write, one immutable unit behind a
      *  single volatile so concurrent persist calls can't pair a new slot with an old
      *  count (torn read). Used to skip the flash write when the window hasn't
-     *  advanced — the 12s poll loop calls persistSnapshot every cycle. */
+     *  advanced — the once-per-slot poll loop calls persistSnapshot every cycle. */
     private record SidecarMark(long newestSlot, int count) {}
     private volatile SidecarMark rootsSidecarLastWritten;
 
@@ -1016,7 +1024,8 @@ public class BeaconLightClient implements AutoCloseable {
             }
         }
 
-        // Phase 2: steady-state poll loop — one slot (mainnet 12s, Gnosis 5s).
+        // Phase 2: steady-state poll loop — once per slot (mainnet 12s, Gnosis 5s), a
+        // third of the way into it (BeaconChainSpec.millisUntilNextPoll).
         // If not yet synced, each cycle disconnects stale connections and retries.
         // Using the network slot time matters on Gnosis: a hardcoded 12s polled
         // finality 2.4x too slowly there, prolonging CATCHING_UP and staling the head.
@@ -1025,6 +1034,13 @@ public class BeaconLightClient implements AutoCloseable {
         // back to the mainnet default rather than crash or spin.
         int slotSeconds = secondsPerSlot > 0 ? secondsPerSlot : BeaconChainSpec.SECONDS_PER_SLOT;
         long pollIntervalMs = slotSeconds * 1000L;
+        // Finality polls fire at this process's point in each slot — just past a third
+        // of the way in, drawn once from a quarter-slot window so a fleet of wallets is
+        // spread out — not a fixed slot after each round: a server's latest update
+        // refreshes when a block lands, so a drifting poll answers up to a slot staler
+        // than needed.
+        long pollOffsetMs = BeaconChainSpec.finalityPollOffsetMillis(
+                slotSeconds, java.util.concurrent.ThreadLocalRandom.current().nextLong());
         int cycleCount = 0;
         long syncStartNanos = System.nanoTime();
         // Reset the hunt on every (re)entry: resume() rebuilds this loop AND
@@ -1056,7 +1072,14 @@ public class BeaconLightClient implements AutoCloseable {
                 // Background classification of untried pool peers (fire-and-forget;
                 // never blocks the cycle) — drains the cache's untried bucket.
                 classifyUntriedPeers();
-                Thread.sleep(pollIntervalMs);
+                // Aligned only after a finality poll ran: bootstrap and committee
+                // catch-up rounds (which return before it) keep the fixed slot pacing,
+                // like the Rust twin's catch-up sleep. pollFinalityUpdate says which.
+                Thread.sleep(finalityPollRan
+                        ? BeaconChainSpec.millisUntilNextPoll(System.currentTimeMillis(),
+                                (System.nanoTime() - finalityPollStartNanos) / 1_000_000L,
+                                clGenesisTime, slotSeconds, pollOffsetMs)
+                        : pollIntervalMs);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
@@ -2355,6 +2378,7 @@ public class BeaconLightClient implements AutoCloseable {
      * successfully applied update. Logs debug-level failures for individual peers.
      */
     private void pollFinalityUpdate() {
+        finalityPollRan = false;
         if (!store.isInitialized()) {
             // Not bootstrapped yet — try bootstrap, then fall back to seeding.
             // We used to disconnect all peers here to force fresh connections,
@@ -2420,6 +2444,8 @@ public class BeaconLightClient implements AutoCloseable {
         // into untried peers (copyPeers puts proven first; the tail is where a
         // new server can only be found).
         final int POLL_FINALITY_FANOUT = hunting ? HUNT_POLL_FANOUT : 16;
+        finalityPollRan = true; // the round below is a finality poll: the loop aligns the next
+        finalityPollStartNanos = System.nanoTime();
         // Heal a late winner from a PREVIOUS round: if its BLS verify outlasted
         // that round's 12s deadline, the store advanced but the poll thread had
         // moved on, skipping updateSyncState/persistSnapshot — and re-polling the
@@ -2569,8 +2595,8 @@ public class BeaconLightClient implements AutoCloseable {
 
         FinalityPollWin win;
         try {
-            // 10s per-request timeout + decode/apply slack; the 12s sync cycle
-            // re-fires either way.
+            // 10s per-request timeout + decode/apply slack — sized to the request
+            // timeout, not the slot; the next aligned poll re-fires either way.
             win = winner.get(12, TimeUnit.SECONDS);
         } catch (Exception e) {
             // Future.get can surface InterruptedException: restore the flag so

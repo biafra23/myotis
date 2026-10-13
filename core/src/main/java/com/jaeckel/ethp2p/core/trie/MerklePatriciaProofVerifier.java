@@ -4,6 +4,7 @@ import org.apache.tuweni.bytes.Bytes;
 import org.apache.tuweni.bytes.Bytes32;
 import org.apache.tuweni.crypto.Hash;
 
+import java.math.BigInteger;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -57,6 +58,45 @@ public final class MerklePatriciaProofVerifier {
     }
 
     private MerklePatriciaProofVerifier() {}
+
+    /**
+     * The integer a storage-trie leaf holds. Storage leaves store {@code rlp(trimmed uint256)},
+     * so the value of a {@link Result.Found} from a storage proof is one canonical RLP string
+     * whose payload is the minimal big-endian integer ({@code 0x80}, the empty string, is
+     * zero). One decoder for every reader of storage proofs, so they cannot disagree on what
+     * a leaf says; as strict as the Rust twin {@code myotis_core::trie::decode_storage_leaf}.
+     *
+     * @throws IllegalArgumentException unless {@code leafValue} is exactly one canonical RLP
+     *                                  string of at most 32 bytes with no leading zero byte
+     */
+    public static BigInteger storageInteger(Bytes leafValue) {
+        if (leafValue.isEmpty()) throw new IllegalArgumentException("empty storage value");
+        int first = leafValue.get(0) & 0xff;
+        Bytes payload;
+        if (first < 0x80) {
+            // A single byte below 0x80 is its own encoding — and must be the whole value.
+            if (leafValue.size() != 1) {
+                throw new IllegalArgumentException("trailing bytes after storage value");
+            }
+            payload = leafValue;
+        } else if (first <= 0xb7) {
+            int len = first - 0x80;
+            if (1 + len != leafValue.size()) {
+                throw new IllegalArgumentException("storage value length does not match its header");
+            }
+            payload = leafValue.slice(1, len);
+            if (len == 1 && (payload.get(0) & 0xff) < 0x80) {
+                throw new IllegalArgumentException("non-canonical single-byte storage value");
+            }
+        } else {
+            // A long string (> 55 bytes) or a list: never a uint256.
+            throw new IllegalArgumentException("storage value is not a short RLP string");
+        }
+        if (payload.size() > 32 || (!payload.isEmpty() && payload.get(0) == 0)) {
+            throw new IllegalArgumentException("storage value is not a canonical uint256");
+        }
+        return payload.isEmpty() ? BigInteger.ZERO : new BigInteger(1, payload.toArrayUnsafe());
+    }
 
     /**
      * Verify a proof. {@code key} is the un-hashed key — the Ethereum state

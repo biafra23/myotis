@@ -1314,13 +1314,13 @@ public final class EthHandler extends ChannelInboundHandlerAdapter {
      * actually serves: its live head as of now.
      *
      * <p>Pass {@code fromNumber} = the beacon-finalized block number (a block every
-     * fresh-enough peer is guaranteed to have) and {@code window} sized to span
-     * finalized→head, so the result lands at (or just above) the beacon-verified head.
+     * fresh-enough peer is guaranteed to have) and {@code window} sized to end at the
+     * beacon-attested head, so the result lands at (or just below) it.
      * An empty response means the peer does not even hold the finalized block — i.e. it
      * is behind the finality floor — and is surfaced as a failure so the caller skips it.
      *
-     * <p>The returned header is NOT trusted here; the caller verifies it against the
-     * beacon anchor (finalized→head) before pinning it.
+     * <p>The returned header is NOT trusted here; the caller proves it by the header walk
+     * up to the beacon-attested head before pinning it.
      */
     public CompletableFuture<com.jaeckel.ethp2p.core.types.BlockHeader> requestFreshHeadHeaderAsync(
             long fromNumber, int window) {

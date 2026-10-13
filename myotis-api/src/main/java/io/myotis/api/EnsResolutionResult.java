@@ -12,11 +12,21 @@ package io.myotis.api;
  * @param blockNumber block the resolution state anchors to; -1 when none
  * @param verified    true iff resolved against beacon-finalized state
  * @param error       null on success or no-record; otherwise why resolution failed
+ * @param blockTimestamp the timestamp (unix seconds) of block {@code blockNumber}, from
+ *                    the verified header the resolution ran against; -1 when none
+ *                    (a failed resolution, or an engine that does not report it)
  */
 public record EnsResolutionResult(
         String name,
         String addressHex,
         long blockNumber,
         boolean verified,
-        String error) {
+        String error,
+        long blockTimestamp) {
+
+    /** A result without a block timestamp ({@code blockTimestamp} -1). */
+    public EnsResolutionResult(String name, String addressHex, long blockNumber,
+                               boolean verified, String error) {
+        this(name, addressHex, blockNumber, verified, error, -1L);
+    }
 }

@@ -3,6 +3,8 @@ package io.myotis.node;
 import com.jaeckel.ethp2p.consensus.BeaconSyncState;
 import com.jaeckel.ethp2p.core.concurrent.Futures;
 import com.jaeckel.ethp2p.consensus.proof.MerklePatriciaVerifier;
+import com.jaeckel.ethp2p.core.trie.MerklePatriciaProofVerifier;
+import com.jaeckel.ethp2p.networking.eth.HeaderChains;
 import com.jaeckel.ethp2p.networking.eth.messages.BlockHeadersMessage;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
 import com.jaeckel.ethp2p.networking.snap.messages.AccountRangeMessage;
@@ -28,10 +30,12 @@ import java.util.concurrent.TimeUnit;
  *   <li><b>stateRootMatch</b> (fast-path) — if the peer's reported stateRoot is one the beacon
  *       light client has already attested ({@link BeaconSyncState#findStateRoot}), we're done.
  *       Rare: only fires when the peer's head briefly aligns with an attested slot.</li>
- *   <li><b>headerChain</b> (load-bearing) — fetch the contiguous header range
- *       {@code [finalizedBlock .. peerBlock]} from the same peer, verify the parent-hash chain,
- *       and require the first header's stateRoot to equal the beacon-finalized execution
- *       stateRoot and the last header's stateRoot to equal the peer-reported stateRoot.</li>
+ *   <li><b>headerChain</b> (load-bearing) — for a peer block above finality and at or below
+ *       the light client's optimistic head, fetch the contiguous header range
+ *       {@code [peerBlock .. optimisticHead]}, verify the parent-hash chain, and require the
+ *       last header to hash to the optimistic head's attested block hash and the first
+ *       header's stateRoot to equal the peer-reported stateRoot ({@link #verifyHeaderChain}:
+ *       trust flows only DOWN from an attested hash).</li>
  * </ul>
  * Verification <em>failures</em> are reported via {@link Result#failReason()} — the returned
  * future only completes exceptionally for bad arguments or a not-running node.
@@ -107,14 +111,17 @@ public final class VerifiedAccountQuery {
      * nonce/balance honest) and are null when the leaf proof didn't verify; callers needing the
      * peer-claimed slim values must fall back explicitly.
      *
-     * @param peerProofValid        proof verifies against the peer's own stateRoot (necessary,
-     *                              not sufficient for trust)
+     * @param peerProofValid        proof verifies against the peer's own stateRoot and agrees
+     *                              with the slim entry — or, without an entry, proves the
+     *                              address absent (necessary, not sufficient for trust)
      * @param verifiedStorageRootHex storage root from the proof-verified leaf, or null
      * @param verifiedCodeHashHex   code hash from the proof-verified leaf, or null
      * @param beaconChainVerified   the peer's stateRoot ties to a beacon-attested root
      * @param blsVerified           the beacon match was BLS-signed
      * @param matchedSlot           slot of the matching attestation; -1 when none
-     * @param verifyMethod          "stateRootMatch" / "headerChain" / null
+     * @param verifyMethod          "stateRootMatch" / "headerChain" / null; set only when
+     *                              {@code peerProofValid} (an attested root vouches for what a
+     *                              proof proves, not for an unproven slim body)
      * @param failReason            null when verified
      */
     public record Verification(
@@ -226,9 +233,10 @@ public final class VerifiedAccountQuery {
             final AccountRangeMessage.AccountData foundFinal = found;
             return verify(result, address, foundFinal, bssFinal, conn).thenApply(v -> {
                 // Shadow-cache bookkeeping for the VERIFIED answer only: the leaf
-                // proof must have verified (verifyMethod alone is not enough — the
-                // stateRootMatch fast path does not consult peerProofValid, and
-                // the hex fields below then fall back to the peer's slim body).
+                // proof verified (or proved the address absent) and the root is
+                // anchored. verifyMethod implies peerProofValid (the fast path's
+                // stateRootMatch gate and the ladder both require it); both are
+                // checked so neither alone has to carry that invariant.
                 if (readStats != null && v.peerProofValid() && v.verifyMethod() != null
                         && result.stateRoot() != null) {
                     var fact = foundFinal == null
@@ -276,7 +284,11 @@ public final class VerifiedAccountQuery {
                         finalizedPeriod,
                         wallClockPeriod,
                         finalizedBlockNumber,
-                        optimisticBlockNumber);
+                        optimisticBlockNumber,
+                        // No block timestamp on this engine yet: one is reported only
+                        // from the light client's attested execution header, which this
+                        // read path does not consult (AccountProofResult.blockTimestamp).
+                        -1L);
             });
         });
     }
@@ -322,7 +334,15 @@ public final class VerifiedAccountQuery {
         String balance = found != null ? found.balance().toString() : null;
 
         Scratch v = new Scratch();
-        if (result.stateRoot() != null && !result.proof().isEmpty()) {
+        if (result.stateRoot() != null && found == null) {
+            // No slim entry for the address. verifyAndExtractAccount only compares nonce/balance
+            // against an entry, so here it would accept ANY leaf — an account the peer withheld
+            // while its proof shows it exists, reported as absent. Without an entry the only
+            // valid answer is a proven absence (an exclusion proof).
+            v.peerProofValid = MerklePatriciaProofVerifier.verify(
+                    result.stateRoot(), Hash.keccak256(address).toArrayUnsafe(), result.proof())
+                    instanceof MerklePatriciaProofVerifier.Result.Absent;
+        } else if (result.stateRoot() != null && !result.proof().isEmpty()) {
             List<byte[]> proofBytes = new ArrayList<>(result.proof().size());
             for (Bytes b : result.proof()) proofBytes.add(b.toArrayUnsafe());
             // verifyAndExtractAccount returns the storageRoot/codeHash from the proof-verified
@@ -336,10 +356,10 @@ public final class VerifiedAccountQuery {
         }
 
         // Fast-path shortcut: if the BLC has already attested the peer's exact stateRoot, we're
-        // done — no header fetch needed. Rare, but free to check.
+        // done — no header fetch needed. Only for a proof that verified: see stateRootMatch.
         if (bss != null && result.stateRoot() != null) {
             BeaconSyncState.SlottedStateRoot match =
-                    bss.findStateRoot(result.stateRoot().toArrayUnsafe());
+                    stateRootMatch(bss, result.stateRoot(), v.peerProofValid);
             if (match != null) {
                 v.beaconChainVerified = true;
                 v.matchedSlot = match.slot();
@@ -359,40 +379,39 @@ public final class VerifiedAccountQuery {
             v.failReason = "beaconNotSynced";
         } else {
             long peerBlockNumber = result.blockNumber();
-            // Read block number + state root from one atomic snapshot — reading them via two
-            // separate getters can pair a block number with a state root from a different
+            // Read block number + block hash from one atomic snapshot — reading them via two
+            // separate getters can pair a block number with a hash from a different
             // finalized payload if an update lands between the calls.
             BeaconSyncState.FinalizedExecution fin = bss.getFinalizedExecution();
             long finalizedBlock = fin.blockNumber();
-            // Anchor the header chain on the beacon-finalized BLOCK HASH (pins
-            // the whole first header), NOT its state root (forgeable — see
-            // verifyHeaderChain's javadoc).
-            byte[] beaconBlockHash = fin.blockHash();
+            WalkAnchor anchor = walkAnchor(peerBlockNumber, bss.getOptimisticExecution());
 
             if (peerBlockNumber <= 0) {
                 v.failReason = "noPeerBlockNumber";
-            } else if (finalizedBlock <= 0 || beaconBlockHash == null) {
+            } else if (finalizedBlock <= 0 || fin.blockHash() == null) {
                 v.failReason = "beaconBlockUnavailable";
             } else if (peerBlockNumber <= finalizedBlock) {
+                // The freshness floor: state at or below finality is too old to answer with.
                 v.failReason = "peerBlockBehindFinalized";
-            } else if (peerBlockNumber - finalizedBlock > MAX_HEADER_CHAIN_GAP) {
+            } else if (anchor == null) {
+                v.failReason = "peerBlockAheadOfAnchor";
+            } else if (anchor.blockNumber() - peerBlockNumber >= MAX_HEADER_CHAIN_GAP) {
                 v.failReason = "headerChainGapTooLarge";
             } else {
-                // headerChain: fetch [finalized .. peerBlock] inclusive from a single peer and
-                // verify the chain end-to-end.
-                final long finalizedSlot = bss.getFinalizedSlot();
-                log.info("[verify] headerChain: peerBlock={}, finalizedBlock={}, gap={}",
-                        peerBlockNumber, finalizedBlock, peerBlockNumber - finalizedBlock);
+                // headerChain: fetch [peerBlock .. anchor] inclusive from a single peer and
+                // verify the chain end-to-end, down from the attested anchor.
+                log.info("[verify] headerChain: peerBlock={}, anchorBlock={}, gap={}",
+                        peerBlockNumber, anchor.blockNumber(), anchor.blockNumber() - peerBlockNumber);
                 return verifyHeaderChainBatched(
-                                connector, finalizedBlock, peerBlockNumber,
-                                beaconBlockHash, result.stateRoot().toArrayUnsafe())
+                                connector, peerBlockNumber, anchor.blockNumber(),
+                                anchor.blockHash(), result.stateRoot().toArrayUnsafe())
                         .handle((chainValid, ex) -> {
                             if (ex != null) {
                                 log.info("[verify] headerChain error: {}", ex.getMessage());
                                 v.failReason = "headerChainError";
                             } else if (Boolean.TRUE.equals(chainValid)) {
                                 v.beaconChainVerified = true;
-                                v.matchedSlot = finalizedSlot;
+                                v.matchedSlot = anchor.slot();
                                 v.blsVerified = true;
                                 v.verifyMethod = "headerChain";
                                 v.failReason = null;
@@ -415,10 +434,10 @@ public final class VerifiedAccountQuery {
         String balance = found != null ? found.balance().toString() : null;
         // storageRoot/codeHash come from the proof-verified leaf when we have it, so they're
         // cryptographically anchored rather than peer-claimed. Fall back to the slim (peer-claimed)
-        // body only when the leaf proof didn't verify (verifiedStorageRootHex == null). Note this
-        // is gated on peerProofValid, NOT beaconChainVerified: the beacon stateRootMatch fast-path
-        // can set beaconChainVerified=true even when the leaf proof didn't verify, so it is not a
-        // proxy for "we have a proof-verified leaf".
+        // body only when the leaf proof didn't verify (verifiedStorageRootHex == null) — such a
+        // result never carries a verifyMethod: both the stateRootMatch fast path and the
+        // headerChain ladder require peerProofValid. A proven-absent address has no leaf (and
+        // no slim entry), so both fields are null for it.
         String storageRootHex = v.verifiedStorageRootHex() != null
                 ? v.verifiedStorageRootHex()
                 : (found != null ? found.storageRoot().toHexString() : null);
@@ -443,27 +462,59 @@ public final class VerifiedAccountQuery {
     }
 
     /**
-     * Fetch headers in a single batch and verify the chain end-to-end. Completes with
-     * {@code true} iff the first header's stateRoot equals the beacon-finalized root, the last
-     * header's stateRoot equals the peer's reported root, and every header's hash equals the
-     * next header's parentHash.
+     * The beacon match that lets a verified read skip the header-chain walk, or null. A read
+     * takes it only when its proof verified against {@code stateRoot}: an attested root vouches
+     * for what a proof proves under it, never for a value no proof proved — so a matching root
+     * with a bad or missing proof falls through to {@code peerProofInvalid}. Shared with
+     * {@link VerifiedStorageQuery}; twin of the Rust {@code el::verify::ladder_precheck} fast
+     * path.
+     */
+    static BeaconSyncState.SlottedStateRoot stateRootMatch(
+            BeaconSyncState bss, Bytes32 stateRoot, boolean proofValid) {
+        if (!proofValid || bss == null || stateRoot == null) return null;
+        return bss.findStateRoot(stateRoot.toArrayUnsafe());
+    }
+
+    /** The attested block a header-chain walk ends at, and the beacon slot that attested it. */
+    record WalkAnchor(long blockNumber, byte[] blockHash, long slot) {}
+
+    /**
+     * The attested block a header-chain walk for {@code peerBlock} ends at — the optimistic
+     * head, when the peer's block is at or below it — or null when nothing attested lies at or
+     * above the peer's block yet ({@code peerBlockAheadOfAnchor}). The anchor must be at or
+     * ABOVE the peer's block; see {@link #verifyHeaderChain} for why. Twin of the anchor choice
+     * in the Rust {@code el::verify::ladder_precheck}. Package-private:
+     * {@link VerifiedStorageQuery} runs the same ladder.
+     */
+    static WalkAnchor walkAnchor(long peerBlock, BeaconSyncState.OptimisticExecution opt) {
+        if (opt != null && opt.blockHash() != null && opt.blockNumber() > 0
+                && peerBlock <= opt.blockNumber()) {
+            return new WalkAnchor(opt.blockNumber(), opt.blockHash(), opt.slot());
+        }
+        return null;
+    }
+
+    /**
+     * Fetch headers {@code [peerBlock .. anchorBlock]} in a single batch and verify the chain
+     * end-to-end ({@link #verifyHeaderChain}): the last header hashes to the attested
+     * {@code anchorHash}, the first carries the peer's state root, every link holds.
      */
     /** Package-private: {@link VerifiedStorageQuery} anchors its account root with the
      *  same walk, so the headerChain fetch+verify lives once. */
     static CompletableFuture<Boolean> verifyHeaderChainBatched(
-            RLPxConnector connector, long finalizedBlock, long peerBlock,
-            byte[] beaconBlockHash, byte[] peerStateRoot) {
-        long totalLong = peerBlock - finalizedBlock + 1;
-        if (totalLong < 2 || totalLong > MAX_HEADER_CHAIN_GAP) {
-            log.info("[verify] headerChain gap {} out of range [2, {}]", totalLong, MAX_HEADER_CHAIN_GAP);
+            RLPxConnector connector, long peerBlock, long anchorBlock,
+            byte[] anchorHash, byte[] peerStateRoot) {
+        long totalLong = anchorBlock - peerBlock + 1;
+        if (totalLong < 1 || totalLong > MAX_HEADER_CHAIN_GAP) {
+            log.info("[verify] headerChain length {} out of range [1, {}]", totalLong, MAX_HEADER_CHAIN_GAP);
             return CompletableFuture.completedFuture(false);
         }
         int total = (int) totalLong;
-        log.info("[verify] Fetching {} headers from #{} to #{}", total, finalizedBlock, peerBlock);
-        return Futures.orTimeout(connector.requestBlockHeadersBatched(finalizedBlock, total),
+        log.info("[verify] Fetching {} headers from #{} to #{}", total, peerBlock, anchorBlock);
+        return Futures.orTimeout(connector.requestBlockHeadersBatched(peerBlock, total),
                         HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS)
                 .thenApply(headers -> {
-                    boolean valid = verifyHeaderChain(headers, beaconBlockHash, peerStateRoot);
+                    boolean valid = verifyHeaderChain(headers, anchorHash, peerStateRoot);
                     log.info("[verify] Full header chain ({} blocks) valid: {}", headers.size(), valid);
                     return valid;
                 });
@@ -473,35 +524,23 @@ public final class VerifiedAccountQuery {
      *  cross-language conformance test (ElVerifyVectorConformanceTest) can pin
      *  it against the Rust twin (myotis-net el::verify::verify_header_chain).
      *
-     *  <p>The first header is anchored by its BLOCK HASH, not its state root:
-     *  the block hash is keccak256 of the whole header, so it pins that header
-     *  completely. A state-root-only anchor was exploitable — the finalized
-     *  state root is public, so a peer could copy it into the stateRoot field
-     *  of a fabricated {@code H_0'} (fake everything else), parent-hash-link a
-     *  forged chain to a fake final state root, and have a fake account proof
-     *  verify against it. Anchoring on the beacon-attested block hash defeats
-     *  that (forging a header with a chosen keccak needs a preimage). */
+     *  <p>The LAST header is the trust anchor, matched by its BLOCK HASH: the
+     *  keccak256 of the whole header, so it pins that header completely (a
+     *  state-root-only match would let a peer copy an attested state root into
+     *  a fabricated header). The FIRST header carries the peer's state root.
+     *
+     *  <p>The anchor must be the NEWEST header. A parent hash commits a header
+     *  to its parent, never to its children, so trust flows only DOWN from the
+     *  anchor: it pins its parent, which pins its own, and so on to the first
+     *  header. This walk was once anchored at the OLDEST header (the finalized
+     *  block) instead, which pinned nothing above it — a peer could name the
+     *  real finalized block as the parent of a header it made up, with any
+     *  state root, and pass. */
     static boolean verifyHeaderChain(List<BlockHeadersMessage.VerifiedHeader> headers,
-                                             byte[] expectedFirstBlockHash,
-                                             byte[] expectedLastStateRoot) {
-        if (headers.isEmpty()) return false;
-
-        byte[] firstBlockHash = headers.get(0).hash().toArrayUnsafe();
-        if (!java.util.Arrays.equals(firstBlockHash, expectedFirstBlockHash)) return false;
-
-        byte[] lastStateRoot = headers.get(headers.size() - 1).header().stateRoot.toArrayUnsafe();
-        if (!java.util.Arrays.equals(lastStateRoot, expectedLastStateRoot)) return false;
-
-        for (int i = 0; i < headers.size() - 1; i++) {
-            Bytes32 currentHash = headers.get(i).hash();
-            Bytes32 nextParent = headers.get(i + 1).header().parentHash;
-            if (!currentHash.equals(nextParent)) {
-                log.info("[verify] hash chain break at index {}: block #{} hash={} != block #{} parentHash={}",
-                        i, headers.get(i).header().number, currentHash.toShortHexString(),
-                        headers.get(i + 1).header().number, nextParent.toShortHexString());
-                return false;
-            }
-        }
-        return true;
+                                             byte[] expectedLastBlockHash,
+                                             byte[] expectedFirstStateRoot) {
+        if (!HeaderChains.anchoredAtTop(headers, expectedLastBlockHash)) return false;
+        byte[] firstStateRoot = headers.get(0).header().stateRoot.toArrayUnsafe();
+        return java.util.Arrays.equals(firstStateRoot, expectedFirstStateRoot);
     }
 }

@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 39
+#define MYOTIS_ABI_VERSION 45
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -89,6 +89,14 @@ bool myotis_set_tor_enabled(bool on);
  * 0 = this build has no Tor support. */
 int32_t myotis_tor_status(void);
 
+/* Name the absolute directories the embedded Tor client keeps its state and
+ * its directory cache in, before the first Tor read (required on Android;
+ * elsewhere unset means Arti's platform defaults). Returns true iff the client
+ * will use exactly these: false for a NULL, non-UTF-8 or relative path, a
+ * different pair once a bootstrap holds its directories, or a Tor-less build.
+ * Process-global, not per-handle. */
+bool myotis_set_tor_storage_dirs(const char *state_dir, const char *cache_dir);
+
 /* Allow or forbid EIP-1459 DNS discovery — the EL node lists, walked over the
  * system resolver — for every network this process runs. Off by default: a
  * host that resolves through the system resolver (desktop, daemon) switches it
@@ -138,7 +146,10 @@ bool myotis_accept_stale_anchor(int64_t handle);
  * refused, retryably, while no finalized block has landed or no peer still
  * serves that state), a number only inside [head-64, head+16] (head state),
  * anything else {"error","code":-32602}. Every result names the block it
- * proved at: "anchor": "head" | "finalized". */
+ * proved at: "anchor": "head" | "finalized".
+ * v41: the account read carries "blockTimestamp" (unix seconds) when that
+ * block's timestamp is PROVEN — the read ran against the beacon-attested
+ * block and its verdict holds — else null. */
 char *myotis_request_account_json(int64_t handle, const char *address,
                                   const char *block);
 char *myotis_get_storage_proof_json(int64_t handle, const char *address,
@@ -221,10 +232,38 @@ char *myotis_estimate_gas_tx_json(int64_t handle, const char *tx,
  * (PERMANENT, do not retry). */
 char *myotis_eth_call_tx_json(int64_t handle, const char *tx,
                               const char *block, const char *state_overrides);
-/* {"status":"ok","addressHex","blockNumber"} | {"status":"noRecord",...} |
- * {"status":"offchain",...} | {"error"}. */
+/* eth_createAccessList for the FULL JSON-RPC transaction object (ABI >= 40):
+ * the arguments of myotis_estimate_gas_tx_json, the request checked as
+ * myotis_eth_call_tx_json checks it. Returns {"status":"ok","accessList":
+ * [{"address","storageKeys":[...]}],"gasUsed":N} — the EIP-2930 list the
+ * transaction touches, built as geth builds it (sorted by address and key),
+ * and the gas the run made with it used — plus "vmError" when that run
+ * itself failed ("execution reverted", with "revertDataHex" = the raw
+ * payload, or the halt, e.g. "out of gas"): geth's `error` field, which it
+ * reports NEXT TO the list, so serve the list and the error together, never
+ * a code-3 error (named vmError here because a top-level "error" is this
+ * engine's failure envelope) | {"status":
+ * "unavailable","reason"} (retryable) | {"status":"infeasible","reason"} (the
+ * request cannot run within the caller's gas, fee cap or funds; serve
+ * JSON-RPC -32000 with `reason` verbatim, as geth does) | {"error"}
+ * (retryable) | {"error","code":-32602} for a malformed or contradictory
+ * object (PERMANENT, do not retry). Every served status also carries
+ * blockNumber and verified, as myotis_eth_call_json's shapes do. */
+char *myotis_create_access_list_json(int64_t handle, const char *tx,
+                                     const char *block,
+                                     const char *state_overrides);
+/* {"status":"ok","addressHex","blockNumber","blockTimestamp"} |
+ * {"status":"noRecord",...} | {"status":"offchain",...} | {"error"}.
+ * v41: "blockTimestamp" (unix seconds) on every status, from the verified
+ * header the resolution ran against; the record shapes below carry it too. */
 char *myotis_resolve_ens_json(int64_t handle, const char *name);
-/* Generic ENS record dispatch; method + args travel in params_json. */
+/* Generic ENS record dispatch; method + args travel in params_json.
+ * v42: method "ownership" — {"status":"ok","blockNumber","blockTimestamp",
+ * "verified","wrapped", and when present "registrantHex","managerHex",
+ * "resolverHex","expiresAt","gracePeriodSeconds"}: the registry's owner and
+ * resolver and, for a .eth second-level name, the registrar's registrant,
+ * expiry and grace period, seen through the NameWrapper; an absent part is
+ * left out. An older engine answers "unknown ens method". */
 char *myotis_ens_record_json(int64_t handle, const char *params_json);
 /* Block JSON, the literal "null", or {"error"}. full_transactions selects
  * decoded tx objects over hashes. */
@@ -258,9 +297,15 @@ char *myotis_fee_history_json(int64_t handle, int64_t block_count,
                               const char *newest_block_tag,
                               const char *percentiles_json);
 /* {"txHash":"0x..."}, {"status":"rejected","reason"} (ABI >= 36: never
- * broadcast; reason = geth's txpool verdict, served under -32000), or
- * {"error"}. */
+ * broadcast; reason = geth's txpool verdict, served under -32000),
+ * {"error","code":-32602} (ABI >= 44: bytes that are no transaction this node
+ * relays, never broadcast — a permanent refusal), or {"error"}. */
 char *myotis_send_raw_transaction_json(int64_t handle, const char *raw_tx_hex);
+/* ABI >= 45: the eth_sendRawTransaction gate on the bytes alone, no handle:
+ * {"ok":true}, the permanent {"error","code":-32602} refusal, or {"error"} for
+ * bad hex. Call it before any readiness hold, so a starting or paused node
+ * answers bytes that are no transaction with the permanent refusal. */
+char *myotis_check_raw_transaction_json(const char *raw_tx_hex);
 
 /* Release any char* returned by the functions above. NULL is a no-op. */
 void myotis_string_free(char *s);

@@ -171,6 +171,14 @@ if (beePoc && railgunPoc) {
     throw GradleException("-PbeePoc and -PrailgunPoc are mutually exclusive — build one flavour at a time")
 }
 
+// The app's name: the bundle's (packageName below) and the macOS menu bar's in a dev run
+// (apple.awt.application.name, on the run task below).
+val appName: String = when {
+    beePoc -> "Myotis Bee PoC"
+    railgunPoc -> "Myotis RAILGUN PoC"
+    else -> "Myotis"
+}
+
 /** The active flavour's staging root name and the seed files only it may ship. */
 val pocFlavourName: String? = when {
     beePoc -> "beePoc"
@@ -254,7 +262,7 @@ val prepareJnaBootLib = tasks.register("prepareJnaBootLib") {
     val (entry, stagedName) = when (osPart) {
         "macos" -> (if (daemonArm) "com/sun/jna/darwin-aarch64/libjnidispatch.jnilib" else "com/sun/jna/darwin-x86-64/libjnidispatch.jnilib") to "libjnidispatch.dylib"
         "linux" -> (if (daemonArm) "com/sun/jna/linux-aarch64/libjnidispatch.so" else "com/sun/jna/linux-x86-64/libjnidispatch.so") to "libjnidispatch.so"
-        "windows" -> "com/sun/jna/win32-x86-64/jnidispatch.dll" to "jnidispatch.dll"
+        "windows" -> (if (daemonArm) "com/sun/jna/win32-aarch64/jnidispatch.dll" else "com/sun/jna/win32-x86-64/jnidispatch.dll") to "jnidispatch.dll"
         else -> error("no JNA native stub mapping for $composeOsArchDir")
     }
     val staged = destDir.map { it.file(stagedName) }
@@ -303,9 +311,10 @@ val prepareJnaBootLib = tasks.register("prepareJnaBootLib") {
 // at build time from the committed data set by scripts/synth_logindex.py and
 // staged into appResources/common/ (Compose flattens common/ next to the
 // os-arch dir) beside a manifest — coverage, expiry, sha256 — that the app
-// checks before installing it. DEBUG/DEMO artefact: RPC-sourced data,
-// unverified until the walker re-fetches it, expiring ~500,000 Gnosis blocks
-// (~29 days) after its fetch. Only runs for -PbeePoc; the flavour-specific
+// checks before installing it. DEBUG/DEMO artefact: RPC-sourced data, served
+// unverified — only the backfill walk (shipped paused) would re-check it, and
+// even that never removes a log the seed added — expiring ~500,000 Gnosis
+// blocks (~29 days) after its fetch. Only runs for -PbeePoc; the flavour-specific
 // resources root above keeps a regular build from ever shipping the seed.
 // ---------------------------------------------------------------------------
 // Compose flattens appResources/common/ next to the os-arch dir; both
@@ -384,7 +393,7 @@ val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
 // this app instead of a public RPC provider (RailgunPoc.kt; docs/railgun-poc.md).
 //
 // The seed data is NOT committed, unlike the Bee flavour's. The Bee set is a
-// 58 MB gzip of ~39k logs; RAILGUN's mainnet one is ~438k logs over 11.4M blocks
+// 3.2 MB gzip (24 MB raw) of ~39k logs; RAILGUN's mainnet one is ~438k logs over 11.4M blocks
 // — 589 MB raw, and a git object nobody wants in a clone. So this task reads each
 // network's fetch from a directory given by a property — -PrailgunSeedDir for
 // mainnet (default ~/myotis-node/railgun), -PrailgunSepoliaSeedDir for Sepolia
@@ -552,6 +561,38 @@ val prepareRailgunPocSeed = tasks.register("prepareRailgunPocSeed") {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The macOS app icon: the ANDROID launcher icon, rendered onto Apple's icon grid.
+// scripts/gen_mac_icon.java reads the Android launcher icon's committed resources
+// (the bat foreground vector and its background colour, both generated from
+// assets/myotis_logo.svg by scripts/gen_android_icons.py) and writes an .icns, so
+// the dmg and the APK carry the same icon by construction and nothing binary is
+// committed. Plain JDK in single-file source mode on the JDK 21 toolchain, headless
+// so the render never touches the window server. Without it jpackage ships its
+// default Java icon. The deb keeps jpackage's default: only macOS is wired.
+// ---------------------------------------------------------------------------
+val macIcon = layout.buildDirectory.file("generated/mac-icon/Myotis.icns")
+val generateMacIcon = tasks.register<Exec>("generateMacIcon") {
+    group = "build"
+    description = "Render the macOS app icon (.icns) from the Android launcher icon resources"
+    val script = rootProject.file("scripts/gen_mac_icon.java")
+    val res = rootProject.file("android-app/src/main/res")
+    val foreground = res.resolve("drawable/ic_launcher_foreground.xml")
+    val background = res.resolve("values/ic_launcher_background.xml")
+    inputs.files(script, foreground, background)
+        .withPropertyName("iconSources")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+    outputs.file(macIcon).withPropertyName("icns")
+    executable = javaToolchains.launcherFor {
+        languageVersion.set(JavaLanguageVersion.of(21))
+    }.get().executablePath.asFile.absolutePath
+    args(
+        "-Djava.awt.headless=true", script.absolutePath,
+        foreground.absolutePath, background.absolutePath, macIcon.get().asFile.absolutePath,
+    )
+}
+val isMacHost = composeOsArchDir.startsWith("macos")
+
 // Compose's own internal prepareAppResources task copies appResourcesRootDir
 // into the image — our staging must run before IT (depending only on the
 // package*/createDistributable* umbrella tasks is too late: the internal copy
@@ -567,6 +608,8 @@ tasks.configureEach {
         dependsOn(prepareRustAppResources)
         dependsOn(prepareJnaBootLib)
         dependsOn(prepareBeePocSeed, prepareRailgunPocSeed)
+        // The app icon jpackage bakes into the macOS bundle (iconFile below).
+        if (isMacHost) dependsOn(generateMacIcon)
         // Compose's jpackage tasks do NOT track the app-resources CONTENT as
         // an input: after a Rust-only change, prepareRustAppResources and
         // Compose's own prepareAppResources both re-run, yet
@@ -614,18 +657,15 @@ compose.desktop {
             // The staged Rust engine lib (see prepareRustAppResources above).
             appResourcesRootDir.set(rustAppResourcesRoot)
             // jpackage is host-OS-bound: the .dmg can only be produced on macOS, the .deb only
-            // on Linux. CI builds each on its matching runner (desktop-dmg.yml /
-            // desktop-linux-deb.yml); locally you get the format for your OS. Msi when a
-            // Windows host exists.
-            targetFormats(TargetFormat.Dmg, TargetFormat.Deb)
+            // on Linux, the .msi only on Windows (and only with WiX 3 on the PATH: JDK 21's
+            // jpackage drives candle/light). CI builds each on its matching runner
+            // (desktop-dmg.yml / desktop-linux-deb.yml / desktop-windows-msi.yml); locally
+            // you get the format for your OS.
+            targetFormats(TargetFormat.Dmg, TargetFormat.Deb, TargetFormat.Msi)
             // The Bee PoC flavour is a separate app (own name, own bundle id, own
             // data dir — see BeePoc.kt) so it coexists with a regular install.
-            packageName = when {
-                beePoc -> "Myotis Bee PoC"
-                railgunPoc -> "Myotis RAILGUN PoC"
-                else -> "Myotis"
-            }
-            // Applies to the dmg (and a future msi); the deb overrides it below.
+            packageName = appName
+            // Applies to the dmg; the deb and the msi override it below.
             // See macOsPackageVersion at the top of this file for the +1-major rule.
             packageVersion = macOsPackageVersion
             // jpackage builds the deb's Maintainer field as "<vendor> <debMaintainer>",
@@ -639,6 +679,12 @@ compose.desktop {
             // runtime that can actually load Netty / Besu / jvm-libp2p / BouncyCastle.
             includeAllModules = true
             macOS {
+                // Generated at package time from the Android launcher icon (generateMacIcon).
+                // A plain file location, not a value mapped from the task: on macOS Compose's
+                // run task reads it at configuration time into -Xdock:icon=, before any task
+                // has run. The packaging tasks get their edge from the name match above, run
+                // from the JavaExec block below.
+                iconFile.set(macIcon)
                 bundleID = when {
                     beePoc -> "io.myotis.desktop.beepoc"
                     railgunPoc -> "io.myotis.desktop.railgunpoc"
@@ -651,6 +697,33 @@ compose.desktop {
                 packageVersion = releaseVersion
                 debMaintainer = "dirk@jaeckel.com"
             }
+            windows {
+                // MSI versions may start at 0 too (MAJOR and MINOR up to 255, BUILD up to
+                // 65535), so Windows carries the honest version like the deb.
+                packageVersion = releaseVersion
+                // Windows Installer recognises a newer msi as an UPGRADE of an installed one
+                // only through this code, so it must never change for a flavour. Each flavour
+                // is a separate app (see bundleID above), so each has its own.
+                upgradeUuid = when {
+                    beePoc -> "c65ad8ab-cde2-4113-92bf-18dd1d577ac8"
+                    railgunPoc -> "55b946b0-ea27-499a-856f-b5f87346f82a"
+                    else -> "15d1f394-905a-449a-bbdb-7afc2d780555"
+                }
+                // Per-user: installs under %LOCALAPPDATA%\<packageName> with no UAC prompt,
+                // like the data dir (~/.myotis) the app writes to anyway. No install-folder
+                // page (Compose turns it ON by default): a per-user install never elevates,
+                // so a folder like Program Files that the user could pick there would only
+                // fail the install.
+                perUserInstall = true
+                dirChooser = false
+                // A Start menu entry in a "Myotis" folder (jpackage's default group is
+                // "Unknown"), shared by the flavours, plus a desktop shortcut.
+                menu = true
+                menuGroup = "Myotis"
+                shortcut = true
+                // No iconFile yet: the msi ships jpackage's default icon, as the deb does
+                // (generateMacIcon writes only the macOS .icns).
+            }
         }
     }
 }
@@ -661,6 +734,14 @@ compose.desktop {
 // without the Rust engine until the packaging PR.
 tasks.withType<JavaExec>().matching { it.name == "run" || it.name == "syncSmoke" }.configureEach {
     dependsOn(rootProject.tasks.named("cargoBuildHost"))
+    // Compose's run passes the macOS icon as -Xdock:icon=<file>: a string, so no task edge.
+    if (isMacHost && name == "run") dependsOn(generateMacIcon)
+    // Compose names only the packaged app (-Xdock:name), so the macOS menu bar named a dev run
+    // after its main class ("MainKt"), the launcher's default for this property when it is
+    // unset. A system property, as Compose's run configuration assigns jvmArgs wholesale.
+    // Cmd-Tab still says "java": macOS names a bundle-less process after its executable, and
+    // JavaExec always runs the toolchain's own `java`. runDistributable runs the real bundle.
+    if (isMacHost && name == "run") systemProperty("apple.awt.application.name", appName)
     // -Pengine=java|rust|auto → -Dmyotis.engine (same knob as :app run).
     (project.findProperty("engine") as String?)?.let { systemProperty("myotis.engine", it) }
     // -Ptor=true → -Dmyotis.tor (dev knob to force Tor routing on at boot; needs the

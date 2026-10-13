@@ -3,12 +3,14 @@
 Convergence iteration counts and end-to-end latency for the corpus the
 Phase 2 plan calls out, measured with `MainnetPrefetchBenchmarkIT`.
 
-> **Status: scaffolding only.** The benchmark IT compiles and runs the
-> measurement loop, but `connectToMainnetPeer()` currently throws
-> `UnsupportedOperationException` — the same gap as
-> `MainnetCallViewIT`. Both light up when the Phase 1 follow-up that
-> extracts an `EthHandler` bootstrap helper out of `:app:Main` lands.
-> Until then, the table below carries placeholders.
+> **Status: runnable, no results recorded.** The benchmark IT's
+> `connectToMainnetPeer()` no longer throws: like `MainnetCallViewIT`, it
+> dials a real peer through `MainnetPeerBootstrap`
+> (`app/src/main/java/com/jaeckel/ethp2p/app/testing/MainnetPeerBootstrap.java`,
+> added in Phase 5). No run has been pasted in yet, so the table below still
+> carries placeholders. The prefetch loop has also changed since the
+> calibration below was written — see the status note in
+> [phase2-design.md](phase2-design.md).
 
 ## Methodology
 
@@ -22,8 +24,8 @@ For each corpus entry the benchmark:
 3. Runs `N = 10` timed iterations against `PrefetchingEvmExecutor`
    (Phase 2). The convergence loop's iteration counts are captured by
    `ConvergenceTracker`.
-4. Reports min / p50 / p95 / max wall-clock latency for both modes plus
-   the min/max convergence iteration counts.
+4. Prints one `[bench]` line with the p50 / p95 wall-clock latency for
+   both modes plus the min/max convergence iteration counts.
 
 The acceptance assertions in the IT:
 
@@ -67,8 +69,9 @@ iteration 1 runs against a cache pre-populated by a parallel batch fetch.
   entirely from inputs). ENS `addr` involves one mapping lookup in the
   Public Resolver — also data-independent. Expected: 2 iterations for all
   three. If we see 3, the iter-0 sentinel run took a different path than
-  iter 1 (a data-dependent branch); if we see > 3, the cap is hit and the
-  call fails.
+  iter 1 (a data-dependent branch); if we see > 3, the IT's ≤ 3 assertion
+  fails (the executor's own cap, `PrefetchingEvmExecutor.DEFAULT_ITERATION_CAP`,
+  is 4).
 - **Baseline latency** (`DefaultEvmExecutor`): ~1 round trip per SLOAD
   plus 1 for the account fetch and 1 for the bytecode. USDC's proxy slot
   + impl + balance mapping = ~5 serial RTTs. At 100 ms RTT to a typical

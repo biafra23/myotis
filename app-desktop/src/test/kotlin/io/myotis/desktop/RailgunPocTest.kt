@@ -255,6 +255,9 @@ class RailgunPocTest {
         val mainNotice = RailgunPoc.seededIndexNotice(data, "mainnet")
         assertTrue(mainNotice != null && mainNotice.contains("437765"), "the notice states the seed size: $mainNotice")
         assertTrue(mainNotice!!.contains("unverified"), "the notice must not present RPC data as verified")
+        // A seed reaching the deployment block leaves the walk nothing below it: nothing
+        // will ever re-check it, and the notice must not promise otherwise.
+        assertTrue(mainNotice.contains("not re-checked"), mainNotice)
         val sepNotice = RailgunPoc.seededIndexNotice(data, "sepolia")
         assertTrue(sepNotice != null && sepNotice.contains("14761") && sepNotice.contains("5784774–11824017"), "$sepNotice")
         assertTrue(sepNotice!!.contains("a Sepolia full node"), sepNotice)

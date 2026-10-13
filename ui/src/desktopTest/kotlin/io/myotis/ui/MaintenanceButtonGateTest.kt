@@ -38,7 +38,7 @@ class MaintenanceButtonGateTest {
 
     @Test
     fun `both maintenance actions are offered while the network is down`() {
-        rule.setContent { NodeScreen(controller = Stopped(), settings = FakeSettings(), logs = NoLogs) }
+        rule.setContent { NodeScreen(controller = Stopped(), settings = FakeSettings(expert = true), logs = NoLogs) }
         pumpFrames()
         rule.onNodeWithText("Reset sync state").performScrollTo().assertIsEnabled()
         rule.onNodeWithText("Clear peer caches").performScrollTo().assertIsEnabled()
@@ -46,7 +46,7 @@ class MaintenanceButtonGateTest {
 
     @Test
     fun `both are withheld while the network runs, and say why`() {
-        rule.setContent { NodeScreen(controller = Running(), settings = FakeSettings(), logs = NoLogs) }
+        rule.setContent { NodeScreen(controller = Running(), settings = FakeSettings(expert = true), logs = NoLogs) }
         pumpFrames()
         rule.onNodeWithText("Reset sync state").performScrollTo().assertIsNotEnabled()
         rule.onNodeWithText("Clear peer caches").performScrollTo().assertIsNotEnabled()

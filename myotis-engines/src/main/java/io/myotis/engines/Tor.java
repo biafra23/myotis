@@ -18,7 +18,9 @@ import org.slf4j.LoggerFactory;
  * :30303} exit coverage is partial (docs §8). While on, balance/state reads may
  * be slow or fail-closed. The routing sets the process-global flag in the Rust
  * engine; the account read path there dials a per-address isolated Tor circuit
- * with a fresh ephemeral identity instead of the clearnet peer pool.
+ * with a fresh ephemeral identity instead of the clearnet peer pool, and the
+ * broadcast of the wallet's own transactions goes out on circuits isolated to
+ * that send, or not at all.
  */
 public final class Tor {
 
@@ -78,6 +80,38 @@ public final class Tor {
             return supported;
         } catch (Throwable t) {
             log.warn("[tor] nativeSetTorEnabled failed: {}", t.toString());
+            return false;
+        }
+    }
+
+    /**
+     * Name the absolute directories the embedded Tor client keeps its state and its
+     * directory cache in. Android must call this before {@link #select(boolean)
+     * select(true)}: Arti's default directories derive from {@code $HOME}, which an
+     * app process has no usable value for, so the engine refuses an unconfigured
+     * Android bootstrap (reads routed over Tor then fail closed). Elsewhere it is
+     * optional — unset keeps Arti's platform defaults. Returns true iff the engine
+     * will use exactly these; false when the Rust engine is unavailable, the build
+     * has no Tor support, a path is relative, or a bootstrap already holds a
+     * different pair (the directories cannot move within a process).
+     */
+    public static synchronized boolean configureStorage(String stateDir, String cacheDir) {
+        if (!RustMyotisEngine.isAvailable()) {
+            log.info("[tor] storage directories not set: the Rust engine is unavailable");
+            return false;
+        }
+        try {
+            boolean applied = RustEngineNative.nativeSetTorStorageDirs(stateDir, cacheDir);
+            if (applied) {
+                log.info("[tor] storage: state {}, cache {}", stateDir, cacheDir);
+            } else {
+                log.warn("[tor] storage directories refused (state {}, cache {}): Tor-less "
+                        + "build, relative path, or a bootstrap already holds others",
+                        stateDir, cacheDir);
+            }
+            return applied;
+        } catch (Throwable t) {
+            log.warn("[tor] nativeSetTorStorageDirs failed: {}", t.toString());
             return false;
         }
     }

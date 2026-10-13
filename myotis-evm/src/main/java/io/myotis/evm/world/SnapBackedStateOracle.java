@@ -194,10 +194,16 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
         });
     }
 
-    /** Max path-sets (accounts) per GetTrieNodes request. Bounds the response size a
-     *  peer must assemble (each path-set is ~one account proof + its slot proofs ≈
-     *  several KB), keeping any one request servable while still collapsing a
-     *  1000-account sweep from ~1000 round-trips to ~16. */
+    /** Max path-sets (accounts) per {@code getTrieNodes} call: one peer's share of a
+     *  sweep, verified and retried on another peer as a unit, so it bounds what one
+     *  failed chunk costs (each path-set is ~one account proof + its slot proofs ≈
+     *  several KB). It does not cut requests: the adapter ({@code EthHandlerSnapPeer})
+     *  sends one {@code GetAccountRange} per account path-set and one
+     *  {@code GetStorageRanges} per slot, so a 1000-account sweep is still ~1000 snap
+     *  requests. What the batch saves is waiting: its ~16 chunks go out together and
+     *  each chunk's requests run concurrently, instead of one sequential read per
+     *  account — capped on the heavy EVM lane, where {@code SnapLaneGate} admits only
+     *  so many chunk calls at a time. */
     private static final int BATCH_PATHSET_CHUNK = 64;
 
     /** Per-account batch work: the address + its hash + the UNCACHED slots wanted
@@ -632,30 +638,12 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
         if (result instanceof MerklePatriciaProofVerifier.Result.Absent) {
             return BigInteger.ZERO;
         }
-        Bytes value = ((MerklePatriciaProofVerifier.Result.Found) result).value();
         // Storage leaves carry RLP-encoded uint256 (the trimmed-leading-zeros
         // big-endian encoding). The verifier already strips the outer RLP
-        // header; the inner item is itself RLP-wrapped, so strip again.
-        if (value.isEmpty()) return BigInteger.ZERO;
-        Bytes raw = stripIntegerHeader(value);
-        return raw.isEmpty() ? BigInteger.ZERO : new BigInteger(1, raw.toArrayUnsafe());
-    }
-
-    /**
-     * Storage trie values are stored as {@code rlp(trimmed_uint256)} — the
-     * leaf-value bytes carry an RLP integer encoding. Strip the header.
-     */
-    private static Bytes stripIntegerHeader(Bytes raw) {
-        if (raw.isEmpty()) return raw;
-        int first = raw.get(0) & 0xff;
-        if (first < 0x80) return raw;
-        if (first <= 0xb7) {
-            int len = first - 0x80;
-            return len == 0 ? Bytes.EMPTY : raw.slice(1, len);
-        }
-        // Long string — should never happen for a uint256, but handle gracefully.
-        int lenLen = first - 0xb7;
-        return raw.slice(1 + lenLen);
+        // header; the inner item is itself RLP-wrapped — the shared decoder
+        // strips it (the operator get-storage query reads leaves through it too).
+        return MerklePatriciaProofVerifier.storageInteger(
+                ((MerklePatriciaProofVerifier.Result.Found) result).value());
     }
 
     /** Storage trie keys are keccak256 of the 32-byte zero-padded slot index. */

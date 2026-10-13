@@ -1,11 +1,13 @@
 package io.myotis.ios
 
+import io.myotis.jsonrpc.RpcAccessListResult
 import io.myotis.jsonrpc.RpcBackend
 import io.myotis.jsonrpc.RpcCallResult
 import io.myotis.jsonrpc.RpcEstimateResult
 import io.myotis.jsonrpc.RpcSendResult
 import io.myotis.jsonrpc.RpcBlockWindow
 import io.myotis.jsonrpc.RpcTransactionArgs
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -196,6 +198,48 @@ class IosRpcBackend(
         }
     }
 
+    override fun supportsAccessListCreation(): Boolean = true // the revm executor traces and confirms the list (ABI >= 40)
+
+    override fun createAccessList(
+        tx: RpcTransactionArgs,
+        block: String,
+        stateOverridesJson: String?,
+    ): RpcAccessListResult {
+        // No host-side block guard, as for callTx: the engine applies the
+        // selector and every field of the canonical object — or refuses it, as
+        // the permanent -32602 envelope (ABI >= 40; JVM-adapter parity).
+        val handle = handleProvider() ?: return RpcAccessListResult.unavailable("engine not running")
+        return accessListFromJson(RustEngine.createAccessListJson(handle, tx.json, block, stateOverridesJson ?: ""))
+    }
+
+    /** The engine's access-list JSON as an [RpcAccessListResult]
+     *  (RustChainHandle.accessListFromJson's twin): the list verbatim and its
+     *  gas, with the run's own failure (`vmError`, geth's `error`) next to them. */
+    private fun accessListFromJson(json: String): RpcAccessListResult {
+        permanentRefusalOrNull(json)?.let { return RpcAccessListResult.refused(it) }
+        val o = resultOrNull(json) ?: return RpcAccessListResult.unavailable("engine error")
+        return when (o.engineString("status")) {
+            "ok" -> {
+                // An `ok` without its list or gas is engine shape drift → retryable,
+                // never a confident answer (JVM-adapter parity: EngineException → unavailable).
+                val list = o["accessList"] as? JsonArray
+                    ?: return RpcAccessListResult.unavailable("ok without an accessList from engine")
+                val gasUsed = (o["gasUsed"] as? JsonPrimitive)?.longOrNull
+                    ?: return RpcAccessListResult.unavailable("ok without gasUsed from engine")
+                // A revert's payload rides with its vmError; malformed hex is drift, as above.
+                val revertData = o.engineString("revertDataHex")?.let {
+                    hexToBytes(it) ?: return RpcAccessListResult.unavailable("malformed revertDataHex from engine")
+                }
+                RpcAccessListResult.ok(list.toString(), gasUsed, o.engineString("vmError"), revertData)
+            }
+            "infeasible" -> RpcAccessListResult.infeasible(
+                o.engineString("reason")?.takeIf { it.isNotBlank() }
+                    ?: return RpcAccessListResult.unavailable("infeasible without a reason from engine"),
+            )
+            else -> RpcAccessListResult.unavailable(o.engineString("reason"))
+        }
+    }
+
     override fun supportsStateOverrides(): Boolean = true   // the revm executor applies them
 
     override fun supportsContractCreation(): Boolean = true // TxKind::Create
@@ -307,9 +351,19 @@ class IosRpcBackend(
 
     override fun sendRawTransactionDetailed(rawTx: ByteArray): RpcSendResult {
         if (rawTx.isEmpty()) return RpcSendResult.unavailable("empty raw transaction")
+        // Bytes that are no transaction are refused on the bytes alone (ABI >= 45,
+        // #360), BEFORE the handle lookup: a node not running must not turn that
+        // permanent refusal into a retryable one (JNI parity: RustChainHandle
+        // checks before its wake wait). The send runs the same gate again.
+        runCatching { permanentRefusalOrNull(RustEngine.checkRawTransactionJson(hex(rawTx))) }
+            .getOrNull()?.let { return RpcSendResult.refused(it) }
         val handle = handleProvider() ?: return RpcSendResult.unavailable()
-        val o = resultOrNull(RustEngine.sendRawTransactionJson(handle, hex(rawTx)))
-            ?: return RpcSendResult.unavailable()
+        val json = RustEngine.sendRawTransactionJson(handle, hex(rawTx))
+        // No transaction the engine relays (ABI >= 44, #360): the permanent
+        // -32602 envelope, nothing broadcast — REFUSED (JNI parity:
+        // RustChainHandle.sendResultFromJson).
+        permanentRefusalOrNull(json)?.let { return RpcSendResult.refused(it) }
+        val o = resultOrNull(json) ?: return RpcSendResult.unavailable()
         // Refused before broadcast (ABI >= 36, #531): geth's txpool verdict,
         // which the router serves under -32000. A reason-less refusal fails
         // closed (JNI parity: RustChainHandle.sendResultFromJson throws).

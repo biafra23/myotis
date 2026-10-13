@@ -37,6 +37,7 @@ myotis-rpcd [--network gnosis|mainnet|sepolia]     # default gnosis
             [--log-index-config FILE]              # enables eth_getLogs for a watch-list
             [--import-log-index FILE]...           # snapshot(s) imported after the config
             [--checkpoint-root 0x… --checkpoint-slot N]
+            [--boot-enodes enode://…,…|@FILE]      # EL peers to dial at start
             [--accept-stale-anchor] [--ws-bound-periods N]
             [--log-calls FILE] [--access-log]
             [--ready-wait 90] [--workers 16]
@@ -59,7 +60,11 @@ myotis-rpcd [--network gnosis|mainnet|sepolia]     # default gnosis
 - `GET /logindex` returns the engine's log-index status JSON (coverage per watch
   entry, backfill cursor, head gap).
 - Engine logs go to stderr. SIGINT and SIGTERM stop the engine handle cleanly,
-  and its sync state persists in the data dir.
+  and its sync state persists in the data dir. On Windows the stop comes from
+  Ctrl+C (SIGINT) or Ctrl+Break (SIGBREAK); closing the console window or
+  `taskkill /F` ends the process without it. The default data dir is built
+  from `HOME`, which Windows does not set (only shells such as Git Bash do), so
+  pass `--data-dir` there.
 
 The HTTP side is deliberately synchronous: every engine read blocks (it may hold
 for a verified head), so a fixed pool of `--workers` threads each takes a
@@ -115,6 +120,41 @@ with `-32000` and an explanation. Two ways forward, both explicit:
   synced, the data dir resumes from its own fresh snapshot and the flag is no
   longer needed. `--ws-bound-periods` overrides the bound itself, with the same
   trade-off.
+
+### --boot-enodes
+
+The EL pool starts by dialing a network's pinned `enode://` URLs, then its
+peer cache, then whatever discovery finds. Mainnet and Gnosis ship no pins, so
+a cold start (a fresh data dir, no cache) has to wait for discovery to surface
+a peer that serves snap, and on mainnet that can take a long time: most peers
+that advertise snap there are still syncing, or never answer. `--boot-enodes`
+gives the pool servers the operator already knows to be good, through the
+engine's host seed pins (`myotis_set_boot_enodes`, #465):
+
+```bash
+myotis-rpcd --network mainnet --boot-enodes enode://<128 hex>@203.0.113.7:30303,enode://…
+myotis-rpcd --network mainnet --boot-enodes @/etc/myotis/mainnet-enodes.txt
+```
+
+A file has one URL per line; blank lines and `#` comments are skipped. Each URL
+must be `enode://<128 hex pubkey>@ip:port`, optionally followed by
+`?discport=N` (geth prints that when its UDP and TCP ports differ), which is
+accepted and ignored. The address must be an IP: a DNS name is refused, not
+resolved. At most 64 URLs, no address twice. The engine applies the list or
+refuses it as a whole, naming every bad entry, and the daemon then exits before
+starting, quoting the engine's reason. A pin is a dial hint, not trust:
+everything a pinned peer serves is verified like any other peer's answer. Pins
+are never written to the peer cache; the pool re-dials them while it is short
+of serving peers, and a pin that is down or does not serve snap is backed off
+like any other peer.
+
+The pins are handed to the engine before it starts and dialed as soon as its
+EL pool is up, but not strictly first: the engine applies host pins just after
+the pool has begun its own start-up dials (the network's pins and the peer
+cache), so with a large cache a pin can queue behind those, or wait for the
+pool's next re-dial. On a cold start there is little ahead of it: on the
+x86-64 and aarch64 boards this was tried on, a pinned peer connected about a
+second after start.
 
 ### eth_getLogs
 
@@ -172,6 +212,7 @@ misbehaves against the node: what it asked, in what order, and what it got.
 | `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt` | verified | Snap proof at the head or at `finalized`. A number pin is served from head state only within [head-64, head+16]. `pending` nonce adds the node's own broadcasts. |
 | `eth_call` | verified | revm over proven state. State overrides applied; `blockOverrides` refused. A tx object with an explicit `type` or gas/fee/list fields goes through the engine's transaction-object call, which applies or refuses them. |
 | `eth_estimateGas` | verified | Full transaction object, state overrides. |
+| `eth_createAccessList` | verified | Full transaction object, state overrides (a third parameter geth does not take). geth's result: `{accessList, gasUsed}`, with the run's own revert or halt as `error` next to them. |
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas` | verified | The engine's fee suggestion (see gaps). |
 | `eth_feeHistory` | verified | Newest block required. At most 1024 blocks and 100 percentiles. |
 | `eth_getBlockByNumber`, `eth_getBlockByHash` | verified | Hashes or full txs; recent/anchored blocks only. Unknown blocks are `null`. |

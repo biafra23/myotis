@@ -263,6 +263,11 @@ const NOT_STARTED = { error: 'handle not started' };
 const NOT_RUNNING = { error: 'node is not running' };
 const notStartedFor = (name) => (['getLogsJson', 'importLogIndexFiles'].includes(name) ? NOT_RUNNING : NOT_STARTED);
 const invalid = (error) => ({ error, code: -32602 });
+// A complete signed transaction, for a send that must reach the engine: a
+// mainnet type-2 transfer already mined (tools/mm-replay/sessions/
+// metamask-send-mainnet.jsonl, tx 0x4c694f62…). Used only on handles that are
+// never started, so it is never broadcast.
+const SIGNED_TX = '0x02f8710107847735940084820ad2e88252089476273bad5c07e97cb91d810094b9cbcad15b45de87021dfa95a9c67c80c001a0febe04c90163fb78037e68925ca70a0d1ac1315c10b0373b96590b8cf2e81db8a059a652dbad354a753a1ede26072b01bfda95b023c03f25a766c243aee74f670a';
 
 async function withCreatedHandle(fn) {
   const base = mkdtempSync(join(tmpdir(), 'myotis-addon-api-'));
@@ -314,7 +319,12 @@ test('a well-formed read reaches the engine: a not-started handle is a plain, re
       ['account', () => m.requestAccountJson(h, ADDR)],
       ['estimate', () => m.estimateGasJson(h, ADDR, ADDR, '0xdeadbeef', '1000000000000000000')],
       ['estimate without from, data or value', () => m.estimateGasJson(h, '', ADDR, '', '')],
-      ['send', () => m.sendRawTransactionJson(h, '0x02f86c')],
+      // A complete signed transaction: since #616/#621 a send is decoded and
+      // checked before the handle is consulted, so only a well-formed one
+      // reaches the engine. This is a mainnet type-2 transfer already mined
+      // (tools/mm-replay/sessions/metamask-send-mainnet.jsonl, tx 0x4c694f62…);
+      // the handle is never started, so nothing is broadcast.
+      ['send', () => m.sendRawTransactionJson(h, SIGNED_TX)],
     ]) {
       assert.deepEqual(JSON.parse(await call()), NOT_STARTED, label);
     }
@@ -380,6 +390,9 @@ test('a request that can never be served is refused permanently, before the hand
       ['estimate value in hex', () => m.estimateGasJson(h, '', ADDR, '', '0x10'), invalid('invalid value (expected decimal wei)')],
       ['send empty', () => m.sendRawTransactionJson(h, '0x'), invalid('empty raw transaction')],
       ['send not hex', () => m.sendRawTransactionJson(h, '0xzz'), invalid('invalid raw transaction hex')],
+      // A truncated type-2 envelope: refused for good, never handed to a peer (#616).
+      ['send truncated type 2', () => m.sendRawTransactionJson(h, '0x02f86c'),
+        invalid('invalid raw transaction: malformed type 0x2 transaction')],
     ];
     for (const [label, call, expected] of refusals) {
       assert.deepEqual(JSON.parse(await call()), expected, label);

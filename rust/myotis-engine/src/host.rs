@@ -222,6 +222,21 @@ pub fn set_tor_enabled(on: bool) -> bool {
     }
 }
 
+/// `nativeSetTorStorageDirs`: where the embedded Arti client keeps its state and
+/// directory cache (`myotis_net::el::tor::set_storage_dirs` has the rules).
+/// `false` — refused — when this build has no Tor support.
+pub fn set_tor_storage_dirs(state_dir: &str, cache_dir: &str) -> bool {
+    #[cfg(feature = "tor")]
+    {
+        myotis_net::el::tor::set_storage_dirs(state_dir, cache_dir)
+    }
+    #[cfg(not(feature = "tor"))]
+    {
+        let _ = (state_dir, cache_dir);
+        false
+    }
+}
+
 /// `nativeTorStatus`: a small bitmask for the host's Status view —
 /// bit0 compiled-in, bit1 enabled, bit2 bootstrapped (circuit ready). `0` means
 /// this build has no Tor support at all.
@@ -335,9 +350,13 @@ pub fn create(network_name: &str, data_dir: &str) -> i64 {
 /// anchor in `sync-anchor[-net].json` next to the snapshot, before any sync
 /// state exists. From then on the directory belongs to that anchor:
 /// - the same root and slot on a later call RESUMES it — the engine's normal
-///   rule applies (a persisted snapshot strictly newer than the checkpoint is
-///   restored and re-verified; otherwise it bootstraps from the checkpoint
-///   again), so a restart never reverts to the embedded anchor;
+///   rule applies (a persisted snapshot bound to this chain and strictly newer
+///   than the checkpoint is restored without re-verifying what it holds, and
+///   stays on probation —
+///   `ResumeGuard` in `myotis-net`'s `sync.rs` — until an update verifies
+///   against it; `RESUME_REJECTS_MAX` rejects in a row discard it and
+///   re-bootstrap from the checkpoint. Otherwise it bootstraps from the
+///   checkpoint again), so a restart never reverts to the embedded anchor;
 /// - a different root or slot, a directory whose snapshot predates the marker
 ///   (state from the embedded anchor), an unreadable marker, or a plain
 ///   [`create`] on a marked directory returns `ANCHOR_MISMATCH` (-3). Nothing
@@ -1902,7 +1921,7 @@ pub fn resolve_ens_json(handle: i64, name: &str) -> String {
 ///
 /// ```json
 /// {"method":"text","name":"a.eth","key":"url","root":"auto"}
-/// {"method":"addr"|"contenthash"|"pubkey","name":"a.eth","root":"finalized"}
+/// {"method":"addr"|"contenthash"|"ownership"|"pubkey","name":"a.eth","root":"finalized"}
 /// {"method":"multicoin","name":"a.eth","coinType":0}
 /// {"method":"abi","name":"a.eth","contentTypes":15}
 /// {"method":"dnsRecord","name":"a.eth","dnsName":"a.eth","resource":1}
@@ -2100,6 +2119,31 @@ pub fn eth_call_tx_json(handle: i64, tx_json: &str, block: &str, overrides_json:
     };
     match engine.rt.block_on(async { reader.eth_call_tx(anchor, tx, chain_id, overrides).await }) {
         Ok(answer) => eljson::call_json(&answer),
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
+/// `nativeCreateAccessListJson` (ABI ≥ 40): verified `eth_createAccessList`
+/// for the FULL JSON-RPC transaction object — the same `tx_json`, `block` and
+/// `overrides_json` as [`estimate_gas_tx_json`], the request checked as
+/// [`eth_call_tx_json`] checks it, every field applied or the request refused
+/// with the permanent `{"error","code":-32602}` envelope. Otherwise the access
+/// list JSON ([`eljson::access_list_json`]: the list the transaction touches,
+/// built as geth builds it, with the gas the run made with it used and that
+/// run's own revert or halt next to the list; `infeasible` for a request that
+/// cannot run within the caller's gas, fee cap or funds) or a retryable
+/// `{"error": "..."}`.
+pub fn create_access_list_json(handle: i64, tx_json: &str, block: &str, overrides_json: &str) -> String {
+    let (tx, selector, overrides) = match parse_tx_args(tx_json, block, overrides_json) {
+        Ok(parsed) => parsed,
+        Err(json) => return json,
+    };
+    let (engine, reader, chain_id, anchor) = match tx_target(handle, &tx, selector) {
+        Ok(target) => target,
+        Err(json) => return json,
+    };
+    match engine.rt.block_on(async { reader.create_access_list(anchor, tx, chain_id, overrides).await }) {
+        Ok(answer) => eljson::access_list_json(&answer),
         Err(e) => eljson::error_json(&e),
     }
 }
@@ -2482,18 +2526,25 @@ pub fn get_block_by_hash_json(
 
 /// `nativeSendRawTransactionJson`: gossip a signed raw transaction to peers and
 /// return `{"txHash":"0x…"}` (keccak256 of the raw tx), or `{"error": "..."}` when
-/// no peer could be reached / the input isn't a plausible tx. A WRITE — the
-/// engine never signs. Since ABI 36, `{"status":"rejected","reason":"…"}` for a
-/// transaction its sender cannot pay for or whose nonce is used, judged on
-/// fresh verified state and never broadcast (#531): the reason is geth's
-/// txpool verdict, which hosts serve verbatim under geth's -32000. `raw_hex` is
-/// the 0x-hex raw tx.
+/// no peer could be reached. A WRITE — the engine never signs. Since ABI 36,
+/// `{"status":"rejected","reason":"…"}` for a transaction its sender cannot pay
+/// for or whose nonce is used, judged on fresh verified state and never
+/// broadcast (#531): the reason is geth's txpool verdict, which hosts serve
+/// verbatim under geth's -32000. Since ABI 44, the permanent
+/// `{"error","code":-32602}` envelope ([`eljson::invalid_params_json`]) for
+/// bytes that are no transaction this node relays — undecodable, no sender, a
+/// blob transaction — never broadcast either (#360). `raw_hex` is the 0x-hex
+/// raw tx.
 pub fn send_raw_transaction_json(handle: i64, raw_hex: &str) -> String {
     let Some(raw) = parse_hex_bytes(raw_hex) else {
         return eljson::error_json("invalid raw transaction hex");
     };
-    if raw.is_empty() {
-        return eljson::error_json("empty raw transaction");
+    // Judged on the bytes alone (#360), BEFORE the engine is asked whether it
+    // is up: a paused or starting node must not turn the permanent refusal of
+    // bytes that are no transaction into a retryable "unavailable". The reader
+    // checks again (its own callers need the gate too); the decode is cheap.
+    if let Err(reason) = myotis_net::el::tx::decode_sendable(&raw) {
+        return eljson::invalid_params_json(&reason);
     }
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
@@ -2505,8 +2556,28 @@ pub fn send_raw_transaction_json(handle: i64, raw_hex: &str) -> String {
     use myotis_net::el::reader::SendError;
     match engine.rt.block_on(reader.request(async { Ok(reader.send_raw_transaction(&raw).await) })) {
         Ok(Ok(hash)) => eljson::tx_hash_json(&hash),
+        Ok(Err(SendError::Refused(reason))) => eljson::invalid_params_json(&reason),
         Ok(Err(SendError::Rejected(reason))) => eljson::send_rejected_json(&reason),
         Ok(Err(SendError::Unavailable(e))) | Err(e) => eljson::error_json(&e),
+    }
+}
+
+/// `nativeCheckRawTransactionJson` (ABI 45): the `eth_sendRawTransaction` gate
+/// (#360) on the bytes alone — no handle, no engine, no wait. `{"ok":true}` when
+/// they are a transaction this node relays, the permanent
+/// `{"error","code":-32602}` envelope ([`eljson::invalid_params_json`]) when they
+/// are not, and `{"error": ...}` for hex that does not parse. Hosts call it
+/// BEFORE their readiness hold — the JVM `RustChainHandle` before its wake wait,
+/// the iOS backend before its handle lookup — so a starting or paused node
+/// answers bytes that are no transaction with the permanent refusal, never a
+/// retryable "not ready". [`send_raw_transaction_json`] runs the same gate.
+pub fn check_raw_transaction_json(raw_hex: &str) -> String {
+    let Some(raw) = parse_hex_bytes(raw_hex) else {
+        return eljson::error_json("invalid raw transaction hex");
+    };
+    match myotis_net::el::tx::decode_sendable(&raw) {
+        Ok(_) => r#"{"ok":true}"#.to_string(),
+        Err(reason) => eljson::invalid_params_json(&reason),
     }
 }
 
@@ -2829,6 +2900,7 @@ fn parse_ens_query(query_method: &str, params: &serde_json::Value) -> Result<Ens
     Ok(match query_method {
         "addr" => EnsQuery::Addr { name: name_field("name")? },
         "contenthash" => EnsQuery::Contenthash { name: name_field("name")? },
+        "ownership" => EnsQuery::Ownership { name: name_field("name")? },
         "pubkey" => EnsQuery::Pubkey { name: name_field("name")? },
         "text" => {
             let name = name_field("name")?;
@@ -3306,6 +3378,32 @@ mod tests {
         assert_eq!(earliest["code"], eljson::INVALID_PARAMS);
     }
 
+    /// The access-list entry point shares the request checks (ABI 40): the
+    /// same refusals, before the handle, in the same words.
+    #[test]
+    fn create_access_list_json_refuses_bad_requests_before_the_handle() {
+        let to = r#""to":"0x2222222222222222222222222222222222222222""#;
+        assert_invalid_params(
+            &create_access_list_json(i64::MIN, &format!(r#"{{{to},"type":"0x4"}}"#), "", ""),
+            "requires an authorizationList",
+        );
+        assert_invalid_params(&create_access_list_json(i64::MIN, "not json", "", ""), "invalid transaction object");
+        assert_invalid_params(&create_access_list_json(i64::MIN, &format!("{{{to}}}"), "", "[]"), "state override");
+        let hash: serde_json::Value = serde_json::from_str(&create_access_list_json(
+            i64::MIN,
+            &format!("{{{to}}}"),
+            &format!("0x{}", "ab".repeat(32)),
+            "",
+        ))
+        .unwrap();
+        assert_eq!(hash["code"], eljson::INVALID_PARAMS);
+        // A well-formed request reaches the handle, which does not exist here.
+        let none: serde_json::Value =
+            serde_json::from_str(&create_access_list_json(i64::MIN, &format!("{{{to}}}"), "latest", "")).unwrap();
+        assert!(none["error"].is_string(), "{none}");
+        assert!(none.get("code").is_none(), "retryable, not permanent: {none}");
+    }
+
     #[test]
     fn fee_history_outer_failure_preserves_stale_cache_policy() {
         use myotis_net::el::reader::FeeHistoryError;
@@ -3424,15 +3522,24 @@ mod tests {
         let marker = dir.join("sync-anchor.json");
         assert!(marker.is_file(), "the anchor marker must be written on first use");
         assert_eq!(read_anchor_marker(&marker), Ok(Some((parse_hex_fixed::<32>(root).unwrap(), slot))));
-        {
+        // Copied out so the asserts run with the map lock released: a failure
+        // under it would poison the shared engine for every later test.
+        let (cfg_root, cfg_slot, cfg_snapshot) = {
             let map = engine().unwrap().handles.lock().unwrap();
-            let ChainEntry::Created(cfg) = map.get(&id).expect("handle registered") else {
-                panic!("fresh handle must be Created");
+            let Some(ChainEntry::Created(cfg)) = map.get(&id) else {
+                drop(map);
+                panic!("fresh handle must be registered as Created");
             };
-            assert_eq!(cfg.checkpoint_root, parse_hex_fixed::<32>(root).unwrap());
-            assert_eq!(cfg.checkpoint_slot, slot);
-            assert_eq!(cfg.snapshot_path.as_deref(), Some(dir.join("sync-state.snapshot").as_path()));
-        }
+            (cfg.checkpoint_root, cfg.checkpoint_slot, cfg.snapshot_path.clone())
+        };
+        assert_eq!(cfg_root, parse_hex_fixed::<32>(root).unwrap());
+        assert_eq!(cfg_slot, slot);
+        // The engine binds the directory's canonical path (`bind_persistence`
+        // comment: identity, not spelling), which differs from temp_dir()'s
+        // spelling on Windows (`\\?\` prefix, 8.3 short names) and macOS
+        // (/var → /private/var).
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        assert_eq!(cfg_snapshot, Some(canonical.join("sync-state.snapshot")));
         // While that handle is alive the directory is in use: a second binding —
         // even the same anchor — is refused before any marker work.
         assert_eq!(create_with_checkpoint("mainnet", d, root, slot), CREATE_FAILED);
@@ -3611,6 +3718,7 @@ mod tests {
         // decodes an address answer with pubkey semantics (a real regression).
         assert!(matches!(q("addr", "").unwrap(), EnsQuery::Addr { .. }));
         assert!(matches!(q("contenthash", "").unwrap(), EnsQuery::Contenthash { .. }));
+        assert!(matches!(q("ownership", "").unwrap(), EnsQuery::Ownership { .. }));
         assert!(matches!(q("pubkey", "").unwrap(), EnsQuery::Pubkey { .. }));
         assert!(matches!(q("text", r#","key":"url""#).unwrap(), EnsQuery::Text { .. }));
         assert!(matches!(q("multicoin", r#","coinType":60"#).unwrap(), EnsQuery::Multicoin { coin_type: 60, .. }));
@@ -5198,6 +5306,39 @@ mod log_index_json_tests {
         // kind of overcount this PR's fix closed for the single-entry case,
         // reopened the moment a second, incomplete entry exists.
         assert!(s.contains("\"blocksRemaining\":5"), "{s}");
+    }
+}
+
+#[cfg(test)]
+mod send_gate_tests {
+    use super::send_raw_transaction_json;
+
+    #[test]
+    fn bytes_that_are_no_transaction_are_refused_whatever_the_engine_state() {
+        // #360: judged on the bytes before any engine or handle is looked up —
+        // a handle that does not exist (as for a paused or starting node)
+        // still gets the permanent refusal, never a retryable "unavailable".
+        assert_eq!(
+            send_raw_transaction_json(-1, "0x00"),
+            r#"{"error":"invalid raw transaction: transaction type not supported (0x0)","code":-32602}"#
+        );
+        assert_eq!(
+            send_raw_transaction_json(-1, "0x"),
+            r#"{"error":"invalid raw transaction: empty","code":-32602}"#
+        );
+        // The same gate, alone: no handle at all.
+        assert_eq!(
+            super::check_raw_transaction_json("0x00"),
+            r#"{"error":"invalid raw transaction: transaction type not supported (0x0)","code":-32602}"#
+        );
+        assert_eq!(super::check_raw_transaction_json("0xzz"), r#"{"error":"invalid raw transaction hex"}"#);
+        // A real transaction gets past the gate, to the readiness checks.
+        let spec = "0xf86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a7\
+                    6400008025a028ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276a0\
+                    67cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83";
+        assert_eq!(super::check_raw_transaction_json(spec), r#"{"ok":true}"#);
+        let out: serde_json::Value = serde_json::from_str(&send_raw_transaction_json(-1, spec)).unwrap();
+        assert!(out.get("error").is_some() && out.get("code").is_none(), "{out}");
     }
 }
 

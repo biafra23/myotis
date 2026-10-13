@@ -26,9 +26,12 @@ import org.slf4j.LoggerFactory;
  *
  * <p><b>Head-anchored.</b> The Rust reader verifies against the peer's fresh head
  * (the CL-anchored latest state), so state reads resolve to that head. A selector
- * of {@code latest}/{@code pending}/{@code safe}/default, OR a specific number
+ * of {@code latest}/{@code pending}/default, OR a specific number
  * within {@code [head-64, head+16]} (wallets pin reads to the just-fetched
- * latest number), is served from the verified head. {@code finalized} is
+ * latest number), is served from the verified head. {@code safe} and
+ * {@code earliest} are never served — no engine tracks the safe head or holds
+ * genesis: the JSON-RPC router refuses {@code safe} with a permanent error, and
+ * the shared block window ({@code RpcBlockWindow}) refuses both (#366). {@code finalized} is
  * APPLIED everywhere on this engine: by {@code call}, {@code getBlockByNumber},
  * {@code getBlockReceipts} and {@code feeHistory} since ABI 30 (#465), and by the
  * account/code/storage/nonce reads since ABI 32 (#366) — they run against, or
@@ -276,8 +279,8 @@ final class RustVerifiedReads implements VerifiedReads {
         try {
             // The engine never signs — it gossips the user-signed tx and returns
             // keccak256(rawTx), or refuses one that can never be mined as sent
-            // (REJECTED, geth's reason). Unavailable on no-peer / not-a-tx
-            // (→ strict -32000).
+            // (REJECTED, geth's reason) or bytes that are no transaction
+            // (REFUSED → -32602). Unavailable on no-peer (→ strict -32000).
             return handle.sendRawTransactionDetailedVerified(toHex(rawTx));
         } catch (RuntimeException e) {
             log.debug("[engines] sendRawTransaction failed: {}", e.getMessage());
@@ -506,6 +509,26 @@ final class RustVerifiedReads implements VerifiedReads {
         } catch (RuntimeException e) {
             log.info("[engines] verified eth_call (transaction object) unavailable: {}", e.getMessage());
             return io.myotis.api.CallResult.unavailable(e.getMessage());
+        }
+    }
+
+    @Override
+    public boolean supportsAccessListCreation() {
+        return true;   // the revm executor traces and confirms the list (ABI >= 40)
+    }
+
+    @Override
+    public io.myotis.api.AccessListResult createAccessList(io.myotis.api.TransactionArgs tx, String block,
+                                                           String stateOverridesJson) {
+        // As callTx: no host-side block guard — the engine applies the selector
+        // and every field of the canonical object, or refuses it as the
+        // permanent {"error","code":-32602} the handle returns as REFUSED.
+        try {
+            return handle.createAccessListVerified(
+                    tx.json(), block, stateOverridesJson == null ? "" : stateOverridesJson);
+        } catch (RuntimeException e) {
+            log.info("[engines] verified eth_createAccessList unavailable: {}", e.getMessage());
+            return io.myotis.api.AccessListResult.unavailable(e.getMessage());
         }
     }
 

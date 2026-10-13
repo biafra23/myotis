@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 39; // 39: set_dns_discovery (the EIP-1459 DNS discovery switch, #539)
+    static final int EXPECTED_ABI_VERSION = 45; // 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
 
     private static final boolean AVAILABLE = load();
 
@@ -87,11 +87,16 @@ final class RustEngineNative {
             return false;
         } catch (Throwable t) {
             // Library FOUND but failed UniFFI's contract/checksum validation (stale or
-            // reshaped .so) — louder than the missing-library case on purpose.
+            // reshaped .so) — louder than the missing-library case on purpose. The
+            // bindings run those checks in a static initializer, so what arrives here is
+            // usually an ExceptionInInitializerError that says nothing by itself: name its
+            // cause, and log the trace (the trailing throwable) for anything else.
+            Throwable reason = t instanceof ExceptionInInitializerError && t.getCause() != null
+                    ? t.getCause() : t;
             log.warn("[engines] libmyotis_engine failed UniFFI validation ({}); "
                     + "Rust engine unavailable — rebuild the library (cargoBuildHost / "
                     + "cargoNdkAndroid) or regenerate the bindings (uniffiGenerateKotlin)",
-                    t.toString());
+                    reason.toString(), t);
             return false;
         }
         log.info("[engines] libmyotis_engine loaded via UniFFI (ABI {})", EXPECTED_ABI_VERSION);
@@ -184,6 +189,17 @@ final class RustEngineNative {
      */
     static int nativeTorStatus() {
         return Myotis_engineKt.torStatus();
+    }
+
+    /**
+     * Name the absolute directories the embedded Tor client keeps its state and
+     * directory cache in (required on Android before the first Tor read). True iff
+     * the client will use exactly these; false for a relative path, a different pair
+     * once a bootstrap holds its directories, or a Tor-less library.
+     */
+    static boolean nativeSetTorStorageDirs(String stateDir, String cacheDir) {
+        // nz(): null or malformed UTF-16 becomes "", which the engine refuses (not absolute).
+        return Myotis_engineKt.setTorStorageDirs(nz(stateDir), nz(cacheDir));
     }
 
     /**
@@ -327,6 +343,17 @@ final class RustEngineNative {
         return Myotis_engineKt.ethCallTxJson(handle, nz(tx), nz(block), nz(stateOverrides));
     }
 
+    /**
+     * Verified {@code eth_createAccessList} for the FULL transaction object (ABI
+     * >= 40) — the arguments of {@link #nativeEstimateGasTxJson}. The list the
+     * transaction touches with the gas the run made with it used, and that run's
+     * own revert or halt next to them; every field is applied or the request
+     * refused (-32602).
+     */
+    static String nativeCreateAccessListJson(long handle, String tx, String block, String stateOverrides) {
+        return Myotis_engineKt.createAccessListJson(handle, nz(tx), nz(block), nz(stateOverrides));
+    }
+
     /** Verified ENS forward resolution (name → address record), as JSON. */
     static String nativeResolveEnsJson(long handle, String name) {
         return Myotis_engineKt.resolveEnsJson(handle, nz(name));
@@ -352,6 +379,12 @@ final class RustEngineNative {
      *  (ABI 36: refused before broadcast, geth's txpool verdict) or an error object. */
     static String nativeSendRawTransactionJson(long handle, String rawTxHex) {
         return Myotis_engineKt.sendRawTransactionJson(handle, nz(rawTxHex));
+    }
+
+    /** The send gate on the bytes alone, no handle (ABI 45): {@code {"ok":true}}, the
+     *  permanent {@code {"error","code":-32602}} refusal, or an error object for bad hex. */
+    static String nativeCheckRawTransactionJson(String rawTxHex) {
+        return Myotis_engineKt.checkRawTransactionJson(nz(rawTxHex));
     }
 
     /** Verified {@code eth_getTransactionReceipt} (receipt JSON / "null" / error). */

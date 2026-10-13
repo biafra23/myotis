@@ -1,7 +1,18 @@
 package io.myotis.desktop
 
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.window.Notification
+import androidx.compose.ui.window.Tray
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
+import androidx.compose.ui.window.isTraySupported
+import androidx.compose.ui.window.rememberTrayState
+import androidx.compose.ui.window.rememberWindowState
 import io.myotis.ui.NodeScreen
 import java.nio.file.Path
 
@@ -41,16 +52,6 @@ fun main() {
     if (poc != null && System.getProperty("myotis.logdir") == null) {
         System.setProperty("myotis.logdir", dataDir.resolve("logs").toString())
     }
-    // macOS naps a GUI app whose window is hidden — and this one serves JSON-RPC to other
-    // processes, so hold a user-initiated activity for the process lifetime (AppNap.kt).
-    // After the logdir property: the outcome is the first line of a start's log.
-    if (AppNap.isMac) {
-        val held = AppNap.disable("Myotis serves JSON-RPC on localhost")
-        org.slf4j.LoggerFactory.getLogger("io.myotis.desktop.Main").info(
-            if (held) "App Nap disabled for this process (NSProcessInfo activity held)"
-            else "App Nap NOT disabled — RPC may stall while the window is hidden",
-        )
-    }
     val settingsFile = dataDir.resolve("settings.properties")
     val firstStart = !java.nio.file.Files.exists(settingsFile)
     poc?.installSeedsIfAbsent(resourcesDir, dataDir)
@@ -58,6 +59,21 @@ fun main() {
     val settings = DesktopSettings(file = settingsFile)
     poc?.applyFirstStartSettings(settings, firstStart)
     val controller = DesktopNodeController(dataDir, settings)
+    // macOS naps a GUI app whose window is hidden — and this one serves JSON-RPC to other
+    // processes, so unless Settings → Power → "Sleep when not in focus" allows it, hold a
+    // user-initiated activity for the process lifetime (AppNap.kt). After the logdir
+    // property and the settings read, before anything starts: the outcome is one of the
+    // first lines of a start's log.
+    if (AppNap.isMac) {
+        controller.applyAppNap()
+        org.slf4j.LoggerFactory.getLogger("io.myotis.desktop.Main").info(
+            when {
+                AppNap.active -> "App Nap disabled for this process (NSProcessInfo activity held)"
+                settings.allowAppNap() -> "App Nap allowed (Settings → Power → Sleep when not in focus)"
+                else -> "App Nap NOT disabled — RPC may stall while the window is hidden"
+            },
+        )
+    }
     // Apply the persisted engine choice BEFORE the first network start, so a saved
     // Rust-engine preference survives a restart (Android parity: NodeService applies
     // it at service start). Networks keep the engine that created them. An explicit
@@ -76,16 +92,86 @@ fun main() {
     val history = DesktopQueryHistory(dataDir.resolve("query-history.tsv"))
     settings.enabledNetworks().forEach(controller::startNetwork)
 
+    // The window title names the flavour, so two PoC builds running side by side are
+    // distinguishable at a glance (they already own separate data dirs). The tray uses it too.
+    val appTitle = poc?.let { "Myotis ${it.label}" } ?: "Myotis"
+
     application {
+        val windowState = rememberWindowState()
+        val trayState = rememberTrayState()
+        // Bumped by a click on the tray icon or its menu (and, on Windows, its notification):
+        // bring the window forward on the Status tab, where a refused page has its Allow.
+        var showRequests by remember { mutableStateOf(0) }
+        // A click on a notification does not reach onAction everywhere (macOS activates the
+        // app instead), so an announcement also arms this: the next time the window gains
+        // focus, however the user got there, it opens on the Status tab.
+        var statusOnFocus by remember { mutableStateOf(false) }
+        var focusReturns by remember { mutableStateOf(0) }
+        // The tray icon: a Show / Quit menu, and the notification route wherever macOS's
+        // Notification Center is not (below).
+        if (isTraySupported) {
+            Tray(
+                icon = MyotisTrayIcon,
+                state = trayState,
+                tooltip = appTitle,
+                onAction = { showRequests++ },
+                menu = {
+                    Item("Show $appTitle", onClick = { showRequests++ })
+                    Item("Quit $appTitle", onClick = { controller.shutdown(); exitApplication() })
+                },
+            )
+        }
         Window(
+            state = windowState,
             // Tear down the in-process node stack (Netty event loops, libp2p, sync threads)
             // before exiting so closing the window doesn't leak resources or hang shutdown.
             onCloseRequest = { controller.shutdown(); exitApplication() },
-            // The window title names the flavour, so two PoC builds running side by side
-            // are distinguishable at a glance (they already own separate data dirs).
-            title = poc?.let { "Myotis ${it.label}" } ?: "Myotis",
+            title = appTitle,
         ) {
-            NodeScreen(controller, settings, DesktopLogSource, history = history)
+            LaunchedEffect(showRequests) {
+                if (showRequests > 0) {
+                    windowState.isMinimized = false
+                    window.toFront()
+                    window.requestFocus()
+                }
+            }
+            DisposableEffect(window) {
+                val listener = object : java.awt.event.WindowAdapter() {
+                    override fun windowGainedFocus(e: java.awt.event.WindowEvent) {
+                        if (statusOnFocus) {
+                            statusOnFocus = false
+                            focusReturns++
+                        }
+                    }
+                }
+                window.addWindowFocusListener(listener)
+                onDispose { window.removeWindowFocusListener(listener) }
+            }
+            LaunchedEffect(Unit) {
+                // Where a refused web page is announced (DesktopAlerts.kt): Notification Center
+                // in a packaged macOS app, the tray icon's notification on other desktops with a
+                // tray; a desktop with neither (GNOME, by default) keeps it in the window. Chosen
+                // here, once the window exists: MacNotifications must not be set up before
+                // NSApplication has finished launching. Its start() also asks for permission,
+                // which is what lists Myotis in System Settings → Notifications.
+                val notifier = when {
+                    MacNotifications.start() -> DesktopNotifier(MacNotifications::post)
+                    isTraySupported -> DesktopNotifier { title, message ->
+                        trayState.sendNotification(Notification(title, message, Notification.Type.Info))
+                        true
+                    }
+                    else -> null
+                }
+                watchWebRefusals(controller, settings, notifier, window) {
+                    // Already in front: the user sees the banner if Status is open; arm
+                    // only for a window the user has to come back to.
+                    if (!window.isFocused) statusOnFocus = true
+                }
+            }
+            NodeScreen(
+                controller, settings, DesktopLogSource, history = history,
+                statusRequests = showRequests + focusReturns,
+            )
         }
     }
 }

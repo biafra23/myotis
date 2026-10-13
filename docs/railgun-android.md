@@ -4,7 +4,7 @@ How to load the RAILGUN PoC seed ([railgun-poc.md](railgun-poc.md)) into the
 Android app's log index. Afterwards a wallet on the same phone can scan
 RAILGUN's history through Myotis's JSON-RPC on `127.0.0.1`. Android has no
 RAILGUN flavour like the desktop dmg. This guide uses the generic
-**Import log-index snapshot…** button on the Index tab, which takes any portable
+**Import log-index snapshot…** button on the Index tab (Settings → Expert mode), which takes any portable
 MLIX snapshot. A seed framed by `scripts/synth_logindex.py` is one, and the Rust
 test `synth_logindex_script_frame_is_importable` (`el/logindex.rs`) checks that
 the portable loader accepts it.
@@ -15,8 +15,8 @@ with no receipt-root proof, and the engine serves it exactly like logs it
 walked and verified itself. The seeded-history exception (CLAUDE.md, owner's
 decision 2026-09-25; [seeded-log-histories.md](seeded-log-histories.md)) does
 not cover it. On Android it is also **unlabelled**: the desktop flavour shows a
-"seeded, unverified" notice on the Index tab from its bundled manifest
-(`seededIndexNotice`), but an Android import has no manifest, so nothing on the
+notice on the Index tab that its index is seeded and unverified, from its bundled
+manifest (`seededIndexNotice`), but an Android import has no manifest, so nothing on the
 phone says where the coverage came from.
 
 ## What you need
@@ -123,9 +123,11 @@ entry.
    its own watch entry. The engine unions watch entries and keeps the **lower**
    from-block (`LogIndexConfig::union_with`). So a hand-typed earlier block
    reaches below the seed's coverage, and queries into that band are refused
-   until the backfill walks it. Subscriptions are add-only
-   ([eth-getlogs-design.md](eth-getlogs-design.md) §Import), so this cannot be
-   undone short of deleting the index.
+   until the backfill walks it. Pushes and imports only ever add
+   ([eth-getlogs-design.md](eth-getlogs-design.md) §Import); the one way back
+   is **Remove** on the Index tab, which deletes the contract's collected logs
+   with its entry — the seed's included — so the seed must then be imported
+   again.
 
    The commonly quoted mainnet block 14,693,013 is exactly that mistake, and the
    retired built-in Kohaku preset used it. An install that once had the preset on
@@ -143,9 +145,11 @@ entry.
    behind the head, nothing catches it up again (*Shelf life* below).
 4. **Keep the node awake for the catch-up in step 5.** Idle sleep stops all P2P
    networking after 5 minutes without RPC or UI activity. That does not happen
-   while the phone is charging and online (**Stay awake while charging**, on by
-   default). Otherwise set **Idle sleep after (minutes, 0 = never)** to 0 until
-   the catch-up is done.
+   while the phone is charging on an unmetered network such as home Wi-Fi
+   (**Stay awake while charging**, on by default). Charging alone is not
+   enough: on mobile data or a metered hotspot the node sleeps even while
+   plugged in. In that case, or with the setting off, set **Idle sleep after
+   (minutes, 0 = never)** to 0 until the catch-up is done.
 
 ## 4. Import
 
@@ -265,5 +269,6 @@ defaults.
   Settings → Apps → Myotis → Storage → **Clear cache**. That wipes the index
   together with the peer caches and the sync snapshot, which rebuild
   themselves. Identity and query history are in the app's files directory and
-  survive. Removing the entry from the Index tab's watch list does not
-  unsubscribe an index that already holds it.
+  survive. To drop only the RAILGUN proxy, use **Remove** on the Index tab
+  instead: it deletes that contract's entry, coverage and logs from the index
+  and leaves the other contracts' alone.
