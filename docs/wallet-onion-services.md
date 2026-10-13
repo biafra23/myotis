@@ -190,7 +190,7 @@ reason:
   `el/enrfilter.rs`); the Rust discv5 record starts with no address
   (`spawn`, `discovery.rs`), the Java one with `0.0.0.0` and its UDP port
   (`DiscV5Service`). discv5's address voting can later fill in the external
-  address the wallet's own PONGs report, but for a phone that is its
+  address that peers' PONGs report back, but for a phone that is its
   carrier's CGNAT, which passes UDP only from hosts the phone has itself just
   sent to. Another wallet cannot originate the ping — the same wall
   `inbound-connections.md` §2 describes for TCP. (A desktop behind a home
@@ -229,20 +229,24 @@ clearnet:
 | Discovery idea | Inside Tor | What it tells | Cost |
 |---|---|---|---|
 | "a myotis node" from its ENR | the onion address, learned only from the overlay (seeds, peer exchange) | everything the overlay hands out is a myotis wallet, by construction | nothing public |
-| a fresh record or table entry | the service's descriptor on the HSDirs, fetched with the address | the service published within the descriptor's lifetime (C tor and current Arti both set 3 h — Arti's `IPT_PUBLISH_CERTAIN`, `tor-hsservice/src/ipt_mgr.rs`; the format allows 30 min–12 h, `descriptor-lifetime`). A stopped service's descriptor is not withdrawn; it expires | one HSDir fetch. Anyone holding the address learns the same (the presence leak under *And it must be a separate identity*) |
+| a fresh record or table entry | the service's descriptor on the HSDirs, fetched with the address | the service published within the descriptor's lifetime: 3 h in C tor (`HS_DESC_DEFAULT_LIFETIME`) and in Arti since 1.2.0 (`IPT_PUBLISH_CERTAIN`, `tor-hsservice/src/ipt_mgr.rs`, checked at arti 2.4.0 and 2.7.0; Arti 1.1.x used 30 min and 12 h). The format allows 30 min–12 h (`descriptor-lifetime`). A stopped service's descriptor is not withdrawn; it expires | one HSDir fetch. Anyone holding the address learns the same (the presence leak under *And it must be a separate identity*) |
 | ping / pong | the dial itself: INTRODUCE1 through an introduction point, then the rendezvous | a completed rendezvous means awake. `NOT_RECOGNIZED` ("does not have a live circuit from the identified service", Arti's `IntroduceAckStatus`) speaks for one intro point only — a service that just rebuilt its circuits gets it from the old ones, and Arti retries it after waiting. From every intro point of a freshly fetched descriptor, it means gone | an intro and a rendezvous circuit, seconds. So don't probe separately: dial when there is something to fetch, and treat a dial that fails at every intro point of a fresh descriptor as the answer |
 | neighbours seen recently | peer-exchange entries carrying when that wallet last served, signed by its overlay key | which onions to try first | the same presence timeline, now shared with the overlay rather than with whoever holds the address |
 
 **For the dial to be an honest ping, a wallet must stop its service before it
-pauses.** A process frozen with its introduction circuits up still looks
-alive to its intro points until the first relay of each circuit notices the
-dead connection (keepalive and TCP timeouts: minutes). Until then the intro
-points relay INTRODUCE2 and answer SUCCESS, and the client waits out its
-rendezvous timeout instead of getting `NOT_RECOGNIZED` at once. Stopping the
-service closes those circuits. The host has a chance to do that at both
-pause points: on Android the idle-pause is myotis's own decision, and iOS
-gives an app a few seconds when it moves to the background. Only a process
-frozen without notice still costs dialers that timeout, for those minutes.
+pauses.** A frozen process's TCP connections live on in the kernel, which
+keeps acknowledging what the first relay sends, so its introduction
+circuits look alive to the intro points until the path breaks (a network
+switch or an expired NAT mapping, then minutes of TCP retransmission) or the
+process is killed. On the charger, the serving window, Doze does not apply,
+so that can be a long time. Until then the intro points relay INTRODUCE2 and
+answer SUCCESS, and every dialer waits out its rendezvous timeout instead of
+getting `NOT_RECOGNIZED` at once. Stopping the service closes those
+circuits. The host has a chance to do that at both pause points it
+controls: on Android the idle-pause is myotis's own decision, and iOS gives
+an app a few seconds when it moves to the background. Only a freeze the
+host gets no notice of still leaves dialers with that timeout, for as long
+as the freeze lasts.
 
 ## Identity: can myotis peer ids be ed25519?
 
