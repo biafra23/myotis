@@ -339,9 +339,11 @@ open class PocFlavour(
      * What becomes of the seeded span, for [seededIndexNotice]. A seed ships no walk cursor,
      * so the index serves it exactly as fetched and never re-checks it on load
      * (`import_log_index` / `LogIndex::merge` in `rust/myotis-net`). The one thing that can
-     * revisit it is the downward backfill walk: the appender seeds the walk's trust edge
-     * above the seed, so a walk that still has blocks to cover below it descends THROUGH the
-     * seeded span first, verifying each block and adding what it finds — but it never
+     * revisit it is the downward backfill walk: the first head-follow append seeds the
+     * walk's trust edge above the seed (none comes while the head is beyond the bridge's
+     * reach — an expired seed — and then the walk does not run at all), so a walk that still
+     * has blocks to cover below it descends THROUGH the seeded span first, verifying each
+     * block and adding what it finds — but it never
      * removes a log, so one the seed invented stays. A seed that reaches its contract's
      * deployment block leaves the walk nothing to cover below it, so (with no other watch
      * entry still short of its own deployment) nothing passes through it.

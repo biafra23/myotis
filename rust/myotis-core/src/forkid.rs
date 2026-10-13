@@ -14,7 +14,7 @@
 //!
 //! The CRC32 chain arithmetic itself lives here too ([`crc32_update`],
 //! [`successor`], [`activation_of`]) — never to compute our id from genesis,
-//! only to step it across one known activation ([`fork_id_at`]) and so the
+//! only to step it across one known activation ([`fork_id_at`]) and so that the
 //! fork watch (`myotis_net::el::fork_watch`, twin of Java `ForkIds`/`ForkWatch`)
 //! can recover, from our pin and a peer's unknown hash, the activation that
 //! would turn one into the other. CRC32 resumes from its own checksum, so the

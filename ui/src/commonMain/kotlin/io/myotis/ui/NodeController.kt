@@ -571,8 +571,10 @@ data class NodeSnapshot(
     // did not fetch it: Android never fills it, and desktop/iOS leave it null
     // only when the status fetch itself failed.
     val logIndex: String? = null,
-    // Raw engine status JSON for the Index tab (null when the feature is off
-    // or the engine is unavailable); parsed via [LogIndexStatus.parse].
+    // Raw engine status JSON for the Index tab, fetched for every running chain
+    // regardless of the Settings flag (so a disabled index or the Java engine
+    // carries the `{"enabled":false,…}` default, a paused handle an `{"error":…}`);
+    // null only when the host could not fetch it. Parsed via [LogIndexStatus.parse].
     val logIndexJson: String? = null,
     // Raw read-fetch shadow-cache JSON (ChainHandle.readStatsJson(), schema 1 —
     // docs/read-stats.md) for the Status tab's "Reads" rows; null when the host

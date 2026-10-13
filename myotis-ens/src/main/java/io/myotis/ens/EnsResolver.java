@@ -111,7 +111,8 @@ public final class EnsResolver {
     /**
      * Construct against non-default contract addresses. Useful for
      * testnets and for unit tests that mock the resolver chain.
-     * {@code universalResolver} is not consulted (see the field). The {@code .eth}
+     * {@code universalResolver} is not consulted: no read calls the Universal Resolver
+     * (forward reads walk the Registry, ENSIP-10). The {@code .eth}
      * registrar is one address on every ENS chain; the NameWrapper is not known here
      * (a wrapped name's holders then read as the wrapper contract itself).
      */
