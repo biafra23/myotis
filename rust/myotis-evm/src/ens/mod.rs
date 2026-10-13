@@ -1,23 +1,26 @@
-//! ENS resolution (EL-C-5): forward `name → address` over verified `eth_call`s.
+//! ENS resolution (EL-C-5) over verified `eth_call`s.
 //!
 //! Mirrors the Java `EnsResolver` direct registry-walk (NOT the Universal
 //! Resolver): find the resolver for the name (or an ancestor, for ENSIP-10
 //! wildcard), detect a wildcard/extended resolver via `supportsInterface`, then
-//! call `addr(bytes32)` directly (legacy) or wrap it in `resolve(bytes,bytes)`
-//! (ENSIP-10). Every step is an `eth_call` against verified state, abstracted
-//! behind [`EthCaller`] so the walk is unit-testable without a node.
+//! call the record method (`addr(bytes32)`, …) directly (legacy) or wrap it in
+//! `resolve(bytes,bytes)` (ENSIP-10). Every step is an `eth_call` against
+//! verified state, abstracted behind [`EthCaller`] so the walk is unit-testable
+//! without a node.
 //!
-//! Scope of this slice: forward address resolution only. Reverse + forward-verify
-//! and CCIP-Read (`OffchainLookup`) offchain resolution are later slices — an
-//! `OffchainLookup` revert surfaces as the distinguishable
-//! [`EnsError::OffchainLookup`] (never folded into "no record"); driving the
-//! gateway arrives with CCIP (EL-C-5-3).
+//! Scope: forward records ([`resolve_address`] and the other `resolve_*`
+//! record types), [`resolve_ownership`], and reverse resolution
+//! ([`reverse_resolve`], forward-verified through the full forward path).
+//! CCIP-Read: an `OffchainLookup` revert surfaces as the distinguishable
+//! [`EnsError::OffchainLookup`] carrying the decoded tuple (never folded into
+//! "no record"); the HOST drives the gateway — HTTP stays outside this crate —
+//! and re-enters through [`ccip_callback`] (EL-C-5-3).
 //!
-//! One deliberate divergence from the Java `EnsResolver`: a NON-revert failure
-//! (state unavailable, halt) during the walk or `supportsInterface` probe
-//! propagates as [`EnsError::Call`] here, where Java folds it into "keep
-//! walking" / `false`. Failing closed is the safer contract — missing state must
-//! never read as "name unregistered".
+//! Both engines fail closed: a NON-revert failure (state unavailable, halt)
+//! during the walk or the `supportsInterface` probe propagates — as
+//! [`EnsError::Call`] here, as a failed future from the Java `walkResolver` /
+//! `decodeSupportsInterface` — and only a revert continues the walk or reads as
+//! "not extended". Missing state must never read as "name unregistered".
 
 mod abi;
 mod name;

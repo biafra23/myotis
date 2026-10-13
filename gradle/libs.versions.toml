@@ -57,7 +57,7 @@ dnsjava = "3.6.2"
 # (evm → besu-evm; internal:algorithms → internal:besu-crypto-algorithms) —
 # probing the old names 404s and looks like publishing stopped; it didn't.
 # Bumping requires a fork-rule audit in EvmFactory, a pass over
-# docs/besu-extraction.md, AND rebasing the Android ART fork
+# docs/evm/besu-extraction.md, AND rebasing the Android ART fork
 # (biafra23/besu, tag <ver>-android.N — android-app substitutes it in).
 besu = "26.4.0"
 # JNA (the UniFFI bindings' loader). 5.18.1 matches Besu's transitive jna so the

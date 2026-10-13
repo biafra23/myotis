@@ -26,9 +26,12 @@ import org.slf4j.LoggerFactory;
  *
  * <p><b>Head-anchored.</b> The Rust reader verifies against the peer's fresh head
  * (the CL-anchored latest state), so state reads resolve to that head. A selector
- * of {@code latest}/{@code pending}/{@code safe}/default, OR a specific number
+ * of {@code latest}/{@code pending}/default, OR a specific number
  * within {@code [head-64, head+16]} (wallets pin reads to the just-fetched
- * latest number), is served from the verified head. {@code finalized} is
+ * latest number), is served from the verified head. {@code safe} and
+ * {@code earliest} are never served — no engine tracks the safe head or holds
+ * genesis: the JSON-RPC router refuses {@code safe} with a permanent error, and
+ * the shared block window ({@code RpcBlockWindow}) refuses both (#366). {@code finalized} is
  * APPLIED everywhere on this engine: by {@code call}, {@code getBlockByNumber},
  * {@code getBlockReceipts} and {@code feeHistory} since ABI 30 (#465), and by the
  * account/code/storage/nonce reads since ABI 32 (#366) — they run against, or

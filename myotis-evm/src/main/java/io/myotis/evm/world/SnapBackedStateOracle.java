@@ -194,10 +194,16 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
         });
     }
 
-    /** Max path-sets (accounts) per GetTrieNodes request. Bounds the response size a
-     *  peer must assemble (each path-set is ~one account proof + its slot proofs ≈
-     *  several KB), keeping any one request servable while still collapsing a
-     *  1000-account sweep from ~1000 round-trips to ~16. */
+    /** Max path-sets (accounts) per {@code getTrieNodes} call: one peer's share of a
+     *  sweep, verified and retried on another peer as a unit, so it bounds what one
+     *  failed chunk costs (each path-set is ~one account proof + its slot proofs ≈
+     *  several KB). It does not cut requests: the adapter ({@code EthHandlerSnapPeer})
+     *  sends one {@code GetAccountRange} per account path-set and one
+     *  {@code GetStorageRanges} per slot, so a 1000-account sweep is still ~1000 snap
+     *  requests. What the batch saves is waiting: its ~16 chunks go out together and
+     *  each chunk's requests run concurrently, instead of one sequential read per
+     *  account — capped on the heavy EVM lane, where {@code SnapLaneGate} admits only
+     *  so many chunk calls at a time. */
     private static final int BATCH_PATHSET_CHUNK = 64;
 
     /** Per-account batch work: the address + its hash + the UNCACHED slots wanted

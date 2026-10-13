@@ -1,6 +1,7 @@
 //! The CL→EL execution anchor (EL-A7), twin of the Java
 //! `consensus.BeaconSyncState` — the SOLE trust hand-off from the beacon light
-//! client to the execution layer (docs/reimplementation/04 §3, README §3).
+//! client to the execution layer (docs/reimplementation/07, *The CL→EL anchor
+//! (`ExecAnchor`)*; README §3; docs/verification.md).
 //!
 //! Holds the beacon-verified execution anchor: the finalized execution
 //! `{block_number, block_hash, state_root, slot}`, the optimistic (attested)

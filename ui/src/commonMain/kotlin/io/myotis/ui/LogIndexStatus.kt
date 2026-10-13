@@ -142,6 +142,9 @@ object LogIndexStatus {
 
     private val COVERED_HIGH = Regex("\"coveredHigh\":\\d")
 
+    /** The message of an engine error envelope (`eljson::error_json`). */
+    private val ERROR_MESSAGE = Regex("\"error\":\"((?:[^\"\\\\]|\\\\.)*)\"")
+
     /** True when [gap] is past the engine's serving slack: head-reaching
      *  `eth_getLogs` is refused. */
     fun refusesHeadQueries(gap: Long): Boolean = gap > NORMAL_HEAD_LAG
@@ -262,9 +265,23 @@ object LogIndexStatus {
         }
     }
 
-    /** Short status line, or a waiting note when the engine has no index yet. */
+    /**
+     * Short status line for the Status screen's Log index row. Desktop and iOS
+     * fill that row for every chain, ungated by the Settings flag, so this has
+     * to name more than an enabled index's progress:
+     * - `off` for `{"enabled":false,…}`: an index switched off, none configured
+     *   at all, or the Java engine, which has none and answers that same
+     *   default;
+     * - `unavailable — <reason>` for the engine's `{"error":…}` (a paused or
+     *   not yet started handle), or plain `unavailable` for anything else that
+     *   is not a status ([isStatus]).
+     */
     fun format(json: String): String {
-        if (!json.contains("\"enabled\":true")) return "enabled \u2014 waiting for engine"
+        if (!isStatus(json)) {
+            val reason = ERROR_MESSAGE.find(json)?.groupValues?.get(1)?.let(::unescapeJson)
+            return if (reason.isNullOrBlank()) "unavailable" else "unavailable \u2014 $reason"
+        }
+        if (!json.contains("\"enabled\":true")) return "off"
         val count = Regex("\"logCount\":(\\d+)").find(json)?.groupValues?.get(1) ?: "0"
         val entries = Regex("\"address\":").findAll(json).count()
         val lows = Regex("\"coveredLow\":(\\d+)").findAll(json).map { it.groupValues[1].toLong() }.toList()

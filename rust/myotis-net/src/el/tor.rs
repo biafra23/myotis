@@ -18,10 +18,15 @@
 //! Scope (matches the design's §4 split): only the sensitive flows are routed
 //! here — account reads, and the broadcast of the wallet's own transactions.
 //! Discovery and clearnet snap-peer validation stay on the real IP.
-//! What is NOT here yet: the quarantined peer pool + aging window (§5) and
-//! multi-source popularity promotion (§6.2) — this reuses whatever the clearnet
-//! pool already validated. Enabling Tor is therefore a network-privacy win
-//! (peer/exit see a Tor exit IP, never the user's) but not yet the full
+//! The peers come only from the Tor reserve (`el::torreserve`, a first step
+//! toward §5's quarantined pool): verified snap servers moved out of the peer
+//! cache, which the pool never dials directly again, each usable over Tor
+//! only `TOR_DIRECT_SEPARATION` after its last direct contact
+//! (`PeerPool::tor_candidates` / `claim_for_tor`); with no
+//! ready node the read or send fails closed. What is NOT here yet: §5's
+//! days-long randomized aging window and batch rotation, and multi-source
+//! popularity promotion (§6.2). Enabling Tor is therefore a network-privacy
+//! win (peer/exit see a Tor exit IP, never the user's) but not yet the full
 //! unlinkability the design targets.
 
 use std::collections::HashMap;

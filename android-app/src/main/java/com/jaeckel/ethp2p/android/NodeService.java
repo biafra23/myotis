@@ -677,10 +677,11 @@ public final class NodeService extends Service {
         io.myotis.engines.Engines.select(choice);
         return choice;
     }
-    /** Settings toggle: route account (balance/nonce) reads over Tor (docs/privacy-and-tor.md).
-     *  Default off. Experimental and Rust-engine-only, and only a {@code -PtorEngine} build can
-     *  honour it ({@link #torSupported}) — the Settings row is shown only there, so a Tor-less
-     *  build never offers a privacy switch it would ignore. Applied by {@link #applyTorMode}. */
+    /** Settings toggle: route account (balance/nonce) reads and the broadcast of the wallet's
+     *  own transactions over Tor (docs/privacy-and-tor.md). Default off. Experimental and
+     *  Rust-engine-only, and only a {@code -PtorEngine} build can honour it
+     *  ({@link #torSupported}) — the Settings row is shown only there, so a Tor-less build
+     *  never offers a privacy switch it would ignore. Applied by {@link #applyTorMode}. */
     public static boolean torEnabled(android.content.Context c) {
         return prefs(c).getBoolean(K_TOR_ROUTING, false);
     }
@@ -705,23 +706,24 @@ public final class NodeService extends Service {
     }
     /** Serializes {@link #applyTorMode}'s read-the-pref-then-push: it runs on boot workers
      *  and on the UI thread (the Settings switch), and an older value pushed after a newer
-     *  one would leave reads on the clearnet pool while the switch shows ON. */
+     *  one would leave reads and sends on the clearnet pool while the switch shows ON. */
     private static final Object TOR_APPLY_LOCK = new Object();
 
     /** Push the Tor setting to the process-global Rust-engine flag. LIVE, unlike the engine
-     *  choice: the engine checks the flag per read, so the next account read of a running
-     *  Rust-engine network routes over Tor (or stops doing so) with no restart. Turning it on
-     *  names Arti's directories first; an OFF that never followed an ON stays a no-op that
-     *  does not load the native library ({@code Tor.select}). Re-applied on each boot of a
+     *  choice: the engine checks the flag per read and per send, so the next account read or
+     *  send of a running Rust-engine network routes over Tor (or stops doing so) with no
+     *  restart. Turning it on names Arti's directories first; an OFF that never followed an
+     *  ON stays a no-op that does not load the native library ({@code Tor.select}).
+     *  Re-applied on each boot of a
      *  network the Rust engine may host (not under a forced Java engine, which has no Tor
      *  path), because the flag lives in the native library and so starts off in every new
      *  process.
      *  Returns the verdict for the boot log: {@code off}, {@code on}, {@code unsupported}
      *  (ON in Settings, but no Tor in this build — a pref left over from a {@code -PtorEngine}
      *  install, whose Settings row this build hides; like the desktop with a Tor-less dylib,
-     *  reads stay on the clearnet pool because this engine has no Tor path to refuse with),
-     *  or {@code storage refused} (ON, but Arti cannot bootstrap: reads routed over Tor fail
-     *  closed — never quietly fall back to the clearnet pool). */
+     *  reads and sends stay on the clearnet pool because this engine has no Tor path to refuse
+     *  with), or {@code storage refused} (ON, but Arti cannot bootstrap: reads and sends routed
+     *  over Tor fail closed — never quietly fall back to the clearnet pool). */
     public static String applyTorMode(android.content.Context c) {
         synchronized (TOR_APPLY_LOCK) {
             boolean on = torEnabled(c);
@@ -732,14 +734,14 @@ public final class NodeService extends Service {
             if (!torSupported()) {
                 LogBuffer.w(TAG, "Tor routing is ON in Settings but this build has no Tor "
                         + "support (needs an APK built with -PtorEngine, with the Rust engine): "
-                        + "account reads use the clearnet peer pool");
+                        + "account reads and sends use the clearnet peer pool");
                 return "unsupported"; // nothing to push: no Tor path exists in this engine
             }
             boolean stored = io.myotis.engines.Tor.configureStorage(
                     torStateDir(c).getAbsolutePath(), torCacheDir(c).getAbsolutePath());
             if (!stored) {
-                LogBuffer.w(TAG, "Tor storage directories refused: reads routed over Tor "
-                        + "will fail closed");
+                LogBuffer.w(TAG, "Tor storage directories refused: reads and sends routed "
+                        + "over Tor will fail closed");
             }
             if (!io.myotis.engines.Tor.select(true)) {
                 // torSupported() said yes a moment ago; only a failing native call lands here.

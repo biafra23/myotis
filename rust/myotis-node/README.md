@@ -280,7 +280,9 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   first call on a directory records the anchor in `sync-anchor[-net].json`
   next to the snapshot; a later call with the **same root and slot resumes**
   that generation under the normal rules (a snapshot strictly newer than the
-  checkpoint is restored and re-verified, otherwise it bootstraps again), so a
+  checkpoint is restored without re-verifying what it holds and stays on probation until
+  an update verifies against it — eight rejects in a row discard it and
+  re-bootstrap from the checkpoint; otherwise it bootstraps again), so a
   restart never reverts to the embedded anchor and needs no extra flag. Any
   other root/slot, a directory that already holds a snapshot from the embedded
   anchor, or a plain `create()` on a marked directory returns **-3**

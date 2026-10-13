@@ -350,9 +350,13 @@ pub fn create(network_name: &str, data_dir: &str) -> i64 {
 /// anchor in `sync-anchor[-net].json` next to the snapshot, before any sync
 /// state exists. From then on the directory belongs to that anchor:
 /// - the same root and slot on a later call RESUMES it — the engine's normal
-///   rule applies (a persisted snapshot strictly newer than the checkpoint is
-///   restored and re-verified; otherwise it bootstraps from the checkpoint
-///   again), so a restart never reverts to the embedded anchor;
+///   rule applies (a persisted snapshot bound to this chain and strictly newer
+///   than the checkpoint is restored without re-verifying what it holds, and
+///   stays on probation —
+///   `ResumeGuard` in `myotis-net`'s `sync.rs` — until an update verifies
+///   against it; `RESUME_REJECTS_MAX` rejects in a row discard it and
+///   re-bootstrap from the checkpoint. Otherwise it bootstraps from the
+///   checkpoint again), so a restart never reverts to the embedded anchor;
 /// - a different root or slot, a directory whose snapshot predates the marker
 ///   (state from the embedded anchor), an unreadable marker, or a plain
 ///   [`create`] on a marked directory returns `ANCHOR_MISMATCH` (-3). Nothing
