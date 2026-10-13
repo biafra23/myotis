@@ -9,9 +9,8 @@ then a peer id *is* an onion address.** Related:
 [`inbound-connections.md`](inbound-connections.md) (accepting connections from
 full nodes; mobile kept outbound-only), [`privacy-and-tor.md`](privacy-and-tor.md)
 (the Tor client in the Rust engine), [`lc-server-design.md`](lc-server-design.md)
-(roost) and `docs/snap-server-design.md` (why snap is different; under
-review in [#623](https://github.com/biafra23/myotis/pull/623)). The open
-decisions at the end are the owner's.
+(roost) and [`snap-server-design.md`](snap-server-design.md) (why snap is
+different). The open decisions at the end are the owner's.
 
 ## TL;DR
 
@@ -97,8 +96,8 @@ Three conclusions:
   (a swarm of small roosts when roost and the public CL servers are scarce),
   not new capability.
 - **Snap stays a full-node problem.** A wallet relaying proofs it fetched
-  serves a perishable object (one block — measured in `snap-server-design.md`,
-  [#623](https://github.com/biafra23/myotis/pull/623))
+  serves a perishable object (one block — measured in
+  [`snap-server-design.md`](snap-server-design.md#measured-what-a-proof-weighs-and-how-long-it-lives))
   and publishes its owner's portfolio while doing it. Out.
 - **Bytecode and log-index data are verifiable but personal.** Serving them
   leaks what the owner uses; leave them out unless a wallet serves only
@@ -156,7 +155,7 @@ is good for privacy and means discovery must be built:
   Tor. Roost then knows which overlay identities are online and when — no
   IPs, but one operator holding the presence timeline of every participating
   wallet. Same concentration trade as the snap server's
-  ([#623](https://github.com/biafra23/myotis/pull/623)), on milder data —
+  ([`snap-server-design.md`](snap-server-design.md#the-proofs-privacy)), on milder data —
   and a new job for roost outside its carve-out: CLAUDE.md lets roost
   relay *self-verifying* consensus objects, and a directory of onion addresses
   is not self-verifying (a sybil-filled one steers discovery). It would need
