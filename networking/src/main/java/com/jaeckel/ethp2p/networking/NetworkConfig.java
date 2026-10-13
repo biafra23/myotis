@@ -195,6 +195,12 @@ public record NetworkConfig(
                     // row) and 91.189.182.90 closed the connection from the runner,
                     // and roost (9109) timed out in the transport handshake, as every
                     // zbox pin did that day (see the Rust twin).
+                    // Re-verified 2026-10-13 at the anchor v0.1.16 ships (period
+                    // 1882), run 38478939810: 2 of 5, the floor again — 84.112.35.112
+                    // and 54.201.148.177 served; 57.129.130.18 (its third close in a
+                    // row) and 91.189.182.90 closed the connection from the runner,
+                    // and so did roost (9109), while zbox's uplink was saturated by a
+                    // PoC seed upload (see the Rust twin).
                     // Mirror of the Rust MAINNET_STATIC_PEERS: keep the two lists
                     // and their ORDER in step (see the reasoning there).
                     "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
@@ -405,6 +411,11 @@ public record NetworkConfig(
             // Its dead-pins cold start bootstrapped through discovery but could
             // not report SYNCED without an EL resolver for the Gloas execution
             // header. Details in the Rust twin (SEPOLIA_STATIC_PEERS).
+            // Release check for v0.1.16 (2026-10-13), slot 11349696: roost served
+            // it on every attempt of run 38478944070; this Nimbus never let the
+            // runner in (dial failed, three attempts), sitting at its 25-peer cap,
+            // while its REST served the same 25,472-byte bootstrap. 1 of 2 — the
+            // owner decides. Details in the Rust twin (SEPOLIA_STATIC_PEERS).
             // Keep this list identical to SEPOLIA_STATIC_PEERS in
             // rust/myotis-net/src/sync.rs (both parity tests pin it).
             List.of(
@@ -532,6 +543,10 @@ public record NetworkConfig(
                     // 3724), run 37955473231: 7 of 8 — every public pin served; roost
                     // (9108) timed out in the transport handshake, then served the
                     // old-anchor walk 23 s later in the same job.
+                    // Re-verified 2026-10-13 at the anchor v0.1.16 ships (period
+                    // 3733), run 38478934518: 7 of 8 — every public pin served; roost
+                    // (9108) failed to dial while zbox's uplink was saturated by a PoC
+                    // seed upload.
                     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
                     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
                     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",

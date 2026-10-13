@@ -759,6 +759,20 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // Gloas, SYNCED also waits for the finalized execution header
     // (`feed_exec_anchor`), which only the EL peer pool resolves, and
     // live_cold_start runs the CL sync alone. The old-anchor walk did not run.
+    //
+    // Release check for v0.1.16 (2026-10-13), anchor slot 11349696, period
+    // 1385: run 38478944070, three attempts. The first found neither pin (dial
+    // failed, while zbox's uplink was saturated by a ~128 MB upload of the
+    // RAILGUN PoC seed). The second and third, after the upload, had roost
+    // serving the bootstrap (25,472 B) and the verified period-1385 update, and
+    // this Nimbus failing to dial: it sat at its --max-peers=25 cap (REST
+    // peer_count 25 connected), the reset-during-handshake caveat above, while
+    // its own REST served the same 25,472-byte bootstrap for this root. So the
+    // anchor is servable by both; the runner could not get a peer slot. 1 of 2
+    // against a floor of 2, the job stopped there, and neither the dead-pins
+    // cold start (which cannot report SYNCED on Gloas anyway, see v0.1.15) nor
+    // the old-anchor walk ran: the owner decides, as at v0.1.15. The
+    // bootnodes seeded discv5 (23 entries).
     "/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
 ];
 
@@ -856,6 +870,13 @@ const GNOSIS_STATIC_PEERS: &[&str] = &[
     // seeded discv5 (24 entries), a cold start with every pin unreachable
     // reached SYNCED in 35 s, and one from the recorded period-3596 anchor
     // (128 periods behind) in 35 s.
+    // Re-verified 2026-10-13 against the anchor v0.1.16 ships (period 3733):
+    // live_pins_alive run 38478934518 on a GitHub-hosted runner, 7 of 8 —
+    // every public pin served; roost (9108) failed to dial, while zbox's
+    // uplink was saturated by a ~128 MB upload of the RAILGUN PoC seed. The
+    // bootnodes seeded discv5 (20 entries), a cold start with every pin
+    // unreachable reached SYNCED in 35 s, and one from the recorded
+    // period-3596 anchor (137 periods behind) in 135 s.
     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
@@ -1007,6 +1028,16 @@ const MAINNET_STATIC_PEERS: &[&str] = &[
     // The bootnodes seeded discv5 (34 entries), a cold start with every pin
     // unreachable reached SYNCED in 30 s, and one from the recorded
     // period-1825 anchor (54 periods behind) in 15 s.
+    // Re-verified 2026-10-13 against the anchor v0.1.16 ships (period 1882):
+    // live_pins_alive run 38478939810 on a GitHub-hosted runner, 2 of 5 —
+    // the floor again. 84.112.35.112 and 54.201.148.177 served;
+    // 57.129.130.18 closed the connection from the runner for the third
+    // release in a row, and 91.189.182.90 for the second; roost (9109) closed
+    // it too, while zbox's uplink was saturated by a ~128 MB upload of the
+    // RAILGUN PoC seed. Recorded, not pruned: whether 57.129.130.18 goes is
+    // the owner's call. The bootnodes seeded discv5 (32 entries), a cold
+    // start with every pin unreachable reached SYNCED in 35 s, and one from
+    // the recorded period-1825 anchor (58 periods behind) in 145 s.
     "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
     "/ip4/84.112.35.112/tcp/9000/p2p/16Uiu2HAm6YkLaGLMH1Q9caGi4A2WctHPhENumfQMJXVCMVpc7GQY",
     "/ip4/91.189.182.90/tcp/9000/p2p/16Uiu2HAmJJUAs17wxW1i4HM5Fce1zYPCvvavxsYorWr4EQVx1Ui8",
