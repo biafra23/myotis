@@ -60,7 +60,10 @@ myotis-rpcd [--network gnosis|mainnet|sepolia]     # default gnosis
 - `GET /logindex` returns the engine's log-index status JSON (coverage per watch
   entry, backfill cursor, head gap).
 - Engine logs go to stderr. SIGINT and SIGTERM stop the engine handle cleanly,
-  and its sync state persists in the data dir.
+  and its sync state persists in the data dir. On Windows that is Ctrl+C or
+  Ctrl+Break; closing the console window or `taskkill /F` ends the process
+  without it. Windows also rarely sets `HOME`, which the default data dir is
+  built from, so pass `--data-dir` there.
 
 The HTTP side is deliberately synchronous: every engine read blocks (it may hold
 for a verified head), so a fixed pool of `--workers` threads each takes a
