@@ -54,8 +54,8 @@ import java.util.function.Function;
  * surface as {@code Reverted} errors carrying the {@code OffchainLookup}
  * selector — distinct from "name not found", so callers can tell whether
  * they forgot to wrap vs. whether the name is genuinely unregistered.
- * Generic UR reverts (ResolverNotFound and friends) still map to
- * {@link Optional#empty()}.
+ * A name with no resolver anywhere up the Registry walk, and any other revert
+ * from its resolver, map to {@link Optional#empty()}.
  */
 public final class EnsResolver {
 
@@ -94,13 +94,15 @@ public final class EnsResolver {
 
     private final EvmExecutor executor;
     private final Address registry;
+    /** Kept for the constructors' signatures only: no read calls the Universal Resolver
+     *  (forward reads walk the Registry, ENSIP-10; reverse reads it step by step). */
     private final Address universalResolver;
     /** The {@code .eth} registrar and the NameWrapper for {@link #resolveOwnership};
      *  null = not known for this chain (ownership then stops at the registry). */
     private final Address baseRegistrar;
     private final Address nameWrapper;
 
-    /** Default constructor: mainnet Registry + Universal Resolver. */
+    /** Default constructor: the mainnet contracts. */
     public EnsResolver(EvmExecutor executor) {
         this(executor, EnsAddresses.MAINNET_REGISTRY, EnsAddresses.MAINNET_UNIVERSAL_RESOLVER,
                 EnsAddresses.BASE_REGISTRAR, EnsAddresses.MAINNET_NAME_WRAPPER);
@@ -108,7 +110,8 @@ public final class EnsResolver {
 
     /**
      * Construct against non-default contract addresses. Useful for
-     * testnets and for unit tests that mock the resolver chain. The {@code .eth}
+     * testnets and for unit tests that mock the resolver chain.
+     * {@code universalResolver} is not consulted (see the field). The {@code .eth}
      * registrar is one address on every ENS chain; the NameWrapper is not known here
      * (a wrapped name's holders then read as the wrapper contract itself).
      */
@@ -128,8 +131,8 @@ public final class EnsResolver {
 
     /**
      * Network-aware factory keyed on the EVM chain ID: picks the
-     * canonical Registry + Universal Resolver pair for the given
-     * network. Throws {@link IllegalArgumentException} for networks
+     * canonical Registry (and the chain's NameWrapper, where pinned) for
+     * the given network. Throws {@link IllegalArgumentException} for networks
      * where ENS is not pinned (callers that need to override can use
      * the three-arg constructor directly).
      *
@@ -172,10 +175,12 @@ public final class EnsResolver {
     /**
      * Forward resolution: {@code name → address}.
      *
-     * <p>Returns {@link Optional#empty()} when the UR returns empty/zero
-     * bytes for the inner call (no record set) or when the UR reverts
-     * with a known "not found" condition. {@code OffchainLookup} reverts
-     * are rethrown for the {@code CcipReadEvmExecutor} wrapper to catch.
+     * <p>Returns {@link Optional#empty()} when no resolver can answer for
+     * the name (none set anywhere up the Registry walk, or only an
+     * ancestor's that does not implement ENSIP-10), when the record is
+     * unset (a zero address), or when the resolver reverts.
+     * {@code OffchainLookup} reverts are rethrown for the
+     * {@code CcipReadEvmExecutor} wrapper to catch.
      */
     public CompletableFuture<Optional<Address>> resolveAddress(String name, BlockContext blockContext) {
         byte[] node = Namehash.of(name);
@@ -306,11 +311,11 @@ public final class EnsResolver {
     /**
      * Reverse resolution: {@code address → name}, with ENSIP-3 verification.
      *
-     * <p>Step-by-step path against the Registry. The plan calls out
-     * switching to the UR's {@code reverse()} method as a future
-     * refinement; the step-by-step path is correct for classic on-chain
-     * reverse records and the verification round-trip uses the new UR-
-     * based forward path under the hood.
+     * <p>Step-by-step path against the Registry: the reverse node's
+     * {@code resolver(bytes32)}, then that resolver's {@code name(bytes32)}.
+     * That covers classic on-chain reverse records. The verification
+     * round-trip is {@link #resolveAddress} — the same Registry walk every
+     * forward read takes.
      *
      * <p>Returns {@link Optional#empty()} when the address has no reverse
      * record OR when the resolver's claim fails ENSIP-3 verification (a
@@ -327,7 +332,7 @@ public final class EnsResolver {
                 });
     }
 
-    // ---- Universal-Resolver dispatch helper -------------------------------
+    // ---- Ownership ---------------------------------------------------------
 
     /** Who holds a name; see {@link #resolveOwnership}. {@code expiresAt} / {@code gracePeriod}
      *  are -1 where there is no registrar entry (a subname, an unregistered name). */
@@ -434,11 +439,17 @@ public final class EnsResolver {
         return v == 0 ? Optional.empty() : Optional.of(v);
     }
 
+    // ---- Record dispatch (Registry walk, ENSIP-10) -------------------------
+
     /**
-     * Wrap {@code innerCall} in a UR {@code resolve(bytes,bytes)} call,
-     * route through {@link EvmExecutor#callView}, handle the standard
-     * revert taxonomy, and feed the inner-call return bytes into
-     * {@code innerResultDecoder}.
+     * Find the resolver for {@code name} ({@link #findResolver}: the Registry
+     * walk of ENSIP-10) and run {@code innerCall} against it through
+     * {@link EvmExecutor#callView}: wrapped in the resolver's own
+     * {@code resolve(bytes,bytes)} when it implements ENSIP-10, or sent as is
+     * to a legacy resolver set on the exact node. A legacy resolver found only
+     * on an ancestor cannot answer for the name, which is then empty. The
+     * outcome goes through the revert taxonomy below, and the inner-call
+     * return bytes into {@code innerResultDecoder}.
      *
      * <p>Revert taxonomy:
      * <ul>
@@ -455,15 +466,16 @@ public final class EnsResolver {
      *
      * <p>Decoding:
      * <ul>
-     *   <li>UR return is {@code (bytes innerResult, address resolver)}.
-     *       We pull {@code innerResult} via
-     *       {@code AbiDecoder.dynamicBytes(urReturn, 0)}.
+     *   <li>An ENSIP-10 {@code resolve()} returns {@code bytes} wrapping
+     *       the inner call's return, pulled out via
+     *       {@code AbiDecoder.dynamicBytes(result, 0)}; a legacy resolver's
+     *       return IS the inner call's return.
      *   <li>The decoder receives {@code innerResult} and returns
      *       {@link Optional#empty()} for any "missing record" condition
      *       (zero address, empty bytes, etc.) and the value otherwise.
      *   <li>A {@link RuntimeException} from the decoder (malformed
      *       buffer) is also folded to {@link Optional#empty()} — same
-     *       reasoning as a generic UR revert.
+     *       reasoning as a plain revert.
      * </ul>
      */
     private <T> CompletableFuture<Optional<T>> dispatchResolve(

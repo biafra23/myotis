@@ -3,12 +3,18 @@
 //!
 //! The reference pins the 4-byte fork hash and refreshes it out-of-band
 //! rather than computing the rolling `CRC32(genesisHash ‖ fork blocks/times…)`
-//! (docs/reimplementation README §6). Same here: WHAT we announce stays pinned
-//! (07-el-implementation-plan.md decision #5). Remote peers validate OUR fork
-//! id and disconnect on mismatch, so these must track the live networks.
+//! from genesis (docs/reimplementation README §6). Same here: the hash is
+//! pinned (07-el-implementation-plan.md decision #5), together with the one
+//! timestamp fork this build knows next (`forkNext`). What we announce is the
+//! pin until that fork passes and its successor after: [`fork_id_at`] folds
+//! `forkNext` into the hash once the wall clock reaches it, and the eth Status
+//! sends exactly that (`EthConfig::fork_id_at` in `myotis_net`). Remote peers
+//! validate OUR fork id and disconnect on mismatch, so these must track the
+//! live networks.
 //!
 //! The CRC32 chain arithmetic itself lives here too ([`crc32_update`],
-//! [`successor`], [`activation_of`]) — not to compute our own id, but so the
+//! [`successor`], [`activation_of`]) — never to compute our id from genesis,
+//! only to step it across one known activation ([`fork_id_at`]) and so the
 //! fork watch (`myotis_net::el::fork_watch`, twin of Java `ForkIds`/`ForkWatch`)
 //! can recover, from our pin and a peer's unknown hash, the activation that
 //! would turn one into the other. CRC32 resumes from its own checksum, so the

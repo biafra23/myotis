@@ -215,8 +215,11 @@ pub enum EnsOutcome {
     /// zero-address record, or a non-wildcard ancestor resolver).
     NoRecord { block_number: u64, block_timestamp: u64 },
     /// The name resolves OFFCHAIN (ERC-3668 `OffchainLookup`) — the record exists
-    /// but needs a CCIP-Read gateway, which this engine doesn't drive yet
-    /// (EL-C-5-3). Distinguishable from `NoRecord` by design.
+    /// but needs a CCIP-Read gateway round. This outcome carries no tuple, so its
+    /// callers cannot drive one: the round goes through an [`EnsQuery`] instead,
+    /// whose [`EnsQueryOutcome::Offchain`] hands the host the tuple for its own
+    /// gateway fetch and the `ccipCallback` re-entry (EL-C-5-3). Distinguishable
+    /// from `NoRecord` by design.
     Offchain { block_number: u64, block_timestamp: u64 },
 }
 

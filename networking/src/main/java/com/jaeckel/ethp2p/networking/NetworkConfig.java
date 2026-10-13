@@ -966,7 +966,7 @@ public record NetworkConfig(
     /**
      * Whether ENS name resolution is available on this chain. ENS is deployed only on
      * Ethereum mainnet and Sepolia — {@link io.myotis.ens.EnsResolver#forChainId} pins
-     * the registry + UniversalResolver for chainId 1 / 11155111 (and still for 17000,
+     * the ENS contracts for chainId 1 / 11155111 (and still for 17000,
      * holesky, which the EF retired in Oct 2025 — dead code, since {@link #byName}
      * rejects that network) and throws for everything else (e.g. Gnosis 100, which has
      * no canonical ENS). This gate admits only 1 / 11155111. UIs gate the ENS query path

@@ -5,8 +5,9 @@ import java.nio.charset.StandardCharsets;
 /**
  * DNS wire-format encoder for ENS names per ENSIP-10.
  *
- * <p>The Universal Resolver and ENSIP-10 wildcard resolvers consume names
- * in the canonical DNS wire format: each label is preceded by its
+ * <p>ENSIP-10 resolvers' {@code resolve(bytes name, bytes data)}, which
+ * {@link EnsResolver} calls directly, takes the name in the canonical DNS
+ * wire format: each label is preceded by its
  * one-byte length, terminated by a zero-length root label. Labels
  * themselves must be ≤ 63 bytes (DNS label limit).
  *
