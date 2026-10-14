@@ -165,8 +165,8 @@ char *myotis_get_storage_at_json(int64_t handle, const char *address,
  * keys as the request carried them (NULL/empty = none; at most 1024, each
  * hex of at most 32 bytes). Every proof is verified at ONE beacon-attested
  * root, of exactly the block `block` names: latest/pending/empty (the
- * verified head), "finalized", or the number of the head, of one of the 128
- * heads before it as the engine held them, or of the finalized block. Any
+ * verified head), "finalized", or the number of one of the last 128 heads
+ * the engine held (the current one included) or of the finalized block. Any
  * other number is refused — -32602 below the head, {"error"} above it —
  * never answered from head state as the other reads answer a near-head
  * number: the caller checks the proof against that block's stateRoot.

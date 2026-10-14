@@ -15,9 +15,10 @@
 //! well-formed answer that fails the client's check, indistinguishable from a
 //! forged one. So a proof is served only at a root this node holds attested
 //! for exactly the block named: the optimistic head (`latest`, `pending`, or
-//! its number), one of the [`RECENT_HEADS`] heads before it as this node held
-//! them (a number a client got from `eth_blockNumber` a few blocks ago, or
-//! from a light client of its own a block behind), or the beacon-finalized
+//! its number), one of the last [`RECENT_HEADS`] heads this node held, the
+//! current one included (a number a client got from `eth_blockNumber` a few
+//! blocks ago, or from a light client of its own a block behind), or the
+//! beacon-finalized
 //! block (`finalized`, or its number). Any other number is refused —
 //! permanently below the head, which never comes back to it; retryably above
 //! it, which the head may yet reach. No fallback to a peer's own head either,
@@ -38,14 +39,22 @@ pub const MAX_PROOF_STORAGE_KEYS: usize = 1024;
 pub const PROOF_SLOTS_IN_FLIGHT: usize = 16;
 
 /// The hedge delay for a proof of `distinct_keys` storage keys: the reads'
-/// `base` per round of [`PROOF_SLOTS_IN_FLIGHT`] keys. An attempt is the WHOLE
-/// proof from one peer, so a fixed delay would start a full duplicate on
-/// another peer every `base` while a large proof is still arriving — and mark
-/// the earlier peers outpaced when one finishes. A failed attempt still starts
-/// the next at once; only a slow one waits this long for its hedge.
-pub fn proof_hedge_delay(base: std::time::Duration, distinct_keys: usize) -> std::time::Duration {
+/// `base` per round of [`PROOF_SLOTS_IN_FLIGHT`] keys, but never more than a
+/// third of the whole read's `budget`. An attempt is the WHOLE proof from one
+/// peer, so a fixed delay would start a full duplicate on another peer every
+/// `base` while a large proof is still arriving — and mark the earlier peers
+/// outpaced when one finishes. A failed attempt (a silent peer's request
+/// times out) still starts the next at once; the cap is for a peer that keeps
+/// answering, slowly: past ~465 keys the uncapped delay would outlast the
+/// budget, and such a peer would hold the read until it ran out with no
+/// second peer ever asked.
+pub fn proof_hedge_delay(
+    base: std::time::Duration,
+    distinct_keys: usize,
+    budget: std::time::Duration,
+) -> std::time::Duration {
     let rounds = distinct_keys.div_ceil(PROOF_SLOTS_IN_FLIGHT).max(1);
-    base.saturating_mul(u32::try_from(rounds).unwrap_or(u32::MAX))
+    base.saturating_mul(u32::try_from(rounds).unwrap_or(u32::MAX)).min(budget / 3)
 }
 
 /// The block an `eth_getProof` names.
@@ -74,9 +83,6 @@ pub enum ProofError {
 pub struct ProofTarget {
     pub block_number: u64,
     pub state_root: [u8; 32],
-    /// Set when the root is the beacon-finalized block's: a peer that pruned
-    /// it answers with an empty proof, a miss the race excuses.
-    pub finalized: Option<FinalizedExecution>,
 }
 
 /// Resolve the block a request names to the root it is proven at, by the pin
@@ -90,15 +96,10 @@ pub fn resolve_target(
     finalized: Option<FinalizedExecution>,
     recent: impl Fn(u64) -> Option<[u8; 32]>,
 ) -> Result<ProofTarget, ProofError> {
-    let at_head = |(block_number, state_root): (u64, [u8; 32])| ProofTarget {
-        block_number,
-        state_root,
-        finalized: None,
-    };
+    let at_head = |(block_number, state_root): (u64, [u8; 32])| ProofTarget { block_number, state_root };
     let at_finalized = |fin: FinalizedExecution| ProofTarget {
         block_number: fin.block_number,
         state_root: fin.state_root,
-        finalized: Some(fin),
     };
     match block {
         ProofBlock::Head => head
@@ -132,9 +133,9 @@ pub fn resolve_target(
                 .unwrap_or_default();
             Err(ProofError::Refused(format!(
                 "eth_getProof at block {n:#x} ({n}) is not served: a proof is pinned to a state \
-                 root this node holds attested for exactly that block — the verified head \
-                 ({head_number}), the {RECENT_HEADS} heads before it as this node held them{fin} — \
-                 and a proof at another root would not verify against block {n}'s stateRoot"
+                 root this node holds attested for exactly that block — the last {RECENT_HEADS} \
+                 heads it held, up to the verified head ({head_number}){fin} — and a proof at \
+                 another root would not verify against block {n}'s stateRoot"
             )))
         }
     }
@@ -200,10 +201,9 @@ mod tests {
     #[test]
     fn tags_resolve_to_their_own_roots() {
         let t = resolve_target(ProofBlock::Head, Some(HEAD), Some(fin(936)), none).unwrap();
-        assert_eq!((t.block_number, t.state_root, t.finalized), (1_000, [0xaa; 32], None));
+        assert_eq!((t.block_number, t.state_root), (1_000, [0xaa; 32]));
         let t = resolve_target(ProofBlock::Finalized, Some(HEAD), Some(fin(936)), none).unwrap();
         assert_eq!((t.block_number, t.state_root), (936, [0xff; 32]));
-        assert_eq!(t.finalized, Some(fin(936)));
         // Not synced: retryable, for either tag.
         assert!(matches!(
             resolve_target(ProofBlock::Head, None, None, none),
@@ -218,9 +218,9 @@ mod tests {
     #[test]
     fn a_number_is_served_only_at_a_root_attested_for_exactly_that_block() {
         let t = resolve_target(ProofBlock::Number(1_000), Some(HEAD), Some(fin(936)), none).unwrap();
-        assert_eq!((t.state_root, t.finalized), ([0xaa; 32], None));
+        assert_eq!((t.block_number, t.state_root), (1_000, [0xaa; 32]));
         let t = resolve_target(ProofBlock::Number(936), Some(HEAD), Some(fin(936)), none).unwrap();
-        assert_eq!((t.state_root, t.finalized), ([0xff; 32], Some(fin(936))));
+        assert_eq!((t.block_number, t.state_root), (936, [0xff; 32]));
         // Just behind the head: inside the other reads' window, but a proof
         // at head state would not verify against this block — refused for good.
         let Err(ProofError::Refused(why)) =
@@ -251,24 +251,25 @@ mod tests {
         // block ago) is served at the root attested for it.
         let recent = |n: u64| (n == 999).then_some([0x99; 32]);
         let t = resolve_target(ProofBlock::Number(999), Some(HEAD), Some(fin(936)), recent).unwrap();
-        assert_eq!((t.block_number, t.state_root, t.finalized), (999, [0x99; 32], None));
+        assert_eq!((t.block_number, t.state_root), (999, [0x99; 32]));
         // The head and the finalized block still take precedence.
         let any = |_: u64| Some([0x11; 32]);
         let t = resolve_target(ProofBlock::Number(1_000), Some(HEAD), Some(fin(936)), any).unwrap();
         assert_eq!(t.state_root, [0xaa; 32]);
         let t = resolve_target(ProofBlock::Number(936), Some(HEAD), Some(fin(936)), any).unwrap();
-        assert_eq!(t.finalized, Some(fin(936)));
+        assert_eq!(t.state_root, [0xff; 32]);
     }
 
     #[test]
-    fn the_hedge_waits_one_base_delay_per_round_of_keys() {
+    fn the_hedge_waits_one_base_delay_per_round_of_keys_within_a_third_of_the_budget() {
         let base = std::time::Duration::from_secs(3);
-        assert_eq!(proof_hedge_delay(base, 0), base);
-        assert_eq!(proof_hedge_delay(base, PROOF_SLOTS_IN_FLIGHT), base);
-        assert_eq!(proof_hedge_delay(base, PROOF_SLOTS_IN_FLIGHT + 1), base * 2);
-        assert_eq!(
-            proof_hedge_delay(base, MAX_PROOF_STORAGE_KEYS),
-            base * (MAX_PROOF_STORAGE_KEYS / PROOF_SLOTS_IN_FLIGHT) as u32
-        );
+        let budget = std::time::Duration::from_secs(90);
+        assert_eq!(proof_hedge_delay(base, 0, budget), base);
+        assert_eq!(proof_hedge_delay(base, PROOF_SLOTS_IN_FLIGHT, budget), base);
+        assert_eq!(proof_hedge_delay(base, PROOF_SLOTS_IN_FLIGHT + 1, budget), base * 2);
+        // Ten rounds fit under the cap; the 1024-key cap (64 rounds) does not,
+        // and still leaves room for two more attempts within the budget.
+        assert_eq!(proof_hedge_delay(base, 10 * PROOF_SLOTS_IN_FLIGHT, budget), base * 10);
+        assert_eq!(proof_hedge_delay(base, MAX_PROOF_STORAGE_KEYS, budget), budget / 3);
     }
 }

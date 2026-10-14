@@ -288,8 +288,8 @@ uniffi::setup_scaffolding!();
 ///      all at ONE beacon-attested root and in geth's result shape. Its
 ///      selector is stricter than the other state reads': a proof is pinned
 ///      to exactly the block named, so only a head tag, `finalized`, or the
-///      number of the head, of one of the 128 heads before it as the engine
-///      held them, or of the finalized block is served; any other number is
+///      number of one of the last 128 heads the engine held (the current one
+///      included) or of the finalized block is served; any other number is
 ///      refused (`{"error","code":-32602}` below the head, `{"error"}` above
 ///      it), never answered from head state. Refused under Tor routing.
 ///      An additive function — bumped so a host that calls it is never paired

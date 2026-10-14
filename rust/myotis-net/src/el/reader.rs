@@ -6434,7 +6434,7 @@ impl ElReader {
         let distinct = distinct.as_slice();
         self.hedged_read(
             &peers,
-            proof_hedge_delay(HEDGE_DELAY, distinct.len()),
+            proof_hedge_delay(HEDGE_DELAY, distinct.len(), super::request::REQUEST_BUDGET),
             |peer| async move { self.proof_from(&peer, target, address, keys, distinct).await },
             // Every answer is verified at the target root by construction.
             |_| true,
