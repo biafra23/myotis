@@ -309,17 +309,6 @@ public final class NodeService extends Service {
         prefs(c).edit().putString("logIndex.watch." + canonicalNetwork(network), json).apply();
     }
 
-    /** The user's own tokens for one network's Query-tab token balances, as
-     *  {@code io.myotis.ui.CustomTokens}' JSON array (same key scheme as the desktop). */
-    public static String customTokensJson(android.content.Context c, String network) {
-        String v = prefs(c).getString("tokens.custom." + canonicalNetwork(network), null);
-        return v != null ? v : "[]";
-    }
-
-    public static void setCustomTokensJson(android.content.Context c, String network, String json) {
-        prefs(c).edit().putString("tokens.custom." + canonicalNetwork(network), json).apply();
-    }
-
     /** Backfill pacing (true = max download speed); same key scheme as the desktop. */
     public static boolean logIndexMaxSpeed(android.content.Context c, String network) {
         return prefs(c).getBoolean("logIndex.maxSpeed." + canonicalNetwork(network), false);

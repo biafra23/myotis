@@ -404,10 +404,13 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun logIndexWatchJson(network: String): String = NodeService.logIndexWatchJson(ctx, network)
     override fun setLogIndexWatchJson(network: String, json: String) =
         NodeService.setLogIndexWatchJson(ctx, network, json)
-    override fun customTokensJson(network: String): String = NodeService.customTokensJson(ctx, network)
+    // The token list is the app's, not the node's: the node service never reads it, so it
+    // lives in the app's own preferences file rather than among NodeService's settings.
+    private val tokenPrefs by lazy { ctx.getSharedPreferences("myotis-tokens", Context.MODE_PRIVATE) }
+    override fun customTokensJson(network: String): String = tokenPrefs.getString(network, null) ?: "[]"
     override fun setCustomTokensJson(network: String, json: String) =
-        NodeService.setCustomTokensJson(ctx, network, json)
-    override fun supportsCustomTokens(): Boolean = true   // SharedPreferences, like the watch list
+        tokenPrefs.edit().putString(network, json).apply()
+    override fun supportsCustomTokens(): Boolean = true
     override fun snapTarget(): Int = NodeService.snapTarget(ctx)
     override fun setSnapTarget(v: Int) = NodeService.setSnapTargetPref(ctx, v)
     override fun servedBlockWindow(): Int = NodeService.servedBlockWindow(ctx)
