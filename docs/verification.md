@@ -394,8 +394,11 @@ index uses it over its whole walked coverage:
   path behind the backfill, the head bridge and the tail);
 - a range outside coverage is refused with a retryable error, never answered with `[]`
   (`get_logs_json` in `rust/myotis-engine/src/host.rs`). `latest` resolves to the top of
-  coverage when that is at most 4 blocks below the head (`LOG_INDEX_LATEST_SLACK`), so a
-  wallet advances its cursor from the answer's range, not from `eth_blockNumber`.
+  coverage when that is at most 4 blocks below the head (`LOG_INDEX_LATEST_SLACK`), and
+  the answer, a bare log array, does not say where it stopped. So a wallet polls with an
+  explicit `toBlock` (taking it from `eth_blockNumber` is fine: an explicit range is served
+  whole or refused, never cut short) and advances its cursor only to a `toBlock` that was
+  served.
 
 `eth_getProof` can do none of this, because logs are not in the state trie. An RPC client
 could run the same walk with header and receipt calls, but it would have to fetch every
