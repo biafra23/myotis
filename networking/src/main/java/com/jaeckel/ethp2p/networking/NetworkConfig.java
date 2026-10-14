@@ -127,9 +127,9 @@ public record NetworkConfig(
             // genesis_validators_root (mainnet)
             Bytes.fromHexString("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95").toArrayUnsafe(),
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized mainnet block root (slot 15394688, 2026-10-09, period 1879)
-            Bytes.fromHexString("3c65d22e715e662bad37f43374ce1b944ff9078617e6cd95eb8f88b2cd485b2b").toArrayUnsafe(),
-            15394688L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized mainnet block root (slot 15425472, 2026-10-13, period 1882)
+            Bytes.fromHexString("c9cd1fa65f9e8b2bcbf049e1f99c67609a6858dfa027fad9608b7bfdf07a9244").toArrayUnsafe(),
+            15425472L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:mainnet:end
             // Fork schedule — consensus-specs configs/mainnet.yaml *_FORK_EPOCH /
             // *_FORK_VERSION. Fulu activated at epoch 411392 = slot 13164544 (2025-12-03).
@@ -195,6 +195,12 @@ public record NetworkConfig(
                     // row) and 91.189.182.90 closed the connection from the runner,
                     // and roost (9109) timed out in the transport handshake, as every
                     // zbox pin did that day (see the Rust twin).
+                    // Re-verified 2026-10-13 at the anchor v0.1.16 ships (period
+                    // 1882), run 38478939810: 2 of 5, the floor again — 84.112.35.112
+                    // and 54.201.148.177 served; 57.129.130.18 (its third close in a
+                    // row) and 91.189.182.90 closed the connection from the runner,
+                    // and so did roost (9109), while zbox's uplink was saturated by a
+                    // PoC seed upload (see the Rust twin).
                     // Mirror of the Rust MAINNET_STATIC_PEERS: keep the two lists
                     // and their ORDER in step (see the reasoning there).
                     "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
@@ -282,9 +288,9 @@ public record NetworkConfig(
             // genesis_validators_root (sepolia)
             Bytes.fromHexString("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078").toArrayUnsafe(),
             // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized sepolia block root (slot 11319040, 2026-10-09, period 1381)
-            Bytes.fromHexString("90bb35755de105925bef3875c65645817625cf69f65a3eb5048750a6709c7c4e").toArrayUnsafe(),
-            11319040L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized sepolia block root (slot 11349696, 2026-10-13, period 1385)
+            Bytes.fromHexString("71e68e6813be97a559881badaf839428dee940d6485924e44e5376bc4682e6b0").toArrayUnsafe(),
+            11349696L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:sepolia:end
             // Fork schedule — eth-clients/sepolia metadata/config.yaml *_FORK_EPOCH /
             // *_FORK_VERSION. Fulu (0x90000075) activated at epoch 272640 (2025-10-14);
@@ -405,6 +411,11 @@ public record NetworkConfig(
             // Its dead-pins cold start bootstrapped through discovery but could
             // not report SYNCED without an EL resolver for the Gloas execution
             // header. Details in the Rust twin (SEPOLIA_STATIC_PEERS).
+            // Release check for v0.1.16 (2026-10-13), slot 11349696: roost served
+            // it on every attempt of run 38478944070; this Nimbus never let the
+            // runner in (dial failed, three attempts), sitting at its 25-peer cap,
+            // while its REST served the same 25,472-byte bootstrap. 1 of 2 — the
+            // owner decides. Details in the Rust twin (SEPOLIA_STATIC_PEERS).
             // Keep this list identical to SEPOLIA_STATIC_PEERS in
             // rust/myotis-net/src/sync.rs (both parity tests pin it).
             List.of(
@@ -474,9 +485,9 @@ public record NetworkConfig(
             // genesis_validators_root (Gnosis Beacon Chain)
             Bytes.fromHexString("f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47").toArrayUnsafe(),
             // @checkpoint:gnosis:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized gnosis block root (slot 30513552, 2026-10-09, period 3724)
-            Bytes.fromHexString("a68918716e413f19655d4c8e4c35b46351b6f566a3123aeb30ecb35c04f09f3c").toArrayUnsafe(),
-            30513552L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized gnosis block root (slot 30587456, 2026-10-13, period 3733)
+            Bytes.fromHexString("5fe43d20277851aa142840c2208d3e66960ddeb1f32f5d76f3eda510d6ee5d9e").toArrayUnsafe(),
+            30587456L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
             // @checkpoint:gnosis:end
             // Fork schedule — gnosischain/configs mainnet/config.yaml *_FORK_EPOCH /
             // *_FORK_VERSION, on 16-slot epochs. Fulu (0x06000064) active since epoch
@@ -532,6 +543,10 @@ public record NetworkConfig(
                     // 3724), run 37955473231: 7 of 8 — every public pin served; roost
                     // (9108) timed out in the transport handshake, then served the
                     // old-anchor walk 23 s later in the same job.
+                    // Re-verified 2026-10-13 at the anchor v0.1.16 ships (period
+                    // 3733), run 38478934518: 7 of 8 — every public pin served; roost
+                    // (9108) failed to dial while zbox's uplink was saturated by a PoC
+                    // seed upload.
                     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
                     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
                     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
