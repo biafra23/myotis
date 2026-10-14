@@ -95,6 +95,9 @@ impl Engine for Fake {
     fn get_storage_at(&self, a: &str, p: &str, b: &str) -> String {
         self.get("storage", format!("{a},{p},{b}"))
     }
+    fn get_proof(&self, a: &str, k: &str, b: &str) -> String {
+        self.get("proof", format!("{a}|{k}|{b}"))
+    }
     fn eth_call(&self, f: &str, t: &str, d: &str, v: &str, b: &str) -> String {
         self.get("call", format!("{f},{t},{d},{v},{b}"))
     }
@@ -682,6 +685,53 @@ fn tri_state_reads() {
         error(&r, "eth_getTransactionReceipt", json!(["0x1234"])).0,
         -32602
     );
+}
+
+#[test]
+fn get_proof() {
+    // The engine's result object passes through; the keys go on as the JSON
+    // array the request carried, for the engine to echo in geth's form.
+    let proof = json!({
+        "address": TOKEN, "accountProof": ["0xc0"], "balance": "0x0",
+        "codeHash": format!("0x{}", "33".repeat(32)), "nonce": "0x1",
+        "storageHash": format!("0x{}", "22".repeat(32)),
+        "storageProof": [{"key": "0x3", "value": "0x2a", "proof": ["0xc1"]}],
+    });
+    let r = Router::new(Fake::new().reply("proof", &proof.to_string()));
+    assert_eq!(result(&r, "eth_getProof", json!([TOKEN, ["0x3"], "latest"])), proof);
+    assert_eq!(calls(&r)[0], format!(r#"proof({TOKEN}|["0x3"]|latest)"#));
+    // Null keys are none; an absent block is latest.
+    result(&r, "eth_getProof", json!([TOKEN, null]));
+    assert_eq!(calls(&r)[1], format!("proof({TOKEN}|[]|latest)"));
+    // The engine alone judges a number: one far below the head (the
+    // finalized block's, on mainnet) is not refused by the state reads'
+    // window before the engine is asked.
+    result(&r, "eth_getProof", json!([TOKEN, [], "0x1"]));
+    assert_eq!(calls(&r)[2], format!("proof({TOKEN}|[]|0x1)"));
+    // Malformed requests never reach the engine.
+    for params in [
+        json!([TOKEN]),
+        json!([TOKEN, "0x3", "latest"]),
+        json!([TOKEN, ["0x"], "latest"]),
+        json!([TOKEN, [format!("0x{}", "1".repeat(65))], "latest"]),
+        json!([TOKEN, [3], "latest"]),
+        json!([TOKEN, vec!["0x1"; myotis_engine::MAX_PROOF_STORAGE_KEYS + 1], "latest"]),
+        json!([TOKEN, [], "safe"]),
+        json!([TOKEN, [], "latest", 1]),
+    ] {
+        assert_eq!(error(&r, "eth_getProof", params.clone()).0, -32602, "{params}");
+    }
+    assert_eq!(calls(&r).len(), 3);
+    // The engine's refusals keep their class.
+    let r = Router::new(Fake::new().reply(
+        "proof",
+        &json!({"error": "not the head", "code": -32602}).to_string(),
+    ));
+    assert_eq!(error(&r, "eth_getProof", json!([TOKEN, [], "0x3c0"])).0, -32602);
+    let r = Router::new(Fake::new().reply("proof", r#"{"error":"no snap peer available"}"#));
+    let (code, msg, _) = error(&r, "eth_getProof", json!([TOKEN, [], "latest"]));
+    assert_eq!(code, -32000);
+    assert!(msg.contains("no snap peer available"), "{msg}");
 }
 
 #[test]

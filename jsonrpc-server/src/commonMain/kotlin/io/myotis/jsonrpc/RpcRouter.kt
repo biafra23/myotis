@@ -54,6 +54,8 @@ class RpcRouter(
             "eth_createAccessList" to 3,
             "eth_getBalance" to 2, "eth_getTransactionCount" to 2, "eth_getCode" to 2,
             "eth_getStorageAt" to 3,
+            // address, storage keys, block
+            "eth_getProof" to 3,
             "eth_sendRawTransaction" to 1, "eth_getTransactionReceipt" to 1, "eth_getBlockByNumber" to 2,
             "eth_gasPrice" to 0, "eth_maxPriorityFeePerGas" to 0, "eth_feeHistory" to 3,
             "eth_getTransactionByHash" to 1, "eth_getBlockByHash" to 2, "eth_getBlockReceipts" to 1,
@@ -79,6 +81,11 @@ class RpcRouter(
         /** The most reward percentiles one `eth_feeHistory` may ask for — geth's
          *  limit. */
         private const val MAX_FEE_HISTORY_PERCENTILES = 100
+
+        /** The most storage keys one `eth_getProof` may ask for — the Rust
+         *  engine's `MAX_PROOF_STORAGE_KEYS` (`el/getproof.rs`), which refuses
+         *  more too: each key is a snap round trip at one root. geth sets none. */
+        internal const val MAX_PROOF_STORAGE_KEYS = 1024
 
         /** The most blocks one `eth_feeHistory` may ask for — the spec's (and
          *  geth's) ceiling. A larger count is clamped, as geth clamps it: the
@@ -640,6 +647,17 @@ class RpcRouter(
                         "builds no access lists — select the Rust engine)",
                 )
             }
+            // Likewise an engine that serves no proofs (the Java engine): permanent
+            // for that build, and the reason comes ahead of any field's.
+            if (m == "eth_getProof" && backend?.supportsProofs() != true) {
+                logger.record(m, idStr, "ERROR", elapsedMs(t0), -32602)
+                return errorEnvelope(
+                    id,
+                    -32602,
+                    "method 'eth_getProof' is not supported by this node's engine (the Java engine " +
+                        "serves no proofs — select the Rust engine)",
+                )
+            }
             if (m == "eth_call" || m == "eth_createAccessList") {
                 (callTx(root, m) as? CallTx.Refuse)?.let { refusal ->
                     logger.record(m, idStr, "ERROR", elapsedMs(t0), -32602)
@@ -893,6 +911,25 @@ class RpcRouter(
             is SelectorParse.Ok -> parsed.selector
             is SelectorParse.Refuse -> invalid(parsed.why)
         }
+
+    /** `eth_getProof`'s storage keys at params[[i]]: an array (null = none) of
+     *  hex strings of at most 32 bytes each, read as [asWord32] reads a slot —
+     *  geth's reading, `0x` optional and an odd digit count padded — and at
+     *  most [MAX_PROOF_STORAGE_KEYS] of them. Handed on as the JSON array the
+     *  request carried: the engine echoes each key in geth's form, which turns
+     *  on how many digits it was given. */
+    private fun JsonArray?.storageKeysAt(i: Int): String {
+        val raw = this?.getOrNull(i) ?: invalid("missing argument $i: the storage keys")
+        if (raw is JsonNull) return "[]"
+        val keys = raw as? JsonArray ?: invalid("invalid argument $i: expected an array of storage keys")
+        if (keys.size > MAX_PROOF_STORAGE_KEYS) {
+            invalid("invalid argument $i: at most $MAX_PROOF_STORAGE_KEYS storage keys, got ${keys.size}")
+        }
+        keys.forEachIndexed { k, key ->
+            key.asWord32() ?: invalid("invalid argument $i: storage key $k is not hex of at most 32 bytes")
+        }
+        return json.encodeToString(JsonArray.serializer(), keys)
+    }
 
     /** A state read's selector (eth_getBalance, eth_getCode, …): a
      *  `BlockNumberOrHash`, but a hash names a historical state this node does
@@ -1183,6 +1220,25 @@ class RpcRouter(
                 val sel = p.stateSelectorAt(2, "eth_getStorageAt").takeIf { pinServable(it, b, "eth_getStorageAt") } ?: return null
                 val v = withContext(rpcIoDispatcher) { b.getStorageAt(addr, slot, sel.value) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexData(v)))
+            }
+            // EIP-1186. The engine alone judges the block, by the proof pin
+            // rules — only a root it holds attested for exactly the block named
+            // (its head, a recent head, the finalized block), never head state
+            // for a near-head number as the reads above have it, because the
+            // caller checks the proofs against that block's own stateRoot. So no
+            // [pinServable] here: its window would refuse the finalized block's
+            // number, more than 64 blocks back on mainnet. An engine that serves
+            // no proofs declines here, and the strict branch refuses it for
+            // good, ahead of any field.
+            "eth_getProof" -> {
+                if (!b.supportsProofs()) return null
+                val p = root.params()
+                val addr = p.addressAt(0)
+                val keys = p.storageKeysAt(1)
+                val sel = p.stateSelectorAt(2, "eth_getProof")
+                val proofJson = withContext(rpcIoDispatcher) { b.getProof(addr, keys, sel.value) }
+                    ?.orEngineThrow() ?: return null
+                resultEnvelope(id, json.parseToJsonElement(proofJson))
             }
             "eth_sendRawTransaction" -> {
                 val raw = root.params().dataAt(0, "the signed transaction")

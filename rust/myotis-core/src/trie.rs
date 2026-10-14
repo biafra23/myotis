@@ -49,6 +49,37 @@ pub enum ProofResult {
 /// pass `keccak256(address)`, for a storage trie `keccak256(slot32)`; the
 /// verifier converts to nibbles internally.
 pub fn verify_proof(root: &[u8; 32], key: &[u8], proof_nodes: &[Vec<u8>]) -> ProofResult {
+    walk(root, key, proof_nodes, |_| {})
+}
+
+/// [`verify_proof`], also returning the proof as `eth_getProof` (EIP-1186)
+/// lists it: the nodes the walk to `key` visits, root first. Only nodes
+/// referenced by hash are listed — an embedded (< 32-byte) child rides inside
+/// its parent, as in geth's `trie.Prove` — so whatever else the supplied set
+/// holds (a snap range proof's second boundary path, nodes of neighbouring
+/// keys) drops out, and a node the set repeats is listed once. The path is returned only with a `Found` or `Absent` result, and is empty
+/// for the empty trie, which needs no node; an `Invalid` walk returns none.
+pub fn verify_proof_path(
+    root: &[u8; 32],
+    key: &[u8],
+    proof_nodes: &[Vec<u8>],
+) -> (ProofResult, Vec<Vec<u8>>) {
+    let mut path = Vec::new();
+    let result = walk(root, key, proof_nodes, |node| path.push(node.to_vec()));
+    if matches!(result, ProofResult::Invalid(_)) {
+        path.clear();
+    }
+    (result, path)
+}
+
+/// The walk behind [`verify_proof`] and [`verify_proof_path`]: `visit` sees
+/// every node looked up by hash, in descent order, before it is interpreted.
+fn walk(
+    root: &[u8; 32],
+    key: &[u8],
+    proof_nodes: &[Vec<u8>],
+    mut visit: impl FnMut(&[u8]),
+) -> ProofResult {
     if key.is_empty() {
         return ProofResult::Invalid("empty key".into());
     }
@@ -98,6 +129,7 @@ pub fn verify_proof(root: &[u8; 32], key: &[u8], proof_nodes: &[Vec<u8>]) -> Pro
                 ))
             }
         };
+        visit(node_rlp);
         let item = match rlp::decode(node_rlp) {
             Ok(it) => it,
             Err(e) => return ProofResult::Invalid(format!("malformed node RLP: {}", e.0)),
@@ -397,6 +429,60 @@ mod tests {
             verify_proof(&root, &[0x01], &[other]),
             ProofResult::Invalid(_)
         ));
+    }
+
+    /// A root branch over two hashed leaves (32-byte keys, so each leaf is
+    /// over 32 bytes and referenced by hash): `(root, branch, leaf_a, leaf_b)`.
+    fn two_leaf_trie() -> ([u8; 32], Vec<u8>, Vec<u8>, Vec<u8>) {
+        let leaf_a = leaf_node(&to_nibbles(&[0x11; 32])[1..], &[0xaa; 40]);
+        let leaf_b = leaf_node(&to_nibbles(&[0x22; 32])[1..], &[0xbb; 40]);
+        let mut items = vec![Item::Bytes(Vec::new()); 17];
+        items[1] = Item::Bytes(keccak256(&leaf_a).to_vec());
+        items[2] = Item::Bytes(keccak256(&leaf_b).to_vec());
+        let branch = rlp::encode(&Item::List(items));
+        (keccak256(&branch), branch, leaf_a, leaf_b)
+    }
+
+    #[test]
+    fn proof_path_is_the_walk_root_first_without_the_rest_of_the_set() {
+        let (root, branch, leaf_a, leaf_b) = two_leaf_trie();
+        // Out of order, with the neighbour's leaf in the set — a snap range
+        // proof's shape. The path is the walk's: root first, neighbour gone.
+        let set = vec![leaf_b.clone(), leaf_a.clone(), branch.clone(), branch.clone()];
+        let (result, path) = verify_proof_path(&root, &[0x11; 32], &set);
+        assert_eq!(result, ProofResult::Found(vec![0xaa; 40]));
+        assert_eq!(path, vec![branch.clone(), leaf_a]);
+        // The result is verify_proof's, for every shape.
+        assert_eq!(result, verify_proof(&root, &[0x11; 32], &set));
+
+        // Exclusion: the walk ends at the branch's empty child, and the
+        // branch alone proves it — as geth's trie.Prove lists it.
+        let (result, path) = verify_proof_path(&root, &[0x33; 32], &set);
+        assert_eq!(result, ProofResult::Absent);
+        assert_eq!(path, vec![branch.clone()]);
+
+        // An invalid walk hands back no path to serve.
+        let (result, path) = verify_proof_path(&root, &[0x11; 32], &[branch]);
+        assert!(matches!(result, ProofResult::Invalid(_)));
+        assert!(path.is_empty());
+    }
+
+    #[test]
+    fn proof_path_leaves_embedded_children_inside_their_parent() {
+        // Tiny leaves (< 32 bytes) are embedded in the branch, not listed.
+        let leaf = |n: &[u8], v: &[u8]| {
+            Item::List(vec![Item::Bytes(hex_prefix_encode(n, true)), Item::Bytes(v.to_vec())])
+        };
+        let mut items = vec![Item::Bytes(Vec::new()); 17];
+        items[1] = leaf(&[0xa], b"v1");
+        items[2] = leaf(&[0xb], b"v2");
+        let branch = rlp::encode(&Item::List(items));
+        let root = keccak256(&branch);
+        let (result, path) = verify_proof_path(&root, &[0x1a], core::slice::from_ref(&branch));
+        assert_eq!(result, ProofResult::Found(b"v1".to_vec()));
+        assert_eq!(path, vec![branch]);
+        // The empty trie needs no node at all.
+        assert_eq!(verify_proof_path(&EMPTY_TRIE_ROOT, &[0x01], &[]), (ProofResult::Absent, vec![]));
     }
 
     #[test]

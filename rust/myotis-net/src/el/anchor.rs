@@ -35,6 +35,12 @@ use crate::el::eth::messages::VerifiedHeader;
 /// cover the same span.
 pub const MAX_KNOWN_ROOTS: usize = 8192;
 
+/// How many recent optimistic heads [`ExecAnchor::optimistic_root_at`]
+/// remembers by block number — about as many blocks as execution clients keep
+/// state for (geth's 128 diff layers), so a remembered head's state is still
+/// one peers serve: 25.6 minutes of mainnet heads, 10.7 of Gnosis.
+pub const RECENT_HEADS: usize = 128;
+
 /// A BLS-attested `(slot, state_root)` pair in the fast-path window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlottedStateRoot {
@@ -107,6 +113,11 @@ struct Inner {
     /// when the light client proved it, not from when its header resolved.
     pending_optimistic_noted: Option<std::time::Instant>,
     known_roots: VecDeque<SlottedStateRoot>,
+    /// The last [`RECENT_HEADS`] optimistic heads as `(block_number,
+    /// state_root)`, oldest first — each one BLS-attested when it was the
+    /// head. Kept for `eth_getProof`, which may serve only a root attested for
+    /// exactly the block it names ([`ExecAnchor::optimistic_root_at`]).
+    recent_heads: VecDeque<(u64, [u8; 32])>,
     finality_current: bool,
     /// Gloas: a finalized execution block hash the light client proved at this
     /// beacon slot whose header has not been resolved yet. Never older than the
@@ -390,6 +401,17 @@ impl ExecAnchor {
             .map(|hash| (inner.optimistic_block_number, hash, inner.optimistic_slot))
     }
 
+    /// The state root of block `number` if it was one of the last
+    /// [`RECENT_HEADS`] optimistic heads this anchor held — attested for
+    /// exactly that block, by the update that made it the head. A head this
+    /// anchor later stepped back from (a reorg, a head that swung back) is
+    /// forgotten, so a block replaced at the same height is never answered
+    /// with the replaced block's root.
+    pub fn optimistic_root_at(&self, number: u64) -> Option<[u8; 32]> {
+        let inner = self.inner.lock().expect("anchor mutex");
+        inner.recent_heads.iter().rev().find(|(n, _)| *n == number).map(|(_, root)| *root)
+    }
+
     /// The optimistic execution `(block_number, state_root, timestamp)` read
     /// atomically — the CURRENT beacon-attested head state, at most a couple of
     /// slots old, and the block's own timestamp proven with it (0 while
@@ -485,6 +507,24 @@ fn set_optimistic(
     inner.optimistic_state_root = Some(state_root);
     inner.optimistic_timestamp = timestamp;
     push_root(&mut inner.known_roots, slot, state_root, true);
+    remember_head(&mut inner.recent_heads, number, state_root);
+}
+
+/// Append a head to [`Inner::recent_heads`] (a re-offered head is no new
+/// entry), first dropping every remembered head at or above its number: a
+/// head that does not advance replaces what was remembered there, so a
+/// reorged-out block is never served by number. Then cap to [`RECENT_HEADS`].
+fn remember_head(heads: &mut VecDeque<(u64, [u8; 32])>, number: u64, state_root: [u8; 32]) {
+    if heads.back() == Some(&(number, state_root)) {
+        return;
+    }
+    while heads.back().is_some_and(|&(n, _)| n >= number) {
+        heads.pop_back();
+    }
+    heads.push_back((number, state_root));
+    while heads.len() > RECENT_HEADS {
+        heads.pop_front();
+    }
 }
 
 /// The finalized execution anchor held in `inner`, if root AND hash have landed.
@@ -534,6 +574,30 @@ mod tests {
         let mut r = [0u8; 32];
         r[0] = n;
         r
+    }
+
+    #[test]
+    fn recent_heads_are_remembered_by_number_and_forgotten_on_a_step_back() {
+        let anchor = ExecAnchor::new();
+        assert_eq!(anchor.optimistic_root_at(10), None);
+        for n in 10..=12u64 {
+            anchor.update_optimistic(n, n, root(n as u8), root(0x80 + n as u8), 0);
+            // Re-offered on every poll: still one entry.
+            anchor.update_optimistic(n, n, root(n as u8), root(0x80 + n as u8), 0);
+        }
+        assert_eq!(anchor.optimistic_root_at(11), Some(root(0x8b)));
+        assert_eq!(anchor.optimistic_root_at(12), Some(root(0x8c)));
+        // A reorg at 11: the replaced 11 and the 12 built on it are forgotten.
+        anchor.update_optimistic(13, 11, root(0x21), root(0x91), 0);
+        assert_eq!(anchor.optimistic_root_at(11), Some(root(0x91)));
+        assert_eq!(anchor.optimistic_root_at(12), None);
+        assert_eq!(anchor.optimistic_root_at(10), Some(root(0x8a)));
+        // The window is capped, oldest first out.
+        for n in 100..100 + RECENT_HEADS as u64 {
+            anchor.update_optimistic(n, n, root(1), root(2), 0);
+        }
+        assert_eq!(anchor.optimistic_root_at(10), None);
+        assert_eq!(anchor.optimistic_root_at(100), Some(root(2)));
     }
 
     #[test]

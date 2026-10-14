@@ -113,6 +113,8 @@ fn arity(method: &str) -> Option<usize> {
         // transaction, block, state overrides (reth's signature; geth takes no
         // override — one it would refuse as too many arguments is applied here)
         "eth_getStorageAt" | "eth_feeHistory" | "eth_createAccessList" => 3,
+        // address, storage keys, block
+        "eth_getProof" => 3,
         // transaction, block, state overrides, block overrides
         "eth_call" | "eth_estimateGas" => 4,
         _ => return None,
@@ -687,6 +689,20 @@ impl<E: Engine> Router<E> {
                 let mut w = [0u8; 32];
                 w[32 - raw.len()..].copy_from_slice(&raw);
                 Ok(json_str(&hex_data(&w)))
+            }
+            // EIP-1186. The engine alone judges the block, by the proof pin
+            // rules — only a root it holds attested for exactly the block named
+            // (its head, a recent head, the finalized block), never head state
+            // for another near-head number — because the caller checks the
+            // proofs against that block's own stateRoot. So neither
+            // `pin_servable` nor `in_window`: their window would refuse the
+            // finalized block's number, more than 64 blocks back on mainnet.
+            "eth_getProof" => {
+                let addr = address_at(params, 0)?;
+                let keys = storage_keys_at(params, 1)?;
+                let sel = state_selector_at(params, 2, method)?;
+                let o = engine_object(&self.engine_ready(g)?.get_proof(&addr, &keys, &sel.value))?;
+                Ok(Value::Object(o).to_string())
             }
             "eth_call" => self.eth_call(params, g),
             "eth_estimateGas" => self.eth_estimate_gas(params, g),
@@ -1323,6 +1339,33 @@ fn word32(v: &Value) -> Option<[u8; 32]> {
     let mut w = [0u8; 32];
     w[32 - raw.len()..].copy_from_slice(&raw);
     Some(w)
+}
+
+/// `eth_getProof`'s storage keys at params[i]: an array (null = none) of hex
+/// strings of at most 32 bytes each, read as [`word32`] reads a slot, and at
+/// most the engine's `MAX_PROOF_STORAGE_KEYS`. Handed on as the JSON array the
+/// request carried: the engine echoes each key in geth's form, which turns on
+/// how many digits it was given.
+fn storage_keys_at(p: &[Value], i: usize) -> Result<String, Fail> {
+    let keys = match p.get(i) {
+        None => return invalid(format!("missing argument {i}: the storage keys")),
+        Some(Value::Null) => return Ok("[]".into()),
+        Some(Value::Array(keys)) => keys,
+        Some(_) => return invalid(format!("invalid argument {i}: expected an array of storage keys")),
+    };
+    let max = myotis_engine::MAX_PROOF_STORAGE_KEYS;
+    if keys.len() > max {
+        return invalid(format!(
+            "invalid argument {i}: at most {max} storage keys, got {}",
+            keys.len()
+        ));
+    }
+    if let Some(k) = keys.iter().position(|key| word32(key).is_none()) {
+        return invalid(format!(
+            "invalid argument {i}: storage key {k} is not hex of at most 32 bytes"
+        ));
+    }
+    Ok(Value::Array(keys.clone()).to_string())
 }
 
 fn is_hex(s: &str) -> bool {

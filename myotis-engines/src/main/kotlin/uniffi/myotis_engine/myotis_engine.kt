@@ -716,6 +716,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_get_logs_json(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_get_proof_json(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_get_storage_at_json(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_get_storage_proof_json(
@@ -818,6 +820,8 @@ internal object UniffiLib {
     external fun uniffi_myotis_engine_fn_func_get_code_json(`handle`: Long,`address`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_get_logs_json(`handle`: Long,`filterJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_get_proof_json(`handle`: Long,`address`: RustBuffer.ByValue,`keys`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_get_storage_at_json(`handle`: Long,`address`: RustBuffer.ByValue,`position`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1048,6 +1052,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_get_logs_json() and 0xFFFF) != 29899) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_myotis_engine_checksum_func_get_proof_json() and 0xFFFF) != 51465) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_get_storage_at_json() and 0xFFFF) != 41050) {
@@ -1749,6 +1756,28 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         
         FfiConverterLong.lower(`handle`),
         FfiConverterString.lower(`filterJson`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * `eth_getProof` (EIP-1186, ABI ≥ 46): the result object, `{"error"}`, or
+         * `{"error","code":-32602}`. `keys` is the JSON array of storage keys as the
+         * request carried them (empty = none); `block` is applied or refused by the
+         * proof pin rules — a head tag, `finalized`, or the number of the head, of
+         * one of the recent heads before it, or of the finalized block (see
+         * `crate::host::get_proof_json`).
+         */ fun `getProofJson`(`handle`: kotlin.Long, `address`: kotlin.String, `keys`: kotlin.String, `block`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_get_proof_json(
+    
+        
+        FfiConverterLong.lower(`handle`),
+        FfiConverterString.lower(`address`),
+        FfiConverterString.lower(`keys`),
+        FfiConverterString.lower(`block`),_status)
 }
     )
     }

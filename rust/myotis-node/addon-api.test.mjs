@@ -252,6 +252,7 @@ const READS = {
   getTransactionByHashJson: (h, arg = HASH) => m.getTransactionByHashJson(h, arg),
   getCodeJson: (h, arg = ADDR) => m.getCodeJson(h, arg, 'latest'),
   getStorageAtJson: (h, arg = ADDR) => m.getStorageAtJson(h, arg, SLOT0, 'latest'),
+  getProofJson: (h, arg = ADDR) => m.getProofJson(h, arg, JSON.stringify([SLOT0]), 'latest'),
   getLogsJson: (h, arg = FILTER) => m.getLogsJson(h, arg),
   ethCallOverridesJson: (h, arg = 'latest') => m.ethCallOverridesJson(h, '', ADDR, '', '', arg, ''),
   importLogIndexFiles: (h, arg = JSON.stringify(['/nonexistent/logindex.db'])) => m.importLogIndexFiles(h, arg),

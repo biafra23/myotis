@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 45; // 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
+    static final int EXPECTED_ABI_VERSION = 46; // 46: get_proof_json; 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
 
     private static final boolean AVAILABLE = load();
 
@@ -292,6 +292,13 @@ final class RustEngineNative {
     /** Verified RAW-32-byte-position storage query (`eth_getStorageAt`) as JSON. */
     static String nativeGetStorageAtJson(long handle, String address, String position, String block) {
         return Myotis_engineKt.getStorageAtJson(handle, nz(address), nz(position), nz(block));
+    }
+
+    /** {@code eth_getProof} (ABI 46) as JSON: the result object, {@code {"error"}} or
+     *  {@code {"error","code":-32602}}; {@code keysJson} is the JSON array of storage
+     *  keys as the request carried them; {@code block} is held to the proof pin rules. */
+    static String nativeGetProofJson(long handle, String address, String keysJson, String block) {
+        return Myotis_engineKt.getProofJson(handle, nz(address), nz(keysJson), nz(block));
     }
 
     /** Verified {@code eth_call} over the revm executor, as JSON. */

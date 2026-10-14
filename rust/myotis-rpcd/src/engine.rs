@@ -27,6 +27,10 @@ pub trait Engine: Send + Sync {
     fn pending_nonce_overlay(&self, address: &str, mined: i64) -> i64;
     fn get_code(&self, address: &str, block: &str) -> String;
     fn get_storage_at(&self, address: &str, position: &str, block: &str) -> String;
+    /// `eth_getProof` (ABI 46): the EIP-1186 result object or an error
+    /// envelope; `keys` is the JSON array of storage keys as the request
+    /// carried them.
+    fn get_proof(&self, address: &str, keys: &str, block: &str) -> String;
     fn eth_call(&self, from: &str, to: &str, data: &str, value: &str, block: &str) -> String;
     #[allow(clippy::too_many_arguments)]
     fn eth_call_overrides(
@@ -135,6 +139,9 @@ impl Engine for FfiEngine {
     }
     fn get_storage_at(&self, address: &str, position: &str, block: &str) -> String {
         ffi::get_storage_at_json(self.handle, address.into(), position.into(), block.into())
+    }
+    fn get_proof(&self, address: &str, keys: &str, block: &str) -> String {
+        ffi::get_proof_json(self.handle, address.into(), keys.into(), block.into())
     }
     fn eth_call(&self, from: &str, to: &str, data: &str, value: &str, block: &str) -> String {
         ffi::eth_call_json(
