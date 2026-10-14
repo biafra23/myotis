@@ -211,6 +211,24 @@ interface NodeController {
     suspend fun resolveEnsOwnership(network: String, name: String): EnsOwnership? = null
 
     /**
+     * Whether [ethCall] works on this host — the Query tab's token balances show only
+     * then. Default false keeps hosts without the seam (and the test fakes) compiling.
+     */
+    val supportsEthCall: Boolean get() = false
+
+    /**
+     * A verified `eth_call` on [network]: [data] (0x-hex calldata) sent to the contract
+     * [to] from the anonymous sender, run by the engine's local EVM against the VERIFIED
+     * head's state (the `latest` selector) — the engine API's `VerifiedReads.callDetailed`.
+     * The Query tab builds its ERC-20 token balances on it ([readTokenBalance]). A revert
+     * or "no verified answer right now" is a status, not an exception; throws only when
+     * the network isn't running or its read surface is down. Hosts that return true from
+     * [supportsEthCall] must override this.
+     */
+    suspend fun ethCall(network: String, to: String, data: String): EthCallResult =
+        throw UnsupportedOperationException("eth_call is not available on this host")
+
+    /**
      * Whether [transactionHistory] works for [network] on this host. Desktop-mainnet-only
      * today (the TrueBlocks scan needs the JVM Java engine's internals); the defaults keep
      * Android/iOS compiling and hide the Query-tab section there.
@@ -248,6 +266,48 @@ data class AccountResult(
      *  ran against the beacon-attested block); -1 when none. The UI shows its age. */
     val blockTimestamp: Long = -1,
 )
+
+/** [EthCallResult.status]. Mirrors `io.myotis.api.CallResult.Status`. */
+enum class EthCallStatus {
+    /** Executed against verified state; the data is the ABI return (possibly empty). */
+    OK,
+    /** Executed and the contract reverted — a verified answer; the data is the payload. */
+    REVERTED,
+    /** No verified answer right now (not synced, no peer); retryable. */
+    UNAVAILABLE,
+    /** This engine will not answer this request on this build; permanent. */
+    REFUSED,
+    /** The call cannot succeed within its own limits (gas, funds). */
+    INFEASIBLE,
+}
+
+/** A verified `eth_call`'s outcome ([NodeController.ethCall]). Mirrors `io.myotis.api.CallResult`. */
+data class EthCallResult(
+    val status: EthCallStatus,
+    /** 0x-hex return data ([EthCallStatus.OK]) or revert payload ([EthCallStatus.REVERTED]); null otherwise. */
+    val dataHex: String?,
+    /** The engine's reason, when it gave one (unavailable / refused / infeasible). */
+    val detail: String? = null,
+) {
+    companion object {
+        /** From an engine outcome whose status enum carries [EthCallStatus]'s names
+         *  (`io.myotis.api.CallResult.Status`, the iOS backend's `RpcCallResult.Kind`). */
+        fun of(statusName: String, data: ByteArray?, detail: String?): EthCallResult =
+            EthCallResult(EthCallStatus.valueOf(statusName), data?.let { "0x" + toHex(it) }, detail)
+    }
+}
+
+/**
+ * [NodeController.ethCall]'s arguments as bytes, checked once for every host: [to] must be
+ * a 20-byte address — an engine reads an empty `to` as CONTRACT CREATION and would run the
+ * calldata as init code, a well-formed answer to a different question — and [data] hex.
+ * Throws [IllegalArgumentException] otherwise.
+ */
+fun ethCallArgs(to: String, data: String): Pair<ByteArray, ByteArray> {
+    require(isHexAddress(to)) { "eth_call needs a 20-byte contract address, got \"$to\"" }
+    val d = requireNotNull(hexToBytes(data)) { "malformed calldata: $data" }
+    return hexToBytes(to)!! to d
+}
 
 /** ENS resolution result. Mirrors `io.myotis.api.EnsResolutionResult`. */
 data class EnsResult(
@@ -425,6 +485,21 @@ interface Settings {
      */
     fun logIndexWatchJson(network: String): String = "[]"
     fun setLogIndexWatchJson(network: String, json: String) {}
+
+    /**
+     * The tokens the user added to [network]'s Query-tab token balances, beside the
+     * built-in [PopularTokens], as the JSON array [CustomTokens] serializes
+     * (`[{"address":"0x…","name":"…","decimals":N},…]`). Hosts store it verbatim (or
+     * through [CustomTokens.normalize]). Defaults keep hosts without the store compiling.
+     */
+    fun customTokensJson(network: String): String = "[]"
+    fun setCustomTokensJson(network: String, json: String) {}
+
+    /**
+     * Whether this host persists [customTokensJson] — the Query tab offers "Add token"
+     * only then: a form whose entries the host drops would be accepted-and-ignored.
+     */
+    fun supportsCustomTokens(): Boolean = false
 
     /** Backfill pacing for the log index, per network: true = max download
      *  speed (multi-batch ticks), false = nice background pace (one batch

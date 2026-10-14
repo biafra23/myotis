@@ -11,6 +11,8 @@ import io.myotis.ui.EnsOwnership
 import io.myotis.ui.EnsProfile
 import io.myotis.ui.EnsRecord
 import io.myotis.ui.EnsResult
+import io.myotis.ui.EthCallResult
+import io.myotis.ui.ethCallArgs
 import io.myotis.ui.readEnsProfile
 import io.myotis.ui.NetworkStatus
 import io.myotis.ui.NodeController
@@ -29,6 +31,10 @@ import io.myotis.ui.WebAccessMode
 import io.myotis.ui.WebOriginRow
 import java.io.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -229,6 +235,20 @@ class AndroidNodeController(
         }
     }
 
+    override val supportsEthCall: Boolean get() = true
+
+    override suspend fun ethCall(network: String, to: String, data: String): EthCallResult {
+        val svc = serviceProvider() ?: throw IllegalStateException("Node is not running")
+        val (toBytes, dataBytes) = ethCallArgs(to, data)
+        val future = svc.ethCall(network, toBytes, dataBytes)
+        // Wait the engine run out even when this read is cancelled: the query pool keeps
+        // running it either way, and the Query tab's bound on reads in flight must count
+        // it (the desktop's blocking withContext holds the same way). Then honour the cancel.
+        val r = withContext(NonCancellable) { future.await() }
+        currentCoroutineContext().ensureActive()
+        return EthCallResult.of(r.status().name, r.data(), r.detail())
+    }
+
     // TrueBlocks transaction history (Query tab add-on). The service builds the scan at
     // its composition root (NodeService.txHistoryService(), mainnet + Java engine only);
     // this bridge only maps events into the shared UI's models.
@@ -384,6 +404,13 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun logIndexWatchJson(network: String): String = NodeService.logIndexWatchJson(ctx, network)
     override fun setLogIndexWatchJson(network: String, json: String) =
         NodeService.setLogIndexWatchJson(ctx, network, json)
+    // The token list is the app's, not the node's: the node service never reads it, so it
+    // lives in the app's own preferences file rather than among NodeService's settings.
+    private val tokenPrefs by lazy { ctx.getSharedPreferences("myotis-tokens", Context.MODE_PRIVATE) }
+    override fun customTokensJson(network: String): String = tokenPrefs.getString(network, null) ?: "[]"
+    override fun setCustomTokensJson(network: String, json: String) =
+        tokenPrefs.edit().putString(network, json).apply()
+    override fun supportsCustomTokens(): Boolean = true
     override fun snapTarget(): Int = NodeService.snapTarget(ctx)
     override fun setSnapTarget(v: Int) = NodeService.setSnapTargetPref(ctx, v)
     override fun servedBlockWindow(): Int = NodeService.servedBlockWindow(ctx)

@@ -94,6 +94,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.async
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withContext
 import kotlin.time.Clock
 import kotlin.time.Instant
@@ -299,7 +300,7 @@ fun NodeScreen(
                     "Logs" -> LogsTab(logs, logFilter, onFilterChange = { logFilter = it })
                     "Index" -> IndexTab(controller, settings, current, network,
                         onLogIndexChanged = { logIndexRev++ })
-                    "Settings" -> SettingsTab(controller, settings, snapshots, webAccess, expert = expert,
+                    "Settings" -> SettingsTab(controller, settings, snapshots, webAccess, network, expert = expert,
                         onEnabledChanged = { enabledRev++ }, onLogIndexChanged = { logIndexRev++ },
                         onExpertChanged = { expertRev++ })
                 }
@@ -522,6 +523,8 @@ private fun SettingsTab(
     snapshots: Map<String, NodeSnapshot>,
     // The live web-page policy, hoisted in NodeScreen (shared with the Status banner).
     webAccess: WebAccessFields,
+    // The chain picked at the top: the Tokens section opens on it.
+    network: String,
     // Notifies the screen that the persisted enabled set changed, so the network
     // chips (derived from settings, not snapshot state) re-derive immediately.
     onEnabledChanged: () -> Unit = {},
@@ -589,6 +592,13 @@ private fun SettingsTab(
         if (settings.supportsWebAccess()) {
             HorizontalDivider()
             WebAccessSection(webAccess, snapshots)
+        }
+
+        // Tokens: which ERC-20 balances every Query lookup reads, per chain. Only where the
+        // host can make the verified eth_call the balances are — elsewhere no lookup shows one.
+        if (controller.supportsEthCall) {
+            HorizontalDivider()
+            TokenSettings(controller, settings, network, snapshots)
         }
 
         // Power: the rows that trade responsiveness for battery or CPU, one per host that
@@ -1437,6 +1447,11 @@ private fun QueryTab(
     // and load off the main thread (entries() reads a file) so composition never blocks on disk.
     // Keyed on `network` like the state it fills: a chain switch resets the list, so reload it.
     var historyList by remember(network) { mutableStateOf<List<QueryHistoryEntry>>(emptyList()) }
+    // What custom token contracts answered to decimals(), kept across lookups on this chain.
+    val tokenDecimals = remember(network) { mutableMapOf<String, Int>() }
+    // The token reads' in-flight bound, shared by every card this tab shows: a replaced
+    // card's reads run on to their end and must still count against it.
+    val tokenReadPermits = remember { Semaphore(TOKEN_READS_IN_FLIGHT) }
     LaunchedEffect(network) { historyList = withContext(Dispatchers.Default) { history.entries() } }
 
     // --- Transaction-history scan state (TrueBlocks index; desktop-mainnet-only hosts). ---
@@ -1634,6 +1649,20 @@ private fun QueryTab(
             )
             Spacer(Modifier.height(12.dp))
         }
+        // The looked-up address's ERC-20 balances (the built-in tokens + the user's own, set
+        // in Settings), each a verified eth_call — part of the result, on hosts that can make
+        // one. A new lookup drops this (the result leaves while it loads), and with it the
+        // old rows and their reads.
+        val tokenHolder = account?.address?.let(::asHexAddress)
+            ?.takeIf { !loading && error == null && controller.supportsEthCall }
+        val tokens = tokenHolder?.let {
+            rememberTokenBalances(
+                controller, settings, network, it,
+                ready = running && snap?.beaconState == "SYNCED",
+                contractDecimals = tokenDecimals,
+                permits = tokenReadPermits,
+            )
+        }
         when {
             loading -> Row(verticalAlignment = Alignment.CenterVertically) {
                 CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
@@ -1641,7 +1670,7 @@ private fun QueryTab(
                 Text(loadingMsg)
             }
             error != null -> Text("Error: $error", color = MaterialTheme.colorScheme.error)
-            account != null -> AccountResultView(account!!, nativeCurrencySymbol(network), expert)
+            account != null -> AccountResultView(account!!, nativeCurrencySymbol(network), expert, tokens, running)
         }
 
         // Transaction-history add-on (TrueBlocks Unchained Index): shown once an account
@@ -1976,7 +2005,14 @@ private fun looksLikeEnsName(input: String): Boolean {
  * start under [expert].
  */
 @Composable
-private fun AccountResultView(a: AccountResult, currency: String?, expert: Boolean) {
+private fun AccountResultView(
+    a: AccountResult,
+    currency: String?,
+    expert: Boolean,
+    // The address's token balances, read alongside; null where the host cannot read them.
+    tokens: TokenBalancesState?,
+    running: Boolean,
+) {
     val clipboard = LocalClipboardManager.current
     var showRaw by remember(expert) { mutableStateOf(expert) }
     Card(Modifier.fillMaxWidth()) {
@@ -1995,7 +2031,10 @@ private fun AccountResultView(a: AccountResult, currency: String?, expert: Boole
                 )
                 Spacer(Modifier.width(8.dp))
                 // One-tap copy of the FULL result (untruncated hex), for pasting into a block explorer.
-                OutlinedButton(onClick = { clipboard.setText(AnnotatedString(formatAccountResult(a, currency))) }) {
+                OutlinedButton(onClick = {
+                    val text = formatAccountResult(a, currency) + (tokens?.let(::formatTokenBalances) ?: "")
+                    clipboard.setText(AnnotatedString(text))
+                }) {
                     Text("Copy")
                 }
             }
@@ -2046,6 +2085,10 @@ private fun AccountResultView(a: AccountResult, currency: String?, expert: Boole
                     detail = rememberBlockAge(a.blockTimestamp),
                 )
             }
+            // Token balances are read whether or not the account exists: a token balance
+            // lives in the token's storage, and an address can hold one without ever having
+            // held the native currency.
+            tokens?.let { TokenBalancesSection(it, running) }
             TextButton(onClick = { showRaw = !showRaw }) {
                 Text(if (showRaw) "Hide raw details" else "Show raw details")
             }

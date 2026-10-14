@@ -126,6 +126,12 @@ class IosSettings : Settings {
     override fun setLogIndexWatchJson(network: String, json: String) =
         defaults.setObject(json, "$K_LOG_INDEX_WATCH_PREFIX$network")
 
+    override fun customTokensJson(network: String): String =
+        defaults.stringForKey("$K_CUSTOM_TOKENS_PREFIX$network") ?: "[]"
+    override fun setCustomTokensJson(network: String, json: String) =
+        defaults.setObject(json, "$K_CUSTOM_TOKENS_PREFIX$network")
+    override fun supportsCustomTokens(): Boolean = true   // NSUserDefaults, like the watch list
+
     override fun expertMode(): Boolean = getBool(K_EXPERT_MODE, false)
     override fun setExpertMode(v: Boolean) = defaults.setBool(v, K_EXPERT_MODE)
 
@@ -146,6 +152,7 @@ class IosSettings : Settings {
         const val K_LOG_INDEX_SPEED_PREFIX = "logIndex.maxSpeed."
         const val K_LOG_INDEX_PAUSED_PREFIX = "logIndex.backfillPaused."
         const val K_LOG_INDEX_WATCH_PREFIX = "logIndex.watch."
+        const val K_CUSTOM_TOKENS_PREFIX = "tokens.custom."
         const val K_SNAP = "snapTarget"
         const val K_SERVED_WINDOW = "servedBlockWindow"
         const val K_WS_BOUND = "wsBoundPeriods"
