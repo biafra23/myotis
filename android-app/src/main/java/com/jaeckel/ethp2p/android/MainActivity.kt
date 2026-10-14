@@ -33,11 +33,19 @@ import io.myotis.ui.NodeScreen
  * in `:ui` — none here — so there is zero UI duplication between Android and Desktop.
  */
 class MainActivity : ComponentActivity() {
-    private companion object {
+    companion object {
+        /** An Intent extra naming the tab to open on: a balance-change notification sends
+         *  "Watch" (BalanceWatchRunner). */
+        const val EXTRA_OPEN_TAB = "open_tab"
+
         /** The Logs-tab save waiting for the SAF picker (see createDocumentLauncher). */
         @Volatile
-        var pendingLogSave: ((android.net.Uri?) -> Unit)? = null
+        private var pendingLogSave: ((android.net.Uri?) -> Unit)? = null
     }
+
+    // Bumped by a tapped balance-change notification (onCreate / onNewIntent) to bring the
+    // shared screen's Watch tab forward.
+    private val watchRequests = mutableStateOf(0)
 
 
     // Exposed to Compose via a state holder so recomposition sees bind/unbind.
@@ -49,6 +57,12 @@ class MainActivity : ComponentActivity() {
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { _ -> startNodeService() }
+
+    // The Watch tab's ask (AndroidNodeController.onWatchListChanged): a denial only means
+    // changes show on the tab alone, which the tab says.
+    private val watchNotificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { _ -> }
 
     // Log-index snapshot import: the SAF picker's results must land in whatever
     // callback the shared UI's Import action registered (one pick in flight at
@@ -114,6 +128,7 @@ class MainActivity : ComponentActivity() {
                         // any and let the engine's format check refuse junk.
                         openDocumentsLauncher.launch(arrayOf("*/*"))
                     },
+                    requestNotifications = ::requestNotificationsForWatch,
                 )
             }
             val settings = remember { AndroidSettings(applicationContext) }
@@ -148,7 +163,10 @@ class MainActivity : ComponentActivity() {
             val history = remember { AndroidQueryHistoryAdapter(applicationContext) }
             MaterialTheme {
                 Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    NodeScreen(controller, settings, logs, netStatus, ::openWifiSettings, history)
+                    NodeScreen(
+                        controller, settings, logs, netStatus, ::openWifiSettings, history,
+                        watchRequests = watchRequests.value,
+                    )
                 }
             }
         }
@@ -167,6 +185,19 @@ class MainActivity : ComponentActivity() {
         if (savedInstanceState == null && !NodeService.isRunning()) {
             startNodeService()
         }
+        // Not on a recreation: the tab survives in the screen's own state, and re-reading the
+        // launch intent would pull the user back to Watch after every rotation.
+        if (savedInstanceState == null) openRequestedTab(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        openRequestedTab(intent)
+    }
+
+    private fun openRequestedTab(intent: Intent?) {
+        if (intent?.getStringExtra(EXTRA_OPEN_TAB) == "Watch") watchRequests.value++
     }
 
     override fun onStart() {
@@ -182,6 +213,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
+        // Ends the foreground's balance-watch schedule (WatchPolicy) — before the unbind
+        // below, which drops the reference.
+        boundServiceState.value?.onAppBackground()
         try {
             unbindService(connection)
         } catch (_: IllegalArgumentException) {
@@ -206,6 +240,17 @@ class MainActivity : ComponentActivity() {
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         } else {
             startNodeService()
+        }
+    }
+
+    /** Ask for POST_NOTIFICATIONS when the user watches an address on Android 13+ and it is
+     *  not granted yet. Once denied twice the system stops showing the dialog; the Watch tab
+     *  then says notifications are off. */
+    private fun requestNotificationsForWatch() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            watchNotificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 

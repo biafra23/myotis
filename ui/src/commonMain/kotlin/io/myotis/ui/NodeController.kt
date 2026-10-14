@@ -225,6 +225,36 @@ interface NodeController {
      */
     fun transactionHistory(network: String, address: String): Flow<TxScanEvent> = emptyFlow()
 
+    /**
+     * Check [network]'s watched balances now — the Watch tab's "Check now" — through the
+     * host's one [BalanceWatcher], so it never runs beside a scheduled check of the same
+     * network, and the host notifies any change exactly as it does for a scheduled one.
+     * Returns the changes found (usually none), or null when nothing was checked (nothing
+     * watched, a check already running, or a host without the feature). Throws when the
+     * network is not running. Hosts with [Settings.supportsBalanceWatch] override this.
+     */
+    suspend fun checkWatched(network: String): List<WatchChange>? = null
+
+    /**
+     * When this host checks watched balances on its own, as one sentence for the Watch
+     * tab (Android: in the foreground, and around sleep and wake while charging on an
+     * unmetered network). Null when it never does — the tab then says to use Check now.
+     */
+    val watchSchedule: String? get() = null
+
+    /**
+     * The Watch tab added an address to [network]'s list: the moment a host that has to
+     * ask for permission to notify (Android 13+, whose auto-started service never asks)
+     * asks, in context. Default no-op.
+     */
+    fun onWatchListChanged(network: String) {}
+
+    /** Why this host's change notifications cannot reach the user, when it knows they
+     *  cannot (Android: notifications turned off for the app; a desktop without a
+     *  notification route) — the Watch tab shows it above the list. Null = they can, or
+     *  the host cannot tell. */
+    val watchNotificationsNote: String? get() = null
+
     // Logs / Settings ops are added with their screens.
 }
 
@@ -442,6 +472,25 @@ interface Settings {
      *  engine-side: pausing and resuming never discards accumulated coverage. */
     fun logIndexBackfillPaused(network: String): Boolean = false
     fun setLogIndexBackfillPaused(network: String, on: Boolean) {}
+
+    /**
+     * Whether this host persists the balance watch's list and state AND checks them
+     * ([NodeController.checkWatched], its own schedule) — the Watch tab shows only then:
+     * a list the host drops or never checks would be accepted-and-ignored. Default false.
+     */
+    fun supportsBalanceWatch(): Boolean = false
+
+    /** [network]'s watched addresses, as the JSON array [BalanceWatch.serializeList] writes
+     *  (`[{"address":"0x…","label":"…"},…]`). The Watch tab edits it; the host's
+     *  [BalanceWatcher] reads it on every check. Stored verbatim. */
+    fun watchListJson(network: String): String = "[]"
+    fun setWatchListJson(network: String, json: String) {}
+
+    /** [network]'s watch state — last verified balances and the recent changes — as
+     *  [BalanceWatch.serializeState] writes it. Written only by the host's
+     *  [BalanceWatcher]; the Watch tab reads it. Stored verbatim. */
+    fun watchStateJson(network: String): String = "{}"
+    fun setWatchStateJson(network: String, json: String) {}
 
     /**
      * Minutes of no RPC/UI activity before a running stack is paused into idle sleep

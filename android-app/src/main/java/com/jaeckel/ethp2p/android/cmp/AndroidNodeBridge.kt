@@ -5,6 +5,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import com.jaeckel.ethp2p.android.AndroidQueryHistory
+import com.jaeckel.ethp2p.android.BalanceWatchRunner
 import com.jaeckel.ethp2p.android.NodeService
 import io.myotis.ui.AccountResult
 import io.myotis.ui.EnsOwnership
@@ -25,6 +26,7 @@ import io.myotis.ui.Settings
 import io.myotis.ui.TxRowUi
 import io.myotis.ui.TxScanEvent
 import io.myotis.ui.UpgradeNotice
+import io.myotis.ui.WatchChange
 import io.myotis.ui.WebAccessMode
 import io.myotis.ui.WebOriginRow
 import java.io.File
@@ -60,6 +62,9 @@ class AndroidNodeController(
      *  cancelled). Provided by the Activity (result launchers live there); null
      *  on hosts without one, which hides the Index tab's Import button. */
     private val pickFiles: (((List<android.net.Uri>) -> Unit) -> Unit)? = null,
+    /** Ask for POST_NOTIFICATIONS if it is not granted (the Activity owns the launcher);
+     *  called when the user watches an address — the notification is what they asked for. */
+    private val requestNotifications: () -> Unit = {},
 ) : NodeController {
 
     override val running: Boolean
@@ -246,6 +251,32 @@ class AndroidNodeController(
             .map { it.toUi() }
     }
 
+    // Balance watch (the Watch tab): the service's checks run through BalanceWatchRunner's
+    // one watcher; Check now joins it, so it never doubles a scheduled check.
+    override suspend fun checkWatched(network: String): List<WatchChange>? {
+        val svc = serviceProvider() ?: throw IllegalStateException("Node is not running")
+        svc.noteUiActivity()
+        val handle = svc.chainHandle(network) ?: throw IllegalStateException("$network is not running")
+        return BalanceWatchRunner.check(appContext, network, handle, NodeService.watchScanBlocks(appContext))
+    }
+
+    override val watchSchedule: String =
+        "Checked every few minutes while the app is open, and — while the phone charges on " +
+            "Wi-Fi or another unmetered network — before the node goes to sleep and when it " +
+            "wakes up (every 10 minutes while \"Stay awake while charging\" keeps it running). " +
+            "A change posts a notification."
+
+    override fun onWatchListChanged(network: String) = requestNotifications()
+
+    override val watchNotificationsNote: String?
+        get() = if (appContext.getSystemService(android.app.NotificationManager::class.java)
+                ?.areNotificationsEnabled() == false) {
+            "Notifications are off for Myotis, so changes show only on this tab. Turn them " +
+                "on in the system settings to hear about a change."
+        } else {
+            null
+        }
+
     private fun TxHistoryEvent.toUi(): TxScanEvent = when (this) {
         is TxHistoryEvent.Started -> TxScanEvent.Started(
             manifestCid, cidSource, totalChunks, latestIndexedBlock, headBlock)
@@ -419,6 +450,11 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun webAccessOrigins(): List<String> = NodeService.webAccessOrigins(ctx)
     override fun setWebAccessOrigins(origins: List<String>) = NodeService.setWebAccessOrigins(ctx, origins)
     override fun supportsWebAccess(): Boolean = true   // NodeService persists and pushes it
+    override fun supportsBalanceWatch(): Boolean = true // NodeService checks it (WatchPolicy)
+    override fun watchListJson(network: String): String = NodeService.watchListJson(ctx, network)
+    override fun setWatchListJson(network: String, json: String) = NodeService.setWatchListJson(ctx, network, json)
+    override fun watchStateJson(network: String): String = NodeService.watchStateJson(ctx, network)
+    override fun setWatchStateJson(network: String, json: String) = NodeService.setWatchStateJson(ctx, network, json)
 }
 
 /**

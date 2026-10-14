@@ -83,6 +83,29 @@ internal suspend fun watchWebRefusals(
     }
 }
 
+/** How often the scheduled balance-watch pass looks for a due network; the pass itself
+ *  checks each one only every WATCH_INTERVAL_MS. */
+private const val WATCH_TICK_MS = 30_000L
+
+/**
+ * The desktop's balance-watch schedule (the Watch tab): every [WATCH_TICK_MS], check each
+ * running, synced network whose watched balances are due ([DesktopNodeController.scheduledWatchChecks]
+ * — which also announces a change). Runs for the window's lifetime; one failed pass is
+ * logged and the next one tries again.
+ */
+internal suspend fun watchBalances(controller: DesktopNodeController) {
+    while (true) {
+        delay(WATCH_TICK_MS)
+        try {
+            controller.scheduledWatchChecks()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            log.warn("balance watch pass failed: {}", t.toString())
+        }
+    }
+}
+
 /**
  * Ask the desktop to draw the user's eye to [window]: flash its taskbar entry where the
  * platform does that per window (Windows), else bounce the dock icon once (macOS; not

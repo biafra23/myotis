@@ -115,7 +115,8 @@ private object NoQueryHistory : QueryHistory {
 /**
  * The shared Myotis screen — identical on Android, Desktop and iOS. A tab host over the
  * per-network [NodeController]/[Settings]/[LogSource] seam: Status / Query / Settings, plus
- * Logs and Index under [Settings.expertMode]. A phone-width window gets a bottom navigation
+ * Watch where the host checks watched balances ([Settings.supportsBalanceWatch]) and Logs
+ * and Index under [Settings.expertMode]. A phone-width window gets a bottom navigation
  * bar, a wider one the tab row under the header. [netStatus] feeds the readiness ladder
  * (the strip's and the status card's offline rung, and the Start gate) and
  * [onOpenNetworkSettings] opens the platform's network settings; both default to the
@@ -133,6 +134,10 @@ fun NodeScreen(
     // clicks a refused-web-page notification, so the banner with Allow is on screen.
     // 0 (the default) never switches.
     statusRequests: Int = 0,
+    // Bumped by the host to bring the Watch tab forward: a tapped balance-change
+    // notification opens on the change. 0 (the default) never switches; ignored where
+    // the host has no balance watch (no Watch tab).
+    watchRequests: Int = 0,
 ) {
     // remember(controller): snapshots() returns a fresh Flow each call, so collecting it
     // directly would re-subscribe on every recomposition. Retain it across recompositions.
@@ -168,12 +173,15 @@ fun NodeScreen(
     // A host may change the policy outside this screen (Android's notification Allow):
     // pick that up on the snapshot cadence so the screen never writes a stale list back.
     LaunchedEffect(snapshots) { webAccess.refresh() }
-    // Normal mode is the three screens a wallet user needs; Expert mode adds the Logs
-    // tab and — under the rule above — the Index tab.
+    // Normal mode is the screens a wallet user needs — Watch only where the host checks
+    // watched balances (Settings.supportsBalanceWatch); Expert mode adds the Logs tab and
+    // — under the rule above — the Index tab.
+    val showWatchTab = remember { settings.supportsBalanceWatch() }
     val tabs = remember(expert, showIndexTab) {
         buildList {
             add("Status")
             add("Query")
+            if (showWatchTab) add("Watch")
             if (expert) {
                 add("Logs")
                 if (showIndexTab) add("Index")
@@ -185,6 +193,7 @@ fun NodeScreen(
     // appears/disappears. A selection whose tab just vanished falls back to Status.
     var tabLabel by remember { mutableStateOf("Status") }
     LaunchedEffect(statusRequests) { if (statusRequests > 0) tabLabel = "Status" }
+    LaunchedEffect(watchRequests) { if (watchRequests > 0 && showWatchTab) tabLabel = "Watch" }
     val tab = tabs.indexOf(tabLabel).coerceAtLeast(0)
     // The fallback also RESETS the stale label: without this, a selection stuck on a
     // vanished tab would silently jump back to it if a future change ever flipped the
@@ -296,6 +305,7 @@ fun NodeScreen(
                         webAccess = webAccess, snapshots = snapshots,
                     )
                     "Query" -> QueryTab(controller, settings, current, network, history, expert)
+                    "Watch" -> WatchTab(controller, settings, current, network)
                     "Logs" -> LogsTab(logs, logFilter, onFilterChange = { logFilter = it })
                     "Index" -> IndexTab(controller, settings, current, network,
                         onLogIndexChanged = { logIndexRev++ })
@@ -2787,7 +2797,7 @@ private fun formatDuration(ms: Long): String {
 /** yyyy-MM-dd HH:mm in [tz] (a date the user plans around, not a log stamp) — cut from
  *  the ISO-8601 form, which is stable across kotlinx-datetime's field renames. */
 @OptIn(kotlin.time.ExperimentalTime::class)
-private fun formatDateTime(ms: Long, tz: TimeZone): String =
+internal fun formatDateTime(ms: Long, tz: TimeZone): String =
     Instant.fromEpochMilliseconds(ms).toLocalDateTime(tz).toString().take(16).replace('T', ' ')
 
 /** Wall-clock seconds, for a term's "in N days" on the ENS card. */

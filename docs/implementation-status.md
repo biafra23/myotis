@@ -195,6 +195,13 @@ An opt-in, per-network index of the logs of contracts the user chooses (the Expe
 
 `-PtorEngine` links Arti into the Rust engine; a Settings toggle (desktop and Android — the Android jniLibs run Arti on rustls/ring and the host names Arti's storage directories; not iOS yet) routes **account reads** (`get_account` — balance/nonce, and the account half of a code read) over per-address isolated Tor circuits and **the broadcast of the wallet's own transactions** (and their rebroadcasts) under a fresh isolation token per send, both with ephemeral RLPx keys, failing closed with no clearnet fallback; a send that went over Tor is never pushed from the real IP again (not rebroadcast, not re-pushed on a wallet's re-submit). Storage, `eth_call`, blocks, receipt polling, the CL fetch and discovery stay on the real IP, and the Tor reads and sends go only to the persisted Tor reserve — about a third of the verified peers (at most 24), moved out of the peer cache while Tor mode is on and never dialed directly again, ready ten minutes after their last direct contact (none ready → fail closed), with a Tor-side Hello that says `myotis` without the version — a first step toward the quarantined pool the design describes, not all of it. A finalized read over Tor is refused. Design, threat model and the validated proof of concept (`rust/tor-poc`): [privacy-and-tor.md](privacy-and-tor.md).
 
+## 13. Balance watch — the Watch tab
+**Implemented (native currency; Android and desktop)**
+
+The user lists addresses per network. The app checks their **verified** balances: an unverified read or one anchored at an older block changes nothing. Android checks while the app is in the foreground, and — plugged in on an unmetered network — right before the idle controller puts a stack to sleep, after a catch-up pass has woken one, and every 10 minutes while "Stay awake while charging" keeps it running. The desktop checks every 5 minutes while it runs. A change posts a notification and joins the tab's list. A scan of up to 64 blocks newest first (16 on a metered network) names the transactions from or to the address, a withdrawal, or a fee-recipient credit. When it finds none, the text says a contract moved the funds, or that the gap was wider than the scan. Design and schedule: [balance-watch.md](balance-watch.md).
+
+**Not implemented:** ERC-20 balances (the store is keyed by asset for them; they need #639's token list); iOS (no Watch tab: the C-ABI reader and the notification permission are not written); EIP-55 checks of mixed-case input (needs #639's Keccak-256); internal transfers named by their contract call (no engine serves traces).
+
 ## Summary
 
 | Architecture Section                 | Status          | Key Gap                                        |
@@ -211,5 +218,6 @@ An opt-in, per-network index of the logs of contracts the user chooses (the Expe
 | 10. Wallet Integration (JSON-RPC, all hosts) | **Implemented** | No WebSocket/`eth_subscribe`; loopback-only, no auth |
 | 11. Log index (`eth_getLogs`)        | **Implemented** (Rust only) | Seeds unmarked; verified bundles not built; no Java engine support |
 | 12. Tor routing                      | **Experimental** (Rust; desktop, Android) | Account reads and own sends only; a Tor reserve, not the full quarantined pool |
+| 13. Balance watch (Watch tab)        | **Implemented** (native currency; Android, desktop) | No ERC-20 yet (#639); no iOS host; a gap wider than the block scan names no transaction |
 
 The core verification pipeline (sync committees → state root → Merkle proofs → local EVM) is functional end-to-end in both engines, exposed as a verified JSON-RPC endpoint on every host, and used by a stock MetaMask to read, estimate and **send a real transaction** on a phone, by a Swarm Bee node as its chain RPC, and by embedders through the Node.js addon and the iOS frameworks. The biggest remaining work: historical-block verification (accumulators), the seeded-history provenance / verified-bundle path for deep log histories, and the Java engine's feature lag behind the Rust engine (or its retirement).

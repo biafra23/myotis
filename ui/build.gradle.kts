@@ -172,6 +172,11 @@ kotlin {
                 implementation(compose.ui)
                 implementation(libs.kotlinx.coroutines.core)
                 implementation(libs.kotlinx.datetime)  // local-time formatting in the Logs tab
+                // The balance watch's store and block reads (BalanceWatch.kt): JsonElement
+                // parsing only, no @Serializable classes, so no serialization plugin. Not a
+                // new artifact in any host — :jsonrpc-server, which all three bundle, already
+                // ships it.
+                implementation(libs.kotlinx.serialization.json)
             }
         }
         // CacheFileStats' stat/read actuals are plain java.nio, identical on the
