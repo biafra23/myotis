@@ -38,13 +38,23 @@ outside the stay-awake rule: on battery, or with the setting off, it would keep 
 node the user lets sleep. In the foreground the 5-minute check does tend to keep the
 node awake while the app is visible.
 
-A before-sleep check that sees the user come back meanwhile (a foreground or a query
-moves the UI clock) cancels that pause. A wallet request does not cancel it, because it
-looks the same as the check's own reads. That request simply wakes the stack again.
+The idle controller never pauses a stack while a check of it is queued or running. A
+before-sleep check that finds another check running skips that pause. A before-sleep
+check that sees the user come back meanwhile (a foreground or a query moves the UI
+clock) cancels that pause. A wallet request does not cancel it, because it looks the same
+as the check's own reads. That request simply wakes the stack again.
 
-Every check is bounded: 3 minutes for a scheduled or before-sleep one, and at most what
-is left of the catch-up slice for an after-wake one. Past the bound, addresses not read
-yet keep their stored state for the next check, and a cause search stops where it is.
+Every check is bounded:
+
+- 3 minutes for a scheduled or before-sleep check;
+- for an after-wake check, at most a minute of what is left of the stack's catch-up slice, ending 2 minutes before the pass's deadline (one read's own bound), so a read in flight cannot carry the pass past it.
+
+Past the bound, addresses not read yet keep their stored state, and a cause search stops
+where it is. Each check reads the least recently verified addresses first, so what one
+check left out leads the next.
+
+Check now runs in the host's own scope, off the main thread. Leaving the tab mid-check
+ends the tab's wait, not the check, so the check's results are still stored.
 
 ### Notification permission
 
@@ -82,8 +92,11 @@ In each block, the scan attributes these to the address:
 
 - a transaction **from** it (sent; its value excludes the fee) or **to** it (received);
 - one from it **to itself** (only the fee moves);
-- a beacon **withdrawal** credited to it (amounts are gwei);
-- the block's **fee recipient** credit (priority fees).
+- the block's **fee recipient** credit (priority fees; `miner`, a header field).
+
+Validator **withdrawals** are not attributed. Neither engine's block JSON carries the
+`withdrawals` list, only `withdrawalsRoot`. An engine that adds the list must verify it
+against that root before the scan may read it.
 
 A block the scan cannot read verified stops the scan: what it found is kept. A block it
 could not see is never read as "nothing found".
@@ -95,9 +108,15 @@ The result is one of these:
 - **unavailable:** a block had no verified answer;
 - **none:** no scan was attempted.
 
-When a complete scan finds nothing, a contract moved the funds: an internal transfer,
-such as a WETH unwrap, a DEX payout, or a multisig execution. The texts say so. Matching
-those would need traces, which no engine serves.
+When a complete scan finds nothing, the balance moved without a transaction of the
+address's own. The texts name what can do that:
+
+- a contract (an internal transfer, such as a WETH unwrap, a DEX payout, or a multisig execution);
+- a validator withdrawal;
+- a bridge credit, such as Gnosis minting bridged xDAI.
+
+Telling these apart would need traces, which no engine serves, or the verified
+withdrawals list.
 
 With a foreground check every 5 minutes, the gap is ~25 blocks on mainnet and ~60 on
 Gnosis, so the scan usually covers it. An hourly background gap (~300 / ~720 blocks)
@@ -110,7 +129,7 @@ as asked.
 - **State:** `Settings.watchStateJson(network)`. It holds the last verified balance, nonce, block and time per address, the last error, the last check and attempt times, and up to 50 changes, newest first. It is written only by the host's one `BalanceWatcher`. The watcher's per-network guard keeps two triggers, such as Check now and a scheduled check, from checking a network at once. The second trigger returns nothing rather than read every proof twice.
   - Android keeps both in the app's preferences, under `watch.list.<net>` and `watch.state.<net>`.
   - The desktop keeps the list in `settings.properties` (`watch.list.<net>`, normalized on load). The state goes in `watch-state-<net>.json` beside it, because it is rewritten on every check.
-- Removing an address drops its stored state at the next check. Its past changes stay in the list.
+- Removing an address drops its stored state: at once (`BalanceWatcher.prune`, through `onWatchListChanged`), or at the end of a check already running. Without this, removing the last address would leave its old balance as the baseline of a later re-add. Its past changes stay in the list.
 
 ## Code
 

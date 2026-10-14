@@ -1276,6 +1276,10 @@ public final class NodeService extends Service {
                                  engineResumeMs));
                 if (now - lastActivity <= idleMs) continue;
                 if (skipWhileCharging) continue; // plugged in on unmetered: keep awake and synced
+                // A balance check of this stack is queued or running (this very tick may have
+                // queued it): pausing now would only have its reads wake the stack again. Its
+                // reads count as activity, so a later tick judges the idle time afresh.
+                if (watchQueued.contains(n) || BalanceWatchRunner.isBusy(this, n)) continue;
                 // SYNCED-once gate: don't pause a stack still doing its initial sync — unless
                 // there's no network to sync over, in which case sleeping saves battery.
                 if (routine && !reachedSynced.contains(n)) {
@@ -1302,7 +1306,12 @@ public final class NodeService extends Service {
                     // user coming back meanwhile (a foreground or a query moves the UI clock)
                     // cancels the pause; a wallet request does not — it is indistinguishable
                     // from the check's own reads — and simply wakes the stack again.
-                    if (routine && watchBeforeSleep(n, h) && uiActivityMs != uiActivityAtDecision) {
+                    int watched = routine ? watchBeforeSleep(n, h) : WATCH_NOT_RUN;
+                    if (watched == WATCH_BUSY) {
+                        LogBuffer.i(TAG, "[" + n + "] a balance check is running; not pausing under it");
+                        return;
+                    }
+                    if (watched == WATCH_RAN && uiActivityMs != uiActivityAtDecision) {
                         LogBuffer.i(TAG, "[" + n + "] app in use again after the balance check; not pausing");
                         return;
                     }
@@ -1345,6 +1354,12 @@ public final class NodeService extends Service {
     });
     /** A scheduled or before-sleep check never runs longer than this. */
     private static final long WATCH_BUDGET_MS = 3 * 60_000L;
+    /** The after-wake check inside a catch-up pass: shorter, because the time is the pass's. */
+    private static final long WATCH_AFTER_WAKE_BUDGET_MS = 60_000L;
+    /** One read's own worst case (the Java engine bounds an account query at 120 s): the
+     *  budget is checked only before a read, so the after-wake check stops this much short
+     *  of the pass's deadline, which a read started just before it could otherwise pass. */
+    private static final long WATCH_READ_BOUND_MS = 120_000L;
 
     /** The idle tick's scheduled balance checks ({@link WatchPolicy#scheduledIntervalMs}):
      *  each RUNNING, synced stack whose watch list is due gets one, queued off the ticker. */
@@ -1383,17 +1398,23 @@ public final class NodeService extends Service {
         }
     }
 
+    /** {@link #watchBeforeSleep}'s outcomes. */
+    private static final int WATCH_NOT_RUN = 0;
+    private static final int WATCH_RAN = 1;
+    /** Another trigger's check of the network holds the watcher: the pause must wait for it. */
+    private static final int WATCH_BUSY = 2;
+
     /** The before-sleep check (see the idle tick): runs it when the stack is about to pause
      *  plugged in on an unmetered network, watches something, is synced and was not checked
-     *  within {@link WatchPolicy#FRESH_MS}. True when a check ran. */
-    private boolean watchBeforeSleep(String n, ChainHandle h) {
+     *  within {@link WatchPolicy#FRESH_MS}. */
+    private int watchBeforeSleep(String n, ChainHandle h) {
         android.content.Context app = getApplicationContext();
-        if (!watchBackgroundApplies(app)) return false;
-        if (!BalanceWatchRunner.isDue(app, n, WatchPolicy.FRESH_MS, WatchPolicy.FRESH_MS)) return false;
-        if (!isSyncedWarm(h)) return false;
-        BalanceWatchRunner.checkBlocking(app, n, h, WatchPolicy.scanBlocks(true), WATCH_BUDGET_MS,
-                "before sleep");
-        return true;
+        if (!watchBackgroundApplies(app)) return WATCH_NOT_RUN;
+        if (!BalanceWatchRunner.isDue(app, n, WatchPolicy.FRESH_MS, WatchPolicy.FRESH_MS)) return WATCH_NOT_RUN;
+        if (!isSyncedWarm(h)) return WATCH_NOT_RUN;
+        int found = BalanceWatchRunner.checkBlocking(app, n, h, WatchPolicy.scanBlocks(true),
+                WATCH_BUDGET_MS, "before sleep");
+        return found < 0 && BalanceWatchRunner.isBusy(app, n) ? WATCH_BUSY : WATCH_RAN;
     }
 
     /** Plugged in on an unmetered network ({@link WatchPolicy#backgroundApplies}). */
@@ -1722,11 +1743,12 @@ public final class NodeService extends Service {
             // activity clock: only activity that arrived during the wait counts as real.
             boolean activityArrived = h.lastActivityEpochMillis() != activityBefore;
             // Balance watch: the stack is awake and at the head — check the watched balances
-            // before it sleeps again (the after-wake check, WatchPolicy), within what is left
-            // of the slice and never past the pass's own deadline.
-            long watchBudgetMs = Math.min(WATCH_BUDGET_MS,
+            // before it sleeps again (the after-wake check, WatchPolicy). Its budget is what is
+            // left of this stack's own slice, at most a minute, and it stops one read's bound
+            // short of the pass's deadline, so a read in flight cannot carry the pass past it.
+            long watchBudgetMs = Math.min(WATCH_AFTER_WAKE_BUDGET_MS,
                     Math.min((deadlineNano - System.nanoTime()) / 1_000_000L,
-                            (passEndNano - System.nanoTime()) / 1_000_000L));
+                            (passEndNano - System.nanoTime()) / 1_000_000L - WATCH_READ_BOUND_MS));
             if (watchBudgetMs > 0 && watchBackgroundApplies(c)
                     && BalanceWatchRunner.isDue(c, n, WatchPolicy.FRESH_MS, WatchPolicy.FRESH_MS)
                     && isSyncedWarm(h)) {

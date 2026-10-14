@@ -97,7 +97,9 @@ internal suspend fun watchBalances(controller: DesktopNodeController) {
     while (true) {
         delay(WATCH_TICK_MS)
         try {
-            controller.scheduledWatchChecks()
+            // Off the window's thread: status(), the state file and the block parses are all
+            // blocking or CPU work (the refusal watcher below hops the same way).
+            withContext(Dispatchers.IO) { controller.scheduledWatchChecks() }
         } catch (e: CancellationException) {
             throw e
         } catch (t: Throwable) {

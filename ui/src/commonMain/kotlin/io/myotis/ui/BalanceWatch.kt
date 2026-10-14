@@ -79,8 +79,6 @@ enum class WatchCauseKind {
     RECEIVED,
     /** A transaction from the address to itself: only the fee moves the balance. */
     SELF,
-    /** A beacon-chain withdrawal credited to the address (no transaction). */
-    WITHDRAWAL,
     /** The address was the block's fee recipient (priority fees, no transaction). */
     FEE_RECIPIENT,
 }
@@ -89,13 +87,13 @@ enum class WatchCauseKind {
 data class WatchCause(
     val kind: WatchCauseKind,
     val blockNumber: Long,
-    /** The transaction's hash; null for a withdrawal or a fee-recipient credit. */
+    /** The transaction's hash; null for a fee-recipient credit. */
     val txHash: String? = null,
     /** The other side: the recipient of a sent transaction (null for a contract
      *  creation), the sender of a received one. */
     val counterparty: String? = null,
-    /** The amount in decimal wei: a transaction's value, a withdrawal's amount; null
-     *  when the block alone does not tell it (a fee-recipient credit). */
+    /** The amount in decimal wei: a transaction's value; null when the block alone does
+     *  not tell it (a fee-recipient credit). */
     val valueWei: String? = null,
 )
 
@@ -353,12 +351,16 @@ object BalanceWatch {
      * Whether a scheduled check of a network is due: the last VERIFIED check is at least
      * [intervalMs] old and the last attempt (which a failing read also stamps) at least
      * [retryMs] — so a network that cannot verify right now is retried at the slower
-     * pace instead of on every host tick.
+     * pace instead of on every host tick. A stamp in the future (written while the clock
+     * ran ahead, then corrected) counts as old: otherwise no check would run until the
+     * clock caught up with it.
      */
     @JvmStatic
     fun isDue(state: WatchState, nowMs: Long, intervalMs: Long, retryMs: Long): Boolean =
-        (state.lastCheckMs == 0L || nowMs - state.lastCheckMs >= intervalMs) &&
-            (state.lastAttemptMs == 0L || nowMs - state.lastAttemptMs >= retryMs)
+        elapsed(state.lastCheckMs, nowMs, intervalMs) && elapsed(state.lastAttemptMs, nowMs, retryMs)
+
+    private fun elapsed(stampMs: Long, nowMs: Long, intervalMs: Long): Boolean =
+        stampMs == 0L || nowMs < stampMs || nowMs - stampMs >= intervalMs
 
     // ---- the check ----
 
@@ -375,7 +377,8 @@ object BalanceWatch {
      * (WorkManager stops a worker at ~10 min). It is checked before every read: past it,
      * the cause search stops where it is (the change keeps what it found, as PARTIAL)
      * and the addresses not read yet keep their stored state untouched, for the next
-     * check. A single read already running is not cut short; its own bound applies.
+     * check — which reads them first: addresses go least recently verified first. A
+     * single read already running is not cut short; its own bound applies.
      */
     suspend fun check(
         entries: List<WatchEntry>,
@@ -390,7 +393,11 @@ object BalanceWatch {
         val addresses = LinkedHashMap<String, WatchAddressState>()
         val found = ArrayList<WatchChange>()
         var anyVerified = false
-        for (e in entries) {
+        // Least recently verified first (never verified before all): when the budget runs
+        // out, the addresses it did not reach lead the next check instead of trailing
+        // every check behind the same ones.
+        val order = entries.sortedBy { previous.addresses[key(it.address)]?.seen?.checkedAtMs ?: Long.MIN_VALUE }
+        for (e in order) {
             val key = key(e.address)
             val prev = previous.addresses[key] ?: WatchAddressState()
             if (outOfTime()) {
@@ -489,10 +496,16 @@ object BalanceWatch {
 
     /**
      * What in block [blockNumber] — `eth_getBlockByNumber` JSON with full transactions —
-     * touched [address]: transactions from or to it, withdrawals credited to it, and the
-     * fee-recipient credit. Null when [blockJson] is no such block (the literal "null",
-     * an error envelope, a hashes-only body, unparseable text): the caller must not read
-     * "nothing found" into a block it could not see.
+     * touched [address]: transactions from or to it (verified against the header's
+     * `transactionsRoot` by the engine) and the fee-recipient credit (`miner`, a header
+     * field). Null when [blockJson] is no such block (the literal "null", an error
+     * envelope, a hashes-only body, unparseable text): the caller must not read "nothing
+     * found" into a block it could not see.
+     *
+     * Not withdrawals: neither engine's block JSON carries the `withdrawals` list (only
+     * `withdrawalsRoot`), so a validator withdrawal is one of the things the texts name
+     * as moving funds without a transaction. Should an engine add the list, it must
+     * verify it against `withdrawalsRoot` before this reads it.
      */
     @JvmStatic
     fun causesIn(blockJson: String, address: String, blockNumber: Long): List<WatchCause>? {
@@ -520,16 +533,6 @@ object BalanceWatch {
                     else -> null
                 },
                 valueWei = tx.str("value")?.let(::hexToDecimal),
-            )
-        }
-        (o["withdrawals"] as? JsonArray)?.forEach { el ->
-            val w = el as? JsonObject ?: return@forEach
-            if (w.str("address")?.lowercase() != me) return@forEach
-            out += WatchCause(
-                kind = WatchCauseKind.WITHDRAWAL,
-                blockNumber = blockNumber,
-                // Withdrawal amounts are in gwei.
-                valueWei = w.str("amount")?.let(::hexToDecimal)?.let { if (it == "0") "0" else it + "000000000" },
             )
         }
         if (o.str("miner")?.lowercase() == me) {
@@ -581,7 +584,8 @@ object BalanceWatch {
         val sentNote = if (sent > 0) " The address sent $sent transaction${if (sent == 1L) "" else "s"} meanwhile." else ""
         return when (c.search) {
             WatchSearch.COMPLETE ->
-                "No transaction from or to this address in $range: a contract moved the funds (an internal transfer).$sentNote"
+                "No transaction from or to this address in $range: the balance moved without one — " +
+                    "through a contract (an internal transfer), a validator withdrawal or a bridge.$sentNote"
             WatchSearch.PARTIAL ->
                 "No transaction from or to this address in the newest $range; the change happened in the " +
                     "${grouped(c.toBlock - c.fromBlock)} blocks since the last check.$sentNote"
@@ -599,7 +603,6 @@ object BalanceWatch {
             WatchCauseKind.SENT ->
                 "sent$amount to ${x.counterparty?.let(::shortAddress) ?: "a new contract"}$tx"
             WatchCauseKind.SELF -> "a transaction to itself$tx"
-            WatchCauseKind.WITHDRAWAL -> "a validator withdrawal of${amount.ifEmpty { " ?" }} in block ${grouped(x.blockNumber)}"
             WatchCauseKind.FEE_RECIPIENT -> "fees as block ${grouped(x.blockNumber)}'s fee recipient"
         }.replaceFirstChar { it.uppercase() }
     }
@@ -745,8 +748,29 @@ class BalanceWatcher(
         }
     }
 
-    /** Whether a check of [network] is running right now (the Watch tab's "Checking…"). */
+    /** Whether a check of [network] is running right now. */
     suspend fun isChecking(network: String): Boolean = guard.withLock { network in inFlight }
+
+    /**
+     * Drop the stored state of addresses no longer on [network]'s list — what every check
+     * does on its write, for a list edit no check follows: removing the last address
+     * leaves nothing to check, and without this its old balance would be the baseline of
+     * a later re-add, which would then announce the whole difference as a change. A check
+     * already running drops them on its own write; this one then does nothing.
+     */
+    suspend fun prune(network: String) {
+        if (!guard.withLock { inFlight.add(network) }) return
+        try {
+            val state = BalanceWatch.parseState(settings.watchStateJson(network))
+            val listed = BalanceWatch.parseList(settings.watchListJson(network)).mapTo(HashSet()) { BalanceWatch.key(it.address) }
+            if (state.addresses.keys.all { it in listed }) return
+            settings.setWatchStateJson(network, BalanceWatch.serializeState(
+                state.copy(addresses = state.addresses.filterKeys { it in listed }),
+            ))
+        } finally {
+            guard.withLock { inFlight.remove(network) }
+        }
+    }
 }
 
 /** The wall clock in unix ms; kotlin.time's Clock is @ExperimentalTime in the 2.2 stdlib. */

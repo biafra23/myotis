@@ -84,6 +84,8 @@ class BalanceWatchTest {
         assertTrue(!BalanceWatch.isDue(s, 11_500, intervalMs = 10_000, retryMs = 7_000))
         assertTrue(BalanceWatch.isDue(s, 12_000, intervalMs = 10_000, retryMs = 7_000))
         assertTrue(BalanceWatch.isDue(WatchState(), 0, intervalMs = 10_000, retryMs = 1))
+        // Stamps from a clock that ran ahead and was corrected must not stall every check.
+        assertTrue(BalanceWatch.isDue(WatchState(lastCheckMs = 90_000, lastAttemptMs = 90_000), 1_000, 10_000, 2_000))
     }
 
     // ---- the check ----
@@ -233,6 +235,25 @@ class BalanceWatchTest {
     }
 
     @Test
+    fun theLeastRecentlyVerifiedAddressIsReadFirst() = runBlocking {
+        val carol = "0x" + "c3".repeat(20)
+        val prev = WatchState(addresses = mapOf(
+            alice to WatchAddressState(WatchSeen("1", 0, 100, -1, checkedAtMs = 50)),
+            bob to WatchAddressState(WatchSeen("1", 0, 100, -1, checkedAtMs = 10)),
+        ))
+        val read = ArrayList<String>()
+        val r = object : FakeReader() {
+            override suspend fun account(address: String): AccountResult {
+                read += address
+                return account(address, "1", block = 101)
+            }
+        }
+        BalanceWatch.check(listOf(WatchEntry(alice, ""), WatchEntry(bob, ""), WatchEntry(carol, "")), prev, r, nowMs = 60)
+        // Never verified first, then by age: what a spent budget left out leads the next check.
+        assertEquals(listOf(carol, bob, alice), read)
+    }
+
+    @Test
     fun aRemovedAddressLosesItsStateButNotItsHistory() = runBlocking {
         val prev = stateWith(alice, "10", block = 100).let {
             it.copy(changes = listOf(change(alice)))
@@ -258,8 +279,7 @@ class BalanceWatchTest {
                  "accessList":[{"address":"$bob","storageKeys":["0x00"]}]}
             ],
             "withdrawals":[
-                {"index":"0x1","validatorIndex":"0x2","address":"$alice","amount":"0x3b9aca00"},
-                {"index":"0x2","validatorIndex":"0x3","address":"$bob","amount":"0x1"}
+                {"index":"0x1","validatorIndex":"0x2","address":"$alice","amount":"0x3b9aca00"}
             ]
         }"""
         assertEquals(
@@ -268,8 +288,7 @@ class BalanceWatchTest {
                 WatchCause(WatchCauseKind.SENT, 16, "0x02", null, "0"),
                 WatchCause(WatchCauseKind.SELF, 16, "0x03", null, "0"),
                 WatchCause(WatchCauseKind.RECEIVED, 16, "0x05", bob, "2"),
-                // 1 gwei-denominated ether: 0x3b9aca00 gwei = 1 ETH.
-                WatchCause(WatchCauseKind.WITHDRAWAL, 16, valueWei = "1000000000000000000"),
+                // A withdrawals list is not read: no engine verifies one into its block JSON.
                 WatchCause(WatchCauseKind.FEE_RECIPIENT, 16),
             ),
             BalanceWatch.causesIn(json, alice, 16),
@@ -333,6 +352,20 @@ class BalanceWatchTest {
         val watcher = BalanceWatcher(store) { 100 }
         assertEquals(emptyList<Any>(), watcher.check("mainnet", reader))
         assertEquals(setOf(alice), BalanceWatch.parseState(store.watchStateJson("mainnet")).addresses.keys)
+    }
+
+    @Test
+    fun pruningAnEmptiedListForgetsTheOldBaseline() = runBlocking {
+        val store = StoreSettings()
+        store.setWatchStateJson("mainnet", BalanceWatch.serializeState(stateWith(alice, "5", block = 100)))
+        val watcher = BalanceWatcher(store) { 100 }
+        // The last address was removed: no check follows, so the edit prunes.
+        watcher.prune("mainnet")
+        assertEquals(emptySet<String>(), BalanceWatch.parseState(store.watchStateJson("mainnet")).addresses.keys)
+        // Re-adding it later starts from a fresh baseline, not the forgotten balance.
+        store.setWatchListJson("mainnet", BalanceWatch.serializeList(listOf(WatchEntry(alice, ""))))
+        val r = FakeReader().apply { balances[alice] = account(alice, "9", block = 500) }
+        assertEquals(emptyList<Any>(), watcher.check("mainnet", r))
     }
 
     @Test

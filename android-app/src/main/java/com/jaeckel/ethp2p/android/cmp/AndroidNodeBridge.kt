@@ -266,7 +266,10 @@ class AndroidNodeController(
             "wakes up (every 10 minutes while \"Stay awake while charging\" keeps it running). " +
             "A change posts a notification."
 
-    override fun onWatchListChanged(network: String) = requestNotifications()
+    override fun onWatchListChanged(network: String, added: Boolean) {
+        BalanceWatchRunner.listChanged(appContext, network)
+        if (added) requestNotifications()
+    }
 
     override val watchNotificationsNote: String?
         get() = if (appContext.getSystemService(android.app.NotificationManager::class.java)

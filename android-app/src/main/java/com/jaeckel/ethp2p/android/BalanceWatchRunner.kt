@@ -16,7 +16,11 @@ import io.myotis.ui.WatchChange
 import io.myotis.ui.WatchReader
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.runInterruptible
 
@@ -43,6 +47,11 @@ object BalanceWatchRunner {
     @Volatile
     private var watcher: BalanceWatcher? = null
 
+    /** Where Check now and list edits run: off the main thread (a cause scan parses up to
+     *  64 full blocks), and outliving the Watch tab's composition, so leaving the tab
+     *  mid-check stops the tab's wait, not the check. */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
     private fun watcher(c: Context): BalanceWatcher =
         watcher ?: synchronized(this) {
             watcher ?: BalanceWatcher(AndroidSettings(c.applicationContext)).also { watcher = it }
@@ -64,26 +73,44 @@ object BalanceWatchRunner {
     /**
      * Check [network] over [handle] now and notify each change; blocking, for the service's
      * threads and the catch-up workers. Returns the number of changes, or -1 when nothing
-     * was checked (nothing watched, or a check of [network] already running). Never throws:
-     * a failed check is logged and the next trigger tries again.
+     * was checked (nothing watched, or a check of [network] already running — [isBusy] tells
+     * which). Never throws: a failed check is logged and the next trigger tries again. An
+     * interrupt is kept on the thread for its owner to see.
      */
     @JvmStatic
     fun checkBlocking(c: Context, network: String, handle: ChainHandle, scanBlocks: Int, budgetMs: Long, why: String): Int =
         try {
-            runBlocking { check(c, network, handle, scanBlocks, budgetMs.milliseconds, why) }?.size ?: -1
+            runBlocking { run(c, network, handle, scanBlocks, budgetMs.milliseconds, why) }?.size ?: -1
         } catch (t: Throwable) {
+            if (t is InterruptedException) Thread.currentThread().interrupt()
             LogBuffer.w(TAG, "[$network] balance watch ($why) failed: $t")
             -1
         }
 
-    /** [checkBlocking] for coroutine callers (the Watch tab's Check now); throws what the reads throw. */
-    suspend fun check(
+    /** Whether a check of [network] is running right now (any trigger's). */
+    @JvmStatic
+    fun isBusy(c: Context, network: String): Boolean = runBlocking { watcher(c).isChecking(network) }
+
+    /** The Watch tab's Check now: [run] in this object's scope; throws what the reads throw. */
+    suspend fun check(c: Context, network: String, handle: ChainHandle, scanBlocks: Int): List<WatchChange>? =
+        scope.async { run(c, network, handle, scanBlocks, Duration.INFINITE, "check now") }.await()
+
+    /** The Watch tab edited [network]'s list: drop what was removed (BalanceWatcher.prune). */
+    @JvmStatic
+    fun listChanged(c: Context, network: String) {
+        scope.launch {
+            runCatching { watcher(c).prune(network) }
+                .onFailure { LogBuffer.w(TAG, "[$network] balance watch prune failed: $it") }
+        }
+    }
+
+    private suspend fun run(
         c: Context,
         network: String,
         handle: ChainHandle,
         scanBlocks: Int,
-        budget: Duration = Duration.INFINITE,
-        why: String = "check now",
+        budget: Duration,
+        why: String,
     ): List<WatchChange>? {
         val changes = watcher(c).check(network, HandleReader(handle), scanBlocks, budget) ?: return null
         LogBuffer.i(TAG, "[$network] balance watch ($why): " +
@@ -125,6 +152,7 @@ object BalanceWatchRunner {
                 c, id,
                 Intent(c, MainActivity::class.java)
                     .putExtra(MainActivity.EXTRA_OPEN_TAB, "Watch")
+                    .putExtra(MainActivity.EXTRA_NETWORK, network)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )

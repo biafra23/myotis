@@ -229,6 +229,8 @@ interface NodeController {
      * Check [network]'s watched balances now — the Watch tab's "Check now" — through the
      * host's one [BalanceWatcher], so it never runs beside a scheduled check of the same
      * network, and the host notifies any change exactly as it does for a scheduled one.
+     * Hosts run it in a scope of their own, off the main thread: cancelling the caller
+     * (the tab left mid-check) stops the wait, never the check, so what it found is stored.
      * Returns the changes found (usually none), or null when nothing was checked (nothing
      * watched, a check already running, or a host without the feature). Throws when the
      * network is not running. Hosts with [Settings.supportsBalanceWatch] override this.
@@ -243,11 +245,14 @@ interface NodeController {
     val watchSchedule: String? get() = null
 
     /**
-     * The Watch tab added an address to [network]'s list: the moment a host that has to
-     * ask for permission to notify (Android 13+, whose auto-started service never asks)
-     * asks, in context. Default no-op.
+     * The Watch tab changed [network]'s list — [added] an address, or removed one. The host
+     * drops the removed addresses' stored state ([BalanceWatcher.prune]: with no check to
+     * follow the edit, an old balance would otherwise be the baseline of a later re-add)
+     * and, on an add, a host that has to ask for permission to notify (Android 13+, whose
+     * auto-started service never asks) asks now, in context. Returns at once; the work
+     * runs on the host's own threads. Default no-op.
      */
-    fun onWatchListChanged(network: String) {}
+    fun onWatchListChanged(network: String, added: Boolean) {}
 
     /** Why this host's change notifications cannot reach the user, when it knows they
      *  cannot (Android: notifications turned off for the app; a desktop without a

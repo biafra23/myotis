@@ -135,9 +135,11 @@ fun NodeScreen(
     // 0 (the default) never switches.
     statusRequests: Int = 0,
     // Bumped by the host to bring the Watch tab forward: a tapped balance-change
-    // notification opens on the change. 0 (the default) never switches; ignored where
-    // the host has no balance watch (no Watch tab).
+    // notification opens on the change — on [watchNetwork]'s chain when it names one.
+    // 0 (the default) never switches; ignored where the host has no balance watch (no
+    // Watch tab).
     watchRequests: Int = 0,
+    watchNetwork: String? = null,
 ) {
     // remember(controller): snapshots() returns a fresh Flow each call, so collecting it
     // directly would re-subscribe on every recomposition. Retain it across recompositions.
@@ -193,7 +195,6 @@ fun NodeScreen(
     // appears/disappears. A selection whose tab just vanished falls back to Status.
     var tabLabel by remember { mutableStateOf("Status") }
     LaunchedEffect(statusRequests) { if (statusRequests > 0) tabLabel = "Status" }
-    LaunchedEffect(watchRequests) { if (watchRequests > 0 && showWatchTab) tabLabel = "Watch" }
     val tab = tabs.indexOf(tabLabel).coerceAtLeast(0)
     // The fallback also RESETS the stale label: without this, a selection stuck on a
     // vanished tab would silently jump back to it if a future change ever flipped the
@@ -218,6 +219,13 @@ fun NodeScreen(
         (settings.enabledNetworks() + snapshots.keys).distinct()
     }
     var selected by remember { mutableStateOf<String?>(null) }
+    // A watch request opens the Watch tab, on the chain it names (when the chips offer it).
+    LaunchedEffect(watchRequests) {
+        if (watchRequests > 0 && showWatchTab) {
+            tabLabel = "Watch"
+            watchNetwork?.let { selected = it }
+        }
+    }
     val network = selected?.takeIf { it in chains } ?: chains.firstOrNull() ?: settings.primaryNetwork()
     val current = snapshots[network]
     // Per-network log-index head catch-up for the top bar. Every network is observed on

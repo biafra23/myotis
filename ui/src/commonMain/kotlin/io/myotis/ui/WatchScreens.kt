@@ -135,7 +135,7 @@ internal fun WatchTab(
             address = ""
             label = ""
             rev++
-            controller.onWatchListChanged(network)
+            controller.onWatchListChanged(network, added = true)
             if (running) runCheck()
         }
         OutlinedTextField(
@@ -213,6 +213,7 @@ internal fun WatchTab(
                         val current = BalanceWatch.parseList(settings.watchListJson(network))
                         settings.setWatchListJson(network, BalanceWatch.serializeList(current.filter { it.address != e.address }))
                         rev++
+                        controller.onWatchListChanged(network, added = false)
                     },
                 )
             }

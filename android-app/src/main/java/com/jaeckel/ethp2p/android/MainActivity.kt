@@ -38,6 +38,9 @@ class MainActivity : ComponentActivity() {
          *  "Watch" (BalanceWatchRunner). */
         const val EXTRA_OPEN_TAB = "open_tab"
 
+        /** With [EXTRA_OPEN_TAB]: the chain to select, e.g. the network a change happened on. */
+        const val EXTRA_NETWORK = "network"
+
         /** The Logs-tab save waiting for the SAF picker (see createDocumentLauncher). */
         @Volatile
         private var pendingLogSave: ((android.net.Uri?) -> Unit)? = null
@@ -46,6 +49,7 @@ class MainActivity : ComponentActivity() {
     // Bumped by a tapped balance-change notification (onCreate / onNewIntent) to bring the
     // shared screen's Watch tab forward.
     private val watchRequests = mutableStateOf(0)
+    private val watchNetwork = mutableStateOf<String?>(null)
 
 
     // Exposed to Compose via a state holder so recomposition sees bind/unbind.
@@ -166,6 +170,7 @@ class MainActivity : ComponentActivity() {
                     NodeScreen(
                         controller, settings, logs, netStatus, ::openWifiSettings, history,
                         watchRequests = watchRequests.value,
+                        watchNetwork = watchNetwork.value,
                     )
                 }
             }
@@ -197,7 +202,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun openRequestedTab(intent: Intent?) {
-        if (intent?.getStringExtra(EXTRA_OPEN_TAB) == "Watch") watchRequests.value++
+        if (intent?.getStringExtra(EXTRA_OPEN_TAB) != "Watch") return
+        watchNetwork.value = intent.getStringExtra(EXTRA_NETWORK)
+        watchRequests.value++
     }
 
     override fun onStart() {

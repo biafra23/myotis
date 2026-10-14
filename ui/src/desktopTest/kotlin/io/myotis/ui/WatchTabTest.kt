@@ -56,7 +56,9 @@ class WatchTabTest {
         private val onCheck: suspend (String) -> List<WatchChange>? = { emptyList() },
     ) : FakeController() {
         var checks = 0
+        val listChanges = ArrayList<Boolean>()
         override val running: Boolean = runningNode
+        override fun onWatchListChanged(network: String, added: Boolean) { listChanges += added }
         override fun snapshots(): Flow<Map<String, NodeSnapshot>> =
             flowOf(if (runningNode) mapOf("mainnet" to testSnapshot()) else emptyMap())
         override suspend fun checkWatched(network: String): List<WatchChange>? {
@@ -100,6 +102,8 @@ class WatchTabTest {
         rule.onNodeWithText("Remove").performScrollTo().performClick()
         assertEquals("[]", settings.watchListJson("mainnet"))
         rule.onNodeWithText("Savings").assertDoesNotExist()
+        // The host hears of both edits: the add (to ask for notifications), the removal (to prune).
+        assertEquals(listOf(true, false), node.listChanges)
     }
 
     @Test
@@ -157,15 +161,22 @@ class WatchTabTest {
     }
 
     @Test
-    fun aWatchRequestBringsTheTabForward() {
+    fun aWatchRequestBringsTheTabForwardOnItsNetwork() {
         var requests by mutableStateOf(0)
+        val twoChains = object : Settings by WatchSettings() {
+            override fun enabledNetworks(): List<String> = listOf("mainnet", "gnosis")
+        }
         rule.setContent {
-            NodeScreen(controller = Node(), settings = WatchSettings(), logs = NoTestLogs, watchRequests = requests)
+            NodeScreen(
+                controller = Node(), settings = twoChains, logs = NoTestLogs,
+                watchRequests = requests, watchNetwork = "gnosis",
+            )
         }
         tab("Status").assertIsSelected()
         requests++
         rule.waitForIdle()
         tab("Watch").assertIsSelected()
+        rule.onNodeWithText("Watch addresses on gnosis", substring = true).assertIsDisplayed()
     }
 
     @Test

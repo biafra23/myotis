@@ -44,12 +44,14 @@ import io.myotis.ui.WatchChange
 import io.myotis.ui.WatchReader
 import io.myotis.ui.WebOriginRow
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
@@ -628,6 +630,11 @@ class DesktopNodeController(
 
     private val balanceWatcher = BalanceWatcher(settings)
 
+    /** Where Check now and list edits run: off the UI thread (a cause scan parses up to 64
+     *  full blocks), and outliving the Watch tab's composition, so leaving the tab mid-check
+     *  stops the tab's wait, not the check. */
+    private val watchScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + Dispatchers.Default)
+
     /** Where a change is announced — a native notification, as (title, message) → posted;
      *  null where this desktop has no notification route. Set once by Main.kt. */
     @Volatile
@@ -640,7 +647,15 @@ class DesktopNodeController(
         watchNotifierKnown = true
     }
 
-    override suspend fun checkWatched(network: String): List<WatchChange>? = runWatchCheck(network, "check now")
+    override suspend fun checkWatched(network: String): List<WatchChange>? =
+        watchScope.async { runWatchCheck(network, "check now") }.await()
+
+    override fun onWatchListChanged(network: String, added: Boolean) {
+        watchScope.launch {
+            runCatching { balanceWatcher.prune(engine.canonicalNetworkName(network)) }
+                .onFailure { log.warn("[{}] balance watch prune failed: {}", network, it.toString()) }
+        }
+    }
 
     override val watchSchedule: String =
         "Checked every ${WATCH_INTERVAL_MS / 60_000} minutes while Myotis runs and the network is " +
@@ -676,7 +691,13 @@ class DesktopNodeController(
     private suspend fun runWatchCheck(network: String, why: String, budget: Duration = Duration.INFINITE): List<WatchChange>? {
         val canonical = engine.canonicalNetworkName(network)
         val handle = engine.get(canonical) ?: throw IllegalStateException("Node is not running on $network")
-        val changes = balanceWatcher.check(canonical, HandleWatchReader(handle), BalanceWatch.DEFAULT_SCAN_BLOCKS, budget)
+        val reader = object : WatchReader {
+            // The Query tab's own read, so both map the engine's result the same way.
+            override suspend fun account(address: String): AccountResult = requestAccount(canonical, address)
+            override suspend fun block(number: Long): String? =
+                withContext(Dispatchers.IO) { handle.reads()?.getBlockByNumber("0x" + number.toString(16), true) }
+        }
+        val changes = balanceWatcher.check(canonical, reader, BalanceWatch.DEFAULT_SCAN_BLOCKS, budget)
             ?: return null
         log.info("[{}] balance watch ({}): {}", canonical, why,
             if (changes.isEmpty()) "no change" else "${changes.size} change(s)")
@@ -693,22 +714,6 @@ class DesktopNodeController(
         val st = h.status()
         st.beaconState() == io.myotis.api.BeaconState.SYNCED && st.verifiedHeadAgeMs() != Long.MAX_VALUE
     }.getOrDefault(false)
-
-    /** A check's engine reads, on the IO pool. */
-    private class HandleWatchReader(private val h: ChainHandle) : WatchReader {
-        override suspend fun account(address: String): AccountResult =
-            withContext(Dispatchers.IO) { h.requestAccount(address) }.let { r ->
-                AccountResult(
-                    r.address(), r.exists(), r.nonce(), r.balanceWei(),
-                    r.storageRootHex(), r.codeHashHex(), r.blockNumber(), r.peerStateRootHex(),
-                    r.peerProofValid(), r.beaconChainVerified(), r.blsVerified(), r.matchedBeaconSlot(),
-                    r.verifyMethod(), r.failReason(), r.blockTimestamp(),
-                )
-            }
-
-        override suspend fun block(number: Long): String? =
-            withContext(Dispatchers.IO) { h.reads()?.getBlockByNumber("0x" + number.toString(16), true) }
-    }
 
     private fun TxHistoryEvent.toUi(): TxScanEvent = when (this) {
         is TxHistoryEvent.Started -> TxScanEvent.Started(
@@ -887,6 +892,15 @@ class DesktopNodeController(
  * handed (BeePocTest pins the Bee PoC's paused backfill through here). Null when there
  * is nothing to say; see [LogIndexWatch.configJson].
  */
+internal fun logIndexConfigJson(settings: Settings, network: String): String? =
+    LogIndexWatch.configJson(
+        settings.logIndexWatchJson(network),
+        settings.logIndexEnabled(network),
+        settings.logIndexMaxSpeed(network),
+        configured = settings.logIndexConfigured(network),
+        backfillPaused = settings.logIndexBackfillPaused(network),
+    )
+
 /** Between the desktop's scheduled balance checks of a network. */
 internal const val WATCH_INTERVAL_MS = 5 * 60_000L
 /** A network whose last check found no verified answer waits this long before the next. */
@@ -912,15 +926,6 @@ internal fun watchNotificationText(displayName: String, network: String, changes
     return "${changes.size} watched balances changed" to
         "$displayName — $lines$more. The Watch tab has the details."
 }
-
-internal fun logIndexConfigJson(settings: Settings, network: String): String? =
-    LogIndexWatch.configJson(
-        settings.logIndexWatchJson(network),
-        settings.logIndexEnabled(network),
-        settings.logIndexMaxSpeed(network),
-        configured = settings.logIndexConfigured(network),
-        backfillPaused = settings.logIndexBackfillPaused(network),
-    )
 
 /** The web-page policy the desktop host hands the engine (#502), straight from [Settings]. */
 internal fun webAccessPolicy(settings: Settings): io.myotis.api.WebAccessPolicy =
