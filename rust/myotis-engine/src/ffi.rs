@@ -203,6 +203,17 @@ pub fn get_storage_at_json(
     crate::host::get_storage_at_json(handle, &address, &position, &block)
 }
 
+/// `eth_getProof` (EIP-1186, ABI ≥ 46): the result object, `{"error"}`, or
+/// `{"error","code":-32602}`. `keys` is the JSON array of storage keys as the
+/// request carried them (empty = none); `block` is applied or refused by the
+/// proof pin rules — a head tag, `finalized`, or the number of the head, of
+/// one of the recent heads before it, or of the finalized block (see
+/// `crate::host::get_proof_json`).
+#[uniffi::export]
+pub fn get_proof_json(handle: i64, address: String, keys: String, block: String) -> String {
+    crate::host::get_proof_json(handle, &address, &keys, &block)
+}
+
 /// Verified `eth_call` over the revm executor. `from` empty ⇒ anonymous call;
 /// `to` EMPTY ⇒ contract creation (the calldata is init code, its return data
 /// is the answer); `value` is wei as a decimal string; `block` is the RPC block

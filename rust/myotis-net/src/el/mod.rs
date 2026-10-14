@@ -14,6 +14,7 @@ pub mod eth;
 mod feecache;
 pub mod evm;
 pub mod fork_watch;
+pub mod getproof;
 pub mod peer;
 pub mod logindex;
 pub mod peercache;

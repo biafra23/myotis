@@ -58,6 +58,29 @@ class DesktopSettingsPersistenceTest {
     }
 
     @Test
+    fun `custom tokens round-trip per network and a hand edit keeps only what checks out`(@TempDir dir: Path) {
+        val file = dir.resolve("settings.properties")
+        val first = DesktopSettings(nets, file)
+        assertTrue(first.supportsCustomTokens())
+        assertEquals("[]", first.customTokensJson("gnosis"))
+        val stored = """[{"address":"0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed","name":"My \"T\"","decimals":6}]"""
+        first.setCustomTokensJson("gnosis", stored)
+
+        val second = DesktopSettings(nets, file)
+        assertEquals(stored, second.customTokensJson("gnosis"), "custom tokens must be sticky")
+        assertEquals("[]", second.customTokensJson("mainnet"), "and scoped to their network")
+
+        // A hand-edited entry with a broken checksum is dropped on load, the good one kept.
+        val props = java.util.Properties().apply { Files.newInputStream(file).use(::load) }
+        props.setProperty(
+            "tokens.custom.gnosis",
+            stored.dropLast(1) + """,{"address":"0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeD","name":"Typo","decimals":18}]""",
+        )
+        Files.newOutputStream(file).use { props.store(it, null) }
+        assertEquals(stored, DesktopSettings(nets, file).customTokensJson("gnosis"))
+    }
+
+    @Test
     fun `expert mode and the App Nap opt-in round-trip across a restart`(@TempDir dir: Path) {
         val file = dir.resolve("settings.properties")
         val first = DesktopSettings(nets, file)

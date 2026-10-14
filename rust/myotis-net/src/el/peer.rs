@@ -771,6 +771,28 @@ impl ManagedPeer {
         state_root: &[u8; 32],
         address: &[u8; 20],
     ) -> Result<AccountOutcome, String> {
+        let response = self.snap_account_range(state_root, address).await?;
+        fetch::verify_account(state_root, address, &response).map_err(|e| e.0)
+    }
+
+    /// [`Self::snap_get_account`], also returning the verified path to the
+    /// account as `eth_getProof` lists it (`fetch::verify_account_proof`).
+    pub async fn snap_get_account_proof(
+        &self,
+        state_root: &[u8; 32],
+        address: &[u8; 20],
+    ) -> Result<(AccountOutcome, Vec<Vec<u8>>), String> {
+        let response = self.snap_account_range(state_root, address).await?;
+        fetch::verify_account_proof(state_root, address, &response).map_err(|e| e.0)
+    }
+
+    /// The single-key `GetAccountRange` both account reads send, decoded but
+    /// NOT verified.
+    async fn snap_account_range(
+        &self,
+        state_root: &[u8; 32],
+        address: &[u8; 20],
+    ) -> Result<snap::AccountRange, String> {
         let codes = self.snap_codes().ok_or("peer does not support snap")?;
         let account_hash = myotis_core::keccak::keccak256(address);
         let payload = self
@@ -778,9 +800,7 @@ impl ManagedPeer {
                 snap::encode_get_account(id, state_root, &account_hash, 4096)
             })
             .await?;
-        let response = snap::decode_account_range(&payload)
-            .map_err(|e| format!("AccountRange decode: {}", e.0))?;
-        fetch::verify_account(state_root, address, &response).map_err(|e| e.0)
+        snap::decode_account_range(&payload).map_err(|e| format!("AccountRange decode: {}", e.0))
     }
 
     /// Fetch and verify one storage slot against the account's proven
@@ -796,6 +816,35 @@ impl ManagedPeer {
         if account.storage_root == EMPTY_TRIE_ROOT {
             return Ok(Vec::new());
         }
+        let response = self.snap_storage_range(state_root, address, slot).await?;
+        fetch::verify_storage(account, slot, &response).map_err(|e| e.0)
+    }
+
+    /// [`Self::snap_get_storage`], also returning the verified path to the
+    /// slot as `eth_getProof` lists it (`fetch::verify_storage_proof`): none
+    /// for an empty storage trie, which costs no round trip either.
+    pub async fn snap_get_storage_proof(
+        &self,
+        state_root: &[u8; 32],
+        address: &[u8; 20],
+        account: &AccountLeaf,
+        slot: &[u8; 32],
+    ) -> Result<(Vec<u8>, Vec<Vec<u8>>), String> {
+        if account.storage_root == EMPTY_TRIE_ROOT {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let response = self.snap_storage_range(state_root, address, slot).await?;
+        fetch::verify_storage_proof(account, slot, &response).map_err(|e| e.0)
+    }
+
+    /// The single-slot `GetStorageRanges` both storage reads send, decoded
+    /// but NOT verified.
+    async fn snap_storage_range(
+        &self,
+        state_root: &[u8; 32],
+        address: &[u8; 20],
+        slot: &[u8; 32],
+    ) -> Result<snap::StorageRanges, String> {
         let codes = self.snap_codes().ok_or("peer does not support snap")?;
         let account_hash = myotis_core::keccak::keccak256(address);
         let slot_hash = myotis_core::keccak::keccak256(slot);
@@ -804,9 +853,7 @@ impl ManagedPeer {
                 snap::encode_get_storage_slot(id, state_root, &account_hash, &slot_hash, 4096)
             })
             .await?;
-        let response = snap::decode_storage_ranges(&payload)
-            .map_err(|e| format!("StorageRanges decode: {}", e.0))?;
-        fetch::verify_storage(account, slot, &response).map_err(|e| e.0)
+        snap::decode_storage_ranges(&payload).map_err(|e| format!("StorageRanges decode: {}", e.0))
     }
 
     /// Fetch and verify one contract's bytecode by its `code_hash`.

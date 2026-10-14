@@ -344,6 +344,26 @@ interface RpcBackend {
     ): RpcAccessListResult = RpcAccessListResult.refused(
         "this engine does not build access lists (eth_createAccessList)",
     )
+
+    /**
+     * Whether this backend serves `eth_getProof` ([getProof]). Consulted BEFORE
+     * dispatch, as [supportsAccessListCreation]: on a backend that does not, the
+     * router refuses (-32602) instead of waking an engine to be refused.
+     */
+    fun supportsProofs(): Boolean = false
+
+    /**
+     * `eth_getProof` (EIP-1186) at [block]: the result object JSON in geth's
+     * shape, an engine `{"error"}` envelope (`{"error","code":-32602}` when
+     * permanent), or null (no verified answer). [storageKeysJson] is the JSON
+     * array of storage keys as the request carried them. [block] is applied
+     * EXACTLY — a proof names no block, so the caller checks it against the
+     * `stateRoot` of the block it asked for; a backend must never answer a
+     * near-head number from head state as the other state reads do.
+     *
+     * Default: null — a backend that serves no proofs.
+     */
+    fun getProof(address: ByteArray, storageKeysJson: String, block: String): String? = null
 }
 
 /**

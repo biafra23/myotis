@@ -315,7 +315,9 @@ transaction (`rust/myotis-net/src/el/send_check.rs`; Java: `SendCheck`).
   (execution side), never a wrong value.
 - **Completeness of history.** A proof shows that a value is in a tree; nothing in the
   protocol proves that a list of *your* transactions is complete. The transaction-history
-  scan (TrueBlocks, `:tx-history`) is debug-only and unverified.
+  scan (TrueBlocks, `:tx-history`) is debug-only and unverified. The one completeness
+  claim Myotis does make is narrower: the logs of watched addresses over the log index's
+  walked coverage (§12).
 - **Old data.** State is served at the head and the finalized block only; blocks up to 512
   back; the header walk under 8192 blocks. The historical accumulators that would extend
   this (pre-Merge epoch accumulator, `historical_summaries`) are designed but **not built**
@@ -358,7 +360,79 @@ transaction (`rust/myotis-net/src/el/send_check.rs`; Java: `SendCheck`).
   mainnet and Sepolia (same registry address) can share entries. The Rust engine walks the
   registry on every resolution.
 
-## 12. Where to look in the code
+## 12. Compared with an `eth_getProof` client
+
+A light client that reads over JSON-RPC and checks `eth_getProof` answers — Helios is the
+best-known one — sits on the same commitments as Myotis. Whether a value can be checked
+depends on what the chain commits to, not on how the bytes arrive. Such a client is only
+as good as its state root: one that takes the block hash from its provider verifies
+nothing. The comparison below assumes it anchors that root as §§2–5 do, from
+sync-committee signatures, as Helios does.
+
+| | `eth_getProof` client | Myotis |
+|---|---|---|
+| Account or storage slot, present or absent | MPT proof against the trusted state root | The same proof: a single-key snap proof is the path `eth_getProof` returns (both are `trie.Prove` of one key against one root — [snap-server-design.md](snap-server-design.md)) |
+| `eth_call`, gas estimation | Verified if it fetches every touched account and slot by proof and runs its own EVM | The same (§9) |
+| Blocks, transactions, receipts | Out of `eth_getProof`'s reach (not in the state trie); checkable with other calls by rebuilding against `transactionsRoot` / `receiptsRoot` | The same rebuild (§8) |
+| Logs: is each one real? | Checkable per block, as for receipts | The same over walked coverage; not for a seeded span (§8) |
+| Logs: is any missing? | Not checked (below) | Checked over the log index's walked coverage (below) |
+| State at an old block | Verified against an archive node, if it can trust that block's header | None: a pin within head − 64 … head + 16 is answered from head state, an older one is refused (§6); snap peers keep ~128 blocks (§7) |
+
+### The one thing Myotis checks that such a client does not: a missing log
+
+A wallet that rebuilds a commitment tree from `eth_getLogs` needs every log to be real
+**and** none left out. The second is the one that matters: a wallet reads `[]` as "no
+events", so an omission corrupts its tree silently (*Trust model* in
+[eth-getlogs-design.md](eth-getlogs-design.md)). Before EIP-7745 the chain commits to a
+single absence witness, each header's `logsBloom`, which has no false negatives. The log
+index uses it over its whole walked coverage:
+
+- every header in the range is fetched and chained by `parentHash` to the beacon anchor;
+- a bloom miss proves that block holds no watched log;
+- a bloom hit is settled by the block's complete receipt list, rebuilt against
+  `receiptsRoot` (`fetch_candidate_logs` in `rust/myotis-net/src/el/reader.rs`, the one
+  path behind the backfill, the head bridge and the tail);
+- a range outside coverage is refused with a retryable error, never answered with `[]`
+  (`get_logs_json` in `rust/myotis-engine/src/host.rs`). `latest` resolves to the top of
+  coverage when that is at most 4 blocks below the head (`LOG_INDEX_LATEST_SLACK`), and
+  the answer, a bare log array, does not say where it stopped. So a wallet polls with an
+  explicit `toBlock` (taking it from `eth_blockNumber` is fine: an explicit range is served
+  whole or refused, never cut short) and advances its cursor only to a `toBlock` that was
+  served.
+
+`eth_getProof` can do none of this, because logs are not in the state trie. An RPC client
+could run the same walk with header and receipt calls, but it would have to fetch every
+header in the range plus the full receipts of every bloom-positive block, and on mainnet
+that is most of them: 85–95 % of blocks for one address and event, about 1 TB of receipts
+for the Tornado Cash history (estimates, not measurements —
+[logindex-verified-bundle-design.md](logindex-verified-bundle-design.md)). Helios does not
+try. Its [`verify_logs`](https://github.com/a16z/helios/blob/2af9b41887e069144ee56cd710f3ddca195473f8/core/src/execution/providers/rpc.rs#L118)
+(read 2026-10-14) fetches receipts only for the blocks the returned logs name, so every log
+it returns is real, but a log the provider left out of any other block goes unnoticed. Myotis pays the walk's
+cost too, which is why a backfill takes days on Gnosis and weeks on mainnet, but in
+devp2p peer traffic rather than metered provider calls.
+
+The claim has limits:
+
+- It covers the watched addresses only (and, where a watch entry names them, only its
+  indexed events), inside the walked coverage, on the Rust engine with the log index
+  switched on.
+- Below a watch entry's `from_block` the index assumes the contract has no logs and walks
+  nothing. That block is configuration (the deployment block), not something the walk
+  proved: set it too high and a sweep from 0 misses the earlier logs without an error.
+- A span imported from a seed was not walked, and `eth_getLogs` cannot yet tell it from a
+  walked one (§8, §11).
+- It is not a complete transaction history: a plain ETH transfer emits no log, and the
+  TrueBlocks scan is unverified (§11).
+
+### What else differs is not verification
+
+The rest of the gap is the one [benefits-doc.md](benefits-doc.md) names: availability and
+surveillance. A single provider sees every address the wallet looks up and can refuse to
+answer; Myotis spreads its reads over many peers and moves on from one that refuses
+(§7, §11), and it broadcasts transactions to devp2p peers directly (§10).
+
+## 13. Where to look in the code
 
 | Step | Rust engine | Java engine |
 |---|---|---|

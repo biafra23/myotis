@@ -1243,6 +1243,18 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     }
 
     /**
+     * Verified {@code eth_getProof} (ABI 46): the EIP-1186 result object JSON, or the
+     * engine's {@code {"error"}} / {@code {"error","code":-32602}} envelope, passed
+     * through for the router to classify. {@code keysJson} is the JSON array of
+     * storage keys as the request carried them; {@code block} is held to the proof
+     * pin rules (the verified head, a recent head or the finalized block, exactly). Throws
+     * {@link EngineException} on a transport / not-running failure.
+     */
+    String proofJson(String hexAddress, String keysJson, String block) {
+        return gated(() -> RustEngineNative.nativeGetProofJson(handle, hexAddress, keysJson, block));
+    }
+
+    /**
      * Verified eth_getBlockByNumber: the block JSON object, the literal
      * {@code "null"} (a verified future/unknown block → eth null), or throws
      * {@link EngineException} when it can't verify (transport / not-running).

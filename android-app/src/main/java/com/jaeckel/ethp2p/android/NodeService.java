@@ -2058,6 +2058,28 @@ public final class NodeService extends Service {
                 () -> toAccountQueryResult(handle.requestAccount(hexAddress)), QUERY_POOL);
     }
 
+    /**
+     * A verified {@code eth_call} for the Query tab's token balances: {@code data} sent to
+     * {@code to} from the anonymous sender against the verified head ({@code latest}),
+     * through the engine API's {@link io.myotis.api.VerifiedReads#callDetailed} on the
+     * query pool. A revert or "no verified answer" is the result's status; the future
+     * fails only when the network isn't running or its read surface is down.
+     */
+    public CompletableFuture<io.myotis.api.CallResult> ethCall(String network, byte[] to, byte[] data) {
+        noteUiActivity();
+        ChainHandle handle = handles.get(canonicalNetwork(network));
+        io.myotis.api.VerifiedReads reads = handle != null ? handle.reads() : null;
+        if (reads == null) {
+            CompletableFuture<io.myotis.api.CallResult> failed = new CompletableFuture<>();
+            failed.completeExceptionally(new IllegalStateException(handle == null
+                    ? "Node is not running"
+                    : "Verified reads are not available (JSON-RPC backend not started)"));
+            return failed;
+        }
+        return CompletableFuture.supplyAsync(
+                () -> reads.callDetailed(null, to, data, null, "latest", null), QUERY_POOL);
+    }
+
     // ---------------------------------------------------------------------
     // TrueBlocks transaction history (Query tab add-on) — the documented exemption
     // from the "hosts consume only io.myotis.api" rule, same shape as the daemon's

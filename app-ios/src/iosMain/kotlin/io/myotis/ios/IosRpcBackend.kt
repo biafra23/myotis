@@ -198,6 +198,16 @@ class IosRpcBackend(
         }
     }
 
+    override fun supportsProofs(): Boolean = true // the verified reads' own proofs, at one attested root (ABI >= 46)
+
+    override fun getProof(address: ByteArray, storageKeysJson: String, block: String): String? {
+        // No isServableBlock guard: the engine holds the selector to the proof
+        // pin rules, which are stricter than that window (JVM-adapter parity).
+        if (address.size != 20) return null
+        val handle = handleProvider() ?: return null
+        return triStateJson(RustEngine.getProofJson(handle, hex(address), storageKeysJson, block))
+    }
+
     override fun supportsAccessListCreation(): Boolean = true // the revm executor traces and confirms the list (ABI >= 40)
 
     override fun createAccessList(

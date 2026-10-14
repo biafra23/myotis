@@ -19,6 +19,7 @@ import io.myotis.engine.capi.myotis_get_block_by_hash_json
 import io.myotis.engine.capi.myotis_get_block_by_number_json
 import io.myotis.engine.capi.myotis_get_block_receipts_json
 import io.myotis.engine.capi.myotis_get_code_json
+import io.myotis.engine.capi.myotis_get_proof_json
 import io.myotis.engine.capi.myotis_get_storage_at_json
 import io.myotis.engine.capi.myotis_get_transaction_by_hash_json
 import io.myotis.engine.capi.myotis_get_transaction_receipt_json
@@ -216,6 +217,12 @@ object RustEngine {
 
     fun getStorageAtJson(handle: Long, address: String, position32Hex: String, block: String = ""): String =
         jsonCall { myotis_get_storage_at_json(handle, address, position32Hex, block) }
+
+    /** eth_getProof (ABI 46): the EIP-1186 result object, `{"error"}` or the
+     *  permanent `{"error","code":-32602}`. [keysJson] is the JSON array of
+     *  storage keys as the request carried them. */
+    fun getProofJson(handle: Long, address: String, keysJson: String, block: String = ""): String =
+        jsonCall { myotis_get_proof_json(handle, address, keysJson, block) }
 
     fun ethCallJson(handle: Long, from: String, to: String, data: String, valueDecimal: String, block: String): String =
         jsonCall { myotis_eth_call_json(handle, from, to, data, valueDecimal, block) }

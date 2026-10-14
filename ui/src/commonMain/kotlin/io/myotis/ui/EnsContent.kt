@@ -165,7 +165,7 @@ private fun swarmHash(b: ByteArray): String? {
     if (codec.value != 0xfaL) return null
     val mh = b.copyOfRange(codec.next, b.size)
     if (mh.size != 34 || mh[0] != 0x1b.toByte() || mh[1] != 0x20.toByte()) return null
-    return hexOf(mh.copyOfRange(2, 34))
+    return toHex(mh.copyOfRange(2, 34))
 }
 
 private class Varint(val value: Long, val next: Int)
@@ -231,21 +231,5 @@ private fun base32(b: ByteArray): String {
     return sb.toString()
 }
 
-private fun hexBytes(hex: String): ByteArray? {
-    val h = hex.trim().removePrefix("0x").removePrefix("0X")
-    if (h.isEmpty() || h.length % 2 != 0) return null
-    val out = ByteArray(h.length / 2)
-    for (i in out.indices) {
-        val hi = h[2 * i].digitToIntOrNull(16) ?: return null
-        val lo = h[2 * i + 1].digitToIntOrNull(16) ?: return null
-        out[i] = ((hi shl 4) or lo).toByte()
-    }
-    return out
-}
-
-private fun hexOf(b: ByteArray): String = buildString(b.size * 2) {
-    for (x in b) {
-        val v = x.toInt() and 0xff
-        append("0123456789abcdef"[v shr 4]).append("0123456789abcdef"[v and 0xf])
-    }
-}
+/** The shared decoder ([hexToBytes]), trimmed, with nothing to decode read as no value. */
+private fun hexBytes(hex: String): ByteArray? = hexToBytes(hex.trim())?.takeIf { it.isNotEmpty() }

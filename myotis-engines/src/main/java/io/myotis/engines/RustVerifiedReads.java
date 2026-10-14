@@ -175,6 +175,28 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     @Override
+    public boolean supportsProofs() {
+        return true;   // ABI 46: the proofs the verified reads check, at one attested root
+    }
+
+    @Override
+    public String getProof(byte[] address, String storageKeysJson, String block) {
+        if (address == null || address.length != 20) return null;
+        // No isServableBlock pre-check: the engine holds the selector to the
+        // proof pin rules, which are stricter than that window — a near-head
+        // number other than the head's own is refused, not served from head
+        // state, because the caller checks the proofs against that block.
+        try {
+            return handle.proofJson(toHex(address),
+                    storageKeysJson == null ? "[]" : storageKeysJson,
+                    block == null ? "" : block);
+        } catch (RuntimeException e) {
+            log.info("[engines] verified proof read unavailable: {}", e.getMessage());
+            return errJson(e);
+        }
+    }
+
+    @Override
     public boolean supportsContractCreation() {
         return true;   // revm runs the init code (TxKind::Create)
     }

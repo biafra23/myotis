@@ -41,7 +41,7 @@ use myotis_engine::capi::{
     myotis_eth_call_tx_json, myotis_eth_call_json, myotis_fee_estimate_json,
     myotis_fee_history_json, myotis_get_block_by_hash_json, myotis_get_block_by_number_json,
     myotis_get_block_receipts_json, myotis_get_code_json, myotis_get_logs_json,
-    myotis_get_storage_at_json, myotis_get_transaction_by_hash_json,
+    myotis_get_proof_json, myotis_get_storage_at_json, myotis_get_transaction_by_hash_json,
     myotis_get_transaction_receipt_json, myotis_import_log_index_files, myotis_init,
     myotis_log_index_status_json, myotis_pause, myotis_pending_nonce_overlay,
     myotis_request_account_json, myotis_resolve_ens_json, myotis_resume,
@@ -814,6 +814,32 @@ pub fn get_storage_at_json<'env>(
             return invalid_params("invalid storage position (expected hex of at most 32 bytes)");
         };
         take(unsafe { myotis_get_storage_at_json(handle, a.as_ptr(), p.as_ptr(), b.as_ptr()) })
+    })
+}
+
+/// eth_getProof (EIP-1186, ABI 46): the result object exactly as geth shapes
+/// it — serve it as the JSON-RPC result — or an `{"error"}`. `keys_json` is the
+/// JSON array of storage keys as the request carried them (omitted or empty =
+/// none); `block` is held to the proof pin rules: a head tag, `finalized`, or
+/// the number of the head, of one of the recent heads before it, or of the
+/// finalized block — any other number is refused, never answered from head
+/// state, since the caller checks the proofs against that block's own
+/// stateRoot.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn get_proof_json<'env>(
+    env: &'env Env,
+    handle: i64,
+    address: String,
+    keys_json: Option<String>,
+    block: Option<String>,
+) -> Result<Object<'env>> {
+    let keys = keys_json.unwrap_or_default();
+    let block = block.unwrap_or_default();
+    scheduler::submit(env, handle, move || {
+        let (Ok(a), Ok(k), Ok(b)) = (c_arg(&address), c_arg(&keys), c_arg(&block)) else {
+            return NUL_INVALID_PARAMS.to_string();
+        };
+        take(unsafe { myotis_get_proof_json(handle, a.as_ptr(), k.as_ptr(), b.as_ptr()) })
     })
 }
 

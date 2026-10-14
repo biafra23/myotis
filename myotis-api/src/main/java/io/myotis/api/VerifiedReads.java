@@ -357,4 +357,38 @@ public interface VerifiedReads {
         return AccessListResult.refused(
                 "this engine does not build access lists (eth_createAccessList); select the Rust engine");
     }
+
+    /**
+     * Whether this engine serves {@code eth_getProof} ({@link #getProof}). Hosts
+     * consult it BEFORE dispatch, as {@link #supportsAccessListCreation()}: on an
+     * engine that does not, the request is refused (-32602) without waking a
+     * paused stack and waiting for a verified head only to be refused.
+     *
+     * @return false by default
+     */
+    default boolean supportsProofs() {
+        return false;
+    }
+
+    /**
+     * {@code eth_getProof} (EIP-1186): the result object as JSON, in geth's shape;
+     * an {@code {"error": ...}} envelope (retryable), or its
+     * {@code {"error","code":-32602}} form (permanent); or {@code null} (no
+     * verified answer). {@code storageKeysJson} is the JSON array of storage keys
+     * as the request carried them; the engine echoes each in geth's form.
+     *
+     * <p>{@code block} (a tag or a 0x-hex number) is applied EXACTLY: the answer
+     * names no block of its own, so the caller checks the proofs against the
+     * {@code stateRoot} of the block it asked for. An engine serves only a root
+     * it holds attested for exactly that block and refuses any other — it must
+     * never answer a near-head number from head state as the other state reads
+     * do. (The Rust engine serves its verified head, the recent heads before it
+     * as it held them, and its finalized block.)
+     *
+     * <p>Default: {@code null}, on an engine that reports no
+     * {@link #supportsProofs()} — the Java engine is one.
+     */
+    default String getProof(byte[] address, String storageKeysJson, String block) {
+        return null;
+    }
 }
