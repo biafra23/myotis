@@ -309,6 +309,17 @@ public final class NodeService extends Service {
         prefs(c).edit().putString("logIndex.watch." + canonicalNetwork(network), json).apply();
     }
 
+    /** The user's own tokens for one network's Query-tab token balances, as
+     *  {@code io.myotis.ui.CustomTokens}' JSON array (same key scheme as the desktop). */
+    public static String customTokensJson(android.content.Context c, String network) {
+        String v = prefs(c).getString("tokens.custom." + canonicalNetwork(network), null);
+        return v != null ? v : "[]";
+    }
+
+    public static void setCustomTokensJson(android.content.Context c, String network, String json) {
+        prefs(c).edit().putString("tokens.custom." + canonicalNetwork(network), json).apply();
+    }
+
     /** Backfill pacing (true = max download speed); same key scheme as the desktop. */
     public static boolean logIndexMaxSpeed(android.content.Context c, String network) {
         return prefs(c).getBoolean("logIndex.maxSpeed." + canonicalNetwork(network), false);
@@ -1878,6 +1889,28 @@ public final class NodeService extends Service {
         // timeout-bounded) — run it on the query pool and expose the future the UI expects.
         return CompletableFuture.supplyAsync(
                 () -> toAccountQueryResult(handle.requestAccount(hexAddress)), QUERY_POOL);
+    }
+
+    /**
+     * A verified {@code eth_call} for the Query tab's token balances: {@code data} sent to
+     * {@code to} from the anonymous sender against the verified head ({@code latest}),
+     * through the engine API's {@link io.myotis.api.VerifiedReads#callDetailed} on the
+     * query pool. A revert or "no verified answer" is the result's status; the future
+     * fails only when the network isn't running or its read surface is down.
+     */
+    public CompletableFuture<io.myotis.api.CallResult> ethCall(String network, byte[] to, byte[] data) {
+        noteUiActivity();
+        ChainHandle handle = handles.get(canonicalNetwork(network));
+        io.myotis.api.VerifiedReads reads = handle != null ? handle.reads() : null;
+        if (reads == null) {
+            CompletableFuture<io.myotis.api.CallResult> failed = new CompletableFuture<>();
+            failed.completeExceptionally(new IllegalStateException(handle == null
+                    ? "Node is not running"
+                    : "Verified reads are not available (JSON-RPC backend not started)"));
+            return failed;
+        }
+        return CompletableFuture.supplyAsync(
+                () -> reads.callDetailed(null, to, data, null, "latest", null), QUERY_POOL);
     }
 
     // ---------------------------------------------------------------------

@@ -1437,6 +1437,8 @@ private fun QueryTab(
     // and load off the main thread (entries() reads a file) so composition never blocks on disk.
     // Keyed on `network` like the state it fills: a chain switch resets the list, so reload it.
     var historyList by remember(network) { mutableStateOf<List<QueryHistoryEntry>>(emptyList()) }
+    // What custom token contracts answered to decimals(), kept across lookups on this chain.
+    val tokenDecimals = remember(network) { mutableMapOf<String, Int>() }
     LaunchedEffect(network) { historyList = withContext(Dispatchers.Default) { history.entries() } }
 
     // --- Transaction-history scan state (TrueBlocks index; desktop-mainnet-only hosts). ---
@@ -1642,6 +1644,19 @@ private fun QueryTab(
             }
             error != null -> Text("Error: $error", color = MaterialTheme.colorScheme.error)
             account != null -> AccountResultView(account!!, nativeCurrencySymbol(network), expert)
+        }
+
+        // ERC-20 balances of the looked-up address (built-in popular tokens + the user's own),
+        // each a verified eth_call — on hosts that can make one. Keyed on the address inside,
+        // so a new lookup drops the old rows and cancels their reads.
+        val tokenHolder = account?.address?.let(::asHexAddress)
+        if (!loading && tokenHolder != null && controller.supportsEthCall) {
+            Spacer(Modifier.height(12.dp))
+            TokenBalancesCard(
+                controller, settings, network, tokenHolder, running,
+                ready = running && snap?.beaconState == "SYNCED",
+                contractDecimals = tokenDecimals,
+            )
         }
 
         // Transaction-history add-on (TrueBlocks Unchained Index): shown once an account

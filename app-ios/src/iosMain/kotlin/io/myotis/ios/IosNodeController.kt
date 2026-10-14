@@ -8,6 +8,8 @@ import io.myotis.ui.EnsOwnership
 import io.myotis.ui.EnsProfile
 import io.myotis.ui.EnsRecord
 import io.myotis.ui.EnsResult
+import io.myotis.ui.EthCallResult
+import io.myotis.ui.ethCallArgs
 import io.myotis.ui.readEnsProfile
 import io.myotis.ui.NodeController
 import io.myotis.ui.NodeSnapshot
@@ -560,6 +562,21 @@ class IosNodeController(
             )
             else -> EnsResult(name, null, blockNumber, verified, "unexpected resolver reply")
         }
+    }
+
+    override val supportsEthCall: Boolean get() = true
+
+    // The Query tab's token balances: the engine's verified eth_call at the head, from the
+    // anonymous sender, through IosRpcBackend's own eth_call path — so the Query tab reads
+    // the engine's reply exactly as JSON-RPC does (one parser for the C ABI's envelope).
+    // callDetailed never reads the chain id, hence the 0.
+    override suspend fun ethCall(network: String, to: String, data: String): EthCallResult {
+        val handle = handleOrThrow(network)
+        val (toBytes, dataBytes) = ethCallArgs(to, data)
+        val r = withContext(Dispatchers.IO) {
+            IosRpcBackend(chainId = 0L) { handle }.callDetailed(null, toBytes, dataBytes, null, "latest", null)
+        }
+        return EthCallResult.of(r.kind.name, r.data, r.detail)
     }
 
     private fun canonical(name: String): String = RustEngine.canonicalNetworkName(name) ?: name

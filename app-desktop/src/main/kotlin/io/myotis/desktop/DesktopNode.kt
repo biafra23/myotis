@@ -28,6 +28,9 @@ import io.myotis.ui.EnsOwnership
 import io.myotis.ui.EnsProfile
 import io.myotis.ui.EnsRecord
 import io.myotis.ui.EnsResult
+import io.myotis.ui.EthCallResult
+import io.myotis.ui.CustomTokens
+import io.myotis.ui.ethCallArgs
 import io.myotis.ui.readEnsProfile
 import io.myotis.ui.NetworkStatus
 import io.myotis.ui.NodeController
@@ -569,6 +572,21 @@ class DesktopNodeController(
         }
     }
 
+    override val supportsEthCall: Boolean get() = true
+
+    // The Query tab's token balances: the engine API's verified eth_call at the head, from
+    // the anonymous sender. reads() is the gate on the Java engine, so a call on a paused
+    // stack wakes it, exactly as a JSON-RPC eth_call would.
+    override suspend fun ethCall(network: String, to: String, data: String): EthCallResult {
+        val handle = engine.get(engine.canonicalNetworkName(network))
+            ?: throw IllegalStateException("Node is not running on $network")
+        val reads = handle.reads()
+            ?: throw IllegalStateException("Verified reads are not available on $network (JSON-RPC backend not started)")
+        val (toBytes, dataBytes) = ethCallArgs(to, data)
+        val r = withContext(Dispatchers.IO) { reads.callDetailed(null, toBytes, dataBytes, null, "latest", null) }
+        return EthCallResult.of(r.status().name, r.data(), r.detail())
+    }
+
     // ------------------------------------------------------------------------------
     // TrueBlocks transaction history (Query tab add-on) — a documented exemption from
     // the "hosts consume only io.myotis.api" rule, same category as the daemon's
@@ -857,6 +875,8 @@ class DesktopSettings(
     private val logIndexPaused = HashMap<String, Boolean>()
     // Per-network watched contracts, as LogIndexWatch's JSON array (Settings.logIndexWatchJson).
     private val logIndexWatch = HashMap<String, String>()
+    // Per-network user-added tokens, as CustomTokens' JSON array (Settings.customTokensJson).
+    private val customTokens = HashMap<String, String>()
     // The networks a PoC flavour has configured (PocFlavour.applyFirstStartSettings); null
     // until one first records it. Desktop-only, so it is not on the shared Settings seam.
     private var pocConfigured: Set<String>? = null
@@ -913,6 +933,11 @@ class DesktopSettings(
         synchronized(this) { logIndexWatch[network] ?: "[]" }
     override fun setLogIndexWatchJson(network: String, json: String) =
         mutate { logIndexWatch[network] = json }
+    override fun customTokensJson(network: String): String =
+        synchronized(this) { customTokens[network] ?: "[]" }
+    override fun setCustomTokensJson(network: String, json: String) =
+        mutate { customTokens[network] = json }
+    override fun supportsCustomTokens(): Boolean = true   // persisted in the settings file
 
     /** The networks a PoC flavour has configured in this settings file, or null if none is recorded. */
     fun pocConfiguredNetworks(): Set<String>? = synchronized(this) { pocConfigured }
@@ -1009,6 +1034,10 @@ class DesktopSettings(
                 logIndexWatch[k.removePrefix(K_LOG_INDEX_WATCH_PREFIX)] = LogIndexWatch.normalize(it)
             }
         }
+        p.stringPropertyNames().filter { it.startsWith(K_CUSTOM_TOKENS_PREFIX) }.forEach { k ->
+            // Through the parser, so a hand-edited value keeps only the entries that check out.
+            p.getProperty(k)?.let { customTokens[k.removePrefix(K_CUSTOM_TOKENS_PREFIX)] = CustomTokens.normalize(it) }
+        }
         p.stringPropertyNames()
             .filter {
                 it.startsWith(K_LOG_INDEX_PREFIX) &&
@@ -1079,6 +1108,7 @@ class DesktopSettings(
         logIndexMax.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_SPEED_PREFIX$net", on.toString()) }
         logIndexPaused.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_PAUSED_PREFIX$net", on.toString()) }
         logIndexWatch.forEach { (net, json) -> p.setProperty("$K_LOG_INDEX_WATCH_PREFIX$net", json) }
+        customTokens.forEach { (net, json) -> p.setProperty("$K_CUSTOM_TOKENS_PREFIX$net", json) }
         return p
     }
 
@@ -1129,6 +1159,7 @@ class DesktopSettings(
         const val K_LOG_INDEX_SPEED_PREFIX = "logIndex.maxSpeed."
         const val K_LOG_INDEX_PAUSED_PREFIX = "logIndex.backfillPaused."
         const val K_LOG_INDEX_WATCH_PREFIX = "logIndex.watch."
+        const val K_CUSTOM_TOKENS_PREFIX = "tokens.custom."
     }
 }
 

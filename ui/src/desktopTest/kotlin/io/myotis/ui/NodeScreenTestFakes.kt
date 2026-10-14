@@ -64,6 +64,12 @@ internal class FakeSettings(
     override fun setStrictStateFreshness(v: Boolean) {}
     override fun nativeBlsEnabled(): Boolean = false
     override fun setNativeBlsEnabled(v: Boolean) {}
+
+    /** The custom-token store, per network, as the host would persist it. */
+    val customTokens = HashMap<String, String>()
+    override fun customTokensJson(network: String): String = customTokens[network] ?: "[]"
+    override fun setCustomTokensJson(network: String, json: String) { customTokens[network] = json }
+    override fun supportsCustomTokens(): Boolean = true
 }
 
 /**
