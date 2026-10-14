@@ -5,8 +5,10 @@ import kotlin.jvm.JvmStatic
 import kotlin.time.Clock
 import kotlin.time.Duration
 import kotlin.time.TimeSource
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -377,7 +379,7 @@ object BalanceWatch {
      * (WorkManager stops a worker at ~10 min). It is checked before every read: past it,
      * the cause search stops where it is (the change keeps what it found, as PARTIAL)
      * and the addresses not read yet keep their stored state untouched, for the next
-     * check — which reads them first: addresses go least recently verified first. A
+     * check — which reads them first: addresses go least recently attempted first. A
      * single read already running is not cut short; its own bound applies.
      */
     suspend fun check(
@@ -393,10 +395,14 @@ object BalanceWatch {
         val addresses = LinkedHashMap<String, WatchAddressState>()
         val found = ArrayList<WatchChange>()
         var anyVerified = false
-        // Least recently verified first (never verified before all): when the budget runs
-        // out, the addresses it did not reach lead the next check instead of trailing
-        // every check behind the same ones.
-        val order = entries.sortedBy { previous.addresses[key(it.address)]?.seen?.checkedAtMs ?: Long.MIN_VALUE }
+        // Least recently attempted first (never attempted before all): when the budget runs
+        // out, the addresses it did not reach lead the next check instead of trailing every
+        // check behind the same ones — and one whose read keeps failing slowly goes to the
+        // back after each attempt rather than leading, and eating, every budget.
+        val order = entries.sortedBy { e ->
+            val a = previous.addresses[key(e.address)]
+            if (a == null) Long.MIN_VALUE else maxOf(a.seen?.checkedAtMs ?: 0, if (a.error != null) a.errorAtMs else 0)
+        }
         for (e in order) {
             val key = key(e.address)
             val prev = previous.addresses[key] ?: WatchAddressState()
@@ -744,7 +750,7 @@ class BalanceWatcher(
             ))
             return out.changes
         } finally {
-            guard.withLock { inFlight.remove(network) }
+            release(network)
         }
     }
 
@@ -768,8 +774,16 @@ class BalanceWatcher(
                 state.copy(addresses = state.addresses.filterKeys { it in listed }),
             ))
         } finally {
-            guard.withLock { inFlight.remove(network) }
+            release(network)
         }
+    }
+
+    /** Free [network]'s slot — also from a cancelled coroutine: `withLock` suspends when the
+     *  guard is contended, and a cancelled caller would throw there instead, leaking the slot
+     *  for the rest of the process (every later check returning null, and Android's idle
+     *  controller, which asks [isChecking], never pausing that stack again). */
+    private suspend fun release(network: String) {
+        withContext(NonCancellable) { guard.withLock { inFlight.remove(network) } }
     }
 }
 

@@ -16,6 +16,7 @@ import io.myotis.ui.WatchChange
 import io.myotis.ui.WatchReader
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -91,9 +92,15 @@ object BalanceWatchRunner {
     @JvmStatic
     fun isBusy(c: Context, network: String): Boolean = runBlocking { watcher(c).isChecking(network) }
 
-    /** The Watch tab's Check now: [run] in this object's scope; throws what the reads throw. */
+    /** The Watch tab's Check now: [run] in this object's scope, bounded like a scheduled
+     *  check ([CHECK_NOW_BUDGET]); throws what the reads throw. */
     suspend fun check(c: Context, network: String, handle: ChainHandle, scanBlocks: Int): List<WatchChange>? =
-        scope.async { run(c, network, handle, scanBlocks, Duration.INFINITE, "check now") }.await()
+        scope.async { run(c, network, handle, scanBlocks, CHECK_NOW_BUDGET, "check now") }.await()
+
+    /** NodeService's scheduled-check budget: a tap on a barely-answering network must not hold
+     *  the watcher's slot — and so the idle pause — for tens of minutes. What it leaves unread
+     *  leads the next check (least recently verified first). */
+    private val CHECK_NOW_BUDGET = 3.minutes
 
     /** The Watch tab edited [network]'s list: drop what was removed (BalanceWatcher.prune). */
     @JvmStatic

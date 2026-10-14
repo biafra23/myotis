@@ -647,10 +647,13 @@ class DesktopNodeController(
         watchNotifierKnown = true
     }
 
+    // Bounded like a scheduled check: one tap on a barely-answering network must not hold
+    // the watcher's slot for tens of minutes (what it leaves unread leads the next check).
     override suspend fun checkWatched(network: String): List<WatchChange>? =
-        watchScope.async { runWatchCheck(network, "check now") }.await()
+        watchScope.async { runWatchCheck(network, "check now", WATCH_BUDGET_MS.milliseconds) }.await()
 
     override fun onWatchListChanged(network: String, added: Boolean) {
+        if (added) return // an add removes nothing to prune; the tab's baseline check follows
         watchScope.launch {
             runCatching { balanceWatcher.prune(engine.canonicalNetworkName(network)) }
                 .onFailure { log.warn("[{}] balance watch prune failed: {}", network, it.toString()) }

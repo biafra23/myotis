@@ -231,6 +231,8 @@ interface NodeController {
      * network, and the host notifies any change exactly as it does for a scheduled one.
      * Hosts run it in a scope of their own, off the main thread: cancelling the caller
      * (the tab left mid-check) stops the wait, never the check, so what it found is stored.
+     * Bounded like a scheduled check, so one tap on a barely-answering network cannot hold
+     * the watcher's slot (and, on Android, defer the idle pause) for tens of minutes.
      * Returns the changes found (usually none), or null when nothing was checked (nothing
      * watched, a check already running, or a host without the feature). Throws when the
      * network is not running. Hosts with [Settings.supportsBalanceWatch] override this.
@@ -245,12 +247,14 @@ interface NodeController {
     val watchSchedule: String? get() = null
 
     /**
-     * The Watch tab changed [network]'s list — [added] an address, or removed one. The host
-     * drops the removed addresses' stored state ([BalanceWatcher.prune]: with no check to
-     * follow the edit, an old balance would otherwise be the baseline of a later re-add)
-     * and, on an add, a host that has to ask for permission to notify (Android 13+, whose
-     * auto-started service never asks) asks now, in context. Returns at once; the work
-     * runs on the host's own threads. Default no-op.
+     * The Watch tab changed [network]'s list — [added] an address, or removed one. On a
+     * removal the host drops the removed addresses' stored state ([BalanceWatcher.prune]:
+     * with no check to follow the edit, an old balance would otherwise be the baseline of a
+     * later re-add); not on an add, which removes nothing — a prune there would only take
+     * the watcher's slot from the baseline check the tab starts next. On an add, a host
+     * that has to ask for permission to notify (Android 13+, whose auto-started service
+     * never asks) asks now, in context. Returns at once; the work runs on the host's own
+     * threads. Default no-op.
      */
     fun onWatchListChanged(network: String, added: Boolean) {}
 

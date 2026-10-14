@@ -50,11 +50,13 @@ Every check is bounded:
 - for an after-wake check, at most a minute of what is left of the stack's catch-up slice, ending 2 minutes before the pass's deadline (one read's own bound), so a read in flight cannot carry the pass past it.
 
 Past the bound, addresses not read yet keep their stored state, and a cause search stops
-where it is. Each check reads the least recently verified addresses first, so what one
-check left out leads the next.
+where it is. Each check reads the least recently attempted addresses first. What one check
+left out leads the next, and an address whose read keeps failing goes to the back after
+each attempt.
 
-Check now runs in the host's own scope, off the main thread. Leaving the tab mid-check
-ends the tab's wait, not the check, so the check's results are still stored.
+Check now runs in the host's own scope, off the main thread, with the same 3-minute bound.
+Leaving the tab mid-check ends the tab's wait, not the check, so the check's results are
+still stored.
 
 ### Notification permission
 

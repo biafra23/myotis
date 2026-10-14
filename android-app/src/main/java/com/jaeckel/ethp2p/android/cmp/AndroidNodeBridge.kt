@@ -267,8 +267,7 @@ class AndroidNodeController(
             "A change posts a notification."
 
     override fun onWatchListChanged(network: String, added: Boolean) {
-        BalanceWatchRunner.listChanged(appContext, network)
-        if (added) requestNotifications()
+        if (added) requestNotifications() else BalanceWatchRunner.listChanged(appContext, network)
     }
 
     override val watchNotificationsNote: String?

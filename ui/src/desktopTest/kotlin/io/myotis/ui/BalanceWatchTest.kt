@@ -2,6 +2,9 @@ package io.myotis.ui
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlin.time.Duration
@@ -235,11 +238,15 @@ class BalanceWatchTest {
     }
 
     @Test
-    fun theLeastRecentlyVerifiedAddressIsReadFirst() = runBlocking {
+    fun theLeastRecentlyAttemptedAddressIsReadFirst() = runBlocking {
         val carol = "0x" + "c3".repeat(20)
+        val dave = "0x" + "d4".repeat(20)
         val prev = WatchState(addresses = mapOf(
             alice to WatchAddressState(WatchSeen("1", 0, 100, -1, checkedAtMs = 50)),
             bob to WatchAddressState(WatchSeen("1", 0, 100, -1, checkedAtMs = 10)),
+            // Never verified, but its read failed most recently: it goes to the back, so a
+            // slowly failing address cannot lead, and eat, every budgeted check.
+            dave to WatchAddressState(null, "headerChainGapTooLarge", errorAtMs = 55),
         ))
         val read = ArrayList<String>()
         val r = object : FakeReader() {
@@ -248,9 +255,13 @@ class BalanceWatchTest {
                 return account(address, "1", block = 101)
             }
         }
-        BalanceWatch.check(listOf(WatchEntry(alice, ""), WatchEntry(bob, ""), WatchEntry(carol, "")), prev, r, nowMs = 60)
-        // Never verified first, then by age: what a spent budget left out leads the next check.
-        assertEquals(listOf(carol, bob, alice), read)
+        BalanceWatch.check(
+            listOf(WatchEntry(alice, ""), WatchEntry(bob, ""), WatchEntry(carol, ""), WatchEntry(dave, "")),
+            prev, r, nowMs = 60,
+        )
+        // Never attempted first, then by the last attempt: what a spent budget left out leads
+        // the next check.
+        assertEquals(listOf(carol, bob, alice, dave), read)
     }
 
     @Test
@@ -365,6 +376,26 @@ class BalanceWatchTest {
         // Re-adding it later starts from a fresh baseline, not the forgotten balance.
         store.setWatchListJson("mainnet", BalanceWatch.serializeList(listOf(WatchEntry(alice, ""))))
         val r = FakeReader().apply { balances[alice] = account(alice, "9", block = 500) }
+        assertEquals(emptyList<Any>(), watcher.check("mainnet", r))
+    }
+
+    @Test
+    fun aCancelledCheckFreesItsSlot() = runBlocking {
+        val store = StoreSettings()
+        store.setWatchListJson("mainnet", BalanceWatch.serializeList(listOf(WatchEntry(alice, ""))))
+        val entered = CompletableDeferred<Unit>()
+        val stuck = object : FakeReader() {
+            override suspend fun account(address: String): AccountResult {
+                entered.complete(Unit)
+                awaitCancellation()
+            }
+        }
+        val watcher = BalanceWatcher(store) { 100 }
+        val job = launch { watcher.check("mainnet", stuck) }
+        entered.await()
+        job.cancelAndJoin()
+        assertTrue(!watcher.isChecking("mainnet"))
+        val r = FakeReader().apply { balances[alice] = account(alice, "1", block = 5) }
         assertEquals(emptyList<Any>(), watcher.check("mainnet", r))
     }
 
