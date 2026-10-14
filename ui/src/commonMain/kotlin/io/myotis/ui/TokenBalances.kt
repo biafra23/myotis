@@ -1,18 +1,19 @@
 package io.myotis.ui
 
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
-import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -31,8 +32,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -47,51 +46,84 @@ import kotlinx.coroutines.sync.withPermit
 
 // Token reads in flight at once. Each is an EVM run over proof-fetched state, i.e. snap
 // round trips to peers; a lookup must not fire every row at the pool at the same time.
-// The semaphore holding the bound lives in QueryTab, not in the card: a new lookup
-// replaces the card while the old card's reads still run (the hosts wait their engine runs
-// out), and a fresh semaphore per card would let both sets run at once.
+// The semaphore holding the bound lives in QueryTab, not in the result: a new lookup
+// replaces the result while the old one's reads still run (the hosts wait their engine runs
+// out), and a fresh semaphore per result would let both sets run at once.
 internal const val TOKEN_READS_IN_FLIGHT = 4
 
 /**
- * The Query tab's token balances for [holder] on [network]: the built-in [PopularTokens]
- * plus the user's own ([CustomTokens], added and removed here when the host persists them),
- * each read with a verified `eth_call` to `balanceOf` ([readTokenBalance]) as soon as the
- * card shows. Rows fill in as their reads land; a row that could not be read says why, and
- * is read again by itself once the node is back up and synced ([ready]).
- * [contractDecimals] remembers what each custom token's contract answered to `decimals()`
- * across lookups (the caller scopes it to the network), so that check costs one call per
- * token, not one per read. [permits] bounds the reads in flight ([TOKEN_READS_IN_FLIGHT]);
- * the caller keeps it across lookups, so the bound also counts a replaced card's reads.
+ * One lookup's token balances, as the query result shows them: the tokens read for the
+ * holder ([PopularTokens] plus the user's own [CustomTokens]) and what each read returned.
+ * Built afresh on every composition by [rememberTokenBalances] over its remembered state.
+ */
+internal class TokenBalancesState(
+    val tokens: List<Token>,
+    private val results: Map<String, TokenBalance>,
+    private val onRetry: () -> Unit,
+    private val onUseChainDecimals: (Token, Int) -> Unit,
+    private val onRefresh: () -> Unit = {},
+    /** Whether the user can add tokens in Settings on this host ([Settings.supportsCustomTokens]). */
+    val canAddTokens: Boolean = true,
+) {
+    /** [t]'s result; null while it is being read (or was read for since-edited decimals). */
+    fun resultFor(t: Token): TokenBalance? = results[t.key]?.takeIf { it.token == t }
+
+    val pending: Int get() = tokens.count { resultFor(it) == null }
+    val anyFailed: Boolean get() = tokens.any { t -> resultFor(t)?.let { it.raw == null } == true }
+
+    /**
+     * Every row failing the same way (the node stopped, its read surface is down) is one
+     * problem: said once instead of on every row.
+     */
+    val sharedError: String?
+        get() = tokens.map { resultFor(it) }
+            .takeIf { it.size > 1 && it.all { r -> r != null && r.raw == null } }
+            ?.map { it!!.error }?.distinct()?.singleOrNull()
+
+    /** Read the failed rows again. */
+    fun retry() = onRetry()
+
+    /** Read every row again — a balance read a while ago may have moved since. */
+    fun refresh() = onRefresh()
+
+    /** Store the contract's own decimals for the custom token [t]. */
+    fun useChainDecimals(t: Token, decimals: Int) = onUseChainDecimals(t, decimals)
+}
+
+/**
+ * Read [holder]'s balance of every token [network] lists — built in and the user's own —
+ * with a verified `eth_call` to `balanceOf` ([readTokenBalance]), as soon as this enters
+ * composition. A row that failed is read again by itself once the node is back up and
+ * synced ([ready]). [contractDecimals] remembers what each custom token's contract
+ * answered to `decimals()` across lookups (the caller scopes it to the network), so that
+ * check costs one call per token, not one per read; [permits] bounds the reads in flight
+ * ([TOKEN_READS_IN_FLIGHT]) across lookups.
  */
 @Composable
-internal fun TokenBalancesCard(
+internal fun rememberTokenBalances(
     controller: NodeController,
     settings: Settings,
     network: String,
     holder: String,
-    running: Boolean,
     ready: Boolean,
     contractDecimals: MutableMap<String, Int>,
     permits: Semaphore,
-) {
-    val clipboard = LocalClipboardManager.current
+): TokenBalancesState {
     val popular = remember(network) { PopularTokens.forNetwork(network) }
+    // Read when the result appears: the Settings tab edits the list, and leaving the Query
+    // tab drops this, so the next lookup sees the edit.
     var custom by remember(network) { mutableStateOf(CustomTokens.parse(settings.customTokensJson(network))) }
-    fun saveCustom(next: List<Token>) {
-        custom = next
-        settings.setCustomTokensJson(network, CustomTokens.serialize(next))
-    }
     // A custom entry for a contract a later release pinned as built-in shows once, as built-in.
     val tokens = popular + custom.filterNot { c -> popular.any { it.key == c.key } }
 
-    // Bumping [refresh] drops every result and re-reads every row; bumping one row's attempt
-    // re-reads that row alone.
+    // Bumping [refresh] drops every result and re-reads every row; bumping one row's
+    // attempt re-reads that row alone.
     var refresh by remember(network, holder) { mutableStateOf(0) }
     val results = remember(network, holder, refresh) { mutableStateMapOf<String, TokenBalance>() }
     val attempts = remember(network, holder, refresh) { mutableStateMapOf<String, Int>() }
     tokens.forEach { t ->
-        // One effect per token, keyed on the token itself: adding a token reads only it,
-        // removing one cancels its read, and a custom token's edited decimals re-read it.
+        // One effect per token, keyed on the token itself: a custom token's edited
+        // decimals re-read it, and a row's bumped attempt re-reads it.
         key(t.key) {
             LaunchedEffect(network, holder, refresh, t, attempts[t.key] ?: 0) {
                 permits.withPermit {
@@ -102,87 +134,95 @@ internal fun TokenBalancesCard(
             }
         }
     }
-    // Rows that failed while the node was down or catching up are read again once it is
-    // ready: a stopped node's "not running" must not outlive the node coming back.
-    LaunchedEffect(ready) {
-        if (!ready) return@LaunchedEffect
+    fun retryFailed() {
         results.filterValues { it.raw == null }.keys.forEach { k ->
             results.remove(k)
             attempts[k] = (attempts[k] ?: 0) + 1
         }
     }
-    // Every row failing the same way (the node stopped, its read surface is down) is one
-    // problem: say it once instead of on every row.
-    val read = tokens.mapNotNull { t -> results[t.key]?.takeIf { it.token == t } }
-    val sharedError = read
-        .takeIf { it.size == tokens.size && it.size > 1 && it.all { r -> r.raw == null } }
-        ?.map { it.error }?.distinct()?.singleOrNull()
-    var hideZero by remember { mutableStateOf(false) }
-    var adding by remember(network) { mutableStateOf(false) }
+    // Rows that failed while the node was down or catching up are read again once it is
+    // ready: a stopped node's "not running" must not outlive the node coming back.
+    LaunchedEffect(ready) { if (ready) retryFailed() }
 
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("Tokens", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
-                TextButton(onClick = { refresh++ }, enabled = running) { Text("Refresh") }
-                OutlinedButton(onClick = {
-                    clipboard.setText(AnnotatedString(formatTokenBalances(holder, tokens, results)))
-                }) { Text("Copy") }
-            }
+    return TokenBalancesState(
+        tokens, results,
+        onRetry = ::retryFailed,
+        onUseChainDecimals = { t, d ->
+            custom = custom.map { if (it.key == t.key) it.copy(decimals = d) else it }
+            settings.setCustomTokensJson(network, CustomTokens.serialize(custom))
+        },
+        onRefresh = { refresh++ },
+        canAddTokens = settings.supportsCustomTokens(),
+    )
+}
+
+/**
+ * The token balances inside the query result: the tokens the holder has a balance of (and
+ * any that could not be read), with the zero balances one tap away. Rows fill in as their
+ * reads land; the header counts the reads still out.
+ */
+@Composable
+internal fun TokenBalancesSection(state: TokenBalancesState, running: Boolean) {
+    var showAll by remember { mutableStateOf(false) }
+    val sharedError = state.sharedError
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        HorizontalDivider()
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text(
-                "Each balance is a verified eth_call to the token's balanceOf, run against the " +
-                    "beacon-verified head state. Built-in tokens are pinned by contract address.",
+                "Tokens",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+            if (state.pending > 0) {
+                CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp)
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    "${state.tokens.size - state.pending} of ${state.tokens.size} read",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                // A failed row need not wait for a slow read elsewhere to be tried again.
+                if (state.anyFailed && running) TextButton(onClick = state::retry) { Text("Retry failed") }
+            } else if (running && state.tokens.isNotEmpty()) {
+                TextButton(onClick = state::refresh) { Text("Refresh") }
+            }
+        }
+        sharedError?.let {
+            Text(
+                "Could not read any token balance: $it",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        var held = 0
+        state.tokens.forEach { t ->
+            val r = state.resultFor(t)
+            val zero = r?.raw != null && r.raw.trimStart('0').isEmpty()
+            val hasBalance = r?.raw != null && !zero
+            if (hasBalance) held++
+            // Collapsed: what the holder has, what could not be read (unless one shared
+            // error already said it), and a custom token whose decimals disagree with its
+            // contract even at a zero balance. Expanded: every token, zero and in-flight.
+            val failedAlone = r != null && r.raw == null && sharedError == null
+            if (showAll || hasBalance || failedAlone || r?.decimalsMismatch == true) {
+                TokenRow(t, r, showError = sharedError == null, onUseChainDecimals = { state.useChainDecimals(t, it) })
+            }
+        }
+        if (!showAll && state.pending == 0 && held == 0 && sharedError == null && !state.anyFailed) {
+            Text(
+                when {
+                    state.tokens.isNotEmpty() -> "No balance in any of the ${state.tokens.size} tokens checked."
+                    state.canAddTokens -> "No tokens are listed for this chain — add some in Settings."
+                    else -> "No tokens are listed for this chain."
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            if (tokens.isEmpty()) {
-                Text(
-                    "No built-in tokens for this network — add one by its contract address.",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-            sharedError?.let {
-                Text(
-                    "Could not read any balance: $it",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
-                )
-            }
-            tokens.forEach { t ->
-                // A result read for a since-edited token (other decimals) is stale: wait.
-                val r = results[t.key]?.takeIf { it.token == t }
-                val zero = r?.raw != null && r.raw.trimStart('0').isEmpty()
-                if (!(hideZero && zero)) {
-                    HorizontalDivider()
-                    TokenRow(
-                        t, r,
-                        showError = sharedError == null,
-                        onRemove = if (t.custom) ({ saveCustom(custom.filterNot { it.key == t.key }) }) else null,
-                        onUseChainDecimals = { d ->
-                            saveCustom(custom.map { if (it.key == t.key) it.copy(decimals = d) else it })
-                        },
-                    )
-                }
-            }
-            if (tokens.isNotEmpty()) {
-                TextButton(onClick = { hideZero = !hideZero }) {
-                    Text(if (hideZero) "Show zero balances" else "Hide zero balances")
-                }
-            }
-            if (settings.supportsCustomTokens()) {
-                if (adding) {
-                    AddTokenForm(
-                        controller, network, running, listed = tokens,
-                        onAdd = { saveCustom(custom + it); adding = false },
-                        onCancel = { adding = false },
-                    )
-                } else {
-                    TextButton(onClick = { adding = true }) { Text("+ Add token") }
-                }
+        }
+        if (state.tokens.isNotEmpty()) {
+            TextButton(onClick = { showAll = !showAll }) {
+                Text(if (showAll) "Hide zero balances" else "Show all ${state.tokens.size} tokens")
             }
         }
     }
@@ -193,7 +233,6 @@ private fun TokenRow(
     t: Token,
     r: TokenBalance?,
     showError: Boolean,
-    onRemove: (() -> Unit)?,
     onUseChainDecimals: (Int) -> Unit,
 ) {
     Column(Modifier.fillMaxWidth()) {
@@ -201,7 +240,7 @@ private fun TokenRow(
             Column(Modifier.weight(1f)) {
                 Text(
                     if (t.custom) "${t.symbol} · custom" else t.symbol,
-                    style = MaterialTheme.typography.titleSmall,
+                    style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.SemiBold,
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
@@ -224,9 +263,6 @@ private fun TokenRow(
                 }
                 else -> Text("—", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            if (onRemove != null) {
-                TextButton(onClick = onRemove) { Text("Remove") }
-            }
         }
         r?.error?.takeIf { showError }?.let {
             Text(
@@ -244,6 +280,89 @@ private fun TokenRow(
                 color = StatusColors.Amber,
             )
             TextButton(onClick = { onUseChainDecimals(d) }) { Text("Use $d decimals") }
+        }
+    }
+}
+
+/**
+ * The Settings tab's Tokens section: which tokens every Query lookup reads, per chain —
+ * the built-in list, the user's own with Remove, and the add form where the host can
+ * store them ([Settings.supportsCustomTokens]). Opens on [network], the chain picked at
+ * the top; the chips switch to any other. Changes are stored at once (no Save).
+ */
+@Composable
+internal fun TokenSettings(
+    controller: NodeController,
+    settings: Settings,
+    network: String,
+    snapshots: Map<String, NodeSnapshot>,
+) {
+    val networks = remember { settings.allNetworks() }
+    var net by remember(network) { mutableStateOf(network) }
+    val popular = remember(net) { PopularTokens.forNetwork(net) }
+    var custom by remember(net) { mutableStateOf(CustomTokens.parse(settings.customTokensJson(net))) }
+    fun save(next: List<Token>) {
+        custom = next
+        settings.setCustomTokensJson(net, CustomTokens.serialize(next))
+    }
+    var adding by remember(net) { mutableStateOf(false) }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SettingsSection("Tokens")
+        SettingsNote(
+            "Every Query lookup shows the address's balance of these tokens, each a verified " +
+                "eth_call to the token's balanceOf. Built-in tokens are pinned by contract " +
+                "address; add any other ERC-20 token by its contract address.",
+        )
+        if (networks.size > 1) {
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                networks.forEach { id ->
+                    FilterChip(selected = id == net, onClick = { net = id }, label = { Text(settings.displayName(id)) })
+                }
+            }
+        }
+        Text("Built in", style = MaterialTheme.typography.labelMedium)
+        if (popular.isEmpty()) {
+            SettingsNote("None for this chain.")
+        } else {
+            Text(popular.joinToString(" · ") { it.symbol }, style = MaterialTheme.typography.bodyMedium)
+        }
+        Text("Added by you", style = MaterialTheme.typography.labelMedium)
+        if (custom.isEmpty()) SettingsNote("None yet.")
+        custom.forEach { t ->
+            // A contract this release pins as built-in: the lookup reads the built-in entry,
+            // so this one does nothing any more (the user may remove it).
+            val shadowed = popular.any { it.key == t.key }
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        "${t.symbol} · ${t.decimals} decimals" + if (shadowed) " · now built in, not used" else "",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (shadowed) MaterialTheme.colorScheme.onSurfaceVariant else Color.Unspecified,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        t.address,
+                        fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                if (settings.supportsCustomTokens()) {
+                    TextButton(onClick = { save(custom.filterNot { it.key == t.key }) }) { Text("Remove") }
+                }
+            }
+        }
+        if (settings.supportsCustomTokens()) {
+            if (adding) {
+                AddTokenForm(
+                    controller, net, running = snapshots[net]?.running == true, listed = popular + custom,
+                    onAdd = { save(custom + it); adding = false },
+                    onCancel = { adding = false },
+                )
+            } else {
+                OutlinedButton(onClick = { adding = true }) { Text("Add token") }
+            }
         }
     }
 }
@@ -295,12 +414,10 @@ private fun AddTokenForm(
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             modifier = Modifier.fillMaxWidth(),
         )
-        Text(
+        SettingsNote(
             "Decimals scale the raw amount: most tokens use 18, USDC and USDT use 6. A wrong " +
                 "value shows a balance off by powers of ten; it is checked against the " +
                 "contract's own decimals() when the balance is read.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         note?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
         problem?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error) }
@@ -345,6 +462,12 @@ private fun AddTokenForm(
             ) { Text("Read from contract") }
             if (reading != null) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
         }
+        if (!running) {
+            SettingsNote(
+                "Reading the contract needs this chain running; you can still enter the name " +
+                    "and decimals yourself.",
+            )
+        }
         TextButton(onClick = { reading?.cancel(); onCancel() }) { Text("Cancel") }
         Spacer(Modifier.height(4.dp))
     }
@@ -353,20 +476,22 @@ private fun AddTokenForm(
 /** "0xA0b8…eB48". */
 private fun shortAddress(a: String): String = if (a.length > 12) "${a.take(6)}…${a.takeLast(4)}" else a
 
-/** Plaintext of the card for the clipboard: one line per token, full addresses. */
-internal fun formatTokenBalances(holder: String, tokens: List<Token>, results: Map<String, TokenBalance>): String =
-    buildString {
-        appendLine("holder: $holder")
-        tokens.forEach { t ->
-            val r = results[t.key]?.takeIf { it.token == t }
-            append(t.symbol).append(if (t.custom) " (custom)" else "").append(": ")
-            when {
-                r == null -> append("not read yet")
-                r.raw != null -> append(formatTokenAmount(r.raw, t.decimals))
-                    .append(" (raw ").append(r.raw).append(", ").append(t.decimals).append(" decimals)")
-                else -> append("error: ").append(r.error)
-            }
-            if (r?.decimalsMismatch == true) append(" [contract reports ${r.chainDecimals} decimals]")
-            append(" — ").appendLine(t.address)
+/**
+ * The token balances as plaintext, for the query result's Copy: one line per token with
+ * its amount, raw base units, decimals and full contract address.
+ */
+internal fun formatTokenBalances(state: TokenBalancesState): String = buildString {
+    appendLine("tokens:")
+    state.tokens.forEach { t ->
+        val r = state.resultFor(t)
+        append("  ").append(t.symbol).append(if (t.custom) " (custom)" else "").append(": ")
+        when {
+            r == null -> append("not read yet")
+            r.raw != null -> append(formatTokenAmount(r.raw, t.decimals))
+                .append(" (raw ").append(r.raw).append(", ").append(t.decimals).append(" decimals)")
+            else -> append("error: ").append(r.error)
         }
+        if (r?.decimalsMismatch == true) append(" [contract reports ${r.chainDecimals} decimals]")
+        append(" — ").appendLine(t.address)
     }
+}

@@ -27,8 +27,9 @@ import org.junit.Test
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * The Query tab's token balances: built-in tokens read after a lookup, the add-token form,
- * removing a token, and a custom token whose decimals disagree with its contract.
+ * Token balances in the Query tab's result — what the looked-up address holds, the zero
+ * balances one tap away, a custom token whose decimals disagree with its contract — and the
+ * Settings tab's Tokens section, where tokens are added and removed.
  */
 class TokenBalancesUiTest {
 
@@ -57,95 +58,32 @@ class TokenBalancesUiTest {
         }
     }
 
+    // ---- the query result ----
+
     @Test
-    fun aLookupShowsThePopularTokensBalances() {
-        lookUp(Node(), FakeSettings())
-        rule.awaitText("1,234.5")
+    fun theResultShowsTheTokensTheAddressHolds() {
+        show(Node(), FakeSettings())
+        lookUp()
         rule.onNodeWithText("Tokens").assertExists()
         rule.onNodeWithText("USDC").assertExists()
         rule.onNodeWithText("1,234.5").assertExists()
-        rule.onNodeWithText("WBTC").assertExists()
-    }
-
-    @Test
-    fun zeroBalancesCanBeHidden() {
-        lookUp(Node(), FakeSettings())
+        // Zero balances are one tap away, not a wall of zeros.
+        rule.onNodeWithText("USDT").assertDoesNotExist()
+        val all = PopularTokens.forNetwork("mainnet").size
+        rule.onNodeWithText("Show all $all tokens").click()
+        rule.pumpFrames()
+        rule.onNodeWithText("USDT").assertExists()
         rule.onNodeWithText("Hide zero balances").click()
         rule.pumpFrames()
         rule.onNodeWithText("USDT").assertDoesNotExist()
-        rule.onNodeWithText("USDC").assertExists()
-        rule.onNodeWithText("Show zero balances").click()
-        rule.pumpFrames()
-        rule.onNodeWithText("USDT").assertExists()
     }
 
     @Test
-    fun aTokenAddedByAddressNameAndDecimalsIsReadAndStored() {
-        val node = Node(balances = mapOf(MINE.lowercase() to 2_500_000L), decimals = mapOf(MINE.lowercase() to 6L))
-        val settings = FakeSettings()
-        lookUp(node, settings)
-        rule.onNodeWithText("+ Add token").click()
-        rule.pumpFrames()
-        field("Contract address (0x…)").performTextInput(MINE.lowercase())
-        field("Name (e.g. the token's symbol)").performTextInput("MINE")
-        field("Decimals").performTextInput("6")
-        rule.pumpFrames()
-        rule.onNodeWithText("Add").click()
-        rule.awaitText("2.5")
-        awaitTokenReads()
-        rule.onNodeWithText("MINE · custom").assertExists()
-        // Stored checksummed, under the network it was added on.
-        assertEquals(
-            listOf(Token(MINE, "MINE", 6, custom = true)),
-            CustomTokens.parse(settings.customTokensJson("mainnet")),
-        )
-
-        rule.onNodeWithText("Remove").click()
-        rule.pumpFrames()
-        rule.onNodeWithText("MINE · custom").assertDoesNotExist()
-        assertEquals("[]", settings.customTokensJson("mainnet"))
-    }
-
-    @Test
-    fun theFormSaysWhyItRefusesAnAddress() {
-        val settings = FakeSettings()
-        lookUp(Node(), settings)
-        rule.onNodeWithText("+ Add token").click()
-        rule.pumpFrames()
-        // USDC's address with one letter's case flipped: a typo the checksum catches.
-        field("Contract address (0x…)").performTextInput("0xa0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
-        field("Name (e.g. the token's symbol)").performTextInput("FAKE")
-        field("Decimals").performTextInput("6")
-        rule.pumpFrames()
-        rule.onNodeWithText("Add").click()
-        rule.pumpFrames()
-        rule.onNodeWithText("That address fails its checksum (EIP-55) — check it for a typo.")
+    fun anAddressWithoutTokensSaysSo() {
+        show(Node(balances = emptyMap()), FakeSettings())
+        lookUp()
+        rule.onNodeWithText("No balance in any of the ${PopularTokens.forNetwork("mainnet").size} tokens checked.")
             .assertExists()
-        assertEquals("[]", settings.customTokensJson("mainnet"))
-    }
-
-    @Test
-    fun readFromContractFillsTheForm() {
-        val node = object : Node() {
-            override suspend fun ethCall(network: String, to: String, data: String): EthCallResult =
-                if (data == Erc20.SYMBOL_CALL && to.equals(MINE, ignoreCase = true)) {
-                    EthCallResult(EthCallStatus.OK, "0x" + toHex(abiString("CHAIN")))
-                } else if (data == Erc20.DECIMALS_CALL && to.equals(MINE, ignoreCase = true)) {
-                    EthCallResult(EthCallStatus.OK, "0x" + toHex(word(8)))
-                } else {
-                    super.ethCall(network, to, data)
-                }
-        }
-        lookUp(node, FakeSettings())
-        rule.onNodeWithText("+ Add token").click()
-        rule.pumpFrames()
-        field("Contract address (0x…)").performTextInput(MINE)
-        rule.pumpFrames()
-        rule.onNodeWithText("Read from contract").click()
-        rule.awaitText("The contract calls itself CHAIN and reports 8 decimals.")
-        awaitTokenReads()
-        rule.onNodeWithText("CHAIN").assertExists()
-        rule.onNodeWithText("8").assertExists()
     }
 
     @Test
@@ -154,8 +92,9 @@ class TokenBalancesUiTest {
         val settings = FakeSettings().apply {
             setCustomTokensJson("mainnet", CustomTokens.serialize(listOf(Token(MINE, "MINE", 18, custom = true))))
         }
-        lookUp(node, settings)
-        rule.awaitText("Use 6 decimals")
+        show(node, settings)
+        lookUp()
+        rule.onNodeWithText("MINE · custom").assertExists()
         rule.onNodeWithText("The contract reports 6 decimals, this entry says 18 — the amount above is scaled by 18.")
             .assertExists()
         rule.onNodeWithText("Use 6 decimals").click()
@@ -166,15 +105,58 @@ class TokenBalancesUiTest {
     }
 
     @Test
+    fun aZeroBalanceStillShowsADecimalsMismatch() {
+        val node = Node(balances = emptyMap(), decimals = mapOf(MINE.lowercase() to 6L))
+        val settings = FakeSettings().apply {
+            setCustomTokensJson("mainnet", CustomTokens.serialize(listOf(Token(MINE, "MINE", 18, custom = true))))
+        }
+        show(node, settings)
+        lookUp()
+        // Collapsed view, zero balance: the wrong entry is still worth a warning.
+        rule.onNodeWithText("Use 6 decimals").assertExists()
+    }
+
+    @Test
+    fun refreshReadsEveryRowAgain() {
+        val node = Node()
+        show(node, FakeSettings())
+        lookUp()
+        assertEquals(1, node.calls[USDC.lowercase()])
+        rule.onNodeWithText("Refresh").click()
+        rule.pumpFrames()
+        awaitTokenReads()
+        assertEquals(2, node.calls[USDC.lowercase()])
+        rule.onNodeWithText("1,234.5").assertExists()
+    }
+
+    @Test
     fun aFailureEveryRowSharesIsSaidOnce() {
         val node = object : Node() {
             override suspend fun ethCall(network: String, to: String, data: String): EthCallResult =
                 throw IllegalStateException("Verified reads are not available on mainnet")
         }
-        lookUp(node, FakeSettings())
-        rule.onNodeWithText("Could not read any balance: Verified reads are not available on mainnet")
+        show(node, FakeSettings())
+        lookUp()
+        rule.onNodeWithText("Could not read any token balance: Verified reads are not available on mainnet")
             .assertExists()
         rule.onNodeWithText("Could not read: Verified reads are not available on mainnet").assertDoesNotExist()
+    }
+
+    @Test
+    fun theResultsCopyTextCarriesTheTokens() {
+        val usdc = PopularTokens.forNetwork("mainnet").first { it.symbol == "USDC" }
+        val mine = Token(MINE, "MINE", 18, custom = true)
+        val state = TokenBalancesState(
+            listOf(usdc, mine),
+            mapOf(usdc.key to TokenBalance(usdc, "1234500000"), mine.key to TokenBalance(mine, null, "the contract reverted")),
+            onRetry = {}, onUseChainDecimals = { _, _ -> },
+        )
+        assertEquals(
+            "tokens:\n" +
+                "  USDC: 1,234.5 (raw 1234500000, 6 decimals) — $USDC\n" +
+                "  MINE (custom): error: the contract reverted — $MINE\n",
+            formatTokenBalances(state),
+        )
     }
 
     @Test
@@ -182,17 +164,121 @@ class TokenBalancesUiTest {
         val node = object : Node() {
             override val supportsEthCall: Boolean = false
         }
-        lookUp(node, FakeSettings())
+        show(node, FakeSettings())
+        lookUp()
         rule.onNodeWithText("Balance (ETH)").assertExists()
         rule.onNodeWithText("Tokens").assertDoesNotExist()
+        openTab("Settings")
+        rule.onNodeWithText("Tokens").assertDoesNotExist()
         assertTrue(node.calls.isEmpty())
+    }
+
+    // ---- the Settings tab ----
+
+    @Test
+    fun settingsListsTheBuiltInTokensAndAddsOneByAddressNameAndDecimals() {
+        val node = Node(balances = mapOf(MINE.lowercase() to 2_500_000L), decimals = mapOf(MINE.lowercase() to 6L))
+        val settings = FakeSettings()
+        show(node, settings)
+        openTab("Settings")
+        rule.onNodeWithText("Tokens").assertExists()
+        rule.onNode(hasText("USDT · USDC · DAI", substring = true)).assertExists()
+        rule.onNodeWithText("None yet.").assertExists()
+
+        rule.onNodeWithText("Add token").click()
+        rule.pumpFrames()
+        field("Contract address (0x…)").performTextInput(MINE.lowercase())
+        field("Name (e.g. the token's symbol)").performTextInput("MINE")
+        field("Decimals").performTextInput("6")
+        rule.pumpFrames()
+        rule.onNodeWithText("Add").click()
+        rule.pumpFrames()
+        rule.onNodeWithText("MINE · 6 decimals").assertExists()
+        rule.onNodeWithText(MINE).assertExists()  // stored checksummed
+        assertEquals(
+            listOf(Token(MINE, "MINE", 6, custom = true)),
+            CustomTokens.parse(settings.customTokensJson("mainnet")),
+        )
+
+        // The next lookup reads it.
+        openTab("Query")
+        lookUp()
+        rule.onNodeWithText("MINE · custom").assertExists()
+        rule.onNodeWithText("2.5").assertExists()
+    }
+
+    @Test
+    fun settingsRefusesAnAddressThatFailsItsChecksum() {
+        val settings = FakeSettings()
+        show(Node(), settings)
+        openTab("Settings")
+        rule.onNodeWithText("Add token").click()
+        rule.pumpFrames()
+        // USDC's address with one letter's case flipped: a typo the checksum catches.
+        field("Contract address (0x…)").performTextInput("0xa0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+        field("Name (e.g. the token's symbol)").performTextInput("FAKE")
+        field("Decimals").performTextInput("6")
+        rule.pumpFrames()
+        rule.onNodeWithText("Add").click()
+        rule.pumpFrames()
+        rule.onNodeWithText("That address fails its checksum (EIP-55) — check it for a typo.").assertExists()
+        assertEquals("[]", settings.customTokensJson("mainnet"))
+    }
+
+    @Test
+    fun settingsReadsANameAndDecimalsFromTheContract() {
+        val node = object : Node() {
+            override suspend fun ethCall(network: String, to: String, data: String): EthCallResult =
+                if (data == Erc20.SYMBOL_CALL && to.equals(MINE, ignoreCase = true)) {
+                    EthCallResult(EthCallStatus.OK, "0x" + toHex(abiString("CHAIN")))
+                } else if (data == Erc20.DECIMALS_CALL && to.equals(MINE, ignoreCase = true)) {
+                    EthCallResult(EthCallStatus.OK, "0x" + toHex(word(8)))
+                } else {
+                    super.ethCall(network, to, data)
+                }
+        }
+        show(node, FakeSettings())
+        openTab("Settings")
+        rule.onNodeWithText("Add token").click()
+        rule.pumpFrames()
+        field("Contract address (0x…)").performTextInput(MINE)
+        rule.pumpFrames()
+        rule.onNodeWithText("Read from contract").click()
+        rule.awaitText("The contract calls itself CHAIN and reports 8 decimals.")
+        rule.onNodeWithText("CHAIN").assertExists()
+        rule.onNodeWithText("8").assertExists()
+    }
+
+    @Test
+    fun settingsMarksAnEntryAReleaseNowBuildsIn() {
+        val settings = FakeSettings().apply {
+            setCustomTokensJson("mainnet", CustomTokens.serialize(listOf(Token(USDC, "MyUSDC", 6, custom = true))))
+        }
+        show(Node(), settings)
+        openTab("Settings")
+        rule.onNodeWithText("MyUSDC · 6 decimals · now built in, not used").assertExists()
+    }
+
+    @Test
+    fun settingsRemovesAToken() {
+        val settings = FakeSettings().apply {
+            setCustomTokensJson("mainnet", CustomTokens.serialize(listOf(Token(MINE, "MINE", 6, custom = true))))
+        }
+        show(Node(), settings)
+        openTab("Settings")
+        rule.onNodeWithText("MINE · 6 decimals").assertExists()
+        rule.onNodeWithText("Remove").click()
+        rule.pumpFrames()
+        rule.onNodeWithText("MINE · 6 decimals").assertDoesNotExist()
+        rule.onNodeWithText("None yet.").assertExists()
+        assertEquals("[]", settings.customTokensJson("mainnet"))
     }
 
     // ---- harness ----
 
     private fun field(label: String) = rule.onNode(hasSetTextAction() and hasText(label))
 
-    /** Click through semantics: the tab is laid out unscrolled, partly below the window. */
+    /** Click through semantics: the screen is laid out unscrolled, partly below the window. */
     private fun SemanticsNodeInteraction.click() = performSemanticsAction(SemanticsActions.OnClick)
 
     /** Pump until no row is reading any more, so assertions see every row's final state. */
@@ -207,18 +293,26 @@ class TokenBalancesUiTest {
         error("token reads did not finish")
     }
 
-    private fun lookUp(controller: NodeController, settings: Settings) {
+    private fun show(controller: NodeController, settings: Settings) {
         rule.mainClock.autoAdvance = false
         rule.setContent {
-            // Tall enough for the whole Query tab to lay out without scrolling: a scroll
-            // animation never finishes under the hand-driven clock these tests need.
+            // Tall enough for a whole tab to lay out without scrolling: a scroll animation
+            // never finishes under the hand-driven clock these tests need.
             Box(Modifier.wrapContentSize(Alignment.TopStart, unbounded = true).requiredSize(1024.dp, 6000.dp)) {
                 NodeScreen(controller = controller, settings = settings, logs = NoTestLogs)
             }
         }
         rule.pumpFrames()
-        rule.onNode(isSelectable() and hasText("Query")).performClick()
+    }
+
+    private fun openTab(label: String) {
+        rule.onNode(isSelectable() and hasText(label)).performClick()
         rule.pumpFrames()
+    }
+
+    /** Look [HOLDER] up on the Query tab and wait for every token read to land. */
+    private fun lookUp() {
+        if (rule.onAllNodes(hasText("Address (0x…) or ENS name")).fetchSemanticsNodes().isEmpty()) openTab("Query")
         rule.onNodeWithText("Address (0x…) or ENS name").performTextInput(HOLDER)
         rule.pumpFrames()
         rule.onNodeWithText("Look up").performClick()
