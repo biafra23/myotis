@@ -29,10 +29,17 @@ class TokensTest {
         assertEquals("313ce567", selector("decimals()"))
         assertEquals("95d89b41", selector("symbol()"))
         assertEquals("08c379a0", selector("Error(string)"))
-        // A multi-block input: 136 bytes is exactly one rate, so padding spills into a second block.
-        assertEquals(
-            toHex(Keccak256.digest(ByteArray(136) { 0x61 })).length, 64,
-        )
+        // Around and past the 136-byte rate: padding inside the last data block (135),
+        // a whole block of padding (136), and inputs spanning two and three blocks. Pinned
+        // from pycryptodome's keccak and a node's web3_sha3, which agree; input byte i = i % 251.
+        mapOf(
+            135 to "cbdfd9dee5faad3818d6b06f95a219fd290b0e1706f6a82e5a595b9ce9faca62",
+            136 to "7ce759f1ab7f9ce437719970c26b0a66ff11fe3e38e17df89cf5d29c7d7f807e",
+            137 to "ac73d4fae68b8453f764007c1a20ce95994187861f0c3227a3a8e99a73a3b1db",
+            300 to "4699841dafd5e26cca72b05a41d38c96b4b468e5a6cbf694cbebe77dacdf6528",
+        ).forEach { (n, digest) ->
+            assertEquals("$n bytes", digest, toHex(Keccak256.digest(ByteArray(n) { (it % 251).toByte() })))
+        }
     }
 
     @Test
@@ -105,6 +112,14 @@ class TokensTest {
         val mkr = ByteArray(32).also { "MKR".encodeToByteArray().copyInto(it) }
         assertEquals("MKR", Erc20.decodeText(mkr))
         assertNull(Erc20.decodeText(ByteArray(7)))
+        // A contract's text is a claim it controls: shown, but never at any length.
+        val long = Erc20.decodeText(abiString("y".repeat(5_000)))!!
+        assertEquals(Erc20.MAX_TEXT_LENGTH + 1, long.length)
+        assertTrue(long.endsWith("…"))
+        assertEquals(
+            Erc20.MAX_TEXT_LENGTH + 1,
+            Erc20.revertReason(hexToBytes("08c379a0")!! + abiString("z".repeat(5_000)))!!.length,
+        )
         // An offset that points outside the reply is no string.
         assertNull(Erc20.decodeText(word(4096) + word(4)))
 
@@ -139,12 +154,16 @@ class TokensTest {
               {"address":"0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359","name":"Duplicate","decimals":18},
               {"address":"0xdbF03B407c01E7cD3CBea99509d93f8DDDC8C6FB","name":"Too many","decimals":256},
               {"address":"0xD1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb","name":"  ","decimals":1},
-              {"address":"0xD1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb","name":"Ok\u0007","decimals":0,"extra":null} ]
+              {"address":"0xD1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb","name":"Ok\u0007","decimals":0,"extra":null},
+              {"address":"0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed","name":"${"x".repeat(23)} and more","decimals":2} ]
         """.trimIndent()
         assertEquals(
             listOf(
                 Token("0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359", "Lower", 6, custom = true),
                 Token("0xD1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb", "Ok", 0, custom = true),
+                // A hand-edited name longer than the form allows is cut to its limit (and the
+                // space the cut leaves at the end trimmed), not kept whole.
+                Token("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "x".repeat(23), 2, custom = true),
             ),
             CustomTokens.parse(stored),
         )

@@ -94,6 +94,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.async
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withContext
 import kotlin.time.Clock
 import kotlin.time.Instant
@@ -1439,6 +1440,9 @@ private fun QueryTab(
     var historyList by remember(network) { mutableStateOf<List<QueryHistoryEntry>>(emptyList()) }
     // What custom token contracts answered to decimals(), kept across lookups on this chain.
     val tokenDecimals = remember(network) { mutableMapOf<String, Int>() }
+    // The token reads' in-flight bound, shared by every card this tab shows: a replaced
+    // card's reads run on to their end and must still count against it.
+    val tokenReadPermits = remember { Semaphore(TOKEN_READS_IN_FLIGHT) }
     LaunchedEffect(network) { historyList = withContext(Dispatchers.Default) { history.entries() } }
 
     // --- Transaction-history scan state (TrueBlocks index; desktop-mainnet-only hosts). ---
@@ -1656,6 +1660,7 @@ private fun QueryTab(
                 controller, settings, network, tokenHolder, running,
                 ready = running && snap?.beaconState == "SYNCED",
                 contractDecimals = tokenDecimals,
+                permits = tokenReadPermits,
             )
         }
 

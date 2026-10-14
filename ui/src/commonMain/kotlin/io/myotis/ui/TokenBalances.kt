@@ -47,7 +47,10 @@ import kotlinx.coroutines.sync.withPermit
 
 // Token reads in flight at once. Each is an EVM run over proof-fetched state, i.e. snap
 // round trips to peers; a lookup must not fire every row at the pool at the same time.
-private const val TOKEN_READS_IN_FLIGHT = 4
+// The semaphore holding the bound lives in QueryTab, not in the card: a new lookup
+// replaces the card while the old card's reads still run (the hosts wait their engine runs
+// out), and a fresh semaphore per card would let both sets run at once.
+internal const val TOKEN_READS_IN_FLIGHT = 4
 
 /**
  * The Query tab's token balances for [holder] on [network]: the built-in [PopularTokens]
@@ -57,7 +60,8 @@ private const val TOKEN_READS_IN_FLIGHT = 4
  * is read again by itself once the node is back up and synced ([ready]).
  * [contractDecimals] remembers what each custom token's contract answered to `decimals()`
  * across lookups (the caller scopes it to the network), so that check costs one call per
- * token, not one per read.
+ * token, not one per read. [permits] bounds the reads in flight ([TOKEN_READS_IN_FLIGHT]);
+ * the caller keeps it across lookups, so the bound also counts a replaced card's reads.
  */
 @Composable
 internal fun TokenBalancesCard(
@@ -68,6 +72,7 @@ internal fun TokenBalancesCard(
     running: Boolean,
     ready: Boolean,
     contractDecimals: MutableMap<String, Int>,
+    permits: Semaphore,
 ) {
     val clipboard = LocalClipboardManager.current
     val popular = remember(network) { PopularTokens.forNetwork(network) }
@@ -84,7 +89,6 @@ internal fun TokenBalancesCard(
     var refresh by remember(network, holder) { mutableStateOf(0) }
     val results = remember(network, holder, refresh) { mutableStateMapOf<String, TokenBalance>() }
     val attempts = remember(network, holder, refresh) { mutableStateMapOf<String, Int>() }
-    val permits = remember { Semaphore(TOKEN_READS_IN_FLIGHT) }
     tokens.forEach { t ->
         // One effect per token, keyed on the token itself: adding a token reads only it,
         // removing one cancels its read, and a custom token's edited decimals re-read it.

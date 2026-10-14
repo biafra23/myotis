@@ -96,15 +96,17 @@ object CustomTokens {
     /**
      * Parse the stored array. Tolerant like the other settings stores: a malformed or
      * hand-edited value yields the entries that do parse (worst case none), never an
-     * exception. An entry with a bad address, decimals or name is dropped, and of two
-     * entries for one contract the first is kept.
+     * exception. An entry with a bad address, decimals or an empty name is dropped, a name
+     * longer than the form allows is cut to [MAX_NAME_LENGTH], and of two entries for one
+     * contract the first is kept.
      */
     @JvmStatic
     fun parse(json: String): List<Token> {
         val seen = HashSet<String>()
         return FlatJson.objects(json).mapNotNull { o ->
             val address = (o["address"] as? String)?.let(::normalizeAddress) ?: return@mapNotNull null
-            val name = (o["name"] as? String)?.let(::cleanName)?.takeIf { it.isNotEmpty() }
+            val name = (o["name"] as? String)?.let(::cleanName)?.take(MAX_NAME_LENGTH)?.trimEnd()
+                ?.takeIf { it.isNotEmpty() }
                 ?: return@mapNotNull null
             val decimals = (o["decimals"] as? Long)?.takeIf { it in 0..MAX_DECIMALS.toLong() }?.toInt()
                 ?: return@mapNotNull null
@@ -201,6 +203,9 @@ object Erc20 {
     const val DECIMALS_CALL = "0x$DECIMALS"
     const val SYMBOL_CALL = "0x$SYMBOL"
 
+    /** The most of a contract's text ([decodeText], [revertReason]) the UI shows; longer is cut with "…". */
+    const val MAX_TEXT_LENGTH = 200
+
     /**
      * The first 32-byte word of [data] as an unsigned decimal string, or null when [data]
      * holds less than one word (an address without code answers an `eth_call` with nothing).
@@ -219,22 +224,28 @@ object Erc20 {
 
     /**
      * A `symbol()`/`name()` reply as text: the ABI `string` most tokens return, or the
-     * `bytes32` some early ones do (MKR, for one), zero padding stripped. Control
-     * characters are dropped — this is a contract's claim, rendered as plain text. Null when
-     * the reply is neither shape.
+     * `bytes32` some early ones do (MKR, for one), zero padding stripped. This is a
+     * contract's claim, rendered as plain text: control characters are dropped and it is cut
+     * to [MAX_TEXT_LENGTH]. Null when the reply is neither shape.
      */
     @JvmStatic
     fun decodeText(data: ByteArray): String? {
         val raw = abiString(data, 0)
             ?: if (data.size == 32) data.copyOfRange(0, data.indexOfLast { it != 0.toByte() } + 1) else null
-        return raw?.decodeToString()?.filterNot { it.isISOControl() }?.trim()
+        return raw?.let(::displayText)
     }
 
-    /** Solidity's `Error(string)` revert reason, or null for any other revert payload. */
+    /** Solidity's `Error(string)` revert reason, shown as [decodeText] shows text; null for
+     *  any other revert payload. */
     @JvmStatic
     fun revertReason(data: ByteArray): String? {
         if (data.size < 4 || toHex(data.copyOfRange(0, 4)) != ERROR_STRING) return null
-        return abiString(data, 4)?.decodeToString()?.filterNot { it.isISOControl() }?.trim()
+        return abiString(data, 4)?.let(::displayText)
+    }
+
+    private fun displayText(raw: ByteArray): String {
+        val s = raw.decodeToString().filterNot { it.isISOControl() }.trim()
+        return if (s.length > MAX_TEXT_LENGTH) s.take(MAX_TEXT_LENGTH) + "…" else s
     }
 
     /** The dynamic `string` whose head word sits at [base], or null when [data] is not one. */
