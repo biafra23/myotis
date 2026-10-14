@@ -1524,6 +1524,93 @@ pub fn get_storage_at_json(
     }
 }
 
+/// `eth_getProof` (EIP-1186) for a running handle: the result object as geth
+/// shapes it ([`eljson::proof_json`]), `{"error": ...}` when it cannot be
+/// served now, or `{"error","code":-32602}` when it can never be served as
+/// asked. `keys_json` is the JSON array of storage keys as the request carried
+/// them ([`parse_proof_keys`]; empty = none); `block` is the RPC block
+/// selector, held to the pin rules of `myotis_net::el::getproof`: a head tag,
+/// `finalized`, or the number of a block whose state root this node holds
+/// attested — the verified head, one of the recent heads before it, the
+/// finalized block. Any other near-head number is NOT answered from head state
+/// as the other reads answer it, since the caller checks the proof against
+/// that block's own `stateRoot`.
+pub fn get_proof_json(handle: i64, address_hex: &str, keys_json: &str, block: &str) -> String {
+    use myotis_net::el::getproof::{ProofBlock, ProofError};
+    let Some(address) = parse_address(address_hex) else {
+        return eljson::invalid_params_json("invalid address (expected 20-byte hex)");
+    };
+    let keys = match parse_proof_keys(keys_json) {
+        Ok(keys) => keys,
+        Err(msg) => return eljson::invalid_params_json(&msg),
+    };
+    let block = match parse_read_block(block) {
+        Ok(BlockSelector::Head) => ProofBlock::Head,
+        Ok(BlockSelector::Finalized) => ProofBlock::Finalized,
+        Ok(BlockSelector::Number(n)) => ProofBlock::Number(n),
+        Err(json) => return json,
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, _, _) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    let words: Vec<[u8; 32]> = keys.iter().map(|(word, _)| *word).collect();
+    let echoes: Vec<String> = keys.into_iter().map(|(_, echo)| echo).collect();
+    match engine
+        .rt
+        .block_on(reader.request(async { Ok(reader.get_proof(block, address, &words).await) }))
+    {
+        Ok(Ok(proof)) => eljson::proof_json(&proof, &echoes),
+        Ok(Err(ProofError::Refused(msg))) => eljson::invalid_params_json(&msg),
+        Ok(Err(ProofError::Unavailable(msg))) | Err(msg) => eljson::error_json(&msg),
+    }
+}
+
+/// The storage keys of an `eth_getProof`: a JSON array of hex strings, each
+/// read as geth's `decodeHash` reads it — `0x` optional, an odd digit count
+/// zero-padded, at most 32 bytes, left-padded to the 32-byte word — but never
+/// empty (`"0x"` names no key). Each comes with the form the result echoes it
+/// in ([`eljson::proof_key_echo`]). Empty input is no keys; more than
+/// `MAX_PROOF_STORAGE_KEYS` is refused.
+fn parse_proof_keys(keys_json: &str) -> Result<Vec<([u8; 32], String)>, String> {
+    use myotis_net::el::getproof::MAX_PROOF_STORAGE_KEYS;
+    let trimmed = keys_json.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|_| "storage keys must be a JSON array of hex strings".to_string())?;
+    let Some(items) = parsed.as_array() else {
+        return Err("storage keys must be an array of hex strings".to_string());
+    };
+    if items.len() > MAX_PROOF_STORAGE_KEYS {
+        return Err(format!(
+            "{} storage keys requested; at most {MAX_PROOF_STORAGE_KEYS} are served",
+            items.len()
+        ));
+    }
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let bad = || format!("invalid storage key {i}: expected hex of at most 32 bytes");
+            let text = item.as_str().ok_or_else(bad)?;
+            let digits = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")).unwrap_or(text);
+            if digits.is_empty() || digits.len() > 64 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(bad());
+            }
+            let padded = format!("{digits:0>64}");
+            let word = parse_word32(&padded).ok_or_else(bad)?;
+            // geth echoes a key given as a full 32-byte word as that word, and
+            // any shorter one as a QUANTITY (`internal/ethapi` GetProof).
+            Ok((word, eljson::proof_key_echo(&word, digits.len() > 62)))
+        })
+        .collect()
+}
+
 /// `nativeEthCallJson`: run a verified `eth_call` for a running handle. `from` is
 /// empty for an anonymous call; an EMPTY `to` means CONTRACT CREATION (the
 /// calldata is init code and the constructor's return data is the answer);
@@ -4039,6 +4126,60 @@ mod tests {
                 assert_eq!(v["code"], -32602, "{refused}: {v}");
             }
         }
+    }
+
+    #[test]
+    fn get_proof_refuses_what_it_can_never_serve_before_the_handle_lookup() {
+        let addr = format!("0x{}", "ab".repeat(20));
+        let call = |addr: &str, keys: &str, block: &str| -> serde_json::Value {
+            serde_json::from_str(&get_proof_json(i64::MIN, addr, keys, block)).unwrap()
+        };
+        // Servable shapes reach the engine (and fail only on the handle).
+        for (keys, block) in [("", ""), ("[]", "latest"), (r#"["0x0","0x01"]"#, "finalized"), ("[]", "0x10")] {
+            assert_eq!(call(&addr, keys, block)["error"], "unknown handle", "{keys} {block}");
+        }
+        // Malformed address, keys or selector: permanent.
+        let too_many = format!("[{}]", vec![r#""0x1""#; MAX_PROOF_KEYS + 1].join(","));
+        for (a, keys, block) in [
+            ("0x1234", "[]", "latest"),
+            (addr.as_str(), "{}", "latest"),
+            (addr.as_str(), "[1]", "latest"),
+            (addr.as_str(), r#"["0x"]"#, "latest"),
+            (addr.as_str(), &format!(r#"["0x{}"]"#, "1".repeat(65)), "latest"),
+            (addr.as_str(), too_many.as_str(), "latest"),
+            (addr.as_str(), "[]", "safe"),
+            (addr.as_str(), "[]", &format!("0x{}", "ab".repeat(32))),
+        ] {
+            let v = call(a, keys, block);
+            assert_eq!(v["code"], -32602, "{a} {keys} {block}: {v}");
+        }
+    }
+
+    const MAX_PROOF_KEYS: usize = myotis_net::el::getproof::MAX_PROOF_STORAGE_KEYS;
+
+    #[test]
+    fn proof_keys_read_as_geth_reads_them_and_echo_in_its_forms() {
+        let keys = parse_proof_keys(&format!(
+            r#"["0x1", "0X0a", "ff", "0x{0}", "{0}", "0x{1}"]"#,
+            "AB".repeat(32),
+            "1".repeat(63)
+        ))
+        .unwrap();
+        let word = |b: &[u8]| {
+            let mut w = [0u8; 32];
+            w[32 - b.len()..].copy_from_slice(b);
+            w
+        };
+        assert_eq!(keys[0], (word(&[1]), "0x1".to_string()));
+        assert_eq!(keys[1], (word(&[0x0a]), "0xa".to_string()));
+        assert_eq!(keys[2], (word(&[0xff]), "0xff".to_string()));
+        // A full word, with or without 0x, echoes as the (lowercase) word.
+        assert_eq!(keys[3], ([0xab; 32], format!("0x{}", "ab".repeat(32))));
+        assert_eq!(keys[4], keys[3]);
+        // 63 digits pad to 32 bytes: a full word, as geth's byte length has it.
+        assert_eq!(keys[5].1, format!("0x0{}", "1".repeat(63)));
+        assert_eq!(parse_proof_keys("  ").unwrap(), vec![]);
+        assert_eq!(parse_proof_keys(r#"["0x0"]"#).unwrap(), vec![([0u8; 32], "0x0".to_string())]);
     }
 
     #[test]

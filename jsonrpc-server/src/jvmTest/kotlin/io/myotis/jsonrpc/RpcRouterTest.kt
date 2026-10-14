@@ -1088,6 +1088,92 @@ class RpcRouterTest {
         assertEquals(-32601, errorCode(resp))                    // not served by this permissionless node
     }
 
+    // ---- eth_getProof (EIP-1186, Rust engine) ---------------------------------------
+
+    /** A backend that serves proofs, recording what the router handed it. */
+    private class ProofBackend(private val answer: String?) : VerifiedReads by FakeBackend() {
+        var lastAddress: ByteArray? = null
+        var lastKeys: String? = null
+        var lastBlock: String? = null
+        override fun supportsProofs(): Boolean = true
+        override fun getProof(address: ByteArray, storageKeysJson: String, block: String): String? {
+            lastAddress = address; lastKeys = storageKeysJson; lastBlock = block
+            return answer
+        }
+    }
+
+    private val proofResult = """{"accountProof":["0xc0"],"address":"0x${"11".repeat(20)}","balance":"0x0",""" +
+        """"codeHash":"0x${"33".repeat(32)}","nonce":"0x1","storageHash":"0x${"22".repeat(32)}",""" +
+        """"storageProof":[{"key":"0x3","proof":["0xc1"],"value":"0x2a"}]}"""
+
+    private fun proofRequest(params: String) =
+        """{"jsonrpc":"2.0","id":1,"method":"eth_getProof","params":$params}"""
+
+    /** The engine's object is the result; the keys go on as the array the
+     *  request carried (the engine echoes them in geth's form). */
+    @Test fun getProof_passesTheEnginesObjectThrough() {
+        val b = ProofBackend(proofResult)
+        val resp = route(b, proofRequest("""["0x${"11".repeat(20)}",["0x3","0X${"ab".repeat(32)}"],"latest"]"""))
+        assertEquals(json.parseToJsonElement(proofResult), json.parseToJsonElement(resp).jsonObject["result"])
+        assertEquals("""["0x3","0X${"ab".repeat(32)}"]""", b.lastKeys)
+        assertEquals("latest", b.lastBlock)
+        assertEquals("0x${"11".repeat(20)}", b.lastAddress!!.toHex())
+        // Null keys are none; an absent block is latest.
+        route(b, proofRequest("""["0x${"11".repeat(20)}",null]"""))
+        assertEquals("[]", b.lastKeys)
+        assertEquals("latest", b.lastBlock)
+        // The engine alone judges a number: one far below the head (the
+        // finalized block's, on mainnet) is not refused by the state reads'
+        // 64-block window before the engine is asked.
+        route(b, proofRequest("""["0x${"11".repeat(20)}",[],"0x10"]"""))
+        assertEquals("0x10", b.lastBlock)
+    }
+
+    /** Malformed requests are refused for good, before the engine is asked. */
+    @Test fun getProof_malformedParams_areInvalidParams() {
+        val addr = "\"0x${"11".repeat(20)}\""
+        val tooMany = (0..RpcRouter.MAX_PROOF_STORAGE_KEYS).joinToString(",", "[", "]") { "\"0x1\"" }
+        for (params in listOf(
+            "[$addr]",                                       // no keys argument
+            "[$addr,\"0x3\",\"latest\"]",                    // keys not an array
+            "[$addr,[\"0x\"],\"latest\"]",                   // an empty key
+            "[$addr,[\"0x${"1".repeat(65)}\"],\"latest\"]",  // wider than a word
+            "[$addr,[3],\"latest\"]",                        // not a string
+            "[$addr,$tooMany,\"latest\"]",
+            "[$addr,[],\"safe\"]",
+            "[$addr,[],\"latest\",1]",                       // too many arguments
+        )) {
+            val b = ProofBackend(proofResult)
+            val resp = route(b, proofRequest(params))
+            assertEquals(-32602, errorCode(resp), params)
+            assertNull(b.lastKeys, "the engine must not be asked: $params")
+        }
+    }
+
+    /** The engine's refusal (a number that is neither the head's nor the
+     *  finalized block's) is permanent; a plain envelope stays retryable and
+     *  carries its reason. */
+    @Test fun getProof_engineEnvelopesKeepTheirClass() {
+        val refused = route(ProofBackend("""{"error":"pinned to the verified head","code":-32602}"""),
+            proofRequest("""["0x${"11".repeat(20)}",[],"0xff"]"""))
+        assertEquals(-32602, errorCode(refused))
+        assertTrue(errorMessageOf(refused).contains("pinned to the verified head"), errorMessageOf(refused))
+        val unavailable = route(ProofBackend("""{"error":"no snap peer available"}"""),
+            proofRequest("""["0x${"11".repeat(20)}",[],"latest"]"""))
+        assertEquals(-32000, errorCode(unavailable))
+        assertTrue(errorMessageOf(unavailable).contains("no snap peer available"), errorMessageOf(unavailable))
+    }
+
+    /** An engine that serves no proofs (the Java engine) is refused for good,
+     *  ahead of any field — -32602, never the retryable -32000. */
+    @Test fun getProof_anEngineWithoutProofs_isRefusedPermanentlyBeforeDispatch() {
+        val resp = route(FakeBackend(), proofRequest("""["0x${"11".repeat(20)}",[],"latest"]"""))
+        assertEquals(-32602, errorCode(resp))
+        assertTrue(errorMessageOf(resp).contains("serves no proofs"), errorMessageOf(resp))
+        val malformed = route(FakeBackend(), proofRequest("""["0x12",[],"latest"]"""))
+        assertTrue(errorMessageOf(malformed).contains("serves no proofs"), errorMessageOf(malformed))
+    }
+
     // ---- eth_getLogs (opt-in watch-list index) ---------------------------------------
 
     @Test fun getLogs_backendWithoutIndex_errorsRetryable() {

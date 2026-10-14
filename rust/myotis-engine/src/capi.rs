@@ -315,6 +315,27 @@ pub unsafe extern "C" fn myotis_get_storage_at_json(
     into_c(crate::host::get_storage_at_json(handle, &address, &position, &block))
 }
 
+/// `eth_getProof` (EIP-1186, ABI ≥ 46; the UniFFI `get_proof_json` twin):
+/// `keys` is the JSON array of storage keys as the request carried them
+/// (NULL or empty = none); `block` is held to the proof pin rules (see
+/// `crate::host::get_proof_json` and the header).
+///
+/// # Safety
+/// `address`, `keys` and `block` must each be null or valid null-terminated
+/// C strings.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_get_proof_json(
+    handle: i64,
+    address: *const c_char,
+    keys: *const c_char,
+    block: *const c_char,
+) -> *mut c_char {
+    let address = read_string(address).unwrap_or_default();
+    let keys = read_string(keys).unwrap_or_default();
+    let block = read_string(block).unwrap_or_default();
+    into_c(crate::host::get_proof_json(handle, &address, &keys, &block))
+}
+
 /// Verified `eth_call` over the revm executor (`nativeEthCallJson` twin).
 /// `from` empty ⇒ anonymous sender; `value` is wei as a decimal string.
 /// `block` is checked by the engine (ABI ≥ 27): a number outside the window
@@ -843,6 +864,13 @@ mod tests {
             take(myotis_get_storage_at_json(i64::MIN, addr.as_ptr(), pos.as_ptr(), null))
         });
         assert_eq!(storage["error"], "unknown handle");
+        // eth_getProof (ABI 46): NULL keys are none and a NULL block is the
+        // head; a selector it can never serve is refused.
+        let proof = |block: *const c_char| {
+            parse(unsafe { take(myotis_get_proof_json(i64::MIN, addr.as_ptr(), null, block)) })
+        };
+        assert_eq!(proof(null)["error"], "unknown handle");
+        assert_eq!(proof(c"safe".as_ptr())["code"], -32602);
     }
 
     /// How eth_call's `block` crosses the C ABI (#452): NULL is an absent

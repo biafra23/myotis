@@ -21,8 +21,8 @@
 use alloc::{borrow::ToOwned, format, string::{String, ToString}, vec, vec::Vec};
 use myotis_core::keccak::keccak256;
 use myotis_core::trie::{
-    decode_account_leaf, decode_storage_leaf, verify_proof, AccountLeaf, ProofResult,
-    EMPTY_CODE_HASH, EMPTY_TRIE_ROOT,
+    decode_account_leaf, decode_storage_leaf, verify_proof, verify_proof_path, AccountLeaf,
+    ProofResult, EMPTY_CODE_HASH, EMPTY_TRIE_ROOT,
 };
 use myotis_core::CoreError;
 
@@ -79,8 +79,23 @@ pub fn verify_account(
     address: &[u8; 20],
     response: &AccountRange,
 ) -> Result<AccountOutcome, CoreError> {
-    let key = keccak256(address);
-    match verify_proof(state_root, &key, &response.proof) {
+    account_outcome(verify_proof(state_root, &keccak256(address), &response.proof))
+}
+
+/// [`verify_account`], also returning the account's proof as `eth_getProof`
+/// lists it — the root-first path to `keccak(address)`, without the page's
+/// other boundary path ([`verify_proof_path`]).
+pub fn verify_account_proof(
+    state_root: &[u8; 32],
+    address: &[u8; 20],
+    response: &AccountRange,
+) -> Result<(AccountOutcome, Vec<Vec<u8>>), CoreError> {
+    let (result, path) = verify_proof_path(state_root, &keccak256(address), &response.proof);
+    Ok((account_outcome(result)?, path))
+}
+
+fn account_outcome(result: ProofResult) -> Result<AccountOutcome, CoreError> {
+    match result {
         ProofResult::Found(leaf) => Ok(AccountOutcome::Present(decode_account_leaf(&leaf)?)),
         ProofResult::Absent => Ok(AccountOutcome::Absent),
         ProofResult::Invalid(reason) => {
@@ -101,8 +116,27 @@ pub fn verify_storage(
         return Ok(Vec::new());
     }
     // Storage anchors at the account's PROVEN storageRoot, not the state root.
-    let key = keccak256(slot);
-    match verify_proof(&account.storage_root, &key, &response.proof) {
+    storage_value(verify_proof(&account.storage_root, &keccak256(slot), &response.proof))
+}
+
+/// [`verify_storage`], also returning the slot's proof as `eth_getProof`
+/// lists it: the root-first path to `keccak(slot)` under the account's proven
+/// `storageRoot` — empty for an empty storage trie, whose every slot is zero.
+pub fn verify_storage_proof(
+    account: &AccountLeaf,
+    slot: &[u8; 32],
+    response: &StorageRanges,
+) -> Result<(Vec<u8>, Vec<Vec<u8>>), CoreError> {
+    if account.storage_root == EMPTY_TRIE_ROOT {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let (result, path) =
+        verify_proof_path(&account.storage_root, &keccak256(slot), &response.proof);
+    Ok((storage_value(result)?, path))
+}
+
+fn storage_value(result: ProofResult) -> Result<Vec<u8>, CoreError> {
+    match result {
         ProofResult::Found(value) => decode_storage_leaf(&value),
         ProofResult::Absent => Ok(Vec::new()),
         ProofResult::Invalid(reason) => {
@@ -279,6 +313,41 @@ mod tests {
             proof,
         };
         assert_eq!(verify_storage(&account, &slot, &response).unwrap(), vec![0x2a]);
+    }
+
+    #[test]
+    fn proof_variants_return_the_verified_path_and_the_same_verdicts() {
+        // Account: the single-leaf proof IS the path; the outcome is
+        // verify_account's.
+        let address = [0x11u8; 20];
+        let leaf_value = rlp::encode(&Item::List(vec![
+            Item::Bytes(vec![1]),
+            Item::Bytes(vec![2]),
+            Item::Bytes(keccak256(b"sroot").to_vec()),
+            Item::Bytes(EMPTY_CODE_HASH.to_vec()),
+        ]));
+        let (state_root, proof) = single_leaf(&keccak256(&address), &leaf_value);
+        let response = AccountRange { request_id: 1, accounts: vec![], proof: proof.clone() };
+        let (outcome, path) = verify_account_proof(&state_root, &address, &response).unwrap();
+        assert_eq!(outcome, verify_account(&state_root, &address, &response).unwrap());
+        assert_eq!(path, proof);
+        // A bad proof is the same marked error, never a path.
+        let bad = AccountRange { request_id: 1, accounts: vec![], proof: vec![] };
+        let err = verify_account_proof(&[0x42; 32], &address, &bad).unwrap_err();
+        assert!(is_unknown_root_error(&err.0), "{}", err.0);
+
+        // Storage: the path under the proven storageRoot, and none at all for
+        // an empty storage trie.
+        let slot = [0x07u8; 32];
+        let slot_value = rlp::encode_bytes(&[0x2a]);
+        let (storage_root, proof) = single_leaf(&keccak256(&slot), &slot_value);
+        let account =
+            AccountLeaf { nonce: 0, balance: Vec::new(), storage_root, code_hash: EMPTY_CODE_HASH };
+        let response = StorageRanges { request_id: 1, slots: vec![], proof: proof.clone() };
+        assert_eq!(verify_storage_proof(&account, &slot, &response).unwrap(), (vec![0x2a], proof));
+        let empty = AccountLeaf { storage_root: EMPTY_TRIE_ROOT, ..account };
+        let none = StorageRanges { request_id: 1, slots: vec![], proof: vec![] };
+        assert_eq!(verify_storage_proof(&empty, &slot, &none).unwrap(), (Vec::new(), Vec::new()));
     }
 
     #[test]

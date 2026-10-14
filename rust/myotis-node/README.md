@@ -81,6 +81,7 @@ unknown handle gets the usual
 | `eth_getTransactionCount` at `pending` | the mined nonce above through `pendingNonceOverlay(h, address, minedNonce)` — synchronous; raises it past this node's own unmined broadcast, -1 = serve the mined nonce |
 | `eth_getCode` | `getCodeJson(h, address, block?)` |
 | `eth_getStorageAt` | `getStorageAtJson(h, address, position, block?)` |
+| `eth_getProof` | `getProofJson(h, address, keysJson?, block?)`: the result object as geth shapes it; `block` only the verified head, a recent head, or the finalized block, exactly (see the header) |
 | `eth_call` | `ethCallJson(h, from, to, data, value, block)`, `ethCallTxJson(h, txJson, block, overrides)` |
 | `eth_call` with a state override | `ethCallOverridesJson(h, from, to, data, value, block, overridesJson)`, or `ethCallTxJson` |
 | `eth_estimateGas` | `estimateGasJson(h, from, to, data, value)`, `estimateGasTxJson(h, txJson, block, overrides)` |

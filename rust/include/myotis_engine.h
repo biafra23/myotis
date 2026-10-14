@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 45
+#define MYOTIS_ABI_VERSION 46
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -158,6 +158,21 @@ char *myotis_get_code_json(int64_t handle, const char *address,
                            const char *block);
 char *myotis_get_storage_at_json(int64_t handle, const char *address,
                                  const char *position, const char *block);
+/* eth_getProof (EIP-1186, ABI >= 46): the result object in geth's shape
+ * ({"address","accountProof","balance","codeHash","nonce","storageHash",
+ * "storageProof":[{"key","value","proof"}]}), {"error"} (retryable) or
+ * {"error","code":-32602} (permanent). `keys` is the JSON array of storage
+ * keys as the request carried them (NULL/empty = none; at most 1024, each
+ * hex of at most 32 bytes). Every proof is verified at ONE beacon-attested
+ * root, of exactly the block `block` names: latest/pending/empty (the
+ * verified head), "finalized", or the number of the head, of one of the 128
+ * heads before it as the engine held them, or of the finalized block. Any
+ * other number is refused — -32602 below the head, {"error"} above it —
+ * never answered from head state as the other reads answer a near-head
+ * number: the caller checks the proof against that block's stateRoot.
+ * Refused (-32602) while Tor routing is on. */
+char *myotis_get_proof_json(int64_t handle, const char *address,
+                            const char *keys, const char *block);
 /* eth_call: {"status":"ok","resultHex"} | {"status":"revert","dataHex"} |
  * {"status":"unavailable","reason"} | {"error"} | {"error","code":-32602}.
  * Every status also carries "blockNumber" (the block the call ran against)

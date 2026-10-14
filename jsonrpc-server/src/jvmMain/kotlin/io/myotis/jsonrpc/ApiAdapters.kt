@@ -145,6 +145,11 @@ class VerifiedReadsBackend(private val v: io.myotis.api.VerifiedReads) : RpcBack
         stateOverridesJson: String?,
     ): RpcAccessListResult = v.createAccessList(tx.toApi(), block, stateOverridesJson).toRpc()
 
+    override fun supportsProofs(): Boolean = v.supportsProofs()
+
+    override fun getProof(address: ByteArray, storageKeysJson: String, block: String): String? =
+        v.getProof(address, storageKeysJson, block)
+
     private fun io.myotis.api.AccessListResult.toRpc(): RpcAccessListResult = when (status()!!) {
         io.myotis.api.AccessListResult.Status.OK ->
             RpcAccessListResult.ok(accessListJson() ?: "[]", gasUsed(), vmError(), revertData())

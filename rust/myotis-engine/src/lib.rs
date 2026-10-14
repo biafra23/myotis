@@ -282,8 +282,26 @@ uniffi::setup_scaffolding!();
 ///      its `--ready-wait` hold. An additive function —
 ///      bumped so a host that calls it is never paired with an engine that
 ///      lacks it.
-pub const ABI_VERSION: i32 = 45;
+/// v46: added get_proof_json / myotis_get_proof_json (UniFFI and the C ABI):
+///      eth_getProof (EIP-1186) — the account proof and one proof per
+///      storage key, the root-first paths the verified reads already check,
+///      all at ONE beacon-attested root and in geth's result shape. Its
+///      selector is stricter than the other state reads': a proof is pinned
+///      to exactly the block named, so only a head tag, `finalized`, or the
+///      number of the head, of one of the 128 heads before it as the engine
+///      held them, or of the finalized block is served; any other number is
+///      refused (`{"error","code":-32602}` below the head, `{"error"}` above
+///      it), never answered from head state. Refused under Tor routing.
+///      An additive function — bumped so a host that calls it is never paired
+///      with an engine that lacks it. The JVM `RustEngineNative` wrapper, the
+///      iOS wrapper, myotis-rpcd and the Node addon call it.
+pub const ABI_VERSION: i32 = 46;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
 pub use myotis_consensus::bls_dst;
+
+/// The most storage keys one `eth_getProof` serves — for hosts that check a
+/// request before handing it on (myotis-rpcd), so they refuse what the engine
+/// would.
+pub use myotis_net::el::getproof::MAX_PROOF_STORAGE_KEYS;

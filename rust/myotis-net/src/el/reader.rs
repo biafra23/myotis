@@ -6374,6 +6374,131 @@ impl ElReader {
         Ok((result, snap))
     }
 
+    /// `eth_getProof` (EIP-1186): the account's proof and one proof per storage
+    /// key, every one fetched and verified at ONE root — the attested root of
+    /// exactly the block `block` names, by the pin rules of
+    /// [`crate::el::getproof`] — or refused. Hedged across peers like the
+    /// other state reads; an attempt is the whole proof from one peer, so a
+    /// peer that fails any part of it is a miss and another peer's attempt
+    /// answers. Unlike those reads, there is no fallback to a peer's own head:
+    /// the answer names no block, so a proof at another root would fail the
+    /// caller's check against the block it asked for.
+    ///
+    /// The root needs no further verdict: it is the anchor's own — an
+    /// optimistic head's BLS-attested state root, or the finality update's —
+    /// the very roots the account read verifies as `stateRootMatch`.
+    ///
+    /// A peer that answers with an empty proof (it does not hold the root —
+    /// it trails the head, or pruned an older one) is excused, not struck:
+    /// the root is our ask, and with no fallback to the peer's own head a
+    /// client polling proofs would otherwise bench peers that serve every
+    /// other read. A malformed proof stays a strike.
+    ///
+    /// Refused while Tor routing is on: an account read there leaves over a
+    /// fresh Tor session at that session's own head, never the anchored root,
+    /// and over clearnet it would expose the address Tor mode hides. No retry
+    /// changes that while Tor stays on, so the refusal is permanent.
+    pub async fn get_proof(
+        &self,
+        block: crate::el::getproof::ProofBlock,
+        address: [u8; 20],
+        keys: &[[u8; 32]],
+    ) -> Result<crate::el::getproof::VerifiedProof, crate::el::getproof::ProofError> {
+        use crate::el::getproof::{
+            proof_hedge_delay, resolve_target, ProofError, MAX_PROOF_STORAGE_KEYS,
+        };
+        if tor_routing_on() {
+            return Err(ProofError::Refused(
+                "eth_getProof is not served while Tor routing is on: Tor reads run at a Tor \
+                 session's own head, not the anchored root a proof is pinned to"
+                    .into(),
+            ));
+        }
+        if keys.len() > MAX_PROOF_STORAGE_KEYS {
+            return Err(ProofError::Refused(format!(
+                "eth_getProof asks for {} storage keys; at most {MAX_PROOF_STORAGE_KEYS} are served",
+                keys.len()
+            )));
+        }
+        let head = self.anchor.optimistic_execution().map(|(number, root, _)| (number, root));
+        let target = resolve_target(block, head, self.anchor.finalized_execution(), |n| {
+            self.anchor.optimistic_root_at(n)
+        })?;
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err(ProofError::Unavailable("no snap peer available".to_string()));
+        }
+        let mut distinct = keys.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let distinct = distinct.as_slice();
+        self.hedged_read(
+            &peers,
+            proof_hedge_delay(HEDGE_DELAY, distinct.len()),
+            |peer| async move { self.proof_from(&peer, target, address, keys, distinct).await },
+            // Every answer is verified at the target root by construction.
+            |_| true,
+            |_| true,
+            |e: &str| crate::el::snap::fetch::is_unknown_root_error(e),
+            "a verifiable eth_getProof",
+        )
+        .await
+        .map_err(ProofError::Unavailable)
+    }
+
+    /// One whole `eth_getProof` attempt against a single peer at `target`'s
+    /// root: the account proof, then the proof of every `distinct` storage
+    /// key under the account's proven `storageRoot` (none fetched for an
+    /// empty one), at most [`crate::el::getproof::PROOF_SLOTS_IN_FLIGHT`] at a
+    /// time, answered in the order of `keys`. Any failure fails the attempt —
+    /// never a partial answer.
+    async fn proof_from(
+        &self,
+        peer: &ManagedPeer,
+        target: crate::el::getproof::ProofTarget,
+        address: [u8; 20],
+        keys: &[[u8; 32]],
+        distinct: &[[u8; 32]],
+    ) -> Result<crate::el::getproof::VerifiedProof, String> {
+        use crate::el::getproof::{empty_account, StorageProof, VerifiedProof, PROOF_SLOTS_IN_FLIGHT};
+        use futures::stream::{self, StreamExt, TryStreamExt};
+        let root = target.state_root;
+        let (outcome, account_proof) = peer.snap_get_account_proof(&root, &address).await?;
+        let account = match outcome {
+            AccountOutcome::Present(leaf) => leaf,
+            AccountOutcome::Absent => empty_account(),
+        };
+        let account_ref = &account;
+        // key → (value, proof)
+        type Proven = std::collections::BTreeMap<[u8; 32], (Vec<u8>, Vec<Vec<u8>>)>;
+        let proven: Proven =
+            stream::iter(distinct.iter().map(|&key| async move {
+                peer.snap_get_storage_proof(&root, &address, account_ref, &key)
+                    .await
+                    .map(|proof| (key, proof))
+            }))
+            .buffer_unordered(PROOF_SLOTS_IN_FLIGHT)
+            .try_collect()
+            .await?;
+        // Every distinct key was proven above, so each lookup holds; a miss
+        // would fail the attempt rather than abort the process.
+        let storage = keys
+            .iter()
+            .map(|key| {
+                let (value, proof) = proven.get(key).cloned().ok_or("storage key left unproven")?;
+                Ok(StorageProof { key: *key, value, proof })
+            })
+            .collect::<Result<_, String>>()?;
+        Ok(VerifiedProof {
+            address,
+            block_number: target.block_number,
+            state_root: root,
+            account,
+            account_proof,
+            storage,
+        })
+    }
+
     /// Fetch + verify a contract's bytecode (`eth_getCode`). The account query is
     /// the trust anchor: it yields a beacon-anchored, proof-verified `code_hash`
     /// and verdict. The bytecode itself is then content-addressed — any snap peer's

@@ -873,6 +873,53 @@ pub fn send_rejected_json(reason: &str) -> String {
     serde_json::Value::Object(obj).to_string()
 }
 
+/// A verified `eth_getProof` as its JSON-RPC result (EIP-1186), in geth's
+/// field names and encodings: `accountProof` and each `proof` are the
+/// root-first node lists, `balance` / `nonce` / each `value` QUANTITYs,
+/// `codeHash` / `storageHash` 32-byte words. An absent account carries the
+/// empty account's hashes (the empty code's, the empty trie's), the values its
+/// exclusion proof proves — reth's answer and the form alloy's `is_empty`
+/// recognises; geth answers zero hashes there. `keys[i]` is the echo of the
+/// i-th requested key ([`proof_key_echo`]), one per `p.storage` entry.
+pub fn proof_json(p: &myotis_net::el::getproof::VerifiedProof, keys: &[String]) -> String {
+    let nodes = |list: &[Vec<u8>]| {
+        serde_json::Value::Array(list.iter().map(|n| hex0x_var(n).into()).collect())
+    };
+    let storage: Vec<serde_json::Value> = p
+        .storage
+        .iter()
+        .zip(keys)
+        .map(|(slot, key)| {
+            serde_json::json!({
+                "key": key,
+                "value": hex_quantity_scalar(&slot.value),
+                "proof": nodes(&slot.proof),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "address": hex0x_var(&p.address),
+        "accountProof": nodes(&p.account_proof),
+        "balance": hex_quantity_scalar(&p.account.balance),
+        "codeHash": hex0x(&p.account.code_hash),
+        "nonce": hex_quantity(p.account.nonce),
+        "storageHash": hex0x(&p.account.storage_root),
+        "storageProof": storage,
+    })
+    .to_string()
+}
+
+/// How an `eth_getProof` result names a requested storage key — geth's rule:
+/// a key given as a full 32-byte word comes back as that word, any shorter
+/// one as a QUANTITY (`0x0` for zero).
+pub fn proof_key_echo(word: &[u8; 32], full_word: bool) -> String {
+    if full_word {
+        hex0x(word)
+    } else {
+        hex_quantity_scalar(word)
+    }
+}
+
 /// A u64 as a minimal-hex QUANTITY (`0x0` for zero).
 fn hex_quantity(v: u64) -> String {
     format!("0x{v:x}")
@@ -1954,6 +2001,79 @@ pub fn get_logs_json(logs: &[myotis_net::el::logindex::StoredLog]) -> String {
     }
     s.push(']');
     s
+}
+
+#[cfg(test)]
+mod proof_json_tests {
+    use myotis_core::trie::AccountLeaf;
+    use myotis_net::el::getproof::{empty_account, StorageProof, VerifiedProof};
+
+    #[test]
+    fn proof_json_shape_is_pinned() {
+        let proof = VerifiedProof {
+            address: [0xab; 20],
+            block_number: 7,
+            state_root: [0x11; 32],
+            account: AccountLeaf {
+                nonce: 3,
+                balance: vec![0x01, 0x00],
+                storage_root: [0x22; 32],
+                code_hash: [0x33; 32],
+            },
+            account_proof: vec![vec![0xc0, 0x01], vec![0xc1]],
+            storage: vec![
+                StorageProof { key: [0u8; 32], value: vec![0x2a], proof: vec![vec![0xc2]] },
+                StorageProof { key: [0x44; 32], value: Vec::new(), proof: Vec::new() },
+            ],
+        };
+        let keys = ["0x0".to_string(), format!("0x{}", "44".repeat(32))];
+        let expected = format!(
+            concat!(
+                r#"{{"accountProof":["0xc001","0xc1"],"address":"0x{addr}","balance":"0x100","#,
+                r#""codeHash":"0x{code}","nonce":"0x3","storageHash":"0x{root}","storageProof":["#,
+                r#"{{"key":"0x0","proof":["0xc2"],"value":"0x2a"}},"#,
+                r#"{{"key":"0x{key}","proof":[],"value":"0x0"}}]}}"#
+            ),
+            addr = "ab".repeat(20),
+            code = "33".repeat(32),
+            root = "22".repeat(32),
+            key = "44".repeat(32),
+        );
+        assert_eq!(super::proof_json(&proof, &keys), expected);
+    }
+
+    #[test]
+    fn an_absent_account_carries_the_empty_accounts_hashes() {
+        let proof = VerifiedProof {
+            address: [0x01; 20],
+            block_number: 1,
+            state_root: [0x11; 32],
+            account: empty_account(),
+            account_proof: vec![vec![0xc0]],
+            storage: Vec::new(),
+        };
+        let v: serde_json::Value = serde_json::from_str(&super::proof_json(&proof, &[])).unwrap();
+        assert_eq!(v["balance"], "0x0");
+        assert_eq!(v["nonce"], "0x0");
+        assert_eq!(
+            v["codeHash"],
+            "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+        );
+        assert_eq!(
+            v["storageHash"],
+            "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+        );
+        assert_eq!(v["storageProof"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn keys_echo_as_geth_echoes_them() {
+        let mut word = [0u8; 32];
+        word[31] = 0x0a;
+        assert_eq!(super::proof_key_echo(&word, false), "0xa");
+        assert_eq!(super::proof_key_echo(&word, true), format!("0x{}0a", "00".repeat(31)));
+        assert_eq!(super::proof_key_echo(&[0u8; 32], false), "0x0");
+    }
 }
 
 #[cfg(test)]
