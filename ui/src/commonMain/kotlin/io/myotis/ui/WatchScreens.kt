@@ -75,6 +75,9 @@ internal fun WatchTab(
     var rev by remember(network) { mutableStateOf(0) }
     val entries = remember(network, rev) { BalanceWatch.parseList(settings.watchListJson(network)) }
     val state = remember(network, rev, snapshot) { BalanceWatch.parseState(settings.watchStateJson(network)) }
+    // The tokens the host's checks read: the network's built-in list and the user's own
+    // (Settings → Tokens), re-read with the state so an edit there shows here.
+    val tokens = remember(network, rev, snapshot) { listedTokens(network, settings.customTokensJson(network)) }
     // The ages below re-read the clock with every snapshot, like the state itself.
     val now = remember(snapshot, rev) { wallClockMillis() }
     var checking by remember(network) { mutableStateOf(false) }
@@ -87,8 +90,9 @@ internal fun WatchTab(
     ) {
         Text(
             "Watch addresses on ${settings.displayName(network)}: Myotis reads their balance " +
-                "from the network, checks the proof, and tells you when it changes — with the " +
-                "transaction behind it when a scan of the blocks in between finds one.",
+                "— the native currency and every token Settings → Tokens lists — from the " +
+                "network, checks the proof, and tells you when one changes, with the transaction " +
+                "behind it when a scan of the blocks in between finds one.",
         )
         Text(
             controller.watchSchedule ?: "This app checks only when you tap Check now.",
@@ -206,6 +210,7 @@ internal fun WatchTab(
                 WatchedAddressCard(
                     entry = e,
                     state = state.addresses[BalanceWatch.key(e.address)],
+                    tokens = tokens.map { it to state.addresses[BalanceWatch.key(e.address, BalanceWatch.tokenAsset(it))] },
                     unit = unit,
                     nowMs = now,
                     onCopy = { clipboard.setText(AnnotatedString(e.address)) },
@@ -235,11 +240,13 @@ internal fun WatchTab(
     }
 }
 
-/** One watched address: its name, the full address, and the last verified balance. */
+/** One watched address: its name, the full address, its last verified native balance, and
+ *  the tokens it holds — the zero balances counted, not listed. */
 @Composable
 private fun WatchedAddressCard(
     entry: WatchEntry,
     state: WatchAddressState?,
+    tokens: List<Pair<Token, WatchAddressState?>>,
     unit: String,
     nowMs: Long,
     onCopy: () -> Unit,
@@ -265,7 +272,7 @@ private fun WatchedAddressCard(
             }
             val seen = state?.seen
             if (seen != null) {
-                Text(BalanceWatch.formatUnits(seen.balanceWei) + unit, style = MaterialTheme.typography.headlineSmall)
+                Text(BalanceWatch.formatUnits(seen.balance) + unit, style = MaterialTheme.typography.headlineSmall)
                 val age = if (seen.blockTimestamp > 0) " · ${formatBlockAge(nowMs / 1000 - seen.blockTimestamp)}" else ""
                 Text(
                     "✓ Verified at block ${BalanceWatch.grouped(seen.blockNumber)}$age",
@@ -287,7 +294,52 @@ private fun WatchedAddressCard(
                     color = MaterialTheme.colorScheme.error,
                 )
             }
+            if (tokens.isNotEmpty()) TokenLines(tokens)
         }
+    }
+}
+
+/** An address's token balances: the non-zero ones by name, then one line each for the zero
+ *  ones, the unread ones and the unreadable ones (with the first reason). */
+@Composable
+private fun TokenLines(tokens: List<Pair<Token, WatchAddressState?>>) {
+    val held = tokens.filter { (_, s) -> s?.seen?.balance?.let { it != "0" } == true }
+    val zero = tokens.count { (_, s) -> s?.seen?.balance == "0" }
+    val unread = tokens.count { (_, s) -> s?.seen == null && s?.error == null }
+    val failed = tokens.filter { (_, s) -> s?.error != null }
+    held.forEach { (t, s) ->
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                formatTokenAmount(s!!.seen!!.balance, t.decimals),
+                Modifier.weight(1f),
+                style = MaterialTheme.typography.bodyLarge,
+            )
+            Text(
+                if (t.custom) "${t.symbol} · custom" else t.symbol,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+    val notes = buildList {
+        if (zero > 0) add("$zero other token${if (zero == 1) "" else "s"} at zero")
+        if (unread > 0) add("$unread token${if (unread == 1) "" else "s"} not checked yet")
+    }
+    if (notes.isNotEmpty()) {
+        Text(
+            notes.joinToString(" · "),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    if (failed.isNotEmpty()) {
+        val (t, s) = failed.first()
+        Text(
+            "${failed.size} token${if (failed.size == 1) "" else "s"} without a verified answer last time" +
+                " (${t.symbol}: ${s!!.error})" + if (failed.any { it.second?.seen != null }) " — showing the last verified balances." else "",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error,
+        )
     }
 }
 
@@ -299,8 +351,9 @@ private fun WatchChangeCard(change: WatchChange, currency: String?, tz: TimeZone
             Text(BalanceWatch.notificationTitle(change, currency), style = MaterialTheme.typography.titleSmall)
             Text(
                 "${formatDateTime(change.detectedAtMs, tz)} · block ${BalanceWatch.grouped(change.toBlock)} · " +
-                    "${BalanceWatch.formatUnits(change.oldWei)} → ${BalanceWatch.formatUnits(change.newWei)}" +
-                    (currency?.let { " $it" } ?: ""),
+                    "${BalanceWatch.formatUnits(change.oldBalance, change.decimals)} → " +
+                    BalanceWatch.formatUnits(change.newBalance, change.decimals) +
+                    BalanceWatch.unitOf(change, currency).let { if (it.isEmpty()) "" else " $it" },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

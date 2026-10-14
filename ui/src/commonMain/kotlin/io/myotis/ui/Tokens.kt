@@ -168,6 +168,17 @@ object CustomTokens {
         s.filterNot { it.isISOControl() }.trim().replace(Regex("\\s+"), " ")
 }
 
+/**
+ * The tokens [network] lists: the built-in [PopularTokens], then the user's own from
+ * [customTokensJson] ([Settings.customTokensJson]). A custom entry for a contract a later
+ * release pinned as built-in shows once, as built-in. The Query tab's balances and the
+ * balance watch both read this list.
+ */
+fun listedTokens(network: String, customTokensJson: String): List<Token> {
+    val popular = PopularTokens.forNetwork(network)
+    return popular + CustomTokens.parse(customTokensJson).filterNot { c -> popular.any { it.key == c.key } }
+}
+
 /** `0x` + 40 hex digits, in any case. */
 internal fun isHexAddress(s: String): Boolean =
     s.length == 42 && (s.startsWith("0x") || s.startsWith("0X")) &&
@@ -340,7 +351,26 @@ suspend fun readTokenBalance(
     token: Token,
     knownChainDecimals: Int? = null,
 ): TokenBalance {
-    val balance = when (val r = ethCallOrError(controller, network, token.address, Erc20.balanceOfCall(holder))) {
+    val call: EthCall = { to, data -> controller.ethCall(network, to, data) }
+    val balance = readTokenRaw(call, holder, token)
+    if (!token.custom || balance.raw == null) return balance
+    if (knownChainDecimals != null) return balance.copy(chainDecimals = knownChainDecimals)
+    val chainDecimals = (ethCallOrError(call, token.address, Erc20.DECIMALS_CALL) as? CallRead.Data)
+        ?.let { Erc20.decodeDecimals(it.bytes) }
+    return balance.copy(chainDecimals = chainDecimals)
+}
+
+/** A verified `eth_call` of `data` to the contract `to` — [NodeController.ethCall] bound to
+ *  one network, or a host's own read of it ([WatchReader.call]). */
+typealias EthCall = suspend (to: String, data: String) -> EthCallResult
+
+/**
+ * [readTokenBalance]'s `balanceOf` read alone, over any [call] — the balance watch reads
+ * through its host's [WatchReader] rather than a controller. Same contract: never throws but
+ * for cancellation, and an empty reply is an error, never a zero balance.
+ */
+suspend fun readTokenRaw(call: EthCall, holder: String, token: Token): TokenBalance =
+    when (val r = ethCallOrError(call, token.address, Erc20.balanceOfCall(holder))) {
         is CallRead.Data -> Erc20.decodeUint256(r.bytes)?.let { TokenBalance(token, it) }
             ?: TokenBalance(
                 token, null,
@@ -349,12 +379,6 @@ suspend fun readTokenBalance(
             )
         is CallRead.Failed -> TokenBalance(token, null, r.reason)
     }
-    if (!token.custom || balance.raw == null) return balance
-    if (knownChainDecimals != null) return balance.copy(chainDecimals = knownChainDecimals)
-    val chainDecimals = (ethCallOrError(controller, network, token.address, Erc20.DECIMALS_CALL) as? CallRead.Data)
-        ?.let { Erc20.decodeDecimals(it.bytes) }
-    return balance.copy(chainDecimals = chainDecimals)
-}
 
 /**
  * What a token contract says about itself — `symbol()` and `decimals()` — to fill the
@@ -365,8 +389,9 @@ data class TokenMetadata(val symbol: String?, val decimals: Int?, val error: Str
 
 /** Read [token]'s `symbol()` and `decimals()` with verified `eth_call`s. */
 suspend fun readTokenMetadata(controller: NodeController, network: String, token: String): TokenMetadata {
-    val sym = ethCallOrError(controller, network, token, Erc20.SYMBOL_CALL)
-    val dec = ethCallOrError(controller, network, token, Erc20.DECIMALS_CALL)
+    val call: EthCall = { to, data -> controller.ethCall(network, to, data) }
+    val sym = ethCallOrError(call, token, Erc20.SYMBOL_CALL)
+    val dec = ethCallOrError(call, token, Erc20.DECIMALS_CALL)
     val symbol = (sym as? CallRead.Data)?.let { Erc20.decodeText(it.bytes) }?.takeIf { it.isNotEmpty() }
     val decimals = (dec as? CallRead.Data)?.let { Erc20.decodeDecimals(it.bytes) }
     val error = when {
@@ -383,9 +408,9 @@ private sealed class CallRead {
     class Failed(val reason: String) : CallRead()
 }
 
-private suspend fun ethCallOrError(controller: NodeController, network: String, to: String, data: String): CallRead {
+private suspend fun ethCallOrError(call: EthCall, to: String, data: String): CallRead {
     val r = try {
-        controller.ethCall(network, to, data)
+        call(to, data)
     } catch (c: kotlin.coroutines.cancellation.CancellationException) {
         throw c
     } catch (t: Throwable) {

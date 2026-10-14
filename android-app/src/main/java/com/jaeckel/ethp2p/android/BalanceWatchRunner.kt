@@ -12,8 +12,10 @@ import io.myotis.api.ChainHandle
 import io.myotis.ui.AccountResult
 import io.myotis.ui.BalanceWatch
 import io.myotis.ui.BalanceWatcher
+import io.myotis.ui.EthCallResult
 import io.myotis.ui.WatchChange
 import io.myotis.ui.WatchReader
+import io.myotis.ui.ethCallArgs
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
@@ -141,6 +143,18 @@ object BalanceWatchRunner {
 
         override suspend fun block(number: Long): String? =
             runInterruptible(Dispatchers.IO) { h.reads()?.getBlockByNumber("0x" + number.toString(16), true) }
+
+        // The token balances: the engine API's verified eth_call at the head from the
+        // anonymous sender — the Query tab's read (NodeService.ethCall), minus its UI clock.
+        override suspend fun call(to: String, data: String): EthCallResult {
+            val reads = h.reads() ?: throw IllegalStateException("Verified reads are not available (JSON-RPC backend not started)")
+            val (toBytes, dataBytes) = ethCallArgs(to, data)
+            val r = runInterruptible(Dispatchers.IO) { reads.callDetailed(null, toBytes, dataBytes, null, "latest", null) }
+            return EthCallResult.of(r.status().name, r.data(), r.detail())
+        }
+
+        override suspend fun receipts(number: Long): String? =
+            runInterruptible(Dispatchers.IO) { h.reads()?.getBlockReceipts("0x" + number.toString(16)) }
     }
 
     private fun notify(c: Context, network: String, changes: List<WatchChange>) {

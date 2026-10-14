@@ -1,19 +1,17 @@
 # Balance watch (the Watch tab)
 
 The user lists addresses per network on the **Watch** tab. The app checks their
-balances in the chain's native currency (ETH, xDAI) now and then. When a balance has
-changed, the app posts a notification and adds the change to the tab's list. A short
-scan of the blocks in between names the transaction behind the change when it finds one.
-
-ERC-20 balances are not watched yet. The token list comes from the Query tab's token
-work (#639), and the watch's store is already keyed by (address, asset) for it — see
-[Tokens: what is left](#tokens-what-is-left).
+balances now and then: the chain's native currency (ETH, xDAI), and every ERC-20 token
+the network lists in **Settings → Tokens** (the built-in tokens and the user's own, #639).
+When a balance has changed, the app posts a notification and adds the change to the tab's
+list. A short scan of the blocks in between names the transaction, or the token `Transfer`,
+behind the change when it finds one.
 
 ## Where it runs
 
 | host | Watch tab | checks on its own | notification |
 |---|---|---|---|
-| Android | yes | foreground; around sleep and wake on the charger (below) | yes, one per address (a later change replaces it); a tap opens the Watch tab |
+| Android | yes | foreground; around sleep and wake on the charger (below) | yes, one per address and asset (a later change replaces it); a tap opens the Watch tab |
 | desktop | yes | every 5 min while the app runs and the network is synced | yes, one per check: Notification Center on a packaged macOS app, the tray elsewhere; none on a desktop with neither (the tab then says so) |
 | iOS | no | — | — |
 
@@ -49,10 +47,11 @@ Every check is bounded:
 - 3 minutes for a scheduled or before-sleep check;
 - for an after-wake check, at most a minute of what is left of the stack's catch-up slice, ending 2 minutes before the pass's deadline (one read's own bound), so a read in flight cannot carry the pass past it.
 
-Past the bound, addresses not read yet keep their stored state, and a cause search stops
-where it is. Each check reads the least recently attempted addresses first. What one check
-left out leads the next, and an address whose read keeps failing goes to the back after
-each attempt.
+Past the bound, balances not read yet keep their stored state, and a cause search stops
+where it is. Each check reads the least recently attempted addresses first (by their least
+recently attempted balance), and an address's tokens in the same order. What one check left
+out leads the next, and a balance whose read keeps failing goes to the back after each
+attempt.
 
 Check now runs in the host's own scope, off the main thread, with the same 3-minute bound.
 Leaving the tab mid-check ends the tab's wait, not the check, so the check's results are
@@ -76,7 +75,12 @@ A verified read that is anchored at an **older** block than the stored one is ig
 The engine's finalized fallback can serve state a few epochs behind the head, and
 comparing against it would announce a change and then its reversal.
 
-The first verified read of an address is its baseline. A later one that differs is a change.
+The first verified read of a balance is its baseline. A later one that differs is a change.
+
+A token balance is a verified `eth_call` to the token's `balanceOf`, run by the engine's
+local EVM against the verified head's state — the Query tab's read (#639). An empty reply
+is an error, never a zero balance: an address without contract code answers any call with
+nothing.
 
 A change at the optimistic head can, in principle, be reorged away. The watch does not
 wait for finality.
@@ -125,28 +129,62 @@ Gnosis, so the scan usually covers it. An hourly background gap (~300 / ~720 blo
 usually does not. Then the notification reports the balance change and the block range,
 as asked.
 
+## Tokens
+
+Each check reads, for every watched address, its balance of every token the network lists
+(`listedTokens`: `PopularTokens` and the user's `CustomTokens`). A custom entry for a
+contract that a later release pinned as built-in reads once, as built-in. That is one
+`eth_call` per token per address per check, four in flight per address, under the check's
+time bound.
+
+**The anchor.** The engine API's `CallResult` does not say which block an `eth_call` ran
+against. The Rust engine's call JSON has the number, but the API drops it. Both engines
+also run a pinned block number against head state, so pinning the call cannot fix that.
+
+So a token observation is anchored to the block of the same address's verified account read
+in the same check, seconds earlier. On the Rust engine both reads run against the verified
+head. Tokens are read only after that account read verified, and never on an anchor older
+than the stored one, so the native rule against stepping back holds for them as well.
+
+The residual case is the Java engine: its `eth_call` can fall back to finalized state while
+its account read did not. In that case a transfer in the last few minutes can show as a
+change and then its reversal. Closing it takes the anchor block on `CallResult` (follow-up).
+
+**The cause.** A token change is searched in the token's `Transfer` logs. The search reads
+each block's receipts (`eth_getBlockReceipts`, verified against `receiptsRoot`), newest
+first, in a quarter of the native window: 16 blocks on an unmetered network, 4 on a metered
+one. Receipts weigh more than block bodies.
+
+A log counts when it comes from this token's contract and has `Transfer`'s topic and exactly
+three topics. An ERC-721 `Transfer` indexes the id as a fourth and moves no balance. Such a
+log names a transfer **from** the address (sent), **to** it (received) or both, with the
+amount and the transaction hash.
+
+When a complete search finds no `Transfer`, the contract changed the balance itself. A
+rebasing token does that daily (stETH), and so does one that takes a fee or adjusts balances
+directly. The texts say so.
+
 ## Storage
 
-- **List:** `Settings.watchListJson(network)`, `[{"address":"0x…","label":"…"}]`. Addresses are stored lowercase. A mixed-case address is not checksum-checked yet, because commonMain has no Keccak-256 until #639 lands one. Labels are cleaned of control characters and cut to 32 characters. At most 20 addresses per network, because each check reads every one's proof.
-- **State:** `Settings.watchStateJson(network)`. It holds the last verified balance, nonce, block and time per address, the last error, the last check and attempt times, and up to 50 changes, newest first. It is written only by the host's one `BalanceWatcher`. The watcher's per-network guard keeps two triggers, such as Check now and a scheduled check, from checking a network at once. The second trigger returns nothing rather than read every proof twice.
+- **List:** `Settings.watchListJson(network)`, `[{"address":"0x…","label":"…"}]`. Addresses are stored lowercase; a mixed-case one must pass its EIP-55 checksum first (#639's Keccak-256), which catches most typos. Labels are cleaned of control characters and cut to 32 characters. At most 20 addresses per network, because each check reads every one's proof and its token balances.
+- **State:** `Settings.watchStateJson(network)`. It holds the last verified balance, block and time per (address, asset) — the native balance under the address, a token's under `address/erc20:<contract>` — with the nonce for the native one, the last error, the last check and attempt times, and up to 50 changes, newest first. A change names its asset, symbol and decimals. It is written only by the host's one `BalanceWatcher`. The watcher's per-network guard keeps two triggers, such as Check now and a scheduled check, from checking a network at once. The second trigger returns nothing rather than read every proof twice.
   - Android keeps both in the app's preferences, under `watch.list.<net>` and `watch.state.<net>`.
   - The desktop keeps the list in `settings.properties` (`watch.list.<net>`, normalized on load). The state goes in `watch-state-<net>.json` beside it, because it is rewritten on every check.
-- Removing an address drops its stored state: at once (`BalanceWatcher.prune`, through `onWatchListChanged`), or at the end of a check already running. Without this, removing the last address would leave its old balance as the baseline of a later re-add. Its past changes stay in the list.
+- Removing an address, or a token in Settings → Tokens, drops its stored state: at once (`BalanceWatcher.prune`, through `onWatchListChanged`), or at the end of a check already running. Without this, removing the last address would leave its old balance as the baseline of a later re-add. Its past changes stay in the list.
 
 ## Code
 
-- `ui/…/BalanceWatch.kt`: the models, the store formats, the comparison, the cause search, the decimal arithmetic (commonMain has no BigInteger), the texts, and `BalanceWatcher`.
+- `ui/…/BalanceWatch.kt`: the models, the store formats, the comparison, the cause searches (block bodies for the native currency, receipts for tokens), the decimal arithmetic (commonMain has no BigInteger), the texts, and `BalanceWatcher`.
+- `ui/…/Tokens.kt` (#639): the token list (`listedTokens`), the `balanceOf` read (`readTokenRaw`, shared with the Query tab), EIP-55.
 - `ui/…/WatchScreens.kt`: the Watch tab.
 - Seams: `Settings.supportsBalanceWatch`/`watchListJson`/`watchStateJson`, and `NodeController.checkWatched`/`watchSchedule`/`onWatchListChanged`/`watchNotificationsNote`. `NodeScreen(watchRequests = …)` brings the tab forward.
-- Android: `WatchPolicy` (when), `BalanceWatchRunner` (the watcher, the reader over `ChainHandle`, the notifications), and the hooks in `NodeService` (the idle tick, the pause thread, the catch-up pass).
+- Android: `WatchPolicy` (when), `BalanceWatchRunner` (the watcher, the reader over `ChainHandle` — account, blocks, `eth_call`, receipts — and the notifications), and the hooks in `NodeService` (the idle tick, the pause thread, the catch-up pass).
 - Desktop: `DesktopNodeController.scheduledWatchChecks`/`checkWatched`, `watchBalances` in `DesktopAlerts.kt`, and the persistence in `DesktopSettings`.
 - Tests: `BalanceWatchTest`, `WatchTabTest`, `WatchPolicyTest`, `DesktopSettingsPersistenceTest`.
 
-## Tokens: what is left
+## Limits and follow-ups
 
-Once #639's token list is on `main`:
-
-1. Add an asset per listed token, plus the user's custom tokens, to each check. `WatchChange.asset` and `BalanceWatch.key(address, asset)` already carry it.
-2. Read each balance through `NodeController.ethCall` (`balanceOf`). Keep the same verified-only rule, and #639's "an empty reply is not a zero balance".
-3. Find the cause from the token's `Transfer` logs in the scanned blocks: from the receipts (`getBlockReceipts`), or from the log index where the token is indexed.
-4. Use #639's EIP-55 helper to check mixed-case input on the Watch tab and to show addresses checksummed.
+- **The `eth_call` anchor block.** `CallResult` carries no block number (above). Adding it to the engine API — the Rust engine already reports it in its call JSON — would anchor each token observation to its own block and close the Java engine's finalized-fallback case.
+- **A ranged block read.** Each block read of a cause search fetches its own header window up to the anchor, ~11% on top of the bodies, and only after a detected change.
+- **iOS.** No Watch tab yet (above).
+- **Cost.** Every check reads every listed token of every address: 14 built-in tokens on mainnet, so 15 reads per address. The time bound and the least-recently-attempted order keep a long list from starving anything. A watched address that holds none of the tokens still pays for reading them, because an incoming transfer to a zero balance is exactly what the watch is for.

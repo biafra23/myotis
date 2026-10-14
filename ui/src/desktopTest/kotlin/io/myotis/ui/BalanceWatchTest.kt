@@ -52,6 +52,10 @@ class BalanceWatchTest {
         val full = (1..BalanceWatch.MAX_ADDRESSES).map { WatchEntry("0x" + it.toString().padStart(40, '0'), "") }
         assertTrue(BalanceWatch.addError(full, bob)!!.contains("At most"))
         assertEquals(alice, BalanceWatch.normalizeAddress(" ${alice.uppercase().replace("0X", "0x")} "))
+        // A mixed-case address carries an EIP-55 checksum, and a typo breaks it.
+        val usdc = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+        assertNull(BalanceWatch.addError(listed, usdc))
+        assertTrue(BalanceWatch.addError(listed, usdc.replace("A0b8", "a0B8"))!!.contains("checksum"))
     }
 
     // ---- the state ----
@@ -98,7 +102,7 @@ class BalanceWatchTest {
         val r = FakeReader().apply { balances[alice] = account(alice, "5", block = 100) }
         val out = BalanceWatch.check(listOf(WatchEntry(alice, "")), WatchState(), r, nowMs = 1)
         assertEquals(emptyList<Any>(), out.changes)
-        assertEquals("5", out.state.addresses[alice]?.seen?.balanceWei)
+        assertEquals("5", out.state.addresses[alice]?.seen?.balance)
         assertEquals(1L, out.state.lastCheckMs)
     }
 
@@ -120,7 +124,7 @@ class BalanceWatchTest {
         val out = BalanceWatch.check(listOf(WatchEntry(alice, "")), prev, r, nowMs = 2)
         assertEquals(emptyList<Any>(), out.changes)
         val a = out.state.addresses[alice]!!
-        assertEquals("5", a.seen?.balanceWei)
+        assertEquals("5", a.seen?.balance)
         assertEquals("headerChainGapTooLarge", a.error)
         // No verified read: the last-check clock stays, the attempt clock moves.
         assertEquals(0L, out.state.lastCheckMs)
@@ -132,7 +136,7 @@ class BalanceWatchTest {
         val prev = stateWith(alice, "5", block = 100)
         val out = BalanceWatch.check(listOf(WatchEntry(alice, "")), prev, FakeReader(), nowMs = 2)
         assertEquals("Node is not running", out.state.addresses[alice]?.error)
-        assertEquals("5", out.state.addresses[alice]?.seen?.balanceWei)
+        assertEquals("5", out.state.addresses[alice]?.seen?.balance)
     }
 
     @Test
@@ -142,7 +146,7 @@ class BalanceWatchTest {
         val out = BalanceWatch.check(listOf(WatchEntry(alice, "")), prev, r, nowMs = 2)
         assertEquals(emptyList<Any>(), out.changes)
         assertEquals(100L, out.state.addresses[alice]?.seen?.blockNumber)
-        assertEquals("5", out.state.addresses[alice]?.seen?.balanceWei)
+        assertEquals("5", out.state.addresses[alice]?.seen?.balance)
     }
 
     @Test
@@ -181,7 +185,7 @@ class BalanceWatchTest {
         val summary = BalanceWatch.causeSummary(c, "ETH")
         assertTrue(summary, "blocks 193–200" in summary && "100 blocks since the last check" in summary)
         assertTrue(summary, "sent 2 transactions" in summary)
-        assertEquals("−< 0.000001", BalanceWatch.formatDelta(c.oldWei, c.newWei))
+        assertEquals("−< 0.000001", BalanceWatch.formatDelta(c.oldBalance, c.newBalance))
     }
 
     @Test
@@ -347,42 +351,180 @@ class BalanceWatchTest {
         assertEquals("999999999999999999", BalanceWatch.subtractDecimal("1000000000000000000", "1"))
     }
 
+    // ---- tokens ----
+
+    private val usdc = Token("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "USDC", 6)
+    private fun usdcKey(holder: String) = BalanceWatch.key(holder, BalanceWatch.tokenAsset(usdc))
+
+    @Test
+    fun aTokenChangeIsTracedToItsTransfer() = runBlocking {
+        val prev = WatchState(addresses = mapOf(
+            alice to WatchAddressState(WatchSeen("5", 3, 100, -1, 0)),
+            usdcKey(alice) to WatchAddressState(WatchSeen("1000000", 0, 100, -1, 0)),
+        ))
+        val r = FakeReader().apply {
+            balances[alice] = account(alice, "5", block = 104, nonce = 3)
+            tokenBalances[usdc.key] = hashMapOf(alice to "101000000")
+            (101L..104L).forEach { receipts[it] = receiptsJson() }
+            receipts[103] = receiptsJson(transferLog(usdc.address, bob, alice, "0x5f5e100"))
+        }
+        val c = BalanceWatch.check(listOf(WatchEntry(alice, "Savings")), prev, r, nowMs = 9, tokens = listOf(usdc))
+            .changes.single()
+        assertEquals(BalanceWatch.tokenAsset(usdc), c.asset)
+        assertEquals("USDC", c.symbol)
+        assertEquals(6, c.decimals)
+        assertEquals(WatchSearch.COMPLETE, c.search)
+        assertEquals(listOf(WatchCause(WatchCauseKind.RECEIVED, 103, "0xfeed", bob, "100000000")), c.causes)
+        assertEquals("Savings: +100 USDC", BalanceWatch.notificationTitle(c, "ETH"))
+        val text = BalanceWatch.notificationText(c, "ETH")
+        assertTrue(text, text.startsWith("Balance 1 → 101 USDC at block 104."))
+        assertTrue(text, "Received 100 USDC from ${BalanceWatch.shortAddress(bob)} (tx 0xfeed)" in text)
+        // The token's search reads receipts, newest first, in a quarter of the block window.
+        assertEquals(listOf(104L, 103L, 102L, 101L), r.receiptReads)
+        assertEquals(emptyList<Any>(), r.blockReads)
+    }
+
+    @Test
+    fun theFirstTokenReadIsItsBaselineAnchoredToTheAccountRead() = runBlocking {
+        val r = FakeReader().apply {
+            balances[alice] = account(alice, "5", block = 104)
+            tokenBalances[usdc.key] = hashMapOf(alice to "7")
+        }
+        val out = BalanceWatch.check(listOf(WatchEntry(alice, "")), WatchState(), r, nowMs = 9, tokens = listOf(usdc))
+        assertEquals(emptyList<Any>(), out.changes)
+        assertEquals(WatchSeen("7", 0, 104, 1_700_000_000, 9), out.state.addresses[usdcKey(alice)]?.seen)
+    }
+
+    @Test
+    fun tokensWaitForAVerifiedAccountReadOnACurrentAnchor() = runBlocking {
+        val prev = WatchState(addresses = mapOf(
+            alice to WatchAddressState(WatchSeen("5", 0, 100, -1, 0)),
+            usdcKey(alice) to WatchAddressState(WatchSeen("1", 0, 100, -1, 0)),
+        ))
+        val unverified = FakeReader().apply {
+            balances[alice] = account(alice, "5", block = 104, verified = false, failReason = "beaconNotSynced")
+            tokenBalances[usdc.key] = hashMapOf(alice to "999")
+        }
+        val out = BalanceWatch.check(listOf(WatchEntry(alice, "")), prev, unverified, nowMs = 9, tokens = listOf(usdc))
+        assertEquals(prev.addresses[usdcKey(alice)], out.state.addresses[usdcKey(alice)])
+        assertEquals(emptyList<Any>(), unverified.calls)
+        val older = FakeReader().apply {
+            balances[alice] = account(alice, "5", block = 90)
+            tokenBalances[usdc.key] = hashMapOf(alice to "999")
+        }
+        val out2 = BalanceWatch.check(listOf(WatchEntry(alice, "")), prev, older, nowMs = 9, tokens = listOf(usdc))
+        assertEquals(emptyList<Any>(), out2.changes)
+        assertEquals(emptyList<Any>(), older.calls)
+    }
+
+    @Test
+    fun anEmptyTokenReplyIsNotAZeroBalance() = runBlocking {
+        val prev = WatchState(addresses = mapOf(usdcKey(alice) to WatchAddressState(WatchSeen("5", 0, 100, -1, 0))))
+        val r = FakeReader().apply { balances[alice] = account(alice, "5", block = 104) } // no token contract answers
+        val out = BalanceWatch.check(listOf(WatchEntry(alice, "")), prev, r, nowMs = 9, tokens = listOf(usdc))
+        assertEquals(emptyList<Any>(), out.changes)
+        val a = out.state.addresses[usdcKey(alice)]!!
+        assertEquals("5", a.seen?.balance)
+        assertTrue(a.error, a.error!!.contains("no reply"))
+    }
+
+    @Test
+    fun aTokenThatChangesWithoutATransferIsSaidToRebase() = runBlocking {
+        val steth = Token("0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84", "stETH", 18)
+        val k = BalanceWatch.key(alice, BalanceWatch.tokenAsset(steth))
+        val prev = WatchState(addresses = mapOf(
+            alice to WatchAddressState(WatchSeen("5", 0, 100, -1, 0)),
+            k to WatchAddressState(WatchSeen("1000000000000000000", 0, 100, -1, 0)),
+        ))
+        val r = FakeReader().apply {
+            balances[alice] = account(alice, "5", block = 102)
+            tokenBalances[steth.key] = hashMapOf(alice to "1000100000000000000")
+            receipts[101] = receiptsJson(); receipts[102] = receiptsJson()
+        }
+        val c = BalanceWatch.check(listOf(WatchEntry(alice, "")), prev, r, nowMs = 9, tokens = listOf(steth)).changes.single()
+        assertEquals(WatchSearch.COMPLETE, c.search)
+        assertTrue(BalanceWatch.causeSummary(c, "ETH"), "rebasing" in BalanceWatch.causeSummary(c, "ETH"))
+    }
+
+    @Test
+    fun theReceiptParserReadsOnlyThisTokensTransfersOfThisHolder() {
+        val other = "0x" + "99".repeat(20)
+        val json = receiptsJson(
+            transferLog(usdc.address, alice, bob, "0x1", tx = "0x01"),
+            transferLog(usdc.address, alice, alice, "0x2", tx = "0x02"),
+            transferLog(other, bob, alice, "0x3", tx = "0x03"),             // another contract
+            transferLog(usdc.address, bob, "0x" + "cc".repeat(20), "0x4"), // not this holder
+            // An ERC-721 Transfer indexes the id: four topics, no balance move.
+            """{"address":"${usdc.address}","topics":["${BalanceWatch.TRANSFER_TOPIC}","${topic(bob)}","${topic(alice)}","${topic(bob)}"],"data":"0x"}""",
+            """{"address":"${usdc.address}","topics":["0x${"11".repeat(32)}","${topic(bob)}","${topic(alice)}"],"data":"0x5"}""",
+        )
+        assertEquals(
+            listOf(
+                WatchCause(WatchCauseKind.SENT, 7, "0x01", bob, "1"),
+                WatchCause(WatchCauseKind.SELF, 7, "0x02", null, "2"),
+            ),
+            BalanceWatch.transfersIn(json, alice, usdc, 7),
+        )
+        assertNull(BalanceWatch.transfersIn("null", alice, usdc, 7))
+        assertNull(BalanceWatch.transfersIn("""{"error":"no snap peer available"}""", alice, usdc, 7))
+        assertEquals(emptyList<Any>(), BalanceWatch.transfersIn("[]", alice, usdc, 7))
+    }
+
+    @Test
+    fun aTokenRemovedInSettingsLosesItsStoredBalance() = runBlocking {
+        val store = StoreSettings()
+        val mine = Token("0x" + "ab".repeat(20), "MINE", 18, custom = true)
+        store.setCustomTokensJson(NET, CustomTokens.serialize(listOf(mine)))
+        store.setWatchListJson(NET, BalanceWatch.serializeList(listOf(WatchEntry(alice, ""))))
+        val r = FakeReader().apply {
+            balances[alice] = account(alice, "5", block = 10)
+            tokenBalances[mine.key] = hashMapOf(alice to "3")
+        }
+        val watcher = BalanceWatcher(store) { 100 }
+        watcher.check(NET, r)
+        val k = BalanceWatch.key(alice, BalanceWatch.tokenAsset(mine))
+        assertEquals("3", BalanceWatch.parseState(store.watchStateJson(NET)).addresses[k]?.seen?.balance)
+        store.setCustomTokensJson(NET, "[]")
+        watcher.prune(NET)
+        assertEquals(setOf(alice), BalanceWatch.parseState(store.watchStateJson(NET)).addresses.keys)
+    }
+
     // ---- the watcher over a Settings store ----
 
     @Test
     fun theWatcherStoresWhatItFoundAndDropsWhatWasRemovedMeanwhile() = runBlocking {
         val store = StoreSettings()
-        store.setWatchListJson("mainnet", BalanceWatch.serializeList(listOf(WatchEntry(alice, ""), WatchEntry(bob, ""))))
+        store.setWatchListJson(NET, BalanceWatch.serializeList(listOf(WatchEntry(alice, ""), WatchEntry(bob, ""))))
         val reader = object : FakeReader() {
             override suspend fun account(address: String): AccountResult {
                 // The user removes bob while the proofs are read.
-                if (address == bob) store.setWatchListJson("mainnet", BalanceWatch.serializeList(listOf(WatchEntry(alice, ""))))
+                if (address == bob) store.setWatchListJson(NET, BalanceWatch.serializeList(listOf(WatchEntry(alice, ""))))
                 return account(address, "1", block = 5)
             }
         }
         val watcher = BalanceWatcher(store) { 100 }
-        assertEquals(emptyList<Any>(), watcher.check("mainnet", reader))
-        assertEquals(setOf(alice), BalanceWatch.parseState(store.watchStateJson("mainnet")).addresses.keys)
+        assertEquals(emptyList<Any>(), watcher.check(NET, reader))
+        assertEquals(setOf(alice), BalanceWatch.parseState(store.watchStateJson(NET)).addresses.keys)
     }
 
     @Test
     fun pruningAnEmptiedListForgetsTheOldBaseline() = runBlocking {
         val store = StoreSettings()
-        store.setWatchStateJson("mainnet", BalanceWatch.serializeState(stateWith(alice, "5", block = 100)))
+        store.setWatchStateJson(NET, BalanceWatch.serializeState(stateWith(alice, "5", block = 100)))
         val watcher = BalanceWatcher(store) { 100 }
         // The last address was removed: no check follows, so the edit prunes.
-        watcher.prune("mainnet")
-        assertEquals(emptySet<String>(), BalanceWatch.parseState(store.watchStateJson("mainnet")).addresses.keys)
+        watcher.prune(NET)
+        assertEquals(emptySet<String>(), BalanceWatch.parseState(store.watchStateJson(NET)).addresses.keys)
         // Re-adding it later starts from a fresh baseline, not the forgotten balance.
-        store.setWatchListJson("mainnet", BalanceWatch.serializeList(listOf(WatchEntry(alice, ""))))
+        store.setWatchListJson(NET, BalanceWatch.serializeList(listOf(WatchEntry(alice, ""))))
         val r = FakeReader().apply { balances[alice] = account(alice, "9", block = 500) }
-        assertEquals(emptyList<Any>(), watcher.check("mainnet", r))
+        assertEquals(emptyList<Any>(), watcher.check(NET, r))
     }
 
     @Test
     fun aCancelledCheckFreesItsSlot() = runBlocking {
         val store = StoreSettings()
-        store.setWatchListJson("mainnet", BalanceWatch.serializeList(listOf(WatchEntry(alice, ""))))
+        store.setWatchListJson(NET, BalanceWatch.serializeList(listOf(WatchEntry(alice, ""))))
         val entered = CompletableDeferred<Unit>()
         val stuck = object : FakeReader() {
             override suspend fun account(address: String): AccountResult {
@@ -391,18 +533,18 @@ class BalanceWatchTest {
             }
         }
         val watcher = BalanceWatcher(store) { 100 }
-        val job = launch { watcher.check("mainnet", stuck) }
+        val job = launch { watcher.check(NET, stuck) }
         entered.await()
         job.cancelAndJoin()
-        assertTrue(!watcher.isChecking("mainnet"))
+        assertTrue(!watcher.isChecking(NET))
         val r = FakeReader().apply { balances[alice] = account(alice, "1", block = 5) }
-        assertEquals(emptyList<Any>(), watcher.check("mainnet", r))
+        assertEquals(emptyList<Any>(), watcher.check(NET, r))
     }
 
     @Test
     fun theWatcherRunsOneCheckPerNetworkAtATime() = runBlocking {
         val store = StoreSettings()
-        store.setWatchListJson("mainnet", BalanceWatch.serializeList(listOf(WatchEntry(alice, ""))))
+        store.setWatchListJson(NET, BalanceWatch.serializeList(listOf(WatchEntry(alice, ""))))
         val entered = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
         val slow = object : FakeReader() {
@@ -413,17 +555,29 @@ class BalanceWatchTest {
             }
         }
         val watcher = BalanceWatcher(store) { 100 }
-        val first = async { watcher.check("mainnet", slow) }
+        val first = async { watcher.check(NET, slow) }
         entered.await()
-        assertTrue(watcher.isChecking("mainnet"))
-        assertNull("a second check of the same network must not run", watcher.check("mainnet", slow))
+        assertTrue(watcher.isChecking(NET))
+        assertNull("a second check of the same network must not run", watcher.check(NET, slow))
         release.complete(Unit)
         assertEquals(emptyList<Any>(), first.await())
-        assertTrue(!watcher.isChecking("mainnet"))
-        assertNull("nothing watched, nothing checked", BalanceWatcher(StoreSettings()).check("mainnet", slow))
+        assertTrue(!watcher.isChecking(NET))
+        assertNull("nothing watched, nothing checked", BalanceWatcher(StoreSettings()).check(NET, slow))
     }
 
     // ---- fixtures ----
+
+    /** A network without built-in tokens: the watcher tests check the watcher, not a token list. */
+    private val NET = "devnet"
+
+    private fun topic(a: String) = "0x" + "0".repeat(24) + a.drop(2).lowercase()
+
+    private fun transferLog(token: String, from: String, to: String, amountHex: String, tx: String = "0xfeed") =
+        """{"address":"$token","topics":["${BalanceWatch.TRANSFER_TOPIC}","${topic(from)}","${topic(to)}"],""" +
+            """"data":"$amountHex","transactionHash":"$tx"}"""
+
+    private fun receiptsJson(vararg logs: String) =
+        """[{"transactionHash":"0xaa","status":"0x1","logs":[${logs.joinToString(",")}]}]"""
 
     private fun stateWith(address: String, wei: String, block: Long, nonce: Long = 0) = WatchState(
         addresses = mapOf(address to WatchAddressState(WatchSeen(wei, nonce, block, -1, 0))),
@@ -444,17 +598,35 @@ class BalanceWatchTest {
         val balances = HashMap<String, AccountResult>()
         val blocks = HashMap<Long, String>()
         val blockReads = ArrayList<Long>()
+        /** token contract (lowercase) → holder (lowercase) → raw balance; absent = empty reply. */
+        val tokenBalances = HashMap<String, HashMap<String, String>>()
+        val receipts = HashMap<Long, String>()
+        val receiptReads = ArrayList<Long>()
+        val calls = ArrayList<String>()
         override suspend fun account(address: String): AccountResult =
             balances[address] ?: throw IllegalStateException("Node is not running")
         override suspend fun block(number: Long): String? {
             blockReads += number
             return blocks[number]
         }
+        override suspend fun call(to: String, data: String): EthCallResult {
+            synchronized(calls) { calls += to.lowercase() }
+            val raw = tokenBalances[to.lowercase()]?.get("0x" + data.takeLast(40))
+                ?: return EthCallResult(EthCallStatus.OK, "0x")
+            return EthCallResult(EthCallStatus.OK, "0x" + java.math.BigInteger(raw).toString(16).padStart(64, '0'))
+        }
+        override suspend fun receipts(number: Long): String? {
+            receiptReads += number
+            return receipts[number]
+        }
     }
 
     private class StoreSettings : Settings by FakeSettings() {
         private val lists = HashMap<String, String>()
         private val states = HashMap<String, String>()
+        private val customTokens = HashMap<String, String>()
+        override fun customTokensJson(network: String): String = customTokens[network] ?: "[]"
+        override fun setCustomTokensJson(network: String, json: String) { customTokens[network] = json }
         override fun supportsBalanceWatch(): Boolean = true
         override fun watchListJson(network: String): String = lists[network] ?: "[]"
         override fun setWatchListJson(network: String, json: String) { lists[network] = json }

@@ -717,6 +717,10 @@ class DesktopNodeController(
             override suspend fun account(address: String): AccountResult = requestAccount(canonical, address)
             override suspend fun block(number: Long): String? =
                 withContext(Dispatchers.IO) { handle.reads()?.getBlockByNumber("0x" + number.toString(16), true) }
+            // The token balances: the Query tab's verified eth_call, same read.
+            override suspend fun call(to: String, data: String): EthCallResult = ethCall(canonical, to, data)
+            override suspend fun receipts(number: Long): String? =
+                withContext(Dispatchers.IO) { handle.reads()?.getBlockReceipts("0x" + number.toString(16)) }
         }
         val changes = balanceWatcher.check(canonical, reader, BalanceWatch.DEFAULT_SCAN_BLOCKS, budget)
             ?: return null

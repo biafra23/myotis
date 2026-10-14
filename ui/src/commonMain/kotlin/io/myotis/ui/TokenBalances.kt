@@ -109,12 +109,10 @@ internal fun rememberTokenBalances(
     contractDecimals: MutableMap<String, Int>,
     permits: Semaphore,
 ): TokenBalancesState {
-    val popular = remember(network) { PopularTokens.forNetwork(network) }
     // Read when the result appears: the Settings tab edits the list, and leaving the Query
     // tab drops this, so the next lookup sees the edit.
-    var custom by remember(network) { mutableStateOf(CustomTokens.parse(settings.customTokensJson(network))) }
-    // A custom entry for a contract a later release pinned as built-in shows once, as built-in.
-    val tokens = popular + custom.filterNot { c -> popular.any { it.key == c.key } }
+    var customJson by remember(network) { mutableStateOf(settings.customTokensJson(network)) }
+    val tokens = remember(network, customJson) { listedTokens(network, customJson) }
 
     // Bumping [refresh] drops every result and re-reads every row; bumping one row's
     // attempt re-reads that row alone.
@@ -148,8 +146,10 @@ internal fun rememberTokenBalances(
         tokens, results,
         onRetry = ::retryFailed,
         onUseChainDecimals = { t, d ->
-            custom = custom.map { if (it.key == t.key) it.copy(decimals = d) else it }
-            settings.setCustomTokensJson(network, CustomTokens.serialize(custom))
+            customJson = CustomTokens.serialize(
+                CustomTokens.parse(customJson).map { if (it.key == t.key) it.copy(decimals = d) else it },
+            )
+            settings.setCustomTokensJson(network, customJson)
         },
         onRefresh = { refresh++ },
         canAddTokens = settings.supportsCustomTokens(),
@@ -302,8 +302,12 @@ internal fun TokenSettings(
     val popular = remember(net) { PopularTokens.forNetwork(net) }
     var custom by remember(net) { mutableStateOf(CustomTokens.parse(settings.customTokensJson(net))) }
     fun save(next: List<Token>) {
+        val removed = custom.any { c -> next.none { it.key == c.key } }
         custom = next
         settings.setCustomTokensJson(net, CustomTokens.serialize(next))
+        // The balance watch reads this list too: a removed token's stored balance is dropped
+        // now, so re-adding it later starts from a fresh baseline, not the forgotten one.
+        if (removed) controller.onWatchListChanged(net, added = false)
     }
     var adding by remember(net) { mutableStateOf(false) }
 

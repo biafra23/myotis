@@ -265,8 +265,9 @@ interface NodeController {
     val watchSchedule: String? get() = null
 
     /**
-     * The Watch tab changed [network]'s list — [added] an address, or removed one. On a
-     * removal the host drops the removed addresses' stored state ([BalanceWatcher.prune]:
+     * The Watch tab changed [network]'s list — [added] an address, or removed one — or
+     * Settings → Tokens removed a token the watch reads (added = false). On a removal the
+     * host drops the stored state of what is no longer listed ([BalanceWatcher.prune]:
      * with no check to follow the edit, an old balance would otherwise be the baseline of a
      * later re-add); not on an add, which removes nothing — a prune there would only take
      * the watcher's slot from the baseline check the tab starts next. On an add, a host

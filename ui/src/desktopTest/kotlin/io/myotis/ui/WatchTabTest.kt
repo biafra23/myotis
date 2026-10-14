@@ -87,8 +87,11 @@ class WatchTabTest {
         rule.onNodeWithText("Enter an address: 0x followed by 40 hex digits.").assertIsDisplayed()
         assertEquals("[]", settings.watchListJson("mainnet"))
 
-        // Mixed case is accepted and stored lowercase.
+        // A mixed-case address must pass its EIP-55 checksum; a checksummed one is stored lowercase.
         rule.onNodeWithTag(WATCH_ADDRESS_TAG).performTextReplacement("0x" + "a1".repeat(19) + "A1")
+        rule.onNodeWithTag(WATCH_ADD_TAG).performClick()
+        rule.onNodeWithText("That address fails its checksum (EIP-55) — check it for a typo.").assertIsDisplayed()
+        rule.onNodeWithTag(WATCH_ADDRESS_TAG).performTextReplacement(Eip55.checksum(alice))
         rule.onNodeWithTag(WATCH_LABEL_TAG).performTextInput("Savings")
         rule.onNodeWithTag(WATCH_ADD_TAG).performClick()
         assertEquals(listOf(WatchEntry(alice, "Savings")), BalanceWatch.parseList(settings.watchListJson("mainnet")))
@@ -135,6 +138,38 @@ class WatchTabTest {
         rule.onNodeWithText("Received 0.5 ETH from ${BalanceWatch.shortAddress(bob)}", substring = true)
             .performScrollTo().assertIsDisplayed()
         rule.onNodeWithText("0x" + "ab".repeat(32)).performScrollTo().assertIsDisplayed()
+    }
+
+    @Test
+    fun anAddressCardShowsTheTokensItHolds() {
+        val usdc = PopularTokens.forNetwork("mainnet").first { it.symbol == "USDC" }
+        val weth = PopularTokens.forNetwork("mainnet").first { it.symbol == "WETH" }
+        val settings = WatchSettings().apply {
+            setWatchListJson("mainnet", BalanceWatch.serializeList(listOf(WatchEntry(alice, "Savings"))))
+            setWatchStateJson("mainnet", BalanceWatch.serializeState(WatchState(
+                addresses = mapOf(
+                    alice to WatchAddressState(WatchSeen("0", 0, 7, -1, 1)),
+                    BalanceWatch.key(alice, BalanceWatch.tokenAsset(usdc)) to WatchAddressState(WatchSeen("101500000", 0, 7, -1, 1)),
+                    BalanceWatch.key(alice, BalanceWatch.tokenAsset(weth)) to WatchAddressState(WatchSeen("0", 0, 7, -1, 1)),
+                ),
+                changes = listOf(
+                    WatchChange(
+                        alice, "Savings", "1500000", "101500000", 0, 0, 6, 7, -1, 1, WatchSearch.COMPLETE, 6,
+                        listOf(WatchCause(WatchCauseKind.RECEIVED, 7, "0x" + "cd".repeat(32), bob, "100000000")),
+                        asset = BalanceWatch.tokenAsset(usdc), symbol = "USDC", decimals = 6,
+                    ),
+                ),
+            )))
+        }
+        show(Node(), settings)
+        rule.onNodeWithText("101.5").assertIsDisplayed()
+        rule.onNodeWithText("USDC").assertIsDisplayed()
+        // Zero balances are counted, not listed; the other built-ins were never read.
+        val others = PopularTokens.forNetwork("mainnet").size - 2
+        rule.onNodeWithText("1 other token at zero · $others tokens not checked yet").assertIsDisplayed()
+        rule.onNodeWithText("Savings: +100 USDC").performScrollTo().assertIsDisplayed()
+        rule.onNodeWithText("Received 100 USDC from ${BalanceWatch.shortAddress(bob)}", substring = true)
+            .performScrollTo().assertIsDisplayed()
     }
 
     @Test
