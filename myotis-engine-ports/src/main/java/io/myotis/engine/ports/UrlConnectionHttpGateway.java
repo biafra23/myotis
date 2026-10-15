@@ -24,8 +24,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * consumer's APK for one request shape. {@link HttpURLConnection} has been present
  * since API 1 and on every JVM.
  *
- * <p>Blocking, per the port contract: the Rust engine's JVM adapter calls it on the
- * thread that called the {@code EnsApi}. This is a legitimate outbound HTTP call, not a
+ * <p>Blocking, per the port contract: the Java engine calls it from its own workers,
+ * the Rust engine's JVM adapter ({@code CcipDriver}) on the thread that called the
+ * {@code EnsApi}. This is a legitimate outbound HTTP call, not a
  * "data source": ERC-3668 gateway responses are not trusted — the resolver re-validates
  * them via the on-chain callback, so the devp2p/libp2p-only rule holds.
  */

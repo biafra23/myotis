@@ -48,11 +48,13 @@ object Myotis {
      * engine. One instance per `create()`.
      *
      * The Rust engine this library ships reads the DNS servers and the gateway from
-     * these ports and keeps its identity, peer caches and sync snapshot itself under
-     * the [io.myotis.api.EngineConfig]'s `dataDir`, in the same file names — pass one
+     * these ports and keeps its peer caches and sync snapshot itself under the
+     * [io.myotis.api.EngineConfig]'s `dataDir`, in the same file names — pass one
      * directory as both that `dataDir` and [cacheDir] and
      * [DefaultEnginePorts.peerCacheFile] / [DefaultEnginePorts.syncSnapshot] name the
-     * files it writes. See [DefaultEnginePorts] for which engine reads which port.
+     * files it writes; its node identity is ephemeral per run (the key file under
+     * [keyDir] serves the Java engine only). See [DefaultEnginePorts] for which engine
+     * reads which port.
      */
     @JvmStatic
     @JvmOverloads

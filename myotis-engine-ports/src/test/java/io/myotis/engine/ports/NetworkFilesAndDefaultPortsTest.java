@@ -54,8 +54,9 @@ class NetworkFilesAndDefaultPortsTest {
         assertTrue(keys.resolve("nodekey-sepolia.hex").toFile().isFile());
         assertTrue(caches.resolve("peers-sepolia.cache").toFile().isFile(), "the EL cache's writer was drained by close()");
         assertTrue(caches.resolve("cl-peers-sepolia.cache").toFile().isFile());
-        assertEquals(caches.resolve("peers-sepolia.cache"),
-                DefaultEnginePorts.forNetwork(keys, caches, "sepolia", null).peerCacheFile());
+        try (DefaultEnginePorts again = DefaultEnginePorts.forNetwork(keys, caches, "sepolia", null)) {
+            assertEquals(caches.resolve("peers-sepolia.cache"), again.peerCacheFile());
+        }
     }
 
     @Test
@@ -77,7 +78,8 @@ class NetworkFilesAndDefaultPortsTest {
             assertNull(ports.logger(), "the engine's default logger");
             assertNull(ports.clock(), "the engine's default clock");
         }
-        assertNull(DefaultEnginePorts.forNetwork(keys, caches, "mainnet", null).ports().dnsServers(),
-                "no DNS servers → the resolver's default");
+        try (DefaultEnginePorts noDns = DefaultEnginePorts.forNetwork(keys, caches, "mainnet", null)) {
+            assertNull(noDns.ports().dnsServers(), "no DNS servers → the resolver's default");
+        }
     }
 }

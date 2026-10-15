@@ -19,15 +19,17 @@ import java.util.Objects;
  *
  * <p><b>Which engine reads what.</b> The engine library ships the Rust engine, and it
  * takes two of these ports: {@code dnsServers} (EIP-1459 resolution) and
- * {@code httpGateway} (CCIP-Read). Its identity, its peer caches and its sync snapshot
- * it keeps ITSELF, under {@link io.myotis.api.EngineConfig#dataDir()} — in the same
- * file names as {@link NetworkFiles}, so a consumer that passes one directory as both
- * the config's {@code dataDir} and this {@code cacheDir} finds the engine's files at
+ * {@code httpGateway} (CCIP-Read). Its peer caches and its sync snapshot it keeps
+ * ITSELF, under {@link io.myotis.api.EngineConfig#dataDir()} — in the same file names
+ * as {@link NetworkFiles}, so a consumer that passes one directory as both the config's
+ * {@code dataDir} and this {@code cacheDir} finds the engine's files at
  * {@link #peerCacheFile()}, {@link #clPeerCacheFile()} and {@link #syncSnapshot()}.
- * The file-backed {@link #keyStore()}, {@link #peerCache()} and {@link #clPeerCache()}
- * are what the JAVA engine consumes — the Myotis apps run it through their engine
- * selector — and are inert under the Rust engine: do not read a live peer count or
- * wipe the caches through them there (the file is the engine's, and
+ * Its node identity is ephemeral: a fresh key per run, on both the EL and the CL side
+ * — it reads no key file, and a {@code nodekey[-net].hex} seeded under {@code dataDir}
+ * changes nothing. The file-backed {@link #keyStore()}, {@link #peerCache()} and
+ * {@link #clPeerCache()} are what the JAVA engine consumes — the Myotis apps run it
+ * through their engine selector — and are inert under the Rust engine: do not read a
+ * live peer count or wipe the caches through them there (the file is the engine's, and
  * {@link FilePeerCache#load()} serves a boot-time copy); read the file, and clear peer
  * state through {@link io.myotis.api.ChainHandle#clearPeerState()}.
  *
@@ -100,7 +102,7 @@ public final class DefaultEnginePorts implements Closeable {
 
     public String network() { return network; }
 
-    /** The node-key file store (the Java engine's; the Rust engine keeps its own key under its data dir). */
+    /** The node-key file store — read and written by the Java engine only (the Rust engine's identity is ephemeral per run). */
     public NodeKeyStore keyStore() { return keyStore; }
 
     /** The EL peer cache (the Java engine's; see the class note for the Rust engine). */

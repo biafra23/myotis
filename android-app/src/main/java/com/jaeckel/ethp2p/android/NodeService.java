@@ -1019,8 +1019,6 @@ public final class NodeService extends Service {
         }
     }
 
-    /** Cache file in getCacheDir(), suffixed by the network (mainnet keeps the bare name) so
-     *  chains never share peer caches / sync snapshots. */
     /** The network's cache-side files, named by the engine library's layout
      *  ({@link NetworkFiles}: mainnet keeps the legacy suffix-less names, every other
      *  network gets {@code -<network>}) — the same names the ports write, so this is
