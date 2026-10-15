@@ -27,7 +27,6 @@ import io.myotis.api.VerifiedReads;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -796,12 +795,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         // compare works whether or not a listener exists (CLAUDE.md: applied or
         // refused, never silently ignored).
         if (rpc != null) return rpc.setWebAccessPolicy(policy);
-        List<String> normalized = new ArrayList<>(policy.origins().size());
-        for (String o : policy.origins()) {
-            String n = io.myotis.jsonrpc.policy.WebOrigins.INSTANCE.normalize(o);
-            if (n != null) normalized.add(n);
-        }
-        return new io.myotis.api.WebAccessPolicy(policy.mode(), normalized);
+        return new io.myotis.api.WebAccessPolicy(policy.mode(),
+                io.myotis.jsonrpc.policy.WebOrigins.INSTANCE.normalizeEach(policy.origins()));
     }
 
     @Override

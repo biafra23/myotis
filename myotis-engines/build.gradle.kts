@@ -45,7 +45,6 @@ dependencies {
     testRuntimeOnly(libs.logback.classic)
 }
 
-
 tasks.test {
     useJUnitPlatform()
     // Build the Rust workspace first (no-op without cargo) and put its release dir on

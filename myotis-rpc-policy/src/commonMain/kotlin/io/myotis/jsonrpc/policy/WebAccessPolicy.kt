@@ -57,6 +57,16 @@ object WebOrigins {
     /** The opaque origin a browser sends for file:, data:, blob: and sandboxed documents. */
     const val OPAQUE = "null"
 
+    /**
+     * [normalize] applied per ENTRY, multiplicity kept: the list a host gets back
+     * from `setWebAccessPolicy` (CLAUDE.md, Trust — applied or refused, never
+     * silently ignored). Two spellings of one origin stay two entries, as a set
+     * would not, so `normalizeEach(asked).size != asked.size` is exactly "an entry
+     * was no origin and was dropped" — the one definition both the listener's
+     * adapter and a handle without a listener answer with.
+     */
+    fun normalizeEach(input: Iterable<String>): List<String> = input.mapNotNull(::normalize)
+
     private val DEFAULT_PORTS = mapOf("http" to 80, "https" to 443, "ws" to 80, "wss" to 443)
 
     /**

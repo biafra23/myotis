@@ -27,7 +27,7 @@ object WebAccessApi {
     @JvmStatic
     fun apply(webAccess: WebAccess, policy: io.myotis.api.WebAccessPolicy): io.myotis.api.WebAccessPolicy {
         webAccess.policy = toPolicy(policy)
-        return io.myotis.api.WebAccessPolicy(policy.mode(), policy.origins().mapNotNull(WebOrigins::normalize))
+        return io.myotis.api.WebAccessPolicy(policy.mode(), WebOrigins.normalizeEach(policy.origins()))
     }
 
     /** The recent-origins list as api rows, most recent first. */

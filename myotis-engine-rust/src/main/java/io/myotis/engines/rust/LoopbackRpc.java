@@ -26,7 +26,13 @@ import java.util.List;
  */
 public interface LoopbackRpc {
 
-    /** Builds one listener per handle; a {@code null} factory means no listener. */
+    /**
+     * Builds one listener per handle, called once per {@code create()} before the
+     * native handle exists (so a throw leaks nothing native). A {@code null} factory
+     * means no listener; a factory RETURNING {@code null} means the same for that
+     * handle — the handle then behaves exactly as with no factory (in-process
+     * {@code reads()}, no RPC status row, policy normalized but judged by nothing).
+     */
     @FunctionalInterface
     interface Factory {
         LoopbackRpc create();
