@@ -52,7 +52,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # The Android app builds the Rust engine FROM SOURCE by default — cargo + cargo-ndk
 # + NDK r28+ + `rustup target add aarch64-linux-android x86_64-linux-android` are
 # REQUIRED to build :android-app. There is no committed .so (so nothing can drift);
-# an Android build also regenerates the committed UniFFI bindings (:myotis-engines)
+# an Android build also regenerates the committed UniFFI bindings (:myotis-engine-rust)
 # from source — other workflows do NOT, so regenerate them explicitly with
 # `./gradlew uniffiGenerateKotlin` after changing the Rust FFI. Opt out when you
 # lack the toolchain — the build tells you about the switch — with:
@@ -77,11 +77,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Key Gradle modules:
 
-- **myotis-engines** — the engine SELECTOR (`Engines`/`SelectorEngine`/`RustMyotisEngine`):
-  hosts' composition roots call `Engines.engine()`; `myotis.engine=java|rust|auto` routes
-  each network (re)start to the Java engine or the Rust one (`rust/myotis-engine`,
-  UniFFI-generated Kotlin bindings over JNA — committed in this module, regenerated
-  via `uniffiGenerateKotlin`; compound values as JSON pinned by golden tests both sides).
+- **myotis-engines** — the engine SELECTOR (`Engines`/`SelectorEngine`): hosts'
+  composition roots call `Engines.engine()`; `myotis.engine=java|rust|auto` routes
+  each network (re)start to the Java engine (node-core) or the Rust one.
+- **myotis-engine-rust** — the RUST engine behind the contract on its own
+  (`RustMyotisEngine`/`RustChainHandle`/`RustVerifiedReads`/`RustEnsApi`, the Tor
+  seam): `rust/myotis-engine` over UniFFI-generated Kotlin bindings + JNA (committed
+  in this module, regenerated via `uniffiGenerateKotlin`; compound values as JSON
+  pinned by golden tests both sides). Depends on nothing from the Java engine, so
+  it can ship alone — the engine library the desktop apps, the Android app and the
+  Android AAR consume (`:jsonrpc-server` is still a dependency; its removal is the
+  next part of `feature/android-aar`).
+- **myotis-engine-common** — the lifecycle primitives both engines' handles wire
+  (`WakeGate`, `SleepMetrics`); Java 17 over `:myotis-api` alone.
 - **myotis-api** — THE ENGINE CONTRACT: zero-dependency Java-17 interfaces
   (`io.myotis.api` + `io.myotis.api.ports`) every host consumes exclusively.
   FFI-portable types only (byte[], String, long, double[], enums, flat records;

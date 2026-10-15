@@ -384,7 +384,7 @@ quality drives dial priority (CONFIRMED first). Mainnet's files carry no `-<net>
 > formats); it ignores the cache ports, `NodeKeyStore` (its node key is generated per start)
 > and the logger/clock, reaches `HttpGateway` only through the JVM hosts' `CcipDriver`, and
 > takes a non-null `DnsServers` only as "DNS discovery off". The ports stay on `EnginePorts`
-> for the Java engine (`myotis-engines/.../RustMyotisEngine.java`).
+> for the Java engine (`myotis-engine-rust/.../RustMyotisEngine.java`).
 
 ### 5.3 The verified-read backend: `VerifiedReads` (the eth_* contract)
 
@@ -592,7 +592,7 @@ The goal is **one engine, three consumers**. Two viable strategies:
 > generalizes the same approach to the whole engine. See
 > [`docs/bls-rust-acceleration.md`](../bls-rust-acceleration.md). *Status:* the whole engine now
 > ships this way — `rust/myotis-engine` is built by `cargoNdkAndroid` into the APK's jniLibs
-> (arm64-v8a, x86_64) with UniFFI Kotlin bindings committed in `:myotis-engines`, and iOS
+> (arm64-v8a, x86_64) with UniFFI Kotlin bindings committed in `:myotis-engine-rust`, and iOS
 > links it as a static library through its plain C ABI (`:app-ios`, or
 > `rust/build-xcframework.sh` for Swift hosts).
 

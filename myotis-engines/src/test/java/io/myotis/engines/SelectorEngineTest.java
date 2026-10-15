@@ -10,6 +10,7 @@ import io.myotis.api.ports.EnginePeerCache;
 import io.myotis.api.ports.EnginePorts;
 import io.myotis.api.ports.NodeKeyStore;
 import io.myotis.api.ports.ServedRange;
+import io.myotis.engines.rust.RustMyotisEngine;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;

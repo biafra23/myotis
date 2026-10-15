@@ -151,7 +151,7 @@ jobs:
       - name: Verify committed UniFFI bindings match the Rust source
         run: |
           ./gradlew uniffiGenerateKotlin --stacktrace
-          bindings=myotis-engines/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt
+          bindings=myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt
           git diff --exit-code -- "$bindings" || {
             echo "::error::$bindings is STALE vs rust/myotis-engine — regenerate with" \
                  "\`./gradlew uniffiGenerateKotlin\` and commit. A from-source .so would" \

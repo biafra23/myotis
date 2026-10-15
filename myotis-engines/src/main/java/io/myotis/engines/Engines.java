@@ -2,6 +2,7 @@ package io.myotis.engines;
 
 import io.myotis.api.EngineException;
 import io.myotis.api.MyotisEngine;
+import io.myotis.engines.rust.RustMyotisEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -43,16 +44,10 @@ public final class Engines {
     public static String drainRustLogs(int max) {
         // Same lazy-load protection as select(): under the java choice the
         // native library may never have been loaded — probing availability
-        // would class-load RustEngineNative and map it just to drain a ring
+        // would class-load the native binding and map it just to drain a ring
         // that is empty by construction. rust/auto choices already probed.
         if ("java".equals(choice)) return "";
-        if (!RustMyotisEngine.isAvailable()) return "";
-        try {
-            String batch = RustEngineNative.nativeDrainLogs(max);
-            return batch != null ? batch : "";
-        } catch (Throwable t) {
-            return ""; // observability must never take the host down
-        }
+        return RustMyotisEngine.drainLogs(max);
     }
 
     /**
@@ -89,7 +84,7 @@ public final class Engines {
         choice = normalized;
         if ("java".equals(normalized)) {
             // Don't touch RustMyotisEngine here: probing availability class-loads
-            // RustEngineNative and maps the native library — pure-Java users
+            // the native binding and maps the library — pure-Java users
             // (Android re-applies the choice on every boot) shouldn't pay that.
             log.info("[engines] engine choice set to java");
         } else {

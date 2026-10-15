@@ -437,7 +437,7 @@ dependencies {
 // the post-build backstop that the produced .so exports every UniFFI symbol the
 // (now-fresh) bindings require. Auto-regen is scoped to the Android build ON
 // PURPOSE — the JVM hosts must stay buildable without cargo (see
-// myotis-engines/build.gradle.kts), and CI enforces bindings freshness for
+// myotis-engine-rust/build.gradle.kts), and CI enforces bindings freshness for
 // everyone via the regenerate-and-diff step in android-apk.yml. Root
 // build.gradle.kts owns the tasks.
 tasks.matching { it.name == "preBuild" }.configureEach {

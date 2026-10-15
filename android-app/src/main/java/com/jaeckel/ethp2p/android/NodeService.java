@@ -692,7 +692,7 @@ public final class NodeService extends Service {
      *  ({@link BuildConfig#TOR_ENGINE}) whose loaded engine library confirms it. Every other
      *  APK answers false without touching the native library. Constant for the process. */
     public static boolean torSupported() {
-        return BuildConfig.TOR_ENGINE && io.myotis.engines.Tor.supported();
+        return BuildConfig.TOR_ENGINE && io.myotis.engines.rust.Tor.supported();
     }
     /** Arti's state directory (guard selection — never backed up: it describes this device's
      *  path into Tor) and its directory cache (re-downloadable, so the system may reclaim it).
@@ -728,7 +728,7 @@ public final class NodeService extends Service {
         synchronized (TOR_APPLY_LOCK) {
             boolean on = torEnabled(c);
             if (!on) {
-                io.myotis.engines.Tor.select(false);
+                io.myotis.engines.rust.Tor.select(false);
                 return "off";
             }
             if (!torSupported()) {
@@ -737,13 +737,13 @@ public final class NodeService extends Service {
                         + "account reads and sends use the clearnet peer pool");
                 return "unsupported"; // nothing to push: no Tor path exists in this engine
             }
-            boolean stored = io.myotis.engines.Tor.configureStorage(
+            boolean stored = io.myotis.engines.rust.Tor.configureStorage(
                     torStateDir(c).getAbsolutePath(), torCacheDir(c).getAbsolutePath());
             if (!stored) {
                 LogBuffer.w(TAG, "Tor storage directories refused: reads and sends routed "
                         + "over Tor will fail closed");
             }
-            if (!io.myotis.engines.Tor.select(true)) {
+            if (!io.myotis.engines.rust.Tor.select(true)) {
                 // torSupported() said yes a moment ago; only a failing native call lands here.
                 LogBuffer.w(TAG, "Tor routing could not be pushed to the engine");
                 return "unsupported";

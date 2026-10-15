@@ -15,7 +15,7 @@ import io.myotis.api.ports.EnginePorts
 import io.myotis.engines.Engines
 import io.myotis.ui.LogIndexWatch
 import io.myotis.engines.SelectorEngine
-import io.myotis.engines.Tor
+import io.myotis.engines.rust.Tor
 import io.myotis.txhistory.TxHistoryEvent
 import io.myotis.txhistory.TxHistoryService
 import io.myotis.txhistory.TxSummary

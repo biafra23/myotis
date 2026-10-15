@@ -33,7 +33,7 @@
 > first Rust-engine PRs bound via hand-JNI, and that decision was reversed in
 > 2026-07 as a transport swap only (see [06](06-rust-phase-notes.md)) —
 > `#[uniffi::export]` functions in `rust/myotis-engine/src/ffi.rs`, generated Kotlin
-> bindings committed in `:myotis-engines` (`./gradlew uniffiGenerateKotlin`
+> bindings committed in `:myotis-engine-rust` (`./gradlew uniffiGenerateKotlin`
 > regenerates them; an Android build does so automatically), `RustEngineNative`
 > reduced to a static delegator, and `:myotis-engines` selecting the engine
 > (`Engines.engine()`, `myotis.engine=java|rust|auto`). Compound values still cross
@@ -100,7 +100,7 @@ makes the blocking call on the thread that called the `EnsApi` and re-enters via
 
 > *As built:* Android bundles `libmyotis_engine.so` (arm64-v8a, x86_64 — `cargoNdkAndroid` /
 > `rust/build-android.sh`) straight into the APK's jniLibs, no `.aar`; the UniFFI Kotlin is
-> committed in `:myotis-engines`, whose `RustMyotisEngine` is the adapter onto `io.myotis.api`.
+> committed in `:myotis-engine-rust`, whose `RustMyotisEngine` is the adapter onto `io.myotis.api`.
 > iOS took the plain C ABI instead of UniFFI Swift: `:app-ios` (Kotlin/Native cinterop; the
 > `MyotisKit` framework absorbs `libmyotis_engine.a`) for the app, and
 > `rust/build-xcframework.sh` (`MyotisEngine.xcframework`) for Swift hosts. Desktop loads the
