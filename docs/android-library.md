@@ -24,7 +24,7 @@ page describes what a consumer gets today.
 
 `<version>` is the tag's: `v0.1.16` publishes `0.1.16`, a release-candidate
 or hotfix tag `v0.1.16-rc1` publishes `0.1.16-rc1`. Everything else the graph
-needs (JNA, slf4j, minimal-json, Tuweni, BouncyCastle) comes from Maven
+needs (JNA, slf4j, minimal-json, the Kotlin stdlib) comes from Maven
 Central. The group is `eth.myotis` — `myotis.eth`, the project's ENS name, is
 the one namespace the owner controls (the Java packages stay `io.myotis.*`; a
 package prefix is not a claim on a domain). Maven Central would not accept it:

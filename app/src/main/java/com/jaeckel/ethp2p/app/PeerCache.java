@@ -25,8 +25,8 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Persists peers that reached READY state so they can be reconnected on restart.
- * Mirrors {@code io.myotis.engine.ports.FilePeerCache} in the engine library (the Android app's cache, moved there) (which went
- * through review) but logs via slf4j instead of the in-app {@code LogBuffer}.
+ * Mirrors {@code io.myotis.engine.ports.FilePeerCache} in the engine library (the
+ * reviewed Android cache, moved there): same file format, same thresholds.
  *
  * <p>Record format:
  * {@code ip\tport\tpublicKeyHex[\tsnap][\tsnapok|\tsnapbad][\tfails=N]\n}
