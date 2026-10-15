@@ -265,9 +265,7 @@ class RpcRouter(
      *  declines) and the strict branch (which names the reason), so the two can
      *  never disagree about which question is being answered. */
     private sealed interface EstimateTx {
-        class Serve(val tx: RpcTransactionArgs, val selector: Selector) : EstimateTx {
-            val block: String get() = selector.value
-        }
+        class Serve(val tx: RpcTransactionArgs, val selector: Selector) : EstimateTx
         class Refuse(val why: String) : EstimateTx
     }
 
@@ -279,7 +277,10 @@ class RpcRouter(
                 return EstimateTx.Refuse("invalid transaction object: ${parsed.why}")
             is RpcTransactionArgs.Parsed.Valid -> parsed.tx
         }
-        val block = when (val selector = txBlock(root.params()?.getOrNull(1), "eth_estimateGas")) {
+        // Every selector form — tag, number, hash, EIP-1898's object — is applied
+        // or refused as [callTx] reads it; a hash is resolved by the handler
+        // ([stateBlock], #641).
+        val block = when (val selector = parseSelector(root.params()?.getOrNull(1), 1, Takes.NUMBER_OR_HASH)) {
             is SelectorParse.Refuse -> return EstimateTx.Refuse(selector.why)
             is SelectorParse.Ok -> selector.selector
         }
@@ -302,9 +303,7 @@ class RpcRouter(
      *  handler and the strict branch, and for `eth_createAccessList`, whose
      *  request is `eth_call`'s with the method named in the refusal. */
     private sealed interface CallTx {
-        class Serve(val tx: RpcTransactionArgs, val selector: Selector) : CallTx {
-            val block: String get() = selector.value
-        }
+        class Serve(val tx: RpcTransactionArgs, val selector: Selector) : CallTx
         class Refuse(val why: String) : CallTx
     }
 
@@ -316,8 +315,10 @@ class RpcRouter(
             is RpcTransactionArgs.Parsed.Valid -> parsed.tx
         }
         // Every selector form — tag, number, EIP-1898's object — is applied or
-        // refused exactly as for eth_estimateGas ([txBlock], #366).
-        val block = when (val selector = txBlock(root.params()?.getOrNull(1), method)) {
+        // refused exactly as for eth_estimateGas (#366). A block hash is a valid
+        // form: the handler resolves it to the canonical block it names and
+        // judges that block as it judges a number ([stateBlock], #641).
+        val block = when (val selector = parseSelector(root.params()?.getOrNull(1), 1, Takes.NUMBER_OR_HASH)) {
             is SelectorParse.Refuse -> return CallTx.Refuse(selector.why)
             is SelectorParse.Ok -> selector.selector
         }
@@ -343,21 +344,6 @@ class RpcRouter(
                 "ignored — $without)"
         }
         return null
-    }
-
-    /** [method]'s block selector (`params[1]`), applied or refused — never
-     *  silently read as the head: [parseSelector]'s reading of a
-     *  `BlockNumberOrHash`, less a block hash (bare or `{"blockHash": …}`),
-     *  which names historical state this node does not hold. eth_call and
-     *  eth_estimateGas read every selector through it, so a refusal here is
-     *  the same in the handler and in the strict branch. */
-    private fun txBlock(param: JsonElement?, method: String): SelectorParse {
-        val parsed = parseSelector(param, 1, Takes.NUMBER_OR_HASH)
-        return if (parsed is SelectorParse.Ok && parsed.selector.hash) {
-            SelectorParse.Refuse("$method at a block hash is not supported (this node holds no historical state)")
-        } else {
-            parsed
-        }
     }
 
     /** The methods that take override parameters. `eth_call`, `eth_estimateGas`
@@ -796,11 +782,12 @@ class RpcRouter(
 
     /** A block selector as read: [value] is what the engine is handed — a tag,
      *  a 0x-number or a 0x-hash; [number] is set for a number, [hash] for a
-     *  hash. */
-    private class Selector(val value: String, val number: Long?, val hash: Boolean)
+     *  hash. [viaHash] is set on a number [resolveHash] made of a hash: the
+     *  hash the caller sent, for the refusal that names it. */
+    private class Selector(val value: String, val number: Long?, val hash: Boolean, val viaHash: String? = null)
 
     /** A selector, or why it is refused — for the transaction methods, whose
-     *  strict branch re-derives the refusal ([txBlock]), and for
+     *  strict branch re-derives the refusal ([callTx], [estimateTx]), and for
      *  [selectorAt], which raises it. */
     private sealed interface SelectorParse {
         class Ok(val selector: Selector) : SelectorParse
@@ -932,13 +919,68 @@ class RpcRouter(
         return json.encodeToString(JsonArray.serializer(), keys)
     }
 
-    /** A state read's selector (eth_getBalance, eth_getCode, …): a
-     *  `BlockNumberOrHash`, but a hash names a historical state this node does
-     *  not hold — refused, never answered from the head. */
-    private fun JsonArray?.stateSelectorAt(i: Int, method: String): Selector {
-        val sel = selectorAt(i, Takes.NUMBER_OR_HASH)
-        if (sel.hash) invalid("$method at a block hash is not supported (this node holds no historical state)")
-        return sel
+    /** A state read's block at params[[i]] (eth_getBalance, eth_getCode, …) as
+     *  the engine is handed it, or null when it cannot be served right now: a
+     *  `BlockNumberOrHash`, a hash resolved to its canonical block
+     *  ([resolveHash]), judged against the state window ([pinServable]). */
+    private suspend fun JsonArray?.stateBlockAt(i: Int, b: RpcBackend, method: String): Selector? =
+        stateBlock(selectorAt(i, Takes.NUMBER_OR_HASH), b, method)
+
+    /** [sel] as a state read or an `eth_call` is served at it, or null when it
+     *  cannot be right now: a hash resolved to its canonical block, then the
+     *  state window applied to the number ([pinServable]) exactly as to a
+     *  caller's own. */
+    private suspend fun stateBlock(sel: Selector, b: RpcBackend, method: String): Selector? =
+        resolveHash(sel, b, method)?.takeIf { pinServable(it, b, method) }
+
+    /**
+     * [sel] as the engine is handed it: a tag or a number unchanged; a block
+     * hash resolved to the NUMBER of the canonical block it names (#641), so a
+     * hash-pinned read (EIP-1898 clients pin every read to the hash of the
+     * block they just saw) is served exactly as that number is — the same state
+     * window, the same state-root verification — and never for another block:
+     *  - the engine resolves it ([RpcBackend.resolveBlockHash]): header only,
+     *    and only to a block the chain carries at its height as of the verified
+     *    head — the head at once, any other hash in one header window anchored
+     *    at it — so a block on a fork, or a hash the node cannot place, is the
+     *    verified "null". That is declined RETRYABLY (-32000), with the reason
+     *    naming the hash: the node cannot tell a block it has not verified YET
+     *    — a client a block ahead of it pins the hash it was just handed, and
+     *    this node holds that block seconds later — from one it never will,
+     *    and a number ahead of the window is retryable for the same reason.
+     *    Calling it invalid params would send a wallet to another provider
+     *    over this node's lag (the #314 failure);
+     *  - no answer right now (null, not synced / no peer): declined retryably,
+     *    as any read;
+     *  - the genesis block: refused for good, as block 0 is everywhere;
+     *  - a block whose hash is not the one asked (engine drift), or one without
+     *    a readable number (shape drift): declined retryably, each by name —
+     *    never served for another block.
+     * The number then goes through [pinServable] like a caller's own; outside
+     * the window the refusal names the hash and the block it is ([Selector.viaHash]).
+     */
+    private suspend fun resolveHash(sel: Selector, b: RpcBackend, method: String): Selector? {
+        if (!sel.hash) return sel
+        // [parseSelector] admitted exactly 0x + 64 hex digits, lowercased.
+        val hashBytes = ByteArray(32) { k -> sel.value.substring(2 + 2 * k, 4 + 2 * k).toInt(16).toByte() }
+        val blockJson = withContext(rpcIoDispatcher) { b.resolveBlockHash(hashBytes) }?.orEngineThrow()
+            ?: return null
+        if (blockJson.trim() == "null") {
+            throw EngineReadUnavailable("this node holds no block with hash ${sel.value} as canonical now — not " +
+                "reached yet (it may be ahead of the verified head), older than the blocks it can place, or on a fork")
+        }
+        val block = runCatching { json.parseToJsonElement(blockJson) }.getOrNull() as? JsonObject
+        val number = (block?.get("number") as? JsonPrimitive)?.contentOrNull
+            ?.takeIf { it.startsWith("0x") }?.substring(2)?.toLongOrNull(16)
+            ?: throw EngineReadUnavailable("malformed block from engine for block hash ${sel.value}")
+        if ((block["hash"] as? JsonPrimitive)?.contentOrNull?.lowercase() != sel.value) {
+            throw EngineReadUnavailable("the engine served another block for block hash ${sel.value}")
+        }
+        if (number == 0L) {
+            invalid("$method at block hash ${sel.value} is not supported: it is block 0 (genesis), which this " +
+                "node holds no state for")
+        }
+        return Selector("0x" + number.toString(16), number = number, hash = false, viaHash = sel.value)
     }
 
     /**
@@ -955,7 +997,8 @@ class RpcRouter(
      *  - otherwise the engine's: inside the window it serves head state, the
      *    documented near-head trade-off (#382); ahead of it, a retryable refusal
      *    (the head may yet reach it).
-     * A tag or hash is never judged here ([true]).
+     * A tag is never judged here ([true]); a hash arrives resolved to its
+     * block's number ([resolveHash]) and is judged as that number.
      */
     private suspend fun pinServable(sel: Selector, b: RpcBackend, method: String): Boolean {
         val n = sel.number ?: return true
@@ -963,7 +1006,8 @@ class RpcRouter(
         if (n < head - RpcBlockWindow.BLOCK_NUM_LAG_TOLERANCE) {
             val lowest = reportedHeads.lowest()
             if (lowest != null && n >= lowest) return false
-            invalid("$method at block $n is not supported: it is more than " +
+            val asked = sel.viaHash?.let { "block hash $it (block $n)" } ?: "block $n"
+            invalid("$method at $asked is not supported: it is more than " +
                 "${RpcBlockWindow.BLOCK_NUM_LAG_TOLERANCE} blocks behind the verified head ($head), and this " +
                 "node holds no historical state")
         }
@@ -1143,10 +1187,11 @@ class RpcRouter(
                 // an expensive refusal where there used to be a free one, and
                 // reported as retryable though it is permanent for that build.
                 if (to == null && backend?.supportsContractCreation() != true) return null
-                // A pin behind the state window is judged here ([pinServable],
-                // #366), against the head as of dispatch, so the strict branch's
-                // re-derivation ([callTx]) stays a pure function of the request.
-                if (!pinServable(serve.selector, b, "eth_call")) return null
+                // A block hash is resolved to its canonical block, and a pin behind
+                // the state window judged, here ([stateBlock], #366, #641) — against
+                // the head as of dispatch, so the strict branch's re-derivation
+                // ([callTx]) stays a pure function of the request.
+                val block = stateBlock(serve.selector, b, "eth_call") ?: return null
                 // The caller (msg.sender): absent/null is anonymous (the backend uses
                 // the zero-address default). Threading it is what lets a wallet's
                 // confirm-screen simulation of a sender-gated call (ERC-20
@@ -1158,10 +1203,10 @@ class RpcRouter(
                     if (tx.hasExtendedFields) {
                         // Gas, fees or lists: only the transaction-object call
                         // applies them.
-                        b.callTx(tx, serve.block, overrideJson)
+                        b.callTx(tx, block.value, overrideJson)
                     } else {
                         // Nothing beyond from/to/data/value: the plain call, as always.
-                        b.callDetailed(tx.from, to, tx.data, tx.valueWei, serve.block, overrideJson)
+                        b.callDetailed(tx.from, to, tx.data, tx.valueWei, block.value, overrideJson)
                     }
                 }
                 when (outcome.kind) {
@@ -1188,28 +1233,28 @@ class RpcRouter(
                 }
             }
             // The state reads: every param applied or refused (#366) — a malformed
-            // one is -32602, never the retryable "cannot be served right now" — and
-            // a block pinned behind the state window refused before the engine is
-            // asked ([pinServable]).
+            // one is -32602, never the retryable "cannot be served right now" — a
+            // block hash resolved to the canonical block it names (#641), and a
+            // block pinned behind the state window refused before the engine is
+            // asked ([stateBlockAt]).
             "eth_getBalance" -> {
                 val p = root.params()
                 val addr = p.addressAt(0)
-                val sel = p.stateSelectorAt(1, "eth_getBalance").takeIf { pinServable(it, b, "eth_getBalance") } ?: return null
+                val sel = p.stateBlockAt(1, b, "eth_getBalance") ?: return null
                 val bal = withContext(rpcIoDispatcher) { b.getBalance(addr, sel.value) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexQuantityDecimal(bal)))
             }
             "eth_getTransactionCount" -> {
                 val p = root.params()
                 val addr = p.addressAt(0)
-                val sel = p.stateSelectorAt(1, "eth_getTransactionCount")
-                    .takeIf { pinServable(it, b, "eth_getTransactionCount") } ?: return null
+                val sel = p.stateBlockAt(1, b, "eth_getTransactionCount") ?: return null
                 val nonce = withContext(rpcIoDispatcher) { b.getTransactionCount(addr, sel.value) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexQuantity(nonce)))
             }
             "eth_getCode" -> {
                 val p = root.params()
                 val addr = p.addressAt(0)
-                val sel = p.stateSelectorAt(1, "eth_getCode").takeIf { pinServable(it, b, "eth_getCode") } ?: return null
+                val sel = p.stateBlockAt(1, b, "eth_getCode") ?: return null
                 val code = withContext(rpcIoDispatcher) { b.getCode(addr, sel.value) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexData(code)))
             }
@@ -1218,7 +1263,7 @@ class RpcRouter(
                 val addr = p.addressAt(0)
                 val slot = p.required(1, "storage slot").asWord32()
                     ?: invalid("invalid argument 1: expected a storage slot (a hex quantity or 32-byte word)")
-                val sel = p.stateSelectorAt(2, "eth_getStorageAt").takeIf { pinServable(it, b, "eth_getStorageAt") } ?: return null
+                val sel = p.stateBlockAt(2, b, "eth_getStorageAt") ?: return null
                 val v = withContext(rpcIoDispatcher) { b.getStorageAt(addr, slot, sel.value) } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexData(v)))
             }
@@ -1228,15 +1273,18 @@ class RpcRouter(
             // for a near-head number as the reads above have it, because the
             // caller checks the proofs against that block's own stateRoot. So no
             // [pinServable] here: its window would refuse the finalized block's
-            // number, more than 64 blocks back on mainnet. An engine that serves
-            // no proofs declines here, and the strict branch refuses it for
-            // good, ahead of any field.
+            // number, more than 64 blocks back on mainnet. A block hash goes to
+            // the engine AS a hash (ABI 47, #641): the engine pins the proof to
+            // that block's attested root in one read, where resolving the hash
+            // here first would leave a window in which a reorg puts another block
+            // at the number. An engine that serves no proofs declines here, and
+            // the strict branch refuses it for good, ahead of any field.
             "eth_getProof" -> {
                 if (!b.supportsProofs()) return null
                 val p = root.params()
                 val addr = p.addressAt(0)
                 val keys = p.storageKeysAt(1)
-                val sel = p.stateSelectorAt(2, "eth_getProof")
+                val sel = p.selectorAt(2, Takes.NUMBER_OR_HASH)
                 val proofJson = withContext(rpcIoDispatcher) { b.getProof(addr, keys, sel.value) }
                     ?.orEngineThrow() ?: return null
                 resultEnvelope(id, json.parseToJsonElement(proofJson))
@@ -1456,8 +1504,8 @@ class RpcRouter(
                 val serve = callTx(root, "eth_createAccessList") as? CallTx.Serve ?: return null
                 if (serve.tx.to == null && !b.supportsContractCreation()) return null
                 if (!b.supportsAccessListCreation()) return null
-                if (!pinServable(serve.selector, b, "eth_createAccessList")) return null
-                val outcome = withContext(rpcIoDispatcher) { b.createAccessList(serve.tx, serve.block, overrideJson) }
+                val block = stateBlock(serve.selector, b, "eth_createAccessList") ?: return null
+                val outcome = withContext(rpcIoDispatcher) { b.createAccessList(serve.tx, block.value, overrideJson) }
                 when (outcome.kind) {
                     RpcAccessListResult.Kind.OK -> {
                         // geth's result: the list, the gas the run made with it
@@ -1508,8 +1556,8 @@ class RpcRouter(
                 val overrideJson = stateOverrideJson(root)
                 if (overrideJson != null && !b.supportsStateOverrides()) return null
                 val serve = estimateTx(root) as? EstimateTx.Serve ?: return null
-                if (!pinServable(serve.selector, b, "eth_estimateGas")) return null
-                val outcome = withContext(rpcIoDispatcher) { b.estimateGasTx(serve.tx, serve.block, overrideJson) }
+                val block = stateBlock(serve.selector, b, "eth_estimateGas") ?: return null
+                val outcome = withContext(rpcIoDispatcher) { b.estimateGasTx(serve.tx, block.value, overrideJson) }
                 when (outcome.kind) {
                     RpcCallResult.Kind.OK ->
                         resultEnvelope(id, JsonPrimitive(hexQuantity(outcome.gas ?: return null)))

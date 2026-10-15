@@ -738,6 +738,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_request_account_json(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_resolve_block_hash_json(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_resolve_ens_json(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_resume_handle(
@@ -842,6 +844,8 @@ internal object UniffiLib {
     external fun uniffi_myotis_engine_fn_func_read_stats_json(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_request_account_json(`handle`: Long,`address`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_resolve_block_hash_json(`handle`: Long,`blockHashHex`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_resolve_ens_json(`handle`: Long,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1054,7 +1058,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_myotis_engine_checksum_func_get_logs_json() and 0xFFFF) != 29899) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if ((lib.uniffi_myotis_engine_checksum_func_get_proof_json() and 0xFFFF) != 51465) {
+    if ((lib.uniffi_myotis_engine_checksum_func_get_proof_json() and 0xFFFF) != 23140) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_get_storage_at_json() and 0xFFFF) != 41050) {
@@ -1085,6 +1089,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_request_account_json() and 0xFFFF) != 48343) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_myotis_engine_checksum_func_resolve_block_hash_json() and 0xFFFF) != 60207) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_resolve_ens_json() and 0xFFFF) != 48380) {
@@ -1766,8 +1773,8 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
          * `{"error","code":-32602}`. `keys` is the JSON array of storage keys as the
          * request carried them (empty = none); `block` is applied or refused by the
          * proof pin rules — a head tag, `finalized`, or the number of the head, of
-         * one of the recent heads before it, or of the finalized block (see
-         * `crate::host::get_proof_json`).
+         * one of the recent heads before it, or of the finalized block, or (ABI ≥ 47)
+         * the hash of one of those blocks (see `crate::host::get_proof_json`).
          */ fun `getProofJson`(`handle`: kotlin.Long, `address`: kotlin.String, `keys`: kotlin.String, `block`: kotlin.String): kotlin.String {
             return FfiConverterString.lift(
     uniffiRustCall() { _status ->
@@ -1947,6 +1954,24 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         FfiConverterLong.lower(`handle`),
         FfiConverterString.lower(`address`),
         FfiConverterString.lower(`block`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * The canonical block a block hash names (ABI ≥ 47, #641): `{"hash","number"}`,
+         * the literal `"null"` (not a canonical block this node holds now), `{"error"}`
+         * (cannot tell right now), or `{"error","code":-32602}` for a malformed hash.
+         * Header-only; see `crate::host::resolve_block_hash_json`.
+         */ fun `resolveBlockHashJson`(`handle`: kotlin.Long, `blockHashHex`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_resolve_block_hash_json(
+    
+        
+        FfiConverterLong.lower(`handle`),
+        FfiConverterString.lower(`blockHashHex`),_status)
 }
     )
     }

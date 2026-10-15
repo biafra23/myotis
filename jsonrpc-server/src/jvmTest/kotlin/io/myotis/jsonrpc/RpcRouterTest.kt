@@ -1090,8 +1090,12 @@ class RpcRouterTest {
 
     // ---- eth_getProof (EIP-1186, Rust engine) ---------------------------------------
 
-    /** A backend that serves proofs, recording what the router handed it. */
-    private class ProofBackend(private val answer: String?) : VerifiedReads by FakeBackend() {
+    /** A backend that serves proofs, recording what the router handed it;
+     *  everything else is [delegate]'s. */
+    private class ProofBackend(
+        private val answer: String?,
+        delegate: FakeBackend = FakeBackend(),
+    ) : VerifiedReads by delegate {
         var lastAddress: ByteArray? = null
         var lastKeys: String? = null
         var lastBlock: String? = null
@@ -1127,6 +1131,17 @@ class RpcRouterTest {
         // 64-block window before the engine is asked.
         route(b, proofRequest("""["0x${"11".repeat(20)}",[],"0x10"]"""))
         assertEquals("0x10", b.lastBlock)
+        // A block hash goes to the engine AS a hash (ABI 47, #641), never resolved
+        // here first: the engine pins the proof to that block's attested root in
+        // one read, so no reorg can put another block at its number in between.
+        val delegate = FakeBackend().apply { blockByHashJson = blockJsonAt("0x10") }
+        val byHash = ProofBackend(proofResult, delegate)
+        route(byHash, proofRequest("""["0x${"11".repeat(20)}",[],"$someHash"]"""))
+        assertEquals(someHash, byHash.lastBlock)
+        assertNull(delegate.lastBlockHash, "the hash was resolved by the router")
+        // ...and the EIP-1898 object form the same way.
+        route(byHash, proofRequest("""["0x${"11".repeat(20)}",[],{"blockHash":"$someHash"}]"""))
+        assertEquals(someHash, byHash.lastBlock)
     }
 
     /** Malformed requests are refused for good, before the engine is asked. */
@@ -1554,8 +1569,6 @@ class RpcRouterTest {
         val tx = """{"to":"0x2222222222222222222222222222222222222222"}"""
         listOf(
             "\"earliest\"",
-            "\"0x" + "ab".repeat(32) + "\"",
-            """{"blockHash":"0x${"ab".repeat(32)}"}""",
             "5",
             "\"latest-ish\"",
         ).forEach { selector ->
@@ -1681,7 +1694,6 @@ class RpcRouterTest {
     @Test fun ethCall_objectBlockSelector_isAppliedOrRefused() {
         val tx = """{"to":"0x2222222222222222222222222222222222222222"}"""
         listOf(
-            """{"blockHash":"0x${"ab".repeat(32)}"}""",
             """{"blockNumber":"earliest"}""",
             """{"blockNumber":5}""",
             "[]",
@@ -1995,16 +2007,169 @@ class RpcRouterTest {
         assertEquals("0xff", b.lastStateBlock)
     }
 
-    @Test fun stateReads_blockHash_isRefused_neverAnsweredFromTheHead() {
+    /** An `eth_getBlockByHash` answer for [number] carrying [hash]. */
+    private fun blockJsonAt(number: String, hash: String = someHash) =
+        """{"number":"$number","hash":"$hash","transactions":[]}"""
+
+    private fun balanceAt(selector: String) =
+        """{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["$vitalik",$selector]}"""
+
+    @Test fun stateReads_blockHash_isAppliedAsTheCanonicalBlockItNames() {
+        // EIP-1898 clients pin every read to the hash of the block they just saw
+        // (#641). The hash is resolved through the engine's own eth_getBlockByHash
+        // — both engines serve only a verified, still-canonical block there —
+        // and the read is served exactly as that block's number is: the same
+        // window, the same verification, never another block.
         for (selector in listOf("""{"blockHash":"$someHash"}""", "\"$someHash\"",
                 """{"blockHash":"$someHash","requireCanonical":true}""")) {
             for (method in listOf("eth_getBalance", "eth_getCode", "eth_getTransactionCount")) {
-                val b = FakeBackend(balance = BigInteger.ONE, code = ByteArray(0), nonce = 1)
+                val b = FakeBackend(balance = BigInteger.ONE, code = ByteArray(0), nonce = 1, head = 0x100)
+                    .apply { blockByHashJson = blockJsonAt("0x100") }
                 val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"$method","params":["$vitalik",$selector]}""")
-                assertEquals(-32602, errorCode(resp), "$method $selector -> $resp")
-                assertNull(b.lastStateBlock, "$method $selector reached the engine")
+                assertTrue(!hasError(resp), "$method $selector -> $resp")
+                assertEquals("0x100", b.lastStateBlock, "$method $selector")
+                assertEquals(someHash, "0x" + b.lastBlockHash!!.joinToString("") { "%02x".format(it) })
+                assertEquals(false, b.lastFullTx)
             }
         }
+        // Inside the window: that block's number, as a caller's own would be.
+        val inWindow = FakeBackend(balance = BigInteger.ONE).apply { blockByHashJson = blockJsonAt("0xc0") }
+        assertEquals("0x1", result(route(inWindow, balanceAt("\"$someHash\""))))
+        assertEquals("0xc0", inWindow.lastStateBlock)
+        val storage = FakeBackend(storage = ByteArray(32)).apply { blockByHashJson = blockJsonAt("0x100") }
+        val stored = route(storage,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_getStorageAt","params":["$vitalik","0x0","$someHash"]}""")
+        assertTrue(!hasError(stored), stored)
+        assertEquals("0x100", storage.lastStateBlock)
+    }
+
+    @Test fun stateReads_blockHashBehindTheWindow_isRefused_namingTheHash() {
+        // The same window as for a number: behind it, permanent, the engine never
+        // asked for state — and the refusal names the hash the caller sent.
+        val b = FakeBackend(balance = BigInteger.ONE).apply { blockByHashJson = blockJsonAt("0x10") }
+        val resp = route(b, balanceAt("\"$someHash\""))
+        assertEquals(-32602, errorCode(resp), resp)
+        val msg = errorMessageOf(resp)
+        assertTrue(msg.contains(someHash) && msg.contains("(block 16)") && msg.contains("behind the verified head"), msg)
+        assertNull(b.lastStateBlock)
+        // ...unless at or above a head this node reported: retryable, as for a number.
+        val reported = FakeBackend(balance = BigInteger.ONE, head = 0x10).apply { blockByHashJson = blockJsonAt("0x10") }
+        val router = RpcRouter(null, MethodLogger(), VerifiedReadsBackend(reported))
+        fun ask(body: String) = runBlocking { router.handle(body) }
+        assertEquals("0x10", result(ask("""{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}""")))
+        reported.head = 0x1000
+        val moved = ask(balanceAt("\"$someHash\""))
+        assertEquals(-32000, errorCode(moved), moved)
+        assertNull(reported.lastStateBlock)
+    }
+
+    @Test fun stateReads_unknownOrForkBlockHash_isDeclined_neverAnsweredFromTheHead() {
+        // Both engines answer eth_getBlockByHash "null" for a hash they never
+        // verified and for one the chain no longer carries at its height (a
+        // fork) — and for a block they have not verified YET, which a client a
+        // block ahead pins. Declined retryably, by name, never served from the
+        // head: a wallet must not leave the node over its own lag.
+        for (method in listOf("eth_getBalance", "eth_getCode", "eth_getTransactionCount")) {
+            val b = FakeBackend(balance = BigInteger.ONE, code = ByteArray(0), nonce = 1).apply { blockByHashJson = "null" }
+            val resp = route(b, """{"jsonrpc":"2.0","id":1,"method":"$method","params":["$vitalik","$someHash"]}""")
+            assertEquals(-32000, errorCode(resp), "$method -> $resp")
+            assertTrue(errorMessageOf(resp).contains("holds no block with hash $someHash"), resp)
+            assertNull(b.lastStateBlock, "$method reached the engine")
+        }
+        // The genesis block is refused for good, as block 0 is everywhere.
+        val genesis = FakeBackend(balance = BigInteger.ONE).apply { blockByHashJson = blockJsonAt("0x0") }
+        val r0 = route(genesis, balanceAt("\"$someHash\""))
+        assertEquals(-32602, errorCode(r0), r0)
+        assertTrue(errorMessageOf(r0).contains("genesis"), r0)
+        assertNull(genesis.lastStateBlock)
+        // No answer right now (not synced, no peer): retryable, as any read.
+        val unavailable = FakeBackend(balance = BigInteger.ONE).apply { blockByHashJson = null }
+        assertEquals(-32000, errorCode(route(unavailable, balanceAt("\"$someHash\""))))
+        assertNull(unavailable.lastStateBlock)
+        // The engine's error envelope keeps its class.
+        val envelope = FakeBackend(balance = BigInteger.ONE).apply { blockByHashJson = """{"error":"no snap peer"}""" }
+        assertEquals(-32000, errorCode(route(envelope, balanceAt("\"$someHash\""))))
+        // A block the engine served for another hash (drift) is never served as
+        // the one asked; a block without a readable number is shape drift. Each
+        // is declined by name.
+        val drift = FakeBackend(balance = BigInteger.ONE)
+            .apply { blockByHashJson = blockJsonAt("0x100", hash = "0x" + "cd".repeat(32)) }
+        val drifted = route(drift, balanceAt("\"$someHash\""))
+        assertEquals(-32000, errorCode(drifted), drifted)
+        assertTrue(errorMessageOf(drifted).contains("served another block"), drifted)
+        assertNull(drift.lastStateBlock)
+        val shape = FakeBackend(balance = BigInteger.ONE).apply { blockByHashJson = blockJsonAt("256") }
+        val malformed = route(shape, balanceAt("\"$someHash\""))
+        assertEquals(-32000, errorCode(malformed), malformed)
+        assertTrue(errorMessageOf(malformed).contains("malformed block"), malformed)
+        assertNull(shape.lastStateBlock)
+        // A malformed hash is a parameter error, before any engine read.
+        for (bad in listOf("\"0x${"ab".repeat(31)}\"", "\"0x${"ab".repeat(31)}zz\"",
+                """{"blockHash":"0x1234"}""", """{"blockHash":"$someHash","requireCanonical":"yes"}""")) {
+            val b = FakeBackend(balance = BigInteger.ONE).apply { blockByHashJson = blockJsonAt("0x100") }
+            assertEquals(-32602, errorCode(route(b, balanceAt(bad))), bad)
+            assertNull(b.lastBlockHash, bad)
+            assertNull(b.lastStateBlock, bad)
+        }
+    }
+
+    @Test fun aHeaderOnlyResolve_isPreferredOverTheBlockRead() {
+        // An engine that resolves a hash header-only (both engines, ABI 47) is asked
+        // that, never for the block: no body is fetched to learn a number.
+        val b = object : VerifiedReads by FakeBackend(balance = BigInteger.ONE) {
+            var resolved: ByteArray? = null
+            override fun resolveBlockHash(blockHash32: ByteArray): String {
+                resolved = blockHash32; return """{"hash":"$someHash","number":"0xff"}"""
+            }
+            override fun getBlockByHash(blockHash32: ByteArray, fullTransactions: Boolean): String =
+                error("the router fetched the block to resolve a hash")
+            var asked: String? = null
+            override fun getBalance(address: ByteArray, block: String): String { asked = block; return "1" }
+        }
+        assertEquals("0x1", result(route(b, balanceAt("\"$someHash\""))))
+        assertEquals("0xff", b.asked)
+        assertEquals(someHash, "0x" + b.resolved!!.joinToString("") { "%02x".format(it) })
+    }
+
+    @Test fun transactionMethods_blockHash_isAppliedAsTheCanonicalBlockItNames() {
+        // eth_call, eth_estimateGas and eth_createAccessList share the state
+        // reads' rule (#641): the hash resolved, the number judged, the engine
+        // handed the number.
+        val call = FakeBackend(callResult = byteArrayOf(0x2a)).apply { blockByHashJson = blockJsonAt("0x100") }
+        assertEquals("0x2a", result(route(call,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"$vitalik"},"$someHash"]}""")))
+        assertEquals("0x100", call.lastBlock)
+        val objectForm = FakeBackend(callResult = byteArrayOf(0x2a)).apply { blockByHashJson = blockJsonAt("0xc0") }
+        assertEquals("0x2a", result(route(objectForm,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"$vitalik"},{"blockHash":"$someHash"}]}""")))
+        assertEquals("0xc0", objectForm.lastBlock)
+        val estimate = FakeBackend().apply {
+            txEstimate = io.myotis.api.EstimateResult.ok(21_000L); blockByHashJson = blockJsonAt("0xff")
+        }
+        assertEquals("0x5208", result(route(estimate,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas","params":[{"to":"$vitalik"},"$someHash"]}""")))
+        assertEquals("0xff", estimate.lastTxBlock)
+        val lists = FakeBackend().apply {
+            buildsLists = true
+            accessList = io.myotis.api.AccessListResult.ok("[]", 21_000L, null, null)
+            blockByHashJson = blockJsonAt("0x100")
+        }
+        val listed = route(lists,
+            """{"jsonrpc":"2.0","id":1,"method":"eth_createAccessList","params":[{"to":"$vitalik"},"$someHash"]}""")
+        assertTrue(!hasError(listed), listed)
+        assertEquals("0x100", lists.lastTxBlock)
+        // Behind the window: refused for good; a hash this node does not hold:
+        // declined retryably — the engine never asked, strict mode names why.
+        val behind = FakeBackend(callResult = byteArrayOf(1)).apply { blockByHashJson = blockJsonAt("0x10") }
+        val r1 = route(behind, """{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"$vitalik"},"$someHash"]}""")
+        assertEquals(-32602, errorCode(r1), r1)
+        assertTrue(errorMessageOf(r1).contains(someHash), r1)
+        assertNull(behind.lastBlock)
+        val unknown = FakeBackend().apply { txEstimate = io.myotis.api.EstimateResult.ok(21_000L); blockByHashJson = "null" }
+        val r2 = route(unknown, """{"jsonrpc":"2.0","id":1,"method":"eth_estimateGas","params":[{"to":"$vitalik"},"$someHash"]}""")
+        assertEquals(-32000, errorCode(r2), r2)
+        assertTrue(errorMessageOf(r2).contains("holds no block with hash"), r2)
+        assertNull(unknown.lastTx)
     }
 
     @Test fun selectors_outOfSpecForms_areRefused_onEveryMethodThatTakesOne() {

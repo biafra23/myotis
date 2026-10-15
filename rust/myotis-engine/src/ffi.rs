@@ -207,8 +207,8 @@ pub fn get_storage_at_json(
 /// `{"error","code":-32602}`. `keys` is the JSON array of storage keys as the
 /// request carried them (empty = none); `block` is applied or refused by the
 /// proof pin rules — a head tag, `finalized`, or the number of the head, of
-/// one of the recent heads before it, or of the finalized block (see
-/// `crate::host::get_proof_json`).
+/// one of the recent heads before it, or of the finalized block, or (ABI ≥ 47)
+/// the hash of one of those blocks (see `crate::host::get_proof_json`).
 #[uniffi::export]
 pub fn get_proof_json(handle: i64, address: String, keys: String, block: String) -> String {
     crate::host::get_proof_json(handle, &address, &keys, &block)
@@ -359,6 +359,15 @@ pub fn pending_nonce_overlay(handle: i64, address_hex: String, mined_nonce: i64)
 #[uniffi::export]
 pub fn get_transaction_by_hash_json(handle: i64, tx_hash_hex: String) -> String {
     crate::host::get_transaction_by_hash_json(handle, &tx_hash_hex)
+}
+
+/// The canonical block a block hash names (ABI ≥ 47, #641): `{"hash","number"}`,
+/// the literal `"null"` (not a canonical block this node holds now), `{"error"}`
+/// (cannot tell right now), or `{"error","code":-32602}` for a malformed hash.
+/// Header-only; see `crate::host::resolve_block_hash_json`.
+#[uniffi::export]
+pub fn resolve_block_hash_json(handle: i64, block_hash_hex: String) -> String {
+    crate::host::resolve_block_hash_json(handle, &block_hash_hex)
 }
 
 /// Verified `eth_getBlockByHash` (hashes this engine has already verified).

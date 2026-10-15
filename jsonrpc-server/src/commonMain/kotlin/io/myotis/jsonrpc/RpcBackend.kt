@@ -241,6 +241,15 @@ interface RpcBackend {
     fun getLogs(filterJson: String): String? = null
     fun getBlockByNumber(block: String, fullTransactions: Boolean): String?
     fun getBlockByHash(blockHash32: ByteArray, fullTransactions: Boolean): String?
+
+    /**
+     * The canonical block a block hash names (`io.myotis.api.VerifiedReads.resolveBlockHash`,
+     * #641), for resolving a state read or an `eth_call` pinned to a hash: an object
+     * carrying the block's `hash` and `number`, the literal `"null"` (no canonical block
+     * this engine holds now has that hash), an `{"error": ...}` envelope, or null.
+     * Default: [getBlockByHash] without transactions, whose block object carries both.
+     */
+    fun resolveBlockHash(blockHash32: ByteArray): String? = getBlockByHash(blockHash32, false)
     fun gasPrice(): String?
     fun maxPriorityFeePerGas(): String?
     fun feeHistory(blockCount: Long, newestBlock: String, rewardPercentiles: DoubleArray?): String?

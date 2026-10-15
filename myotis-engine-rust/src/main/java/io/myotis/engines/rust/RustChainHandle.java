@@ -982,8 +982,10 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      *  {@code {"status":"revert","dataHex"}} / {@code {"status":"unavailable",
      *  "reason"}}, each with {@code blockNumber} (the block the call ran
      *  against) and {@code verified} (ran against the beacon-finalized block)
-     *  since ABI 30 — all pinned by the eljson golden tests; the two extra keys
-     *  are not surfaced through {@link io.myotis.api.CallResult} yet. A revert
+     *  since ABI 30 — all pinned by the eljson golden tests; an answered call
+     *  ({@code ok}/{@code revert}) carries {@code blockNumber} on into
+     *  {@link io.myotis.api.CallResult#blockNumber}, {@code verified} is not
+     *  surfaced. A revert
      *  is a VERIFIED answer whose payload the host serves as the standard
      *  code-3 error. The permanent {@code {"error","code":-32602}} envelope (a
      *  block the node will never serve since ABI 27, an executor refusal since
@@ -1001,12 +1003,13 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         throwIfError(o);
         try {
             String status = stringOrNull(o, "status");
+            long block = o.getLong("blockNumber", -1L);
             if ("ok".equals(status)) {
                 // 0x / empty → empty bytes
-                return io.myotis.api.CallResult.ok(hexToBytes(stringOrNull(o, "resultHex")));
+                return io.myotis.api.CallResult.ok(hexToBytes(stringOrNull(o, "resultHex"))).atBlock(block);
             }
             if ("revert".equals(status)) {
-                return io.myotis.api.CallResult.reverted(hexToBytes(stringOrNull(o, "dataHex")));
+                return io.myotis.api.CallResult.reverted(hexToBytes(stringOrNull(o, "dataHex"))).atBlock(block);
             }
             if ("infeasible".equals(status)) {
                 String reason = stringOrNull(o, "reason");
@@ -1256,7 +1259,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      * engine's {@code {"error"}} / {@code {"error","code":-32602}} envelope, passed
      * through for the router to classify. {@code keysJson} is the JSON array of
      * storage keys as the request carried them; {@code block} is held to the proof
-     * pin rules (the verified head, a recent head or the finalized block, exactly). Throws
+     * pin rules (the verified head, a recent head or the finalized block, exactly — by
+     * tag, number or, since ABI 47, block hash). Throws
      * {@link EngineException} on a transport / not-running failure.
      */
     String proofJson(String hexAddress, String keysJson, String block) {
@@ -1319,6 +1323,18 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         return blockJsonOrThrow(
                 gated(() -> RustEngineNative.nativeGetBlockByHashJson(
                         handle, blockHashHex, fullTransactions)));
+    }
+
+    /**
+     * The canonical block a block hash names (ABI 47, #641): {@code {"hash","number"}},
+     * the literal {@code "null"} (no canonical block this engine holds now has that hash),
+     * or throws {@link EngineException} when it cannot tell (transport / not-running /
+     * an error envelope). Header only — no body, and the block need not have been served.
+     */
+    String resolveBlockHashJson(String blockHashHex) {
+        return jsonObjectOrThrow(
+                gated(() -> RustEngineNative.nativeResolveBlockHashJson(handle, blockHashHex)),
+                "resolved block");
     }
 
     /**

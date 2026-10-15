@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 46; // 46: get_proof_json; 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
+    static final int EXPECTED_ABI_VERSION = 47; // 47: resolve_block_hash_json, get_proof_json takes a block hash; 46: get_proof_json; 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
 
     private static final boolean AVAILABLE = load();
 
@@ -407,6 +407,12 @@ final class RustEngineNative {
     /** Verified {@code eth_getTransactionByHash} (tx JSON / "null" / error). */
     static String nativeGetTransactionByHashJson(long handle, String txHashHex) {
         return Myotis_engineKt.getTransactionByHashJson(handle, nz(txHashHex));
+    }
+
+    /** The canonical block a block hash names (ABI 47, #641): {@code {"hash","number"}},
+     *  the {@code "null"} literal, or an error envelope — header only. */
+    static String nativeResolveBlockHashJson(long handle, String blockHashHex) {
+        return Myotis_engineKt.resolveBlockHashJson(handle, nz(blockHashHex));
     }
 
     /** Verified {@code eth_getBlockByHash} (block JSON / "null" / error). */
