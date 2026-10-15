@@ -294,6 +294,144 @@ subprojects {
 }
 
 // -------------------------------------------------------------------------
+// Publishing: the engine library and the modules it is built from.
+//
+// `:myotis-engine` (the Android AAR + the desktop jar, docs/android-library.md)
+// is consumed OUTSIDE this build — a separate wallet product is the first
+// consumer — so it is published as Maven artifacts, and with it every project
+// module its POMs reach: a consumer resolving the AAR needs them from the same
+// repository. That closure is exactly the Rust-engine half of the tree, none of
+// the Java engine (node-core, networking, consensus, Besu) and no Ktor server.
+// Coordinates: `io.myotis:<artifactId>` — the published packages are io.myotis.*,
+// and `com.jaeckel.ethp2p` (the Gradle group of everything else, the apps'
+// package id) stays the apps' name, not the library's.
+//
+// Where they go:
+//   - GitHub Packages (the `GitHubPackages` repository below), on every `v*` tag
+//     by .github/workflows/engine-library.yml; reading it needs a GitHub token
+//     with read:packages even for a public repository (GitHub's rule).
+//   - The `Staging` repository: build/maven-repo, a complete local Maven
+//     repository of just these artifacts. The workflow zips it as a release
+//     asset next to the bare AAR, so a consumer that wants no GitHub token can
+//     point Gradle at the unzipped directory (third-party dependencies still
+//     come from Maven Central); it is also what the publication checks
+//     (scripts/check_engine_library.sh) read.
+//   - ~/.m2 via the standard publishToMavenLocal, for a consumer under development.
+//
+// Versions: by default the artifacts carry project.version (X.Y.Z-SNAPSHOT),
+// which is right for publishToMavenLocal from a working tree. -PpublishRelease
+// drops the suffix: the workflow passes it on every run, so the staged layout is
+// the one a tag publishes (X.Y.Z file names — Gradle stages a SNAPSHOT under
+// Maven's timestamped names, which the check does not read). On a tag it is
+// -PpublishRelease=<the tag's version>: vX.Y.Z publishes X.Y.Z and an rc/hotfix
+// tag vX.Y.Z-<suffix> (a shape the version guard accepts) publishes
+// X.Y.Z-<suffix> — never the final X.Y.Z coordinates, which GitHub Packages
+// could not replace once the real release comes. The value must be the release
+// version or the release version plus a `-suffix`, the guard's own rule, so a
+// mis-typed flag fails here rather than publishing a version the tree does not
+// build. It applies to the published modules only, so nothing else in the build
+// (the apps' versions, verifyCrateVersions) sees a different project.version.
+//
+// The two Kotlin Multiplatform modules get their publications from the Kotlin
+// plugin (one per target plus the `kotlinMultiplatform` root, which carries the
+// Gradle module metadata a consumer's variant selection needs — Android picks
+// the `-android` AAR, the desktop jar `-jvm`; Maven consumers without module
+// metadata must name the target artifact). The plain Java modules get one
+// publication each from their `java` component, sources jar included.
+val publishedArtifactIds = mapOf(
+    "myotis-api" to "myotis-api",
+    // `core` is a name a consumer's dependency graph could meet elsewhere.
+    "core" to "myotis-core",
+    "myotis-engine-common" to "myotis-engine-common",
+    "myotis-rpc-policy" to "myotis-rpc-policy",
+    "myotis-engine-rust" to "myotis-engine-rust",
+    "myotis-engine" to "myotis-engine",
+)
+val publishedDescriptions = mapOf(
+    "myotis-api" to "The Myotis engine contract: the zero-dependency Java 17 interfaces every host consumes",
+    "core" to "Myotis core types and the minSdk-29-safe JDK shims the engine modules share",
+    "myotis-engine-common" to "The lifecycle primitives the Myotis engine handles wire (WakeGate, SleepMetrics)",
+    "myotis-rpc-policy" to "The JSON-RPC serving policy (block window, web-page access) with no server attached",
+    "myotis-engine-rust" to "The Myotis Rust engine behind the engine contract, over UniFFI bindings and JNA",
+    "myotis-engine" to "The Myotis engine library: the Rust light-client engine for Android (AAR) and desktop JVM (jar)",
+)
+val publishedVersion: String? = providers.gradleProperty("publishRelease").orNull?.let { requested ->
+    if (requested.isEmpty()) {
+        releaseVersion
+    } else {
+        require(requested == releaseVersion || requested.startsWith("$releaseVersion-")) {
+            "-PpublishRelease=$requested does not match the release version $releaseVersion " +
+                "(accepted: $releaseVersion, or $releaseVersion-<suffix>)"
+        }
+        requested
+    }
+}
+val stagingRepository = layout.buildDirectory.dir("maven-repo")
+configure(subprojects.filter { it.name in publishedArtifactIds }) {
+    apply(plugin = "maven-publish")
+    group = "io.myotis"
+    if (publishedVersion != null) version = publishedVersion
+    val publishedArtifactId = publishedArtifactIds.getValue(name)
+    val publishedDescription = publishedDescriptions.getValue(name)
+
+    // The Kotlin Multiplatform plugin registers its publications itself (and
+    // names them after the project, which these two already carry); the Java
+    // modules need theirs created, and `core` renamed. `java` is applied by the
+    // subprojects block above, so the component exists here; `java-library` in
+    // the module's own script extends the same component with `api`.
+    if (name !in setOf("myotis-rpc-policy", "myotis-engine")) {
+        extensions.configure<JavaPluginExtension> { withSourcesJar() }
+        extensions.configure<PublishingExtension> {
+            publications.create<MavenPublication>("maven") {
+                artifactId = publishedArtifactId
+                from(components["java"])
+            }
+        }
+    }
+
+    extensions.configure<PublishingExtension> {
+        // Every publication of the module (one, or one per Kotlin target) gets
+        // the same POM metadata.
+        publications.withType<MavenPublication>().configureEach {
+            pom {
+                name.set(publishedArtifactId)
+                description.set(publishedDescription)
+                url.set("https://github.com/biafra23/myotis")
+                licenses {
+                    license {
+                        name.set("Apache-2.0")
+                        url.set("https://www.apache.org/licenses/LICENSE-2.0")
+                    }
+                }
+                scm {
+                    url.set("https://github.com/biafra23/myotis")
+                    connection.set("scm:git:https://github.com/biafra23/myotis.git")
+                }
+            }
+        }
+        repositories {
+            maven {
+                name = "GitHubPackages"
+                url = uri("https://maven.pkg.github.com/biafra23/myotis")
+                // Actions supplies both (packages: write on the job); a maintainer
+                // publishing by hand exports a classic PAT with write:packages
+                // under the same two names. Unset everywhere else, which only a
+                // publish to THIS repository notices (a 401 from GitHub) — the
+                // repository is declared on every build and used by none other.
+                credentials {
+                    username = System.getenv("GITHUB_ACTOR")
+                    password = System.getenv("GITHUB_TOKEN")
+                }
+            }
+            maven {
+                name = "Staging"
+                url = uri(stagingRepository)
+            }
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
 // Optional Rust build (rust/ Cargo workspace — the coming Rust engine plus the
 // native BLS backend). Rust is OPTIONAL for the JVM hosts: without cargo the
 // cargo* tasks self-skip with a single lifecycle note and the pure-Java build is
