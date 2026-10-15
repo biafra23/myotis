@@ -98,10 +98,10 @@ class NetworkConfigGnosisTest {
     }
 
     @Test
-    void gnosisHasNoEns() {
-        // ENS is mainnet/Sepolia-only; Gnosis has no canonical registry (EnsResolver
-        // .forChainId throws for chainId 100), so the UI must not offer ENS lookups here.
-        assertFalse(G.hasEns(), "Gnosis must not advertise ENS");
+    void gnosisHasGenomeNames() {
+        // Gnosis has no ENS, but it has Genome's .gno names (EnsResolver.forChainId(100)
+        // is the Genome registry), so the UI offers name lookups here too.
+        assertTrue(G.hasEns(), "Gnosis advertises .gno name resolution");
         assertTrue(NetworkConfig.MAINNET.hasEns(), "mainnet has ENS");
         assertTrue(NetworkConfig.SEPOLIA.hasEns(), "sepolia has ENS");
         assertEquals("Gnosis Chain", G.displayName());

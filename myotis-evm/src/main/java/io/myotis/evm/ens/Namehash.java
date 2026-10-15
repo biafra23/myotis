@@ -38,14 +38,29 @@ public final class Namehash {
 
     /** Compute the namehash of {@code name}. Empty string returns 32 zero bytes. */
     public static byte[] of(String name) {
+        return of(name, ROOT);
+    }
+
+    /**
+     * The namehash of {@code name} in a tree whose empty name hashes to {@code root}
+     * instead of 32 zero bytes: the same ENSIP-1 recurrence, started at {@code root}.
+     * ENS itself is {@code root} = zero ({@link #of(String)}); SPACE ID namespaces such as
+     * Genome's {@code .gno} on Gnosis Chain root every name under a per-TLD node
+     * ({@code keccak256(0x00…00 ‖ identifier)}), so {@code x.gno} there is
+     * {@code keccak256(keccak256(root ‖ keccak256("gno")) ‖ keccak256("x"))}.
+     */
+    public static byte[] of(String name, byte[] root) {
+        if (root == null || root.length != 32) {
+            throw new IllegalArgumentException("namehash root must be 32 bytes");
+        }
         CryptoProviders.ensureRegistered();
-        if (name == null || name.isEmpty()) return ROOT.clone();
+        if (name == null || name.isEmpty()) return root.clone();
         // Lowercase per ENSIP-1; full UTS-46 normalisation is a Phase 3 concern.
         // Most production names are already canonical lowercase ASCII; documenting
         // the simplification here so the gap is visible.
         String lower = name.toLowerCase(java.util.Locale.ROOT);
         String[] labels = lower.split("\\.", -1);
-        byte[] node = ROOT.clone();
+        byte[] node = root.clone();
         for (int i = labels.length - 1; i >= 0; i--) {
             byte[] labelHash = Hash.keccak256(
                     Bytes.wrap(labels[i].getBytes(StandardCharsets.UTF_8))).toArrayUnsafe();

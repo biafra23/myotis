@@ -1124,6 +1124,13 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             return CompletableFuture.completedFuture(
                     new EnsResolution(trimmed, null, -1, false, "empty name"));
         }
+        // A name outside this chain's tree (a non-.gno name on Gnosis) is refused before
+        // any peer probe or EVM setup, and not retried by AUTO.
+        String refused = io.myotis.ens.EnsResolver.refusal(conn.getNetwork().networkId(), trimmed);
+        if (refused != null) {
+            return CompletableFuture.completedFuture(
+                    new EnsResolution(trimmed, null, -1, false, refused));
+        }
         final io.myotis.ens.EnsResolutionRoot m =
                 (mode == null) ? io.myotis.ens.EnsResolutionRoot.AUTO : mode;
         conn.enterSnapHeavy();
@@ -1233,56 +1240,56 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     /** ENSIP-5 text record. */
     public CompletableFuture<EnsRecord<String>> resolveEnsText(
             String name, String key, io.myotis.ens.EnsResolutionRoot mode) {
-        return resolveRecordWithMode("resolveText", mode,
+        return resolveRecordWithMode("resolveText", name, mode,
                 (r, ctx) -> r.resolveText(name, key, ctx));
     }
 
     /** Who holds the name (registry + .eth registrar, through the NameWrapper). */
     public CompletableFuture<EnsRecord<io.myotis.ens.EnsResolver.Ownership>> resolveEnsOwnership(
             String name, io.myotis.ens.EnsResolutionRoot mode) {
-        return resolveRecordWithMode("resolveOwnership", mode,
+        return resolveRecordWithMode("resolveOwnership", name, mode,
                 (r, ctx) -> r.resolveOwnership(name, ctx));
     }
 
     /** ENSIP-7 contenthash. */
     public CompletableFuture<EnsRecord<byte[]>> resolveEnsContenthash(
             String name, io.myotis.ens.EnsResolutionRoot mode) {
-        return resolveRecordWithMode("resolveContenthash", mode,
+        return resolveRecordWithMode("resolveContenthash", name, mode,
                 (r, ctx) -> r.resolveContenthash(name, ctx));
     }
 
     /** ENSIP-9 multi-coin address (SLIP-44 coin type). */
     public CompletableFuture<EnsRecord<byte[]>> resolveEnsMultiCoinAddr(
             String name, long coinType, io.myotis.ens.EnsResolutionRoot mode) {
-        return resolveRecordWithMode("resolveMultiCoinAddress", mode,
+        return resolveRecordWithMode("resolveMultiCoinAddress", name, mode,
                 (r, ctx) -> r.resolveMultiCoinAddress(name, coinType, ctx));
     }
 
     /** Pubkey record (secp256k1 x/y). */
     public CompletableFuture<EnsRecord<io.myotis.ens.EnsResolver.Pubkey>> resolveEnsPubkey(
             String name, io.myotis.ens.EnsResolutionRoot mode) {
-        return resolveRecordWithMode("resolvePubkey", mode,
+        return resolveRecordWithMode("resolvePubkey", name, mode,
                 (r, ctx) -> r.resolvePubkey(name, ctx));
     }
 
     /** ABI record (ENSIP-4); {@code contentTypes} is the accepted-encodings bitmask. */
     public CompletableFuture<EnsRecord<io.myotis.ens.EnsResolver.AbiRecord>> resolveEnsAbi(
             String name, long contentTypes, io.myotis.ens.EnsResolutionRoot mode) {
-        return resolveRecordWithMode("resolveAbi", mode,
+        return resolveRecordWithMode("resolveAbi", name, mode,
                 (r, ctx) -> r.resolveAbi(name, contentTypes, ctx));
     }
 
     /** DNS record stored in ENS (ENSIP-6); {@code dnsNameWire} is the wire-encoded name. */
     public CompletableFuture<EnsRecord<byte[]>> resolveEnsDnsRecord(
             String name, byte[] dnsNameWire, int resource, io.myotis.ens.EnsResolutionRoot mode) {
-        return resolveRecordWithMode("resolveDnsRecord", mode,
+        return resolveRecordWithMode("resolveDnsRecord", name, mode,
                 (r, ctx) -> r.resolveDnsRecord(name, dnsNameWire, resource, ctx));
     }
 
     /** ERC-165 interface-implementer record. */
     public CompletableFuture<EnsRecord<io.myotis.evm.Address>> resolveEnsInterfaceImplementer(
             String name, byte[] interfaceId4, io.myotis.ens.EnsResolutionRoot mode) {
-        return resolveRecordWithMode("resolveInterfaceImplementer", mode,
+        return resolveRecordWithMode("resolveInterfaceImplementer", name, mode,
                 (r, ctx) -> r.resolveInterfaceImplementer(name, interfaceId4, ctx));
     }
 
@@ -1300,7 +1307,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             return CompletableFuture.completedFuture(
                     new EnsRecord<>(null, -1, false, unwrap(e)));
         }
-        return resolveRecordWithMode("resolveName", mode,
+        return resolveRecordWithMode("resolveName", null, mode,
                 (r, ctx) -> r.resolveName(addr, ctx));
     }
 
@@ -1308,15 +1315,23 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      * Shared mode dispatch + snap-heavy guard for the record lookups — mirrors
      * {@link #resolveEns}: AUTO tries FINALIZED and falls back to PEER_HEAD only when the
      * record was absent AND no CCIP gateway already determined the answer. Never throws.
+     * {@code name} is the name asked about ({@code null} for a reverse lookup): a query the
+     * chain's name tree does not serve ({@link io.myotis.ens.EnsResolver#refusal}) is
+     * refused before any peer probe or EVM setup, and is not retried by AUTO.
      */
     private <T> CompletableFuture<EnsRecord<T>> resolveRecordWithMode(
-            String label, io.myotis.ens.EnsResolutionRoot mode,
+            String label, String name, io.myotis.ens.EnsResolutionRoot mode,
             java.util.function.BiFunction<io.myotis.ens.EnsResolver, io.myotis.evm.BlockContext,
                     CompletableFuture<java.util.Optional<T>>> call) {
         RLPxConnector conn = connector;
         if (conn == null) {
             return CompletableFuture.completedFuture(
                     new EnsRecord<>(null, -1, false, "node not running"));
+        }
+        String refused = io.myotis.ens.EnsResolver.refusal(conn.getNetwork().networkId(),
+                name == null ? null : name.trim());
+        if (refused != null) {
+            return CompletableFuture.completedFuture(new EnsRecord<>(null, -1, false, refused));
         }
         final io.myotis.ens.EnsResolutionRoot m =
                 (mode == null) ? io.myotis.ens.EnsResolutionRoot.AUTO : mode;
@@ -2095,7 +2110,8 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 new io.myotis.evm.CcipReadEvmExecutor(prefetching, ccip);
         // ENS is optional: only resolveEnsName() uses the resolver — get-account,
         // get-storage and eth_call all run off executor/oracle/blockCtx. On chains with
-        // no pinned ENS deployment (e.g. Gnosis, chainId 100) forChainId() throws; that
+        // no pinned name service forChainId() throws (Gnosis, chainId 100, has one:
+        // Genome's .gno names); that
         // must NOT abort the whole verified-head build, or the head warmer can never pin
         // a PEER_HEAD context and the node never reaches GREEN. Leave the resolver null
         // and let resolveEnsName() fail gracefully for those chains.

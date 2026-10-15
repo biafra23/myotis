@@ -25,7 +25,7 @@
 mod abi;
 mod name;
 
-pub use name::{dns_encode, namehash};
+pub use name::{dns_encode, namehash, namehash_from};
 
 use crate::block::BlockContext;
 use crate::error::EvmError;
@@ -67,6 +67,110 @@ fn name_wrapper(chain_id: u64) -> Option<[u8; 20]> {
     }
 }
 
+/// Genome's `.gno` names on Gnosis Chain (chain id 100): a SPACE ID deployment —
+/// an ENS fork with the same registry/resolver interfaces — whose names hash
+/// under a per-TLD root node instead of ENS's zero root. Java `EnsAddresses`
+/// twin (`GNOSIS_GENOME_*`, sources and on-chain cross-check documented there).
+pub const GENOME_TLD: &str = "gno";
+
+/// Genome's SID registry on Gnosis Chain: `0x5dC881dDA4e4a8d312be3544AD13118D1a04Cb17`.
+const GENOME_REGISTRY: [u8; 20] = [
+    0x5d, 0xc8, 0x81, 0xdd, 0xa4, 0xe4, 0xa8, 0xd3, 0x12, 0xbe, 0x35, 0x44, 0xad, 0x13, 0x11, 0x8d,
+    0x1a, 0x04, 0xcb, 0x17,
+];
+
+/// Genome's `.gno` registrar ("Base", ERC-721, token id = labelhash, the `.eth`
+/// BaseRegistrar's `ownerOf`/`nameExpires`/`GRACE_PERIOD`):
+/// `0x942fcaf68a0c264d5447b03a2011b395a899f2d3`.
+const GENOME_REGISTRAR: [u8; 20] = [
+    0x94, 0x2f, 0xca, 0xf6, 0x8a, 0x0c, 0x26, 0x4d, 0x54, 0x47, 0xb0, 0x3a, 0x20, 0x11, 0xb3, 0x95,
+    0xa8, 0x99, 0xf2, 0xd3,
+];
+
+/// `namehash("")` of the Genome tree on Gnosis Chain:
+/// `0xc4a8c56f9b0096f720f38bd557d30306dbd78f7751d277e05f062d1b85912a63`.
+pub const GENOME_ROOT: [u8; 32] = [
+    0xc4, 0xa8, 0xc5, 0x6f, 0x9b, 0x00, 0x96, 0xf7, 0x20, 0xf3, 0x8b, 0xd5, 0x57, 0xd3, 0x03, 0x06,
+    0xdb, 0xd7, 0x8f, 0x77, 0x51, 0xd2, 0x77, 0xe0, 0x5f, 0x06, 0x2d, 0x1b, 0x85, 0x91, 0x2a, 0x63,
+];
+
+/// One name tree: where its registry lives, the node its empty name hashes to,
+/// its second-level registrar, and — for a single-TLD tree — the only TLD it
+/// serves. Selected by chain id ([`Namespace::for_chain`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Namespace {
+    registry: [u8; 20],
+    root: [u8; 32],
+    /// The TLD whose second-level names `registrar` registers.
+    registrar_tld: &'static str,
+    registrar: [u8; 20],
+    /// `Some(tld)` = refuse every name outside `.tld` (Genome); `None` = any (ENS).
+    required_tld: Option<&'static str>,
+}
+
+impl Namespace {
+    /// The name tree a chain resolves: Genome on Gnosis Chain (100), ENS
+    /// everywhere else (the Java `EnsResolver.forChainId` twin; the host only
+    /// offers names on chains its catalog marks `hasEns`).
+    pub fn for_chain(chain_id: u64) -> Namespace {
+        if chain_id == 100 {
+            Namespace {
+                registry: GENOME_REGISTRY,
+                root: GENOME_ROOT,
+                registrar_tld: GENOME_TLD,
+                registrar: GENOME_REGISTRAR,
+                required_tld: Some(GENOME_TLD),
+            }
+        } else {
+            Namespace {
+                registry: REGISTRY,
+                root: [0u8; 32],
+                registrar_tld: "eth",
+                registrar: BASE_REGISTRAR,
+                required_tld: None,
+            }
+        }
+    }
+
+    /// Whether this tree serves `name`: any name for ENS; for a single-TLD tree
+    /// only `x.tld` (one trailing root dot allowed). Java `servesName` twin.
+    pub fn serves(&self, name: &str) -> bool {
+        let Some(tld) = self.required_tld else { return true };
+        let lower = name.to_lowercase();
+        let n = lower.strip_suffix('.').unwrap_or(&lower);
+        n.len() > tld.len() + 1 && n.ends_with(tld) && n.as_bytes()[n.len() - tld.len() - 1] == b'.'
+    }
+
+    /// `name`'s node in this tree, refusing a name outside a single-TLD tree —
+    /// `vitalik.eth` hashed under the Genome root is no one's name, and "no
+    /// record" would hide the mistake.
+    fn node(&self, name: &str) -> Result<[u8; 32], EnsError> {
+        if !self.serves(name) {
+            return Err(EnsError::Unsupported(ONLY_GNO_NAMES));
+        }
+        Ok(namehash_from(&self.root, name))
+    }
+
+    /// Whether reverse (`address → name`) resolution is served: ENS only.
+    pub fn serves_reverse(&self) -> bool {
+        self.required_tld.is_none()
+    }
+}
+
+/// The refusal a query on `chain_id` gets before any state is touched: a name
+/// outside the chain's tree (`name`), or a reverse lookup (`name` = None) where
+/// the tree has none. `None` = the query can be tried. Hosts and the reader call
+/// it first so a refused query costs no EVM setup and no AUTO-ladder retry.
+pub fn refusal(chain_id: u64, name: Option<&str>) -> Option<EnsError> {
+    let ns = Namespace::for_chain(chain_id);
+    match name {
+        Some(n) if !ns.serves(n) => Some(EnsError::Unsupported(ONLY_GNO_NAMES)),
+        Some(_) => None,
+        None if !ns.serves_reverse() => Some(EnsError::Unsupported(NO_GNO_REVERSE)),
+        None => None,
+    }
+}
+
 /// The ERC-3668 `OffchainLookup(address,string[],bytes,bytes4,bytes)` revert
 /// selector — an offchain (CCIP-Read) name announcing itself.
 const OFFCHAIN_LOOKUP_SELECTOR: [u8; 4] = [0x55, 0x6f, 0x18, 0x30];
@@ -95,7 +199,18 @@ pub enum EnsError {
     /// halt, unsupported chain). A plain revert is treated as "no record", not an
     /// error.
     Call(EvmError),
+    /// The query is outside what this chain's name tree serves — a non-`.gno`
+    /// name on Gnosis Chain, or a reverse lookup there (Genome keeps reverse
+    /// records outside the tree this resolver reads). Refused before any call,
+    /// never answered as "no record".
+    Unsupported(&'static str),
 }
+
+/// The refusal for a non-`.gno` name on Gnosis Chain (Java `EnsResolver` uses the
+/// same words).
+pub const ONLY_GNO_NAMES: &str = "only .gno names resolve on Gnosis Chain";
+/// The refusal for a reverse lookup on Gnosis Chain (Java parity).
+pub const NO_GNO_REVERSE: &str = "reverse resolution is not supported for .gno names";
 
 /// The decoded ERC-3668 `OffchainLookup(address,string[],bytes,bytes4,bytes)`
 /// revert body (Java `OffchainLookupRevert` twin — same bounds: body ≥ 160
@@ -125,6 +240,7 @@ impl std::fmt::Display for EnsError {
                 "name resolves offchain (ERC-3668 OffchainLookup); a CCIP-Read gateway round is required"
             ),
             EnsError::Call(e) => write!(f, "ENS resolution call failed: {e}"),
+            EnsError::Unsupported(why) => write!(f, "{why}"),
         }
     }
 }
@@ -161,6 +277,11 @@ pub trait EthCaller {
     /// A from-less view call to `target` with `calldata`. A revert surfaces as
     /// `Err(EvmError::Reverted { .. })` (the resolver treats that as "no record").
     fn eth_call(&self, target: [u8; 20], calldata: &[u8]) -> Result<Vec<u8>, EvmError>;
+
+    /// The chain the calls run against — selects the name tree
+    /// ([`Namespace::for_chain`]). Required, so no caller can silently hash a
+    /// Gnosis name into the ENS tree; [`ExecutorCaller`] reports its block's id.
+    fn chain_id(&self) -> u64;
 }
 
 /// Binds an [`EvmExecutor`] + [`BlockContext`] as an [`EthCaller`] (anonymous
@@ -173,6 +294,10 @@ pub struct ExecutorCaller<'a> {
 impl EthCaller for ExecutorCaller<'_> {
     fn eth_call(&self, target: [u8; 20], calldata: &[u8]) -> Result<Vec<u8>, EvmError> {
         self.executor.call_view(target, calldata, self.ctx)
+    }
+
+    fn chain_id(&self) -> u64 {
+        self.ctx.chain_id
     }
 }
 
@@ -190,7 +315,7 @@ pub fn resolve_address(
     caller: &dyn EthCaller,
     name: &str,
 ) -> Result<Option<[u8; 20]>, EnsError> {
-    let node = namehash(name);
+    let node = Namespace::for_chain(caller.chain_id()).node(name)?;
     let inner = abi::encode_call_bytes32("addr(bytes32)", &node);
     let Some(raw) = resolve_record(caller, name, &inner)? else {
         return Ok(None);
@@ -202,7 +327,8 @@ pub fn resolve_address(
 }
 
 /// Read who holds `name`: the registry's `owner(node)` and `resolver(node)`,
-/// then for a `.eth` second-level name the BaseRegistrar's `ownerOf`,
+/// then for a second-level name of the tree's registrar TLD (`x.eth`; `x.gno`
+/// on Gnosis Chain) the registrar's `ownerOf`,
 /// `nameExpires` and `GRACE_PERIOD`, each unwrapped through this chain's
 /// NameWrapper where it is the holder. `Ok(None)` = nothing on chain for the
 /// name (no registry owner or resolver, no registrar token, no expiry). A
@@ -224,12 +350,14 @@ pub fn resolve_ownership(
     dns_encode(name)?;
     let lower = name.to_lowercase();
     let labels: Vec<&str> = lower.split('.').collect();
-    let node = namehash(name);
+    let ns = Namespace::for_chain(chain_id);
+    let node = ns.node(name)?;
     let wrapper = name_wrapper(chain_id);
 
-    let owner = call_address(caller, REGISTRY, &abi::encode_call_bytes32("owner(bytes32)", &node))?;
+    let owner =
+        call_address(caller, ns.registry, &abi::encode_call_bytes32("owner(bytes32)", &node))?;
     let resolver =
-        call_address(caller, REGISTRY, &abi::encode_call_bytes32("resolver(bytes32)", &node))?;
+        call_address(caller, ns.registry, &abi::encode_call_bytes32("resolver(bytes32)", &node))?;
     let wrapped = matches!((owner, wrapper), (Some(o), Some(w)) if o == w);
     let manager = match (wrapped, wrapper) {
         (true, Some(w)) => {
@@ -238,11 +366,11 @@ pub fn resolve_ownership(
         _ => owner,
     };
 
-    let (registrant, expires_at, grace_period) = if labels.len() == 2 && labels[1] == "eth" {
+    let (registrant, expires_at, grace_period) = if labels.len() == 2 && labels[1] == ns.registrar_tld {
         let label_hash = myotis_core::keccak::keccak256(labels[0].as_bytes());
         let token_owner = call_address(
             caller,
-            BASE_REGISTRAR,
+            ns.registrar,
             &abi::encode_call_bytes32("ownerOf(uint256)", &label_hash),
         )?;
         let registrant = match (token_owner, wrapper) {
@@ -251,12 +379,12 @@ pub fn resolve_ownership(
         };
         let expires = call_u64(
             caller,
-            BASE_REGISTRAR,
+            ns.registrar,
             &abi::encode_call_bytes32("nameExpires(uint256)", &label_hash),
         )?
         .filter(|e| *e > 0);
         let grace = match expires {
-            Some(_) => call_u64(caller, BASE_REGISTRAR, &abi::encode_call_no_args("GRACE_PERIOD()"))?,
+            Some(_) => call_u64(caller, ns.registrar, &abi::encode_call_no_args("GRACE_PERIOD()"))?,
             None => None,
         };
         (registrant, expires, grace)
@@ -299,7 +427,7 @@ pub fn resolve_text(
     name: &str,
     key: &str,
 ) -> Result<Option<String>, EnsError> {
-    let node = namehash(name);
+    let node = Namespace::for_chain(caller.chain_id()).node(name)?;
     let inner = abi::encode_call_bytes32_string("text(bytes32,string)", &node, key);
     let Some(raw) = resolve_record(caller, name, &inner)? else {
         return Ok(None);
@@ -313,7 +441,7 @@ pub fn resolve_contenthash(
     caller: &dyn EthCaller,
     name: &str,
 ) -> Result<Option<Vec<u8>>, EnsError> {
-    let node = namehash(name);
+    let node = Namespace::for_chain(caller.chain_id()).node(name)?;
     let inner = abi::encode_call_bytes32("contenthash(bytes32)", &node);
     let Some(raw) = resolve_record(caller, name, &inner)? else {
         return Ok(None);
@@ -328,7 +456,7 @@ pub fn resolve_multicoin(
     name: &str,
     coin_type: u64,
 ) -> Result<Option<Vec<u8>>, EnsError> {
-    let node = namehash(name);
+    let node = Namespace::for_chain(caller.chain_id()).node(name)?;
     let inner = abi::encode_call_bytes32_u64("addr(bytes32,uint256)", &node, coin_type);
     let Some(raw) = resolve_record(caller, name, &inner)? else {
         return Ok(None);
@@ -342,7 +470,7 @@ pub fn resolve_pubkey(
     caller: &dyn EthCaller,
     name: &str,
 ) -> Result<Option<([u8; 32], [u8; 32])>, EnsError> {
-    let node = namehash(name);
+    let node = Namespace::for_chain(caller.chain_id()).node(name)?;
     let inner = abi::encode_call_bytes32("pubkey(bytes32)", &node);
     let Some(raw) = resolve_record(caller, name, &inner)? else {
         return Ok(None);
@@ -358,7 +486,7 @@ pub fn resolve_abi(
     name: &str,
     content_types: u64,
 ) -> Result<Option<(u64, Vec<u8>)>, EnsError> {
-    let node = namehash(name);
+    let node = Namespace::for_chain(caller.chain_id()).node(name)?;
     let inner = abi::encode_call_bytes32_u64("ABI(bytes32,uint256)", &node, content_types);
     let Some(raw) = resolve_record(caller, name, &inner)? else {
         return Ok(None);
@@ -376,7 +504,7 @@ pub fn resolve_dns_record(
     dns_name: &str,
     resource: u16,
 ) -> Result<Option<Vec<u8>>, EnsError> {
-    let node = namehash(name);
+    let node = Namespace::for_chain(caller.chain_id()).node(name)?;
     let wire = dns_encode(dns_name)?;
     let inner = abi::encode_call_bytes32_bytes_u64(
         "dnsRecord(bytes32,bytes,uint16)",
@@ -397,7 +525,7 @@ pub fn resolve_interface_implementer(
     name: &str,
     interface_id: [u8; 4],
 ) -> Result<Option<[u8; 20]>, EnsError> {
-    let node = namehash(name);
+    let node = Namespace::for_chain(caller.chain_id()).node(name)?;
     let inner = abi::encode_call_bytes32_bytes4(
         "interfaceImplementer(bytes32,bytes4)",
         &node,
@@ -430,12 +558,21 @@ pub fn reverse_resolve(
     caller: &dyn EthCaller,
     address: [u8; 20],
 ) -> Result<Option<String>, EnsError> {
+    let ns = Namespace::for_chain(caller.chain_id());
+    if !ns.serves_reverse() {
+        // Genome keeps its reverse records in SPACE ID's own reverse scheme (an
+        // `addr.reverse` node read through `tldName`/`name` with the TLD's
+        // identifier), which this resolver does not implement. Refuse rather
+        // than answer "no primary name", which would look like a real answer
+        // (Java `resolveName` parity).
+        return Err(EnsError::Unsupported(NO_GNO_REVERSE));
+    }
     let rev_name = reverse_name(address);
     let rev_node = namehash(&rev_name);
 
     // Exact resolver lookup; a zero resolver (or a revert) is "no reverse record".
     let call = abi::encode_call_bytes32("resolver(bytes32)", &rev_node);
-    let out = match caller.eth_call(REGISTRY, &call) {
+    let out = match caller.eth_call(ns.registry, &call) {
         Ok(out) => out,
         Err(EvmError::Reverted { .. }) => return Ok(None),
         Err(e) => return Err(EnsError::Call(e)),
@@ -651,11 +788,12 @@ fn find_resolver(caller: &dyn EthCaller, name: &str) -> Result<Option<ResolverIn
         trimmed.split('.').collect()
     };
 
+    let ns = Namespace::for_chain(caller.chain_id());
     for i in 0..labels.len() {
         let suffix = labels[i..].join(".");
-        let suffix_node = namehash(&suffix);
+        let suffix_node = namehash_from(&ns.root, &suffix);
         let call = abi::encode_call_bytes32("resolver(bytes32)", &suffix_node);
-        let out = match caller.eth_call(REGISTRY, &call) {
+        let out = match caller.eth_call(ns.registry, &call) {
             Ok(out) => out,
             Err(EvmError::Reverted { .. }) => continue,
             Err(e) => return Err(EnsError::Call(e)),
@@ -693,11 +831,16 @@ mod tests {
         #[allow(clippy::type_complexity)]
         handlers: Vec<Box<dyn Fn([u8; 20], &[u8]) -> Option<Result<Vec<u8>, EvmError>>>>,
         calls: RefCell<usize>,
+        chain: u64,
     }
 
     impl MockCaller {
         fn new() -> MockCaller {
-            MockCaller { handlers: Vec::new(), calls: RefCell::new(0) }
+            MockCaller { handlers: Vec::new(), calls: RefCell::new(0), chain: 1 }
+        }
+        fn on_chain(mut self, chain: u64) -> Self {
+            self.chain = chain;
+            self
         }
         fn on(
             mut self,
@@ -718,6 +861,10 @@ mod tests {
             }
             // Unmatched call → empty (decodes to zero address / false).
             Ok(vec![0u8; 32])
+        }
+
+        fn chain_id(&self) -> u64 {
+            self.chain
         }
     }
 
@@ -742,6 +889,128 @@ mod tests {
 
     const RESOLVER: [u8; 20] = [0x44; 20];
     const VITALIK: [u8; 20] = [0xd8; 20];
+
+    fn gno(name: &str) -> [u8; 32] {
+        namehash_from(&GENOME_ROOT, name)
+    }
+
+    #[test]
+    fn genome_pins_match_the_java_engine() {
+        // Byte-for-byte the Java EnsAddresses pins (GNOSIS_GENOME_*).
+        assert_eq!(
+            GENOME_ROOT.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "c4a8c56f9b0096f720f38bd557d30306dbd78f7751d277e05f062d1b85912a63"
+        );
+        assert_eq!(
+            GENOME_REGISTRY.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "5dc881dda4e4a8d312be3544ad13118d1a04cb17"
+        );
+        assert_eq!(
+            GENOME_REGISTRAR.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "942fcaf68a0c264d5447b03a2011b395a899f2d3"
+        );
+        // namehash("gno") in that tree — what the registrar must report as baseNode().
+        assert_eq!(
+            gno("gno").iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "b610db9c8c31e1a841d7e46f0184e3ae40589639b590138de0de5df028245ce2"
+        );
+    }
+
+    #[test]
+    fn gnosis_resolves_gno_names_against_the_genome_registry() {
+        let resolver_sel = abi::selector("resolver(bytes32)");
+        let addr_sel = abi::selector("addr(bytes32)");
+        let supports_sel = abi::selector("supportsInterface(bytes4)");
+        let node = gno("levvv.gno");
+        let mock = MockCaller::new()
+            .on_chain(100)
+            .on(move |t, cd| {
+                (t == GENOME_REGISTRY && sel(cd) == resolver_sel && cd[4..36] == node)
+                    .then(|| Ok(addr_word(RESOLVER)))
+            })
+            .on(move |t, cd| (t == RESOLVER && sel(cd) == supports_sel).then(|| Ok(bool_word(false))))
+            .on(move |t, cd| {
+                (t == RESOLVER && sel(cd) == addr_sel && cd[4..36] == node).then(|| Ok(addr_word(VITALIK)))
+            })
+            // Any ENS-registry read would be a bug: the Genome tree only.
+            .on(|t, _| (t == REGISTRY).then(|| panic!("ENS registry read on Gnosis")));
+        assert_eq!(resolve_address(&mock, "Levvv.GNO").unwrap(), Some(VITALIK));
+    }
+
+    #[test]
+    fn gnosis_refuses_names_outside_gno() {
+        let mock = MockCaller::new().on_chain(100);
+        assert_eq!(resolve_address(&mock, "vitalik.eth"), Err(EnsError::Unsupported(ONLY_GNO_NAMES)));
+        assert_eq!(
+            resolve_ownership(&mock, "vitalik.eth", 100),
+            Err(EnsError::Unsupported(ONLY_GNO_NAMES))
+        );
+        assert_eq!(refusal(100, Some("vitalik.eth")), Some(EnsError::Unsupported(ONLY_GNO_NAMES)));
+        assert_eq!(refusal(100, Some("levvv.gno")), None);
+        assert_eq!(refusal(1, Some("levvv.gno")), None);
+        assert_eq!(*mock.calls.borrow(), 0, "refused before any call");
+        let ns = Namespace::for_chain(100);
+        assert!(ns.serves("levvv.gno"));
+        assert!(ns.serves("a.levvv.gno."));
+        assert!(!ns.serves("gno"));
+        assert!(!ns.serves("xgno"));
+        assert!(!ns.serves("levvv.gno.eth"));
+        // ENS serves any name.
+        assert!(Namespace::for_chain(1).serves("levvv.gno"));
+    }
+
+    #[test]
+    fn gnosis_refuses_reverse_resolution() {
+        let mock = MockCaller::new().on_chain(100);
+        assert_eq!(reverse_resolve(&mock, VITALIK), Err(EnsError::Unsupported(NO_GNO_REVERSE)));
+        assert_eq!(*mock.calls.borrow(), 0);
+        assert_eq!(refusal(100, None), Some(EnsError::Unsupported(NO_GNO_REVERSE)));
+        assert_eq!(refusal(1, None), None);
+    }
+
+    #[test]
+    fn gnosis_ownership_reads_the_gno_registrar() {
+        let owner_sel = abi::selector("owner(bytes32)");
+        let resolver_sel = abi::selector("resolver(bytes32)");
+        let owner_of_sel = abi::selector("ownerOf(uint256)");
+        let expires_sel = abi::selector("nameExpires(uint256)");
+        let grace_sel = abi::selector("GRACE_PERIOD()");
+        let node = gno("levvv.gno");
+        let label = myotis_core::keccak::keccak256(b"levvv");
+        let user = [0x51u8; 20];
+        let u64_word = |v: u64| {
+            let mut w = vec![0u8; 32];
+            w[24..].copy_from_slice(&v.to_be_bytes());
+            w
+        };
+        let (e, g) = (u64_word(1_900_000_000), u64_word(7_776_000));
+        let mock = MockCaller::new()
+            .on_chain(100)
+            .on(move |t, cd| {
+                (t == GENOME_REGISTRY && sel(cd) == owner_sel && cd[4..36] == node)
+                    .then(|| Ok(addr_word(user)))
+            })
+            .on(move |t, cd| {
+                (t == GENOME_REGISTRY && sel(cd) == resolver_sel && cd[4..36] == node)
+                    .then(|| Ok(addr_word(RESOLVER)))
+            })
+            .on(move |t, cd| {
+                (t == GENOME_REGISTRAR && sel(cd) == owner_of_sel && cd[4..36] == label)
+                    .then(|| Ok(addr_word(user)))
+            })
+            .on(move |t, cd| {
+                (t == GENOME_REGISTRAR && sel(cd) == expires_sel && cd[4..36] == label)
+                    .then(|| Ok(e.clone()))
+            })
+            .on(move |t, cd| (t == GENOME_REGISTRAR && sel(cd) == grace_sel).then(|| Ok(g.clone())));
+        let o = resolve_ownership(&mock, "levvv.gno", 100).unwrap().unwrap();
+        assert_eq!(o.registrant, Some(user));
+        assert_eq!(o.manager, Some(user));
+        assert!(!o.wrapped);
+        assert_eq!(o.resolver, Some(RESOLVER));
+        assert_eq!(o.expires_at, Some(1_900_000_000));
+        assert_eq!(o.grace_period, Some(7_776_000));
+    }
 
     #[test]
     fn extended_resolver_id_is_the_resolve_selector() {

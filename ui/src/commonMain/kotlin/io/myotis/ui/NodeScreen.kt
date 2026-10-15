@@ -1528,6 +1528,10 @@ private fun QueryTab(
                         error = "ENS isn't available on ${network.replaceFirstChar { it.uppercase() }} — enter a 0x address."
                         return@launch
                     }
+                    nameNetworkMismatch(network, q)?.let {
+                        error = it
+                        return@launch
+                    }
                     loadingMsg = "Resolving…"
                     val r = controller.resolveEns(network, q)
                     ens = r
@@ -1579,7 +1583,15 @@ private fun QueryTab(
         OutlinedTextField(
             value = input,
             onValueChange = { input = it },
-            label = { Text(if (ensCapable) "Address (0x…) or ENS name" else "Address (0x…)") },
+            label = {
+                Text(
+                    when {
+                        !ensCapable -> "Address (0x…)"
+                        network == "gnosis" -> "Address (0x…) or .gno name"
+                        else -> "Address (0x…) or ENS name"
+                    }
+                )
+            },
             singleLine = true,
             enabled = !loading,
             // The keyboard's search key runs the lookup, like the button below.
@@ -2228,7 +2240,7 @@ private fun EnsResultView(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text("ENS", style = MaterialTheme.typography.titleSmall)
+            Text(nameServiceTitle(e.name), style = MaterialTheme.typography.titleSmall)
             e.addressHex?.let { addr ->
                 OutlinedButton(onClick = { clipboard.setText(AnnotatedString(addr)) }) { Text("Copy address") }
             }
@@ -2271,9 +2283,10 @@ private fun EnsResultView(
                     Text("Reading records…", style = MaterialTheme.typography.bodySmall)
                 } else {
                     HelpButton(
-                        "ENS records",
+                        "${nameServiceTitle(e.name)} records",
                         "Reads who holds the name (registrant, manager, resolver, expiry and grace " +
-                            "period — the registry and the .eth registrar, seen through the NameWrapper), " +
+                            "period — the registry and the name's registrar: the .eth registrar seen " +
+                            "through the NameWrapper, or Genome's .gno registrar on Gnosis), " +
                             "the name's contenthash (ENSIP-7 — an IPFS, IPNS or Swarm pointer) and its " +
                             "common text records (avatar, description, url, email, com.twitter, " +
                             "com.github, org.telegram, com.discord), each verified against finalized " +
