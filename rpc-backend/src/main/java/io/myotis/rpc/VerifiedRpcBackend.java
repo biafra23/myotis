@@ -563,13 +563,14 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 }
             });
 
-    /** Block hashes a {@link #rpcResolveBlockHash} window did not hold → the anchor number
-     *  that window was anchored at: asked again at that anchor, the answer is the same, so
-     *  a client retrying a hash this node cannot place (one a block ahead, the common case)
-     *  costs no second header fetch until the anchor moves. Bounded LRU. */
-    private final Map<String, Long> unplacedBlockHashes = java.util.Collections.synchronizedMap(
+    /** Block hashes a {@link #rpcResolveBlockHash} window did not hold → the HASH of the
+     *  anchor that window was anchored at (the anchor itself, not its number, which a head
+     *  replaced at the same height keeps): asked again at that anchor, the answer is the
+     *  same, so a client retrying a hash this node cannot place (one a block ahead, the
+     *  common case) costs no second header fetch until the anchor moves. Bounded LRU. */
+    private final Map<String, String> unplacedBlockHashes = java.util.Collections.synchronizedMap(
             new java.util.LinkedHashMap<>(16, 0.75f, true) {
-                @Override protected boolean removeEldestEntry(Map.Entry<String, Long> e) {
+                @Override protected boolean removeEldestEntry(Map.Entry<String, String> e) {
                     return size() > 64;
                 }
             });
@@ -3600,15 +3601,15 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 return resolvedBlockJson(hash, anchor.number());
             }
             String key = "0x" + Bytes.wrap(hash).toUnprefixedHexString();
-            Long unplacedAt = unplacedBlockHashes.get(key);
-            if (unplacedAt != null && unplacedAt == anchor.number()) return "null";
+            String anchorKey = "0x" + Bytes.wrap(anchor.blockHash()).toUnprefixedHexString();
+            if (anchorKey.equals(unplacedBlockHashes.get(key))) return "null";
             long from = hashScanStart(anchor.number(), blockHashToNumber.get(key));
             List<BlockHeadersMessage.VerifiedHeader> window = conn
                     .requestBlockHeadersBatched(from, (int) (anchor.number() - from + 1))
                     .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
             String resolved = resolvedFromWindow(window, anchor.blockHash(), hash);
             if ("null".equals(resolved)) {
-                unplacedBlockHashes.put(key, anchor.number());
+                unplacedBlockHashes.put(key, anchorKey);
             } else if (resolved != null) {
                 for (BlockHeadersMessage.VerifiedHeader vh : window) {
                     if (java.util.Arrays.equals(vh.hash().toArrayUnsafe(), hash)) {

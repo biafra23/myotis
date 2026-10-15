@@ -1963,9 +1963,11 @@ pub struct ElReader {
     /// by-number serve); the shared LRU is the myotis-evm cache one.
     block_hash_numbers: std::sync::Mutex<myotis_evm::Lru<[u8; 32], u64>>,
     /// Block hashes a [`Self::resolve_block_hash`] window did not hold, each
-    /// with the optimistic head number that window was anchored at: the same
-    /// head gives the same answer, so a retry is not another fetch.
-    unplaced_hashes: std::sync::Mutex<myotis_evm::Lru<[u8; 32], u64>>,
+    /// with the HASH of the optimistic head that window was anchored at — the
+    /// head itself, not its number, which a head replaced at the same height
+    /// keeps: the same head gives the same answer, so a retry is not another
+    /// fetch.
+    unplaced_hashes: std::sync::Mutex<myotis_evm::Lru<[u8; 32], [u8; 32]>>,
     /// The sent-tx watch + pending-nonce overlay + raw-bytes cache (the Java
     /// `sentTxWatch`/`pendingNonces`/`sentTxCache` trio). One brief-hold lock:
     /// every access is a map poke; the rebroadcast collects its work under the
@@ -7222,7 +7224,7 @@ impl ElReader {
         let mut attempt = 0;
         loop {
             let (head_num, head_hash) = self.anchored_head()?;
-            if self.unplaced_hashes.lock().ok().and_then(|mut m| m.get(&hash).copied()) == Some(head_num) {
+            if self.unplaced_hashes.lock().ok().and_then(|mut m| m.get(&hash).copied()) == Some(head_hash) {
                 return Ok(None);
             }
             let scan_from = head_num.saturating_sub(HASH_SCAN_DEPTH);
@@ -7234,7 +7236,7 @@ impl ElReader {
                 Ok(window) => {
                     let Some(vh) = window.iter().find(|vh| vh.hash == hash) else {
                         if let Ok(mut unplaced) = self.unplaced_hashes.lock() {
-                            unplaced.put(hash, head_num);
+                            unplaced.put(hash, head_hash);
                         }
                         return Ok(None);
                     };
@@ -9398,8 +9400,8 @@ fn choose_window_top(
 /// header hash-links to the next. This is the sole gate that turns
 /// peer-supplied headers into trusted ones — one implementation, seven callers
 /// (block serve, fee estimate, fee history, receipts, receipt scan,
-/// canonicality re-check), so a hardening never has to be applied in six
-/// places.
+/// canonicality re-check, block-hash resolve), so a hardening never has to be
+/// applied in seven places.
 async fn fetch_anchored_window(
     peer: &ManagedPeer,
     from: u64,
