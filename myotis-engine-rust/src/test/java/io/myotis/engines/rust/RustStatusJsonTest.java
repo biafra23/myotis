@@ -123,13 +123,37 @@ class RustStatusJsonTest {
         assertFalse(s.rpcServing());
     }
 
+    /** A listener that is attached but never up — the bind-failure shape. */
+    private static final class NeverUpRpc implements LoopbackRpc {
+        @Override public io.myotis.api.WebAccessPolicy setWebAccessPolicy(io.myotis.api.WebAccessPolicy p) { return p; }
+        @Override public java.util.List<io.myotis.api.WebOrigin> recentWebOrigins() { return java.util.List.of(); }
+        @Override public void start(int port, io.myotis.api.VerifiedReads r, io.myotis.api.NodeStatusReads s,
+                io.myotis.api.NodeLifecycle l) throws java.io.IOException {
+            throw new java.io.IOException("port " + port + " unavailable");
+        }
+        @Override public boolean isServing() { return false; }
+        @Override public void stop() {}
+    }
+
+    @Test
+    void noListenerAttachedHidesTheRpcRow() {
+        // The engine library's shape: a port is configured but NO listener is
+        // attached (LoopbackRpc null), so nothing will ever serve it. The row is
+        // hidden (port 0) rather than rendered as a red "port N unavailable" —
+        // that row means a bind failure, and there was no bind to fail.
+        RustChainHandle h = new RustChainHandle(0L, "mainnet", 1L, 8545, false);
+        StatusSnapshot running = h.statusFromJsonOnThisHandle(CATCHING_UP_JSON);
+        assertEquals(0, running.rpcPort());
+        assertFalse(running.rpcServing());
+    }
+
     @Test
     void configuredButUnservedRpcPortSurfacesAsNotServing() {
-        // A handle configured with a port whose server never started (bind
-        // failure shape): the RUNNING status must carry the port with
+        // A handle with a listener attached and a port whose server never started
+        // (bind failure shape): the RUNNING status must carry the port with
         // rpcServing=false — the state the UI renders as the red
         // "port N unavailable" row. A stopped handle must hide the row (port 0).
-        RustChainHandle h = new RustChainHandle(0L, "mainnet", 1L, 8545, false);
+        RustChainHandle h = new RustChainHandle(0L, "mainnet", 1L, 8545, false, null, new NeverUpRpc());
         StatusSnapshot running = h.statusFromJsonOnThisHandle(CATCHING_UP_JSON);
         assertEquals(8545, running.rpcPort());
         assertFalse(running.rpcServing());

@@ -772,7 +772,7 @@ mod tests {
             crate::ABI_VERSION,
             "rust/include/myotis_engine.h declares MYOTIS_ABI_VERSION {declared} but \
              crate::ABI_VERSION is {}. Update the header; :app-ios picks the new value \
-             up automatically, but RustEngineNative.EXPECTED_ABI_VERSION (myotis-engines) \
+             up automatically, but RustEngineNative.EXPECTED_ABI_VERSION (myotis-engine-rust) \
              is still a hand-kept mirror.",
             crate::ABI_VERSION
         );

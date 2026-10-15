@@ -198,7 +198,7 @@ that header and the anchor adopts it iff its keccak is the hash (`resolve_header
 > account and storage queries were built (`request_account_json`, `get_storage_proof_json`):
 > the Rust handle throws for `getHeaders`/`getBlockVerified`/`dialPeer` and treats
 > `setTargetSnapPeers`/`clearPeerState` as no-ops (it sizes its own pool —
-> `myotis-engines/.../RustChainHandle.java`). The milestone-B dispatch native was not built
+> `myotis-engine-rust/.../RustChainHandle.java`). The milestone-B dispatch native was not built
 > (decision 4). The JSON golden-pin and input-validation rules below still hold.
 
 All natives remain `Java_io_myotis_engines_RustEngineNative_*`, panic-free by construction
@@ -585,7 +585,7 @@ Spec: doc 03 §§3–7, doc 04 §3. New crate `myotis-evm` (sans-I/O; revm gated
      decodes the OffchainLookup 5-tuple (Java `OffchainLookupRevert` bounds: body ≥160, ≤32
      URLs; unparseable → `lookup:None`, still distinguishable from no-record) and carries it +
      the ENSIP-10 `wrapped` flag through `status:"offchain"` JSON; the HOST (`CcipDriver` in
-     `myotis-engines`) drives the gateway over the `HttpGateway` port — serial URLs, GET iff
+     `myotis-engine-rust`) drives the gateway over the `HttpGateway` port — serial URLs, GET iff
      `{data}` in the template (pre-substitution), else POST `{"sender","data"}`, lenient
      `"data"` regex extraction, `HttpError` selector `0xca7a4e75` substring scan, per-URL
      failure reasons — then re-enters via `method:"ccipCallback"` (same dispatch native, ABI

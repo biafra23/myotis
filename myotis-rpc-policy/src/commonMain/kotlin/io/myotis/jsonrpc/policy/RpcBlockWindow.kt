@@ -1,4 +1,4 @@
-package io.myotis.jsonrpc
+package io.myotis.jsonrpc.policy
 
 /**
  * The block-selector serving window shared by every RpcBackend adapter (the

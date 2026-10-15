@@ -50,10 +50,12 @@ import java.util.List;
  * {@link EngineException} by design ({@code NOT_AVAILABLE} below): block reads go
  * through {@link VerifiedReads}, and the engine dials from its own pool.
  *
- * <p>{@link #reads()} serves the verified JSON-RPC endpoint: on {@link #start()} this
- * handle self-starts the shared {@code jsonrpc-server} on {@code 127.0.0.1:rpcPort}
- * backed by {@link RustVerifiedReads}, mirroring how the Java engine self-starts it
- * inside {@code ChainStack}.
+ * <p>{@link #reads()} is the verified read surface ({@link RustVerifiedReads}, answered
+ * in-process from the native engine). A host that wants it on the wire attaches a
+ * {@link LoopbackRpc} listener: on {@link #start()} this handle starts it on
+ * {@code 127.0.0.1:rpcPort}, mirroring how the Java engine self-starts the shared
+ * {@code jsonrpc-server} inside {@code ChainStack}. The JVM hosts get that listener
+ * from the selector; the engine library attaches none.
  *
  * <p>Idle sleep is REAL on this engine (the Java engine's behaviour, mirrored for
  * Android): {@link #pause()} tears the native networking down while the handle and
@@ -75,16 +77,16 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     private final long handle;
     private final String networkName;
     private final long chainId;
-    /** Loopback JSON-RPC port; {@code <= 0} disables the server (e.g. the JSON test seams). */
+    /** Loopback JSON-RPC port; {@code <= 0} disables the listener (e.g. the JSON test seams). */
     private final int rpcPort;
-    /** The verified read surface the JSON-RPC server serves; never null. */
+    /** The verified read surface; never null. Served on the wire by {@link #rpc} when set. */
     private final RustVerifiedReads verifiedReads = new RustVerifiedReads(this);
-    /** The running JSON-RPC server, or null when disabled / not started. */
-    private volatile io.myotis.jsonrpc.MyotisRpcServer rpcServer;
-    /** The listener's web-page gate (#502) — the policy the host installs and the
-     *  recent-origins list, owned by the handle so they work before the server
-     *  exists and after it stopped (ChainStack parity). */
-    private final io.myotis.jsonrpc.WebAccess webAccess = new io.myotis.jsonrpc.WebAccess();
+    /** The host's loopback listener (a port — see {@link LoopbackRpc}), or null when the
+     *  host attaches none (the engine library). It owns the web-page gate (#502), so the
+     *  policy works before the listener is up and after it stopped (ChainStack parity). */
+    private final LoopbackRpc rpc;
+    /** Whether {@link #rpc} was started by this run's start(); cleared in stop(). */
+    private volatile boolean rpcStarted;
 
     /** Monotonic time (ns) the current run's start() was ENTERED — uptime counts the native
      *  boot itself, not just the time since it finished; drives {@link #uptimeSeconds()}.
@@ -113,11 +115,17 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
 
     RustChainHandle(long handle, String networkName, long chainId, int rpcPort, boolean hasEns,
             io.myotis.api.ports.HttpGateway httpGateway) {
+        this(handle, networkName, chainId, rpcPort, hasEns, httpGateway, null);
+    }
+
+    RustChainHandle(long handle, String networkName, long chainId, int rpcPort, boolean hasEns,
+            io.myotis.api.ports.HttpGateway httpGateway, LoopbackRpc rpc) {
         this.handle = handle;
         this.networkName = networkName;
         this.chainId = chainId;
         this.rpcPort = rpcPort;
         this.httpGateway = httpGateway;
+        this.rpc = rpc;
         // Networks without ENS (e.g. gnosis) get no EnsApi — ens() returns null.
         this.ensApi = hasEns ? new RustEnsApi(this) : null;
         // Wake-on-request over the NATIVE lifecycle: the same primitive ChainStack
@@ -161,10 +169,9 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     @Override
     public synchronized void stop() {
         // Stop serving before tearing down the native stack the reads depend on.
-        io.myotis.jsonrpc.MyotisRpcServer server = this.rpcServer;
-        if (server != null) {
-            try { server.stop(); } catch (Throwable ignored) {}
-            this.rpcServer = null;
+        if (rpcStarted) {
+            try { rpc.stop(); } catch (Throwable ignored) {}
+            rpcStarted = false;
         }
         started = false;   // a fresh start() after stop re-anchors uptime to that run
         RustEngineNative.nativeStop(handle);
@@ -388,34 +395,25 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         return !started ? 0L : (System.nanoTime() - startedAtNs) / 1_000_000_000L;
     }
 
-    /**
-     * Start the shared {@code jsonrpc-server} on {@code 127.0.0.1:rpcPort}, backed by
-     * {@link RustVerifiedReads} — the Rust-engine counterpart to
-     * {@code ChainStack.startRpc()}. Loopback only, strict (no upstream proxy). A
-     * bind failure is logged and the stack continues without JSON-RPC (mirrors the
-     * Java engine): the IPC socket still serves the same verified primitives.
-     */
     /** Live listener state (bound AND no fatal supervisor failure) — ChainStack parity. */
     private boolean rpcServing() {
-        io.myotis.jsonrpc.MyotisRpcServer s = rpcServer;
-        return s != null && s.isServing();
+        return rpcStarted && rpc.isServing();
     }
 
+    /**
+     * Start the host's {@link LoopbackRpc} listener on {@code 127.0.0.1:rpcPort}, backed
+     * by {@link RustVerifiedReads} — the Rust-engine counterpart to
+     * {@code ChainStack.startRpc()}. A bind failure is logged and the stack continues
+     * without JSON-RPC (mirrors the Java engine): the IPC socket still serves the same
+     * verified primitives. No listener attached (the engine library) = nothing to start.
+     */
     private void startRpc() {
+        if (rpc == null) return;         // no listener attached (in-process consumer)
         if (rpcPort <= 0) return;        // RPC disabled (test seam / explicit opt-out)
-        if (rpcServer != null) return;   // already started — avoid a re-bind / server leak
+        if (rpcStarted) return;          // already started — avoid a re-bind / server leak
         try {
-            // Deterministic up-front bind probe: Ktor's CIO engine surfaces bind
-            // failures asynchronously, which a try/catch around start() can miss.
-            try (java.net.ServerSocket probe = new java.net.ServerSocket()) {
-                probe.setReuseAddress(true);
-                probe.bind(new java.net.InetSocketAddress("127.0.0.1", rpcPort));
-            }
-            io.myotis.jsonrpc.MyotisRpcServer server =
-                    io.myotis.jsonrpc.MyotisRpc.server(rpcPort, null, "127.0.0.1", verifiedReads, this, this,
-                            webAccess);
-            server.start();
-            this.rpcServer = server;
+            rpc.start(rpcPort, verifiedReads, this, this);
+            rpcStarted = true;
             log.info("[{}] JSON-RPC listening on http://127.0.0.1:{} (verified, strict)",
                     networkName, rpcPort);
         } catch (java.io.IOException bindEx) {
@@ -668,7 +666,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                 // on 127.0.0.1:rpcPort is what WAKES the stack) — and whether the
                 // server is live right now. Only a STOPPED handle reports 0, hiding
                 // the row instead of faking a red bind failure.
-                (s.running() || s.paused()) && rpcPort > 0 ? rpcPort : 0,
+                (s.running() || s.paused()) && rpc != null && rpcPort > 0 ? rpcPort : 0,
                 rpcServing(),
                 s.upgradeAdvisory());
     }
@@ -707,8 +705,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
 
     // ---- verified-read surface ----
     //
-    // reads() returns the RustVerifiedReads adapter — the JSON-RPC read surface the
-    // shared jsonrpc-server serves on 127.0.0.1:rpcPort (started in startRpc()). It
+    // reads() returns the RustVerifiedReads adapter — the read surface the host's
+    // LoopbackRpc listener serves on 127.0.0.1:rpcPort (started in startRpc()). It
     // answers the whole VerifiedReads surface from the native engine: the
     // beacon-anchored account / storage / code reads from the same proof-verified
     // queries as requestAccount below, eth_call and estimateGas (state overrides
@@ -719,11 +717,13 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     //
     // Per the ChainHandle contract, reads() is null "while the RPC backend isn't
     // started (e.g. the RPC port was unavailable at start())". The adapter is itself
-    // transport-independent (it queries the native directly), but reads() gates on
-    // rpcServer so it means the same thing on both engines: the Java engine's
-    // rpcBackend is null until startRpc() succeeds, and hosts null-check reads()
-    // to decide whether verified RPC is available. So: null before start(), when
-    // rpcPort<=0, or on a bind failure; non-null once serving.
+    // transport-independent (it queries the native directly), but with a listener
+    // attached reads() gates on it so it means the same thing on both engines: the
+    // Java engine's rpcBackend is null until startRpc() succeeds, and hosts null-check
+    // reads() to decide whether verified RPC is available. So: null before start(),
+    // when rpcPort<=0, or on a bind failure; non-null once serving. With NO listener
+    // (the engine library's in-process consumer) there is no backend to wait for:
+    // reads() is non-null once start() succeeded, null before.
     //
     // ens() serves every EnsApi record type via the native resolver, and is non-null
     // only on ENS-capable networks: mainnet and Sepolia have a registry, gnosis has
@@ -737,7 +737,9 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     // not serve is a capability error (no verification to report a failReason for)
     // — a failReason record would misrepresent "we don't" as "we tried and failed".
 
-    @Override public VerifiedReads reads() { return rpcServer != null ? verifiedReads : null; }
+    @Override public VerifiedReads reads() {
+        return (rpc == null ? started : rpcStarted) ? verifiedReads : null;
+    }
 
     // Non-null only for ENS-capable networks (gnosis has no ENS registry — the
     // ChainHandle contract returns null there). Assigned in the constructor since
@@ -784,15 +786,18 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
 
     @Override
     public io.myotis.api.WebAccessPolicy setWebAccessPolicy(io.myotis.api.WebAccessPolicy policy) {
-        // The listener is the shared Kotlin server on both engines, so the policy
-        // never crosses the FFI: it lands on the gate this handle owns — live, and
-        // before start() too (hosts set it between create() and start()).
-        return io.myotis.jsonrpc.WebAccessApi.apply(webAccess, policy);
+        // The listener is host-side on both engines, so the policy never crosses the
+        // FFI: it lands on the gate the listener owns — live, and before start() too
+        // (hosts set it between create() and start()). With no listener there is
+        // nothing that could judge an origin: the policy is returned as asked, since
+        // no entry of it is ever applied or dropped.
+        if (rpc == null) return policy;
+        return rpc.setWebAccessPolicy(policy);
     }
 
     @Override
     public List<io.myotis.api.WebOrigin> recentWebOrigins() {
-        return io.myotis.jsonrpc.WebAccessApi.recent(webAccess);
+        return rpc == null ? List.of() : rpc.recentWebOrigins();
     }
 
     @Override

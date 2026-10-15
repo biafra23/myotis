@@ -5,7 +5,7 @@ import io.myotis.jsonrpc.RpcBackend
 import io.myotis.jsonrpc.RpcCallResult
 import io.myotis.jsonrpc.RpcEstimateResult
 import io.myotis.jsonrpc.RpcSendResult
-import io.myotis.jsonrpc.RpcBlockWindow
+import io.myotis.jsonrpc.policy.RpcBlockWindow
 import io.myotis.jsonrpc.RpcTransactionArgs
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull

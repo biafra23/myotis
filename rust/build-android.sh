@@ -32,7 +32,7 @@ jniLibs="$here/../android-app/src/main/jniLibs"
 cd "$here"
 # Build from the workspace root so the workspace [profile.release] and
 # .cargo/config.toml apply. Ships myotis-bls (native BLS) and myotis-engine
-# (the Rust engine behind :myotis-engines' RustEngineNative). 16 KB-aligned
+# (the Rust engine behind :myotis-engine-rust's RustEngineNative). 16 KB-aligned
 # LOAD segments (.cargo/config.toml passes -Wl,-z,max-page-size=16384) so the
 # libs load on Android 15+ devices with 16 KB memory pages.
 # A plain string, not an array: macOS's bash 3.2 rejects an empty array

@@ -49,7 +49,7 @@ dependencies {
 
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)
-    // ReadStatsTest parses the shadow-cache JSON it pins (Android-safe parser, also used by :myotis-engines).
+    // ReadStatsTest parses the shadow-cache JSON it pins (Android-safe parser, also used by :myotis-engine-rust).
     testImplementation(libs.minimal.json)
     testRuntimeOnly(libs.logback.classic)
 }

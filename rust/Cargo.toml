@@ -35,7 +35,7 @@
 #                      `panic = "abort"` is the contract it already lives under)
 #                      and adds only a blocking HTTP server and clap.
 #   uniffi-bindgen   — the pinned uniffi-bindgen CLI (Gradle `uniffiGenerateKotlin`
-#                      regenerates :myotis-engines' committed Kotlin bindings with it).
+#                      regenerates :myotis-engine-rust's committed Kotlin bindings with it).
 #
 # Built from Gradle when cargo is available (root build.gradle.kts `cargoBuildHost`
 # etc.); entirely optional — the pure-Java build never needs this workspace.

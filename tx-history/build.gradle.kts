@@ -48,7 +48,7 @@ dependencies {
     // trueblocks-kotlin's POM exposes kethereum at runtime scope only.
     implementation(libs.kethereum.model)
     // Manifest JSON parsing (tiny, dependency-free, Android-safe — same parser
-    // :myotis-engines uses for its JNI marshalling).
+    // :myotis-engine-rust uses for its JNI marshalling).
     implementation(libs.minimal.json)
 
     implementation(libs.kotlinx.coroutines.core)
