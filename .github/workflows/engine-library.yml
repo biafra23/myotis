@@ -1,0 +1,356 @@
+# The engine library's publication: io.myotis:myotis-engine (the Android AAR +
+# the desktop jar) and the modules its POMs reach, staged as a Maven repository
+# and checked (scripts/check_engine_library.sh) on every run; on a `v*` tag,
+# published to GitHub Packages and attached to the release as the bare AAR plus
+# a zip of that repository, with a SHA256SUMS file. Consumer side:
+# docs/android-library.md. Which modules, and why: the `Publishing` section of
+# the root build.gradle.kts.
+#
+# The APK workflow already builds the same AAR into the Myotis app on every
+# push to main; what this one adds is the PUBLICATION — the coordinates, the
+# POMs and module metadata a consumer resolves, the strict JNA pin in them,
+# and an AAR checked on its own rather than merged into an app.
+name: Engine library
+
+on:
+  # Pushes to main only where the publication can change (its modules, the
+  # root build that defines it, the Rust engine inside the AAR, this file and
+  # its check) — like node-binding.yml. GitHub does not evaluate paths filters
+  # for tag pushes, so `v*` release runs always fire. No pull_request trigger:
+  # the Rust Android cross-compile this needs is a 10-minute leg, and the APK
+  # workflow already runs it on every PR into main; a PR that changes the
+  # publication dispatches this on its branch from the Actions tab.
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+    paths:
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
+      - 'gradle/**'
+      - 'myotis-api/**'
+      - 'core/**'
+      - 'myotis-engine-common/**'
+      - 'myotis-rpc-policy/**'
+      - 'myotis-engine-rust/**'
+      - 'myotis-engine/**'
+      - 'rust/**'
+      - 'scripts/check_engine_library.sh'
+      - '.github/workflows/engine-library.yml'
+      - '.github/workflows/release-version-guard.yml'
+  workflow_dispatch:
+
+# The event is part of the group so a dispatch on main cannot cancel an
+# in-flight merge-to-main run, nor one on a v* tag that tag's publish —
+# as in node-binding.yml.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Stage + check, no upload: every push to main and every dispatch. Not on a
+  # tag — there the publish job below IS the build, so the tag's assets and its
+  # GitHub Packages artifacts come from one build (a second build would not
+  # produce the same bytes: jars are not reproducible here).
+  build:
+    name: Stage and check the publication
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      # The AAR builds the Rust engine FROM SOURCE (:myotis-engine's preBuild
+      # chain): the Android rustup targets, cargo-ndk and the runner's NDK, as
+      # in android-apk.yml. No -PskipRustEngine — a published AAR without the
+      # engine is a library that loads nothing.
+      - name: Set up Rust (Android targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: engine-library-rust
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      # Retry to ride out transient dependency-resolution blips, as the APK
+      # build does. The staging repository is wiped first: Gradle's publish
+      # only adds, so a retry after a half-written attempt would otherwise
+      # leave a layout the check cannot tell from a complete one.
+      # -PpublishRelease here too, although nothing is published: it stages
+      # the release layout (X.Y.Z file names) the check reads and a tag would
+      # publish — a SNAPSHOT is staged under Maven's timestamped names.
+      - name: Stage the publication (build/maven-repo)
+        run: |
+          for attempt in 1 2 3; do
+            rm -rf build/maven-repo
+            ./gradlew -PpublishRelease publishAllPublicationsToStagingRepository --stacktrace && exit 0
+            echo "::warning::staging attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
+            sleep 25
+          done
+          echo "::error::staging the publication failed after 3 attempts"
+          exit 1
+
+      # Same two backstops as android-apk.yml: the jniLibs were really built
+      # (cargoNdkAndroid self-skips only on an incomplete toolchain, which
+      # requireAndroidRustEngine turns into an error — belt and braces), and
+      # the committed UniFFI bindings match the Rust source the AAR's .so was
+      # built from, or the published AAR fails UniFFI validation on-device.
+      - name: Verify the jniLibs were built from source and the bindings are current
+        run: |
+          set -euo pipefail
+          for abi in arm64-v8a x86_64; do
+            lib="myotis-engine/src/androidMain/jniLibs/$abi/libmyotis_engine.so"
+            [ "$lib" -nt gradlew ] \
+              || { echo "::error::$lib was NOT built (cargoNdkAndroid self-skipped?)"; exit 1; }
+          done
+          bindings=myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt
+          git diff --exit-code -- "$bindings" || {
+            echo "::error::$bindings is STALE vs rust/myotis-engine — regenerate with" \
+                 "\`./gradlew uniffiGenerateKotlin\` and commit."
+            exit 1
+          }
+
+      - name: Check the staged publication
+        run: scripts/check_engine_library.sh build/maven-repo
+
+      - name: Upload the staged repository
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-library-maven-repo-${{ github.sha }}
+          path: build/maven-repo
+          if-no-files-found: error
+          retention-days: 30
+
+  # Refuse to publish a release whose tag disagrees with the project version —
+  # the artifacts carry project.version (minus -SNAPSHOT), the release is named
+  # after the tag. See release-version-guard.yml; runs in parallel with nothing
+  # here (the publish job waits for it), ~30s.
+  version-guard:
+    name: Release version guard
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/release-version-guard.yml
+
+  # The tag build: stage, check, publish to GitHub Packages, attach to the
+  # release. Builds itself (see the build job's note) — the same steps; here
+  # -PpublishRelease is what makes vX.Y.Z publish X.Y.Z.
+  #
+  # Re-running a tag's publish: GitHub Packages refuses to overwrite a version
+  # (the Gradle publish fails with 409/422), so a republish needs that package
+  # version deleted first — every io.myotis.* package of it — in the
+  # repository's Packages page. The release assets re-upload with --clobber.
+  publish:
+    name: Publish to GitHub Packages and the release
+    needs: version-guard
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      # gh release create/upload/edit needs write access to Releases; the Maven
+      # publish needs write access to Packages.
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Set up Rust (Android targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: engine-library-rust
+          # The tag's run restores main's cache; it does not save one.
+          save-if: false
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Stage the release publication (build/maven-repo)
+        run: |
+          for attempt in 1 2 3; do
+            rm -rf build/maven-repo
+            ./gradlew -PpublishRelease publishAllPublicationsToStagingRepository --stacktrace && exit 0
+            echo "::warning::staging attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
+            sleep 25
+          done
+          echo "::error::staging the publication failed after 3 attempts"
+          exit 1
+
+      - name: Verify the jniLibs were built from source and the bindings are current
+        run: |
+          set -euo pipefail
+          for abi in arm64-v8a x86_64; do
+            lib="myotis-engine/src/androidMain/jniLibs/$abi/libmyotis_engine.so"
+            [ "$lib" -nt gradlew ] \
+              || { echo "::error::$lib was NOT built (cargoNdkAndroid self-skipped?)"; exit 1; }
+          done
+          bindings=myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt
+          git diff --exit-code -- "$bindings" || {
+            echo "::error::$bindings is STALE vs rust/myotis-engine — regenerate with" \
+                 "\`./gradlew uniffiGenerateKotlin\` and commit."
+            exit 1
+          }
+
+      # Everything below uploads; nothing is uploaded unless the staged set is
+      # complete and correct.
+      - name: Check the staged publication
+        run: scripts/check_engine_library.sh build/maven-repo
+
+      # The same build, published again by Gradle to GitHub Packages: the
+      # staged files and these are the outputs of the one build above (the
+      # jars, poms and module files are task outputs Gradle reuses, not
+      # rebuilt). GITHUB_ACTOR is set by Actions; the token is the job's.
+      - name: Publish to GitHub Packages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./gradlew -PpublishRelease publishAllPublicationsToGitHubPackagesRepository --stacktrace
+
+      - name: Assemble the release assets
+        run: |
+          set -euo pipefail
+          # The tag goes into the asset file names (as for the APK and the dmg).
+          printf '%s' "${GITHUB_REF_NAME}" | grep -Eq '^v[A-Za-z0-9._-]+$' \
+            || { echo "::error::'${GITHUB_REF_NAME}' is not a valid release tag (expected v<version>)"; exit 1; }
+          version=$(basename "$(ls -d build/maven-repo/io/myotis/myotis-engine/*/)")
+          mkdir -p assets
+          cp "build/maven-repo/io/myotis/myotis-engine-android/$version/myotis-engine-android-$version.aar" \
+             "assets/myotis-engine-${GITHUB_REF_NAME}-android.aar"
+          # The whole staged repository: unzip it and point Gradle at the
+          # directory, and no GitHub token is needed (docs/android-library.md).
+          (cd build/maven-repo && zip -qr "../../assets/myotis-engine-${GITHUB_REF_NAME}-maven-repo.zip" io)
+          (cd assets && sha256sum myotis-engine-*.aar myotis-engine-*.zip > myotis-engine.SHA256SUMS && cat myotis-engine.SHA256SUMS)
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          # The engine-library section for the notes. Quoted heredoc keeps the
+          # markdown literal; the placeholder dodges backtick substitution.
+          section=$(mktemp)
+          cat > "$section" <<'SECTION'
+          **Engine library (`myotis-engine-<tag>-android.aar`, `myotis-engine-<tag>-maven-repo.zip`)** —
+          the Myotis Rust engine as a library for other apps: `io.myotis:myotis-engine:__VERSION__`
+          on GitHub Packages (needs a token with read:packages), or the zip unpacked as a local
+          Maven repository for a build without one. The AAR alone is the Android artifact; its
+          dependencies are in the zip and on GitHub Packages. Verify downloads against
+          `myotis-engine.SHA256SUMS`. See docs/android-library.md.
+          SECTION
+          sed -i "s/__VERSION__/$version/g" "$section"
+          # Master notes for the case where THIS job creates the release (same
+          # text the android/desktop/node workflows carry), plus the section.
+          notes=$(mktemp)
+          cat > "$notes" <<'NOTES'
+          Pre-release build of the Myotis wallet apps.
+
+          **Android (`*-android.apk`)** — the Myotis app, signed with Myotis's own release key
+          (its certificate's SHA-256 is in `android-app/release-signing-cert.sha256` in the
+          repository). Install via "Install unknown apps" and switch that off again afterwards;
+          only ever install Myotis, and its updates, from this releases page.
+
+          **Android debug (`*-android-debug.apk`)** — a separate test app ("Myotis Debug", amber
+          icon, package `com.jaeckel.ethp2p.android.debug`), signed with the publicly known debug
+          key: anyone can build an APK that installs over it as an update, so do not rely on it for
+          a wallet you use. It installs next to the release app, but run only one of them at a time:
+          both use the same network and JSON-RPC ports.
+
+          **Coming from an older Android release?** Releases that shipped only an
+          `*-android-debug.apk` installed Myotis itself (package `com.jaeckel.ethp2p.android`)
+          signed with that public debug key. Android will not update it to the release-signed app
+          ("App not installed … conflicts with an existing package"), and while it stays installed
+          anyone's lookalike can replace it. Uninstall it first: that deletes its settings, allowed
+          websites and sync progress (Myotis holds no wallet keys or funds), and the new app
+          re-syncs on its first start.
+
+          **Desktop macOS (`Myotis-v<version>-<arch>.dmg`)** — unsigned; download the dmg matching
+          your Mac (arm64 for Apple Silicon, x64 for Intel). First launch:
+          right-click → Open to get past Gatekeeper (not notarized yet).
+
+          **Bee PoC (`Myotis-v<version>-bee-poc-arm64.dmg`, when present)** — a separate app
+          ("Myotis Bee PoC", own data dir) that a Swarm Bee full node can use as its
+          Gnosis RPC from the first minute: it ships a pre-built PostageStamp log-index
+          seed and warm peer caches. Demo/debug artefact — the seed is RPC-sourced and
+          served unverified (only the backfill walk would re-check it, and the app ships
+          with that walk switched off), and it stops catching up about 29
+          days after its fetch (the Index tab shows the block it is usable until). See
+          docs/bee-rpc-service.md.
+
+          **RAILGUN PoC (`Myotis-v<version>-railgun-poc-arm64.dmg`, when present)** — a separate
+          app ("Myotis RAILGUN PoC", own data dir) that the RAILGUN Terminal Wallet CLI can use as
+          its mainnet RPC from the first minute, and as its Sepolia RPC once Sepolia is switched on
+          in the app: it ships pre-built log-index seeds covering the RailgunSmartWallet contract
+          on both networks from its deployment block. It
+          serves mainnet on port 8555 and Sepolia on 8557, not the regular app's 8545 and 8547:
+          point the wallet at `http://127.0.0.1:8555` or `http://127.0.0.1:8557`. Debug/demo
+          artefact, not a production path — the seeds are RPC-sourced and unverified (no
+          receipt-root proof), and each stops catching up about 69 days after its fetch (the
+          Index tab shows the block it is usable until). See docs/railgun-poc.md.
+
+          **Desktop Linux (`Myotis-v<version>-<arch>.deb`)** — install with
+          `sudo apt install ./Myotis-v<version>-<arch>.deb` (x64 for Intel/AMD, arm64 for
+          Raspberry Pi 5 / ARM machines).
+          NOTES
+          printf '\n' >> "$notes"
+          cat "$section" >> "$notes"
+          # Create the release if it doesn't exist yet. Another workflow may win
+          # this race for the same tag: if `create` fails, re-check with `view`
+          # (node-binding.yml's pattern).
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --prerelease \
+              --title "Myotis $tag" \
+              --notes-file "$notes" \
+              --target "${GITHUB_SHA}" \
+            || gh release view "$tag" >/dev/null 2>&1
+          fi
+          # Whether we created the release or another workflow did: make sure
+          # the notes carry the engine-library section exactly once.
+          body=$(mktemp)
+          gh release view "$tag" --json body --jq .body > "$body"
+          if ! grep -q 'Engine library' "$body"; then
+            printf '\n' >> "$body"
+            cat "$section" >> "$body"
+            gh release edit "$tag" --notes-file "$body"
+          fi
+          gh release upload "$tag" \
+            assets/myotis-engine-*.aar assets/myotis-engine-*.zip assets/myotis-engine.SHA256SUMS --clobber
