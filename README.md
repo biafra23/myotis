@@ -1004,7 +1004,7 @@ itself (verified reverse-ENS), so a generated file cannot lie about who a contra
 Key Gradle modules (plus the `rust/` Cargo workspace):
 
 - **myotis-api** -- the engine contract: zero-dependency interfaces every host consumes exclusively
-- **myotis-engine** -- the engine LIBRARY: a Kotlin Multiplatform module (jvm + android, no UI) packaging the Rust engine for the hosts as the Android AAR (jniLibs + JNA's dispatcher inside) and the desktop jar; `io.myotis.engine.Myotis` is the entry point. Published as `io.myotis:myotis-engine` (GitHub Packages + a Maven-repository zip on each release) — docs/android-library.md
+- **myotis-engine** -- the engine LIBRARY: a Kotlin Multiplatform module (jvm + android, no UI) packaging the Rust engine for the hosts as the Android AAR (jniLibs + JNA's dispatcher inside) and the desktop jar; `io.myotis.engine.Myotis` is the entry point. Published as `eth.myotis:myotis-engine` (GitHub Packages, the token-free `maven-repo` branch and a Maven-repository zip on each release) — docs/android-library.md
 - **myotis-engines** -- the engine selector (`Engines.engine()`; `myotis.engine=java|rust|auto`) routing to the Java engine or the Rust one
 - **myotis-engine-rust** -- the Rust engine behind the `:myotis-api` contract on its own, over the committed UniFFI Kotlin bindings + JNA; no Java-engine dependency and no HTTP server (the loopback listener is a port the selector fills)
 - **myotis-rpc-policy** -- the JSON-RPC serving policy (`RpcBlockWindow`) shared by the Rust engine, the router and the iOS backend; Kotlin Multiplatform, dependency-free

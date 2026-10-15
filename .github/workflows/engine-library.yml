@@ -1,8 +1,9 @@
-# The engine library's publication: io.myotis:myotis-engine (the Android AAR +
+# The engine library's publication: eth.myotis:myotis-engine (the Android AAR +
 # the desktop jar) and the modules its POMs reach, staged as a Maven repository
 # and checked (scripts/check_engine_library.sh) on every run; on a `v*` tag,
-# published to GitHub Packages and attached to the release as the bare AAR plus
-# a zip of that repository, with a SHA256SUMS file. Consumer side:
+# published to GitHub Packages, merged into the `maven-repo` branch (a Maven
+# repository URL that needs no token) and attached to the release as the bare
+# AAR plus a zip of that repository, with a SHA256SUMS file. Consumer side:
 # docs/android-library.md. Which modules, and why: the `Publishing` section of
 # the root build.gradle.kts.
 #
@@ -137,14 +138,14 @@ jobs:
             || { echo "::error::'${GITHUB_REF_NAME}' is not a valid release tag (expected v<version>)"; exit 1; }
           # The one staged version — what GitHub Packages now carries and what
           # the release notes below name; exported for that step.
-          version=$(basename "$(ls -d build/maven-repo/io/myotis/myotis-engine/*/)")
+          version=$(basename "$(ls -d build/maven-repo/eth/myotis/myotis-engine/*/)")
           echo "STAGED_VERSION=$version" >> "$GITHUB_ENV"
           mkdir -p assets
-          cp "build/maven-repo/io/myotis/myotis-engine-android/$version/myotis-engine-android-$version.aar" \
+          cp "build/maven-repo/eth/myotis/myotis-engine-android/$version/myotis-engine-android-$version.aar" \
              "assets/myotis-engine-${GITHUB_REF_NAME}-android.aar"
           # The whole staged repository: unzip it and point Gradle at the
           # directory, and no GitHub token is needed (docs/android-library.md).
-          (cd build/maven-repo && zip -qr "../../assets/myotis-engine-${GITHUB_REF_NAME}-maven-repo.zip" io)
+          (cd build/maven-repo && zip -qr "../../assets/myotis-engine-${GITHUB_REF_NAME}-maven-repo.zip" eth)
           (cd assets && sha256sum myotis-engine-*.aar myotis-engine-*.zip > myotis-engine.SHA256SUMS && cat myotis-engine.SHA256SUMS)
 
       - name: Publish to GitHub Release
@@ -159,9 +160,10 @@ jobs:
           section=$(mktemp)
           cat > "$section" <<'SECTION'
           **Engine library (`myotis-engine-<tag>-android.aar`, `myotis-engine-<tag>-maven-repo.zip`)** —
-          the Myotis Rust engine as a library for other apps: `io.myotis:myotis-engine:__VERSION__`
-          on GitHub Packages (needs a token with read:packages), or the zip unpacked as a local
-          Maven repository for a build without one. The AAR alone is the Android artifact; its
+          the Myotis Rust engine as a library for other apps: `eth.myotis:myotis-engine:__VERSION__`
+          on GitHub Packages (needs a token with read:packages), from the `maven-repo` branch
+          (`https://raw.githubusercontent.com/biafra23/myotis/maven-repo`, no token), or the zip
+          unpacked as a local Maven repository. The AAR alone is the Android artifact; its
           dependencies are in the zip and on GitHub Packages. Verify downloads against
           `myotis-engine.SHA256SUMS`. See docs/android-library.md.
           SECTION
@@ -252,3 +254,50 @@ jobs:
           done
           gh release upload "$tag" \
             assets/myotis-engine-*.aar assets/myotis-engine-*.zip assets/myotis-engine.SHA256SUMS --clobber
+
+      # The same staged repository as a Maven repository URL that needs no token:
+      # merged into the `maven-repo` branch (an orphan branch holding nothing but
+      # the repository layout, created on the first publish), which
+      # raw.githubusercontent.com serves file by file — all Gradle needs. Versions
+      # add up; the artifact-level maven-metadata.xml is merged, not replaced
+      # (scripts/merge_maven_repo.py), so `0.1.+` keeps seeing every version.
+      # Last, so a transient failure here leaves GitHub Packages and the release
+      # assets in place (a re-run of the job publishes the branch alone: the
+      # Packages step then fails on the existing version, see the job's note).
+      - name: Publish to the maven-repo branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          work=$(mktemp -d)
+          if git ls-remote --exit-code --heads "$remote" maven-repo >/dev/null 2>&1; then
+            git clone --quiet --depth 1 --branch maven-repo "$remote" "$work"
+          else
+            git init --quiet --initial-branch=maven-repo "$work"
+            cat > "$work/README.md" <<'README'
+          # Myotis engine library — Maven repository
+
+          The `eth.myotis` artifacts of every release (docs/android-library.md on `main`),
+          laid out as a Maven repository and served by raw.githubusercontent.com, so a
+          build needs no GitHub token:
+
+          ```kotlin
+          maven {
+              url = uri("https://raw.githubusercontent.com/biafra23/myotis/maven-repo")
+              content { includeGroup("eth.myotis") }
+          }
+          ```
+
+          Written by the engine-library workflow on each `v*` tag; never edited by hand.
+          README
+          fi
+          python3 scripts/merge_maven_repo.py build/maven-repo "$work"
+          git -C "$work" add -A
+          if git -C "$work" -c user.name="github-actions[bot]" \
+                -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                commit --quiet -m "Publish ${GITHUB_REF_NAME}"; then
+            git -C "$work" push --quiet "$remote" HEAD:refs/heads/maven-repo
+          else
+            echo "maven-repo branch already carries ${GITHUB_REF_NAME}; nothing to publish"
+          fi

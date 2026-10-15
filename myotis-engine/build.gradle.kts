@@ -48,7 +48,7 @@ kotlin {
     // here is 17 or dependency-free, and the AAR must be consumable by a plain
     // Android app with no toolchain two-step.
     androidTarget {
-        // The AAR a consumer gets: the release variant — io.myotis:myotis-engine-android
+        // The AAR a consumer gets: the release variant — eth.myotis:myotis-engine-android
         // (root build.gradle.kts, `Publishing`; docs/android-library.md).
         publishLibraryVariants("release")
         compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) }

@@ -9,7 +9,7 @@
 # android-apk.yml does. No -PskipRustEngine — a published AAR without the
 # engine is a library that loads nothing.
 name: Stage the engine library
-description: Build the io.myotis publication into build/maven-repo and check it
+description: Build the eth.myotis publication into build/maven-repo and check it
 
 inputs:
   release-tag:

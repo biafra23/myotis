@@ -6,7 +6,7 @@
 // (NetworkFiles), assembled by DefaultEnginePorts.forNetwork. These are the
 // implementations the Myotis Android app carried in NodeService until the engine
 // library existed (the daemon and desktop keep their own twins in :app for now);
-// moved here so a consumer of io.myotis:myotis-engine gets a working engine from
+// moved here so a consumer of eth.myotis:myotis-engine gets a working engine from
 // a data directory alone instead of re-implementing four ports.
 //
 // Java 17 class files, Android-safe (the minSdk-29 budget in CLAUDE.md: plain

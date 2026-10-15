@@ -302,14 +302,22 @@ subprojects {
 // module its POMs reach: a consumer resolving the AAR needs them from the same
 // repository. That closure is exactly the Rust-engine half of the tree, none of
 // the Java engine (node-core, networking, consensus, Besu) and no Ktor server.
-// Coordinates: `io.myotis:<artifactId>` — the published packages are io.myotis.*,
-// and `com.jaeckel.ethp2p` (the Gradle group of everything else, the apps'
-// package id) stays the apps' name, not the library's.
+// Coordinates: `eth.myotis:<artifactId>` — myotis.eth is the project's ENS name
+// and the one namespace the owner controls (myotis.io is not theirs, so the Java
+// packages' io.myotis stays a package prefix and never becomes the Maven group);
+// `com.jaeckel.ethp2p` (the Gradle group of everything else, the apps' package
+// id) stays the apps' name, not the library's. A caveat for later: Maven Central
+// verifies a namespace through DNS, which an ENS name has none of, so a Central
+// publication would need another group (io.github.biafra23, verified through
+// GitHub) — GitHub Packages, the static branch and the release zip verify nothing.
 //
 // Where they go:
 //   - GitHub Packages (the `GitHubPackages` repository below), on every `v*` tag
 //     by .github/workflows/engine-library.yml; reading it needs a GitHub token
 //     with read:packages even for a public repository (GitHub's rule).
+//   - The `maven-repo` branch: the same staged repository, merged in by the tag's
+//     publish job (scripts/merge_maven_repo.py) and served file by file by
+//     raw.githubusercontent.com — a Maven repository URL with no token at all.
 //   - The `Staging` repository: build/maven-repo, a complete local Maven
 //     repository of just these artifacts. The workflow zips it as a release
 //     asset next to the bare AAR, so a consumer that wants no GitHub token can
@@ -371,7 +379,7 @@ val publishedVersion: String? = providers.gradleProperty("publishRelease").orNul
 val stagingRepository = layout.buildDirectory.dir("maven-repo")
 configure(subprojects.filter { it.name in publishedArtifactIds }) {
     apply(plugin = "maven-publish")
-    group = "io.myotis"
+    group = "eth.myotis"
     if (publishedVersion != null) version = publishedVersion
     val publishedArtifactId = publishedArtifactIds.getValue(name)
     val publishedDescription = publishedDescriptions.getValue(name)

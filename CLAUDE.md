@@ -81,11 +81,12 @@ Key Gradle modules:
 - **myotis-engine** — THE ENGINE LIBRARY: a Kotlin Multiplatform module (jvm +
   android targets, no UI) that packages the Rust engine for the hosts — the
   Android AAR (the Myotis app and a separate wallet product) and the desktop jar.
-  Published as `io.myotis:myotis-engine` with its upstream modules (`myotis-api`,
+  Published as `eth.myotis:myotis-engine` with its upstream modules (`myotis-api`,
   `myotis-engine-rust`, `myotis-engine-common`, `myotis-engine-ports`,
   `myotis-rpc-policy`, `myotis-core`
-  — the root build's `Publishing` section): GitHub Packages on every `v*` tag
-  plus the AAR and a Maven-repository zip as release assets
+  — the root build's `Publishing` section): GitHub Packages and the token-free
+  `maven-repo` branch on every `v*` tag plus the AAR and a Maven-repository zip
+  as release assets
   (`engine-library.yml`; `publishAllPublicationsToStagingRepository` +
   `scripts/check_engine_library.sh` verify the set; `publishToMavenLocal` for a
   consumer under development). docs/android-library.md is the consumer page.
