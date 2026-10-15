@@ -1,6 +1,10 @@
-package com.jaeckel.ethp2p.android;
+package io.myotis.engine.ports;
 
-import com.jaeckel.ethp2p.android.log.LogBuffer;
+import io.myotis.api.ports.BootstrapPeer;
+import io.myotis.api.ports.EngineClPeerCache;
+import io.myotis.api.ports.ServedRange;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
 import java.io.FileInputStream;
@@ -15,25 +19,30 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Android-native CL peer cache. Mirrors {@code CLPeerCache} in the :app module
- * but uses {@code android.util.Log} and {@code java.io} streams instead of
- * {@code java.nio.file.Files}, matching {@link AndroidPeerCache}.
+ * The file-backed CL (beacon, libp2p) peer cache — the engine API's
+ * {@link EngineClPeerCache} port over one text file. The Myotis Android app's cache,
+ * moved into the library (the daemon's twin is {@code com.jaeckel.ethp2p.app.CLPeerCache};
+ * same file format).
  *
  * <p>Format: one peer per line, {@code multiaddr[\t<token>]...}, with optional
  * tab-separated tokens {@code <low>-<high>} (served period range), {@code b<period>}
  * (bootstrap period), {@code lc}/{@code nolc} (light_client confirmed/denied), and a
  * bare {@code <period>} for legacy files. Peers are evicted after
  * {@link #FAILURE_THRESHOLD} consecutive failures.
+ *
+ * <p>Writes are inline (an append per new peer, a sorted rewrite when a verdict
+ * changes); the in-memory sets are authoritative and mutated under
+ * {@code synchronized(this)}.
  */
-public final class AndroidCLPeerCache {
+public final class FileClPeerCache implements EngineClPeerCache {
 
-    private static final String TAG = "ethp2p.cl-cache";
+    private static final Logger log = LoggerFactory.getLogger(FileClPeerCache.class);
     private static final char SEP = '\t';
-
     public static final int FAILURE_THRESHOLD = 3;
 
     private final Path cacheFile;
@@ -48,14 +57,19 @@ public final class AndroidCLPeerCache {
     /** Peers proven NOT to serve light_client (no LC protocols / negotiation failure) — dial last. */
     private final Set<String> lcDenied = ConcurrentHashMap.newKeySet();
 
-    public AndroidCLPeerCache(Path cacheFile) {
-        this.cacheFile = cacheFile;
+    public FileClPeerCache(Path cacheFile) {
+        this.cacheFile = Objects.requireNonNull(cacheFile, "cacheFile");
+    }
+
+    /** The file this cache persists to. */
+    public Path cacheFile() {
+        return cacheFile;
     }
 
     /** A demonstrably-served sync-committee period envelope {@code [low, high]}. Immutable;
      *  {@link #union} widens it. {@code low} never grows, {@code high} never shrinks. */
-    public record Range(long low, long high) {
-        public Range {
+    private record Range(long low, long high) {
+        private Range {
             if (high < low) { long t = low; low = high; high = t; } // normalize hand-edited files
         }
         Range union(Range o) {
@@ -63,6 +77,7 @@ public final class AndroidCLPeerCache {
         }
     }
 
+    @Override
     public synchronized void add(String multiaddr) {
         if (multiaddr == null || multiaddr.isEmpty()) return;
         failures.remove(multiaddr);
@@ -70,7 +85,7 @@ public final class AndroidCLPeerCache {
         try (FileOutputStream out = new FileOutputStream(cacheFile.toFile(), true)) {
             out.write((multiaddr + "\n").getBytes(StandardCharsets.UTF_8));
         } catch (IOException e) {
-            LogBuffer.w(TAG, "write failed: " + e.getMessage());
+            log.warn("write to {} failed: {}", cacheFile, e.getMessage());
         }
     }
 
@@ -80,6 +95,7 @@ public final class AndroidCLPeerCache {
      * {@code multiaddr\t<low>-<high>} so a restart can prefer peers whose range covers
      * the period we need.
      */
+    @Override
     public synchronized void recordServed(String multiaddr, long low, long high) {
         if (multiaddr == null || multiaddr.isEmpty()) return;
         failures.remove(multiaddr);
@@ -92,16 +108,12 @@ public final class AndroidCLPeerCache {
         rewriteFile();
     }
 
-    /** Convenience overload for a single served period (degenerate range {@code [p, p]}). */
-    public synchronized void recordServed(String multiaddr, long period) {
-        recordServed(multiaddr, period, period);
-    }
-
     /**
      * Record that a peer served a {@code LightClientBootstrap} for {@code period}. Keeps
      * the deepest (highest) checkpoint period. Persisted as {@code multiaddr\tb<period>}
      * so a restart prefers it as the bootstrap peer.
      */
+    @Override
     public synchronized void recordBootstrap(String multiaddr, long period) {
         if (multiaddr == null || multiaddr.isEmpty()) return;
         failures.remove(multiaddr);
@@ -112,50 +124,27 @@ public final class AndroidCLPeerCache {
         rewriteFile();
     }
 
-    /** multiaddr -> {low, high} served period range, for peers proven to serve catch-up. */
-    public Map<String, long[]> servedRanges() {
-        Map<String, long[]> out = new java.util.HashMap<>();
-        servedRange.forEach((ma, r) -> out.put(ma, new long[]{r.low(), r.high()}));
+    /** The served period range of every peer proven to serve catch-up. */
+    @Override
+    public List<ServedRange> servedRanges() {
+        List<ServedRange> out = new ArrayList<>(servedRange.size());
+        servedRange.forEach((ma, r) -> out.add(new ServedRange(ma, r.low(), r.high())));
         return out;
     }
 
-    /** multiaddr -> lowest served period (range floor), for peers proven to serve catch-up. */
-    public Map<String, Long> servedPeriods() {
-        Map<String, Long> out = new java.util.HashMap<>();
-        servedRange.forEach((ma, r) -> out.put(ma, r.low()));
+    /** The bootstrap period of every peer proven to serve a LightClientBootstrap. */
+    @Override
+    public List<BootstrapPeer> bootstrapPeers() {
+        List<BootstrapPeer> out = new ArrayList<>(bootstrapPeriod.size());
+        bootstrapPeriod.forEach((ma, p) -> out.add(new BootstrapPeer(ma, p)));
         return out;
-    }
-
-    /** multiaddr -> bootstrap period served, for peers proven to serve a LightClientBootstrap. */
-    public Map<String, Long> bootstrapPeers() {
-        return new java.util.HashMap<>(bootstrapPeriod);
-    }
-
-    /** Record that a peer's Identify confirmed light_client protocol support. Persisted so
-     *  a restart dials known light-client servers first instead of re-Identifying the whole
-     *  fork-matched cache (most of which are full nodes without the light-client server). */
-    public synchronized void markLightClient(String multiaddr) {
-        if (multiaddr == null || multiaddr.isEmpty()) return;
-        seen.add(multiaddr);
-        boolean changed = lcConfirmed.add(multiaddr);
-        changed |= lcDenied.remove(multiaddr);
-        if (changed) rewriteFile();
-    }
-
-    /** Record that a peer is proven NOT to serve light_client (no LC protocols on Identify,
-     *  or a protocol-negotiation failure). Deprioritized on a restart, not evicted. A
-     *  later confirmation (markLightClient) overrides this. */
-    public synchronized void markNoLightClient(String multiaddr) {
-        if (multiaddr == null || multiaddr.isEmpty() || lcConfirmed.contains(multiaddr)) return;
-        seen.add(multiaddr);
-        if (lcDenied.add(multiaddr)) rewriteFile();
     }
 
     /** Persist a whole Identify round's verdicts in a single rewrite. Avoids one disk
      *  write per peer when dozens are identified in parallel at startup. A confirmation
      *  overrides a prior denial; a denial never demotes a confirmed peer. */
-    public synchronized void markLightClientBatch(java.util.Collection<String> confirmed,
-                                                  java.util.Collection<String> denied) {
+    @Override
+    public synchronized void markLightClientBatch(List<String> confirmed, List<String> denied) {
         boolean changed = false;
         if (confirmed != null) {
             for (String ma : confirmed) {
@@ -176,15 +165,18 @@ public final class AndroidCLPeerCache {
     }
 
     /** Peers whose Identify confirmed light_client support (dial first). */
-    public Set<String> lightClientConfirmed() {
-        return new java.util.HashSet<>(lcConfirmed);
+    @Override
+    public List<String> lightClientConfirmed() {
+        return new ArrayList<>(lcConfirmed);
     }
 
     /** Peers proven not to serve light_client (dial last / skip). */
-    public Set<String> lightClientDenied() {
-        return new java.util.HashSet<>(lcDenied);
+    @Override
+    public List<String> lightClientDenied() {
+        return new ArrayList<>(lcDenied);
     }
 
+    @Override
     public synchronized void markFailure(String multiaddr) {
         if (multiaddr == null || multiaddr.isEmpty()) return;
         if (!seen.contains(multiaddr)) return;
@@ -197,11 +189,13 @@ public final class AndroidCLPeerCache {
                 lcConfirmed.remove(multiaddr);
                 lcDenied.remove(multiaddr);
                 rewriteFile();
-                LogBuffer.i(TAG, "evicted peer after " + count + " failures: " + multiaddr);
+                log.info("evicted CL peer after {} failures: {}", count, multiaddr);
             }
         }
     }
 
+    /** Read the file: every peer on it, filling the verdict maps from its tokens. */
+    @Override
     public List<String> load() {
         List<String> result = new ArrayList<>();
         if (!cacheFile.toFile().exists()) return result;
@@ -230,8 +224,9 @@ public final class AndroidCLPeerCache {
                                     ? new Range(Long.parseLong(tok.substring(0, dash)),
                                                 Long.parseLong(tok.substring(dash + 1)))
                                     : new Range(Long.parseLong(tok), Long.parseLong(tok)); // legacy floor
-                            // Widen (not overwrite) if a line carries multiple range/legacy tokens,
-                            // so duplicates keep the envelope instead of silently dropping data.
+                            // Widen (not overwrite) if a line carries multiple range/legacy
+                            // tokens, so duplicates keep the envelope instead of silently
+                            // dropping data.
                             servedRange.merge(multiaddr, incoming, Range::union);
                         } catch (NumberFormatException ignored) {}
                     }
@@ -240,17 +235,17 @@ public final class AndroidCLPeerCache {
                 seen.add(multiaddr);
             }
             if (!result.isEmpty()) {
-                LogBuffer.i(TAG, "loaded " + result.size() + " cached CL peer(s) ("
-                        + servedRange.size() + " catch-up servers, "
-                        + bootstrapPeriod.size() + " bootstrap peers, "
-                        + lcConfirmed.size() + " light-client, " + lcDenied.size() + " non-LC)");
+                log.info("loaded {} cached CL peer(s) from {} ({} catch-up servers, {} bootstrap peers, {} light-client, {} non-LC)",
+                        result.size(), cacheFile, servedRange.size(), bootstrapPeriod.size(),
+                        lcConfirmed.size(), lcDenied.size());
             }
         } catch (IOException e) {
-            LogBuffer.w(TAG, "read failed: " + e.getMessage());
+            log.warn("read of {} failed: {}", cacheFile, e.getMessage());
         }
         return result;
     }
 
+    /** Forget every peer and delete the cache file. */
     public synchronized void clear() {
         seen.clear();
         failures.clear();
@@ -259,9 +254,13 @@ public final class AndroidCLPeerCache {
         lcConfirmed.clear();
         lcDenied.clear();
         if (!cacheFile.toFile().delete() && cacheFile.toFile().exists()) {
-            LogBuffer.w(TAG, "failed to delete cache file " + cacheFile);
+            log.warn("failed to delete cache file {}", cacheFile);
         }
     }
+
+    /** Writes are inline, so there is nothing to drain. */
+    @Override
+    public void close() {}
 
     private synchronized void rewriteFile() {
         List<String> peers = new ArrayList<>(seen);
@@ -279,7 +278,7 @@ public final class AndroidCLPeerCache {
                 w.write('\n');
             }
         } catch (IOException e) {
-            LogBuffer.w(TAG, "rewrite failed: " + e.getMessage());
+            log.warn("rewrite of {} failed: {}", cacheFile, e.getMessage());
         }
     }
 }

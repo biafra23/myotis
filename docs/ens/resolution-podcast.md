@@ -436,7 +436,7 @@ GET or POST to a URL, return the body as a string, async." That keeps
 `myotis-evm` free of any HTTP-client dependency. The wallet integration
 provides the transport. On the daemon and the desktop app,
 `JavaHttpCcipGateway`, in app's `rpc` package, uses Java's built-in
-`java.net.http.HttpClient`. Android ships `AndroidCcipGateway` over
+`java.net.http.HttpClient`. Android ships the engine library's `UrlConnectionHttpGateway` over
 `HttpURLConnection` instead, because java-dot-net-dot-http isn't available
 below API 33.
 
@@ -850,7 +850,7 @@ running on the phone or on a server it trusts.
 
 [BOB] Same idea. myotis-evm doesn't import HttpClient. CcipGateway is one
 method. JavaHttpCcipGateway lives in app. Android ships
-`AndroidCcipGateway` over `HttpURLConnection` — not the Ktor that the
+`UrlConnectionHttpGateway` over `HttpURLConnection` — not the Ktor that the
 project's CLAUDE dot md asks for, a deviation the `CcipGateway` Javadoc
 records. Decoupling cost: minor; future-proofing
 benefit: you can target Kotlin Multiplatform without ripping out the

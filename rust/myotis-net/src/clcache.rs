@@ -1,5 +1,5 @@
 //! CL peer cache — the Rust reader/writer of the SAME `cl-peers[-net].cache`
-//! file the Java hosts maintain (`AndroidCLPeerCache` / `app CLPeerCache`), so
+//! file the Java hosts maintain (the engine library's `FileClPeerCache` / `app CLPeerCache`), so
 //! proven light-client servers survive restarts AND engine switches.
 //!
 //! Format (tab-separated UTF-8 lines, one peer per line, only lines starting

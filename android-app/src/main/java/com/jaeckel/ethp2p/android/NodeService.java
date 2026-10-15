@@ -25,11 +25,13 @@ import io.myotis.api.MyotisEngine;
 import io.myotis.api.NetworkInfo;
 import io.myotis.api.StatusSnapshot;
 import io.myotis.api.ports.EnginePorts;
-import io.myotis.api.ports.NodeKeyStore;
+import io.myotis.engine.ports.DefaultEnginePorts;
+import io.myotis.engine.ports.FileClPeerCache;
+import io.myotis.engine.ports.FilePeerCache;
+import io.myotis.engine.ports.NetworkFiles;
 import io.myotis.ui.CacheFileStats;
 
 import java.net.InetAddress;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -1017,12 +1019,18 @@ public final class NodeService extends Service {
         }
     }
 
-    /** Cache file in getCacheDir(), suffixed by the network (mainnet keeps the bare name) so
-     *  chains never share peer caches / sync snapshots. */
-    private java.io.File netCacheFor(String network, String base, String ext) {
-        String n = canonicalNetwork(network);
-        String suffix = n.equals("mainnet") ? "" : "-" + n;
-        return new java.io.File(getCacheDir(), base + suffix + ext);
+    /** The network's cache-side files, named by the engine library's layout
+     *  ({@link NetworkFiles}: mainnet keeps the legacy suffix-less names, every other
+     *  network gets {@code -<network>}) — the same names the ports write, so this is
+     *  one definition for the app's own file handling too. */
+    private Path peerCacheFile(String network) {
+        return NetworkFiles.peerCache(getCacheDir().toPath(), canonicalNetwork(network));
+    }
+    private Path clPeerCacheFile(String network) {
+        return NetworkFiles.clPeerCache(getCacheDir().toPath(), canonicalNetwork(network));
+    }
+    private Path syncSnapshotFile(String network) {
+        return NetworkFiles.syncSnapshot(getCacheDir().toPath(), canonicalNetwork(network));
     }
 
 
@@ -1039,8 +1047,8 @@ public final class NodeService extends Service {
     // The live cache instances per network (also handed to the engine via the port
     // adapters), kept so "Clear caches" can wipe the in-memory + on-disk cache of a
     // running chain. Removed on shutdown.
-    private final Map<String, AndroidPeerCache> elCaches = new ConcurrentHashMap<>();
-    private final Map<String, AndroidCLPeerCache> clCaches = new ConcurrentHashMap<>();
+    private final Map<String, FilePeerCache> elCaches = new ConcurrentHashMap<>();
+    private final Map<String, FileClPeerCache> clCaches = new ConcurrentHashMap<>();
     // Per-network lifecycle lock: a network's start() and stop() serialize on this, so a
     // fast Stop→Start or disable→enable of the same chain has the new boot wait for the old
     // teardown to free its ports AND unregister from the engine (create() throws on a
@@ -2312,15 +2320,22 @@ public final class NodeService extends Service {
                     return;
                 }
 
-                // Build the caches HERE — inside the lock, after every bail check — so an
+                // Build the ports HERE — inside the lock, after every bail check — so an
                 // early bail can never orphan a freshly-started cache writer thread, and the
                 // maps can never be clobbered while a live stack still uses the previous
-                // instances (the engine owns these via the port adapters from create() on).
-                // Reconstructible network state lives in getCacheDir() so "Clear cache" wipes
-                // the peer caches + sync snapshot while identity / query history in
-                // getFilesDir() survive.
-                AndroidPeerCache pc = new AndroidPeerCache(netCacheFor(n, "peers", ".cache").toPath());
-                AndroidCLPeerCache cl = new AndroidCLPeerCache(netCacheFor(n, "cl-peers", ".cache").toPath());
+                // instances (the engine owns the caches from create() on). The engine
+                // library's defaults (io.myotis.engine.ports): identity under getFilesDir()
+                // (legacy mainnet keeps nodekey.hex; other chains get a per-network key so
+                // two chains never share an identity), the peer caches under getCacheDir()
+                // so "Clear cache" wipes them + the sync snapshot while identity / query
+                // history survive, the HttpURLConnection CCIP gateway, and — the one port a
+                // mobile host must fill itself — the active network's DNS servers for
+                // EIP-1459 resolution.
+                DefaultEnginePorts defaults = DefaultEnginePorts.forNetwork(
+                        getFilesDir().toPath(), getCacheDir().toPath(), n,
+                        this::activeNetworkDnsServers);
+                FilePeerCache pc = defaults.peerCache();
+                FileClPeerCache cl = defaults.clPeerCache();
                 cachedElCounts.put(n, pc.load().size());
                 cachedClCounts.put(n, cl.load().size());
                 elCaches.put(n, pc);
@@ -2328,25 +2343,16 @@ public final class NodeService extends Service {
 
                 // EL/discv5 ports use the engine's per-network defaults (0); the RPC port is
                 // the user-configurable one. The snap maintainer keeps snap peers topped up
-                // (the discv4-independent path NAT'd mobile needs); Android supplies the
-                // active network's DNS servers for EIP-1459 resolution.
+                // (the discv4-independent path NAT'd mobile needs).
                 EngineConfig config = new EngineConfig(
                         n, 0, 0, rpcPort,
-                        netCacheFor(n, "sync-state", ".snapshot").getAbsolutePath(),
+                        defaults.syncSnapshot().toAbsolutePath().toString(),
                         snapTarget(this),
                         strictStateFreshness(this),
                         // Reconstructible engine-owned state belongs with the other network
                         // caches so "Clear cache" wipes it too.
                         getCacheDir().getAbsolutePath());
-                EnginePorts ports = new EnginePorts(
-                        // Identity: legacy mainnet keeps nodekey.hex; other chains get a
-                        // per-network key so two chains never share an identity.
-                        new AndroidNodeKeyStore(getFilesDir()),
-                        new AndroidPeerCacheAdapter(pc),
-                        new AndroidClPeerCacheAdapter(cl),
-                        this::activeNetworkDnsServers,
-                        new com.jaeckel.ethp2p.android.ens.AndroidCcipGateway(),
-                        null, null); // engine default logger/clock
+                EnginePorts ports = defaults.ports(); // engine default logger/clock
 
                 ChainHandle handle = ENGINE.create(config, ports);
                 created = handle;
@@ -2458,53 +2464,6 @@ public final class NodeService extends Service {
         }
     }
 
-    /** Node-identity storage over getFilesDir(): one hex file per network, byte-compatible
-     *  with the files NodeKey.loadOrGenerate has always written (identities carry over). */
-    private static final class AndroidNodeKeyStore implements NodeKeyStore {
-        private final java.io.File filesDir;
-        AndroidNodeKeyStore(java.io.File filesDir) { this.filesDir = filesDir; }
-        private Path fileFor(String network) {
-            return new java.io.File(filesDir,
-                    network.equals("mainnet") ? "nodekey.hex" : "nodekey-" + network + ".hex").toPath();
-        }
-        @Override public byte[] load(String networkName) {
-            Path file = fileFor(networkName);
-            if (!Files.exists(file)) return null;
-            try {
-                String hex = new String(Files.readAllBytes(file),
-                        java.nio.charset.StandardCharsets.UTF_8).strip();
-                if (hex.startsWith("0x") || hex.startsWith("0X")) hex = hex.substring(2);
-                // Hand-rolled hex: java.util.HexFormat is API 34 and NOT covered by
-                // core-library desugaring, so it would crash at runtime on minSdk 29.
-                if (hex.length() % 2 != 0) throw new IllegalArgumentException("odd-length hex");
-                byte[] out = new byte[hex.length() / 2];
-                for (int i = 0; i < out.length; i++) {
-                    int hi = Character.digit(hex.charAt(i * 2), 16);
-                    int lo = Character.digit(hex.charAt(i * 2 + 1), 16);
-                    if (hi < 0 || lo < 0) throw new IllegalArgumentException("non-hex character");
-                    out[i] = (byte) ((hi << 4) | lo);
-                }
-                return out;
-            } catch (Exception e) {
-                throw new RuntimeException("failed to read node key " + file + ": " + e.getMessage(), e);
-            }
-        }
-        @Override public void store(String networkName, byte[] secret32) {
-            Path file = fileFor(networkName);
-            try {
-                StringBuilder sb = new StringBuilder(2 + secret32.length * 2);
-                sb.append("0x");
-                for (byte b : secret32) {
-                    sb.append(Character.forDigit((b >> 4) & 0xF, 16))
-                      .append(Character.forDigit(b & 0xF, 16));
-                }
-                Files.write(file, sb.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            } catch (Exception e) {
-                throw new RuntimeException("failed to write node key " + file + ": " + e.getMessage(), e);
-            }
-        }
-    }
-
     /**
      * Tear down the node from the UI.
      * <p>
@@ -2569,7 +2528,7 @@ public final class NodeService extends Service {
     /**
      * Wipe the in-memory backoff + blacklist sets and delete the on-disk peer
      * cache. Safe to call while the node is running; the next discv4 hit will
-     * refill backoff/blacklist from scratch, and {@link AndroidPeerCache} will
+     * refill backoff/blacklist from scratch, and {@link FilePeerCache} will
      * recreate the file on the next successful RLPx handshake.
      *
      * <p>Does not touch {@code attempted} — those are live in-flight dials, not
@@ -2592,20 +2551,20 @@ public final class NodeService extends Service {
         cachedClCounts.put(n, 0);
         // Clear the live cache instance when the chain is up (also wipes the file); when it's
         // stopped no live instance exists, so delete the on-disk file directly.
-        AndroidPeerCache pc = elCaches.get(n);
+        FilePeerCache pc = elCaches.get(n);
         if (pc != null) {
             pc.clear();
         } else {
-            java.io.File cacheFile = netCacheFor(n, "peers", ".cache");
+            java.io.File cacheFile = peerCacheFile(n).toFile();
             if (cacheFile.exists() && !cacheFile.delete()) {
                 LogBuffer.w(TAG, "failed to delete " + cacheFile);
             }
         }
-        AndroidCLPeerCache clpc = clCaches.get(n);
+        FileClPeerCache clpc = clCaches.get(n);
         if (clpc != null) {
             clpc.clear();
         } else {
-            java.io.File clCacheFile = netCacheFor(n, "cl-peers", ".cache");
+            java.io.File clCacheFile = clPeerCacheFile(n).toFile();
             if (clCacheFile.exists() && !clCacheFile.delete()) {
                 LogBuffer.w(TAG, "failed to delete " + clCacheFile);
             }
@@ -2622,7 +2581,7 @@ public final class NodeService extends Service {
         String n = canonicalNetwork(network);
         LogBuffer.i(TAG, "[" + n + "] resetting persisted sync state from UI");
         new Thread(() -> {
-            java.io.File snap = netCacheFor(n, "sync-state", ".snapshot");
+            java.io.File snap = syncSnapshotFile(n).toFile();
             if (snap.exists() && !snap.delete()) {
                 LogBuffer.w(TAG, "failed to delete " + snap);
             } else {
@@ -2665,8 +2624,8 @@ public final class NodeService extends Service {
         // Live counts from the cache FILES (mtime-memoized): the files are the
         // cross-engine truth — the Rust engine writes them directly, so the
         // boot-time cachedElCounts/cachedClCounts maps go stale mid-run.
-        CacheFileStats.ElStats elCache = CacheFileStats.INSTANCE.el(netCacheFor(network, "peers", ".cache").getAbsolutePath());
-        CacheFileStats.ClStats clCache = CacheFileStats.INSTANCE.cl(netCacheFor(network, "cl-peers", ".cache").getAbsolutePath());
+        CacheFileStats.ElStats elCache = CacheFileStats.INSTANCE.el(peerCacheFile(network).toAbsolutePath().toString());
+        CacheFileStats.ClStats clCache = CacheFileStats.INSTANCE.cl(clPeerCacheFile(network).toAbsolutePath().toString());
         String beaconState = bs.state() == BeaconState.STARTING ? "STOPPED" : bs.state().name();
         // Catch-up progress: preserve the historical -1-until-known convention (the engine
         // API defaults these to 0 pre-beacon) for the UI's determinate progress bar.

@@ -2,7 +2,10 @@ package io.myotis.engine
 
 import io.myotis.api.EngineException
 import io.myotis.api.MyotisEngine
+import io.myotis.api.ports.DnsServers
+import io.myotis.engine.ports.DefaultEnginePorts
 import io.myotis.engines.rust.RustMyotisEngine
+import java.nio.file.Path
 
 /**
  * The engine library's entry point: the Rust engine behind the `io.myotis.api`
@@ -12,13 +15,15 @@ import io.myotis.engines.rust.RustMyotisEngine
  * selector; a wallet built on this library needs none.
  *
  * A host supplies its platform through [io.myotis.api.ports.EnginePorts] on
- * `create()` (the node-key store, the peer caches, DNS, the CCIP gateway) and
- * drives the handle it gets back; the engine persists its own sync state under
- * the data dir it is given.
+ * `create()` (the node-key store, the peer caches, DNS, the CCIP gateway) — its
+ * own, or the library's file-backed defaults from [defaultPorts] — and drives the
+ * handle it gets back; the engine persists its own sync state under the data dir
+ * it is given.
  */
 object Myotis {
 
     /** True when `libmyotis_engine` loaded and passed the ABI handshake on this host. */
+    @JvmStatic
     fun isAvailable(): Boolean = RustMyotisEngine.isAvailable()
 
     /**
@@ -28,13 +33,46 @@ object Myotis {
      *
      * @throws EngineException when the native library is not available here
      */
+    @JvmStatic
     fun newEngine(): MyotisEngine = RustMyotisEngine()
+
+    /**
+     * The library's default ports for one network ([io.myotis.engine.ports]): the
+     * node key under [keyDir], the EL and CL peer caches under [cacheDir] (the
+     * per-network file names of [io.myotis.engine.ports.NetworkFiles], the Myotis
+     * apps' own), the CCIP-Read gateway over `HttpURLConnection`, and [dnsServers]
+     * — the host's DNS servers for EIP-1459 resolution, which a mobile host must
+     * supply (null on a host whose system resolver the engine can use).
+     * [DefaultEnginePorts.ports] is what [engine]'s `create()` takes; [network] is
+     * canonicalized through [engine] first, so an alias names the same files as the
+     * engine. One instance per `create()`.
+     *
+     * The Rust engine this library ships reads the DNS servers and the gateway from
+     * these ports and keeps its peer caches and sync snapshot itself under the
+     * [io.myotis.api.EngineConfig]'s `dataDir`, in the same file names — pass one
+     * directory as both that `dataDir` and [cacheDir] and
+     * [DefaultEnginePorts.peerCacheFile] / [DefaultEnginePorts.syncSnapshot] name the
+     * files it writes; its node identity is ephemeral per run (the key file under
+     * [keyDir] serves the Java engine only). See [DefaultEnginePorts] for which engine
+     * reads which port.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun defaultPorts(
+        engine: MyotisEngine,
+        keyDir: Path,
+        cacheDir: Path,
+        network: String,
+        dnsServers: DnsServers? = null,
+    ): DefaultEnginePorts =
+        DefaultEnginePorts.forNetwork(keyDir, cacheDir, engine.canonicalNetworkName(network), dnsServers)
 
     /**
      * Drain up to [max] buffered engine tracing lines (oldest first,
      * newline-joined; empty when idle or unavailable) into the host's own log
      * pipeline. Never throws.
      */
+    @JvmStatic
     fun drainLogs(max: Int): String = RustMyotisEngine.drainLogs(max)
 
     /**

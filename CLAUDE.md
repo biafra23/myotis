@@ -81,10 +81,12 @@ Key Gradle modules:
 - **myotis-engine** — THE ENGINE LIBRARY: a Kotlin Multiplatform module (jvm +
   android targets, no UI) that packages the Rust engine for the hosts — the
   Android AAR (the Myotis app and a separate wallet product) and the desktop jar.
-  Published as `io.myotis:myotis-engine` with its upstream modules (`myotis-api`,
-  `myotis-engine-rust`, `myotis-engine-common`, `myotis-rpc-policy`, `myotis-core`
-  — the root build's `Publishing` section): GitHub Packages on every `v*` tag
-  plus the AAR and a Maven-repository zip as release assets
+  Published as `eth.myotis:myotis-engine` with its upstream modules (`myotis-api`,
+  `myotis-engine-rust`, `myotis-engine-common`, `myotis-engine-ports`,
+  `myotis-rpc-policy`, `myotis-core`
+  — the root build's `Publishing` section): GitHub Packages and the token-free
+  `maven-repo` branch on every `v*` tag plus the AAR and a Maven-repository zip
+  as release assets
   (`engine-library.yml`; `publishAllPublicationsToStagingRepository` +
   `scripts/check_engine_library.sh` verify the set; `publishToMavenLocal` for a
   consumer under development). docs/android-library.md is the consumer page.
@@ -111,6 +113,14 @@ Key Gradle modules:
   answers `reads()` in-process with nothing listening.
 - **myotis-engine-common** — the lifecycle primitives both engines' handles wire
   (`WakeGate`, `SleepMetrics`); Java 17 over `:myotis-api` and slf4j.
+- **myotis-engine-ports** — the engine library's DEFAULT port actuals
+  (`io.myotis.engine.ports`): the node-key file, the file-backed EL and CL peer
+  caches, the `HttpURLConnection` CCIP-Read gateway and the per-network file
+  layout (`NetworkFiles`), assembled by `DefaultEnginePorts.forNetwork` /
+  `Myotis.defaultPorts`. The Android app's former `NodeService` actuals, moved
+  here so a consumer of the AAR gets a working engine from two directories; the
+  daemon and desktop keep their twins in `:app` for now. Java 17, minSdk-29-safe,
+  over `:myotis-api` and slf4j; re-exported (`api`) by `:myotis-engine`.
 - **myotis-rpc-policy** — the JSON-RPC serving policy with no server attached
   (`RpcBlockWindow`, the block-selector window of #366; `WebAccessPolicy` /
   `WebOrigins`, the web-page policy's pure half of #502): a dependency-free Kotlin

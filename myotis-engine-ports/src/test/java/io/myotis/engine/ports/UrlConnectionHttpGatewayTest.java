@@ -1,9 +1,9 @@
-package com.jaeckel.ethp2p.android.ens;
+package io.myotis.engine.ports;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThrows;
-import static org.junit.Assert.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.squareup.okhttp.OkHttpClient;
 import com.squareup.okhttp.OkUrlFactory;
@@ -26,27 +26,30 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import org.junit.After;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 /**
- * The gateway's deadline and size cap against local servers, one connection each. It runs
+ * The gateway's deadline and size cap against local servers, one connection each (the
+ * Myotis Android app's test, moved with the gateway). It runs
  * on OkHttp 2.7.5's HttpURLConnection, the code Android's platform HttpURLConnection is
  * forked from, not on the host JDK's: the deadline rests on how disconnect() cancels a
  * call, and the JDK's works differently (it waits for a read in progress). Every test
  * gets a fresh client and fresh connections: upstream OkHttp lacks Android's patch that a
  * cancelled call never recovers, and retries one on a pooled connection forever. The
- * per-test timeout turns a gateway that hangs into a failure.
+ * per-test timeout turns a gateway that hangs into a failure — on a separate thread, as
+ * JUnit 4's did: interrupting the test thread does not unblock a socket read.
  */
-public class AndroidCcipGatewayTest {
+class UrlConnectionHttpGatewayTest {
 
     private static final long DEADLINE_MS = 500;
     /** How far past the deadline a request may end: scheduling, not network time. */
     private static final long SLACK_MS = 2_000;
     private static final int MAX_RESPONSE_BYTES = 1_048_576;
 
-    private final AndroidCcipGateway gateway =
-            new AndroidCcipGateway(DEADLINE_MS, new OkUrlFactory(new OkHttpClient())::open);
+    private final UrlConnectionHttpGateway gateway =
+            new UrlConnectionHttpGateway(DEADLINE_MS, new OkUrlFactory(new OkHttpClient())::open);
     private final List<ServerSocket> servers = new ArrayList<>();
     private final List<Thread> serverThreads = new ArrayList<>();
 
@@ -77,7 +80,7 @@ public class AndroidCcipGatewayTest {
         return "http://127.0.0.1:" + server.getLocalPort() + "/";
     }
 
-    @After
+    @AfterEach
     public void stop() throws IOException {
         for (Thread serverThread : serverThreads) serverThread.interrupt();
         for (ServerSocket server : servers) server.close();
@@ -123,13 +126,15 @@ public class AndroidCcipGatewayTest {
         return (System.nanoTime() - startNanos) / 1_000_000;
     }
 
-    @Test(timeout = 30_000)
+    @Test
+    @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     public void returnsA2xxBody() throws IOException {
         String url = serve((head, body, out) -> respond(out, 200, "{\"data\":\"0x01\"}".getBytes(UTF_8)));
         assertEquals("{\"data\":\"0x01\"}", gateway.request(Method.GET, url, null));
     }
 
-    @Test(timeout = 30_000)
+    @Test
+    @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     public void postsTheBodyAsJson() throws IOException {
         String url = serve((head, body, out) -> {
             boolean json = head.toLowerCase(Locale.ROOT).contains("content-type: application/json");
@@ -139,14 +144,16 @@ public class AndroidCcipGatewayTest {
                 gateway.request(Method.POST, url, "{\"sender\":\"0xab\"}"));
     }
 
-    @Test(timeout = 30_000)
+    @Test
+    @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     public void aNon2xxStatusFails() throws IOException {
         String url = serve((head, body, out) -> respond(out, 404, "not here".getBytes(UTF_8)));
         RuntimeException e = failure(url);
-        assertTrue(e.getMessage(), e.getMessage().contains("HTTP 404"));
+        assertTrue(e.getMessage().contains("HTTP 404"), e.getMessage());
     }
 
-    @Test(timeout = 30_000)
+    @Test
+    @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     public void aRedirectIsFollowedAndTheDeadlineCoversTheNextHop() throws IOException {
         // The next hop is another server whose headers never come. Not followed, the
         // redirect would fail at once with its status rather than at the deadline.
@@ -156,18 +163,20 @@ public class AndroidCcipGatewayTest {
         long start = System.nanoTime();
         RuntimeException e = failure(url);
         long elapsedMs = msSince(start);
-        assertTrue(e.getMessage(), e.getMessage().contains("no complete response within " + DEADLINE_MS + " ms"));
-        assertTrue("took " + elapsedMs + " ms", elapsedMs < DEADLINE_MS + SLACK_MS);
+        assertTrue(e.getMessage().contains("no complete response within " + DEADLINE_MS + " ms"), e.getMessage());
+        assertTrue(elapsedMs < DEADLINE_MS + SLACK_MS, "took " + elapsedMs + " ms");
     }
 
-    @Test(timeout = 30_000)
+    @Test
+    @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     public void aBodyOverTheCapFails() throws IOException {
         String url = serve((head, body, out) -> respond(out, 200, filled(MAX_RESPONSE_BYTES + 1)));
         RuntimeException e = failure(url);
-        assertTrue(e.getMessage(), e.getMessage().contains("exceeds " + MAX_RESPONSE_BYTES + " bytes"));
+        assertTrue(e.getMessage().contains("exceeds " + MAX_RESPONSE_BYTES + " bytes"), e.getMessage());
     }
 
-    @Test(timeout = 30_000)
+    @Test
+    @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     public void aBodyThatNeverEndsFailsAtTheDeadlineAndClosesTheConnection()
             throws IOException, InterruptedException {
         // Headers at once, then a byte at a time: each read returns long before the read
@@ -188,12 +197,13 @@ public class AndroidCcipGatewayTest {
         long start = System.nanoTime();
         RuntimeException e = failure(url);
         long elapsedMs = msSince(start);
-        assertTrue(e.getMessage(), e.getMessage().contains("no complete response within " + DEADLINE_MS + " ms"));
-        assertTrue("took " + elapsedMs + " ms", elapsedMs < DEADLINE_MS + SLACK_MS);
-        assertTrue("the connection was left open", hungUp.await(5, TimeUnit.SECONDS));
+        assertTrue(e.getMessage().contains("no complete response within " + DEADLINE_MS + " ms"), e.getMessage());
+        assertTrue(elapsedMs < DEADLINE_MS + SLACK_MS, "took " + elapsedMs + " ms");
+        assertTrue(hungUp.await(5, TimeUnit.SECONDS), "the connection was left open");
     }
 
-    @Test(timeout = 30_000)
+    @Test
+    @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     public void aBodyThatStopsFailsAtTheDeadline() throws IOException {
         // Headers, then nothing: no read returns, so only the disconnect can end it.
         String url = serve((head, body, out) -> {
@@ -204,22 +214,23 @@ public class AndroidCcipGatewayTest {
         long start = System.nanoTime();
         RuntimeException e = failure(url);
         long elapsedMs = msSince(start);
-        assertTrue(e.getMessage(), e.getMessage().contains("no complete response within " + DEADLINE_MS + " ms"));
-        assertTrue("took " + elapsedMs + " ms", elapsedMs < DEADLINE_MS + SLACK_MS);
+        assertTrue(e.getMessage().contains("no complete response within " + DEADLINE_MS + " ms"), e.getMessage());
+        assertTrue(elapsedMs < DEADLINE_MS + SLACK_MS, "took " + elapsedMs + " ms");
     }
 
-    @Test(timeout = 30_000)
+    @Test
+    @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     public void aDisconnectThatThrowsIsRepeated() throws IOException {
         // The watchdog's first disconnect throws: the repeat a second later must still end
         // a request whose headers never come, not leave it to the 15 s read timeout.
-        AndroidCcipGateway gateway = new AndroidCcipGateway(DEADLINE_MS,
+        UrlConnectionHttpGateway gateway = new UrlConnectionHttpGateway(DEADLINE_MS,
                 url -> new FirstDisconnectThrows(new OkUrlFactory(new OkHttpClient()).open(url)));
         String url = serve((head, body, out) -> Thread.sleep(60_000));
         long start = System.nanoTime();
         RuntimeException e = assertThrows(RuntimeException.class, () -> gateway.request(Method.GET, url, null));
         long elapsedMs = msSince(start);
-        assertTrue(e.getMessage(), e.getMessage().contains("no complete response within " + DEADLINE_MS + " ms"));
-        assertTrue("took " + elapsedMs + " ms", elapsedMs < DEADLINE_MS + 1_000 + SLACK_MS);
+        assertTrue(e.getMessage().contains("no complete response within " + DEADLINE_MS + " ms"), e.getMessage());
+        assertTrue(elapsedMs < DEADLINE_MS + 1_000 + SLACK_MS, "took " + elapsedMs + " ms");
     }
 
     /** Android's HttpURLConnection, except that its first disconnect() throws. */
@@ -253,13 +264,14 @@ public class AndroidCcipGatewayTest {
         @Override public InputStream getInputStream() throws IOException { return delegate.getInputStream(); }
     }
 
-    @Test(timeout = 30_000)
+    @Test
+    @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     public void headersThatNeverComeFailAtTheDeadline() throws IOException {
         String url = serve((head, body, out) -> Thread.sleep(60_000));
         long start = System.nanoTime();
         RuntimeException e = failure(url);
         long elapsedMs = msSince(start);
-        assertTrue(e.getMessage(), e.getMessage().contains("no complete response within " + DEADLINE_MS + " ms"));
-        assertTrue("took " + elapsedMs + " ms", elapsedMs < DEADLINE_MS + SLACK_MS);
+        assertTrue(e.getMessage().contains("no complete response within " + DEADLINE_MS + " ms"), e.getMessage());
+        assertTrue(elapsedMs < DEADLINE_MS + SLACK_MS, "took " + elapsedMs + " ms");
     }
 }

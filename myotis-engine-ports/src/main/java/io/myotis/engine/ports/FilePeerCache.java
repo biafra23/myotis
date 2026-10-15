@@ -1,0 +1,394 @@
+package io.myotis.engine.ports;
+
+import io.myotis.api.ports.CachedPeerInfo;
+import io.myotis.api.ports.EnginePeerCache;
+import io.myotis.api.ports.SnapQuality;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.BufferedReader;
+import java.io.Closeable;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * The file-backed EL peer cache — the engine API's {@link EnginePeerCache} port over one
+ * text file. The Myotis Android app's cache, moved into the library (the daemon's twin
+ * is {@code com.jaeckel.ethp2p.app.PeerCache}; same file format, same thresholds).
+ *
+ * <p>Record format:
+ * {@code ip\tport\tpublicKeyHex[\tsnap][\tsnapok|\tsnapbad][\tfails=N]\n}
+ * (tab-separated, UTF-8). Tabs can't appear in an IP literal, so the format stays
+ * unambiguous for IPv6. The trailing {@code snap} flag ("1"/"0") records snap
+ * <em>capability</em> and is optional, so pre-existing cache files load unchanged
+ * (missing flag → not snap-capable). An optional {@code snapok}/{@code snapbad} token
+ * after it records snap-serving <em>quality</em> — whether the peer actually returned
+ * usable proofs ({@link SnapQuality}).
+ *
+ * <p><b>Capability vs quality.</b> The {@code snap} flag means the peer negotiated snap
+ * (snap/1 or snap/2) during Hello; it says nothing about whether the peer actually
+ * serves the state trie for a given root. Many advertised snap peers hang or return
+ * empty proofs. {@link #recordSnapServed} / {@link #recordSnapFailure} layer a learned
+ * quality verdict on top — analogous to the CL cache's light-client confirmed/denied —
+ * so a restart can dial peers proven to serve proofs first and deprioritize known
+ * hangers, instead of re-discovering the bad ones one timeout at a time. A peer needs
+ * {@link #SNAP_FAILURE_THRESHOLD} consecutive failures (no intervening serve) to be
+ * marked {@code DENIED}; any successful serve re-confirms it. Denied peers are
+ * deprioritized, never evicted for serve failures — state roots change, and a peer
+ * that couldn't serve an old pivot may serve the current one (and is still a fine
+ * plain-eth peer for headers/blocks).
+ *
+ * <p><b>Reachability.</b> {@link #recordConnectFailure} tracks consecutive TCP-level
+ * dial failures (refused/timeout — the peer is <em>gone</em>, not merely unhelpful),
+ * persisted as a {@code fails=N} token. A peer past {@link #CONNECT_FAILURE_DEMOTE}
+ * reports {@code DENIED} from {@link #load()} so the dial loop stops leading with
+ * long-dead peers; past {@link #CONNECT_FAILURE_EVICT} it is dropped from the cache
+ * entirely (the only eviction path — re-discovery re-adds it if it ever comes back).
+ * Any successful handshake ({@link #add} on a known peer) or serve resets the streak.
+ * The engine only reports failures while demonstrably online, so an offline device
+ * can't decimate its own cache.
+ *
+ * <p><b>Threading.</b> The in-memory maps are the authoritative copy and are mutated
+ * only under {@code synchronized(this)}. Disk writes are offloaded to a single daemon
+ * thread ({@link #diskWriter}) so the engine's callbacks never block on file I/O. Each
+ * write task is submitted <em>while holding the monitor</em>, so submission order
+ * matches the in-memory state-capture order and the single-threaded executor applies
+ * them in that order — the file converges to the in-memory state. Persistence is
+ * best-effort: a process kill can drop a queued write, which is fine because the
+ * cache is reconstructible (peers are re-discovered) and was never fsync'd.
+ */
+public final class FilePeerCache implements EnginePeerCache, Closeable {
+
+    private static final Logger log = LoggerFactory.getLogger(FilePeerCache.class);
+    private static final char SEP = '\t';
+
+    /** Consecutive snap-serve failures before a peer is marked {@code DENIED}.
+     *  Deliberately equal to the Java engine's {@code RLPxConnector.READ_FAILS_EVICT}:
+     *  the read that evicts a peer from the live pool is the read whose persisted
+     *  verdict flips to DENIED, like the Rust engine's compile-asserted twin thresholds
+     *  (pool.rs / peercache.rs). This module can't reference the constant; the daemon
+     *  twin's {@code PeerCacheTest} pins the equality — keep this in step with
+     *  {@code PeerCache.SNAP_FAILURE_THRESHOLD} when it moves. */
+    public static final int SNAP_FAILURE_THRESHOLD = 3;
+    /** Consecutive TCP connect failures before a peer reports {@code DENIED} from
+     *  {@link #load()} (≈3 min of unreachability at the maintainer's re-dial cadence —
+     *  dead peers stop hogging the head of the dial order). */
+    public static final int CONNECT_FAILURE_DEMOTE = 5;
+    /** Consecutive TCP connect failures before a peer is evicted from the cache
+     *  (≈35 min of continuous unreachability, cumulative across restarts). */
+    public static final int CONNECT_FAILURE_EVICT = 50;
+
+    /** In-memory record of a known peer, enough to rewrite its line. */
+    private record PeerRec(String publicKeyHex, boolean snap) {}
+
+    private final Path cacheFile;
+    /** key ("ip\tport") -> identity (pubkey + snap capability). Insertion-ordered so a
+     *  rewrite preserves discovery order among same-quality peers. */
+    private final Map<String, PeerRec> entries = new LinkedHashMap<>();
+    private final Set<String> snapConfirmed = ConcurrentHashMap.newKeySet();
+    private final Set<String> snapDenied = ConcurrentHashMap.newKeySet();
+    private final Map<String, Integer> snapFailures = new ConcurrentHashMap<>();
+    /** Consecutive TCP connect failures per key. Persisted (as {@code fails=N}) only
+     *  when a rewrite happens anyway or a threshold is crossed, so a dead peer doesn't
+     *  cost one disk write per failed dial. */
+    private final Map<String, Integer> connectFailures = new ConcurrentHashMap<>();
+    /** True once the on-disk file has been read into {@link #entries} (or shown absent),
+     *  after which {@link #load()} serves from memory without disk I/O. */
+    private boolean loaded = false;
+    /** Serializes all file writes off the caller's thread. Single-threaded so submission
+     *  order == apply order; daemon so it never blocks JVM exit. */
+    private final ExecutorService diskWriter = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "peer-cache-writer");
+        t.setDaemon(true);
+        return t;
+    });
+
+    public FilePeerCache(Path cacheFile) {
+        this.cacheFile = Objects.requireNonNull(cacheFile, "cacheFile");
+    }
+
+    /** The file this cache persists to. */
+    public Path cacheFile() {
+        return cacheFile;
+    }
+
+    private static String keyOf(String host, int port) {
+        return host + SEP + port;
+    }
+
+    /**
+     * Record a newly-handshaked peer. Updates the in-memory map and appends its line to
+     * disk (asynchronously). No-op if already known.
+     */
+    @Override
+    public synchronized void add(String host, int port, String publicKeyHex, boolean snap) {
+        String key = keyOf(host, port);
+        if (entries.containsKey(key)) {
+            // Re-handshake of a known peer: it's reachable — clear the connect failure
+            // streak. If a streak was persisted, rewrite the file too: a memory-only
+            // reset would be resurrected by the next restart and re-demote an actually
+            // reachable peer.
+            if (connectFailures.remove(key) != null) rewriteAsync();
+            return;
+        }
+        entries.put(key, new PeerRec(publicKeyHex, snap));
+        // Append fast path: a single new line (UNKNOWN quality) rather than rewriting
+        // the whole file on every newly-handshaked peer.
+        byte[] line = (key + SEP + publicKeyHex + SEP + (snap ? "1" : "0") + "\n")
+                .getBytes(StandardCharsets.UTF_8);
+        submitWrite(() -> writeBytes(line, true));
+    }
+
+    /**
+     * Record that a peer returned a usable snap proof for some state root — promote it
+     * to {@code CONFIRMED} so a restart dials it first. Resets the failure counter and
+     * clears any prior denial. Idempotent: once confirmed, repeat serves are in-memory
+     * no-ops (no disk rewrite).
+     */
+    @Override
+    public synchronized void recordSnapServed(String host, int port) {
+        String key = keyOf(host, port);
+        snapFailures.remove(key);
+        // A cleared persisted streak counts as a change: without the rewrite, fails=N
+        // would survive on disk and re-demote the peer after a restart.
+        boolean changed = connectFailures.remove(key) != null;
+        changed |= snapConfirmed.add(key);
+        changed |= snapDenied.remove(key);
+        if (changed) rewriteAsync();
+    }
+
+    /**
+     * Record that a peer failed to serve the current state root (empty/invalid proof,
+     * timeout, or IO error). After {@link #SNAP_FAILURE_THRESHOLD} consecutive failures
+     * the peer is marked {@code DENIED} (deprioritized on restart, not evicted). A later
+     * {@link #recordSnapServed} re-confirms it.
+     */
+    @Override
+    public synchronized void recordSnapFailure(String host, int port) {
+        String key = keyOf(host, port);
+        if (!entries.containsKey(key)) return; // never seen → nothing to demote
+        int count = snapFailures.merge(key, 1, Integer::sum);
+        if (count >= SNAP_FAILURE_THRESHOLD) {
+            boolean changed = snapDenied.add(key);
+            changed |= snapConfirmed.remove(key);
+            if (changed) {
+                rewriteAsync();
+                log.info("snap peer denied after {} failures: {}:{}", count, host, port);
+            }
+        }
+    }
+
+    /**
+     * Record a TCP-level connect failure (refused/timeout/unreachable) against a cached
+     * peer. No-op for unknown addresses, so the counter map can't grow from discovery
+     * dials that were never cached. Crossing {@link #CONNECT_FAILURE_DEMOTE} persists the
+     * streak and demotes the peer's reported quality; crossing
+     * {@link #CONNECT_FAILURE_EVICT} evicts it. Callers must only report while
+     * demonstrably online (some other peer or a DNS resolve succeeded recently).
+     */
+    @Override
+    public synchronized void recordConnectFailure(String host, int port) {
+        String key = keyOf(host, port);
+        if (!entries.containsKey(key)) return;
+        int count = connectFailures.merge(key, 1, Integer::sum);
+        if (count >= CONNECT_FAILURE_EVICT) {
+            entries.remove(key);
+            snapConfirmed.remove(key);
+            snapDenied.remove(key);
+            snapFailures.remove(key);
+            connectFailures.remove(key);
+            rewriteAsync();
+            log.info("evicted unreachable peer after {} consecutive connect failures: {}:{}",
+                    count, host, port);
+        } else if (count % CONNECT_FAILURE_DEMOTE == 0) {
+            // Persist every 5th failure (not just the demote crossing) so a restart
+            // resumes the streak with at most 4 counts lost — keeping eviction
+            // genuinely cumulative across restarts.
+            rewriteAsync();
+            if (count == CONNECT_FAILURE_DEMOTE) {
+                log.info("deprioritized unreachable peer after {} consecutive connect failures: {}:{}",
+                        count, host, port);
+            }
+        }
+    }
+
+    /**
+     * Forget every peer and delete the cache file. Memory is the authoritative copy, so
+     * it's cleared synchronously and {@link #loaded} stays true (an immediately-following
+     * {@link #load()} correctly returns the now-empty set without racing the
+     * asynchronous file delete).
+     */
+    public synchronized void clear() {
+        entries.clear();
+        snapConfirmed.clear();
+        snapDenied.clear();
+        snapFailures.clear();
+        connectFailures.clear();
+        loaded = true;
+        submitWrite(() -> {
+            if (!cacheFile.toFile().delete() && cacheFile.toFile().exists()) {
+                log.warn("failed to delete cache file {}", cacheFile);
+            }
+        });
+    }
+
+    /**
+     * Return all cached peers. Reads and parses the file on the first call, then serves
+     * from the in-memory copy — so the engine's periodic peer maintenance doesn't
+     * re-read/parse the file every few seconds.
+     */
+    @Override
+    public synchronized List<CachedPeerInfo> load() {
+        if (!loaded) loadFromDisk();
+        List<CachedPeerInfo> result = new ArrayList<>(entries.size());
+        for (Map.Entry<String, PeerRec> e : entries.entrySet()) {
+            String key = e.getKey();
+            int tab = key.indexOf(SEP);
+            if (tab < 0) continue;
+            String ip = key.substring(0, tab);
+            int port;
+            try {
+                port = Integer.parseInt(key.substring(tab + 1));
+            } catch (NumberFormatException ex) {
+                continue;
+            }
+            PeerRec rec = e.getValue();
+            // A peer past the connect-failure demote threshold reports DENIED regardless
+            // of its learned serve quality: a currently-unreachable CONFIRMED peer must
+            // not outrank reachable candidates. The underlying verdict is kept — one
+            // successful handshake clears the streak and restores it.
+            SnapQuality quality =
+                    connectFailures.getOrDefault(key, 0) >= CONNECT_FAILURE_DEMOTE ? SnapQuality.DENIED
+                    : snapConfirmed.contains(key) ? SnapQuality.CONFIRMED
+                    : snapDenied.contains(key) ? SnapQuality.DENIED
+                    : SnapQuality.UNKNOWN;
+            result.add(new CachedPeerInfo(ip, port, rec.publicKeyHex(), rec.snap(), quality));
+        }
+        return result;
+    }
+
+    /** Read the file into the in-memory maps. Runs at most once (guarded by
+     *  {@link #loaded}); each line parses independently so a malformed entry is skipped
+     *  without aborting the rest. */
+    private void loadFromDisk() {
+        loaded = true;
+        if (!cacheFile.toFile().exists()) return;
+        int conf = 0, den = 0, count = 0;
+        try (BufferedReader r = new BufferedReader(new InputStreamReader(
+                new FileInputStream(cacheFile.toFile()), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                line = line.strip();
+                if (line.isEmpty()) continue;
+                try {
+                    String[] parts = line.split(String.valueOf(SEP), -1);
+                    if (parts.length < 3) {
+                        log.warn("skipping malformed peer line in {}", cacheFile);
+                        continue;
+                    }
+                    String ip = parts[0];
+                    int port = Integer.parseInt(parts[1]);
+                    String pubKeyHex = parts[2];
+                    // Optional trailing tokens: snap flag ("1"/"0"), then a quality token
+                    // ("snapok"/"snapbad"). Older lines without them parse as
+                    // snap=false / UNKNOWN.
+                    boolean snap = parts.length > 3 && "1".equals(parts[3]);
+                    SnapQuality quality = SnapQuality.UNKNOWN;
+                    int fails = 0;
+                    for (int i = 4; i < parts.length; i++) {
+                        if ("snapok".equals(parts[i])) quality = SnapQuality.CONFIRMED;
+                        else if ("snapbad".equals(parts[i])) quality = SnapQuality.DENIED;
+                        else if (parts[i].startsWith("fails=")) {
+                            try {
+                                fails = Integer.parseInt(parts[i].substring("fails=".length()));
+                            } catch (NumberFormatException ignore) {
+                                // unreadable token → streak starts over at 0
+                            }
+                        }
+                    }
+                    String key = ip + SEP + port;
+                    entries.put(key, new PeerRec(pubKeyHex, snap));
+                    if (fails > 0) connectFailures.put(key, fails);
+                    if (quality == SnapQuality.CONFIRMED) { snapConfirmed.add(key); conf++; }
+                    else if (quality == SnapQuality.DENIED) { snapDenied.add(key); den++; }
+                    count++;
+                } catch (Exception e) {
+                    log.warn("skipping malformed peer line in {}: {}", cacheFile, e.getMessage());
+                }
+            }
+            if (count > 0 && (conf > 0 || den > 0)) {
+                log.info("loaded {} cached peer(s) from {} ({} snap-confirmed, {} snap-denied)",
+                        count, cacheFile, conf, den);
+            }
+        } catch (IOException e) {
+            log.warn("read of {} failed: {}", cacheFile, e.getMessage());
+        }
+    }
+
+    /** Render the full file content from the in-memory state (called under the monitor)
+     *  and submit it as a truncating rewrite. */
+    private void rewriteAsync() {
+        StringBuilder sb = new StringBuilder(entries.size() * 96);
+        for (Map.Entry<String, PeerRec> e : entries.entrySet()) {
+            String key = e.getKey();
+            PeerRec rec = e.getValue();
+            sb.append(key)                                  // ip\tport
+              .append(SEP).append(rec.publicKeyHex())
+              .append(SEP).append(rec.snap() ? "1" : "0");
+            if (snapConfirmed.contains(key)) sb.append(SEP).append("snapok");
+            else if (snapDenied.contains(key)) sb.append(SEP).append("snapbad");
+            int fails = connectFailures.getOrDefault(key, 0);
+            if (fails > 0) sb.append(SEP).append("fails=").append(fails);
+            sb.append('\n');
+        }
+        byte[] data = sb.toString().getBytes(StandardCharsets.UTF_8);
+        submitWrite(() -> writeBytes(data, false));
+    }
+
+    /** Submit a file op to the writer thread; tolerate a shutdown executor. */
+    private void submitWrite(Runnable task) {
+        try {
+            diskWriter.execute(task);
+        } catch (java.util.concurrent.RejectedExecutionException ignore) {
+            // Cache already closed (node stopping) — drop the write; memory is
+            // authoritative and the next start re-reads whatever did land.
+        }
+    }
+
+    /** Write {@code data} to the cache file on the writer thread. */
+    private void writeBytes(byte[] data, boolean append) {
+        try (FileOutputStream out = new FileOutputStream(cacheFile.toFile(), append)) {
+            out.write(data);
+        } catch (IOException e) {
+            log.warn("write to {} failed: {}", cacheFile, e.getMessage());
+        }
+    }
+
+    /** Stop the writer thread, draining any queued writes first. */
+    @Override
+    public void close() {
+        diskWriter.shutdown();
+        try {
+            if (!diskWriter.awaitTermination(2, TimeUnit.SECONDS)) {
+                diskWriter.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            diskWriter.shutdownNow();
+        }
+    }
+}

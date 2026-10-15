@@ -7,7 +7,7 @@
 # GitHub Packages, where it cannot be replaced:
 #
 #   - the closure is complete: every module the engine library's POMs reach is
-#     in the repository, at the one version, under its io.myotis artifact id
+#     in the repository, at the one version, under its eth.myotis artifact id
 #     (a project dependency that published under `core` instead of
 #     `myotis-core` would resolve to nothing);
 #   - the Android AAR carries the Rust engine for every shipped ABI
@@ -46,7 +46,7 @@ for arg in "$@"; do
 done
 
 here=$(cd "$(dirname "$0")/.." && pwd)
-group_dir="$repo/io/myotis"
+group_dir="$repo/eth/myotis"
 [ -d "$group_dir" ] || { echo "::error::$group_dir is missing — nothing was staged (run ./gradlew publishAllPublicationsToStagingRepository first)"; exit 1; }
 
 # The JNA version the AAR's libjnidispatch.so is taken from — the one catalog
@@ -71,7 +71,7 @@ shopt -s nullglob
 versions=("$group_dir"/myotis-engine/*/)
 shopt -u nullglob
 # (`${versions[*]-}`: an empty array is "unbound" to bash < 4.4 under set -u.)
-[ "${#versions[@]}" -eq 1 ] || { err "expected exactly one staged version of io.myotis:myotis-engine, found: ${versions[*]-}"; exit 1; }
+[ "${#versions[@]}" -eq 1 ] || { err "expected exactly one staged version of eth.myotis:myotis-engine, found: ${versions[*]-}"; exit 1; }
 version=$(basename "${versions[0]}")
 echo "staged version: $version"
 case "$version" in
@@ -87,36 +87,36 @@ expect() { # <artifactId> <file suffix>
     local f="$group_dir/$1/$version/$1-$version$2"
     [ -s "$f" ] || err "missing or empty: ${f#$repo/}"
 }
-for a in myotis-api myotis-core myotis-engine-common myotis-engine-rust; do
+for a in myotis-api myotis-core myotis-engine-common myotis-engine-ports myotis-engine-rust; do
     expect "$a" .jar
     expect "$a" -sources.jar
 done
 expect myotis-rpc-policy-jvm .jar
 expect myotis-engine-jvm .jar
 expect myotis-engine-android .aar
-for a in myotis-api myotis-core myotis-engine-common myotis-engine-rust \
+for a in myotis-api myotis-core myotis-engine-common myotis-engine-ports myotis-engine-rust \
          myotis-rpc-policy myotis-rpc-policy-jvm myotis-engine myotis-engine-jvm myotis-engine-android; do
     expect "$a" .pom
     expect "$a" .module
 done
 
 # No stale name: nothing may be staged under the Gradle project name `core`, and
-# every io.myotis dependency a POM names must be staged under that name. And
+# every eth.myotis dependency a POM names must be staged under that name. And
 # no leak: a project dependency on a module OUTSIDE the published set keeps
 # the build's own group (com.jaeckel.ethp2p) in the POM — resolvable from no
 # repository, and the one shape a consumer would otherwise find only after
 # the version is on GitHub Packages.
-[ ! -e "$group_dir/core" ] || err "io.myotis:core was staged — :core must publish as myotis-core"
+[ ! -e "$group_dir/core" ] || err "eth.myotis:core was staged — :core must publish as myotis-core"
 while IFS= read -r pom; do
     if grep -q '<groupId>com.jaeckel.ethp2p</groupId>' "$pom"; then
         err "${pom#$repo/} names com.jaeckel.ethp2p:* — a dependency on an unpublished project module leaked into the publication"
     fi
-    # Dependencies and constraints alike: `<groupId>io.myotis</groupId>` followed
+    # Dependencies and constraints alike: `<groupId>eth.myotis</groupId>` followed
     # by the artifactId on the next line (Gradle's POM layout).
     while IFS= read -r dep; do
         [ -d "$group_dir/$dep/$version" ] \
-            || err "${pom#$repo/} depends on io.myotis:$dep, which is not staged at $version"
-    done < <(grep -A1 '<groupId>io.myotis</groupId>' "$pom" | sed -n 's/.*<artifactId>\(.*\)<\/artifactId>.*/\1/p' | sort -u)
+            || err "${pom#$repo/} depends on eth.myotis:$dep, which is not staged at $version"
+    done < <(grep -A1 '<groupId>eth.myotis</groupId>' "$pom" | sed -n 's/.*<artifactId>\(.*\)<\/artifactId>.*/\1/p' | sort -u)
 done < <(find "$group_dir" -name "*-$version.pom")
 
 # The JNA pin, in both halves of the engine library. The module metadata, which
@@ -176,4 +176,4 @@ if [ -s "$aar" ]; then
 fi
 
 [ "$fail" = 0 ] || exit 1
-echo "OK: io.myotis:* $version staged completely under ${repo}"
+echo "OK: eth.myotis:* $version staged completely under ${repo}"

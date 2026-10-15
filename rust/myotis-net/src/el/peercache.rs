@@ -1,7 +1,7 @@
 //! The EL peer cache (EL-A8): persists peers that reached a READY snap session so
 //! a restart warm-starts from proven snap servers instead of re-discovering them
 //! one discv4 timeout at a time. The Rust twin of the Java `app/PeerCache`
-//! (and `AndroidPeerCache`), reading and writing the SAME `peers[-net].cache`
+//! (and the engine library's `FilePeerCache`), reading and writing the SAME `peers[-net].cache`
 //! file + format so verified EL peers survive restarts AND engine switches
 //! (the same cross-engine sharing the CL [`crate::clcache`] gives).
 //!

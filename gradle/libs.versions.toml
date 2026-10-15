@@ -165,9 +165,9 @@ androidx-test-ext-junit           = { module = "androidx.test.ext:junit",  versi
 # JUnit 5 via `junit` above; androidx.test is JUnit-4-based). One alias so the
 # two classpaths can't drift onto different JUnit 4 versions.
 junit4                            = { module = "junit:junit",              version = "4.13.2" }
-# :android-app unit tests ONLY: OkHttp 2.7.5's HttpURLConnection, the code Android's
-# platform HttpURLConnection is forked from, so AndroidCcipGatewayTest runs on its
-# cancel semantics rather than the host JDK's. Never a runtime dependency. It lacks
+# :myotis-engine-ports unit tests ONLY: OkHttp 2.7.5's HttpURLConnection, the code
+# Android's platform HttpURLConnection is forked from, so UrlConnectionHttpGatewayTest
+# runs on its cancel semantics rather than the host JDK's. Never a runtime dependency. It lacks
 # Android's own patch that a cancelled call never recovers (b/33763156): here a call
 # cancelled on a pooled connection retries forever, so tests must not pool.
 okhttp2-urlconnection             = { module = "com.squareup.okhttp:okhttp-urlconnection", version = "2.7.5" }

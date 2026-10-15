@@ -48,7 +48,7 @@ kotlin {
     // here is 17 or dependency-free, and the AAR must be consumable by a plain
     // Android app with no toolchain two-step.
     androidTarget {
-        // The AAR a consumer gets: the release variant — io.myotis:myotis-engine-android
+        // The AAR a consumer gets: the release variant — eth.myotis:myotis-engine-android
         // (root build.gradle.kts, `Publishing`; docs/android-library.md).
         publishLibraryVariants("release")
         compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) }
@@ -72,6 +72,10 @@ kotlin {
                 // the library's public API, per CLAUDE.md ("hosts talk ONLY to
                 // :myotis-api")…
                 api(project(":myotis-api"))
+                // …and the default port actuals a consumer hands create() when it has
+                // none of its own (the node-key file, the peer caches, the CCIP
+                // gateway; io.myotis.engine.ports) — `api`, since a host names them.
+                api(project(":myotis-engine-ports"))
                 // …over the Rust engine, which stays an implementation detail: its
                 // classes, the UniFFI bindings and the JSON shapes are not a consumer's
                 // compile classpath. The few host seams beside the contract (the Tor
