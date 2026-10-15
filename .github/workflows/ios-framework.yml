@@ -154,7 +154,9 @@ jobs:
           fi
           echo "building $task"
           for attempt in 1 2 3; do
-            if ./gradlew "${heap[@]}" "$task" --stacktrace 2>&1 | tee /tmp/gradle.log; then
+            # ${heap[@]+…}: an empty array is "unbound" to bash 3.2 (the macOS
+            # runner's /bin/bash) under set -u, so spell it to survive a later -u.
+            if ./gradlew ${heap[@]+"${heap[@]}"} "$task" --stacktrace 2>&1 | tee /tmp/gradle.log; then
               exit 0
             fi
             if [ "$attempt" -lt 3 ] && grep -qE "Could not resolve|Could not GET|Connection reset|Read timed out|502 |503 |Premature end of Content-Length" /tmp/gradle.log; then
