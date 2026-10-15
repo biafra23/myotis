@@ -195,7 +195,7 @@ misbehaves against the node: what it asked, in what order, and what it got.
 | code | meaning |
 |---|---|
 | `-32000` | Implemented, but not answerable verified right now (not synced, no serving peer, range not indexed, a block hash this node holds no block for — never verified here, not yet, or on a fork). Retryable. |
-| `-32602` | Can never be answered as asked: malformed input, or state this node does not hold (a block more than 64 behind head, by number or by hash; `safe`, `earliest`; the genesis block, by number or by hash). Do not retry (#366). |
+| `-32602` | Can never be answered as asked: malformed input, or state this node does not hold (a block more than 64 behind head, by number or by hash; `safe`, `earliest`; the genesis block by number, or by a hash the node can place — on a live network it never can, so the genesis hash is declined like any unknown hash). Do not retry (#366). |
 | `-32601` | Method not implemented. |
 | `3` | The call reverted. A verified answer; `data` is the revert payload. |
 
