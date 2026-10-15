@@ -55,6 +55,13 @@ tasks.withType<JavaCompile>().configureEach {
 tasks.named("compileKotlin") {
     mustRunAfter(rootProject.tasks.named("uniffiGenerateKotlin"))
 }
+// The sources jars of the publication (root build.gradle.kts, `Publishing`)
+// read the same committed bindings, so they need the same ordering for the
+// same reason — in an Android build Gradle refuses a sources jar that reads
+// uniffiGenerateKotlin's output without it (implicit-dependency validation).
+tasks.matching { it.name == "sourcesJar" || it.name == "kotlinSourcesJar" }.configureEach {
+    mustRunAfter(rootProject.tasks.named("uniffiGenerateKotlin"))
+}
 
 dependencies {
     // The contract this engine implements.
