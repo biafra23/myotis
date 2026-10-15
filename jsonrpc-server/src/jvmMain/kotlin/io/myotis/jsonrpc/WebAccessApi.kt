@@ -1,5 +1,9 @@
 package io.myotis.jsonrpc
 
+import io.myotis.jsonrpc.policy.WebAccessMode
+import io.myotis.jsonrpc.policy.WebAccessPolicy
+import io.myotis.jsonrpc.policy.WebOrigins
+
 /**
  * The `io.myotis.api` ↔ commonMain mapping for the web-page policy (#502): the
  * engines hand a host's [io.myotis.api.WebAccessPolicy] to the listener's

@@ -23,7 +23,12 @@ plugins {
 // slip into the engine library.
 kotlin {
     jvmToolchain(21)
-    compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) }
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+        // The Kotlin half (the committed UniFFI bindings) gets the same guard as
+        // javac's `release`: compiled against the JDK 17 class library.
+        freeCompilerArgs.add("-Xjdk-release=17")
+    }
 }
 java {
     sourceCompatibility = JavaVersion.VERSION_17
@@ -56,8 +61,9 @@ dependencies {
     api(project(":myotis-api"))
     // WakeGate + SleepMetrics: the lifecycle primitives both engines' handles wire.
     implementation(project(":myotis-engine-common"))
-    // RpcBlockWindow: the block-selector serving window RustVerifiedReads applies,
-    // ONE definition shared with the JSON-RPC router and the iOS backend — and no
+    // RpcBlockWindow, the block-selector serving window RustVerifiedReads applies,
+    // and WebOrigins, the origin form a web-page policy is normalized to: ONE
+    // definition shared with the JSON-RPC router and the iOS backend — and no
     // server with it (that is the whole point of the module).
     implementation(project(":myotis-rpc-policy"))
     // Android-safe minSdk-29 shims shared across the engine modules (core.encoding.Hex

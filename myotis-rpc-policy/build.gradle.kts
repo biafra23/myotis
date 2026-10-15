@@ -1,7 +1,9 @@
 // :myotis-rpc-policy — the JSON-RPC SERVING POLICY every backend applies, with no
-// server attached: today RpcBlockWindow, the block-selector window that decides
-// which `latest`/`finalized`/number pins a verified read may answer from head
-// state (#366). It lives in its own Kotlin Multiplatform module so that the
+// server attached: RpcBlockWindow, the block-selector window that decides which
+// `latest`/`finalized`/number pins a verified read may answer from head state
+// (#366), and the web-page policy's pure half (WebAccessMode / WebAccessPolicy /
+// WebOrigins — which browser origins a listener admits, and the one canonical
+// origin form, #502). It lives in its own Kotlin Multiplatform module so that the
 // policy stays ONE definition for the JVM Rust engine (:myotis-engine-rust), the
 // JSON-RPC router (:jsonrpc-server) and the iOS backend (:app-ios), while the
 // engine module carries no Ktor listener — the engine library (the Android AAR,
@@ -20,6 +22,9 @@ kotlin {
     jvm {
         compilerOptions {
             jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+            // Compile against the JDK 17 class library too, so no JDK-21-only API
+            // slips in (jvmTarget alone only sets the class-file version).
+            freeCompilerArgs.add("-Xjdk-release=17")
         }
     }
     iosArm64()

@@ -1,6 +1,6 @@
 package io.myotis.ui
 
-import io.myotis.jsonrpc.WebOrigins
+import io.myotis.jsonrpc.policy.WebOrigins
 import org.junit.Assert.assertEquals
 import org.junit.Test
 

@@ -31,7 +31,7 @@ class KtorLoopbackRpcTest {
 
     @Test
     void bindsServesReportsAndStops() throws Exception {
-        KtorLoopbackRpc rpc = new KtorLoopbackRpc("mainnet");
+        KtorLoopbackRpc rpc = new KtorLoopbackRpc();
         assertFalse(rpc.isServing(), "nothing listens before start()");
         // The policy lands on the gate before the server exists (hosts set it
         // between create() and start()); the non-origin entry is dropped from
@@ -63,7 +63,7 @@ class KtorLoopbackRpcTest {
         try (ServerSocket taken = new ServerSocket()) {
             taken.setReuseAddress(true);
             taken.bind(new java.net.InetSocketAddress("127.0.0.1", 0));
-            KtorLoopbackRpc rpc = new KtorLoopbackRpc("mainnet");
+            KtorLoopbackRpc rpc = new KtorLoopbackRpc();
             assertThrows(IOException.class, () -> rpc.start(taken.getLocalPort(), null, null, null));
             assertFalse(rpc.isServing());
         }

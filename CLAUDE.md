@@ -86,16 +86,18 @@ Key Gradle modules:
   in this module, regenerated via `uniffiGenerateKotlin`; compound values as JSON
   pinned by golden tests both sides). Java 17, and it depends on nothing from the
   Java engine and carries no HTTP server: the loopback JSON-RPC listener is a PORT
-  (`LoopbackRpc`) that the selector fills with the Ktor server for the JVM hosts
-  (`KtorLoopbackRpc` in `:myotis-engines`), while the engine library (the desktop
-  apps, the Android app and the Android AAR consume it) ships the engine without
-  one — a handle with no listener answers `reads()` in-process.
+  (`LoopbackRpc`). The selector fills it with the Ktor server (`KtorLoopbackRpc` in
+  `:myotis-engines`), so the daemon, the desktop app and the Android app keep the
+  listener they always had; an in-process consumer of the engine library (the
+  Android AAR's wallet) constructs the engine with no factory and gets a handle that
+  answers `reads()` in-process with nothing listening.
 - **myotis-engine-common** — the lifecycle primitives both engines' handles wire
   (`WakeGate`, `SleepMetrics`); Java 17 over `:myotis-api` and slf4j.
 - **myotis-rpc-policy** — the JSON-RPC serving policy with no server attached
-  (`RpcBlockWindow`, the block-selector window of #366): a dependency-free Kotlin
+  (`RpcBlockWindow`, the block-selector window of #366; `WebAccessPolicy` /
+  `WebOrigins`, the web-page policy's pure half of #502): a dependency-free Kotlin
   Multiplatform module, one definition for the Rust engine, the router in
-  `:jsonrpc-server` and the iOS backend.
+  `:jsonrpc-server`, the iOS backend and the UI's normalizer parity test.
 - **myotis-api** — THE ENGINE CONTRACT: zero-dependency Java-17 interfaces
   (`io.myotis.api` + `io.myotis.api.ports`) every host consumes exclusively.
   FFI-portable types only (byte[], String, long, double[], enums, flat records;

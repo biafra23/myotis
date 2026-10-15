@@ -34,10 +34,6 @@ final class KtorLoopbackRpc implements LoopbackRpc {
     private final WebAccess webAccess = new WebAccess();
     private volatile MyotisRpcServer server;
 
-    KtorLoopbackRpc(String networkName) {
-        // The network name is the handle's business; the gate and the server are per network already.
-    }
-
     @Override
     public WebAccessPolicy setWebAccessPolicy(WebAccessPolicy policy) {
         return WebAccessApi.apply(webAccess, policy);

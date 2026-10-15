@@ -26,10 +26,10 @@ import java.util.List;
  */
 public interface LoopbackRpc {
 
-    /** Builds the listener for one network; a {@code null} factory means no listener. */
+    /** Builds one listener per handle; a {@code null} factory means no listener. */
     @FunctionalInterface
     interface Factory {
-        LoopbackRpc create(String networkName);
+        LoopbackRpc create();
     }
 
     /**

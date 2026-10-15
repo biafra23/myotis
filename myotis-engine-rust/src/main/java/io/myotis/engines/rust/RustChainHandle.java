@@ -27,6 +27,7 @@ import io.myotis.api.VerifiedReads;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -789,10 +790,18 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         // The listener is host-side on both engines, so the policy never crosses the
         // FFI: it lands on the gate the listener owns — live, and before start() too
         // (hosts set it between create() and start()). With no listener there is
-        // nothing that could judge an origin: the policy is returned as asked, since
-        // no entry of it is ever applied or dropped.
-        if (rpc == null) return policy;
-        return rpc.setWebAccessPolicy(policy);
+        // nothing that could judge an origin, but the contract's answer is the same
+        // pure function of the input: the mode with the origins normalized and the
+        // entries that are no origin dropped, so a host's "was an entry dropped?"
+        // compare works whether or not a listener exists (CLAUDE.md: applied or
+        // refused, never silently ignored).
+        if (rpc != null) return rpc.setWebAccessPolicy(policy);
+        List<String> normalized = new ArrayList<>(policy.origins().size());
+        for (String o : policy.origins()) {
+            String n = io.myotis.jsonrpc.policy.WebOrigins.INSTANCE.normalize(o);
+            if (n != null) normalized.add(n);
+        }
+        return new io.myotis.api.WebAccessPolicy(policy.mode(), normalized);
     }
 
     @Override

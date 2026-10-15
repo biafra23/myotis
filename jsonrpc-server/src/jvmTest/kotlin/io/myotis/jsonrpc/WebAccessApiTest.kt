@@ -1,5 +1,8 @@
 package io.myotis.jsonrpc
 
+import io.myotis.jsonrpc.policy.WebAccessMode
+import io.myotis.jsonrpc.policy.WebAccessPolicy
+
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
