@@ -195,6 +195,26 @@ pub fn unattested_hash(hash: &[u8; 32], number: u64, head: Option<u64>) -> Proof
     }
 }
 
+/// Whether a recent head at `number` that the anchor's ring does not link to
+/// the current head (`ExecAnchor::recent_head_at`) can be confirmed by a header
+/// window `[number ..= head]` anchored at the head: at or below the head, and
+/// less than `lookback` blocks below it (the one-request window bound).
+pub fn confirmable(number: u64, head: u64, lookback: u64) -> bool {
+    number <= head && head - number < lookback
+}
+
+/// The root an unlinked recent head is served at, once a header window
+/// anchored at the current head starts with `canonical` (the hash of the
+/// canonical block at its number; `None` for an empty window): its own
+/// attested root when it IS that block, else nothing — a sibling chain
+/// replaced it, and its root would not verify against the canonical block.
+pub fn confirmed_root(
+    head: &crate::el::anchor::RecentHeadAt,
+    canonical: Option<[u8; 32]>,
+) -> Option<[u8; 32]> {
+    (canonical == Some(head.hash)).then_some(head.state_root)
+}
+
 /// One storage key's proof: the key as asked (a 32-byte word), its minimal
 /// big-endian value (empty = zero) and the root-first path under the account's
 /// proven `storageRoot` (empty when the account has no storage).
@@ -352,6 +372,28 @@ mod tests {
         // Above the head, or with no head: the head may yet reach it.
         assert!(matches!(unattested_hash(&[0x44; 32], 1_001, Some(1_000)), ProofError::Unavailable(_)));
         assert!(matches!(unattested_hash(&[0x44; 32], 5, None), ProofError::Unavailable(_)));
+    }
+
+    #[test]
+    fn an_unlinked_recent_head_is_served_only_while_it_is_the_canonical_block() {
+        use crate::el::anchor::RecentHeadAt;
+        let head = RecentHeadAt { hash: [0x11; 32], state_root: [0x22; 32], linked: false };
+        // The window anchored at the current head starts with this very block.
+        assert_eq!(confirmed_root(&head, Some([0x11; 32])), Some([0x22; 32]));
+        // Another block holds the number now (a sibling chain replaced it), or
+        // the window came back empty: never served at this head's root.
+        assert_eq!(confirmed_root(&head, Some([0x33; 32])), None);
+        assert_eq!(confirmed_root(&head, None), None);
+    }
+
+    #[test]
+    fn only_a_number_one_window_below_the_head_can_be_confirmed() {
+        assert!(confirmable(990, 1_000, 512));
+        assert!(confirmable(1_000, 1_000, 512));
+        assert!(confirmable(489, 1_000, 512));
+        // Past the window bound, or above the head: nothing to confirm against.
+        assert!(!confirmable(488, 1_000, 512));
+        assert!(!confirmable(1_001, 1_000, 512));
     }
 
     #[test]

@@ -6463,10 +6463,16 @@ impl ElReader {
         // current head — a skipped head (a gap) or a replaced sibling above it
         // — is confirmed against one header window anchored at the head, and
         // served only if it is still the canonical block at its number.
-        let finalized_number = self.anchor.finalized_execution().map(|f| f.block_number);
+        // One finality snapshot for this skip AND the pin rules below, so the
+        // two cannot disagree about which block is final.
+        let finalized = self.anchor.finalized_execution();
         let recent = match block {
             // The finalized block is served at its own root by the pin rules.
-            crate::el::getproof::ProofBlock::Number(n) if finalized_number == Some(n) => None,
+            crate::el::getproof::ProofBlock::Number(n)
+                if finalized.is_some_and(|f| f.block_number == n) =>
+            {
+                None
+            }
             crate::el::getproof::ProofBlock::Number(n) => match self.anchor.recent_head_at(n) {
                 Some(h) if h.linked => Some((n, h.state_root)),
                 Some(h) => self.confirm_recent_head(n, h).await?.map(|root| (n, root)),
@@ -6477,7 +6483,7 @@ impl ElReader {
         let target = resolve_target(
             block,
             head,
-            self.anchor.finalized_execution(),
+            finalized,
             |n| recent.filter(|(m, _)| *m == n).map(|(_, root)| root),
             |hash| self.anchor.attested_block_of(hash),
         )?;
@@ -6516,13 +6522,13 @@ impl ElReader {
         number: u64,
         head: crate::el::anchor::RecentHeadAt,
     ) -> Result<Option<[u8; 32]>, crate::el::getproof::ProofError> {
-        use crate::el::getproof::ProofError;
+        use crate::el::getproof::{confirmable, confirmed_root, ProofError};
         let (head_num, head_hash) = self.anchored_head().map_err(ProofError::Unavailable)?;
-        if number > head_num || head_num - number >= BLOCK_LOOKBACK_MAX {
+        if !confirmable(number, head_num, BLOCK_LOOKBACK_MAX) {
             return Ok(None);
         }
         match self.head_anchored_header_window(number, (head_num, head_hash)).await {
-            Ok(window) => Ok((window.first().map(|vh| vh.hash) == Some(head.hash)).then_some(head.state_root)),
+            Ok(window) => Ok(confirmed_root(&head, window.first().map(|vh| vh.hash))),
             Err(PoolReadError::TipLag { error, failed }) => {
                 self.record_batch_failures(&failed, false).await;
                 Err(ProofError::Unavailable(error))
