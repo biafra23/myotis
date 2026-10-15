@@ -1786,7 +1786,9 @@ enum BlockSelector {
 /// JSON-RPC quantity carries either.
 ///
 /// `Err` is a selector no retry can make servable (`safe`, `earliest`, a block
-/// hash, garbage), so the caller refuses it as invalid params. `safe` is
+/// hash — the routers resolve one to its canonical block's number before the
+/// engine is asked (#641), so none reaches here from them — garbage), so the
+/// caller refuses it as invalid params. `safe` is
 /// refused rather than read as the head (#366): nothing here tracks the safe
 /// (justified) head, and the head is a different block.
 fn parse_call_block(block: &str) -> Result<BlockSelector, String> {

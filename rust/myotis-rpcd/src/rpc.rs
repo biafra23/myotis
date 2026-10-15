@@ -293,6 +293,9 @@ struct Selector {
     value: String,
     number: Option<u64>,
     hash: bool,
+    /// Set on a number [`Router::resolve_hash`] made of a block hash: the hash
+    /// the caller sent, for the refusal that names it.
+    via_hash: Option<String>,
 }
 
 /// An `eth_call` / `eth_estimateGas` transaction object, shape-checked.
@@ -626,7 +629,8 @@ impl<E: Engine> Router<E> {
             }
             "eth_getBalance" => {
                 let addr = address_at(params, 0)?;
-                let sel = state_selector_at(params, 1, method)?;
+                let sel = selector_at(params, 1, Takes::NumberOrHash)?;
+                let sel = self.resolve_hash(sel, method, g)?;
                 self.pin_servable(&sel, method, g)?;
                 // Verified-absent account → balance 0: the proof of exclusion IS
                 // the verified answer.
@@ -635,7 +639,8 @@ impl<E: Engine> Router<E> {
             }
             "eth_getTransactionCount" => {
                 let addr = address_at(params, 0)?;
-                let sel = state_selector_at(params, 1, method)?;
+                let sel = selector_at(params, 1, Takes::NumberOrHash)?;
+                let sel = self.resolve_hash(sel, method, g)?;
                 self.pin_servable(&sel, method, g)?;
                 let mined = self.account(&addr, &sel, g)?.nonce;
                 // ONLY the pending tag consults the sent-tx overlay:
@@ -652,7 +657,8 @@ impl<E: Engine> Router<E> {
             }
             "eth_getCode" => {
                 let addr = address_at(params, 0)?;
-                let sel = state_selector_at(params, 1, method)?;
+                let sel = selector_at(params, 1, Takes::NumberOrHash)?;
+                let sel = self.resolve_hash(sel, method, g)?;
                 self.pin_servable(&sel, method, g)?;
                 self.in_window(&sel, g)?;
                 let o = engine_object(&self.engine_ready(g)?.get_code(&addr, &sel.value))?;
@@ -670,7 +676,8 @@ impl<E: Engine> Router<E> {
                             .into(),
                     )
                 })?;
-                let sel = state_selector_at(params, 2, method)?;
+                let sel = selector_at(params, 2, Takes::NumberOrHash)?;
+                let sel = self.resolve_hash(sel, method, g)?;
                 self.pin_servable(&sel, method, g)?;
                 self.in_window(&sel, g)?;
                 let o = engine_object(&self.engine_ready(g)?.get_storage_at(
@@ -700,7 +707,8 @@ impl<E: Engine> Router<E> {
             "eth_getProof" => {
                 let addr = address_at(params, 0)?;
                 let keys = storage_keys_at(params, 1)?;
-                let sel = state_selector_at(params, 2, method)?;
+                let sel = selector_at(params, 2, Takes::NumberOrHash)?;
+                let sel = self.resolve_hash(sel, method, g)?;
                 let o = engine_object(&self.engine_ready(g)?.get_proof(&addr, &keys, &sel.value))?;
                 Ok(Value::Object(o).to_string())
             }
@@ -862,8 +870,9 @@ impl<E: Engine> Router<E> {
         };
         let tx =
             parse_tx(obj).or_else(|why| invalid(format!("invalid transaction object: {why}")))?;
-        let sel = state_selector_at(params, 1, "eth_call")?;
+        let sel = selector_at(params, 1, Takes::NumberOrHash)?;
         self.check_chain_id(&tx)?;
+        let sel = self.resolve_hash(sel, "eth_call", g)?;
         self.pin_servable(&sel, "eth_call", g)?;
         let json = if tx.extended {
             let e = self.engine_ready(g)?;
@@ -904,8 +913,9 @@ impl<E: Engine> Router<E> {
         };
         let tx =
             parse_tx(obj).or_else(|why| invalid(format!("invalid transaction object: {why}")))?;
-        let sel = state_selector_at(params, 1, "eth_estimateGas")?;
+        let sel = selector_at(params, 1, Takes::NumberOrHash)?;
         self.check_chain_id(&tx)?;
+        let sel = self.resolve_hash(sel, "eth_estimateGas", g)?;
         self.pin_servable(&sel, "eth_estimateGas", g)?;
         // Always the transaction-object estimate: the engine applies the selector
         // and every field, or refuses with the permanent envelope.
@@ -934,8 +944,9 @@ impl<E: Engine> Router<E> {
         };
         let tx =
             parse_tx(obj).or_else(|why| invalid(format!("invalid transaction object: {why}")))?;
-        let sel = state_selector_at(params, 1, "eth_createAccessList")?;
+        let sel = selector_at(params, 1, Takes::NumberOrHash)?;
         self.check_chain_id(&tx)?;
+        let sel = self.resolve_hash(sel, "eth_createAccessList", g)?;
         self.pin_servable(&sel, "eth_createAccessList", g)?;
         access_list_outcome(
             &self
@@ -954,10 +965,85 @@ impl<E: Engine> Router<E> {
         }
     }
 
+    /// `sel` as the engine is handed it: a tag or a number unchanged; a block
+    /// hash resolved to the NUMBER of the canonical block it names (#641), so a
+    /// hash-pinned read (EIP-1898 clients pin every read to the hash of the
+    /// block they just saw) is served exactly as that number is — the same
+    /// state window, the same verification — and never for another block:
+    ///  - the engine's own `eth_getBlockByHash` resolves it. It serves only a
+    ///    hash it verified AND that the chain still carries at its height, so
+    ///    a block on a fork, or a hash this node never saw, is the verified
+    ///    `null`. That is declined RETRYABLY (-32000), with the reason naming
+    ///    the hash: the node cannot tell a block it has not verified YET — a
+    ///    client a block ahead of it pins the hash it was just handed, and this
+    ///    node holds that block seconds later — from one it never will, and a
+    ///    number ahead of the window is retryable for the same reason. Calling
+    ///    it invalid params would send a wallet to another provider over this
+    ///    node's lag;
+    ///  - the engine's error envelope keeps its class (retryable, or the
+    ///    permanent -32602), as for `eth_getBlockByHash`;
+    ///  - the genesis block: refused for good, as block 0 is everywhere;
+    ///  - a block without the hash asked (engine drift), or without a readable
+    ///    number (shape drift): declined retryably, each by name — never served
+    ///    for another block.
+    ///
+    /// The number then goes through [`Self::pin_servable`] like a caller's own;
+    /// outside the window the refusal names the hash and the block it is.
+    fn resolve_hash(&self, sel: Selector, method: &str, g: &Gate) -> Result<Selector, Fail> {
+        if !sel.hash {
+            return Ok(sel);
+        }
+        let json = self.engine_ready(g)?.block_by_hash(&sel.value, false);
+        if json.trim() == "null" {
+            return Err(Fail::Unavailable(Some(format!(
+                "this node holds no block with hash {} — never verified here, not yet (it may be \
+                 ahead of the verified head), or on a fork",
+                sel.value
+            ))));
+        }
+        let block = engine_object(&json)?;
+        let Some(n) = block
+            .get("number")
+            .and_then(Value::as_str)
+            .and_then(|n| n.strip_prefix("0x"))
+            .and_then(|digits| u64::from_str_radix(digits, 16).ok())
+        else {
+            return Err(Fail::Unavailable(Some(format!(
+                "malformed block from engine for block hash {}",
+                sel.value
+            ))));
+        };
+        let served = block
+            .get("hash")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase);
+        if served.as_deref() != Some(sel.value.as_str()) {
+            return Err(Fail::Unavailable(Some(format!(
+                "the engine served another block for block hash {}",
+                sel.value
+            ))));
+        }
+        if n == 0 {
+            return invalid(format!(
+                "{method} at block hash {} is not supported: it is block 0 (genesis), which this node \
+                 holds no state for",
+                sel.value
+            ));
+        }
+        Ok(Selector {
+            value: format!("0x{n:x}"),
+            number: Some(n),
+            hash: false,
+            via_hash: Some(sel.value),
+        })
+    }
+
     /// Judge a number pin against the state window before the engine is asked:
     /// BEHIND it is refused for good (-32602) — no engine holds older state —
     /// unless this node itself recently reported a head at or below the pin;
-    /// no verified head known is a retryable decline. Tags pass.
+    /// no verified head known is a retryable decline. Tags pass; a hash arrives
+    /// resolved to its block's number ([`Self::resolve_hash`]) and is judged as
+    /// that number, the refusal naming the hash.
     fn pin_servable(&self, sel: &Selector, method: &str, g: &Gate) -> Result<(), Fail> {
         let Some(n) = sel.number else { return Ok(()) };
         let head = self
@@ -968,8 +1054,12 @@ impl<E: Engine> Router<E> {
             if self.reported_heads.lowest().is_some_and(|low| n >= low) {
                 return Err(Fail::Unavailable(None));
             }
+            let asked = match &sel.via_hash {
+                Some(h) => format!("block hash {h} (block {n})"),
+                None => format!("block {n}"),
+            };
             return invalid(format!(
-                "{method} at block {n} is not supported: it is more than \
+                "{method} at {asked} is not supported: it is more than \
                  {BLOCK_NUM_LAG_TOLERANCE} blocks behind the verified head ({head}), and this node \
                  holds no historical state"
             ));
@@ -1351,7 +1441,11 @@ fn storage_keys_at(p: &[Value], i: usize) -> Result<String, Fail> {
         None => return invalid(format!("missing argument {i}: the storage keys")),
         Some(Value::Null) => return Ok("[]".into()),
         Some(Value::Array(keys)) => keys,
-        Some(_) => return invalid(format!("invalid argument {i}: expected an array of storage keys")),
+        Some(_) => {
+            return invalid(format!(
+                "invalid argument {i}: expected an array of storage keys"
+            ))
+        }
     };
     let max = myotis_engine::MAX_PROOF_STORAGE_KEYS;
     if keys.len() > max {
@@ -1419,6 +1513,7 @@ fn parse_selector(param: Option<&Value>, arg: usize, takes: Takes) -> Result<Sel
                         value: h.to_ascii_lowercase(),
                         number: None,
                         hash: true,
+                        via_hash: None,
                     });
                 }
                 (None, Some(n)) => {
@@ -1451,7 +1546,12 @@ fn parse_selector(param: Option<&Value>, arg: usize, takes: Takes) -> Result<Sel
     }
     match raw.as_str() {
         "latest" | "pending" | "finalized" => {
-            return Ok(Selector { value: raw, number: None, hash: false })
+            return Ok(Selector {
+                value: raw,
+                number: None,
+                hash: false,
+                via_hash: None,
+            })
         }
         "safe" => {
             return refuse("the 'safe' tag is not served: this node tracks the verified head and the \
@@ -1482,6 +1582,7 @@ fn parse_selector(param: Option<&Value>, arg: usize, takes: Takes) -> Result<Sel
             value: raw.to_ascii_lowercase(),
             number: None,
             hash: true,
+            via_hash: None,
         });
     }
     if raw.len() == 66 && takes == Takes::Number {
@@ -1509,23 +1610,12 @@ fn parse_selector(param: Option<&Value>, arg: usize, takes: Takes) -> Result<Sel
         value: format!("0x{n:x}"),
         number: Some(n),
         hash: false,
+        via_hash: None,
     })
 }
 
 fn selector_at(p: &[Value], i: usize, takes: Takes) -> Result<Selector, Fail> {
     parse_selector(p.get(i), i, takes)
-}
-
-/// A state read's selector: a `BlockNumberOrHash`, but a hash names historical
-/// state this node does not hold — refused, never answered from the head.
-fn state_selector_at(p: &[Value], i: usize, method: &str) -> Result<Selector, Fail> {
-    let sel = selector_at(p, i, Takes::NumberOrHash)?;
-    if sel.hash {
-        return invalid(format!(
-            "{method} at a block hash is not supported (this node holds no historical state)"
-        ));
-    }
-    Ok(sel)
 }
 
 /// `eth_feeHistory`'s block count: a hex or decimal string or a JSON number,

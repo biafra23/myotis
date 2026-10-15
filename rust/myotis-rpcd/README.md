@@ -194,8 +194,8 @@ misbehaves against the node: what it asked, in what order, and what it got.
 
 | code | meaning |
 |---|---|
-| `-32000` | Implemented, but not answerable verified right now (not synced, no serving peer, range not indexed). Retryable. |
-| `-32602` | Can never be answered as asked: malformed input, or state this node does not hold (a block more than 64 behind head, `safe`, `earliest`, a block hash on a state read). Do not retry (#366). |
+| `-32000` | Implemented, but not answerable verified right now (not synced, no serving peer, range not indexed, a block hash this node holds no block for — never verified here, not yet, or on a fork). Retryable. |
+| `-32602` | Can never be answered as asked: malformed input, or state this node does not hold (a block more than 64 behind head, by number or by hash; `safe`, `earliest`; the genesis block by number, or by a hash the node can place — on a live network it never can, so the genesis hash is declined like any unknown hash). Do not retry (#366). |
 | `-32601` | Method not implemented. |
 | `3` | The call reverted. A verified answer; `data` is the revert payload. |
 
@@ -232,7 +232,8 @@ misbehaves against the node: what it asked, in what order, and what it got.
   after sending), but an older transaction comes back `null` ("verified not
   seen") where geth would return it.
 - **No historical state.** State reads more than 64 blocks behind head are
-  `-32602`.
+  `-32602`, pinned by number or by block hash (a hash is resolved to the
+  canonical block it names and judged as that number, #641).
 - **Fee suggestions are not a full node's.** On gnosis `eth_gasPrice` answers
   about base fee + 0.01 gwei where Nethermind answers about base fee, and
   `eth_maxPriorityFeePerGas` was seen to answer 0.001, 0.01, 0.1 and 1 gwei
