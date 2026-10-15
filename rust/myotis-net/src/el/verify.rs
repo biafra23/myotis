@@ -409,14 +409,14 @@ mod tests {
             Some("peerBlockAheadOfAnchor")
         );
         // Above the optimistic head: nothing attested above it yet.
-        anchor.update_optimistic(264, 21_000_064, root(0xe1), root(0xe0), 0);
+        anchor.update_optimistic(264, 21_000_064, root(0xe1), [0; 32], root(0xe0), 0);
         assert_eq!(
             fail(ladder_precheck(Some(&root(1)), true, 21_000_065, &anchor)),
             Some("peerBlockAheadOfAnchor")
         );
         // A walk longer than its bound (a stalled finality far below the head):
         // MAX headers, the anchor included, is the longest one allowed.
-        anchor.update_optimistic(300, 21_009_000, root(0xd1), root(0xd0), 0);
+        anchor.update_optimistic(300, 21_009_000, root(0xd1), [0; 32], root(0xd0), 0);
         assert_eq!(
             fail(ladder_precheck(Some(&root(1)), true, 21_009_000 - 8192, &anchor)),
             Some("headerChainGapTooLarge")
@@ -431,7 +431,7 @@ mod tests {
     fn the_walk_ends_at_the_optimistic_head_above_the_peer() {
         let anchor = ExecAnchor::new();
         anchor.update_finalized(200, root(0xf0), 21_000_000, root(0xf1), 0);
-        anchor.update_optimistic(264, 21_000_064, root(0xe1), root(0xe0), 0);
+        anchor.update_optimistic(264, 21_000_064, root(0xe1), [0; 32], root(0xe0), 0);
         assert_eq!(
             ladder_precheck(Some(&root(1)), true, 21_000_010, &anchor),
             LadderStep::NeedHeaderChain {

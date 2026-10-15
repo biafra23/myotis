@@ -4019,6 +4019,7 @@ fn update_exec_anchor(store: &LightClientStore, anchor: &ExecAnchor) {
                     optimistic.beacon.slot,
                     e.block_number,
                     e.block_hash,
+                    e.parent_hash,
                     e.state_root,
                     e.timestamp,
                 );
@@ -4255,6 +4256,34 @@ mod tests {
         // store's signature slot 1003.
         assert_eq!(anchor.find_state_root(&[0x11; 32]).map(|r| r.slot), Some(1000));
         assert_eq!(anchor.find_state_root(&[0x33; 32]).map(|r| r.slot), Some(1002));
+    }
+
+    #[test]
+    fn the_payload_headers_parent_hash_links_the_heads_the_anchor_answers_by_number() {
+        // The optimistic payload header's own parent hash reaches the anchor:
+        // a head built on the previous one keeps that one answerable by number
+        // (eth_getProof), a head built on another block does not.
+        let anchor = ExecAnchor::new();
+        let mut store = LightClientStore::new_mainnet_preset();
+        let first = header_with_exec(1002, [0x33; 32], 21_000_002, [0x44; 32]);
+        store.update_optimistic(&first, 1003);
+        update_exec_anchor(&store, &anchor);
+        let mut next = header_with_exec(1003, [0x55; 32], 21_000_003, [0x66; 32]);
+        if let HeaderExecution::Payload(e) = &mut next.execution {
+            e.parent_hash = [0x44; 32];
+        }
+        store.update_optimistic(&next, 1004);
+        update_exec_anchor(&store, &anchor);
+        assert_eq!(anchor.optimistic_root_at(21_000_003), Some([0x55; 32]));
+        assert_eq!(anchor.optimistic_root_at(21_000_002), Some([0x33; 32]));
+        let mut sibling = header_with_exec(1004, [0x77; 32], 21_000_004, [0x88; 32]);
+        if let HeaderExecution::Payload(e) = &mut sibling.execution {
+            e.parent_hash = [0x99; 32]; // not 21_000_003's hash
+        }
+        store.update_optimistic(&sibling, 1005);
+        update_exec_anchor(&store, &anchor);
+        assert_eq!(anchor.optimistic_root_at(21_000_004), Some([0x77; 32]));
+        assert_eq!(anchor.optimistic_root_at(21_000_003), None);
     }
 
     #[test]
