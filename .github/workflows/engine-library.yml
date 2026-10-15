@@ -22,7 +22,10 @@ on:
   # workflow already runs it on every PR into main; a PR that changes the
   # publication dispatches this on its branch from the Actions tab.
   push:
-    branches: [ "main" ]
+    # TEMPORARY, on a throwaway branch only (deleted after the run): rehearses
+    # the build job on the final feature tree, since a workflow that is not on
+    # main yet cannot be dispatched. Never merged.
+    branches: [ "main", "claude/youthful-cray-5ihdhz-rehearse" ]
     tags: [ "v*" ]
     paths:
       - 'build.gradle.kts'
