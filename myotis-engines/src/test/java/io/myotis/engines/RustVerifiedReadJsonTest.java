@@ -231,16 +231,24 @@ class RustVerifiedReadJsonTest {
                 "{\"status\":\"ok\",\"resultHex\":\"0x2a\",\"blockNumber\":21000000,\"verified\":false}");
         assertEquals(io.myotis.api.CallResult.Status.OK, ok.status());
         assertArrayEquals(new byte[] {0x2a}, ok.data());
+        // An answered call carries the block it ran against (the balance watch orders by it).
+        assertEquals(21000000L, ok.blockNumber());
         io.myotis.api.CallResult fin = RustChainHandle.callDetailedFromJson(
                 "{\"status\":\"revert\",\"dataHex\":\"0x08\",\"blockNumber\":20999936,\"verified\":true}");
         assertEquals(io.myotis.api.CallResult.Status.REVERTED, fin.status());
         assertArrayEquals(new byte[] {0x08}, fin.data());
+        assertEquals(20999936L, fin.blockNumber());
         io.myotis.api.CallResult un = RustChainHandle.callDetailedFromJson(
                 "{\"status\":\"unavailable\",\"reason\":\"state unavailable\","
                 + "\"blockNumber\":20999936,\"verified\":false}");
         assertEquals(io.myotis.api.CallResult.Status.UNAVAILABLE, un.status());
         assertNull(un.data());
         assertEquals("state unavailable", un.detail());
+        // No answer, no block to order it by.
+        assertEquals(-1L, un.blockNumber());
+        // A pre-ABI-30 envelope without the key: unknown, not block 0.
+        assertEquals(-1L, RustChainHandle.callDetailedFromJson(
+                "{\"status\":\"ok\",\"resultHex\":\"0x\"}").blockNumber());
     }
 
     @Test

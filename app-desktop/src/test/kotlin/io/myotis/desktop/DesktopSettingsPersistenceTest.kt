@@ -227,10 +227,58 @@ class DesktopSettingsPersistenceTest {
     }
 
     @Test
+    fun `the balance watch list and state survive a restart`(@TempDir dir: Path) {
+        val file = dir.resolve("settings.properties")
+        val alice = "0x" + "a1".repeat(20)
+        val first = DesktopSettings(nets, file)
+        assertTrue(first.supportsBalanceWatch())
+        first.setWatchListJson("gnosis", """[{"address":"$alice","label":"Savings"}]""")
+        first.setWatchStateJson("gnosis", """{"v":1,"lastCheckMs":5}""")
+
+        val second = DesktopSettings(nets, file)
+        assertEquals("""[{"address":"$alice","label":"Savings"}]""", second.watchListJson("gnosis"))
+        assertEquals("""{"v":1,"lastCheckMs":5}""", second.watchStateJson("gnosis"))
+        assertEquals("[]", second.watchListJson("mainnet"))
+        assertEquals("{}", second.watchStateJson("mainnet"))
+        // The state is rewritten on every check, so it lives beside the settings, not in them.
+        assertTrue(Files.isRegularFile(dir.resolve("watch-state-gnosis.json")))
+        assertFalse(Files.readString(file).contains("lastCheckMs"))
+    }
+
+    @Test
+    fun `a hand-edited watch list keeps only what checks out`(@TempDir dir: Path) {
+        val file = dir.resolve("settings.properties")
+        val alice = "0x" + "a1".repeat(20)
+        Files.writeString(
+            file,
+            "watch.list.mainnet=[{\"address\":\"0xA1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1\",\"label\":\"x\"}," +
+                "{\"address\":\"0x12\"}]\n",
+        )
+        assertEquals("""[{"address":"$alice","label":"x"}]""", DesktopSettings(nets, file).watchListJson("mainnet"))
+    }
+
+    @Test
+    fun `one notification names every change of a check`() {
+        val alice = "0x" + "a1".repeat(20)
+        val change = io.myotis.ui.WatchChange(
+            alice, "Savings", "1000000000000000000", "1500000000000000000", 0, 0, 1, 2, -1, 0,
+            io.myotis.ui.WatchSearch.NONE, -1, emptyList(),
+        )
+        val (title, message) = watchNotificationText("Ethereum Mainnet", "mainnet", listOf(change))
+        assertEquals("Savings: +0.5 ETH", title)
+        assertTrue(message.startsWith("Ethereum Mainnet — Balance 1 → 1.5 ETH"), message)
+        val (manyTitle, manyMessage) = watchNotificationText("Gnosis Chain", "gnosis", List(5) { change })
+        assertEquals("5 watched balances changed", manyTitle)
+        assertTrue(manyMessage.contains("Savings: +0.5 xDAI") && manyMessage.contains("and 2 more"), manyMessage)
+    }
+
+    @Test
     fun `null file keeps the store in-memory`(@TempDir dir: Path) {
         val s = DesktopSettings(nets, null)
         s.setPreferJavaEngine(true)
         assertTrue(s.preferJavaEngine())
+        s.setWatchStateJson("mainnet", "{}")
+        assertEquals("{}", s.watchStateJson("mainnet"))
         assertEquals(0, Files.list(dir).use { it.count() }, "no file must be written")
     }
 }

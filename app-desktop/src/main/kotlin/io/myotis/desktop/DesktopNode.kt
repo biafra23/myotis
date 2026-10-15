@@ -22,6 +22,8 @@ import io.myotis.txhistory.TxSummary
 import io.myotis.txhistory.headline
 import io.myotis.txhistory.uiKind
 import io.myotis.ui.AccountResult
+import io.myotis.ui.BalanceWatch
+import io.myotis.ui.BalanceWatcher
 import io.myotis.ui.CacheFileStats
 import io.myotis.ui.ENS_CONTENTHASH_KEY
 import io.myotis.ui.EnsOwnership
@@ -41,14 +43,18 @@ import io.myotis.ui.TxRowUi
 import io.myotis.ui.TxScanEvent
 import io.myotis.ui.UpgradeNotice
 import io.myotis.ui.WebAccessMode
+import io.myotis.ui.WatchChange
+import io.myotis.ui.WatchReader
 import io.myotis.ui.WebOriginRow
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
@@ -56,6 +62,8 @@ import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.io.path.createDirectories
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
 
 /**
  * The Desktop actual of [NodeController]: drives the SAME engine the daemon and Android
@@ -584,7 +592,7 @@ class DesktopNodeController(
             ?: throw IllegalStateException("Verified reads are not available on $network (JSON-RPC backend not started)")
         val (toBytes, dataBytes) = ethCallArgs(to, data)
         val r = withContext(Dispatchers.IO) { reads.callDetailed(null, toBytes, dataBytes, null, "latest", null) }
-        return EthCallResult.of(r.status().name, r.data(), r.detail())
+        return EthCallResult.of(r.status().name, r.data(), r.detail(), r.blockNumber())
     }
 
     // ------------------------------------------------------------------------------
@@ -631,6 +639,107 @@ class DesktopNodeController(
         )
         return service.scan(address).map { it.toUi() }
     }
+
+    // ------------------------------------------------------------------------------
+    // Balance watch (the Watch tab): checked every few minutes while the app runs
+    // (Main.kt's loop calls scheduledWatchChecks), and on Check now. One watcher for
+    // both, so its per-network guard keeps them from checking a network twice at once.
+    // ------------------------------------------------------------------------------
+
+    private val balanceWatcher = BalanceWatcher(settings)
+
+    /** Where Check now and list edits run: off the UI thread (a cause scan parses up to 64
+     *  full blocks), and outliving the Watch tab's composition, so leaving the tab mid-check
+     *  stops the tab's wait, not the check. */
+    private val watchScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + Dispatchers.Default)
+
+    /** Where a change is announced — a native notification, as (title, message) → posted;
+     *  null where this desktop has no notification route. Set once by Main.kt. */
+    @Volatile
+    private var watchNotifier: ((String, String) -> Boolean)? = null
+    @Volatile
+    private var watchNotifierKnown = false
+
+    fun setWatchNotifier(notifier: ((String, String) -> Boolean)?) {
+        watchNotifier = notifier
+        watchNotifierKnown = true
+    }
+
+    // Bounded like a scheduled check: one tap on a barely-answering network must not hold
+    // the watcher's slot for tens of minutes (what it leaves unread leads the next check).
+    override suspend fun checkWatched(network: String): List<WatchChange>? =
+        watchScope.async { runWatchCheck(network, "check now", WATCH_BUDGET_MS.milliseconds) }.await()
+
+    override fun onWatchListChanged(network: String, added: Boolean) {
+        if (added) return // an add removes nothing to prune; the tab's baseline check follows
+        watchScope.launch {
+            runCatching { balanceWatcher.prune(engine.canonicalNetworkName(network)) }
+                .onFailure { log.warn("[{}] balance watch prune failed: {}", network, it.toString()) }
+        }
+    }
+
+    override val watchSchedule: String =
+        "Checked every ${WATCH_INTERVAL_MS / 60_000} minutes while Myotis runs and the network is " +
+            "synced. A change posts a notification."
+
+    override val watchNotificationsNote: String?
+        get() = if (watchNotifierKnown && watchNotifier == null) {
+            "This desktop has no notification area Myotis can post to, so changes show only on this tab."
+        } else {
+            null
+        }
+
+    /** One scheduled pass: every running, synced network whose watch list is due. */
+    internal suspend fun scheduledWatchChecks() {
+        for (network in engine.hostedNetworks()) {
+            val handle = engine.get(network) ?: continue
+            val due = BalanceWatch.parseList(settings.watchListJson(network)).isNotEmpty() &&
+                BalanceWatch.isDue(
+                    BalanceWatch.parseState(settings.watchStateJson(network)),
+                    System.currentTimeMillis(), WATCH_INTERVAL_MS, WATCH_RETRY_MS,
+                )
+            if (!due || !handle.isRunning || !syncedWarm(handle)) continue
+            try {
+                runWatchCheck(network, "scheduled", WATCH_BUDGET_MS.milliseconds)
+            } catch (c: kotlinx.coroutines.CancellationException) {
+                throw c
+            } catch (t: Throwable) {
+                log.warn("[{}] balance watch failed: {}", network, t.toString())
+            }
+        }
+    }
+
+    private suspend fun runWatchCheck(network: String, why: String, budget: Duration = Duration.INFINITE): List<WatchChange>? {
+        val canonical = engine.canonicalNetworkName(network)
+        val handle = engine.get(canonical) ?: throw IllegalStateException("Node is not running on $network")
+        val reader = object : WatchReader {
+            // The Query tab's own read, so both map the engine's result the same way.
+            override suspend fun account(address: String): AccountResult = requestAccount(canonical, address)
+            override suspend fun block(number: Long): String? =
+                withContext(Dispatchers.IO) { handle.reads()?.getBlockByNumber("0x" + number.toString(16), true) }
+            // The token balances: the Query tab's verified eth_call, same read.
+            override suspend fun call(to: String, data: String): EthCallResult = ethCall(canonical, to, data)
+            override suspend fun receipts(number: Long): String? =
+                withContext(Dispatchers.IO) { handle.reads()?.getBlockReceipts("0x" + number.toString(16)) }
+        }
+        // A desktop's network is taken as unmetered: the full windows, tokens on every check.
+        val changes = balanceWatcher.check(canonical, reader, BalanceWatch.DEFAULT_SCAN_BLOCKS, budget)
+            ?: return null
+        log.info("[{}] balance watch ({}): {}", canonical, why,
+            if (changes.isEmpty()) "no change" else "${changes.size} change(s)")
+        if (changes.isNotEmpty()) {
+            val (title, message) = watchNotificationText(settings.displayName(canonical), canonical, changes)
+            val posted = watchNotifier?.invoke(title, message) ?: false
+            if (!posted) log.info("[{}] balance change shown in the window only (no notification route)", canonical)
+        }
+        return changes
+    }
+
+    /** The beacon light client is SYNCED and the verified head is warm — Android's bar too. */
+    private fun syncedWarm(h: ChainHandle): Boolean = runCatching {
+        val st = h.status()
+        st.beaconState() == io.myotis.api.BeaconState.SYNCED && st.verifiedHeadAgeMs() != Long.MAX_VALUE
+    }.getOrDefault(false)
 
     private fun TxHistoryEvent.toUi(): TxScanEvent = when (this) {
         is TxHistoryEvent.Started -> TxScanEvent.Started(
@@ -818,6 +927,32 @@ internal fun logIndexConfigJson(settings: Settings, network: String): String? =
         backfillPaused = settings.logIndexBackfillPaused(network),
     )
 
+/** Between the desktop's scheduled balance checks of a network. */
+internal const val WATCH_INTERVAL_MS = 5 * 60_000L
+/** A network whose last check found no verified answer waits this long before the next. */
+internal const val WATCH_RETRY_MS = 2 * 60_000L
+/** A scheduled check never runs longer than this. */
+internal const val WATCH_BUDGET_MS = 3 * 60_000L
+
+/**
+ * The one native notification for a check's [changes] on [network] as (title, message).
+ * One per check, never one per address: Compose hands a notification to the tray only
+ * while its collector is idle, so a burst would lose all but the first (the web-refusal
+ * notifications batch for the same reason).
+ */
+internal fun watchNotificationText(displayName: String, network: String, changes: List<WatchChange>): Pair<String, String> {
+    val currency = BalanceWatch.currency(network)
+    if (changes.size == 1) {
+        val c = changes.single()
+        return BalanceWatch.notificationTitle(c, currency) to
+            "$displayName — ${BalanceWatch.notificationText(c, currency)}"
+    }
+    val lines = changes.take(3).joinToString("; ") { BalanceWatch.notificationTitle(it, currency) }
+    val more = if (changes.size > 3) "; and ${changes.size - 3} more" else ""
+    return "${changes.size} watched balances changed" to
+        "$displayName — $lines$more. The Watch tab has the details."
+}
+
 /** The web-page policy the desktop host hands the engine (#502), straight from [Settings]. */
 internal fun webAccessPolicy(settings: Settings): io.myotis.api.WebAccessPolicy =
     io.myotis.api.WebAccessPolicy(
@@ -880,6 +1015,14 @@ class DesktopSettings(
     // The networks a PoC flavour has configured (PocFlavour.applyFirstStartSettings); null
     // until one first records it. Desktop-only, so it is not on the shared Settings seam.
     private var pocConfigured: Set<String>? = null
+    // Balance watch (the Watch tab): per-network address lists, as BalanceWatch's JSON array.
+    private val watchLists = HashMap<String, String>()
+    // …and the watcher's per-network state. It is rewritten on every check (every few
+    // minutes), so it lives in its own file beside this one (watch-state-<network>.json),
+    // not in the properties file every Settings write rewrites. Cached here; guarded by
+    // [watchStateLock], not `this`, so a state write's disk I/O never blocks settings reads.
+    private val watchStates = HashMap<String, String>()
+    private val watchStateLock = Any()
 
     /** Serializes file writes, separate from the state lock (`this`) so settings
      *  readers never wait on disk I/O. */
@@ -938,6 +1081,37 @@ class DesktopSettings(
     override fun setCustomTokensJson(network: String, json: String) =
         mutate { customTokens[network] = json }
     override fun supportsCustomTokens(): Boolean = true   // persisted in the settings file
+
+    override fun supportsBalanceWatch(): Boolean = true // DesktopNodeController checks it
+    override fun watchListJson(network: String): String = synchronized(this) { watchLists[network] ?: "[]" }
+    override fun setWatchListJson(network: String, json: String) = mutate { watchLists[network] = json }
+
+    override fun watchStateJson(network: String): String = synchronized(watchStateLock) {
+        watchStates.getOrPut(network) {
+            watchStateFile(network)?.takeIf { Files.isRegularFile(it) }
+                ?.let { f -> runCatching { String(Files.readAllBytes(f), Charsets.UTF_8) }.getOrNull() }
+                ?: "{}"
+        }
+    }
+
+    override fun setWatchStateJson(network: String, json: String) = synchronized(watchStateLock) {
+        watchStates[network] = json
+        val f = watchStateFile(network) ?: return@synchronized
+        runCatching {
+            val tmp = f.resolveSibling("${f.fileName}.tmp")
+            Files.write(tmp, json.toByteArray(Charsets.UTF_8))
+            try {
+                Files.move(tmp, f, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(tmp, f, StandardCopyOption.REPLACE_EXISTING)
+            }
+        }.onFailure { log.warn("balance watch state not persisted to {}: {}", f, it.toString()) }
+    }
+
+    /** `watch-state-<network>.json` beside the settings file; null without a file (tests)
+     *  or for a name that is not a plain network id. */
+    private fun watchStateFile(network: String): Path? =
+        file?.takeIf { network.matches(Regex("[a-z0-9-]+")) }?.resolveSibling("watch-state-$network.json")
 
     /** The networks a PoC flavour has configured in this settings file, or null if none is recorded. */
     fun pocConfiguredNetworks(): Set<String>? = synchronized(this) { pocConfigured }
@@ -1015,6 +1189,13 @@ class DesktopSettings(
             // nothing" it would re-apply the primary network over the user's settings.
             pocConfigured = csv.split(',').map(String::trim).filter { it.isNotEmpty() }.toSet()
                 .takeIf { it.isNotEmpty() }
+        }
+        p.stringPropertyNames().filter { it.startsWith(K_WATCH_LIST_PREFIX) }.forEach { k ->
+            // Through the parser, so a hand edit keeps only the entries that check out.
+            p.getProperty(k)?.let {
+                watchLists[k.removePrefix(K_WATCH_LIST_PREFIX)] =
+                    io.myotis.ui.BalanceWatch.serializeList(io.myotis.ui.BalanceWatch.parseList(it))
+            }
         }
         p.stringPropertyNames().filter { it.startsWith(K_LOG_INDEX_PAUSED_PREFIX) }.forEach { k ->
             p.getProperty(k)?.toBooleanStrictOrNull()
@@ -1109,6 +1290,7 @@ class DesktopSettings(
         logIndexPaused.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_PAUSED_PREFIX$net", on.toString()) }
         logIndexWatch.forEach { (net, json) -> p.setProperty("$K_LOG_INDEX_WATCH_PREFIX$net", json) }
         customTokens.forEach { (net, json) -> p.setProperty("$K_CUSTOM_TOKENS_PREFIX$net", json) }
+        watchLists.forEach { (net, json) -> p.setProperty("$K_WATCH_LIST_PREFIX$net", json) }
         return p
     }
 
@@ -1160,6 +1342,7 @@ class DesktopSettings(
         const val K_LOG_INDEX_PAUSED_PREFIX = "logIndex.backfillPaused."
         const val K_LOG_INDEX_WATCH_PREFIX = "logIndex.watch."
         const val K_CUSTOM_TOKENS_PREFIX = "tokens.custom."
+        const val K_WATCH_LIST_PREFIX = "watch.list."
     }
 }
 
