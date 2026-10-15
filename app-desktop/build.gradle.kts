@@ -67,10 +67,12 @@ dependencies {
     implementation(project(":node-core"))
     // Engine selector: DesktopNodeController defaults to Engines.engine().
     implementation(project(":myotis-engines"))
-    // The engine library (the Rust engine + its host seams: the Tor toggle
-    // DesktopNode.applyTorMode and Main's --tor flag use, a documented API-boundary
-    // exemption in CLAUDE.md). The desktop app consumes the Rust engine through it.
+    // The engine library: the desktop app consumes the Rust engine through it.
     implementation(project(":myotis-engine"))
+    // The Rust engine's Tor seam (io.myotis.engines.rust.Tor — DesktopNode.applyTorMode,
+    // Main's --tor flag), a documented API-boundary exemption (CLAUDE.md): the
+    // library keeps the engine module off consumers' classpaths, so the app names it.
+    implementation(project(":myotis-engine-rust"))
     implementation(project(":app"))
     // TrueBlocks tx-history scan for the Query tab (documented API-boundary exemption:
     // it reaches the raw connector via SelectorEngine.javaDelegate().debugStack).

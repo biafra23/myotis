@@ -751,6 +751,9 @@ val skipRustEngine = project.hasProperty("skipRustEngine") &&
     (project.property("skipRustEngine") as? String).let {
         it.isNullOrBlank() || it.trim().lowercase() !in setOf("false", "0", "no", "off")
     }
+// :myotis-engine reads the parsed flag from here (rootProject.extra), so its
+// packaging exclude and this file's task gating can never disagree on a spelling.
+extra["myotis.skipRustEngine"] = skipRustEngine
 val androidRustTargets = listOf("aarch64-linux-android", "x86_64-linux-android")
 val androidRustToolchainReady = rustAvailable &&
     cargoNdkVersion.isNotEmpty() &&
@@ -847,6 +850,9 @@ tasks.register("requireAndroidRustEngine") {
 // (checksum drift, no new symbol) is still caught at load time by UniFFI's
 // checksum gate and, in CI, by the regenerate-and-diff step in android-apk.yml.
 val shippedAbis = listOf("arm64-v8a", "x86_64")
+// :myotis-engine extracts JNA's dispatcher for exactly these ABIs (rootProject.extra):
+// one list, so an ABI added here cannot ship an engine with no dispatcher there.
+extra["myotis.shippedAbis"] = shippedAbis
 val engineJniLibs = shippedAbis.map { file("myotis-engine/src/androidMain/jniLibs/$it/libmyotis_engine.so") }
 val blsJniLibs = shippedAbis.map { file("myotis-engine/src/androidMain/jniLibs/$it/libmyotis_bls.so") }
 val committedBindings = project(":myotis-engine-rust").projectDir

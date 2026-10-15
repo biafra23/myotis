@@ -96,6 +96,14 @@ val derivedVersionCode: Int = rootProject.extra["releaseBuildNumber"] as Int
 android {
     namespace = "com.jaeckel.ethp2p.android"
     compileSdk = 35
+    // The app has NO jniLibs of its own: every native lib it ships (the engine,
+    // native BLS, JNA's dispatcher) arrives inside the engine library's AAR. Said
+    // explicitly because AGP's default src/main/jniLibs is where cargoNdkAndroid
+    // used to write, and an app's own copy wins the merge over a library's — a
+    // libmyotis_*.so left there by an earlier build (not removed by `clean`) would
+    // shadow the AAR's fresh one and fail UniFFI validation on-device, a silent
+    // Java fallback. With no source dir, nothing from the app's tree reaches the APK.
+    sourceSets.getByName("main").jniLibs.setSrcDirs(emptyList<String>())
 
     defaultConfig {
         applicationId = "com.jaeckel.ethp2p.android"
@@ -315,12 +323,15 @@ dependencies {
     // Engine selector: NodeService.ENGINE is Engines.engine(); the Settings "Rust
     // engine" toggle drives it via NodeService.applyEngineChoice.
     implementation(project(":myotis-engines"))
-    // The engine library: the Rust engine (and its host seams — the Tor toggle
-    // NodeService and AndroidNodeBridge use, a documented API-boundary exemption in
-    // CLAUDE.md) with the jniLibs and JNA's Android dispatcher inside its AAR. The
-    // Android app consumes the Rust engine through it; the JNA classes come with it
-    // (and from Besu), the natives ride in the AAR.
+    // The engine library: the Rust engine with the jniLibs and JNA's Android
+    // dispatcher inside its AAR. The Android app consumes the Rust engine through
+    // it; the JNA classes come with it (and from Besu), the natives ride in the AAR.
     implementation(project(":myotis-engine"))
+    // The Rust engine's Tor seam (io.myotis.engines.rust.Tor — NodeService's Tor
+    // toggle, AndroidNodeBridge), a documented API-boundary exemption (CLAUDE.md):
+    // the library keeps the engine module off consumers' classpaths, so the app
+    // names it itself.
+    implementation(project(":myotis-engine-rust"))
     // TrueBlocks tx-history scan for the Query tab (documented API-boundary exemption:
     // NodeService reaches the raw connector via SelectorEngine.javaDelegate().debugStack).
     // Java-21 classfiles like :networking — already dexed fine (see libs.versions.toml).

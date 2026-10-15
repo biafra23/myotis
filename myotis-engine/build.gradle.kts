@@ -26,15 +26,20 @@ plugins {
     alias(libs.plugins.android.library)
 }
 
-// Mirror the root build's -PskipRustEngine parse (same truthy rules). When set,
-// the AAR omits the Rust native libs — so packaging must also drop any
-// libmyotis_*.so LEFT OVER in the source tree from an earlier toolchain build,
-// or the AAR would ship a stale engine and the app would silently fall back to
-// Java on-device (the very failure this contract prevents).
-val skipRustEngine = project.hasProperty("skipRustEngine") &&
-    (project.property("skipRustEngine") as? String).let {
-        it.isNullOrBlank() || it.trim().lowercase() !in setOf("false", "0", "no", "off")
-    }
+// The root build parses -PskipRustEngine once (same truthy rules everywhere) and
+// exports it; reading it here keeps this module's packaging exclude and the root's
+// task gating on one definition. When set, the AAR omits the Rust native libs — so
+// packaging must also drop any libmyotis_*.so LEFT OVER in the source tree from
+// an earlier toolchain build, or the AAR would ship a stale engine and the app
+// would silently fall back to Java on-device (the very failure this contract
+// prevents).
+@Suppress("UNCHECKED_CAST")
+val skipRustEngine = rootProject.extra["myotis.skipRustEngine"] as Boolean
+// The ABIs cargoNdkAndroid builds for (rust/build-android.sh + the root build's
+// output list): JNA's dispatcher is extracted for exactly these, from the root's
+// one list.
+@Suppress("UNCHECKED_CAST")
+val shippedAbis = rootProject.extra["myotis.shippedAbis"] as List<String>
 
 kotlin {
     jvmToolchain(21)
@@ -62,12 +67,15 @@ kotlin {
         val jvmSharedMain by creating {
             dependsOn(commonMain.get())
             dependencies {
-                // The engine contract every consumer codes against (io.myotis.api)…
+                // The engine contract every consumer codes against (io.myotis.api):
+                // the library's public API, per CLAUDE.md ("hosts talk ONLY to
+                // :myotis-api")…
                 api(project(":myotis-api"))
-                // …and the Rust engine behind it, with its host-side seams (the Tor
-                // toggle, availability, the log drain) — reachable from the hosts
-                // through this module, which is what they now depend on.
-                api(project(":myotis-engine-rust"))
+                // …over the Rust engine, which stays an implementation detail: its
+                // classes, the UniFFI bindings and the JSON shapes are not a consumer's
+                // compile classpath. The few host seams beside the contract (the Tor
+                // toggle, availability, the log drain) are re-exported on `Myotis`.
+                implementation(project(":myotis-engine-rust"))
             }
         }
         val jvmMain by getting { dependsOn(jvmSharedMain) }
@@ -134,6 +142,81 @@ tasks.named<Test>("jvmTest") {
     }
 }
 
+// === JNA's Android dispatcher, inside the AAR ==================================
+// The engine's UniFFI bindings load through JNA. com.sun.jna.* comes from the
+// plain jna JAR (:myotis-engine-rust's dependency, so every consumer has it), but
+// that jar carries desktop natives only (win32/darwin/linux/aix) —
+// jni/<abi>/libjnidispatch.so, without which JNA cannot dispatch at all, ships
+// exclusively in jna-<v>.aar. Take ONLY the natives from the aar, into this
+// module's jniLibs, so the AAR a consumer gets is complete on its own: no
+// consumer has to know about the aar, and none can hit the duplicate-class
+// failure of putting it on a classpath next to the jar. A detached,
+// non-consumable configuration keeps the aar off every classpath.
+//
+// The classpath jar and the extracted natives MUST be the same version: JNA's
+// Native.<clinit> compares its own version against the native library's and
+// throws on a major/minor mismatch. Both come from the one catalog entry, and the
+// jar side is pinned by a STRICT constraint that lands in the published POM, so a
+// consumer whose graph wants another jna (a BOM, another library) gets a
+// resolution error at build time instead of an engine that cannot load on every
+// device. (The Myotis app additionally forces the same value against Besu's BOM.)
+val jnaVersion = libs.versions.jna.get()
+dependencies {
+    constraints {
+        "jvmSharedMainApi"("net.java.dev.jna:jna") {
+            version { strictly(jnaVersion) }
+            because("libjnidispatch.so inside the AAR is jna $jnaVersion; JNA refuses a mismatched jar")
+        }
+    }
+}
+
+val jnaAndroidNatives: Configuration by configurations.creating {
+    isTransitive = false
+    isCanBeConsumed = false
+}
+
+dependencies {
+    jnaAndroidNatives("net.java.dev.jna:jna:$jnaVersion@aar")
+}
+
+// Every ABI that gets libmyotis_engine.so needs a matching libjnidispatch.so,
+// or UniFFI cannot load and that ABI silently falls back to the Java engine —
+// hence the root's one shippedAbis list (read above), which cargoNdkAndroid's
+// outputs and `cargo ndk -t ...` in rust/build-android.sh follow too. What
+// actually enforces the invariant is the APK post-condition in
+// .github/workflows/android-apk.yml, which checks the built Myotis app.
+
+// aar layout is jni/<abi>/lib*.so; the jniLibs source set wants <abi>/lib*.so.
+// Sync, not Copy: Copy leaves behind files no longer in the spec, so a narrowed
+// abi list (or a jna upgrade dropping one) would keep packaging a stale .so.
+// NOT configuration-cache compatible, knowingly (the lambdas capture the build
+// script); CC is off project-wide today.
+val extractJnaAndroidNatives = tasks.register<Sync>("extractJnaAndroidNatives") {
+    from(jnaAndroidNatives.elements.map { zipTree(it.single().asFile) }) {
+        shippedAbis.forEach { abi -> include("jni/$abi/**") }
+    }
+    eachFile { path = path.substringAfter("jni/") }
+    includeEmptyDirs = false
+    into(layout.buildDirectory.dir("jna-android-natives"))
+    // Gradle does not warn about include patterns that match nothing, so an ABI
+    // the aar has never carried would extract silently to nothing and that ABI
+    // would ship an engine with no dispatcher.
+    doLast {
+        val got = destinationDir.listFiles { f: java.io.File -> f.isDirectory }
+            ?.map { it.name }.orEmpty().toSet()
+        val missing = shippedAbis.filterNot { it in got }
+        check(missing.isEmpty()) {
+            "jna-$jnaVersion.aar carries no libjnidispatch.so for $missing — those ABIs " +
+                "would ship libmyotis_engine.so with no JNA dispatcher, so the Rust engine " +
+                "could not load at runtime (a silent Java fallback on API 33+, a failed boot below)."
+        }
+    }
+}
+
+android {
+    sourceSets.getByName("main").jniLibs.srcDir(extractJnaAndroidNatives)
+}
+
 // === The Rust engine, built from source into this module's jniLibs ===========
 // requireAndroidRustEngine enforces the contract: with the toolchain present,
 // cargoNdkAndroid cross-compiles the jniLibs and uniffiGenerateKotlin refreshes
@@ -146,6 +229,13 @@ tasks.named<Test>("jvmTest") {
 // everyone via the regenerate-and-diff step in android-apk.yml. Root
 // build.gradle.kts owns the tasks.
 tasks.matching { it.name == "preBuild" }.configureEach {
+    // JNA's Android dispatcher (the extraction task is defined further down):
+    // srcDir(<TaskProvider>) registers the DIRECTORY but does NOT carry a task
+    // dependency through AGP's source sets, so on a clean build the jniLib merge
+    // would run before anything has extracted and the AAR would silently ship
+    // without libjnidispatch.so. preBuild runs ahead of every merge/assemble/
+    // bundle path.
+    dependsOn(extractJnaAndroidNatives)
     // Always run the gate: with -PskipRustEngine it just logs the opt-out.
     dependsOn(rootProject.tasks.named("requireAndroidRustEngine"))
     // Only pull the Rust build tasks into the graph when we actually want the
@@ -180,81 +270,3 @@ rootProject.tasks.named("cargoBuildHost").configure {
     mustRunAfter(rootProject.tasks.named("requireAndroidRustEngine"))
 }
 
-// === JNA's Android dispatcher, inside the AAR ==================================
-// The engine's UniFFI bindings load through JNA. com.sun.jna.* comes from the
-// plain jna JAR (:myotis-engine-rust's dependency, so every consumer has it), but
-// that jar carries desktop natives only (win32/darwin/linux/aix) —
-// jni/<abi>/libjnidispatch.so, without which JNA cannot dispatch at all, ships
-// exclusively in jna-<v>.aar. Take ONLY the natives from the aar, into this
-// module's jniLibs, so the AAR a consumer gets is complete on its own: no
-// consumer has to know about the aar, and none can hit the duplicate-class
-// failure of putting it on a classpath next to the jar. A detached,
-// non-consumable configuration keeps the aar off every classpath.
-//
-// The classpath jar and the extracted natives MUST be the same version: JNA's
-// Native.<clinit> compares its own version against the native library's and
-// throws on a major/minor mismatch. Both come from the one catalog entry; a
-// consumer that forces another jna version (the Myotis app does, against Besu's
-// BOM) forces the SAME catalog value for that reason.
-val jnaVersion = libs.versions.jna.get()
-
-val jnaAndroidNatives: Configuration by configurations.creating {
-    isTransitive = false
-    isCanBeConsumed = false
-}
-
-dependencies {
-    jnaAndroidNatives("net.java.dev.jna:jna:$jnaVersion@aar")
-}
-
-// Every ABI that gets libmyotis_engine.so needs a matching libjnidispatch.so,
-// or UniFFI cannot load and that ABI silently falls back to the Java engine.
-//
-// KEEP IN SYNC with `cargo ndk -t ...` in rust/build-android.sh and the
-// cargoNdkAndroid output paths in the root build.gradle.kts — one list, three
-// places. Deliberately a literal rather than a listing of src/androidMain/jniLibs:
-// that directory is cargoNdkAndroid's EXECUTION-time output while this is read
-// at CONFIGURATION time. What actually enforces the invariant is the APK
-// post-condition in .github/workflows/android-apk.yml, which checks the built
-// Myotis app.
-val shippedAbis = listOf("arm64-v8a", "x86_64")
-
-// aar layout is jni/<abi>/lib*.so; the jniLibs source set wants <abi>/lib*.so.
-// Sync, not Copy: Copy leaves behind files no longer in the spec, so a narrowed
-// abi list (or a jna upgrade dropping one) would keep packaging a stale .so.
-// NOT configuration-cache compatible, knowingly (the lambdas capture the build
-// script); CC is off project-wide today.
-val extractJnaAndroidNatives = tasks.register<Sync>("extractJnaAndroidNatives") {
-    from(jnaAndroidNatives.elements.map { zipTree(it.single().asFile) }) {
-        shippedAbis.forEach { abi -> include("jni/$abi/**") }
-    }
-    eachFile { path = path.substringAfter("jni/") }
-    includeEmptyDirs = false
-    into(layout.buildDirectory.dir("jna-android-natives"))
-    // Gradle does not warn about include patterns that match nothing, so an ABI
-    // the aar has never carried would extract silently to nothing and that ABI
-    // would ship an engine with no dispatcher.
-    doLast {
-        val got = destinationDir.listFiles { f: java.io.File -> f.isDirectory }
-            ?.map { it.name }.orEmpty().toSet()
-        val missing = shippedAbis.filterNot { it in got }
-        check(missing.isEmpty()) {
-            "jna-$jnaVersion.aar carries no libjnidispatch.so for $missing — those ABIs " +
-                "would ship libmyotis_engine.so with no JNA dispatcher, so the Rust engine " +
-                "could not load at runtime (a silent Java fallback on API 33+, a failed boot below)."
-        }
-    }
-}
-
-android {
-    sourceSets.getByName("main").jniLibs.srcDir(extractJnaAndroidNatives)
-}
-
-// srcDir(<TaskProvider>) registers the DIRECTORY but does NOT carry a task
-// dependency through AGP's source sets: on a clean build the jniLib merge runs
-// before anything has extracted and the AAR silently ships without
-// libjnidispatch.so. Wire it through the same preBuild hook cargoNdkAndroid
-// uses, which runs ahead of every merge/assemble/bundle path.
-tasks.matching { it.name == "preBuild" }.configureEach {
-    dependsOn(extractJnaAndroidNatives)
-}

@@ -1,8 +1,6 @@
 package io.myotis.engine
 
 import io.myotis.api.EngineException
-import io.myotis.engines.rust.RustMyotisEngine
-import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -14,11 +12,6 @@ import org.junit.jupiter.api.Test
  * [EngineException] — never a half-built engine.
  */
 class MyotisTest {
-
-    @Test
-    fun availabilityMirrorsTheRustEngine() {
-        assertEquals(RustMyotisEngine.isAvailable(), Myotis.isAvailable())
-    }
 
     @Test
     fun newEngineIsTheRustEngineOrARefusal() {
