@@ -291,7 +291,7 @@ kotlin {
 
 // JNA reaches the APK in TWO pieces, because no single artifact carries both:
 //   - com.sun.jna.* classes come from the plain jna JAR, transitively via
-//     :myotis-engines and Besu (nothing here declares it directly);
+//     :myotis-engine-rust and Besu (nothing here declares it directly);
 //   - jni/<abi>/libjnidispatch.so comes from jna-<v>.aar, extracted at the
 //     bottom of this file into jniLibs.
 // The aar cannot just be put on a classpath instead: it carries the same

@@ -1,6 +1,6 @@
 package io.myotis.engines.rust;
 
-import io.myotis.jsonrpc.RpcBlockWindow;
+import io.myotis.jsonrpc.policy.RpcBlockWindow;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;

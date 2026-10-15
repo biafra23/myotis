@@ -28,7 +28,7 @@ import java.util.concurrent.TimeoutException;
  *
  * <p>Blocking, per the port contract. The Java engine calls it from its own
  * workers ({@code PortBridges.toCcipGateway}) and bridges to its internal async
- * shape; with the Rust engine, {@code CcipDriver} (in {@code :myotis-engines})
+ * shape; with the Rust engine, {@code CcipDriver} (in {@code :myotis-engine-rust})
  * calls it on the thread that called the {@code EnsApi}. Any non-2xx HTTP status
  * is surfaced as a thrown {@link RuntimeException} carrying the status code and
  * URL, which both engines treat as "this gateway failed", moving on to the next

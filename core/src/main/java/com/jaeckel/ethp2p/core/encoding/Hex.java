@@ -23,7 +23,7 @@ import java.nio.charset.StandardCharsets;
  * 40-char length check no longer proves 20 bytes) and accepts the same
  * non-ASCII Unicode digits as {@code Character.digit}. This class is the
  * strict codec for validation paths; Tuweni {@code Bytes} remains fine where
- * the input is already trusted bytes. (Also: {@code :myotis-engines} has no
+ * the input is already trusted bytes. (Also: {@code :myotis-engine-rust} has no
  * Tuweni on its classpath at all.)
  */
 public final class Hex {

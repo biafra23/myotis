@@ -47,7 +47,7 @@ starts per that plan's entry criteria (see also "EL-phase entry" below).
 - Binding choice (REVISED): the JVM boundary is **UniFFI + JSON marshalling** —
   the original hand-JNI decision was reversed (user decision, 2026-07) as a
   transport swap only: `#[uniffi::export]` fns in `rust/myotis-engine/src/ffi.rs`,
-  generated Kotlin bindings committed in `:myotis-engines`
+  generated Kotlin bindings committed in `:myotis-engine-rust`
   (`uniffiGenerateKotlin` regenerates), `RustEngineNative` reduced to a static
   delegator. Compound values STILL cross as JSON strings with the golden-test-
   pinned shapes; UniFFI's per-function API checksums replace the hand-rolled

@@ -604,10 +604,11 @@ final class RustVerifiedReads implements VerifiedReads {
 
     /** Package-private, JNI-free: the block-window decision, with the anchored head
      *  supplied lazily (fetched only when a numeric pin needs validating). The
-     *  policy + tolerances live ONCE in jsonrpc-server's RpcBlockWindow, shared
-     *  with the iOS backend so the serving window can never drift between hosts. */
+     *  policy + tolerances live ONCE in :myotis-rpc-policy's RpcBlockWindow, shared
+     *  with the JSON-RPC router and the iOS backend so the serving window can never
+     *  drift between hosts. */
     static boolean blockInWindow(String block, java.util.function.Supplier<Long> head) {
-        return io.myotis.jsonrpc.RpcBlockWindow.INSTANCE.blockInWindow(block, head::get);
+        return io.myotis.jsonrpc.policy.RpcBlockWindow.INSTANCE.blockInWindow(block, head::get);
     }
 
     /** Fixed-width bytes → lowercase 0x-hex (a 20-byte address or a 32-byte

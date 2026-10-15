@@ -86,7 +86,7 @@ kotlinx-serialization = "1.7.3"
 # compiling :ui against 0.6.x crashed the desktop Logs tab with NoClassDefFoundError at runtime
 # — keep this in sync with what the Compose BOM ships.
 kotlinx-datetime = "0.7.1"
-# Tiny (~30 KB), dependency-free, Android-safe JSON parser for :myotis-engines'
+# Tiny (~30 KB), dependency-free, Android-safe JSON parser for :myotis-engine-rust's
 # JNI JSON marshalling (hand-JNI decision, docs/reimplementation/05).
 minimal-json = "0.9.5"
 
@@ -127,7 +127,7 @@ junit-jupiter       = { module = "org.junit.jupiter:junit-jupiter" }
 milagro             = { module = "org.miracl.milagro.amcl:milagro-crypto-java", version.ref = "milagro" }
 jblst               = { module = "tech.pegasys:jblst",                        version.ref = "jblst" }
 jvm-libp2p          = { module = "io.libp2p:jvm-libp2p",                   version.ref = "jvm-libp2p" }
-# JNA — the FFI layer under the UniFFI-generated Kotlin bindings in :myotis-engines
+# JNA — the FFI layer under the UniFFI-generated Kotlin bindings in :myotis-engine-rust
 # (replaces the old hand-JNI). :android-app additionally pins the @aar variant so
 # the packaged natives come from JNA's Android artifact.
 jna                 = { module = "net.java.dev.jna:jna",                   version.ref = "jna" }

@@ -1,5 +1,7 @@
 package io.myotis.jsonrpc
 
+import io.myotis.jsonrpc.policy.WebOrigins
+
 import io.ktor.server.application.ApplicationCallPipeline
 import io.ktor.server.application.call
 import io.ktor.server.application.serverConfig

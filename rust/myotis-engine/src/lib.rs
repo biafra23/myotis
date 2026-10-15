@@ -1,5 +1,5 @@
 //! The Rust implementation of the `io.myotis.api` engine contract, exposed to the
-//! JVM via UniFFI (`ffi` — generated Kotlin bindings live in `:myotis-engines`;
+//! JVM via UniFFI (`ffi` — generated Kotlin bindings live in `:myotis-engine-rust`;
 //! compound records still cross as JSON, see the phase-1 plan and
 //! docs/reimplementation/05). The old hand-JNI shims are gone; the iOS hosts keep
 //! consuming the plain C ABI in `capi`.

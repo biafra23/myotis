@@ -23,7 +23,7 @@ java {
 dependencies {
     // The contract this module selects implementations of.
     api(project(":myotis-api"))
-    // The Rust engine — the other selectable engine. `implementation`, like
+    // The Rust engine — one of the two selectable engines. `implementation`, like
     // node-core: a host that uses the Rust engine's own host-side seam (the Tor
     // toggle, a documented exemption in CLAUDE.md) declares :myotis-engine-rust
     // itself, so the engine does not land on every host's compile classpath by
@@ -31,6 +31,10 @@ dependencies {
     implementation(project(":myotis-engine-rust"))
     // The Java engine (JavaMyotisEngine) — the other selectable engine.
     implementation(project(":node-core"))
+    // The loopback JSON-RPC listener the selector attaches to every Rust handle
+    // (KtorLoopbackRpc over the shared Ktor server): the Rust engine module carries
+    // no server itself, so the JVM hosts get theirs from here.
+    implementation(project(":jsonrpc-server"))
     implementation(libs.slf4j.api)
 
     testImplementation(platform(libs.junit.bom))

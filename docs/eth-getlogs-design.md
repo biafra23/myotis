@@ -580,7 +580,7 @@ with the permanent `-32602` — `parse_get_logs_filter`, `myotis-engine/src/host
 ### 5. Config & opt-in plumbing
 
 There is no existing config channel into the Rust engine beyond
-(network, dataDir) (`RustMyotisEngine.java:138` → `ffi.rs:65`), and
+(network, dataDir) (`RustMyotisEngine.create` in `:myotis-engine-rust` → `ffi.rs:65`), and
 `servedBlockWindow` never crosses the FFI (true at ABI v21; v22 then added
 `set_served_block_window` the same post-create way) — so the watch-list gets a dedicated
 post-create call rather than a `create_handle` signature break:

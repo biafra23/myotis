@@ -61,13 +61,15 @@ kotlin {
             // The JSON-RPC listener (Ktor CIO in commonMain; the backend here
             // adapts its seams over the Rust engine's C ABI).
             implementation(project(":jsonrpc-server"))
+            // The serving-window policy the iOS backend applies (RpcBlockWindow).
+            implementation(project(":myotis-rpc-policy"))
             implementation(compose.runtime)
             implementation(compose.foundation)
             implementation(compose.material3)
             implementation(compose.ui)
             implementation(libs.kotlinx.coroutines.core)
             // Parses the engine's JSON (status/account/ENS/catalog) — the Kotlin
-            // twin of :myotis-engines' minimal-json marshalling layer.
+            // twin of :myotis-engine-rust's minimal-json marshalling layer.
             implementation(libs.kotlinx.serialization.json)
         }
     }

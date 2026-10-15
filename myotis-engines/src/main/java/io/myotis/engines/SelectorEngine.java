@@ -54,7 +54,9 @@ public final class SelectorEngine implements MyotisEngine {
         RustMyotisEngine r = rust;
         if (r == null) {
             synchronized (this) {
-                if (rust == null) rust = new RustMyotisEngine();
+                // The JVM hosts' loopback JSON-RPC listener rides with the selector: the
+                // engine module itself ships none (LoopbackRpc).
+                if (rust == null) rust = new RustMyotisEngine(KtorLoopbackRpc::new);
                 r = rust;
             }
         }

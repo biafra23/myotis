@@ -1,5 +1,9 @@
 package io.myotis.jsonrpc
 
+import io.myotis.jsonrpc.policy.WebAccessMode
+import io.myotis.jsonrpc.policy.WebAccessPolicy
+import io.myotis.jsonrpc.policy.WebOrigins
+
 /**
  * The `io.myotis.api` ↔ commonMain mapping for the web-page policy (#502): the
  * engines hand a host's [io.myotis.api.WebAccessPolicy] to the listener's
@@ -23,7 +27,7 @@ object WebAccessApi {
     @JvmStatic
     fun apply(webAccess: WebAccess, policy: io.myotis.api.WebAccessPolicy): io.myotis.api.WebAccessPolicy {
         webAccess.policy = toPolicy(policy)
-        return io.myotis.api.WebAccessPolicy(policy.mode(), policy.origins().mapNotNull(WebOrigins::normalize))
+        return io.myotis.api.WebAccessPolicy(policy.mode(), WebOrigins.normalizeEach(policy.origins()))
     }
 
     /** The recent-origins list as api rows, most recent first. */

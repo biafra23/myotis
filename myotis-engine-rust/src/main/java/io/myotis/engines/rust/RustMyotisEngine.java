@@ -49,6 +49,9 @@ public final class RustMyotisEngine implements MyotisEngine {
     /** Networks this engine currently hosts, keyed by canonical name. */
     private final Map<String, RustChainHandle> hosted = new ConcurrentHashMap<>();
 
+    /** Builds each handle's loopback listener, or null: no listener (the engine library). */
+    private final LoopbackRpc.Factory rpcFactory;
+
     /** True when libmyotis_engine loaded and passed the ABI handshake. */
     public static boolean isAvailable() {
         return RustEngineNative.isAvailable();
@@ -70,15 +73,30 @@ public final class RustMyotisEngine implements MyotisEngine {
     }
 
     /**
+     * An engine whose handles attach NO loopback listener: {@code reads()} answers
+     * in-process once a network is started, and nothing listens on {@code rpcPort}.
+     * The engine library's constructor.
+     *
+     * @throws EngineException when libmyotis_engine is not available on this host
+     */
+    public RustMyotisEngine() {
+        this(null);
+    }
+
+    /**
      * Public because the selector ({@code :myotis-engines}) and the engine library
      * construct it from other modules — the same standing as {@code JavaMyotisEngine}
      * in node-core. Host composition roots still go through {@code Engines.engine()}
      * (CLAUDE.md): a second instance built here is unknown to the selector's
      * ownership routing.
      *
+     * @param rpcFactory builds the loopback JSON-RPC listener each {@link #create}
+     *        attaches to its handle (the selector passes the Ktor one for the JVM
+     *        hosts); null attaches none
      * @throws EngineException when libmyotis_engine is not available on this host
      */
-    public RustMyotisEngine() {
+    public RustMyotisEngine(LoopbackRpc.Factory rpcFactory) {
+        this.rpcFactory = rpcFactory;
         if (!RustEngineNative.isAvailable()) {
             throw new EngineException("libmyotis_engine is not available on this host");
         }
@@ -157,6 +175,9 @@ public final class RustMyotisEngine implements MyotisEngine {
         if (net == null) {
             throw new EngineException("unknown network: " + config.networkName());
         }
+        // The host's listener for this handle, built BEFORE the native handle: a
+        // factory that throws must not leak a native tokio/libp2p host.
+        LoopbackRpc rpc = rpcFactory != null ? rpcFactory.create() : null;
         // The native side is the single source of truth for which networks it
         // hosts: nativeCreate returns UNSUPPORTED_NETWORK for a canonical network
         // whose Rust config hasn't landed yet, and auto mode falls back to Java
@@ -203,7 +224,7 @@ public final class RustMyotisEngine implements MyotisEngine {
         // network's catalog default (mainnet 8545, sepolia 8547, ...).
         int rpcPort = config.rpcPort() > 0 ? config.rpcPort() : net.defaultRpcPort();
         RustChainHandle handle = new RustChainHandle(id, canonical, net.chainId(), rpcPort,
-                net.hasEns(), ports != null ? ports.httpGateway() : null);
+                net.hasEns(), ports != null ? ports.httpGateway() : null, rpc);
         // Atomic claim (mirrors JavaMyotisEngine.putIfAbsent): reject a re-create rather
         // than orphaning the previous handle's native entry. On a lost race, release the
         // native handle we just allocated so it doesn't leak a tokio/libp2p host.

@@ -33,6 +33,9 @@ kotlin {
 
     sourceSets {
         commonMain.dependencies {
+            // The serving policy (RpcBlockWindow) the router applies — its own module,
+            // shared with :myotis-engine-rust and :app-ios without this server.
+            api(project(":myotis-rpc-policy"))
             // HTTP server (endpoint) + client (upstream proxy).
             implementation(libs.ktor.server.core)
             implementation(libs.ktor.server.cio)
