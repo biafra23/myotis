@@ -35,9 +35,9 @@ on:
       - "app-desktop/build.gradle.kts"
       - "app-desktop/src/main/kotlin/io/myotis/desktop/Main.kt"
       - "app-desktop/src/main/resources/logback-desktop.xml"
-      - "myotis-engines/src/main/java/io/myotis/engines/RustEngineNative.java"
+      - "myotis-engine-rust/src/main/java/io/myotis/engines/rust/RustEngineNative.java"
       # The committed UniFFI bindings: the verify step checks the engine against them.
-      - "myotis-engines/src/main/kotlin/uniffi/**"
+      - "myotis-engine-rust/src/main/kotlin/uniffi/**"
       - "build.gradle.kts"
       - "gradle/libs.versions.toml"
   # Any branch, on demand from the Actions tab.
@@ -237,7 +237,7 @@ jobs:
           Write-Output "OK: x64 msi $version carries an x64 launcher, JVM, Rust engine and JNA stub, and no PoC seed"
 
           # The bundled engine must pass the integrity checks the committed UniFFI
-          # bindings run when they load it (myotis-engines' myotis_engine.kt): the
+          # bindings run when they load it (myotis-engine-rust's myotis_engine.kt): the
           # contract version and every API checksum. A mismatch makes the app fall
           # back to the Java engine silently, and the dmg/deb legs never load the
           # library at all. Each checksum is read the way the bindings read it (a
@@ -256,7 +256,7 @@ jobs:
           '@
           $dll = (Get-ChildItem -Path $ex -Recurse -File -Filter 'myotis_engine.dll')[0].FullName
           $lib = [System.Runtime.InteropServices.NativeLibrary]::Load($dll)
-          $kt = Get-Content -Raw 'myotis-engines/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt'
+          $kt = Get-Content -Raw 'myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt'
           $contract = [regex]::Match($kt, 'val bindings_contract_version = (\d+)').Groups[1].Value
           $got = [UniffiProbe]::Call($lib, 'ffi_myotis_engine_uniffi_contract_version')
           Write-Output "UniFFI contract version: bindings $contract, engine $got"

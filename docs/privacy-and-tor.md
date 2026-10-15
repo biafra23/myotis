@@ -611,6 +611,6 @@ Re-evaluate when any of these becomes true:
   `rust/myotis-net/src/el/tor.rs` (`push_transaction`)
 - DNS ENR trees: `networking/dns/DnsEnrResolver`, `NetworkConfig.elEnrTreeUrls`
 - Tor transport + Arti setup: `rust/myotis-net/src/el/tor.rs`; host seams:
-  `myotis-engines/.../Tor.java`, desktop `DesktopNode.applyTorMode`, Android
+  `myotis-engine-rust/.../Tor.java`, desktop `DesktopNode.applyTorMode`, Android
   `NodeService.applyTorMode`
 - Hello clientId: `networking/.../HelloMessage.java`

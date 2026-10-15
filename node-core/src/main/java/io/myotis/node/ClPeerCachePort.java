@@ -7,7 +7,7 @@ import java.util.Set;
 
 /**
  * The CL (beacon libp2p) peer-cache operations a {@code ChainStack} needs, abstracted
- * so the daemon ({@code CLPeerCache}) and Android ({@code AndroidCLPeerCache}) can each
+ * so the daemon ({@code CLPeerCache}) and the engine library ({@code io.myotis.engine.ports.FileClPeerCache}) can each
  * supply their own file-backed implementation via a thin adapter. Method shapes mirror
  * what {@code BeaconLightClient}'s seed/listener setters consume, so they wire as direct
  * method references.

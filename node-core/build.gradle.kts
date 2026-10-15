@@ -30,6 +30,8 @@ dependencies {
     // The formal engine boundary this module implements (io.myotis.node.api adapters).
     // `api` (not `implementation`): hosts consume the interface types transitively.
     api(project(":myotis-api"))
+    // WakeGate + SleepMetrics — shared with the Rust engine's handle (:myotis-engine-rust).
+    implementation(project(":myotis-engine-common"))
     implementation(project(":core"))
     implementation(project(":networking"))
     implementation(project(":consensus"))

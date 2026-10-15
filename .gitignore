@@ -57,6 +57,8 @@ ios-app/DerivedData/
 # SOURCE by the Android build (cargoNdkAndroid), not committed — a committed
 # binary would drift from the Rust source and silently ship a dead engine.
 # `-PskipRustEngine` omits them (the app falls back to the Java engine).
+/myotis-engine/src/androidMain/jniLibs/*/libmyotis_*.so
+# The pre-:myotis-engine location: a leftover from an older build must not get staged.
 /android-app/src/main/jniLibs/*/libmyotis_*.so
 logindex-*.db
 __pycache__/

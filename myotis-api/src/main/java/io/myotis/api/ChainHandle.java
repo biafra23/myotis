@@ -156,8 +156,11 @@ public interface ChainHandle {
     BeaconStatus beaconStatus();
 
     /**
-     * The verified eth_* read surface, or {@code null} while the RPC backend
-     * isn't started (e.g. the RPC port was unavailable at {@link #start()}).
+     * The verified eth_* read surface, or {@code null} until the handle can
+     * answer: with a loopback listener attached (the Myotis apps), while the RPC
+     * backend isn't started (e.g. the RPC port was unavailable at
+     * {@link #start()}); with no listener (the engine library's in-process
+     * consumer), before {@link #start()} succeeded.
      */
     VerifiedReads reads();
 

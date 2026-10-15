@@ -23,12 +23,12 @@ ERC-3668.
 > addresses stay pinned in `EnsAddresses`, unused). There is no Ktor
 > gateway: the daemon and desktop use `JavaHttpCcipGateway` (`java.net.http`,
 > `app/src/main/java/com/jaeckel/ethp2p/app/rpc/`) and Android uses
-> `AndroidCcipGateway` (`HttpURLConnection`), both behind the engine API's
+> `UrlConnectionHttpGateway` (`HttpURLConnection`, the engine library's), both behind the engine API's
 > `HttpGateway` port (`PortBridges.toCcipGateway`). And generic `eth_call` is
 > now served over JSON-RPC; on the Java engine it runs through the same
 > `CcipReadEvmExecutor` (`rpc-backend`'s `VerifiedRpcBackend`). The Rust
 > engine reports an offchain answer to its host, which drives the gateway
-> round (`myotis-engines/src/main/java/io/myotis/engines/CcipDriver.java`).
+> round (`myotis-engine-rust/src/main/java/io/myotis/engines/rust/CcipDriver.java`).
 
 ## Acceptance criteria (from the original plan)
 

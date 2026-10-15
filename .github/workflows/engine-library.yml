@@ -1,0 +1,396 @@
+# The engine library's publication: eth.myotis:myotis-engine (the Android AAR +
+# the desktop jar) and the modules its POMs reach, staged as a Maven repository
+# and checked (scripts/check_engine_library.sh) on every run; on a `v*` tag,
+# published to GitHub Packages, merged into the `maven-repo` branch (a Maven
+# repository URL that needs no token) and attached to the release as the bare
+# AAR plus a zip of that repository, with a SHA256SUMS file. Consumer side:
+# docs/android-library.md. Which modules, and why: the `Publishing` section of
+# the root build.gradle.kts.
+#
+# The APK workflow already builds the same AAR into the Myotis app on every
+# push to main; what this one adds is the PUBLICATION — the coordinates, the
+# POMs and module metadata a consumer resolves, the strict JNA pin in them,
+# and an AAR checked on its own rather than merged into an app.
+name: Engine library
+
+on:
+  # Pushes to main only where the publication can change (its modules, the
+  # root build that defines it, the Rust engine inside the AAR, this file and
+  # its check) — like node-binding.yml. GitHub does not evaluate paths filters
+  # for tag pushes, so `v*` release runs always fire. No pull_request trigger:
+  # the Rust Android cross-compile this needs is a 10-minute leg, and the APK
+  # workflow already runs it on every PR into main; a PR that changes the
+  # publication dispatches this on its branch from the Actions tab.
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+    paths:
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
+      - 'gradle/**'
+      - 'myotis-api/**'
+      - 'myotis-engine-common/**'
+      - 'myotis-engine-ports/**'
+      - 'myotis-rpc-policy/**'
+      - 'myotis-engine-rust/**'
+      - 'myotis-engine/**'
+      - 'rust/**'
+      - 'scripts/check_engine_library.sh'
+      - 'scripts/merge_maven_repo.py'
+      - '.github/workflows/engine-library.yml'
+      - '.github/actions/stage-engine-library/**'
+      - '.github/workflows/release-version-guard.yml'
+  workflow_dispatch:
+
+# The event is part of the group so a dispatch on main cannot cancel an
+# in-flight merge-to-main run, nor one on a v* tag that tag's publish —
+# as in node-binding.yml.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Stage + check, no upload: every push to main and every dispatch. Not on a
+  # tag — there the publish job below IS the build, so the tag's assets and its
+  # GitHub Packages artifacts come from one build (a second build would not
+  # produce the same bytes: jars are not reproducible here).
+  build:
+    name: Stage and check the publication
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    # A wedged cargo-ndk or Gradle daemon must not hold the runner for the
+    # 6-hour default (android-apk.yml's budget for the same build).
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Stage and check the publication
+        uses: ./.github/actions/stage-engine-library
+
+      - name: Upload the staged repository
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-library-maven-repo-${{ github.sha }}
+          path: build/maven-repo
+          if-no-files-found: error
+          retention-days: 30
+
+  # Refuse to publish a release whose tag disagrees with the project version —
+  # the artifacts carry project.version (minus -SNAPSHOT), the release is named
+  # after the tag. See release-version-guard.yml; runs in parallel with nothing
+  # here (the publish job waits for it), ~30s.
+  version-guard:
+    name: Release version guard
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/release-version-guard.yml
+
+  # The tag build: stage, check, publish to GitHub Packages, attach to the
+  # release. Builds itself (see the build job's note) — the same steps, with
+  # the tag's version: vX.Y.Z publishes X.Y.Z, vX.Y.Z-rc1 publishes X.Y.Z-rc1.
+  #
+  # Re-running a tag's publish: GitHub Packages refuses to overwrite a version
+  # (the Gradle publish fails with 409/422), so a republish needs that package
+  # version deleted first — every eth.myotis.* package of it — in the
+  # repository's Packages page. The release assets re-upload with --clobber.
+  publish:
+    name: Publish to GitHub Packages and the release
+    needs: version-guard
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      # gh release create/upload/edit needs write access to Releases; the Maven
+      # publish needs write access to Packages.
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Everything below uploads; nothing is uploaded unless the staged set is
+      # complete and correct (the action's check). The tag's version is what
+      # the artifacts carry — v0.1.16-rc1 publishes 0.1.16-rc1, never the
+      # final 0.1.16 coordinates, which GitHub Packages could not replace.
+      - name: Stage and check the release publication
+        uses: ./.github/actions/stage-engine-library
+        with:
+          release-tag: ${{ github.ref_name }}
+          # The tag's run restores main's cache; it does not save one.
+          save-rust-cache: 'false'
+
+      # The same build, published again by Gradle to GitHub Packages: the
+      # staged files and these are the outputs of the one build above (the
+      # jars, poms and module files are task outputs Gradle reuses, not
+      # rebuilt). GITHUB_ACTOR is set by Actions; the token is the job's.
+      - name: Publish to GitHub Packages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./gradlew "-PpublishRelease=${GITHUB_REF_NAME#v}" publishAllPublicationsToGitHubPackagesRepository --stacktrace
+
+      # The staged repository, for the maven-repo job below — uploaded the
+      # moment the version is irrevocably on GitHub Packages, so "the artifact
+      # exists" means exactly "this version is published and belongs on the
+      # branch": a failure later in this job (a release upload blip) still gets
+      # the branch published, and a failure earlier does not. Overwritable: a
+      # re-run of this job (after deleting the package versions, see the job's
+      # note) uploads it again under the same run. Kept the default 90 days:
+      # that is how long "re-run failed jobs" can repair the branch job alone.
+      - name: Upload the staged repository for the maven-repo branch
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-library-maven-repo-release-${{ github.sha }}
+          path: build/maven-repo
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Assemble the release assets
+        run: |
+          set -euo pipefail
+          # The tag goes into the asset file names (as for the APK and the dmg).
+          printf '%s' "${GITHUB_REF_NAME}" | grep -Eq '^v[A-Za-z0-9._-]+$' \
+            || { echo "::error::'${GITHUB_REF_NAME}' is not a valid release tag (expected v<version>)"; exit 1; }
+          # The one staged version — what GitHub Packages now carries and what
+          # the release notes below name; exported for that step.
+          version=$(basename "$(ls -d build/maven-repo/eth/myotis/myotis-engine/*/)")
+          echo "STAGED_VERSION=$version" >> "$GITHUB_ENV"
+          mkdir -p assets
+          cp "build/maven-repo/eth/myotis/myotis-engine-android/$version/myotis-engine-android-$version.aar" \
+             "assets/myotis-engine-${GITHUB_REF_NAME}-android.aar"
+          # The whole staged repository: unzip it and point Gradle at the
+          # directory, and no GitHub token is needed (docs/android-library.md).
+          (cd build/maven-repo && zip -qr "../../assets/myotis-engine-${GITHUB_REF_NAME}-maven-repo.zip" eth)
+          (cd assets && sha256sum myotis-engine-*.aar myotis-engine-*.zip > myotis-engine.SHA256SUMS && cat myotis-engine.SHA256SUMS)
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          version="${STAGED_VERSION:?set by the assets step}"
+          # The engine-library section for the notes. Quoted heredoc keeps the
+          # markdown literal; the placeholder dodges backtick substitution.
+          section=$(mktemp)
+          cat > "$section" <<'SECTION'
+          **Engine library (`myotis-engine-<tag>-android.aar`, `myotis-engine-<tag>-maven-repo.zip`)** —
+          the Myotis Rust engine as a library for other apps: `eth.myotis:myotis-engine:__VERSION__`
+          on GitHub Packages (needs a token with read:packages), from the `maven-repo` branch
+          (`https://raw.githubusercontent.com/__REPO__/maven-repo`, no token), or the zip
+          unpacked as a local Maven repository. The AAR alone is the Android artifact; its
+          dependencies are in the zip and on GitHub Packages. Verify downloads against
+          `myotis-engine.SHA256SUMS`. See docs/android-library.md.
+          SECTION
+          sed -i "s/__VERSION__/$version/g; s#__REPO__#${GITHUB_REPOSITORY}#g" "$section"
+          # Master notes for the case where THIS job creates the release (same
+          # text the android/desktop/node workflows carry), plus the section.
+          notes=$(mktemp)
+          cat > "$notes" <<'NOTES'
+          Pre-release build of the Myotis wallet apps.
+
+          **Android (`*-android.apk`)** — the Myotis app, signed with Myotis's own release key
+          (its certificate's SHA-256 is in `android-app/release-signing-cert.sha256` in the
+          repository). Install via "Install unknown apps" and switch that off again afterwards;
+          only ever install Myotis, and its updates, from this releases page.
+
+          **Android debug (`*-android-debug.apk`)** — a separate test app ("Myotis Debug", amber
+          icon, package `com.jaeckel.ethp2p.android.debug`), signed with the publicly known debug
+          key: anyone can build an APK that installs over it as an update, so do not rely on it for
+          a wallet you use. It installs next to the release app, but run only one of them at a time:
+          both use the same network and JSON-RPC ports.
+
+          **Coming from an older Android release?** Releases that shipped only an
+          `*-android-debug.apk` installed Myotis itself (package `com.jaeckel.ethp2p.android`)
+          signed with that public debug key. Android will not update it to the release-signed app
+          ("App not installed … conflicts with an existing package"), and while it stays installed
+          anyone's lookalike can replace it. Uninstall it first: that deletes its settings, allowed
+          websites and sync progress (Myotis holds no wallet keys or funds), and the new app
+          re-syncs on its first start.
+
+          **Desktop macOS (`Myotis-v<version>-<arch>.dmg`)** — unsigned; download the dmg matching
+          your Mac (arm64 for Apple Silicon, x64 for Intel). First launch:
+          right-click → Open to get past Gatekeeper (not notarized yet).
+
+          **Bee PoC (`Myotis-v<version>-bee-poc-arm64.dmg`, when present)** — a separate app
+          ("Myotis Bee PoC", own data dir) that a Swarm Bee full node can use as its
+          Gnosis RPC from the first minute: it ships a pre-built PostageStamp log-index
+          seed and warm peer caches. Demo/debug artefact — the seed is RPC-sourced and
+          served unverified (only the backfill walk would re-check it, and the app ships
+          with that walk switched off), and it stops catching up about 29
+          days after its fetch (the Index tab shows the block it is usable until). See
+          docs/bee-rpc-service.md.
+
+          **RAILGUN PoC (`Myotis-v<version>-railgun-poc-arm64.dmg`, when present)** — a separate
+          app ("Myotis RAILGUN PoC", own data dir) that the RAILGUN Terminal Wallet CLI can use as
+          its mainnet RPC from the first minute, and as its Sepolia RPC once Sepolia is switched on
+          in the app: it ships pre-built log-index seeds covering the RailgunSmartWallet contract
+          on both networks from its deployment block. It
+          serves mainnet on port 8555 and Sepolia on 8557, not the regular app's 8545 and 8547:
+          point the wallet at `http://127.0.0.1:8555` or `http://127.0.0.1:8557`. Debug/demo
+          artefact, not a production path — the seeds are RPC-sourced and unverified (no
+          receipt-root proof), and each stops catching up about 69 days after its fetch (the
+          Index tab shows the block it is usable until). See docs/railgun-poc.md.
+
+          **Desktop Linux (`Myotis-v<version>-<arch>.deb`)** — install with
+          `sudo apt install ./Myotis-v<version>-<arch>.deb` (x64 for Intel/AMD, arm64 for
+          Raspberry Pi 5 / ARM machines).
+          NOTES
+          printf '\n' >> "$notes"
+          cat "$section" >> "$notes"
+          # Create the release if it doesn't exist yet. Another workflow may win
+          # this race for the same tag: if `create` fails, re-check with `view`
+          # (node-binding.yml's pattern).
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --prerelease \
+              --title "Myotis $tag" \
+              --notes-file "$notes" \
+              --target "${GITHUB_SHA}" \
+            || gh release view "$tag" >/dev/null 2>&1
+          fi
+          # Whether we created the release or another workflow did: make sure
+          # the notes carry the engine-library section exactly once. This is
+          # the read-modify-write node-binding.yml and ios-framework.yml do on
+          # the same body (GitHub has no append), so two of these finishing in
+          # the same second can drop each other's section: re-read after the
+          # edit and re-append if ours went missing, which repairs the case
+          # where the other writer won; the other's own section is theirs to
+          # re-check. The edit window is milliseconds, the sections land
+          # minutes apart in practice.
+          for attempt in 1 2 3; do
+            body=$(mktemp)
+            gh release view "$tag" --json body --jq .body > "$body"
+            grep -q 'Engine library' "$body" && break
+            printf '\n' >> "$body"
+            cat "$section" >> "$body"
+            gh release edit "$tag" --notes-file "$body"
+            sleep 5
+          done
+          gh release upload "$tag" \
+            assets/myotis-engine-*.aar assets/myotis-engine-*.zip assets/myotis-engine.SHA256SUMS --clobber
+
+  # The same staged repository as a Maven repository URL that needs no token:
+  # merged into the `maven-repo` branch (an orphan branch holding nothing but
+  # the repository layout and a README, created on the first publish), which
+  # raw.githubusercontent.com serves file by file — all Gradle needs. Versions
+  # add up; the artifact-level maven-metadata.xml is merged, not replaced
+  # (scripts/merge_maven_repo.py), so `0.1.+` keeps seeing every version.
+  #
+  # Its own job, after the publish job, keyed on the artifact that job uploads
+  # once the version is on GitHub Packages: it runs whenever the publish job
+  # got that far — even if that job then failed on a release upload — and is
+  # a no-op when it did not. A failure here (a GitHub blip, a concurrent tag's
+  # push winning the race) is repaired with "re-run failed jobs", which
+  # re-runs this job alone, from the uploaded repository, never the Packages
+  # publish that would refuse its own version. Two tags publishing at once
+  # (the concurrency group is per ref) race on the branch; a rejected push is
+  # retried from a fresh clone.
+  maven-repo-branch:
+    name: Publish to the maven-repo branch
+    needs: publish
+    # `!cancelled()`, so a publish job that failed after the Packages step
+    # still gets its branch publish; the tag test keeps the job off every
+    # other event, where `publish` is skipped.
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      # Only scripts/merge_maven_repo.py is needed from the tree; the branch
+      # itself is cloned separately.
+      - name: Checkout the merge script
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/merge_maven_repo.py
+          sparse-checkout-cone-mode: false
+
+      # Absent when the publish job failed before the version reached GitHub
+      # Packages: then there is nothing to put on the branch, and this job
+      # says so instead of failing. After a SUCCESSFUL publish the artifact
+      # exists, so a download failure there is a real error (a GitHub blip)
+      # and fails this job — "re-run failed jobs" then retries it; a green job
+      # must never mean "the branch was skipped".
+      - name: Download the staged repository
+        id: staged
+        continue-on-error: ${{ needs.publish.result != 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: engine-library-maven-repo-release-${{ github.sha }}
+          path: build/maven-repo
+
+      - name: Nothing to publish
+        if: steps.staged.outcome != 'success'
+        run: |
+          echo "the publish job did not reach GitHub Packages for ${GITHUB_REF_NAME} (its result: ${{ needs.publish.result }}); the maven-repo branch stays as it is"
+
+      - name: Merge into the maven-repo branch and push
+        if: steps.staged.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          for attempt in 1 2 3; do
+            work=$(mktemp -d)
+            # The full ref, so a `something/maven-repo` branch cannot match; exit
+            # code 2 is "no such ref" (the first publish), anything else non-zero
+            # is a failure — its message stays on the log, and it gets the same
+            # retry as the push.
+            rc=0
+            git ls-remote --exit-code --heads "$remote" refs/heads/maven-repo >/dev/null || rc=$?
+            case "$rc" in
+              0) git clone --quiet --depth 1 --branch maven-repo "$remote" "$work" ;;
+              2) git init --quiet --initial-branch=maven-repo "$work" ;;
+              *) echo "::warning::git ls-remote failed with exit code $rc (attempt $attempt); retrying"
+                 sleep 10
+                 continue ;;
+            esac
+            # Written on every publish (the commit below carries it only when it
+            # changed), so an edit here reaches the branch; the repository name
+            # comes from the run, never a literal.
+            cat > "$work/README.md" <<README
+          # Myotis engine library — Maven repository
+
+          The \`eth.myotis\` artifacts of every release (docs/android-library.md on \`main\`),
+          laid out as a Maven repository and served by raw.githubusercontent.com, so a
+          build needs no GitHub token:
+
+          \`\`\`kotlin
+          maven {
+              url = uri("https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/maven-repo")
+              content { includeGroup("eth.myotis") }
+          }
+          \`\`\`
+
+          Written by the engine-library workflow on each \`v*\` tag; never edited by hand.
+          README
+            python3 scripts/merge_maven_repo.py build/maven-repo "$work"
+            git -C "$work" add -A
+            if git -C "$work" diff --cached --quiet; then
+              echo "maven-repo branch already carries ${GITHUB_REF_NAME}; nothing to publish"
+              exit 0
+            fi
+            git -C "$work" -c user.name="github-actions[bot]" \
+                -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                commit --quiet -m "Publish ${GITHUB_REF_NAME}"
+            # Only a non-fast-forward rejection (another publish moved the branch
+            # between our clone and our push) is retried; any other refusal (a
+            # protected branch, a token without write access) is the error it is.
+            if out=$(git -C "$work" push --quiet "$remote" HEAD:refs/heads/maven-repo 2>&1); then
+              exit 0
+            fi
+            printf '%s\n' "$out"
+            case "$out" in
+              *"fetch first"*|*"non-fast-forward"*|*"cannot lock ref"*)
+                echo "::warning::push to maven-repo rejected (attempt $attempt) — another publish moved the branch; retrying from a fresh clone"
+                sleep 10 ;;
+              *)
+                echo "::error::push to the maven-repo branch refused"
+                exit 1 ;;
+            esac
+          done
+          echo "::error::could not push to the maven-repo branch after 3 attempts"
+          exit 1

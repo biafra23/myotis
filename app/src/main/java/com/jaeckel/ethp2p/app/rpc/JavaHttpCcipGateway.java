@@ -21,14 +21,14 @@ import java.util.concurrent.TimeoutException;
 /**
  * JVM-only {@link HttpGateway} (the engine API's CCIP-Read transport) backed by
  * {@code java.net.http.HttpClient}. Used by the daemon and the desktop app, where
- * JVM 21 is guaranteed. Android uses its own {@code AndroidCcipGateway} over
+ * JVM 21 is guaranteed. the engine library (and so the Android app) uses {@code io.myotis.engine.ports.UrlConnectionHttpGateway} over
  * {@code HttpURLConnection} instead, since the Android app cannot use
  * java.net.http at its minSdk 29 — which is also why this class lives in
  * {@code :app}.
  *
  * <p>Blocking, per the port contract. The Java engine calls it from its own
  * workers ({@code PortBridges.toCcipGateway}) and bridges to its internal async
- * shape; with the Rust engine, {@code CcipDriver} (in {@code :myotis-engines})
+ * shape; with the Rust engine, {@code CcipDriver} (in {@code :myotis-engine-rust})
  * calls it on the thread that called the {@code EnsApi}. Any non-2xx HTTP status
  * is surfaced as a thrown {@link RuntimeException} carrying the status code and
  * URL, which both engines treat as "this gateway failed", moving on to the next

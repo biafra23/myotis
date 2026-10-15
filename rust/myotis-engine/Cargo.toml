@@ -7,7 +7,7 @@ description = "Rust implementation of the io.myotis.api engine contract (JNI cdy
 license = "MIT OR Apache-2.0"
 
 [lib]
-# libmyotis_engine.{so,dylib,dll} — loaded by :myotis-engines' RustEngineNative.
+# libmyotis_engine.{so,dylib,dll} — loaded by :myotis-engine-rust's RustEngineNative.
 # The iOS static archive is NOT listed here: the cargoBuildIos* Gradle tasks
 # build it with `cargo rustc --crate-type staticlib` (which overrides this
 # list), so host/Android builds don't pay for an archive they never consume.
@@ -34,7 +34,7 @@ myotis-net = { path = "../myotis-net" }
 myotis-evm = { path = "../myotis-evm" }
 tokio = { version = "=1.52.3", features = ["rt-multi-thread"] }
 # The JVM boundary: UniFFI proc-macro scaffolding (replaces the old hand-JNI —
-# the generated Kotlin bindings live in :myotis-engines and are pinned to this
+# the generated Kotlin bindings live in :myotis-engine-rust and are pinned to this
 # uniffi version by UniFFI's own per-function API checksums). Compound values
 # still cross as JSON strings (transport swap only; shapes unchanged and pinned
 # by the golden tests on both sides). The iOS C ABI (capi.rs) is untouched.

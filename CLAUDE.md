@@ -49,10 +49,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ./gradlew cargoBuildNoStd  # no_std canary: cargo build -p myotis-core --no-default-features for x86_64-unknown-none (part of `check`; self-skips without that rustup target)
 ./gradlew cargoNdkAndroid  # Android jniLibs, built from source (needs cargo-ndk + NDK + Android rustup targets)
 
-# The Android app builds the Rust engine FROM SOURCE by default — cargo + cargo-ndk
-# + NDK r28+ + `rustup target add aarch64-linux-android x86_64-linux-android` are
-# REQUIRED to build :android-app. There is no committed .so (so nothing can drift);
-# an Android build also regenerates the committed UniFFI bindings (:myotis-engines)
+# The Android engine library (:myotis-engine, the AAR the Android app consumes)
+# builds the Rust engine FROM SOURCE by default — cargo + cargo-ndk + NDK r28+ +
+# `rustup target add aarch64-linux-android x86_64-linux-android` are REQUIRED to
+# build it, and so :android-app. There is no committed .so (so nothing can drift);
+# an Android build also regenerates the committed UniFFI bindings (:myotis-engine-rust)
 # from source — other workflows do NOT, so regenerate them explicitly with
 # `./gradlew uniffiGenerateKotlin` after changing the Rust FFI. Opt out when you
 # lack the toolchain — the build tells you about the switch — with:
@@ -77,11 +78,55 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Key Gradle modules:
 
-- **myotis-engines** — the engine SELECTOR (`Engines`/`SelectorEngine`/`RustMyotisEngine`):
-  hosts' composition roots call `Engines.engine()`; `myotis.engine=java|rust|auto` routes
-  each network (re)start to the Java engine or the Rust one (`rust/myotis-engine`,
-  UniFFI-generated Kotlin bindings over JNA — committed in this module, regenerated
-  via `uniffiGenerateKotlin`; compound values as JSON pinned by golden tests both sides).
+- **myotis-engine** — THE ENGINE LIBRARY: a Kotlin Multiplatform module (jvm +
+  android targets, no UI) that packages the Rust engine for the hosts — the
+  Android AAR (the Myotis app and a separate wallet product) and the desktop jar.
+  Published as `eth.myotis:myotis-engine` with its upstream modules (`myotis-api`,
+  `myotis-engine-rust`, `myotis-engine-common`, `myotis-engine-ports`,
+  `myotis-rpc-policy`; not `:core`, whose Tuweni + BouncyCastle would ride into
+  every consumer
+  — the root build's `Publishing` section): GitHub Packages and the token-free
+  `maven-repo` branch on every `v*` tag plus the AAR and a Maven-repository zip
+  as release assets
+  (`engine-library.yml`; `publishAllPublicationsToStagingRepository` +
+  `scripts/check_engine_library.sh` verify the set; `publishToMavenLocal` for a
+  consumer under development). docs/android-library.md is the consumer page.
+  `io.myotis.engine.Myotis` is the entry point (`newEngine()`: the Rust engine
+  with no loopback listener, for an in-process consumer); it re-exports
+  `:myotis-api`, keeping `:myotis-engine-rust` implementation-only (host
+  seams re-exported on `Myotis`). Its androidMain owns the jniLibs
+  (`cargoNdkAndroid` builds them there from source) and JNA's Android dispatcher,
+  so a consumer's APK is complete with the AAR alone. The Myotis apps consume the
+  Rust engine through it and keep the Java engine via the selector.
+- **myotis-engines** — the engine SELECTOR (`Engines`/`SelectorEngine`): hosts'
+  composition roots call `Engines.engine()`; `myotis.engine=java|rust|auto` routes
+  each network (re)start to the Java engine (node-core) or the Rust one.
+- **myotis-engine-rust** — the RUST engine behind the contract on its own
+  (`RustMyotisEngine`/`RustChainHandle`/`RustVerifiedReads`/`RustEnsApi`, the Tor
+  seam): `rust/myotis-engine` over UniFFI-generated Kotlin bindings + JNA (committed
+  in this module, regenerated via `uniffiGenerateKotlin`; compound values as JSON
+  pinned by golden tests both sides). Java 17, and it depends on nothing from the
+  Java engine and carries no HTTP server: the loopback JSON-RPC listener is a PORT
+  (`LoopbackRpc`). The selector fills it with the Ktor server (`KtorLoopbackRpc` in
+  `:myotis-engines`), so the daemon, the desktop app and the Android app keep the
+  listener they always had; an in-process consumer of the engine library (the
+  Android AAR's wallet) constructs the engine with no factory and gets a handle that
+  answers `reads()` in-process with nothing listening.
+- **myotis-engine-common** — the lifecycle primitives both engines' handles wire
+  (`WakeGate`, `SleepMetrics`); Java 17 over `:myotis-api` and slf4j.
+- **myotis-engine-ports** — the engine library's DEFAULT port actuals
+  (`io.myotis.engine.ports`): the node-key file, the file-backed EL and CL peer
+  caches, the `HttpURLConnection` CCIP-Read gateway and the per-network file
+  layout (`NetworkFiles`), assembled by `DefaultEnginePorts.forNetwork` /
+  `Myotis.defaultPorts`. The Android app's former `NodeService` actuals, moved
+  here so a consumer of the AAR gets a working engine from two directories; the
+  daemon and desktop keep their twins in `:app` for now. Java 17, minSdk-29-safe,
+  over `:myotis-api` and slf4j; re-exported (`api`) by `:myotis-engine`.
+- **myotis-rpc-policy** — the JSON-RPC serving policy with no server attached
+  (`RpcBlockWindow`, the block-selector window of #366; `WebAccessPolicy` /
+  `WebOrigins`, the web-page policy's pure half of #502): a dependency-free Kotlin
+  Multiplatform module, one definition for the Rust engine, the router in
+  `:jsonrpc-server`, the iOS backend and the UI's normalizer parity test.
 - **myotis-api** — THE ENGINE CONTRACT: zero-dependency Java-17 interfaces
   (`io.myotis.api` + `io.myotis.api.ports`) every host consumes exclusively.
   FFI-portable types only (byte[], String, long, double[], enums, flat records;
@@ -127,7 +172,10 @@ Key Gradle modules:
   (node-core/networking/consensus types). Composition roots use the `:myotis-engines`
   selector (`Engines.engine()`; `myotis.engine=java|rust|auto`, default auto —
   `-Pengine=…` on run tasks), which routes to the Java engine (node-core) or the
-  Rust engine (rust/myotis-engine via UniFFI + JSON). Documented exemptions: the
+  Rust engine (rust/myotis-engine via UniFFI + JSON). The engine library's default
+  port actuals (`io.myotis.engine.ports`, `:myotis-engine-ports` — `Myotis.defaultPorts`)
+  are part of the library's public surface, not engine internals: a host may build its
+  `EnginePorts` from them, as the Android app does. Documented exemptions: the
   single `Engines.engine()` line at each composition root; the TrueBlocks
   transaction-history scan in `:tx-history` (`TxHistoryService` wraps the raw
   `RLPxConnector`; UNVERIFIED, Java-engine + mainnet only), consumed by the daemon's

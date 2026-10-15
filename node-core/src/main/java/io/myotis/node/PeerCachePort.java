@@ -5,7 +5,7 @@ import java.util.List;
 
 /**
  * The EL peer-cache operations a {@code ChainStack} needs, abstracted so the daemon
- * ({@code PeerCache}) and Android ({@code AndroidPeerCache}) can each supply their own
+ * ({@code PeerCache}) and the engine library ({@code io.myotis.engine.ports.FilePeerCache}) can each supply their own
  * file-backed implementation (via a thin adapter) without {@code node-core} depending
  * on either host module.
  */

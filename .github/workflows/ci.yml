@@ -69,8 +69,8 @@ jobs:
           }
 
       # -PskipRustEngine: this runner has no Android Rust toolchain (cargo-ndk,
-      # NDK, Android rustup targets), and :android-app builds the Rust engine
-      # from source by DEFAULT (a missing toolchain is a hard error naming this
+      # NDK, Android rustup targets), and :myotis-engine (so :android-app) builds
+      # the Rust engine from source by DEFAULT (a missing toolchain is a hard error naming this
       # switch). This job is a JVM compile/test check — it does not ship the APK
       # (android-apk.yml does, with the full toolchain), so build the app without
       # the engine. Host Rust is set up above, so `check` still runs the

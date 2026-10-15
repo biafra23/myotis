@@ -231,8 +231,8 @@ When neither works, the result carries a `failReason` instead (`beaconNotSynced`
 Which state a read uses: `latest`/`pending` read at the attested head; `finalized` (Rust
 engine only) reads at the finalized root, with no fallback. Myotis holds no historical state:
 a block-number pin is answered from head state only when it is within 64 blocks below
-(or 16 above) the head, and refused otherwise (`RpcBlockWindow`); a block-hash pin is
-resolved to the canonical block it names and judged as that number (#641).
+(or 16 above) the head, and refused otherwise (`RpcBlockWindow`, in `:myotis-rpc-policy`); a
+block-hash pin is resolved to the canonical block it names and judged as that number (#641).
 
 **Java engine:** its account query asks the peer at the peer's own head, so `headerChain` is
 its usual path rather than the fallback; the walk is fetched in batches.

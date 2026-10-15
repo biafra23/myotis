@@ -235,6 +235,8 @@ subprojects {
     //   app-desktop  → kotlin.jvm + compose (desktop)
     //   app-ios      → kotlin-multiplatform + compose (iOS framework)
     //   jsonrpc-server → kotlin-multiplatform (JVM hosts + the iOS RPC listener)
+    //   myotis-rpc-policy → kotlin-multiplatform (the serving policy those share)
+    //   myotis-engine  → kotlin-multiplatform + com.android.library (the engine library: AAR + desktop jar)
     // Excludes shared by EVERY module (Android plugin modules included):
     // - native Netty transports, for Android compatibility;
     // - Besu 26.4's log4j: it drags log4j-slf4j2-impl — a SECOND slf4j
@@ -257,7 +259,7 @@ subprojects {
         exclude(group = "org.apache.logging.log4j", module = "log4j-core")
     }
 
-    if (name in setOf("android-app", "ui", "app-desktop", "app-ios", "jsonrpc-server")) {
+    if (name in setOf("android-app", "ui", "app-desktop", "app-ios", "jsonrpc-server", "myotis-rpc-policy", "myotis-engine")) {
         return@subprojects
     }
 
@@ -292,6 +294,151 @@ subprojects {
 }
 
 // -------------------------------------------------------------------------
+// Publishing: the engine library and the modules it is built from.
+//
+// `:myotis-engine` (the Android AAR + the desktop jar, docs/android-library.md)
+// is consumed OUTSIDE this build — a separate wallet product is the first
+// consumer — so it is published as Maven artifacts, and with it every project
+// module its POMs reach: a consumer resolving the AAR needs them from the same
+// repository. That closure is exactly the Rust-engine half of the tree, none of
+// the Java engine (node-core, networking, consensus, Besu) and no Ktor server.
+// Coordinates: `eth.myotis:<artifactId>` — myotis.eth is the project's ENS name
+// and the one namespace the owner controls (myotis.io is not theirs, so the Java
+// packages' io.myotis stays a package prefix and never becomes the Maven group);
+// `com.jaeckel.ethp2p` (the Gradle group of everything else, the apps' package
+// id) stays the apps' name, not the library's. A caveat for later: Maven Central
+// verifies a namespace through DNS, which an ENS name has none of, so a Central
+// publication would need another group (io.github.biafra23, verified through
+// GitHub) — GitHub Packages, the static branch and the release zip verify nothing.
+//
+// Where they go:
+//   - GitHub Packages (the `GitHubPackages` repository below), on every `v*` tag
+//     by .github/workflows/engine-library.yml; reading it needs a GitHub token
+//     with read:packages even for a public repository (GitHub's rule).
+//   - The `maven-repo` branch: the same staged repository, merged in by the tag's
+//     publish job (scripts/merge_maven_repo.py) and served file by file by
+//     raw.githubusercontent.com — a Maven repository URL with no token at all.
+//   - The `Staging` repository: build/maven-repo, a complete local Maven
+//     repository of just these artifacts. The workflow zips it as a release
+//     asset next to the bare AAR, so a consumer that wants no GitHub token can
+//     point Gradle at the unzipped directory (third-party dependencies still
+//     come from Maven Central); it is also what the publication checks
+//     (scripts/check_engine_library.sh) read.
+//   - ~/.m2 via the standard publishToMavenLocal, for a consumer under development.
+//
+// Versions: by default the artifacts carry project.version (X.Y.Z-SNAPSHOT),
+// which is right for publishToMavenLocal from a working tree. -PpublishRelease
+// drops the suffix: the workflow passes it on every run, so the staged layout is
+// the one a tag publishes (X.Y.Z file names — Gradle stages a SNAPSHOT under
+// Maven's timestamped names, which the check does not read). On a tag it is
+// -PpublishRelease=<the tag's version>: vX.Y.Z publishes X.Y.Z and an rc/hotfix
+// tag vX.Y.Z-<suffix> (a shape the version guard accepts) publishes
+// X.Y.Z-<suffix> — never the final X.Y.Z coordinates, which GitHub Packages
+// could not replace once the real release comes. The value must be the release
+// version or the release version plus a `-suffix`, the guard's own rule, so a
+// mis-typed flag fails here rather than publishing a version the tree does not
+// build. It applies to the published modules only, so nothing else in the build
+// (the apps' versions, verifyCrateVersions) sees a different project.version.
+//
+// The two Kotlin Multiplatform modules get their publications from the Kotlin
+// plugin (one per target plus the `kotlinMultiplatform` root, which carries the
+// Gradle module metadata a consumer's variant selection needs — Android picks
+// the `-android` AAR, the desktop jar `-jvm`; Maven consumers without module
+// metadata must name the target artifact). The plain Java modules get one
+// publication each from their `java` component, sources jar included.
+val publishedArtifactIds = mapOf(
+    "myotis-api" to "myotis-api",
+    "myotis-engine-common" to "myotis-engine-common",
+    "myotis-engine-ports" to "myotis-engine-ports",
+    "myotis-rpc-policy" to "myotis-rpc-policy",
+    "myotis-engine-rust" to "myotis-engine-rust",
+    "myotis-engine" to "myotis-engine",
+)
+val publishedDescriptions = mapOf(
+    "myotis-api" to "The Myotis engine contract: the zero-dependency Java 17 interfaces every host consumes",
+    "myotis-engine-common" to "The lifecycle primitives the Myotis engine handles wire (WakeGate, SleepMetrics)",
+    "myotis-engine-ports" to "The Myotis engine library's default port actuals: node-key file, file-backed peer caches, HttpURLConnection CCIP gateway",
+    "myotis-rpc-policy" to "The JSON-RPC serving policy (block window, web-page access) with no server attached",
+    "myotis-engine-rust" to "The Myotis Rust engine behind the engine contract, over UniFFI bindings and JNA",
+    "myotis-engine" to "The Myotis engine library: the Rust light-client engine for Android (AAR) and desktop JVM (jar)",
+)
+val publishedVersion: String? = providers.gradleProperty("publishRelease").orNull?.let { requested ->
+    if (requested.isEmpty()) {
+        releaseVersion
+    } else {
+        require(requested == releaseVersion || requested.startsWith("$releaseVersion-")) {
+            "-PpublishRelease=$requested does not match the release version $releaseVersion " +
+                "(accepted: $releaseVersion, or $releaseVersion-<suffix>)"
+        }
+        requested
+    }
+}
+val stagingRepository = layout.buildDirectory.dir("maven-repo")
+configure(subprojects.filter { it.name in publishedArtifactIds }) {
+    apply(plugin = "maven-publish")
+    group = "eth.myotis"
+    if (publishedVersion != null) version = publishedVersion
+    val publishedArtifactId = publishedArtifactIds.getValue(name)
+    val publishedDescription = publishedDescriptions.getValue(name)
+
+    // The Kotlin Multiplatform plugin registers its publications itself (and
+    // names them after the project, which these two already carry); the Java
+    // modules need theirs created. `java` is applied by the
+    // subprojects block above, so the component exists here; `java-library` in
+    // the module's own script extends the same component with `api`.
+    if (name !in setOf("myotis-rpc-policy", "myotis-engine")) {
+        extensions.configure<JavaPluginExtension> { withSourcesJar() }
+        extensions.configure<PublishingExtension> {
+            publications.create<MavenPublication>("maven") {
+                artifactId = publishedArtifactId
+                from(components["java"])
+            }
+        }
+    }
+
+    extensions.configure<PublishingExtension> {
+        // Every publication of the module (one, or one per Kotlin target) gets
+        // the same POM metadata.
+        publications.withType<MavenPublication>().configureEach {
+            pom {
+                name.set(publishedArtifactId)
+                description.set(publishedDescription)
+                url.set("https://github.com/biafra23/myotis")
+                licenses {
+                    license {
+                        name.set("Apache-2.0")
+                        url.set("https://www.apache.org/licenses/LICENSE-2.0")
+                    }
+                }
+                scm {
+                    url.set("https://github.com/biafra23/myotis")
+                    connection.set("scm:git:https://github.com/biafra23/myotis.git")
+                }
+            }
+        }
+        repositories {
+            maven {
+                name = "GitHubPackages"
+                url = uri("https://maven.pkg.github.com/biafra23/myotis")
+                // Actions supplies both (packages: write on the job); a maintainer
+                // publishing by hand exports a classic PAT with write:packages
+                // under the same two names. Unset everywhere else, which only a
+                // publish to THIS repository notices (a 401 from GitHub) — the
+                // repository is declared on every build and used by none other.
+                credentials {
+                    username = System.getenv("GITHUB_ACTOR")
+                    password = System.getenv("GITHUB_TOKEN")
+                }
+            }
+            maven {
+                name = "Staging"
+                url = uri(stagingRepository)
+            }
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
 // Optional Rust build (rust/ Cargo workspace — the coming Rust engine plus the
 // native BLS backend). Rust is OPTIONAL for the JVM hosts: without cargo the
 // cargo* tasks self-skip with a single lifecycle note and the pure-Java build is
@@ -303,7 +450,7 @@ subprojects {
 //   cargoTest       → cargo test --workspace; wired into root `check`
 //   cargoNdkAndroid → Android jniLibs (engine + native BLS) via
 //                     rust/build-android.sh; built from source (no committed
-//                     .so) and wired into :android-app preBuild. Required by
+//                     .so) and wired into :myotis-engine preBuild. Required by
 //                     default; -PskipRustEngine opts out.
 // -------------------------------------------------------------------------
 
@@ -546,7 +693,7 @@ tasks.register<Exec>("cargoBuildHost") {
     outputs.files(hostLibNames.map { file("$rustReleaseDir/$it") })
 }
 
-// Regenerate the UniFFI Kotlin bindings for the Rust engine into :myotis-engines'
+// Regenerate the UniFFI Kotlin bindings for the Rust engine into :myotis-engine-rust's
 // source tree. The generated file is COMMITTED (like the Android jniLibs) so
 // cargo-less machines still compile the pure-Java/Kotlin build; re-run this task
 // whenever rust/myotis-engine/src/ffi.rs changes shape. Library mode: bindgen
@@ -554,7 +701,7 @@ tasks.register<Exec>("cargoBuildHost") {
 // never disagree silently (UniFFI additionally checksum-verifies at load time).
 tasks.register<Exec>("uniffiGenerateKotlin") {
     group = "rust"
-    description = "Regenerate the committed UniFFI Kotlin bindings in :myotis-engines (self-skips without cargo)"
+    description = "Regenerate the committed UniFFI Kotlin bindings in :myotis-engine-rust (self-skips without cargo)"
     onlyIf { rustAvailable }
     dependsOn(tasks.named("cargoBuildHost"))
     workingDir = file("rust")
@@ -563,11 +710,11 @@ tasks.register<Exec>("uniffiGenerateKotlin") {
         rustTool("cargo"), "run", "--release", "-p", "uniffi-bindgen", "--",
         "generate", "--library", "$rustReleaseDir/${hostLibNames.last()}".removePrefix("rust/"),
         "--language", "kotlin", "--no-format",
-        "--out-dir", project(":myotis-engines").projectDir.resolve("src/main/kotlin").absolutePath,
+        "--out-dir", project(":myotis-engine-rust").projectDir.resolve("src/main/kotlin").absolutePath,
     )
     inputs.files(rustSources).withPathSensitivity(PathSensitivity.RELATIVE)
     inputs.property("cargoVersion", cargoVersion)
-    val bindingsFile = project(":myotis-engines").projectDir
+    val bindingsFile = project(":myotis-engine-rust").projectDir
         .resolve("src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt")
     outputs.files(bindingsFile)
     // UniFFI 0.32's Kotlin generator reads each u16 API checksum through a 32-bit
@@ -729,9 +876,10 @@ val cargoBuildNoStd = tasks.register<Exec>("cargoBuildNoStd") {
 }
 tasks.named("check") { dependsOn(cargoBuildNoStd) }
 
-// The Android app builds the Rust engine (its jniLibs) FROM SOURCE — cargo,
-// cargo-ndk, the Android NDK, and the Android rustup targets are REQUIRED to
-// build :android-app by default. Making the engine a build output (not a
+// The Android engine library (:myotis-engine, the AAR the Android app consumes)
+// builds the Rust engine (its jniLibs) FROM SOURCE — cargo, cargo-ndk, the
+// Android NDK, and the Android rustup targets are REQUIRED to build it, and so
+// :android-app, by default. Making the engine a build output (not a
 // committed binary) is what stops a stale artifact from silently shipping a
 // dead "Rust engine" toggle: there is no committed .so to drift from the source.
 //
@@ -748,6 +896,9 @@ val skipRustEngine = project.hasProperty("skipRustEngine") &&
     (project.property("skipRustEngine") as? String).let {
         it.isNullOrBlank() || it.trim().lowercase() !in setOf("false", "0", "no", "off")
     }
+// :myotis-engine reads the parsed flag from here (rootProject.extra), so its
+// packaging exclude and this file's task gating can never disagree on a spelling.
+extra["myotis.skipRustEngine"] = skipRustEngine
 val androidRustTargets = listOf("aarch64-linux-android", "x86_64-linux-android")
 val androidRustToolchainReady = rustAvailable &&
     cargoNdkVersion.isNotEmpty() &&
@@ -782,26 +933,28 @@ tasks.register<Exec>("cargoNdkAndroid") {
     // The Tor feature flips the libs' contents, so it must key UP-TO-DATE too.
     inputs.property("torEngine", torEngine)
     outputs.files(
-        file("android-app/src/main/jniLibs/arm64-v8a/libmyotis_bls.so"),
-        file("android-app/src/main/jniLibs/x86_64/libmyotis_bls.so"),
-        file("android-app/src/main/jniLibs/arm64-v8a/libmyotis_engine.so"),
-        file("android-app/src/main/jniLibs/x86_64/libmyotis_engine.so"),
+        file("myotis-engine/src/androidMain/jniLibs/arm64-v8a/libmyotis_bls.so"),
+        file("myotis-engine/src/androidMain/jniLibs/x86_64/libmyotis_bls.so"),
+        file("myotis-engine/src/androidMain/jniLibs/arm64-v8a/libmyotis_engine.so"),
+        file("myotis-engine/src/androidMain/jniLibs/x86_64/libmyotis_engine.so"),
     )
 }
 
-// Build-time contract for :android-app: the Rust engine is built from source by
-// default (cargoNdkAndroid), so a MISSING toolchain must fail loudly and name the
-// escape hatch — never silently produce a Java-only app. Wired into
-// :android-app:preBuild (see its build file). `-PskipRustEngine` is the opt-out.
+// Build-time contract for :myotis-engine (and so :android-app): the Rust engine
+// is built from source by default (cargoNdkAndroid), so a MISSING toolchain must
+// fail loudly and name the escape hatch — never silently produce a Java-only
+// app. Wired into :myotis-engine:preBuild (see its build file).
+// `-PskipRustEngine` is the opt-out.
 tasks.register("requireAndroidRustEngine") {
     group = "verification"
     description = "Fail the Android build when the Rust engine toolchain is missing, unless -PskipRustEngine is set"
     // A fast environment gate — no inputs/outputs, always evaluates.
     doLast {
         if (skipRustEngine) {
-            logger.lifecycle("[rust] -PskipRustEngine set — building :android-app WITHOUT the " +
-                "Rust engine; it will use the Java engine (and JVM BLS) at runtime, which boots only " +
-                "on Android 13 (API 33) and newer — below that the app is Rust-engine-only.")
+            logger.lifecycle("[rust] -PskipRustEngine set — building :myotis-engine (and so " +
+                ":android-app) WITHOUT the Rust engine; the app will use the Java engine (and JVM BLS) " +
+                "at runtime, which boots only on Android 13 (API 33) and newer — below that the app " +
+                "is Rust-engine-only.")
             return@doLast
         }
         if (!androidRustToolchainReady) {
@@ -842,9 +995,12 @@ tasks.register("requireAndroidRustEngine") {
 // (checksum drift, no new symbol) is still caught at load time by UniFFI's
 // checksum gate and, in CI, by the regenerate-and-diff step in android-apk.yml.
 val shippedAbis = listOf("arm64-v8a", "x86_64")
-val engineJniLibs = shippedAbis.map { file("android-app/src/main/jniLibs/$it/libmyotis_engine.so") }
-val blsJniLibs = shippedAbis.map { file("android-app/src/main/jniLibs/$it/libmyotis_bls.so") }
-val committedBindings = project(":myotis-engines").projectDir
+// :myotis-engine extracts JNA's dispatcher for exactly these ABIs (rootProject.extra):
+// one list, so an ABI added here cannot ship an engine with no dispatcher there.
+extra["myotis.shippedAbis"] = shippedAbis
+val engineJniLibs = shippedAbis.map { file("myotis-engine/src/androidMain/jniLibs/$it/libmyotis_engine.so") }
+val blsJniLibs = shippedAbis.map { file("myotis-engine/src/androidMain/jniLibs/$it/libmyotis_bls.so") }
+val committedBindings = project(":myotis-engine-rust").projectDir
     .resolve("src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt")
 tasks.register("verifyAndroidJniLibs") {
     group = "verification"

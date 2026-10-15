@@ -44,7 +44,7 @@ object WebAccessUi {
     /**
      * The canonical `scheme://host[:port]` of a typed site, or null when it is not
      * a plain origin — the SAME reduction the engine applies to the `Origin` header
-     * (`io.myotis.jsonrpc.WebOrigins.normalize`; keep the two in step, the engine's
+     * (`io.myotis.jsonrpc.policy.WebOrigins.normalize`; keep the two in step, the engine's
      * test pins the rules), so a stored entry and a recent-list origin compare as
      * strings. A bare domain means `https://<domain>`; a scheme's default port is
      * dropped; a trailing slash is tolerated; a path, query, userinfo, wildcard or

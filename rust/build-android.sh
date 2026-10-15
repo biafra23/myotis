@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Cross-compile the workspace's Android cdylibs (myotis-bls today; myotis-engine once
-# it grows a real JNI surface) for Android ABIs into the app's jniLibs, so
+# it grows a real JNI surface) for Android ABIs into the engine library's jniLibs, so
 # NativeBlsBackend.isAvailable() is true on-device and the ~4-15x faster BLS verify
 # kicks in. See docs/bls-rust-acceleration.md.
 #
@@ -23,7 +23,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
-jniLibs="$here/../android-app/src/main/jniLibs"
+jniLibs="$here/../myotis-engine/src/androidMain/jniLibs"
 
 : "${ANDROID_NDK_HOME:?set ANDROID_NDK_HOME to your NDK path (e.g. \$ANDROID_SDK/ndk/27.0.11718014)}"
 
@@ -32,7 +32,7 @@ jniLibs="$here/../android-app/src/main/jniLibs"
 cd "$here"
 # Build from the workspace root so the workspace [profile.release] and
 # .cargo/config.toml apply. Ships myotis-bls (native BLS) and myotis-engine
-# (the Rust engine behind :myotis-engines' RustEngineNative). 16 KB-aligned
+# (the Rust engine behind :myotis-engine-rust's RustEngineNative). 16 KB-aligned
 # LOAD segments (.cargo/config.toml passes -Wl,-z,max-page-size=16384) so the
 # libs load on Android 15+ devices with 16 KB memory pages.
 # A plain string, not an array: macOS's bash 3.2 rejects an empty array

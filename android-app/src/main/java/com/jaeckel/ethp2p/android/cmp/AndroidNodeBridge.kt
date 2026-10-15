@@ -355,7 +355,7 @@ class AndroidNetworkStatus(private val ctx: Context) : NetworkStatus {
  */
 private fun torModeFor(engineKind: String?): String? {
     if (!com.jaeckel.ethp2p.android.BuildConfig.TOR_ENGINE || engineKind != "rust") return null
-    val st = io.myotis.engines.Tor.status()
+    val st = io.myotis.engines.rust.Tor.status()
     if (st and 1 == 0) return null
     return when {
         st and 2 == 0 -> "off"

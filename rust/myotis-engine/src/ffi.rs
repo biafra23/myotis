@@ -1,4 +1,4 @@
-//! The UniFFI export surface for the JVM hosts (`:myotis-engines`' generated
+//! The UniFFI export surface for the JVM hosts (`:myotis-engine-rust`'s generated
 //! Kotlin bindings + the `RustEngineNative` delegator).
 //!
 //! TRANSPORT SWAP ONLY: these functions mirror the old hand-JNI natives 1:1 —

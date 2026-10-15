@@ -1,0 +1,149 @@
+# Stage the engine library's publication (build/maven-repo) and check it — the
+# steps engine-library.yml's two jobs share: the build job on pushes to main and
+# dispatch (stage + check, nothing uploaded) and the publish job on a v* tag
+# (the same, then GitHub Packages + the release). One definition, so a fix to
+# the staging retry or the verification never has to be applied twice.
+#
+# The AAR builds the Rust engine FROM SOURCE (:myotis-engine's preBuild chain),
+# so this sets up the Android rustup targets, cargo-ndk and the runner's NDK as
+# android-apk.yml does. No -PskipRustEngine — a published AAR without the
+# engine is a library that loads nothing.
+name: Stage the engine library
+description: Build the eth.myotis publication into build/maven-repo and check it
+
+inputs:
+  release-tag:
+    description: >-
+      The v* tag being published (its version is what the artifacts carry: v0.1.16
+      publishes 0.1.16, v0.1.16-rc1 publishes 0.1.16-rc1). Empty on a non-tag run,
+      which stages the bare release version — the layout a tag would publish, not
+      a SNAPSHOT (see -PpublishRelease in the root build.gradle.kts).
+    required: false
+    default: ''
+  save-rust-cache:
+    description: Whether this run saves the Rust build cache (main saves, a tag only restores).
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+
+    - name: Set up Gradle
+      uses: gradle/actions/setup-gradle@v4
+
+    - name: Make gradlew executable
+      shell: bash
+      run: chmod +x gradlew
+
+    - name: Set up Rust (Android targets)
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: aarch64-linux-android,x86_64-linux-android
+
+    - name: Cache Rust build
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: rust
+        shared-key: engine-library-rust
+        save-if: ${{ inputs.save-rust-cache }}
+
+    - name: Install cargo-ndk
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-ndk
+
+    # Retry to ride out transient dependency-resolution blips, as the APK build
+    # does. The staging repository is wiped first: Gradle's publish only adds,
+    # so a retry after a half-written attempt would otherwise leave a layout
+    # the check cannot tell from a complete one.
+    - name: Stage the publication (build/maven-repo)
+      shell: bash
+      env:
+        RELEASE_TAG: ${{ inputs.release-tag }}
+      run: |
+        set -u
+        # -PpublishRelease=<version> on a tag; bare -PpublishRelease otherwise.
+        flag="-PpublishRelease=${RELEASE_TAG#v}"
+        [ -n "$RELEASE_TAG" ] || flag="-PpublishRelease"
+        for attempt in 1 2 3; do
+          rm -rf build/maven-repo
+          ./gradlew "$flag" publishAllPublicationsToStagingRepository --stacktrace && exit 0
+          echo "::warning::staging attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
+          sleep 25
+        done
+        echo "::error::staging the publication failed after 3 attempts"
+        exit 1
+
+    # Same two backstops as android-apk.yml: the jniLibs were really built
+    # (cargoNdkAndroid self-skips only on an incomplete toolchain, which
+    # requireAndroidRustEngine turns into an error — belt and braces), and the
+    # committed UniFFI bindings match the Rust source the AAR's .so was built
+    # from, or the published AAR fails UniFFI validation on-device.
+    - name: Verify the jniLibs were built from source and the bindings are current
+      shell: bash
+      run: |
+        set -euo pipefail
+        for abi in arm64-v8a x86_64; do
+          lib="myotis-engine/src/androidMain/jniLibs/$abi/libmyotis_engine.so"
+          [ "$lib" -nt gradlew ] \
+            || { echo "::error::$lib was NOT built (cargoNdkAndroid self-skipped?)"; exit 1; }
+        done
+        bindings=myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt
+        git diff --exit-code -- "$bindings" || {
+          echo "::error::$bindings is STALE vs rust/myotis-engine — regenerate with" \
+               "\`./gradlew uniffiGenerateKotlin\` and commit."
+          exit 1
+        }
+
+    - name: Check the staged publication
+      shell: bash
+      run: scripts/check_engine_library.sh build/maven-repo
+
+    # The maven-repo branch merge (scripts/merge_maven_repo.py) otherwise runs
+    # only on a tag, after GitHub Packages and the release assets are final —
+    # so exercise it here on what was just staged: a first publish into an
+    # empty repository, the same release again (a republish, which must change
+    # nothing), and the release on top of a fictitious earlier one (the copy
+    # renamed to 0.0.1), after which the metadata must list both versions with
+    # the staged one as `release`. Each result must pass the check, with every
+    # artifact-level maven-metadata.xml carrying the four checksums Gradle
+    # writes, each matching the file.
+    - name: Exercise the maven-repo merge on the staged publication
+      shell: bash
+      run: |
+        set -euo pipefail
+        checksums_match() {
+          while IFS= read -r f; do
+            for h in md5 sha1 sha256 sha512; do
+              [ -f "$f.$h" ] || { echo "::error::$f.$h is missing"; exit 1; }
+              [ "$(cat "$f.$h")" = "$(${h}sum < "$f" | cut -d' ' -f1)" ] \
+                || { echo "::error::$f.$h does not match the file"; exit 1; }
+            done
+          done < <(find "$1" -name maven-metadata.xml)
+        }
+        python3 scripts/test_merge_maven_repo.py
+        version=$(basename "$(ls -d build/maven-repo/eth/myotis/myotis-engine/*/)")
+        merged=$(mktemp -d)
+        python3 scripts/merge_maven_repo.py build/maven-repo "$merged"
+        python3 scripts/merge_maven_repo.py build/maven-repo "$merged"
+        diff -r build/maven-repo "$merged"   # a republish of the same release is a no-op
+        scripts/check_engine_library.sh "$merged"
+        checksums_match "$merged"
+        # An earlier release on the branch: the same set, as 0.0.1.
+        older=$(mktemp -d)
+        cp -R "$merged"/. "$older"/
+        mapfile -t dirs < <(find "$older" -type d -name "$version")
+        for d in "${dirs[@]}"; do mv "$d" "$(dirname "$d")/0.0.1"; done
+        find "$older" -name maven-metadata.xml -exec sed -i "s/$version/0.0.1/g" {} +
+        python3 scripts/merge_maven_repo.py build/maven-repo "$older"
+        m="$older/eth/myotis/myotis-engine/maven-metadata.xml"
+        grep -q "<version>0.0.1</version>" "$m" && grep -q "<version>$version</version>" "$m" \
+          && grep -q "<release>$version</release>" "$m" \
+          || { echo "::error::the merged metadata does not list both versions with $version as release:"; cat "$m"; exit 1; }
+        checksums_match "$older"
