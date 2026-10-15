@@ -93,19 +93,17 @@ val releaseVersion = project.version.toString().substringBefore('-')
 // releaseBuildNumber, shared with the iOS CFBundleVersion check.
 val derivedVersionCode: Int = rootProject.extra["releaseBuildNumber"] as Int
 
-// Mirror the root build's -PskipRustEngine parse (same truthy rules). When set,
-// the Android build omits the Rust native libs — so packaging must also drop any
-// libmyotis_*.so LEFT OVER in the source tree from an earlier toolchain build,
-// or the APK would ship a stale engine and silently fall back to Java on-device
-// (the very failure this contract prevents). See the packaging block below.
-val skipRustEngine = project.hasProperty("skipRustEngine") &&
-    (project.property("skipRustEngine") as? String).let {
-        it.isNullOrBlank() || it.trim().lowercase() !in setOf("false", "0", "no", "off")
-    }
-
 android {
     namespace = "com.jaeckel.ethp2p.android"
     compileSdk = 35
+    // The app has NO jniLibs of its own: every native lib it ships (the engine,
+    // native BLS, JNA's dispatcher) arrives inside the engine library's AAR. Said
+    // explicitly because AGP's default src/main/jniLibs is where cargoNdkAndroid
+    // used to write, and an app's own copy wins the merge over a library's — a
+    // libmyotis_*.so left there by an earlier build (not removed by `clean`) would
+    // shadow the AAR's fresh one and fail UniFFI validation on-device, a silent
+    // Java fallback. With no source dir, nothing from the app's tree reaches the APK.
+    sourceSets.getByName("main").jniLibs.setSrcDirs(emptyList<String>())
 
     defaultConfig {
         applicationId = "com.jaeckel.ethp2p.android"
@@ -206,7 +204,7 @@ android {
                     apiLevel = 29
                     systemImageSource = "aosp"
                     // REQUIRED, not a preference: the APK always carries native
-                    // libs for exactly arm64-v8a + x86_64 (extractJnaAndroidNatives
+                    // libs for exactly arm64-v8a + x86_64 (the engine library's AAR
                     // packages libjnidispatch.so even under -PskipRustEngine), and
                     // an APK with native libs installs only on a device offering a
                     // matching ABI. Left false, AGP resolves this device to the
@@ -222,6 +220,16 @@ android {
     }
 
     packaging {
+        // -PskipRustEngine: the engine library already keeps its jniLibs directory
+        // out of the build then (its source set is gated on the root's flag), so no
+        // libmyotis_*.so should reach this merge at all. This exclude is the second
+        // line, authoritative at the APK merge whatever a library-side mechanism
+        // covers: the APK the flag describes carries no Rust engine.
+        if (rootProject.extra["myotis.skipRustEngine"] as Boolean) {
+            jniLibs {
+                excludes += setOf("**/libmyotis_engine.so", "**/libmyotis_bls.so")
+            }
+        }
         resources {
             // Common collisions when shipping JVM libs in an APK
             excludes += setOf(
@@ -258,18 +266,6 @@ android {
                 "META-INF/versions/9/OSGI-INF/MANIFEST.MF",
             )
         }
-        // -PskipRustEngine means "no Rust engine in this APK". The jniLibs live in
-        // the source tree (src/main/jniLibs), outside build/, so a lib left there
-        // by an earlier full-toolchain build is NOT removed by `clean`, by
-        // .gitignore, or by cargoNdkAndroid being skipped — AGP would happily
-        // package it, and on-device it would fail UniFFI validation (bindings vs a
-        // stale .so) and silently fall back to Java. Exclude them so the flag
-        // means what requireAndroidRustEngine says it does.
-        if (skipRustEngine) {
-            jniLibs {
-                excludes += setOf("**/libmyotis_engine.so", "**/libmyotis_bls.so")
-            }
-        }
     }
 }
 
@@ -289,22 +285,9 @@ kotlin {
     jvmToolchain(21)
 }
 
-// JNA reaches the APK in TWO pieces, because no single artifact carries both:
-//   - com.sun.jna.* classes come from the plain jna JAR, transitively via
-//     :myotis-engine-rust and Besu (nothing here declares it directly);
-//   - jni/<abi>/libjnidispatch.so comes from jna-<v>.aar, extracted at the
-//     bottom of this file into jniLibs.
-// The aar cannot just be put on a classpath instead: it carries the same
-// classes as the jar and fails the duplicate-class check.
-//
-// A previous attempt used variant-aware dependency substitution with an
-// `artifactType = "aar"` attribute. That silently matched NO artifact — jna
-// publishes no Gradle Module Metadata (only jna-<v>.pom, <packaging>jar</packaging>),
-// so there is no aar variant to select — and the module resolved with its jar
-// artifact dropped. The APK ended up with NO JNA at all, so the UniFFI bindings
-// died on `NoClassDefFoundError: com.sun.jna.Native`, RustEngineNative reported
-// the engine unavailable, and the "Rust engine" toggle silently fell back to
-// Java. That is what shipped in v0.1.3 and v0.1.4.
+// The Rust engine, its jniLibs and JNA's Android dispatcher all arrive through
+// the engine library (:myotis-engine, the AAR): nothing here builds or packages a
+// native lib any more. The -PskipRustEngine opt-out is honoured there too.
 
 dependencies {
     testImplementation(libs.junit4)
@@ -350,14 +333,15 @@ dependencies {
     // Engine selector: NodeService.ENGINE is Engines.engine(); the Settings "Rust
     // engine" toggle drives it via NodeService.applyEngineChoice.
     implementation(project(":myotis-engines"))
+    // The engine library: the Rust engine with the jniLibs and JNA's Android
+    // dispatcher inside its AAR. The Android app consumes the Rust engine through
+    // it; the JNA classes come with it (and from Besu), the natives ride in the AAR.
+    implementation(project(":myotis-engine"))
     // The Rust engine's Tor seam (io.myotis.engines.rust.Tor — NodeService's Tor
-    // toggle, AndroidNodeBridge), a documented API-boundary exemption (CLAUDE.md).
+    // toggle, AndroidNodeBridge), a documented API-boundary exemption (CLAUDE.md):
+    // the library keeps the engine module off consumers' classpaths, so the app
+    // names it itself.
     implementation(project(":myotis-engine-rust"))
-    // JNA (the UniFFI bindings' loader) arrives transitively via :myotis-engine-rust
-    // and Besu, supplying com.sun.jna.*. Its ANDROID natives are added separately
-    // at the bottom of this file — see "JNA's Android natives". Do NOT also put
-    // jna-<v>.aar on a classpath here: it carries the same classes and fails the
-    // duplicate-class check.
     // TrueBlocks tx-history scan for the Query tab (documented API-boundary exemption:
     // NodeService reaches the raw connector via SelectorEngine.javaDelegate().debugStack).
     // Java-21 classfiles like :networking — already dexed fine (see libs.versions.toml).
@@ -430,147 +414,14 @@ dependencies {
     implementation(libs.androidx.work.runtime)
 }
 
-// The Rust engine is built FROM SOURCE as part of the Android build (there is no
-// committed .so to drift). requireAndroidRustEngine enforces the contract: with
-// the toolchain present, cargoNdkAndroid cross-compiles the jniLibs and
-// uniffiGenerateKotlin refreshes the committed bindings from the same source;
-// without it, the build fails and names `-PskipRustEngine` (which omits the
-// engine; the app then runs the Java engine, on API 33+ only — EngineGate).
-// verifyAndroidJniLibs is
-// the post-build backstop that the produced .so exports every UniFFI symbol the
-// (now-fresh) bindings require. Auto-regen is scoped to the Android build ON
-// PURPOSE — the JVM hosts must stay buildable without cargo (see
-// myotis-engine-rust/build.gradle.kts), and CI enforces bindings freshness for
-// everyone via the regenerate-and-diff step in android-apk.yml. Root
-// build.gradle.kts owns the tasks.
-tasks.matching { it.name == "preBuild" }.configureEach {
-    // Always run the gate: with -PskipRustEngine it just logs the opt-out.
-    dependsOn(rootProject.tasks.named("requireAndroidRustEngine"))
-    // Only pull the Rust build tasks into the graph when we actually want the
-    // engine — under -PskipRustEngine they'd only self-skip anyway, and keeping
-    // them out avoids the JVM build touching cargo/bindings at all.
-    if (!skipRustEngine) {
-        dependsOn(rootProject.tasks.named("uniffiGenerateKotlin"))
-        dependsOn(rootProject.tasks.named("cargoNdkAndroid"))
-        dependsOn(rootProject.tasks.named("verifyAndroidJniLibs"))
-    }
-}
-// The backstop must see the FRESH outputs of BOTH producers: cargoNdkAndroid's
-// .so and uniffiGenerateKotlin's regenerated bindings (which verifyAndroidJniLibs
-// reads as an input — without this ordering Gradle 8.12 fails the build with an
-// implicit-dependency validation error, and the check could otherwise validate
-// against the stale .kt it is about to replace). The gate should fail first
-// (before we spend time cross-compiling) when the toolchain is missing.
-rootProject.tasks.named("verifyAndroidJniLibs").configure {
-    mustRunAfter(rootProject.tasks.named("cargoNdkAndroid"))
-    mustRunAfter(rootProject.tasks.named("uniffiGenerateKotlin"))
-}
-// Both expensive Rust producers run AFTER the gate, so a machine with cargo but
-// without the Android toolchain (cargo-ndk / NDK / targets) fails fast instead of
-// first building the whole host workspace: cargoNdkAndroid directly, and
-// cargoBuildHost because uniffiGenerateKotlin dependsOn it (ordering the generator
-// alone wouldn't hold cargoBuildHost back). Both edges are inert off-Android,
-// where requireAndroidRustEngine isn't in the graph.
-rootProject.tasks.named("cargoNdkAndroid").configure {
-    mustRunAfter(rootProject.tasks.named("requireAndroidRustEngine"))
-}
-rootProject.tasks.named("cargoBuildHost").configure {
-    mustRunAfter(rootProject.tasks.named("requireAndroidRustEngine"))
-}
-
-// === JNA's Android natives =============================================
-// The graph resolves the plain jna JAR, which supplies com.sun.jna.* but
-// carries desktop natives only (win32/darwin/linux/aix). jni/<abi>/libjnidispatch.so
-// — without which JNA cannot dispatch at all — ships exclusively in jna-<v>.aar.
-//
-// Take ONLY the natives from the aar and leave the classes on the jar: putting
-// the aar on a classpath alongside the jar duplicates com.sun.jna.* and fails
-// the duplicate-class check. A detached, non-consumable configuration keeps the
-// aar off every classpath, so this adds files to the APK and changes no
-// dependency resolution.
-val jnaVersion = libs.versions.jna.get()
-
-// The classpath jar and the extracted natives MUST be the same version: JNA's
-// Native.<clinit> compares its own version against the native library's and
-// throws on a major/minor mismatch. The natives below are hard-pinned via
-// artifact-only @aar notation, which bypasses conflict resolution entirely, so
-// without this the jar side would float free — today it lands on the right
-// version only because Besu's BOM happens to constrain jna to the same value.
-// A Besu bump could therefore silently reintroduce the very failure this file
-// exists to prevent (JNA throws, RustEngineNative reports the engine
-// unavailable, the toggle falls back to Java) and CI could not catch it, since
-// it builds the APK but never runs it. Force keeps the two sides equal by
-// construction; to move jna, move the catalog entry.
+// JNA version pin. The engine library's AAR carries libjnidispatch.so from
+// jna-<catalog version>.aar, and JNA's Native.<clinit> compares the classpath
+// jar's version against that native library's, throwing on a mismatch. Besu's
+// BOM also constrains jna, so without this force the jar side would float with a
+// Besu bump and silently reintroduce the failure (JNA throws, RustEngineNative
+// reports the engine unavailable, the toggle falls back to Java) — and CI could
+// not catch it, since it builds the APK but never runs it. Force keeps the two
+// sides equal by construction; to move jna, move the catalog entry.
 configurations.configureEach {
-    resolutionStrategy.force("net.java.dev.jna:jna:$jnaVersion")
-}
-
-val jnaAndroidNatives: Configuration by configurations.creating {
-    isTransitive = false
-    isCanBeConsumed = false
-}
-
-dependencies {
-    jnaAndroidNatives("net.java.dev.jna:jna:$jnaVersion@aar")
-}
-
-// Every ABI that gets libmyotis_engine.so needs a matching libjnidispatch.so,
-// or UniFFI cannot load and that ABI silently falls back to the Java engine.
-//
-// KEEP IN SYNC with `cargo ndk -t ...` in rust/build-android.sh and the
-// cargoNdkAndroid output paths in the root build.gradle.kts — one list, three
-// places. Deliberately a literal rather than a listing of src/main/jniLibs:
-// that directory is cargoNdkAndroid's EXECUTION-time output while this is read
-// at CONFIGURATION time, so the first build after an ABI was added would read
-// the pre-cargo state, omit the new ABI and ship it without a dispatcher — then
-// self-heal on the next build, which is the worst way for this to fail. What
-// actually enforces the invariant is the APK post-condition in
-// .github/workflows/android-apk.yml, which checks the built artifact.
-val shippedAbis = listOf("arm64-v8a", "x86_64")
-
-// aar layout is jni/<abi>/lib*.so; the jniLibs source set wants <abi>/lib*.so.
-// Sync, not Copy: Copy leaves behind files no longer in the spec, so a narrowed
-// abi list (or a jna upgrade dropping one) would keep packaging a stale .so.
-// NOT configuration-cache compatible, knowingly: the `from {}` / `eachFile {}`
-// lambdas capture the build script, so `--configuration-cache` fails the whole
-// build with "cannot serialize Gradle script object references". CC is off
-// project-wide today (nothing sets it in gradle.properties or the Android CI
-// workflow), so this is latent — enabling it for :android-app means moving this
-// into a typed task in buildSrc first, which would also let the jniLibs wiring
-// use AGP's addGeneratedSourceDirectory (a real producer->consumer edge)
-// instead of the preBuild anchor below.
-val extractJnaAndroidNatives = tasks.register<Sync>("extractJnaAndroidNatives") {
-    from(jnaAndroidNatives.elements.map { zipTree(it.single().asFile) }) {
-        shippedAbis.forEach { abi -> include("jni/$abi/**") }
-    }
-    eachFile { path = path.substringAfter("jni/") }
-    includeEmptyDirs = false
-    into(layout.buildDirectory.dir("jna-android-natives"))
-    // Gradle does not warn about include patterns that match nothing, so an ABI
-    // the aar has never carried (riscv64 being the realistic one) would extract
-    // silently to nothing and that ABI would ship an engine with no dispatcher.
-    doLast {
-        val got = destinationDir.listFiles { f: java.io.File -> f.isDirectory }
-            ?.map { it.name }.orEmpty().toSet()
-        val missing = shippedAbis.filterNot { it in got }
-        check(missing.isEmpty()) {
-            "jna-$jnaVersion.aar carries no libjnidispatch.so for $missing — those ABIs " +
-                "would ship libmyotis_engine.so with no JNA dispatcher, so the Rust engine " +
-                "could not load at runtime (a silent Java fallback on API 33+, a failed boot below)."
-        }
-    }
-}
-
-android {
-    sourceSets.getByName("main").jniLibs.srcDir(extractJnaAndroidNatives)
-}
-
-// srcDir(<TaskProvider>) registers the DIRECTORY but does NOT carry a task
-// dependency through AGP's source sets: on a clean build the jniLib merge runs
-// before anything has extracted and the APK silently ships without
-// libjnidispatch.so (incremental builds hide this — the directory is already
-// populated from a previous run). Wire it through the same preBuild hook
-// cargoNdkAndroid uses, which runs ahead of every merge/assemble/bundle path.
-tasks.matching { it.name == "preBuild" }.configureEach {
-    dependsOn(extractJnaAndroidNatives)
+    resolutionStrategy.force("net.java.dev.jna:jna:${libs.versions.jna.get()}")
 }

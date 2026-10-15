@@ -42,7 +42,7 @@ tasks.withType<JavaCompile>().configureEach {
 // a `dependsOn(uniffiGenerateKotlin)` would drag a full `cargo build --release`
 // (via cargoBuildHost) in front of every JVM host's Kotlin compile and make a
 // broken rust/ break the JVM build — violating "Rust is OPTIONAL for the JVM
-// hosts". Auto-regeneration is scoped to the Android build (:android-app
+// hosts". Auto-regeneration is scoped to the Android build (:myotis-engine's
 // preBuild, where cargo is already required); CI enforces freshness everywhere
 // via the regenerate-and-diff step in android-apk.yml; regenerate manually
 // elsewhere with `./gradlew uniffiGenerateKotlin`.
@@ -72,7 +72,8 @@ dependencies {
     implementation(libs.minimal.json)
     implementation(libs.slf4j.api)
     // The FFI layer under the UniFFI-generated Kotlin bindings. Plain JVM artifact
-    // here; the Android hosts supply the @aar natives (libjnidispatch.so) themselves.
+    // here; the engine library (:myotis-engine) packs the @aar natives
+    // (libjnidispatch.so) into its AAR for Android.
     implementation(libs.jna)
 
     testImplementation(platform(libs.junit.bom))

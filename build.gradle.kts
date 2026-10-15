@@ -236,6 +236,7 @@ subprojects {
     //   app-ios      → kotlin-multiplatform + compose (iOS framework)
     //   jsonrpc-server → kotlin-multiplatform (JVM hosts + the iOS RPC listener)
     //   myotis-rpc-policy → kotlin-multiplatform (the serving policy those share)
+    //   myotis-engine  → kotlin-multiplatform + com.android.library (the engine library: AAR + desktop jar)
     // Excludes shared by EVERY module (Android plugin modules included):
     // - native Netty transports, for Android compatibility;
     // - Besu 26.4's log4j: it drags log4j-slf4j2-impl — a SECOND slf4j
@@ -258,7 +259,7 @@ subprojects {
         exclude(group = "org.apache.logging.log4j", module = "log4j-core")
     }
 
-    if (name in setOf("android-app", "ui", "app-desktop", "app-ios", "jsonrpc-server", "myotis-rpc-policy")) {
+    if (name in setOf("android-app", "ui", "app-desktop", "app-ios", "jsonrpc-server", "myotis-rpc-policy", "myotis-engine")) {
         return@subprojects
     }
 
@@ -304,7 +305,7 @@ subprojects {
 //   cargoTest       → cargo test --workspace; wired into root `check`
 //   cargoNdkAndroid → Android jniLibs (engine + native BLS) via
 //                     rust/build-android.sh; built from source (no committed
-//                     .so) and wired into :android-app preBuild. Required by
+//                     .so) and wired into :myotis-engine preBuild. Required by
 //                     default; -PskipRustEngine opts out.
 // -------------------------------------------------------------------------
 
@@ -730,9 +731,10 @@ val cargoBuildNoStd = tasks.register<Exec>("cargoBuildNoStd") {
 }
 tasks.named("check") { dependsOn(cargoBuildNoStd) }
 
-// The Android app builds the Rust engine (its jniLibs) FROM SOURCE — cargo,
-// cargo-ndk, the Android NDK, and the Android rustup targets are REQUIRED to
-// build :android-app by default. Making the engine a build output (not a
+// The Android engine library (:myotis-engine, the AAR the Android app consumes)
+// builds the Rust engine (its jniLibs) FROM SOURCE — cargo, cargo-ndk, the
+// Android NDK, and the Android rustup targets are REQUIRED to build it, and so
+// :android-app, by default. Making the engine a build output (not a
 // committed binary) is what stops a stale artifact from silently shipping a
 // dead "Rust engine" toggle: there is no committed .so to drift from the source.
 //
@@ -749,6 +751,9 @@ val skipRustEngine = project.hasProperty("skipRustEngine") &&
     (project.property("skipRustEngine") as? String).let {
         it.isNullOrBlank() || it.trim().lowercase() !in setOf("false", "0", "no", "off")
     }
+// :myotis-engine reads the parsed flag from here (rootProject.extra), so its
+// packaging exclude and this file's task gating can never disagree on a spelling.
+extra["myotis.skipRustEngine"] = skipRustEngine
 val androidRustTargets = listOf("aarch64-linux-android", "x86_64-linux-android")
 val androidRustToolchainReady = rustAvailable &&
     cargoNdkVersion.isNotEmpty() &&
@@ -783,26 +788,28 @@ tasks.register<Exec>("cargoNdkAndroid") {
     // The Tor feature flips the libs' contents, so it must key UP-TO-DATE too.
     inputs.property("torEngine", torEngine)
     outputs.files(
-        file("android-app/src/main/jniLibs/arm64-v8a/libmyotis_bls.so"),
-        file("android-app/src/main/jniLibs/x86_64/libmyotis_bls.so"),
-        file("android-app/src/main/jniLibs/arm64-v8a/libmyotis_engine.so"),
-        file("android-app/src/main/jniLibs/x86_64/libmyotis_engine.so"),
+        file("myotis-engine/src/androidMain/jniLibs/arm64-v8a/libmyotis_bls.so"),
+        file("myotis-engine/src/androidMain/jniLibs/x86_64/libmyotis_bls.so"),
+        file("myotis-engine/src/androidMain/jniLibs/arm64-v8a/libmyotis_engine.so"),
+        file("myotis-engine/src/androidMain/jniLibs/x86_64/libmyotis_engine.so"),
     )
 }
 
-// Build-time contract for :android-app: the Rust engine is built from source by
-// default (cargoNdkAndroid), so a MISSING toolchain must fail loudly and name the
-// escape hatch — never silently produce a Java-only app. Wired into
-// :android-app:preBuild (see its build file). `-PskipRustEngine` is the opt-out.
+// Build-time contract for :myotis-engine (and so :android-app): the Rust engine
+// is built from source by default (cargoNdkAndroid), so a MISSING toolchain must
+// fail loudly and name the escape hatch — never silently produce a Java-only
+// app. Wired into :myotis-engine:preBuild (see its build file).
+// `-PskipRustEngine` is the opt-out.
 tasks.register("requireAndroidRustEngine") {
     group = "verification"
     description = "Fail the Android build when the Rust engine toolchain is missing, unless -PskipRustEngine is set"
     // A fast environment gate — no inputs/outputs, always evaluates.
     doLast {
         if (skipRustEngine) {
-            logger.lifecycle("[rust] -PskipRustEngine set — building :android-app WITHOUT the " +
-                "Rust engine; it will use the Java engine (and JVM BLS) at runtime, which boots only " +
-                "on Android 13 (API 33) and newer — below that the app is Rust-engine-only.")
+            logger.lifecycle("[rust] -PskipRustEngine set — building :myotis-engine (and so " +
+                ":android-app) WITHOUT the Rust engine; the app will use the Java engine (and JVM BLS) " +
+                "at runtime, which boots only on Android 13 (API 33) and newer — below that the app " +
+                "is Rust-engine-only.")
             return@doLast
         }
         if (!androidRustToolchainReady) {
@@ -843,8 +850,11 @@ tasks.register("requireAndroidRustEngine") {
 // (checksum drift, no new symbol) is still caught at load time by UniFFI's
 // checksum gate and, in CI, by the regenerate-and-diff step in android-apk.yml.
 val shippedAbis = listOf("arm64-v8a", "x86_64")
-val engineJniLibs = shippedAbis.map { file("android-app/src/main/jniLibs/$it/libmyotis_engine.so") }
-val blsJniLibs = shippedAbis.map { file("android-app/src/main/jniLibs/$it/libmyotis_bls.so") }
+// :myotis-engine extracts JNA's dispatcher for exactly these ABIs (rootProject.extra):
+// one list, so an ABI added here cannot ship an engine with no dispatcher there.
+extra["myotis.shippedAbis"] = shippedAbis
+val engineJniLibs = shippedAbis.map { file("myotis-engine/src/androidMain/jniLibs/$it/libmyotis_engine.so") }
+val blsJniLibs = shippedAbis.map { file("myotis-engine/src/androidMain/jniLibs/$it/libmyotis_bls.so") }
 val committedBindings = project(":myotis-engine-rust").projectDir
     .resolve("src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt")
 tasks.register("verifyAndroidJniLibs") {
