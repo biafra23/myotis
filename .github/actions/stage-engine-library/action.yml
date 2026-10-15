@@ -127,6 +127,7 @@ runs:
             done
           done < <(find "$1" -name maven-metadata.xml)
         }
+        python3 scripts/test_merge_maven_repo.py
         version=$(basename "$(ls -d build/maven-repo/eth/myotis/myotis-engine/*/)")
         merged=$(mktemp -d)
         python3 scripts/merge_maven_repo.py build/maven-repo "$merged"

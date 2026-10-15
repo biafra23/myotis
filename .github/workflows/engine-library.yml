@@ -309,10 +309,13 @@ jobs:
 
       # Absent when the publish job failed before the version reached GitHub
       # Packages: then there is nothing to put on the branch, and this job
-      # says so instead of failing.
+      # says so instead of failing. After a SUCCESSFUL publish the artifact
+      # exists, so a download failure there is a real error (a GitHub blip)
+      # and fails this job — "re-run failed jobs" then retries it; a green job
+      # must never mean "the branch was skipped".
       - name: Download the staged repository
         id: staged
-        continue-on-error: true
+        continue-on-error: ${{ needs.publish.result != 'success' }}
         uses: actions/download-artifact@v4
         with:
           name: engine-library-maven-repo-release-${{ github.sha }}
@@ -320,7 +323,8 @@ jobs:
 
       - name: Nothing to publish
         if: steps.staged.outcome != 'success'
-        run: echo "the publish job did not reach GitHub Packages for ${GITHUB_REF_NAME}; the maven-repo branch stays as it is"
+        run: |
+          echo "the publish job did not reach GitHub Packages for ${GITHUB_REF_NAME} (its result: ${{ needs.publish.result }}); the maven-repo branch stays as it is"
 
       - name: Merge into the maven-repo branch and push
         if: steps.staged.outcome == 'success'
