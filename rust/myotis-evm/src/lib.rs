@@ -64,6 +64,7 @@ pub use ens::{
     resolve_interface_implementer, resolve_multicoin, resolve_pubkey, resolve_text,
     reverse_resolve, EnsError, EthCaller, ExecutorCaller, OffchainLookup, resolve_ownership, EnsOwnership,
 };
+pub use ens::refusal as ens_refusal;
 pub use error::EvmError;
 pub use executor::{CallCost, CreatedAccessList, EvmExecutor};
 pub use oracle::{OracleAccount, OracleError, SnapStateOracle, WireCost};

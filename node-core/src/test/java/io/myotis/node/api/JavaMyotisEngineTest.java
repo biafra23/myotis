@@ -58,7 +58,7 @@ class JavaMyotisEngineTest {
         assertEquals(12, mainnet.secondsPerSlot());
         NetworkInfo gnosis = nets.stream().filter(n -> n.name().equals("gnosis")).findFirst().orElseThrow();
         assertEquals(100L, gnosis.chainId());
-        assertFalse(gnosis.hasEns());
+        assertTrue(gnosis.hasEns());   // Genome .gno names
         assertEquals(5, gnosis.secondsPerSlot());
     }
 

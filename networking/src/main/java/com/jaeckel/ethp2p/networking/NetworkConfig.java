@@ -979,16 +979,18 @@ public record NetworkConfig(
     // -------------------------------------------------------------------------
 
     /**
-     * Whether ENS name resolution is available on this chain. ENS is deployed only on
-     * Ethereum mainnet and Sepolia — {@link io.myotis.ens.EnsResolver#forChainId} pins
-     * the ENS contracts for chainId 1 / 11155111 (and still for 17000,
-     * holesky, which the EF retired in Oct 2025 — dead code, since {@link #byName}
-     * rejects that network) and throws for everything else (e.g. Gnosis 100, which has
-     * no canonical ENS). This gate admits only 1 / 11155111. UIs gate the ENS query path
-     * on it; plain address balance/account queries work on every chain regardless.
+     * Whether name resolution is available on this chain: ENS on Ethereum mainnet and
+     * Sepolia, and Genome's {@code .gno} names on Gnosis Chain (a SPACE ID deployment with
+     * the ENS interfaces, resolved against Gnosis state — see
+     * {@link io.myotis.ens.EnsResolver#gnosisGenome}). {@link io.myotis.ens.EnsResolver#forChainId}
+     * pins the contracts for chainId 1 / 11155111 / 100 (and still for 17000, holesky,
+     * which the EF retired in Oct 2025 — dead code, since {@link #byName} rejects that
+     * network). UIs gate the name query path on it; plain address balance/account queries
+     * work on every chain regardless. Which names a chain serves is the resolver's call:
+     * on Gnosis only {@code .gno}.
      */
     public boolean hasEns() {
-        return networkId == 1 || networkId == 11155111;
+        return networkId == 1 || networkId == 11155111 || networkId == 100;
     }
 
     /** Human-readable chain name for UI labels (the {@link #name} is the lowercase id). */

@@ -23,8 +23,11 @@ class RustEnsApiTest {
 
     @Test
     void ensIsNullOnNetworksWithoutEns() {
-        // gnosis (hasEns=false) → ChainHandle.ens() is null; mainnet (true) → non-null.
-        assertNull(new RustChainHandle(0L, "gnosis", 100L, 0, false).ens());
+        // The catalog's hasEns flag decides: false → ChainHandle.ens() is null, true →
+        // non-null. (Every hosted network has a name service now — gnosis serves .gno —
+        // so the false case is a hypothetical chain id.)
+        assertNull(new RustChainHandle(0L, "other", 12345L, 0, false).ens());
+        assertNotNull(new RustChainHandle(0L, "gnosis", 100L, 0, true).ens());
         assertNotNull(new RustChainHandle(0L, "mainnet", 1L, 0, true).ens());
     }
 

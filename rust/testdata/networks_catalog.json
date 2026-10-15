@@ -14,7 +14,7 @@
     "name": "gnosis",
     "displayName": "Gnosis Chain",
     "chainId": 100,
-    "hasEns": false,
+    "hasEns": true,
     "defaultElPort": 30304,
     "defaultDiscv5Port": 9001,
     "defaultRpcPort": 8546,

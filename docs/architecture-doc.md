@@ -289,7 +289,7 @@ The "interpretation" of returned bytes is a separate concern from verification: 
 
 ### Network Coverage
 
-The canonical Registry address is pinned for mainnet and Sepolia (sourced from the `ensdomains/ens-contracts` deployment manifests; `NetworkConfig.hasEns`). Gnosis has no ENS, and the resolver commands fail fast there with a clear error. (`EnsResolver.forChainId` still carries holesky's addresses — dead code since the network was retired.)
+The canonical Registry address is pinned for mainnet and Sepolia (sourced from the `ensdomains/ens-contracts` deployment manifests; `NetworkConfig.hasEns`). Gnosis has no ENS; there the same resolver serves Genome's `.gno` names (`EnsResolver.gnosisGenome`: the Genome registry, rooted at a per-TLD node instead of zero) and refuses any other name. (`EnsResolver.forChainId` still carries holesky's addresses — dead code since the network was retired.)
 
 ---
 

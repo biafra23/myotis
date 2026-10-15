@@ -2,6 +2,7 @@ package io.myotis.ui
 
 import kotlinx.datetime.TimeZone
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Test
 
@@ -105,5 +106,27 @@ class EnsContenthashTest {
         assertNull(ensGatewayUrl("a#b.eth"))
         assertNull(ensGatewayUrl("ümlaut.eth"))
         assertEquals("https://my-name2.eth.limo/", ensGatewayUrl("my-name2.eth"))
+    }
+
+    @Test
+    fun gnoNamesOpenViaGnoLimo() {
+        // eth.limo serves Genome names at *.gno.limo; same plain-hostname rule.
+        assertEquals("https://levvv.gno.limo/", ensGatewayUrl("Levvv.gno"))
+        assertNull(ensGatewayUrl(".gno"))
+        assertNull(ensGatewayUrl("evil.com/x.gno"))
+    }
+
+    @Test
+    fun namesAreCheckedAgainstTheirChain() {
+        // Gnosis serves only .gno; a .gno name elsewhere is pointed at Gnosis.
+        assertNull(nameNetworkMismatch("gnosis", "levvv.gno"))
+        assertNull(nameNetworkMismatch("gnosis", "a.levvv.gno."))
+        assertNotNull(nameNetworkMismatch("gnosis", "vitalik.eth"))
+        assertNotNull(nameNetworkMismatch("gnosis", "gno"))
+        assertNull(nameNetworkMismatch("mainnet", "vitalik.eth"))
+        assertNull(nameNetworkMismatch("sepolia", "cb.id"))
+        assertNotNull(nameNetworkMismatch("mainnet", "levvv.gno"))
+        assertEquals("Genome (.gno)", nameServiceTitle("levvv.gno"))
+        assertEquals("ENS", nameServiceTitle("vitalik.eth"))
     }
 }

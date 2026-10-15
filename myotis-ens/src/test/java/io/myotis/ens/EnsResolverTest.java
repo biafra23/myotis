@@ -607,6 +607,131 @@ class EnsResolverTest {
         assertTrue(result.isEmpty());
     }
 
+    // ---- Genome .gno names on Gnosis Chain ----------------------------------
+
+    private static final Address GNO_REGISTRY = EnsAddresses.GNOSIS_GENOME_REGISTRY;
+    private static final Address GNO_REGISTRAR = EnsAddresses.GNOSIS_GENOME_REGISTRAR;
+
+    private static byte[] gno(String name) {
+        return Namehash.of(name, EnsAddresses.gnosisGenomeRoot());
+    }
+
+    private static byte[] gnoCall(String fn, String name) {
+        return AbiEncoder.encodeCall(FunctionSignature.of(fn), AbiEncoder.bytes32(gno(name)));
+    }
+
+    @Test
+    void genomeNamesHashUnderTheirTldRootNotTheEnsRoot() {
+        // The scheme, pinned by an independent implementation: Blockscout's ENS service
+        // test (blockscout-rs, bens-logic hash_name / domain_name tests) hashes
+        // "levvv.gno" under an empty-label hash of 0x6cbb… to 0x79e0….
+        byte[] fixtureRoot = HexFormat.of().parseHex(
+                "6cbb71e02aa156be31c9be2644cd7e3fe375b291d0786c825495af35fe98ee72");
+        assertEquals("79e028f97b232b1600b2ed68cc7d9811c28595c3ab859b166d13980bcfcece9d",
+                HexFormat.of().formatHex(Namehash.of("levvv.gno", fixtureRoot)));
+        // …and Blockscout's Chiado fixture: levvv.gno's domain id under Chiado Genome's root.
+        byte[] chiadoRoot = HexFormat.of().parseHex(
+                "1a13b687a5ff1d8ab1a9e189e1507a6abe834a9296cc8cff937905e3dee0c4f6");
+        assertEquals("a3504cdec527495c69c760c85d5be9996252f853b91fd0df04c5b6aa2deb3347",
+                HexFormat.of().formatHex(Namehash.of("levvv.gno", chiadoRoot)));
+        // The empty name IS the root; a zero root is plain ENSIP-1.
+        assertEquals(EnsAddresses.GNOSIS_GENOME_ROOT_HEX,
+                HexFormat.of().formatHex(gno("")));
+        assertEquals(HexFormat.of().formatHex(Namehash.of("vitalik.eth")),
+                HexFormat.of().formatHex(Namehash.of("vitalik.eth", new byte[32])));
+        // Gnosis mainnet's .gno node — what Genome's registrar must report as baseNode().
+        assertEquals("b610db9c8c31e1a841d7e46f0184e3ae40589639b590138de0de5df028245ce2",
+                HexFormat.of().formatHex(gno("gno")));
+    }
+
+    @Test
+    void forChainId100IsTheGenomeRegistry() throws Exception {
+        var mock = new MockExecutor();
+        Address resolverAddr = Address.fromHex("0x6D3B3F99177FB2A5de7F9E928a9BD807bF7b5BAD");
+        mock.respond(GNO_REGISTRY, gnoCall("resolver(bytes32)", "levvv.gno"), encodeAddress(resolverAddr));
+        mock.respond(resolverAddr, callSupportsExtended(), encodeBool(false));
+        mock.respond(resolverAddr, gnoCall("addr(bytes32)", "levvv.gno"), encodeAddress(USER));
+
+        var r = EnsResolver.forChainId(mock, 100L);
+        assertEquals(Optional.of(USER), r.resolveAddress("Levvv.GNO", ctx()).get());
+    }
+
+    @Test
+    void genomeWalksUpUnderTheGenomeRoot() throws Exception {
+        var mock = new MockExecutor();
+        // No resolver on the subname: the walk asks for "gno" next, under the Genome root,
+        // and never for a zero-rooted node.
+        mock.respond(GNO_REGISTRY, gnoCall("resolver(bytes32)", "a.levvv.gno"), encodeAddress(Address.ZERO));
+        mock.respond(GNO_REGISTRY, gnoCall("resolver(bytes32)", "levvv.gno"), encodeAddress(Address.ZERO));
+        mock.respond(GNO_REGISTRY, gnoCall("resolver(bytes32)", "gno"), encodeAddress(PUBLIC_RESOLVER));
+        mock.respond(PUBLIC_RESOLVER, callSupportsExtended(), encodeBool(false));
+
+        // A legacy resolver on an ancestor cannot answer for the subname: no record.
+        assertTrue(EnsResolver.gnosisGenome(mock).resolveAddress("a.levvv.gno", ctx()).get().isEmpty());
+    }
+
+    @Test
+    void genomeRefusesNamesOutsideGno() {
+        var r = EnsResolver.gnosisGenome(new MockExecutor());
+        assertTrue(r.servesName("levvv.gno"));
+        assertTrue(r.servesName("a.levvv.gno."));
+        assertFalse(r.servesName("gno"));
+        assertFalse(r.servesName("vitalik.eth"));
+        assertFalse(r.servesName("levvv.gno.eth"));
+        // Refused before any call: "vitalik.eth" hashed under the Genome root is no one's name.
+        var e = assertThrows(IllegalArgumentException.class,
+                () -> r.resolveAddress("vitalik.eth", ctx()));
+        assertEquals(EnsResolver.ONLY_GNO_NAMES, e.getMessage());
+        var own = r.resolveOwnership("vitalik.eth", ctx());
+        assertTrue(assertThrows(java.util.concurrent.ExecutionException.class, own::get).getCause()
+                instanceof IllegalArgumentException);
+        // ENS serves any name, .gno included (it simply has none registered).
+        assertTrue(new EnsResolver(new MockExecutor()).servesName("levvv.gno"));
+    }
+
+    @Test
+    void genomeOwnershipReadsTheGnoRegistrar() throws Exception {
+        var mock = new MockExecutor();
+        mock.respond(GNO_REGISTRY, gnoCall("owner(bytes32)", "levvv.gno"), encodeAddress(USER));
+        mock.respond(GNO_REGISTRY, gnoCall("resolver(bytes32)", "levvv.gno"), encodeAddress(PUBLIC_RESOLVER));
+        // Token id = labelhash, as on the .eth registrar (Blockscout's levvv.gno fixture:
+        // token 0x1a8247ca… = keccak256("levvv")).
+        assertEquals("1a8247ca2a4190d90c748b31fa6517e5560c1b7a680f03ff73dbbc3ed2c0ed66",
+                HexFormat.of().formatHex(Namehash.labelhash("levvv")));
+        mock.respond(GNO_REGISTRAR, registrarCall("ownerOf(uint256)", "levvv"), encodeAddress(USER));
+        mock.respond(GNO_REGISTRAR, registrarCall("nameExpires(uint256)", "levvv"), encodeUint(1_900_000_000L));
+        mock.respond(GNO_REGISTRAR, gracePeriodCall(), encodeUint(7_776_000L));
+
+        var o = EnsResolver.gnosisGenome(mock).resolveOwnership("levvv.gno", ctx()).get().orElseThrow();
+        assertEquals(USER, o.registrant());
+        assertEquals(USER, o.manager());
+        assertFalse(o.wrapped());
+        assertEquals(PUBLIC_RESOLVER, o.resolver());
+        assertEquals(1_900_000_000L, o.expiresAt());
+        assertEquals(7_776_000L, o.gracePeriod());
+    }
+
+    @Test
+    void genomeRefusesReverseResolution() {
+        var mock = new MockExecutor();
+        // Refused, not "no primary name" — and before any call.
+        var f = EnsResolver.gnosisGenome(mock).resolveName(VITALIK, ctx());
+        var cause = assertThrows(java.util.concurrent.ExecutionException.class, f::get).getCause();
+        assertTrue(cause instanceof UnsupportedOperationException, String.valueOf(cause));
+        assertEquals(EnsResolver.NO_GNO_REVERSE, cause.getMessage());
+        assertEquals(0, mock.callCount());
+    }
+
+    @Test
+    void refusalIsDecidedPerChainBeforeAnyState() {
+        assertNull(EnsResolver.refusal(1L, "vitalik.eth"));
+        assertNull(EnsResolver.refusal(1L, "levvv.gno"));   // ENS serves any name
+        assertNull(EnsResolver.refusal(1L, null));          // reverse on ENS
+        assertNull(EnsResolver.refusal(100L, "levvv.gno"));
+        assertEquals(EnsResolver.ONLY_GNO_NAMES, EnsResolver.refusal(100L, "vitalik.eth"));
+        assertEquals(EnsResolver.NO_GNO_REVERSE, EnsResolver.refusal(100L, null));
+    }
+
     // ---- Direct-path programming helpers ----------------------------------
 
     /** Program an exact-match legacy resolver: registry → resolver, supportsInterface=false, direct record call. */

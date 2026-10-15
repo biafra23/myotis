@@ -40,7 +40,8 @@ pub const NETWORKS: [NetworkInfo; 3] = [
         name: "gnosis",
         display_name: "Gnosis Chain",
         chain_id: 100,
-        has_ens: false,
+        // Genome's .gno names (myotis_evm `Namespace::for_chain(100)`).
+        has_ens: true,
         default_el_port: 30304,
         default_discv5_port: 9001,
         default_rpc_port: 8546,
