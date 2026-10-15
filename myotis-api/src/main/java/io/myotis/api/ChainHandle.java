@@ -162,8 +162,9 @@ public interface ChainHandle {
     VerifiedReads reads();
 
     /**
-     * The ENS resolution surface, or {@code null} when this network has no ENS
-     * registry (see {@link NetworkInfo#hasEns()}).
+     * The name resolution surface, or {@code null} when this network has no name
+     * registry (see {@link NetworkInfo#hasEns()}). ENS-shaped on every chain: on Gnosis
+     * it serves Genome's {@code .gno} names, and refuses any other name.
      */
     EnsApi ens();
 

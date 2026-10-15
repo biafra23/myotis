@@ -7,7 +7,8 @@ package io.myotis.api;
  * @param name              canonical lowercase name ({@code mainnet}, {@code gnosis}, …)
  * @param displayName       human-facing name ("Ethereum Mainnet", "Gnosis Chain", …)
  * @param chainId           the EVM chain id
- * @param hasEns            whether ENS resolution is available on this chain
+ * @param hasEns            whether name resolution ({@link EnsApi}) is available on this
+ *                          chain: ENS on mainnet/Sepolia, Genome {@code .gno} names on Gnosis
  * @param defaultElPort     default RLPx TCP + discv4 UDP port
  * @param defaultDiscv5Port default CL discv5 UDP port
  * @param defaultRpcPort    default verified JSON-RPC HTTP port

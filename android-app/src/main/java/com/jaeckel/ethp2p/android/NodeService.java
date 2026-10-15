@@ -2244,8 +2244,9 @@ public final class NodeService extends Service {
         noteUiActivity();
         final String trimmed = name == null ? "" : name.trim();
         final String n = canonicalNetwork(network);
-        // ENS is mainnet/Sepolia-only — refuse early so we never run ENS contracts against
-        // a chain that can't have them; the UI also hides the ENS path there.
+        // Names resolve only where the catalog says a registry exists (ENS on mainnet and
+        // Sepolia, Genome .gno on Gnosis) — refuse early elsewhere; the UI also hides the
+        // name path there.
         if (!networkInfo(n).hasEns()) {
             return CompletableFuture.completedFuture(new EnsResolution(
                     trimmed, null, -1, false, "ENS is not available on " + n, -1));

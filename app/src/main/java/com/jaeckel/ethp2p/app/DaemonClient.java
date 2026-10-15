@@ -114,7 +114,7 @@ public class DaemonClient {
                 yield "{\"cmd\":\"get-transactions\",\"address\":\"" + esc(args[1]) + "\"}";
             }
             case "resolve-ens" -> {
-                if (args.length < 2) throw new IllegalArgumentException("Usage: resolve-ens <name.eth>");
+                if (args.length < 2) throw new IllegalArgumentException("Usage: resolve-ens <name.eth|name.gno>");
                 yield "{\"cmd\":\"resolve-ens\",\"name\":\"" + esc(args[1]) + "\"}";
             }
             case "reverse-ens" -> {
@@ -123,34 +123,34 @@ public class DaemonClient {
             }
             case "resolve-ens-text" -> {
                 if (args.length < 3) throw new IllegalArgumentException(
-                    "Usage: resolve-ens-text <name.eth> <key>");
+                    "Usage: resolve-ens-text <name.eth|name.gno> <key>");
                 yield "{\"cmd\":\"resolve-ens-text\",\"name\":\"" + esc(args[1])
                     + "\",\"key\":\"" + esc(args[2]) + "\"}";
             }
             case "resolve-ens-contenthash" -> {
                 if (args.length < 2) throw new IllegalArgumentException(
-                    "Usage: resolve-ens-contenthash <name.eth>");
+                    "Usage: resolve-ens-contenthash <name.eth|name.gno>");
                 yield "{\"cmd\":\"resolve-ens-contenthash\",\"name\":\"" + esc(args[1]) + "\"}";
             }
             case "resolve-ens-ownership" -> {
                 if (args.length < 2) throw new IllegalArgumentException(
-                    "Usage: resolve-ens-ownership <name.eth>");
+                    "Usage: resolve-ens-ownership <name.eth|name.gno>");
                 yield "{\"cmd\":\"resolve-ens-ownership\",\"name\":\"" + esc(args[1]) + "\"}";
             }
             case "resolve-ens-addr-coin" -> {
                 if (args.length < 3) throw new IllegalArgumentException(
-                    "Usage: resolve-ens-addr-coin <name.eth> <coinType>");
+                    "Usage: resolve-ens-addr-coin <name.eth|name.gno> <coinType>");
                 yield "{\"cmd\":\"resolve-ens-addr-coin\",\"name\":\"" + esc(args[1])
                     + "\",\"coinType\":" + Long.parseLong(args[2]) + "}";
             }
             case "resolve-ens-pubkey" -> {
                 if (args.length < 2) throw new IllegalArgumentException(
-                    "Usage: resolve-ens-pubkey <name.eth>");
+                    "Usage: resolve-ens-pubkey <name.eth|name.gno>");
                 yield "{\"cmd\":\"resolve-ens-pubkey\",\"name\":\"" + esc(args[1]) + "\"}";
             }
             case "resolve-ens-abi" -> {
                 if (args.length < 2) throw new IllegalArgumentException(
-                    "Usage: resolve-ens-abi <name.eth> [contentTypes]");
+                    "Usage: resolve-ens-abi <name.eth|name.gno> [contentTypes]");
                 String json = "{\"cmd\":\"resolve-ens-abi\",\"name\":\"" + esc(args[1]) + "\"";
                 if (args.length > 2) {
                     json += ",\"contentTypes\":" + Long.parseLong(args[2]);
@@ -160,14 +160,14 @@ public class DaemonClient {
             }
             case "resolve-ens-dns" -> {
                 if (args.length < 4) throw new IllegalArgumentException(
-                    "Usage: resolve-ens-dns <name.eth> <dnsName> <resource>");
+                    "Usage: resolve-ens-dns <name.eth|name.gno> <dnsName> <resource>");
                 yield "{\"cmd\":\"resolve-ens-dns\",\"name\":\"" + esc(args[1])
                     + "\",\"dnsName\":\"" + esc(args[2])
                     + "\",\"resource\":" + Long.parseLong(args[3]) + "}";
             }
             case "resolve-ens-interface" -> {
                 if (args.length < 3) throw new IllegalArgumentException(
-                    "Usage: resolve-ens-interface <name.eth> <0xInterfaceId>");
+                    "Usage: resolve-ens-interface <name.eth|name.gno> <0xInterfaceId>");
                 yield "{\"cmd\":\"resolve-ens-interface\",\"name\":\"" + esc(args[1])
                     + "\",\"interfaceId\":\"" + esc(args[2]) + "\"}";
             }

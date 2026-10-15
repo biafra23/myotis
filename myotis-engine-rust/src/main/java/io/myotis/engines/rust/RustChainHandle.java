@@ -126,7 +126,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         this.rpcPort = rpcPort;
         this.httpGateway = httpGateway;
         this.rpc = rpc;
-        // Networks without ENS (e.g. gnosis) get no EnsApi — ens() returns null.
+        // Networks without a name service get no EnsApi — ens() returns null. (gnosis
+        // has one: Genome's .gno names, resolved by the same native walk.)
         this.ensApi = hasEns ? new RustEnsApi(this) : null;
         // Wake-on-request over the NATIVE lifecycle: the same primitive ChainStack
         // wires, so the two engines share the hold/single-flight semantics.
@@ -726,9 +727,9 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     // reads() is non-null once start() succeeded, null before.
     //
     // ens() serves every EnsApi record type via the native resolver, and is non-null
-    // only on ENS-capable networks: mainnet and Sepolia have a registry, gnosis has
-    // none, so hasEns is false there and ens() returns null per the ChainHandle
-    // contract. Every failure — a resolver fault, an offchain name CCIP could not be
+    // only on name-capable networks: mainnet and Sepolia have the ENS registry,
+    // gnosis Genome's .gno registry; a network without one has hasEns false and
+    // ens() null per the ChainHandle contract. Every failure — a resolver fault, an offchain name CCIP could not be
     // driven for, bad arguments, even not-running — lands in the record's error
     // field (RustEnsApi's documented divergence from JavaEnsApi, which throws for the
     // last two). The operator queries further down (getHeaders/getBlockVerified/
@@ -741,9 +742,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         return (rpc == null ? started : rpcStarted) ? verifiedReads : null;
     }
 
-    // Non-null only for ENS-capable networks (gnosis has no ENS registry — the
-    // ChainHandle contract returns null there). Assigned in the constructor since
-    // it depends on hasEns.
+    // Non-null only for name-capable networks (hasEns; the ChainHandle contract
+    // returns null elsewhere). Assigned in the constructor since it depends on hasEns.
     private final EnsApi ensApi;
 
     @Override public EnsApi ens() { return ensApi; }
