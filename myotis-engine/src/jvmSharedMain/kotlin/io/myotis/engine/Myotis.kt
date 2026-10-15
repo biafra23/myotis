@@ -23,6 +23,7 @@ import java.nio.file.Path
 object Myotis {
 
     /** True when `libmyotis_engine` loaded and passed the ABI handshake on this host. */
+    @JvmStatic
     fun isAvailable(): Boolean = RustMyotisEngine.isAvailable()
 
     /**
@@ -32,6 +33,7 @@ object Myotis {
      *
      * @throws EngineException when the native library is not available here
      */
+    @JvmStatic
     fun newEngine(): MyotisEngine = RustMyotisEngine()
 
     /**
@@ -40,22 +42,35 @@ object Myotis {
      * per-network file names of [io.myotis.engine.ports.NetworkFiles], the Myotis
      * apps' own), the CCIP-Read gateway over `HttpURLConnection`, and [dnsServers]
      * — the host's DNS servers for EIP-1459 resolution, which a mobile host must
-     * supply (null on a host whose system resolver the engine can use). One
-     * instance per `create()`; [DefaultEnginePorts.ports] is what `create()` takes,
-     * the caches stay reachable on it for a count or a wipe, and
-     * [DefaultEnginePorts.syncSnapshot] names the snapshot path for the
-     * [io.myotis.api.EngineConfig].
+     * supply (null on a host whose system resolver the engine can use).
+     * [DefaultEnginePorts.ports] is what [engine]'s `create()` takes; [network] is
+     * canonicalized through [engine] first, so an alias names the same files as the
+     * engine. One instance per `create()`.
      *
-     * @param network the canonical network name ([MyotisEngine.canonicalNetworkName])
+     * The Rust engine this library ships reads the DNS servers and the gateway from
+     * these ports and keeps its identity, peer caches and sync snapshot itself under
+     * the [io.myotis.api.EngineConfig]'s `dataDir`, in the same file names — pass one
+     * directory as both that `dataDir` and [cacheDir] and
+     * [DefaultEnginePorts.peerCacheFile] / [DefaultEnginePorts.syncSnapshot] name the
+     * files it writes. See [DefaultEnginePorts] for which engine reads which port.
      */
-    fun defaultPorts(keyDir: Path, cacheDir: Path, network: String, dnsServers: DnsServers? = null): DefaultEnginePorts =
-        DefaultEnginePorts.forNetwork(keyDir, cacheDir, network, dnsServers)
+    @JvmStatic
+    @JvmOverloads
+    fun defaultPorts(
+        engine: MyotisEngine,
+        keyDir: Path,
+        cacheDir: Path,
+        network: String,
+        dnsServers: DnsServers? = null,
+    ): DefaultEnginePorts =
+        DefaultEnginePorts.forNetwork(keyDir, cacheDir, engine.canonicalNetworkName(network), dnsServers)
 
     /**
      * Drain up to [max] buffered engine tracing lines (oldest first,
      * newline-joined; empty when idle or unavailable) into the host's own log
      * pipeline. Never throws.
      */
+    @JvmStatic
     fun drainLogs(max: Int): String = RustMyotisEngine.drainLogs(max)
 
     /**

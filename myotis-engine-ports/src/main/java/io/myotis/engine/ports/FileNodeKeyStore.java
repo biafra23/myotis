@@ -62,6 +62,8 @@ public final class FileNodeKeyStore implements NodeKeyStore {
                 sb.append(Character.forDigit((b >> 4) & 0xF, 16))
                   .append(Character.forDigit(b & 0xF, 16));
             }
+            Path parent = file.toAbsolutePath().getParent();
+            if (parent != null) Files.createDirectories(parent);
             Files.write(file, sb.toString().getBytes(StandardCharsets.UTF_8));
         } catch (Exception e) {
             throw new RuntimeException("failed to write node key " + file + ": " + e.getMessage(), e);

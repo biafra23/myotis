@@ -38,7 +38,8 @@ import org.junit.jupiter.api.Timeout;
  * call, and the JDK's works differently (it waits for a read in progress). Every test
  * gets a fresh client and fresh connections: upstream OkHttp lacks Android's patch that a
  * cancelled call never recovers, and retries one on a pooled connection forever. The
- * per-test timeout turns a gateway that hangs into a failure.
+ * per-test timeout turns a gateway that hangs into a failure — on a separate thread, as
+ * JUnit 4's did: interrupting the test thread does not unblock a socket read.
  */
 class UrlConnectionHttpGatewayTest {
 
@@ -126,14 +127,14 @@ class UrlConnectionHttpGatewayTest {
     }
 
     @Test
-    @Timeout(30)
+    @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     public void returnsA2xxBody() throws IOException {
         String url = serve((head, body, out) -> respond(out, 200, "{\"data\":\"0x01\"}".getBytes(UTF_8)));
         assertEquals("{\"data\":\"0x01\"}", gateway.request(Method.GET, url, null));
     }
 
     @Test
-    @Timeout(30)
+    @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     public void postsTheBodyAsJson() throws IOException {
         String url = serve((head, body, out) -> {
             boolean json = head.toLowerCase(Locale.ROOT).contains("content-type: application/json");
@@ -144,7 +145,7 @@ class UrlConnectionHttpGatewayTest {
     }
 
     @Test
-    @Timeout(30)
+    @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     public void aNon2xxStatusFails() throws IOException {
         String url = serve((head, body, out) -> respond(out, 404, "not here".getBytes(UTF_8)));
         RuntimeException e = failure(url);
@@ -152,7 +153,7 @@ class UrlConnectionHttpGatewayTest {
     }
 
     @Test
-    @Timeout(30)
+    @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     public void aRedirectIsFollowedAndTheDeadlineCoversTheNextHop() throws IOException {
         // The next hop is another server whose headers never come. Not followed, the
         // redirect would fail at once with its status rather than at the deadline.
@@ -167,7 +168,7 @@ class UrlConnectionHttpGatewayTest {
     }
 
     @Test
-    @Timeout(30)
+    @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     public void aBodyOverTheCapFails() throws IOException {
         String url = serve((head, body, out) -> respond(out, 200, filled(MAX_RESPONSE_BYTES + 1)));
         RuntimeException e = failure(url);
@@ -175,7 +176,7 @@ class UrlConnectionHttpGatewayTest {
     }
 
     @Test
-    @Timeout(30)
+    @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     public void aBodyThatNeverEndsFailsAtTheDeadlineAndClosesTheConnection()
             throws IOException, InterruptedException {
         // Headers at once, then a byte at a time: each read returns long before the read
@@ -202,7 +203,7 @@ class UrlConnectionHttpGatewayTest {
     }
 
     @Test
-    @Timeout(30)
+    @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     public void aBodyThatStopsFailsAtTheDeadline() throws IOException {
         // Headers, then nothing: no read returns, so only the disconnect can end it.
         String url = serve((head, body, out) -> {
@@ -218,7 +219,7 @@ class UrlConnectionHttpGatewayTest {
     }
 
     @Test
-    @Timeout(30)
+    @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     public void aDisconnectThatThrowsIsRepeated() throws IOException {
         // The watchdog's first disconnect throws: the repeat a second later must still end
         // a request whose headers never come, not leave it to the 15 s read timeout.
@@ -264,7 +265,7 @@ class UrlConnectionHttpGatewayTest {
     }
 
     @Test
-    @Timeout(30)
+    @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     public void headersThatNeverComeFailAtTheDeadline() throws IOException {
         String url = serve((head, body, out) -> Thread.sleep(60_000));
         long start = System.nanoTime();

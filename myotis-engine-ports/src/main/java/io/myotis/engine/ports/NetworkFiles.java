@@ -12,8 +12,12 @@ import java.util.Objects;
  * <p>Mainnet keeps the legacy suffix-less names ({@code nodekey.hex},
  * {@code peers.cache}); every other network gets {@code -<network>} before the
  * extension. {@code network} is the canonical name
- * ({@link io.myotis.api.MyotisEngine#canonicalNetworkName}): an alias would name a
- * second set of files.
+ * ({@link io.myotis.api.MyotisEngine#canonicalNetworkName}, lowercase letters and
+ * digits): the engine canonicalizes the name it is given, so a name in any other
+ * shape would silently name a second set of files — it is refused instead
+ * ({@link #suffix}). An alias the engine knows ({@code xdai} for gnosis) has that
+ * shape too and cannot be told apart here: canonicalize through the engine first
+ * (the engine library's {@code Myotis.defaultPorts} does).
  *
  * <p>Two directories, on purpose: the node key is identity and lives with the
  * host's durable files; the caches and the sync snapshot are reconstructible
@@ -47,10 +51,21 @@ public final class NetworkFiles {
         return Objects.requireNonNull(cacheDir, "cacheDir").resolve("sync-state" + suffix(network) + ".snapshot");
     }
 
-    /** The empty string for mainnet, {@code -<network>} otherwise. */
+    /**
+     * The empty string for mainnet, {@code -<network>} otherwise.
+     *
+     * @throws IllegalArgumentException for a name that is not in canonical shape
+     *                                  (lowercase ASCII letters and digits only)
+     */
     public static String suffix(String network) {
         Objects.requireNonNull(network, "network");
-        if (network.isEmpty()) throw new IllegalArgumentException("network name is empty");
+        if (!CANONICAL.matcher(network).matches()) {
+            throw new IllegalArgumentException("not a canonical network name: '" + network
+                    + "' (lowercase letters and digits, e.g. mainnet, gnosis, sepolia — "
+                    + "canonicalize through MyotisEngine.canonicalNetworkName first)");
+        }
         return network.equals("mainnet") ? "" : "-" + network;
     }
+
+    private static final java.util.regex.Pattern CANONICAL = java.util.regex.Pattern.compile("[a-z0-9]+");
 }

@@ -171,7 +171,7 @@ class MainnetEnsResolutionIT {
 
     /**
      * IT-only {@link CcipGateway} backed by {@code java.net.http.HttpClient}.
-     * Android has its own gateway, {@code AndroidCcipGateway} over
+     * Android uses the engine library's gateway, {@code io.myotis.engine.ports.UrlConnectionHttpGateway} over
      * {@code HttpURLConnection}; this one is fine for the JVM integration
      * test, which only runs on developer/CI machines, not on Android.
      */

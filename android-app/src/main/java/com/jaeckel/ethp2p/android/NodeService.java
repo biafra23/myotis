@@ -32,7 +32,6 @@ import io.myotis.engine.ports.NetworkFiles;
 import io.myotis.ui.CacheFileStats;
 
 import java.net.InetAddress;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;

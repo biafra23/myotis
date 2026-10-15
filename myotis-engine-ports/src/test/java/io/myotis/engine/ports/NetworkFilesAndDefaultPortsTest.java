@@ -31,6 +31,34 @@ class NetworkFilesAndDefaultPortsTest {
     }
 
     @Test
+    void aNameTheEngineWouldCanonicalizeIsRefusedNotGivenItsOwnFiles(@TempDir Path dir) {
+        // The engine turns "Mainnet" into mainnet and would read nodekey.hex; these
+        // would have named nodekey-Mainnet.hex. Applied or refused, never silently different.
+        assertThrows(IllegalArgumentException.class, () -> NetworkFiles.suffix("Mainnet"));
+        assertThrows(IllegalArgumentException.class, () -> NetworkFiles.suffix("main net"));
+        assertThrows(IllegalArgumentException.class,
+                () -> DefaultEnginePorts.forNetwork(dir, dir, "Gnosis", null));
+    }
+
+    @Test
+    void theDirectoriesAreCreatedOnAFreshInstall(@TempDir Path root) {
+        Path keys = root.resolve("a/keys");
+        Path caches = root.resolve("b/caches");
+        try (DefaultEnginePorts d = DefaultEnginePorts.forNetwork(keys, caches, "sepolia", null)) {
+            assertTrue(keys.toFile().isDirectory());
+            assertTrue(caches.toFile().isDirectory());
+            d.keyStore().store("sepolia", new byte[32]);
+            d.peerCache().add("1.2.3.4", 30303, "0xab", false);
+            d.clPeerCache().add("/ip4/1.2.3.4/tcp/9000/p2p/x");
+        }
+        assertTrue(keys.resolve("nodekey-sepolia.hex").toFile().isFile());
+        assertTrue(caches.resolve("peers-sepolia.cache").toFile().isFile(), "the EL cache's writer was drained by close()");
+        assertTrue(caches.resolve("cl-peers-sepolia.cache").toFile().isFile());
+        assertEquals(caches.resolve("peers-sepolia.cache"),
+                DefaultEnginePorts.forNetwork(keys, caches, "sepolia", null).peerCacheFile());
+    }
+
+    @Test
     void theDefaultsAreWiredToTheLayout(@TempDir Path keys, @TempDir Path caches) {
         List<String> dns = List.of("9.9.9.9");
         try (DefaultEnginePorts d = DefaultEnginePorts.forNetwork(keys, caches, "gnosis", () -> dns)) {
