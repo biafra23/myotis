@@ -47,7 +47,28 @@ pub const RECENT_HEADS: usize = 128;
 struct RecentHead {
     number: u64,
     hash: [u8; 32],
+    /// The head's parent block hash, proven with it (the light-client payload
+    /// header carries it; a resolved Gloas header is the one that hashes to the
+    /// proven block hash): the link [`ExecAnchor::optimistic_root_at`] follows
+    /// to tell an ancestor of the current head from a replaced sibling.
+    parent_hash: [u8; 32],
     state_root: [u8; 32],
+}
+
+/// One of the recent heads at a number, as [`ExecAnchor::recent_head_at`]
+/// finds it: the block that was the head there, its attested state root, and
+/// whether the ring itself links it to the current head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecentHeadAt {
+    pub hash: [u8; 32],
+    pub state_root: [u8; 32],
+    /// Every head between it and the current one is in the ring and each is
+    /// the proven parent of the one above it: the block IS an ancestor of the
+    /// current head, canonical with it. False past a break — a head the light
+    /// client skipped (a gap whose link cannot be checked here), or a head a
+    /// sibling chain replaced — where only a header window anchored at the
+    /// current head can say whether this block is still canonical.
+    pub linked: bool,
 }
 
 /// A BLS-attested `(slot, state_root)` pair in the fast-path window.
@@ -184,13 +205,15 @@ impl ExecAnchor {
     }
 
     /// Record the optimistic (attested) execution head (~1-2 slots behind wall
-    /// clock, vs ~2 epochs for finalized), with its execution timestamp. Also
+    /// clock, vs ~2 epochs for finalized), with its parent block hash and its
+    /// execution timestamp, all from the same proven payload header. Also
     /// appends to the window.
     pub fn update_optimistic(
         &self,
         optimistic_slot: u64,
         optimistic_block_number: u64,
         optimistic_block_hash: [u8; 32],
+        optimistic_parent_hash: [u8; 32],
         optimistic_state_root: [u8; 32],
         optimistic_timestamp: u64,
     ) {
@@ -200,6 +223,7 @@ impl ExecAnchor {
             optimistic_slot,
             optimistic_block_number,
             optimistic_block_hash,
+            optimistic_parent_hash,
             optimistic_state_root,
             optimistic_timestamp,
             Some(std::time::Instant::now()),
@@ -296,6 +320,7 @@ impl ExecAnchor {
             return false;
         }
         let (number, root, timestamp) = (header.header.number, header.header.state_root, header.header.timestamp);
+        let parent = header.header.parent_hash;
         let mut inner = self.inner.lock().expect("anchor mutex");
         let mut adopted = false;
         if let Some((slot, pending)) = inner.pending_finalized {
@@ -308,7 +333,7 @@ impl ExecAnchor {
         if let Some((slot, pending)) = inner.pending_optimistic {
             if pending == hash {
                 let learned = inner.pending_optimistic_noted;
-                set_optimistic(&mut inner, slot, number, hash, root, timestamp, learned);
+                set_optimistic(&mut inner, slot, number, hash, parent, root, timestamp, learned);
                 inner.pending_optimistic = None;
                 adopted = true;
             }
@@ -411,15 +436,36 @@ impl ExecAnchor {
             .map(|hash| (inner.optimistic_block_number, hash, inner.optimistic_slot))
     }
 
-    /// The state root of block `number` if it was one of the last
-    /// [`RECENT_HEADS`] optimistic heads this anchor held — attested for
-    /// exactly that block, by the update that made it the head. A head this
-    /// anchor later stepped back from (a reorg, a head that swung back) is
-    /// forgotten, so a block replaced at the same height is never answered
-    /// with the replaced block's root.
+    /// The state root of block `number` if one of the last [`RECENT_HEADS`]
+    /// optimistic heads this anchor held is the CANONICAL block at that number
+    /// — the current head, or an ancestor of it — attested for exactly that
+    /// block, by the update that made it the head.
+    ///
+    /// Canonical is checked, not assumed. The ring keeps a head until a later
+    /// head at or below its number replaces it, so a head replaced by a sibling
+    /// chain WITHOUT the head stepping back (11A, then 12B built on an 11B the
+    /// light client never reported) would otherwise stay and answer for 11 with
+    /// 11A's root — a proof the caller's check against block 11's stateRoot
+    /// rejects. So the ring is walked down from the current head through each
+    /// head's proven parent hash, and only a head that walk reaches counts; it
+    /// stops at the first break: a sibling (the parent hash is another block's)
+    /// or a gap (a head the light client skipped, whose link cannot be
+    /// checked), and nothing below a break is answered by number. Such a block
+    /// can still be named by its HASH ([`Self::attested_block_of`]), whose
+    /// root is that block's own whatever chain it is on, and a caller that can
+    /// fetch headers confirms it against the current head instead
+    /// ([`Self::recent_head_at`]).
     pub fn optimistic_root_at(&self, number: u64) -> Option<[u8; 32]> {
+        self.recent_head_at(number).filter(|h| h.linked).map(|h| h.state_root)
+    }
+
+    /// The recent head at `number`, linked or not ([`RecentHeadAt::linked`]):
+    /// for a caller that can confirm an unlinked one itself, against a header
+    /// window anchored at the current head, rather than refuse it — a gap in
+    /// the ring is a skipped light-client update far more often than a reorg.
+    pub fn recent_head_at(&self, number: u64) -> Option<RecentHeadAt> {
         let inner = self.inner.lock().expect("anchor mutex");
-        inner.recent_heads.iter().rev().find(|h| h.number == number).map(|h| h.state_root)
+        recent_head_at(&inner.recent_heads, number)
     }
 
     /// The block `hash` names as this anchor holds it attested — its number
@@ -520,11 +566,13 @@ fn set_finalized(
     push_root(&mut inner.known_roots, slot, state_root, true);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn set_optimistic(
     inner: &mut Inner,
     slot: u64,
     number: u64,
     hash: [u8; 32],
+    parent_hash: [u8; 32],
     state_root: [u8; 32],
     timestamp: u64,
     learned: Option<std::time::Instant>,
@@ -545,7 +593,27 @@ fn set_optimistic(
     inner.optimistic_state_root = Some(state_root);
     inner.optimistic_timestamp = timestamp;
     push_root(&mut inner.known_roots, slot, state_root, true);
-    remember_head(&mut inner.recent_heads, RecentHead { number, hash, state_root });
+    remember_head(&mut inner.recent_heads, RecentHead { number, hash, parent_hash, state_root });
+}
+
+/// [`ExecAnchor::recent_head_at`]'s walk: from the newest head in `heads` (the
+/// current one) down to `number`, noting whether every step is a proven parent
+/// link. The ring's numbers strictly ascend ([`remember_head`] drops every
+/// head at or above a new one), so each step is the next head down; one that
+/// is not the parent of the head above it — a sibling, or a gap — unlinks it
+/// and everything below it.
+fn recent_head_at(heads: &VecDeque<RecentHead>, number: u64) -> Option<RecentHeadAt> {
+    let mut walk = heads.iter().rev();
+    let mut child = walk.next()?;
+    let mut linked = true;
+    loop {
+        if child.number == number {
+            return Some(RecentHeadAt { hash: child.hash, state_root: child.state_root, linked });
+        }
+        let head = walk.next().filter(|h| h.number >= number)?;
+        linked &= head.number + 1 == child.number && head.hash == child.parent_hash;
+        child = head;
+    }
 }
 
 /// Append a head to [`Inner::recent_heads`] (a re-offered head is no new
@@ -614,28 +682,90 @@ mod tests {
         r
     }
 
+    /// The hash of head `n` on a chain of linked heads (`tag` tells chains apart).
+    fn head_hash(tag: u8, n: u64) -> [u8; 32] {
+        let mut h = root(tag);
+        h[1..9].copy_from_slice(&n.to_be_bytes());
+        h
+    }
+
+    /// Head `n` of chain `tag`, built on head `n - 1` of the same chain.
+    fn linked(anchor: &ExecAnchor, tag: u8, n: u64, state_root: [u8; 32]) {
+        anchor.update_optimistic(n, n, head_hash(tag, n), head_hash(tag, n - 1), state_root, 0);
+    }
+
     #[test]
     fn recent_heads_are_remembered_by_number_and_forgotten_on_a_step_back() {
         let anchor = ExecAnchor::new();
         assert_eq!(anchor.optimistic_root_at(10), None);
         for n in 10..=12u64 {
-            anchor.update_optimistic(n, n, root(n as u8), root(0x80 + n as u8), 0);
+            linked(&anchor, 0xa0, n, root(0x80 + n as u8));
             // Re-offered on every poll: still one entry.
-            anchor.update_optimistic(n, n, root(n as u8), root(0x80 + n as u8), 0);
+            linked(&anchor, 0xa0, n, root(0x80 + n as u8));
         }
         assert_eq!(anchor.optimistic_root_at(11), Some(root(0x8b)));
         assert_eq!(anchor.optimistic_root_at(12), Some(root(0x8c)));
-        // A reorg at 11: the replaced 11 and the 12 built on it are forgotten.
-        anchor.update_optimistic(13, 11, root(0x21), root(0x91), 0);
+        // A reorg at 11 (built on 10): the replaced 11 and the 12 built on it
+        // are forgotten, and 10 is still the new head's parent.
+        anchor.update_optimistic(13, 11, root(0x21), head_hash(0xa0, 10), root(0x91), 0);
         assert_eq!(anchor.optimistic_root_at(11), Some(root(0x91)));
         assert_eq!(anchor.optimistic_root_at(12), None);
         assert_eq!(anchor.optimistic_root_at(10), Some(root(0x8a)));
         // The window is capped, oldest first out.
+        anchor.update_optimistic(99, 99, head_hash(0xb0, 99), root(0x21), root(1), 0);
         for n in 100..100 + RECENT_HEADS as u64 {
-            anchor.update_optimistic(n, n, root(1), root(2), 0);
+            linked(&anchor, 0xb0, n, root(2));
         }
         assert_eq!(anchor.optimistic_root_at(10), None);
+        assert_eq!(anchor.optimistic_root_at(99), None);
         assert_eq!(anchor.optimistic_root_at(100), Some(root(2)));
+    }
+
+    #[test]
+    fn a_head_replaced_without_a_step_back_is_never_answered_by_number() {
+        let anchor = ExecAnchor::new();
+        for n in 10..=11u64 {
+            linked(&anchor, 0xa0, n, root(0x80 + n as u8));
+        }
+        // 12B arrives built on an 11B the light client never reported: 11A
+        // stays in the ring (nothing at or above 12 to drop), but it is not
+        // 12B's parent, so neither it nor anything below it answers by number.
+        anchor.update_optimistic(12, 12, head_hash(0xbb, 12), head_hash(0xbb, 11), root(0x9c), 0);
+        assert_eq!(anchor.optimistic_root_at(12), Some(root(0x9c)));
+        assert_eq!(anchor.optimistic_root_at(11), None);
+        assert_eq!(anchor.optimistic_root_at(10), None);
+        assert!(anchor.recent_head_at(11).is_some_and(|h| !h.linked && h.hash == head_hash(0xa0, 11)));
+        // By hash, 11A is still its own attested block, with its own root.
+        assert_eq!(anchor.attested_block_of(&head_hash(0xa0, 11)), Some((11, root(0x8b))));
+        // Once 11B is reported (a head stepping back to it), the chain links
+        // again from 11B up — and 12B, at its number, was dropped with it.
+        anchor.update_optimistic(13, 11, head_hash(0xbb, 11), head_hash(0xa0, 10), root(0x9b), 0);
+        assert_eq!(anchor.optimistic_root_at(11), Some(root(0x9b)));
+        assert_eq!(anchor.optimistic_root_at(10), Some(root(0x8a)));
+    }
+
+    #[test]
+    fn a_gap_in_the_heads_stops_the_walk_below_it() {
+        let anchor = ExecAnchor::new();
+        for n in 10..=11u64 {
+            linked(&anchor, 0xa0, n, root(0x80 + n as u8));
+        }
+        // 12 was never reported: 13's parent link cannot be checked against 11.
+        linked(&anchor, 0xa0, 13, root(0x8d));
+        linked(&anchor, 0xa0, 14, root(0x8e));
+        assert_eq!(anchor.optimistic_root_at(14), Some(root(0x8e)));
+        assert_eq!(anchor.optimistic_root_at(13), Some(root(0x8d)));
+        assert_eq!(anchor.optimistic_root_at(12), None);
+        assert_eq!(anchor.optimistic_root_at(11), None);
+        // A number above the head, or no head at all: nothing.
+        assert_eq!(anchor.optimistic_root_at(15), None);
+        assert_eq!(ExecAnchor::new().optimistic_root_at(14), None);
+        // Below the gap the heads are still there, marked unlinked, for a
+        // caller that can confirm them against a header window.
+        let unlinked = anchor.recent_head_at(11).expect("11 is in the ring");
+        assert_eq!((unlinked.hash, unlinked.state_root, unlinked.linked), (head_hash(0xa0, 11), root(0x8b), false));
+        assert!(anchor.recent_head_at(13).is_some_and(|h| h.linked));
+        assert_eq!(anchor.recent_head_at(12), None);
     }
 
     #[test]
@@ -643,14 +773,14 @@ mod tests {
         let anchor = ExecAnchor::new();
         assert_eq!(anchor.attested_block_of(&root(11)), None);
         for n in 10..=12u64 {
-            anchor.update_optimistic(n, n, root(n as u8), root(0x80 + n as u8), 0);
+            anchor.update_optimistic(n, n, root(n as u8), [0; 32], root(0x80 + n as u8), 0);
         }
         // The current head and a recent one: number and attested root together.
         assert_eq!(anchor.attested_block_of(&root(12)), Some((12, root(0x8c))));
         assert_eq!(anchor.attested_block_of(&root(11)), Some((11, root(0x8b))));
         // A reorg at 11: the replaced 11 and the 12 built on it are no longer
         // placed; the block that replaced 11 is, with its own root.
-        anchor.update_optimistic(13, 11, root(0x21), root(0x91), 0);
+        anchor.update_optimistic(13, 11, root(0x21), [0; 32], root(0x91), 0);
         assert_eq!(anchor.attested_block_of(&root(11)), None);
         assert_eq!(anchor.attested_block_of(&root(12)), None);
         assert_eq!(anchor.attested_block_of(&root(0x21)), Some((11, root(0x91))));
@@ -662,7 +792,7 @@ mod tests {
         for n in 100..100 + RECENT_HEADS as u64 {
             let mut h = root(0xa0);
             h[1..9].copy_from_slice(&n.to_be_bytes());
-            anchor.update_optimistic(n, n, h, root(2), 0);
+            anchor.update_optimistic(n, n, h, [0; 32], root(2), 0);
         }
         assert_eq!(anchor.attested_block_of(&root(10)), None);
         assert_eq!(anchor.attested_block_of(&root(0x55)), Some((5, root(0x70))));
@@ -693,7 +823,7 @@ mod tests {
 
         assert_eq!(anchor.optimistic_head(), None); // no optimistic update yet
         assert_eq!(anchor.optimistic_head_state(), None);
-        anchor.update_optimistic(102, 21_000_005, root(0xf2), root(2), 1_700_000_000);
+        anchor.update_optimistic(102, 21_000_005, root(0xf2), [0; 32], root(2), 1_700_000_000);
         // The head's root and age come with it, under the same lock (#531).
         let head = anchor.optimistic_head_state().expect("a head");
         assert_eq!((head.number, head.state_root, head.timestamp), (21_000_005, root(2), 1_700_000_000));
@@ -762,21 +892,21 @@ mod tests {
         // #531: the first head after a start is a restored snapshot's (fed
         // before any live update), so it carries no adoption time.
         let anchor = ExecAnchor::new();
-        anchor.update_optimistic(102, 21_000_005, root(0xf2), root(2), 1_700_000_000);
+        anchor.update_optimistic(102, 21_000_005, root(0xf2), [0; 32], root(2), 1_700_000_000);
         assert_eq!(anchor.optimistic_head_state().map(|h| h.adopted), Some(None));
         // A live head past it is adopted.
-        anchor.update_optimistic(103, 21_000_006, root(0xf3), root(3), 1_700_000_012);
+        anchor.update_optimistic(103, 21_000_006, root(0xf3), [0; 32], root(3), 1_700_000_012);
         let first = anchor.optimistic_head_state().and_then(|h| h.adopted).expect("adopted");
         // The light-client loop offers its head on every poll; the same block
         // again is no newer a head, so a stalled light client's head ages.
         std::thread::sleep(std::time::Duration::from_millis(5));
-        anchor.update_optimistic(104, 21_000_006, root(0xf3), root(3), 1_700_000_012);
+        anchor.update_optimistic(104, 21_000_006, root(0xf3), [0; 32], root(3), 1_700_000_012);
         assert_eq!(anchor.optimistic_head_state().and_then(|h| h.adopted), Some(first));
         // The next block is adopted anew; a step back (a reorg to an older
         // block, an older restore) is not adopted at all.
-        anchor.update_optimistic(105, 21_000_007, root(0xf4), root(4), 1_700_000_024);
+        anchor.update_optimistic(105, 21_000_007, root(0xf4), [0; 32], root(4), 1_700_000_024);
         assert!(anchor.optimistic_head_state().and_then(|h| h.adopted).is_some_and(|at| at > first));
-        anchor.update_optimistic(106, 21_000_006, root(0xf5), root(5), 1_700_000_012);
+        anchor.update_optimistic(106, 21_000_006, root(0xf5), [0; 32], root(5), 1_700_000_012);
         assert_eq!(anchor.optimistic_head_state().map(|h| h.adopted), Some(None));
     }
 
