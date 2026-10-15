@@ -84,12 +84,14 @@ Key Gradle modules:
   (`RustMyotisEngine`/`RustChainHandle`/`RustVerifiedReads`/`RustEnsApi`, the Tor
   seam): `rust/myotis-engine` over UniFFI-generated Kotlin bindings + JNA (committed
   in this module, regenerated via `uniffiGenerateKotlin`; compound values as JSON
-  pinned by golden tests both sides). Depends on nothing from the Java engine, so
-  it can ship alone — the engine library the desktop apps, the Android app and the
-  Android AAR consume (`:jsonrpc-server` is still a dependency; its removal is the
-  next part of `feature/android-aar`).
+  pinned by golden tests both sides). Meant to depend on nothing from the Java
+  engine, so it can ship alone as the engine library the desktop apps, the Android
+  app and the Android AAR consume. Not there yet: it still depends on
+  `:jsonrpc-server`, whose jvmMain pulls `:networking`/`:consensus`/`:myotis-evm`
+  in transitively — the next part of `feature/android-aar` turns the loopback
+  server into a port.
 - **myotis-engine-common** — the lifecycle primitives both engines' handles wire
-  (`WakeGate`, `SleepMetrics`); Java 17 over `:myotis-api` alone.
+  (`WakeGate`, `SleepMetrics`); Java 17 over `:myotis-api` and slf4j.
 - **myotis-api** — THE ENGINE CONTRACT: zero-dependency Java-17 interfaces
   (`io.myotis.api` + `io.myotis.api.ports`) every host consumes exclusively.
   FFI-portable types only (byte[], String, long, double[], enums, flat records;

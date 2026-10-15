@@ -28,7 +28,7 @@ ERC-3668.
 > now served over JSON-RPC; on the Java engine it runs through the same
 > `CcipReadEvmExecutor` (`rpc-backend`'s `VerifiedRpcBackend`). The Rust
 > engine reports an offchain answer to its host, which drives the gateway
-> round (`myotis-engines/src/main/java/io/myotis/engines/CcipDriver.java`).
+> round (`myotis-engine-rust/src/main/java/io/myotis/engines/rust/CcipDriver.java`).
 
 ## Acceptance criteria (from the original plan)
 

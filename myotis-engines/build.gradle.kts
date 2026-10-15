@@ -23,10 +23,12 @@ java {
 dependencies {
     // The contract this module selects implementations of.
     api(project(":myotis-api"))
-    // The Rust engine — `api`, because hosts reach its host-side seams (the Tor
-    // toggle, RustMyotisEngine.isAvailable) through this module's classpath; the
-    // documented host-UI exemptions in CLAUDE.md.
-    api(project(":myotis-engine-rust"))
+    // The Rust engine — the other selectable engine. `implementation`, like
+    // node-core: a host that uses the Rust engine's own host-side seam (the Tor
+    // toggle, a documented exemption in CLAUDE.md) declares :myotis-engine-rust
+    // itself, so the engine does not land on every host's compile classpath by
+    // way of the selector.
+    implementation(project(":myotis-engine-rust"))
     // The Java engine (JavaMyotisEngine) — the other selectable engine.
     implementation(project(":node-core"))
     implementation(libs.slf4j.api)

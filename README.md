@@ -1005,7 +1005,7 @@ Key Gradle modules (plus the `rust/` Cargo workspace):
 
 - **myotis-api** -- the engine contract: zero-dependency interfaces every host consumes exclusively
 - **myotis-engines** -- the engine selector (`Engines.engine()`; `myotis.engine=java|rust|auto`) routing to the Java engine or the Rust one
-- **myotis-engine-rust** -- the Rust engine behind the `:myotis-api` contract on its own, over the committed UniFFI Kotlin bindings + JNA (no Java-engine dependency)
+- **myotis-engine-rust** -- the Rust engine behind the `:myotis-api` contract on its own, over the committed UniFFI Kotlin bindings + JNA (its last Java-engine edge, `:jsonrpc-server`, goes in the next part of `feature/android-aar`)
 - **myotis-engine-common** -- `WakeGate` + `SleepMetrics`, the lifecycle primitives both engines' handles share
 - **node-core** -- the Java engine's adapters (`JavaMyotisEngine`/`JavaChainHandle`) plus the verification ladder over the modules below
 - **core** -- cryptographic identity (`NodeKey`), data types (`BlockHeader`), ENR decoding

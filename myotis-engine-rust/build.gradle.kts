@@ -2,13 +2,16 @@
 // RustMyotisEngine / RustChainHandle / RustVerifiedReads / RustEnsApi over the
 // COMMITTED UniFFI-generated Kotlin bindings (src/main/kotlin/uniffi/myotis_engine/,
 // regenerated via the root `uniffiGenerateKotlin` task) and JNA, plus the Tor seam.
-// It depends on NOTHING from the Java engine (node-core / networking / consensus /
-// Besu), which is what lets a library ship this engine alone: a consumer needs none
-// of the Java engine's Android build hacks (the Besu fork substitutions, the Guava
-// variant pin, the log4j shim) and boots on minSdk 29. Host composition roots keep
-// using the :myotis-engines selector; this module is what the selector routes
-// `rust`/`auto` to, and what the Kotlin Multiplatform engine library (the Android
-// AAR + the desktop jar) will wrap.
+// The goal is a module that depends on NOTHING from the Java engine (node-core /
+// networking / consensus / Besu), so that a library can ship this engine alone and a
+// consumer needs none of the Java engine's Android build hacks (the Besu fork
+// substitutions, the Guava variant pin, the log4j shim). NOT THERE YET: the direct
+// node-core dependency is gone (WakeGate/SleepMetrics live in :myotis-engine-common
+// now), but :jsonrpc-server below still pulls :networking, :consensus and
+// :myotis-evm (Besu) in transitively — the next part of feature/android-aar turns it
+// into a port. Host composition roots keep using the :myotis-engines selector; this
+// module is what the selector routes `rust`/`auto` to, and what the Kotlin
+// Multiplatform engine library (the Android AAR + the desktop jar) will wrap.
 
 plugins {
     `java-library`
@@ -48,11 +51,13 @@ dependencies {
     implementation(project(":myotis-engine-common"))
     // The shared JSON-RPC server (MyotisRpcServer/RpcRouter): the Rust engine self-
     // starts it over RustVerifiedReads, mirroring how the Java engine (node-core)
-    // self-starts it internally. STILL HERE: the Android library must not carry the
-    // loopback server (owner's request, 2026-10-15), so the next part turns this
-    // into a port the :myotis-engines selector supplies for the JVM hosts, and moves
-    // RpcBlockWindow (the serving-window policy RustVerifiedReads shares with the iOS
-    // backend) out of :jsonrpc-server.
+    // self-starts it internally. STILL HERE, and it is the one edge that still drags
+    // the Java engine's stack in (its jvmMain depends on :networking, :consensus and
+    // :myotis-evm). The library must not carry the loopback server (owner's request,
+    // 2026-10-15), so the next part turns this into a port the :myotis-engines
+    // selector supplies for the JVM hosts, and moves RpcBlockWindow (the
+    // serving-window policy RustVerifiedReads shares with the iOS backend) out of
+    // :jsonrpc-server.
     implementation(project(":jsonrpc-server"))
     // Android-safe minSdk-29 shims shared across the engine modules (core.encoding.Hex
     // for the FFI hex boundary — java.util.HexFormat is API 34; see CLAUDE.md).

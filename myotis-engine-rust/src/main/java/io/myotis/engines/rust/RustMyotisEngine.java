@@ -69,7 +69,15 @@ public final class RustMyotisEngine implements MyotisEngine {
         }
     }
 
-    /** @throws EngineException when libmyotis_engine is not available on this host */
+    /**
+     * Public because the selector ({@code :myotis-engines}) and the engine library
+     * construct it from other modules — the same standing as {@code JavaMyotisEngine}
+     * in node-core. Host composition roots still go through {@code Engines.engine()}
+     * (CLAUDE.md): a second instance built here is unknown to the selector's
+     * ownership routing.
+     *
+     * @throws EngineException when libmyotis_engine is not available on this host
+     */
     public RustMyotisEngine() {
         if (!RustEngineNative.isAvailable()) {
             throw new EngineException("libmyotis_engine is not available on this host");
@@ -86,6 +94,8 @@ public final class RustMyotisEngine implements MyotisEngine {
     /**
      * Parse the catalog JSON (a JSON array of camelCase NetworkInfo objects — the schema
      * pinned by rust/testdata/networks_catalog.json and the golden tests on both sides).
+     * Public for the selector module's golden test, which compares the parsed sample
+     * with the JAVA engine's catalog and so cannot live next to this parser.
      */
     public static List<NetworkInfo> parseNetworks(String json) {
         try {

@@ -350,7 +350,10 @@ dependencies {
     // Engine selector: NodeService.ENGINE is Engines.engine(); the Settings "Rust
     // engine" toggle drives it via NodeService.applyEngineChoice.
     implementation(project(":myotis-engines"))
-    // JNA (the UniFFI bindings' loader) arrives transitively via :myotis-engines
+    // The Rust engine's Tor seam (io.myotis.engines.rust.Tor — NodeService's Tor
+    // toggle, AndroidNodeBridge), a documented API-boundary exemption (CLAUDE.md).
+    implementation(project(":myotis-engine-rust"))
+    // JNA (the UniFFI bindings' loader) arrives transitively via :myotis-engine-rust
     // and Besu, supplying com.sun.jna.*. Its ANDROID natives are added separately
     // at the bottom of this file — see "JNA's Android natives". Do NOT also put
     // jna-<v>.aar on a classpath here: it carries the same classes and fails the

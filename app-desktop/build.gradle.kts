@@ -67,6 +67,9 @@ dependencies {
     implementation(project(":node-core"))
     // Engine selector: DesktopNodeController defaults to Engines.engine().
     implementation(project(":myotis-engines"))
+    // The Rust engine's Tor seam (io.myotis.engines.rust.Tor — DesktopNode.applyTorMode,
+    // Main's --tor flag), a documented API-boundary exemption (CLAUDE.md).
+    implementation(project(":myotis-engine-rust"))
     implementation(project(":app"))
     // TrueBlocks tx-history scan for the Query tab (documented API-boundary exemption:
     // it reaches the raw connector via SelectorEngine.javaDelegate().debugStack).
