@@ -16,6 +16,8 @@ import com.jaeckel.ethp2p.networking.eth.ForkWatch;
 import com.jaeckel.ethp2p.networking.eth.ServeStats;
 import com.jaeckel.ethp2p.networking.rlpx.RLPxConnector;
 import io.myotis.api.LifecycleState;
+import io.myotis.engines.common.SleepMetrics;
+import io.myotis.engines.common.WakeGate;
 import org.apache.tuweni.bytes.Bytes;
 import org.apache.tuweni.crypto.SECP256K1;
 import org.slf4j.Logger;

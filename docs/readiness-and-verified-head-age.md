@@ -238,7 +238,7 @@ the tag there (`-32602`) on every method (`VerifiedReads.supportsFinalizedTag`,
 - Rust sync states + criteria: `rust/myotis-net/src/sync.rs` (`sync_state_at`, `publish_status`)
 - Head age (Java): `rpc-backend/.../VerifiedRpcBackend.java`
   (`verifiedHeadAgeMs`, staleness constants `RPC_*_MS`)
-- Head age (Rust mapping): `myotis-engines/.../RustChainHandle.java` (`status()`)
+- Head age (Rust mapping): `myotis-engine-rust/.../RustChainHandle.java` (`status()`)
 - Readiness gate: `node-core/.../ChainStack.java` (`readyForReads`)
 - UI readiness ladder + 45 s threshold: `ui/.../Readiness.kt` (`readinessOf`,
   `READY_HEAD_WARM_MS`); the strip that paints it: `ui/.../NodeScreen.kt` (`ReadinessStrip`)

@@ -80,7 +80,7 @@ from typing import NamedTuple
 # the repo's own packages, this covers first-party code living under
 # foreign-looking prefixes: the hand-written log4j shims in android-app
 # (org.apache.logging.log4j.*) and the committed UniFFI-generated bindings in
-# :myotis-engines (uniffi.myotis_engine.*) — for generated code the wanted
+# :myotis-engine-rust (uniffi.myotis_engine.*) — for generated code the wanted
 # remediation is fix/regenerate, never an allowlist entry.
 FIRST_PARTY_PREFIXES = ("com/jaeckel/", "io/myotis/",
                         "org/apache/logging/log4j/", "uniffi/myotis_engine/")

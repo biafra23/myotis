@@ -43,7 +43,7 @@ The integration builds on three assets:
    > independently rather than by analogy to `:android-app`.
 
 1. **Android: RN-ready today.** The Rust engine ships behind the UniFFI
-   surface (`myotis-engines/.../RustEngineNative.java` over the generated
+   surface (`myotis-engine-rust/.../RustEngineNative.java` over the generated
    Kotlin bindings), so consumers on the published package build without a
    Rust toolchain. Compound values cross as JSON strings pinned by golden
    tests on both sides (`rust/testdata/networks_catalog.json`, the
@@ -92,7 +92,7 @@ is the only option — the JVM engine can never run there).
   Java-on-Android would mean permanent cross-engine divergence testing
   inside the RN layer.
 - The RN Android artifact stays tiny and clean: `:myotis-api` +
-  `:myotis-engines` + two `.so`s. Pulling `:node-core` into third-party RN
+  `:myotis-engine-rust` + two `.so`s. Pulling `:node-core` into third-party RN
   apps would export the entire dependency-hygiene problem `android-app`
   solved internally (Besu ART fork, single-Netty policy, BouncyCastle
   provider order, log4j shim, desugaring constraints).
@@ -106,7 +106,7 @@ is the only option — the JVM engine can never run there).
 
 RN iOS consumes `rust/include/myotis_engine.h` directly through a thin
 Swift marshalling layer — the Swift twin of `:app-ios`'s `RustEngine.kt`
-and `:myotis-engines`' minimal-json layer (JSON decode, error mapping,
+and `:myotis-engine-rust`'s minimal-json layer (JSON decode, error mapping,
 `myotis_string_free` discipline, pause/resume idempotency accounting as in
 `RustChainHandle.java`).
 
@@ -172,7 +172,7 @@ react-native-myotis/
   src/NativeMyotis.ts             # codegen spec
   src/index.ts                    # public TS API (engine/chain/reads/ens classes)
   android/                        # Kotlin Turbo Module + foreground service,
-                                  # AAR over :myotis-api + :myotis-engines + jniLibs
+                                  # AAR over :myotis-api + :myotis-engine-rust + jniLibs
   ios/                            # Swift Turbo Module over myotis_engine.h
   react-native-myotis.podspec     # vendors the prebuilt Rust library
 examples/rn-demo/                 # bare RN app used as the validation harness
@@ -235,7 +235,7 @@ examples/rn-demo/                 # bare RN app used as the validation harness
 ### Packaging
 
 - **Android**: an AAR bundling the Kotlin module, `:myotis-api` +
-  `:myotis-engines`, and the same jniLibs (arm64-v8a, x86_64; 16 KB
+  `:myotis-engine-rust`, and the same jniLibs (arm64-v8a, x86_64; 16 KB
   page-size alignment inherited from `rust/.cargo/config.toml` +
   `build-android.sh`). Build those `.so`s from source via `cargoNdkAndroid`
   at package-assembly time and bundle them into the AAR / npm tarball —
@@ -306,7 +306,7 @@ path is P0 → P2 → P3, with P1 parallel.
   JVM shim that replaced `jni_shim`),
   `src/host.rs` (the binding-neutral surface both shims share),
   `src/capi.rs` + `rust/include/myotis_engine.h` *(feat/ios-target)*
-- `myotis-engines/src/main/java/io/myotis/engines/` —
+- `myotis-engine-rust/src/main/java/io/myotis/engines/rust/` —
   `RustEngineNative.java`, `RustChainHandle.java` (the wrapper contract the
   Swift layer ports), `CcipDriver.java`
 - `app-ios/src/iosMain/kotlin/io/myotis/ios/RustEngine.kt`,

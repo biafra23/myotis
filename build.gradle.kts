@@ -546,7 +546,7 @@ tasks.register<Exec>("cargoBuildHost") {
     outputs.files(hostLibNames.map { file("$rustReleaseDir/$it") })
 }
 
-// Regenerate the UniFFI Kotlin bindings for the Rust engine into :myotis-engines'
+// Regenerate the UniFFI Kotlin bindings for the Rust engine into :myotis-engine-rust's
 // source tree. The generated file is COMMITTED (like the Android jniLibs) so
 // cargo-less machines still compile the pure-Java/Kotlin build; re-run this task
 // whenever rust/myotis-engine/src/ffi.rs changes shape. Library mode: bindgen
@@ -554,7 +554,7 @@ tasks.register<Exec>("cargoBuildHost") {
 // never disagree silently (UniFFI additionally checksum-verifies at load time).
 tasks.register<Exec>("uniffiGenerateKotlin") {
     group = "rust"
-    description = "Regenerate the committed UniFFI Kotlin bindings in :myotis-engines (self-skips without cargo)"
+    description = "Regenerate the committed UniFFI Kotlin bindings in :myotis-engine-rust (self-skips without cargo)"
     onlyIf { rustAvailable }
     dependsOn(tasks.named("cargoBuildHost"))
     workingDir = file("rust")
@@ -563,11 +563,11 @@ tasks.register<Exec>("uniffiGenerateKotlin") {
         rustTool("cargo"), "run", "--release", "-p", "uniffi-bindgen", "--",
         "generate", "--library", "$rustReleaseDir/${hostLibNames.last()}".removePrefix("rust/"),
         "--language", "kotlin", "--no-format",
-        "--out-dir", project(":myotis-engines").projectDir.resolve("src/main/kotlin").absolutePath,
+        "--out-dir", project(":myotis-engine-rust").projectDir.resolve("src/main/kotlin").absolutePath,
     )
     inputs.files(rustSources).withPathSensitivity(PathSensitivity.RELATIVE)
     inputs.property("cargoVersion", cargoVersion)
-    val bindingsFile = project(":myotis-engines").projectDir
+    val bindingsFile = project(":myotis-engine-rust").projectDir
         .resolve("src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt")
     outputs.files(bindingsFile)
     // UniFFI 0.32's Kotlin generator reads each u16 API checksum through a 32-bit
@@ -844,7 +844,7 @@ tasks.register("requireAndroidRustEngine") {
 val shippedAbis = listOf("arm64-v8a", "x86_64")
 val engineJniLibs = shippedAbis.map { file("android-app/src/main/jniLibs/$it/libmyotis_engine.so") }
 val blsJniLibs = shippedAbis.map { file("android-app/src/main/jniLibs/$it/libmyotis_bls.so") }
-val committedBindings = project(":myotis-engines").projectDir
+val committedBindings = project(":myotis-engine-rust").projectDir
     .resolve("src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt")
 tasks.register("verifyAndroidJniLibs") {
     group = "verification"

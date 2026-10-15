@@ -6,6 +6,7 @@ import io.myotis.api.EngineException;
 import io.myotis.api.MyotisEngine;
 import io.myotis.api.NetworkInfo;
 import io.myotis.api.ports.EnginePorts;
+import io.myotis.engines.rust.RustMyotisEngine;
 import io.myotis.node.api.JavaMyotisEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;

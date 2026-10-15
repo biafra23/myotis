@@ -1,6 +1,7 @@
 package io.myotis.engines;
 
 import io.myotis.api.NetworkInfo;
+import io.myotis.engines.rust.RustMyotisEngine;
 import io.myotis.node.api.JavaMyotisEngine;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.junit.jupiter.api.BeforeAll;

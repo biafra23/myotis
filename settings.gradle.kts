@@ -87,4 +87,4 @@ dependencyResolutionManagement {
     }
 }
 
-include("core", "networking", "consensus", "app", "android-app", "myotis-evm", "myotis-ens", "jsonrpc-server", "rpc-backend", "node-core", "ui", "app-desktop", "app-ios", "myotis-api", "myotis-engines", "tx-history")
+include("core", "networking", "consensus", "app", "android-app", "myotis-evm", "myotis-ens", "jsonrpc-server", "rpc-backend", "node-core", "ui", "app-desktop", "app-ios", "myotis-api", "myotis-engine-common", "myotis-engine-rust", "myotis-engines", "tx-history")

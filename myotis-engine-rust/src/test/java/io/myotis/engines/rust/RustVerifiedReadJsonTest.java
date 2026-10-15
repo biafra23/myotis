@@ -1,0 +1,887 @@
+package io.myotis.engines.rust;
+
+import io.myotis.api.AccountProofResult;
+import io.myotis.api.EngineException;
+import io.myotis.api.StorageProofResult;
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * The Java half of the EL verified-read JSON golden contract: parse the exact
+ * {@link AccountProofResult} / {@link StorageProofResult} shapes the Rust
+ * {@code eljson} module emits (pinned there by its {@code account_json_shape} /
+ * {@code storage_json_shape} tests) into the api records, and assert the
+ * mapping. Needs no native library — it exercises the JSON→record seam that
+ * {@link RustChainHandle} uses once {@code nativeRequestAccountJson} /
+ * {@code nativeGetStorageProofJson} return.
+ *
+ * <p>The values here mirror the Rust {@code eljson} sample (a headerChain-verified
+ * vitalik-style account), so the two sides are visibly parallel.
+ */
+class RustVerifiedReadJsonTest {
+
+    /** A headerChain-verified account (mirrors the Rust eljson sample_account). */
+    private static final String ACCOUNT_JSON =
+            "{\"address\":\"0xd8da6bf26964af9d7eed9e03e53415d37aa96045\","
+            + "\"exists\":true,\"nonce\":5898,\"balanceWei\":\"1000000000000000000\","
+            + "\"storageRootHex\":\"0x56e81f171bcac1a441cf3f1d5f0b8d5f0f3f0e5e5b5b5b5b5b5b5b5b5b5b5b5b5\","
+            + "\"codeHashHex\":\"0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470\","
+            + "\"blockNumber\":21000000,\"blockTimestamp\":1700000000,"
+            + "\"peerStateRootHex\":\"0x5555555555555555555555555555555555555555555555555555555555555555\","
+            + "\"peerProofValid\":true,\"beaconChainVerified\":true,\"blsVerified\":true,"
+            + "\"matchedBeaconSlot\":7000000,\"verifyMethod\":\"headerChain\",\"failReason\":null,"
+            + "\"accountHashHex\":\"0x2222222222222222222222222222222222222222222222222222222222222222\","
+            + "\"proofNodesHex\":[],\"beaconSynced\":true,"
+            + "\"finalizedPeriod\":1777,\"wallClockPeriod\":1795,"
+            + "\"finalizedBlockNumber\":20999000,\"optimisticBlockNumber\":21000010}";
+
+    @Test
+    void accountJsonMapsToRecord() {
+        AccountProofResult r = RustChainHandle.accountFromJson(
+                "0xd8da6bf26964af9d7eed9e03e53415d37aa96045", ACCOUNT_JSON);
+        assertEquals("0xd8da6bf26964af9d7eed9e03e53415d37aa96045", r.address());
+        assertTrue(r.exists());
+        assertEquals(5898L, r.nonce());
+        assertEquals("1000000000000000000", r.balanceWei());
+        assertEquals(21000000L, r.blockNumber());
+        assertTrue(r.peerProofValid());
+        assertTrue(r.beaconChainVerified());
+        assertTrue(r.blsVerified());
+        assertEquals(7000000L, r.matchedBeaconSlot());
+        // THE gate token.
+        assertEquals("headerChain", r.verifyMethod());
+        assertNull(r.failReason());
+        assertTrue(r.beaconSynced());
+        assertEquals(1777L, r.finalizedPeriod());
+        assertEquals(1795L, r.wallClockPeriod());
+        assertEquals(20999000L, r.finalizedBlockNumber());
+        assertEquals(21000010L, r.optimisticBlockNumber());
+        assertTrue(r.proofNodesHex().isEmpty());
+        // ABI 41: the proven block timestamp.
+        assertEquals(1700000000L, r.blockTimestamp());
+    }
+
+    @Test
+    void anUnprovenBlockTimestampIsMinusOne() {
+        // null: the engine proved no timestamp (a peer-head read); absent: an
+        // older literal. Either way the record says "none".
+        AccountProofResult nul = RustChainHandle.accountFromJson("0x0",
+                ACCOUNT_JSON.replace("\"blockTimestamp\":1700000000", "\"blockTimestamp\":null"));
+        assertEquals(-1L, nul.blockTimestamp());
+        AccountProofResult absent = RustChainHandle.accountFromJson("0x0",
+                ACCOUNT_JSON.replace("\"blockTimestamp\":1700000000,", ""));
+        assertEquals(-1L, absent.blockTimestamp());
+    }
+
+    @Test
+    void absentAccountUsesNegativeOneAndNull() {
+        String json = "{\"address\":\"0x0\",\"exists\":false,\"nonce\":-1,\"balanceWei\":null,"
+                + "\"beaconChainVerified\":false,\"verifyMethod\":null,\"failReason\":\"beaconNotSynced\","
+                + "\"matchedBeaconSlot\":-1,\"proofNodesHex\":[]}";
+        AccountProofResult r = RustChainHandle.accountFromJson("0x0", json);
+        assertFalse(r.exists());
+        assertEquals(-1L, r.nonce());
+        assertNull(r.balanceWei());
+    }
+
+    @Test
+    void verificationFailureIsAResultNotAnException() {
+        // beaconNotSynced is a VERDICT, not a transport error — it must parse to a
+        // record with failReason set, never throw.
+        String json = "{\"address\":\"0x0\",\"exists\":true,\"nonce\":0,\"balanceWei\":\"0\","
+                + "\"beaconChainVerified\":false,\"blsVerified\":false,\"verifyMethod\":null,"
+                + "\"failReason\":\"beaconNotSynced\",\"matchedBeaconSlot\":-1,\"proofNodesHex\":[]}";
+        AccountProofResult r = RustChainHandle.accountFromJson("0x0", json);
+        assertNull(r.verifyMethod());
+        assertEquals("beaconNotSynced", r.failReason());
+        assertFalse(r.beaconChainVerified());
+    }
+
+    @Test
+    void errorObjectBecomesEngineException() {
+        EngineException e = assertThrows(EngineException.class,
+                () -> RustChainHandle.accountFromJson("0x0", "{\"error\":\"no snap peer available\"}"));
+        assertTrue(e.getMessage().contains("no snap peer available"));
+    }
+
+    @Test
+    void structuredErrorValueStillBecomesEngineException() {
+        // A non-string error value must not leak a raw library exception.
+        assertThrows(EngineException.class, () -> RustChainHandle.accountFromJson(
+                "0x0", "{\"error\":{\"code\":-32000,\"message\":\"boom\"}}"));
+    }
+
+    @Test
+    void nullAndMalformedPayloadsThrow() {
+        assertThrows(EngineException.class, () -> RustChainHandle.accountFromJson("0x0", null));
+        assertThrows(EngineException.class, () -> RustChainHandle.accountFromJson("0x0", ""));
+        assertThrows(EngineException.class, () -> RustChainHandle.accountFromJson("0x0", "not json"));
+        // A non-object payload (e.g. a bare number) → EngineException, not a raw throw.
+        assertThrows(EngineException.class, () -> RustChainHandle.accountFromJson("0x0", "42"));
+    }
+
+    @Test
+    void driftedArrayFieldFailsClosed() {
+        // proofNodesHex present but not an array → EngineException (fail closed),
+        // NOT a silently-swallowed empty list.
+        String json = "{\"exists\":true,\"nonce\":0,\"proofNodesHex\":{\"unexpected\":true}}";
+        assertThrows(EngineException.class, () -> RustChainHandle.accountFromJson("0x0", json));
+    }
+
+    @Test
+    void typeMismatchedFieldBecomesEngineException() {
+        // Rust-side shape drift: a numeric field arrives as a string. The
+        // field-extraction must surface an EngineException, not a raw
+        // UnsupportedOperationException from the JSON library.
+        String json = "{\"exists\":true,\"nonce\":\"not-a-number\",\"proofNodesHex\":[]}";
+        assertThrows(EngineException.class, () -> RustChainHandle.accountFromJson("0x0", json));
+    }
+
+    /** A headerChain-verified storage slot (mirrors the Rust eljson storage sample). */
+    private static final String STORAGE_JSON =
+            "{\"addressHex\":\"0xC0\",\"slot\":3,\"holderHex\":null,"
+            + "\"storageKeyHex\":\"0x0000000000000000000000000000000000000000000000000000000000000003\","
+            + "\"storageKeyHashHex\":\"0x6666666666666666666666666666666666666666666666666666666666666666\","
+            + "\"exists\":true,\"valueHex\":\"0x2a\",\"valueDecimal\":\"42\",\"slotsReturned\":1,"
+            + "\"storageRootHex\":\"0x3333333333333333333333333333333333333333333333333333333333333333\","
+            + "\"proofNodesHex\":[],\"storageProofValid\":true,\"beaconSynced\":true,"
+            + "\"beaconChainVerified\":true,\"blsVerified\":true,\"matchedBeaconSlot\":7000000,"
+            + "\"verifyMethod\":\"headerChain\",\"failReason\":null,\"peerBlockNumber\":21000000,"
+            + "\"finalizedBlockNumber\":20999000,\"optimisticBlockNumber\":21000010,"
+            + "\"finalizedSlot\":14560000,\"optimisticSlot\":14560032,\"maxHeaderChainGap\":8192}";
+
+    @Test
+    void storageJsonMapsToRecord() {
+        StorageProofResult r = RustChainHandle.storageFromJson("0xC0", 3, STORAGE_JSON);
+        assertEquals("0xC0", r.addressHex());
+        assertEquals(3L, r.slot());
+        assertNull(r.holderHex());
+        assertTrue(r.exists());
+        assertEquals("0x2a", r.valueHex());
+        assertEquals("42", r.valueDecimal());
+        assertEquals(1, r.slotsReturned());
+        assertTrue(r.storageProofValid());
+        assertTrue(r.beaconChainVerified());
+        assertEquals("headerChain", r.verifyMethod());
+        assertNull(r.failReason());
+        assertEquals(21000000L, r.peerBlockNumber());
+        assertEquals(14560000L, r.finalizedSlot());
+        assertEquals(14560032L, r.optimisticSlot());
+        assertEquals(8192, r.maxHeaderChainGap());
+    }
+
+    @Test
+    void storageErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.storageFromJson("0x0", 1, "{\"error\":\"handle not started\"}"));
+    }
+
+    // ---- eth_getCode (codeFromJson) ----
+
+    /** A headerChain-verified contract (mirrors the Rust eljson code sample). */
+    private static final String CODE_JSON =
+            "{\"address\":\"0xC0\",\"exists\":true,\"codeHex\":\"0x60806040\","
+            + "\"codeHashHex\":\"0x4444444444444444444444444444444444444444444444444444444444444444\","
+            + "\"blockNumber\":21000000,\"beaconChainVerified\":true,\"blsVerified\":true,"
+            + "\"matchedBeaconSlot\":7000000,\"verifyMethod\":\"headerChain\",\"failReason\":null,"
+            + "\"beaconSynced\":true,\"finalizedPeriod\":1777,\"wallClockPeriod\":1795,"
+            + "\"finalizedBlockNumber\":20999000,\"optimisticBlockNumber\":21000010}";
+
+    @Test
+    void codeJsonMapsToVerifiedBytecode() {
+        assertArrayEquals(new byte[] {0x60, (byte) 0x80, 0x60, 0x40},
+                RustChainHandle.codeFromJson(CODE_JSON));
+    }
+
+    @Test
+    void emptyVerifiedCodeIsEmptyArray() {
+        // A verified EOA / empty-code account: codeHex "0x" → empty bytecode (not null).
+        String json = "{\"exists\":false,\"codeHex\":\"0x\",\"verifyMethod\":\"headerChain\"}";
+        assertArrayEquals(new byte[0], RustChainHandle.codeFromJson(json));
+    }
+
+    @Test
+    void unverifiedCodeIsNull() {
+        // No verdict (verifyMethod null) → can't answer verified → null (router -32000).
+        String json = "{\"exists\":true,\"codeHex\":\"0x6080\",\"verifyMethod\":null,"
+                + "\"failReason\":\"beaconNotSynced\"}";
+        assertNull(RustChainHandle.codeFromJson(json));
+    }
+
+    @Test
+    void codeErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.codeFromJson("{\"error\":\"no snap peer available\"}"));
+    }
+
+    // ---- eth_call (callResultFromJson) ----
+
+    @Test
+    void abi30CallEnvelopeKeysParseAndAreNotMistakenForData() {
+        // ABI 30 added blockNumber + verified to every call status (#465); the
+        // three-way mapping must read past them, and a finalized-block answer
+        // is still an ordinary ok/revert/unavailable to the API.
+        io.myotis.api.CallResult ok = RustChainHandle.callDetailedFromJson(
+                "{\"status\":\"ok\",\"resultHex\":\"0x2a\",\"blockNumber\":21000000,\"verified\":false}");
+        assertEquals(io.myotis.api.CallResult.Status.OK, ok.status());
+        assertArrayEquals(new byte[] {0x2a}, ok.data());
+        io.myotis.api.CallResult fin = RustChainHandle.callDetailedFromJson(
+                "{\"status\":\"revert\",\"dataHex\":\"0x08\",\"blockNumber\":20999936,\"verified\":true}");
+        assertEquals(io.myotis.api.CallResult.Status.REVERTED, fin.status());
+        assertArrayEquals(new byte[] {0x08}, fin.data());
+        io.myotis.api.CallResult un = RustChainHandle.callDetailedFromJson(
+                "{\"status\":\"unavailable\",\"reason\":\"state unavailable\","
+                + "\"blockNumber\":20999936,\"verified\":false}");
+        assertEquals(io.myotis.api.CallResult.Status.UNAVAILABLE, un.status());
+        assertNull(un.data());
+        assertEquals("state unavailable", un.detail());
+    }
+
+    @Test
+    void okCallReturnsResultBytes() {
+        String json = "{\"status\":\"ok\",\"resultHex\":\"0x00000000000000000000000000000000"
+                + "0000000000000000000000000000002a\"}";
+        byte[] out = RustChainHandle.callResultFromJson(json);
+        byte[] expected = new byte[32];
+        expected[31] = 0x2a;
+        assertArrayEquals(expected, out);
+    }
+
+    @Test
+    void emptyOkCallIsEmptyArray() {
+        // A call that returns no data (resultHex "0x") → empty bytes, not null.
+        assertArrayEquals(new byte[0],
+                RustChainHandle.callResultFromJson("{\"status\":\"ok\",\"resultHex\":\"0x\"}"));
+    }
+
+    @Test
+    void revertedCallIsNull() {
+        // The LEGACY two-state view stays null on a revert; the payload rides
+        // callDetailedFromJson (below) so the router can serve code 3.
+        String json = "{\"status\":\"revert\",\"dataHex\":\"0x08c379a0\"}";
+        assertNull(RustChainHandle.callResultFromJson(json));
+    }
+
+    @Test
+    void unavailableCallIsNull() {
+        assertNull(RustChainHandle.callResultFromJson(
+                "{\"status\":\"unavailable\",\"reason\":\"out of gas\"}"));
+    }
+
+    @Test
+    void detailedCall_okCarriesBytes() {
+        io.myotis.api.CallResult r = RustChainHandle.callDetailedFromJson(
+                "{\"status\":\"ok\",\"resultHex\":\"0x2a\"}");
+        org.junit.jupiter.api.Assertions.assertEquals(io.myotis.api.CallResult.Status.OK, r.status());
+        org.junit.jupiter.api.Assertions.assertArrayEquals(new byte[]{0x2a}, r.data());
+    }
+
+    @Test
+    void detailedCall_revertCarriesThePayload() {
+        // The whole point of the detailed seam: the revert is a VERIFIED answer
+        // and its payload must survive to the router's code-3 envelope.
+        io.myotis.api.CallResult r = RustChainHandle.callDetailedFromJson(
+                "{\"status\":\"revert\",\"dataHex\":\"0x08c379a0\"}");
+        org.junit.jupiter.api.Assertions.assertEquals(io.myotis.api.CallResult.Status.REVERTED, r.status());
+        org.junit.jupiter.api.Assertions.assertArrayEquals(
+                new byte[]{0x08, (byte) 0xc3, 0x79, (byte) 0xa0}, r.data());
+    }
+
+    @Test
+    void detailedCall_unavailableCarriesTheReason() {
+        io.myotis.api.CallResult r = RustChainHandle.callDetailedFromJson(
+                "{\"status\":\"unavailable\",\"reason\":\"no snap peer\"}");
+        org.junit.jupiter.api.Assertions.assertEquals(io.myotis.api.CallResult.Status.UNAVAILABLE, r.status());
+        org.junit.jupiter.api.Assertions.assertEquals("no snap peer", r.detail());
+    }
+
+    @Test
+    void detailedCall_infeasibleCarriesGethsMessage() {
+        // ABI 35 (#509): a transaction-object call that cannot succeed within the
+        // caller's gas, fee cap or funds is an ANSWER in geth's words, which the
+        // router serves verbatim as -32000 — shape pinned by eljson's call_json test.
+        io.myotis.api.CallResult r = RustChainHandle.callDetailedFromJson(
+                "{\"status\":\"infeasible\",\"reason\":\"intrinsic gas too low: have 20000, want 21000\","
+                + "\"blockNumber\":21000000,\"verified\":false}");
+        assertEquals(io.myotis.api.CallResult.Status.INFEASIBLE, r.status());
+        assertEquals("intrinsic gas too low: have 20000, want 21000", r.detail());
+        assertNull(r.data());
+        // The legacy two-state view reads it as no answer.
+        assertNull(RustChainHandle.callResultFromJson(
+                "{\"status\":\"infeasible\",\"reason\":\"out of gas\"}"));
+        // A reasonless one is shape drift: it must not become an answer.
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.callDetailedFromJson("{\"status\":\"infeasible\"}"));
+    }
+
+    @Test
+    void callErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.callResultFromJson("{\"error\":\"no snap peer available\"}"));
+    }
+
+    @Test
+    void callInvalidParamsEnvelopeIsAPermanentRefusal() {
+        // ABI 27: eth_call's permanent block refusal carries a JSON-RPC code
+        // (eljson::invalid_params_json, pinned there by invalid_params_json_shape);
+        // since ABI 33 an executor refusal uses the same envelope. CLAUDE.md
+        // requires a refusal to be PERMANENT (-32602), so it must reach the
+        // wallet as REFUSED (the router serves -32602), not as an error the
+        // adapter reads as UNAVAILABLE (the retryable -32000 a client spins on).
+        // The second key must not make it read as a result with no status either.
+        String json = "{\"error\":\"block \\\"0x1\\\" is too old\",\"code\":-32602}";
+        io.myotis.api.CallResult r = RustChainHandle.callDetailedFromJson(json);
+        assertEquals(io.myotis.api.CallResult.Status.REFUSED, r.status());
+        assertEquals("block \"0x1\" is too old", r.detail());
+        assertNull(r.data());
+        // The legacy two-state view has no refusal: null, like any non-ok outcome.
+        assertNull(RustChainHandle.callResultFromJson(json));
+        // Only -32602 is a refusal: an error with another code still throws
+        // (the adapter's retryable UNAVAILABLE), as a plain {"error"} does.
+        EngineException e = assertThrows(EngineException.class,
+                () -> RustChainHandle.callDetailedFromJson("{\"error\":\"busy\",\"code\":-32000}"));
+        assertEquals("busy", e.getMessage());
+    }
+
+    @Test
+    void estimateInvalidParamsEnvelopeIsAPermanentRefusal() {
+        // ABI 33: estimate_gas_json returns the same permanent envelope for an
+        // executor refusal (an Amsterdam block without EIP-7843's slot_number,
+        // eljson::estimate_json over GasOutcome::Refused). CLAUDE.md: a refusal
+        // is PERMANENT (-32602) — REFUSED, never the retryable UNAVAILABLE.
+        String why = "block 0x10 is an Amsterdam block without a slot number";
+        String json = "{\"error\":\"" + why + "\",\"code\":-32602}";
+        io.myotis.api.EstimateResult r = RustChainHandle.estimateGasDetailedFromJson(json);
+        assertEquals(io.myotis.api.EstimateResult.Status.REFUSED, r.status());
+        assertEquals(why, r.detail());
+        assertNull(r.revertData());
+        // A plain error envelope is still a failure to answer, not a refusal.
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.estimateGasDetailedFromJson("{\"error\":\"handle not started\"}"));
+    }
+
+    // ---- eth_estimateGas (estimateGasFromJson) ----
+
+    @Test
+    void okEstimateReturnsGasNumber() {
+        assertEquals(Long.valueOf(24_150L),
+                RustChainHandle.estimateGasFromJson("{\"status\":\"ok\",\"gas\":24150}"));
+    }
+
+    @Test
+    void detailedEstimate_okRevertsUnavailable() {
+        var ok = RustChainHandle.estimateGasDetailedFromJson("{\"status\":\"ok\",\"gas\":24150}");
+        org.junit.jupiter.api.Assertions.assertEquals(io.myotis.api.EstimateResult.Status.OK, ok.status());
+        org.junit.jupiter.api.Assertions.assertEquals(24150L, ok.gas());
+
+        // ABI v23: the revert carries its payload — a verified answer the router
+        // serves as code 3, not the retryable null.
+        var rv = RustChainHandle.estimateGasDetailedFromJson(
+                "{\"status\":\"revert\",\"dataHex\":\"0x08c379a0\"}");
+        org.junit.jupiter.api.Assertions.assertEquals(
+                io.myotis.api.EstimateResult.Status.REVERTED, rv.status());
+        org.junit.jupiter.api.Assertions.assertArrayEquals(
+                new byte[]{0x08, (byte) 0xc3, 0x79, (byte) 0xa0}, rv.revertData());
+
+        var un = RustChainHandle.estimateGasDetailedFromJson(
+                "{\"status\":\"unavailable\",\"reason\":\"no verified head\"}");
+        org.junit.jupiter.api.Assertions.assertEquals(
+                io.myotis.api.EstimateResult.Status.UNAVAILABLE, un.status());
+        org.junit.jupiter.api.Assertions.assertEquals("no verified head", un.detail());
+    }
+
+    @Test
+    void detailedEstimate_infeasibleCarriesGethsMessage() {
+        // ABI 34 (#509): the transaction does not fit the caller's gas or funds —
+        // an answer the router serves as geth does (-32000, this message verbatim).
+        var inf = RustChainHandle.estimateGasDetailedFromJson(
+                "{\"status\":\"infeasible\",\"reason\":\"gas required exceeds allowance (50000)\"}");
+        org.junit.jupiter.api.Assertions.assertEquals(
+                io.myotis.api.EstimateResult.Status.INFEASIBLE, inf.status());
+        org.junit.jupiter.api.Assertions.assertEquals("gas required exceeds allowance (50000)", inf.detail());
+        // The legacy two-state view has no number for it.
+        assertNull(RustChainHandle.estimateGasFromJson(
+                "{\"status\":\"infeasible\",\"reason\":\"insufficient funds for transfer\"}"));
+        // A reasonless one is native shape drift: fail closed.
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.estimateGasDetailedFromJson("{\"status\":\"infeasible\"}"));
+    }
+
+    @Test
+    void detailedEstimate_legacyViewStaysNullOnRevert() {
+        org.junit.jupiter.api.Assertions.assertNull(RustChainHandle.estimateGasFromJson(
+                "{\"status\":\"revert\",\"dataHex\":\"0x08c379a0\"}"));
+    }
+
+    @Test
+    void unavailableEstimateIsNull() {
+        assertNull(RustChainHandle.estimateGasFromJson(
+                "{\"status\":\"unavailable\",\"reason\":\"execution reverted\"}"));
+    }
+
+    @Test
+    void estimateErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.estimateGasFromJson("{\"error\":\"handle not started\"}"));
+    }
+
+    @Test
+    void okEstimateWithoutGasFailsClosed() {
+        // status=ok but no numeric gas is native shape drift → EngineException, not a
+        // silent null (which would masquerade as a legitimate "unavailable").
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.estimateGasFromJson("{\"status\":\"ok\"}"));
+    }
+
+    // ---- eth_createAccessList (accessListFromJson, ABI 40) ----
+
+    private static final String ACCESS_LIST_OK = "{\"status\":\"ok\",\"accessList\":[{\"address\":"
+            + "\"0x2222222222222222222222222222222222222222\",\"storageKeys\":"
+            + "[\"0x0000000000000000000000000000000000000000000000000000000000000001\"]},"
+            + "{\"address\":\"0x3333333333333333333333333333333333333333\",\"storageKeys\":[]}],"
+            + "\"gasUsed\":32437,\"blockNumber\":21000000,\"verified\":false}";
+
+    @Test
+    void accessList_okCarriesTheListVerbatimAndTheGasUsed() {
+        var r = RustChainHandle.accessListFromJson(ACCESS_LIST_OK);
+        assertEquals(io.myotis.api.AccessListResult.Status.OK, r.status());
+        assertEquals(32_437L, r.gasUsed());
+        // The list crosses as JSON, exactly as the JSON-RPC result carries it.
+        assertEquals("[{\"address\":\"0x2222222222222222222222222222222222222222\",\"storageKeys\":"
+                + "[\"0x0000000000000000000000000000000000000000000000000000000000000001\"]},"
+                + "{\"address\":\"0x3333333333333333333333333333333333333333\",\"storageKeys\":[]}]",
+                r.accessListJson());
+        assertNull(r.vmError());
+        assertNull(r.revertData());
+        assertNull(r.detail());
+    }
+
+    @Test
+    void accessList_theRunsOwnFailureRidesNextToTheList() {
+        // geth reports a revert or a halt in the result's `error` next to the
+        // list, never instead of it; the engine names it vmError, since a
+        // top-level error is its failure envelope (ABI 40).
+        var reverted = RustChainHandle.accessListFromJson(
+                "{\"status\":\"ok\",\"accessList\":[],\"gasUsed\":23105,"
+                + "\"vmError\":\"execution reverted\",\"revertDataHex\":\"0x08c379a0\","
+                + "\"blockNumber\":1,\"verified\":false}");
+        assertEquals(io.myotis.api.AccessListResult.Status.OK, reverted.status());
+        assertEquals("[]", reverted.accessListJson());
+        assertEquals(23_105L, reverted.gasUsed());
+        assertEquals("execution reverted", reverted.vmError());
+        assertArrayEquals(new byte[]{0x08, (byte) 0xc3, 0x79, (byte) 0xa0}, reverted.revertData());
+        var halted = RustChainHandle.accessListFromJson(
+                "{\"status\":\"ok\",\"accessList\":[],\"gasUsed\":100000,\"vmError\":\"out of gas\"}");
+        assertEquals("out of gas", halted.vmError());
+        assertNull(halted.revertData());
+    }
+
+    @Test
+    void accessList_infeasibleRefusedAndUnavailable() {
+        var inf = RustChainHandle.accessListFromJson(
+                "{\"status\":\"infeasible\",\"reason\":\"err: intrinsic gas too low: have 21000, want 21064 (supplied gas 21000)\"}");
+        assertEquals(io.myotis.api.AccessListResult.Status.INFEASIBLE, inf.status());
+        assertEquals("err: intrinsic gas too low: have 21000, want 21064 (supplied gas 21000)", inf.detail());
+        var refused = RustChainHandle.accessListFromJson("{\"error\":\"no slot number\",\"code\":-32602}");
+        assertEquals(io.myotis.api.AccessListResult.Status.REFUSED, refused.status());
+        assertEquals("no slot number", refused.detail());
+        var un = RustChainHandle.accessListFromJson("{\"status\":\"unavailable\",\"reason\":\"no peer\"}");
+        assertEquals(io.myotis.api.AccessListResult.Status.UNAVAILABLE, un.status());
+        assertEquals("no peer", un.detail());
+        // A plain error envelope is a failure to answer, never a refusal.
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.accessListFromJson("{\"error\":\"handle not started\"}"));
+    }
+
+    @Test
+    void accessList_okWithoutItsListOrGasFailsClosed() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.accessListFromJson("{\"status\":\"ok\",\"gasUsed\":1}"));
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.accessListFromJson("{\"status\":\"ok\",\"accessList\":[]}"));
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.accessListFromJson("{\"status\":\"infeasible\"}"));
+    }
+
+    // ---- resolve-ens (ensResolutionFromJson) ----
+
+    @Test
+    void okEnsResolutionCarriesAddressAndBlock() {
+        var r = RustChainHandle.ensResolutionFromJson("vitalik.eth",
+                "{\"status\":\"ok\",\"addressHex\":\"0xd8da6bf26964af9d7eed9e03e53415d37aa96045\","
+                + "\"blockNumber\":21000010,\"blockTimestamp\":1700000120}");
+        assertEquals("vitalik.eth", r.name());
+        assertEquals("0xd8da6bf26964af9d7eed9e03e53415d37aa96045", r.addressHex());
+        assertEquals(21000010L, r.blockNumber());
+        assertEquals(1700000120L, r.blockTimestamp());
+        assertNull(r.error());
+    }
+
+    @Test
+    void noRecordEnsResolutionIsSuccessfulNull() {
+        // API convention: addressHex==null && error==null = successful "no record".
+        var r = RustChainHandle.ensResolutionFromJson("nonexistent.eth",
+                "{\"status\":\"noRecord\",\"blockNumber\":21000010}");
+        assertNull(r.addressHex());
+        assertNull(r.error());
+        assertEquals(21000010L, r.blockNumber());
+        assertEquals(-1L, r.blockTimestamp(), "no blockTimestamp key reads as none");
+    }
+
+    @Test
+    void offchainEnsResolutionCarriesError() {
+        var r = RustChainHandle.ensResolutionFromJson("offchain.cb.id",
+                "{\"status\":\"offchain\",\"blockNumber\":21000010}");
+        assertNull(r.addressHex());
+        assertTrue(r.error().contains("offchain"));
+    }
+
+    @Test
+    void ensErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class, () -> RustChainHandle.ensResolutionFromJson(
+                "vitalik.eth", "{\"error\":\"no snap peer available\"}"));
+    }
+
+    @Test
+    void okEnsWithoutAddressFailsClosed() {
+        // status=ok without an addressHex is native shape drift -> EngineException,
+        // never a silent "no record" (same convention as okEstimateWithoutGasFailsClosed).
+        assertThrows(EngineException.class, () -> RustChainHandle.ensResolutionFromJson(
+                "vitalik.eth", "{\"status\":\"ok\",\"blockNumber\":21000010}"));
+    }
+
+    @Test
+    void ensWithoutBlockNumberFailsClosed() {
+        // blockNumber is part of the pinned shape for every status — missing = drift.
+        assertThrows(EngineException.class, () -> RustChainHandle.ensResolutionFromJson(
+                "vitalik.eth",
+                "{\"status\":\"ok\",\"addressHex\":\"0xd8da6bf26964af9d7eed9e03e53415d37aa96045\"}"));
+        assertThrows(EngineException.class, () -> RustChainHandle.ensResolutionFromJson(
+                "vitalik.eth", "{\"status\":\"noRecord\"}"));
+    }
+
+    @Test
+    void unknownEnsStatusFailsClosed() {
+        assertThrows(EngineException.class, () -> RustChainHandle.ensResolutionFromJson(
+                "vitalik.eth", "{\"status\":\"weird\"}"));
+    }
+
+    // ---- eth_getStorageAt (storageValueFromJson) ----
+
+    @Test
+    void storageValueLeftPadsToWord() {
+        // valueHex is the big-endian value (0x2a in STORAGE_JSON) → a full 32-byte word.
+        byte[] word = RustChainHandle.storageValueFromJson(STORAGE_JSON);
+        byte[] expected = new byte[32];
+        expected[31] = 0x2a;
+        assertArrayEquals(expected, word);
+    }
+
+    @Test
+    void unsetStorageSlotIsZeroWord() {
+        // A verified zero/unset slot: valueHex null → 32 zero bytes (eth_getStorageAt 0x0…0).
+        String json = "{\"exists\":false,\"valueHex\":null,\"verifyMethod\":\"headerChain\"}";
+        assertArrayEquals(new byte[32], RustChainHandle.storageValueFromJson(json));
+    }
+
+    @Test
+    void unverifiedStorageValueIsNull() {
+        String json = "{\"valueHex\":\"0x2a\",\"verifyMethod\":null,\"failReason\":\"beaconNotSynced\"}";
+        assertNull(RustChainHandle.storageValueFromJson(json));
+    }
+
+    // ---- eth_getBlockByNumber (blockJsonOrThrow) ----
+
+    @Test
+    void blockJsonPassesThroughObject() {
+        String block = "{\"number\":\"0x1406f40\",\"hash\":\"0x99\",\"transactions\":[],\"uncles\":[]}";
+        assertEquals(block, RustChainHandle.blockJsonOrThrow(block));
+    }
+
+    @Test
+    void blockNullLiteralIsVerifiedNotFound() {
+        // "null" (a verified future/unknown block) is returned as-is → the router
+        // emits a JSON null result (eth's unknown-block convention), not an error.
+        assertEquals("null", RustChainHandle.blockJsonOrThrow("null"));
+    }
+
+    @Test
+    void blockErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.blockJsonOrThrow("{\"error\":\"beacon not synced\"}"));
+    }
+
+    @Test
+    void blockBlankOrMalformedPayloadThrows() {
+        assertThrows(EngineException.class, () -> RustChainHandle.blockJsonOrThrow(null));
+        assertThrows(EngineException.class, () -> RustChainHandle.blockJsonOrThrow(""));
+        assertThrows(EngineException.class, () -> RustChainHandle.blockJsonOrThrow("not json"));
+    }
+
+    // ---- eth_getTransactionReceipt (receiptJsonOrThrow) ----
+
+    @Test
+    void receiptJsonPassesThroughObject() {
+        // The exact shape the Rust eljson::receipt_json emits (its
+        // receipt_json_shape_and_values test pins the other half of this golden):
+        // buildReceiptJson field order, minimal-hex QUANTITYs, block-global logIndex.
+        String receipt = "{\"transactionHash\":\"0x" + "a1".repeat(32) + "\""
+                + ",\"transactionIndex\":\"0x2\""
+                + ",\"blockHash\":\"0x" + "99".repeat(32) + "\""
+                + ",\"blockNumber\":\"0x1406f40\""
+                + ",\"cumulativeGasUsed\":\"0xf4240\""
+                + ",\"gasUsed\":\"0xc738\""
+                + ",\"from\":\"0x" + "cc".repeat(20) + "\""
+                + ",\"to\":\"0x" + "bb".repeat(20) + "\",\"contractAddress\":null"
+                + ",\"effectiveGasPrice\":\"0x2cb417800\""
+                + ",\"status\":\"0x1\",\"type\":\"0x2\""
+                + ",\"logsBloom\":\"0x" + "00".repeat(256) + "\""
+                + ",\"logs\":[{\"address\":\"0x" + "aa".repeat(20) + "\""
+                + ",\"topics\":[\"0x" + "11".repeat(32) + "\"],\"data\":\"0xdead\""
+                + ",\"blockNumber\":\"0x1406f40\",\"blockHash\":\"0x" + "99".repeat(32) + "\""
+                + ",\"transactionHash\":\"0x" + "a1".repeat(32) + "\""
+                + ",\"transactionIndex\":\"0x2\",\"logIndex\":\"0x7\",\"removed\":false}]}";
+        assertEquals(receipt, RustChainHandle.receiptJsonOrThrow(receipt));
+    }
+
+    @Test
+    void receiptNullLiteralIsVerifiedNotSeen() {
+        // "null" (a verified pending/unknown tx) passes through → the router emits
+        // a JSON null result (eth's receipt-not-available convention), not an error.
+        assertEquals("null", RustChainHandle.receiptJsonOrThrow("null"));
+    }
+
+    @Test
+    void receiptErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.receiptJsonOrThrow("{\"error\":\"no snap peer available\"}"));
+    }
+
+    @Test
+    void receiptBlankOrMalformedPayloadThrows() {
+        assertThrows(EngineException.class, () -> RustChainHandle.receiptJsonOrThrow(null));
+        assertThrows(EngineException.class, () -> RustChainHandle.receiptJsonOrThrow(""));
+        assertThrows(EngineException.class, () -> RustChainHandle.receiptJsonOrThrow("not json"));
+    }
+
+    // ---- eth_getBlockReceipts (blockReceiptsJsonOrThrow) ----
+
+    @Test
+    void blockReceiptsArrayPassesThrough() {
+        // The SUCCESS shape is a JSON ARRAY (each element the receipt-object
+        // shape the Rust eljson::block_receipts_json test pins).
+        String receipts = "[{\"transactionHash\":\"0x" + "a1".repeat(32)
+                + "\",\"transactionIndex\":\"0x0\",\"status\":\"0x1\"}]";
+        assertEquals(receipts, RustChainHandle.blockReceiptsJsonOrThrow(receipts));
+        assertEquals("[]", RustChainHandle.blockReceiptsJsonOrThrow("[]")); // empty block
+    }
+
+    @Test
+    void blockReceiptsNullLiteralIsVerifiedUnknownBlock() {
+        assertEquals("null", RustChainHandle.blockReceiptsJsonOrThrow("null"));
+    }
+
+    @Test
+    void blockReceiptsErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class, () -> RustChainHandle.blockReceiptsJsonOrThrow(
+                "{\"error\":\"no snap peer available\"}"));
+    }
+
+    @Test
+    void blockReceiptsUnexpectedShapesThrow() {
+        assertThrows(EngineException.class, () -> RustChainHandle.blockReceiptsJsonOrThrow(null));
+        assertThrows(EngineException.class, () -> RustChainHandle.blockReceiptsJsonOrThrow(""));
+        assertThrows(EngineException.class, () -> RustChainHandle.blockReceiptsJsonOrThrow("not json"));
+        // An object WITHOUT an error key is native shape drift, not a result.
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.blockReceiptsJsonOrThrow("{\"transactionHash\":\"0x11\"}"));
+    }
+
+    // ---- eth_getTransactionByHash (transactionJsonOrThrow) ----
+
+    @Test
+    void transactionJsonPassesThroughObject() {
+        // The exact shape the Rust eljson::tx_json emits (its
+        // tx_json_shape_and_values test pins the other half of this golden):
+        // buildTxJson field order, minimal-hex QUANTITYs, 32-byte DATA r/s.
+        String tx = "{\"hash\":\"0x" + "a1".repeat(32) + "\""
+                + ",\"blockHash\":\"0x" + "99".repeat(32) + "\""
+                + ",\"blockNumber\":\"0x1406f40\",\"transactionIndex\":\"0x2\""
+                + ",\"type\":\"0x2\",\"chainId\":\"0x1\",\"nonce\":\"0x5\""
+                + ",\"from\":\"0x" + "cc".repeat(20) + "\""
+                + ",\"to\":\"0x" + "bb".repeat(20) + "\""
+                + ",\"value\":\"0xde0b6b3a7640000\",\"gas\":\"0x15f90\""
+                + ",\"maxFeePerGas\":\"0xba43b7400\",\"maxPriorityFeePerGas\":\"0x77359400\""
+                + ",\"input\":\"0xa9059cbb\",\"v\":\"0x1\",\"yParity\":\"0x1\""
+                + ",\"r\":\"0x" + "11".repeat(32) + "\",\"s\":\"0x" + "22".repeat(32) + "\"}";
+        assertEquals(tx, RustChainHandle.transactionJsonOrThrow(tx));
+    }
+
+    @Test
+    void transactionNullLiteralIsVerifiedNotSeen() {
+        // "null" (a verified unknown/pending tx) passes through → the router
+        // emits a JSON null result, not an error.
+        assertEquals("null", RustChainHandle.transactionJsonOrThrow("null"));
+    }
+
+    @Test
+    void transactionErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class, () -> RustChainHandle.transactionJsonOrThrow(
+                "{\"error\":\"transaction located but its type cannot be decoded\"}"));
+    }
+
+    @Test
+    void transactionBlankOrMalformedPayloadThrows() {
+        assertThrows(EngineException.class, () -> RustChainHandle.transactionJsonOrThrow(null));
+        assertThrows(EngineException.class, () -> RustChainHandle.transactionJsonOrThrow(""));
+        assertThrows(EngineException.class, () -> RustChainHandle.transactionJsonOrThrow("not json"));
+    }
+
+    // ---- eth_feeHistory (feeHistoryJsonOrThrow) ----
+
+    @Test
+    void feeHistoryJsonPassesThroughObject() {
+        // The exact shape the Rust eljson::fee_history_json emits (its
+        // fee_history_json_shape_and_values test pins the other half of this
+        // golden): oldestBlock + hex QUANTITYs, raw JSON doubles, reward rows.
+        String feeHistory = "{\"oldestBlock\":\"0x1406f40\""
+                + ",\"baseFeePerGas\":[\"0x2540be400\",\"0x28fa6ae00\",\"0x2dfdc1c35\"]"
+                + ",\"gasUsedRatio\":[0.5,0.9932]"
+                + ",\"reward\":[[\"0x3b9aca00\",\"0x77359400\"],[\"0x0\",\"0xb2d05e00\"]]}";
+        assertEquals(feeHistory, RustChainHandle.feeHistoryJsonOrThrow(feeHistory));
+        // Without percentiles the reward key is absent — still a plain pass-through.
+        String noReward = "{\"oldestBlock\":\"0x1\",\"baseFeePerGas\":[\"0x0\",\"0x0\"]"
+                + ",\"gasUsedRatio\":[0.0,1.0]}";
+        assertEquals(noReward, RustChainHandle.feeHistoryJsonOrThrow(noReward));
+    }
+
+    @Test
+    void feeHistoryErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class, () -> RustChainHandle.feeHistoryJsonOrThrow(
+                "{\"error\":\"oldest block 20 is beyond the 512-block verify window\"}"));
+    }
+
+    @Test
+    void feeHistoryBlankOrMalformedPayloadThrows() {
+        assertThrows(EngineException.class, () -> RustChainHandle.feeHistoryJsonOrThrow(null));
+        assertThrows(EngineException.class, () -> RustChainHandle.feeHistoryJsonOrThrow(""));
+        assertThrows(EngineException.class, () -> RustChainHandle.feeHistoryJsonOrThrow("not json"));
+    }
+
+    // ---- eth_gasPrice / eth_maxPriorityFeePerGas (feeFromJson) ----
+
+    @Test
+    void feeJsonMapsToEstimate() {
+        RustChainHandle.FeeEstimate est = RustChainHandle.feeFromJson(
+                "{\"gasPriceWei\":\"12345678900\",\"maxPriorityFeePerGasWei\":\"1500000000\"}");
+        assertEquals("12345678900", est.gasPriceWei());
+        assertEquals("1500000000", est.maxPriorityFeePerGasWei());
+    }
+
+    @Test
+    void feeErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.feeFromJson("{\"error\":\"beacon not synced\"}"));
+    }
+
+    @Test
+    void feeMissingFieldThrows() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.feeFromJson("{\"gasPriceWei\":\"100\"}"));
+    }
+
+    // ---- eth_sendRawTransaction (txHashFromJson) ----
+
+    @Test
+    void txHashJsonMapsToHash() {
+        byte[] h = RustChainHandle.txHashFromJson("{\"txHash\":\"0x" + "ab".repeat(32) + "\"}");
+        byte[] expected = new byte[32];
+        java.util.Arrays.fill(expected, (byte) 0xab);
+        assertArrayEquals(expected, h);
+    }
+
+    @Test
+    void sendTxErrorObjectBecomesEngineException() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.txHashFromJson("{\"error\":\"no peer available to broadcast\"}"));
+    }
+
+    @Test
+    void sendTxMissingHashThrows() {
+        assertThrows(EngineException.class, () -> RustChainHandle.txHashFromJson("{}"));
+    }
+
+    @Test
+    void sendTxNon32ByteHashThrows() {
+        // A txHash that isn't exactly 32 bytes fails closed (contract: 32-byte hash).
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.txHashFromJson("{\"txHash\":\"0xdead\"}"));
+    }
+
+    // ---- eth_sendRawTransaction outcomes (sendResultFromJson, ABI 36, #531; ABI 44, #360) ----
+    // The Rust golden twin: eljson's a_send_is_a_hash_or_geths_refusal.
+
+    @Test
+    void theSendGateJsonIsARefusalOrLetsTheSendAnswer() {
+        // ABI 45: check_raw_transaction_json's three shapes, as sendGateRefusalOrNull
+        // reads them (its place before the wake wait is RustChainHandle's ordering).
+        assertEquals("invalid raw transaction: transaction type not supported (0x0)",
+                RustChainHandle.sendGateRefusalOrNull(
+                        "{\"error\":\"invalid raw transaction: transaction type not supported (0x0)\",\"code\":-32602}"));
+        assertNull(RustChainHandle.sendGateRefusalOrNull("{\"ok\":true}"));
+        assertNull(RustChainHandle.sendGateRefusalOrNull("{\"error\":\"invalid raw transaction hex\"}"));
+        assertNull(RustChainHandle.sendGateRefusalOrNull("not json"));
+    }
+
+    @Test
+    void sendTxOfBytesThatAreNoTransactionIsRefused() {
+        // ABI 44 (#360): the permanent envelope is REFUSED, which the router
+        // answers -32602 — not the retryable -32000 a plain {"error"} gets.
+        io.myotis.api.SendResult r = RustChainHandle.sendResultFromJson(
+                "{\"error\":\"invalid raw transaction: transaction type not supported (0x0)\",\"code\":-32602}");
+        assertEquals(io.myotis.api.SendResult.Status.REFUSED, r.status());
+        assertEquals("invalid raw transaction: transaction type not supported (0x0)", r.detail());
+        assertNull(r.txHash());
+        // A plain error stays an exception (→ UNAVAILABLE in RustVerifiedReads).
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.sendResultFromJson("{\"error\":\"no peer available\"}"));
+    }
+
+    @Test
+    void sendTxHashIsSent() {
+        io.myotis.api.SendResult r =
+                RustChainHandle.sendResultFromJson("{\"txHash\":\"0x" + "ab".repeat(32) + "\"}");
+        assertEquals(io.myotis.api.SendResult.Status.SENT, r.status());
+        assertEquals(32, r.txHash().length);
+    }
+
+    @Test
+    void sendTxRejectionIsGethsVerdictNotAHash() {
+        String reason = "insufficient funds for gas * price + value: balance 1, tx cost 2, overshot 1";
+        io.myotis.api.SendResult r = RustChainHandle.sendResultFromJson(
+                "{\"status\":\"rejected\",\"reason\":\"" + reason + "\"}");
+        assertEquals(io.myotis.api.SendResult.Status.REJECTED, r.status());
+        assertEquals(reason, r.detail());
+        assertNull(r.txHash());
+    }
+
+    @Test
+    void sendTxRejectionWithoutAReasonFailsClosed() {
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.sendResultFromJson("{\"status\":\"rejected\"}"));
+        assertThrows(EngineException.class,
+                () -> RustChainHandle.sendResultFromJson("{\"status\":\"rejected\",\"reason\":\" \"}"));
+    }
+
+    @Test
+    void sendTxErrorIsStillAnEngineException() {
+        assertThrows(EngineException.class, () -> RustChainHandle.sendResultFromJson(
+                "{\"error\":\"no peer available to broadcast the transaction\"}"));
+    }
+}

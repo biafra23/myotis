@@ -72,7 +72,7 @@ abstract class AppVersionSource : ValueSource<String, AppVersionSource.Params> {
      * that the Android build regenerates from source: the jniLibs .so files (now
      * gitignored, so already invisible to --untracked-files=no — kept in the
      * pathspec for intent) and the committed UniFFI bindings under
-     * myotis-engines/src/main/kotlin/uniffi. The Android build rebuilds the .so
+     * myotis-engine-rust/src/main/kotlin/uniffi. The Android build rebuilds the .so
      * (near-never byte-identical) and regenerates the .kt from source before
      * assembling; counting either would make every release APK label itself a dev
      * build. Untracked files are ignored, matching `describe --dirty`.
@@ -81,7 +81,7 @@ abstract class AppVersionSource : ValueSource<String, AppVersionSource.Params> {
         "status", "--porcelain", "--untracked-files=no",
         "--", ".",
         ":(exclude)android-app/src/main/jniLibs",
-        ":(exclude)myotis-engines/src/main/kotlin/uniffi",
+        ":(exclude)myotis-engine-rust/src/main/kotlin/uniffi",
     ).isNotEmpty()
 
     /** Newest RELEASED version reachable from HEAD, or null when none is. */
