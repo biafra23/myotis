@@ -98,8 +98,9 @@ makes the blocking call on the thread that called the `EnsApi` and re-enters via
 - **Desktop**: use the crate directly from the JVM via JNI/UniFFI-Kotlin, or ship the
   Rust daemon binary with the same UDS JSON-lines IPC.
 
-> *As built:* Android bundles `libmyotis_engine.so` (arm64-v8a, x86_64 — `cargoNdkAndroid` /
-> `rust/build-android.sh`) straight into the APK's jniLibs, no `.aar`; the UniFFI Kotlin is
+> *As built:* Android gets `libmyotis_engine.so` (arm64-v8a, x86_64 — `cargoNdkAndroid` /
+> `rust/build-android.sh`) through the `:myotis-engine` AAR's jniLibs (its androidMain; the
+> app has no jniLibs of its own), published as `eth.myotis:myotis-engine`; the UniFFI Kotlin is
 > committed in `:myotis-engine-rust`, whose `RustMyotisEngine` is the adapter onto `io.myotis.api`.
 > iOS took the plain C ABI instead of UniFFI Swift: `:app-ios` (Kotlin/Native cinterop; the
 > `MyotisKit` framework absorbs `libmyotis_engine.a`) for the app, and

@@ -348,8 +348,6 @@ subprojects {
 // publication each from their `java` component, sources jar included.
 val publishedArtifactIds = mapOf(
     "myotis-api" to "myotis-api",
-    // `core` is a name a consumer's dependency graph could meet elsewhere.
-    "core" to "myotis-core",
     "myotis-engine-common" to "myotis-engine-common",
     "myotis-engine-ports" to "myotis-engine-ports",
     "myotis-rpc-policy" to "myotis-rpc-policy",
@@ -358,7 +356,6 @@ val publishedArtifactIds = mapOf(
 )
 val publishedDescriptions = mapOf(
     "myotis-api" to "The Myotis engine contract: the zero-dependency Java 17 interfaces every host consumes",
-    "core" to "Myotis core types and the minSdk-29-safe JDK shims the engine modules share",
     "myotis-engine-common" to "The lifecycle primitives the Myotis engine handles wire (WakeGate, SleepMetrics)",
     "myotis-engine-ports" to "The Myotis engine library's default port actuals: node-key file, file-backed peer caches, HttpURLConnection CCIP gateway",
     "myotis-rpc-policy" to "The JSON-RPC serving policy (block window, web-page access) with no server attached",
@@ -386,7 +383,7 @@ configure(subprojects.filter { it.name in publishedArtifactIds }) {
 
     // The Kotlin Multiplatform plugin registers its publications itself (and
     // names them after the project, which these two already carry); the Java
-    // modules need theirs created, and `core` renamed. `java` is applied by the
+    // modules need theirs created. `java` is applied by the
     // subprojects block above, so the component exists here; `java-library` in
     // the module's own script extends the same component with `api`.
     if (name !in setOf("myotis-rpc-policy", "myotis-engine")) {

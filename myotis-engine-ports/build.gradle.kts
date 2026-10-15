@@ -32,6 +32,8 @@ tasks.withType<JavaCompile>().configureEach {
 dependencies {
     // The port interfaces these implement, and the flat records they return.
     api(project(":myotis-api"))
+    // Hex: the engine library's one strict codec, for the node-key file.
+    implementation(project(":myotis-engine-common"))
     implementation(libs.slf4j.api)
 
     testImplementation(platform(libs.junit.bom))

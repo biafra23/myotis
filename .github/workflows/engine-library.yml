@@ -29,7 +29,6 @@ on:
       - 'settings.gradle.kts'
       - 'gradle/**'
       - 'myotis-api/**'
-      - 'core/**'
       - 'myotis-engine-common/**'
       - 'myotis-engine-ports/**'
       - 'myotis-rpc-policy/**'

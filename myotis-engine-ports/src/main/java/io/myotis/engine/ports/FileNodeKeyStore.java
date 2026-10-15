@@ -1,6 +1,7 @@
 package io.myotis.engine.ports;
 
 import io.myotis.api.ports.NodeKeyStore;
+import io.myotis.engines.common.Hex;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -37,16 +38,9 @@ public final class FileNodeKeyStore implements NodeKeyStore {
         if (!Files.exists(file)) return null;
         try {
             String hex = new String(Files.readAllBytes(file), StandardCharsets.UTF_8).strip();
-            if (hex.startsWith("0x") || hex.startsWith("0X")) hex = hex.substring(2);
-            if (hex.length() % 2 != 0) throw new IllegalArgumentException("odd-length hex");
-            byte[] out = new byte[hex.length() / 2];
-            for (int i = 0; i < out.length; i++) {
-                int hi = Character.digit(hex.charAt(i * 2), 16);
-                int lo = Character.digit(hex.charAt(i * 2 + 1), 16);
-                if (hi < 0 || lo < 0) throw new IllegalArgumentException("non-hex character");
-                out[i] = (byte) ((hi << 4) | lo);
-            }
-            return out;
+            // The library's strict codec (ASCII digits only), the same one the Rust
+            // engine's FFI boundary parses with — not a second, laxer copy.
+            return Hex.parseHexPrefixed(hex);
         } catch (Exception e) {
             throw new RuntimeException("failed to read node key " + file + ": " + e.getMessage(), e);
         }
@@ -56,15 +50,10 @@ public final class FileNodeKeyStore implements NodeKeyStore {
     public void store(String networkName, byte[] secret32) {
         Path file = fileFor.apply(networkName);
         try {
-            StringBuilder sb = new StringBuilder(2 + secret32.length * 2);
-            sb.append("0x");
-            for (byte b : secret32) {
-                sb.append(Character.forDigit((b >> 4) & 0xF, 16))
-                  .append(Character.forDigit(b & 0xF, 16));
-            }
+            String hex = Hex.formatHexPrefixed(secret32);
             Path parent = file.toAbsolutePath().getParent();
             if (parent != null) Files.createDirectories(parent);
-            Files.write(file, sb.toString().getBytes(StandardCharsets.UTF_8));
+            Files.write(file, hex.getBytes(StandardCharsets.UTF_8));
         } catch (Exception e) {
             throw new RuntimeException("failed to write node key " + file + ": " + e.getMessage(), e);
         }

@@ -83,7 +83,8 @@ Key Gradle modules:
   Android AAR (the Myotis app and a separate wallet product) and the desktop jar.
   Published as `eth.myotis:myotis-engine` with its upstream modules (`myotis-api`,
   `myotis-engine-rust`, `myotis-engine-common`, `myotis-engine-ports`,
-  `myotis-rpc-policy`, `myotis-core`
+  `myotis-rpc-policy`; not `:core`, whose Tuweni + BouncyCastle would ride into
+  every consumer
   — the root build's `Publishing` section): GitHub Packages and the token-free
   `maven-repo` branch on every `v*` tag plus the AAR and a Maven-repository zip
   as release assets
@@ -171,7 +172,10 @@ Key Gradle modules:
   (node-core/networking/consensus types). Composition roots use the `:myotis-engines`
   selector (`Engines.engine()`; `myotis.engine=java|rust|auto`, default auto —
   `-Pengine=…` on run tasks), which routes to the Java engine (node-core) or the
-  Rust engine (rust/myotis-engine via UniFFI + JSON). Documented exemptions: the
+  Rust engine (rust/myotis-engine via UniFFI + JSON). The engine library's default
+  port actuals (`io.myotis.engine.ports`, `:myotis-engine-ports` — `Myotis.defaultPorts`)
+  are part of the library's public surface, not engine internals: a host may build its
+  `EnginePorts` from them, as the Android app does. Documented exemptions: the
   single `Engines.engine()` line at each composition root; the TrueBlocks
   transaction-history scan in `:tx-history` (`TxHistoryService` wraps the raw
   `RLPxConnector`; UNVERIFIED, Java-engine + mainnet only), consumed by the daemon's

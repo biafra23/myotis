@@ -333,7 +333,7 @@ final class RustEnsApi implements EnsApi {
             return new EnsInterfaceResult(name, null, null, -1, false,
                     "interfaceId must be exactly 4 bytes");
         }
-        String idHex = com.jaeckel.ethp2p.core.encoding.Hex.formatHexPrefixed(interfaceId4);
+        String idHex = io.myotis.engines.common.Hex.formatHexPrefixed(interfaceId4);
         if (name == null || name.isBlank()) {
             return new EnsInterfaceResult(name, idHex, null, -1, false, "empty ENS name");
         }

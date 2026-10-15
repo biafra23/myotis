@@ -8,8 +8,8 @@
 #
 #   - the closure is complete: every module the engine library's POMs reach is
 #     in the repository, at the one version, under its eth.myotis artifact id
-#     (a project dependency that published under `core` instead of
-#     `myotis-core` would resolve to nothing);
+#     (a project dependency on a module outside the set keeps the build's own
+#     group and would resolve to nothing);
 #   - the Android AAR carries the Rust engine for every shipped ABI
 #     (libmyotis_engine.so + libmyotis_bls.so) and JNA's dispatcher
 #     (libjnidispatch.so) next to it — an AAR missing one of them loads no
@@ -87,15 +87,20 @@ expect() { # <artifactId> <file suffix>
     local f="$group_dir/$1/$version/$1-$version$2"
     [ -s "$f" ] || err "missing or empty: ${f#$repo/}"
 }
-for a in myotis-api myotis-core myotis-engine-common myotis-engine-ports myotis-engine-rust; do
+for a in myotis-api myotis-engine-common myotis-engine-ports myotis-engine-rust; do
     expect "$a" .jar
     expect "$a" -sources.jar
 done
 expect myotis-rpc-policy-jvm .jar
+# The policy module's iOS variants: cross-compiled on the Linux runner and named
+# by the root module metadata, so a KMP consumer with an iOS target resolves them.
+expect myotis-rpc-policy-iosarm64 .klib
+expect myotis-rpc-policy-iossimulatorarm64 .klib
 expect myotis-engine-jvm .jar
 expect myotis-engine-android .aar
-for a in myotis-api myotis-core myotis-engine-common myotis-engine-ports myotis-engine-rust \
-         myotis-rpc-policy myotis-rpc-policy-jvm myotis-engine myotis-engine-jvm myotis-engine-android; do
+for a in myotis-api myotis-engine-common myotis-engine-ports myotis-engine-rust \
+         myotis-rpc-policy myotis-rpc-policy-jvm myotis-rpc-policy-iosarm64 myotis-rpc-policy-iossimulatorarm64 \
+         myotis-engine myotis-engine-jvm myotis-engine-android; do
     expect "$a" .pom
     expect "$a" .module
 done
@@ -106,7 +111,7 @@ done
 # the build's own group (com.jaeckel.ethp2p) in the POM — resolvable from no
 # repository, and the one shape a consumer would otherwise find only after
 # the version is on GitHub Packages.
-[ ! -e "$group_dir/core" ] || err "eth.myotis:core was staged — :core must publish as myotis-core"
+[ ! -e "$group_dir/core" ] && [ ! -e "$group_dir/myotis-core" ] || err ":core was staged — it is not part of the published set (Tuweni + BouncyCastle would ride into every consumer)"
 while IFS= read -r pom; do
     if grep -q '<groupId>com.jaeckel.ethp2p</groupId>' "$pom"; then
         err "${pom#$repo/} names com.jaeckel.ethp2p:* — a dependency on an unpublished project module leaked into the publication"

@@ -18,9 +18,9 @@ page describes what a consumer gets today.
 | `eth.myotis:myotis-engine:<version>` | the root: Gradle module metadata that picks `-android` for an Android consumer and `-jvm` for a desktop one |
 | `eth.myotis:myotis-engine-android:<version>` | the AAR: the Kotlin entry point, `libmyotis_engine.so` + `libmyotis_bls.so` for `arm64-v8a` and `x86_64`, JNA's `libjnidispatch.so` beside them |
 | `eth.myotis:myotis-engine-jvm:<version>` | the desktop jar (the host library is not inside it — see *Desktop* below) |
-| `eth.myotis:myotis-api` | the contract (`MyotisEngine`, `ChainHandle`, `VerifiedReads`, the ports) — the AAR's one `api` dependency, so it is on the consumer's compile classpath |
-| `eth.myotis:myotis-engine-ports` | the default port actuals (`io.myotis.engine.ports`: the node-key file, the file-backed peer caches, the CCIP-Read gateway, the per-network file layout) — the AAR's other `api` dependency, see *Using it* |
-| `eth.myotis:myotis-engine-rust`, `myotis-engine-common`, `myotis-rpc-policy`, `myotis-core` | implementation dependencies the POMs pull in; a consumer never names them |
+| `eth.myotis:myotis-api` | the contract (`MyotisEngine`, `ChainHandle`, `VerifiedReads`, the ports) — one of the AAR's two `api` dependencies, so it is on the consumer's compile classpath |
+| `eth.myotis:myotis-engine-ports` | the default port actuals (`io.myotis.engine.ports`: the node-key file, the file-backed peer caches, the CCIP-Read gateway, the per-network file layout) — the AAR's second `api` dependency, see *Using it* |
+| `eth.myotis:myotis-engine-rust`, `myotis-engine-common`, `myotis-rpc-policy` | implementation dependencies the POMs pull in; a consumer never names them. Nothing from the Java engine, and no Tuweni or BouncyCastle: the engine library's whole third-party graph is JNA, slf4j and minimal-json |
 
 `<version>` is the tag's: `v0.1.16` publishes `0.1.16`, a release-candidate
 or hotfix tag `v0.1.16-rc1` publishes `0.1.16-rc1`. Everything else the graph
@@ -119,7 +119,8 @@ consumer and for nothing else.
   whether it loaded.
 - **No listener.** Nothing binds a port. `ChainHandle.reads()` answers
   in-process once the handle is started; `rpcPort` in the status snapshot stays
-  0 and `setWebAccessPolicy` only normalizes and stores the policy.
+  0 and `setWebAccessPolicy` only normalizes and returns the policy — nothing stores
+  or judges it, and `recentWebOrigins()` stays empty.
 - **JNA is pinned.** The AAR carries `libjnidispatch.so` of one JNA version and
   its POM pins `net.java.dev.jna:jna` to that version with a *strict*
   constraint (Gradle: `strictly`). A graph that wants another JNA fails at

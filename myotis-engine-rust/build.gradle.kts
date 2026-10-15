@@ -73,9 +73,10 @@ dependencies {
     // definition shared with the JSON-RPC router and the iOS backend — and no
     // server with it (that is the whole point of the module).
     implementation(project(":myotis-rpc-policy"))
-    // Android-safe minSdk-29 shims shared across the engine modules (core.encoding.Hex
-    // for the FFI hex boundary — java.util.HexFormat is API 34; see CLAUDE.md).
-    implementation(project(":core"))
+    // No :core: its Hex was the one thing this module used, and :core carries
+    // Tuweni and BouncyCastle, which would ride into every consumer of the AAR.
+    // The FFI hex boundary uses io.myotis.engines.common.Hex instead (strict,
+    // minSdk-29-safe — java.util.HexFormat is API 34; see CLAUDE.md).
     implementation(libs.minimal.json)
     implementation(libs.slf4j.api)
     // The FFI layer under the UniFFI-generated Kotlin bindings. Plain JVM artifact
