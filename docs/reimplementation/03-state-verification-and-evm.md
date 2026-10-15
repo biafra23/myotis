@@ -311,11 +311,14 @@ only if it returns the original address).
 
 ### 7.5 Network coverage
 
-ENS is pinned for **mainnet (1)** and **sepolia (11155111)** only (`forChainId` still carries
+ENS is pinned for **mainnet (1)** and **sepolia (11155111)** (`forChainId` still carries
 Holesky's 17000 addresses — dead code since the network was retired and dropped from
-`NetworkConfig`). The factory
-keys on chain id and throws for chains without canonical ENS (e.g. Gnosis) — `NetworkConfig.hasEns()`
-gates the UI. Keep ENS off `NetworkConfig` so the ENS module doesn't depend on the networking stack.
+`NetworkConfig`). **Gnosis (100)** has no ENS; `forChainId(100)` is Genome's `.gno` tree
+(`EnsResolver.gnosisGenome` / Rust `Namespace::for_chain(100)`): a SPACE ID registry with the
+ENS interfaces whose names hash under a per-TLD root node instead of zero. It serves `.gno`
+names only and refuses reverse lookups (`EnsResolver.refusal` / `myotis_evm::ens::refusal`,
+checked before any state is read). The factory keys on chain id and throws for any other
+chain — `NetworkConfig.hasEns()` gates the UI. Keep ENS off `NetworkConfig` so the ENS module doesn't depend on the networking stack.
 
 ---
 

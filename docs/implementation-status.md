@@ -95,7 +95,7 @@ Every query takes a **resolution root**: Java `AUTO` (finalized first, peer head
 
 CCIP-Read end-to-end: `OffchainLookup` reverts caught by `CcipReadEvmExecutor` (Java) or returned to the host as the gateway tuple and re-entered via `ccipCallback` (Rust, driven by `CcipDriver` on the JVM hosts); the HTTP transport is the injectable `HttpGateway` port — `java.net.http` on the daemon and desktop (`JavaHttpCcipGateway`), `HttpURLConnection` on Android (`AndroidCcipGateway`); both cap the response at 1 MiB and the whole request at 15 s (on Android from the connect on: a stalled DNS lookup before it is bounded by the platform resolver). Validated against the EIP-3668 demo gateway and Coinbase IDs (`*.cb.id`). The Java engine can chain two CCIP rounds (an off-chain reverse then an off-chain forward); the Rust path allows one. **iOS has no CCIP-Read yet** — off-chain names report "resolves off-chain (CCIP-Read), which this app doesn't support yet".
 
-Network coverage: mainnet and Sepolia (`NetworkConfig.hasEns`); Gnosis has no ENS. (`EnsResolver.forChainId` still carries holesky's addresses, dead code since the network was retired.)
+Network coverage: mainnet and Sepolia (`NetworkConfig.hasEns`); on Gnosis, Genome's `.gno` names through the same resolver (forward records and ownership; reverse lookups are refused). (`EnsResolver.forChainId` still carries holesky's addresses, dead code since the network was retired.)
 
 Reverse resolution also names the log index's imported entries (verified reverse-ENS, Rust engine), so a generated index file cannot lie about who a contract is.
 

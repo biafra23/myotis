@@ -6846,6 +6846,10 @@ impl ElReader {
     }
 
     async fn resolve_ens_inner(&self, name: String, chain_id: u64) -> Result<EnsOutcome, String> {
+        // A name outside this chain's tree is refused before any state is read.
+        if let Some(refused) = myotis_evm::ens_refusal(chain_id, Some(&name)) {
+            return Err(refused.to_string());
+        }
         let (ctx, executor) = self.evm_setup(chain_id, "resolve-ens").await?;
         let (block_number, block_timestamp) = (ctx.block_number, ctx.timestamp);
         let walk = super::request::blocking(move || {
@@ -6881,6 +6885,12 @@ impl ElReader {
 
     async fn resolve_ens_query_with_budget(&self, query: EnsQuery, chain_id: u64,
         root: EnsRootMode, budget: std::time::Duration) -> Result<EnsQueryOutcome, String> {
+        // Refuse a query outside this chain's name tree (a non-.gno name, or a
+        // reverse lookup, on Gnosis) up front: no EVM setup, and no AUTO retry of
+        // an answer that cannot change with the root.
+        if let Some(refused) = myotis_evm::ens_refusal(chain_id, ens_query_name(&query)) {
+            return Err(refused.to_string());
+        }
         // One registered whole-query scope; AUTO's second attempt gets only
         // the remainder after the finalized attempt has cancelled and drained.
         let ladder = async {
@@ -10541,6 +10551,22 @@ fn next_base_fee_calc(base: u128, gas_limit: u64, gas_used: u64) -> u128 {
     }
 }
 
+/// The name an [`EnsQuery`] asks about; `None` for a reverse lookup.
+fn ens_query_name(query: &EnsQuery) -> Option<&str> {
+    match query {
+        EnsQuery::Addr { name }
+        | EnsQuery::Text { name, .. }
+        | EnsQuery::Contenthash { name }
+        | EnsQuery::Multicoin { name, .. }
+        | EnsQuery::Pubkey { name }
+        | EnsQuery::Abi { name, .. }
+        | EnsQuery::DnsRecord { name, .. }
+        | EnsQuery::Interface { name, .. }
+        | EnsQuery::Ownership { name } => Some(name),
+        EnsQuery::Reverse { .. } => None,
+    }
+}
+
 /// Dispatch one [`EnsQuery`] to its `myotis_evm::ens` resolver function,
 /// folding each typed answer into [`EnsRecordValue`]. Runs on a blocking
 /// thread (every step's oracle fetch bridges via `block_on`).
@@ -12176,6 +12202,9 @@ mod tests {
 
     struct ScriptedCaller(Vec<([u8; 20], Vec<u8>)>);
     impl myotis_evm::EthCaller for ScriptedCaller {
+        fn chain_id(&self) -> u64 {
+            1
+        }
         fn eth_call(
             &self,
             target: [u8; 20],

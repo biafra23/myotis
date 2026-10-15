@@ -84,4 +84,46 @@ public final class EnsAddresses {
      */
     public static final Address HOLESKY_UNIVERSAL_RESOLVER =
             Address.fromHex("0x9b37980C10bc0A31Bb61d740De46444853fe2359");
+
+    // ---- Gnosis Chain (chainId 100): Genome .gno names -------------------
+
+    /**
+     * The TLD Genome serves on Gnosis Chain. Genome is a SPACE ID deployment, an ENS
+     * fork: the same {@code owner/resolver(bytes32)} registry and resolver interfaces,
+     * but every name hashes under {@link #gnosisGenomeRoot()} rather than ENS's zero
+     * root, so a {@code .gno} name is NOT in the ENS tree — it resolves against
+     * Gnosis Chain state, read and verified by the Gnosis node like any other
+     * {@code eth_call}, with no mainnet involved.
+     *
+     * <p>Sources for the three pins: the {@code genome-subgraph} deployment and the
+     * {@code genome} protocol entry ({@code empty_label_hash}, {@code native_token_contract})
+     * in Blockscout's ENS service ({@code blockscout/blockscout-rs}, {@code blockscout-ens});
+     * eth.limo's gateway resolves {@code *.gno.limo} the same way, through SPACE ID's
+     * {@code @web3-name-sdk/core} ({@code tldNamehash}). The hashing scheme is checked
+     * against Blockscout fixtures in {@code EnsResolverTest}; the pins themselves are
+     * cross-checked on chain by {@code scripts/check_genome_pins.py} against a Gnosis
+     * node (the registrar's own {@code baseNode()} and {@code sidRegistry()} must equal
+     * them, and the registry must list the registrar as the {@code gno} node's owner).
+     */
+    public static final String GENOME_TLD = "gno";
+
+    /** Genome's SID registry on Gnosis Chain ({@code owner/resolver(bytes32)}). */
+    public static final Address GNOSIS_GENOME_REGISTRY =
+            Address.fromHex("0x5dC881dDA4e4a8d312be3544AD13118D1a04Cb17");
+
+    /** Genome's {@code .gno} registrar ("Base", ERC-721 of the second-level names, token
+     *  id = labelhash): {@code ownerOf}, {@code nameExpires}, {@code GRACE_PERIOD}, like
+     *  the {@code .eth} BaseRegistrar. */
+    public static final Address GNOSIS_GENOME_REGISTRAR =
+            Address.fromHex("0x942fcaf68a0c264d5447b03a2011b395a899f2d3");
+
+    /** The node every Genome name hashes under — {@code namehash("")} in that tree,
+     *  i.e. {@code keccak256(0x00…00 ‖ identifier)} for the {@code .gno} TLD's SPACE ID
+     *  identifier. {@code namehash("gno")} there is this, then {@code keccak256("gno")}. */
+    public static byte[] gnosisGenomeRoot() {
+        return com.jaeckel.ethp2p.core.encoding.Hex.parseHex(GNOSIS_GENOME_ROOT_HEX);
+    }
+
+    static final String GNOSIS_GENOME_ROOT_HEX =
+            "c4a8c56f9b0096f720f38bd557d30306dbd78f7751d277e05f062d1b85912a63";
 }

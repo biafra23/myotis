@@ -17,7 +17,16 @@ use super::EnsError;
 /// trailing empties). A trailing-dot name therefore lands on a node no real
 /// resolver serves → resolution fails safe with "no record" on both engines.
 pub fn namehash(name: &str) -> [u8; 32] {
-    let mut node = [0u8; 32];
+    namehash_from(&[0u8; 32], name)
+}
+
+/// The namehash of `name` in a tree whose EMPTY name hashes to `root` instead of
+/// 32 zero bytes — the same recurrence started at `root` (Java `Namehash.of(name,
+/// root)`). ENS is `root` = zero ([`namehash`]); a SPACE ID namespace such as
+/// Genome's `.gno` on Gnosis Chain roots every name under a per-TLD node
+/// (`keccak256(0x00…00 ‖ identifier)`).
+pub fn namehash_from(root: &[u8; 32], name: &str) -> [u8; 32] {
+    let mut node = *root;
     if name.is_empty() {
         return node;
     }
@@ -82,6 +91,30 @@ mod tests {
             namehash("vitalik.eth"),
             hex32("ee6c4522aab0003e8d14cd40a6af439055fd2577951148c14b6cea9a53475835")
         );
+    }
+
+    #[test]
+    fn namehash_from_a_tld_root() {
+        // Blockscout's ENS service (bens-logic) hashes "levvv.gno" under an
+        // empty-label hash of 0x6cbb… to 0x79e0… (its domain_name test), and
+        // Chiado Genome's root gives its levvv.gno fixture id 0xa350….
+        assert_eq!(
+            namehash_from(
+                &hex32("6cbb71e02aa156be31c9be2644cd7e3fe375b291d0786c825495af35fe98ee72"),
+                "levvv.gno"
+            ),
+            hex32("79e028f97b232b1600b2ed68cc7d9811c28595c3ab859b166d13980bcfcece9d")
+        );
+        assert_eq!(
+            namehash_from(
+                &hex32("1a13b687a5ff1d8ab1a9e189e1507a6abe834a9296cc8cff937905e3dee0c4f6"),
+                "levvv.gno"
+            ),
+            hex32("a3504cdec527495c69c760c85d5be9996252f853b91fd0df04c5b6aa2deb3347")
+        );
+        let root = [0x5au8; 32];
+        assert_eq!(namehash_from(&root, ""), root);
+        assert_eq!(namehash_from(&[0u8; 32], "vitalik.eth"), namehash("vitalik.eth"));
     }
 
     #[test]

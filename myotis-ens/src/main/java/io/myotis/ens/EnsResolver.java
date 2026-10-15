@@ -101,6 +101,14 @@ public final class EnsResolver {
      *  null = not known for this chain (ownership then stops at the registry). */
     private final Address baseRegistrar;
     private final Address nameWrapper;
+    /** {@code namehash("")} of this name tree: zero for ENS, a per-TLD node for a SPACE ID
+     *  namespace (Genome {@code .gno}). Every node this resolver computes starts here. */
+    private final byte[] rootNode;
+    /** The TLD whose second-level names {@link #baseRegistrar} registers ({@code eth}, {@code gno}). */
+    private final String registrarTld;
+    /** Non-null = the only TLD this resolver serves (Genome: {@code gno}); any other name is
+     *  refused instead of being hashed into a tree it does not belong to. Null = any (ENS). */
+    private final String requiredTld;
 
     /** Default constructor: the mainnet contracts. */
     public EnsResolver(EvmExecutor executor) {
@@ -123,11 +131,86 @@ public final class EnsResolver {
     /** With the chain's {@code .eth} registrar and NameWrapper, for {@link #resolveOwnership}. */
     public EnsResolver(EvmExecutor executor, Address registry, Address universalResolver,
                        Address baseRegistrar, Address nameWrapper) {
+        this(executor, registry, universalResolver, baseRegistrar, nameWrapper,
+                new byte[32], "eth", null);
+    }
+
+    private EnsResolver(EvmExecutor executor, Address registry, Address universalResolver,
+                        Address baseRegistrar, Address nameWrapper,
+                        byte[] rootNode, String registrarTld, String requiredTld) {
         this.executor = executor;
         this.registry = registry;
         this.universalResolver = universalResolver;
         this.baseRegistrar = baseRegistrar;
         this.nameWrapper = nameWrapper;
+        this.rootNode = rootNode.clone();
+        this.registrarTld = registrarTld;
+        this.requiredTld = requiredTld;
+    }
+
+    /**
+     * Genome's {@code .gno} names on Gnosis Chain (chainId 100): a SPACE ID registry with the
+     * ENS interfaces, rooted at {@link EnsAddresses#gnosisGenomeRoot()} instead of zero.
+     * Serves {@code .gno} names only — any other name is refused with an
+     * {@link IllegalArgumentException}, the same way a malformed name is. There is no
+     * NameWrapper; the registrar is Genome's {@code .gno} Base.
+     */
+    public static EnsResolver gnosisGenome(EvmExecutor executor) {
+        return new EnsResolver(executor, EnsAddresses.GNOSIS_GENOME_REGISTRY, null,
+                EnsAddresses.GNOSIS_GENOME_REGISTRAR, null,
+                EnsAddresses.gnosisGenomeRoot(), EnsAddresses.GENOME_TLD, EnsAddresses.GENOME_TLD);
+    }
+
+    /** The refusal for a non-{@code .gno} name on Gnosis Chain (Rust {@code ONLY_GNO_NAMES}). */
+    public static final String ONLY_GNO_NAMES = "only .gno names resolve on Gnosis Chain";
+    /** The refusal for a reverse lookup on Gnosis Chain (Rust {@code NO_GNO_REVERSE}). */
+    public static final String NO_GNO_REVERSE = "reverse resolution is not supported for .gno names";
+
+    /**
+     * Why a query on {@code chainId} is refused before any state is read, or null when it
+     * can be tried: a name outside the chain's tree ({@code name}), or a reverse lookup
+     * ({@code name} = null) where the tree has none — on Gnosis, anything but a forward
+     * {@code .gno} lookup. Callers check it first so a refused query costs no peer probe,
+     * no EVM setup and no AUTO retry. Rust twin: {@code myotis_evm::ens::refusal}.
+     */
+    public static String refusal(long chainId, String name) {
+        // Derived from the same forChainId table the resolution itself uses, so a tree
+        // added there is refused here by construction (the Rust twin reads
+        // Namespace::for_chain for both). The executor is never touched.
+        final EnsResolver tree;
+        try {
+            tree = forChainId(null, chainId);
+        } catch (IllegalArgumentException noTree) {
+            return null;   // no pinned tree: the caller reports that itself
+        }
+        if (tree.requiredTld == null) return null;
+        if (name == null) return NO_GNO_REVERSE;
+        return tree.servesName(name) ? null : ONLY_GNO_NAMES;
+    }
+
+    private static boolean servesUnderTld(String tld, String name) {
+        if (name == null) return false;
+        String n = name.toLowerCase(java.util.Locale.ROOT);
+        if (n.endsWith(".")) n = n.substring(0, n.length() - 1);
+        return n.endsWith("." + tld) && n.length() > tld.length() + 1;
+    }
+
+    /** Whether this resolver serves {@code name}: any name for ENS, only names under its
+     *  TLD for a single-TLD namespace (Genome: {@code x.gno}, one trailing root dot allowed). */
+    public boolean servesName(String name) {
+        return requiredTld == null || servesUnderTld(requiredTld, name);
+    }
+
+    /**
+     * The node of {@code name} in this resolver's tree. Throws {@link IllegalArgumentException}
+     * for a name outside a single-TLD namespace — a {@code vitalik.eth} hashed under the
+     * Genome root is not a name anyone registered, and "no record" would hide the mistake.
+     */
+    private byte[] node(String name) {
+        if (!servesName(name)) {
+            throw new IllegalArgumentException(ONLY_GNO_NAMES);
+        }
+        return Namehash.of(name, rootNode);
     }
 
     /**
@@ -142,7 +225,8 @@ public final class EnsResolver {
      * ENS module needs to remain Android-friendly and the networking
      * module pulls in Netty + discv5 transitively.
      *
-     * @param chainId EVM chain id: 1 = mainnet, 11155111 = sepolia,
+     * @param chainId EVM chain id: 1 = mainnet, 11155111 = sepolia, 100 = Gnosis Chain
+     *                (Genome {@code .gno} names, {@link #gnosisGenome}),
      *                17000 = holesky — dead code: the EF retired the network in
      *                Oct 2025, {@code NetworkConfig.byName} rejects it and
      *                {@code NetworkConfig.hasEns} never admits it, so no production
@@ -168,6 +252,9 @@ public final class EnsResolver {
                     EnsAddresses.HOLESKY_REGISTRY, EnsAddresses.HOLESKY_UNIVERSAL_RESOLVER,
                     EnsAddresses.BASE_REGISTRAR, null);
         }
+        if (chainId == 100L) {
+            return gnosisGenome(executor);
+        }
         throw new IllegalArgumentException("ENS not pinned for chain id " + chainId);
     }
 
@@ -184,7 +271,7 @@ public final class EnsResolver {
      * {@code CcipReadEvmExecutor} wrapper to catch.
      */
     public CompletableFuture<Optional<Address>> resolveAddress(String name, BlockContext blockContext) {
-        byte[] node = Namehash.of(name);
+        byte[] node = node(name);
         byte[] innerCall = AbiEncoder.encodeCall(ADDR, AbiEncoder.bytes32(node));
         return dispatchResolve(name, innerCall, blockContext, EnsResolver::decodeAddrResult);
     }
@@ -201,7 +288,7 @@ public final class EnsResolver {
      */
     public CompletableFuture<Optional<byte[]>> resolveMultiCoinAddress(
             String name, long coinType, BlockContext blockContext) {
-        byte[] node = Namehash.of(name);
+        byte[] node = node(name);
         byte[] innerCall = AbiEncoder.encodeCall(
                 ADDR_COIN, AbiEncoder.bytes32(node), AbiEncoder.uint256(coinType));
         return dispatchResolve(name, innerCall, blockContext, EnsResolver::decodeNonEmptyBytes);
@@ -215,7 +302,7 @@ public final class EnsResolver {
      */
     public CompletableFuture<Optional<String>> resolveText(
             String name, String key, BlockContext blockContext) {
-        byte[] node = Namehash.of(name);
+        byte[] node = node(name);
         byte[] innerCall = AbiEncoder.encodeCall(
                 TEXT, AbiEncoder.bytes32(node), AbiEncoder.string(key));
         return dispatchResolve(name, innerCall, blockContext, EnsResolver::decodeStringResult);
@@ -230,7 +317,7 @@ public final class EnsResolver {
      */
     public CompletableFuture<Optional<byte[]>> resolveContenthash(
             String name, BlockContext blockContext) {
-        byte[] node = Namehash.of(name);
+        byte[] node = node(name);
         byte[] innerCall = AbiEncoder.encodeCall(CONTENTHASH, AbiEncoder.bytes32(node));
         return dispatchResolve(name, innerCall, blockContext, EnsResolver::decodeNonEmptyBytes);
     }
@@ -243,7 +330,7 @@ public final class EnsResolver {
      */
     public CompletableFuture<Optional<Pubkey>> resolvePubkey(
             String name, BlockContext blockContext) {
-        byte[] node = Namehash.of(name);
+        byte[] node = node(name);
         byte[] innerCall = AbiEncoder.encodeCall(PUBKEY, AbiEncoder.bytes32(node));
         return dispatchResolve(name, innerCall, blockContext, EnsResolver::decodePubkeyResult);
     }
@@ -258,7 +345,7 @@ public final class EnsResolver {
      */
     public CompletableFuture<Optional<AbiRecord>> resolveAbi(
             String name, long contentTypes, BlockContext blockContext) {
-        byte[] node = Namehash.of(name);
+        byte[] node = node(name);
         byte[] innerCall = AbiEncoder.encodeCall(
                 ABI, AbiEncoder.bytes32(node), AbiEncoder.uint256(contentTypes));
         return dispatchResolve(name, innerCall, blockContext, EnsResolver::decodeAbiResult);
@@ -277,7 +364,7 @@ public final class EnsResolver {
      */
     public CompletableFuture<Optional<byte[]>> resolveDnsRecord(
             String name, byte[] dnsName, int resource, BlockContext blockContext) {
-        byte[] node = Namehash.of(name);
+        byte[] node = node(name);
         byte[] innerCall = AbiEncoder.encodeCall(
                 DNS_RECORD,
                 AbiEncoder.bytes32(node),
@@ -301,7 +388,7 @@ public final class EnsResolver {
         }
         byte[] padded = new byte[32];
         System.arraycopy(interfaceId, 0, padded, 0, 4);
-        byte[] node = Namehash.of(name);
+        byte[] node = node(name);
         byte[] innerCall = AbiEncoder.encodeCall(
                 INTERFACE_IMPLEMENTER,
                 AbiEncoder.bytes32(node),
@@ -324,6 +411,14 @@ public final class EnsResolver {
      * original address).
      */
     public CompletableFuture<Optional<String>> resolveName(Address address, BlockContext blockContext) {
+        if (requiredTld != null) {
+            // Genome keeps its reverse records in SPACE ID's own reverse scheme (an
+            // addr.reverse node read through tldName/name with the TLD's identifier),
+            // which this resolver does not implement. Refuse: "no primary name" would
+            // look like a real answer.
+            return com.jaeckel.ethp2p.core.concurrent.Futures.failedFuture(
+                    new UnsupportedOperationException(NO_GNO_REVERSE));
+        }
         byte[] reverseNode = Namehash.of(ReverseLookup.nameFor(address));
         return getReverseResolver(reverseNode, blockContext)
                 .thenCompose(resolver -> {
@@ -342,10 +437,11 @@ public final class EnsResolver {
 
     /**
      * Who holds {@code name}: the registry's {@code owner(node)} and {@code resolver(node)},
-     * then for a {@code .eth} second-level name the BaseRegistrar's {@code ownerOf},
-     * {@code nameExpires} and {@code GRACE_PERIOD}, each unwrapped through the chain's
-     * NameWrapper where it is the holder. Empty = nothing on chain for the name (no
-     * registry owner or resolver, no registrar token, no expiry). A reverting
+     * then for a second-level name of the registrar's TLD ({@code x.eth}; {@code x.gno} on
+     * Gnosis Chain, whose Genome registrar has the same interface) the registrar's
+     * {@code ownerOf}, {@code nameExpires} and {@code GRACE_PERIOD}, each unwrapped through
+     * the chain's NameWrapper where it is the holder (Gnosis has none). Empty = nothing
+     * on chain for the name (no registry owner or resolver, no registrar token, no expiry). A reverting
      * {@code ownerOf} (an expired or never registered token) is "no registrant", never a
      * failure; any other failure propagates. The name is validated and hashed exactly as
      * the record reads validate and hash it ({@link DnsEncoder#encode}, {@link Namehash#of}),
@@ -356,29 +452,34 @@ public final class EnsResolver {
         // The record reads' own validation (an empty label, more than one trailing dot)
         // and their node: Namehash.of lowercases as it hashes and keeps a trailing dot as
         // an empty label — so "x.eth." is the three-label node the records look at, not
-        // the 2LD's, and the registrar is asked only for a two-label .eth name.
+        // the 2LD's, and the registrar is asked only for a two-label name of its TLD.
         try {
             DnsEncoder.encode(name);
         } catch (IllegalArgumentException e) {
             return com.jaeckel.ethp2p.core.concurrent.Futures.failedFuture(e);
         }
         String[] labels = name.toLowerCase(java.util.Locale.ROOT).split("\\.", -1);
-        byte[] node = Namehash.of(name);
+        byte[] node;
+        try {
+            node = node(name);
+        } catch (IllegalArgumentException e) {
+            return com.jaeckel.ethp2p.core.concurrent.Futures.failedFuture(e);
+        }
         if (baseRegistrar == null) {
             return com.jaeckel.ethp2p.core.concurrent.Futures.failedFuture(
-                    new IllegalStateException("the .eth registrar is not pinned for this chain"));
+                    new IllegalStateException("the ." + registrarTld + " registrar is not pinned for this chain"));
         }
-        boolean secondLevelEth = labels.length == 2 && labels[1].equals("eth");
-        byte[] labelHash = secondLevelEth ? Namehash.labelhash(labels[0]) : null;
+        boolean secondLevel = labels.length == 2 && labels[1].equals(registrarTld);
+        byte[] labelHash = secondLevel ? Namehash.labelhash(labels[0]) : null;
 
         CompletableFuture<Optional<Address>> owner =
                 callAddress(registry, AbiEncoder.encodeCall(OWNER, AbiEncoder.bytes32(node)), ctx);
         CompletableFuture<Optional<Address>> resolver =
                 callAddress(registry, AbiEncoder.encodeCall(RESOLVER, AbiEncoder.bytes32(node)), ctx);
-        CompletableFuture<Optional<Address>> tokenOwner = secondLevelEth
+        CompletableFuture<Optional<Address>> tokenOwner = secondLevel
                 ? callAddress(baseRegistrar, AbiEncoder.encodeCall(OWNER_OF, AbiEncoder.bytes32(labelHash)), ctx)
                 : CompletableFuture.completedFuture(Optional.empty());
-        CompletableFuture<Optional<Long>> expires = secondLevelEth
+        CompletableFuture<Optional<Long>> expires = secondLevel
                 ? callUint(baseRegistrar, AbiEncoder.encodeCall(NAME_EXPIRES, AbiEncoder.bytes32(labelHash)), ctx)
                 : CompletableFuture.completedFuture(Optional.empty());
         CompletableFuture<Optional<Long>> grace = expires.thenCompose(e -> e.isPresent()
@@ -608,7 +709,7 @@ public final class EnsResolver {
     private CompletableFuture<Optional<Found>> walkResolver(String[] labels, int i, BlockContext ctx) {
         if (i >= labels.length) return CompletableFuture.completedFuture(Optional.empty());
         String suffix = String.join(".", java.util.Arrays.asList(labels).subList(i, labels.length));
-        byte[] node = Namehash.of(suffix);
+        byte[] node = Namehash.of(suffix, rootNode);
         byte[] calldata = AbiEncoder.encodeCall(RESOLVER, AbiEncoder.bytes32(node));
         return executor.callView(registry, calldata, ctx)
                 .handle((res, err) -> {

@@ -109,6 +109,21 @@ class QueryResultCardTest {
     }
 
     @Test
+    fun gnosisOffersGnoNamesAndRefusesOthersBeforeResolving() {
+        rule.mainClock.autoAdvance = false
+        rule.setContent {
+            NodeScreen(controller = Node(verified(), network = "gnosis"), settings = FakeSettings(network = "gnosis"), logs = NoTestLogs)
+        }
+        rule.pumpFrames()
+        rule.onNode(isSelectable() and hasText("Query")).performClick()
+        rule.pumpFrames()
+        rule.onNodeWithText("Address (0x…) or .gno name").performTextInput("vitalik.eth")
+        rule.pumpFrames()
+        rule.onNodeWithText("Look up").performClick()
+        rule.awaitText("Error: Only .gno names resolve on Gnosis Chain — enter a .gno name or a 0x address.")
+    }
+
+    @Test
     fun anUnverifiedGnosisBalanceIsAnXdaiClaim() {
         lookUp(
             Node(verified().copy(beaconChainVerified = false, blsVerified = false, verifyMethod = null, failReason = "beaconNotSynced"), network = "gnosis"),
@@ -144,7 +159,8 @@ class QueryResultCardTest {
         rule.pumpFrames()
         rule.onNode(isSelectable() and hasText("Query")).performClick()
         rule.pumpFrames()
-        rule.onNodeWithText("Address (0x…) or ENS name").performTextInput(ADDR)
+        // The field's label names the chain's name service ("or ENS name", "or .gno name").
+        rule.onNodeWithText("Address (0x…) or ", substring = true).performTextInput(ADDR)
         rule.pumpFrames()
         rule.onNodeWithText("Look up").performClick()
         rule.awaitText("Copy")
