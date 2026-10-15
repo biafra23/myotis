@@ -81,7 +81,7 @@ unknown handle gets the usual
 | `eth_getTransactionCount` at `pending` | the mined nonce above through `pendingNonceOverlay(h, address, minedNonce)` — synchronous; raises it past this node's own unmined broadcast, -1 = serve the mined nonce |
 | `eth_getCode` | `getCodeJson(h, address, block?)` |
 | `eth_getStorageAt` | `getStorageAtJson(h, address, position, block?)` |
-| `eth_getProof` | `getProofJson(h, address, keysJson?, block?)`: the result object as geth shapes it; `block` only the verified head, a recent head, or the finalized block, exactly (see the header) |
+| `eth_getProof` | `getProofJson(h, address, keysJson?, block?)`: the result object as geth shapes it; `block` only the verified head, a recent head, or the finalized block, exactly — by number, tag or (ABI 47) block hash (see the header) |
 | `eth_call` | `ethCallJson(h, from, to, data, value, block)`, `ethCallTxJson(h, txJson, block, overrides)` |
 | `eth_call` with a state override | `ethCallOverridesJson(h, from, to, data, value, block, overridesJson)`, or `ethCallTxJson` |
 | `eth_estimateGas` | `estimateGasJson(h, from, to, data, value)`, `estimateGasTxJson(h, txJson, block, overrides)` |
@@ -90,6 +90,7 @@ unknown handle gets the usual
 | `eth_feeHistory` | `feeHistoryJson(h, blockCount, newestBlock, percentilesJson?)` |
 | `eth_getBlockByNumber` | `getBlockByNumberJson(h, blockTag, fullTransactions?)` |
 | `eth_getBlockByHash` | `getBlockByHashJson(h, blockHash, fullTransactions?)` |
+| a state read or `eth_call` pinned to a block hash (EIP-1898) | `resolveBlockHashJson(h, blockHash)`: `{"hash","number"}` of the canonical block it names, header only, or `"null"`; then read at that number (see the header) |
 | `eth_getTransactionByHash` | `getTransactionByHashJson(h, txHash)` |
 | `eth_getTransactionReceipt` | `getTransactionReceiptJson(h, txHash)` |
 | `eth_getBlockReceipts` | `getBlockReceiptsJson(h, selector)` (a tag, a 0x-number or a 0x-hash) |

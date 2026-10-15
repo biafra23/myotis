@@ -96,6 +96,11 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     // it with margin and stays one modest header-range fetch (~300 KB).
     // Mirrored by the Rust engine's BLOCK_LOOKBACK_MAX (el/reader.rs) — keep in sync.
     private static final int BLOCK_LOOKBACK_MAX = 512;
+    /** How far below the header anchor {@link #resolveBlockHash} looks for a hash it has
+     *  no number for: the hosts' state window below the head
+     *  ({@code RpcBlockWindow.BLOCK_NUM_LAG_TOLERANCE}), so a hash it cannot place is one
+     *  no state read would serve now (the Rust {@code HASH_SCAN_DEPTH} twin). */
+    static final long HASH_SCAN_DEPTH = 64;
 
     private static final long ENS_TIMEOUT_SEC = 60;
 
@@ -555,6 +560,18 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             new java.util.LinkedHashMap<>(64, 0.75f, true) {
                 @Override protected boolean removeEldestEntry(Map.Entry<String, Long> e) {
                     return size() > 512;
+                }
+            });
+
+    /** Block hashes a {@link #rpcResolveBlockHash} window did not hold → the HASH of the
+     *  anchor that window was anchored at (the anchor itself, not its number, which a head
+     *  replaced at the same height keeps): asked again at that anchor, the answer is the
+     *  same, so a client retrying a hash this node cannot place (one a block ahead, the
+     *  common case) costs no second header fetch until the anchor moves. Bounded LRU. */
+    private final Map<String, String> unplacedBlockHashes = java.util.Collections.synchronizedMap(
+            new java.util.LinkedHashMap<>(16, 0.75f, true) {
+                @Override protected boolean removeEldestEntry(Map.Entry<String, String> e) {
+                    return size() > 64;
                 }
             });
 
@@ -1026,6 +1043,12 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         if (blockHash32 == null || blockHash32.length != 32) return null;
         return rpcGetBlockByHash("0x" + org.apache.tuweni.bytes.Bytes.wrap(blockHash32).toUnprefixedHexString(),
                 fullTransactions);
+    }
+
+    @Override
+    public String resolveBlockHash(byte[] blockHash32) {
+        if (blockHash32 == null || blockHash32.length != 32) return null;
+        return rpcResolveBlockHash(blockHash32);
     }
 
     @Override
@@ -3536,6 +3559,102 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         // also match (the Rust twin compares block.hash structurally).
         int i = json.indexOf("\"hash\":\"");
         return i >= 0 && json.startsWith(key + "\"", i + 8) ? json : "null";
+    }
+
+    /**
+     * The canonical block a block hash names (#641; the Rust
+     * {@code ElReader::resolve_block_hash} twin), header-only: the beacon OPTIMISTIC head
+     * and the FINALIZED block are placed with no I/O (their hashes are light-client
+     * proven); any other hash in ONE header window anchored at {@link #headerAnchor()}
+     * — re-anchored at the beacon optimistic head when that is ahead of it, as a number pin
+     * is ({@link #reAnchorForPin}), so a block between the two is placed too —
+     * ({@link HeaderChains#anchoredAtTop}: every header in it is the canonical block at
+     * its height as of that anchor), spanning {@link #HASH_SCAN_DEPTH} blocks, or reaching
+     * down to the number a block served earlier by this hash had when that is deeper and
+     * within {@link #BLOCK_LOOKBACK_MAX} ({@link #hashScanStart}). No body is fetched; the
+     * header found is remembered for eth_getBlockByHash (that one only, so a resolve never
+     * evicts the blocks a wallet's receipts put there), and a hash the window does not hold
+     * is remembered against its anchor, answered from there while the anchor stays.
+     * Returns {@code {"hash","number"}} | "null" (no canonical block this node can place
+     * now has that hash) | Java null (cannot tell right now).
+     */
+    private String rpcResolveBlockHash(byte[] hash) {
+        BeaconSyncState bss = beaconSyncState;
+        if (bss != null) {
+            BeaconSyncState.OptimisticExecution opt = bss.getOptimisticExecution();
+            if (opt.blockNumber() > 0 && java.util.Arrays.equals(opt.blockHash(), hash)) {
+                return resolvedBlockJson(hash, opt.blockNumber());
+            }
+            BeaconSyncState.FinalizedExecution fin = bss.getFinalizedExecution();
+            if (fin.blockNumber() > 0 && java.util.Arrays.equals(fin.blockHash(), hash)) {
+                return resolvedBlockJson(hash, fin.blockNumber());
+            }
+        }
+        RLPxConnector conn = connector;
+        if (conn == null) return null;
+        try {
+            HeaderAnchor anchor = headerAnchor();
+            if (anchor == null) return null;
+            HeaderAnchor ahead = bss == null ? null : reAnchorForPin(anchor.number() + 1);
+            if (ahead != null) anchor = ahead;
+            if (java.util.Arrays.equals(anchor.blockHash(), hash)) {
+                return resolvedBlockJson(hash, anchor.number());
+            }
+            String key = "0x" + Bytes.wrap(hash).toUnprefixedHexString();
+            String anchorKey = "0x" + Bytes.wrap(anchor.blockHash()).toUnprefixedHexString();
+            if (anchorKey.equals(unplacedBlockHashes.get(key))) return "null";
+            long from = hashScanStart(anchor.number(), blockHashToNumber.get(key));
+            List<BlockHeadersMessage.VerifiedHeader> window = conn
+                    .requestBlockHeadersBatched(from, (int) (anchor.number() - from + 1))
+                    .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+            String resolved = resolvedFromWindow(window, anchor.blockHash(), hash);
+            if ("null".equals(resolved)) {
+                unplacedBlockHashes.put(key, anchorKey);
+            } else if (resolved != null) {
+                for (BlockHeadersMessage.VerifiedHeader vh : window) {
+                    if (java.util.Arrays.equals(vh.hash().toArrayUnsafe(), hash)) {
+                        blockHashToNumber.put(key, vh.header().number);
+                    }
+                }
+            }
+            return resolved;
+        } catch (Exception e) {
+            log.info("[rpc] block-hash resolve failed: " + unwrap(e));
+            return null;
+        }
+    }
+
+    /** Where {@link #rpcResolveBlockHash} starts its window below an anchor at
+     *  {@code head}: {@link #HASH_SCAN_DEPTH} blocks down, or at {@code known} — the
+     *  number a block served earlier by the hash had — when that is deeper but still
+     *  within {@link #BLOCK_LOOKBACK_MAX}, so a client pinned to an older block it read
+     *  here learns its number (and the host can refuse it as behind its window). Pure. */
+    static long hashScanStart(long head, Long known) {
+        long scanFrom = Math.max(0, head - HASH_SCAN_DEPTH);
+        if (known != null && known < scanFrom && head - known < BLOCK_LOOKBACK_MAX) return known;
+        return scanFrom;
+    }
+
+    /** The resolve answer a fetched {@code window} gives for {@code hash}: Java null when
+     *  the window does not hash-link up to {@code anchorHash} (nothing in it is proven);
+     *  else {@code {"hash","number"}} of the header carrying {@code hash}, or "null"
+     *  when no header in it does. Pure. */
+    static String resolvedFromWindow(List<BlockHeadersMessage.VerifiedHeader> window,
+                                     byte[] anchorHash, byte[] hash) {
+        if (!HeaderChains.anchoredAtTop(window, anchorHash)) return null;
+        for (BlockHeadersMessage.VerifiedHeader vh : window) {
+            if (java.util.Arrays.equals(vh.hash().toArrayUnsafe(), hash)) {
+                return resolvedBlockJson(hash, vh.header().number);
+            }
+        }
+        return "null";
+    }
+
+    /** {@code {"hash","number"}} — the fields a block object carries, so a host reads it
+     *  as it reads eth_getBlockByHash's answer (the Rust {@code resolved_block_json} twin). */
+    static String resolvedBlockJson(byte[] hash, long number) {
+        return "{\"hash\":\"0x" + Bytes.wrap(hash).toUnprefixedHexString()
+                + "\",\"number\":\"" + hexQuantity(number) + "\"}";
     }
 
     /**

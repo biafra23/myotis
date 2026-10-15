@@ -704,11 +704,14 @@ impl<E: Engine> Router<E> {
             // proofs against that block's own stateRoot. So neither
             // `pin_servable` nor `in_window`: their window would refuse the
             // finalized block's number, more than 64 blocks back on mainnet.
+            // A block hash goes to the engine AS a hash (ABI 47): it pins the
+            // proof to that block's attested root in one read of its anchor,
+            // where resolving the hash here first would leave a window in
+            // which a reorg puts another block at the number (#641).
             "eth_getProof" => {
                 let addr = address_at(params, 0)?;
                 let keys = storage_keys_at(params, 1)?;
                 let sel = selector_at(params, 2, Takes::NumberOrHash)?;
-                let sel = self.resolve_hash(sel, method, g)?;
                 let o = engine_object(&self.engine_ready(g)?.get_proof(&addr, &keys, &sel.value))?;
                 Ok(Value::Object(o).to_string())
             }
@@ -970,9 +973,11 @@ impl<E: Engine> Router<E> {
     /// hash-pinned read (EIP-1898 clients pin every read to the hash of the
     /// block they just saw) is served exactly as that number is — the same
     /// state window, the same verification — and never for another block:
-    ///  - the engine's own `eth_getBlockByHash` resolves it. It serves only a
-    ///    hash it verified AND that the chain still carries at its height, so
-    ///    a block on a fork, or a hash this node never saw, is the verified
+    ///  - the engine resolves it (ABI 47, `resolve_block_hash`): header only,
+    ///    and only to a block the chain carries at its height as of the
+    ///    verified head — the head or the finalized block at
+    ///    once, any other in one header window anchored at the head — so a
+    ///    block on a fork, or a hash this node cannot place, is the verified
     ///    `null`. That is declined RETRYABLY (-32000), with the reason naming
     ///    the hash: the node cannot tell a block it has not verified YET — a
     ///    client a block ahead of it pins the hash it was just handed, and this
@@ -993,11 +998,11 @@ impl<E: Engine> Router<E> {
         if !sel.hash {
             return Ok(sel);
         }
-        let json = self.engine_ready(g)?.block_by_hash(&sel.value, false);
+        let json = self.engine_ready(g)?.resolve_block_hash(&sel.value);
         if json.trim() == "null" {
             return Err(Fail::Unavailable(Some(format!(
-                "this node holds no block with hash {} — never verified here, not yet (it may be \
-                 ahead of the verified head), or on a fork",
+                "this node holds no block with hash {} as canonical now — not reached yet (it may \
+                 be ahead of the verified head), older than the blocks it can place, or on a fork",
                 sel.value
             ))));
         }

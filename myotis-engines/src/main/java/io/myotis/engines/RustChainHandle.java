@@ -1247,7 +1247,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      * engine's {@code {"error"}} / {@code {"error","code":-32602}} envelope, passed
      * through for the router to classify. {@code keysJson} is the JSON array of
      * storage keys as the request carried them; {@code block} is held to the proof
-     * pin rules (the verified head, a recent head or the finalized block, exactly). Throws
+     * pin rules (the verified head, a recent head or the finalized block, exactly — by
+     * tag, number or, since ABI 47, block hash). Throws
      * {@link EngineException} on a transport / not-running failure.
      */
     String proofJson(String hexAddress, String keysJson, String block) {
@@ -1310,6 +1311,18 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         return blockJsonOrThrow(
                 gated(() -> RustEngineNative.nativeGetBlockByHashJson(
                         handle, blockHashHex, fullTransactions)));
+    }
+
+    /**
+     * The canonical block a block hash names (ABI 47, #641): {@code {"hash","number"}},
+     * the literal {@code "null"} (no canonical block this engine holds now has that hash),
+     * or throws {@link EngineException} when it cannot tell (transport / not-running /
+     * an error envelope). Header only — no body, and the block need not have been served.
+     */
+    String resolveBlockHashJson(String blockHashHex) {
+        return jsonObjectOrThrow(
+                gated(() -> RustEngineNative.nativeResolveBlockHashJson(handle, blockHashHex)),
+                "resolved block");
     }
 
     /**

@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 46
+#define MYOTIS_ABI_VERSION 47
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -170,6 +170,10 @@ char *myotis_get_storage_at_json(int64_t handle, const char *address,
  * other number is refused — -32602 below the head, {"error"} above it —
  * never answered from head state as the other reads answer a near-head
  * number: the caller checks the proof against that block's stateRoot.
+ * Since ABI 47 `block` may also be a 32-byte block hash (0x + 64 hex): the
+ * proof is pinned to the attested root of exactly the block that hash names
+ * (the head, a recent head or the finalized block), placed in the same read
+ * of the anchor that yields the root; any other hash is {"error"}.
  * Refused (-32602) while Tor routing is on. */
 char *myotis_get_proof_json(int64_t handle, const char *address,
                             const char *keys, const char *block);
@@ -295,6 +299,14 @@ char *myotis_get_transaction_receipt_json(int64_t handle,
 /* Tx JSON, the literal "null" (verified not-seen), or {"error"}. */
 char *myotis_get_transaction_by_hash_json(int64_t handle,
                                           const char *tx_hash_hex);
+/* The canonical block a block hash names (ABI >= 47): {"hash","number"}
+ * (both hex), the literal "null" (no canonical block this node holds now has
+ * that hash: ahead of the head, older than the window, on a fork), {"error"}
+ * (cannot tell right now) or {"error","code":-32602} (malformed hash). Header
+ * only: the head or the finalized block is placed at once,
+ * any other hash in one header window anchored at the verified head. */
+char *myotis_resolve_block_hash_json(int64_t handle,
+                                     const char *block_hash_hex);
 /* Block JSON, the literal "null" (never-verified hash), or {"error"}.
  * full_transactions selects decoded tx objects over hashes. */
 char *myotis_get_block_by_hash_json(int64_t handle,

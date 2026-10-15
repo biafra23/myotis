@@ -233,7 +233,9 @@ misbehaves against the node: what it asked, in what order, and what it got.
   seen") where geth would return it.
 - **No historical state.** State reads more than 64 blocks behind head are
   `-32602`, pinned by number or by block hash (a hash is resolved to the
-  canonical block it names and judged as that number, #641).
+  canonical block it names, header only, and judged as that number, #641;
+  `eth_getProof` hands the hash to the engine, which pins the proof to that
+  block's attested root in one read).
 - **Fee suggestions are not a full node's.** On gnosis `eth_gasPrice` answers
   about base fee + 0.01 gwei where Nethermind answers about base fee, and
   `eth_maxPriorityFeePerGas` was seen to answer 0.001, 0.01, 0.1 and 1 gwei

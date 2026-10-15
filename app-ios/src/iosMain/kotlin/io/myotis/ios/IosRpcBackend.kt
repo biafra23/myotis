@@ -422,6 +422,14 @@ class IosRpcBackend(
         return triStateJson(RustEngine.getBlockByHashJson(handle, hex(blockHash32), fullTransactions))
     }
 
+    /** Header only (ABI 47, #641): the head or the finalized block at once, any
+     *  other hash in one header window — never a block body. */
+    override fun resolveBlockHash(blockHash32: ByteArray): String? {
+        if (blockHash32.size != 32) return null
+        val handle = handleProvider() ?: return null
+        return triStateJson(RustEngine.resolveBlockHashJson(handle, hex(blockHash32)))
+    }
+
     override fun gasPrice(): String? {
         val handle = handleProvider() ?: return null
         return resultOrNull(RustEngine.feeEstimateJson(handle))?.engineString("gasPriceWei")

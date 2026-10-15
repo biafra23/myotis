@@ -1534,7 +1534,12 @@ pub fn get_storage_at_json(
 /// attested — the verified head, one of the recent heads before it, the
 /// finalized block. Any other near-head number is NOT answered from head state
 /// as the other reads answer it, since the caller checks the proof against
-/// that block's own `stateRoot`.
+/// that block's own `stateRoot`. Since ABI 47 (#641) `block` may also be a
+/// 32-byte block HASH: the proof is pinned to the attested root of exactly the
+/// block that hash names, placed in the same read of the anchor that yields
+/// the root — never a hash resolved to a number first and proven at whatever
+/// block that number holds a moment later. A hash of no attested block is the
+/// retryable `{"error"}`.
 pub fn get_proof_json(handle: i64, address_hex: &str, keys_json: &str, block: &str) -> String {
     use myotis_net::el::getproof::{ProofBlock, ProofError};
     let Some(address) = parse_address(address_hex) else {
@@ -1544,11 +1549,14 @@ pub fn get_proof_json(handle: i64, address_hex: &str, keys_json: &str, block: &s
         Ok(keys) => keys,
         Err(msg) => return eljson::invalid_params_json(&msg),
     };
-    let block = match parse_read_block(block) {
-        Ok(BlockSelector::Head) => ProofBlock::Head,
-        Ok(BlockSelector::Finalized) => ProofBlock::Finalized,
-        Ok(BlockSelector::Number(n)) => ProofBlock::Number(n),
-        Err(json) => return json,
+    let block = match parse_block_hash(block) {
+        Some(hash) => ProofBlock::Hash(hash),
+        None => match parse_read_block(block) {
+            Ok(BlockSelector::Head) => ProofBlock::Head,
+            Ok(BlockSelector::Finalized) => ProofBlock::Finalized,
+            Ok(BlockSelector::Number(n)) => ProofBlock::Number(n),
+            Err(json) => return json,
+        },
     };
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
@@ -2611,6 +2619,47 @@ pub fn get_block_by_hash_json(
         Ok(None) => "null".to_string(), // never-verified/reorged-away hash → eth null
         Err(e) => eljson::error_json(&e),
     }
+}
+
+/// `nativeResolveBlockHashJson` (ABI ≥ 47, #641): the canonical block a block
+/// hash names, for a host resolving a state read or an `eth_call` pinned to a
+/// hash (EIP-1898) to the number it then judges and serves exactly as a number.
+/// `{"hash","number"}` ([`eljson::resolved_block_json`]) for a block this node
+/// holds as canonical now — the head or the finalized block at
+/// once, else found in one header-only window anchored at the verified head
+/// ([`ElReader::resolve_block_hash`]); the literal `"null"` for one it does not
+/// (ahead of the head, older than the window, on a fork); `{"error"}` when it
+/// cannot tell right now. A malformed hash is the permanent
+/// `{"error","code":-32602}`, judged before the handle lookup. Unlike
+/// [`get_block_by_hash_json`] no block body is fetched, and the block need not
+/// have been served here before.
+pub fn resolve_block_hash_json(handle: i64, block_hash_hex: &str) -> String {
+    let Some(hash) = parse_block_hash(block_hash_hex) else {
+        return eljson::invalid_params_json("invalid block hash (expected 0x + 64 hex digits)");
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    match engine.rt.block_on(reader.request(async { reader.resolve_block_hash(hash).await })) {
+        Ok(Some(number)) => eljson::resolved_block_json(&hash, number),
+        Ok(None) => "null".to_string(),
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
+/// A block selector that is a block hash: exactly `0x` + 64 hex digits (either
+/// case, surrounding whitespace ignored) — the routers' own reading of one.
+fn parse_block_hash(selector: &str) -> Option<[u8; 32]> {
+    let s = selector.trim();
+    let digits = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
+    if digits.len() != 64 {
+        return None;
+    }
+    parse_word32(digits)
 }
 
 /// `nativeSendRawTransactionJson`: gossip a signed raw transaction to peers and
@@ -4136,8 +4185,12 @@ mod tests {
         let call = |addr: &str, keys: &str, block: &str| -> serde_json::Value {
             serde_json::from_str(&get_proof_json(i64::MIN, addr, keys, block)).unwrap()
         };
-        // Servable shapes reach the engine (and fail only on the handle).
-        for (keys, block) in [("", ""), ("[]", "latest"), (r#"["0x0","0x01"]"#, "finalized"), ("[]", "0x10")] {
+        // Servable shapes reach the engine (and fail only on the handle) — a
+        // block hash among them since ABI 47 (#641).
+        let hash = format!("0x{}", "ab".repeat(32));
+        for (keys, block) in
+            [("", ""), ("[]", "latest"), (r#"["0x0","0x01"]"#, "finalized"), ("[]", "0x10"), ("[]", hash.as_str())]
+        {
             assert_eq!(call(&addr, keys, block)["error"], "unknown handle", "{keys} {block}");
         }
         // Malformed address, keys or selector: permanent.
@@ -4150,7 +4203,8 @@ mod tests {
             (addr.as_str(), &format!(r#"["0x{}"]"#, "1".repeat(65)), "latest"),
             (addr.as_str(), too_many.as_str(), "latest"),
             (addr.as_str(), "[]", "safe"),
-            (addr.as_str(), "[]", &format!("0x{}", "ab".repeat(32))),
+            (addr.as_str(), "[]", &format!("0x{}", "ab".repeat(31))),
+            (addr.as_str(), "[]", &format!("0x{}zz", "ab".repeat(31))),
         ] {
             let v = call(a, keys, block);
             assert_eq!(v["code"], -32602, "{a} {keys} {block}: {v}");
@@ -4158,6 +4212,27 @@ mod tests {
     }
 
     const MAX_PROOF_KEYS: usize = myotis_net::el::getproof::MAX_PROOF_STORAGE_KEYS;
+
+    #[test]
+    fn resolve_block_hash_refuses_a_malformed_hash_before_the_handle_lookup() {
+        let call = |hash: &str| -> serde_json::Value {
+            serde_json::from_str(&resolve_block_hash_json(i64::MIN, hash)).unwrap()
+        };
+        for good in [format!("0x{}", "ab".repeat(32)), format!("0X{}", "AB".repeat(32))] {
+            assert_eq!(call(&good)["error"], "unknown handle", "{good}");
+        }
+        for bad in [
+            String::new(),
+            "latest".to_string(),
+            "0x10".to_string(),
+            "ab".repeat(32),
+            format!("0x{}", "ab".repeat(31)),
+            format!("0x{}zz", "ab".repeat(31)),
+            format!("0x{}", "ab".repeat(33)),
+        ] {
+            assert_eq!(call(&bad)["code"], -32602, "{bad}");
+        }
+    }
 
     #[test]
     fn proof_keys_read_as_geth_reads_them_and_echo_in_its_forms() {

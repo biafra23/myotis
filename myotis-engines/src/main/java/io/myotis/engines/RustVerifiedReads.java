@@ -400,6 +400,19 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     @Override
+    public String resolveBlockHash(byte[] blockHash32) {
+        if (blockHash32 == null || blockHash32.length != 32) return null;
+        try {
+            // {"hash","number"} of the canonical block, header only (ABI 47); the
+            // "null" literal; or throws (→ the error envelope → -32000).
+            return handle.resolveBlockHashJson(toHex(blockHash32));
+        } catch (RuntimeException e) {
+            log.info("[engines] block-hash resolve unavailable: {}", e.getMessage());
+            return errJson(e);
+        }
+    }
+
+    @Override
     public String getLogs(String filterJson) {
         try {
             // Array or {"error": ...} — passed through verbatim; the router

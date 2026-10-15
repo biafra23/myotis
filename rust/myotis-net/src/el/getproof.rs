@@ -23,10 +23,21 @@
 //! permanently below the head, which never comes back to it; retryably above
 //! it, which the head may yet reach. No fallback to a peer's own head either,
 //! the other reads' last resort: it is a different block.
+//!
+//! A block HASH (EIP-1898, #641) is served at the root of exactly the block it
+//! names, placed among those same attested blocks by its hash in one read of
+//! the anchor ([`crate::el::anchor::ExecAnchor::attested_block_of`]) — never
+//! resolved to a number first and proven at whatever block holds that number
+//! a moment later. A hash it does not place is declined retryably: a hash of a
+//! block this node has not attested YET is one the head may still reach.
 
 use myotis_core::trie::{AccountLeaf, EMPTY_CODE_HASH, EMPTY_TRIE_ROOT};
 
 use crate::el::anchor::{FinalizedExecution, RECENT_HEADS};
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// The most storage keys one `eth_getProof` may ask for. Each is a snap round
 /// trip at one root, so the bound caps one request's fan-out; geth sets none,
@@ -66,6 +77,9 @@ pub enum ProofBlock {
     Finalized,
     /// A number: served only when it is the head's or the finalized block's.
     Number(u64),
+    /// A block hash: served only when it is the hash of the head, of a recent
+    /// head or of the finalized block, at that block's own attested root.
+    Hash([u8; 32]),
 }
 
 /// Why no proof was served. Hosts answer [`ProofError::Refused`] with the
@@ -88,13 +102,15 @@ pub struct ProofTarget {
 /// Resolve the block a request names to the root it is proven at, by the pin
 /// rules above. `head` is the optimistic head's `(number, state_root)`, read
 /// together; `finalized` the beacon-finalized block; `recent` the root of a
-/// number among the recent heads (`ExecAnchor::optimistic_root_at`) — all as
-/// the anchor holds them now.
+/// number among the recent heads (`ExecAnchor::optimistic_root_at`); `by_hash`
+/// the `(number, state_root)` of a hash among the attested blocks
+/// (`ExecAnchor::attested_block_of`) — all as the anchor holds them now.
 pub fn resolve_target(
     block: ProofBlock,
     head: Option<(u64, [u8; 32])>,
     finalized: Option<FinalizedExecution>,
     recent: impl Fn(u64) -> Option<[u8; 32]>,
+    by_hash: impl Fn(&[u8; 32]) -> Option<(u64, [u8; 32])>,
 ) -> Result<ProofTarget, ProofError> {
     let at_head = |(block_number, state_root): (u64, [u8; 32])| ProofTarget { block_number, state_root };
     let at_finalized = |fin: FinalizedExecution| ProofTarget {
@@ -107,6 +123,18 @@ pub fn resolve_target(
             .ok_or_else(|| ProofError::Unavailable("beacon not synced: no verified head yet".into())),
         ProofBlock::Finalized => finalized.map(at_finalized).ok_or_else(|| {
             ProofError::Unavailable("no beacon-finalized execution block yet".into())
+        }),
+        // One lookup gives the number AND the root of the block the hash
+        // names: there is no second read in which a reorg could put another
+        // block at that number.
+        ProofBlock::Hash(hash) => by_hash(&hash).map(at_head).ok_or_else(|| {
+            ProofError::Unavailable(format!(
+                "eth_getProof at block hash 0x{} is not served now: a proof is pinned to a state \
+                 root this node holds attested for exactly that block — the last \
+                 {RECENT_HEADS} heads it held, or the finalized block — and this hash is none \
+                 of them (not yet, or no longer)",
+                hex(&hash)
+            ))
         }),
         ProofBlock::Number(n) => {
             if let Some(h) = head.filter(|&(number, _)| number == n) {
@@ -138,6 +166,28 @@ pub fn resolve_target(
                  another root would not verify against block {n}'s stateRoot"
             )))
         }
+    }
+}
+
+/// Why a proof at `hash` — a block hash no attested block carries, which the
+/// node placed at `number` all the same — is not served: refused for good when
+/// that block is at or below the head (`head`), which never becomes attested
+/// once passed, as a number there is refused; retryable above it, or with no
+/// head to judge by.
+pub fn unattested_hash(hash: &[u8; 32], number: u64, head: Option<u64>) -> ProofError {
+    match head {
+        Some(head) if number <= head => ProofError::Refused(format!(
+            "eth_getProof at block hash 0x{} (block {number}) is not served: a proof is pinned to \
+             a state root this node holds attested for exactly that block — the last \
+             {RECENT_HEADS} heads it held, up to the verified head ({head}), or the finalized \
+             block — and that block is none of them",
+            hex(hash)
+        )),
+        _ => ProofError::Unavailable(format!(
+            "eth_getProof at block hash 0x{} (block {number}) is not served now: the block is not \
+             attested here yet",
+            hex(hash)
+        )),
     }
 }
 
@@ -198,66 +248,106 @@ mod tests {
         None
     }
 
+    /// No block placed by hash.
+    fn unplaced(_: &[u8; 32]) -> Option<(u64, [u8; 32])> {
+        None
+    }
+
     #[test]
     fn tags_resolve_to_their_own_roots() {
-        let t = resolve_target(ProofBlock::Head, Some(HEAD), Some(fin(936)), none).unwrap();
+        let t = resolve_target(ProofBlock::Head, Some(HEAD), Some(fin(936)), none, unplaced).unwrap();
         assert_eq!((t.block_number, t.state_root), (1_000, [0xaa; 32]));
-        let t = resolve_target(ProofBlock::Finalized, Some(HEAD), Some(fin(936)), none).unwrap();
+        let t = resolve_target(ProofBlock::Finalized, Some(HEAD), Some(fin(936)), none, unplaced).unwrap();
         assert_eq!((t.block_number, t.state_root), (936, [0xff; 32]));
         // Not synced: retryable, for either tag.
         assert!(matches!(
-            resolve_target(ProofBlock::Head, None, None, none),
+            resolve_target(ProofBlock::Head, None, None, none, unplaced),
             Err(ProofError::Unavailable(_))
         ));
         assert!(matches!(
-            resolve_target(ProofBlock::Finalized, Some(HEAD), None, none),
+            resolve_target(ProofBlock::Finalized, Some(HEAD), None, none, unplaced),
             Err(ProofError::Unavailable(_))
         ));
     }
 
     #[test]
     fn a_number_is_served_only_at_a_root_attested_for_exactly_that_block() {
-        let t = resolve_target(ProofBlock::Number(1_000), Some(HEAD), Some(fin(936)), none).unwrap();
+        let t = resolve_target(ProofBlock::Number(1_000), Some(HEAD), Some(fin(936)), none, unplaced).unwrap();
         assert_eq!((t.block_number, t.state_root), (1_000, [0xaa; 32]));
-        let t = resolve_target(ProofBlock::Number(936), Some(HEAD), Some(fin(936)), none).unwrap();
+        let t = resolve_target(ProofBlock::Number(936), Some(HEAD), Some(fin(936)), none, unplaced).unwrap();
         assert_eq!((t.block_number, t.state_root), (936, [0xff; 32]));
         // Just behind the head: inside the other reads' window, but a proof
         // at head state would not verify against this block — refused for good.
         let Err(ProofError::Refused(why)) =
-            resolve_target(ProofBlock::Number(999), Some(HEAD), Some(fin(936)), none)
+            resolve_target(ProofBlock::Number(999), Some(HEAD), Some(fin(936)), none, unplaced)
         else {
             panic!("a number below the head that is not finalized must be refused");
         };
         assert!(why.contains("(1000)") && why.contains("(936)"), "{why}");
         // Below finality too.
         assert!(matches!(
-            resolve_target(ProofBlock::Number(10), Some(HEAD), None, none),
+            resolve_target(ProofBlock::Number(10), Some(HEAD), None, none, unplaced),
             Err(ProofError::Refused(_))
         ));
         // Ahead of the head: the head may yet reach it.
         assert!(matches!(
-            resolve_target(ProofBlock::Number(1_001), Some(HEAD), Some(fin(936)), none),
+            resolve_target(ProofBlock::Number(1_001), Some(HEAD), Some(fin(936)), none, unplaced),
             Err(ProofError::Unavailable(_))
         ));
         // No head to judge a number against: retryable, even when the number
         // is no finalized block either.
         assert!(matches!(
-            resolve_target(ProofBlock::Number(5), None, Some(fin(936)), none),
+            resolve_target(ProofBlock::Number(5), None, Some(fin(936)), none, unplaced),
             Err(ProofError::Unavailable(_))
         ));
         // ...but the finalized block's own number is servable without a head.
-        assert!(resolve_target(ProofBlock::Number(936), None, Some(fin(936)), none).is_ok());
+        assert!(resolve_target(ProofBlock::Number(936), None, Some(fin(936)), none, unplaced).is_ok());
         // A recent head this node held (a client pinned the number it got a
         // block ago) is served at the root attested for it.
         let recent = |n: u64| (n == 999).then_some([0x99; 32]);
-        let t = resolve_target(ProofBlock::Number(999), Some(HEAD), Some(fin(936)), recent).unwrap();
+        let t = resolve_target(ProofBlock::Number(999), Some(HEAD), Some(fin(936)), recent, unplaced).unwrap();
         assert_eq!((t.block_number, t.state_root), (999, [0x99; 32]));
         // The head and the finalized block still take precedence.
         let any = |_: u64| Some([0x11; 32]);
-        let t = resolve_target(ProofBlock::Number(1_000), Some(HEAD), Some(fin(936)), any).unwrap();
+        let t = resolve_target(ProofBlock::Number(1_000), Some(HEAD), Some(fin(936)), any, unplaced).unwrap();
         assert_eq!(t.state_root, [0xaa; 32]);
-        let t = resolve_target(ProofBlock::Number(936), Some(HEAD), Some(fin(936)), any).unwrap();
+        let t = resolve_target(ProofBlock::Number(936), Some(HEAD), Some(fin(936)), any, unplaced).unwrap();
         assert_eq!(t.state_root, [0xff; 32]);
+    }
+
+    #[test]
+    fn a_hash_is_served_only_at_the_root_attested_for_the_block_it_names() {
+        // A hash the anchor places: that block's number and its own root, in
+        // one lookup — even where the head or a recent head holds another root.
+        let placed = |h: &[u8; 32]| (h == &[0x77; 32]).then_some((999, [0x99; 32]));
+        let any = |_: u64| Some([0x11; 32]);
+        let t = resolve_target(ProofBlock::Hash([0x77; 32]), Some(HEAD), Some(fin(936)), any, placed)
+            .unwrap();
+        assert_eq!((t.block_number, t.state_root), (999, [0x99; 32]));
+        // Placed even with no head to judge numbers against.
+        assert!(resolve_target(ProofBlock::Hash([0x77; 32]), None, None, none, placed).is_ok());
+        // A hash it does not place: retryable (the head may yet reach it), and
+        // never answered at the head's or a recent head's root.
+        let Err(ProofError::Unavailable(why)) =
+            resolve_target(ProofBlock::Hash([0x55; 32]), Some(HEAD), Some(fin(936)), any, placed)
+        else {
+            panic!("an unplaced hash must be declined retryably");
+        };
+        assert!(why.contains(&"55".repeat(32)), "{why}");
+    }
+
+    #[test]
+    fn an_unattested_hash_is_refused_like_its_number() {
+        // At or below the head: never attested once passed — permanent, by name.
+        let Some(ProofError::Refused(why)) = Some(unattested_hash(&[0x44; 32], 990, Some(1_000))) else {
+            panic!("a placed hash below the head must be refused for good");
+        };
+        assert!(why.contains(&"44".repeat(32)) && why.contains("(block 990)") && why.contains("(1000)"), "{why}");
+        // A fork block at the head's own height is no attested block either.
+        assert!(matches!(unattested_hash(&[0x44; 32], 1_000, Some(1_000)), ProofError::Refused(_)));
+        // Above the head, or with no head: the head may yet reach it.
+        assert!(matches!(unattested_hash(&[0x44; 32], 1_001, Some(1_000)), ProofError::Unavailable(_)));
+        assert!(matches!(unattested_hash(&[0x44; 32], 5, None), ProofError::Unavailable(_)));
     }
 
     #[test]

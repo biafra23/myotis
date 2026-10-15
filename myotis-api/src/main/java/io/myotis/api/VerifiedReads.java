@@ -201,6 +201,28 @@ public interface VerifiedReads {
     String getBlockByHash(byte[] blockHash32, boolean fullTransactions);
 
     /**
+     * The canonical block a block hash names, for a host resolving a state read or an
+     * {@code eth_call} pinned to a block hash (EIP-1898, #641) to the number it then
+     * judges and serves exactly as a number: a JSON object carrying at least the
+     * block's {@code "hash"} and {@code "number"} (0x-hex, as a block object carries
+     * them) | the {@code "null"} literal (no block this engine holds as canonical now
+     * has that hash — not reached yet, older than it can place, or on a fork) | an
+     * {@code {"error": ...}} envelope | {@code null} (cannot tell right now).
+     *
+     * <p>An engine must answer only for a block the chain carries at that height now
+     * — never a block it once saw that a reorg has since replaced.
+     *
+     * <p>Default: {@link #getBlockByHash getBlockByHash(blockHash32, false)}, whose
+     * block object carries both fields. Both engines override it header-only: the
+     * beacon-attested head and the finalized block with no I/O, any other hash in one header window anchored at
+     * the verified head — no block body, and no need for the block to have been
+     * served before.
+     */
+    default String resolveBlockHash(byte[] blockHash32) {
+        return getBlockByHash(blockHash32, false);
+    }
+
+    /**
      * Every receipt of one block as a JSON array (each element the
      * {@code getTransactionReceipt} object shape, verified against the anchored
      * header's {@code receiptsRoot}) | {@code "null"} literal (verified
@@ -377,13 +399,16 @@ public interface VerifiedReads {
      * verified answer). {@code storageKeysJson} is the JSON array of storage keys
      * as the request carried them; the engine echoes each in geth's form.
      *
-     * <p>{@code block} (a tag or a 0x-hex number) is applied EXACTLY: the answer
+     * <p>{@code block} (a tag, a 0x-hex number, or a 0x-hex 32-byte block hash) is
+     * applied EXACTLY: the answer
      * names no block of its own, so the caller checks the proofs against the
      * {@code stateRoot} of the block it asked for. An engine serves only a root
      * it holds attested for exactly that block and refuses any other — it must
      * never answer a near-head number from head state as the other state reads
      * do. (The Rust engine serves its verified head, the recent heads before it
-     * as it held them, and its finalized block.)
+     * as it held them, and its finalized block — by number, tag or block hash; a
+     * hash is pinned to that block's attested root in one read, so hosts pass it
+     * through rather than resolve it to a number first.)
      *
      * <p>Default: {@code null}, on an engine that reports no
      * {@link #supportsProofs()} — the Java engine is one.

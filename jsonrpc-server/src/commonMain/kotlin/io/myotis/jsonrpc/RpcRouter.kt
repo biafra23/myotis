@@ -938,9 +938,10 @@ class RpcRouter(
      * hash-pinned read (EIP-1898 clients pin every read to the hash of the
      * block they just saw) is served exactly as that number is — the same state
      * window, the same state-root verification — and never for another block:
-     *  - the engine's own `eth_getBlockByHash` resolves it. Both engines serve
-     *    only a hash they verified AND that the chain still carries at its
-     *    height, so a block on a fork, or a hash this node never saw, is the
+     *  - the engine resolves it ([RpcBackend.resolveBlockHash]): header only,
+     *    and only to a block the chain carries at its height as of the verified
+     *    head — the head at once, any other hash in one header window anchored
+     *    at it — so a block on a fork, or a hash the node cannot place, is the
      *    verified "null". That is declined RETRYABLY (-32000), with the reason
      *    naming the hash: the node cannot tell a block it has not verified YET
      *    — a client a block ahead of it pins the hash it was just handed, and
@@ -961,11 +962,11 @@ class RpcRouter(
         if (!sel.hash) return sel
         // [parseSelector] admitted exactly 0x + 64 hex digits, lowercased.
         val hashBytes = ByteArray(32) { k -> sel.value.substring(2 + 2 * k, 4 + 2 * k).toInt(16).toByte() }
-        val blockJson = withContext(rpcIoDispatcher) { b.getBlockByHash(hashBytes, false) }?.orEngineThrow()
+        val blockJson = withContext(rpcIoDispatcher) { b.resolveBlockHash(hashBytes) }?.orEngineThrow()
             ?: return null
         if (blockJson.trim() == "null") {
-            throw EngineReadUnavailable("this node holds no block with hash ${sel.value} — never verified here, " +
-                "not yet (it may be ahead of the verified head), or on a fork")
+            throw EngineReadUnavailable("this node holds no block with hash ${sel.value} as canonical now — not " +
+                "reached yet (it may be ahead of the verified head), older than the blocks it can place, or on a fork")
         }
         val block = runCatching { json.parseToJsonElement(blockJson) }.getOrNull() as? JsonObject
         val number = (block?.get("number") as? JsonPrimitive)?.contentOrNull
@@ -1271,17 +1272,18 @@ class RpcRouter(
             // for a near-head number as the reads above have it, because the
             // caller checks the proofs against that block's own stateRoot. So no
             // [pinServable] here: its window would refuse the finalized block's
-            // number, more than 64 blocks back on mainnet. A block hash is still
-            // resolved to its canonical block's number ([resolveHash], #641),
-            // which the engine then applies exactly. An engine that serves no
-            // proofs declines here, and the strict branch refuses it for good,
-            // ahead of any field.
+            // number, more than 64 blocks back on mainnet. A block hash goes to
+            // the engine AS a hash (ABI 47, #641): the engine pins the proof to
+            // that block's attested root in one read, where resolving the hash
+            // here first would leave a window in which a reorg puts another block
+            // at the number. An engine that serves no proofs declines here, and
+            // the strict branch refuses it for good, ahead of any field.
             "eth_getProof" -> {
                 if (!b.supportsProofs()) return null
                 val p = root.params()
                 val addr = p.addressAt(0)
                 val keys = p.storageKeysAt(1)
-                val sel = resolveHash(p.selectorAt(2, Takes.NUMBER_OR_HASH), b, "eth_getProof") ?: return null
+                val sel = p.selectorAt(2, Takes.NUMBER_OR_HASH)
                 val proofJson = withContext(rpcIoDispatcher) { b.getProof(addr, keys, sel.value) }
                     ?.orEngineThrow() ?: return null
                 resultEnvelope(id, json.parseToJsonElement(proofJson))

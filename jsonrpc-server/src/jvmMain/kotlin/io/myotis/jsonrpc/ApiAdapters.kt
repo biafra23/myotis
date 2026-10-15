@@ -113,6 +113,7 @@ class VerifiedReadsBackend(private val v: io.myotis.api.VerifiedReads) : RpcBack
         v.getBlockByNumber(block, fullTransactions)
     override fun getBlockByHash(blockHash32: ByteArray, fullTransactions: Boolean): String? =
         v.getBlockByHash(blockHash32, fullTransactions)
+    override fun resolveBlockHash(blockHash32: ByteArray): String? = v.resolveBlockHash(blockHash32)
     override fun gasPrice(): String? = v.gasPrice()
     override fun maxPriorityFeePerGas(): String? = v.maxPriorityFeePerGas()
     override fun feeHistory(blockCount: Long, newestBlock: String, rewardPercentiles: DoubleArray?): String? =
