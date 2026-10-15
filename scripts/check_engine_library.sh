@@ -70,7 +70,8 @@ err() { echo "::error::$*"; fail=1; }
 shopt -s nullglob
 versions=("$group_dir"/myotis-engine/*/)
 shopt -u nullglob
-[ "${#versions[@]}" -eq 1 ] || { err "expected exactly one staged version of io.myotis:myotis-engine, found: ${versions[*]}"; exit 1; }
+# (`${versions[*]-}`: an empty array is "unbound" to bash < 4.4 under set -u.)
+[ "${#versions[@]}" -eq 1 ] || { err "expected exactly one staged version of io.myotis:myotis-engine, found: ${versions[*]-}"; exit 1; }
 version=$(basename "${versions[0]}")
 echo "staged version: $version"
 case "$version" in
@@ -100,9 +101,16 @@ for a in myotis-api myotis-core myotis-engine-common myotis-engine-rust \
 done
 
 # No stale name: nothing may be staged under the Gradle project name `core`, and
-# every io.myotis dependency a POM names must be staged under that name.
+# every io.myotis dependency a POM names must be staged under that name. And
+# no leak: a project dependency on a module OUTSIDE the published set keeps
+# the build's own group (com.jaeckel.ethp2p) in the POM — resolvable from no
+# repository, and the one shape a consumer would otherwise find only after
+# the version is on GitHub Packages.
 [ ! -e "$group_dir/core" ] || err "io.myotis:core was staged — :core must publish as myotis-core"
 while IFS= read -r pom; do
+    if grep -q '<groupId>com.jaeckel.ethp2p</groupId>' "$pom"; then
+        err "${pom#$repo/} names com.jaeckel.ethp2p:* — a dependency on an unpublished project module leaked into the publication"
+    fi
     # Dependencies and constraints alike: `<groupId>io.myotis</groupId>` followed
     # by the artifactId on the next line (Gradle's POM layout).
     while IFS= read -r dep; do
@@ -138,13 +146,18 @@ done
 aar="$group_dir/myotis-engine-android/$version/myotis-engine-android-$version.aar"
 if [ -s "$aar" ]; then
     listing=$(unzip -Z1 "$aar")
-    grep -qx 'classes.jar' <<<"$listing" || err "$(basename "$aar") has no classes.jar"
-    classes_jar=$(mktemp)
-    unzip -p "$aar" classes.jar > "$classes_jar"
-    classes=$(unzip -Z1 "$classes_jar")
-    rm -f "$classes_jar"
-    grep -qx 'io/myotis/engine/Myotis.class' <<<"$classes" \
-        || err "$(basename "$aar")'s classes.jar has no io.myotis.engine.Myotis — the entry point"
+    # Extract only when the entry exists: `unzip -p` of a missing entry would
+    # end the script here under set -e, ahead of the ABI checks and the roll-up.
+    if grep -qx 'classes.jar' <<<"$listing"; then
+        classes_jar=$(mktemp)
+        unzip -p "$aar" classes.jar > "$classes_jar"
+        classes=$(unzip -Z1 "$classes_jar")
+        rm -f "$classes_jar"
+        grep -qx 'io/myotis/engine/Myotis.class' <<<"$classes" \
+            || err "$(basename "$aar")'s classes.jar has no io.myotis.engine.Myotis — the entry point"
+    else
+        err "$(basename "$aar") has no classes.jar"
+    fi
     for abi in "${abis[@]}"; do
         grep -qx "jni/$abi/libjnidispatch.so" <<<"$listing" \
             || err "$(basename "$aar") has no jni/$abi/libjnidispatch.so (JNA cannot dispatch on $abi)"
