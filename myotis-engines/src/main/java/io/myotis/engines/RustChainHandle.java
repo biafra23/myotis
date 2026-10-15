@@ -973,8 +973,10 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      *  {@code {"status":"revert","dataHex"}} / {@code {"status":"unavailable",
      *  "reason"}}, each with {@code blockNumber} (the block the call ran
      *  against) and {@code verified} (ran against the beacon-finalized block)
-     *  since ABI 30 — all pinned by the eljson golden tests; the two extra keys
-     *  are not surfaced through {@link io.myotis.api.CallResult} yet. A revert
+     *  since ABI 30 — all pinned by the eljson golden tests; an answered call
+     *  ({@code ok}/{@code revert}) carries {@code blockNumber} on into
+     *  {@link io.myotis.api.CallResult#blockNumber}, {@code verified} is not
+     *  surfaced. A revert
      *  is a VERIFIED answer whose payload the host serves as the standard
      *  code-3 error. The permanent {@code {"error","code":-32602}} envelope (a
      *  block the node will never serve since ABI 27, an executor refusal since
@@ -992,12 +994,13 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         throwIfError(o);
         try {
             String status = stringOrNull(o, "status");
+            long block = o.getLong("blockNumber", -1L);
             if ("ok".equals(status)) {
                 // 0x / empty → empty bytes
-                return io.myotis.api.CallResult.ok(hexToBytes(stringOrNull(o, "resultHex")));
+                return io.myotis.api.CallResult.ok(hexToBytes(stringOrNull(o, "resultHex"))).atBlock(block);
             }
             if ("revert".equals(status)) {
-                return io.myotis.api.CallResult.reverted(hexToBytes(stringOrNull(o, "dataHex")));
+                return io.myotis.api.CallResult.reverted(hexToBytes(stringOrNull(o, "dataHex"))).atBlock(block);
             }
             if ("infeasible".equals(status)) {
                 String reason = stringOrNull(o, "reason");

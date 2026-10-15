@@ -48,10 +48,16 @@ Every check is bounded:
 - for an after-wake check, at most a minute of what is left of the stack's catch-up slice, ending 2 minutes before the pass's deadline (one read's own bound), so a read in flight cannot carry the pass past it.
 
 Past the bound, balances not read yet keep their stored state, and a cause search stops
-where it is. Each check reads the least recently attempted addresses first (by their least
-recently attempted balance), and an address's tokens in the same order. What one check left
-out leads the next, and a balance whose read keeps failing goes to the back after each
-attempt.
+where it is. Each check reads every native balance first, then the token balances, each
+least recently attempted first. While token balances are due, the native reads stop at half
+the bound (their cause searches may use all of it), so neither a long token list nor a slow
+native phase keeps the other out of every check. What one check left out leads the next,
+and a balance whose read keeps failing goes to the back after each attempt.
+
+On a metered network a token balance is read at most every 15 minutes
+(`WatchPolicy.TOKEN_METERED_INTERVAL_MS`): each is an `eth_call`, ~15 per mainnet address,
+against one proof for the native balance. One whose newest read failed, or that was never
+read, is due on every check. Check now reads them all whatever the network.
 
 Check now runs in the host's own scope, off the main thread, with the same 3-minute bound.
 Leaving the tab mid-check ends the tab's wait, not the check, so the check's results are
@@ -134,34 +140,42 @@ as asked.
 Each check reads, for every watched address, its balance of every token the network lists
 (`listedTokens`: `PopularTokens` and the user's `CustomTokens`). A custom entry for a
 contract that a later release pinned as built-in reads once, as built-in. That is one
-`eth_call` per token per address per check, four in flight per address, under the check's
-time bound.
+`eth_call` per token per address per check, four in flight across the check (the Query
+tab's `TOKEN_READS_IN_FLIGHT`), under the check's time bound. Tokens of an address are read
+only after its account read verified in the same check, on an anchor no older than the
+stored one.
 
-**The anchor.** The engine API's `CallResult` does not say which block an `eth_call` ran
-against. The Rust engine's call JSON has the number, but the API drops it. Both engines
-also run a pinned block number against head state, so pinning the call cannot fix that.
+**The anchor.** `CallResult.blockNumber` names the block an `eth_call` ran against: the
+verified head both engines resolved for it (the Java engine's finalized fallback included),
+-1 when an engine does not say. A token observation is anchored to that block, and, should
+it be -1, to the same address's account read seconds earlier. An observation on an older
+block than the stored one changes nothing, so a finalized fallback never shows a fresh
+transfer as a change and then its reversal.
 
-So a token observation is anchored to the block of the same address's verified account read
-in the same check, seconds earlier. On the Rust engine both reads run against the verified
-head. Tokens are read only after that account read verified, and never on an anchor older
-than the stored one, so the native rule against stepping back holds for them as well.
+**The decimals.** A built-in token's decimals are pinned. A custom token's are asked from
+its contract (`decimals()`), once per check until an answer is stored with the balance, and
+kept from then on — a failed ask never drops a known scale. A change is shown in the
+contract's scale, and the tab says so when it differs from what Settings → Tokens saved.
 
-The residual case is the Java engine: its `eth_call` can fall back to finalized state while
-its account read did not. In that case a transfer in the last few minutes can show as a
-change and then its reversal. Closing it takes the anchor block on `CallResult` (follow-up).
+**The cause.** A token change is searched in the token's logs. The search reads each
+block's receipts (`eth_getBlockReceipts`, verified against `receiptsRoot`), newest first:
+64 blocks on an unmetered network, 8 on a metered one (`WatchPolicy.tokenScanBlocks`) —
+receipts weigh more than block bodies. One check fetches a block's receipts once, however
+many (address, token) searches cover it, since one rebase moves every holder's balance; it
+keeps only the logs of the listed tokens that name a watched address. The native search
+does the same with block bodies: one transaction can move several watched addresses.
 
-**The cause.** A token change is searched in the token's `Transfer` logs. The search reads
-each block's receipts (`eth_getBlockReceipts`, verified against `receiptsRoot`), newest
-first, in a quarter of the native window: 16 blocks on an unmetered network, 4 on a metered
-one. Receipts weigh more than block bodies.
+A log counts when it comes from this token's contract and is one of:
 
-A log counts when it comes from this token's contract and has `Transfer`'s topic and exactly
-three topics. An ERC-721 `Transfer` indexes the id as a fourth and moves no balance. Such a
-log names a transfer **from** the address (sent), **to** it (received) or both, with the
-amount and the transaction hash.
+- `Transfer(from, to, value)` with exactly three topics — an ERC-721 `Transfer` indexes the id as a fourth and moves no balance — from the address (sent) or to it (received); one from the address to itself moves nothing and is skipped;
+- `Deposit(dst, wad)` or `Withdrawal(src, wad)` naming the address: a wrapped native token (WETH9, WXDAI) mints and burns with these, without a `Transfer`. A wrapper that also emits a mint or burn `Transfer` is named by the `Transfer` alone.
 
-When a complete search finds no `Transfer`, the contract changed the balance itself. A
-rebasing token does that daily (stETH), and so does one that takes a fee or adjusts balances
+An address topic whose upper 12 bytes are not zero is not an address, and its log is skipped.
+
+Each names the amount and the transaction hash.
+
+When a complete search finds none, the contract changed the balance itself. A rebasing
+token does that daily (stETH), and so does one that takes a fee or adjusts balances
 directly. The texts say so.
 
 ## Storage
@@ -184,7 +198,6 @@ directly. The texts say so.
 
 ## Limits and follow-ups
 
-- **The `eth_call` anchor block.** `CallResult` carries no block number (above). Adding it to the engine API — the Rust engine already reports it in its call JSON — would anchor each token observation to its own block and close the Java engine's finalized-fallback case.
 - **A ranged block read.** Each block read of a cause search fetches its own header window up to the anchor, ~11% on top of the bodies, and only after a detected change.
 - **iOS.** No Watch tab yet (above).
-- **Cost.** Every check reads every listed token of every address: 14 built-in tokens on mainnet, so 15 reads per address. The time bound and the least-recently-attempted order keep a long list from starving anything. A watched address that holds none of the tokens still pays for reading them, because an incoming transfer to a zero balance is exactly what the watch is for.
+- **Cost.** Every check that reads tokens reads every listed token of every address: 14 built-in tokens on mainnet, so 15 reads per address (every 15 minutes at most on a metered network). The time bound, the natives-first order and the least-recently-attempted order keep a long list from starving anything. A watched address that holds none of the tokens still pays for reading them, because an incoming transfer to a zero balance is exactly what the watch is for.

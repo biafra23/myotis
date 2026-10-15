@@ -42,9 +42,9 @@ object BalanceWatchRunner {
      *  it lands in the shade with a sound, without peeking over the app in front. */
     private const val CHANNEL_ID = "myotis_balance_watch"
 
-    /** Notification ids: one per watched (network, address), so a later change of the same
-     *  address replaces its notification — the Watch tab keeps the history. Above the web
-     *  refusals' range (1000 + one per refused site). */
+    /** Notification ids: one per watched (network, address, asset), so a later change of the
+     *  same balance replaces its notification — the Watch tab keeps the history. Above the
+     *  web refusals' range (1000 + one per refused site). */
     private const val NOTIFICATION_BASE = 100_000
 
     @Volatile
@@ -81,9 +81,11 @@ object BalanceWatchRunner {
      * interrupt is kept on the thread for its owner to see.
      */
     @JvmStatic
-    fun checkBlocking(c: Context, network: String, handle: ChainHandle, scanBlocks: Int, budgetMs: Long, why: String): Int =
+    fun checkBlocking(c: Context, network: String, handle: ChainHandle, unmetered: Boolean, budgetMs: Long, why: String): Int =
         try {
-            runBlocking { run(c, network, handle, scanBlocks, budgetMs.milliseconds, why) }?.size ?: -1
+            runBlocking {
+                run(c, network, handle, unmetered, budgetMs.milliseconds, why, WatchPolicy.tokenIntervalMs(unmetered))
+            }?.size ?: -1
         } catch (t: Throwable) {
             if (t is InterruptedException) Thread.currentThread().interrupt()
             LogBuffer.w(TAG, "[$network] balance watch ($why) failed: $t")
@@ -95,9 +97,10 @@ object BalanceWatchRunner {
     fun isBusy(c: Context, network: String): Boolean = runBlocking { watcher(c).isChecking(network) }
 
     /** The Watch tab's Check now: [run] in this object's scope, bounded like a scheduled
-     *  check ([CHECK_NOW_BUDGET]); throws what the reads throw. */
-    suspend fun check(c: Context, network: String, handle: ChainHandle, scanBlocks: Int): List<WatchChange>? =
-        scope.async { run(c, network, handle, scanBlocks, CHECK_NOW_BUDGET, "check now") }.await()
+     *  check ([CHECK_NOW_BUDGET]), and reading the token balances whatever the network —
+     *  the user asked; throws what the reads throw. */
+    suspend fun check(c: Context, network: String, handle: ChainHandle, unmetered: Boolean): List<WatchChange>? =
+        scope.async { run(c, network, handle, unmetered, CHECK_NOW_BUDGET, "check now", tokenIntervalMs = 0) }.await()
 
     /** NodeService's scheduled-check budget: a tap on a barely-answering network must not hold
      *  the watcher's slot — and so the idle pause — for tens of minutes. What it leaves unread
@@ -117,11 +120,15 @@ object BalanceWatchRunner {
         c: Context,
         network: String,
         handle: ChainHandle,
-        scanBlocks: Int,
+        unmetered: Boolean,
         budget: Duration,
         why: String,
+        tokenIntervalMs: Long,
     ): List<WatchChange>? {
-        val changes = watcher(c).check(network, HandleReader(handle), scanBlocks, budget) ?: return null
+        val changes = watcher(c).check(
+            network, HandleReader(handle), WatchPolicy.scanBlocks(unmetered), budget,
+            maxTokenScanBlocks = WatchPolicy.tokenScanBlocks(unmetered), tokenIntervalMs = tokenIntervalMs,
+        ) ?: return null
         LogBuffer.i(TAG, "[$network] balance watch ($why): " +
             if (changes.isEmpty()) "no change" else "${changes.size} change(s)")
         if (changes.isNotEmpty()) notify(c, network, changes)
@@ -150,7 +157,7 @@ object BalanceWatchRunner {
             val reads = h.reads() ?: throw IllegalStateException("Verified reads are not available (JSON-RPC backend not started)")
             val (toBytes, dataBytes) = ethCallArgs(to, data)
             val r = runInterruptible(Dispatchers.IO) { reads.callDetailed(null, toBytes, dataBytes, null, "latest", null) }
-            return EthCallResult.of(r.status().name, r.data(), r.detail())
+            return EthCallResult.of(r.status().name, r.data(), r.detail(), r.blockNumber())
         }
 
         override suspend fun receipts(number: Long): String? =

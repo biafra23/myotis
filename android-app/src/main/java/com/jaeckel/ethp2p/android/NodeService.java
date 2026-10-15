@@ -1367,7 +1367,6 @@ public final class NodeService extends Service {
         long interval = WatchPolicy.scheduledIntervalMs(appForeground, stayAwake);
         if (interval <= 0) return;
         android.content.Context app = getApplicationContext();
-        int scan = WatchPolicy.scanBlocks(unmeteredNow(app));
         for (Map.Entry<String, ChainHandle> e : handles.entrySet()) {
             String n = e.getKey();
             ChainHandle h = e.getValue();
@@ -1389,7 +1388,9 @@ public final class NodeService extends Service {
             WATCH_POOL.execute(() -> {
                 try {
                     if (RUNNING.get() && handles.get(n) == h) {
-                        BalanceWatchRunner.checkBlocking(app, n, h, scan, WATCH_BUDGET_MS, "scheduled");
+                        // The network as of the check's start, not the tick's: a check can wait
+                        // its turn on the pool behind other networks' checks.
+                        BalanceWatchRunner.checkBlocking(app, n, h, unmeteredNow(app), WATCH_BUDGET_MS, "scheduled");
                     }
                 } finally {
                     watchQueued.remove(n);
@@ -1412,8 +1413,7 @@ public final class NodeService extends Service {
         if (!watchBackgroundApplies(app)) return WATCH_NOT_RUN;
         if (!BalanceWatchRunner.isDue(app, n, WatchPolicy.FRESH_MS, WatchPolicy.FRESH_MS)) return WATCH_NOT_RUN;
         if (!isSyncedWarm(h)) return WATCH_NOT_RUN;
-        int found = BalanceWatchRunner.checkBlocking(app, n, h, WatchPolicy.scanBlocks(true),
-                WATCH_BUDGET_MS, "before sleep");
+        int found = BalanceWatchRunner.checkBlocking(app, n, h, true, WATCH_BUDGET_MS, "before sleep");
         return found < 0 && BalanceWatchRunner.isBusy(app, n) ? WATCH_BUSY : WATCH_RAN;
     }
 
@@ -1427,16 +1427,12 @@ public final class NodeService extends Service {
                         android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED));
     }
 
-    /** The active network is unmetered (a read error counts as metered: the shorter scan). */
-    private static boolean unmeteredNow(android.content.Context c) {
+    /** The active network is unmetered (a read error counts as metered: the shorter scans and
+     *  the token interval, {@link WatchPolicy}) — for a check started now. */
+    public static boolean unmeteredNow(android.content.Context c) {
         android.net.NetworkCapabilities caps = activeNetworkCapabilities(c);
         return caps != null
                 && caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED);
-    }
-
-    /** The cause-search window for a check started now ({@link WatchPolicy#scanBlocks}). */
-    public static int watchScanBlocks(android.content.Context c) {
-        return WatchPolicy.scanBlocks(unmeteredNow(c));
     }
 
     /** The live stack of [network] for the Watch tab's Check now, or null when it is not running. */
@@ -1752,8 +1748,7 @@ public final class NodeService extends Service {
             if (watchBudgetMs > 0 && watchBackgroundApplies(c)
                     && BalanceWatchRunner.isDue(c, n, WatchPolicy.FRESH_MS, WatchPolicy.FRESH_MS)
                     && isSyncedWarm(h)) {
-                BalanceWatchRunner.checkBlocking(c, n, h, WatchPolicy.scanBlocks(true),
-                        watchBudgetMs, label);
+                BalanceWatchRunner.checkBlocking(c, n, h, true, watchBudgetMs, label);
             }
             // Real user/RPC activity arrived mid-catch-up, or the device went on the charger on
             // an unmetered network meanwhile → leave the stack to the idle controller; otherwise

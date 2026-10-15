@@ -379,7 +379,7 @@ class BalanceWatchTest {
         val text = BalanceWatch.notificationText(c, "ETH")
         assertTrue(text, text.startsWith("Balance 1 → 101 USDC at block 104."))
         assertTrue(text, "Received 100 USDC from ${BalanceWatch.shortAddress(bob)} (tx 0xfeed)" in text)
-        // The token's search reads receipts, newest first, in a quarter of the block window.
+        // The token's search reads receipts, newest first; a native search reads bodies.
         assertEquals(listOf(104L, 103L, 102L, 101L), r.receiptReads)
         assertEquals(emptyList<Any>(), r.blockReads)
     }
@@ -447,27 +447,284 @@ class BalanceWatchTest {
     }
 
     @Test
+    fun theEventTopicsAreTheHashesOfTheirSignatures() {
+        fun topicOf(signature: String) = "0x" + Keccak256.digest(signature.encodeToByteArray())
+            .joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
+        assertEquals(topicOf("Transfer(address,address,uint256)"), BalanceWatch.TRANSFER_TOPIC)
+        assertEquals(topicOf("Deposit(address,uint256)"), BalanceWatch.DEPOSIT_TOPIC)
+        assertEquals(topicOf("Withdrawal(address,uint256)"), BalanceWatch.WITHDRAWAL_TOPIC)
+    }
+
+    @Test
     fun theReceiptParserReadsOnlyThisTokensTransfersOfThisHolder() {
         val other = "0x" + "99".repeat(20)
         val json = receiptsJson(
             transferLog(usdc.address, alice, bob, "0x1", tx = "0x01"),
-            transferLog(usdc.address, alice, alice, "0x2", tx = "0x02"),
+            transferLog(usdc.address, alice, alice, "0x2", tx = "0x02"),   // to itself: no balance move
             transferLog(other, bob, alice, "0x3", tx = "0x03"),             // another contract
             transferLog(usdc.address, bob, "0x" + "cc".repeat(20), "0x4"), // not this holder
             // An ERC-721 Transfer indexes the id: four topics, no balance move.
             """{"address":"${usdc.address}","topics":["${BalanceWatch.TRANSFER_TOPIC}","${topic(bob)}","${topic(alice)}","${topic(bob)}"],"data":"0x"}""",
             """{"address":"${usdc.address}","topics":["0x${"11".repeat(32)}","${topic(bob)}","${topic(alice)}"],"data":"0x5"}""",
+            // A Deposit of another holder, and one claimed by another contract.
+            wrapLog(usdc.address, BalanceWatch.DEPOSIT_TOPIC, bob, "0x6"),
+            wrapLog(other, BalanceWatch.DEPOSIT_TOPIC, alice, "0x7"),
+            // A "to" topic that is no address (dirty upper bytes): not a transfer to name.
+            """{"address":"${usdc.address}","topics":["${BalanceWatch.TRANSFER_TOPIC}","${topic(alice)}","0x${"ff".repeat(32)}"],"data":"0x8"}""",
         )
         assertEquals(
-            listOf(
-                WatchCause(WatchCauseKind.SENT, 7, "0x01", bob, "1"),
-                WatchCause(WatchCauseKind.SELF, 7, "0x02", null, "2"),
-            ),
+            listOf(WatchCause(WatchCauseKind.SENT, 7, "0x01", bob, "1")),
             BalanceWatch.transfersIn(json, alice, usdc, 7),
         )
         assertNull(BalanceWatch.transfersIn("null", alice, usdc, 7))
         assertNull(BalanceWatch.transfersIn("""{"error":"no snap peer available"}""", alice, usdc, 7))
         assertEquals(emptyList<Any>(), BalanceWatch.transfersIn("[]", alice, usdc, 7))
+    }
+
+    @Test
+    fun aWrappedNativeTokenIsTracedToItsDepositAndWithdrawal() = runBlocking {
+        // WETH9 mints on deposit() and burns on withdraw() without a Transfer event.
+        val weth = Token("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "WETH", 18)
+        val k = BalanceWatch.key(alice, BalanceWatch.tokenAsset(weth))
+        val prev = WatchState(addresses = mapOf(
+            alice to WatchAddressState(WatchSeen("5", 0, 100, -1, 0)),
+            k to WatchAddressState(WatchSeen("1000000000000000000", 0, 100, -1, 0)),
+        ))
+        val r = FakeReader().apply {
+            balances[alice] = account(alice, "5", block = 102)
+            tokenBalances[weth.key] = hashMapOf(alice to "2500000000000000000")
+            receipts[101] = receiptsJson(wrapLog(weth.address, BalanceWatch.WITHDRAWAL_TOPIC, alice, "0x6f05b59d3b20000", "0x0b"))
+            receipts[102] = receiptsJson(wrapLog(weth.address, BalanceWatch.DEPOSIT_TOPIC, alice, "0x1bc16d674ec80000", "0x0a"))
+        }
+        val c = BalanceWatch.check(listOf(WatchEntry(alice, "")), prev, r, nowMs = 9, tokens = listOf(weth)).changes.single()
+        assertEquals(
+            listOf(
+                WatchCause(WatchCauseKind.WRAPPED, 102, "0x0a", null, "2000000000000000000"),
+                WatchCause(WatchCauseKind.UNWRAPPED, 101, "0x0b", null, "500000000000000000"),
+            ),
+            c.causes,
+        )
+        assertEquals("Wrapped 2 WETH (tx 0x0a); Unwrapped 0.5 WETH (tx 0x0b).", BalanceWatch.causeSummary(c, "ETH"))
+    }
+
+    @Test
+    fun aWrapperThatAlsoEmitsATransferIsNamedOnce() {
+        val weth = Token("0x" + "77".repeat(20), "WX", 18)
+        val zero = "0x" + "00".repeat(20)
+        val json = receiptsJson(
+            wrapLog(weth.address, BalanceWatch.DEPOSIT_TOPIC, alice, "0x2", "0x0a"),
+            transferLog(weth.address, zero, alice, "0x2", "0x0a"),
+            wrapLog(weth.address, BalanceWatch.DEPOSIT_TOPIC, alice, "0x3", "0x0b"), // a plain WETH9 deposit
+        )
+        assertEquals(
+            listOf(
+                WatchCause(WatchCauseKind.RECEIVED, 7, "0x0a", zero, "2"),
+                WatchCause(WatchCauseKind.WRAPPED, 7, "0x0b", null, "3"),
+            ),
+            BalanceWatch.transfersIn(json, alice, weth, 7),
+        )
+    }
+
+    @Test
+    fun aTokenIsAnchoredToItsCallsOwnBlock() = runBlocking {
+        val prev = WatchState(addresses = mapOf(
+            alice to WatchAddressState(WatchSeen("5", 0, 100, -1, 0)),
+            usdcKey(alice) to WatchAddressState(WatchSeen("1", 0, 100, -1, 0)),
+        ))
+        val r = FakeReader().apply {
+            balances[alice] = account(alice, "5", block = 104)
+            tokenBalances[usdc.key] = hashMapOf(alice to "2")
+            callBlock = 105 // the head moved between the account read and the call
+            (101L..105L).forEach { receipts[it] = receiptsJson() }
+        }
+        val c = BalanceWatch.check(listOf(WatchEntry(alice, "")), prev, r, nowMs = 9, tokens = listOf(usdc)).changes.single()
+        assertEquals(105L, c.toBlock)
+        assertEquals(-1L, c.blockTimestamp) // the account read's timestamp is block 104's
+        assertEquals(listOf(105L, 104L, 103L, 102L, 101L), r.receiptReads)
+        assertEquals(105L, BalanceWatch.check(listOf(WatchEntry(alice, "")), prev, r, nowMs = 9, tokens = listOf(usdc))
+            .state.addresses[usdcKey(alice)]?.seen?.blockNumber)
+    }
+
+    @Test
+    fun aCallOnAnOlderBlockThanTheStoredOneChangesNothing() = runBlocking {
+        // The account read is current, but the call fell back to finalized state.
+        val prev = WatchState(addresses = mapOf(
+            alice to WatchAddressState(WatchSeen("5", 0, 100, -1, 0)),
+            usdcKey(alice) to WatchAddressState(WatchSeen("2", 0, 105, -1, 0)),
+        ))
+        val r = FakeReader().apply {
+            balances[alice] = account(alice, "5", block = 106)
+            tokenBalances[usdc.key] = hashMapOf(alice to "1") // the pre-transfer balance
+            callBlock = 40
+        }
+        val out = BalanceWatch.check(listOf(WatchEntry(alice, "")), prev, r, nowMs = 9, tokens = listOf(usdc))
+        assertEquals(emptyList<Any>(), out.changes)
+        assertEquals(prev.addresses[usdcKey(alice)], out.state.addresses[usdcKey(alice)])
+    }
+
+    @Test
+    fun everyNativeBalanceIsReadBeforeAnyToken() = runBlocking {
+        val r = FakeReader().apply {
+            balances[alice] = account(alice, "5", block = 104)
+            balances[bob] = account(bob, "6", block = 104)
+            tokenBalances[usdc.key] = hashMapOf(alice to "1", bob to "2")
+        }
+        BalanceWatch.check(listOf(WatchEntry(alice, ""), WatchEntry(bob, "")), WatchState(), r, nowMs = 9, tokens = listOf(usdc))
+        assertEquals(listOf("account", "account", "call", "call"), r.reads)
+    }
+
+    @Test
+    fun aTokenWindowOfItsOwnBoundsTheReceiptSearch() = runBlocking {
+        val prev = WatchState(addresses = mapOf(
+            alice to WatchAddressState(WatchSeen("5", 0, 100, -1, 0)),
+            usdcKey(alice) to WatchAddressState(WatchSeen("1", 0, 100, -1, 0)),
+        ))
+        val r = FakeReader().apply {
+            balances[alice] = account(alice, "5", block = 110)
+            tokenBalances[usdc.key] = hashMapOf(alice to "2")
+            (101L..110L).forEach { receipts[it] = receiptsJson() }
+        }
+        val c = BalanceWatch.check(
+            listOf(WatchEntry(alice, "")), prev, r, nowMs = 9, maxScanBlocks = 10, tokens = listOf(usdc), maxTokenScanBlocks = 3,
+        ).changes.single()
+        assertEquals(WatchSearch.PARTIAL, c.search)
+        assertEquals(108L, c.scannedFrom)
+        assertEquals(listOf(110L, 109L, 108L), r.receiptReads)
+    }
+
+    @Test
+    fun oneRebaseReadsEachBlocksReceiptsOnce() = runBlocking {
+        val steth = Token("0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84", "stETH", 18)
+        val prev = WatchState(addresses = listOf(alice, bob).flatMap { a ->
+            listOf(
+                a to WatchAddressState(WatchSeen("5", 0, 100, -1, 0)),
+                BalanceWatch.key(a, BalanceWatch.tokenAsset(steth)) to WatchAddressState(WatchSeen("10", 0, 100, -1, 0)),
+            )
+        }.toMap())
+        val r = FakeReader().apply {
+            balances[alice] = account(alice, "5", block = 102)
+            balances[bob] = account(bob, "5", block = 102)
+            tokenBalances[steth.key] = hashMapOf(alice to "11", bob to "12")
+            receipts[101] = receiptsJson(); receipts[102] = receiptsJson()
+        }
+        val changes = BalanceWatch.check(
+            listOf(WatchEntry(alice, ""), WatchEntry(bob, "")), prev, r, nowMs = 9, tokens = listOf(steth),
+        ).changes
+        assertEquals(2, changes.size)
+        assertEquals(listOf(102L, 101L), r.receiptReads)
+    }
+
+    @Test
+    fun aCustomTokenIsShownInTheDecimalsItsContractSays() = runBlocking {
+        // Saved as 18 decimals in Settings → Tokens; the contract says 6.
+        val mine = Token("0x" + "ab".repeat(20), "MINE", 18, custom = true)
+        val r = FakeReader().apply {
+            balances[alice] = account(alice, "5", block = 104)
+            tokenBalances[mine.key] = hashMapOf(alice to "2500000")
+            tokenDecimals[mine.key] = 6
+        }
+        val k = BalanceWatch.key(alice, BalanceWatch.tokenAsset(mine))
+        val first = BalanceWatch.check(listOf(WatchEntry(alice, "")), WatchState(), r, nowMs = 9, tokens = listOf(mine))
+        assertEquals(6, first.state.addresses[k]?.seen?.decimals)
+        // The stored decimals survive the store, and a change is formatted in them.
+        val stored = BalanceWatch.parseState(BalanceWatch.serializeState(first.state))
+        assertEquals(6, stored.addresses[k]?.seen?.decimals)
+        r.tokenBalances[mine.key] = hashMapOf(alice to "3500000")
+        r.balances[alice] = account(alice, "5", block = 105)
+        r.receipts[105] = receiptsJson(transferLog(mine.address, bob, alice, "0xf4240"))
+        // Once stored, the scale is kept: decimals() is not asked again, and a failed ask
+        // could not drop it either.
+        r.tokenDecimals.remove(mine.key)
+        r.calls.clear()
+        val c = BalanceWatch.check(listOf(WatchEntry(alice, "")), stored, r, nowMs = 10, tokens = listOf(mine)).changes.single()
+        assertEquals(6, c.decimals)
+        assertEquals("${BalanceWatch.shortAddress(alice)}: +1 MINE", BalanceWatch.notificationTitle(c, "ETH"))
+        assertEquals(listOf(mine.key), r.calls) // the balanceOf alone
+    }
+
+    @Test
+    fun aMeteredHostReadsTheTokensOnlyEveryInterval() = runBlocking {
+        val store = StoreSettings()
+        val mine = Token("0x" + "ab".repeat(20), "MINE", 18, custom = true)
+        store.setCustomTokensJson(NET, CustomTokens.serialize(listOf(mine)))
+        store.setWatchListJson(NET, BalanceWatch.serializeList(listOf(WatchEntry(alice, ""))))
+        val r = FakeReader().apply {
+            balances[alice] = account(alice, "5", block = 10)
+            tokenBalances[mine.key] = hashMapOf(alice to "3")
+        }
+        var now = 1_000_000L
+        val watcher = BalanceWatcher(store) { now }
+        val interval = 15 * 60_000L
+        val k = BalanceWatch.key(alice, BalanceWatch.tokenAsset(mine))
+        watcher.check(NET, r, tokenIntervalMs = interval)
+        assertTrue(r.calls.isNotEmpty())
+        assertEquals(now, BalanceWatch.parseState(store.watchStateJson(NET)).addresses[k]?.seen?.checkedAtMs)
+        r.calls.clear()
+        now += 5 * 60_000L
+        watcher.check(NET, r, tokenIntervalMs = interval)
+        assertEquals(emptyList<Any>(), r.calls)
+        assertEquals("3", BalanceWatch.parseState(store.watchStateJson(NET)).addresses[k]?.seen?.balance)
+        now += interval
+        watcher.check(NET, r, tokenIntervalMs = interval)
+        assertTrue(r.calls.isNotEmpty())
+    }
+
+    @Test
+    fun aFailedTokenReadIsRetriedOnTheNextCheckWhateverTheInterval() = runBlocking {
+        val store = StoreSettings()
+        val mine = Token("0x" + "ab".repeat(20), "MINE", 18, custom = true)
+        store.setCustomTokensJson(NET, CustomTokens.serialize(listOf(mine)))
+        store.setWatchListJson(NET, BalanceWatch.serializeList(listOf(WatchEntry(alice, ""))))
+        val r = FakeReader().apply { balances[alice] = account(alice, "5", block = 10) } // the call answers nothing
+        var now = 1_000_000L
+        val watcher = BalanceWatcher(store) { now }
+        val interval = 15 * 60_000L
+        watcher.check(NET, r, tokenIntervalMs = interval)
+        val k = BalanceWatch.key(alice, BalanceWatch.tokenAsset(mine))
+        assertTrue(BalanceWatch.parseState(store.watchStateJson(NET)).addresses[k]?.error != null)
+        r.calls.clear()
+        r.tokenBalances[mine.key] = hashMapOf(alice to "3")
+        now += 60_000L
+        watcher.check(NET, r, tokenIntervalMs = interval)
+        assertTrue(r.calls.isNotEmpty())
+        assertEquals("3", BalanceWatch.parseState(store.watchStateJson(NET)).addresses[k]?.seen?.balance)
+    }
+
+    @Test
+    fun tokensGetTheirTurnWhenTheNativeReadsAreSlow() = runBlocking {
+        val many = (1..10).map { "0x" + it.toString(16).padStart(2, '0').repeat(20) }
+        val slow = object : FakeReader() {
+            override suspend fun account(address: String): AccountResult {
+                synchronized(reads) { reads += "account" }
+                delay(40)
+                return account(address, "5", block = 10)
+            }
+        }
+        slow.tokenBalances[usdc.key] = HashMap(many.associateWith { "1" })
+        val out = BalanceWatch.check(
+            many.map { WatchEntry(it, "") }, WatchState(), slow, nowMs = 9, budget = 200.milliseconds, tokens = listOf(usdc),
+        )
+        // The native reads stopped at half the budget, which left time for the tokens.
+        val nativesRead = slow.reads.count { it == "account" }
+        assertTrue("$nativesRead", nativesRead in 1 until many.size)
+        assertEquals(nativesRead, slow.calls.size)
+        assertEquals(nativesRead, out.state.addresses.count { (k, a) -> "/" in k && a.seen != null })
+    }
+
+    @Test
+    fun oneBlockIsReadOnceForEveryWatchedAddressItMoved() = runBlocking {
+        val prev = WatchState(addresses = mapOf(
+            alice to WatchAddressState(WatchSeen("5", 0, 100, -1, 0)),
+            bob to WatchAddressState(WatchSeen("5", 0, 100, -1, 0)),
+        ))
+        val r = FakeReader().apply {
+            balances[alice] = account(alice, "4", block = 101, nonce = 1)
+            balances[bob] = account(bob, "6", block = 101)
+            blocks[101] = blockJson(101, tx("0xab", alice, bob, "0x1"))
+        }
+        val changes = BalanceWatch.check(listOf(WatchEntry(alice, ""), WatchEntry(bob, "")), prev, r, nowMs = 9).changes
+        assertEquals(listOf(WatchCauseKind.SENT, WatchCauseKind.RECEIVED), changes.map { it.causes.single().kind })
+        assertEquals(listOf(101L), r.blockReads)
     }
 
     @Test
@@ -576,6 +833,9 @@ class BalanceWatchTest {
         """{"address":"$token","topics":["${BalanceWatch.TRANSFER_TOPIC}","${topic(from)}","${topic(to)}"],""" +
             """"data":"$amountHex","transactionHash":"$tx"}"""
 
+    private fun wrapLog(token: String, eventTopic: String, holder: String, amountHex: String, tx: String = "0xfeed") =
+        """{"address":"$token","topics":["$eventTopic","${topic(holder)}"],"data":"$amountHex","transactionHash":"$tx"}"""
+
     private fun receiptsJson(vararg logs: String) =
         """[{"transactionHash":"0xaa","status":"0x1","logs":[${logs.joinToString(",")}]}]"""
 
@@ -603,17 +863,29 @@ class BalanceWatchTest {
         val receipts = HashMap<Long, String>()
         val receiptReads = ArrayList<Long>()
         val calls = ArrayList<String>()
-        override suspend fun account(address: String): AccountResult =
-            balances[address] ?: throw IllegalStateException("Node is not running")
+        /** token contract (lowercase) → what its decimals() answers; absent = empty reply. */
+        val tokenDecimals = HashMap<String, Int>()
+        /** The block a call reports it ran against; -1 = an engine that does not say. */
+        var callBlock = -1L
+        /** "account" / "call", in the order they were asked. */
+        val reads = ArrayList<String>()
+        override suspend fun account(address: String): AccountResult {
+            synchronized(reads) { reads += "account" }
+            return balances[address] ?: throw IllegalStateException("Node is not running")
+        }
         override suspend fun block(number: Long): String? {
             blockReads += number
             return blocks[number]
         }
         override suspend fun call(to: String, data: String): EthCallResult {
+            synchronized(reads) { reads += "call" }
             synchronized(calls) { calls += to.lowercase() }
-            val raw = tokenBalances[to.lowercase()]?.get("0x" + data.takeLast(40))
-                ?: return EthCallResult(EthCallStatus.OK, "0x")
-            return EthCallResult(EthCallStatus.OK, "0x" + java.math.BigInteger(raw).toString(16).padStart(64, '0'))
+            val raw = if (data == Erc20.DECIMALS_CALL) tokenDecimals[to.lowercase()]?.toString()
+            else tokenBalances[to.lowercase()]?.get("0x" + data.takeLast(40))
+            if (raw == null) return EthCallResult(EthCallStatus.OK, "0x", blockNumber = callBlock)
+            return EthCallResult(
+                EthCallStatus.OK, "0x" + java.math.BigInteger(raw).toString(16).padStart(64, '0'), blockNumber = callBlock,
+            )
         }
         override suspend fun receipts(number: Long): String? {
             receiptReads += number

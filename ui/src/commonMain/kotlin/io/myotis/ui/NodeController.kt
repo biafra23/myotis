@@ -328,12 +328,15 @@ data class EthCallResult(
     val dataHex: String?,
     /** The engine's reason, when it gave one (unavailable / refused / infeasible). */
     val detail: String? = null,
+    /** The block whose state the call ran against, when the engine said; -1 otherwise
+     *  (`io.myotis.api.CallResult.blockNumber`). The balance watch orders token reads by it. */
+    val blockNumber: Long = -1,
 ) {
     companion object {
         /** From an engine outcome whose status enum carries [EthCallStatus]'s names
          *  (`io.myotis.api.CallResult.Status`, the iOS backend's `RpcCallResult.Kind`). */
-        fun of(statusName: String, data: ByteArray?, detail: String?): EthCallResult =
-            EthCallResult(EthCallStatus.valueOf(statusName), data?.let { "0x" + toHex(it) }, detail)
+        fun of(statusName: String, data: ByteArray?, detail: String?, blockNumber: Long = -1): EthCallResult =
+            EthCallResult(EthCallStatus.valueOf(statusName), data?.let { "0x" + toHex(it) }, detail, blockNumber)
     }
 }
 

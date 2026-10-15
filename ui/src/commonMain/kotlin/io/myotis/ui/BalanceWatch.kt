@@ -48,11 +48,13 @@ import kotlinx.serialization.json.put
  * chain's native currency ([NATIVE_ASSET]), and each ERC-20 token the network lists
  * ([listedTokens]: the built-in ones and the user's own, from Settings). A token balance
  * is a verified `eth_call` to `balanceOf` ([readTokenRaw] — an empty reply is an error,
- * never a zero). The engine API does not say which block an `eth_call` ran against, so a
- * token observation is anchored to the block of the same address's verified account read
- * in the same check, seconds earlier; tokens are read only after that read verified, and
- * never on an anchor older than the stored one. A token change's cause is searched in the
- * token's `Transfer` logs (block receipts, verified against `receiptsRoot` by the engine).
+ * never a zero). A token observation is anchored at the block the call ran against
+ * ([EthCallResult.blockNumber]; an engine that does not say falls back to the same address's
+ * verified account read in the same check), and an older one than the stored never steps a
+ * balance back. Tokens are read only for addresses whose account read verified in the same
+ * check. A token change's cause is searched in the token's `Transfer` logs — and, for a
+ * wrapped native token (WETH, WXDAI), its `Deposit`/`Withdrawal` — in the block receipts,
+ * which the engine verifies against `receiptsRoot`.
  */
 
 /** The chain's native currency (ETH, xDAI) as a [WatchChange.asset]. */
@@ -69,12 +71,16 @@ data class WatchSeen(
     /** The account nonce — transactions it has sent; 0 for an account that does not exist
      *  yet, and for a token observation. */
     val nonce: Long,
-    /** The block the proof anchored to (for a token: the same check's account read's). */
+    /** The block the proof anchored to; for a token, the block its `eth_call` ran against
+     *  (or, from an engine that does not say, the same check's account read's). */
     val blockNumber: Long,
     /** That block's proven timestamp, unix seconds; -1 when the engine did not date it. */
     val blockTimestamp: Long,
     /** Wall-clock ms of the read. */
     val checkedAtMs: Long,
+    /** For a custom token: what its contract's own `decimals()` answered, when it did — the
+     *  scale its amounts are shown in, whatever Settings → Tokens says. Null otherwise. */
+    val decimals: Int? = null,
 )
 
 /** One watched address's stored state: its last verified observation, and why the newest
@@ -96,6 +102,10 @@ enum class WatchCauseKind {
     SELF,
     /** The address was the block's fee recipient (priority fees, no transaction). */
     FEE_RECIPIENT,
+    /** A wrapped native token (WETH, WXDAI) minted to the address: its `Deposit`. */
+    WRAPPED,
+    /** A wrapped native token burned from the address: its `Withdrawal`. */
+    UNWRAPPED,
 }
 
 /** Something in a block that moved the watched balance. */
@@ -210,17 +220,23 @@ object BalanceWatch {
     /** Stored changes per network; older ones fall off the Watch tab's list. */
     const val MAX_CHANGES: Int = 50
 
-    /** Blocks a change's cause search scans by default, newest first. Hosts pass less
-     *  on a metered network: a mainnet block with its transactions is ~100–200 KB. A token
-     *  change scans a quarter as many: its search reads the blocks' receipts, which weigh
-     *  more than their bodies. */
+    /** Blocks a change's cause search scans by default, newest first — a token change's too,
+     *  in the blocks' receipts, unless the host passes a window of its own. Hosts pass less on
+     *  a metered network: a mainnet block with its transactions is ~100–200 KB, and its
+     *  receipts weigh more. */
     const val DEFAULT_SCAN_BLOCKS: Int = 64
-
-    /** Token balances of one address read at once (the Query tab's bound too). */
-    const val TOKEN_READS_IN_FLIGHT: Int = 4
 
     /** `Transfer(address,address,uint256)`'s event signature, the logs' topic 0. */
     const val TRANSFER_TOPIC: String = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+    /** WETH9's `Deposit(address,uint256)` — a wrap mints without a `Transfer` (WETH, WXDAI). */
+    const val DEPOSIT_TOPIC: String = "0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c"
+
+    /** WETH9's `Withdrawal(address,uint256)` — an unwrap burns without a `Transfer`. */
+    const val WITHDRAWAL_TOPIC: String = "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65"
+
+    /** How a stored "no verified answer" token read says it is retried. */
+    private const val WATCH_RETRY_HINT = " — the next check retries"
 
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -309,9 +325,13 @@ object BalanceWatch {
         (o["seen"] as? JsonObject)?.forEach { (k, v) ->
             val a = v as? JsonObject ?: return@forEach
             val seen = run {
-                val balance = a.str("bal")?.takeIf(::isDecimal) ?: return@run null
+                // "wei" is this branch's first key for it (its test builds stored that).
+                val balance = (a.str("bal") ?: a.str("wei"))?.takeIf(::isDecimal) ?: return@run null
                 val block = a.long("block") ?: return@run null
-                WatchSeen(balance, a.long("nonce") ?: 0, block, a.long("ts") ?: -1, a.long("at") ?: 0)
+                WatchSeen(
+                    balance, a.long("nonce") ?: 0, block, a.long("ts") ?: -1, a.long("at") ?: 0,
+                    a.long("dec")?.toInt()?.takeIf { it in 0..CustomTokens.MAX_DECIMALS },
+                )
             }
             addresses[k] = WatchAddressState(seen, a.str("err"), a.long("errAt") ?: 0)
         }
@@ -339,7 +359,7 @@ object BalanceWatch {
                         blockNumber = x.long("block") ?: -1,
                         txHash = x.str("tx"),
                         counterparty = x.str("cp"),
-                        amount = x.str("amt")?.takeIf(::isDecimal),
+                        amount = (x.str("amt") ?: x.str("wei"))?.takeIf(::isDecimal),
                     )
                 } ?: emptyList(),
                 asset = c.str("asset") ?: NATIVE_ASSET,
@@ -347,7 +367,10 @@ object BalanceWatch {
                 decimals = c.long("decimals")?.toInt()?.takeIf { it in 0..CustomTokens.MAX_DECIMALS } ?: 18,
             )
         }?.take(MAX_CHANGES) ?: emptyList()
-        return WatchState(addresses, changes, o.long("lastCheckMs") ?: 0, o.long("lastAttemptMs") ?: 0)
+        return WatchState(
+            addresses, changes,
+            o.long("lastCheckMs") ?: 0, o.long("lastAttemptMs") ?: 0,
+        )
     }
 
     @JvmStatic
@@ -364,6 +387,7 @@ object BalanceWatch {
                         put("block", it.blockNumber)
                         put("ts", it.blockTimestamp)
                         put("at", it.checkedAtMs)
+                        it.decimals?.let { d -> put("dec", d) }
                     }
                     a.error?.let { put("err", it) }
                     if (a.error != null) put("errAt", a.errorAtMs)
@@ -425,20 +449,27 @@ object BalanceWatch {
     data class Outcome(val state: WatchState, val changes: List<WatchChange>)
 
     /**
-     * Read every entry's balances through [reader] and compare them with [previous]: its
-     * native balance, then — once that read verified, on an anchor no older than the stored
-     * one — its balance of each of [tokens]. The first verified read of a balance is its
-     * baseline (no change); a later one that differs is a [WatchChange]. Its cause is
-     * searched in at most [maxScanBlocks] blocks, newest first — a token's in a quarter as
-     * many blocks' receipts. State for balances no longer listed is dropped.
+     * Read every entry's balances through [reader] and compare them with [previous]. First
+     * every native balance; then the balance of each of [tokens] of every address whose
+     * account read verified in this check. The first verified read of a balance is its
+     * baseline (no change); a later one that differs is a [WatchChange]. Its cause is searched
+     * in at most [maxScanBlocks] blocks, newest first — a token's in at most
+     * [maxTokenScanBlocks] blocks' receipts. State for balances no longer listed is dropped.
+     *
+     * A token balance verified less than [tokenIntervalMs] ago (0, the default: never) is not
+     * read again — a host on a metered network reads its many `eth_call`s less often than the
+     * one proof per address. One whose newest read failed, or that was never read, is due on
+     * every check.
      *
      * [budget] bounds the whole check — a background pass has a deadline of its own
      * (WorkManager stops a worker at ~10 min). It is checked before every read: past it,
      * the cause search stops where it is (the change keeps what it found, as PARTIAL)
      * and the balances not read yet keep their stored state untouched, for the next check
-     * — which reads them first: addresses go least recently attempted first (by their
-     * least recently attempted balance), and so do an address's tokens. A single read
-     * already running is not cut short; its own bound applies.
+     * — which reads them first: the native balances go least recently attempted first, and
+     * so do the (address, token) pairs. While token balances are due, the native reads stop
+     * at half the budget (their cause searches may use all of it), so neither a long token
+     * list nor a slow native phase keeps the other out of every check. A single read already
+     * running is not cut short; its own bound applies.
      */
     suspend fun check(
         entries: List<WatchEntry>,
@@ -448,6 +479,8 @@ object BalanceWatch {
         maxScanBlocks: Int = DEFAULT_SCAN_BLOCKS,
         budget: Duration = Duration.INFINITE,
         tokens: List<Token> = emptyList(),
+        maxTokenScanBlocks: Int = maxScanBlocks,
+        tokenIntervalMs: Long = 0,
     ): Outcome {
         val started = TimeSource.Monotonic.markNow()
         val outOfTime = { started.elapsedNow() >= budget }
@@ -455,24 +488,24 @@ object BalanceWatch {
         val found = ArrayList<WatchChange>()
         var anyVerified = false
         fun prevOf(k: String) = previous.addresses[k] ?: WatchAddressState()
-        // Least recently attempted first (never attempted before all): when the budget runs
-        // out, the balances it did not reach lead the next check instead of trailing every
-        // check behind the same ones — and one whose read keeps failing slowly goes to the
-        // back after each attempt rather than leading, and eating, every budget.
-        val order = entries.sortedBy { e ->
-            (listOf(key(e.address)) + tokens.map { key(e.address, tokenAsset(it)) })
-                .minOf { lastAttempt(previous.addresses[it]) }
-        }
-        for (e in order) {
-            val nativeKey = key(e.address)
-            val tokenKeys = tokens.map { key(e.address, tokenAsset(it)) }
-            val prev = prevOf(nativeKey)
-            // Until this address's account read verifies on a current anchor, its token
-            // balances have none to be anchored to: they keep their stored state.
-            fun keepTokens() = tokenKeys.forEach { addresses[it] = prevOf(it) }
-            if (outOfTime()) {
-                addresses[nativeKey] = prev
-                keepTokens()
+        fun tokenDue(e: WatchEntry, t: Token) = tokenDue(previous.addresses[key(e.address, tokenAsset(t))], nowMs, tokenIntervalMs)
+        val tokensWait = entries.any { e -> tokens.any { t -> tokenDue(e, t) } }
+        val nativeBudget = if (tokensWait && budget.isFinite()) budget / 2 else budget
+        val nativeOutOfTime = { started.elapsedNow() >= nativeBudget }
+        val watched = entries.mapTo(HashSet()) { it.address }
+
+        // ---- the native balances: least recently attempted first (never attempted before
+        // all), so what a spent budget left out leads the next check, and a read that keeps
+        // failing slowly goes to the back after each attempt instead of eating every budget.
+        val anchors = HashMap<String, AccountResult>() // address → its verified, current account read
+        // One fetch per block for the whole check, kept as what it holds for the watched
+        // addresses only: one transaction can move several of them.
+        val blocks = HashMap<Long, BlockSlice?>()
+        for (e in entries.sortedBy { lastAttempt(previous.addresses[key(it.address)]) }) {
+            val k = key(e.address)
+            val prev = prevOf(k)
+            if (nativeOutOfTime()) {
+                addresses[k] = prev
                 continue
             }
             val r = try {
@@ -480,14 +513,12 @@ object BalanceWatch {
             } catch (c: CancellationException) {
                 throw c
             } catch (t: Throwable) {
-                addresses[nativeKey] = prev.copy(error = t.message ?: t::class.simpleName ?: "read failed", errorAtMs = nowMs)
-                keepTokens()
+                addresses[k] = prev.copy(error = t.message ?: t::class.simpleName ?: "read failed", errorAtMs = nowMs)
                 continue
             }
             val balance = if (r.exists) r.balanceWei else "0"
             if (!isVerified(r) || balance == null || !isDecimal(balance)) {
-                addresses[nativeKey] = prev.copy(error = r.failReason ?: "unverified", errorAtMs = nowMs)
-                keepTokens()
+                addresses[k] = prev.copy(error = r.failReason ?: "unverified", errorAtMs = nowMs)
                 continue
             }
             anyVerified = true
@@ -495,16 +526,18 @@ object BalanceWatch {
             val now = WatchSeen(normalizeDecimal(balance), nonce, r.blockNumber, r.blockTimestamp, nowMs)
             val old = prev.seen
             // An older anchor than the stored one (a finalized fallback): no news, and never a
-            // step back — see the file header. The tokens wait for a current anchor too.
+            // step back — see the file header.
             if (old != null && r.blockNumber < old.blockNumber) {
-                addresses[nativeKey] = WatchAddressState(old)
-                keepTokens()
+                addresses[k] = WatchAddressState(old)
                 continue
             }
-            addresses[nativeKey] = WatchAddressState(now)
+            addresses[k] = WatchAddressState(now)
+            anchors[e.address] = r
             if (old != null && old.balance != now.balance) {
-                val (search, scannedFrom, causes) =
-                    findCauses(e.address, old.blockNumber, r.blockNumber, reader, maxScanBlocks, outOfTime)
+                val (search, scannedFrom, causes) = scan(old.blockNumber, r.blockNumber, maxScanBlocks, outOfTime) { b ->
+                    val slice = if (b in blocks) blocks[b] else reader.block(b)?.let { blockSlice(it, watched) }.also { blocks[b] = it }
+                    slice?.let { causesIn(it, e.address, b) }
+                }
                 found += WatchChange(
                     address = e.address, label = e.label,
                     oldBalance = old.balance, newBalance = now.balance,
@@ -514,37 +547,73 @@ object BalanceWatch {
                     search = search, scannedFrom = scannedFrom, causes = causes,
                 )
             }
-            if (tokens.isEmpty()) continue
-            // The address's tokens, least recently attempted first, a few reads at a time.
-            val reads = readTokens(e.address, tokens.sortedBy { lastAttempt(previous.addresses[key(e.address, tokenAsset(it))]) }, reader, outOfTime)
+        }
+
+        // ---- the token balances: every pair keeps its stored state unless read below.
+        for (e in entries) for (t in tokens) key(e.address, tokenAsset(t)).let { addresses[it] = prevOf(it) }
+        val pairs = entries.filter { it.address in anchors }
+            .flatMap { e -> tokens.filter { tokenDue(e, it) }.map { e to it } }
+            .sortedBy { (e, t) -> lastAttempt(previous.addresses[key(e.address, tokenAsset(t))]) }
+        if (pairs.isNotEmpty()) {
+            val call: EthCall = { to, data -> reader.call(to, data) }
+            val reads = readTokens(pairs, call, outOfTime)
+            // A custom token's own decimals(): the scale its amounts are shown in (a built-in
+            // token's are pinned). Kept once a read stored them; asked, once per check, only
+            // while none is stored — so a failed ask never drops a known scale.
+            val chainDecimals = HashMap<String, Int?>()
             for (t in tokens) {
-                val k = key(e.address, tokenAsset(t))
-                val tokenPrev = prevOf(k)
-                val read = reads[t.key]
-                when {
-                    read == null -> addresses[k] = tokenPrev // out of time before it was read
-                    read.raw == null -> addresses[k] = tokenPrev.copy(error = read.error ?: "unreadable", errorAtMs = nowMs)
-                    else -> {
-                        anyVerified = true
-                        val seen = WatchSeen(normalizeDecimal(read.raw), 0, r.blockNumber, r.blockTimestamp, nowMs)
-                        val was = tokenPrev.seen
-                        addresses[k] = WatchAddressState(if (was != null && r.blockNumber < was.blockNumber) was else seen)
-                        if (was != null && r.blockNumber >= was.blockNumber && was.balance != seen.balance) {
-                            val (search, scannedFrom, causes) = findTokenCauses(
-                                e.address, t, was.blockNumber, r.blockNumber, reader, maxScanBlocks / 4, outOfTime,
-                            )
-                            found += WatchChange(
-                                address = e.address, label = e.label,
-                                oldBalance = was.balance, newBalance = seen.balance,
-                                oldNonce = old?.nonce ?: nonce, newNonce = nonce,
-                                fromBlock = was.blockNumber, toBlock = r.blockNumber,
-                                blockTimestamp = r.blockTimestamp, detectedAtMs = nowMs,
-                                search = search, scannedFrom = scannedFrom, causes = causes,
-                                asset = tokenAsset(t), symbol = t.symbol, decimals = t.decimals,
-                            )
-                        }
-                    }
+                if (!t.custom) continue
+                val stored = previous.addresses.entries.firstNotNullOfOrNull { (k, a) ->
+                    a.seen?.decimals?.takeIf { k.endsWith("/" + tokenAsset(t)) }
                 }
+                chainDecimals[t.key] = stored ?: if (
+                    !outOfTime() && pairs.any { (e, p) -> p == t && reads[key(e.address, tokenAsset(t))]?.raw != null }
+                ) readTokenDecimals(call, t) else null
+            }
+            // One fetch per block's receipts for the whole check, kept as the logs that concern
+            // the listed tokens and watched addresses only: one rebase moves every holder's
+            // balance, and their searches cover the same blocks.
+            val tokenKeys = tokens.mapTo(HashSet()) { it.key }
+            val receipts = HashMap<Long, List<TokenLog>?>()
+            for ((e, t) in pairs) {
+                val k = key(e.address, tokenAsset(t))
+                val read = reads[k] ?: continue // out of time before it was read
+                val tokenPrev = prevOf(k)
+                if (read.raw == null) {
+                    addresses[k] = tokenPrev.copy(error = read.error ?: "unreadable", errorAtMs = nowMs)
+                    continue
+                }
+                anyVerified = true
+                val anchor = anchors.getValue(e.address)
+                // The call's own block; an engine that does not say falls back to the account
+                // read's, from this check's native phase.
+                val block = read.blockNumber.takeIf { it > 0 } ?: anchor.blockNumber
+                val seen = WatchSeen(
+                    normalizeDecimal(read.raw), 0, block,
+                    if (block == anchor.blockNumber) anchor.blockTimestamp else -1, nowMs,
+                    chainDecimals[t.key],
+                )
+                val was = tokenPrev.seen
+                if (was != null && block < was.blockNumber) {
+                    addresses[k] = WatchAddressState(was) // an older anchor: never a step back
+                    continue
+                }
+                addresses[k] = WatchAddressState(seen)
+                if (was == null || was.balance == seen.balance) continue
+                val (search, scannedFrom, causes) = scan(was.blockNumber, block, maxTokenScanBlocks, outOfTime) { b ->
+                    val logs = if (b in receipts) receipts[b]
+                    else reader.receipts(b)?.let { tokenLogs(it, tokenKeys, watched) }.also { receipts[b] = it }
+                    logs?.let { transfersIn(it, e.address, t, b) }
+                }
+                found += WatchChange(
+                    address = e.address, label = e.label,
+                    oldBalance = was.balance, newBalance = seen.balance,
+                    oldNonce = 0, newNonce = 0,
+                    fromBlock = was.blockNumber, toBlock = block,
+                    blockTimestamp = seen.blockTimestamp, detectedAtMs = nowMs,
+                    search = search, scannedFrom = scannedFrom, causes = causes,
+                    asset = tokenAsset(t), symbol = t.symbol, decimals = seen.decimals ?: t.decimals,
+                )
             }
         }
         val state = WatchState(
@@ -556,25 +625,32 @@ object BalanceWatch {
         return Outcome(state, found)
     }
 
+    /** Whether a token balance stored as [a] is read on a check at [nowMs]: always without an
+     *  interval, when never read or its newest read failed, else once [intervalMs] passed
+     *  since it was last verified. */
+    private fun tokenDue(a: WatchAddressState?, nowMs: Long, intervalMs: Long): Boolean {
+        val seen = a?.seen
+        return intervalMs <= 0 || seen == null || a.error != null || elapsed(seen.checkedAtMs, nowMs, intervalMs)
+    }
+
     /** When [a] was last attempted, verified or not; never attempted sorts first. */
     private fun lastAttempt(a: WatchAddressState?): Long =
         if (a == null) Long.MIN_VALUE else maxOf(a.seen?.checkedAtMs ?: 0, if (a.error != null) a.errorAtMs else 0)
 
-    /** [holder]'s balances of [tokens] ([readTokenRaw]), [TOKEN_READS_IN_FLIGHT] at a time,
-     *  keyed by [Token.key]; a token the budget left unread is absent. */
+    /** The balances of [pairs] ([readTokenRaw]), the Query tab's [TOKEN_READS_IN_FLIGHT] at a
+     *  time, keyed by [key]; a pair the budget left unread is absent. */
     private suspend fun readTokens(
-        holder: String,
-        tokens: List<Token>,
-        reader: WatchReader,
+        pairs: List<Pair<WatchEntry, Token>>,
+        call: EthCall,
         outOfTime: () -> Boolean,
     ): Map<String, TokenBalance> {
         val permits = Semaphore(TOKEN_READS_IN_FLIGHT)
-        val call: EthCall = { to, data -> reader.call(to, data) }
         return coroutineScope {
-            tokens.map { t ->
+            pairs.map { (e, t) ->
                 async {
                     permits.withPermit {
-                        if (outOfTime()) null else t.key to readTokenRaw(call, holder, t)
+                        if (outOfTime()) null
+                        else key(e.address, tokenAsset(t)) to readTokenRaw(call, e.address, t, WATCH_RETRY_HINT)
                     }
                 }
             }.awaitAll().filterNotNull().toMap()
@@ -588,16 +664,15 @@ object BalanceWatch {
     private data class Search(val search: WatchSearch, val scannedFrom: Long, val causes: List<WatchCause>)
 
     /** Scan blocks ([fromBlock], [toBlock]] newest first, at most [maxScanBlocks] of them,
-     *  for what touched [address]. Stops at the first block without a verified answer, and
-     *  when [outOfTime] says so (then only the blocks scanned so far count: PARTIAL, or
-     *  NONE before the first). */
-    private suspend fun findCauses(
-        address: String,
+     *  asking [inBlock] what each one did (null: no verified answer). Stops at the first
+     *  block without one, and when [outOfTime] says so (then only the blocks scanned so far
+     *  count: PARTIAL, or NONE before the first). */
+    private suspend fun scan(
         fromBlock: Long,
         toBlock: Long,
-        reader: WatchReader,
         maxScanBlocks: Int,
         outOfTime: () -> Boolean,
+        inBlock: suspend (Long) -> List<WatchCause>?,
     ): Search {
         if (maxScanBlocks <= 0 || toBlock <= fromBlock) return Search(WatchSearch.NONE, -1, emptyList())
         val lowest = maxOf(fromBlock + 1, toBlock - maxScanBlocks + 1)
@@ -608,29 +683,54 @@ object BalanceWatch {
             if (outOfTime()) {
                 return Search(if (scannedFrom < 0) WatchSearch.NONE else WatchSearch.PARTIAL, scannedFrom, causes)
             }
-            val text = try {
-                reader.block(b)
+            val got = try {
+                inBlock(b)
             } catch (c: CancellationException) {
                 throw c
             } catch (_: Throwable) {
                 null
-            }
-            val inBlock = text?.let { causesIn(it, address, b) }
-                ?: return Search(WatchSearch.UNAVAILABLE, scannedFrom, causes)
-            causes += inBlock
+            } ?: return Search(WatchSearch.UNAVAILABLE, scannedFrom, causes)
+            causes += got
             scannedFrom = b
             b--
         }
         return Search(if (lowest == fromBlock + 1) WatchSearch.COMPLETE else WatchSearch.PARTIAL, scannedFrom, causes)
     }
 
+    /** One block's transaction as the native cause search reads it: who sent it, to whom
+     *  (null for a contract creation), its hash and its value (hex wei). */
+    internal data class BlockTx(val hash: String?, val from: String?, val to: String?, val value: String?)
+
+    /** What a block holds for a set of addresses: its fee recipient and the transactions
+     *  from or to any of them, in block order. */
+    internal data class BlockSlice(val miner: String?, val txs: List<BlockTx>)
+
+    /**
+     * Block [blockJson] — `eth_getBlockByNumber` JSON with full transactions, verified
+     * against the header's `transactionsRoot` by the engine — cut down to what touches
+     * [addresses] (lowercase), so a check can keep it for every watched address's search.
+     * Null when [blockJson] is no such block (the literal "null", an error envelope, a
+     * hashes-only body, unparseable text): the caller must not read "nothing found" into a
+     * block it could not see.
+     */
+    internal fun blockSlice(blockJson: String, addresses: Set<String>): BlockSlice? {
+        val o = runCatching { json.parseToJsonElement(blockJson) as? JsonObject }.getOrNull() ?: return null
+        val txs = o["transactions"] as? JsonArray ?: return null
+        val out = ArrayList<BlockTx>()
+        for (el in txs) {
+            val tx = el as? JsonObject ?: return null // hashes only: cannot tell who sent what
+            val from = tx.str("from")?.lowercase()
+            val to = tx.str("to")?.lowercase()
+            if (from in addresses || to in addresses) out += BlockTx(tx.str("hash"), from, to, tx.str("value"))
+        }
+        return BlockSlice(o.str("miner")?.lowercase(), out)
+    }
+
     /**
      * What in block [blockNumber] — `eth_getBlockByNumber` JSON with full transactions —
      * touched [address]: transactions from or to it (verified against the header's
      * `transactionsRoot` by the engine) and the fee-recipient credit (`miner`, a header
-     * field). Null when [blockJson] is no such block (the literal "null", an error
-     * envelope, a hashes-only body, unparseable text): the caller must not read "nothing
-     * found" into a block it could not see.
+     * field). Null when [blockJson] is no such block ([blockSlice]).
      *
      * Not withdrawals: neither engine's block JSON carries the `withdrawals` list (only
      * `withdrawalsRoot`), so a validator withdrawal is one of the things the texts name
@@ -638,121 +738,122 @@ object BalanceWatch {
      * verify it against `withdrawalsRoot` before this reads it.
      */
     @JvmStatic
-    fun causesIn(blockJson: String, address: String, blockNumber: Long): List<WatchCause>? {
-        val o = runCatching { json.parseToJsonElement(blockJson) as? JsonObject }.getOrNull() ?: return null
-        val txs = o["transactions"] as? JsonArray ?: return null
+    fun causesIn(blockJson: String, address: String, blockNumber: Long): List<WatchCause>? =
+        blockSlice(blockJson, setOf(address.lowercase()))?.let { causesIn(it, address, blockNumber) }
+
+    internal fun causesIn(block: BlockSlice, address: String, blockNumber: Long): List<WatchCause> {
         val me = address.lowercase()
         val out = ArrayList<WatchCause>()
-        for (el in txs) {
-            val tx = el as? JsonObject ?: return null // hashes only: cannot tell who sent what
-            val from = tx.str("from")?.lowercase()
-            val to = tx.str("to")?.lowercase()
+        for (tx in block.txs) {
             val kind = when {
-                from == me && to == me -> WatchCauseKind.SELF
-                from == me -> WatchCauseKind.SENT
-                to == me -> WatchCauseKind.RECEIVED
+                tx.from == me && tx.to == me -> WatchCauseKind.SELF
+                tx.from == me -> WatchCauseKind.SENT
+                tx.to == me -> WatchCauseKind.RECEIVED
                 else -> continue
             }
             out += WatchCause(
                 kind = kind,
                 blockNumber = blockNumber,
-                txHash = tx.str("hash"),
+                txHash = tx.hash,
                 counterparty = when (kind) {
-                    WatchCauseKind.SENT -> to
-                    WatchCauseKind.RECEIVED -> from
+                    WatchCauseKind.SENT -> tx.to
+                    WatchCauseKind.RECEIVED -> tx.from
                     else -> null
                 },
-                amount = tx.str("value")?.let(::hexToDecimal),
+                amount = tx.value?.let(::hexToDecimal),
             )
         }
-        if (o.str("miner")?.lowercase() == me) {
-            out += WatchCause(WatchCauseKind.FEE_RECIPIENT, blockNumber)
-        }
+        if (block.miner == me) out += WatchCause(WatchCauseKind.FEE_RECIPIENT, blockNumber)
         return out
     }
 
-    /** [findCauses] for a token: the `Transfer` logs of [token] to or from [holder] in the
-     *  receipts of blocks ([fromBlock], [toBlock]], newest first, at most [maxScanBlocks]. */
-    private suspend fun findTokenCauses(
-        holder: String,
-        token: Token,
-        fromBlock: Long,
-        toBlock: Long,
-        reader: WatchReader,
-        maxScanBlocks: Int,
-        outOfTime: () -> Boolean,
-    ): Search {
-        if (maxScanBlocks <= 0 || toBlock <= fromBlock) return Search(WatchSearch.NONE, -1, emptyList())
-        val lowest = maxOf(fromBlock + 1, toBlock - maxScanBlocks + 1)
-        val causes = ArrayList<WatchCause>()
-        var scannedFrom = -1L
-        var b = toBlock
-        while (b >= lowest) {
-            if (outOfTime()) {
-                return Search(if (scannedFrom < 0) WatchSearch.NONE else WatchSearch.PARTIAL, scannedFrom, causes)
-            }
-            val text = try {
-                reader.receipts(b)
-            } catch (c: CancellationException) {
-                throw c
-            } catch (_: Throwable) {
-                null
-            }
-            val inBlock = text?.let { transfersIn(it, holder, token, b) }
-                ?: return Search(WatchSearch.UNAVAILABLE, scannedFrom, causes)
-            causes += inBlock
-            scannedFrom = b
-            b--
-        }
-        return Search(if (lowest == fromBlock + 1) WatchSearch.COMPLETE else WatchSearch.PARTIAL, scannedFrom, causes)
-    }
+    /** One token log as the token cause search reads it: the emitting contract (lowercase),
+     *  its topics (lowercase), its data, and its transaction's hash. */
+    internal data class TokenLog(val tx: String?, val token: String, val topics: List<String>, val data: String?)
 
     /**
-     * The `Transfer` logs of [token] that moved [holder]'s balance in block [blockNumber] —
-     * `eth_getBlockReceipts` JSON, verified against the header's `receiptsRoot` by the
-     * engine: from [holder] (SENT) or to it (RECEIVED), with the amount in the token's base
-     * units. Null when [receiptsJson] is no receipt list (the literal "null", an error
-     * envelope, unparseable text), so a block that could not be read is never "nothing
-     * found". A log of another contract claiming the topic is not [token]'s and is skipped.
+     * Block receipts [receiptsJson] — `eth_getBlockReceipts` JSON, verified against the
+     * header's `receiptsRoot` by the engine — cut down to the `Transfer`, `Deposit` and
+     * `Withdrawal` logs of the contracts [tokenKeys] that name one of [holders] (all
+     * lowercase), so a check can keep them for every search. Null when [receiptsJson] is no
+     * receipt list (the literal "null", an error envelope, unparseable text), so a block that
+     * could not be read is never "nothing found".
      */
-    @JvmStatic
-    fun transfersIn(receiptsJson: String, holder: String, token: Token, blockNumber: Long): List<WatchCause>? {
+    internal fun tokenLogs(receiptsJson: String, tokenKeys: Set<String>, holders: Set<String>): List<TokenLog>? {
         val arr = runCatching { json.parseToJsonElement(receiptsJson) as? JsonArray }.getOrNull() ?: return null
-        val me = holder.lowercase()
-        val out = ArrayList<WatchCause>()
+        val out = ArrayList<TokenLog>()
         for (el in arr) {
             val receipt = el as? JsonObject ?: return null
             val logs = receipt["logs"] as? JsonArray ?: continue
             for (le in logs) {
                 val log = le as? JsonObject ?: continue
-                if (log.str("address")?.lowercase() != token.key) continue
+                val token = log.str("address")?.lowercase() ?: continue
+                if (token !in tokenKeys) continue
                 val topics = (log["topics"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.content?.lowercase() }
                     ?: continue
-                // Transfer(address indexed from, address indexed to, uint256 value): an
-                // ERC-721 Transfer indexes the id as a fourth topic and is not a balance move.
-                if (topics.size != 3 || topics[0] != TRANSFER_TOPIC) continue
-                val from = topicAddress(topics[1]) ?: continue
-                val to = topicAddress(topics[2]) ?: continue
-                val kind = when {
-                    from == me && to == me -> WatchCauseKind.SELF
-                    from == me -> WatchCauseKind.SENT
-                    to == me -> WatchCauseKind.RECEIVED
-                    else -> continue
+                val named = when (topics.firstOrNull()) {
+                    TRANSFER_TOPIC -> topics.size == 3 &&
+                        (topicAddress(topics[1]) in holders || topicAddress(topics[2]) in holders)
+                    DEPOSIT_TOPIC, WITHDRAWAL_TOPIC -> topics.size == 2 && topicAddress(topics[1]) in holders
+                    else -> false
                 }
-                out += WatchCause(
-                    kind = kind,
-                    blockNumber = blockNumber,
-                    txHash = log.str("transactionHash") ?: receipt.str("transactionHash"),
-                    counterparty = when (kind) {
-                        WatchCauseKind.SENT -> to
-                        WatchCauseKind.RECEIVED -> from
-                        else -> null
-                    },
-                    amount = log.str("data")?.let(::hexToDecimal),
-                )
+                if (named) {
+                    out += TokenLog(log.str("transactionHash") ?: receipt.str("transactionHash"), token, topics, log.str("data"))
+                }
             }
         }
         return out
+    }
+
+    /**
+     * What [token]'s logs in block [blockNumber] — `eth_getBlockReceipts` JSON, verified
+     * against the header's `receiptsRoot` by the engine — did to [holder]'s balance: a
+     * `Transfer` from [holder] (SENT) or to it (RECEIVED), and a `Deposit` to it (WRAPPED) or
+     * `Withdrawal` from it (UNWRAPPED) — a wrapped native token (WETH9, WXDAI) mints and
+     * burns with these, without a `Transfer`; one that emits both for the same move is named
+     * by its `Transfer` alone. Amounts are in the token's base units. A transfer from
+     * [holder] to itself moves no balance and is not a cause; nor is an ERC-721 `Transfer`
+     * (it indexes the id as a fourth topic), or a log whose address topics are not
+     * addresses. Null when [receiptsJson] is no receipt list ([tokenLogs]). Logs of other
+     * contracts are skipped, whatever topics they claim.
+     */
+    @JvmStatic
+    fun transfersIn(receiptsJson: String, holder: String, token: Token, blockNumber: Long): List<WatchCause>? =
+        tokenLogs(receiptsJson, setOf(token.key), setOf(holder.lowercase()))?.let { transfersIn(it, holder, token, blockNumber) }
+
+    internal fun transfersIn(logs: List<TokenLog>, holder: String, token: Token, blockNumber: Long): List<WatchCause> {
+        val me = holder.lowercase()
+        val out = ArrayList<WatchCause>()
+        for (log in logs) {
+            if (log.token != token.key) continue
+            val t = log.topics
+            val amount = log.data?.let(::hexToDecimal)
+            out += when {
+                // Transfer(address indexed from, address indexed to, uint256 value)
+                t.size == 3 && t[0] == TRANSFER_TOPIC -> {
+                    val from = topicAddress(t[1]) ?: continue
+                    val to = topicAddress(t[2]) ?: continue
+                    when {
+                        from == me && to == me -> continue
+                        from == me -> WatchCause(WatchCauseKind.SENT, blockNumber, log.tx, to, amount)
+                        to == me -> WatchCause(WatchCauseKind.RECEIVED, blockNumber, log.tx, from, amount)
+                        else -> continue
+                    }
+                }
+                t.size == 2 && t[0] == DEPOSIT_TOPIC && topicAddress(t[1]) == me ->
+                    WatchCause(WatchCauseKind.WRAPPED, blockNumber, log.tx, null, amount)
+                t.size == 2 && t[0] == WITHDRAWAL_TOPIC && topicAddress(t[1]) == me ->
+                    WatchCause(WatchCauseKind.UNWRAPPED, blockNumber, log.tx, null, amount)
+                else -> continue
+            }
+        }
+        // A transaction with a Transfer of this holder is named by it: a wrapper that also
+        // emits a mint or burn Transfer must not count the same move twice.
+        val transferred = out.filter { it.kind == WatchCauseKind.SENT || it.kind == WatchCauseKind.RECEIVED }
+            .mapTo(HashSet()) { it.txHash }
+        return out.filter {
+            (it.kind != WatchCauseKind.WRAPPED && it.kind != WatchCauseKind.UNWRAPPED) || it.txHash !in transferred
+        }
     }
 
     /** An indexed address topic (32 bytes, the address in the low 20) as `0x…`, lowercase. */
@@ -845,6 +946,8 @@ object BalanceWatch {
                 "sent$amount to ${x.counterparty?.let(::shortAddress) ?: "a new contract"}$tx"
             WatchCauseKind.SELF -> "a transaction to itself$tx"
             WatchCauseKind.FEE_RECIPIENT -> "fees as block ${grouped(x.blockNumber)}'s fee recipient"
+            WatchCauseKind.WRAPPED -> "wrapped$amount$tx"
+            WatchCauseKind.UNWRAPPED -> "unwrapped$amount$tx"
         }.replaceFirstChar { it.uppercase() }
     }
 
@@ -956,20 +1059,30 @@ class BalanceWatcher(
      * Check [network]'s watch list now. Returns the changes found — empty most of the
      * time — or null when nothing was checked: nothing is watched there, or a check of
      * [network] is already running. The state is stored either way it ran.
+     *
+     * The token balances are read too, each unless it was verified less than
+     * [tokenIntervalMs] ago (0, the default: every check) — a host on a metered network reads
+     * its many `eth_call`s less often than the one proof per address. A token change's cause
+     * is searched in at most [maxTokenScanBlocks] blocks' receipts.
      */
     suspend fun check(
         network: String,
         reader: WatchReader,
         maxScanBlocks: Int = BalanceWatch.DEFAULT_SCAN_BLOCKS,
         budget: Duration = Duration.INFINITE,
+        maxTokenScanBlocks: Int = maxScanBlocks,
+        tokenIntervalMs: Long = 0,
     ): List<WatchChange>? {
         val entries = BalanceWatch.parseList(settings.watchListJson(network))
         if (entries.isEmpty()) return null
         if (!guard.withLock { inFlight.add(network) }) return null
         try {
             val previous = BalanceWatch.parseState(settings.watchStateJson(network))
+            val now = nowMs()
             val out = BalanceWatch.check(
-                entries, previous, reader, nowMs(), maxScanBlocks, budget, tokens = tokens(network),
+                entries, previous, reader, now, maxScanBlocks, budget, tokens = tokens(network),
+                maxTokenScanBlocks = maxTokenScanBlocks,
+                tokenIntervalMs = tokenIntervalMs,
             )
             // Re-read the lists for the write: an address removed while the proofs were
             // being read, or a token removed in Settings, must not come back as stored state.

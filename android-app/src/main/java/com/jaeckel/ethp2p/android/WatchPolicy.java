@@ -7,7 +7,10 @@ package com.jaeckel.ethp2p.android;
  *
  * <ul>
  *   <li><b>App in the foreground</b>: every {@link #FOREGROUND_INTERVAL_MS}, on any network —
- *       the user is looking, and one proof per address is a few KB.</li>
+ *       the user is looking, and one proof per address is a few KB. The token balances are
+ *       an {@code eth_call} each (14 built-in on mainnet, per address), so on a metered
+ *       network each is read at most every {@link #TOKEN_METERED_INTERVAL_MS} (a failed
+ *       one on every check).</li>
  *   <li><b>Plugged in on an unmetered network</b> ({@link #backgroundApplies}): once right
  *       before the idle controller puts a stack to sleep, and once when a catch-up pass has
  *       woken one and brought it to the head. Independent of "Stay awake while charging" —
@@ -35,6 +38,13 @@ final class WatchPolicy {
      *  block with its transactions is ~100–200 KB, so a metered network gets a short one. */
     static final int SCAN_BLOCKS_UNMETERED = 64;
     static final int SCAN_BLOCKS_METERED = 16;
+    /** A token change's search reads block receipts, heavier than bodies: the full window
+     *  on an unmetered network, a short one on a metered network. */
+    static final int TOKEN_SCAN_BLOCKS_UNMETERED = 64;
+    static final int TOKEN_SCAN_BLOCKS_METERED = 8;
+    /** On a metered network a token balance is read at most this often once it verified
+     *  (one whose newest read failed is retried on every check). */
+    static final long TOKEN_METERED_INTERVAL_MS = 15 * 60_000L;
 
     /** Plugged in, and the active network has Internet and is unmetered. */
     static boolean backgroundApplies(boolean pluggedIn, boolean internet, boolean unmetered) {
@@ -55,5 +65,15 @@ final class WatchPolicy {
 
     static int scanBlocks(boolean unmetered) {
         return unmetered ? SCAN_BLOCKS_UNMETERED : SCAN_BLOCKS_METERED;
+    }
+
+    static int tokenScanBlocks(boolean unmetered) {
+        return unmetered ? TOKEN_SCAN_BLOCKS_UNMETERED : TOKEN_SCAN_BLOCKS_METERED;
+    }
+
+    /** How long a check leaves a token balance after it last verified: 0 (every check) on
+     *  an unmetered network, {@link #TOKEN_METERED_INTERVAL_MS} on a metered one. */
+    static long tokenIntervalMs(boolean unmetered) {
+        return unmetered ? 0 : TOKEN_METERED_INTERVAL_MS;
     }
 }

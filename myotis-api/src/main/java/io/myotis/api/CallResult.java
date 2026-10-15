@@ -36,14 +36,35 @@ package io.myotis.api;
  *       — never as return data.</li>
  * </ul>
  *
- * <p>Flat record over FFI-portable types (enum, {@code byte[]}, {@code String})
- * per the engine-contract rules; {@code data}/{@code detail} are null when not
- * applicable to the status.
+ * <p>{@code blockNumber} is the block whose state the call ran against, when
+ * the producer says ({@code -1} otherwise): a {@code latest} call runs against
+ * whatever verified head the engine holds at that moment — the optimistic head,
+ * or a finalized fallback some epochs older — so a caller comparing answers over
+ * time (the apps' balance watch) needs the block to order them. It is set on an
+ * answered call ({@link Status#OK}, {@link Status#REVERTED}) by the Rust engine
+ * and by the Java engine's plain call ({@code callDetailed} without state
+ * overrides, and {@code callTx}); the Java engine's state-override path and the
+ * default {@link VerifiedReads#callDetailed} keep {@code -1}. So a caller must
+ * handle {@code -1} on any status — it is additive, never a guarantee.
+ *
+ * <p>Flat record over FFI-portable types (enum, {@code byte[]}, {@code String},
+ * {@code long}) per the engine-contract rules; {@code data}/{@code detail} are
+ * null when not applicable to the status.
  */
-public record CallResult(Status status, byte[] data, String detail) {
+public record CallResult(Status status, byte[] data, String detail, long blockNumber) {
 
     public CallResult {
         java.util.Objects.requireNonNull(status, "status");
+    }
+
+    /** A result whose block is not known ({@code blockNumber} {@code -1}). */
+    public CallResult(Status status, byte[] data, String detail) {
+        this(status, data, detail, -1L);
+    }
+
+    /** This result, stating that the call ran against block {@code block}. */
+    public CallResult atBlock(long block) {
+        return new CallResult(status, data, detail, block);
     }
 
     public enum Status { OK, REVERTED, UNAVAILABLE, REFUSED, INFEASIBLE }

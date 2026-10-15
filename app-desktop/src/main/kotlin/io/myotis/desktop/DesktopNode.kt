@@ -592,7 +592,7 @@ class DesktopNodeController(
             ?: throw IllegalStateException("Verified reads are not available on $network (JSON-RPC backend not started)")
         val (toBytes, dataBytes) = ethCallArgs(to, data)
         val r = withContext(Dispatchers.IO) { reads.callDetailed(null, toBytes, dataBytes, null, "latest", null) }
-        return EthCallResult.of(r.status().name, r.data(), r.detail())
+        return EthCallResult.of(r.status().name, r.data(), r.detail(), r.blockNumber())
     }
 
     // ------------------------------------------------------------------------------
@@ -722,6 +722,7 @@ class DesktopNodeController(
             override suspend fun receipts(number: Long): String? =
                 withContext(Dispatchers.IO) { handle.reads()?.getBlockReceipts("0x" + number.toString(16)) }
         }
+        // A desktop's network is taken as unmetered: the full windows, tokens on every check.
         val changes = balanceWatcher.check(canonical, reader, BalanceWatch.DEFAULT_SCAN_BLOCKS, budget)
             ?: return null
         log.info("[{}] balance watch ({}): {}", canonical, why,

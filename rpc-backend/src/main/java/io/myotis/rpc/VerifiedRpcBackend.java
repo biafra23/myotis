@@ -2339,7 +2339,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             log.info("[rpc] eth_call " + desc + " ok in "
                     + (clock.elapsedMillis() - t0) + "ms (cached)");
             // hand each reader its own copy; never expose the cached array
-            return io.myotis.api.CallResult.ok(cached.clone());
+            return io.myotis.api.CallResult.ok(cached.clone()).atBlock(h.blockNumber());
         }
         // Route small calls onto the reserved EVM lane so a confirm screen's tiny
         // probes/simulations never queue behind a ~32KB token-sweep storm. The hint
@@ -2409,7 +2409,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                     + (clock.elapsedMillis() - t0) + "ms" + (leader ? "" : " (deduped)"));
             return out == null
                     ? io.myotis.api.CallResult.unavailable("execution returned no result")
-                    : io.myotis.api.CallResult.ok(out);
+                    : io.myotis.api.CallResult.ok(out).atBlock(h.blockNumber());
         } catch (Exception e) {
             // A REVERT is not an error: the EVM ran to completion over verified
             // state and the contract answered no. Surface its payload so the
@@ -2425,7 +2425,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
                 log.info("[rpc] eth_call " + desc + " -> reverted (" + revert.length
                         + " bytes) after " + (clock.elapsedMillis() - t0) + "ms"
                         + (leader ? "" : " (deduped)"));
-                return io.myotis.api.CallResult.reverted(revert);
+                return io.myotis.api.CallResult.reverted(revert).atBlock(h.blockNumber());
             }
             // A fork this engine cannot price (Sepolia past Amsterdam on Besu 26.4)
             // is not "no verified answer right now": no retry can change it, so it

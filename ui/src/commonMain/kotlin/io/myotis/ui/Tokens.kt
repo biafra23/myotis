@@ -332,6 +332,8 @@ data class TokenBalance(
      * Differing from [Token.decimals] means the shown amount is scaled wrong.
      */
     val chainDecimals: Int? = null,
+    /** The block the `balanceOf` call ran against, when the engine said; -1 otherwise. */
+    val blockNumber: Long = -1,
 ) {
     val decimalsMismatch: Boolean get() = chainDecimals != null && chainDecimals != token.decimals
 }
@@ -355,10 +357,12 @@ suspend fun readTokenBalance(
     val balance = readTokenRaw(call, holder, token)
     if (!token.custom || balance.raw == null) return balance
     if (knownChainDecimals != null) return balance.copy(chainDecimals = knownChainDecimals)
-    val chainDecimals = (ethCallOrError(call, token.address, Erc20.DECIMALS_CALL) as? CallRead.Data)
-        ?.let { Erc20.decodeDecimals(it.bytes) }
-    return balance.copy(chainDecimals = chainDecimals)
+    return balance.copy(chainDecimals = readTokenDecimals(call, token))
 }
+
+/** What [token]'s own `decimals()` answers, or null when it does not (or cannot be read). */
+suspend fun readTokenDecimals(call: EthCall, token: Token): Int? =
+    (ethCallOrError(call, token.address, Erc20.DECIMALS_CALL) as? CallRead.Data)?.let { Erc20.decodeDecimals(it.bytes) }
 
 /** A verified `eth_call` of `data` to the contract `to` — [NodeController.ethCall] bound to
  *  one network, or a host's own read of it ([WatchReader.call]). */
@@ -367,11 +371,17 @@ typealias EthCall = suspend (to: String, data: String) -> EthCallResult
 /**
  * [readTokenBalance]'s `balanceOf` read alone, over any [call] — the balance watch reads
  * through its host's [WatchReader] rather than a controller. Same contract: never throws but
- * for cancellation, and an empty reply is an error, never a zero balance.
+ * for cancellation, and an empty reply is an error, never a zero balance. [retryHint] ends
+ * the "no verified answer right now" error: what retries on the caller's screen.
  */
-suspend fun readTokenRaw(call: EthCall, holder: String, token: Token): TokenBalance =
-    when (val r = ethCallOrError(call, token.address, Erc20.balanceOfCall(holder))) {
-        is CallRead.Data -> Erc20.decodeUint256(r.bytes)?.let { TokenBalance(token, it) }
+suspend fun readTokenRaw(
+    call: EthCall,
+    holder: String,
+    token: Token,
+    retryHint: String = QUERY_RETRY_HINT,
+): TokenBalance =
+    when (val r = ethCallOrError(call, token.address, Erc20.balanceOfCall(holder), retryHint)) {
+        is CallRead.Data -> Erc20.decodeUint256(r.bytes)?.let { TokenBalance(token, it, blockNumber = r.block) }
             ?: TokenBalance(
                 token, null,
                 if (r.bytes.isEmpty()) "no reply — no token contract at this address on this network?"
@@ -403,12 +413,15 @@ suspend fun readTokenMetadata(controller: NodeController, network: String, token
     return TokenMetadata(symbol, decimals, error)
 }
 
+/** The Query tab's retry: its Refresh button. */
+private const val QUERY_RETRY_HINT = " — try Refresh"
+
 private sealed class CallRead {
-    class Data(val bytes: ByteArray) : CallRead()
+    class Data(val bytes: ByteArray, val block: Long) : CallRead()
     class Failed(val reason: String) : CallRead()
 }
 
-private suspend fun ethCallOrError(call: EthCall, to: String, data: String): CallRead {
+private suspend fun ethCallOrError(call: EthCall, to: String, data: String, retryHint: String = QUERY_RETRY_HINT): CallRead {
     val r = try {
         call(to, data)
     } catch (c: kotlin.coroutines.cancellation.CancellationException) {
@@ -417,14 +430,14 @@ private suspend fun ethCallOrError(call: EthCall, to: String, data: String): Cal
         return CallRead.Failed(t.message ?: t.toString())
     }
     return when (r.status) {
-        EthCallStatus.OK -> hexToBytes(r.dataHex ?: "0x")?.let { CallRead.Data(it) }
+        EthCallStatus.OK -> hexToBytes(r.dataHex ?: "0x")?.let { CallRead.Data(it, r.blockNumber) }
             ?: CallRead.Failed("malformed reply from the engine")
         EthCallStatus.REVERTED -> CallRead.Failed(
             "the contract reverted" +
                 (r.dataHex?.let(::hexToBytes)?.let(Erc20::revertReason)?.let { ": $it" } ?: ""),
         )
         EthCallStatus.UNAVAILABLE -> CallRead.Failed(
-            "no verified answer right now" + (r.detail?.let { " ($it)" } ?: "") + " — try Refresh",
+            "no verified answer right now" + (r.detail?.let { " ($it)" } ?: "") + retryHint,
         )
         EthCallStatus.REFUSED -> CallRead.Failed("refused by the engine" + (r.detail?.let { ": $it" } ?: ""))
         EthCallStatus.INFEASIBLE -> CallRead.Failed(r.detail ?: "the call cannot run")

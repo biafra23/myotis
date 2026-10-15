@@ -36,5 +36,13 @@ public class WatchPolicyTest {
     @Test
     public void aMeteredNetworkScansFewerBlocks() {
         assertTrue(WatchPolicy.scanBlocks(false) < WatchPolicy.scanBlocks(true));
+        assertTrue(WatchPolicy.tokenScanBlocks(false) < WatchPolicy.tokenScanBlocks(true));
+    }
+
+    @Test
+    public void aMeteredNetworkReadsTheTokensLessOften() {
+        // Pinned: every token balance is an eth_call, ~15 per mainnet address per check.
+        assertEquals(0, WatchPolicy.tokenIntervalMs(true));
+        assertTrue(WatchPolicy.tokenIntervalMs(false) > WatchPolicy.FOREGROUND_INTERVAL_MS);
     }
 }

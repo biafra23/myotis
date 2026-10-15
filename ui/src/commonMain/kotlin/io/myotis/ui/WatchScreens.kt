@@ -308,9 +308,12 @@ private fun TokenLines(tokens: List<Pair<Token, WatchAddressState?>>) {
     val unread = tokens.count { (_, s) -> s?.seen == null && s?.error == null }
     val failed = tokens.filter { (_, s) -> s?.error != null }
     held.forEach { (t, s) ->
+        val seen = s!!.seen!!
+        // A custom token is shown in its contract's own decimals when the contract answered.
+        val decimals = seen.decimals ?: t.decimals
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
-                formatTokenAmount(s!!.seen!!.balance, t.decimals),
+                formatTokenAmount(seen.balance, decimals),
                 Modifier.weight(1f),
                 style = MaterialTheme.typography.bodyLarge,
             )
@@ -318,6 +321,14 @@ private fun TokenLines(tokens: List<Pair<Token, WatchAddressState?>>) {
                 if (t.custom) "${t.symbol} · custom" else t.symbol,
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (decimals != t.decimals) {
+            Text(
+                "The ${t.symbol} contract uses $decimals decimals, Settings → Tokens says ${t.decimals}: " +
+                    "shown in the contract's.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
             )
         }
     }

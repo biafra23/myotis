@@ -251,7 +251,7 @@ class AndroidNodeController(
         // it (the desktop's blocking withContext holds the same way). Then honour the cancel.
         val r = withContext(NonCancellable) { future.await() }
         currentCoroutineContext().ensureActive()
-        return EthCallResult.of(r.status().name, r.data(), r.detail())
+        return EthCallResult.of(r.status().name, r.data(), r.detail(), r.blockNumber())
     }
 
     // TrueBlocks transaction history (Query tab add-on). The service builds the scan at
@@ -277,7 +277,7 @@ class AndroidNodeController(
         val svc = serviceProvider() ?: throw IllegalStateException("Node is not running")
         svc.noteUiActivity()
         val handle = svc.chainHandle(network) ?: throw IllegalStateException("$network is not running")
-        return BalanceWatchRunner.check(appContext, network, handle, NodeService.watchScanBlocks(appContext))
+        return BalanceWatchRunner.check(appContext, network, handle, NodeService.unmeteredNow(appContext))
     }
 
     override val watchSchedule: String =
@@ -437,8 +437,10 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun logIndexWatchJson(network: String): String = NodeService.logIndexWatchJson(ctx, network)
     override fun setLogIndexWatchJson(network: String, json: String) =
         NodeService.setLogIndexWatchJson(ctx, network, json)
-    // The token list is the app's, not the node's: the node service never reads it, so it
-    // lives in the app's own preferences file rather than among NodeService's settings.
+    // The token list is the app's, not the node's: the node never reads it, so it lives in
+    // the app's own preferences file rather than among NodeService's settings. The balance
+    // watch does read it — BalanceWatchRunner, from the service's threads, through an
+    // AndroidSettings over this same file — so the file must stay reachable from there.
     private val tokenPrefs by lazy { ctx.getSharedPreferences("myotis-tokens", Context.MODE_PRIVATE) }
     override fun customTokensJson(network: String): String = tokenPrefs.getString(network, null) ?: "[]"
     override fun setCustomTokensJson(network: String, json: String) =
