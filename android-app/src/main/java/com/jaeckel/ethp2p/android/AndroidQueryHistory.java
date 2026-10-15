@@ -16,7 +16,7 @@ import java.util.List;
  * Persistent most-recent-first history of Query-tab inputs (addresses and ENS
  * names), so the user can re-run a past query with one tap instead of retyping.
  *
- * <p>Follows the {@link AndroidPeerCache} pattern: a filesDir-rooted file,
+ * <p>Follows the peer caches' pattern (now {@code io.myotis.engine.ports.FilePeerCache}): a filesDir-rooted file,
  * tab-separated UTF-8 lines, synchronized writes. Neither hex addresses nor ENS
  * names contain tabs or newlines, so the format stays unambiguous.
  *

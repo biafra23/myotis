@@ -11,7 +11,7 @@ import java.util.concurrent.CompletableFuture;
  * hosts implement the engine API's {@code HttpGateway} port, which
  * {@code PortBridges.toCcipGateway} adapts to this interface: the daemon
  * and the desktop app use {@code JavaHttpCcipGateway} over
- * {@code java.net.http}, and Android uses {@code AndroidCcipGateway} over
+ * {@code java.net.http}, and the engine library's Android/desktop default is {@code io.myotis.engine.ports.UrlConnectionHttpGateway} over
  * {@code HttpURLConnection}. Both deviate from {@code CLAUDE.md}, which
  * asks for Ktor for exactly this transport and rules out java.net.http.
  *

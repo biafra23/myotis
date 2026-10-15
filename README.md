@@ -1009,6 +1009,7 @@ Key Gradle modules (plus the `rust/` Cargo workspace):
 - **myotis-engine-rust** -- the Rust engine behind the `:myotis-api` contract on its own, over the committed UniFFI Kotlin bindings + JNA; no Java-engine dependency and no HTTP server (the loopback listener is a port the selector fills)
 - **myotis-rpc-policy** -- the JSON-RPC serving policy (`RpcBlockWindow`) shared by the Rust engine, the router and the iOS backend; Kotlin Multiplatform, dependency-free
 - **myotis-engine-common** -- `WakeGate` + `SleepMetrics`, the lifecycle primitives both engines' handles share
+- **myotis-engine-ports** -- the engine library's default port actuals (`io.myotis.engine.ports`: the node-key file, the file-backed peer caches, the `HttpURLConnection` CCIP gateway, the per-network file layout), what a consumer hands `create()` when it has none of its own; the Android app's former actuals
 - **node-core** -- the Java engine's adapters (`JavaMyotisEngine`/`JavaChainHandle`) plus the verification ladder over the modules below
 - **core** -- cryptographic identity (`NodeKey`), data types (`BlockHeader`), ENR decoding
 - **networking** -- protocol layers, all Netty-based:

@@ -1,4 +1,4 @@
-package com.jaeckel.ethp2p.android.ens;
+package io.myotis.engine.ports;
 
 import io.myotis.api.ports.HttpGateway;
 
@@ -15,22 +15,21 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * CCIP-Read transport for Android — the engine API's {@link HttpGateway} port, backed
- * by {@link HttpURLConnection}.
+ * The CCIP-Read transport — the engine API's {@link HttpGateway} port, backed by
+ * {@link HttpURLConnection}. The Myotis Android app's gateway, moved into the library.
  *
- * <p>The JVM daemon uses a {@code java.net.http.HttpClient} gateway, but that API is
- * unavailable on Android below API 33 and not covered by {@code coreLibraryDesugaring} —
- * at minSdk 29 it would {@code NoClassDefFound} at runtime. {@link HttpURLConnection}
- * has been present since API 1.
+ * <p>{@code java.net.http.HttpClient} is unavailable on Android below API 33 and not
+ * covered by {@code coreLibraryDesugaring} — at minSdk 29 it would
+ * {@code NoClassDefFound} at runtime — and Ktor would put an HTTP stack into every
+ * consumer's APK for one request shape. {@link HttpURLConnection} has been present
+ * since API 1 and on every JVM.
  *
- * <p>Blocking, per the port contract: the Java engine calls it from its own workers, the
- * Rust engine's JVM adapter ({@code CcipDriver}; the Rust engine is the only one below
- * API 33) on the thread that called the {@code EnsApi}. This is a legitimate outbound
- * HTTP call, not a "data source": ERC-3668 gateway responses are not trusted — the
- * resolver re-validates them via the on-chain callback, so the devp2p/libp2p-only rule
- * holds.
+ * <p>Blocking, per the port contract: the Rust engine's JVM adapter calls it on the
+ * thread that called the {@code EnsApi}. This is a legitimate outbound HTTP call, not a
+ * "data source": ERC-3668 gateway responses are not trusted — the resolver re-validates
+ * them via the on-chain callback, so the devp2p/libp2p-only rule holds.
  */
-public final class AndroidCcipGateway implements HttpGateway {
+public final class UrlConnectionHttpGateway implements HttpGateway {
 
     private static final int CONNECT_TIMEOUT_MS = 10_000;
     private static final int READ_TIMEOUT_MS = 15_000;
@@ -47,7 +46,7 @@ public final class AndroidCcipGateway implements HttpGateway {
     /**
      * Hard cap on the response body. ERC-3668 gateway responses are JSON wrapping a
      * small ABI blob (well under 1 MB); without a cap, a malicious or misconfigured
-     * gateway could stream unbounded data into memory and OOM the app.
+     * gateway could stream unbounded data into memory and OOM the host.
      */
     private static final int MAX_RESPONSE_BYTES = 1_048_576; // 1 MiB
 
@@ -77,12 +76,12 @@ public final class AndroidCcipGateway implements HttpGateway {
     private final long deadlineMs;
     private final Opener opener;
 
-    public AndroidCcipGateway() {
+    public UrlConnectionHttpGateway() {
         this(DEADLINE_MS, url -> (HttpURLConnection) url.openConnection());
     }
 
     /** Tests shrink the deadline and pick the HttpURLConnection. */
-    AndroidCcipGateway(long deadlineMs, Opener opener) {
+    UrlConnectionHttpGateway(long deadlineMs, Opener opener) {
         this.deadlineMs = deadlineMs;
         this.opener = opener;
     }

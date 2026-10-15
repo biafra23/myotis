@@ -2,7 +2,10 @@ package io.myotis.engine
 
 import io.myotis.api.EngineException
 import io.myotis.api.MyotisEngine
+import io.myotis.api.ports.DnsServers
+import io.myotis.engine.ports.DefaultEnginePorts
 import io.myotis.engines.rust.RustMyotisEngine
+import java.nio.file.Path
 
 /**
  * The engine library's entry point: the Rust engine behind the `io.myotis.api`
@@ -12,9 +15,10 @@ import io.myotis.engines.rust.RustMyotisEngine
  * selector; a wallet built on this library needs none.
  *
  * A host supplies its platform through [io.myotis.api.ports.EnginePorts] on
- * `create()` (the node-key store, the peer caches, DNS, the CCIP gateway) and
- * drives the handle it gets back; the engine persists its own sync state under
- * the data dir it is given.
+ * `create()` (the node-key store, the peer caches, DNS, the CCIP gateway) — its
+ * own, or the library's file-backed defaults from [defaultPorts] — and drives the
+ * handle it gets back; the engine persists its own sync state under the data dir
+ * it is given.
  */
 object Myotis {
 
@@ -29,6 +33,23 @@ object Myotis {
      * @throws EngineException when the native library is not available here
      */
     fun newEngine(): MyotisEngine = RustMyotisEngine()
+
+    /**
+     * The library's default ports for one network ([io.myotis.engine.ports]): the
+     * node key under [keyDir], the EL and CL peer caches under [cacheDir] (the
+     * per-network file names of [io.myotis.engine.ports.NetworkFiles], the Myotis
+     * apps' own), the CCIP-Read gateway over `HttpURLConnection`, and [dnsServers]
+     * — the host's DNS servers for EIP-1459 resolution, which a mobile host must
+     * supply (null on a host whose system resolver the engine can use). One
+     * instance per `create()`; [DefaultEnginePorts.ports] is what `create()` takes,
+     * the caches stay reachable on it for a count or a wipe, and
+     * [DefaultEnginePorts.syncSnapshot] names the snapshot path for the
+     * [io.myotis.api.EngineConfig].
+     *
+     * @param network the canonical network name ([MyotisEngine.canonicalNetworkName])
+     */
+    fun defaultPorts(keyDir: Path, cacheDir: Path, network: String, dnsServers: DnsServers? = null): DefaultEnginePorts =
+        DefaultEnginePorts.forNetwork(keyDir, cacheDir, network, dnsServers)
 
     /**
      * Drain up to [max] buffered engine tracing lines (oldest first,

@@ -759,7 +759,7 @@ public final class RLPxConnector implements AutoCloseable {
      *  benched, freeing its slot for a fresh candidate (the snap maintainer refills on
      *  serving count). Twin of the Rust engine's {@code READ_FAILS_EVICT}
      *  (rust/myotis-net/src/el/pool.rs), and deliberately equal to the peer caches'
-     *  snap-failure DENIED threshold ({@code PeerCache}/{@code AndroidPeerCache}
+     *  snap-failure DENIED threshold ({@code PeerCache}/{@code io.myotis.engine.ports.FilePeerCache}
      *  {@code SNAP_FAILURE_THRESHOLD} — they can't import this constant, hosts don't
      *  see {@code :networking}; {@code PeerCacheTest} pins the equality) so eviction
      *  and the persisted verdict move in lockstep: the read that evicts is the read

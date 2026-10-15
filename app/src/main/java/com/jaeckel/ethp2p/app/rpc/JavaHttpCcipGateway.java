@@ -21,7 +21,7 @@ import java.util.concurrent.TimeoutException;
 /**
  * JVM-only {@link HttpGateway} (the engine API's CCIP-Read transport) backed by
  * {@code java.net.http.HttpClient}. Used by the daemon and the desktop app, where
- * JVM 21 is guaranteed. Android uses its own {@code AndroidCcipGateway} over
+ * JVM 21 is guaranteed. the engine library (and so the Android app) uses {@code io.myotis.engine.ports.UrlConnectionHttpGateway} over
  * {@code HttpURLConnection} instead, since the Android app cannot use
  * java.net.http at its minSdk 29 — which is also why this class lives in
  * {@code :app}.
