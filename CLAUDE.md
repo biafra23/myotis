@@ -83,7 +83,8 @@ Key Gradle modules:
   Android AAR (the Myotis app and a separate wallet product) and the desktop jar.
   `io.myotis.engine.Myotis` is the entry point (`newEngine()`: the Rust engine
   with no loopback listener, for an in-process consumer); it re-exports
-  `:myotis-api` and `:myotis-engine-rust`. Its androidMain owns the jniLibs
+  `:myotis-api`, keeping `:myotis-engine-rust` implementation-only (host
+  seams re-exported on `Myotis`). Its androidMain owns the jniLibs
   (`cargoNdkAndroid` builds them there from source) and JNA's Android dispatcher,
   so a consumer's APK is complete with the AAR alone. The Myotis apps consume the
   Rust engine through it and keep the Java engine via the selector.

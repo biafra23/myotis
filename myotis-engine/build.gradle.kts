@@ -103,21 +103,17 @@ android {
     }
     sourceSets.getByName("main") {
         // cargoNdkAndroid's output: <abi>/libmyotis_engine.so + libmyotis_bls.so.
-        jniLibs.srcDir("src/androidMain/jniLibs")
-    }
-    packaging {
-        // -PskipRustEngine means "no Rust engine in this AAR". The jniLibs live in
-        // the source tree, outside build/, so a lib left there by an earlier
-        // toolchain build is NOT removed by `clean`, by .gitignore, or by
-        // cargoNdkAndroid being skipped — AGP would happily package it, and
-        // on-device it would fail UniFFI validation (bindings vs a stale .so) and
-        // silently fall back to Java. Exclude them so the flag means what
-        // requireAndroidRustEngine says it does.
-        if (skipRustEngine) {
-            jniLibs {
-                excludes += setOf("**/libmyotis_engine.so", "**/libmyotis_bls.so")
-            }
-        }
+        // -PskipRustEngine means "no Rust engine in this AAR": the directory is then
+        // NOT a source at all. The libs live in the source tree, outside build/, so
+        // a lib left there by an earlier toolchain build is not removed by `clean`,
+        // by .gitignore, or by cargoNdkAndroid being skipped — AGP would happily
+        // package it, and on-device it would fail UniFFI validation (bindings vs a
+        // stale .so) and silently fall back to Java. Gating the SOURCE (rather than
+        // a packaging exclude) keeps a leftover out of every consumer's merge — the
+        // bundled AAR and a project dependency alike, which AGP feeds from this
+        // module's intermediate JNI artifact, not from the AAR. The app adds its
+        // own exclude on the same flag as a second line, at the APK merge.
+        if (!skipRustEngine) jniLibs.srcDir("src/androidMain/jniLibs")
     }
 }
 
@@ -229,7 +225,7 @@ android {
 // everyone via the regenerate-and-diff step in android-apk.yml. Root
 // build.gradle.kts owns the tasks.
 tasks.matching { it.name == "preBuild" }.configureEach {
-    // JNA's Android dispatcher (the extraction task is defined further down):
+    // JNA's Android dispatcher (the extraction task is defined above):
     // srcDir(<TaskProvider>) registers the DIRECTORY but does NOT carry a task
     // dependency through AGP's source sets, so on a clean build the jniLib merge
     // would run before anything has extracted and the AAR would silently ship

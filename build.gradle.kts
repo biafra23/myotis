@@ -305,7 +305,7 @@ subprojects {
 //   cargoTest       → cargo test --workspace; wired into root `check`
 //   cargoNdkAndroid → Android jniLibs (engine + native BLS) via
 //                     rust/build-android.sh; built from source (no committed
-//                     .so) and wired into :android-app preBuild. Required by
+//                     .so) and wired into :myotis-engine preBuild. Required by
 //                     default; -PskipRustEngine opts out.
 // -------------------------------------------------------------------------
 

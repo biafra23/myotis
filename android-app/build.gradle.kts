@@ -220,6 +220,16 @@ android {
     }
 
     packaging {
+        // -PskipRustEngine: the engine library already keeps its jniLibs directory
+        // out of the build then (its source set is gated on the root's flag), so no
+        // libmyotis_*.so should reach this merge at all. This exclude is the second
+        // line, authoritative at the APK merge whatever a library-side mechanism
+        // covers: the APK the flag describes carries no Rust engine.
+        if (rootProject.extra["myotis.skipRustEngine"] as Boolean) {
+            jniLibs {
+                excludes += setOf("**/libmyotis_engine.so", "**/libmyotis_bls.so")
+            }
+        }
         resources {
             // Common collisions when shipping JVM libs in an APK
             excludes += setOf(
