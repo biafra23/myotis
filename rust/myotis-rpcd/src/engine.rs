@@ -49,6 +49,9 @@ pub trait Engine: Send + Sync {
     fn create_access_list(&self, tx: &str, block: &str, overrides: &str) -> String;
     fn block_by_number(&self, tag: &str, full: bool) -> String;
     fn block_by_hash(&self, hash: &str, full: bool) -> String;
+    /// The canonical block a block hash names (ABI 47, #641): `{"hash","number"}`,
+    /// the literal `null`, or an error envelope — header only.
+    fn resolve_block_hash(&self, hash: &str) -> String;
     fn fee_estimate(&self) -> String;
     fn fee_history(&self, count: i64, newest: &str, percentiles: &str) -> String;
     fn send_raw_transaction(&self, raw: &str) -> String;
@@ -186,6 +189,9 @@ impl Engine for FfiEngine {
     }
     fn block_by_hash(&self, hash: &str, full: bool) -> String {
         ffi::get_block_by_hash_json(self.handle, hash.into(), full)
+    }
+    fn resolve_block_hash(&self, hash: &str) -> String {
+        ffi::resolve_block_hash_json(self.handle, hash.into())
     }
     fn fee_estimate(&self) -> String {
         ffi::fee_estimate_json(self.handle)

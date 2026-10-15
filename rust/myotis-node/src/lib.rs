@@ -42,6 +42,7 @@ use myotis_engine::capi::{
     myotis_fee_history_json, myotis_get_block_by_hash_json, myotis_get_block_by_number_json,
     myotis_get_block_receipts_json, myotis_get_code_json, myotis_get_logs_json,
     myotis_get_proof_json, myotis_get_storage_at_json, myotis_get_transaction_by_hash_json,
+    myotis_resolve_block_hash_json,
     myotis_get_transaction_receipt_json, myotis_import_log_index_files, myotis_init,
     myotis_log_index_status_json, myotis_pause, myotis_pending_nonce_overlay,
     myotis_request_account_json, myotis_resolve_ens_json, myotis_resume,
@@ -672,6 +673,21 @@ pub fn get_block_by_number_json<'env>(
             return invalid_params("a block number must be 0x-hex");
         }
         take(unsafe { myotis_get_block_by_number_json(handle, b.as_ptr(), full) })
+    })
+}
+
+/// The canonical block a block hash names (ABI 47): `{"hash","number"}`, the
+/// literal `"null"` (no canonical block this node holds now has that hash), or
+/// `{"error"}` — to resolve a state read or an eth_call pinned to a block hash
+/// (EIP-1898) to the number it then serves exactly as a number.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn resolve_block_hash_json<'env>(env: &'env Env, handle: i64, block_hash: String) -> Result<Object<'env>> {
+    scheduler::submit(env, handle, move || {
+        let Ok(h) = c_arg(&block_hash) else { return NUL_INVALID_PARAMS.to_string() };
+        if !hex_of_len(&block_hash, 32) {
+            return invalid_params("invalid block hash (expected 32-byte hex)");
+        }
+        take(unsafe { myotis_resolve_block_hash_json(handle, h.as_ptr()) })
     })
 }
 

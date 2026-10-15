@@ -1131,15 +1131,17 @@ class RpcRouterTest {
         // 64-block window before the engine is asked.
         route(b, proofRequest("""["0x${"11".repeat(20)}",[],"0x10"]"""))
         assertEquals("0x10", b.lastBlock)
-        // A block hash is resolved to the canonical block it names (#641) and
-        // handed on as that number — judged by the engine, like any number here.
-        val byHash = ProofBackend(proofResult, FakeBackend().apply { blockByHashJson = blockJsonAt("0x10") })
+        // A block hash goes to the engine AS a hash (ABI 47, #641), never resolved
+        // here first: the engine pins the proof to that block's attested root in
+        // one read, so no reorg can put another block at its number in between.
+        val delegate = FakeBackend().apply { blockByHashJson = blockJsonAt("0x10") }
+        val byHash = ProofBackend(proofResult, delegate)
         route(byHash, proofRequest("""["0x${"11".repeat(20)}",[],"$someHash"]"""))
-        assertEquals("0x10", byHash.lastBlock)
-        val unknown = ProofBackend(proofResult, FakeBackend().apply { blockByHashJson = "null" })
-        val declined = route(unknown, proofRequest("""["0x${"11".repeat(20)}",[],"$someHash"]"""))
-        assertEquals(-32000, errorCode(declined), declined)
-        assertNull(unknown.lastBlock)
+        assertEquals(someHash, byHash.lastBlock)
+        assertNull(delegate.lastBlockHash, "the hash was resolved by the router")
+        // ...and the EIP-1898 object form the same way.
+        route(byHash, proofRequest("""["0x${"11".repeat(20)}",[],{"blockHash":"$someHash"}]"""))
+        assertEquals(someHash, byHash.lastBlock)
     }
 
     /** Malformed requests are refused for good, before the engine is asked. */
@@ -2109,6 +2111,24 @@ class RpcRouterTest {
             assertNull(b.lastBlockHash, bad)
             assertNull(b.lastStateBlock, bad)
         }
+    }
+
+    @Test fun aHeaderOnlyResolve_isPreferredOverTheBlockRead() {
+        // An engine that resolves a hash header-only (both engines, ABI 47) is asked
+        // that, never for the block: no body is fetched to learn a number.
+        val b = object : VerifiedReads by FakeBackend(balance = BigInteger.ONE) {
+            var resolved: ByteArray? = null
+            override fun resolveBlockHash(blockHash32: ByteArray): String {
+                resolved = blockHash32; return """{"hash":"$someHash","number":"0xff"}"""
+            }
+            override fun getBlockByHash(blockHash32: ByteArray, fullTransactions: Boolean): String =
+                error("the router fetched the block to resolve a hash")
+            var asked: String? = null
+            override fun getBalance(address: ByteArray, block: String): String { asked = block; return "1" }
+        }
+        assertEquals("0x1", result(route(b, balanceAt("\"$someHash\""))))
+        assertEquals("0xff", b.asked)
+        assertEquals(someHash, "0x" + b.resolved!!.joinToString("") { "%02x".format(it) })
     }
 
     @Test fun transactionMethods_blockHash_isAppliedAsTheCanonicalBlockItNames() {

@@ -214,6 +214,11 @@ final class GatedVerifiedReads implements VerifiedReads {
     }
 
     @Override
+    public String resolveBlockHash(byte[] blockHash32) {
+        return guardedJson(d -> d.resolveBlockHash(blockHash32));
+    }
+
+    @Override
     public String getBlockReceipts(String blockSelector) {
         return guardedJson(d -> d.getBlockReceipts(blockSelector));
     }

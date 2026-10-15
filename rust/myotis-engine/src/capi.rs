@@ -599,6 +599,21 @@ pub unsafe extern "C" fn myotis_get_transaction_by_hash_json(
     into_c(crate::host::get_transaction_by_hash_json(handle, &tx_hash_hex))
 }
 
+/// The canonical block a block hash names (ABI ≥ 47, #641; the UniFFI
+/// `resolve_block_hash_json` twin): `{"hash","number"}`, the literal `"null"`,
+/// `{"error"}`, or `{"error","code":-32602}` for a malformed hash.
+///
+/// # Safety
+/// `block_hash_hex` must be null or a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_resolve_block_hash_json(
+    handle: i64,
+    block_hash_hex: *const c_char,
+) -> *mut c_char {
+    let block_hash_hex = read_string(block_hash_hex).unwrap_or_default();
+    into_c(crate::host::resolve_block_hash_json(handle, &block_hash_hex))
+}
+
 /// Verified `eth_getBlockByHash` (`nativeGetBlockByHashJson` twin);
 /// `full_transactions` selects decoded tx objects over hashes. Returns the
 /// block JSON, the literal `"null"` (a hash this engine never verified), or
@@ -871,6 +886,15 @@ mod tests {
         };
         assert_eq!(proof(null)["error"], "unknown handle");
         assert_eq!(proof(c"safe".as_ptr())["code"], -32602);
+        // ...and (ABI 47) a block hash is a selector it takes.
+        let hash = CString::new(format!("0x{}", "ab".repeat(32))).unwrap();
+        assert_eq!(proof(hash.as_ptr())["error"], "unknown handle");
+        // The hash resolve (ABI 47): a well-formed hash reaches the handle
+        // lookup; NULL or a malformed one is refused for good.
+        let resolve = |h: *const c_char| parse(unsafe { take(myotis_resolve_block_hash_json(i64::MIN, h)) });
+        assert_eq!(resolve(hash.as_ptr())["error"], "unknown handle");
+        assert_eq!(resolve(null)["code"], -32602);
+        assert_eq!(resolve(c"0xdead".as_ptr())["code"], -32602);
     }
 
     /// How eth_call's `block` crosses the C ABI (#452): NULL is an absent

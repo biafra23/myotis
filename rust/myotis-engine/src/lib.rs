@@ -295,7 +295,23 @@ uniffi::setup_scaffolding!();
 ///      An additive function — bumped so a host that calls it is never paired
 ///      with an engine that lacks it. The JVM `RustEngineNative` wrapper, the
 ///      iOS wrapper, myotis-rpcd and the Node addon call it.
-pub const ABI_VERSION: i32 = 46;
+/// v47: added resolve_block_hash_json / myotis_resolve_block_hash_json (UniFFI
+///      and the C ABI, #641): the canonical block a block hash names, as
+///      `{"hash","number"}`, the literal `"null"` for a hash this node does
+///      not hold as canonical now, `{"error"}` when it cannot tell, or the
+///      permanent envelope for a malformed hash. Header-only: the head or
+///      the finalized block is placed with no I/O, any other
+///      hash in ONE header window anchored at the verified head (64 blocks, or
+///      down to the number a block served earlier by that hash had). Hosts use
+///      it to resolve a state read or an eth_call pinned to a hash
+///      (EIP-1898), where they used eth_getBlockByHash — which fetched a body
+///      and knew only blocks served before. get_proof_json's `block` now
+///      also takes a block hash, pinned to that block's attested root in one
+///      read of the anchor. An additive function plus a widened selector —
+///      bumped so a host that calls either is never paired with an engine
+///      that lacks it. The JVM `RustEngineNative` wrapper, the iOS wrapper,
+///      myotis-rpcd and the Node addon call it.
+pub const ABI_VERSION: i32 = 47;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

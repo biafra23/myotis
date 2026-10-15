@@ -585,6 +585,15 @@ enum BlockDepth {
 /// response soft limit.
 const BLOCK_LOOKBACK_MAX: u64 = 512;
 
+/// How far below the head [`ElReader::resolve_block_hash`] looks for a hash it
+/// has no number for: the header window `[head − 64 ..= head]`, fetched once,
+/// header only. 64 is the hosts' state window below the head
+/// (`RpcBlockWindow.BLOCK_NUM_LAG_TOLERANCE`): a state read or `eth_call`
+/// pinned to a hash is served only for a block inside it, so a hash this scan
+/// cannot place is one no such read would serve now — a block not reached
+/// yet, an older one, or one on a fork.
+const HASH_SCAN_DEPTH: u64 = 64;
+
 /// Tip-lag tolerance for a `latest` block/receipt read. The anchored head is
 /// the beacon OPTIMISTIC head, which can momentarily run 1-2 blocks ahead of
 /// what EL peers have imported — they then honestly answer "0 headers" for a
@@ -721,6 +730,12 @@ pub struct VerifiedTransaction {
 /// Entry cap for the verified block-hash → number map (the Java
 /// `blockHashToNumber` cache's 512).
 const BLOCK_HASH_LRU_MAX: usize = 512;
+
+/// Entry cap for the hashes [`ElReader::resolve_block_hash`] searched a head's
+/// window for and did not find, keyed to that head: a client retrying a hash
+/// this node cannot place (one a block ahead of it, the common case) is
+/// answered from here until the head moves, not with another window fetch.
+const UNPLACED_HASH_LRU_MAX: usize = 64;
 
 /// Raw-bytes cache cap for the wallet's own broadcast txs (the Java
 /// `sentTxCache` LRU's 256). Bytes aging out silently end that tx's
@@ -1947,6 +1962,10 @@ pub struct ElReader {
     /// ONLY by blocks this reader itself verified (the receipt/tx scan and the
     /// by-number serve); the shared LRU is the myotis-evm cache one.
     block_hash_numbers: std::sync::Mutex<myotis_evm::Lru<[u8; 32], u64>>,
+    /// Block hashes a [`Self::resolve_block_hash`] window did not hold, each
+    /// with the optimistic head number that window was anchored at: the same
+    /// head gives the same answer, so a retry is not another fetch.
+    unplaced_hashes: std::sync::Mutex<myotis_evm::Lru<[u8; 32], u64>>,
     /// The sent-tx watch + pending-nonce overlay + raw-bytes cache (the Java
     /// `sentTxWatch`/`pendingNonces`/`sentTxCache` trio). One brief-hold lock:
     /// every access is a map poke; the rebroadcast collects its work under the
@@ -2263,6 +2282,7 @@ impl ElReader {
                 last_sweep: std::time::Instant::now(),
             }),
             block_hash_numbers: std::sync::Mutex::new(myotis_evm::Lru::new(BLOCK_HASH_LRU_MAX)),
+            unplaced_hashes: std::sync::Mutex::new(myotis_evm::Lru::new(UNPLACED_HASH_LRU_MAX)),
             sent_txs: std::sync::Mutex::new(SentTxState {
                 pending_nonces: crate::el::sent_tx::PendingNonceTracker::new(),
                 bytes: myotis_evm::Lru::new(SENT_TX_CACHE_MAX),
@@ -6421,9 +6441,29 @@ impl ElReader {
             )));
         }
         let head = self.anchor.optimistic_execution().map(|(number, root, _)| (number, root));
-        let target = resolve_target(block, head, self.anchor.finalized_execution(), |n| {
-            self.anchor.optimistic_root_at(n)
-        })?;
+        // A hash of no attested block is never served. Placing it anyway says
+        // WHY, with the class a number gets: a block below the head that is
+        // not attested never will be (the ring only grows upward), so it is
+        // refused for good, as its number would be; one this node cannot place
+        // at all may be ahead of the head, and stays retryable.
+        if let crate::el::getproof::ProofBlock::Hash(hash) = block {
+            if self.anchor.attested_block_of(&hash).is_none() {
+                let placed = match self.lookup_block_number(&hash) {
+                    Some(n) => Some(n),
+                    None => self.resolve_block_hash(hash).await.ok().flatten(),
+                };
+                if let Some(number) = placed {
+                    return Err(crate::el::getproof::unattested_hash(&hash, number, head.map(|h| h.0)));
+                }
+            }
+        }
+        let target = resolve_target(
+            block,
+            head,
+            self.anchor.finalized_execution(),
+            |n| self.anchor.optimistic_root_at(n),
+            |hash| self.anchor.attested_block_of(hash),
+        )?;
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
             return Err(ProofError::Unavailable("no snap peer available".to_string()));
@@ -7136,6 +7176,123 @@ impl ElReader {
             .block_by_number(target, BlockDepth::HeaderOnly)
             .await?
             .map(|block| (block.hash, block.header)))
+    }
+
+    /// The canonical block `hash` names, as its number — for a host resolving a
+    /// state read or an `eth_call` pinned to a block hash (EIP-1898, #641) —
+    /// or `Ok(None)` when this node does not hold it as canonical now.
+    /// Header-only, and canonical by construction:
+    ///
+    /// 1. The optimistic head and the finalized block are placed with no I/O:
+    ///    their hashes are the beacon updates' own, and both are canonical by
+    ///    definition. This is the common case — a client pins its reads to the
+    ///    head it was just handed. (An earlier head is NOT taken from the
+    ///    anchor's ring of recent heads here: one replaced by a sibling chain
+    ///    without the head stepping back stays in that ring, so only the
+    ///    window below can say it is still canonical.)
+    /// 2. Otherwise ONE header window anchored at the optimistic head is
+    ///    fetched — the trust gate every anchored read shares
+    ///    (`fetch_anchored_window`): every header in it hash-links up to the
+    ///    BLS-attested head hash, so each is the canonical block at its height
+    ///    as of that head — and searched for the hash. It spans
+    ///    [`HASH_SCAN_DEPTH`] blocks, or reaches down to the number a block
+    ///    served earlier by this hash had (`lookup_block_number`) when that is
+    ///    deeper and within [`BLOCK_LOOKBACK_MAX`], so a client pinned to an
+    ///    older block it read here learns that block's number (and the host
+    ///    can refuse it as behind its window) rather than an unknown hash.
+    ///    The header found is remembered for `eth_getBlockByHash` — that one
+    ///    only, so a resolve never evicts the blocks a wallet's receipts put
+    ///    there. A hash the window does not hold is remembered against the
+    ///    head it was anchored at, and asked again at that head it is answered
+    ///    from there, with no second fetch.
+    ///
+    /// No body is fetched at any step. `Ok(None)` covers a hash ahead of the
+    /// head, one deeper than the window, and one on a fork: none of them is a
+    /// canonical block this node can place now. `Err` is "cannot tell right
+    /// now" (no anchored head, no peer, every peer failed the window).
+    pub async fn resolve_block_hash(&self, hash: [u8; 32]) -> Result<Option<u64>, String> {
+        if let Some((number, _)) = self.anchor.optimistic_head().filter(|(_, h)| *h == hash) {
+            return Ok(Some(number));
+        }
+        if let Some(fin) = self.anchor.finalized_execution().filter(|f| f.block_hash == hash) {
+            return Ok(Some(fin.block_number));
+        }
+        // Tip-lag tolerance as for `latest`: the window is anchored at the
+        // optimistic head, which peers can trail by a block or two.
+        let mut attempt = 0;
+        loop {
+            let (head_num, head_hash) = self.anchored_head()?;
+            if self.unplaced_hashes.lock().ok().and_then(|mut m| m.get(&hash).copied()) == Some(head_num) {
+                return Ok(None);
+            }
+            let scan_from = head_num.saturating_sub(HASH_SCAN_DEPTH);
+            let from = match self.lookup_block_number(&hash) {
+                Some(n) if n < scan_from && head_num - n < BLOCK_LOOKBACK_MAX => n,
+                _ => scan_from,
+            };
+            match self.head_anchored_header_window(from, (head_num, head_hash)).await {
+                Ok(window) => {
+                    let Some(vh) = window.iter().find(|vh| vh.hash == hash) else {
+                        if let Ok(mut unplaced) = self.unplaced_hashes.lock() {
+                            unplaced.put(hash, head_num);
+                        }
+                        return Ok(None);
+                    };
+                    self.remember_block_number(vh.hash, vh.header.number);
+                    return Ok(Some(vh.header.number));
+                }
+                Err(PoolReadError::TipLag { error, failed }) => {
+                    if attempt < TIP_LAG_RETRIES {
+                        attempt += 1;
+                        tracing::debug!(attempt, error = %error,
+                            "block-hash resolve behind peers' imported tip — retrying");
+                        tokio::time::sleep(TIP_LAG_RETRY_DELAY).await;
+                        continue;
+                    }
+                    self.record_batch_failures(&failed, false).await;
+                    return Err(error);
+                }
+                Err(PoolReadError::Fatal(e)) => return Err(e),
+            }
+        }
+    }
+
+    /// The verified header window `[from ..= head]`, anchored at the optimistic
+    /// head `(head_num, head_hash)` — header only, raced across the snap pool
+    /// as the block reads are and settled the same way ([`Self::settle_pool_race`]).
+    async fn head_anchored_header_window(
+        &self,
+        from: u64,
+        (head_num, head_hash): (u64, [u8; 32]),
+    ) -> Result<Vec<crate::el::eth::messages::VerifiedHeader>, PoolReadError> {
+        let top = WindowTop::Head { number: head_num, hash: head_hash };
+        let span = head_num.saturating_sub(from);
+        let peers = self.pool.snap_peers().await;
+        if peers.is_empty() {
+            return Err(PoolReadError::Fatal("no snap peer available".to_string()));
+        }
+        let coverage: Vec<Coverage> = peers.iter().map(|p| p.coverage()).collect();
+        let out = hedged_race(
+            &peers,
+            block_hedge_delay(span),
+            |peer: std::sync::Arc<ManagedPeer>| async move {
+                fetch_anchored_window(&peer, from, top).await
+            },
+            |_: &Vec<crate::el::eth::messages::VerifiedHeader>| true,
+        )
+        .await;
+        let window = self
+            .settle_pool_race(
+                &peers,
+                &coverage,
+                out,
+                (from, span),
+                true,
+                "a verifiable header window",
+                "verified header window fetch failed against every snap peer",
+            )
+            .await?;
+        Ok(window)
     }
 
     /// The read behind [`Self::get_block_by_number`] and
@@ -9239,7 +9396,7 @@ fn choose_window_top(
 /// the trust gate every anchored read shares: exact length, the right starting
 /// number, the window top IS the beacon-anchored hash (`top`), and every
 /// header hash-links to the next. This is the sole gate that turns
-/// peer-supplied headers into trusted ones — one implementation, six callers
+/// peer-supplied headers into trusted ones — one implementation, seven callers
 /// (block serve, fee estimate, fee history, receipts, receipt scan,
 /// canonicality re-check), so a hardening never has to be applied in six
 /// places.
