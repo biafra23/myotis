@@ -322,11 +322,15 @@ subprojects {
 // which is right for publishToMavenLocal from a working tree. -PpublishRelease
 // drops the suffix: the workflow passes it on every run, so the staged layout is
 // the one a tag publishes (X.Y.Z file names — Gradle stages a SNAPSHOT under
-// Maven's timestamped names, which the check does not read), and on the tag
-// vX.Y.Z it is what publishes X.Y.Z, after the version guard has checked that
-// the two agree. It applies to the published modules only, so nothing else in
-// the build (the apps' versions, verifyCrateVersions) sees a different
-// project.version.
+// Maven's timestamped names, which the check does not read). On a tag it is
+// -PpublishRelease=<the tag's version>: vX.Y.Z publishes X.Y.Z and an rc/hotfix
+// tag vX.Y.Z-<suffix> (a shape the version guard accepts) publishes
+// X.Y.Z-<suffix> — never the final X.Y.Z coordinates, which GitHub Packages
+// could not replace once the real release comes. The value must be the release
+// version or the release version plus a `-suffix`, the guard's own rule, so a
+// mis-typed flag fails here rather than publishing a version the tree does not
+// build. It applies to the published modules only, so nothing else in the build
+// (the apps' versions, verifyCrateVersions) sees a different project.version.
 //
 // The two Kotlin Multiplatform modules get their publications from the Kotlin
 // plugin (one per target plus the `kotlinMultiplatform` root, which carries the
@@ -351,12 +355,22 @@ val publishedDescriptions = mapOf(
     "myotis-engine-rust" to "The Myotis Rust engine behind the engine contract, over UniFFI bindings and JNA",
     "myotis-engine" to "The Myotis engine library: the Rust light-client engine for Android (AAR) and desktop JVM (jar)",
 )
-val publishRelease = providers.gradleProperty("publishRelease").isPresent
+val publishedVersion: String? = providers.gradleProperty("publishRelease").orNull?.let { requested ->
+    if (requested.isEmpty()) {
+        releaseVersion
+    } else {
+        require(requested == releaseVersion || requested.startsWith("$releaseVersion-")) {
+            "-PpublishRelease=$requested does not match the release version $releaseVersion " +
+                "(accepted: $releaseVersion, or $releaseVersion-<suffix>)"
+        }
+        requested
+    }
+}
 val stagingRepository = layout.buildDirectory.dir("maven-repo")
 configure(subprojects.filter { it.name in publishedArtifactIds }) {
     apply(plugin = "maven-publish")
     group = "io.myotis"
-    if (publishRelease) version = releaseVersion
+    if (publishedVersion != null) version = publishedVersion
     val publishedArtifactId = publishedArtifactIds.getValue(name)
     val publishedDescription = publishedDescriptions.getValue(name)
 

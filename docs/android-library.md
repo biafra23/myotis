@@ -21,8 +21,9 @@ page describes what a consumer gets today.
 | `io.myotis:myotis-api` | the contract (`MyotisEngine`, `ChainHandle`, `VerifiedReads`, the ports) — the AAR's one `api` dependency, so it is on the consumer's compile classpath |
 | `io.myotis:myotis-engine-rust`, `myotis-engine-common`, `myotis-rpc-policy`, `myotis-core` | implementation dependencies the POMs pull in; a consumer never names them |
 
-`<version>` is the release: `v0.1.16` publishes `0.1.16`. Everything else the
-graph needs (JNA, slf4j, minimal-json, Tuweni, BouncyCastle) comes from Maven
+`<version>` is the tag's: `v0.1.16` publishes `0.1.16`, a release-candidate
+or hotfix tag `v0.1.16-rc1` publishes `0.1.16-rc1`. Everything else the graph
+needs (JNA, slf4j, minimal-json, Tuweni, BouncyCastle) comes from Maven
 Central.
 
 **GitHub Packages.** Every `v*` tag publishes the set to this repository's

@@ -55,16 +55,21 @@ jna_version=$(sed -n 's/^jna *= *"\([^"]*\)".*/\1/p' "$here/gradle/libs.versions
 [ -n "$jna_version" ] || { echo "::error::could not read the jna version from gradle/libs.versions.toml"; exit 1; }
 
 # The ABIs the AAR ships, from rust/build-android.sh's `cargo ndk -t` list — the
-# same source the root build's shippedAbis follows.
-mapfile -t abis < <(sed -n 's/.*cargo ndk \(.*\) -o .*/\1/p' "$here/rust/build-android.sh" \
-    | tr ' ' '\n' | sed -n '/^-t$/{n;p}')
+# same source the root build's shippedAbis follows. (Portable shell throughout:
+# a maintainer runs this on macOS too — bash 3.2, BSD sed — so no mapfile, no
+# GNU-only sed.)
+abis=($(awk '/cargo ndk/ { for (i = 1; i <= NF; i++) if ($i == "-t") print $(i + 1) }' "$here/rust/build-android.sh"))
 [ "${#abis[@]}" -ge 1 ] || { echo "::error::could not read the shipped ABIs from rust/build-android.sh"; exit 1; }
 
 fail=0
 err() { echo "::error::$*"; fail=1; }
 
 # One version for the whole set: the directory under the root publication.
+# nullglob, so a repository with no myotis-engine at all is "found 0", not a
+# literal `*` that every check below then reports as a missing file.
+shopt -s nullglob
 versions=("$group_dir"/myotis-engine/*/)
+shopt -u nullglob
 [ "${#versions[@]}" -eq 1 ] || { err "expected exactly one staged version of io.myotis:myotis-engine, found: ${versions[*]}"; exit 1; }
 version=$(basename "${versions[0]}")
 echo "staged version: $version"
@@ -81,24 +86,17 @@ expect() { # <artifactId> <file suffix>
     local f="$group_dir/$1/$version/$1-$version$2"
     [ -s "$f" ] || err "missing or empty: ${f#$repo/}"
 }
-expect myotis-api .jar
-expect myotis-api -sources.jar
-expect myotis-core .jar
-expect myotis-core -sources.jar
-expect myotis-engine-common .jar
-expect myotis-engine-rust .jar
-expect myotis-engine-rust -sources.jar
-expect myotis-rpc-policy .module
-expect myotis-rpc-policy .pom
+for a in myotis-api myotis-core myotis-engine-common myotis-engine-rust; do
+    expect "$a" .jar
+    expect "$a" -sources.jar
+done
 expect myotis-rpc-policy-jvm .jar
-expect myotis-engine .module
-expect myotis-engine .pom
 expect myotis-engine-jvm .jar
-expect myotis-engine-jvm .pom
 expect myotis-engine-android .aar
-expect myotis-engine-android .pom
-for a in myotis-api myotis-core myotis-engine-common myotis-engine-rust myotis-rpc-policy-jvm myotis-engine-jvm myotis-engine-android; do
+for a in myotis-api myotis-core myotis-engine-common myotis-engine-rust \
+         myotis-rpc-policy myotis-rpc-policy-jvm myotis-engine myotis-engine-jvm myotis-engine-android; do
     expect "$a" .pom
+    expect "$a" .module
 done
 
 # No stale name: nothing may be staged under the Gradle project name `core`, and
@@ -161,7 +159,7 @@ if [ -s "$aar" ]; then
         echo "note: --without-rust-engine — libmyotis_*.so not checked"
     fi
     echo "aar: $(du -h "$aar" | cut -f1) $(basename "$aar")"
-    printf '%s\n' "$listing" | grep '^jni/' | sed 's/^/  /'
+    printf '%s\n' "$listing" | { grep '^jni/' || true; } | sed 's/^/  /'
 fi
 
 [ "$fail" = 0 ] || exit 1
