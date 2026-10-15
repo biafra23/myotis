@@ -15,9 +15,13 @@
 //! well-formed answer that fails the client's check, indistinguishable from a
 //! forged one. So a proof is served only at a root this node holds attested
 //! for exactly the block named: the optimistic head (`latest`, `pending`, or
-//! its number), one of the last [`RECENT_HEADS`] heads this node held, the
-//! current one included (a number a client got from `eth_blockNumber` a few
-//! blocks ago, or from a light client of its own a block behind), or the
+//! its number), one of the last [`RECENT_HEADS`] heads this node held that the
+//! current head builds on (a number a client got from `eth_blockNumber` a few
+//! blocks ago, or from a light client of its own a block behind — checked
+//! through each head's proven parent hash, and where a skipped head breaks
+//! that chain against one header window anchored at the current head, so a
+//! head a sibling chain replaced never answers for its number:
+//! `ExecAnchor::recent_head_at`, `ElReader::get_proof`), or the
 //! beacon-finalized
 //! block (`finalized`, or its number). Any other number is refused —
 //! permanently below the head, which never comes back to it; retryably above
@@ -162,8 +166,8 @@ pub fn resolve_target(
             Err(ProofError::Refused(format!(
                 "eth_getProof at block {n:#x} ({n}) is not served: a proof is pinned to a state \
                  root this node holds attested for exactly that block — the last {RECENT_HEADS} \
-                 heads it held, up to the verified head ({head_number}){fin} — and a proof at \
-                 another root would not verify against block {n}'s stateRoot"
+                 heads it held that the verified head ({head_number}) builds on{fin} — and a \
+                 proof at another root would not verify against block {n}'s stateRoot"
             )))
         }
     }

@@ -6459,11 +6459,26 @@ impl ElReader {
                 }
             }
         }
+        // A number among the recent heads that the ring does not link to the
+        // current head — a skipped head (a gap) or a replaced sibling above it
+        // — is confirmed against one header window anchored at the head, and
+        // served only if it is still the canonical block at its number.
+        let finalized_number = self.anchor.finalized_execution().map(|f| f.block_number);
+        let recent = match block {
+            // The finalized block is served at its own root by the pin rules.
+            crate::el::getproof::ProofBlock::Number(n) if finalized_number == Some(n) => None,
+            crate::el::getproof::ProofBlock::Number(n) => match self.anchor.recent_head_at(n) {
+                Some(h) if h.linked => Some((n, h.state_root)),
+                Some(h) => self.confirm_recent_head(n, h).await?.map(|root| (n, root)),
+                None => None,
+            },
+            _ => None,
+        };
         let target = resolve_target(
             block,
             head,
             self.anchor.finalized_execution(),
-            |n| self.anchor.optimistic_root_at(n),
+            |n| recent.filter(|(m, _)| *m == n).map(|(_, root)| root),
             |hash| self.anchor.attested_block_of(hash),
         )?;
         let peers = self.pool.snap_peers().await;
@@ -6486,6 +6501,34 @@ impl ElReader {
         )
         .await
         .map_err(ProofError::Unavailable)
+    }
+
+    /// Whether `head`, the recent head at `number` the anchor's ring does not
+    /// link to the current head, is still the canonical block there: one
+    /// header window `[number ..= head]` anchored at the optimistic head
+    /// (the trust gate every anchored read shares) says, header only. Its
+    /// root when it is; `None` when another block holds that number now (a
+    /// sibling chain replaced it), which the pin rules then refuse as any
+    /// number below the head without an attested root. A window that cannot
+    /// be fetched is retryable.
+    async fn confirm_recent_head(
+        &self,
+        number: u64,
+        head: crate::el::anchor::RecentHeadAt,
+    ) -> Result<Option<[u8; 32]>, crate::el::getproof::ProofError> {
+        use crate::el::getproof::ProofError;
+        let (head_num, head_hash) = self.anchored_head().map_err(ProofError::Unavailable)?;
+        if number > head_num || head_num - number >= BLOCK_LOOKBACK_MAX {
+            return Ok(None);
+        }
+        match self.head_anchored_header_window(number, (head_num, head_hash)).await {
+            Ok(window) => Ok((window.first().map(|vh| vh.hash) == Some(head.hash)).then_some(head.state_root)),
+            Err(PoolReadError::TipLag { error, failed }) => {
+                self.record_batch_failures(&failed, false).await;
+                Err(ProofError::Unavailable(error))
+            }
+            Err(PoolReadError::Fatal(e)) => Err(ProofError::Unavailable(e)),
+        }
     }
 
     /// One whole `eth_getProof` attempt against a single peer at `target`'s
@@ -11410,7 +11453,7 @@ mod tests {
                 h
             };
             anchor.update_finalized(head - 64, [1; 32], head - 64, hash(head - 64), 0);
-            anchor.update_optimistic(head, head, hash(head), [2; 32], 1_700_000_000);
+            anchor.update_optimistic(head, head, hash(head), [0; 32], [2; 32], 1_700_000_000);
             let key = Arc::new(NodeKey::from_secret_bytes(&keccak256(b"fee-bounded-wait-test")).unwrap());
             let cfg = ElConfig {
                 bootnodes: Vec::new(),
@@ -16119,7 +16162,7 @@ mod restart_claim_reader_tests {
     /// Point `a` where the CL loop would leave it.
     fn set_anchor(a: &ExecAnchor, finalized: u64, head: u64) {
         a.update_finalized(finalized, [1; 32], finalized, hash(finalized), 0);
-        a.update_optimistic(head, head, hash(head), [2; 32], 1_700_000_000);
+        a.update_optimistic(head, head, hash(head), [0; 32], [2; 32], 1_700_000_000);
     }
 
     fn anchor_at(finalized: u64, head: u64) -> Arc<ExecAnchor> {
@@ -17141,8 +17184,8 @@ mod pre_broadcast_tests {
         let anchor = Arc::new(ExecAnchor::new());
         if let Some(time) = head_time {
             anchor.update_finalized(36, [1; 32], 36, [3; 32], 0);
-            anchor.update_optimistic(99, 99, [5; 32], [6; 32], time - 12);
-            anchor.update_optimistic(100, 100, [4; 32], [2; 32], time);
+            anchor.update_optimistic(99, 99, [5; 32], [0; 32], [6; 32], time - 12);
+            anchor.update_optimistic(100, 100, [4; 32], [5; 32], [2; 32], time);
         }
         let key = Arc::new(NodeKey::from_secret_bytes(&keccak256(b"pre-broadcast-test")).unwrap());
         let cfg = ElConfig {
@@ -17219,7 +17262,7 @@ mod pre_broadcast_tests {
         // live update: never judged by, whatever the wall clock says.
         let anchor = Arc::new(ExecAnchor::new());
         anchor.update_finalized(36, [1; 32], 36, [3; 32], 0);
-        anchor.update_optimistic(100, 100, [4; 32], [2; 32], now_unix() - 5);
+        anchor.update_optimistic(100, 100, [4; 32], [0; 32], [2; 32], now_unix() - 5);
         let key = Arc::new(NodeKey::from_secret_bytes(&keccak256(b"pre-broadcast-test")).unwrap());
         let cfg = ElConfig {
             bootnodes: Vec::new(),
@@ -17233,7 +17276,7 @@ mod pre_broadcast_tests {
         let tx = tx::decode_summary(&spec_tx()).expect("decodes");
         assert_eq!(reader.ready_to_judge(&tx, now_unix()).err(), Some("head not fresh"));
         // The first live head after it is.
-        anchor.update_optimistic(101, 101, [7; 32], [8; 32], now_unix() - 3);
+        anchor.update_optimistic(101, 101, [7; 32], [0; 32], [8; 32], now_unix() - 3);
         assert!(reader.ready_to_judge(&tx, now_unix()).is_ok());
     }
 
