@@ -50,6 +50,10 @@ def eth_call(rpc, to, data):
     req = urllib.request.Request(rpc, body, {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=180) as resp:
         out = json.load(resp)
+    if not isinstance(out, dict) or ("error" not in out and not isinstance(out.get("result"), str)):
+        # JSON, but not a JSON-RPC answer (a proxy page, a batch-shaped reply): the
+        # endpoint is wrong, not the pin — "could not check", never "mismatch".
+        raise ValueError(f"not a JSON-RPC response: {str(out)[:200]}")
     if "error" in out:
         return f"error: {out['error']}"
     return out["result"][2:].lower()

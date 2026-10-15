@@ -174,9 +174,18 @@ public final class EnsResolver {
      * no EVM setup and no AUTO retry. Rust twin: {@code myotis_evm::ens::refusal}.
      */
     public static String refusal(long chainId, String name) {
-        if (chainId != 100L) return null;
+        // Derived from the same forChainId table the resolution itself uses, so a tree
+        // added there is refused here by construction (the Rust twin reads
+        // Namespace::for_chain for both). The executor is never touched.
+        final EnsResolver tree;
+        try {
+            tree = forChainId(null, chainId);
+        } catch (IllegalArgumentException noTree) {
+            return null;   // no pinned tree: the caller reports that itself
+        }
+        if (tree.requiredTld == null) return null;
         if (name == null) return NO_GNO_REVERSE;
-        return servesUnderTld(EnsAddresses.GENOME_TLD, name) ? null : ONLY_GNO_NAMES;
+        return tree.servesName(name) ? null : ONLY_GNO_NAMES;
     }
 
     private static boolean servesUnderTld(String tld, String name) {

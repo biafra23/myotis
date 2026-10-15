@@ -350,6 +350,16 @@ pub fn resolve_ownership(
     dns_encode(name)?;
     let lower = name.to_lowercase();
     let labels: Vec<&str> = lower.split('.').collect();
+    // The tree and the wrapper come from the CALLER's chain, like every other
+    // read here: the caller's executor is the state being read, so a `chain_id`
+    // argument that disagreed with it would hash the name into one tree and read
+    // through another chain's state — a well-formed wrong answer.
+    debug_assert_eq!(
+        chain_id,
+        caller.chain_id(),
+        "resolve_ownership: chain_id disagrees with the caller"
+    );
+    let chain_id = caller.chain_id();
     let ns = Namespace::for_chain(chain_id);
     let node = ns.node(name)?;
     let wrapper = name_wrapper(chain_id);
@@ -1580,6 +1590,8 @@ mod tests {
         assert_eq!(o.manager, Some(USER));
         assert_eq!(o.registrant, Some(USER));
         // On a chain without a known wrapper the same answers are taken as they are.
+        let caller = ownership_caller(WRAPPER_MAINNET, Some(WRAPPER_MAINNET), 1_823_155_031)
+            .on_chain(17000);
         let o = resolve_ownership(&caller, "myotis.eth", 17000).unwrap().unwrap();
         assert!(!o.wrapped);
         assert_eq!(o.manager, Some(WRAPPER_MAINNET));
