@@ -131,6 +131,22 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./gradlew "-PpublishRelease=${GITHUB_REF_NAME#v}" publishAllPublicationsToGitHubPackagesRepository --stacktrace
 
+      # The staged repository, for the maven-repo job below — uploaded the
+      # moment the version is irrevocably on GitHub Packages, so "the artifact
+      # exists" means exactly "this version is published and belongs on the
+      # branch": a failure later in this job (a release upload blip) still gets
+      # the branch published, and a failure earlier does not. Overwritable: a
+      # re-run of this job (after deleting the package versions, see the job's
+      # note) uploads it again under the same run. Kept the default 90 days:
+      # that is how long "re-run failed jobs" can repair the branch job alone.
+      - name: Upload the staged repository for the maven-repo branch
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-library-maven-repo-release-${{ github.sha }}
+          path: build/maven-repo
+          if-no-files-found: error
+          overwrite: true
+
       - name: Assemble the release assets
         run: |
           set -euo pipefail
@@ -256,17 +272,6 @@ jobs:
           gh release upload "$tag" \
             assets/myotis-engine-*.aar assets/myotis-engine-*.zip assets/myotis-engine.SHA256SUMS --clobber
 
-      # The staged repository, for the maven-repo job below (its own job, so a
-      # failure there is re-run on its own — this job cannot run twice: GitHub
-      # Packages refuses the version it already holds).
-      - name: Upload the staged repository for the maven-repo branch
-        uses: actions/upload-artifact@v4
-        with:
-          name: engine-library-maven-repo-release-${{ github.sha }}
-          path: build/maven-repo
-          if-no-files-found: error
-          retention-days: 7
-
   # The same staged repository as a Maven repository URL that needs no token:
   # merged into the `maven-repo` branch (an orphan branch holding nothing but
   # the repository layout and a README, created on the first publish), which
@@ -274,33 +279,52 @@ jobs:
   # add up; the artifact-level maven-metadata.xml is merged, not replaced
   # (scripts/merge_maven_repo.py), so `0.1.+` keeps seeing every version.
   #
-  # Its own job, after the publish job: GitHub Packages and the release assets
-  # are final once that job is green, and a failure here (a GitHub blip, a
-  # concurrent tag's push winning the race) is repaired with "re-run failed
-  # jobs" — which re-runs this job alone, from the staged repository the
-  # publish job uploaded, never the Packages publish that would refuse its own
-  # version. Two tags publishing at once (the concurrency group is per ref)
-  # race on the branch; the push is retried from a fresh clone.
+  # Its own job, after the publish job, keyed on the artifact that job uploads
+  # once the version is on GitHub Packages: it runs whenever the publish job
+  # got that far — even if that job then failed on a release upload — and is
+  # a no-op when it did not. A failure here (a GitHub blip, a concurrent tag's
+  # push winning the race) is repaired with "re-run failed jobs", which
+  # re-runs this job alone, from the uploaded repository, never the Packages
+  # publish that would refuse its own version. Two tags publishing at once
+  # (the concurrency group is per ref) race on the branch; a rejected push is
+  # retried from a fresh clone.
   maven-repo-branch:
     name: Publish to the maven-repo branch
     needs: publish
-    if: startsWith(github.ref, 'refs/tags/v')
+    # `!cancelled()`, so a publish job that failed after the Packages step
+    # still gets its branch publish; the tag test keeps the job off every
+    # other event, where `publish` is skipped.
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
     steps:
-      # For scripts/merge_maven_repo.py; the branch itself is cloned separately.
-      - name: Checkout
+      # Only scripts/merge_maven_repo.py is needed from the tree; the branch
+      # itself is cloned separately.
+      - name: Checkout the merge script
         uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/merge_maven_repo.py
+          sparse-checkout-cone-mode: false
 
+      # Absent when the publish job failed before the version reached GitHub
+      # Packages: then there is nothing to put on the branch, and this job
+      # says so instead of failing.
       - name: Download the staged repository
+        id: staged
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: engine-library-maven-repo-release-${{ github.sha }}
           path: build/maven-repo
 
+      - name: Nothing to publish
+        if: steps.staged.outcome != 'success'
+        run: echo "the publish job did not reach GitHub Packages for ${GITHUB_REF_NAME}; the maven-repo branch stays as it is"
+
       - name: Merge into the maven-repo branch and push
+        if: steps.staged.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -310,15 +334,16 @@ jobs:
             work=$(mktemp -d)
             # The full ref, so a `something/maven-repo` branch cannot match; exit
             # code 2 is "no such ref" (the first publish), anything else non-zero
-            # is a real failure that must not be mistaken for it.
-            set +e
-            git ls-remote --exit-code --heads "$remote" refs/heads/maven-repo >/dev/null 2>&1
-            rc=$?
-            set -e
+            # is a failure — its message stays on the log, and it gets the same
+            # retry as the push.
+            rc=0
+            git ls-remote --exit-code --heads "$remote" refs/heads/maven-repo >/dev/null || rc=$?
             case "$rc" in
               0) git clone --quiet --depth 1 --branch maven-repo "$remote" "$work" ;;
               2) git init --quiet --initial-branch=maven-repo "$work" ;;
-              *) echo "::error::git ls-remote failed with exit code $rc"; exit "$rc" ;;
+              *) echo "::warning::git ls-remote failed with exit code $rc (attempt $attempt); retrying"
+                 sleep 10
+                 continue ;;
             esac
             # Written on every publish (the commit below carries it only when it
             # changed), so an edit here reaches the branch; the repository name
@@ -348,11 +373,21 @@ jobs:
             git -C "$work" -c user.name="github-actions[bot]" \
                 -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
                 commit --quiet -m "Publish ${GITHUB_REF_NAME}"
-            if git -C "$work" push --quiet "$remote" HEAD:refs/heads/maven-repo; then
+            # Only a non-fast-forward rejection (another publish moved the branch
+            # between our clone and our push) is retried; any other refusal (a
+            # protected branch, a token without write access) is the error it is.
+            if out=$(git -C "$work" push --quiet "$remote" HEAD:refs/heads/maven-repo 2>&1); then
               exit 0
             fi
-            echo "::warning::push to maven-repo rejected (attempt $attempt) — another publish moved the branch? retrying from a fresh clone"
-            sleep 10
+            printf '%s\n' "$out"
+            case "$out" in
+              *"fetch first"*|*"non-fast-forward"*|*"cannot lock ref"*)
+                echo "::warning::push to maven-repo rejected (attempt $attempt) — another publish moved the branch; retrying from a fresh clone"
+                sleep 10 ;;
+              *)
+                echo "::error::push to the maven-repo branch refused"
+                exit 1 ;;
+            esac
           done
           echo "::error::could not push to the maven-repo branch after 3 attempts"
           exit 1

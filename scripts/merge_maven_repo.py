@@ -37,13 +37,29 @@ CHECKSUMS = ("md5", "sha1", "sha256", "sha512")
 METADATA = "maven-metadata.xml"
 
 
+# Qualifiers Maven ranks BELOW the bare release (`0.1.16-rc1` < `0.1.16`); any
+# other qualifier ranks above it (`0.1.16-hotfix1` > `0.1.16`), as in Maven's
+# ComparableVersion.
+PRE_RELEASE = {"alpha", "a", "beta", "b", "milestone", "m", "rc", "cr", "snapshot"}
+
+
 def version_key(version: str):
-    """Order versions like Maven does for the common shapes: numeric parts
-    numerically, and a qualifier (`-rc1`, `-hotfix1`) ranks BELOW the same core
-    without one (`0.1.16-rc1` < `0.1.16`), qualifiers among themselves textually."""
+    """Order versions as Maven's ComparableVersion does for the shapes the
+    release guard accepts (X.Y.Z, X.Y.Z-<suffix>): numeric parts numerically; a
+    pre-release qualifier (rc, alpha, beta, …) ranks below the bare core, any
+    other qualifier (hotfix, sp) above it; a qualifier's trailing number is
+    compared numerically (rc10 > rc9)."""
     core, _, qualifier = version.partition("-")
-    parts = tuple(int(p) if p.isdigit() else 0 for p in re.split(r"[.]", core))
-    return (parts, qualifier == "", qualifier)
+    parts = tuple(int(p) if p.isdigit() else 0 for p in core.split("."))
+    m = re.fullmatch(r"([A-Za-z]*)[.-]?(\d*)(.*)", qualifier)
+    word, number, rest = (m.group(1).lower(), m.group(2), m.group(3)) if m else (qualifier.lower(), "", "")
+    if qualifier == "":
+        rank = 1
+    elif word in PRE_RELEASE:
+        rank = 0
+    else:
+        rank = 2
+    return (parts, rank, word, int(number) if number else -1, rest)
 
 
 def merge_metadata(existing: Path, staged: Path) -> bytes:

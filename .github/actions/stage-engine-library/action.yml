@@ -108,23 +108,41 @@ runs:
     # The maven-repo branch merge (scripts/merge_maven_repo.py) otherwise runs
     # only on a tag, after GitHub Packages and the release assets are final —
     # so exercise it here on what was just staged: a first publish into an
-    # empty repository, then the same release again (a republish, which must
-    # change nothing), and the result must still pass the check, with every
+    # empty repository, the same release again (a republish, which must change
+    # nothing), and the release on top of a fictitious earlier one (the copy
+    # renamed to 0.0.1), after which the metadata must list both versions with
+    # the staged one as `release`. Each result must pass the check, with every
     # artifact-level maven-metadata.xml carrying the four checksums Gradle
     # writes, each matching the file.
     - name: Exercise the maven-repo merge on the staged publication
       shell: bash
       run: |
         set -euo pipefail
+        checksums_match() {
+          while IFS= read -r f; do
+            for h in md5 sha1 sha256 sha512; do
+              [ -f "$f.$h" ] || { echo "::error::$f.$h is missing"; exit 1; }
+              [ "$(cat "$f.$h")" = "$(${h}sum < "$f" | cut -d' ' -f1)" ] \
+                || { echo "::error::$f.$h does not match the file"; exit 1; }
+            done
+          done < <(find "$1" -name maven-metadata.xml)
+        }
+        version=$(basename "$(ls -d build/maven-repo/eth/myotis/myotis-engine/*/)")
         merged=$(mktemp -d)
         python3 scripts/merge_maven_repo.py build/maven-repo "$merged"
         python3 scripts/merge_maven_repo.py build/maven-repo "$merged"
         diff -r build/maven-repo "$merged"   # a republish of the same release is a no-op
         scripts/check_engine_library.sh "$merged"
-        while IFS= read -r f; do
-          for h in md5 sha1 sha256 sha512; do
-            [ -f "$f.$h" ] || { echo "::error::$f.$h is missing"; exit 1; }
-            [ "$(cat "$f.$h")" = "$(${h}sum < "$f" | cut -d' ' -f1)" ] \
-              || { echo "::error::$f.$h does not match the file"; exit 1; }
-          done
-        done < <(find "$merged" -name maven-metadata.xml)
+        checksums_match "$merged"
+        # An earlier release on the branch: the same set, as 0.0.1.
+        older=$(mktemp -d)
+        cp -R "$merged"/. "$older"/
+        mapfile -t dirs < <(find "$older" -type d -name "$version")
+        for d in "${dirs[@]}"; do mv "$d" "$(dirname "$d")/0.0.1"; done
+        find "$older" -name maven-metadata.xml -exec sed -i "s/$version/0.0.1/g" {} +
+        python3 scripts/merge_maven_repo.py build/maven-repo "$older"
+        m="$older/eth/myotis/myotis-engine/maven-metadata.xml"
+        grep -q "<version>0.0.1</version>" "$m" && grep -q "<version>$version</version>" "$m" \
+          && grep -q "<release>$version</release>" "$m" \
+          || { echo "::error::the merged metadata does not list both versions with $version as release:"; cat "$m"; exit 1; }
+        checksums_match "$older"
