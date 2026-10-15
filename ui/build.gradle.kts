@@ -80,7 +80,7 @@ abstract class AppVersionSource : ValueSource<String, AppVersionSource.Params> {
     private fun treeIsPatched(): Boolean = git(
         "status", "--porcelain", "--untracked-files=no",
         "--", ".",
-        ":(exclude)android-app/src/main/jniLibs",
+        ":(exclude)myotis-engine/src/androidMain/jniLibs",
         ":(exclude)myotis-engine-rust/src/main/kotlin/uniffi",
     ).isNotEmpty()
 

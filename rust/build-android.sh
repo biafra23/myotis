@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Cross-compile the workspace's Android cdylibs (myotis-bls today; myotis-engine once
-# it grows a real JNI surface) for Android ABIs into the app's jniLibs, so
+# it grows a real JNI surface) for Android ABIs into the engine library's jniLibs, so
 # NativeBlsBackend.isAvailable() is true on-device and the ~4-15x faster BLS verify
 # kicks in. See docs/bls-rust-acceleration.md.
 #
@@ -23,7 +23,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
-jniLibs="$here/../android-app/src/main/jniLibs"
+jniLibs="$here/../myotis-engine/src/androidMain/jniLibs"
 
 : "${ANDROID_NDK_HOME:?set ANDROID_NDK_HOME to your NDK path (e.g. \$ANDROID_SDK/ndk/27.0.11718014)}"
 

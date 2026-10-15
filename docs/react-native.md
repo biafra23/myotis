@@ -312,7 +312,7 @@ path is P0 → P2 → P3, with P1 parallel.
 - `app-ios/src/iosMain/kotlin/io/myotis/ios/RustEngine.kt`,
   `IosNodeController.kt` *(feat/ios-target)*
 - `android-app/src/main/java/com/jaeckel/ethp2p/android/NodeService.java`
-  (lifecycle playbook), `android-app/build.gradle.kts` (builds the jniLibs
+  (lifecycle playbook), `myotis-engine/build.gradle.kts` (builds the jniLibs
   from source; `-PskipRustEngine` opts out — no committed fallback any more)
 - `docs/reimplementation/05-engine-api-bindings.md` (binding decisions; the
   lockstep rule is in the C header's preamble), `docs/myotis-rust-engine-guidelines.md` (target matrix —

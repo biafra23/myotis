@@ -49,9 +49,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ./gradlew cargoBuildNoStd  # no_std canary: cargo build -p myotis-core --no-default-features for x86_64-unknown-none (part of `check`; self-skips without that rustup target)
 ./gradlew cargoNdkAndroid  # Android jniLibs, built from source (needs cargo-ndk + NDK + Android rustup targets)
 
-# The Android app builds the Rust engine FROM SOURCE by default — cargo + cargo-ndk
-# + NDK r28+ + `rustup target add aarch64-linux-android x86_64-linux-android` are
-# REQUIRED to build :android-app. There is no committed .so (so nothing can drift);
+# The Android engine library (:myotis-engine, the AAR the Android app consumes)
+# builds the Rust engine FROM SOURCE by default — cargo + cargo-ndk + NDK r28+ +
+# `rustup target add aarch64-linux-android x86_64-linux-android` are REQUIRED to
+# build it, and so :android-app. There is no committed .so (so nothing can drift);
 # an Android build also regenerates the committed UniFFI bindings (:myotis-engine-rust)
 # from source — other workflows do NOT, so regenerate them explicitly with
 # `./gradlew uniffiGenerateKotlin` after changing the Rust FFI. Opt out when you
@@ -77,6 +78,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Key Gradle modules:
 
+- **myotis-engine** — THE ENGINE LIBRARY: a Kotlin Multiplatform module (jvm +
+  android targets, no UI) that packages the Rust engine for the hosts — the
+  Android AAR (the Myotis app and a separate wallet product) and the desktop jar.
+  `io.myotis.engine.Myotis` is the entry point (`newEngine()`: the Rust engine
+  with no loopback listener, for an in-process consumer); it re-exports
+  `:myotis-api` and `:myotis-engine-rust`. Its androidMain owns the jniLibs
+  (`cargoNdkAndroid` builds them there from source) and JNA's Android dispatcher,
+  so a consumer's APK is complete with the AAR alone. The Myotis apps consume the
+  Rust engine through it and keep the Java engine via the selector.
 - **myotis-engines** — the engine SELECTOR (`Engines`/`SelectorEngine`): hosts'
   composition roots call `Engines.engine()`; `myotis.engine=java|rust|auto` routes
   each network (re)start to the Java engine (node-core) or the Rust one.
