@@ -37,6 +37,7 @@ on:
       - 'myotis-engine/**'
       - 'rust/**'
       - 'scripts/check_engine_library.sh'
+      - 'scripts/merge_maven_repo.py'
       - '.github/workflows/engine-library.yml'
       - '.github/actions/stage-engine-library/**'
       - '.github/workflows/release-version-guard.yml'
@@ -93,7 +94,7 @@ jobs:
   #
   # Re-running a tag's publish: GitHub Packages refuses to overwrite a version
   # (the Gradle publish fails with 409/422), so a republish needs that package
-  # version deleted first — every io.myotis.* package of it — in the
+  # version deleted first — every eth.myotis.* package of it — in the
   # repository's Packages page. The release assets re-upload with --clobber.
   publish:
     name: Publish to GitHub Packages and the release
@@ -162,12 +163,12 @@ jobs:
           **Engine library (`myotis-engine-<tag>-android.aar`, `myotis-engine-<tag>-maven-repo.zip`)** —
           the Myotis Rust engine as a library for other apps: `eth.myotis:myotis-engine:__VERSION__`
           on GitHub Packages (needs a token with read:packages), from the `maven-repo` branch
-          (`https://raw.githubusercontent.com/biafra23/myotis/maven-repo`, no token), or the zip
+          (`https://raw.githubusercontent.com/__REPO__/maven-repo`, no token), or the zip
           unpacked as a local Maven repository. The AAR alone is the Android artifact; its
           dependencies are in the zip and on GitHub Packages. Verify downloads against
           `myotis-engine.SHA256SUMS`. See docs/android-library.md.
           SECTION
-          sed -i "s/__VERSION__/$version/g" "$section"
+          sed -i "s/__VERSION__/$version/g; s#__REPO__#${GITHUB_REPOSITORY}#g" "$section"
           # Master notes for the case where THIS job creates the release (same
           # text the android/desktop/node workflows carry), plus the section.
           notes=$(mktemp)
@@ -255,49 +256,103 @@ jobs:
           gh release upload "$tag" \
             assets/myotis-engine-*.aar assets/myotis-engine-*.zip assets/myotis-engine.SHA256SUMS --clobber
 
-      # The same staged repository as a Maven repository URL that needs no token:
-      # merged into the `maven-repo` branch (an orphan branch holding nothing but
-      # the repository layout, created on the first publish), which
-      # raw.githubusercontent.com serves file by file — all Gradle needs. Versions
-      # add up; the artifact-level maven-metadata.xml is merged, not replaced
-      # (scripts/merge_maven_repo.py), so `0.1.+` keeps seeing every version.
-      # Last, so a transient failure here leaves GitHub Packages and the release
-      # assets in place (a re-run of the job publishes the branch alone: the
-      # Packages step then fails on the existing version, see the job's note).
-      - name: Publish to the maven-repo branch
+      # The staged repository, for the maven-repo job below (its own job, so a
+      # failure there is re-run on its own — this job cannot run twice: GitHub
+      # Packages refuses the version it already holds).
+      - name: Upload the staged repository for the maven-repo branch
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-library-maven-repo-release-${{ github.sha }}
+          path: build/maven-repo
+          if-no-files-found: error
+          retention-days: 7
+
+  # The same staged repository as a Maven repository URL that needs no token:
+  # merged into the `maven-repo` branch (an orphan branch holding nothing but
+  # the repository layout and a README, created on the first publish), which
+  # raw.githubusercontent.com serves file by file — all Gradle needs. Versions
+  # add up; the artifact-level maven-metadata.xml is merged, not replaced
+  # (scripts/merge_maven_repo.py), so `0.1.+` keeps seeing every version.
+  #
+  # Its own job, after the publish job: GitHub Packages and the release assets
+  # are final once that job is green, and a failure here (a GitHub blip, a
+  # concurrent tag's push winning the race) is repaired with "re-run failed
+  # jobs" — which re-runs this job alone, from the staged repository the
+  # publish job uploaded, never the Packages publish that would refuse its own
+  # version. Two tags publishing at once (the concurrency group is per ref)
+  # race on the branch; the push is retried from a fresh clone.
+  maven-repo-branch:
+    name: Publish to the maven-repo branch
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      # For scripts/merge_maven_repo.py; the branch itself is cloned separately.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download the staged repository
+        uses: actions/download-artifact@v4
+        with:
+          name: engine-library-maven-repo-release-${{ github.sha }}
+          path: build/maven-repo
+
+      - name: Merge into the maven-repo branch and push
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          work=$(mktemp -d)
-          if git ls-remote --exit-code --heads "$remote" maven-repo >/dev/null 2>&1; then
-            git clone --quiet --depth 1 --branch maven-repo "$remote" "$work"
-          else
-            git init --quiet --initial-branch=maven-repo "$work"
-            cat > "$work/README.md" <<'README'
+          for attempt in 1 2 3; do
+            work=$(mktemp -d)
+            # The full ref, so a `something/maven-repo` branch cannot match; exit
+            # code 2 is "no such ref" (the first publish), anything else non-zero
+            # is a real failure that must not be mistaken for it.
+            set +e
+            git ls-remote --exit-code --heads "$remote" refs/heads/maven-repo >/dev/null 2>&1
+            rc=$?
+            set -e
+            case "$rc" in
+              0) git clone --quiet --depth 1 --branch maven-repo "$remote" "$work" ;;
+              2) git init --quiet --initial-branch=maven-repo "$work" ;;
+              *) echo "::error::git ls-remote failed with exit code $rc"; exit "$rc" ;;
+            esac
+            # Written on every publish (the commit below carries it only when it
+            # changed), so an edit here reaches the branch; the repository name
+            # comes from the run, never a literal.
+            cat > "$work/README.md" <<README
           # Myotis engine library — Maven repository
 
-          The `eth.myotis` artifacts of every release (docs/android-library.md on `main`),
+          The \`eth.myotis\` artifacts of every release (docs/android-library.md on \`main\`),
           laid out as a Maven repository and served by raw.githubusercontent.com, so a
           build needs no GitHub token:
 
-          ```kotlin
+          \`\`\`kotlin
           maven {
-              url = uri("https://raw.githubusercontent.com/biafra23/myotis/maven-repo")
+              url = uri("https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/maven-repo")
               content { includeGroup("eth.myotis") }
           }
-          ```
+          \`\`\`
 
-          Written by the engine-library workflow on each `v*` tag; never edited by hand.
+          Written by the engine-library workflow on each \`v*\` tag; never edited by hand.
           README
-          fi
-          python3 scripts/merge_maven_repo.py build/maven-repo "$work"
-          git -C "$work" add -A
-          if git -C "$work" -c user.name="github-actions[bot]" \
+            python3 scripts/merge_maven_repo.py build/maven-repo "$work"
+            git -C "$work" add -A
+            if git -C "$work" diff --cached --quiet; then
+              echo "maven-repo branch already carries ${GITHUB_REF_NAME}; nothing to publish"
+              exit 0
+            fi
+            git -C "$work" -c user.name="github-actions[bot]" \
                 -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-                commit --quiet -m "Publish ${GITHUB_REF_NAME}"; then
-            git -C "$work" push --quiet "$remote" HEAD:refs/heads/maven-repo
-          else
-            echo "maven-repo branch already carries ${GITHUB_REF_NAME}; nothing to publish"
-          fi
+                commit --quiet -m "Publish ${GITHUB_REF_NAME}"
+            if git -C "$work" push --quiet "$remote" HEAD:refs/heads/maven-repo; then
+              exit 0
+            fi
+            echo "::warning::push to maven-repo rejected (attempt $attempt) — another publish moved the branch? retrying from a fresh clone"
+            sleep 10
+          done
+          echo "::error::could not push to the maven-repo branch after 3 attempts"
+          exit 1
