@@ -33,6 +33,7 @@ import io.myotis.engine.capi.myotis_init
 import io.myotis.engine.capi.myotis_pause
 import io.myotis.engine.capi.myotis_pending_nonce_overlay
 import io.myotis.engine.capi.myotis_request_account_json
+import io.myotis.engine.capi.myotis_resolve_block_hash_json
 import io.myotis.engine.capi.myotis_resume
 import io.myotis.engine.capi.myotis_accept_stale_anchor
 import io.myotis.engine.capi.myotis_set_ws_bound_periods
@@ -220,7 +221,8 @@ object RustEngine {
 
     /** eth_getProof (ABI 46): the EIP-1186 result object, `{"error"}` or the
      *  permanent `{"error","code":-32602}`. [keysJson] is the JSON array of
-     *  storage keys as the request carried them. */
+     *  storage keys as the request carried them; [block] a tag, a number or
+     *  (ABI 47) a block hash. */
     fun getProofJson(handle: Long, address: String, keysJson: String, block: String = ""): String =
         jsonCall { myotis_get_proof_json(handle, address, keysJson, block) }
 
@@ -274,6 +276,11 @@ object RustEngine {
 
     fun getBlockByHashJson(handle: Long, blockHash32Hex: String, fullTransactions: Boolean): String =
         jsonCall { myotis_get_block_by_hash_json(handle, blockHash32Hex, fullTransactions) }
+
+    /** The canonical block a block hash names (ABI 47, #641): `{"hash","number"}`,
+     *  the literal `"null"`, or an error envelope — header only. */
+    fun resolveBlockHashJson(handle: Long, blockHash32Hex: String): String =
+        jsonCall { myotis_resolve_block_hash_json(handle, blockHash32Hex) }
 
     fun getTransactionByHashJson(handle: Long, txHash32Hex: String): String =
         jsonCall { myotis_get_transaction_by_hash_json(handle, txHash32Hex) }

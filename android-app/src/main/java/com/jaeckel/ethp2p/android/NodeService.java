@@ -142,6 +142,8 @@ public final class NodeService extends Service {
     private static final String K_EXPERT_MODE = "expertMode";
     private static final String K_WEB_ACCESS_MODE = "webAccess.mode";
     private static final String K_WEB_ACCESS_ORIGINS = "webAccess.origins";
+    private static final String K_WATCH_LIST_PREFIX = "watch.list.";
+    private static final String K_WATCH_STATE_PREFIX = "watch.state.";
     public static final int DEFAULT_IDLE_PAUSE_MIN = 5;
     public static final int DEFAULT_RPC_PORT = 8545;
     // Gnosis defaults to a distinct port so both networks can be added to MetaMask
@@ -309,6 +311,26 @@ public final class NodeService extends Service {
 
     public static void setLogIndexWatchJson(android.content.Context c, String network, String json) {
         prefs(c).edit().putString("logIndex.watch." + canonicalNetwork(network), json).apply();
+    }
+
+    /** The balance watch's address list per network ({@code io.myotis.ui.BalanceWatch}'s JSON
+     *  array; same key scheme as the desktop). Edited by the Watch tab. */
+    public static String watchListJson(android.content.Context c, String network) {
+        return prefs(c).getString(K_WATCH_LIST_PREFIX + canonicalNetwork(network), "[]");
+    }
+
+    public static void setWatchListJson(android.content.Context c, String network, String json) {
+        prefs(c).edit().putString(K_WATCH_LIST_PREFIX + canonicalNetwork(network), json).apply();
+    }
+
+    /** The balance watch's state per network — last verified balances, recent changes —
+     *  written only by {@link BalanceWatchRunner}'s watcher, read by the Watch tab. */
+    public static String watchStateJson(android.content.Context c, String network) {
+        return prefs(c).getString(K_WATCH_STATE_PREFIX + canonicalNetwork(network), "{}");
+    }
+
+    public static void setWatchStateJson(android.content.Context c, String network, String json) {
+        prefs(c).edit().putString(K_WATCH_STATE_PREFIX + canonicalNetwork(network), json).apply();
     }
 
     /** Backfill pacing (true = max download speed); same key scheme as the desktop. */
@@ -1131,6 +1153,10 @@ public final class NodeService extends Service {
      */
     public void onAppForeground() {
         noteUiActivity();
+        appForeground = true;
+        // Coming to the foreground asks for a fresh look at the watched balances: the first
+        // scheduled check after it needs only FRESH_MS since the last, not the full interval.
+        watchFreshOnForeground.addAll(handles.keySet());
         for (Map.Entry<String, ChainHandle> e : handles.entrySet()) {
             String n = e.getKey();
             ChainHandle h = e.getValue();
@@ -1152,6 +1178,12 @@ public final class NodeService extends Service {
                 updateNotification();
             }, "ethp2p-fg-resume-" + n).start();
         }
+    }
+
+    /** The app left the foreground (MainActivity.onStop): the foreground's balance-watch
+     *  schedule ends ({@link WatchPolicy}). */
+    public void onAppBackground() {
+        appForeground = false;
     }
 
     private void startIdleTicker() {
@@ -1226,6 +1258,7 @@ public final class NodeService extends Service {
                 stayAwakeLastTick = skipWhileCharging;
                 if (startsToHold && anyStackPaused()) startChargingCatchUp();
             }
+            if (routine) scheduleWatchChecks(skipWhileCharging);
             for (Map.Entry<String, ChainHandle> e : handles.entrySet()) {
                 String n = e.getKey();
                 ChainHandle h = e.getValue();
@@ -1251,6 +1284,10 @@ public final class NodeService extends Service {
                                  engineResumeMs));
                 if (now - lastActivity <= idleMs) continue;
                 if (skipWhileCharging) continue; // plugged in on unmetered: keep awake and synced
+                // A balance check of this stack is queued or running (this very tick may have
+                // queued it): pausing now would only have its reads wake the stack again. Its
+                // reads count as activity, so a later tick judges the idle time afresh.
+                if (watchQueued.contains(n) || BalanceWatchRunner.isBusy(this, n)) continue;
                 // SYNCED-once gate: don't pause a stack still doing its initial sync — unless
                 // there's no network to sync over, in which case sleeping saves battery.
                 if (routine && !reachedSynced.contains(n)) {
@@ -1268,7 +1305,24 @@ public final class NodeService extends Service {
                     // else: not synced and offline → allow the pause below
                 }
                 long idleForSec = (now - lastActivity) / 1000;
+                long uiActivityAtDecision = uiActivityMs;
                 new Thread(() -> {
+                    // Balance watch: one last check before the stack sleeps, while plugged in
+                    // on an unmetered network (routine pauses only — an emergency pause under
+                    // memory pressure must not wait on proofs). Outside the boot lock: it can
+                    // take a while, and a foreground resume must not queue behind it. The
+                    // user coming back meanwhile (a foreground or a query moves the UI clock)
+                    // cancels the pause; a wallet request does not — it is indistinguishable
+                    // from the check's own reads — and simply wakes the stack again.
+                    int watched = routine ? watchBeforeSleep(n, h) : WATCH_NOT_RUN;
+                    if (watched == WATCH_BUSY) {
+                        LogBuffer.i(TAG, "[" + n + "] a balance check is running; not pausing under it");
+                        return;
+                    }
+                    if (watched == WATCH_RAN && uiActivityMs != uiActivityAtDecision) {
+                        LogBuffer.i(TAG, "[" + n + "] app in use again after the balance check; not pausing");
+                        return;
+                    }
                     synchronized (bootLock(n)) {
                         // Re-check under the lock: a disable/reboot/stop may have raced us,
                         // and pause() on a stack that lost that race is a no-op anyway.
@@ -1288,6 +1342,110 @@ public final class NodeService extends Service {
         } catch (Throwable t) {
             LogBuffer.w(TAG, "idle tick error: " + t);
         }
+    }
+
+    // ----- Balance watch (the Watch tab; when: WatchPolicy) -----
+
+    /** Whether the app is in the foreground (MainActivity started and not stopped). */
+    private volatile boolean appForeground;
+    /** Networks whose next foreground check is the one opening the app asks for (see
+     *  {@link #onAppForeground}): due after {@link WatchPolicy#FRESH_MS}, not the interval. */
+    private final java.util.Set<String> watchFreshOnForeground = ConcurrentHashMap.newKeySet();
+    /** Networks with a scheduled check queued or running on {@link #WATCH_POOL}, so a slow
+     *  check is not queued again by the next 30 s tick. */
+    private static final java.util.Set<String> watchQueued = ConcurrentHashMap.newKeySet();
+    /** One thread: scheduled checks run one network at a time, off the idle ticker. */
+    private static final ExecutorService WATCH_POOL = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "ethp2p-watch");
+        t.setDaemon(true);
+        return t;
+    });
+    /** A scheduled or before-sleep check never runs longer than this. */
+    private static final long WATCH_BUDGET_MS = 3 * 60_000L;
+    /** The after-wake check inside a catch-up pass: shorter, because the time is the pass's. */
+    private static final long WATCH_AFTER_WAKE_BUDGET_MS = 60_000L;
+    /** One read's own worst case (the Java engine bounds an account query at 120 s): the
+     *  budget is checked only before a read, so the after-wake check stops this much short
+     *  of the pass's deadline, which a read started just before it could otherwise pass. */
+    private static final long WATCH_READ_BOUND_MS = 120_000L;
+
+    /** The idle tick's scheduled balance checks ({@link WatchPolicy#scheduledIntervalMs}):
+     *  each RUNNING, synced stack whose watch list is due gets one, queued off the ticker. */
+    private void scheduleWatchChecks(boolean stayAwake) {
+        long interval = WatchPolicy.scheduledIntervalMs(appForeground, stayAwake);
+        if (interval <= 0) return;
+        android.content.Context app = getApplicationContext();
+        for (Map.Entry<String, ChainHandle> e : handles.entrySet()) {
+            String n = e.getKey();
+            ChainHandle h = e.getValue();
+            try {
+                if (h.lifecycle() != io.myotis.api.LifecycleState.RUNNING) continue;
+            } catch (Throwable t) {
+                continue;
+            }
+            boolean fresh = appForeground && watchFreshOnForeground.contains(n);
+            long dueAfter = fresh ? WatchPolicy.FRESH_MS : interval;
+            if (!BalanceWatchRunner.isDue(app, n, dueAfter, Math.min(dueAfter, WatchPolicy.RETRY_MS))) {
+                // Checked recently enough already: the foreground's ask is answered.
+                if (fresh && BalanceWatchRunner.hasEntries(app, n)) watchFreshOnForeground.remove(n);
+                continue;
+            }
+            if (!isSyncedWarm(h)) continue; // not yet: a later tick checks once it is
+            if (!watchQueued.add(n)) continue;
+            watchFreshOnForeground.remove(n);
+            WATCH_POOL.execute(() -> {
+                try {
+                    if (RUNNING.get() && handles.get(n) == h) {
+                        // The network as of the check's start, not the tick's: a check can wait
+                        // its turn on the pool behind other networks' checks.
+                        BalanceWatchRunner.checkBlocking(app, n, h, unmeteredNow(app), WATCH_BUDGET_MS, "scheduled");
+                    }
+                } finally {
+                    watchQueued.remove(n);
+                }
+            });
+        }
+    }
+
+    /** {@link #watchBeforeSleep}'s outcomes. */
+    private static final int WATCH_NOT_RUN = 0;
+    private static final int WATCH_RAN = 1;
+    /** Another trigger's check of the network holds the watcher: the pause must wait for it. */
+    private static final int WATCH_BUSY = 2;
+
+    /** The before-sleep check (see the idle tick): runs it when the stack is about to pause
+     *  plugged in on an unmetered network, watches something, is synced and was not checked
+     *  within {@link WatchPolicy#FRESH_MS}. */
+    private int watchBeforeSleep(String n, ChainHandle h) {
+        android.content.Context app = getApplicationContext();
+        if (!watchBackgroundApplies(app)) return WATCH_NOT_RUN;
+        if (!BalanceWatchRunner.isDue(app, n, WatchPolicy.FRESH_MS, WatchPolicy.FRESH_MS)) return WATCH_NOT_RUN;
+        if (!isSyncedWarm(h)) return WATCH_NOT_RUN;
+        int found = BalanceWatchRunner.checkBlocking(app, n, h, true, WATCH_BUDGET_MS, "before sleep");
+        return found < 0 && BalanceWatchRunner.isBusy(app, n) ? WATCH_BUSY : WATCH_RAN;
+    }
+
+    /** Plugged in on an unmetered network ({@link WatchPolicy#backgroundApplies}). */
+    static boolean watchBackgroundApplies(android.content.Context c) {
+        android.net.NetworkCapabilities caps = activeNetworkCapabilities(c);
+        return WatchPolicy.backgroundApplies(isCharging(c),
+                caps != null && caps.hasCapability(
+                        android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET),
+                caps != null && caps.hasCapability(
+                        android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED));
+    }
+
+    /** The active network is unmetered (a read error counts as metered: the shorter scans and
+     *  the token interval, {@link WatchPolicy}) — for a check started now. */
+    public static boolean unmeteredNow(android.content.Context c) {
+        android.net.NetworkCapabilities caps = activeNetworkCapabilities(c);
+        return caps != null
+                && caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED);
+    }
+
+    /** The live stack of [network] for the Watch tab's Check now, or null when it is not running. */
+    public ChainHandle chainHandle(String network) {
+        return handles.get(canonicalNetwork(network));
     }
 
     /** The stack has a fresh verified head from a SYNCED beacon light client — the same
@@ -1585,10 +1743,25 @@ public final class NodeService extends Service {
                     break;
                 }
             }
+            // Read before the balance check below, whose own reads move the engine's
+            // activity clock: only activity that arrived during the wait counts as real.
+            boolean activityArrived = h.lastActivityEpochMillis() != activityBefore;
+            // Balance watch: the stack is awake and at the head — check the watched balances
+            // before it sleeps again (the after-wake check, WatchPolicy). Its budget is what is
+            // left of this stack's own slice, at most a minute, and it stops one read's bound
+            // short of the pass's deadline, so a read in flight cannot carry the pass past it.
+            long watchBudgetMs = Math.min(WATCH_AFTER_WAKE_BUDGET_MS,
+                    Math.min((deadlineNano - System.nanoTime()) / 1_000_000L,
+                            (passEndNano - System.nanoTime()) / 1_000_000L - WATCH_READ_BOUND_MS));
+            if (watchBudgetMs > 0 && watchBackgroundApplies(c)
+                    && BalanceWatchRunner.isDue(c, n, WatchPolicy.FRESH_MS, WatchPolicy.FRESH_MS)
+                    && isSyncedWarm(h)) {
+                BalanceWatchRunner.checkBlocking(c, n, h, true, watchBudgetMs, label);
+            }
             // Real user/RPC activity arrived mid-catch-up, or the device went on the charger on
             // an unmetered network meanwhile → leave the stack to the idle controller; otherwise
             // go straight back to sleep (pause persists the freshly-caught-up snapshot).
-            if (h.lastActivityEpochMillis() != activityBefore) {
+            if (activityArrived) {
                 LogBuffer.i(TAG, "[" + n + "] " + label + ": activity arrived; staying awake");
             } else if (stayAwakeApplies(c)) {
                 LogBuffer.i(TAG, "[" + n + "] " + label

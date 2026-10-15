@@ -41,6 +41,15 @@ pub const MAX_KNOWN_ROOTS: usize = 8192;
 /// one peers serve: 25.6 minutes of mainnet heads, 10.7 of Gnosis.
 pub const RECENT_HEADS: usize = 128;
 
+/// One of [`Inner::recent_heads`]: an optimistic head as the update that made
+/// it the head attested it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecentHead {
+    number: u64,
+    hash: [u8; 32],
+    state_root: [u8; 32],
+}
+
 /// A BLS-attested `(slot, state_root)` pair in the fast-path window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlottedStateRoot {
@@ -113,11 +122,12 @@ struct Inner {
     /// when the light client proved it, not from when its header resolved.
     pending_optimistic_noted: Option<std::time::Instant>,
     known_roots: VecDeque<SlottedStateRoot>,
-    /// The last [`RECENT_HEADS`] optimistic heads as `(block_number,
-    /// state_root)`, oldest first — each one BLS-attested when it was the
-    /// head. Kept for `eth_getProof`, which may serve only a root attested for
-    /// exactly the block it names ([`ExecAnchor::optimistic_root_at`]).
-    recent_heads: VecDeque<(u64, [u8; 32])>,
+    /// The last [`RECENT_HEADS`] optimistic heads, oldest first — each one
+    /// BLS-attested when it was the head. Kept for `eth_getProof`, which may
+    /// serve only a root attested for exactly the block it names
+    /// ([`ExecAnchor::optimistic_root_at`]), and for resolving a block hash a
+    /// client pins a read to ([`ExecAnchor::attested_block_of`], #641).
+    recent_heads: VecDeque<RecentHead>,
     finality_current: bool,
     /// Gloas: a finalized execution block hash the light client proved at this
     /// beacon slot whose header has not been resolved yet. Never older than the
@@ -409,7 +419,35 @@ impl ExecAnchor {
     /// with the replaced block's root.
     pub fn optimistic_root_at(&self, number: u64) -> Option<[u8; 32]> {
         let inner = self.inner.lock().expect("anchor mutex");
-        inner.recent_heads.iter().rev().find(|(n, _)| *n == number).map(|(_, root)| *root)
+        inner.recent_heads.iter().rev().find(|h| h.number == number).map(|h| h.state_root)
+    }
+
+    /// The block `hash` names as this anchor holds it attested — its number
+    /// and its BLS-attested state root, read under ONE lock — if it is the
+    /// beacon-finalized block or one of the last [`RECENT_HEADS`] optimistic
+    /// heads (the current one included). `None` for any other hash: one this
+    /// anchor never held, one older than its window, or one it stepped back
+    /// from (a reorged-out head is forgotten, as for
+    /// [`Self::optimistic_root_at`]), so a hash is never answered with another
+    /// block's root. Attested is not CANONICAL: a head replaced by a sibling
+    /// chain without the head stepping back (the next head builds on a block
+    /// the light client never reported) stays until it ages out — its root is
+    /// still that block's own, which is all a proof at its hash needs, but a
+    /// caller asking which block is canonical must not take it from here.
+    ///
+    /// No I/O: the hash is the update's own, proven under a sync-committee
+    /// signature, so a client pinning a read to the head it was just handed
+    /// (EIP-1898, #641) is placed at once, and a proof at that hash is pinned
+    /// to that block's root in the same read — no window in which a reorg
+    /// can swap the block between resolving the hash and proving at it.
+    pub fn attested_block_of(&self, hash: &[u8; 32]) -> Option<(u64, [u8; 32])> {
+        let inner = self.inner.lock().expect("anchor mutex");
+        if let Some(h) = inner.recent_heads.iter().rev().find(|h| &h.hash == hash) {
+            return Some((h.number, h.state_root));
+        }
+        finalized_of(&inner)
+            .filter(|fin| &fin.block_hash == hash)
+            .map(|fin| (fin.block_number, fin.state_root))
     }
 
     /// The optimistic execution `(block_number, state_root, timestamp)` read
@@ -507,21 +545,21 @@ fn set_optimistic(
     inner.optimistic_state_root = Some(state_root);
     inner.optimistic_timestamp = timestamp;
     push_root(&mut inner.known_roots, slot, state_root, true);
-    remember_head(&mut inner.recent_heads, number, state_root);
+    remember_head(&mut inner.recent_heads, RecentHead { number, hash, state_root });
 }
 
 /// Append a head to [`Inner::recent_heads`] (a re-offered head is no new
 /// entry), first dropping every remembered head at or above its number: a
 /// head that does not advance replaces what was remembered there, so a
 /// reorged-out block is never served by number. Then cap to [`RECENT_HEADS`].
-fn remember_head(heads: &mut VecDeque<(u64, [u8; 32])>, number: u64, state_root: [u8; 32]) {
-    if heads.back() == Some(&(number, state_root)) {
+fn remember_head(heads: &mut VecDeque<RecentHead>, head: RecentHead) {
+    if heads.back() == Some(&head) {
         return;
     }
-    while heads.back().is_some_and(|&(n, _)| n >= number) {
+    while heads.back().is_some_and(|h| h.number >= head.number) {
         heads.pop_back();
     }
-    heads.push_back((number, state_root));
+    heads.push_back(head);
     while heads.len() > RECENT_HEADS {
         heads.pop_front();
     }
@@ -598,6 +636,36 @@ mod tests {
         }
         assert_eq!(anchor.optimistic_root_at(10), None);
         assert_eq!(anchor.optimistic_root_at(100), Some(root(2)));
+    }
+
+    #[test]
+    fn attested_blocks_are_placed_by_hash_and_forgotten_with_their_head() {
+        let anchor = ExecAnchor::new();
+        assert_eq!(anchor.attested_block_of(&root(11)), None);
+        for n in 10..=12u64 {
+            anchor.update_optimistic(n, n, root(n as u8), root(0x80 + n as u8), 0);
+        }
+        // The current head and a recent one: number and attested root together.
+        assert_eq!(anchor.attested_block_of(&root(12)), Some((12, root(0x8c))));
+        assert_eq!(anchor.attested_block_of(&root(11)), Some((11, root(0x8b))));
+        // A reorg at 11: the replaced 11 and the 12 built on it are no longer
+        // placed; the block that replaced 11 is, with its own root.
+        anchor.update_optimistic(13, 11, root(0x21), root(0x91), 0);
+        assert_eq!(anchor.attested_block_of(&root(11)), None);
+        assert_eq!(anchor.attested_block_of(&root(12)), None);
+        assert_eq!(anchor.attested_block_of(&root(0x21)), Some((11, root(0x91))));
+        assert_eq!(anchor.attested_block_of(&root(10)), Some((10, root(0x8a))));
+        // The finalized block is placed too, with its own root.
+        anchor.update_finalized(9, root(0x70), 5, root(0x55), 0);
+        assert_eq!(anchor.attested_block_of(&root(0x55)), Some((5, root(0x70))));
+        // Out of the window: forgotten, oldest first.
+        for n in 100..100 + RECENT_HEADS as u64 {
+            let mut h = root(0xa0);
+            h[1..9].copy_from_slice(&n.to_be_bytes());
+            anchor.update_optimistic(n, n, h, root(2), 0);
+        }
+        assert_eq!(anchor.attested_block_of(&root(10)), None);
+        assert_eq!(anchor.attested_block_of(&root(0x55)), Some((5, root(0x70))));
     }
 
     #[test]

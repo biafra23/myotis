@@ -141,6 +141,9 @@ impl Engine for Fake {
     fn block_by_hash(&self, h: &str, f: bool) -> String {
         self.get("block_hash", format!("{h},{f}"))
     }
+    fn resolve_block_hash(&self, h: &str) -> String {
+        self.get("resolve", h.into())
+    }
     fn fee_estimate(&self) -> String {
         self.get("fee", String::new())
     }
@@ -310,7 +313,11 @@ fn unverified_and_engine_errors_are_retryable_or_permanent() {
 
 #[test]
 fn selectors_are_applied_or_refused() {
-    let r = Router::new(Fake::new().reply("account", &account("1", 1)));
+    let r = Router::new(
+        Fake::new()
+            .reply("account", &account("1", 1))
+            .reply("resolve", "null"),
+    );
     for bad in [
         json!("safe"),
         json!("earliest"),
@@ -325,7 +332,8 @@ fn selectors_are_applied_or_refused() {
             "{bad}"
         );
     }
-    // A hash names historical state this node does not hold.
+    // A hash this node never verified (the engine's verified null) is declined
+    // retryably (the hash rules: `a_block_hash_is_served_as_the_canonical_block_it_names`).
     assert_eq!(
         error(
             &r,
@@ -333,7 +341,7 @@ fn selectors_are_applied_or_refused() {
             json!([ADDR, format!("0x{}", "ab".repeat(32))])
         )
         .0,
-        -32602
+        -32000
     );
     // Behind the window: refused for good. Inside: served. Ahead: retryable.
     assert_eq!(
@@ -368,6 +376,168 @@ fn selectors_are_applied_or_refused() {
         error(&r2, "eth_getBalance", json!([ADDR, "0x3e8"])).0,
         -32000
     );
+}
+
+/// A block hash on the state reads and the transaction methods (#641): resolved
+/// through the engine's own `eth_getBlockByHash` — which serves only a verified,
+/// still-canonical block — to the block it names, and served exactly as that
+/// block's number: the same window, the same refusals, never another block.
+#[test]
+fn a_block_hash_is_served_as_the_canonical_block_it_names() {
+    let h = format!("0x{}", "ab".repeat(32));
+    let block = |n: &str| format!(r#"{{"number":"{n}","hash":"{h}","transactions":[]}}"#);
+    let call_ok = r#"{"status":"ok","resultHex":"0xdead","blockNumber":1000,"verified":false}"#;
+    let fake = || {
+        Fake::new()
+            .reply("account", &account("1", 1))
+            .reply("call", call_ok)
+            .reply("estimate_tx", r#"{"status":"ok","gas":21000}"#)
+            .reply("proof", r#"{"address":"0x1"}"#)
+    };
+    // The head's hash (head = 1000 = 0x3e8), in every form: served as its number.
+    for sel in [
+        json!(h),
+        json!({"blockHash": h}),
+        json!({"blockHash": h, "requireCanonical": true}),
+    ] {
+        let r = Router::new(fake().reply("resolve", &block("0x3e8")));
+        assert_eq!(
+            result(&r, "eth_getBalance", json!([ADDR, sel])),
+            "0x1",
+            "{sel}"
+        );
+        assert_eq!(
+            calls(&r),
+            vec![
+                format!("resolve({h})"),
+                format!("account({ADDR},0x3e8)")
+            ]
+        );
+    }
+    // Inside the window: that block's number. Behind it: refused for good, the
+    // refusal naming the hash, the engine never asked for state.
+    let r = Router::new(fake().reply("resolve", &block("0x3c0")));
+    assert_eq!(result(&r, "eth_getBalance", json!([ADDR, h])), "0x1");
+    assert_eq!(calls(&r)[1], format!("account({ADDR},0x3c0)"));
+    let r = Router::new(fake().reply("resolve", &block("0x100")));
+    let (code, msg, _) = error(&r, "eth_getBalance", json!([ADDR, h]));
+    assert_eq!(code, -32602);
+    assert!(
+        msg.contains(&h) && msg.contains("(block 256)") && msg.contains("behind the verified head"),
+        "{msg}"
+    );
+    assert_eq!(calls(&r).len(), 1);
+    // ...unless at or above a head this node reported: retryable, as for a number.
+    let r = Router::new(fake().reply("resolve", &block("0x3e8")));
+    assert_eq!(result(&r, "eth_blockNumber", json!([])), "0x3e8");
+    let mut moved = fake().reply("resolve", &block("0x3e8"));
+    moved.head = Some(2000);
+    let r2 = Router { engine: moved, ..r };
+    assert_eq!(error(&r2, "eth_getBalance", json!([ADDR, h])).0, -32000);
+    // A hash this node never verified, one the chain no longer carries at its
+    // height (a fork) — or one it has not verified YET, which a client a block
+    // ahead pins: the engine's verified null, declined retryably by name on
+    // every state read, never served from the head.
+    let r = Router::new(fake().reply("resolve", "null"));
+    for method in ["eth_getBalance", "eth_getCode", "eth_getTransactionCount"] {
+        let (code, msg, _) = error(&r, method, json!([ADDR, h]));
+        assert_eq!(code, -32000, "{method}");
+        assert!(
+            msg.contains(&format!("holds no block with hash {h}")),
+            "{msg}"
+        );
+    }
+    let (code, msg, _) = error(&r, "eth_getStorageAt", json!([ADDR, "0x0", h]));
+    assert_eq!(
+        (code, msg.contains("holds no block with hash")),
+        (-32000, true),
+        "{msg}"
+    );
+    assert!(
+        calls(&r).iter().all(|c| c.starts_with("resolve(")),
+        "{:?}",
+        calls(&r)
+    );
+    // No answer right now stays retryable; the engine's permanent envelope
+    // keeps its class.
+    let r = Router::new(fake().reply("resolve", r#"{"error":"no snap peer"}"#));
+    assert_eq!(error(&r, "eth_getBalance", json!([ADDR, h])).0, -32000);
+    let r = Router::new(fake().reply("resolve", r#"{"error":"bad hash","code":-32602}"#));
+    assert_eq!(error(&r, "eth_getBalance", json!([ADDR, h])).0, -32602);
+    // A block without the hash asked (engine drift) is never served as it; one
+    // without a readable number is shape drift. Each is declined by name.
+    let other = format!(r#"{{"number":"0x3e8","hash":"0x{}"}}"#, "cd".repeat(32));
+    let r = Router::new(fake().reply("resolve", &other));
+    let (code, msg, _) = error(&r, "eth_getBalance", json!([ADDR, h]));
+    assert_eq!(
+        (code, msg.contains("served another block")),
+        (-32000, true),
+        "{msg}"
+    );
+    assert_eq!(calls(&r).len(), 1);
+    let r = Router::new(fake().reply("resolve", &format!(r#"{{"number":1000,"hash":"{h}"}}"#)));
+    let (code, msg, _) = error(&r, "eth_getBalance", json!([ADDR, h]));
+    assert_eq!(
+        (code, msg.contains("malformed block")),
+        (-32000, true),
+        "{msg}"
+    );
+    // The genesis block is refused for good, as block 0 is everywhere.
+    let r = Router::new(fake().reply("resolve", &block("0x0")));
+    let (code, msg, _) = error(&r, "eth_getBalance", json!([ADDR, h]));
+    assert_eq!((code, msg.contains("genesis")), (-32602, true), "{msg}");
+    assert_eq!(calls(&r).len(), 1);
+    // A malformed hash is a parameter error, before any engine read.
+    let r = Router::new(fake().reply("resolve", &block("0x3e8")));
+    for bad in [
+        json!(format!("0x{}", "ab".repeat(31))),
+        json!(format!("0x{}zz", "ab".repeat(31))),
+        json!({"blockHash": "0x1234"}),
+        json!({"blockHash": h, "requireCanonical": "yes"}),
+    ] {
+        assert_eq!(
+            error(&r, "eth_getBalance", json!([ADDR, bad])).0,
+            -32602,
+            "{bad}"
+        );
+    }
+    assert!(calls(&r).is_empty(), "{:?}", calls(&r));
+    // The transaction methods resolve it the same way, through the same window.
+    let r = Router::new(fake().reply("resolve", &block("0x3e8")));
+    assert_eq!(
+        result(
+            &r,
+            "eth_call",
+            json!([{"to": TOKEN, "data": "0x70a08231"}, h])
+        ),
+        "0xdead"
+    );
+    assert_eq!(calls(&r)[1], format!("call(,{TOKEN},0x70a08231,,0x3e8)"));
+    assert_eq!(
+        result(&r, "eth_estimateGas", json!([{"to": TOKEN}, h])),
+        "0x5208"
+    );
+    assert!(
+        calls(&r)[3].starts_with("estimate_tx(") && calls(&r)[3].contains("|0x3e8|"),
+        "{:?}",
+        calls(&r)
+    );
+    let r = Router::new(fake().reply("resolve", &block("0x100")));
+    assert_eq!(error(&r, "eth_call", json!([{"to": TOKEN}, h])).0, -32602);
+    assert_eq!(
+        error(&r, "eth_estimateGas", json!([{"to": TOKEN}, h])).0,
+        -32602
+    );
+    assert!(
+        calls(&r).iter().all(|c| c.starts_with("resolve(")),
+        "{:?}",
+        calls(&r)
+    );
+    // eth_getProof: the hash goes to the engine AS a hash, never resolved here
+    // — the engine pins the proof to that block's attested root in one read.
+    let r = Router::new(fake().reply("resolve", &block("0x100")));
+    result(&r, "eth_getProof", json!([TOKEN, [], h]));
+    assert_eq!(calls(&r), vec![format!("proof({TOKEN}|[]|{h})")]);
 }
 
 #[test]
@@ -472,7 +642,6 @@ fn eth_call_paths_and_refusals() {
         json!([{"to": TOKEN, "blobVersionedHashes": ["0x01"]}]),
         json!([{"to": "0x1234"}]),
         json!(["not an object"]),
-        json!([{"to": TOKEN}, format!("0x{}", "ab".repeat(32))]),
     ] {
         assert_eq!(error(&r, "eth_call", bad.clone()).0, -32602, "{bad}");
     }

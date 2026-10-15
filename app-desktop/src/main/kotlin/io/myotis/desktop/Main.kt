@@ -14,6 +14,7 @@ import androidx.compose.ui.window.isTraySupported
 import androidx.compose.ui.window.rememberTrayState
 import androidx.compose.ui.window.rememberWindowState
 import io.myotis.ui.NodeScreen
+import kotlinx.coroutines.launch
 import java.nio.file.Path
 
 /**
@@ -162,6 +163,10 @@ fun main() {
                     }
                     else -> null
                 }
+                // Watched balances (the Watch tab) announce through the same route, and are
+                // checked on their schedule for as long as the window lives.
+                controller.setWatchNotifier(notifier?.let { n -> { title, message -> n.post(title, message) } })
+                launch { watchBalances(controller) }
                 watchWebRefusals(controller, settings, notifier, window) {
                     // Already in front: the user sees the banner if Status is open; arm
                     // only for a window the user has to come back to.

@@ -857,6 +857,17 @@ pub fn estimate_json(outcome: &GasOutcome) -> String {
     serde_json::Value::Object(obj).to_string()
 }
 
+/// A block hash resolved to the canonical block it names (ABI ≥ 47, #641):
+/// `{"hash":"0x…","number":"0x…"}` — the two fields a block object carries
+/// under the same names and encodings, so a host reads it as it reads
+/// `eth_getBlockByHash`'s answer.
+pub fn resolved_block_json(hash: &[u8; 32], number: u64) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert("hash".into(), hex0x(hash).into());
+    obj.insert("number".into(), hex_quantity(number).into());
+    serde_json::Value::Object(obj).to_string()
+}
+
 pub fn tx_hash_json(hash: &[u8; 32]) -> String {
     let mut obj = serde_json::Map::new();
     obj.insert("txHash".into(), hex0x(hash).into());
@@ -2106,6 +2117,15 @@ mod get_logs_json_tests {
         );
         assert_eq!(super::get_logs_json(&[log]), expected);
         assert_eq!(super::get_logs_json(&[]), "[]");
+    }
+
+    #[test]
+    fn a_resolved_block_hash_reads_as_a_block_objects_hash_and_number() {
+        // Pinned by the hosts' golden twins (ABI 47, #641).
+        assert_eq!(
+            super::resolved_block_json(&[0xab; 32], 21_000_000),
+            format!(r#"{{"hash":"0x{}","number":"0x1406f40"}}"#, "ab".repeat(32))
+        );
     }
 
     #[test]

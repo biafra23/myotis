@@ -246,6 +246,7 @@ const CONFIG = JSON.stringify({ enabled: true, watch: [{ address: ADDR, fromBloc
 const READS = {
   getBlockByNumberJson: (h, arg = 'latest') => m.getBlockByNumberJson(h, arg),
   getBlockByHashJson: (h, arg = HASH) => m.getBlockByHashJson(h, arg, true),
+  resolveBlockHashJson: (h, arg = HASH) => m.resolveBlockHashJson(h, arg),
   feeHistoryJson: (h, arg = 'latest') => m.feeHistoryJson(h, 4, arg, '[25,75]'),
   getTransactionReceiptJson: (h, arg = HASH) => m.getTransactionReceiptJson(h, arg),
   getBlockReceiptsJson: (h, arg = 'latest') => m.getBlockReceiptsJson(h, arg),
@@ -375,6 +376,7 @@ test('a request that can never be served is refused permanently, before the hand
       ['receipt hash', () => m.getTransactionReceiptJson(h, '0xdead'), invalid('invalid transaction hash (expected 32-byte hex)')],
       ['tx hash', () => m.getTransactionByHashJson(h, '0xdead'), invalid('invalid transaction hash (expected 32-byte hex)')],
       ['block hash', () => m.getBlockByHashJson(h, '0xdead'), invalid('invalid block hash (expected 32-byte hex)')],
+      ['resolved block hash', () => m.resolveBlockHashJson(h, '0xdead'), invalid('invalid block hash (expected 32-byte hex)')],
       ['code address', () => m.getCodeJson(h, '0xdead', 'latest'), invalid('invalid address (expected 20-byte hex)')],
       ['storage address', () => m.getStorageAtJson(h, '0xdead', SLOT0), invalid('invalid address (expected 20-byte hex)')],
       ['storage position too long', () => m.getStorageAtJson(h, ADDR, '0x' + '1'.repeat(65)),
