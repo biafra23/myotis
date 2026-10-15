@@ -82,7 +82,8 @@ Key Gradle modules:
   android targets, no UI) that packages the Rust engine for the hosts — the
   Android AAR (the Myotis app and a separate wallet product) and the desktop jar.
   Published as `io.myotis:myotis-engine` with its upstream modules (`myotis-api`,
-  `myotis-engine-rust`, `myotis-engine-common`, `myotis-rpc-policy`, `myotis-core`
+  `myotis-engine-rust`, `myotis-engine-common`, `myotis-engine-ports`,
+  `myotis-rpc-policy`, `myotis-core`
   — the root build's `Publishing` section): GitHub Packages on every `v*` tag
   plus the AAR and a Maven-repository zip as release assets
   (`engine-library.yml`; `publishAllPublicationsToStagingRepository` +

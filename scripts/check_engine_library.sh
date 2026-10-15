@@ -87,14 +87,14 @@ expect() { # <artifactId> <file suffix>
     local f="$group_dir/$1/$version/$1-$version$2"
     [ -s "$f" ] || err "missing or empty: ${f#$repo/}"
 }
-for a in myotis-api myotis-core myotis-engine-common myotis-engine-rust; do
+for a in myotis-api myotis-core myotis-engine-common myotis-engine-ports myotis-engine-rust; do
     expect "$a" .jar
     expect "$a" -sources.jar
 done
 expect myotis-rpc-policy-jvm .jar
 expect myotis-engine-jvm .jar
 expect myotis-engine-android .aar
-for a in myotis-api myotis-core myotis-engine-common myotis-engine-rust \
+for a in myotis-api myotis-core myotis-engine-common myotis-engine-ports myotis-engine-rust \
          myotis-rpc-policy myotis-rpc-policy-jvm myotis-engine myotis-engine-jvm myotis-engine-android; do
     expect "$a" .pom
     expect "$a" .module

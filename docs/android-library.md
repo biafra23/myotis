@@ -19,6 +19,7 @@ page describes what a consumer gets today.
 | `io.myotis:myotis-engine-android:<version>` | the AAR: the Kotlin entry point, `libmyotis_engine.so` + `libmyotis_bls.so` for `arm64-v8a` and `x86_64`, JNA's `libjnidispatch.so` beside them |
 | `io.myotis:myotis-engine-jvm:<version>` | the desktop jar (the host library is not inside it — see *Desktop* below) |
 | `io.myotis:myotis-api` | the contract (`MyotisEngine`, `ChainHandle`, `VerifiedReads`, the ports) — the AAR's one `api` dependency, so it is on the consumer's compile classpath |
+| `io.myotis:myotis-engine-ports` | the default port actuals (`io.myotis.engine.ports`: the node-key file, the file-backed peer caches, the CCIP-Read gateway, the per-network file layout) — the AAR's other `api` dependency, see *Using it* |
 | `io.myotis:myotis-engine-rust`, `myotis-engine-common`, `myotis-rpc-policy`, `myotis-core` | implementation dependencies the POMs pull in; a consumer never names them |
 
 `<version>` is the tag's: `v0.1.16` publishes `0.1.16`, a release-candidate
@@ -103,22 +104,25 @@ consumer and for nothing else.
 
 ```kotlin
 import io.myotis.api.EngineConfig
-import io.myotis.api.ports.EnginePorts
 import io.myotis.engine.Myotis
 
 check(Myotis.isAvailable()) { "no Rust engine on this device" }
 val engine = Myotis.newEngine()           // one per process
-val dataDir = context.filesDir.resolve("myotis")   // engine-owned private state
+val dataDir = context.filesDir.resolve("myotis").toPath()   // engine-owned private state
+// The library's default ports for this network: the node key and the peer caches
+// under dataDir, the CCIP-Read gateway, and the DNS servers a mobile host must
+// supply (ConnectivityManager's, for EIP-1459 resolution; null on a desktop).
+val defaults = Myotis.defaultPorts(engine, dataDir, dataDir, "mainnet") { activeNetworkDnsServers() }
 val config = EngineConfig(
     "mainnet",                            // or "gnosis", "sepolia": engine.availableNetworks()
     0, 0, 0,                              // EL port, discv5 port, rpcPort: the network's defaults
                                           // (rpcPort is unused here — nothing listens)
-    dataDir.resolve("sync-state.snapshot").path,   // light-client snapshot: a cache, not a trust anchor
+    defaults.syncSnapshot().toString(),   // light-client snapshot: a cache, not a trust anchor
     3,                                    // snap-peer maintainer target (keep it on behind NAT / on mobile)
     true,                                 // strict state freshness
-    dataDir.path,
+    dataDir.toString(),
 )
-val handle = engine.create(config, ports)  // ports: see below
+val handle = engine.create(config, defaults.ports())
 handle.start()
 // later, once handle.beaconStatus() reports SYNCED:
 val reads = handle.reads()                 // null until started
@@ -128,12 +132,19 @@ val result = reads.call(from, to, calldata, "0", "latest")
 
 `EnginePorts` is what the host supplies (`io.myotis.api.ports`): the node-key
 store, the EL and CL peer caches, DNS servers, the HTTP gateway (CCIP-Read),
-the logger and a monotonic clock. The library ships no defaults for them yet
-(the next part of the plan does); until then the Myotis apps' actuals are the
-reference — `android-app/.../NodeService.java` builds them for Android,
-`app-desktop/.../DesktopNode.kt` for the desktop. The Android app's lifecycle
-handling (foreground service, pause on background, wake on request) is the
-app's, not the library's, for the same reason.
+the logger and a monotonic clock. `Myotis.defaultPorts` fills them from
+`io.myotis.engine.ports` (`DefaultEnginePorts.forNetwork` in Java): the key
+file under the first directory, the file-backed caches under the second, the
+`HttpURLConnection` gateway, the engine's own logger and clock. The Rust engine
+reads the DNS servers and the gateway from these ports and keeps its peer
+caches and sync snapshot itself under `EngineConfig.dataDir` — in the same
+file names (`NetworkFiles`), which is why the sketch passes one directory for
+both; its node identity is ephemeral per run (the key file serves the Java
+engine, which the Myotis apps run through their engine selector). What a host
+still supplies itself: the DNS servers on mobile (Android has no system resolver
+configuration the engine could read), and its lifecycle handling (the Android
+app's foreground service, pause on background and wake on request are the
+app's, not the library's).
 
 The contract is Java 17 and FFI-flat (byte arrays, strings, longs, flat records,
 blocking calls); `docs/reimplementation/05-engine-api-bindings.md` documents it.

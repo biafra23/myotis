@@ -30,6 +30,7 @@ on:
       - 'myotis-api/**'
       - 'core/**'
       - 'myotis-engine-common/**'
+      - 'myotis-engine-ports/**'
       - 'myotis-rpc-policy/**'
       - 'myotis-engine-rust/**'
       - 'myotis-engine/**'

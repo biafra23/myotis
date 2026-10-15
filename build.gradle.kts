@@ -343,6 +343,7 @@ val publishedArtifactIds = mapOf(
     // `core` is a name a consumer's dependency graph could meet elsewhere.
     "core" to "myotis-core",
     "myotis-engine-common" to "myotis-engine-common",
+    "myotis-engine-ports" to "myotis-engine-ports",
     "myotis-rpc-policy" to "myotis-rpc-policy",
     "myotis-engine-rust" to "myotis-engine-rust",
     "myotis-engine" to "myotis-engine",
@@ -351,6 +352,7 @@ val publishedDescriptions = mapOf(
     "myotis-api" to "The Myotis engine contract: the zero-dependency Java 17 interfaces every host consumes",
     "core" to "Myotis core types and the minSdk-29-safe JDK shims the engine modules share",
     "myotis-engine-common" to "The lifecycle primitives the Myotis engine handles wire (WakeGate, SleepMetrics)",
+    "myotis-engine-ports" to "The Myotis engine library's default port actuals: node-key file, file-backed peer caches, HttpURLConnection CCIP gateway",
     "myotis-rpc-policy" to "The JSON-RPC serving policy (block window, web-page access) with no server attached",
     "myotis-engine-rust" to "The Myotis Rust engine behind the engine contract, over UniFFI bindings and JNA",
     "myotis-engine" to "The Myotis engine library: the Rust light-client engine for Android (AAR) and desktop JVM (jar)",
