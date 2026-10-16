@@ -136,14 +136,27 @@ jobs:
       # not after 3 cold macOS runs. Dependency-resolution flakes still retry.
       - name: Build framework
         run: |
+          # Without pipefail the `if` below tests tee's status, not Gradle's: a
+          # failed build counted as a success, the flake retry never ran, and the
+          # v0.1.16 tag's failure surfaced one step later as a missing xcframework.
+          set -o pipefail
+          heap=()
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             task=":app-ios:assembleMyotisKitReleaseXCFramework"
+            # The RELEASE link runs Kotlin/Native inside the Gradle daemon, and
+            # by v0.1.16 it no longer fit the repo-wide -Xmx2g (gradle.properties):
+            # OutOfMemoryError in linkReleaseFrameworkIosArm64, where v0.1.15 had
+            # fit. The debug simulator link below still does, so only a tag gets
+            # the larger daemon (the runner has 7 GB).
+            heap=(-Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g")
           else
             task=":app-ios:linkDebugFrameworkIosSimulatorArm64"
           fi
           echo "building $task"
           for attempt in 1 2 3; do
-            if ./gradlew "$task" --stacktrace 2>&1 | tee /tmp/gradle.log; then
+            # ${heap[@]+…}: an empty array is "unbound" to bash 3.2 (the macOS
+            # runner's /bin/bash) under set -u, so spell it to survive a later -u.
+            if ./gradlew ${heap[@]+"${heap[@]}"} "$task" --stacktrace 2>&1 | tee /tmp/gradle.log; then
               exit 0
             fi
             if [ "$attempt" -lt 3 ] && grep -qE "Could not resolve|Could not GET|Connection reset|Read timed out|502 |503 |Premature end of Content-Length" /tmp/gradle.log; then
