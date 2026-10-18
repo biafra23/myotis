@@ -313,7 +313,7 @@ answers for `N-256 ≤ k < N` and is zero otherwise, as on any node:
   through to the walk below. A proof that fails fails the call.
 - What the contract does not hold (before Prague, or just after it) comes from a header walk:
   the headers `k ..= N-1` from a snap peer, accepted only when each hashes to its child's
-  `parentHash` and the newest hashes to N's `parentHash` (`walked_block_hash` in
+  `parentHash` and the newest hashes to N's `parentHash` (`walked_block_hashes` in
   `rust/myotis-net/src/el/verify.rs`).
 
 A state override never changes `BLOCKHASH`: it reads the chain, as geth's does. A hash none of

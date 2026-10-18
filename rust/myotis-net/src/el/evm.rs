@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Handle;
 
-use super::reader::{hedged_race, RaceOutcome, BULK_HEDGE_DELAY, HEDGE_DELAY};
+use super::reader::{block_hedge_delay, hedged_race, RaceOutcome, BULK_HEDGE_DELAY, HEDGE_DELAY};
 
 use myotis_core::header::BlockHeader;
 use myotis_core::trie::{AccountLeaf, EMPTY_TRIE_ROOT};
@@ -42,6 +42,10 @@ use crate::el::peer::ManagedPeer;
 use crate::el::readstats::{AccountFact, ReadStats};
 use crate::el::snap::fetch::AccountOutcome;
 use crate::el::verify::{walked_block_hashes, ChainHeader};
+
+/// A walked block hash's key: the anchor hash it was proven down from, and
+/// the block number.
+type WalkKey = ([u8; 32], u64);
 
 /// The outcome of an `eth_call`. Mirrors the Java engine's contract, which
 /// returns bytes on success and treats every other outcome (revert, halt,
@@ -599,7 +603,7 @@ pub struct PoolOracle {
     /// hash they were proven down from and the block number (one oracle
     /// serves one call, so the anchor is fixed; keying by it keeps that
     /// structural).
-    walked: Mutex<HashMap<([u8; 32], u64), [u8; 32]>>,
+    walked: Mutex<HashMap<WalkKey, [u8; 32]>>,
     /// The reader's read-fetch shadow cache: every verified fetch this oracle
     /// makes — including the prefetch wave's — is reported with its wall-clock
     /// cost so `read_stats_json` covers the EVM path too.
@@ -1409,9 +1413,13 @@ impl SnapStateOracle for PoolOracle {
         let fetched = self.wait(async {
             hedged_race(
                 peers,
-                HEDGE_DELAY,
+                // A deep header window hedges at the bulk delay, as block and
+                // receipt reads do: on a slow link it looks like silence.
+                block_hedge_delay(span),
                 |peer: Arc<ManagedPeer>| async move {
-                    let headers = peer.get_block_headers_by_number(number, span + 1, 0, false).await?;
+                    // The raw fetch: nothing enters the served-header window
+                    // before the whole range is proven below.
+                    let headers = peer.get_block_headers_by_number_raw(number, span + 1).await?;
                     let chain: Vec<ChainHeader> =
                         headers.into_iter().map(|vh| ChainHeader { hash: vh.hash, header: vh.header }).collect();
                     walked_block_hashes(&chain, anchor_number, anchor_hash, number)
@@ -1427,7 +1435,7 @@ impl SnapStateOracle for PoolOracle {
         let mut walked = self.walked.lock().unwrap();
         walked.extend(proven.iter().map(|(n, hash)| ((*anchor_hash, *n), *hash)));
         // `walked_block_hashes` proved the range starts at `number`.
-        Ok(proven[0].1)
+        proven.first().map(|&(_, hash)| hash).ok_or(OracleError::BlockHashUnavailable { number })
     }
 
     fn fetch_bytecode(&self, code_hash: &[u8; 32]) -> Result<Vec<u8>, OracleError> {
