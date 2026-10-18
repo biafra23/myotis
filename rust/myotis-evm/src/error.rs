@@ -127,6 +127,7 @@ impl EvmError {
                 | EvmError::UnexpectedSlotNumber { .. }
                 | EvmError::InvalidRequest { .. }
                 | EvmError::CallBudgetExceeded { .. }
+                | EvmError::Oracle(OracleError::BlockHashUnsupported { .. })
         )
     }
 

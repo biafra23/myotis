@@ -84,6 +84,20 @@ impl SnapStateOracle for RecordingOracle {
         self.inner.check_request()
     }
 
+    /// Forwarded, NOT recorded: a world holds state, not headers, so a replay
+    /// of a run that walked the header chain for a `BLOCKHASH` fails there
+    /// (the replay oracle refuses it) rather than answering from nothing.
+    /// From Prague on the history contract's storage serves `BLOCKHASH`, and
+    /// that is recorded like any slot.
+    fn fetch_block_hash(
+        &self,
+        anchor_number: u64,
+        anchor_hash: &[u8; 32],
+        number: u64,
+    ) -> Result<[u8; 32], OracleError> {
+        self.inner.fetch_block_hash(anchor_number, anchor_hash, number)
+    }
+
     fn fetch_account(
         &self,
         state_root: &[u8; 32],

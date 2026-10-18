@@ -17,6 +17,13 @@ pub struct BlockContext {
     pub state_root: [u8; 32],
     /// Block number: NUMBER opcode, and pre-merge fork selection.
     pub block_number: u64,
+    /// The header's `parentHash`: what `BLOCKHASH(block_number - 1)` returns,
+    /// and the anchor a header walk to an older `BLOCKHASH` starts from (see
+    /// [`crate::database`]). `None` only for a context that never carried it
+    /// (a fixture recorded before the field existed): `BLOCKHASH` of that
+    /// block, and every block a header walk would reach, is then refused,
+    /// never answered with a made-up hash.
+    pub parent_hash: Option<[u8; 32]>,
     /// Unix-seconds timestamp: TIMESTAMP opcode, and post-merge fork selection.
     pub timestamp: u64,
     /// EIP-1559 base fee (wei): BASEFEE opcode. 0 pre-London (there is none).

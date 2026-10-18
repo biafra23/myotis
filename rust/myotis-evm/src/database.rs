@@ -13,6 +13,29 @@
 //!
 //! To drive the EVM, wrap it: `WrapDatabaseRef(oracle_database)` implements
 //! `revm::Database`.
+//!
+//! ## `BLOCKHASH`
+//!
+//! The call runs on block N's post-state with N's header as the block
+//! context, so `BLOCKHASH(k)` is defined for `N-256 <= k < N` and zero
+//! otherwise (revm enforces that window before it asks
+//! [`DatabaseRef::block_hash_ref`]; the adapter answers zero outside it too).
+//! Inside it, every hash comes from what the call already proves
+//! ([`BlockHashes`]):
+//!
+//! 1. `k = N-1`: N's `parentHash`, from the verified header.
+//! 2. otherwise, from Prague on: the EIP-2935 history contract's storage at
+//!    slot `k % 8191`, read through the same verified tiers as any `SLOAD`
+//!    (proven against the call's state root, prefetched in waves, cached by
+//!    root). N's post-state holds there the hash of every block from the
+//!    fork's parent up to N-1, and a slot it never wrote holds zero, which no
+//!    block hash is — so a zero means "not in the contract" and falls through.
+//! 3. what the contract does not hold (before Prague, or a block older than
+//!    the fork's parent): a header walk down from N-1, proven by
+//!    [`SnapStateOracle::fetch_block_hash`].
+//!
+//! A caller's state override never reaches it: `BLOCKHASH` reads the chain,
+//! not the call's hypothetical state (geth answers it from its headers).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -24,9 +47,45 @@ use revm::state::{AccountInfo, Bytecode};
 use myotis_core::keccak::keccak256;
 use myotis_core::trie::EMPTY_CODE_HASH;
 
+use crate::block::BlockContext;
 use crate::cache::{BytecodeCache, StateProofCache};
 use crate::oracle::{OracleAccount, OracleError, SnapStateOracle};
 use crate::overrides::StateOverrides;
+
+/// The EIP-2935 history contract (`HISTORY_STORAGE_ADDRESS`): the same
+/// address on every chain this engine serves.
+pub const HISTORY_STORAGE_ADDRESS: [u8; 20] = [
+    0x00, 0x00, 0xF9, 0x08, 0x27, 0xF1, 0xC5, 0x3a, 0x10, 0xcb, 0x7A, 0x02, 0x33, 0x5B, 0x17, 0x53, 0x20, 0x00,
+    0x29, 0x35,
+];
+
+/// The history contract's ring size (`HISTORY_SERVE_WINDOW`): block `k`'s
+/// hash lives at slot `k % 8191`.
+pub const HISTORY_SERVE_WINDOW: u64 = 8191;
+
+/// How far back `BLOCKHASH` reaches (the opcode's own window).
+const BLOCKHASH_WINDOW: u64 = 256;
+
+/// What `BLOCKHASH` answers from for one call (see the module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockHashes {
+    /// The call's block N (the NUMBER opcode's value).
+    pub number: u64,
+    /// N's verified `parentHash`; `None` refuses `BLOCKHASH(N-1)` and every
+    /// header walk (see [`BlockContext::parent_hash`]).
+    pub parent_hash: Option<[u8; 32]>,
+    /// Whether the call's spec is Prague or later, i.e. whether N's
+    /// post-state can hold the EIP-2935 history contract's ring.
+    pub history_contract: bool,
+}
+
+impl BlockHashes {
+    /// The source for a call in `ctx` under a spec where the history contract
+    /// is (`history_contract`) or is not active.
+    pub fn for_context(ctx: &BlockContext, history_contract: bool) -> BlockHashes {
+        BlockHashes { number: ctx.block_number, parent_hash: ctx.parent_hash, history_contract }
+    }
+}
 
 /// The per-call cache (tier 1). Bound to one `OracleDatabase` (one call) and
 /// discarded with it — it holds this call's reads regardless of proof/root and
@@ -47,6 +106,9 @@ struct ViewCache {
     /// when the shared bytecode cache is a Noop — a sentinel pass must execute
     /// the REAL primed code, not an empty placeholder.
     code: HashMap<[u8; 32], Bytes>,
+    /// Block hashes a header walk proved for this call
+    /// ([`SnapStateOracle::fetch_block_hash`]).
+    block_hashes: HashMap<u64, [u8; 32]>,
 }
 
 /// Everything one execution TOUCHED (hit or miss) — the prefetch loop diffs
@@ -111,6 +173,9 @@ pub struct OracleDatabase {
     /// an overridden value is a hypothesis, not a verified fact, and must not
     /// outlive the call or leak into a cache another call reads.
     overrides: StateOverrides,
+    /// Where `BLOCKHASH` reads from; `None` refuses it
+    /// ([`OracleError::BlockHashUnsupported`]).
+    block_hashes: Option<BlockHashes>,
 }
 
 impl OracleDatabase {
@@ -148,7 +213,15 @@ impl OracleDatabase {
             view: Mutex::new(ViewCache::default()),
             track: Mutex::new(Track::default()),
             overrides,
+            block_hashes: None,
         }
+    }
+
+    /// Serve `BLOCKHASH` from `source` (see the module docs). Without it the
+    /// database refuses the opcode.
+    pub fn with_block_hashes(mut self, source: BlockHashes) -> OracleDatabase {
+        self.block_hashes = Some(source);
+        self
     }
 
     /// Toggle sentinel mode (prefetch discovery passes). OFF by default.
@@ -339,7 +412,52 @@ impl DatabaseRef for OracleDatabase {
         if let Some(v) = self.overrides.get(&address.into_array()).and_then(|o| o.storage(index)) {
             return Ok(v);
         }
-        let addr = address.into_array();
+        self.verified_storage(address.into_array(), index)
+    }
+
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        let Some(source) = self.block_hashes else {
+            return Err(OracleError::BlockHashUnsupported { number });
+        };
+        // Outside the opcode's window the answer is zero by definition (revm
+        // already pushes zero there without asking; kept here so the adapter
+        // is right on its own).
+        if number >= source.number || source.number - number > BLOCKHASH_WINDOW {
+            return Ok(B256::ZERO);
+        }
+        let parent = source.number - 1;
+        if number == parent {
+            return source
+                .parent_hash
+                .map(B256::from)
+                .ok_or(OracleError::BlockHashUnsupported { number });
+        }
+        if source.history_contract {
+            let slot = U256::from(number % HISTORY_SERVE_WINDOW);
+            let misses = self.track.lock().unwrap().misses;
+            let stored = self.verified_storage(HISTORY_STORAGE_ADDRESS, slot)?;
+            // In window, a written slot holds exactly block `number`'s hash —
+            // it is overwritten only 8191 blocks later.
+            if stored != U256::ZERO {
+                return Ok(B256::from(stored.to_be_bytes::<32>()));
+            }
+            // A discovery pass's placeholder (counted, and the slot is in the
+            // access set for the wave): the real run reads the slot, so no
+            // walk now.
+            if self.track.lock().unwrap().misses != misses {
+                return Ok(B256::ZERO);
+            }
+            // A proven zero: a slot the ring never wrote.
+        }
+        let anchor = source.parent_hash.ok_or(OracleError::BlockHashUnsupported { number })?;
+        self.walked_block_hash(parent, &anchor, number).map(B256::from)
+    }
+}
+
+impl OracleDatabase {
+    /// A storage slot from verified state, through the three tiers — never an
+    /// override (the caller of `storage_ref` applies those first).
+    fn verified_storage(&self, addr: [u8; 20], index: U256) -> Result<U256, OracleError> {
         self.track.lock().unwrap().set.slots.insert((addr, index));
         // Tier 1.
         if let Some(v) = self.view.lock().unwrap().storage.get(&(addr, index)) {
@@ -374,9 +492,20 @@ impl DatabaseRef for OracleDatabase {
         Ok(value)
     }
 
-    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
-        // No local block store to serve historical hashes; a contract reading
-        // BLOCKHASH cannot be executed. Fail fast (matches the Java engine).
-        Err(OracleError::BlockHashUnsupported { number })
+    /// Block `number`'s hash from a header walk down from the verified block
+    /// `anchor_number` (hash `anchor_hash`): this call's view first, else the
+    /// oracle's proven walk.
+    ///
+    /// A discovery pass walks too, rather than handing out a placeholder: a
+    /// walk is one request no prefetch wave could batch, so deferring it to
+    /// the real run saves nothing, while a zero hash would cost every pass the
+    /// hit-only fast path and could steer discovery down a wrong branch.
+    fn walked_block_hash(&self, anchor_number: u64, anchor_hash: &[u8; 32], number: u64) -> Result<[u8; 32], OracleError> {
+        if let Some(hash) = self.view.lock().unwrap().block_hashes.get(&number) {
+            return Ok(*hash);
+        }
+        let hash = self.oracle.fetch_block_hash(anchor_number, anchor_hash, number)?;
+        self.view.lock().unwrap().block_hashes.insert(number, hash);
+        Ok(hash)
     }
 }

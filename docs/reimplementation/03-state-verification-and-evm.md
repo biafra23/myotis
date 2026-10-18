@@ -162,8 +162,9 @@ CcipReadEvmExecutor( PrefetchingEvmExecutor( DefaultEvmExecutor( SnapBackedState
   `gas` (capped there) minus the intrinsic cost.
 - **EIP-7702 delegation**: if the target's code is exactly 23 bytes and starts with `0xef0100`,
   follow the designator **one hop** (chains are not followed — that correctly yields invalid-opcode).
-- **BLOCKHASH is deliberately unsupported** (no verified block-hash provider) — fail fast rather
-  than return a wrong hash.
+- **BLOCKHASH is deliberately unsupported** in the Java engine (no verified block-hash provider) —
+  fail fast rather than return a wrong hash. The Rust engine serves it from verified data since #664
+  (parent hash, EIP-2935 history-contract storage proof, header walk; see `verification.md` §9).
 - Drive the frame stack until empty; derive the outcome from the original outer frame
   (`COMPLETED_SUCCESS` → output bytes; revert reason present → `Reverted`; insufficient-gas halt →
   `OutOfGas`; else `Reverted` with a human detail).
@@ -335,5 +336,5 @@ chain — `NetworkConfig.hasEns()` gates the UI. Keep ENS off `NetworkConfig` so
 **Port priority**: (1) MPT verifier — security-critical, small; (2) the `world`/oracle adapter to
 your EVM's state trait; (3) the EVM fork table + view-call/estimate frame setup; (4) CCIP-Read + ENS
 (pure logic). The verification semantics (Found/Absent/Invalid, leaf-only storageRoot/codeHash,
-bytecode-by-codeHash, the 15% gas buffer, EIP-7702 one-hop, BLOCKHASH-unsupported) are the parts to
-replicate verbatim and test.
+bytecode-by-codeHash, the 15% gas buffer, EIP-7702 one-hop, BLOCKHASH served only from verified
+data or refused — never zero inside its window) are the parts to replicate verbatim and test.
