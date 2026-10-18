@@ -178,8 +178,9 @@ public interface VerifiedReads {
      * {@link #sendRawTransaction} with its outcome told apart (#531): an engine
      * that judges a send before broadcasting it answers a transaction that can
      * never be mined as sent {@link SendResult.Status#REJECTED}, with geth's
-     * reason, instead of a hash; bytes that are no transaction it relays are
-     * {@link SendResult.Status#REFUSED} (#360). The default wraps
+     * reason, instead of a hash; bytes that are no transaction it relays, and a
+     * transaction signed for another chain, are {@link SendResult.Status#REFUSED}
+     * (#360, #665). The default wraps
      * {@link #sendRawTransaction}: a hash is {@code SENT}, null
      * {@code UNAVAILABLE}.
      */

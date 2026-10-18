@@ -22,10 +22,12 @@ import java.util.function.Supplier;
  * and the {@link Checker} that runs them over one account read; {@link VerifiedRpcBackend}
  * supplies the head and the read.
  *
- * <p>The check fails OPEN: anything that stops it from judging (another chain's
- * transaction, no anchored head, a stale head, too many reads already in flight, a
- * slow or failed account read, anything unexpected) broadcasts the transaction as
- * before — a node that lags the chain must never block a send.
+ * <p>The check fails OPEN: anything that stops it from judging (no anchored head, a
+ * stale head, too many reads already in flight, a slow or failed account read, anything
+ * unexpected) broadcasts the transaction as before — a node that lags the chain must
+ * never block a send. Another chain's transaction never reaches it: the send path
+ * refuses that on its signed bytes alone ({@link EthTxDecoder#chainRefusal}, #665),
+ * with no state to be stale.
  *
  * <p>Where it judges differs from the Rust engine's, and so does one rule. The Rust
  * engine reads at the light client's optimistic head; this engine at its anchored head —
@@ -139,7 +141,8 @@ final class SendCheck {
     /**
      * Why there is nothing to judge, or null when the send can be judged at {@code head}:
      * an unrecovered sender (which {@link EthTxDecoder#checkSendable} refuses before a
-     * send gets here), another chain's transaction (peers drop it anyway, and this
+     * send gets here), another chain's transaction (which
+     * {@link EthTxDecoder#chainRefusal} refuses before a send gets here, #665; this
      * chain's state says nothing about it), no anchored head, or a head older than
      * {@link #freshBoundSec}.
      */

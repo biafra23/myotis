@@ -9,11 +9,12 @@
 //!
 //! The check fails OPEN. Anything that stops it from judging (an undecodable
 //! transaction — a blob transaction's network form among them — an
-//! unrecovered sender, another chain's transaction, a stale head, an
-//! unreadable wall clock, Tor-routed reads, too many reads already in flight,
-//! a slow account read or one not proven at the head's own root) broadcasts
-//! the transaction as before: a node that lags the chain must never block a
-//! send.
+//! unrecovered sender, a stale head, an unreadable wall clock, Tor-routed
+//! reads, too many reads already in flight, a slow account read or one not
+//! proven at the head's own root) broadcasts the transaction as before: a
+//! node that lags the chain must never block a send. Another chain's
+//! transaction never reaches it: the send path refuses that on its signed
+//! bytes alone (`tx::check_chain`, #665), with no state to be stale.
 
 use std::time::Duration;
 

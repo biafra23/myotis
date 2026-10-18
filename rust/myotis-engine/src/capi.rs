@@ -682,7 +682,7 @@ pub unsafe extern "C" fn myotis_fee_history_json(
     ))
 }
 
-/// Gossip a signed raw tx: `{"txHash":"0x…"}`, `{"status":"rejected","reason"}` (ABI ≥ 36: refused before broadcast, nothing sent; the reason is geth's txpool verdict), `{"error","code":-32602}` (ABI ≥ 44: no transaction this node relays, nothing sent) or `{"error": ...}`
+/// Gossip a signed raw tx: `{"txHash":"0x…"}`, `{"status":"rejected","reason"}` (ABI ≥ 36: refused before broadcast, nothing sent; the reason is geth's txpool verdict), `{"error","code":-32602}` (ABI ≥ 44: no transaction this node relays, or (#665) one signed for another chain than the handle's, nothing sent) or `{"error": ...}`
 /// (`nativeSendRawTransactionJson` twin).
 ///
 /// # Safety
@@ -699,7 +699,8 @@ pub unsafe extern "C" fn myotis_send_raw_transaction_json(
 /// The `eth_sendRawTransaction` gate on the bytes alone (ABI ≥ 45), no handle:
 /// `{"ok":true}`, the permanent `{"error","code":-32602}` refusal, or
 /// `{"error": ...}` for bad hex (`nativeCheckRawTransactionJson` twin). Hosts call
-/// it before their readiness hold.
+/// it before their readiness hold. It knows no chain: `{"ok":true}` does not rule
+/// out the send's `-32602` for a transaction signed for another chain (#665).
 ///
 /// # Safety
 /// `raw_tx_hex` must be null or a valid null-terminated C string.

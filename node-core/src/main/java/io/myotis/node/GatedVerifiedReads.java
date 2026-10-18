@@ -26,6 +26,8 @@ import io.myotis.api.VerifiedReads;
  */
 final class GatedVerifiedReads implements VerifiedReads {
 
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(GatedVerifiedReads.class);
+
     private final ChainStack stack;
 
     GatedVerifiedReads(ChainStack stack) {
@@ -145,18 +147,43 @@ final class GatedVerifiedReads implements VerifiedReads {
 
     @Override
     public io.myotis.api.SendResult sendRawTransactionDetailed(byte[] rawTx) {
-        // Bytes that are no transaction are refused on the bytes alone (#360),
-        // BEFORE the wait for a ready backend: a paused or starting stack must
-        // not turn that permanent refusal into a retryable "stack not ready".
-        // The backend checks again; the decode is cheap.
-        String refusal = com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.checkSendable(
-                org.apache.tuweni.bytes.Bytes.wrap(rawTx == null ? new byte[0] : rawTx)).refusal();
+        // Bytes that are no transaction (#360), and a transaction signed for another
+        // chain (#665), are refused on the bytes and the static network config alone,
+        // BEFORE the wait for a ready backend: a paused or starting stack must not turn
+        // that permanent refusal into a retryable "stack not ready". The backend checks
+        // again; the decode is cheap.
+        String refusal = sendRefusal(rawTx, this::chainId);
         if (refusal != null) return io.myotis.api.SendResult.refused(refusal);
         // Forwarded, not inherited: the default would collapse the backend's
         // own verdict into hash-or-null (#531).
         io.myotis.api.SendResult r = guarded(d -> d.sendRawTransactionDetailed(rawTx));
         // guarded() returns null when no backend is available — retryable.
         return r != null ? r : io.myotis.api.SendResult.unavailable("stack not ready");
+    }
+
+    /**
+     * Why a send is refused before anything is broadcast, or null: bytes that are no
+     * transaction this node relays (#360), or one signed for another chain than
+     * {@code chainId}'s (#665). {@code chainId} is read only for a transaction that
+     * passed the first check. Every refusal is logged here — the backend's own log
+     * line is never reached for one — with the transaction's hash when the bytes are
+     * one (strictly decoded, so {@code keccak256(raw)} is its own hash).
+     */
+    static String sendRefusal(byte[] rawTx, java.util.function.LongSupplier chainId) {
+        org.apache.tuweni.bytes.Bytes raw = org.apache.tuweni.bytes.Bytes.wrap(rawTx == null ? new byte[0] : rawTx);
+        com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.SendCheck check =
+                com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.checkSendable(raw);
+        if (check.refusal() != null) {
+            log.info("[rpc] eth_sendRawTransaction refused, nothing broadcast: {}", check.refusal());
+            return check.refusal();
+        }
+        String wrongChain = com.jaeckel.ethp2p.networking.eth.messages.EthTxDecoder.chainRefusal(
+                check.tx(), chainId.getAsLong());
+        if (wrongChain != null) {
+            log.info("[rpc] eth_sendRawTransaction {} refused, nothing broadcast: {}",
+                    org.apache.tuweni.crypto.Hash.keccak256(raw).toHexString(), wrongChain);
+        }
+        return wrongChain;
     }
 
     @Override

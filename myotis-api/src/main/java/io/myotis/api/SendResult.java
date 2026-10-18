@@ -19,7 +19,9 @@ package io.myotis.api;
  *   <li>{@link Status#REFUSED} — the bytes are no transaction this node relays
  *       (#360): they do not decode as one under a strict reading of their type,
  *       their signature names no sender (or carries values a peer refuses), or
- *       it is a blob transaction. Nothing was broadcast, and no retry changes
+ *       it is a blob transaction — or it was signed for another chain (#665;
+ *       "invalid sender: invalid chain id for signer: have X want Y", geth's
+ *       words). Nothing was broadcast, and no retry changes
  *       the bytes: hosts serve the PERMANENT JSON-RPC -32602 with
  *       {@code detail}, never the retryable -32000 a client would spin on
  *       (CLAUDE.md: a refusal is permanent).</li>

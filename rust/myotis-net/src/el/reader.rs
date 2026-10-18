@@ -349,8 +349,10 @@ impl ElConfig {
 pub enum SendError {
     /// Not a transaction this node relays ([`tx::decode_sendable`], #360):
     /// the bytes do not decode as one, its signature names no sender, or it
-    /// is a blob transaction. Nothing was broadcast, and no retry changes the
-    /// bytes: hosts answer the permanent JSON-RPC -32602 with the message.
+    /// is a blob transaction — or one signed for another chain
+    /// ([`tx::check_chain`], #665). Nothing was broadcast, and no retry
+    /// changes the bytes: hosts answer the permanent JSON-RPC -32602 with the
+    /// message.
     Refused(String),
     /// The transaction can never be mined as sent: its sender cannot pay for
     /// it, or its nonce is used — judged on fresh, verified state, and nothing
@@ -1933,7 +1935,7 @@ pub struct ElReader {
     /// From `ElConfig::block_time`.
     block_time: Duration,
     /// The chain's id: `ElConfig::network_id`, which equals it on every
-    /// network served (a send for another chain is not judged, #531).
+    /// network served. A send signed for another chain is refused (#665).
     chain_id: u64,
     /// Cross-call EVM caches, shared across every `eth_call` on this reader. Both
     /// hold `stateRoot`-keyed / content-addressed cryptographic facts, so reuse is
@@ -8268,7 +8270,9 @@ impl ElReader {
     /// First, the bytes must BE a transaction (#360; [`tx::decode_sendable`]):
     /// strictly decoded, with a sender its signature recovers — anything else
     /// is [`SendError::Refused`] and never reaches a peer. Strict decoding is
-    /// also what makes the hash returned the decoded transaction's own.
+    /// also what makes the hash returned the decoded transaction's own. A
+    /// transaction signed for another chain is refused the same way (#665;
+    /// [`tx::check_chain`]): no peer here would ever include it.
     /// Then the check geth's txpool makes (#531; [`send_check`]): a
     /// transaction its sender cannot pay for, or whose nonce is used, is
     /// [`SendError::Rejected`] in geth's words and never broadcast — no peer
@@ -8282,6 +8286,11 @@ impl ElReader {
                 return Err(SendError::Refused(reason));
             }
         };
+        if let Err(reason) = tx::check_chain(&summary, self.chain_id) {
+            let tx_hash = crate::el::sent_tx::raw_hash_hex(raw_tx);
+            tracing::info!(tx = %tx_hash, %reason, "transaction refused: signed for another chain");
+            return Err(SendError::Refused(reason));
+        }
         let verdict = self.pre_broadcast_check(&summary).await;
         self.send_judged(raw_tx, summary, verdict).await
     }
@@ -8477,8 +8486,9 @@ impl ElReader {
     /// The transaction, its sender and the head a verdict would be judged at,
     /// or why there is nothing to judge: an unrecovered sender (which
     /// [`tx::decode_sendable`] refuses before a send gets here), another
-    /// chain's transaction (peers drop it anyway, and this chain's
-    /// state says nothing about it), no head, or a head older than
+    /// chain's transaction (which [`tx::check_chain`] refuses before a send
+    /// gets here, #665; this chain's state says nothing about it), no head,
+    /// or a head older than
     /// [`send_check::fresh_bound`] — by its proven timestamp against the wall
     /// clock, and by when this node adopted it against its own monotonic clock,
     /// so a wall clock set wrong cannot pass a stalled head as fresh.
@@ -17368,7 +17378,8 @@ mod pre_broadcast_tests {
         let senderless = TxSummary { from: None, ..tx.clone() };
         assert_eq!(fresh.ready_to_judge(&senderless, now).err(), Some("sender not recovered"));
         // Signed for Sepolia, posted to mainnet: this chain's state says
-        // nothing about it.
+        // nothing about it. (The send path refuses it before this, #665;
+        // the judge still never reads this chain's state for it.)
         let key = NodeKey::from_secret_bytes(&[0x42; 32]).unwrap();
         let sepolia = tx::decode_summary(&signed_typed(2, 11_155_111, &key)).expect("decodes");
         assert_eq!(fresh.ready_to_judge(&sepolia, now).err(), Some("another chain's transaction"));
@@ -17406,6 +17417,33 @@ mod pre_broadcast_tests {
         let mut sent = reader.sent_txs.lock().unwrap();
         assert!(sent.bytes.get(&keccak256(&[0x00])).is_none());
         assert!(sent.bytes.get(&keccak256(truncated)).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_transaction_signed_for_another_chain_is_refused_before_any_peer_is_asked() {
+        // #665: signed for Sepolia, posted to a mainnet node. It used to skip
+        // the pre-broadcast check and go out, answered with its hash — a
+        // "sent" that no peer here would ever include.
+        let reader = offline_reader(Some(now_unix() - 5)).await;
+        let key = NodeKey::from_secret_bytes(&[0x42; 32]).unwrap();
+        for ty in [2u8, 4] {
+            let raw = signed_typed(ty, 11_155_111, &key);
+            assert_eq!(
+                reader.send_raw_transaction(&raw).await,
+                Err(SendError::Refused(
+                    "invalid sender: invalid chain id for signer: have 11155111 want 1".to_string()
+                )),
+                "type {ty}"
+            );
+            // Not booked as sent: no rebroadcast, no pending nonce.
+            assert!(reader.sent_txs.lock().unwrap().bytes.get(&keccak256(&raw)).is_none(), "type {ty}");
+        }
+        // The same transaction signed for this chain goes on as before: the
+        // check fails open offline, and only the missing peer stops it.
+        assert_eq!(
+            reader.send_raw_transaction(&signed_typed(2, 1, &key)).await,
+            Err(SendError::Unavailable("no peer available to broadcast the transaction".to_string()))
+        );
     }
 
     #[tokio::test]

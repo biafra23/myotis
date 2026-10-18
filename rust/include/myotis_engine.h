@@ -326,12 +326,15 @@ char *myotis_fee_history_json(int64_t handle, int64_t block_count,
 /* {"txHash":"0x..."}, {"status":"rejected","reason"} (ABI >= 36: never
  * broadcast; reason = geth's txpool verdict, served under -32000),
  * {"error","code":-32602} (ABI >= 44: bytes that are no transaction this node
- * relays, never broadcast — a permanent refusal), or {"error"}. */
+ * relays, or (#665) one signed for another chain than the handle's, never
+ * broadcast — a permanent refusal), or {"error"}. */
 char *myotis_send_raw_transaction_json(int64_t handle, const char *raw_tx_hex);
 /* ABI >= 45: the eth_sendRawTransaction gate on the bytes alone, no handle:
  * {"ok":true}, the permanent {"error","code":-32602} refusal, or {"error"} for
  * bad hex. Call it before any readiness hold, so a starting or paused node
- * answers bytes that are no transaction with the permanent refusal. */
+ * answers bytes that are no transaction with the permanent refusal. It knows
+ * no chain: {"ok":true} does not rule out the send's -32602 for a transaction
+ * signed for another chain (#665). */
 char *myotis_check_raw_transaction_json(const char *raw_tx_hex);
 
 /* Release any char* returned by the functions above. NULL is a no-op. */
