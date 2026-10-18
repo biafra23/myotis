@@ -1440,11 +1440,25 @@ pub fn get_storage_proof_json(
         Ok(reader) => reader,
         Err(msg) => return eljson::error_json(msg),
     };
+    // The result's finalizedSlot / optimisticSlot are the EL anchor's — the
+    // finality and the head the reads prove against — not the light client's,
+    // which runs ahead of them while a Gloas header waits to be resolved (the
+    // Java engine reports the same resolved slots). Each is its block's own
+    // beacon slot, the one a read proven there reports as matchedBeaconSlot;
+    // the light client's optimistic slot is the SIGNATURE slot, one or more
+    // above the head's block, which no read ever matched (#658). Both move
+    // up (a reorg aside), so the finality is sampled before the read and the
+    // head after it: a read matched at either still lands between the two
+    // when one of them moves on meanwhile.
+    let finalized_slot = reader.finalized_slot();
     match engine.rt.block_on(reader.request(async { reader.get_storage(address, slot, holder).await })) {
-        Ok(storage) => {
-            let (finalized_slot, optimistic_slot) = proven_slots(&reader);
-            eljson::storage_json(address_hex, holder_hex, &storage, finalized_slot, optimistic_slot)
-        }
+        Ok(storage) => eljson::storage_json(
+            address_hex,
+            holder_hex,
+            &storage,
+            finalized_slot,
+            reader.optimistic_slot(),
+        ),
         Err(e) => eljson::error_json(&e),
     }
 }
@@ -1510,13 +1524,14 @@ pub fn get_storage_at_json(
         Ok(anchor) => anchor,
         Err(json) => return json,
     };
+    // The finality before the read, the head after it: see get_storage_proof_json.
+    let finalized_slot = reader.finalized_slot();
     match engine
         .rt
         .block_on(reader.request(async { reader.get_storage_at(anchor, address, position).await }))
     {
         Ok(storage) => {
-            let (finalized_slot, optimistic_slot) = proven_slots(&reader);
-            eljson::storage_json(address_hex, None, &storage, finalized_slot, optimistic_slot)
+            eljson::storage_json(address_hex, None, &storage, finalized_slot, reader.optimistic_slot())
         }
         Err(e) => eljson::error_json(&e),
     }
@@ -2998,20 +3013,6 @@ fn running_reader(engine: &EngineState, handle: i64) -> Result<Arc<ElReader>, &'
         Some(ChainEntry::Created(_)) => Err("handle not started"),
         None => Err("unknown handle"),
     }
-}
-
-/// A storage read's `(finalizedSlot, optimisticSlot)`. Both are the EL
-/// anchor's — the finality and the head the reads prove against, which
-/// `finalizedBlockNumber` / `optimisticBlockNumber` name — not the light
-/// client's, which runs ahead of them while a Gloas header waits to be
-/// resolved (the Java engine reports the same resolved slots). Each is its
-/// block's own beacon slot, the one a read anchored there reports as its
-/// `matchedBeaconSlot`; the light client's optimistic slot is the SIGNATURE
-/// slot, one or more above the head's block, which no read ever matched
-/// (#658). Read once the proof is in, so a head that moved on during the read
-/// leaves the match below `optimisticSlot` rather than above it.
-fn proven_slots(reader: &ElReader) -> (u64, u64) {
-    (reader.finalized_slot(), reader.optimistic_slot())
 }
 
 /// Build the [`EnsQuery`] for one record method from the params JSON — shared

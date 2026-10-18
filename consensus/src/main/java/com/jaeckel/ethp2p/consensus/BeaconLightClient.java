@@ -2452,7 +2452,9 @@ public class BeaconLightClient implements AutoCloseable {
         // re-polling it is "no advance" now — nothing else would push it.
         if (store.isInitialized()
                 && (store.getFinalizedSlot() > syncState.getFinalizedSlot()
-                    || blockSlot(store.getOptimisticHeader()) > syncState.getOptimisticSlot())) {
+                    // != rather than >: a head re-proven at a LOWER block slot (a reorg)
+                    // must reach the sync state too.
+                    || blockSlot(store.getOptimisticHeader()) != syncState.getOptimisticSlot())) {
             updateSyncState();
             persistSnapshot();
         }

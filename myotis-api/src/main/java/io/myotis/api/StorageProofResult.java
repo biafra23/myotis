@@ -35,8 +35,9 @@ import java.util.List;
  *                              whose hash the header walk ended at (headerChain); -1 if
  *                              none. Like the two slots below, a BLOCK's own slot (#658): a
  *                              read proven at the current head reports {@code optimisticSlot},
- *                              one proven at the finality {@code finalizedSlot}, one matched
- *                              to an earlier root still in the window a slot below the head
+ *                              one proven at the finality {@code finalizedSlot} (unless that
+ *                              head or finality moved on during the read), one matched to an
+ *                              earlier root still in the window a slot below the head
  * @param verifyMethod          "stateRootMatch" / "headerChain" / null
  * @param failReason            null when verified; otherwise a stable reason token
  * @param peerBlockNumber       block the account proof anchors to. Java engine (and
@@ -53,7 +54,10 @@ import java.util.List;
  *                              against: the attested header's own slot, not the later
  *                              signature slot of the sync aggregate that attested it (#658);
  *                              0 if none. Read once the proof is in, so a head that moved on
- *                              during the read leaves {@code matchedBeaconSlot} below it
+ *                              during the read leaves {@code matchedBeaconSlot} below it. Like
+ *                              {@code finalizedSlot} it is the head the reads have RESOLVED:
+ *                              from Gloas on, a newer head waits for its execution header, and
+ *                              meanwhile this can trail {@code finalizedSlot}
  * @param maxHeaderChainGap     the engine's header-chain walk bound (currently 8192)
  */
 public record StorageProofResult(

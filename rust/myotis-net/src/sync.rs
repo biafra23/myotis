@@ -3751,7 +3751,7 @@ async fn poll_finality(
                     clcache.note_success(&format!("{}/p2p/{}", peer.addr, peer.id));
                     tracing::info!(peer = %peer.id, client = ?client.client_of(&peer.id),
                         finalized_slot = processor.store.finalized_slot(),
-                        optimistic_slot = processor.store.optimistic_slot(),
+                        optimistic_slot = optimistic_block_slot(&processor.store),
                         period = processor.store.current_period(),
                         "finality update applied");
                     applied = true;
