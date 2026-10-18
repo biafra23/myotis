@@ -386,7 +386,7 @@ Returns beacon chain light client sync state.
 | `connectedPeers` | int | Connected libp2p beacon peers |
 | `lightClientPeers` | long | Connected peers advertising the light-client protocols |
 | `finalizedSlot` | long | Latest finalized beacon slot (0 while `SYNCING`) |
-| `optimisticSlot` | long | Latest optimistic (attested but not finalized) slot (0 while `SYNCING`) |
+| `optimisticSlot` | long | Latest optimistic (attested but not finalized) slot — the attested block's own slot, not the later signature slot of the sync aggregate (0 while `SYNCING`) |
 | `finalizedPeriod` | long | `finalizedSlot / 8192` (absent while `SYNCING`) |
 | `syncCommitteePeriod` | long | Same as `currentPeriod` — the committee period the store verifies against, **not** `finalizedSlot / 8192` (absent while `SYNCING`) |
 | `wallClockPeriod` | long | Same as `targetPeriod` (absent while `SYNCING`) |

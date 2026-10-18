@@ -1126,6 +1126,11 @@ pub struct SyncStatus {
     pub finalized_slot: u64,
     /// hash_tree_root of the finalized beacon header.
     pub finalized_root: [u8; 32],
+    /// Beacon slot of the light client's optimistic header — the attested
+    /// block's own slot, as `finalized_slot` is the finalized block's. NOT the
+    /// store's tracked `optimistic_slot`, which is the update's signature slot,
+    /// one or more above the block it attests (#658): a head dated from that
+    /// reads younger than it is.
     pub optimistic_slot: u64,
     /// Sync-committee period the store currently holds a committee for.
     pub period: u64,
@@ -4106,6 +4111,14 @@ fn publish_stale_anchor(
     anchor.set_finality_current(false);
 }
 
+/// The beacon slot of `store`'s optimistic header's own block, 0 before it
+/// holds one — the status's optimistic slot (#658). The store tracks the
+/// update's signature slot instead, one or more above it, which is what its
+/// advance checks and snapshot compare, never a slot any block was proposed at.
+fn optimistic_block_slot(store: &LightClientStore) -> u64 {
+    store.optimistic_header().map_or(0, |h| h.beacon.slot)
+}
+
 async fn publish_status(
     config: &ChainConfig,
     client: &ReqRespClient,
@@ -4131,7 +4144,7 @@ async fn publish_status(
         state,
         finalized_slot: store.finalized_slot(),
         finalized_root,
-        optimistic_slot: store.optimistic_slot(),
+        optimistic_slot: optimistic_block_slot(store),
         period: store.current_period(),
         peer_count: client.connected_peer_count().await,
         served_peers_last_min: pool.served_last_minute(),
@@ -4256,6 +4269,14 @@ mod tests {
         // store's signature slot 1003.
         assert_eq!(anchor.find_state_root(&[0x11; 32]).map(|r| r.slot), Some(1000));
         assert_eq!(anchor.find_state_root(&[0x33; 32]).map(|r| r.slot), Some(1002));
+        // And the slots a read and the status report beside its
+        // matchedBeaconSlot are those same block slots (#658): a read
+        // anchored at this head matches 1002, so the optimistic slot it is
+        // compared against must be 1002 too, not the signature slot 1003.
+        assert_eq!(anchor.optimistic_slot(), 1002);
+        assert_eq!(store.optimistic_slot(), 1003, "the store keeps the signature slot");
+        assert_eq!(optimistic_block_slot(&store), 1002);
+        assert_eq!(optimistic_block_slot(&LightClientStore::new_mainnet_preset()), 0);
     }
 
     #[test]
@@ -4385,6 +4406,11 @@ mod tests {
         assert_eq!((fin.slot, fin.block_number, fin.state_root), (wall - 64, 21_004_000, [3; 32]));
         assert!(anchor.finality_is_current());
         assert_eq!(anchor.pending_hashes(), vec![[9; 32]], "the optimistic head still waits");
+        // The read's optimistic slot is the anchor's, so it trails the light
+        // client's head (the status's, at the attested block wall - 2) until
+        // that head's header resolves, as the finalized slot does (#658).
+        assert_eq!(anchor.optimistic_slot(), 0);
+        assert_eq!(optimistic_block_slot(&store), wall - 2);
     }
 
     /// A resolver that stays behind — no EL peer serves the header — drops the

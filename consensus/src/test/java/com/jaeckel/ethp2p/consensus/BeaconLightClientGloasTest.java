@@ -225,6 +225,9 @@ class BeaconLightClientGloasTest {
             byte[] want = new byte[32];
             for (int i = 0; i < 32; i++) want[i] = (byte) (63 + i); // gloas_header(60)'s root(63)
             assertArrayEquals(want, pending.get(0));
+            // The head's own block slot (gloas_header(60)), not the store's signature slot
+            // 11_296_829 (#658).
+            assertEquals(11_296_828L, syncState.getOptimisticSlot());
             assertEquals(1379L, syncState.getCurrentSyncCommitteePeriod());
         } finally {
             blc.close();

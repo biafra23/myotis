@@ -1436,18 +1436,15 @@ pub fn get_storage_proof_json(
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
     };
-    let (reader, finalized_slot, optimistic_slot) = match snapshot_reader_slots(engine, handle) {
-        Ok(snap) => snap,
+    let reader = match running_reader(engine, handle) {
+        Ok(reader) => reader,
         Err(msg) => return eljson::error_json(msg),
     };
     match engine.rt.block_on(reader.request(async { reader.get_storage(address, slot, holder).await })) {
-        Ok(storage) => eljson::storage_json(
-            address_hex,
-            holder_hex,
-            &storage,
-            finalized_slot,
-            optimistic_slot,
-        ),
+        Ok(storage) => {
+            let (finalized_slot, optimistic_slot) = proven_slots(&reader);
+            eljson::storage_json(address_hex, holder_hex, &storage, finalized_slot, optimistic_slot)
+        }
         Err(e) => eljson::error_json(&e),
     }
 }
@@ -1505,8 +1502,8 @@ pub fn get_storage_at_json(
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
     };
-    let (reader, finalized_slot, optimistic_slot) = match snapshot_reader_slots(engine, handle) {
-        Ok(snap) => snap,
+    let reader = match running_reader(engine, handle) {
+        Ok(reader) => reader,
         Err(msg) => return eljson::error_json(msg),
     };
     let anchor = match read_anchor(selector, &reader) {
@@ -1518,6 +1515,7 @@ pub fn get_storage_at_json(
         .block_on(reader.request(async { reader.get_storage_at(anchor, address, position).await }))
     {
         Ok(storage) => {
+            let (finalized_slot, optimistic_slot) = proven_slots(&reader);
             eljson::storage_json(address_hex, None, &storage, finalized_slot, optimistic_slot)
         }
         Err(e) => eljson::error_json(&e),
@@ -2989,27 +2987,31 @@ fn snapshot_reader(
     }
 }
 
-/// Snapshot `(reader, finalizedSlot, optimisticSlot)` for a running handle.
-/// The finalized slot is the EL anchor's — the finality the read proves
-/// against, paired with the `finalizedBlockNumber` beside it — not the light
-/// client's, which runs ahead of it while a Gloas finality waits for its
-/// execution header (the Java engine reports the same resolved slot).
-fn snapshot_reader_slots(
-    engine: &EngineState,
-    handle: i64,
-) -> Result<(Arc<ElReader>, u64, u64), &'static str> {
+/// The EL reader of a running handle, or an error message. Holds the map lock
+/// only for the clone.
+fn running_reader(engine: &EngineState, handle: i64) -> Result<Arc<ElReader>, &'static str> {
     let map = engine.handles.lock().map_err(|_| "engine lock poisoned")?;
     match map.get(&handle) {
-        Some(ChainEntry::Running(_, sync, Some(reader))) => Ok((
-            Arc::clone(reader),
-            reader.finalized_slot(),
-            sync.status().optimistic_slot,
-        )),
+        Some(ChainEntry::Running(_, _, Some(reader))) => Ok(Arc::clone(reader)),
         Some(ChainEntry::Running(_, _, None)) => Err("EL reader unavailable on this handle"),
         Some(ChainEntry::Paused(..)) => Err("handle is paused"),
         Some(ChainEntry::Created(_)) => Err("handle not started"),
         None => Err("unknown handle"),
     }
+}
+
+/// A storage read's `(finalizedSlot, optimisticSlot)`. Both are the EL
+/// anchor's — the finality and the head the reads prove against, which
+/// `finalizedBlockNumber` / `optimisticBlockNumber` name — not the light
+/// client's, which runs ahead of them while a Gloas header waits to be
+/// resolved (the Java engine reports the same resolved slots). Each is its
+/// block's own beacon slot, the one a read anchored there reports as its
+/// `matchedBeaconSlot`; the light client's optimistic slot is the SIGNATURE
+/// slot, one or more above the head's block, which no read ever matched
+/// (#658). Read once the proof is in, so a head that moved on during the read
+/// leaves the match below `optimisticSlot` rather than above it.
+fn proven_slots(reader: &ElReader) -> (u64, u64) {
+    (reader.finalized_slot(), reader.optimistic_slot())
 }
 
 /// Build the [`EnsQuery`] for one record method from the params JSON — shared

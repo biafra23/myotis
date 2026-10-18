@@ -150,7 +150,8 @@ public class BeaconSyncState {
      *
      * @param finalizedSlot       the latest finalized beacon slot
      * @param executionStateRoot  the execution state root from the finalized execution payload header
-     * @param optimisticSlot      the latest optimistic (attested) slot
+     * @param optimisticSlot      the latest optimistic (attested) header's own beacon slot —
+     *                            not the update's signature slot above it (#658)
      */
     public void update(long finalizedSlot, byte[] executionStateRoot, long optimisticSlot) {
         synchronized (lock) {
@@ -382,8 +383,9 @@ public class BeaconSyncState {
     /**
      * The optimistic (attested) execution head's block number and block hash, read together,
      * and the light client's latest optimistic slot ({@link #getOptimisticSlot()}) from the
-     * same read — reported as a walk's {@code matchedBeaconSlot}, it is not necessarily the
-     * slot that attested this block (a finality update moves it on its own).
+     * same read — reported as a walk's {@code matchedBeaconSlot}. It is the attested block's
+     * own slot (#658), but not necessarily THIS block's: a finality update moves it on its own,
+     * a moment before the next head's number and hash follow.
      * {@code blockHash} is null until an optimistic update lands.
      */
     public record OptimisticExecution(long slot, long blockNumber, byte[] blockHash) {}
@@ -418,7 +420,8 @@ public class BeaconSyncState {
     }
 
     /**
-     * Returns the latest optimistic (attested) slot, or 0 if not yet synced.
+     * Returns the latest optimistic (attested) header's own beacon slot — not the signature
+     * slot of the update that carried it (#658) — or 0 if not yet synced.
      */
     public long getOptimisticSlot() {
         return state.get().optimisticSlot();

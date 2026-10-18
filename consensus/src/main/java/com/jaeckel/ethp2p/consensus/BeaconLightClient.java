@@ -2233,10 +2233,10 @@ public class BeaconLightClient implements AutoCloseable {
                 // Seed the sync state directly (trusted peer, no BLS verification)
                 long execBlockNum = finalizedExec.blockNumber();
                 byte[] execBlockHash = finalizedExec.blockHash();
-                syncState.update(finalizedSlot, executionStateRoot, update.signatureSlot(), execBlockNum, execBlockHash);
+                long attestedSlot = update.attestedHeader().beacon().slot();
+                syncState.update(finalizedSlot, executionStateRoot, attestedSlot, execBlockNum, execBlockHash);
                 syncState.recordStateRoot(finalizedSlot, executionStateRoot, false);
                 // Also record the attested header's execution state root
-                long attestedSlot = update.attestedHeader().beacon().slot();
                 ExecutionPayloadHeader attestedExec = update.attestedHeader().execution();
                 byte[] attestedRoot = attestedExec != null ? attestedExec.stateRoot() : null;
                 if (attestedRoot != null && attestedRoot.length == 32) {
@@ -2304,10 +2304,13 @@ public class BeaconLightClient implements AutoCloseable {
             }
             long finalizedSlot = Long.parseLong(slotMatcher.group(1));
 
-            // Extract signature_slot
-            Pattern sigSlotPattern = Pattern.compile("\"signature_slot\"\\s*:\\s*\"(\\d+)\"");
-            Matcher sigSlotMatcher = sigSlotPattern.matcher(body);
-            long signatureSlot = sigSlotMatcher.find() ? Long.parseLong(sigSlotMatcher.group(1)) : finalizedSlot + 1;
+            // Extract attested_header.beacon.slot: the head's own block slot, not the update's
+            // signature_slot above it (#658)
+            Pattern attestedSlotPattern = Pattern.compile(
+                    "\"attested_header\"\\s*:\\s*\\{\\s*\"beacon\"\\s*:\\s*\\{.*?\"slot\"\\s*:\\s*\"(\\d+)\"",
+                    Pattern.DOTALL);
+            Matcher attestedSlotMatcher = attestedSlotPattern.matcher(body);
+            long attestedSlot = attestedSlotMatcher.find() ? Long.parseLong(attestedSlotMatcher.group(1)) : -1L;
 
             // Extract finalized execution block_number
             Pattern blockNumPattern = Pattern.compile(
@@ -2323,7 +2326,8 @@ public class BeaconLightClient implements AutoCloseable {
             Matcher blockHashMatcher = blockHashPattern.matcher(body);
             byte[] execBlockHash = blockHashMatcher.find() ? hexToBytes(blockHashMatcher.group(1)) : null;
 
-            syncState.update(finalizedSlot, executionStateRoot, signatureSlot, execBlockNum, execBlockHash);
+            syncState.update(finalizedSlot, executionStateRoot, attestedSlot >= 0 ? attestedSlot : finalizedSlot,
+                    execBlockNum, execBlockHash);
             syncState.recordStateRoot(finalizedSlot, executionStateRoot, false);
 
             // Also extract attested_header execution state root if present
@@ -2331,16 +2335,9 @@ public class BeaconLightClient implements AutoCloseable {
                     "\"attested_header\"\\s*:\\s*\\{.*?\"execution\"\\s*:\\s*\\{.*?\"state_root\"\\s*:\\s*\"(0x[0-9a-fA-F]{64})\"",
                     Pattern.DOTALL);
             Matcher attestedSrMatcher = attestedSrPattern.matcher(body);
-            if (attestedSrMatcher.find()) {
+            if (attestedSrMatcher.find() && attestedSlot >= 0) {
                 byte[] attestedRoot = hexToBytes(attestedSrMatcher.group(1));
-                Pattern attestedSlotPattern = Pattern.compile(
-                        "\"attested_header\"\\s*:\\s*\\{\\s*\"beacon\"\\s*:\\s*\\{.*?\"slot\"\\s*:\\s*\"(\\d+)\"",
-                        Pattern.DOTALL);
-                Matcher attestedSlotMatcher = attestedSlotPattern.matcher(body);
-                if (attestedSlotMatcher.find()) {
-                    long attestedSlot = Long.parseLong(attestedSlotMatcher.group(1));
-                    syncState.recordStateRoot(attestedSlot, attestedRoot, false);
-                }
+                syncState.recordStateRoot(attestedSlot, attestedRoot, false);
             }
 
             log.info("[beacon] Seeded from beacon HTTP API, finalizedSlot={}, stateRoot={}",
@@ -2455,7 +2452,7 @@ public class BeaconLightClient implements AutoCloseable {
         // re-polling it is "no advance" now — nothing else would push it.
         if (store.isInitialized()
                 && (store.getFinalizedSlot() > syncState.getFinalizedSlot()
-                    || store.getOptimisticSlot() > syncState.getOptimisticSlot())) {
+                    || blockSlot(store.getOptimisticHeader()) > syncState.getOptimisticSlot())) {
             updateSyncState();
             persistSnapshot();
         }
@@ -2689,7 +2686,7 @@ public class BeaconLightClient implements AutoCloseable {
         if (slot > syncState.getFinalizedSlot()) {
             long execBlockNum = fhExec.blockNumber();
             byte[] execBlockHash = fhExec.blockHash();
-            syncState.update(slot, sr, win.update().signatureSlot(), execBlockNum, execBlockHash);
+            syncState.update(slot, sr, attestedSlot, execBlockNum, execBlockHash);
             log.debug("[beacon] Finality update refreshed from {}, finalizedSlot={}", win.peer(), slot);
         }
     }
@@ -2769,33 +2766,49 @@ public class BeaconLightClient implements AutoCloseable {
         // resolver fetches the header whose keccak it is (resolveHeader) — the number and
         // state root come from there. Slots as for the payload shape, so the pending
         // bookkeeping compares like with like.
+        //
+        // Each head is labelled with ITS block's slot (beacon.slot), as the Rust engine's
+        // update_exec_anchor does — not the store's optimistic slot, which is the update's
+        // SIGNATURE slot, one or more above the attested block. A read matched at the head
+        // reports that slot as its matchedBeaconSlot, and the beacon status and the read's
+        // optimisticSlot report it beside it, so all three must be the block's (#658).
         LightClientHeader finalizedHeader = store.getFinalizedHeader();
+        LightClientHeader optimisticHeader = store.getOptimisticHeader();
+        long optimisticSlot = blockSlot(optimisticHeader);
         if (finalizedHeader != null) {
             ExecutionPayloadHeader exec = finalizedHeader.execution();
             if (exec != null) {
                 byte[] stateRoot = exec.stateRoot();
-                syncState.update(store.getFinalizedSlot(), stateRoot, store.getOptimisticSlot(),
+                syncState.update(store.getFinalizedSlot(), stateRoot, optimisticSlot,
                         exec.blockNumber(), exec.blockHash());
                 syncState.recordStateRoot(store.getFinalizedSlot(), stateRoot, true);
             } else if (finalizedHeader.shape() == LcFork.GLOAS && !isZero(finalizedHeader.executionBlockHash())) {
                 syncState.noteFinalizedHash(store.getFinalizedSlot(), finalizedHeader.executionBlockHash());
             }
         }
-        LightClientHeader optimisticHeader = store.getOptimisticHeader();
         if (optimisticHeader != null) {
             ExecutionPayloadHeader exec = optimisticHeader.execution();
             if (exec != null) {
                 byte[] optRoot = exec.stateRoot();
-                syncState.recordStateRoot(store.getOptimisticSlot(), optRoot, true);
+                syncState.recordStateRoot(optimisticSlot, optRoot, true);
                 syncState.updateOptimisticExecution(exec.blockNumber(), exec.blockHash(), optRoot);
             } else if (optimisticHeader.shape() == LcFork.GLOAS && !isZero(optimisticHeader.executionBlockHash())) {
-                syncState.noteOptimisticHash(store.getOptimisticSlot(), optimisticHeader.executionBlockHash());
+                syncState.noteOptimisticHash(optimisticSlot, optimisticHeader.executionBlockHash());
             }
         }
         // Mirror the store's committee period into the observable sync state so
         // beacon-status' SYNCED gate and verification callers don't need a store
         // reference to detect "wall-clock crossed into a period we don't hold."
         syncState.setCurrentSyncCommitteePeriod(store.getCurrentSyncCommitteePeriod());
+    }
+
+    /**
+     * The beacon slot of {@code header}'s own block, 0 for none — how the sync state labels a
+     * head (#658). The store tracks its optimistic header at the update's signature slot instead,
+     * which is what its own advance checks and snapshot compare, never a slot the block was at.
+     */
+    private static long blockSlot(LightClientHeader header) {
+        return header != null ? header.beacon().slot() : 0L;
     }
 
     // -------------------------------------------------------------------------
