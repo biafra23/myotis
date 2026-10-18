@@ -8287,7 +8287,8 @@ impl ElReader {
             }
         };
         if let Err(reason) = tx::check_chain(&summary, self.chain_id) {
-            tracing::info!(%reason, "transaction refused: signed for another chain");
+            let tx_hash = crate::el::sent_tx::hash_hex(&keccak256(raw_tx));
+            tracing::info!(tx = %tx_hash, %reason, "transaction refused: signed for another chain");
             return Err(SendError::Refused(reason));
         }
         let verdict = self.pre_broadcast_check(&summary).await;
