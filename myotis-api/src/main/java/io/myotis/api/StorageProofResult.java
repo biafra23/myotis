@@ -47,7 +47,12 @@ import java.util.List;
  *                              the anchored root (preferred since the #355 fix),
  *                              the peer's head only on its fallback
  * @param finalizedBlockNumber  finalized execution block number (0 if none)
- * @param optimisticBlockNumber optimistic-head execution block number (0 if none)
+ * @param optimisticBlockNumber optimistic-head execution block number (0 if none). The block
+ *                              numbers and the two slots below are sampled at different
+ *                              moments of the read, so while the head (or the finality) moves
+ *                              on during it a number and its slot can name different blocks:
+ *                              compare {@code matchedBeaconSlot} with the slots, and do not
+ *                              label a block number with a slot from here
  * @param finalizedSlot         beacon slot of the finalized block the reads prove against
  *                              (0 if none)
  * @param optimisticSlot        beacon slot of the optimistic head block the reads prove

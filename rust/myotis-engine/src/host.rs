@@ -1449,7 +1449,12 @@ pub fn get_storage_proof_json(
     // above the head's block, which no read ever matched (#658). Both move
     // up (a reorg aside), so the finality is sampled before the read and the
     // head after it: a read matched at either still lands between the two
-    // when one of them moves on meanwhile.
+    // when one of them moves on meanwhile. The bracket is only as good as
+    // the order of the two: from Gloas on the anchor's head can trail its
+    // finality while the head's header resolves (0 before any head has), and
+    // a finalized read then sits above optimisticSlot. The block numbers
+    // beside them are sampled mid-read (`anchor_diagnostics`), so a number
+    // and its slot can name different blocks while either moves.
     let finalized_slot = reader.finalized_slot();
     match engine.rt.block_on(reader.request(async { reader.get_storage(address, slot, holder).await })) {
         Ok(storage) => eljson::storage_json(
