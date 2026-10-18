@@ -2452,8 +2452,10 @@ public class BeaconLightClient implements AutoCloseable {
         // re-polling it is "no advance" now — nothing else would push it.
         if (store.isInitialized()
                 && (store.getFinalizedSlot() > syncState.getFinalizedSlot()
-                    // != rather than >: a head re-proven at a LOWER block slot (a reorg)
-                    // must reach the sync state too.
+                    // != rather than >: a payload-shaped head re-proven at a LOWER block slot
+                    // (a reorg) must reach the sync state too. A Gloas-shaped one still waits
+                    // for a head above the old slot: noteOptimisticHash orders pending heads by
+                    // slot, as Rust's note_optimistic_hash does.
                     || blockSlot(store.getOptimisticHeader()) != syncState.getOptimisticSlot())) {
             updateSyncState();
             persistSnapshot();
@@ -2773,7 +2775,10 @@ public class BeaconLightClient implements AutoCloseable {
         // update_exec_anchor does — not the store's optimistic slot, which is the update's
         // SIGNATURE slot, one or more above the attested block. A read matched at the head
         // reports that slot as its matchedBeaconSlot, and the beacon status and the read's
-        // optimisticSlot report it beside it, so all three must be the block's (#658).
+        // optimisticSlot report it beside it, so all three must be the block's (#658). The
+        // slot is written only with its head (updateOptimisticExecution, or resolveHeader for
+        // a Gloas head), never by the finality: a pending Gloas head's slot must not label
+        // the previous head's block meanwhile — as Rust's set_optimistic writes them together.
         LightClientHeader finalizedHeader = store.getFinalizedHeader();
         LightClientHeader optimisticHeader = store.getOptimisticHeader();
         long optimisticSlot = blockSlot(optimisticHeader);
@@ -2781,7 +2786,7 @@ public class BeaconLightClient implements AutoCloseable {
             ExecutionPayloadHeader exec = finalizedHeader.execution();
             if (exec != null) {
                 byte[] stateRoot = exec.stateRoot();
-                syncState.update(store.getFinalizedSlot(), stateRoot, optimisticSlot,
+                syncState.updateFinalized(store.getFinalizedSlot(), stateRoot,
                         exec.blockNumber(), exec.blockHash());
                 syncState.recordStateRoot(store.getFinalizedSlot(), stateRoot, true);
             } else if (finalizedHeader.shape() == LcFork.GLOAS && !isZero(finalizedHeader.executionBlockHash())) {
@@ -2793,7 +2798,7 @@ public class BeaconLightClient implements AutoCloseable {
             if (exec != null) {
                 byte[] optRoot = exec.stateRoot();
                 syncState.recordStateRoot(optimisticSlot, optRoot, true);
-                syncState.updateOptimisticExecution(exec.blockNumber(), exec.blockHash(), optRoot);
+                syncState.updateOptimisticExecution(optimisticSlot, exec.blockNumber(), exec.blockHash(), optRoot);
             } else if (optimisticHeader.shape() == LcFork.GLOAS && !isZero(optimisticHeader.executionBlockHash())) {
                 syncState.noteOptimisticHash(optimisticSlot, optimisticHeader.executionBlockHash());
             }
