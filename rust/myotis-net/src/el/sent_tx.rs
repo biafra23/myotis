@@ -123,6 +123,12 @@ impl SentTxTracker {
     }
 }
 
+/// The hash of raw transaction bytes, `keccak256(raw)`, as `0x…` hex — for a
+/// send's log line where the hash is not otherwise at hand (#665).
+pub fn raw_hash_hex(raw: &[u8]) -> String {
+    hash_hex(&myotis_core::keccak::keccak256(raw))
+}
+
 /// A tx hash as `0x…` hex, for the send log lines (#531).
 pub fn hash_hex(hash: &[u8; 32]) -> String {
     use std::fmt::Write;

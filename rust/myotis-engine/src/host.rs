@@ -2713,7 +2713,7 @@ pub fn send_raw_transaction_json(handle: i64, raw_hex: &str) -> String {
     // too. The reader checks again (its own callers need the check).
     if let Some(chain_id) = handle_chain_id(engine, handle) {
         if let Err(reason) = myotis_net::el::tx::check_chain(&summary, chain_id) {
-            let tx_hash = myotis_net::el::sent_tx::hash_hex(&myotis_core::keccak::keccak256(&raw));
+            let tx_hash = myotis_net::el::sent_tx::raw_hash_hex(&raw);
             tracing::info!(tx = %tx_hash, %reason, "transaction refused: signed for another chain");
             return eljson::invalid_params_json(&reason);
         }
