@@ -158,6 +158,34 @@ class EthTxSendCheckTest {
     }
 
     @Test
+    void onlyATransactionSignedForThisChainPassesTheChainCheck() {
+        // #665. Typed: the signed chainId field. unsignedFields signs for chain 1.
+        for (int ty : new int[] {1, 2, 4}) {
+            EthTxDecoder.DecodedTx tx = sendable(signTyped(ty, unsignedFields(ty)));
+            assertNull(EthTxDecoder.chainRefusal(tx, 1), "type " + ty);
+            assertEquals("invalid sender: invalid chain id for signer: have 1 want 11155111",
+                    EthTxDecoder.chainRefusal(tx, 11_155_111), "type " + ty);
+        }
+        // Legacy EIP-155: the chain in v. The spec vector is chain 1.
+        assertNull(EthTxDecoder.chainRefusal(sendable(SPEC_TX), 1));
+        assertEquals("invalid sender: invalid chain id for signer: have 1 want 100",
+                EthTxDecoder.chainRefusal(sendable(SPEC_TX), 100));
+        // Pre-EIP-155 legacy (v 27/28) names no chain: it passes on any.
+        List<Object> unsigned = new ArrayList<>(List.of(be(7), be(30_000_000_000L), be(21_000),
+                Bytes.repeat((byte) 0x11, 20), be(1), Bytes.EMPTY));
+        SECP256K1.Signature sig = SECP256K1.signHashed(Hash.keccak256(encode(unsigned)), KP);
+        List<Object> fields = new ArrayList<>(unsigned);
+        fields.add(be(27 + sig.v()));
+        fields.add(be(sig.r()));
+        fields.add(be(sig.s()));
+        EthTxDecoder.DecodedTx unprotected = sendable(encode(fields));
+        assertNull(unprotected.chainId());
+        for (long chainId : new long[] {1, 100, 11_155_111}) {
+            assertNull(EthTxDecoder.chainRefusal(unprotected, chainId), "chain " + chainId);
+        }
+    }
+
+    @Test
     void bytesThatAreNoTransactionAreRefused() {
         // The issue's reproduction: one 0x00 byte.
         assertEquals("invalid raw transaction: transaction type not supported (0x0)",

@@ -287,8 +287,9 @@ const SECP256K1_HALF_N: [u8; 32] = [
 /// - A sender the signature recovers.
 ///
 /// Whether the transaction can be mined — fees, nonce, balance, chain — is
-/// not judged here: that is the pre-broadcast check's ([`crate::el::send_check`])
-/// on verified state, and otherwise the peers'.
+/// not judged here: the chain is [`check_chain`]'s, against the node's own,
+/// and the rest the pre-broadcast check's ([`crate::el::send_check`]) on
+/// verified state, and otherwise the peers'.
 pub fn decode_sendable(raw: &[u8]) -> Result<TxSummary, String> {
     let Some(&first) = raw.first() else {
         return Err("invalid raw transaction: empty".into());
@@ -341,6 +342,25 @@ pub fn decode_sendable(raw: &[u8]) -> Result<TxSummary, String> {
         return Err("invalid sender: the signature recovers no address".into());
     }
     Ok(tx)
+}
+
+/// Whether a transaction [`decode_sendable`] passed was signed for `chain_id`
+/// (#665): the refusal in geth's words when it was signed for another chain
+/// (its txpool's `ErrInvalidSender` around the signer's `ErrInvalidChainId`).
+/// No peer here would ever include it, so broadcasting it and answering its
+/// hash would show a wallet "sent" for a transaction that can never confirm.
+/// Unlike the pre-broadcast check's verdicts this one rests on the signed
+/// bytes alone — no state, no head to be stale — so it never fails open.
+/// A pre-EIP-155 legacy transaction names no chain and passes, as geth's
+/// signer recovers it without one. Twin of the Java
+/// `EthTxDecoder.chainRefusal` — same rule, same words.
+pub fn check_chain(tx: &TxSummary, chain_id: u64) -> Result<(), String> {
+    match tx.chain_id {
+        Some(signed) if signed != chain_id => {
+            Err(format!("invalid sender: invalid chain id for signer: have {signed} want {chain_id}"))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// An access list as geth decodes one (`[]AccessTuple`): every entry is
@@ -848,6 +868,48 @@ mod tests {
             f
         });
         assert_eq!(decode_sendable(&create).map(|t| t.to), Ok(None));
+    }
+
+    #[test]
+    fn only_a_transaction_signed_for_this_chain_passes_the_chain_check() {
+        let chain = |raw: &[u8], chain_id: u64| {
+            check_chain(&decode_sendable(raw).expect("sendable"), chain_id)
+        };
+        // Typed: the signed chainId field. unsigned_fields signs for chain 1.
+        for ty in [1u8, 2, 4] {
+            let (raw, _) = sign_typed(ty, unsigned_fields(ty));
+            assert_eq!(chain(&raw, 1), Ok(()), "type {ty}");
+            assert_eq!(
+                chain(&raw, 11_155_111),
+                Err("invalid sender: invalid chain id for signer: have 1 want 11155111".to_string()),
+                "type {ty}"
+            );
+        }
+        // Legacy EIP-155: the chain in v. The spec vector is chain 1.
+        let spec = hex(SPEC_TX);
+        assert_eq!(chain(&spec, 1), Ok(()));
+        assert_eq!(chain(&spec, 100), Err("invalid sender: invalid chain id for signer: have 1 want 100".to_string()));
+        // Pre-EIP-155 legacy (v 27/28) names no chain: it passes on any.
+        let unsigned = vec![
+            Item::Bytes(be(7)),              // nonce
+            Item::Bytes(be(30_000_000_000)), // gasPrice
+            Item::Bytes(be(21_000)),         // gas
+            Item::Bytes(vec![0x11; 20]),     // to
+            Item::Bytes(be(1)),              // value
+            Item::Bytes(Vec::new()),         // data
+        ];
+        let key = myotis_core::nodekey::NodeKey::from_secret_bytes(&[0x42; 32]).unwrap();
+        let sig = key.sign_hash(&keccak256(&encode(&Item::List(unsigned.clone())))).unwrap();
+        let strip = |b: &[u8]| b.iter().skip_while(|&&x| x == 0).copied().collect::<Vec<_>>();
+        let mut fields = unsigned;
+        fields.push(Item::Bytes(be(27 + sig[64] as u128)));
+        fields.push(Item::Bytes(strip(&sig[..32])));
+        fields.push(Item::Bytes(strip(&sig[32..64])));
+        let unprotected = encode(&Item::List(fields));
+        assert_eq!(decode_sendable(&unprotected).expect("sendable").chain_id, None);
+        for chain_id in [1, 100, 11_155_111] {
+            assert_eq!(chain(&unprotected, chain_id), Ok(()), "chain {chain_id}");
+        }
     }
 
     #[test]

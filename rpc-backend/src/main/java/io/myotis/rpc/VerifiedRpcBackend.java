@@ -2900,6 +2900,12 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             log.info("[rpc] eth_sendRawTransaction refused, nothing broadcast: " + check.refusal());
             return io.myotis.api.SendResult.refused(check.refusal());
         }
+        // Signed for another chain (#665): no peer here would ever include it.
+        String wrongChain = EthTxDecoder.chainRefusal(check.tx(), chainId());
+        if (wrongChain != null) {
+            log.info("[rpc] eth_sendRawTransaction refused, nothing broadcast: " + wrongChain);
+            return io.myotis.api.SendResult.refused(wrongChain);
+        }
         Bytes32 hash = Hash.keccak256(Bytes.wrap(rawTx));
         String txHashHex = hash.toHexString();
         SendCheck.PreBroadcast verdict = preBroadcastCheck(check.tx(), txHashHex);

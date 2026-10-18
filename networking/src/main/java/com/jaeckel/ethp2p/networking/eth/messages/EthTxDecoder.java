@@ -112,8 +112,8 @@ public final class EthTxDecoder {
      *   <li>A sender the signature recovers.</li>
      * </ul>
      * Whether the transaction can be mined — fees, nonce, balance, chain — is not
-     * judged here: that is the peers' (and, on the Rust engine, a pre-broadcast check
-     * on verified state).
+     * judged here: the chain is {@link #chainRefusal}'s, against the node's own, and the
+     * rest a pre-broadcast check's on verified state, and otherwise the peers'.
      */
     public static SendCheck checkSendable(Bytes raw) {
         if (raw == null || raw.isEmpty()) return SendCheck.refused("invalid raw transaction: empty");
@@ -166,6 +166,24 @@ public final class EthTxDecoder {
             return SendCheck.refused("invalid sender: the signature recovers no address");
         }
         return new SendCheck(tx, null);
+    }
+
+    /**
+     * Why a transaction {@link #checkSendable} passed was not signed for {@code chainId}
+     * (#665), or null when it was: the refusal in geth's words (its txpool's
+     * {@code ErrInvalidSender} around the signer's {@code ErrInvalidChainId}). No peer
+     * here would ever include it, so broadcasting it and answering its hash would show a
+     * wallet "sent" for a transaction that can never confirm. Unlike the pre-broadcast
+     * check's verdicts this one rests on the signed bytes alone — no state, no head to be
+     * stale — so it never fails open. A pre-EIP-155 legacy transaction names no chain and
+     * passes, as geth's signer recovers it without one. Twin of the Rust
+     * {@code tx::check_chain} — same rule, same words.
+     */
+    public static String chainRefusal(DecodedTx tx, long chainId) {
+        Long signed = tx.chainId();
+        if (signed == null || signed == chainId) return null;
+        return "invalid sender: invalid chain id for signer: have " + Long.toUnsignedString(signed)
+                + " want " + Long.toUnsignedString(chainId);
     }
 
     /** One top-level field of a transaction's RLP list: a list (kept as its encoding) or bytes. */

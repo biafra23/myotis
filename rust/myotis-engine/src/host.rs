@@ -2689,8 +2689,9 @@ fn parse_block_hash(selector: &str) -> Option<[u8; 32]> {
 /// verbatim under geth's -32000. Since ABI 44, the permanent
 /// `{"error","code":-32602}` envelope ([`eljson::invalid_params_json`]) for
 /// bytes that are no transaction this node relays — undecodable, no sender, a
-/// blob transaction — never broadcast either (#360). `raw_hex` is the 0x-hex
-/// raw tx.
+/// blob transaction — never broadcast either (#360), and likewise for a
+/// transaction signed for another chain than the handle's (#665). `raw_hex`
+/// is the 0x-hex raw tx.
 pub fn send_raw_transaction_json(handle: i64, raw_hex: &str) -> String {
     let Some(raw) = parse_hex_bytes(raw_hex) else {
         return eljson::error_json("invalid raw transaction hex");
@@ -2727,6 +2728,8 @@ pub fn send_raw_transaction_json(handle: i64, raw_hex: &str) -> String {
 /// the iOS backend before its handle lookup — so a starting or paused node
 /// answers bytes that are no transaction with the permanent refusal, never a
 /// retryable "not ready". [`send_raw_transaction_json`] runs the same gate.
+/// Having no handle, it knows no chain: a transaction signed for another one
+/// (#665) passes here and is refused by [`send_raw_transaction_json`].
 pub fn check_raw_transaction_json(raw_hex: &str) -> String {
     let Some(raw) = parse_hex_bytes(raw_hex) else {
         return eljson::error_json("invalid raw transaction hex");
