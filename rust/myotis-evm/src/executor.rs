@@ -19,7 +19,9 @@
 //! EIP-7702 one-hop delegation is handled by revm itself: the oracle serves the
 //! delegation designator as the account's code, and revm resolves the one hop to
 //! the delegate's code (fetched, again, through the oracle). BLOCKHASH is
-//! unsupported — the `Database` returns an error, surfaced as [`EvmError`].
+//! served from verified data only — the header's parent hash, the EIP-2935
+//! history contract's proven storage, or a proven header walk (see
+//! [`crate::database`]); what none of them can prove fails the call.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
@@ -213,7 +215,7 @@ const ACCESS_LIST_ROUNDS: usize = 10;
 
 use crate::block::BlockContext;
 use crate::cache::{BytecodeCache, StateProofCache};
-use crate::database::{AccessSet, OracleDatabase};
+use crate::database::{AccessSet, BlockHashes, OracleDatabase};
 use crate::error::EvmError;
 use crate::fork::spec_for;
 use crate::oracle::{OracleError, SnapStateOracle};
@@ -834,6 +836,10 @@ impl EvmExecutor {
     }
 
     fn database_for_with(&self, ctx: &BlockContext, overrides: StateOverrides) -> OracleDatabase {
+        // Every caller has already refused a context without a spec; a failure
+        // here would only mean "no history contract", which the header walk
+        // covers.
+        let history_contract = spec_for_context(ctx).is_ok_and(|spec| spec.is_enabled_in(SpecId::PRAGUE));
         OracleDatabase::with_overrides(
             Arc::clone(&self.oracle),
             ctx.state_root,
@@ -841,6 +847,7 @@ impl EvmExecutor {
             Arc::clone(&self.bytecode_cache),
             overrides,
         )
+        .with_block_hashes(BlockHashes::for_context(ctx, history_contract))
     }
 
     /// One `transact` of `tx` at `gas_limit` against a caller-owned database —
@@ -1438,6 +1445,9 @@ mod tests {
     /// The mainnet RelayAdapt7702 shield, replayed from its recorded world (#509).
     mod relay_adapt_7702_shield;
 
+    /// BLOCKHASH from verified data (#664).
+    mod blockhash;
+
     struct CancelledOracle;
     impl SnapStateOracle for CancelledOracle {
         fn check_request(&self) -> Result<(), OracleError> {
@@ -1472,11 +1482,13 @@ mod tests {
 
     const ROOT: [u8; 32] = [0xAA; 32];
     const TARGET: [u8; 20] = [0x11; 20];
+    const PARENT: [u8; 32] = [0x9a; 32];
 
     fn ctx(block: u64, ts: u64) -> BlockContext {
         BlockContext {
             state_root: ROOT,
             block_number: block,
+            parent_hash: Some(PARENT),
             timestamp: ts,
             base_fee_per_gas: 7, // non-zero: proves disable_base_fee lets a 0-price call run
             coinbase: [0x22; 20],
@@ -1964,6 +1976,9 @@ mod tests {
         }
         fn keep_discovering(&self, pass: usize) -> bool {
             self.discovery_passes.is_none_or(|passes| pass < passes)
+        }
+        fn fetch_block_hash(&self, anchor_number: u64, anchor_hash: &[u8; 32], number: u64) -> Result<[u8; 32], crate::oracle::OracleError> {
+            self.inner.fetch_block_hash(anchor_number, anchor_hash, number)
         }
         fn prefetch_batch(
             &self,

@@ -299,6 +299,27 @@ some value cannot be proven, the call fails as retryable — it never runs on a 
 The proof cache is keyed by the root a value was proven against, so a value is never
 reused under a root it was not proven for.
 
+`BLOCKHASH` is served from the same verified data, never guessed (Rust engine; #664). The call
+runs on block N's post-state with N's verified header as its block context, so the opcode
+answers for `N-256 ≤ k < N` and is zero otherwise, as on any node:
+
+- `k = N-1` is N's `parentHash`, from the header the call already verified against the
+  attested block hash.
+- From Prague on (mainnet, Sepolia and Gnosis all run it), any other `k` is read from the
+  EIP-2935 history contract (`0x0000F90827F1C53a10cb7A02335B175320002935`) at slot
+  `k % 8191`: a storage proof against the very state root the call runs on, fetched, batched
+  and cached like any other slot. N's post-state holds there the hash of every block from the
+  fork's parent to N-1; a slot it never wrote is zero, which no block hash is, so a zero falls
+  through to the walk below. A proof that fails fails the call.
+- What the contract does not hold (before Prague, or just after it) comes from a header walk:
+  the headers `k ..= N-1` from a snap peer, accepted only when each hashes to its child's
+  `parentHash` and the newest hashes to N's `parentHash` (`walked_block_hash` in
+  `rust/myotis-net/src/el/verify.rs`).
+
+A state override never changes `BLOCKHASH`: it reads the chain, as geth's does. A hash none of
+these sources can prove fails the call as retryable; it is never answered with zero. The Java
+engine still refuses `BLOCKHASH` (the call fails) rather than serving it.
+
 ## 10. Sending a transaction
 
 Myotis never holds keys: the wallet signs, Myotis gossips the bytes to devp2p peers. Before

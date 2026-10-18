@@ -57,7 +57,7 @@ pub use cache::{
     BytecodeCache, InMemoryBytecodeCache, InMemoryStateProofCache, Lru, NoopBytecodeCache,
     NoopStateProofCache, StateProofCache,
 };
-pub use database::OracleDatabase;
+pub use database::{BlockHashes, OracleDatabase, HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS};
 pub use ens::{
     ccip_callback, decode_abi_answer, decode_address_answer, decode_bytes_answer,
     decode_name_answer, decode_pubkey_answer, decode_text_answer, resolve_abi, resolve_address, resolve_contenthash, resolve_dns_record,
@@ -324,7 +324,9 @@ mod tests {
     }
 
     #[test]
-    fn blockhash_is_unsupported() {
+    fn blockhash_without_a_source_is_refused() {
+        // A database built without `with_block_hashes` (the executor always
+        // gives it one) refuses BLOCKHASH rather than answering zero.
         let d = db(
             Arc::new(FixtureSnapStateOracle::new()),
             ROOT_A,

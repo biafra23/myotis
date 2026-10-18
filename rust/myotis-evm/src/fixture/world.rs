@@ -102,6 +102,7 @@ impl EvmFixture {
             "block": {
                 "hash": hex0x(&self.block_hash),
                 "number": quantity(U256::from(b.block_number)),
+                "parentHash": b.parent_hash.map(|h| hex0x(&h)),
                 "stateRoot": hex0x(&b.state_root),
                 "timestamp": quantity(U256::from(b.timestamp)),
                 "baseFeePerGas": quantity(U256::from(b.base_fee_per_gas)),
@@ -148,11 +149,17 @@ impl EvmFixture {
         only_keys(
             block,
             "block",
-            &["hash", "number", "stateRoot", "timestamp", "baseFeePerGas", "gasLimit", "coinbase", "prevRandao", "chainId", "slotNumber"],
+            &["hash", "number", "parentHash", "stateRoot", "timestamp", "baseFeePerGas", "gasLimit", "coinbase", "prevRandao", "chainId", "slotNumber"],
         )?;
         let context = BlockContext {
             state_root: fixed(required(block, "stateRoot")?, "block.stateRoot")?,
             block_number: quantity_u64(required(block, "number")?, "block.number")?,
+            // Absent from files recorded before BLOCKHASH was served: a replay
+            // of one then refuses BLOCKHASH(N-1), as the recorded runs did.
+            parent_hash: match block.get("parentHash") {
+                None | Some(Value::Null) => None,
+                Some(h) => Some(fixed(h, "block.parentHash")?),
+            },
             timestamp: quantity_u64(required(block, "timestamp")?, "block.timestamp")?,
             base_fee_per_gas: quantity_u64(required(block, "baseFeePerGas")?, "block.baseFeePerGas")?,
             coinbase: fixed(required(block, "coinbase")?, "block.coinbase")?,
@@ -566,6 +573,7 @@ mod tests {
             block: BlockContext {
                 state_root: [0x11; 32],
                 block_number: 26_000_000,
+                parent_hash: Some([0x55; 32]),
                 timestamp: 1_790_000_000,
                 base_fee_per_gas: 1_000_000_000,
                 coinbase: [0x33; 20],

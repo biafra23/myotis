@@ -237,6 +237,35 @@ pub fn verify_header_chain(
     true
 }
 
+/// `BLOCKHASH`'s header walk (#664): the hashes of blocks
+/// `number ..= anchor_number`, oldest first, from the ascending range a peer
+/// served for them, proven DOWN from the verified block `anchor_number` whose
+/// hash is `anchor_hash` — the same direction of trust as
+/// [`verify_header_chain`]: the newest header must hash to the anchor, each
+/// header must hash to its child's `parentHash`, and the range must start at
+/// `number`. A header past the asked range (a BlockHeaders answer may carry
+/// one more than requested) is dropped before the check. `None` when any of
+/// that fails.
+pub fn walked_block_hashes(
+    headers: &[ChainHeader],
+    anchor_number: u64,
+    anchor_hash: &[u8; 32],
+    number: u64,
+) -> Option<Vec<(u64, [u8; 32])>> {
+    let wanted = usize::try_from(anchor_number.checked_sub(number)?.checked_add(1)?).ok()?;
+    let headers = headers.get(..wanted)?;
+    let (first, last) = (headers.first()?, headers.last()?);
+    if &last.hash != anchor_hash || last.header.number != anchor_number || first.header.number != number {
+        return None;
+    }
+    for pair in headers.windows(2) {
+        if pair[0].hash != pair[1].header.parent_hash || pair[0].header.number.checked_add(1) != Some(pair[1].header.number) {
+            return None;
+        }
+    }
+    Some(headers.iter().map(|h| (h.header.number, h.hash)).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +304,53 @@ mod tests {
             hash: header::hash(&rlp),
             header: BlockHeader::decode(&rlp).unwrap(),
         }
+    }
+
+    /// Headers `from ..= to`, each linked to the one below (`from`'s parent
+    /// is made up).
+    fn linked(from: u64, to: u64) -> Vec<ChainHeader> {
+        let mut out: Vec<ChainHeader> = Vec::new();
+        for n in from..=to {
+            let parent = out.last().map_or(root(0xfe), |h| h.hash);
+            out.push(header(n, root(n as u8), parent));
+        }
+        out
+    }
+
+    #[test]
+    fn a_walk_proves_every_hash_down_from_the_anchor() {
+        let chain = linked(100, 299);
+        let anchor = chain[199].hash;
+        let proven = walked_block_hashes(&chain, 299, &anchor, 100).unwrap();
+        assert_eq!(proven.len(), 200);
+        assert_eq!(proven[0], (100, chain[0].hash));
+        assert_eq!(proven[199], (299, anchor));
+        // A one-header walk is the anchor itself.
+        assert_eq!(walked_block_hashes(&chain[199..], 299, &anchor, 299), Some(vec![(299, anchor)]));
+        // One header more than asked for (decode allows it) is dropped.
+        let longer = linked(100, 300);
+        assert_eq!(walked_block_hashes(&longer, 299, &anchor, 100).map(|p| p.len()), Some(200));
+    }
+
+    #[test]
+    fn a_walk_that_does_not_reach_the_anchor_is_refused() {
+        let chain = linked(100, 110);
+        let anchor = chain[10].hash;
+        // Another anchor hash, a wrong anchor number, a short range, a range
+        // starting elsewhere, an anchor below the block.
+        assert_eq!(walked_block_hashes(&chain, 110, &root(0xbb), 100), None);
+        assert_eq!(walked_block_hashes(&chain, 111, &anchor, 101), None);
+        assert_eq!(walked_block_hashes(&chain[1..], 110, &anchor, 100), None);
+        assert_eq!(walked_block_hashes(&chain, 110, &anchor, 101), None);
+        assert_eq!(walked_block_hashes(&chain, 99, &anchor, 100), None);
+        // A forged header in the middle: its child's parentHash no longer names it.
+        let mut forged = linked(100, 110);
+        forged[5] = header(105, root(0xee), forged[4].hash);
+        assert_eq!(walked_block_hashes(&forged, 110, &anchor, 100), None);
+        // A forged oldest header linked to nothing above it.
+        let mut forged = chain;
+        forged[0] = header(100, root(0xee), root(0xfe));
+        assert_eq!(walked_block_hashes(&forged, 110, &anchor, 100), None);
     }
 
     #[test]

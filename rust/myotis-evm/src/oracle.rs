@@ -82,9 +82,17 @@ pub enum OracleError {
         address: [u8; 20],
         detail: String,
     },
-    /// `BLOCKHASH` is unsupported (no local block store to serve historical
-    /// hashes) — a contract that reads it cannot be executed. Fail fast.
+    /// `BLOCKHASH` of block `number` cannot be served by this oracle or
+    /// context at all: an oracle with no header walk
+    /// ([`SnapStateOracle::fetch_block_hash`]'s default), or a context without
+    /// the parent hash a walk anchors at. A contract that reads it cannot be
+    /// executed. Fail fast — never answered with zero, which would be a
+    /// well-formed wrong result.
     BlockHashUnsupported { number: u64 },
+    /// No peer served a header chain proving block `number`'s hash against
+    /// the call's verified block (the header-walk fallback of `BLOCKHASH`).
+    /// Retryable, like [`OracleError::StateUnavailable`].
+    BlockHashUnavailable { number: u64 },
 }
 
 impl std::fmt::Display for OracleError {
@@ -111,6 +119,9 @@ impl std::fmt::Display for OracleError {
             OracleError::BlockHashUnsupported { number } => {
                 write!(f, "BLOCKHASH unsupported (requested block {number})")
             }
+            OracleError::BlockHashUnavailable { number } => {
+                write!(f, "block hash unavailable for block {number}")
+            }
         }
     }
 }
@@ -131,6 +142,7 @@ impl OracleError {
             OracleError::BytecodeUnavailable { .. } => "bytecode unavailable",
             OracleError::InvalidProof { .. } => "invalid proof",
             OracleError::BlockHashUnsupported { .. } => "BLOCKHASH unsupported",
+            OracleError::BlockHashUnavailable { .. } => "block hash unavailable",
         }
     }
 }
@@ -217,6 +229,25 @@ pub trait SnapStateOracle: Send + Sync {
     /// tied to a state root). Empty for the empty-code hash.
     fn fetch_bytecode(&self, code_hash: &[u8; 32]) -> Result<Vec<u8>, OracleError>;
 
+    /// The hash of block `number`, proven by a contiguous header chain that
+    /// links DOWN from the verified block `anchor_number` whose hash is
+    /// `anchor_hash` (the call block's parent: its hash is the call header's
+    /// `parentHash`): every header's hash must be its child's `parentHash`, the
+    /// newest one's hash must be `anchor_hash`, and the oldest must be block
+    /// `number`. Only `BLOCKHASH`'s fallback asks for it — where the EIP-2935
+    /// history contract does not hold the hash (see [`crate::database`]) —
+    /// and only for `anchor_number - 255 <= number < anchor_number`.
+    /// Default: [`OracleError::BlockHashUnsupported`], an oracle with no
+    /// header source.
+    fn fetch_block_hash(
+        &self,
+        _anchor_number: u64,
+        _anchor_hash: &[u8; 32],
+        number: u64,
+    ) -> Result<[u8; 32], OracleError> {
+        Err(OracleError::BlockHashUnsupported { number })
+    }
+
     /// Best-effort BATCH warm-up (the Java `fetchBatch` twin, EL-C-3-2): fetch +
     /// verify every `(account, slots…)` item and every code hash CONCURRENTLY
     /// where the transport allows, writing verified results into the sinks.
@@ -249,6 +280,8 @@ mod fixture {
         accounts: HashMap<([u8; 32], [u8; 20]), OracleAccount>,
         storage: HashMap<([u8; 32], [u8; 20], [u8; 32]), U256>,
         bytecode: HashMap<[u8; 32], Vec<u8>>,
+        /// Hashes [`SnapStateOracle::fetch_block_hash`] serves, by number.
+        block_hashes: HashMap<u64, [u8; 32]>,
     }
 
     impl FixtureSnapStateOracle {
@@ -276,6 +309,13 @@ mod fixture {
             value: U256,
         ) -> Self {
             self.storage.insert((state_root, address, slot), value);
+            self
+        }
+
+        /// Serve `hash` as block `number`'s from the header-walk fallback
+        /// (`fetch_block_hash`; the fixture checks no header chain).
+        pub fn with_block_hash(mut self, number: u64, hash: [u8; 32]) -> Self {
+            self.block_hashes.insert(number, hash);
             self
         }
 
@@ -320,6 +360,18 @@ mod fixture {
                 .ok_or(OracleError::BytecodeUnavailable {
                     code_hash: *code_hash,
                 })
+        }
+
+        fn fetch_block_hash(
+            &self,
+            _anchor_number: u64,
+            _anchor_hash: &[u8; 32],
+            number: u64,
+        ) -> Result<[u8; 32], OracleError> {
+            self.block_hashes
+                .get(&number)
+                .copied()
+                .ok_or(OracleError::BlockHashUnavailable { number })
         }
     }
 }

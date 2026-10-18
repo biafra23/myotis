@@ -41,6 +41,7 @@ use myotis_evm::{
 use crate::el::peer::ManagedPeer;
 use crate::el::readstats::{AccountFact, ReadStats};
 use crate::el::snap::fetch::AccountOutcome;
+use crate::el::verify::{walked_block_hashes, ChainHeader};
 
 /// The outcome of an `eth_call`. Mirrors the Java engine's contract, which
 /// returns bytes on success and treats every other outcome (revert, halt,
@@ -325,6 +326,7 @@ pub fn block_context(header: &BlockHeader, chain_id: u64) -> Result<BlockContext
     Ok(BlockContext {
         state_root: header.state_root,
         block_number: header.number,
+        parent_hash: Some(header.parent_hash),
         timestamp: header.timestamp,
         base_fee_per_gas,
         coinbase,
@@ -593,6 +595,11 @@ pub struct PoolOracle {
     /// and every `fetch_storage` on the same contract need. `Some(None)` caches a
     /// proven absence.
     leaf_memo: Mutex<HashMap<[u8; 20], Option<AccountLeaf>>>,
+    /// Block hashes a `BLOCKHASH` header walk proved, keyed by the anchor
+    /// hash they were proven down from and the block number (one oracle
+    /// serves one call, so the anchor is fixed; keying by it keeps that
+    /// structural).
+    walked: Mutex<HashMap<([u8; 32], u64), [u8; 32]>>,
     /// The reader's read-fetch shadow cache: every verified fetch this oracle
     /// makes — including the prefetch wave's — is reported with its wall-clock
     /// cost so `read_stats_json` covers the EVM path too.
@@ -747,6 +754,7 @@ impl PoolOracle {
             handle,
             quality,
             leaf_memo: Mutex::new(HashMap::new()),
+            walked: Mutex::new(HashMap::new()),
             stats,
             order,
             lost,
@@ -1370,6 +1378,58 @@ impl SnapStateOracle for PoolOracle {
         }
     }
 
+    /// `BLOCKHASH`'s header walk (#664): the headers `number ..= anchor_number`
+    /// from one peer, hedged across the call's peers like a state read, and
+    /// accepted only when they prove the hashes down from the call's verified
+    /// parent ([`walked_block_hashes`]); a range that does not is a miss, and
+    /// the next peer is asked. Every hash the range proves is kept for the
+    /// rest of the call, so a contract reading several recent blocks makes one
+    /// walk. Only reached where the EIP-2935 history contract holds nothing,
+    /// so before Prague or just after it. Header requests feed neither the
+    /// snap ranking nor the call's ask order: both judge snap serving.
+    fn fetch_block_hash(
+        &self,
+        anchor_number: u64,
+        anchor_hash: &[u8; 32],
+        number: u64,
+    ) -> Result<[u8; 32], OracleError> {
+        self.check_request()?;
+        if let Some(hash) = self.walked.lock().unwrap().get(&(*anchor_hash, number)) {
+            return Ok(*hash);
+        }
+        let _timer = self.wire.serial();
+        // BLOCKHASH reaches 256 blocks below the call's block, so the walk
+        // spans at most 255 below its parent.
+        let span = anchor_number.checked_sub(number).filter(|span| *span < 256);
+        let Some(span) = span else {
+            return Err(OracleError::BlockHashUnsupported { number });
+        };
+        let (_, peers) = self.ladder();
+        let peers = &peers;
+        let fetched = self.wait(async {
+            hedged_race(
+                peers,
+                HEDGE_DELAY,
+                |peer: Arc<ManagedPeer>| async move {
+                    let headers = peer.get_block_headers_by_number(number, span + 1, 0, false).await?;
+                    let chain: Vec<ChainHeader> =
+                        headers.into_iter().map(|vh| ChainHeader { hash: vh.hash, header: vh.header }).collect();
+                    walked_block_hashes(&chain, anchor_number, anchor_hash, number)
+                        .ok_or_else(|| format!("headers {number}..={anchor_number} do not link to the call's block"))
+                },
+                |_: &Vec<(u64, [u8; 32])>| true,
+            )
+            .await
+            .accepted
+            .map(|(_, proven)| proven)
+        })?;
+        let proven = fetched.ok_or(OracleError::BlockHashUnavailable { number })?;
+        let mut walked = self.walked.lock().unwrap();
+        walked.extend(proven.iter().map(|(n, hash)| ((*anchor_hash, *n), *hash)));
+        // `walked_block_hashes` proved the range starts at `number`.
+        Ok(proven[0].1)
+    }
+
     fn fetch_bytecode(&self, code_hash: &[u8; 32]) -> Result<Vec<u8>, OracleError> {
         let _timer = self.wire.serial();
         // Content-addressed: snap_get_bytecode checks keccak(code) == code_hash,
@@ -1425,6 +1485,7 @@ mod tests {
         let mut h = BlockHeader::default();
         h.state_root = [0xAB; 32];
         h.number = 21_000_000;
+        h.parent_hash = [0x77; 32];
         h.timestamp = 1_710_338_200;
         h.beneficiary = vec![0x11; 20];
         h.mix_hash_or_prev_randao = [0x33; 32];
@@ -1433,6 +1494,7 @@ mod tests {
         let ctx = block_context(&h, 1).unwrap();
         assert_eq!(ctx.state_root, [0xAB; 32]);
         assert_eq!(ctx.block_number, 21_000_000);
+        assert_eq!(ctx.parent_hash, Some([0x77; 32])); // BLOCKHASH(N-1), the walk's anchor
         assert_eq!(ctx.timestamp, 1_710_338_200);
         assert_eq!(ctx.base_fee_per_gas, 256);
         assert_eq!(ctx.coinbase, [0x11; 20]);
