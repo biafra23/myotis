@@ -1436,17 +1436,33 @@ pub fn get_storage_proof_json(
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
     };
-    let (reader, finalized_slot, optimistic_slot) = match snapshot_reader_slots(engine, handle) {
-        Ok(snap) => snap,
+    let reader = match running_reader(engine, handle) {
+        Ok(reader) => reader,
         Err(msg) => return eljson::error_json(msg),
     };
+    // The result's finalizedSlot / optimisticSlot are the EL anchor's — the
+    // finality and the head the reads prove against — not the light client's,
+    // which runs ahead of them while a Gloas header waits to be resolved (the
+    // Java engine reports the same resolved slots). Each is its block's own
+    // beacon slot, the one a read proven there reports as matchedBeaconSlot;
+    // the light client's optimistic slot is the SIGNATURE slot, one or more
+    // above the head's block, which no read ever matched (#658). Both move
+    // up (a reorg aside), so the finality is sampled before the read and the
+    // head after it: a read matched at either still lands between the two
+    // when one of them moves on meanwhile. The bracket is only as good as
+    // the order of the two: from Gloas on the anchor's head can trail its
+    // finality while the head's header resolves (0 before any head has), and
+    // a finalized read then sits above optimisticSlot. The block numbers
+    // beside them are sampled mid-read (`anchor_diagnostics`), so a number
+    // and its slot can name different blocks while either moves.
+    let finalized_slot = reader.finalized_slot();
     match engine.rt.block_on(reader.request(async { reader.get_storage(address, slot, holder).await })) {
         Ok(storage) => eljson::storage_json(
             address_hex,
             holder_hex,
             &storage,
             finalized_slot,
-            optimistic_slot,
+            reader.optimistic_slot(),
         ),
         Err(e) => eljson::error_json(&e),
     }
@@ -1505,20 +1521,22 @@ pub fn get_storage_at_json(
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
     };
-    let (reader, finalized_slot, optimistic_slot) = match snapshot_reader_slots(engine, handle) {
-        Ok(snap) => snap,
+    let reader = match running_reader(engine, handle) {
+        Ok(reader) => reader,
         Err(msg) => return eljson::error_json(msg),
     };
     let anchor = match read_anchor(selector, &reader) {
         Ok(anchor) => anchor,
         Err(json) => return json,
     };
+    // The finality before the read, the head after it: see get_storage_proof_json.
+    let finalized_slot = reader.finalized_slot();
     match engine
         .rt
         .block_on(reader.request(async { reader.get_storage_at(anchor, address, position).await }))
     {
         Ok(storage) => {
-            eljson::storage_json(address_hex, None, &storage, finalized_slot, optimistic_slot)
+            eljson::storage_json(address_hex, None, &storage, finalized_slot, reader.optimistic_slot())
         }
         Err(e) => eljson::error_json(&e),
     }
@@ -2989,22 +3007,12 @@ fn snapshot_reader(
     }
 }
 
-/// Snapshot `(reader, finalizedSlot, optimisticSlot)` for a running handle.
-/// The finalized slot is the EL anchor's — the finality the read proves
-/// against, paired with the `finalizedBlockNumber` beside it — not the light
-/// client's, which runs ahead of it while a Gloas finality waits for its
-/// execution header (the Java engine reports the same resolved slot).
-fn snapshot_reader_slots(
-    engine: &EngineState,
-    handle: i64,
-) -> Result<(Arc<ElReader>, u64, u64), &'static str> {
+/// The EL reader of a running handle, or an error message. Holds the map lock
+/// only for the clone.
+fn running_reader(engine: &EngineState, handle: i64) -> Result<Arc<ElReader>, &'static str> {
     let map = engine.handles.lock().map_err(|_| "engine lock poisoned")?;
     match map.get(&handle) {
-        Some(ChainEntry::Running(_, sync, Some(reader))) => Ok((
-            Arc::clone(reader),
-            reader.finalized_slot(),
-            sync.status().optimistic_slot,
-        )),
+        Some(ChainEntry::Running(_, _, Some(reader))) => Ok(Arc::clone(reader)),
         Some(ChainEntry::Running(_, _, None)) => Err("EL reader unavailable on this handle"),
         Some(ChainEntry::Paused(..)) => Err("handle is paused"),
         Some(ChainEntry::Created(_)) => Err("handle not started"),

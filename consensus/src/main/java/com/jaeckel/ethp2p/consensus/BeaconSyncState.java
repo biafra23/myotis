@@ -150,7 +150,8 @@ public class BeaconSyncState {
      *
      * @param finalizedSlot       the latest finalized beacon slot
      * @param executionStateRoot  the execution state root from the finalized execution payload header
-     * @param optimisticSlot      the latest optimistic (attested) slot
+     * @param optimisticSlot      the latest optimistic (attested) header's own beacon slot —
+     *                            not the update's signature slot above it (#658)
      */
     public void update(long finalizedSlot, byte[] executionStateRoot, long optimisticSlot) {
         synchronized (lock) {
@@ -187,17 +188,36 @@ public class BeaconSyncState {
     }
 
     /**
-     * Record the optimistic (attested) header's execution payload fields. Separate from the
-     * finalized {@code update()} path because the two headers advance on different cadences:
-     * finalized lags by ~2 epochs between finality events (~12 min), while the attested header
-     * refreshes every slot. Verification code can prefer the attested anchor when the finalized
-     * block is too far behind the snap peer's head.
+     * Record a verified finality's execution payload fields, leaving the optimistic head as it
+     * is — the light client's own path, where the head's slot travels with the head
+     * ({@link #updateOptimisticExecution}, {@link #resolveHeader}). {@link #update} also sets
+     * the optimistic slot, which would label the previous head with a newer one's slot until
+     * that head's own fields arrive — for as long as a Gloas head waits for its header (#658).
      */
-    public void updateOptimisticExecution(long optimisticBlockNumber, byte[] optimisticBlockHash,
-                                          byte[] optimisticStateRoot) {
+    public void updateFinalized(long finalizedSlot, byte[] executionStateRoot,
+                                long executionBlockNumber, byte[] executionBlockHash) {
         synchronized (lock) {
             InnerState prev = state.get();
-            state.set(new InnerState(prev.finalizedSlot(), prev.executionStateRoot(), prev.optimisticSlot(),
+            state.set(new InnerState(finalizedSlot, executionStateRoot, prev.optimisticSlot(),
+                    executionBlockNumber, executionBlockHash != null ? executionBlockHash.clone() : null,
+                    prev.optimisticBlockNumber(), prev.optimisticBlockHash(), prev.optimisticStateRoot(), null));
+        }
+    }
+
+    /**
+     * Record the optimistic (attested) header's execution payload fields, with the beacon slot
+     * of that header's own block. Separate from the finalized {@code update()} path because the
+     * two headers advance on different cadences: finalized lags by ~2 epochs between finality
+     * events (~12 min), while the attested header refreshes every slot. Verification code can
+     * prefer the attested anchor when the finalized block is too far behind the snap peer's
+     * head. The slot is written with the rest so {@link #getOptimisticExecution()} never pairs
+     * one head's slot with another head's block (#658).
+     */
+    public void updateOptimisticExecution(long optimisticSlot, long optimisticBlockNumber,
+                                          byte[] optimisticBlockHash, byte[] optimisticStateRoot) {
+        synchronized (lock) {
+            InnerState prev = state.get();
+            state.set(new InnerState(prev.finalizedSlot(), prev.executionStateRoot(), optimisticSlot,
                     prev.executionBlockNumber(), prev.executionBlockHash(),
                     optimisticBlockNumber,
                     optimisticBlockHash != null ? optimisticBlockHash.clone() : null,
@@ -382,8 +402,9 @@ public class BeaconSyncState {
     /**
      * The optimistic (attested) execution head's block number and block hash, read together,
      * and the light client's latest optimistic slot ({@link #getOptimisticSlot()}) from the
-     * same read — reported as a walk's {@code matchedBeaconSlot}, it is not necessarily the
-     * slot that attested this block (a finality update moves it on its own).
+     * same read — reported as a walk's {@code matchedBeaconSlot}: this block's own beacon slot
+     * (#658), written with its number and hash. (The unverified seed paths set the slot alone,
+     * but they never record a head's number or hash, so no walk anchors there.)
      * {@code blockHash} is null until an optimistic update lands.
      */
     public record OptimisticExecution(long slot, long blockNumber, byte[] blockHash) {}
@@ -418,7 +439,8 @@ public class BeaconSyncState {
     }
 
     /**
-     * Returns the latest optimistic (attested) slot, or 0 if not yet synced.
+     * Returns the latest optimistic (attested) header's own beacon slot — not the signature
+     * slot of the update that carried it (#658) — or 0 if not yet synced.
      */
     public long getOptimisticSlot() {
         return state.get().optimisticSlot();

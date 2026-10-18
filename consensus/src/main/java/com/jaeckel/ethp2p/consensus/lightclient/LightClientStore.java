@@ -140,6 +140,13 @@ public class LightClientStore {
         return finalizedSlot;
     }
 
+    /**
+     * The SIGNATURE slot of the update that set the optimistic header — one or more above the
+     * header's own {@code beacon().slot()}, the block it attests (until the first update, the
+     * bootstrap header's own slot). It orders updates (the advance checks) and is persisted as
+     * is; a slot to report or to label the head's block with is
+     * {@code getOptimisticHeader().beacon().slot()} (#658).
+     */
     public synchronized long getOptimisticSlot() {
         return optimisticSlot;
     }

@@ -382,6 +382,16 @@ impl ExecAnchor {
         self.inner.lock().expect("anchor mutex").finalized_slot
     }
 
+    /// The beacon slot of the optimistic head's own block — the attested
+    /// header's `beacon.slot`, never the light client's signature slot one or
+    /// more above it — so a read anchored at the current head reports it as
+    /// its `matchedBeaconSlot` (#658). Trails the light client's head while a
+    /// Gloas head's header is still being resolved, as
+    /// [`Self::finalized_slot`] does. 0 until a head lands.
+    pub fn optimistic_slot(&self) -> u64 {
+        self.inner.lock().expect("anchor mutex").optimistic_slot
+    }
+
     /// Record whether the beacon light client considers its finality CURRENT —
     /// its `SYNCED` gate: committee period current and the finalized header
     /// within a few epochs of the wall clock. Set by the CL loop on every
@@ -1068,8 +1078,13 @@ mod tests {
         anchor.note_finalized_hash(64, h.hash);
         anchor.note_optimistic_hash(65, h.hash);
         assert_eq!(anchor.pending_hashes(), vec![h.hash], "fetched once");
+        assert_eq!(anchor.optimistic_slot(), 0, "a pending head is not the anchor's yet");
         assert!(anchor.resolve_header(&h));
         assert_eq!(anchor.optimistic_head(), Some((9, h.hash)));
+        // The slot a head-anchored read reports beside its matchedBeaconSlot
+        // is the one the walk's anchor carries (#658).
+        assert_eq!(anchor.optimistic_slot(), 65);
+        assert_eq!(anchor.optimistic_anchor().map(|(_, _, slot)| slot), Some(65));
         assert_eq!(anchor.optimistic_execution().map(|(n, r, _)| (n, r)), Some((9, root(9))));
         // A Gloas head's age is its resolved header's own timestamp (#531).
         assert_eq!(

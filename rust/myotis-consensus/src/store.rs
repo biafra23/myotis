@@ -135,6 +135,12 @@ impl LightClientStore {
     pub fn finalized_slot(&self) -> u64 {
         self.finalized_slot
     }
+    /// The SIGNATURE slot of the update that set the optimistic header — one
+    /// or more above the header's own `beacon.slot`, the block it attests
+    /// (until the first update, the bootstrap header's own slot). It orders
+    /// updates (the advance checks) and is persisted as is; a slot to report
+    /// or to label the head's block with is `optimistic_header().beacon.slot`
+    /// (#658).
     pub fn optimistic_slot(&self) -> u64 {
         self.optimistic_slot
     }

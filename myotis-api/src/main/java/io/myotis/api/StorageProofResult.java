@@ -30,7 +30,14 @@ import java.util.List;
  * @param beaconSynced          beacon client was SYNCED at query time
  * @param beaconChainVerified   the anchoring state root ties to a beacon-attested root
  * @param blsVerified           the beacon match was BLS-signed
- * @param matchedBeaconSlot     slot of the matching beacon attestation; -1 if none
+ * @param matchedBeaconSlot     beacon slot of the block the anchoring state root was matched
+ *                              to — the attested block whose root it is (stateRootMatch) or
+ *                              whose hash the header walk ended at (headerChain); -1 if
+ *                              none. Like the two slots below, a BLOCK's own slot (#658): a
+ *                              read proven at the current head reports {@code optimisticSlot},
+ *                              one proven at the finality {@code finalizedSlot} (unless that
+ *                              head or finality moved on during the read), one matched to an
+ *                              earlier root still in the window a slot below the head
  * @param verifyMethod          "stateRootMatch" / "headerChain" / null
  * @param failReason            null when verified; otherwise a stable reason token
  * @param peerBlockNumber       block the account proof anchors to. Java engine (and
@@ -40,9 +47,22 @@ import java.util.List;
  *                              the anchored root (preferred since the #355 fix),
  *                              the peer's head only on its fallback
  * @param finalizedBlockNumber  finalized execution block number (0 if none)
- * @param optimisticBlockNumber optimistic-head execution block number (0 if none)
- * @param finalizedSlot         finalized beacon slot (0 if none)
- * @param optimisticSlot        optimistic beacon slot (0 if none)
+ * @param optimisticBlockNumber optimistic-head execution block number (0 if none). The block
+ *                              numbers and the two slots below are sampled at different
+ *                              moments of the read, so while the head (or the finality) moves
+ *                              on during it a number and its slot can name different blocks:
+ *                              compare {@code matchedBeaconSlot} with the slots, and do not
+ *                              label a block number with a slot from here
+ * @param finalizedSlot         beacon slot of the finalized block the reads prove against
+ *                              (0 if none)
+ * @param optimisticSlot        beacon slot of the optimistic head block the reads prove
+ *                              against: the attested header's own slot, not the later
+ *                              signature slot of the sync aggregate that attested it (#658);
+ *                              0 if none. Read once the proof is in, so a head that moved on
+ *                              during the read leaves {@code matchedBeaconSlot} below it. Like
+ *                              {@code finalizedSlot} it is the head the reads have RESOLVED:
+ *                              from Gloas on, a newer head waits for its execution header, and
+ *                              meanwhile this can trail {@code finalizedSlot}
  * @param maxHeaderChainGap     the engine's header-chain walk bound (currently 8192)
  */
 public record StorageProofResult(

@@ -19,7 +19,10 @@ import java.util.List;
  *                              updates?" signal (CL connections are short-lived, so
  *                              the instantaneous count above is usually 0)
  * @param finalizedSlot         finalized beacon slot (0 while SYNCING)
- * @param optimisticSlot        optimistic beacon slot (0 while SYNCING)
+ * @param optimisticSlot        beacon slot of the optimistic (attested) head block — the
+ *                              slot the block was proposed at, not the later signature slot
+ *                              of the sync aggregate that attested it (#658), so a head's age
+ *                              dated from it is the block's own (0 while SYNCING)
  * @param finalizedPeriod       period of the finalized slot
  * @param executionStateRootHex latest verified execution state root (0x-hex), null while SYNCING
  * @param executionBlockHashHex finalized execution block hash (0x-hex), null until first finality

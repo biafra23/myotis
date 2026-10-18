@@ -5571,6 +5571,14 @@ impl ElReader {
         self.anchor.finalized_slot()
     }
 
+    /// The beacon slot of the optimistic head the reads prove against: the
+    /// attested block's own slot, the one a head-anchored read reports as its
+    /// `matchedBeaconSlot` (#658). Like [`Self::finalized_slot`], it trails the
+    /// light client while a Gloas head's header is still being resolved.
+    pub fn optimistic_slot(&self) -> u64 {
+        self.anchor.optimistic_slot()
+    }
+
     /// Fetch + verify one account, running the full beacon-anchor ladder.
     ///
     /// HEDGED across live snap peers (see [`ElReader::hedged_read`]): starts the
