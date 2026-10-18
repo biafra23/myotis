@@ -23,6 +23,11 @@ class GatedSendRefusalTest {
         assertEquals(SendResult.Status.REFUSED, reads.sendRawTransactionDetailed(null).status());
     }
 
+    static {
+        // Sender recovery (EthTxDecoder) runs on BouncyCastle, as the hosts register it.
+        java.security.Security.addProvider(new org.bouncycastle.jce.provider.BouncyCastleProvider());
+    }
+
     /** The EIP-155 spec example: a legacy transaction signed for chain 1. */
     private static final byte[] SPEC_TX = org.apache.tuweni.bytes.Bytes.fromHexString(
             "0xf86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a7"
