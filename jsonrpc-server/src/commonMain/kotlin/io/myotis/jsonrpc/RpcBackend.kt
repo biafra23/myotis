@@ -116,8 +116,8 @@ class RpcAccessListResult private constructor(
  * was broadcast, and [detail] is geth's txpool verdict ("insufficient funds for
  * gas * price + value: …", "nonce too low: …"), served verbatim under geth's
  * -32000 so wallets classify it. REFUSED (#360): the bytes are no transaction
- * the engine relays — nothing was broadcast, and [detail] says why under the
- * PERMANENT -32602. UNAVAILABLE keeps the retryable -32000 path.
+ * the engine relays, or (#665) one signed for another chain — nothing was
+ * broadcast, and [detail] says why under the PERMANENT -32602. UNAVAILABLE keeps the retryable -32000 path.
  */
 class RpcSendResult private constructor(
     val kind: Kind,

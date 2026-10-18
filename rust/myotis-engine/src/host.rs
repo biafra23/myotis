@@ -2700,12 +2700,22 @@ pub fn send_raw_transaction_json(handle: i64, raw_hex: &str) -> String {
     // is up: a paused or starting node must not turn the permanent refusal of
     // bytes that are no transaction into a retryable "unavailable". The reader
     // checks again (its own callers need the gate too); the decode is cheap.
-    if let Err(reason) = myotis_net::el::tx::decode_sendable(&raw) {
-        return eljson::invalid_params_json(&reason);
-    }
+    let summary = match myotis_net::el::tx::decode_sendable(&raw) {
+        Ok(summary) => summary,
+        Err(reason) => return eljson::invalid_params_json(&reason),
+    };
     let Some(engine) = engine() else {
         return eljson::error_json("engine unavailable");
     };
+    // Another chain's transaction (#665), likewise before the handle is asked
+    // whether it is up: its chain is in its config in every state, so a
+    // paused, not-yet-started or reader-less handle refuses it permanently
+    // too. The reader checks again (its own callers need the check).
+    if let Some(chain_id) = handle_chain_id(engine, handle) {
+        if let Err(reason) = myotis_net::el::tx::check_chain(&summary, chain_id) {
+            return eljson::invalid_params_json(&reason);
+        }
+    }
     let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
@@ -3007,6 +3017,17 @@ fn snapshot_reader(
         Some(ChainEntry::Paused(..)) => Err("handle is paused"),
         Some(ChainEntry::Created(_)) => Err("handle not started"),
         None => Err("unknown handle"),
+    }
+}
+
+/// The chain id of a handle in any state, `None` for an unknown handle or a
+/// poisoned lock.
+fn handle_chain_id(engine: &EngineState, handle: i64) -> Option<u64> {
+    let map = engine.handles.lock().ok()?;
+    match map.get(&handle)? {
+        ChainEntry::Created(config) | ChainEntry::Running(config, ..) | ChainEntry::Paused(config, ..) => {
+            Some(config.chain_id)
+        }
     }
 }
 
@@ -5568,6 +5589,30 @@ mod send_gate_tests {
         assert_eq!(super::check_raw_transaction_json(spec), r#"{"ok":true}"#);
         let out: serde_json::Value = serde_json::from_str(&send_raw_transaction_json(-1, spec)).unwrap();
         assert!(out.get("error").is_some() && out.get("code").is_none(), "{out}");
+    }
+
+    #[test]
+    fn another_chains_transaction_is_refused_by_a_handle_that_is_not_up() {
+        // #665: the handle's chain is in its config in every state, so a
+        // created-but-never-started one refuses a transaction signed for
+        // another chain with the permanent -32602, never "handle not started".
+        // The EIP-155 spec vector is signed for chain 1.
+        let spec = "0xf86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a7\
+                    6400008025a028ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276a0\
+                    67cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83";
+        let sepolia = super::create("sepolia", "");
+        assert!(sepolia >= 1, "create failed: {sepolia}");
+        assert_eq!(
+            send_raw_transaction_json(sepolia, spec),
+            r#"{"error":"invalid sender: invalid chain id for signer: have 1 want 11155111","code":-32602}"#
+        );
+        super::stop(sepolia);
+        // On its own chain the same handle state answers the retryable
+        // not-started error, as before.
+        let mainnet = super::create("mainnet", "");
+        assert!(mainnet >= 1, "create failed: {mainnet}");
+        assert_eq!(send_raw_transaction_json(mainnet, spec), r#"{"error":"handle not started"}"#);
+        super::stop(mainnet);
     }
 }
 
