@@ -336,5 +336,5 @@ chain — `NetworkConfig.hasEns()` gates the UI. Keep ENS off `NetworkConfig` so
 **Port priority**: (1) MPT verifier — security-critical, small; (2) the `world`/oracle adapter to
 your EVM's state trait; (3) the EVM fork table + view-call/estimate frame setup; (4) CCIP-Read + ENS
 (pure logic). The verification semantics (Found/Absent/Invalid, leaf-only storageRoot/codeHash,
-bytecode-by-codeHash, the 15% gas buffer, EIP-7702 one-hop, BLOCKHASH-unsupported) are the parts to
-replicate verbatim and test.
+bytecode-by-codeHash, the 15% gas buffer, EIP-7702 one-hop, BLOCKHASH served only from verified
+data or refused — never zero inside its window) are the parts to replicate verbatim and test.
