@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 47
+#define MYOTIS_ABI_VERSION 48
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -343,25 +343,30 @@ void myotis_string_free(char *s);
 /* v21: the opt-in eth_getLogs watch-list index (docs/eth-getlogs-design.md).
  * get_logs answers only inside indexed coverage; anything else is an
  * {"error": ...} JSON — never an empty array for unindexed ranges. A filter
- * that fails to parse (malformed, a `safe` or hash selector, no address)
- * carries "code": -32602 as well, like eth_call's refusals; a refusal that
- * depends on the index (coverage, the watch-list) stays plain and retryable.
+ * that fails to parse (malformed, a `safe` or hash selector, no address and
+ * no topic 1-3 pinned to one value) carries "code": -32602 as well, like
+ * eth_call's refusals; a refusal that depends on the index (coverage, the
+ * watch-list) stays plain and retryable.
  *
  * set_log_index_config takes {"enabled":bool,"watch":[{"address","fromBlock",
- * "topic0s"?,"name"?}],"unwatch":["0x..",..]?}. `watch` is additive (v24): an
+ * "topic0s"?,"name"?}],"unwatch":["0x..",..]?}. v48: an entry may name a
+ * 32-byte "topic" (with "positions"?, 1-3, default all) instead of an
+ * "address" — every log from any emitter carrying it there — and `unwatch`
+ * takes such values too. `watch` is additive (v24): an
  * address left out of it stays subscribed. `unwatch` (v37) is the unsubscribe
  * — each address it names leaves the index before the union, with its
  * coverage and its stored logs; the other entries keep theirs, and an address
  * the index does not watch is ignored. true means the unwatch is durable (its
- * checkpoint is on disk). false for malformed JSON, an address listed twice
- * or under both keys, a handle without a running EL reader, or an unwatch
+ * checkpoint is on disk). false for malformed JSON, an address or topic listed
+ * twice or under both keys, a handle without a running EL reader, or an unwatch
  * whose checkpoint could not be written — the entries are then dropped in
  * memory only, the rest of the push is not applied, and repeating the push
  * retries the write.
  *
  * The status JSON's entries are {"address","fromBlock","name"?,"coveredLow"?,
  * "coveredHigh"?,"restricted"?}; "restricted":true (v37) marks an entry
- * indexed under a topic0 restriction. */
+ * indexed under a topic0 restriction. A topic entry (v48) opens with
+ * {"topic","positions"} in place of "address". */
 char *myotis_get_logs_json(int64_t handle, const char *filter_json);
 bool myotis_set_log_index_config(int64_t handle, const char *config_json);
 char *myotis_log_index_status_json(int64_t handle);

@@ -163,10 +163,24 @@ await myotis.setLogIndexConfig(h, JSON.stringify({
          // both `watch` and `unwatch` refuses the push. '{"ok":true}' means the
          // unwatch is durable; '{"ok":false}' can also mean its checkpoint
          // could not be written (dropped in memory only — send it again)
+// ABI 48: watch a TOPIC VALUE from any emitter — a wallet's own token
+// transfers, whichever token emits them. `positions` (1-3) defaults to all
+// three: ERC-20/721 `Transfer` names the wallet at topic1 or topic2, ERC-1155
+// at topic2 or topic3. `fromBlock` asserts nothing carries it below.
+await myotis.setLogIndexConfig(h, JSON.stringify({
+  enabled: true,
+  watch: [{ topic: '0x000000000000000000000000' + wallet.slice(2), fromBlock: 9400000 }],
+}));
+// …and query it with or without an address, pinning the value where it sits:
+await myotis.getLogsJson(h, JSON.stringify({
+  fromBlock: '0x8f6d80', toBlock: 'latest',
+  topics: [TRANSFER, null, '0x000000000000000000000000' + wallet.slice(2)],
+}));     // incoming transfers; unwatch it by its 32-byte value
 JSON.parse(await myotis.logIndexStatusJson(h));
 // { enabled, logCount, maxSpeed?, backfillPaused?, headGap?, …,
 //   entries: [{ address, fromBlock, name?, coveredLow?, coveredHigh?,
 //               restricted? }] }   (restricted: indexed under topic0s; ABI 37)
+// a topic entry: { topic, positions, fromBlock, name?, … } (ABI 48)
 // (an index never configured: { enabled: false, logCount: 0, entries: [] })
 ```
 

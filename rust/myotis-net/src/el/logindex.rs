@@ -17,20 +17,163 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// One watched contract: index every log this address emits from
-/// `from_block` onward. `topic0s`, when non-empty, restricts indexing to
-/// those event signatures — and correspondingly restricts which queries are
+/// What a watch entry is keyed by — its identity in the watch-list, the
+/// unit `unwatch` names, and what the header bloom is probed for.
+///
+/// - `Address`: one contract — every log it EMITS.
+/// - `Topic` (#673): one 32-byte topic value — every log, from ANY emitter,
+///   that carries it at one of the entry's `positions`. A wallet's own token
+///   history is mostly logs other contracts emit ABOUT it: an ERC-20/721
+///   `Transfer` names it as topic1 or topic2, an ERC-1155 transfer as topic2
+///   or topic3. A header's `logsBloom` accrues each topic as well as the
+///   address, so probing for the value is as selective as probing for an
+///   address, and a miss is just as definitive.
+///
+/// The two never collide: an entry's identity includes its kind, so a topic
+/// value that happens to be a left-padded address is a different entry from
+/// that address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum WatchKey {
+    Address([u8; 20]),
+    Topic([u8; 32]),
+}
+
+impl From<[u8; 20]> for WatchKey {
+    fn from(address: [u8; 20]) -> Self {
+        WatchKey::Address(address)
+    }
+}
+
+impl From<[u8; 32]> for WatchKey {
+    fn from(value: [u8; 32]) -> Self {
+        WatchKey::Topic(value)
+    }
+}
+
+impl WatchKey {
+    /// The key's bytes: 20 for an address, 32 for a topic value — what the
+    /// header bloom accrues for it.
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            WatchKey::Address(a) => a,
+            WatchKey::Topic(t) => t,
+        }
+    }
+
+    /// The address, for an address entry.
+    pub fn address(&self) -> Option<[u8; 20]> {
+        match self {
+            WatchKey::Address(a) => Some(*a),
+            WatchKey::Topic(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for WatchKey {
+    /// `0x` + lowercase hex: 40 digits for an address, 64 for a topic value,
+    /// the same width the config JSON names them with.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "0x")?;
+        for b in self.as_bytes() {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The topic positions a topic entry may watch: 1 to 3. Position 0 is the
+/// event signature, and "every log of one event, from any emitter" is not a
+/// watch-list, it is a scan of the chain.
+pub const TOPIC_POSITIONS: [u8; 3] = [1, 2, 3];
+
+/// One watch entry: index every log it selects from `from_block` onward —
+/// for an address entry, every log the contract emits; for a topic entry,
+/// every log carrying the value at one of `positions` (see [`WatchKey`]).
+/// `topic0s`, when non-empty, restricts indexing to those event signatures
+/// for either kind — and correspondingly restricts which queries are
 /// answerable (see [`LogIndex::query`]).
+///
+/// `from_block` is the config's assertion that nothing the entry selects
+/// exists below it: a contract's deployment block, or for a topic entry the
+/// first block that can carry the value (a wallet's creation block).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchEntry {
-    pub address: [u8; 20],
+    pub key: WatchKey,
     pub from_block: u64,
     pub topic0s: Vec<[u8; 32]>,
+    /// The topic positions a TOPIC entry matches its value at: strictly
+    /// ascending, non-empty, each in [`TOPIC_POSITIONS`]. Empty for an
+    /// address entry. Part of the entry's restriction, like `topic0s`: a span
+    /// indexed under positions {1, 2} says nothing about logs carrying the
+    /// value at position 3, so a query pinning it there is refused, and two
+    /// sources disagreeing on positions conflict exactly as on `topic0s`.
+    pub positions: Vec<u8>,
     /// Human-readable label (ENS reverse name or a host-supplied one), purely
     /// cosmetic: displayed by hosts, carried by the portable v2 snapshot, and
     /// deliberately EXCLUDED from [`LogIndexConfig::fingerprint`] — renaming
     /// an entry must never invalidate accumulated coverage. Empty = unnamed.
     pub name: String,
+}
+
+impl WatchEntry {
+    /// Would this entry store a log at `block_number` emitted by `address`
+    /// with `topics`? The one rule behind indexing, the receipts-only scan
+    /// and merge, so none of them can disagree with another.
+    pub fn selects(&self, block_number: u64, address: &[u8; 20], topics: &[[u8; 32]]) -> bool {
+        block_number >= self.from_block
+            && match self.key {
+                WatchKey::Address(a) => a == *address,
+                WatchKey::Topic(v) => {
+                    self.positions.iter().any(|&p| topics.get(p as usize) == Some(&v))
+                }
+            }
+            && (self.topic0s.is_empty() || topics.first().is_some_and(|t| self.topic0s.contains(t)))
+    }
+
+    /// Same restriction as `other` — equal topic0 sets and equal positions.
+    /// Two entries for one key that differ here describe different log sets,
+    /// so their spans cannot be combined (see [`MergeError::TopicConflict`]).
+    pub fn same_restriction(&self, other: &WatchEntry) -> bool {
+        let mut ta = self.topic0s.clone();
+        let mut tb = other.topic0s.clone();
+        ta.sort_unstable();
+        tb.sort_unstable();
+        ta == tb && self.positions == other.positions
+    }
+
+    /// Whether the positions fit the kind (see [`Self::positions`]).
+    fn positions_valid(&self) -> bool {
+        match self.key {
+            WatchKey::Address(_) => self.positions.is_empty(),
+            WatchKey::Topic(_) => {
+                !self.positions.is_empty()
+                    && self.positions.windows(2).all(|p| p[0] < p[1])
+                    && self.positions.iter().all(|p| TOPIC_POSITIONS.contains(p))
+            }
+        }
+    }
+
+    /// Whether a query pinned by `filter` gets every log it can match from
+    /// this entry's store: for a topic entry the filter must pin the value at
+    /// one of the entry's positions (otherwise it could match logs carrying
+    /// the value elsewhere, or not at all), and for either kind a topic0
+    /// restriction must be honoured by the filter's own topic0. An address
+    /// entry's address match is the caller's (it answers per address).
+    fn answers(&self, filter: &LogFilter) -> bool {
+        let pinned = match self.key {
+            WatchKey::Address(_) => true,
+            WatchKey::Topic(v) => self.positions.iter().any(|&p| filter.pins(p as usize, &v)),
+        };
+        // Topic-restricted entry: only queries pinned to a subset of the
+        // indexed topic0s are answerable — a wildcard would deserve logs we
+        // never stored.
+        pinned
+            && (self.topic0s.is_empty()
+                || filter
+                    .topics
+                    .first()
+                    .is_some_and(|alts| !alts.is_empty() && alts.iter().all(|t| self.topic0s.contains(t))))
+    }
 }
 
 /// The network a snapshot belongs to. Persisted in every v2 file and checked
@@ -80,46 +223,39 @@ pub struct LogIndexConfig {
 }
 
 impl LogIndexConfig {
-    /// Would any watch entry store this log? (Address match at/past the
-    /// entry's from_block, honoring topic0 restrictions.) Exposed so batch
-    /// fetchers can pre-filter against a captured config snapshot instead of
-    /// buffering every log of every candidate block.
+    /// Would any watch entry store this log? (Selected by an entry at/past
+    /// its from_block, honoring topic0 restrictions — [`WatchEntry::selects`].)
+    /// Exposed so batch fetchers can pre-filter against a captured config
+    /// snapshot instead of buffering every log of every candidate block.
     pub fn watches(&self, log: &StoredLog) -> bool {
-        self.watches_parts(log.block_number, &log.address, log.topics.first())
+        self.watches_parts(log.block_number, &log.address, &log.topics)
     }
 
     /// [`Self::watches`] for a log that is not a [`StoredLog`] yet: the three
     /// things the rule reads. A receipts-only scan asks this before the block's
     /// body (and so the log's transaction hash) has been fetched at all (#544).
     /// One rule for both, so the scan and the store cannot disagree.
-    pub fn watches_parts(&self, block_number: u64, address: &[u8; 20], topic0: Option<&[u8; 32]>) -> bool {
-        self.watch.iter().any(|w| {
-            w.address == *address
-                && block_number >= w.from_block
-                && (w.topic0s.is_empty() || topic0.is_some_and(|t| w.topic0s.contains(t)))
-        })
+    pub fn watches_parts(&self, block_number: u64, address: &[u8; 20], topics: &[[u8; 32]]) -> bool {
+        self.watch.iter().any(|w| w.selects(block_number, address, topics))
     }
 
     /// Union this (pushed) config with an already-subscribed watch-list —
     /// what keeps an imported subscription alive across host preset pushes:
     /// a host re-applying its shipped preset must EXTEND the stored set, not
     /// replace it, or every restart would fingerprint-mismatch the imported
-    /// index into a full re-index. Same-address entries take the MIN
+    /// index into a full re-index. Same-key entries take the MIN
     /// `from_block` (undershooting cannot lie) and the pushed name when
-    /// non-empty (the host is authoritative for cosmetics); addresses only
+    /// non-empty (the host is authoritative for cosmetics); keys only
     /// in `stored` are appended behind the pushed ones. `enabled`/`max_speed`
-    /// come from `self` — they are the push's whole point. None on a topic0
-    /// conflict (the caller falls back to replace semantics).
+    /// come from `self` — they are the push's whole point. None on a
+    /// restriction conflict — topic0s or positions (the caller falls back to
+    /// replace semantics).
     pub fn union_with(&self, stored: &[WatchEntry]) -> Option<LogIndexConfig> {
         let mut watch = self.watch.clone();
         for s in stored {
-            match watch.iter_mut().find(|w| w.address == s.address) {
+            match watch.iter_mut().find(|w| w.key == s.key) {
                 Some(w) => {
-                    let mut ta = w.topic0s.clone();
-                    let mut tb = s.topic0s.clone();
-                    ta.sort_unstable();
-                    tb.sort_unstable();
-                    if ta != tb {
+                    if !w.same_restriction(s) {
                         return None;
                     }
                     w.from_block = w.from_block.min(s.from_block);
@@ -138,8 +274,10 @@ impl LogIndexConfig {
         })
     }
 
-    /// The duplicate watch address this config carries, if any — the ONE
-    /// reason [`LogIndex::new`] refuses a config.
+    /// Why this config cannot be an index's, if it cannot — the ONE reason
+    /// [`LogIndex::new`] refuses a config: a key listed twice, or a topic
+    /// entry's positions out of shape (an address entry with positions at
+    /// all).
     ///
     /// Exposed separately so a caller can refuse a bad config at the door,
     /// before the push has cost anything — before any lock is taken and
@@ -148,12 +286,15 @@ impl LogIndexConfig {
     /// outright), so a caller that must leave the installed index intact on a
     /// refusal asks HERE first (see `ElReader::set_log_index_config`). The
     /// deserializers ask too: they build `Self` directly, bypassing `new`.
-    pub fn duplicate_address(&self) -> Option<DuplicateWatchAddress> {
+    pub fn invalid(&self) -> Option<InvalidWatchList> {
+        if let Some(w) = self.watch.iter().find(|w| !w.positions_valid()) {
+            return Some(InvalidWatchList::BadPositions(w.key));
+        }
         self.watch
             .iter()
             .enumerate()
-            .find(|(i, w)| self.watch.iter().skip(i + 1).any(|o| o.address == w.address))
-            .map(|(_, w)| DuplicateWatchAddress(w.address))
+            .find(|(i, w)| self.watch.iter().skip(i + 1).any(|o| o.key == w.key))
+            .map(|(_, w)| InvalidWatchList::Duplicate(w.key))
     }
 
     /// Order-insensitive fingerprint of the watch-list. A changed fingerprint
@@ -168,9 +309,21 @@ impl LogIndexConfig {
             .watch
             .iter()
             .map(|w| {
-                let mut e = Vec::with_capacity(28 + 32 * w.topic0s.len());
-                e.extend_from_slice(&w.address);
+                let mut e = Vec::with_capacity(44 + 32 * w.topic0s.len());
+                // An address entry encodes exactly as before topic entries
+                // existed, so every file and finality claim written by an
+                // earlier build keeps its fingerprint. A topic entry starts
+                // with a marker byte and is never the 28 + 32k bytes long an
+                // address entry is (41 + positions, positions ≤ 3).
+                match w.key {
+                    WatchKey::Address(a) => e.extend_from_slice(&a),
+                    WatchKey::Topic(v) => {
+                        e.push(b'T');
+                        e.extend_from_slice(&v);
+                    }
+                }
                 e.extend_from_slice(&w.from_block.to_le_bytes());
+                e.extend_from_slice(&w.positions);
                 let mut ts = w.topic0s.clone();
                 ts.sort_unstable();
                 for t in ts {
@@ -250,9 +403,30 @@ impl Coverage {
     }
 }
 
-/// The config lists the same address twice (see [`LogIndex::new`]).
+/// Why a watch-list cannot be an index's (see [`LogIndexConfig::invalid`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DuplicateWatchAddress(pub [u8; 20]);
+pub enum InvalidWatchList {
+    /// The list names this key twice. Query resolution is per key, and two
+    /// entries for one key can desynchronize storage from coverage (a
+    /// coverage-honesty hole).
+    Duplicate(WatchKey),
+    /// A topic entry's positions are empty, out of order, repeated or outside
+    /// 1–3 — or an address entry has positions at all.
+    BadPositions(WatchKey),
+}
+
+impl std::fmt::Display for InvalidWatchList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InvalidWatchList::Duplicate(k) => write!(f, "{k} is listed twice"),
+            InvalidWatchList::BadPositions(k) => write!(
+                f,
+                "{k} has invalid topic positions (a topic entry needs ascending positions \
+                 from 1-3, an address entry none)"
+            ),
+        }
+    }
+}
 
 /// A non-contiguous extend was rejected: the caller tried to record `block`
 /// against a span whose nearest edge is `edge` — the blocks between were
@@ -295,6 +469,30 @@ impl LogFilter {
         }
         true
     }
+
+    /// Whether the filter pins `position` to exactly `value`: an OR-list
+    /// there whose every alternative is `value`. Only then is every log the
+    /// filter can match one that carries the value at that position.
+    pub fn pins(&self, position: usize, value: &[u8; 32]) -> bool {
+        self.topics
+            .get(position)
+            .is_some_and(|alts| !alts.is_empty() && alts.iter().all(|t| t == value))
+    }
+
+    /// Whether the filter pins some position 1–3 to a single value — the
+    /// only shape a topic entry could answer without an address. A filter
+    /// that pins none can never be served by this index without one.
+    pub fn pins_a_topic(&self) -> bool {
+        pins_a_topic(&self.topics)
+    }
+}
+
+/// [`LogFilter::pins_a_topic`] over a filter's positional `topics` alone, for
+/// a caller that has not built the filter yet.
+pub fn pins_a_topic(topics: &[Vec<[u8; 32]>]) -> bool {
+    topics.iter().skip(1).take(TOPIC_POSITIONS.len()).any(|alts| {
+        alts.first().is_some_and(|v| alts.iter().all(|t| t == v))
+    })
 }
 
 /// Why a query cannot be answered. Every variant maps to a strict
@@ -307,15 +505,19 @@ pub enum QueryError {
     Disabled,
     /// An address in the filter is not on the watch-list at all.
     UnwatchedAddress([u8; 20]),
-    /// The watch entry is topic0-restricted and the filter's topic0 position
-    /// is a wildcard or asks for an unindexed signature.
-    UnindexedTopic([u8; 20]),
-    /// The address is watched but the requested range is not (fully) indexed
+    /// The filter names no address, and no topic entry has a value the
+    /// filter pins: nothing on the watch-list selects the logs it asks for.
+    UnwatchedTopic,
+    /// The entry is restricted and the filter steps outside the restriction:
+    /// its topic0 position is a wildcard or asks for an unindexed signature,
+    /// or (a topic entry) it pins the value only at positions the entry does
+    /// not watch.
+    UnindexedTopic(WatchKey),
+    /// The entry is watched but the requested range is not (fully) indexed
     /// yet. Carries what IS covered so status/errors can say how far along
     /// the backfill is.
-    OutOfCoverage { address: [u8; 20], covered: Coverage },
-    /// Filter is structurally unanswerable (from > to, or no address — a
-    /// scoped index cannot serve address-less queries).
+    OutOfCoverage { key: WatchKey, covered: Coverage },
+    /// Filter is structurally unanswerable (from > to).
     Unanswerable,
 }
 
@@ -332,12 +534,13 @@ pub struct LogIndex {
 }
 
 impl LogIndex {
-    /// Build an empty index. Rejects configs with duplicate watch addresses:
-    /// query resolution is per-address, and two entries for one address can
-    /// desynchronize storage from coverage (a coverage-honesty hole).
-    pub fn new(config: LogIndexConfig) -> Result<Self, DuplicateWatchAddress> {
-        if let Some(dup) = config.duplicate_address() {
-            return Err(dup);
+    /// Build an empty index. Rejects an invalid watch-list
+    /// ([`LogIndexConfig::invalid`]): query resolution is per key, and two
+    /// entries for one key can desynchronize storage from coverage (a
+    /// coverage-honesty hole).
+    pub fn new(config: LogIndexConfig) -> Result<Self, InvalidWatchList> {
+        if let Some(bad) = config.invalid() {
+            return Err(bad);
         }
         let n = config.watch.len();
         Ok(Self { config, coverage: vec![Coverage::default(); n], logs: BTreeMap::new(), cursor: None })
@@ -351,30 +554,26 @@ impl LogIndex {
 
     /// Swap in `config` while keeping ALL accumulated state — the additive
     /// re-apply path. Adoptable iff it subscribes exactly this index's
-    /// address set under the same topic0 restrictions: then coverage still
-    /// describes every entry (re-paired by address, since order may differ).
+    /// key set under the same restrictions: then coverage still
+    /// describes every entry (re-paired by key, since order may differ).
     /// Names and runtime bits ride along. A LOWERED `from_block` adopts too:
     /// while the walk is mid-descent that is just a deeper target, and when
     /// it drops below an already-complete span's low (a hole the descending
     /// walk could never reach — see [`walk_resumable`]) the cursor is
     /// DROPPED so the appender re-seeds at the top and the walker
     /// re-descends: coverage survives, the hole closes, nothing wedges.
-    /// False (and untouched state) for a new/removed address or a changed
-    /// topic set — those need a re-index (or a merge).
+    /// False (and untouched state) for a new/removed key or a changed
+    /// restriction — those need a re-index (or a merge).
     pub fn adopt_config(&mut self, config: LogIndexConfig) -> bool {
         if config.watch.len() != self.config.watch.len() {
             return false;
         }
         let mut coverage = Vec::with_capacity(config.watch.len());
         for w in &config.watch {
-            let Some(i) = self.config.watch.iter().position(|o| o.address == w.address) else {
+            let Some(i) = self.config.watch.iter().position(|o| o.key == w.key) else {
                 return false;
             };
-            let mut ta = w.topic0s.clone();
-            let mut tb = self.config.watch[i].topic0s.clone();
-            ta.sort_unstable();
-            tb.sort_unstable();
-            if ta != tb {
+            if !w.same_restriction(&self.config.watch[i]) {
                 return false;
             }
             coverage.push(self.coverage[i]);
@@ -387,15 +586,20 @@ impl LogIndex {
         true
     }
 
-    /// The explicit unsubscribe: drop every entry in `addresses` that this
+    /// The explicit unsubscribe: drop every entry in `keys` that this
     /// index watches — its watch entry, its coverage and every log it stored
-    /// for that address. The other entries keep all of theirs: spans are per
-    /// entry, and a stored log names its own address (addresses are unique
-    /// across entries, so a log at a dropped address belonged to exactly that
-    /// entry). An address the index does not watch is ignored, which makes a
-    /// repeated unwatch a no-op. Returns how many entries were dropped.
+    /// that no surviving entry covers. The other entries keep all of theirs:
+    /// spans are per entry, and a log a dropped entry selected stays exactly
+    /// while a surviving entry both selects it and covers its block (a
+    /// transfer from a watched wallet on a watched token is both entries' log,
+    /// and outlives either one's unwatch) — the rule [`Self::merge`] keeps
+    /// logs by, so nothing is held that no query can reach. A log no dropped
+    /// entry selected is a surviving entry's and is not looked at further,
+    /// which keeps the pass over a large store cheap. A key the index does
+    /// not watch is ignored, which makes a repeated unwatch a no-op. Returns
+    /// how many entries were dropped.
     ///
-    /// This is the one path by which an address leaves an index without the
+    /// This is the one path by which an entry leaves an index without the
     /// index being rebuilt: [`LogIndexConfig::union_with`] and [`Self::merge`]
     /// only ever add.
     ///
@@ -408,34 +612,40 @@ impl LogIndex {
     /// The watch-list fingerprint changes with the entries, which is what
     /// makes a backfill batch, bridge plan or tail window that was computed
     /// against the old list discard itself rather than apply.
-    pub fn unwatch(&mut self, addresses: &[[u8; 20]]) -> usize {
-        let before = self.config.watch.len();
+    pub fn unwatch(&mut self, keys: &[WatchKey]) -> usize {
         let watch = std::mem::take(&mut self.config.watch);
         let coverage = std::mem::take(&mut self.coverage);
+        let mut dropped = Vec::new();
         for (w, c) in watch.into_iter().zip(coverage) {
-            if !addresses.contains(&w.address) {
+            if keys.contains(&w.key) {
+                dropped.push(w);
+            } else {
                 self.config.watch.push(w);
                 self.coverage.push(c);
             }
         }
-        let dropped = before - self.config.watch.len();
-        if dropped == 0 {
+        if dropped.is_empty() {
             return 0;
         }
-        self.logs.retain(|_, l| !addresses.contains(&l.address));
+        let (watch, coverage) = (&self.config.watch, &self.coverage);
+        self.logs.retain(|_, l| {
+            let (b, a, t) = (l.block_number, &l.address, &l.topics[..]);
+            !dropped.iter().any(|d| d.selects(b, a, t))
+                || watch.iter().zip(coverage).any(|(w, c)| w.selects(b, a, t) && c.contains(b, b))
+        });
         if !walk_resumable(&self.config.watch, &self.coverage, self.cursor) {
             self.cursor = None;
         }
-        dropped
+        dropped.len()
     }
 
-    /// Whether `address` has a watch entry here.
-    pub fn watches_address(&self, address: &[u8; 20]) -> bool {
-        self.config.watch.iter().any(|w| &w.address == address)
+    /// Whether `key` has a watch entry here.
+    pub fn watches_key(&self, key: &WatchKey) -> bool {
+        self.config.watch.iter().any(|w| &w.key == key)
     }
 
     /// Whether there is anything to follow the head FOR: the index is enabled
-    /// and watches at least one address. An enabled index with an empty
+    /// and watches at least one entry. An enabled index with an empty
     /// watch-list — every contract unwatched, collection left on — covers
     /// nothing whatever is fetched for it: `append_block` has no entry to
     /// extend, so the append edge never forms and the appender would read the
@@ -461,16 +671,16 @@ impl LogIndex {
         &self.config
     }
 
-    /// Fill in a display name for a watched address IF it is still unnamed —
+    /// Fill in a display name for a watch entry IF it is still unnamed —
     /// the post-import naming pass. Never overwrites: a name baked into a
     /// snapshot (or pushed by a host) outranks a late lookup. Cosmetic only
     /// (names are fingerprint-neutral); persists with the next checkpoint.
     /// Returns whether anything changed.
-    pub fn set_name(&mut self, address: &[u8; 20], name: &str) -> bool {
+    pub fn set_name(&mut self, key: &WatchKey, name: &str) -> bool {
         if name.is_empty() {
             return false;
         }
-        match self.config.watch.iter_mut().find(|w| &w.address == address) {
+        match self.config.watch.iter_mut().find(|w| &w.key == key) {
             Some(w) if w.name.is_empty() => {
                 w.name = name.to_string();
                 true
@@ -479,12 +689,12 @@ impl LogIndex {
         }
     }
 
-    pub fn coverage_of(&self, address: &[u8; 20]) -> Option<Coverage> {
+    pub fn coverage_of(&self, key: &WatchKey) -> Option<Coverage> {
         self.config
             .watch
             .iter()
             .zip(self.coverage.iter())
-            .find(|(w, _)| &w.address == address)
+            .find(|(w, _)| &w.key == key)
             .map(|(_, c)| *c)
     }
 
@@ -592,50 +802,91 @@ impl LogIndex {
     }
 
     /// Answer `eth_getLogs`, enforcing coverage honesty (see module docs).
+    ///
+    /// Two ways a filter is answerable:
+    ///
+    /// - A TOPIC entry whose value the filter pins at one of the entry's
+    ///   positions answers it whole, whatever the filter's address list (none,
+    ///   one token, several): every log the filter can match carries the value
+    ///   there, and inside the entry's coverage every such log is stored.
+    /// - Otherwise every address the filter names must be an address entry
+    ///   covering the range — the filter's logs all come from those addresses.
+    ///
+    /// Either way the scan returns every stored log in range the filter
+    /// matches, whichever entry stored it: a log one entry selected and
+    /// another did not is still a verified log the filter asked for.
     pub fn query(&self, filter: &LogFilter) -> Result<Vec<StoredLog>, QueryError> {
         if !self.config.enabled {
             return Err(QueryError::Disabled);
         }
-        if filter.from_block > filter.to_block || filter.addresses.is_empty() {
+        if filter.from_block > filter.to_block {
             return Err(QueryError::Unanswerable);
         }
+        // The topic entries first. A refusal from one is kept to explain
+        // the answer if nothing else serves — a covered-but-not-yet span is
+        // the most useful (the caller can wait it out), so it wins.
+        let mut topic_refusal: Option<QueryError> = None;
+        for (w, cov) in self.config.watch.iter().zip(self.coverage.iter()) {
+            let WatchKey::Topic(v) = w.key else {
+                continue;
+            };
+            if !w.answers(filter) {
+                // Pinned, but where this entry does not look, or outside its
+                // topic0 restriction: the entry exists for the value and
+                // cannot serve this shape of question.
+                if (1..filter.topics.len()).any(|p| filter.pins(p, &v)) && topic_refusal.is_none() {
+                    topic_refusal = Some(QueryError::UnindexedTopic(w.key));
+                }
+                continue;
+            }
+            match Self::check_coverage(w, cov, filter) {
+                Ok(()) => return Ok(self.scan(filter)),
+                Err(e) => topic_refusal = Some(e),
+            }
+        }
+        if filter.addresses.is_empty() {
+            return Err(topic_refusal.unwrap_or(QueryError::UnwatchedTopic));
+        }
+        let address_refusal = |e: QueryError| match topic_refusal.clone() {
+            Some(t @ QueryError::OutOfCoverage { .. }) => t,
+            _ => e,
+        };
         for addr in &filter.addresses {
             let Some((w, cov)) = self
                 .config
                 .watch
                 .iter()
                 .zip(self.coverage.iter())
-                .find(|(w, _)| &w.address == addr)
+                .find(|(w, _)| w.key == WatchKey::Address(*addr))
             else {
-                return Err(QueryError::UnwatchedAddress(*addr));
+                return Err(address_refusal(QueryError::UnwatchedAddress(*addr)));
             };
-            if !w.topic0s.is_empty() {
-                // Topic-restricted entry: only queries pinned to a subset of
-                // the indexed topic0s are answerable — a wildcard would
-                // deserve logs we never stored.
-                let ok = filter
-                    .topics
-                    .first()
-                    .is_some_and(|alts| !alts.is_empty() && alts.iter().all(|t| w.topic0s.contains(t)));
-                if !ok {
-                    return Err(QueryError::UnindexedTopic(*addr));
-                }
+            if !w.answers(filter) {
+                return Err(address_refusal(QueryError::UnindexedTopic(w.key)));
             }
-            // Only the part of the range at/after the entry's from_block must
-            // be covered — below it the contract cannot have logs by config,
-            // which the config itself asserts (deployment block).
-            let need_from = filter.from_block.max(w.from_block);
-            if need_from <= filter.to_block && !cov.contains(need_from, filter.to_block) {
-                return Err(QueryError::OutOfCoverage { address: *addr, covered: *cov });
-            }
+            Self::check_coverage(w, cov, filter).map_err(address_refusal)?;
         }
-        Ok(self
-            .logs
+        Ok(self.scan(filter))
+    }
+
+    /// Only the part of the range at/after the entry's from_block must
+    /// be covered — below it the entry selects no log by config, which the
+    /// config itself asserts (deployment block, wallet creation).
+    fn check_coverage(w: &WatchEntry, cov: &Coverage, filter: &LogFilter) -> Result<(), QueryError> {
+        let need_from = filter.from_block.max(w.from_block);
+        if need_from <= filter.to_block && !cov.contains(need_from, filter.to_block) {
+            return Err(QueryError::OutOfCoverage { key: w.key, covered: *cov });
+        }
+        Ok(())
+    }
+
+    fn scan(&self, filter: &LogFilter) -> Vec<StoredLog> {
+        self.logs
             .range((filter.from_block, 0)..=(filter.to_block, u32::MAX))
             .map(|(_, l)| l)
             .filter(|l| filter.matches(l))
             .cloned()
-            .collect())
+            .collect()
     }
 
     pub fn log_count(&self) -> usize {
@@ -661,11 +912,13 @@ impl LogIndex {
     /// any watch entry would store? `false` is a definitive skip (blooms
     /// have no false negatives); `true` still requires verified receipts.
     /// Entries whose `from_block` is above `block_number` are ignored, and
-    /// a topic0-restricted entry requires address AND one of its topic0s.
+    /// a topic0-restricted entry requires its key AND one of its topic0s.
+    /// A topic entry probes for its value: the bloom accrues every topic of
+    /// every log, whatever its position.
     pub fn bloom_may_match(&self, block_number: u64, bloom: &myotis_core::bloom::LogsBloom) -> bool {
         self.config.watch.iter().any(|w| {
             block_number >= w.from_block
-                && myotis_core::bloom::may_contain(bloom, &w.address)
+                && myotis_core::bloom::may_contain(bloom, w.key.as_bytes())
                 && (w.topic0s.is_empty()
                     || w.topic0s.iter().any(|t| myotis_core::bloom::may_contain(bloom, t)))
         })
@@ -683,8 +936,8 @@ impl LogIndex {
     /// This is deliberately not the same value as `target_low` (the lowest
     /// `from_block` over EVERY entry, complete or not — the figure hosts
     /// display as `targetLow`): two entries can legitimately share a
-    /// `from_block` (nothing but the address is checked for duplicates, see
-    /// [`LogIndexConfig::duplicate_address`]) while only one of them is
+    /// `from_block` (nothing but the key is checked for duplicates, see
+    /// [`LogIndexConfig::invalid`]) while only one of them is
     /// actually done, and a newly added entry can sit above the walker's
     /// current frontier with no span at all yet. Filtering to "whichever
     /// entry happens to own `target_low`" would get both wrong; this scans
@@ -801,10 +1054,21 @@ const MAGIC: &[u8; 4] = b"MLIX";
 /// v2: self-describing — adds the chain tag and the full watch-table
 ///     (address, from_block, topic0s, name), so a file can be imported on a
 ///     host that has never seen its config, and cannot cross networks.
+/// v3: v2 whose watch-table entries each open with a kind byte — 0 for an
+///     address entry (then exactly v2's fields), 1 for a topic entry (#673:
+///     value(32), from_block, positions, topic0s, name). Written ONLY when
+///     the index holds a topic entry: an address-only index stays v2 byte
+///     for byte, so its files, exports and finality claims still read on
+///     builds (and tools — `scripts/synth_logindex.py`) that predate v3.
 const VERSION: u32 = 2;
+const VERSION_TOPICS: u32 = 3;
 const VERSION_LEGACY: u32 = 1;
 
-/// Byte offset of the v2 checksum field: magic(4) + version(4) +
+/// Watch-table kind bytes of a v3 frame.
+const KIND_ADDRESS: u8 = 0;
+const KIND_TOPIC: u8 = 1;
+
+/// Byte offset of the v2 checksum field (v3 shares the header): magic(4) + version(4) +
 /// network_id(8) + genesis_hash(32) + fingerprint(8). The checksum covers
 /// everything AFTER itself.
 const V2_CHECKSUM_AT: usize = 56;
@@ -907,7 +1171,8 @@ impl LogIndex {
         self.serialize_impl(tag, clamp, false)
     }
 
-    /// The one serializer (always writes VERSION 2). `clamp` bounds what is
+    /// The one serializer (VERSION 2, or 3 when a topic entry needs it).
+    /// `clamp` bounds what is
     /// written (see [`Self::serialize_clamped`]) and filters DURING the
     /// write: the tail keeps coverage above finality at all times, so a clamp
     /// that cloned the index would deep-copy the whole log store on every
@@ -915,8 +1180,9 @@ impl LogIndex {
     /// blanks the watch-table names (see [`Self::export_unnamed`]).
     fn serialize_impl(&self, tag: &ChainTag, clamp: Option<u64>, strip_names: bool) -> Vec<u8> {
         let mut out = Vec::with_capacity(128 + self.logs.len() * 200);
+        let v3 = self.config.watch.iter().any(|w| matches!(w.key, WatchKey::Topic(_)));
         out.extend_from_slice(MAGIC);
-        put_u32(&mut out, VERSION);
+        put_u32(&mut out, if v3 { VERSION_TOPICS } else { VERSION });
         put_u64(&mut out, tag.network_id);
         out.extend_from_slice(&tag.genesis_hash);
         put_u64(&mut out, self.config.fingerprint());
@@ -927,8 +1193,21 @@ impl LogIndex {
         // config that produced them.
         put_u32(&mut out, self.config.watch.len() as u32);
         for w in &self.config.watch {
-            out.extend_from_slice(&w.address);
-            put_u64(&mut out, w.from_block);
+            match w.key {
+                WatchKey::Address(a) => {
+                    if v3 {
+                        out.push(KIND_ADDRESS);
+                    }
+                    out.extend_from_slice(&a);
+                    put_u64(&mut out, w.from_block);
+                }
+                WatchKey::Topic(v) => {
+                    out.push(KIND_TOPIC);
+                    out.extend_from_slice(&v);
+                    put_u64(&mut out, w.from_block);
+                    put_bytes(&mut out, &w.positions);
+                }
+            }
             put_u32(&mut out, w.topic0s.len() as u32);
             for t in &w.topic0s {
                 out.extend_from_slice(t);
@@ -1002,7 +1281,7 @@ impl LogIndex {
     }
 
     /// Rebuild from bytes for the given config. Any mismatch or corruption
-    /// → None (re-index). Accepts the current v2 layout (tag-checked) and the
+    /// → None (re-index). Accepts the current v2/v3 layouts (tag-checked) and the
     /// legacy v1 layout (pre-tag files written by earlier builds — loading
     /// them preserves accumulated coverage across the upgrade; the next
     /// checkpoint rewrites the file as v2).
@@ -1013,27 +1292,27 @@ impl LogIndex {
         }
         match c.u32()? {
             VERSION_LEGACY => Self::deserialize_v1(config, data, c),
-            VERSION => {
-                let parsed = parse_v2(data, c)?;
+            version @ (VERSION | VERSION_TOPICS) => {
+                let parsed = parse_v2(data, c, version)?;
                 if parsed.tag != *tag || parsed.fingerprint != config.fingerprint() {
                     return None;
                 }
                 // The file's coverage vec parallels the file's watch order;
                 // the given config may list the same set in another order
                 // (the fingerprint is order-insensitive). Re-pair coverage by
-                // ADDRESS so a reordered-but-equal config cannot attach a
+                // KEY so a reordered-but-equal config cannot attach a
                 // span to the wrong entry. The config (not the file) supplies
                 // the names — the host is authoritative for cosmetics.
                 let mut coverage = Vec::with_capacity(config.watch.len());
                 for w in &config.watch {
-                    let j = parsed.watch.iter().position(|f| f.address == w.address)?;
+                    let j = parsed.watch.iter().position(|f| f.key == w.key)?;
                     coverage.push(parsed.coverage[j]);
                 }
-                // Same bar as `new`: a duplicate address desynchronizes
+                // Same bar as `new`: a duplicate key desynchronizes
                 // storage from coverage, and this path builds `Self` directly.
                 // Reachable with a hand-written config, since the fingerprint
                 // the file is keyed by is computed from that same config.
-                config.duplicate_address().is_none().then(|| Self {
+                config.invalid().is_none().then(|| Self {
                     config: config.clone(),
                     coverage,
                     logs: parsed.logs,
@@ -1063,13 +1342,10 @@ impl LogIndex {
             return None; // trailing garbage → treat as corrupt
         }
         // Same bar as `new` (see `deserialize`).
-        config
-            .duplicate_address()
-            .is_none()
-            .then(|| Self { config: config.clone(), coverage, logs, cursor })
+        config.invalid().is_none().then(|| Self { config: config.clone(), coverage, logs, cursor })
     }
 
-    /// Self-describing read (v2 only): reconstruct the subscription set from
+    /// Self-describing read (v2/v3): reconstruct the subscription set from
     /// the file's own watch-table instead of requiring the config that wrote
     /// it — the import path. Returns the file's chain tag so the importer can
     /// refuse a file from another network, and the index carrying the file's
@@ -1084,10 +1360,14 @@ impl LogIndex {
     /// loaded. Reading the header a second time could see a different file.
     pub fn deserialize_portable_with_id(data: &[u8]) -> Option<(Self, SnapshotId)> {
         let mut c = Cursor { d: data, pos: 0 };
-        if c.take(4)? != MAGIC || c.u32()? != VERSION {
+        if c.take(4)? != MAGIC {
+            return None;
+        }
+        let version = c.u32()?;
+        if version != VERSION && version != VERSION_TOPICS {
             return None; // v1 files are not self-describing — not importable
         }
-        let parsed = parse_v2(data, c)?;
+        let parsed = parse_v2(data, c, version)?;
         let config =
             LogIndexConfig { enabled: false, max_speed: false, backfill_paused: false, watch: parsed.watch };
         // The stored fingerprint must actually match the stored watch-table —
@@ -1176,12 +1456,12 @@ pub struct SnapshotId {
 }
 
 impl SnapshotId {
-    /// The id of a serialized v2 frame, read off its header — for a writer
+    /// The id of a serialized v2/v3 frame, read off its header — for a writer
     /// that holds the bytes it is about to put on disk (it produced them, so
-    /// the checksum is not re-verified). `None` for anything but a v2 frame.
+    /// the checksum is not re-verified). `None` for anything but such a frame.
     pub fn of_frame(bytes: &[u8]) -> Option<SnapshotId> {
         let mut c = Cursor { d: bytes, pos: 0 };
-        if c.take(4)? != MAGIC || c.u32()? != VERSION {
+        if c.take(4)? != MAGIC || !matches!(c.u32()?, VERSION | VERSION_TOPICS) {
             return None;
         }
         let network_id = c.u64()?;
@@ -1290,11 +1570,12 @@ pub enum MergeError {
     /// A source belongs to another network. Merging it would key logs of a
     /// foreign chain into this chain's block numbers — fabricated coverage.
     ChainMismatch { expected: ChainTag, got: ChainTag },
-    /// Two sources watch the same address under DIFFERENT topic0 sets. A
-    /// coverage span's meaning includes the topic restriction it was indexed
-    /// under; unioning restrictions would claim logs nobody stored. Refused
-    /// rather than resolved — re-generate one source with matching topics.
-    TopicConflict([u8; 20]),
+    /// Two sources watch the same key under DIFFERENT restrictions (topic0
+    /// sets, or a topic entry's positions). A coverage span's meaning
+    /// includes the restriction it was indexed under; unioning restrictions
+    /// would claim logs nobody stored. Refused rather than resolved —
+    /// re-generate one source with matching topics.
+    TopicConflict(WatchKey),
 }
 
 impl std::fmt::Display for MergeError {
@@ -1306,12 +1587,8 @@ impl std::fmt::Display for MergeError {
                 "snapshot belongs to another chain (network id {}, expected {})",
                 got.network_id, expected.network_id
             ),
-            MergeError::TopicConflict(a) => {
-                write!(f, "0x")?;
-                for b in a {
-                    write!(f, "{b:02x}")?;
-                }
-                write!(f, " is watched under conflicting topic restrictions")
+            MergeError::TopicConflict(k) => {
+                write!(f, "{k} is watched under conflicting topic restrictions")
             }
         }
     }
@@ -1321,20 +1598,20 @@ impl LogIndex {
     /// Merge portable snapshots (all of one chain) into a single canonical
     /// index. Rules:
     ///
-    /// - watch union — same address requires equal topic0 sets
+    /// - watch union — same key requires the same restriction
     ///   ([`MergeError::TopicConflict`]); `from_block` = min (undershooting
     ///   cannot lie); name = first non-empty in input order.
-    /// - sources that contribute nothing (no new address, no lower
+    /// - sources that contribute nothing (no new key, no lower
     ///   `from_block`, no coverage extension) are dropped FIRST, so a stale
     ///   re-import cannot drag the global high back in time.
     /// - coverage: global high `H` = min over contributing sources' own
     ///   highs; every span is clamped to `H` (one whose low is above `H`
-    ///   vanishes — its blocks re-index later) and unioned per address. With
+    ///   vanishes — its blocks re-index later) and unioned per key. With
     ///   canonical inputs every surviving span contains `H`, so the union is
     ///   contiguous and single-span coverage suffices. The band above `H` is
     ///   re-covered by the existing bridge/appender — re-fetched, never
     ///   trusted from the staler file.
-    /// - logs: kept iff inside the merged span of their address's entry —
+    /// - logs: kept iff inside the merged span of an entry that selects them —
     ///   anything else is unreachable by the coverage-honest query anyway.
     /// - cursor: the lowest source cursor (the deepest verified trust edge).
     ///
@@ -1357,13 +1634,9 @@ impl LogIndex {
         for (i, a) in sources.iter().enumerate() {
             for b in sources.iter().skip(i + 1) {
                 for wa in &a.config.watch {
-                    if let Some(wb) = b.config.watch.iter().find(|w| w.address == wa.address) {
-                        let mut ta = wa.topic0s.clone();
-                        let mut tb = wb.topic0s.clone();
-                        ta.sort_unstable();
-                        tb.sort_unstable();
-                        if ta != tb {
-                            return Err(MergeError::TopicConflict(wa.address));
+                    if let Some(wb) = b.config.watch.iter().find(|w| w.key == wa.key) {
+                        if !wa.same_restriction(wb) {
+                            return Err(MergeError::TopicConflict(wa.key));
                         }
                     }
                 }
@@ -1383,9 +1656,9 @@ impl LogIndex {
                     sources[i].config.watch.iter().all(|w| {
                         rest.iter().any(|r| {
                             r.config.watch.iter().zip(r.coverage.iter()).any(|(rw, rc)| {
-                                rw.address == w.address
+                                rw.key == w.key
                                     && rw.from_block <= w.from_block
-                                    && match sources[i].coverage_of(&w.address).and_then(|c| c.span) {
+                                    && match sources[i].coverage_of(&w.key).and_then(|c| c.span) {
                                         None => true,
                                         Some((low, high)) => matches!(
                                             rc.span,
@@ -1408,7 +1681,7 @@ impl LogIndex {
         let mut watch: Vec<WatchEntry> = Vec::new();
         for s in &sources {
             for w in &s.config.watch {
-                match watch.iter_mut().find(|m| m.address == w.address) {
+                match watch.iter_mut().find(|m| m.key == w.key) {
                     Some(m) => {
                         m.from_block = m.from_block.min(w.from_block);
                         if m.name.is_empty() && !w.name.is_empty() {
@@ -1435,7 +1708,7 @@ impl LogIndex {
             .map(|w| {
                 let mut pieces: Vec<(u64, u64)> = sources
                     .iter()
-                    .filter_map(|s| s.coverage_of(&w.address).and_then(|c| c.span))
+                    .filter_map(|s| s.coverage_of(&w.key).and_then(|c| c.span))
                     .filter_map(|(low, high)| {
                         let h = h.expect("a span exists, so H exists");
                         (low <= h).then_some((low, high.min(h)))
@@ -1476,11 +1749,10 @@ impl LogIndex {
         for s in &mut sources {
             let taken = std::mem::take(&mut s.logs);
             for (key, log) in taken {
-                let served = watch
-                    .iter()
-                    .zip(coverage.iter())
-                    .find(|(w, _)| w.address == log.address)
-                    .is_some_and(|(_, c)| c.contains(log.block_number, log.block_number));
+                let served = watch.iter().zip(coverage.iter()).any(|(w, c)| {
+                    w.selects(log.block_number, &log.address, &log.topics)
+                        && c.contains(log.block_number, log.block_number)
+                });
                 if served {
                     logs.insert(key, log);
                 }
@@ -1488,7 +1760,7 @@ impl LogIndex {
         }
         let config = LogIndexConfig { enabled: false, max_speed: false, backfill_paused: false, watch };
         // Duplicates are impossible post-union; new() also re-validates.
-        let ix = Self::new(config).expect("union has unique addresses");
+        let ix = Self::new(config).expect("union has unique keys");
         Ok((expected, Self { coverage, logs, cursor, ..ix }))
     }
 }
@@ -1544,10 +1816,10 @@ struct ParsedV2 {
     logs: BTreeMap<(u64, u32), StoredLog>,
 }
 
-/// Parse a v2 frame from just past the version field. Verifies the checksum
-/// and structural framing; policy checks (tag, fingerprint-vs-config) are the
-/// caller's.
-fn parse_v2(data: &[u8], mut c: Cursor) -> Option<ParsedV2> {
+/// Parse a v2 or v3 frame (`version`) from just past the version field.
+/// Verifies the checksum and structural framing; policy checks (tag,
+/// fingerprint-vs-config, the watch-list's own validity) are the caller's.
+fn parse_v2(data: &[u8], mut c: Cursor, version: u32) -> Option<ParsedV2> {
     let network_id = c.u64()?;
     let genesis_hash = c.arr::<32>()?;
     let fingerprint = c.u64()?;
@@ -1558,15 +1830,27 @@ fn parse_v2(data: &[u8], mut c: Cursor) -> Option<ParsedV2> {
     let n_watch = c.u32()? as usize;
     let mut watch = Vec::with_capacity(n_watch.min(1024));
     for _ in 0..n_watch {
-        let address = c.arr::<20>()?;
-        let from_block = c.u64()?;
+        let kind = if version == VERSION_TOPICS { *c.take(1)?.first()? } else { KIND_ADDRESS };
+        let (key, from_block, positions) = match kind {
+            KIND_ADDRESS => (WatchKey::Address(c.arr::<20>()?), c.u64()?, Vec::new()),
+            KIND_TOPIC => {
+                let value = c.arr::<32>()?;
+                let from_block = c.u64()?;
+                let positions = c.bytes()?;
+                if positions.len() > TOPIC_POSITIONS.len() {
+                    return None;
+                }
+                (WatchKey::Topic(value), from_block, positions.to_vec())
+            }
+            _ => return None,
+        };
         let n_topics = c.u32()? as usize;
         let mut topic0s = Vec::with_capacity(n_topics.min(64));
         for _ in 0..n_topics {
             topic0s.push(c.arr::<32>()?);
         }
         let name = String::from_utf8(c.bytes()?.to_vec()).ok()?;
-        watch.push(WatchEntry { address, from_block, topic0s, name });
+        watch.push(WatchEntry { key, from_block, topic0s, positions, name });
     }
     // Coverage is parallel to the watch-table by construction of the writer —
     // a count disagreeing with the table is an inconsistent frame.
@@ -1714,7 +1998,7 @@ mod tests {
         assert_eq!(tag.network_id, gnosis.network_id);
         assert_eq!(tag.genesis_hash, gnosis.genesis_hash);
         assert_eq!(ix.config.watch.len(), 1);
-        assert_eq!(ix.config.watch[0].address, address);
+        assert_eq!(ix.config.watch[0].key, address.into());
         assert_eq!(ix.config.watch[0].from_block, 31_305_656, "the deployment block, not the fetch's low edge");
         assert!(ix.config.watch[0].topic0s.is_empty());
         assert_eq!(ix.coverage[0].span, Some((47_000_000, 47_000_010)), "coverage is the fetched range");
@@ -1767,7 +2051,7 @@ mod tests {
     fn pausing_the_backfill_is_fingerprint_neutral_and_flippable() {
         // The pause is a runtime bit like max_speed: coverage already walked
         // must survive the flip, and resuming continues from the same cursor.
-        let w = WatchEntry { address: [9u8; 20], from_block: 5, topic0s: vec![], name: String::new() };
+        let w = WatchEntry { key: WatchKey::Address([9u8; 20]), positions: vec![], from_block: 5, topic0s: vec![], name: String::new() };
         let running = LogIndexConfig {
             enabled: true, max_speed: false, backfill_paused: false, watch: vec![w.clone()],
         };
@@ -1785,7 +2069,7 @@ mod tests {
 
     #[test]
     fn max_speed_is_fingerprint_neutral_and_flippable() {
-        let w = WatchEntry { address: [7u8; 20], from_block: 5, topic0s: vec![], name: String::new() };
+        let w = WatchEntry { key: WatchKey::Address([7u8; 20]), positions: vec![], from_block: 5, topic0s: vec![], name: String::new() };
         let a = LogIndexConfig { enabled: true, max_speed: false, backfill_paused: false, watch: vec![w.clone()] };
         let b = LogIndexConfig { enabled: true, max_speed: true, backfill_paused: false, watch: vec![w] };
         // Flipping pacing must never invalidate accumulated coverage.
@@ -1820,7 +2104,7 @@ mod tests {
     }
 
     fn watch_all(a: [u8; 20], from: u64) -> WatchEntry {
-        WatchEntry { address: a, from_block: from, topic0s: vec![], name: String::new() }
+        WatchEntry { key: WatchKey::Address(a), positions: vec![], from_block: from, topic0s: vec![], name: String::new() }
     }
 
     /// The chain tag every test persists under (arbitrary but fixed).
@@ -1851,8 +2135,8 @@ mod tests {
         assert_eq!(ix.query(&filter(200, 201, addr(1))).unwrap().len(), 1);
         // Range dipping below coverage errors instead of answering empt-ish.
         match ix.query(&filter(150, 201, addr(1))) {
-            Err(QueryError::OutOfCoverage { address, covered }) => {
-                assert_eq!(address, addr(1));
+            Err(QueryError::OutOfCoverage { key, covered }) => {
+                assert_eq!(key, addr(1).into());
                 assert_eq!(covered.span, Some((200, 201)));
             }
             other => panic!("expected OutOfCoverage, got {other:?}"),
@@ -1876,23 +2160,25 @@ mod tests {
         assert_eq!(ix.query(&filter(0, 10, addr(2))), Err(QueryError::UnwatchedAddress(addr(2))));
         let off = LogIndex::new(LogIndexConfig { enabled: false, max_speed: false, backfill_paused: false, watch: vec![watch_all(addr(1), 0)] }).unwrap();
         assert_eq!(off.query(&filter(0, 0, addr(1))), Err(QueryError::Disabled));
-        assert_eq!(ix.query(&LogFilter { from_block: 0, to_block: 10, addresses: vec![], topics: vec![] }), Err(QueryError::Unanswerable));
+        // No address, and no topic entry for anything the filter pins.
+        assert_eq!(ix.query(&LogFilter { from_block: 0, to_block: 10, addresses: vec![], topics: vec![] }), Err(QueryError::UnwatchedTopic));
+        assert_eq!(ix.query(&LogFilter { from_block: 10, to_block: 0, addresses: vec![addr(1)], topics: vec![] }), Err(QueryError::Unanswerable));
     }
 
     #[test]
     fn topic_restricted_watch_rejects_wildcard_queries() {
-        let w = WatchEntry { address: addr(1), from_block: 0, topic0s: vec![topic(7)], name: String::new() };
+        let w = WatchEntry { key: WatchKey::Address(addr(1)), positions: vec![], from_block: 0, topic0s: vec![topic(7)], name: String::new() };
         let mut ix = LogIndex::new(config_ok(vec![w])).unwrap();
         ix.append_block(5, [0xbb; 32], vec![log(5, 0, addr(1), vec![topic(7)])]).unwrap();
         // Wildcard topic0 would deserve unindexed signatures → error.
-        assert_eq!(ix.query(&filter(5, 5, addr(1))), Err(QueryError::UnindexedTopic(addr(1))));
+        assert_eq!(ix.query(&filter(5, 5, addr(1))), Err(QueryError::UnindexedTopic(addr(1).into())));
         // Pinned to the indexed signature → answers.
         let mut f = filter(5, 5, addr(1));
         f.topics = vec![vec![topic(7)]];
         assert_eq!(ix.query(&f).unwrap().len(), 1);
         // Pinned to a different signature → error, not empty.
         f.topics = vec![vec![topic(8)]];
-        assert_eq!(ix.query(&f), Err(QueryError::UnindexedTopic(addr(1))));
+        assert_eq!(ix.query(&f), Err(QueryError::UnindexedTopic(addr(1).into())));
     }
 
     #[test]
@@ -1914,7 +2200,7 @@ mod tests {
         ix.append_block(300, [0xbb; 32], vec![]).unwrap();
         ix.backfill_block(299, [9; 32], vec![log(299, 2, addr(1), vec![])]).unwrap();
         ix.backfill_block(298, [8; 32], vec![]).unwrap();
-        assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((298, 300)));
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((298, 300)));
         assert_eq!(ix.cursor, Some((298, [8; 32])));
         assert_eq!(ix.query(&filter(298, 300, addr(1))).unwrap().len(), 1);
     }
@@ -1934,10 +2220,10 @@ mod tests {
         // past them nothing would ever rewind them.
         ix.persist_clamped(&tag(), &path, 12).unwrap();
         let loaded = LogIndex::load(&cfg, &tag(), &path).unwrap();
-        assert_eq!(loaded.coverage_of(&addr(1)).unwrap().span, Some((10, 12)));
+        assert_eq!(loaded.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((10, 12)));
         assert_eq!(loaded.log_count(), 3);
         // The live index is untouched — the clamp is a serialization concern.
-        assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((10, 14)));
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((10, 14)));
         assert_eq!(ix.log_count(), 5);
         // Nothing above the clamp → byte-identical to a plain serialize.
         assert_eq!(ix.serialize_clamped(&tag(), 14), ix.serialize(&tag()));
@@ -2052,12 +2338,12 @@ mod tests {
         // written with the clamped high; the live index is untouched either way.
         let bytes = ix.serialize_clamped(&tag(), 12);
         let loaded = LogIndex::deserialize(&cfg, &tag(), &bytes).unwrap();
-        assert_eq!(loaded.coverage_of(&addr(1)).unwrap().span, Some((10, 12)));
+        assert_eq!(loaded.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((10, 12)));
         assert_eq!(loaded.log_count(), 3);
-        assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((10, 14)));
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((10, 14)));
         assert_eq!(ix.log_count(), 5);
         let below = LogIndex::deserialize(&cfg, &tag(), &ix.serialize_clamped(&tag(), 9)).unwrap();
-        assert_eq!(below.coverage_of(&addr(1)).unwrap().span, None);
+        assert_eq!(below.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, None);
         assert_eq!(below.log_count(), 0);
     }
 
@@ -2085,7 +2371,7 @@ mod tests {
             ix.append_block(b, [0xbb; 32], vec![log(b, 0, addr(1), vec![])]).unwrap();
         }
         ix.rewind_above(12);
-        assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((10, 12)));
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((10, 12)));
         assert_eq!(ix.log_count(), 3);
         // Above the fork point is out of coverage again.
         assert!(matches!(ix.query(&filter(10, 14, addr(1))), Err(QueryError::OutOfCoverage { .. })));
@@ -2105,14 +2391,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("logindex-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("logindex-test.db");
-        let cfg = config(vec![watch_all(addr(1), 100), WatchEntry { address: addr(2), from_block: 0, topic0s: vec![topic(7)], name: String::new() }]);
+        let cfg = config(vec![watch_all(addr(1), 100), WatchEntry { key: WatchKey::Address(addr(2)), positions: vec![], from_block: 0, topic0s: vec![topic(7)], name: String::new() }]);
         let mut ix = LogIndex::new(cfg.clone()).unwrap();
         ix.append_block(200, [0xbb; 32], vec![log(200, 3, addr(1), vec![topic(7), topic(8)])]).unwrap();
         ix.backfill_block(199, [7; 32], vec![]).unwrap();
         ix.persist(&tag(), &path).unwrap();
 
         let back = LogIndex::load(&cfg, &tag(), &path).expect("roundtrip");
-        assert_eq!(back.coverage_of(&addr(1)).unwrap().span, Some((199, 200)));
+        assert_eq!(back.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((199, 200)));
         assert_eq!(back.cursor, Some((199, [7; 32])));
         assert_eq!(back.query(&filter(199, 200, addr(1))).unwrap(), ix.query(&filter(199, 200, addr(1))).unwrap());
 
@@ -2137,12 +2423,12 @@ mod tests {
         // Skipping 201 must fail and store nothing.
         assert_eq!(ix.append_block(205, [0xbb; 32], vec![log(205, 0, addr(1), vec![])]), Err(CoverageGap { edge: 200, block: 205 }));
         assert_eq!(ix.log_count(), 0);
-        assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((200, 200)));
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((200, 200)));
         // Contiguous append still works; downward gap equally rejected.
         ix.append_block(201, [0xbb; 32], vec![]).unwrap();
         assert_eq!(ix.backfill_block(150, [1; 32], vec![]), Err(CoverageGap { edge: 200, block: 150 }));
         ix.backfill_block(199, [2; 32], vec![]).unwrap();
-        assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((199, 201)));
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((199, 201)));
         // The gap blocks never answer as empty.
         assert!(matches!(ix.query(&filter(199, 205, addr(1))), Err(QueryError::OutOfCoverage { .. })));
     }
@@ -2178,14 +2464,14 @@ mod tests {
 
     #[test]
     fn duplicate_watch_addresses_are_rejected() {
-        let dup = config(vec![watch_all(addr(1), 0), WatchEntry { address: addr(1), from_block: 50, topic0s: vec![], name: String::new() }]);
+        let dup = config(vec![watch_all(addr(1), 0), WatchEntry { key: WatchKey::Address(addr(1)), positions: vec![], from_block: 50, topic0s: vec![], name: String::new() }]);
         // Askable ahead of construction, so a caller holding an index it must
         // not lose can refuse the config before spending anything on it.
-        assert!(matches!(dup.duplicate_address(), Some(DuplicateWatchAddress(a)) if a == addr(1)));
-        assert!(matches!(LogIndex::new(dup), Err(DuplicateWatchAddress(a)) if a == addr(1)));
+        assert!(matches!(dup.invalid(), Some(InvalidWatchList::Duplicate(a)) if a == addr(1).into()));
+        assert!(matches!(LogIndex::new(dup), Err(InvalidWatchList::Duplicate(a)) if a == addr(1).into()));
         // …and it answers None for the configs `new` accepts, including empty.
-        assert!(config(vec![watch_all(addr(1), 0), watch_all(addr(2), 0)]).duplicate_address().is_none());
-        assert!(config(vec![]).duplicate_address().is_none());
+        assert!(config(vec![watch_all(addr(1), 0), watch_all(addr(2), 0)]).invalid().is_none());
+        assert!(config(vec![]).invalid().is_none());
     }
 
     /// Re-key serialized bytes to `fp` so a hand-written config the real
@@ -2250,7 +2536,7 @@ mod tests {
     #[test]
     fn a_union_never_manufactures_a_duplicate_the_pushed_config_lacked() {
         let pushed = config(vec![watch_all(addr(1), 10), watch_all(addr(2), 10)]);
-        assert!(pushed.duplicate_address().is_none());
+        assert!(pushed.invalid().is_none());
         for stored in [
             vec![watch_all(addr(2), 5), watch_all(addr(3), 5)], // overlap + new
             vec![watch_all(addr(3), 5), watch_all(addr(3), 7)], // duplicated stored
@@ -2259,9 +2545,9 @@ mod tests {
         ] {
             let union = pushed.union_with(&stored).expect("no topic conflict");
             assert!(
-                union.duplicate_address().is_none(),
+                union.invalid().is_none(),
                 "union_with produced a duplicate the guard could not have caught: {:?}",
-                union.watch.iter().map(|w| w.address[0]).collect::<Vec<_>>()
+                union.watch.iter().map(|w| w.key.address().unwrap()[0]).collect::<Vec<_>>()
             );
             assert!(LogIndex::new(union).is_ok(), "the union config is unbuildable");
         }
@@ -2328,13 +2614,13 @@ mod tests {
     #[test]
     fn fingerprint_is_order_insensitive_but_content_sensitive() {
         let a = watch_all(addr(1), 5);
-        let b = WatchEntry { address: addr(2), from_block: 9, topic0s: vec![topic(3), topic(4)], name: String::new() };
+        let b = WatchEntry { key: WatchKey::Address(addr(2)), positions: vec![], from_block: 9, topic0s: vec![topic(3), topic(4)], name: String::new() };
         let mut b_rev = b.clone();
         b_rev.topic0s.reverse();
         let c1 = config(vec![a.clone(), b.clone()]);
         let c2 = config(vec![b_rev, a.clone()]);
         assert_eq!(c1.fingerprint(), c2.fingerprint());
-        let c3 = config(vec![a, WatchEntry { address: addr(2), from_block: 10, topic0s: vec![topic(3), topic(4)], name: String::new() }]);
+        let c3 = config(vec![a, WatchEntry { key: WatchKey::Address(addr(2)), positions: vec![], from_block: 10, topic0s: vec![topic(3), topic(4)], name: String::new() }]);
         assert_ne!(c1.fingerprint(), c3.fingerprint());
     }
 
@@ -2351,14 +2637,14 @@ mod tests {
         ix.append_block(200, [0xbb; 32], vec![]).unwrap();
         let back = LogIndex::deserialize(&named, &tag(), &ix.serialize(&tag())).unwrap();
         assert_eq!(back.config().watch[0].name, "tornado.registry.eth");
-        assert_eq!(back.coverage_of(&addr(1)).unwrap().span, Some((200, 200)));
+        assert_eq!(back.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((200, 200)));
     }
 
     #[test]
     fn portable_roundtrip_reconstructs_config_from_the_bytes() {
         let mut w1 = watch_all(addr(1), 100);
         w1.name = "tornado.registry.eth".to_string();
-        let w2 = WatchEntry { address: addr(2), from_block: 50, topic0s: vec![topic(7)], name: String::new() };
+        let w2 = WatchEntry { key: WatchKey::Address(addr(2)), positions: vec![], from_block: 50, topic0s: vec![topic(7)], name: String::new() };
         let mut ix = LogIndex::new(config(vec![w1.clone(), w2.clone()])).unwrap();
         ix.append_block(200, [0xbb; 32], vec![log(200, 0, addr(1), vec![topic(7)])]).unwrap();
         ix.backfill_block(199, [9; 32], vec![]).unwrap();
@@ -2371,7 +2657,7 @@ mod tests {
         assert!(!back.config().enabled);
         assert!(!back.config().max_speed);
         // Coverage, cursor, and logs all survive.
-        assert_eq!(back.coverage_of(&addr(1)).unwrap().span, Some((199, 200)));
+        assert_eq!(back.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((199, 200)));
         assert_eq!(back.cursor, Some((199, [9; 32])));
         assert_eq!(back.log_count(), 1);
     }
@@ -2392,13 +2678,13 @@ mod tests {
         // but coverage, logs and from_block all did.
         assert!(back.config().watch[0].name.is_empty());
         assert_eq!(back.config().watch[0].from_block, 100);
-        assert_eq!(back.coverage_of(&addr(1)).unwrap().span, Some((200, 200)));
+        assert_eq!(back.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((200, 200)));
         assert_eq!(back.log_count(), 1);
         // The clamp behaves like every checkpoint's.
         ix.append_block(201, [0xbc; 32], vec![]).unwrap();
         ix.export_unnamed(&tag(), &path, Some(200)).unwrap();
         let (_, clamped) = LogIndex::load_portable(&path).unwrap();
-        assert_eq!(clamped.coverage_of(&addr(1)).unwrap().span, Some((200, 200)));
+        assert_eq!(clamped.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((200, 200)));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2489,7 +2775,7 @@ mod tests {
         ix.backfill_block(199, [9; 32], vec![]).unwrap();
         let v1 = serialize_v1(&ix);
         let back = LogIndex::deserialize(&cfg, &tag(), &v1).expect("v1 upgrade load");
-        assert_eq!(back.coverage_of(&addr(1)).unwrap().span, Some((199, 200)));
+        assert_eq!(back.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((199, 200)));
         assert_eq!(back.cursor, Some((199, [9; 32])));
         assert_eq!(back.log_count(), 1);
         // Same guards as ever: wrong fingerprint or truncation → None.
@@ -2503,13 +2789,13 @@ mod tests {
         named.name = "baked.eth".to_string();
         let mut ix = LogIndex::new(config(vec![named, watch_all(addr(2), 0)])).unwrap();
         // A baked-in name outranks a late lookup; empty names never install.
-        assert!(!ix.set_name(&addr(1), "late.eth"));
+        assert!(!ix.set_name(&addr(1).into(), "late.eth"));
         assert_eq!(ix.config().watch[0].name, "baked.eth");
-        assert!(!ix.set_name(&addr(2), ""));
-        assert!(ix.set_name(&addr(2), "resolved.eth"));
+        assert!(!ix.set_name(&addr(2).into(), ""));
+        assert!(ix.set_name(&addr(2).into(), "resolved.eth"));
         assert_eq!(ix.config().watch[1].name, "resolved.eth");
         // Unknown address: no-op.
-        assert!(!ix.set_name(&addr(9), "nobody.eth"));
+        assert!(!ix.set_name(&addr(9).into(), "nobody.eth"));
     }
 
     #[test]
@@ -2536,7 +2822,7 @@ mod tests {
         assert_eq!(eff.watch[0].name, "preset name"); // push is authoritative
         assert_eq!(eff.watch[1], stored_extra); // imported entry survives
         // Topic conflict → None (caller replaces instead).
-        let restricted = vec![WatchEntry { address: addr(1), from_block: 100, topic0s: vec![topic(7)], name: String::new() }];
+        let restricted = vec![WatchEntry { key: WatchKey::Address(addr(1)), positions: vec![], from_block: 100, topic0s: vec![topic(7)], name: String::new() }];
         assert!(pushed.union_with(&restricted).is_none());
     }
 
@@ -2552,7 +2838,7 @@ mod tests {
         assert!(ix.adopt_config(eff));
         assert!(ix.config().enabled && ix.config().max_speed);
         assert_eq!(ix.config().watch[0].from_block, 150);
-        assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((500, 500)));
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((500, 500)));
         assert_eq!(ix.log_count(), 1);
         // A new address is NOT adoptable (needs a re-index), and the failed
         // attempt leaves everything untouched.
@@ -2561,7 +2847,7 @@ mod tests {
         assert_eq!(ix.config().watch.len(), 2);
         // A changed topic set is NOT adoptable either.
         let retopiced = config(vec![
-            WatchEntry { address: addr(1), from_block: 200, topic0s: vec![topic(9)], name: String::new() },
+            WatchEntry { key: WatchKey::Address(addr(1)), positions: vec![], from_block: 200, topic0s: vec![topic(9)], name: String::new() },
             watch_all(addr(2), 150),
         ]);
         assert!(!ix.adopt_config(retopiced));
@@ -2580,16 +2866,16 @@ mod tests {
         let before = ix.config().fingerprint();
         assert_eq!(ix.log_count(), 4);
 
-        assert_eq!(ix.unwatch(&[addr(1)]), 1);
+        assert_eq!(ix.unwatch(&[addr(1).into()]), 1);
 
         // The entry and its coverage are gone, so a query for it is refused as
         // unwatched rather than answered from an index that no longer follows it.
-        assert!(!ix.watches_address(&addr(1)));
-        assert_eq!(ix.coverage_of(&addr(1)), None);
+        assert!(!ix.watches_key(&addr(1).into()));
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(1))), None);
         assert_eq!(ix.query(&filter(100, 200, addr(1))), Err(QueryError::UnwatchedAddress(addr(1))));
         // The other entry lost nothing: same span, same logs.
         assert_eq!(ix.config().watch, vec![watch_all(addr(2), 100)]);
-        assert_eq!(ix.coverage_of(&addr(2)).unwrap().span, Some((100, 200)));
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(2))).unwrap().span, Some((100, 200)));
         let kept = ix.query(&filter(100, 200, addr(2))).unwrap();
         assert_eq!(kept.iter().map(|l| (l.block_number, l.log_index)).collect::<Vec<_>>(), vec![(120, 1), (200, 0)]);
         assert_eq!(ix.log_count(), 2, "only the unwatched address's logs were dropped");
@@ -2604,7 +2890,7 @@ mod tests {
 
         // Idempotent: unknown addresses are ignored and change nothing.
         let fp = ix.config().fingerprint();
-        assert_eq!(ix.unwatch(&[addr(1), addr(9)]), 0);
+        assert_eq!(ix.unwatch(&[addr(1).into(), addr(9).into()]), 0);
         assert_eq!(ix.config().fingerprint(), fp);
         assert_eq!(ix.log_count(), 2);
     }
@@ -2620,14 +2906,14 @@ mod tests {
 
         let mut ix = build();
         assert_eq!(ix.walk_target(), Some(50));
-        assert_eq!(ix.unwatch(&[addr(1)]), 1);
+        assert_eq!(ix.unwatch(&[addr(1).into()]), 1);
         assert!(ix.backfill_complete(), "the only incomplete entry left — nothing more to walk");
         assert_eq!(ix.cursor.map(|(n, _)| n), Some(120), "the trust edge is still usable");
         ix.append_block(201, [7; 32], vec![]).expect("head-follow continues");
-        assert_eq!(ix.coverage_of(&addr(2)).unwrap().span, Some((150, 201)));
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(2))).unwrap().span, Some((150, 201)));
 
         let mut ix = build();
-        assert_eq!(ix.unwatch(&[addr(2)]), 1);
+        assert_eq!(ix.unwatch(&[addr(2).into()]), 1);
         assert_eq!(ix.walk_target(), Some(50));
         assert_eq!(ix.cursor.map(|(n, _)| n), Some(120));
         assert_catch_up_completes(&mut ix);
@@ -2640,19 +2926,19 @@ mod tests {
         // nothing.
         let mut ix =
             span_ix(config(vec![watch_all(addr(1), 100), watch_all(addr(2), 500)]), 150, 200, vec![]);
-        assert_eq!(ix.unwatch(&[addr(1)]), 1);
+        assert_eq!(ix.unwatch(&[addr(1).into()]), 1);
         assert_eq!(ix.cursor, None);
         assert_eq!(ix.append_edge(), None);
         assert_eq!(ix.log_count(), 0);
         // The appender starts over at the head and re-seeds the trust edge.
         ix.append_block(600, [6; 32], vec![log(600, 0, addr(2), vec![])]).unwrap();
         assert_eq!(ix.cursor, Some((600, [6; 32])));
-        assert_eq!(ix.coverage_of(&addr(2)).unwrap().span, Some((600, 600)));
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(2))).unwrap().span, Some((600, 600)));
 
         // Unwatching everything leaves a valid, empty index — one the appender
         // has nothing to follow the head for, enabled or not.
         assert!(ix.follows_head());
-        assert_eq!(ix.unwatch(&[addr(2)]), 1);
+        assert_eq!(ix.unwatch(&[addr(2).into()]), 1);
         assert!(ix.config().watch.is_empty());
         assert_eq!(ix.log_count(), 0);
         assert_eq!(ix.cursor, None);
@@ -2684,7 +2970,7 @@ mod tests {
         }
         for (w, c) in ix.coverage_entries() {
             let (low, _) = c.span.unwrap_or_else(|| {
-                panic!("entry 0x{:02x}.. never covered", w.address[0])
+                panic!("entry 0x{:02x}.. never covered", w.key.address().unwrap()[0])
             });
             assert!(low <= w.from_block, "entry incomplete: low {low} > from {}", w.from_block);
         }
@@ -2712,10 +2998,10 @@ mod tests {
         let b = span_ix(config(vec![watch_all(addr(2), 400)]), 400, 500, vec![log(450, 0, addr(2), vec![])]);
         let (t, m) = LogIndex::merge(vec![(tag(), a), (tag(), b)]).unwrap();
         assert_eq!(t, tag());
-        assert_eq!(m.coverage_of(&addr(1)).unwrap().span, Some((100, 300)));
+        assert_eq!(m.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((100, 300)));
         // B's span lies entirely above H=300 → dormant, its log dropped
         // (unreachable by the coverage-honest query anyway).
-        assert_eq!(m.coverage_of(&addr(2)).unwrap().span, None);
+        assert_eq!(m.coverage_of(&WatchKey::Address(addr(2))).unwrap().span, None);
         assert_eq!(m.log_count(), 1);
         // Config is the union; runtime bits are the installer's.
         assert_eq!(m.config().watch.len(), 2);
@@ -2751,9 +3037,9 @@ mod tests {
         let complete = span_ix(config(vec![watch_all(addr(1), 100)]), 100, 150, vec![]);
         let incomplete = span_ix(config(vec![watch_all(addr(2), 100)]), 120, 150, vec![]);
         let (_, merged) = LogIndex::merge(vec![(tag(), complete), (tag(), incomplete)]).unwrap();
-        assert_eq!(merged.coverage_of(&addr(1)).unwrap().span, Some((100, 150)), "sanity: A complete");
+        assert_eq!(merged.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((100, 150)), "sanity: A complete");
         assert_eq!(
-            merged.coverage_of(&addr(2)).unwrap().span,
+            merged.coverage_of(&WatchKey::Address(addr(2))).unwrap().span,
             Some((120, 150)),
             "sanity: B still short of its own from_block"
         );
@@ -2769,7 +3055,7 @@ mod tests {
         let b = span_ix(config(vec![watch_all(addr(1), 50)]), 150, 260, vec![log(250, 0, addr(1), vec![])]);
         let (_, mut m) = LogIndex::merge(vec![(tag(), a), (tag(), b)]).unwrap();
         // H = min(200, 260) = 200; spans [50,200] ∪ [150,200] = [50,200].
-        assert_eq!(m.coverage_of(&addr(1)).unwrap().span, Some((50, 200)));
+        assert_eq!(m.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((50, 200)));
         // B's log at 250 is above the merged span → dropped; A's at 60 kept.
         assert_eq!(m.log_count(), 1);
         m.set_enabled(true); // the installer's decision, made here for the query
@@ -2784,7 +3070,7 @@ mod tests {
         let a = span_ix(config(vec![watch_all(addr(1), 50)]), 50, 120, vec![log(70, 0, addr(1), vec![])]);
         let b = span_ix(config(vec![watch_all(addr(1), 50)]), 300, 400, vec![log(350, 0, addr(1), vec![])]);
         let (_, mut m) = LogIndex::merge(vec![(tag(), a), (tag(), b)]).unwrap();
-        assert_eq!(m.coverage_of(&addr(1)).unwrap().span, Some((50, 120)));
+        assert_eq!(m.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((50, 120)));
         assert_eq!(m.log_count(), 1);
         m.set_enabled(true); // the installer's decision, made here for the query
         assert!(matches!(m.query(&filter(300, 400, addr(1))), Err(QueryError::OutOfCoverage { .. })));
@@ -2804,14 +3090,14 @@ mod tests {
         // includes what it indexed — refuse, never widen.
         let all = span_ix(config(vec![watch_all(addr(1), 50)]), 50, 100, vec![]);
         let restricted = span_ix(
-            config(vec![WatchEntry { address: addr(1), from_block: 50, topic0s: vec![topic(7)], name: String::new() }]),
+            config(vec![WatchEntry { key: WatchKey::Address(addr(1)), positions: vec![], from_block: 50, topic0s: vec![topic(7)], name: String::new() }]),
             50,
             100,
             vec![],
         );
         assert!(matches!(
             LogIndex::merge(vec![(tag(), all), (tag(), restricted)]),
-            Err(MergeError::TopicConflict(a)) if a == addr(1)
+            Err(MergeError::TopicConflict(a)) if a == addr(1).into()
         ));
     }
 
@@ -2834,7 +3120,7 @@ mod tests {
         let fresh = span_ix(config(vec![watch_all(addr(1), 100)]), 100, 500, vec![log(450, 0, addr(1), vec![])]);
         let stale = span_ix(config(vec![watch_all(addr(1), 100)]), 100, 300, vec![]);
         let (_, m) = LogIndex::merge(vec![(tag(), stale), (tag(), fresh)]).unwrap();
-        assert_eq!(m.coverage_of(&addr(1)).unwrap().span, Some((100, 500)));
+        assert_eq!(m.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((100, 500)));
         assert_eq!(m.log_count(), 1);
     }
 
@@ -2865,7 +3151,7 @@ mod tests {
         let (_, mut m) = LogIndex::merge(vec![(tag(), config_only), (tag(), covered)]).unwrap();
         assert_eq!(m.cursor, None, "no cursor can reach the new entry's hole");
         // Coverage survived the union.
-        assert_eq!(m.coverage_of(&addr(1)).unwrap().span, Some((50, 300)));
+        assert_eq!(m.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((50, 300)));
         assert_catch_up_completes(&mut m);
     }
 
@@ -2885,11 +3171,11 @@ mod tests {
             vec![],
         );
         assert_eq!(ix.cursor.map(|(n, _)| n), Some(150));
-        assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((200, 300)));
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((200, 300)));
         let lowered = config(vec![watch_all(addr(1), 50), watch_all(addr(2), 100)]);
         assert!(ix.adopt_config(lowered));
         assert_eq!(ix.cursor, None, "X1's hole [50,200) sits above the old cursor");
-        assert_eq!(ix.coverage_of(&addr(1)).unwrap().span, Some((200, 300)), "coverage kept");
+        assert_eq!(ix.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((200, 300)), "coverage kept");
         assert_catch_up_completes(&mut ix);
         // Mid-descent lowering (span low == cursor) keeps the cursor: the
         // walk just runs deeper.
@@ -2943,7 +3229,7 @@ mod tests {
                 if let Some((low, high)) = c.span {
                     for b in low..=high {
                         let covered_somewhere = originals.iter().any(|s| {
-                            s.coverage_of(&w.address).is_some_and(|sc| sc.contains(b, b))
+                            s.coverage_of(&w.key).is_some_and(|sc| sc.contains(b, b))
                         });
                         assert!(covered_somewhere, "merged claims block {b} for an address no source covered");
                     }
@@ -2972,8 +3258,299 @@ mod tests {
         let reordered = config(vec![w2, w1]);
         assert_eq!(reordered.fingerprint(), ix.config().fingerprint());
         let back = LogIndex::deserialize(&reordered, &tag(), &bytes).unwrap();
-        assert_eq!(back.coverage_of(&addr(1)).unwrap().span, Some((200, 210)));
-        assert_eq!(back.coverage_of(&addr(2)).unwrap().span, None);
+        assert_eq!(back.coverage_of(&WatchKey::Address(addr(1))).unwrap().span, Some((200, 210)));
+        assert_eq!(back.coverage_of(&WatchKey::Address(addr(2))).unwrap().span, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Topic entries (#673): a topic value, any emitter.
+    // -----------------------------------------------------------------------
+
+    /// The wallet the topic tests watch, as the 32-byte topic it appears as.
+    const WALLET: [u8; 32] = {
+        let mut t = [0u8; 32];
+        let mut i = 12;
+        while i < 32 {
+            t[i] = 0x77;
+            i += 1;
+        }
+        t
+    };
+    const TRANSFER: [u8; 32] = [0xdd; 32];
+
+    fn watch_topic(value: [u8; 32], positions: &[u8], from: u64) -> WatchEntry {
+        WatchEntry {
+            key: WatchKey::Topic(value),
+            from_block: from,
+            topic0s: vec![],
+            positions: positions.to_vec(),
+            name: String::new(),
+        }
+    }
+
+    fn pinned(from: u64, to: u64, addresses: Vec<[u8; 20]>, topics: Vec<Option<[u8; 32]>>) -> LogFilter {
+        LogFilter {
+            from_block: from,
+            to_block: to,
+            addresses,
+            topics: topics.into_iter().map(|t| t.into_iter().collect()).collect(),
+        }
+    }
+
+    /// One block of the wallet's token history: a transfer out (wallet at
+    /// topic1, token A), a transfer in (topic2, token B), an ERC-1155-style
+    /// log with the wallet at topic3, and a log about someone else.
+    fn wallet_block(bn: u64) -> Vec<StoredLog> {
+        vec![
+            log(bn, 0, addr(0xa1), vec![TRANSFER, WALLET, topic(0x01)]),
+            log(bn, 1, addr(0xb2), vec![TRANSFER, topic(0x02), WALLET]),
+            log(bn, 2, addr(0xc3), vec![topic(0x33), topic(0x03), topic(0x04), WALLET]),
+            log(bn, 3, addr(0xa1), vec![TRANSFER, topic(0x05), topic(0x06)]),
+        ]
+    }
+
+    #[test]
+    fn a_topic_entry_stores_logs_from_any_emitter_at_its_positions_only() {
+        let mut ix = LogIndex::new(config_ok(vec![watch_topic(WALLET, &[1, 2], 100)])).unwrap();
+        ix.append_block(100, [0xbb; 32], wallet_block(100)).unwrap();
+        // Two emitters, the value at topic1 and at topic2. Not the log with
+        // the value at topic3 (position not watched), not the stranger's.
+        assert_eq!(ix.log_count(), 2);
+        let out = ix.query(&pinned(100, 100, vec![], vec![None, Some(WALLET)])).unwrap();
+        assert_eq!(out.iter().map(|l| l.address).collect::<Vec<_>>(), vec![addr(0xa1)]);
+        let inbound = ix.query(&pinned(100, 100, vec![], vec![Some(TRANSFER), None, Some(WALLET)])).unwrap();
+        assert_eq!(inbound.iter().map(|l| l.address).collect::<Vec<_>>(), vec![addr(0xb2)]);
+        // An address list narrows the answer and needs no address entry:
+        // every log the filter can match carries the value at topic2.
+        let from_b = ix.query(&pinned(100, 100, vec![addr(0xb2), addr(0xee)], vec![None, None, Some(WALLET)])).unwrap();
+        assert_eq!(from_b.len(), 1);
+        assert!(ix.query(&pinned(100, 100, vec![addr(0xa1)], vec![None, None, Some(WALLET)])).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_topic_entry_refuses_what_its_store_cannot_answer() {
+        let key = WatchKey::Topic(WALLET);
+        let mut ix = LogIndex::new(config_ok(vec![watch_topic(WALLET, &[1, 2], 100)])).unwrap();
+        ix.append_block(100, [0xbb; 32], wallet_block(100)).unwrap();
+        // Pinned at a position the entry does not watch.
+        assert_eq!(
+            ix.query(&pinned(100, 100, vec![], vec![None, None, None, Some(WALLET)])),
+            Err(QueryError::UnindexedTopic(key))
+        );
+        // Not pinned: an OR-list with another value could match logs nobody
+        // stored, and so could a wildcard.
+        let or_list = LogFilter {
+            from_block: 100,
+            to_block: 100,
+            addresses: vec![],
+            topics: vec![vec![], vec![WALLET, topic(0x05)]],
+        };
+        assert_eq!(ix.query(&or_list), Err(QueryError::UnwatchedTopic));
+        assert_eq!(ix.query(&pinned(100, 100, vec![], vec![Some(TRANSFER)])), Err(QueryError::UnwatchedTopic));
+        // A value nobody watches, with an address nobody watches either.
+        assert_eq!(
+            ix.query(&pinned(100, 100, vec![addr(0xa1)], vec![None, Some(topic(0x05))])),
+            Err(QueryError::UnwatchedAddress(addr(0xa1)))
+        );
+        // Outside coverage: the honest refusal, never `[]` — and it wins over
+        // the address path's refusal, since waiting it out will answer.
+        match ix.query(&pinned(100, 101, vec![addr(0xa1)], vec![None, Some(WALLET)])) {
+            Err(QueryError::OutOfCoverage { key: k, covered }) => {
+                assert_eq!(k, key);
+                assert_eq!(covered.span, Some((100, 100)));
+            }
+            other => panic!("expected OutOfCoverage, got {other:?}"),
+        }
+        // Below from_block the entry asserts nothing exists: answerable.
+        assert_eq!(ix.query(&pinned(0, 100, vec![], vec![None, Some(WALLET)])).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_topic_entrys_topic0_restriction_applies_to_storage_and_queries() {
+        let mut w = watch_topic(WALLET, &[1, 2], 0);
+        w.topic0s = vec![TRANSFER];
+        let mut ix = LogIndex::new(config_ok(vec![w])).unwrap();
+        let mut logs = wallet_block(5);
+        logs.push(log(5, 4, addr(0xa1), vec![topic(0x44), WALLET])); // an Approval-like log
+        ix.append_block(5, [0xbb; 32], logs).unwrap();
+        assert_eq!(ix.log_count(), 2, "only the Transfer logs");
+        assert_eq!(ix.query(&pinned(5, 5, vec![], vec![Some(TRANSFER), Some(WALLET)])).unwrap().len(), 1);
+        assert_eq!(
+            ix.query(&pinned(5, 5, vec![], vec![None, Some(WALLET)])),
+            Err(QueryError::UnindexedTopic(WatchKey::Topic(WALLET)))
+        );
+    }
+
+    #[test]
+    fn an_address_entry_and_a_topic_entry_share_one_store() {
+        // Token A watched as a contract, the wallet watched as a topic: the
+        // wallet's transfer on A is both entries' log, stored once.
+        let mut ix =
+            LogIndex::new(config_ok(vec![watch_all(addr(0xa1), 0), watch_topic(WALLET, &[1, 2, 3], 0)])).unwrap();
+        ix.append_block(7, [0xbb; 32], wallet_block(7)).unwrap();
+        // A's two logs + the wallet's three, one of them shared.
+        assert_eq!(ix.log_count(), 4);
+        assert_eq!(ix.query(&filter(7, 7, addr(0xa1))).unwrap().len(), 2);
+        // Dropping the topic entry keeps the shared log (A still selects it)
+        // and drops the two only the wallet's entry selected.
+        assert_eq!(ix.unwatch(&[WatchKey::Topic(WALLET)]), 1);
+        assert_eq!(ix.log_count(), 2);
+        assert_eq!(ix.query(&filter(7, 7, addr(0xa1))).unwrap().len(), 2);
+        assert_eq!(ix.query(&pinned(7, 7, vec![], vec![None, Some(WALLET)])), Err(QueryError::UnwatchedTopic));
+    }
+
+    #[test]
+    fn an_unwatch_keeps_a_shared_log_only_where_a_survivor_covers_it() {
+        // The wallet's entry covers 100..=200; token A's entry, added later,
+        // covers only 150..=200 although it selects from block 0. A's
+        // transfer at 120 was stored for the wallet: once the wallet goes, no
+        // entry covers it, so it goes too — the rule merge keeps logs by.
+        let mut ix = LogIndex::new(config_ok(vec![watch_topic(WALLET, &[1, 2], 100)])).unwrap();
+        for b in 100..=200 {
+            let logs = if b == 120 || b == 180 { wallet_block(b) } else { vec![] };
+            ix.append_block(b, [0xbb; 32], logs).unwrap();
+        }
+        ix.config.watch.push(watch_all(addr(0xa1), 0));
+        ix.coverage.push(Coverage { span: Some((150, 200)) });
+        assert_eq!(ix.log_count(), 4);
+        assert_eq!(ix.unwatch(&[WatchKey::Topic(WALLET)]), 1);
+        let left: Vec<(u64, u32)> = ix.logs.keys().copied().collect();
+        assert_eq!(left, vec![(180, 0)], "only A's covered transfer stays");
+    }
+
+    #[test]
+    fn a_topic_entry_bloom_probes_for_its_value() {
+        let ix = LogIndex::new(config_ok(vec![watch_topic(WALLET, &[2], 10)])).unwrap();
+        let mut hit: myotis_core::bloom::LogsBloom = [0; 256];
+        myotis_core::bloom::accrue(&mut hit, &WALLET);
+        assert!(ix.bloom_may_match(10, &hit));
+        assert!(!ix.bloom_may_match(9, &hit), "below from_block");
+        // The address the value pads is a different bloom item.
+        let mut padded_address: myotis_core::bloom::LogsBloom = [0; 256];
+        myotis_core::bloom::accrue(&mut padded_address, &WALLET[12..]);
+        assert!(!ix.bloom_may_match(10, &padded_address));
+        // And the receipts-side rule agrees with the store.
+        assert!(ix.config().watches_parts(10, &addr(1), &[TRANSFER, topic(1), WALLET]));
+        assert!(!ix.config().watches_parts(10, &addr(1), &[TRANSFER, WALLET, topic(1)]));
+    }
+
+    #[test]
+    fn topic_positions_are_validated() {
+        let bad = |positions: &[u8]| config(vec![watch_topic(WALLET, positions, 0)]).invalid();
+        let key = WatchKey::Topic(WALLET);
+        for p in [&[][..], &[0], &[4], &[2, 1], &[1, 1]] {
+            assert_eq!(bad(p), Some(InvalidWatchList::BadPositions(key)), "positions {p:?}");
+        }
+        assert_eq!(bad(&[1, 2, 3]), None);
+        let mut address_with_positions = watch_all(addr(1), 0);
+        address_with_positions.positions = vec![1];
+        assert!(matches!(
+            LogIndex::new(config(vec![address_with_positions])),
+            Err(InvalidWatchList::BadPositions(WatchKey::Address(_)))
+        ));
+        // A topic entry and an address entry never collide, even when the
+        // value is the address left-padded.
+        let mut padded = [0u8; 32];
+        padded[12..].copy_from_slice(&addr(1));
+        assert_eq!(config(vec![watch_all(addr(1), 0), watch_topic(padded, &[1], 0)]).invalid(), None);
+        assert_eq!(
+            config(vec![watch_topic(WALLET, &[1], 0), watch_topic(WALLET, &[2], 5)]).invalid(),
+            Some(InvalidWatchList::Duplicate(key))
+        );
+    }
+
+    #[test]
+    fn an_address_only_fingerprint_is_unchanged_by_topic_entries() {
+        // The encoding every earlier build keyed its files and finality
+        // claims by: address, from_block, sorted topic0s per entry.
+        let cfg = config(vec![
+            WatchEntry { topic0s: vec![topic(9), topic(3)], ..watch_all(addr(2), 77) },
+            watch_all(addr(1), 5),
+        ]);
+        let mut encoded: Vec<Vec<u8>> = cfg
+            .watch
+            .iter()
+            .map(|w| {
+                let mut e = w.key.address().unwrap().to_vec();
+                e.extend_from_slice(&w.from_block.to_le_bytes());
+                let mut ts = w.topic0s.clone();
+                ts.sort_unstable();
+                ts.iter().for_each(|t| e.extend_from_slice(t));
+                e
+            })
+            .collect();
+        encoded.sort_unstable();
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for e in encoded {
+            for b in e.into_iter().chain([0xff]) {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        assert_eq!(cfg.fingerprint(), h);
+        // Positions are part of what a topic entry's span means.
+        assert_ne!(
+            config(vec![watch_topic(WALLET, &[1], 0)]).fingerprint(),
+            config(vec![watch_topic(WALLET, &[1, 2], 0)]).fingerprint()
+        );
+    }
+
+    #[test]
+    fn a_topic_entry_survives_the_snapshot_and_only_it_makes_a_v3_frame() {
+        let address_only = LogIndex::new(config_ok(vec![watch_all(addr(1), 0)])).unwrap();
+        assert_eq!(address_only.serialize(&tag())[4..8], VERSION.to_le_bytes(), "address-only stays v2");
+
+        let mut ix = LogIndex::new(config_ok(vec![
+            watch_all(addr(0xa1), 3),
+            WatchEntry { name: "me".into(), ..watch_topic(WALLET, &[1, 3], 0) },
+        ]))
+        .unwrap();
+        ix.append_block(4, [0xbb; 32], wallet_block(4)).unwrap();
+        let bytes = ix.serialize(&tag());
+        assert_eq!(bytes[4..8], VERSION_TOPICS.to_le_bytes());
+        assert!(SnapshotId::of_frame(&bytes).is_some(), "a v3 frame can carry a finality claim");
+
+        let (t, back) = LogIndex::deserialize_portable(&bytes).expect("v3 is importable");
+        assert_eq!(t, tag());
+        assert_eq!(back.config.watch, ix.config.watch);
+        assert_eq!(back.coverage, ix.coverage);
+        assert_eq!(back.logs, ix.logs);
+        // The config-keyed load reads it too (a node's own checkpoint).
+        let own = LogIndex::deserialize(ix.config(), &tag(), &bytes).expect("v3 loads for its config");
+        assert_eq!(own.log_count(), ix.log_count());
+        // A frame whose topic entry carries invalid positions is refused.
+        let mut corrupt = ix;
+        corrupt.config.watch[1].positions = vec![0];
+        assert!(LogIndex::deserialize_portable(&corrupt.serialize(&tag())).is_none());
+    }
+
+    #[test]
+    fn merging_topic_entries_follows_the_address_rules() {
+        let a = {
+            let mut ix = LogIndex::new(config_ok(vec![watch_topic(WALLET, &[1, 2], 0)])).unwrap();
+            ix.append_block(10, [0xbb; 32], wallet_block(10)).unwrap();
+            ix
+        };
+        // Same value under other positions: different spans, a conflict.
+        let other = LogIndex::new(config_ok(vec![watch_topic(WALLET, &[1], 0)])).unwrap();
+        assert_eq!(
+            LogIndex::merge(vec![(tag(), a), (tag(), other)]).err(),
+            Some(MergeError::TopicConflict(WatchKey::Topic(WALLET)))
+        );
+        let a = {
+            let mut ix = LogIndex::new(config_ok(vec![watch_topic(WALLET, &[1, 2], 0)])).unwrap();
+            ix.append_block(10, [0xbb; 32], wallet_block(10)).unwrap();
+            ix
+        };
+        // A config-only source adding an address entry: the wallet's logs
+        // survive under its own entry's span.
+        let b = LogIndex::new(config_ok(vec![watch_all(addr(0xa1), 0)])).unwrap();
+        let (_, merged) = LogIndex::merge(vec![(tag(), a), (tag(), b)]).unwrap();
+        assert_eq!(merged.coverage_of(&WatchKey::Topic(WALLET)).unwrap().span, Some((10, 10)));
+        assert_eq!(merged.log_count(), 2);
+        // And the union refuses a positions mismatch the same way.
+        let pushed = config(vec![watch_topic(WALLET, &[2], 0)]);
+        assert_eq!(pushed.union_with(&merged.config.watch), None);
     }
 }
 
@@ -2987,7 +3564,7 @@ mod bloom_match_tests {
         fn addr(b: u8) -> [u8; 20] {
             [b; 20]
         }
-        let watch = WatchEntry { address: addr(1), from_block: 100, topic0s: vec![[7; 32]], name: String::new() };
+        let watch = WatchEntry { key: WatchKey::Address(addr(1)), positions: vec![], from_block: 100, topic0s: vec![[7; 32]], name: String::new() };
         let ix = LogIndex::new(LogIndexConfig { enabled: true, max_speed: false, backfill_paused: false, watch: vec![watch] }).unwrap();
         let mut hit = EMPTY_BLOOM;
         accrue(&mut hit, &addr(1));
@@ -3026,7 +3603,7 @@ mod finality_claim_tests {
     }
 
     fn index(high: u64) -> LogIndex {
-        let watch = WatchEntry { address: [1; 20], from_block: 0, topic0s: vec![], name: String::new() };
+        let watch = WatchEntry { key: WatchKey::Address([1; 20]), positions: vec![], from_block: 0, topic0s: vec![], name: String::new() };
         let mut ix = LogIndex::new(LogIndexConfig {
             enabled: true,
             max_speed: false,

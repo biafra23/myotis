@@ -11,6 +11,9 @@ object LogIndexStatus {
 
     /** One watch entry's parsed status. Coverage is null while nothing is indexed. */
     data class Entry(
+        /** The entry's key, lowercase: the contract address — or, for a
+         *  [topic] entry, the 32-byte topic value it watches. Either is what
+         *  a removal names under the config's `unwatch`. */
         val address: String,
         val fromBlock: Long,
         val coveredLow: Long?,
@@ -22,7 +25,17 @@ object LogIndexStatus {
          *  pushing it is a topic conflict — which makes the engine replace the
          *  WHOLE index. It can be shown and removed, never listed. */
         val restricted: Boolean = false,
-    )
+        /** A topic entry (engine ABI 48, #673): every log, from any emitter,
+         *  carrying the value [address] at one of [positions] (1–3) — a
+         *  wallet's own token transfers. Not a contract: the host's watch list
+         *  holds addresses only, so it can be shown and removed, never listed. */
+        val topic: Boolean = false,
+        val positions: List<Int> = emptyList(),
+    ) {
+        /** Whether the host's watch list can hold this entry: an address
+         *  entry indexed without a topic restriction. */
+        val listable: Boolean get() = !restricted && !topic
+    }
 
     data class Parsed(
         val enabled: Boolean,
@@ -72,19 +85,26 @@ object LogIndexStatus {
     fun parse(json: String): Parsed {
         val enabled = json.contains("\"enabled\":true")
         val logCount = Regex("\"logCount\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+        // An address entry, or a topic entry opening with its value and
+        // positions in the address's place; the rest of the shape is shared.
         val entries = Regex(
-            "\\{\"address\":\"(0x[0-9a-fA-F]{40})\",\"fromBlock\":(\\d+)" +
+            "\\{(?:\"address\":\"(0x[0-9a-fA-F]{40})\"" +
+                "|\"topic\":\"(0x[0-9a-fA-F]{64})\",\"positions\":\\[([0-9,]*)\\])" +
+                ",\"fromBlock\":(\\d+)" +
                 "(?:,\"name\":\"((?:[^\"\\\\]|\\\\.)*)\")?" +
                 "(?:,\"coveredLow\":(\\d+),\"coveredHigh\":(\\d+))?" +
                 "(,\"restricted\":true)?\\}"
         ).findAll(json).map { m ->
+            val topic = m.groupValues[2].isNotEmpty()
             Entry(
-                address = m.groupValues[1].lowercase(),
-                fromBlock = m.groupValues[2].toLongOrNull() ?: 0L,
-                coveredLow = m.groupValues[4].takeIf { it.isNotEmpty() }?.toLongOrNull(),
-                coveredHigh = m.groupValues[5].takeIf { it.isNotEmpty() }?.toLongOrNull(),
-                name = m.groupValues[3].takeIf { it.isNotEmpty() }?.let(::unescapeJson),
-                restricted = m.groupValues[6].isNotEmpty(),
+                address = (if (topic) m.groupValues[2] else m.groupValues[1]).lowercase(),
+                fromBlock = m.groupValues[4].toLongOrNull() ?: 0L,
+                coveredLow = m.groupValues[6].takeIf { it.isNotEmpty() }?.toLongOrNull(),
+                coveredHigh = m.groupValues[7].takeIf { it.isNotEmpty() }?.toLongOrNull(),
+                name = m.groupValues[5].takeIf { it.isNotEmpty() }?.let(::unescapeJson),
+                restricted = m.groupValues[8].isNotEmpty(),
+                topic = topic,
+                positions = m.groupValues[3].split(',').mapNotNull { it.toIntOrNull() },
             )
         }.toList()
         val backfillPaused = json.contains("\"backfillPaused\":true")
