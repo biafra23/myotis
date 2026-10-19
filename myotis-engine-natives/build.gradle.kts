@@ -40,7 +40,10 @@ val nativesDir: String? = providers.gradleProperty("engineNativesDir").orNull?.t
 
 // The host's platform, for the cargoBuildHost mode: the cross target when one is set
 // (the root build's own rule), else the JVM's OS and architecture in JNA's spelling.
-fun hostPlatform(followRustTarget: Boolean = true): HostNative {
+// Null for a host platforms.txt does not list (Windows, for now): it publishes no
+// natives, and the rest of the build is unaffected. A cross target that is not
+// listed is a mistake and fails.
+fun hostPlatform(followRustTarget: Boolean = true): HostNative? {
     val rustTarget = rootProject.extra["rustTargetTriple"] as String?
     if (followRustTarget && rustTarget != null) {
         return platforms.firstOrNull { it.rustTarget == rustTarget }
@@ -58,14 +61,13 @@ fun hostPlatform(followRustTarget: Boolean = true): HostNative {
         else -> "linux-$arch"
     }
     return platforms.firstOrNull { it.jnaPrefix == prefix }
-        ?: throw GradleException("this host ($prefix) is not in myotis-engine-natives/platforms.txt")
 }
 
-val published: List<HostNative> = if (nativesDir != null) platforms else listOf(hostPlatform())
+val published: List<HostNative> = if (nativesDir != null) platforms else listOfNotNull(hostPlatform())
 
 // The platform this JVM runs on, when platforms.txt has it: its jar is the one the
 // load test below can actually load (a cross-compiled one is not).
-val hostPlatformOrNull: HostNative? = runCatching { hostPlatform(followRustTarget = false) }.getOrNull()
+val hostPlatformOrNull: HostNative? = hostPlatform(followRustTarget = false)
 var hostJar: TaskProvider<Jar>? = null
 
 extensions.configure<PublishingExtension> {
@@ -114,7 +116,7 @@ extensions.configure<PublishingExtension> {
 // consumer of the two artifacts gets — must yield the Rust engine. Proves the path
 // inside the jar is the one JNA reads and that the library matches the bindings
 // (UniFFI's checksums and the ABI version run at load). Skipped where this host has
-// no jar (no cargo, or a host not in platforms.txt).
+// no jar (no cargo, or a host not in platforms.txt, or a cross-compile).
 dependencies {
     testImplementation(project(":myotis-engine-rust"))
     testImplementation(platform(libs.junit.bom))

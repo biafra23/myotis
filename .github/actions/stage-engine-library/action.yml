@@ -116,11 +116,19 @@ runs:
     # What a desktop consumer gets: the engine jar and this runner's natives jar
     # (linux-x86-64, from the staged set, not a local build) on the classpath and
     # no library path — the engine must load, with bindings and library agreeing.
+    # The staging step's -PpublishRelease flag too: without it the modules' version
+    # changes, their jars are rebuilt under it, and the tag's GitHub Packages publish
+    # would then build them a third time — other bytes than the staged ones.
     - name: Load the engine from the natives jar
       shell: bash
       env:
+        RELEASE_TAG: ${{ inputs.release-tag }}
         NATIVES_DIR: ${{ inputs.natives-dir }}
-      run: ./gradlew "-PengineNativesDir=$NATIVES_DIR" :myotis-engine-natives:test --stacktrace
+      run: |
+        set -u
+        flag="-PpublishRelease=${RELEASE_TAG#v}"
+        [ -n "$RELEASE_TAG" ] || flag="-PpublishRelease"
+        ./gradlew "$flag" "-PengineNativesDir=$NATIVES_DIR" :myotis-engine-natives:test --stacktrace
 
     # The maven-repo branch merge (scripts/merge_maven_repo.py) otherwise runs
     # only on a tag, after GitHub Packages and the release assets are final —
