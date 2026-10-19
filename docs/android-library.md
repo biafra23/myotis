@@ -18,6 +18,7 @@ page describes what a consumer gets today.
 | `eth.myotis:myotis-engine:<version>` | the root: Gradle module metadata that picks `-android` for an Android consumer and `-jvm` for a desktop one |
 | `eth.myotis:myotis-engine-android:<version>` | the AAR: the Kotlin entry point, `libmyotis_engine.so` + `libmyotis_bls.so` for `arm64-v8a` and `x86_64`, JNA's `libjnidispatch.so` beside them |
 | `eth.myotis:myotis-engine-jvm:<version>` | the desktop jar (the host library is not inside it — see *Desktop* below) |
+| `eth.myotis:myotis-engine-natives-<platform>:<version>` | the host library for one desktop platform (`darwin-aarch64`, `darwin-x86-64`, `linux-x86-64`, `linux-aarch64`): `<platform>/libmyotis_engine.{dylib,so}` in a plain jar, where JNA finds it on the classpath — see *Desktop* |
 | `eth.myotis:myotis-api` | the contract (`MyotisEngine`, `ChainHandle`, `VerifiedReads`, the ports) — one of the AAR's two `api` dependencies, so it is on the consumer's compile classpath |
 | `eth.myotis:myotis-engine-ports` | the default port actuals (`io.myotis.engine.ports`: the node-key file, the file-backed peer caches, the CCIP-Read gateway, the per-network file layout) — the AAR's second `api` dependency, see *Using it* |
 | `eth.myotis:myotis-engine-rust`, `myotis-engine-common`, `myotis-rpc-policy` | implementation dependencies the POMs pull in; a consumer never names them. Nothing from the Java engine, and no Tuweni or BouncyCastle: the engine library's whole third-party graph is JNA, slf4j and minimal-json |
@@ -184,10 +185,35 @@ docs/privacy-and-tor.md).
 ## Desktop
 
 `eth.myotis:myotis-engine-jvm` is the same entry point for a JVM host. The jar
-does not contain the host library: JNA loads `libmyotis_engine.{so,dylib,dll}`
-from `java.library.path`, built with `cargo build --release -p myotis-engine`
-in `rust/` (the Myotis desktop app bundles it the same way). No release asset
-carries the host libraries yet.
+does not contain the host library, which is built per OS and architecture;
+`eth.myotis:myotis-engine-natives-<platform>` carries it, one artifact per
+platform in `myotis-engine-natives/platforms.txt`. Put the one for the host on
+the runtime classpath, at the same version as the engine:
+
+```kotlin
+dependencies {
+    implementation("eth.myotis:myotis-engine:0.1.16")
+    runtimeOnly("eth.myotis:myotis-engine-natives-darwin-aarch64:0.1.16") // the host's platform
+}
+```
+
+JNA then loads `libmyotis_engine` from the jar's `<platform>/` entry (it
+extracts it to a temporary file first) whenever `jna.library.path` has none,
+so nothing has to be set; a library found on that path, or named by
+`-Dmyotis.engine.lib=<file>`, still wins, which is how a development build is
+tried. A library from another version is refused at load (the ABI version and
+UniFFI's checksums), and `Myotis.isAvailable()` says false. The artifacts are
+built on one runner per platform from the tag's tree: macOS 14 for both Mac
+architectures, Ubuntu 22.04 for Linux (so glibc 2.35 or newer). A signed and
+notarized macOS app with the hardened runtime may refuse a library extracted
+at run time; such an app ships the library inside its bundle, signed with it,
+as the Myotis desktop app does (`appResources`), and points
+`jna.library.path` there. Windows has no artifact yet.
+
+Building the host library yourself: `./gradlew cargoBuildHost` (or
+`cargo build --release --workspace` in `rust/`) and `-Djava.library.path=`
+`rust/target/release`; `./gradlew :myotis-engine-natives:publishToMavenLocal`
+publishes it as this host's natives artifact.
 
 ## How it is published
 
@@ -197,7 +223,9 @@ change the publication it stages the set into a local Maven repository
 `build/maven-repo`; the flag drops `-SNAPSHOT`, so what is staged is laid out
 as a release) and checks it with `scripts/check_engine_library.sh`: every
 artifact present at one version, the AAR complete for every shipped ABI, the
-JNA pin in both halves' POM and module metadata. On a `v*` tag — after the
+JNA pin in both halves' POM and module metadata, a natives jar of the right
+architecture for every platform (built first, one runner per platform), and
+that the engine loads from the Linux x64 one with no library path. On a `v*` tag — after the
 release version guard — the same build is checked again, published to GitHub
 Packages, merged into the `maven-repo` branch (`scripts/merge_maven_repo.py`)
 and attached to the release. A GitHub Packages version cannot be
