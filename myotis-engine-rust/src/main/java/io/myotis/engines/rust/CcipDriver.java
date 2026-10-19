@@ -25,15 +25,21 @@ import java.util.regex.Pattern;
  * {@code {"sender":"0x..","data":"0x.."}}; the response's {@code data} field is
  * extracted with a lenient regex, not a JSON parser; response data containing
  * the {@code HttpError} selector {@code 0xca7a4e75} at any offset counts as
- * that gateway failing; ONE round only ({@code MAX_RECURSION_DEPTH = 1}) — a
- * second OffchainLookup from the callback is an error.
+ * that gateway failing; ONE round per resolution step
+ * ({@code MAX_RECURSION_DEPTH = 1}) — a second OffchainLookup from a step's own
+ * callback is an error.
  *
- * <p>Documented divergence from the Java engine: Java's per-callView depth
- * counter lets an OFFCHAIN reverse record be forward-verified by an OFFCHAIN
- * forward resolver (two independent gateway rounds). Here the forward-verify's
- * OffchainLookup surfaces as a second offchain envelope and hits the cap — a
- * rare Basenames-style setup reports the cap error instead of chaining;
- * chained CCIP is a possible later refinement.
+ * <p>A reverse lookup has two steps, each a call of its own on the Java engine
+ * (its depth counter is per callView): reading the claimed name, and
+ * forward-verifying it. Either may resolve off chain. An envelope whose round
+ * is the FORWARD check carries {@code reverseClaim} (ABI 48), which this
+ * driver echoes into the callback so the native side reads the answer as the
+ * claimed name's address rather than as a claim — without it, an on-chain
+ * claim with an off-chain forward record (a {@code *.cb.id} primary name)
+ * decoded the address as a name and reported no primary name. The forward
+ * check gets a round of its own, so an off-chain claim forward-verified off
+ * chain takes two rounds, as on the Java engine; it is entered once, and a
+ * further OffchainLookup in it hits the cap.
  *
  * <p>Failures throw {@link EngineException}; {@link RustEnsApi} folds them into
  * the result's error field (it never throws).
@@ -59,7 +65,11 @@ final class CcipDriver {
      */
     static String drive(JsonObject originalParams, String json, HttpGateway gateway,
             UnaryOperator<String> nativeCall) {
-        for (int round = 0; ; round++) {
+        // Rounds driven in the current step; the forward check of a reverse
+        // claim is a step of its own, entered at most once.
+        int round = 0;
+        boolean forwardCheck = false;
+        while (true) {
             JsonValue parsed;
             try {
                 parsed = Json.parse(json);
@@ -83,6 +93,14 @@ final class CcipDriver {
                 throw new EngineException(
                         "name resolves offchain (ERC-3668) and no CCIP-Read HTTP gateway"
                         + " is configured on this host");
+            }
+            // Echoed, never dropped: without it the callback reads the forward
+            // check's answer as the claim.
+            String reverseClaim = o.get("reverseClaim") == null ? null
+                    : requireString(o, "reverseClaim");
+            if (reverseClaim != null && !forwardCheck) {
+                forwardCheck = true;
+                round = 0;
             }
             if (round >= MAX_ROUNDS) {
                 // Java parity message shape (CcipReadEvmExecutor's cap).
@@ -118,6 +136,10 @@ final class CcipDriver {
             // The callback must run against the same root kind the offchain
             // attempt did (verified == finalized in the record envelope).
             cb.add("finalized", o.getBoolean("verified", false));
+            if (reverseClaim != null) {
+                cb.add("reverseClaim", reverseClaim);
+            }
+            round++;
             json = nativeCall.apply(cb.toString());
         }
     }
