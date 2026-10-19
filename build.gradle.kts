@@ -302,6 +302,9 @@ subprojects {
 // module its POMs reach: a consumer resolving the AAR needs them from the same
 // repository. That closure is exactly the Rust-engine half of the tree, none of
 // the Java engine (node-core, networking, consensus, Besu) and no Ktor server.
+// Beside it, `:myotis-engine-natives` publishes the engine's desktop host library,
+// one artifact per OS and architecture (its build file), which no POM reaches: a
+// desktop consumer names the one for its platform.
 // Coordinates: `eth.myotis:<artifactId>` — myotis.eth is the project's ENS name
 // and the one namespace the owner controls (myotis.io is not theirs, so the Java
 // packages' io.myotis stays a package prefix and never becomes the Maven group);
@@ -353,6 +356,9 @@ val publishedArtifactIds = mapOf(
     "myotis-rpc-policy" to "myotis-rpc-policy",
     "myotis-engine-rust" to "myotis-engine-rust",
     "myotis-engine" to "myotis-engine",
+    // One artifact per desktop platform (myotis-engine-natives-<jna-prefix>); the
+    // module names its publications itself (myotis-engine-natives/build.gradle.kts).
+    "myotis-engine-natives" to "myotis-engine-natives",
 )
 val publishedDescriptions = mapOf(
     "myotis-api" to "The Myotis engine contract: the zero-dependency Java 17 interfaces every host consumes",
@@ -361,6 +367,7 @@ val publishedDescriptions = mapOf(
     "myotis-rpc-policy" to "The JSON-RPC serving policy (block window, web-page access) with no server attached",
     "myotis-engine-rust" to "The Myotis Rust engine behind the engine contract, over UniFFI bindings and JNA",
     "myotis-engine" to "The Myotis engine library: the Rust light-client engine for Android (AAR) and desktop JVM (jar)",
+    "myotis-engine-natives" to "The Myotis Rust engine's host library for one desktop platform, at JNA's classpath path",
 )
 val publishedVersion: String? = providers.gradleProperty("publishRelease").orNull?.let { requested ->
     if (requested.isEmpty()) {
@@ -386,7 +393,7 @@ configure(subprojects.filter { it.name in publishedArtifactIds }) {
     // modules need theirs created. `java` is applied by the
     // subprojects block above, so the component exists here; `java-library` in
     // the module's own script extends the same component with `api`.
-    if (name !in setOf("myotis-rpc-policy", "myotis-engine")) {
+    if (name !in setOf("myotis-rpc-policy", "myotis-engine", "myotis-engine-natives")) {
         extensions.configure<JavaPluginExtension> { withSourcesJar() }
         extensions.configure<PublishingExtension> {
             publications.create<MavenPublication>("maven") {
@@ -643,6 +650,7 @@ val rustReleaseDir = if (rustTargetTriple != null) {
     "rust/target/release"
 }
 extra["rustReleaseDir"] = rustReleaseDir
+extra["rustTargetTriple"] = rustTargetTriple // null: the host's own triple
 extra["rustEngineLibName"] = hostLibNames.last() // lib?myotis_engine.{dylib,so,dll}
 
 // Opt-in Tor support in the engine (docs/privacy-and-tor.md): builds
