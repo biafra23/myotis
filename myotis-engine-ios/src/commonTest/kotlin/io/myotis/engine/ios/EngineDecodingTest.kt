@@ -33,6 +33,10 @@ class EngineDecodingTest {
         // A missing field is drift, not a default.
         assertFailsWith<EngineException> { EngineDecoding.networks("""[{"name":"sepolia"}]""") }
         assertFailsWith<EngineException> { EngineDecoding.networks("""{"name":"sepolia"}""") }
+        val wide = """[{"name":"sepolia","displayName":"Sepolia","chainId":11155111,"hasEns":true,""" +
+            """"defaultElPort":30303,"defaultDiscv5Port":9000,"defaultRpcPort":4294975843,""" +
+            """"clGenesisTime":1655733600,"secondsPerSlot":12}]"""
+        assertFailsWith<EngineException>("a port out of Int range is drift") { EngineDecoding.networks(wide) }
     }
 
     // ---- status ----
@@ -557,6 +561,12 @@ class EngineDecodingTest {
         assertFailsWith<EngineException> { EngineDecoding.ensAddress("a.eth", ok(""""unrelated":1""")) }
         assertFailsWith<EngineException> {
             EngineDecoding.ensAddress("a.eth", """{"status":"ok","addressHex":"$addr40"}""")
+        }
+        assertFailsWith<EngineException>("verified is mandatory, null included") {
+            EngineDecoding.ensAddress(
+                "a.eth",
+                """{"status":"ok","blockNumber":5,"verified":null,"addressHex":"$addr40"}""",
+            )
         }
         assertFailsWith<EngineException> {
             EngineDecoding.ensAddress("a.eth", """{"status":"weird","blockNumber":1,"verified":false}""")

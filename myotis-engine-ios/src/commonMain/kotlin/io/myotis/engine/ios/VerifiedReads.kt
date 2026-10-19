@@ -18,9 +18,9 @@ class VerifiedReads internal constructor(private val handle: ChainHandle) {
     /** The chain these reads answer for. */
     val chainId: Long get() = handle.chainId
 
-    /** The optimistic head's execution block number (`eth_blockNumber`), or null when
-     *  the anchor has no head yet. */
-    fun headBlockNumber(): Long? = answer { handle.status().optimisticBlockNumber.takeIf { it > 0 } }
+    /** The optimistic head's execution block number (`eth_blockNumber`), or null while
+     *  no verified read can be served at it (paused, not synced, no head, no snap peer). */
+    fun headBlockNumber(): Long? = answer { handle.servableHead() }
 
     /** The balance in decimal wei (0 for an account proven absent), or null. */
     fun getBalance(address: ByteArray, block: String): String? {

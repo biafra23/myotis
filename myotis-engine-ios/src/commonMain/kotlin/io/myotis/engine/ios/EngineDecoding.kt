@@ -46,11 +46,11 @@ internal object EngineDecoding {
                     displayName = o.requiredString("displayName"),
                     chainId = o.requiredLong("chainId"),
                     hasEns = o.requiredBoolean("hasEns"),
-                    defaultElPort = o.requiredLong("defaultElPort").toInt(),
-                    defaultDiscv5Port = o.requiredLong("defaultDiscv5Port").toInt(),
-                    defaultRpcPort = o.requiredLong("defaultRpcPort").toInt(),
+                    defaultElPort = o.requiredInt("defaultElPort"),
+                    defaultDiscv5Port = o.requiredInt("defaultDiscv5Port"),
+                    defaultRpcPort = o.requiredInt("defaultRpcPort"),
                     clGenesisTime = o.requiredLong("clGenesisTime"),
-                    secondsPerSlot = o.requiredLong("secondsPerSlot").toInt(),
+                    secondsPerSlot = o.requiredInt("secondsPerSlot"),
                 )
             }
         }
@@ -407,7 +407,7 @@ internal object EngineDecoding {
             val status = o.string("status")
             val block = o["blockNumber"]
             val verified = o["verified"]
-            if (status == null || block == null || block is JsonNull || verified == null) {
+            if (status == null || block == null || block is JsonNull || verified == null || verified is JsonNull) {
                 throw EngineException("ens-record JSON: missing status/blockNumber/verified")
             }
             val blockNumber = o.long("blockNumber")
@@ -528,6 +528,11 @@ private fun JsonObject.requiredString(key: String): String =
 private fun JsonObject.requiredLong(key: String): Long {
     primitive(key) ?: throw IllegalArgumentException("missing $key")
     return long(key)
+}
+
+private fun JsonObject.requiredInt(key: String): Int {
+    primitive(key) ?: throw IllegalArgumentException("missing $key")
+    return int(key)
 }
 
 private fun JsonObject.requiredBoolean(key: String): Boolean {

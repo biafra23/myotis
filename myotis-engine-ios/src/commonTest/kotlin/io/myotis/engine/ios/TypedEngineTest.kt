@@ -38,6 +38,10 @@ class TypedEngineTest {
         var ens = """{"status":"noRecord","blockNumber":1,"verified":true}"""
         var receipt = "null"
 
+        override fun newLock(): EngineLock = object : EngineLock {
+            override fun lock() {}
+            override fun unlock() {}
+        }
         override fun availableNetworksJson() = catalog
         override fun canonicalNetworkName(nameOrAlias: String) =
             when (nameOrAlias) {
@@ -304,5 +308,24 @@ class TypedEngineTest {
         assertEquals(Long.MAX_VALUE, handle.status().verifiedHeadAgeMs)
         native.status = "{}"
         assertEquals(LifecycleState.STOPPED, handle.lifecycle())
+    }
+
+    @Test
+    fun theHeadBlockIsOnlyReportedWhileAReadCanBeServed() {
+        val reads = sepolia().reads()
+        native.status = synced
+        assertEquals(100L, reads.headBlockNumber())
+        native.status = synced.replace("SYNCED", "CATCHING_UP")
+        assertNull(reads.headBlockNumber(), "a head the light client has not caught up to")
+        native.status = synced.replace("\"running\":true", "\"running\":true,\"paused\":true")
+        assertNull(reads.headBlockNumber(), "a paused handle's frozen head")
+        native.status = "{}"
+        assertNull(reads.headBlockNumber())
+    }
+
+    @Test
+    fun anUnknownNetworkNamesTheCatalog() {
+        val e = assertFailsWith<EngineException> { engine.canonicalNetworkName("holesky") }
+        assertTrue(e.message!!.endsWith("Supported: sepolia, gnosis"), e.message)
     }
 }

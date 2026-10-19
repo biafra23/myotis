@@ -1,5 +1,7 @@
 package io.myotis.engine.ios
 
+import platform.Foundation.NSRecursiveLock
+
 /**
  * The iOS engine library's entry point, the twin of `io.myotis.engine.Myotis` on the
  * JVM: [newEngine] is the Rust engine behind the typed API, linked into the app from
@@ -21,6 +23,12 @@ object Myotis {
 
 /** [NativeEngine] over the C ABI: each call is the [RustEngine] function of its name. */
 internal object RustNativeEngine : NativeEngine {
+    override fun newLock(): EngineLock = object : EngineLock {
+        private val lock = NSRecursiveLock()
+        override fun lock() = lock.lock()
+        override fun unlock() = lock.unlock()
+    }
+
     override fun availableNetworksJson() = RustEngine.availableNetworksJson()
     override fun canonicalNetworkName(nameOrAlias: String) = RustEngine.canonicalNetworkName(nameOrAlias)
     override fun create(network: String, dataDir: String) = RustEngine.create(network, dataDir)

@@ -7,6 +7,10 @@ package io.myotis.engine.ios
  * without the engine, as the JVM side tests its decoders without JNI.
  */
 internal interface NativeEngine {
+    /** A new reentrant lock: the typed API serializes each handle's lifecycle, and the
+     *  engine's create/stop, on these, as the C ABI requires (rust/include/myotis_engine.h). */
+    fun newLock(): EngineLock
+
     fun availableNetworksJson(): String
     fun canonicalNetworkName(nameOrAlias: String): String?
 
@@ -41,4 +45,19 @@ internal interface NativeEngine {
     fun checkRawTransactionJson(rawTxHex: String): String
     fun sendRawTransactionJson(handle: Long, rawTxHex: String): String
     fun ensRecordJson(handle: Long, paramsJson: String): String
+}
+
+/** A reentrant lock, from the platform ([NativeEngine.newLock]). */
+internal interface EngineLock {
+    fun lock()
+    fun unlock()
+}
+
+internal inline fun <T> EngineLock.withLock(block: () -> T): T {
+    lock()
+    try {
+        return block()
+    } finally {
+        unlock()
+    }
 }

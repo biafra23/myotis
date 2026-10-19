@@ -17,13 +17,20 @@ class MyotisEngine internal constructor(private val native: NativeEngine) {
 
     private val hosted = AtomicReference<Map<String, ChainHandle>>(emptyMap())
 
+    /** create/stop/shutdownAll are mutually exclusive, as on the JVM: two creates of one
+     *  network, or a create during a shutdown, would otherwise both reach the engine.
+     *  Reads of [hosted] stay lock-free. */
+    private val lifecycleLock = native.newLock()
+
     /** The networks the engine knows, from its embedded catalog. */
     fun availableNetworks(): List<NetworkInfo> = EngineDecoding.networks(native.availableNetworksJson())
 
     /** The catalog's name for [nameOrAlias]; an unknown one throws [EngineException]. */
     fun canonicalNetworkName(nameOrAlias: String): String =
         native.canonicalNetworkName(nameOrAlias)
-            ?: throw EngineException("Unknown network: $nameOrAlias. Supported: mainnet, sepolia, gnosis")
+            ?: throw EngineException(
+                "Unknown network: $nameOrAlias. Supported: " + availableNetworks().joinToString { it.name },
+            )
 
     /**
      * A not-yet-started handle for [config]'s network, its state under [EngineConfig.dataDir].
@@ -31,7 +38,7 @@ class MyotisEngine internal constructor(private val native: NativeEngine) {
      * network already hosted by this engine, a directory bound to a caller-supplied
      * checkpoint (which this API cannot resume), or a runtime that would not come up.
      */
-    fun create(config: EngineConfig): ChainHandle {
+    fun create(config: EngineConfig): ChainHandle = lifecycleLock.withLock {
         val canonical = canonicalNetworkName(config.networkName)
         val network = availableNetworks().firstOrNull { it.name == canonical }
             ?: throw EngineException("unknown network: ${config.networkName}")
@@ -48,15 +55,8 @@ class MyotisEngine internal constructor(private val native: NativeEngine) {
             )
         }
         val handle = ChainHandle(native, id, canonical, network.chainId, network.hasEns)
-        // Claim the network atomically; a create that lost a race releases its native handle.
-        while (true) {
-            val current = hosted.load()
-            if (canonical in current) {
-                native.stop(id)
-                throw EngineException("network already hosted: $canonical")
-            }
-            if (hosted.compareAndSet(current, current + (canonical to handle))) return handle
-        }
+        hosted.store(hosted.load() + (canonical to handle))
+        handle
     }
 
     /** The handle hosting [networkName] (its canonical name), or null. */
@@ -66,19 +66,14 @@ class MyotisEngine internal constructor(private val native: NativeEngine) {
     fun hostedNetworks(): List<String> = hosted.load().keys.toList()
 
     /** Stops [networkName]'s handle and releases it; the network can then be created again. */
-    fun stop(networkName: String) {
-        while (true) {
-            val current = hosted.load()
-            val handle = current[networkName] ?: return
-            if (hosted.compareAndSet(current, current - networkName)) {
-                handle.stop()
-                return
-            }
-        }
+    fun stop(networkName: String) = lifecycleLock.withLock {
+        val handle = hosted.load()[networkName] ?: return@withLock
+        hosted.store(hosted.load() - networkName)
+        handle.stop()
     }
 
     /** Stops every hosted network. */
-    fun shutdownAll() {
+    fun shutdownAll() = lifecycleLock.withLock {
         hostedNetworks().forEach(::stop)
     }
 

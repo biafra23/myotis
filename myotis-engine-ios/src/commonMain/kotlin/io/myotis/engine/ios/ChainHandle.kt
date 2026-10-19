@@ -35,20 +35,24 @@ class ChainHandle internal constructor(
 
     private val ensApi = if (hasEns) EnsApi(this) else null
 
+    /** Serializes start/stop/pause/resume, which the C ABI requires per handle. */
+    private val lifecycleLock = native.newLock()
+
     /** Starts the sync loop; false for a handle that is running already or could not start
      *  (the engine's log, `Myotis.drainLogs`, says why). */
-    fun start(): Boolean = native.start(handle)
+    fun start(): Boolean = lifecycleLock.withLock { native.start(handle) }
 
-    /** Stops the handle: its networking and its sync loop. Synchronous. */
-    fun stop() = native.stop(handle)
+    /** Stops the handle: its networking and its sync loop. Synchronous. The network stays
+     *  hosted, as on the JVM: [MyotisEngine.stop] is what releases it for a new create. */
+    fun stop() = lifecycleLock.withLock { native.stop(handle) }
 
     /** Tears networking down and keeps the warm state, for while the app is in the
      *  background; true only on an actual transition. */
-    fun pause(): Boolean = native.pause(handle)
+    fun pause(): Boolean = lifecycleLock.withLock { native.pause(handle) }
 
     /** A warm restart after [pause]; false when it failed (still paused, retryable) or
      *  the handle was not paused. */
-    fun resume(): Boolean = native.resume(handle)
+    fun resume(): Boolean = lifecycleLock.withLock { native.resume(handle) }
 
     /** Where the handle is in its lifecycle. */
     fun lifecycle(): LifecycleState = status().lifecycle
@@ -64,6 +68,14 @@ class ChainHandle internal constructor(
     fun status(): StatusSnapshot {
         val s = EngineDecoding.status(native.statusJson(handle))
         return EngineDecoding.snapshot(networkName, s, headAgeMs(s))
+    }
+
+    /** The optimistic head's block number while a verified read can be served at it
+     *  (running, SYNCED, an anchored head, a snap peer serving it), else null: a paused
+     *  or catching-up handle's frozen head is not the chain's. */
+    internal fun servableHead(): Long? {
+        val s = EngineDecoding.status(native.statusJson(handle))
+        return s.optimisticBlockNumber.takeIf { s.running && !s.paused && s.serveable }
     }
 
     private fun headAgeMs(s: EngineDecoding.ParsedStatus): Long {
