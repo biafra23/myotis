@@ -53,21 +53,22 @@ the lookup returns absent.
 ### Reverse resolution (ENSIP-3)
 
 ```
-reverseName = addressHex.toLowerCase().replace("0x", "") + ".addr.reverse"
-reverseNode = namehash(reverseName)
-// The record walk every forward read takes: the exact node's resolver, else the
-// nearest ancestor's when it implements ENSIP-10 (then through resolve()).
-name = resolveRecord(reverseName, name(reverseNode))
+reverseNode = namehash(addressHex.toLowerCase().replace("0x", "") + ".addr.reverse")
+reverseResolver = registry.resolver(reverseNode)
+name = reverseResolver.name(reverseNode)
 // Verification step (mandatory per ENSIP-3):
 forward = resolveAddress(name)
 if forward != address: return absent
 ```
 
-*As built since #671:* the reverse read walks up like a forward one. It first
-looked only at the exact `<hex>.addr.reverse` node, which misses a primary name
-that has no reverse resolver of its own: one set through ENSv2 on Sepolia, and on
-mainnet one the `reverse` node's wildcard resolver answers (it does, on chain,
-for `0x51fd…9f0d` → `myotis.eth`).
+*As built since #671:* an address with no reverse resolver of its own is asked of
+the nearest resolver of `addr.reverse` or `reverse` instead, when that one
+implements ENSIP-10 (through `resolve(bytes,bytes)`). That is where a primary
+name set through ENSv2 on Sepolia lives, and on mainnet one the `reverse` node's
+wildcard resolver keeps (it answers, on chain, `0x51fd…9f0d` → `myotis.eth`). An
+address WITH its own reverse resolver is read as above, `name()` directly and
+without a `supportsInterface` probe: the old reverse resolvers predate ERC-165
+and halt on one (vitalik's, `0x5fBb…F358`).
 
 The verification round-trip defeats impersonation: anyone can claim any
 name in their reverse record without proof, so the resolver's word alone

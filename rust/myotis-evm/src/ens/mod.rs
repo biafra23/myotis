@@ -226,11 +226,12 @@ pub const ONLY_GNO_NAMES: &str = "only .gno names resolve on Gnosis Chain";
 /// The refusal for a reverse lookup on Gnosis Chain (Java parity).
 pub const NO_GNO_REVERSE: &str = "reverse resolution is not supported for .gno names";
 
-/// The ownership refusal for a name ENSv2 decides (#671): the v1 registry and
-/// registrar no longer speak for it, and this engine does not read ENSv2's
-/// registries yet. Answering from v1 would show a registered name as unowned.
+/// The ownership refusal for a name ENSv2 decides (#671), registered there or
+/// not: the v1 registry and registrar no longer speak for it, and this engine
+/// does not read ENSv2's registries yet. Answering from v1 would show a name
+/// registered in ENSv2 as unowned, or a stale v1 holder as its owner.
 pub const ENSV2_OWNERSHIP: &str =
-    "this name's ownership is recorded in ENSv2, which this engine does not read yet";
+    "ENSv2 decides this name's ownership, and this engine does not read ENSv2 yet";
 
 /// The decoded ERC-3668 `OffchainLookup(address,string[],bytes,bytes4,bytes)`
 /// revert body (Java `OffchainLookupRevert` twin — same bounds: body ≥ 160
@@ -608,16 +609,23 @@ pub fn resolve_interface_implementer(
 /// forward-verify are all indistinguishable `Ok(None)` (Java parity — no
 /// special error token).
 ///
-/// The claim is read the way every record is ([`resolve_record`]): the resolver
-/// of `<hex>.addr.reverse` itself, else the nearest ancestor's when it is an
-/// ENSIP-10 wildcard resolver, called through `resolve(bytes,bytes)`. The walk
-/// up matters (#671): a primary name set through ENSv2 on Sepolia has no
-/// `addr.reverse` resolver of its own, and the `reverse` node's wildcard
-/// resolver answers it; mainnet's `reverse` node has a wildcard resolver too,
-/// which answers on chain for an address without its own reverse resolver
-/// (`0x51fd…9f0d` → `myotis.eth`, 2026-10-19). A plain revert is no record, an `OffchainLookup`
-/// stays distinguishable, and any other failure (state unavailable) is an
-/// error — the forward path's classification, on both engines.
+/// The claim comes from the resolver of the EXACT `<hex>.addr.reverse` node when
+/// it has one, read as always (Java `resolveName` parity): `name(bytes32)`
+/// called directly, with no `supportsInterface` probe and no ENSIP-10 wrap —
+/// the old reverse resolvers predate ERC-165 and halt on the probe (mainnet's
+/// `0x5fBb…F358`, vitalik's). Only an address WITHOUT a reverse resolver of its
+/// own walks up (#671): the nearest resolver of `addr.reverse` or `reverse`
+/// answers when it is an ENSIP-10 wildcard one, through `resolve(bytes,bytes)`.
+/// A primary name set through ENSv2 on Sepolia is answered that way, and so, on
+/// mainnet, is one the `reverse` node's wildcard resolver keeps for an address
+/// (`0x51fd…9f0d` → `myotis.eth`, 2026-10-19).
+///
+/// One deliberate divergence from the Java reverse path: a plain REVERT during
+/// the reverse lookup (registry or `name()`) folds to `Ok(None)` here, where
+/// Java surfaces it as an error record — this matches the FORWARD path's
+/// revert-is-no-record classification on both engines, and a reverse resolver
+/// without a `name(bytes32)` function simply has no reverse record to give.
+/// Non-revert failures (state unavailable) still propagate as errors.
 pub fn reverse_resolve(
     caller: &dyn EthCaller,
     address: [u8; 20],
@@ -633,11 +641,41 @@ pub fn reverse_resolve(
     }
     let rev_name = reverse_name(address);
     let rev_node = namehash(&rev_name);
-
     // name(node) → the claimed primary name (empty/malformed → no record).
     let name_call = abi::encode_call_bytes32("name(bytes32)", &rev_node);
-    let Some(raw) = resolve_record(caller, &rev_name, &name_call)? else {
-        return Ok(None);
+
+    // Exact resolver lookup; a revert is "no reverse record".
+    let call = abi::encode_call_bytes32("resolver(bytes32)", &rev_node);
+    let out = match caller.eth_call(ns.registry, &call) {
+        Ok(out) => out,
+        Err(EvmError::Reverted { .. }) => return Ok(None),
+        Err(e) => return Err(EnsError::Call(e)),
+    };
+    let raw = match abi::decode_address(&out).filter(|a| a != &[0u8; 20]) {
+        // An OffchainLookup revert stays distinguishable, like every resolver call.
+        Some(resolver) => match caller.eth_call(resolver, &name_call) {
+            Ok(out) => out,
+            Err(EvmError::Reverted { data }) => {
+                // name() is a direct legacy-style call — never ENSIP-10-wrapped.
+                return match revert_outcome(&data, false) {
+                    Ok(_) => Ok(None),
+                    Err(e) => Err(e),
+                };
+            }
+            Err(e) => return Err(EnsError::Call(e)),
+        },
+        None => {
+            let Some(info) = find_resolver(caller, "addr.reverse")? else {
+                return Ok(None);
+            };
+            if !info.extended {
+                return Ok(None);
+            }
+            match call_wrapped(caller, info.resolver, &dns_encode(&rev_name)?, &name_call)? {
+                Some(raw) => raw,
+                None => return Ok(None),
+            }
+        }
     };
     let Some(claimed) = decode_name_answer(&raw) else {
         return Ok(None);
@@ -727,14 +765,7 @@ fn resolve_record(
     }
 
     if info.extended {
-        // ENSIP-10: resolver.resolve(dnsEncode(name), inner) → bytes wrapping
-        // the inner return.
-        let call = abi::encode_resolve(&dns, inner_call);
-        match caller.eth_call(info.resolver, &call) {
-            Ok(out) => Ok(abi::decode_dynamic_bytes(&out, 0)),
-            Err(EvmError::Reverted { data }) => revert_outcome(&data, true),
-            Err(e) => Err(EnsError::Call(e)),
-        }
+        call_wrapped(caller, info.resolver, &dns, inner_call)
     } else {
         // Legacy exact resolver: dispatch the inner call directly.
         match caller.eth_call(info.resolver, inner_call) {
@@ -742,6 +773,23 @@ fn resolve_record(
             Err(EvmError::Reverted { data }) => revert_outcome(&data, false),
             Err(e) => Err(EnsError::Call(e)),
         }
+    }
+}
+
+/// ENSIP-10: `resolver.resolve(dns, inner)` → the bytes wrapping the inner
+/// call's return. A plain revert is no record; an `OffchainLookup` surfaces
+/// with `wrapped`, so the callback's answer is unwrapped the same way.
+fn call_wrapped(
+    caller: &dyn EthCaller,
+    resolver: [u8; 20],
+    dns: &[u8],
+    inner_call: &[u8],
+) -> Result<Option<Vec<u8>>, EnsError> {
+    let call = abi::encode_resolve(dns, inner_call);
+    match caller.eth_call(resolver, &call) {
+        Ok(out) => Ok(abi::decode_dynamic_bytes(&out, 0)),
+        Err(EvmError::Reverted { data }) => revert_outcome(&data, true),
+        Err(e) => Err(EnsError::Call(e)),
     }
 }
 
@@ -1479,6 +1527,34 @@ mod tests {
     }
 
     #[test]
+    fn reverse_reads_an_exact_resolver_without_probing_it() {
+        // vitalik's reverse resolver on mainnet (0x5fBb…F358) predates ERC-165:
+        // supportsInterface hits INVALID, a halt the walk would report as a
+        // failure. The exact reverse resolver is read as always, name() directly.
+        const OLD_REVERSE: [u8; 20] = [0x5f; 20];
+        let resolver_sel = abi::selector("resolver(bytes32)");
+        let supports_sel = abi::selector("supportsInterface(bytes4)");
+        let name_sel = abi::selector("name(bytes32)");
+        let addr_sel = abi::selector("addr(bytes32)");
+        let rev_node = namehash(&reverse_name(VITALIK));
+        let claimed = dyn_bytes_return(b"vitalik.eth");
+        let caller = MockCaller::new()
+            .on(move |t, cd| {
+                (t == REGISTRY && sel(cd) == resolver_sel && cd[4..36] == rev_node)
+                    .then(|| Ok(addr_word(OLD_REVERSE)))
+            })
+            .on(move |t, cd| {
+                (t == OLD_REVERSE && sel(cd) == supports_sel)
+                    .then(|| Err(EvmError::Halted { reason: "InvalidFEOpcode".into() }))
+            })
+            .on(move |t, cd| (t == OLD_REVERSE && sel(cd) == name_sel).then(|| Ok(claimed.clone())))
+            .on(move |t, cd| (t == REGISTRY && sel(cd) == resolver_sel).then(|| Ok(addr_word(RESOLVER))))
+            .on(move |t, cd| (t == RESOLVER && sel(cd) == supports_sel).then(revert))
+            .on(move |t, cd| (t == RESOLVER && sel(cd) == addr_sel).then(|| Ok(addr_word(VITALIK))));
+        assert_eq!(reverse_resolve(&caller, VITALIK).unwrap(), Some("vitalik.eth".to_string()));
+    }
+
+    #[test]
     fn reverse_does_not_ask_an_ancestors_legacy_resolver() {
         // A resolver on `reverse` without ENSIP-10 cannot answer for a subname.
         let resolver_sel = abi::selector("resolver(bytes32)");
@@ -1828,6 +1904,42 @@ mod tests {
         assert_eq!(o.registrant, Some(USER));
         assert_eq!(o.resolver, Some(RESOLVER));
         assert_eq!(o.expires_at, Some(1_823_155_031));
+    }
+
+    #[test]
+    fn a_mirror_of_another_registry_does_not_hand_the_name_to_v1() {
+        // REGISTRY_V1() must name THIS registry: a resolver mirroring some other
+        // registry is no evidence that this one decides the name.
+        let dns = dns_encode("ens.eth").unwrap();
+        let v1_sel = abi::selector("REGISTRY_V1()");
+        let caller = MockCaller::new()
+            .on_chain(11_155_111)
+            .on(move |t, cd| (t == MIRROR && sel(cd) == v1_sel).then(|| Ok(addr_word([0x77; 20]))));
+        let caller = ensv2_chain(caller, dns, MIRROR);
+        assert_eq!(
+            resolve_ownership(&caller, "ens.eth", 11_155_111),
+            Err(EnsError::Unsupported(ENSV2_OWNERSHIP))
+        );
+    }
+
+    #[test]
+    fn a_universal_resolver_that_cannot_run_fails_ownership_instead_of_reading_v1() {
+        // State that cannot be served is not "no ENSv2 root": answering from v1 then
+        // would put the unowned reading of an ENSv2 name back.
+        let root_sel = abi::selector("ROOT_REGISTRY()");
+        let caller = MockCaller::new()
+            .on_chain(11_155_111)
+            .on(move |t, cd| {
+                (t == UNIVERSAL_RESOLVER && sel(cd) == root_sel)
+                    .then(|| Err(EvmError::Halted { reason: "state unavailable".into() }))
+            })
+            .on(|t, _| {
+                (t == REGISTRY || t == BASE_REGISTRAR).then(|| panic!("v1 read after a failed check"))
+            });
+        assert!(matches!(
+            resolve_ownership(&caller, "myotis.eth", 11_155_111),
+            Err(EnsError::Call(EvmError::Halted { .. }))
+        ));
     }
 
     #[test]

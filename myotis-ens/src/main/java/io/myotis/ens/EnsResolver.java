@@ -100,7 +100,7 @@ public final class EnsResolver {
 
     /** The ownership refusal for a name ENSv2 decides (#671; Rust {@code ENSV2_OWNERSHIP}). */
     public static final String ENSV2_OWNERSHIP =
-            "this name's ownership is recorded in ENSv2, which this engine does not read yet";
+            "ENSv2 decides this name's ownership, and this engine does not read ENSv2 yet";
 
     private final EvmExecutor executor;
     private final Address registry;
@@ -410,11 +410,13 @@ public final class EnsResolver {
     /**
      * Reverse resolution: {@code address → name}, with ENSIP-3 verification.
      *
-     * <p>The claim is {@code name(bytes32)} of the reverse node, read through the
-     * same Registry walk as every record ({@link #dispatchResolve}): the node's own
-     * resolver, else the nearest ancestor's ENSIP-10 wildcard resolver. A plain
-     * revert is no claim; an {@code OffchainLookup} goes to the CCIP wrapper. The
-     * verification round-trip is {@link #resolveAddress}.
+     * <p>Step-by-step path against the Registry: the reverse node's
+     * {@code resolver(bytes32)}, then that resolver's {@code name(bytes32)}, called
+     * directly — the old reverse resolvers predate ERC-165 and halt on a
+     * {@code supportsInterface} probe. That covers classic on-chain reverse records. An
+     * address with no reverse resolver of its own is asked of an ancestor's ENSIP-10
+     * resolver ({@link #ancestorReverseName}). The verification round-trip is
+     * {@link #resolveAddress} — the same Registry walk every forward read takes.
      *
      * <p>Returns {@link Optional#empty()} when the address has no reverse
      * record OR when the resolver's claim fails ENSIP-3 verification (a
@@ -430,15 +432,36 @@ public final class EnsResolver {
             return com.jaeckel.ethp2p.core.concurrent.Futures.failedFuture(
                     new UnsupportedOperationException(NO_GNO_REVERSE));
         }
-        // The claim is read like any record (dispatchResolve): the reverse node's own
-        // resolver, else the nearest ancestor's ENSIP-10 wildcard one. ENSv2 needs the
-        // walk up (#671): a Sepolia primary name set there has no addr.reverse resolver,
-        // and the `reverse` node's wildcard resolver answers it (mainnet's does too, for
-        // an address without a reverse resolver of its own). Rust twin: reverse_resolve.
         String reverseName = ReverseLookup.nameFor(address);
-        byte[] nameCall = AbiEncoder.encodeCall(NAME, AbiEncoder.bytes32(Namehash.of(reverseName)));
-        return dispatchResolve(reverseName, nameCall, blockContext, EnsResolver::decodeStringResult)
+        byte[] reverseNode = Namehash.of(reverseName);
+        return getReverseResolver(reverseNode, blockContext)
+                .thenCompose(resolver -> resolver.isPresent()
+                        ? getName(resolver.get(), reverseNode, blockContext)
+                        : ancestorReverseName(reverseName, reverseNode, blockContext))
                 .thenCompose(claimed -> verifyForward(claimed, address, blockContext));
+    }
+
+    /**
+     * The claim for an address WITHOUT a reverse resolver of its own (#671): the nearest
+     * resolver of {@code addr.reverse} or {@code reverse}, when it is an ENSIP-10 wildcard
+     * one, asked through {@code resolve(bytes,bytes)}. A primary name set through ENSv2 on
+     * Sepolia is answered that way, and so, on mainnet, is one the {@code reverse} node's
+     * wildcard resolver keeps for an address. Rust twin: the walk-up branch of
+     * {@code reverse_resolve}.
+     */
+    private CompletableFuture<Optional<String>> ancestorReverseName(
+            String reverseName, byte[] reverseNode, BlockContext ctx) {
+        return findResolver("addr.reverse", ctx).thenCompose(found -> {
+            if (found.isEmpty() || !found.get().extended()) {
+                return CompletableFuture.completedFuture(Optional.<String>empty());
+            }
+            byte[] nameCall = AbiEncoder.encodeCall(NAME, AbiEncoder.bytes32(reverseNode));
+            byte[] calldata = AbiEncoder.encodeCall(RESOLVE,
+                    AbiEncoder.bytes(DnsEncoder.encode(reverseName)), AbiEncoder.bytes(nameCall));
+            return executor.callView(found.get().resolver(), calldata, ctx)
+                    .handle((result, error) ->
+                            decodeOutcome(result, error, /* wrapped */ true, EnsResolver::decodeStringResult));
+        });
     }
 
     // ---- Ownership ---------------------------------------------------------
@@ -786,6 +809,22 @@ public final class EnsResolver {
                 && eee.error() instanceof EvmExecutionError.Reverted;
     }
 
+    // ---- Reverse-path step-by-step calls ----------------------------------
+
+    /** Registry call: {@code resolver(bytes32) → address}. Used only for the reverse path. */
+    private CompletableFuture<Optional<Address>> getReverseResolver(byte[] node, BlockContext ctx) {
+        byte[] calldata = AbiEncoder.encodeCall(RESOLVER, AbiEncoder.bytes32(node));
+        return executor.callView(registry, calldata, ctx)
+                .thenApply(EnsResolver::decodeAddressOrEmpty);
+    }
+
+    /** Resolver call: {@code name(bytes32) → string}. */
+    private CompletableFuture<Optional<String>> getName(Address resolver, byte[] node, BlockContext ctx) {
+        byte[] calldata = AbiEncoder.encodeCall(NAME, AbiEncoder.bytes32(node));
+        return executor.callView(resolver, calldata, ctx)
+                .thenApply(EnsResolver::decodeStringOrEmpty);
+    }
+
     // ---- Decoders ---------------------------------------------------------
 
     /**
@@ -851,6 +890,17 @@ public final class EnsResolver {
         if (result == null || result.length < 32) return Optional.empty();
         Address addr = AbiDecoder.address(result, 0);
         return addr.equals(Address.ZERO) ? Optional.<Address>empty() : Optional.of(addr);
+    }
+
+    /** Decode a single dynamic string with empty/short/malformed fallback. */
+    private static Optional<String> decodeStringOrEmpty(byte[] result) {
+        if (result == null || result.length < 64) return Optional.empty();
+        try {
+            String s = AbiDecoder.string(result, 0);
+            return s.isEmpty() ? Optional.<String>empty() : Optional.of(s);
+        } catch (RuntimeException e) {
+            return Optional.empty();
+        }
     }
 
     /**
