@@ -234,6 +234,7 @@ subprojects {
     //   ui           → kotlin-multiplatform + com.android.library + compose
     //   app-desktop  → kotlin.jvm + compose (desktop)
     //   app-ios      → kotlin-multiplatform + compose (iOS framework)
+    //   myotis-engine-ios → kotlin-multiplatform (the engine library's iOS cinterop)
     //   jsonrpc-server → kotlin-multiplatform (JVM hosts + the iOS RPC listener)
     //   myotis-rpc-policy → kotlin-multiplatform (the serving policy those share)
     //   myotis-engine  → kotlin-multiplatform + com.android.library (the engine library: AAR + desktop jar)
@@ -259,7 +260,7 @@ subprojects {
         exclude(group = "org.apache.logging.log4j", module = "log4j-core")
     }
 
-    if (name in setOf("android-app", "ui", "app-desktop", "app-ios", "jsonrpc-server", "myotis-rpc-policy", "myotis-engine")) {
+    if (name in setOf("android-app", "ui", "app-desktop", "app-ios", "jsonrpc-server", "myotis-rpc-policy", "myotis-engine", "myotis-engine-ios")) {
         return@subprojects
     }
 
@@ -304,7 +305,9 @@ subprojects {
 // the Java engine (node-core, networking, consensus, Besu) and no Ktor server.
 // Beside it, `:myotis-engine-natives` publishes the engine's desktop host library,
 // one artifact per OS and architecture (its build file), which no POM reaches: a
-// desktop consumer names the one for its platform.
+// desktop consumer names the one for its platform. And `:myotis-engine-ios` is the
+// engine for a Kotlin/Native iOS consumer (the C ABI's cinterop, libmyotis_engine.a
+// inside), built on macOS only.
 // Coordinates: `eth.myotis:<artifactId>` — myotis.eth is the project's ENS name
 // and the one namespace the owner controls (myotis.io is not theirs, so the Java
 // packages' io.myotis stays a package prefix and never becomes the Maven group);
@@ -343,7 +346,7 @@ subprojects {
 // build. It applies to the published modules only, so nothing else in the build
 // (the apps' versions, verifyCrateVersions) sees a different project.version.
 //
-// The two Kotlin Multiplatform modules get their publications from the Kotlin
+// The Kotlin Multiplatform modules get their publications from the Kotlin
 // plugin (one per target plus the `kotlinMultiplatform` root, which carries the
 // Gradle module metadata a consumer's variant selection needs — Android picks
 // the `-android` AAR, the desktop jar `-jvm`; Maven consumers without module
@@ -359,6 +362,9 @@ val publishedArtifactIds = mapOf(
     // One artifact per desktop platform (myotis-engine-natives-<jna-prefix>); the
     // module names its publications itself (myotis-engine-natives/build.gradle.kts).
     "myotis-engine-natives" to "myotis-engine-natives",
+    // macOS only (its cinterop needs Apple's SDK): engine-library.yml stages it on a
+    // macOS runner; a build elsewhere disables it and stages none.
+    "myotis-engine-ios" to "myotis-engine-ios",
 )
 val publishedDescriptions = mapOf(
     "myotis-api" to "The Myotis engine contract: the zero-dependency Java 17 interfaces every host consumes",
@@ -368,6 +374,7 @@ val publishedDescriptions = mapOf(
     "myotis-engine-rust" to "The Myotis Rust engine behind the engine contract, over UniFFI bindings and JNA",
     "myotis-engine" to "The Myotis engine library: the Rust light-client engine for Android (AAR) and desktop JVM (jar)",
     "myotis-engine-natives" to "The Myotis Rust engine's host library for one desktop platform, at JNA's classpath path",
+    "myotis-engine-ios" to "The Myotis Rust engine for Kotlin/Native iOS: its C ABI's cinterop bindings with libmyotis_engine.a inside",
 )
 val publishedVersion: String? = providers.gradleProperty("publishRelease").orNull?.let { requested ->
     if (requested.isEmpty()) {
@@ -393,7 +400,7 @@ configure(subprojects.filter { it.name in publishedArtifactIds }) {
     // modules need theirs created. `java` is applied by the
     // subprojects block above, so the component exists here; `java-library` in
     // the module's own script extends the same component with `api`.
-    if (name !in setOf("myotis-rpc-policy", "myotis-engine", "myotis-engine-natives")) {
+    if (name !in setOf("myotis-rpc-policy", "myotis-engine", "myotis-engine-natives", "myotis-engine-ios")) {
         extensions.configure<JavaPluginExtension> { withSourcesJar() }
         extensions.configure<PublishingExtension> {
             publications.create<MavenPublication>("maven") {
@@ -1070,11 +1077,12 @@ tasks.register("verifyAndroidJniLibs") {
     }
 }
 
-// iOS static libs (libmyotis_engine.a) for the :app-ios Kotlin/Native framework —
-// cinterop absorbs them into the framework over the plain C ABI (rust/include/
-// myotis_engine.h). One task per Apple triple; :app-ios wires each Kotlin/Native
-// target's cinterop to the matching task. Self-skips off-macOS or without the
-// rustup target (rustup target add aarch64-apple-ios aarch64-apple-ios-sim).
+// iOS static libs (libmyotis_engine.a) for :myotis-engine-ios — its cinterop absorbs
+// them over the plain C ABI (rust/include/myotis_engine.h), and the :app-ios
+// framework links them from there. One task per Apple triple; :myotis-engine-ios
+// wires each Kotlin/Native target's cinterop to the matching task. Self-skips
+// off-macOS or without the rustup target (rustup target add aarch64-apple-ios
+// aarch64-apple-ios-sim).
 val isMacHost = System.getProperty("os.name").lowercase().contains("mac")
 fun registerCargoBuildIos(taskName: String, triple: String) =
     tasks.register<Exec>(taskName) {
@@ -1099,11 +1107,12 @@ fun registerCargoBuildIos(taskName: String, triple: String) =
 registerCargoBuildIos("cargoBuildIosDevice", "aarch64-apple-ios")
 registerCargoBuildIos("cargoBuildIosSim", "aarch64-apple-ios-sim")
 
-// Whether the :app-ios framework chain can run at all: EVERY triple's
-// libmyotis_engine.a can either be built now (the cargo task's own onlyIf) or
-// absorbed from an earlier build. When false, :app-ios disables its whole task
-// chain (see its build file — it reads this single-sourced verdict) instead of
-// failing at the cinterop, keeping "cargo strictly optional" true build-wide.
+// Whether the iOS chain (:myotis-engine-ios and the :app-ios framework on it) can
+// run at all: EVERY triple's libmyotis_engine.a can either be built now (the cargo
+// task's own onlyIf) or absorbed from an earlier build. When false, both modules
+// disable their whole task chain (see their build files — they read this
+// single-sourced verdict) instead of failing at the cinterop, keeping "cargo
+// strictly optional" true build-wide.
 // All-or-nothing across the triples: the shared-source metadata/commonizer
 // tasks span both targets, so a half-enabled module would just move the
 // missing-input failure.
@@ -1148,9 +1157,9 @@ gradle.taskGraph.whenReady {
     // The iOS skips get a WARNING, not a note: unlike the other cargo tasks there
     // is no committed fallback. With a previously built libmyotis_engine.a in
     // rust/target the cinterop absorbs it (possibly STALE — only the runtime ABI
-    // handshake would catch the drift); with no .a at all, :app-ios disables its
-    // whole framework chain (see app-ios/build.gradle.kts) so a cargo-less build
-    // still passes.
+    // handshake would catch the drift); with no .a at all, :myotis-engine-ios and
+    // :app-ios disable their task chains (see their build files) so a cargo-less
+    // build still passes.
     listOf("cargoBuildIosDevice" to "aarch64-apple-ios", "cargoBuildIosSim" to "aarch64-apple-ios-sim")
         .forEach { (task, triple) ->
             if (allTasks.any { it.name == task } && (!isMacHost || rustSkipNote != null || triple !in installedRustupTargets)) {
@@ -1160,7 +1169,7 @@ gradle.taskGraph.whenReady {
                         "[rust] $task skipped ($prereqs) — the iOS framework will embed the EXISTING " +
                             "rust/target/$triple/release/libmyotis_engine.a, which may be stale"
                     else
-                        "[rust] $task skipped ($prereqs) — the :app-ios framework tasks are disabled " +
+                        "[rust] $task skipped ($prereqs) — the :myotis-engine-ios and :app-ios tasks are disabled " +
                             "(not every triple has a previously built libmyotis_engine.a to embed); " +
                             "the rest of the build is unaffected"
                 )

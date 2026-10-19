@@ -23,6 +23,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>The values here mirror the Rust {@code eljson} sample (a headerChain-verified
  * vitalik-style account), so the two sides are visibly parallel.
+ *
+ * <p>A third half decodes the same literals on iOS: {@code EngineDecodingTest} in
+ * {@code :myotis-engine-ios}. A shape change here is a change there too.
  */
 class RustVerifiedReadJsonTest {
 

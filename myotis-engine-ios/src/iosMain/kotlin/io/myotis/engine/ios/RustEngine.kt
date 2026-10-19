@@ -1,4 +1,4 @@
-package io.myotis.ios
+package io.myotis.engine.ios
 
 import io.myotis.engine.capi.MYOTIS_ABI_VERSION
 import io.myotis.engine.capi.myotis_available_networks_json
@@ -21,6 +21,7 @@ import io.myotis.engine.capi.myotis_get_block_receipts_json
 import io.myotis.engine.capi.myotis_get_code_json
 import io.myotis.engine.capi.myotis_get_proof_json
 import io.myotis.engine.capi.myotis_get_storage_at_json
+import io.myotis.engine.capi.myotis_get_storage_proof_json
 import io.myotis.engine.capi.myotis_get_transaction_by_hash_json
 import io.myotis.engine.capi.myotis_get_transaction_receipt_json
 import io.myotis.engine.capi.myotis_import_log_index_files
@@ -51,8 +52,9 @@ import kotlinx.cinterop.toKString
  * `RustEngineNative` on the JVM side. Owns exactly two concerns: the
  * string-memory contract (every `char*` the engine returns is copied to a
  * Kotlin String and immediately released via `myotis_string_free`) and the
- * ABI handshake. Everything else (JSON parsing, lifecycle bookkeeping) lives
- * in [IosNodeController].
+ * ABI handshake. The JSON decoding and the lifecycle bookkeeping live above it:
+ * in the typed API ([MyotisEngine], from `Myotis.newEngine()`), or in a host that
+ * reads the JSON itself (`:app-ios`'s `IosNodeController`).
  *
  * All calls are BLOCKING (verified reads up to ~90 s) — callers stay off the
  * main thread, same rule as every other host.
@@ -200,6 +202,11 @@ object RustEngine {
         return take(myotis_request_account_json(handle, address, block))
             ?: """{"error":"engine returned no result"}"""
     }
+
+    /** StorageProofResult JSON for storage [slot] of [address] — keyed by
+     *  [holderOrNull] where the slot is an address-keyed mapping — or `{"error": ...}`. */
+    fun getStorageProofJson(handle: Long, address: String, slot: Long, holderOrNull: String?): String =
+        jsonCall { myotis_get_storage_proof_json(handle, address, slot, holderOrNull) }
 
     /** Generic ENS record dispatch (method + args in [paramsJson]). */
     fun ensRecordJson(handle: Long, paramsJson: String): String {

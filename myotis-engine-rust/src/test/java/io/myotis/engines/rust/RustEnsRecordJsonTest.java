@@ -13,6 +13,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Golden JSON→record vectors for the RustEnsApi parsers (the Java half of the
  * cross-language pin — the Rust half is {@code eljson::ens_record_json_shapes},
  * which emits these exact literals). No JNI.
+ *
+ * <p>A third half decodes the same literals on iOS: {@code EngineDecodingTest} in
+ * {@code :myotis-engine-ios}. A shape change here is a change there too.
  */
 class RustEnsRecordJsonTest {
 

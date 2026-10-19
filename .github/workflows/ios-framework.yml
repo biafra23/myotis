@@ -23,7 +23,8 @@ on:
   # both push-to-main and PRs to the inputs that can change MyotisKit — a
   # docs-only PR shouldn't pay a 10x-billed macOS build. The set is everything
   # the framework compiles from: rust/ (the C ABI + engine), :app-ios and the
-  # modules it bundles (:ui, :jsonrpc-server), and the Gradle build inputs.
+  # modules it bundles (:myotis-engine-ios, :ui, :jsonrpc-server), and the Gradle
+  # build inputs.
   # Path filters are ignored for TAG pushes (GitHub behaviour, same as the
   # sibling ios-xcframework.yml), so releases still fire regardless.
   push:
@@ -32,6 +33,7 @@ on:
     paths: &fw_paths
       - 'rust/**'
       - 'app-ios/**'
+      - 'myotis-engine-ios/**'
       - 'ui/**'
       - 'jsonrpc-server/**'
       - '**/build.gradle.kts'
@@ -182,6 +184,18 @@ jobs:
           fw="app-ios/build/bin/iosSimulatorArm64/debugFramework/MyotisKit.framework"
           test -d "$fw"             || { echo "::error::$fw missing — :app-ios was disabled (no cargo/rustup iOS targets on the runner?), so NOTHING was compiled"; exit 1; }
           echo "linked $fw"
+
+      # The engine library's iOS module tests its typed API (JSON decoding, the
+      # handle and read rules) on the simulator Xcode picks by default. Same
+      # disabled-module trap as above: assert the test results exist.
+      - name: Test the iOS engine module on the simulator
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        run: |
+          set -euo pipefail
+          ./gradlew :myotis-engine-ios:iosSimulatorArm64Test --stacktrace
+          results="myotis-engine-ios/build/test-results/iosSimulatorArm64Test"
+          ls "$results"/*.xml >/dev/null 2>&1 || { echo "::error::no test results in $results — :myotis-engine-ios was disabled, so NOTHING was tested"; exit 1; }
+          echo "tested: $(ls "$results"/*.xml | wc -l) suites"
 
       # Zip + checksum the xcframework for upload (the bundle is a directory;
       # it survives artifact round-trips only zipped). ditto is Apple's

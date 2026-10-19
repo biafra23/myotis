@@ -1,7 +1,9 @@
 /*
  * Plain C ABI of the Myotis Rust engine (rust/myotis-engine/src/capi.rs).
- * Consumed by the :app-ios Kotlin/Native cinterop; keep in lockstep with
- * capi.rs and bump MYOTIS_ABI_VERSION expectations on any shape change.
+ * Consumed by the Kotlin/Native cinterop of :myotis-engine-ios (published as
+ * eth.myotis:myotis-engine-ios; :app-ios links it from there); keep in lockstep
+ * with capi.rs and bump MYOTIS_ABI_VERSION expectations on any shape change. A
+ * JSON shape change also moves the module's typed API and its EngineDecodingTest.
  *
  * Conventions (identical to the hand-JNI surface):
  *  - Compound values cross as JSON strings; schemas are pinned by the golden

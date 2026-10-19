@@ -1,5 +1,6 @@
 package io.myotis.ios
 
+import io.myotis.engine.ios.RustEngine
 import io.myotis.ui.Settings
 import kotlinx.serialization.Serializable
 import platform.Foundation.NSUserDefaults

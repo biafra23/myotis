@@ -8,7 +8,7 @@ it runs the engine in-process and reads the chain through
 in the Myotis apps (README §Trust model).
 
 Module: `:myotis-engine` (Kotlin Multiplatform, `jvm` + `android` targets). Entry
-point: `io.myotis.engine.Myotis`. Part of the `feature/android-aar` plan; this
+point: `io.myotis.engine.Myotis`. For iOS, `:myotis-engine-ios` (see *iOS*). Part of the `feature/android-aar` plan; this
 page describes what a consumer gets today.
 
 ## Coordinates and where to get them
@@ -19,9 +19,10 @@ page describes what a consumer gets today.
 | `eth.myotis:myotis-engine-android:<version>` | the AAR: the Kotlin entry point, `libmyotis_engine.so` + `libmyotis_bls.so` for `arm64-v8a` and `x86_64`, JNA's `libjnidispatch.so` beside them |
 | `eth.myotis:myotis-engine-jvm:<version>` | the desktop jar (the host library is not inside it — see *Desktop* below) |
 | `eth.myotis:myotis-engine-natives-<platform>:<version>` | the host library for one desktop platform (`darwin-aarch64`, `darwin-x86-64`, `linux-x86-64`, `linux-aarch64`): `<platform>/libmyotis_engine.{dylib,so}` in a plain jar, where JNA finds it on the classpath — see *Desktop* |
+| `eth.myotis:myotis-engine-ios:<version>` | the engine for a Kotlin/Native iOS consumer (`iosArm64`, `iosSimulatorArm64`): the typed API (`Myotis.newEngine()`, the `io.myotis.api` names) over the C ABI's cinterop bindings and `io.myotis.engine.ios.RustEngine`, `libmyotis_engine.a` inside — see *iOS* |
 | `eth.myotis:myotis-api` | the contract (`MyotisEngine`, `ChainHandle`, `VerifiedReads`, the ports) — one of the AAR's two `api` dependencies, so it is on the consumer's compile classpath |
 | `eth.myotis:myotis-engine-ports` | the default port actuals (`io.myotis.engine.ports`: the node-key file, the file-backed peer caches, the CCIP-Read gateway, the per-network file layout) — the AAR's second `api` dependency, see *Using it* |
-| `eth.myotis:myotis-engine-rust`, `myotis-engine-common`, `myotis-rpc-policy` | implementation dependencies the POMs pull in; a consumer never names them. Nothing from the Java engine, and no Tuweni or BouncyCastle: the engine library's whole third-party graph is JNA, slf4j and minimal-json |
+| `eth.myotis:myotis-engine-rust`, `myotis-engine-common`, `myotis-rpc-policy` | implementation dependencies the POMs pull in; a consumer never names them. Nothing from the Java engine, and no Tuweni or BouncyCastle: the JVM and Android engine library's whole third-party graph is JNA, slf4j and minimal-json (the iOS module's is kotlinx-serialization-json) |
 
 `<version>` is the tag's: `v0.1.16` publishes `0.1.16`, a release-candidate
 or hotfix tag `v0.1.16-rc1` publishes `0.1.16-rc1`. Everything else the graph
@@ -218,6 +219,64 @@ Building the host library yourself: `./gradlew cargoBuildHost` (or
 `rust/target/release`; `./gradlew :myotis-engine-natives:publishToMavenLocal`
 publishes it as this host's natives artifact.
 
+## iOS
+
+`eth.myotis:myotis-engine-ios` is the engine for a Kotlin Multiplatform app with
+iOS targets. The `io.myotis.api` contract is Java, which Kotlin/Native cannot
+run, so the module carries its Kotlin twin over the Rust engine's plain C ABI
+(`rust/include/myotis_engine.h`), in two layers:
+
+- **The typed API**, `Myotis.newEngine()` → `MyotisEngine` → `ChainHandle`, with
+  `VerifiedReads` and `EnsApi` from the handle. The names and meanings are
+  `io.myotis.api`'s, for the part of it a wallet reads: the catalog, a handle's
+  lifecycle and status, the account and storage proofs, `eth_call`, gas
+  estimates, the nonce (with the pending overlay), fee history, receipts, sending
+  and ENS forward resolution. It decodes the engine's JSON by the JVM side's rules,
+  pinned by the same golden shapes (`EngineDecodingTest`): an error envelope fails
+  the call, shape drift fails closed, and the permanent `-32602` refusal is a
+  result, never the retryable failure.
+- **`io.myotis.engine.ios.RustEngine`**, the bindings under it: every call returns
+  the engine's JSON as a `String`, copies and frees the C string, and refuses to
+  run against a library whose ABI version differs from the header it was built
+  from. Myotis's own iOS app (`:app-ios`) reads the JSON itself at this layer.
+
+The calls block (a verified read can take a minute and more), so keep them off
+the main thread. Two differences from the JVM handle: a read on a paused or
+starting handle is not held until the node can answer, it answers at once as
+unavailable, so the host resumes the handle before reading; and there is no
+CCIP-Read gateway, so a name that resolves off chain is an error result.
+
+```kotlin
+val engine = Myotis.newEngine()
+val sepolia = engine.create(EngineConfig("sepolia", dataDir))
+sepolia.start()
+// … once sepolia.status().beaconState is SYNCED:
+val account = sepolia.requestAccount("0x…")   // verifyMethod set = a verdict
+```
+
+```kotlin
+kotlin {
+    iosArm64()
+    iosSimulatorArm64()
+    sourceSets {
+        iosMain.dependencies {
+            implementation("eth.myotis:myotis-engine-ios:0.1.16")
+        }
+    }
+}
+```
+
+Each target's cinterop klib carries `libmyotis_engine.a` for its triple
+(`aarch64-apple-ios`, `aarch64-apple-ios-sim`), so the app's framework links the
+engine with no extra linker flags and no Rust toolchain on the consumer's side.
+A consumer that uses the module from a shared `iosMain`, as above, sets
+`kotlin.mpp.enableCInteropCommonization=true` in its `gradle.properties`, as this
+repository does, so the cinterop declarations behind the module's own `iosMain`
+resolve there. There is no x86_64 simulator. Building it yourself needs a Mac with Xcode and
+`rustup target add --toolchain stable aarch64-apple-ios aarch64-apple-ios-sim`:
+`./gradlew :myotis-engine-ios:publishToMavenLocal`. Anywhere else the module
+disables itself.
+
 ## How it is published
 
 `.github/workflows/engine-library.yml`. On every push to `main` that can
@@ -227,8 +286,10 @@ change the publication it stages the set into a local Maven repository
 as a release) and checks it with `scripts/check_engine_library.sh`: every
 artifact present at one version, the AAR complete for every shipped ABI, the
 JNA pin in both halves' POM and module metadata, a natives jar of the right
-architecture for every platform (built first, one runner per platform), and
-that the engine loads from the Linux x64 one with no library path. On a `v*` tag — after the
+architecture for every platform (built first, one runner per platform), the
+iOS module with the engine's archive in each target's cinterop klib (staged on
+a macOS runner and merged in), and that the engine loads from the Linux x64
+one with no library path. On a `v*` tag — after the
 release version guard — the same build is checked again, published to GitHub
 Packages, merged into the `maven-repo` branch (`scripts/merge_maven_repo.py`)
 and attached to the release. A GitHub Packages version cannot be
