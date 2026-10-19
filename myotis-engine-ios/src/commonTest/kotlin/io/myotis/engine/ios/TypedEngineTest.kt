@@ -298,11 +298,12 @@ class TypedEngineTest {
     @Test
     fun theHeadIsAgedOnlyWhileAReadCanBeServed() {
         val handle = sepolia()
-        native.status = synced.replace("SYNCED", "CATCHING_UP")
+        // An outage on another block: the first serveable reading makes a fresh mark from
+        // the same clock reading it measures against, so its age is exactly 0.
+        native.status = synced.replace("SYNCED", "CATCHING_UP").replace(":100", ":99")
         assertEquals(Long.MAX_VALUE, handle.status().verifiedHeadAgeMs)
         native.status = synced
-        val first = handle.status().verifiedHeadAgeMs
-        assertTrue(first in 0..1_000, "a head just seen is fresh, was $first")
+        assertEquals(0L, handle.status().verifiedHeadAgeMs, "a head just seen is fresh")
         assertEquals(LifecycleState.RUNNING, handle.lifecycle())
         native.status = synced.replace("\"snapServingPeers\":1", "\"snapServingPeers\":0")
         assertEquals(Long.MAX_VALUE, handle.status().verifiedHeadAgeMs)

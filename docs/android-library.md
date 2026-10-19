@@ -22,7 +22,7 @@ page describes what a consumer gets today.
 | `eth.myotis:myotis-engine-ios:<version>` | the engine for a Kotlin/Native iOS consumer (`iosArm64`, `iosSimulatorArm64`): the typed API (`Myotis.newEngine()`, the `io.myotis.api` names) over the C ABI's cinterop bindings and `io.myotis.engine.ios.RustEngine`, `libmyotis_engine.a` inside — see *iOS* |
 | `eth.myotis:myotis-api` | the contract (`MyotisEngine`, `ChainHandle`, `VerifiedReads`, the ports) — one of the AAR's two `api` dependencies, so it is on the consumer's compile classpath |
 | `eth.myotis:myotis-engine-ports` | the default port actuals (`io.myotis.engine.ports`: the node-key file, the file-backed peer caches, the CCIP-Read gateway, the per-network file layout) — the AAR's second `api` dependency, see *Using it* |
-| `eth.myotis:myotis-engine-rust`, `myotis-engine-common`, `myotis-rpc-policy` | implementation dependencies the POMs pull in; a consumer never names them. Nothing from the Java engine, and no Tuweni or BouncyCastle: the engine library's whole third-party graph is JNA, slf4j and minimal-json |
+| `eth.myotis:myotis-engine-rust`, `myotis-engine-common`, `myotis-rpc-policy` | implementation dependencies the POMs pull in; a consumer never names them. Nothing from the Java engine, and no Tuweni or BouncyCastle: the JVM and Android engine library's whole third-party graph is JNA, slf4j and minimal-json (the iOS module's is kotlinx-serialization-json) |
 
 `<version>` is the tag's: `v0.1.16` publishes `0.1.16`, a release-candidate
 or hotfix tag `v0.1.16-rc1` publishes `0.1.16-rc1`. Everything else the graph
