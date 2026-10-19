@@ -19,9 +19,12 @@
 # `append`.
 #
 # A section starts with its bold label, `**Name (`asset`)** — …`; that label is
-# how `append` recognises it in the body, so keep it stable once released, and
-# never let the master notes carry another section's label. Workflows write
-# their section with a quoted heredoc so the markdown stays literal.
+# how `append` recognises it in the body (at the START of a line, so another
+# section quoting it mid-sentence does not count), so keep it stable once
+# released, and never let the master notes carry another section's label, nor
+# start a line with it. Workflows write their section with a quoted heredoc so
+# the markdown stays literal. scripts/test_release_notes.sh tests this script
+# against a stubbed `gh`.
 #
 # Why `append` loops: GitHub cannot append to a release body. Every edit sends
 # the whole body (read, modify, write), so two publishers editing within the
@@ -57,6 +60,12 @@ if [ -n "$section" ]; then
   ! grep -qF -- "$label" "$master" || fail "the master notes already carry the label $label"
 fi
 
+# Whether a line of the notes in $1 starts with the section's label.
+# (Through ENVIRON: `awk -v` would expand backslash escapes in the label.)
+has_section() {
+  LABEL="$label" awk 'index($0, ENVIRON["LABEL"]) == 1 { found = 1 } END { exit !found }' "$1"
+}
+
 case "$cmd" in
   create)
     [ $# -le 3 ] || usage
@@ -87,7 +96,7 @@ case "$cmd" in
     # comes at least `settle` after our own last edit (or with no edit at all).
     for attempt in 1 2 3 4 5 6; do
       gh release view "$tag" --json body --jq .body > "$body"
-      if grep -qF -- "$label" "$body"; then
+      if has_section "$body"; then
         [ "$attempt" -eq 1 ] || echo "release-notes.sh: $label is in the notes of $tag after $((attempt - 1)) edit(s)"
         exit 0
       fi
@@ -98,7 +107,7 @@ case "$cmd" in
     done
     # The last edit may have stuck: one more read before calling it a failure.
     gh release view "$tag" --json body --jq .body > "$body"
-    if grep -qF -- "$label" "$body"; then
+    if has_section "$body"; then
       echo "release-notes.sh: $label is in the notes of $tag after 6 edits"
       exit 0
     fi
