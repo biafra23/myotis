@@ -1970,6 +1970,17 @@ mod tests {
     }
 
     #[test]
+    fn the_universal_resolver_pin_matches_the_java_engine() {
+        // Byte-for-byte the Java EnsAddresses.UNIVERSAL_RESOLVER. A typo would fail
+        // OPEN: a codeless account answers ROOT_REGISTRY() with nothing, read as "no
+        // ENSv2 root", and v1 would answer for ENSv2 names again (#672 review).
+        assert_eq!(
+            UNIVERSAL_RESOLVER.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "eeeeeeee14d718c2b47d9923deab1335e144eeee"
+        );
+    }
+
+    #[test]
     fn the_v1_mirror_pin_matches_the_java_engine() {
         // Byte-for-byte the Java EnsAddresses.SEPOLIA_ENSV1_MIRROR; none on mainnet yet.
         let hex = |a: [u8; 20]| a.iter().map(|b| format!("{b:02x}")).collect::<String>();

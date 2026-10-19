@@ -162,6 +162,17 @@ class EnsResolverTest {
     }
 
     @Test
+    void theEnsv2PinsMatchTheRustEngine() {
+        // Byte-for-byte rust/myotis-evm's UNIVERSAL_RESOLVER and ensv1_mirror(11155111).
+        // A typo in the Universal Resolver fails OPEN (a codeless account reads as "no
+        // ENSv2 root"), so both engines pin the same lowercase hex (#672 review).
+        assertEquals("0xeeeeeeee14d718c2b47d9923deab1335e144eeee",
+                EnsAddresses.UNIVERSAL_RESOLVER.toHex().toLowerCase(java.util.Locale.ROOT));
+        assertEquals("0x322b7581ca210a69c6d0e0d7c88a7688d2789cb0",
+                EnsAddresses.SEPOLIA_ENSV1_MIRROR.toHex().toLowerCase(java.util.Locale.ROOT));
+    }
+
+    @Test
     void aResolverThatOnlyClaimsToBeTheMirrorDoesNotHandTheNameToV1() {
         // #672 review: the name's ENSv2 owner sets its resolver and can make it answer
         // REGISTRY_V1() with the v1 registry. Only the pinned mirror counts.
