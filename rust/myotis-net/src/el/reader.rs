@@ -2360,17 +2360,17 @@ impl ElReader {
     pub fn set_log_index_config(&self, config: crate::el::logindex::LogIndexConfig) -> bool {
         // Refuse an unbuildable config HERE — before the locks, before the
         // outgoing index is checkpointed, and before anything is taken out of
-        // the slot. Duplicate addresses are the only thing `LogIndex::new`
-        // rejects, and every `new` below is downstream of a step that cannot
-        // be undone, so catching it at the door is what makes a refused push
-        // a no-op. (Union output inherits this: `union_with` appends only
-        // addresses the pushed list lacks, and the live config was itself
-        // validated here or by `LogIndex::new`.)
-        if let Some(crate::el::logindex::DuplicateWatchAddress(a)) = config.duplicate_address() {
+        // the slot. An invalid watch-list (a key twice, a topic entry's
+        // positions out of shape) is the only thing `LogIndex::new` rejects,
+        // and every `new` below is downstream of a step that cannot be undone,
+        // so catching it at the door is what makes a refused push a no-op.
+        // (Union output inherits this: `union_with` appends only keys the
+        // pushed list lacks, and the live config was itself validated here or
+        // by `LogIndex::new`.)
+        if let Some(bad) = config.invalid() {
             tracing::warn!(
-                address = %a.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                "log-index config lists the same watch address twice; refusing it — \
-                 the installed index is unchanged"
+                reason = %bad,
+                "log-index config refused — the installed index is unchanged"
             );
             return false;
         }
@@ -2693,8 +2693,9 @@ impl ElReader {
         true
     }
 
-    /// The explicit unsubscribe: drop `addresses` from the log index — each
-    /// one's watch entry, its coverage and the logs stored for it
+    /// The explicit unsubscribe: drop `keys` (addresses or topic values) from
+    /// the log index — each one's watch entry, its coverage and the logs stored
+    /// for it that no other entry selects
     /// ([`crate::el::logindex::LogIndex::unwatch`]). Every other entry keeps
     /// what it has, so head-follow and the walk carry on for them; nothing
     /// descends for a dropped entry any more.
@@ -2735,9 +2736,9 @@ impl ElReader {
     /// BLOCKS like the config push once there is something to drop — on the
     /// checkpoint lock, which an import holds for as long as merging GBs
     /// takes. Not a UI-thread call.
-    pub fn unwatch_log_index(&self, addresses: &[[u8; 20]]) -> Result<usize, UnwatchError> {
+    pub fn unwatch_log_index(&self, keys: &[crate::el::logindex::WatchKey]) -> Result<usize, UnwatchError> {
         use std::sync::atomic::Ordering;
-        if addresses.is_empty() {
+        if keys.is_empty() {
             return Ok(0);
         }
         // Nothing to drop and nothing owed is answered under the index lock
@@ -2747,7 +2748,7 @@ impl ElReader {
         match self.log_index.lock() {
             Ok(slot) => {
                 let nothing_to_drop =
-                    slot.as_ref().is_some_and(|ix| !addresses.iter().any(|a| ix.watches_address(a)));
+                    slot.as_ref().is_some_and(|ix| !keys.iter().any(|k| ix.watches_key(k)));
                 if nothing_to_drop && !self.log_index_unwatch_owed.load(Ordering::Acquire) {
                     return Ok(0);
                 }
@@ -2778,7 +2779,7 @@ impl ElReader {
             let Some(ix) = slot.as_mut() else {
                 return Ok(0);
             };
-            let dropped = ix.unwatch(addresses);
+            let dropped = ix.unwatch(keys);
             // Re-read under the checkpoint lock: every writer that can settle
             // the debt holds it, so it cannot change from here to the write.
             if dropped == 0 && !self.log_index_unwatch_owed.load(Ordering::Acquire) {
@@ -2971,7 +2972,7 @@ impl ElReader {
     }
 
     /// Import portable log-index snapshots (docs/eth-getlogs-design.md):
-    /// every file must be a v2 self-describing snapshot of THIS chain; they
+    /// every file must be a v2/v3 self-describing snapshot of THIS chain; they
     /// merge with the node's current index (checkpointed first so nothing
     /// in-memory is lost), the merged result is persisted and installed, and
     /// the ordinary appender/bridge/walker machinery catches the union up —
@@ -3251,7 +3252,9 @@ impl ElReader {
                     .watch
                     .iter()
                     .filter(|w| w.name.is_empty())
-                    .map(|w| w.address)
+                    // ENS reverse names an address; a topic entry is named by
+                    // whoever pushed it, or stays its value.
+                    .filter_map(|w| w.key.address())
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -3275,7 +3278,7 @@ impl ElReader {
         if let Ok(EnsQueryOutcome::Value { value: EnsRecordValue::Name(name), .. }) = out {
             if let Ok(mut slot) = self.log_index.lock() {
                 if let Some(ix) = slot.as_mut() {
-                    if ix.set_name(&address, &name) {
+                    if ix.set_name(&address.into(), &name) {
                         tracing::info!(
                             name = %name,
                             "log index: named an imported watch entry via ENS reverse lookup"
@@ -9692,20 +9695,19 @@ fn receipts_hold_watched_log(
     config: &crate::el::logindex::LogIndexConfig,
 ) -> Result<bool, String> {
     let mut hit = false;
+    // Every topic, not just topic0: a topic entry matches its value at
+    // positions 1–3. One buffer for the whole block, refilled per log.
+    let mut topics: Vec<[u8; 32]> = Vec::with_capacity(4);
     for receipt in receipts {
         let decoded = crate::el::receipt::decode(receipt)?;
         for log in &decoded.logs {
             let address: &[u8; 20] =
                 log.address.as_slice().try_into().map_err(|_| MALFORMED_LOG_FIELD)?;
-            let mut topic0: Option<&[u8; 32]> = None;
-            for (k, topic) in log.topics.iter().enumerate() {
-                let topic: &[u8; 32] =
-                    topic.as_slice().try_into().map_err(|_| MALFORMED_LOG_FIELD)?;
-                if k == 0 {
-                    topic0 = Some(topic);
-                }
+            topics.clear();
+            for topic in &log.topics {
+                topics.push(topic.as_slice().try_into().map_err(|_| MALFORMED_LOG_FIELD)?);
             }
-            hit |= config.watches_parts(block_number, address, topic0);
+            hit |= config.watches_parts(block_number, address, &topics);
         }
     }
     Ok(hit)
@@ -14834,7 +14836,8 @@ mod candidate_chunk_tests {
         LogIndexConfig {
             enabled: true,
             watch: vec![WatchEntry {
-                address: WATCHED,
+                key: crate::el::logindex::WatchKey::Address(WATCHED),
+                positions: vec![],
                 from_block: 100,
                 topic0s: Vec::new(),
                 name: String::new(),
@@ -14990,6 +14993,38 @@ mod candidate_chunk_tests {
         assert!(!holds(&hit(200), 200, &restricted));
         restricted.watch[0].topic0s = vec![TOPIC];
         assert!(holds(&hit(200), 200, &restricted));
+    }
+
+    #[test]
+    fn the_scan_finds_a_watched_topic_from_any_emitter_at_its_positions() {
+        let value = [0x77; 32];
+        let receipts = |topics: &[&[u8]]| {
+            raw_list(&[encode(&Item::List(vec![
+                Item::Bytes(vec![1]),
+                Item::Bytes(u64_to_minimal_be(21_000)),
+                Item::Bytes(vec![0u8; 256]),
+                Item::List(vec![log_item(&OTHER, topics)]),
+            ]))])
+        };
+        let cfg = LogIndexConfig {
+            enabled: true,
+            watch: vec![WatchEntry {
+                key: crate::el::logindex::WatchKey::Topic(value),
+                from_block: 100,
+                topic0s: Vec::new(),
+                positions: vec![2],
+                name: String::new(),
+            }],
+            ..Default::default()
+        };
+        // An emitter nobody watches, the value at topic2: a hit.
+        assert!(receipts_hold_watched_log(200, &receipts(&[&TOPIC, &[0x01; 32], &value]), &cfg).unwrap());
+        // The value at a position the entry does not watch, or nowhere.
+        assert!(!receipts_hold_watched_log(200, &receipts(&[&TOPIC, &value]), &cfg).unwrap());
+        assert!(!receipts_hold_watched_log(200, &receipts(&[&TOPIC]), &cfg).unwrap());
+        // A wrong-length topic past topic0 is still an error, not a miss.
+        let err = receipts_hold_watched_log(200, &receipts(&[&TOPIC, &[0x01; 31]]), &cfg).unwrap_err();
+        assert!(err.contains("malformed log field"), "{err}");
     }
 
     #[test]
@@ -16207,7 +16242,8 @@ mod persist_cadence_tests {
             max_speed: false,
             backfill_paused: false,
             watch: vec![WatchEntry {
-                address: [1u8; 20],
+                key: crate::el::logindex::WatchKey::Address([1u8; 20]),
+                positions: vec![],
                 from_block: 0,
                 topic0s: vec![],
                 name: String::new(),
@@ -16239,7 +16275,7 @@ mod persist_cadence_tests {
         crate::el::logindex::write_atomic(&clamp, &checkpoint_bytes(&ix, &tag, Some(12))).unwrap();
         let clamped = LogIndex::load(&cfg, &tag, &clamp).unwrap();
         assert_eq!(
-            clamped.coverage_of(&[1u8; 20]).unwrap().span,
+            clamped.coverage_of(&crate::el::logindex::WatchKey::Address([1u8; 20])).unwrap().span,
             Some((10, 12))
         );
         let _ = std::fs::remove_file(&clamp);
@@ -16256,7 +16292,7 @@ mod persist_cadence_tests {
         crate::el::logindex::write_atomic(&nofin, &checkpoint_bytes(&ix, &tag, None)).unwrap();
         let unclamped = LogIndex::load(&cfg, &tag, &nofin).unwrap();
         assert_eq!(
-            unclamped.coverage_of(&[1u8; 20]).unwrap().span,
+            unclamped.coverage_of(&crate::el::logindex::WatchKey::Address([1u8; 20])).unwrap().span,
             Some((10, 14))
         );
         let _ = std::fs::remove_file(&nofin);
@@ -16516,7 +16552,7 @@ mod restart_claim_reader_tests {
             enabled: true,
             max_speed: false,
             backfill_paused: false,
-            watch: vec![WatchEntry { address: STAMP, from_block: 31_305_656, topic0s: vec![], name: String::new() }],
+            watch: vec![WatchEntry { key: crate::el::logindex::WatchKey::Address(STAMP), positions: vec![], from_block: 31_305_656, topic0s: vec![], name: String::new() }],
         }
     }
 
@@ -16943,7 +16979,7 @@ mod restart_claim_reader_tests {
         append(&reader, F1 + 1, F1 + 5, true);
 
         let mut grown = watch();
-        grown.watch.push(WatchEntry { address: [0x46; 20], from_block: 0, topic0s: vec![], name: String::new() });
+        grown.watch.push(WatchEntry { key: crate::el::logindex::WatchKey::Address([0x46; 20]), positions: vec![], from_block: 0, topic0s: vec![], name: String::new() });
         assert!(reader.set_log_index_config(grown));
         assert!(reader.log_index_tail.lock().unwrap().is_empty());
         assert_eq!(reader.log_index_covered_high(), Some(F1), "unconfirmed appends outlived their record");
@@ -16965,7 +17001,8 @@ mod restart_claim_reader_tests {
     fn watch_two() -> LogIndexConfig {
         let mut config = watch();
         config.watch.push(WatchEntry {
-            address: OTHER,
+            key: crate::el::logindex::WatchKey::Address(OTHER),
+            positions: vec![],
             from_block: 31_305_656,
             topic0s: vec![],
             name: String::new(),
@@ -16995,7 +17032,7 @@ mod restart_claim_reader_tests {
     }
 
     fn watches(reader: &ElReader, address: &[u8; 20]) -> bool {
-        reader.with_log_index(|ix| ix.watches_address(address)).expect("index installed")
+        reader.with_log_index(|ix| ix.watches_key(&(*address).into())).expect("index installed")
     }
 
     fn log_count(reader: &ElReader) -> usize {
@@ -17028,7 +17065,7 @@ mod restart_claim_reader_tests {
         append_two(&reader, F1 + 1, F1 + 5, true);
         let before = log_count(&reader);
 
-        assert_eq!(reader.unwatch_log_index(&[OTHER]), Ok(1));
+        assert_eq!(reader.unwatch_log_index(&[OTHER.into()]), Ok(1));
 
         assert!(!watches(&reader, &OTHER));
         assert_eq!(log_count(&reader), before / 2, "exactly the unwatched address's logs went");
@@ -17039,7 +17076,7 @@ mod restart_claim_reader_tests {
         // finds nothing of the address to bring back.
         assert_eq!(on_disk(&path), (Some(F1), Some(F1)));
         let (disk, _) = LogIndex::load_portable_with_id(&path).unwrap();
-        assert_eq!(disk.config().watch.iter().map(|w| w.address).collect::<Vec<_>>(), vec![STAMP]);
+        assert_eq!(disk.config().watch.iter().map(|w| w.key).collect::<Vec<_>>(), vec![STAMP.into()]);
 
         // The additive push that follows has nothing to union the address
         // back from, and costs the surviving entry nothing.
@@ -17048,11 +17085,11 @@ mod restart_claim_reader_tests {
         assert_eq!(reader.log_index_covered_high(), Some(F1 + 5));
 
         // Repeating it is free: nothing to drop, nothing owed, nothing written.
-        assert_eq!(reader.unwatch_log_index(&[OTHER]), Ok(0));
+        assert_eq!(reader.unwatch_log_index(&[OTHER.into()]), Ok(0));
         assert_eq!(reader.log_index_covered_high(), Some(F1 + 5));
 
         // With the last entry goes everything that described its coverage.
-        assert_eq!(reader.unwatch_log_index(&[STAMP, OTHER]), Ok(1));
+        assert_eq!(reader.unwatch_log_index(&[STAMP.into(), OTHER.into()]), Ok(1));
         assert_eq!(log_count(&reader), 0);
         assert_eq!(reader.log_index_covered_high(), None);
         assert!(reader.log_index_tail.lock().unwrap().is_empty(), "a record outlived its coverage");
@@ -17071,7 +17108,7 @@ mod restart_claim_reader_tests {
         let reader = offline_reader(anchor_at(F1, F1 + 40), &path).await;
         assert!(reader.with_log_index(|_| ()).is_none(), "nothing installed yet");
 
-        assert_eq!(reader.unwatch_log_index(&[OTHER]), Ok(1));
+        assert_eq!(reader.unwatch_log_index(&[OTHER.into()]), Ok(1));
         assert!(reader.set_log_index_config(watch()));
 
         assert!(!watches(&reader, &OTHER), "the boot union brought the address back");
@@ -17094,18 +17131,18 @@ mod restart_claim_reader_tests {
         // The disk goes away under the index (a full one fails the same way:
         // the scratch file cannot be created).
         std::fs::remove_dir_all(&dir.0).unwrap();
-        assert_eq!(reader.unwatch_log_index(&[OTHER]), Err(UnwatchError::NotPersisted));
+        assert_eq!(reader.unwatch_log_index(&[OTHER.into()]), Err(UnwatchError::NotPersisted));
         assert!(!watches(&reader, &OTHER), "the entries stay dropped in memory");
         // Nothing left to drop — and still not done.
-        assert_eq!(reader.unwatch_log_index(&[OTHER]), Err(UnwatchError::NotPersisted));
+        assert_eq!(reader.unwatch_log_index(&[OTHER.into()]), Err(UnwatchError::NotPersisted));
 
         std::fs::create_dir_all(&dir.0).unwrap();
-        assert_eq!(reader.unwatch_log_index(&[OTHER]), Ok(0), "the owed checkpoint was not retried");
+        assert_eq!(reader.unwatch_log_index(&[OTHER.into()]), Ok(0), "the owed checkpoint was not retried");
         let (disk, _) = LogIndex::load_portable_with_id(&path).expect("the retried checkpoint");
-        assert_eq!(disk.config().watch.iter().map(|w| w.address).collect::<Vec<_>>(), vec![STAMP]);
+        assert_eq!(disk.config().watch.iter().map(|w| w.key).collect::<Vec<_>>(), vec![STAMP.into()]);
         // Settled: the next repeat is the free one again.
         std::fs::remove_dir_all(&dir.0).unwrap();
-        assert_eq!(reader.unwatch_log_index(&[OTHER]), Ok(0));
+        assert_eq!(reader.unwatch_log_index(&[OTHER.into()]), Ok(0));
         std::fs::create_dir_all(&dir.0).unwrap();
         reader.stop().await;
     }
@@ -17119,12 +17156,12 @@ mod restart_claim_reader_tests {
         let reader = offline_reader(anchor_at(F1, F1 + 40), &path).await;
         assert!(reader.install_log_index_from_disk());
         std::fs::remove_dir_all(&dir.0).unwrap();
-        assert_eq!(reader.unwatch_log_index(&[OTHER]), Err(UnwatchError::NotPersisted));
+        assert_eq!(reader.unwatch_log_index(&[OTHER.into()]), Err(UnwatchError::NotPersisted));
 
         std::fs::create_dir_all(&dir.0).unwrap();
         assert!(reader.persist_log_index(F1, false));
         std::fs::remove_dir_all(&dir.0).unwrap();
-        assert_eq!(reader.unwatch_log_index(&[OTHER]), Ok(0), "the debt outlived a landed checkpoint");
+        assert_eq!(reader.unwatch_log_index(&[OTHER.into()]), Ok(0), "the debt outlived a landed checkpoint");
         std::fs::create_dir_all(&dir.0).unwrap();
         reader.stop().await;
     }
@@ -17134,7 +17171,7 @@ mod restart_claim_reader_tests {
         let dir = TempDir::new("unwatch-none");
         let path = dir.0.join("logindex-gnosis.db");
         let reader = offline_reader(anchor_at(F1, F1 + 40), &path).await;
-        assert_eq!(reader.unwatch_log_index(&[OTHER]), Ok(0));
+        assert_eq!(reader.unwatch_log_index(&[OTHER.into()]), Ok(0));
         assert_eq!(reader.unwatch_log_index(&[]), Ok(0));
         assert!(reader.with_log_index(|_| ()).is_none(), "an unwatch conjured an index");
         assert!(!path.exists());
@@ -17157,7 +17194,7 @@ mod restart_claim_reader_tests {
 
         let mut bad = watch();
         bad.watch[0].topic0s = vec![[0x99; 32]]; // no union, so no merge path
-        bad.watch.push(WatchEntry { address: STAMP, from_block: 0, topic0s: vec![], name: String::new() });
+        bad.watch.push(WatchEntry { key: crate::el::logindex::WatchKey::Address(STAMP), positions: vec![], from_block: 0, topic0s: vec![], name: String::new() });
         assert!(!reader.set_log_index_config(bad), "a duplicate-address config installed");
 
         assert_eq!(reader.log_index_covered_high(), Some(F1 + 5), "the live index vanished");
@@ -17179,7 +17216,7 @@ mod restart_claim_reader_tests {
         append(&reader, F1 + 1, F1 + 5, true);
 
         let mut bad = watch();
-        bad.watch.push(WatchEntry { address: STAMP, from_block: 0, topic0s: vec![], name: String::new() });
+        bad.watch.push(WatchEntry { key: crate::el::logindex::WatchKey::Address(STAMP), positions: vec![], from_block: 0, topic0s: vec![], name: String::new() });
         assert!(!reader.set_log_index_config(bad), "a duplicate-address config installed");
 
         assert_eq!(reader.log_index_covered_high(), Some(F1 + 5), "unconfirmed coverage was rewound");
@@ -17203,7 +17240,7 @@ mod restart_claim_reader_tests {
         assert!(reader.install_log_index_from_disk());
 
         let mut bad = watch();
-        bad.watch.push(WatchEntry { address: STAMP, from_block: 0, topic0s: vec![], name: String::new() });
+        bad.watch.push(WatchEntry { key: crate::el::logindex::WatchKey::Address(STAMP), positions: vec![], from_block: 0, topic0s: vec![], name: String::new() });
 
         // Held as a checkpoint write (or an import) holds it.
         let held = reader.log_index_write.lock().unwrap();

@@ -2076,7 +2076,7 @@ pub fn ens_record_json(handle: i64, params_json: &str) -> String {
     // method:"ccipCallback" re-enters after a host-driven gateway round: the
     // ORIGINAL query travels as queryMethod + its usual fields (drives the
     // decode semantics + reverse forward-verify), plus the callback tuple and,
-    // when the offchain envelope carried one, its reverseClaim (ABI ≥ 48).
+    // when the offchain envelope carried one, its reverseClaim (ABI ≥ 49).
     let is_ccip = method == "ccipCallback";
     let query_method = if is_ccip {
         match str_field("queryMethod") {
@@ -3053,7 +3053,7 @@ fn running_reader(engine: &EngineState, handle: i64) -> Result<Arc<ElReader>, &'
 }
 
 /// The `reverseClaim` a ccipCallback echoes from the offchain envelope (ABI ≥
-/// 48): the claimed name whose forward check the round answered, which makes
+/// 49): the claimed name whose forward check the round answered, which makes
 /// the callback read the answer as that name's address. Applied or refused,
 /// never ignored: only a reverse query's callback may carry one, and it must be
 /// a well-formed name — the engine emits no other, so anything else is a host
@@ -4611,15 +4611,19 @@ mod tests {
 
 /// Install the watch-list config: `{"enabled":bool,"watch":[{"address":"0x..",
 /// "fromBlock":n,"topic0s":["0x..",..]?,"name":"..."?}],"unwatch":["0x..",..]?}`.
-/// False on malformed input, duplicate addresses, an address under both
+/// A watch entry may name a 32-byte `"topic"` instead of an `"address"`
+/// (ABI ≥ 48, #673), with optional `"positions"` (1–3, default all three):
+/// every log from any emitter carrying that value at one of those positions.
+/// False on malformed input, a key listed twice, a key under both
 /// `watch` and `unwatch`, or an unavailable reader.
 ///
 /// `watch` is ADDITIVE — unioned with what the index already subscribes — so
-/// leaving an address out of it removes nothing. `unwatch` (ABI ≥ 37) is the
-/// unsubscribe: each address it names is dropped from the index before the
-/// union, with its coverage and its stored logs, while every other entry
-/// keeps its own (`ElReader::unwatch_log_index`). An address the index does
-/// not watch is ignored, so repeating an unwatch is harmless.
+/// leaving an entry out of it removes nothing. `unwatch` (ABI ≥ 37) is the
+/// unsubscribe: each address (or, ABI ≥ 48, 32-byte topic value) it names is
+/// dropped from the index before the union, with its coverage and its stored
+/// logs, while every other entry keeps its own
+/// (`ElReader::unwatch_log_index`). A key the index does not watch is
+/// ignored, so repeating an unwatch is harmless.
 ///
 /// `true` means the whole push is done, the unwatch DURABLY: its checkpoint
 /// is on disk, so a restart cannot bring the address back. A host may stop
@@ -4639,17 +4643,18 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
     };
     let Some(config) = parse_log_index_config(&v) else {
         tracing::warn!(
-            "log-index config refused: a watch entry is missing `address` or `fromBlock`, \
-             a field has the wrong type or is not valid hex, or the watch list names \
-             one address twice; ignoring the push"
+            "log-index config refused: a watch entry is missing `fromBlock` or does not \
+             name exactly one of `address` and `topic`, a field has the wrong type or is \
+             not valid hex, `positions` is not a list of 1-3, or the watch list names one \
+             address or topic twice; ignoring the push"
         );
         return false;
     };
     let Some(unwatch) = parse_log_index_unwatch(&v, &config) else {
         tracing::warn!(
             "log-index config refused: `unwatch` is not an array of 20-byte hex \
-             addresses, or it names an address the same push lists under `watch`; \
-             ignoring the push"
+             addresses and 32-byte hex topic values, or it names one the same push \
+             lists under `watch`; ignoring the push"
         );
         return false;
     };
@@ -4691,31 +4696,37 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
     installed
 }
 
-/// The config JSON's `unwatch` list — the addresses the host no longer wants
-/// indexed (see [`set_log_index_config_json`]). Absent or `null` is the empty
-/// list. `None` = malformed: `unwatch` is there but is not an array, an
-/// element is not a 20-byte hex address, or an address is also in `config`'s
-/// watch-list. A push cannot both subscribe and unsubscribe one address, and
+/// The config JSON's `unwatch` list — the entries the host no longer wants
+/// indexed (see [`set_log_index_config_json`]): 20-byte hex addresses and
+/// 32-byte hex topic values, told apart by their width. Absent or `null` is
+/// the empty list. `None` = malformed: `unwatch` is there but is not an
+/// array, an element is neither width, or a key is also in `config`'s
+/// watch-list. A push cannot both subscribe and unsubscribe one key, and
 /// picking one for the caller would silently drop either its subscription or
-/// its unwatch (CLAUDE.md §Trust — applied or refused). Naming an address
-/// twice is harmless — an unwatch is idempotent — and is folded into one.
+/// its unwatch (CLAUDE.md §Trust — applied or refused). Naming a key twice is
+/// harmless — an unwatch is idempotent — and is folded into one.
 /// Pure — unit-tested.
 fn parse_log_index_unwatch(
     v: &serde_json::Value,
     config: &myotis_net::el::logindex::LogIndexConfig,
-) -> Option<Vec<[u8; 20]>> {
+) -> Option<Vec<myotis_net::el::logindex::WatchKey>> {
+    use myotis_net::el::logindex::WatchKey;
     let entries = match v.get("unwatch") {
         None | Some(serde_json::Value::Null) => return Some(Vec::new()),
         Some(other) => other.as_array()?,
     };
     let mut unwatch = Vec::with_capacity(entries.len());
     for e in entries {
-        let address = e.as_str().and_then(parse_address)?;
-        if config.watch.iter().any(|w| w.address == address) {
+        let hex = e.as_str()?;
+        let key = match parse_address(hex) {
+            Some(address) => WatchKey::Address(address),
+            None => WatchKey::Topic(parse_word32(hex)?),
+        };
+        if config.watch.iter().any(|w| w.key == key) {
             return None;
         }
-        if !unwatch.contains(&address) {
-            unwatch.push(address);
+        if !unwatch.contains(&key) {
+            unwatch.push(key);
         }
     }
     Some(unwatch)
@@ -4736,10 +4747,11 @@ fn strict_bool(v: &serde_json::Value, key: &str, default: bool) -> Option<bool> 
 
 /// Pure config-JSON → typed config (unit-tested; the FFI wrapper above only
 /// adds engine plumbing). `None` = malformed — a watch entry missing the
-/// required `address` or `fromBlock`, a field of the wrong type, an address
-/// or topic that is not valid hex of the right width, or a watch-list that
-/// names one address twice. Unknown keys are ignored for forward
-/// compatibility.
+/// required `fromBlock`, naming neither or both of `address` and `topic`, a
+/// field of the wrong type, an address or topic that is not valid hex of the
+/// right width, `positions` that are not 1–3 (or on an address entry at all),
+/// or a watch-list that names one key twice. Unknown keys are ignored for
+/// forward compatibility.
 fn parse_log_index_config(
     v: &serde_json::Value,
 ) -> Option<myotis_net::el::logindex::LogIndexConfig> {
@@ -4761,7 +4773,23 @@ fn parse_log_index_config(
     }
     if let Some(entries) = v.get("watch").and_then(|w| w.as_array()) {
         for e in entries {
-            let address = e.get("address").and_then(|a| a.as_str()).and_then(parse_address)?;
+            let present = |k: &str| e.get(k).is_some_and(|x| !x.is_null());
+            let (key, positions) = match (present("address"), present("topic")) {
+                (true, false) => {
+                    // Positions belong to a topic entry; on an address entry
+                    // they would be a restriction nothing applies.
+                    if present("positions") {
+                        return None;
+                    }
+                    let address = e.get("address").and_then(|a| a.as_str()).and_then(parse_address)?;
+                    (myotis_net::el::logindex::WatchKey::Address(address), Vec::new())
+                }
+                (false, true) => {
+                    let value = e.get("topic").and_then(|t| t.as_str()).and_then(parse_word32)?;
+                    (myotis_net::el::logindex::WatchKey::Topic(value), parse_topic_positions(e.get("positions"))?)
+                }
+                _ => return None,
+            };
             let from_block = e.get("fromBlock").and_then(|b| b.as_u64())?;
             let mut topic0s = Vec::new();
             if e.get("topic0s").is_some_and(|t| !t.is_array() && !t.is_null()) {
@@ -4778,7 +4806,7 @@ fn parse_log_index_config(
                 return None;
             }
             let name = e.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-            watch.push(myotis_net::el::logindex::WatchEntry { address, from_block, topic0s, name });
+            watch.push(myotis_net::el::logindex::WatchEntry { key, from_block, topic0s, positions, name });
         }
     }
     let config =
@@ -4788,14 +4816,35 @@ fn parse_log_index_config(
     // here keeps a malformed push off the checkpoint lock entirely — that lock
     // can be held for as long as an import takes to merge GBs, and a caller
     // that is going to get `false` either way should not wait behind it.
-    if config.duplicate_address().is_some() {
+    if config.invalid().is_some() {
         return None;
     }
     Some(config)
 }
 
+/// A topic entry's `positions`: absent or `null` is all three (the common
+/// case — a wallet's address sits at topic1 or topic2 of an ERC-20/721
+/// transfer and topic2 or topic3 of an ERC-1155 one); otherwise a non-empty
+/// array of the integers 1–3, in any order, a repeat folded. Anything else is
+/// `None` — a malformed restriction is refused, never widened to a default.
+fn parse_topic_positions(v: Option<&serde_json::Value>) -> Option<Vec<u8>> {
+    use myotis_net::el::logindex::TOPIC_POSITIONS;
+    let items = match v {
+        None | Some(serde_json::Value::Null) => return Some(TOPIC_POSITIONS.to_vec()),
+        Some(other) => other.as_array()?,
+    };
+    let mut positions = Vec::with_capacity(items.len());
+    for p in items {
+        let p = u8::try_from(p.as_u64()?).ok().filter(|p| TOPIC_POSITIONS.contains(p))?;
+        positions.push(p);
+    }
+    positions.sort_unstable();
+    positions.dedup();
+    (!positions.is_empty()).then_some(positions)
+}
+
 /// Import portable log-index snapshots: `paths_json` is a JSON array of
-/// absolute file paths (each a v2 self-describing snapshot of THIS handle's
+/// absolute file paths (each a v2/v3 self-describing snapshot of THIS handle's
 /// chain). They merge with the node's current index (all-or-nothing), the
 /// result is persisted + installed, and — since importing IS the opt-in —
 /// the appender is spawned so catch-up starts immediately.
@@ -4823,8 +4872,9 @@ pub fn import_log_index_files(handle: i64, paths_json: &str) -> String {
 }
 
 /// Export the current index as a portable snapshot at `path` (the
-/// generator's output; finality-clamped, self-describing v2 — importable
-/// anywhere on the same chain). `{"ok":true}` or `{"error":"..."}`.
+/// generator's output; finality-clamped, self-describing v2 — v3 when it
+/// holds a topic entry — importable anywhere on the same chain).
+/// `{"ok":true}` or `{"error":"..."}`.
 pub fn export_log_index(handle: i64, path: &str) -> String {
     if path.trim().is_empty() {
         return eljson::error_json("empty export path");
@@ -4967,11 +5017,25 @@ fn build_log_index_status(
             if k > 0 {
                 s.push(',');
             }
-            s.push_str("{\"address\":\"0x");
-            for b in &w.address {
-                let _ = std::fmt::Write::write_fmt(&mut s, format_args!("{b:02x}"));
+            // An address entry keeps the exact shape the hosts' parser pins;
+            // a topic entry (#673) opens with its value and positions instead,
+            // which that parser does not read as an address entry.
+            match w.key {
+                myotis_net::el::logindex::WatchKey::Address(_) => {
+                    s.push_str("{\"address\":\"");
+                    s.push_str(&w.key.to_string());
+                    s.push('"');
+                }
+                myotis_net::el::logindex::WatchKey::Topic(_) => {
+                    s.push_str("{\"topic\":\"");
+                    s.push_str(&w.key.to_string());
+                    s.push_str("\",\"positions\":[");
+                    let positions: Vec<String> = w.positions.iter().map(u8::to_string).collect();
+                    s.push_str(&positions.join(","));
+                    s.push(']');
+                }
             }
-            s.push_str("\",\"fromBlock\":");
+            s.push_str(",\"fromBlock\":");
             s.push_str(&w.from_block.to_string());
             if !w.name.is_empty() {
                 // serde_json handles the escaping (names come from hosts or
@@ -5083,12 +5147,13 @@ fn parse_get_logs_filter(v: &serde_json::Value) -> Result<ParsedLogFilter, Strin
         Some(serde_json::Value::String(a)) => {
             addresses.push(parse_address(a).ok_or("malformed address")?);
         }
-        Some(serde_json::Value::Array(items)) if !items.is_empty() => {
+        Some(serde_json::Value::Array(items)) => {
             for a in items {
                 addresses.push(a.as_str().and_then(parse_address).ok_or("malformed address")?);
             }
         }
-        _ => return Err("eth_getLogs without an address is not served by this scoped index".to_string()),
+        None | Some(serde_json::Value::Null) => {}
+        Some(_) => return Err("malformed address".to_string()),
     }
     let mut topics: Vec<Vec<[u8; 32]>> = Vec::new();
     match v.get("topics") {
@@ -5113,6 +5178,15 @@ fn parse_get_logs_filter(v: &serde_json::Value) -> Result<ParsedLogFilter, Strin
         }
         Some(_) => return Err("malformed topics".to_string()),
     }
+    // Without an address only a topic entry (#673) can answer, and only a
+    // filter that pins one of topics 1-3 to a single value can be one a topic
+    // entry answers. Anything else is refused for good: no watch-list this
+    // node could hold selects its logs.
+    if addresses.is_empty() && !myotis_net::el::logindex::pins_a_topic(&topics) {
+        return Err("eth_getLogs without an address is served by this scoped index only for a \
+                    watched topic: pin one of topics 1-3 to a single value"
+            .to_string());
+    }
     Ok(ParsedLogFilter { from, to, addresses, topics })
 }
 
@@ -5120,7 +5194,8 @@ fn parse_get_logs_filter(v: &serde_json::Value) -> Result<ParsedLogFilter, Strin
 /// range is inside indexed coverage; every other case is `{"error": ...}`
 /// (the router maps it to strict -32000) — never an empty array for an
 /// unindexed range. A filter that fails to parse — malformed, a `safe` or hash
-/// selector, no address, two explicit bounds the wrong way round — is the
+/// selector, no address and no pinned topic, two explicit bounds the wrong way
+/// round — is the
 /// permanent `{"error","code":-32602}` (#366), decided before the node's state
 /// is consulted, so a paused or unsynced node answers it the same; every
 /// refusal that depends on the index (coverage, the watch-list, a range
@@ -5284,17 +5359,17 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
     // daemon's `logindex-backfill on` does not exist on desktop, Android or iOS,
     // whose lever is the Index tab's pause switch.
     let paused = reader.with_log_index(|ix| ix.config().backfill_paused) == Some(true);
-    let effective_from = |address: [u8; 20]| -> u64 {
+    let effective_from = |key: myotis_net::el::logindex::WatchKey| -> u64 {
         let entry_from = reader
             .with_log_index(|ix| {
-                ix.config().watch.iter().find(|w| w.address == address).map(|w| w.from_block)
+                ix.config().watch.iter().find(|w| w.key == key).map(|w| w.from_block)
             })
             .flatten()
             .unwrap_or(0);
         filter.from_block.max(entry_from)
     };
-    let advice = |address: [u8; 20], low: u64| -> &'static str {
-        if paused && effective_from(address) < low {
+    let advice = |key: myotis_net::el::logindex::WatchKey, low: u64| -> &'static str {
+        if paused && effective_from(key) < low {
             "the backfill is paused on this node, so this range will not be filled in; resume it (Index tab switch, or logindex-backfill on in the daemon) or query within the covered range"
         } else {
             "retry as the index catches up"
@@ -5307,13 +5382,22 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
         Some(Err(QueryError::UnwatchedAddress(_))) => {
             eljson::error_json("address is not on this node's log watch-list")
         }
-        Some(Err(QueryError::UnindexedTopic(_))) => {
+        Some(Err(QueryError::UnwatchedTopic)) => eljson::error_json(
+            "no topic this filter pins is on this node's log watch-list, and it names no address",
+        ),
+        Some(Err(QueryError::UnindexedTopic(myotis_net::el::logindex::WatchKey::Address(_)))) => {
             eljson::error_json("topic is outside this node's indexed signatures for that address")
         }
-        Some(Err(QueryError::OutOfCoverage { address, covered })) => match covered.span {
+        Some(Err(QueryError::UnindexedTopic(myotis_net::el::logindex::WatchKey::Topic(_)))) => {
+            eljson::error_json(
+                "the watched topic is pinned only at positions, or under signatures, this node \
+                 does not index it for",
+            )
+        }
+        Some(Err(QueryError::OutOfCoverage { key, covered })) => match covered.span {
             Some((low, high)) => eljson::error_json(&format!(
                 "requested range is not indexed yet (covered: {low}-{high}); {}",
-                advice(address, low)
+                advice(key, low)
             )),
             // No coverage at all yet, so there is no side to compare against.
             // Head-follow still starts covering from the head as blocks arrive,
@@ -5345,7 +5429,7 @@ mod log_index_json_tests {
     }
 
     /// The `unwatch` list of a config that itself parses.
-    fn unwatch(json: &str) -> Option<Vec<[u8; 20]>> {
+    fn unwatch(json: &str) -> Option<Vec<myotis_net::el::logindex::WatchKey>> {
         let v = serde_json::from_str(json).unwrap();
         parse_log_index_unwatch(&v, &parse_log_index_config(&v).expect("config parses"))
     }
@@ -5362,7 +5446,7 @@ mod log_index_json_tests {
         let twice = format!(r#"{{"enabled":false,"unwatch":["{a}","{}","{b}"]}}"#, a.to_lowercase());
         let parsed = unwatch(&twice).unwrap();
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[1], [0xab; 20]);
+        assert_eq!(parsed[1], [0xab; 20].into());
         // Applied or refused: a malformed list refuses the push rather than
         // unwatching the part of it that happened to parse.
         assert!(unwatch(r#"{"enabled":true,"unwatch":"0x4e69fD587118dFb64957d18654E3894118E9b1BF"}"#).is_none());
@@ -5379,7 +5463,76 @@ mod log_index_json_tests {
         let swap = format!(
             r#"{{"enabled":true,"watch":[{{"address":"{a}","fromBlock":5}}],"unwatch":["{b}"]}}"#
         );
-        assert_eq!(unwatch(&swap), Some(vec![[0xab; 20]]));
+        assert_eq!(unwatch(&swap), Some(vec![[0xab; 20].into()]));
+    }
+
+    #[test]
+    fn parses_topic_entries_and_their_unwatch() {
+        use myotis_net::el::logindex::WatchKey;
+        let t = format!("0x{}", "77".repeat(32));
+        // Positions default to all three; given, they are sorted and folded.
+        let c = cfg(&format!(r#"{{"enabled":true,"watch":[{{"topic":"{t}","fromBlock":9}}]}}"#)).unwrap();
+        assert_eq!(c.watch[0].key, WatchKey::Topic([0x77; 32]));
+        assert_eq!(c.watch[0].positions, vec![1, 2, 3]);
+        assert_eq!(c.watch[0].from_block, 9);
+        let c = cfg(&format!(r#"{{"enabled":true,"watch":[{{"topic":"{t}","positions":[2,1,2],"fromBlock":9,"topic0s":["0x{}"]}}]}}"#, "dd".repeat(32)))
+            .unwrap();
+        assert_eq!(c.watch[0].positions, vec![1, 2]);
+        assert_eq!(c.watch[0].topic0s, vec![[0xdd; 32]]);
+        // Refused, never widened: bad positions, positions on an address
+        // entry, both or neither key, a short topic.
+        let a = format!("0x{}", "ab".repeat(20));
+        for bad in [
+            format!(r#"{{"topic":"{t}","positions":[],"fromBlock":0}}"#),
+            format!(r#"{{"topic":"{t}","positions":[0],"fromBlock":0}}"#),
+            format!(r#"{{"topic":"{t}","positions":[4],"fromBlock":0}}"#),
+            format!(r#"{{"topic":"{t}","positions":["1"],"fromBlock":0}}"#),
+            format!(r#"{{"topic":"{t}","positions":1,"fromBlock":0}}"#),
+            format!(r#"{{"address":"{a}","positions":[1],"fromBlock":0}}"#),
+            format!(r#"{{"address":"{a}","topic":"{t}","fromBlock":0}}"#),
+            r#"{"fromBlock":0}"#.to_string(),
+            format!(r#"{{"topic":"{a}","fromBlock":0}}"#),
+            format!(r#"{{"topic":"{t}"}}"#),
+        ] {
+            assert!(cfg(&format!(r#"{{"enabled":true,"watch":[{bad}]}}"#)).is_none(), "{bad} parsed");
+        }
+        // A topic value twice is a duplicate, whatever its positions.
+        assert!(cfg(&format!(
+            r#"{{"enabled":true,"watch":[{{"topic":"{t}","fromBlock":0}},{{"topic":"{t}","positions":[1],"fromBlock":5}}]}}"#
+        ))
+        .is_none());
+        // The unwatch list tells the two kinds apart by width, and refuses a
+        // topic the same push watches.
+        let both = unwatch(&format!(r#"{{"enabled":true,"unwatch":["{a}","{t}"]}}"#)).unwrap();
+        assert_eq!(both, vec![WatchKey::Address([0xab; 20]), WatchKey::Topic([0x77; 32])]);
+        assert!(unwatch(&format!(
+            r#"{{"enabled":true,"watch":[{{"topic":"{t}","fromBlock":0}}],"unwatch":["{t}"]}}"#
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn status_shows_a_topic_entry_with_its_positions() {
+        use myotis_net::el::logindex::{LogIndex, LogIndexConfig, WatchEntry, WatchKey};
+        let w = WatchEntry {
+            key: WatchKey::Topic([0x77; 32]),
+            from_block: 3,
+            topic0s: vec![[0xdd; 32]],
+            positions: vec![1, 2],
+            name: "me".into(),
+        };
+        let mut ix = LogIndex::new(LogIndexConfig { enabled: true, watch: vec![w], ..Default::default() }).unwrap();
+        ix.append_block(3, [0; 32], vec![]).unwrap();
+        let json = build_log_index_status(&ix, None, 3);
+        assert!(
+            json.contains(&format!(
+                r#"{{"topic":"0x{}","positions":[1,2],"fromBlock":3,"name":"me","coveredLow":3,"coveredHigh":3,"restricted":true}}"#,
+                "77".repeat(32)
+            )),
+            "{json}"
+        );
+        assert!(!json.contains("\"address\""), "a topic entry is not an address entry: {json}");
+        serde_json::from_str::<serde_json::Value>(&json).expect("valid JSON");
     }
 
     #[test]
@@ -5466,7 +5619,8 @@ mod log_index_json_tests {
     #[test]
     fn status_json_carries_progress_keys() {
         let w = myotis_net::el::logindex::WatchEntry {
-            address: [0x11; 20],
+            key: myotis_net::el::logindex::WatchKey::Address([0x11; 20]),
+            positions: vec![],
             from_block: 100,
             topic0s: vec![],
             name: String::new(),
@@ -5503,7 +5657,8 @@ mod log_index_json_tests {
         // there and pushing it would be a topic conflict, which replaces the
         // whole index. The status is how a host knows not to.
         let entry = |b: u8, topic0s| myotis_net::el::logindex::WatchEntry {
-            address: [b; 20],
+            key: myotis_net::el::logindex::WatchKey::Address([b; 20]),
+            positions: vec![],
             from_block: 100,
             topic0s,
             name: String::new(),
@@ -5539,7 +5694,8 @@ mod log_index_json_tests {
     #[test]
     fn blocks_remaining_is_zero_once_the_target_entry_is_already_complete() {
         let w = myotis_net::el::logindex::WatchEntry {
-            address: [0x11; 20],
+            key: myotis_net::el::logindex::WatchKey::Address([0x11; 20]),
+            positions: vec![],
             from_block: 100,
             topic0s: vec![],
             name: String::new(),
@@ -5585,7 +5741,7 @@ mod log_index_json_tests {
         let addr_b = [0x22; 20];
 
         // Source A: already backfilled all the way to its own from_block=1.
-        let a = WatchEntry { address: addr_a, from_block: 1, topic0s: vec![], name: String::new() };
+        let a = WatchEntry { key: myotis_net::el::logindex::WatchKey::Address(addr_a), positions: vec![], from_block: 1, topic0s: vec![], name: String::new() };
         let cfg_a =
             LogIndexConfig { enabled: true, max_speed: true, backfill_paused: true, watch: vec![a] };
         let mut ix_a = LogIndex::new(cfg_a).unwrap();
@@ -5596,7 +5752,7 @@ mod log_index_json_tests {
 
         // Source B: config-only — the user just added contract B
         // (from_block=15), nothing fetched for it yet.
-        let b = WatchEntry { address: addr_b, from_block: 15, topic0s: vec![], name: String::new() };
+        let b = WatchEntry { key: myotis_net::el::logindex::WatchKey::Address(addr_b), positions: vec![], from_block: 15, topic0s: vec![], name: String::new() };
         let cfg_b =
             LogIndexConfig { enabled: false, max_speed: false, backfill_paused: false, watch: vec![b] };
         let ix_b = LogIndex::new(cfg_b).unwrap();
@@ -5609,8 +5765,8 @@ mod log_index_json_tests {
         // The next head-follow append reseeds the cursor and gives B its
         // first-ever span, above its own from_block.
         ix.append_block(20, [2u8; 32], vec![]).unwrap();
-        assert_eq!(ix.coverage_of(&addr_a).unwrap().span, Some((1, 20)), "sanity: A still complete");
-        assert_eq!(ix.coverage_of(&addr_b).unwrap().span, Some((20, 20)), "sanity: B seeded, not backfilled");
+        assert_eq!(ix.coverage_of(&myotis_net::el::logindex::WatchKey::Address(addr_a)).unwrap().span, Some((1, 20)), "sanity: A still complete");
+        assert_eq!(ix.coverage_of(&myotis_net::el::logindex::WatchKey::Address(addr_b)).unwrap().span, Some((20, 20)), "sanity: B seeded, not backfilled");
 
         let s = build_log_index_status(&ix, None, 0);
         // targetLow is unaffected — still the minimum from_block over every
@@ -5908,6 +6064,7 @@ mod get_logs_filter_tests {
     fn address_forms_and_empty_array_error() {
         assert!(f("{}").is_err());
         assert!(f("{\"address\":[]}").unwrap_err().contains("without an address"));
+        assert!(f("{\"address\":5}").unwrap_err().contains("malformed address"));
         assert!(f(&format!("{{\"address\":[\"0x{}\",\"0x{}\"]}}", "11".repeat(20), "22".repeat(20))).unwrap().addresses.len() == 2);
         assert!(f("{\"address\":\"0xzz\"}").is_err());
     }
@@ -5922,5 +6079,30 @@ mod get_logs_filter_tests {
         // A non-array topics value must ERROR, not silently widen the query.
         assert!(f(&format!("{{{addr},\"topics\":\"{t}\"}}")).unwrap_err().contains("malformed topics"));
         assert!(f(&format!("{{{addr},\"topics\":[5]}}")).is_err());
+    }
+
+    #[test]
+    fn an_address_less_filter_must_pin_one_of_topics_1_to_3() {
+        let t = format!("\"0x{}\"", "77".repeat(32));
+        let u = format!("\"0x{}\"", "88".repeat(32));
+        // What a topic entry can answer: a value pinned at 1, 2 or 3, alone or
+        // as an OR-list repeating it, with or without an address list.
+        for ok in [
+            format!("{{\"topics\":[null,{t}]}}"),
+            format!("{{\"topics\":[{u},null,[{t},{t}]]}}"),
+            format!("{{\"address\":null,\"topics\":[null,null,null,{t}]}}"),
+            format!("{{\"address\":[],\"topics\":[null,{t}]}}"),
+        ] {
+            assert!(f(&ok).is_ok(), "{ok}");
+        }
+        // Never answerable without an address: refused for good.
+        for bad in [
+            format!("{{\"topics\":[{t}]}}"),
+            format!("{{\"topics\":[null,[{t},{u}]]}}"),
+            format!("{{\"topics\":[null,null]}}"),
+            format!("{{\"topics\":[null,null,null,null,{t}]}}"),
+        ] {
+            assert!(f(&bad).unwrap_err().contains("without an address"), "{bad}");
+        }
     }
 }

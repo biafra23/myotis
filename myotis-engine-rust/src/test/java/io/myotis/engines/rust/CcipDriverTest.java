@@ -37,7 +37,7 @@ class CcipDriverTest {
     }
 
     /**
-     * The envelope of a reverse query's FORWARD-check round (ABI 48): the same
+     * The envelope of a reverse query's FORWARD-check round (ABI 49): the same
      * tuple plus the claimed name it verifies ({@code ens_record_json_shapes}
      * pins the Rust half).
      */

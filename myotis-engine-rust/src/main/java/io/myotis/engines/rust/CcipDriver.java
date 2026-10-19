@@ -32,7 +32,7 @@ import java.util.regex.Pattern;
  * <p>A reverse lookup has two steps, each a call of its own on the Java engine
  * (its depth counter is per callView): reading the claimed name, and
  * forward-verifying it. Either may resolve off chain. An envelope whose round
- * is the FORWARD check carries {@code reverseClaim} (ABI 48), which this
+ * is the FORWARD check carries {@code reverseClaim} (ABI 49), which this
  * driver echoes into the callback so the native side reads the answer as the
  * claimed name's address rather than as a claim — without it, an on-chain
  * claim with an off-chain forward record (a {@code *.cb.id} primary name)

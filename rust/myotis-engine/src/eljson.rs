@@ -671,7 +671,7 @@ pub fn ens_json(outcome: &EnsOutcome) -> String {
 /// - `{"status":"offchain","blockNumber":N,"blockTimestamp":T,"verified":b,"wrapped":b}`
 ///   plus, when the revert's tuple parsed, `senderHex` / `urls` / `callDataHex`
 ///   / `callbackFunctionHex` / `extraDataHex` for the host's gateway round and —
-///   ABI ≥ 48, a reverse query forward-verifying a claimed name — `reverseClaim`,
+///   ABI ≥ 49, a reverse query forward-verifying a claimed name — `reverseClaim`,
 ///   which the host echoes into the `ccipCallback` with the tuple.
 ///
 /// `verified` = the resolution ran against the beacon-FINALIZED root.
@@ -764,7 +764,7 @@ pub fn ens_record_json(outcome: &EnsQueryOutcome) -> String {
                     hex0x_var(&l.callback_function).into(),
                 );
                 obj.insert("extraDataHex".into(), hex0x_var(&l.extra_data).into());
-                // ABI ≥ 48: a reverse query's round that forward-verifies this
+                // ABI ≥ 49: a reverse query's round that forward-verifies this
                 // claimed name — the host echoes it into the callback, which then
                 // reads the answer as the name's address, not as a claim.
                 if let Some(claim) = reverse_claim {
@@ -1497,7 +1497,7 @@ mod tests {
         assert_eq!(full["verified"], true);
         // Only a reverse query's forward-check round carries a claim.
         assert!(full.get("reverseClaim").is_none());
-        // ABI 48: the forward check of a reverse claim — the same tuple plus the
+        // ABI 49: the forward check of a reverse claim — the same tuple plus the
         // claim the host echoes (CcipDriverTest replays this literal too).
         let claim: serde_json::Value = serde_json::from_str(&ens_record_json(
             &EnsQueryOutcome::Offchain {
