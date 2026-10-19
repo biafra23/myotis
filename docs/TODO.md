@@ -327,3 +327,6 @@ complete on its own.
   would mean the same `findResolver` step in `EnsResolver.dispatchResolve` and
   `resolveName`, and the registry walk in `resolveOwnership` — revisit if the Java engine ever serves a network with ENSv2
   for real users (the `auto` selection runs the Rust engine wherever it can).
+  The same applies to the Rust engine's stop before v1's `eth` bridge
+  (`ENSV2Resolver`) for a mirror-handed name with no v1 resolver of its own
+  (#676 review): the Java engine's v1 walk can still reach the bridge there.

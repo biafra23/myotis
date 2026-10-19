@@ -20,6 +20,13 @@ inputs:
       a SNAPSHOT (see -PpublishRelease in the root build.gradle.kts).
     required: false
     default: ''
+  natives-dir:
+    description: >-
+      The desktop host libraries, <dir>/<jna-prefix>/<library> for every line of
+      myotis-engine-natives/platforms.txt (engine-library.yml's host-natives
+      matrix): passed as -PengineNativesDir, so the natives publications are that
+      set and not this runner's own host build.
+    required: true
   save-rust-cache:
     description: Whether this run saves the Rust build cache (main saves, a tag only restores).
     required: false
@@ -66,6 +73,7 @@ runs:
       shell: bash
       env:
         RELEASE_TAG: ${{ inputs.release-tag }}
+        NATIVES_DIR: ${{ inputs.natives-dir }}
       run: |
         set -u
         # -PpublishRelease=<version> on a tag; bare -PpublishRelease otherwise.
@@ -73,7 +81,7 @@ runs:
         [ -n "$RELEASE_TAG" ] || flag="-PpublishRelease"
         for attempt in 1 2 3; do
           rm -rf build/maven-repo
-          ./gradlew "$flag" publishAllPublicationsToStagingRepository --stacktrace && exit 0
+          ./gradlew "$flag" "-PengineNativesDir=$NATIVES_DIR" publishAllPublicationsToStagingRepository --stacktrace && exit 0
           echo "::warning::staging attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
           sleep 25
         done
@@ -104,6 +112,23 @@ runs:
     - name: Check the staged publication
       shell: bash
       run: scripts/check_engine_library.sh build/maven-repo
+
+    # What a desktop consumer gets: the engine jar and this runner's natives jar
+    # (linux-x86-64, from the staged set, not a local build) on the classpath and
+    # no library path — the engine must load, with bindings and library agreeing.
+    # The staging step's -PpublishRelease flag too: without it the modules' version
+    # changes, their jars are rebuilt under it, and the tag's GitHub Packages publish
+    # would then build them a third time — other bytes than the staged ones.
+    - name: Load the engine from the natives jar
+      shell: bash
+      env:
+        RELEASE_TAG: ${{ inputs.release-tag }}
+        NATIVES_DIR: ${{ inputs.natives-dir }}
+      run: |
+        set -u
+        flag="-PpublishRelease=${RELEASE_TAG#v}"
+        [ -n "$RELEASE_TAG" ] || flag="-PpublishRelease"
+        ./gradlew "$flag" "-PengineNativesDir=$NATIVES_DIR" :myotis-engine-natives:test --stacktrace
 
     # The maven-repo branch merge (scripts/merge_maven_repo.py) otherwise runs
     # only on a tag, after GitHub Packages and the release assets are final —

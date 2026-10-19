@@ -18,29 +18,39 @@
 #     constraint myotis-engine/build.gradle.kts declares, so a consumer whose
 #     graph wants another jna version fails at resolution instead of at
 #     Native.<clinit> on every device;
+#   - the desktop host libraries: one myotis-engine-natives-<platform> jar per
+#     line of myotis-engine-natives/platforms.txt, each holding just the engine
+#     library at JNA's classpath path, built for that OS and architecture;
 #   - the version carries no -SNAPSHOT: the publication is staged with
 #     -PpublishRelease (a SNAPSHOT on GitHub Packages would be a release nobody
 #     can pin — and Gradle stages a SNAPSHOT under Maven's timestamped file
 #     names, which is not the layout the release publishes).
 #
-# Usage: scripts/check_engine_library.sh <staging-repo-dir> [--without-rust-engine]
+# Usage: scripts/check_engine_library.sh <staging-repo-dir> [--without-rust-engine] [--host-natives]
 #   <staging-repo-dir>     build/maven-repo after
 #                          `./gradlew -PpublishRelease publishAllPublicationsToStagingRepository`
 #   --without-rust-engine  the publication was built with -PskipRustEngine
 #                          (no Android Rust toolchain): skip the jniLibs checks,
 #                          keep every other one. For a local run; CI never passes it.
+#   --host-natives         a local staging without -PengineNativesDir, which holds
+#                          only this host's natives jar (built by cargoBuildHost, so
+#                          a local run needs host cargo): check the natives jars that
+#                          are staged, at least one, instead of requiring every
+#                          platform. For a local run; CI never passes it.
 #
 # Run by .github/workflows/engine-library.yml on every build of the publication
 # and again on the tag build right before anything is uploaded.
 
 set -euo pipefail
 
-repo=${1:?usage: $0 <staging-repo-dir> [--without-rust-engine]}
+repo=${1:?usage: $0 <staging-repo-dir> [--without-rust-engine] [--host-natives]}
 shift
 with_native=1
+all_natives=1
 for arg in "$@"; do
     case "$arg" in
         --without-rust-engine) with_native=0 ;;
+        --host-natives) all_natives=0 ;;
         *) echo "unknown option: $arg" >&2; exit 2 ;;
     esac
 done
@@ -178,6 +188,49 @@ if [ -s "$aar" ]; then
     fi
     echo "aar: $(du -h "$aar" | cut -f1) $(basename "$aar")"
     printf '%s\n' "$listing" | { grep '^jni/' || true; } | sed 's/^/  /'
+fi
+
+# The desktop host libraries: one myotis-engine-natives-<jna-prefix> per line of
+# myotis-engine-natives/platforms.txt, each a jar holding exactly
+# <jna-prefix>/<library>, built for that platform's OS and architecture (`file`'s
+# reading of the binary: a leg that built on the wrong runner, or a cross-compile
+# that silently built the host, ships a library JNA cannot load), and the engine:
+# it exports the UniFFI scaffolding the bindings call.
+natives_seen=0
+while read -r prefix _target library; do
+    a="myotis-engine-natives-$prefix"
+    if [ "$all_natives" = 0 ] && [ ! -d "$group_dir/$a" ]; then
+        continue
+    fi
+    natives_seen=$((natives_seen + 1))
+    expect "$a" .jar
+    expect "$a" .pom
+    jar="$group_dir/$a/$version/$a-$version.jar"
+    [ -s "$jar" ] || continue  # reported above
+    entries=$(unzip -Z1 "$jar" | { grep -v -e '/$' -e '^META-INF/' || true; })
+    [ "$entries" = "$prefix/$library" ] \
+        || { err "$(basename "$jar") must hold exactly $prefix/$library, holds: $(echo $entries)"; continue; }
+    lib=$(mktemp)
+    unzip -p "$jar" "$prefix/$library" > "$lib"
+    case "$prefix" in
+        darwin-aarch64) want='Mach-O 64-bit*arm64' ;;
+        darwin-x86-64)  want='Mach-O 64-bit*x86_64' ;;
+        linux-x86-64)   want='ELF 64-bit*x86-64' ;;
+        linux-aarch64)  want='ELF 64-bit*aarch64' ;;
+        win32-x86-64)   want='PE32+*x86-64' ;;
+        *) want=''; err "no architecture rule for $prefix — add one here" ;;
+    esac
+    kind=$(file -b "$lib")
+    # shellcheck disable=SC2053 # $want is a glob on purpose
+    [ -z "$want" ] || [[ "$kind" == *$want* ]] || err "$(basename "$jar"): $prefix/$library is not a $want binary: $kind"
+    LC_ALL=C grep -q 'uniffi_myotis_engine_checksum_func_engine_init' "$lib" \
+        || err "$(basename "$jar"): $prefix/$library does not export the engine's UniFFI scaffolding — not libmyotis_engine?"
+    echo "natives: $(du -h "$jar" | cut -f1) $(basename "$jar") ($kind)"
+    rm -f "$lib"
+done < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$here/myotis-engine-natives/platforms.txt")
+if [ "$all_natives" = 0 ]; then
+    [ "$natives_seen" -ge 1 ] || err "--host-natives: no myotis-engine-natives-* jar is staged"
+    echo "note: --host-natives — $natives_seen of the platforms checked, not all"
 fi
 
 [ "$fail" = 0 ] || exit 1
