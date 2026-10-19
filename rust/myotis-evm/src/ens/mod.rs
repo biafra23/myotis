@@ -313,8 +313,9 @@ pub struct EnsOwnership {
     /// Read from ENSv2's registries (#671), which hold one owner per label:
     /// `registrant` is the label's token owner, `manager` is None (per-name roles
     /// replace v1's single registry owner), `wrapped` is false, `resolver` is the
-    /// registry's entry for the label, and `grace_period` is 0 — an ENSv2 label is
-    /// AVAILABLE from its expiry on.
+    /// registry's entry for the label, and `grace_period` is 0 when there is an
+    /// expiry (None for a label that never expires) — an ENSv2 label is AVAILABLE
+    /// from its expiry on.
     pub ensv2: bool,
 }
 
@@ -417,7 +418,7 @@ pub fn resolve_ownership(
     let wrapper = name_wrapper(chain_id);
     if let Some(ur) = ns.universal_resolver {
         if let Some(root) = call_address(caller, ur, &abi::encode_call_no_args("ROOT_REGISTRY()"))? {
-            match ensv2_ownership(caller, &ns, root, name, &dns)? {
+            match ensv2_ownership(caller, &ns, root, &labels, &dns)? {
                 Ensv2Ownership::V1 => {}
                 Ensv2Ownership::Answer(o) => return Ok(o),
             }
@@ -512,11 +513,9 @@ fn ensv2_ownership(
     caller: &dyn EthCaller,
     ns: &Namespace,
     root: [u8; 20],
-    name: &str,
+    labels: &[&str],
     dns: &[u8],
 ) -> Result<Ensv2Ownership, EnsError> {
-    let lower = name.to_lowercase();
-    let labels: Vec<&str> = lower.split('.').collect();
     let mut registry = root;
     for (depth, label) in labels.iter().enumerate().rev() {
         let id = myotis_core::keccak::keccak256(label.as_bytes());
@@ -544,7 +543,9 @@ fn ensv2_ownership(
                     wrapped: false,
                     resolver,
                     expires_at,
-                    grace_period: Some(0),
+                    // ENSv2 has none: a label is AVAILABLE from its expiry on. No
+                    // expiry, no grace period (the hosts' "-1 iff -1" rule).
+                    grace_period: expires_at.map(|_| 0),
                     ensv2: true,
                 })));
             }
@@ -2630,6 +2631,7 @@ mod tests {
         let o = resolve_ownership(&caller, "forever.eth", 11_155_111).unwrap().unwrap();
         assert_eq!(o.registrant, Some(USER));
         assert_eq!(o.expires_at, None);
+        assert_eq!(o.grace_period, None, "no expiry, no grace period");
     }
 
     #[test]

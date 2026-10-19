@@ -119,6 +119,12 @@ class RustEnsRecordJsonTest {
         assertEquals(0L, v2.gracePeriodSeconds());
         assertThrows(EngineException.class,
                 () -> RustEnsApi.ownershipFromJson("x.eth", ok("\"wrapped\":false,\"ensv2\":\"yes\"")));
+        // A label ENSv2 never expires: neither expiry key — the eljson golden's twin.
+        var forever = RustEnsApi.ownershipFromJson("forever.eth", ok(
+                "\"registrantHex\":\"" + ADDR40 + "\",\"wrapped\":false,\"ensv2\":true"));
+        assertTrue(forever.ensv2());
+        assertEquals(-1L, forever.expiresAt());
+        assertEquals(-1L, forever.gracePeriodSeconds());
     }
 
     @Test

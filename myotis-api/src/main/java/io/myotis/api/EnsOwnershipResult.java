@@ -3,7 +3,9 @@ package io.myotis.api;
 /**
  * Who holds an ENS name and for how long — the registry and, for a {@code .eth}
  * second-level name, the BaseRegistrar, read directly (no resolver involved), each
- * seen through the chain's NameWrapper where it is the holder.
+ * seen through the chain's NameWrapper where it is the holder. Where ENSv2 is live and
+ * holds the name ({@link #ensv2()}), the answer comes from ENSv2's registries instead:
+ * the label's owner and expiry, no manager, no grace period.
  *
  * <p>The record convention of every ENS read: a successful "nothing on chain for this
  * name" is every address null and both times -1 with {@code error == null}; a read
@@ -36,8 +38,8 @@ package io.myotis.api;
  *                           label's owner, {@code managerHex} null (per-name roles replace
  *                           v1's single registry owner), {@code wrapped} false,
  *                           {@code resolverHex} the registry's entry for the label, and
- *                           {@code gracePeriodSeconds} 0 — an ENSv2 label is free from its
- *                           expiry on. False for a v1 answer and from an engine that does not
+ *                           {@code gracePeriodSeconds} 0 with an expiry (-1 without one) —
+ *                           an ENSv2 label is free from its expiry on. False for a v1 answer and from an engine that does not
  *                           read ENSv2.
  */
 public record EnsOwnershipResult(

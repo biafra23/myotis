@@ -1546,6 +1546,25 @@ mod tests {
         assert!(v2.get("managerHex").is_none());
         assert_eq!(v2["registrantHex"], format!("0x{}", "51".repeat(20)));
         assert_eq!(v2["gracePeriodSeconds"], 0u64);
+        // A label ENSv2 never expires: neither key (#671 part 3 review).
+        let forever: serde_json::Value = serde_json::from_str(&ens_record_json(&EnsQueryOutcome::Value {
+            value: EnsRecordValue::Ownership(myotis_evm::EnsOwnership {
+                registrant: Some([0x51; 20]),
+                manager: None,
+                wrapped: false,
+                resolver: None,
+                expires_at: None,
+                grace_period: None,
+                ensv2: true,
+            }),
+            block_number: 11_947_300,
+            block_timestamp: 1_760_000_000,
+            verified: true,
+        }))
+        .unwrap();
+        assert_eq!(forever["ensv2"], true);
+        assert!(forever.get("expiresAt").is_none());
+        assert!(forever.get("gracePeriodSeconds").is_none());
     }
 
     fn sample_code() -> VerifiedCode {

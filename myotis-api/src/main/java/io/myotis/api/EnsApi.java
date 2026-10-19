@@ -44,7 +44,10 @@ public interface EnsApi {
     /**
      * Who holds {@code name} and until when (registry owner and resolver; for a
      * {@code .eth} second-level name the registrar's registrant, expiry and grace
-     * period), seen through the NameWrapper where it is the holder. Same root policy
+     * period), seen through the NameWrapper where it is the holder. Where ENSv2 is live,
+     * its registries decide first: a name they hold is answered from them
+     * ({@link EnsOwnershipResult#ensv2()}), one they hand to v1 as above; an engine
+     * that does not read ENSv2 refuses such a name in {@code error}. Same root policy
      * as the record reads (finalized first). Default: an engine that has not
      * implemented it answers a refusal in {@code error}, never a guess.
      */
