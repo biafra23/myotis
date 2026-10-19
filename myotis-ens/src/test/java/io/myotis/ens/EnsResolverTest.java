@@ -95,7 +95,9 @@ class EnsResolverTest {
 
     private static final Address ROOT_V2 = Address.fromHex("0x" + "b4".repeat(20));
     private static final Address V2_RESOLVER = Address.fromHex("0x" + "5e".repeat(20));
-    private static final Address MIRROR = Address.fromHex("0x" + "32".repeat(20));
+    private static final Address MIRROR = EnsAddresses.SEPOLIA_ENSV1_MIRROR;
+    /** A name owner's own resolver that claims to be a v1 mirror. */
+    private static final Address SPOOF = Address.fromHex("0x" + "33".repeat(20));
 
     /**
      * An ENSv2 chain: the Universal Resolver names a root registry and finds {@code found}
@@ -110,8 +112,9 @@ class EnsResolverTest {
                         AbiEncoder.uint256(0)));
         byte[] registryV1 = AbiEncoder.encodeCall(FunctionSignature.of("REGISTRY_V1()"));
         mock.respond(MIRROR, registryV1, encodeAddress(REGISTRY));
+        mock.respond(SPOOF, registryV1, encodeAddress(REGISTRY));
         mock.revertOn(V2_RESOLVER, registryV1, new byte[0]);
-        return new EnsResolver(mock, REGISTRY, UR, BASE_REGISTRAR, NAME_WRAPPER);
+        return new EnsResolver(mock, REGISTRY, UR, BASE_REGISTRAR, NAME_WRAPPER, MIRROR);
     }
 
     private static void assertEnsv2Refusal(java.util.concurrent.CompletableFuture<?> f) {
@@ -156,6 +159,23 @@ class EnsResolverTest {
                 () -> new EnsResolver(mock, REGISTRY, UR, BASE_REGISTRAR, NAME_WRAPPER)
                         .resolveOwnership("myotis.eth", ctx()).get());
         assertTrue(e.getCause() instanceof IllegalStateException, String.valueOf(e.getCause()));
+    }
+
+    @Test
+    void aResolverThatOnlyClaimsToBeTheMirrorDoesNotHandTheNameToV1() {
+        // #672 review: the name's ENSv2 owner sets its resolver and can make it answer
+        // REGISTRY_V1() with the v1 registry. Only the pinned mirror counts.
+        var mock = new MockExecutor();
+        assertEnsv2Refusal(ensv2Resolver(mock, "myotis.eth", SPOOF).resolveOwnership("myotis.eth", ctx()));
+    }
+
+    @Test
+    void whereEnsv2IsLiveButNoMirrorIsPinnedNoNameIsV1s() {
+        // Mainnet right after activation: even the genuine mirror is not taken as v1's word.
+        var mock = new MockExecutor();
+        ensv2Resolver(mock, "ens.eth", MIRROR);
+        var unpinned = new EnsResolver(mock, REGISTRY, UR, BASE_REGISTRAR, NAME_WRAPPER);
+        assertEnsv2Refusal(unpinned.resolveOwnership("ens.eth", ctx()));
     }
 
     @Test

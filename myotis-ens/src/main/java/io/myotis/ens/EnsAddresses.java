@@ -70,6 +70,16 @@ public final class EnsAddresses {
     /** Sepolia Universal Resolver: ENS's proxy ({@link #UNIVERSAL_RESOLVER}). */
     public static final Address SEPOLIA_UNIVERSAL_RESOLVER = UNIVERSAL_RESOLVER;
 
+    /**
+     * Sepolia's ENSv2 v1 mirror ({@code ENSV1Resolver}): the resolver ENSv2 sets for a name
+     * not migrated yet. Pinned, not recognised by its {@code REGISTRY_V1()} getter alone: a
+     * name's ENSv2 owner sets its resolver and could deploy one that answers that getter
+     * too (#672 review). From ENS's deployments page, and the resolver ENSv2 names for every
+     * unmigrated name probed (2026-10-19). Mainnet has none pinned until ENSv2 activates.
+     */
+    public static final Address SEPOLIA_ENSV1_MIRROR =
+            Address.fromHex("0x322B7581cA210a69c6D0e0D7c88a7688D2789Cb0");
+
     public static final Address SEPOLIA_NAME_WRAPPER =
             Address.fromHex("0x0635513f179D50A207757E05759CbD106d7dFcE8");
 

@@ -108,6 +108,9 @@ public final class EnsResolver {
      *  {@link #resolveOwnership}); no record is read through it. Null = no ENSv2 on this
      *  tree (Genome). */
     private final Address universalResolver;
+    /** ENSv2's v1 mirror on this chain, pinned ({@link EnsAddresses#SEPOLIA_ENSV1_MIRROR});
+     *  null = none known, so where ENSv2 is live no name is v1's. */
+    private final Address ensv1Mirror;
     /** The {@code .eth} registrar and the NameWrapper for {@link #resolveOwnership};
      *  null = not known for this chain (ownership then stops at the registry). */
     private final Address baseRegistrar;
@@ -142,16 +145,23 @@ public final class EnsResolver {
     /** With the chain's {@code .eth} registrar and NameWrapper, for {@link #resolveOwnership}. */
     public EnsResolver(EvmExecutor executor, Address registry, Address universalResolver,
                        Address baseRegistrar, Address nameWrapper) {
-        this(executor, registry, universalResolver, baseRegistrar, nameWrapper,
+        this(executor, registry, universalResolver, baseRegistrar, nameWrapper, null);
+    }
+
+    /** With the chain's ENSv2 v1 mirror too ({@link #v1Decides}); null = none known. */
+    public EnsResolver(EvmExecutor executor, Address registry, Address universalResolver,
+                       Address baseRegistrar, Address nameWrapper, Address ensv1Mirror) {
+        this(executor, registry, universalResolver, baseRegistrar, nameWrapper, ensv1Mirror,
                 new byte[32], "eth", null);
     }
 
     private EnsResolver(EvmExecutor executor, Address registry, Address universalResolver,
-                        Address baseRegistrar, Address nameWrapper,
+                        Address baseRegistrar, Address nameWrapper, Address ensv1Mirror,
                         byte[] rootNode, String registrarTld, String requiredTld) {
         this.executor = executor;
         this.registry = registry;
         this.universalResolver = universalResolver;
+        this.ensv1Mirror = ensv1Mirror;
         this.baseRegistrar = baseRegistrar;
         this.nameWrapper = nameWrapper;
         this.rootNode = rootNode.clone();
@@ -168,7 +178,7 @@ public final class EnsResolver {
      */
     public static EnsResolver gnosisGenome(EvmExecutor executor) {
         return new EnsResolver(executor, EnsAddresses.GNOSIS_GENOME_REGISTRY, null,
-                EnsAddresses.GNOSIS_GENOME_REGISTRAR, null,
+                EnsAddresses.GNOSIS_GENOME_REGISTRAR, null, null,
                 EnsAddresses.gnosisGenomeRoot(), EnsAddresses.GENOME_TLD, EnsAddresses.GENOME_TLD);
     }
 
@@ -256,7 +266,8 @@ public final class EnsResolver {
         if (chainId == 11155111L) {
             return new EnsResolver(executor,
                     EnsAddresses.SEPOLIA_REGISTRY, EnsAddresses.SEPOLIA_UNIVERSAL_RESOLVER,
-                    EnsAddresses.BASE_REGISTRAR, EnsAddresses.SEPOLIA_NAME_WRAPPER);
+                    EnsAddresses.BASE_REGISTRAR, EnsAddresses.SEPOLIA_NAME_WRAPPER,
+                    EnsAddresses.SEPOLIA_ENSV1_MIRROR);
         }
         if (chainId == 17000L) {
             return new EnsResolver(executor,
@@ -520,18 +531,21 @@ public final class EnsResolver {
      * ENSv2 is live on a chain when its Universal Resolver names a root registry
      * ({@code ROOT_REGISTRY()}: Sepolia since the ENSv2 beta; a revert on mainnet until
      * activation). Where it is not, v1 decides everything. Where it is, v1 decides only a
-     * name the Universal Resolver hands to the v1 mirror — the resolver whose
-     * {@code REGISTRY_V1()} is this registry, which ENSv2 sets for names not migrated yet.
-     * Any other answer, no resolver included, belongs to ENSv2. Rust twin: {@code v1_decides}.
+     * name the Universal Resolver hands to this chain's pinned v1 mirror ({@link #ensv1Mirror}),
+     * which ENSv2 sets for names not migrated yet; its {@code REGISTRY_V1()} must still name
+     * this registry. Any other answer, no resolver included, belongs to ENSv2; and where no
+     * mirror is pinned, no name is v1's. Rust twin: {@code v1_decides}.
      */
     private CompletableFuture<Boolean> v1Decides(byte[] dnsName, BlockContext ctx) {
         return callAddress(universalResolver, AbiEncoder.encodeCall(ROOT_REGISTRY), ctx).thenCompose(root -> {
             if (root.isEmpty()) return CompletableFuture.completedFuture(true);
+            if (ensv1Mirror == null) return CompletableFuture.completedFuture(false);
             byte[] find = AbiEncoder.encodeCall(FIND_RESOLVER, AbiEncoder.bytes(dnsName));
-            return callAddress(universalResolver, find, ctx).thenCompose(resolver -> resolver.isEmpty()
-                    ? CompletableFuture.completedFuture(false)
-                    : callAddress(resolver.get(), AbiEncoder.encodeCall(REGISTRY_V1), ctx)
-                            .thenApply(v1 -> v1.isPresent() && v1.get().equals(registry)));
+            return callAddress(universalResolver, find, ctx).thenCompose(resolver ->
+                    resolver.isEmpty() || !resolver.get().equals(ensv1Mirror)
+                            ? CompletableFuture.completedFuture(false)
+                            : callAddress(resolver.get(), AbiEncoder.encodeCall(REGISTRY_V1), ctx)
+                                    .thenApply(v1 -> v1.isPresent() && v1.get().equals(registry)));
         });
     }
 

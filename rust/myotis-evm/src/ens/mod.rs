@@ -57,6 +57,23 @@ const BASE_REGISTRAR: [u8; 20] = [
     0xf1, 0x47, 0xea, 0x85,
 ];
 
+/// ENSv2's v1 mirror per chain (`ENSV1Resolver`): the resolver ENSv2 sets for a
+/// name not migrated yet, which resolves it through the v1 registry. Pinned, not
+/// recognised by its `REGISTRY_V1()` getter alone: a name's ENSv2 owner sets its
+/// resolver and could deploy one that answers that getter too (#672 review).
+/// Sepolia `0x322B7581cA210a69c6D0e0D7c88a7688D2789Cb0` (ENS's deployments page,
+/// and the resolver ENSv2 names for every unmigrated name probed, 2026-10-19).
+/// None where ENSv2 is not live or its mirror is not known yet (mainnet).
+fn ensv1_mirror(chain_id: u64) -> Option<[u8; 20]> {
+    match chain_id {
+        11155111 => Some([
+            0x32, 0x2b, 0x75, 0x81, 0xca, 0x21, 0x0a, 0x69, 0xc6, 0xd0, 0xe0, 0xd7, 0xc8, 0x8a,
+            0x76, 0x88, 0xd2, 0x78, 0x9c, 0xb0,
+        ]),
+        _ => None,
+    }
+}
+
 /// The NameWrapper per chain — the ERC-1155 a wrapped name's registry owner
 /// points at; its `ownerOf(uint256(node))` is the user behind it. Verified by
 /// each contract's `ens()` / `registrar()` answers. None on a chain without one.
@@ -441,10 +458,13 @@ pub fn resolve_ownership(
 /// live on a chain when its Universal Resolver names a root registry
 /// (`ROOT_REGISTRY()`: Sepolia since the ENSv2 beta; a revert on mainnet until
 /// activation). Where it is not, v1 decides everything. Where it is, v1 decides
-/// only a name the Universal Resolver hands to the v1 mirror — the resolver
-/// whose `REGISTRY_V1()` is this registry, which ENSv2 sets for names not
-/// migrated yet. Any other answer, no resolver included, belongs to ENSv2: a
-/// name registered there, or one whose v1 entry is stale.
+/// only a name the Universal Resolver hands to this chain's pinned v1 mirror
+/// ([`ensv1_mirror`]), which ENSv2 sets for names not migrated yet; its
+/// `REGISTRY_V1()` must still name this registry. Any other answer, no resolver
+/// included, belongs to ENSv2: a name registered there, or one whose v1 entry is
+/// stale. Where ENSv2 is live but its mirror is not pinned (mainnet right after
+/// activation), no name is v1's: refusals, until the mirror is pinned or
+/// ownership is read from ENSv2 itself (#671 part 3).
 fn v1_decides(
     caller: &dyn EthCaller,
     ur: [u8; 20],
@@ -454,6 +474,9 @@ fn v1_decides(
     if call_address(caller, ur, &abi::encode_call_no_args("ROOT_REGISTRY()"))?.is_none() {
         return Ok(true);
     }
+    let Some(mirror) = ensv1_mirror(caller.chain_id()) else {
+        return Ok(false);
+    };
     // A revert here means the Universal Resolver could not walk the name; whether
     // v1 decides it is then unknown, which is not a yes.
     let Some(resolver) =
@@ -461,6 +484,9 @@ fn v1_decides(
     else {
         return Ok(false);
     };
+    if resolver != mirror {
+        return Ok(false);
+    }
     let mirrored = call_address(caller, resolver, &abi::encode_call_no_args("REGISTRY_V1()"))?;
     Ok(mirrored == Some(registry))
 }
@@ -1876,7 +1902,13 @@ mod tests {
 
     const ROOT_V2: [u8; 20] = [0xb4; 20];
     const V2_RESOLVER: [u8; 20] = [0x5e; 20];
-    const MIRROR: [u8; 20] = [0x32; 20];
+    /// Sepolia's pinned v1 mirror.
+    const MIRROR: [u8; 20] = [
+        0x32, 0x2b, 0x75, 0x81, 0xca, 0x21, 0x0a, 0x69, 0xc6, 0xd0, 0xe0, 0xd7, 0xc8, 0x8a, 0x76,
+        0x88, 0xd2, 0x78, 0x9c, 0xb0,
+    ];
+    /// A name owner's own resolver that claims to be a v1 mirror.
+    const SPOOF: [u8; 20] = [0x33; 20];
 
     /// An ENSv2 chain: the Universal Resolver names a root registry and answers
     /// `findResolver(expect_dns)` with `found`. MIRROR is the v1 mirror (its
@@ -1900,6 +1932,7 @@ mod tests {
                 Some(Ok(out))
             })
             .on(move |t, cd| (t == MIRROR && sel(cd) == v1_sel).then(|| Ok(addr_word(REGISTRY))))
+            .on(move |t, cd| (t == SPOOF && sel(cd) == v1_sel).then(|| Ok(addr_word(REGISTRY))))
             .on(move |t, cd| (t == V2_RESOLVER && sel(cd) == v1_sel).then(revert))
     }
 
@@ -1934,6 +1967,45 @@ mod tests {
         assert_eq!(o.registrant, Some(USER));
         assert_eq!(o.resolver, Some(RESOLVER));
         assert_eq!(o.expires_at, Some(1_823_155_031));
+    }
+
+    #[test]
+    fn the_v1_mirror_pin_matches_the_java_engine() {
+        // Byte-for-byte the Java EnsAddresses.SEPOLIA_ENSV1_MIRROR; none on mainnet yet.
+        let hex = |a: [u8; 20]| a.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(hex(ensv1_mirror(11_155_111).unwrap()), "322b7581ca210a69c6d0e0d7c88a7688d2789cb0");
+        assert_eq!(ensv1_mirror(11_155_111), Some(MIRROR));
+        assert_eq!(ensv1_mirror(1), None);
+    }
+
+    #[test]
+    fn a_resolver_that_only_claims_to_be_the_mirror_does_not_hand_the_name_to_v1() {
+        // #672 review: the name's ENSv2 owner sets its resolver and can make it
+        // answer REGISTRY_V1() with the v1 registry. Only the pinned mirror counts,
+        // or an ENSv2-only name would read as unowned again, on demand.
+        let dns = dns_encode("myotis.eth").unwrap();
+        let caller = ensv2_chain(MockCaller::new().on_chain(11_155_111), dns, SPOOF).on(|t, _| {
+            (t == REGISTRY || t == BASE_REGISTRAR).then(|| panic!("v1 read for an ENSv2 name"))
+        });
+        assert_eq!(
+            resolve_ownership(&caller, "myotis.eth", 11_155_111),
+            Err(EnsError::Unsupported(ENSV2_OWNERSHIP))
+        );
+    }
+
+    #[test]
+    fn where_ensv2_is_live_but_no_mirror_is_pinned_no_name_is_v1s() {
+        // Mainnet right after activation: the genuine mirror's address is not
+        // pinned yet, so even it is not taken as v1's word. Refusals, never v1
+        // answers for names ENSv2 may have taken over.
+        let dns = dns_encode("ens.eth").unwrap();
+        let caller = ensv2_chain(MockCaller::new().on_chain(1), dns, MIRROR).on(|t, _| {
+            (t == REGISTRY || t == BASE_REGISTRAR).then(|| panic!("v1 read for an ENSv2 name"))
+        });
+        assert_eq!(
+            resolve_ownership(&caller, "ens.eth", 1),
+            Err(EnsError::Unsupported(ENSV2_OWNERSHIP))
+        );
     }
 
     #[test]
