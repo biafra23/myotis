@@ -26,24 +26,31 @@
 #     can pin — and Gradle stages a SNAPSHOT under Maven's timestamped file
 #     names, which is not the layout the release publishes).
 #
-# Usage: scripts/check_engine_library.sh <staging-repo-dir> [--without-rust-engine]
+# Usage: scripts/check_engine_library.sh <staging-repo-dir> [--without-rust-engine] [--host-natives]
 #   <staging-repo-dir>     build/maven-repo after
 #                          `./gradlew -PpublishRelease publishAllPublicationsToStagingRepository`
 #   --without-rust-engine  the publication was built with -PskipRustEngine
 #                          (no Android Rust toolchain): skip the jniLibs checks,
 #                          keep every other one. For a local run; CI never passes it.
+#   --host-natives         a local staging without -PengineNativesDir, which holds
+#                          only this host's natives jar (built by cargoBuildHost, so
+#                          a local run needs host cargo): check the natives jars that
+#                          are staged, at least one, instead of requiring every
+#                          platform. For a local run; CI never passes it.
 #
 # Run by .github/workflows/engine-library.yml on every build of the publication
 # and again on the tag build right before anything is uploaded.
 
 set -euo pipefail
 
-repo=${1:?usage: $0 <staging-repo-dir> [--without-rust-engine]}
+repo=${1:?usage: $0 <staging-repo-dir> [--without-rust-engine] [--host-natives]}
 shift
 with_native=1
+all_natives=1
 for arg in "$@"; do
     case "$arg" in
         --without-rust-engine) with_native=0 ;;
+        --host-natives) all_natives=0 ;;
         *) echo "unknown option: $arg" >&2; exit 2 ;;
     esac
 done
@@ -189,8 +196,13 @@ fi
 # reading of the binary: a leg that built on the wrong runner, or a cross-compile
 # that silently built the host, ships a library JNA cannot load), and the engine:
 # it exports the UniFFI scaffolding the bindings call.
+natives_seen=0
 while read -r prefix _target library; do
     a="myotis-engine-natives-$prefix"
+    if [ "$all_natives" = 0 ] && [ ! -d "$group_dir/$a" ]; then
+        continue
+    fi
+    natives_seen=$((natives_seen + 1))
     expect "$a" .jar
     expect "$a" .pom
     jar="$group_dir/$a/$version/$a-$version.jar"
@@ -216,6 +228,10 @@ while read -r prefix _target library; do
     echo "natives: $(du -h "$jar" | cut -f1) $(basename "$jar") ($kind)"
     rm -f "$lib"
 done < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$here/myotis-engine-natives/platforms.txt")
+if [ "$all_natives" = 0 ]; then
+    [ "$natives_seen" -ge 1 ] || err "--host-natives: no myotis-engine-natives-* jar is staged"
+    echo "note: --host-natives — $natives_seen of the platforms checked, not all"
+fi
 
 [ "$fail" = 0 ] || exit 1
 echo "OK: eth.myotis:* $version staged completely under ${repo}"

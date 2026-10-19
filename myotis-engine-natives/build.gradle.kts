@@ -22,8 +22,10 @@
 //
 // No dependencies, no classes, no module metadata of its own: a consumer names the
 // artifact of its platform next to eth.myotis:myotis-engine at the SAME version. A
-// mismatched pair is refused at load (RustEngineNative's ABI check and UniFFI's
-// per-function checksums), never half-loaded.
+// pair that disagrees on the FFI is refused at load (RustEngineNative's ABI check and
+// UniFFI's per-function checksums); a library of another release with the same FFI
+// loads and runs that release's engine, unnoticed, so a consumer keeps both versions
+// on one catalog entry.
 
 data class HostNative(val jnaPrefix: String, val rustTarget: String, val library: String)
 
@@ -40,14 +42,14 @@ val nativesDir: String? = providers.gradleProperty("engineNativesDir").orNull?.t
 
 // The host's platform, for the cargoBuildHost mode: the cross target when one is set
 // (the root build's own rule), else the JVM's OS and architecture in JNA's spelling.
-// Null for a host platforms.txt does not list (Windows, for now): it publishes no
-// natives, and the rest of the build is unaffected. A cross target that is not
-// listed is a mistake and fails.
+// Null for a host or cross target platforms.txt does not list (Windows, for now; an
+// experimental triple): it publishes no natives, with a warning for a cross target,
+// and the rest of the build is unaffected.
 fun hostPlatform(followRustTarget: Boolean = true): HostNative? {
     val rustTarget = rootProject.extra["rustTargetTriple"] as String?
     if (followRustTarget && rustTarget != null) {
         return platforms.firstOrNull { it.rustTarget == rustTarget }
-            ?: throw GradleException("rust target $rustTarget is not in myotis-engine-natives/platforms.txt")
+            ?: null.also { logger.warn("rust target $rustTarget is not in myotis-engine-natives/platforms.txt: no natives publication") }
     }
     val os = System.getProperty("os.name").lowercase()
     val arch = when (val a = System.getProperty("os.arch").lowercase()) {
@@ -75,11 +77,13 @@ extensions.configure<PublishingExtension> {
         val taskSuffix = platform.jnaPrefix.split('-').joinToString("") { it.replaceFirstChar(Char::uppercase) }
         val artifactId = "myotis-engine-natives-${platform.jnaPrefix}"
         val dir = nativesDir
+        // Resolved here, so the providers capture a File and no Project.
         val source: Provider<File> = if (dir != null) {
-            provider { rootProject.file(dir).resolve("${platform.jnaPrefix}/${platform.library}") }
+            val lib = rootProject.file(dir).resolve("${platform.jnaPrefix}/${platform.library}")
+            provider { lib }
         } else {
-            val releaseDir = rootProject.extra["rustReleaseDir"] as String
-            rootProject.tasks.named("cargoBuildHost").map { rootProject.file("$releaseDir/${platform.library}") }
+            val lib = rootProject.file("${rootProject.extra["rustReleaseDir"]}/${platform.library}")
+            rootProject.tasks.named("cargoBuildHost").map { lib }
         }
         val jar = tasks.register<Jar>("nativesJar$taskSuffix") {
             description = "The Rust engine's host library for ${platform.jnaPrefix}, at JNA's classpath path"

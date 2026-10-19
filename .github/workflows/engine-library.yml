@@ -108,7 +108,15 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x gradlew
-          ./gradlew cargoBuildHost --stacktrace
+          # Retried like every Gradle call here: configuring the build resolves the
+          # plugins, and a resolution blip on one leg would fail the publication.
+          built=0
+          for attempt in 1 2 3; do
+            ./gradlew cargoBuildHost --stacktrace && { built=1; break; }
+            echo "::warning::cargoBuildHost attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
+            sleep 25
+          done
+          [ "$built" = 1 ] || { echo "::error::cargoBuildHost failed after 3 attempts"; exit 1; }
           lib="rust/target/${RUST_TARGET}/release/${{ matrix.library }}"
           # cargoBuildHost self-skips without cargo; here that is an error.
           [ "$lib" -nt gradlew ] || { echo "::error::$lib was NOT built"; exit 1; }

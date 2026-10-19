@@ -201,8 +201,11 @@ JNA then loads `libmyotis_engine` from the jar's `<platform>/` entry (it
 extracts it to a temporary file first) whenever `jna.library.path` has none,
 so nothing has to be set; a library found on that path, or named by
 `-Dmyotis.engine.lib=<file>`, still wins, which is how a development build is
-tried. A library from another version is refused at load (the ABI version and
-UniFFI's checksums), and `Myotis.isAvailable()` says false. The artifacts are
+tried. Keep both artifacts on one version (one catalog entry): a library whose FFI
+differs from the bindings is refused at load (the ABI version and UniFFI's
+checksums), and `Myotis.isAvailable()` says false, but a library from another
+release with the same FFI loads and runs that release's engine, its checkpoints
+and bootnodes included, with nothing to say so. The artifacts are
 built on one runner per platform from the tag's tree: macOS 14 for both Mac
 architectures, Ubuntu 22.04 for Linux (so glibc 2.35 or newer). A signed and
 notarized macOS app with the hardened runtime may refuse a library extracted
