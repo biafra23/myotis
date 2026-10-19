@@ -91,11 +91,22 @@ public final class EnsResolver {
             FunctionSignature.of("name(bytes32)");
     private static final FunctionSignature SUPPORTS_INTERFACE =
             FunctionSignature.of("supportsInterface(bytes4)");
+    private static final FunctionSignature ROOT_REGISTRY =
+            FunctionSignature.of("ROOT_REGISTRY()");
+    private static final FunctionSignature FIND_RESOLVER =
+            FunctionSignature.of("findResolver(bytes)");
+    private static final FunctionSignature REGISTRY_V1 =
+            FunctionSignature.of("REGISTRY_V1()");
+
+    /** The ownership refusal for a name ENSv2 decides (#671; Rust {@code ENSV2_OWNERSHIP}). */
+    public static final String ENSV2_OWNERSHIP =
+            "this name's ownership is recorded in ENSv2, which this engine does not read yet";
 
     private final EvmExecutor executor;
     private final Address registry;
-    /** Kept for the constructors' signatures only: no read calls the Universal Resolver
-     *  (forward reads walk the Registry, ENSIP-10; reverse reads it step by step). */
+    /** Asked only whether ENSv2 decides a name ({@link #v1Decides}, for
+     *  {@link #resolveOwnership}); no record is read through it. Null = no ENSv2 on this
+     *  tree (Genome). */
     private final Address universalResolver;
     /** The {@code .eth} registrar and the NameWrapper for {@link #resolveOwnership};
      *  null = not known for this chain (ownership then stops at the registry). */
@@ -119,8 +130,8 @@ public final class EnsResolver {
     /**
      * Construct against non-default contract addresses. Useful for
      * testnets and for unit tests that mock the resolver chain.
-     * {@code universalResolver} is not consulted: no read calls the Universal Resolver
-     * (forward reads walk the Registry, ENSIP-10). The {@code .eth}
+     * {@code universalResolver} resolves no record (reads walk the Registry, ENSIP-10);
+     * ownership asks it whether ENSv2 decides the name. The {@code .eth}
      * registrar is one address on every ENS chain; the NameWrapper is not known here
      * (a wrapped name's holders then read as the wrapper contract itself).
      */
@@ -399,11 +410,11 @@ public final class EnsResolver {
     /**
      * Reverse resolution: {@code address → name}, with ENSIP-3 verification.
      *
-     * <p>Step-by-step path against the Registry: the reverse node's
-     * {@code resolver(bytes32)}, then that resolver's {@code name(bytes32)}.
-     * That covers classic on-chain reverse records. The verification
-     * round-trip is {@link #resolveAddress} — the same Registry walk every
-     * forward read takes.
+     * <p>The claim is {@code name(bytes32)} of the reverse node, read through the
+     * same Registry walk as every record ({@link #dispatchResolve}): the node's own
+     * resolver, else the nearest ancestor's ENSIP-10 wildcard resolver. A plain
+     * revert is no claim; an {@code OffchainLookup} goes to the CCIP wrapper. The
+     * verification round-trip is {@link #resolveAddress}.
      *
      * <p>Returns {@link Optional#empty()} when the address has no reverse
      * record OR when the resolver's claim fails ENSIP-3 verification (a
@@ -419,13 +430,15 @@ public final class EnsResolver {
             return com.jaeckel.ethp2p.core.concurrent.Futures.failedFuture(
                     new UnsupportedOperationException(NO_GNO_REVERSE));
         }
-        byte[] reverseNode = Namehash.of(ReverseLookup.nameFor(address));
-        return getReverseResolver(reverseNode, blockContext)
-                .thenCompose(resolver -> {
-                    if (resolver.isEmpty()) return CompletableFuture.completedFuture(Optional.<String>empty());
-                    return getName(resolver.get(), reverseNode, blockContext)
-                            .thenCompose(claimed -> verifyForward(claimed, address, blockContext));
-                });
+        // The claim is read like any record (dispatchResolve): the reverse node's own
+        // resolver, else the nearest ancestor's ENSIP-10 wildcard one. ENSv2 needs the
+        // walk up (#671): a Sepolia primary name set there has no addr.reverse resolver,
+        // and the `reverse` node's wildcard resolver answers it (mainnet's does too, for
+        // an address without a reverse resolver of its own). Rust twin: reverse_resolve.
+        String reverseName = ReverseLookup.nameFor(address);
+        byte[] nameCall = AbiEncoder.encodeCall(NAME, AbiEncoder.bytes32(Namehash.of(reverseName)));
+        return dispatchResolve(reverseName, nameCall, blockContext, EnsResolver::decodeStringResult)
+                .thenCompose(claimed -> verifyForward(claimed, address, blockContext));
     }
 
     // ---- Ownership ---------------------------------------------------------
@@ -445,8 +458,9 @@ public final class EnsResolver {
      * {@code ownerOf} (an expired or never registered token) is "no registrant", never a
      * failure; any other failure propagates. The name is validated and hashed exactly as
      * the record reads validate and hash it ({@link DnsEncoder#encode}, {@link Namehash#of}),
-     * so this read and the record reads of one input answer about the same node. Rust
-     * twin: {@code resolve_ownership}.
+     * so this read and the record reads of one input answer about the same node. A name
+     * ENSv2 decides fails with {@link #ENSV2_OWNERSHIP} (#671): v1's registry and registrar
+     * would read it as unowned or name a stale holder. Rust twin: {@code resolve_ownership}.
      */
     public CompletableFuture<Optional<Ownership>> resolveOwnership(String name, BlockContext ctx) {
         // The record reads' own validation (an empty label, more than one trailing dot)
@@ -469,6 +483,37 @@ public final class EnsResolver {
             return com.jaeckel.ethp2p.core.concurrent.Futures.failedFuture(
                     new IllegalStateException("the ." + registrarTld + " registrar is not pinned for this chain"));
         }
+        CompletableFuture<Boolean> v1 = universalResolver == null
+                ? CompletableFuture.completedFuture(true)
+                : v1Decides(DnsEncoder.encode(name), ctx);
+        return v1.thenCompose(decides -> decides
+                ? readOwnership(labels, node, ctx)
+                : com.jaeckel.ethp2p.core.concurrent.Futures.<Optional<Ownership>>failedFuture(
+                        new UnsupportedOperationException(ENSV2_OWNERSHIP)));
+    }
+
+    /**
+     * Whether the v1 registry still decides the name {@code dnsName} encodes (#671).
+     * ENSv2 is live on a chain when its Universal Resolver names a root registry
+     * ({@code ROOT_REGISTRY()}: Sepolia since the ENSv2 beta; a revert on mainnet until
+     * activation). Where it is not, v1 decides everything. Where it is, v1 decides only a
+     * name the Universal Resolver hands to the v1 mirror — the resolver whose
+     * {@code REGISTRY_V1()} is this registry, which ENSv2 sets for names not migrated yet.
+     * Any other answer, no resolver included, belongs to ENSv2. Rust twin: {@code v1_decides}.
+     */
+    private CompletableFuture<Boolean> v1Decides(byte[] dnsName, BlockContext ctx) {
+        return callAddress(universalResolver, AbiEncoder.encodeCall(ROOT_REGISTRY), ctx).thenCompose(root -> {
+            if (root.isEmpty()) return CompletableFuture.completedFuture(true);
+            byte[] find = AbiEncoder.encodeCall(FIND_RESOLVER, AbiEncoder.bytes(dnsName));
+            return callAddress(universalResolver, find, ctx).thenCompose(resolver -> resolver.isEmpty()
+                    ? CompletableFuture.completedFuture(false)
+                    : callAddress(resolver.get(), AbiEncoder.encodeCall(REGISTRY_V1), ctx)
+                            .thenApply(v1 -> v1.isPresent() && v1.get().equals(registry)));
+        });
+    }
+
+    /** The v1 reads of {@link #resolveOwnership}, once v1 is known to decide the name. */
+    private CompletableFuture<Optional<Ownership>> readOwnership(String[] labels, byte[] node, BlockContext ctx) {
         boolean secondLevel = labels.length == 2 && labels[1].equals(registrarTld);
         byte[] labelHash = secondLevel ? Namehash.labelhash(labels[0]) : null;
 
@@ -741,22 +786,6 @@ public final class EnsResolver {
                 && eee.error() instanceof EvmExecutionError.Reverted;
     }
 
-    // ---- Reverse-path step-by-step calls ----------------------------------
-
-    /** Registry call: {@code resolver(bytes32) → address}. Used only for the reverse path. */
-    private CompletableFuture<Optional<Address>> getReverseResolver(byte[] node, BlockContext ctx) {
-        byte[] calldata = AbiEncoder.encodeCall(RESOLVER, AbiEncoder.bytes32(node));
-        return executor.callView(registry, calldata, ctx)
-                .thenApply(EnsResolver::decodeAddressOrEmpty);
-    }
-
-    /** Resolver call: {@code name(bytes32) → string}. */
-    private CompletableFuture<Optional<String>> getName(Address resolver, byte[] node, BlockContext ctx) {
-        byte[] calldata = AbiEncoder.encodeCall(NAME, AbiEncoder.bytes32(node));
-        return executor.callView(resolver, calldata, ctx)
-                .thenApply(EnsResolver::decodeStringOrEmpty);
-    }
-
     // ---- Decoders ---------------------------------------------------------
 
     /**
@@ -822,17 +851,6 @@ public final class EnsResolver {
         if (result == null || result.length < 32) return Optional.empty();
         Address addr = AbiDecoder.address(result, 0);
         return addr.equals(Address.ZERO) ? Optional.<Address>empty() : Optional.of(addr);
-    }
-
-    /** Decode a single dynamic string with empty/short/malformed fallback. */
-    private static Optional<String> decodeStringOrEmpty(byte[] result) {
-        if (result == null || result.length < 64) return Optional.empty();
-        try {
-            String s = AbiDecoder.string(result, 0);
-            return s.isEmpty() ? Optional.<String>empty() : Optional.of(s);
-        } catch (RuntimeException e) {
-            return Optional.empty();
-        }
     }
 
     /**
