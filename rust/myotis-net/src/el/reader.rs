@@ -6982,8 +6982,12 @@ impl ElReader {
     /// SAME root kind as the original attempt and decodes the answer with the
     /// original query's record semantics. A second `OffchainLookup` from the
     /// callback surfaces as `Offchain` again — the HOST enforces the recursion
-    /// cap (Java `MAX_RECURSION_DEPTH = 1`). For a `Reverse` query the decoded
-    /// claimed name is forward-verified here, exactly like the direct path.
+    /// cap (Java `MAX_RECURSION_DEPTH = 1`). For a `Reverse` query the round is
+    /// one of two steps: `reverse_claim` None = it read the claim, which is
+    /// decoded as a name and forward-verified here, exactly like the direct
+    /// path; `Some(name)` = it forward-verified `name`, a claim read before
+    /// (the offchain outcome's `reverse_claim`), so its answer is `name`'s
+    /// address. A claim on any other query is refused, never ignored.
     #[allow(clippy::too_many_arguments)]
     pub async fn ens_ccip_callback(
         &self,
@@ -6995,23 +6999,19 @@ impl ElReader {
         response: Vec<u8>,
         extra_data: Vec<u8>,
         wrapped: bool,
+        reverse_claim: Option<String>,
     ) -> Result<EnsQueryOutcome, String> {
+        if let Some(refused) = ccip_callback_refusal(&query, chain_id, reverse_claim.as_deref()) {
+            return Err(refused);
+        }
         let attempt = async {
             let anchor = ReadAnchor::for_finalized(finalized);
             let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "resolve-ens").await?;
             let (block_number, block_timestamp) = (ctx.block_number, ctx.timestamp);
             let walk = super::request::blocking(move || {
                 let caller = ExecutorCaller { executor: &executor, ctx: &ctx };
-                let raw = myotis_evm::ccip_callback(
-                    &caller,
-                    sender,
-                    callback_function,
-                    &response,
-                    &extra_data,
-                    wrapped,
-                )?;
-                let Some(raw) = raw else { return Ok(None) };
-                decode_ccip_answer(&caller, &query, &raw)
+                let round = CcipRound { sender, callback_function, response, extra_data, wrapped };
+                continue_ccip_round(&caller, &query, reverse_claim, &round)
             });
             let joined = walk.await?;
             match joined {
@@ -7019,13 +7019,14 @@ impl ElReader {
                     Ok(EnsQueryOutcome::Value { value, block_number, block_timestamp, verified: finalized })
                 }
                 Ok(None) => Ok(EnsQueryOutcome::NoRecord { block_number, block_timestamp, verified: finalized }),
-                Err(EnsError::OffchainLookup { lookup, wrapped }) => {
+                Err(EnsError::OffchainLookup { lookup, wrapped, reverse_claim }) => {
                     Ok(EnsQueryOutcome::Offchain {
                         block_number,
                         block_timestamp,
                         verified: finalized,
                         lookup,
                         wrapped,
+                        reverse_claim,
                     })
                 }
                 Err(e) => Err(e.to_string()),
@@ -7058,12 +7059,13 @@ impl ElReader {
         match joined {
             Ok(Some(value)) => Ok(EnsQueryOutcome::Value { value, block_number, block_timestamp, verified: finalized }),
             Ok(None) => Ok(EnsQueryOutcome::NoRecord { block_number, block_timestamp, verified: finalized }),
-            Err(EnsError::OffchainLookup { lookup, wrapped }) => Ok(EnsQueryOutcome::Offchain {
+            Err(EnsError::OffchainLookup { lookup, wrapped, reverse_claim }) => Ok(EnsQueryOutcome::Offchain {
                 block_number,
                 block_timestamp,
                 verified: finalized,
                 lookup,
                 wrapped,
+                reverse_claim,
             }),
             Err(e) => Err(e.to_string()),
         }
@@ -10680,13 +10682,69 @@ fn run_ens_query(
     })
 }
 
+/// Why a ccipCallback re-entry is refused before any state is read, if it is.
+/// The direct path's refusal (a non-.gno name, or a reverse lookup, on Gnosis)
+/// holds for its continuation too: a round the engine never offered must not be
+/// answered. And a claim belongs to a reverse query's forward check only.
+fn ccip_callback_refusal(query: &EnsQuery, chain_id: u64, reverse_claim: Option<&str>) -> Option<String> {
+    if let Some(refused) = myotis_evm::ens_refusal(chain_id, ens_query_name(query)) {
+        return Some(refused.to_string());
+    }
+    if reverse_claim.is_some() && !matches!(query, EnsQuery::Reverse { .. }) {
+        return Some("reverseClaim is only valid for a reverse query".to_string());
+    }
+    None
+}
+
+/// One gateway round's callback tuple, as the host hands it back.
+struct CcipRound {
+    sender: [u8; 20],
+    callback_function: [u8; 4],
+    response: Vec<u8>,
+    extra_data: Vec<u8>,
+    wrapped: bool,
+}
+
+/// Run one round's callback and decode its answer for `query`. A further
+/// `OffchainLookup` from a forward-check round (`reverse_claim` Some) is still
+/// that step's: it keeps the claim, so the host counts it against the same
+/// step's round cap and a later round, were the cap raised, still decodes an
+/// address.
+fn continue_ccip_round(
+    caller: &dyn myotis_evm::EthCaller,
+    query: &EnsQuery,
+    reverse_claim: Option<String>,
+    round: &CcipRound,
+) -> Result<Option<EnsRecordValue>, EnsError> {
+    let raw = match myotis_evm::ccip_callback(
+        caller,
+        round.sender,
+        round.callback_function,
+        &round.response,
+        &round.extra_data,
+        round.wrapped,
+    ) {
+        Err(EnsError::OffchainLookup { lookup, wrapped, .. }) => {
+            return Err(EnsError::OffchainLookup { lookup, wrapped, reverse_claim });
+        }
+        other => other?,
+    };
+    let Some(raw) = raw else { return Ok(None) };
+    decode_ccip_answer(caller, query, reverse_claim.as_deref(), &raw)
+}
+
 /// Decode a CCIP callback's raw answer with the ORIGINAL query's record
-/// semantics (single source: the myotis-evm `decode_*_answer` helpers). A
-/// `Reverse` claimed name is forward-verified here, exactly like the direct
-/// path (the forward walk may itself surface `OffchainLookup` — propagated).
+/// semantics (single source: the myotis-evm `decode_*_answer` helpers). For a
+/// `Reverse` query, `reverse_claim` says which step the round answered: None,
+/// the claim — decoded as a name and forward-verified here, exactly like the
+/// direct path (the forward walk may itself surface `OffchainLookup`, which
+/// then carries the claim); `Some(name)`, the forward check of `name` — the
+/// answer is its address record. Callers pass a claim only with a `Reverse`
+/// query.
 fn decode_ccip_answer(
     caller: &dyn myotis_evm::EthCaller,
     query: &EnsQuery,
+    reverse_claim: Option<&str>,
     raw: &[u8],
 ) -> Result<Option<EnsRecordValue>, EnsError> {
     Ok(match query {
@@ -10705,15 +10763,17 @@ fn decode_ccip_answer(
         }
         EnsQuery::Abi { .. } => myotis_evm::decode_abi_answer(raw)
             .map(|(content_type, data)| EnsRecordValue::Abi { content_type, data }),
-        EnsQuery::Reverse { address } => match myotis_evm::decode_name_answer(raw) {
-            None => None,
+        EnsQuery::Reverse { address } => match reverse_claim {
+            Some(claimed) => myotis_evm::reverse_forward_answer(*address, claimed, raw)
+                .map(EnsRecordValue::Name),
             // Same hardening as the direct reverse path: a MALFORMED claimed
             // name (adversarial gateway data) is a failed verify, never an
             // error a malicious resolver can force.
-            Some(claimed) => match myotis_evm::resolve_address(caller, &claimed) {
-                Ok(Some(fwd)) if fwd == *address => Some(EnsRecordValue::Name(claimed)),
-                Ok(_) | Err(EnsError::InvalidName(_)) => None,
-                Err(e) => return Err(e),
+            None => match myotis_evm::decode_name_answer(raw) {
+                None => None,
+                Some(claimed) => {
+                    myotis_evm::verify_reverse_claim(caller, *address, claimed)?.map(EnsRecordValue::Name)
+                }
             },
         },
     })
@@ -12303,6 +12363,7 @@ mod tests {
         let addr = decode_ccip_answer(
             &caller,
             &EnsQuery::Addr { name: "a.eth".into() },
+            None,
             &addr_word([0xd8; 20]),
         )
         .unwrap();
@@ -12312,6 +12373,7 @@ mod tests {
         let pk = decode_ccip_answer(
             &caller,
             &EnsQuery::Pubkey { name: "a.eth".into() },
+            None,
             &addr_word([0xd8; 20]),
         )
         .unwrap();
@@ -12334,10 +12396,219 @@ mod tests {
         let out = decode_ccip_answer(
             &caller,
             &EnsQuery::Reverse { address: [0xd8; 20] },
+            None,
             &claimed,
         )
         .unwrap();
         assert_eq!(out, None);
+    }
+
+    /// An [`myotis_evm::EthCaller`] answering every call through one closure.
+    struct FnCaller<F>(F);
+    impl<F> myotis_evm::EthCaller for FnCaller<F>
+    where
+        F: Fn([u8; 20], &[u8]) -> Result<Vec<u8>, myotis_evm::EvmError>,
+    {
+        fn chain_id(&self) -> u64 {
+            1
+        }
+        fn eth_call(
+            &self,
+            target: [u8; 20],
+            calldata: &[u8],
+        ) -> Result<Vec<u8>, myotis_evm::EvmError> {
+            (self.0)(target, calldata)
+        }
+    }
+
+    #[test]
+    fn ccip_reverse_forward_check_round_answers_the_claim() {
+        // The bug this pins: the reverse record claims "x.cb.id" ON chain and the
+        // name's address record is OFF chain, so the round the host drove is the
+        // forward check's and its callback answers an ADDRESS. With the claim
+        // echoed back, the answer is compared with the queried address and the
+        // claim stands; read as the claim round's name(), it was "no record".
+        let queried = [0xd8; 20];
+        let reverse = EnsQuery::Reverse { address: queried };
+        let caller = ScriptedCaller(Vec::new());
+        let out = decode_ccip_answer(&caller, &reverse, Some("x.cb.id"), &addr_word(queried)).unwrap();
+        assert_eq!(out, Some(EnsRecordValue::Name("x.cb.id".into())));
+        let out = decode_ccip_answer(&caller, &reverse, None, &addr_word(queried)).unwrap();
+        assert_eq!(out, None, "the same answer read as the claim");
+        // The claimed name pointing at someone else is a failed verify.
+        let out = decode_ccip_answer(&caller, &reverse, Some("x.cb.id"), &addr_word([0xba; 20])).unwrap();
+        assert_eq!(out, None);
+        // The forward check reads nothing on chain: the round already answered it.
+        let silent = FnCaller(|_: [u8; 20], _: &[u8]| -> Result<Vec<u8>, myotis_evm::EvmError> {
+            panic!("a forward-check round made a call")
+        });
+        let out = decode_ccip_answer(&silent, &reverse, Some("x.cb.id"), &addr_word(queried)).unwrap();
+        assert_eq!(out, Some(EnsRecordValue::Name("x.cb.id".into())));
+    }
+
+    #[test]
+    fn ccip_forward_check_round_keeps_its_claim_through_a_further_lookup() {
+        let sender = [0x5e; 20];
+        let round = CcipRound {
+            sender,
+            callback_function: [0xcb; 4],
+            response: vec![0xaa],
+            extra_data: vec![0xee; 3],
+            wrapped: false,
+        };
+        let reverse = EnsQuery::Reverse { address: [0xd8; 20] };
+        // The round's callback answers: the claim stands when it points back.
+        let answers = FnCaller(move |t: [u8; 20], _: &[u8]| {
+            assert_eq!(t, sender);
+            Ok(addr_word([0xd8; 20]))
+        });
+        assert_eq!(
+            continue_ccip_round(&answers, &reverse, Some("x.cb.id".into()), &round).unwrap(),
+            Some(EnsRecordValue::Name("x.cb.id".into()))
+        );
+        // The round's callback reverts OffchainLookup again: still the forward
+        // check's lookup, so the claim stays with it; a claim round's stays bare.
+        let again = FnCaller(|_: [u8; 20], _: &[u8]| {
+            let mut data = vec![0x55, 0x6f, 0x18, 0x30];
+            data.extend_from_slice(&[0u8; 32]);
+            Err(myotis_evm::EvmError::Reverted { data })
+        });
+        match continue_ccip_round(&again, &reverse, Some("x.cb.id".into()), &round) {
+            Err(EnsError::OffchainLookup { reverse_claim, .. }) => {
+                assert_eq!(reverse_claim.as_deref(), Some("x.cb.id"));
+            }
+            other => panic!("expected a further lookup with the claim, got {other:?}"),
+        }
+        match continue_ccip_round(&again, &reverse, None, &round) {
+            Err(EnsError::OffchainLookup { reverse_claim: None, .. }) => {}
+            other => panic!("expected a further lookup without a claim, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ccip_callback_refuses_rounds_the_engine_never_offers() {
+        let reverse = EnsQuery::Reverse { address: [0xd8; 20] };
+        let addr = |name: &str| EnsQuery::Addr { name: name.into() };
+        // Gnosis: no reverse lookup, no name outside .gno — as on the direct path.
+        assert_eq!(
+            ccip_callback_refusal(&reverse, 100, None).as_deref(),
+            Some(myotis_evm::ens::NO_GNO_REVERSE)
+        );
+        assert_eq!(
+            ccip_callback_refusal(&reverse, 100, Some("x.cb.id")).as_deref(),
+            Some(myotis_evm::ens::NO_GNO_REVERSE)
+        );
+        assert_eq!(
+            ccip_callback_refusal(&addr("x.cb.id"), 100, None).as_deref(),
+            Some(myotis_evm::ens::ONLY_GNO_NAMES)
+        );
+        assert_eq!(ccip_callback_refusal(&addr("levvv.gno"), 100, None), None);
+        // A claim belongs to a reverse query's forward check only.
+        assert_eq!(
+            ccip_callback_refusal(&addr("x.cb.id"), 1, Some("x.cb.id")).as_deref(),
+            Some("reverseClaim is only valid for a reverse query")
+        );
+        // What the engine does offer passes, with or without a claim.
+        assert_eq!(ccip_callback_refusal(&reverse, 1, None), None);
+        assert_eq!(ccip_callback_refusal(&reverse, 1, Some("x.cb.id")), None);
+        assert_eq!(ccip_callback_refusal(&addr("x.cb.id"), 1, None), None);
+    }
+
+    #[test]
+    fn ccip_offchain_claim_then_offchain_forward_check_ends_in_the_name() {
+        // Both steps off chain, chained as the host drives them: the claim
+        // round's continuation hands back the forward check's lookup with the
+        // claim, and the round driven with that claim answers the name.
+        const SUPPORTS: [u8; 4] = [0x01, 0xff, 0xc9, 0xa7];
+        const RESOLVE: [u8; 4] = [0x90, 0x61, 0xb9, 0x23];
+        let queried = [0xd8; 20];
+        let reverse = EnsQuery::Reverse { address: queried };
+        let (claim_sender, cb_resolver) = ([0x5e; 20], [0x6c; 20]);
+        let mut name_answer = vec![0u8; 32];
+        name_answer[31] = 0x20;
+        let mut len = vec![0u8; 32];
+        len[31] = 7;
+        name_answer.extend_from_slice(&len);
+        name_answer.extend_from_slice(b"x.cb.id");
+        name_answer.extend_from_slice(&[0u8; 25]);
+        let caller = FnCaller(move |t: [u8; 20], cd: &[u8]| {
+            if t == claim_sender {
+                // The claim round's callback: the gateway-backed name().
+                return Ok(name_answer.clone());
+            }
+            if t == cb_resolver && cd[..4] == SUPPORTS {
+                return Ok(vec![0u8; 31].into_iter().chain([1u8]).collect());
+            }
+            if t == cb_resolver && cd[..4] == RESOLVE {
+                let mut data = vec![0x55, 0x6f, 0x18, 0x30];
+                data.extend_from_slice(&[0u8; 32]);
+                return Err(myotis_evm::EvmError::Reverted { data });
+            }
+            if t == cb_resolver {
+                // The forward round's callback: x.cb.id's address.
+                return Ok(addr_word(queried));
+            }
+            Ok(addr_word(cb_resolver))
+        });
+        let claim_round = CcipRound {
+            sender: claim_sender,
+            callback_function: [0xcb; 4],
+            response: vec![0xaa],
+            extra_data: vec![],
+            wrapped: false,
+        };
+        let claim = match continue_ccip_round(&caller, &reverse, None, &claim_round) {
+            Err(EnsError::OffchainLookup { reverse_claim: Some(c), .. }) => c,
+            other => panic!("expected the forward check's lookup, got {other:?}"),
+        };
+        let forward_round = CcipRound {
+            sender: cb_resolver,
+            callback_function: [0xf4; 4],
+            response: vec![0xbb],
+            extra_data: vec![],
+            wrapped: false,
+        };
+        assert_eq!(
+            continue_ccip_round(&caller, &reverse, Some(claim), &forward_round).unwrap(),
+            Some(EnsRecordValue::Name("x.cb.id".into()))
+        );
+    }
+
+    #[test]
+    fn ccip_reverse_claim_round_hands_its_offchain_forward_check_the_claim() {
+        // A claim round (off-chain claim) whose forward check is off chain too:
+        // the next lookup is the forward check's and carries the claim, so the
+        // round after it is decoded as an address.
+        const SUPPORTS: [u8; 4] = [0x01, 0xff, 0xc9, 0xa7];
+        const RESOLVE: [u8; 4] = [0x90, 0x61, 0xb9, 0x23];
+        let resolver = [0x6c; 20];
+        let caller = FnCaller(move |target: [u8; 20], cd: &[u8]| {
+            if target == resolver && cd[..4] == SUPPORTS {
+                return Ok(vec![0u8; 31].into_iter().chain([1u8]).collect());
+            }
+            if target == resolver && cd[..4] == RESOLVE {
+                // OffchainLookup selector + a truncated body: offchain, no tuple.
+                let mut data = vec![0x55, 0x6f, 0x18, 0x30];
+                data.extend_from_slice(&[0u8; 32]);
+                return Err(myotis_evm::EvmError::Reverted { data });
+            }
+            // The registry: every resolver(bytes32) lookup names `resolver`.
+            Ok(addr_word(resolver))
+        });
+        let mut claimed = vec![0u8; 32];
+        claimed[31] = 0x20;
+        let mut len = vec![0u8; 32];
+        len[31] = 7;
+        claimed.extend_from_slice(&len);
+        claimed.extend_from_slice(b"x.cb.id");
+        claimed.extend_from_slice(&[0u8; 25]);
+        let out = decode_ccip_answer(&caller, &EnsQuery::Reverse { address: [0xd8; 20] }, None, &claimed);
+        match out {
+            Err(EnsError::OffchainLookup { wrapped: true, reverse_claim, .. }) => {
+                assert_eq!(reverse_claim.as_deref(), Some("x.cb.id"));
+            }
+            other => panic!("expected the forward check's lookup with its claim, got {other:?}"),
+        }
     }
 
     #[test]

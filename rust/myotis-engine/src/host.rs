@@ -2075,7 +2075,8 @@ pub fn ens_record_json(handle: i64, params_json: &str) -> String {
     }
     // method:"ccipCallback" re-enters after a host-driven gateway round: the
     // ORIGINAL query travels as queryMethod + its usual fields (drives the
-    // decode semantics + reverse forward-verify), plus the callback tuple.
+    // decode semantics + reverse forward-verify), plus the callback tuple and,
+    // when the offchain envelope carried one, its reverseClaim (ABI ≥ 49).
     let is_ccip = method == "ccipCallback";
     let query_method = if is_ccip {
         match str_field("queryMethod") {
@@ -2101,6 +2102,10 @@ pub fn ens_record_json(handle: i64, params_json: &str) -> String {
 
     let query = match parse_ens_query(&query_method, &params) {
         Ok(q) => q,
+        Err(e) => return eljson::error_json(&e),
+    };
+    let reverse_claim = match parse_reverse_claim(is_ccip, &query, &params) {
+        Ok(c) => c,
         Err(e) => return eljson::error_json(&e),
     };
 
@@ -2136,6 +2141,7 @@ pub fn ens_record_json(handle: i64, params_json: &str) -> String {
             reader
                 .ens_ccip_callback(
                     query, chain_id, finalized, sender, callback, response, extra, wrapped,
+                    reverse_claim,
                 )
                 .await
         }) {
@@ -3046,6 +3052,36 @@ fn running_reader(engine: &EngineState, handle: i64) -> Result<Arc<ElReader>, &'
     }
 }
 
+/// The `reverseClaim` a ccipCallback echoes from the offchain envelope (ABI ≥
+/// 49): the claimed name whose forward check the round answered, which makes
+/// the callback read the answer as that name's address. Applied or refused,
+/// never ignored: only a reverse query's callback may carry one, and it must be
+/// a well-formed name — the engine emits no other, so anything else is a host
+/// fault. Not trimmed: the answer is the name verified, byte for byte. Trusted
+/// as the tuple it travels with is: it is the host's echo of the round, not
+/// bound to it on chain (`senderHex` already picks the contract that answers).
+fn parse_reverse_claim(
+    is_ccip: bool,
+    query: &EnsQuery,
+    params: &serde_json::Value,
+) -> Result<Option<String>, String> {
+    let Some(value) = params.get("reverseClaim") else {
+        return Ok(None);
+    };
+    if !is_ccip {
+        return Err("reverseClaim is only valid on a ccipCallback".to_string());
+    }
+    if !matches!(query, EnsQuery::Reverse { .. }) {
+        return Err("reverseClaim is only valid for a reverse query".to_string());
+    }
+    match value.as_str() {
+        Some(claim) if !claim.is_empty() && myotis_evm::ens::dns_encode(claim).is_ok() => {
+            Ok(Some(claim.to_string()))
+        }
+        _ => Err("malformed reverseClaim".to_string()),
+    }
+}
+
 /// Build the [`EnsQuery`] for one record method from the params JSON — shared
 /// by the direct dispatch AND the ccipCallback re-entry (which passes the
 /// ORIGINAL query's method as `queryMethod`), so the two paths can never
@@ -3909,6 +3945,33 @@ mod tests {
         // ccipCallback can never be a queryMethod (no native recursion).
         assert!(parse_ens_query("ccipCallback", &rev).is_err());
         assert!(parse_ens_query("bogus", &rev).is_err());
+    }
+
+    #[test]
+    fn reverse_claim_is_applied_or_refused_never_ignored() {
+        use myotis_net::el::evm::EnsQuery;
+        let reverse = EnsQuery::Reverse { address: [0xd8; 20] };
+        let params = |extra: &str| -> serde_json::Value {
+            serde_json::from_str(&format!(r#"{{"method":"ccipCallback"{extra}}}"#)).unwrap()
+        };
+        // Absent: the round read the claim itself.
+        assert_eq!(parse_reverse_claim(true, &reverse, &params("")), Ok(None));
+        // A reverse callback's claim travels byte for byte (no trimming).
+        assert_eq!(
+            parse_reverse_claim(true, &reverse, &params(r#","reverseClaim":"x.cb.id""#)),
+            Ok(Some("x.cb.id".to_string()))
+        );
+        // Anything that would otherwise be dropped is refused.
+        let refused = |is_ccip: bool, query: &EnsQuery, extra: &str| {
+            parse_reverse_claim(is_ccip, query, &params(extra)).unwrap_err()
+        };
+        let addr = EnsQuery::Addr { name: "x.cb.id".into() };
+        assert!(refused(true, &addr, r#","reverseClaim":"x.cb.id""#).contains("reverse query"));
+        assert!(refused(false, &reverse, r#","reverseClaim":"x.cb.id""#).contains("ccipCallback"));
+        for bad in [r#","reverseClaim":"""#, r#","reverseClaim":"a..eth""#,
+                    r#","reverseClaim":null"#, r#","reverseClaim":7"#] {
+            assert_eq!(refused(true, &reverse, bad), "malformed reverseClaim", "{bad}");
+        }
     }
 
     #[test]

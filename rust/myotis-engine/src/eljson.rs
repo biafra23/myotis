@@ -668,7 +668,11 @@ pub fn ens_json(outcome: &EnsOutcome) -> String {
 ///   `gracePeriodSeconds` (ownership; only `wrapped` is always present, an
 ///   absent part is left out rather than null).
 /// - `{"status":"noRecord","blockNumber":N,"blockTimestamp":T,"verified":b}`
-/// - `{"status":"offchain","blockNumber":N,"blockTimestamp":T,"verified":b}`
+/// - `{"status":"offchain","blockNumber":N,"blockTimestamp":T,"verified":b,"wrapped":b}`
+///   plus, when the revert's tuple parsed, `senderHex` / `urls` / `callDataHex`
+///   / `callbackFunctionHex` / `extraDataHex` for the host's gateway round and —
+///   ABI ≥ 49, a reverse query forward-verifying a claimed name — `reverseClaim`,
+///   which the host echoes into the `ccipCallback` with the tuple.
 ///
 /// `verified` = the resolution ran against the beacon-FINALIZED root.
 /// `blockTimestamp` (ABI ≥ 41) = the block's own timestamp, unix seconds, from
@@ -731,7 +735,14 @@ pub fn ens_record_json(outcome: &EnsQueryOutcome) -> String {
             obj.insert("blockTimestamp".into(), json_u64(*block_timestamp));
             obj.insert("verified".into(), (*verified).into());
         }
-        EnsQueryOutcome::Offchain { block_number, block_timestamp, verified, lookup, wrapped } => {
+        EnsQueryOutcome::Offchain {
+            block_number,
+            block_timestamp,
+            verified,
+            lookup,
+            wrapped,
+            reverse_claim,
+        } => {
             obj.insert("status".into(), "offchain".into());
             obj.insert("blockNumber".into(), json_u64(*block_number));
             obj.insert("blockTimestamp".into(), json_u64(*block_timestamp));
@@ -753,6 +764,12 @@ pub fn ens_record_json(outcome: &EnsQueryOutcome) -> String {
                     hex0x_var(&l.callback_function).into(),
                 );
                 obj.insert("extraDataHex".into(), hex0x_var(&l.extra_data).into());
+                // ABI ≥ 49: a reverse query's round that forward-verifies this
+                // claimed name — the host echoes it into the callback, which then
+                // reads the answer as the name's address, not as a claim.
+                if let Some(claim) = reverse_claim {
+                    obj.insert("reverseClaim".into(), claim.as_str().into());
+                }
             }
         }
     }
@@ -1445,7 +1462,7 @@ mod tests {
         assert!(none.get("dataHex").is_none());
 
         let off: serde_json::Value = serde_json::from_str(&ens_record_json(
-            &EnsQueryOutcome::Offchain { block_number: 21_000_010, block_timestamp: 1_700_000_120, verified: false, lookup: None, wrapped: false },
+            &EnsQueryOutcome::Offchain { block_number: 21_000_010, block_timestamp: 1_700_000_120, verified: false, lookup: None, wrapped: false, reverse_claim: None },
         ))
         .unwrap();
         assert_eq!(off["status"], "offchain");
@@ -1467,6 +1484,7 @@ mod tests {
                     extra_data: vec![0xEE; 3],
                 })),
                 wrapped: true,
+                reverse_claim: None,
             },
         ))
         .unwrap();
@@ -1477,6 +1495,42 @@ mod tests {
         assert_eq!(full["extraDataHex"], "0xeeeeee");
         assert_eq!(full["wrapped"], true);
         assert_eq!(full["verified"], true);
+        // Only a reverse query's forward-check round carries a claim.
+        assert!(full.get("reverseClaim").is_none());
+        // ABI 49: the forward check of a reverse claim — the same tuple plus the
+        // claim the host echoes (CcipDriverTest replays this literal too).
+        let claim: serde_json::Value = serde_json::from_str(&ens_record_json(
+            &EnsQueryOutcome::Offchain {
+                block_number: 21_000_010,
+                block_timestamp: 1_700_000_120,
+                verified: true,
+                lookup: Some(Box::new(myotis_evm::OffchainLookup {
+                    sender: [0x5E; 20],
+                    urls: vec!["https://gw.example/{sender}/{data}.json".into()],
+                    call_data: vec![0xCA, 0x11],
+                    callback_function: [0xCB; 4],
+                    extra_data: vec![0xEE; 3],
+                })),
+                wrapped: true,
+                reverse_claim: Some("x.cb.id".into()),
+            },
+        ))
+        .unwrap();
+        assert_eq!(claim["reverseClaim"], "x.cb.id");
+        assert_eq!(claim["senderHex"], full["senderHex"]);
+        // Without a tuple there is no round to continue, so no claim either.
+        let bare: serde_json::Value = serde_json::from_str(&ens_record_json(
+            &EnsQueryOutcome::Offchain {
+                block_number: 21_000_010,
+                block_timestamp: 1_700_000_120,
+                verified: true,
+                lookup: None,
+                wrapped: true,
+                reverse_claim: Some("x.cb.id".into()),
+            },
+        ))
+        .unwrap();
+        assert!(bare.get("reverseClaim").is_none());
         // ABI 42: the ownership answer; absent parts are left out.
         let own: serde_json::Value = serde_json::from_str(&ens_record_json(&EnsQueryOutcome::Value {
             value: EnsRecordValue::Ownership(myotis_evm::EnsOwnership {

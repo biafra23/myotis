@@ -304,13 +304,17 @@ pub enum EnsQueryOutcome {
     /// gateway round with the carried tuple, then re-enter via the callback
     /// (`method:"ccipCallback"`). `lookup` is `None` when the revert's tuple was
     /// unparseable (still distinguishable from `NoRecord`); `wrapped` = the
-    /// revert came from inside the ENSIP-10 `resolve()` wrap.
+    /// revert came from inside the ENSIP-10 `resolve()` wrap. `reverse_claim`
+    /// is set for a `Reverse` query whose round forward-verifies that claimed
+    /// name (see `myotis_evm::EnsError::OffchainLookup`): the host hands it back
+    /// with the callback, which then reads the answer as the name's address.
     Offchain {
         block_number: u64,
         block_timestamp: u64,
         verified: bool,
         lookup: Option<Box<myotis_evm::OffchainLookup>>,
         wrapped: bool,
+        reverse_claim: Option<String>,
     },
 }
 
