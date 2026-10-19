@@ -21,12 +21,15 @@
 #   - the desktop host libraries: one myotis-engine-natives-<platform> jar per
 #     line of myotis-engine-natives/platforms.txt, each holding just the engine
 #     library at JNA's classpath path, built for that OS and architecture;
+#   - the iOS module (myotis-engine-ios, staged on macOS and merged in): one klib
+#     per iOS target and, beside it, the target's cinterop klib with
+#     libmyotis_engine.a inside — a cinterop without the archive links no engine;
 #   - the version carries no -SNAPSHOT: the publication is staged with
 #     -PpublishRelease (a SNAPSHOT on GitHub Packages would be a release nobody
 #     can pin — and Gradle stages a SNAPSHOT under Maven's timestamped file
 #     names, which is not the layout the release publishes).
 #
-# Usage: scripts/check_engine_library.sh <staging-repo-dir> [--without-rust-engine] [--host-natives]
+# Usage: scripts/check_engine_library.sh <staging-repo-dir> [--without-rust-engine] [--host-natives] [--without-ios]
 #   <staging-repo-dir>     build/maven-repo after
 #                          `./gradlew -PpublishRelease publishAllPublicationsToStagingRepository`
 #   --without-rust-engine  the publication was built with -PskipRustEngine
@@ -37,20 +40,26 @@
 #                          a local run needs host cargo): check the natives jars that
 #                          are staged, at least one, instead of requiring every
 #                          platform. For a local run; CI never passes it.
+#   --without-ios          a staging without the iOS module (any host but a Mac
+#                          with the iOS rustup targets, where the module disables
+#                          itself): skip its checks. For a local run; CI never
+#                          passes it.
 #
 # Run by .github/workflows/engine-library.yml on every build of the publication
 # and again on the tag build right before anything is uploaded.
 
 set -euo pipefail
 
-repo=${1:?usage: $0 <staging-repo-dir> [--without-rust-engine] [--host-natives]}
+repo=${1:?usage: $0 <staging-repo-dir> [--without-rust-engine] [--host-natives] [--without-ios]}
 shift
 with_native=1
 all_natives=1
+with_ios=1
 for arg in "$@"; do
     case "$arg" in
         --without-rust-engine) with_native=0 ;;
         --host-natives) all_natives=0 ;;
+        --without-ios) with_ios=0 ;;
         *) echo "unknown option: $arg" >&2; exit 2 ;;
     esac
 done
@@ -231,6 +240,44 @@ done < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$here/myotis-engine-natives/pl
 if [ "$all_natives" = 0 ]; then
     [ "$natives_seen" -ge 1 ] || err "--host-natives: no myotis-engine-natives-* jar is staged"
     echo "note: --host-natives — $natives_seen of the platforms checked, not all"
+fi
+
+# The iOS module: the root (module metadata a KMP consumer's iOS targets resolve
+# through) and per target its klib and its cinterop klib, which must carry the
+# engine's static archive (the def file's staticLibraries, absorbed at cinterop
+# time: a consumer's framework link takes the engine from there) exporting the C
+# ABI's handshake. Which archive went to which triple is the build's
+# (-libraryPath per target); a swap fails the consumer's link, not silently.
+if [ "$with_ios" = 1 ]; then
+    expect myotis-engine-ios .pom
+    expect myotis-engine-ios .module
+    for target in iosarm64 iossimulatorarm64; do
+        a="myotis-engine-ios-$target"
+        expect "$a" .klib
+        expect "$a" .pom
+        expect "$a" .module
+        shopt -s nullglob
+        cinterops=("$group_dir/$a/$version/$a-$version"-cinterop-*.klib)
+        shopt -u nullglob
+        [ "${#cinterops[@]}" -eq 1 ] \
+            || { err "$a: expected exactly one cinterop klib, found ${#cinterops[@]}"; continue; }
+        klib=${cinterops[0]}
+        # The maven-repo branch is a git branch: GitHub refuses a file over 100 MB.
+        size=$(wc -c < "$klib" | tr -d ' ')
+        [ "$size" -lt 95000000 ] \
+            || err "$(basename "$klib") is $size bytes — near GitHub's 100 MB file limit, the maven-repo branch push would fail"
+        archive=$(unzip -Z1 "$klib" | { grep '/included/libmyotis_engine\.a$' || true; })
+        [ -n "$archive" ] \
+            || { err "$(basename "$klib") does not include libmyotis_engine.a — a consumer would link no engine"; continue; }
+        lib=$(mktemp)
+        unzip -p "$klib" "$archive" > "$lib"
+        LC_ALL=C grep -q '_myotis_init' "$lib" \
+            || err "$(basename "$klib"): $archive does not define myotis_init — not the engine's C ABI?"
+        echo "ios: $(du -h "$klib" | cut -f1) $(basename "$klib") ($archive, $(du -h "$lib" | cut -f1))"
+        rm -f "$lib"
+    done
+else
+    echo "note: --without-ios — the iOS module not checked"
 fi
 
 [ "$fail" = 0 ] || exit 1

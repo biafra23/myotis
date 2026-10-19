@@ -23,7 +23,8 @@ on:
   # both push-to-main and PRs to the inputs that can change MyotisKit — a
   # docs-only PR shouldn't pay a 10x-billed macOS build. The set is everything
   # the framework compiles from: rust/ (the C ABI + engine), :app-ios and the
-  # modules it bundles (:ui, :jsonrpc-server), and the Gradle build inputs.
+  # modules it bundles (:myotis-engine-ios, :ui, :jsonrpc-server), and the Gradle
+  # build inputs.
   # Path filters are ignored for TAG pushes (GitHub behaviour, same as the
   # sibling ios-xcframework.yml), so releases still fire regardless.
   push:
@@ -32,6 +33,7 @@ on:
     paths: &fw_paths
       - 'rust/**'
       - 'app-ios/**'
+      - 'myotis-engine-ios/**'
       - 'ui/**'
       - 'jsonrpc-server/**'
       - '**/build.gradle.kts'

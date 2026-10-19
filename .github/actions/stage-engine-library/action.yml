@@ -1,7 +1,8 @@
-# Stage the engine library's publication (build/maven-repo) and check it — the
-# steps engine-library.yml's two jobs share: the build job on pushes to main and
-# dispatch (stage + check, nothing uploaded) and the publish job on a v* tag
-# (the same, then GitHub Packages + the release). One definition, so a fix to
+# Stage the engine library's publication (build/maven-repo), merge in the iOS
+# module staged on macOS, and check it — the steps engine-library.yml's two jobs
+# share: the build job on pushes to main and dispatch (stage + check, nothing
+# uploaded) and the publish job on a v* tag (the same, then GitHub Packages + the
+# release). One definition, so a fix to
 # the staging retry or the verification never has to be applied twice.
 #
 # The AAR builds the Rust engine FROM SOURCE (:myotis-engine's preBuild chain),
@@ -26,6 +27,13 @@ inputs:
       myotis-engine-natives/platforms.txt (engine-library.yml's host-natives
       matrix): passed as -PengineNativesDir, so the natives publications are that
       set and not this runner's own host build.
+    required: true
+  ios-dir:
+    description: >-
+      The iOS module (eth.myotis:myotis-engine-ios*) as engine-library.yml's
+      ios-engine job staged it on macOS, a Maven repository layout: merged into
+      build/maven-repo after the staging here, which leaves the module out (its
+      cinterop needs Apple's SDK), so the check below covers the whole set.
     required: true
   save-rust-cache:
     description: Whether this run saves the Rust build cache (main saves, a tag only restores).
@@ -87,6 +95,25 @@ runs:
         done
         echo "::error::staging the publication failed after 3 attempts"
         exit 1
+
+    # Into the set before anything checks it: the iOS module never overlaps the
+    # Linux-staged artifacts, so this adds directories and replaces nothing (and
+    # refuses if it ever would). The same -PpublishRelease on both sides, so one
+    # version; the check enforces it.
+    - name: Merge the macOS-staged iOS module
+      shell: bash
+      env:
+        IOS_DIR: ${{ inputs.ios-dir }}
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        modules=("$IOS_DIR"/eth/myotis/myotis-engine-ios*)
+        [ "${#modules[@]}" -ge 1 ] || { echo "::error::$IOS_DIR holds no eth/myotis/myotis-engine-ios*"; exit 1; }
+        for m in "${modules[@]}"; do
+          [ ! -e "build/maven-repo/eth/myotis/$(basename "$m")" ] \
+            || { echo "::error::$(basename "$m") is staged on both sides"; exit 1; }
+          cp -R "$m" build/maven-repo/eth/myotis/
+        done
 
     # Same two backstops as android-apk.yml: the jniLibs were really built
     # (cargoNdkAndroid self-skips only on an incomplete toolchain, which

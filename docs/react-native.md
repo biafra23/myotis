@@ -58,14 +58,16 @@ The integration builds on three assets:
      the engine self-persists its node key, peer caches, and finality
      snapshots under `data_dir`, so the FFI is purely blocking call-in.
    - `rust/include/myotis_engine.h` — the hand-written header, consumed via
-     Kotlin/Native cinterop by `:app-ios`.
+     Kotlin/Native cinterop by `:myotis-engine-ios` (published as
+     `eth.myotis:myotis-engine-ios`), which `:app-ios` builds on.
    - Cargo tasks `cargoBuildIosDevice` / `cargoBuildIosSim`
      (aarch64-apple-ios, aarch64-apple-ios-sim) producing
      `libmyotis_engine.a`.
    - `:app-ios` (Kotlin/Native `MyotisKit.framework` bundling the Compose
      `:ui`) and the `ios-app/` Xcode shell — proof the C ABI hosts a real
-     iOS light client (`app-ios/src/iosMain/kotlin/io/myotis/ios/RustEngine.kt`,
-     `IosNodeController.kt`).
+     iOS light client
+     (`myotis-engine-ios/src/iosMain/kotlin/io/myotis/engine/ios/RustEngine.kt`,
+     `app-ios/src/iosMain/kotlin/io/myotis/ios/IosNodeController.kt`).
 
 3. **Engine features on `main`.** ABI 14 includes verified reads
    (account/storage/code), revm `eth_call`/`estimateGas`, `sendRawTransaction`,
@@ -309,8 +311,8 @@ path is P0 → P2 → P3, with P1 parallel.
 - `myotis-engine-rust/src/main/java/io/myotis/engines/rust/` —
   `RustEngineNative.java`, `RustChainHandle.java` (the wrapper contract the
   Swift layer ports), `CcipDriver.java`
-- `app-ios/src/iosMain/kotlin/io/myotis/ios/RustEngine.kt`,
-  `IosNodeController.kt` *(feat/ios-target)*
+- `myotis-engine-ios/src/iosMain/kotlin/io/myotis/engine/ios/RustEngine.kt`,
+  `app-ios/src/iosMain/kotlin/io/myotis/ios/IosNodeController.kt` *(feat/ios-target)*
 - `android-app/src/main/java/com/jaeckel/ethp2p/android/NodeService.java`
   (lifecycle playbook), `myotis-engine/build.gradle.kts` (builds the jniLibs
   from source; `-PskipRustEngine` opts out — no committed fallback any more)

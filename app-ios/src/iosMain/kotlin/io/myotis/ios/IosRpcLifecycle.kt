@@ -1,5 +1,6 @@
 package io.myotis.ios
 
+import io.myotis.engine.ios.RustEngine
 import io.myotis.jsonrpc.RpcLifecycle
 import io.myotis.jsonrpc.RpcLifecycleResult
 import kotlinx.serialization.json.JsonObject

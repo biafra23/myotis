@@ -1,6 +1,8 @@
 # The engine library's publication: eth.myotis:myotis-engine (the Android AAR +
-# the desktop jar), the modules its POMs reach and the desktop host libraries
-# (eth.myotis:myotis-engine-natives-<platform>, built by the host-natives matrix), staged as a Maven repository
+# the desktop jar), the modules its POMs reach, the desktop host libraries
+# (eth.myotis:myotis-engine-natives-<platform>, built by the host-natives matrix)
+# and the iOS module (eth.myotis:myotis-engine-ios, staged by the macOS ios-engine
+# job), staged as a Maven repository
 # and checked (scripts/check_engine_library.sh) on every run; on a `v*` tag,
 # published to GitHub Packages, merged into the `maven-repo` branch (a Maven
 # repository URL that needs no token) and attached to the release as the bare
@@ -36,6 +38,7 @@ on:
       - 'myotis-engine-rust/**'
       - 'myotis-engine/**'
       - 'myotis-engine-natives/**'
+      - 'myotis-engine-ios/**'
       - 'rust/**'
       - 'scripts/check_engine_library.sh'
       - 'scripts/merge_maven_repo.py'
@@ -134,14 +137,138 @@ jobs:
           # re-run needs these too.
           overwrite: true
 
+  # The iOS module, eth.myotis:myotis-engine-ios: the Rust engine's C ABI as
+  # Kotlin/Native cinterop with libmyotis_engine.a inside each target's cinterop
+  # klib. Its cinterop needs Apple's SDK, so it is staged here on macOS (both
+  # triples built fresh by the root cargoBuildIos* tasks) with the same
+  # -PpublishRelease the Linux staging uses, and the jobs below merge it into the
+  # set they stage, check and publish; on Linux the module disables itself and
+  # stages nothing (myotis-engine-ios/build.gradle.kts).
+  #
+  # On a tag this job is also the module's GitHub Packages publish, from the same
+  # Gradle invocation that stages it (so the staged bytes are the published ones,
+  # and Gradle merges the remote maven-metadata.xml as for every other module):
+  # Gradle on Linux has the module disabled. Hence the version guard first. The
+  # rest of the set is checked and published by the publish job, which also
+  # checks this module's staged files before anything of its own goes up; a
+  # failure there leaves this module's version on GitHub Packages, to delete
+  # with the others before a re-run — with "Re-run all jobs", so this job
+  # publishes it again (the publish job's note; that job checks it is there).
+  ios-engine:
+    name: Engine iOS module (myotis-engine-ios)
+    needs: version-guard
+    # version-guard runs on tags only: skipped elsewhere, which must not skip this.
+    if: ${{ !cancelled() && (needs.version-guard.result == 'success' || needs.version-guard.result == 'skipped') }}
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      # The tag's GitHub Packages publish (see above).
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21 (aarch64)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          architecture: 'aarch64'
+
+      - name: Set up Rust (iOS targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: engine-ios
+          # The tag's run restores main's cache; it does not save one.
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Stage the iOS module
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          # -PpublishRelease=<version> on a tag; bare -PpublishRelease otherwise —
+          # the stage action's rule, so both halves carry the one version.
+          flag="-PpublishRelease"
+          case "${GITHUB_REF}" in refs/tags/v*) flag="-PpublishRelease=${GITHUB_REF_NAME#v}" ;; esac
+          staged=0
+          for attempt in 1 2 3; do
+            rm -rf build/maven-repo
+            ./gradlew "$flag" :myotis-engine-ios:publishAllPublicationsToStagingRepository --stacktrace \
+              && { staged=1; break; }
+            echo "::warning::staging attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
+            sleep 25
+          done
+          [ "$staged" = 1 ] || { echo "::error::staging myotis-engine-ios failed after 3 attempts"; exit 1; }
+          echo "STAGE_FLAG=$flag" >> "$GITHUB_ENV"
+          # A disabled module (no iOS rustup targets after all) stages nothing and
+          # exits 0; the publication check would catch it on Linux, this says why.
+          for triple in aarch64-apple-ios aarch64-apple-ios-sim; do
+            lib="rust/target/$triple/release/libmyotis_engine.a"
+            [ "$lib" -nt gradlew ] || { echo "::error::$lib was NOT built (cargoBuildIos* self-skipped?)"; exit 1; }
+          done
+          ls -d build/maven-repo/eth/myotis/myotis-engine-ios* \
+            || { echo "::error::nothing was staged: :myotis-engine-ios was disabled"; exit 1; }
+          find build/maven-repo -type f -name '*.klib' -exec ls -l {} +
+          # The engine inside each target's cinterop klib, under the maven-repo
+          # branch's file limit: check_engine_library.sh's iOS checks, run here too
+          # because the tag's publish below comes before the Linux check (the full
+          # check there adds what needs the whole set: one version, the closure).
+          shopt -s nullglob
+          klibs=(build/maven-repo/eth/myotis/myotis-engine-ios-*/*/*-cinterop-*.klib)
+          shopt -u nullglob
+          [ "${#klibs[@]}" -eq 2 ] \
+            || { echo "::error::expected 2 cinterop klibs (one per iOS target), found ${#klibs[@]}"; exit 1; }
+          for k in "${klibs[@]}"; do
+            size=$(wc -c < "$k" | tr -d ' ')
+            [ "$size" -lt 95000000 ] \
+              || { echo "::error::$k is $size bytes, near GitHub's 100 MB file limit"; exit 1; }
+            archive=$(unzip -Z1 "$k" | { grep '/included/libmyotis_engine\.a$' || true; })
+            [ -n "$archive" ] || { echo "::error::$k does not include libmyotis_engine.a"; exit 1; }
+            unzip -p "$k" "$archive" > "$RUNNER_TEMP/engine.a"
+            LC_ALL=C grep -q '_myotis_init' "$RUNNER_TEMP/engine.a" \
+              || { echo "::error::$k: $archive does not define myotis_init"; exit 1; }
+          done
+
+      # Same build, no rebuild: the tasks above are up to date, so Gradle uploads
+      # the staged outputs (as the publish job does for the rest of the set).
+      - name: Publish the iOS module to GitHub Packages
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./gradlew "$STAGE_FLAG" :myotis-engine-ios:publishAllPublicationsToGitHubPackagesRepository --stacktrace
+
+      - name: Upload the staged iOS module
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-ios-${{ github.sha }}
+          path: build/maven-repo
+          if-no-files-found: error
+          # The default 90 days, as for the host libraries: a tag's publish job
+          # re-run needs it too.
+          overwrite: true
+
   # Stage + check, no upload: every push to main and every dispatch. Not on a
   # tag — there the publish job below IS the build, so the tag's assets and its
   # GitHub Packages artifacts come from one build (a second build would not
   # produce the same bytes: jars are not reproducible here).
   build:
     name: Stage and check the publication
-    needs: host-natives
-    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+    needs: [host-natives, ios-engine]
+    # Explicit results: ios-engine depends on version-guard, which is skipped off a
+    # tag, and the implicit success() skips every job downstream of a skipped one.
+    if: >-
+      ${{ !cancelled() && !startsWith(github.ref, 'refs/tags/v')
+          && needs.host-natives.result == 'success' && needs.ios-engine.result == 'success' }}
     runs-on: ubuntu-latest
     # A wedged cargo-ndk or Gradle daemon must not hold the runner for the
     # 6-hour default (android-apk.yml's budget for the same build).
@@ -159,10 +286,17 @@ jobs:
           path: build/engine-natives
           merge-multiple: true
 
+      - name: Download the staged iOS module
+        uses: actions/download-artifact@v4
+        with:
+          name: engine-ios-${{ github.sha }}
+          path: build/engine-ios
+
       - name: Stage and check the publication
         uses: ./.github/actions/stage-engine-library
         with:
           natives-dir: build/engine-natives
+          ios-dir: build/engine-ios
 
       - name: Upload the staged repository
         uses: actions/upload-artifact@v4
@@ -188,10 +322,14 @@ jobs:
   # Re-running a tag's publish: GitHub Packages refuses to overwrite a version
   # (the Gradle publish fails with 409/422), so a republish needs that package
   # version deleted first — every eth.myotis.* package of it — in the
-  # repository's Packages page. The release assets re-upload with --clobber.
+  # repository's Packages page. Then "Re-run all jobs", not "Re-run failed
+  # jobs": eth.myotis:myotis-engine-ios is published by the ios-engine job,
+  # which a failed-jobs re-run leaves out (the step after the Gradle publish
+  # fails the run if the module is missing). The release assets re-upload
+  # with --clobber.
   publish:
     name: Publish to GitHub Packages and the release
-    needs: [version-guard, host-natives]
+    needs: [version-guard, host-natives, ios-engine]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -211,6 +349,12 @@ jobs:
           path: build/engine-natives
           merge-multiple: true
 
+      - name: Download the staged iOS module
+        uses: actions/download-artifact@v4
+        with:
+          name: engine-ios-${{ github.sha }}
+          path: build/engine-ios
+
       # Everything below uploads; nothing is uploaded unless the staged set is
       # complete and correct (the action's check). The tag's version is what
       # the artifacts carry — v0.1.16-rc1 publishes 0.1.16-rc1, never the
@@ -220,6 +364,7 @@ jobs:
         with:
           release-tag: ${{ github.ref_name }}
           natives-dir: build/engine-natives
+          ios-dir: build/engine-ios
           # The tag's run restores main's cache; it does not save one.
           save-rust-cache: 'false'
 
@@ -233,6 +378,21 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./gradlew "-PpublishRelease=${GITHUB_REF_NAME#v}" -PengineNativesDir=build/engine-natives publishAllPublicationsToGitHubPackagesRepository --stacktrace
+
+      # The iOS module went up from the ios-engine job (Gradle here has it
+      # disabled): make sure it is there, or a re-run of this job alone after a
+      # deleted version would publish everything but it, all green.
+      - name: Check the iOS module is on GitHub Packages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF_NAME#v}"
+          for a in myotis-engine-ios myotis-engine-ios-iosarm64 myotis-engine-ios-iossimulatorarm64; do
+            url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/eth/myotis/$a/$v/$a-$v.pom"
+            curl -fsS -o /dev/null -u "${GITHUB_ACTOR}:${GITHUB_TOKEN}" "$url" \
+              || { echo "::error::eth.myotis:$a:$v is not on GitHub Packages — re-run ALL jobs (the ios-engine job publishes it)"; exit 1; }
+          done
 
       # The staged repository, for the maven-repo job below — uploaded the
       # moment the version is irrevocably on GitHub Packages, so "the artifact
@@ -286,7 +446,9 @@ jobs:
           unpacked as a local Maven repository. The AAR alone is the Android artifact; its
           dependencies are in the zip and on GitHub Packages. A desktop consumer adds
           `eth.myotis:myotis-engine-natives-<platform>:__VERSION__` for its platform
-          (darwin-aarch64, darwin-x86-64, linux-x86-64, linux-aarch64): the engine's host library. Verify downloads against
+          (darwin-aarch64, darwin-x86-64, linux-x86-64, linux-aarch64): the engine's host library. A Kotlin
+          Multiplatform app with iOS targets adds `eth.myotis:myotis-engine-ios:__VERSION__` (iosArm64,
+          iosSimulatorArm64): the engine's C ABI as cinterop, the engine linked in. Verify downloads against
           `myotis-engine.SHA256SUMS`. See docs/android-library.md.
           SECTION
           sed -i "s/__VERSION__/$version/g; s#__REPO__#${GITHUB_REPOSITORY}#g" "$section"

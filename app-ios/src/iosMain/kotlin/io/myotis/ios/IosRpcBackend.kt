@@ -1,5 +1,6 @@
 package io.myotis.ios
 
+import io.myotis.engine.ios.RustEngine
 import io.myotis.jsonrpc.RpcAccessListResult
 import io.myotis.jsonrpc.RpcBackend
 import io.myotis.jsonrpc.RpcCallResult
