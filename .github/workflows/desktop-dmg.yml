@@ -396,6 +396,9 @@ jobs:
             .github/release-notes.md
             .github/release-notes.sh
           sparse-checkout-cone-mode: false
+          # gh takes the token from the publish step's env; keep the job's
+          # write token out of .git/config.
+          persist-credentials: false
       # Both matrix jobs' artifacts (Myotis-arm64.dmg, Myotis-x64.dmg) land under
       # dmg/ — they were already arch-tagged and verified in the build job.
       - name: Download dmg artifacts

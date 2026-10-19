@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# The notes of a `v*` tag's GitHub release, written by every workflow that
-# publishes to it (the list is in release-version-guard.yml's header). There is
-# no cross-workflow ordering, so whichever publisher runs first creates the
+# The notes of a `v*` tag's GitHub release, written through this script by
+# every workflow that publishes assets to it (the list is in
+# release-version-guard.yml's header) except ci.yml, whose jars go up with
+# softprops/action-gh-release and its generated "What's Changed". There is no
+# cross-workflow ordering, so whichever publisher runs first creates the
 # release and the others add to it:
 #
 #   release-notes.sh create <tag> [<section.md>]
@@ -94,6 +96,12 @@ case "$cmd" in
       gh release edit "$tag" --notes-file "$body"
       sleep "$settle"
     done
+    # The last edit may have stuck: one more read before calling it a failure.
+    gh release view "$tag" --json body --jq .body > "$body"
+    if grep -qF -- "$label" "$body"; then
+      echo "release-notes.sh: $label is in the notes of $tag after 6 edits"
+      exit 0
+    fi
     fail "$label kept disappearing from the notes of $tag (another writer editing in a loop?); re-run this job once the other publishers are done"
     ;;
   *) usage ;;
