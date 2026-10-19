@@ -217,7 +217,11 @@ public interface ChainHandle {
      * {@code unwatch} is the unsubscribe — each address it names leaves the
      * index before the union, with its coverage and its stored logs, while the
      * other entries keep theirs; an address the index does not watch is
-     * ignored, and one listed under both keys refuses the push. {@code true}
+     * ignored, and one listed under both keys refuses the push. On the Rust
+     * engine (ABI 48) an entry may name a 32-byte {@code "topic"} (with
+     * {@code "positions"}, 1–3) in place of {@code "address"}: every log from
+     * any emitter carrying that value there, and {@code unwatch} takes such
+     * values too (docs/eth-getlogs-design.md §6). {@code true}
      * means the push is done and its unwatch durable; {@code false} also
      * covers an unwatch whose checkpoint could not be written (repeat the
      * push).
