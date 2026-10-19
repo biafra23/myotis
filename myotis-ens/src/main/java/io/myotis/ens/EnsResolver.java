@@ -107,9 +107,10 @@ public final class EnsResolver {
     public static final String ENSV2_NAMES =
             "ENSv2 decides this name, which the Java engine does not resolve (the Rust engine does)";
 
-    /** The ownership refusal for a name ENSv2 decides (#671; Rust {@code ENSV2_OWNERSHIP}). */
+    /** The ownership refusal for a name ENSv2 decides (#671). The Rust engine reads such a name's
+     *  ownership from ENSv2's registries; this engine refuses it (owner decision, 2026-10-19). */
     public static final String ENSV2_OWNERSHIP =
-            "ENSv2 decides this name's ownership, and this engine does not read ENSv2 yet";
+            "ENSv2 decides this name's ownership, which the Java engine does not read (the Rust engine does)";
 
     private final EvmExecutor executor;
     private final Address registry;

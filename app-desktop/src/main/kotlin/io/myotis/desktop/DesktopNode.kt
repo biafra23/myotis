@@ -558,7 +558,7 @@ class DesktopNodeController(
         val r = withContext(Dispatchers.IO) { ens.resolveOwnership(name.trim()) }
         return EnsOwnership(
             r.name(), r.registrantHex(), r.managerHex(), r.wrapped(), r.resolverHex(),
-            r.expiresAt(), r.gracePeriodSeconds(), r.blockNumber(), r.verified(), r.error(),
+            r.expiresAt(), r.gracePeriodSeconds(), r.blockNumber(), r.verified(), r.error(), r.ensv2(),
         )
     }
 

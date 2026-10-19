@@ -86,6 +86,22 @@ class EnsProfileCardTest {
     }
 
     @Test
+    fun anOwnershipReadFromEnsv2NamesItsOwnerAndSaysWhereItCameFrom() {
+        // #671: one owner per label, no manager, no grace period.
+        val owner = "0x" + "51".repeat(20)
+        val ownership = EnsOwnership(
+            "myotis.eth", registrantHex = owner, managerHex = null, wrapped = false,
+            resolverHex = "0x" + "5e".repeat(20), expiresAt = 4_102_444_800L, gracePeriodSeconds = 0,
+            blockNumber = 11_947_300, verified = true, error = null, ensv2 = true,
+        )
+        readRecords(EnsController(profile = EnsProfile("myotis.eth", emptyList()), ownership = ownership), "myotis.eth")
+        awaitText("Owner: $owner")
+        rule.onNodeWithText("Read from ENSv2's registries.").assertExists()
+        rule.onAllNodes(hasText("Registrant", substring = true)).assertCountEquals(0)
+        rule.onAllNodes(hasText("Manager", substring = true)).assertCountEquals(0)
+    }
+
+    @Test
     fun aNameWithNothingOnChainSaysSo() {
         readRecords(EnsController(profile = null, ownership = EnsOwnership("x.eth", null, null, false, null, -1, -1, 1, true, null)), "x.eth")
         awaitText("Nothing on chain for this name.")

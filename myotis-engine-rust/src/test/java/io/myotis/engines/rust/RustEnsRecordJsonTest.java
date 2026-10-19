@@ -107,6 +107,24 @@ class RustEnsRecordJsonTest {
         // The mandatory boolean missing is shape drift, fail closed.
         assertThrows(EngineException.class,
                 () -> RustEnsApi.ownershipFromJson("x.eth", ok("\"managerHex\":\"" + ADDR40 + "\"")));
+        assertFalse(full.ensv2(), "a v1 answer carries no ensv2 key");
+        // ABI 50 (#671): an answer read from ENSv2's registries — the eljson golden's twin.
+        var v2 = RustEnsApi.ownershipFromJson("myotis.eth", ok(
+                "\"registrantHex\":\"" + ADDR40 + "\",\"wrapped\":false,"
+                + "\"resolverHex\":\"0x" + "5e".repeat(20) + "\",\"expiresAt\":1980874152,"
+                + "\"gracePeriodSeconds\":0,\"ensv2\":true"));
+        assertTrue(v2.ensv2());
+        assertEquals(ADDR40, v2.registrantHex());
+        assertNull(v2.managerHex());
+        assertEquals(0L, v2.gracePeriodSeconds());
+        assertThrows(EngineException.class,
+                () -> RustEnsApi.ownershipFromJson("x.eth", ok("\"wrapped\":false,\"ensv2\":\"yes\"")));
+        // A label ENSv2 never expires: neither expiry key — the eljson golden's twin.
+        var forever = RustEnsApi.ownershipFromJson("forever.eth", ok(
+                "\"registrantHex\":\"" + ADDR40 + "\",\"wrapped\":false,\"ensv2\":true"));
+        assertTrue(forever.ensv2());
+        assertEquals(-1L, forever.expiresAt());
+        assertEquals(-1L, forever.gracePeriodSeconds());
     }
 
     @Test
