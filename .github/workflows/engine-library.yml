@@ -130,7 +130,8 @@ jobs:
           name: engine-natives-${{ matrix.prefix }}-${{ github.sha }}
           path: build/engine-natives
           if-no-files-found: error
-          retention-days: 7
+          # The default 90 days, as for the staged repository: a tag's publish job
+          # re-run needs these too.
           overwrite: true
 
   # Stage + check, no upload: every push to main and every dispatch. Not on a
