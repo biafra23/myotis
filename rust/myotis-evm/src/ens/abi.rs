@@ -51,6 +51,14 @@ pub fn encode_resolve(dns_name: &[u8], inner_call: &[u8]) -> Vec<u8> {
     out
 }
 
+/// `selector ‖ head-tail(bytes)` — one dynamic `bytes` arg
+/// (`findResolver(bytes)` with a DNS-encoded name).
+pub fn encode_call_bytes(signature: &str, b: &[u8]) -> Vec<u8> {
+    let mut out = selector(signature).to_vec();
+    out.extend_from_slice(&encode_bytes_args(&[b]));
+    out
+}
+
 /// `selector ‖ bytes32 ‖ head-tail(string)` — one static node + one dynamic
 /// string arg (`text(bytes32,string)`). The string's offset is relative to the
 /// start of the args (after the selector), so with one static word ahead of it
@@ -322,6 +330,23 @@ mod tests {
         // the mainnet PublicResolver's dnsRecord(bytes32,bytes32,uint16) 0xa8fa5682.
         assert_eq!(selector("dnsRecord(bytes32,bytes,uint16)"), [0xee, 0x8d, 0xe1, 0xf7]);
         assert_eq!(selector("interfaceImplementer(bytes32,bytes4)"), [0x12, 0x4a, 0x31, 0x9c]);
+    }
+
+    #[test]
+    fn ensv2_selectors_and_the_find_resolver_call() {
+        // UniversalResolverV2 / ENSV1Resolver getters (#671), pinned against cast's ids.
+        assert_eq!(selector("findResolver(bytes)"), [0xa1, 0xcb, 0xcb, 0xaf]);
+        assert_eq!(selector("ROOT_REGISTRY()"), [0xc9, 0x2c, 0xc4, 0x9a]);
+        assert_eq!(selector("REGISTRY_V1()"), [0xe3, 0x70, 0xec, 0xbe]);
+        // `cast calldata 'findResolver(bytes)' <dns("myotis.eth")>`, byte for byte.
+        let dns = b"\x06myotis\x03eth\x00";
+        let enc = encode_call_bytes("findResolver(bytes)", dns);
+        let mut want = vec![0xa1, 0xcb, 0xcb, 0xaf];
+        want.extend_from_slice(&word(0x20));
+        want.extend_from_slice(&word(12));
+        want.extend_from_slice(dns);
+        want.extend(std::iter::repeat_n(0u8, 20));
+        assert_eq!(enc, want);
     }
 
     #[test]

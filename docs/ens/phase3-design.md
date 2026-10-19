@@ -61,6 +61,15 @@ forward = resolveAddress(name)
 if forward != address: return absent
 ```
 
+*As built since #671:* an address with no reverse resolver of its own is asked of
+the nearest resolver of `addr.reverse` or `reverse` instead, when that one
+implements ENSIP-10 (through `resolve(bytes,bytes)`). That is where a primary
+name set through ENSv2 on Sepolia lives, and on mainnet one the `reverse` node's
+wildcard resolver keeps (it answers, on chain, `0x51fd…9f0d` → `myotis.eth`). An
+address WITH its own reverse resolver is read as above, `name()` directly and
+without a `supportsInterface` probe: the old reverse resolvers predate ERC-165
+and halt on one (vitalik's, `0x5fBb…F358`).
+
 The verification round-trip defeats impersonation: anyone can claim any
 name in their reverse record without proof, so the resolver's word alone
 isn't trustworthy. Only when a forward resolution of the claimed name

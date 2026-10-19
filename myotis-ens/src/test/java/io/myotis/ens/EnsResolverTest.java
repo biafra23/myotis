@@ -42,8 +42,9 @@ class EnsResolverTest {
 
     private static final Address REGISTRY = Address.fromHex(
             "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e");
-    private static final Address UR = Address.fromHex(
-            "0xce01f8eee7E479C928F8919abD53E553a36CeF67");
+    /** ENS's Universal Resolver proxy — a different address from WILDCARD_RESOLVER, so a
+     *  call aimed at the wrong one cannot pass a test. */
+    private static final Address UR = EnsAddresses.UNIVERSAL_RESOLVER;
     private static final Address PUBLIC_RESOLVER = Address.fromHex(
             "0x231b0Ee14048e9dCcD1d247744d114a4EB5E8E63");
     private static final Address WILDCARD_RESOLVER = Address.fromHex(
@@ -84,8 +85,127 @@ class EnsResolverTest {
         return AbiEncoder.encodeRaw(AbiEncoder.uint256(v));
     }
 
+    /** Mainnet today: the Universal Resolver names no ENSv2 root, so v1 decides every name. */
     private static EnsResolver ownershipResolver(MockExecutor mock) {
+        mock.revertOn(UR, AbiEncoder.encodeCall(FunctionSignature.of("ROOT_REGISTRY()")), new byte[0]);
         return new EnsResolver(mock, REGISTRY, UR, BASE_REGISTRAR, NAME_WRAPPER);
+    }
+
+    // ---- ENSv2 (#671): whether v1 still decides a name's ownership ---------
+
+    private static final Address ROOT_V2 = Address.fromHex("0x" + "b4".repeat(20));
+    private static final Address V2_RESOLVER = Address.fromHex("0x" + "5e".repeat(20));
+    private static final Address MIRROR = EnsAddresses.SEPOLIA_ENSV1_MIRROR;
+    /** A name owner's own resolver that claims to be a v1 mirror. */
+    private static final Address SPOOF = Address.fromHex("0x" + "33".repeat(20));
+
+    /**
+     * An ENSv2 chain: the Universal Resolver names a root registry and finds {@code found}
+     * for {@code name}. MIRROR is the v1 mirror ({@code REGISTRY_V1()} = the v1 registry);
+     * V2_RESOLVER has no such getter.
+     */
+    private static EnsResolver ensv2Resolver(MockExecutor mock, String name, Address found) {
+        mock.respond(UR, AbiEncoder.encodeCall(FunctionSignature.of("ROOT_REGISTRY()")), encodeAddress(ROOT_V2));
+        mock.respond(UR, AbiEncoder.encodeCall(FunctionSignature.of("findResolver(bytes)"),
+                        AbiEncoder.bytes(DnsEncoder.encode(name))),
+                AbiEncoder.encodeRaw(AbiEncoder.address(found), AbiEncoder.bytes32(new byte[32]),
+                        AbiEncoder.uint256(0)));
+        byte[] registryV1 = AbiEncoder.encodeCall(FunctionSignature.of("REGISTRY_V1()"));
+        mock.respond(MIRROR, registryV1, encodeAddress(REGISTRY));
+        mock.respond(SPOOF, registryV1, encodeAddress(REGISTRY));
+        mock.revertOn(V2_RESOLVER, registryV1, new byte[0]);
+        return new EnsResolver(mock, REGISTRY, UR, BASE_REGISTRAR, NAME_WRAPPER, MIRROR);
+    }
+
+    private static void assertEnsv2Refusal(java.util.concurrent.CompletableFuture<?> f) {
+        var e = assertThrows(java.util.concurrent.ExecutionException.class, f::get);
+        assertTrue(e.getCause() instanceof UnsupportedOperationException, String.valueOf(e.getCause()));
+        assertEquals(EnsResolver.ENSV2_OWNERSHIP, e.getCause().getMessage());
+    }
+
+    @Test
+    void ownershipOfANameEnsv2DecidesIsRefusedBeforeAnyV1Read() {
+        // myotis.eth on Sepolia: registered in ENSv2 only; v1 would read it as unowned.
+        // No v1 call is programmed, so any v1 read would fail the test with an
+        // AssertionError instead of the refusal. The name reaches the UR lowercased.
+        var mock = new MockExecutor();
+        assertEnsv2Refusal(ensv2Resolver(mock, "myotis.eth", V2_RESOLVER)
+                .resolveOwnership("Myotis.eth", ctx()));
+    }
+
+    @Test
+    void aNameEnsv2HandsToItsV1MirrorKeepsItsV1Ownership() throws Exception {
+        // Not migrated (ens.eth on Sepolia): ENSv2 resolves it through the v1 mirror.
+        var mock = new MockExecutor();
+        mock.respond(REGISTRY, registryCall("owner(bytes32)", "ens.eth"), encodeAddress(USER));
+        mock.respond(REGISTRY, registryCall("resolver(bytes32)", "ens.eth"), encodeAddress(PUBLIC_RESOLVER));
+        mock.respond(BASE_REGISTRAR, registrarCall("ownerOf(uint256)", "ens"), encodeAddress(USER));
+        mock.respond(BASE_REGISTRAR, registrarCall("nameExpires(uint256)", "ens"), encodeUint(1_823_155_031L));
+        mock.respond(BASE_REGISTRAR, gracePeriodCall(), encodeUint(7_776_000L));
+        var o = ensv2Resolver(mock, "ens.eth", MIRROR).resolveOwnership("ens.eth", ctx()).get().orElseThrow();
+        assertEquals(USER, o.registrant());
+        assertEquals(PUBLIC_RESOLVER, o.resolver());
+        assertEquals(1_823_155_031L, o.expiresAt());
+    }
+
+    @Test
+    void anOwnershipCheckThatCannotRunFailsInsteadOfReadingV1() {
+        // ENSv2 check (#671): state the Universal Resolver needs but cannot get is not
+        // "no ENSv2 root" — answering from v1 then would put back the unowned reading.
+        var mock = new MockExecutor();
+        mock.failOn(UR, AbiEncoder.encodeCall(FunctionSignature.of("ROOT_REGISTRY()")),
+                new IllegalStateException("state unavailable"));
+        var e = assertThrows(java.util.concurrent.ExecutionException.class,
+                () -> new EnsResolver(mock, REGISTRY, UR, BASE_REGISTRAR, NAME_WRAPPER)
+                        .resolveOwnership("myotis.eth", ctx()).get());
+        assertTrue(e.getCause() instanceof IllegalStateException, String.valueOf(e.getCause()));
+    }
+
+    @Test
+    void theEnsv2PinsMatchTheRustEngine() {
+        // Byte-for-byte rust/myotis-evm's UNIVERSAL_RESOLVER and ensv1_mirror(11155111).
+        // A typo in the Universal Resolver fails OPEN (a codeless account reads as "no
+        // ENSv2 root"), so both engines pin the same lowercase hex (#672 review).
+        assertEquals("0xeeeeeeee14d718c2b47d9923deab1335e144eeee",
+                EnsAddresses.UNIVERSAL_RESOLVER.toHex().toLowerCase(java.util.Locale.ROOT));
+        assertEquals("0x322b7581ca210a69c6d0e0d7c88a7688d2789cb0",
+                EnsAddresses.SEPOLIA_ENSV1_MIRROR.toHex().toLowerCase(java.util.Locale.ROOT));
+    }
+
+    @Test
+    void aResolverThatOnlyClaimsToBeTheMirrorDoesNotHandTheNameToV1() {
+        // #672 review: the name's ENSv2 owner sets its resolver and can make it answer
+        // REGISTRY_V1() with the v1 registry. Only the pinned mirror counts.
+        var mock = new MockExecutor();
+        assertEnsv2Refusal(ensv2Resolver(mock, "myotis.eth", SPOOF).resolveOwnership("myotis.eth", ctx()));
+    }
+
+    @Test
+    void whereEnsv2IsLiveButNoMirrorIsPinnedNoNameIsV1s() {
+        // Mainnet right after activation: even the genuine mirror is not taken as v1's word.
+        var mock = new MockExecutor();
+        ensv2Resolver(mock, "ens.eth", MIRROR);
+        var unpinned = new EnsResolver(mock, REGISTRY, UR, BASE_REGISTRAR, NAME_WRAPPER);
+        assertEnsv2Refusal(unpinned.resolveOwnership("ens.eth", ctx()));
+    }
+
+    @Test
+    void aMirrorOfAnotherRegistryDoesNotHandTheNameToV1() {
+        // REGISTRY_V1() must name THIS registry: a resolver mirroring some other registry
+        // is no evidence that this one decides the name (Rust twin of the same name).
+        var mock = new MockExecutor();
+        var resolver = ensv2Resolver(mock, "ens.eth", MIRROR);
+        mock.respond(MIRROR, AbiEncoder.encodeCall(FunctionSignature.of("REGISTRY_V1()")),
+                encodeAddress(Address.fromHex("0x" + "77".repeat(20))));
+        assertEnsv2Refusal(resolver.resolveOwnership("ens.eth", ctx()));
+    }
+
+    @Test
+    void aStaleV1EntryEnsv2KnowsNoResolverForIsRefused() {
+        // alice.eth on Sepolia: expired, still holding a v1 resolver, unknown to ENSv2.
+        var mock = new MockExecutor();
+        assertEnsv2Refusal(ensv2Resolver(mock, "alice.eth", Address.ZERO)
+                .resolveOwnership("alice.eth", ctx()));
     }
 
     @Test
@@ -137,7 +257,8 @@ class EnsResolverTest {
         assertEquals(USER, expired.manager());
         assertNull(expired.resolver());
         assertEquals(1_700_000_000L, expired.expiresAt());
-        // A subname: registry only, no registrar calls at all.
+        // A subname: the Universal Resolver (no ENSv2 root) and the registry only, no
+        // registrar calls at all.
         var sub = new MockExecutor();
         sub.respond(REGISTRY, registryCall("owner(bytes32)", "sub.myotis.eth"), encodeAddress(USER));
         sub.respond(REGISTRY, registryCall("resolver(bytes32)", "sub.myotis.eth"), encodeAddress(PUBLIC_RESOLVER));
@@ -145,7 +266,7 @@ class EnsResolverTest {
         assertEquals(USER, s.manager());
         assertNull(s.registrant());
         assertEquals(-1L, s.expiresAt());
-        assertEquals(2, sub.callCount());
+        assertEquals(3, sub.callCount());
     }
 
     @Test
@@ -539,7 +660,7 @@ class EnsResolverTest {
                 () -> EnsResolver.forChainId(new MockExecutor(), 999_999L));
     }
 
-    // ---- Reverse resolution (step-by-step path) ---------------------------
+    // ---- Reverse resolution (step-by-step path, ENSIP-10 above it) ----------
 
     @Test
     void resolveNameVerifiesForwardRoundTrip() throws Exception {
@@ -549,7 +670,9 @@ class EnsResolverTest {
         // Reverse path: Registry.resolver(reverseNode) → PUBLIC_RESOLVER
         mock.respond(REGISTRY, callRegistryResolver(reverseName),
                 encodeAddress(PUBLIC_RESOLVER));
-        // Resolver.name(reverseNode) → "vitalik.eth"
+        // Resolver.name(reverseNode) → "vitalik.eth", asked directly: no supportsInterface
+        // probe is programmed for the reverse lookup, so probing would fail the test (the
+        // old reverse resolvers halt on it — vitalik's 0x5fBb…F358 on mainnet).
         mock.respond(PUBLIC_RESOLVER, callResolverName(reverseName),
                 encodeString("vitalik.eth"));
         // Forward verification of vitalik.eth — now via the direct path.
@@ -584,14 +707,88 @@ class EnsResolverTest {
     void resolveNameMissingReverseRecordReturnsEmpty() throws Exception {
         var mock = new MockExecutor();
         String reverseName = ReverseLookup.nameFor(VITALIK);
-        mock.respond(REGISTRY, callRegistryResolver(reverseName),
-                encodeAddress(Address.ZERO));
+        mock.respond(REGISTRY, callRegistryResolver(reverseName), encodeAddress(Address.ZERO));
+        mock.respond(REGISTRY, callRegistryResolver("addr.reverse"), encodeAddress(Address.ZERO));
+        mock.respond(REGISTRY, callRegistryResolver("reverse"), encodeAddress(Address.ZERO));
 
         var resolver = new EnsResolver(mock, REGISTRY, UR);
         Optional<String> result = resolver.resolveName(VITALIK, ctx()).get();
         assertTrue(result.isEmpty());
-        assertEquals(1, mock.callCount(),
-                "absence of reverse resolver short-circuits before any other call");
+        assertEquals(3, mock.callCount(),
+                "no resolver up the reverse tree ends after the three registry reads");
+    }
+
+    @Test
+    void resolveNameWalksUpToAWildcardResolverOnTheReverseNode() throws Exception {
+        // A primary name set through ENSv2 on Sepolia (#671): no resolver at
+        // <hex>.addr.reverse or addr.reverse; the `reverse` node's ENSIP-10 resolver
+        // answers name() through resolve(bytes,bytes).
+        var mock = new MockExecutor();
+        String reverseName = ReverseLookup.nameFor(VITALIK);
+        mock.respond(REGISTRY, callRegistryResolver(reverseName), encodeAddress(Address.ZERO));
+        mock.respond(REGISTRY, callRegistryResolver("addr.reverse"), encodeAddress(Address.ZERO));
+        mock.respond(REGISTRY, callRegistryResolver("reverse"), encodeAddress(WILDCARD_RESOLVER));
+        mock.respond(WILDCARD_RESOLVER, callSupportsExtended(), encodeBool(true));
+        mock.respond(WILDCARD_RESOLVER, resolveCalldata(reverseName, callResolverName(reverseName)),
+                encodeBytes(encodeString("myotis.eth")));
+        programLegacy(mock, "myotis.eth", innerAddr("myotis.eth"), encodeAddress(VITALIK));
+
+        var resolver = new EnsResolver(mock, REGISTRY, UR);
+        assertEquals(Optional.of("myotis.eth"), resolver.resolveName(VITALIK, ctx()).get());
+    }
+
+    @Test
+    void anOffchainAncestorReverseResolverSurfacesItsLookup() {
+        // The walk-up asks through resolve(), so an OffchainLookup from it must reach the
+        // CCIP wrapper like any ENSIP-10 one, never read as "no primary name".
+        var mock = new MockExecutor();
+        String reverseName = ReverseLookup.nameFor(VITALIK);
+        mock.respond(REGISTRY, callRegistryResolver(reverseName), encodeAddress(Address.ZERO));
+        mock.respond(REGISTRY, callRegistryResolver("addr.reverse"), encodeAddress(Address.ZERO));
+        mock.respond(REGISTRY, callRegistryResolver("reverse"), encodeAddress(WILDCARD_RESOLVER));
+        mock.respond(WILDCARD_RESOLVER, callSupportsExtended(), encodeBool(true));
+        mock.revertOn(WILDCARD_RESOLVER, resolveCalldata(reverseName, callResolverName(reverseName)),
+                offchainLookupPayload());
+
+        var e = assertThrows(java.util.concurrent.ExecutionException.class,
+                () -> new EnsResolver(mock, REGISTRY, UR).resolveName(VITALIK, ctx()).get());
+        var eee = org.junit.jupiter.api.Assertions.assertInstanceOf(EvmExecutionException.class, e.getCause());
+        assertTrue(io.myotis.evm.ccipread.OffchainLookupRevert.tryParse(
+                ((EvmExecutionError.Reverted) eee.error()).data()).isPresent());
+    }
+
+    @Test
+    void resolverDiscoveryIsCachedPerChain() throws Exception {
+        // Mainnet and Sepolia share the registry address, and one process can serve both:
+        // a resolver found on one chain must not be reused on the other.
+        String name = "shared.eth";
+        Address sepoliaResolver = Address.fromHex("0x" + "66".repeat(20));
+        var mainnet = new MockExecutor();
+        programLegacy(mainnet, name, innerAddr(name), encodeAddress(VITALIK));
+        assertEquals(Optional.of(VITALIK),
+                new EnsResolver(mainnet, REGISTRY, UR).resolveAddress(name, ctx()).get());
+
+        var sepolia = new MockExecutor();
+        sepolia.respond(REGISTRY, callRegistryResolver(name), encodeAddress(sepoliaResolver));
+        sepolia.respond(sepoliaResolver, callSupportsExtended(), encodeBool(false));
+        sepolia.respond(sepoliaResolver, innerAddr(name), encodeAddress(USER));
+        assertEquals(Optional.of(USER),
+                new EnsResolver(sepolia, REGISTRY, UR).resolveAddress(name, ctx(11_155_111L)).get());
+    }
+
+    @Test
+    void resolveNameDoesNotAskAnAncestorsLegacyResolver() throws Exception {
+        // A resolver on `reverse` without ENSIP-10 cannot answer for a subname; its
+        // name() is not programmed, so asking it would fail the test.
+        var mock = new MockExecutor();
+        String reverseName = ReverseLookup.nameFor(VITALIK);
+        mock.respond(REGISTRY, callRegistryResolver(reverseName), encodeAddress(Address.ZERO));
+        mock.respond(REGISTRY, callRegistryResolver("addr.reverse"), encodeAddress(Address.ZERO));
+        mock.respond(REGISTRY, callRegistryResolver("reverse"), encodeAddress(PUBLIC_RESOLVER));
+        mock.respond(PUBLIC_RESOLVER, callSupportsExtended(), encodeBool(false));
+
+        var resolver = new EnsResolver(mock, REGISTRY, UR);
+        assertTrue(resolver.resolveName(VITALIK, ctx()).get().isEmpty());
     }
 
     @Test
@@ -868,6 +1065,10 @@ class EnsResolverTest {
     }
 
     private static BlockContext ctx() {
+        return ctx(1L);
+    }
+
+    private static BlockContext ctx(long chainId) {
         return new BlockContext(
                 new byte[32],
                 19_500_000L,
@@ -875,7 +1076,7 @@ class EnsResolverTest {
                 BigInteger.valueOf(1_000_000_000L),
                 Address.ZERO,
                 new byte[32],
-                BigInteger.ONE,
+                BigInteger.valueOf(chainId),
                 30_000_000L);
     }
 

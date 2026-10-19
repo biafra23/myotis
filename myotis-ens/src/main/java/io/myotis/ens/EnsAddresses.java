@@ -16,15 +16,24 @@ import io.myotis.evm.Address;
  * resolver is looked up dynamically from the Registry (the ENSIP-10 walk:
  * the exact node, then each parent).
  *
- * <p>The Universal Resolver pins are no longer read by anything:
- * {@link EnsResolver} resolves forward by walking the Registry itself and
- * calling the resolver it finds directly, so no UR (and no shared CCIP
- * batch gateway) sits in the path. They are kept because the constructors
- * still take a UR address.
+ * <p>The Universal Resolver resolves nothing here: {@link EnsResolver} resolves
+ * by walking the Registry itself and calling the resolver it finds directly, so
+ * no UR (and no shared CCIP batch gateway) sits in a record's path. It is read
+ * for one question: whether ENSv2 decides a name, so that ownership is not
+ * answered from a v1 registry that no longer speaks for it (#671). Mainnet and
+ * Sepolia share ENS's upgradeable proxy {@link #UNIVERSAL_RESOLVER}.
  */
 public final class EnsAddresses {
 
     private EnsAddresses() {}
+
+    /**
+     * ENS's Universal Resolver proxy, one address on mainnet and Sepolia; its
+     * {@code ROOT_REGISTRY()} answers where ENSv2 is live (Sepolia since the ENSv2
+     * beta) and reverts where it is not (mainnet until activation).
+     */
+    public static final Address UNIVERSAL_RESOLVER =
+            Address.fromHex("0xeEeEEEeE14D718C2B47D9923Deab1335E144EeEe");
 
     // ---- Mainnet (chainId 1) ---------------------------------------------
 
@@ -36,15 +45,8 @@ public final class EnsAddresses {
     public static final Address MAINNET_REGISTRY =
             Address.fromHex("0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e");
 
-    /**
-     * Mainnet ENS Universal Resolver. Not read: wildcard names (Coinbase,
-     * Uniswap, Base subnames), whose resolvers implement only
-     * {@code resolve(bytes name, bytes data)}, are served by
-     * {@link EnsResolver}'s own ENSIP-10 walk, which calls that method on
-     * the resolver directly.
-     */
-    public static final Address MAINNET_UNIVERSAL_RESOLVER =
-            Address.fromHex("0xce01f8eee7E479C928F8919abD53E553a36CeF67");
+    /** Mainnet Universal Resolver: ENS's proxy ({@link #UNIVERSAL_RESOLVER}). */
+    public static final Address MAINNET_UNIVERSAL_RESOLVER = UNIVERSAL_RESOLVER;
 
     /** The {@code .eth} BaseRegistrar (ERC-721 of the second-level names) — the same
      *  address on mainnet and Sepolia (verified against both chains' {@code ens()}). */
@@ -65,9 +67,18 @@ public final class EnsAddresses {
     public static final Address SEPOLIA_REGISTRY =
             Address.fromHex("0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e");
 
-    /** Sepolia Universal Resolver. Not read (see the class doc). */
-    public static final Address SEPOLIA_UNIVERSAL_RESOLVER =
-            Address.fromHex("0x3c85752a5d47DD09D677C645Ff2A938B38fbFEbA");
+    /** Sepolia Universal Resolver: ENS's proxy ({@link #UNIVERSAL_RESOLVER}). */
+    public static final Address SEPOLIA_UNIVERSAL_RESOLVER = UNIVERSAL_RESOLVER;
+
+    /**
+     * Sepolia's ENSv2 v1 mirror ({@code ENSV1Resolver}): the resolver ENSv2 sets for a name
+     * not migrated yet. Pinned, not recognised by its {@code REGISTRY_V1()} getter alone: a
+     * name's ENSv2 owner sets its resolver and could deploy one that answers that getter
+     * too (#672 review). From ENS's deployments page, and the resolver ENSv2 names for every
+     * unmigrated name probed (2026-10-19). Mainnet has none pinned until ENSv2 activates.
+     */
+    public static final Address SEPOLIA_ENSV1_MIRROR =
+            Address.fromHex("0x322B7581cA210a69c6D0e0D7c88a7688D2789Cb0");
 
     public static final Address SEPOLIA_NAME_WRAPPER =
             Address.fromHex("0x0635513f179D50A207757E05759CbD106d7dFcE8");

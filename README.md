@@ -689,6 +689,8 @@ Reads the contenthash (ENSIP-7) — a multicodec-encoded pointer to IPFS, Swarm,
 
 Who holds the name and until when: the registry's owner (the **manager**, who sets records and subnames) and resolver, and for a `.eth` second-level name the BaseRegistrar's token owner (the **registrant**), `nameExpires` and `GRACE_PERIOD` — each seen through the chain's NameWrapper where it is the holder (`wrapped`). No resolver is involved; the reads are plain registry and registrar calls, verified like every other ENS read.
 
+Where ENSv2 is live (Sepolia today; #671), the read is answered from the v1 registry only for a name ENSv2 still hands to v1 (one not migrated yet). Every other name is refused with an error, whether ENSv2 registered it or not, since the v1 registry would show an ENSv2 name as unowned and a superseded v1 entry as owned. DNS names count among them. Mainnet is unaffected until ENSv2 activates there.
+
 **Response fields:** `name`, `blockNumber`, `verified`, `wrapped`, then where present: `registrant`, `manager`, `resolver`, `expiresAt` (unix seconds) with `gracePeriodSeconds`. A subname has no registrar part; an expired name has an `expiresAt` in the past and no `registrant` (the registrar's `ownerOf` reverts from the expiry on, grace period included — only the former registrant may renew inside it). Whether a `.eth` name is taken is therefore a question of time: `expiresAt + gracePeriodSeconds` against the clock, since the registry keeps the old owner and the registrar the old expiry long after the name became free.
 
 ### Resolve ENS multi-coin address
