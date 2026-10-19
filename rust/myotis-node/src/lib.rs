@@ -885,11 +885,13 @@ pub fn get_logs_json<'env>(env: &'env Env, handle: i64, filter_json: String) -> 
 // behind it, and `stop`/`pause` — synchronous on the JS thread — wait for it.
 
 /// Install the watch-list config (docs/eth-getlogs-design.md; the JSON the
-/// other hosts push). `watch` is additive; an address leaves the index only by
+/// other hosts push). `watch` is additive; an entry leaves the index only by
 /// being named under `unwatch` (ABI ≥ 37), which drops its entry, its coverage
-/// and its stored logs. Resolves `{"ok":true}` when installed, `{"ok":false}`
-/// when refused — invalid JSON, a watch entry without `address` or a numeric
-/// `fromBlock`, an address listed twice or under both `watch` and `unwatch`,
+/// and its stored logs. Since ABI 48 an entry may name a 32-byte `topic`
+/// (with `positions`) instead of an `address`. Resolves `{"ok":true}` when
+/// installed, `{"ok":false}` when refused — invalid JSON, a watch entry
+/// without exactly one of `address` and `topic` or a numeric `fromBlock`, an
+/// address or topic listed twice or under both `watch` and `unwatch`,
 /// a handle without a running EL reader, or an unwatch whose checkpoint could
 /// not be written (the entries are dropped in memory only; send it again);
 /// the engine logs the refusals (drainLogs).

@@ -60,6 +60,30 @@ class LogIndexStatusTest {
     }
 
     @Test
+    fun a_topic_entry_is_parsed_in_order_and_is_not_listable() {
+        // host.rs build_log_index_status, engine ABI 48 (#673): a topic entry
+        // opens with its value and positions where an address entry has its
+        // address; everything after `fromBlock` is the shared shape.
+        val value = "0x000000000000000000000000" + "ab".repeat(20)
+        val json = "{\"enabled\":true,\"logCount\":3,\"entries\":[" +
+            "{\"address\":\"0x4e69fd587118dfb64957d18654e3894118e9b1bf\",\"fromBlock\":5}," +
+            "{\"topic\":\"$value\",\"positions\":[1,2],\"fromBlock\":9,\"name\":\"me\"," +
+            "\"coveredLow\":9,\"coveredHigh\":20,\"restricted\":true}]}"
+        val entries = LogIndexStatus.parse(json).entries
+        assertEquals(2, entries.size)
+        assertFalse(entries[0].topic)
+        assertTrue(entries[0].listable)
+        val t = entries[1]
+        assertTrue(t.topic)
+        assertEquals(value, t.address)
+        assertEquals(listOf(1, 2), t.positions)
+        assertEquals("me", t.name)
+        assertEquals(20L, t.coveredHigh)
+        assertTrue(t.restricted)
+        assertFalse(t.listable)
+    }
+
+    @Test
     fun an_error_object_is_not_a_status() {
         // A paused handle answers the ungated probe with one; reading it as "an
         // index with no entries" is what must not happen.
