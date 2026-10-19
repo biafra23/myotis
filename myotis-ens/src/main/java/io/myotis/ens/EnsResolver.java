@@ -98,6 +98,15 @@ public final class EnsResolver {
     private static final FunctionSignature REGISTRY_V1 =
             FunctionSignature.of("REGISTRY_V1()");
 
+    /**
+     * The refusal for a record or reverse read of a name ENSv2 decides (#671). The Rust
+     * engine reads such a name from the resolver ENSv2's Universal Resolver names; this
+     * engine reads v1 only (owner decision, 2026-10-19), and v1's answer for the name
+     * would be the ENSV2Resolver bridge's or a stale entry's.
+     */
+    public static final String ENSV2_NAMES =
+            "ENSv2 decides this name, which the Java engine does not resolve (the Rust engine does)";
+
     /** The ownership refusal for a name ENSv2 decides (#671; Rust {@code ENSV2_OWNERSHIP}). */
     public static final String ENSV2_OWNERSHIP =
             "ENSv2 decides this name's ownership, and this engine does not read ENSv2 yet";
@@ -445,7 +454,8 @@ public final class EnsResolver {
         }
         String reverseName = ReverseLookup.nameFor(address);
         byte[] reverseNode = Namehash.of(reverseName);
-        return getReverseResolver(reverseNode, blockContext)
+        return v1Only(DnsEncoder.encode(reverseName), blockContext, ENSV2_NAMES)
+                .thenCompose(v -> getReverseResolver(reverseNode, blockContext))
                 .thenCompose(resolver -> resolver.isPresent()
                         ? getName(resolver.get(), reverseNode, blockContext)
                         : ancestorReverseName(reverseName, reverseNode, blockContext))
@@ -517,13 +527,21 @@ public final class EnsResolver {
             return com.jaeckel.ethp2p.core.concurrent.Futures.failedFuture(
                     new IllegalStateException("the ." + registrarTld + " registrar is not pinned for this chain"));
         }
-        CompletableFuture<Boolean> v1 = universalResolver == null
-                ? CompletableFuture.completedFuture(true)
-                : v1Decides(DnsEncoder.encode(name), ctx);
-        return v1.thenCompose(decides -> decides
-                ? readOwnership(labels, node, ctx)
-                : com.jaeckel.ethp2p.core.concurrent.Futures.<Optional<Ownership>>failedFuture(
-                        new UnsupportedOperationException(ENSV2_OWNERSHIP)));
+        return v1Only(DnsEncoder.encode(name), ctx, ENSV2_OWNERSHIP)
+                .thenCompose(v -> readOwnership(labels, node, ctx));
+    }
+
+    /**
+     * Completes when v1 decides the name {@code dnsName} encodes ({@link #v1Decides});
+     * fails with {@code refusal} when ENSv2 does. A tree without ENSv2 (no Universal
+     * Resolver: Genome) is always v1's.
+     */
+    private CompletableFuture<Void> v1Only(byte[] dnsName, BlockContext ctx, String refusal) {
+        if (universalResolver == null) return CompletableFuture.completedFuture(null);
+        return v1Decides(dnsName, ctx).thenCompose(decides -> decides
+                ? CompletableFuture.<Void>completedFuture(null)
+                : com.jaeckel.ethp2p.core.concurrent.Futures.<Void>failedFuture(
+                        new UnsupportedOperationException(refusal)));
     }
 
     /**
@@ -666,7 +684,8 @@ public final class EnsResolver {
             String name, byte[] innerCall, BlockContext blockContext,
             Function<byte[], Optional<T>> innerResultDecoder) {
         byte[] dnsName = DnsEncoder.encode(name);
-        return findResolver(name, blockContext).thenCompose(found -> {
+        return v1Only(dnsName, blockContext, ENSV2_NAMES)
+                .thenCompose(v -> findResolver(name, blockContext)).thenCompose(found -> {
             if (found.isEmpty()) {
                 // No resolver set anywhere up the chain → unregistered / no record.
                 return CompletableFuture.completedFuture(Optional.<T>empty());

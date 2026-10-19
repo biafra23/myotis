@@ -132,6 +132,12 @@ Phase 4 executor handles.
 A new `DnsEncoder` helper produces the DNS wire format
 (length-prefixed labels + null terminator). Reusable; small (~30 lines).
 
+*As built, and since ENSv2 (#671):* records still do not go through
+`ur.resolve` — its CCIP path batches through ENS's gateway. Where ENSv2 is
+live, the Rust engine asks the UR one narrower question, `findResolver(name)`,
+and calls the resolver it names directly, so an off-chain name keeps asking
+its own gateway (`rust/myotis-evm/src/ens/mod.rs`, `authority`).
+
 ### What this branch will ship
 
 This is a multi-commit phase:

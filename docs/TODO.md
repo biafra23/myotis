@@ -313,3 +313,16 @@ complete on its own.
   the peer succeeds again; or no QUIC listener in the wallet (then a QUIC
   connection exists only after TCP failed, which is the one case it is for);
   or leave it until Nimbus holds QUIC connections and the order flips anyway.
+
+## From #671 — ENSv2
+
+- [ ] **Java engine: names ENSv2 decides are refused, not resolved** (owner
+  decision, 2026-10-19: the Rust engine gets the ENSv2 path, the Java engine
+  the interim fixes and refusals). Where ENS's Universal Resolver names an
+  ENSv2 root (Sepolia today) and does not hand a name to its v1 mirror, the
+  Java engine's record, reverse and ownership reads fail with
+  `EnsResolver.ENSV2_NAMES` / `ENSV2_OWNERSHIP`; the Rust engine reads records
+  and reverse claims from the resolver `findResolver` names. Parity would mean
+  the same `findResolver` step in `EnsResolver.dispatchResolve` and
+  `resolveName` — revisit if the Java engine ever serves a network with ENSv2
+  for real users (the `auto` selection runs the Rust engine wherever it can).
