@@ -152,7 +152,8 @@ jobs:
   # rest of the set is checked and published by the publish job, which also
   # checks this module's staged files before anything of its own goes up; a
   # failure there leaves this module's version on GitHub Packages, to delete
-  # with the others before a re-run (the publish job's note).
+  # with the others before a re-run — with "Re-run all jobs", so this job
+  # publishes it again (the publish job's note; that job checks it is there).
   ios-engine:
     name: Engine iOS module (myotis-engine-ios)
     needs: version-guard
@@ -218,12 +219,24 @@ jobs:
           ls -d build/maven-repo/eth/myotis/myotis-engine-ios* \
             || { echo "::error::nothing was staged: :myotis-engine-ios was disabled"; exit 1; }
           find build/maven-repo -type f -name '*.klib' -exec ls -l {} +
-          # The engine inside each target's cinterop klib (the full check runs on
-          # Linux; this one guards the tag's publish below).
-          for k in build/maven-repo/eth/myotis/myotis-engine-ios-*/*/*-cinterop-*.klib; do
-            listing=$(unzip -Z1 "$k")
-            grep -q '/included/libmyotis_engine\.a$' <<<"$listing" \
-              || { echo "::error::$k does not include libmyotis_engine.a"; exit 1; }
+          # The engine inside each target's cinterop klib, under the maven-repo
+          # branch's file limit: check_engine_library.sh's iOS checks, run here too
+          # because the tag's publish below comes before the Linux check (the full
+          # check there adds what needs the whole set: one version, the closure).
+          shopt -s nullglob
+          klibs=(build/maven-repo/eth/myotis/myotis-engine-ios-*/*/*-cinterop-*.klib)
+          shopt -u nullglob
+          [ "${#klibs[@]}" -eq 2 ] \
+            || { echo "::error::expected 2 cinterop klibs (one per iOS target), found ${#klibs[@]}"; exit 1; }
+          for k in "${klibs[@]}"; do
+            size=$(wc -c < "$k" | tr -d ' ')
+            [ "$size" -lt 95000000 ] \
+              || { echo "::error::$k is $size bytes, near GitHub's 100 MB file limit"; exit 1; }
+            archive=$(unzip -Z1 "$k" | { grep '/included/libmyotis_engine\.a$' || true; })
+            [ -n "$archive" ] || { echo "::error::$k does not include libmyotis_engine.a"; exit 1; }
+            unzip -p "$k" "$archive" > "$RUNNER_TEMP/engine.a"
+            LC_ALL=C grep -q '_myotis_init' "$RUNNER_TEMP/engine.a" \
+              || { echo "::error::$k: $archive does not define myotis_init"; exit 1; }
           done
 
       # Same build, no rebuild: the tasks above are up to date, so Gradle uploads
@@ -305,7 +318,11 @@ jobs:
   # Re-running a tag's publish: GitHub Packages refuses to overwrite a version
   # (the Gradle publish fails with 409/422), so a republish needs that package
   # version deleted first — every eth.myotis.* package of it — in the
-  # repository's Packages page. The release assets re-upload with --clobber.
+  # repository's Packages page. Then "Re-run all jobs", not "Re-run failed
+  # jobs": eth.myotis:myotis-engine-ios is published by the ios-engine job,
+  # which a failed-jobs re-run leaves out (the step after the Gradle publish
+  # fails the run if the module is missing). The release assets re-upload
+  # with --clobber.
   publish:
     name: Publish to GitHub Packages and the release
     needs: [version-guard, host-natives, ios-engine]
@@ -357,6 +374,21 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./gradlew "-PpublishRelease=${GITHUB_REF_NAME#v}" -PengineNativesDir=build/engine-natives publishAllPublicationsToGitHubPackagesRepository --stacktrace
+
+      # The iOS module went up from the ios-engine job (Gradle here has it
+      # disabled): make sure it is there, or a re-run of this job alone after a
+      # deleted version would publish everything but it, all green.
+      - name: Check the iOS module is on GitHub Packages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF_NAME#v}"
+          for a in myotis-engine-ios myotis-engine-ios-iosarm64 myotis-engine-ios-iossimulatorarm64; do
+            url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/eth/myotis/$a/$v/$a-$v.pom"
+            curl -fsS -o /dev/null -u "${GITHUB_ACTOR}:${GITHUB_TOKEN}" "$url" \
+              || { echo "::error::eth.myotis:$a:$v is not on GitHub Packages — re-run ALL jobs (the ios-engine job publishes it)"; exit 1; }
+          done
 
       # The staged repository, for the maven-repo job below — uploaded the
       # moment the version is irrevocably on GitHub Packages, so "the artifact
