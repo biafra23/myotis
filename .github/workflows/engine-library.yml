@@ -144,12 +144,26 @@ jobs:
   # -PpublishRelease the Linux staging uses, and the jobs below merge it into the
   # set they stage, check and publish; on Linux the module disables itself and
   # stages nothing (myotis-engine-ios/build.gradle.kts).
+  #
+  # On a tag this job is also the module's GitHub Packages publish, from the same
+  # Gradle invocation that stages it (so the staged bytes are the published ones,
+  # and Gradle merges the remote maven-metadata.xml as for every other module):
+  # Gradle on Linux has the module disabled. Hence the version guard first. The
+  # rest of the set is checked and published by the publish job, which also
+  # checks this module's staged files before anything of its own goes up; a
+  # failure there leaves this module's version on GitHub Packages, to delete
+  # with the others before a re-run (the publish job's note).
   ios-engine:
     name: Engine iOS module (myotis-engine-ios)
+    needs: version-guard
+    # version-guard runs on tags only: skipped elsewhere, which must not skip this.
+    if: ${{ !cancelled() && (needs.version-guard.result == 'success' || needs.version-guard.result == 'skipped') }}
     runs-on: macos-15
     timeout-minutes: 60
     permissions:
       contents: read
+      # The tag's GitHub Packages publish (see above).
+      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -194,6 +208,7 @@ jobs:
             sleep 25
           done
           [ "$staged" = 1 ] || { echo "::error::staging myotis-engine-ios failed after 3 attempts"; exit 1; }
+          echo "STAGE_FLAG=$flag" >> "$GITHUB_ENV"
           # A disabled module (no iOS rustup targets after all) stages nothing and
           # exits 0; the publication check would catch it on Linux, this says why.
           for triple in aarch64-apple-ios aarch64-apple-ios-sim; do
@@ -203,6 +218,21 @@ jobs:
           ls -d build/maven-repo/eth/myotis/myotis-engine-ios* \
             || { echo "::error::nothing was staged: :myotis-engine-ios was disabled"; exit 1; }
           find build/maven-repo -type f -name '*.klib' -exec ls -l {} +
+          # The engine inside each target's cinterop klib (the full check runs on
+          # Linux; this one guards the tag's publish below).
+          for k in build/maven-repo/eth/myotis/myotis-engine-ios-*/*/*-cinterop-*.klib; do
+            listing=$(unzip -Z1 "$k")
+            grep -q '/included/libmyotis_engine\.a$' <<<"$listing" \
+              || { echo "::error::$k does not include libmyotis_engine.a"; exit 1; }
+          done
+
+      # Same build, no rebuild: the tasks above are up to date, so Gradle uploads
+      # the staged outputs (as the publish job does for the rest of the set).
+      - name: Publish the iOS module to GitHub Packages
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./gradlew "$STAGE_FLAG" :myotis-engine-ios:publishAllPublicationsToGitHubPackagesRepository --stacktrace
 
       - name: Upload the staged iOS module
         uses: actions/upload-artifact@v4
@@ -327,27 +357,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./gradlew "-PpublishRelease=${GITHUB_REF_NAME#v}" -PengineNativesDir=build/engine-natives publishAllPublicationsToGitHubPackagesRepository --stacktrace
-
-      # The iOS module was staged on macOS (the ios-engine job), and Gradle here
-      # has it disabled, so its files go up as they were staged and checked: one
-      # HTTP PUT per file, the way Gradle's own Maven publish uploads them —
-      # each version directory's files first, then the artifact-level metadata.
-      - name: Publish the iOS module to GitHub Packages
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          base="https://maven.pkg.github.com/${GITHUB_REPOSITORY}"
-          put() { # <path relative to build/engine-ios>
-            curl -sS --fail-with-body --retry 3 --retry-all-errors \
-              -u "${GITHUB_ACTOR}:${GITHUB_TOKEN}" -T "build/engine-ios/$1" "$base/$1" >/dev/null
-            echo "uploaded $1"
-          }
-          files=$(cd build/engine-ios && find eth/myotis -type f | sort)
-          [ -n "$files" ] || { echo "::error::build/engine-ios holds nothing to publish"; exit 1; }
-          # (Maven paths hold no spaces, so word splitting is safe here.)
-          for f in $(printf '%s\n' "$files" | grep -v '/maven-metadata\.xml'); do put "$f"; done
-          for f in $(printf '%s\n' "$files" | grep '/maven-metadata\.xml'); do put "$f"; done
 
       # The staged repository, for the maven-repo job below — uploaded the
       # moment the version is irrevocably on GitHub Packages, so "the artifact

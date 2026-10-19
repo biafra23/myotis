@@ -102,8 +102,9 @@ makes the blocking call on the thread that called the `EnsApi` and re-enters via
 > `rust/build-android.sh`) through the `:myotis-engine` AAR's jniLibs (its androidMain; the
 > app has no jniLibs of its own), published as `eth.myotis:myotis-engine`; the UniFFI Kotlin is
 > committed in `:myotis-engine-rust`, whose `RustMyotisEngine` is the adapter onto `io.myotis.api`.
-> iOS took the plain C ABI instead of UniFFI Swift: `:app-ios` (Kotlin/Native cinterop; the
-> `MyotisKit` framework absorbs `libmyotis_engine.a`) for the app, and
+> iOS took the plain C ABI instead of UniFFI Swift: `:myotis-engine-ios` (Kotlin/Native cinterop
+> with `libmyotis_engine.a` inside, published as `eth.myotis:myotis-engine-ios`) for Kotlin hosts,
+> the `MyotisKit` framework of `:app-ios` on it for the app, and
 > `rust/build-xcframework.sh` (`MyotisEngine.xcframework`) for Swift hosts. Desktop loads the
 > library through the same UniFFI Kotlin over JNA; the standalone Rust daemon,
 > `rust/myotis-rpcd`, serves JSON-RPC over HTTP rather than the UDS IPC.

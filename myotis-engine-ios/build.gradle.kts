@@ -40,6 +40,12 @@ kotlin {
             // (device and simulator builds live in different cargo target dirs).
             extraOpts("-libraryPath", rootProject.file("rust/target/$triple/release").absolutePath)
         }
+        // The archive the cinterop absorbs is reached only through the def file and
+        // the search path above, which Gradle does not track: without this, a Rust
+        // rebuild left the cinterop UP-TO-DATE with the old engine inside.
+        val archive = rootProject.file("rust/target/$triple/release/libmyotis_engine.a")
+        tasks.matching { it.name == "cinteropMyotisEngine${target.name.replaceFirstChar(Char::uppercase)}" }
+            .configureEach { inputs.files(archive).withPropertyName("engineArchive") }
     }
 
     sourceSets {
