@@ -221,6 +221,40 @@ class EnsResolverTest {
     }
 
     @Test
+    void onSepoliasLayoutAReverseClaimOfAnEnsv2NameIsRefusedByTheForwardCheck() {
+        // Sepolia today: ENSv2 hands the `reverse` subtree to its v1 mirror, so the claim
+        // is read from v1 (the `reverse` node's wildcard resolver answers myotis.eth); the
+        // claimed name itself is ENSv2's, so its forward check is refused, not guessed.
+        var mock = new MockExecutor();
+        String reverseName = ReverseLookup.nameFor(VITALIK);
+        var resolver = ensv2Resolver(mock, reverseName, MIRROR);
+        mock.respond(UR, AbiEncoder.encodeCall(FunctionSignature.of("findResolver(bytes)"),
+                        AbiEncoder.bytes(DnsEncoder.encode("myotis.eth"))),
+                AbiEncoder.encodeRaw(AbiEncoder.address(V2_RESOLVER), AbiEncoder.bytes32(new byte[32]),
+                        AbiEncoder.uint256(0)));
+        mock.respond(REGISTRY, callRegistryResolver(reverseName), encodeAddress(Address.ZERO));
+        mock.respond(REGISTRY, callRegistryResolver("addr.reverse"), encodeAddress(Address.ZERO));
+        mock.respond(REGISTRY, callRegistryResolver("reverse"), encodeAddress(WILDCARD_RESOLVER));
+        mock.respond(WILDCARD_RESOLVER, callSupportsExtended(), encodeBool(true));
+        mock.respond(WILDCARD_RESOLVER, resolveCalldata(reverseName, callResolverName(reverseName)),
+                encodeBytes(encodeString("myotis.eth")));
+
+        var e = assertThrows(java.util.concurrent.ExecutionException.class,
+                () -> resolver.resolveName(VITALIK, ctx()).get());
+        assertEquals(EnsResolver.ENSV2_NAMES, e.getCause().getMessage());
+    }
+
+    @Test
+    void aRecordReadWhoseEnsv2CheckCannotRunFailsInsteadOfReadingV1() {
+        var mock = new MockExecutor();
+        mock.failOn(UR, AbiEncoder.encodeCall(FunctionSignature.of("ROOT_REGISTRY()")),
+                new IllegalStateException("state unavailable"));
+        var e = assertThrows(java.util.concurrent.ExecutionException.class,
+                () -> new EnsResolver(mock, REGISTRY, UR).resolveAddress("vitalik.eth", ctx()).get());
+        assertTrue(e.getCause() instanceof IllegalStateException, String.valueOf(e.getCause()));
+    }
+
+    @Test
     void aNameEnsv2HandsToItsV1MirrorIsReadThroughTheV1Walk() throws Exception {
         // ens.eth on Sepolia: not migrated, so v1's own resolver answers, as before.
         var mock = new MockExecutor();

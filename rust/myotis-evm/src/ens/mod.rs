@@ -6,8 +6,9 @@
 //! call the record method (`addr(bytes32)`, …) directly (legacy) or wrap it in
 //! `resolve(bytes,bytes)` (ENSIP-10). Every step is an `eth_call` against
 //! verified state, abstracted behind [`EthCaller`] so the walk is unit-testable
-//! without a node. The Universal Resolver resolves nothing here; it is asked
-//! only whether ENSv2 decides a name, for [`resolve_ownership`] (#671).
+//! without a node. The Universal Resolver resolves nothing here; where ENSv2 is
+//! live it is asked which resolver answers a name ([`authority`], #671), and the
+//! records are read from that resolver as from any other.
 //!
 //! Scope: forward records ([`resolve_address`] and the other `resolve_*`
 //! record types), [`resolve_ownership`], and reverse resolution
@@ -234,7 +235,9 @@ pub enum EnsError {
     /// non-`.gno` name on Gnosis Chain, or a reverse lookup there (Genome keeps
     /// reverse records outside the tree this resolver reads), refused before any
     /// call; or the ownership of a name ENSv2 decides ([`ENSV2_OWNERSHIP`]),
-    /// refused once chain state shows it. Never answered as "no record".
+    /// refused once chain state shows it; or any read where ENSv2's Universal
+    /// Resolver gives no usable answer ([`UR_UNUSABLE`]). Never answered as "no
+    /// record".
     Unsupported(&'static str),
 }
 
@@ -464,10 +467,12 @@ enum Authority {
     Ensv2 { resolver: Option<[u8; 20]>, exact: bool },
 }
 
-/// The refusal for a Universal Resolver whose `findResolver` answer is too short
-/// to carry its `(resolver, node, offset)` tuple: which resolver ENSv2 names is
-/// then unknown, and neither v1 nor "no record" may stand in for it.
-pub const UR_MALFORMED: &str = "the Universal Resolver's findResolver answer is malformed";
+/// The refusal where ENSv2 is live but its Universal Resolver's `findResolver`
+/// gives no usable answer — it reverts (it answers every name `dns_encode` can
+/// produce, so a revert means the contract changed), or its answer is too short to
+/// carry the `(resolver, node, offset)` tuple. Which resolver ENSv2 names is then
+/// unknown, and neither v1 nor "no record" may stand in for it.
+pub const UR_UNUSABLE: &str = "the Universal Resolver's findResolver gave no usable answer";
 
 /// Who speaks for the name `dns` encodes (#671). ENSv2 is live on a chain when
 /// its Universal Resolver names a root registry (`ROOT_REGISTRY()`: Sepolia
@@ -489,14 +494,13 @@ fn authority(caller: &dyn EthCaller, ns: &Namespace, dns: &[u8]) -> Result<Autho
     if call_address(caller, ur, &abi::encode_call_no_args("ROOT_REGISTRY()"))?.is_none() {
         return Ok(Authority::V1);
     }
-    // A revert means the Universal Resolver could not walk the name: no resolver.
     let out = match caller.eth_call(ur, &abi::encode_call_bytes("findResolver(bytes)", dns)) {
         Ok(out) => out,
-        Err(EvmError::Reverted { .. }) => return Ok(Authority::Ensv2 { resolver: None, exact: false }),
+        Err(EvmError::Reverted { .. }) => return Err(EnsError::Unsupported(UR_UNUSABLE)),
         Err(e) => return Err(EnsError::Call(e)),
     };
     let Some(offset) = out.get(64..96).and_then(abi::decode_u64) else {
-        return Err(EnsError::Unsupported(UR_MALFORMED));
+        return Err(EnsError::Unsupported(UR_UNUSABLE));
     };
     let Some(resolver) = abi::decode_address(&out).filter(|a| a != &[0u8; 20]) else {
         return Ok(Authority::Ensv2 { resolver: None, exact: offset == 0 });
@@ -698,8 +702,10 @@ pub fn reverse_resolve(
 
     let raw = match authority(caller, &ns, &rev_dns)? {
         Authority::V1 => v1_reverse_claim(caller, &ns, &rev_node, &rev_dns, &name_call)?,
-        // ENSv2's resolver for the reverse name is a current one: probed for
-        // ENSIP-10 like any record's (the no-probe rule is for v1's old ones).
+        // The resolver ENSv2 names is probed for ENSIP-10 like any record's. The
+        // no-probe rule protects v1's pre-ERC-165 reverse resolvers; should ENSv2
+        // ever name one, the probe halts and the lookup fails loudly (an error,
+        // never a wrong answer).
         Authority::Ensv2 { resolver: None, .. } => None,
         Authority::Ensv2 { resolver: Some(resolver), exact } => {
             if supports_interface(caller, resolver, EXTENDED_RESOLVER_INTERFACE_ID)? {
@@ -2238,7 +2244,72 @@ mod tests {
                 .on(move |t, cd| (t == UNIVERSAL_RESOLVER && sel(cd) == root_sel).then(|| Ok(addr_word(ROOT_V2))))
                 .on(move |t, cd| (t == UNIVERSAL_RESOLVER && sel(cd) == find_sel).then(|| Ok(addr_word(V2_RESOLVER)))),
         );
-        assert_eq!(resolve_address(&caller, "myotis.eth"), Err(EnsError::Unsupported(UR_MALFORMED)));
+        assert_eq!(resolve_address(&caller, "myotis.eth"), Err(EnsError::Unsupported(UR_UNUSABLE)));
+    }
+
+    /// An ENSv2 chain whose Universal Resolver answers `findResolver` with `answer`.
+    fn ensv2_find_answers(answer: Result<Vec<u8>, EvmError>) -> MockCaller {
+        let root_sel = abi::selector("ROOT_REGISTRY()");
+        let find_sel = abi::selector("findResolver(bytes)");
+        no_v1(
+            MockCaller::new()
+                .on_chain(11_155_111)
+                .on(move |t, cd| (t == UNIVERSAL_RESOLVER && sel(cd) == root_sel).then(|| Ok(addr_word(ROOT_V2))))
+                .on(move |t, cd| (t == UNIVERSAL_RESOLVER && sel(cd) == find_sel).then(|| answer.clone())),
+        )
+    }
+
+    #[test]
+    fn a_find_resolver_that_reverts_or_cannot_run_is_never_no_record() {
+        // It answers every name dns_encode produces; a revert means the contract
+        // changed. Reading that as "no record" would blank every name on the chain.
+        let reverted = ensv2_find_answers(Err(EvmError::Reverted { data: vec![] }));
+        assert_eq!(resolve_address(&reverted, "myotis.eth"), Err(EnsError::Unsupported(UR_UNUSABLE)));
+        assert_eq!(reverse_resolve(&reverted, VITALIK), Err(EnsError::Unsupported(UR_UNUSABLE)));
+        let halted = ensv2_find_answers(Err(EvmError::Halted { reason: "state unavailable".into() }));
+        assert!(matches!(resolve_address(&halted, "myotis.eth"), Err(EnsError::Call(EvmError::Halted { .. }))));
+    }
+
+    #[test]
+    fn an_exact_legacy_resolver_ensv2_names_is_asked_directly() {
+        // No ENSIP-10: the record call goes to it as is, as for a v1 exact resolver.
+        let supports_sel = abi::selector("supportsInterface(bytes4)");
+        let addr_sel = abi::selector("addr(bytes32)");
+        let dns = dns_encode("myotis.eth").unwrap();
+        let caller = no_v1(ensv2_chain(MockCaller::new().on_chain(11_155_111), dns, V2_RESOLVER))
+            .on(move |t, cd| (t == V2_RESOLVER && sel(cd) == supports_sel).then(|| Ok(bool_word(false))))
+            .on(move |t, cd| (t == V2_RESOLVER && sel(cd) == addr_sel).then(|| Ok(addr_word(USER))));
+        assert_eq!(resolve_address(&caller, "myotis.eth").unwrap(), Some(USER));
+    }
+
+    #[test]
+    fn an_offchain_ensv2_resolver_hands_its_own_lookup_up_wrapped() {
+        // "The UR only says who answers": the OffchainLookup the host drives is the
+        // resolver's own (its sender, its gateway URLs), never a Universal Resolver
+        // batch envelope, and it is marked wrapped since it came through resolve().
+        let supports_sel = abi::selector("supportsInterface(bytes4)");
+        let resolve_sel = abi::selector("resolve(bytes,bytes)");
+        let dns = dns_encode("myotis.eth").unwrap();
+        let body = offchain_revert_body(&["https://own-gateway.example/{sender}/{data}.json"]);
+        let caller = no_v1(ensv2_chain(MockCaller::new().on_chain(11_155_111), dns, V2_RESOLVER))
+            .on(move |t, cd| (t == V2_RESOLVER && sel(cd) == supports_sel).then(|| Ok(bool_word(true))))
+            .on(move |t, cd| {
+                (t == V2_RESOLVER && sel(cd) == resolve_sel).then(|| Err(EvmError::Reverted { data: body.clone() }))
+            });
+        match resolve_address(&caller, "myotis.eth") {
+            Err(EnsError::OffchainLookup { lookup: Some(l), wrapped: true }) => {
+                assert_eq!(l.sender, V2_RESOLVER);
+                assert_eq!(l.urls, vec!["https://own-gateway.example/{sender}/{data}.json".to_string()]);
+            }
+            other => panic!("expected the resolver's own wrapped lookup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reverse_where_ensv2_knows_no_resolver_for_the_reverse_name_has_no_claim() {
+        let dns = dns_encode(&reverse_name(VITALIK)).unwrap();
+        let caller = no_v1(ensv2_chain(MockCaller::new().on_chain(11_155_111), dns, [0u8; 20]));
+        assert_eq!(reverse_resolve(&caller, VITALIK).unwrap(), None);
     }
 
     #[test]

@@ -552,7 +552,8 @@ public final class EnsResolver {
      * name the Universal Resolver hands to this chain's pinned v1 mirror ({@link #ensv1Mirror}),
      * which ENSv2 sets for names not migrated yet; its {@code REGISTRY_V1()} must still name
      * this registry. Any other answer, no resolver included, belongs to ENSv2; and where no
-     * mirror is pinned, no name is v1's. Rust twin: {@code v1_decides}.
+     * mirror is pinned, no name is v1's. Rust twin: {@code authority} (which, being the full
+     * ENSv2 path, also says which resolver ENSv2 names; this engine only refuses).
      */
     private CompletableFuture<Boolean> v1Decides(byte[] dnsName, BlockContext ctx) {
         return callAddress(universalResolver, AbiEncoder.encodeCall(ROOT_REGISTRY), ctx).thenCompose(root -> {
