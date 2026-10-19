@@ -420,6 +420,12 @@ public record NetworkConfig(
             // runner in (dial failed, three attempts), sitting at its 25-peer cap,
             // while its REST served the same 25,472-byte bootstrap. 1 of 2 — the
             // owner decides. Details in the Rust twin (SEPOLIA_STATIC_PEERS).
+            // Release check for v0.1.17 (2026-10-19), slot 11393056: roost served
+            // it on both attempts of run 39339724807; this Nimbus failed to dial
+            // both times, at its 25-peer cap, as at v0.1.16. (The first refresh,
+            // slot 11392896, was finalized while this Nimbus ran optimistically
+            // after a restart, and it never built that bootstrap.) 1 of 2 — the
+            // owner decides. Details in the Rust twin (SEPOLIA_STATIC_PEERS).
             // Keep this list identical to SEPOLIA_STATIC_PEERS in
             // rust/myotis-net/src/sync.rs (both parity tests pin it).
             List.of(

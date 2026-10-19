@@ -773,6 +773,20 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // cold start (which cannot report SYNCED on Gloas anyway, see v0.1.15) nor
     // the old-anchor walk ran: the owner decides, as at v0.1.15. The
     // bootnodes seeded discv5 (23 entries).
+    //
+    // Release check for v0.1.17 (2026-10-19), anchor period 1390. The first
+    // refresh, slot 11392896, was finalized minutes after this Nimbus and its
+    // geth were restarted, while Nimbus still ran optimistically: it builds no
+    // light-client bootstrap for a block imported that way and never backfills
+    // it, so its REST answered 404 for that root, roost relayed
+    // ResourceUnavailable, and run 39336092556 found 0 of 2. Re-refreshed once
+    // Nimbus was out of optimistic mode: slot 11393056, which its REST serves
+    // (25,472 B). Run 39339724807, two attempts: roost served the bootstrap and
+    // the verified period-1390 update both times, and this Nimbus failed to
+    // dial both times, at its --max-peers=25 cap (REST peer_count 25
+    // connected), as at v0.1.16. 1 of 2 against a floor of 2; the dead-pins
+    // cold start and the old-anchor walk did not run: the owner decides. The
+    // bootnodes seeded discv5 (22 entries).
     "/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
 ];
 
