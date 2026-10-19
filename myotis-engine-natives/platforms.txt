@@ -1,0 +1,16 @@
+# The desktop platforms eth.myotis:myotis-engine-natives-<jna-prefix> is published
+# for: one artifact per line, holding the Rust engine's host library at
+# <jna-prefix>/<library> — the classpath path JNA loads `myotis_engine` from when
+# nothing on jna.library.path has it. Read by myotis-engine-natives/build.gradle.kts
+# (which publications exist), scripts/check_engine_library.sh (every line must be
+# staged, built for its architecture) and engine-library.yml's host-natives
+# matrix, whose legs must cover every line (the check fails a publication missing
+# one).
+#
+# <jna-prefix>    <rust target>                 <library>
+darwin-aarch64    aarch64-apple-darwin          libmyotis_engine.dylib
+darwin-x86-64     x86_64-apple-darwin           libmyotis_engine.dylib
+linux-x86-64      x86_64-unknown-linux-gnu      libmyotis_engine.so
+linux-aarch64     aarch64-unknown-linux-gnu     libmyotis_engine.so
+# Windows (win32-x86-64, x86_64-pc-windows-msvc, myotis_engine.dll) comes later:
+# a line here and a windows leg in the matrix.

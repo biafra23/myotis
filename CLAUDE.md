@@ -98,6 +98,12 @@ Key Gradle modules:
   (`cargoNdkAndroid` builds them there from source) and JNA's Android dispatcher,
   so a consumer's APK is complete with the AAR alone. The Myotis apps consume the
   Rust engine through it and keep the Java engine via the selector.
+- **myotis-engine-natives** — the desktop half the jar lacks: the Rust engine's
+  host library as `eth.myotis:myotis-engine-natives-<platform>`, one plain jar
+  per line of its `platforms.txt` (macOS arm64/x64, Linux x64/arm64; Windows
+  later), the library at JNA's classpath path. Built by `engine-library.yml`'s
+  `host-natives` matrix, one runner per platform, staged with
+  `-PengineNativesDir`; without it, this host's own from `cargoBuildHost`.
 - **myotis-engines** — the engine SELECTOR (`Engines`/`SelectorEngine`): hosts'
   composition roots call `Engines.engine()`; `myotis.engine=java|rust|auto` routes
   each network (re)start to the Java engine (node-core) or the Rust one.
