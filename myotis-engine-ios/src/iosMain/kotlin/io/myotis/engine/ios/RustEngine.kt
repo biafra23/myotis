@@ -1,4 +1,4 @@
-package io.myotis.ios
+package io.myotis.engine.ios
 
 import io.myotis.engine.capi.MYOTIS_ABI_VERSION
 import io.myotis.engine.capi.myotis_available_networks_json
@@ -52,7 +52,7 @@ import kotlinx.cinterop.toKString
  * string-memory contract (every `char*` the engine returns is copied to a
  * Kotlin String and immediately released via `myotis_string_free`) and the
  * ABI handshake. Everything else (JSON parsing, lifecycle bookkeeping) lives
- * in [IosNodeController].
+ * in the host (`:app-ios`'s `IosNodeController`).
  *
  * All calls are BLOCKING (verified reads up to ~90 s) — callers stay off the
  * main thread, same rule as every other host.

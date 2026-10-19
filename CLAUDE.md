@@ -63,7 +63,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # workspace's rust-toolchain.toml selects — i.e.
 # `rustup target add --toolchain stable aarch64-apple-ios aarch64-apple-ios-sim`).
 # Cargo stays optional here too: without the toolchain (and with no previously
-# built libmyotis_engine.a) :app-ios disables its framework tasks with a warning
+# built libmyotis_engine.a) :myotis-engine-ios and :app-ios disable their tasks with a warning
 # instead of failing the build — the full toolchain is required only to actually
 # build the iOS app.
 ./gradlew cargoBuildIosSim                              # libmyotis_engine.a for the arm64 simulator
@@ -104,6 +104,13 @@ Key Gradle modules:
   later), the library at JNA's classpath path. Built by `engine-library.yml`'s
   `host-natives` matrix, one runner per platform, staged with
   `-PengineNativesDir`; without it, this host's own from `cargoBuildHost`.
+- **myotis-engine-ios** — the engine library's iOS module
+  (`eth.myotis:myotis-engine-ios`; iosArm64 + iosSimulatorArm64): the cinterop of
+  the RUST engine's plain C ABI (`rust/include/myotis_engine.h`), with
+  libmyotis_engine.a absorbed into each target's cinterop klib, and
+  `io.myotis.engine.ios.RustEngine` over it — the only code that imports
+  `io.myotis.engine.capi`. macOS only (disabled elsewhere), so
+  `engine-library.yml` stages it on a macOS runner and merges it into the set.
 - **myotis-engines** — the engine SELECTOR (`Engines`/`SelectorEngine`): hosts'
   composition roots call `Engines.engine()`; `myotis.engine=java|rust|auto` routes
   each network (re)start to the Java engine (node-core) or the Rust one.
@@ -151,9 +158,8 @@ Key Gradle modules:
   (`NodeController`/`Settings`/`LogSource`/`NetworkStatus`/`QueryHistory`);
   targets Android + Desktop JVM + iOS. Hosts supply the seam actuals.
 - **app-ios** — The iOS host: Kotlin/Native framework (`MyotisKit`) bundling `:ui`
-  with iOS seam actuals over the RUST engine's plain C ABI
-  (`rust/include/myotis_engine.h`, cinterop; libmyotis_engine.a is absorbed into
-  the framework). The JVM engine never runs on iOS. The Xcode shell lives in
+  with iOS seam actuals over the Rust engine, through `:myotis-engine-ios` (whose
+  libmyotis_engine.a the framework links). The JVM engine never runs on iOS. The Xcode shell lives in
   `ios-app/` (regenerate with `xcodegen generate`).
 
 **Protocol flow**: `DiscV4Service` discovers peers → `Main` dials them via `RLPxConnector.connect()` → `RLPxHandler` performs ECIES handshake (state machine: HANDSHAKE_WRITE → HANDSHAKE_READ → FRAMED) → fires `RLPX_READY` event → `EthHandler` runs eth handshake (AWAITING_HELLO → AWAITING_STATUS → READY) → block header requests available.

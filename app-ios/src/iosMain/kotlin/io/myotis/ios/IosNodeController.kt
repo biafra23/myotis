@@ -1,5 +1,6 @@
 package io.myotis.ios
 
+import io.myotis.engine.ios.RustEngine
 import io.myotis.jsonrpc.MyotisRpcServer
 import io.myotis.ui.AccountResult
 import io.myotis.ui.CacheFileStats
