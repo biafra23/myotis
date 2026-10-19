@@ -264,7 +264,11 @@ jobs:
   build:
     name: Stage and check the publication
     needs: [host-natives, ios-engine]
-    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+    # Explicit results: ios-engine depends on version-guard, which is skipped off a
+    # tag, and the implicit success() skips every job downstream of a skipped one.
+    if: >-
+      ${{ !cancelled() && !startsWith(github.ref, 'refs/tags/v')
+          && needs.host-natives.result == 'success' && needs.ios-engine.result == 'success' }}
     runs-on: ubuntu-latest
     # A wedged cargo-ndk or Gradle daemon must not hold the runner for the
     # 6-hour default (android-apk.yml's budget for the same build).
