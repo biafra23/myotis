@@ -201,6 +201,10 @@ public record NetworkConfig(
                     // row) and 91.189.182.90 closed the connection from the runner,
                     // and so did roost (9109), while zbox's uplink was saturated by a
                     // PoC seed upload (see the Rust twin).
+                    // Re-verified 2026-10-19 at the anchor v0.1.17 ships (period
+                    // 1888), run 39336083362: 5 of 5 — every pin served: 57.129.130.18
+                    // and 91.189.182.90 after their closes, and roost (9109), with the
+                    // PoC seed upload held until after the runs (see the Rust twin).
                     // Mirror of the Rust MAINNET_STATIC_PEERS: keep the two lists
                     // and their ORDER in step (see the reasoning there).
                     "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
@@ -288,9 +292,9 @@ public record NetworkConfig(
             // genesis_validators_root (sepolia)
             Bytes.fromHexString("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078").toArrayUnsafe(),
             // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized sepolia block root (slot 11392896, 2026-10-19, period 1390)
-            Bytes.fromHexString("9913af4beff778c3122a65db275f8e0e4b418e0fded8ab3cac08a2c7a15786a9").toArrayUnsafe(),
-            11392896L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized sepolia block root (slot 11393056, 2026-10-19, period 1390)
+            Bytes.fromHexString("4419c0cbb2b4738154dc9ea6d63a4b674af520d93bd939d42ef26f3548604fb7").toArrayUnsafe(),
+            11393056L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:sepolia:end
             // Fork schedule — eth-clients/sepolia metadata/config.yaml *_FORK_EPOCH /
             // *_FORK_VERSION. Fulu (0x90000075) activated at epoch 272640 (2025-10-14);
@@ -547,6 +551,9 @@ public record NetworkConfig(
                     // 3733), run 38478934518: 7 of 8 — every public pin served; roost
                     // (9108) failed to dial while zbox's uplink was saturated by a PoC
                     // seed upload.
+                    // Re-verified 2026-10-19 at the anchor v0.1.17 ships (period
+                    // 3746), run 39336087407: 8 of 8 — every pin served, roost (9108)
+                    // included, with the PoC seed upload held until after the runs.
                     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
                     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
                     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
