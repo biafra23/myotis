@@ -48,10 +48,21 @@ object LogIndexWatch {
     // The `unwatch` array of a config push, exactly as [configJson] writes it.
     private val PUSHED_UNWATCH = Regex(""""unwatch":\[([^\]]*)\]""")
 
-    /** A 0x-prefixed 20-byte hex address — the only shape the engine accepts. */
+    /** A 0x-prefixed 20-byte hex address — the only shape a watch entry here takes. */
     @JvmStatic
-    fun isValidAddress(s: String): Boolean =
-        s.length == 42 && s.startsWith("0x") && s.drop(2).all {
+    fun isValidAddress(s: String): Boolean = isHex(s, 20)
+
+    /**
+     * What a removal marker may name: an address, or the 32-byte value of an
+     * engine topic entry ([LogIndexStatus.Entry.topic], engine ABI 48). This
+     * list never watches a topic, but the Index tab can remove one the engine
+     * indexes (an imported snapshot's), and the engine's `unwatch` takes both.
+     */
+    @JvmStatic
+    fun isValidKey(s: String): Boolean = isHex(s, 20) || isHex(s, 32)
+
+    private fun isHex(s: String, bytes: Int): Boolean =
+        s.length == 2 + 2 * bytes && s.startsWith("0x") && s.drop(2).all {
             it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F'
         }
 
@@ -113,7 +124,7 @@ object LogIndexWatch {
                 if (!UNWATCHED.containsMatchIn(obj.value)) return@mapNotNull null
                 val addr = ADDRESS.find(obj.value)?.groupValues?.get(1) ?: return@mapNotNull null
                 val key = addr.lowercase()
-                if (isValidAddress(addr) && key !in watched && seen.add(key)) addr else null
+                if (isValidKey(addr) && key !in watched && seen.add(key)) addr else null
             }
             .toList()
     }
@@ -202,8 +213,9 @@ object LogIndexWatch {
      * A topic-restricted entry ([LogIndexStatus.Entry.restricted]) is NOT
      * listed: this store carries no topics, so the next push would name the
      * address unrestricted — a topic conflict, on which the engine replaces
-     * the whole index. It stays among the contracts the Index tab shows as
-     * indexed but unlisted, where it can be removed.
+     * the whole index. Nor is a topic entry ([LogIndexStatus.Entry.topic]),
+     * which is no contract at all. Both stay among the entries the Index tab
+     * shows as indexed but unlisted, where they can be removed.
      *
      * [statusBefore] that is null, or is not a status at all (the probe failed
      * and returned an error object), leaves [json] untouched: with nothing to
@@ -221,7 +233,7 @@ object LogIndexWatch {
         val listed = entries.mapTo(HashSet()) { it.address.lowercase() }
         val broughtKeys = brought.mapTo(HashSet()) { it.address }
         return serialize(
-            entries + brought.filter { it.address !in listed && !it.restricted }
+            entries + brought.filter { it.address !in listed && it.listable }
                 .map { Entry(it.address, it.fromBlock) },
             unwatched(json).filterNot { it.lowercase() in broughtKeys },
         )

@@ -186,7 +186,7 @@ final class RustEnsApi implements EnsApi {
         }
     }
 
-    /** ABI ≥ 42: absent parts are left out of the JSON, never null; ABI ≥ 48: {@code "ensv2":true}
+    /** ABI ≥ 42: absent parts are left out of the JSON, never null; ABI ≥ 50: {@code "ensv2":true}
      *  marks an answer read from ENSv2's registries (absent = v1). */
     static EnsOwnershipResult ownershipFromJson(String name, String json) {
         Parsed p = Parsed.of(json);

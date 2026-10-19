@@ -21,8 +21,8 @@ closed with the verified receipt/body paths).
 
 Generic archive `getLogs` (any address, any range) is explicitly a non-goal:
 that is an archive-node feature. This is a **watch-list index**: a small set of
-(address, from-block) subscriptions per network, indexed once, then followed at
-head.
+(address, from-block) subscriptions per network — or (topic value, from-block),
+§6 — indexed once, then followed at head.
 
 ## Trust model
 
@@ -592,7 +592,8 @@ post-create call rather than a `create_handle` signature break:
   changelog line (`lib.rs:285`).
 - Config JSON: `{ "enabled": bool, "maxSpeed": bool?, "backfillPaused": bool?,
   "watch": [{"address": "0x…", "fromBlock": n, "topic0s": ["0x…", …]?,
-  "name": "…"? }, …], "unwatch": ["0x…", …]? }`.
+  "name": "…"? }, …], "unwatch": ["0x…", …]? }`. A watch entry may name a
+  32-byte `"topic"` (with `"positions"`) in place of `"address"` — §6.
   Watch lists live host-side as data, not in the engine — originally a
   built-in preset (the kohaku contract set per network), since 2026-08-20 the
   user's own entries (`LogIndexWatch`, entered on the Index tab (Settings → Expert mode) and persisted
@@ -609,6 +610,92 @@ post-create call rather than a `create_handle` signature break:
   `VERIFIED_ARITY` table it derives from) and
   `tryVerified`, backed by a new `RpcBackend.getLogs(filterJson)`; tri-state
   string convention like `getBlockReceipts` (`VerifiedReads.java:211`).
+
+### 6. Topic entries: a topic value, any emitter (#673, ABI 48)
+
+An address entry watches the contract that EMITS a log. A wallet's own history
+is mostly logs other contracts emit ABOUT it: every ERC-20/721 `Transfer` names
+it as topic1 or topic2, ERC-1155 `TransferSingle`/`TransferBatch` as topic2 or
+topic3, emitted by whichever token moved. Indexing every token under
+`topic0s: [Transfer]` stores every transfer of every listed token (on a popular
+token most blooms match, so the walk fetches receipts for most blocks and
+drops nearly everything) and still misses any token not on the list.
+
+A **topic entry** is keyed by a 32-byte value instead of an address:
+
+```json
+{"topic": "0x000000000000000000000000<20-byte address>", "positions": [1, 2, 3], "fromBlock": 9400000}
+```
+
+- **Walk.** A header's `logsBloom` accrues each log's address AND each of its
+  topics, so the bloom probe for the value is as selective as one for an
+  address and a miss is just as definitive. The entry rides the same appender,
+  bridge, tail and backfill as every other — `LogIndex::bloom_may_match` probes
+  the value, `fetch_candidate_logs` verifies receipts for candidates and keeps
+  what the entry selects.
+- **What it stores** (`WatchEntry::selects`): every log, from ANY emitter, whose
+  topic at one of `positions` equals the value, at/after `fromBlock`. `topic0s`
+  restricts it exactly as it restricts an address entry (`[Transfer]` drops the
+  wallet's `Approval`s).
+- **`positions`** is part of the entry, chosen over "any position": a stored
+  span means "every log carrying the value at THESE positions", so a query
+  pinning it elsewhere is refused (`UnindexedTopic`), and two sources or a push
+  disagreeing on positions are a restriction conflict — the same rule as
+  `topic0s`. 1–3 only: position 0 would be "every log of one event, from any
+  emitter", a scan of the chain rather than a watch-list. The config JSON
+  defaults it to all three (the wallet case); a position named twice folds.
+- **Serving.** A filter is answered by a topic entry when it pins the value
+  (an OR-list whose every alternative is the value) at one of the entry's
+  positions and the range lies inside the entry's coverage — with no
+  `address`, with one, or with several (the address list only narrows the
+  answer). The scan returns every stored log the filter matches, whichever
+  entry stored it. An address-less filter that pins none of topics 1–3 is
+  refused for good (`-32602`): no watch-list could answer it. When the address
+  path fails too, a topic entry's `OutOfCoverage` wins over the address
+  refusal — waiting it out will answer.
+- **Coverage honesty** is unchanged: per entry, inside covered spans only, an
+  error outside; `fromBlock` is the entry's assertion that nothing carries the
+  value below it (the wallet's first block), clamping a query's coverage
+  requirement exactly like a deployment block.
+- **Identity.** An entry is keyed by kind AND bytes (`WatchKey`): a topic
+  value that is an address left-padded is a different entry from that
+  address. One store serves both kinds: a transfer from a watched wallet on a
+  watched token is stored once and outlives either entry's `unwatch`
+  (`LogIndex::unwatch` keeps every log a surviving entry selects).
+- **Config, unwatch, status.** `unwatch` takes 32-byte values next to
+  addresses, told apart by width. The status lists a topic entry as
+  `{"topic","positions","fromBlock",…}`; the hosts' Index tab shows it among
+  the entries it does not list, removable, never "Keep"-able (its list holds
+  addresses only).
+- **Snapshots.** An index holding a topic entry is written as MLIX **v3** —
+  v2 whose watch-table entries open with a kind byte, a topic entry carrying
+  value, from_block, positions, topic0s and name. An address-only index is
+  still written as v2 byte for byte (and its fingerprint is unchanged), so
+  every existing file, export, finality claim and `scripts/synth_logindex.py`
+  frame keeps working. A v3 file does not load on an older engine, which
+  reads it as a corrupt index and re-indexes from scratch — address entries
+  included — overwriting it at its first checkpoint. Before downgrading past
+  ABI 48, unwatch the topic entries: the next checkpoint is v2 again and
+  the address entries' coverage survives the downgrade.
+- **Privacy.** A topic entry names the user's OWN address, where an address
+  entry names a public contract. `eth_getLogs` answers a pinned query for a
+  watched value and refuses an unwatched one differently, so whoever may call
+  it can test candidate addresses and, on a hit, read the wallet's whole
+  transfer history. The same holds today for address entries (which contract
+  a user indexes is also telling); it matters more here. Callers are the
+  hosts' own wallet, local processes on the loopback listener, and web pages
+  the user admitted (`WebAccessPolicy`: none by default, every page only in
+  the ALL mode). Whether topic entries should be hidden from admitted pages
+  is an open question for the owner, not decided here.
+
+**Not covered.** Plain ETH transfers to an EOA emit no log; a wallet needs
+balance checkpoints or body scans for those. Internal transfers likewise.
+
+**Bloom fill — not yet measured.** A false positive costs one block's receipts,
+as for an address entry, and a topic entry tests three bits of the same 2048.
+The rate on mainnet's well-filled blooms (and on Sepolia) is worth measuring
+before a wallet backfills years of history with one; nothing in the design
+depends on it beyond walk speed.
 
 ### Kohaku preset (RETIRED 2026-08-20 — now migration seed data)
 

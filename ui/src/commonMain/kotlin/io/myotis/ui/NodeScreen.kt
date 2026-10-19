@@ -2964,18 +2964,24 @@ private fun IndexTab(
         }
         confirmRemoval?.let { addresses ->
             val one = addresses.size == 1
+            // A topic watch (an engine entry keyed by a 32-byte value, never one
+            // of this list's contracts) cannot be added back from this tab.
+            val topics = addresses.any { !LogIndexWatch.isValidAddress(it) }
+            val what = if (topics) "entr" + (if (one) "y" else "ies") else "contract" + (if (one) "" else "s")
             AlertDialog(
                 onDismissRequest = { confirmRemoval = null },
                 title = {
-                    Text(if (one) "Remove this contract?" else "Remove ${addresses.size} contracts?")
+                    Text(if (one) "Remove this $what?" else "Remove ${addresses.size} $what?")
                 },
                 text = {
                     Text(
                         (if (one) "${addresses.first()}\n\nThe logs collected for it"
                         else "The logs collected for them") +
-                            " on $network are deleted and indexing stops. Adding " +
-                            (if (one) "it" else "one") + " again starts its backfill over. " +
-                            "The other contracts keep their logs.",
+                            " on $network are deleted and indexing stops. " +
+                            (if (topics) "A topic watch cannot be added back here — only by an " +
+                                "import, or by the app that set it up. "
+                            else "Adding " + (if (one) "it" else "one") + " again starts its backfill over. ") +
+                            "The other entries keep their logs.",
                     )
                 },
                 confirmButton = {
@@ -3043,6 +3049,8 @@ private fun IndexTab(
                         Text(e.name ?: e.address)
                         Text(
                             (if (e.name != null) "${e.address} · " else "") + "from block ${e.fromBlock}" +
+                                (if (e.topic) " · topic watch: logs of any contract carrying this value " +
+                                    "at topic ${e.positions.joinToString("/")} — cannot be listed" else "") +
                                 (if (e.restricted) " · selected events only — cannot be listed" else ""),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -3051,8 +3059,8 @@ private fun IndexTab(
                     // Not for an entry indexed under a topic restriction: the list
                     // carries no topics, so the next push would name it
                     // unrestricted — a conflict the engine answers by replacing the
-                    // whole index.
-                    if (!e.restricted) {
+                    // whole index. Nor for a topic entry, which is no contract.
+                    if (e.listable) {
                         TextButton(onClick = {
                             // The engine already indexes it: listing it changes
                             // nothing there, so no push.

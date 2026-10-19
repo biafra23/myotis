@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 48
+#define MYOTIS_ABI_VERSION 50
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -283,7 +283,13 @@ char *myotis_resolve_ens_json(int64_t handle, const char *name);
  * resolver and, for a .eth second-level name, the registrar's registrant,
  * expiry and grace period, seen through the NameWrapper; an absent part is
  * left out. An older engine answers "unknown ens method".
- * v48: "ensv2":true when the answer was read from ENSv2's registries (#671):
+ * v49: a {"status":"offchain",...} envelope with the gateway tuple may carry
+ * "reverseClaim" (a reverse query whose round forward-verifies that claimed
+ * name); a host driving the round echoes it into the method "ccipCallback"
+ * params next to the tuple. The callback refuses one on any other query.
+ * Cap the rounds per step: the claim and its forward check may each need one
+ * (an off-chain claim verified off chain takes two).
+ * v50: "ensv2":true when the answer was read from ENSv2's registries (#671):
  * "registrantHex" is the label's owner, no "managerHex", "gracePeriodSeconds"
  * 0; absent for a v1 answer. */
 char *myotis_ens_record_json(int64_t handle, const char *params_json);
@@ -346,25 +352,30 @@ void myotis_string_free(char *s);
 /* v21: the opt-in eth_getLogs watch-list index (docs/eth-getlogs-design.md).
  * get_logs answers only inside indexed coverage; anything else is an
  * {"error": ...} JSON — never an empty array for unindexed ranges. A filter
- * that fails to parse (malformed, a `safe` or hash selector, no address)
- * carries "code": -32602 as well, like eth_call's refusals; a refusal that
- * depends on the index (coverage, the watch-list) stays plain and retryable.
+ * that fails to parse (malformed, a `safe` or hash selector, no address and
+ * no topic 1-3 pinned to one value) carries "code": -32602 as well, like
+ * eth_call's refusals; a refusal that depends on the index (coverage, the
+ * watch-list) stays plain and retryable.
  *
  * set_log_index_config takes {"enabled":bool,"watch":[{"address","fromBlock",
- * "topic0s"?,"name"?}],"unwatch":["0x..",..]?}. `watch` is additive (v24): an
+ * "topic0s"?,"name"?}],"unwatch":["0x..",..]?}. v48: an entry may name a
+ * 32-byte "topic" (with "positions"?, 1-3, default all) instead of an
+ * "address" — every log from any emitter carrying it there — and `unwatch`
+ * takes such values too. `watch` is additive (v24): an
  * address left out of it stays subscribed. `unwatch` (v37) is the unsubscribe
  * — each address it names leaves the index before the union, with its
  * coverage and its stored logs; the other entries keep theirs, and an address
  * the index does not watch is ignored. true means the unwatch is durable (its
- * checkpoint is on disk). false for malformed JSON, an address listed twice
- * or under both keys, a handle without a running EL reader, or an unwatch
+ * checkpoint is on disk). false for malformed JSON, an address or topic listed
+ * twice or under both keys, a handle without a running EL reader, or an unwatch
  * whose checkpoint could not be written — the entries are then dropped in
  * memory only, the rest of the push is not applied, and repeating the push
  * retries the write.
  *
  * The status JSON's entries are {"address","fromBlock","name"?,"coveredLow"?,
  * "coveredHigh"?,"restricted"?}; "restricted":true (v37) marks an entry
- * indexed under a topic0 restriction. */
+ * indexed under a topic0 restriction. A topic entry (v48) opens with
+ * {"topic","positions"} in place of "address". */
 char *myotis_get_logs_json(int64_t handle, const char *filter_json);
 bool myotis_set_log_index_config(int64_t handle, const char *config_json);
 char *myotis_log_index_status_json(int64_t handle);

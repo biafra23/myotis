@@ -108,7 +108,7 @@ class RustEnsRecordJsonTest {
         assertThrows(EngineException.class,
                 () -> RustEnsApi.ownershipFromJson("x.eth", ok("\"managerHex\":\"" + ADDR40 + "\"")));
         assertFalse(full.ensv2(), "a v1 answer carries no ensv2 key");
-        // ABI 48 (#671): an answer read from ENSv2's registries — the eljson golden's twin.
+        // ABI 50 (#671): an answer read from ENSv2's registries — the eljson golden's twin.
         var v2 = RustEnsApi.ownershipFromJson("myotis.eth", ok(
                 "\"registrantHex\":\"" + ADDR40 + "\",\"wrapped\":false,"
                 + "\"resolverHex\":\"0x" + "5e".repeat(20) + "\",\"expiresAt\":1980874152,"
