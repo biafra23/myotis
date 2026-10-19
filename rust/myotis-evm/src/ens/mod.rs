@@ -513,12 +513,21 @@ const STATUS_REGISTERED: u64 = 2;
 /// `reverse` is REGISTERED with the v1 mirror as its resolver, and a migrated
 /// wrapped name's registry does the same for children not migrated yet. That
 /// is [`ensv2_registers_nothing`]'s call. A status that cannot be read fails the
-/// read ([`ENSV2_UNREADABLE`]): it is never guessed as v1's.
+/// read ([`ENSV2_UNREADABLE`]): it is never guessed as v1's. Nor is a REGISTERED
+/// label whose registry names no owner for it: ENSv2's own status logic answers
+/// REGISTERED only for a label with an owner, so a missing one means the registry
+/// contradicts itself (or lacks `findOwner`) and the read is refused, not shown
+/// as an owner-less ENSv2 answer. Its resolver and expiry stay optional — a
+/// label may have no resolver, and never-expiring labels carry no date.
 ///
 /// The labels are the name's own, split as the v1 path splits them: a trailing
 /// root dot keeps its empty label, so `x.eth.` asks ENSv2 about the same
 /// three-label name the record reads look up (and finds nothing there), never
-/// about `x.eth`. RESERVED is a status ENS's own registries set; a custom
+/// about `x.eth`. The fallback for a name ENSv2 registers nothing for judges the
+/// dot-stripped name, though: [`ensv2_registers_nothing`] asks the Universal
+/// Resolver about `dns`, which drops the trailing dot, so `x.eth.`'s handoff is
+/// decided by `x.eth`'s resolver; a v1 answer it leads to is still read at the
+/// dotted node (#682 review). RESERVED is a status ENS's own registries set; a custom
 /// subregistry could answer it too, but only for names its owner already holds.
 fn ensv2_ownership(
     caller: &dyn EthCaller,
@@ -540,7 +549,11 @@ fn ensv2_ownership(
             Some(STATUS_RESERVED) => return Ok(Ensv2Ownership::V1),
             Some(STATUS_AVAILABLE) => return ensv2_registers_nothing(caller, ns, dns),
             Some(STATUS_REGISTERED) if depth == 0 => {
-                let owner = call_address(caller, registry, &abi::encode_call_bytes("findOwner(string)", label))?;
+                let Some(owner) =
+                    call_address(caller, registry, &abi::encode_call_bytes("findOwner(string)", label))?
+                else {
+                    return Err(EnsError::Unsupported(ENSV2_UNREADABLE));
+                };
                 let resolver =
                     call_address(caller, registry, &abi::encode_call_bytes("getResolver(string)", label))?;
                 // ENSv2 marks a label that never expires with the largest uint64
@@ -549,7 +562,7 @@ fn ensv2_ownership(
                 let expires_at = call_u64(caller, registry, &abi::encode_call_bytes("findExpiry(string)", label))?
                     .filter(|e| *e > 0 && *e <= i64::MAX as u64);
                 return Ok(Ensv2Ownership::Answer(Some(EnsOwnership {
-                    registrant: owner,
+                    registrant: Some(owner),
                     manager: None,
                     wrapped: false,
                     resolver,
@@ -2860,5 +2873,28 @@ mod tests {
             vec![(ETH_REGISTRY, "myotis", Entry(STATUS_REGISTERED, USER, 1_980_874_152, V2_RESOLVER, [0u8; 20]))],
         ));
         assert_eq!(resolve_ownership(&caller, "myotis.eth.", 11_155_111).unwrap(), None);
+    }
+
+    #[test]
+    fn a_registered_label_whose_registry_names_no_owner_is_refused() {
+        // #682 review: REGISTERED means "has an owner" in ENSv2's own status logic,
+        // so a registry that answers the status but no findOwner contradicts itself
+        // (or lacks the getter); refused rather than shown as an owner-less answer.
+        let owner_sel = abi::selector("findOwner(string)");
+        let registries = ensv2_registries(
+            11_155_111,
+            vec![(ETH_REGISTRY, "myotis", Entry(STATUS_REGISTERED, USER, 1_980_874_152, V2_RESOLVER, [0u8; 20]))],
+        );
+        // findOwner reverts on ETH_REGISTRY; every other call goes to the registries.
+        let caller = no_v1(
+            MockCaller::new()
+                .on_chain(11_155_111)
+                .on(move |t, cd| (t == ETH_REGISTRY && sel(cd) == owner_sel).then(revert)),
+        )
+        .on(move |t, cd| Some(registries.eth_call(t, cd)));
+        assert_eq!(
+            resolve_ownership(&caller, "myotis.eth", 11_155_111),
+            Err(EnsError::Unsupported(ENSV2_UNREADABLE))
+        );
     }
 }
