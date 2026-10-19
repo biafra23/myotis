@@ -3057,7 +3057,9 @@ fn running_reader(engine: &EngineState, handle: i64) -> Result<Arc<ElReader>, &'
 /// the callback read the answer as that name's address. Applied or refused,
 /// never ignored: only a reverse query's callback may carry one, and it must be
 /// a well-formed name — the engine emits no other, so anything else is a host
-/// fault. Not trimmed: the answer is the name verified, byte for byte.
+/// fault. Not trimmed: the answer is the name verified, byte for byte. Trusted
+/// as the tuple it travels with is: it is the host's echo of the round, not
+/// bound to it on chain (`senderHex` already picks the contract that answers).
 fn parse_reverse_claim(
     is_ccip: bool,
     query: &EnsQuery,

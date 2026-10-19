@@ -7007,28 +7007,8 @@ impl ElReader {
             let (block_number, block_timestamp) = (ctx.block_number, ctx.timestamp);
             let walk = super::request::blocking(move || {
                 let caller = ExecutorCaller { executor: &executor, ctx: &ctx };
-                let raw = match myotis_evm::ccip_callback(
-                    &caller,
-                    sender,
-                    callback_function,
-                    &response,
-                    &extra_data,
-                    wrapped,
-                ) {
-                    // A further lookup from a forward-check round is still that
-                    // step's: it keeps the claim, so the host counts it against
-                    // the same step's round cap.
-                    Err(EnsError::OffchainLookup { lookup, wrapped, .. }) => {
-                        return Err(EnsError::OffchainLookup {
-                            lookup,
-                            wrapped,
-                            reverse_claim: reverse_claim.clone(),
-                        });
-                    }
-                    other => other?,
-                };
-                let Some(raw) = raw else { return Ok(None) };
-                decode_ccip_answer(&caller, &query, reverse_claim.as_deref(), &raw)
+                let round = CcipRound { sender, callback_function, response, extra_data, wrapped };
+                continue_ccip_round(&caller, &query, reverse_claim, &round)
             });
             let joined = walk.await?;
             match joined {
@@ -10700,6 +10680,43 @@ fn run_ens_query(
     })
 }
 
+/// One gateway round's callback tuple, as the host hands it back.
+struct CcipRound {
+    sender: [u8; 20],
+    callback_function: [u8; 4],
+    response: Vec<u8>,
+    extra_data: Vec<u8>,
+    wrapped: bool,
+}
+
+/// Run one round's callback and decode its answer for `query`. A further
+/// `OffchainLookup` from a forward-check round (`reverse_claim` Some) is still
+/// that step's: it keeps the claim, so the host counts it against the same
+/// step's round cap and a later round, were the cap raised, still decodes an
+/// address.
+fn continue_ccip_round(
+    caller: &dyn myotis_evm::EthCaller,
+    query: &EnsQuery,
+    reverse_claim: Option<String>,
+    round: &CcipRound,
+) -> Result<Option<EnsRecordValue>, EnsError> {
+    let raw = match myotis_evm::ccip_callback(
+        caller,
+        round.sender,
+        round.callback_function,
+        &round.response,
+        &round.extra_data,
+        round.wrapped,
+    ) {
+        Err(EnsError::OffchainLookup { lookup, wrapped, .. }) => {
+            return Err(EnsError::OffchainLookup { lookup, wrapped, reverse_claim });
+        }
+        other => other?,
+    };
+    let Some(raw) = raw else { return Ok(None) };
+    decode_ccip_answer(caller, query, reverse_claim.as_deref(), &raw)
+}
+
 /// Decode a CCIP callback's raw answer with the ORIGINAL query's record
 /// semantics (single source: the myotis-evm `decode_*_answer` helpers). For a
 /// `Reverse` query, `reverse_claim` says which step the round answered: None,
@@ -12411,6 +12428,45 @@ mod tests {
         });
         let out = decode_ccip_answer(&silent, &reverse, Some("x.cb.id"), &addr_word(queried)).unwrap();
         assert_eq!(out, Some(EnsRecordValue::Name("x.cb.id".into())));
+    }
+
+    #[test]
+    fn ccip_forward_check_round_keeps_its_claim_through_a_further_lookup() {
+        let sender = [0x5e; 20];
+        let round = CcipRound {
+            sender,
+            callback_function: [0xcb; 4],
+            response: vec![0xaa],
+            extra_data: vec![0xee; 3],
+            wrapped: false,
+        };
+        let reverse = EnsQuery::Reverse { address: [0xd8; 20] };
+        // The round's callback answers: the claim stands when it points back.
+        let answers = FnCaller(move |t: [u8; 20], _: &[u8]| {
+            assert_eq!(t, sender);
+            Ok(addr_word([0xd8; 20]))
+        });
+        assert_eq!(
+            continue_ccip_round(&answers, &reverse, Some("x.cb.id".into()), &round).unwrap(),
+            Some(EnsRecordValue::Name("x.cb.id".into()))
+        );
+        // The round's callback reverts OffchainLookup again: still the forward
+        // check's lookup, so the claim stays with it; a claim round's stays bare.
+        let again = FnCaller(|_: [u8; 20], _: &[u8]| {
+            let mut data = vec![0x55, 0x6f, 0x18, 0x30];
+            data.extend_from_slice(&[0u8; 32]);
+            Err(myotis_evm::EvmError::Reverted { data })
+        });
+        match continue_ccip_round(&again, &reverse, Some("x.cb.id".into()), &round) {
+            Err(EnsError::OffchainLookup { reverse_claim, .. }) => {
+                assert_eq!(reverse_claim.as_deref(), Some("x.cb.id"));
+            }
+            other => panic!("expected a further lookup with the claim, got {other:?}"),
+        }
+        match continue_ccip_round(&again, &reverse, None, &round) {
+            Err(EnsError::OffchainLookup { reverse_claim: None, .. }) => {}
+            other => panic!("expected a further lookup without a claim, got {other:?}"),
+        }
     }
 
     #[test]
