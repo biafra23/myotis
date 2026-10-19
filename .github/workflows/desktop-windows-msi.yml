@@ -8,8 +8,9 @@ name: Desktop MSI (Windows)
 # It does not prove the app syncs from a home connection: the Windows addon
 # smoke found peers over UDP but held no TCP connections from Azure
 # (docs/TODO.md, `smoke-windows`). Download the msi from the run's artifacts;
-# adding it to a release job (and to the release notes the sibling workflows
-# write) is a follow-up once it has been tried on a real Windows machine.
+# adding it to a release job (and a paragraph to the release notes every
+# publisher shares, .github/release-notes.md) is a follow-up once it has been
+# tried on a real Windows machine.
 #
 # x64 only. Windows 11 on ARM runs it through its x64 emulation (Prism), which
 # is also how a Windows VM on an Apple Silicon Mac runs it. A native arm64 msi
