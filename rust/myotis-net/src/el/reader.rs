@@ -6998,14 +6998,8 @@ impl ElReader {
         wrapped: bool,
         reverse_claim: Option<String>,
     ) -> Result<EnsQueryOutcome, String> {
-        // The direct path's refusal (a non-.gno name, or a reverse lookup, on
-        // Gnosis) holds for its continuation too: a round the engine never
-        // offered must not be answered.
-        if let Some(refused) = myotis_evm::ens_refusal(chain_id, ens_query_name(&query)) {
-            return Err(refused.to_string());
-        }
-        if reverse_claim.is_some() && !matches!(query, EnsQuery::Reverse { .. }) {
-            return Err("reverseClaim is only valid for a reverse query".to_string());
+        if let Some(refused) = ccip_callback_refusal(&query, chain_id, reverse_claim.as_deref()) {
+            return Err(refused);
         }
         let attempt = async {
             let anchor = ReadAnchor::for_finalized(finalized);
@@ -10686,6 +10680,20 @@ fn run_ens_query(
     })
 }
 
+/// Why a ccipCallback re-entry is refused before any state is read, if it is.
+/// The direct path's refusal (a non-.gno name, or a reverse lookup, on Gnosis)
+/// holds for its continuation too: a round the engine never offered must not be
+/// answered. And a claim belongs to a reverse query's forward check only.
+fn ccip_callback_refusal(query: &EnsQuery, chain_id: u64, reverse_claim: Option<&str>) -> Option<String> {
+    if let Some(refused) = myotis_evm::ens_refusal(chain_id, ens_query_name(query)) {
+        return Some(refused.to_string());
+    }
+    if reverse_claim.is_some() && !matches!(query, EnsQuery::Reverse { .. }) {
+        return Some("reverseClaim is only valid for a reverse query".to_string());
+    }
+    None
+}
+
 /// One gateway round's callback tuple, as the host hands it back.
 struct CcipRound {
     sender: [u8; 20],
@@ -12473,6 +12481,35 @@ mod tests {
             Err(EnsError::OffchainLookup { reverse_claim: None, .. }) => {}
             other => panic!("expected a further lookup without a claim, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ccip_callback_refuses_rounds_the_engine_never_offers() {
+        let reverse = EnsQuery::Reverse { address: [0xd8; 20] };
+        let addr = |name: &str| EnsQuery::Addr { name: name.into() };
+        // Gnosis: no reverse lookup, no name outside .gno — as on the direct path.
+        assert_eq!(
+            ccip_callback_refusal(&reverse, 100, None).as_deref(),
+            Some(myotis_evm::ens::NO_GNO_REVERSE)
+        );
+        assert_eq!(
+            ccip_callback_refusal(&reverse, 100, Some("x.cb.id")).as_deref(),
+            Some(myotis_evm::ens::NO_GNO_REVERSE)
+        );
+        assert_eq!(
+            ccip_callback_refusal(&addr("x.cb.id"), 100, None).as_deref(),
+            Some(myotis_evm::ens::ONLY_GNO_NAMES)
+        );
+        assert_eq!(ccip_callback_refusal(&addr("levvv.gno"), 100, None), None);
+        // A claim belongs to a reverse query's forward check only.
+        assert_eq!(
+            ccip_callback_refusal(&addr("x.cb.id"), 1, Some("x.cb.id")).as_deref(),
+            Some("reverseClaim is only valid for a reverse query")
+        );
+        // What the engine does offer passes, with or without a claim.
+        assert_eq!(ccip_callback_refusal(&reverse, 1, None), None);
+        assert_eq!(ccip_callback_refusal(&reverse, 1, Some("x.cb.id")), None);
+        assert_eq!(ccip_callback_refusal(&addr("x.cb.id"), 1, None), None);
     }
 
     #[test]
