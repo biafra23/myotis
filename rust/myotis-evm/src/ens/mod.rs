@@ -461,10 +461,16 @@ enum Authority {
     /// The v1 registry: ENSv2 is not live on this chain, or it hands the name to
     /// its v1 mirror (a name not migrated yet).
     V1,
-    /// ENSv2: the resolver its Universal Resolver names for the name, if any, and
-    /// whether it was set for the exact name rather than inherited from an
-    /// ancestor (`offset == 0`).
-    Ensv2 { resolver: Option<[u8; 20]>, exact: bool },
+    /// ENSv2: the resolver its Universal Resolver names for the name, if any.
+    Ensv2(Option<Ensv2Resolver>),
+}
+
+/// The resolver ENSv2 names for a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ensv2Resolver {
+    resolver: [u8; 20],
+    /// Set for the exact name, not inherited from an ancestor (`offset == 0`).
+    exact: bool,
 }
 
 /// The refusal where ENSv2 is live but its Universal Resolver's `findResolver`
@@ -503,7 +509,7 @@ fn authority(caller: &dyn EthCaller, ns: &Namespace, dns: &[u8]) -> Result<Autho
         return Err(EnsError::Unsupported(UR_UNUSABLE));
     };
     let Some(resolver) = abi::decode_address(&out).filter(|a| a != &[0u8; 20]) else {
-        return Ok(Authority::Ensv2 { resolver: None, exact: offset == 0 });
+        return Ok(Authority::Ensv2(None));
     };
     // Only the pinned mirror hands a name to v1: a name's ENSv2 owner sets its
     // resolver and could make one answer REGISTRY_V1() too (#672 review).
@@ -513,7 +519,7 @@ fn authority(caller: &dyn EthCaller, ns: &Namespace, dns: &[u8]) -> Result<Autho
     {
         return Ok(Authority::V1);
     }
-    Ok(Authority::Ensv2 { resolver: Some(resolver), exact: offset == 0 })
+    Ok(Authority::Ensv2(Some(Ensv2Resolver { resolver, exact: offset == 0 })))
 }
 
 /// One `address`-returning view: the zero address and a revert are both "none".
@@ -706,8 +712,8 @@ pub fn reverse_resolve(
         // no-probe rule protects v1's pre-ERC-165 reverse resolvers; should ENSv2
         // ever name one, the probe halts and the lookup fails loudly (an error,
         // never a wrong answer).
-        Authority::Ensv2 { resolver: None, .. } => None,
-        Authority::Ensv2 { resolver: Some(resolver), exact } => {
+        Authority::Ensv2(None) => None,
+        Authority::Ensv2(Some(Ensv2Resolver { resolver, exact })) => {
             if supports_interface(caller, resolver, EXTENDED_RESOLVER_INTERFACE_ID)? {
                 call_wrapped(caller, resolver, &rev_dns, &name_call)?
             } else if exact {
@@ -839,14 +845,12 @@ fn resolve_record(
     let ns = Namespace::for_chain(caller.chain_id());
     let found = match authority(caller, &ns, &dns)? {
         Authority::V1 => find_resolver(caller, name)?,
-        Authority::Ensv2 { resolver, exact } => match resolver {
-            Some(resolver) => Some(ResolverInfo {
-                resolver,
-                exact,
-                extended: supports_interface(caller, resolver, EXTENDED_RESOLVER_INTERFACE_ID)?,
-            }),
-            None => None,
-        },
+        Authority::Ensv2(None) => None,
+        Authority::Ensv2(Some(Ensv2Resolver { resolver, exact })) => Some(ResolverInfo {
+            resolver,
+            exact,
+            extended: supports_interface(caller, resolver, EXTENDED_RESOLVER_INTERFACE_ID)?,
+        }),
     };
     let Some(info) = found else {
         return Ok(None);
