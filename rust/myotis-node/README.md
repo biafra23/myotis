@@ -401,7 +401,8 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   host's job (not yet wrapped here). Echo the envelope's `reverseClaim` into
   the callback with the tuple when it is present (engines from ABI 48 send it):
   it marks a reverse lookup's forward check, whose answer is an address, not a
-  name.
+  name. Cap rounds per step, not per lookup: the claim and its forward check
+  may each need one (an off-chain claim verified off chain takes two).
 - The addon is loadable from Electron main/utility processes as-is (N-API is
   ABI-stable across Node and Electron).
 

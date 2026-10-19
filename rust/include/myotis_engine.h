@@ -286,7 +286,9 @@ char *myotis_resolve_ens_json(int64_t handle, const char *name);
  * v48: a {"status":"offchain",...} envelope with the gateway tuple may carry
  * "reverseClaim" (a reverse query whose round forward-verifies that claimed
  * name); a host driving the round echoes it into the method "ccipCallback"
- * params next to the tuple. The callback refuses one on any other query. */
+ * params next to the tuple. The callback refuses one on any other query.
+ * Cap the rounds per step: the claim and its forward check may each need one
+ * (an off-chain claim verified off chain takes two). */
 char *myotis_ens_record_json(int64_t handle, const char *params_json);
 /* Block JSON, the literal "null", or {"error"}. full_transactions selects
  * decoded tx objects over hashes. */
