@@ -87,6 +87,10 @@ multi-record return shape.
 Switching to UR happens in Phase 4 once `DefaultEvmExecutor` learns to
 catch and handle ERC-3668 reverts.
 
+*As built:* neither engine resolves through the UR (Phase 4's status note).
+Since ENSv2 (#671) the Rust engine asks it which resolver answers a name ENSv2
+decides (`findResolver`), and reads the records from that resolver itself.
+
 ## Module layout
 
 ```

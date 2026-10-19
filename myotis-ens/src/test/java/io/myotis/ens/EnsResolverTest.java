@@ -201,6 +201,69 @@ class EnsResolverTest {
     }
 
     @Test
+    void recordAndReverseReadsOfANameEnsv2DecidesAreRefused() {
+        // #671 part 2, owner decision 3: the Java engine reads v1 only. For a name ENSv2
+        // decides, v1's answer would be the ENSV2Resolver bridge's or a stale entry's, so
+        // the read is refused rather than answered. Nothing of v1 is programmed.
+        var mock = new MockExecutor();
+        var resolver = ensv2Resolver(mock, "myotis.eth", V2_RESOLVER);
+        var e = assertThrows(java.util.concurrent.ExecutionException.class,
+                () -> resolver.resolveAddress("myotis.eth", ctx()).get());
+        assertTrue(e.getCause() instanceof UnsupportedOperationException, String.valueOf(e.getCause()));
+        assertEquals(EnsResolver.ENSV2_NAMES, e.getCause().getMessage());
+
+        // Reverse: ENSv2 names a resolver of its own for the reverse name.
+        var rev = new MockExecutor();
+        var revResolver = ensv2Resolver(rev, ReverseLookup.nameFor(VITALIK), V2_RESOLVER);
+        var r = assertThrows(java.util.concurrent.ExecutionException.class,
+                () -> revResolver.resolveName(VITALIK, ctx()).get());
+        assertEquals(EnsResolver.ENSV2_NAMES, r.getCause().getMessage());
+    }
+
+    @Test
+    void onSepoliasLayoutAReverseClaimOfAnEnsv2NameIsRefusedByTheForwardCheck() {
+        // Sepolia today: ENSv2 hands the `reverse` subtree to its v1 mirror, so the claim
+        // is read from v1 (the `reverse` node's wildcard resolver answers myotis.eth); the
+        // claimed name itself is ENSv2's, so its forward check is refused, not guessed.
+        var mock = new MockExecutor();
+        String reverseName = ReverseLookup.nameFor(VITALIK);
+        var resolver = ensv2Resolver(mock, reverseName, MIRROR);
+        mock.respond(UR, AbiEncoder.encodeCall(FunctionSignature.of("findResolver(bytes)"),
+                        AbiEncoder.bytes(DnsEncoder.encode("myotis.eth"))),
+                AbiEncoder.encodeRaw(AbiEncoder.address(V2_RESOLVER), AbiEncoder.bytes32(new byte[32]),
+                        AbiEncoder.uint256(0)));
+        mock.respond(REGISTRY, callRegistryResolver(reverseName), encodeAddress(Address.ZERO));
+        mock.respond(REGISTRY, callRegistryResolver("addr.reverse"), encodeAddress(Address.ZERO));
+        mock.respond(REGISTRY, callRegistryResolver("reverse"), encodeAddress(WILDCARD_RESOLVER));
+        mock.respond(WILDCARD_RESOLVER, callSupportsExtended(), encodeBool(true));
+        mock.respond(WILDCARD_RESOLVER, resolveCalldata(reverseName, callResolverName(reverseName)),
+                encodeBytes(encodeString("myotis.eth")));
+
+        var e = assertThrows(java.util.concurrent.ExecutionException.class,
+                () -> resolver.resolveName(VITALIK, ctx()).get());
+        assertEquals(EnsResolver.ENSV2_NAMES, e.getCause().getMessage());
+    }
+
+    @Test
+    void aRecordReadWhoseEnsv2CheckCannotRunFailsInsteadOfReadingV1() {
+        var mock = new MockExecutor();
+        mock.failOn(UR, AbiEncoder.encodeCall(FunctionSignature.of("ROOT_REGISTRY()")),
+                new IllegalStateException("state unavailable"));
+        var e = assertThrows(java.util.concurrent.ExecutionException.class,
+                () -> new EnsResolver(mock, REGISTRY, UR).resolveAddress("vitalik.eth", ctx()).get());
+        assertTrue(e.getCause() instanceof IllegalStateException, String.valueOf(e.getCause()));
+    }
+
+    @Test
+    void aNameEnsv2HandsToItsV1MirrorIsReadThroughTheV1Walk() throws Exception {
+        // ens.eth on Sepolia: not migrated, so v1's own resolver answers, as before.
+        var mock = new MockExecutor();
+        programLegacy(mock, "ens.eth", innerAddr("ens.eth"), encodeAddress(VITALIK));
+        var resolver = ensv2Resolver(mock, "ens.eth", MIRROR);
+        assertEquals(Optional.of(VITALIK), resolver.resolveAddress("ens.eth", ctx()).get());
+    }
+
+    @Test
     void aStaleV1EntryEnsv2KnowsNoResolverForIsRefused() {
         // alice.eth on Sepolia: expired, still holding a v1 resolver, unknown to ENSv2.
         var mock = new MockExecutor();
@@ -414,7 +477,8 @@ class EnsResolverTest {
         EvmExecutionException eee = causeOf(resolver.resolveAddress("vitalik.eth", ctx()));
         org.junit.jupiter.api.Assertions.assertInstanceOf(
                 EvmExecutionError.UnsupportedFork.class, eee.error());
-        assertEquals(1, mock.callCount(), "the walk stops at the failure");
+        assertEquals(2, mock.callCount(),
+                "the walk stops at the failure (after the Universal Resolver's ENSv2 check)");
         // Every record lookup shares the walk.
         eee = causeOf(resolver.resolveText("vitalik.eth", "url", ctx()));
         org.junit.jupiter.api.Assertions.assertInstanceOf(
@@ -714,8 +778,9 @@ class EnsResolverTest {
         var resolver = new EnsResolver(mock, REGISTRY, UR);
         Optional<String> result = resolver.resolveName(VITALIK, ctx()).get();
         assertTrue(result.isEmpty());
-        assertEquals(3, mock.callCount(),
-                "no resolver up the reverse tree ends after the three registry reads");
+        assertEquals(4, mock.callCount(),
+                "no resolver up the reverse tree ends after the Universal Resolver's ENSv2 check"
+                        + " and the three registry reads");
     }
 
     @Test
@@ -1119,6 +1184,12 @@ class EnsResolverTest {
                         new EvmExecutionError.Reverted(revertData)));
             }
             byte[] response = responses.get(key);
+            if (response == null && key.equals(UR_ROOT_REGISTRY)) {
+                // Mainnet today: the Universal Resolver names no ENSv2 root, so v1 decides
+                // every name. ENSv2 tests program the call.
+                return CompletableFuture.failedFuture(new EvmExecutionException(
+                        new EvmExecutionError.Reverted(new byte[0])));
+            }
             if (response == null) {
                 return CompletableFuture.failedFuture(new AssertionError(
                         "MockExecutor: no response programmed for callView(target="
@@ -1127,6 +1198,9 @@ class EnsResolverTest {
             }
             return CompletableFuture.completedFuture(response);
         }
+
+        private static final Key UR_ROOT_REGISTRY = new Key(UR, HexFormat.of().formatHex(
+                AbiEncoder.encodeCall(FunctionSignature.of("ROOT_REGISTRY()"))));
 
         private record Key(Address target, String calldataHex) {
             Key {
