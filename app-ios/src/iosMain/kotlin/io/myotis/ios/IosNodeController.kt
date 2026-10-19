@@ -487,7 +487,7 @@ class IosNodeController(
             "ok" -> EnsOwnership(
                 n, o.engineString("registrantHex"), o.engineString("managerHex"), o.engineBoolean("wrapped"),
                 o.engineString("resolverHex"), o.engineLong("expiresAt", -1L), o.engineLong("gracePeriodSeconds", -1L),
-                blockNumber, verified, null,
+                blockNumber, verified, null, ensv2 = o.engineBoolean("ensv2"),
             )
             "noRecord" -> EnsOwnership(n, null, null, false, null, -1L, -1L, blockNumber, verified, null)
             // Unreachable for ownership (its reads never go off-chain); mapped as the record

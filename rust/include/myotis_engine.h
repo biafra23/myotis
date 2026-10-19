@@ -34,7 +34,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 47
+#define MYOTIS_ABI_VERSION 48
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -282,7 +282,10 @@ char *myotis_resolve_ens_json(int64_t handle, const char *name);
  * "resolverHex","expiresAt","gracePeriodSeconds"}: the registry's owner and
  * resolver and, for a .eth second-level name, the registrar's registrant,
  * expiry and grace period, seen through the NameWrapper; an absent part is
- * left out. An older engine answers "unknown ens method". */
+ * left out. An older engine answers "unknown ens method".
+ * v48: "ensv2":true when the answer was read from ENSv2's registries (#671):
+ * "registrantHex" is the label's owner, no "managerHex", "gracePeriodSeconds"
+ * 0; absent for a v1 answer. */
 char *myotis_ens_record_json(int64_t handle, const char *params_json);
 /* Block JSON, the literal "null", or {"error"}. full_transactions selects
  * decoded tx objects over hashes. */

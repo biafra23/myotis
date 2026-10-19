@@ -186,7 +186,8 @@ final class RustEnsApi implements EnsApi {
         }
     }
 
-    /** ABI ≥ 42: absent parts are left out of the JSON, never null. */
+    /** ABI ≥ 42: absent parts are left out of the JSON, never null; ABI ≥ 48: {@code "ensv2":true}
+     *  marks an answer read from ENSv2's registries (absent = v1). */
     static EnsOwnershipResult ownershipFromJson(String name, String json) {
         Parsed p = Parsed.of(json);
         return switch (p.status) {
@@ -198,7 +199,7 @@ final class RustEnsApi implements EnsApi {
                     p.optionalString("resolverHex"),
                     p.optionalLong("expiresAt"),
                     p.optionalLong("gracePeriodSeconds"),
-                    p.block, p.timestamp, p.verified, null);
+                    p.block, p.timestamp, p.verified, null, p.optionalTrue("ensv2"));
             case "noRecord" -> new EnsOwnershipResult(
                     name, null, null, false, null, -1, -1, p.block, p.timestamp, p.verified, null);
             case "offchain" -> new EnsOwnershipResult(
@@ -482,6 +483,16 @@ final class RustEnsApi implements EnsApi {
             } catch (RuntimeException e) {
                 throw new EngineException("ens-record JSON: " + key + " is not an integer", e);
             }
+        }
+
+        /** An optional boolean flag: absent is false, anything but a boolean is shape drift. */
+        boolean optionalTrue(String key) {
+            var v = o.get(key);
+            if (v == null || v.isNull()) return false;
+            if (!v.isBoolean()) {
+                throw new EngineException("ens-record JSON: " + key + " is not a boolean");
+            }
+            return v.asBoolean();
         }
 
         boolean requireBoolean(String key) {

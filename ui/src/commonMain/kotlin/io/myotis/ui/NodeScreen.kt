@@ -2331,7 +2331,8 @@ private fun EnsResultView(
                 else -> SelectionContainer {
                     Column {
                         val style = MaterialTheme.typography.bodySmall
-                        o.registrantHex?.let { Text("Registrant: $it", style = style) }
+                        if (o.ensv2) Text("Read from ENSv2's registries.", style = MaterialTheme.typography.labelSmall)
+                        o.registrantHex?.let { Text((if (o.ensv2) "Owner: " else "Registrant: ") + it, style = style) }
                         o.managerHex?.let { Text("Manager: $it" + if (o.wrapped) " (wrapped)" else "", style = style) }
                         o.resolverHex?.let { Text("Resolver: $it", style = style) }
                         if (o.expiresAt >= 0) {

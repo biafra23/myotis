@@ -226,7 +226,7 @@ class AndroidNodeController(
         return svc.resolveEnsOwnership(network, name).await().let { r ->
             EnsOwnership(
                 r.name(), r.registrantHex(), r.managerHex(), r.wrapped(), r.resolverHex(),
-                r.expiresAt(), r.gracePeriodSeconds(), r.blockNumber(), r.verified(), r.error(),
+                r.expiresAt(), r.gracePeriodSeconds(), r.blockNumber(), r.verified(), r.error(), r.ensv2(),
             )
         }
     }

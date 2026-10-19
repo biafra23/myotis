@@ -322,7 +322,8 @@ complete on its own.
   ENSv2 root (Sepolia today) and does not hand a name to its v1 mirror, the
   Java engine's record, reverse and ownership reads fail with
   `EnsResolver.ENSV2_NAMES` / `ENSV2_OWNERSHIP`; the Rust engine reads records
-  and reverse claims from the resolver `findResolver` names. Parity would mean
-  the same `findResolver` step in `EnsResolver.dispatchResolve` and
-  `resolveName` — revisit if the Java engine ever serves a network with ENSv2
+  and reverse claims from the resolver `findResolver` names, and ownership from
+  ENSv2's registries (status, owner, expiry; `ensv2` in the result). Parity
+  would mean the same `findResolver` step in `EnsResolver.dispatchResolve` and
+  `resolveName`, and the registry walk in `resolveOwnership` — revisit if the Java engine ever serves a network with ENSv2
   for real users (the `auto` selection runs the Rust engine wherever it can).

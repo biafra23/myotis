@@ -383,6 +383,8 @@ data class EnsProfile(val name: String, val records: List<EnsRecord>)
  * (the registrar's `ownerOf` reverts from the expiry on, grace period included); no
  * manager when the registry holds no owner. [expiresAt] and [gracePeriodSeconds] are
  * -1 where there is no registrar entry. [error] null with nothing set = nothing on chain.
+ * [ensv2]: read from ENSv2's registries (#671) — [registrantHex] is the label's owner, there
+ * is no [managerHex] (per-name roles replace v1's registry owner) and no grace period.
  */
 data class EnsOwnership(
     val name: String,
@@ -395,6 +397,7 @@ data class EnsOwnership(
     val blockNumber: Long,           // -1 when none
     val verified: Boolean,           // true iff beacon-verified finalized state
     val error: String?,              // null unless the read itself failed
+    val ensv2: Boolean = false,      // read from ENSv2's registries
 ) {
     /** Something is on chain for the name — a holder, a resolver or an expiry. Whether a `.eth`
      *  name is TAKEN is a question of time ([expiresAt] + [gracePeriodSeconds] against the clock). */

@@ -726,6 +726,8 @@ public class CommandHandler {
             if (r.expiresAt() >= 0) sb.append(",\"expiresAt\":").append(r.expiresAt());
             // -1 = the registrar's GRACE_PERIOD() was unanswered; the field is seconds or absent.
             if (r.gracePeriodSeconds() >= 0) sb.append(",\"gracePeriodSeconds\":").append(r.gracePeriodSeconds());
+            // #671: read from ENSv2's registries (registrant = the label's owner, no manager).
+            if (r.ensv2()) sb.append(",\"ensv2\":true");
             return sb.append('}').toString();
         } catch (EngineException | IllegalStateException e) {
             return jsonError(e.getMessage());

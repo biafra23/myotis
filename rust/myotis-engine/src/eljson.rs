@@ -666,7 +666,8 @@ pub fn ens_json(outcome: &EnsOutcome) -> String {
 ///   `name` (reverse), or — ABI ≥ 42, the one shape with OPTIONAL keys —
 ///   `registrantHex` / `managerHex` / `wrapped` / `resolverHex` / `expiresAt` /
 ///   `gracePeriodSeconds` (ownership; only `wrapped` is always present, an
-///   absent part is left out rather than null).
+///   absent part is left out rather than null; ABI ≥ 48 adds `"ensv2": true`
+///   for an answer read from ENSv2's registries, absent otherwise).
 /// - `{"status":"noRecord","blockNumber":N,"blockTimestamp":T,"verified":b}`
 /// - `{"status":"offchain","blockNumber":N,"blockTimestamp":T,"verified":b}`
 ///
@@ -721,6 +722,10 @@ pub fn ens_record_json(outcome: &EnsQueryOutcome) -> String {
                     }
                     if let Some(g) = o.grace_period {
                         obj.insert("gracePeriodSeconds".into(), json_u64(g));
+                    }
+                    // ABI ≥ 48 (#671): read from ENSv2's registries; absent for v1.
+                    if o.ensv2 {
+                        obj.insert("ensv2".into(), true.into());
                     }
                 }
             }
@@ -1486,6 +1491,7 @@ mod tests {
                 resolver: Some([0x23; 20]),
                 expires_at: Some(1_823_155_031),
                 grace_period: Some(7_776_000),
+                ensv2: false,
             }),
             block_number: 21_000_010,
             block_timestamp: 1_760_000_000,
@@ -1509,6 +1515,7 @@ mod tests {
                 resolver: None,
                 expires_at: None,
                 grace_period: None,
+                ensv2: false,
             }),
             block_number: 21_000_010,
             block_timestamp: 1_760_000_000,
@@ -1518,6 +1525,27 @@ mod tests {
         assert!(sub.get("registrantHex").is_none());
         assert!(sub.get("expiresAt").is_none());
         assert_eq!(sub["wrapped"], true);
+        assert!(own.get("ensv2").is_none(), "a v1 answer carries no ensv2 key");
+        // ABI 48: an answer read from ENSv2's registries (#671).
+        let v2: serde_json::Value = serde_json::from_str(&ens_record_json(&EnsQueryOutcome::Value {
+            value: EnsRecordValue::Ownership(myotis_evm::EnsOwnership {
+                registrant: Some([0x51; 20]),
+                manager: None,
+                wrapped: false,
+                resolver: Some([0x5e; 20]),
+                expires_at: Some(1_980_874_152),
+                grace_period: Some(0),
+                ensv2: true,
+            }),
+            block_number: 11_947_300,
+            block_timestamp: 1_760_000_000,
+            verified: true,
+        }))
+        .unwrap();
+        assert_eq!(v2["ensv2"], true);
+        assert!(v2.get("managerHex").is_none());
+        assert_eq!(v2["registrantHex"], format!("0x{}", "51".repeat(20)));
+        assert_eq!(v2["gracePeriodSeconds"], 0u64);
     }
 
     fn sample_code() -> VerifiedCode {

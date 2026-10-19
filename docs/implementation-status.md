@@ -98,9 +98,8 @@ CCIP-Read end-to-end: `OffchainLookup` reverts caught by `CcipReadEvmExecutor` (
 **ENSv2 (#671), in progress.** Sepolia runs on ENSv2: its v1 contracts "still exist but are no longer in use". Where ENS's Universal Resolver (`0xeEeE…EeEe`, one address on mainnet and Sepolia) names an ENSv2 root registry — Sepolia today, mainnet once ENSv2 activates there; chain state decides, no release — a name ENSv2 does not hand to its v1 mirror (pinned per chain: Sepolia's `ENSV1Resolver`; a resolver that merely claims to be the mirror does not count) is ENSv2's:
 - **Rust engine:** records and reverse claims of such a name are read from the resolver the Universal Resolver's `findResolver` names, called directly — the UR only says who answers, so an off-chain name still asks its own gateway, never ENS's batch gateway. A stale v1 entry for the name, or the `ENSV2Resolver` bridge v1 sets on `eth`, is never consulted.
 - **Java engine:** refuses such reads (owner decision, 2026-10-19; [TODO.md](TODO.md)).
-- **Both:** a name the mirror covers (not migrated yet) is read from v1 as before; an address without a reverse resolver of its own is asked of the `reverse` node's wildcard resolver, which answers v2 primary names (on mainnet too, for a name it keeps); ownership of an ENSv2 name is refused, since v1's registry and registrar would read it as unowned.
-
-Still to come: ownership read from ENSv2 (Rust engine).
+- **Both:** a name the mirror covers (not migrated yet) is read from v1 as before; an address without a reverse resolver of its own is asked of the `reverse` node's wildcard resolver, which answers v2 primary names (on mainnet too, for a name it keeps).
+- **Ownership:** the Rust engine reads it from ENSv2's registries, whose own status of each label decides — RESERVED is v1's (read as before), REGISTERED is answered from ENSv2 (`ensv2`, ABI 48: the label's owner, no manager, no grace period), anything else is nothing on chain. No pinned address is involved, so mainnet's activation needs no release here. The Java engine refuses ENSv2 names' ownership.
 
 Network coverage: mainnet and Sepolia (`NetworkConfig.hasEns`); on Gnosis, Genome's `.gno` names through the same resolver (forward records and ownership; reverse lookups are refused). (`EnsResolver.forChainId` still carries holesky's addresses, dead code since the network was retired.)
 

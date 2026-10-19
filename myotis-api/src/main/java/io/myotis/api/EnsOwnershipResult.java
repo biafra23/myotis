@@ -32,6 +32,13 @@ package io.myotis.api;
  *                           none (a failed read, or an engine that does not report it)
  * @param verified           true iff resolved against beacon-finalized state
  * @param error              null on success
+ * @param ensv2              read from ENSv2's registries (#671): {@code registrantHex} is the
+ *                           label's owner, {@code managerHex} null (per-name roles replace
+ *                           v1's single registry owner), {@code wrapped} false,
+ *                           {@code resolverHex} the registry's entry for the label, and
+ *                           {@code gracePeriodSeconds} 0 — an ENSv2 label is free from its
+ *                           expiry on. False for a v1 answer and from an engine that does not
+ *                           read ENSv2.
  */
 public record EnsOwnershipResult(
         String name,
@@ -44,5 +51,14 @@ public record EnsOwnershipResult(
         long blockNumber,
         long blockTimestamp,
         boolean verified,
-        String error) {
+        String error,
+        boolean ensv2) {
+
+    /** A v1 answer (or a refusal): {@code ensv2} false. The pre-#671 shape, kept for callers. */
+    public EnsOwnershipResult(String name, String registrantHex, String managerHex, boolean wrapped,
+                              String resolverHex, long expiresAt, long gracePeriodSeconds,
+                              long blockNumber, long blockTimestamp, boolean verified, String error) {
+        this(name, registrantHex, managerHex, wrapped, resolverHex, expiresAt, gracePeriodSeconds,
+                blockNumber, blockTimestamp, verified, error, false);
+    }
 }

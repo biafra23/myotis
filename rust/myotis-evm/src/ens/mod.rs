@@ -234,8 +234,8 @@ pub enum EnsError {
     /// The query is outside what this engine can answer for this chain — a
     /// non-`.gno` name on Gnosis Chain, or a reverse lookup there (Genome keeps
     /// reverse records outside the tree this resolver reads), refused before any
-    /// call; or the ownership of a name ENSv2 decides ([`ENSV2_OWNERSHIP`]),
-    /// refused once chain state shows it; or any read where ENSv2's Universal
+    /// call; or an ownership read ENSv2's registries cannot answer
+    /// ([`ENSV2_UNREADABLE`]); or any read where ENSv2's Universal
     /// Resolver gives no usable answer ([`UR_UNUSABLE`]). Never answered as "no
     /// record".
     Unsupported(&'static str),
@@ -247,12 +247,11 @@ pub const ONLY_GNO_NAMES: &str = "only .gno names resolve on Gnosis Chain";
 /// The refusal for a reverse lookup on Gnosis Chain (Java parity).
 pub const NO_GNO_REVERSE: &str = "reverse resolution is not supported for .gno names";
 
-/// The ownership refusal for a name ENSv2 decides (#671), registered there or
-/// not: the v1 registry and registrar no longer speak for it, and this engine
-/// does not read ENSv2's registries yet. Answering from v1 would show a name
-/// registered in ENSv2 as unowned, or a stale v1 holder as its owner.
-pub const ENSV2_OWNERSHIP: &str =
-    "ENSv2 decides this name's ownership, and this engine does not read ENSv2 yet";
+/// The ownership refusal where ENSv2 is live but its registries give no usable
+/// answer for a label on the name's path (a `getStatus` that reverts, or a status
+/// outside AVAILABLE / RESERVED / REGISTERED). Answering from v1 instead would
+/// show a name registered in ENSv2 as unowned, or a stale v1 holder as its owner.
+pub const ENSV2_UNREADABLE: &str = "ENSv2's registries gave no usable answer for this name";
 
 /// The decoded ERC-3668 `OffchainLookup(address,string[],bytes,bytes4,bytes)`
 /// revert body (Java `OffchainLookupRevert` twin — same bounds: body ≥ 160
@@ -311,6 +310,12 @@ pub struct EnsOwnership {
     /// The registrar's `GRACE_PERIOD` (seconds past `expires_at` in which only
     /// the registrant may renew), read alongside `expires_at`.
     pub grace_period: Option<u64>,
+    /// Read from ENSv2's registries (#671), which hold one owner per label:
+    /// `registrant` is the label's token owner, `manager` is None (per-name roles
+    /// replace v1's single registry owner), `wrapped` is false, `resolver` is the
+    /// registry's entry for the label, and `grace_period` is 0 — an ENSv2 label is
+    /// AVAILABLE from its expiry on.
+    pub ensv2: bool,
 }
 
 /// The verified-`eth_call` capability the resolver reads through. Implemented for
@@ -380,8 +385,11 @@ pub fn resolve_address(
 /// and the record reads of one input answer about the same node.
 /// On a chain without a known NameWrapper a wrapped name's holders read as the
 /// wrapper contract itself and `wrapped` stays false — the chain's own answer.
-/// A name ENSv2 decides is refused ([`ENSV2_OWNERSHIP`], #671): v1's registry
-/// and registrar would read it as unowned or name a stale holder.
+/// Where ENSv2 is live (its Universal Resolver names a root registry), ENSv2's
+/// registries decide first ([`ensv2_ownership`], #671): a name they hand to v1
+/// (RESERVED) is read as above, any other is answered from ENSv2
+/// (`ensv2: true`) — v1's registry and registrar would read a name registered
+/// there as unowned, or name a stale holder.
 pub fn resolve_ownership(
     caller: &dyn EthCaller,
     name: &str,
@@ -407,8 +415,13 @@ pub fn resolve_ownership(
     let ns = Namespace::for_chain(chain_id);
     let node = ns.node(name)?;
     let wrapper = name_wrapper(chain_id);
-    if authority(caller, &ns, &dns)? != Authority::V1 {
-        return Err(EnsError::Unsupported(ENSV2_OWNERSHIP));
+    if let Some(ur) = ns.universal_resolver {
+        if let Some(root) = call_address(caller, ur, &abi::encode_call_no_args("ROOT_REGISTRY()"))? {
+            match ensv2_ownership(caller, root, &dns)? {
+                Ensv2Ownership::V1 => {}
+                Ensv2Ownership::Answer(o) => return Ok(o),
+            }
+        }
     }
 
     let owner =
@@ -452,7 +465,91 @@ pub fn resolve_ownership(
     if owner.is_none() && resolver.is_none() && registrant.is_none() && expires_at.is_none() {
         return Ok(None);
     }
-    Ok(Some(EnsOwnership { registrant, manager, wrapped, resolver, expires_at, grace_period }))
+    Ok(Some(EnsOwnership {
+        registrant,
+        manager,
+        wrapped,
+        resolver,
+        expires_at,
+        grace_period,
+        ensv2: false,
+    }))
+}
+
+/// What ENSv2's registries say about a name's ownership.
+enum Ensv2Ownership {
+    /// v1 decides: the name, or the ancestor it hangs under, is RESERVED in
+    /// ENSv2 — a v1 name not migrated yet.
+    V1,
+    /// ENSv2's own answer: `None` = nothing registered for the name.
+    Answer(Option<EnsOwnership>),
+}
+
+/// `IPermissionedRegistry.Status`, as `getStatus(uint256)` answers it.
+const STATUS_AVAILABLE: u64 = 0;
+const STATUS_RESERVED: u64 = 1;
+const STATUS_REGISTERED: u64 = 2;
+
+/// Read a name's ownership from ENSv2's registries (#671), down from `root` one
+/// label at a time (`eth`, then `myotis` for `myotis.eth`). At each label the
+/// registry's own `getStatus(labelhash)` decides, a status no name owner can
+/// mint: RESERVED hands the name — and everything under it — to v1 (a name not
+/// migrated yet); AVAILABLE is nothing registered (never registered, or expired:
+/// ENSv2 has no grace period); REGISTERED is ENSv2's, answered for the name
+/// itself, or followed into the label's subregistry (none = nothing below). A
+/// status that cannot be read fails the read ([`ENSV2_UNREADABLE`]): it is never
+/// guessed as v1's.
+fn ensv2_ownership(caller: &dyn EthCaller, root: [u8; 20], dns: &[u8]) -> Result<Ensv2Ownership, EnsError> {
+    // The labels exactly as the Universal Resolver walks them: dns_encode's wire
+    // form (lowercased, one trailing root dot stripped), deepest label first.
+    let mut labels = Vec::new();
+    let mut at = 0;
+    while let Some(&len) = dns.get(at) {
+        if len == 0 {
+            break;
+        }
+        let label = dns.get(at + 1..at + 1 + len as usize).ok_or(EnsError::InvalidName("malformed wire name"))?;
+        labels.push(label);
+        at += 1 + len as usize;
+    }
+    let mut registry = root;
+    for (depth, label) in labels.iter().enumerate().rev() {
+        let id = myotis_core::keccak::keccak256(label);
+        let status = match caller.eth_call(registry, &abi::encode_call_bytes32("getStatus(uint256)", &id)) {
+            Ok(out) => abi::decode_u64(&out),
+            Err(EvmError::Reverted { .. }) => None,
+            Err(e) => return Err(EnsError::Call(e)),
+        };
+        match status {
+            Some(STATUS_RESERVED) => return Ok(Ensv2Ownership::V1),
+            Some(STATUS_AVAILABLE) => return Ok(Ensv2Ownership::Answer(None)),
+            Some(STATUS_REGISTERED) if depth == 0 => {
+                let owner = call_address(caller, registry, &abi::encode_call_bytes("findOwner(string)", label))?;
+                let resolver =
+                    call_address(caller, registry, &abi::encode_call_bytes("getResolver(string)", label))?;
+                let expires_at =
+                    call_u64(caller, registry, &abi::encode_call_bytes("findExpiry(string)", label))?.filter(|e| *e > 0);
+                return Ok(Ensv2Ownership::Answer(Some(EnsOwnership {
+                    registrant: owner,
+                    manager: None,
+                    wrapped: false,
+                    resolver,
+                    expires_at,
+                    grace_period: Some(0),
+                    ensv2: true,
+                })));
+            }
+            Some(STATUS_REGISTERED) => {
+                match call_address(caller, registry, &abi::encode_call_bytes("getSubregistry(string)", label))? {
+                    Some(sub) => registry = sub,
+                    None => return Ok(Ensv2Ownership::Answer(None)),
+                }
+            }
+            _ => return Err(EnsError::Unsupported(ENSV2_UNREADABLE)),
+        }
+    }
+    // The root name itself: nothing ENSv2 registers.
+    Ok(Ensv2Ownership::Answer(None))
 }
 
 /// Who speaks for a name (#671).
@@ -2014,39 +2111,6 @@ mod tests {
     }
 
     #[test]
-    fn ownership_of_a_name_ensv2_decides_is_refused_before_any_v1_read() {
-        // myotis.eth on Sepolia: registered in ENSv2 only. v1 would read it as
-        // unowned, so nothing of v1 is asked. The name reaches the Universal
-        // Resolver lowercased, as the registries hash it.
-        let dns = dns_encode("myotis.eth").unwrap();
-        let caller = ensv2_chain(MockCaller::new().on_chain(11_155_111), dns, V2_RESOLVER).on(|t, _| {
-            (t == REGISTRY || t == BASE_REGISTRAR).then(|| panic!("v1 read for an ENSv2 name"))
-        });
-        assert_eq!(
-            resolve_ownership(&caller, "Myotis.eth", 11_155_111),
-            Err(EnsError::Unsupported(ENSV2_OWNERSHIP))
-        );
-    }
-
-    #[test]
-    fn a_name_ensv2_hands_to_its_v1_mirror_keeps_its_v1_ownership() {
-        // Not migrated (ens.eth on Sepolia): ENSv2 resolves it through the v1
-        // mirror, so v1's registry and registrar still decide it.
-        let dns = dns_encode("ens.eth").unwrap();
-        let caller = with_v1_ownership(
-            ensv2_chain(MockCaller::new().on_chain(11_155_111), dns, MIRROR),
-            USER,
-            RESOLVER,
-            Some(USER),
-            1_823_155_031,
-        );
-        let o = resolve_ownership(&caller, "ens.eth", 11_155_111).unwrap().unwrap();
-        assert_eq!(o.registrant, Some(USER));
-        assert_eq!(o.resolver, Some(RESOLVER));
-        assert_eq!(o.expires_at, Some(1_823_155_031));
-    }
-
-    #[test]
     fn the_universal_resolver_pin_matches_the_java_engine() {
         // Byte-for-byte the Java EnsAddresses.UNIVERSAL_RESOLVER. A typo would fail
         // OPEN: a codeless account answers ROOT_REGISTRY() with nothing, read as "no
@@ -2064,52 +2128,6 @@ mod tests {
         assert_eq!(hex(ensv1_mirror(11_155_111).unwrap()), "322b7581ca210a69c6d0e0d7c88a7688d2789cb0");
         assert_eq!(ensv1_mirror(11_155_111), Some(MIRROR));
         assert_eq!(ensv1_mirror(1), None);
-    }
-
-    #[test]
-    fn a_resolver_that_only_claims_to_be_the_mirror_does_not_hand_the_name_to_v1() {
-        // #672 review: the name's ENSv2 owner sets its resolver and can make it
-        // answer REGISTRY_V1() with the v1 registry. Only the pinned mirror counts,
-        // or an ENSv2-only name would read as unowned again, on demand.
-        let dns = dns_encode("myotis.eth").unwrap();
-        let caller = ensv2_chain(MockCaller::new().on_chain(11_155_111), dns, SPOOF).on(|t, _| {
-            (t == REGISTRY || t == BASE_REGISTRAR).then(|| panic!("v1 read for an ENSv2 name"))
-        });
-        assert_eq!(
-            resolve_ownership(&caller, "myotis.eth", 11_155_111),
-            Err(EnsError::Unsupported(ENSV2_OWNERSHIP))
-        );
-    }
-
-    #[test]
-    fn where_ensv2_is_live_but_no_mirror_is_pinned_no_name_is_v1s() {
-        // Mainnet right after activation: the genuine mirror's address is not
-        // pinned yet, so even it is not taken as v1's word. Refusals, never v1
-        // answers for names ENSv2 may have taken over.
-        let dns = dns_encode("ens.eth").unwrap();
-        let caller = ensv2_chain(MockCaller::new().on_chain(1), dns, MIRROR).on(|t, _| {
-            (t == REGISTRY || t == BASE_REGISTRAR).then(|| panic!("v1 read for an ENSv2 name"))
-        });
-        assert_eq!(
-            resolve_ownership(&caller, "ens.eth", 1),
-            Err(EnsError::Unsupported(ENSV2_OWNERSHIP))
-        );
-    }
-
-    #[test]
-    fn a_mirror_of_another_registry_does_not_hand_the_name_to_v1() {
-        // REGISTRY_V1() must name THIS registry: a resolver mirroring some other
-        // registry is no evidence that this one decides the name.
-        let dns = dns_encode("ens.eth").unwrap();
-        let v1_sel = abi::selector("REGISTRY_V1()");
-        let caller = MockCaller::new()
-            .on_chain(11_155_111)
-            .on(move |t, cd| (t == MIRROR && sel(cd) == v1_sel).then(|| Ok(addr_word([0x77; 20]))));
-        let caller = ensv2_chain(caller, dns, MIRROR);
-        assert_eq!(
-            resolve_ownership(&caller, "ens.eth", 11_155_111),
-            Err(EnsError::Unsupported(ENSV2_OWNERSHIP))
-        );
     }
 
     #[test]
@@ -2345,21 +2363,172 @@ mod tests {
         assert_eq!(reverse_resolve(&caller, VITALIK).unwrap(), Some("myotis.eth".to_string()));
     }
 
+    // ---- ENSv2 ownership (#671 part 3): the registries' status decides ----
+
+    const ETH_REGISTRY: [u8; 20] = [0xd4; 20];
+    const SUB_REGISTRY: [u8; 20] = [0x5b; 20];
+
+    /// One label's ENSv2 entry: status, owner, expiry, resolver, subregistry.
+    #[derive(Clone, Copy)]
+    struct Entry(u64, [u8; 20], u64, [u8; 20], [u8; 20]);
+
+    /// ENSv2's registries on `chain`: the Universal Resolver names ROOT_V2, whose
+    /// `eth` is REGISTERED with ETH_REGISTRY below it; `entries` are (registry,
+    /// label, entry). Anything else a registry is asked reads as AVAILABLE.
+    fn ensv2_registries(chain: u64, entries: Vec<([u8; 20], &'static str, Entry)>) -> MockCaller {
+        let root_sel = abi::selector("ROOT_REGISTRY()");
+        let status_sel = abi::selector("getStatus(uint256)");
+        let owner_sel = abi::selector("findOwner(string)");
+        let expiry_sel = abi::selector("findExpiry(string)");
+        let resolver_sel = abi::selector("getResolver(string)");
+        let sub_sel = abi::selector("getSubregistry(string)");
+        let mut all = entries;
+        all.push((ROOT_V2, "eth", Entry(STATUS_REGISTERED, [0u8; 20], 0, [0u8; 20], ETH_REGISTRY)));
+        MockCaller::new()
+            .on_chain(chain)
+            .on(move |t, cd| (t == UNIVERSAL_RESOLVER && sel(cd) == root_sel).then(|| Ok(addr_word(ROOT_V2))))
+            .on(move |t, cd| {
+                let s = sel(cd);
+                if s == status_sel {
+                    let e = all.iter().find(|(r, l, _)| *r == t && cd[4..36] == myotis_core::keccak::keccak256(l.as_bytes()));
+                    return Some(Ok(u64_word(e.map_or(STATUS_AVAILABLE, |(_, _, e)| e.0))));
+                }
+                if ![owner_sel, expiry_sel, resolver_sel, sub_sel].contains(&s) {
+                    return None;
+                }
+                let asked = abi::decode_dynamic_bytes(&cd[4..], 0).unwrap();
+                let Entry(_, owner, expiry, resolver, sub) = all
+                    .iter()
+                    .find(|(r, l, _)| *r == t && l.as_bytes() == asked.as_slice())
+                    .map_or(Entry(STATUS_AVAILABLE, [0u8; 20], 0, [0u8; 20], [0u8; 20]), |(_, _, e)| *e);
+                Some(Ok(match s {
+                    x if x == owner_sel => addr_word(owner),
+                    x if x == expiry_sel => u64_word(expiry),
+                    x if x == resolver_sel => addr_word(resolver),
+                    _ => addr_word(sub),
+                }))
+            })
+    }
+
     #[test]
-    fn a_stale_v1_entry_ensv2_knows_no_resolver_for_is_refused() {
-        // alice.eth on Sepolia: expired, still holding a v1 resolver, unknown to
-        // ENSv2. v1's answer is stale, not v1's to give.
-        let dns = dns_encode("alice.eth").unwrap();
+    fn ownership_of_a_name_registered_in_ensv2_is_read_from_its_registry() {
+        // myotis.eth on Sepolia: REGISTERED in ENSv2 only. v1 would read it as
+        // unowned, so v1 is not asked; the name reaches the registries lowercased.
+        let caller = no_v1(ensv2_registries(
+            11_155_111,
+            vec![(ETH_REGISTRY, "myotis", Entry(STATUS_REGISTERED, USER, 1_980_874_152, V2_RESOLVER, [0u8; 20]))],
+        ));
+        let o = resolve_ownership(&caller, "Myotis.eth", 11_155_111).unwrap().unwrap();
+        assert!(o.ensv2);
+        assert_eq!(o.registrant, Some(USER));
+        assert_eq!(o.manager, None);
+        assert!(!o.wrapped);
+        assert_eq!(o.resolver, Some(V2_RESOLVER));
+        assert_eq!(o.expires_at, Some(1_980_874_152));
+        assert_eq!(o.grace_period, Some(0));
+    }
+
+    #[test]
+    fn a_name_reserved_in_ensv2_keeps_its_v1_ownership() {
+        // ens.eth on Sepolia: not migrated. RESERVED is the registry's own status,
+        // which no name owner can mint — unlike a resolver claiming to be a mirror.
         let caller = with_v1_ownership(
-            ensv2_chain(MockCaller::new().on_chain(11_155_111), dns, [0u8; 20]),
+            ensv2_registries(
+                11_155_111,
+                vec![(ETH_REGISTRY, "ens", Entry(STATUS_RESERVED, [0u8; 20], 1_853_483_388, MIRROR, [0u8; 20]))],
+            ),
             USER,
             RESOLVER,
             Some(USER),
-            1_785_054_756,
+            1_823_155_031,
+        );
+        let o = resolve_ownership(&caller, "ens.eth", 11_155_111).unwrap().unwrap();
+        assert!(!o.ensv2);
+        assert_eq!(o.registrant, Some(USER));
+        assert_eq!(o.resolver, Some(RESOLVER));
+        assert_eq!(o.expires_at, Some(1_823_155_031));
+        // The same holds on a chain with no pinned mirror (mainnet after activation).
+        let mainnet = with_v1_ownership(
+            ensv2_registries(1, vec![(ETH_REGISTRY, "ens", Entry(STATUS_RESERVED, [0u8; 20], 1, MIRROR, [0u8; 20]))]),
+            USER,
+            RESOLVER,
+            Some(USER),
+            1_823_155_031,
+        );
+        assert_eq!(resolve_ownership(&mainnet, "ens.eth", 1).unwrap().unwrap().registrant, Some(USER));
+    }
+
+    #[test]
+    fn a_name_available_in_ensv2_has_nothing_on_chain_whatever_v1_holds() {
+        // alice.eth on Sepolia: expired, still holding a v1 resolver, AVAILABLE in
+        // ENSv2. v1's entry is stale, so it is not read.
+        let caller = no_v1(ensv2_registries(
+            11_155_111,
+            vec![(ETH_REGISTRY, "alice", Entry(STATUS_AVAILABLE, [0u8; 20], 1_790_411_556, [0u8; 20], [0u8; 20]))],
+        ));
+        assert_eq!(resolve_ownership(&caller, "alice.eth", 11_155_111).unwrap(), None);
+    }
+
+    #[test]
+    fn subnames_follow_their_parents_status_and_subregistry() {
+        // Under a RESERVED parent the subtree is v1's.
+        let reserved = with_v1_ownership(
+            ensv2_registries(11_155_111, vec![(ETH_REGISTRY, "ens", Entry(STATUS_RESERVED, [0u8; 20], 1, MIRROR, [0u8; 20]))]),
+            USER,
+            RESOLVER,
+            None,
+            0,
+        );
+        let o = resolve_ownership(&reserved, "sub.ens.eth", 11_155_111).unwrap().unwrap();
+        assert!(!o.ensv2);
+        assert_eq!(o.manager, Some(USER));
+        // Under a REGISTERED parent without a subregistry there is nothing below.
+        let flat = no_v1(ensv2_registries(
+            11_155_111,
+            vec![(ETH_REGISTRY, "myotis", Entry(STATUS_REGISTERED, USER, 1, V2_RESOLVER, [0u8; 20]))],
+        ));
+        assert_eq!(resolve_ownership(&flat, "sub.myotis.eth", 11_155_111).unwrap(), None);
+        // With one, the subname is read there.
+        let nested = no_v1(ensv2_registries(
+            11_155_111,
+            vec![
+                (ETH_REGISTRY, "myotis", Entry(STATUS_REGISTERED, USER, 1, V2_RESOLVER, SUB_REGISTRY)),
+                (SUB_REGISTRY, "sub", Entry(STATUS_REGISTERED, VITALIK, 2_000_000_000, [0u8; 20], [0u8; 20])),
+            ],
+        ));
+        let s = resolve_ownership(&nested, "sub.myotis.eth", 11_155_111).unwrap().unwrap();
+        assert!(s.ensv2);
+        assert_eq!(s.registrant, Some(VITALIK));
+        assert_eq!(s.resolver, None);
+        assert_eq!(s.expires_at, Some(2_000_000_000));
+    }
+
+    #[test]
+    fn a_status_ensv2_cannot_give_fails_ownership_instead_of_guessing() {
+        // A getStatus that reverts or answers outside the enum is not v1's word.
+        let status_sel = abi::selector("getStatus(uint256)");
+        let caller = no_v1(
+            MockCaller::new()
+                .on_chain(11_155_111)
+                .on(move |t, cd| {
+                    (t == UNIVERSAL_RESOLVER && sel(cd) == abi::selector("ROOT_REGISTRY()"))
+                        .then(|| Ok(addr_word(ROOT_V2)))
+                })
+                .on(move |t, cd| (t == ROOT_V2 && sel(cd) == status_sel).then(revert)),
         );
         assert_eq!(
-            resolve_ownership(&caller, "alice.eth", 11_155_111),
-            Err(EnsError::Unsupported(ENSV2_OWNERSHIP))
+            resolve_ownership(&caller, "myotis.eth", 11_155_111),
+            Err(EnsError::Unsupported(ENSV2_UNREADABLE))
         );
+        let odd = no_v1(
+            MockCaller::new()
+                .on_chain(11_155_111)
+                .on(move |t, cd| {
+                    (t == UNIVERSAL_RESOLVER && sel(cd) == abi::selector("ROOT_REGISTRY()"))
+                        .then(|| Ok(addr_word(ROOT_V2)))
+                })
+                .on(move |t, cd| (t == ROOT_V2 && sel(cd) == status_sel).then(|| Ok(u64_word(7)))),
+        );
+        assert_eq!(resolve_ownership(&odd, "myotis.eth", 11_155_111), Err(EnsError::Unsupported(ENSV2_UNREADABLE)));
     }
 }

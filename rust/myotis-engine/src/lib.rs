@@ -311,7 +311,15 @@ uniffi::setup_scaffolding!();
 ///      bumped so a host that calls either is never paired with an engine
 ///      that lacks it. The JVM `RustEngineNative` wrapper, the iOS wrapper,
 ///      myotis-rpcd and the Node addon call it.
-pub const ABI_VERSION: i32 = 47;
+/// v48: ENS ownership answers carry `"ensv2": true` when they were read from
+///      ENSv2's registries (#671): where ENSv2 is live, the registries' own
+///      status decides — RESERVED is v1's and read as before, AVAILABLE is
+///      nothing on chain, REGISTERED is answered from ENSv2 (the label's owner
+///      as `registrantHex`, no `managerHex`, `gracePeriodSeconds` 0). A shape
+///      change — bumped so a host showing ownership is never paired with an
+///      engine whose answers it would misread as v1's. The JVM `RustEngineNative`
+///      wrapper and the iOS wrapper read it.
+pub const ABI_VERSION: i32 = 48;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.
