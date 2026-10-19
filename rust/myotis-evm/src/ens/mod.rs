@@ -407,7 +407,7 @@ pub fn resolve_ownership(
     let ns = Namespace::for_chain(chain_id);
     let node = ns.node(name)?;
     let wrapper = name_wrapper(chain_id);
-    if authority(caller, &ns, &dns)? != Authority::V1 {
+    if !matches!(authority(caller, &ns, &dns)?, Authority::V1(_)) {
         return Err(EnsError::Unsupported(ENSV2_OWNERSHIP));
     }
 
@@ -458,9 +458,9 @@ pub fn resolve_ownership(
 /// Who speaks for a name (#671).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Authority {
-    /// The v1 registry: ENSv2 is not live on this chain, or it hands the name to
-    /// its v1 mirror (a name not migrated yet).
-    V1,
+    /// The v1 registry: ENSv2 is not live on this chain (`None`), or it hands the
+    /// name to its v1 mirror (a name not migrated yet; ENSv2's root registry).
+    V1(Option<[u8; 20]>),
     /// ENSv2: the resolver its Universal Resolver names for the name, if any.
     Ensv2(Option<Ensv2Resolver>),
 }
@@ -495,11 +495,11 @@ pub const UR_UNUSABLE: &str = "the Universal Resolver's findResolver gave no usa
 /// an off-chain name still asks its own gateway, never ENS's batch gateway.
 fn authority(caller: &dyn EthCaller, ns: &Namespace, dns: &[u8]) -> Result<Authority, EnsError> {
     let Some(ur) = ns.universal_resolver else {
-        return Ok(Authority::V1);
+        return Ok(Authority::V1(None));
     };
-    if call_address(caller, ur, &abi::encode_call_no_args("ROOT_REGISTRY()"))?.is_none() {
-        return Ok(Authority::V1);
-    }
+    let Some(root) = call_address(caller, ur, &abi::encode_call_no_args("ROOT_REGISTRY()"))? else {
+        return Ok(Authority::V1(None));
+    };
     let out = match caller.eth_call(ur, &abi::encode_call_bytes("findResolver(bytes)", dns)) {
         Ok(out) => out,
         Err(EvmError::Reverted { .. }) => return Err(EnsError::Unsupported(UR_UNUSABLE)),
@@ -508,16 +508,21 @@ fn authority(caller: &dyn EthCaller, ns: &Namespace, dns: &[u8]) -> Result<Autho
     let Some(offset) = out.get(64..96).and_then(abi::decode_u64) else {
         return Err(EnsError::Unsupported(UR_UNUSABLE));
     };
-    let Some(resolver) = abi::decode_address(&out).filter(|a| a != &[0u8; 20]) else {
-        return Ok(Authority::Ensv2(None));
+    // A word that is no clean address is as unusable as a short answer (#676
+    // review); only a clean zero address is "ENSv2 names no resolver".
+    let Some(resolver) = abi::decode_address(&out) else {
+        return Err(EnsError::Unsupported(UR_UNUSABLE));
     };
+    if resolver == [0u8; 20] {
+        return Ok(Authority::Ensv2(None));
+    }
     // Only the pinned mirror hands a name to v1: a name's ENSv2 owner sets its
     // resolver and could make one answer REGISTRY_V1() too (#672 review).
     if Some(resolver) == ensv1_mirror(caller.chain_id())
         && call_address(caller, resolver, &abi::encode_call_no_args("REGISTRY_V1()"))?
             == Some(ns.registry)
     {
-        return Ok(Authority::V1);
+        return Ok(Authority::V1(Some(root)));
     }
     Ok(Authority::Ensv2(Some(Ensv2Resolver { resolver, exact: offset == 0 })))
 }
@@ -707,7 +712,7 @@ pub fn reverse_resolve(
     let name_call = abi::encode_call_bytes32("name(bytes32)", &rev_node);
 
     let raw = match authority(caller, &ns, &rev_dns)? {
-        Authority::V1 => v1_reverse_claim(caller, &ns, &rev_node, &rev_dns, &name_call)?,
+        Authority::V1(_) => v1_reverse_claim(caller, &ns, &rev_node, &rev_dns, &name_call)?,
         // The resolver ENSv2 names is probed for ENSIP-10 like any record's. The
         // no-probe rule protects v1's pre-ERC-165 reverse resolvers; should ENSv2
         // ever name one, the probe halts and the lookup fails loudly (an error,
@@ -844,7 +849,23 @@ fn resolve_record(
 
     let ns = Namespace::for_chain(caller.chain_id());
     let found = match authority(caller, &ns, &dns)? {
-        Authority::V1 => find_resolver(caller, name)?,
+        Authority::V1(None) => find_resolver(caller, name)?,
+        // Handed to v1 by ENSv2's mirror, the v1 walk may climb past the name to
+        // the bridge v1 sets on `eth` (ENSV2Resolver: it answers ROOT_REGISTRY()
+        // with ENSv2's root), which hands the name straight back to ENSv2 and
+        // answers off-chain names through ENS's batch gateway. A name with no v1
+        // resolver of its own up to that bridge has none set: no record (#676
+        // review). A genuine ancestor wildcard resolver answers as before.
+        Authority::V1(Some(root)) => match find_resolver(caller, name)? {
+            Some(info)
+                if !info.exact
+                    && call_address(caller, info.resolver, &abi::encode_call_no_args("ROOT_REGISTRY()"))?
+                        == Some(root) =>
+            {
+                None
+            }
+            found => found,
+        },
         Authority::Ensv2(None) => None,
         Authority::Ensv2(Some(Ensv2Resolver { resolver, exact })) => Some(ResolverInfo {
             resolver,
@@ -2272,6 +2293,67 @@ mod tests {
         assert_eq!(reverse_resolve(&reverted, VITALIK), Err(EnsError::Unsupported(UR_UNUSABLE)));
         let halted = ensv2_find_answers(Err(EvmError::Halted { reason: "state unavailable".into() }));
         assert!(matches!(resolve_address(&halted, "myotis.eth"), Err(EnsError::Call(EvmError::Halted { .. }))));
+    }
+
+    #[test]
+    fn a_find_resolver_word_that_is_no_clean_address_is_refused() {
+        // #676 review: only a clean zero word means "no resolver"; dirty upper bytes
+        // mean the answer is not what the contract promises.
+        let mut word = addr_word(V2_RESOLVER);
+        word[0] = 0x01;
+        word.extend_from_slice(&[0u8; 64]);
+        let caller = ensv2_find_answers(Ok(word));
+        assert_eq!(resolve_address(&caller, "myotis.eth"), Err(EnsError::Unsupported(UR_UNUSABLE)));
+    }
+
+    /// v1's `eth` bridge on Sepolia (ENSV2Resolver): ENSIP-10, answers ROOT_REGISTRY()
+    /// with ENSv2's root, and must never be asked a record (#676 review).
+    const BRIDGE: [u8; 20] = [0x1c; 20];
+
+    #[test]
+    fn a_mirrored_name_with_no_v1_resolver_of_its_own_stops_before_the_bridge() {
+        // ENSv2 hands old.eth to v1, whose registry holds no resolver for it; the walk
+        // climbs to `eth`, where the bridge would hand it back to ENSv2 and answer an
+        // off-chain name through ENS's batch gateway. No record instead.
+        let resolver_sel = abi::selector("resolver(bytes32)");
+        let supports_sel = abi::selector("supportsInterface(bytes4)");
+        let root_sel = abi::selector("ROOT_REGISTRY()");
+        let resolve_sel = abi::selector("resolve(bytes,bytes)");
+        let eth_node = namehash("eth");
+        let dns = dns_encode("old.eth").unwrap();
+        let caller = ensv2_chain(MockCaller::new().on_chain(11_155_111), dns, MIRROR)
+            .on(move |t, cd| {
+                (t == REGISTRY && sel(cd) == resolver_sel && cd[4..36] == eth_node).then(|| Ok(addr_word(BRIDGE)))
+            })
+            .on(move |t, cd| (t == REGISTRY && sel(cd) == resolver_sel).then(|| Ok(addr_word([0u8; 20]))))
+            .on(move |t, cd| (t == BRIDGE && sel(cd) == supports_sel).then(|| Ok(bool_word(true))))
+            .on(move |t, cd| (t == BRIDGE && sel(cd) == root_sel).then(|| Ok(addr_word(ROOT_V2))))
+            .on(move |t, cd| (t == BRIDGE && sel(cd) == resolve_sel).then(|| panic!("the bridge was asked")));
+        assert_eq!(resolve_address(&caller, "old.eth").unwrap(), None);
+    }
+
+    #[test]
+    fn a_mirrored_name_under_a_genuine_v1_wildcard_is_answered_by_it() {
+        // The stop is for the bridge alone: an ancestor's own ENSIP-10 resolver
+        // (no ROOT_REGISTRY()) answers a mirrored subname as before.
+        const WILD: [u8; 20] = [0x66; 20];
+        let resolver_sel = abi::selector("resolver(bytes32)");
+        let supports_sel = abi::selector("supportsInterface(bytes4)");
+        let root_sel = abi::selector("ROOT_REGISTRY()");
+        let resolve_sel = abi::selector("resolve(bytes,bytes)");
+        let parent = namehash("wild.eth");
+        let dns = dns_encode("sub.wild.eth").unwrap();
+        let caller = ensv2_chain(MockCaller::new().on_chain(11_155_111), dns, MIRROR)
+            .on(move |t, cd| {
+                (t == REGISTRY && sel(cd) == resolver_sel && cd[4..36] == parent).then(|| Ok(addr_word(WILD)))
+            })
+            .on(move |t, cd| (t == REGISTRY && sel(cd) == resolver_sel).then(|| Ok(addr_word([0u8; 20]))))
+            .on(move |t, cd| (t == WILD && sel(cd) == supports_sel).then(|| Ok(bool_word(true))))
+            .on(move |t, cd| (t == WILD && sel(cd) == root_sel).then(revert))
+            .on(move |t, cd| {
+                (t == WILD && sel(cd) == resolve_sel).then(|| Ok(dyn_bytes_return(&addr_word(USER))))
+            });
+        assert_eq!(resolve_address(&caller, "sub.wild.eth").unwrap(), Some(USER));
     }
 
     #[test]
