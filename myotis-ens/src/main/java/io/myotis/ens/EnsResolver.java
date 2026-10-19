@@ -725,7 +725,9 @@ public final class EnsResolver {
     /** IExtendedResolver (ENSIP-10) interface id — {@code resolve(bytes,bytes)} support. */
     private static final byte[] EXTENDED_RESOLVER_INTERFACE_ID = {(byte) 0x90, 0x61, (byte) 0xb9, 0x23};
     private static final long RESOLVER_CACHE_TTL_MS = 5 * 60 * 1000L;
-    /** Per (registry,name) resolver-discovery cache so repeated lookups skip the walk. */
+    /** Per (chain,registry,name) resolver-discovery cache so repeated lookups skip the walk.
+     *  The chain is part of the key: mainnet and Sepolia share the registry address, and one
+     *  process can serve both. */
     private static final java.util.concurrent.ConcurrentHashMap<String, CachedResolver> RESOLVER_CACHE =
             new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -736,11 +738,12 @@ public final class EnsResolver {
      * Find the resolver responsible for {@code name} via the registry (ENSIP-10
      * walk: exact node, then each parent, until a resolver is set) and detect
      * whether it implements ENSIP-10. All reads are snap/EVM — no gateway.
-     * Cached per registry+name for a few minutes. Empty when no resolver is set
+     * Cached per chain+registry+name for a few minutes. Empty when no resolver is set
      * anywhere up the chain.
      */
     private CompletableFuture<Optional<ResolverInfo>> findResolver(String name, BlockContext ctx) {
-        String cacheKey = registry.toHex() + ':' + name.toLowerCase(java.util.Locale.ROOT);
+        String cacheKey = ctx.chainId() + ":" + registry.toHex() + ':'
+                + name.toLowerCase(java.util.Locale.ROOT);
         CachedResolver cached = RESOLVER_CACHE.get(cacheKey);
         if (cached != null && cached.expiresAtMs() > System.currentTimeMillis()) {
             return CompletableFuture.completedFuture(Optional.of(cached.info()));

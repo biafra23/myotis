@@ -213,10 +213,11 @@ pub enum EnsError {
     /// halt, unsupported chain). A plain revert is treated as "no record", not an
     /// error.
     Call(EvmError),
-    /// The query is outside what this chain's name tree serves — a non-`.gno`
-    /// name on Gnosis Chain, or a reverse lookup there (Genome keeps reverse
-    /// records outside the tree this resolver reads). Refused before any call,
-    /// never answered as "no record".
+    /// The query is outside what this engine can answer for this chain — a
+    /// non-`.gno` name on Gnosis Chain, or a reverse lookup there (Genome keeps
+    /// reverse records outside the tree this resolver reads), refused before any
+    /// call; or the ownership of a name ENSv2 decides ([`ENSV2_OWNERSHIP`]),
+    /// refused once chain state shows it. Never answered as "no record".
     Unsupported(&'static str),
 }
 
@@ -1552,6 +1553,35 @@ mod tests {
             .on(move |t, cd| (t == RESOLVER && sel(cd) == supports_sel).then(revert))
             .on(move |t, cd| (t == RESOLVER && sel(cd) == addr_sel).then(|| Ok(addr_word(VITALIK))));
         assert_eq!(reverse_resolve(&caller, VITALIK).unwrap(), Some("vitalik.eth".to_string()));
+    }
+
+    #[test]
+    fn an_offchain_ancestor_reverse_resolver_surfaces_a_wrapped_lookup() {
+        // The walk-up asks through resolve(), so its OffchainLookup must carry
+        // wrapped=true: the callback's answer is then bytes-unwrapped before the
+        // name is decoded. With wrapped=false an off-chain primary name would decode
+        // as garbage, fail the forward check and vanish as "no record".
+        const WILD: [u8; 20] = [0x66; 20];
+        let resolver_sel = abi::selector("resolver(bytes32)");
+        let supports_sel = abi::selector("supportsInterface(bytes4)");
+        let resolve_sel = abi::selector("resolve(bytes,bytes)");
+        let reverse_node = namehash("reverse");
+        let body = offchain_revert_body(&["https://gateway.example/{sender}/{data}"]);
+        let caller = MockCaller::new()
+            .on(move |t, cd| {
+                (t == REGISTRY && sel(cd) == resolver_sel && cd[4..36] == reverse_node)
+                    .then(|| Ok(addr_word(WILD)))
+            })
+            .on(move |t, cd| (t == REGISTRY && sel(cd) == resolver_sel).then(|| Ok(addr_word([0u8; 20]))))
+            .on(move |t, cd| (t == WILD && sel(cd) == supports_sel).then(|| Ok(bool_word(true))))
+            .on(move |t, cd| {
+                (t == WILD && sel(cd) == resolve_sel)
+                    .then(|| Err(EvmError::Reverted { data: body.clone() }))
+            });
+        match reverse_resolve(&caller, VITALIK) {
+            Err(EnsError::OffchainLookup { lookup: Some(_), wrapped: true }) => {}
+            other => panic!("expected a wrapped OffchainLookup, got {other:?}"),
+        }
     }
 
     #[test]
