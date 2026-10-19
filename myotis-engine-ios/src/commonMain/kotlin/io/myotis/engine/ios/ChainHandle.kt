@@ -42,8 +42,10 @@ class ChainHandle internal constructor(
      *  (the engine's log, `Myotis.drainLogs`, says why). */
     fun start(): Boolean = lifecycleLock.withLock { native.start(handle) }
 
-    /** Stops the handle: its networking and its sync loop. Synchronous. The network stays
-     *  hosted, as on the JVM: [MyotisEngine.stop] is what releases it for a new create. */
+    /** Stops the handle: its networking and its sync loop. Synchronous and final: the
+     *  engine forgets the handle, so it cannot be started again. The network stays
+     *  hosted, as on the JVM: [MyotisEngine.stop] is what releases it for a new create,
+     *  and is the call a host normally makes. */
     fun stop() = lifecycleLock.withLock { native.stop(handle) }
 
     /** Tears networking down and keeps the warm state, for while the app is in the
