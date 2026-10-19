@@ -260,6 +260,27 @@ class LogIndexWatchTest {
     }
 
     @Test
+    fun a_topic_entry_is_never_listed_but_can_be_removed() {
+        // An engine topic entry (ABI 48) is no contract: an import bringing one
+        // in does not list it, and removing it leaves a marker naming its
+        // 32-byte value, which the push carries under `unwatch`.
+        val value = "0x000000000000000000000000" + "ab".repeat(20)
+        val withTopic = """{"ok":true,"status":{"enabled":true,"logCount":0,"entries":[""" +
+            """{"topic":"$value","positions":[1,2,3],"fromBlock":100}]}}"""
+        assertEquals("[]", LogIndexWatch.adoptImported("[]", status(), withTopic))
+        val removed = LogIndexWatch.unwatch("[]", value)
+        assertEquals(listOf(value), LogIndexWatch.unwatched(removed))
+        assertTrue(LogIndexWatch.parse(removed).isEmpty())
+        val push = LogIndexWatch.configJson(removed, enabled = true, configured = true)!!
+        assertTrue(push, push.contains(""""unwatch":["$value"]"""))
+        assertEquals("[]", LogIndexWatch.delivered(removed, push))
+        // Still nothing but an address is a watch entry.
+        assertFalse(LogIndexWatch.isValidAddress(value))
+        assertTrue(LogIndexWatch.isValidKey(value))
+        assertFalse(LogIndexWatch.isValidKey(value.dropLast(1)))
+    }
+
+    @Test
     fun forgetting_a_contract_leaves_neither_entry_nor_marker() {
         val store = LogIndexWatch.unwatch(
             LogIndexWatch.serialize(listOf(LogIndexWatch.Entry(a, 7), LogIndexWatch.Entry(b, 9))), c,

@@ -311,7 +311,38 @@ uniffi::setup_scaffolding!();
 ///      bumped so a host that calls either is never paired with an engine
 ///      that lacks it. The JVM `RustEngineNative` wrapper, the iOS wrapper,
 ///      myotis-rpcd and the Node addon call it.
-pub const ABI_VERSION: i32 = 47;
+/// v48: the log index watches a TOPIC VALUE from any emitter (#673):
+///      set_log_index_config's watch entries may name a 32-byte `"topic"`
+///      instead of an `"address"`, with optional `"positions"` (1-3, default
+///      all three) — every log carrying the value at one of them, whatever
+///      contract emitted it (a wallet's own token transfers). `unwatch` takes
+///      32-byte topic values next to addresses. get_logs_json answers a
+///      filter WITHOUT an address when it pins a watched topic at one of the
+///      entry's positions (an address-less filter that pins none of topics
+///      1-3 stays the permanent -32602). The status JSON lists a topic entry
+///      as `{"topic","positions","fromBlock",…}` — the address entries keep
+///      their shape. A payload extension, no signature change — bumped so a
+///      host that pushes topic entries knows the engine applies them (an
+///      older one refuses the push, and refuses the address-less query for
+///      good). Snapshots holding a topic entry are written as MLIX v3, which
+///      older engines do not load; an address-only index stays v2.
+/// v49: ens_record_json's offchain envelope gained `reverseClaim`, and its
+///      ccipCallback takes it back. A reverse lookup whose claim is ON chain
+///      but whose claimed name's address record is OFF chain (a `*.cb.id`
+///      primary name) used to hand the host the forward check's
+///      OffchainLookup as if it were the claim's, and the callback decoded
+///      the gateway-backed ADDRESS as the reverse record's name: "no primary
+///      name" for a valid one. The envelope of a round that forward-verifies
+///      a claim now names the claim; a host that echoes it into the callback
+///      gets the answer compared with the queried address and the claim back.
+///      A callback carrying one on anything but a reverse query, or a
+///      malformed one, is refused. A payload extension, no signature change —
+///      bumped so a host that echoes the claim is never paired with an engine
+///      that drops it. The JVM `CcipDriver` echoes it (and counts the forward
+///      check's round apart from the claim's, Java-engine parity); the iOS
+///      host drives no CCIP round yet, and the Node addon leaves the round to
+///      its caller.
+pub const ABI_VERSION: i32 = 49;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

@@ -226,7 +226,18 @@ pub enum EnsError {
     /// particular revert occurred, and is therefore carried unchanged through
     /// callback rounds. A tuple that fails to parse is `lookup: None` — still
     /// distinguishable from "no record".
-    OffchainLookup { lookup: Option<Box<OffchainLookup>>, wrapped: bool },
+    ///
+    /// `reverse_claim` names the step of a reverse lookup the revert came from.
+    /// `Some(name)`: forward-verifying `name`, the claim the reverse record
+    /// already made — the round answers `name`'s ADDRESS record, which the
+    /// continuation compares with the queried address
+    /// ([`reverse_forward_answer`]). `None`: any other lookup, a reverse one's
+    /// claim read included, whose round answers the queried record itself.
+    OffchainLookup {
+        lookup: Option<Box<OffchainLookup>>,
+        wrapped: bool,
+        reverse_claim: Option<String>,
+    },
     /// A resolution `eth_call` failed for a non-revert reason (state unavailable,
     /// halt, unsupported chain). A plain revert is treated as "no record", not an
     /// error.
@@ -738,15 +749,32 @@ pub fn reverse_resolve(
     let Some(claimed) = decode_name_answer(&raw) else {
         return Ok(None);
     };
+    verify_reverse_claim(caller, address, claimed)
+}
 
-    // Forward-verify through the FULL forward path (registry walk + ENSIP-10):
-    // the claimed name must resolve back to the queried address, byte-equal.
-    // A MALFORMED claimed name is a failed verify (no record), not an error —
-    // a malicious reverse record must not be able to force an error result
-    // where "no verified reverse record" is the truthful answer.
+/// Forward-verify `claimed`, the name `address`'s reverse record claims, through
+/// the FULL forward path (registry walk + ENSIP-10): `Some(claimed)` iff its
+/// address record is `address`, byte-equal. A MALFORMED claimed name is a failed
+/// verify (no record), not an error — a malicious reverse record must not be
+/// able to force an error result where "no verified reverse record" is the
+/// truthful answer.
+///
+/// An off-chain address record surfaces as an `OffchainLookup` carrying the
+/// claim (`reverse_claim`), whether the claim itself was read on chain or came
+/// back from a gateway round: the host's round for it then answers the name's
+/// address, which [`reverse_forward_answer`] checks. Without the claim the
+/// continuation would read that address as the reverse record's name.
+pub fn verify_reverse_claim(
+    caller: &dyn EthCaller,
+    address: [u8; 20],
+    claimed: String,
+) -> Result<Option<String>, EnsError> {
     match resolve_address(caller, &claimed) {
         Ok(Some(fwd)) if fwd == address => Ok(Some(claimed)),
         Ok(_) | Err(EnsError::InvalidName(_)) => Ok(None),
+        Err(EnsError::OffchainLookup { lookup, wrapped, .. }) => {
+            Err(EnsError::OffchainLookup { lookup, wrapped, reverse_claim: Some(claimed) })
+        }
         Err(e) => Err(e),
     }
 }
@@ -781,6 +809,15 @@ fn v1_reverse_claim(
             _ => Ok(None),
         },
     }
+}
+
+/// The continuation of a CCIP round that forward-verified `claimed` (an
+/// `OffchainLookup` whose `reverse_claim` was `claimed`): the callback's `raw`
+/// answer is `claimed`'s address record, so the claim stands iff it is
+/// `address`. Decoded as [`decode_address_answer`] decodes, so a zero or dirty
+/// word is no record.
+pub fn reverse_forward_answer(address: [u8; 20], claimed: &str, raw: &[u8]) -> Option<String> {
+    (decode_address_answer(raw) == Some(address)).then(|| claimed.to_string())
 }
 
 /// `<lowercase-hex-no-0x>.addr.reverse` (EIP-181; Java `ReverseLookup.nameFor`).
@@ -940,7 +977,9 @@ pub fn ccip_callback(
         // A second OffchainLookup carries the ORIGINAL `wrapped` forward: the
         // flag is the original call's decode contract (see the variant doc),
         // so a deeper round — if the cap were ever raised — still applies the
-        // right final unwrap.
+        // right final unwrap. It carries no `reverse_claim`: the step a round
+        // answers is the caller's to re-attach (the reader does, for a
+        // forward-check round).
         Err(EvmError::Reverted { data }) => revert_outcome(&data, wrapped),
         Err(e) => Err(EnsError::Call(e)),
     }
@@ -954,6 +993,7 @@ fn revert_outcome(data: &[u8], wrapped: bool) -> Result<Option<Vec<u8>>, EnsErro
         Err(EnsError::OffchainLookup {
             lookup: decode_offchain_lookup(&data[4..]).map(Box::new),
             wrapped,
+            reverse_claim: None,
         })
     } else {
         Ok(None)
@@ -1260,7 +1300,7 @@ mod tests {
         // offchain classification survive.
         assert!(matches!(
             resolve_address(&caller, "offchain.eth"),
-            Err(EnsError::OffchainLookup { lookup: None, wrapped: true })
+            Err(EnsError::OffchainLookup { lookup: None, wrapped: true, reverse_claim: None })
         ));
         // A plain revert stays "no record".
         let plain = MockCaller::new()
@@ -1696,7 +1736,7 @@ mod tests {
                     .then(|| Err(EvmError::Reverted { data: body.clone() }))
             });
         match reverse_resolve(&caller, VITALIK) {
-            Err(EnsError::OffchainLookup { lookup: Some(_), wrapped: true }) => {}
+            Err(EnsError::OffchainLookup { lookup: Some(_), wrapped: true, reverse_claim: None }) => {}
             other => panic!("expected a wrapped OffchainLookup, got {other:?}"),
         }
     }
@@ -1785,7 +1825,7 @@ mod tests {
             .on(move |t, cd| (t == RESOLVER && sel(cd) == supports_sel).then(revert))
             .on(move |t, _cd| (t == RESOLVER).then(|| Err(EvmError::Reverted { data: body2.clone() })));
         match resolve_address(&caller, "offchain.eth") {
-            Err(EnsError::OffchainLookup { lookup: Some(l), wrapped: false }) => {
+            Err(EnsError::OffchainLookup { lookup: Some(l), wrapped: false, reverse_claim: None }) => {
                 assert_eq!(l.sender, [0x5E; 20]);
                 assert_eq!(l.urls.len(), 2);
             }
@@ -1831,6 +1871,101 @@ mod tests {
             ccip_callback(&again, SENDER, [0xCB; 4], &[0xAA], &[], false),
             Err(EnsError::OffchainLookup { .. })
         ));
+    }
+
+    /// An exact legacy reverse resolver that claims `claimed` on chain, and a
+    /// `cb.id`-style ENSIP-10 resolver on `cb.id` whose `resolve()` reverts with
+    /// an OffchainLookup for every forward record of a subname.
+    fn onchain_claim_offchain_forward_caller(claimed: &'static str) -> MockCaller {
+        const REV_RESOLVER: [u8; 20] = [0x5f; 20];
+        const CB_RESOLVER: [u8; 20] = [0x6c; 20];
+        let resolver_sel = abi::selector("resolver(bytes32)");
+        let supports_sel = abi::selector("supportsInterface(bytes4)");
+        let resolve_sel = abi::selector("resolve(bytes,bytes)");
+        let name_sel = abi::selector("name(bytes32)");
+        let rev_node = namehash(&reverse_name(VITALIK));
+        let cb_node = namehash("cb.id");
+        let body = offchain_revert_body(&["https://gw.example/{sender}/{data}.json"]);
+        MockCaller::new()
+            .on(move |t, cd| {
+                (t == REGISTRY && sel(cd) == resolver_sel && cd[4..36] == rev_node)
+                    .then(|| Ok(addr_word(REV_RESOLVER)))
+            })
+            .on(move |t, cd| {
+                (t == REV_RESOLVER && sel(cd) == name_sel)
+                    .then(|| Ok(dyn_bytes_return(claimed.as_bytes())))
+            })
+            .on(move |t, cd| {
+                (t == REGISTRY && sel(cd) == resolver_sel && cd[4..36] == cb_node)
+                    .then(|| Ok(addr_word(CB_RESOLVER)))
+            })
+            // x.cb.id itself has no resolver: the walk finds cb.id's.
+            .on(move |t, cd| (t == REGISTRY && sel(cd) == resolver_sel).then(|| Ok(addr_word([0u8; 20]))))
+            .on(move |t, cd| (t == CB_RESOLVER && sel(cd) == supports_sel).then(|| Ok(bool_word(true))))
+            .on(move |t, cd| {
+                (t == CB_RESOLVER && sel(cd) == resolve_sel)
+                    .then(|| Err(EvmError::Reverted { data: body.clone() }))
+            })
+    }
+
+    #[test]
+    fn an_onchain_claim_with_an_offchain_forward_record_surfaces_the_claim() {
+        // The claim is on chain, its forward check is not: the lookup the host
+        // drives is the FORWARD one, so it must say so and carry the claim —
+        // the round answers x.cb.id's address, not a name.
+        let caller = onchain_claim_offchain_forward_caller("x.cb.id");
+        match reverse_resolve(&caller, VITALIK) {
+            Err(EnsError::OffchainLookup { lookup: Some(l), wrapped: true, reverse_claim }) => {
+                assert_eq!(l.sender, [0x5E; 20]);
+                assert_eq!(reverse_claim.as_deref(), Some("x.cb.id"));
+            }
+            other => panic!("expected the forward check's lookup with its claim, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_forward_check_round_answers_the_claim_when_it_points_back() {
+        // The continuation of the lookup above: the gateway answered, the
+        // resolver's callback returns x.cb.id's address (ENSIP-10-wrapped).
+        const SENDER: [u8; 20] = [0x5E; 20];
+        let callback = |answer: [u8; 20]| {
+            MockCaller::new().on(move |t, cd| {
+                (t == SENDER && cd[..4] == [0xCB; 4])
+                    .then(|| Ok(dyn_bytes_return(&addr_word(answer))))
+            })
+        };
+        let raw = ccip_callback(&callback(VITALIK), SENDER, [0xCB; 4], &[0xAA], &[0xEE; 3], true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reverse_forward_answer(VITALIK, "x.cb.id", &raw), Some("x.cb.id".to_string()));
+        // Read as the reverse record's own name() answer, as the continuation did
+        // before the claim travelled with the lookup, the address is no name:
+        // a valid primary name vanished as "no record".
+        assert_eq!(decode_name_answer(&raw), None);
+
+        // The claimed name pointing elsewhere is a failed verify.
+        let raw = ccip_callback(&callback([0xBA; 20]), SENDER, [0xCB; 4], &[0xAA], &[0xEE; 3], true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reverse_forward_answer(VITALIK, "x.cb.id", &raw), None);
+        // A zero address record is no record, never a match for the zero address.
+        assert_eq!(reverse_forward_answer([0u8; 20], "x.cb.id", &addr_word([0u8; 20])), None);
+    }
+
+    #[test]
+    fn verifying_a_gateway_supplied_claim_carries_it_into_the_forward_lookup() {
+        // An off-chain claim (decoded from a claim round's callback) whose forward
+        // record is off chain too: the second lookup is the forward check's and
+        // says so, like the on-chain claim's.
+        let caller = onchain_claim_offchain_forward_caller("unused.eth");
+        match verify_reverse_claim(&caller, VITALIK, "x.cb.id".to_string()) {
+            Err(EnsError::OffchainLookup { lookup: Some(_), wrapped: true, reverse_claim }) => {
+                assert_eq!(reverse_claim.as_deref(), Some("x.cb.id"));
+            }
+            other => panic!("expected the forward check's lookup with its claim, got {other:?}"),
+        }
+        // A malformed claim stays a failed verify, before any lookup.
+        assert_eq!(verify_reverse_claim(&caller, VITALIK, "a..eth".to_string()), Ok(None));
     }
 
     #[test]
@@ -2383,7 +2518,7 @@ mod tests {
                 (t == V2_RESOLVER && sel(cd) == resolve_sel).then(|| Err(EvmError::Reverted { data: body.clone() }))
             });
         match resolve_address(&caller, "myotis.eth") {
-            Err(EnsError::OffchainLookup { lookup: Some(l), wrapped: true }) => {
+            Err(EnsError::OffchainLookup { lookup: Some(l), wrapped: true, reverse_claim: None }) => {
                 assert_eq!(l.sender, V2_RESOLVER);
                 assert_eq!(l.urls, vec!["https://own-gateway.example/{sender}/{data}.json".to_string()]);
             }
