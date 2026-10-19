@@ -1,6 +1,7 @@
 // :myotis-engine-ios — the Rust engine for a Kotlin/Native iOS consumer: the cinterop
-// bindings of the engine's plain C ABI (rust/include/myotis_engine.h) and RustEngine,
-// the thin Kotlin face over them (the string-memory contract and the ABI handshake).
+// bindings of the engine's plain C ABI (rust/include/myotis_engine.h), RustEngine, the
+// thin Kotlin face over them (the string-memory contract and the ABI handshake), and
+// the typed API over that (Myotis.newEngine(), io.myotis.api's names).
 // The iOS twin of what eth.myotis:myotis-engine is for Android and the desktop JVM,
 // published as
 //
@@ -52,6 +53,16 @@ kotlin {
         // This module is the FFI seam: cinterop symbols are what it is made of.
         all {
             languageSettings.optIn("kotlinx.cinterop.ExperimentalForeignApi")
+        }
+        // commonMain is the typed API over the C ABI (MyotisEngine, ChainHandle,
+        // VerifiedReads, EnsApi) and its JSON decoding, behind the NativeEngine seam;
+        // iosMain the cinterop side of that seam. The tests run on the simulator
+        // (iosSimulatorArm64Test, ios-framework.yml) with a fake behind the seam.
+        commonMain.dependencies {
+            implementation(libs.kotlinx.serialization.json)
+        }
+        commonTest.dependencies {
+            implementation(kotlin("test"))
         }
     }
 }

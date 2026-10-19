@@ -25,6 +25,9 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * <p>The parse/mapping part needs no native library; the live-JNI part (create →
  * status through the real {@code libmyotis_engine}) self-skips when the library
  * isn't on {@code java.library.path}, mirroring {@link RustCatalogParityTest}.
+ *
+ * <p>A third half decodes the same literals on iOS: {@code EngineDecodingTest} in
+ * {@code :myotis-engine-ios}. A shape change here is a change there too.
  */
 class RustStatusJsonTest {
 
