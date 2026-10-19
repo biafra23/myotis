@@ -107,9 +107,13 @@ Key Gradle modules:
 - **myotis-engine-ios** — the engine library's iOS module
   (`eth.myotis:myotis-engine-ios`; iosArm64 + iosSimulatorArm64): the cinterop of
   the RUST engine's plain C ABI (`rust/include/myotis_engine.h`), with
-  libmyotis_engine.a absorbed into each target's cinterop klib, and
+  libmyotis_engine.a absorbed into each target's cinterop klib,
   `io.myotis.engine.ios.RustEngine` over it — the only code that imports
-  `io.myotis.engine.capi`. macOS only (disabled elsewhere), so
+  `io.myotis.engine.capi` — and, in commonMain over a `NativeEngine` seam, the
+  typed API with `io.myotis.api`'s names (`Myotis.newEngine()` → `MyotisEngine` /
+  `ChainHandle` / `VerifiedReads` / `EnsApi`), its JSON decoding pinned by the
+  JVM side's golden shapes and tested on the simulator (`ios-framework.yml`).
+  macOS only (disabled elsewhere), so
   `engine-library.yml` stages it on a macOS runner and merges it into the set.
 - **myotis-engines** — the engine SELECTOR (`Engines`/`SelectorEngine`): hosts'
   composition roots call `Engines.engine()`; `myotis.engine=java|rust|auto` routes
