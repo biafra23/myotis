@@ -21,7 +21,9 @@
 #                 #422 shape. Pinned peers are exempt from eviction, so they
 #                 hold their pool slots and keep steering targeted lookups;
 #                 discovery has to find a real server anyway. The dispatched
-#                 smoke job dials a warm peer cache, which hides this.
+#                 smoke job dials a warm peer cache, which hides this. The EL
+#                 pins are dead too (Sepolia's is zbox's geth, behind roost's
+#                 relay).
 #   * old-anchor: the trust anchor is several periods behind, so bootstrap is
 #                 not enough and catch-up must actually walk periods. A
 #                 release-fresh anchor walks 0-2 periods and proves little, so
@@ -35,6 +37,16 @@
 #                 bootstrapping, first suspect that the file's entry has aged
 #                 out of what roost still serves: re-probe on zbox and update
 #                 the file before hunting for a regression.
+#
+# Both cold starts run the EL reader beside the light client, as a host does,
+# and pass only on SYNCED. On a Gloas chain SYNCED also waits for the EL pool
+# to fetch the finalized execution header by its hash, so a CL-only run can
+# never pass there (Sepolia's release checks at v0.1.15 and v0.1.18). A run
+# that misses SYNCED says which half stalled. The old-anchor step runs even
+# when the dead-pins step failed (the job still fails): the two are
+# independent, and a release check that stops at the first red step leaves the
+# owner deciding without the deep walk's answer. Only a failed pin check stops
+# the job early.
 #
 # The `census` scope runs none of the three. It runs
 # rust/myotis-net/examples/period_census.rs instead: the whole discv5 DHT asked
@@ -143,6 +155,7 @@ jobs:
       # Cheap and first: if the shipped pins are dead, say so before spending
       # 15 minutes proving the wallet copes without them.
       - name: Are the shipped pins and bootnodes alive?
+        id: pins_alive
         if: inputs.scope != 'census'
         working-directory: rust
         env:
@@ -152,13 +165,15 @@ jobs:
           cargo test --release -p myotis-net --test live_pins_alive -- \
             --ignored --nocapture --test-threads=1
 
-      # Discovery-only: no pinned peers at all.
+      # Discovery-only: every pin (CL and EL) configured but dead. The EL at
+      # info: its pool's debug output would bury the light client's, and the
+      # test's progress lines carry what the EL half contributes.
       - name: Cold start with every pinned peer unreachable
         if: inputs.scope != 'census'
         working-directory: rust
         env:
           NET: ${{ inputs.network }}
-          RUST_LOG: info,myotis_net=debug
+          RUST_LOG: info,myotis_net=debug,myotis_net::el=info
         run: |
           cargo test --release -p myotis-net --test live_cold_start -- \
             --ignored --nocapture cold_start_with_every_pinned_peer_unreachable
@@ -166,14 +181,18 @@ jobs:
       # Runs for every scope except an explicit pins-only (or a census). With no
       # override the test reads the committed test-anchor file; a half-supplied
       # override reaches the test's own loud guard rather than skipping green.
+      # !cancelled() lets it run after a failed dead-pins step (the job stays
+      # red); the pin check passing is still required.
       - name: Cold start from an old anchor
-        if: inputs.scope != 'pins-only' && inputs.scope != 'census'
+        if: >-
+          ${{ !cancelled() && steps.pins_alive.outcome == 'success' &&
+          inputs.scope != 'pins-only' && inputs.scope != 'census' }}
         working-directory: rust
         env:
           NET: ${{ inputs.network }}
           MYOTIS_TEST_ANCHOR_ROOT: ${{ inputs.anchor_root }}
           MYOTIS_TEST_ANCHOR_SLOT: ${{ inputs.anchor_slot }}
-          RUST_LOG: info,myotis_net=debug
+          RUST_LOG: info,myotis_net=debug,myotis_net::el=info
         run: |
           cargo test --release -p myotis-net --test live_cold_start -- \
             --ignored --nocapture cold_start_from_an_old_anchor

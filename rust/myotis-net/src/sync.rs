@@ -765,7 +765,8 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // from it and roost, but stayed CATCHING_UP for its 900 s budget: since
     // Gloas, SYNCED also waits for the finalized execution header
     // (`feed_exec_anchor`), which only the EL peer pool resolves, and
-    // live_cold_start runs the CL sync alone. The old-anchor walk did not run.
+    // live_cold_start ran the CL sync alone (it has started the EL reader too
+    // since 2026-10-20). The old-anchor walk did not run.
     //
     // Release check for v0.1.16 (2026-10-13), anchor slot 11349696, period
     // 1385: run 38478944070, three attempts. The first found neither pin (dial
