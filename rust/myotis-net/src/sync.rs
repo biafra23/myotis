@@ -638,8 +638,10 @@ impl ChainConfig {
         delay_to_next_poll(now_unix_ms(), since_poll_ms, self.genesis_time, self.seconds_per_slot, offset_ms)
     }
 
-    /// Wall-clock slot estimate (the clock read is [`now_unix_ms`]).
-    fn current_slot_estimate(&self) -> u64 {
+    /// Wall-clock slot estimate (the clock read is [`now_unix_ms`]) — the
+    /// slot the SYNCED gate judges finality against. Public for the live
+    /// cold-start test, which reports that gate's light-client half.
+    pub fn current_slot_estimate(&self) -> u64 {
         let now = now_unix_ms() / 1000;
         now.saturating_sub(self.genesis_time) / self.seconds_per_slot.max(1)
     }
@@ -765,7 +767,8 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // from it and roost, but stayed CATCHING_UP for its 900 s budget: since
     // Gloas, SYNCED also waits for the finalized execution header
     // (`feed_exec_anchor`), which only the EL peer pool resolves, and
-    // live_cold_start runs the CL sync alone. The old-anchor walk did not run.
+    // live_cold_start ran the CL sync alone (it has started the EL reader too
+    // since 2026-10-20). The old-anchor walk did not run.
     //
     // Release check for v0.1.16 (2026-10-13), anchor slot 11349696, period
     // 1385: run 38478944070, three attempts. The first found neither pin (dial
@@ -4105,6 +4108,24 @@ fn update_exec_anchor(store: &LightClientStore, anchor: &ExecAnchor) {
 /// (`RESTART_CLAIM_MAX_LEAD` in el/reader.rs, pinned by a test there).
 pub(crate) const SYNCED_SLOT_SLACK_EPOCHS: u64 = 5;
 
+/// The light client's half of the SYNCED gate, over the two numbers a
+/// [`SyncStatus`] publishes for it (its `period` and `finalized_slot` are the
+/// store's): the committee period is the wall clock's, and the finality is
+/// within [`SYNCED_SLOT_SLACK_EPOCHS`] of `wall_slot`. Before Gloas that is the
+/// whole gate; from Gloas, `feed_exec_anchor` also holds the execution
+/// anchor's finality to the same slack. Public so the live cold-start test
+/// tells the two halves apart by the gate's own definition, not a copy.
+pub fn light_client_current(
+    period: u64,
+    finalized_slot: u64,
+    wall_slot: u64,
+    slots_per_epoch: u64,
+    slots_per_period: u64,
+) -> bool {
+    period == spec::compute_sync_committee_period_with(wall_slot, slots_per_period)
+        && finalized_slot + SYNCED_SLOT_SLACK_EPOCHS * slots_per_epoch >= wall_slot
+}
+
 /// The published state of `store` at `wall_slot` — the SYNCED gate above.
 /// Pure, so the status and the execution anchor's currency flag (which the EL
 /// log index trusts to tell a restored finality from a current one) cannot
@@ -4115,12 +4136,15 @@ fn sync_state_at(
     slots_per_epoch: u64,
     slots_per_period: u64,
 ) -> SyncState {
-    let wall_period = spec::compute_sync_committee_period_with(wall_slot, slots_per_period);
     if !store.is_initialized() {
         SyncState::Bootstrapping
-    } else if wall_period == store.current_period()
-        && store.finalized_slot() + SYNCED_SLOT_SLACK_EPOCHS * slots_per_epoch >= wall_slot
-    {
+    } else if light_client_current(
+        store.current_period(),
+        store.finalized_slot(),
+        wall_slot,
+        slots_per_epoch,
+        slots_per_period,
+    ) {
         SyncState::Synced
     } else {
         SyncState::CatchingUp
