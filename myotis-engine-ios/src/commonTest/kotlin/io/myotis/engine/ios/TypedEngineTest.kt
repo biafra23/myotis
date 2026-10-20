@@ -381,7 +381,7 @@ class TypedEngineTest {
         native.logs = """{"error":"invalid filter","code":-32602}"""
         assertEquals(native.logs, handle.reads().getLogs(filter))
         native.logs = null
-        assertNull(handle.reads().getLogs(filter), "an engine that answered nothing")
+        assertNull(handle.reads().getLogs(filter), "defensively: no string came back")
         assertEquals(
             listOf("logConfig $config", "logConfig $config", "logConfig $config", "logStatus") +
                 List(4) { "logs $filter" },

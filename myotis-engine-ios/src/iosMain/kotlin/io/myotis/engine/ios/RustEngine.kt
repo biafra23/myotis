@@ -180,8 +180,8 @@ object RustEngine {
     }
 
     /** eth_getLogs over the watch-list index: the log array, or an `{"error":...}`
-     *  object carrying the coverage or config detail; null when the engine answers
-     *  nothing (an unknown handle). */
+     *  object carrying the coverage or config detail, an unknown or stopped handle's
+     *  ("node is not running") included; null only defensively, when no C string came back. */
     fun getLogsJson(handle: Long, filterJson: String): String? {
         requireAbi()
         return take(myotis_get_logs_json(handle, filterJson))
