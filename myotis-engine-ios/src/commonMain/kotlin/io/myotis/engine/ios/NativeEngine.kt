@@ -49,6 +49,10 @@ internal interface NativeEngine {
     fun checkRawTransactionJson(rawTxHex: String): String
     fun sendRawTransactionJson(handle: Long, rawTxHex: String): String
     fun ensRecordJson(handle: Long, paramsJson: String): String
+    fun setLogIndexConfig(handle: Long, configJson: String): Boolean
+    fun logIndexStatusJson(handle: Long): String
+    /** Null only defensively (no C string came back): an unknown or stopped handle is an `{"error":…}` object. */
+    fun getLogsJson(handle: Long, filterJson: String): String?
 }
 
 /** A reentrant lock, from the platform ([NativeEngine.newLock]). */

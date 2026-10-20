@@ -1,5 +1,7 @@
 package io.myotis.engine.ios
 
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import kotlin.concurrent.atomics.AtomicReference
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.time.TimeSource
@@ -124,6 +126,32 @@ class ChainHandle internal constructor(
     fun getStorageProof(hexAddress: String, slot: Long, holderHexOrNull: String?): StorageProofResult =
         EngineDecoding.storage(hexAddress, slot, native.getStorageProofJson(handle, hexAddress, slot, holderHexOrNull))
 
+    /**
+     * Installs the opt-in `eth_getLogs` watch-list config, as `io.myotis.api.ChainHandle`'s
+     * `setLogIndexConfig` describes it (`{"enabled":bool,"watch":[…],"unwatch":[…]?}`: `watch`
+     * is additive, `unwatch` removes an entry with its coverage and logs). True once the push
+     * is done and its unwatch durable; false for a config the engine refuses, a handle it no
+     * longer knows, or an unwatch whose checkpoint could not be written (repeat the push).
+     */
+    fun setLogIndexConfig(configJson: String): Boolean =
+        try {
+            native.setLogIndexConfig(handle, configJson)
+        } catch (e: Exception) {
+            false
+        }
+
+    /**
+     * The log index's status JSON (enabled flag, log count, backfill cursor, per-entry covered
+     * spans), or an `{"error":…}` object: the engine's, or one naming a call that failed. A
+     * status probe, answered at once whatever the handle's state, as on the JVM.
+     */
+    fun logIndexStatusJson(): String =
+        try {
+            native.logIndexStatusJson(handle)
+        } catch (e: Exception) {
+            buildJsonObject { put("error", e.message ?: e::class.simpleName ?: "the status call failed") }.toString()
+        }
+
     /** The verified `eth_*` reads. */
     fun reads(): VerifiedReads = verifiedReads
 
@@ -177,4 +205,6 @@ class ChainHandle internal constructor(
     }
 
     internal fun ensRecord(paramsJson: String): String = native.ensRecordJson(handle, paramsJson)
+
+    internal fun logs(filterJson: String): String? = native.getLogsJson(handle, filterJson)
 }

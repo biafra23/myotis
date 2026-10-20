@@ -115,6 +115,16 @@ class VerifiedReads internal constructor(private val handle: ChainHandle) {
         return answer { handle.receipt(Hex.encode(txHash)) }
     }
 
+    /**
+     * Verified `eth_getLogs` over the engine's opt-in watch-list log index
+     * ([ChainHandle.setLogIndexConfig]): the log-array JSON, the engine's `{"error":…}` object
+     * carrying the coverage or config detail (a range the index does not cover is an error,
+     * never an empty array; a filter the engine refuses for good carries `"code":-32602`), or
+     * null when no answer could be had. Passed on verbatim, as the JVM's `RustVerifiedReads`
+     * does.
+     */
+    fun getLogs(filterJson: String): String? = answer { handle.logs(filterJson) }
+
     /** Gossips a signed raw transaction to the peers (the engine never signs), its
      *  outcome told apart ([SendResult]). */
     fun sendRawTransactionDetailed(rawTx: ByteArray): SendResult {
