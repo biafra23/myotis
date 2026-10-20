@@ -34,9 +34,15 @@ order:
 - JSON-RPC `myotis_status` on the loopback listener,
 - the engine's own status JSON (`status_json` / `myotis_status_json`, ABI 50),
   which the JVM wrapper and the iOS module decode into the types above,
-- the apps' Status screen: **Data today** (↓ in, ↑ out, and the metered part),
-  **Data total** (since start) and **Connection** (metered / unmetered /
-  unknown), in Expert mode.
+- the apps' Status screen: **Data today** (↓ in, ↑ out), **Metered** (today's
+  bytes split into metered and unmetered), **Data total** (since start) and
+  **Connection** (metered / unmetered / unknown), in Expert mode,
+- the Android node notification: today's total across **all** hosted networks
+  — running or asleep — in its header (`12.4 MB today`), and expanded, the
+  split: `Data today 12.4 MB · 4.1 MB metered · 8.3 MB unmetered`. Refreshed
+  with the notification's 30-second idle tick. "Unmetered" there, as on the
+  Status screen, is everything not moved on a metered network, including the
+  rare bytes moved while the device had no active network.
 
 ## Metered or not: the host says
 

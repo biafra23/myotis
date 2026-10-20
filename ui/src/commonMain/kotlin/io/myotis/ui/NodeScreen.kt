@@ -1398,16 +1398,25 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         StatusRow("Uptime", "${s.uptimeSeconds}s", help = StatusHelp.UPTIME)
         // Data usage (docs/data-usage.md): this network's bytes on the wire.
         s.dataUsage?.let { u ->
-            val metered = u.todayMeteredIn + u.todayMeteredOut
+            val today = DataUsageText.Today(u.todayIn, u.todayOut, u.todayMeteredIn, u.todayMeteredOut)
             StatusRow(
                 "Data today",
-                "↓ ${formatBytes(u.todayIn)} ↑ ${formatBytes(u.todayOut)}" +
-                    if (metered > 0) " · ${formatBytes(metered)} metered" else "",
+                "↓ ${DataUsageText.bytes(u.todayIn)} ↑ ${DataUsageText.bytes(u.todayOut)}",
                 help = StatusHelp.DATA_TODAY,
             )
+            // Only where the split means something: a host that cannot tell (desktop:
+            // Connection "unknown" all day) would otherwise call every byte unmetered.
+            if (today.metered > 0 || s.networkMetering == "METERED" || s.networkMetering == "UNMETERED") {
+                StatusRow(
+                    "Metered",
+                    "${DataUsageText.bytes(today.metered)} metered · " +
+                        "${DataUsageText.bytes(today.unmetered)} unmetered",
+                    help = StatusHelp.DATA_METERED,
+                )
+            }
             StatusRow(
                 "Data total",
-                "↓ ${formatBytes(u.totalIn)} ↑ ${formatBytes(u.totalOut)}",
+                "↓ ${DataUsageText.bytes(u.totalIn)} ↑ ${DataUsageText.bytes(u.totalOut)}",
                 help = StatusHelp.DATA_TOTAL,
             )
         }
@@ -1758,7 +1767,7 @@ private fun QueryTab(
                         "Scanning chunk ${p.chunksScanned + 1}/${p.totalChunks}" +
                             " (block ~${groupDigits(p.currentRange.substringAfter('-').trimStart('0'))})" +
                             " — ${p.hits} hit${if (p.hits == 1) "" else "s"}" +
-                            " · ${formatBytes(p.bytesDownloaded)} fetched",
+                            " · ${DataUsageText.bytes(p.bytesDownloaded)} fetched",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -2033,13 +2042,6 @@ internal fun meteringLabel(name: String): String = when (name) {
     "METERED" -> "metered"
     "UNMETERED" -> "unmetered"
     else -> "unknown"
-}
-
-private fun formatBytes(b: Long): String = when {
-    b >= 1_073_741_824 -> "${(b * 10 / 1_073_741_824).toDouble() / 10} GB"
-    b >= 1_048_576 -> "${b / 1_048_576} MB"
-    b >= 1024 -> "${b / 1024} KB"
-    else -> "$b B"
 }
 
 /**
@@ -2620,9 +2622,11 @@ private object StatusHelp {
         "past 45s."
     const val UPTIME = "Seconds since this network's stack started running."
     const val DATA_TODAY = "Bytes this network received (↓) and sent (↑) today, local time — " +
-        "kept across restarts on the same day. \"metered\" is the part moved while the " +
-        "device was on a metered network (mobile data, a hotspot). Counts the peer-to-peer " +
-        "traffic on the wire; Tor's own traffic and DNS lookups are not included."
+        "kept across restarts on the same day. Counts the peer-to-peer traffic on the wire; " +
+        "Tor's own traffic and DNS lookups are not included."
+    const val DATA_METERED = "Today's bytes (both directions) split by the network they went " +
+        "over: metered (mobile data, a hotspot, Low Data Mode) or unmetered (Wi-Fi, Ethernet — " +
+        "and anything moved while the app could not tell)."
     const val DATA_TOTAL = "Bytes this network received (↓) and sent (↑) since it was started " +
         "in this app session, across sleeps."
     const val CONNECTION = "Whether the device's current network is metered (mobile data, a " +
