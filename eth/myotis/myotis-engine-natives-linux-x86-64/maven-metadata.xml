@@ -3,11 +3,12 @@
   <groupId>eth.myotis</groupId>
   <artifactId>myotis-engine-natives-linux-x86-64</artifactId>
   <versioning>
-    <latest>0.1.17</latest>
-    <release>0.1.17</release>
+    <latest>0.1.18</latest>
+    <release>0.1.18</release>
     <versions>
       <version>0.1.17</version>
+      <version>0.1.18</version>
     </versions>
-    <lastUpdated>20261020010425</lastUpdated>
+    <lastUpdated>20261020224448</lastUpdated>
   </versioning>
 </metadata>
