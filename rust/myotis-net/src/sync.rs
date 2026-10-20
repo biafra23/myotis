@@ -794,6 +794,18 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // connected), as at v0.1.16. 1 of 2 against a floor of 2; the dead-pins
     // cold start and the old-anchor walk did not run: the owner decides. The
     // bootnodes seeded discv5 (22 entries).
+    //
+    // Release check for v0.1.18 (2026-10-20), anchor slot 11399296, period
+    // 1391: run 39487420418, 2 of 2 — both pins served the bootstrap and the
+    // verified period-1391 update, the first full pin check since Gloas. This
+    // Nimbus now runs --max-peers=60 --hard-max-peers=80 (a systemd drop-in
+    // on zbox, 2026-10-20); at 25 it had refused the runner at v0.1.16 and
+    // v0.1.17. The cold start with every pin unreachable bootstrapped through
+    // discovery in under two minutes and followed finality (11399328 to
+    // 11399392) but stayed CATCHING_UP for its 900 s budget, as at v0.1.15:
+    // on Gloas, SYNCED also waits for the finalized execution header, which
+    // live_cold_start does not resolve (it runs no EL pool). The old-anchor
+    // walk did not run. The bootnodes seeded discv5 (22 entries).
     "/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
 ];
 
@@ -904,6 +916,11 @@ const GNOSIS_STATIC_PEERS: &[&str] = &[
     // until after the runs. The bootnodes seeded discv5 (21 entries), a cold
     // start with every pin unreachable reached SYNCED in 35 s, and one from
     // the recorded period-3596 anchor (150 periods behind) in 35 s.
+    // Re-verified 2026-10-20 against the anchor v0.1.18 ships (period 3748):
+    // live_pins_alive run 39487401685 on a GitHub-hosted runner, 8 of 8. The
+    // bootnodes seeded discv5 (21 entries), a cold start with every pin
+    // unreachable reached SYNCED in 55 s, and one from the recorded
+    // period-3596 anchor (152 periods behind) in 165 s.
     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
@@ -1073,6 +1090,14 @@ const MAINNET_STATIC_PEERS: &[&str] = &[
     // bootnodes seeded discv5 (29 entries, SYNCED), a cold start with every
     // pin unreachable reached SYNCED in 35 s, and one from the recorded
     // period-1825 anchor (63 periods behind) in 10 s.
+    // Re-verified 2026-10-20 against the anchor v0.1.18 ships (period 1889):
+    // live_pins_alive run 39487395099 on a GitHub-hosted runner, 3 of 5 —
+    // roost (9109), 91.189.182.90 and 54.201.148.177 served; 57.129.130.18
+    // closed the connection from the runner again (after serving at v0.1.17)
+    // and 84.112.35.112 closed it for the first time. The bootnodes seeded
+    // discv5 (27 entries, SYNCED), a cold start with every pin unreachable
+    // reached SYNCED in 35 s, and one from the recorded period-1825 anchor
+    // (64 periods behind) in 5 s.
     "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
     "/ip4/84.112.35.112/tcp/9000/p2p/16Uiu2HAm6YkLaGLMH1Q9caGi4A2WctHPhENumfQMJXVCMVpc7GQY",
     "/ip4/91.189.182.90/tcp/9000/p2p/16Uiu2HAmJJUAs17wxW1i4HM5Fce1zYPCvvavxsYorWr4EQVx1Ui8",

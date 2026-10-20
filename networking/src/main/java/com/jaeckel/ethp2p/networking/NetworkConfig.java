@@ -205,6 +205,11 @@ public record NetworkConfig(
                     // 1888), run 39336083362: 5 of 5 — every pin served: 57.129.130.18
                     // and 91.189.182.90 after their closes, and roost (9109), with the
                     // PoC seed upload held until after the runs (see the Rust twin).
+                    // Re-verified 2026-10-20 at the anchor v0.1.18 ships (period
+                    // 1889), run 39487395099: 3 of 5 — roost (9109), 91.189.182.90 and
+                    // 54.201.148.177 served; 57.129.130.18 (again, after serving at
+                    // v0.1.17) and 84.112.35.112 (a first) closed the connection from
+                    // the runner (see the Rust twin).
                     // Mirror of the Rust MAINNET_STATIC_PEERS: keep the two lists
                     // and their ORDER in step (see the reasoning there).
                     "/ip4/57.129.130.18/tcp/9000/p2p/16Uiu2HAkwmBd7zSRAiBkGar6ghHYfKCKTpGbGL1igrD6mC4W99T9",
@@ -426,6 +431,12 @@ public record NetworkConfig(
             // slot 11392896, was finalized while this Nimbus ran optimistically
             // after a restart, and it never built that bootstrap.) 1 of 2 — the
             // owner decides. Details in the Rust twin (SEPOLIA_STATIC_PEERS).
+            // Release check for v0.1.18 (2026-10-20), slot 11399296: 2 of 2, the
+            // first full pin check since Gloas, after this Nimbus got
+            // --max-peers=60 (it had refused the runner at 25). The dead-pins
+            // cold start then stayed CATCHING_UP, as at v0.1.15: on Gloas, SYNCED
+            // waits for the execution header, which that test does not resolve.
+            // Details in the Rust twin (SEPOLIA_STATIC_PEERS).
             // Keep this list identical to SEPOLIA_STATIC_PEERS in
             // rust/myotis-net/src/sync.rs (both parity tests pin it).
             List.of(
@@ -560,6 +571,8 @@ public record NetworkConfig(
                     // Re-verified 2026-10-19 at the anchor v0.1.17 ships (period
                     // 3746), run 39336087407: 8 of 8 — every pin served, roost (9108)
                     // included, with the PoC seed upload held until after the runs.
+                    // Re-verified 2026-10-20 at the anchor v0.1.18 ships (period
+                    // 3748), run 39487401685: 8 of 8.
                     "/ip4/134.65.194.144/tcp/9500/p2p/16Uiu2HAmLZasEWSgafRb5hqW5M2jSN7YcERyVQ81AeCGCFZmynsQ",
                     "/ip4/144.76.118.19/tcp/9000/p2p/16Uiu2HAmEJpzjSyajPJzzrN8TnV1VaNMaEecQo1v4Mkedwb6UYwE",
                     "/ip4/144.76.163.174/tcp/9000/p2p/16Uiu2HAkxLFxkn7MbAPH17VdwEvXytqgteNAr52AaqKYuEmsw2bt",
