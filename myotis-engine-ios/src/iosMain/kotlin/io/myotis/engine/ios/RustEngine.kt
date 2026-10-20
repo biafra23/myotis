@@ -19,6 +19,7 @@ import io.myotis.engine.capi.myotis_get_block_by_hash_json
 import io.myotis.engine.capi.myotis_get_block_by_number_json
 import io.myotis.engine.capi.myotis_get_block_receipts_json
 import io.myotis.engine.capi.myotis_get_code_json
+import io.myotis.engine.capi.myotis_get_logs_json
 import io.myotis.engine.capi.myotis_get_proof_json
 import io.myotis.engine.capi.myotis_get_storage_at_json
 import io.myotis.engine.capi.myotis_get_storage_proof_json
