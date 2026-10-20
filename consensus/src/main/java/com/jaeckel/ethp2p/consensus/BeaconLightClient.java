@@ -333,6 +333,11 @@ public class BeaconLightClient implements AutoCloseable {
     // Period last written, to avoid rewriting the (~50KB) snapshot when nothing advanced.
     private volatile long lastPersistedPeriod = -1L;
 
+    /** See {@link BeaconP2PService#setWireHandler}; before {@code start}. */
+    public void setWireHandler(io.netty.channel.ChannelHandler handler) {
+        p2pService.setWireHandler(handler);
+    }
+
     /** File to persist/restore the verified light-client store. Set before {@link #start()}. */
     public void setSnapshotFile(java.nio.file.Path file) {
         this.snapshotFile = file;

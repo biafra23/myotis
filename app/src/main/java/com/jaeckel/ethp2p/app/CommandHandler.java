@@ -188,6 +188,8 @@ public class CommandHandler {
                 + ",\"lastPauseEpochMs\":" + s.lastPauseEpochMs()
                 + ",\"lastResumeEpochMs\":" + s.lastResumeEpochMs()
                 + ",\"lastWakeReason\":" + wakeReason
+                + ",\"dataUsage\":" + buildDataUsageJson(s.dataUsage())
+                + ",\"networkMetering\":\"" + s.networkMetering() + "\""
                 + ",\"upgradeAdvisory\":" + buildUpgradeAdvisoryJson(s.upgradeAdvisory()) + "}";
     }
 
@@ -306,6 +308,22 @@ public class CommandHandler {
                 + ",\"wsBoundPeriods\":" + bs.wsBoundPeriods()
                 + advisory
                 + ",\"peers\":" + peersJson + "}";
+    }
+
+    /** {@link io.myotis.api.DataUsage} as the status's {@code dataUsage} object —
+     *  the same keys, in the same order, as JSON-RPC myotis_status (StatusJson.kt). */
+    static String buildDataUsageJson(io.myotis.api.DataUsage u) {
+        return "{\"bytesIn\":" + u.bytesIn()
+                + ",\"bytesOut\":" + u.bytesOut()
+                + ",\"elBytesIn\":" + u.elBytesIn()
+                + ",\"elBytesOut\":" + u.elBytesOut()
+                + ",\"clBytesIn\":" + u.clBytesIn()
+                + ",\"clBytesOut\":" + u.clBytesOut()
+                + ",\"day\":\"" + escapeJson(u.day()) + "\""
+                + ",\"todayBytesIn\":" + u.todayBytesIn()
+                + ",\"todayBytesOut\":" + u.todayBytesOut()
+                + ",\"todayMeteredBytesIn\":" + u.todayMeteredBytesIn()
+                + ",\"todayMeteredBytesOut\":" + u.todayMeteredBytesOut() + "}";
     }
 
     /**

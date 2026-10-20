@@ -1396,6 +1396,29 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
             help = StatusHelp.HEAD_AGE,
         )
         StatusRow("Uptime", "${s.uptimeSeconds}s", help = StatusHelp.UPTIME)
+        // Data usage (docs/data-usage.md): this network's bytes on the wire.
+        s.dataUsage?.let { u ->
+            val today = DataUsageText.Today(u.todayIn, u.todayOut, u.todayMeteredIn, u.todayMeteredOut)
+            StatusRow(
+                "Data today",
+                "↓ ${DataUsageText.bytes(u.todayIn)} ↑ ${DataUsageText.bytes(u.todayOut)}",
+                help = StatusHelp.DATA_TODAY,
+            )
+            // Only where the split means something: a host that cannot tell (desktop:
+            // Connection "unknown" all day) would otherwise call every byte unmetered.
+            if (DataUsageText.showsSplit(today, s.networkMetering)) {
+                StatusRow("Metered", DataUsageText.bytes(today.metered), help = StatusHelp.DATA_SPLIT)
+                StatusRow("Unmetered", DataUsageText.bytes(today.unmetered), help = StatusHelp.DATA_SPLIT)
+            }
+            StatusRow(
+                "Data total",
+                "↓ ${DataUsageText.bytes(u.totalIn)} ↑ ${DataUsageText.bytes(u.totalOut)}",
+                help = StatusHelp.DATA_TOTAL,
+            )
+        }
+        s.networkMetering?.let {
+            StatusRow("Connection", meteringLabel(it), help = StatusHelp.CONNECTION)
+        }
         // Pseudo-sleep observability: how much the node has idle-slept, and when/why it
         // last woke. Foreground (opening the app) is excluded from the "last woke" reason,
         // so this keeps showing the last real request/catch-up wake even as you view it.
@@ -1740,7 +1763,7 @@ private fun QueryTab(
                         "Scanning chunk ${p.chunksScanned + 1}/${p.totalChunks}" +
                             " (block ~${groupDigits(p.currentRange.substringAfter('-').trimStart('0'))})" +
                             " — ${p.hits} hit${if (p.hits == 1) "" else "s"}" +
-                            " · ${formatBytes(p.bytesDownloaded)} fetched",
+                            " · ${DataUsageText.bytes(p.bytesDownloaded)} fetched",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -2010,11 +2033,11 @@ private fun groupDigits(s: String): String {
     return digits.reversed().chunked(3).joinToString(",").reversed()
 }
 
-private fun formatBytes(b: Long): String = when {
-    b >= 1_073_741_824 -> "${(b * 10 / 1_073_741_824).toDouble() / 10} GB"
-    b >= 1_048_576 -> "${b / 1_048_576} MB"
-    b >= 1024 -> "${b / 1024} KB"
-    else -> "$b B"
+/** The API's NetworkMetering name as the Status "Connection" row shows it. */
+internal fun meteringLabel(name: String): String = when (name) {
+    "METERED" -> "metered"
+    "UNMETERED" -> "unmetered"
+    else -> "unknown"
 }
 
 /**
@@ -2594,6 +2617,17 @@ private object StatusHelp {
         "against. \"—\" = no verified head yet, so no read can be served. The UI turns amber " +
         "past 45s."
     const val UPTIME = "Seconds since this network's stack started running."
+    const val DATA_TODAY = "Bytes this network received (↓) and sent (↑) today, local time — " +
+        "kept across restarts on the same day. Counts the peer-to-peer traffic on the wire; " +
+        "Tor's own traffic and DNS lookups are not included."
+    const val DATA_SPLIT = "Metered / Unmetered: today's bytes (both directions) split by the network they went " +
+        "over: metered (mobile data, a hotspot, Low Data Mode) or unmetered (Wi-Fi, Ethernet — " +
+        "and anything moved while the app could not tell)."
+    const val DATA_TOTAL = "Bytes this network received (↓) and sent (↑) since it was started " +
+        "in this app session, across sleeps."
+    const val CONNECTION = "Whether the device's current network is metered (mobile data, a " +
+        "hotspot) or unmetered (Wi-Fi, Ethernet), as the app told the engine; \"unknown\" " +
+        "where the host cannot tell (desktop). For debugging."
     const val SLEEP = "Idle-sleep summary: \"always on\" if this host can't idle-sleep, " +
         "\"never slept\", or the total time paused over N pauses."
     const val LAST_WOKE = "When the node last woke on a real request, and why (foreground/" +

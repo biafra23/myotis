@@ -202,8 +202,11 @@ internal enum class Tone { NONE, BAD, WAIT, OK, GREAT }
 /** One tile on the status screen: a label, the headline value, a one-line detail, and a color tone. */
 internal data class Vital(val label: String, val value: String, val detail: String?, val tone: Tone)
 
-/** The four vitals the normal-mode status screen shows. [index] is null unless the log index is enabled. */
-internal data class Vitals(val el: Vital, val cl: Vital, val head: Vital, val index: Vital?)
+/**
+ * The vitals the normal-mode status screen shows. [index] is null unless the log index is
+ * enabled; [data] (today's data usage) is null where the host does not report it.
+ */
+internal data class Vitals(val el: Vital, val cl: Vital, val head: Vital, val index: Vital?, val data: Vital? = null)
 
 /**
  * The vitals for one network: usable execution peers, consensus state and servers,
@@ -224,6 +227,7 @@ internal fun vitalsOf(s: NodeSnapshot?, deepPoolThreshold: Int, catchUp: CatchUp
             Vital(CL_LABEL, "—", "sleeping", Tone.NONE),
             Vital(HEAD_LABEL, "—", "sleeping", Tone.NONE),
             index = indexVital(s, catchUp),
+            data = dataVital(s),
         )
     }
     if (s == null || !s.running) {
@@ -232,6 +236,8 @@ internal fun vitalsOf(s: NodeSnapshot?, deepPoolThreshold: Int, catchUp: CatchUp
             Vital(CL_LABEL, "—", null, Tone.NONE),
             Vital(HEAD_LABEL, "—", null, Tone.NONE),
             index = null,
+            // The day's figures outlive a stop of the network: they are still today's.
+            data = s?.let(::dataVital),
         )
     }
     val el = Vital(
@@ -272,7 +278,25 @@ internal fun vitalsOf(s: NodeSnapshot?, deepPoolThreshold: Int, catchUp: CatchUp
             Vital(HEAD_LABEL, formatAge(s.verifiedHeadAgeMs), "stale — waiting for a fresh head", Tone.WAIT)
         else -> Vital(HEAD_LABEL, formatAge(s.verifiedHeadAgeMs), "fresh", Tone.OK)
     }
-    return Vitals(el, cl, head, indexVital(s, catchUp))
+    return Vitals(el, cl, head, indexVital(s, catchUp), dataVital(s))
+}
+
+/**
+ * Today's data usage (docs/data-usage.md): the total, and beneath it the metered /
+ * unmetered split where the host can tell the two apart — else the two directions, so
+ * a host that never knows (desktop) does not call every byte unmetered. Informational:
+ * no tone. Null where the host does not report usage.
+ */
+internal fun dataVital(s: NodeSnapshot): Vital? {
+    val u = s.dataUsage ?: return null
+    val t = DataUsageText.Today(u.todayIn, u.todayOut, u.todayMeteredIn, u.todayMeteredOut)
+    val detail = if (DataUsageText.showsSplit(t, s.networkMetering)) {
+        // One figure per line: a phone-width tile would otherwise break one mid-figure.
+        "${DataUsageText.bytes(t.metered)} metered\n${DataUsageText.bytes(t.unmetered)} unmetered"
+    } else {
+        "↓ ${DataUsageText.bytes(u.todayIn)} ↑ ${DataUsageText.bytes(u.todayOut)}"
+    }
+    return Vital(DATA_LABEL, DataUsageText.bytes(t.total), detail, Tone.NONE)
 }
 
 /** The log-index tile, or null when the engine reports no enabled index. */
@@ -313,3 +337,4 @@ internal const val EL_LABEL = "Execution peers"
 internal const val CL_LABEL = "Consensus"
 internal const val HEAD_LABEL = "Verified head"
 internal const val INDEX_LABEL = "Log index"
+internal const val DATA_LABEL = "Data today"

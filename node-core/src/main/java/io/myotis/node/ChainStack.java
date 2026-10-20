@@ -123,6 +123,13 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
     private final ClPeerCachePort clPeerCache;
     private final io.myotis.evm.ccipread.CcipGateway ccipGateway;
     private final Path syncSnapshotFile;
+    /** This stack's bytes on the wire (docs/data-usage.md): RLPx + discv4 count into
+     *  its EL layer, libp2p into its CL layer. Lives as long as the stack, so a
+     *  pause/resume keeps counting into the same one. */
+    private final com.jaeckel.ethp2p.core.traffic.TrafficMeter traffic =
+            new com.jaeckel.ethp2p.core.traffic.TrafficMeter();
+    /** Today's figures over {@link #traffic}, kept beside the snapshot. */
+    private final io.myotis.engines.common.DataUsageLedger usage;
 
     // -- per-stack mutable state (formerly Main/NodeService singletons) ---------
     private final Set<String> attempted = ConcurrentHashMap.newKeySet();
@@ -234,6 +241,12 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         this.clPeerCache = clPeerCache;
         this.ccipGateway = ccipGateway;
         this.syncSnapshotFile = syncSnapshotFile;
+        this.usage = new io.myotis.engines.common.DataUsageLedger(
+                () -> new long[] {traffic.el.in(), traffic.el.out(), traffic.cl.in(), traffic.cl.out()},
+                syncSnapshotFile != null
+                        ? syncSnapshotFile.resolveSibling(
+                                io.myotis.engines.common.DataUsageLedger.fileName(network.name()))
+                        : null);
         this.forkWatch = ForkWatch.enabledFor(network) ? ForkWatch.forNetwork(network) : null;
         this.clForkWatch = ClForkWatch.forNetwork(network);
         this.wakeGate = new WakeGate(phase::get, this::readyForReads, this::notReadyDetail,
@@ -425,6 +438,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         sleepMetrics.onPause(System.currentTimeMillis(), System.nanoTime());
         log.info("[{}] pausing: quiescing networking (RPC keeps listening)", network.name());
         closeNetworkingComponents();
+        usage.tick(true);   // today's figures go to disk with the rest of the warm state
         log.info("[{}] paused", network.name());
         return true;
     }
@@ -563,6 +577,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         if (discV4 != null) { try { discV4.close(); } catch (Throwable ignored) {} }
         try { peerCache.close(); } catch (Throwable ignored) {}
         try { clPeerCache.close(); } catch (Throwable ignored) {}
+        usage.tick(true);
         attempted.clear();
         backoff.clear();
         busySeen.clear();
@@ -717,6 +732,10 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
 
     /** Inbound-serve counters for the status surfaces. */
     public ServeStats serveStats() { return serveStats; }
+
+    /** This stack's data usage, ticked (docs/data-usage.md); {@code force} also
+     *  writes today's file. */
+    public io.myotis.api.DataUsage dataUsage(boolean force) { return usage.tick(force); }
     public io.myotis.evm.world.ReadStats readStats() { return readStats; }
     /** The fork watch, or null where it is not enabled for this network. */
     public ForkWatch forkWatch() { return forkWatch; }
@@ -864,6 +883,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
     private void startDiscV4(List<Enr> dnsElEnrs) throws Exception {
         List<InetSocketAddress> mergedBootnodes = mergeBootnodes(dnsElEnrs);
         this.discV4 = buildDiscV4(mergedBootnodes);
+        discV4.setTrafficCounter(traffic.el);
         try {
             discV4.start(ports.elPort());
         } catch (Exception e) {
@@ -901,6 +921,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         // Apply a window size set before start(): setServedBlockWindow may have run while
         // connector was still null (hosts read Settings before booting the stack).
         conn.servedWindow().setMaxWindow(servedBlockWindow);
+        conn.setTrafficCounter(traffic.el);
         return conn;
     }
 
@@ -1088,6 +1109,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         blc.setProvenNonLightClient(clPeerCache.lightClientDenied());
         blc.setOnLightClientVerdict(clPeerCache::markLightClientBatch);
         blc.setSnapshotFile(syncSnapshotFile);
+        blc.setWireHandler(new com.jaeckel.ethp2p.networking.traffic.CountingHandler(traffic.cl));
         // Every peer Status the host decodes feeds the CL fork watch (a /dns4/
         // peer names no IP literal and casts no vote).
         blc.setOnPeerStatus((remote, digest) -> {

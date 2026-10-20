@@ -341,6 +341,17 @@ class CommandHandlerJsonGoldenTest {
                 CommandHandler.buildHeadersJson(r));
     }
 
+    // -- status: data usage ---------------------------------------------------
+
+    @Test
+    void dataUsageJson() {
+        assertEquals("{\"bytesIn\":40,\"bytesOut\":6,\"elBytesIn\":10,\"elBytesOut\":2,"
+                        + "\"clBytesIn\":30,\"clBytesOut\":4,\"day\":\"2026-10-20\",\"todayBytesIn\":400,"
+                        + "\"todayBytesOut\":60,\"todayMeteredBytesIn\":100,\"todayMeteredBytesOut\":9}",
+                CommandHandler.buildDataUsageJson(
+                        new io.myotis.api.DataUsage(40, 6, 10, 2, 30, 4, "2026-10-20", 400, 60, 100, 9)));
+    }
+
     // -- status / beacon-status: the fork-watch upgrade advisory -------------
 
     @Test

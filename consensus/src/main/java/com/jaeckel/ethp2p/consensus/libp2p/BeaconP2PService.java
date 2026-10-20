@@ -308,6 +308,22 @@ public class BeaconP2PService implements AutoCloseable {
         this(null);
     }
 
+    /** Set before {@link #start()}: installed on every connection's raw channel. */
+    private volatile io.netty.channel.ChannelHandler wireHandler;
+
+    /**
+     * A {@code @Sharable} Netty handler to install on every connection's channel
+     * BEFORE the secure channel — so it sees the socket's bytes, noise and muxer
+     * framing included (the host's data-usage counter, docs/data-usage.md). Must be
+     * set before {@link #start()}.
+     */
+    public void setWireHandler(io.netty.channel.ChannelHandler handler) {
+        if (host != null) {
+            throw new IllegalStateException("the wire handler cannot change after start()");
+        }
+        this.wireHandler = handler;
+    }
+
     public BeaconP2PService(Supplier<StatusMessage> localStatusSupplier) {
         this.localStatusSupplier = localStatusSupplier;
     }
@@ -375,14 +391,24 @@ public class BeaconP2PService implements AutoCloseable {
         // `gossip` field doc: Lighthouse fatally bans peers that lack it). Topic
         // subscription is a separate switch, off by default — PR 1 of the
         // gossipsub rollout plan (plan-gossipsub-subscription.md) is on hold.
+        io.netty.channel.ChannelHandler wire = wireHandler;
         HostBuilder hostBuilder = new HostBuilder()
                 .transport(TcpTransport::new)
                 .secureChannel((key, muxers) -> new NoiseXXSecureChannel(key, muxers))
                 .muxer(StreamMuxerProtocol::getYamux)
                 .muxer(StreamMuxerProtocol::getMplex)
                 .listen("/ip4/0.0.0.0/tcp/0") // ephemeral port; some peers reject dial-only hosts
-                // Ethereum CL spec requires secp256k1 identity keys
-                .builderModifier(b -> b.getIdentity().random(KeyType.SECP256K1));
+                // ONE modifier: HostBuilder keeps only the last one it is given.
+                .builderModifier(b -> {
+                    // Ethereum CL spec requires secp256k1 identity keys
+                    b.getIdentity().random(KeyType.SECP256K1);
+                    if (wire != null) {
+                        b.debug(d -> {
+                            d.getBeforeSecureHandler().addNettyHandler(wire);
+                            return kotlin.Unit.INSTANCE;
+                        });
+                    }
+                });
         gossipExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "beacon-gossip-router");
             t.setDaemon(true);

@@ -209,7 +209,11 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
                 stack.elHunting(),
                 stack.rpcListenPort(),
                 stack.rpcServing(),
-                upgradeAdvisory(stack.forkWatch(), stack.clForkWatch()));
+                upgradeAdvisory(stack.forkWatch(), stack.clForkWatch()),
+                // RLPx, discv4 and libp2p bytes; discv5's are not counted on this
+                // engine (docs/data-usage.md).
+                stack.dataUsage(false),
+                io.myotis.engines.common.DataUsageLedger.metering());
     }
 
     /** The fork watches' current advisory as the API shape — the EL and CL detectors'

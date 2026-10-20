@@ -3,7 +3,9 @@ package io.myotis.jsonrpc
 import io.myotis.api.BeaconState
 import io.myotis.api.BeaconStatus
 import io.myotis.api.ClPeerInfo
+import io.myotis.api.DataUsage
 import io.myotis.api.LifecycleState
+import io.myotis.api.NetworkMetering
 import io.myotis.api.NodeStatusReads
 import io.myotis.api.PeerInfo
 import io.myotis.api.StatusSnapshot
@@ -79,6 +81,8 @@ class MyotisStatusRpcTest {
         /* rpcServing */ true,
         // Non-null on purpose: the exact-string asserts prove it stays off JSON-RPC.
         /* upgradeAdvisory */ UpgradeAdvisory(UpgradePhase.ACTIVE, 1_791_294_816L, "0x6c1d9423", 3),
+        /* dataUsage */ DataUsage(40, 6, 10, 2, 30, 4, "2026-10-20", 400, 60, 100, 9),
+        /* networkMetering */ NetworkMetering.METERED,
     )
 
     private fun beaconStatus(
@@ -116,7 +120,10 @@ class MyotisStatusRpcTest {
                 """"connectedPeers":4,"readyPeers":3,"snapPeers":2,"snapServingPeers":1,"snap2ServingPeers":7,""" +
                 """"backedOffPeers":1,""" +
                 """"blacklistedPeers":0,"pauseCount":7,"totalPausedMs":1000,""" +
-                """"lastPauseEpochMs":111,"lastResumeEpochMs":222,"lastWakeReason":"REQUEST"}""",
+                """"lastPauseEpochMs":111,"lastResumeEpochMs":222,"lastWakeReason":"REQUEST",""" +
+                """"dataUsage":{"bytesIn":40,"bytesOut":6,"elBytesIn":10,"elBytesOut":2,"clBytesIn":30,""" +
+                """"clBytesOut":4,"day":"2026-10-20","todayBytesIn":400,"todayBytesOut":60,""" +
+                """"todayMeteredBytesIn":100,"todayMeteredBytesOut":9},"networkMetering":"METERED"}""",
             encode(StatusJson.status(statusSnapshot(), 42L)),
         )
     }
@@ -124,7 +131,7 @@ class MyotisStatusRpcTest {
     @Test fun statusJson_nullWakeReason_isJsonNull() {
         assertTrue(
             encode(StatusJson.status(statusSnapshot(lastWakeReason = null), 0L))
-                .endsWith(""""lastWakeReason":null}"""),
+                .contains(""""lastWakeReason":null,"""),
         )
     }
 

@@ -232,8 +232,15 @@ public final class RLPxConnector implements AutoCloseable {
                     // RLPxHandler routes decoded messages to EthHandler
                     RLPxHandler rlpxHandler = new RLPxHandler(
                         localKey, peerPublicKey,
-                        msg -> ethHandler.onMessage(ch.pipeline().firstContext(), msg)
+                        // The rlpx handler's own context (the first one before the
+                        // traffic counter could precede it).
+                        msg -> ethHandler.onMessage(ch.pipeline().context("rlpx"), msg)
                     );
+                    var counter = trafficCounter;
+                    if (counter != null) {
+                        ch.pipeline().addLast("traffic",
+                                new com.jaeckel.ethp2p.networking.traffic.CountingHandler(counter));
+                    }
                     ch.pipeline().addLast("rlpx", rlpxHandler);
                     ch.pipeline().addLast("eth", ethHandler);
                     ch.closeFuture().addListener(f -> {
@@ -622,6 +629,18 @@ public final class RLPxConnector implements AutoCloseable {
         }
         log.info("[rlpx] Broadcast transaction to {} peer(s)", sent);
         return sent;
+    }
+
+    /** Counts every session's bytes (set before the first dial); null = not counted. */
+    private volatile com.jaeckel.ethp2p.core.traffic.TrafficMeter.Counter trafficCounter;
+
+    /**
+     * Count every RLPx session's socket bytes — handshake and frames — into
+     * {@code counter} (the stack's data usage, docs/data-usage.md). Applies to
+     * connections opened after the call.
+     */
+    public void setTrafficCounter(com.jaeckel.ethp2p.core.traffic.TrafficMeter.Counter counter) {
+        this.trafficCounter = counter;
     }
 
     /**

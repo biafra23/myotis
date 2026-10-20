@@ -44,6 +44,7 @@ async fn the_filter_judges_live_nodes() {
             bootnodes: cfg.bootnodes.clone(),
             fork_filter: filter_on.then(|| fork_filter_for(&cfg)),
             pool_below_target: None,
+            traffic: None,
         },
         tx,
     )

@@ -72,6 +72,7 @@ async fn pool_dials_from_discovery_and_serves_a_verified_account() {
         None,
         None,
         None,
+        Default::default(),
     );
 
     let mut probe = [0u8; 20];

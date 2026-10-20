@@ -36,7 +36,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 49
+#define MYOTIS_ABI_VERSION 50
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -106,6 +106,15 @@ bool myotis_set_tor_storage_dirs(const char *state_dir, const char *cache_dir);
  * engine yet and leaves it off (mobile). Never used while Tor is enabled.
  * Returns the state now in force. Process-global, not per-handle. */
 bool myotis_set_dns_discovery(bool on);
+
+/* The host's word on the device's current network, for the status JSON's
+ * data-usage figures (docs/data-usage.md): 0 unknown, 1 unmetered, 2 metered.
+ * Bytes moved from now on count as metered while it is 2. Returns false, and
+ * records nothing, for any other code. Process-global, not per-handle. */
+bool myotis_set_network_metering(int32_t code);
+
+/* The metering code last recorded (0 until a host reports one). */
+int32_t myotis_network_metering(void);
 
 /* Status JSON object (camelCase keys), or "{}" for an unknown handle. */
 char *myotis_status_json(int64_t handle);

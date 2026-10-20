@@ -8,6 +8,7 @@ import com.jaeckel.ethp2p.android.AndroidQueryHistory
 import com.jaeckel.ethp2p.android.BalanceWatchRunner
 import com.jaeckel.ethp2p.android.NodeService
 import io.myotis.ui.AccountResult
+import io.myotis.ui.DataUsageRow
 import io.myotis.ui.EnsOwnership
 import io.myotis.ui.EnsProfile
 import io.myotis.ui.EnsRecord
@@ -414,6 +415,19 @@ private fun NodeService.Snapshot.toModel(): NodeSnapshot = NodeSnapshot(
     upgrade = upgradeAdvisory()?.let {
         UpgradeNotice(it.phase().name, it.activationTime(), it.forkId(), it.observedPeers())
     },
+    dataUsage = dataUsage().toRow(),
+    networkMetering = networkMetering().name,
+)
+
+/** The API's [io.myotis.api.DataUsage] as the Status rows' [DataUsageRow]. */
+internal fun io.myotis.api.DataUsage.toRow() = DataUsageRow(
+    day = day(),
+    todayIn = todayBytesIn(),
+    todayOut = todayBytesOut(),
+    todayMeteredIn = todayMeteredBytesIn(),
+    todayMeteredOut = todayMeteredBytesOut(),
+    totalIn = bytesIn(),
+    totalOut = bytesOut(),
 )
 
 /** Android actual of [Settings] over the NodeService SharedPreferences statics. */

@@ -59,6 +59,13 @@ class TypedEngineTest {
         override fun setWsBoundPeriods(handle: Long, periods: Long) = true
         override fun acceptStaleAnchor(handle: Long) = true
         override fun statusJson(handle: Long) = status
+        var metering = 0
+        override fun setNetworkMetering(code: Int): Boolean {
+            if (code !in 0..2) return false
+            metering = code
+            return true
+        }
+        override fun networkMetering() = metering
         override fun requestAccountJson(handle: Long, address: String, block: String): String {
             calls += "account $address $block"
             return account
@@ -159,6 +166,18 @@ class TypedEngineTest {
         engine.shutdownAll()
         assertEquals(setOf(7L, 8L), native.stopped.toSet())
         assertTrue(engine.hostedNetworks().isEmpty())
+    }
+
+    @Test
+    fun networkMeteringCrossesAsTheEngineCodes() {
+        assertEquals(NetworkMetering.UNKNOWN, engine.networkMetering())
+        engine.setNetworkMetering(NetworkMetering.METERED)
+        assertEquals(2, native.metering)
+        assertEquals(NetworkMetering.METERED, engine.networkMetering())
+        engine.setNetworkMetering(NetworkMetering.UNMETERED)
+        assertEquals(1, native.metering)
+        engine.setNetworkMetering(NetworkMetering.UNKNOWN)
+        assertEquals(0, native.metering)
     }
 
     // ---- the reads ----

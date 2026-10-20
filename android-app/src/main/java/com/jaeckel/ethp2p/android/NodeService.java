@@ -1435,6 +1435,30 @@ public final class NodeService extends Service {
                         android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED));
     }
 
+    /** The device's current network as the engine's data-usage figures label it
+     *  (docs/data-usage.md): no active network (or a read error) is UNKNOWN. */
+    static io.myotis.api.NetworkMetering meteringNow(android.content.Context c) {
+        android.net.NetworkCapabilities caps = activeNetworkCapabilities(c);
+        if (caps == null) return io.myotis.api.NetworkMetering.UNKNOWN;
+        return caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+                ? io.myotis.api.NetworkMetering.UNMETERED
+                : io.myotis.api.NetworkMetering.METERED;
+    }
+
+    /** Tell the engine what kind of network the device is on, so bytes moved on mobile
+     *  data count as metered. Cheap and idempotent; called on every connectivity change. */
+    private void pushNetworkMetering() {
+        try {
+            io.myotis.api.NetworkMetering m = meteringNow(this);
+            if (ENGINE.networkMetering() != m) {
+                ENGINE.setNetworkMetering(m);
+                LogBuffer.i(TAG, "network metering: " + m);
+            }
+        } catch (Throwable t) {
+            LogBuffer.w(TAG, "network metering push failed: " + t);
+        }
+    }
+
     /** The active network is unmetered (a read error counts as metered: the shorter scans and
      *  the token interval, {@link WatchPolicy}) — for a check started now. */
     public static boolean unmeteredNow(android.content.Context c) {
@@ -1781,15 +1805,15 @@ public final class NodeService extends Service {
         if (!RUNNING.get()) return;
         try {
             // Poll live state OUTSIDE the lock (status()/lifecycle() are blocking engine calls).
-            String[] tt = notificationText();
-            String key = tt[0] + "\n" + tt[1];
+            String[] tt = notificationText(true);
+            String key = tt[0] + "\n" + tt[1] + "\n" + tt[2] + "\n" + tt[3];
             // Diff-and-notify atomically so concurrent callers can't post out of order or both
             // re-notify the same content; building the Notification is cheap (no engine calls).
             synchronized (notifLock) {
                 if (key.equals(notifiedContent)) return;   // unchanged → skip the re-notify
                 notifiedContent = key;
                 NotificationManager nm = getSystemService(NotificationManager.class);
-                if (nm != null) nm.notify(NOTIFICATION_ID, buildNotification(tt[0], tt[1]));
+                if (nm != null) nm.notify(NOTIFICATION_ID, buildNotification(tt[0], tt[1], tt[2], tt[3]));
             }
         } catch (Throwable t) {
             LogBuffer.w(TAG, "notification update failed: " + t);
@@ -1797,50 +1821,115 @@ public final class NodeService extends Service {
     }
 
     /**
-     * The ongoing notification's {@code [title, text]}, derived from live node + connectivity
-     * state. Priority: idle-sleep (networking intentionally off) → no device network → per-network
-     * readiness. Readiness mirrors the in-app {@code ReadinessStrip} tiers.
+     * The ongoing notification's {@code [title, text, dataShort, dataLine]}, derived from live
+     * node + connectivity state. Priority for the text: idle-sleep (networking intentionally off)
+     * → no device network → per-network readiness. Readiness mirrors the in-app
+     * {@code ReadinessStrip} tiers. The data fields are today's usage across every hosted network
+     * ({@link #dataTodayText}).
      */
-    private String[] notificationText() {
+    private String[] notificationText(boolean withData) {
+        NotifReads r = readForNotification(withData);
+        String[] data = withData ? dataTodayText(r) : new String[]{"", ""};
         if (allStacksPaused()) {
-            return new String[]{"Myotis node sleeping", "Networking off — a wallet request wakes it"};
+            return new String[]{"Myotis node sleeping", "Networking off — a wallet request wakes it",
+                    data[0], data[1]};
         }
         if (!networkAvailable()) {
             // Actively meant to be running, but the device has no connectivity — surface it: the
             // node can't discover peers or sync until a network returns.
-            return new String[]{"Myotis node running", "No network connection"};
+            return new String[]{"Myotis node running", "No network connection", data[0], data[1]};
         }
-        return new String[]{"Myotis node running", readinessSummary()};
+        return new String[]{"Myotis node running", readinessSummary(r), data[0], data[1]};
+    }
+
+    /** What one notification refresh read from the hosted networks. */
+    private static final class NotifReads {
+        /** network → readiness word, sorted by network name so the text is stable across polls. */
+        final java.util.TreeMap<String, String> words = new java.util.TreeMap<>();
+        /** each read network's data usage (filled only when the data line was asked for). */
+        final List<io.myotis.api.DataUsage> usage = new java.util.ArrayList<>();
+        /** some network's status could not be read: its bytes are unknown. */
+        boolean usageUnreadable;
+    }
+
+    /** One pass over the hosted networks per refresh, with at most ONE {@code status()} per
+     *  network feeding both its readiness word and its data figures. A paused network's
+     *  readiness needs no status; its data figures do (they outlive a pause), so it is read
+     *  only when {@code withData}. */
+    private NotifReads readForNotification(boolean withData) {
+        NotifReads r = new NotifReads();
+        for (Map.Entry<String, ChainHandle> e : handles.entrySet()) {
+            String n = e.getKey();
+            ChainHandle h = e.getValue();
+            boolean paused;
+            try {
+                paused = h.lifecycle() == io.myotis.api.LifecycleState.PAUSED;
+            } catch (Throwable t) {
+                r.words.put(n, "…");
+                r.usageUnreadable = true;
+                continue;
+            }
+            if (paused && !withData) {
+                r.words.put(n, "sleeping");
+                continue;
+            }
+            StatusSnapshot s;
+            try {
+                s = h.status();
+            } catch (Throwable t) {
+                r.words.put(n, paused ? "sleeping" : "…");
+                r.usageUnreadable = true;
+                continue;
+            }
+            r.words.put(n, paused ? "sleeping" : readinessWord(s));
+            r.usage.add(s.dataUsage());
+        }
+        return r;
+    }
+
+    /** {@code [short, line]} for the notification — {@code "12.4 MB today"} and
+     *  {@code "Data today 12.4 MB · 4.1 MB metered · 8.3 MB unmetered"}: today's usage of every
+     *  hosted network, running or asleep, added up (docs/data-usage.md). Two empty strings —
+     *  no data line at all, never a wrong figure — before any network is hosted or when one
+     *  network's status could not be read. Only the latest local day's figures are added: just
+     *  after midnight a network whose ledger has not ticked yet still reports yesterday's. */
+    private static String[] dataTodayText(NotifReads r) {
+        if (r.usage.isEmpty() || r.usageUnreadable) return new String[]{"", ""};
+        String day = "";
+        for (io.myotis.api.DataUsage u : r.usage) {
+            if (u.day().compareTo(day) > 0) day = u.day();   // YYYY-MM-DD sorts as dates
+        }
+        if (day.isEmpty()) return new String[]{"", ""};       // nothing measured
+        io.myotis.ui.DataUsageText.Today t = io.myotis.ui.DataUsageText.Today.ZERO;
+        for (io.myotis.api.DataUsage u : r.usage) {
+            if (!day.equals(u.day())) continue;
+            t = t.plus(new io.myotis.ui.DataUsageText.Today(u.todayBytesIn(), u.todayBytesOut(),
+                    u.todayMeteredBytesIn(), u.todayMeteredBytesOut()));
+        }
+        return new String[]{
+                io.myotis.ui.DataUsageText.INSTANCE.notificationShort(t),
+                io.myotis.ui.DataUsageText.INSTANCE.notificationLine(t)};
     }
 
     /** Per-network readiness on one line, e.g. {@code "mainnet ready · gnosis syncing"}; sorted by
      *  network name so the text is stable across polls. Empty (pre-boot) → {@code "Starting…"}. */
-    private String readinessSummary() {
-        java.util.List<String> names = new java.util.ArrayList<>(handles.keySet());
-        java.util.Collections.sort(names);
+    private static String readinessSummary(NotifReads r) {
         StringBuilder sb = new StringBuilder();
-        for (String n : names) {
-            ChainHandle h = handles.get(n);
-            if (h == null) continue;
+        for (Map.Entry<String, String> e : r.words.entrySet()) {
             if (sb.length() > 0) sb.append(" · ");
-            sb.append(n).append(' ').append(readinessWord(h));
+            sb.append(e.getKey()).append(' ').append(e.getValue());
         }
         return sb.length() == 0 ? "Starting…" : sb.toString();
     }
 
-    /** One-word readiness for a stack, mirroring the app's {@code ReadinessStrip} tiers:
-     *  {@code sleeping} (paused) → {@code syncing} (beacon not SYNCED) → {@code warming up}
-     *  (SYNCED but no verified head yet, so reads would 503) → {@code ready}. */
-    private static String readinessWord(ChainHandle h) {
-        try {
-            if (h.lifecycle() == io.myotis.api.LifecycleState.PAUSED) return "sleeping";
-            StatusSnapshot s = h.status();
-            if (s.beaconState() != BeaconState.SYNCED) return "syncing";
-            if (s.verifiedHeadAgeMs() == Long.MAX_VALUE) return "warming up";
-            return "ready";
-        } catch (Throwable t) {
-            return "…";
-        }
+    /** One-word readiness for a running stack, mirroring the app's {@code ReadinessStrip} tiers:
+     *  {@code syncing} (beacon not SYNCED) → {@code warming up} (SYNCED but no verified head yet,
+     *  so reads would 503) → {@code ready}. A paused stack is {@code sleeping}
+     *  ({@link #readForNotification}). */
+    private static String readinessWord(StatusSnapshot s) {
+        if (s.beaconState() != BeaconState.SYNCED) return "syncing";
+        if (s.verifiedHeadAgeMs() == Long.MAX_VALUE) return "warming up";
+        return "ready";
     }
 
     /** Register a default-network callback that refreshes the notification on connectivity
@@ -1851,6 +1940,9 @@ public final class NodeService extends Service {
             ConnectivityManager cm = getSystemService(ConnectivityManager.class);
             if (cm == null) return;
             lastNetworkUp = networkAvailable();   // seed so the first callback doesn't spuriously poll
+            // And the data-usage label, from the start — off the main thread: it ticks
+            // every network's ledger, which may write its file.
+            QUERY_POOL.execute(this::pushNetworkMetering);
             ConnectivityManager.NetworkCallback cb = new ConnectivityManager.NetworkCallback() {
                 @Override public void onAvailable(Network network) { onNotifConnectivityChanged(); }
                 @Override public void onLost(Network network) { onNotifConnectivityChanged(); }
@@ -1876,6 +1968,9 @@ public final class NodeService extends Service {
      *  up↔down gate is checked under {@link #notifLock} so concurrent callbacks don't both poll. */
     private void onNotifConnectivityChanged() {
         QUERY_POOL.execute(() -> {
+            // Metering changes ride on capability callbacks that do NOT flip up↔down
+            // (Wi-Fi → mobile data), so it is pushed before the gate below.
+            pushNetworkMetering();
             boolean up = networkAvailable();
             synchronized (notifLock) {
                 Boolean prev = lastNetworkUp;
@@ -1989,7 +2084,12 @@ public final class NodeService extends Service {
                                           // syncCurrentPeriod is the refused anchor's age
             // Fork watch: peers announce (or already activated) a network upgrade this
             // build doesn't support; null = none / not watched here. Kept while paused.
-            io.myotis.api.UpgradeAdvisory upgradeAdvisory) {}
+            io.myotis.api.UpgradeAdvisory upgradeAdvisory,
+            // This network's bytes on the wire, since start and today (docs/data-usage.md);
+            // kept while paused.
+            io.myotis.api.DataUsage dataUsage,
+            // The device network's metering as last pushed to the engine (debugging aid).
+            io.myotis.api.NetworkMetering networkMetering) {}
 
     /** Result of a get-account query. Mirrors the JVM daemon's JSON response shape. */
     public record AccountQueryResult(
@@ -2405,11 +2505,13 @@ public final class NodeService extends Service {
         // API 34+ requires the foregroundServiceType to be passed here and
         // to match the manifest's <service android:foregroundServiceType="...">
         // declaration. API 29-33 ignore the third arg. minSdk is 29.
-        String[] tt0 = notificationText();
+        // No data line yet: this runs on the main thread, and reading it ticks every network's
+        // usage ledger (which may write its file). The idle tick adds it within 30 s.
+        String[] tt0 = notificationText(false);
         synchronized (notifLock) {   // the field's documented guard — keep the prime
-            notifiedContent = tt0[0] + "\n" + tt0[1];   // ordered with any concurrent diff-and-notify
+            notifiedContent = tt0[0] + "\n" + tt0[1] + "\n" + tt0[2] + "\n" + tt0[3];   // ordered with any concurrent diff-and-notify
         }
-        startForeground(NOTIFICATION_ID, buildNotification(tt0[0], tt0[1]),
+        startForeground(NOTIFICATION_ID, buildNotification(tt0[0], tt0[1], tt0[2], tt0[3]),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
         startIdleTicker();
         startWebRefusalPoll();
@@ -2824,7 +2926,7 @@ public final class NodeService extends Service {
                     s.peerHeaderRequests(), s.peerHeaderRequestsServed(),
                     s.peerBodyRequests(), s.peerBodyRequestsServed(),
                     s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing(), s.wsBoundPeriods(),
-                    s.upgradeAdvisory());
+                    s.upgradeAdvisory(), s.dataUsage(), s.networkMetering());
         }
         return new Snapshot(true, lifecycle, chainStartMs,
                 s.discoveredPeers(), s.connectedPeers(), s.readyPeers(),
@@ -2841,7 +2943,7 @@ public final class NodeService extends Service {
                 s.peerHeaderRequests(), s.peerHeaderRequestsServed(),
                 s.peerBodyRequests(), s.peerBodyRequestsServed(),
                 s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing(), s.wsBoundPeriods(),
-                s.upgradeAdvisory());
+                s.upgradeAdvisory(), s.dataUsage(), s.networkMetering());
     }
 
     // ---- Failure forensics (see ProcessHealthDiag) ----
@@ -3256,7 +3358,9 @@ public final class NodeService extends Service {
         webNotified.clear();
     }
 
-    private Notification buildNotification(String title, String text) {
+    /** {@code dataShort} goes in the collapsed header ("12.4 MB today"); {@code dataLine}, the
+     *  metered/unmetered split, under the text when expanded. Both empty → neither is shown. */
+    private Notification buildNotification(String title, String text, String dataShort, String dataLine) {
         // Guard the channel creation like updateNotification() treats the manager as nullable —
         // this also runs on the startForeground() path, which isn't wrapped in try/catch, so a
         // (practically impossible) null manager must not NPE the service start.
@@ -3271,11 +3375,17 @@ public final class NodeService extends Service {
                     NotificationManager.IMPORTANCE_LOW);
             nm.createNotificationChannel(channel);
         }
-        return new Notification.Builder(this, CHANNEL_ID)
+        Notification.Builder b = new Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle(title)
                 .setContentText(text)
                 .setSmallIcon(R.drawable.ic_stat_myotis)
                 .setOngoing(true)
-                .build();
+                // The data line changes as bytes move: re-posts must stay silent.
+                .setOnlyAlertOnce(true);
+        if (!dataShort.isEmpty()) b.setSubText(dataShort);
+        if (!dataLine.isEmpty()) {
+            b.setStyle(new Notification.BigTextStyle().bigText(text + "\n" + dataLine));
+        }
+        return b.build();
     }
 }

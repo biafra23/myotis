@@ -5,6 +5,7 @@ import io.myotis.api.EngineConfig;
 import io.myotis.api.EngineException;
 import io.myotis.api.MyotisEngine;
 import io.myotis.api.NetworkInfo;
+import io.myotis.api.NetworkMetering;
 import io.myotis.api.ports.EnginePorts;
 import io.myotis.engines.rust.RustMyotisEngine;
 import io.myotis.node.api.JavaMyotisEngine;
@@ -232,5 +233,22 @@ public final class SelectorEngine implements MyotisEngine {
         java.shutdownAll();
         RustMyotisEngine r = rust;
         if (r != null) r.shutdownAll();
+    }
+
+    /** Both engines hear it: a network created later on either one must count
+     *  under the device's current metering from its first byte. The Rust engine
+     *  first: {@link #networkMetering()} reads the Java one, so a Rust failure
+     *  leaves it reporting the OLD value and a host that pushes only on a change
+     *  retries. */
+    @Override
+    public void setNetworkMetering(NetworkMetering metering) {
+        if (metering == null) throw new EngineException("metering is required");
+        if (RustMyotisEngine.isAvailable()) rustEngine().setNetworkMetering(metering);
+        java.setNetworkMetering(metering);
+    }
+
+    @Override
+    public NetworkMetering networkMetering() {
+        return java.networkMetering();
     }
 }

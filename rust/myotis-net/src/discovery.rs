@@ -118,6 +118,10 @@ pub struct DiscoveryConfig {
     /// record is self-declared and would make the watch's source floor free).
     /// None = no detector (tools, tests).
     pub cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
+    /// The stack's meter: while this discovery runs, it takes its share of
+    /// discv5's process-wide byte counts ([`crate::traffic::Discv5Share`]).
+    /// None = not counted (tools, tests).
+    pub traffic: Option<Arc<crate::traffic::TrafficMeter>>,
 }
 
 /// Spawn the discovery task. Discovered, fork-matched peers stream out on the
@@ -146,6 +150,9 @@ pub async fn spawn(
 
     let bootnodes = seed_bootnodes(&discv5, &config.bootstrap_enrs);
 
+    // Joined before the socket opens so the bootstrap pings are counted;
+    // held by the lookup task, so it leaves the share when the task ends.
+    let share = config.traffic.as_ref().map(crate::traffic::Discv5Share::join);
     discv5
         .start()
         .await
@@ -184,6 +191,7 @@ pub async fn spawn(
         config.hunt_boost,
         tx,
         config.cl_fork_watch,
+        share,
     ));
     Ok((task, table_size))
 }
@@ -243,6 +251,8 @@ async fn run_lookups(
     hunt_boost: Arc<AtomicBool>,
     tx: mpsc::Sender<DiscoveredPeer>,
     cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
+    // Held for the task's life only (see `spawn`).
+    _traffic_share: Option<crate::traffic::Discv5Share>,
 ) {
     // Once-ever emission set, SHARED with the Discovered-event consumer so a
     // re-seed (which clears it) refills the pool from both paths.

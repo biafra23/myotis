@@ -58,6 +58,24 @@ internal object StatusJson {
         put("lastResumeEpochMs", s.lastResumeEpochMs())
         val reason = s.lastWakeReason()
         if (reason == null) put("lastWakeReason", JsonNull) else put("lastWakeReason", reason)
+        // This network's bytes on the wire, since start and today, and the host's
+        // word on the device's network (docs/data-usage.md). Same keys and order as
+        // the IPC shape's.
+        val u = s.dataUsage()
+        put("dataUsage", buildJsonObject {
+            put("bytesIn", u.bytesIn())
+            put("bytesOut", u.bytesOut())
+            put("elBytesIn", u.elBytesIn())
+            put("elBytesOut", u.elBytesOut())
+            put("clBytesIn", u.clBytesIn())
+            put("clBytesOut", u.clBytesOut())
+            put("day", u.day())
+            put("todayBytesIn", u.todayBytesIn())
+            put("todayBytesOut", u.todayBytesOut())
+            put("todayMeteredBytesIn", u.todayMeteredBytesIn())
+            put("todayMeteredBytesOut", u.todayMeteredBytesOut())
+        })
+        put("networkMetering", s.networkMetering().name)
     }
 
     /** Mirrors CommandHandler.handleBeaconStatus, incl. its STALE_ANCHOR and

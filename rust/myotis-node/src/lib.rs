@@ -44,9 +44,10 @@ use myotis_engine::capi::{
     myotis_get_proof_json, myotis_get_storage_at_json, myotis_get_transaction_by_hash_json,
     myotis_resolve_block_hash_json,
     myotis_get_transaction_receipt_json, myotis_import_log_index_files, myotis_init,
-    myotis_log_index_status_json, myotis_pause, myotis_pending_nonce_overlay,
+    myotis_log_index_status_json, myotis_network_metering, myotis_pause, myotis_pending_nonce_overlay,
     myotis_request_account_json, myotis_resolve_ens_json, myotis_resume,
     myotis_send_raw_transaction_json, myotis_set_boot_enodes, myotis_set_log_index_config,
+    myotis_set_network_metering,
     myotis_set_ws_bound_periods, myotis_start,
     myotis_status_json, myotis_stop, myotis_string_free,
 };
@@ -191,6 +192,20 @@ pub fn create_with_checkpoint(
 pub fn start(env: &Env, handle: i64) -> bool {
     if !scheduler::owns(env, handle) { return false; }
     unsafe { myotis_start(handle) }
+}
+
+/// The host's word on the device's current network, for `statusJson`'s
+/// `dataUsage` (0 unknown, 1 unmetered, 2 metered); false — nothing recorded —
+/// for any other code. Process-wide, not per handle.
+#[napi]
+pub fn set_network_metering(code: i32) -> bool {
+    myotis_set_network_metering(code)
+}
+
+/// The metering code last recorded (0 until a host reports one).
+#[napi]
+pub fn network_metering() -> i32 {
+    myotis_network_metering()
 }
 
 /// Status JSON object (camelCase keys), or "{}" for an unknown handle.

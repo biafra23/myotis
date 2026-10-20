@@ -31,12 +31,14 @@ import io.myotis.engine.capi.myotis_set_log_index_config
 import io.myotis.engine.capi.myotis_send_raw_transaction_json
 import io.myotis.engine.capi.myotis_set_boot_enodes
 import io.myotis.engine.capi.myotis_init
+import io.myotis.engine.capi.myotis_network_metering
 import io.myotis.engine.capi.myotis_pause
 import io.myotis.engine.capi.myotis_pending_nonce_overlay
 import io.myotis.engine.capi.myotis_request_account_json
 import io.myotis.engine.capi.myotis_resolve_block_hash_json
 import io.myotis.engine.capi.myotis_resume
 import io.myotis.engine.capi.myotis_accept_stale_anchor
+import io.myotis.engine.capi.myotis_set_network_metering
 import io.myotis.engine.capi.myotis_set_ws_bound_periods
 import io.myotis.engine.capi.myotis_start
 import io.myotis.engine.capi.myotis_status_json
@@ -188,6 +190,17 @@ object RustEngine {
         requireAbi()
         return take(myotis_import_log_index_files(handle, pathsJson))
             ?: """{"error":"engine returned no result"}"""
+    }
+
+    /** The host's word on the device's network (0 unknown, 1 unmetered, 2 metered). */
+    fun setNetworkMetering(code: Int): Boolean {
+        requireAbi()
+        return myotis_set_network_metering(code)
+    }
+
+    fun networkMetering(): Int {
+        requireAbi()
+        return myotis_network_metering()
     }
 
     fun statusJson(handle: Long): String {

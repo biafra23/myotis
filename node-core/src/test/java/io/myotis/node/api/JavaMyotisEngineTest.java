@@ -115,6 +115,19 @@ class JavaMyotisEngineTest {
         assertEquals(0L, snap.lastResumeEpochMs());
         assertNull(snap.lastWakeReason());
 
+        // Data usage: nothing moved yet, today's day named; metering is what the
+        // engine was last told, and it is engine-wide.
+        assertEquals(0L, snap.dataUsage().bytesIn());
+        assertEquals(0L, snap.dataUsage().todayBytes());
+        assertEquals(java.time.LocalDate.now().toString(), snap.dataUsage().day());
+        io.myotis.api.NetworkMetering before = engine.networkMetering();
+        try {
+            engine.setNetworkMetering(io.myotis.api.NetworkMetering.METERED);
+            assertEquals(io.myotis.api.NetworkMetering.METERED, handle.status().networkMetering());
+        } finally {
+            engine.setNetworkMetering(before);
+        }
+
         // resume(reason) is a safe no-op on STOPPED (same as resume()).
         assertFalse(handle.resume(io.myotis.api.WakeReason.CATCH_UP));
         assertEquals(io.myotis.api.LifecycleState.STOPPED, handle.lifecycle());

@@ -23,6 +23,10 @@ internal interface NativeEngine {
     fun setWsBoundPeriods(handle: Long, periods: Long): Boolean
     fun acceptStaleAnchor(handle: Long): Boolean
     fun statusJson(handle: Long): String
+    /** `myotis_set_network_metering` (0 unknown, 1 unmetered, 2 metered); false for another code. */
+    fun setNetworkMetering(code: Int): Boolean
+    /** `myotis_network_metering`. */
+    fun networkMetering(): Int
 
     fun requestAccountJson(handle: Long, address: String, block: String): String
     fun getStorageProofJson(handle: Long, address: String, slot: Long, holder: String?): String

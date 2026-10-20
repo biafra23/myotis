@@ -40,5 +40,6 @@ pub mod protocols;
 pub mod reqresp;
 pub mod status;
 pub mod sync;
+pub mod traffic;
 
 pub use sync::{ChainConfig, SyncHandle, SyncState, SyncStatus};
