@@ -14,7 +14,8 @@ package io.myotis.api;
  * @param bytesOut              sent since the handle was created
  * @param elBytesIn             of {@code bytesIn}, the execution layer's (RLPx, discv4)
  * @param elBytesOut            of {@code bytesOut}, the execution layer's
- * @param clBytesIn             of {@code bytesIn}, the consensus layer's (libp2p, discv5)
+ * @param clBytesIn             of {@code bytesIn}, the consensus layer's (libp2p; plus discv5
+ *                              on the Rust engine)
  * @param clBytesOut            of {@code bytesOut}, the consensus layer's
  * @param day                   the local date the {@code today*} figures cover
  *                              ({@code YYYY-MM-DD}); empty when not measured
