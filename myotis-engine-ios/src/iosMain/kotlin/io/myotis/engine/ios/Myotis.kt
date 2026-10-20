@@ -85,4 +85,10 @@ internal object RustNativeEngine : NativeEngine {
         RustEngine.sendRawTransactionJson(handle, rawTxHex)
 
     override fun ensRecordJson(handle: Long, paramsJson: String) = RustEngine.ensRecordJson(handle, paramsJson)
+
+    override fun setLogIndexConfig(handle: Long, configJson: String) = RustEngine.setLogIndexConfig(handle, configJson)
+
+    override fun logIndexStatusJson(handle: Long) = RustEngine.logIndexStatusJson(handle)
+
+    override fun getLogsJson(handle: Long, filterJson: String) = RustEngine.getLogsJson(handle, filterJson)
 }

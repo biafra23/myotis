@@ -7,6 +7,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertSame
@@ -37,6 +38,9 @@ class TypedEngineTest {
         var send = """{"txHash":"0x${"ab".repeat(32)}"}"""
         var ens = """{"status":"noRecord","blockNumber":1,"verified":true}"""
         var receipt = "null"
+        var logConfigTaken = true
+        var logStatus = """{"enabled":true,"logCount":0,"entries":[]}"""
+        var logs: String? = "[]"
 
         override fun newLock(): EngineLock = object : EngineLock {
             override fun lock() {}
@@ -116,6 +120,18 @@ class TypedEngineTest {
         override fun ensRecordJson(handle: Long, paramsJson: String): String {
             calls += "ens $paramsJson"
             return ens
+        }
+        override fun setLogIndexConfig(handle: Long, configJson: String): Boolean {
+            calls += "logConfig $configJson"
+            return logConfigTaken
+        }
+        override fun logIndexStatusJson(handle: Long): String {
+            calls += "logStatus"
+            return logStatus
+        }
+        override fun getLogsJson(handle: Long, filterJson: String): String {
+            calls += "logs $filterJson"
+            return logs ?: throw IllegalStateException("the engine is not running")
         }
     }
 
@@ -341,6 +357,30 @@ class TypedEngineTest {
         assertNull(reads.headBlockNumber(), "a paused handle's frozen head")
         native.status = "{}"
         assertNull(reads.headBlockNumber())
+    }
+
+    // ---- the log index ----
+
+    @Test
+    fun theLogIndexCallsReachTheEngineAndItsAnswersComeBackVerbatim() {
+        val handle = sepolia()
+        val config = """{"enabled":true,"watch":[{"address":"0x${"11".repeat(20)}","fromBlock":5}]}"""
+        assertTrue(handle.setLogIndexConfig(config))
+        native.logConfigTaken = false
+        assertFalse(handle.setLogIndexConfig(config), "a config the engine refuses")
+        assertEquals(native.logStatus, handle.logIndexStatusJson())
+        val filter = """{"address":"0x${"11".repeat(20)}","fromBlock":"0x5","toBlock":"0x9"}"""
+        native.logs = """[{"blockNumber":"0x6"}]"""
+        assertEquals(native.logs, handle.reads().getLogs(filter))
+        // An uncovered range is the engine's error object, passed on, never an empty array.
+        native.logs = """{"error":"range not covered"}"""
+        assertEquals(native.logs, handle.reads().getLogs(filter))
+        native.logs = null
+        assertNull(handle.reads().getLogs(filter), "a failed call is no answer")
+        assertEquals(
+            listOf("logConfig $config", "logConfig $config", "logStatus") + List(3) { "logs $filter" },
+            native.calls,
+        )
     }
 
     @Test

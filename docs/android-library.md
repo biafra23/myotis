@@ -238,8 +238,9 @@ run, so the module carries its Kotlin twin over the Rust engine's plain C ABI
   `VerifiedReads` and `EnsApi` from the handle. The names and meanings are
   `io.myotis.api`'s, for the part of it a wallet reads: the catalog, a handle's
   lifecycle and status, the account and storage proofs, `eth_call`, gas
-  estimates, the nonce (with the pending overlay), fee history, receipts, sending
-  and ENS forward resolution. It decodes the engine's JSON by the JVM side's rules,
+  estimates, the nonce (with the pending overlay), fee history, receipts, sending,
+  ENS forward resolution, and the opt-in log index (`setLogIndexConfig`,
+  `logIndexStatusJson`, `VerifiedReads.getLogs`). It decodes the engine's JSON by the JVM side's rules,
   pinned by the same golden shapes (`EngineDecodingTest`): an error envelope fails
   the call, shape drift fails closed, and the permanent `-32602` refusal is a
   result, never the retryable failure.

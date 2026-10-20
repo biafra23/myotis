@@ -166,7 +166,6 @@ object RustEngine {
         return myotis_set_boot_enodes(handle, enodesJson)
     }
 
-    /** Status JSON object; `"{}"` for an unknown handle. */
     /** Install the eth_getLogs watch-list config; false = invalid/unavailable. */
     fun setLogIndexConfig(handle: Long, configJson: String): Boolean {
         requireAbi()
@@ -178,6 +177,11 @@ object RustEngine {
         requireAbi()
         return take(myotis_log_index_status_json(handle)) ?: """{"enabled":false}"""
     }
+
+    /** eth_getLogs over the watch-list index: the log array, or an `{"error":...}`
+     *  object carrying the coverage or config detail. */
+    fun getLogsJson(handle: Long, filterJson: String): String =
+        jsonCall { myotis_get_logs_json(handle, filterJson) }
 
     /** Read-fetch shadow-cache counters JSON (docs/read-stats.md). */
     fun readStatsJson(handle: Long): String {
