@@ -1435,6 +1435,30 @@ public final class NodeService extends Service {
                         android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED));
     }
 
+    /** The device's current network as the engine's data-usage figures label it
+     *  (docs/data-usage.md): no active network (or a read error) is UNKNOWN. */
+    static io.myotis.api.NetworkMetering meteringNow(android.content.Context c) {
+        android.net.NetworkCapabilities caps = activeNetworkCapabilities(c);
+        if (caps == null) return io.myotis.api.NetworkMetering.UNKNOWN;
+        return caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+                ? io.myotis.api.NetworkMetering.UNMETERED
+                : io.myotis.api.NetworkMetering.METERED;
+    }
+
+    /** Tell the engine what kind of network the device is on, so bytes moved on mobile
+     *  data count as metered. Cheap and idempotent; called on every connectivity change. */
+    private void pushNetworkMetering() {
+        try {
+            io.myotis.api.NetworkMetering m = meteringNow(this);
+            if (ENGINE.networkMetering() != m) {
+                ENGINE.setNetworkMetering(m);
+                LogBuffer.i(TAG, "network metering: " + m);
+            }
+        } catch (Throwable t) {
+            LogBuffer.w(TAG, "network metering push failed: " + t);
+        }
+    }
+
     /** The active network is unmetered (a read error counts as metered: the shorter scans and
      *  the token interval, {@link WatchPolicy}) — for a check started now. */
     public static boolean unmeteredNow(android.content.Context c) {
@@ -1851,6 +1875,9 @@ public final class NodeService extends Service {
             ConnectivityManager cm = getSystemService(ConnectivityManager.class);
             if (cm == null) return;
             lastNetworkUp = networkAvailable();   // seed so the first callback doesn't spuriously poll
+            // And the data-usage label, from the start — off the main thread: it ticks
+            // every network's ledger, which may write its file.
+            QUERY_POOL.execute(this::pushNetworkMetering);
             ConnectivityManager.NetworkCallback cb = new ConnectivityManager.NetworkCallback() {
                 @Override public void onAvailable(Network network) { onNotifConnectivityChanged(); }
                 @Override public void onLost(Network network) { onNotifConnectivityChanged(); }
@@ -1876,6 +1903,9 @@ public final class NodeService extends Service {
      *  up↔down gate is checked under {@link #notifLock} so concurrent callbacks don't both poll. */
     private void onNotifConnectivityChanged() {
         QUERY_POOL.execute(() -> {
+            // Metering changes ride on capability callbacks that do NOT flip up↔down
+            // (Wi-Fi → mobile data), so it is pushed before the gate below.
+            pushNetworkMetering();
             boolean up = networkAvailable();
             synchronized (notifLock) {
                 Boolean prev = lastNetworkUp;
@@ -1989,7 +2019,12 @@ public final class NodeService extends Service {
                                           // syncCurrentPeriod is the refused anchor's age
             // Fork watch: peers announce (or already activated) a network upgrade this
             // build doesn't support; null = none / not watched here. Kept while paused.
-            io.myotis.api.UpgradeAdvisory upgradeAdvisory) {}
+            io.myotis.api.UpgradeAdvisory upgradeAdvisory,
+            // This network's bytes on the wire, since start and today (docs/data-usage.md);
+            // kept while paused.
+            io.myotis.api.DataUsage dataUsage,
+            // The device network's metering as last pushed to the engine (debugging aid).
+            io.myotis.api.NetworkMetering networkMetering) {}
 
     /** Result of a get-account query. Mirrors the JVM daemon's JSON response shape. */
     public record AccountQueryResult(
@@ -2824,7 +2859,7 @@ public final class NodeService extends Service {
                     s.peerHeaderRequests(), s.peerHeaderRequestsServed(),
                     s.peerBodyRequests(), s.peerBodyRequestsServed(),
                     s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing(), s.wsBoundPeriods(),
-                    s.upgradeAdvisory());
+                    s.upgradeAdvisory(), s.dataUsage(), s.networkMetering());
         }
         return new Snapshot(true, lifecycle, chainStartMs,
                 s.discoveredPeers(), s.connectedPeers(), s.readyPeers(),
@@ -2841,7 +2876,7 @@ public final class NodeService extends Service {
                 s.peerHeaderRequests(), s.peerHeaderRequestsServed(),
                 s.peerBodyRequests(), s.peerBodyRequestsServed(),
                 s.lcHunting(), s.elHunting(), s.rpcPort(), s.rpcServing(), s.wsBoundPeriods(),
-                s.upgradeAdvisory());
+                s.upgradeAdvisory(), s.dataUsage(), s.networkMetering());
     }
 
     // ---- Failure forensics (see ProcessHealthDiag) ----

@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 49; // 49: ens offchain envelope carries reverseClaim; 48: log-index topic entries (#673); 47: resolve_block_hash_json, get_proof_json takes a block hash; 46: get_proof_json; 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
+    static final int EXPECTED_ABI_VERSION = 50; // 50: dataUsage + networkMetering in the status, set_network_metering; 49: ens offchain envelope carries reverseClaim; 48: log-index topic entries (#673); 47: resolve_block_hash_json, get_proof_json takes a block hash; 46: get_proof_json; 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
 
     private static final boolean AVAILABLE = load();
 
@@ -210,6 +210,20 @@ final class RustEngineNative {
      */
     static boolean nativeSetDnsDiscovery(boolean on) {
         return Myotis_engineKt.setDnsDiscovery(on);
+    }
+
+    /**
+     * The host's word on the device's current network, for the status JSON's data
+     * usage (docs/data-usage.md): 0 unknown, 1 unmetered, 2 metered. False, and
+     * nothing recorded, for any other code. Process-global, not per-handle.
+     */
+    static boolean nativeSetNetworkMetering(int code) {
+        return Myotis_engineKt.setNetworkMetering(code);
+    }
+
+    /** The metering code last recorded (0 until a host reports one). */
+    static int nativeNetworkMetering() {
+        return Myotis_engineKt.networkMetering();
     }
 
     /** One handle's status as a JSON object, or {@code "{}"} for an unknown handle. */

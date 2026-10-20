@@ -498,6 +498,8 @@ pub async fn serve(
             lc_responder: Some(store.clone()),
             // A server follows its beacon node's schedule; nothing to warn about.
             cl_fork_watch: None,
+            // A server reports no data usage.
+            traffic: None,
         },
     )
     .map_err(|e| anyhow!("starting the libp2p host: {e}"))?;

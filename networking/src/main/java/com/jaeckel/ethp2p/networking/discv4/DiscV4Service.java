@@ -59,6 +59,15 @@ public final class DiscV4Service implements AutoCloseable {
         this.onPeerDiscovered = onPeerDiscovered;
     }
 
+    /** Counts every datagram (set before {@link #start}); null = not counted. */
+    private volatile com.jaeckel.ethp2p.core.traffic.TrafficMeter.Counter trafficCounter;
+
+    /** Count every datagram's payload into {@code counter} (the stack's data
+     *  usage, docs/data-usage.md). Before {@link #start}. */
+    public void setTrafficCounter(com.jaeckel.ethp2p.core.traffic.TrafficMeter.Counter counter) {
+        this.trafficCounter = counter;
+    }
+
     public void start(int udpPort) throws InterruptedException {
         handler = new DiscV4Handler(nodeKey, table, onPeerDiscovered);
 
@@ -76,6 +85,11 @@ public final class DiscV4Service implements AutoCloseable {
             .handler(new ChannelInitializer<NioDatagramChannel>() {
                 @Override
                 protected void initChannel(NioDatagramChannel ch) {
+                    var counter = trafficCounter;
+                    if (counter != null) {
+                        ch.pipeline().addLast(
+                                new com.jaeckel.ethp2p.networking.traffic.CountingHandler(counter));
+                    }
                     ch.pipeline().addLast(handler);
                 }
             });

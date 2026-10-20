@@ -55,6 +55,40 @@ data class UpgradeAdvisory(
 )
 
 /**
+ * The host's word on the network the device is on now, for [DataUsage]'s metered
+ * figures ([MyotisEngine.setNetworkMetering]). [UNKNOWN] is not counted as metered.
+ */
+enum class NetworkMetering { UNKNOWN, UNMETERED, METERED }
+
+/**
+ * One network's bytes on the wire (docs/data-usage.md), the JVM contract's `DataUsage`.
+ * The `today*` figures cover the local calendar day [day] and survive a restart of the
+ * network on the same day; the rest count since the handle was created. A host running
+ * several networks adds them up for the app's total.
+ */
+data class DataUsage(
+    val bytesIn: Long,
+    val bytesOut: Long,
+    val elBytesIn: Long,
+    val elBytesOut: Long,
+    val clBytesIn: Long,
+    val clBytesOut: Long,
+    val day: String,
+    val todayBytesIn: Long,
+    val todayBytesOut: Long,
+    val todayMeteredBytesIn: Long,
+    val todayMeteredBytesOut: Long,
+) {
+    val todayBytes: Long get() = todayBytesIn + todayBytesOut
+    val todayMeteredBytes: Long get() = todayMeteredBytesIn + todayMeteredBytesOut
+
+    companion object {
+        /** Nothing measured. */
+        val NONE = DataUsage(0, 0, 0, 0, 0, 0, "", 0, 0, 0, 0)
+    }
+}
+
+/**
  * One reading of a handle's status. The JVM contract's `StatusSnapshot` and
  * `BeaconStatus` in one: the light client's slots and [bootstrapped] are here too,
  * since this engine reports both from one status object.
@@ -101,6 +135,8 @@ data class StatusSnapshot(
     val lcHunting: Boolean,
     val elHunting: Boolean,
     val upgradeAdvisory: UpgradeAdvisory?,
+    val dataUsage: DataUsage,
+    val networkMetering: NetworkMetering,
 )
 
 /**

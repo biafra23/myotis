@@ -47,6 +47,11 @@ serde_json = "1"
 tracing = "=0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# localtime_r, for the data-usage ledger's local day (usage.rs). Already in the
+# lock through tokio.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # The block/header types (re-exported through myotis-net) are constructed directly
 # in the block_json golden test; myotis-core is otherwise transitive via myotis-net.

@@ -365,6 +365,7 @@ async fn main() {
             // pinned servers would only skew the sample toward nodes we run.
             pinned_peer_ids: vec![],
             cl_fork_watch: None,
+            traffic: None,
         },
         disc_tx,
     )

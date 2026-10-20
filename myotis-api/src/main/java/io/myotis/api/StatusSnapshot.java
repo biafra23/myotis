@@ -66,6 +66,12 @@ import java.util.List;
  *                              upgrade this build does not support — hosts tell the
  *                              user to update; null = none detected / watch not enabled
  *                              for this network. Advisory only (see {@link UpgradeAdvisory})
+ * @param dataUsage             this network's bytes on the wire, since start and today
+ *                              (see {@link DataUsage}); {@link DataUsage#NONE} when the
+ *                              engine does not measure. Never null
+ * @param networkMetering       the device network's metering as the host last reported
+ *                              it ({@link MyotisEngine#setNetworkMetering}); engine-wide,
+ *                              shown for debugging. Never null
  */
 public record StatusSnapshot(
         boolean running,
@@ -107,5 +113,7 @@ public record StatusSnapshot(
         boolean elHunting,
         int rpcPort,
         boolean rpcServing,
-        UpgradeAdvisory upgradeAdvisory) {
+        UpgradeAdvisory upgradeAdvisory,
+        DataUsage dataUsage,
+        NetworkMetering networkMetering) {
 }

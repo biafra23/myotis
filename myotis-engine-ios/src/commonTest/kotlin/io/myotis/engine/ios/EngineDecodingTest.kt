@@ -53,7 +53,8 @@ class EngineDecodingTest {
             """"backedOffPeers":0,"blacklistedPeers":0,"optimisticBlockNumber":0,""" +
             """"finalizedBlockNumber":0,"executionBlockNumber":0,"elHunting":false,""" +
             """"peerHeaderRequests":0,"peerHeaderRequestsServed":0,""" +
-            """"peerBodyRequests":0,"peerBodyRequestsServed":0,"upgradeAdvisory":null}"""
+            """"peerBodyRequests":0,"peerBodyRequestsServed":0,"upgradeAdvisory":null,""" +
+            """"dataUsage":null,"networkMetering":"UNKNOWN"}"""
 
     /** A synthetic catching-up shape (real running numbers, the EL counts too). */
     private val catchingUp =
@@ -229,6 +230,34 @@ class EngineDecodingTest {
             ).upgradeAdvisory,
         )
         assertNull(EngineDecoding.status(scheduledAdvisory.replace("\"SCHEDULED\"", "5")).upgradeAdvisory)
+    }
+
+    /** The ABI-50 data-usage keys, as the Rust status_object emits them. */
+    private val dataUsageStatus =
+        """{"running":true,"network":"gnosis","beaconState":"SYNCED",""" +
+            """"dataUsage":{"bytesIn":40,"bytesOut":6,"elBytesIn":10,"elBytesOut":2,""" +
+            """"clBytesIn":30,"clBytesOut":4,"day":"2026-10-20","todayBytesIn":400,""" +
+            """"todayBytesOut":60,"todayMeteredBytesIn":100,"todayMeteredBytesOut":9},""" +
+            """"networkMetering":"METERED"}"""
+
+    @Test
+    fun dataUsageAndMeteringAreDecodedAndNeverFailAStatus() {
+        val s = snapshot(dataUsageStatus)
+        assertEquals(DataUsage(40, 6, 10, 2, 30, 4, "2026-10-20", 400, 60, 100, 9), s.dataUsage)
+        assertEquals(460L, s.dataUsage.todayBytes)
+        assertEquals(109L, s.dataUsage.todayMeteredBytes)
+        assertEquals(NetworkMetering.METERED, s.networkMetering)
+        for (json in listOf(notStarted, catchingUp, "{}")) {
+            assertEquals(DataUsage.NONE, snapshot(json).dataUsage, json)
+            assertEquals(NetworkMetering.UNKNOWN, snapshot(json).networkMetering, json)
+        }
+        // A metering name this build does not know, a usage field of the wrong type.
+        val odd = snapshot(
+            dataUsageStatus.replace("\"METERED\"", "\"SATELLITE\"").replace("\"bytesIn\":40", "\"bytesIn\":\"lots\""),
+        )
+        assertTrue(odd.running)
+        assertEquals(DataUsage.NONE, odd.dataUsage)
+        assertEquals(NetworkMetering.UNKNOWN, odd.networkMetering)
     }
 
     // ---- the account ----

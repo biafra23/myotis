@@ -177,6 +177,14 @@ configuration the engine could read), and its lifecycle handling (the Android
 app's foreground service, pause on background and wake on request are the
 app's, not the library's).
 
+**Data usage.** `handle.status().dataUsage()` is the bytes this network moved
+on the wire — since start and today (local day, kept across restarts) — and
+`todayMetered*` the part moved while the device was on a metered network. The
+engine cannot see that; tell it on every connectivity change with
+`engine.setNetworkMetering(NetworkMetering.METERED | UNMETERED | UNKNOWN)`
+(from `ConnectivityManager`'s `NET_CAPABILITY_NOT_METERED`). Add the networks
+up for the app's total. docs/data-usage.md has what is and is not counted.
+
 The contract is Java 17 and FFI-flat (byte arrays, strings, longs, flat records,
 blocking calls); `docs/reimplementation/05-engine-api-bindings.md` documents it.
 Log lines from the engine come out of `Myotis.drainLogs(max)`; Tor routing of

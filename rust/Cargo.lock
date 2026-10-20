@@ -4210,6 +4210,7 @@ dependencies = [
 name = "myotis-engine"
 version = "0.1.17"
 dependencies = [
+ "libc",
  "myotis-consensus",
  "myotis-core",
  "myotis-evm",

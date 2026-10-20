@@ -91,6 +91,11 @@ pub struct ElConfig {
     /// bootnodes. Twin of the Java `NetworkConfig.elEnrTreeUrls`. Empty for a
     /// network without a tree (Gnosis).
     pub enr_tree_urls: Vec<String>,
+    /// This stack's byte counters ([`crate::traffic`]): discv4 and every RLPx
+    /// session count into its EL layer. Each network constructor makes a
+    /// fresh one; the engine host replaces it with the handle's
+    /// (`ChainConfig::traffic`) so both layers land on one meter.
+    pub traffic: Arc<crate::traffic::TrafficMeter>,
 }
 
 /// The dedicated myotis-serving sepolia node (docs/dedicated-sepolia-node.md).
@@ -243,6 +248,7 @@ impl ElConfig {
             log_index_path: None,
             min_suggested_tip_wei: 100_000_000, // 0.1 gwei
             block_time: Duration::from_secs(12),
+            traffic: crate::traffic::TrafficMeter::new(),
             boot_enodes: Vec::new(),
             // The Ethereum Foundation's canonical list, which every EL client
             // walks (geth `params.KnownDNSNetwork`). Its signing key is the
@@ -300,6 +306,7 @@ impl ElConfig {
             log_index_path: None,
             min_suggested_tip_wei: 100_000_000, // 0.1 gwei
             block_time: Duration::from_secs(12),
+            traffic: crate::traffic::TrafficMeter::new(),
             // The dedicated myotis-serving node (docs/dedicated-sepolia-node.md):
             // it admits wallets past its peer cap by RLPx Hello client-id, so
             // direct-dialing it beats waiting for discovery on a saturated
@@ -336,6 +343,7 @@ impl ElConfig {
             log_index_path: None,
             min_suggested_tip_wei: 1_000_000, // 0.001 gwei — cheap-chain floor
             block_time: Duration::from_secs(5),
+            traffic: crate::traffic::TrafficMeter::new(),
             boot_enodes: Vec::new(),
             // Gnosis publishes no EL node list; its chainspec enodes are the
             // Java twin's substitute (`NetworkConfig.GNOSIS_EL_ENODES`).
@@ -2204,6 +2212,7 @@ impl ElReader {
                 // judging and widens the refresh fan-out.
                 fork_filter: Some(fork_filter_for(&cfg)),
                 pool_below_target: Some(Arc::clone(&below_target)),
+                traffic: Some(Arc::clone(&cfg.traffic)),
             },
             tx,
         )
@@ -2255,6 +2264,7 @@ impl ElReader {
                 // probe would count that against the peer).
                 move || anchor.optimistic_head()
             })),
+            Arc::clone(&cfg.traffic),
         );
         // Gloas: the light client proves only execution block hashes; the pool
         // fetches their headers for the anchor to verify and adopt.

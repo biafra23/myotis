@@ -9,6 +9,7 @@ import io.myotis.api.EngineConfig;
 import io.myotis.api.EngineException;
 import io.myotis.api.MyotisEngine;
 import io.myotis.api.NetworkInfo;
+import io.myotis.api.NetworkMetering;
 import io.myotis.api.ports.EnginePorts;
 
 import java.util.ArrayList;
@@ -256,5 +257,35 @@ public final class RustMyotisEngine implements MyotisEngine {
         for (String name : new ArrayList<>(hosted.keySet())) {
             stop(name);
         }
+    }
+
+    /** Process-global in the native engine (it is the device's network), like the
+     *  DNS-discovery switch. The codes are the native {@code usage::Metering}'s. */
+    @Override
+    public void setNetworkMetering(NetworkMetering metering) {
+        if (metering == null) throw new EngineException("metering is required");
+        int code = switch (metering) {
+            case UNKNOWN -> 0;
+            case UNMETERED -> 1;
+            case METERED -> 2;
+        };
+        if (!RustEngineNative.nativeSetNetworkMetering(code)) {
+            throw new EngineException("the Rust engine refused network metering " + metering);
+        }
+    }
+
+    @Override
+    public NetworkMetering networkMetering() {
+        return meteringOf(RustEngineNative.nativeNetworkMetering());
+    }
+
+    /** A native metering code (or the status JSON's name's ordinal) → the API enum;
+     *  anything unknown reads as UNKNOWN (display-only). */
+    static NetworkMetering meteringOf(int code) {
+        return switch (code) {
+            case 1 -> NetworkMetering.UNMETERED;
+            case 2 -> NetworkMetering.METERED;
+            default -> NetworkMetering.UNKNOWN;
+        };
     }
 }

@@ -10,6 +10,7 @@ import io.myotis.api.BlockResult;
 import io.myotis.api.ChainHandle;
 import io.myotis.api.ClPeerInfo;
 import io.myotis.api.ConnectedPeer;
+import io.myotis.api.DataUsage;
 import io.myotis.api.DialResult;
 import io.myotis.api.DiscoveredPeer;
 import io.myotis.api.EngineException;
@@ -17,6 +18,7 @@ import io.myotis.api.EnsApi;
 import io.myotis.api.EnsResolutionResult;
 import io.myotis.api.HeadersResult;
 import io.myotis.api.LifecycleState;
+import io.myotis.api.NetworkMetering;
 import io.myotis.api.NodeStatusReads;
 import io.myotis.api.PeerInfo;
 import io.myotis.api.StatusSnapshot;
@@ -469,7 +471,9 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
             boolean lcHunting,
             boolean elHunting,
             long wsBoundPeriods,
-            UpgradeAdvisory upgradeAdvisory) {
+            UpgradeAdvisory upgradeAdvisory,
+            DataUsage dataUsage,
+            NetworkMetering networkMetering) {
 
         /** {@code beaconState} tolerant of a NEWER .so than this wrapper: an
          *  unrecognized value maps to STARTING (not-ready, fail closed) instead of
@@ -525,7 +529,12 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                         o.getBoolean("elHunting", false),
                         // Older .so vintages don't emit it; 0 = "bound unknown".
                         o.getLong("wsBoundPeriods", 0L),
-                        parseAdvisory(o.get("upgradeAdvisory")));
+                        parseAdvisory(o.get("upgradeAdvisory")),
+                        // ABI >= 50 (docs/data-usage.md). Display-only, like the
+                        // advisory: absent or malformed → NONE / UNKNOWN, never
+                        // a "malformed status" failure.
+                        parseDataUsage(o.get("dataUsage")),
+                        meteringOf(o.get("networkMetering")));
             } catch (RuntimeException e) {
                 throw new EngineException(
                         "malformed status JSON from the Rust engine: " + e.getMessage(), e);
@@ -534,7 +543,37 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
 
         static ParsedStatus notRunning() {
             return new ParsedStatus(false, false, false, BeaconState.STARTING, false, 0L, 0L, 0L,
-                    0L, 0L, 0, 0, -1L, 0, 0, 0, 0, 0, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, false, false, 0L, null);
+                    0L, 0L, 0, 0, -1L, 0, 0, 0, 0, 0, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, false, false, 0L, null,
+                    DataUsage.NONE, NetworkMetering.UNKNOWN);
+        }
+
+        /** The nested {@code dataUsage} object → the API record; absent, null or
+         *  not an object → {@link DataUsage#NONE}. */
+        static DataUsage parseDataUsage(JsonValue v) {
+            if (v == null || !v.isObject()) return DataUsage.NONE;
+            JsonObject u = v.asObject();
+            try {
+                return new DataUsage(
+                        u.getLong("bytesIn", 0L), u.getLong("bytesOut", 0L),
+                        u.getLong("elBytesIn", 0L), u.getLong("elBytesOut", 0L),
+                        u.getLong("clBytesIn", 0L), u.getLong("clBytesOut", 0L),
+                        u.getString("day", ""),
+                        u.getLong("todayBytesIn", 0L), u.getLong("todayBytesOut", 0L),
+                        u.getLong("todayMeteredBytesIn", 0L), u.getLong("todayMeteredBytesOut", 0L));
+            } catch (RuntimeException wrongType) {
+                return DataUsage.NONE;
+            }
+        }
+
+        /** {@code networkMetering}: absent, not a string, or a name this wrapper
+         *  doesn't know → UNKNOWN. */
+        static NetworkMetering meteringOf(JsonValue v) {
+            if (v == null || !v.isString()) return NetworkMetering.UNKNOWN;
+            try {
+                return NetworkMetering.valueOf(v.asString());
+            } catch (IllegalArgumentException e) {
+                return NetworkMetering.UNKNOWN;
+            }
         }
 
         /** The optional nested {@code upgradeAdvisory} object → the API record. Absent
@@ -669,7 +708,9 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                 // the row instead of faking a red bind failure.
                 (s.running() || s.paused()) && rpc != null && rpcPort > 0 ? rpcPort : 0,
                 rpcServing(),
-                s.upgradeAdvisory());
+                s.upgradeAdvisory(),
+                s.dataUsage(),
+                s.networkMetering());
     }
 
     @Override

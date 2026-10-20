@@ -43,6 +43,52 @@ public final class JavaMyotisEngine implements MyotisEngine {
         return t;
     });
 
+    /**
+     * Ticks every hosted network's data-usage ledger once a minute, so the day's
+     * figures roll over at midnight and reach disk without a host polling status
+     * (the Rust engine's usage ticker). Started with the first network.
+     */
+    private volatile java.util.concurrent.ScheduledExecutorService usageTicker;
+
+    private synchronized void stopUsageTicker() {
+        if (usageTicker == null) return;
+        usageTicker.shutdownNow();
+        usageTicker = null;
+    }
+
+    private synchronized void startUsageTicker() {
+        if (usageTicker != null) return;
+        usageTicker = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "engine-data-usage");
+            t.setDaemon(true);
+            return t;
+        });
+        usageTicker.scheduleWithFixedDelay(this::tickAllUsage, 60, 60, java.util.concurrent.TimeUnit.SECONDS);
+    }
+
+    private void tickAllUsage() {
+        for (JavaChainHandle h : handles.values()) {
+            try {
+                h.stack().dataUsage(false);
+            } catch (Throwable ignored) {
+                // accounting must never take the ticker down
+            }
+        }
+    }
+
+    @Override
+    public void setNetworkMetering(io.myotis.api.NetworkMetering metering) {
+        if (metering == null) throw new EngineException("metering is required");
+        // Bytes moved before the change keep the label they were moved under.
+        tickAllUsage();
+        io.myotis.engines.common.DataUsageLedger.setMetering(metering);
+    }
+
+    @Override
+    public io.myotis.api.NetworkMetering networkMetering() {
+        return io.myotis.engines.common.DataUsageLedger.metering();
+    }
+
     @Override
     public List<NetworkInfo> availableNetworks() {
         List<NetworkInfo> out = new ArrayList<>();
@@ -130,6 +176,7 @@ public final class JavaMyotisEngine implements MyotisEngine {
             throw new EngineException("network already hosted: " + name);
         }
         registry.add(stack);
+        startUsageTicker();
         return handle;
     }
 
@@ -163,7 +210,8 @@ public final class JavaMyotisEngine implements MyotisEngine {
     @Override
     public void shutdownAll() {
         handles.clear();
-        registry.shutdownAll();
+        registry.shutdownAll();   // each stack writes its day's figures as it stops
+        stopUsageTicker();        // restarted by the next create()
     }
 
     private NodeKey loadOrCreateKey(String networkName, EnginePorts ports) {

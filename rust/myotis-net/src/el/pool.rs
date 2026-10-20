@@ -599,6 +599,8 @@ impl QualityOutcome {
 struct PoolInner {
     tasks: super::tasks::Tasks,
     key: Arc<NodeKey>,
+    /// Every RLPx session this pool dials counts its bytes here (EL layer).
+    traffic: Arc<crate::traffic::TrafficMeter>,
     local_pubkey: [u8; 64],
     cfg: Arc<EthConfig>,
     pool_cfg: PoolConfig,
@@ -1209,7 +1211,7 @@ impl PoolInner {
     /// Dial one candidate through the full eth+snap handshake, updating the
     /// bookkeeping by outcome. `addr` is already in `attempted`.
     async fn dial_one(self: &Arc<PoolInner>, addr: SocketAddr, pubkey: [u8; 64]) {
-        let conn = match RlpxConnection::dial(Arc::clone(&self.key), addr, pubkey).await {
+        let conn = match RlpxConnection::dial_metered(Arc::clone(&self.key), addr, pubkey, Some(Arc::clone(&self.traffic))).await {
             Ok(conn) => conn,
             Err(e) => {
                 // Transport-level failure (refused/timeout/ECIES) — the peer is
@@ -1405,6 +1407,7 @@ impl PeerPool {
         tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
         probe: Option<mpsc::Sender<SocketAddr>>,
         head_source: Option<Box<dyn Fn() -> Option<(u64, [u8; 32])> + Send + Sync>>,
+        traffic: Arc<crate::traffic::TrafficMeter>,
     ) -> PeerPool {
         // Built before the struct literal (cfg is moved into it below).
         let served = Arc::new(ServedHeaders::with_genesis(
@@ -1453,6 +1456,7 @@ impl PeerPool {
             tx_watch,
             probe,
             fork_watch: std::sync::OnceLock::new(),
+            traffic,
         });
         inner.tasks.spawn(dialer_loop(Arc::clone(&inner), rx));
         inner.tasks.spawn(maintainer_loop(Arc::clone(&inner)));
@@ -3165,6 +3169,7 @@ mod tests {
                 None,
                 None,
                 None,
+                Default::default(),
             )
         }
 
@@ -3960,6 +3965,7 @@ mod tests {
             None,
             None,
             None,
+            Default::default(),
         );
         assert_eq!(pool.snap_peer_count().await, 0);
         assert!(pool.snap_peer().await.is_none());
@@ -4015,6 +4021,7 @@ mod tests {
             None,
             None,
             None,
+            Default::default(),
         );
         // The warm-start branch dials the cached peer, claiming its address.
         // Poll briefly (the silent listener parks the handshake, so the address
@@ -4074,6 +4081,7 @@ mod tests {
             None,
             None,
             None,
+            Default::default(),
         );
 
         // No verdict is persisted without another live peer to compare

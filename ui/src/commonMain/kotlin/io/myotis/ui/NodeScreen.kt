@@ -1396,6 +1396,24 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
             help = StatusHelp.HEAD_AGE,
         )
         StatusRow("Uptime", "${s.uptimeSeconds}s", help = StatusHelp.UPTIME)
+        // Data usage (docs/data-usage.md): this network's bytes on the wire.
+        s.dataUsage?.let { u ->
+            val metered = u.todayMeteredIn + u.todayMeteredOut
+            StatusRow(
+                "Data today",
+                "↓ ${formatBytes(u.todayIn)} ↑ ${formatBytes(u.todayOut)}" +
+                    if (metered > 0) " · ${formatBytes(metered)} metered" else "",
+                help = StatusHelp.DATA_TODAY,
+            )
+            StatusRow(
+                "Data total",
+                "↓ ${formatBytes(u.totalIn)} ↑ ${formatBytes(u.totalOut)}",
+                help = StatusHelp.DATA_TOTAL,
+            )
+        }
+        s.networkMetering?.let {
+            StatusRow("Connection", meteringLabel(it), help = StatusHelp.CONNECTION)
+        }
         // Pseudo-sleep observability: how much the node has idle-slept, and when/why it
         // last woke. Foreground (opening the app) is excluded from the "last woke" reason,
         // so this keeps showing the last real request/catch-up wake even as you view it.
@@ -2010,6 +2028,13 @@ private fun groupDigits(s: String): String {
     return digits.reversed().chunked(3).joinToString(",").reversed()
 }
 
+/** The API's NetworkMetering name as the Status "Connection" row shows it. */
+internal fun meteringLabel(name: String): String = when (name) {
+    "METERED" -> "metered"
+    "UNMETERED" -> "unmetered"
+    else -> "unknown"
+}
+
 private fun formatBytes(b: Long): String = when {
     b >= 1_073_741_824 -> "${(b * 10 / 1_073_741_824).toDouble() / 10} GB"
     b >= 1_048_576 -> "${b / 1_048_576} MB"
@@ -2594,6 +2619,15 @@ private object StatusHelp {
         "against. \"—\" = no verified head yet, so no read can be served. The UI turns amber " +
         "past 45s."
     const val UPTIME = "Seconds since this network's stack started running."
+    const val DATA_TODAY = "Bytes this network received (↓) and sent (↑) today, local time — " +
+        "kept across restarts on the same day. \"metered\" is the part moved while the " +
+        "device was on a metered network (mobile data, a hotspot). Counts the peer-to-peer " +
+        "traffic on the wire; Tor's own traffic and DNS lookups are not included."
+    const val DATA_TOTAL = "Bytes this network received (↓) and sent (↑) since it was started " +
+        "in this app session, across sleeps."
+    const val CONNECTION = "Whether the device's current network is metered (mobile data, a " +
+        "hotspot) or unmetered (Wi-Fi, Ethernet), as the app told the engine; \"unknown\" " +
+        "where the host cannot tell (desktop). For debugging."
     const val SLEEP = "Idle-sleep summary: \"always on\" if this host can't idle-sleep, " +
         "\"never slept\", or the total time paused over N pauses."
     const val LAST_WOKE = "When the node last woke on a real request, and why (foreground/" +

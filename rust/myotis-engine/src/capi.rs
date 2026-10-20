@@ -187,6 +187,19 @@ pub extern "C" fn myotis_set_dns_discovery(on: bool) -> bool {
     crate::host::set_dns_discovery(on)
 }
 
+/// The host's word on the device's current network (`set_network_metering`
+/// twin): 0 unknown, 1 unmetered, 2 metered; false for any other code.
+#[no_mangle]
+pub extern "C" fn myotis_set_network_metering(code: i32) -> bool {
+    crate::host::set_network_metering(code)
+}
+
+/// The metering code last recorded (`network_metering` twin).
+#[no_mangle]
+pub extern "C" fn myotis_network_metering() -> i32 {
+    crate::host::network_metering()
+}
+
 /// One handle's status as a JSON object, or `"{}"` for an unknown handle
 /// (`nativeStatusJson` twin).
 #[no_mangle]

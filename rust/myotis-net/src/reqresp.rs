@@ -1032,6 +1032,9 @@ pub struct HostConfig {
     /// Fed every peer's Status `fork_digest` (with the peer's source address),
     /// so a fork this build does not know surfaces as an upgrade advisory.
     pub cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
+    /// Counts every connection's bytes into this meter's CL layer
+    /// ([`crate::traffic`]). None (the default) counts nothing.
+    pub traffic: Option<Arc<crate::traffic::TrafficMeter>>,
 }
 
 impl Default for HostConfig {
@@ -1043,6 +1046,7 @@ impl Default for HostConfig {
             keypair: None,
             lc_responder: None,
             cl_fork_watch: None,
+            traffic: None,
         }
     }
 }
@@ -1076,17 +1080,24 @@ fn build_swarm(
     serving: bool,
     max_incoming: Option<u32>,
     dns: bool,
+    traffic: Arc<crate::traffic::TrafficMeter>,
 ) -> Result<Swarm<Behaviour>, String> {
     let base = libp2p::SwarmBuilder::with_existing_identity(keypair).with_tokio();
     let idle = |c: libp2p::swarm::Config| c.with_idle_connection_timeout(Duration::from_secs(120));
     let behaviour = |key: &libp2p::identity::Keypair| {
         Behaviour::new(key.public(), serving, max_incoming)
     };
+    // The transport is assembled here rather than by the builder's
+    // `with_tcp`/`with_quic` so the bytes can be counted (`crate::traffic`):
+    // TCP below noise (the socket's every byte), QUIC per substream (its own
+    // socket is not exposed). Otherwise it is exactly what those two build:
+    // TCP + noise + both muxers, or'ed with QUIC.
+    //
     // Both stream multiplexers, yamux proposed first. The consensus p2p spec
     // (phase0/p2p-interface.md, "Multiplexing") has it the other way round
     // from what rust-libp2p ships by default: a TCP-capable client "MUST
     // support mplex and MAY support yamux", and where both exist "yamux MUST
-    // take precedence during negotiation" — the tuple order IS that
+    // take precedence during negotiation" — the `SelectUpgrade` order IS that
     // precedence. Nimbus dropped yamux in 2024 (status-im/nimbus-eth2#6636)
     // and speaks only mplex on TCP, as does Lodestar, so a yamux-only host
     // (this one, before mplex was added) completed noise with every Nimbus
@@ -1096,7 +1107,7 @@ fn build_swarm(
     // (71f8a9d2), and why after the Sepolia Gloas fork roost was the only
     // light-client server the Rust engine could reach (#573). The Java engine
     // always offered both.
-    let muxers = || (libp2p::yamux::Config::default, libp2p_mplex::Config::default);
+    //
     // QUIC beside TCP: the spec's PRIMARY transport since consensus-specs#5330
     // ("QUIC MUST be supported", TCP is the fallback), and what every client
     // listens on by default now (Nimbus `--quic-port`, Lighthouse, Teku,
@@ -1106,15 +1117,34 @@ fn build_swarm(
     // `/ip4/<ip>/udp/<port>/quic-v1`; a peer known at both is dialed at TCP
     // first, QUIC only when the TCP dial fails — one at a time, never
     // concurrently (see `ReqRespClient::request_raw_at` for why).
+    let transport = |key: &libp2p::identity::Keypair| -> Result<_, Box<dyn std::error::Error + Send + Sync>> {
+        use libp2p::core::muxing::StreamMuxerBox;
+        use libp2p::core::upgrade::{SelectUpgrade, Version};
+        use libp2p::Transport as _;
+        let tcp_meter = Arc::clone(&traffic);
+        let tcp = libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default().nodelay(true))
+            .map(move |stream, _| {
+                crate::traffic::CountingStream::new(stream, Arc::clone(&tcp_meter), crate::traffic::cl)
+            })
+            .upgrade(Version::V1Lazy)
+            .authenticate(libp2p::noise::Config::new(key)?)
+            .multiplex(SelectUpgrade::new(
+                libp2p::yamux::Config::default(),
+                libp2p_mplex::Config::default(),
+            ))
+            .map(|(p, c), _| (p, StreamMuxerBox::new(c)));
+        let quic_meter = Arc::clone(&traffic);
+        let quic = libp2p::quic::tokio::Transport::new(libp2p::quic::Config::new(key)).map(
+            move |(p, c), _| {
+                (p, StreamMuxerBox::new(crate::traffic::CountingMuxer::new(c, Arc::clone(&quic_meter))))
+            },
+        );
+        Ok(tcp.or_transport(quic).map(|either, _| either.into_inner()))
+    };
     if dns {
         Ok(base
-            .with_tcp(
-                libp2p::tcp::Config::default().nodelay(true),
-                libp2p::noise::Config::new,
-                muxers(),
-            )
+            .with_other_transport(transport)
             .map_err(|e| format!("tcp/noise/muxer setup failed: {e}"))?
-            .with_quic()
             .with_dns()
             .map_err(|e| format!("dns transport setup failed: {e}"))?
             .with_behaviour(behaviour)
@@ -1123,13 +1153,8 @@ fn build_swarm(
             .build())
     } else {
         Ok(base
-            .with_tcp(
-                libp2p::tcp::Config::default().nodelay(true),
-                libp2p::noise::Config::new,
-                muxers(),
-            )
+            .with_other_transport(transport)
             .map_err(|e| format!("tcp/noise/muxer setup failed: {e}"))?
-            .with_quic()
             .with_behaviour(behaviour)
             .map_err(|e| format!("behaviour setup failed: {e}"))?
             .with_swarm_config(idle)
@@ -1164,13 +1189,15 @@ pub fn start_host_with(
     //
     // So: try with DNS, fall back to plain TCP with a warning. The degraded mode
     // is exactly today's behaviour, and the warning names what stops working.
-    let mut swarm = match build_swarm(keypair.clone(), serving, max_incoming, true) {
+    // No meter: count into one nobody reads (tools, roost, tests).
+    let traffic = config.traffic.clone().unwrap_or_default();
+    let mut swarm = match build_swarm(keypair.clone(), serving, max_incoming, true, Arc::clone(&traffic)) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e,
                 "no system DNS resolver — continuing WITHOUT the DNS transport; \
                  /ip4/ peers are unaffected but /dns4/ peers cannot be dialed");
-            build_swarm(keypair, serving, max_incoming, false)?
+            build_swarm(keypair, serving, max_incoming, false, traffic)?
         }
     };
 
@@ -2274,9 +2301,12 @@ mod dial_resolution_tests {
     /// negotiation must complete with B recorded as a gossipsub peer.
     #[tokio::test]
     async fn meshsub_negotiates_without_any_subscription() {
-        let mut a = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+        // A's meter also pins the transport's counting: the TCP socket's
+        // bytes (noise handshake, muxer, gossipsub) land in its CL layer.
+        let meter_a = crate::traffic::TrafficMeter::new();
+        let mut a = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Arc::clone(&meter_a))
             .expect("swarm a");
-        let mut b = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+        let mut b = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
             .expect("swarm b");
         b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
         let addr = loop {
@@ -2311,6 +2341,9 @@ mod dial_resolution_tests {
                         let kind = format!("{kind:?}");
                         assert_ne!(kind, "NotSupported");
                         if kind.starts_with("Gossipsub") {
+                            let (rx, tx) = meter_a.cl.snapshot();
+                            assert!(rx > 0 && tx > 0, "libp2p bytes counted: rx={rx} tx={tx}");
+                            assert_eq!(meter_a.el.snapshot(), (0, 0));
                             return;
                         }
                     }
@@ -2424,7 +2457,7 @@ mod dial_resolution_tests {
     /// the yamux-only host died.
     #[tokio::test]
     async fn the_host_connects_to_an_mplex_only_peer_like_nimbus() {
-        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
             .expect("swarm");
         dial_outcome(host, mplex_only_peer(), "/ip4/127.0.0.1/tcp/0")
             .await
@@ -2436,7 +2469,7 @@ mod dial_resolution_tests {
     /// no noise, no muxer negotiation, the TLS handshake carries the peer id.
     #[tokio::test]
     async fn the_host_connects_to_a_quic_only_peer() {
-        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
             .expect("swarm");
         dial_outcome(host, quic_only_peer(), "/ip4/127.0.0.1/udp/0/quic-v1")
             .await
@@ -2447,7 +2480,7 @@ mod dial_resolution_tests {
     /// wallet's `HostConfig::default` opens one on an ephemeral port).
     #[tokio::test]
     async fn a_quic_only_peer_reaches_the_host() {
-        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
             .expect("swarm");
         dial_outcome(quic_only_peer(), host, "/ip4/127.0.0.1/udp/0/quic-v1")
             .await
@@ -2458,7 +2491,7 @@ mod dial_resolution_tests {
     /// context its event loop needs, so a test can drive `handle_swarm_event`
     /// — responder included — against a real peer.
     fn host_with_ctx() -> (Swarm<Behaviour>, SwarmCtx) {
-        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
             .expect("swarm");
         let ctx = SwarmCtx::new(
             LocalStatus::new(StatusMessage {
@@ -2782,7 +2815,7 @@ mod pending_request_tests {
     use tokio::sync::oneshot::error::TryRecvError;
 
     fn host() -> (Swarm<Behaviour>, SwarmCtx) {
-        let swarm = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+        let swarm = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
             .expect("swarm");
         (swarm, SwarmCtx::new(LocalStatus::new(status(0)), None, None, Arc::default()))
     }
@@ -2876,7 +2909,7 @@ mod pending_request_tests {
     #[tokio::test]
     async fn client_label_follows_identify_goodbye_and_the_last_close() {
         let agents: AgentMap = Arc::default();
-        let mut swarm = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false)
+        let mut swarm = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
             .expect("swarm");
         let mut ctx = SwarmCtx::new(LocalStatus::new(status(0)), None, None, agents.clone());
         let client = ReqRespClient { tx: mpsc::channel(1).0, agents: agents.clone(), last_resolved: Arc::default() };

@@ -39,6 +39,7 @@ use myotis_net::{ChainConfig, SyncHandle, SyncState, SyncStatus};
 use myotis_evm::U256;
 
 use crate::eljson;
+use crate::usage::{Metering, UsageLedger, UsageSnapshot};
 
 /// Slots per sync-committee period (for the finalized-slot → period diagnostics
 /// the verified-read results carry).
@@ -155,6 +156,11 @@ struct EngineState {
     /// — otherwise a `createWithCheckpoint` slipping in between would label a
     /// late embedded-anchor snapshot as the caller's generation.
     tearing_down: Mutex<std::collections::HashSet<std::path::PathBuf>>,
+    /// Per-handle data-usage ledger (`crate::usage`) over the handle's
+    /// `ChainConfig::traffic`: created with the handle, ticked by every status
+    /// read and by the minute ticker, written at pause and stop. Dies with the
+    /// handle.
+    usage: Mutex<HashMap<i64, Arc<UsageLedger>>>,
 }
 
 /// How long a last-good `eth_feeHistory` result may be re-served (the Java
@@ -187,6 +193,7 @@ fn engine() -> Option<&'static EngineState> {
                     cl_fork_watches: Mutex::new(HashMap::new()),
             create_lock: Mutex::new(()),
             tearing_down: Mutex::new(std::collections::HashSet::new()),
+                    usage: Mutex::new(HashMap::new()),
                 }),
                 Err(_) => None,
             }
@@ -624,11 +631,24 @@ fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
 }
 
 /// Insert a not-yet-started handle for `config` and hand out its id.
-fn register(engine: &EngineState, config: ChainConfig) -> i64 {
+fn register(engine: &'static EngineState, config: ChainConfig) -> i64 {
     let id = engine.next_id.fetch_add(1, Ordering::Relaxed);
+    // The day ledger sits beside the snapshot, suffixed like the other
+    // per-network files (`data-usage[-net].json`); memory-only without one.
+    let usage_path = config
+        .snapshot_path
+        .as_deref()
+        .and_then(|p| p.parent())
+        .map(|dir| dir.join(format!("data-usage{}.json", persistence_suffix(&config))));
+    let ledger = Arc::new(UsageLedger::open(Arc::clone(&config.traffic), usage_path));
     match engine.handles.lock() {
         Ok(mut map) => {
             map.insert(id, ChainEntry::Created(Arc::new(config)));
+            drop(map);
+            if let Ok(mut usage) = engine.usage.lock() {
+                usage.insert(id, ledger);
+            }
+            start_usage_ticker(engine);
             id
         }
         // A poisoned lock means another native panicked mid-critical-section —
@@ -740,7 +760,12 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
     let el_fork_id = el_config.as_ref().map(|c| (c.fork_id_hash, c.fork_next));
     let reader = match el_config {
         Some(cfg) => match engine.rt.block_on(async {
-            let cfg = myotis_net::el::reader::ElConfig { log_index_path, ..cfg };
+            // The EL counts into the handle's meter, beside the CL.
+            let cfg = myotis_net::el::reader::ElConfig {
+                log_index_path,
+                traffic: Arc::clone(&config.traffic),
+                ..cfg
+            };
             ElReader::start_for(sync.exec_anchor(), el_cache_path, cfg, read_stats).await
         }) {
             Ok(r) => Some(Arc::new(r)),
@@ -913,6 +938,10 @@ pub fn pause(handle: i64) -> bool {
             reader.stop().await;
         }
     });
+    // Today's figures go to disk with the rest of the warm state.
+    if let Some(ledger) = usage_ledger(engine, handle) {
+        ledger.tick(true);
+    }
     tracing::info!(handle, "paused (networking torn down; warm state persisted)");
     true
 }
@@ -986,13 +1015,16 @@ pub fn status_json(handle: i64) -> String {
         .and_then(|m| m.get(&handle).cloned())
         .and_then(|w| w.advisory());
     let upgrade_advisory = cl_fork_watch::merge_advisories(el_advisory, cl_advisory);
+    // Data usage in every lifecycle state: the day's figures outlive a pause.
+    let usage = usage_ledger(engine, handle).map(|l| l.tick(false));
+    let metering = crate::usage::metering();
     match snap {
         Snap::Created(network, wall) => status_object(
             Lifecycle::NotStarted,
             network,
             None,
             wall,
-            ElCounts { upgrade_advisory, ..ElCounts::default() },
+            ElCounts { upgrade_advisory, usage, metering, ..ElCounts::default() },
         ),
         Snap::Running(network, status, wall, reader) => {
             let el = match reader {
@@ -1018,10 +1050,12 @@ pub fn status_json(handle: i64) -> String {
                             body_requests_served: b_served,
                             el_hunting: r.el_hunting(),
                             upgrade_advisory,
+                            usage,
+                            metering,
                         }
                     }
                 }),
-                None => ElCounts { upgrade_advisory, ..ElCounts::default() },
+                None => ElCounts { upgrade_advisory, usage, metering, ..ElCounts::default() },
             };
             status_object(Lifecycle::Running, network, Some(status), wall, el)
         }
@@ -1032,7 +1066,7 @@ pub fn status_json(handle: i64) -> String {
             network,
             Some(frozen),
             wall,
-            ElCounts { upgrade_advisory, ..ElCounts::default() },
+            ElCounts { upgrade_advisory, usage, metering, ..ElCounts::default() },
         ),
         Snap::Unknown => "{}".to_string(),
     }
@@ -1078,6 +1112,11 @@ struct ElCounts {
     /// Peers announce (or already activated) a network upgrade this build does
     /// not support — EL-derived like the counts, but NOT zeroed while paused.
     upgrade_advisory: Option<fork_watch::Advisory>,
+    /// The handle's data usage (both layers; not zeroed while paused). None
+    /// only where no ledger exists, which no live handle lacks.
+    usage: Option<UsageSnapshot>,
+    /// The host's last metering report (engine-wide).
+    metering: Metering,
 }
 
 /// The handle's fork watch — created on its first spin_up from the network's
@@ -1169,6 +1208,7 @@ pub fn stop(handle: i64) {
     if let Ok(mut watches) = engine.cl_fork_watches.lock() {
         watches.remove(&handle);
     }
+    let ledger = engine.usage.lock().ok().and_then(|mut m| m.remove(&handle));
     if let Some(ChainEntry::Running(cfg, sync, reader)) = entry {
         engine.rt.block_on(async move {
             if let Some(reader) = &reader { reader.cancel_requests(); }
@@ -1177,11 +1217,72 @@ pub fn stop(handle: i64) {
                 reader.stop().await;
             }
         });
+        // The day's last figures, while the directory is still ours.
+        if let Some(ledger) = &ledger {
+            ledger.tick(true);
+        }
         // Teardown complete: no writer is left for this directory.
         if let (Some(p), Ok(mut td)) = (cfg.snapshot_path.as_ref(), engine.tearing_down.lock()) {
             td.remove(p);
         }
+    } else if let Some(ledger) = &ledger {
+        ledger.tick(true);
     }
+}
+
+/// The handle's data-usage ledger, if it has one.
+fn usage_ledger(engine: &EngineState, handle: i64) -> Option<Arc<UsageLedger>> {
+    engine.usage.lock().ok().and_then(|m| m.get(&handle).cloned())
+}
+
+/// Start the minute ticker once per process: it keeps every ledger's day
+/// current (bytes moved before midnight land on the old day give or take a
+/// minute) and its file within `usage::WRITE_EVERY` of the truth, with no host
+/// polling status at all.
+fn start_usage_ticker(engine: &'static EngineState) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        engine.rt.spawn(async move {
+            let mut every = tokio::time::interval(std::time::Duration::from_secs(60));
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                every.tick().await;
+                tick_all_ledgers(engine);
+            }
+        });
+    });
+}
+
+/// Tick every handle's ledger (not forced: each writes when it is due).
+fn tick_all_ledgers(engine: &EngineState) {
+    let ledgers: Vec<Arc<UsageLedger>> = match engine.usage.lock() {
+        Ok(m) => m.values().cloned().collect(),
+        Err(_) => return,
+    };
+    for ledger in ledgers {
+        ledger.tick(false);
+    }
+}
+
+/// `nativeSetNetworkMetering`: the host's word on the device's current network
+/// (`usage::Metering` codes: 0 unknown, 1 unmetered, 2 metered). Engine-wide —
+/// it is the device's network, not a chain's. Every ledger is ticked first, so
+/// the bytes moved before the change keep the label they were moved under.
+/// `false` (and nothing recorded) for an unknown code.
+pub fn set_network_metering(code: i32) -> bool {
+    let Some(m) = Metering::from_code(code) else {
+        return false;
+    };
+    if let Some(engine) = engine() {
+        tick_all_ledgers(engine);
+    }
+    crate::usage::set_metering(m);
+    true
+}
+
+/// `nativeNetworkMetering`: the code [`set_network_metering`] recorded last.
+pub fn network_metering() -> i32 {
+    crate::usage::metering() as i32
 }
 
 /// Live-set the eth/69 served-block window (ChainHandle.setServedBlockWindow).
@@ -3358,6 +3459,29 @@ fn status_object(
             None => serde_json::Value::Null,
         },
     );
+    // Data usage (docs/data-usage.md): this handle's bytes since it was
+    // created, by layer, and the local day's figures with their metered part.
+    obj.insert(
+        "dataUsage".into(),
+        match el.usage {
+            Some(u) => serde_json::json!({
+                "bytesIn": u.session.rx(),
+                "bytesOut": u.session.tx(),
+                "elBytesIn": u.session.el_rx,
+                "elBytesOut": u.session.el_tx,
+                "clBytesIn": u.session.cl_rx,
+                "clBytesOut": u.session.cl_tx,
+                "day": u.day,
+                "todayBytesIn": u.today.rx,
+                "todayBytesOut": u.today.tx,
+                "todayMeteredBytesIn": u.today.metered_rx,
+                "todayMeteredBytesOut": u.today.metered_tx,
+            }),
+            None => serde_json::Value::Null,
+        },
+    );
+    // The host's word on the device's network (`ChainHandle`-independent).
+    obj.insert("networkMetering".into(), el.metering.as_str().into());
     // A hand-built object of primitives always serializes; fall back to the
     // literal not-started shape rather than panic on the (impossible) error.
     serde_json::to_string(&serde_json::Value::Object(obj))
@@ -3379,7 +3503,8 @@ const NOT_STARTED_FALLBACK: &str = concat!(
     r#""backedOffPeers":0,"blacklistedPeers":0,"optimisticBlockNumber":0,"#,
     r#""finalizedBlockNumber":0,"executionBlockNumber":0,"elHunting":false,"#,
     r#""peerHeaderRequests":0,"peerHeaderRequestsServed":0,"#,
-    r#""peerBodyRequests":0,"peerBodyRequestsServed":0,"upgradeAdvisory":null}"#,
+    r#""peerBodyRequests":0,"peerBodyRequestsServed":0,"upgradeAdvisory":null,"#,
+    r#""dataUsage":null,"networkMetering":"UNKNOWN"}"#,
 );
 
 #[cfg(test)]
@@ -4120,6 +4245,12 @@ mod tests {
             body_requests_served: 0,
             el_hunting: false,
             upgrade_advisory: None,
+            usage: Some(UsageSnapshot {
+                session: myotis_net::traffic::TrafficSnapshot { el_rx: 10, el_tx: 2, cl_rx: 30, cl_tx: 4 },
+                day: "2026-10-20".to_string(),
+                today: crate::usage::DayTotals { rx: 400, tx: 60, metered_rx: 100, metered_tx: 9 },
+            }),
+            metering: Metering::Metered,
         };
         let synced: serde_json::Value = serde_json::from_str(&status_object(
             Lifecycle::Running,
@@ -4133,6 +4264,17 @@ mod tests {
         assert_eq!(synced["paused"], false);
         assert_eq!(synced["beaconState"], "SYNCED");
         assert_eq!(synced["bootstrapped"], true);
+        assert_eq!(
+            synced["dataUsage"],
+            serde_json::json!({
+                "bytesIn": 40, "bytesOut": 6,
+                "elBytesIn": 10, "elBytesOut": 2, "clBytesIn": 30, "clBytesOut": 4,
+                "day": "2026-10-20",
+                "todayBytesIn": 400, "todayBytesOut": 60,
+                "todayMeteredBytesIn": 100, "todayMeteredBytesOut": 9,
+            })
+        );
+        assert_eq!(synced["networkMetering"], "METERED");
         assert_eq!(synced["finalizedSlot"], 100);
         assert_eq!(synced["peerHeaderRequests"], 6);
         assert_eq!(synced["peerHeaderRequestsServed"], 2);
@@ -4439,6 +4581,45 @@ mod tests {
         assert_eq!(v["running"], false);
         assert_eq!(v["paused"], false);
         stop(id);
+    }
+
+    #[test]
+    fn a_created_handle_reports_data_usage_and_its_ledger_dies_with_it() {
+        let engine = engine().expect("engine");
+        let dir = std::env::temp_dir().join(format!("myotis-host-usage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let id = create("gnosis", dir.to_str().unwrap());
+        assert!(id >= 1, "create failed: {id}");
+        let v: serde_json::Value = serde_json::from_str(&status_json(id)).unwrap();
+        let u = &v["dataUsage"];
+        assert_eq!(u["bytesIn"], 0, "{v}");
+        assert_eq!(u["todayBytesOut"], 0);
+        assert_eq!(u["day"].as_str().map(str::len), Some(10), "a YYYY-MM-DD day: {u}");
+        assert!(v["networkMetering"].is_string());
+        // Bytes on the handle's meter reach its status...
+        match engine.handles.lock().unwrap().get(&id) {
+            Some(ChainEntry::Created(c)) => c.traffic.el.add_rx(5),
+            _ => panic!("handle not Created"),
+        }
+        let v: serde_json::Value = serde_json::from_str(&status_json(id)).unwrap();
+        assert_eq!(v["dataUsage"]["bytesIn"], 5);
+        assert_eq!(v["dataUsage"]["elBytesIn"], 5);
+        assert_eq!(v["dataUsage"]["todayBytesIn"], 5);
+        // ...and stop() writes the day's file beside the snapshot, then drops
+        // the ledger.
+        stop(id);
+        assert!(engine.usage.lock().unwrap().get(&id).is_none());
+        let file = std::fs::read_to_string(dir.join("data-usage-gnosis.json")).expect("written at stop");
+        assert!(file.contains("\"bytesIn\":5"), "{file}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn network_metering_refuses_unknown_codes() {
+        let before = network_metering();
+        assert!(!set_network_metering(3));
+        assert!(!set_network_metering(-1));
+        assert_eq!(network_metering(), before, "a refused code records nothing");
     }
 
     #[test]

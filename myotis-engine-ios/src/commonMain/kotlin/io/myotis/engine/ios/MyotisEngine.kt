@@ -77,6 +77,22 @@ class MyotisEngine internal constructor(private val native: NativeEngine) {
         hostedNetworks().forEach(::stop)
     }
 
+    /**
+     * Tell the engine what kind of network the device is on now (call it on every
+     * path change): bytes moved while it is [NetworkMetering.METERED] count toward
+     * [DataUsage]'s metered figures, and every status reports it back. Engine-wide —
+     * it is the device's network, not a chain's.
+     */
+    fun setNetworkMetering(metering: NetworkMetering) {
+        if (!native.setNetworkMetering(metering.ordinal)) {
+            throw EngineException("the Rust engine refused network metering $metering")
+        }
+    }
+
+    /** The metering last set ([NetworkMetering.UNKNOWN] until a host sets one). */
+    fun networkMetering(): NetworkMetering =
+        NetworkMetering.entries.getOrNull(native.networkMetering()) ?: NetworkMetering.UNKNOWN
+
     private companion object {
         /** `myotis_create`'s sentinels (rust/include/myotis_engine.h). */
         const val UNSUPPORTED_NETWORK = -2L

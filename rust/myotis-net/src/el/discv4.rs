@@ -219,6 +219,9 @@ pub struct Discv4Config {
     /// over unjudged, as before, rather than be pinged for a verdict nobody
     /// needs yet. `None` = always judge (tests).
     pub pool_below_target: Option<Arc<AtomicBool>>,
+    /// Every datagram sent and received is counted into this meter's EL layer
+    /// ([`crate::traffic`]). None = not counted (tests).
+    pub traffic: Option<Arc<crate::traffic::TrafficMeter>>,
 }
 
 /// How the fork-id filter (#539) judged the nodes it saw this run.
@@ -297,6 +300,7 @@ impl Discv4Service {
             enr,
             pool_below_target: cfg.pool_below_target,
             wide: WideState::default(),
+            traffic: cfg.traffic.unwrap_or_default(),
         };
         let task = tokio::spawn(loop_state.run(stop_rx));
         Ok(Discv4Service {
@@ -423,6 +427,8 @@ fn set_recv_buffer_best_effort(socket: &socket2::Socket) {
 struct ServiceLoop {
     key: Arc<NodeKey>,
     socket: tokio::net::UdpSocket,
+    /// Where the socket's bytes are counted (`Discv4Config::traffic`).
+    traffic: Arc<crate::traffic::TrafficMeter>,
     /// True when `socket` is a dual-stack v6 socket (outgoing v4 targets need
     /// the v4-mapped form).
     dual_stack: bool,
@@ -789,6 +795,7 @@ impl ServiceLoop {
                     // pending-ping key and the recorded IP bytes match what we
                     // sent to and what peers advertise.
                     let sender = canonical_addr(sender);
+                    self.traffic.el.add_rx(n);
                     match parse(&buf[..n]) {
                         Ok(parsed) => self.handle(parsed, sender).await,
                         Err(e) => tracing::debug!(bytes = n, %sender, "discv4 unparseable: {}", e.0),
@@ -1430,7 +1437,9 @@ impl ServiceLoop {
             }
             _ => to,
         };
-        self.socket.send_to(packet, dest).await
+        let sent = self.socket.send_to(packet, dest).await?;
+        self.traffic.el.add_tx(sent);
+        Ok(sent)
     }
 }
 
@@ -1630,6 +1639,7 @@ mod tests {
                 bootnodes: Vec::new(),
                 fork_filter: Some(a_filter),
                 pool_below_target: None,
+                traffic: None,
             },
             a_tx,
         )
@@ -1643,6 +1653,7 @@ mod tests {
                 bootnodes: vec![SocketAddr::from(([127, 0, 0, 1], a.local_port()))],
                 fork_filter: b_filter,
                 pool_below_target: None,
+                traffic: None,
             },
             b_tx,
         )
@@ -1725,6 +1736,7 @@ mod tests {
                 bootnodes: Vec::new(),
                 fork_filter: Some(ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0)),
                 pool_below_target: None,
+                traffic: None,
             },
             a_tx,
         )
@@ -1950,6 +1962,7 @@ mod tests {
                 bootnodes: Vec::new(),
                 fork_filter: Some(ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0)),
                 pool_below_target: None,
+                traffic: None,
             },
             a_tx,
         )
@@ -2094,6 +2107,7 @@ mod tests {
                 bootnodes: Vec::new(),
                 fork_filter: Some(ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0)),
                 pool_below_target: None,
+                traffic: None,
             },
             a_tx,
         )
@@ -2158,6 +2172,8 @@ mod tests {
         let below_target = Arc::new(AtomicBool::new(false));
         let a_key = Arc::new(key(21));
         let (a_tx, mut a_rx) = tokio::sync::mpsc::channel(16);
+        // A's meter also pins the datagram counting: both rounds move bytes.
+        let meter = crate::traffic::TrafficMeter::new();
         let a = Discv4Service::start(
             Arc::clone(&a_key),
             Discv4Config {
@@ -2165,6 +2181,7 @@ mod tests {
                 bootnodes: Vec::new(),
                 fork_filter: Some(ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0)),
                 pool_below_target: Some(Arc::clone(&below_target)),
+                traffic: Some(Arc::clone(&meter)),
             },
             a_tx,
         )
@@ -2183,6 +2200,9 @@ mod tests {
         assert_eq!(entry.node_id, wanted.public_key_bytes().to_vec());
         assert_eq!(entry.tcp_port, 50505, "below target the record is asked for first");
         assert_eq!(a.enr_counts().snapshot(), (1, 0, 0));
+        let (rx, tx) = meter.el.snapshot();
+        assert!(rx > 0 && tx > 0, "discv4 datagrams counted: rx={rx} tx={tx}");
+        assert_eq!(meter.cl.snapshot(), (0, 0));
         a.stop().await;
     }
 
@@ -2201,6 +2221,7 @@ mod tests {
                 bootnodes: Vec::new(),
                 fork_filter: Some(ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0)),
                 pool_below_target: None,
+                traffic: None,
             },
             a_tx,
         )
@@ -2254,6 +2275,7 @@ mod tests {
                 bootnodes: Vec::new(),
                 fork_filter: Some(ForkFilter::for_chain([0xaa, 0xbb, 0xcc, 0xdd], 0)),
                 pool_below_target: None,
+                traffic: None,
             },
             tx,
         )

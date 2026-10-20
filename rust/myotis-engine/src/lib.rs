@@ -21,6 +21,7 @@ pub mod catalog;
 mod eljson;
 pub mod ffi;
 mod host;
+mod usage;
 pub mod ringlog;
 
 // UniFFI scaffolding (checksums, FFI glue) for the `ffi` exports; must be invoked
@@ -342,7 +343,16 @@ uniffi::setup_scaffolding!();
 ///      check's round apart from the claim's, Java-engine parity); the iOS
 ///      host drives no CCIP round yet, and the Node addon leaves the round to
 ///      its caller.
-pub const ABI_VERSION: i32 = 49;
+/// v50: data usage (docs/data-usage.md). The status JSON gained `dataUsage`
+///      (this handle's bytes since it was created, by layer, and the local
+///      day's figures with their metered part, persisted in
+///      `data-usage[-net].json` beside the snapshot) and `networkMetering`;
+///      `set_network_metering` / `network_metering` (C: `myotis_set_network_metering`
+///      / `myotis_network_metering`) carry the host's word on the device's
+///      network. An additive function pair plus a payload extension —
+///      bumped so a host that reports metering is never paired with an
+///      engine that lacks the function.
+pub const ABI_VERSION: i32 = 50;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

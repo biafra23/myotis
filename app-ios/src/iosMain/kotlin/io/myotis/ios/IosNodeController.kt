@@ -4,6 +4,7 @@ import io.myotis.engine.ios.RustEngine
 import io.myotis.jsonrpc.MyotisRpcServer
 import io.myotis.ui.AccountResult
 import io.myotis.ui.CacheFileStats
+import io.myotis.ui.DataUsageRow
 import io.myotis.ui.ENS_CONTENTHASH_KEY
 import io.myotis.ui.EnsOwnership
 import io.myotis.ui.EnsProfile
@@ -121,6 +122,8 @@ class IosNodeController(
             // every restart look like a mysterious cold boot.
             logs.append("ERROR failed to create data directory at $dataDir — sync state will not persist")
         }
+        // The data-usage figures' metered part follows the device's network path.
+        IosNetworkMetering.start { logs.append("WARN $it") }
         // Rust log pump — the only log producer on this host, so it feeds the
         // Logs tab directly. Process-lifetime, decoupled from UI collection
         // (parity with the desktop `myotis-rust-logs` thread).
@@ -712,6 +715,18 @@ class IosNodeController(
             elHunting = o.engineBoolean("elHunting"),
             wsBoundPeriods = o.engineLong("wsBoundPeriods", 0L),
             upgrade = upgradeNoticeOf(o["upgradeAdvisory"] as? JsonObject),
+            dataUsage = (o["dataUsage"] as? JsonObject)?.let { u ->
+                DataUsageRow(
+                    day = (u["day"] as? JsonPrimitive)?.takeIf { it.isString }?.content ?: "",
+                    todayIn = u.engineLong("todayBytesIn"),
+                    todayOut = u.engineLong("todayBytesOut"),
+                    todayMeteredIn = u.engineLong("todayMeteredBytesIn"),
+                    todayMeteredOut = u.engineLong("todayMeteredBytesOut"),
+                    totalIn = u.engineLong("bytesIn"),
+                    totalOut = u.engineLong("bytesOut"),
+                )
+            },
+            networkMetering = (o["networkMetering"] as? JsonPrimitive)?.takeIf { it.isString }?.content,
         )
     }
 }

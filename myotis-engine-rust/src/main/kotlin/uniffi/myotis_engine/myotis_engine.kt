@@ -730,6 +730,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_log_index_status_json(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_network_metering(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_pause_handle(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_pending_nonce_overlay(
@@ -749,6 +751,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_myotis_engine_checksum_func_set_dns_discovery(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_set_log_index_config(
+    ): Int
+    external fun uniffi_myotis_engine_checksum_func_set_network_metering(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_set_served_block_window(
     ): Int
@@ -837,6 +841,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_log_index_status_json(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_network_metering(uniffi_out_err: UniffiRustCallStatus, 
+    ): Int
     external fun uniffi_myotis_engine_fn_func_pause_handle(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_myotis_engine_fn_func_pending_nonce_overlay(`handle`: Long,`addressHex`: RustBuffer.ByValue,`minedNonce`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -856,6 +862,8 @@ internal object UniffiLib {
     external fun uniffi_myotis_engine_fn_func_set_dns_discovery(`on`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_myotis_engine_fn_func_set_log_index_config(`handle`: Long,`configJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
+    external fun uniffi_myotis_engine_fn_func_set_network_metering(`code`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_myotis_engine_fn_func_set_served_block_window(`handle`: Long,`blocks`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
@@ -1079,6 +1087,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_myotis_engine_checksum_func_log_index_status_json() and 0xFFFF) != 7764) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_myotis_engine_checksum_func_network_metering() and 0xFFFF) != 33479) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_myotis_engine_checksum_func_pause_handle() and 0xFFFF) != 51434) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1107,6 +1118,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_set_log_index_config() and 0xFFFF) != 49994) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_myotis_engine_checksum_func_set_network_metering() and 0xFFFF) != 45561) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_set_served_block_window() and 0xFFFF) != 15483) {
@@ -1892,6 +1906,20 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     
 
         /**
+         * The metering code [`set_network_metering`] recorded last (0 until a host
+         * reports one).
+         */ fun `networkMetering`(): kotlin.Int {
+            return FfiConverterInt.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_network_metering(
+    
+        _status)
+}
+    )
+    }
+    
+
+        /**
          * Idle-sleep a RUNNING handle. True ONLY on an actual RUNNING→PAUSED transition.
          */ fun `pauseHandle`(`handle`: kotlin.Long): kotlin.Boolean {
             return FfiConverterBoolean.lift(
@@ -2050,6 +2078,23 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         
         FfiConverterLong.lower(`handle`),
         FfiConverterString.lower(`configJson`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * The host's word on the device's current network, for the data-usage
+         * figures (docs/data-usage.md): 0 unknown, 1 unmetered, 2 metered. Bytes
+         * moved from now on count as metered while it is 2. False — nothing
+         * recorded — for any other code. Process-global, not per-handle.
+         */ fun `setNetworkMetering`(`code`: kotlin.Int): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_set_network_metering(
+    
+        
+        FfiConverterInt.lower(`code`),_status)
 }
     )
     }

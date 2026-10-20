@@ -730,6 +730,24 @@ data class NodeSnapshot(
     // recent first — the Settings tab's "recent web pages" list and the Status tab's
     // refusal banner. Empty when the host doesn't report it.
     val webOrigins: List<WebOriginRow> = emptyList(),
+    // This network's bytes on the wire (the API's DataUsage — docs/data-usage.md),
+    // Status "Data today" / "Data total" rows. null = the host doesn't report it.
+    val dataUsage: DataUsageRow? = null,
+    // The device network's metering as the host last told the engine (the API's
+    // NetworkMetering name: METERED / UNMETERED / UNKNOWN), Status "Connection"
+    // row — a debugging aid. null = the host doesn't report it.
+    val networkMetering: String? = null,
+)
+
+/** One network's data usage, as the hosts map it from the engine API's `DataUsage`. */
+data class DataUsageRow(
+    val day: String,                // local date the today* figures cover (YYYY-MM-DD)
+    val todayIn: Long,
+    val todayOut: Long,
+    val todayMeteredIn: Long,       // of today's, moved while the network was metered
+    val todayMeteredOut: Long,
+    val totalIn: Long,              // since this network's handle was created
+    val totalOut: Long,
 )
 
 /**

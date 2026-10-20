@@ -39,6 +39,8 @@ internal object RustNativeEngine : NativeEngine {
     override fun setWsBoundPeriods(handle: Long, periods: Long) = RustEngine.setWsBoundPeriods(handle, periods)
     override fun acceptStaleAnchor(handle: Long) = RustEngine.acceptStaleAnchor(handle)
     override fun statusJson(handle: Long) = RustEngine.statusJson(handle)
+    override fun setNetworkMetering(code: Int) = RustEngine.setNetworkMetering(code)
+    override fun networkMetering() = RustEngine.networkMetering()
 
     override fun requestAccountJson(handle: Long, address: String, block: String) =
         RustEngine.requestAccountJson(handle, address, block)

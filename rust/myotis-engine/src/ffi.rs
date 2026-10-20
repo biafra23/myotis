@@ -107,6 +107,22 @@ pub fn set_dns_discovery(on: bool) -> bool {
     crate::host::set_dns_discovery(on)
 }
 
+/// The host's word on the device's current network, for the data-usage
+/// figures (docs/data-usage.md): 0 unknown, 1 unmetered, 2 metered. Bytes
+/// moved from now on count as metered while it is 2. False — nothing
+/// recorded — for any other code. Process-global, not per-handle.
+#[uniffi::export]
+pub fn set_network_metering(code: i32) -> bool {
+    crate::host::set_network_metering(code)
+}
+
+/// The metering code [`set_network_metering`] recorded last (0 until a host
+/// reports one).
+#[uniffi::export]
+pub fn network_metering() -> i32 {
+    crate::host::network_metering()
+}
+
 /// One handle's status as a JSON object, or `"{}"` for an unknown handle.
 #[uniffi::export]
 pub fn status_json(handle: i64) -> String {

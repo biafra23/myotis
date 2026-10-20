@@ -223,6 +223,10 @@ pub struct ChainConfig {
     /// the engine host so its evidence survives pause/resume; None (the
     /// network constructors' default) runs without the detector.
     pub cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
+    /// This stack's byte counters ([`crate::traffic`]), shared across config
+    /// clones like [`Self::ws_policy`]: the libp2p host and discv5 count into
+    /// it, and the engine host hands it to the EL reader.
+    pub traffic: Arc<crate::traffic::TrafficMeter>,
 }
 
 impl ChainConfig {
@@ -347,6 +351,7 @@ impl ChainConfig {
             cl_peer_cache_path: None,
             ws_bound_periods: 13, // spec WS plateau 3532 epochs / 256 = 13.8 -> floor 13 (~14.7 days)
             ws_policy: Arc::new(WsPolicy::default()),
+            traffic: crate::traffic::TrafficMeter::new(),
             cl_fork_watch: None,
         }
         .with_env_overrides()
@@ -413,6 +418,7 @@ impl ChainConfig {
             cl_peer_cache_path: None,
             ws_bound_periods: 13, // permissioned validator set; mainnet-preset bound kept as hygiene
             ws_policy: Arc::new(WsPolicy::default()),
+            traffic: crate::traffic::TrafficMeter::new(),
             cl_fork_watch: None,
         }
         .with_env_overrides()
@@ -483,6 +489,7 @@ impl ChainConfig {
             cl_peer_cache_path: None,
             ws_bound_periods: 3, // short churn window (see NetworkConfig.wsBoundPeriods) — pragmatic floor
             ws_policy: Arc::new(WsPolicy::default()),
+            traffic: crate::traffic::TrafficMeter::new(),
             cl_fork_watch: None,
         }
         .with_env_overrides()
@@ -1241,6 +1248,7 @@ impl SyncHandle {
             Arc::clone(&local_status),
             reqresp::HostConfig {
                 cl_fork_watch: config.cl_fork_watch.clone(),
+                traffic: Some(Arc::clone(&config.traffic)),
                 ..reqresp::HostConfig::default()
             },
         )
@@ -1262,6 +1270,7 @@ impl SyncHandle {
             // Every ENR heard — accepted or not — is evidence for the CL fork
             // watch; it must see them BEFORE the digest filter drops them.
             cl_fork_watch: config.cl_fork_watch.clone(),
+            traffic: Some(Arc::clone(&config.traffic)),
             // The pinned CL peers, for targeted lookups: discovery walks toward
             // their derived discv5 ids so a stale pinned address (roost behind
             // a rotated residential IP) heals from third-party tables in

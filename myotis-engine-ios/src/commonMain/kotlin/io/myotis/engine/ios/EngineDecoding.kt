@@ -90,6 +90,8 @@ internal object EngineDecoding {
         val elHunting: Boolean,
         val wsBoundPeriods: Long,
         val upgradeAdvisory: UpgradeAdvisory?,
+        val dataUsage: DataUsage,
+        val networkMetering: NetworkMetering,
     ) {
         /** A verified read can be served now: SYNCED, an anchored optimistic head, and a
          *  pooled snap peer that can answer at it ([snapServingPeers], never the pooled
@@ -140,6 +142,10 @@ internal object EngineDecoding {
                 elHunting = o.boolean("elHunting"),
                 wsBoundPeriods = o.long("wsBoundPeriods"),
                 upgradeAdvisory = advisory(o["upgradeAdvisory"]),
+                // ABI >= 50. Display-only, like the advisory: absent or malformed is
+                // NONE / UNKNOWN, never a failed status read.
+                dataUsage = dataUsage(o["dataUsage"]),
+                networkMetering = metering(o["networkMetering"]),
             )
         }
     }
@@ -192,7 +198,38 @@ internal object EngineDecoding {
             lcHunting = s.lcHunting,
             elHunting = s.elHunting,
             upgradeAdvisory = s.upgradeAdvisory,
+            dataUsage = s.dataUsage,
+            networkMetering = s.networkMetering,
         )
+    }
+
+    /** The nested `dataUsage`; absent, null, not an object or a field of the wrong
+     *  type is [DataUsage.NONE]. */
+    private fun dataUsage(element: JsonElement?): DataUsage {
+        val u = element as? JsonObject ?: return DataUsage.NONE
+        return try {
+            DataUsage(
+                bytesIn = u.long("bytesIn"),
+                bytesOut = u.long("bytesOut"),
+                elBytesIn = u.long("elBytesIn"),
+                elBytesOut = u.long("elBytesOut"),
+                clBytesIn = u.long("clBytesIn"),
+                clBytesOut = u.long("clBytesOut"),
+                day = u.string("day") ?: "",
+                todayBytesIn = u.long("todayBytesIn"),
+                todayBytesOut = u.long("todayBytesOut"),
+                todayMeteredBytesIn = u.long("todayMeteredBytesIn"),
+                todayMeteredBytesOut = u.long("todayMeteredBytesOut"),
+            )
+        } catch (e: IllegalArgumentException) {
+            DataUsage.NONE
+        }
+    }
+
+    /** `networkMetering`; a name this build does not know reads as UNKNOWN. */
+    private fun metering(element: JsonElement?): NetworkMetering {
+        val name = (element as? JsonPrimitive)?.takeIf { it.isString }?.content
+        return NetworkMetering.entries.firstOrNull { it.name == name } ?: NetworkMetering.UNKNOWN
     }
 
     /** The nested advisory; absent, null, not an object, a phase this build does not
@@ -220,7 +257,7 @@ internal object EngineDecoding {
         backedOffPeers = 0, blacklistedPeers = 0, optimisticBlockNumber = 0, finalizedBlockNumber = 0,
         peerHeaderRequests = 0, peerHeaderRequestsServed = 0, peerBodyRequests = 0,
         peerBodyRequestsServed = 0, lcHunting = false, elHunting = false, wsBoundPeriods = 0,
-        upgradeAdvisory = null,
+        upgradeAdvisory = null, dataUsage = DataUsage.NONE, networkMetering = NetworkMetering.UNKNOWN,
     )
 
     // ---- proofs ----

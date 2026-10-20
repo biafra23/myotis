@@ -2,8 +2,10 @@ package io.myotis.engines.rust;
 
 import io.myotis.api.BeaconState;
 import io.myotis.api.BeaconStatus;
+import io.myotis.api.DataUsage;
 import io.myotis.api.EngineConfig;
 import io.myotis.api.EngineException;
+import io.myotis.api.NetworkMetering;
 import io.myotis.api.StatusSnapshot;
 import io.myotis.api.UpgradeAdvisory;
 import io.myotis.api.UpgradePhase;
@@ -43,7 +45,8 @@ class RustStatusJsonTest {
             + "\"backedOffPeers\":0,\"blacklistedPeers\":0,\"optimisticBlockNumber\":0,"
             + "\"finalizedBlockNumber\":0,\"executionBlockNumber\":0,\"elHunting\":false,"
             + "\"peerHeaderRequests\":0,\"peerHeaderRequestsServed\":0,"
-            + "\"peerBodyRequests\":0,\"peerBodyRequestsServed\":0,\"upgradeAdvisory\":null}";
+            + "\"peerBodyRequests\":0,\"peerBodyRequestsServed\":0,\"upgradeAdvisory\":null,"
+            + "\"dataUsage\":null,\"networkMetering\":\"UNKNOWN\"}";
 
     /** A synthetic catching-up shape (real running numbers, incl. EL counts). */
     private static final String CATCHING_UP_JSON =
@@ -399,6 +402,47 @@ class RustStatusJsonTest {
         // A wrong-typed field inside the object (a buggy native): still no status failure.
         assertNull(RustChainHandle.statusFromJson("sepolia",
                 SCHEDULED_ADVISORY_JSON.replace("\"SCHEDULED\"", "5")).upgradeAdvisory());
+    }
+
+    /** The ABI-50 data-usage keys, as the Rust status_object emits them. */
+    private static final String DATA_USAGE_JSON =
+            "{\"running\":true,\"network\":\"gnosis\",\"beaconState\":\"SYNCED\","
+            + "\"dataUsage\":{\"bytesIn\":40,\"bytesOut\":6,\"elBytesIn\":10,\"elBytesOut\":2,"
+            + "\"clBytesIn\":30,\"clBytesOut\":4,\"day\":\"2026-10-20\",\"todayBytesIn\":400,"
+            + "\"todayBytesOut\":60,\"todayMeteredBytesIn\":100,\"todayMeteredBytesOut\":9},"
+            + "\"networkMetering\":\"METERED\"}";
+
+    @Test
+    void dataUsageAndMeteringAreParsed() {
+        StatusSnapshot s = RustChainHandle.statusFromJson("gnosis", DATA_USAGE_JSON);
+        assertEquals(new DataUsage(40, 6, 10, 2, 30, 4, "2026-10-20", 400, 60, 100, 9), s.dataUsage());
+        assertEquals(460, s.dataUsage().todayBytes());
+        assertEquals(109, s.dataUsage().todayMeteredBytes());
+        assertEquals(NetworkMetering.METERED, s.networkMetering());
+    }
+
+    @Test
+    void dataUsageAbsentNullOrMalformedIsNoneNotAFailure() {
+        // JSON null (a handle without a ledger), absent (older natives), unknown handle.
+        for (String json : new String[] {NOT_STARTED_JSON, CATCHING_UP_JSON, "{}"}) {
+            StatusSnapshot s = RustChainHandle.statusFromJson("mainnet", json);
+            assertEquals(DataUsage.NONE, s.dataUsage(), json);
+            assertEquals(NetworkMetering.UNKNOWN, s.networkMetering(), json);
+        }
+        // A newer native's metering name, or a wrong-typed usage object: still a status.
+        StatusSnapshot s = RustChainHandle.statusFromJson("gnosis",
+                DATA_USAGE_JSON.replace("\"METERED\"", "\"SATELLITE\"")
+                        .replace("\"bytesIn\":40", "\"bytesIn\":\"lots\""));
+        assertTrue(s.running());
+        assertEquals(DataUsage.NONE, s.dataUsage());
+        assertEquals(NetworkMetering.UNKNOWN, s.networkMetering());
+        // A null or numeric metering (a buggy native) is UNKNOWN, not a failed status.
+        for (String bad : new String[] {"null", "2"}) {
+            StatusSnapshot t = RustChainHandle.statusFromJson("gnosis",
+                    DATA_USAGE_JSON.replace("\"METERED\"", bad));
+            assertTrue(t.running(), bad);
+            assertEquals(NetworkMetering.UNKNOWN, t.networkMetering(), bad);
+        }
     }
 
     @Test

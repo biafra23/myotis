@@ -47,4 +47,18 @@ public interface MyotisEngine {
 
     /** Stop and unregister every hosted network. */
     void shutdownAll();
+
+    /**
+     * Tell the engine what kind of network the device is on now — mobile hosts
+     * call it on every connectivity change. Bytes moved while it is
+     * {@link NetworkMetering#METERED} count toward the {@code todayMetered*}
+     * figures of {@link DataUsage}, and every status reports it back
+     * ({@link StatusSnapshot#networkMetering()}). Engine-wide: it is the
+     * device's network, not a chain's. {@link NetworkMetering#UNKNOWN} until a
+     * host calls this.
+     */
+    void setNetworkMetering(NetworkMetering metering);
+
+    /** The metering last set by {@link #setNetworkMetering}. */
+    NetworkMetering networkMetering();
 }

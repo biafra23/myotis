@@ -25,6 +25,7 @@ import io.myotis.ui.AccountResult
 import io.myotis.ui.BalanceWatch
 import io.myotis.ui.BalanceWatcher
 import io.myotis.ui.CacheFileStats
+import io.myotis.ui.DataUsageRow
 import io.myotis.ui.ENS_CONTENTHASH_KEY
 import io.myotis.ui.EnsOwnership
 import io.myotis.ui.EnsProfile
@@ -876,6 +877,18 @@ class DesktopNodeController(
                 UpgradeNotice(it.phase().name, it.activationTime(), it.forkId(), it.observedPeers())
             },
             webOrigins = webOriginRows(s.network(), handle),
+            dataUsage = s.dataUsage().let {
+                DataUsageRow(
+                    day = it.day(),
+                    todayIn = it.todayBytesIn(),
+                    todayOut = it.todayBytesOut(),
+                    todayMeteredIn = it.todayMeteredBytesIn(),
+                    todayMeteredOut = it.todayMeteredBytesOut(),
+                    totalIn = it.bytesIn(),
+                    totalOut = it.bytesOut(),
+                )
+            },
+            networkMetering = s.networkMetering().name,
         )
     }
 

@@ -16,6 +16,8 @@ use tokio::net::TcpStream;
 
 use myotis_core::nodekey::NodeKey;
 
+use crate::traffic::TrafficMeter;
+
 use super::frame::{DecodedFrame, FrameCodec, FrameDecoder, FrameEncoder};
 use super::handshake::Initiator;
 
@@ -55,6 +57,9 @@ pub struct RlpxConnection<S = TcpStream> {
     codec: FrameCodec,
     /// The peer's static public key (its enode id).
     peer_pubkey: [u8; 64],
+    /// Where the connection's bytes are counted (the EL layer), from the
+    /// handshake on; carried into the split halves. None = not counted.
+    traffic: Option<Arc<TrafficMeter>>,
 }
 
 impl RlpxConnection<TcpStream> {
@@ -66,7 +71,18 @@ impl RlpxConnection<TcpStream> {
         addr: std::net::SocketAddr,
         peer_pubkey: [u8; 64],
     ) -> Result<RlpxConnection, String> {
-        let fut = Self::dial_inner(local_key, addr, peer_pubkey);
+        Self::dial_metered(local_key, addr, peer_pubkey, None).await
+    }
+
+    /// [`dial`](Self::dial), counting every byte on the wire — the handshake
+    /// included — into `traffic`'s EL layer.
+    pub async fn dial_metered(
+        local_key: Arc<NodeKey>,
+        addr: std::net::SocketAddr,
+        peer_pubkey: [u8; 64],
+        traffic: Option<Arc<TrafficMeter>>,
+    ) -> Result<RlpxConnection, String> {
+        let fut = Self::dial_inner(local_key, addr, peer_pubkey, traffic);
         tokio::time::timeout(HANDSHAKE_TIMEOUT, fut)
             .await
             .map_err(|_| "rlpx handshake timed out".to_string())?
@@ -76,12 +92,13 @@ impl RlpxConnection<TcpStream> {
         local_key: Arc<NodeKey>,
         addr: std::net::SocketAddr,
         peer_pubkey: [u8; 64],
+        traffic: Option<Arc<TrafficMeter>>,
     ) -> Result<RlpxConnection, String> {
         let stream = TcpStream::connect(addr)
             .await
             .map_err(|e| format!("rlpx connect: {e}"))?;
         stream.set_nodelay(true).ok();
-        Self::handshake_over(stream, local_key, peer_pubkey).await
+        Self::handshake_metered(stream, local_key, peer_pubkey, traffic).await
     }
 
     /// Split into independent read/write halves for the managed-peer's separate
@@ -92,8 +109,8 @@ impl RlpxConnection<TcpStream> {
         let (read_half, write_half) = self.stream.into_split();
         let (encoder, decoder) = self.codec.split();
         (
-            RlpxReader { read_half, decoder },
-            RlpxWriter { write_half, encoder },
+            RlpxReader { read_half, decoder, traffic: self.traffic.clone() },
+            RlpxWriter { write_half, encoder, traffic: self.traffic },
             self.peer_pubkey,
         )
     }
@@ -107,9 +124,20 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> RlpxConnection<S> {
     /// (Tor's multi-hop build wants a larger budget). Entropy is drawn from the
     /// OS here.
     pub async fn handshake_over(
+        stream: S,
+        local_key: Arc<NodeKey>,
+        peer_pubkey: [u8; 64],
+    ) -> Result<RlpxConnection<S>, String> {
+        Self::handshake_metered(stream, local_key, peer_pubkey, None).await
+    }
+
+    /// [`handshake_over`](Self::handshake_over), counting the connection's
+    /// bytes into `traffic`'s EL layer from the first auth byte on.
+    pub async fn handshake_metered(
         mut stream: S,
         local_key: Arc<NodeKey>,
         peer_pubkey: [u8; 64],
+        traffic: Option<Arc<TrafficMeter>>,
     ) -> Result<RlpxConnection<S>, String> {
         // Fresh entropy for this handshake.
         let eph_secret = random32();
@@ -127,6 +155,9 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> RlpxConnection<S> {
             .write_all(&auth_wire)
             .await
             .map_err(|e| format!("rlpx write auth: {e}"))?;
+        if let Some(t) = &traffic {
+            t.el.add_tx(auth_wire.len());
+        }
         // Flush before blocking on the ack: a plain TcpStream sends immediately,
         // but a buffered stream (Arti's Tor `DataStream`) holds the auth in its
         // write buffer until flushed — without this the peer never sees our auth
@@ -138,6 +169,9 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> RlpxConnection<S> {
 
         // Read the EIP-8 ack: 2-byte size prefix, then that many bytes.
         let ack_wire = read_ack(&mut stream).await?;
+        if let Some(t) = &traffic {
+            t.el.add_rx(ack_wire.len());
+        }
         let secrets = initiator
             .process_ack(&ack_wire)
             .map_err(|e| format!("rlpx ack: {}", e.0))?;
@@ -146,6 +180,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> RlpxConnection<S> {
             stream,
             codec: FrameCodec::new(&secrets),
             peer_pubkey,
+            traffic,
         })
     }
 
@@ -156,7 +191,11 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> RlpxConnection<S> {
     /// Frame and send one message (bounded by [`FRAME_WRITE_TIMEOUT`]).
     pub async fn send(&mut self, message_code: u64, body: &[u8]) -> Result<(), String> {
         let frame = self.codec.encode_frame(message_code, body);
-        write_frame(&mut self.stream, &frame).await
+        write_frame(&mut self.stream, &frame).await?;
+        if let Some(t) = &self.traffic {
+            t.el.add_tx(frame.len());
+        }
+        Ok(())
     }
 
     /// Read and decode the next frame. Blocks indefinitely waiting for the next
@@ -189,8 +228,11 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> RlpxConnection<S> {
         self.stream
             .read_exact(buf)
             .await
-            .map(|_| ())
-            .map_err(|e| format!("rlpx read: {e}"))
+            .map_err(|e| format!("rlpx read: {e}"))?;
+        if let Some(t) = &self.traffic {
+            t.el.add_rx(buf.len());
+        }
+        Ok(())
     }
 }
 
@@ -208,6 +250,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> RlpxConnection<S> {
             stream,
             codec: FrameCodec::new(secrets),
             peer_pubkey,
+            traffic: None,
         }
     }
 }
@@ -217,13 +260,18 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> RlpxConnection<S> {
 pub struct RlpxWriter {
     write_half: OwnedWriteHalf,
     encoder: FrameEncoder,
+    traffic: Option<Arc<TrafficMeter>>,
 }
 
 impl RlpxWriter {
     /// Frame and send one message (bounded by [`FRAME_WRITE_TIMEOUT`]).
     pub async fn send(&mut self, message_code: u64, body: &[u8]) -> Result<(), String> {
         let frame = self.encoder.encode_frame(message_code, body);
-        write_frame(&mut self.write_half, &frame).await
+        write_frame(&mut self.write_half, &frame).await?;
+        if let Some(t) = &self.traffic {
+            t.el.add_tx(frame.len());
+        }
+        Ok(())
     }
 }
 
@@ -246,6 +294,7 @@ async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, frame: &[u8]) -> Resul
 pub struct RlpxReader {
     read_half: OwnedReadHalf,
     decoder: FrameDecoder,
+    traffic: Option<Arc<TrafficMeter>>,
 }
 
 impl RlpxReader {
@@ -263,6 +312,9 @@ impl RlpxReader {
             .read_exact(&mut header_mac)
             .await
             .map_err(|e| format!("rlpx read: {e}"))?;
+        if let Some(t) = &self.traffic {
+            t.el.add_rx(header.len() + header_mac.len());
+        }
         let body_len = self
             .decoder
             .decode_header(&header, &header_mac)
@@ -277,6 +329,9 @@ impl RlpxReader {
         .await
         .map_err(|_| "rlpx frame body timed out".to_string())?
         .map_err(|e| format!("rlpx read: {e}"))?;
+        if let Some(t) = &self.traffic {
+            t.el.add_rx(enc_body.len() + body_mac.len());
+        }
         self.decoder
             .decode_body(&enc_body, &body_mac, body_len)
             .map_err(|e| format!("rlpx body: {}", e.0))

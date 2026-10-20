@@ -406,6 +406,13 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   head); while it still verifies, an ACTIVE advisory means "update soon". Its
   evidence survives `pause()`, but ages out a day after its peers were last
   seen connected (a long sleep re-derives it from the peers dialed on wake).
+- **Data usage** (ABI 50, docs/data-usage.md): `statusJson` carries
+  `dataUsage` — this network's bytes on the wire since `create()`
+  (`bytesIn`/`bytesOut`, split `elBytes*`/`clBytes*`) and today's, local time
+  (`day`, `todayBytesIn`/`todayBytesOut`, kept across restarts in the data
+  dir), with `todayMeteredBytes*` the part moved while the host reported a
+  metered network — `setNetworkMetering(0 | 1 | 2)` (unknown / unmetered /
+  metered), echoed as `networkMetering`. Add the networks up for a total.
 - **data_dir**: the engine creates it on `create()` (an uncreatable path
   yields a negative handle) as of the data_dir fix; on engine versions
   without it, create the directory yourself first — otherwise sync works but
