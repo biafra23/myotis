@@ -22,8 +22,7 @@
 #                 hold their pool slots and keep steering targeted lookups;
 #                 discovery has to find a real server anyway. The dispatched
 #                 smoke job dials a warm peer cache, which hides this. The EL
-#                 pins are dead too (Sepolia's is zbox's geth, behind roost's
-#                 relay).
+#                 pins stay live (see the test for why).
 #   * old-anchor: the trust anchor is several periods behind, so bootstrap is
 #                 not enough and catch-up must actually walk periods. A
 #                 release-fresh anchor walks 0-2 periods and proves little, so
@@ -165,9 +164,9 @@ jobs:
           cargo test --release -p myotis-net --test live_pins_alive -- \
             --ignored --nocapture --test-threads=1
 
-      # Discovery-only: every pin (CL and EL) configured but dead. The EL at
-      # info: its pool's debug output would bury the light client's, and the
-      # test's progress lines carry what the EL half contributes.
+      # Discovery-only: every CL pin configured but dead. The EL at info: its
+      # pool's debug output would bury the light client's, and the test's
+      # progress lines carry what the EL half contributes.
       - name: Cold start with every pinned peer unreachable
         if: inputs.scope != 'census'
         working-directory: rust

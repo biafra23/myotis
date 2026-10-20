@@ -16,8 +16,7 @@
 //!   so a dead pin stays in the pool for the life of the process, keeps being
 //!   handed to every catch-up fan-out, and keeps steering targeted discovery
 //!   lookups at a server that will never answer. Discovery has to win anyway.
-//!   The EL boot enodes go the same way, so on a Gloas chain the EL peer that
-//!   SYNCED needs (below) has to come through discv4 too.
+//!   The EL pins stay live: see the test body for why.
 //!
 //! * `cold_start_from_an_old_anchor_walks_periods_to_head` — the trust anchor
 //!   is several periods behind, so bootstrap is not enough and catch-up must
@@ -75,7 +74,7 @@
 //! Gloas chain until the EL pool resolves the header — and a run that misses
 //! SYNCED says which half stalled ([`diagnose`]).
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -324,7 +323,13 @@ fn blackhole(i: usize) -> Ipv4Addr {
 async fn cold_start_with_every_pinned_peer_unreachable_syncs_through_discovery() {
     init_tracing();
     assert_no_cl_env_overrides();
-    let (mut config, mut el_config) = configs_for_env();
+    // The EL config as shipped, pins included. #422 is the CL pins dead, and
+    // that is what this measures. With Sepolia's EL pin (zbox's geth) dead too,
+    // discv4 alone kept no Sepolia EL peer in 10 minutes from zbox
+    // (2026-10-20: 25 fork-compatible ENRs, one of them a crawler that hangs
+    // up at once), so the run would fail on EL peer scarcity instead — a real
+    // fresh-install question, and a different one from this test's.
+    let (mut config, el_config) = configs_for_env();
 
     // Keep every pinned peer ID, point it at a black hole. NOT a cleared list:
     // pinned peers are exempt from eviction, so these stay in the pool, keep
@@ -350,34 +355,16 @@ async fn cold_start_with_every_pinned_peer_unreachable_syncs_through_discovery()
     // "a node with no way in cannot get in".
     assert!(!config.bootstrap_enrs.is_empty(), "discovery needs its bootnodes");
 
-    // The EL pins the same way, key kept and address dead. Sepolia's is zbox's
-    // geth, behind the same relay as both its CL pins, so an outage that takes
-    // roost takes it too. On a Gloas chain SYNCED needs an EL peer as well, and
-    // here it has to come through discv4, as the light-client server has to
-    // come through discv5.
-    let el_pinned = el_config.boot_enodes.len();
-    el_config.boot_enodes = el_config
-        .boot_enodes
-        .iter()
-        .enumerate()
-        .map(|(i, &(_, pubkey))| (SocketAddr::from((blackhole(i), 30303)), pubkey))
-        .collect();
-    assert!(
-        el_config.boot_enodes.iter().all(|(a, _)| a.ip().to_string().starts_with(BLACKHOLE_PREFIX)),
-        "every EL pin must be blackholed, or this measures a live server"
-    );
-    assert!(!el_config.bootnodes.is_empty(), "EL discovery needs its bootnodes");
-
     let run = ColdStart::start(config, el_config).await;
     let synced = run_to_synced(&run, "dead-pins", NO_PINS_BUDGET).await;
     run.stop().await;
 
     if let Err(last) = synced {
         panic!(
-            "cold start with all {pinned} CL pins and {el_pinned} EL pins unreachable did not \
-             reach SYNCED in {} min: {}. With every pin dead, a CL stall means discovery could \
-             not find a light-client server while the dead pins held their un-evictable pool \
-             slots, which is the #422 condition",
+            "cold start with all {pinned} pinned CL peers unreachable did not reach SYNCED in \
+             {} min: {}. With every pin dead, a CL stall means discovery could not find a \
+             light-client server while the dead pins held their un-evictable pool slots, which \
+             is the #422 condition",
             NO_PINS_BUDGET.as_secs() / 60,
             diagnose(&last)
         );
@@ -389,8 +376,7 @@ async fn cold_start_with_every_pinned_peer_unreachable_syncs_through_discovery()
 async fn cold_start_from_an_old_anchor_walks_periods_to_head() {
     init_tracing();
     assert_no_cl_env_overrides();
-    // The EL config as shipped, pins included: this test removes the fresh
-    // anchor, nothing else.
+    // The EL config as shipped, pins included, as in the dead-pins test.
     let (mut config, el_config) = configs_for_env();
 
     // The anchor comes from MYOTIS_TEST_ANCHOR_ROOT + MYOTIS_TEST_ANCHOR_SLOT

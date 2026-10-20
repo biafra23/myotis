@@ -468,7 +468,7 @@ asset workflow and a stronger action than the merge this file already forbids.
    # 3a. are the shipped pins and bootnodes alive? (seconds when healthy)
    NET=gnosis cargo test --release -p myotis-net --test live_pins_alive -- \
        --ignored --nocapture --test-threads=1
-   # 3b. dead pins: every pinned CL server and EL peer configured but unreachable
+   # 3b. dead pins: every pinned CL server configured but unreachable
    NET=gnosis cargo test --release -p myotis-net --test live_cold_start -- \
        --ignored --nocapture cold_start_with_every_pinned_peer_unreachable
    # 3c. deep catch-up: an anchor further behind than the network's ws bound
