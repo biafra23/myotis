@@ -72,6 +72,14 @@ shows `—` and no dot) and one line of detail. All come from `vitalsOf` in
 | **Verified head** | the verified head's age (`4 s`, `2 min`), `None yet`, or `—` | `fresh` (≤ 45 s), `stale — waiting for a fresh head`, `waiting for a peer that can answer`, `waiting for sync`, or `paused — needs your decision` | green when fresh, amber when stale or missing on a synced node, no dot while not synced |
 | **Log index** (only when the engine reports an enabled index) | `Up to date` (within the 4-block serving slack), `Trailing` (past the slack but short of a catch-up — green, like the strip, with the gap named and a note that queries at the very head wait), `Behind head` / `Too far behind` (a tracked catch-up — the card's amber rung), `Starting` (no block covered yet), `Nothing watched` | the head gap, then the history: `history complete`, `history paused · N blocks unindexed`, or `history incomplete · <ETA or blocks left>` | follows the HEAD side only, and agrees with the card: amber exactly while the ladder's catch-up rung is up. An incomplete or paused history is said in the detail and never changes the tone, because it does not affect what the node can answer at the head |
 
+A fifth tile, **Data today**, follows wherever the host reports data usage
+(all three apps): the network's bytes on the wire today (local time, both
+directions) as its value, and beneath it the metered and unmetered parts, one
+per line — or, on a host that cannot tell the two apart (desktop), the two
+directions (`↓ in ↑ out`). No tone: it is information, not a health signal. It
+stays while the network sleeps or is stopped (the day's figures outlive both).
+docs/data-usage.md has what is counted.
+
 While the stack is down the first three tiles read `—` and the index tile is
 hidden; while it sleeps, `—` with "sleeping". The index tile also disappears whenever the status probe answers an
 error envelope (a paused or still-starting handle).
@@ -178,7 +186,7 @@ In on-screen order. "Row" is the literal left-hand text label.
 | **Head age** | `Long.MAX_VALUE` displays as `—` ("no verified head yet — no state read can be served"); otherwise the freshness in ms of the head context verified reads are currently served against. Meaning differs by engine (rebuild-timer on Java, block-advance timer on Rust) — full explanation in `docs/readiness-and-verified-head-age.md` §What "verified head age" means. The UI's own amber/green threshold is 45 s. |
 | **Uptime** | Seconds since this network's stack started running. |
 | **Data today** | This network's bytes on the wire today (local time): `↓ in ↑ out`. Kept across restarts on the same day; starts from zero at midnight. Peer-to-peer traffic only — Tor's own traffic and DNS lookups are not counted, nor discv5 on the Java engine. Full detail: `docs/data-usage.md`. |
-| **Metered** | Today's bytes (both directions) split by the network they went over: `N metered · M unmetered`. Metered = mobile data, a hotspot, Low Data Mode; unmetered = Wi-Fi/Ethernet, plus anything moved while the app could not tell (no active network). Hidden where the host reports no metering at all (the desktop app) and nothing was metered today. |
+| **Metered** / **Unmetered** | Today's bytes (both directions) split by the network they went over. Metered = mobile data, a hotspot, Low Data Mode; unmetered = Wi-Fi/Ethernet, plus anything moved while the app could not tell (no active network). Both rows are hidden where the host reports no metering at all (the desktop app) and nothing was metered today. |
 | **Data total** | The same since this network was started in this app session, across sleeps. |
 | **Connection** | What the app told the engine about the device's network: `metered`, `unmetered`, or `unknown` (the desktop app, which cannot tell). A debugging aid for the metered split above. |
 | **Sleep** | Idle-sleep (pseudo-sleep) summary: `always on` if the host has no idle controller at all (e.g. desktop); `never slept` if it supports sleep but hasn't paused yet; otherwise `<duration> over N pause(s)` — cumulative time spent idle-paused and how many times. |

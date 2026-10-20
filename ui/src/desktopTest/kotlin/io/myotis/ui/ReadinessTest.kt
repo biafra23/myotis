@@ -235,6 +235,31 @@ class ReadinessTest {
     }
 
     @Test
+    fun dataTodayTileSplitsMeteredWhereTheHostCanTell() {
+        val mb = 1024L * 1024
+        val usage = DataUsageRow("2026-10-20", 10 * mb, 2 * mb, 3 * mb, 1 * mb, 50 * mb, 9 * mb)
+        // A mobile host (metering known): total, then the metered / unmetered split.
+        val phone = vitalsOf(synced().copy(dataUsage = usage, networkMetering = "UNMETERED"), 16).data!!
+        assertEquals("Data today", phone.label)
+        assertEquals("12.0 MB", phone.value)
+        assertEquals("4.0 MB metered\n8.0 MB unmetered", phone.detail)
+        assertEquals(Tone.NONE, phone.tone)
+        // A host that never knows (desktop): the directions instead — it must not call
+        // every byte unmetered.
+        val desk = vitalsOf(
+            synced().copy(dataUsage = usage.copy(todayMeteredIn = 0, todayMeteredOut = 0), networkMetering = "UNKNOWN"),
+            16,
+        ).data!!
+        assertEquals("↓ 10.0 MB ↑ 2.0 MB", desk.detail)
+        // Today's figures stay while the network sleeps or is stopped; a host that does
+        // not report usage gets no tile.
+        assertEquals("12.0 MB", vitalsOf(synced().copy(lifecycle = "PAUSED", dataUsage = usage), 16).data!!.value)
+        assertEquals("12.0 MB", vitalsOf(synced().copy(running = false, dataUsage = usage), 16).data!!.value)
+        assertNull(vitalsOf(synced(), 16).data)
+        assertNull(vitalsOf(null, 16).data)
+    }
+
+    @Test
     fun executionPeersCountTheServingOnes() {
         val v = vitalsOf(synced().copy(readyPeers = 18, snapServingPeers = 12), 16)
         assertEquals("Execution peers", v.el.label)

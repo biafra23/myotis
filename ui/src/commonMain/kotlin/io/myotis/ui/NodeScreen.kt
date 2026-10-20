@@ -1406,13 +1406,9 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
             )
             // Only where the split means something: a host that cannot tell (desktop:
             // Connection "unknown" all day) would otherwise call every byte unmetered.
-            if (today.metered > 0 || s.networkMetering == "METERED" || s.networkMetering == "UNMETERED") {
-                StatusRow(
-                    "Metered",
-                    "${DataUsageText.bytes(today.metered)} metered · " +
-                        "${DataUsageText.bytes(today.unmetered)} unmetered",
-                    help = StatusHelp.DATA_METERED,
-                )
+            if (DataUsageText.showsSplit(today, s.networkMetering)) {
+                StatusRow("Metered", DataUsageText.bytes(today.metered), help = StatusHelp.DATA_SPLIT)
+                StatusRow("Unmetered", DataUsageText.bytes(today.unmetered), help = StatusHelp.DATA_SPLIT)
             }
             StatusRow(
                 "Data total",
@@ -2624,7 +2620,7 @@ private object StatusHelp {
     const val DATA_TODAY = "Bytes this network received (↓) and sent (↑) today, local time — " +
         "kept across restarts on the same day. Counts the peer-to-peer traffic on the wire; " +
         "Tor's own traffic and DNS lookups are not included."
-    const val DATA_METERED = "Today's bytes (both directions) split by the network they went " +
+    const val DATA_SPLIT = "Metered / Unmetered: today's bytes (both directions) split by the network they went " +
         "over: metered (mobile data, a hotspot, Low Data Mode) or unmetered (Wi-Fi, Ethernet — " +
         "and anything moved while the app could not tell)."
     const val DATA_TOTAL = "Bytes this network received (↓) and sent (↑) since it was started " +

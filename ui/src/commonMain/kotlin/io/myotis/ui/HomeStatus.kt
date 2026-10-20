@@ -101,17 +101,17 @@ internal fun StatusHero(
     }
 }
 
-/** The vitals, two per row: execution peers / consensus, verified head / log index (when enabled). */
+/** The vitals, two per row: execution peers / consensus, verified head, then the log index
+ *  (when enabled) and today's data usage (when reported), in that order. */
 @Composable
 internal fun VitalsGrid(v: Vitals) {
+    val tiles = listOfNotNull(v.el, v.cl, v.head, v.index, v.data)
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            VitalTile(v.el, Modifier.weight(1f))
-            VitalTile(v.cl, Modifier.weight(1f))
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            VitalTile(v.head, Modifier.weight(1f))
-            if (v.index != null) VitalTile(v.index, Modifier.weight(1f)) else Spacer(Modifier.weight(1f))
+        for (row in tiles.chunked(2)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                VitalTile(row[0], Modifier.weight(1f))
+                if (row.size > 1) VitalTile(row[1], Modifier.weight(1f)) else Spacer(Modifier.weight(1f))
+            }
         }
     }
 }

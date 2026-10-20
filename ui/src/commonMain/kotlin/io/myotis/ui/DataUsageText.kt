@@ -26,6 +26,15 @@ object DataUsageText {
         }
     }
 
+    /**
+     * Whether a metered/unmetered split means something for this host: something was
+     * metered today, or the host reports metering at all. A host that never can (desktop:
+     * always UNKNOWN) would otherwise call every byte unmetered. [networkMetering] is the
+     * API's NetworkMetering name, null when unreported.
+     */
+    fun showsSplit(t: Today, networkMetering: String?): Boolean =
+        t.metered > 0 || networkMetering == "METERED" || networkMetering == "UNMETERED"
+
     /** One line for the node notification: `Data today 12.4 MB · 4.1 MB metered · 8.3 MB unmetered`. */
     fun notificationLine(t: Today): String =
         "Data today ${bytes(t.total)} · ${bytes(t.metered)} metered · ${bytes(t.unmetered)} unmetered"
