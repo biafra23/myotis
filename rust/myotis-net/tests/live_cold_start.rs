@@ -81,7 +81,7 @@ use std::time::Duration;
 
 use myotis_net::el::reader::{ElConfig, ElReader};
 use myotis_net::el::readstats::ReadStats;
-use myotis_net::sync::SYNCED_SLOT_SLACK_EPOCHS;
+use myotis_net::sync::light_client_current;
 use myotis_net::{ChainConfig, SyncHandle, SyncState, SyncStatus};
 
 /// The CL and EL configs of the network under test. Gnosis when unset: its
@@ -201,11 +201,11 @@ struct Sample {
     /// The wall-clock slot and sync-committee period when it was taken.
     wall_slot: u64,
     wall_period: u64,
-    /// The light client's half of the SYNCED gate (`sync_state_at` in
-    /// sync.rs): bootstrapped, its period current, and its finality within
-    /// [`SYNCED_SLOT_SLACK_EPOCHS`] of the wall clock. Before Gloas that is the
-    /// whole gate; on a Gloas chain SYNCED also needs the execution anchor's
-    /// finality within the same slack (`feed_exec_anchor`).
+    /// The light client's half of the SYNCED gate: bootstrapped, and
+    /// [`light_client_current`] (the gate's own predicate, from sync.rs) on the
+    /// published numbers. Before Gloas that is the whole gate; on a Gloas chain
+    /// SYNCED also needs the execution anchor's finality within the same slack
+    /// (`feed_exec_anchor`).
     cl_ready: bool,
     /// The execution anchor's finalized slot: the light client's own before
     /// Gloas; on a Gloas chain the newest finality whose execution header the
@@ -229,8 +229,13 @@ async fn run_to_synced(
         let wall_slot = run.chain.current_slot_estimate();
         let wall_period = wall_slot / run.chain.slots_per_period();
         let cl_ready = s.sync_start_period >= 0
-            && s.period == wall_period
-            && s.finalized_slot + SYNCED_SLOT_SLACK_EPOCHS * run.chain.slots_per_epoch >= wall_slot;
+            && light_client_current(
+                s.period,
+                s.finalized_slot,
+                wall_slot,
+                run.chain.slots_per_epoch,
+                run.chain.slots_per_period(),
+            );
         let exec_finalized_slot = run.el.finalized_slot();
         let el_peers = run.el.snap_peer_count().await;
         eprintln!(
