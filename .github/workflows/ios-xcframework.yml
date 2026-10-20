@@ -111,17 +111,13 @@ jobs:
           hosts must gate on `myotis_init()` returning exactly __ABI__.
           SECTION
           sed -i "s/__ABI__/$abi/g" "$section"
-          # Tolerate the create/append race with the sibling asset workflows,
-          # and keep the append idempotent for manual republish runs.
-          if ! gh release view "$tag" > /dev/null 2>&1; then
-            gh release create "$tag" --title "$tag" --prerelease \
-              --notes "Pre-release build of the Myotis wallet apps." || true
-          fi
-          existing=$(gh release view "$tag" --json body --jq .body)
-          if ! grep -q 'MyotisEngine.xcframework.zip' <<<"$existing"; then
-            printf '%s\n\n%s\n' "$existing" "$(cat "$section")" > notes.md
-            gh release edit "$tag" --notes-file notes.md
-          fi
+          # Create the release with the master notes (.github/release-notes.md)
+          # plus this section, unless another publisher already did; upload; then
+          # make sure the notes carry this section exactly once — appended when
+          # another publisher created the release, re-appended when a concurrent
+          # edit dropped it (.github/release-notes.sh explains the race).
+          bash .github/release-notes.sh create "$tag" "$section"
           gh release upload "$tag" --clobber \
             dist/MyotisEngine.xcframework.zip \
             dist/MyotisEngine.xcframework.zip.sha256
+          bash .github/release-notes.sh append "$tag" "$section"
