@@ -38,8 +38,8 @@ class TypedEngineTest {
         var send = """{"txHash":"0x${"ab".repeat(32)}"}"""
         var ens = """{"status":"noRecord","blockNumber":1,"verified":true}"""
         var receipt = "null"
-        var logConfigTaken = true
-        var logStatus = """{"enabled":true,"logCount":0,"entries":[]}"""
+        var logConfigTaken: Boolean? = true
+        var logStatus: String? = """{"enabled":true,"logCount":0,"entries":[]}"""
         var logs: String? = "[]"
 
         override fun newLock(): EngineLock = object : EngineLock {
@@ -123,15 +123,15 @@ class TypedEngineTest {
         }
         override fun setLogIndexConfig(handle: Long, configJson: String): Boolean {
             calls += "logConfig $configJson"
-            return logConfigTaken
+            return logConfigTaken ?: throw IllegalStateException("the engine is not running")
         }
         override fun logIndexStatusJson(handle: Long): String {
             calls += "logStatus"
-            return logStatus
+            return logStatus ?: throw IllegalStateException("the engine is not running")
         }
-        override fun getLogsJson(handle: Long, filterJson: String): String {
+        override fun getLogsJson(handle: Long, filterJson: String): String? {
             calls += "logs $filterJson"
-            return logs ?: throw IllegalStateException("the engine is not running")
+            return logs
         }
     }
 
@@ -368,19 +368,33 @@ class TypedEngineTest {
         assertTrue(handle.setLogIndexConfig(config))
         native.logConfigTaken = false
         assertFalse(handle.setLogIndexConfig(config), "a config the engine refuses")
+        native.logConfigTaken = null
+        assertFalse(handle.setLogIndexConfig(config), "a call that failed")
         assertEquals(native.logStatus, handle.logIndexStatusJson())
         val filter = """{"address":"0x${"11".repeat(20)}","fromBlock":"0x5","toBlock":"0x9"}"""
         native.logs = """[{"blockNumber":"0x6"}]"""
         assertEquals(native.logs, handle.reads().getLogs(filter))
-        // An uncovered range is the engine's error object, passed on, never an empty array.
+        // An uncovered range is the engine's error object, passed on, never an empty array;
+        // so is a permanent refusal, its code with it.
         native.logs = """{"error":"range not covered"}"""
         assertEquals(native.logs, handle.reads().getLogs(filter))
+        native.logs = """{"error":"invalid filter","code":-32602}"""
+        assertEquals(native.logs, handle.reads().getLogs(filter))
         native.logs = null
-        assertNull(handle.reads().getLogs(filter), "a failed call is no answer")
+        assertNull(handle.reads().getLogs(filter), "an engine that answered nothing")
         assertEquals(
-            listOf("logConfig $config", "logConfig $config", "logStatus") + List(3) { "logs $filter" },
+            listOf("logConfig $config", "logConfig $config", "logConfig $config", "logStatus") +
+                List(4) { "logs $filter" },
             native.calls,
         )
+    }
+
+    @Test
+    fun aFailedStatusProbeIsAnErrorObjectNotAThrow() {
+        val handle = sepolia()
+        native.logStatus = null
+        val status = Json.parseToJsonElement(handle.logIndexStatusJson()).jsonObject
+        assertEquals("the engine is not running", status["error"]?.jsonPrimitive?.content)
     }
 
     @Test

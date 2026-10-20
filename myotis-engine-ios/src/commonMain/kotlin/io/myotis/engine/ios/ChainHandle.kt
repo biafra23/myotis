@@ -1,5 +1,7 @@
 package io.myotis.engine.ios
 
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import kotlin.concurrent.atomics.AtomicReference
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.time.TimeSource
@@ -140,10 +142,15 @@ class ChainHandle internal constructor(
 
     /**
      * The log index's status JSON (enabled flag, log count, backfill cursor, per-entry covered
-     * spans), or the engine's `{"error":…}` object. A status probe, answered at once whatever
-     * the handle's state, as on the JVM.
+     * spans), or an `{"error":…}` object: the engine's, or one naming a call that failed. A
+     * status probe, answered at once whatever the handle's state, as on the JVM.
      */
-    fun logIndexStatusJson(): String = native.logIndexStatusJson(handle)
+    fun logIndexStatusJson(): String =
+        try {
+            native.logIndexStatusJson(handle)
+        } catch (e: Exception) {
+            buildJsonObject { put("error", e.message ?: e::class.simpleName ?: "the status call failed") }.toString()
+        }
 
     /** The verified `eth_*` reads. */
     fun reads(): VerifiedReads = verifiedReads
@@ -199,5 +206,5 @@ class ChainHandle internal constructor(
 
     internal fun ensRecord(paramsJson: String): String = native.ensRecordJson(handle, paramsJson)
 
-    internal fun logs(filterJson: String): String = native.getLogsJson(handle, filterJson)
+    internal fun logs(filterJson: String): String? = native.getLogsJson(handle, filterJson)
 }

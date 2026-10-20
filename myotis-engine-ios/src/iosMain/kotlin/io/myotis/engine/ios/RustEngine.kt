@@ -172,16 +172,20 @@ object RustEngine {
         return myotis_set_log_index_config(handle, configJson)
     }
 
-    /** Log-index status JSON (enabled, counts, per-entry coverage). */
+    /** Log-index status JSON (enabled, counts, per-entry coverage); the JVM contract's
+     *  stable "no index" object when the engine answers nothing. */
     fun logIndexStatusJson(handle: Long): String {
         requireAbi()
-        return take(myotis_log_index_status_json(handle)) ?: """{"enabled":false}"""
+        return take(myotis_log_index_status_json(handle)) ?: """{"enabled":false,"logCount":0,"entries":[]}"""
     }
 
     /** eth_getLogs over the watch-list index: the log array, or an `{"error":...}`
-     *  object carrying the coverage or config detail. */
-    fun getLogsJson(handle: Long, filterJson: String): String =
-        jsonCall { myotis_get_logs_json(handle, filterJson) }
+     *  object carrying the coverage or config detail; null when the engine answers
+     *  nothing (an unknown handle). */
+    fun getLogsJson(handle: Long, filterJson: String): String? {
+        requireAbi()
+        return take(myotis_get_logs_json(handle, filterJson))
+    }
 
     /** Read-fetch shadow-cache counters JSON (docs/read-stats.md). */
     fun readStatsJson(handle: Long): String {
@@ -207,6 +211,7 @@ object RustEngine {
         return myotis_network_metering()
     }
 
+    /** Status JSON object; `"{}"` for an unknown handle. */
     fun statusJson(handle: Long): String {
         requireAbi()
         return take(myotis_status_json(handle)) ?: "{}"
