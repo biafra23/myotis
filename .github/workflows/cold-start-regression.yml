@@ -45,8 +45,8 @@
 # that misses SYNCED says which half stalled. The old-anchor step runs even
 # when the dead-pins step failed (the job still fails): the two are
 # independent, and a release check that stops at the first red step leaves the
-# owner deciding without the deep walk's answer. Only a failed pin check stops
-# the job early.
+# owner deciding without the deep walk's answer. Only a failed build or pin
+# check stops the job early.
 #
 # The `census` scope runs none of the three. It runs
 # rust/myotis-net/examples/period_census.rs instead: the whole discv5 DHT asked

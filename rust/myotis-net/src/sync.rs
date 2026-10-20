@@ -638,8 +638,10 @@ impl ChainConfig {
         delay_to_next_poll(now_unix_ms(), since_poll_ms, self.genesis_time, self.seconds_per_slot, offset_ms)
     }
 
-    /// Wall-clock slot estimate (the clock read is [`now_unix_ms`]).
-    fn current_slot_estimate(&self) -> u64 {
+    /// Wall-clock slot estimate (the clock read is [`now_unix_ms`]) — the
+    /// slot the SYNCED gate judges finality against. Public for the live
+    /// cold-start test, which reports that gate's light-client half.
+    pub fn current_slot_estimate(&self) -> u64 {
         let now = now_unix_ms() / 1000;
         now.saturating_sub(self.genesis_time) / self.seconds_per_slot.max(1)
     }
@@ -4077,9 +4079,11 @@ fn update_exec_anchor(store: &LightClientStore, anchor: &ExecAnchor) {
 
 /// SYNCED gate: committee period current AND the finalized header within ~5
 /// epochs of wall clock (finality itself trails the head by ~2 epochs).
-/// Crate-visible because the EL log index sizes a bound from it
-/// (`RESTART_CLAIM_MAX_LEAD` in el/reader.rs, pinned by a test there).
-pub(crate) const SYNCED_SLOT_SLACK_EPOCHS: u64 = 5;
+/// Public because the EL log index sizes a bound from it
+/// (`RESTART_CLAIM_MAX_LEAD` in el/reader.rs, pinned by a test there) and the
+/// live cold-start test tells the light client's half of the gate from the
+/// execution anchor's with it.
+pub const SYNCED_SLOT_SLACK_EPOCHS: u64 = 5;
 
 /// The published state of `store` at `wall_slot` — the SYNCED gate above.
 /// Pure, so the status and the execution anchor's currency flag (which the EL

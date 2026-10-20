@@ -67,12 +67,13 @@
 //! CATCHING_UP for its whole budget at v0.1.15 and v0.1.18), the deep walk
 //! queued behind it never ran there, and mainnet and Gnosis would have
 //! followed at their forks. So the pass condition stays SYNCED, the state a
-//! host shows, and the tests start the EL half the way a host does. Before Gloas the EL reader plays no part in
-//! SYNCED, so there the check is the CL-only one it always was. A run that
-//! misses SYNCED says which half stalled ([`diagnose`]), and each progress line
-//! prints both: the light client's `finalized_slot` and the execution anchor's
-//! `exec_finalized_slot`, which trails it on a Gloas chain until the EL pool
-//! resolves the header.
+//! host shows, and the tests start the EL half the way a host does. Before
+//! Gloas the EL reader plays no part in SYNCED, so there the check is the
+//! CL-only one it always was. Each progress line prints both halves —
+//! `cl_ready` (the light client's half of the gate) and the execution anchor's
+//! `exec_finalized_slot`, which trails the light client's `finalized_slot` on a
+//! Gloas chain until the EL pool resolves the header — and a run that misses
+//! SYNCED says which half stalled ([`diagnose`]).
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::Ordering;
@@ -81,6 +82,7 @@ use std::time::Duration;
 
 use myotis_net::el::reader::{ElConfig, ElReader};
 use myotis_net::el::readstats::ReadStats;
+use myotis_net::sync::SYNCED_SLOT_SLACK_EPOCHS;
 use myotis_net::{ChainConfig, SyncHandle, SyncState, SyncStatus};
 
 /// The CL and EL configs of the network under test. Gnosis when unset: its
@@ -176,9 +178,15 @@ impl ColdStart {
     async fn start(cl: ChainConfig, el: ElConfig) -> ColdStart {
         let chain = cl.clone();
         let sync = SyncHandle::start(cl).expect("sync start");
-        let el = ElReader::start_for(sync.exec_anchor(), None, el, Arc::new(ReadStats::new()))
+        let el = match ElReader::start_for(sync.exec_anchor(), None, el, Arc::new(ReadStats::new()))
             .await
-            .expect("EL reader start");
+        {
+            Ok(el) => el,
+            Err(e) => {
+                sync.stop().await;
+                panic!("EL reader start: {e}");
+            }
+        };
         ColdStart { sync, el, chain }
     }
 
@@ -191,8 +199,15 @@ impl ColdStart {
 /// One progress sample of both halves.
 struct Sample {
     status: SyncStatus,
-    /// The wall-clock sync-committee period when it was taken.
+    /// The wall-clock slot and sync-committee period when it was taken.
+    wall_slot: u64,
     wall_period: u64,
+    /// The light client's half of the SYNCED gate (`sync_state_at` in
+    /// sync.rs): bootstrapped, its period current, and its finality within
+    /// [`SYNCED_SLOT_SLACK_EPOCHS`] of the wall clock. Before Gloas that is the
+    /// whole gate; on a Gloas chain SYNCED also needs the execution anchor's
+    /// finality within the same slack (`feed_exec_anchor`).
+    cl_ready: bool,
     /// The execution anchor's finalized slot: the light client's own before
     /// Gloas; on a Gloas chain the newest finality whose execution header the
     /// EL pool has resolved (0 until the first).
@@ -202,17 +217,25 @@ struct Sample {
 
 /// Drive the cold start to SYNCED or the deadline: the SYNCED status, or the
 /// last sample before the deadline for [`diagnose`].
-async fn run_to_synced(run: &ColdStart, label: &str, budget: Duration) -> Result<SyncStatus, Sample> {
+async fn run_to_synced(
+    run: &ColdStart,
+    label: &str,
+    budget: Duration,
+) -> Result<SyncStatus, Sample> {
     let deadline = tokio::time::Instant::now() + budget;
     let mut last = None;
     while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_secs(5)).await;
         let s = run.sync.status();
-        let wall_period = run.chain.wall_clock_period();
+        let wall_slot = run.chain.current_slot_estimate();
+        let wall_period = wall_slot / run.chain.slots_per_period();
+        let cl_ready = s.sync_start_period >= 0
+            && s.period == wall_period
+            && s.finalized_slot + SYNCED_SLOT_SLACK_EPOCHS * run.chain.slots_per_epoch >= wall_slot;
         let exec_finalized_slot = run.el.finalized_slot();
         let el_peers = run.el.snap_peer_count().await;
         eprintln!(
-            "[{label}] state={} period={} start_period={} finalized_slot={} \
+            "[{label}] state={} period={} start_period={} finalized_slot={} cl_ready={cl_ready} \
              exec_finalized_slot={exec_finalized_slot} peers={} served/min={} el_peers={el_peers}",
             s.state, s.period, s.sync_start_period, s.finalized_slot, s.peer_count,
             s.served_peers_last_min
@@ -220,7 +243,14 @@ async fn run_to_synced(run: &ColdStart, label: &str, budget: Duration) -> Result
         if s.state == SyncState::Synced {
             return Ok(s);
         }
-        last = Some(Sample { status: s, wall_period, exec_finalized_slot, el_peers });
+        last = Some(Sample {
+            status: s,
+            wall_slot,
+            wall_period,
+            cl_ready,
+            exec_finalized_slot,
+            el_peers,
+        });
     }
     Err(last.expect("a budget of at least one 5 s sample"))
 }
@@ -229,27 +259,38 @@ async fn run_to_synced(run: &ColdStart, label: &str, budget: Duration) -> Result
 /// [`Sample`], with the numbers that say so. A hint for the failure message,
 /// not a verdict the test passes on: the pass condition is SYNCED alone.
 ///
-/// The EL half is named only when the light client's period is current AND
-/// its finality is ahead of the execution anchor's. Before Gloas the two
-/// finalities are the same number by construction (`update_exec_anchor` feeds
-/// the anchor straight from the light-client header), so a pre-Gloas run is
-/// never put down to the EL.
+/// The EL half is named only when the light client's half of the gate held
+/// ([`Sample::cl_ready`]), which leaves the execution anchor's finality as
+/// the part that failed. Before Gloas that cannot happen: the anchor's
+/// finality is the light client's by construction (`update_exec_anchor` feeds
+/// it straight from the light-client header), so a pre-Gloas run is never put
+/// down to the EL.
 fn diagnose(last: &Sample) -> String {
-    let (s, wall_period) = (&last.status, last.wall_period);
-    let stalled = if s.sync_start_period < 0 {
+    let s = &last.status;
+    let stalled = if s.state == SyncState::StaleAnchor {
+        "it parked in STALE_ANCHOR: the trust anchor is older than the network's \
+         weak-subjectivity bound and nothing consented, so refresh the checkpoint"
+    } else if s.sync_start_period < 0 {
         "it never bootstrapped"
-    } else if s.period == wall_period && last.exec_finalized_slot < s.finalized_slot {
+    } else if last.cl_ready {
         "the CL half caught up (the light client's period is current and its finality \
-         is ahead of the execution anchor's) but the EL half did not: on a Gloas chain \
-         SYNCED also waits until the EL pool fetches the finalized execution header by \
-         its hash (`feed_exec_anchor` in sync.rs), and no EL peer served it in time"
+         within the SYNCED slack of the wall clock) but the EL half did not: on a Gloas \
+         chain SYNCED also waits until the EL pool fetches the finalized execution header \
+         by its hash (`feed_exec_anchor` in sync.rs), and no EL peer served one in time"
     } else {
         "the light client's own catch-up stalled"
     };
     format!(
-        "{stalled}. Last sample: state={} period={} (wall {wall_period}) finalized_slot={} \
+        "{stalled}. Last sample: state={} period={} (wall {}) finalized_slot={} (wall slot {}) \
          exec_finalized_slot={} CL peers={} EL peers={}",
-        s.state, s.period, s.finalized_slot, last.exec_finalized_slot, s.peer_count, last.el_peers
+        s.state,
+        s.period,
+        last.wall_period,
+        s.finalized_slot,
+        last.wall_slot,
+        last.exec_finalized_slot,
+        s.peer_count,
+        last.el_peers
     )
 }
 
@@ -275,7 +316,7 @@ const BLACKHOLE_PREFIX: &str = "203.0.113.";
 /// The `i`-th pin's black hole in [`BLACKHOLE_PREFIX`]'s range — a distinct
 /// address each, so none can collide with a live host.
 fn blackhole(i: usize) -> Ipv4Addr {
-    Ipv4Addr::new(203, 0, 113, (i % 254 + 1) as u8)
+    format!("{BLACKHOLE_PREFIX}{}", i % 254 + 1).parse().expect("a TEST-NET-3 address")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -321,6 +362,10 @@ async fn cold_start_with_every_pinned_peer_unreachable_syncs_through_discovery()
         .enumerate()
         .map(|(i, &(_, pubkey))| (SocketAddr::from((blackhole(i), 30303)), pubkey))
         .collect();
+    assert!(
+        el_config.boot_enodes.iter().all(|(a, _)| a.ip().to_string().starts_with(BLACKHOLE_PREFIX)),
+        "every EL pin must be blackholed, or this measures a live server"
+    );
     assert!(!el_config.bootnodes.is_empty(), "EL discovery needs its bootnodes");
 
     let run = ColdStart::start(config, el_config).await;
