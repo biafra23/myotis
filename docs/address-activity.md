@@ -17,7 +17,7 @@ On `ChainHandle` (`io.myotis.api`), in the style of the log index config:
 - `setActivityWatch(json)`, with `{"watch":["0x…"]?,"unwatch":["0x…"]?}`. It drops
   `unwatch`, then adds `watch`. It is additive: an address left out of `watch`
   stays watched. `false` means refused, nothing changed: malformed JSON, an entry
-  that is not a 20-byte hex address, an address under both keys, more than 1024
+  that is not a 20-byte hex address, an address under both keys, more than 256
   addresses, or a chain that is not running (a paused one included; the host
   pushes again).
 - `addressActivityJson(afterBlock)` covers the blocks `(afterBlock, head]`. It is
@@ -43,15 +43,21 @@ C: `myotis_set_activity_watch` and `myotis_address_activity_json`. iOS:
 ## What a report promises
 
 **Every block of `[from, to]` is either covered or in a gap, per kind.** A
-watched address that is not in `touched` for a covered block was not touched
-there. A block the engine did not check is a gap, never a silence: before the
-follower started, below its window, paused, or not fetched yet.
+block the engine did not check is a gap, never a silence: before the follower
+started, below its window, paused, or not fetched yet. So is a kept block that
+nothing proves leads to the current head. Between a reorg and the follower's
+next tick, the kept run may be on the fork the head left. A kept block counts
+as covered only when it is the head, or the anchor's ring of recent beacon
+heads links it to the head.
 
 - **`log`** is the header's `logsBloom`. Each address is probed twice: as a log's
   emitter, and as an indexed topic, i.e. the address left-padded to 32 bytes, as
-  a `Transfer` carries its `from` and `to`. A miss is definitive. A hit means the
-  block *may* have touched the address: a bloom gives false positives, and a hit
-  costs the host one extra proof.
+  a `Transfer` carries its `from` and `to`. A miss is definitive for exactly
+  that: no log of the block names the address as emitter or indexed topic. It
+  says nothing of a change no such log names: a rebasing token (stETH) moves
+  balances with no log naming the holder, and some contracts put an address
+  only in a log's data. A hit means the block *may* have such a log: a bloom
+  gives false positives, and a hit costs the host one extra proof.
 - **`account`** is the account itself: its balance, nonce and code. Seeing that
   needs the block access list (EIP-7928), which this part does not fetch, so every
   block is an account gap for now. That includes plain ETH transfers and ETH a
@@ -96,8 +102,12 @@ holds its addresses.
 ## What it costs
 
 A tick with no new head reads a lock. A new head usually costs one header-window
-request of two headers, plus two bloom probes per watched address. Answering a
-poll costs no I/O.
+request of two headers. Answering a poll costs no I/O. It does cost two bloom
+probes per watched address and kept block, each probe with its bits computed
+once, at the push. The answer lists every bloom hit. On mainnet, whose blooms run
+full, that is a fair share of all pairs, which is why the list is capped at 256
+addresses and why a host should ask from the oldest block it needs, not further
+back.
 
 Measured on Sepolia on 2026-10-21, watching WETH, USDC, `0x…dEaD` and
 `0x1111…1111` (`myotis-engine` built in release, 6 minutes):

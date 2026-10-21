@@ -1090,8 +1090,8 @@ pub fn activity_json(r: &myotis_net::el::activity::ActivityReport) -> String {
 mod tests {
     use super::*;
 
-    /// The activity answer's shape, byte for byte: the JVM and iOS parsers'
-    /// golden tests use this same string.
+    /// The activity answer's shape, byte for byte. The JVM and iOS hosts pass
+    /// the JSON through unparsed; the parser this pins is the consumer's.
     #[test]
     fn activity_json_shape_is_pinned() {
         use myotis_net::el::activity::{ActivityReport, Touch, Via};

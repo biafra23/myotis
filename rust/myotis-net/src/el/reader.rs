@@ -8021,10 +8021,35 @@ impl ElReader {
 
     /// The watched addresses' activity in `(after, head]`, from what the
     /// follower has kept: no I/O. `None` before the beacon anchors a head.
-    pub fn activity_report(&self, after: u64) -> Option<crate::el::activity::ActivityReport> {
-        let (head, _) = self.anchored_head().ok()?;
-        let state = self.activity.lock().ok()?;
-        Some(state.report(after, head))
+    ///
+    /// A kept block counts as covered only when it is known to lead to the
+    /// anchored head: it is that head, or the anchor's ring of recent heads
+    /// links it to it. Between a reorg and the follower's next tick the kept
+    /// run can be on the fork the head left, and its blocks are then a gap.
+    ///
+    /// Also keeps the follower running while the list is non-empty: a tick
+    /// that saw the list empty can exit just as a push refills it, and the
+    /// host's polls are what bring it back.
+    pub fn activity_report(self: &Arc<Self>, after: u64) -> Option<crate::el::activity::ActivityReport> {
+        let (head, head_hash) = self.anchored_head().ok()?;
+        let is_ancestor = |number: u64, hash: &[u8; 32]| {
+            (number == head && *hash == head_hash)
+                || (number < head
+                    && self.anchor.recent_head_at(number).is_some_and(|r| r.linked && r.hash == *hash))
+        };
+        let (report, active) = {
+            let state = self.activity.lock().ok()?;
+            (state.report(after, head, is_ancestor), state.is_active())
+        };
+        if active {
+            self.ensure_activity_follower();
+        }
+        Some(report)
+    }
+
+    /// The activity watch list as it stands, ascending.
+    pub fn activity_watching(&self) -> Vec<[u8; 20]> {
+        self.activity.lock().map(|s| s.watching()).unwrap_or_default()
     }
 
     /// Spawn (or keep) the activity follower. Idempotent; a no-op outside a
@@ -8069,7 +8094,10 @@ impl ElReader {
     /// top), or nothing is kept, or the head jumped past [`activity::WINDOW`],
     /// one full window is fetched and installed; whatever it cannot link to
     /// is dropped, and the report shows it as a gap. A failed fetch keeps
-    /// what is kept: the blocks above it are a gap until a later tick.
+    /// what is kept: the blocks above it are a gap until a later tick. (A
+    /// tip-lag failure's deferred strikes are forgiven, never banked: the
+    /// next tick asks again against a newer anchor, which is the retry they
+    /// are deferred for.)
     async fn activity_follow_tick(&self) -> bool {
         use crate::el::activity::{BlockRecord, WINDOW};
         let Ok(top) = self.activity.lock().map(|s| s.is_active().then(|| s.top())) else {
@@ -8133,9 +8161,6 @@ impl ElReader {
     }
 
     /// Abort and await the activity follower (teardown; see [`Self::stop`]).
-    /// (A tip-lag failure's deferred strikes are forgiven, never banked: the
-    /// next tick asks again against a newer anchor, which is the retry they
-    /// are deferred for.)
     async fn stop_activity_follower(&self) {
         let handle = match self.activity_task.lock() {
             Ok(mut t) => t.take(),

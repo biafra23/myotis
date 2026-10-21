@@ -248,8 +248,8 @@ public interface ChainHandle {
      * verified heads for activity only while the list is non-empty, and keeps
      * it across a pause and resume of this chain, not across a restart.
      * {@code false} = refused, nothing changed: malformed JSON, an entry that
-     * is not a 20-byte hex address, an address under both keys, more than 1024
-     * addresses, or a chain that is not running.
+     * is not a 20-byte hex address, an address under both keys, more than 256
+     * addresses, or a chain that is not running (paused included: push again).
      * Default false: no activity follower on this engine.
      */
     default boolean setActivityWatch(String configJson) {
@@ -262,12 +262,14 @@ public interface ChainHandle {
      * {@code {"from","to","base":{"block","hash"|null},"gaps":{"account":[[a,b]…],
      * "log":[[a,b]…]},"touched":[{"address","block","blockHash","via":["log"]}…],
      * "watching":["0x…"…]}}. Every block of {@code [from, to]} (to = the
-     * verified head) is covered or listed in {@code gaps}, per kind, so a
-     * watched address absent from {@code touched} for a covered block was not
-     * touched; a block the follower did not check is a gap, never a silence.
-     * {@code "log"} is the header's logs bloom (a hit may be a false
-     * positive); {@code "account"} needs block access lists and is a gap on
-     * every block for now. Above finality a block can come back with a new
+     * verified head) is covered or listed in {@code gaps}, per kind; a block
+     * the follower did not check is a gap, never a silence. {@code "log"} is
+     * the header's logs bloom: a watched address absent from {@code touched}
+     * for a log-covered block is named by no log of it, as emitter or indexed
+     * topic (a hit may be a false positive), which says nothing of a change no
+     * such log names, such as a rebasing token's. {@code "account"} — the
+     * account's own balance, nonce and code — needs block access lists and is
+     * a gap on every block for now. Above finality a block can come back with a new
      * {@code blockHash}. {@code {"error":…}} when the chain is not running.
      * Default {@code null}: no activity follower on this engine.
      */

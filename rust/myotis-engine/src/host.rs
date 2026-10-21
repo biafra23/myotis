@@ -816,16 +816,14 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
         }
         // And the activity watch list: the resumed reader starts empty, and
         // its report shows the paused blocks as a gap, never as a silence.
-        let watched: Vec<[u8; 20]> = engine
-            .activity_watch
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&handle).map(|w| w.iter().copied().collect()))
-            .unwrap_or_default();
-        if !watched.is_empty() {
-            let _guard = engine.rt.enter();
-            if let Err(e) = reader.set_activity_watch(&watched, &[]) {
-                tracing::warn!(error = %e, "activity: re-applying the watch list failed");
+        // Under the stash lock, which a push holds from lookup to stash write.
+        if let Ok(stash) = engine.activity_watch.lock() {
+            let watched: Vec<[u8; 20]> = stash.get(&handle).map(|w| w.iter().copied().collect()).unwrap_or_default();
+            if !watched.is_empty() {
+                let _guard = engine.rt.enter();
+                if let Err(e) = reader.set_activity_watch(&watched, &[]) {
+                    tracing::warn!(error = %e, "activity: re-applying the watch list failed");
+                }
             }
         }
     }
@@ -5159,6 +5157,13 @@ pub fn set_activity_watch_json(handle: i64, config_json: &str) -> bool {
     let Some(engine) = engine() else {
         return false;
     };
+    // Held from the reader lookup to the stash write, so pushes are applied
+    // and stashed in one order, and a resume — whose re-apply takes this lock
+    // too — sees either none of a push or all of it: a push that reached a
+    // reader a pause then dropped is still in the stash its resume re-applies.
+    let Ok(mut stash) = engine.activity_watch.lock() else {
+        return false;
+    };
     let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
         return false;
     };
@@ -5168,20 +5173,16 @@ pub fn set_activity_watch_json(handle: i64, config_json: &str) -> bool {
         tracing::warn!(error = %e, "activity watch refused");
         return false;
     }
-    // Stashed for resume under the handles lock, and only while the handle is
-    // still Running, like the log index's runtime bits.
-    if let Ok(map) = engine.handles.lock() {
-        if matches!(map.get(&handle), Some(ChainEntry::Running(..))) {
-            if let Ok(mut stash) = engine.activity_watch.lock() {
-                let list = stash.entry(handle).or_default();
-                for a in &unwatch {
-                    list.remove(a);
-                }
-                list.extend(watch.iter().copied());
-                if list.is_empty() {
-                    stash.remove(&handle);
-                }
-            }
+    // The reader's resulting list, not this push's delta: the two cannot drift.
+    // Kept while the handle exists, paused included; a stopped one is gone,
+    // and `stop` dropped its entry already.
+    let still_there = engine.handles.lock().is_ok_and(|map| map.contains_key(&handle));
+    if still_there {
+        let list = reader.activity_watching();
+        if list.is_empty() {
+            stash.remove(&handle);
+        } else {
+            stash.insert(handle, list.into_iter().collect());
         }
     }
     true
@@ -5230,8 +5231,10 @@ pub fn address_activity_json(handle: i64, after_block: i64) -> String {
         Ok(snap) => snap,
         Err(msg) => return eljson::error_json(msg),
     };
-    // A negative cursor asks for everything kept: block 0 onward.
+    // A negative cursor reads as 0: everything kept, from block 1 on.
     let after = u64::try_from(after_block).unwrap_or(0);
+    // A poll may restart the follower (see `ElReader::activity_report`).
+    let _guard = engine.rt.enter();
     match reader.activity_report(after) {
         Some(report) => eljson::activity_json(&report),
         None => eljson::error_json("no beacon-anchored head yet"),

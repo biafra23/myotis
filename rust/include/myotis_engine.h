@@ -393,17 +393,20 @@ char *myotis_log_index_status_json(int64_t handle);
  * address left out of `watch` stays watched). The engine follows verified
  * heads for activity only while the list is non-empty. false = refused,
  * nothing changed: malformed JSON, an entry that is not a 20-byte hex address,
- * an address under both keys, more than 1024 addresses, or a handle that is
- * not running.
+ * an address under both keys, more than 256 addresses, or a handle that is
+ * not running (paused included).
  *
  * address_activity_json answers, with no I/O, which watched addresses the
  * verified blocks (after_block, head] touched:
  * {"from","to","base":{"block","hash"|null},"gaps":{"account":[[a,b]..],
  * "log":[[a,b]..]},"touched":[{"address","block","blockHash","via":["log"]}..],
  * "watching":["0x..",..]}. Every block of [from, to] is covered or in a gap,
- * per kind: a watched address absent from `touched` for a covered block was not
- * touched. "log" is the header's logs bloom (a hit may be a false positive);
- * "account" needs block access lists and is a gap on every block for now. The
+ * per kind. "log" is the header's logs bloom: an address absent from `touched`
+ * for a log-covered block is named by no log of it as emitter or indexed topic
+ * (a hit may be a false positive), which says nothing of a change no such log
+ * names. "account" needs block access lists and is a gap on every block for
+ * now. A kept block not known to lead to the current head (a reorg the
+ * follower has not caught up with) is a gap too. The
  * follower keeps the last 256 blocks; anything older, paused or not yet
  * fetched is a gap. {"error":..} when the handle is not running. */
 bool myotis_set_activity_watch(int64_t handle, const char *config_json);

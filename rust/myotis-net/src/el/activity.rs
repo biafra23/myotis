@@ -12,7 +12,10 @@
 //! - **`log`**: the header's `logsBloom`, probed for each watched address both
 //!   as a log's emitter (20 bytes) and as an indexed topic (the address
 //!   left-padded to 32 bytes, as `Transfer(from, to, …)` carries it). A miss is
-//!   definitive; a hit only says the block MAY have touched the address.
+//!   definitive for exactly that: no log of the block names the address as its
+//!   emitter or in an indexed topic. It says nothing of a change no such log
+//!   names (a rebasing token's balance, an address only in a log's data). A
+//!   hit only says the block MAY have such a log.
 //! - **`account`**: the account itself (balance, nonce, code), which needs the
 //!   block access list (EIP-7928). Not followed yet: every block is an account
 //!   gap.
@@ -20,21 +23,25 @@
 //! Coverage honesty is the contract: every block of a report's range is either
 //! covered or listed in its gaps, per kind. A block the follower did not see —
 //! before it started, past its window, skipped by a head jump or a failed
-//! fetch — is a gap, never a silence.
+//! fetch — is a gap, never a silence. So is a kept block nothing proves to be
+//! an ancestor of the CURRENT head: between a reorg and the tick that follows
+//! it, the kept run may be on the losing fork.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use myotis_core::bloom::{may_contain, LogsBloom};
+use myotis_core::bloom::{BloomProbe, LogsBloom};
 
 /// Blocks of activity kept below the anchored head: ~51 min on Sepolia and
 /// mainnet (12 s slots), ~21 min on Gnosis (5 s). A host back within that
 /// learns what it missed without re-proving; further back is a gap.
 pub const WINDOW: u64 = 256;
 
-/// Upper bound on the watch list. Every watched address costs two bloom probes
-/// per block, and the report lists every bloom hit, so an unbounded list
-/// would make a no-I/O poll arbitrarily large. A push past it is refused.
-pub const MAX_WATCHED: usize = 1024;
+/// Upper bound on the watch list: far more than a wallet's accounts. Every
+/// watched address costs two bloom probes per kept block at each poll, and
+/// the report lists every bloom hit — on mainnet, whose blooms run full, a
+/// fair share of all of them — so an unbounded list would make a no-I/O poll
+/// arbitrarily large. A push past it is refused.
+pub const MAX_WATCHED: usize = 256;
 
 /// One verified block, as the follower keeps it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,7 +100,8 @@ pub struct ActivityReport {
 /// The watch list and the follower's run of verified blocks.
 #[derive(Debug, Default)]
 pub struct ActivityState {
-    watched: BTreeSet<[u8; 20]>,
+    /// Each watched address with its two bloom probes (as emitter, as topic).
+    watched: BTreeMap<[u8; 20], [BloomProbe; 2]>,
     /// Contiguous by number and parent-linked: `records[n].parent_hash ==
     /// records[n - 1].hash` for every kept pair.
     records: BTreeMap<u64, BlockRecord>,
@@ -112,7 +120,9 @@ impl ActivityState {
         for a in unwatch {
             next.remove(a);
         }
-        next.extend(watch.iter().copied());
+        for a in watch {
+            next.entry(*a).or_insert_with(|| probes(a));
+        }
         if next.len() > MAX_WATCHED {
             return Err(format!("watch list would hold {} addresses, more than {MAX_WATCHED}", next.len()));
         }
@@ -128,6 +138,11 @@ impl ActivityState {
     /// Whether the follower should run.
     pub fn is_active(&self) -> bool {
         !self.watched.is_empty()
+    }
+
+    /// The watch list, ascending.
+    pub fn watching(&self) -> Vec<[u8; 20]> {
+        self.watched.keys().copied().collect()
     }
 
     /// The highest kept block, `(number, hash)`.
@@ -175,11 +190,24 @@ impl ActivityState {
     }
 
     /// The activity of the watched addresses in `(after, head]`. No I/O.
-    pub fn report(&self, after: u64, head: u64) -> ActivityReport {
+    ///
+    /// `is_ancestor(number, hash)` says whether a block is known to be the
+    /// head or one of its ancestors. A kept block counts as covered only up
+    /// to the highest one it vouches for: the run is parent-linked, so every
+    /// kept block below that one is an ancestor too, and every one above it
+    /// may be on a fork the head has left, which is a gap until the follower
+    /// re-links the run.
+    pub fn report(&self, after: u64, head: u64, is_ancestor: impl Fn(u64, &[u8; 32]) -> bool) -> ActivityReport {
         let from = after.saturating_add(1);
         let to = head;
-        let base = (after, self.records.get(&after).map(|r| r.hash));
-        let watching: Vec<[u8; 20]> = self.watched.iter().copied().collect();
+        let vouched_top = self
+            .records
+            .range(..=head)
+            .rev()
+            .find(|(_, r)| is_ancestor(r.number, &r.hash))
+            .map(|(n, _)| *n);
+        let base = (after, self.records.get(&after).filter(|_| vouched_top.is_some_and(|t| after <= t)).map(|r| r.hash));
+        let watching = self.watching();
         if from > to {
             return ActivityReport {
                 from,
@@ -191,8 +219,12 @@ impl ActivityState {
                 watching,
             };
         }
-        // Kept blocks above the head (it moved back) are not in the range.
-        let kept: Vec<&BlockRecord> = self.records.range(from..=to).map(|(_, r)| r).collect();
+        // Kept blocks above the head (it moved back), or above the highest one
+        // known to lead to it, are not covered.
+        let kept: Vec<&BlockRecord> = match vouched_top {
+            Some(top) if top >= from => self.records.range(from..=top).map(|(_, r)| r).collect(),
+            _ => Vec::new(),
+        };
         let log_gaps = match (kept.first(), kept.last()) {
             (Some(lo), Some(hi)) => {
                 let mut gaps = Vec::new();
@@ -208,8 +240,8 @@ impl ActivityState {
         };
         let mut touched = Vec::new();
         for r in &kept {
-            for address in &self.watched {
-                if bloom_may_touch(&r.bloom, address) {
+            for (address, [emitter, topic]) in &self.watched {
+                if emitter.may_match(&r.bloom) || topic.may_match(&r.bloom) {
                     touched.push(Touch { address: *address, block: r.number, block_hash: r.hash, via: Via::Log });
                 }
             }
@@ -226,12 +258,19 @@ impl ActivityState {
     }
 }
 
+/// The bloom probes of `address`: as a log's emitter, and as an indexed topic
+/// (left-padded to 32 bytes).
+fn probes(address: &[u8; 20]) -> [BloomProbe; 2] {
+    let mut topic = [0u8; 32];
+    topic[12..].copy_from_slice(address);
+    [BloomProbe::of(address), BloomProbe::of(&topic)]
+}
+
 /// Could a log in a block with this bloom name `address`, as its emitter or as
 /// an indexed topic? `false` is definitive.
 pub fn bloom_may_touch(bloom: &LogsBloom, address: &[u8; 20]) -> bool {
-    let mut topic = [0u8; 32];
-    topic[12..].copy_from_slice(address);
-    may_contain(bloom, address) || may_contain(bloom, &topic)
+    let [emitter, topic] = probes(address);
+    emitter.may_match(bloom) || topic.may_match(bloom)
 }
 
 #[cfg(test)]
@@ -255,6 +294,11 @@ mod tests {
             parent_hash = h;
         }
         out
+    }
+
+    /// Every kept block leads to the head (no reorg since the last tick).
+    fn every(_: u64, _: &[u8; 32]) -> bool {
+        true
     }
 
     const A: [u8; 20] = [0xaa; 20];
@@ -283,7 +327,7 @@ mod tests {
 
     #[test]
     fn nothing_followed_is_one_gap_of_each_kind() {
-        let r = watching(&[A]).report(99, 110);
+        let r = watching(&[A]).report(99, 110, every);
         assert_eq!((r.from, r.to), (100, 110));
         assert_eq!(r.log_gaps, vec![(100, 110)]);
         assert_eq!(r.account_gaps, vec![(100, 110)]);
@@ -295,14 +339,14 @@ mod tests {
     fn covered_blocks_leave_gaps_only_outside_the_run() {
         let mut s = watching(&[A]);
         s.install(run(105, 110, 0, hash(104, 0)), 110);
-        let r = s.report(99, 110);
+        let r = s.report(99, 110, every);
         assert_eq!(r.log_gaps, vec![(100, 104)]);
         // Account activity is not followed: the whole range stays a gap.
         assert_eq!(r.account_gaps, vec![(100, 110)]);
         assert_eq!(r.base, (99, None));
-        assert_eq!(s.report(106, 110).base, (106, Some(hash(106, 0))));
+        assert_eq!(s.report(106, 110, every).base, (106, Some(hash(106, 0))));
         // A head past the run is a gap at the top.
-        assert_eq!(s.report(104, 112).log_gaps, vec![(111, 112)]);
+        assert_eq!(s.report(104, 112, every).log_gaps, vec![(111, 112)]);
     }
 
     #[test]
@@ -311,7 +355,7 @@ mod tests {
         let mut seg = run(100, 102, 0, hash(99, 0));
         accrue(&mut seg[1].bloom, &B);
         s.install(seg, 102);
-        let r = s.report(99, 102);
+        let r = s.report(99, 102, every);
         assert_eq!(
             r.touched,
             vec![Touch { address: B, block: 101, block_hash: hash(101, 0), via: Via::Log }]
@@ -327,7 +371,7 @@ mod tests {
         accrue(&mut seg[0].bloom, &B);
         s.install(seg, 101);
         s.apply(&[B], &[]).unwrap();
-        let r = s.report(99, 101);
+        let r = s.report(99, 101, every);
         assert!(r.log_gaps.is_empty());
         assert_eq!(r.touched.len(), 1);
         assert_eq!(r.touched[0].address, B);
@@ -339,7 +383,7 @@ mod tests {
         s.install(run(100, 105, 0, hash(99, 0)), 105);
         s.install(run(106, 107, 0, hash(105, 0)), 107);
         assert_eq!(s.top(), Some((107, hash(107, 0))));
-        assert!(s.report(99, 107).log_gaps.is_empty());
+        assert!(s.report(99, 107, every).log_gaps.is_empty());
     }
 
     #[test]
@@ -348,10 +392,10 @@ mod tests {
         s.install(run(100, 105, 0, hash(99, 0)), 105);
         // Fork 1 branches off after block 102 and is now the canonical head.
         s.install(run(103, 106, 1, hash(102, 0)), 106);
-        let r = s.report(99, 106);
+        let r = s.report(99, 106, every);
         assert!(r.log_gaps.is_empty());
-        assert_eq!(s.report(102, 106).base.1, Some(hash(102, 0)));
-        assert_eq!(s.report(104, 106).base.1, Some(hash(104, 1)));
+        assert_eq!(s.report(102, 106, every).base.1, Some(hash(102, 0)));
+        assert_eq!(s.report(104, 106, every).base.1, Some(hash(104, 1)));
         assert_eq!(s.top(), Some((106, hash(106, 1))));
     }
 
@@ -361,12 +405,12 @@ mod tests {
         s.install(run(100, 105, 0, hash(99, 0)), 105);
         // A head jump: the new run's parent is not a kept block.
         s.install(run(400, 402, 0, hash(399, 0)), 402);
-        assert_eq!(s.report(99, 402).log_gaps, vec![(100, 399)]);
+        assert_eq!(s.report(99, 402, every).log_gaps, vec![(100, 399)]);
         // A run whose parent at a kept height is on another fork starts over too.
         let mut s = watching(&[A]);
         s.install(run(100, 105, 0, hash(99, 0)), 105);
         s.install(run(104, 106, 1, hash(103, 1)), 106);
-        assert_eq!(s.report(99, 106).log_gaps, vec![(100, 103)]);
+        assert_eq!(s.report(99, 106, every).log_gaps, vec![(100, 103)]);
     }
 
     #[test]
@@ -374,7 +418,7 @@ mod tests {
         let mut s = watching(&[A]);
         s.install(run(1, 300, 0, hash(0, 0)), 300);
         let lowest = 300 - WINDOW + 1;
-        assert_eq!(s.report(0, 300).log_gaps, vec![(1, lowest - 1)]);
+        assert_eq!(s.report(0, 300, every).log_gaps, vec![(1, lowest - 1)]);
     }
 
     #[test]
@@ -395,14 +439,41 @@ mod tests {
         let mut seg = run(100, 105, 0, hash(99, 0));
         accrue(&mut seg[5].bloom, &A);
         s.install(seg, 105);
-        let r = s.report(99, 103);
+        let r = s.report(99, 103, every);
         assert!(r.log_gaps.is_empty());
         assert!(r.touched.is_empty());
     }
 
     #[test]
+    fn kept_blocks_not_known_to_lead_to_the_head_are_a_gap() {
+        let mut s = watching(&[A]);
+        let mut seg = run(100, 105, 0, hash(99, 0));
+        accrue(&mut seg[4].bloom, &A);
+        s.install(seg, 105);
+        // The head moved to fork 1, which branched after 102, before the next tick:
+        // only 100..=102 are known to lead to it.
+        let on_fork_1 = |n: u64, h: &[u8; 32]| n <= 102 && *h == hash(n, 0);
+        let r = s.report(99, 106, on_fork_1);
+        assert_eq!(r.log_gaps, vec![(103, 106)]);
+        assert!(r.touched.is_empty(), "a touch on the abandoned fork is not reported as coverage either");
+        assert_eq!(s.report(102, 106, on_fork_1).base, (102, Some(hash(102, 0))));
+        assert_eq!(s.report(104, 106, on_fork_1).base, (104, None));
+        // Nothing known to lead to the head: the whole range is a gap.
+        assert_eq!(s.report(99, 105, |_, _| false).log_gaps, vec![(100, 105)]);
+    }
+
+    #[test]
+    fn a_kept_run_that_lags_the_head_still_covers_up_to_its_top() {
+        let mut s = watching(&[A]);
+        s.install(run(100, 105, 0, hash(99, 0)), 105);
+        // A new head 106 the follower has not fetched yet, whose ancestry vouches for 105.
+        let r = s.report(99, 106, |n, h| *h == hash(n, 0));
+        assert_eq!(r.log_gaps, vec![(106, 106)]);
+    }
+
+    #[test]
     fn an_empty_range_reports_nothing() {
-        let r = watching(&[A]).report(110, 110);
+        let r = watching(&[A]).report(110, 110, every);
         assert_eq!((r.from, r.to), (111, 110));
         assert!(r.log_gaps.is_empty() && r.account_gaps.is_empty() && r.touched.is_empty());
     }
@@ -411,9 +482,9 @@ mod tests {
     fn the_watch_list_is_additive_bounded_and_clears_the_run_when_emptied() {
         let mut s = watching(&[A]);
         s.apply(&[B], &[]).unwrap();
-        assert_eq!(s.report(0, 0).watching, vec![A, B]);
+        assert_eq!(s.report(0, 0, every).watching, vec![A, B]);
         s.apply(&[], &[A]).unwrap();
-        assert_eq!(s.report(0, 0).watching, vec![B]);
+        assert_eq!(s.report(0, 0, every).watching, vec![B]);
 
         let too_many: Vec<[u8; 20]> = (0..=MAX_WATCHED as u32)
             .map(|i| {
@@ -423,7 +494,7 @@ mod tests {
             })
             .collect();
         assert!(s.apply(&too_many, &[]).is_err());
-        assert_eq!(s.report(0, 0).watching, vec![B], "a refused push changes nothing");
+        assert_eq!(s.report(0, 0, every).watching, vec![B], "a refused push changes nothing");
 
         s.install(run(100, 101, 0, hash(99, 0)), 101);
         s.apply(&[], &[B]).unwrap();

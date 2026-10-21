@@ -167,7 +167,8 @@ class ChainHandle internal constructor(
     /**
      * Which watched addresses the verified blocks after [afterBlock] touched (#691), as
      * `io.myotis.api.ChainHandle`'s `addressActivityJson` describes it — every block of the
-     * range covered or in a gap, per kind — or an `{"error":…}` object: the engine's, or one
+     * range covered or in a gap, per kind, "log" coverage saying only that no log named the
+     * address — or an `{"error":…}` object: the engine's, or one
      * naming a call that failed. Answered from memory, whatever the handle's state.
      */
     fun addressActivityJson(afterBlock: Long): String =
