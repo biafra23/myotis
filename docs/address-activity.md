@@ -166,9 +166,10 @@ source.
 
 ## Next
 
-- **Done in part 3:** the pool keeps its one recent BAL server and hunts for a
-  peer speaking eth/71 or snap/2 when it holds none. Since part 4 (eth/71), the
-  pool rarely needs the hunt.
+- **Done in part 3:** while BALs are wanted, the pool keeps its one recent BAL
+  server (benched, never evicted, for 5 minutes after its last verified BAL). If
+  no pooled peer served one lately, it dials for a peer speaking eth/71 or snap/2,
+  one slot past the target at most. Since eth/71, the pool rarely needs the hunt.
 - **Mainnet and Gnosis** have no Amsterdam yet: their blocks commit to no BAL,
   and their account side stays a gap until the fork.
 - **Shared with #685:** the fetch-and-verify step is

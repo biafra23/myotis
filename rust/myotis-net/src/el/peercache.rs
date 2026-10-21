@@ -325,6 +325,17 @@ impl ElPeerCache {
         self.entries.get(&addr_key(addr)).is_some_and(|e| e.bal)
     }
 
+    /// Drop the BAL mark of the peer at `addr`: it was caught forging one, or
+    /// its session no longer speaks a BAL protocol.
+    pub fn record_bal_lost(&mut self, addr: SocketAddr) {
+        if let Some(e) = self.entries.get_mut(&addr_key(addr)) {
+            if e.bal {
+                e.bal = false;
+                self.dirty = true;
+            }
+        }
+    }
+
     /// Mark the peer at `addr` as one that served a verified block access
     /// list (#691). A peer not in the cache is not added: only an admitted
     /// peer is ever asked, and admission adds it.

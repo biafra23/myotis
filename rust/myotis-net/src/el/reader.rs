@@ -1747,7 +1747,7 @@ const ACTIVITY_FOLLOW_TICK: std::time::Duration = std::time::Duration::from_secs
 /// this rate per head rather than in one large request.
 const ACTIVITY_BALS_PER_PASS: usize = 16;
 
-/// snap/2 peers one pass asks, best first, before leaving the rest for the
+/// Peers speaking eth/71 or snap/2 one pass asks, best first, before leaving the rest for the
 /// next head: most peers may not serve BALs at all, and a pass must stay cheap.
 const ACTIVITY_BAL_PEERS: usize = 3;
 
@@ -1755,7 +1755,7 @@ const ACTIVITY_BAL_PEERS: usize = 3;
 const ACTIVITY_BAL_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// What the activity follower's BAL passes did since the last summary: how
-/// many BALs a network's snap/2 peers actually serve is not known in advance,
+/// many BALs a network's peers actually serve is not known in advance,
 /// and a summary of one pass misses a peer that served between two.
 #[derive(Default)]
 struct ActivityBalStats {
@@ -8048,12 +8048,14 @@ impl ElReader {
         watch: &[[u8; 20]],
         unwatch: &[[u8; 20]],
     ) -> Result<(), String> {
-        let (active, wants_bals) = {
+        let active = {
             let mut state = self.activity.lock().map_err(|_| "activity lock poisoned".to_string())?;
             state.apply(watch, unwatch)?;
-            (state.is_active(), state.is_active() && state.top_commits_to_bal())
+            // Under the activity lock, as the follower sets it: the last word
+            // on the demand is the last change to the list.
+            self.pool.set_bal_demand(state.is_active() && state.top_commits_to_bal());
+            state.is_active()
         };
-        self.pool.set_bal_demand(wants_bals);
         if active {
             self.ensure_activity_follower();
         }
@@ -8141,7 +8143,14 @@ impl ElReader {
     /// are deferred for.)
     async fn activity_follow_tick(self: &Arc<Self>) -> bool {
         use crate::el::activity::{BlockRecord, WINDOW};
-        let Ok(top) = self.activity.lock().map(|s| s.is_active().then(|| s.top())) else {
+        let Ok(top) = self.activity.lock().map(|s| {
+            if !s.is_active() {
+                // Following ends: the pool stops keeping and hunting for a BAL
+                // server — under the lock, so a push refilling the list wins.
+                self.pool.set_bal_demand(false);
+            }
+            s.is_active().then(|| s.top())
+        }) else {
             return false;
         };
         let Some(top) = top else {
@@ -8194,16 +8203,16 @@ impl ElReader {
                 })
             })
             .collect();
-        let wants_bals = self.activity.lock().is_ok_and(|mut state| {
+        if let Ok(mut state) = self.activity.lock() {
             // A push that emptied the list while this tick fetched must not be
             // refilled: its records were cleared on purpose.
             if state.is_active() {
                 state.install(segment, head.0);
             }
-            state.is_active() && state.top_commits_to_bal()
-        });
-        // The pool keeps (and hunts for) a BAL server only where BALs exist.
-        self.pool.set_bal_demand(wants_bals);
+            // The pool keeps (and hunts for) a BAL server only where BALs
+            // exist; set under the lock, like a push's.
+            self.pool.set_bal_demand(state.is_active() && state.top_commits_to_bal());
+        }
         self.spawn_activity_bal_pass();
         true
     }
@@ -8236,7 +8245,7 @@ impl ElReader {
     /// The BAL step of a follower pass with a new head: fetch the access lists
     /// of the kept blocks that commit to one and have none verified yet,
     /// newest first ([`ACTIVITY_BALS_PER_PASS`]), from up to
-    /// [`ACTIVITY_BAL_PEERS`] snap/2 peers, each list verified against its
+    /// [`ACTIVITY_BAL_PEERS`] peers speaking eth/71 or snap/2, each list verified against its
     /// header's `blockAccessListHash` ([`ManagedPeer::get_block_access_lists`]: eth/71, else snap/2).
     /// A block no peer served stays an account gap and is asked for again at
     /// the next head. A peer that serves none is not struck: serving BALs is
@@ -8275,6 +8284,7 @@ impl ElReader {
                         if let Ok(mut l) = self.activity_bal_liars.lock() {
                             l.insert(peer.addr());
                         }
+                        self.pool.forget_bal_server(peer.addr()).await;
                     }
                     entries
                 }

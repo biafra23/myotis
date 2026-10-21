@@ -772,28 +772,34 @@ impl ManagedPeer {
                 messages::encode_get_receipts70(id, 0, hashes)
             })
             .await?;
-        let (_rid, incomplete, mut blocks) = messages::decode_receipts70(&payload, hashes.len())
+        let (_rid, incomplete, blocks) = messages::decode_receipts70(&payload, hashes.len())
             .map_err(|e| format!("Receipts (eth/70) decode: {}", e.0))?;
-        if !incomplete {
-            return Ok(blocks);
-        }
-        if blocks.len() > 1 {
-            blocks.pop();
-            return Ok(blocks);
-        }
-        let Some(mut first) = blocks.pop() else {
-            return Ok(blocks);
+        let mut first = match receipts70_step(incomplete, blocks) {
+            Receipts70Step::Done(blocks) => return Ok(blocks),
+            Receipts70Step::Continue(first) => first,
         };
         let Some(first_hash) = hashes.first() else {
             return Err("peer cut receipts nobody asked for".to_string());
         };
+        // Unverified until the whole list passes the caller's checks: bound
+        // what one read holds, and how long it takes, as one frame did before
+        // eth/70 (EIP-7975 asks receivers to bound partial lists).
+        let deadline = std::time::Instant::now() + RECEIPT_CONTINUATION_TIME;
+        let mut held = payload.len();
         for _ in 0..RECEIPT_CONTINUATIONS {
+            if std::time::Instant::now() >= deadline {
+                return Err("a block's receipts still incomplete at the continuation deadline".to_string());
+            }
             let have = first.len() as u64;
             let payload = self
                 .request(messages::GET_RECEIPTS, messages::RECEIPTS, |id| {
                     messages::encode_get_receipts70(id, have, std::slice::from_ref(first_hash))
                 })
                 .await?;
+            held += payload.len();
+            if held > RECEIPT_CONTINUATION_BYTES {
+                return Err(format!("a block's receipts pass {RECEIPT_CONTINUATION_BYTES} bytes across continuations"));
+            }
             let (_rid, still_incomplete, more) = messages::decode_receipts70(&payload, 1)
                 .map_err(|e| format!("Receipts (eth/70) decode: {}", e.0))?;
             let Some(rest) = more.first().filter(|rest| !rest.is_empty()) else {
@@ -819,6 +825,33 @@ impl ManagedPeer {
         if self.eth_version < 71 {
             return self.snap_get_block_access_lists(blocks).await;
         }
+        let snap2 = self.snap_version.is_some_and(|v| v >= 2);
+        let (mut entries, mut forged) = match self.eth_get_block_access_lists(blocks).await {
+            Ok(answer) => answer,
+            // A session with both asks the other on a failed eth/71 request.
+            Err(_) if snap2 => return self.snap_get_block_access_lists(blocks).await,
+            Err(e) => return Err(e),
+        };
+        // The blocks eth/71 left out are asked over snap/2 when the session
+        // has it: a client may serve BALs over one protocol and not the other.
+        let missing: Vec<usize> = (0..blocks.len()).filter(|&i| entries[i].is_none()).collect();
+        if snap2 && !missing.is_empty() {
+            let rest: Vec<([u8; 32], [u8; 32])> = missing.iter().map(|&i| blocks[i]).collect();
+            if let Ok((more, more_forged)) = self.snap_get_block_access_lists(&rest).await {
+                forged |= more_forged;
+                for (&i, entry) in missing.iter().zip(more) {
+                    entries[i] = entry;
+                }
+            }
+        }
+        Ok((entries, forged))
+    }
+
+    /// The eth/71 (EIP-8159) half of [`Self::get_block_access_lists`].
+    async fn eth_get_block_access_lists(
+        &self,
+        blocks: &[([u8; 32], [u8; 32])],
+    ) -> Result<(Vec<Option<Vec<u8>>>, bool), String> {
         let hashes: Vec<[u8; 32]> = blocks.iter().map(|(block, _)| *block).collect();
         let payload = self
             .request(messages::GET_BLOCK_ACCESS_LISTS, messages::BLOCK_ACCESS_LISTS, |id| {
@@ -1236,6 +1269,39 @@ async fn read_loop(
 /// soft) is far more than any block's receipts.
 const RECEIPT_CONTINUATIONS: usize = 8;
 
+/// Bytes of receipts one eth/70 read may hold across continuations before
+/// any of them is verified — what the 10 MiB frame cap bounded alone before.
+const RECEIPT_CONTINUATION_BYTES: usize = 16 * 1024 * 1024;
+
+/// How long one eth/70 read may spend continuing a block, over the
+/// per-request timeout of each round.
+const RECEIPT_CONTINUATION_TIME: Duration = Duration::from_secs(45);
+
+/// What an eth/70 Receipts answer leaves to do ([`receipts70_step`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Receipts70Step {
+    /// The whole blocks to hand back: every block complete, or the cut tail
+    /// block dropped so the caller resumes there.
+    Done(Vec<messages::BlockReceipts>),
+    /// The only block was cut: continue it from its receipts so far.
+    Continue(messages::BlockReceipts),
+}
+
+/// Pure: the next step after an eth/70 Receipts answer.
+fn receipts70_step(incomplete: bool, mut blocks: Vec<messages::BlockReceipts>) -> Receipts70Step {
+    if !incomplete || blocks.is_empty() {
+        return Receipts70Step::Done(blocks);
+    }
+    if blocks.len() > 1 {
+        blocks.pop();
+        return Receipts70Step::Done(blocks);
+    }
+    match blocks.pop() {
+        Some(first) => Receipts70Step::Continue(first),
+        None => Receipts70Step::Done(blocks),
+    }
+}
+
 /// A BlockAccessLists answer to `blocks`, checked: one entry per block, in
 /// order, each kept only if it hashes to the block's commitment; the `bool`
 /// says some entry did not (a forgery, dropped). A short answer is padded
@@ -1368,6 +1434,22 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn an_eth70_cut_tail_is_dropped_and_a_cut_lone_block_continued() {
+        use messages::BlockReceipts;
+        let block = |n: usize| {
+            let mut list = messages::RawList::new();
+            for _ in 0..n {
+                list.push(&[0xc0]);
+            }
+            BlockReceipts::Eth69(list)
+        };
+        assert_eq!(receipts70_step(false, vec![block(1), block(2)]), Receipts70Step::Done(vec![block(1), block(2)]));
+        assert_eq!(receipts70_step(true, vec![block(1), block(2)]), Receipts70Step::Done(vec![block(1)]));
+        assert_eq!(receipts70_step(true, vec![block(3)]), Receipts70Step::Continue(block(3)));
+        assert_eq!(receipts70_step(true, vec![]), Receipts70Step::Done(vec![]));
+    }
     use myotis_core::rlp;
 
     /// The pure head classifier behind the read ladder, the admission and
