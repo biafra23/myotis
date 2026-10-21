@@ -4789,6 +4789,13 @@ mod tests {
         assert!(parse_activity_watch(r#"{"watch":["0x1234"]}"#).is_none());
         assert!(parse_activity_watch(r#"{"watch":[7]}"#).is_none());
         assert!(parse_activity_watch(&format!(r#"{{"watch":["{a}"],"unwatch":["{a}"]}}"#)).is_none());
+        // A watch past the cap is refused while parsing; an unwatch of any length is not.
+        let many: Vec<String> = (0..=myotis_net::el::activity::MAX_WATCHED as u32)
+            .map(|i| format!("\"0x{i:040x}\""))
+            .collect();
+        let many = many.join(",");
+        assert!(parse_activity_watch(&format!(r#"{{"watch":[{many}]}}"#)).is_none());
+        assert!(parse_activity_watch(&format!(r#"{{"unwatch":[{many}]}}"#)).is_some());
     }
 
     #[test]
@@ -5150,7 +5157,8 @@ pub fn set_activity_watch_json(handle: i64, config_json: &str) -> bool {
     let Some((watch, unwatch)) = parse_activity_watch(config_json) else {
         tracing::warn!(
             "activity watch refused: not a JSON object whose `watch` and `unwatch` are arrays \
-             of 20-byte hex addresses, or one address is under both; ignoring the push"
+             of 20-byte hex addresses, one address is under both, or `watch` names more \
+             addresses than the engine follows; ignoring the push"
         );
         return false;
     };
@@ -5188,34 +5196,39 @@ pub fn set_activity_watch_json(handle: i64, config_json: &str) -> bool {
     true
 }
 
-/// The `(watch, unwatch)` lists of an activity push. `None` = malformed (see
-/// [`set_activity_watch_json`]). An address named twice under one key is
-/// folded into one. Pure — unit-tested.
+/// The `(watch, unwatch)` lists of an activity push, each ascending with an
+/// address named twice folded into one. `None` = malformed (see
+/// [`set_activity_watch_json`]), or a `watch` longer than
+/// `activity::MAX_WATCHED`: refused while parsing, since applying it could
+/// only refuse it, and a caller's runaway list is not scanned to its end.
+/// Pure — unit-tested.
 fn parse_activity_watch(config_json: &str) -> Option<(Vec<[u8; 20]>, Vec<[u8; 20]>)> {
+    use std::collections::BTreeSet;
     let v: serde_json::Value = serde_json::from_str(config_json).ok()?;
     if !v.is_object() {
         return None;
     }
-    let list = |key: &str| -> Option<Vec<[u8; 20]>> {
+    let list = |key: &str, cap: Option<usize>| -> Option<BTreeSet<[u8; 20]>> {
         let entries = match v.get(key) {
-            None | Some(serde_json::Value::Null) => return Some(Vec::new()),
+            None | Some(serde_json::Value::Null) => return Some(BTreeSet::new()),
             Some(other) => other.as_array()?,
         };
-        let mut out: Vec<[u8; 20]> = Vec::with_capacity(entries.len());
+        let mut out = BTreeSet::new();
         for e in entries {
-            let a = parse_address(e.as_str()?)?;
-            if !out.contains(&a) {
-                out.push(a);
+            out.insert(parse_address(e.as_str()?)?);
+            if cap.is_some_and(|cap| out.len() > cap) {
+                return None;
             }
         }
         Some(out)
     };
-    let watch = list("watch")?;
-    let unwatch = list("unwatch")?;
-    if watch.iter().any(|a| unwatch.contains(a)) {
+    let watch = list("watch", Some(myotis_net::el::activity::MAX_WATCHED))?;
+    // No cap: an oversized unwatch of addresses nobody watches is a no-op, not a refusal.
+    let unwatch = list("unwatch", None)?;
+    if !watch.is_disjoint(&unwatch) {
         return None;
     }
-    Some((watch, unwatch))
+    Some((watch.into_iter().collect(), unwatch.into_iter().collect()))
 }
 
 /// The watched addresses' activity in the verified blocks after `after_block`
