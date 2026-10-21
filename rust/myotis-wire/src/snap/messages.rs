@@ -492,6 +492,47 @@ mod tests {
         ])
     }
 
+    fn hex20(hex: &str) -> [u8; 20] {
+        let mut out = [0u8; 20];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
+        }
+        out
+    }
+
+    /// A real BAL — Sepolia block 11960753, served by a Nethermind peer over
+    /// snap/2 — with its header. Unlike the fixtures above it does not come
+    /// from this file's encoder, so it pins what each position of an account
+    /// entry means against the network, through facts that hold whatever
+    /// the decoder assumes: the header commits to these exact bytes, the
+    /// EIP-4788 and EIP-2935 system contracts write storage in every block
+    /// (`storage_changes`), and the fee recipient's balance changes in a block
+    /// that pays it fees (`balance_changes`).
+    #[test]
+    fn a_real_sepolia_bal_hashes_to_its_header_and_names_what_every_block_changes() {
+        let header_raw = include_bytes!("../../../testdata/el/bal/sepolia-11960753.header.rlp");
+        let bal: &[u8] = include_bytes!("../../../testdata/el/bal/sepolia-11960753.bal.rlp");
+        let header = myotis_core::header::BlockHeader::decode(header_raw).unwrap();
+        assert_eq!(header.number, 11_960_753);
+        assert_eq!(header.block_access_list_hash, Some(keccak256(bal)));
+
+        let changed = bal_changed_accounts(bal).unwrap();
+        let beacon_roots = hex20("000f3df6d732807ef1319fb7b8bb8522d0beac02");
+        let history_storage = hex20("0000f90827f1c53a10cb7a02335b175320002935");
+        let mut coinbase = [0u8; 20];
+        coinbase.copy_from_slice(&header.beneficiary);
+        for (name, account) in
+            [("EIP-4788 beacon roots", beacon_roots), ("EIP-2935 history", history_storage), ("coinbase", coinbase)]
+        {
+            assert!(changed.binary_search(&account).is_ok(), "{name} must be a changed account");
+        }
+        // Ascending, as the BAL orders its accounts; and some accounts the
+        // block only accessed are left out.
+        assert!(changed.windows(2).all(|w| w[0] < w[1]));
+        let listed = rlp::View::new(bal).unwrap().as_list().unwrap().count();
+        assert!(changed.len() < listed, "{} changed of {listed} listed", changed.len());
+    }
+
     #[test]
     fn the_empty_bal_hashes_to_the_spec_constant() {
         // EIP-7928: keccak256(rlp.encode([])) — what the header carries for an empty BAL.
