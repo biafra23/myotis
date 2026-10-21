@@ -6,9 +6,13 @@
 //! (the same cross-engine sharing the CL [`crate::clcache`] gives).
 //!
 //! **Record format** (tab-separated, UTF-8), one peer per line:
-//! `ip \t port \t publicKeyHex \t {1|0} [\t snapok|snapbad] [\t fails=N]`
+//! `ip \t port \t publicKeyHex \t {1|0} [\t snapok|snapbad] [\t fails=N] [\t bal]`
 //! — the trailing `{1|0}` is snap CAPABILITY (snap/1 or snap/2); the optional `snapok`/`snapbad`
-//! token records learned snap-serving QUALITY. `publicKeyHex` is the peer's
+//! token records learned snap-serving QUALITY; `bal` (Rust engine only) marks a
+//! peer that served a verified block access list over snap/2 (#691), dialed
+//! first while a host follows address activity. The Java caches ignore it and
+//! drop it on their next rewrite, which costs only that preference.
+//! `publicKeyHex` is the peer's
 //! 64-byte node id as `0x`-prefixed hex (Java `Bytes.toHexString()`). Tabs
 //! can't appear in an IP literal, so IPv6 stays unambiguous. Lines in the
 //! legacy colon format (`ip:port:publicKeyHex[:snap]`, IPv4 only) still parse,
@@ -106,6 +110,8 @@ struct Entry {
     /// Consecutive TCP connect failures (persisted as `fails=N`, shared with
     /// the Java caches). Reset by any successful connect or serve.
     fails: u32,
+    /// Served a verified block access list (persisted as `bal`).
+    bal: bool,
 }
 
 impl Entry {
@@ -125,6 +131,7 @@ impl Entry {
             _ => SnapQuality::Unknown,
         };
         self.fails = self.fails.min(other.fails);
+        self.bal |= other.bal;
     }
 }
 
@@ -201,10 +208,12 @@ impl ElPeerCache {
         let snap = parts.get(3).map_or(false, |f| *f == "1");
         let mut quality = SnapQuality::Unknown;
         let mut fails = 0u32;
+        let mut bal = false;
         for token in &parts[4.min(parts.len())..] {
             match *token {
                 "snapok" => quality = SnapQuality::Confirmed,
                 "snapbad" => quality = SnapQuality::Denied,
+                "bal" => bal = true,
                 t => {
                     if let Some(n) = t.strip_prefix("fails=") {
                         // Unreadable count → streak starts over at 0 (Java parity).
@@ -215,7 +224,7 @@ impl ElPeerCache {
         }
         self.insert_loaded(
             key(ip, port),
-            Entry { pubkey_hex: pubkey_hex.to_string(), snap, quality, fails },
+            Entry { pubkey_hex: pubkey_hex.to_string(), snap, quality, fails, bal },
         );
     }
 
@@ -248,6 +257,7 @@ impl ElPeerCache {
                 snap,
                 quality: SnapQuality::Unknown,
                 fails: 0,
+                bal: false,
             },
         );
     }
@@ -280,10 +290,11 @@ impl ElPeerCache {
     }
 
     /// All cached peers, snap-serving quality first (Confirmed → Unknown →
-    /// Denied), then non-snap. Entries whose stored address/pubkey no longer
-    /// parse are skipped.
+    /// Denied), then non-snap; within a rank, the peers that served a verified
+    /// BAL first. Entries whose stored address/pubkey no longer parse are
+    /// skipped.
     pub fn peers(&self) -> Vec<CachedElPeer> {
-        let mut out: Vec<CachedElPeer> = self
+        let mut out: Vec<(CachedElPeer, bool)> = self
             .entries
             .iter()
             .filter_map(|(k, e)| {
@@ -300,12 +311,33 @@ impl ElPeerCache {
                 } else {
                     e.quality
                 };
-                Some(CachedElPeer { addr, pubkey, snap: e.snap, quality })
+                Some((CachedElPeer { addr, pubkey, snap: e.snap, quality }, e.bal))
             })
             .collect();
-        // Snap peers first (by quality), then non-snap. Stable within a rank.
-        out.sort_by_key(|p| if p.snap { p.quality.dial_rank() } else { 3 });
-        out
+        // Snap peers first (by quality), then non-snap; BAL servers first
+        // within a rank. Stable otherwise.
+        out.sort_by_key(|(p, bal)| (if p.snap { p.quality.dial_rank() } else { 3 }, !*bal));
+        out.into_iter().map(|(p, _)| p).collect()
+    }
+
+    /// Whether the peer at `addr` served a verified BAL (the `bal` token).
+    pub fn is_bal_server(&self, addr: SocketAddr) -> bool {
+        self.entries.get(&addr_key(addr)).is_some_and(|e| e.bal)
+    }
+
+    /// Mark the peer at `addr` as one that served a verified block access
+    /// list (#691). A peer not in the cache is not added: only an admitted
+    /// peer is ever asked, and admission adds it.
+    pub fn record_bal_served(&mut self, addr: SocketAddr) {
+        if self.path.is_none() {
+            return;
+        }
+        if let Some(e) = self.entries.get_mut(&addr_key(addr)) {
+            if !e.bal {
+                e.bal = true;
+                self.dirty = true;
+            }
+        }
     }
 
     /// How many cached peers are snap servers [`peers`](Self::peers) would not
@@ -345,7 +377,7 @@ impl ElPeerCache {
         self.failures.remove(&k);
         self.entries.insert(
             k,
-            Entry { pubkey_hex: pubkey_hex(&peer.pubkey), snap: peer.snap, quality: peer.quality, fails: 0 },
+            Entry { pubkey_hex: pubkey_hex(&peer.pubkey), snap: peer.snap, quality: peer.quality, fails: 0, bal: false },
         );
         self.dirty = true;
     }
@@ -401,6 +433,7 @@ impl ElPeerCache {
                         snap,
                         quality: SnapQuality::Unknown,
                         fails: 0,
+                        bal: false,
                     },
                 );
                 self.dirty = true;
@@ -533,6 +566,10 @@ impl ElPeerCache {
             if e.fails > 0 {
                 body.push(SEP_CH);
                 body.push_str(&format!("fails={}", e.fails));
+            }
+            if e.bal {
+                body.push(SEP_CH);
+                body.push_str("bal");
             }
             body.push('\n');
         }
@@ -680,6 +717,33 @@ mod tests {
         assert_eq!(c.peers()[0].quality, SnapQuality::Denied); // 3rd → denied
         c.record_snap_served(a);
         assert_eq!(c.peers()[0].quality, SnapQuality::Confirmed); // serve reconfirms
+    }
+
+    #[test]
+    fn a_bal_server_survives_a_reload_and_is_dialed_first_within_its_rank() {
+        let path = std::env::temp_dir().join(format!("myotis-elcache-bal-{}.cache", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let mut c = ElPeerCache::load(path.clone());
+        let a: SocketAddr = "1.2.3.4:30303".parse().unwrap();
+        let b: SocketAddr = "1.2.3.5:30303".parse().unwrap();
+        c.add(a, &pk(1), true);
+        c.add(b, &pk(2), true);
+        c.record_bal_served(b);
+        // Not added by a mark: only an admitted peer is ever asked for a BAL.
+        c.record_bal_served("9.9.9.9:30303".parse().unwrap());
+        c.flush();
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().filter(|l| l.ends_with("\tbal")).count(), 1, "{text}");
+        let reloaded = ElPeerCache::load(path.clone());
+        assert!(reloaded.is_bal_server(b) && !reloaded.is_bal_server(a));
+        assert_eq!(reloaded.len(), 2);
+        // Same rank (Unknown): the BAL server first.
+        assert_eq!(reloaded.peers()[0].addr, b);
+        // A Confirmed peer still outranks it: the mark orders within a rank only.
+        let mut c = reloaded;
+        c.record_snap_served(a);
+        assert_eq!(c.peers()[0].addr, a);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
@@ -904,6 +968,7 @@ mod tests {
             snap,
             quality,
             fails,
+            bal: false,
         };
         let fold = |a: Entry, b: Entry| {
             let mut a = a;

@@ -8048,11 +8048,12 @@ impl ElReader {
         watch: &[[u8; 20]],
         unwatch: &[[u8; 20]],
     ) -> Result<(), String> {
-        let active = {
+        let (active, wants_bals) = {
             let mut state = self.activity.lock().map_err(|_| "activity lock poisoned".to_string())?;
             state.apply(watch, unwatch)?;
-            state.is_active()
+            (state.is_active(), state.is_active() && state.top_commits_to_bal())
         };
+        self.pool.set_bal_demand(wants_bals);
         if active {
             self.ensure_activity_follower();
         }
@@ -8193,13 +8194,16 @@ impl ElReader {
                 })
             })
             .collect();
-        if let Ok(mut state) = self.activity.lock() {
+        let wants_bals = self.activity.lock().is_ok_and(|mut state| {
             // A push that emptied the list while this tick fetched must not be
             // refilled: its records were cleared on purpose.
             if state.is_active() {
                 state.install(segment, head.0);
             }
-        }
+            state.is_active() && state.top_commits_to_bal()
+        });
+        // The pool keeps (and hunts for) a BAL server only where BALs exist.
+        self.pool.set_bal_demand(wants_bals);
         self.spawn_activity_bal_pass();
         true
     }
@@ -8248,13 +8252,9 @@ impl ElReader {
             return;
         }
         let liars = self.activity_bal_liars.lock().map(|l| l.clone()).unwrap_or_default();
-        let snap2: Vec<Arc<ManagedPeer>> = self
-            .pool
-            .snap_peers()
-            .await
-            .into_iter()
-            .filter(|p| p.snap_version.is_some_and(|v| v >= 2) && !liars.contains(&p.addr()))
-            .collect();
+        // Recent BAL servers first, so the per-pass cap reaches them.
+        let snap2: Vec<Arc<ManagedPeer>> =
+            self.pool.bal_peers().await.into_iter().filter(|p| !liars.contains(&p.addr())).collect();
         let mut missing = wanted.clone();
         let mut asked = 0usize;
         let mut serving: Vec<String> = Vec::new();
@@ -8308,6 +8308,7 @@ impl ElReader {
             }
             if got > 0 {
                 serving.push(crate::el::pool::log_client_id(&peer.peer_hello.client_id));
+                self.pool.record_bal_served(peer.addr()).await;
             }
             missing = still;
         }

@@ -166,6 +166,12 @@ impl ActivityState {
         self.watched.keys().copied().collect()
     }
 
+    /// Whether the kept top commits to a block access list: the chain is past
+    /// Amsterdam, so fetching BALs can cover the account side.
+    pub fn top_commits_to_bal(&self) -> bool {
+        self.records.values().next_back().is_some_and(|r| r.bal_hash.is_some())
+    }
+
     /// The highest kept block, `(number, hash)`.
     pub fn top(&self) -> Option<(u64, [u8; 32])> {
         self.records.values().next_back().map(|r| (r.number, r.hash))
