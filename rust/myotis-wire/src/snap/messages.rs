@@ -5,7 +5,7 @@
 //! Snap uses `GetAccountRange`/`GetStorageRanges` (which return full
 //! root-to-leaf boundary proofs), NOT `GetTrieNodes`. Message codes are
 //! DYNAMIC: `base = 0x10 + eth_protocol_length` (17 → base 0x21 for eth/67-68,
-//! 18 → base 0x22 for eth/69); see [`SnapCodes`].
+//! 18 → base 0x22 for eth/69-70, 20 → base 0x24 for eth/71); see [`SnapCodes`].
 //!
 //! Both snap/1 and snap/2 (EIP-8189) are spoken. snap/2 leaves ids 0x00-0x05
 //! — every request this engine sends — byte-for-byte unchanged; it retires
@@ -48,9 +48,15 @@ pub struct SnapCodes {
 
 impl SnapCodes {
     /// `base = 0x10 + eth_protocol_length`. eth/67-68 has length 17 (base
-    /// 0x21); eth/69 adds BlockRangeUpdate → length 18 (base 0x22).
+    /// 0x21); eth/69 adds BlockRangeUpdate → length 18 (base 0x22); eth/70
+    /// changes no message count; eth/71 adds GetBlockAccessLists /
+    /// BlockAccessLists → length 20 (base 0x24).
     pub fn negotiated(eth_version: u64, snap_version: u64) -> SnapCodes {
-        let base = if eth_version >= 69 { 0x22 } else { 0x21 };
+        let base = match eth_version {
+            ..=68 => 0x21,
+            69 | 70 => 0x22,
+            _ => 0x24,
+        };
         SnapCodes {
             snap_version,
             get_account_range: base,
@@ -616,7 +622,12 @@ mod tests {
         assert_eq!(SnapCodes::negotiated(69, 1).byte_codes, 0x27);
         // snap/2 (EIP-8189) keeps 0x00-0x05 where they were — the read path is
         // version-blind — and puts the BAL pair after the retired trie-node pair.
-        for eth in [68, 69] {
+        // eth/70 (EIP-7975) adds no message; eth/71 (EIP-8159) adds two at
+        // 0x22/0x23, so snap starts at 0x24 — clear of the eth/71 BAL pair.
+        assert_eq!(SnapCodes::negotiated(70, 2).get_account_range, 0x22);
+        assert_eq!(SnapCodes::negotiated(71, 2).get_account_range, 0x24);
+        assert!(SnapCodes::negotiated(71, 2).get_account_range > crate::eth::BLOCK_ACCESS_LISTS);
+        for eth in [68, 69, 70, 71] {
             let (v1, v2) = (SnapCodes::negotiated(eth, 1), SnapCodes::negotiated(eth, 2));
             assert_eq!(v2.get_account_range, v1.get_account_range);
             assert_eq!(v2.storage_ranges, v1.storage_ranges);

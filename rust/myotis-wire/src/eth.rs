@@ -1,4 +1,4 @@
-//! eth/66-69 sub-protocol messages (EL-A5), twin of the Java
+//! eth/66-71 sub-protocol messages (EL-A5; eth/70-71 Rust only), twin of the Java
 //! `networking.eth.messages` package (docs/reimplementation/02 §6).
 //!
 //! Pure encode/decode over bytes — the async handshake + request correlation
@@ -43,6 +43,12 @@ pub const BLOCK_BODIES: u64 = 0x16;
 pub const NEW_POOLED_TRANSACTION_HASHES: u64 = 0x18;
 pub const GET_RECEIPTS: u64 = 0x1f;
 pub const RECEIPTS: u64 = 0x20;
+/// eth/71 (EIP-8159) GetBlockAccessLists / BlockAccessLists: spec ids 0x12 /
+/// 0x13, absolute 0x22 / 0x23 — the two slots that grow the eth/71 protocol
+/// length 18 → 20 (so the snap base moves 0x22 → 0x24, see snap::SnapCodes).
+/// Gate on the negotiated version: on eth/69-70 absolute 0x22 is the SNAP base.
+pub const GET_BLOCK_ACCESS_LISTS: u64 = 0x22;
+pub const BLOCK_ACCESS_LISTS: u64 = 0x23;
 
 // ---------------------------------------------------------------------------
 // Status (0x10).
@@ -424,6 +430,34 @@ pub fn encode_get_receipts(request_id: u64, hashes: &[[u8; 32]]) -> Vec<u8> {
     encode_hash_request(request_id, hashes)
 }
 
+/// Encode an eth/70 (EIP-7975) GetReceipts: `[reqId, firstBlockReceiptIndex,
+/// [blockHash, …]]` — the server omits the first block's receipts before
+/// `first_block_receipt_index`, so a block cut short can be continued.
+pub fn encode_get_receipts70(request_id: u64, first_block_receipt_index: u64, hashes: &[[u8; 32]]) -> Vec<u8> {
+    rlp::encode(&Item::List(vec![
+        Item::Bytes(rlp::u64_to_minimal_be(request_id)),
+        Item::Bytes(rlp::u64_to_minimal_be(first_block_receipt_index)),
+        Item::List(hashes.iter().map(|h| Item::Bytes(h.to_vec())).collect()),
+    ]))
+}
+
+/// `[reqId, 0, []]` — an empty eth/70 Receipts response (see
+/// [`encode_empty_response`] for the eth/66-69 one).
+pub fn encode_empty_receipts70(request_id: u64) -> Vec<u8> {
+    rlp::encode(&Item::List(vec![
+        Item::Bytes(rlp::u64_to_minimal_be(request_id)),
+        Item::Bytes(rlp::u64_to_minimal_be(0)),
+        Item::List(vec![]),
+    ]))
+}
+
+/// Encode an eth/71 (EIP-8159) GetBlockAccessLists: `[reqId, [blockHash, …]]`.
+/// The response has snap/2's `BlockAccessLists` shape, decoded by
+/// `snap::messages::decode_block_access_lists`.
+pub fn encode_get_block_access_lists(request_id: u64, hashes: &[[u8; 32]]) -> Vec<u8> {
+    encode_hash_request(request_id, hashes)
+}
+
 /// Encode an eth `Transactions` message carrying a single raw transaction (no
 /// request id — it's an unsolicited broadcast). A legacy tx (a bare RLP list) is
 /// embedded as-is; a typed tx (EIP-2718 `type_byte ‖ payload`) is wrapped as an
@@ -565,6 +599,20 @@ impl BlockReceipts {
         self.expand()
     }
 
+    /// Append `more` — the rest of the same block's receipts, as an eth/70
+    /// continuation serves them — to these. Both must be eth/69-shaped.
+    pub fn append(&mut self, more: &BlockReceipts) -> Result<(), CoreError> {
+        match (self, more) {
+            (BlockReceipts::Eth69(list), BlockReceipts::Eth69(rest)) => {
+                for receipt in rest.0.iter() {
+                    list.push_item(receipt);
+                }
+                Ok(())
+            }
+            _ => Err(CoreError("receipts: only eth/69-shaped lists continue".into())),
+        }
+    }
+
     /// The expansion itself. Private: every way in bounds the count first.
     fn expand(&self) -> Result<Cow<'_, RawList>, CoreError> {
         match self {
@@ -614,6 +662,35 @@ pub fn decode_receipts(rlp_bytes: &[u8], requested: usize) -> Result<(u64, Vec<B
 /// malformed one fails the response as before; only the recomputation waits.
 pub fn decode_receipts69(rlp_bytes: &[u8], requested: usize) -> Result<(u64, Vec<BlockReceipts>), CoreError> {
     let (request_id, blocks_view) = request_and_payload(rlp_bytes)?;
+    Ok((request_id, eth69_blocks(blocks_view, requested)?))
+}
+
+/// Decode an eth/70 (EIP-7975) Receipts response
+/// `[reqId, lastBlockIncomplete, [[receipt, …], …]]` to a request for
+/// `requested` blocks: `(request_id, last_block_incomplete, blocks)`, the
+/// receipts in eth/69's shape. A flag other than 0 or 1 is an error. When the
+/// flag is set the last block's list is only a prefix of its receipts — it
+/// cannot pass a receiptsRoot check until the rest is fetched.
+pub fn decode_receipts70(
+    rlp_bytes: &[u8],
+    requested: usize,
+) -> Result<(u64, bool, Vec<BlockReceipts>), CoreError> {
+    let items = rlp::raw_list_prefix(rlp_bytes, 3)?;
+    let (Some(id), Some(flag), Some(payload)) = (items.first(), items.get(1), items.get(2)) else {
+        return Err(CoreError("eth/70 Receipts: missing [reqId, lastBlockIncomplete, receipts]".into()));
+    };
+    let incomplete = match rlp::decode(flag)?.as_u64()? {
+        0 => false,
+        1 => true,
+        _ => return Err(CoreError("eth/70 Receipts: lastBlockIncomplete is not 0 or 1".into())),
+    };
+    let blocks = eth69_blocks(rlp::View::new(payload)?, requested)?;
+    Ok((request_id_at(id)?, incomplete, blocks))
+}
+
+/// The per-block receipt lists of an eth/69-shaped payload, every receipt
+/// checked, keeping at most one block more than `requested` (see [`kept`]).
+fn eth69_blocks(blocks_view: rlp::View<'_>, requested: usize) -> Result<Vec<BlockReceipts>, CoreError> {
     let mut blocks = Vec::new();
     for (i, block) in blocks_view.as_list()?.enumerate() {
         for wire in block.as_list()? {
@@ -627,7 +704,7 @@ pub fn decode_receipts69(rlp_bytes: &[u8], requested: usize) -> Result<(u64, Vec
             blocks.push(BlockReceipts::Eth69(receipts));
         }
     }
-    Ok((request_id, blocks))
+    Ok(blocks)
 }
 
 /// The fields of an eth/69 wire receipt `[txType, statusOrState, cumGas, logs]`
@@ -956,6 +1033,41 @@ mod tests {
     }
 
     use super::*;
+
+    /// An eth/69-shaped receipt `[type, status, cumGas, []]`.
+    fn wire_receipt(cum_gas: u8) -> Item {
+        Item::List(vec![Item::Bytes(vec![2]), Item::Bytes(vec![1]), Item::Bytes(vec![cum_gas]), Item::List(vec![])])
+    }
+
+    #[test]
+    fn eth70_receipts_carry_the_incomplete_flag_and_continue() {
+        let req = encode_get_receipts70(5, 3, &[[0xaa; 32]]);
+        let mut fields = rlp::View::new(&req).unwrap().as_list().unwrap();
+        assert_eq!(fields.next().unwrap().as_u64().unwrap(), 5);
+        assert_eq!(fields.next().unwrap().as_u64().unwrap(), 3);
+        assert_eq!(fields.next().unwrap().as_list().unwrap().count(), 1);
+
+        let resp = |flag: u64, receipts: Vec<Item>| {
+            rlp::encode(&Item::List(vec![
+                Item::Bytes(rlp::u64_to_minimal_be(5)),
+                Item::Bytes(rlp::u64_to_minimal_be(flag)),
+                Item::List(vec![Item::List(receipts)]),
+            ]))
+        };
+        let (id, incomplete, blocks) = decode_receipts70(&resp(1, vec![wire_receipt(1)]), 1).unwrap();
+        assert_eq!((id, incomplete, blocks.len(), blocks[0].len()), (5, true, 1, 1));
+        let (_, incomplete, more) = decode_receipts70(&resp(0, vec![wire_receipt(2), wire_receipt(3)]), 1).unwrap();
+        assert!(!incomplete);
+        let mut first = blocks.into_iter().next().unwrap();
+        first.append(&more[0]).unwrap();
+        assert_eq!(first.len(), 3);
+        assert_eq!(first.canonical(3).unwrap().len(), 3);
+        // A flag other than 0 or 1 is refused.
+        assert!(decode_receipts70(&resp(2, vec![wire_receipt(1)]), 1).is_err());
+        // The empty eth/70 answer decodes as complete and empty.
+        let (id, incomplete, blocks) = decode_receipts70(&encode_empty_receipts70(9), 1).unwrap();
+        assert_eq!((id, incomplete, blocks.len()), (9, false, 0));
+    }
     use myotis_core::keccak::keccak256;
 
     #[test]

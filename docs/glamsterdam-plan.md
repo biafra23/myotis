@@ -9,7 +9,7 @@ fork-keyed decoding, the shape gate before BLS, relaying light-client objects
 under their own slot's digest, and the execution anchor resolved by block hash,
 see "The EL anchor after Gloas") and B.4 (Amsterdam EVM: served by revm 43 on
 the Rust engine, refused with a permanent `-32602` by the Java engine's Besu
-26.4). Still open: B.5 (eth/70–71), the mainnet and Gnosis schedule entries
+26.4). Still open: B.5 on the Java engine (eth/70–71; the Rust engine has them), the mainnet and Gnosis schedule entries
 once their forks are announced, A.3's inertness check on the live fork, and the
 "Known limitations after review" list. Dates without a decision are projections
 and move whenever testing finds something. Since the fork: Lighthouse serves no
@@ -529,8 +529,21 @@ behaviour on mainnet or gnosis today.
 
 Amsterdam also ships eth/70 (EIP-7975 partial receipts) and eth/71
 (EIP-8159 BAL exchange). eth/66–69 keep negotiating for a transition window,
-so nothing breaks on day one, but track deprecation — the receipts path (log
-index) eventually needs eth/70. Separate ticket, not part of A or B DoD.
+so nothing broke on day one.
+
+**Done on the Rust engine** (#691, part 4). It advertises and negotiates
+eth/66–71, so a current geth peer, which offers eth/69–72, lands on eth/71.
+
+- **eth/70 receipts** carry the `lastBlockIncomplete` flag. A cut tail block is
+  dropped, so the caller resumes there. A cut lone block is continued with
+  `firstBlockReceiptIndex`.
+- **eth/71 `GetBlockAccessLists`** (0x22/0x23) feeds the address-activity
+  follower's account coverage beside snap/2. On eth/71 the snap base moves to
+  0x24.
+- **Inbound:** the new `Receipts` shape on eth/70+, and zero BAL entries on
+  eth/71.
+
+The Java engine still stops at eth/69.
 
 ### Known limitations after review (tracked, not fork-day-critical)
 

@@ -166,6 +166,12 @@ impl ActivityState {
         self.watched.keys().copied().collect()
     }
 
+    /// Whether the kept top commits to a block access list: the chain is past
+    /// Amsterdam, so fetching BALs can cover the account side.
+    pub fn top_commits_to_bal(&self) -> bool {
+        self.records.values().next_back().is_some_and(|r| r.bal_hash.is_some())
+    }
+
     /// The highest kept block, `(number, hash)`.
     pub fn top(&self) -> Option<(u64, [u8; 32])> {
         self.records.values().next_back().map(|r| (r.number, r.hash))
@@ -213,7 +219,8 @@ impl ActivityState {
     }
 
     /// The kept blocks whose BAL is still wanted — at or above the BAL floor
-    /// ([`Self::bal_floor`]), committing to one, none verified yet — newest
+    /// (the head the run last started over at), committing to one, none
+    /// verified yet — newest
     /// first, at most `max`: `(number, block hash, blockAccessListHash)`.
     pub fn bals_wanted(&self, max: usize) -> Vec<(u64, [u8; 32], [u8; 32])> {
         self.records

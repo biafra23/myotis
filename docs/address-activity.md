@@ -60,8 +60,8 @@ heads links it to the head.
   gives false positives, and a hit costs the host one extra proof.
 - **`account`** is the account itself: a balance, nonce or code change, or a
   storage write. It comes from the block access list (EIP-7928), fetched over
-  snap/2 (EIP-8189 `GetBlockAccessLists`) and verified against the header's
-  `blockAccessListHash`: a peer can withhold one, not forge one. Where covered
+  eth/71 (EIP-8159) or snap/2 (EIP-8189), both `GetBlockAccessLists`, and
+  verified against the header's `blockAccessListHash`: a peer can withhold one, not forge one. Where covered
   it is definitive, and it sees what no log shows: plain ETH transfers, ETH a
   contract sends, withdrawals, fees. An account the block only accessed (a
   read, a call, a zero-value transfer) is not a touch. A block whose BAL no
@@ -100,7 +100,8 @@ is non-empty:
   the push.
 - On a tick with a new head, it asks for the BALs of the kept blocks that commit
   to one and have none verified yet: newest first, 16 at most, from up to 3
-  snap/2 peers. Only blocks from the head where the run last started over
+  peers that speak eth/71 or snap/2. On an eth/71 session the request goes over
+  `eth`; otherwise over snap/2. Only blocks from the head where the run last started over
   count: a start, a resume after a pause, a head jump past the window. A
   host's proofs from then on anchor at that head or later, and an older proof
   meets a gap anyway. So a wake costs one BAL per new block, never a backfill of
@@ -145,25 +146,30 @@ Measured on Sepolia on 2026-10-21, watching WETH, USDC, `0x…dEaD` and
 
 ## Who serves block access lists
 
-Measured on Sepolia on 2026-10-21, 12 minutes, release build:
+Measured on Sepolia on 2026-10-21, release build:
 
-- **Nethermind** (v2.1.0 and v2.2.0) serves BALs over snap/2. Every BAL it
-  served decoded and hashed to its header's commitment.
-- No other client showed up as a snap/2 peer. For the first 6 minutes the pool
-  held none, and every block was an account gap.
-- Once a Nethermind peer was in the pool (never more than one at a time),
-  account coverage was complete: the backlog filled 16 blocks per head, and the
-  last 3 minutes reported no account gap at all.
+- **Over snap/2** (12 minutes, before eth/71): only Nethermind (v2.1.0 and
+  v2.2.0) served BALs. The pool held no snap/2 peer for the first 6 minutes,
+  and coverage came and went with the pool's churn. A pool that keeps and hunts
+  for a BAL server (part 3) found Nethermind twice in 10 minutes, but the peers
+  closed their sessions within a minute or two.
+- **Over eth/71** (10 minutes, part 4): every peer the pool admitted negotiated
+  eth/71 — 9 geth, 4 Nethermind and 2 enrscout sessions. geth (v1.17.7 and
+  v1.17.8) serves BALs over `eth` by default, and every BAL wanted was verified
+  in each of the 7 minute summaries, from up to 6 BAL-capable peers at once.
+  Account coverage was complete except, at times, the newest block for one
+  pass. eth/70 receipts read verified throughout.
 
-So account coverage on Sepolia today depends on the pool happening to hold a
-snap/2 Nethermind peer. The pool does not look for one.
+geth also implements snap/2, but behind `--snap.v2`, off by default and
+labelled "not safe on public networks". So on Sepolia today eth/71 is the
+source.
 
 ## Next
 
-- **Keep a BAL server in the pool.** While the watch list is non-empty, the pool
-  should prefer, or dial for, at least one snap/2 peer that has served a
-  verified BAL. Without one, account coverage comes and goes with the pool's
-  churn.
+- **Done in part 3:** while BALs are wanted, the pool keeps its one recent BAL
+  server (benched, never evicted, for 5 minutes after its last verified BAL). If
+  no pooled peer served one lately, it dials for a peer speaking eth/71 or snap/2,
+  one slot past the target at most. Since eth/71, the pool rarely needs the hunt.
 - **Mainnet and Gnosis** have no Amsterdam yet: their blocks commit to no BAL,
   and their account side stays a gap until the fork.
 - **Shared with #685:** the fetch-and-verify step is

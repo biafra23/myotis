@@ -339,6 +339,15 @@ impl Default for PoolConfig {
 /// cached peers held every slot through days of failing reads (2026-09-02).
 const READ_FAIL_BENCH: Duration = Duration::from_secs(30);
 
+/// How long a verified block access list keeps its server shielded from
+/// eviction while a host follows address activity (#691; [`bal_shielded`]).
+/// A server that starts withholding loses the shield this long after its
+/// last BAL.
+const BAL_SHIELD_FOR: Duration = Duration::from_secs(300);
+
+/// Dials the BAL hunt ([`bal_hunt_tick`]) launches per maintainer tick.
+const BAL_HUNT_DIALS: usize = 2;
+
 /// Consecutive verified-read failures that EVICT a live peer, freeing its
 /// slot for the maintainer to refill with a fresh candidate. Reset on any
 /// successful serve. A repeated outpace counts as a failure too (see
@@ -412,6 +421,8 @@ struct PooledPeer {
     /// Consecutive head probes this peer ANSWERED without the anchored head
     /// (see `probe_unknown_heads`); reset by any serve.
     probe_misses: u32,
+    /// When it last served a verified block access list (#691); `None` = never.
+    bal_served_at: Option<Instant>,
 }
 
 impl PooledPeer {
@@ -465,6 +476,34 @@ fn ladder_order(keys: &[LadderKey]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..keys.len()).collect();
     order.sort_by_key(|&i| keys[i]);
     order
+}
+
+/// Pure: whether a peer is spared an eviction as the pool's one BAL server
+/// (#691) — BALs are wanted, it served a verified one within
+/// [`BAL_SHIELD_FOR`], and no other pooled peer did. One peer at most, so a
+/// BAL server cannot hold more than one slot this way; and since a BAL is
+/// checked against its header's commitment, the worst a shielded peer can do
+/// is withhold, which ends the shield.
+fn bal_shielded(demand: bool, this_recent: bool, another_recent: bool) -> bool {
+    demand && this_recent && !another_recent
+}
+
+/// Pure: whether the BAL hunt dials this tick — BALs are wanted, the pool has
+/// not taken its one slot past the target yet, and no pooled peer served a
+/// verified BAL within [`BAL_SHIELD_FOR`]. Keyed on serving, not on the
+/// protocol: a peer that speaks eth/71 or snap/2 but serves none, or one caught
+/// forging (never asked again), does not switch the hunt off.
+fn bal_hunt_due(demand: bool, live: usize, target: usize, recent_server: bool) -> bool {
+    demand && live <= target && !recent_server
+}
+
+/// Pure: whether a peer the BAL hunt dialed may be pooled with `len` peers
+/// already in: below the target as any peer is, and into the one slot past
+/// it only if it speaks a BAL protocol. Checked at admission, under the lock
+/// that inserts the peer, since the dials of a tick (and one still in its
+/// handshake at the next) all count against the same slot.
+fn bal_only_admits(len: usize, target: usize, can_bal: bool) -> bool {
+    len < target || (len == target && can_bal)
 }
 
 /// Live verdict after a verified-read failure — pure. Returns
@@ -697,6 +736,18 @@ struct PoolInner {
     scarcity_cursor: std::sync::atomic::AtomicUsize,
     /// When the maintainer last logged a below-target re-dial.
     last_scarcity_log: Mutex<Option<Instant>>,
+    /// A host follows address activity on a chain whose blocks commit to
+    /// BALs (#691; [`PeerPool::set_bal_demand`]): the pool then keeps its one
+    /// recent BAL server ([`bal_shielded`]) and, holding no BAL-capable peer,
+    /// dials for one past the target ([`bal_hunt_tick`]).
+    bal_demand: std::sync::atomic::AtomicBool,
+    /// Addresses whose session this run negotiated neither eth/71 nor
+    /// snap/2: the BAL hunt does not dial them again.
+    bal_unable: std::sync::Mutex<HashSet<SocketAddr>>,
+    /// Where the BAL hunt's last walk of the discovery table stopped.
+    bal_hunt_cursor: std::sync::atomic::AtomicUsize,
+    /// When the BAL hunt last logged at INFO.
+    last_bal_hunt_log: std::sync::Mutex<Option<Instant>>,
     /// The host-owned fork watch (EIP-2124 stale-software detection), fed the
     /// fork id of every compatible peer's Status. Set once right after start —
     /// the handle owns it so it outlives this pool across pause/resume; unset
@@ -809,6 +860,8 @@ impl PoolInner {
                         && !pins.iter().any(|(a, n)| *a == c.addr || *n == c.pubkey)
                         && !tor_quarantined(c.pubkey, now)
                         && !reserve.was_released(&c.pubkey)
+                        // A BAL server is scarce (#691): kept dialable.
+                        && !cache.is_bal_server(c.addr)
                 })
                 .collect();
             picks.sort_by_key(|c| tor_reserve_draw(&c.pubkey));
@@ -948,6 +1001,7 @@ impl PoolInner {
         {
             let mut peers = self.peers.lock().await;
             let len = peers.len();
+            let shielded = self.shields_bal_server(&peers, addr, Instant::now());
             if let Some(p) = peers.iter_mut().find(|p| p.addr == addr) {
                 if served {
                     p.benched_until = None;
@@ -957,7 +1011,9 @@ impl PoolInner {
                     p.served = p.served.saturating_add(1);
                 } else {
                     let (fails, evict) = read_failure_verdict(p.read_fails, len);
-                    if evict {
+                    // The pool's one recent BAL server is benched, not evicted,
+                    // while BALs are wanted: state reads go elsewhere first.
+                    if evict && !shielded {
                         tracing::info!(%addr, fails,
                             client = ?log_client_id(&p.peer.peer_hello.client_id),
                             "evicting snap peer after repeated verified-read failures — \
@@ -1126,6 +1182,15 @@ impl PoolInner {
         self.peers.lock().await.iter().filter(|p| pred(p.is_benched(now), p.peer.coverage())).count()
     }
 
+    /// Whether the peer at `addr` is the pool's one recent BAL server and BALs
+    /// are wanted ([`bal_shielded`]), judged over `peers` (the locked list).
+    fn shields_bal_server(&self, peers: &[PooledPeer], addr: SocketAddr, now: Instant) -> bool {
+        let recent = |t: &Option<Instant>| t.is_some_and(|t| now.saturating_duration_since(t) < BAL_SHIELD_FOR);
+        let this = peers.iter().find(|p| p.addr == addr).is_some_and(|p| recent(&p.bal_served_at));
+        let other = peers.iter().any(|p| p.addr != addr && recent(&p.bal_served_at));
+        bal_shielded(self.bal_demand.load(Ordering::Relaxed), this, other)
+    }
+
     /// Evict a pooled peer as LAGGING — its own word, or its answers to the
     /// head probe, put it behind the anchored head — with the long backoff and
     /// no cache verdict (lagging is not a snap-quality judgement). Never the
@@ -1145,6 +1210,10 @@ impl PoolInner {
         let client = {
             let mut peers = self.peers.lock().await;
             if peers.len() <= 1 {
+                return;
+            }
+            if self.shields_bal_server(&peers, addr, Instant::now()) {
+                tracing::debug!(%addr, "not evicting the pool's one recent BAL server as lagging: {why}");
                 return;
             }
             let Some(p) = peers.iter().find(|p| p.addr == addr) else {
@@ -1210,7 +1279,9 @@ impl PoolInner {
 
     /// Dial one candidate through the full eth+snap handshake, updating the
     /// bookkeeping by outcome. `addr` is already in `attempted`.
-    async fn dial_one(self: &Arc<PoolInner>, addr: SocketAddr, pubkey: [u8; 64]) {
+    /// `bal_only`: the BAL hunt's dial ([`bal_hunt_tick`]) — a peer that
+    /// speaks neither eth/71 nor snap/2 is not pooled past the target.
+    async fn dial_one(self: &Arc<PoolInner>, addr: SocketAddr, pubkey: [u8; 64], bal_only: bool) {
         let conn = match RlpxConnection::dial_metered(Arc::clone(&self.key), addr, pubkey, Some(Arc::clone(&self.traffic))).await {
             Ok(conn) => conn,
             Err(e) => {
@@ -1269,6 +1340,32 @@ impl PoolInner {
         }
         match result {
             Ok(session) if session.snap => {
+                // A peer that speaks no BAL protocol (eth/71, snap/2) is
+                // skipped by later hunts, and loses any BAL mark it held.
+                let can_bal = session.snap_version.unwrap_or(0) >= 2 || session.eth_version >= 71;
+                if !can_bal {
+                    if let Ok(mut no_bal) = self.bal_unable.lock() {
+                        no_bal.insert(addr);
+                    }
+                    let mut cache = self.cache.lock().await;
+                    cache.record_bal_lost(addr);
+                    cache.flush();
+                }
+                let len = self.peers.lock().await.len();
+                if bal_only && !bal_only_admits(len, self.pool_cfg.target_snap_peers, can_bal) {
+                    // The hunt's one extra slot is taken, or is not for this
+                    // peer. A usable snap peer still: cached as one, cooled off.
+                    tracing::debug!(%addr, len, can_bal, "el dial: not pooling the BAL hunt's dial past the target");
+                    {
+                        let mut cache = self.cache.lock().await;
+                        cache.record_connect_success(addr);
+                        cache.add(addr, &pubkey, true);
+                        cache.flush();
+                    }
+                    self.record_backoff(addr, BackoffKind::Transient, now).await;
+                    self.attempted.lock().await.remove(&addr);
+                    return;
+                }
                 // Admission by announced head (#465): a peer whose fresh Status
                 // puts its head far below our anchored one is syncing or
                 // stalled — it would answer "0 headers" to every tip read and
@@ -1319,19 +1416,45 @@ impl PoolInner {
                     self.head_source.clone(),
                 ));
                 // Keep `addr` in `attempted` while connected — dropped by
-                // prune_closed when the peer later closes.
-                self.peers.lock().await.push(PooledPeer {
-                    addr,
-                    peer,
-                    admitted_at: Instant::now(),
-                    benched_until: None,
-                    read_fails: 0,
-                    outpaced: 0,
-                    served: 0,
-                    cache_confirmed,
-                    last_probe: None,
-                    probe_misses: 0,
-                });
+                // prune_closed when the peer later closes. A BAL hunt dial is
+                // admitted against the count under the SAME lock as the push:
+                // the check above read it under its own, and two hunt dials
+                // finishing together would both have seen the one free slot.
+                let admitted = {
+                    let mut peers = self.peers.lock().await;
+                    if bal_only && !bal_only_admits(peers.len(), self.pool_cfg.target_snap_peers, can_bal) {
+                        false
+                    } else {
+                        peers.push(PooledPeer {
+                            addr,
+                            peer,
+                            admitted_at: Instant::now(),
+                            benched_until: None,
+                            read_fails: 0,
+                            outpaced: 0,
+                            served: 0,
+                            cache_confirmed,
+                            last_probe: None,
+                            probe_misses: 0,
+                            bal_served_at: None,
+                        });
+                        true
+                    }
+                };
+                if !admitted {
+                    // The slot went to another hunt dial; the session closes
+                    // with its dropped peer. Cached and cooled off, as above.
+                    tracing::debug!(%addr, "el dial: the BAL hunt's slot was taken meanwhile — not pooling");
+                    {
+                        let mut cache = self.cache.lock().await;
+                        cache.record_connect_success(addr);
+                        cache.add(addr, &pubkey, true);
+                        cache.flush();
+                    }
+                    self.record_backoff(addr, BackoffKind::Transient, now).await;
+                    self.attempted.lock().await.remove(&addr);
+                    return;
+                }
                 // Persist this proven snap-capable peer for warm-start next run.
                 // `add` only marks the cache dirty for a genuinely new peer, so
                 // `flush` no-ops on a re-connect.
@@ -1438,6 +1561,10 @@ impl PeerPool {
             dns_seeder: std::sync::Mutex::new(None),
             scarcity_cursor: std::sync::atomic::AtomicUsize::new(0),
             last_scarcity_log: Mutex::new(None),
+            bal_demand: std::sync::atomic::AtomicBool::new(false),
+            bal_unable: std::sync::Mutex::new(HashSet::new()),
+            bal_hunt_cursor: std::sync::atomic::AtomicUsize::new(0),
+            last_bal_hunt_log: std::sync::Mutex::new(None),
             blacklist: Mutex::new(HashSet::new()),
             lingering: std::sync::Mutex::new(Vec::new()),
             cache: Mutex::new(cache),
@@ -1467,6 +1594,56 @@ impl PeerPool {
     /// `None` if the pool has none yet.
     pub async fn snap_peer(&self) -> Option<Arc<ManagedPeer>> {
         self.snap_peers().await.into_iter().next()
+    }
+
+    /// Say whether block access lists are wanted (#691): a host follows
+    /// address activity on a chain whose blocks commit to them. While on, the
+    /// pool keeps its one recent BAL server and hunts for a BAL-capable peer (eth/71 or
+    /// snap/2) when it holds none.
+    pub fn set_bal_demand(&self, wanted: bool) {
+        self.inner.bal_demand.store(wanted, Ordering::Relaxed);
+    }
+
+    /// The peer at `addr` served a verified block access list: shielded for
+    /// [`BAL_SHIELD_FOR`], asked first next time ([`Self::bal_peers`]), and
+    /// marked in the cache so a restart dials it first.
+    pub async fn record_bal_served(&self, addr: SocketAddr) {
+        if let Some(p) = self.inner.peers.lock().await.iter_mut().find(|p| p.addr == addr) {
+            p.bal_served_at = Some(Instant::now());
+        }
+        let mut cache = self.inner.cache.lock().await;
+        cache.record_bal_served(addr);
+        cache.flush();
+    }
+
+    /// The peer at `addr` was caught sending a BAL its header does not commit
+    /// to: no longer shielded or asked first, and its cache mark is dropped.
+    pub async fn forget_bal_server(&self, addr: SocketAddr) {
+        if let Some(p) = self.inner.peers.lock().await.iter_mut().find(|p| p.addr == addr) {
+            p.bal_served_at = None;
+        }
+        let mut cache = self.inner.cache.lock().await;
+        cache.record_bal_lost(addr);
+        cache.flush();
+    }
+
+    /// The pooled peers that speak a BAL protocol (eth/71 or snap/2,
+    /// [`ManagedPeer::speaks_bal`]), the ones that served a verified BAL most
+    /// recently first, then the read ladder's order.
+    pub async fn bal_peers(&self) -> Vec<Arc<ManagedPeer>> {
+        let served: HashMap<SocketAddr, Instant> = self
+            .inner
+            .peers
+            .lock()
+            .await
+            .iter()
+            .filter_map(|p| p.bal_served_at.map(|t| (p.addr, t)))
+            .collect();
+        let mut out: Vec<Arc<ManagedPeer>> =
+            self.snap_peers().await.into_iter().filter(|p| p.speaks_bal()).collect();
+        // Stable: unserved peers keep the ladder's order behind the servers.
+        out.sort_by_key(|p| std::cmp::Reverse(served.get(&p.addr()).copied()));
+        out
     }
 
     /// All live snap peers in READ-LADDER order (see [`LadderKey`]): peers
@@ -2286,6 +2463,16 @@ async fn try_dial_verdict(
     addr: SocketAddr,
     pubkey: [u8; 64],
 ) -> DialVerdict {
+    try_dial_with(inner, addr, pubkey, false).await
+}
+
+/// [`try_dial_verdict`], with `bal_only` passed to [`PoolInner::dial_one`].
+async fn try_dial_with(
+    inner: &Arc<PoolInner>,
+    addr: SocketAddr,
+    pubkey: [u8; 64],
+    bal_only: bool,
+) -> DialVerdict {
     if inner.blacklist.lock().await.contains(&pubkey) {
         return DialVerdict::Skipped;
     }
@@ -2334,7 +2521,7 @@ async fn try_dial_verdict(
         // wrong chain, lagging) is stamped here; a pooled one is live and
         // stamped again when its session ends.
         let _stamp = DirectContactOnDrop(pubkey);
-        inner2.dial_one(addr, pubkey).await;
+        inner2.dial_one(addr, pubkey, bal_only).await;
         drop(permit);
     });
     DialVerdict::Dialed
@@ -2522,15 +2709,18 @@ async fn backfill_served_headers(inner: &Arc<PoolInner>) {
 const MAX_LAG_EVICTIONS_PER_TICK: usize = 2;
 
 async fn evict_lagging_peers(inner: &Arc<PoolInner>) {
-    let victims: Vec<(SocketAddr, u64)> = inner
-        .peers
-        .lock()
-        .await
+    let now = Instant::now();
+    let peers = inner.peers.lock().await;
+    let victims: Vec<(SocketAddr, u64)> = peers
         .iter()
         .filter(|p| !p.peer.is_closed() && p.peer.coverage() == Coverage::Behind)
+        // A shielded BAL server would only take a slot of the per-tick budget
+        // and be spared (evict_lagging): left out, so others go at full speed.
+        .filter(|p| !inner.shields_bal_server(&peers, p.addr, now))
         .map(|p| (p.addr, p.peer.known_head().and_then(|h| h.lag()).unwrap_or(0)))
         .take(MAX_LAG_EVICTIONS_PER_TICK)
         .collect();
+    drop(peers);
     for (addr, lag) in victims {
         inner
             .evict_lagging(addr, &format!("its announced head is {lag} blocks behind the anchored one"))
@@ -2771,6 +2961,11 @@ async fn maintainer_loop(inner: Arc<PoolInner>) {
         if !dial_pins(&inner, due).await {
             return; // pool shutting down
         }
+        // A BAL server for the address-activity follower (#691), even past the
+        // target: by one slot, and only for a peer speaking eth/71 or snap/2.
+        if !bal_hunt_tick(&inner, live).await {
+            return; // pool shutting down
+        }
         // Discovered/cached peers are fungible — only fill UP TO the count target.
         if live >= inner.pool_cfg.target_snap_peers {
             continue;
@@ -2826,6 +3021,95 @@ fn spawn_dns_walk(inner: &Arc<PoolInner>, seeder: Arc<DnsSeeder>) {
             }
         }
     });
+}
+
+/// One tick of the BAL hunt (#691): while BALs are wanted and the pool
+/// holds no peer speaking eth/71 or snap/2, dial up to [`BAL_HUNT_DIALS`] candidates for one —
+/// first the cache's BAL servers, then discovery's table from where the last
+/// walk stopped — allowing ONE slot past the target, which only a peer speaking eth/71
+/// or snap/2 may take ([`PoolInner::dial_one`]'s `bal_only`). Peers seen
+/// speaking neither this run are skipped. No pooled peer is evicted for it,
+/// so the state-serving peers keep their slots. `false` when the pool is
+/// shutting down.
+async fn bal_hunt_tick(inner: &Arc<PoolInner>, live: usize) -> bool {
+    let target = inner.pool_cfg.target_snap_peers;
+    let now = Instant::now();
+    let recent_server = inner
+        .peers
+        .lock()
+        .await
+        .iter()
+        .any(|p| p.bal_served_at.is_some_and(|t| now.saturating_duration_since(t) < BAL_SHIELD_FOR));
+    if !bal_hunt_due(inner.bal_demand.load(Ordering::Relaxed), live, target, recent_server) {
+        return true;
+    }
+    let unable = inner.bal_unable.lock().map(|s| s.clone()).unwrap_or_default();
+    let mut candidates: Vec<(SocketAddr, [u8; 64])> = {
+        let cache = inner.cache.lock().await;
+        cache
+            .peers()
+            .into_iter()
+            .filter(|c| c.snap && cache.is_bal_server(c.addr))
+            .map(|c| (c.addr, c.pubkey))
+            .collect()
+    };
+    let table: Vec<TableEntry> = {
+        let handle = inner
+            .discovery_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        handle.map(|t| t.lock().unwrap_or_else(|e| e.into_inner()).all_peers()).unwrap_or_default()
+    };
+    let from_cache = candidates.len();
+    let cursor = if table.is_empty() { 0 } else { inner.bal_hunt_cursor.load(Ordering::Relaxed) % table.len() };
+    for i in rotated_indices(table.len(), cursor) {
+        let entry = &table[i];
+        if let (Some(addr), Some(pubkey)) = (to_socket_addr(&entry.ip, entry.tcp_port), to_pubkey(&entry.node_id)) {
+            candidates.push((addr, pubkey));
+        }
+    }
+    let mut dialed = 0usize;
+    let mut consumed_table = 0usize;
+    for (k, (addr, pubkey)) in candidates.into_iter().enumerate() {
+        if dialed >= BAL_HUNT_DIALS || inner.peers.lock().await.len() > target {
+            break;
+        }
+        if k >= from_cache {
+            consumed_table += 1;
+        }
+        if unable.contains(&addr) {
+            continue;
+        }
+        match try_dial_with(inner, addr, pubkey, true).await {
+            DialVerdict::Dialed => dialed += 1,
+            DialVerdict::Skipped => {}
+            DialVerdict::Shutdown => return false,
+        }
+    }
+    if !table.is_empty() {
+        inner.bal_hunt_cursor.store((cursor + consumed_table) % table.len(), Ordering::Relaxed);
+    }
+    if dialed > 0 {
+        let now = Instant::now();
+        let log_now = inner.last_bal_hunt_log.lock().is_ok_and(|mut last| {
+            let due = last.is_none_or(|t| now.saturating_duration_since(t) >= SCARCITY_LOG_INTERVAL);
+            if due {
+                *last = Some(now);
+            }
+            due
+        });
+        if log_now {
+            tracing::info!(
+                live,
+                target,
+                dialed,
+                known_without_bal = unable.len(),
+                "EL pool holds no peer that served a block access list lately while they are wanted — dialing for one past the target"
+            );
+        }
+    }
+    true
 }
 
 /// One below-target tick of the DNS seeding (#539, part 3): start a walk when
@@ -3920,6 +4204,34 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn only_the_one_recent_bal_server_is_shielded_and_only_while_bals_are_wanted() {
+        // (demand, this served recently, another pooled peer did)
+        assert!(bal_shielded(true, true, false));
+        assert!(!bal_shielded(false, true, false), "no demand, no shield");
+        assert!(!bal_shielded(true, false, false), "a peer that served none (lately) is evictable");
+        assert!(!bal_shielded(true, true, true), "with a second server, neither is irreplaceable");
+    }
+
+    #[test]
+    fn the_bal_hunt_dials_only_while_no_peer_serves_bals_and_one_slot_is_free() {
+        // (demand, live, target, a pooled peer served a BAL lately)
+        assert!(bal_hunt_due(true, 8, 8, false));
+        assert!(bal_hunt_due(true, 3, 8, false), "a short pool hunts too");
+        assert!(!bal_hunt_due(false, 8, 8, false), "no demand");
+        assert!(!bal_hunt_due(true, 9, 8, false), "the extra slot is taken");
+        assert!(!bal_hunt_due(true, 8, 8, true), "a peer served lately");
+    }
+
+    #[test]
+    fn a_bal_hunt_dial_takes_one_slot_past_the_target_and_only_for_a_bal_server() {
+        // (peers already in, target, the session speaks eth/71 or snap/2)
+        assert!(bal_only_admits(7, 8, false), "below the target, any snap peer");
+        assert!(bal_only_admits(8, 8, true), "the one extra slot, for a BAL server");
+        assert!(!bal_only_admits(8, 8, false), "not for a peer that cannot serve one");
+        assert!(!bal_only_admits(9, 8, true), "never a second extra slot");
+    }
 
     #[test]
     fn to_socket_addr_validation() {
