@@ -29,6 +29,8 @@ import io.myotis.engine.capi.myotis_import_log_index_files
 import io.myotis.engine.capi.myotis_log_index_status_json
 import io.myotis.engine.capi.myotis_read_stats_json
 import io.myotis.engine.capi.myotis_set_log_index_config
+import io.myotis.engine.capi.myotis_set_activity_watch
+import io.myotis.engine.capi.myotis_address_activity_json
 import io.myotis.engine.capi.myotis_send_raw_transaction_json
 import io.myotis.engine.capi.myotis_set_boot_enodes
 import io.myotis.engine.capi.myotis_init
@@ -178,6 +180,19 @@ object RustEngine {
     fun logIndexStatusJson(handle: Long): String {
         requireAbi()
         return take(myotis_log_index_status_json(handle)) ?: """{"enabled":false,"logCount":0,"entries":[]}"""
+    }
+
+    /** Install the address-activity watch list (#691); false = refused/unavailable. */
+    fun setActivityWatch(handle: Long, configJson: String): Boolean {
+        requireAbi()
+        return myotis_set_activity_watch(handle, configJson)
+    }
+
+    /** Address-activity JSON (#691), or an `{"error":...}` object; null only defensively,
+     *  when no C string came back. */
+    fun addressActivityJson(handle: Long, afterBlock: Long): String? {
+        requireAbi()
+        return take(myotis_address_activity_json(handle, afterBlock))
     }
 
     /** eth_getLogs over the watch-list index: the log array, or an `{"error":...}`

@@ -1737,6 +1737,40 @@ pub(crate) const FEE_HISTORY_MAX_BLOCKS: u64 = 10;
 /// within a second of the head for the price of a lock read.
 const FEE_FOLLOW_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How often the address-activity follower (#691) checks for a new anchored
+/// head. A tick with no new head is a lock read; one with a new head fetches
+/// the headers above the kept top, usually one or two.
+const ACTIVITY_FOLLOW_TICK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Block access lists one follower pass asks for, newest first: a new head
+/// usually wants one, and a backlog (a start, a peer that withheld) drains at
+/// this rate per head rather than in one large request.
+const ACTIVITY_BALS_PER_PASS: usize = 16;
+
+/// Peers speaking eth/71 or snap/2 one pass asks, best first, before leaving the rest for the
+/// next head: most peers may not serve BALs at all, and a pass must stay cheap.
+const ACTIVITY_BAL_PEERS: usize = 3;
+
+/// How often the follower logs its block-access-list summary at INFO.
+const ACTIVITY_BAL_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What the activity follower's BAL passes did since the last summary: how
+/// many BALs a network's peers actually serve is not known in advance,
+/// and a summary of one pass misses a peer that served between two.
+#[derive(Default)]
+struct ActivityBalStats {
+    since: Option<Instant>,
+    passes: u64,
+    /// The distinct blocks wanted, and of those, verified: a block no peer
+    /// serves is wanted again at every pass, and is counted once.
+    wanted: std::collections::BTreeSet<u64>,
+    verified: std::collections::BTreeSet<u64>,
+    /// The most BAL-capable peers (eth/71 or snap/2) one pass found in the pool.
+    bal_peers_max: usize,
+    /// The client ids of the peers that served a verified BAL.
+    serving: std::collections::BTreeSet<String>,
+}
+
 /// Budget for one background fee refresh (estimate or one feeHistory shape).
 const FEE_REFRESH_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -2107,6 +2141,20 @@ pub struct ElReader {
     /// The fee follower (see [`Self::ensure_fee_follower`]): refreshes the fee
     /// reads a wallet is polling on every new head, off the request path.
     fee_follow_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The address-activity watch list and the verified blocks kept for it
+    /// (#691; [`crate::el::activity`]). In memory only: it dies with the
+    /// reader, and the host's stash re-applies the list on resume.
+    activity: std::sync::Mutex<crate::el::activity::ActivityState>,
+    /// The activity follower (see [`Self::ensure_activity_follower`]).
+    activity_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The follower's BAL pass, when one runs (see [`Self::spawn_activity_bal_pass`]).
+    activity_bal_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Peers caught serving a BAL that does not hash to its header's
+    /// commitment: never asked for one again by this reader.
+    activity_bal_liars: std::sync::Mutex<std::collections::HashSet<std::net::SocketAddr>>,
+    /// The activity follower's block-access-list counters since its last
+    /// INFO summary ([`ACTIVITY_BAL_LOG_EVERY`]).
+    activity_bal_stats: std::sync::Mutex<ActivityBalStats>,
     /// Permits for the fee computes a read left running ([`FEE_COMPUTES_MAX`]).
     fee_compute_permits: Arc<tokio::sync::Semaphore>,
     /// The pre-broadcast check's detached account reads in flight (#531;
@@ -2328,6 +2376,11 @@ impl ElReader {
             fee_estimate_compute: Arc::new(tokio::sync::Mutex::new(())),
             fee_fill: tokio::sync::Mutex::new(()),
             fee_follow_task: std::sync::Mutex::new(None),
+            activity: std::sync::Mutex::new(crate::el::activity::ActivityState::default()),
+            activity_task: std::sync::Mutex::new(None),
+            activity_bal_task: std::sync::Mutex::new(None),
+            activity_bal_liars: std::sync::Mutex::new(std::collections::HashSet::new()),
+            activity_bal_stats: std::sync::Mutex::new(ActivityBalStats::default()),
             fee_compute_permits: Arc::new(tokio::sync::Semaphore::new(FEE_COMPUTES_MAX)),
             send_check_permits: Arc::new(tokio::sync::Semaphore::new(send_check::DETACHED_READS_MAX)),
             fee_stored: tokio::sync::Notify::new(),
@@ -7987,6 +8040,331 @@ impl ElReader {
         }
     }
 
+    /// Apply an address-activity push (#691; see [`crate::el::activity`]):
+    /// drop `unwatch`, add `watch`, and run the follower while the list is
+    /// non-empty. `Err` = refused, nothing changed.
+    pub fn set_activity_watch(
+        self: &Arc<Self>,
+        watch: &[[u8; 20]],
+        unwatch: &[[u8; 20]],
+    ) -> Result<(), String> {
+        let active = {
+            let mut state = self.activity.lock().map_err(|_| "activity lock poisoned".to_string())?;
+            state.apply(watch, unwatch)?;
+            // Under the activity lock, as the follower sets it: the last word
+            // on the demand is the last change to the list.
+            self.pool.set_bal_demand(state.is_active() && state.top_commits_to_bal());
+            state.is_active()
+        };
+        if active {
+            self.ensure_activity_follower();
+        }
+        Ok(())
+    }
+
+    /// The watched addresses' activity in `(after, head]`, from what the
+    /// follower has kept: no I/O. `None` before the beacon anchors a head.
+    ///
+    /// A kept block counts as covered only when it is known to lead to the
+    /// anchored head: it is that head, or the anchor's ring of recent heads
+    /// links it to it. Between a reorg and the follower's next tick the kept
+    /// run can be on the fork the head left, and its blocks are then a gap.
+    ///
+    /// Also keeps the follower running while the list is non-empty: a tick
+    /// that saw the list empty can exit just as a push refills it, and the
+    /// host's polls are what bring it back.
+    pub fn activity_report(self: &Arc<Self>, after: u64) -> Option<crate::el::activity::ActivityReport> {
+        let (head, head_hash) = self.anchored_head().ok()?;
+        let is_ancestor = |number: u64, hash: &[u8; 32]| {
+            (number == head && *hash == head_hash)
+                || (number < head
+                    && self.anchor.recent_head_at(number).is_some_and(|r| r.linked && r.hash == *hash))
+        };
+        let (report, active) = {
+            let state = self.activity.lock().ok()?;
+            (state.report(after, head, is_ancestor), state.is_active())
+        };
+        if active {
+            self.ensure_activity_follower();
+        }
+        Some(report)
+    }
+
+    /// The activity watch list as it stands, ascending.
+    pub fn activity_watching(&self) -> Vec<[u8; 20]> {
+        self.activity.lock().map(|s| s.watching()).unwrap_or_default()
+    }
+
+    /// Spawn (or keep) the activity follower. Idempotent; a no-op outside a
+    /// tokio runtime. Holds only a WEAK reference, like the fee follower, so
+    /// it never blocks the host's teardown; `stop` aborts it. It ends itself
+    /// once the watch list is empty, and the next non-empty push respawns it.
+    fn ensure_activity_follower(self: &Arc<Self>) {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if *self.request_shutdown.borrow() {
+            return;
+        }
+        let Ok(mut slot) = self.activity_task.lock() else {
+            return;
+        };
+        if slot.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        *slot = Some(rt.spawn(async move {
+            let mut tick = tokio::time::interval(ACTIVITY_FOLLOW_TICK);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let Some(reader) = weak.upgrade() else {
+                    return;
+                };
+                if !reader.activity_follow_tick().await {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// One follower pass: bring the kept run up to the anchored head.
+    /// `false` = the watch list is empty, stop following.
+    ///
+    /// Usually the window is `[top ..= head]`, a header or two: its lowest
+    /// header must be the kept top, by hash, and the parent links then vouch
+    /// for every kept block below it. When it is not (a reorg reached the
+    /// top), or nothing is kept, or the head jumped past [`activity::WINDOW`],
+    /// one full window is fetched and installed; whatever it cannot link to
+    /// is dropped, and the report shows it as a gap. A failed fetch keeps
+    /// what is kept: the blocks above it are a gap until a later tick. (A
+    /// tip-lag failure's deferred strikes are forgiven, never banked: the
+    /// next tick asks again against a newer anchor, which is the retry they
+    /// are deferred for.)
+    async fn activity_follow_tick(self: &Arc<Self>) -> bool {
+        use crate::el::activity::{BlockRecord, WINDOW};
+        let Ok(top) = self.activity.lock().map(|s| {
+            if !s.is_active() {
+                // Following ends: the pool stops keeping and hunting for a BAL
+                // server — under the lock, so a push refilling the list wins.
+                self.pool.set_bal_demand(false);
+            }
+            s.is_active().then(|| s.top())
+        }) else {
+            return false;
+        };
+        let Some(top) = top else {
+            return false;
+        };
+        if *self.request_shutdown.borrow() {
+            return false;
+        }
+        let Ok(head) = self.anchored_head() else {
+            return true;
+        };
+        if top == Some(head) {
+            return true;
+        }
+        let deep_from = head.0.saturating_sub(WINDOW - 1);
+        let shallow_from = top.and_then(|(t, _)| (t < head.0 && head.0 - t < WINDOW).then_some(t));
+        let mut window = None;
+        if let Some(from) = shallow_from {
+            match self.head_anchored_header_window(from, head).await {
+                Ok(w) if w.first().map(|h| (h.header.number, h.hash)) == top => window = Some(w),
+                Ok(_) => tracing::debug!(head = head.0, "activity: the kept top is not canonical any more; refetching the window"),
+                Err(e) => {
+                    tracing::debug!(error = %pool_read_error_text(&e), "activity: header window failed");
+                    return true;
+                }
+            }
+        }
+        let window = match window {
+            Some(w) => w,
+            None => match self.head_anchored_header_window(deep_from, head).await {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::debug!(error = %pool_read_error_text(&e), "activity: header window failed");
+                    return true;
+                }
+            },
+        };
+        let segment: Vec<BlockRecord> = window
+            .into_iter()
+            .filter_map(|vh| {
+                let bloom: [u8; 256] = vh.header.logs_bloom.as_slice().try_into().ok()?;
+                Some(BlockRecord {
+                    number: vh.header.number,
+                    hash: vh.hash,
+                    parent_hash: vh.header.parent_hash,
+                    bloom: Box::new(bloom),
+                    bal_hash: vh.header.block_access_list_hash,
+                    account: None,
+                    bal_undecodable: false,
+                })
+            })
+            .collect();
+        if let Ok(mut state) = self.activity.lock() {
+            // A push that emptied the list while this tick fetched must not be
+            // refilled: its records were cleared on purpose.
+            if state.is_active() {
+                state.install(segment, head.0);
+            }
+            // The pool keeps (and hunts for) a BAL server only where BALs
+            // exist; set under the lock, like a push's.
+            self.pool.set_bal_demand(state.is_active() && state.top_commits_to_bal());
+        }
+        self.spawn_activity_bal_pass();
+        true
+    }
+
+    /// Start a BAL pass ([`Self::activity_fetch_bals`]) unless one runs: its
+    /// requests can take a peer timeout each, and the header follow — the log
+    /// coverage — must never wait on them. One at a time, so a slow pass is
+    /// not stacked on at every head.
+    fn spawn_activity_bal_pass(self: &Arc<Self>) {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if *self.request_shutdown.borrow() {
+            return;
+        }
+        let Ok(mut slot) = self.activity_bal_task.lock() else {
+            return;
+        };
+        if slot.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        *slot = Some(rt.spawn(async move {
+            if let Some(reader) = weak.upgrade() {
+                reader.activity_fetch_bals().await;
+            }
+        }));
+    }
+
+    /// The BAL step of a follower pass with a new head: fetch the access lists
+    /// of the kept blocks that commit to one and have none verified yet,
+    /// newest first ([`ACTIVITY_BALS_PER_PASS`]), from up to
+    /// [`ACTIVITY_BAL_PEERS`] peers speaking eth/71 or snap/2, each list verified against its
+    /// header's `blockAccessListHash` ([`ManagedPeer::get_block_access_lists`]: eth/71, else snap/2).
+    /// A block no peer served stays an account gap and is asked for again at
+    /// the next head. A peer that serves none is not struck: serving BALs is
+    /// optional, and a peer that does not is no worse at state
+    /// reads. One that sends a BAL its header does not commit to is lying,
+    /// provably: its verified entries are kept, and it is never asked again
+    /// ([`ElReader::activity_bal_liars`]).
+    async fn activity_fetch_bals(&self) {
+        let Ok(wanted) = self.activity.lock().map(|s| s.bals_wanted(ACTIVITY_BALS_PER_PASS)) else {
+            return;
+        };
+        if wanted.is_empty() {
+            return;
+        }
+        let liars = self.activity_bal_liars.lock().map(|l| l.clone()).unwrap_or_default();
+        // Recent BAL servers first, so the per-pass cap reaches them.
+        let bal_capable: Vec<Arc<ManagedPeer>> =
+            self.pool.bal_peers().await.into_iter().filter(|p| !liars.contains(&p.addr())).collect();
+        let mut missing = wanted.clone();
+        let mut asked = 0usize;
+        let mut serving: Vec<String> = Vec::new();
+        for peer in bal_capable.iter().take(ACTIVITY_BAL_PEERS) {
+            if missing.is_empty() {
+                break;
+            }
+            asked += 1;
+            let blocks: Vec<([u8; 32], [u8; 32])> = missing.iter().map(|(_, hash, bal)| (*hash, *bal)).collect();
+            let entries = match peer.get_block_access_lists(&blocks).await {
+                Ok((entries, forged)) => {
+                    if forged {
+                        tracing::warn!(
+                            peer = %peer.addr(),
+                            client = ?crate::el::pool::log_client_id(&peer.peer_hello.client_id),
+                            "activity: a peer sent a block access list its header does not commit to; not asking it again"
+                        );
+                        if let Ok(mut l) = self.activity_bal_liars.lock() {
+                            l.insert(peer.addr());
+                        }
+                        self.pool.forget_bal_server(peer.addr()).await;
+                    }
+                    entries
+                }
+                Err(e) => {
+                    tracing::debug!(peer = %peer.addr(), error = %e, "activity: block access lists failed");
+                    continue;
+                }
+            };
+            let mut still = Vec::new();
+            let mut got = 0usize;
+            for (want, entry) in missing.into_iter().zip(entries) {
+                let changed = entry.map(|raw| crate::el::snap::messages::bal_changed_accounts(&raw));
+                match changed {
+                    Some(Ok(changed)) => {
+                        got += 1;
+                        if let Ok(mut state) = self.activity.lock() {
+                            state.set_account(want.0, &want.1, changed);
+                        }
+                    }
+                    Some(Err(e)) => {
+                        // It hashed to the header's commitment, so this is the
+                        // decoder's limit, not the peer's lie, and the same for
+                        // every peer: marked, never fetched again, a gap.
+                        tracing::warn!(block = want.0, error = %e.0, "activity: a verified block access list did not decode; the block stays an account gap");
+                        if let Ok(mut state) = self.activity.lock() {
+                            state.set_bal_undecodable(want.0, &want.1);
+                        }
+                    }
+                    None => still.push(want),
+                }
+            }
+            if got > 0 {
+                serving.push(crate::el::pool::log_client_id(&peer.peer_hello.client_id));
+                self.pool.record_bal_served(peer.addr()).await;
+            }
+            missing = still;
+        }
+        tracing::debug!(
+            wanted = wanted.len(),
+            verified = wanted.len() - missing.len(),
+            asked,
+            bal_peers = bal_capable.len(),
+            "activity: block access lists pass"
+        );
+        let Ok(mut stats) = self.activity_bal_stats.lock() else {
+            return;
+        };
+        let since = *stats.since.get_or_insert_with(Instant::now);
+        stats.passes += 1;
+        stats.wanted.extend(wanted.iter().map(|(n, _, _)| *n));
+        stats.verified.extend(wanted.iter().filter(|w| !missing.contains(w)).map(|(n, _, _)| *n));
+        stats.bal_peers_max = stats.bal_peers_max.max(bal_capable.len());
+        stats.serving.extend(serving);
+        if since.elapsed() >= ACTIVITY_BAL_LOG_EVERY {
+            let done = std::mem::take(&mut *stats);
+            tracing::info!(
+                passes = done.passes,
+                wanted = done.wanted.len(),
+                verified = done.verified.len(),
+                bal_peers_max = done.bal_peers_max,
+                serving = ?done.serving,
+                "activity: block access lists in the last minute"
+            );
+        }
+    }
+
+    /// Abort and await the activity follower (teardown; see [`Self::stop`]).
+    async fn stop_activity_follower(&self) {
+        for slot in [&self.activity_task, &self.activity_bal_task] {
+            let handle = match slot.lock() {
+                Ok(mut t) => t.take(),
+                Err(_) => None,
+            };
+            if let Some(h) = handle {
+                h.abort();
+                let _ = h.await;
+            }
+        }
+    }
+
     /// Verified `eth_feeHistory` (the Java `rpcFeeHistory` twin). `newest_block`
     /// `None` = the latest tag (the beacon-anchored head); `reward_percentiles`
     /// `None` omits the reward matrix (its per-block cost is a verified body +
@@ -9331,6 +9709,7 @@ impl ElReader {
         // Stop producers before collecting/draining registered work.
         self.stop_log_index_appender().await;
         self.stop_fee_follower().await;
+        self.stop_activity_follower().await;
         // Log the window so far: a pause or stop would otherwise lose it
         // (#532 review). A read the stop cancelled is not in it.
         log_fee_summary(self.with_fee_cache(|c| c.stats.flush(Instant::now())).ok().flatten());
@@ -9461,6 +9840,13 @@ impl WindowTop {
         } else {
             "the finalized block"
         }
+    }
+}
+
+/// The message of a pool read's failure, for a log line.
+fn pool_read_error_text(e: &PoolReadError) -> &str {
+    match e {
+        PoolReadError::Fatal(error) | PoolReadError::TipLag { error, .. } => error,
     }
 }
 

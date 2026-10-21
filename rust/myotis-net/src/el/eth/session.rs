@@ -1,4 +1,4 @@
-//! The eth/66-69 session: Hello capability negotiation, the Status handshake
+//! The eth/66-71 session: Hello capability negotiation, the Status handshake
 //! with the network compatibility gate, and request/response correlation over
 //! a FRAMED [`RlpxConnection`] (EL-A5), twin of the Java `EthHandler` state
 //! machine (`AWAITING_HELLO → AWAITING_STATUS → READY`).
@@ -28,7 +28,7 @@ use crate::el::snap::messages as snap;
 use myotis_core::trie::{AccountLeaf, EMPTY_CODE_HASH, EMPTY_TRIE_ROOT};
 
 /// eth versions we advertise (highest-common wins, floor 66).
-const OUR_ETH_VERSIONS: &[u64] = &[66, 67, 68, 69];
+const OUR_ETH_VERSIONS: &[u64] = &[66, 67, 68, 69, 70, 71];
 const MIN_ETH_VERSION: u64 = 66;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -73,7 +73,7 @@ impl EthConfig {
 /// snap flow over a Tor `DataStream` — see `docs/privacy-and-tor.md` §3/§4.
 pub struct EthSession<S = TcpStream> {
     conn: RlpxConnection<S>,
-    /// Negotiated eth version (66-69).
+    /// Negotiated eth version (66-71).
     pub eth_version: u64,
     /// Whether a snap version is shared with the peer (drives EL-A6) — i.e.
     /// `snap_version.is_some()`.
@@ -221,7 +221,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
             .map_err(|_| "eth handshake timed out".to_string())?
     }
 
-    /// Every eth/66-69 request/response carries a request id. (The eth/69
+    /// Every eth/66-71 request/response carries a request id. (The eth/69
     /// changes are the Status shape and bloomless receipts — NOT the request-id
     /// wrapper: the Java `EthHandler` decodes all versions with the reqId path,
     /// so the "eth/69 drops reqId" note in doc 02 §6.6 is inaccurate.)
@@ -727,7 +727,7 @@ mod tests {
     }
 
     /// Run our handshake against a peer that answers our Hello with its own
-    /// (eth/66-69 + snap/1-2, so eth/69 and snap/2 are negotiated) and sends `script` once our
+    /// (eth/66-71 + snap/1-2, so eth/71 and snap/2 are negotiated) and sends `script` once our
     /// Status arrives. Returns our outcome (negotiated eth and snap versions, the peer's
     /// Status) and the codes of every frame we sent after our Status.
     async fn handshake_against(
@@ -768,7 +768,9 @@ mod tests {
         let (outcome, answered) =
             handshake_against(vec![(P2P_PING, vec![0xc0]), (messages::STATUS, status)]).await;
         let (eth_version, snap, peer_status) = outcome.expect("handshake completes");
-        assert_eq!((eth_version, snap), (69, Some(2)));
+        // Against our own Hello the highest shared version is eth/71, which
+        // keeps eth/69's Status.
+        assert_eq!((eth_version, snap), (71, Some(2)));
         assert_eq!(peer_status.network_id, NETWORK_ID);
         assert_eq!(peer_status.latest_block, Some(100));
         assert_eq!(answered, vec![P2P_PONG]);

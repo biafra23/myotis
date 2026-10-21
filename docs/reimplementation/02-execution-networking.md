@@ -255,7 +255,7 @@ to avoid event-loop contention.
 
 ---
 
-## 6. The `eth` sub-protocol (eth/66–69)
+## 6. The `eth` sub-protocol (eth/66–71)
 
 ### 6.1 Handler state machine
 
@@ -265,9 +265,15 @@ handshake timeout that closes the connection if READY isn't reached.
 ### 6.2 Capability negotiation (Hello)
 
 Hello RLP: `[protocolVersion(5), clientId, [[capName, capVersion], …], listenPort, nodeId(64)]`.
-Advertise `eth/66, eth/67, eth/68, eth/69, snap/1, snap/2` (capabilities ascending). Negotiate the highest
-mutually supported eth version (`{66,67,68}` floor 66 — it introduced request-ids and shares the
-Status/snap layout with 67/68; ≤65 rejected; 69 supported). snap is negotiated the same way: the
+Advertise `eth/66, eth/67, eth/68, eth/69, eth/70, eth/71, snap/1, snap/2` (capabilities
+ascending; the Java engine stops at eth/69). Negotiate the highest mutually supported eth version
+(`{66,67,68}` floor 66 — it introduced request-ids and shares the Status/snap layout with 67/68;
+≤65 rejected; 69 supported; 70 and 71 keep eth/69's Status). eth/70 (EIP-7975) changes only the
+receipts pair: `GetReceipts [reqId, firstBlockReceiptIndex, [hash…]]`, `Receipts [reqId,
+lastBlockIncomplete, [[receipt…]…]]` — a cut tail block is dropped and resumed after, a cut lone
+block continued from the receipts held. eth/71 (EIP-8159) adds `GetBlockAccessLists 0x12` /
+`BlockAccessLists 0x13` (absolute `0x22`/`0x23`; snap/2's response shape, `0x80` = unavailable),
+each BAL checked against the header's `blockAccessListHash`. snap is negotiated the same way: the
 connection runs the highest snap version both sides advertise (RLPx runs one version per
 capability name), so a peer offering only `snap/1` or only `snap/2` is a snap peer either way.
 
@@ -335,7 +341,8 @@ from a state root).
 ### 7.1 Dynamic message codes
 
 snap base = `0x10 + eth-protocol-length`. eth/67–68 length 17 → base `0x21`; eth/69 length 18
-(adds BlockRangeUpdate `0x11`) → base `0x22`. Offsets from base:
+(adds BlockRangeUpdate `0x11`) → base `0x22`; eth/70 length 18 → `0x22`; eth/71 length 20 (adds
+the BAL pair `0x12`/`0x13`) → base `0x24`. Offsets from base:
 `0x00 GetAccountRange / 0x01 AccountRange, 0x02 GetStorageRanges / 0x03 StorageRanges,
 0x04 GetByteCodes / 0x05 ByteCodes, 0x06 GetTrieNodes / 0x07 TrieNodes` (snap/1 only),
 `0x08 GetBlockAccessLists / 0x09 BlockAccessLists` (snap/2 only). snap/2's capability is 10

@@ -5,7 +5,7 @@
 //! Snap uses `GetAccountRange`/`GetStorageRanges` (which return full
 //! root-to-leaf boundary proofs), NOT `GetTrieNodes`. Message codes are
 //! DYNAMIC: `base = 0x10 + eth_protocol_length` (17 → base 0x21 for eth/67-68,
-//! 18 → base 0x22 for eth/69); see [`SnapCodes`].
+//! 18 → base 0x22 for eth/69-70, 20 → base 0x24 for eth/71); see [`SnapCodes`].
 //!
 //! Both snap/1 and snap/2 (EIP-8189) are spoken. snap/2 leaves ids 0x00-0x05
 //! — every request this engine sends — byte-for-byte unchanged; it retires
@@ -48,9 +48,15 @@ pub struct SnapCodes {
 
 impl SnapCodes {
     /// `base = 0x10 + eth_protocol_length`. eth/67-68 has length 17 (base
-    /// 0x21); eth/69 adds BlockRangeUpdate → length 18 (base 0x22).
+    /// 0x21); eth/69 adds BlockRangeUpdate → length 18 (base 0x22); eth/70
+    /// changes no message count; eth/71 adds GetBlockAccessLists /
+    /// BlockAccessLists → length 20 (base 0x24).
     pub fn negotiated(eth_version: u64, snap_version: u64) -> SnapCodes {
-        let base = if eth_version >= 69 { 0x22 } else { 0x21 };
+        let base = match eth_version {
+            ..=68 => 0x21,
+            69 | 70 => 0x22,
+            _ => 0x24,
+        };
         SnapCodes {
             snap_version,
             get_account_range: base,
@@ -352,6 +358,82 @@ pub fn decode_byte_codes(rlp_bytes: &[u8], requested: usize) -> Result<(u64, Vec
     Ok((request_id, codes))
 }
 
+/// `GetBlockAccessLists` (snap/2, EIP-8189): `[reqId, [blockHash, …], bytes]`,
+/// `bytes` the response's soft size limit.
+pub fn encode_get_block_access_lists(request_id: u64, block_hashes: &[[u8; 32]], response_bytes: u64) -> Vec<u8> {
+    encode_get_byte_codes(request_id, block_hashes, response_bytes)
+}
+
+/// Decode `BlockAccessLists: [reqId, [bal, …]]` → `(reqId, entries)` for a
+/// request of `requested` block hashes. Entries answer the request in order,
+/// possibly fewer of them (the tail cut); each is the BAL's exact RLP (an RLP
+/// list, kept raw for the caller to hash against the header's
+/// `blockAccessListHash`), or `None` for the spec's "unavailable" marker, the
+/// empty string `0x80`. Any other string is a protocol violation, not an
+/// unavailable BAL. At most one entry more than asked for is kept (#454).
+pub fn decode_block_access_lists(
+    rlp_bytes: &[u8],
+    requested: usize,
+) -> Result<(u64, Vec<Option<Vec<u8>>>), CoreError> {
+    let mut items = rlp::View::new(rlp_bytes)?.as_list()?;
+    let Some(request_id) = items.next() else {
+        return Err(CoreError("BlockAccessLists: empty".into()));
+    };
+    let request_id = request_id.as_u64()?;
+    let mut entries = Vec::new();
+    if let Some(list) = items.next().filter(rlp::View::is_list) {
+        for (i, entry) in list.as_list()?.enumerate() {
+            let decoded = if entry.is_list() {
+                Some(entry.raw().to_vec())
+            } else if entry.as_bytes()?.is_empty() {
+                None
+            } else {
+                return Err(CoreError("BlockAccessLists: an entry is neither a list nor 0x80".into()));
+            };
+            if i < kept(requested) {
+                entries.push(decoded);
+            }
+        }
+    }
+    Ok((request_id, entries))
+}
+
+/// The accounts a block access list (EIP-7928) records a state change for:
+/// a storage write, or a balance, nonce or code change. An account the block
+/// only accessed (a read, a call, a zero-value transfer's recipient) is listed
+/// with empty change lists and is not returned. Ascending, as the BAL orders
+/// its accounts. `raw` is the BAL's RLP, `[[address, storage_changes,
+/// storage_reads, balance_changes, nonce_changes, code_changes], …]`; a shape
+/// other than that is an error, never a partial answer.
+pub fn bal_changed_accounts(raw: &[u8]) -> Result<Vec<[u8; 20]>, CoreError> {
+    let mut out = Vec::new();
+    for account in rlp::View::new(raw)?.as_list()? {
+        let mut fields = account.as_list()?;
+        let address = fields.next().ok_or_else(|| CoreError("BAL: an account without an address".into()))?;
+        let mut a = [0u8; 20];
+        a.copy_from_slice(address.as_fixed_bytes(20)?);
+        let mut changed = false;
+        // storage_changes, storage_reads, balance_changes, nonce_changes, code_changes
+        for (k, name) in ["storage_changes", "storage_reads", "balance_changes", "nonce_changes", "code_changes"]
+            .into_iter()
+            .enumerate()
+        {
+            let list = fields.next().ok_or_else(|| CoreError(format!("BAL: an account without {name}")))?;
+            let non_empty = list.as_list()?.next().is_some();
+            if k != 1 && non_empty {
+                changed = true;
+            }
+        }
+        if fields.next().is_some() {
+            return Err(CoreError("BAL: an account with more than six fields".into()));
+        }
+        if changed {
+            out.push(a);
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Empty responders (a wallet answers inbound snap Get* with empty responses so
 // peers don't time out — doc 02 §7.3). Encoders live here; WIRING them into an
@@ -403,6 +485,135 @@ mod tests {
     use super::*;
     use myotis_core::keccak::keccak256;
 
+    fn bal_account(address: u8, storage: bool, reads: bool, balance: bool, nonce: bool, code: bool) -> Item {
+        let change = |on: bool, value: Item| if on { Item::List(vec![value]) } else { Item::List(vec![]) };
+        let idx_value = |v: u8| Item::List(vec![Item::Bytes(vec![1]), Item::Bytes(vec![v])]);
+        Item::List(vec![
+            Item::Bytes(vec![address; 20]),
+            change(storage, Item::List(vec![Item::Bytes(vec![7]), Item::List(vec![idx_value(9)])])),
+            change(reads, Item::Bytes(vec![8])),
+            change(balance, idx_value(5)),
+            change(nonce, idx_value(1)),
+            change(code, Item::List(vec![Item::Bytes(vec![1]), Item::Bytes(vec![0x60, 0x00])])),
+        ])
+    }
+
+    fn hex20(hex: &str) -> [u8; 20] {
+        let mut out = [0u8; 20];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
+        }
+        out
+    }
+
+    /// A real BAL — Sepolia block 11960753, served by a Nethermind peer over
+    /// snap/2 — with its header. Unlike the fixtures above it does not come
+    /// from this file's encoder, so it pins what each position of an account
+    /// entry means against the network, through facts that hold whatever
+    /// the decoder assumes: the header commits to these exact bytes, the
+    /// EIP-4788 and EIP-2935 system contracts write storage in every block
+    /// (`storage_changes`), and the fee recipient's balance changes in a block
+    /// that pays it fees (`balance_changes`).
+    #[test]
+    fn a_real_sepolia_bal_hashes_to_its_header_and_names_what_every_block_changes() {
+        let header_raw = include_bytes!("../../../testdata/el/bal/sepolia-11960753.header.rlp");
+        let bal: &[u8] = include_bytes!("../../../testdata/el/bal/sepolia-11960753.bal.rlp");
+        let header = myotis_core::header::BlockHeader::decode(header_raw).unwrap();
+        assert_eq!(header.number, 11_960_753);
+        assert_eq!(header.block_access_list_hash, Some(keccak256(bal)));
+
+        let changed = bal_changed_accounts(bal).unwrap();
+        let beacon_roots = hex20("000f3df6d732807ef1319fb7b8bb8522d0beac02");
+        let history_storage = hex20("0000f90827f1c53a10cb7a02335b175320002935");
+        let mut coinbase = [0u8; 20];
+        coinbase.copy_from_slice(&header.beneficiary);
+        for (name, account) in
+            [("EIP-4788 beacon roots", beacon_roots), ("EIP-2935 history", history_storage), ("coinbase", coinbase)]
+        {
+            assert!(changed.binary_search(&account).is_ok(), "{name} must be a changed account");
+        }
+        // Ascending, as the BAL orders its accounts; and some accounts the
+        // block only accessed are left out.
+        assert!(changed.windows(2).all(|w| w[0] < w[1]));
+        let listed = rlp::View::new(bal).unwrap().as_list().unwrap().count();
+        assert!(changed.len() < listed, "{} changed of {listed} listed", changed.len());
+    }
+
+    #[test]
+    fn the_empty_bal_hashes_to_the_spec_constant() {
+        // EIP-7928: keccak256(rlp.encode([])) — what the header carries for an empty BAL.
+        let empty = rlp::encode(&Item::List(vec![]));
+        assert_eq!(empty, vec![0xc0]);
+        assert_eq!(
+            keccak256(&empty),
+            [
+                0x1d, 0xcc, 0x4d, 0xe8, 0xde, 0xc7, 0x5d, 0x7a, 0xab, 0x85, 0xb5, 0x67, 0xb6, 0xcc, 0xd4, 0x1a, 0xd3,
+                0x12, 0x45, 0x1b, 0x94, 0x8a, 0x74, 0x13, 0xf0, 0xa1, 0x42, 0xfd, 0x40, 0xd4, 0x93, 0x47
+            ]
+        );
+        assert_eq!(bal_changed_accounts(&empty).unwrap(), Vec::<[u8; 20]>::new());
+    }
+
+    #[test]
+    fn bal_changed_accounts_skips_accounts_only_accessed() {
+        let bal = rlp::encode(&Item::List(vec![
+            bal_account(0x01, false, false, false, false, false), // accessed only
+            bal_account(0x02, false, true, false, false, false),  // a storage read only
+            bal_account(0x03, true, false, false, false, false),  // a storage write
+            bal_account(0x04, false, false, true, false, false),  // a balance change
+            bal_account(0x05, false, false, false, true, false),  // a nonce change
+            bal_account(0x06, false, false, false, false, true),  // a code change
+        ]));
+        assert_eq!(bal_changed_accounts(&bal).unwrap(), vec![[0x03; 20], [0x04; 20], [0x05; 20], [0x06; 20]]);
+
+        // A shape that is not EIP-7928's is an error, never a partial answer.
+        let short = rlp::encode(&Item::List(vec![Item::List(vec![Item::Bytes(vec![1; 20])])]));
+        assert!(bal_changed_accounts(&short).is_err());
+        let mut seven = bal_account(0x01, false, false, false, false, false);
+        if let Item::List(fields) = &mut seven {
+            fields.push(Item::List(vec![]));
+        }
+        assert!(bal_changed_accounts(&rlp::encode(&Item::List(vec![seven]))).is_err());
+        let bad_address = rlp::encode(&Item::List(vec![Item::List(vec![
+            Item::Bytes(vec![1; 19]),
+            Item::List(vec![]),
+            Item::List(vec![]),
+            Item::List(vec![]),
+            Item::List(vec![]),
+            Item::List(vec![]),
+        ])]));
+        assert!(bal_changed_accounts(&bad_address).is_err());
+    }
+
+    #[test]
+    fn block_access_lists_round_trip_with_unavailable_entries() {
+        let req = encode_get_block_access_lists(7, &[[0xaa; 32], [0xbb; 32]], 2 * 1024 * 1024);
+        let mut fields = rlp::View::new(&req).unwrap().as_list().unwrap();
+        assert_eq!(fields.next().unwrap().as_u64().unwrap(), 7);
+        assert_eq!(fields.next().unwrap().as_list().unwrap().count(), 2);
+        assert_eq!(fields.next().unwrap().as_u64().unwrap(), 2 * 1024 * 1024);
+
+        let bal = Item::List(vec![bal_account(0x04, false, false, true, false, false)]);
+        let bal_raw = rlp::encode(&bal);
+        let resp = rlp::encode(&Item::List(vec![
+            Item::Bytes(vec![7]),
+            Item::List(vec![bal, Item::Bytes(vec![])]),
+        ]));
+        let (id, entries) = decode_block_access_lists(&resp, 2).unwrap();
+        assert_eq!(id, 7);
+        assert_eq!(entries, vec![Some(bal_raw), None]);
+
+        // A non-empty string where a BAL belongs is a violation, not "unavailable".
+        let bad = rlp::encode(&Item::List(vec![Item::Bytes(vec![7]), Item::List(vec![Item::Bytes(vec![1])])]));
+        assert!(decode_block_access_lists(&bad, 1).is_err());
+        // More than one entry past the request is checked, not kept.
+        let many = rlp::encode(&Item::List(vec![
+            Item::Bytes(vec![7]),
+            Item::List(vec![Item::Bytes(vec![]), Item::Bytes(vec![]), Item::Bytes(vec![])]),
+        ]));
+        assert_eq!(decode_block_access_lists(&many, 1).unwrap().1.len(), 2);
+    }
+
     #[test]
     fn snap_codes_by_eth_version() {
         assert_eq!(SnapCodes::negotiated(68, 1).get_account_range, 0x21);
@@ -411,7 +622,12 @@ mod tests {
         assert_eq!(SnapCodes::negotiated(69, 1).byte_codes, 0x27);
         // snap/2 (EIP-8189) keeps 0x00-0x05 where they were — the read path is
         // version-blind — and puts the BAL pair after the retired trie-node pair.
-        for eth in [68, 69] {
+        // eth/70 (EIP-7975) adds no message; eth/71 (EIP-8159) adds two at
+        // 0x22/0x23, so snap starts at 0x24 — clear of the eth/71 BAL pair.
+        assert_eq!(SnapCodes::negotiated(70, 2).get_account_range, 0x22);
+        assert_eq!(SnapCodes::negotiated(71, 2).get_account_range, 0x24);
+        assert!(SnapCodes::negotiated(71, 2).get_account_range > crate::eth::BLOCK_ACCESS_LISTS);
+        for eth in [68, 69, 70, 71] {
             let (v1, v2) = (SnapCodes::negotiated(eth, 1), SnapCodes::negotiated(eth, 2));
             assert_eq!(v2.get_account_range, v1.get_account_range);
             assert_eq!(v2.storage_ranges, v1.storage_ranges);

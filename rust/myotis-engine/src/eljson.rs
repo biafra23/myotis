@@ -1030,9 +1030,113 @@ fn be_to_decimal(bytes: &[u8]) -> String {
     String::from_utf8(out).unwrap_or_else(|_| "0".to_string())
 }
 
+/// The address-activity answer (#691), fixed key order, no whitespace — the
+/// hosts' parsers and their golden tests pin this shape:
+/// `{"from":n,"to":n,"base":{"block":n,"hash":"0x…"|null},
+///   "gaps":{"account":[[a,b],…],"log":[…]},
+///   "touched":[{"address":"0x…","block":n,"blockHash":"0x…","via":["account"?,"log"?]},…],
+///   "watching":["0x…",…]}`.
+pub fn activity_json(r: &myotis_net::el::activity::ActivityReport) -> String {
+    fn ranges(s: &mut String, gaps: &[(u64, u64)]) {
+        s.push('[');
+        for (i, (a, b)) in gaps.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("[{a},{b}]"));
+        }
+        s.push(']');
+    }
+    let mut s = format!("{{\"from\":{},\"to\":{},\"base\":{{\"block\":{},\"hash\":", r.from, r.to, r.base.0);
+    match &r.base.1 {
+        Some(h) => {
+            s.push('"');
+            s.push_str(&hex0x(h));
+            s.push('"');
+        }
+        None => s.push_str("null"),
+    }
+    s.push_str("},\"gaps\":{\"account\":");
+    ranges(&mut s, &r.account_gaps);
+    s.push_str(",\"log\":");
+    ranges(&mut s, &r.log_gaps);
+    s.push_str("},\"touched\":[");
+    for (i, t) in r.touched.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let via: Vec<String> = t.via.iter().map(|v| format!("\"{}\"", v.as_str())).collect();
+        s.push_str(&format!(
+            "{{\"address\":\"{}\",\"block\":{},\"blockHash\":\"{}\",\"via\":[{}]}}",
+            hex0x_var(&t.address),
+            t.block,
+            hex0x(&t.block_hash),
+            via.join(",")
+        ));
+    }
+    s.push_str("],\"watching\":[");
+    for (i, a) in r.watching.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('"');
+        s.push_str(&hex0x_var(a));
+        s.push('"');
+    }
+    s.push_str("]}");
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The activity answer's shape, byte for byte. The JVM and iOS hosts pass
+    /// the JSON through unparsed; the parser this pins is the consumer's.
+    #[test]
+    fn activity_json_shape_is_pinned() {
+        use myotis_net::el::activity::{ActivityReport, Touch, Via};
+        let r = ActivityReport {
+            from: 101,
+            to: 103,
+            base: (100, Some([0x11; 32])),
+            account_gaps: vec![(101, 103)],
+            log_gaps: vec![(103, 103)],
+            touched: vec![
+                Touch { address: [0xaa; 20], block: 102, block_hash: [0x22; 32], via: vec![Via::Log] },
+                Touch { address: [0xbb; 20], block: 103, block_hash: [0x33; 32], via: vec![Via::Account, Via::Log] },
+            ],
+            watching: vec![[0xaa; 20], [0xbb; 20]],
+        };
+        assert_eq!(
+            activity_json(&r),
+            format!(
+                "{{\"from\":101,\"to\":103,\"base\":{{\"block\":100,\"hash\":\"0x{h11}\"}},\
+                 \"gaps\":{{\"account\":[[101,103]],\"log\":[[103,103]]}},\
+                 \"touched\":[{{\"address\":\"0x{aa}\",\"block\":102,\"blockHash\":\"0x{h22}\",\"via\":[\"log\"]}},\
+                 {{\"address\":\"0x{bb}\",\"block\":103,\"blockHash\":\"0x{h33}\",\"via\":[\"account\",\"log\"]}}],\
+                 \"watching\":[\"0x{aa}\",\"0x{bb}\"]}}",
+                h11 = "11".repeat(32),
+                h22 = "22".repeat(32),
+                h33 = "33".repeat(32),
+                aa = "aa".repeat(20),
+                bb = "bb".repeat(20),
+            )
+        );
+        let empty = ActivityReport {
+            from: 5,
+            to: 4,
+            base: (4, None),
+            account_gaps: vec![],
+            log_gaps: vec![],
+            touched: vec![],
+            watching: vec![],
+        };
+        assert_eq!(
+            activity_json(&empty),
+            "{\"from\":5,\"to\":4,\"base\":{\"block\":4,\"hash\":null},\"gaps\":{\"account\":[],\"log\":[]},\"touched\":[],\"watching\":[]}"
+        );
+    }
     use myotis_net::el::reader::{
         FeeEstimate, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedStorage,
     };

@@ -119,6 +119,11 @@ struct EngineState {
     /// spin_up (start AND resume) after activation, exactly like
     /// [`Engine::pending_served_window`]. Dies with the handle.
     log_index_runtime_bits: Mutex<HashMap<i64, (bool, bool, bool)>>,
+    /// Per-handle address-activity watch list (#691), as the pushes left it.
+    /// The list lives in the EL reader, which a pause drops, and no host
+    /// re-pushes on resume: re-applied by every spin_up (start AND resume),
+    /// exactly like [`EngineState::log_index_runtime_bits`]. Dies with the handle.
+    activity_watch: Mutex<HashMap<i64, std::collections::BTreeSet<[u8; 20]>>>,
     /// Per-handle last-good `eth_feeHistory`: the EMITTED JSON plus the raw
     /// request signature it answered, re-servable within
     /// [`FEE_HISTORY_STALE_MAX`] when a fresh build fails for the SAME
@@ -188,6 +193,7 @@ fn engine() -> Option<&'static EngineState> {
                     pending_boot_enodes: Mutex::new(HashMap::new()),
                     boot_enodes_apply: Mutex::new(()),
                     log_index_runtime_bits: Mutex::new(HashMap::new()),
+                    activity_watch: Mutex::new(HashMap::new()),
                     fee_history_cache: Mutex::new(HashMap::new()),
                     fork_watches: Mutex::new(HashMap::new()),
                     cl_fork_watches: Mutex::new(HashMap::new()),
@@ -808,6 +814,18 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
                 reader.apply_log_index_runtime_bits(enabled, max_speed, backfill_paused);
             }
         }
+        // And the activity watch list: the resumed reader starts empty, and
+        // its report shows the paused blocks as a gap, never as a silence.
+        // Under the stash lock, which a push holds from lookup to stash write.
+        if let Ok(stash) = engine.activity_watch.lock() {
+            let watched: Vec<[u8; 20]> = stash.get(&handle).map(|w| w.iter().copied().collect()).unwrap_or_default();
+            if !watched.is_empty() {
+                let _guard = engine.rt.enter();
+                if let Err(e) = reader.set_activity_watch(&watched, &[]) {
+                    tracing::warn!(error = %e, "activity: re-applying the watch list failed");
+                }
+            }
+        }
     }
     // Re-lock and publish ONLY if the entry is still the same Created/Paused one
     // we spun up from: a concurrent stop() may have removed it, or a racing
@@ -1201,6 +1219,9 @@ pub fn stop(handle: i64) {
     }
     if let Ok(mut bits) = engine.log_index_runtime_bits.lock() {
         bits.remove(&handle);
+    }
+    if let Ok(mut watch) = engine.activity_watch.lock() {
+        watch.remove(&handle);
     }
     if let Ok(mut watches) = engine.fork_watches.lock() {
         watches.remove(&handle);
@@ -4752,6 +4773,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_activity_watch_applies_or_refuses_the_whole_push() {
+        let a = format!("0x{}", "aa".repeat(20));
+        let b = format!("0x{}", "bb".repeat(20));
+        assert_eq!(
+            parse_activity_watch(&format!(r#"{{"watch":["{a}","{a}"],"unwatch":["{b}"]}}"#)),
+            Some((vec![[0xaa; 20]], vec![[0xbb; 20]]))
+        );
+        assert_eq!(parse_activity_watch("{}"), Some((vec![], vec![])));
+        assert_eq!(parse_activity_watch(r#"{"watch":null}"#), Some((vec![], vec![])));
+        // Refused: not an object, not a list, not an address, under both keys.
+        assert!(parse_activity_watch("[]").is_none());
+        assert!(parse_activity_watch("not json").is_none());
+        assert!(parse_activity_watch(&format!(r#"{{"watch":"{a}"}}"#)).is_none());
+        assert!(parse_activity_watch(r#"{"watch":["0x1234"]}"#).is_none());
+        assert!(parse_activity_watch(r#"{"watch":[7]}"#).is_none());
+        assert!(parse_activity_watch(&format!(r#"{{"watch":["{a}"],"unwatch":["{a}"]}}"#)).is_none());
+        // A watch past the cap is refused while parsing; an unwatch of any length is not.
+        let many: Vec<String> = (0..=myotis_net::el::activity::MAX_WATCHED as u32)
+            .map(|i| format!("\"0x{i:040x}\""))
+            .collect();
+        let many = many.join(",");
+        assert!(parse_activity_watch(&format!(r#"{{"watch":[{many}]}}"#)).is_none());
+        assert!(parse_activity_watch(&format!(r#"{{"unwatch":[{many}]}}"#)).is_some());
+    }
+
+    #[test]
     fn parse_address_accepts_valid_and_rejects_malformed() {
         assert_eq!(parse_address(&"11".repeat(20)), Some([0x11; 20]));
         assert_eq!(parse_address(&format!("0x{}", "22".repeat(20))), Some([0x22; 20]));
@@ -5094,6 +5141,120 @@ pub fn log_index_status_json(handle: i64) -> String {
     let head = reader.head_block_number().unwrap_or(0);
     let status = reader.with_log_index(|ix| build_log_index_status(ix, rate_bps, head));
     status.unwrap_or_else(|| "{\"enabled\":false,\"logCount\":0,\"entries\":[]}".to_string())
+}
+
+/// Install the address-activity watch list (#691) from JSON
+/// `{"watch":["0x…",…],"unwatch":["0x…",…]}`, both optional: drop `unwatch`,
+/// then add `watch`. Additive like [`set_log_index_config_json`]: an address
+/// left out of `watch` stays watched. The engine follows verified heads for
+/// activity only while the list is non-empty.
+///
+/// `false` = refused, nothing changed: not valid JSON, an entry that is not a
+/// 20-byte hex address, an address under both keys (applying either would
+/// silently drop the other — CLAUDE.md §Trust), a list past
+/// `activity::MAX_WATCHED`, or a handle that is not running.
+pub fn set_activity_watch_json(handle: i64, config_json: &str) -> bool {
+    let Some((watch, unwatch)) = parse_activity_watch(config_json) else {
+        tracing::warn!(
+            "activity watch refused: not a JSON object whose `watch` and `unwatch` are arrays \
+             of 20-byte hex addresses, one address is under both, or `watch` names more \
+             addresses than the engine follows; ignoring the push"
+        );
+        return false;
+    };
+    let Some(engine) = engine() else {
+        return false;
+    };
+    // Held from the reader lookup to the stash write, so pushes are applied
+    // and stashed in one order, and a resume — whose re-apply takes this lock
+    // too — sees either none of a push or all of it: a push that reached a
+    // reader a pause then dropped is still in the stash its resume re-applies.
+    let Ok(mut stash) = engine.activity_watch.lock() else {
+        return false;
+    };
+    let Ok((reader, _, _)) = snapshot_reader(engine, handle) else {
+        return false;
+    };
+    // The follower is spawned on the engine runtime, from a host thread.
+    let _guard = engine.rt.enter();
+    if let Err(e) = reader.set_activity_watch(&watch, &unwatch) {
+        tracing::warn!(error = %e, "activity watch refused");
+        return false;
+    }
+    // The reader's resulting list, not this push's delta: the two cannot drift.
+    // Kept while the handle exists, paused included; a stopped one is gone,
+    // and `stop` dropped its entry already.
+    let still_there = engine.handles.lock().is_ok_and(|map| map.contains_key(&handle));
+    if still_there {
+        let list = reader.activity_watching();
+        if list.is_empty() {
+            stash.remove(&handle);
+        } else {
+            stash.insert(handle, list.into_iter().collect());
+        }
+    }
+    true
+}
+
+/// An activity push's `(watch, unwatch)` lists.
+type ActivityPush = (Vec<[u8; 20]>, Vec<[u8; 20]>);
+
+/// The `(watch, unwatch)` lists of an activity push, each ascending with an
+/// address named twice folded into one. `None` = malformed (see
+/// [`set_activity_watch_json`]), or a `watch` longer than
+/// `activity::MAX_WATCHED`: refused while parsing, since applying it could
+/// only refuse it, and a caller's runaway list is not scanned to its end.
+/// Pure — unit-tested.
+fn parse_activity_watch(config_json: &str) -> Option<ActivityPush> {
+    use std::collections::BTreeSet;
+    let v: serde_json::Value = serde_json::from_str(config_json).ok()?;
+    if !v.is_object() {
+        return None;
+    }
+    let list = |key: &str, cap: Option<usize>| -> Option<BTreeSet<[u8; 20]>> {
+        let entries = match v.get(key) {
+            None | Some(serde_json::Value::Null) => return Some(BTreeSet::new()),
+            Some(other) => other.as_array()?,
+        };
+        let mut out = BTreeSet::new();
+        for e in entries {
+            out.insert(parse_address(e.as_str()?)?);
+            if cap.is_some_and(|cap| out.len() > cap) {
+                return None;
+            }
+        }
+        Some(out)
+    };
+    let watch = list("watch", Some(myotis_net::el::activity::MAX_WATCHED))?;
+    // No cap: an oversized unwatch of addresses nobody watches is a no-op, not a refusal.
+    let unwatch = list("unwatch", None)?;
+    if !watch.is_disjoint(&unwatch) {
+        return None;
+    }
+    Some((watch.into_iter().collect(), unwatch.into_iter().collect()))
+}
+
+/// The watched addresses' activity in the verified blocks after `after_block`
+/// (#691), answered from what the follower kept, with no I/O — see
+/// [`eljson::activity_json`] for the shape and `myotis_net::el::activity` for
+/// what a gap and a touch mean. `{"error":…}` when the handle is not running
+/// or no head is anchored yet.
+pub fn address_activity_json(handle: i64, after_block: i64) -> String {
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, _, _) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    // A negative cursor reads as 0: everything kept, from block 1 on.
+    let after = u64::try_from(after_block).unwrap_or(0);
+    // A poll may restart the follower (see `ElReader::activity_report`).
+    let _guard = engine.rt.enter();
+    match reader.activity_report(after) {
+        Some(report) => eljson::activity_json(&report),
+        None => eljson::error_json("no beacon-anchored head yet"),
+    }
 }
 
 /// The read-fetch shadow cache's counters (`myotis_net::el::readstats`): how

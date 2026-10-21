@@ -1,4 +1,4 @@
-//! The eth/66-69 sub-protocol (EL-A5) on top of the RLPx framed channel.
+//! The eth/66-71 sub-protocol (EL-A5; eth/70-71 #691) on top of the RLPx framed channel.
 //!
 //! - [`messages`] — pure encode/decode for Status, GetBlockHeaders/Bodies/
 //!   Receipts and their responses (canonical header hashing, eth/69 bloomless

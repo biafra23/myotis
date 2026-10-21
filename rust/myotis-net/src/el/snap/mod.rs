@@ -1,7 +1,7 @@
 //! The snap sub-protocol (EL-A6; snap/1 and snap/2) — SNAP-served state, verified on fetch.
 //!
 //! - [`messages`] — pure encode/decode with the dynamic base offset
-//!   (0x21 eth/67-68, 0x22 eth/69), the slim-account and double-wrapped-slot
+//!   (0x21 eth/67-68, 0x22 eth/69-70, 0x24 eth/71), the slim-account and double-wrapped-slot
 //!   rules, and empty responders. Twin of `networking.snap.messages`.
 //! - [`fetch`] — verify-on-fetch against a trusted state root (the MPT proof
 //!   is the trust anchor; the peer's slim body is never trusted). Twin of the

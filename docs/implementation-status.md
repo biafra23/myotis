@@ -48,7 +48,7 @@ Comparison of the [architecture document](architecture-doc.md) against what is a
 ## 4. Fetching and Verifying Block Data — devp2p
 **Implemented (both engines)**
 
-- Full devp2p stack in both engines: discv4 discovery, RLPx ECIES handshake and AES-CTR framing, eth/66–69 (eth/69 `BlockRangeUpdate` and bloomless receipts included). The Rust stack is hand-rolled on small primitive crates (no reth); its RLP decoding of unsolicited peer frames is allocation-bounded (#454).
+- Full devp2p stack in both engines: discv4 discovery, RLPx ECIES handshake and AES-CTR framing, eth/66–69 (eth/69 `BlockRangeUpdate` and bloomless receipts included); the Rust engine also eth/70 (EIP-7975 partial receipts) and eth/71 (EIP-8159 block access lists), #691. The Rust stack is hand-rolled on small primitive crates (no reth); its RLP decoding of unsolicited peer frames is allocation-bounded (#454).
 - `GetBlockHeaders`, `GetBlockBodies`, `GetReceipts`; bodies verified by rebuilding the transactions trie, receipts against `receiptsRoot` (eth/69's omitted `logsBloom` is recomputed first). Powers the block/receipt reads, `eth_feeHistory`'s reward percentiles and the log index.
 - Block header verification against the beacon chain (a header chain walked down from an attested block hash; a matching state root alone never vouches for a header).
 - **Rust engine**: block, receipt and `eth_call` state reads are **hedged** — a second peer is raced after 3 s near the head (6 s for bulk reads), and peers that keep losing are evicted (#457); the `eth_call` prefetch wave stops waiting on a peer that has answered none of our requests for 6 s (silence, not a request's age, so a slow link is not cut), reports it outpaced when the call's other peers were delivering meanwhile (so the silence was not our own link), and asks a peer that went silent or lost a race in the call only after the others; `eth_sendRawTransaction` answers at the first peer that takes the bytes, and the other writes get 5 s more, cut at once by a pause or stop (#320); the fee reads stay sequential, as hedging them would duplicate multi-MB downloads on every head; peers are admitted, ranked and struck by their announced head (`BlockRangeUpdate`, or a probe on eth/68), and readiness is gated on `snapServingPeers` — pooled peers that can answer at the anchored head *now* (#465); the by-number header window is anchored at the finalized block, honouring the `finalized` tag (ABI 30). The Java engine rotates `GetBlockBodies`/`GetReceipts` requests across peers instead of one-shot (#387) and evicts snap peers on repeated verified-read failures (#417), but has no hedging or serving count.
@@ -59,7 +59,7 @@ Comparison of the [architecture document](architecture-doc.md) against what is a
 - Inbound: neither engine accepts inbound RLPx (outbound dialer only; [design](inbound-connections.md)). Both answer peers' `GetBlockHeaders` from a small served-header window (default 32, Settings-adjustable) so eth/69 peers keep them; the Rust libp2p host accepts inbound CL connections but serves no light-client protocols (roost does).
 
 **Not implemented:**
-- EIP-4444 fallback strategies; inbound EL connections; eth/70–71 (Amsterdam's partial receipts and BAL exchange — tracked in the Glamsterdam plan, B.5).
+- EIP-4444 fallback strategies; inbound EL connections; eth/70–71 on the Java engine (Amsterdam's partial receipts and BAL exchange — the Rust engine speaks both, #691; Glamsterdam plan, B.5).
 
 ## 5. State Data — SNAP Protocol
 **Implemented (both engines)**

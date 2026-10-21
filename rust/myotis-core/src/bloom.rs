@@ -30,14 +30,29 @@ pub fn accrue(bloom: &mut LogsBloom, item: &[u8]) {
 /// eth_getLogs indexer to skip blocks whose header bloom cannot contain any
 /// watched address (docs/eth-getlogs-design.md).
 pub fn may_contain(bloom: &LogsBloom, item: &[u8]) -> bool {
-    let h = keccak256(item);
-    for i in (0..6).step_by(2) {
-        let bit = ((usize::from(h[i]) << 8) | usize::from(h[i + 1])) & 0x7ff;
-        if bloom[255 - bit / 8] & (1 << (bit % 8)) == 0 {
-            return false;
+    BloomProbe::of(item).may_match(bloom)
+}
+
+/// [`may_contain`] with the item's three bits computed once: for a caller that
+/// probes one item against many blooms, so each probe costs no Keccak.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BloomProbe([usize; 3]);
+
+impl BloomProbe {
+    /// The bits [`accrue`] would set for `item`.
+    pub fn of(item: &[u8]) -> Self {
+        let h = keccak256(item);
+        let mut bits = [0usize; 3];
+        for (k, i) in (0..6).step_by(2).enumerate() {
+            bits[k] = ((usize::from(h[i]) << 8) | usize::from(h[i + 1])) & 0x7ff;
         }
+        BloomProbe(bits)
     }
-    true
+
+    /// [`may_contain`]'s answer for the item this probe was made of.
+    pub fn may_match(&self, bloom: &LogsBloom) -> bool {
+        self.0.iter().all(|&bit| bloom[255 - bit / 8] & (1 << (bit % 8)) != 0)
+    }
 }
 
 #[cfg(test)]

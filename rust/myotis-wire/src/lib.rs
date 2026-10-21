@@ -8,7 +8,7 @@
 //!
 //! - [`discv4`] -- the discovery packet codec (ping/pong/findnode/neighbors)
 //! - [`rlpx`]   -- ECIES handshake, frame codec, p2p Hello
-//! - [`eth`]    -- eth/66-69 messages (Status, headers, bodies, receipts)
+//! - [`eth`]    -- eth/66-71 messages (Status, headers, bodies, receipts, BALs)
 //! - [`snap`]   -- snap/1 messages and proof verification of the responses
 //! - [`eth2`]   -- consensus req/resp framing (ssz_snappy), Status, fork digests
 //!
