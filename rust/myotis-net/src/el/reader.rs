@@ -8189,6 +8189,7 @@ impl ElReader {
                     bloom: Box::new(bloom),
                     bal_hash: vh.header.block_access_list_hash,
                     account: None,
+                    bal_undecodable: false,
                 })
             })
             .collect();
@@ -8295,9 +8296,12 @@ impl ElReader {
                     }
                     Some(Err(e)) => {
                         // It hashed to the header's commitment, so this is the
-                        // decoder's limit, not the peer's lie: a gap, logged.
-                        tracing::warn!(block = want.0, error = %e.0, "activity: a verified block access list did not decode");
-                        still.push(want);
+                        // decoder's limit, not the peer's lie, and the same for
+                        // every peer: marked, never fetched again, a gap.
+                        tracing::warn!(block = want.0, error = %e.0, "activity: a verified block access list did not decode; the block stays an account gap");
+                        if let Ok(mut state) = self.activity.lock() {
+                            state.set_bal_undecodable(want.0, &want.1);
+                        }
                     }
                     None => still.push(want),
                 }

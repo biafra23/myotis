@@ -57,6 +57,9 @@ pub struct BlockRecord {
     /// The accounts the block's verified BAL changed, ascending; `None` until
     /// one is fetched and verified (an account gap until then).
     pub account: Option<Box<[[u8; 20]]>>,
+    /// Its BAL verified but did not decode. The commitment pins the bytes, so
+    /// no peer can serve one that does: never asked for again, an account gap.
+    pub bal_undecodable: bool,
 }
 
 /// One touch in a report: `address` may have been touched by block `number`
@@ -193,6 +196,7 @@ impl ActivityState {
         for mut r in segment {
             if let Some(old) = replaced.remove(&r.number).filter(|old| old.hash == r.hash) {
                 r.account = r.account.or(old.account);
+                r.bal_undecodable |= old.bal_undecodable;
             }
             self.records.insert(r.number, r);
         }
@@ -207,7 +211,7 @@ impl ActivityState {
         self.records
             .values()
             .rev()
-            .filter(|r| r.account.is_none())
+            .filter(|r| r.account.is_none() && !r.bal_undecodable)
             .filter_map(|r| r.bal_hash.map(|bal| (r.number, r.hash, bal)))
             .take(max)
             .collect()
@@ -221,6 +225,14 @@ impl ActivityState {
             changed.sort_unstable();
             changed.dedup();
             r.account = Some(changed.into_boxed_slice());
+        }
+    }
+
+    /// Mark block `number` (`hash`) as one whose verified BAL does not decode
+    /// ([`BlockRecord::bal_undecodable`]). Ignored as [`Self::set_account`] is.
+    pub fn set_bal_undecodable(&mut self, number: u64, hash: &[u8; 32]) {
+        if let Some(r) = self.records.get_mut(&number).filter(|r| &r.hash == hash) {
+            r.bal_undecodable = true;
         }
     }
 
@@ -354,6 +366,7 @@ mod tests {
                 bloom: Box::new(EMPTY_BLOOM),
                 bal_hash: Some([n as u8; 32]),
                 account: None,
+                bal_undecodable: false,
             });
             parent_hash = h;
         }
@@ -571,6 +584,18 @@ mod tests {
         // A reorg replaces 102 with another block: its BAL is gone with it.
         s.install(run(102, 104, 1, hash(101, 0)), 104);
         assert_eq!(s.report(100, 104, every).account_gaps, vec![(102, 104)]);
+    }
+
+    #[test]
+    fn an_undecodable_bal_is_not_wanted_again_and_stays_a_gap() {
+        let mut s = watching(&[A]);
+        s.install(run(100, 101, 0, hash(99, 0)), 101);
+        s.set_bal_undecodable(101, &hash(101, 0));
+        assert_eq!(s.bals_wanted(8), vec![(100, hash(100, 0), [100; 32])]);
+        // Kept across a reinstall of the same block, like a verified BAL.
+        s.install(run(101, 102, 0, hash(100, 0)), 102);
+        assert_eq!(s.bals_wanted(8), vec![(102, hash(102, 0), [102; 32]), (100, hash(100, 0), [100; 32])]);
+        assert_eq!(s.report(99, 102, every).account_gaps, vec![(100, 102)]);
     }
 
     #[test]
