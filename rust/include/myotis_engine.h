@@ -393,8 +393,9 @@ char *myotis_log_index_status_json(int64_t handle);
  * address left out of `watch` stays watched). The engine follows verified
  * heads for activity only while the list is non-empty. false = refused,
  * nothing changed: malformed JSON, an entry that is not a 20-byte hex address,
- * an address under both keys, more than 256 addresses, or a handle that is
- * not running (paused included).
+ * a `watch` naming more than 256 addresses or a list that would exceed 256
+ * (an `unwatch` of any length is accepted), or a handle that is not running
+ * (paused included).
  *
  * address_activity_json answers, with no I/O, which watched addresses the
  * verified blocks (after_block, head] touched:
@@ -404,13 +405,14 @@ char *myotis_log_index_status_json(int64_t handle);
  * per kind. "log" is the header's logs bloom: an address absent from `touched`
  * for a log-covered block is named by no log of it as emitter or indexed topic
  * (a hit may be a false positive), which says nothing of a change no such log
- * names. "account" is the block access list (EIP-7928, fetched over snap/2
- * and verified against the header's blockAccessListHash): a balance, nonce or
+ * names. "account" is the block access list (EIP-7928, fetched over eth/71 or
+ * snap/2 and verified against the header's blockAccessListHash): a balance, nonce or
  * code change or a storage write, definitive where covered; a block whose list
  * no peer served, or one before Amsterdam, is an account gap. A kept block not known to lead to the current head (a reorg the
  * follower has not caught up with) is a gap too. The
  * follower keeps the last 256 blocks; anything older, paused or not yet
- * fetched is a gap. {"error":..} when the handle is not running. */
+ * fetched is a gap. {"error":..} when the handle is not running (paused
+ * included) or the light client has anchored no head yet. */
 bool myotis_set_activity_watch(int64_t handle, const char *config_json);
 char *myotis_address_activity_json(int64_t handle, int64_t after_block);
 

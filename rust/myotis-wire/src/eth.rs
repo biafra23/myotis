@@ -283,7 +283,7 @@ pub fn encode_block_headers_response(request_id: u64, raw_headers: &[Vec<u8>]) -
     rlp::encode_list_payload(&body)
 }
 
-/// Encode GetBlockHeaders by block number. ALL of eth/66-69 wrap the request
+/// Encode GetBlockHeaders by block number. ALL of eth/66-71 wrap the request
 /// id (only the Status shape and bloomless receipts changed in eth/69 — the
 /// Java `EthHandler` decodes every version with the reqId path).
 pub fn encode_get_block_headers_by_number(
@@ -875,7 +875,7 @@ fn encode_hash_request(request_id: u64, hashes: &[[u8; 32]]) -> Vec<u8> {
     ]))
 }
 
-/// The request id heading an eth/66-69 or snap/1 request or response
+/// The request id heading an eth/66-71 or snap request or response
 /// (`[reqId, …]`), or `None` when the payload is not one. The read loops
 /// call this on every frame a peer sends, so it walks the list instead of
 /// building it (#454). The whole list is still validated, as before.
@@ -905,7 +905,8 @@ fn check_control_size(what: &str, payload: &[u8]) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// Split an eth/66-69 `[reqId, payload]` response into the request id and a
+/// Split an eth/66-71 `[reqId, payload]` response (all but eth/70's
+/// three-field Receipts, [`decode_receipts70`]) into the request id and a
 /// view of the payload to read in place (#454). The elements of the message
 /// are checked as they always were (each a whole item, anything after the
 /// payload checked but not read), so the nesting a response may use is
@@ -1249,7 +1250,7 @@ mod tests {
 
     #[test]
     fn get_headers_encoding_wraps_request_id() {
-        // All of eth/66-69 wrap `[reqId, [start, max, skip, reverse]]`.
+        // All of eth/66-71 wrap `[reqId, [start, max, skip, reverse]]`.
         let msg = encode_get_block_headers_by_number(42, 21_000_000, 1024, 0, false);
         let outer = rlp::decode(&msg).unwrap();
         let items = outer.as_list().unwrap();

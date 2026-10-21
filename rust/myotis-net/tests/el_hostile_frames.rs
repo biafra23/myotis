@@ -235,6 +235,30 @@ fn eth69_receipts_expand_only_for_the_verified_count() {
 }
 
 #[test]
+fn eth70_receipts_are_one_buffer_as_eth69_ones() {
+    // eth/70 `[1, 0, [[receipt…]]]`: the same receipts behind the
+    // lastBlockIncomplete flag (EIP-7975), decoded like eth/69's.
+    let minimal = [0xc4, 0x80, 0x80, 0x80, 0xc0];
+    let count = ELEMENTS / minimal.len();
+    let msg = list(&[&[0x01, 0x80][..], &list(&list(&minimal.repeat(count)))].concat());
+    let (a, b, decoded) = counted(|| messages::decode_receipts70(&msg, 1));
+    let (_, incomplete, blocks) = decoded.unwrap();
+    assert!(!incomplete);
+    assert_eq!(blocks[0].len(), count);
+    assert_one_buffer("eth/70 Receipts", a, b);
+}
+
+#[test]
+fn block_access_lists_keep_only_what_was_asked_for() {
+    // `[1, [0x80; N]]`: a frame of "unavailable" markers for a request of one
+    // BAL (eth/71 and snap/2 alike) is walked, and keeps two entries.
+    let msg = response(&list(&vec![0x80; ELEMENTS]));
+    let (a, b, decoded) = counted(|| snap::decode_block_access_lists(&msg, 1));
+    assert_eq!(decoded.unwrap().1.len(), 2);
+    assert_flat("BlockAccessLists of unavailable markers", a, b);
+}
+
+#[test]
 fn snap_responses_are_bounded_by_the_proof_cap_and_the_request() {
     // `[1, [], [0x01; N]]`: a proof of one-byte nodes, refused on its count.
     let proof = [vec![0xc0], list(&vec![0x01; ELEMENTS])].concat();

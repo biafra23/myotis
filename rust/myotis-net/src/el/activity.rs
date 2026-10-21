@@ -18,7 +18,8 @@
 //!   hit only says the block MAY have such a log.
 //! - **`account`**: the account's own state — a balance, nonce or code change,
 //!   or a storage write — from the block's access list (EIP-7928), fetched over
-//!   snap/2 and verified against the header's `blockAccessListHash`. A block
+//!   eth/71 (EIP-8159) or snap/2 (EIP-8189) and verified against the header's
+//!   `blockAccessListHash`. A block
 //!   whose BAL no peer served, or a block before Amsterdam (no commitment to
 //!   check one against), is an account gap.
 //!

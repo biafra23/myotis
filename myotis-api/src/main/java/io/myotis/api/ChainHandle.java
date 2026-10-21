@@ -248,9 +248,12 @@ public interface ChainHandle {
      * verified heads for activity only while the list is non-empty, and keeps
      * it across a pause and resume of this chain, not across a restart.
      * {@code false} = refused, nothing changed: malformed JSON, an entry that
-     * is not a 20-byte hex address, an address under both keys, more than 256
-     * addresses, or a chain that is not running (paused included: push again).
-     * Default false: no activity follower on this engine.
+     * is not a 20-byte hex address, an address under both keys, a
+     * {@code watch} naming more than 256 addresses or a list that would exceed
+     * 256 ({@code unwatch} of any length is accepted), or a chain that is not
+     * running (paused included: push again). Default false: no activity
+     * follower on this engine — tell that apart from a paused chain by
+     * {@link #addressActivityJson} answering {@code null}, and do not retry.
      */
     default boolean setActivityWatch(String configJson) {
         return false;
@@ -272,7 +275,8 @@ public interface ChainHandle {
      * write — from the block's access list (EIP-7928), verified against the
      * header's commitment: definitive where covered. A block whose list no
      * peer served, or one before Amsterdam, is an account gap. Above finality a block can come back with a new
-     * {@code blockHash}. {@code {"error":…}} when the chain is not running.
+     * {@code blockHash}. {@code {"error":…}} when the chain is not running
+     * (paused included) or its light client has anchored no head yet.
      * Default {@code null}: no activity follower on this engine.
      */
     default String addressActivityJson(long afterBlock) {

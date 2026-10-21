@@ -169,7 +169,8 @@ class ChainHandle internal constructor(
      * `io.myotis.api.ChainHandle`'s `addressActivityJson` describes it — every block of the
      * range covered or in a gap, per kind, "log" coverage saying only that no log named the
      * address — or an `{"error":…}` object: the engine's, or one
-     * naming a call that failed. Answered from memory, whatever the handle's state.
+     * naming a call that failed (a paused handle, or no anchored head yet, is the engine's
+     * error). Answered from memory, with no I/O.
      */
     fun addressActivityJson(afterBlock: Long): String =
         try {

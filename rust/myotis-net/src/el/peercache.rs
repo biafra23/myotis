@@ -9,7 +9,7 @@
 //! `ip \t port \t publicKeyHex \t {1|0} [\t snapok|snapbad] [\t fails=N] [\t bal]`
 //! — the trailing `{1|0}` is snap CAPABILITY (snap/1 or snap/2); the optional `snapok`/`snapbad`
 //! token records learned snap-serving QUALITY; `bal` (Rust engine only) marks a
-//! peer that served a verified block access list over snap/2 (#691), dialed
+//! peer that served a verified block access list (eth/71 or snap/2, #691), dialed
 //! first while a host follows address activity. The Java caches ignore it and
 //! drop it on their next rewrite, which costs only that preference.
 //! `publicKeyHex` is the peer's

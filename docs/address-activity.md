@@ -17,9 +17,11 @@ On `ChainHandle` (`io.myotis.api`), in the style of the log index config:
 - `setActivityWatch(json)`, with `{"watch":["0x…"]?,"unwatch":["0x…"]?}`. It drops
   `unwatch`, then adds `watch`. It is additive: an address left out of `watch`
   stays watched. `false` means refused, nothing changed: malformed JSON, an entry
-  that is not a 20-byte hex address, an address under both keys, more than 256
-  addresses, or a chain that is not running (a paused one included; the host
-  pushes again).
+  that is not a 20-byte hex address, an address under both keys, a `watch` of
+  more than 256 addresses or a list that would exceed 256 (an `unwatch` of any
+  length is accepted), or a chain that is not running (a paused one included;
+  the host pushes again). On the Java engine `false` is final: its
+  `addressActivityJson` answers `null`.
 - `addressActivityJson(afterBlock)` covers the blocks `(afterBlock, head]`. It is
   answered from memory, with no I/O, so a host can poll it as often as it polls
   `status()`.
@@ -173,5 +175,5 @@ source.
 - **Mainnet and Gnosis** have no Amsterdam yet: their blocks commit to no BAL,
   and their account side stays a gap until the fork.
 - **Shared with #685:** the fetch-and-verify step is
-  `ManagedPeer::snap_get_block_access_lists`.
+  `ManagedPeer::get_block_access_lists` (eth/71, snap/2 as the fallback).
 - The Node addon and the JVM daemon do not expose the calls yet.
