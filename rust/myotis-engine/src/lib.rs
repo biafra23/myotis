@@ -355,8 +355,9 @@ uniffi::setup_scaffolding!();
 /// v51: address activity (#691). `set_activity_watch` / `address_activity_json`
 ///      (C: `myotis_set_activity_watch` / `myotis_address_activity_json`): a
 ///      host installs a watch list, and the engine reports which watched
-///      addresses each verified block touched (the header's logs bloom so
-///      far), with every block it could not check listed as a gap. An
+///      addresses each verified block touched (the header's logs bloom, and
+///      the block access list over snap/2 verified against its header's
+///      commitment), with every block it could not check listed as a gap. An
 ///      additive function pair — bumped so a host that relies on the report
 ///      is never paired with an engine that lacks it.
 pub const ABI_VERSION: i32 = 51;

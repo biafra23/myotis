@@ -16,9 +16,11 @@
 //!   emitter or in an indexed topic. It says nothing of a change no such log
 //!   names (a rebasing token's balance, an address only in a log's data). A
 //!   hit only says the block MAY have such a log.
-//! - **`account`**: the account itself (balance, nonce, code), which needs the
-//!   block access list (EIP-7928). Not followed yet: every block is an account
-//!   gap.
+//! - **`account`**: the account's own state — a balance, nonce or code change,
+//!   or a storage write — from the block's access list (EIP-7928), fetched over
+//!   snap/2 and verified against the header's `blockAccessListHash`. A block
+//!   whose BAL no peer served, or a block before Amsterdam (no commitment to
+//!   check one against), is an account gap.
 //!
 //! Coverage honesty is the contract: every block of a report's range is either
 //! covered or listed in its gaps, per kind. A block the follower did not see —
@@ -50,6 +52,11 @@ pub struct BlockRecord {
     pub hash: [u8; 32],
     pub parent_hash: [u8; 32],
     pub bloom: Box<LogsBloom>,
+    /// The header's `blockAccessListHash`: none before Amsterdam.
+    pub bal_hash: Option<[u8; 32]>,
+    /// The accounts the block's verified BAL changed, ascending; `None` until
+    /// one is fetched and verified (an account gap until then).
+    pub account: Option<Box<[[u8; 20]]>>,
 }
 
 /// One touch in a report: `address` may have been touched by block `number`
@@ -59,12 +66,15 @@ pub struct Touch {
     pub address: [u8; 20],
     pub block: u64,
     pub block_hash: [u8; 32],
-    pub via: Via,
+    /// Ascending ([`Via::Account`] first), never empty.
+    pub via: Vec<Via>,
 }
 
 /// What a touch was seen through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Via {
+    /// The block's verified access list records a change to the account.
+    Account,
     /// The header's logs bloom matched.
     Log,
 }
@@ -72,6 +82,7 @@ pub enum Via {
 impl Via {
     pub fn as_str(self) -> &'static str {
         match self {
+            Via::Account => "account",
             Via::Log => "log",
         }
     }
@@ -172,16 +183,45 @@ impl ActivityState {
             .checked_sub(1)
             .and_then(|below| self.records.get(&below))
             .is_some_and(|r| r.hash == first.parent_hash);
-        if links_below {
-            let _ = self.records.split_off(&first.number);
+        // Replaced records hand a verified BAL on to the same block re-fetched
+        // (the shallow window always repeats the kept top).
+        let mut replaced = if links_below {
+            self.records.split_off(&first.number)
         } else {
-            self.records.clear();
-        }
-        for r in segment {
+            std::mem::take(&mut self.records)
+        };
+        for mut r in segment {
+            if let Some(old) = replaced.remove(&r.number).filter(|old| old.hash == r.hash) {
+                r.account = r.account.or(old.account);
+            }
             self.records.insert(r.number, r);
         }
         let floor = head.saturating_sub(WINDOW - 1);
         self.records = self.records.split_off(&floor);
+    }
+
+    /// The kept blocks whose BAL is still wanted — they commit to one and none
+    /// was verified yet — newest first, at most `max`: `(number, block hash,
+    /// blockAccessListHash)`.
+    pub fn bals_wanted(&self, max: usize) -> Vec<(u64, [u8; 32], [u8; 32])> {
+        self.records
+            .values()
+            .rev()
+            .filter(|r| r.account.is_none())
+            .filter_map(|r| r.bal_hash.map(|bal| (r.number, r.hash, bal)))
+            .take(max)
+            .collect()
+    }
+
+    /// Record the accounts block `number` (`hash`) changed, from its verified
+    /// BAL. Ignored when that block is no longer kept under that hash (a reorg
+    /// or a trim while the BAL was fetched).
+    pub fn set_account(&mut self, number: u64, hash: &[u8; 32], mut changed: Vec<[u8; 20]>) {
+        if let Some(r) = self.records.get_mut(&number).filter(|r| &r.hash == hash) {
+            changed.sort_unstable();
+            changed.dedup();
+            r.account = Some(changed.into_boxed_slice());
+        }
     }
 
     /// Forget every kept block (the follower stopped following).
@@ -238,24 +278,41 @@ impl ActivityState {
             }
             _ => vec![(from, to)],
         };
+        // Account coverage: the kept blocks whose BAL was verified.
+        let account_gaps = gaps_of(from, to, kept.iter().filter(|r| r.account.is_some()).map(|r| r.number));
         let mut touched = Vec::new();
         for r in &kept {
             for (address, [emitter, topic]) in &self.watched {
+                let mut via = Vec::new();
+                if r.account.as_ref().is_some_and(|changed| changed.binary_search(address).is_ok()) {
+                    via.push(Via::Account);
+                }
                 if emitter.may_match(&r.bloom) || topic.may_match(&r.bloom) {
-                    touched.push(Touch { address: *address, block: r.number, block_hash: r.hash, via: Via::Log });
+                    via.push(Via::Log);
+                }
+                if !via.is_empty() {
+                    touched.push(Touch { address: *address, block: r.number, block_hash: r.hash, via });
                 }
             }
         }
-        ActivityReport {
-            from,
-            to,
-            base,
-            account_gaps: vec![(from, to)],
-            log_gaps,
-            touched,
-            watching,
-        }
+        ActivityReport { from, to, base, account_gaps, log_gaps, touched, watching }
     }
+}
+
+/// The inclusive ranges of `[from, to]` not in `covered` (ascending).
+fn gaps_of(from: u64, to: u64, covered: impl Iterator<Item = u64>) -> Vec<(u64, u64)> {
+    let mut gaps = Vec::new();
+    let mut next = from;
+    for n in covered {
+        if n > next {
+            gaps.push((next, n - 1));
+        }
+        next = n + 1;
+    }
+    if next <= to {
+        gaps.push((next, to));
+    }
+    gaps
 }
 
 /// The bloom probes of `address`: as a log's emitter, and as an indexed topic
@@ -290,7 +347,14 @@ mod tests {
         let mut parent_hash = parent;
         for n in lo..=hi {
             let h = hash(n, fork);
-            out.push(BlockRecord { number: n, hash: h, parent_hash, bloom: Box::new(EMPTY_BLOOM) });
+            out.push(BlockRecord {
+                number: n,
+                hash: h,
+                parent_hash,
+                bloom: Box::new(EMPTY_BLOOM),
+                bal_hash: Some([n as u8; 32]),
+                account: None,
+            });
             parent_hash = h;
         }
         out
@@ -358,7 +422,7 @@ mod tests {
         let r = s.report(99, 102, every);
         assert_eq!(
             r.touched,
-            vec![Touch { address: B, block: 101, block_hash: hash(101, 0), via: Via::Log }]
+            vec![Touch { address: B, block: 101, block_hash: hash(101, 0), via: vec![Via::Log] }]
         );
         assert!(r.log_gaps.is_empty());
         assert_eq!(r.watching, vec![A, B]);
@@ -469,6 +533,75 @@ mod tests {
         // A new head 106 the follower has not fetched yet, whose ancestry vouches for 105.
         let r = s.report(99, 106, |n, h| *h == hash(n, 0));
         assert_eq!(r.log_gaps, vec![(106, 106)]);
+    }
+
+    #[test]
+    fn a_verified_bal_covers_the_account_side_and_names_what_it_changed() {
+        let mut s = watching(&[A, B]);
+        let mut seg = run(100, 103, 0, hash(99, 0));
+        accrue(&mut seg[1].bloom, &A);
+        s.install(seg, 103);
+        // Newest first, every block still wanting its BAL.
+        assert_eq!(s.bals_wanted(2), vec![(103, hash(103, 0), [103; 32]), (102, hash(102, 0), [102; 32])]);
+        s.set_account(101, &hash(101, 0), vec![B, A]);
+        s.set_account(102, &hash(102, 0), vec![]);
+        // A BAL for a block no longer kept under that hash changes nothing.
+        s.set_account(103, &hash(103, 1), vec![A]);
+        let r = s.report(99, 103, every);
+        assert_eq!(r.account_gaps, vec![(100, 100), (103, 103)]);
+        assert_eq!(
+            r.touched,
+            vec![
+                Touch { address: A, block: 101, block_hash: hash(101, 0), via: vec![Via::Account, Via::Log] },
+                Touch { address: B, block: 101, block_hash: hash(101, 0), via: vec![Via::Account] },
+            ]
+        );
+        assert_eq!(s.bals_wanted(8), vec![(103, hash(103, 0), [103; 32]), (100, hash(100, 0), [100; 32])]);
+    }
+
+    #[test]
+    fn a_block_fetched_again_keeps_its_verified_bal_and_a_reorged_one_loses_it() {
+        let mut s = watching(&[A]);
+        s.install(run(100, 102, 0, hash(99, 0)), 102);
+        s.set_account(102, &hash(102, 0), vec![A]);
+        s.set_account(101, &hash(101, 0), vec![]);
+        // The next shallow window repeats the kept top.
+        s.install(run(102, 103, 0, hash(101, 0)), 103);
+        assert_eq!(s.report(101, 103, every).account_gaps, vec![(103, 103)]);
+        // A reorg replaces 102 with another block: its BAL is gone with it.
+        s.install(run(102, 104, 1, hash(101, 0)), 104);
+        assert_eq!(s.report(100, 104, every).account_gaps, vec![(102, 104)]);
+    }
+
+    #[test]
+    fn a_block_without_a_bal_commitment_is_never_wanted_and_stays_a_gap() {
+        let mut s = watching(&[A]);
+        let mut seg = run(100, 101, 0, hash(99, 0));
+        for r in &mut seg {
+            r.bal_hash = None; // before Amsterdam
+        }
+        s.install(seg, 101);
+        assert!(s.bals_wanted(8).is_empty());
+        assert_eq!(s.report(99, 101, every).account_gaps, vec![(100, 101)]);
+    }
+
+    #[test]
+    fn account_coverage_ends_where_ancestry_does() {
+        let mut s = watching(&[A]);
+        s.install(run(100, 102, 0, hash(99, 0)), 102);
+        for n in 100..=102 {
+            s.set_account(n, &hash(n, 0), vec![]);
+        }
+        assert!(s.report(99, 102, every).account_gaps.is_empty());
+        assert_eq!(s.report(99, 102, |n, _| n <= 100).account_gaps, vec![(101, 102)]);
+    }
+
+    #[test]
+    fn gaps_of_fills_around_covered_blocks() {
+        assert_eq!(gaps_of(1, 5, [].into_iter()), vec![(1, 5)]);
+        assert_eq!(gaps_of(1, 5, [1, 2, 3, 4, 5].into_iter()), vec![]);
+        assert_eq!(gaps_of(1, 5, [2, 4].into_iter()), vec![(1, 1), (3, 3), (5, 5)]);
+        assert_eq!(gaps_of(1, 5, [1, 5].into_iter()), vec![(2, 4)]);
     }
 
     #[test]
