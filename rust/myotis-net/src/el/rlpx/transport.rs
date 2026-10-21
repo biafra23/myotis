@@ -395,10 +395,12 @@ mod tests {
         assert_eq!(hello.client_id, concat!("myotis/", env!("CARGO_PKG_VERSION")));
         assert_eq!(hello.listen_port, 30303);
         assert_eq!(hello.node_id, pubkey.to_vec());
-        assert_eq!(hello.capabilities.len(), 6);
+        assert_eq!(hello.capabilities.len(), 8);
         assert_eq!(hello.capabilities[3], Capability { name: "eth".into(), version: 69 });
-        assert_eq!(hello.capabilities[4], Capability { name: "snap".into(), version: 1 });
-        assert_eq!(hello.capabilities[5], Capability { name: "snap".into(), version: 2 });
+        assert_eq!(hello.capabilities[4], Capability { name: "eth".into(), version: 70 });
+        assert_eq!(hello.capabilities[5], Capability { name: "eth".into(), version: 71 });
+        assert_eq!(hello.capabilities[6], Capability { name: "snap".into(), version: 1 });
+        assert_eq!(hello.capabilities[7], Capability { name: "snap".into(), version: 2 });
     }
 
     #[test]

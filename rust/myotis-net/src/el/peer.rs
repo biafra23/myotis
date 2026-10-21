@@ -740,6 +740,9 @@ impl ManagedPeer {
     /// verified body. An eth/69 peer's bloomless receipts get their blooms
     /// recomputed there, so callers see one shape across versions.
     pub async fn get_receipts(&self, hashes: &[[u8; 32]]) -> Result<Vec<messages::BlockReceipts>, String> {
+        if self.eth_version >= 70 {
+            return self.get_receipts70(hashes).await;
+        }
         let payload = self
             .request(messages::GET_RECEIPTS, messages::RECEIPTS, |id| {
                 messages::encode_get_receipts(id, hashes)
@@ -753,6 +756,84 @@ impl ManagedPeer {
                 .map_err(|e| format!("Receipts decode: {}", e.0))?
         };
         Ok(blocks)
+    }
+
+    /// [`Self::get_receipts`] on eth/70 (EIP-7975), where a peer may cut a
+    /// block's receipts short and say so. A cut tail block is dropped: the
+    /// whole blocks before it are a prefix every caller takes (and resumes
+    /// after). A cut FIRST block — one block over the peer's response limit —
+    /// is continued with `firstBlockReceiptIndex` until complete, bounded by
+    /// [`RECEIPT_CONTINUATIONS`] rounds that must each add receipts. The
+    /// caller's count and receiptsRoot checks then judge the whole list, as
+    /// for any other answer.
+    async fn get_receipts70(&self, hashes: &[[u8; 32]]) -> Result<Vec<messages::BlockReceipts>, String> {
+        let payload = self
+            .request(messages::GET_RECEIPTS, messages::RECEIPTS, |id| {
+                messages::encode_get_receipts70(id, 0, hashes)
+            })
+            .await?;
+        let (_rid, incomplete, mut blocks) = messages::decode_receipts70(&payload, hashes.len())
+            .map_err(|e| format!("Receipts (eth/70) decode: {}", e.0))?;
+        if !incomplete {
+            return Ok(blocks);
+        }
+        if blocks.len() > 1 {
+            blocks.pop();
+            return Ok(blocks);
+        }
+        let Some(mut first) = blocks.pop() else {
+            return Ok(blocks);
+        };
+        let Some(first_hash) = hashes.first() else {
+            return Err("peer cut receipts nobody asked for".to_string());
+        };
+        for _ in 0..RECEIPT_CONTINUATIONS {
+            let have = first.len() as u64;
+            let payload = self
+                .request(messages::GET_RECEIPTS, messages::RECEIPTS, |id| {
+                    messages::encode_get_receipts70(id, have, std::slice::from_ref(first_hash))
+                })
+                .await?;
+            let (_rid, still_incomplete, more) = messages::decode_receipts70(&payload, 1)
+                .map_err(|e| format!("Receipts (eth/70) decode: {}", e.0))?;
+            let Some(rest) = more.first().filter(|rest| !rest.is_empty()) else {
+                return Err("peer continued a cut block's receipts with none".to_string());
+            };
+            first.append(rest).map_err(|e| e.0)?;
+            if !still_incomplete {
+                return Ok(vec![first]);
+            }
+        }
+        Err(format!("a block's receipts still incomplete after {RECEIPT_CONTINUATIONS} continuations"))
+    }
+
+    /// The block access lists (EIP-7928) of `blocks` — each a block hash with
+    /// its header's `blockAccessListHash` — over eth/71 (EIP-8159) when the
+    /// session runs it, else snap/2 (EIP-8189). The two answer in one shape
+    /// and are verified alike; see [`Self::snap_get_block_access_lists`] for
+    /// what the result means. `Err` for a peer that speaks neither.
+    pub async fn get_block_access_lists(
+        &self,
+        blocks: &[([u8; 32], [u8; 32])],
+    ) -> Result<(Vec<Option<Vec<u8>>>, bool), String> {
+        if self.eth_version < 71 {
+            return self.snap_get_block_access_lists(blocks).await;
+        }
+        let hashes: Vec<[u8; 32]> = blocks.iter().map(|(block, _)| *block).collect();
+        let payload = self
+            .request(messages::GET_BLOCK_ACCESS_LISTS, messages::BLOCK_ACCESS_LISTS, |id| {
+                messages::encode_get_block_access_lists(id, &hashes)
+            })
+            .await?;
+        let (_id, entries) = snap::decode_block_access_lists(&payload, blocks.len())
+            .map_err(|e| format!("BlockAccessLists (eth/71) decode: {}", e.0))?;
+        Ok(verified_bal_entries(entries, blocks))
+    }
+
+    /// Whether the session can be asked for block access lists: eth/71 or
+    /// snap/2.
+    pub fn speaks_bal(&self) -> bool {
+        self.eth_version >= 71 || self.snap_version.is_some_and(|v| v >= 2)
     }
 
     // -----------------------------------------------------------------------
@@ -895,18 +976,9 @@ impl ManagedPeer {
                 snap::encode_get_block_access_lists(id, &hashes, 2 * 1024 * 1024)
             })
             .await?;
-        let (_id, mut entries) = snap::decode_block_access_lists(&payload, blocks.len())
+        let (_id, entries) = snap::decode_block_access_lists(&payload, blocks.len())
             .map_err(|e| format!("BlockAccessLists decode: {}", e.0))?;
-        entries.truncate(blocks.len());
-        let mut forged = false;
-        for (entry, (_, commitment)) in entries.iter_mut().zip(blocks) {
-            if entry.as_ref().is_some_and(|raw| &myotis_core::keccak::keccak256(raw) != commitment) {
-                *entry = None;
-                forged = true;
-            }
-        }
-        entries.resize(blocks.len(), None);
-        Ok((entries, forged))
+        Ok(verified_bal_entries(entries, blocks))
     }
 
     // -----------------------------------------------------------------------
@@ -1138,7 +1210,7 @@ async fn read_loop(
         let request_id = messages::leading_request_id(&frame.payload);
 
         // An inbound Get* request we answer with an empty response.
-        if let Some((resp_code, empty)) = request_id.and_then(|id| empty_answer(code, &snap_codes, id)) {
+        if let Some((resp_code, empty)) = request_id.and_then(|id| empty_answer(code, &snap_codes, id, eth_version)) {
             if let Err(e) = send_frame(&writer, resp_code, &empty).await {
                 fail_all(&pending, &closed, &close_reason, format!("peer write failure on empty response: {e}"))
                     .await;
@@ -1159,10 +1231,32 @@ async fn read_loop(
     closed.store(true, Ordering::SeqCst);
 }
 
+/// Continuations of one block's receipts an eth/70 read may ask for
+/// ([`ManagedPeer::get_receipts70`]): 8 × the peer's response limit (2 MiB
+/// soft) is far more than any block's receipts.
+const RECEIPT_CONTINUATIONS: usize = 8;
+
+/// A BlockAccessLists answer to `blocks`, checked: one entry per block, in
+/// order, each kept only if it hashes to the block's commitment; the `bool`
+/// says some entry did not (a forgery, dropped). A short answer is padded
+/// with `None` (the tail the peer cut).
+fn verified_bal_entries(mut entries: Vec<Option<Vec<u8>>>, blocks: &[([u8; 32], [u8; 32])]) -> (Vec<Option<Vec<u8>>>, bool) {
+    entries.truncate(blocks.len());
+    let mut forged = false;
+    for (entry, (_, commitment)) in entries.iter_mut().zip(blocks) {
+        if entry.as_ref().is_some_and(|raw| &myotis_core::keccak::keccak256(raw) != commitment) {
+            *entry = None;
+            forged = true;
+        }
+    }
+    entries.resize(blocks.len(), None);
+    (entries, forged)
+}
+
 /// If `code` is an inbound eth/snap Get\* request, return the `(responseCode,
 /// emptyBody)` to answer it with — echoing the request's `id`. `None` for any
 /// other frame.
-fn empty_answer(code: u64, snap_codes: &Option<snap::SnapCodes>, id: u64) -> Option<(u64, Vec<u8>)> {
+fn empty_answer(code: u64, snap_codes: &Option<snap::SnapCodes>, id: u64, eth_version: u64) -> Option<(u64, Vec<u8>)> {
     match code {
         messages::GET_BLOCK_HEADERS => {
             Some((messages::BLOCK_HEADERS, messages::encode_empty_response(id)))
@@ -1170,7 +1264,16 @@ fn empty_answer(code: u64, snap_codes: &Option<snap::SnapCodes>, id: u64) -> Opt
         messages::GET_BLOCK_BODIES => {
             Some((messages::BLOCK_BODIES, messages::encode_empty_response(id)))
         }
+        // eth/70 (EIP-7975) puts a lastBlockIncomplete flag in its Receipts.
+        messages::GET_RECEIPTS if eth_version >= 70 => {
+            Some((messages::RECEIPTS, messages::encode_empty_receipts70(id)))
+        }
         messages::GET_RECEIPTS => Some((messages::RECEIPTS, messages::encode_empty_response(id))),
+        // eth/71 (EIP-8159): no block access lists here — answered with zero
+        // entries, as snap/2's are. Below eth/71 the code is the snap base.
+        messages::GET_BLOCK_ACCESS_LISTS if eth_version >= 71 => {
+            Some((messages::BLOCK_ACCESS_LISTS, snap::encode_empty_codes(id)))
+        }
         _ => {
             let c = snap_codes.as_ref()?;
             if code == c.get_account_range {
@@ -1444,29 +1547,42 @@ mod tests {
 
     #[test]
     fn empty_answer_maps_eth_get_star() {
-        let (code, body) = empty_answer(messages::GET_BLOCK_HEADERS, &None, 7).unwrap();
+        let (code, body) = empty_answer(messages::GET_BLOCK_HEADERS, &None, 7, 69).unwrap();
         assert_eq!(code, messages::BLOCK_HEADERS);
         assert_eq!(messages::leading_request_id(&body), Some(7));
 
-        let (code, _) = empty_answer(messages::GET_RECEIPTS, &None, 7).unwrap();
+        let (code, _) = empty_answer(messages::GET_RECEIPTS, &None, 7, 69).unwrap();
+        assert_eq!(code, messages::RECEIPTS);
+        // eth/70 (EIP-7975): Receipts carries a lastBlockIncomplete flag.
+        let (code, body) = empty_answer(messages::GET_RECEIPTS, &None, 7, 70).unwrap();
+        assert_eq!((code, body), (messages::RECEIPTS, messages::encode_empty_receipts70(7)));
+        // eth/71 (EIP-8159): GetBlockAccessLists gets zero entries; below eth/71
+        // the same code is the snap base, never answered as a BAL request.
+        let (code, body) = empty_answer(messages::GET_BLOCK_ACCESS_LISTS, &None, 7, 71).unwrap();
+        assert_eq!((code, body), (messages::BLOCK_ACCESS_LISTS, snap::encode_empty_codes(7)));
+        assert!(empty_answer(messages::GET_BLOCK_ACCESS_LISTS, &None, 7, 70).is_none());
+        let eth69_snap = snap::SnapCodes::negotiated(69, 2);
+        let (code, _) = empty_answer(messages::GET_BLOCK_ACCESS_LISTS, &Some(eth69_snap), 7, 69).unwrap();
+        assert_eq!(code, eth69_snap.account_range, "on eth/69 0x22 is snap GetAccountRange");
+        let (code, _) = empty_answer(messages::GET_RECEIPTS, &None, 7, 69).unwrap();
         assert_eq!(code, messages::RECEIPTS);
 
         // A response code is not an inbound request.
-        assert!(empty_answer(messages::BLOCK_HEADERS, &None, 7).is_none());
+        assert!(empty_answer(messages::BLOCK_HEADERS, &None, 7, 69).is_none());
     }
 
     #[test]
     fn empty_answer_maps_snap_get_star() {
         let codes = snap::SnapCodes::negotiated(68, 1);
-        let (code, body) = empty_answer(codes.get_account_range, &Some(codes), 9).unwrap();
+        let (code, body) = empty_answer(codes.get_account_range, &Some(codes), 9, 69).unwrap();
         assert_eq!(code, codes.account_range);
         assert_eq!(messages::leading_request_id(&body), Some(9));
 
-        let (code, _) = empty_answer(codes.get_byte_codes, &Some(codes), 9).unwrap();
+        let (code, _) = empty_answer(codes.get_byte_codes, &Some(codes), 9, 69).unwrap();
         assert_eq!(code, codes.byte_codes);
 
         // Without snap negotiated, snap codes aren't answered.
-        assert!(empty_answer(codes.get_account_range, &None, 9).is_none());
+        assert!(empty_answer(codes.get_account_range, &None, 9, 69).is_none());
     }
 
     #[test]
@@ -1477,21 +1593,21 @@ mod tests {
 
             // The shared requests are answered on both versions.
             for codes in [v1, v2] {
-                let (code, _) = empty_answer(codes.get_storage_ranges, &Some(codes), 9).unwrap();
+                let (code, _) = empty_answer(codes.get_storage_ranges, &Some(codes), 9, 69).unwrap();
                 assert_eq!(code, codes.storage_ranges);
             }
 
             // GetTrieNodes exists on snap/1 only (EIP-8189 removed it) …
-            let (code, body) = empty_answer(v1.get_trie_nodes, &Some(v1), 9).unwrap();
+            let (code, body) = empty_answer(v1.get_trie_nodes, &Some(v1), 9, 69).unwrap();
             assert_eq!(code, v1.trie_nodes);
             assert_eq!(messages::leading_request_id(&body), Some(9));
-            assert!(empty_answer(v2.get_trie_nodes, &Some(v2), 9).is_none());
+            assert!(empty_answer(v2.get_trie_nodes, &Some(v2), 9, 69).is_none());
 
             // … and GetBlockAccessLists on snap/2 only.
-            let (code, body) = empty_answer(v2.get_block_access_lists, &Some(v2), 9).unwrap();
+            let (code, body) = empty_answer(v2.get_block_access_lists, &Some(v2), 9, 69).unwrap();
             assert_eq!(code, v2.block_access_lists);
             assert_eq!(body, snap::encode_empty_codes(9));
-            assert!(empty_answer(v1.get_block_access_lists, &Some(v1), 9).is_none());
+            assert!(empty_answer(v1.get_block_access_lists, &Some(v1), 9, 69).is_none());
         }
     }
 }

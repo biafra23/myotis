@@ -1765,8 +1765,8 @@ struct ActivityBalStats {
     /// serves is wanted again at every pass, and is counted once.
     wanted: std::collections::BTreeSet<u64>,
     verified: std::collections::BTreeSet<u64>,
-    /// The most snap/2 peers one pass found in the pool.
-    snap2_peers_max: usize,
+    /// The most BAL-capable peers (eth/71 or snap/2) one pass found in the pool.
+    bal_peers_max: usize,
     /// The client ids of the peers that served a verified BAL.
     serving: std::collections::BTreeSet<String>,
 }
@@ -8237,10 +8237,10 @@ impl ElReader {
     /// of the kept blocks that commit to one and have none verified yet,
     /// newest first ([`ACTIVITY_BALS_PER_PASS`]), from up to
     /// [`ACTIVITY_BAL_PEERS`] snap/2 peers, each list verified against its
-    /// header's `blockAccessListHash` ([`ManagedPeer::snap_get_block_access_lists`]).
+    /// header's `blockAccessListHash` ([`ManagedPeer::get_block_access_lists`]: eth/71, else snap/2).
     /// A block no peer served stays an account gap and is asked for again at
     /// the next head. A peer that serves none is not struck: serving BALs is
-    /// optional for a snap/2 peer, and one that does not is no worse at state
+    /// optional, and a peer that does not is no worse at state
     /// reads. One that sends a BAL its header does not commit to is lying,
     /// provably: its verified entries are kept, and it is never asked again
     /// ([`ElReader::activity_bal_liars`]).
@@ -8253,18 +8253,18 @@ impl ElReader {
         }
         let liars = self.activity_bal_liars.lock().map(|l| l.clone()).unwrap_or_default();
         // Recent BAL servers first, so the per-pass cap reaches them.
-        let snap2: Vec<Arc<ManagedPeer>> =
+        let bal_capable: Vec<Arc<ManagedPeer>> =
             self.pool.bal_peers().await.into_iter().filter(|p| !liars.contains(&p.addr())).collect();
         let mut missing = wanted.clone();
         let mut asked = 0usize;
         let mut serving: Vec<String> = Vec::new();
-        for peer in snap2.iter().take(ACTIVITY_BAL_PEERS) {
+        for peer in bal_capable.iter().take(ACTIVITY_BAL_PEERS) {
             if missing.is_empty() {
                 break;
             }
             asked += 1;
             let blocks: Vec<([u8; 32], [u8; 32])> = missing.iter().map(|(_, hash, bal)| (*hash, *bal)).collect();
-            let entries = match peer.snap_get_block_access_lists(&blocks).await {
+            let entries = match peer.get_block_access_lists(&blocks).await {
                 Ok((entries, forged)) => {
                     if forged {
                         tracing::warn!(
@@ -8316,7 +8316,7 @@ impl ElReader {
             wanted = wanted.len(),
             verified = wanted.len() - missing.len(),
             asked,
-            snap2_peers = snap2.len(),
+            bal_peers = bal_capable.len(),
             "activity: block access lists pass"
         );
         let Ok(mut stats) = self.activity_bal_stats.lock() else {
@@ -8326,7 +8326,7 @@ impl ElReader {
         stats.passes += 1;
         stats.wanted.extend(wanted.iter().map(|(n, _, _)| *n));
         stats.verified.extend(wanted.iter().filter(|w| !missing.contains(w)).map(|(n, _, _)| *n));
-        stats.snap2_peers_max = stats.snap2_peers_max.max(snap2.len());
+        stats.bal_peers_max = stats.bal_peers_max.max(bal_capable.len());
         stats.serving.extend(serving);
         if since.elapsed() >= ACTIVITY_BAL_LOG_EVERY {
             let done = std::mem::take(&mut *stats);
@@ -8334,7 +8334,7 @@ impl ElReader {
                 passes = done.passes,
                 wanted = done.wanted.len(),
                 verified = done.verified.len(),
-                snap2_peers_max = done.snap2_peers_max,
+                bal_peers_max = done.bal_peers_max,
                 serving = ?done.serving,
                 "activity: block access lists in the last minute"
             );

@@ -59,7 +59,7 @@ Comparison of the [architecture document](architecture-doc.md) against what is a
 - Inbound: neither engine accepts inbound RLPx (outbound dialer only; [design](inbound-connections.md)). Both answer peers' `GetBlockHeaders` from a small served-header window (default 32, Settings-adjustable) so eth/69 peers keep them; the Rust libp2p host accepts inbound CL connections but serves no light-client protocols (roost does).
 
 **Not implemented:**
-- EIP-4444 fallback strategies; inbound EL connections; eth/70–71 (Amsterdam's partial receipts and BAL exchange — tracked in the Glamsterdam plan, B.5).
+- EIP-4444 fallback strategies; inbound EL connections; eth/70–71 on the Java engine (Amsterdam's partial receipts and BAL exchange — the Rust engine speaks both, #691; Glamsterdam plan, B.5).
 
 ## 5. State Data — SNAP Protocol
 **Implemented (both engines)**

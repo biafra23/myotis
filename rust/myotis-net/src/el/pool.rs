@@ -345,7 +345,7 @@ const READ_FAIL_BENCH: Duration = Duration::from_secs(30);
 /// last BAL.
 const BAL_SHIELD_FOR: Duration = Duration::from_secs(300);
 
-/// Dials the snap/2 hunt ([`bal_hunt_tick`]) launches per maintainer tick.
+/// Dials the BAL hunt ([`bal_hunt_tick`]) launches per maintainer tick.
 const BAL_HUNT_DIALS: usize = 2;
 
 /// Consecutive verified-read failures that EVICT a live peer, freeing its
@@ -720,15 +720,15 @@ struct PoolInner {
     last_scarcity_log: Mutex<Option<Instant>>,
     /// A host follows address activity on a chain whose blocks commit to
     /// BALs (#691; [`PeerPool::set_bal_demand`]): the pool then keeps its one
-    /// recent BAL server ([`bal_shielded`]) and, holding no snap/2 peer,
+    /// recent BAL server ([`bal_shielded`]) and, holding no BAL-capable peer,
     /// dials for one past the target ([`bal_hunt_tick`]).
     bal_demand: std::sync::atomic::AtomicBool,
-    /// Addresses whose session this run negotiated snap/1 only: the snap/2
-    /// hunt does not dial them again.
+    /// Addresses whose session this run negotiated neither eth/71 nor
+    /// snap/2: the BAL hunt does not dial them again.
     bal_snap1: std::sync::Mutex<HashSet<SocketAddr>>,
-    /// Where the snap/2 hunt's last walk of the discovery table stopped.
+    /// Where the BAL hunt's last walk of the discovery table stopped.
     bal_hunt_cursor: std::sync::atomic::AtomicUsize,
-    /// When the snap/2 hunt last logged at INFO.
+    /// When the BAL hunt last logged at INFO.
     last_bal_hunt_log: std::sync::Mutex<Option<Instant>>,
     /// The host-owned fork watch (EIP-2124 stale-software detection), fed the
     /// fork id of every compatible peer's Status. Set once right after start —
@@ -1261,9 +1261,9 @@ impl PoolInner {
 
     /// Dial one candidate through the full eth+snap handshake, updating the
     /// bookkeeping by outcome. `addr` is already in `attempted`.
-    /// `snap2_only`: the snap/2 hunt's dial ([`bal_hunt_tick`]) — a peer that
+    /// `bal_only`: the BAL hunt's dial ([`bal_hunt_tick`]) — a peer that
     /// negotiates snap/1 is not pooled past the target.
-    async fn dial_one(self: &Arc<PoolInner>, addr: SocketAddr, pubkey: [u8; 64], snap2_only: bool) {
+    async fn dial_one(self: &Arc<PoolInner>, addr: SocketAddr, pubkey: [u8; 64], bal_only: bool) {
         let conn = match RlpxConnection::dial_metered(Arc::clone(&self.key), addr, pubkey, Some(Arc::clone(&self.traffic))).await {
             Ok(conn) => conn,
             Err(e) => {
@@ -1322,16 +1322,17 @@ impl PoolInner {
         }
         match result {
             Ok(session) if session.snap => {
-                // The snap/2 hunt skips a peer it has seen speak snap/1 only.
-                if session.snap_version.unwrap_or(0) < 2 {
+                // The BAL hunt skips a peer it has seen speak neither BAL
+                // protocol (eth/71, snap/2).
+                if session.snap_version.unwrap_or(0) < 2 && session.eth_version < 71 {
                     if let Ok(mut snap1) = self.bal_snap1.lock() {
                         snap1.insert(addr);
                     }
                     let full = self.peers.lock().await.len() >= self.pool_cfg.target_snap_peers;
-                    if snap2_only && full {
-                        // The hunt's extra slot is for a snap/2 peer only. A
-                        // usable snap peer still: cached as one, cooled off.
-                        tracing::debug!(%addr, "el dial: snap/1 peer on the snap/2 hunt's slot — not pooling");
+                    if bal_only && full {
+                        // The hunt's extra slot is for a BAL-capable peer only.
+                        // A usable snap peer still: cached as one, cooled off.
+                        tracing::debug!(%addr, "el dial: peer without eth/71 or snap/2 on the BAL hunt's slot — not pooling");
                         {
                             let mut cache = self.cache.lock().await;
                             cache.record_connect_success(addr);
@@ -1559,8 +1560,8 @@ impl PeerPool {
     /// added. Prunes closed peers first.
     /// Say whether block access lists are wanted (#691): a host follows
     /// address activity on a chain whose blocks commit to them. While on, the
-    /// pool keeps its one recent BAL server and hunts for a snap/2 peer when
-    /// it holds none.
+    /// pool keeps its one recent BAL server and hunts for a BAL-capable peer (eth/71 or
+    /// snap/2) when it holds none.
     pub fn set_bal_demand(&self, wanted: bool) {
         self.inner.bal_demand.store(wanted, Ordering::Relaxed);
     }
@@ -1577,7 +1578,8 @@ impl PeerPool {
         cache.flush();
     }
 
-    /// The pooled snap/2 peers, the ones that served a verified BAL most
+    /// The pooled peers that speak a BAL protocol (eth/71 or snap/2,
+    /// [`ManagedPeer::speaks_bal`]), the ones that served a verified BAL most
     /// recently first, then the read ladder's order.
     pub async fn bal_peers(&self) -> Vec<Arc<ManagedPeer>> {
         let served: HashMap<SocketAddr, Instant> = self
@@ -1589,7 +1591,7 @@ impl PeerPool {
             .filter_map(|p| p.bal_served_at.map(|t| (p.addr, t)))
             .collect();
         let mut out: Vec<Arc<ManagedPeer>> =
-            self.snap_peers().await.into_iter().filter(|p| p.snap_version.is_some_and(|v| v >= 2)).collect();
+            self.snap_peers().await.into_iter().filter(|p| p.speaks_bal()).collect();
         // Stable: unserved peers keep the ladder's order behind the servers.
         out.sort_by_key(|p| std::cmp::Reverse(served.get(&p.addr()).copied()));
         out
@@ -2406,12 +2408,12 @@ async fn try_dial_verdict(
     try_dial_with(inner, addr, pubkey, false).await
 }
 
-/// [`try_dial_verdict`], with `snap2_only` passed to [`PoolInner::dial_one`].
+/// [`try_dial_verdict`], with `bal_only` passed to [`PoolInner::dial_one`].
 async fn try_dial_with(
     inner: &Arc<PoolInner>,
     addr: SocketAddr,
     pubkey: [u8; 64],
-    snap2_only: bool,
+    bal_only: bool,
 ) -> DialVerdict {
     if inner.blacklist.lock().await.contains(&pubkey) {
         return DialVerdict::Skipped;
@@ -2461,7 +2463,7 @@ async fn try_dial_with(
         // wrong chain, lagging) is stamped here; a pooled one is live and
         // stamped again when its session ends.
         let _stamp = DirectContactOnDrop(pubkey);
-        inner2.dial_one(addr, pubkey, snap2_only).await;
+        inner2.dial_one(addr, pubkey, bal_only).await;
         drop(permit);
     });
     DialVerdict::Dialed
@@ -2899,7 +2901,7 @@ async fn maintainer_loop(inner: Arc<PoolInner>) {
             return; // pool shutting down
         }
         // A BAL server for the address-activity follower (#691), even past the
-        // target: by one slot, and only for a snap/2 peer.
+        // target: by one slot, and only for a peer speaking eth/71 or snap/2.
         if !bal_hunt_tick(&inner, live).await {
             return; // pool shutting down
         }
@@ -2960,11 +2962,11 @@ fn spawn_dns_walk(inner: &Arc<PoolInner>, seeder: Arc<DnsSeeder>) {
     });
 }
 
-/// One tick of the snap/2 hunt (#691): while BALs are wanted and the pool
-/// holds no snap/2 peer, dial up to [`BAL_HUNT_DIALS`] candidates for one —
+/// One tick of the BAL hunt (#691): while BALs are wanted and the pool
+/// holds no peer speaking eth/71 or snap/2, dial up to [`BAL_HUNT_DIALS`] candidates for one —
 /// first the cache's BAL servers, then discovery's table from where the last
 /// walk stopped — allowing ONE slot past the target, which only a snap/2
-/// peer may take ([`PoolInner::dial_one`]'s `snap2_only`). Peers seen
+/// peer may take ([`PoolInner::dial_one`]'s `bal_only`). Peers seen
 /// speaking snap/1 this run are skipped. No pooled peer is evicted for it,
 /// so the state-serving peers keep their slots. `false` when the pool is
 /// shutting down.
@@ -2973,7 +2975,7 @@ async fn bal_hunt_tick(inner: &Arc<PoolInner>, live: usize) -> bool {
     if !inner.bal_demand.load(Ordering::Relaxed) || live > target {
         return true;
     }
-    if inner.peers.lock().await.iter().any(|p| p.peer.snap_version.is_some_and(|v| v >= 2)) {
+    if inner.peers.lock().await.iter().any(|p| p.peer.speaks_bal()) {
         return true;
     }
     let snap1 = inner.bal_snap1.lock().map(|s| s.clone()).unwrap_or_default();
@@ -3038,7 +3040,7 @@ async fn bal_hunt_tick(inner: &Arc<PoolInner>, live: usize) -> bool {
                 target,
                 dialed,
                 skipped_snap1 = snap1.len(),
-                "EL pool holds no snap/2 peer while block access lists are wanted — dialing for one past the target"
+                "EL pool holds no eth/71 or snap/2 peer while block access lists are wanted — dialing for one past the target"
             );
         }
     }

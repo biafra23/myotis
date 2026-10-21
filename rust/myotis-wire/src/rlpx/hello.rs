@@ -17,9 +17,11 @@ pub const P2P_PONG: u64 = 0x03;
 pub const CLIENT_ID: &str = concat!("myotis/", env!("CARGO_PKG_VERSION"));
 
 /// Build a p2p Hello body: `[protocolVersion, clientId, [[cap,ver]…], listenPort, nodeId]`.
-/// Advertises eth/66-69 + snap/1 + snap/2 (ascending), matching the Java
-/// `HelloMessage`. Both snap versions are offered so the session runs whichever
-/// one the peer has — the highest shared (see `eth::session::negotiate`).
+/// Advertises eth/66-71 + snap/1 + snap/2 (ascending). The Java `HelloMessage`
+/// stops at eth/69: eth/70 (EIP-7975 receipts) and eth/71 (EIP-8159 block
+/// access lists) are the Rust engine's alone. Both snap versions are offered
+/// so the session runs whichever one the peer has — the highest shared (see
+/// `eth::session::negotiate`).
 pub fn encode_hello(node_pubkey: &[u8; 64], listen_port: u16) -> Vec<u8> {
     encode_hello_as(node_pubkey, listen_port, CLIENT_ID)
 }
@@ -42,6 +44,8 @@ pub fn encode_hello_as(node_pubkey: &[u8; 64], listen_port: u16, client_id: &str
             cap("eth", 67),
             cap("eth", 68),
             cap("eth", 69),
+            cap("eth", 70),
+            cap("eth", 71),
             cap("snap", 1),
             cap("snap", 2),
         ]),
