@@ -674,6 +674,8 @@ internal object IntegrityCheckingUniffiLib {
     }
     external fun uniffi_myotis_engine_checksum_func_accept_stale_anchor(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_address_activity_json(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_available_networks_json(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_canonical_network_name(
@@ -748,6 +750,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_send_raw_transaction_json(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_set_activity_watch(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_set_dns_discovery(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_set_log_index_config(
@@ -785,6 +789,8 @@ internal object UniffiLib {
     }
     external fun uniffi_myotis_engine_fn_func_accept_stale_anchor(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
+    external fun uniffi_myotis_engine_fn_func_address_activity_json(`handle`: Long,`afterBlock`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_available_networks_json(uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_canonical_network_name(`nameOrAlias`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -859,6 +865,8 @@ internal object UniffiLib {
     ): Byte
     external fun uniffi_myotis_engine_fn_func_send_raw_transaction_json(`handle`: Long,`rawTxHex`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_set_activity_watch(`handle`: Long,`configJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
     external fun uniffi_myotis_engine_fn_func_set_dns_discovery(`on`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_myotis_engine_fn_func_set_log_index_config(`handle`: Long,`configJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1003,6 +1011,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_myotis_engine_checksum_func_accept_stale_anchor() and 0xFFFF) != 5742) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_myotis_engine_checksum_func_address_activity_json() and 0xFFFF) != 44174) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_myotis_engine_checksum_func_available_networks_json() and 0xFFFF) != 49639) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1112,6 +1123,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_send_raw_transaction_json() and 0xFFFF) != 13582) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_myotis_engine_checksum_func_set_activity_watch() and 0xFFFF) != 19585) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_set_dns_discovery() and 0xFFFF) != 13006) {
@@ -1407,6 +1421,22 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     
         
         FfiConverterLong.lower(`handle`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * The watched addresses' activity in the verified blocks after `after_block`,
+         * from what the follower kept: no I/O (#691; see host docs for the shape).
+         */ fun `addressActivityJson`(`handle`: kotlin.Long, `afterBlock`: kotlin.Long): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_address_activity_json(
+    
+        
+        FfiConverterLong.lower(`handle`),
+        FfiConverterLong.lower(`afterBlock`),_status)
 }
     )
     }
@@ -2045,6 +2075,22 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         
         FfiConverterLong.lower(`handle`),
         FfiConverterString.lower(`rawTxHex`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Install the address-activity watch list (#691; JSON
+         * `{"watch":[…],"unwatch":[…]}`, additive). False = refused, nothing changed.
+         */ fun `setActivityWatch`(`handle`: kotlin.Long, `configJson`: kotlin.String): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_set_activity_watch(
+    
+        
+        FfiConverterLong.lower(`handle`),
+        FfiConverterString.lower(`configJson`),_status)
 }
     )
     }

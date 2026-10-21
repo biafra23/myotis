@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 50; // 50: dataUsage + networkMetering in the status, set_network_metering; 49: ens offchain envelope carries reverseClaim; 48: log-index topic entries (#673); 47: resolve_block_hash_json, get_proof_json takes a block hash; 46: get_proof_json; 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
+    static final int EXPECTED_ABI_VERSION = 51; // 51: set_activity_watch + address_activity_json (#691); 50: dataUsage + networkMetering in the status, set_network_metering; 49: ens offchain envelope carries reverseClaim; 48: log-index topic entries (#673); 47: resolve_block_hash_json, get_proof_json takes a block hash; 46: get_proof_json; 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
 
     private static final boolean AVAILABLE = load();
 
@@ -453,6 +453,16 @@ final class RustEngineNative {
     /** Log-index status JSON (enabled, counts, coverage per entry). */
     static String nativeLogIndexStatusJson(long handle) {
         return Myotis_engineKt.logIndexStatusJson(handle);
+    }
+
+    /** Install the address-activity watch list (#691); false = refused/unavailable. */
+    static boolean nativeSetActivityWatch(long handle, String configJson) {
+        return Myotis_engineKt.setActivityWatch(handle, nz(configJson));
+    }
+
+    /** Address-activity JSON (#691; {"error":...} when not running). */
+    static String nativeAddressActivityJson(long handle, long afterBlock) {
+        return Myotis_engineKt.addressActivityJson(handle, afterBlock);
     }
 
     /** Read-fetch shadow-cache counters JSON (docs/read-stats.md). */

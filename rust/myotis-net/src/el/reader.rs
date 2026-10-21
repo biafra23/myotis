@@ -1737,6 +1737,11 @@ pub(crate) const FEE_HISTORY_MAX_BLOCKS: u64 = 10;
 /// within a second of the head for the price of a lock read.
 const FEE_FOLLOW_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How often the address-activity follower (#691) checks for a new anchored
+/// head. A tick with no new head is a lock read; one with a new head fetches
+/// the headers above the kept top, usually one or two.
+const ACTIVITY_FOLLOW_TICK: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Budget for one background fee refresh (estimate or one feeHistory shape).
 const FEE_REFRESH_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -2107,6 +2112,12 @@ pub struct ElReader {
     /// The fee follower (see [`Self::ensure_fee_follower`]): refreshes the fee
     /// reads a wallet is polling on every new head, off the request path.
     fee_follow_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The address-activity watch list and the verified blocks kept for it
+    /// (#691; [`crate::el::activity`]). In memory only: it dies with the
+    /// reader, and the host's stash re-applies the list on resume.
+    activity: std::sync::Mutex<crate::el::activity::ActivityState>,
+    /// The activity follower (see [`Self::ensure_activity_follower`]).
+    activity_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Permits for the fee computes a read left running ([`FEE_COMPUTES_MAX`]).
     fee_compute_permits: Arc<tokio::sync::Semaphore>,
     /// The pre-broadcast check's detached account reads in flight (#531;
@@ -2328,6 +2339,8 @@ impl ElReader {
             fee_estimate_compute: Arc::new(tokio::sync::Mutex::new(())),
             fee_fill: tokio::sync::Mutex::new(()),
             fee_follow_task: std::sync::Mutex::new(None),
+            activity: std::sync::Mutex::new(crate::el::activity::ActivityState::default()),
+            activity_task: std::sync::Mutex::new(None),
             fee_compute_permits: Arc::new(tokio::sync::Semaphore::new(FEE_COMPUTES_MAX)),
             send_check_permits: Arc::new(tokio::sync::Semaphore::new(send_check::DETACHED_READS_MAX)),
             fee_stored: tokio::sync::Notify::new(),
@@ -7987,6 +8000,153 @@ impl ElReader {
         }
     }
 
+    /// Apply an address-activity push (#691; see [`crate::el::activity`]):
+    /// drop `unwatch`, add `watch`, and run the follower while the list is
+    /// non-empty. `Err` = refused, nothing changed.
+    pub fn set_activity_watch(
+        self: &Arc<Self>,
+        watch: &[[u8; 20]],
+        unwatch: &[[u8; 20]],
+    ) -> Result<(), String> {
+        let active = {
+            let mut state = self.activity.lock().map_err(|_| "activity lock poisoned".to_string())?;
+            state.apply(watch, unwatch)?;
+            state.is_active()
+        };
+        if active {
+            self.ensure_activity_follower();
+        }
+        Ok(())
+    }
+
+    /// The watched addresses' activity in `(after, head]`, from what the
+    /// follower has kept: no I/O. `None` before the beacon anchors a head.
+    pub fn activity_report(&self, after: u64) -> Option<crate::el::activity::ActivityReport> {
+        let (head, _) = self.anchored_head().ok()?;
+        let state = self.activity.lock().ok()?;
+        Some(state.report(after, head))
+    }
+
+    /// Spawn (or keep) the activity follower. Idempotent; a no-op outside a
+    /// tokio runtime. Holds only a WEAK reference, like the fee follower, so
+    /// it never blocks the host's teardown; `stop` aborts it. It ends itself
+    /// once the watch list is empty, and the next non-empty push respawns it.
+    fn ensure_activity_follower(self: &Arc<Self>) {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if *self.request_shutdown.borrow() {
+            return;
+        }
+        let Ok(mut slot) = self.activity_task.lock() else {
+            return;
+        };
+        if slot.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        *slot = Some(rt.spawn(async move {
+            let mut tick = tokio::time::interval(ACTIVITY_FOLLOW_TICK);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let Some(reader) = weak.upgrade() else {
+                    return;
+                };
+                if !reader.activity_follow_tick().await {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// One follower pass: bring the kept run up to the anchored head.
+    /// `false` = the watch list is empty, stop following.
+    ///
+    /// Usually the window is `[top ..= head]`, a header or two: its lowest
+    /// header must be the kept top, by hash, and the parent links then vouch
+    /// for every kept block below it. When it is not (a reorg reached the
+    /// top), or nothing is kept, or the head jumped past [`activity::WINDOW`],
+    /// one full window is fetched and installed; whatever it cannot link to
+    /// is dropped, and the report shows it as a gap. A failed fetch keeps
+    /// what is kept: the blocks above it are a gap until a later tick.
+    async fn activity_follow_tick(&self) -> bool {
+        use crate::el::activity::{BlockRecord, WINDOW};
+        let Ok(top) = self.activity.lock().map(|s| s.is_active().then(|| s.top())) else {
+            return false;
+        };
+        let Some(top) = top else {
+            return false;
+        };
+        if *self.request_shutdown.borrow() {
+            return false;
+        }
+        let Ok(head) = self.anchored_head() else {
+            return true;
+        };
+        if top == Some(head) {
+            return true;
+        }
+        let deep_from = head.0.saturating_sub(WINDOW - 1);
+        let shallow_from = top.and_then(|(t, _)| (t < head.0 && head.0 - t < WINDOW).then_some(t));
+        let mut window = None;
+        if let Some(from) = shallow_from {
+            match self.head_anchored_header_window(from, head).await {
+                Ok(w) if w.first().map(|h| (h.header.number, h.hash)) == top => window = Some(w),
+                Ok(_) => tracing::debug!(head = head.0, "activity: the kept top is not canonical any more; refetching the window"),
+                Err(e) => {
+                    tracing::debug!(error = %pool_read_error_text(&e), "activity: header window failed");
+                    return true;
+                }
+            }
+        }
+        let window = match window {
+            Some(w) => w,
+            None => match self.head_anchored_header_window(deep_from, head).await {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::debug!(error = %pool_read_error_text(&e), "activity: header window failed");
+                    return true;
+                }
+            },
+        };
+        let segment: Vec<BlockRecord> = window
+            .into_iter()
+            .filter_map(|vh| {
+                let bloom: [u8; 256] = vh.header.logs_bloom.as_slice().try_into().ok()?;
+                Some(BlockRecord {
+                    number: vh.header.number,
+                    hash: vh.hash,
+                    parent_hash: vh.header.parent_hash,
+                    bloom: Box::new(bloom),
+                })
+            })
+            .collect();
+        if let Ok(mut state) = self.activity.lock() {
+            // A push that emptied the list while this tick fetched must not be
+            // refilled: its records were cleared on purpose.
+            if state.is_active() {
+                state.install(segment, head.0);
+            }
+        }
+        true
+    }
+
+    /// Abort and await the activity follower (teardown; see [`Self::stop`]).
+    /// (A tip-lag failure's deferred strikes are forgiven, never banked: the
+    /// next tick asks again against a newer anchor, which is the retry they
+    /// are deferred for.)
+    async fn stop_activity_follower(&self) {
+        let handle = match self.activity_task.lock() {
+            Ok(mut t) => t.take(),
+            Err(_) => None,
+        };
+        if let Some(h) = handle {
+            h.abort();
+            let _ = h.await;
+        }
+    }
+
     /// Verified `eth_feeHistory` (the Java `rpcFeeHistory` twin). `newest_block`
     /// `None` = the latest tag (the beacon-anchored head); `reward_percentiles`
     /// `None` omits the reward matrix (its per-block cost is a verified body +
@@ -9331,6 +9491,7 @@ impl ElReader {
         // Stop producers before collecting/draining registered work.
         self.stop_log_index_appender().await;
         self.stop_fee_follower().await;
+        self.stop_activity_follower().await;
         // Log the window so far: a pause or stop would otherwise lose it
         // (#532 review). A read the stop cancelled is not in it.
         log_fee_summary(self.with_fee_cache(|c| c.stats.flush(Instant::now())).ok().flatten());
@@ -9461,6 +9622,13 @@ impl WindowTop {
         } else {
             "the finalized block"
         }
+    }
+}
+
+/// The message of a pool read's failure, for a log line.
+fn pool_read_error_text(e: &PoolReadError) -> &str {
+    match e {
+        PoolReadError::Fatal(error) | PoolReadError::TipLag { error, .. } => error,
     }
 }
 

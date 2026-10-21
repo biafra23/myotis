@@ -36,7 +36,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 50
+#define MYOTIS_ABI_VERSION 51
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -387,6 +387,27 @@ void myotis_string_free(char *s);
 char *myotis_get_logs_json(int64_t handle, const char *filter_json);
 bool myotis_set_log_index_config(int64_t handle, const char *config_json);
 char *myotis_log_index_status_json(int64_t handle);
+
+/* v51: address activity (#691). set_activity_watch takes {"watch":["0x..",..]?,
+ * "unwatch":["0x..",..]?}: drop `unwatch`, then add `watch` (additive — an
+ * address left out of `watch` stays watched). The engine follows verified
+ * heads for activity only while the list is non-empty. false = refused,
+ * nothing changed: malformed JSON, an entry that is not a 20-byte hex address,
+ * an address under both keys, more than 1024 addresses, or a handle that is
+ * not running.
+ *
+ * address_activity_json answers, with no I/O, which watched addresses the
+ * verified blocks (after_block, head] touched:
+ * {"from","to","base":{"block","hash"|null},"gaps":{"account":[[a,b]..],
+ * "log":[[a,b]..]},"touched":[{"address","block","blockHash","via":["log"]}..],
+ * "watching":["0x..",..]}. Every block of [from, to] is covered or in a gap,
+ * per kind: a watched address absent from `touched` for a covered block was not
+ * touched. "log" is the header's logs bloom (a hit may be a false positive);
+ * "account" needs block access lists and is a gap on every block for now. The
+ * follower keeps the last 256 blocks; anything older, paused or not yet
+ * fetched is a gap. {"error":..} when the handle is not running. */
+bool myotis_set_activity_watch(int64_t handle, const char *config_json);
+char *myotis_address_activity_json(int64_t handle, int64_t after_block);
 
 /* v28: the read-fetch shadow-cache counters (docs/read-stats.md): how much of
  * the verified account / storage / bytecode fetch traffic a cache would have

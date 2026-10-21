@@ -352,7 +352,14 @@ uniffi::setup_scaffolding!();
 ///      network. An additive function pair plus a payload extension —
 ///      bumped so a host that reports metering is never paired with an
 ///      engine that lacks the function.
-pub const ABI_VERSION: i32 = 50;
+/// v51: address activity (#691). `set_activity_watch` / `address_activity_json`
+///      (C: `myotis_set_activity_watch` / `myotis_address_activity_json`): a
+///      host installs a watch list, and the engine reports which watched
+///      addresses each verified block touched (the header's logs bloom so
+///      far), with every block it could not check listed as a gap. An
+///      additive function pair — bumped so a host that relies on the report
+///      is never paired with an engine that lacks it.
+pub const ABI_VERSION: i32 = 51;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

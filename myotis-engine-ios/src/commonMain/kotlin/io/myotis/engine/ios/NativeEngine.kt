@@ -51,6 +51,9 @@ internal interface NativeEngine {
     fun ensRecordJson(handle: Long, paramsJson: String): String
     fun setLogIndexConfig(handle: Long, configJson: String): Boolean
     fun logIndexStatusJson(handle: Long): String
+    fun setActivityWatch(handle: Long, configJson: String): Boolean
+    /** Null only defensively (no C string came back). */
+    fun addressActivityJson(handle: Long, afterBlock: Long): String?
     /** Null only defensively (no C string came back): an unknown or stopped handle is an `{"error":…}` object. */
     fun getLogsJson(handle: Long, filterJson: String): String?
 }

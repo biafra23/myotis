@@ -241,6 +241,41 @@ public interface ChainHandle {
     }
 
     /**
+     * Install the address-activity watch list (#691) as JSON
+     * ({@code {"watch":["0x…"]?,"unwatch":["0x…"]?}}): drop {@code unwatch},
+     * then add {@code watch}. ADDITIVE like {@link #setLogIndexConfig}: an
+     * address left out of {@code watch} stays watched. The engine follows
+     * verified heads for activity only while the list is non-empty, and keeps
+     * it across a pause and resume of this chain, not across a restart.
+     * {@code false} = refused, nothing changed: malformed JSON, an entry that
+     * is not a 20-byte hex address, an address under both keys, more than 1024
+     * addresses, or a chain that is not running.
+     * Default false: no activity follower on this engine.
+     */
+    default boolean setActivityWatch(String configJson) {
+        return false;
+    }
+
+    /**
+     * Which watched addresses the verified blocks after {@code afterBlock}
+     * touched (#691), answered from what the follower kept, with no I/O:
+     * {@code {"from","to","base":{"block","hash"|null},"gaps":{"account":[[a,b]…],
+     * "log":[[a,b]…]},"touched":[{"address","block","blockHash","via":["log"]}…],
+     * "watching":["0x…"…]}}. Every block of {@code [from, to]} (to = the
+     * verified head) is covered or listed in {@code gaps}, per kind, so a
+     * watched address absent from {@code touched} for a covered block was not
+     * touched; a block the follower did not check is a gap, never a silence.
+     * {@code "log"} is the header's logs bloom (a hit may be a false
+     * positive); {@code "account"} needs block access lists and is a gap on
+     * every block for now. Above finality a block can come back with a new
+     * {@code blockHash}. {@code {"error":…}} when the chain is not running.
+     * Default {@code null}: no activity follower on this engine.
+     */
+    default String addressActivityJson(long afterBlock) {
+        return null;
+    }
+
+    /**
      * Read-fetch shadow-cache counters as JSON (schema 1; docs/read-stats.md):
      * how much of this chain's verified account / storage / bytecode fetch
      * traffic a cache — and which keying — would have served, with the
