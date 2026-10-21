@@ -478,16 +478,6 @@ fn ladder_order(keys: &[LadderKey]) -> Vec<usize> {
     order
 }
 
-/// Live verdict after a verified-read failure — pure. Returns
-/// `(new_fail_count, evict)`: evict once the count reaches
-/// [`READ_FAILS_EVICT`], except for the sole remaining peer.
-///
-/// A sole peer's failures are NOT banked (`read_fails` stays 0): a failure
-/// against the only server is ambiguous — likely our own stale ask, the same
-/// reason the persisted-verdict guard shields it — so banking strikes there
-/// would evict it on its very next failure the instant the pool grows, before
-/// it has actually failed as a NON-sole peer. It is still benched by the
-/// caller (30 s) so a second peer, once found, leads the ladder.
 /// Pure: whether a peer is spared an eviction as the pool's one BAL server
 /// (#691) — BALs are wanted, it served a verified one within
 /// [`BAL_SHIELD_FOR`], and no other pooled peer did. One peer at most, so a
@@ -509,13 +499,23 @@ fn bal_hunt_due(demand: bool, live: usize, target: usize, recent_server: bool) -
 
 /// Pure: whether a peer the BAL hunt dialed may be pooled with `len` peers
 /// already in: below the target as any peer is, and into the one slot past
-/// it only if it speaks a BAL protocol. Checked at admission, since the dials
-/// of a tick (and one still in its handshake at the next) all count against
-/// the same slot.
+/// it only if it speaks a BAL protocol. Checked at admission, under the lock
+/// that inserts the peer, since the dials of a tick (and one still in its
+/// handshake at the next) all count against the same slot.
 fn bal_only_admits(len: usize, target: usize, can_bal: bool) -> bool {
     len < target || (len == target && can_bal)
 }
 
+/// Live verdict after a verified-read failure — pure. Returns
+/// `(new_fail_count, evict)`: evict once the count reaches
+/// [`READ_FAILS_EVICT`], except for the sole remaining peer.
+///
+/// A sole peer's failures are NOT banked (`read_fails` stays 0): a failure
+/// against the only server is ambiguous — likely our own stale ask, the same
+/// reason the persisted-verdict guard shields it — so banking strikes there
+/// would evict it on its very next failure the instant the pool grows, before
+/// it has actually failed as a NON-sole peer. It is still benched by the
+/// caller (30 s) so a second peer, once found, leads the ladder.
 fn read_failure_verdict(fails_before: u32, pool_len: usize) -> (u32, bool) {
     if pool_len <= 1 {
         return (0, false);
@@ -1182,6 +1182,15 @@ impl PoolInner {
         self.peers.lock().await.iter().filter(|p| pred(p.is_benched(now), p.peer.coverage())).count()
     }
 
+    /// Whether the peer at `addr` is the pool's one recent BAL server and BALs
+    /// are wanted ([`bal_shielded`]), judged over `peers` (the locked list).
+    fn shields_bal_server(&self, peers: &[PooledPeer], addr: SocketAddr, now: Instant) -> bool {
+        let recent = |t: &Option<Instant>| t.is_some_and(|t| now.saturating_duration_since(t) < BAL_SHIELD_FOR);
+        let this = peers.iter().find(|p| p.addr == addr).is_some_and(|p| recent(&p.bal_served_at));
+        let other = peers.iter().any(|p| p.addr != addr && recent(&p.bal_served_at));
+        bal_shielded(self.bal_demand.load(Ordering::Relaxed), this, other)
+    }
+
     /// Evict a pooled peer as LAGGING — its own word, or its answers to the
     /// head probe, put it behind the anchored head — with the long backoff and
     /// no cache verdict (lagging is not a snap-quality judgement). Never the
@@ -1194,15 +1203,6 @@ impl PoolInner {
     /// backoff is recorded, the ordering the read-failure eviction in
     /// `record_quality` documents, so a concurrent dial cannot re-dial it in
     /// the gap.
-    /// Whether the peer at `addr` is the pool's one recent BAL server and BALs
-    /// are wanted ([`bal_shielded`]), judged over `peers` (the locked list).
-    fn shields_bal_server(&self, peers: &[PooledPeer], addr: SocketAddr, now: Instant) -> bool {
-        let recent = |t: &Option<Instant>| t.is_some_and(|t| now.saturating_duration_since(t) < BAL_SHIELD_FOR);
-        let this = peers.iter().find(|p| p.addr == addr).is_some_and(|p| recent(&p.bal_served_at));
-        let other = peers.iter().any(|p| p.addr != addr && recent(&p.bal_served_at));
-        bal_shielded(self.bal_demand.load(Ordering::Relaxed), this, other)
-    }
-
     async fn evict_lagging(&self, addr: SocketAddr, why: &str) {
         // The evicted peer's client id, read before its entry goes (the
         // `client=` of the log line below). Not pooled, or the sole peer:
@@ -1416,20 +1416,45 @@ impl PoolInner {
                     self.head_source.clone(),
                 ));
                 // Keep `addr` in `attempted` while connected — dropped by
-                // prune_closed when the peer later closes.
-                self.peers.lock().await.push(PooledPeer {
-                    addr,
-                    peer,
-                    admitted_at: Instant::now(),
-                    benched_until: None,
-                    read_fails: 0,
-                    outpaced: 0,
-                    served: 0,
-                    cache_confirmed,
-                    last_probe: None,
-                    probe_misses: 0,
-                    bal_served_at: None,
-                });
+                // prune_closed when the peer later closes. A BAL hunt dial is
+                // admitted against the count under the SAME lock as the push:
+                // the check above read it under its own, and two hunt dials
+                // finishing together would both have seen the one free slot.
+                let admitted = {
+                    let mut peers = self.peers.lock().await;
+                    if bal_only && !bal_only_admits(peers.len(), self.pool_cfg.target_snap_peers, can_bal) {
+                        false
+                    } else {
+                        peers.push(PooledPeer {
+                            addr,
+                            peer,
+                            admitted_at: Instant::now(),
+                            benched_until: None,
+                            read_fails: 0,
+                            outpaced: 0,
+                            served: 0,
+                            cache_confirmed,
+                            last_probe: None,
+                            probe_misses: 0,
+                            bal_served_at: None,
+                        });
+                        true
+                    }
+                };
+                if !admitted {
+                    // The slot went to another hunt dial; the session closes
+                    // with its dropped peer. Cached and cooled off, as above.
+                    tracing::debug!(%addr, "el dial: the BAL hunt's slot was taken meanwhile — not pooling");
+                    {
+                        let mut cache = self.cache.lock().await;
+                        cache.record_connect_success(addr);
+                        cache.add(addr, &pubkey, true);
+                        cache.flush();
+                    }
+                    self.record_backoff(addr, BackoffKind::Transient, now).await;
+                    self.attempted.lock().await.remove(&addr);
+                    return;
+                }
                 // Persist this proven snap-capable peer for warm-start next run.
                 // `add` only marks the cache dirty for a genuinely new peer, so
                 // `flush` no-ops on a re-connect.
@@ -1571,15 +1596,6 @@ impl PeerPool {
         self.snap_peers().await.into_iter().next()
     }
 
-    /// All live snap peers in READ-LADDER order (see [`LadderKey`]): peers
-    /// whose fresh word says they lack the anchored head last, read-benched
-    /// peers (see [`READ_FAIL_BENCH`]) behind unbenched ones, then by how well
-    /// their known head covers the anchored one, proven servers before
-    /// unproven ones, newest connection first. Every peer stays reachable as
-    /// the last resort. The verified-read ladder tries them in order, moving
-    /// to the next on a failure — twin of the Java `RLPxConnector.trySnapPeer`
-    /// retry loop with its transient bench, plus the head and proof keys #465
-    /// added. Prunes closed peers first.
     /// Say whether block access lists are wanted (#691): a host follows
     /// address activity on a chain whose blocks commit to them. While on, the
     /// pool keeps its one recent BAL server and hunts for a BAL-capable peer (eth/71 or
@@ -1630,6 +1646,15 @@ impl PeerPool {
         out
     }
 
+    /// All live snap peers in READ-LADDER order (see [`LadderKey`]): peers
+    /// whose fresh word says they lack the anchored head last, read-benched
+    /// peers (see [`READ_FAIL_BENCH`]) behind unbenched ones, then by how well
+    /// their known head covers the anchored one, proven servers before
+    /// unproven ones, newest connection first. Every peer stays reachable as
+    /// the last resort. The verified-read ladder tries them in order, moving
+    /// to the next on a failure — twin of the Java `RLPxConnector.trySnapPeer`
+    /// retry loop with its transient bench, plus the head and proof keys #465
+    /// added. Prunes closed peers first.
     pub async fn snap_peers(&self) -> Vec<Arc<ManagedPeer>> {
         self.inner.prune_closed().await;
         let now = Instant::now();

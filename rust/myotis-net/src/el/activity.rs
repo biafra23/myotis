@@ -219,7 +219,8 @@ impl ActivityState {
     }
 
     /// The kept blocks whose BAL is still wanted — at or above the BAL floor
-    /// ([`Self::bal_floor`]), committing to one, none verified yet — newest
+    /// (the head the run last started over at), committing to one, none
+    /// verified yet — newest
     /// first, at most `max`: `(number, block hash, blockAccessListHash)`.
     pub fn bals_wanted(&self, max: usize) -> Vec<(u64, [u8; 32], [u8; 32])> {
         self.records
