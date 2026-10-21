@@ -878,13 +878,15 @@ impl ManagedPeer {
     /// (EIP-8189), each verified against the commitment its header carries:
     /// `blocks` pairs a block hash with that header's `blockAccessListHash`.
     /// One entry per block, in order: the verified BAL's RLP, or `None` where
-    /// the peer has none (the spec's `0x80`) or cut its answer short. `Err`
-    /// for a peer without snap/2, a failed request, or a BAL that does not
-    /// hash to its commitment — a peer can withhold a BAL, never forge one.
+    /// the peer has none (the spec's `0x80`), cut its answer short, or sent a
+    /// BAL that does not hash to its commitment. A peer can withhold a BAL,
+    /// never forge one: the `bool` says it tried (some entry was dropped for
+    /// its hash), which a caller may hold against it; the entries that did
+    /// verify are kept. `Err` for a peer without snap/2 or a failed request.
     pub async fn snap_get_block_access_lists(
         &self,
         blocks: &[([u8; 32], [u8; 32])],
-    ) -> Result<Vec<Option<Vec<u8>>>, String> {
+    ) -> Result<(Vec<Option<Vec<u8>>>, bool), String> {
         let codes = self.snap_codes().filter(|c| c.snap_version >= 2).ok_or("peer does not speak snap/2")?;
         let hashes: Vec<[u8; 32]> = blocks.iter().map(|(block, _)| *block).collect();
         let payload = self
@@ -896,15 +898,15 @@ impl ManagedPeer {
         let (_id, mut entries) = snap::decode_block_access_lists(&payload, blocks.len())
             .map_err(|e| format!("BlockAccessLists decode: {}", e.0))?;
         entries.truncate(blocks.len());
-        for (entry, (_, commitment)) in entries.iter().zip(blocks) {
-            if let Some(raw) = entry {
-                if &myotis_core::keccak::keccak256(raw) != commitment {
-                    return Err("a block access list does not hash to its header's commitment".to_string());
-                }
+        let mut forged = false;
+        for (entry, (_, commitment)) in entries.iter_mut().zip(blocks) {
+            if entry.as_ref().is_some_and(|raw| &myotis_core::keccak::keccak256(raw) != commitment) {
+                *entry = None;
+                forged = true;
             }
         }
         entries.resize(blocks.len(), None);
-        Ok(entries)
+        Ok((entries, forged))
     }
 
     // -----------------------------------------------------------------------
