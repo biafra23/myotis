@@ -41,6 +41,8 @@ class TypedEngineTest {
         var logConfigTaken: Boolean? = true
         var logStatus: String? = """{"enabled":true,"logCount":0,"entries":[]}"""
         var logs: String? = "[]"
+        var activityTaken: Boolean? = true
+        var activity: String? = """{"from":1,"to":0,"base":{"block":0,"hash":null},"gaps":{"account":[],"log":[]},"touched":[],"watching":[]}"""
 
         override fun newLock(): EngineLock = object : EngineLock {
             override fun lock() {}
@@ -132,6 +134,14 @@ class TypedEngineTest {
         override fun getLogsJson(handle: Long, filterJson: String): String? {
             calls += "logs $filterJson"
             return logs
+        }
+        override fun setActivityWatch(handle: Long, configJson: String): Boolean {
+            calls += "activityWatch $configJson"
+            return activityTaken ?: throw IllegalStateException("the engine is not running")
+        }
+        override fun addressActivityJson(handle: Long, afterBlock: Long): String? {
+            calls += "activity $afterBlock"
+            return activity ?: throw IllegalStateException("the engine is not running")
         }
     }
 
@@ -387,6 +397,24 @@ class TypedEngineTest {
                 List(4) { "logs $filter" },
             native.calls,
         )
+    }
+
+    // ---- address activity (#691) ----
+
+    @Test
+    fun theActivityCallsReachTheEngineAndItsAnswersComeBackVerbatim() {
+        val handle = sepolia()
+        val push = """{"watch":["0x${"aa".repeat(20)}"]}"""
+        assertTrue(handle.setActivityWatch(push))
+        native.activityTaken = false
+        assertFalse(handle.setActivityWatch(push), "a push the engine refuses")
+        native.activityTaken = null
+        assertFalse(handle.setActivityWatch(push), "a call that failed")
+        assertEquals(native.activity, handle.addressActivityJson(41))
+        native.activity = null
+        val failed = Json.parseToJsonElement(handle.addressActivityJson(41)).jsonObject
+        assertEquals("the engine is not running", failed["error"]?.jsonPrimitive?.content)
+        assertEquals(List(3) { "activityWatch $push" } + List(2) { "activity 41" }, native.calls)
     }
 
     @Test

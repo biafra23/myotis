@@ -1023,6 +1023,28 @@ pub unsafe extern "C" fn myotis_log_index_status_json(handle: i64) -> *mut std::
     into_c(crate::host::log_index_status_json(handle))
 }
 
+/// Install the address-activity watch list (see ffi::set_activity_watch).
+///
+/// # Safety
+/// `config_json` must be null or a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_set_activity_watch(
+    handle: i64,
+    config_json: *const std::os::raw::c_char,
+) -> bool {
+    match read_string(config_json) {
+        Some(c) => crate::host::set_activity_watch_json(handle, &c),
+        None => false,
+    }
+}
+
+/// Address-activity JSON (see ffi::address_activity_json).
+/// Returned string must be freed with `myotis_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_address_activity_json(handle: i64, after_block: i64) -> *mut std::os::raw::c_char {
+    into_c(crate::host::address_activity_json(handle, after_block))
+}
+
 /// Read-fetch shadow-cache counters JSON (see ffi::read_stats_json).
 /// Returned string must be freed with `myotis_string_free`.
 #[no_mangle]

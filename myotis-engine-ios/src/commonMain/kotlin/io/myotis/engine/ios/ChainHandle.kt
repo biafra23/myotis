@@ -152,6 +152,33 @@ class ChainHandle internal constructor(
             buildJsonObject { put("error", e.message ?: e::class.simpleName ?: "the status call failed") }.toString()
         }
 
+    /**
+     * Installs the address-activity watch list (#691), as `io.myotis.api.ChainHandle`'s
+     * `setActivityWatch` describes it (`{"watch":["0x…"]?,"unwatch":["0x…"]?}`, additive).
+     * False = refused, nothing changed, or a call that failed.
+     */
+    fun setActivityWatch(configJson: String): Boolean =
+        try {
+            native.setActivityWatch(handle, configJson)
+        } catch (e: Exception) {
+            false
+        }
+
+    /**
+     * Which watched addresses the verified blocks after [afterBlock] touched (#691), as
+     * `io.myotis.api.ChainHandle`'s `addressActivityJson` describes it — every block of the
+     * range covered or in a gap, per kind, "log" coverage saying only that no log named the
+     * address — or an `{"error":…}` object: the engine's, or one
+     * naming a call that failed. Answered from memory, whatever the handle's state.
+     */
+    fun addressActivityJson(afterBlock: Long): String =
+        try {
+            native.addressActivityJson(handle, afterBlock)
+                ?: buildJsonObject { put("error", "no answer from the engine") }.toString()
+        } catch (e: Exception) {
+            buildJsonObject { put("error", e.message ?: e::class.simpleName ?: "the activity call failed") }.toString()
+        }
+
     /** The verified `eth_*` reads. */
     fun reads(): VerifiedReads = verifiedReads
 

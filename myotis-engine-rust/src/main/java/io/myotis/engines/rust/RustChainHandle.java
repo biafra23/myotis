@@ -1432,6 +1432,26 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         return RustEngineNative.nativeLogIndexStatusJson(handle);
     }
 
+    /** Install the address-activity watch list (#691); false = refused or not running. */
+    @Override
+    public boolean setActivityWatch(String configJson) {
+        // NOT gated(): a push must never wake a paused stack or wait out a warm-up.
+        // A paused handle refuses it (false), and the host retries.
+        try {
+            return RustEngineNative.nativeSetActivityWatch(handle, configJson);
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** Address-activity JSON ({"error":...} when the handle is not running). */
+    @Override
+    public String addressActivityJson(long afterBlock) {
+        // NOT gated(), for the reason logIndexStatusJson gives: hosts poll it, and
+        // the native answers {"error":...} on its own when the handle is not running.
+        return RustEngineNative.nativeAddressActivityJson(handle, afterBlock);
+    }
+
     /** Read-fetch shadow-cache counters ({"error":...} when the gate is down).
      *  NOT gated(), for the same status-probe reasons as logIndexStatusJson. */
     @Override

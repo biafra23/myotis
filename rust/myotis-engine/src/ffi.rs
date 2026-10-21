@@ -432,6 +432,20 @@ pub fn log_index_status_json(handle: i64) -> String {
     crate::host::log_index_status_json(handle)
 }
 
+/// Install the address-activity watch list (#691; JSON
+/// `{"watch":[…],"unwatch":[…]}`, additive). False = refused, nothing changed.
+#[uniffi::export]
+pub fn set_activity_watch(handle: i64, config_json: String) -> bool {
+    crate::host::set_activity_watch_json(handle, &config_json)
+}
+
+/// The watched addresses' activity in the verified blocks after `after_block`,
+/// from what the follower kept: no I/O (#691; see host docs for the shape).
+#[uniffi::export]
+pub fn address_activity_json(handle: i64, after_block: i64) -> String {
+    crate::host::address_activity_json(handle, after_block)
+}
+
 /// Read-fetch shadow-cache counters as JSON (schema 1: `account` / `storage`
 /// / `code` fetch, repeat and avoidable-cost counters plus age buckets; see
 /// docs/read-stats.md). `{"error":…}` when the handle has no EL reader.

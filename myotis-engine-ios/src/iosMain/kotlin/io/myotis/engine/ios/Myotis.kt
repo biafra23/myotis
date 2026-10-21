@@ -90,5 +90,9 @@ internal object RustNativeEngine : NativeEngine {
 
     override fun logIndexStatusJson(handle: Long) = RustEngine.logIndexStatusJson(handle)
 
+    override fun setActivityWatch(handle: Long, configJson: String) = RustEngine.setActivityWatch(handle, configJson)
+
+    override fun addressActivityJson(handle: Long, afterBlock: Long) = RustEngine.addressActivityJson(handle, afterBlock)
+
     override fun getLogsJson(handle: Long, filterJson: String) = RustEngine.getLogsJson(handle, filterJson)
 }

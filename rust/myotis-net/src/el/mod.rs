@@ -6,6 +6,7 @@
 //! split `codec.rs`/`reqresp.rs` uses on the CL side; the codecs are pinned
 //! against Java-generated conformance corpora under `rust/testdata/el/`.
 
+pub mod activity;
 pub mod anchor;
 pub mod discv4;
 pub mod dnsdisco;
