@@ -100,7 +100,12 @@ is non-empty:
   the push.
 - On a tick with a new head, it asks for the BALs of the kept blocks that commit
   to one and have none verified yet: newest first, 16 at most, from up to 3
-  snap/2 peers. It keeps each BAL as the set of accounts the BAL changed, so
+  snap/2 peers. Only blocks from the head where the run last started over
+  count: a start, a resume after a pause, a head jump past the window. A
+  host's proofs from then on anchor at that head or later, and an older proof
+  meets a gap anyway. So a wake costs one BAL per new block, never a backfill of
+  the 256 kept blocks, which would be about 14 MB on Sepolia that no proof can
+  use. It keeps each BAL as the set of accounts the BAL changed, so
   BAL coverage is retroactive for a newly added address too. A block no peer
   served stays an account gap and is asked for again at the next head. Peers
   are not struck for serving no BAL, because serving them is optional, and

@@ -119,6 +119,13 @@ pub struct ActivityState {
     /// Contiguous by number and parent-linked: `records[n].parent_hash ==
     /// records[n - 1].hash` for every kept pair.
     records: BTreeMap<u64, BlockRecord>,
+    /// The lowest block whose BAL is worth fetching: the head the run last
+    /// started over at (a start, a resume, a head jump past the window, a run
+    /// that links to nothing kept). A host's proofs from then on anchor at
+    /// that head or later, and one from before it meets a gap anyway, so the
+    /// kept blocks below it would cost a BAL each (~54 KB on Sepolia) that
+    /// can never vouch for a proof.
+    bal_floor: u64,
 }
 
 impl ActivityState {
@@ -191,6 +198,7 @@ impl ActivityState {
         let mut replaced = if links_below {
             self.records.split_off(&first.number)
         } else {
+            self.bal_floor = head;
             std::mem::take(&mut self.records)
         };
         for mut r in segment {
@@ -204,12 +212,13 @@ impl ActivityState {
         self.records = self.records.split_off(&floor);
     }
 
-    /// The kept blocks whose BAL is still wanted — they commit to one and none
-    /// was verified yet — newest first, at most `max`: `(number, block hash,
-    /// blockAccessListHash)`.
+    /// The kept blocks whose BAL is still wanted — at or above the BAL floor
+    /// ([`Self::bal_floor`]), committing to one, none verified yet — newest
+    /// first, at most `max`: `(number, block hash, blockAccessListHash)`.
     pub fn bals_wanted(&self, max: usize) -> Vec<(u64, [u8; 32], [u8; 32])> {
         self.records
-            .values()
+            .range(self.bal_floor..)
+            .map(|(_, r)| r)
             .rev()
             .filter(|r| r.account.is_none() && !r.bal_undecodable)
             .filter_map(|r| r.bal_hash.map(|bal| (r.number, r.hash, bal)))
@@ -554,8 +563,9 @@ mod tests {
         let mut seg = run(100, 103, 0, hash(99, 0));
         accrue(&mut seg[1].bloom, &A);
         s.install(seg, 103);
-        // Newest first, every block still wanting its BAL.
-        assert_eq!(s.bals_wanted(2), vec![(103, hash(103, 0), [103; 32]), (102, hash(102, 0), [102; 32])]);
+        // A run that starts over wants the BAL of its head only: nothing below it
+        // can vouch for a proof made from now on.
+        assert_eq!(s.bals_wanted(8), vec![(103, hash(103, 0), [103; 32])]);
         s.set_account(101, &hash(101, 0), vec![B, A]);
         s.set_account(102, &hash(102, 0), vec![]);
         // A BAL for a block no longer kept under that hash changes nothing.
@@ -569,7 +579,23 @@ mod tests {
                 Touch { address: B, block: 101, block_hash: hash(101, 0), via: vec![Via::Account] },
             ]
         );
-        assert_eq!(s.bals_wanted(8), vec![(103, hash(103, 0), [103; 32]), (100, hash(100, 0), [100; 32])]);
+        assert_eq!(s.bals_wanted(8), vec![(103, hash(103, 0), [103; 32])]);
+    }
+
+    #[test]
+    fn bals_are_wanted_from_the_head_the_run_started_over_at() {
+        let mut s = watching(&[A]);
+        s.install(run(100, 105, 0, hash(99, 0)), 105);
+        assert_eq!(s.bals_wanted(8).iter().map(|w| w.0).collect::<Vec<_>>(), vec![105]);
+        // New blocks that link: each is wanted, the backlog below the start never.
+        s.install(run(105, 107, 0, hash(104, 0)), 107);
+        assert_eq!(s.bals_wanted(8).iter().map(|w| w.0).collect::<Vec<_>>(), vec![107, 106, 105]);
+        // A reorg above a kept block does not move the floor.
+        s.install(run(107, 108, 1, hash(106, 0)), 108);
+        assert_eq!(s.bals_wanted(8).iter().map(|w| w.0).collect::<Vec<_>>(), vec![108, 107, 106, 105]);
+        // A head jump past the window starts over: the floor moves to the new head.
+        s.install(run(400, 402, 0, hash(399, 0)), 402);
+        assert_eq!(s.bals_wanted(8).iter().map(|w| w.0).collect::<Vec<_>>(), vec![402]);
     }
 
     #[test]
@@ -591,10 +617,10 @@ mod tests {
         let mut s = watching(&[A]);
         s.install(run(100, 101, 0, hash(99, 0)), 101);
         s.set_bal_undecodable(101, &hash(101, 0));
-        assert_eq!(s.bals_wanted(8), vec![(100, hash(100, 0), [100; 32])]);
+        assert!(s.bals_wanted(8).is_empty());
         // Kept across a reinstall of the same block, like a verified BAL.
         s.install(run(101, 102, 0, hash(100, 0)), 102);
-        assert_eq!(s.bals_wanted(8), vec![(102, hash(102, 0), [102; 32]), (100, hash(100, 0), [100; 32])]);
+        assert_eq!(s.bals_wanted(8), vec![(102, hash(102, 0), [102; 32])]);
         assert_eq!(s.report(99, 102, every).account_gaps, vec![(100, 102)]);
     }
 
