@@ -58,10 +58,16 @@ heads links it to the head.
   balances with no log naming the holder, and some contracts put an address
   only in a log's data. A hit means the block *may* have such a log: a bloom
   gives false positives, and a hit costs the host one extra proof.
-- **`account`** is the account itself: its balance, nonce and code. Seeing that
-  needs the block access list (EIP-7928), which this part does not fetch, so every
-  block is an account gap for now. That includes plain ETH transfers and ETH a
-  contract sends, which no log shows.
+- **`account`** is the account itself: a balance, nonce or code change, or a
+  storage write. It comes from the block access list (EIP-7928), fetched over
+  snap/2 (EIP-8189 `GetBlockAccessLists`) and verified against the header's
+  `blockAccessListHash`: a peer can withhold one, not forge one. Where covered
+  it is definitive, and it sees what no log shows: plain ETH transfers, ETH a
+  contract sends, withdrawals, fees. An account the block only accessed (a
+  read, a call, a zero-value transfer) is not a touch. A block whose BAL no
+  peer served yet, or a block before Amsterdam (no commitment to check one
+  against: mainnet and Gnosis today), is an account gap.
+- A touch lists what saw it: `"via":["account"]`, `["log"]` or both.
 
 `to` is the anchored (optimistic) head. `base` is the block `afterBlock` itself,
 with its hash when the follower holds it, so a host whose proof anchors there
@@ -92,6 +98,27 @@ is non-empty:
 - It keeps the blooms themselves, not per-address results. So an address added
   later is covered over every block already kept, from the first report after
   the push.
+- On a tick with a new head, it asks for the BALs of the kept blocks that commit
+  to one and have none verified yet: newest first, 16 at most, from up to 3
+  snap/2 peers. Only blocks from the head where the run last started over
+  count: a start, a resume after a pause, a head jump past the window. A
+  host's proofs from then on anchor at that head or later, and an older proof
+  meets a gap anyway. So a wake costs one BAL per new block, never a backfill of
+  the 256 kept blocks, which would be about 14 MB on Sepolia that no proof can
+  use. It keeps each BAL as the set of accounts the BAL changed, so
+  BAL coverage is retroactive for a newly added address too. A block no peer
+  served stays an account gap and is asked for again at the next head. Peers
+  are not struck for serving no BAL, because serving them is optional, and
+  such a peer is no worse at state reads.
+- A block reinstalled under the same hash (the kept top, at every shallow
+  window) keeps its verified BAL. A block replaced in a reorg loses it with the
+  block.
+- When the light client skipped a head, the ring cannot link the kept run to
+  the new head. Until the follower's next tick fetches the window (2 s at most),
+  the whole range reports as a gap: the host re-proves once, never trusts a
+  stale fork. Measured on Sepolia: 1 poll in about 50.
+- Once a minute it logs at INFO what its BAL passes found: passes, BALs wanted
+  and verified, the most snap/2 peers in the pool, and the clients that served.
 
 The list lives in the reader. A pause drops the reader; the host layer stashes
 the list per handle and re-applies it on resume. The paused blocks then show as
@@ -116,11 +143,29 @@ Measured on Sepolia on 2026-10-21, watching WETH, USDC, `0x…dEaD` and
 - Over about 27 heads the log coverage had no gaps.
 - USDC was touched in 24 of 27 blocks and WETH in 20.
 
+## Who serves block access lists
+
+Measured on Sepolia on 2026-10-21, 12 minutes, release build:
+
+- **Nethermind** (v2.1.0 and v2.2.0) serves BALs over snap/2. Every BAL it
+  served decoded and hashed to its header's commitment.
+- No other client showed up as a snap/2 peer. For the first 6 minutes the pool
+  held none, and every block was an account gap.
+- Once a Nethermind peer was in the pool (never more than one at a time),
+  account coverage was complete: the backlog filled 16 blocks per head, and the
+  last 3 minutes reported no account gap at all.
+
+So account coverage on Sepolia today depends on the pool happening to hold a
+snap/2 Nethermind peer. The pool does not look for one.
+
 ## Next
 
-- **Part 2: block access lists.** Fetch them over snap/2 (EIP-8189
-  `GetBlockAccessLists`), verify each against the header's `blockAccessListHash`,
-  and test membership. That turns the `account` gaps into coverage on Amsterdam
-  networks (Sepolia since 2026-10-06; not mainnet or Gnosis yet). It shares this
-  step with #685.
+- **Keep a BAL server in the pool.** While the watch list is non-empty, the pool
+  should prefer, or dial for, at least one snap/2 peer that has served a
+  verified BAL. Without one, account coverage comes and goes with the pool's
+  churn.
+- **Mainnet and Gnosis** have no Amsterdam yet: their blocks commit to no BAL,
+  and their account side stays a gap until the fork.
+- **Shared with #685:** the fetch-and-verify step is
+  `ManagedPeer::snap_get_block_access_lists`.
 - The Node addon and the JVM daemon do not expose the calls yet.

@@ -1034,7 +1034,7 @@ fn be_to_decimal(bytes: &[u8]) -> String {
 /// hosts' parsers and their golden tests pin this shape:
 /// `{"from":n,"to":n,"base":{"block":n,"hash":"0x…"|null},
 ///   "gaps":{"account":[[a,b],…],"log":[…]},
-///   "touched":[{"address":"0x…","block":n,"blockHash":"0x…","via":["log"]},…],
+///   "touched":[{"address":"0x…","block":n,"blockHash":"0x…","via":["account"?,"log"?]},…],
 ///   "watching":["0x…",…]}`.
 pub fn activity_json(r: &myotis_net::el::activity::ActivityReport) -> String {
     fn ranges(s: &mut String, gaps: &[(u64, u64)]) {
@@ -1065,12 +1065,13 @@ pub fn activity_json(r: &myotis_net::el::activity::ActivityReport) -> String {
         if i > 0 {
             s.push(',');
         }
+        let via: Vec<String> = t.via.iter().map(|v| format!("\"{}\"", v.as_str())).collect();
         s.push_str(&format!(
-            "{{\"address\":\"{}\",\"block\":{},\"blockHash\":\"{}\",\"via\":[\"{}\"]}}",
+            "{{\"address\":\"{}\",\"block\":{},\"blockHash\":\"{}\",\"via\":[{}]}}",
             hex0x_var(&t.address),
             t.block,
             hex0x(&t.block_hash),
-            t.via.as_str()
+            via.join(",")
         ));
     }
     s.push_str("],\"watching\":[");
@@ -1101,7 +1102,10 @@ mod tests {
             base: (100, Some([0x11; 32])),
             account_gaps: vec![(101, 103)],
             log_gaps: vec![(103, 103)],
-            touched: vec![Touch { address: [0xaa; 20], block: 102, block_hash: [0x22; 32], via: Via::Log }],
+            touched: vec![
+                Touch { address: [0xaa; 20], block: 102, block_hash: [0x22; 32], via: vec![Via::Log] },
+                Touch { address: [0xbb; 20], block: 103, block_hash: [0x33; 32], via: vec![Via::Account, Via::Log] },
+            ],
             watching: vec![[0xaa; 20], [0xbb; 20]],
         };
         assert_eq!(
@@ -1109,10 +1113,12 @@ mod tests {
             format!(
                 "{{\"from\":101,\"to\":103,\"base\":{{\"block\":100,\"hash\":\"0x{h11}\"}},\
                  \"gaps\":{{\"account\":[[101,103]],\"log\":[[103,103]]}},\
-                 \"touched\":[{{\"address\":\"0x{aa}\",\"block\":102,\"blockHash\":\"0x{h22}\",\"via\":[\"log\"]}}],\
+                 \"touched\":[{{\"address\":\"0x{aa}\",\"block\":102,\"blockHash\":\"0x{h22}\",\"via\":[\"log\"]}},\
+                 {{\"address\":\"0x{bb}\",\"block\":103,\"blockHash\":\"0x{h33}\",\"via\":[\"account\",\"log\"]}}],\
                  \"watching\":[\"0x{aa}\",\"0x{bb}\"]}}",
                 h11 = "11".repeat(32),
                 h22 = "22".repeat(32),
+                h33 = "33".repeat(32),
                 aa = "aa".repeat(20),
                 bb = "bb".repeat(20),
             )

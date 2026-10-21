@@ -260,16 +260,18 @@ public interface ChainHandle {
      * Which watched addresses the verified blocks after {@code afterBlock}
      * touched (#691), answered from what the follower kept, with no I/O:
      * {@code {"from","to","base":{"block","hash"|null},"gaps":{"account":[[a,b]…],
-     * "log":[[a,b]…]},"touched":[{"address","block","blockHash","via":["log"]}…],
+     * "log":[[a,b]…]},"touched":[{"address","block","blockHash","via":["account"?,"log"?]}…],
      * "watching":["0x…"…]}}. Every block of {@code [from, to]} (to = the
      * verified head) is covered or listed in {@code gaps}, per kind; a block
      * the follower did not check is a gap, never a silence. {@code "log"} is
      * the header's logs bloom: a watched address absent from {@code touched}
      * for a log-covered block is named by no log of it, as emitter or indexed
      * topic (a hit may be a false positive), which says nothing of a change no
-     * such log names, such as a rebasing token's. {@code "account"} — the
-     * account's own balance, nonce and code — needs block access lists and is
-     * a gap on every block for now. Above finality a block can come back with a new
+     * such log names, such as a rebasing token's. {@code "account"} is the
+     * account's own state — a balance, nonce or code change, or a storage
+     * write — from the block's access list (EIP-7928), verified against the
+     * header's commitment: definitive where covered. A block whose list no
+     * peer served, or one before Amsterdam, is an account gap. Above finality a block can come back with a new
      * {@code blockHash}. {@code {"error":…}} when the chain is not running.
      * Default {@code null}: no activity follower on this engine.
      */

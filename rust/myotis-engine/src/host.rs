@@ -5196,13 +5196,16 @@ pub fn set_activity_watch_json(handle: i64, config_json: &str) -> bool {
     true
 }
 
+/// An activity push's `(watch, unwatch)` lists.
+type ActivityPush = (Vec<[u8; 20]>, Vec<[u8; 20]>);
+
 /// The `(watch, unwatch)` lists of an activity push, each ascending with an
 /// address named twice folded into one. `None` = malformed (see
 /// [`set_activity_watch_json`]), or a `watch` longer than
 /// `activity::MAX_WATCHED`: refused while parsing, since applying it could
 /// only refuse it, and a caller's runaway list is not scanned to its end.
 /// Pure — unit-tested.
-fn parse_activity_watch(config_json: &str) -> Option<(Vec<[u8; 20]>, Vec<[u8; 20]>)> {
+fn parse_activity_watch(config_json: &str) -> Option<ActivityPush> {
     use std::collections::BTreeSet;
     let v: serde_json::Value = serde_json::from_str(config_json).ok()?;
     if !v.is_object() {

@@ -399,13 +399,15 @@ char *myotis_log_index_status_json(int64_t handle);
  * address_activity_json answers, with no I/O, which watched addresses the
  * verified blocks (after_block, head] touched:
  * {"from","to","base":{"block","hash"|null},"gaps":{"account":[[a,b]..],
- * "log":[[a,b]..]},"touched":[{"address","block","blockHash","via":["log"]}..],
+ * "log":[[a,b]..]},"touched":[{"address","block","blockHash","via":["account"?,"log"?]}..],
  * "watching":["0x..",..]}. Every block of [from, to] is covered or in a gap,
  * per kind. "log" is the header's logs bloom: an address absent from `touched`
  * for a log-covered block is named by no log of it as emitter or indexed topic
  * (a hit may be a false positive), which says nothing of a change no such log
- * names. "account" needs block access lists and is a gap on every block for
- * now. A kept block not known to lead to the current head (a reorg the
+ * names. "account" is the block access list (EIP-7928, fetched over snap/2
+ * and verified against the header's blockAccessListHash): a balance, nonce or
+ * code change or a storage write, definitive where covered; a block whose list
+ * no peer served, or one before Amsterdam, is an account gap. A kept block not known to lead to the current head (a reorg the
  * follower has not caught up with) is a gap too. The
  * follower keeps the last 256 blocks; anything older, paused or not yet
  * fetched is a gap. {"error":..} when the handle is not running. */

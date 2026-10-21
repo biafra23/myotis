@@ -1742,6 +1742,35 @@ const FEE_FOLLOW_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 /// the headers above the kept top, usually one or two.
 const ACTIVITY_FOLLOW_TICK: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Block access lists one follower pass asks for, newest first: a new head
+/// usually wants one, and a backlog (a start, a peer that withheld) drains at
+/// this rate per head rather than in one large request.
+const ACTIVITY_BALS_PER_PASS: usize = 16;
+
+/// snap/2 peers one pass asks, best first, before leaving the rest for the
+/// next head: most peers may not serve BALs at all, and a pass must stay cheap.
+const ACTIVITY_BAL_PEERS: usize = 3;
+
+/// How often the follower logs its block-access-list summary at INFO.
+const ACTIVITY_BAL_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What the activity follower's BAL passes did since the last summary: how
+/// many BALs a network's snap/2 peers actually serve is not known in advance,
+/// and a summary of one pass misses a peer that served between two.
+#[derive(Default)]
+struct ActivityBalStats {
+    since: Option<Instant>,
+    passes: u64,
+    /// The distinct blocks wanted, and of those, verified: a block no peer
+    /// serves is wanted again at every pass, and is counted once.
+    wanted: std::collections::BTreeSet<u64>,
+    verified: std::collections::BTreeSet<u64>,
+    /// The most snap/2 peers one pass found in the pool.
+    snap2_peers_max: usize,
+    /// The client ids of the peers that served a verified BAL.
+    serving: std::collections::BTreeSet<String>,
+}
+
 /// Budget for one background fee refresh (estimate or one feeHistory shape).
 const FEE_REFRESH_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -2118,6 +2147,14 @@ pub struct ElReader {
     activity: std::sync::Mutex<crate::el::activity::ActivityState>,
     /// The activity follower (see [`Self::ensure_activity_follower`]).
     activity_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The follower's BAL pass, when one runs (see [`Self::spawn_activity_bal_pass`]).
+    activity_bal_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Peers caught serving a BAL that does not hash to its header's
+    /// commitment: never asked for one again by this reader.
+    activity_bal_liars: std::sync::Mutex<std::collections::HashSet<std::net::SocketAddr>>,
+    /// The activity follower's block-access-list counters since its last
+    /// INFO summary ([`ACTIVITY_BAL_LOG_EVERY`]).
+    activity_bal_stats: std::sync::Mutex<ActivityBalStats>,
     /// Permits for the fee computes a read left running ([`FEE_COMPUTES_MAX`]).
     fee_compute_permits: Arc<tokio::sync::Semaphore>,
     /// The pre-broadcast check's detached account reads in flight (#531;
@@ -2341,6 +2378,9 @@ impl ElReader {
             fee_follow_task: std::sync::Mutex::new(None),
             activity: std::sync::Mutex::new(crate::el::activity::ActivityState::default()),
             activity_task: std::sync::Mutex::new(None),
+            activity_bal_task: std::sync::Mutex::new(None),
+            activity_bal_liars: std::sync::Mutex::new(std::collections::HashSet::new()),
+            activity_bal_stats: std::sync::Mutex::new(ActivityBalStats::default()),
             fee_compute_permits: Arc::new(tokio::sync::Semaphore::new(FEE_COMPUTES_MAX)),
             send_check_permits: Arc::new(tokio::sync::Semaphore::new(send_check::DETACHED_READS_MAX)),
             fee_stored: tokio::sync::Notify::new(),
@@ -8098,7 +8138,7 @@ impl ElReader {
     /// tip-lag failure's deferred strikes are forgiven, never banked: the
     /// next tick asks again against a newer anchor, which is the retry they
     /// are deferred for.)
-    async fn activity_follow_tick(&self) -> bool {
+    async fn activity_follow_tick(self: &Arc<Self>) -> bool {
         use crate::el::activity::{BlockRecord, WINDOW};
         let Ok(top) = self.activity.lock().map(|s| s.is_active().then(|| s.top())) else {
             return false;
@@ -8147,6 +8187,9 @@ impl ElReader {
                     hash: vh.hash,
                     parent_hash: vh.header.parent_hash,
                     bloom: Box::new(bloom),
+                    bal_hash: vh.header.block_access_list_hash,
+                    account: None,
+                    bal_undecodable: false,
                 })
             })
             .collect();
@@ -8157,18 +8200,157 @@ impl ElReader {
                 state.install(segment, head.0);
             }
         }
+        self.spawn_activity_bal_pass();
         true
+    }
+
+    /// Start a BAL pass ([`Self::activity_fetch_bals`]) unless one runs: its
+    /// requests can take a peer timeout each, and the header follow — the log
+    /// coverage — must never wait on them. One at a time, so a slow pass is
+    /// not stacked on at every head.
+    fn spawn_activity_bal_pass(self: &Arc<Self>) {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if *self.request_shutdown.borrow() {
+            return;
+        }
+        let Ok(mut slot) = self.activity_bal_task.lock() else {
+            return;
+        };
+        if slot.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        *slot = Some(rt.spawn(async move {
+            if let Some(reader) = weak.upgrade() {
+                reader.activity_fetch_bals().await;
+            }
+        }));
+    }
+
+    /// The BAL step of a follower pass with a new head: fetch the access lists
+    /// of the kept blocks that commit to one and have none verified yet,
+    /// newest first ([`ACTIVITY_BALS_PER_PASS`]), from up to
+    /// [`ACTIVITY_BAL_PEERS`] snap/2 peers, each list verified against its
+    /// header's `blockAccessListHash` ([`ManagedPeer::snap_get_block_access_lists`]).
+    /// A block no peer served stays an account gap and is asked for again at
+    /// the next head. A peer that serves none is not struck: serving BALs is
+    /// optional for a snap/2 peer, and one that does not is no worse at state
+    /// reads. One that sends a BAL its header does not commit to is lying,
+    /// provably: its verified entries are kept, and it is never asked again
+    /// ([`ElReader::activity_bal_liars`]).
+    async fn activity_fetch_bals(&self) {
+        let Ok(wanted) = self.activity.lock().map(|s| s.bals_wanted(ACTIVITY_BALS_PER_PASS)) else {
+            return;
+        };
+        if wanted.is_empty() {
+            return;
+        }
+        let liars = self.activity_bal_liars.lock().map(|l| l.clone()).unwrap_or_default();
+        let snap2: Vec<Arc<ManagedPeer>> = self
+            .pool
+            .snap_peers()
+            .await
+            .into_iter()
+            .filter(|p| p.snap_version.is_some_and(|v| v >= 2) && !liars.contains(&p.addr()))
+            .collect();
+        let mut missing = wanted.clone();
+        let mut asked = 0usize;
+        let mut serving: Vec<String> = Vec::new();
+        for peer in snap2.iter().take(ACTIVITY_BAL_PEERS) {
+            if missing.is_empty() {
+                break;
+            }
+            asked += 1;
+            let blocks: Vec<([u8; 32], [u8; 32])> = missing.iter().map(|(_, hash, bal)| (*hash, *bal)).collect();
+            let entries = match peer.snap_get_block_access_lists(&blocks).await {
+                Ok((entries, forged)) => {
+                    if forged {
+                        tracing::warn!(
+                            peer = %peer.addr(),
+                            client = ?crate::el::pool::log_client_id(&peer.peer_hello.client_id),
+                            "activity: a peer sent a block access list its header does not commit to; not asking it again"
+                        );
+                        if let Ok(mut l) = self.activity_bal_liars.lock() {
+                            l.insert(peer.addr());
+                        }
+                    }
+                    entries
+                }
+                Err(e) => {
+                    tracing::debug!(peer = %peer.addr(), error = %e, "activity: block access lists failed");
+                    continue;
+                }
+            };
+            let mut still = Vec::new();
+            let mut got = 0usize;
+            for (want, entry) in missing.into_iter().zip(entries) {
+                let changed = entry.map(|raw| crate::el::snap::messages::bal_changed_accounts(&raw));
+                match changed {
+                    Some(Ok(changed)) => {
+                        got += 1;
+                        if let Ok(mut state) = self.activity.lock() {
+                            state.set_account(want.0, &want.1, changed);
+                        }
+                    }
+                    Some(Err(e)) => {
+                        // It hashed to the header's commitment, so this is the
+                        // decoder's limit, not the peer's lie, and the same for
+                        // every peer: marked, never fetched again, a gap.
+                        tracing::warn!(block = want.0, error = %e.0, "activity: a verified block access list did not decode; the block stays an account gap");
+                        if let Ok(mut state) = self.activity.lock() {
+                            state.set_bal_undecodable(want.0, &want.1);
+                        }
+                    }
+                    None => still.push(want),
+                }
+            }
+            if got > 0 {
+                serving.push(crate::el::pool::log_client_id(&peer.peer_hello.client_id));
+            }
+            missing = still;
+        }
+        tracing::debug!(
+            wanted = wanted.len(),
+            verified = wanted.len() - missing.len(),
+            asked,
+            snap2_peers = snap2.len(),
+            "activity: block access lists pass"
+        );
+        let Ok(mut stats) = self.activity_bal_stats.lock() else {
+            return;
+        };
+        let since = *stats.since.get_or_insert_with(Instant::now);
+        stats.passes += 1;
+        stats.wanted.extend(wanted.iter().map(|(n, _, _)| *n));
+        stats.verified.extend(wanted.iter().filter(|w| !missing.contains(w)).map(|(n, _, _)| *n));
+        stats.snap2_peers_max = stats.snap2_peers_max.max(snap2.len());
+        stats.serving.extend(serving);
+        if since.elapsed() >= ACTIVITY_BAL_LOG_EVERY {
+            let done = std::mem::take(&mut *stats);
+            tracing::info!(
+                passes = done.passes,
+                wanted = done.wanted.len(),
+                verified = done.verified.len(),
+                snap2_peers_max = done.snap2_peers_max,
+                serving = ?done.serving,
+                "activity: block access lists in the last minute"
+            );
+        }
     }
 
     /// Abort and await the activity follower (teardown; see [`Self::stop`]).
     async fn stop_activity_follower(&self) {
-        let handle = match self.activity_task.lock() {
-            Ok(mut t) => t.take(),
-            Err(_) => None,
-        };
-        if let Some(h) = handle {
-            h.abort();
-            let _ = h.await;
+        for slot in [&self.activity_task, &self.activity_bal_task] {
+            let handle = match slot.lock() {
+                Ok(mut t) => t.take(),
+                Err(_) => None,
+            };
+            if let Some(h) = handle {
+                h.abort();
+                let _ = h.await;
+            }
         }
     }
 
