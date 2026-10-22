@@ -224,7 +224,8 @@ class CallResult(
     /** This result, answered at [block], of proven hash [hashHex] (null: not proven). */
     fun atBlock(block: Long, hashHex: String? = null): CallResult = CallResult(status, data, detail, block, hashHex)
 
-    override fun toString(): String = "CallResult($status, ${data?.size ?: "no"} bytes, $detail, block $blockNumber)"
+    override fun toString(): String =
+        "CallResult($status, ${data?.size ?: "no"} bytes, $detail, block $blockNumber, hash $blockHashHex)"
 
     companion object {
         fun ok(data: ByteArray): CallResult = CallResult(Status.OK, data, null)

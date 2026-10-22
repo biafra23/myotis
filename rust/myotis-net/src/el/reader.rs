@@ -7174,8 +7174,9 @@ impl ElReader {
         joined: Result<Vec<u8>, EvmError>,
     ) -> CallAnswer {
         let outcome = CallOutcome::from_executor(joined);
-        // A call that ran nowhere names no block hash.
-        let ran = !matches!(outcome, CallOutcome::Unavailable(_));
+        // Only a call that ran against the state names its block's hash: not one
+        // with no answer, nor one that could not start within its own limits.
+        let ran = matches!(outcome, CallOutcome::Success(_) | CallOutcome::Revert(_));
         CallAnswer {
             outcome,
             block_number,

@@ -51,6 +51,9 @@ const acct = JSON.parse(await myotis.requestAccountJson(h, '0xd8dA…6045'));
 // acct.blockTimestamp (ABI >= 41): blockNumber's own timestamp, unix seconds,
 // when the engine proved it (the read ran against the beacon-attested block),
 // else null. resolveEnsJson / ensRecordJson results carry it too.
+// acct.blockHash (ABI >= 52): blockNumber's hash when proven (the anchor vouches
+// for a block of that number with the proof's state root), else null; an
+// answered ethCall*Json result carries it too.
 // ...or at the beacon-finalized block (ABI >= 32; a number near the head also works):
 const fin = JSON.parse(await myotis.requestAccountJson(h, '0xd8dA…6045', 'finalized'));
 const ens = JSON.parse(await myotis.resolveEnsJson(h, 'vitalik.eth'));
@@ -468,7 +471,8 @@ transaction the engine relays — undecodable, no sender recovered, or a blob
 transaction — where it used to broadcast them (#360): nothing was sent; and
 ABI 45 adds the engine's handle-less send gate, `check_raw_transaction_json` (not
 wrapped here: the addon has no readiness hold, so its sends reach the same
-gate at once). It is not a drop-in artifact for a host pinned to ABI 22.
+gate at once); and ABI 52 adds `blockHash` to the `requestAccountJson` and
+`ethCall*Json` results (a key addition). It is not a drop-in artifact for a host pinned to ABI 22.
 Engine failures, admission refusal, cancellation, and deadline expiry remain
 in-band JSON errors. Node-API infrastructure failures may throw/reject.
 
