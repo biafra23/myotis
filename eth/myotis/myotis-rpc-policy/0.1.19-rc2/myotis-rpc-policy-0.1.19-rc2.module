@@ -1,0 +1,223 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "eth.myotis",
+    "module": "myotis-rpc-policy",
+    "version": "0.1.19-rc2",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "8.12"
+    }
+  },
+  "variants": [
+    {
+      "name": "metadataApiElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-metadata",
+        "org.jetbrains.kotlin.platform.type": "common"
+      },
+      "dependencies": [
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-stdlib",
+          "version": {
+            "requires": "2.2.21"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "myotis-rpc-policy-metadata-0.1.19-rc2.jar",
+          "url": "myotis-rpc-policy-0.1.19-rc2.jar",
+          "size": 3339,
+          "sha512": "11e37c479b18e4f834402f005643ef20e55acc430aba0fc157b9f2791aa30f4468996dca5248286334686354c28516722e352cb15c8f1405f2e14bfd24e3910c",
+          "sha256": "934a33221e5ad3b01e20fc4c4b7bb2fb157a5d1a5e1a1f1b43347f96399201bc",
+          "sha1": "507200a84ea1aa5d745eee3660f135d8a26689f5",
+          "md5": "c595bb37cec0e40f2627faa7fd4abca9"
+        }
+      ]
+    },
+    {
+      "name": "metadataSourcesElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-runtime",
+        "org.jetbrains.kotlin.platform.type": "common"
+      },
+      "files": [
+        {
+          "name": "myotis-rpc-policy-kotlin-0.1.19-rc2-sources.jar",
+          "url": "myotis-rpc-policy-0.1.19-rc2-sources.jar",
+          "size": 5123,
+          "sha512": "e33a4fa4034d6517d7f6cb885a0c5a3d2a7093fa44f178046d5fddbaaecb6676a8259bdf65110f57db7953108b35d0fc93d2ca4a616e7aba70400d8824382c3e",
+          "sha256": "1738b3ad7fe79f365de62861fa20ad2d3fdb44dbb61bf5bc9e32a5efc20be75e",
+          "sha1": "eae3ba8a0f0f01d0a777c8537646d02719718c3e",
+          "md5": "303cad5c901a4a95e6ef6e69f0a2da77"
+        }
+      ]
+    },
+    {
+      "name": "iosArm64ApiElements-published",
+      "attributes": {
+        "artifactType": "org.jetbrains.kotlin.klib",
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-api",
+        "org.jetbrains.kotlin.native.target": "ios_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "available-at": {
+        "url": "../../myotis-rpc-policy-iosarm64/0.1.19-rc2/myotis-rpc-policy-iosarm64-0.1.19-rc2.module",
+        "group": "eth.myotis",
+        "module": "myotis-rpc-policy-iosarm64",
+        "version": "0.1.19-rc2"
+      }
+    },
+    {
+      "name": "iosArm64SourcesElements-published",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-runtime",
+        "org.jetbrains.kotlin.native.target": "ios_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "available-at": {
+        "url": "../../myotis-rpc-policy-iosarm64/0.1.19-rc2/myotis-rpc-policy-iosarm64-0.1.19-rc2.module",
+        "group": "eth.myotis",
+        "module": "myotis-rpc-policy-iosarm64",
+        "version": "0.1.19-rc2"
+      }
+    },
+    {
+      "name": "iosArm64MetadataElements-published",
+      "attributes": {
+        "artifactType": "org.jetbrains.kotlin.klib",
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-metadata",
+        "org.jetbrains.kotlin.native.target": "ios_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "available-at": {
+        "url": "../../myotis-rpc-policy-iosarm64/0.1.19-rc2/myotis-rpc-policy-iosarm64-0.1.19-rc2.module",
+        "group": "eth.myotis",
+        "module": "myotis-rpc-policy-iosarm64",
+        "version": "0.1.19-rc2"
+      }
+    },
+    {
+      "name": "iosSimulatorArm64ApiElements-published",
+      "attributes": {
+        "artifactType": "org.jetbrains.kotlin.klib",
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-api",
+        "org.jetbrains.kotlin.native.target": "ios_simulator_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "available-at": {
+        "url": "../../myotis-rpc-policy-iossimulatorarm64/0.1.19-rc2/myotis-rpc-policy-iossimulatorarm64-0.1.19-rc2.module",
+        "group": "eth.myotis",
+        "module": "myotis-rpc-policy-iossimulatorarm64",
+        "version": "0.1.19-rc2"
+      }
+    },
+    {
+      "name": "iosSimulatorArm64SourcesElements-published",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-runtime",
+        "org.jetbrains.kotlin.native.target": "ios_simulator_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "available-at": {
+        "url": "../../myotis-rpc-policy-iossimulatorarm64/0.1.19-rc2/myotis-rpc-policy-iossimulatorarm64-0.1.19-rc2.module",
+        "group": "eth.myotis",
+        "module": "myotis-rpc-policy-iossimulatorarm64",
+        "version": "0.1.19-rc2"
+      }
+    },
+    {
+      "name": "iosSimulatorArm64MetadataElements-published",
+      "attributes": {
+        "artifactType": "org.jetbrains.kotlin.klib",
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-metadata",
+        "org.jetbrains.kotlin.native.target": "ios_simulator_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "available-at": {
+        "url": "../../myotis-rpc-policy-iossimulatorarm64/0.1.19-rc2/myotis-rpc-policy-iossimulatorarm64-0.1.19-rc2.module",
+        "group": "eth.myotis",
+        "module": "myotis-rpc-policy-iossimulatorarm64",
+        "version": "0.1.19-rc2"
+      }
+    },
+    {
+      "name": "jvmApiElements-published",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "standard-jvm",
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-api",
+        "org.jetbrains.kotlin.platform.type": "jvm"
+      },
+      "available-at": {
+        "url": "../../myotis-rpc-policy-jvm/0.1.19-rc2/myotis-rpc-policy-jvm-0.1.19-rc2.module",
+        "group": "eth.myotis",
+        "module": "myotis-rpc-policy-jvm",
+        "version": "0.1.19-rc2"
+      }
+    },
+    {
+      "name": "jvmRuntimeElements-published",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "standard-jvm",
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime",
+        "org.jetbrains.kotlin.platform.type": "jvm"
+      },
+      "available-at": {
+        "url": "../../myotis-rpc-policy-jvm/0.1.19-rc2/myotis-rpc-policy-jvm-0.1.19-rc2.module",
+        "group": "eth.myotis",
+        "module": "myotis-rpc-policy-jvm",
+        "version": "0.1.19-rc2"
+      }
+    },
+    {
+      "name": "jvmSourcesElements-published",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.jvm.environment": "standard-jvm",
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime",
+        "org.jetbrains.kotlin.platform.type": "jvm"
+      },
+      "available-at": {
+        "url": "../../myotis-rpc-policy-jvm/0.1.19-rc2/myotis-rpc-policy-jvm-0.1.19-rc2.module",
+        "group": "eth.myotis",
+        "module": "myotis-rpc-policy-jvm",
+        "version": "0.1.19-rc2"
+      }
+    }
+  ]
+}
