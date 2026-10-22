@@ -455,6 +455,12 @@ pub struct VerifiedAccount {
     /// the header whose keccak equals the attested block hash. `None`
     /// otherwise: a header no attestation pins dates nothing.
     pub block_timestamp: Option<u64>,
+    /// That block's hash, only when it is PROVEN like `block_timestamp`: the
+    /// anchor vouches for a block of that number whose state root is the one
+    /// the proof was verified against ([`ElReader::proven_block_hash`]).
+    /// `None` otherwise. Lets a host tell, later, whether the block its
+    /// proof anchors to is still canonical (#691).
+    pub block_hash: Option<[u8; 32]>,
     pub peer_state_root: [u8; 32],
     pub peer_proof_valid: bool,
     pub beacon_chain_verified: bool,
@@ -6042,6 +6048,24 @@ impl ElReader {
         Ok((root, number, None, outcome))
     }
 
+    /// The hash of the block a verified read ran against, when the anchor
+    /// vouches for one of that `number` whose state root is `state_root`: the
+    /// beacon-finalized execution block, or one of the recent optimistic heads.
+    /// Keyed by the state root as well as the number, so a read is never
+    /// labelled with a sibling block's hash: a replaced head at that number
+    /// carries another root, and gives `None`.
+    fn proven_block_hash(&self, number: u64, state_root: &[u8; 32]) -> Option<[u8; 32]> {
+        if let Some(fin) = self.anchor.finalized_execution() {
+            if fin.block_number == number && &fin.state_root == state_root {
+                return Some(fin.block_hash);
+            }
+        }
+        self.anchor
+            .recent_head_at(number)
+            .filter(|head| &head.state_root == state_root)
+            .map(|head| head.hash)
+    }
+
     /// Assemble a `VerifiedAccount` from the proof-verified outcome + the beacon
     /// anchor verdict + the reader's live anchor diagnostics. Shared by the
     /// clearnet ([`get_account_from`]) and Tor read paths so the verdict/trust
@@ -6073,6 +6097,9 @@ impl ElReader {
             // the one a header walk proved with the read block's header.
             block_timestamp: attested_timestamp
                 .or(verdict.block_timestamp)
+                .filter(|_| verdict.beacon_chain_verified),
+            block_hash: self
+                .proven_block_hash(block_number, &state_root)
                 .filter(|_| verdict.beacon_chain_verified),
             peer_state_root: state_root,
             peer_proof_valid: true,
@@ -6762,12 +6789,13 @@ impl ElReader {
     ) -> Result<CallAnswer, String> {
         let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "eth_call (create)").await?;
         let block_number = ctx.block_number;
+        let state_root = ctx.state_root;
         let joined = super::request::blocking(move || {
             let sender = from.unwrap_or([0u8; 20]);
             executor.create_view(sender, &init_code, value, &ctx, overrides)
         })
         .await?;
-        Ok(Self::call_answer(anchor, block_number, joined))
+        Ok(self.call_answer(anchor, block_number, &state_root, joined))
     }
 
     /// Verified `eth_call`: run a read-only call against verified state, with
@@ -6819,6 +6847,7 @@ impl ElReader {
     ) -> Result<CallAnswer, String> {
         let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "eth_call").await?;
         let block_number = ctx.block_number;
+        let state_root = ctx.state_root;
         // Run the SYNCHRONOUS executor off the runtime worker so the oracle's
         // per-fetch `block_on` is a fresh (non-nested) runtime entry.
         let joined = super::request::blocking(move || {
@@ -6829,7 +6858,7 @@ impl ElReader {
             executor.call_view_overridden(sender, to, &data, value, &ctx, overrides)
         })
         .await?;
-        Ok(Self::call_answer(anchor, block_number, joined))
+        Ok(self.call_answer(anchor, block_number, &state_root, joined))
     }
 
     /// Verified `eth_call` for a full transaction object (#509): every field
@@ -6860,6 +6889,7 @@ impl ElReader {
         let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "eth_call").await?;
         let setup = started.elapsed();
         let block_number = ctx.block_number;
+        let state_root = ctx.state_root;
         // Logged inside the blocking run, which always finishes: a call whose
         // request timed out or was cancelled still shows what it cost.
         let joined = super::request::blocking(move || {
@@ -6868,7 +6898,7 @@ impl ElReader {
             joined
         })
         .await?;
-        Ok(Self::call_answer(anchor, block_number, joined))
+        Ok(self.call_answer(anchor, block_number, &state_root, joined))
     }
 
     /// Verified `eth_estimateGas` for a full transaction object (#509): every
@@ -7137,13 +7167,19 @@ impl ElReader {
     /// The executor's verdict as a [`CallAnswer`] for the block it ran against
     /// — one mapping for both call shapes.
     fn call_answer(
+        &self,
         anchor: ReadAnchor,
         block_number: u64,
+        state_root: &[u8; 32],
         joined: Result<Vec<u8>, EvmError>,
     ) -> CallAnswer {
+        let outcome = CallOutcome::from_executor(joined);
+        // A call that ran nowhere names no block hash.
+        let ran = !matches!(outcome, CallOutcome::Unavailable(_));
         CallAnswer {
-            outcome: CallOutcome::from_executor(joined),
+            outcome,
             block_number,
+            block_hash: self.proven_block_hash(block_number, state_root).filter(|_| ran),
             finalized: anchor == ReadAnchor::Finalized,
         }
     }
@@ -12006,6 +12042,32 @@ mod tests {
             assert_eq!(proven_timestamp(1_700_000_000), Some(1_700_000_000));
             // The anchor's optimistic head carries its proven timestamp with its root.
             assert_eq!(reader.anchor.optimistic_execution(), Some((21_000_000, [2; 32], 1_700_000_000)));
+        }
+
+        /// A read names its block's hash only when the anchor vouches for a block
+        /// of that number with the read's own state root (#691): the finalized
+        /// block or a recent optimistic head — never a sibling's, never a guess.
+        #[tokio::test]
+        async fn a_read_names_its_block_hash_only_for_a_block_with_its_state_root() {
+            let head = 21_000_000u64;
+            let reader = offline_reader(head).await;
+            let hash = |n: u64| {
+                let mut h = [0u8; 32];
+                h[..8].copy_from_slice(&n.to_be_bytes());
+                h
+            };
+            assert_eq!(reader.proven_block_hash(head, &[2; 32]), Some(hash(head)), "the optimistic head");
+            assert_eq!(reader.proven_block_hash(head - 64, &[1; 32]), Some(hash(head - 64)), "the finalized block");
+            assert_eq!(reader.proven_block_hash(head, &[9; 32]), None, "another state root: another block");
+            assert_eq!(reader.proven_block_hash(head - 1, &[2; 32]), None, "a block the anchor never held");
+            // Carried into the account result only with a verdict that holds.
+            let holds = crate::el::verify::finalized_root_verdict(7);
+            let fails = crate::el::verify::Verdict { beacon_chain_verified: false, ..holds.clone() };
+            let build = |verdict: crate::el::verify::Verdict| {
+                reader.build_verified_account([0x9d; 20], [2; 32], head, None, AccountOutcome::Absent, verdict, false)
+            };
+            assert_eq!(build(holds).block_hash, Some(hash(head)));
+            assert_eq!(build(fails).block_hash, None);
         }
 
         #[tokio::test]
@@ -17920,6 +17982,7 @@ mod pre_broadcast_tests {
             code_hash: EMPTY_CODE_HASH,
             block_number: 100,
             block_timestamp: None,
+            block_hash: None,
             peer_state_root: state_root,
             peer_proof_valid: true,
             beacon_chain_verified: verified,

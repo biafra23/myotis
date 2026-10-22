@@ -36,6 +36,7 @@ class RustVerifiedReadJsonTest {
             + "\"storageRootHex\":\"0x56e81f171bcac1a441cf3f1d5f0b8d5f0f3f0e5e5b5b5b5b5b5b5b5b5b5b5b5b5\","
             + "\"codeHashHex\":\"0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470\","
             + "\"blockNumber\":21000000,\"blockTimestamp\":1700000000,"
+            + "\"blockHash\":\"0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b\","
             + "\"peerStateRootHex\":\"0x5555555555555555555555555555555555555555555555555555555555555555\","
             + "\"peerProofValid\":true,\"beaconChainVerified\":true,\"blsVerified\":true,"
             + "\"matchedBeaconSlot\":7000000,\"verifyMethod\":\"headerChain\",\"failReason\":null,"
@@ -68,6 +69,17 @@ class RustVerifiedReadJsonTest {
         assertTrue(r.proofNodesHex().isEmpty());
         // ABI 41: the proven block timestamp.
         assertEquals(1700000000L, r.blockTimestamp());
+        // ABI 52: the proven block hash.
+        assertEquals("0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b", r.blockHashHex());
+    }
+
+    @Test
+    void anUnprovenBlockHashIsNull() {
+        // null: the engine proved no hash; absent: an engine before ABI 52.
+        assertNull(RustChainHandle.accountFromJson("0x0",
+                ACCOUNT_JSON.replace("\"0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b\"", "null")).blockHashHex());
+        assertNull(RustChainHandle.accountFromJson("0x0",
+                ACCOUNT_JSON.replace("\"blockHash\":\"0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b\",", "")).blockHashHex());
     }
 
     @Test
@@ -249,6 +261,14 @@ class RustVerifiedReadJsonTest {
         assertEquals("state unavailable", un.detail());
         // No answer, no block to order it by.
         assertEquals(-1L, un.blockNumber());
+        // ABI 52: an answered call names its block's hash when proven, null otherwise.
+        assertNull(ok.blockHashHex());
+        assertEquals("0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b", RustChainHandle.callDetailedFromJson(
+                "{\"status\":\"ok\",\"resultHex\":\"0x\",\"blockNumber\":21000000,"
+                + "\"blockHash\":\"0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b\",\"verified\":false}").blockHashHex());
+        assertNull(RustChainHandle.callDetailedFromJson(
+                "{\"status\":\"unavailable\",\"reason\":\"x\",\"blockNumber\":1,"
+                + "\"blockHash\":null,\"verified\":false}").blockHashHex());
         // A pre-ABI-30 envelope without the key: unknown, not block 0.
         assertEquals(-1L, RustChainHandle.callDetailedFromJson(
                 "{\"status\":\"ok\",\"resultHex\":\"0x\"}").blockNumber());
