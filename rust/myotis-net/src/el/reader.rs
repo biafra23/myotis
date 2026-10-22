@@ -6053,7 +6053,13 @@ impl ElReader {
     /// beacon-finalized execution block, or one of the recent optimistic heads.
     /// Keyed by the state root as well as the number, so a read is never
     /// labelled with a sibling block's hash: a replaced head at that number
-    /// carries another root, and gives `None`.
+    /// carries another root, and gives `None`. Attested is not CANONICAL:
+    /// `recent_head_at` serves a ring entry linked or not, so `Some` can name a
+    /// head a sibling chain has replaced since (the `11A → 12B` case of
+    /// `optimistic_root_at`). That is still the block the read ran against; a
+    /// caller that needs it canonical NOW compares it with a hash the follower
+    /// vouches for, as the activity report's `base.hash`
+    /// (docs/address-activity.md).
     fn proven_block_hash(&self, number: u64, state_root: &[u8; 32]) -> Option<[u8; 32]> {
         if let Some(fin) = self.anchor.finalized_execution() {
             if fin.block_number == number && &fin.state_root == state_root {
