@@ -48,6 +48,14 @@ import java.util.List;
  *                              attested block hash). -1 otherwise — a header no
  *                              attestation pins dates nothing (the Java engine
  *                              reports -1 throughout)
+ * @param blockHashHex          the hash (0x-hex) of block {@code blockNumber} when it
+ *                              is PROVEN: the beacon anchor vouches for a block of
+ *                              that number whose state root is the one the proof was
+ *                              checked against, and the verdict holds. A caller that
+ *                              compares answers across blocks pins it to tell a block
+ *                              from its reorged sibling (#691). Null otherwise, and
+ *                              always from the Java engine and Rust engines before
+ *                              ABI 52
  */
 public record AccountProofResult(
         String address,
@@ -71,5 +79,37 @@ public record AccountProofResult(
         long wallClockPeriod,
         long finalizedBlockNumber,
         long optimisticBlockNumber,
-        long blockTimestamp) {
+        long blockTimestamp,
+        String blockHashHex) {
+
+    /** A result that names no proven block hash ({@code blockHashHex} null). */
+    public AccountProofResult(
+            String address,
+            boolean exists,
+            long nonce,
+            String balanceWei,
+            String storageRootHex,
+            String codeHashHex,
+            long blockNumber,
+            String peerStateRootHex,
+            boolean peerProofValid,
+            boolean beaconChainVerified,
+            boolean blsVerified,
+            long matchedBeaconSlot,
+            String verifyMethod,
+            String failReason,
+            String accountHashHex,
+            List<String> proofNodesHex,
+            boolean beaconSynced,
+            long finalizedPeriod,
+            long wallClockPeriod,
+            long finalizedBlockNumber,
+            long optimisticBlockNumber,
+            long blockTimestamp) {
+        this(address, exists, nonce, balanceWei, storageRootHex, codeHashHex, blockNumber,
+                peerStateRootHex, peerProofValid, beaconChainVerified, blsVerified,
+                matchedBeaconSlot, verifyMethod, failReason, accountHashHex, proofNodesHex,
+                beaconSynced, finalizedPeriod, wallClockPeriod, finalizedBlockNumber,
+                optimisticBlockNumber, blockTimestamp, null);
+    }
 }

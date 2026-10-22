@@ -360,7 +360,18 @@ uniffi::setup_scaffolding!();
 ///      header's commitment), with every block it could not check listed as a gap. An
 ///      additive function pair — bumped so a host that relies on the report
 ///      is never paired with an engine that lacks it.
-pub const ABI_VERSION: i32 = 51;
+/// v52: a proof names its block's hash. `get_account_json` and the call
+///      family's JSON (`call_json`: eth_call, its transaction-object and
+///      state-override variants) gained `"blockHash"`: the hash of
+///      `blockNumber` when the beacon anchor vouches for a block of that number
+///      whose state root is the one the read was verified against (the
+///      finalized block or a recent optimistic head), else null. A host that
+///      compares answers across blocks — skipping a re-proof because nothing
+///      it watches changed since (#691) — pins it to tell a block from its
+///      reorged sibling. A payload extension, no signature change — bumped so
+///      a host that relies on the hash is never paired with an engine that
+///      omits it.
+pub const ABI_VERSION: i32 = 52;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

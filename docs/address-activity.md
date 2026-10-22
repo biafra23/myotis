@@ -77,6 +77,17 @@ can check that block is still canonical. Above finality a block can come back
 with a new `blockHash` after a reorg. The report always reflects the chain as
 it is now.
 
+A host that keeps a proof because nothing changed since needs to know the proof
+is from the block `base` names, not from a sibling at the same height. Since ABI
+52 every account proof and every answered call says so. Their JSON carries
+`"blockHash"`, and the JVM and iOS results carry `blockHashHex`. That field is the
+hash of `blockNumber` when the beacon anchor vouches for a block of that number
+whose state root is the one the read was verified against: the finalized block or
+a recent optimistic head. Otherwise it is null. So the check is exact: ask
+`address_activity_json(provenAt)` and keep the proof only if `base.hash` equals the
+proof's `blockHash`, and the address has no touch and no gap above it. A null hash
+on either side means re-prove.
+
 ## How the engine follows
 
 `myotis-net/src/el/activity.rs` holds the state and the report. The follower is

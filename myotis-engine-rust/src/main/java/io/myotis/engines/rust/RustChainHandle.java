@@ -900,7 +900,9 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                 o.getLong("finalizedBlockNumber", 0L),
                 o.getLong("optimisticBlockNumber", 0L),
                 // ABI >= 41: the proven block timestamp, null when none is proven.
-                longOrMinusOne(o, "blockTimestamp"));
+                longOrMinusOne(o, "blockTimestamp"),
+                // ABI >= 52: the proven block hash, null when none is proven.
+                stringOrNull(o, "blockHash"));
         } catch (RuntimeException e) {
             // A type-mismatched field (Rust-side shape drift) surfaces as an
             // EngineException, never a raw UnsupportedOperationException.
@@ -1025,7 +1027,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
      *  against) and {@code verified} (ran against the beacon-finalized block)
      *  since ABI 30 — all pinned by the eljson golden tests; an answered call
      *  ({@code ok}/{@code revert}) carries {@code blockNumber} on into
-     *  {@link io.myotis.api.CallResult#blockNumber}, {@code verified} is not
+     *  {@link io.myotis.api.CallResult#blockNumber}, and {@code blockHash}
+     *  (ABI 52, null unless proven) into {@code blockHashHex}; {@code verified} is not
      *  surfaced. A revert
      *  is a VERIFIED answer whose payload the host serves as the standard
      *  code-3 error. The permanent {@code {"error","code":-32602}} envelope (a
@@ -1045,12 +1048,13 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         try {
             String status = stringOrNull(o, "status");
             long block = o.getLong("blockNumber", -1L);
+            String hash = stringOrNull(o, "blockHash"); // ABI >= 52; null when not proven
             if ("ok".equals(status)) {
                 // 0x / empty → empty bytes
-                return io.myotis.api.CallResult.ok(hexToBytes(stringOrNull(o, "resultHex"))).atBlock(block);
+                return io.myotis.api.CallResult.ok(hexToBytes(stringOrNull(o, "resultHex"))).atBlock(block, hash);
             }
             if ("revert".equals(status)) {
-                return io.myotis.api.CallResult.reverted(hexToBytes(stringOrNull(o, "dataHex"))).atBlock(block);
+                return io.myotis.api.CallResult.reverted(hexToBytes(stringOrNull(o, "dataHex"))).atBlock(block, hash);
             }
             if ("infeasible".equals(status)) {
                 String reason = stringOrNull(o, "reason");

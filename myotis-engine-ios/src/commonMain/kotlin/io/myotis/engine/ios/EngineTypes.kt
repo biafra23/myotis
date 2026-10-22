@@ -143,7 +143,8 @@ data class StatusSnapshot(
  * A verified account read. [verifyMethod] set means a verdict; [failReason] set means
  * the verification failed, which is a result, not an error. [nonce] is -1 and
  * [balanceWei] null for an account proven absent; [blockTimestamp] is -1 unless the
- * block's timestamp is proven.
+ * block's timestamp is proven, and [blockHashHex] null unless the block's hash is (the
+ * beacon anchor vouches for a block of that number with the proof's state root; ABI 52).
  */
 data class AccountProofResult(
     val address: String,
@@ -168,6 +169,7 @@ data class AccountProofResult(
     val finalizedBlockNumber: Long,
     val optimisticBlockNumber: Long,
     val blockTimestamp: Long,
+    val blockHashHex: String? = null,
 )
 
 /** A verified storage-slot read, with the same verdict rules as [AccountProofResult]. */
@@ -202,19 +204,28 @@ data class StorageProofResult(
  * A verified `eth_call`, its outcomes told apart. [data] is the return data for
  * [Status.OK] and the revert payload for [Status.REVERTED], null otherwise; [detail]
  * the reason for the others. [blockNumber] is the block an answered call ran against,
- * -1 when unknown.
+ * -1 when unknown, and [blockHashHex] that block's hash when it is proven (the beacon
+ * anchor vouches for a block of that number with the state root the call ran against;
+ * ABI 52), null otherwise.
  */
-class CallResult(val status: Status, val data: ByteArray?, val detail: String?, val blockNumber: Long = -1L) {
+class CallResult(
+    val status: Status,
+    val data: ByteArray?,
+    val detail: String?,
+    val blockNumber: Long = -1L,
+    val blockHashHex: String? = null,
+) {
 
     /** The outcomes: [REFUSED] is permanent (no retry can succeed), [UNAVAILABLE]
      *  is not, and [INFEASIBLE] is a call that cannot succeed within the caller's
      *  gas, fee cap or funds, in geth's words. */
     enum class Status { OK, REVERTED, UNAVAILABLE, REFUSED, INFEASIBLE }
 
-    /** This result, answered at [block]. */
-    fun atBlock(block: Long): CallResult = CallResult(status, data, detail, block)
+    /** This result, answered at [block], of proven hash [hashHex] (null: not proven). */
+    fun atBlock(block: Long, hashHex: String? = null): CallResult = CallResult(status, data, detail, block, hashHex)
 
-    override fun toString(): String = "CallResult($status, ${data?.size ?: "no"} bytes, $detail, block $blockNumber)"
+    override fun toString(): String =
+        "CallResult($status, ${data?.size ?: "no"} bytes, $detail, block $blockNumber, hash $blockHashHex)"
 
     companion object {
         fun ok(data: ByteArray): CallResult = CallResult(Status.OK, data, null)

@@ -47,11 +47,17 @@ package io.myotis.api;
  * default {@link VerifiedReads#callDetailed} keep {@code -1}. So a caller must
  * handle {@code -1} on any status — it is additive, never a guarantee.
  *
+ * <p>{@code blockHashHex} is that block's hash (0x-hex) when it is PROVEN: the
+ * beacon anchor vouches for a block of that number whose state root is the one
+ * the call ran against. A caller comparing answers across blocks pins it to tell
+ * a block from its reorged sibling (#691). Null otherwise: set only by the Rust
+ * engine from ABI 52, on an answered call.
+ *
  * <p>Flat record over FFI-portable types (enum, {@code byte[]}, {@code String},
  * {@code long}) per the engine-contract rules; {@code data}/{@code detail} are
  * null when not applicable to the status.
  */
-public record CallResult(Status status, byte[] data, String detail, long blockNumber) {
+public record CallResult(Status status, byte[] data, String detail, long blockNumber, String blockHashHex) {
 
     public CallResult {
         java.util.Objects.requireNonNull(status, "status");
@@ -62,9 +68,19 @@ public record CallResult(Status status, byte[] data, String detail, long blockNu
         this(status, data, detail, -1L);
     }
 
-    /** This result, stating that the call ran against block {@code block}. */
+    /** A result that names no proven block hash ({@code blockHashHex} null). */
+    public CallResult(Status status, byte[] data, String detail, long blockNumber) {
+        this(status, data, detail, blockNumber, null);
+    }
+
+    /** This result, stating that the call ran against block {@code block}, whose hash is not proven. */
     public CallResult atBlock(long block) {
-        return new CallResult(status, data, detail, block);
+        return atBlock(block, null);
+    }
+
+    /** This result, stating that the call ran against block {@code block} of proven hash {@code hashHex} (null: not proven). */
+    public CallResult atBlock(long block, String hashHex) {
+        return new CallResult(status, data, detail, block, hashHex);
     }
 
     public enum Status { OK, REVERTED, UNAVAILABLE, REFUSED, INFEASIBLE }

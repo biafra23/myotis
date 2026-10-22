@@ -88,6 +88,12 @@ pub fn account_json(
         "blockTimestamp".into(),
         a.block_timestamp.map(json_u64).unwrap_or(serde_json::Value::Null),
     );
+    // ABI ≥ 52: that block's hash when it is PROVEN — the anchor vouches for a
+    // block of that number with the proof's state root — else null.
+    obj.insert(
+        "blockHash".into(),
+        a.block_hash.map(|h| serde_json::Value::from(hex0x(&h))).unwrap_or(serde_json::Value::Null),
+    );
     obj.insert("peerStateRootHex".into(), hex0x(&a.peer_state_root).into());
     obj.insert("peerProofValid".into(), a.peer_proof_valid.into());
     obj.insert("beaconChainVerified".into(), a.beacon_chain_verified.into());
@@ -585,7 +591,8 @@ pub fn fee_json(f: &FeeEstimate) -> String {
 /// message, served as geth serves it (JSON-RPC -32000); a plain call gets it
 /// only for calldata that alone costs more than the 30 M budget — each also
 /// carrying `"blockNumber":N`, the block the
-/// call ran against, and `"verified":b`, true when the call was ANSWERED
+/// call ran against (ABI ≥ 52: and `"blockHash"`, that block's hash when
+/// proven, else null), and `"verified":b`, true when the call was ANSWERED
 /// (anything but `unavailable`) at the beacon-FINALIZED block (the `finalized` tag;
 /// the vocabulary of `ens_record_json`). ABI ≥ 30, additive: the hosts read
 /// `status` and the data keys only.
@@ -617,6 +624,12 @@ pub fn call_json(answer: &CallAnswer) -> String {
         }
     }
     obj.insert("blockNumber".into(), json_u64(answer.block_number));
+    // ABI ≥ 52: that block's hash when proven (the anchor vouches for a block
+    // of that number with the state root the call ran against), else null.
+    obj.insert(
+        "blockHash".into(),
+        answer.block_hash.map(|h| serde_json::Value::from(hex0x(&h))).unwrap_or(serde_json::Value::Null),
+    );
     // "Ran against the finalized block": an `unavailable` call ran nowhere, so
     // it is never `verified`, whatever anchor it asked for.
     let ran = !matches!(answer.outcome, CallOutcome::Unavailable(_));
@@ -1153,6 +1166,7 @@ mod tests {
             code_hash: [0x44; 32],
             block_number: 21_000_000,
             block_timestamp: Some(1_700_000_000),
+            block_hash: Some([0x0b; 32]),
             peer_state_root: [0x55; 32],
             peer_proof_valid: true,
             beacon_chain_verified: true,
@@ -1180,6 +1194,16 @@ mod tests {
         assert_eq!(v["blockNumber"], 21_000_000);
         // ABI >= 41: the proven block timestamp, or null when none is proven.
         assert_eq!(v["blockTimestamp"], 1_700_000_000);
+        // ABI >= 52: the proven block hash, likewise.
+        assert_eq!(v["blockHash"], hex0x(&[0x0b; 32]));
+        let unproven: serde_json::Value = serde_json::from_str(&account_json(
+            "0xabc",
+            &VerifiedAccount { block_hash: None, ..sample_account() },
+            1,
+            1,
+        ))
+        .unwrap();
+        assert!(unproven["blockHash"].is_null());
         assert_eq!(v["peerStateRootHex"], hex0x(&[0x55; 32]));
         assert_eq!(v["peerProofValid"], true);
         assert_eq!(v["beaconChainVerified"], true);
@@ -1299,7 +1323,7 @@ mod tests {
 
     #[test]
     fn call_json_shapes() {
-        let at_head = |outcome: CallOutcome| CallAnswer { outcome, block_number: 21_000_000, finalized: false };
+        let at_head = |outcome: CallOutcome| CallAnswer { outcome, block_number: 21_000_000, block_hash: None, finalized: false };
         // ok → status + resultHex, plus the block the call ran against
         let ok: serde_json::Value =
             serde_json::from_str(&call_json(&at_head(CallOutcome::Success(vec![0xde, 0xad])))).unwrap();
@@ -1307,6 +1331,14 @@ mod tests {
         assert_eq!(ok["resultHex"], "0xdead");
         assert_eq!(ok["blockNumber"], 21_000_000);
         assert_eq!(ok["verified"], false);
+        // ABI >= 52: null when no hash is proven, else the block's hash.
+        assert!(ok["blockHash"].is_null());
+        let hashed: serde_json::Value = serde_json::from_str(&call_json(&CallAnswer {
+            block_hash: Some([0x0c; 32]),
+            ..at_head(CallOutcome::Success(vec![1]))
+        }))
+        .unwrap();
+        assert_eq!(hashed["blockHash"], hex0x(&[0x0c; 32]));
 
         // empty success data serializes as 0x
         let empty: serde_json::Value =
@@ -1343,6 +1375,7 @@ mod tests {
         let at_fin = |outcome: CallOutcome| CallAnswer {
             outcome,
             block_number: 20_999_936,
+            block_hash: None,
             finalized: true,
         };
         let fin: serde_json::Value =
@@ -1474,6 +1507,7 @@ mod tests {
         let call = call_json(&CallAnswer {
             outcome: CallOutcome::Refused(why.to_string()),
             block_number: 21_000_000,
+            block_hash: None,
             finalized: false,
         });
         assert_eq!(call, invalid_params_json(why));

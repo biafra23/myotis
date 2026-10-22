@@ -268,7 +268,7 @@ class EngineDecodingTest {
             """"exists":true,"nonce":5898,"balanceWei":"1000000000000000000",""" +
             """"storageRootHex":"0x56e81f171bcac1a441cf3f1d5f0b8d5f0f3f0e5e5b5b5b5b5b5b5b5b5b5b5b5b5",""" +
             """"codeHashHex":"0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",""" +
-            """"blockNumber":21000000,"blockTimestamp":1700000000,""" +
+            """"blockNumber":21000000,"blockTimestamp":1700000000,"blockHash":"0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",""" +
             """"peerStateRootHex":"0x5555555555555555555555555555555555555555555555555555555555555555",""" +
             """"peerProofValid":true,"beaconChainVerified":true,"blsVerified":true,""" +
             """"matchedBeaconSlot":7000000,"verifyMethod":"headerChain","failReason":null,""" +
@@ -299,6 +299,13 @@ class EngineDecodingTest {
         assertEquals(21000010L, r.optimisticBlockNumber)
         assertTrue(r.proofNodesHex.isEmpty())
         assertEquals(1700000000L, r.blockTimestamp)
+        assertEquals("0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b", r.blockHashHex)
+    }
+
+    @Test
+    fun anUnprovenBlockHashIsNull() {
+        assertNull(EngineDecoding.account("0x0", account.replace("\"0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b\"", "null")).blockHashHex)
+        assertNull(EngineDecoding.account("0x0", account.replace("\"blockHash\":\"0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b\",", "")).blockHashHex)
     }
 
     @Test
@@ -438,6 +445,14 @@ class EngineDecodingTest {
         assertNull(unavailable.data)
         assertEquals("state unavailable", unavailable.detail)
         assertEquals(-1L, unavailable.blockNumber)
+        // ABI 52: an answered call names its block's hash when proven, null otherwise.
+        assertNull(ok.blockHashHex)
+        assertEquals(
+            "0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+            EngineDecoding.call(
+                """{"status":"ok","resultHex":"0x","blockNumber":21000000,"blockHash":"0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b","verified":false}""",
+            ).blockHashHex,
+        )
         // A pre-ABI-30 envelope without the key: unknown, not block 0.
         assertEquals(-1L, EngineDecoding.call("""{"status":"ok","resultHex":"0x"}""").blockNumber)
         assertContentEquals(ByteArray(0), EngineDecoding.call("""{"status":"ok","resultHex":"0x"}""").data)

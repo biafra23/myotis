@@ -120,6 +120,11 @@ impl ReadAnchor {
 pub struct CallAnswer {
     pub outcome: CallOutcome,
     pub block_number: u64,
+    /// The hash of that block, only when proven: the anchor vouches for a
+    /// block of that number with the state root the call ran against
+    /// (`ElReader::proven_block_hash`). `None` otherwise, and for a call that
+    /// ran nowhere.
+    pub block_hash: Option<[u8; 32]>,
     /// Ran against the beacon-FINALIZED block (the `verified` of
     /// `ens_record_json`).
     pub finalized: bool,

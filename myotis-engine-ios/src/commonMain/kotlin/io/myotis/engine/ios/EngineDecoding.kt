@@ -289,6 +289,8 @@ internal object EngineDecoding {
                 optimisticBlockNumber = o.long("optimisticBlockNumber"),
                 // ABI 41: the proven block timestamp, -1 when none is proven.
                 blockTimestamp = o.long("blockTimestamp", -1L),
+                // ABI 52: the proven block hash, null when none is proven.
+                blockHashHex = o.string("blockHash"),
             )
         }
     }
@@ -356,9 +358,10 @@ internal object EngineDecoding {
         throwIfError(o)
         return fields("call") {
             val block = o.long("blockNumber", -1L)
+            val hash = o.string("blockHash") // ABI 52; null when not proven
             when (o.string("status")) {
-                "ok" -> CallResult.ok(Hex.decode(o.string("resultHex"))).atBlock(block)
-                "revert" -> CallResult.reverted(Hex.decode(o.string("dataHex"))).atBlock(block)
+                "ok" -> CallResult.ok(Hex.decode(o.string("resultHex"))).atBlock(block, hash)
+                "revert" -> CallResult.reverted(Hex.decode(o.string("dataHex"))).atBlock(block, hash)
                 "infeasible" -> CallResult.infeasible(requiredReason(o, "call"))
                 else -> CallResult.unavailable(o.string("reason"))
             }
