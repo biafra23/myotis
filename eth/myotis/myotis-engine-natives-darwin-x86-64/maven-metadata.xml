@@ -3,12 +3,13 @@
   <groupId>eth.myotis</groupId>
   <artifactId>myotis-engine-natives-darwin-x86-64</artifactId>
   <versioning>
-    <latest>0.1.18</latest>
-    <release>0.1.18</release>
+    <latest>0.1.19-rc1</latest>
+    <release>0.1.19-rc1</release>
     <versions>
       <version>0.1.17</version>
       <version>0.1.18</version>
+      <version>0.1.19-rc1</version>
     </versions>
-    <lastUpdated>20261020224446</lastUpdated>
+    <lastUpdated>20261022173402</lastUpdated>
   </versioning>
 </metadata>

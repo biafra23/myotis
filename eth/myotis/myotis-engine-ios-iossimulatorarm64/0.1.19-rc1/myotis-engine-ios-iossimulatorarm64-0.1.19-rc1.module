@@ -1,0 +1,263 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "url": "../../myotis-engine-ios/0.1.19-rc1/myotis-engine-ios-0.1.19-rc1.module",
+    "group": "eth.myotis",
+    "module": "myotis-engine-ios",
+    "version": "0.1.19-rc1",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "8.12"
+    }
+  },
+  "variants": [
+    {
+      "name": "iosSimulatorArm64ApiElements-published",
+      "attributes": {
+        "artifactType": "org.jetbrains.kotlin.klib",
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-api",
+        "org.jetbrains.kotlin.native.target": "ios_simulator_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "dependencies": [
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-stdlib",
+          "version": {
+            "requires": "2.2.21"
+          },
+          "excludes": [
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-epoll"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-kqueue"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-unix-common"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-codec-native-quic"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j2-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j18-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-core"
+            }
+          ]
+        },
+        {
+          "group": "org.jetbrains.kotlinx",
+          "module": "kotlinx-serialization-json",
+          "version": {
+            "requires": "1.7.3"
+          },
+          "excludes": [
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-epoll"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-kqueue"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-unix-common"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-codec-native-quic"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j2-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j18-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-core"
+            }
+          ]
+        }
+      ],
+      "files": [
+        {
+          "name": "myotis-engine-ios-iosSimulatorArm64Main-0.1.19-rc1.klib",
+          "url": "myotis-engine-ios-iossimulatorarm64-0.1.19-rc1.klib",
+          "size": 155544,
+          "sha512": "1beeaafc78faf57b8a212c709f7785fbcf6a2b621be0c24121443b0483d7cf250acef58fe107d10ba10b2a63246f97e1aefd0d413f11991fe13741e87fd0ee82",
+          "sha256": "1925a15389456310957fc1b064d10ccaacd2c97d1e7ce83e5e04a4a0f17a7386",
+          "sha1": "57c9ef738abf5bc563e81a38975a4d9bac2f0db7",
+          "md5": "249d9df63c5d9ce4a0fe4e75ed85934a"
+        },
+        {
+          "name": "myotis-engine-ios-iosSimulatorArm64Cinterop-myotisEngineMain-0.1.19-rc1.klib",
+          "url": "myotis-engine-ios-iossimulatorarm64-0.1.19-rc1-cinterop-myotisEngine.klib",
+          "size": 8265357,
+          "sha512": "d602bac51b78d3ffc5df99bc2cfce4d3e7904cb21e993cb4bf6c3da9fd5c96ee748e7dacc79117f81eee27c8dc6734dbdb34e344abe534cbf40e2b479eaec2a9",
+          "sha256": "1dcb034f3a6fdcdf6fb67df45f1c5836e9d411de1fea7c288fc1541875d54767",
+          "sha1": "fcab54f330019dc4369bfc227238a10a892bf128",
+          "md5": "49607e73862c9d6a7d97f98f251f34ec"
+        }
+      ]
+    },
+    {
+      "name": "iosSimulatorArm64SourcesElements-published",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-runtime",
+        "org.jetbrains.kotlin.native.target": "ios_simulator_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "files": [
+        {
+          "name": "myotis-engine-ios-iossimulatorarm64-0.1.19-rc1-sources.jar",
+          "url": "myotis-engine-ios-iossimulatorarm64-0.1.19-rc1-sources.jar",
+          "size": 29798,
+          "sha512": "47389a7340546ed0b06c503d3e81138601ff8a9901b6b8dc82933094ed43059a179f59ac2fbe3a35cbaf46f3a84e0058b54f11b185881a8bef8a30b18d5ff9d2",
+          "sha256": "e0a45a0f356dc46dc11ff94a639e910173718ee202871387d8e0d3b4f07d9a6d",
+          "sha1": "855282865e370502ef7678d81b73ffc19348f9d8",
+          "md5": "514e6953f24caf6f695b4c25dd6f3f75"
+        }
+      ]
+    },
+    {
+      "name": "iosSimulatorArm64MetadataElements-published",
+      "attributes": {
+        "artifactType": "org.jetbrains.kotlin.klib",
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-metadata",
+        "org.jetbrains.kotlin.native.target": "ios_simulator_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "dependencies": [
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-stdlib",
+          "version": {
+            "requires": "2.2.21"
+          },
+          "excludes": [
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-epoll"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-kqueue"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-unix-common"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-codec-native-quic"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j2-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j18-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-core"
+            }
+          ]
+        },
+        {
+          "group": "org.jetbrains.kotlinx",
+          "module": "kotlinx-serialization-json",
+          "version": {
+            "requires": "1.7.3"
+          },
+          "excludes": [
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-epoll"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-kqueue"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-unix-common"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-codec-native-quic"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j2-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j18-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-core"
+            }
+          ]
+        }
+      ],
+      "files": [
+        {
+          "name": "myotis-engine-ios-iossimulatorarm64-0.1.19-rc1-metadata.jar",
+          "url": "myotis-engine-ios-iossimulatorarm64-0.1.19-rc1-metadata.jar",
+          "size": 55633,
+          "sha512": "339f5f0a3d048ad5de7507224fa1b87121b5a091ebd562a9e9fc5d9b01688f1f99d18274dcc424a84a11fb21057fbd7d4fa7a701c7a1f6b4ca4404031f7382e9",
+          "sha256": "206a0ebe44bde145eeaf0ea793a642d9f5a0b34374be591529d6fc231a4552ac",
+          "sha1": "ce2fcea1f7696d900f70920cf7eb8daf8c77780b",
+          "md5": "cdbe711bc046fa0cdc0572f983606490"
+        }
+      ]
+    }
+  ]
+}
