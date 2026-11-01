@@ -25,6 +25,8 @@ class HideAmountsTest {
         // A call without value and a creation carry no amount.
         assertEquals("call · 132 bytes calldata", maskTxHeadline("call", "call · 132 bytes calldata", true))
         assertEquals("contract creation · 4 bytes", maskTxHeadline("create", "contract creation · 4 bytes", true))
+        // A kind the mask does not know is hidden whole: drift over-masks, never leaks.
+        assertEquals(AMOUNT_MASK, maskTxHeadline("swap", "2 ETH → 3000 USDC", true))
         // Shown, nothing changes.
         assertEquals("1.25 ETH → 0xab12cd…9e4f", maskTxHeadline("eth", "1.25 ETH → 0xab12cd…9e4f", false))
     }

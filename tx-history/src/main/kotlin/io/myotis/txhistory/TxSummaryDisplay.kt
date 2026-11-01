@@ -7,6 +7,12 @@ package io.myotis.txhistory
  * hosts map [TxHistoryEvent] into the UI's own models and only borrow the formatting.)
  */
 
+/*
+ * Coupled consumer: the UI's Hide amounts masks these strings by shape
+ * (`maskTxHeadline` in ui/…/HideAmounts.kt, pinned by `HideAmountsTest`). A new kind or a
+ * changed headline shape must be mirrored there; an unknown kind is masked whole.
+ */
+
 /** The UI's short kind tag: "eth" | "erc20" | "call" | "create". */
 fun TxSummary.uiKind(): String = when (kind) {
     TxKind.ETH_TRANSFER -> "eth"

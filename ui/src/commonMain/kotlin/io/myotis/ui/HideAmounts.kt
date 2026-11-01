@@ -31,14 +31,18 @@ fun maskAmount(text: String, hidden: Boolean): String = if (hidden) AMOUNT_MASK 
  * A transaction-history row's [TxRowUi.headline] with its amount masked when [hidden]:
  * the leading amount of a transfer ("1.25 ETH → …", "1250.50 USDC → …") and the value a
  * call carries ("call · 132 bytes calldata · 0x38ed1739 · 0.5 ETH"). The headline is
- * formatted by the hosts (:tx-history's `TxSummaryDisplay`), so this follows its shapes.
+ * formatted by the hosts (:tx-history's `TxSummaryDisplay`), so this follows its shapes —
+ * and fails closed: a kind it does not know is masked whole, so a new shape over-masks
+ * rather than leaks. (A field of its own for the amount on [TxRowUi] would end the string
+ * matching; the hosts have it structured in `TxSummary`.)
  */
 internal fun maskTxHeadline(kind: String, headline: String, hidden: Boolean): String {
     if (!hidden) return headline
     return when (kind) {
         "eth", "erc20" -> AMOUNT_MASK + headline.substring(headline.indexOf(' ').let { if (it < 0) headline.length else it })
         "call" -> headline.replace(CALL_VALUE, "· $AMOUNT_MASK ETH")
-        else -> headline
+        "create" -> headline // "contract creation · N bytes": no amount
+        else -> AMOUNT_MASK
     }
 }
 
