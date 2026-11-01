@@ -28,6 +28,23 @@ const val AMOUNT_MASK = "••••"
 fun maskAmount(text: String, hidden: Boolean): String = if (hidden) AMOUNT_MASK else text
 
 /**
+ * A transaction-history row's [TxRowUi.headline] with its amount masked when [hidden]:
+ * the leading amount of a transfer ("1.25 ETH → …", "1250.50 USDC → …") and the value a
+ * call carries ("call · 132 bytes calldata · 0x38ed1739 · 0.5 ETH"). The headline is
+ * formatted by the hosts (:tx-history's `TxSummaryDisplay`), so this follows its shapes.
+ */
+internal fun maskTxHeadline(kind: String, headline: String, hidden: Boolean): String {
+    if (!hidden) return headline
+    return when (kind) {
+        "eth", "erc20" -> AMOUNT_MASK + headline.substring(headline.indexOf(' ').let { if (it < 0) headline.length else it })
+        "call" -> headline.replace(CALL_VALUE, "· $AMOUNT_MASK ETH")
+        else -> headline
+    }
+}
+
+private val CALL_VALUE = Regex("· [^·]+ ETH$")
+
+/**
  * Whether the screens below the header hide amounts. Provided once by [NodeScreen] from
  * [Settings.hideAmounts], so every tab reads the same live value without threading it
  * through each composable.

@@ -173,7 +173,7 @@ fun NodeScreen(
     val expert = remember(expertRev) { settings.expertMode() }
     // Hide amounts (the header's closed eye): one live value every tab reads through
     // LocalHideAmounts, written back to Settings on each flip so it survives a restart.
-    var hideAmounts by remember { mutableStateOf(settings.hideAmounts()) }
+    var hideAmounts by remember(settings) { mutableStateOf(settings.hideAmounts()) }
     // Web page access (#502): one live holder of the persisted policy, shared by the
     // Status tab's refusal banner and the Settings section so an Allow on either is
     // visible on both at once (the `when` below disposes a tab's own remembers).
@@ -2015,7 +2015,7 @@ private fun TxRowView(row: TxRowUi) {
             .clickable { clipboard.setText(AnnotatedString(row.hash)) }
             .padding(vertical = 4.dp),
     ) {
-        Text(row.headline, style = MaterialTheme.typography.bodyMedium)
+        Text(maskTxHeadline(row.kind, row.headline, LocalHideAmounts.current), style = MaterialTheme.typography.bodyMedium)
         Text(
             buildString {
                 append("#").append(groupDigits(row.blockNumber.toString()))

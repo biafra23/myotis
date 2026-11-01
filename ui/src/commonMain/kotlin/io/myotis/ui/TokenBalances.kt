@@ -254,11 +254,13 @@ private fun TokenRow(
             when {
                 r == null -> CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
                 r.raw != null -> {
+                    // Hidden, a zero is not dimmed either: the color would show which masked rows are empty.
+                    val hide = LocalHideAmounts.current
                     val zero = r.raw.trimStart('0').isEmpty()
                     Text(
-                        maskAmount(formatTokenAmount(r.raw, t.decimals), LocalHideAmounts.current),
+                        maskAmount(formatTokenAmount(r.raw, t.decimals), hide),
                         style = MaterialTheme.typography.titleMedium,
-                        color = if (zero) MaterialTheme.colorScheme.onSurfaceVariant else Color.Unspecified,
+                        color = if (zero && !hide) MaterialTheme.colorScheme.onSurfaceVariant else Color.Unspecified,
                     )
                 }
                 else -> Text("—", color = MaterialTheme.colorScheme.onSurfaceVariant)

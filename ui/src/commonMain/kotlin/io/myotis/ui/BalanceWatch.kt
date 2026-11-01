@@ -883,13 +883,17 @@ object BalanceWatch {
     @JvmStatic
     fun unitOf(c: WatchChange, currency: String?): String = c.symbol ?: currency ?: ""
 
+    /** [unitOf] as a suffix: " ETH", or "" when no unit is known. */
+    private fun unitSuffix(c: WatchChange, currency: String?): String =
+        unitOf(c, currency).let { if (it.isEmpty()) "" else " $it" }
+
     /** The notification title: "Savings: +0.5 ETH", "Savings: −100 USDC"; with
      *  [hideAmounts] (Settings.hideAmounts), "Savings: •••• ETH" — not even the sign. */
     @JvmStatic
     @JvmOverloads
     fun notificationTitle(c: WatchChange, currency: String?, hideAmounts: Boolean = false): String =
         "${displayName(c.address, c.label)}: ${maskAmount(formatDelta(c.oldBalance, c.newBalance, c.decimals), hideAmounts)}" +
-            unitOf(c, currency).let { if (it.isEmpty()) "" else " $it" }
+            unitSuffix(c, currency)
 
     /** The balance move, "1.5 → 2 ETH" ("•••• → •••• ETH" with [hideAmounts]). */
     @JvmStatic
@@ -897,7 +901,7 @@ object BalanceWatch {
     fun balanceMove(c: WatchChange, currency: String?, hideAmounts: Boolean = false): String =
         "${maskAmount(formatUnits(c.oldBalance, c.decimals), hideAmounts)} → " +
             maskAmount(formatUnits(c.newBalance, c.decimals), hideAmounts) +
-            unitOf(c, currency).let { if (it.isEmpty()) "" else " $it" }
+            unitSuffix(c, currency)
 
     /** The notification body: the balance move, then what the scan attributed it to. */
     @JvmStatic
@@ -913,7 +917,7 @@ object BalanceWatch {
     @JvmStatic
     @JvmOverloads
     fun causeSummary(c: WatchChange, currency: String?, hideAmounts: Boolean = false): String {
-        val unit = unitOf(c, currency).let { if (it.isEmpty()) "" else " $it" }
+        val unit = unitSuffix(c, currency)
         if (c.causes.isNotEmpty()) {
             val shown = c.causes.take(3).joinToString("; ") { causeLine(it, unit, c.decimals, hideAmounts) }
             val more = if (c.causes.size > 3) "; and ${c.causes.size - 3} more" else ""
@@ -951,7 +955,9 @@ object BalanceWatch {
     }
 
     private fun causeLine(x: WatchCause, unit: String, decimals: Int, hideAmounts: Boolean): String {
-        val amount = x.amount?.takeIf { it != "0" }?.let { " ${maskAmount(formatUnits(it, decimals), hideAmounts)}$unit" } ?: ""
+        // Hidden, a zero-value cause is masked too: dropping its amount would tell it apart.
+        val amount = x.amount?.takeIf { it != "0" || hideAmounts }
+            ?.let { " ${maskAmount(formatUnits(it, decimals), hideAmounts)}$unit" } ?: ""
         val tx = x.txHash?.let { " (tx ${shortHash(it)})" } ?: ""
         return when (x.kind) {
             WatchCauseKind.RECEIVED -> "received$amount from ${x.counterparty?.let(::shortAddress) ?: "?"}$tx"
