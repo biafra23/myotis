@@ -1,9 +1,12 @@
 package io.myotis.ui
 
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isSelectable
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onFirst
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performImeAction
@@ -55,11 +58,13 @@ class QueryResultCardTest {
     fun hiddenAmountsMaskTheBalanceAndItsRawRow() {
         lookUp(Node(verified()), FakeSettings(expert = true, hide = true))
         rule.onNodeWithText("Balance (ETH)").assertIsDisplayed()
-        rule.onNodeWithText(AMOUNT_MASK).assertIsDisplayed()
+        // Two masks: the headline balance and the open raw row's wei (Expert mode).
+        rule.onAllNodesWithText(AMOUNT_MASK).assertCountEquals(2)
+        rule.onAllNodesWithText(AMOUNT_MASK).onFirst().assertIsDisplayed()
         rule.onNodeWithText("1234.567800").assertDoesNotExist()
         rule.onNodeWithText("1234567800000000000000", substring = true).assertDoesNotExist()
-        // Only amounts are hidden: the nonce stays.
-        rule.onNodeWithText("1412").assertIsDisplayed()
+        // Only amounts are hidden: the nonce stays (the stat and the open raw row).
+        rule.onAllNodesWithText("1412").assertCountEquals(2)
     }
 
     @Test
