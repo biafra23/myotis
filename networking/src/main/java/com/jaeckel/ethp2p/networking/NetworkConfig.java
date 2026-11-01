@@ -127,9 +127,9 @@ public record NetworkConfig(
             // genesis_validators_root (mainnet)
             Bytes.fromHexString("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95").toArrayUnsafe(),
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized mainnet block root (slot 15475072, 2026-10-20, period 1889)
-            Bytes.fromHexString("311635d8543f94cc21afd4fd85311749e16db34214a00bbe584003fc2a662b85").toArrayUnsafe(),
-            15475072L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized mainnet block root (slot 15557088, 2026-11-01, period 1899)
+            Bytes.fromHexString("9e10af227d7fc94fff81a4d9a559a2e2d5c028eba12435eab7eb256c6ad04ebb").toArrayUnsafe(),
+            15557088L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:mainnet:end
             // Fork schedule — consensus-specs configs/mainnet.yaml *_FORK_EPOCH /
             // *_FORK_VERSION. Fulu activated at epoch 411392 = slot 13164544 (2025-12-03).
@@ -297,9 +297,9 @@ public record NetworkConfig(
             // genesis_validators_root (sepolia)
             Bytes.fromHexString("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078").toArrayUnsafe(),
             // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized sepolia block root (slot 11399296, 2026-10-20, period 1391)
-            Bytes.fromHexString("e2358242b8da502f6030be9087f3158ad44179640d9225867d5555c5c94b4658").toArrayUnsafe(),
-            11399296L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized sepolia block root (slot 11481280, 2026-11-01, period 1401)
+            Bytes.fromHexString("ce0d5968b6629de6301019fd81bddda846cc19c37dc9d6457067d06f83b25916").toArrayUnsafe(),
+            11481280L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:sepolia:end
             // Fork schedule — eth-clients/sepolia metadata/config.yaml *_FORK_EPOCH /
             // *_FORK_VERSION. Fulu (0x90000075) activated at epoch 272640 (2025-10-14);
@@ -437,6 +437,13 @@ public record NetworkConfig(
             // cold start then stayed CATCHING_UP, as at v0.1.15: on Gloas, SYNCED
             // waits for the execution header, which that test does not resolve.
             // Details in the Rust twin (SEPOLIA_STATIC_PEERS).
+            // Release check for v0.1.19 (2026-11-01), slot 11481280: roost served
+            // it on both attempts of run 41276222168; this Nimbus closed every
+            // handshake, back at its cap (60 connected after 11 days of uptime),
+            // while its REST served the same 25,472-byte bootstrap. 1 of 2 — the
+            // owner decides. Run locally on zbox, the dead-pins cold start and the
+            // old-anchor walk both reached SYNCED, the first time since Gloas.
+            // Details in the Rust twin (SEPOLIA_STATIC_PEERS).
             // Keep this list identical to SEPOLIA_STATIC_PEERS in
             // rust/myotis-net/src/sync.rs (both parity tests pin it).
             List.of(
@@ -506,9 +513,9 @@ public record NetworkConfig(
             // genesis_validators_root (Gnosis Beacon Chain)
             Bytes.fromHexString("f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47").toArrayUnsafe(),
             // @checkpoint:gnosis:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized gnosis block root (slot 30706480, 2026-10-20, period 3748)
-            Bytes.fromHexString("403ff591a5576e59d2a0f90f964d17efc944ef6135a256ccdb45530113a2df24").toArrayUnsafe(),
-            30706480L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized gnosis block root (slot 30903280, 2026-11-01, period 3772)
+            Bytes.fromHexString("801ff671de60286e672762eb4df7aaf13354d6743ca73144df5a25b1db015581").toArrayUnsafe(),
+            30903280L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
             // @checkpoint:gnosis:end
             // Fork schedule — gnosischain/configs mainnet/config.yaml *_FORK_EPOCH /
             // *_FORK_VERSION, on 16-slot epochs. Fulu (0x06000064) active since epoch
