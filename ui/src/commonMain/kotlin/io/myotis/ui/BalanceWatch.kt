@@ -1,6 +1,7 @@
 package io.myotis.ui
 
 import kotlin.coroutines.cancellation.CancellationException
+import kotlin.jvm.JvmOverloads
 import kotlin.jvm.JvmStatic
 import kotlin.time.Clock
 import kotlin.time.Duration
@@ -882,27 +883,39 @@ object BalanceWatch {
     @JvmStatic
     fun unitOf(c: WatchChange, currency: String?): String = c.symbol ?: currency ?: ""
 
-    /** The notification title: "Savings: +0.5 ETH", "Savings: −100 USDC". */
+    /** The notification title: "Savings: +0.5 ETH", "Savings: −100 USDC"; with
+     *  [hideAmounts] (Settings.hideAmounts), "Savings: •••• ETH" — not even the sign. */
     @JvmStatic
-    fun notificationTitle(c: WatchChange, currency: String?): String =
-        "${displayName(c.address, c.label)}: ${formatDelta(c.oldBalance, c.newBalance, c.decimals)}" +
+    @JvmOverloads
+    fun notificationTitle(c: WatchChange, currency: String?, hideAmounts: Boolean = false): String =
+        "${displayName(c.address, c.label)}: ${maskAmount(formatDelta(c.oldBalance, c.newBalance, c.decimals), hideAmounts)}" +
+            unitOf(c, currency).let { if (it.isEmpty()) "" else " $it" }
+
+    /** The balance move, "1.5 → 2 ETH" ("•••• → •••• ETH" with [hideAmounts]). */
+    @JvmStatic
+    @JvmOverloads
+    fun balanceMove(c: WatchChange, currency: String?, hideAmounts: Boolean = false): String =
+        "${maskAmount(formatUnits(c.oldBalance, c.decimals), hideAmounts)} → " +
+            maskAmount(formatUnits(c.newBalance, c.decimals), hideAmounts) +
             unitOf(c, currency).let { if (it.isEmpty()) "" else " $it" }
 
     /** The notification body: the balance move, then what the scan attributed it to. */
     @JvmStatic
-    fun notificationText(c: WatchChange, currency: String?): String = buildString {
-        val unit = unitOf(c, currency).let { if (it.isEmpty()) "" else " $it" }
-        append("Balance ${formatUnits(c.oldBalance, c.decimals)} → ${formatUnits(c.newBalance, c.decimals)}$unit")
+    @JvmOverloads
+    fun notificationText(c: WatchChange, currency: String?, hideAmounts: Boolean = false): String = buildString {
+        append("Balance ${balanceMove(c, currency, hideAmounts)}")
         append(" at block ${grouped(c.toBlock)}. ")
-        append(causeSummary(c, currency))
+        append(causeSummary(c, currency, hideAmounts))
     }.trim()
 
-    /** One sentence on the cause: the transactions found, or why none is named. */
+    /** One sentence on the cause: the transactions found, or why none is named. The
+     *  amounts moved read [AMOUNT_MASK] with [hideAmounts]. */
     @JvmStatic
-    fun causeSummary(c: WatchChange, currency: String?): String {
+    @JvmOverloads
+    fun causeSummary(c: WatchChange, currency: String?, hideAmounts: Boolean = false): String {
         val unit = unitOf(c, currency).let { if (it.isEmpty()) "" else " $it" }
         if (c.causes.isNotEmpty()) {
-            val shown = c.causes.take(3).joinToString("; ") { causeLine(it, unit, c.decimals) }
+            val shown = c.causes.take(3).joinToString("; ") { causeLine(it, unit, c.decimals, hideAmounts) }
             val more = if (c.causes.size > 3) "; and ${c.causes.size - 3} more" else ""
             return "$shown$more."
         }
@@ -937,8 +950,8 @@ object BalanceWatch {
         }
     }
 
-    private fun causeLine(x: WatchCause, unit: String, decimals: Int): String {
-        val amount = x.amount?.takeIf { it != "0" }?.let { " ${formatUnits(it, decimals)}$unit" } ?: ""
+    private fun causeLine(x: WatchCause, unit: String, decimals: Int, hideAmounts: Boolean): String {
+        val amount = x.amount?.takeIf { it != "0" }?.let { " ${maskAmount(formatUnits(it, decimals), hideAmounts)}$unit" } ?: ""
         val tx = x.txHash?.let { " (tx ${shortHash(it)})" } ?: ""
         return when (x.kind) {
             WatchCauseKind.RECEIVED -> "received$amount from ${x.counterparty?.let(::shortAddress) ?: "?"}$tx"

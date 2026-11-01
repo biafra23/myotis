@@ -135,6 +135,8 @@ class IosSettings : Settings {
 
     override fun expertMode(): Boolean = getBool(K_EXPERT_MODE, false)
     override fun setExpertMode(v: Boolean) = defaults.setBool(v, K_EXPERT_MODE)
+    override fun hideAmounts(): Boolean = getBool(K_HIDE_AMOUNTS, false)
+    override fun setHideAmounts(v: Boolean) = defaults.setBool(v, K_HIDE_AMOUNTS)
 
     // blst is statically linked into the engine — there is nothing to toggle.
     override fun nativeBlsEnabled(): Boolean = true
@@ -160,5 +162,6 @@ class IosSettings : Settings {
         const val K_DEEP = "deepPool"
         const val K_STRICT = "strictStateFreshness"
         const val K_EXPERT_MODE = "expertMode"
+        const val K_HIDE_AMOUNTS = "hideAmounts"
     }
 }

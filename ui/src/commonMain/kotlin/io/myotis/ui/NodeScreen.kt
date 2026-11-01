@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -51,6 +52,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -169,6 +171,9 @@ fun NodeScreen(
     // Settings switch bumps expertRev so the tab set re-derives immediately.
     var expertRev by remember { mutableStateOf(0) }
     val expert = remember(expertRev) { settings.expertMode() }
+    // Hide amounts (the header's closed eye): one live value every tab reads through
+    // LocalHideAmounts, written back to Settings on each flip so it survives a restart.
+    var hideAmounts by remember { mutableStateOf(settings.hideAmounts()) }
     // Web page access (#502): one live holder of the persisted policy, shared by the
     // Status tab's refusal banner and the Settings section so an Allow on either is
     // visible on both at once (the `when` below disposes a tab's own remembers).
@@ -277,6 +282,15 @@ fun NodeScreen(
             // where the tab switcher sits differs.
             val header: @Composable () -> Unit = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    // Hide amounts, top left on every tab — the same place whichever tab
+                    // is open, so the title never shifts. Pulled into the padding by the
+                    // icon button's own inset, so the glyph lines up with the content edge.
+                    Box(Modifier.offset(x = (-12).dp)) {
+                        HideAmountsButton(hideAmounts) {
+                            hideAmounts = !hideAmounts
+                            settings.setHideAmounts(hideAmounts)
+                        }
+                    }
                     // Title + version stacked: the version is the first thing to ask for in
                     // a bug report, so it's on screen everywhere rather than buried in an
                     // about box. Release builds read "v0.1.4"; anything else carries the
@@ -328,6 +342,7 @@ fun NodeScreen(
             // icons and labels; a wider one keeps the tab row under the header. Both are
             // selectable nodes carrying the tab's label, so tests and screen readers see the
             // same tabs either way.
+            CompositionLocalProvider(LocalHideAmounts provides hideAmounts) {
             BoxWithConstraints(Modifier.fillMaxSize()) {
                 if (maxWidth < COMPACT_WIDTH) {
                     Scaffold(
@@ -362,6 +377,7 @@ fun NodeScreen(
                         content()
                     }
                 }
+            }
             }
         }
     }
@@ -2106,7 +2122,7 @@ private fun AccountResultView(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Text(
-                        formatNative(a.balanceWei),
+                        maskAmount(formatNative(a.balanceWei), LocalHideAmounts.current),
                         style = MaterialTheme.typography.headlineMedium,
                         color = if (verified) Color.Unspecified else MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -2149,7 +2165,7 @@ private fun AccountResultView(
                 StatusRow("Address", a.address)
                 StatusRow("Exists", a.exists.toString())
                 if (a.exists) {
-                    StatusRow("Balance (wei)", a.balanceWei ?: "—")
+                    StatusRow("Balance (wei)", a.balanceWei?.let { maskAmount(it, LocalHideAmounts.current) } ?: "—")
                     StatusRow("Nonce", a.nonce.toString())
                     StatusRow("Storage root", a.storageRootHex ?: "—")
                     StatusRow("Code hash", a.codeHashHex ?: "—")

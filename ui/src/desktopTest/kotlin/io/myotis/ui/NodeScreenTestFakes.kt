@@ -41,9 +41,12 @@ internal class FakeSettings(
     private var expert: Boolean = false,
     /** The one enabled chain, and so the one the screen selects. */
     private val network: String = "mainnet",
+    private var hide: Boolean = false,
 ) : Settings {
     override fun expertMode(): Boolean = expert
     override fun setExpertMode(v: Boolean) { expert = v }
+    override fun hideAmounts(): Boolean = hide
+    override fun setHideAmounts(v: Boolean) { hide = v }
     override fun enabledNetworks(): List<String> = listOf(network)
     override fun primaryNetwork(): String = network
     override fun allNetworks(): List<String> = listOf(network)

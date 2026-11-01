@@ -616,6 +616,17 @@ interface Settings {
     fun setExpertMode(v: Boolean)
 
     /**
+     * Hide amounts — the header's closed-eye toggle. On = every balance, token amount
+     * and balance change the screens show reads [AMOUNT_MASK] (Copy still copies the real
+     * values: it is a deliberate act), and so do the hosts' balance-change notifications.
+     * Off by default. Not defaulted, like [expertMode]: every host persists it — a
+     * privacy switch that forgets itself on restart would show the amounts it was set
+     * to hide.
+     */
+    fun hideAmounts(): Boolean
+    fun setHideAmounts(v: Boolean)
+
+    /**
      * macOS App Nap opt-in (desktop only). false (default) = the process holds an
      * NSProcessInfo activity so RPC never stalls while the window is hidden — today's
      * behaviour; true = let macOS nap the app when it is not in focus. Defaults keep

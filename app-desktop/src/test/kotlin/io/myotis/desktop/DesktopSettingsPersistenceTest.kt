@@ -101,6 +101,17 @@ class DesktopSettingsPersistenceTest {
     }
 
     @Test
+    fun `hide amounts round-trips across a restart`(@TempDir dir: Path) {
+        val file = dir.resolve("settings.properties")
+        val first = DesktopSettings(nets, file)
+        assertFalse(first.hideAmounts(), "amounts show by default")
+        first.setHideAmounts(true)
+        assertTrue(DesktopSettings(nets, file).hideAmounts(), "a privacy switch must be sticky")
+        Files.writeString(file, "hideAmounts=yes\n")
+        assertFalse(DesktopSettings(nets, file).hideAmounts(), "garbage falls back to the default")
+    }
+
+    @Test
     fun `web page access round-trips across a restart`(@TempDir dir: Path) {
         val file = dir.resolve("settings.properties")
         val first = DesktopSettings(nets, file)
@@ -270,6 +281,14 @@ class DesktopSettingsPersistenceTest {
         val (manyTitle, manyMessage) = watchNotificationText("Gnosis Chain", "gnosis", List(5) { change })
         assertEquals("5 watched balances changed", manyTitle)
         assertTrue(manyMessage.contains("Savings: +0.5 xDAI") && manyMessage.contains("and 2 more"), manyMessage)
+
+        // Hide amounts covers the notification: what changed, never by how much.
+        val (hiddenTitle, hiddenMessage) =
+            watchNotificationText("Ethereum Mainnet", "mainnet", listOf(change), hideAmounts = true)
+        assertEquals("Savings: •••• ETH", hiddenTitle)
+        assertTrue(hiddenMessage.startsWith("Ethereum Mainnet — Balance •••• → •••• ETH"), hiddenMessage)
+        val (_, hiddenMany) = watchNotificationText("Gnosis Chain", "gnosis", List(5) { change }, hideAmounts = true)
+        assertFalse(hiddenMany.contains("0.5"), hiddenMany)
     }
 
     @Test

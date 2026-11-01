@@ -729,7 +729,9 @@ class DesktopNodeController(
         log.info("[{}] balance watch ({}): {}", canonical, why,
             if (changes.isEmpty()) "no change" else "${changes.size} change(s)")
         if (changes.isNotEmpty()) {
-            val (title, message) = watchNotificationText(settings.displayName(canonical), canonical, changes)
+            val (title, message) = watchNotificationText(
+                settings.displayName(canonical), canonical, changes, hideAmounts = settings.hideAmounts(),
+            )
             val posted = watchNotifier?.invoke(title, message) ?: false
             if (!posted) log.info("[{}] balance change shown in the window only (no notification route)", canonical)
         }
@@ -948,19 +950,25 @@ internal const val WATCH_RETRY_MS = 2 * 60_000L
 internal const val WATCH_BUDGET_MS = 3 * 60_000L
 
 /**
- * The one native notification for a check's [changes] on [network] as (title, message).
+ * The one native notification for a check's [changes] on [network] as (title, message);
+ * with [hideAmounts] (Settings.hideAmounts) every amount in it reads as the mask.
  * One per check, never one per address: Compose hands a notification to the tray only
  * while its collector is idle, so a burst would lose all but the first (the web-refusal
  * notifications batch for the same reason).
  */
-internal fun watchNotificationText(displayName: String, network: String, changes: List<WatchChange>): Pair<String, String> {
+internal fun watchNotificationText(
+    displayName: String,
+    network: String,
+    changes: List<WatchChange>,
+    hideAmounts: Boolean = false,
+): Pair<String, String> {
     val currency = BalanceWatch.currency(network)
     if (changes.size == 1) {
         val c = changes.single()
-        return BalanceWatch.notificationTitle(c, currency) to
-            "$displayName — ${BalanceWatch.notificationText(c, currency)}"
+        return BalanceWatch.notificationTitle(c, currency, hideAmounts) to
+            "$displayName — ${BalanceWatch.notificationText(c, currency, hideAmounts)}"
     }
-    val lines = changes.take(3).joinToString("; ") { BalanceWatch.notificationTitle(it, currency) }
+    val lines = changes.take(3).joinToString("; ") { BalanceWatch.notificationTitle(it, currency, hideAmounts) }
     val more = if (changes.size > 3) "; and ${changes.size - 3} more" else ""
     return "${changes.size} watched balances changed" to
         "$displayName — $lines$more. The Watch tab has the details."
@@ -1008,6 +1016,8 @@ class DesktopSettings(
     private var torRouting = false
     // Expert mode (Logs/Index tabs, full Status rows, advanced settings); off by default.
     private var expert = false
+    // Hide amounts (the header's closed-eye toggle); off by default.
+    private var hide = false
     // Web page access (#502): default Specific sites with none allowed — every web page
     // is refused until the user allows it (native wallets are never affected).
     private var webAccess = WebAccessMode.ALLOWLIST
@@ -1156,6 +1166,8 @@ class DesktopSettings(
     }
     override fun expertMode(): Boolean = synchronized(this) { expert }
     override fun setExpertMode(v: Boolean) = mutate { expert = v }
+    override fun hideAmounts(): Boolean = synchronized(this) { hide }
+    override fun setHideAmounts(v: Boolean) = mutate { hide = v }
     override fun allowAppNap(): Boolean = synchronized(this) { allowNap }
     override fun setAllowAppNap(v: Boolean) = mutate { allowNap = v }
     // The row shows only where the toggle can take effect: App Nap is a macOS mechanism,
@@ -1189,6 +1201,7 @@ class DesktopSettings(
         p.getProperty(K_PREFER_JAVA)?.toBooleanStrictOrNull()?.let { preferJava = it }
         p.getProperty(K_TOR)?.toBooleanStrictOrNull()?.let { torRouting = it }
         p.getProperty(K_EXPERT)?.toBooleanStrictOrNull()?.let { expert = it }
+        p.getProperty(K_HIDE_AMOUNTS)?.toBooleanStrictOrNull()?.let { hide = it }
         p.getProperty(K_APP_NAP)?.toBooleanStrictOrNull()?.let { allowNap = it }
         // An unknown mode name (a hand edit, a newer version's value) keeps the safe default.
         p.getProperty(K_WEB_ACCESS)?.let { v -> WebAccessMode.entries.firstOrNull { it.name == v } }
@@ -1294,6 +1307,7 @@ class DesktopSettings(
         p.setProperty(K_PREFER_JAVA, preferJava.toString())
         p.setProperty(K_TOR, torRouting.toString())
         p.setProperty(K_EXPERT, expert.toString())
+        p.setProperty(K_HIDE_AMOUNTS, hide.toString())
         p.setProperty(K_APP_NAP, allowNap.toString())
         p.setProperty(K_WEB_ACCESS, webAccess.name)
         p.setProperty(K_WEB_ORIGINS, webOrigins.joinToString(","))
@@ -1344,6 +1358,7 @@ class DesktopSettings(
         const val K_PREFER_JAVA = "engine.preferJava"
         const val K_TOR = "torRouting"
         const val K_EXPERT = "expertMode"
+        const val K_HIDE_AMOUNTS = "hideAmounts"
         const val K_APP_NAP = "appNap.allow"
         const val K_WEB_ACCESS = "webAccess.mode"
         const val K_WEB_ORIGINS = "webAccess.origins"

@@ -10,6 +10,7 @@ import kotlinx.coroutines.runBlocking
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -167,6 +168,12 @@ class BalanceWatchTest {
         val text = BalanceWatch.notificationText(c, "ETH")
         assertTrue(text, text.startsWith("Balance 1 → 1.5 ETH at block 104."))
         assertTrue(text, "Received 0.5 ETH from ${BalanceWatch.shortAddress(bob)} (tx 0xfeed)" in text)
+        // Hide amounts: the same texts with every amount — the delta's sign too — masked.
+        assertEquals("Savings: •••• ETH", BalanceWatch.notificationTitle(c, "ETH", hideAmounts = true))
+        val hidden = BalanceWatch.notificationText(c, "ETH", hideAmounts = true)
+        assertTrue(hidden, hidden.startsWith("Balance •••• → •••• ETH at block 104."))
+        assertTrue(hidden, "Received •••• ETH from ${BalanceWatch.shortAddress(bob)} (tx 0xfeed)" in hidden)
+        assertFalse(hidden, "0.5" in hidden || "1.5" in hidden)
         // Scanned newest first, and never below the old observation.
         assertEquals(listOf(104L, 103L, 102L, 101L), r.blockReads)
     }

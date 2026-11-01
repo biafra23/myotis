@@ -256,7 +256,7 @@ private fun TokenRow(
                 r.raw != null -> {
                     val zero = r.raw.trimStart('0').isEmpty()
                     Text(
-                        formatTokenAmount(r.raw, t.decimals),
+                        maskAmount(formatTokenAmount(r.raw, t.decimals), LocalHideAmounts.current),
                         style = MaterialTheme.typography.titleMedium,
                         color = if (zero) MaterialTheme.colorScheme.onSurfaceVariant else Color.Unspecified,
                     )

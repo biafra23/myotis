@@ -140,6 +140,7 @@ public final class NodeService extends Service {
     private static final String K_IDLE_PAUSE_MIN = "idlePauseMinutes";
     private static final String K_STAY_AWAKE_CHARGING = "stayAwakeWhileCharging";
     private static final String K_EXPERT_MODE = "expertMode";
+    private static final String K_HIDE_AMOUNTS = "hideAmounts";
     private static final String K_WEB_ACCESS_MODE = "webAccess.mode";
     private static final String K_WEB_ACCESS_ORIGINS = "webAccess.origins";
     private static final String K_WATCH_LIST_PREFIX = "watch.list.";
@@ -578,6 +579,14 @@ public final class NodeService extends Service {
     }
     public static void setExpertMode(android.content.Context c, boolean v) {
         prefs(c).edit().putBoolean(K_EXPERT_MODE, v).apply();
+    }
+    /** Hide amounts (the header's closed-eye toggle): balances on screen and in the
+     *  balance-change notifications read as a mask. Off by default. */
+    public static boolean hideAmounts(android.content.Context c) {
+        return prefs(c).getBoolean(K_HIDE_AMOUNTS, false);
+    }
+    public static void setHideAmounts(android.content.Context c, boolean v) {
+        prefs(c).edit().putBoolean(K_HIDE_AMOUNTS, v).apply();
     }
     /** Web page access (#502): which browser origins may use the JSON-RPC listeners, as an
      *  {@link io.myotis.api.WebAccessMode} name. Default ALLOWLIST with no sites — every web

@@ -490,6 +490,8 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun supportsIdleSleep(): Boolean = true   // NodeService runs the idle controller
     override fun expertMode(): Boolean = NodeService.expertMode(ctx)
     override fun setExpertMode(v: Boolean) = NodeService.setExpertMode(ctx, v)
+    override fun hideAmounts(): Boolean = NodeService.hideAmounts(ctx)
+    override fun setHideAmounts(v: Boolean) = NodeService.setHideAmounts(ctx, v)
     override fun webAccessMode(): WebAccessMode = WebAccessMode.valueOf(NodeService.webAccessMode(ctx))
     override fun setWebAccessMode(mode: WebAccessMode) = NodeService.setWebAccessMode(ctx, mode.name)
     override fun webAccessOrigins(): List<String> = NodeService.webAccessOrigins(ctx)

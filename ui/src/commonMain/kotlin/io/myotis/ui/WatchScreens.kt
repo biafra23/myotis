@@ -272,7 +272,10 @@ private fun WatchedAddressCard(
             }
             val seen = state?.seen
             if (seen != null) {
-                Text(BalanceWatch.formatUnits(seen.balance) + unit, style = MaterialTheme.typography.headlineSmall)
+                Text(
+                    maskAmount(BalanceWatch.formatUnits(seen.balance), LocalHideAmounts.current) + unit,
+                    style = MaterialTheme.typography.headlineSmall,
+                )
                 val age = if (seen.blockTimestamp > 0) " · ${formatBlockAge(nowMs / 1000 - seen.blockTimestamp)}" else ""
                 Text(
                     "✓ Verified at block ${BalanceWatch.grouped(seen.blockNumber)}$age",
@@ -313,7 +316,7 @@ private fun TokenLines(tokens: List<Pair<Token, WatchAddressState?>>) {
         val decimals = seen.decimals ?: t.decimals
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
-                formatTokenAmount(seen.balance, decimals),
+                maskAmount(formatTokenAmount(seen.balance, decimals), LocalHideAmounts.current),
                 Modifier.weight(1f),
                 style = MaterialTheme.typography.bodyLarge,
             )
@@ -357,18 +360,17 @@ private fun TokenLines(tokens: List<Pair<Token, WatchAddressState?>>) {
 /** One change: the move, when, what the scan attributed it to, and the hashes to copy. */
 @Composable
 private fun WatchChangeCard(change: WatchChange, currency: String?, tz: TimeZone, onCopy: (String) -> Unit) {
+    val hide = LocalHideAmounts.current
     OutlinedCard(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text(BalanceWatch.notificationTitle(change, currency), style = MaterialTheme.typography.titleSmall)
+            Text(BalanceWatch.notificationTitle(change, currency, hide), style = MaterialTheme.typography.titleSmall)
             Text(
                 "${formatDateTime(change.detectedAtMs, tz)} · block ${BalanceWatch.grouped(change.toBlock)} · " +
-                    "${BalanceWatch.formatUnits(change.oldBalance, change.decimals)} → " +
-                    BalanceWatch.formatUnits(change.newBalance, change.decimals) +
-                    BalanceWatch.unitOf(change, currency).let { if (it.isEmpty()) "" else " $it" },
+                    BalanceWatch.balanceMove(change, currency, hide),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            Text(BalanceWatch.causeSummary(change, currency), style = MaterialTheme.typography.bodySmall)
+            Text(BalanceWatch.causeSummary(change, currency, hide), style = MaterialTheme.typography.bodySmall)
             change.causes.mapNotNull { it.txHash }.distinct().forEach { hash ->
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     SelectionContainer(Modifier.weight(1f)) {

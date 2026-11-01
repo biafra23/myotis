@@ -172,6 +172,8 @@ object BalanceWatchRunner {
             },
         )
         val currency = BalanceWatch.currency(network)
+        // Hide amounts (the header's closed eye) covers the notifications too.
+        val hide = NodeService.hideAmounts(c)
         for (ch in changes) {
             val id = NOTIFICATION_BASE + Math.floorMod("$network/${ch.address}/${ch.asset}".hashCode(), 1_000_000)
             // The tap opens the app on the Watch tab: NEW_TASK from a service context,
@@ -184,9 +186,9 @@ object BalanceWatchRunner {
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )
-            val text = BalanceWatch.notificationText(ch, currency)
+            val text = BalanceWatch.notificationText(ch, currency, hide)
             val n = Notification.Builder(c, CHANNEL_ID)
-                .setContentTitle(BalanceWatch.notificationTitle(ch, currency))
+                .setContentTitle(BalanceWatch.notificationTitle(ch, currency, hide))
                 .setContentText(text)
                 .setStyle(Notification.BigTextStyle().bigText(text))
                 .setSubText(NodeService.displayName(network))

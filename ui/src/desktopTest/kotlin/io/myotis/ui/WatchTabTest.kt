@@ -14,6 +14,7 @@ import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isSelectable
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -24,6 +25,8 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 
@@ -170,6 +173,62 @@ class WatchTabTest {
         rule.onNodeWithText("Savings: +100 USDC").performScrollTo().assertIsDisplayed()
         rule.onNodeWithText("Received 100 USDC from ${BalanceWatch.shortAddress(bob)}", substring = true)
             .performScrollTo().assertIsDisplayed()
+    }
+
+    @Test
+    fun theClosedEyeHidesEveryAmountAndRemembersIt() {
+        val usdc = PopularTokens.forNetwork("mainnet").first { it.symbol == "USDC" }
+        val settings = WatchSettings().apply {
+            setWatchListJson("mainnet", BalanceWatch.serializeList(listOf(WatchEntry(alice, "Savings"))))
+            setWatchStateJson("mainnet", BalanceWatch.serializeState(WatchState(
+                addresses = mapOf(
+                    alice to WatchAddressState(WatchSeen("1500000000000000000", 0, 7, -1, 1)),
+                    BalanceWatch.key(alice, BalanceWatch.tokenAsset(usdc)) to WatchAddressState(WatchSeen("101500000", 0, 7, -1, 1)),
+                ),
+                changes = listOf(
+                    WatchChange(
+                        alice, "Savings", "1500000", "101500000", 0, 0, 6, 7, -1, 1, WatchSearch.COMPLETE, 6,
+                        listOf(WatchCause(WatchCauseKind.RECEIVED, 7, "0x" + "cd".repeat(32), bob, "100000000")),
+                        asset = BalanceWatch.tokenAsset(usdc), symbol = "USDC", decimals = 6,
+                    ),
+                ),
+            )))
+        }
+        show(Node(), settings)
+        rule.onNodeWithText("1.5 ETH").assertIsDisplayed()
+        rule.onNodeWithContentDescription("Hide amounts").performClick()
+        rule.waitForIdle()
+        assertTrue("the choice is persisted", settings.hideAmounts())
+        rule.onNodeWithText("1.5 ETH").assertDoesNotExist()
+        rule.onNodeWithText("$AMOUNT_MASK ETH").assertIsDisplayed()
+        rule.onNodeWithText("101.5").assertDoesNotExist()
+        rule.onNodeWithText("Savings: $AMOUNT_MASK USDC").performScrollTo().assertIsDisplayed()
+        rule.onNodeWithText("Received $AMOUNT_MASK USDC from", substring = true).performScrollTo().assertIsDisplayed()
+        rule.onNodeWithText("100 USDC", substring = true).assertDoesNotExist()
+
+        // The eye is in the header, so it is there on every tab.
+        tab("Status").performClick()
+        rule.onNodeWithTag(HIDE_AMOUNTS_TAG).assertIsDisplayed()
+        rule.onNodeWithContentDescription("Show amounts").performClick()
+        rule.waitForIdle()
+        assertFalse(settings.hideAmounts())
+        tab("Watch").performClick()
+        rule.onNodeWithText("1.5 ETH").assertIsDisplayed()
+    }
+
+    @Test
+    fun aStoredHideAmountsHidesFromTheStart() {
+        val settings = WatchSettings().apply {
+            setHideAmounts(true)
+            setWatchListJson("mainnet", BalanceWatch.serializeList(listOf(WatchEntry(alice, "Savings"))))
+            setWatchStateJson("mainnet", BalanceWatch.serializeState(WatchState(
+                addresses = mapOf(alice to WatchAddressState(WatchSeen("1500000000000000000", 0, 7, -1, 1))),
+            )))
+        }
+        show(Node(), settings)
+        rule.onNodeWithText("$AMOUNT_MASK ETH").assertIsDisplayed()
+        rule.onNodeWithText("1.5 ETH").assertDoesNotExist()
+        rule.onNodeWithContentDescription("Show amounts").assertIsDisplayed()
     }
 
     @Test

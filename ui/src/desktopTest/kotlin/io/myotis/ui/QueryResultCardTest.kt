@@ -52,6 +52,17 @@ class QueryResultCardTest {
     }
 
     @Test
+    fun hiddenAmountsMaskTheBalanceAndItsRawRow() {
+        lookUp(Node(verified()), FakeSettings(expert = true, hide = true))
+        rule.onNodeWithText("Balance (ETH)").assertIsDisplayed()
+        rule.onNodeWithText(AMOUNT_MASK).assertIsDisplayed()
+        rule.onNodeWithText("1234.567800").assertDoesNotExist()
+        rule.onNodeWithText("1234567800000000000000", substring = true).assertDoesNotExist()
+        // Only amounts are hidden: the nonce stays.
+        rule.onNodeWithText("1412").assertIsDisplayed()
+    }
+
+    @Test
     fun expertModeOpensTheRawRowsAtOnce() {
         lookUp(Node(verified()), FakeSettings(expert = true))
         rule.onNodeWithText("Balance (ETH)").assertIsDisplayed()

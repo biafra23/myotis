@@ -69,6 +69,19 @@ On Android 13+, the auto-started service never asks for `POST_NOTIFICATIONS`.
 Watching an address is the moment the app asks, because the notification is what the
 user just asked for. With notifications off, the tab says that changes show only there.
 
+### Hide amounts
+
+The closed eye at the top left of the header, on every tab, hides amounts:
+`Settings.hideAmounts`, persisted by every host (Android preferences, the desktop's
+`settings.properties` and iOS `NSUserDefaults`, all under `hideAmounts`). While it is on,
+every balance, token amount and balance change reads `••••` (`AMOUNT_MASK`), on the Watch
+tab and in the Query tab's result card. The unit, the names, the addresses and the block
+numbers stay. The balance-change notifications on Android and the desktop mask theirs the
+same way, the delta's sign included: `Savings: •••• ETH`. Copy still copies the real
+values, because copying is a deliberate act. The screens read the live value through
+`LocalHideAmounts`, which `NodeScreen` provides. The notification texts take it as
+`BalanceWatch.notificationTitle/notificationText(…, hideAmounts)`.
+
 ## Trust
 
 Only a **verified** read moves the stored balance. That is the Query tab's green badge:
