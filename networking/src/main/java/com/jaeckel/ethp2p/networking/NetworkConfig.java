@@ -437,6 +437,13 @@ public record NetworkConfig(
             // cold start then stayed CATCHING_UP, as at v0.1.15: on Gloas, SYNCED
             // waits for the execution header, which that test does not resolve.
             // Details in the Rust twin (SEPOLIA_STATIC_PEERS).
+            // Release check for v0.1.19 (2026-11-01), slot 11481280: roost served
+            // it on both attempts of run 41276222168; this Nimbus closed every
+            // handshake, back at its cap (60 connected after 11 days of uptime),
+            // while its REST served the same 25,472-byte bootstrap. 1 of 2 — the
+            // owner decides. Run locally on zbox, the dead-pins cold start and the
+            // old-anchor walk both reached SYNCED, the first time since Gloas.
+            // Details in the Rust twin (SEPOLIA_STATIC_PEERS).
             // Keep this list identical to SEPOLIA_STATIC_PEERS in
             // rust/myotis-net/src/sync.rs (both parity tests pin it).
             List.of(

@@ -809,6 +809,21 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // on Gloas, SYNCED also waits for the finalized execution header, which
     // live_cold_start does not resolve (it runs no EL pool). The old-anchor
     // walk did not run. The bootnodes seeded discv5 (22 entries).
+    //
+    // Release check for v0.1.19 (2026-11-01), anchor slot 11481280, period
+    // 1401: run 41276222168, two attempts, 1 of 2 both times. roost served the
+    // bootstrap (25,472 B) and the verified period-1401 update; this Nimbus
+    // ended every dial in the noise handshake (`unexpected end of file`, from
+    // the runner and from zbox itself), sitting at its --max-peers=60 cap
+    // (REST peer_count 59–60 connected, after 11 days of uptime since the
+    // v0.1.18 restart), while its REST served the same 25,472-byte bootstrap.
+    // So 60 only delays the v0.1.16 failure. The job stopped there; run
+    // locally on zbox from this build, both later steps passed for the first
+    // time since Gloas (the test runs the EL reader since 2026-10-20): the
+    // cold start with every pin unreachable reached SYNCED in 85 s, and the
+    // old-anchor walk from oldest-servable.properties reached SYNCED in 75 s
+    // from period 1323 (78 behind). The owner decides. The bootnodes seeded
+    // discv5 (25 entries).
     "/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
 ];
 
