@@ -5,7 +5,9 @@ each verified block, which of them that block touched. The host then proves an
 address's state again only when a block touched it, or when a block could not be
 checked, instead of at every new head. A wallet's account list is the case it
 was made for: almost every proof it makes at a new head re-proves a value that
-has not changed.
+has not changed. Where blocks commit to a block access list, even that read
+usually needs no proof: the engine carries a watched account's state from its
+last proof through each verified BAL (*Answering from block access lists*).
 
 Rust engine only. The Java engine keeps the contract's defaults (`false` and
 `null`).
@@ -140,6 +142,58 @@ a gap. A restart forgets it, as the log index's runtime settings are forgotten,
 and the host pushes again: `watching` tells a host whether the engine still
 holds its addresses.
 
+## Answering from block access lists
+
+A touch tells the host to read the account again. The engine answers that read without
+asking any peer, as long as it can. The reason is privacy. A snap proof request names the
+account: `GetAccountRange` asks for `keccak256(address)`, which maps straight back to any
+address that has transacted. A re-proof right after a block that touched the address tells
+the serving peer which address this node holds. A BAL request names only a block hash, the
+same one every node following the chain asks for. So the engine fetches every block's BAL
+anyway and applies the watched accounts' changes locally. From then on, reads of those
+accounts put no address on the wire.
+
+- **What starts it:** a verified head read of a watched account. That read is a proof, and
+  the block it ran against must be one the anchor vouches for by hash (`blockHash` set).
+  The engine then holds that account's state (balance, nonce, code hash, storage root) at
+  that block. A newer proof replaces an older one, and nothing is fetched just to start it.
+- **What moves it:** each block's verified BAL. A BAL lists every account its block
+  touched, with the values after the block. The engine takes the last entry of each change
+  list, since each one is the value after its transaction. An account the BAL does not list
+  is unchanged. So the state stays proven from block to block, by induction from the first
+  proof, with no new trust anchor. The stored state advances to `FOLLOW_MARGIN` (8) blocks
+  below the kept top. The blocks above that are applied at each answer, so a reorg of the
+  newest blocks replaces them and keeps the account.
+- **What a read gets:** `verifyMethod` `"blockAccessList"`, `blockNumber`, `blockHash`
+  and `blockTimestamp` of the block answered at, and `peerStateRootHex` set to that
+  block's state root. The answer comes from the anchored head, or from at most
+  `FOLLOW_MAX_LAG` (2) blocks below it, which covers the few seconds before the head's own
+  BAL arrives. The block must lead to the head (as for a report), and the anchor must attest
+  its state root. `matchedBeaconSlot` and `blsVerified` are that attestation's, as for a
+  `stateRootMatch` proof. Finalized reads and `eth_getProof` are always proven. So is the
+  pre-broadcast check of a send, which needs the head's own root (it only uses a BAL answer
+  at the head itself). That check's request reveals nothing the send does not.
+- **What sends it back to a proof:** the read is proven over snap again, and that proof
+  restarts the following. This happens when:
+  - a block wrote the account's storage (the new storage root is not in a BAL; for a wallet
+    EOA that means an EIP-7702 delegated account using its storage);
+  - a block's BAL does not decode, or the block has none (before Amsterdam);
+  - the BAL of a block above the stored state is still missing when the read comes, or the
+    covered block is more than 2 below the head (no BAL server, a paused follower);
+  - a reorg reached the stored block, or the block was trimmed out of the window;
+  - the account was unwatched, or the follower stopped.
+  
+  A proof with the Tor routing on goes over Tor, as any account read does. A BAL answer
+  precedes that routing, since it sends nothing.
+- `get_code` reads its code hash through the same path. A storage read
+  (`get_storage`, a token's `balanceOf` through the EVM) still proves the account and its
+  slot over snap. Following token slots is the next step (#685).
+
+The once-a-minute BAL log line counts the reads answered this way (`answered_from_bals`).
+`examples/bal_follow_check.rs` in `rust/myotis-engine` checks the values live: it reads
+busy Sepolia accounts until the engine answers from BALs, then compares each answer with an
+`eth_getProof` at the same block.
+
 ## What it costs
 
 A tick with no new head reads a lock. A new head usually costs one header-window
@@ -188,3 +242,6 @@ source.
 - **Shared with #685:** the fetch-and-verify step is
   `ManagedPeer::get_block_access_lists` (eth/71, snap/2 as the fallback).
 - The Node addon and the JVM daemon do not expose the calls yet.
+- **Token balances from BALs (#685):** carry the watched holders' ERC-20 balance
+  slots through each BAL's `storage_changes`, so `balanceOf` at the head needs no
+  storage proof either.

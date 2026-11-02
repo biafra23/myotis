@@ -406,32 +406,108 @@ pub fn decode_block_access_lists(
 /// storage_reads, balance_changes, nonce_changes, code_changes], …]`; a shape
 /// other than that is an error, never a partial answer.
 pub fn bal_changed_accounts(raw: &[u8]) -> Result<Vec<[u8; 20]>, CoreError> {
+    Ok(bal_account_changes(raw)?.into_iter().map(|c| c.address).collect())
+}
+
+/// What a block did to one account, by its block access list (EIP-7928): the
+/// account's values AFTER the block, for each kind of state the block changed.
+/// A kind the block left alone is `None` (`false` for storage).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BalAccountChange {
+    pub address: [u8; 20],
+    /// The post-block balance, big-endian and minimal (empty for zero), as an
+    /// account leaf carries it.
+    pub balance: Option<Vec<u8>>,
+    pub nonce: Option<u64>,
+    /// keccak256 of the post-block code (an EIP-7702 delegation indicator
+    /// included; the empty-code hash when the code was cleared).
+    pub code_hash: Option<[u8; 32]>,
+    /// The block wrote at least one of the account's storage slots: its
+    /// storage root changed, to a value a BAL does not carry.
+    pub storage_written: bool,
+}
+
+/// The accounts a block access list (EIP-7928) records a state change for,
+/// with their post-block values: the entry with the highest block access
+/// index of each change list, since every entry is the value after its
+/// transaction and a transaction that leaves a value as it found it records
+/// none. An account the block only accessed (a read, a call, a zero-value
+/// transfer's recipient) is listed in the BAL with empty change lists and is
+/// not returned. Ascending by address, as the BAL orders its accounts.
+///
+/// `raw` is the BAL's RLP, `[[address, storage_changes, storage_reads,
+/// balance_changes, nonce_changes, code_changes], …]`. A shape other than
+/// that, or a change list whose block access indices do not strictly ascend
+/// (the spec's ordering and at-most-once rules), is an error, never a partial
+/// answer: the values are applied to proven state, so a list read in an order
+/// it does not have would name the wrong post-block value.
+pub fn bal_account_changes(raw: &[u8]) -> Result<Vec<BalAccountChange>, CoreError> {
     let mut out = Vec::new();
     for account in rlp::View::new(raw)?.as_list()? {
         let mut fields = account.as_list()?;
-        let address = fields.next().ok_or_else(|| CoreError("BAL: an account without an address".into()))?;
-        let mut a = [0u8; 20];
-        a.copy_from_slice(address.as_fixed_bytes(20)?);
-        let mut changed = false;
-        // storage_changes, storage_reads, balance_changes, nonce_changes, code_changes
-        for (k, name) in ["storage_changes", "storage_reads", "balance_changes", "nonce_changes", "code_changes"]
-            .into_iter()
-            .enumerate()
-        {
-            let list = fields.next().ok_or_else(|| CoreError(format!("BAL: an account without {name}")))?;
-            let non_empty = list.as_list()?.next().is_some();
-            if k != 1 && non_empty {
-                changed = true;
-            }
-        }
+        let mut field = |name: &str| fields.next().ok_or_else(|| CoreError(format!("BAL: an account without {name}")));
+        let mut address = [0u8; 20];
+        address.copy_from_slice(field("an address")?.as_fixed_bytes(20)?);
+        let storage_changes = field("storage_changes")?;
+        let storage_reads = field("storage_reads")?;
+        let balance_changes = field("balance_changes")?;
+        let nonce_changes = field("nonce_changes")?;
+        let code_changes = field("code_changes")?;
         if fields.next().is_some() {
             return Err(CoreError("BAL: an account with more than six fields".into()));
         }
-        if changed {
-            out.push(a);
+        let mut storage_written = false;
+        for slot in storage_changes.as_list()? {
+            let mut slot = slot.as_list()?;
+            slot.next().ok_or_else(|| CoreError("BAL: a slot change without its slot".into()))?.as_bytes()?;
+            let changes = slot.next().ok_or_else(|| CoreError("BAL: a slot change without changes".into()))?;
+            if slot.next().is_some() {
+                return Err(CoreError("BAL: a slot change with more than two fields".into()));
+            }
+            if last_change(changes, "storage_changes")?.is_none() {
+                return Err(CoreError("BAL: a slot change with no change".into()));
+            }
+            storage_written = true;
+        }
+        storage_reads.as_list()?;
+        let balance = match last_change(balance_changes, "balance_changes")? {
+            Some(v) => {
+                let b = v.as_bytes()?;
+                if b.len() > 32 {
+                    return Err(CoreError("BAL: a balance wider than 256 bits".into()));
+                }
+                let first = b.iter().position(|&x| x != 0).unwrap_or(b.len());
+                Some(b[first..].to_vec())
+            }
+            None => None,
+        };
+        let nonce = last_change(nonce_changes, "nonce_changes")?.map(|v| v.as_u64()).transpose()?;
+        let code_hash = last_change(code_changes, "code_changes")?
+            .map(|v| v.as_bytes().map(myotis_core::keccak::keccak256))
+            .transpose()?;
+        if storage_written || balance.is_some() || nonce.is_some() || code_hash.is_some() {
+            out.push(BalAccountChange { address, balance, nonce, code_hash, storage_written });
         }
     }
     Ok(out)
+}
+
+/// The value of the last `[block_access_index, value]` entry of a change
+/// list, `None` for an empty list; an error unless the indices strictly ascend.
+fn last_change<'a>(list: rlp::View<'a>, name: &str) -> Result<Option<rlp::View<'a>>, CoreError> {
+    let mut last: Option<(u64, rlp::View<'a>)> = None;
+    for entry in list.as_list()? {
+        let mut entry = entry.as_list()?;
+        let (Some(index), Some(value), None) = (entry.next(), entry.next(), entry.next()) else {
+            return Err(CoreError(format!("BAL: a {name} entry that is not [index, value]")));
+        };
+        let index = index.as_u64()?;
+        if last.as_ref().is_some_and(|(prev, _)| *prev >= index) {
+            return Err(CoreError(format!("BAL: {name} out of block access index order")));
+        }
+        last = Some((index, value));
+    }
+    Ok(last.map(|(_, v)| v))
 }
 
 // ---------------------------------------------------------------------------
@@ -583,6 +659,79 @@ mod tests {
             Item::List(vec![]),
         ])]));
         assert!(bal_changed_accounts(&bad_address).is_err());
+    }
+
+    #[test]
+    fn bal_account_changes_names_each_post_block_value() {
+        let idx_value = |i: u8, v: &[u8]| Item::List(vec![Item::Bytes(rlp::u64_to_minimal_be(i.into())), Item::Bytes(v.to_vec())]);
+        let account = |address: u8, storage: Vec<Item>, balance: Vec<Item>, nonce: Vec<Item>, code: Vec<Item>| {
+            Item::List(vec![
+                Item::Bytes(vec![address; 20]),
+                Item::List(storage),
+                Item::List(vec![Item::Bytes(vec![3])]),
+                Item::List(balance),
+                Item::List(nonce),
+                Item::List(code),
+            ])
+        };
+        let bal = rlp::encode(&Item::List(vec![
+            // Two transactions moved the balance and the nonce: the second one's values hold.
+            account(0x01, vec![], vec![idx_value(1, &[0x05]), idx_value(2, &[0x01, 0x00])], vec![idx_value(1, &[7]), idx_value(2, &[8])], vec![]),
+            // An EIP-7702 delegation: a nonce and a code change.
+            account(0x02, vec![], vec![], vec![idx_value(1, &[1])], vec![idx_value(1, &[0xef, 0x01, 0x00])]),
+            // A storage write, and a balance zeroed.
+            account(
+                0x03,
+                vec![Item::List(vec![Item::Bytes(vec![9]), Item::List(vec![idx_value(1, &[4])])])],
+                vec![idx_value(0, &[])],
+                vec![],
+                vec![],
+            ),
+        ]));
+        let changes = bal_account_changes(&bal).unwrap();
+        assert_eq!(
+            changes,
+            vec![
+                BalAccountChange { address: [1; 20], balance: Some(vec![1, 0]), nonce: Some(8), code_hash: None, storage_written: false },
+                BalAccountChange {
+                    address: [2; 20],
+                    balance: None,
+                    nonce: Some(1),
+                    code_hash: Some(keccak256(&[0xef, 0x01, 0x00])),
+                    storage_written: false
+                },
+                BalAccountChange { address: [3; 20], balance: Some(vec![]), nonce: None, code_hash: None, storage_written: true },
+            ]
+        );
+        assert_eq!(bal_changed_accounts(&bal).unwrap(), vec![[1; 20], [2; 20], [3; 20]]);
+
+        // Indices out of order, or repeated, would name the wrong post-block value.
+        for balance in [vec![idx_value(2, &[1]), idx_value(1, &[2])], vec![idx_value(1, &[1]), idx_value(1, &[2])]] {
+            let bad = rlp::encode(&Item::List(vec![account(0x01, vec![], balance, vec![], vec![])]));
+            assert!(bal_account_changes(&bad).is_err());
+        }
+        // A slot change with no change, and a balance wider than a word.
+        let empty_slot = Item::List(vec![Item::Bytes(vec![9]), Item::List(vec![])]);
+        assert!(bal_account_changes(&rlp::encode(&Item::List(vec![account(1, vec![empty_slot], vec![], vec![], vec![])]))).is_err());
+        let wide = rlp::encode(&Item::List(vec![account(1, vec![], vec![idx_value(1, &[1; 33])], vec![], vec![])]));
+        assert!(bal_account_changes(&wide).is_err());
+    }
+
+    /// The real Sepolia BAL's coinbase entry: a post-block balance, and the
+    /// fee recipient's nonce left alone. The value is pinned against the
+    /// chain: `eth_getBalance(0x25941dc7…77e9, 11960753)` on a Sepolia archive
+    /// node answers the same (checked 2026-11-03).
+    #[test]
+    fn a_real_sepolia_bal_carries_the_coinbase_post_block_balance() {
+        let header_raw = include_bytes!("../../../testdata/el/bal/sepolia-11960753.header.rlp");
+        let bal: &[u8] = include_bytes!("../../../testdata/el/bal/sepolia-11960753.bal.rlp");
+        let header = myotis_core::header::BlockHeader::decode(header_raw).unwrap();
+        let changes = bal_account_changes(bal).unwrap();
+        let coinbase = changes.iter().find(|c| c.address[..] == header.beneficiary[..]).unwrap();
+        // 0x358dbe4bfb4ef2c5612 wei, as eth_getBalance answers at the block.
+        assert_eq!(coinbase.balance.as_deref(), Some(&[0x03, 0x58, 0xdb, 0xe4, 0xbf, 0xb4, 0xef, 0x2c, 0x56, 0x12][..]));
+        assert_eq!(coinbase.nonce, None);
+        assert_eq!(coinbase.code_hash, None);
     }
 
     #[test]

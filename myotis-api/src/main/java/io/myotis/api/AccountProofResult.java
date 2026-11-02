@@ -29,7 +29,10 @@ import java.util.List;
  * @param beaconChainVerified   {@code peerStateRoot} ties to a beacon-attested root
  * @param blsVerified           the beacon match was BLS-signed
  * @param matchedBeaconSlot     slot of the matching beacon attestation; -1 if none
- * @param verifyMethod          "stateRootMatch" / "headerChain" / null
+ * @param verifyMethod          "stateRootMatch" / "headerChain" / "blockAccessList" (Rust
+ *                              engine: a watched account carried from an earlier proof
+ *                              by verified block access lists, no proof fetched — see
+ *                              docs/address-activity.md) / null
  * @param failReason            null when verified; otherwise a stable reason token
  *                              (e.g. "beaconNotSynced", "headerChainGapTooLarge")
  * @param accountHashHex        keccak256(address) — the snap trie key

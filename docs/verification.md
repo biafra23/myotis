@@ -224,7 +224,15 @@ tied to the beacon chain. The decision logic lives in `rust/myotis-net/src/el/ve
   walk also has to fit in one peer response (geth serves at most 1024 headers per request); a
   longer gap comes back short and fails closed as `headerChainInvalid`.
 
-When neither works, the result carries a `failReason` instead (`beaconNotSynced`,
+- **`blockAccessList`** (Rust engine, account reads at the head only) — no proof was
+  fetched for this read. The account is on the activity watch list, a verified proof
+  established its state at an earlier block, and the engine carried that state to this
+  block by applying the post-block values of every block access list in between. Each
+  BAL hashes to its header's `blockAccessListHash`, and the headers are parent-linked
+  up to a block the beacon chain attested, whose state root is the one reported. See
+  [address-activity.md](address-activity.md#answering-from-block-access-lists).
+
+When none of these works, the result carries a `failReason` instead (`beaconNotSynced`,
 `peerProofInvalid`, `peerBlockBehindFinalized`, `peerBlockAheadOfAnchor`,
 `headerChainGapTooLarge`, `headerChainInvalid`, …) and nothing is served as verified.
 
