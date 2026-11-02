@@ -149,7 +149,10 @@ consent once with `./gradlew :app:run -Pnetwork=gnosis -Pargs=accept-stale-ancho
 
 **1. Synthesize the seed straight into the data directory**, with the daemon
 stopped. The engine activates a `logindex-gnosis.db` it finds at start, so no
-import step is needed:
+import step is needed. The script overwrites `--out` without asking. If that
+file holds an index walked on path B, writing the seed over it throws away the
+verified coverage, so check first. Re-seeding is never the fix for a path-B
+index:
 
 ```bash
 python3 scripts/synth_logindex.py \
@@ -417,6 +420,7 @@ The SSH tunnel keeps it private.
 | Bee refuses to start: header too old | Bee wants the latest header under 60 s old. Myotis is not `SYNCED`, or has lost its snap peers |
 | `-32000 requested range is not indexed yet (covered: A-B)` | Honest refusal. The range is outside coverage. Wait for the walk or the bridge, or (path A) check the seed's `usableUntilBlock` |
 | `headGap` never closes on path A | The seed is past its shelf life (more than 500,000 blocks behind the head). Re-synthesize from a current checkout |
+| `headGap` never closes on path B | The daemon was down for more than ~500,000 blocks (~29 days). The bridge does not close a gap that wide, and the walk only goes downward, so it never fills a gap above coverage. Do not re-seed, because that would replace verified coverage with unverified data. Delete the index and walk again (*Moving from A to B*, then path B). To avoid this, keep downtime under ~29 days |
 | `beacon-status` says `STALE_ANCHOR` | The anchor is past Gnosis's ~34 h bound. Run `refreshCheckpoint -Pnetwork=gnosis` and restart, or consent once with `-Pargs=accept-stale-anchor` |
 | `403` through a proxy or forwarder | The `Host` header is not a loopback name. Use the SSH tunnel |
 | Port 8546 already in use | Another Myotis (for example the desktop app running Gnosis) holds it. Stop that one, or Bee may end up talking to an instance without the index |
