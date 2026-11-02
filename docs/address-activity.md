@@ -179,7 +179,10 @@ accounts put no address on the wire.
   pre-broadcast check of a send, which needs the head's own root (it only uses a BAL answer
   at the head itself). That check's request reveals nothing the send does not.
 - **What sends it back to a proof:** the read is proven over snap again, and that proof
-  restarts the following. This happens when:
+  restarts the following. The lag does not soften these: a block the account cannot be
+  carried through is never answered from the state below it, since that state is known
+  to be stale. And on a chain whose blocks commit to no BAL, a proof is never replayed,
+  not even at its own block, so reads there are proofs as before. This happens when:
   - a block wrote the account's storage (the new storage root is not in a BAL; for a wallet
     EOA that means an EIP-7702 delegated account using its storage);
   - a block's BAL does not decode, or the block has none (before Amsterdam);

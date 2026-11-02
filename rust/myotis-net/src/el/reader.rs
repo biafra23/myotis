@@ -5715,9 +5715,7 @@ impl ElReader {
         not_below: Option<u64>,
     ) -> Result<VerifiedAccount, String> {
         if anchor == ReadAnchor::Head {
-            if let Some(followed) =
-                self.followed_account(address, max_lag).filter(|a| not_below.is_none_or(|n| a.block_number >= n))
-            {
+            if let Some(followed) = self.followed_account(address, max_lag, not_below) {
                 return Ok(followed);
             }
         }
@@ -5737,14 +5735,21 @@ impl ElReader {
     /// with the hash the follower holds for it: the same bar a
     /// `stateRootMatch` proof clears, so the answer is labelled as one is
     /// (slot, BLS flag, `blockHash`), with its own `verifyMethod`.
-    fn followed_account(&self, address: [u8; 20], max_lag: u64) -> Option<VerifiedAccount> {
+    ///
+    /// `not_below`: never an answer from a block below it (a pinned read).
+    fn followed_account(&self, address: [u8; 20], max_lag: u64, not_below: Option<u64>) -> Option<VerifiedAccount> {
         let (head, head_hash) = self.anchored_head().ok()?;
         let is_ancestor = |number: u64, hash: &[u8; 32]| {
             (number == head && *hash == head_hash)
                 || (number < head
                     && self.anchor.recent_head_at(number).is_some_and(|r| r.linked && r.hash == *hash))
         };
-        let answer = self.activity.lock().ok()?.followed_answer(&address, head, max_lag, is_ancestor)?;
+        let answer = self
+            .activity
+            .lock()
+            .ok()?
+            .followed_answer(&address, head, max_lag, is_ancestor)
+            .filter(|a| not_below.is_none_or(|n| a.number >= n))?;
         let attested = self.anchor.find_state_root(&answer.state_root)?;
         if self.proven_block_hash(answer.number, &answer.state_root) != Some(answer.hash) {
             return None;
@@ -18485,17 +18490,20 @@ mod pre_broadcast_tests {
             VerifiedAccount { block_hash: None, ..at_99() },
         ] {
             reader.seed_followed(&r);
-            assert!(reader.followed_account(a, 2).is_none());
+            assert!(reader.followed_account(a, 2, None).is_none());
         }
         reader.seed_followed(&at_99());
         // 100's BAL is not in yet: answered at 99, one below the head, never
         // at no lag (the pre-broadcast check's read), never below a pin of 100.
-        let lagging = reader.followed_account(a, 2).expect("answered at 99");
+        let lagging = reader.followed_account(a, 2, None).expect("answered at 99");
         assert_eq!((lagging.block_number, lagging.block_hash, lagging.peer_state_root), (99, Some([5; 32]), [6; 32]));
         assert_eq!(lagging.verify_method, Some(VERIFY_BLOCK_ACCESS_LIST));
-        assert!(reader.followed_account(a, 0).is_none());
+        assert!(reader.followed_account(a, 0, None).is_none());
+        assert!(reader.followed_account(a, 2, Some(100)).is_none());
         let pinned = reader.get_account_following(ReadAnchor::Head, a, 2, Some(100)).await;
         assert!(pinned.is_err() || pinned.unwrap().verify_method != Some(VERIFY_BLOCK_ACCESS_LIST));
+        // Only the lagging answer was served (and counted); the pinned read was not.
+        assert_eq!(reader.activity_bal_stats.lock().unwrap().answered, 1);
         // 100 credits the account.
         let credit = BalAccountChange { address: a, balance: Some(vec![9]), nonce: None, code_hash: None, storage_written: false };
         reader.activity.lock().unwrap().set_account(100, &[4; 32], vec![a], vec![credit]);
@@ -18508,6 +18516,6 @@ mod pre_broadcast_tests {
         assert!(reader.get_account(ReadAnchor::Finalized, a).await.map_or(true, |r| r.verify_method != Some(VERIFY_BLOCK_ACCESS_LIST)));
         // A follower record whose root the anchor does not attest answers nothing.
         reader.activity.lock().unwrap().install(vec![record(100, [4; 32], [5; 32], [7; 32])], 100);
-        assert!(reader.followed_account(a, 0).is_none());
+        assert!(reader.followed_account(a, 0, None).is_none());
     }
 }

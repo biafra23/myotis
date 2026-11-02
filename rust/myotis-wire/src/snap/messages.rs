@@ -466,17 +466,25 @@ pub struct BalAccountChange {
 ///
 /// `raw` is the BAL's RLP, `[[address, storage_changes, storage_reads,
 /// balance_changes, nonce_changes, code_changes], …]`. A shape other than
-/// that, or a change list whose block access indices do not strictly ascend
-/// (the spec's ordering and at-most-once rules), is an error, never a partial
+/// that, accounts that do not strictly ascend by address, or a change list
+/// whose block access indices do not strictly ascend (the spec's ordering and
+/// at-most-once rules), is an error, never a partial
 /// answer: the values are applied to proven state, so a list read in an order
 /// it does not have would name the wrong post-block value.
 pub fn bal_account_changes(raw: &[u8]) -> Result<Vec<BalAccountChange>, CoreError> {
     let mut out = Vec::new();
+    let mut previous: Option<[u8; 20]> = None;
     for account in rlp::View::new(raw)?.as_list()? {
         let mut fields = account.as_list()?;
         let mut field = |name: &str| fields.next().ok_or_else(|| CoreError(format!("BAL: an account without {name}")));
         let mut address = [0u8; 20];
         address.copy_from_slice(field("an address")?.as_fixed_bytes(20)?);
+        // Ascending and unique, as the spec orders them: a repeated account
+        // would leave which of its entries holds open.
+        if previous.is_some_and(|p| p >= address) {
+            return Err(CoreError("BAL: accounts out of address order".into()));
+        }
+        previous = Some(address);
         let storage_changes = field("storage_changes")?;
         let storage_reads = field("storage_reads")?;
         let balance_changes = field("balance_changes")?;
@@ -740,6 +748,13 @@ mod tests {
             assert!(bal_account_changes(&bad).is_err());
             // The touch report still reads which accounts changed.
             assert_eq!(bal_changed_accounts(&bad).unwrap(), vec![[1; 20]]);
+        }
+        // Accounts out of order, or one listed twice.
+        for order in [[0x02, 0x01], [0x01, 0x01]] {
+            let bad = rlp::encode(&Item::List(
+                order.iter().map(|&a| account(a, vec![], vec![idx_value(1, &[1])], vec![], vec![])).collect(),
+            ));
+            assert!(bal_account_changes(&bad).is_err());
         }
         // A slot change with no change, and a balance wider than a word.
         let empty_slot = Item::List(vec![Item::Bytes(vec![9]), Item::List(vec![])]);

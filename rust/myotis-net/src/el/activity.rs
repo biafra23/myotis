@@ -454,15 +454,27 @@ impl ActivityState {
             .rev()
             .find(|(_, r)| is_ancestor(r.number, &r.hash))
             .map(|(n, _)| *n)?;
-        let start = self.records.get(&f.number).filter(|r| r.hash == f.hash && r.number <= vouched_top)?;
+        // A chain whose blocks commit to no BAL (before Amsterdam) carries
+        // nothing: its reads stay proofs, as before following existed.
+        let start = self
+            .records
+            .get(&f.number)
+            .filter(|r| r.hash == f.hash && r.number <= vouched_top && r.bal_hash.is_some())?;
         let mut at = start;
         let mut values = f.values.clone();
         // `start` is at or below `vouched_top`, so the range is never inverted
         // (an empty one when the proof is at the top).
         for (_, r) in self.records.range(f.number + 1..vouched_top.saturating_add(1)) {
             let mut next = values.clone();
-            if carry(&mut next, address, r).is_err() {
-                break;
+            match carry(&mut next, address, r) {
+                Ok(()) => {}
+                // A BAL still on its way: the state below it is the newest
+                // known, answered within the lag.
+                Err(Carry::NotYet) => break,
+                // A block the account cannot be carried through: the state
+                // below it is known to be superseded (or, with no BAL, not
+                // known to be current), so the read is proven.
+                Err(Carry::Never) => return None,
             }
             values = next;
             at = r;
@@ -1017,8 +1029,8 @@ mod tests {
         s.apply(&[A], &[]).unwrap();
         s.seed(A, 101, hash(101, 0), proven(1, &[5]));
         set_bal(&mut s, 103, &hash(103, 0), none(103));
-        assert_eq!(s.followed_answer(&A, 103, FOLLOW_MAX_LAG, every).map(|a| a.number), Some(101));
-        assert_eq!(s.followed_answer(&A, 103, 1, every), None);
+        // Not even within the lag: the state below 102 is known to be superseded.
+        assert_eq!(s.followed_answer(&A, 103, FOLLOW_MAX_LAG, every), None);
 
         // A BAL whose values did not decode: its changed accounts are known,
         // their values are not.
@@ -1027,8 +1039,7 @@ mod tests {
         s.seed(A, 100, hash(100, 0), proven(1, &[5]));
         s.set_account(101, &hash(101, 0), vec![A], Vec::new());
         s.set_account(102, &hash(102, 0), vec![B], Vec::new());
-        assert_eq!(s.followed_answer(&A, 102, FOLLOW_MAX_LAG, every).map(|a| a.number), Some(100));
-        assert_eq!(s.followed_answer(&A, 102, 1, every), None);
+        assert_eq!(s.followed_answer(&A, 102, FOLLOW_MAX_LAG, every), None);
         assert!(s.report(99, 102, every).touched.iter().any(|t| t.address == A && t.via == vec![Via::Account]));
 
         // A block before Amsterdam commits to no BAL.
@@ -1039,6 +1050,33 @@ mod tests {
         s.seed(A, 100, hash(100, 0), proven(1, &[5]));
         set_bal(&mut s, 101, &hash(101, 0), none(101));
         assert_eq!(s.followed_answer(&A, 102, 0, every), None);
+        assert_eq!(s.followed_answer(&A, 102, FOLLOW_MAX_LAG, every), None, "never served from below a block with no BAL");
+
+        // A storage write at the head itself: the pre-write state is not
+        // served within the lag either.
+        let mut s = watching(&[A]);
+        s.install(run(100, 103, 0, hash(99, 0)), 103);
+        s.seed(A, 100, hash(100, 0), proven(1, &[5]));
+        bals(&mut s, 101, 103, 0, |n| {
+            if n == 103 {
+                vec![BalAccountChange { storage_written: true, ..change(A, None, None) }]
+            } else {
+                Vec::new()
+            }
+        });
+        assert_eq!(s.followed_answer(&A, 103, FOLLOW_MAX_LAG, every), None);
+        assert_eq!(s.followed_answer(&A, 102, 0, every).map(|a| a.number), Some(102));
+
+        // A chain with no BALs at all (mainnet and Gnosis before Amsterdam):
+        // a proof is never replayed, not even at its own block.
+        let mut s = watching(&[A]);
+        let mut seg = run(100, 101, 0, hash(99, 0));
+        for r in &mut seg {
+            r.bal_hash = None;
+        }
+        s.install(seg, 101);
+        s.seed(A, 101, hash(101, 0), proven(1, &[5]));
+        assert_eq!(s.followed_answer(&A, 101, FOLLOW_MAX_LAG, every), None);
     }
 
     #[test]

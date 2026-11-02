@@ -25,7 +25,10 @@ import java.util.List;
  *                              anchored root (the preferred path since the #355
  *                              fix), the peer's head only on its fallback
  * @param peerStateRootHex      the peer's state root the proof was checked against
- * @param peerProofValid        the MPT proof verifies against {@code peerStateRoot}
+ * @param peerProofValid        the MPT proof verifies against {@code peerStateRoot}; for a
+ *                              "blockAccessList" answer, which fetched no proof, true: the
+ *                              state is the one an earlier verified proof established,
+ *                              carried to {@code peerStateRoot}'s block by verified BALs
  * @param beaconChainVerified   {@code peerStateRoot} ties to a beacon-attested root
  * @param blsVerified           the beacon match was BLS-signed
  * @param matchedBeaconSlot     slot of the matching beacon attestation; -1 if none
