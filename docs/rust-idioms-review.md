@@ -89,7 +89,7 @@ Production code only unless stated; "mentions" are source-line matches.
 | `[u8; 32]` mentions / hash newtypes | 723 / 0 | §4.4 |
 | `pub fn` / `pub(crate)` | 1 073 / 141 | §4.6 |
 | `pub` structs+enums / without `Debug` | 270 / 76 | §4.6 |
-| `#[must_use]` / `#[non_exhaustive]` / `impl FromStr` / `impl From` / `impl Iterator` | 1 / 0 / 0 / 6 / 0 | std-trait conventions barely used — §4.6 |
+| `#[must_use]` / `#[non_exhaustive]` / `impl FromStr` / `impl From` / `impl Iterator` | 1 / 0 / 0 / 7 / 2 | std-trait conventions barely used — §4.6 |
 | `let … else` / `matches!` / `is_some_and`-style combinators | 323 / 157 / present | modern control flow is in use (positive) |
 | legacy `format!("{}", x)` / inline `format!("{x}")` | 333 / 497 | mixed in every crate — §4.9 |
 | `serde_json::Value`/`json!` sites / `#[derive(Serialize)]` | 388 / 1 | §4.9 |
@@ -129,8 +129,11 @@ the *text* of an error is what the program branches on:
   `myotis-wire/src/snap/fetch.rs:47–72` defines `PROOF_INVALID_MARKER = "proof
   invalid"` and `is_unservable_root_error(error: &str) -> bool { error.contains(..) }`
   — a comment calls the substring "LOAD-BEARING" and asks to keep format
-  strings "in sync" with `trie.rs` — and `el/reader.rs:5709`, `:6026`, `:6290`,
-  `:6381`, `:6614` and `el/evm.rs:855` route peers on it. `el/pool.rs:78–80`
+  strings "in sync" with `trie.rs` — and six sites route peers on it:
+  `el/reader.rs:6026` and `:6290` call `is_unservable_root_error`, while
+  `:5709`, `:6381`, `:6614` and `el/evm.rs:855` call its sibling
+  `is_unknown_root_error` (`fetch.rs:70`, the same marker plus a second
+  substring). `el/pool.rs:78–80`
   classifies dial outcomes with `e.starts_with("peer disconnected") &&
   e.ends_with("reason=4")` and `e.starts_with("incompatible peer")`
   (`:1490–1492`), with a 40-line test pinning the string shape.
@@ -173,7 +176,7 @@ the *text* of an error is what the program branches on:
   (`types.rs:26`) and `myotis-wire` (`eth2/codec.rs:35`) write
   `#[cfg(feature = "std")] impl std::error::Error for …`, so a `no_std`
   consumer of those two gets an error type that is not an `Error`.
-- No `From` impls to feed `?`: 6 in the whole tree, so conversions are
+- Almost no `From` impls to feed `?`: 7 in the whole tree, so conversions are
   `map_err` chains at every call site.
 
 The idiom: per-crate (or per-module) `enum` error types with `Display`,
@@ -315,7 +318,7 @@ Two smaller structure points:
   on — keeps every existing path working with no extra files, lets rustdoc
   show the original item docs instead of "Moved to…", and stops every future
   `pub` item of the wire module from entering this crate's API unreviewed.
-- `myotis-net/src/el/mod.rs:10–40` lists its 29 submodules in no order
+- `myotis-net/src/el/mod.rs:10–40` lists its 28 submodules in no order
   (`feecache` and `tasks` private among public ones, `tor` with a doc comment,
   `torreserve` `pub(crate)`); `clippy::redundant_pub_crate` (24 sites, 20 in
   `myotis-net`) flags `pub(crate)` items inside already-private modules.
@@ -331,9 +334,10 @@ Two smaller structure points:
   (`pub use sync::{ChainConfig, SyncHandle, …}`).
 - **std traits**: no `FromStr` impl in the tree although hex quantities,
   block tags, enode URLs and ENS names are parsed everywhere (ad-hoc
-  `parse_*`/`*_from_hex` functions instead); 6 `From` impls; no `Iterator`
-  impl (two `IntoIterator`s in `myotis-wire/src/eth.rs:835`, `:851` are the
-  exception and are done right); 7 manual `Default`s next to 47 derived ones;
+  `parse_*`/`*_from_hex` functions instead); 7 `From` impls; one
+  `IntoIterator` and two `Iterator` impls (`myotis-wire/src/eth.rs:834`/`:850`
+  with `ExactSizeIterator`, `myotis-core/src/rlp.rs:184` with `FusedIterator`)
+  are the exception and are done right; 8 manual `Default`s next to 47 derived ones;
   `Display` is implemented 17 times, often for things that are then
   `.to_string()`ed into a `String` error.
 - **Docs**: the volume is exceptional (every file but two has a `//!` header,
@@ -794,13 +798,15 @@ clone 7, `Result<_, String>` 5; net root — unwrap/expect 11, `as` 5, clone 16,
   `snap/fetch.rs:47–72` defines `PROOF_INVALID_MARKER = "proof invalid"` and
   `is_unservable_root_error(error: &str) -> bool { error.contains(..) }`, with a
   comment calling the substring "LOAD-BEARING" and asking to keep format
-  strings "in sync" with `trie.rs`; `el/reader.rs:5709`, `:6026`, `:6290`,
-  `:6381`, `:6614` and `el/evm.rs:855` branch peer-routing on it. A typed
+  strings "in sync" with `trie.rs`; `el/reader.rs:6026` and `:6290` branch
+  peer-routing on it directly and `:5709`, `:6381`, `:6614` and `el/evm.rs:855`
+  through the sibling `is_unknown_root_error` (`:70`). A typed
   `FetchError { ProofInvalid { kind, reason }, Transport(..) }` is the idiom.
 - **[B] Three string-error shapes in one crate**: `CodecError(pub String)`
   (`eth2/codec.rs:28`), bare `String` (`rlpx/hello.rs:79`, `eth2/status.rs:42`,
   `:57`, `snappy.rs:83`, `:141`) and `CoreError`; `hello.rs:88–106` does
-  `.map_err(|e| e.0)?` nine times to turn one into the other;
+  `.map_err(|e| e.0)?` eight times and `map_err(|e| format!("hello: {}", e.0))`
+  twice to turn one into the other;
   `#[cfg(feature = "std")] impl std::error::Error for CodecError` (`:35–36`)
   where `core::error::Error` is available.
 - **[B] Wire-declared `u64` lengths narrowed with `as usize`, one unchecked
