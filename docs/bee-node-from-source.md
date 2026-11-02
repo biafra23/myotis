@@ -10,6 +10,9 @@ the logs is doing and why.
 
 The long-form reference — every checked RPC method, the run reports, the trust
 analysis — is `docs/bee-rpc-service.md`. This is the short path.
+For a headless Linux server (the daemon under systemd, the seed versus the
+verified walk, Bee in Docker or on another host), see
+[bee-daemon-linux.md](bee-daemon-linux.md).
 
 ## 1. What Bee asks of an RPC node
 
