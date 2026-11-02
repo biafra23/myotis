@@ -10,6 +10,10 @@ anchored to sync-committee-signed beacon roots, logs against receipt roots, and
 nothing served on trust. See the README's *Trust model* and *Wallet API*
 sections for the full verification story.
 
+Running the daemon on a Linux server, with the seed or with the verified walk,
+under systemd, with Bee native, in Docker or on another machine: see
+[bee-daemon-linux.md](bee-daemon-linux.md).
+
 ## What Bee gets, and from where
 
 | Bee's need | Myotis serving path |
@@ -227,8 +231,10 @@ What the frame claims, and what stays honest:
   the fetched range only, so a query between the two (Bee never makes one
   while its snapshot is in use) gets the `-32000` refusal, and the walker
   backfills that band over devp2p in the background, verified — never a
-  fabricated `[]`. Passing the fetch's low edge as the deployment block is
-  refused by the script for exactly that reason.
+  fabricated `[]`. The script refuses a deployment block above the fetch's
+  low edge, but not one equal to it: passing the fetch's low edge as the
+  deployment block is accepted, and turns that band into silent `[]`s, so
+  keep the real block.
 - The span high is `toBlock − 128` by default: a fetch that ran to `latest`
   can hold a block that was reorged out afterwards, and the walker's
   re-descent only fills holes — it never evicts a seeded log. The dropped
