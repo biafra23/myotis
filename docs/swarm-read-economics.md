@@ -43,7 +43,7 @@ with `swarm.MaxPO = 31` (`pkg/swarm/swarm.go`) and `poPrice = basePrice = 10_000
 A light node picks the closest connected peer. For a chunk in bin *p* of its
 own address, that peer shares at least *p + 1* bits with the chunk, plus about
 log₂(peers in the bin). Bin 0 carries half of all chunks, so the typical first
-hop sits at proximity about 2–8: **about 250k–300k units per chunk**. The rest
+hop sits at proximity about 2–8: **about 240k–300k units per chunk**. The rest
 of this note uses 270k as the typical value.
 
 Price depends on the chunk count, not on bytes. A 500-byte trie node stored as
@@ -148,12 +148,14 @@ Paying does **not**:
 ### Sync-committee data: does not need payment
 
 One `LightClientUpdate` per sync-committee period is about 25 KiB (the 512
-committee public keys alone are 512 × 48 B = 24.6 KiB). Periods last 27.3 h on
-mainnet and 11.4 h on Gnosis. A full year of mainnet periods is about 320 ×
-25 KiB ≈ 8 MiB, about 2,000 chunks. Finality and optimistic updates are under
-1 KiB each. All of this fits easily inside the free rate, and paying for all
-of it would cost about 0.005 BZZ, a fraction of a cent. Payment would buy
-nothing here.
+committee public keys alone are 512 × 48 B = 24.0 KiB, 24.05 KiB with the
+aggregate key). Periods last 27.3 h on mainnet and 11.4 h on Gnosis. A full
+year of mainnet periods is about 320 × 25 KiB ≈ 8 MiB, about 2,000 chunks.
+Since Capella each light-client header embeds the execution payload header
+plus its branch, so a finality update (two headers, finality branch, sync
+aggregate) is about 2 KiB and an optimistic update about 1 KiB. All of this
+fits easily inside the free rate, and paying for all of it would cost about
+0.005 BZZ, a fraction of a cent. Payment would buy nothing here.
 
 ### State data: payment helps throughput, not latency
 
