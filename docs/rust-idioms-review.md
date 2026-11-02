@@ -32,7 +32,7 @@ accident:
 | 5 | Everything `pub` | 1 073 `pub fn` vs 141 `pub(crate)`; every submodule of `myotis-net` is `pub mod` | `pub(crate)` by default, a deliberate public surface |
 | 6 | JSON by hand | 388 `serde_json::Value`/`json!` sites vs **one** `#[derive(Serialize)]` in the whole tree | `#[derive(Serialize, Deserialize)]` DTOs |
 | 7 | Five lock-poisoning policies side by side | `.lock().unwrap()` 55, `.lock().expect("…")` 35, `unwrap_or_else(\|e\| e.into_inner())` 93, the recovery `match` pasted by hand, `lock().ok()?` / `map_err(…)` silently skipping — up to five in one file (`engine/host.rs`) | one policy, one helper (or `parking_lot`) |
-| 8 | `unsafe` without `// SAFETY:` | 77 `unsafe {}` blocks in `myotis-node` and 40 `unsafe fn`s in `capi.rs` against 3 `// SAFETY:` comments in the whole production tree; 7 `unsafe extern "C" fn`s without a `# Safety` doc section | every `unsafe` block states the invariant it relies on |
+| 8 | `unsafe` without `// SAFETY:` | 77 `unsafe {}` blocks in `myotis-node` and 39 `unsafe fn`s in `capi.rs` against 3 `// SAFETY:` comments in the whole production tree; 7 `unsafe extern "C" fn`s without a `# Safety` doc section | every `unsafe` block states the invariant it relies on |
 | 9 | Manifest hygiene | no `[workspace.dependencies]` (tokio pinned in 2 crates, tracing in 4, serde_json in 6), no `[workspace.lints]`, edition 2021 on an MSRV (1.91) that allows 2024 | shared workspace dependency and lint tables |
 
 Nothing found here is a soundness hole, and **no panic reachable from peer
@@ -97,7 +97,7 @@ Production code only unless stated; "mentions" are source-line matches.
 | `std::sync::Mutex` / `tokio::sync::Mutex` mentions | 102 / 29 | right default; clippy `significant_drop_tightening`: 44 — §4.8 |
 | `Ordering::SeqCst` / weaker orderings | 69 / 138 | mixed — §4.8 |
 | `block_on` / `block_on(async { f().await })` | 35 / 12 | the inner `async` block is redundant — §4.8 |
-| `unsafe {}` blocks (`myotis-node`) / `unsafe fn`s (`capi.rs`) / `// SAFETY:` comments / `/// # Safety` sections | 77 / 40 / 3 / 31 | §4.10 |
+| `unsafe {}` blocks (`myotis-node`) / `unsafe fn`s (`capi.rs`) / `// SAFETY:` comments / `/// # Safety` sections | 77 / 39 / 3 / 31 | §4.10 |
 | files > 2 000 lines / functions > 150 lines | 11 / 20 | §4.5 |
 | `#[allow(clippy::too_many_arguments)]` / `#[allow(unused_imports)] use alloc::{…}` | 15 / 17 | §4.5, §4.11 |
 | rustdoc: broken intra-doc links / public docs linking private items | 23 / 53 | the extensive docs are not `cargo doc`-clean — §4.6 |
@@ -212,7 +212,7 @@ fixed-size conversions). The concentrations are:
   intent).
 - Constructor validation by `assert!` in library code:
   `myotis-consensus/src/fork.rs:81–83` (`ForkSchedule::new`) and
-  `spec.rs:114` panic on a bad fork table. These are programmer-error checks
+  `spec.rs:115` panic on a bad fork table. These are programmer-error checks
   on embedded constants, which is a legitimate use of `assert!`, but
   `clippy::missing_panics_doc` (58 sites) notes none of them documents the
   `# Panics` contract.
@@ -284,12 +284,13 @@ production part is still very large:
 | `myotis-evm/src/ens/mod.rs` | 2 211 | 982 | 1 229 |
 | `myotis-net/src/el/evm.rs` | 2 043 | 1 480 | 563 |
 
-Twenty production functions are longer than 150 lines, seven longer than
+Twenty production functions are longer than 150 lines, eight longer than
 300: `myotis-net/src/sync.rs:2992` `catch_up` (544 lines), `roost/src/serve.rs:403`
 `serve` (505), `sync.rs:2045` `run_sync` (443), `el/reader.rs:5121`
 `log_index_backfill_batch` (379), `el/reader.rs:2429` `set_log_index_config`
 (335), `el/reader.rs:3626` `log_index_tail_tick` (326), `el/reader.rs:4343`
-`log_index_bridge_step` (323), `myotis-rpcd/src/rpc.rs:574` `dispatch` (284),
+`log_index_bridge_step` (323), `el/evm.rs:1037` `prefetch_batch` (301),
+`myotis-rpcd/src/rpc.rs:574` `dispatch` (284),
 `roost/src/main.rs:329` `ingest` (235), `el/pool.rs:1284` `dial_one` (227),
 `cl_fork_watch.rs:340` `evaluate_locked` (188), `el/reader.rs:3365`
 `log_index_append_tick` (187), `engine/host.rs:695` `spin_up` (183),
@@ -442,7 +443,7 @@ and only because libp2p's `request_response::Codec` requires it
 
 ### 4.10 `unsafe` and FFI (B, one A-class habit)
 
-`unsafe` is confined to four places — `myotis-engine/src/capi.rs` (40 `unsafe
+`unsafe` is confined to four places — `myotis-engine/src/capi.rs` (39 `unsafe
 fn`s), `myotis-node/src/{lib,scheduler}.rs` (77 `unsafe {}` blocks and 3
 `unsafe extern "C"` callbacks), `myotis-engine/src/usage.rs` (2 blocks,
 `localtime_r`), `myotis-rpcd` (2 blocks) — which is the right shape, and `catch_unwind` is absent
@@ -452,8 +453,8 @@ not idiomatic:
 - **Three `// SAFETY:` comments in the whole production tree**
   (`myotis-engine/src/usage.rs:245`, `myotis-rpcd/src/checkpoint.rs:80`,
   `seeds.rs:60`; two more in tests) against 77 `unsafe {}` blocks in
-  `myotis-node` and 40 `unsafe fn`s in `capi.rs`. `capi.rs` documents 31 of
-  its 39 `unsafe fn`s with the *caller*-side `/// # Safety` section (good), but
+  `myotis-node` and 39 `unsafe fn`s in `capi.rs`. `capi.rs` documents 31 of
+  those 39 with the *caller*-side `/// # Safety` section (good), but
   the *implementer* side is absent: the bodies have no explicit `unsafe {}`
   block at the deref sites — they rely on edition-2021's implicit unsafe-fn
   body (`capi.rs:27–31` `read_string`, `:174`, `:738`), which
@@ -550,7 +551,11 @@ production items after a test module.
 message-only); `println!`/`eprintln!` in library code are confined to
 `#[cfg(test)]` skip notices and the two binaries (`myotis-rpcd`'s access log,
 `roost`), plus four `eprintln!` in `myotis-node/src/scheduler.rs:122–233` for
-a poisoned scheduler where no logger is reachable — defensible.
+a poisoned scheduler where no logger is reachable — defensible as a last
+resort, with one caveat: `eprintln!` panics on a stderr write error such as
+`EPIPE` (std ignores only a closed descriptor), which under `panic = "abort"`
+kills the host; `let _ = writeln!(std::io::stderr(), …)` is the panic-free
+spelling (§5.9).
 
 ### 4.14 Comments that are wrong about the code (A-class per the rubric, cheap to fix)
 
@@ -563,8 +568,9 @@ has a runtime effect, each costs a maintainer a wrong assumption:
   five statics including a bootstrapped `TorClient`, `el/pool.rs:2217` contact
   logs, `engine/host.rs:175` the engine itself.
 - `myotis-consensus/src/store.rs:37–38` "REFUSES zero rather than defaulting
-  to the mainnet preset" — `#[derive(Default)]` + a silent 8192 fallback
-  (`:17`, `:53–59`).
+  to the mainnet preset" — true of `new()`, which asserts it, false of the type:
+  `#[derive(Default)]` lets a zero in by another door and `slots_per_period()`
+  silently substitutes 8192 (`:17`, `:53–59`).
 - `myotis-net/src/el/reader.rs:1977–1980` "Only read on the `tor` feature" +
   `allow(dead_code)` on `eth_cfg`, read at `:2956`, `:3340`, `:4277`.
 - `el/peer.rs:323` "Negotiated eth version (66-69)" — branches on `>= 70`/`>= 71`.
@@ -597,9 +603,10 @@ has a runtime effect, each costs a maintainer a wrong assumption:
 ### 4.15 Correctness notes found on the way (not idiom, reported because they were seen)
 
 - `roost/src/serve.rs:578–581`: `tokio::signal::ctrl_c()` is re-created per
-  `select!` iteration, so a SIGINT arriving while the tick body runs is
-  dropped; the first Ctrl-C does nothing, SIGTERM is never handled. Pin one
-  future before the loop.
+  `select!` iteration, so a SIGINT arriving while the tick body runs (REST
+  calls, probe dials) is dropped — a Ctrl-C during a tick does nothing, one
+  while the loop is parked on `ctrl_c()` works; SIGTERM is never handled. Pin
+  one future before the loop.
 - `roost/src/serve.rs:534`, `:1130`, `:1139`: `/ip4/{ip}` formatted around an
   address `upstream_external_ip` deliberately lets be IPv6 (`:1094–1101`) — the
   unparseable multiaddr `dialable()`'s doc exists to prevent. Log line only.
@@ -677,11 +684,13 @@ found in any of them. Counts (production): unwrap/expect 0 / 0 / 28 (all
 guarded), `as` 1 / 23 / 13, clone 0 / 13 / 8, `Result<_, String>` 0.
 Findings: A 1 (latent), B 19, C 31.
 
-- **[A, latent — comment contradicts code]** `myotis-consensus/src/store.rs:37–38`
-  documents that `LightClientStore` "REFUSES zero rather than defaulting to
-  the mainnet preset", but the struct is `#[derive(Default)]` (`:17`) and
-  `slots_per_period()` (`:53–59`) silently substitutes 8192 when the field is
-  0 — exactly the accepted-and-ignored shape the comment forbids. No
+- **[A, latent — a documented invariant the type does not hold]** `new()`'s
+  doc (`myotis-consensus/src/store.rs:37–38`) says the store "REFUSES zero
+  rather than defaulting to the mainnet preset", and `new()` does assert it
+  (`:44`) — but the struct is `#[derive(Default)]` (`:17`), so
+  `LightClientStore::default()` holds `slots_per_period == 0`, and
+  `slots_per_period()` (`:53–59`) then silently substitutes 8192: zero gets in
+  by another door and is defaulted exactly as the doc says it never is. No
   production caller uses `Default` (`sync.rs` goes through `new(..)`), so it is
   latent; drop the derive or make the accessor return the field.
 - **[B] 25 guarded `.unwrap()`s in the hand-rolled SSZ decoders**
@@ -789,7 +798,7 @@ clone 7, `Result<_, String>` 5; net root — unwrap/expect 11, `as` 5, clone 16,
   `:6381`, `:6614` and `el/evm.rs:855` branch peer-routing on it. A typed
   `FetchError { ProofInvalid { kind, reason }, Transport(..) }` is the idiom.
 - **[B] Three string-error shapes in one crate**: `CodecError(pub String)`
-  (`eth2/codec.rs:27`), bare `String` (`rlpx/hello.rs:79`, `eth2/status.rs:42`,
+  (`eth2/codec.rs:28`), bare `String` (`rlpx/hello.rs:79`, `eth2/status.rs:42`,
   `:57`, `snappy.rs:83`, `:141`) and `CoreError`; `hello.rs:88–106` does
   `.map_err(|e| e.0)?` nine times to turn one into the other;
   `#[cfg(feature = "std")] impl std::error::Error for CodecError` (`:35–36`)
@@ -939,7 +948,8 @@ unwrap/expect 2 / 9 / 0, `as` 6 / 3 / 0, clone 27 / 18 / 1,
 - **[B] Hand-rolled hex, duplicated across the crate**: `hex_str` (`:2537`,
   one `String` per byte) beside `el/getproof.rs:42 hex`, `el/eth/session.rs:612
   hex_all`, `el/sent_tx.rs:133 hash_hex`, `reqresp.rs:1863 hex4`/`1869 hex8`,
-  and `fn hex32` byte-identical in `sync.rs:650` and `el/reader.rs:11004`.
+  and the same six-line `fn hex32` in `sync.rs:650` and `el/reader.rs:11004`
+  (differing only in the `expect` text).
 - **[B] `reqresp.rs` doc comments attached to the wrong items** — a genuine
   doc bug: the paragraph for `external_address` (`:619–625`) runs without a
   blank line into `observe_via`'s and lands on `observe_via` (`:643`), leaving
@@ -1000,8 +1010,8 @@ unwrap/expect 2 / 9 / 0, `as` 6 / 3 / 0, clone 27 / 18 / 1,
 
 **Lines 1–9 200.** `pub struct ElReader` (`:1968–2172`) has about 45 fields
 — 22 `std::sync::Mutex`, 3 `tokio::sync::Mutex`, 4 `JoinHandle` slots, 2
-semaphores, 3 atomics, a `Notify` — and `impl ElReader {` (`:2197–9783`) is
-7 587 lines; 159 methods (63 `pub`) fall in this range. The field groups never
+semaphores, 3 atomics, a `Notify` — and `impl ElReader {` (`:2197–9775`) is
+7 579 lines; 159 methods (63 `pub`) fall in this range. The field groups never
 touch each other (log index 14 fields, fees 7, activity 5, sent-tx 3,
 receipts 3), so twelve cohesive units are visible: config + enode parsing
 (`:55–353`), verified result types, the hedged-race policy (`:1083–1216`,
@@ -1012,8 +1022,8 @@ reads (`:5656–6769`), EVM/ENS bridging (`:6771–7326`), block reads
 (`:8086–8409`) and receipt/tx lookup (`:9085–9200`) — each a sub-struct and a
 module. Counts (production, this range): unwrap/expect 12 (11
 `lock().unwrap()` in the sent-tx section + 1 `expect`), `as` 16 (all bounded),
-clone 29 + 31 `Arc::clone`, `Result<_, String>` 67 signature sites (28 of 69
-`pub` methods), unsafe 0. Findings: A 1, B 16, C 11.
+clone 29 + 31 `Arc::clone`, `Result<_, String>` 67 signature sites (28 of them on
+`pub` functions), unsafe 0. Findings: A 1, B 16, C 11.
 
 - **[A — comment contradicts code, no runtime effect]** `:1977–1980`: "Only
   read on the `tor` feature" + `#[cfg_attr(not(feature = "tor"),
@@ -1440,7 +1450,7 @@ unsafe 0. Findings: A 2 (doc/code mismatches), B 27, C 19.
   connect ")` and friends (`tor.rs:254–259`); three live tests match
   `e.contains("incompatible peer")`. 17 `Result<_, String>` signatures in scope.
 - **[B] Five mutex-poisoning policies in one directory**: `lock().expect("anchor
-  mutex")` ×23 (`anchor.rs:196`), `unwrap_or_else(|e| e.into_inner())`
+  mutex")` ×24 (`anchor.rs:196`), `unwrap_or_else(|e| e.into_inner())`
   (`readstats.rs:351`), the recovery `match` pasted eight times
   (`served.rs:156–159`, `:187`, `:213`, `:233`, `:244`, `:260`, `:274`, `:287`),
   `lock().ok()?` / `let Ok(..) = … else { return }` silently dropping an
@@ -1635,8 +1645,8 @@ Findings: A 0, B 24, C 39.
 ### 5.9 `myotis-engine`, `myotis-node`, `uniffi-bindgen` — the FFI layers
 
 **Verdict.** Idiomatic where it matters most for an FFI crate: `host.rs` has
-**zero** `unwrap`/`expect`/`[]` indexing on runtime data in about 4 460
-production lines ("panic-free by construction", `host.rs:20–26`, is real),
+**zero** `unwrap`/`expect`/`[]` indexing on runtime data in about 5 600
+production lines (6 451 minus two test modules) ("panic-free by construction", `host.rs:20–26`, is real),
 saturating arithmetic at every window check, a documented and consistently
 applied "snapshot under the lock, release, then `block_on`" discipline
 (`:699–718`, `:985–1019`), every pointer-dereferencing C export is `pub unsafe
@@ -1649,7 +1659,7 @@ per-handle admission, a 90 s deadline + cancel bit, `#[must_use] Cancellation`).
 The un-idiomatic side is structural and in `unsafe` hygiene. Counts
 (production): host.rs unwrap/expect 0, `as` 9, `Result<_, String>` 14 fns;
 capi.rs/ffi.rs 39 `unsafe fn`s with **0 explicit `unsafe {}` blocks** (the
-bodies rely on edition-2021's implicit unsafe-fn body); myotis-node 81 `unsafe`
+bodies rely on edition-2021's implicit unsafe-fn body); myotis-node 77 `unsafe {}`
 blocks + 3 `unsafe extern "C"` callbacks with 0 `// SAFETY:` comments.
 Findings: A 0, B 35, C 38.
 
@@ -1736,7 +1746,7 @@ Findings: A 0, B 35, C 38.
 - **[B] `myotis-node`**: crate-wide `#![allow(unused_unsafe)] // capi fns are a
   mix of safe/unsafe; calls are wrapped uniformly` (`lib.rs:22`) while `:202`
   and `:208` call capi fns *without* `unsafe` and eight safe fns are wrapped
-  (`:92`, `:194`, `:215`, …); 81 `unsafe` blocks and 3 `unsafe extern "C"`
+  (`:92`, `:194`, `:215`, …); 77 `unsafe {}` blocks and 3 `unsafe extern "C"`
   callbacks with zero `// SAFETY:` comments, including ownership transfers
   whose soundness rests on three non-local facts (`scheduler.rs:88–89`
   `Box::from_raw(data.cast::<Completion>())`); raw Node-API pointers stored as
@@ -1748,8 +1758,9 @@ Findings: A 0, B 35, C 38.
   machinery (36 unsafe blocks) where napi 3 ships `ThreadsafeFunction` and
   `JsDeferred` — the reasons are written down (`:143–146`, `:253–254`,
   `:549–550`) but a module-level "evaluated and rejected because" note is
-  missing; four `eprintln!` (`:122`, `:173`, `:218`, `:233`), which panic when
-  stderr is closed and so abort the Electron process under `panic = "abort"`;
+  missing; four `eprintln!` (`:122`, `:173`, `:218`, `:233`), which panic on a
+  stderr write error such as `EPIPE` (std ignores only a closed descriptor)
+  and so abort the Electron process under `panic = "abort"`;
   NUL-byte refusal shaped as retryable in two entry points and permanent in the
   rest (`lib.rs:76–78`, `:472–475`).
 - **[B] Doc bugs**: the `///` for `get_transaction_receipt_json` runs into
@@ -1823,9 +1834,9 @@ B 24, C 38.
 - **[A — bug] Ctrl-C swallowed while a tick body runs** (`roost/src/serve.rs:578–581`):
   `tokio::signal::ctrl_c()` is a fresh future every `select!` iteration, so
   while the tick arm's body runs (loopback REST calls, outbound probe dials)
-  no listener exists and tokio's registry drops the pending SIGINT; the
-  operator's first Ctrl-C does nothing, the second works, and SIGTERM is never
-  handled. Fix: pin one `ctrl_c()` future before the loop (plus a
+  no listener exists and tokio's registry drops the pending SIGINT: a Ctrl-C
+  during a tick is lost (one while the loop is parked on `ctrl_c()` works), and
+  SIGTERM is never handled. Fix: pin one `ctrl_c()` future before the loop (plus a
   `SignalKind::terminate()` stream).
 - **[A — bug, cosmetic] `/ip4/{ip}` formatted around an address that can be
   IPv6** (`serve.rs:534`, `:1130`, `:1139`): `upstream_external_ip`
