@@ -1527,7 +1527,11 @@ pub fn request_account_json(handle: i64, address_hex: &str, block: &str) -> Stri
         Ok(anchor) => anchor,
         Err(json) => return json,
     };
-    match engine.rt.block_on(reader.request(async { reader.get_account(anchor, address).await })) {
+    let pin = match selector {
+        BlockSelector::Number(n) => Some(n),
+        _ => None,
+    };
+    match engine.rt.block_on(reader.request(async { reader.get_account_pinned(anchor, address, pin).await })) {
         Ok(account) => eljson::account_json(address_hex, &account, finalized_period, wall_period),
         Err(e) => eljson::error_json(&e),
     }
@@ -1613,7 +1617,11 @@ pub fn get_code_json(handle: i64, address_hex: &str, block: &str) -> String {
         Ok(anchor) => anchor,
         Err(json) => return json,
     };
-    match engine.rt.block_on(reader.request(async { reader.get_code(anchor, address).await })) {
+    let pin = match selector {
+        BlockSelector::Number(n) => Some(n),
+        _ => None,
+    };
+    match engine.rt.block_on(reader.request(async { reader.get_code_pinned(anchor, address, pin).await })) {
         Ok(code) => eljson::code_json(address_hex, &code, finalized_period, wall_period),
         Err(e) => eljson::error_json(&e),
     }

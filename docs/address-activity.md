@@ -157,6 +157,8 @@ accounts put no address on the wire.
   the block it ran against must be one the anchor vouches for by hash (`blockHash` set).
   The engine then holds that account's state (balance, nonce, code hash, storage root) at
   that block. A newer proof replaces an older one, and nothing is fetched just to start it.
+  A proof made before the follower's run started over still counts: BALs are wanted from
+  the block above the lowest such proof, not only from where the run started.
 - **What moves it:** each block's verified BAL. A BAL lists every account its block
   touched, with the values after the block. The engine takes the last entry of each change
   list, since each one is the value after its transaction. An account the BAL does not list
@@ -168,7 +170,10 @@ accounts put no address on the wire.
   and `blockTimestamp` of the block answered at, and `peerStateRootHex` set to that
   block's state root. The answer comes from the anchored head, or from at most
   `FOLLOW_MAX_LAG` (2) blocks below it, which covers the few seconds before the head's own
-  BAL arrives. The block must lead to the head (as for a report), and the anchor must attest
+  BAL arrives. A read pinned to a block number is never answered from below that block.
+  Reads that are always proven (`eth_call`, storage) run at the head, so for those few
+  seconds a balance answered this way can be a block older than an `eth_call` made
+  beside it. Its `blockNumber` says so. The block must lead to the head (as for a report), and the anchor must attest
   its state root. `matchedBeaconSlot` and `blsVerified` are that attestation's, as for a
   `stateRootMatch` proof. Finalized reads and `eth_getProof` are always proven. So is the
   pre-broadcast check of a send, which needs the head's own root (it only uses a BAL answer

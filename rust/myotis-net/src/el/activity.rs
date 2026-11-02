@@ -333,9 +333,15 @@ impl ActivityState {
     /// (the head the run last started over at), committing to one, none
     /// verified yet — newest
     /// first, at most `max`: `(number, block hash, blockAccessListHash)`.
+    ///
+    /// The floor reaches down to the block above a followed account's proof
+    /// when that is lower (a proof made at a head just before the run last
+    /// started over): carrying the account needs every BAL above it, and
+    /// without them its next read would be proven again.
     pub fn bals_wanted(&self, max: usize) -> Vec<(u64, [u8; 32], [u8; 32])> {
+        let floor = self.followed.values().map(|f| f.number + 1).min().map_or(self.bal_floor, |f| f.min(self.bal_floor));
         self.records
-            .range(self.bal_floor..)
+            .range(floor..)
             .map(|(_, r)| r)
             .rev()
             .filter(|r| r.account.is_none() && !r.bal_undecodable)
@@ -345,16 +351,25 @@ impl ActivityState {
     }
 
     /// Record what block `number` (`hash`) changed, from its verified BAL:
-    /// the accounts, and the post-block values of those watched now. Ignored
-    /// when that block is no longer kept under that hash (a reorg or a trim
-    /// while the BAL was fetched).
-    pub fn set_account(&mut self, number: u64, hash: &[u8; 32], mut changes: Vec<BalAccountChange>) {
+    /// the accounts (`changed`), and the post-block values (`changes`) of
+    /// those watched now. A changed account `changes` does not name cannot be
+    /// carried through the block. Ignored when that block is no longer kept
+    /// under that hash (a reorg or a trim while the BAL was fetched).
+    pub fn set_account(
+        &mut self,
+        number: u64,
+        hash: &[u8; 32],
+        mut changed: Vec<[u8; 20]>,
+        mut changes: Vec<BalAccountChange>,
+    ) {
         let Some(r) = self.records.get_mut(&number).filter(|r| &r.hash == hash) else {
             return;
         };
+        changed.sort_unstable();
+        changed.dedup();
+        r.account = Some(changed.into_boxed_slice());
         changes.sort_unstable_by_key(|c| c.address);
         changes.dedup_by(|a, b| a.address == b.address);
-        r.account = Some(changes.iter().map(|c| c.address).collect());
         changes.retain(|c| self.watched.contains_key(&c.address));
         r.watched_changes = changes.into_boxed_slice();
         self.advance_followed();
@@ -382,8 +397,9 @@ impl ActivityState {
     /// that can never be carried on: its block was replaced or trimmed, or
     /// the next block is one it cannot be carried through ([`Carry::Never`]).
     fn advance_followed(&mut self) {
+        // Nothing kept yet (the follower's first window is still on its way):
+        // a proof made meanwhile waits for it.
         let Some((&lowest, _)) = self.records.first_key_value() else {
-            self.followed.clear();
             return;
         };
         let top = self.records.last_key_value().map_or(0, |(n, _)| *n);
@@ -610,6 +626,12 @@ mod tests {
         out
     }
 
+    /// Record a verified BAL that changed exactly the accounts `changes` names.
+    fn set_bal(s: &mut ActivityState, number: u64, hash: &[u8; 32], changes: Vec<BalAccountChange>) {
+        let changed = changes.iter().map(|c| c.address).collect();
+        s.set_account(number, hash, changed, changes);
+    }
+
     /// A BAL's changes to `addresses`: a balance change each.
     fn touched(addresses: &[[u8; 20]]) -> Vec<BalAccountChange> {
         addresses
@@ -802,10 +824,10 @@ mod tests {
         // A run that starts over wants the BAL of its head only: nothing below it
         // can vouch for a proof made from now on.
         assert_eq!(s.bals_wanted(8), vec![(103, hash(103, 0), [103; 32])]);
-        s.set_account(101, &hash(101, 0), touched(&[B, A]));
-        s.set_account(102, &hash(102, 0), touched(&[]));
+        set_bal(&mut s, 101, &hash(101, 0), touched(&[B, A]));
+        set_bal(&mut s, 102, &hash(102, 0), touched(&[]));
         // A BAL for a block no longer kept under that hash changes nothing.
-        s.set_account(103, &hash(103, 1), touched(&[A]));
+        set_bal(&mut s, 103, &hash(103, 1), touched(&[A]));
         let r = s.report(99, 103, every);
         assert_eq!(r.account_gaps, vec![(100, 100), (103, 103)]);
         assert_eq!(
@@ -835,11 +857,26 @@ mod tests {
     }
 
     #[test]
+    fn bals_are_wanted_from_above_a_followed_proof_below_the_floor() {
+        let mut s = watching(&[A]);
+        // A proof at 104, just before the run started over at 107.
+        s.seed(A, 104, hash(104, 0), proven(1, &[5]));
+        s.install(run(100, 107, 0, hash(99, 0)), 107);
+        assert_eq!(s.bals_wanted(8).iter().map(|w| w.0).collect::<Vec<_>>(), vec![107, 106, 105]);
+        bals(&mut s, 105, 107, 0, none);
+        assert_eq!(s.followed_answer(&A, 107, 0, every).map(|a| a.number), Some(107));
+        // Unwatched, the floor is the run's own again.
+        s.apply(&[B], &[A]).unwrap();
+        s.install(run(108, 108, 0, hash(107, 0)), 108);
+        assert_eq!(s.bals_wanted(8).iter().map(|w| w.0).collect::<Vec<_>>(), vec![108]);
+    }
+
+    #[test]
     fn a_block_fetched_again_keeps_its_verified_bal_and_a_reorged_one_loses_it() {
         let mut s = watching(&[A]);
         s.install(run(100, 102, 0, hash(99, 0)), 102);
-        s.set_account(102, &hash(102, 0), touched(&[A]));
-        s.set_account(101, &hash(101, 0), touched(&[]));
+        set_bal(&mut s, 102, &hash(102, 0), touched(&[A]));
+        set_bal(&mut s, 101, &hash(101, 0), touched(&[]));
         // The next shallow window repeats the kept top.
         s.install(run(102, 103, 0, hash(101, 0)), 103);
         assert_eq!(s.report(101, 103, every).account_gaps, vec![(103, 103)]);
@@ -877,7 +914,7 @@ mod tests {
         let mut s = watching(&[A]);
         s.install(run(100, 102, 0, hash(99, 0)), 102);
         for n in 100..=102 {
-            s.set_account(n, &hash(n, 0), touched(&[]));
+            set_bal(&mut s, n, &hash(n, 0), touched(&[]));
         }
         assert!(s.report(99, 102, every).account_gaps.is_empty());
         assert_eq!(s.report(99, 102, |n, _| n <= 100).account_gaps, vec![(101, 102)]);
@@ -900,7 +937,7 @@ mod tests {
     /// Verify the BAL of every kept block `lo..=hi` on `fork`, with `at(n)`'s changes.
     fn bals(s: &mut ActivityState, lo: u64, hi: u64, fork: u8, at: impl Fn(u64) -> Vec<BalAccountChange>) {
         for n in lo..=hi {
-            s.set_account(n, &hash(n, fork), at(n));
+            set_bal(s, n, &hash(n, fork), at(n));
         }
     }
 
@@ -950,7 +987,7 @@ mod tests {
         bals(&mut s, 101, 104, 0, none);
         bals(&mut s, 106, 110, 0, none);
         assert_eq!(s.followed_answer(&A, 110, FOLLOW_MAX_LAG, every), None);
-        s.set_account(105, &hash(105, 0), none(105));
+        set_bal(&mut s, 105, &hash(105, 0), none(105));
         assert_eq!(s.followed_answer(&A, 110, 0, every).map(|a| a.number), Some(110));
     }
 
@@ -976,12 +1013,23 @@ mod tests {
         // when its BAL arrived.
         let mut s = watching(&[B]);
         s.install(run(100, 103, 0, hash(99, 0)), 103);
-        s.set_account(102, &hash(102, 0), vec![change(A, Some(&[7]), None)]);
+        set_bal(&mut s, 102, &hash(102, 0), vec![change(A, Some(&[7]), None)]);
         s.apply(&[A], &[]).unwrap();
         s.seed(A, 101, hash(101, 0), proven(1, &[5]));
-        s.set_account(103, &hash(103, 0), none(103));
+        set_bal(&mut s, 103, &hash(103, 0), none(103));
         assert_eq!(s.followed_answer(&A, 103, FOLLOW_MAX_LAG, every).map(|a| a.number), Some(101));
         assert_eq!(s.followed_answer(&A, 103, 1, every), None);
+
+        // A BAL whose values did not decode: its changed accounts are known,
+        // their values are not.
+        let mut s = watching(&[A]);
+        s.install(run(100, 102, 0, hash(99, 0)), 102);
+        s.seed(A, 100, hash(100, 0), proven(1, &[5]));
+        s.set_account(101, &hash(101, 0), vec![A], Vec::new());
+        s.set_account(102, &hash(102, 0), vec![B], Vec::new());
+        assert_eq!(s.followed_answer(&A, 102, FOLLOW_MAX_LAG, every).map(|a| a.number), Some(100));
+        assert_eq!(s.followed_answer(&A, 102, 1, every), None);
+        assert!(s.report(99, 102, every).touched.iter().any(|t| t.address == A && t.via == vec![Via::Account]));
 
         // A block before Amsterdam commits to no BAL.
         let mut s = watching(&[A]);
@@ -989,7 +1037,7 @@ mod tests {
         seg[2].bal_hash = None;
         s.install(seg, 102);
         s.seed(A, 100, hash(100, 0), proven(1, &[5]));
-        s.set_account(101, &hash(101, 0), none(101));
+        set_bal(&mut s, 101, &hash(101, 0), none(101));
         assert_eq!(s.followed_answer(&A, 102, 0, every), None);
     }
 

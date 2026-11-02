@@ -405,8 +405,37 @@ pub fn decode_block_access_lists(
 /// its accounts. `raw` is the BAL's RLP, `[[address, storage_changes,
 /// storage_reads, balance_changes, nonce_changes, code_changes], …]`; a shape
 /// other than that is an error, never a partial answer.
+///
+/// Deliberately looser than [`bal_account_changes`]: it reads only whether
+/// each change list is empty, so the touch report keeps covering a block
+/// whose change entries the value decoder refuses.
 pub fn bal_changed_accounts(raw: &[u8]) -> Result<Vec<[u8; 20]>, CoreError> {
-    Ok(bal_account_changes(raw)?.into_iter().map(|c| c.address).collect())
+    let mut out = Vec::new();
+    for account in rlp::View::new(raw)?.as_list()? {
+        let mut fields = account.as_list()?;
+        let address = fields.next().ok_or_else(|| CoreError("BAL: an account without an address".into()))?;
+        let mut a = [0u8; 20];
+        a.copy_from_slice(address.as_fixed_bytes(20)?);
+        let mut changed = false;
+        // storage_changes, storage_reads, balance_changes, nonce_changes, code_changes
+        for (k, name) in ["storage_changes", "storage_reads", "balance_changes", "nonce_changes", "code_changes"]
+            .into_iter()
+            .enumerate()
+        {
+            let list = fields.next().ok_or_else(|| CoreError(format!("BAL: an account without {name}")))?;
+            let non_empty = list.as_list()?.next().is_some();
+            if k != 1 && non_empty {
+                changed = true;
+            }
+        }
+        if fields.next().is_some() {
+            return Err(CoreError("BAL: an account with more than six fields".into()));
+        }
+        if changed {
+            out.push(a);
+        }
+    }
+    Ok(out)
 }
 
 /// What a block did to one account, by its block access list (EIP-7928): the
@@ -709,6 +738,8 @@ mod tests {
         for balance in [vec![idx_value(2, &[1]), idx_value(1, &[2])], vec![idx_value(1, &[1]), idx_value(1, &[2])]] {
             let bad = rlp::encode(&Item::List(vec![account(0x01, vec![], balance, vec![], vec![])]));
             assert!(bal_account_changes(&bad).is_err());
+            // The touch report still reads which accounts changed.
+            assert_eq!(bal_changed_accounts(&bad).unwrap(), vec![[1; 20]]);
         }
         // A slot change with no change, and a balance wider than a word.
         let empty_slot = Item::List(vec![Item::Bytes(vec![9]), Item::List(vec![])]);
