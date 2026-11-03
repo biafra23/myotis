@@ -232,8 +232,10 @@ impl TraceRecorder {
         }
     }
 
-    /// A call frame begins. `input` is its calldata.
-    pub fn call(&self, inputs: &CallInputs, input: Vec<u8>) {
+    /// A call frame begins. `input` yields its calldata, and is called only
+    /// when the frame is recorded: a `prestateTracer` run and `onlyTopCall`'s
+    /// inner frames need the depth and log bookkeeping, not a copy of the input.
+    pub fn call(&self, inputs: &CallInputs, input: impl FnOnce() -> Vec<u8>) {
         let mut st = self.state.borrow_mut();
         let depth = st.depth;
         st.depth += 1;
@@ -262,7 +264,7 @@ impl TraceRecorder {
             value,
             gas: inputs.gas_limit,
             gas_used: 0,
-            input,
+            input: input(),
             output: None,
             error: None,
             revert_reason: None,
@@ -448,6 +450,13 @@ fn clear_failed_logs(frame: &mut CallFrame, parent_failed: bool) {
 /// geth's error for a frame that ended with `result` (`core/vm/errors.go`).
 /// `op` and `stack_len` are the frame's last opcode and its stack height
 /// then, which geth's invalid-opcode and stack-fault messages name.
+///
+/// Where geth has no single string, the frame's error is this crate's own
+/// wording: a failed precompile carries the precompile's own message in geth
+/// (blake2f's `invalid input length`, …), but revm reduces every such halt to
+/// `PrecompileError` before an inspector sees the frame end, so it reads
+/// `precompile failed` here. Results no plain request reaches fall back to
+/// revm's name for them.
 pub(crate) fn error_string(result: InstructionResult, op: u8, stack_len: usize) -> String {
     use InstructionResult as R;
     let info = opcode::OPCODE_INFO[op as usize];
@@ -481,6 +490,7 @@ pub(crate) fn error_string(result: InstructionResult, op: u8, stack_len: usize) 
             }
             None => "stack overflow".into(),
         },
+        R::PrecompileError => "precompile failed".into(),
         other => format!("{other:?}"),
     }
 }
@@ -600,5 +610,7 @@ mod tests {
         // PUSH1 pops none and pushes one: the limit is 1023.
         assert_eq!(error_string(InstructionResult::StackOverflow, opcode::PUSH1, 1024), "stack limit reached 1024 (1023)");
         assert_eq!(error_string(InstructionResult::StateChangeDuringStaticCall, 0, 0), "write protection");
+        // revm drops the precompile's own message before the frame ends.
+        assert_eq!(error_string(InstructionResult::PrecompileError, 0, 0), "precompile failed");
     }
 }

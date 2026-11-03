@@ -111,7 +111,7 @@ impl<CTX: ContextTr> Inspector<CTX> for RequestInspector<'_> {
             code_needed.borrow_mut().insert(inputs.bytecode_address.into_array());
         }
         if let Some(trace) = self.trace {
-            trace.call(inputs, inputs.input.bytes(context).to_vec());
+            trace.call(inputs, || inputs.input.bytes(context).to_vec());
         }
         None
     }
