@@ -36,7 +36,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 52
+#define MYOTIS_ABI_VERSION 53
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -324,6 +324,21 @@ char *myotis_get_transaction_by_hash_json(int64_t handle,
  * any other hash in one header window anchored at the verified head. */
 char *myotis_resolve_block_hash_json(int64_t handle,
                                      const char *block_hash_hex);
+/* A transaction's raw consensus bytes (ABI >= 53): "0x..." as a JSON string
+ * (the EIP-2718 envelope for a typed transaction), found as
+ * myotis_get_transaction_by_hash_json finds the transaction (a verified block,
+ * or one of our own unmined broadcasts); the literal "null" (verified
+ * not-seen); {"error"}; or {"error","code":-32602} (malformed hash). */
+char *myotis_get_raw_transaction_by_hash_json(int64_t handle,
+                                              const char *tx_hash_hex);
+/* The raw bytes of the transaction at `index` of the block `selector` names (a
+ * tag, a 0x number or a 0x block hash; NULL = latest), from its
+ * transactionsRoot-verified body (ABI >= 53): "0x..." as a JSON string; the
+ * literal "null" (unknown or future block, or an index past its transactions);
+ * {"error"}; or {"error","code":-32602} (a selector no retry serves). */
+char *myotis_get_raw_transaction_by_block_json(int64_t handle,
+                                               const char *selector,
+                                               uint64_t index);
 /* Block JSON, the literal "null" (never-verified hash), or {"error"}.
  * full_transactions selects decoded tx objects over hashes. */
 char *myotis_get_block_by_hash_json(int64_t handle,

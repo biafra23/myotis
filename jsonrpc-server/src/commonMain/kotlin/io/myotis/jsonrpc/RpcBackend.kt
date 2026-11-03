@@ -243,6 +243,25 @@ interface RpcBackend {
     fun getBlockByHash(blockHash32: ByteArray, fullTransactions: Boolean): String?
 
     /**
+     * Whether this backend serves raw transactions ([getRawTransactionByHash],
+     * [getRawTransactionByBlock]; `io.myotis.api.VerifiedReads.supportsRawTransactions`,
+     * #715). Consulted BEFORE dispatch: on a backend that does not, the router
+     * refuses `eth_getRawTransaction*` (-32602) instead of waking an engine to be
+     * refused.
+     */
+    fun supportsRawTransactions(): Boolean = false
+
+    /** `eth_getRawTransactionByHash` (#715): the raw consensus bytes as a JSON
+     *  string `"0x…"`, the literal `"null"`, an `{"error"}` envelope, or null —
+     *  `io.myotis.api.VerifiedReads.getRawTransactionByHash`. Default: null. */
+    fun getRawTransactionByHash(txHash: ByteArray): String? = null
+
+    /** `eth_getRawTransactionByBlock{Number,Hash}AndIndex` (#715): as
+     *  [getRawTransactionByHash], for the transaction at [index] of the block
+     *  [blockSelector] names (a tag, a 0x number or a 0x block hash). Default: null. */
+    fun getRawTransactionByBlock(blockSelector: String, index: Long): String? = null
+
+    /**
      * The canonical block a block hash names (`io.myotis.api.VerifiedReads.resolveBlockHash`,
      * #641), for resolving a state read or an `eth_call` pinned to a hash: an object
      * carrying the block's `hash` and `number`, the literal `"null"` (no canonical block

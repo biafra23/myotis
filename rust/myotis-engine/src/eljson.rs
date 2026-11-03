@@ -502,6 +502,16 @@ fn tx_json_at(
     s
 }
 
+/// A verified raw transaction (`eth_getRawTransaction*`, #715) as its JSON
+/// value: the `0x`-hex consensus bytes as a JSON string, or the literal
+/// `null` (eth's verified "not seen" / no such index).
+pub fn raw_tx_json(raw: Option<&[u8]>) -> String {
+    match raw {
+        Some(bytes) => format!("\"{}\"", hex0x_var(bytes)),
+        None => "null".to_string(),
+    }
+}
+
 /// Serialize a verified `eth_getBlockReceipts` result: a JSON array whose
 /// elements are exactly the [`receipt_json`] objects (the Java
 /// `rpcGetBlockReceipts` emits the same per-element shape via
@@ -1795,7 +1805,16 @@ mod tests {
             header,
             tx_hashes: vec![[0xa1; 32], [0xb2; 32]],
             full_transactions: None,
+            raw_transactions: Default::default(),
         }
+    }
+
+    #[test]
+    fn raw_tx_json_is_a_hex_string_or_null() {
+        assert_eq!(raw_tx_json(Some(&[0x02, 0xf8, 0x6c])), "\"0x02f86c\"");
+        assert_eq!(raw_tx_json(None), "null");
+        let v: serde_json::Value = serde_json::from_str(&raw_tx_json(Some(&[0xc0]))).unwrap();
+        assert_eq!(v, "0xc0");
     }
 
     #[test]

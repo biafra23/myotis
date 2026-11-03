@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 52; // 52: account and call JSON carry the proven blockHash; 51: set_activity_watch + address_activity_json (#691); 50: dataUsage + networkMetering in the status, set_network_metering; 49: ens offchain envelope carries reverseClaim; 48: log-index topic entries (#673); 47: resolve_block_hash_json, get_proof_json takes a block hash; 46: get_proof_json; 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
+    static final int EXPECTED_ABI_VERSION = 53; // 53: get_raw_transaction_by_hash_json + get_raw_transaction_by_block_json (#715); 52: account and call JSON carry the proven blockHash; 51: set_activity_watch + address_activity_json (#691); 50: dataUsage + networkMetering in the status, set_network_metering; 49: ens offchain envelope carries reverseClaim; 48: log-index topic entries (#673); 47: resolve_block_hash_json, get_proof_json takes a block hash; 46: get_proof_json; 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
 
     private static final boolean AVAILABLE = load();
 
@@ -421,6 +421,18 @@ final class RustEngineNative {
     /** Verified {@code eth_getTransactionByHash} (tx JSON / "null" / error). */
     static String nativeGetTransactionByHashJson(long handle, String txHashHex) {
         return Myotis_engineKt.getTransactionByHashJson(handle, nz(txHashHex));
+    }
+
+    /** Verified {@code eth_getRawTransactionByHash} (ABI 53, #715): {@code "0x…"} as a JSON
+     *  string, the {@code "null"} literal, or an error envelope. */
+    static String nativeGetRawTransactionByHashJson(long handle, String txHashHex) {
+        return Myotis_engineKt.getRawTransactionByHashJson(handle, nz(txHashHex));
+    }
+
+    /** Verified {@code eth_getRawTransactionByBlock{Number,Hash}AndIndex} (ABI 53, #715):
+     *  {@code selector} is a tag, a 0x number or a 0x block hash. */
+    static String nativeGetRawTransactionByBlockJson(long handle, String selector, long index) {
+        return Myotis_engineKt.getRawTransactionByBlockJson(handle, nz(selector), index);
     }
 
     /** The canonical block a block hash names (ABI 47, #641): {@code {"hash","number"}},

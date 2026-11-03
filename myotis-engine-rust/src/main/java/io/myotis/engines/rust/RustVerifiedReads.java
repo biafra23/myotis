@@ -413,6 +413,34 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     @Override
+    public boolean supportsRawTransactions() {
+        return true;   // ABI 53 (#715)
+    }
+
+    @Override
+    public String getRawTransactionByHash(byte[] txHash) {
+        if (txHash == null || txHash.length != 32) return null;
+        try {
+            return handle.rawTransactionByHashJson(toHex(txHash));
+        } catch (RuntimeException e) {
+            log.info("[engines] raw transaction read unavailable: {}", e.getMessage());
+            return errJson(e);
+        }
+    }
+
+    @Override
+    public String getRawTransactionByBlock(String blockSelector, long index) {
+        if (index < 0) return null;
+        try {
+            String sel = (blockSelector == null || blockSelector.isBlank()) ? "latest" : blockSelector;
+            return handle.rawTransactionByBlockJson(sel, index);
+        } catch (RuntimeException e) {
+            log.info("[engines] raw transaction read unavailable: {}", e.getMessage());
+            return errJson(e);
+        }
+    }
+
+    @Override
     public String getLogs(String filterJson) {
         try {
             // Array or {"error": ...} — passed through verbatim; the router

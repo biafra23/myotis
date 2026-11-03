@@ -2797,6 +2797,89 @@ pub fn resolve_block_hash_json(handle: i64, block_hash_hex: &str) -> String {
     }
 }
 
+/// `nativeGetRawTransactionByHashJson` (ABI ≥ 53, #715): verified
+/// `eth_getRawTransactionByHash` — the transaction's raw consensus bytes (the
+/// EIP-2718 envelope for a typed one) as a JSON string `"0x…"`, found as
+/// [`get_transaction_by_hash_json`] finds the transaction (a verified block of
+/// the scanned chain, or one of our own unmined broadcasts); the literal
+/// `"null"` for a verified "not seen"; `{"error"}` when it cannot tell right
+/// now. A malformed hash is the permanent `{"error","code":-32602}`, judged
+/// before the handle lookup.
+pub fn get_raw_transaction_by_hash_json(handle: i64, tx_hash_hex: &str) -> String {
+    let Some(tx_hash) = parse_block_hash(tx_hash_hex) else {
+        return eljson::invalid_params_json("invalid transaction hash (expected 0x + 64 hex digits)");
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    match engine.rt.block_on(reader.request(async { reader.get_raw_transaction_by_hash(tx_hash).await })) {
+        Ok(raw) => eljson::raw_tx_json(raw.as_deref()),
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
+/// `nativeGetRawTransactionByBlockJson` (ABI ≥ 53, #715): verified
+/// `eth_getRawTransactionByBlock{Number,Hash}AndIndex` — the raw consensus
+/// bytes of the transaction at `index` of the block `selector` names (a tag, a
+/// `0x` number, or a `0x` 32-byte block hash, read as
+/// [`get_block_receipts_json`] reads it), from the block's
+/// `transactionsRoot`-verified body, as a JSON string `"0x…"`; the literal
+/// `"null"` for an unknown or future block, or an index past its
+/// transactions; `{"error"}` when it cannot tell right now. A selector no retry
+/// can serve (`safe`, `earliest`, malformed) is the permanent
+/// `{"error","code":-32602}`.
+pub fn get_raw_transaction_by_block_json(handle: i64, selector: &str, index: u64) -> String {
+    let selector = selector.trim();
+    let by_hash = selector.len() == 66 && (selector.starts_with("0x") || selector.starts_with("0X"));
+    let block_hash = if by_hash {
+        match parse_block_hash(selector) {
+            Some(h) => Some(h),
+            None => return eljson::invalid_params_json("invalid block hash (expected 32-byte hex)"),
+        }
+    } else {
+        None
+    };
+    let target = if block_hash.is_none() {
+        let tag = if selector.is_empty() { "latest" } else { selector };
+        match parse_block_target(tag) {
+            Ok(t) => Some(t),
+            Err(msg) => return eljson::invalid_params_json(msg),
+        }
+    } else {
+        None
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, _finalized_period, _wall_period) = match snapshot_reader(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    let outcome = match (block_hash, target) {
+        (Some(hash), _) => engine.rt.block_on(reader.request(async {
+            reader.get_raw_transaction_by_block_hash(hash, index).await
+        })),
+        (None, Some(target)) => {
+            let target = match resolve_block_target(target, reader.finalized_block_number()) {
+                Ok(t) => t,
+                Err(msg) => return eljson::error_json(&msg),
+            };
+            engine.rt.block_on(reader.request(async {
+                reader.get_raw_transaction_by_block(target, index).await
+            }))
+        }
+        (None, None) => return eljson::invalid_params_json("invalid block selector"),
+    };
+    match outcome {
+        Ok(raw) => eljson::raw_tx_json(raw.as_deref()),
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
 /// A block selector that is a block hash: exactly `0x` + 64 hex digits (either
 /// case, surrounding whitespace ignored) — the routers' own reading of one.
 fn parse_block_hash(selector: &str) -> Option<[u8; 32]> {

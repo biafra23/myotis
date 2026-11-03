@@ -612,6 +612,38 @@ pub unsafe extern "C" fn myotis_get_transaction_by_hash_json(
     into_c(crate::host::get_transaction_by_hash_json(handle, &tx_hash_hex))
 }
 
+/// Verified `eth_getRawTransactionByHash` (ABI ≥ 53, #715; the UniFFI
+/// `get_raw_transaction_by_hash_json` twin): `"0x…"`, the literal `"null"`,
+/// `{"error"}`, or `{"error","code":-32602}` for a malformed hash.
+///
+/// # Safety
+/// `tx_hash_hex` must be null or a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_get_raw_transaction_by_hash_json(
+    handle: i64,
+    tx_hash_hex: *const c_char,
+) -> *mut c_char {
+    let tx_hash_hex = read_string(tx_hash_hex).unwrap_or_default();
+    into_c(crate::host::get_raw_transaction_by_hash_json(handle, &tx_hash_hex))
+}
+
+/// Verified `eth_getRawTransactionByBlock{Number,Hash}AndIndex` (ABI ≥ 53,
+/// #715; the UniFFI `get_raw_transaction_by_block_json` twin): `selector` is a
+/// tag, a 0x number or a 0x block hash (NULL = latest); `"0x…"`, the literal
+/// `"null"`, `{"error"}`, or `{"error","code":-32602}`.
+///
+/// # Safety
+/// `selector` must be null or a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_get_raw_transaction_by_block_json(
+    handle: i64,
+    selector: *const c_char,
+    index: u64,
+) -> *mut c_char {
+    let selector = read_string(selector).unwrap_or_default();
+    into_c(crate::host::get_raw_transaction_by_block_json(handle, &selector, index))
+}
+
 /// The canonical block a block hash names (ABI ≥ 47, #641; the UniFFI
 /// `resolve_block_hash_json` twin): `{"hash","number"}`, the literal `"null"`,
 /// `{"error"}`, or `{"error","code":-32602}` for a malformed hash.
@@ -909,6 +941,22 @@ mod tests {
         assert_eq!(resolve(hash.as_ptr())["error"], "unknown handle");
         assert_eq!(resolve(null)["code"], -32602);
         assert_eq!(resolve(c"0xdead".as_ptr())["code"], -32602);
+        // The raw transaction reads (ABI 53, #715): a well-formed hash or
+        // selector reaches the handle lookup; a malformed one is refused for
+        // good, before it.
+        let raw_by_hash =
+            |h: *const c_char| parse(unsafe { take(myotis_get_raw_transaction_by_hash_json(i64::MIN, h)) });
+        assert_eq!(raw_by_hash(hash.as_ptr())["error"], "unknown handle");
+        assert_eq!(raw_by_hash(null)["code"], -32602);
+        assert_eq!(raw_by_hash(c"0xdead".as_ptr())["code"], -32602);
+        let raw_by_block = |s: *const c_char| {
+            parse(unsafe { take(myotis_get_raw_transaction_by_block_json(i64::MIN, s, 0)) })
+        };
+        assert_eq!(raw_by_block(null)["error"], "unknown handle");          // NULL = latest
+        assert_eq!(raw_by_block(c"0x10".as_ptr())["error"], "unknown handle");
+        assert_eq!(raw_by_block(hash.as_ptr())["error"], "unknown handle");
+        assert_eq!(raw_by_block(c"safe".as_ptr())["code"], -32602);
+        assert_eq!(raw_by_block(c"earliest".as_ptr())["code"], -32602);
     }
 
     /// How eth_call's `block` crosses the C ABI (#452): NULL is an absent
