@@ -7432,10 +7432,15 @@ impl ElReader {
     /// canonical block this node can place now. `Err` is "cannot tell right
     /// now" (no anchored head, no peer, every peer failed the window).
     pub async fn resolve_block_hash(&self, hash: [u8; 32]) -> Result<Option<u64>, String> {
+        // The head and the finalized block are placed with no I/O — and
+        // remembered like a window's find, so a by-hash read that follows a
+        // resolve (eth_getRawTransactionByBlockHashAndIndex, #715) knows them too.
         if let Some((number, _)) = self.anchor.optimistic_head().filter(|(_, h)| *h == hash) {
+            self.remember_block_number(hash, number);
             return Ok(Some(number));
         }
         if let Some(fin) = self.anchor.finalized_execution().filter(|f| f.block_hash == hash) {
+            self.remember_block_number(hash, fin.block_number);
             return Ok(Some(fin.block_number));
         }
         // Tip-lag tolerance as for `latest`: the window is anchored at the

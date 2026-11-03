@@ -3616,14 +3616,20 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      * now has that hash) | Java null (cannot tell right now).
      */
     private String rpcResolveBlockHash(byte[] hash) {
+        String key = "0x" + Bytes.wrap(hash).toUnprefixedHexString();
         BeaconSyncState bss = beaconSyncState;
         if (bss != null) {
+            // Placed with no I/O — and remembered like a window's find, so a by-hash
+            // read that follows a resolve (eth_getRawTransactionByBlockHashAndIndex,
+            // #715) knows the block too.
             BeaconSyncState.OptimisticExecution opt = bss.getOptimisticExecution();
             if (opt.blockNumber() > 0 && java.util.Arrays.equals(opt.blockHash(), hash)) {
+                blockHashToNumber.put(key, opt.blockNumber());
                 return resolvedBlockJson(hash, opt.blockNumber());
             }
             BeaconSyncState.FinalizedExecution fin = bss.getFinalizedExecution();
             if (fin.blockNumber() > 0 && java.util.Arrays.equals(fin.blockHash(), hash)) {
+                blockHashToNumber.put(key, fin.blockNumber());
                 return resolvedBlockJson(hash, fin.blockNumber());
             }
         }
@@ -3635,9 +3641,9 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             HeaderAnchor ahead = bss == null ? null : reAnchorForPin(anchor.number() + 1);
             if (ahead != null) anchor = ahead;
             if (java.util.Arrays.equals(anchor.blockHash(), hash)) {
+                blockHashToNumber.put(key, anchor.number());
                 return resolvedBlockJson(hash, anchor.number());
             }
-            String key = "0x" + Bytes.wrap(hash).toUnprefixedHexString();
             String anchorKey = "0x" + Bytes.wrap(anchor.blockHash()).toUnprefixedHexString();
             if (anchorKey.equals(unplacedBlockHashes.get(key))) return "null";
             long from = hashScanStart(anchor.number(), blockHashToNumber.get(key));
