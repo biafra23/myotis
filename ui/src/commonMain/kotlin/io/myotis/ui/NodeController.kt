@@ -300,7 +300,7 @@ data class AccountResult(
     val beaconChainVerified: Boolean,// peerStateRoot ties to a beacon-attested root
     val blsVerified: Boolean,        // the beacon match was BLS-signed
     val matchedBeaconSlot: Long,     // -1 when not matched
-    val verifyMethod: String?,       // "stateRootMatch" / "headerChain" / null
+    val verifyMethod: String?,       // "stateRootMatch" / "headerChain" / "blockAccessList" / null
     val failReason: String?,         // null when verified
     /** [blockNumber]'s own timestamp, unix seconds, when the engine PROVED it (the read
      *  ran against the beacon-attested block); -1 when none. The UI shows its age. */

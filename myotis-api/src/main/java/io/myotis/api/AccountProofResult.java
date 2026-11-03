@@ -25,11 +25,17 @@ import java.util.List;
  *                              anchored root (the preferred path since the #355
  *                              fix), the peer's head only on its fallback
  * @param peerStateRootHex      the peer's state root the proof was checked against
- * @param peerProofValid        the MPT proof verifies against {@code peerStateRoot}
+ * @param peerProofValid        the MPT proof verifies against {@code peerStateRoot}; for a
+ *                              "blockAccessList" answer, which fetched no proof, true: the
+ *                              state is the one an earlier verified proof established,
+ *                              carried to {@code peerStateRoot}'s block by verified BALs
  * @param beaconChainVerified   {@code peerStateRoot} ties to a beacon-attested root
  * @param blsVerified           the beacon match was BLS-signed
  * @param matchedBeaconSlot     slot of the matching beacon attestation; -1 if none
- * @param verifyMethod          "stateRootMatch" / "headerChain" / null
+ * @param verifyMethod          "stateRootMatch" / "headerChain" / "blockAccessList" (Rust
+ *                              engine: a watched account carried from an earlier proof
+ *                              by verified block access lists, no proof fetched — see
+ *                              docs/address-activity.md) / null
  * @param failReason            null when verified; otherwise a stable reason token
  *                              (e.g. "beaconNotSynced", "headerChainGapTooLarge")
  * @param accountHashHex        keccak256(address) — the snap trie key
