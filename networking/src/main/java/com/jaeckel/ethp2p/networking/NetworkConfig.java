@@ -513,9 +513,9 @@ public record NetworkConfig(
             // genesis_validators_root (Gnosis Beacon Chain)
             Bytes.fromHexString("f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47").toArrayUnsafe(),
             // @checkpoint:gnosis:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized gnosis block root (slot 30903280, 2026-11-01, period 3772)
-            Bytes.fromHexString("801ff671de60286e672762eb4df7aaf13354d6743ca73144df5a25b1db015581").toArrayUnsafe(),
-            30903280L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized gnosis block root (slot 30951184, 2026-11-03, period 3778)
+            Bytes.fromHexString("a4b4ddf17b887d23c9aab392bdc3965b4973cf079aff7c4d2b100c540b392491").toArrayUnsafe(),
+            30951184L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
             // @checkpoint:gnosis:end
             // Fork schedule — gnosischain/configs mainnet/config.yaml *_FORK_EPOCH /
             // *_FORK_VERSION, on 16-slot epochs. Fulu (0x06000064) active since epoch
