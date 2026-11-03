@@ -444,6 +444,10 @@ public record NetworkConfig(
             // owner decides. Run locally on zbox, the dead-pins cold start and the
             // old-anchor walk both reached SYNCED, the first time since Gloas.
             // Details in the Rust twin (SEPOLIA_STATIC_PEERS).
+            // Release check for v0.1.20-rc1 (2026-11-03), slot 11481280 (kept from
+            // v0.1.19): run 41739549063, 2 of 2, and both cold starts SYNCED — the
+            // first fully green Sepolia run since Gloas. This Nimbus had 41 of 60
+            // peers then. Details in the Rust twin (SEPOLIA_STATIC_PEERS).
             // Keep this list identical to SEPOLIA_STATIC_PEERS in
             // rust/myotis-net/src/sync.rs (both parity tests pin it).
             List.of(

@@ -824,6 +824,17 @@ const SEPOLIA_STATIC_PEERS: &[&str] = &[
     // old-anchor walk from oldest-servable.properties reached SYNCED in 75 s
     // from period 1323 (78 behind). The owner decides. The bootnodes seeded
     // discv5 (25 entries).
+    //
+    // Release check for v0.1.20-rc1 (2026-11-03), anchor slot 11481280 (the
+    // v0.1.19 one, kept), period 1401: run 41739549063, the first fully green
+    // Sepolia cold-start run since Gloas. 2 of 2 — both pins served the
+    // bootstrap, the verified period-1401 update and the current period 1403.
+    // This Nimbus had 41 of 60 peers connected, so the runner got a slot (same
+    // process as at v0.1.19, up since 2026-10-20: the cap fills and drains, it
+    // is not a one-way leak). The cold start with every pin unreachable
+    // reached SYNCED in 65 s, and the old-anchor walk from
+    // oldest-servable.properties reached SYNCED in 70 s from period 1323
+    // (80 behind).
     "/ip4/188.68.32.16/tcp/9104/p2p/16Uiu2HAkvYx58piGw1oxz34CUoeTv8nNQwTwE2cZZh4jR4wVMYy6",
 ];
 
