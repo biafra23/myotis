@@ -915,4 +915,24 @@ class RustVerifiedReadJsonTest {
         assertThrows(EngineException.class, () -> RustChainHandle.sendResultFromJson(
                 "{\"error\":\"no peer available to broadcast the transaction\"}"));
     }
+
+    // ---- debug_traceCall (traceFromJson, ABI 54, #716) ----
+
+    @Test
+    void trace_okCarriesTheTraceVerbatim_andEveryOtherStatusMaps() {
+        var ok = RustChainHandle.traceFromJson("{\"status\":\"ok\",\"trace\":{\"type\":\"CALL\",\"gas\":\"0x1\"},"
+                + "\"blockNumber\":1,\"verified\":false}");
+        assertEquals(io.myotis.api.TraceResult.Status.OK, ok.status());
+        assertEquals("{\"type\":\"CALL\",\"gas\":\"0x1\"}", ok.traceJson());
+        var infeasible = RustChainHandle.traceFromJson("{\"status\":\"infeasible\",\"reason\":\"out of gas\",\"blockNumber\":1}");
+        assertEquals(io.myotis.api.TraceResult.Status.INFEASIBLE, infeasible.status());
+        assertEquals("out of gas", infeasible.detail());
+        var unavailable = RustChainHandle.traceFromJson("{\"status\":\"unavailable\",\"reason\":\"no snap peer\"}");
+        assertEquals(io.myotis.api.TraceResult.Status.UNAVAILABLE, unavailable.status());
+        var refused = RustChainHandle.traceFromJson("{\"error\":\"the tracer '4byteTracer' is not served\",\"code\":-32602}");
+        assertEquals(io.myotis.api.TraceResult.Status.REFUSED, refused.status());
+        // A plain error throws (→ unavailable at the adapter); an ok without a trace is drift.
+        assertThrows(EngineException.class, () -> RustChainHandle.traceFromJson("{\"error\":\"node is not running\"}"));
+        assertThrows(EngineException.class, () -> RustChainHandle.traceFromJson("{\"status\":\"ok\"}"));
+    }
 }

@@ -381,7 +381,13 @@ uniffi::setup_scaffolding!();
 ///      `transactionsRoot`-verified body. An additive function pair — bumped
 ///      so a host that serves `eth_getRawTransaction*` is never paired with an
 ///      engine that lacks them.
-pub const ABI_VERSION: i32 = 53;
+/// v54: `debug_traceCall` (#716). `debug_trace_call_json` (UniFFI and the C
+///      ABI: `myotis_debug_trace_call_json`): the run `eth_call_tx_json` makes
+///      for a transaction object, seen through geth's `callTracer` or
+///      `prestateTracer`, as `{"status":"ok","trace":…}`. An additive function
+///      — bumped so a host that serves `debug_traceCall` is never paired with
+///      an engine that lacks it.
+pub const ABI_VERSION: i32 = 54;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

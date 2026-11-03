@@ -41,7 +41,7 @@ use crate::el::eth::session::EthConfig;
 use crate::el::feecache::{BlockRewards, BlockTips, FeeCache, Head, HistoryShape, Lookup};
 use crate::el::evm::{
     block_context, ReadAnchor, AccessListAnswer, AccessListOutcome, CallAnswer, CallOutcome, EnsOutcome, EnsQuery, EnsQueryOutcome,
-    EnsRecordValue, EnsRootMode, GasOutcome, PoolOracle,
+    EnsRecordValue, EnsRootMode, GasOutcome, PoolOracle, TraceAnswer, TraceOutcome,
 };
 use crate::el::peer::{Coverage, ManagedPeer};
 use crate::el::pool::{Enode, PeerPool, PoolConfig};
@@ -7180,6 +7180,46 @@ impl ElReader {
         .await?;
         Ok(AccessListAnswer {
             outcome: AccessListOutcome::from_executor(joined),
+            block_number,
+            finalized: anchor == ReadAnchor::Finalized,
+        })
+    }
+
+    /// `debug_traceCall` (#716): the run [`Self::eth_call_tx`] makes for `tx`,
+    /// at the block `anchor` names, seen through `tracer` (geth's `callTracer`
+    /// or `prestateTracer`; `myotis_evm::trace`). The request is checked as the
+    /// call checks it; a run that reverts or halts is a trace, not a failure.
+    pub async fn trace_call(
+        &self,
+        anchor: ReadAnchor,
+        tx: myotis_evm::TxRequest,
+        chain_id: u64,
+        overrides: myotis_evm::overrides::StateOverrides,
+        tracer: myotis_evm::trace::Tracer,
+    ) -> Result<TraceAnswer, String> {
+        self.request(self.trace_call_inner(anchor, tx, chain_id, overrides, tracer)).await
+    }
+
+    async fn trace_call_inner(
+        &self,
+        anchor: ReadAnchor,
+        tx: myotis_evm::TxRequest,
+        chain_id: u64,
+        overrides: myotis_evm::overrides::StateOverrides,
+        tracer: myotis_evm::trace::Tracer,
+    ) -> Result<TraceAnswer, String> {
+        let started = Instant::now();
+        let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "traceCall").await?;
+        let setup = started.elapsed();
+        let block_number = ctx.block_number;
+        let joined = super::request::blocking(move || {
+            let joined = executor.trace_call(&tx, &ctx, overrides, tracer);
+            log_call_cost("debug_traceCall", false, setup, started.elapsed(), &executor.cost(), joined.as_ref().err());
+            joined
+        })
+        .await?;
+        Ok(TraceAnswer {
+            outcome: TraceOutcome::from_executor(joined),
             block_number,
             finalized: anchor == ReadAnchor::Finalized,
         })

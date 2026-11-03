@@ -38,7 +38,12 @@ use revm::primitives::hardfork::SpecId;
 use revm::precompile::{PrecompileSpecId, Precompiles};
 use revm::primitives::{Address, Bytes, TxKind, B256, U256};
 use revm::{Context, InspectEvm, Inspector, MainBuilder, MainContext};
-use revm::interpreter::{CallInputs, CallOutcome, Interpreter, InterpreterAction, InterpreterResult, InstructionResult};
+use revm::interpreter::{
+    CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter, InterpreterAction, InterpreterResult,
+    InstructionResult,
+};
+use revm::context_interface::ContextTr;
+use revm::primitives::Log;
 use revm::interpreter::interpreter_types::{Jumps, LoopControl};
 
 /// The accounts whose code a discovery pass needed (see [`RequestInspector`]).
@@ -58,9 +63,21 @@ struct RequestInspector<'a> {
     /// Records, for `eth_createAccessList`, every address and storage key the
     /// run touches ([`AccessListRecorder`]). `None` on every other run.
     access_list: Option<&'a AccessListRecorder>,
+    /// Records, for `debug_traceCall`, the tracer's view of the run
+    /// ([`TraceRecorder`]). `None` on every other run.
+    trace: Option<&'a TraceRecorder>,
 }
 
-impl<CTX> Inspector<CTX> for RequestInspector<'_> {
+/// The recorders a run carries beyond the request's own bookkeeping: each one
+/// is reset at the start of every run the prefetch loop makes, so what it
+/// holds when the loop settles is the returned run's.
+#[derive(Clone, Copy, Default)]
+struct Recorders<'a> {
+    access_list: Option<&'a AccessListRecorder>,
+    trace: Option<&'a TraceRecorder>,
+}
+
+impl<CTX: ContextTr> Inspector<CTX> for RequestInspector<'_> {
     fn step(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
         if self.oracle.check_request().is_err() {
             interp.bytecode.set_action(InterpreterAction::Return(InterpreterResult {
@@ -84,13 +101,50 @@ impl<CTX> Inspector<CTX> for RequestInspector<'_> {
         if let Some(recorder) = self.access_list {
             recorder.record(interp);
         }
+        if let Some(trace) = self.trace {
+            trace.step(interp);
+        }
     }
 
-    fn call(&mut self, _context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
+    fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
         if let Some(code_needed) = self.code_needed {
             code_needed.borrow_mut().insert(inputs.bytecode_address.into_array());
         }
+        if let Some(trace) = self.trace {
+            trace.call(inputs, || inputs.input.bytes(context).to_vec());
+        }
         None
+    }
+
+    fn call_end(&mut self, _context: &mut CTX, _inputs: &CallInputs, outcome: &mut CallOutcome) {
+        if let Some(trace) = self.trace {
+            trace.end(&outcome.result, None);
+        }
+    }
+
+    fn create(&mut self, _context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
+        if let Some(trace) = self.trace {
+            trace.create(inputs);
+        }
+        None
+    }
+
+    fn create_end(&mut self, _context: &mut CTX, _inputs: &CreateInputs, outcome: &mut CreateOutcome) {
+        if let Some(trace) = self.trace {
+            trace.end(&outcome.result, outcome.address);
+        }
+    }
+
+    fn log(&mut self, _context: &mut CTX, log: Log) {
+        if let Some(trace) = self.trace {
+            trace.log(&log);
+        }
+    }
+
+    fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
+        if let Some(trace) = self.trace {
+            trace.selfdestruct(contract, target, value);
+        }
     }
 }
 
@@ -220,6 +274,7 @@ use crate::error::EvmError;
 use crate::fork::spec_for;
 use crate::oracle::{OracleError, SnapStateOracle};
 use crate::overrides::StateOverrides;
+use crate::trace::{PrestateAccount, Trace, TraceRecorder, Tracer};
 use crate::tx::{AccessListItem, Fees, TxRequest, TYPE_DYNAMIC_FEE, TYPE_LEGACY, TYPE_SET_CODE};
 
 /// The gas a view call is given — the mainnet block gas limit. Also set as the
@@ -526,7 +581,7 @@ impl EvmExecutor {
         // passes fetch what the run touches in parallel waves. A single real
         // run fetched each miss one round-trip at a time — the 4–33 s #532
         // measured. The search's probes below then run on what it fetched.
-        let run = self.converge(&db, spec, tx, hi, ctx, PREFETCH_ITERATION_CAP, None).map_err(|e| match e {
+        let run = self.converge(&db, spec, tx, hi, ctx, PREFETCH_ITERATION_CAP, Recorders::default()).map_err(|e| match e {
             // The intrinsic cost or the EIP-7623 floor above the ceiling: for an
             // estimate that is the caller's allowance talking, exactly like
             // running out of gas during execution — geth answers the same.
@@ -809,7 +864,15 @@ impl EvmExecutor {
             listed.access_list = Some(current.clone());
             let recorder = AccessListRecorder::new(&current, excluded.clone());
             let result = self
-                .converge(&db, spec, &listed, gas_limit, ctx, PREFETCH_ITERATION_CAP, Some(&recorder))
+                .converge(
+                    &db,
+                    spec,
+                    &listed,
+                    gas_limit,
+                    ctx,
+                    PREFETCH_ITERATION_CAP,
+                    Recorders { access_list: Some(&recorder), trace: None },
+                )
                 .map_err(|error| before_the_run(gas_limit, error))?;
             let next = recorder.items();
             if next != current {
@@ -833,6 +896,116 @@ impl EvmExecutor {
             return Ok(CreatedAccessList { access_list: current, gas_used, error });
         }
         Err(EvmError::AccessListNotSettled { rounds })
+    }
+
+    /// `debug_traceCall` (#716): the run [`Self::call_tx`] makes for `tx` at
+    /// `ctx` — the same request checks, the same gas limit, the same prefetch
+    /// loop, `overrides` layered over verified state — seen through `tracer`
+    /// (geth's `callTracer` or `prestateTracer`; [`crate::trace`]).
+    ///
+    /// A run that reverts or halts is an answer here, as in geth: the trace
+    /// carries the failure. What [`Self::call_tx`] refuses before the run (an
+    /// infeasible request, a `gas` above the budget whose run runs out there)
+    /// is refused the same way.
+    pub fn trace_call(
+        &self,
+        tx: &TxRequest,
+        ctx: &BlockContext,
+        overrides: StateOverrides,
+        tracer: Tracer,
+    ) -> Result<Trace, EvmError> {
+        // A trace names its gas — the top frame's limit, each callee's share,
+        // every GAS read — so a `gas` above the budget is refused rather than
+        // traced at the budget: that would be another transaction's trace.
+        if let Some(gas) = tx.gas.filter(|gas| *gas > VIEW_CALL_GAS) {
+            return Err(EvmError::CallBudgetExceeded { budget: VIEW_CALL_GAS, requested: gas });
+        }
+        let (spec, db, gas_limit) = self.prepare_tx_call(tx, ctx, overrides)?;
+        let recorder = TraceRecorder::new(tracer);
+        let result = self
+            .converge(
+                &db,
+                spec,
+                tx,
+                gas_limit,
+                ctx,
+                PREFETCH_ITERATION_CAP,
+                Recorders { access_list: None, trace: Some(&recorder) },
+            )
+            .map_err(|error| before_the_run(gas_limit, error))?;
+        match recorder.tracer() {
+            Tracer::Call { .. } => recorder
+                .call_tree(gas_limit, result.tx_gas_used())
+                .map(|frame| Trace::Call(Box::new(frame)))
+                .ok_or_else(|| EvmError::InvalidRequest { detail: "the run recorded no call frame".into() }),
+            Tracer::Prestate { disable_code, disable_storage, include_empty } => {
+                let touched = recorder.touched();
+                let from = Address::from(tx.from);
+                let created = match tx.to {
+                    Some(_) => None,
+                    None => Some(from.create(db.basic_ref(from)?.map_or(0, |account| account.nonce))),
+                };
+                let mut accounts: BTreeSet<Address> = touched.accounts;
+                accounts.extend(crate::trace::tx_start_accounts(tx, created, Address::from(ctx.coinbase)));
+                // An account a call reached (or the transaction's recipient)
+                // that holds an EIP-7702 delegation brings its delegate, from
+                // Prague on — geth's lookup.
+                if spec.is_enabled_in(SpecId::PRAGUE) {
+                    let mut reached = touched.call_targets;
+                    reached.extend(tx.to.map(Address::from));
+                    for address in reached {
+                        if let Some(delegate) = self.delegate_of(&db, address)? {
+                            accounts.insert(delegate);
+                        }
+                    }
+                }
+                let mut out = BTreeMap::new();
+                for address in accounts {
+                    let info = db.basic_ref(address)?.unwrap_or_default();
+                    let code = if info.code_hash == revm::primitives::KECCAK_EMPTY || info.code_hash == B256::ZERO {
+                        Vec::new()
+                    } else {
+                        db.code_by_hash_ref(info.code_hash)?.original_bytes().to_vec()
+                    };
+                    let exists = info.nonce > 0 || !code.is_empty() || !info.balance.is_zero();
+                    if !exists && !include_empty {
+                        continue;
+                    }
+                    let storage = if disable_storage {
+                        None
+                    } else {
+                        let mut slots = BTreeMap::new();
+                        for slot in touched.slots.get(&address).into_iter().flatten() {
+                            let value = db.storage_ref(address, U256::from_be_bytes(slot.0))?;
+                            slots.insert(slot.0, value.to_be_bytes::<32>());
+                        }
+                        Some(slots)
+                    };
+                    let code_hash = (!code.is_empty()).then_some(info.code_hash.0);
+                    out.insert(
+                        address.into_array(),
+                        PrestateAccount {
+                            balance: info.balance,
+                            nonce: info.nonce,
+                            code: (!code.is_empty() && !disable_code).then_some(code),
+                            code_hash,
+                            storage,
+                        },
+                    );
+                }
+                Ok(Trace::Prestate(out))
+            }
+        }
+    }
+
+    /// The account `address`'s EIP-7702 delegate, when its code is a
+    /// delegation designator (`0xef0100 ‖ address`).
+    fn delegate_of(&self, db: &OracleDatabase, address: Address) -> Result<Option<Address>, EvmError> {
+        let Some(info) = db.basic_ref(address)? else { return Ok(None) };
+        if info.code_hash == revm::primitives::KECCAK_EMPTY || info.code_hash == B256::ZERO {
+            return Ok(None);
+        }
+        Ok(db.code_by_hash_ref(info.code_hash)?.eip7702_address())
     }
 
     fn database_for_with(&self, ctx: &BlockContext, overrides: StateOverrides) -> OracleDatabase {
@@ -864,7 +1037,7 @@ impl EvmExecutor {
         gas_limit: u64,
         ctx: &BlockContext,
     ) -> Result<ExecutionResult, EvmError> {
-        self.execute_recording(db, spec, tx, gas_limit, ctx, None, None)
+        self.execute_recording(db, spec, tx, gas_limit, ctx, None, Recorders::default())
     }
 
     /// [`Self::execute_with_db`], recording the accounts whose code the run
@@ -881,13 +1054,16 @@ impl EvmExecutor {
         gas_limit: u64,
         ctx: &BlockContext,
         code_needed: Option<&CodeNeeded>,
-        access_list: Option<&AccessListRecorder>,
+        recorders: Recorders<'_>,
     ) -> Result<ExecutionResult, EvmError> {
         self.oracle.check_request()?;
         self.runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let cfg = view_cfg(spec, ctx.chain_id);
         let tx = tx_env(tx, gas_limit, ctx.chain_id)?;
-        if let Some(recorder) = access_list {
+        if let Some(recorder) = recorders.access_list {
+            recorder.reset();
+        }
+        if let Some(recorder) = recorders.trace {
             recorder.reset();
         }
 
@@ -898,7 +1074,8 @@ impl EvmExecutor {
             .build_mainnet_with_inspector(RequestInspector {
                 oracle: self.oracle.as_ref(),
                 code_needed,
-                access_list,
+                access_list: recorders.access_list,
+                trace: recorders.trace,
             });
 
         let result = evm.inspect_tx(tx);
@@ -983,7 +1160,7 @@ impl EvmExecutor {
         ctx: &BlockContext,
         cap: usize,
     ) -> Result<Vec<u8>, EvmError> {
-        self.converge(db, spec, tx, gas_limit, ctx, cap, None).and_then(finish_call)
+        self.converge(db, spec, tx, gas_limit, ctx, cap, Recorders::default()).and_then(finish_call)
     }
 
     /// The convergence loop itself: the converged run's whole result — its
@@ -1000,7 +1177,7 @@ impl EvmExecutor {
         gas_limit: u64,
         ctx: &BlockContext,
         cap: usize,
-        access_list: Option<&AccessListRecorder>,
+        recorders: Recorders<'_>,
     ) -> Result<ExecutionResult, EvmError> {
         // Prime the target's account + code synchronously (sentinel OFF, not
         // access-tracked — Java parity) so iteration 0 executes real top-level
@@ -1028,7 +1205,7 @@ impl EvmExecutor {
             let misses_before = db.sentinel_misses();
             let code_needed = CodeNeeded::default();
             let outcome =
-                self.execute_recording(db, spec, tx, gas_limit, ctx, sentinel.then_some(&code_needed), access_list);
+                self.execute_recording(db, spec, tx, gas_limit, ctx, sentinel.then_some(&code_needed), recorders);
             db.set_sentinel(false);
             let fresh = db.take_access_set().minus(&seen);
 
@@ -1475,8 +1652,8 @@ mod tests {
     #[test]
     fn cancelled_instruction_sets_stop_without_running_bytecode() {
         let mut interpreter = Interpreter::default_ext();
-        RequestInspector { oracle: &CancelledOracle, code_needed: None, access_list: None }
-            .step(&mut interpreter, &mut ());
+        RequestInspector { oracle: &CancelledOracle, code_needed: None, access_list: None, trace: None }
+            .step(&mut interpreter, &mut Context::mainnet());
         assert!(interpreter.bytecode.action().is_some());
     }
 
@@ -2937,6 +3114,262 @@ mod tests {
         let mut key = [0u8; 32];
         key[31] = byte;
         key
+    }
+
+    // ---- debug_traceCall (#716) --------------------------------------------
+
+    fn traced(exec: &EvmExecutor, tx: &TxRequest, tracer: Tracer) -> Trace {
+        exec.trace_call(tx, &ctx(19_500_000, CANCUN_TIME + 1), StateOverrides::new(), tracer).unwrap()
+    }
+
+    fn call_tree(exec: &EvmExecutor, tx: &TxRequest, only_top_call: bool, with_log: bool) -> crate::trace::CallFrame {
+        match traced(exec, tx, Tracer::Call { only_top_call, with_log }) {
+            Trace::Call(frame) => *frame,
+            other => panic!("not a call tree: {other:?}"),
+        }
+    }
+
+    /// PUSH1 0; PUSH1 0; LOG0 — an empty log.
+    const LOG0: [u8; 5] = [0x60, 0x00, 0x60, 0x00, 0xa0];
+
+    /// STATICCALL `address` with no data and all remaining gas; POP the result.
+    fn staticcall_to(address: [u8; 20]) -> Vec<u8> {
+        let mut code = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73];
+        code.extend_from_slice(&address);
+        code.extend_from_slice(&[0x5a, 0xfa, 0x50]);
+        code
+    }
+
+    /// REVERT with `Panic(0x11)` (arithmetic underflow or overflow) as the payload.
+    fn revert_panic_0x11() -> Vec<u8> {
+        let mut code = vec![0x7f, 0x4e, 0x48, 0x7b, 0x71];
+        code.extend_from_slice(&[0u8; 28]);
+        code.extend_from_slice(&[0x60, 0x00, 0x52, 0x60, 0x11, 0x60, 0x04, 0x52, 0x60, 0x24, 0x60, 0x00, 0xfd]);
+        code
+    }
+
+    /// geth's callTracer: one frame per call, the top one with the
+    /// transaction's limit and gas used, a STATICCALL without a value, and each
+    /// log with the run's index and its position among the frame's sub-calls.
+    #[test]
+    fn trace_call_records_the_call_tree_with_its_logs() {
+        let mut target = LOG0.to_vec();
+        target.extend(call_to(OTHER));
+        target.extend(staticcall_to(THIRD));
+        target.extend(LOG0);
+        target.push(0x00);
+        let mut other = LOG0.to_vec();
+        other.push(0x00);
+        let exec = executor_with_accounts(&[(TARGET, target.clone(), U256::ZERO, 1), (OTHER, other, U256::ZERO, 1)]);
+        let mut tx = TxRequest::call(SENDER, Some(TARGET), Bytes::from(vec![0xab]), U256::ZERO);
+        tx.gas = Some(1_000_000);
+
+        let root = call_tree(&exec, &tx, false, true);
+        assert_eq!(root.kind, crate::trace::FrameKind::Call);
+        assert_eq!((root.from, root.to, root.value), (SENDER, Some(TARGET), Some(U256::ZERO)));
+        assert_eq!(root.input, vec![0xab]);
+        assert_eq!(root.gas, 1_000_000, "the top frame's gas is the transaction's limit");
+        let run = exec.run_tx(&tx, 1_000_000, &ctx(19_500_000, CANCUN_TIME + 1), StateOverrides::new()).unwrap();
+        assert_eq!(root.gas_used, run.tx_gas_used(), "and its gas used the transaction's");
+        assert!(root.error.is_none() && root.output.is_none());
+
+        assert_eq!(root.calls.len(), 2);
+        let (call, staticcall) = (&root.calls[0], &root.calls[1]);
+        assert_eq!(call.kind, crate::trace::FrameKind::Call);
+        assert_eq!((call.from, call.to, call.value), (TARGET, Some(OTHER), Some(U256::ZERO)));
+        assert!(call.gas > 0 && call.gas_used > 0 && call.gas_used < call.gas);
+        assert_eq!(staticcall.kind, crate::trace::FrameKind::StaticCall);
+        assert_eq!((staticcall.to, staticcall.value), (Some(THIRD), None), "a STATICCALL carries no value");
+        assert_eq!(staticcall.gas_used, 0, "a call to an account without code runs nothing");
+
+        // TARGET's logs: before any call, and after both.
+        let positions: Vec<(u64, u64)> = root.logs.iter().map(|l| (l.index, l.position)).collect();
+        assert_eq!(positions, vec![(0, 0), (2, 2)]);
+        assert_eq!(root.logs[0].address, TARGET);
+        assert_eq!((call.logs[0].index, call.logs[0].position, call.logs[0].address), (1, 0, OTHER));
+
+        // A gas above the budget would be traced at the budget — another
+        // transaction's trace — so it is refused.
+        let mut above = tx.clone();
+        above.gas = Some(VIEW_CALL_GAS + 1);
+        let refused = exec.trace_call(&above, &ctx(19_500_000, CANCUN_TIME + 1), StateOverrides::new(), Tracer::Call {
+            only_top_call: false,
+            with_log: false,
+        });
+        assert!(matches!(refused, Err(EvmError::CallBudgetExceeded { .. })), "{refused:?}");
+
+        // Without withLog, no logs; with onlyTopCall, no sub-calls.
+        assert!(call_tree(&exec, &tx, false, false).logs.is_empty());
+        let top = call_tree(&exec, &tx, true, true);
+        assert!(top.calls.is_empty());
+        assert_eq!(top.logs.iter().map(|l| (l.index, l.position)).collect::<Vec<_>>(), vec![(0, 0), (2, 0)]);
+    }
+
+    /// A reverted frame keeps its payload and geth's decoded reason, loses its
+    /// logs, and the logs after it take the indexes it gave back.
+    #[test]
+    fn trace_call_reports_a_reverted_frame_as_geth_does() {
+        let mut target = call_to(OTHER);
+        target.extend(LOG0);
+        target.push(0x00);
+        let mut other = LOG0.to_vec();
+        other.extend(revert_panic_0x11());
+        let exec = executor_with_accounts(&[(TARGET, target, U256::ZERO, 1), (OTHER, other, U256::ZERO, 1)]);
+        let tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+
+        let root = call_tree(&exec, &tx, false, true);
+        assert!(root.error.is_none(), "the caller survives its callee's revert");
+        let child = &root.calls[0];
+        assert_eq!(child.error.as_deref(), Some("execution reverted"));
+        assert_eq!(child.revert_reason.as_deref(), Some("arithmetic underflow or overflow"));
+        assert_eq!(child.output.as_ref().map(Vec::len), Some(36));
+        assert!(child.logs.is_empty(), "a failed frame's logs are cleared");
+        assert_eq!(root.logs.iter().map(|l| (l.index, l.position)).collect::<Vec<_>>(), vec![(0, 1)]);
+
+        // A failing top frame: the error is the trace's, not the request's.
+        let failing = executor_with_accounts(&[(TARGET, revert_panic_0x11(), U256::ZERO, 1)]);
+        let top = call_tree(&failing, &tx, false, false);
+        assert_eq!(top.error.as_deref(), Some("execution reverted"));
+        assert_eq!(top.revert_reason.as_deref(), Some("arithmetic underflow or overflow"));
+    }
+
+    /// A creation's top frame is a CREATE to the new contract's address, with
+    /// the deployed code as its output.
+    #[test]
+    fn trace_call_of_a_creation_names_the_new_contract() {
+        // PUSH1 0; PUSH1 0; MSTORE8; PUSH1 1; PUSH1 0; RETURN — deploys `0x00`.
+        let init = vec![0x60, 0x00, 0x60, 0x00, 0x53, 0x60, 0x01, 0x60, 0x00, 0xf3];
+        let exec = executor_with_accounts(&[]);
+        let tx = TxRequest::call(SENDER, None, Bytes::from(init.clone()), U256::ZERO);
+        let root = call_tree(&exec, &tx, false, false);
+        assert_eq!(root.kind, crate::trace::FrameKind::Create);
+        assert_eq!(root.to, Some(Address::from(SENDER).create(0).into_array()));
+        assert_eq!(root.input, init);
+        assert_eq!(root.output, Some(vec![0x00]));
+    }
+
+    /// geth's prestateTracer: the accounts and slots the run touched, as they
+    /// stood before it, plus the sender, the recipient and the coinbase — an
+    /// account that did not exist is left out unless includeEmpty asks for it.
+    #[test]
+    fn trace_call_prestate_lists_what_the_run_touched_before_it_ran() {
+        let mut target = sload(1);
+        target.extend(balance_of(THIRD));
+        target.extend(call_to(OTHER));
+        target.push(0x00);
+        let other = vec![0x00];
+        let mut fx = FixtureSnapStateOracle::new();
+        let target_hash = fx.with_bytecode(target.clone());
+        let other_hash = fx.with_bytecode(other.clone());
+        let fx = fx
+            .with_account(ROOT, SENDER, OracleAccount { nonce: 3, balance: U256::from(100), code_hash: EMPTY_CODE_HASH, storage_root: [0x9; 32] })
+            .with_account(ROOT, TARGET, OracleAccount { nonce: 1, balance: U256::ZERO, code_hash: target_hash, storage_root: [0x9; 32] })
+            .with_account(ROOT, OTHER, OracleAccount { nonce: 1, balance: U256::ZERO, code_hash: other_hash, storage_root: [0x9; 32] })
+            .with_account(ROOT, THIRD, OracleAccount { nonce: 0, balance: U256::from(7), code_hash: EMPTY_CODE_HASH, storage_root: [0x9; 32] })
+            .with_storage(ROOT, TARGET, slot_key(1), U256::from(5));
+        let exec = EvmExecutor::new(Arc::new(fx), Arc::new(NoopStateProofCache), Arc::new(NoopBytecodeCache));
+        let tx = TxRequest::call(SENDER, Some(TARGET), Bytes::new(), U256::ZERO);
+
+        let prestate = |disable_code, disable_storage, include_empty| match traced(
+            &exec,
+            &tx,
+            Tracer::Prestate { disable_code, disable_storage, include_empty },
+        ) {
+            Trace::Prestate(map) => map,
+            other => panic!("not a prestate: {other:?}"),
+        };
+        let pre = prestate(false, false, false);
+        assert_eq!(pre.keys().copied().collect::<Vec<_>>(), {
+            let mut keys = vec![TARGET, SENDER, OTHER, THIRD];
+            keys.sort();
+            keys
+        });
+        let target_pre = &pre[&TARGET];
+        assert_eq!(target_pre.code.as_deref(), Some(target.as_slice()));
+        assert_eq!(target_pre.code_hash, Some(target_hash));
+        assert_eq!(target_pre.nonce, 1);
+        assert_eq!(target_pre.storage.as_ref().unwrap()[&slot_key(1)], U256::from(5).to_be_bytes::<32>());
+        assert_eq!((pre[&SENDER].balance, pre[&SENDER].nonce), (U256::from(100), 3));
+        assert_eq!((pre[&THIRD].balance, pre[&THIRD].code_hash), (U256::from(7), None));
+        assert!(pre[&OTHER].storage.as_ref().unwrap().is_empty());
+
+        // The options: no code, no storage, and the coinbase that does not exist.
+        let bare = prestate(true, true, true);
+        assert!(bare[&TARGET].code.is_none() && bare[&TARGET].code_hash.is_some() && bare[&TARGET].storage.is_none());
+        assert!(bare.contains_key(&[0x22; 20]), "includeEmpty keeps the coinbase that does not exist");
+    }
+
+    /// A recorded callTracer answer (`want`, geth's JSON) against a traced frame,
+    /// field by field, gas included.
+    fn assert_frame_matches(frame: &crate::trace::CallFrame, want: &serde_json::Value, path: &str) {
+        let field = |key: &str| want.get(key).and_then(|v| v.as_str()).map(str::to_string);
+        let hex_of = |bytes: &[u8]| format!("0x{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        let q = |v: u64| format!("0x{v:x}");
+        assert_eq!(Some(frame.kind.name().to_string()), field("type"), "{path}.type");
+        assert_eq!(Some(hex_of(&frame.from)), field("from"), "{path}.from");
+        assert_eq!(frame.to.map(|t| hex_of(&t)), field("to"), "{path}.to");
+        assert_eq!(frame.value.map(|v| format!("{v:#x}")), field("value"), "{path}.value");
+        assert_eq!(Some(q(frame.gas)), field("gas"), "{path}.gas");
+        assert_eq!(Some(q(frame.gas_used)), field("gasUsed"), "{path}.gasUsed");
+        assert_eq!(Some(hex_of(&frame.input)), field("input"), "{path}.input");
+        assert_eq!(frame.output.as_ref().map(|o| hex_of(o)), field("output"), "{path}.output");
+        assert_eq!(frame.error, field("error"), "{path}.error");
+        assert_eq!(frame.revert_reason, field("revertReason"), "{path}.revertReason");
+        let calls = want.get("calls").and_then(|c| c.as_array()).cloned().unwrap_or_default();
+        assert_eq!(frame.calls.len(), calls.len(), "{path}.calls");
+        for (i, (call, want)) in frame.calls.iter().zip(&calls).enumerate() {
+            assert_frame_matches(call, want, &format!("{path}.calls[{i}]"));
+        }
+        let logs = want.get("logs").and_then(|l| l.as_array()).cloned().unwrap_or_default();
+        assert_eq!(frame.logs.len(), logs.len(), "{path}.logs");
+        for (i, (log, want)) in frame.logs.iter().zip(&logs).enumerate() {
+            let f = |key: &str| want.get(key).and_then(|v| v.as_str()).map(str::to_string);
+            assert_eq!(Some(hex_of(&log.address)), f("address"), "{path}.logs[{i}].address");
+            assert_eq!(Some(hex_of(&log.data)), f("data"), "{path}.logs[{i}].data");
+            assert_eq!(Some(q(log.index)), f("index"), "{path}.logs[{i}].index");
+            assert_eq!(Some(q(log.position)), f("position"), "{path}.logs[{i}].position");
+            let topics: Vec<String> = log.topics.iter().map(|t| hex_of(t)).collect();
+            let want_topics: Vec<String> = want["topics"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect();
+            assert_eq!(topics, want_topics, "{path}.logs[{i}].topics");
+        }
+    }
+
+    /// geth's callTracer, field by field — gas included — against a recorded
+    /// `debug_traceCall` of the same contracts (`testdata/evm/callTracer-golden.json`:
+    /// a full node's answer, the accounts installed by state overrides).
+    #[test]
+    fn trace_call_matches_a_full_nodes_call_tracer() {
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("../../testdata/evm/callTracer-golden.json")).unwrap();
+        let hex = |v: &serde_json::Value| -> Vec<u8> {
+            let s = v.as_str().unwrap().trim_start_matches("0x");
+            (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        };
+        let address = |v: &serde_json::Value| -> [u8; 20] { hex(v).try_into().unwrap() };
+        let quantity = |v: &serde_json::Value| u64::from_str_radix(v.as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+
+        for (name, case) in golden["cases"].as_object().unwrap() {
+            let mut accounts = Vec::new();
+            for (addr, account) in case["stateOverrides"].as_object().unwrap() {
+                let code = hex(&account["code"]);
+                if !code.is_empty() {
+                    accounts.push((address(&serde_json::Value::from(addr.as_str())), code, U256::ZERO, 1));
+                }
+            }
+            let exec = executor_with_accounts(&accounts);
+            let req = &case["request"];
+            let mut tx = TxRequest::call(
+                address(&req["from"]),
+                Some(address(&req["to"])),
+                Bytes::from(hex(&req["data"])),
+                U256::ZERO,
+            );
+            tx.gas = Some(quantity(&req["gas"]));
+            let with_log = case["tracerConfig"]["withLog"].as_bool().unwrap_or(false);
+            assert_eq!(quantity(&case["block"]), 19_500_000, "the goldens ran at a Cancun block");
+            let frame = call_tree(&exec, &tx, false, with_log);
+            assert_frame_matches(&frame, &case["trace"], name);
+        }
     }
 
     fn created_with(exec: &EvmExecutor, tx: &TxRequest) -> CreatedAccessList {

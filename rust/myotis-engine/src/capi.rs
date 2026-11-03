@@ -612,6 +612,28 @@ pub unsafe extern "C" fn myotis_get_transaction_by_hash_json(
     into_c(crate::host::get_transaction_by_hash_json(handle, &tx_hash_hex))
 }
 
+/// `debug_traceCall` (ABI ≥ 54, #716; the UniFFI `debug_trace_call_json`
+/// twin): `tx_json` is the transaction object, `block` the selector (NULL =
+/// latest), `overrides_json` the state override (NULL or empty = none) and
+/// `tracer_json` `{"tracer":…,"tracerConfig":{…}}`.
+///
+/// # Safety
+/// Each pointer must be null or a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_debug_trace_call_json(
+    handle: i64,
+    tx_json: *const c_char,
+    block: *const c_char,
+    overrides_json: *const c_char,
+    tracer_json: *const c_char,
+) -> *mut c_char {
+    let tx_json = read_string(tx_json).unwrap_or_default();
+    let block = read_string(block).unwrap_or_default();
+    let overrides_json = read_string(overrides_json).unwrap_or_default();
+    let tracer_json = read_string(tracer_json).unwrap_or_default();
+    into_c(crate::host::debug_trace_call_json(handle, &tx_json, &block, &overrides_json, &tracer_json))
+}
+
 /// Verified `eth_getRawTransactionByHash` (ABI ≥ 53, #715; the UniFFI
 /// `get_raw_transaction_by_hash_json` twin): `"0x…"`, the literal `"null"`,
 /// `{"error"}`, or `{"error","code":-32602}` for a malformed hash.
@@ -956,6 +978,16 @@ mod tests {
         assert_eq!(raw_by_block(c"0x10".as_ptr())["error"], "unknown handle");
         assert_eq!(raw_by_block(hash.as_ptr())["error"], "unknown handle");
         assert_eq!(raw_by_block(c"safe".as_ptr())["code"], -32602);
+        // debug_traceCall (ABI 54): a tracer this node does not serve, and a
+        // malformed transaction, are refused for good before the handle lookup.
+        let trace = |tx: *const c_char, tracer: *const c_char| {
+            parse(unsafe { take(myotis_debug_trace_call_json(i64::MIN, tx, null, null, tracer)) })
+        };
+        let tx = c"{\"from\":\"0x0000000000000000000000000000000000000001\",\"to\":\"0x0000000000000000000000000000000000000002\"}";
+        assert_eq!(trace(tx.as_ptr(), c"{\"tracer\":\"callTracer\"}".as_ptr())["error"], "unknown handle");
+        assert_eq!(trace(tx.as_ptr(), null)["code"], -32602);
+        assert_eq!(trace(tx.as_ptr(), c"{\"tracer\":\"4byteTracer\"}".as_ptr())["code"], -32602);
+        assert_eq!(trace(c"{\"to\":7}".as_ptr(), c"{\"tracer\":\"callTracer\"}".as_ptr())["code"], -32602);
         assert_eq!(raw_by_block(c"earliest".as_ptr())["code"], -32602);
     }
 

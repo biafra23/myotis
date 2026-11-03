@@ -134,6 +134,24 @@ class RpcSendResult private constructor(
     }
 }
 
+/**
+ * `io.myotis.api.TraceResult`'s pure-Kotlin mirror: a `debug_traceCall`'s
+ * outcome (#716). OK carries the trace as the JSON-RPC result carries it — a
+ * run that reverts or halts is still OK, the trace carrying the failure;
+ * UNAVAILABLE keeps the retryable -32000 path; REFUSED is permanent (-32602);
+ * INFEASIBLE is geth's -32000 in geth's words, as for [RpcCallResult].
+ */
+class RpcTraceResult private constructor(val kind: Kind, val traceJson: String?, val detail: String?) {
+    enum class Kind { OK, UNAVAILABLE, REFUSED, INFEASIBLE }
+
+    companion object {
+        fun ok(traceJson: String) = RpcTraceResult(Kind.OK, traceJson, null)
+        fun unavailable(detail: String? = null) = RpcTraceResult(Kind.UNAVAILABLE, null, detail)
+        fun refused(detail: String) = RpcTraceResult(Kind.REFUSED, null, detail)
+        fun infeasible(detail: String) = RpcTraceResult(Kind.INFEASIBLE, null, detail)
+    }
+}
+
 interface RpcBackend {
     fun chainId(): Long
     fun headBlockNumber(): Long?
@@ -372,6 +390,26 @@ interface RpcBackend {
     ): RpcAccessListResult = RpcAccessListResult.refused(
         "this engine does not build access lists (eth_createAccessList)",
     )
+
+    /**
+     * Whether this backend traces calls (`debug_traceCall`, [traceCall]; #716).
+     * Consulted BEFORE dispatch, as [supportsAccessListCreation].
+     */
+    fun supportsCallTracing(): Boolean = false
+
+    /**
+     * `debug_traceCall` (#716): the run [callTx] makes for [tx] at [block], with a
+     * state override when [stateOverridesJson] is non-null, seen through the tracer
+     * [tracerJson] names (`{"tracer":…,"tracerConfig":{…}}`) — applied or REFUSED.
+     *
+     * Default: REFUSED — a backend that traces no calls.
+     */
+    fun traceCall(
+        tx: RpcTransactionArgs,
+        block: String,
+        stateOverridesJson: String?,
+        tracerJson: String,
+    ): RpcTraceResult = RpcTraceResult.refused("this engine does not trace calls (debug_traceCall)")
 
     /**
      * Whether this backend serves `eth_getProof` ([getProof]). Consulted BEFORE

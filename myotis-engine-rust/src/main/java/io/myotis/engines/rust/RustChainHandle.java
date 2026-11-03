@@ -1180,6 +1180,46 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                 handle, txJson, block, stateOverridesJson)));
     }
 
+    /**
+     * One verified {@code debug_traceCall} (ABI 54, #716) for the full transaction
+     * object, seen through the tracer {@code tracerJson} names. Throws
+     * {@link EngineException} on a transport / not-running failure.
+     */
+    io.myotis.api.TraceResult traceCallVerified(String txJson, String block, String stateOverridesJson,
+                                                String tracerJson) {
+        return traceFromJson(gated(() -> RustEngineNative.nativeDebugTraceCallJson(
+                handle, txJson, block, stateOverridesJson, tracerJson)));
+    }
+
+    /** Package-private test seam: trace JSON (ABI 54) → the engine's outcome:
+     *  {@code {"status":"ok","trace":…}} / {@code {"status":"unavailable","reason"}} /
+     *  {@code {"status":"infeasible","reason"}}; the permanent {@code {"error",
+     *  "code":-32602}} is REFUSED and a plain {@code {"error"}} throws, as for
+     *  {@link #accessListFromJson}. An {@code ok} without a trace is shape drift and
+     *  fails closed. */
+    static io.myotis.api.TraceResult traceFromJson(String json) {
+        JsonObject o = parseJsonObject(json, "debug_traceCall");
+        String refusal = permanentRefusalOrNull(o);
+        if (refusal != null) return io.myotis.api.TraceResult.refused(refusal);
+        throwIfError(o);
+        String status = stringOrNull(o, "status");
+        if ("ok".equals(status)) {
+            var trace = o.get("trace");
+            if (trace == null || !trace.isObject()) {
+                throw new EngineException("debug_traceCall JSON: status=ok without a trace object");
+            }
+            return io.myotis.api.TraceResult.ok(trace.toString());
+        }
+        if ("infeasible".equals(status)) {
+            String reason = stringOrNull(o, "reason");
+            if (reason == null || reason.isBlank()) {
+                throw new EngineException("debug_traceCall JSON: status=infeasible without a reason");
+            }
+            return io.myotis.api.TraceResult.infeasible(reason);
+        }
+        return io.myotis.api.TraceResult.unavailable(stringOrNull(o, "reason"));
+    }
+
     /** Package-private test seam: access-list JSON (ABI 40) → the engine's
      *  outcome. The Rust side emits {@code {"status":"ok","accessList":[…],
      *  "gasUsed":N}} — plus {@code vmError} (and {@code revertDataHex} for a

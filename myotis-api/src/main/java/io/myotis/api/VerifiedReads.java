@@ -427,6 +427,30 @@ public interface VerifiedReads {
     }
 
     /**
+     * Whether this engine traces calls ({@code debug_traceCall}, {@link #traceCall}; #716).
+     * Hosts consult it BEFORE dispatch, as {@link #supportsAccessListCreation()}.
+     *
+     * @return false by default
+     */
+    default boolean supportsCallTracing() {
+        return false;
+    }
+
+    /**
+     * {@code debug_traceCall} (#716): the run {@link #callTx} makes for the full
+     * transaction object at {@code block} — the same request checks, with a state override
+     * when {@code stateOverridesJson} is non-empty — seen through the tracer
+     * {@code tracerJson} names: {@code {"tracer":"callTracer"|"prestateTracer",
+     * "tracerConfig":{…}}}. The tracer and its options are applied or refused
+     * ({@link TraceResult.Status#REFUSED}), never ignored; see {@link TraceResult}.
+     *
+     * <p>Default: refused, on an engine that reports no {@link #supportsCallTracing()}.
+     */
+    default TraceResult traceCall(TransactionArgs tx, String block, String stateOverridesJson, String tracerJson) {
+        return TraceResult.refused("this engine does not trace calls (debug_traceCall); select the Rust engine");
+    }
+
+    /**
      * Whether this engine serves {@code eth_getProof} ({@link #getProof}). Hosts
      * consult it BEFORE dispatch, as {@link #supportsAccessListCreation()}: on an
      * engine that does not, the request is refused (-32602) without waking a

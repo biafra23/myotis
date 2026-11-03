@@ -203,6 +203,42 @@ impl AccessListOutcome {
     }
 }
 
+/// A `debug_traceCall`'s outcome (#716), mapped from the executor as
+/// [`AccessListOutcome`]: a run that reverts or halts is still a trace.
+#[derive(Debug)]
+pub enum TraceOutcome {
+    /// The run's trace ([`myotis_evm::trace::Trace`]).
+    Traced(myotis_evm::trace::Trace),
+    /// No trace right now (state unavailable). The string is diagnostic.
+    Unavailable(String),
+    /// Never answerable on this build — permanent, as [`CallOutcome::Refused`].
+    Refused(String),
+    /// The request cannot run within the caller's own limits, as
+    /// [`CallOutcome::Infeasible`]: geth's -32000 answer in geth's words.
+    Infeasible(String),
+}
+
+impl TraceOutcome {
+    /// The executor's verdict, mapped as [`CallOutcome::from_executor`].
+    pub fn from_executor(joined: Result<myotis_evm::trace::Trace, EvmError>) -> TraceOutcome {
+        match joined {
+            Ok(trace) => TraceOutcome::Traced(trace),
+            Err(e) if e.is_refusal() => TraceOutcome::Refused(e.to_string()),
+            Err(e) if e.is_infeasible() => TraceOutcome::Infeasible(e.to_string()),
+            Err(e) => TraceOutcome::Unavailable(e.to_string()),
+        }
+    }
+}
+
+/// A trace's outcome plus the block it ran against, as [`CallAnswer`].
+#[derive(Debug)]
+pub struct TraceAnswer {
+    pub outcome: TraceOutcome,
+    pub block_number: u64,
+    /// Ran against the beacon-FINALIZED block.
+    pub finalized: bool,
+}
+
 /// An access list's outcome plus the block it ran against, as [`CallAnswer`].
 #[derive(Debug)]
 pub struct AccessListAnswer {

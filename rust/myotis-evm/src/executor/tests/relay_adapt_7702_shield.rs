@@ -216,3 +216,24 @@ fn the_shield_call_reads_its_state_in_waves_and_leaves_the_estimate_nothing() {
     assert_eq!(exec.call_tx(&requests.shield, &fixture.block, fixture.overrides()).unwrap(), output);
     assert!(serial(&serial_world) > 50, "{}", serial(&serial_world));
 }
+
+/// `debug_traceCall`'s callTracer over the recorded world (#716), frame by
+/// frame and log by log, gas included, against a full node's trace of the
+/// same request at the same block (`relayadapt7702-shield-calltrace.json`).
+#[test]
+fn the_call_trace_matches_a_full_nodes() {
+    let text = std::fs::read_to_string(FIXTURE).unwrap();
+    let fixture = EvmFixture::from_json(&text).unwrap();
+    let golden: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../testdata/evm/relayadapt7702-shield-calltrace.json"
+    ))
+    .unwrap();
+    let exec = EvmExecutor::new(Arc::new(fixture.oracle()), Arc::new(NoopStateProofCache), Arc::new(NoopBytecodeCache));
+    let mut tx = ShieldRequests::from_fixture(&fixture).unwrap().shield;
+    tx.gas = Some(u64::from_str_radix(golden["gas"].as_str().unwrap().trim_start_matches("0x"), 16).unwrap());
+    let trace = exec
+        .trace_call(&tx, &fixture.block, fixture.overrides(), Tracer::Call { only_top_call: false, with_log: true })
+        .unwrap();
+    let Trace::Call(frame) = trace else { panic!("not a call tree") };
+    assert_frame_matches(&frame, &golden["trace"], "shield");
+}

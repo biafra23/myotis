@@ -46,6 +46,7 @@ pub mod fixture;
 pub mod fork;
 pub mod oracle;
 pub mod overrides;
+pub mod trace;
 pub mod tx;
 
 // Re-exported so downstream crates implementing [`SnapStateOracle`] / building a

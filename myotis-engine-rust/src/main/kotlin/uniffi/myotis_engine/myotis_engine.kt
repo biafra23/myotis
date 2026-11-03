@@ -686,6 +686,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_create_handle(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_debug_trace_call_json(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_drain_logs(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_engine_init(
@@ -805,6 +807,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_create_handle(`network`: RustBuffer.ByValue,`dataDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
+    external fun uniffi_myotis_engine_fn_func_debug_trace_call_json(`handle`: Long,`tx`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,`overrides`: RustBuffer.ByValue,`tracer`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_drain_logs(`max`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_engine_init(uniffi_out_err: UniffiRustCallStatus, 
@@ -1035,6 +1039,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_create_handle() and 0xFFFF) != 44197) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_myotis_engine_checksum_func_debug_trace_call_json() and 0xFFFF) != 24257) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_drain_logs() and 0xFFFF) != 44503) {
@@ -1533,6 +1540,28 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         
         FfiConverterString.lower(`network`),
         FfiConverterString.lower(`dataDir`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * `debug_traceCall` (ABI ≥ 54, #716): the run `eth_call_tx_json` makes for
+         * the transaction object, seen through the tracer `tracer` names
+         * (`{"tracer":"callTracer"|"prestateTracer","tracerConfig":{…}}`):
+         * `{"status":"ok","trace":…}`, `infeasible`, `unavailable`, or the permanent
+         * `{"error","code":-32602}`; see `crate::host::debug_trace_call_json`.
+         */ fun `debugTraceCallJson`(`handle`: kotlin.Long, `tx`: kotlin.String, `block`: kotlin.String, `overrides`: kotlin.String, `tracer`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_debug_trace_call_json(
+    
+        
+        FfiConverterLong.lower(`handle`),
+        FfiConverterString.lower(`tx`),
+        FfiConverterString.lower(`block`),
+        FfiConverterString.lower(`overrides`),
+        FfiConverterString.lower(`tracer`),_status)
 }
     )
     }
