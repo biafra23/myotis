@@ -656,7 +656,8 @@ class RpcRouter(
                         "serves no proofs — select the Rust engine)",
                 )
             }
-            // And a backend that serves no raw transactions (#715): the iOS host's.
+            // And a backend that serves no raw transactions (#715): every shipped host's
+            // serves them; this covers a VerifiedReads that keeps the interface default.
             if (m in RAW_TRANSACTION_METHODS && backend?.supportsRawTransactions() != true) {
                 logger.record(m, idStr, "ERROR", elapsedMs(t0), -32602)
                 return errorEnvelope(id, -32602, "method '$m' is not supported by this node's engine")
