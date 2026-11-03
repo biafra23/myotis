@@ -60,6 +60,12 @@ final class KtorLoopbackRpc implements LoopbackRpc {
     }
 
     @Override
+    public void onPause() {
+        MyotisRpcServer s = server;
+        if (s != null) s.dropFilters();
+    }
+
+    @Override
     public boolean isServing() {
         MyotisRpcServer s = server;
         return s != null && s.isServing();

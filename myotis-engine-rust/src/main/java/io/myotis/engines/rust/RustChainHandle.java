@@ -216,6 +216,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     public synchronized boolean pause() {
         if (RustEngineNative.nativePause(handle)) {
             sleepMetrics.onPause(System.currentTimeMillis(), System.nanoTime());
+            if (rpc != null) rpc.onPause();   // its filters go with the pause (#714)
             log.info("[{}] paused (networking torn down; RPC keeps listening)", networkName);
             return true;
         }

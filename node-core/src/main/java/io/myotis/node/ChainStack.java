@@ -436,6 +436,10 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
     public synchronized boolean pause() {
         if (!phase.compareAndSet(RUNNING, PAUSED)) return phase.get() == PAUSED;
         sleepMetrics.onPause(System.currentTimeMillis(), System.nanoTime());
+        // The listener's JSON-RPC filters go with the pause (#714): clients
+        // re-create them on their next poll, as after an expiry.
+        io.myotis.jsonrpc.MyotisRpcServer liveRpc = rpcServer;
+        if (liveRpc != null) liveRpc.dropFilters();
         log.info("[{}] pausing: quiescing networking (RPC keeps listening)", network.name());
         closeNetworkingComponents();
         usage.tick(true);   // today's figures go to disk with the rest of the warm state
