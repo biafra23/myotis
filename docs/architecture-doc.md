@@ -389,10 +389,14 @@ A host-agnostic router (`jsonrpc-server`, Kotlin Multiplatform/Ktor) maps the Et
 | Method(s) | Verification basis |
 |---|---|
 | `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt` | snap Merkle-Patricia proof against a beacon-anchored `stateRoot` (Section 5) |
+| `eth_getProof`, `eth_getAccount` (Rust engine) | the same snap proofs, at exactly the block asked for: EIP-1186's account and storage proofs, and geth's `{codeHash, storageRoot, balance, nonce}` from the account leaf of one (Section 5) |
 | `eth_call`, `eth_estimateGas`, `eth_createAccessList` (Rust engine) | local EVM over proof-served state (Sections 8–9) |
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory` | base fee from verified headers; tips from bodies/receipts verified against `transactionsRoot`/`receiptsRoot` (Section 8) |
+| `eth_blobBaseFee` | EIP-4844's formula over the verified head's own `excessBlobGas`, with the blob fee schedule of the fork its timestamp falls in (per network, from the clients' chain specs; a chain without one is refused) |
 | `eth_getBlockByNumber`/`ByHash` and the block-derived reads (transaction counts, transactions by index, uncle counts/uncles), `eth_getTransactionReceipt`, `eth_getBlockReceipts`, `eth_getTransactionByHash` | header window anchored to the beacon head; bodies/receipts verified against `transactionsRoot`/`receiptsRoot` (Sections 4, 7) |
+| `eth_getRawTransactionByHash`, `eth_getRawTransactionByBlockNumberAndIndex`, `eth_getRawTransactionByBlockHashAndIndex` | the raw bytes from a body verified against `transactionsRoot` (or this node's own unmined broadcast), found as the decoded reads find the transaction; by hash, checked to hash to the transaction asked for |
 | `eth_getLogs` | the opt-in log index — every log verified against `receiptsRoot`; an uncovered range is an error, never `[]` (Rust engine; not yet wired on the iOS host) |
+| `eth_newFilter`, `eth_newBlockFilter`, `eth_getFilterChanges`, `eth_getFilterLogs`, `eth_uninstallFilter` | held by the router: block filters walk the verified head chain by `parentHash`; log filters answer from the log index under `eth_getLogs`'s rules, refused at creation where it cannot serve them; reorgs re-deliver orphaned logs as `removed` |
 | `eth_sendRawTransaction` | devp2p transaction gossip (Section 7) |
 | `eth_chainId`, `net_version`, `eth_blockNumber`, `eth_syncing`, `eth_accounts`, `net_listening`, `net_peerCount`, `web3_clientVersion`, `web3_sha3` | config, the beacon light client's own state, or local computation — no peer data |
 

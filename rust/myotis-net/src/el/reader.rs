@@ -571,6 +571,11 @@ pub struct VerifiedBlock {
     /// only from the `transactionsRoot`-verified body — an undecodable tx
     /// fails the serve rather than degrade to a hash.
     pub full_transactions: Option<Vec<VerifiedTransaction>>,
+    /// Each transaction's raw consensus bytes (the EIP-2718 envelope for a
+    /// typed one), in block order, from the `transactionsRoot`-verified body —
+    /// what `eth_getRawTransactionByBlock*AndIndex` serves (#715). Empty for a
+    /// header-only read. Kept in the wire's compact list, as the body arrived.
+    pub raw_transactions: crate::el::eth::messages::RawList,
 }
 
 /// What a verified block read fetches beyond its anchored header window.
@@ -1048,6 +1053,40 @@ pub enum TxLookup {
     Pending { tx_hash: [u8; 32], tx: TxSummary },
     /// Verified "not seen" (eth's null; the wallet keeps polling).
     NotSeen,
+}
+
+/// [`ElReader::find_transaction`]'s answer: the verified location, OUR
+/// unmined broadcast's bytes, or not seen.
+enum Found {
+    Mined(Arc<TxLocation>),
+    Pending(Vec<u8>),
+    NotSeen,
+}
+
+/// The raw transaction at `index` of a block's verified transactions, or
+/// `None` past their end.
+fn raw_at(raw: &crate::el::eth::messages::RawList, index: u64) -> Option<Vec<u8>> {
+    raw.get(usize::try_from(index).ok()?).map(<[u8]>::to_vec)
+}
+
+#[cfg(test)]
+mod raw_at_tests {
+    use super::*;
+
+    #[test]
+    fn serves_each_transactions_own_bytes_and_none_past_the_end() {
+        // A legacy transaction is an RLP list; a typed one is `type ‖ rlp(…)` —
+        // both come back as the bytes the transactions trie was built over.
+        let legacy = vec![0xc3, 0x01, 0x02, 0x03];
+        let typed = vec![0x02, 0xc2, 0x80, 0x80];
+        let mut body = crate::el::eth::messages::RawList::new();
+        body.push(&legacy);
+        body.push(&typed);
+        assert_eq!(raw_at(&body, 0), Some(legacy));
+        assert_eq!(raw_at(&body, 1), Some(typed));
+        assert_eq!(raw_at(&body, 2), None);
+        assert_eq!(raw_at(&body, u64::MAX), None);
+    }
 }
 
 /// Where a mined tx was found, cached per tx hash so wallet polls don't rescan
@@ -7544,10 +7583,15 @@ impl ElReader {
     /// canonical block this node can place now. `Err` is "cannot tell right
     /// now" (no anchored head, no peer, every peer failed the window).
     pub async fn resolve_block_hash(&self, hash: [u8; 32]) -> Result<Option<u64>, String> {
+        // The head and the finalized block are placed with no I/O — and
+        // remembered like a window's find, so a by-hash read that follows a
+        // resolve (eth_getRawTransactionByBlockHashAndIndex, #715) knows them too.
         if let Some((number, _)) = self.anchor.optimistic_head().filter(|(_, h)| *h == hash) {
+            self.remember_block_number(hash, number);
             return Ok(Some(number));
         }
         if let Some(fin) = self.anchor.finalized_execution().filter(|f| f.block_hash == hash) {
+            self.remember_block_number(hash, fin.block_number);
             return Ok(Some(fin.block_number));
         }
         // Tip-lag tolerance as for `latest`: the window is anchored at the
@@ -7784,6 +7828,7 @@ impl ElReader {
                     header: vh.header.clone(),
                     tx_hashes: Vec::new(),
                     full_transactions: None,
+                    raw_transactions: crate::el::eth::messages::RawList::new(),
                 });
             }
             BlockDepth::Body { full_transactions } => full_transactions,
@@ -7827,6 +7872,7 @@ impl ElReader {
             header: vh.header.clone(),
             tx_hashes,
             full_transactions: full,
+            raw_transactions: body.transactions,
         })
     }
 
@@ -9330,6 +9376,46 @@ impl ElReader {
     /// exists, so "can't render it" must never read as "unknown tx" (the Java
     /// buildTxJson-null convention).
     pub async fn get_transaction_by_hash(&self, tx_hash: [u8; 32]) -> Result<TxLookup, String> {
+        match self.find_transaction(tx_hash).await? {
+            Found::Mined(loc) => {
+                let tx = tx::decode_summary(&loc.raw_tx)
+                    .ok_or("transaction located but its type cannot be decoded")?;
+                Ok(TxLookup::Mined(VerifiedTransaction {
+                    tx_hash,
+                    tx_index: loc.index as u64,
+                    block_hash: loc.block_hash,
+                    block_number: loc.header.number,
+                    tx,
+                }))
+            }
+            Found::Pending(raw) => {
+                let tx = tx::decode_summary(&raw).ok_or("own sent tx cached but cannot be decoded")?;
+                Ok(TxLookup::Pending { tx_hash, tx })
+            }
+            Found::NotSeen => Ok(TxLookup::NotSeen),
+        }
+    }
+
+    /// Verified `eth_getRawTransactionByHash` (#715): the transaction's raw
+    /// consensus bytes — the EIP-2718 envelope for a typed one — found exactly
+    /// as [`Self::get_transaction_by_hash`] finds it: in a
+    /// `transactionsRoot`-verified block of the scanned chain, or as one of OUR
+    /// broadcasts not mined yet (the bytes we sent). `Ok(None)` = verified "not
+    /// seen" (eth's null).
+    pub async fn get_raw_transaction_by_hash(
+        &self,
+        tx_hash: [u8; 32],
+    ) -> Result<Option<Vec<u8>>, String> {
+        Ok(match self.find_transaction(tx_hash).await? {
+            Found::Mined(loc) => Some(loc.raw_tx.clone()),
+            Found::Pending(raw) => Some(raw),
+            Found::NotSeen => None,
+        })
+    }
+
+    /// Where a transaction is, for the by-hash reads: in a verified block, one
+    /// of our unmined broadcasts, or not seen.
+    async fn find_transaction(&self, tx_hash: [u8; 32]) -> Result<Found, String> {
         self.maybe_rebroadcast_sent_txs().await;
         // Anchor loss must not hide the wallet's OWN broadcast (Java parity:
         // locateMinedTx answers null on a missing anchor and the sentTxCache
@@ -9338,38 +9424,61 @@ impl ElReader {
         let (head_num, head_hash) = match self.anchored_head() {
             Ok(v) => v,
             Err(e) => {
-                let mut st = self.sent_txs.lock().unwrap();
-                if let Some(SentTx { raw, .. }) = st.bytes.get(&tx_hash) {
-                    let tx = tx::decode_summary(raw)
-                        .ok_or("own sent tx cached but cannot be decoded")?;
-                    return Ok(TxLookup::Pending { tx_hash, tx });
-                }
-                return Err(e);
+                return match self.sent_tx_bytes(&tx_hash) {
+                    Some(raw) => Ok(Found::Pending(raw)),
+                    None => Err(e),
+                };
             }
         };
         let Some(loc) = self.locate_mined_tx(tx_hash, head_num, &head_hash).await? else {
             // Not in the scanned chain — but if it is OUR broadcast, answer the
             // pending shape from the cached bytes (the Java sentTxCache path):
             // the wallet sees its tx exists while it awaits inclusion.
-            let mut st = self.sent_txs.lock().unwrap();
-            if let Some(SentTx { raw, .. }) = st.bytes.get(&tx_hash) {
-                let tx = tx::decode_summary(raw)
-                    .ok_or("own sent tx cached but cannot be decoded")?;
-                return Ok(TxLookup::Pending { tx_hash, tx });
-            }
-            return Ok(TxLookup::NotSeen);
+            return Ok(match self.sent_tx_bytes(&tx_hash) {
+                Some(raw) => Found::Pending(raw),
+                None => Found::NotSeen,
+            });
         };
         // Located in a verified block: the watch is done with this tx.
         self.sent_tx_watch.lock().unwrap().confirm_mined(&tx_hash);
-        let tx = tx::decode_summary(&loc.raw_tx)
-            .ok_or("transaction located but its type cannot be decoded")?;
-        Ok(TxLookup::Mined(VerifiedTransaction {
-            tx_hash,
-            tx_index: loc.index as u64,
-            block_hash: loc.block_hash,
-            block_number: loc.header.number,
-            tx,
-        }))
+        Ok(Found::Mined(loc))
+    }
+
+    /// The bytes of one of OUR broadcasts, while the sent-tx cache holds them.
+    fn sent_tx_bytes(&self, tx_hash: &[u8; 32]) -> Option<Vec<u8>> {
+        self.sent_txs.lock().unwrap().bytes.get(tx_hash).map(|SentTx { raw, .. }| raw.clone())
+    }
+
+    /// Verified `eth_getRawTransactionByBlockNumberAndIndex` (#715): the raw
+    /// consensus bytes of the transaction at `index` in the block at `target`
+    /// (`None` = latest), from its `transactionsRoot`-verified body. `Ok(None)`
+    /// for a verified future/unknown block, as [`Self::get_block_by_number`],
+    /// and for an index past the block's transactions (eth's null).
+    pub async fn get_raw_transaction_by_block(
+        &self,
+        target: Option<u64>,
+        index: u64,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let block = self.block_by_number(target, BlockDepth::Body { full_transactions: false }).await?;
+        Ok(block.and_then(|b| raw_at(&b.raw_transactions, index)))
+    }
+
+    /// Verified `eth_getRawTransactionByBlockHashAndIndex` (#715): as
+    /// [`Self::get_raw_transaction_by_block`] for the block a hash names, found
+    /// as [`Self::get_block_by_hash`] finds it — a hash this reader never
+    /// verified, or one a reorg replaced at its height, is eth's null.
+    pub async fn get_raw_transaction_by_block_hash(
+        &self,
+        block_hash: [u8; 32],
+        index: u64,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let Some(number) = self.lookup_block_number(&block_hash) else {
+            return Ok(None);
+        };
+        let block = self
+            .block_by_number(Some(number), BlockDepth::Body { full_transactions: false })
+            .await?;
+        Ok(block.filter(|b| b.hash == block_hash).and_then(|b| raw_at(&b.raw_transactions, index)))
     }
 
     /// Verified `eth_getBlockByHash` (transactions as hashes). Wallets call it

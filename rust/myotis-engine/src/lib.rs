@@ -371,7 +371,17 @@ uniffi::setup_scaffolding!();
 ///      reorged sibling. A payload extension, no signature change — bumped so
 ///      a host that relies on the hash is never paired with an engine that
 ///      omits it.
-pub const ABI_VERSION: i32 = 52;
+/// v53: raw transactions (#715). `get_raw_transaction_by_hash_json` and
+///      `get_raw_transaction_by_block_json` (UniFFI and the C ABI:
+///      `myotis_get_raw_transaction_by_hash_json` /
+///      `myotis_get_raw_transaction_by_block_json`): a transaction's raw
+///      consensus bytes — the EIP-2718 envelope for a typed one — as a JSON
+///      string, found by hash as `get_transaction_by_hash_json` finds it, or at
+///      an index of the block a tag, number or hash names, from its
+///      `transactionsRoot`-verified body. An additive function pair — bumped
+///      so a host that serves `eth_getRawTransaction*` is never paired with an
+///      engine that lacks them.
+pub const ABI_VERSION: i32 = 53;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

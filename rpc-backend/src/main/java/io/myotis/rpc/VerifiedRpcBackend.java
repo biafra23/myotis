@@ -1052,6 +1052,21 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
     }
 
     @Override
+    public boolean supportsRawTransactions() {
+        return true;
+    }
+
+    @Override
+    public String getRawTransactionByHash(byte[] txHash) {
+        return rpcGetRawTransactionByHash(txHash);
+    }
+
+    @Override
+    public String getRawTransactionByBlock(String blockSelector, long index) {
+        return rpcGetRawTransactionByBlock(blockSelector, index);
+    }
+
+    @Override
     public String getBlockReceipts(String blockSelector) {
         return rpcGetBlockReceipts(blockSelector);
     }
@@ -3601,14 +3616,20 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      * now has that hash) | Java null (cannot tell right now).
      */
     private String rpcResolveBlockHash(byte[] hash) {
+        String key = "0x" + Bytes.wrap(hash).toUnprefixedHexString();
         BeaconSyncState bss = beaconSyncState;
         if (bss != null) {
+            // Placed with no I/O — and remembered like a window's find, so a by-hash
+            // read that follows a resolve (eth_getRawTransactionByBlockHashAndIndex,
+            // #715) knows the block too.
             BeaconSyncState.OptimisticExecution opt = bss.getOptimisticExecution();
             if (opt.blockNumber() > 0 && java.util.Arrays.equals(opt.blockHash(), hash)) {
+                blockHashToNumber.put(key, opt.blockNumber());
                 return resolvedBlockJson(hash, opt.blockNumber());
             }
             BeaconSyncState.FinalizedExecution fin = bss.getFinalizedExecution();
             if (fin.blockNumber() > 0 && java.util.Arrays.equals(fin.blockHash(), hash)) {
+                blockHashToNumber.put(key, fin.blockNumber());
                 return resolvedBlockJson(hash, fin.blockNumber());
             }
         }
@@ -3620,9 +3641,9 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             HeaderAnchor ahead = bss == null ? null : reAnchorForPin(anchor.number() + 1);
             if (ahead != null) anchor = ahead;
             if (java.util.Arrays.equals(anchor.blockHash(), hash)) {
+                blockHashToNumber.put(key, anchor.number());
                 return resolvedBlockJson(hash, anchor.number());
             }
-            String key = "0x" + Bytes.wrap(hash).toUnprefixedHexString();
             String anchorKey = "0x" + Bytes.wrap(anchor.blockHash()).toUnprefixedHexString();
             if (anchorKey.equals(unplacedBlockHashes.get(key))) return "null";
             long from = hashScanStart(anchor.number(), blockHashToNumber.get(key));
@@ -3714,9 +3735,25 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
      * unknown/future block or a never-verified hash, or Java null (→ error)
      * when it can't verify right now.
      */
-    private String rpcGetBlockReceipts(String blockSelector) {
-        RLPxConnector conn = connector;
-        if (conn == null) return null;
+    /** A block selector resolved to its verified header ({@link #selectVerifiedBlock}):
+     *  the header, or {@link #UNKNOWN} — eth's null (a future block, or a hash this
+     *  engine cannot place). */
+    private record SelectedBlock(BlockHeadersMessage.VerifiedHeader header, boolean unknown) {
+        static final SelectedBlock UNKNOWN = new SelectedBlock(null, true);
+    }
+
+    /**
+     * The verified header of the block {@code blockSelector} names — a tag, a 0x-hex
+     * number, or a 0x-32-byte hash resolved from blocks already verified (the shared
+     * reading of eth_getBlockReceipts and eth_getRawTransactionByBlock*AndIndex):
+     * anchored by one header window to the verified head (re-anchored at the beacon
+     * optimistic head for a pin just past it), and remembered for eth_getBlockByHash.
+     * {@link SelectedBlock#UNKNOWN} for a block past the verified tip, a hash never
+     * verified, or a hash a reorg has since replaced at its height; {@code null} when
+     * it cannot be verified (no anchor, too deep, a peer that did not anchor, or a
+     * selector that is no tag, 0x-number or 0x-hash).
+     */
+    private SelectedBlock selectVerifiedBlock(RLPxConnector conn, String blockSelector) throws Exception {
         String b = (blockSelector == null || blockSelector.isBlank())
                 ? "latest" : blockSelector.trim();
         // A 32-byte 0x hash (unambiguous: a block NUMBER is at most 18 hex chars)
@@ -3726,7 +3763,7 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
         if (b.length() == 66 && (b.startsWith("0x") || b.startsWith("0X"))) {
             String key = b.toLowerCase(java.util.Locale.ROOT);
             Long number = blockHashToNumber.get(key);
-            if (number == null) return "null";
+            if (number == null) return SelectedBlock.UNKNOWN;
             expectHash = key;
             b = "0x" + Long.toHexString(number);
         }
@@ -3753,34 +3790,110 @@ public final class VerifiedRpcBackend implements io.myotis.api.VerifiedReads,
             // same request identically.
             if (pinned <= 0) return null;
         }
-        try {
-            HeaderAnchor anchor = headerAnchor();
-            if (anchor == null) return null;
-            long headNum = anchor.number();
-            long target = isTag ? headNum : pinned;
-            if (target > headNum) {
-                // Same near-head re-anchor as getBlockByNumber: a pin just past the
-                // preferred anchor is the normal mobile state, and the beacon
-                // OPTIMISTIC payload is itself a verified anchor at/past it.
-                HeaderAnchor reanchored = reAnchorForPin(target);
-                if (reanchored == null) {
-                    return "null"; // beyond the verified chain tip → eth null
-                }
-                anchor = reanchored;
-                headNum = reanchored.number();
+        HeaderAnchor anchor = headerAnchor();
+        if (anchor == null) return null;
+        long headNum = anchor.number();
+        long target = isTag ? headNum : pinned;
+        if (target > headNum) {
+            // Same near-head re-anchor as getBlockByNumber: a pin just past the
+            // preferred anchor is the normal mobile state, and the beacon
+            // OPTIMISTIC payload is itself a verified anchor at/past it.
+            HeaderAnchor reanchored = reAnchorForPin(target);
+            if (reanchored == null) {
+                return SelectedBlock.UNKNOWN; // beyond the verified chain tip → eth null
             }
-            long back = headNum - target;
-            if (back >= BLOCK_LOOKBACK_MAX) return null; // too far to verify cheaply
+            anchor = reanchored;
+            headNum = reanchored.number();
+        }
+        long back = headNum - target;
+        if (back >= BLOCK_LOOKBACK_MAX) return null; // too far to verify cheaply
 
-            List<BlockHeadersMessage.VerifiedHeader> window = conn
-                    .requestBlockHeadersBatched(target, (int) (back + 1))
+        List<BlockHeadersMessage.VerifiedHeader> window = conn
+                .requestBlockHeadersBatched(target, (int) (back + 1))
+                .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
+        if (!anchor.anchors(window)) return null;
+        BlockHeadersMessage.VerifiedHeader vh = window.get(0);
+        // A hash-form request must still name the block served at that height
+        // (a reorg can remap the number under a stale map entry).
+        if (expectHash != null && !vh.hash().toHexString().equals(expectHash)) return SelectedBlock.UNKNOWN;
+        blockHashToNumber.put(vh.hash().toHexString(), vh.header().number);
+        return new SelectedBlock(vh, false);
+    }
+
+    /**
+     * eth_getRawTransactionByBlock{Number,Hash}AndIndex (#715): the raw consensus bytes
+     * of the transaction at {@code index} of the block {@code blockSelector} names
+     * ({@link #selectVerifiedBlock}), from its body verified against the anchored
+     * header's transactionsRoot, as a JSON string; the literal "null" for an unknown
+     * or future block or an index past its transactions; Java null when it cannot
+     * verify.
+     */
+    private String rpcGetRawTransactionByBlock(String blockSelector, long index) {
+        RLPxConnector conn = connector;
+        if (conn == null || index < 0) return null;
+        try {
+            SelectedBlock selected = selectVerifiedBlock(conn, blockSelector);
+            if (selected == null) return null;
+            if (selected.unknown()) return "null";
+            BlockHeadersMessage.VerifiedHeader vh = selected.header();
+            List<BlockBodiesMessage.BlockBody> bodies = conn
+                    .requestBlockBodies(vh.hash())
                     .get(HEADER_CHAIN_TIMEOUT_SEC, TimeUnit.SECONDS);
-            if (!anchor.anchors(window)) return null;
-            BlockHeadersMessage.VerifiedHeader vh = window.get(0);
-            // A hash-form request must still name the block served at that height
-            // (a reorg can remap the number under a stale map entry).
-            if (expectHash != null && !vh.hash().toHexString().equals(expectHash)) return "null";
-            blockHashToNumber.put(vh.hash().toHexString(), vh.header().number);
+            if (bodies.isEmpty()) return null;
+            List<Bytes> txs = bodies.get(0).transactions();
+            if (!OrderedTrieRoot.verify(txs, vh.header().transactionsRoot)) return null;
+            if (index >= txs.size()) return "null";
+            return rawTxJson(txs.get((int) index).toArrayUnsafe());
+        } catch (Exception e) {
+            if (e instanceof InterruptedException || e.getCause() instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            log.info("[rpc] eth_getRawTransactionByBlock failed: " + unwrap(e));
+            return null;
+        }
+    }
+
+    /**
+     * eth_getRawTransactionByHash (#715): the transaction's raw consensus bytes as a JSON
+     * string, found exactly as {@link #rpcGetTransactionByHash} finds it — in a verified
+     * block of the scan, or as our own just-sent transaction; the literal "null" when
+     * not seen with an anchor; Java null when it cannot verify.
+     */
+    private String rpcGetRawTransactionByHash(byte[] txHash) {
+        RLPxConnector conn = connector;
+        if (conn == null || txHash == null || txHash.length != 32) return null;
+        Bytes32 want = Bytes32.wrap(txHash);
+        try {
+            TxLocation loc = locateMinedTx(conn, want);
+            if (loc != null) {
+                sentTxWatch.confirmMined(want);
+                return rawTxJson(loc.txBytes());
+            }
+            byte[] ourRaw = sentTxCache.get(want.toHexString());
+            if (ourRaw != null) return rawTxJson(ourRaw);
+            return headerAnchor() == null ? null : "null";
+        } catch (Exception e) {
+            if (e instanceof InterruptedException || e.getCause() instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            log.info("[rpc] eth_getRawTransactionByHash failed: " + unwrap(e));
+            return null;
+        }
+    }
+
+    /** Raw transaction bytes as their JSON value: a 0x-hex string. */
+    static String rawTxJson(byte[] raw) {
+        return "\"" + Bytes.wrap(raw).toHexString() + "\"";
+    }
+
+    private String rpcGetBlockReceipts(String blockSelector) {
+        RLPxConnector conn = connector;
+        if (conn == null) return null;
+        try {
+            SelectedBlock selected = selectVerifiedBlock(conn, blockSelector);
+            if (selected == null) return null;
+            if (selected.unknown()) return "null";
+            BlockHeadersMessage.VerifiedHeader vh = selected.header();
 
             // Body + receipts in flight together, ONE shared deadline for the pair
             // (sequential .get calls would each start a fresh timeout — worst case

@@ -23,6 +23,8 @@ import io.myotis.engine.capi.myotis_get_logs_json
 import io.myotis.engine.capi.myotis_get_proof_json
 import io.myotis.engine.capi.myotis_get_storage_at_json
 import io.myotis.engine.capi.myotis_get_storage_proof_json
+import io.myotis.engine.capi.myotis_get_raw_transaction_by_block_json
+import io.myotis.engine.capi.myotis_get_raw_transaction_by_hash_json
 import io.myotis.engine.capi.myotis_get_transaction_by_hash_json
 import io.myotis.engine.capi.myotis_get_transaction_receipt_json
 import io.myotis.engine.capi.myotis_import_log_index_files
@@ -329,6 +331,17 @@ object RustEngine {
 
     fun getTransactionByHashJson(handle: Long, txHash32Hex: String): String =
         jsonCall { myotis_get_transaction_by_hash_json(handle, txHash32Hex) }
+
+    /** A transaction's raw consensus bytes (ABI 53, #715): `"0x…"` as a JSON string,
+     *  the literal `"null"`, or an error envelope. */
+    fun getRawTransactionByHashJson(handle: Long, txHash32Hex: String): String =
+        jsonCall { myotis_get_raw_transaction_by_hash_json(handle, txHash32Hex) }
+
+    /** The raw bytes of the transaction at [index] of the block [selector] names (a
+     *  tag, a 0x number or a 0x block hash; ABI 53, #715), as
+     *  [getRawTransactionByHashJson]. */
+    fun getRawTransactionByBlockJson(handle: Long, selector: String, index: Long): String =
+        jsonCall { myotis_get_raw_transaction_by_block_json(handle, selector, index.toULong()) }
 
     fun getTransactionReceiptJson(handle: Long, txHash32Hex: String): String =
         jsonCall { myotis_get_transaction_receipt_json(handle, txHash32Hex) }

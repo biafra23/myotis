@@ -423,6 +423,20 @@ class IosRpcBackend(
         return triStateJson(RustEngine.getBlockByHashJson(handle, hex(blockHash32), fullTransactions))
     }
 
+    override fun supportsRawTransactions(): Boolean = true // ABI >= 53 (#715)
+
+    override fun getRawTransactionByHash(txHash: ByteArray): String? {
+        if (txHash.size != 32) return null
+        val handle = handleProvider() ?: return null
+        return triStateStringJson(RustEngine.getRawTransactionByHashJson(handle, hex(txHash)))
+    }
+
+    override fun getRawTransactionByBlock(blockSelector: String, index: Long): String? {
+        if (index < 0) return null
+        val handle = handleProvider() ?: return null
+        return triStateStringJson(RustEngine.getRawTransactionByBlockJson(handle, blockSelector, index))
+    }
+
     /** Header only (ABI 47, #641): the head or the finalized block at once, any
      *  other hash in one header window — never a block body. */
     override fun resolveBlockHash(blockHash32: ByteArray): String? {
@@ -509,6 +523,17 @@ class IosRpcBackend(
         if (t == "null") return t
         if (isEngineErrorEnvelope(t)) return t
         return if (resultOrNull(t) != null) t else null
+    }
+
+    /** [triStateJson]'s string twin (eth_getRawTransaction*, #715): a JSON string
+     *  value | literal "null" | the `{"error"}` envelope (passed through for the
+     *  router to unwrap) | null. */
+    private fun triStateStringJson(json: String): String? {
+        val t = json.trim()
+        if (t.isEmpty()) return null
+        if (t == "null") return t
+        if (isEngineErrorEnvelope(t)) return t
+        return if (t.length >= 2 && t.first() == '"' && t.last() == '"') t else null
     }
 
     /** [triStateJson]'s array twin (eth_getBlockReceipts): array string |

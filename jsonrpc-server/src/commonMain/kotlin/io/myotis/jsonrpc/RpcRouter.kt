@@ -79,6 +79,9 @@ class RpcRouter internal constructor(
             "eth_gasPrice" to 0, "eth_maxPriorityFeePerGas" to 0, "eth_feeHistory" to 3,
             "eth_getTransactionByHash" to 1, "eth_getBlockByHash" to 2, "eth_getBlockReceipts" to 1,
             "eth_getLogs" to 1,
+            // #715: the blob base fee, the account leaf in one proof, raw transactions.
+            "eth_blobBaseFee" to 0, "eth_getAccount" to 2, "eth_getRawTransactionByHash" to 1,
+            "eth_getRawTransactionByBlockNumberAndIndex" to 2, "eth_getRawTransactionByBlockHashAndIndex" to 2,
             // The polled filter family over the log index and the verified head (#714).
             "eth_newFilter" to 1, "eth_newBlockFilter" to 0, "eth_getFilterChanges" to 1,
             "eth_getFilterLogs" to 1, "eth_uninstallFilter" to 1,
@@ -88,6 +91,13 @@ class RpcRouter internal constructor(
             "eth_getTransactionByBlockNumberAndIndex" to 2, "eth_getTransactionByBlockHashAndIndex" to 2,
             "eth_getUncleCountByBlockNumber" to 1, "eth_getUncleCountByBlockHash" to 1,
             "eth_getUncleByBlockNumberAndIndex" to 2, "eth_getUncleByBlockHashAndIndex" to 2,
+        )
+
+        /** The raw transaction reads (#715), refused up front on a backend without them. */
+        private val RAW_TRANSACTION_METHODS = setOf(
+            "eth_getRawTransactionByHash",
+            "eth_getRawTransactionByBlockNumberAndIndex",
+            "eth_getRawTransactionByBlockHashAndIndex",
         )
 
         /** Used in strict mode to tell "supported but can't answer right now"
@@ -667,14 +677,21 @@ class RpcRouter internal constructor(
             }
             // Likewise an engine that serves no proofs (the Java engine): permanent
             // for that build, and the reason comes ahead of any field's.
-            if (m == "eth_getProof" && backend?.supportsProofs() != true) {
+            // eth_getAccount is the account leaf of an eth_getProof (#715).
+            if ((m == "eth_getProof" || m == "eth_getAccount") && backend?.supportsProofs() != true) {
                 logger.record(m, idStr, "ERROR", elapsedMs(t0), -32602)
                 return errorEnvelope(
                     id,
                     -32602,
-                    "method 'eth_getProof' is not supported by this node's engine (the Java engine " +
+                    "method '$m' is not supported by this node's engine (the Java engine " +
                         "serves no proofs — select the Rust engine)",
                 )
+            }
+            // And a backend that serves no raw transactions (#715): every shipped host's
+            // serves them; this covers a VerifiedReads that keeps the interface default.
+            if (m in RAW_TRANSACTION_METHODS && backend?.supportsRawTransactions() != true) {
+                logger.record(m, idStr, "ERROR", elapsedMs(t0), -32602)
+                return errorEnvelope(id, -32602, "method '$m' is not supported by this node's engine")
             }
             if (m == "eth_call" || m == "eth_createAccessList") {
                 (callTx(root, m) as? CallTx.Refuse)?.let { refusal ->
@@ -1320,6 +1337,18 @@ class RpcRouter internal constructor(
                     ?.orEngineThrow() ?: return null
                 resultEnvelope(id, json.parseToJsonElement(proofJson))
             }
+            // eth_getAccount (#715): geth's {codeHash, storageRoot, balance, nonce}
+            // — the account leaf of the proof eth_getProof serves, at the block it
+            // pins exactly, so every field comes from one state root.
+            "eth_getAccount" -> {
+                if (!b.supportsProofs()) return null
+                val p = root.params()
+                val addr = p.addressAt(0)
+                val sel = p.selectorAt(1, Takes.NUMBER_OR_HASH)
+                val proofJson = withContext(rpcIoDispatcher) { b.getProof(addr, "[]", sel.value) }
+                    ?.orEngineThrow() ?: return null
+                resultEnvelope(id, accountOf(proofJson))
+            }
             "eth_sendRawTransaction" -> {
                 val raw = root.params().dataAt(0, "the signed transaction")
                 if (raw.isEmpty()) invalid("invalid argument 0: the signed transaction is empty")
@@ -1353,6 +1382,58 @@ class RpcRouter internal constructor(
                 // verified-unknown tx; Kotlin null (can't verify) → strict error.
                 val txJson = withContext(rpcIoDispatcher) { b.getTransactionByHash(txHash) }?.orEngineThrow() ?: return null
                 resultEnvelope(id, json.parseToJsonElement(txJson))
+            }
+            // ---- raw transactions (#715): the verified bytes themselves ----
+            "eth_getRawTransactionByHash" -> {
+                if (!b.supportsRawTransactions()) return null
+                val txHash = root.params().hashAt(0, "transaction hash")
+                val raw = withContext(rpcIoDispatcher) { b.getRawTransactionByHash(txHash) }
+                    ?.orEngineThrow() ?: return null
+                resultEnvelope(id, rawTransactionOf(raw, txHash))
+            }
+            "eth_getRawTransactionByBlockNumberAndIndex" -> {
+                if (!b.supportsRawTransactions()) return null
+                val p = root.params()
+                val sel = p.selectorAt(0, Takes.NUMBER)
+                val index = p.indexAt(1)
+                val raw = withContext(rpcIoDispatcher) { b.getRawTransactionByBlock(sel.value, index.toLong()) }
+                    ?.orEngineThrow() ?: return null
+                resultEnvelope(id, rawTransactionOf(raw, null))
+            }
+            "eth_getRawTransactionByBlockHashAndIndex" -> {
+                if (!b.supportsRawTransactions()) return null
+                val p = root.params()
+                val blockHash = p.hashAt(0, "block hash")
+                val index = p.indexAt(1)
+                // Place the hash header-only first (#641): both engines remember the
+                // header a resolve finds, so the read below knows the block even when
+                // this node never served it — and still re-checks it by hash. A hash
+                // no canonical block carries is eth's null.
+                val placed = withContext(rpcIoDispatcher) { b.resolveBlockHash(blockHash) }
+                    ?.orEngineThrow() ?: return null
+                if (placed.trim() == "null") return resultEnvelope(id, JsonNull)
+                val raw = withContext(rpcIoDispatcher) { b.getRawTransactionByBlock(hexData(blockHash), index.toLong()) }
+                    ?.orEngineThrow() ?: return null
+                resultEnvelope(id, rawTransactionOf(raw, null))
+            }
+            // eth_blobBaseFee (#715): EIP-4844's blob base fee of the verified head,
+            // from its own excessBlobGas and its fork's update fraction (BlobFees).
+            "eth_blobBaseFee" -> {
+                val blockJson = withContext(rpcIoDispatcher) { b.getBlockByNumber("latest", false) }
+                    ?.orEngineThrow() ?: return null
+                val block = runCatching { json.parseToJsonElement(blockJson) }.getOrNull() as? JsonObject
+                    ?: return null   // the literal "null": no head block to read right now
+                val timestamp = block.quantity("timestamp")
+                    ?: throw EngineReadUnavailable("malformed head block from engine (no timestamp)")
+                if (block["excessBlobGas"] == null) {
+                    throw EngineRefused("the head block carries no excessBlobGas: blobs are not active on this chain")
+                }
+                val excess = block.quantity("excessBlobGas")
+                    ?: throw EngineReadUnavailable("malformed head block from engine (excessBlobGas)")
+                when (val fee = BlobFees.baseFeePerBlobGas(b.chainId(), timestamp.toLong(), excess)) {
+                    is BlobFees.Answer.Fee -> resultEnvelope(id, JsonPrimitive(fee.hexWei))
+                    is BlobFees.Answer.Refused -> throw EngineRefused(fee.why)
+                }
             }
             "eth_getBlockByNumber" -> {
                 val p = root.params()
@@ -1634,6 +1715,49 @@ class RpcRouter internal constructor(
         if (raw == null || raw is JsonNull) return
         val args = raw as? JsonArray ?: invalid("params must be an array of positional arguments")
         if (args.size > arity) invalid("too many arguments, want at most $arity")
+    }
+
+    /** A `0x` QUANTITY field of [this] as an unsigned 64-bit value, or null when
+     *  absent or not one. */
+    private fun JsonObject.quantity(key: String): ULong? =
+        (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.content
+            ?.takeIf { it.startsWith("0x") && it.length in 3..18 }?.substring(2)?.toULongOrNull(16)
+
+    /**
+     * eth_getAccount's answer from an eth_getProof result (#715): geth's
+     * `{codeHash, storageRoot, balance, nonce}`, the proof's `storageHash` named as
+     * geth names it here. A proof without one of the fields is the engine's fault,
+     * declined retryably — never an answer with a field made up.
+     */
+    private fun accountOf(proofJson: String): JsonObject {
+        val proof = runCatching { json.parseToJsonElement(proofJson) }.getOrNull() as? JsonObject
+            ?: throw EngineReadUnavailable("malformed proof from engine")
+        fun field(key: String): JsonElement = (proof[key] as? JsonPrimitive)?.takeIf { it.isString }
+            ?: throw EngineReadUnavailable("the engine's proof carries no '$key'")
+        return buildJsonObject {
+            put("codeHash", field("codeHash"))
+            put("storageRoot", field("storageHash"))
+            put("balance", field("balance"))
+            put("nonce", field("nonce"))
+        }
+    }
+
+    /**
+     * A raw transaction's answer (#715) from the engine's JSON value: a `0x` hex
+     * string, or JSON null (verified not seen / no such index). By hash, the bytes
+     * must hash to the transaction asked for ([expectHash]) — a check of the
+     * engine's own lookup, and never an answer for another transaction.
+     */
+    private fun rawTransactionOf(raw: String, expectHash: ByteArray?): JsonElement {
+        val value = runCatching { json.parseToJsonElement(raw) }.getOrNull()
+        if (value is JsonNull) return JsonNull
+        val hex = (value as? JsonPrimitive)?.takeIf { it.isString }?.content
+        val bytes = hex?.let { JsonPrimitive(it).asHexBytes() }?.takeIf { it.isNotEmpty() }
+            ?: throw EngineReadUnavailable("malformed raw transaction from engine")
+        if (expectHash != null && !Keccak256.digest(bytes).contentEquals(expectHash)) {
+            throw EngineReadUnavailable("the engine served the bytes of another transaction")
+        }
+        return JsonPrimitive(hexData(bytes))
     }
 
     /** params[[i]] as a filter id: a string, as `eth_newFilter` handed it out. */

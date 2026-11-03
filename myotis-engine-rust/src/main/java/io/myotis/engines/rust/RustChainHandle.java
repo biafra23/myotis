@@ -1384,6 +1384,21 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     }
 
     /**
+     * Verified eth_getRawTransactionByHash (ABI 53, #715): the native answer as it came
+     * — {@code "0x…"}, the {@code "null"} literal, or an error envelope (its permanent
+     * {@code "code":-32602} kept for the router) — after the wake gate.
+     */
+    String rawTransactionByHashJson(String txHashHex) {
+        return gated(() -> RustEngineNative.nativeGetRawTransactionByHashJson(handle, txHashHex));
+    }
+
+    /** Verified eth_getRawTransactionByBlock{Number,Hash}AndIndex (ABI 53, #715), passed
+     *  through as {@link #rawTransactionByHashJson}. */
+    String rawTransactionByBlockJson(String selector, long index) {
+        return gated(() -> RustEngineNative.nativeGetRawTransactionByBlockJson(handle, selector, index));
+    }
+
+    /**
      * Verified eth_feeHistory: the result JSON object, or throws
      * {@link EngineException} when it can't verify (transport / not-running /
      * bad selector) — this method has no {@code "null"} literal case, but the

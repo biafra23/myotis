@@ -245,6 +245,23 @@ final class GatedVerifiedReads implements VerifiedReads {
         return guardedJson(d -> d.resolveBlockHash(blockHash32));
     }
 
+    /** A static capability of this engine: {@code VerifiedRpcBackend} serves both raw reads
+     *  (#715), so a host asks without waking the stack. */
+    @Override
+    public boolean supportsRawTransactions() {
+        return true;
+    }
+
+    @Override
+    public String getRawTransactionByHash(byte[] txHash) {
+        return guardedJson(d -> d.getRawTransactionByHash(txHash));
+    }
+
+    @Override
+    public String getRawTransactionByBlock(String blockSelector, long index) {
+        return guardedJson(d -> d.getRawTransactionByBlock(blockSelector, index));
+    }
+
     @Override
     public String getBlockReceipts(String blockSelector) {
         return guardedJson(d -> d.getBlockReceipts(blockSelector));

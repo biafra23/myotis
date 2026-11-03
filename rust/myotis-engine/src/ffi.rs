@@ -377,6 +377,30 @@ pub fn get_transaction_by_hash_json(handle: i64, tx_hash_hex: String) -> String 
     crate::host::get_transaction_by_hash_json(handle, &tx_hash_hex)
 }
 
+/// Verified `eth_getRawTransactionByHash` (ABI ≥ 53, #715): `"0x…"` (the raw
+/// consensus bytes as a JSON string), the literal `"null"`, `{"error"}`, or
+/// `{"error","code":-32602}` for a malformed hash; see
+/// `crate::host::get_raw_transaction_by_hash_json`.
+#[uniffi::export]
+pub fn get_raw_transaction_by_hash_json(handle: i64, tx_hash_hex: String) -> String {
+    crate::host::get_raw_transaction_by_hash_json(handle, &tx_hash_hex)
+}
+
+/// Verified `eth_getRawTransactionByBlock{Number,Hash}AndIndex` (ABI ≥ 53,
+/// #715): the raw bytes of the transaction at `index` of the block `selector`
+/// names (a tag, a 0x number or a 0x block hash) as `"0x…"`, the literal
+/// `"null"`, `{"error"}`, or the permanent `{"error","code":-32602}`; see
+/// `crate::host::get_raw_transaction_by_block_json`. `index` is signed as every
+/// UniFFI integer here is (a JVM `long`, no `ULong`); a negative one is refused
+/// for good.
+#[uniffi::export]
+pub fn get_raw_transaction_by_block_json(handle: i64, selector: String, index: i64) -> String {
+    match u64::try_from(index) {
+        Ok(index) => crate::host::get_raw_transaction_by_block_json(handle, &selector, index),
+        Err(_) => crate::eljson::invalid_params_json("negative transaction index"),
+    }
+}
+
 /// The canonical block a block hash names (ABI ≥ 47, #641): `{"hash","number"}`,
 /// the literal `"null"` (not a canonical block this node holds now), `{"error"}`
 /// (cannot tell right now), or `{"error","code":-32602}` for a malformed hash.

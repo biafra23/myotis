@@ -224,6 +224,51 @@ public interface VerifiedReads {
     }
 
     /**
+     * Whether this engine serves raw transactions ({@link #getRawTransactionByHash},
+     * {@link #getRawTransactionByBlock}; #715). A host refuses
+     * {@code eth_getRawTransaction*} for good on an engine that does not, rather than
+     * wake it to be refused.
+     *
+     * @return false by default
+     */
+    default boolean supportsRawTransactions() {
+        return false;
+    }
+
+    /**
+     * {@code eth_getRawTransactionByHash} (#715): the transaction's raw consensus bytes
+     * — the EIP-2718 envelope for a typed one — as a JSON string ({@code "0x…"}),
+     * found exactly as {@link #getTransactionByHash} finds the transaction (in a block
+     * verified against its {@code transactionsRoot}, or as one of this node's own
+     * broadcasts not mined yet) | the {@code "null"} literal (verified not seen) | an
+     * {@code {"error": ...}} envelope, or its permanent {@code {"error","code":-32602}}
+     * form | {@code null} (no verified answer).
+     *
+     * <p>Default: {@code null}, on an engine that reports no
+     * {@link #supportsRawTransactions()}.
+     */
+    default String getRawTransactionByHash(byte[] txHash) {
+        return null;
+    }
+
+    /**
+     * {@code eth_getRawTransactionByBlock{Number,Hash}AndIndex} (#715): the raw
+     * consensus bytes of the transaction at {@code index} of the block
+     * {@code blockSelector} names (a tag, a 0x-hex number, or a 0x-32-byte block hash,
+     * read as {@link #getBlockReceipts} reads it), from the block's body verified
+     * against its {@code transactionsRoot}, as a JSON string ({@code "0x…"}) | the
+     * {@code "null"} literal (an unknown or future block, a block hash this engine
+     * cannot place, or an index past the block's transactions) | an error envelope, as
+     * {@link #getRawTransactionByHash} | {@code null}.
+     *
+     * <p>Default: {@code null}, on an engine that reports no
+     * {@link #supportsRawTransactions()}.
+     */
+    default String getRawTransactionByBlock(String blockSelector, long index) {
+        return null;
+    }
+
+    /**
      * Every receipt of one block as a JSON array (each element the
      * {@code getTransactionReceipt} object shape, verified against the anchored
      * header's {@code receiptsRoot}) | {@code "null"} literal (verified

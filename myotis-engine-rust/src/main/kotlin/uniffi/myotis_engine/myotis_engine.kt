@@ -720,6 +720,10 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_get_proof_json(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_get_raw_transaction_by_block_json(
+    ): Int
+    external fun uniffi_myotis_engine_checksum_func_get_raw_transaction_by_hash_json(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_get_storage_at_json(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_get_storage_proof_json(
@@ -834,6 +838,10 @@ internal object UniffiLib {
     external fun uniffi_myotis_engine_fn_func_get_logs_json(`handle`: Long,`filterJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_get_proof_json(`handle`: Long,`address`: RustBuffer.ByValue,`keys`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_get_raw_transaction_by_block_json(`handle`: Long,`selector`: RustBuffer.ByValue,`index`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_get_raw_transaction_by_hash_json(`handle`: Long,`txHashHex`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_get_storage_at_json(`handle`: Long,`address`: RustBuffer.ByValue,`position`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1078,6 +1086,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_get_proof_json() and 0xFFFF) != 23140) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_myotis_engine_checksum_func_get_raw_transaction_by_block_json() and 0xFFFF) != 15663) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_myotis_engine_checksum_func_get_raw_transaction_by_hash_json() and 0xFFFF) != 23253) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_get_storage_at_json() and 0xFFFF) != 41050) {
@@ -1829,6 +1843,46 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         FfiConverterString.lower(`address`),
         FfiConverterString.lower(`keys`),
         FfiConverterString.lower(`block`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Verified `eth_getRawTransactionByBlock{Number,Hash}AndIndex` (ABI ≥ 53,
+         * #715): the raw bytes of the transaction at `index` of the block `selector`
+         * names (a tag, a 0x number or a 0x block hash) as `"0x…"`, the literal
+         * `"null"`, `{"error"}`, or the permanent `{"error","code":-32602}`; see
+         * `crate::host::get_raw_transaction_by_block_json`. `index` is signed as every
+         * UniFFI integer here is (a JVM `long`, no `ULong`); a negative one is refused
+         * for good.
+         */ fun `getRawTransactionByBlockJson`(`handle`: kotlin.Long, `selector`: kotlin.String, `index`: kotlin.Long): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_get_raw_transaction_by_block_json(
+    
+        
+        FfiConverterLong.lower(`handle`),
+        FfiConverterString.lower(`selector`),
+        FfiConverterLong.lower(`index`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Verified `eth_getRawTransactionByHash` (ABI ≥ 53, #715): `"0x…"` (the raw
+         * consensus bytes as a JSON string), the literal `"null"`, `{"error"}`, or
+         * `{"error","code":-32602}` for a malformed hash; see
+         * `crate::host::get_raw_transaction_by_hash_json`.
+         */ fun `getRawTransactionByHashJson`(`handle`: kotlin.Long, `txHashHex`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_get_raw_transaction_by_hash_json(
+    
+        
+        FfiConverterLong.lower(`handle`),
+        FfiConverterString.lower(`txHashHex`),_status)
 }
     )
     }
