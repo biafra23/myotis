@@ -445,6 +445,11 @@ Spec: README §5.3, doc 04 §2. Highlights per PR-sized chunk:
      `eth_blobBaseFee` — the blob base-fee update fraction is fork-dependent
      (and BPO forks reschedule it), so a router-side constant would silently go
      stale; it needs an engine-side answer if it's ever wanted.
+     *(Later, #715: served after all, in the router — not as a constant but as
+     a per-network fork schedule keyed by the verified head's timestamp
+     (`BlobFees.kt`), pinned by full-node vectors in every era, and refusing a
+     chain it has no schedule for. A new BPO fork still needs its entry added
+     there, as the engines' fork tables do.)*
    - **Landed (chunk 3): the sent-tx watch + pending overlay** (ABI v19,
      `nativePendingNonceOverlay` + `myotis_pending_nonce_overlay`): `el/sent_tx.rs`
      twins the Java `SentTxTracker`/`PendingNonceTracker` exactly (180 s watch TTL,
