@@ -427,7 +427,17 @@ char *myotis_log_index_status_json(int64_t handle);
  * follower has not caught up with) is a gap too. The
  * follower keeps the last 256 blocks; anything older, paused or not yet
  * fetched is a gap. {"error":..} when the handle is not running (paused
- * included) or the light client has anchored no head yet. */
+ * included) or the light client has anchored no head yet.
+ *
+ * Watching an address also changes how its head account reads are answered
+ * (#685; no ABI change, the shape is the same): once one verified proof of it
+ * names its block by hash, the engine carries its state through each block's
+ * verified access list, and a head read of it (request_account_json, and the
+ * account behind get_code_json) asks no peer. Such an answer carries
+ * "verifyMethod":"blockAccessList", from the head or at most 2 blocks below it
+ * (never below a pinned block number), with that block's blockNumber,
+ * blockHash, blockTimestamp and state root. A non-null verifyMethod stays the
+ * verified mark; finalized reads and eth_getProof are always proven. */
 bool myotis_set_activity_watch(int64_t handle, const char *config_json);
 char *myotis_address_activity_json(int64_t handle, int64_t after_block);
 

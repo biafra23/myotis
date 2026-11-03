@@ -60,6 +60,15 @@ public interface LoopbackRpc {
     void start(int port, VerifiedReads reads, NodeStatusReads status, NodeLifecycle lifecycle)
             throws IOException;
 
+    /**
+     * The handle paused (idle sleep): forget the listener's installed JSON-RPC filters
+     * ({@code eth_newFilter} / {@code eth_newBlockFilter}, #714). A client's next poll
+     * answers {@code filter not found} and it re-creates its filter, the same recovery
+     * as an expiry. Must not block. The default does nothing — a listener without
+     * filters.
+     */
+    default void onPause() {}
+
     /** Bound AND no fatal supervisor failure — the live listener state the status row shows. */
     boolean isServing();
 

@@ -1814,7 +1814,13 @@ struct ActivityBalStats {
     bal_peers_max: usize,
     /// The client ids of the peers that served a verified BAL.
     serving: std::collections::BTreeSet<String>,
+    /// Account reads answered from the BALs, with no request to a peer.
+    answered: u64,
 }
+
+/// The `verifyMethod` of an account read answered from the activity
+/// follower's block access lists ([`ElReader::get_account`]).
+pub const VERIFY_BLOCK_ACCESS_LIST: &str = "blockAccessList";
 
 /// Budget for one background fee refresh (estimate or one feeHistory shape).
 const FEE_REFRESH_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
@@ -5709,7 +5715,141 @@ impl ElReader {
     /// fallback to any other root (a peer that pruned it fails this attempt;
     /// a whole-pool miss is retryable), so the answer is the block asked for
     /// or nothing (CLAUDE.md §Trust).
+    ///
+    /// A head read of a watched account the activity follower carries
+    /// (docs/address-activity.md, *Answering from block access lists*) is
+    /// answered from its verified BALs instead, with no request to any peer:
+    /// `verifyMethod` `blockAccessList`, at the head or at most
+    /// [`activity::FOLLOW_MAX_LAG`](crate::el::activity::FOLLOW_MAX_LAG)
+    /// blocks below it. A verified head proof of a watched account is what
+    /// starts carrying it.
     pub async fn get_account(
+        &self,
+        anchor: ReadAnchor,
+        address: [u8; 20],
+    ) -> Result<VerifiedAccount, String> {
+        self.get_account_following(anchor, address, crate::el::activity::FOLLOW_MAX_LAG, None).await
+    }
+
+    /// [`Self::get_account`] for a read the caller pinned to block `pin`
+    /// (answered from head state, the window policy's rule for a pin near the
+    /// head): an answer from BALs is never from a block below `pin`, which
+    /// could predate a change the pinned block made.
+    pub async fn get_account_pinned(
+        &self,
+        anchor: ReadAnchor,
+        address: [u8; 20],
+        pin: Option<u64>,
+    ) -> Result<VerifiedAccount, String> {
+        self.get_account_following(anchor, address, crate::el::activity::FOLLOW_MAX_LAG, pin).await
+    }
+
+    /// [`Self::get_account`], answering a followed account only at a block at
+    /// most `max_lag` below the head and not below `not_below`.
+    async fn get_account_following(
+        &self,
+        anchor: ReadAnchor,
+        address: [u8; 20],
+        max_lag: u64,
+        not_below: Option<u64>,
+    ) -> Result<VerifiedAccount, String> {
+        if anchor == ReadAnchor::Head {
+            if let Some(followed) = self.followed_account(address, max_lag, not_below) {
+                return Ok(followed);
+            }
+        }
+        let result = self.get_account_proven(anchor, address).await?;
+        if anchor == ReadAnchor::Head {
+            self.seed_followed(&result);
+        }
+        Ok(result)
+    }
+
+    /// A watched account's state at the head (or at most `max_lag` below it)
+    /// from the activity follower's verified BALs, carried from an earlier
+    /// proof ([`ActivityState::followed_answer`](crate::el::activity::ActivityState::followed_answer)),
+    /// or `None` for a read that needs a proof.
+    ///
+    /// The block answered at must be one the anchor attests by its state root,
+    /// with the hash the follower holds for it: the same bar a
+    /// `stateRootMatch` proof clears, so the answer is labelled as one is
+    /// (slot, BLS flag, `blockHash`), with its own `verifyMethod`.
+    ///
+    /// `not_below`: never an answer from a block below it (a pinned read).
+    fn followed_account(&self, address: [u8; 20], max_lag: u64, not_below: Option<u64>) -> Option<VerifiedAccount> {
+        let (head, head_hash) = self.anchored_head().ok()?;
+        let is_ancestor = |number: u64, hash: &[u8; 32]| {
+            (number == head && *hash == head_hash)
+                || (number < head
+                    && self.anchor.recent_head_at(number).is_some_and(|r| r.linked && r.hash == *hash))
+        };
+        let answer = self
+            .activity
+            .lock()
+            .ok()?
+            .followed_answer(&address, head, max_lag, is_ancestor)
+            .filter(|a| not_below.is_none_or(|n| a.number >= n))?;
+        let attested = self.anchor.find_state_root(&answer.state_root)?;
+        if self.proven_block_hash(answer.number, &answer.state_root) != Some(answer.hash) {
+            return None;
+        }
+        if let Ok(mut stats) = self.activity_bal_stats.lock() {
+            stats.answered += 1;
+        }
+        let (fin_num, opt_num, synced) = self.anchor_diagnostics();
+        let values = answer.values;
+        Some(VerifiedAccount {
+            address,
+            account_hash: keccak256(&address),
+            exists: values.exists,
+            nonce: values.nonce,
+            balance: values.balance,
+            storage_root: values.storage_root,
+            code_hash: values.code_hash,
+            block_number: answer.number,
+            // The follower's header, hash-linked to the attested block.
+            block_timestamp: Some(answer.timestamp),
+            block_hash: Some(answer.hash),
+            peer_state_root: answer.state_root,
+            // No proof was fetched for this read: the state is the one a
+            // verified proof established, carried by verified BALs.
+            peer_proof_valid: true,
+            beacon_chain_verified: true,
+            bls_verified: attested.bls_verified,
+            matched_beacon_slot: attested.slot as i64,
+            verify_method: Some(VERIFY_BLOCK_ACCESS_LIST),
+            fail_reason: None,
+            beacon_synced: synced,
+            finalized_block_number: fin_num,
+            optimistic_block_number: opt_num,
+            finalized: false,
+        })
+    }
+
+    /// Hand a verified head proof of a watched account to the activity
+    /// follower, which carries it forward from then on. Only a proof whose
+    /// block the anchor vouches for by hash: the follower carries it only
+    /// along a kept run that holds that very block.
+    fn seed_followed(&self, r: &VerifiedAccount) {
+        let (Some(hash), true, false) = (r.block_hash, r.verify_method.is_some(), r.finalized) else {
+            return;
+        };
+        let first = r.balance.iter().position(|&b| b != 0).unwrap_or(r.balance.len());
+        let values = crate::el::activity::AccountValues {
+            exists: r.exists,
+            nonce: r.nonce,
+            balance: r.balance[first..].to_vec(),
+            storage_root: r.storage_root,
+            code_hash: r.code_hash,
+        };
+        if let Ok(mut state) = self.activity.lock() {
+            state.seed(r.address, r.block_number, hash, values);
+        }
+    }
+
+    /// [`Self::get_account`] by proof alone: snap (or Tor), never the
+    /// follower's BALs.
+    async fn get_account_proven(
         &self,
         anchor: ReadAnchor,
         address: [u8; 20],
@@ -6750,7 +6890,18 @@ impl ElReader {
         anchor: ReadAnchor,
         address: [u8; 20],
     ) -> Result<VerifiedCode, String> {
-        let account = self.get_account(anchor, address).await?;
+        self.get_code_pinned(anchor, address, None).await
+    }
+
+    /// [`Self::get_code`] for a read pinned to block `pin`
+    /// ([`Self::get_account_pinned`]).
+    pub async fn get_code_pinned(
+        &self,
+        anchor: ReadAnchor,
+        address: [u8; 20],
+        pin: Option<u64>,
+    ) -> Result<VerifiedCode, String> {
+        let account = self.get_account_pinned(anchor, address, pin).await?;
         let mut result = VerifiedCode {
             address,
             exists: account.exists,
@@ -8285,9 +8436,12 @@ impl ElReader {
                     number: vh.header.number,
                     hash: vh.hash,
                     parent_hash: vh.header.parent_hash,
+                    state_root: vh.header.state_root,
+                    timestamp: vh.header.timestamp,
                     bloom: Box::new(bloom),
                     bal_hash: vh.header.block_access_list_hash,
                     account: None,
+                    watched_changes: Box::new([]),
                     bal_undecodable: false,
                 })
             })
@@ -8385,12 +8539,21 @@ impl ElReader {
             let mut still = Vec::new();
             let mut got = 0usize;
             for (want, entry) in missing.into_iter().zip(entries) {
-                let changed = entry.map(|raw| crate::el::snap::messages::bal_changed_accounts(&raw));
+                let changed = entry.map(|raw| {
+                    crate::el::snap::messages::bal_changed_accounts(&raw).map(|changed| (changed, raw))
+                });
                 match changed {
-                    Some(Ok(changed)) => {
+                    Some(Ok((changed, raw))) => {
                         got += 1;
+                        // The post-block values carry followed accounts. A
+                        // decode failure here costs only that: the changed
+                        // accounts it leaves without values go back to a proof.
+                        let values = crate::el::snap::messages::bal_account_changes(&raw).unwrap_or_else(|e| {
+                            tracing::warn!(block = want.0, error = %e.0, "activity: a verified block access list's values did not decode; its changed accounts are proven again");
+                            Vec::new()
+                        });
                         if let Ok(mut state) = self.activity.lock() {
-                            state.set_account(want.0, &want.1, changed);
+                            state.set_account(want.0, &want.1, changed, values);
                         }
                     }
                     Some(Err(e)) => {
@@ -8435,6 +8598,7 @@ impl ElReader {
                 verified = done.verified.len(),
                 bal_peers_max = done.bal_peers_max,
                 serving = ?done.serving,
+                answered_from_bals = done.answered,
                 "activity: block access lists in the last minute"
             );
         }
@@ -8949,7 +9113,12 @@ impl ElReader {
         let read = tokio::spawn(async move {
             let _permit = permit;
             reader
-                .request_with_budget(send_check::DETACHED_READ_BUDGET, reader.get_account(ReadAnchor::Head, from))
+                // At the head itself (no lag): the verdict needs the head's
+                // own state root.
+                .request_with_budget(
+                    send_check::DETACHED_READ_BUDGET,
+                    reader.get_account_following(ReadAnchor::Head, from, 0, None),
+                )
                 .await
         });
         let read = match tokio::time::timeout(send_check::ACCOUNT_READ_BUDGET, read).await {
@@ -18392,5 +18561,70 @@ mod pre_broadcast_tests {
             assert_eq!(el.block_time.as_secs(), cl.seconds_per_slot, "{}", el.network_id);
             assert_eq!(el.network_id, chain_id);
         }
+    }
+
+    /// A follower record of block `number` (`hash`, state root `root`) on top of `parent`.
+    fn record(number: u64, hash: [u8; 32], parent: [u8; 32], root: [u8; 32]) -> crate::el::activity::BlockRecord {
+        crate::el::activity::BlockRecord {
+            number,
+            hash,
+            parent_hash: parent,
+            state_root: root,
+            timestamp: number * 12,
+            bloom: Box::new([0; 256]),
+            bal_hash: Some([0xba; 32]),
+            account: None,
+            watched_changes: Box::new([]),
+            bal_undecodable: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_watched_account_proven_once_is_answered_from_bals_without_a_proof() {
+        use crate::el::snap::messages::BalAccountChange;
+        // Head 100 (hash [4; 32], root [2; 32]) on top of 99 ([5; 32], root [6; 32]).
+        let reader = offline_reader(Some(now_unix())).await;
+        let a = [0x9d; 20];
+        {
+            let mut st = reader.activity.lock().unwrap();
+            st.apply(&[a], &[]).unwrap();
+            st.install(vec![record(99, [5; 32], [0; 32], [6; 32]), record(100, [4; 32], [5; 32], [2; 32])], 100);
+        }
+        let at_99 = || VerifiedAccount { block_number: 99, block_hash: Some([5; 32]), ..account([6; 32], 4, 5, true) };
+        // Proofs that do not start following: unverified, finalized, or at a
+        // block the anchor does not vouch for by hash.
+        for r in [
+            VerifiedAccount { verify_method: None, ..at_99() },
+            VerifiedAccount { finalized: true, ..at_99() },
+            VerifiedAccount { block_hash: None, ..at_99() },
+        ] {
+            reader.seed_followed(&r);
+            assert!(reader.followed_account(a, 2, None).is_none());
+        }
+        reader.seed_followed(&at_99());
+        // 100's BAL is not in yet: answered at 99, one below the head, never
+        // at no lag (the pre-broadcast check's read), never below a pin of 100.
+        let lagging = reader.followed_account(a, 2, None).expect("answered at 99");
+        assert_eq!((lagging.block_number, lagging.block_hash, lagging.peer_state_root), (99, Some([5; 32]), [6; 32]));
+        assert_eq!(lagging.verify_method, Some(VERIFY_BLOCK_ACCESS_LIST));
+        assert!(reader.followed_account(a, 0, None).is_none());
+        assert!(reader.followed_account(a, 2, Some(100)).is_none());
+        let pinned = reader.get_account_following(ReadAnchor::Head, a, 2, Some(100)).await;
+        assert!(pinned.is_err() || pinned.unwrap().verify_method != Some(VERIFY_BLOCK_ACCESS_LIST));
+        // Only the lagging answer was served (and counted); the pinned read was not.
+        assert_eq!(reader.activity_bal_stats.lock().unwrap().answered, 1);
+        // 100 credits the account.
+        let credit = BalAccountChange { address: a, balance: Some(vec![9]), nonce: None, code_hash: None, storage_written: false };
+        reader.activity.lock().unwrap().set_account(100, &[4; 32], vec![a], vec![credit]);
+        let at_head = reader.get_account(ReadAnchor::Head, a).await.expect("answered with no peer");
+        assert_eq!((at_head.block_number, at_head.block_hash, at_head.peer_state_root), (100, Some([4; 32]), [2; 32]));
+        assert_eq!((at_head.nonce, at_head.balance.clone(), at_head.exists), (4, vec![9], true));
+        assert_eq!(at_head.block_timestamp, Some(1200));
+        assert!(at_head.beacon_chain_verified && at_head.fail_reason.is_none());
+        // A finalized read is always proven: no snap peer, so it fails.
+        assert!(reader.get_account(ReadAnchor::Finalized, a).await.map_or(true, |r| r.verify_method != Some(VERIFY_BLOCK_ACCESS_LIST)));
+        // A follower record whose root the anchor does not attest answers nothing.
+        reader.activity.lock().unwrap().install(vec![record(100, [4; 32], [5; 32], [7; 32])], 100);
+        assert!(reader.followed_account(a, 0, None).is_none());
     }
 }
