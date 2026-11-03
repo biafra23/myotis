@@ -2399,6 +2399,106 @@ pub fn create_access_list_json(handle: i64, tx_json: &str, block: &str, override
     }
 }
 
+/// `debug_traceCall` (ABI ≥ 54, #716): the run [`eth_call_tx_json`] makes for
+/// the transaction object, at `block`, with `overrides_json` layered over
+/// verified state, seen through the tracer `tracer_json` names —
+/// `{"tracer":"callTracer"|"prestateTracer","tracerConfig":{…}}`
+/// ([`parse_tracer`]). The request and the tracer are each applied whole or
+/// refused with the permanent `{"error","code":-32602}`, before the handle is
+/// consulted. Otherwise [`eljson::trace_json`]: the trace, `infeasible` for a
+/// request that cannot run within the caller's own limits, or a retryable
+/// `unavailable`.
+pub fn debug_trace_call_json(
+    handle: i64,
+    tx_json: &str,
+    block: &str,
+    overrides_json: &str,
+    tracer_json: &str,
+) -> String {
+    let tracer = match parse_tracer(tracer_json) {
+        Ok(tracer) => tracer,
+        Err(msg) => return eljson::invalid_params_json(&msg),
+    };
+    let (tx, selector, overrides) = match parse_tx_args(tx_json, block, overrides_json) {
+        Ok(parsed) => parsed,
+        Err(json) => return json,
+    };
+    let (engine, reader, chain_id, anchor) = match tx_target(handle, &tx, selector) {
+        Ok(target) => target,
+        Err(json) => return json,
+    };
+    match engine.rt.block_on(async { reader.trace_call(anchor, tx, chain_id, overrides, tracer).await }) {
+        Ok(answer) => eljson::trace_json(&answer),
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
+/// The tracer a `debug_traceCall` asks for: `tracer` names geth's
+/// `callTracer` (options `onlyTopCall`, `withLog`) or `prestateTracer`
+/// (options `disableCode`, `disableStorage`, `includeEmpty`), and
+/// `tracerConfig` (absent or null: none) sets the options as booleans. Applied
+/// or refused, never ignored: no tracer (geth's default opcode logger), any
+/// other tracer, an unknown key, a non-boolean option, and `diffMode` set are
+/// refused with the reason.
+fn parse_tracer(tracer_json: &str) -> Result<myotis_evm::trace::Tracer, String> {
+    use myotis_evm::trace::Tracer;
+    let value: serde_json::Value = if tracer_json.trim().is_empty() {
+        serde_json::Value::Object(Default::default())
+    } else {
+        serde_json::from_str(tracer_json).map_err(|e| format!("invalid trace config: {e}"))?
+    };
+    let obj = value.as_object().ok_or("invalid trace config: expected an object")?;
+    for key in obj.keys() {
+        if key != "tracer" && key != "tracerConfig" {
+            return Err(format!("invalid trace config: '{key}' is not applied by this node"));
+        }
+    }
+    let name = match obj.get("tracer") {
+        None | Some(serde_json::Value::Null) => {
+            return Err("this node serves the callTracer and prestateTracer only; name one in 'tracer' (geth's default opcode logger is not served)"
+                .to_string())
+        }
+        Some(serde_json::Value::String(name)) => name.as_str(),
+        Some(_) => return Err("invalid trace config: 'tracer' must be a string".to_string()),
+    };
+    let config = match obj.get("tracerConfig") {
+        None | Some(serde_json::Value::Null) => serde_json::Map::new(),
+        Some(serde_json::Value::Object(config)) => config.clone(),
+        Some(_) => return Err("invalid trace config: 'tracerConfig' must be an object".to_string()),
+    };
+    let allowed: &[&str] = match name {
+        "callTracer" => &["onlyTopCall", "withLog"],
+        "prestateTracer" => &["diffMode", "disableCode", "disableStorage", "includeEmpty"],
+        other => {
+            return Err(format!(
+                "the tracer '{other}' is not served by this node; it serves the callTracer and prestateTracer"
+            ))
+        }
+    };
+    let mut flags = std::collections::HashMap::new();
+    for (key, value) in &config {
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!("the {name} option '{key}' is not applied by this node"));
+        }
+        let flag = value.as_bool().ok_or_else(|| format!("the {name} option '{key}' must be a boolean"))?;
+        flags.insert(key.as_str(), flag);
+    }
+    let flag = |key: &str| flags.get(key).copied().unwrap_or(false);
+    Ok(match name {
+        "callTracer" => Tracer::Call { only_top_call: flag("onlyTopCall"), with_log: flag("withLog") },
+        _ => {
+            if flag("diffMode") {
+                return Err("the prestateTracer's diffMode is not served by this node".to_string());
+            }
+            Tracer::Prestate {
+                disable_code: flag("disableCode"),
+                disable_storage: flag("disableStorage"),
+                include_empty: flag("includeEmpty"),
+            }
+        }
+    })
+}
+
 /// The request half of the transaction-object entry points. Every refusal of
 /// the request's own arguments is permanent (-32602), and decided before the
 /// handle is consulted: no retry, and no sync progress, changes a
@@ -6536,6 +6636,51 @@ mod get_logs_filter_tests {
             format!("{{\"topics\":[null,null,null,null,{t}]}}"),
         ] {
             assert!(f(&bad).unwrap_err().contains("without an address"), "{bad}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod trace_config_tests {
+    use super::parse_tracer;
+    use myotis_evm::trace::Tracer;
+
+    #[test]
+    fn applies_the_two_tracers_and_their_options() {
+        assert_eq!(
+            parse_tracer(r#"{"tracer":"callTracer"}"#),
+            Ok(Tracer::Call { only_top_call: false, with_log: false })
+        );
+        assert_eq!(
+            parse_tracer(r#"{"tracer":"callTracer","tracerConfig":{"onlyTopCall":true,"withLog":true}}"#),
+            Ok(Tracer::Call { only_top_call: true, with_log: true })
+        );
+        assert_eq!(
+            parse_tracer(r#"{"tracer":"prestateTracer","tracerConfig":{"disableCode":true,"includeEmpty":true,"diffMode":false}}"#),
+            Ok(Tracer::Prestate { disable_code: true, disable_storage: false, include_empty: true })
+        );
+        assert_eq!(
+            parse_tracer(r#"{"tracer":"prestateTracer","tracerConfig":null}"#),
+            Ok(Tracer::Prestate { disable_code: false, disable_storage: false, include_empty: false })
+        );
+    }
+
+    /// Applied or refused: what this node does not do is named, never ignored.
+    #[test]
+    fn refuses_what_it_does_not_apply() {
+        for (config, says) in [
+            ("{}", "default opcode logger"),
+            ("", "default opcode logger"),
+            (r#"{"tracer":"4byteTracer"}"#, "'4byteTracer' is not served"),
+            (r#"{"tracer":"callTracer","tracerConfig":{"withLogs":true}}"#, "'withLogs' is not applied"),
+            (r#"{"tracer":"callTracer","tracerConfig":{"withLog":"yes"}}"#, "must be a boolean"),
+            (r#"{"tracer":"prestateTracer","tracerConfig":{"diffMode":true}}"#, "diffMode is not served"),
+            (r#"{"tracer":"callTracer","timeout":"5s"}"#, "'timeout' is not applied"),
+            (r#"{"tracer":7}"#, "must be a string"),
+            ("[]", "expected an object"),
+        ] {
+            let err = parse_tracer(config).unwrap_err();
+            assert!(err.contains(says), "{config}: {err}");
         }
     }
 }

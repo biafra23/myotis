@@ -81,3 +81,26 @@ replay: state unavailable for 0x…").
 
 The format is `myotis-evm-fixture/1`, documented in
 `rust/myotis-evm/src/fixture/world.rs`.
+
+## `callTracer-golden.json` and `relayadapt7702-shield-calltrace.json`
+
+`debug_traceCall` answers from a full node, the references for this node's
+`callTracer` (#716; `executor::tests::trace_call_matches_a_full_nodes_call_tracer`
+and `relay_adapt_7702_shield::the_call_trace_matches_a_full_nodes`). Both were
+fetched from `eth.drpc.org` on 2026-11-03: its client is not identified, but its
+answers have geth's `callTracer` shape. The tests compare every frame and log,
+gas included.
+
+- `callTracer-golden.json`: two synthetic call trees (nested calls, a STATICCALL,
+  logs, a reverted callee with a `Panic` reason) at mainnet block 19,500,000
+  (Cancun). The contracts are installed by `stateOverrides`, so nothing else is
+  read; the replay installs the same code in a fixture world.
+- `relayadapt7702-shield-calltrace.json`: the recorded shield request
+  (`relayadapt7702-shield.json`) at its block, with its state override, an
+  explicit 30,000,000 gas limit (this node's call budget; without a `gas` the
+  node used its own RPC gas cap) and `withLog`.
+
+Only the `callTracer` is pinned this way. The same provider's `prestateTracer`
+answers differ from current geth (no `codeHash`, no coinbase entry), so that
+tracer follows geth's source (`eth/tracers/native/prestate.go`) and is covered by
+unit tests instead.

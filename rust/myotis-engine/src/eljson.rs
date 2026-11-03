@@ -11,7 +11,7 @@
 use myotis_evm::EvmError;
 use myotis_net::el::evm::{
     AccessListAnswer, AccessListOutcome, CallAnswer, CallOutcome, EnsOutcome, EnsQueryOutcome,
-    EnsRecordValue, GasOutcome,
+    EnsRecordValue, GasOutcome, TraceAnswer, TraceOutcome,
 };
 use myotis_net::el::reader::{
     FeeEstimate, FeeHistory, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedReceipt,
@@ -858,6 +858,115 @@ pub fn access_list_json(answer: &AccessListAnswer) -> String {
     let ran = !matches!(answer.outcome, AccessListOutcome::Unavailable(_));
     obj.insert("verified".into(), (answer.finalized && ran).into());
     serde_json::Value::Object(obj).to_string()
+}
+
+/// `debug_traceCall` result (#716): `{"status":"ok","trace":…}` — the trace in
+/// geth's shape ([`trace_value`]) — / `{"status":"unavailable","reason"}`
+/// (retryable) / `{"status":"infeasible","reason"}` (geth's -32000 in geth's
+/// words) / the permanent `{"error","code":-32602}` for a refusal. Every
+/// status names the block it ran against (`blockNumber`, `verified`), as
+/// [`access_list_json`] does.
+pub fn trace_json(answer: &TraceAnswer) -> String {
+    let mut obj = serde_json::Map::new();
+    match &answer.outcome {
+        TraceOutcome::Refused(reason) => return invalid_params_json(reason),
+        TraceOutcome::Traced(trace) => {
+            obj.insert("status".into(), "ok".into());
+            obj.insert("trace".into(), trace_value(trace));
+        }
+        TraceOutcome::Unavailable(reason) => {
+            obj.insert("status".into(), "unavailable".into());
+            obj.insert("reason".into(), reason.as_str().into());
+        }
+        TraceOutcome::Infeasible(reason) => {
+            obj.insert("status".into(), "infeasible".into());
+            obj.insert("reason".into(), reason.as_str().into());
+        }
+    }
+    obj.insert("blockNumber".into(), json_u64(answer.block_number));
+    let ran = !matches!(answer.outcome, TraceOutcome::Unavailable(_));
+    obj.insert("verified".into(), (answer.finalized && ran).into());
+    serde_json::Value::Object(obj).to_string()
+}
+
+/// A trace as geth's tracers serialize it: `callTracer`'s `callFrame`
+/// (`from`, `gas`, `gasUsed`, `to`, `input`, `output`, `error`,
+/// `revertReason`, `calls`, `logs`, `value`, `type` — the empty and absent ones
+/// left out as geth leaves them out) or `prestateTracer`'s map of accounts
+/// (`balance`, `code`, `codeHash`, `nonce` as a number, `storage`).
+pub fn trace_value(trace: &myotis_evm::trace::Trace) -> serde_json::Value {
+    match trace {
+        myotis_evm::trace::Trace::Call(frame) => call_frame_value(frame),
+        myotis_evm::trace::Trace::Prestate(accounts) => {
+            let mut map = serde_json::Map::new();
+            for (address, account) in accounts {
+                let mut entry = serde_json::Map::new();
+                entry.insert("balance".into(), hex_quantity_scalar(&account.balance.to_be_bytes::<32>()).into());
+                if let Some(code) = &account.code {
+                    entry.insert("code".into(), hex0x_var(code).into());
+                }
+                if let Some(hash) = &account.code_hash {
+                    entry.insert("codeHash".into(), hex0x(hash).into());
+                }
+                if account.nonce != 0 {
+                    entry.insert("nonce".into(), json_u64(account.nonce));
+                }
+                if let Some(storage) = account.storage.as_ref().filter(|s| !s.is_empty()) {
+                    let slots = storage.iter().map(|(k, v)| (hex0x(k), serde_json::Value::from(hex0x(v)))).collect();
+                    entry.insert("storage".into(), serde_json::Value::Object(slots));
+                }
+                map.insert(hex0x_var(address), serde_json::Value::Object(entry));
+            }
+            serde_json::Value::Object(map)
+        }
+    }
+}
+
+fn call_frame_value(frame: &myotis_evm::trace::CallFrame) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("from".into(), hex0x_var(&frame.from).into());
+    obj.insert("gas".into(), hex_quantity(frame.gas).into());
+    obj.insert("gasUsed".into(), hex_quantity(frame.gas_used).into());
+    if let Some(to) = &frame.to {
+        obj.insert("to".into(), hex0x_var(to).into());
+    }
+    obj.insert("input".into(), hex0x_var(&frame.input).into());
+    if let Some(output) = frame.output.as_ref().filter(|o| !o.is_empty()) {
+        obj.insert("output".into(), hex0x_var(output).into());
+    }
+    if let Some(error) = &frame.error {
+        obj.insert("error".into(), error.as_str().into());
+    }
+    if let Some(reason) = frame.revert_reason.as_ref().filter(|r| !r.is_empty()) {
+        obj.insert("revertReason".into(), reason.as_str().into());
+    }
+    if !frame.calls.is_empty() {
+        obj.insert("calls".into(), serde_json::Value::Array(frame.calls.iter().map(call_frame_value).collect()));
+    }
+    if !frame.logs.is_empty() {
+        let logs = frame
+            .logs
+            .iter()
+            .map(|log| {
+                let mut entry = serde_json::Map::new();
+                entry.insert("address".into(), hex0x_var(&log.address).into());
+                entry.insert(
+                    "topics".into(),
+                    serde_json::Value::Array(log.topics.iter().map(|t| hex0x(t).into()).collect()),
+                );
+                entry.insert("data".into(), hex0x_var(&log.data).into());
+                entry.insert("index".into(), hex_quantity(log.index).into());
+                entry.insert("position".into(), hex_quantity(log.position).into());
+                serde_json::Value::Object(entry)
+            })
+            .collect();
+        obj.insert("logs".into(), serde_json::Value::Array(logs));
+    }
+    if let Some(value) = &frame.value {
+        obj.insert("value".into(), hex_quantity_scalar(&value.to_be_bytes::<32>()).into());
+    }
+    obj.insert("type".into(), frame.kind.name().into());
+    serde_json::Value::Object(obj)
 }
 
 /// `estimateGas` result: `{"status":"ok","gas":N}` (the gas-limit estimate as a
@@ -1807,6 +1916,90 @@ mod tests {
             full_transactions: None,
             raw_transactions: Default::default(),
         }
+    }
+
+    /// geth's callTracer and prestateTracer shapes: absent fields left out as
+    /// geth leaves them out, QUANTITYs as hex, a prestate nonce as a number.
+    #[test]
+    fn trace_json_shapes_are_geths() {
+        use myotis_evm::trace::{CallFrame, CallLog, FrameKind, PrestateAccount, Trace};
+        use myotis_evm::U256;
+        use myotis_net::el::evm::{TraceAnswer, TraceOutcome};
+        let child = CallFrame {
+            kind: FrameKind::StaticCall,
+            from: [0x11; 20],
+            to: Some([0x22; 20]),
+            value: None,
+            gas: 100,
+            gas_used: 0,
+            input: Vec::new(),
+            output: None,
+            error: Some("execution reverted".into()),
+            revert_reason: Some("nope".into()),
+            calls: Vec::new(),
+            logs: Vec::new(),
+        };
+        let root = CallFrame {
+            kind: FrameKind::Call,
+            from: [0x42; 20],
+            to: Some([0x11; 20]),
+            value: Some(U256::from(255)),
+            gas: 1_000_000,
+            gas_used: 21_000,
+            input: vec![0xab],
+            output: Some(vec![0x01]),
+            error: None,
+            revert_reason: None,
+            calls: vec![child],
+            logs: vec![CallLog { address: [0x11; 20], topics: vec![[0x99; 32]], data: vec![], index: 0, position: 1 }],
+        };
+        let answer = TraceAnswer { outcome: TraceOutcome::Traced(Trace::Call(Box::new(root))), block_number: 7, finalized: false };
+        let v: serde_json::Value = serde_json::from_str(&trace_json(&answer)).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["blockNumber"], 7);
+        let t = &v["trace"];
+        assert_eq!(t["type"], "CALL");
+        assert_eq!((t["gas"].as_str(), t["gasUsed"].as_str(), t["value"].as_str()), (Some("0xf4240"), Some("0x5208"), Some("0xff")));
+        assert_eq!((t["input"].as_str(), t["output"].as_str()), (Some("0xab"), Some("0x01")));
+        assert!(t.get("error").is_none() && t.get("revertReason").is_none());
+        assert_eq!(t["logs"][0]["position"], "0x1");
+        assert_eq!(t["logs"][0]["index"], "0x0");
+        let c = &t["calls"][0];
+        assert_eq!(c["type"], "STATICCALL");
+        assert!(c.get("value").is_none(), "a STATICCALL has no value");
+        assert!(c.get("output").is_none() && c.get("calls").is_none() && c.get("logs").is_none());
+        assert_eq!((c["input"].as_str(), c["error"].as_str(), c["revertReason"].as_str()), (Some("0x"), Some("execution reverted"), Some("nope")));
+
+        let mut accounts = std::collections::BTreeMap::new();
+        accounts.insert(
+            [0x11; 20],
+            PrestateAccount {
+                balance: U256::from(16),
+                nonce: 2,
+                code: Some(vec![0x60, 0x00]),
+                code_hash: Some([0x77; 32]),
+                storage: Some([([0x01; 32], [0x02; 32])].into_iter().collect()),
+            },
+        );
+        accounts.insert(
+            [0x22; 20],
+            PrestateAccount { balance: U256::ZERO, nonce: 0, code: None, code_hash: None, storage: Some(Default::default()) },
+        );
+        let answer = TraceAnswer { outcome: TraceOutcome::Traced(Trace::Prestate(accounts)), block_number: 7, finalized: true };
+        let v: serde_json::Value = serde_json::from_str(&trace_json(&answer)).unwrap();
+        assert_eq!(v["verified"], true);
+        let a = &v["trace"][hex0x_var(&[0x11; 20])];
+        assert_eq!((a["balance"].as_str(), a["nonce"].as_u64(), a["code"].as_str()), (Some("0x10"), Some(2), Some("0x6000")));
+        assert_eq!(a["codeHash"], hex0x(&[0x77; 32]));
+        assert_eq!(a["storage"][hex0x(&[0x01; 32])], hex0x(&[0x02; 32]));
+        let b = v["trace"][hex0x_var(&[0x22; 20])].as_object().unwrap();
+        assert_eq!(b.keys().collect::<Vec<_>>(), vec!["balance"], "only the balance: geth leaves the rest out");
+
+        // A refusal is the permanent envelope; infeasible and unavailable are statuses.
+        let refused = TraceAnswer { outcome: TraceOutcome::Refused("no".into()), block_number: 7, finalized: false };
+        assert!(trace_json(&refused).contains("-32602"));
+        let infeasible = TraceAnswer { outcome: TraceOutcome::Infeasible("out of gas".into()), block_number: 7, finalized: false };
+        assert!(trace_json(&infeasible).contains("\"status\":\"infeasible\""));
     }
 
     #[test]

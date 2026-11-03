@@ -82,6 +82,8 @@ class RpcRouter internal constructor(
             // #715: the blob base fee, the account leaf in one proof, raw transactions.
             "eth_blobBaseFee" to 0, "eth_getAccount" to 2, "eth_getRawTransactionByHash" to 1,
             "eth_getRawTransactionByBlockNumberAndIndex" to 2, "eth_getRawTransactionByBlockHashAndIndex" to 2,
+            // #716: transaction, block, trace config (tracer, its options, state overrides).
+            "debug_traceCall" to 3,
             // The polled filter family over the log index and the verified head (#714).
             "eth_newFilter" to 1, "eth_newBlockFilter" to 0, "eth_getFilterChanges" to 1,
             "eth_getFilterLogs" to 1, "eth_uninstallFilter" to 1,
@@ -239,9 +241,12 @@ class RpcRouter internal constructor(
         data class Malformed(val why: String) : OverrideParam
     }
 
-    private fun stateOverrideParam(root: JsonObject): OverrideParam {
-        val raw = root.params()?.getOrNull(2) ?: return OverrideParam.Absent
-        if (raw is JsonNull) return OverrideParam.Absent
+    private fun stateOverrideParam(root: JsonObject): OverrideParam = overrideParamOf(root.params()?.getOrNull(2))
+
+    /** [stateOverrideParam]'s reading of one override object, wherever the
+     *  request carries it (`debug_traceCall`'s sits in its trace config). */
+    private fun overrideParamOf(raw: JsonElement?): OverrideParam {
+        if (raw == null || raw is JsonNull) return OverrideParam.Absent
         val ov = raw as? JsonObject
             ?: return OverrideParam.Malformed("state override must be an object keyed by address")
         var changesExecution = false
@@ -265,6 +270,25 @@ class RpcRouter internal constructor(
         return OverrideParam.Valid(json.encodeToString(JsonObject.serializer(), ov))
     }
 
+    /** The keys a `debug_traceCall` trace config may carry: the tracer and its
+     *  options (the engine applies or refuses them), a state override (applied),
+     *  a block override (refused unless empty), and geth's `timeout`. geth's
+     *  logger options shape only its default opcode logger, which is not served,
+     *  so they are refused with any other key. */
+    private val traceConfigKeys = setOf("tracer", "tracerConfig", "stateOverrides", "blockOverrides", "timeout")
+
+    /** `debug_traceCall`'s trace config (params[2]): absent or null is none. */
+    private fun traceConfig(root: JsonObject): JsonObject? =
+        when (val raw = root.params()?.getOrNull(2)) {
+            null, is JsonNull -> JsonObject(emptyMap())
+            is JsonObject -> raw
+            else -> null
+        }
+
+    /** The state override a `debug_traceCall` applies, as JSON, or null. */
+    private fun traceOverrideJson(root: JsonObject): String? =
+        (overrideParamOf(traceConfig(root)?.get("stateOverrides")) as? OverrideParam.Valid)?.json
+
     /** [stateOverrideParam]'s JSON when it is one to apply, else null. */
     private fun stateOverrideJson(root: JsonObject): String? =
         (stateOverrideParam(root) as? OverrideParam.Valid)?.json
@@ -274,12 +298,21 @@ class RpcRouter internal constructor(
      *  Only an absent parameter, JSON null or an empty object is inert; any
      *  other value — a non-empty object, or one that is not an object at all —
      *  is present, refused rather than ignored (#366 review). */
-    private fun blockOverridePresent(root: JsonObject): Boolean =
-        when (val raw = root.params()?.getOrNull(3)) {
+    private fun blockOverridePresent(root: JsonObject): Boolean = blockOverrideIn(root.params()?.getOrNull(3))
+
+    /** [blockOverridePresent]'s reading of one block override, wherever the
+     *  request carries it (`debug_traceCall`'s sits in its trace config). */
+    private fun blockOverrideIn(raw: JsonElement?): Boolean =
+        when (raw) {
             null, is JsonNull -> false
             is JsonObject -> raw.isNotEmpty()
             else -> true
         }
+
+    /** A Go duration (`time.ParseDuration`): one or more decimal numbers, each
+     *  with a unit (`ns`, `us`, `µs`, `ms`, `s`, `m`, `h`), optionally signed —
+     *  what geth reads a trace config's `timeout` as. */
+    private val goDuration = Regex("""^[+-]?(([0-9]+(\.[0-9]*)?|\.[0-9]+)(ns|us|µs|μs|ms|s|m|h))+$|^[+-]?0$""")
 
     /** True when the request is a contract-creation `eth_call`: `to` absent or
      *  explicitly null. A present-but-malformed `to` is NOT creation — running
@@ -606,6 +639,7 @@ class RpcRouter internal constructor(
             // returns null above.
             val label =
                 if (takesOverrides(method) && stateOverrideJson(root) != null) "SIMULATED"
+                else if (method == "debug_traceCall" && traceOverrideJson(root) != null) "SIMULATED"
                 else "VERIFIED"
             // NB a code-3 REVERT response counts here too, deliberately: the
             // revert is a verified (or simulated) ANSWER, not a failure to
@@ -1666,6 +1700,72 @@ class RpcRouter internal constructor(
                     // The request cannot run within the caller's gas, fee cap or
                     // funds: geth's -32000 in geth's words, as for eth_call.
                     RpcAccessListResult.Kind.INFEASIBLE -> errorEnvelope(id, -32000, outcome.detail ?: "out of gas")
+                }
+            }
+            // debug_traceCall (#716): the run eth_call makes for the transaction
+            // object, seen through geth's callTracer or prestateTracer. Everything
+            // the request carries is applied or refused here or in the engine:
+            // the tracer and its options (the engine's refusal is permanent), the
+            // state override (applied as eth_call applies it), a block override
+            // (refused, as eth_call refuses it), and any other config key.
+            "debug_traceCall" -> {
+                if (!b.supportsCallTracing()) {
+                    invalid("method 'debug_traceCall' is not supported by this node's engine (the Java engine " +
+                        "traces no calls — select the Rust engine)")
+                }
+                val config = traceConfig(root) ?: invalid("invalid argument 2: expected a trace config object")
+                for (key in config.keys) {
+                    if (key !in traceConfigKeys) {
+                        invalid("invalid argument 2: '$key' is not applied by this node (it serves the callTracer " +
+                            "and prestateTracer, whose options go in 'tracerConfig')")
+                    }
+                }
+                if (blockOverrideIn(config["blockOverrides"])) {
+                    invalid("debug_traceCall with blockOverrides is not supported by this node (the override " +
+                        "was rejected, not ignored)")
+                }
+                // geth's timeout bounds how long it waits, never what it answers;
+                // this node's own request bound applies. It is still read as geth
+                // reads it, and refused where geth refuses it.
+                config["timeout"]?.let { timeout ->
+                    val text = (timeout as? JsonPrimitive)?.takeIf { it.isString }?.content
+                    if (timeout !is JsonNull && (text == null || !goDuration.matches(text))) {
+                        invalid("invalid argument 2: 'timeout' must be a duration string such as \"5s\"")
+                    }
+                }
+                val overrideJson = when (val ov = overrideParamOf(config["stateOverrides"])) {
+                    OverrideParam.Absent -> null
+                    is OverrideParam.Valid -> ov.json
+                    is OverrideParam.Malformed -> invalid("invalid state override: ${ov.why}")
+                }
+                if (overrideJson != null && !b.supportsStateOverrides()) {
+                    invalid("debug_traceCall with state overrides is not supported by this node's engine")
+                }
+                val serve = when (val parsed = callTx(root, "debug_traceCall")) {
+                    is CallTx.Serve -> parsed
+                    is CallTx.Refuse -> invalid(parsed.why)
+                }
+                if (serve.tx.to == null && !b.supportsContractCreation()) {
+                    invalid("debug_traceCall without a 'to' (contract creation) is not supported by this node's engine")
+                }
+                val block = stateBlock(serve.selector, b, "debug_traceCall") ?: return null
+                val tracerJson = json.encodeToString(JsonObject.serializer(), buildJsonObject {
+                    config["tracer"]?.let { put("tracer", it) }
+                    config["tracerConfig"]?.let { put("tracerConfig", it) }
+                })
+                val outcome = withContext(rpcIoDispatcher) { b.traceCall(serve.tx, block.value, overrideJson, tracerJson) }
+                when (outcome.kind) {
+                    RpcTraceResult.Kind.OK -> {
+                        // A trace the backend could not shape is drift → retryable.
+                        val trace = outcome.traceJson?.let { runCatching { json.parseToJsonElement(it) }.getOrNull() }
+                            as? JsonObject ?: return null
+                        resultEnvelope(id, trace)
+                    }
+                    RpcTraceResult.Kind.UNAVAILABLE ->
+                        outcome.detail?.takeIf { it.isNotBlank() }?.let { throw EngineReadUnavailable(it) }
+                            ?: return null
+                    RpcTraceResult.Kind.REFUSED -> throw EngineRefused(outcome.detail ?: "refused")
+                    RpcTraceResult.Kind.INFEASIBLE -> errorEnvelope(id, -32000, outcome.detail ?: "out of gas")
                 }
             }
             "eth_estimateGas" -> {

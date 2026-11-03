@@ -6,6 +6,7 @@ import io.myotis.engine.capi.myotis_canonical_network_name
 import io.myotis.engine.capi.myotis_check_raw_transaction_json
 import io.myotis.engine.capi.myotis_create
 import io.myotis.engine.capi.myotis_create_access_list_json
+import io.myotis.engine.capi.myotis_debug_trace_call_json
 import io.myotis.engine.capi.myotis_drain_logs
 import io.myotis.engine.capi.myotis_ens_record_json
 import io.myotis.engine.capi.myotis_estimate_gas_json
@@ -317,6 +318,12 @@ object RustEngine {
      *  envelope. */
     fun createAccessListJson(handle: Long, txJson: String, block: String, stateOverrides: String): String =
         jsonCall { myotis_create_access_list_json(handle, txJson, block, stateOverrides) }
+
+    /** `debug_traceCall` (ABI 54, #716): `{"status":"ok","trace":…}`, `infeasible`,
+     *  `unavailable`, or the permanent -32602 envelope for a tracer or option this
+     *  engine does not apply. */
+    fun debugTraceCallJson(handle: Long, txJson: String, block: String, stateOverrides: String, tracerJson: String): String =
+        jsonCall { myotis_debug_trace_call_json(handle, txJson, block, stateOverrides, tracerJson) }
 
     fun getBlockByNumberJson(handle: Long, blockTag: String, fullTransactions: Boolean): String =
         jsonCall { myotis_get_block_by_number_json(handle, blockTag, fullTransactions) }

@@ -576,6 +576,25 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     @Override
+    public boolean supportsCallTracing() {
+        return true;   // ABI 54 (#716): geth's callTracer and prestateTracer over the revm run
+    }
+
+    @Override
+    public io.myotis.api.TraceResult traceCall(io.myotis.api.TransactionArgs tx, String block,
+                                               String stateOverridesJson, String tracerJson) {
+        // As createAccessList: the engine applies the selector, every field of the
+        // object and the tracer, or refuses them as the permanent -32602 (REFUSED).
+        try {
+            return handle.traceCallVerified(tx.json(), block,
+                    stateOverridesJson == null ? "" : stateOverridesJson, tracerJson == null ? "" : tracerJson);
+        } catch (RuntimeException e) {
+            log.info("[engines] verified debug_traceCall unavailable: {}", e.getMessage());
+            return io.myotis.api.TraceResult.unavailable(e.getMessage());
+        }
+    }
+
+    @Override
     public boolean supportsAccessListCreation() {
         return true;   // the revm executor traces and confirms the list (ABI >= 40)
     }

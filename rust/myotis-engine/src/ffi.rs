@@ -377,6 +377,16 @@ pub fn get_transaction_by_hash_json(handle: i64, tx_hash_hex: String) -> String 
     crate::host::get_transaction_by_hash_json(handle, &tx_hash_hex)
 }
 
+/// `debug_traceCall` (ABI ≥ 54, #716): the run `eth_call_tx_json` makes for
+/// the transaction object, seen through the tracer `tracer` names
+/// (`{"tracer":"callTracer"|"prestateTracer","tracerConfig":{…}}`):
+/// `{"status":"ok","trace":…}`, `infeasible`, `unavailable`, or the permanent
+/// `{"error","code":-32602}`; see `crate::host::debug_trace_call_json`.
+#[uniffi::export]
+pub fn debug_trace_call_json(handle: i64, tx: String, block: String, overrides: String, tracer: String) -> String {
+    crate::host::debug_trace_call_json(handle, &tx, &block, &overrides, &tracer)
+}
+
 /// Verified `eth_getRawTransactionByHash` (ABI ≥ 53, #715): `"0x…"` (the raw
 /// consensus bytes as a JSON string), the literal `"null"`, `{"error"}`, or
 /// `{"error","code":-32602}` for a malformed hash; see

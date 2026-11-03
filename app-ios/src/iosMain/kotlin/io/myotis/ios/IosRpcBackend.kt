@@ -2,6 +2,7 @@ package io.myotis.ios
 
 import io.myotis.engine.ios.RustEngine
 import io.myotis.jsonrpc.RpcAccessListResult
+import io.myotis.jsonrpc.RpcTraceResult
 import io.myotis.jsonrpc.RpcBackend
 import io.myotis.jsonrpc.RpcCallResult
 import io.myotis.jsonrpc.RpcEstimateResult
@@ -248,6 +249,31 @@ class IosRpcBackend(
                     ?: return RpcAccessListResult.unavailable("infeasible without a reason from engine"),
             )
             else -> RpcAccessListResult.unavailable(o.engineString("reason"))
+        }
+    }
+
+    override fun supportsCallTracing(): Boolean = true // geth's callTracer and prestateTracer (ABI >= 54)
+
+    override fun traceCall(
+        tx: RpcTransactionArgs,
+        block: String,
+        stateOverridesJson: String?,
+        tracerJson: String,
+    ): RpcTraceResult {
+        val handle = handleProvider() ?: return RpcTraceResult.unavailable("engine not running")
+        val json = RustEngine.debugTraceCallJson(handle, tx.json, block, stateOverridesJson ?: "", tracerJson)
+        // RustChainHandle.traceFromJson's twin.
+        permanentRefusalOrNull(json)?.let { return RpcTraceResult.refused(it) }
+        val o = resultOrNull(json) ?: return RpcTraceResult.unavailable("engine error")
+        return when (o.engineString("status")) {
+            "ok" -> RpcTraceResult.ok(
+                (o["trace"] as? JsonObject)?.toString() ?: return RpcTraceResult.unavailable("ok without a trace from engine"),
+            )
+            "infeasible" -> RpcTraceResult.infeasible(
+                o.engineString("reason")?.takeIf { it.isNotBlank() }
+                    ?: return RpcTraceResult.unavailable("infeasible without a reason from engine"),
+            )
+            else -> RpcTraceResult.unavailable(o.engineString("reason"))
         }
     }
 

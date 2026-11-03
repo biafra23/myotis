@@ -391,6 +391,7 @@ A host-agnostic router (`jsonrpc-server`, Kotlin Multiplatform/Ktor) maps the Et
 | `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt` | snap Merkle-Patricia proof against a beacon-anchored `stateRoot` (Section 5) |
 | `eth_getProof`, `eth_getAccount` (Rust engine) | the same snap proofs, at exactly the block asked for: EIP-1186's account and storage proofs, and geth's `{codeHash, storageRoot, balance, nonce}` from the account leaf of one (Section 5) |
 | `eth_call`, `eth_estimateGas`, `eth_createAccessList` (Rust engine) | local EVM over proof-served state (Sections 8–9) |
+| `debug_traceCall` (Rust engine) | the same local EVM run as `eth_call`, seen through geth's `callTracer` or `prestateTracer` (Sections 8–9) |
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory` | base fee from verified headers; tips from bodies/receipts verified against `transactionsRoot`/`receiptsRoot` (Section 8) |
 | `eth_blobBaseFee` | EIP-4844's formula over the verified head's own `excessBlobGas`, with the blob fee schedule of the fork its timestamp falls in (per network, from the clients' chain specs; a chain without one is refused) |
 | `eth_getBlockByNumber`/`ByHash` and the block-derived reads (transaction counts, transactions by index, uncle counts/uncles), `eth_getTransactionReceipt`, `eth_getBlockReceipts`, `eth_getTransactionByHash` | header window anchored to the beacon head; bodies/receipts verified against `transactionsRoot`/`receiptsRoot` (Sections 4, 7) |

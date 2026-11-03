@@ -150,6 +150,23 @@ class VerifiedReadsBackend(private val v: io.myotis.api.VerifiedReads) : RpcBack
         stateOverridesJson: String?,
     ): RpcAccessListResult = v.createAccessList(tx.toApi(), block, stateOverridesJson).toRpc()
 
+    override fun supportsCallTracing(): Boolean = v.supportsCallTracing()
+
+    override fun traceCall(
+        tx: RpcTransactionArgs,
+        block: String,
+        stateOverridesJson: String?,
+        tracerJson: String,
+    ): RpcTraceResult {
+        val r = v.traceCall(tx.toApi(), block, stateOverridesJson, tracerJson)
+        return when (r.status()!!) {
+            io.myotis.api.TraceResult.Status.OK -> RpcTraceResult.ok(r.traceJson())
+            io.myotis.api.TraceResult.Status.UNAVAILABLE -> RpcTraceResult.unavailable(r.detail())
+            io.myotis.api.TraceResult.Status.REFUSED -> RpcTraceResult.refused(r.detail())
+            io.myotis.api.TraceResult.Status.INFEASIBLE -> RpcTraceResult.infeasible(r.detail())
+        }
+    }
+
     override fun supportsProofs(): Boolean = v.supportsProofs()
 
     override fun getProof(address: ByteArray, storageKeysJson: String, block: String): String? =
