@@ -376,7 +376,11 @@ internal class RpcFilters(
             }
             walked += blk
             if (walked.size > MAX_BRIDGE_BLOCKS) {
-                drop(f, "the head moved more than $MAX_BRIDGE_BLOCKS blocks past the filter's last poll")
+                // The head moved at most MAX_BRIDGE_BLOCKS (checked above), so
+                // the walk ran past it only by descending below the last
+                // delivered block, through a reorg.
+                drop(f, "the walk needed more than $MAX_BRIDGE_BLOCKS blocks to reach the blocks the filter " +
+                    "delivered (a reorg on top of a long gap)")
             }
             val parent = n - 1
             if (parent <= last.number) {
@@ -395,6 +399,12 @@ internal class RpcFilters(
         val log = f.log
         val newLogs: Map<Long, List<JsonObject>> =
             if (log == null) emptyMap() else newLogs(f, log, walked, chain) ?: return stall(f, f.stallReason)
+        // The cap counts everything this poll delivers: the orphaned logs
+        // re-delivered as removed, and the new branch's.
+        val delivered = orphaned.sumOf { it.logs.size } + newLogs.values.sumOf { it.size }
+        if (delivered > MAX_LOGS_PER_POLL) {
+            drop(f, "more than $MAX_LOGS_PER_POLL logs since the last poll, removed ones included")
+        }
         // Commit: drop the orphaned blocks, record the new ones, keep the window.
         while (f.window.isNotEmpty() && f.window.last().number > fork) f.window.removeLast()
         for (blk in walked) f.window.addLast(Delivered(blk.number, blk.hash, newLogs[blk.number].orEmpty()))

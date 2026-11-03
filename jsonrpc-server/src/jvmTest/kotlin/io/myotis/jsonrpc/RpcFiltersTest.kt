@@ -457,6 +457,20 @@ class RpcFiltersTest {
         assertTrue(resp.message().contains("more than"), resp.message())
     }
 
+    @Test fun theLogCap_countsTheRemovedLogsToo() {
+        val chain = Chain(head = 10)
+        val r = router(chain)
+        val id = logFilter(r)
+        chain.logsPer = 4_000
+        chain.extend(11)
+        assertEquals(4_000, r.call("eth_getFilterChanges", """["$id"]""").resultArray().size)
+        // 8,000 new logs alone fit the cap; with the 4,000 removed ones they do not.
+        chain.reorg(from = 11, to = 12, branch = 'b')
+        val resp = r.call("eth_getFilterChanges", """["$id"]""")
+        assertEquals(-32000, resp.code())
+        assertTrue(resp.message().contains("removed ones included"), resp.message())
+    }
+
     @Test fun dropFilters_forgetsEveryFilter() {
         val r = router(Chain(head = 10))
         val a = r.call("eth_newBlockFilter").id()
