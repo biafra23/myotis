@@ -106,8 +106,10 @@ its deployment block:
 ## Known limits (honest ones)
 
 - **HTTP polling only.** Myotis serves plain HTTP JSON-RPC. There is no
-  WebSocket endpoint and no `eth_newFilter`/`eth_subscribe` family; Bee's
-  default HTTP polling mode works, a subscription-configured Bee does not.
+  WebSocket endpoint and no `eth_subscribe` (#666); the polled filters
+  (`eth_newFilter` / `eth_getFilterChanges`, #714) are served over the same
+  log index. Bee's default HTTP polling mode works, a subscription-configured
+  Bee does not.
 - **Coverage is explicit.** A query outside the indexed contracts or outside
   their covered range errors out (`-32000`, the **retryable** class — backfill
   may cover the range later, so a client should retry, not give up) instead of

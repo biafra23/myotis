@@ -87,6 +87,11 @@ class MyotisRpcServer(
     private val logger = MethodLogger()
     private val router = RpcRouter(proxy, logger, backend, statusReads, lifecycle)
 
+    /** Forget every installed `eth_newFilter` / `eth_newBlockFilter` filter — a host
+     *  calls it when it pauses the node (#714); clients re-create them on their next
+     *  poll. Non-blocking, safe from any thread. */
+    fun dropFilters() = router.dropFilters()
+
     /**
      * Optional request/response capture for debugging + replay (JVM-only —
      * gated on the {@code myotis.rpc.capture} system property; a no-op on iOS).

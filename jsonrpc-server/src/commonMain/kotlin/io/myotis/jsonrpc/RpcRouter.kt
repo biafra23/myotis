@@ -29,14 +29,32 @@ import kotlin.time.TimeSource
  * the whole body verbatim (Phase A is all-proxy anyway) and log each element's
  * method; a single local method is answered here.
  */
-class RpcRouter(
+class RpcRouter internal constructor(
     private val proxy: UpstreamProxy?,
     private val logger: MethodLogger,
-    private val backend: RpcBackend? = null,
-    private val statusReads: RpcStatusSource? = null,
-    private val lifecycle: RpcLifecycle? = null,
+    private val backend: RpcBackend?,
+    private val statusReads: RpcStatusSource?,
+    private val lifecycle: RpcLifecycle?,
+    /** The installed `eth_newFilter` / `eth_newBlockFilter` filters (#714); a
+     *  test hands in one on its own clock. */
+    private val filters: RpcFilters,
 ) {
+    constructor(
+        proxy: UpstreamProxy?,
+        logger: MethodLogger,
+        backend: RpcBackend? = null,
+        statusReads: RpcStatusSource? = null,
+        lifecycle: RpcLifecycle? = null,
+    ) : this(proxy, logger, backend, statusReads, lifecycle, RpcFilters())
+
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+
+    /**
+     * Forget every installed filter — for a host pausing the node (#714): the
+     * client's next poll answers `filter not found` and it re-creates its
+     * filter, the same recovery as an expiry. Non-blocking, safe from any thread.
+     */
+    fun dropFilters() = filters.dropAll()
 
     internal companion object {
         private val HEX_DIGITS = "0123456789abcdef".toCharArray()
@@ -61,6 +79,9 @@ class RpcRouter(
             "eth_gasPrice" to 0, "eth_maxPriorityFeePerGas" to 0, "eth_feeHistory" to 3,
             "eth_getTransactionByHash" to 1, "eth_getBlockByHash" to 2, "eth_getBlockReceipts" to 1,
             "eth_getLogs" to 1,
+            // The polled filter family over the log index and the verified head (#714).
+            "eth_newFilter" to 1, "eth_newBlockFilter" to 0, "eth_getFilterChanges" to 1,
+            "eth_getFilterLogs" to 1, "eth_uninstallFilter" to 1,
             "web3_clientVersion" to 0, "eth_syncing" to 0,
             "eth_accounts" to 0, "net_listening" to 0, "net_peerCount" to 0, "web3_sha3" to 1,
             "eth_getBlockTransactionCountByNumber" to 1, "eth_getBlockTransactionCountByHash" to 1,
@@ -494,6 +515,9 @@ class RpcRouter(
                 val r = withContext(rpcIoDispatcher) {
                     if (method == "myotis_pause") lc.pause() else lc.wakeUp()
                 }
+                // A paused node drops its filters (#714): the client re-creates
+                // them on its next poll rather than bridging the pause's gap.
+                if (method == "myotis_pause" && r.ok) filters.dropAll()
                 // Unlike the status reads (hardcoded 0), record the REAL elapsed time:
                 // a pause/wakeup takes seconds, and the access log is where that shows.
                 logger.record(method, idStr, "LOCAL", elapsedMs(tLc))
@@ -535,6 +559,13 @@ class RpcRouter(
             staleAnchorMessage(method)?.let { return errorEnvelope(id, -32000, it) }
             return errorEnvelope(id, -32000,
                 "method '$method' cannot be served verified right now: ${e.reason}")
+        } catch (e: FilterError) {
+            // A filter refused or failed with its own code and reason (#714) —
+            // `filter not found` in geth's words, which clients match on. No
+            // dev-proxy fallback: a filter id names state held HERE, which no
+            // upstream knows.
+            logger.record(method, idStr, "ERROR", elapsedMs(t0), e.code)
+            return errorEnvelope(id, e.code, e.message)
         } catch (e: EngineRefused) {
             // The engine's PERMANENT refusal (e.g. an EVM fork this build cannot
             // price): -32602 with its reason, like the router's own override /
@@ -1467,6 +1498,20 @@ class RpcRouter(
                     resultEnvelope(id, parsed)
                 }
             }
+            // ---- the polled filter family (#714): see RpcFilters ----
+            "eth_newFilter" -> {
+                val criteria = root.params().required(0, "the filter object") as? JsonObject
+                    ?: invalid("invalid argument 0: expected a filter object")
+                resultEnvelope(id, JsonPrimitive(filters.newLogFilter(criteria, FilterBackend(b))))
+            }
+            "eth_newBlockFilter" ->
+                resultEnvelope(id, JsonPrimitive(filters.newBlockFilter(FilterBackend(b))))
+            "eth_getFilterChanges" ->
+                resultEnvelope(id, filters.changes(root.params().filterIdAt(0), FilterBackend(b)))
+            "eth_getFilterLogs" ->
+                resultEnvelope(id, filters.filterLogs(root.params().filterIdAt(0), FilterBackend(b)))
+            "eth_uninstallFilter" ->
+                resultEnvelope(id, JsonPrimitive(filters.uninstall(root.params().filterIdAt(0))))
             "eth_gasPrice" -> {
                 val price = withContext(rpcIoDispatcher) { b.gasPrice() } ?: return null
                 resultEnvelope(id, JsonPrimitive(hexQuantityDecimal(price)))
@@ -1589,6 +1634,62 @@ class RpcRouter(
         if (raw == null || raw is JsonNull) return
         val args = raw as? JsonArray ?: invalid("params must be an array of positional arguments")
         if (args.size > arity) invalid("too many arguments, want at most $arity")
+    }
+
+    /** params[[i]] as a filter id: a string, as `eth_newFilter` handed it out. */
+    private fun JsonArray?.filterIdAt(i: Int): String =
+        (required(i, "filter id") as? JsonPrimitive)?.takeIf { it.isString }?.content
+            ?: invalid("invalid argument $i: expected a filter id as a string")
+
+    /**
+     * [FilterChain] over [b]: the verified head `eth_blockNumber` reports, the
+     * canonical block `eth_getBlockByNumber` serves (hash and parent hash
+     * only), and `eth_getLogs` — each off the event loop like every backend
+     * read. A block read that cannot answer is unavailable — the filter then
+     * waits, and does not advance past what it could not see — unless the
+     * engine refused it for good (its `-32602` envelope).
+     */
+    private inner class FilterBackend(private val b: RpcBackend) : FilterChain {
+        override suspend fun head(): Long? = withContext(rpcIoDispatcher) { b.headBlockNumber() }
+
+        override suspend fun block(number: Long): FilterBlockRead {
+            val raw = withContext(rpcIoDispatcher) {
+                b.getBlockByNumber("0x" + number.toString(16), false)
+            } ?: return FilterBlockRead.Unavailable("no verified answer (no peer / not synced)")
+            val parsed = runCatching { json.parseToJsonElement(raw) }.getOrNull()
+            if (parsed is JsonNull) return FilterBlockRead.Unavailable("the node holds no block $number now")
+            val o = parsed as? JsonObject ?: return FilterBlockRead.Unavailable("malformed block from engine")
+            val err = o["error"]
+            if (err != null && (o.size == 1 || (o.size == 2 && o.containsKey("code")))) {
+                val msg = (err as? JsonPrimitive)?.contentOrNull ?: err.toString()
+                return if (o.permanentCode()) FilterBlockRead.Refused(msg) else FilterBlockRead.Unavailable(msg)
+            }
+            fun word(key: String): String? = (o[key] as? JsonPrimitive)?.contentOrNull?.lowercase()
+                ?.takeIf { it.length == 66 && isHex(it) }
+            val n = (o["number"] as? JsonPrimitive)?.contentOrNull
+                ?.takeIf { it.startsWith("0x") }?.substring(2)?.toLongOrNull(16)
+            val hash = word("hash")
+            val parent = word("parentHash")
+            // A block that is not the one asked for, or without its hashes
+            // (shape drift), is no block to walk.
+            if (n != number || hash == null || parent == null) {
+                return FilterBlockRead.Unavailable("malformed block from engine")
+            }
+            return FilterBlockRead.Found(FilterBlock(number, hash, parent))
+        }
+
+        override suspend fun logs(criteria: JsonObject): FilterLogs {
+            val raw = withContext(rpcIoDispatcher) { b.getLogs(criteria.toString()) } ?: return FilterLogs.NoIndex
+            return when (val parsed = runCatching { json.parseToJsonElement(raw) }.getOrNull()) {
+                is JsonArray -> FilterLogs.Ok(parsed)
+                is JsonObject -> {
+                    val err = parsed["error"]?.let { (it as? JsonPrimitive)?.contentOrNull ?: it.toString() }
+                        ?: return FilterLogs.Unavailable("malformed log index answer")
+                    if (parsed.permanentCode()) FilterLogs.Refused(err) else FilterLogs.Unavailable(err)
+                }
+                else -> FilterLogs.Unavailable("malformed log index answer")
+            }
+        }
     }
 
     /** This request's `params` array, or null if absent / not an array. */

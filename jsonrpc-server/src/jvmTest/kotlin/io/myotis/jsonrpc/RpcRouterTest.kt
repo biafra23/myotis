@@ -1083,7 +1083,7 @@ class RpcRouterTest {
 
     @Test fun strict_unimplementedMethod_errorsMethodNotSupported() {
         val resp = route(FakeBackend(),                          // no proxy → strict
-            """{"jsonrpc":"2.0","id":1,"method":"eth_newFilter","params":[{}]}""")
+            """{"jsonrpc":"2.0","id":1,"method":"eth_newPendingTransactionFilter","params":[]}""")
         assertTrue(hasError(resp))
         assertEquals(-32601, errorCode(resp))                    // not served by this permissionless node
     }
@@ -1796,7 +1796,7 @@ class RpcRouterTest {
         val b = FakeBackend(head = 0x123)
         val resp = route(b, """[
             {"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]},
-            {"jsonrpc":"2.0","id":2,"method":"eth_newFilter","params":[{}]}
+            {"jsonrpc":"2.0","id":2,"method":"eth_newPendingTransactionFilter","params":[]}
         ]""")
         val arr = json.parseToJsonElement(resp).jsonArray
         assertEquals(2, arr.size)
