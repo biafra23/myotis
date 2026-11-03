@@ -151,7 +151,8 @@ class RpcFiltersTest {
         val chain = Chain(head = 10)
         val r = router(chain)
         val id = r.call("eth_newBlockFilter").id()
-        assertTrue(id.matches(Regex("0x[0-9a-f]{16}")), id)
+        // geth's form: no leading zeros, so 1 to 16 digits (and not "0x0").
+        assertTrue(id.matches(Regex("0x[1-9a-f][0-9a-f]{0,15}")), id)
         assertEquals(0, r.call("eth_getFilterChanges", """["$id"]""").resultArray().size)
         chain.extend(13)   // the head jumped three blocks: all three are delivered
         val hashes = r.call("eth_getFilterChanges", """["$id"]""").resultArray().map { it.jsonPrimitive.content }

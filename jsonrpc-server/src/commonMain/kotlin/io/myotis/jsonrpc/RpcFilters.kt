@@ -8,7 +8,8 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
-import kotlin.concurrent.Volatile
+import kotlin.concurrent.atomics.AtomicInt
+import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.random.Random
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
@@ -98,6 +99,7 @@ internal interface FilterChain {
  * a part of its changes. [dropAll] forgets every filter (a paused node: the
  * client's next poll re-creates its filter, the same path as an expiry).
  */
+@OptIn(ExperimentalAtomicApi::class)
 internal class RpcFilters(
     private val time: TimeSource = TimeSource.Monotonic,
     private val random: Random = Random.Default,
@@ -151,23 +153,23 @@ internal class RpcFilters(
     private val tableMutex = Mutex()
     private val filters = HashMap<String, Filter>()
 
-    /** Bumped by [dropAll]: a filter created under an older epoch is gone. A
-     *  counter rather than a lock so a host can drop every filter from any
-     *  thread without suspending. */
-    @Volatile
-    private var epoch = 0
+    /** Bumped by [dropAll]: a filter created under an older epoch is gone. An
+     *  atomic counter rather than a lock, so a host can drop every filter from
+     *  any thread without suspending, and two pauses racing each other (the
+     *  engine's own and `myotis_pause`'s) both count. */
+    private val epoch = AtomicInt(0)
 
     /** Forget every filter. Safe from any thread; the next lookup of one
      *  answers [NOT_FOUND]. */
     fun dropAll() {
-        epoch += 1
+        epoch.addAndFetch(1)
     }
 
     // ---- creation ----------------------------------------------------------
 
     /** `eth_newBlockFilter`: the id of a filter starting at the verified head. */
     suspend fun newBlockFilter(chain: FilterChain): String {
-        val epochAtStart = epoch
+        val epochAtStart = epoch.load()
         val head = chain.head() ?: throw unavailable("there is no verified head yet")
         return install(null, startBlock(chain, head), epochAtStart)
     }
@@ -178,7 +180,7 @@ internal class RpcFilters(
      * cannot serve its criteria now ([FilterError]).
      */
     suspend fun newLogFilter(criteria: JsonObject, chain: FilterChain): String {
-        val epochAtStart = epoch
+        val epochAtStart = epoch.load()
         criteria["blockHash"]?.takeUnless { it is JsonNull }?.let {
             throw FilterError(-32602, "eth_newFilter takes no 'blockHash': a filter on one block has no changes " +
                 "to poll; ask eth_getLogs for that block's logs")
@@ -300,7 +302,7 @@ internal class RpcFilters(
 
     /** Forget expired filters and those [dropAll] dropped. Under [tableMutex]. */
     private fun sweep() {
-        val now = epoch
+        val now = epoch.load()
         filters.values.removeAll { it.epoch != now || it.lastPolled.elapsedNow() > TIMEOUT }
     }
 
