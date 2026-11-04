@@ -13689,6 +13689,29 @@ mod tests {
     }
 
     #[test]
+    fn chiado_config_pins_known_values() {
+        // Chiado has no pinned enodes, no EIP-1459 tree and no static CL peers:
+        // these four discv4 seeds are its whole EL cold start, so pin them as
+        // strings — a typo'd one would otherwise drop out of `filter_map` silently.
+        let cfg = ElConfig::chiado();
+        assert_eq!(cfg.network_id, 10_200);
+        assert_eq!(
+            cfg.genesis_hash,
+            super::hex32("ada44fd8d2ecab8b08f256af07ad3e777f17fb434f8f8e678b312f576212ba9a")
+        );
+        assert_eq!(cfg.fork_id_hash, [0x71, 0xc4, 0x57, 0xcd]);
+        assert_eq!(cfg.fork_next, 0);
+        assert_eq!(
+            cfg.bootnodes.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            ["51.75.246.2:30303", "57.129.70.222:30303", "57.128.252.123:30303", "54.39.148.98:30303"],
+            "all four chiado bootnodes must parse (Java twin: NetworkConfigChiadoTest)"
+        );
+        assert!(cfg.boot_enodes.is_empty() && cfg.enr_tree_urls.is_empty());
+        assert_eq!(cfg.listen_port, 30306);
+        assert_eq!(cfg.min_suggested_tip_wei, 1_000_000, "gnosis-family cheap-chain tip floor");
+    }
+
+    #[test]
     fn percentile_rewards_walks_gas_weighted_thresholds() {
         // Three txs, tips 1/5/10 gwei with gas weights 10k/70k/20k (total 100k).
         // Sorted by tip the cumulative gas is 10k, 80k, 100k:
