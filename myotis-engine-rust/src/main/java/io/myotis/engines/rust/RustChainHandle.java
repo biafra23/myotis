@@ -1220,6 +1220,44 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         return io.myotis.api.TraceResult.unavailable(stringOrNull(o, "reason"));
     }
 
+    /**
+     * One verified {@code eth_simulateV1} (ABI 55, #716) of geth's {@code simOpts} object at
+     * {@code block}. Throws {@link EngineException} on a transport / not-running failure.
+     */
+    io.myotis.api.SimulateResult simulateVerified(String optsJson, String block) {
+        return simulateFromJson(gated(() -> RustEngineNative.nativeSimulateV1Json(handle, optsJson, block)));
+    }
+
+    /** Package-private test seam: simulate JSON (ABI 55) → the engine's outcome:
+     *  {@code {"status":"ok","result":[…]}} / {@code {"status":"failed","code","message"}}
+     *  (geth's own error) / {@code {"status":"unavailable","reason"}}; the permanent
+     *  {@code {"error","code":-32602}} is REFUSED and a plain {@code {"error"}} throws, as
+     *  for {@link #traceFromJson}. An {@code ok} without its result array, or a
+     *  {@code failed} without its code or message, is shape drift and fails closed. */
+    static io.myotis.api.SimulateResult simulateFromJson(String json) {
+        JsonObject o = parseJsonObject(json, "eth_simulateV1");
+        String refusal = permanentRefusalOrNull(o);
+        if (refusal != null) return io.myotis.api.SimulateResult.refused(refusal);
+        throwIfError(o);
+        String status = stringOrNull(o, "status");
+        if ("ok".equals(status)) {
+            var result = o.get("result");
+            if (result == null || !result.isArray()) {
+                throw new EngineException("eth_simulateV1 JSON: status=ok without a result array");
+            }
+            return io.myotis.api.SimulateResult.ok(result.toString());
+        }
+        if ("failed".equals(status)) {
+            var code = o.get("code");
+            String message = stringOrNull(o, "message");
+            if (code == null || !code.isNumber() || message == null || message.isBlank()) {
+                throw new EngineException("eth_simulateV1 JSON: status=failed without a code and a message");
+            }
+            return io.myotis.api.SimulateResult.failed((int) code.asLong(), message);
+        }
+        return io.myotis.api.SimulateResult.unavailable(stringOrNull(o, "reason"));
+    }
+
     /** Package-private test seam: access-list JSON (ABI 40) → the engine's
      *  outcome. The Rust side emits {@code {"status":"ok","accessList":[…],
      *  "gasUsed":N}} — plus {@code vmError} (and {@code revertDataHex} for a

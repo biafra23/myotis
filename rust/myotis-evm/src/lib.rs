@@ -46,6 +46,7 @@ pub mod fixture;
 pub mod fork;
 pub mod oracle;
 pub mod overrides;
+pub mod simulate;
 pub mod trace;
 pub mod tx;
 

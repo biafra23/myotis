@@ -595,6 +595,23 @@ final class RustVerifiedReads implements VerifiedReads {
     }
 
     @Override
+    public boolean supportsSimulation() {
+        return true;   // ABI 55 (#716): geth's eth_simulateV1 over the revm run
+    }
+
+    @Override
+    public io.myotis.api.SimulateResult simulateV1(String optsJson, String block) {
+        // As traceCall: the engine applies the selector and every field of the request,
+        // or refuses them as the permanent -32602 (REFUSED).
+        try {
+            return handle.simulateVerified(optsJson == null ? "" : optsJson, block);
+        } catch (RuntimeException e) {
+            log.info("[engines] verified eth_simulateV1 unavailable: {}", e.getMessage());
+            return io.myotis.api.SimulateResult.unavailable(e.getMessage());
+        }
+    }
+
+    @Override
     public boolean supportsAccessListCreation() {
         return true;   // the revm executor traces and confirms the list (ABI >= 40)
     }

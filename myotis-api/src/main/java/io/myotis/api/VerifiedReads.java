@@ -451,6 +451,32 @@ public interface VerifiedReads {
     }
 
     /**
+     * Whether this engine simulates blocks of calls ({@code eth_simulateV1},
+     * {@link #simulateV1}; #716). Hosts consult it BEFORE dispatch, as
+     * {@link #supportsCallTracing()}.
+     *
+     * @return false by default
+     */
+    default boolean supportsSimulation() {
+        return false;
+    }
+
+    /**
+     * {@code eth_simulateV1} (#716): the blocks of calls {@code optsJson} describes — geth's
+     * {@code simOpts} object ({@code blockStateCalls}, {@code traceTransfers},
+     * {@code validation}, {@code returnFullTransactions}), passed as the request carried it —
+     * simulated on top of {@code block} (a tag or a 0x-hex number), as geth simulates them.
+     * Every parameter is applied or refused ({@link SimulateResult.Status#REFUSED}), never
+     * ignored; what the engine does not compute (a simulated block's hash and state root) is
+     * {@code null} in the result; see {@link SimulateResult}.
+     *
+     * <p>Default: refused, on an engine that reports no {@link #supportsSimulation()}.
+     */
+    default SimulateResult simulateV1(String optsJson, String block) {
+        return SimulateResult.refused("this engine does not simulate blocks (eth_simulateV1); select the Rust engine");
+    }
+
+    /**
      * Whether this engine serves {@code eth_getProof} ({@link #getProof}). Hosts
      * consult it BEFORE dispatch, as {@link #supportsAccessListCreation()}: on an
      * engine that does not, the request is refused (-32602) without waking a

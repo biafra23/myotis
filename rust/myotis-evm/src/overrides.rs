@@ -84,6 +84,14 @@ impl StateOverrides {
         self.accounts.get(address)
     }
 
+    /// Every override, in address order (geth applies them in that order, so
+    /// the outcome and the first error do not depend on a map's order).
+    pub fn sorted(&self) -> Vec<(&[u8; 20], &AccountOverride)> {
+        let mut all: Vec<_> = self.accounts.iter().collect();
+        all.sort_by(|a, b| a.0.cmp(b.0));
+        all
+    }
+
     /// Overridden code whose keccak matches `hash`, if any. revm resolves code
     /// by hash when an `AccountInfo` carries one, so an overridden account's
     /// bytecode has to be reachable that way too.

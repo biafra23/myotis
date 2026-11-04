@@ -634,6 +634,23 @@ pub unsafe extern "C" fn myotis_debug_trace_call_json(
     into_c(crate::host::debug_trace_call_json(handle, &tx_json, &block, &overrides_json, &tracer_json))
 }
 
+/// `eth_simulateV1` (ABI ≥ 55, #716; the UniFFI `simulate_v1_json` twin):
+/// `opts_json` is geth's `simOpts` object, `block` the selector (NULL =
+/// latest).
+///
+/// # Safety
+/// Each pointer must be null or a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn myotis_simulate_v1_json(
+    handle: i64,
+    opts_json: *const c_char,
+    block: *const c_char,
+) -> *mut c_char {
+    let opts_json = read_string(opts_json).unwrap_or_default();
+    let block = read_string(block).unwrap_or_default();
+    into_c(crate::host::simulate_v1_json(handle, &opts_json, &block))
+}
+
 /// Verified `eth_getRawTransactionByHash` (ABI ≥ 53, #715; the UniFFI
 /// `get_raw_transaction_by_hash_json` twin): `"0x…"`, the literal `"null"`,
 /// `{"error"}`, or `{"error","code":-32602}` for a malformed hash.
@@ -988,6 +1005,16 @@ mod tests {
         assert_eq!(trace(tx.as_ptr(), null)["code"], -32602);
         assert_eq!(trace(tx.as_ptr(), c"{\"tracer\":\"4byteTracer\"}".as_ptr())["code"], -32602);
         assert_eq!(trace(c"{\"to\":7}".as_ptr(), c"{\"tracer\":\"callTracer\"}".as_ptr())["code"], -32602);
+        // eth_simulateV1 (ABI 55): a malformed request and an unknown key are
+        // refused for good before the handle lookup.
+        let simulate = |opts: *const c_char, block: *const c_char| {
+            parse(unsafe { take(myotis_simulate_v1_json(i64::MIN, opts, block)) })
+        };
+        let opts = c"{\"blockStateCalls\":[{\"calls\":[]}]}";
+        assert_eq!(simulate(opts.as_ptr(), null)["error"], "unknown handle"); // NULL = latest
+        assert_eq!(simulate(null, null)["code"], -32602);
+        assert_eq!(simulate(c"{\"blockStateCalls\":[],\"x\":1}".as_ptr(), null)["code"], -32602);
+        assert_eq!(simulate(opts.as_ptr(), c"safe".as_ptr())["code"], -32602);
         assert_eq!(raw_by_block(c"earliest".as_ptr())["code"], -32602);
     }
 

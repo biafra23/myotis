@@ -387,6 +387,16 @@ pub fn debug_trace_call_json(handle: i64, tx: String, block: String, overrides: 
     crate::host::debug_trace_call_json(handle, &tx, &block, &overrides, &tracer)
 }
 
+/// `eth_simulateV1` (ABI ≥ 55, #716): the blocks of calls `opts` (geth's
+/// `simOpts`) simulated on top of `block`: `{"status":"ok","result":[…]}`,
+/// geth's own error as `{"status":"failed","code","message"}`, `unavailable`,
+/// or the permanent `{"error","code":-32602}`; see
+/// `crate::host::simulate_v1_json`.
+#[uniffi::export]
+pub fn simulate_v1_json(handle: i64, opts: String, block: String) -> String {
+    crate::host::simulate_v1_json(handle, &opts, &block)
+}
+
 /// Verified `eth_getRawTransactionByHash` (ABI ≥ 53, #715): `"0x…"` (the raw
 /// consensus bytes as a JSON string), the literal `"null"`, `{"error"}`, or
 /// `{"error","code":-32602}` for a malformed hash; see

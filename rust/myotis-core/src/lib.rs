@@ -29,6 +29,7 @@ use alloc::string::String;
 
 pub mod bloom;
 pub mod enr;
+pub mod fees;
 pub mod forkid;
 pub mod header;
 pub mod keccak;

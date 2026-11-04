@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 54; // 54: debug_trace_call_json (#716); 53: get_raw_transaction_by_hash_json + get_raw_transaction_by_block_json (#715); 52: account and call JSON carry the proven blockHash; 51: set_activity_watch + address_activity_json (#691); 50: dataUsage + networkMetering in the status, set_network_metering; 49: ens offchain envelope carries reverseClaim; 48: log-index topic entries (#673); 47: resolve_block_hash_json, get_proof_json takes a block hash; 46: get_proof_json; 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
+    static final int EXPECTED_ABI_VERSION = 55; // 55: simulate_v1_json (#716); 54: debug_trace_call_json (#716); 53: get_raw_transaction_by_hash_json + get_raw_transaction_by_block_json (#715); 52: account and call JSON carry the proven blockHash; 51: set_activity_watch + address_activity_json (#691); 50: dataUsage + networkMetering in the status, set_network_metering; 49: ens offchain envelope carries reverseClaim; 48: log-index topic entries (#673); 47: resolve_block_hash_json, get_proof_json takes a block hash; 46: get_proof_json; 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
 
     private static final boolean AVAILABLE = load();
 
@@ -428,6 +428,12 @@ final class RustEngineNative {
     static String nativeDebugTraceCallJson(long handle, String txJson, String block, String stateOverrides,
                                            String tracerJson) {
         return Myotis_engineKt.debugTraceCallJson(handle, nz(txJson), nz(block), nz(stateOverrides), nz(tracerJson));
+    }
+
+    /** {@code eth_simulateV1} (ABI 55, #716): geth's result, geth's own simulation error,
+     *  unavailable, or the permanent -32602 envelope. */
+    static String nativeSimulateV1Json(long handle, String optsJson, String block) {
+        return Myotis_engineKt.simulateV1Json(handle, nz(optsJson), nz(block));
     }
 
     /** Verified {@code eth_getRawTransactionByHash} (ABI 53, #715): {@code "0x…"} as a JSON

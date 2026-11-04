@@ -7,6 +7,7 @@ import io.myotis.jsonrpc.RpcBackend
 import io.myotis.jsonrpc.RpcCallResult
 import io.myotis.jsonrpc.RpcEstimateResult
 import io.myotis.jsonrpc.RpcSendResult
+import io.myotis.jsonrpc.RpcSimulateResult
 import io.myotis.jsonrpc.policy.RpcBlockWindow
 import io.myotis.jsonrpc.RpcTransactionArgs
 import kotlinx.serialization.json.JsonArray
@@ -274,6 +275,32 @@ class IosRpcBackend(
                     ?: return RpcTraceResult.unavailable("infeasible without a reason from engine"),
             )
             else -> RpcTraceResult.unavailable(o.engineString("reason"))
+        }
+    }
+
+    override fun supportsSimulation(): Boolean = true // geth's eth_simulateV1 (ABI >= 55)
+
+    override fun simulateV1(optsJson: String, block: String): RpcSimulateResult {
+        val handle = handleProvider() ?: return RpcSimulateResult.unavailable("engine not running")
+        val json = RustEngine.simulateV1Json(handle, optsJson, block)
+        // RustChainHandle.simulateFromJson's twin.
+        permanentRefusalOrNull(json)?.let { return RpcSimulateResult.refused(it) }
+        val o = resultOrNull(json) ?: return RpcSimulateResult.unavailable("engine error")
+        return when (o.engineString("status")) {
+            "ok" -> RpcSimulateResult.ok(
+                (o["result"] as? JsonArray)?.toString()
+                    ?: return RpcSimulateResult.unavailable("ok without a result from engine"),
+            )
+            "failed" -> {
+                val code = (o["code"] as? JsonPrimitive)?.longOrNull?.toInt()
+                val message = o.engineString("message")?.takeIf { it.isNotBlank() }
+                if (code == null || message == null) {
+                    RpcSimulateResult.unavailable("failed without a code and a message from engine")
+                } else {
+                    RpcSimulateResult.failed(code, message)
+                }
+            }
+            else -> RpcSimulateResult.unavailable(o.engineString("reason"))
         }
     }
 
