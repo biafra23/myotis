@@ -35,7 +35,7 @@ use rpc::Router;
 )]
 struct Args {
     /// Network to follow.
-    #[arg(long, default_value = "gnosis", value_parser = ["gnosis", "mainnet", "sepolia"])]
+    #[arg(long, default_value = "gnosis", value_parser = ["gnosis", "mainnet", "sepolia", "chiado"])]
     network: String,
     /// Engine state directory (sync anchor, peers, log index).
     /// Default: ~/.local/share/myotis-rpcd/<network>.
@@ -43,7 +43,7 @@ struct Args {
     data_dir: Option<PathBuf>,
     /// Address to serve JSON-RPC on. Default: loopback, on the port the apps
     /// and the daemon use for the network (mainnet 8545, gnosis 8546, sepolia
-    /// 8547). The node signs nothing, but it is not built to face the internet.
+    /// 8547, chiado 8548). The node signs nothing, but it is not built to face the internet.
     #[arg(long, value_name = "ADDR")]
     listen: Option<SocketAddr>,
     /// Comma-separated host names a request's Host header may carry (geth's
@@ -363,6 +363,7 @@ fn default_listen(network: &str) -> SocketAddr {
     let port = match network {
         "mainnet" => 8545,
         "sepolia" => 8547,
+        "chiado" => 8548,
         _ => 8546, // gnosis, the only other network --network accepts
     };
     SocketAddr::from(([127, 0, 0, 1], port))

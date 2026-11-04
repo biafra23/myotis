@@ -86,6 +86,14 @@ public final class EvmFactory {
     public static final long GNOSIS_PRAGUE_TIME   = 1_746_021_820L;
     public static final long GNOSIS_OSAKA_TIME    = 1_776_168_380L;
 
+    // Chiado (Gnosis's testnet, chainId 10200) fork-activation timestamps
+    // (nethermind chiado.json, hex-sourced: 0x646e0e4c / 0x65ba8e4c / 0x67c96e4c /
+    // 0x69b7ce4c — the same values Erigon's Chiado fork-id tests step through).
+    public static final long CHIADO_SHANGHAI_TIME = 1_684_934_220L;
+    public static final long CHIADO_CANCUN_TIME   = 1_706_724_940L;
+    public static final long CHIADO_PRAGUE_TIME   = 1_741_254_220L;
+    public static final long CHIADO_OSAKA_TIME    = 1_773_653_580L;
+
     private EvmFactory() {}
 
     /**
@@ -177,6 +185,9 @@ public final class EvmFactory {
         if (chainId == 100L) {
             return gnosisSpec(ctx);
         }
+        if (chainId == 10_200L) {
+            return chiadoSpec(ctx);
+        }
         throw new IllegalArgumentException(
                 "unsupported chain id " + chainId + " (no fork table — failing closed, "
                         + "never silently applying mainnet fork rules)");
@@ -214,6 +225,16 @@ public final class EvmFactory {
         if (ts >= GNOSIS_PRAGUE_TIME) return EvmSpecVersion.PRAGUE;
         if (ts >= GNOSIS_CANCUN_TIME) return EvmSpecVersion.CANCUN;
         if (ts >= GNOSIS_SHANGHAI_TIME) return EvmSpecVersion.SHANGHAI;
+        throw tooOld(ctx.blockNumber(), ts);
+    }
+
+    /** Chiado: all timestamp-gated (merged pre-Shanghai; older is unservable). */
+    private static EvmSpecVersion chiadoSpec(BlockContext ctx) {
+        long ts = ctx.timestamp();
+        if (ts >= CHIADO_OSAKA_TIME) return EvmSpecVersion.OSAKA;
+        if (ts >= CHIADO_PRAGUE_TIME) return EvmSpecVersion.PRAGUE;
+        if (ts >= CHIADO_CANCUN_TIME) return EvmSpecVersion.CANCUN;
+        if (ts >= CHIADO_SHANGHAI_TIME) return EvmSpecVersion.SHANGHAI;
         throw tooOld(ctx.blockNumber(), ts);
     }
 

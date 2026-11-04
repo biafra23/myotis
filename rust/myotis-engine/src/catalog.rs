@@ -23,8 +23,8 @@ pub struct NetworkInfo {
 }
 
 /// Display order matches the Java engine (`NetworkConfig.allNetworks()`):
-/// mainnet, gnosis, sepolia.
-pub const NETWORKS: [NetworkInfo; 3] = [
+/// mainnet, gnosis, sepolia, chiado.
+pub const NETWORKS: [NetworkInfo; 4] = [
     NetworkInfo {
         name: "mainnet",
         display_name: "Ethereum Mainnet",
@@ -59,6 +59,18 @@ pub const NETWORKS: [NetworkInfo; 3] = [
         cl_genesis_time: 1_655_733_600, // 2022-06-20 14:00:00 UTC
         seconds_per_slot: 12,
     },
+    NetworkInfo {
+        name: "chiado",
+        display_name: "Chiado",
+        chain_id: 10_200,
+        // No name service pinned for Chiado (`Namespace::for_chain(10200)` is none).
+        has_ens: false,
+        default_el_port: 30306,
+        default_discv5_port: 9003,
+        default_rpc_port: 8548,
+        cl_genesis_time: 1_665_396_300, // 2022-10-10 10:05:00 UTC
+        seconds_per_slot: 5,
+    },
 ];
 
 /// The catalog as the JSON array `RustEngineNative.nativeAvailableNetworksJson()`
@@ -77,6 +89,7 @@ pub fn canonical_network_name(name_or_alias: &str) -> Option<&'static str> {
         "mainnet" => Some("mainnet"),
         "gnosis" | "gbc" | "xdai" => Some("gnosis"),
         "sepolia" => Some("sepolia"),
+        "chiado" => Some("chiado"),
         // holesky retired: the EF shut it down in Oct 2025.
         _ => None,
     }
@@ -103,6 +116,7 @@ mod tests {
         assert_eq!(canonical_network_name("GBC"), Some("gnosis"));
         assert_eq!(canonical_network_name("gnosis"), Some("gnosis"));
         assert_eq!(canonical_network_name("sepolia"), Some("sepolia"));
+        assert_eq!(canonical_network_name("Chiado"), Some("chiado"));
         assert_eq!(canonical_network_name("holesky"), None);
         assert_eq!(canonical_network_name(""), None);
         // No trim — whitespace-wrapped input is rejected exactly like the Java engine.

@@ -495,6 +495,67 @@ impl ChainConfig {
         .with_env_overrides()
     }
 
+    /// Chiado — Gnosis Chain's testnet; values duplicated verbatim from the Java
+    /// `NetworkConfig.CHIADO`. Its own beacon chain on the GNOSIS preset (5 s
+    /// slots, 16-slot epochs, 512-epoch periods). No roost instance and no
+    /// census-confirmed light-client servers yet, so `static_peers` is EMPTY and
+    /// a cold start finds its servers over discv5 from the bootnodes alone.
+    pub fn chiado() -> Self {
+        // One binding for both the period math and the schedule's slot->epoch map.
+        let slots_per_epoch: u64 = 16;
+        Self {
+            name: "chiado",
+            chain_id: 10_200,
+            // gnosischain/configs chiado/config.yaml *_FORK_EPOCH / *_FORK_VERSION
+            // (16-slot epochs) — the live beacon API's fork_schedule serves the
+            // same seven entries. Fulu (0x0600006f) active since epoch 1353216
+            // (2026-03-16); Electra's epoch is also the blob_params_epoch below.
+            fork_schedule: ForkSchedule::new(slots_per_epoch, &[
+                (0, [0x00, 0x00, 0x00, 0x6f]),         // phase0 (genesis)
+                (90, [0x01, 0x00, 0x00, 0x6f]),        // altair
+                (180, [0x02, 0x00, 0x00, 0x6f]),       // bellatrix
+                (244_224, [0x03, 0x00, 0x00, 0x6f]),   // capella
+                (516_608, [0x04, 0x00, 0x00, 0x6f]),   // deneb
+                (948_224, [0x05, 0x00, 0x00, 0x6f]),   // electra
+                (1_353_216, [0x06, 0x00, 0x00, 0x6f]), // fulu
+            ]),
+            // No prior-fork fallback: Fulu has been active since 2026-03.
+            accept_prior_fork_digest: false,
+            genesis_validators_root: hex32(
+                "9d642dac73058fbf39c0ae41ab1e34e4d889043cb199851ded7095bc99eb4c1e",
+            ),
+            genesis_time: 1_665_396_300, // 2022-10-10 10:05:00 UTC
+            seconds_per_slot: 5,
+            slots_per_epoch,
+            epochs_per_sync_committee_period: 512,
+            // EIP-7892: Chiado's BLOB_SCHEDULE is empty, so — as on Gnosis —
+            // clients fold the Electra-baseline params (ELECTRA_FORK_EPOCH=948224,
+            // MAX_BLOBS=2) into the Fulu digest: 0x25f9148e.
+            blob_params_epoch: 948_224,
+            blob_params_max_blobs: 2,
+            // Mirrors the @checkpoint:chiado region of NetworkConfig.java;
+            // `./gradlew refreshCheckpoint` rewrites both from one fetch, and
+            // `java_and_rust_checkpoints_agree` fails if they ever diverge.
+            // @checkpoint:chiado:begin — managed by `./gradlew refreshCheckpoint`
+            // trusted checkpoint: recent finalized chiado block root (slot 25676976, 2026-11-04, period 3134)
+            checkpoint_root: hex32(
+                "47112fb5b2304eb748bcb893e4c3ad93cdca690737d874b4aa08656306e8c4f1",
+            ),
+            checkpoint_slot: 25_676_976,
+            // @checkpoint:chiado:end
+            static_peers: CHIADO_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
+            bootstrap_enrs: CHIADO_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
+            discv5_port: 0,
+            snapshot_path: None,
+            cl_peer_cache_path: None,
+            ws_bound_periods: 3, // Gnosis's preset and churn parameters (see NetworkConfig.wsBoundPeriods)
+            ws_policy: Arc::new(WsPolicy::default()),
+            traffic: crate::traffic::TrafficMeter::new(),
+            cl_fork_watch: None,
+        }
+        .with_env_overrides()
+    }
+
     /// The shipped config whose chain matches this `genesis_validators_root`,
     /// or None for a chain this build does not know.
     ///
@@ -508,7 +569,7 @@ impl ChainConfig {
     /// `MYOTIS_CL_DISABLE_DISCV5=1` empties `bootstrap_enrs` here too — the
     /// consistent reading of "disable discv5" for any process honoring it.
     pub fn for_genesis(genesis_validators_root: &[u8; 32]) -> Option<Self> {
-        [Self::mainnet(), Self::sepolia(), Self::gnosis()]
+        [Self::mainnet(), Self::sepolia(), Self::gnosis(), Self::chiado()]
             .into_iter()
             .find(|c| &c.genesis_validators_root == genesis_validators_root)
     }
@@ -1016,6 +1077,24 @@ const GNOSIS_BOOTSTRAP_ENRS: &[&str] = &[
 /// via the Lighthouse peer API 2026-03-11, re-censused via period_census
 /// 2026-09-01 (#410), re-verified and pruned 2026-09-02 (#411), re-censused and
 /// pruned again 2026-09-13 (per-entry evidence in the comments below).
+/// Pinned chiado LC-serving peer multiaddrs (Java `NetworkConfig.CHIADO.clPeerMultiaddrs`).
+/// EMPTY until a period census (`examples/period_census.rs`, the cold-start
+/// workflow's `census` scope) confirms Chiado servers worth pinning: there is no
+/// roost instance for Chiado, and an unverified pin is worse than none — pinned
+/// peers are exempt from eviction and steer targeted lookups. Until then a cold
+/// start relies on discv5 from [`CHIADO_BOOTSTRAP_ENRS`]. Keep this list
+/// identical to the Java twin when it gains entries.
+const CHIADO_STATIC_PEERS: &[&str] = &[];
+
+/// Chiado CL discv5 bootstrap ENRs (Java `NetworkConfig.CHIADO.clDiscv5Bootnodes`
+/// — gnosischain/configs chiado/bootstrap_nodes.txt).
+const CHIADO_BOOTSTRAP_ENRS: &[&str] = &[
+    "enr:-IS4QC9xcSNOKeUBrjOX1-qwcPDGOvRK-Aql_YnRfuYsuXElQawANMLTOz1YfrZTMI07B7DAl9hmk3ic5G7ZHQbq4HsUgmlkgnY0gmlwhDNL9gKJc2VjcDI1NmsxoQOzB8HdKe07eQBOxu5nexAWECV47zxlau23oEYqoToy9YN1ZHCCIyg",
+    "enr:-IS4QMpCWNqXmqbtXg7vQyYBwV2xTDpgTNpgAz060TY5cpJ3JdjuwAkLG01Vf9Vlfb0jtRhJEpj0CfteG-3K_V36bmECgmlkgnY0gmlwhDmBRt6Jc2VjcDI1NmsxoQNkoifSsk1ijP3-OR9pcL2VWCSfD5_syapyrXA83GcAvYN1ZHCCIyg",
+    "enr:-IS4QBa3hl_BcjrY4z_OvhRBx7qUMBFGkjkoedGNMXgC_fzLRBsg161SipeHWAkUnSuvBg_7529-Qfxcc7CAbokn4fMCgmlkgnY0gmlwhDmA_HuJc2VjcDI1NmsxoQL8xX-V_pyU_l3AIfVokHKMN1OMUG02vcy4AMOxdyi5jIN1ZHCCIyg",
+    "enr:-IS4QEuUku9zL0V3hFHt41fqmEdvphEvrOg0D4K_TgiiaePCDH2IPzt6B3O6NLHtgJNXk3UW68DL6KVBD4rjoW-nW9ACgmlkgnY0gmlwhDYnlGKJc2VjcDI1NmsxoQP3W66lisn2YOJF4B0QDEnURZ6tqzpi5gBy9rbMfpC70YN1ZHCCIyg",
+];
+
 const MAINNET_STATIC_PEERS: &[&str] = &[
     // roost mainnet (rust/roost). FIRST for the same reason as sepolia: a
     // general-purpose beacon node shares one connection semaphore between
@@ -4683,7 +4762,7 @@ mod tests {
     /// Java twin: NetworkConfigForkScheduleTest.aFutureForkPinnedAheadDoesNotChangeTodaysDigest.
     #[test]
     fn a_future_fork_pinned_ahead_does_not_change_todays_digest() {
-        for c in [ChainConfig::mainnet(), ChainConfig::sepolia(), ChainConfig::gnosis()] {
+        for c in [ChainConfig::mainnet(), ChainConfig::sepolia(), ChainConfig::gnosis(), ChainConfig::chiado()] {
             let mut forks = c.fork_schedule.forks().to_vec();
             forks.push((u64::MAX / 64, [0x7F, 0, 0, 0])); // never activates in this test's lifetime
             let ahead = ChainConfig {
@@ -4932,6 +5011,65 @@ mod tests {
         assert_eq!(c.bootstrap_enrs.len(), 9);
     }
 
+    #[test]
+    fn chiado_config_matches_networkconfig_java() {
+        let c = ChainConfig::chiado();
+        assert_eq!(c.chain_id, 10_200);
+        assert_eq!(c.current_fork_version(), [0x06, 0x00, 0x00, 0x6f]); // Fulu on Chiado
+        assert_eq!(c.prior_fork_version(), None); // no fallback digest
+        // gnosischain/configs chiado/config.yaml and the live beacon API's
+        // fork_schedule — the Java twin (NetworkConfigChiadoTest) pins the same.
+        assert_eq!((c.fork_schedule.slots_per_epoch(), c.slots_per_epoch), (16, 16));
+        assert_eq!(
+            c.fork_schedule.forks(),
+            &[
+                (0, [0x00, 0x00, 0x00, 0x6f]),
+                (90, [0x01, 0x00, 0x00, 0x6f]),
+                (180, [0x02, 0x00, 0x00, 0x6f]),
+                (244_224, [0x03, 0x00, 0x00, 0x6f]),
+                (516_608, [0x04, 0x00, 0x00, 0x6f]),
+                (948_224, [0x05, 0x00, 0x00, 0x6f]),
+                (1_353_216, [0x06, 0x00, 0x00, 0x6f]),
+            ]
+        );
+        // Fulu epoch 1353216 x 16 = slot 21651456: first slot still Electra.
+        assert_eq!(c.fork_schedule.version_for_signature_slot(21_651_456), [0x05, 0, 0, 0x6f]);
+        assert_eq!(c.fork_schedule.version_for_signature_slot(21_651_457), [0x06, 0, 0, 0x6f]);
+        // @checkpoint:chiado:test:begin — managed by `./gradlew refreshCheckpoint`
+        assert_eq!(c.checkpoint_slot, 25_676_976);
+        assert_eq!(
+            hex_str(&c.checkpoint_root),
+            "47112fb5b2304eb748bcb893e4c3ad93cdca690737d874b4aa08656306e8c4f1"
+        );
+        // @checkpoint:chiado:test:end
+        assert_eq!(
+            hex_str(&c.genesis_validators_root),
+            "9d642dac73058fbf39c0ae41ab1e34e4d889043cb199851ded7095bc99eb4c1e"
+        );
+        assert_eq!(c.genesis_time, 1_665_396_300);
+        // The GNOSIS preset, not mainnet's: 5 s slots, 16 x 512 = 8192.
+        assert_eq!((c.seconds_per_slot, c.slots_per_epoch), (5, 16));
+        assert_eq!(c.epochs_per_sync_committee_period, 512);
+        assert_eq!(c.slots_per_period(), 8192);
+        assert_eq!(c.effective_ws_bound_periods(), 3);
+        assert_eq!((c.blob_params_epoch, c.blob_params_max_blobs), (948_224, 2));
+        // The digest the Java computes (NetworkConfig.CHIADO.currentForkDigest):
+        // Fulu over Chiado's root with the Electra-baseline blob params folded in.
+        // The plain Fulu digest would be 0xa26586db — a mismatch here means the
+        // EIP-7892 fold stopped applying.
+        assert_eq!(c.current_fork_digest(), [0x25, 0xF9, 0x14, 0x8E]);
+        assert_eq!(c.accepted_fork_digests(), vec![[0x25, 0xF9, 0x14, 0x8E]]);
+        // No census-confirmed servers yet: nothing pinned, discovery does the work.
+        assert!(c.static_peers.is_empty());
+        assert_eq!(c.bootstrap_enrs.len(), 4);
+        assert!(c.bootstrap_enrs.iter().all(|e| e.parse::<discv5::Enr>().is_ok()));
+        // Identified by its own root, never mistaken for Gnosis's.
+        assert_eq!(
+            ChainConfig::for_genesis(&c.genesis_validators_root).map(|f| f.name),
+            Some("chiado")
+        );
+    }
+
     /// The Java anchor and the Rust one, compared directly.
     ///
     /// The `*_config_matches_networkconfig_java` tests above are ONE-SIDED: they
@@ -4974,6 +5112,7 @@ mod tests {
             ("mainnet", ChainConfig::mainnet()),
             ("sepolia", ChainConfig::sepolia()),
             ("gnosis", ChainConfig::gnosis()),
+            ("chiado", ChainConfig::chiado()),
         ] {
             let begin = format!("// @checkpoint:{net}:begin");
             let end = format!("// @checkpoint:{net}:end");

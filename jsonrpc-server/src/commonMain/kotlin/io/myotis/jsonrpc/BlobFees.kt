@@ -12,7 +12,7 @@ package io.myotis.jsonrpc
  * mainnet and Sepolia (a fork without an entry keeps the previous fork's —
  * Osaka keeps Prague's, Sepolia's Amsterdam keeps BPO2's), Nethermind's
  * `gnosis.json` for Gnosis, whose one entry since Cancun carries its own
- * fraction and a 1 gwei minimum. Cross-checked against full nodes'
+ * fraction and a 1 gwei minimum, and `chiado.json` for Chiado, which uses the same. Cross-checked against full nodes'
  * `eth_feeHistory` `baseFeePerBlobGas` in every era (`BlobFeesTest`).
  */
 internal object BlobFees {
@@ -40,6 +40,11 @@ internal object BlobFees {
         // Gnosis: one entry since its Cancun, and a 1 gwei minimum (EIP-4844 on Gnosis).
         100L to Schedule(1_000_000_000, listOf(
             Era(1_710_181_820, 1_112_826),
+        )),
+        // Chiado: Gnosis's parameters on its own Cancun (Nethermind `chiado.json`:
+        // one blobSchedule entry, fraction 0x10fafa, eip4844MinBlobGasPrice 1 gwei).
+        10_200L to Schedule(1_000_000_000, listOf(
+            Era(1_706_724_940, 1_112_826),
         )),
     )
 

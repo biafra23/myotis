@@ -26,7 +26,7 @@ pub enum EvmError {
     /// state (no local archive, and the fork rules below London aren't modelled).
     ForkTooOld { block_number: u64, timestamp: u64 },
     /// The block context is for a chain this executor has no fork table for (the
-    /// table covers mainnet, Sepolia and Gnosis), so any other chain id would
+    /// table covers mainnet, Sepolia, Gnosis and Chiado), so any other chain id would
     /// otherwise run under another chain's forks — fail closed instead of returning
     /// a silently-wrong result.
     UnsupportedChain { chain_id: u64 },
@@ -206,7 +206,7 @@ impl std::fmt::Display for EvmError {
                 "pre-London blocks are not supported (blockNumber={block_number}, timestamp={timestamp})"
             ),
             EvmError::UnsupportedChain { chain_id } => {
-                write!(f, "unsupported chain id {chain_id} (no fork table: the executor runs mainnet, sepolia and gnosis)")
+                write!(f, "unsupported chain id {chain_id} (no fork table: the executor runs mainnet, sepolia, gnosis and chiado)")
             }
             EvmError::Transaction { detail } => write!(f, "invalid transaction: {detail}"),
             EvmError::IterationLimitExceeded { cap } => write!(

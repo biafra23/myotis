@@ -486,8 +486,9 @@ private fun StaleAnchorDialog(
 ) {
     val agePeriods = (s.syncTargetPeriod - s.syncCurrentPeriod).coerceAtLeast(0)
     // Rough period length per chain, for a human-scale age (exact math stays in
-    // periods — this is display only): mainnet preset ~27.3 h, Gnosis ~11.4 h.
-    val hoursPerPeriod = if (network == "gnosis") 11.4 else 27.3
+    // periods — this is display only): mainnet preset ~27.3 h, the Gnosis preset
+    // (Gnosis Chain and its testnet Chiado) ~11.4 h.
+    val hoursPerPeriod = if (network == "gnosis" || network == "chiado") 11.4 else 27.3
     val ageDays = ((agePeriods * hoursPerPeriod) / 24.0).toInt()
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -2206,14 +2207,15 @@ private fun VerificationBadge(a: AccountResult) {
 
 /**
  * The native currency a chain's balances are counted in, as a wallet shows it: xDAI on
- * Gnosis Chain, ETH on mainnet and Sepolia (Sepolia's is test ether). Null for a network
+ * Gnosis Chain and Chiado (Chiado's is test xDAI), ETH on mainnet and Sepolia (Sepolia's
+ * is test ether). Null for a network
  * this table does not know, and the card then names no unit: a network added later reads
  * "Balance" until it is listed here, never a wrong symbol. Every listed chain has 18
  * decimals, which is what [formatNative] assumes; check that before listing a new one.
  */
 internal fun nativeCurrencySymbol(network: String): String? = when (network) {
     "mainnet", "sepolia" -> "ETH"
-    "gnosis" -> "xDAI"
+    "gnosis", "chiado" -> "xDAI"
     else -> null
 }
 

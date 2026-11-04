@@ -193,6 +193,14 @@ impl Namespace {
 /// the tree has none. `None` = the query can be tried. Hosts and the reader call
 /// it first so a refused query costs no EVM setup and no AUTO-ladder retry.
 pub fn refusal(chain_id: u64, name: Option<&str>) -> Option<EnsError> {
+    // A chain with no pinned name tree (Chiado, 10200) is REFUSED, never handed
+    // to `for_chain`'s ENS default: mainnet's registry address holds nothing on
+    // another chain, so every lookup would come back a well-formed "no record"
+    // the caller cannot tell from a real one. The Java twin refuses the same
+    // chains (`EnsResolver.forChainId` throws, the backend reports no resolver).
+    if !has_name_tree(chain_id) {
+        return Some(EnsError::Unsupported(NO_NAME_SERVICE));
+    }
     let ns = Namespace::for_chain(chain_id);
     match name {
         Some(n) if !ns.serves(n) => Some(EnsError::Unsupported(ONLY_GNO_NAMES)),
@@ -248,6 +256,16 @@ pub enum EnsError {
     /// refused once chain state shows it. Never answered as "no record".
     Unsupported(&'static str),
 }
+
+/// Whether `chain_id` has a pinned name tree: ENS on mainnet and Sepolia (and
+/// Holesky, retired but still pinned in the Java `EnsResolver.forChainId`),
+/// Genome on Gnosis Chain. Every other chain is refused by [`refusal`].
+pub fn has_name_tree(chain_id: u64) -> bool {
+    matches!(chain_id, 1 | 11_155_111 | 17_000 | 100)
+}
+
+/// The refusal for a name query on a chain with no pinned name tree.
+pub const NO_NAME_SERVICE: &str = "no name service is pinned for this chain";
 
 /// The refusal for a non-`.gno` name on Gnosis Chain (Java `EnsResolver` uses the
 /// same words).
@@ -1094,6 +1112,20 @@ mod tests {
             // Any ENS-registry read would be a bug: the Genome tree only.
             .on(|t, _| (t == REGISTRY).then(|| panic!("ENS registry read on Gnosis")));
         assert_eq!(resolve_address(&mock, "Levvv.GNO").unwrap(), Some(VITALIK));
+    }
+
+    #[test]
+    fn a_chain_without_a_name_tree_refuses_every_query() {
+        // Chiado (10200) has no pinned tree: refused up front, never resolved
+        // against mainnet's ENS addresses (which hold nothing there).
+        for name in [Some("vitalik.eth"), Some("levvv.gno"), None] {
+            assert_eq!(refusal(10_200, name), Some(EnsError::Unsupported(NO_NAME_SERVICE)), "{name:?}");
+        }
+        assert!(!has_name_tree(10_200));
+        for chain in [1, 11_155_111, 100] {
+            assert!(has_name_tree(chain), "{chain}");
+        }
+        assert_eq!(refusal(11_155_111, Some("vitalik.eth")), None);
     }
 
     #[test]

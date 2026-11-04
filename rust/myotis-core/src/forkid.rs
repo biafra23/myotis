@@ -32,6 +32,11 @@ pub const MAINNET_FORK_ID_HASH: [u8; 4] = [0x07, 0xc9, 0x46, 0x2e];
 /// Gnosis fork-id hash (Fulu/Osaka head), forkNext = 0.
 pub const GNOSIS_FORK_ID_HASH: [u8; 4] = [0xcf, 0xca, 0x38, 0x7c];
 
+/// Chiado fork-id hash (Osaka head), forkNext = 0: CRC32 of the genesis hash
+/// folded with the Shanghai/Cancun/Prague/Osaka timestamps — the value Erigon's
+/// `p2p/forkid` tests expect for Chiado's first Osaka block.
+pub const CHIADO_FORK_ID_HASH: [u8; 4] = [0x71, 0xc4, 0x57, 0xcd];
+
 /// Sepolia fork-id hash (post-BPO2 / Fusaka head), forkNext = Amsterdam.
 pub const SEPOLIA_FORK_ID_HASH: [u8; 4] = [0x26, 0x89, 0x56, 0xb6];
 
@@ -46,6 +51,7 @@ pub fn fork_id_hash(network: &str) -> Option<[u8; 4]> {
         "mainnet" => Some(MAINNET_FORK_ID_HASH),
         "gnosis" => Some(GNOSIS_FORK_ID_HASH),
         "sepolia" => Some(SEPOLIA_FORK_ID_HASH),
+        "chiado" => Some(CHIADO_FORK_ID_HASH),
         _ => None,
     }
 }
@@ -54,7 +60,7 @@ pub fn fork_id_hash(network: &str) -> Option<[u8; 4]> {
 /// (0 = none) — twin of Java `NetworkConfig.forkNext`.
 pub fn fork_next(network: &str) -> Option<u64> {
     match network {
-        "mainnet" | "gnosis" => Some(0),
+        "mainnet" | "gnosis" | "chiado" => Some(0),
         "sepolia" => Some(SEPOLIA_FORK_NEXT),
         _ => None,
     }

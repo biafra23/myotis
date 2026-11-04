@@ -39,9 +39,10 @@ async fn main() {
     let config = match net.as_str() {
         "sepolia" => ChainConfig::sepolia(),
         "gnosis" => ChainConfig::gnosis(),
+        "chiado" => ChainConfig::chiado(),
         "mainnet" => ChainConfig::mainnet(),
         other => {
-            tracing::error!(net = other, "unknown NET (want mainnet|sepolia|gnosis)");
+            tracing::error!(net = other, "unknown NET (want mainnet|sepolia|gnosis|chiado)");
             std::process::exit(2);
         }
     };

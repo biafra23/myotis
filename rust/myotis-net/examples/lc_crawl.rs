@@ -50,6 +50,7 @@ async fn main() {
     let config = match net.as_str() {
         "mainnet" => ChainConfig::mainnet(),
         "gnosis" => ChainConfig::gnosis(),
+        "chiado" => ChainConfig::chiado(),
         _ => ChainConfig::sepolia(),
     };
     let crawl_secs: u64 = std::env::var("CRAWL_SECS")

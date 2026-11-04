@@ -88,7 +88,7 @@ class SelectorEngineTest {
     void defaultChoiceIsAutoAndCatalogAnswers() {
         assertEquals("auto", Engines.choice());
         MyotisEngine e = Engines.engine();
-        assertEquals(3, e.availableNetworks().size());
+        assertEquals(4, e.availableNetworks().size());
         assertEquals("gnosis", e.canonicalNetworkName("xdai"));
     }
 
@@ -113,7 +113,7 @@ class SelectorEngineTest {
     void autoWithoutLibraryUsesJava() {
         assumeRustUnavailable();
         Engines.select("auto");
-        assertEquals(3, Engines.engine().availableNetworks().size());
+        assertEquals(4, Engines.engine().availableNetworks().size());
     }
 
     @Test

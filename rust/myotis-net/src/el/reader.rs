@@ -179,6 +179,7 @@ pub fn fork_filter_for(cfg: &ElConfig) -> crate::el::enrfilter::ForkFilter {
         1 => Some(crate::sync::ChainConfig::mainnet()),
         11_155_111 => Some(crate::sync::ChainConfig::sepolia()),
         100 => Some(crate::sync::ChainConfig::gnosis()),
+        10_200 => Some(crate::sync::ChainConfig::chiado()),
         _ => None,
     };
     match chain {
@@ -347,6 +348,39 @@ impl ElConfig {
             boot_enodes: Vec::new(),
             // Gnosis publishes no EL node list; its chainspec enodes are the
             // Java twin's substitute (`NetworkConfig.GNOSIS_EL_ENODES`).
+            enr_tree_urls: Vec::new(),
+        }
+    }
+
+    /// Chiado (Gnosis's testnet) EL parameters — verbatim from the Java
+    /// `NetworkConfig.CHIADO`. The fork-id is the Osaka-head hash (Erigon's
+    /// Chiado fork-id tests: 0x71c457cd, next 0).
+    pub fn chiado() -> ElConfig {
+        // The four boot nodes of gnosischain/configs chiado/genesis.json. They
+        // are UDP-only discovery nodes (TCP port 0), so they seed discv4 and are
+        // never dialed over RLPx — hence no `boot_enodes`.
+        const CHIADO_BOOTNODES: &[&str] = &[
+            "51.75.246.2:30303",
+            "57.129.70.222:30303",
+            "57.128.252.123:30303",
+            "54.39.148.98:30303",
+        ];
+        ElConfig {
+            network_id: 10_200,
+            genesis_hash: hex32("ada44fd8d2ecab8b08f256af07ad3e777f17fb434f8f8e678b312f576212ba9a"),
+            fork_id_hash: myotis_core::forkid::CHIADO_FORK_ID_HASH,
+            fork_next: 0,
+            bootnodes: CHIADO_BOOTNODES.iter().filter_map(|s| s.parse().ok()).collect(),
+            discv4_port: 0,
+            listen_port: 30306, // chiado conventional EL port (Java defaultElPort)
+            pool_config: PoolConfig::default(),
+            cache_path: None,
+            log_index_path: None,
+            min_suggested_tip_wei: 1_000_000, // 0.001 gwei — Gnosis's cheap-chain floor
+            block_time: Duration::from_secs(5),
+            traffic: crate::traffic::TrafficMeter::new(),
+            boot_enodes: Vec::new(),
+            // Chiado publishes no EL node list.
             enr_tree_urls: Vec::new(),
         }
     }
@@ -17234,7 +17268,7 @@ mod restart_claim_tests {
         // many slots, hence blocks. The bound must sit well above it, or a
         // genuine claim would be dropped the moment the light client catches up.
         use crate::sync::{ChainConfig, SYNCED_SLOT_SLACK_EPOCHS};
-        for cfg in [ChainConfig::mainnet(), ChainConfig::sepolia(), ChainConfig::gnosis()] {
+        for cfg in [ChainConfig::mainnet(), ChainConfig::sepolia(), ChainConfig::gnosis(), ChainConfig::chiado()] {
             let slack = SYNCED_SLOT_SLACK_EPOCHS * cfg.slots_per_epoch;
             assert!(RESTART_CLAIM_MAX_LEAD >= 2 * slack, "{slack} slots of SYNCED slack");
         }
@@ -18597,6 +18631,7 @@ mod pre_broadcast_tests {
             (ElConfig::mainnet(), ChainConfig::mainnet(), 1),
             (ElConfig::sepolia(), ChainConfig::sepolia(), 11_155_111),
             (ElConfig::gnosis(), ChainConfig::gnosis(), 100),
+            (ElConfig::chiado(), ChainConfig::chiado(), 10_200),
         ] {
             assert_eq!(el.block_time.as_secs(), cl.seconds_per_slot, "{}", el.network_id);
             assert_eq!(el.network_id, chain_id);

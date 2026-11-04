@@ -39,4 +39,12 @@ class ForkTimePinsTest {
         assertEquals(0x6812_2dbcL, EvmFactory.GNOSIS_PRAGUE_TIME);
         assertEquals(0x69de_2dbcL, EvmFactory.GNOSIS_OSAKA_TIME);
     }
+
+    @Test
+    void chiadoForkTimesMatchTheNethermindHex() {
+        assertEquals(0x646e_0e4cL, EvmFactory.CHIADO_SHANGHAI_TIME);
+        assertEquals(0x65ba_8e4cL, EvmFactory.CHIADO_CANCUN_TIME);
+        assertEquals(0x67c9_6e4cL, EvmFactory.CHIADO_PRAGUE_TIME);
+        assertEquals(0x69b7_ce4cL, EvmFactory.CHIADO_OSAKA_TIME);
+    }
 }

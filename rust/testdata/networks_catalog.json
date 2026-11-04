@@ -31,5 +31,16 @@
     "defaultRpcPort": 8547,
     "clGenesisTime": 1655733600,
     "secondsPerSlot": 12
+  },
+  {
+    "name": "chiado",
+    "displayName": "Chiado",
+    "chainId": 10200,
+    "hasEns": false,
+    "defaultElPort": 30306,
+    "defaultDiscv5Port": 9003,
+    "defaultRpcPort": 8548,
+    "clGenesisTime": 1665396300,
+    "secondsPerSlot": 5
   }
 ]

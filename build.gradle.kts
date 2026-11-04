@@ -1654,15 +1654,22 @@ val checkpointEndpoints = mapOf(
         "https://rpc-gbc.gnosischain.com",
         "https://checkpoint.gnosischain.com",
     ),
+    // Chiado, Gnosis's testnet: publicnode and the Gnosis team's own endpoint —
+    // two operators, the agreement gate's minimum. (checkpoint.chiadochain.net,
+    // the Gnosis team's checkpointz host, would add no voice: same operator.)
+    "chiado" to listOf(
+        "https://gnosis-chiado-beacon-api.publicnode.com",
+        "https://rpc-gbc.chiadochain.net",
+    ),
 )
-val checkpointSecondsPerSlot = mapOf("mainnet" to 12L, "sepolia" to 12L, "gnosis" to 5L)
-val checkpointSlotsPerPeriod = mapOf("mainnet" to 8192L, "sepolia" to 8192L, "gnosis" to 8192L)
+val checkpointSecondsPerSlot = mapOf("mainnet" to 12L, "sepolia" to 12L, "gnosis" to 5L, "chiado" to 5L)
+val checkpointSlotsPerPeriod = mapOf("mainnet" to 8192L, "sepolia" to 8192L, "gnosis" to 8192L, "chiado" to 8192L)
 // Gnosis reaches the same 8192-slot period from 16 x 512 rather than 32 x 256,
 // so the epoch divisor is NOT shared even though the period one is. Only used
 // for the generated comment — but a comment on a trust anchor that says
 // `epoch = slot/32` on a 16-slot-epoch chain is exactly the kind of wrong an
 // operator would act on.
-val checkpointSlotsPerEpoch = mapOf("mainnet" to 32L, "sepolia" to 32L, "gnosis" to 16L)
+val checkpointSlotsPerEpoch = mapOf("mainnet" to 32L, "sepolia" to 32L, "gnosis" to 16L, "chiado" to 16L)
 /** Pinned `genesis_validators_root` per network — the chain's identity, used to
  *  confirm a `-PextraEndpoint` node is on the chain the operator thinks it is.
  *  Checked against `NetworkConfig.java` on every run so this copy cannot drift. */
@@ -1670,12 +1677,13 @@ val checkpointGenesisValidatorsRoot = mapOf(
     "mainnet" to "4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95",
     "sepolia" to "d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078",
     "gnosis" to "f5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47",
+    "chiado" to "9d642dac73058fbf39c0ae41ab1e34e4d889043cb199851ded7095bc99eb4c1e",
 )
 
 /**
  * Refresh a network's trusted checkpoint in BOTH engines.
  *
- *   ./gradlew refreshCheckpoint                      # all three networks
+ *   ./gradlew refreshCheckpoint                      # every network
  *   ./gradlew refreshCheckpoint -Pnetwork=mainnet    # one
  *   ./gradlew refreshCheckpoint -Pdry                # preview, no write
  *   ./gradlew refreshCheckpoint -PanchorFile=rust/testdata/anchors/oldest-servable.properties
@@ -1708,10 +1716,10 @@ tasks.register("refreshCheckpoint") {
         if ((project.findProperty("slot") != null || project.findProperty("period") != null) && only == null) {
             throw GradleException("-Pslot/-Pperiod need an explicit -Pnetwork=<name> — a slot is only meaningful on one chain")
         }
-        val nets = if (only != null) listOf(only) else listOf("mainnet", "sepolia", "gnosis")
+        val nets = if (only != null) listOf(only) else listOf("mainnet", "sepolia", "gnosis", "chiado")
         nets.forEach { n ->
             if (!checkpointEndpoints.containsKey(n)) {
-                throw GradleException("unknown network '$n' (mainnet|sepolia|gnosis)")
+                throw GradleException("unknown network '$n' (mainnet|sepolia|gnosis|chiado)")
             }
         }
         // -PanchorFile writes recorded anchors instead of fetching. It fixes the

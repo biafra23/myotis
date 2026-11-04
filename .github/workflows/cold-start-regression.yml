@@ -62,7 +62,7 @@ on:
       network:
         description: "Network to cold-start (gnosis is where #422 bit hardest)"
         type: choice
-        options: [gnosis, mainnet, sepolia]
+        options: [gnosis, mainnet, sepolia, chiado]
         default: gnosis
       scope:
         description: "full = all three checks (release). pins-only = skip the deep walk. census = only the DHT period census (no checks)."

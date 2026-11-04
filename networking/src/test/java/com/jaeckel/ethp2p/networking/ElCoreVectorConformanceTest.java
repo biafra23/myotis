@@ -191,8 +191,12 @@ class ElCoreVectorConformanceTest {
         actual.put("forkid.forkNext.mainnet", Long.toString(NetworkConfig.MAINNET.forkNext()));
         actual.put("forkid.forkNext.gnosis", Long.toString(NetworkConfig.GNOSIS.forkNext()));
         actual.put("forkid.forkNext.sepolia", Long.toString(NetworkConfig.SEPOLIA.forkNext()));
+        actual.put("forkid.chiado",
+                Bytes.wrap(NetworkConfig.CHIADO.forkIdHash()).toUnprefixedHexString());
+        actual.put("forkid.forkNext.chiado", Long.toString(NetworkConfig.CHIADO.forkNext()));
         // The fork id once forkNext has passed: both engines' CRC32 must agree on it.
-        for (NetworkConfig net : List.of(NetworkConfig.MAINNET, NetworkConfig.GNOSIS, NetworkConfig.SEPOLIA)) {
+        for (NetworkConfig net : List.of(NetworkConfig.MAINNET, NetworkConfig.GNOSIS, NetworkConfig.SEPOLIA,
+                NetworkConfig.CHIADO)) {
             actual.put("forkid.afterNext." + net.name(), net.forkNext() == 0 ? "none"
                     : String.format(Locale.ROOT, "%08x", net.forkIdAt(net.forkNext()).hash()));
         }

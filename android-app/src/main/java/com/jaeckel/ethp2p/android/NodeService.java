@@ -190,6 +190,7 @@ public final class NodeService extends Service {
         switch (n.toLowerCase(java.util.Locale.ROOT)) {
             case "gnosis": case "gbc": case "xdai": return "gnosis";
             case "sepolia": return "sepolia";
+            case "chiado": return "chiado";
             default: return "mainnet";
         }
     }
@@ -236,7 +237,7 @@ public final class NodeService extends Service {
     }
     /** Per-network default RPC port — from the engine's catalog so the defaults stay
      *  collision-free and consistent with the engine's own port defaulting (mainnet 8545,
-     *  Gnosis 8546, Sepolia 8547). A NodeService-local table would silently put Sepolia on
+     *  Gnosis 8546, Sepolia 8547, Chiado 8548). A NodeService-local table would silently put Sepolia on
      *  8545 and collide with mainnet's RPC bind when both run. */
     public static int defaultRpcPort(String network) {
         return networkInfo(canonicalNetwork(network)).defaultRpcPort();
