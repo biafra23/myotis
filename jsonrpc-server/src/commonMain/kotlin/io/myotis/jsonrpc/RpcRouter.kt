@@ -1776,7 +1776,11 @@ class RpcRouter internal constructor(
             // geth simulates them. The simulation object goes to the engine as the
             // request carried it: the engine reads it whole and refuses (-32602)
             // whatever it does not apply, and geth's own simulation errors come back
-            // with geth's codes. The block is read as for eth_call.
+            // with geth's codes. The block is read as for eth_call, a hash resolved
+            // to its number, but with no [pinServable]: the engine judges every
+            // number itself (the head's or the finalized block's own, and nothing
+            // else), and the state window would refuse the finalized block's
+            // number, more than 64 blocks back on mainnet, as for eth_getProof.
             "eth_simulateV1" -> {
                 if (!b.supportsSimulation()) {
                     invalid("method 'eth_simulateV1' is not supported by this node's engine (the Java engine " +
@@ -1785,7 +1789,7 @@ class RpcRouter internal constructor(
                 val p = root.params()
                 val opts = p?.getOrNull(0) as? JsonObject
                     ?: invalid("invalid argument 0: expected the simulation object (blockStateCalls, …)")
-                val block = stateBlock(p.selectorAt(1, Takes.NUMBER_OR_HASH), b, "eth_simulateV1") ?: return null
+                val block = resolveHash(p.selectorAt(1, Takes.NUMBER_OR_HASH), b, "eth_simulateV1") ?: return null
                 val optsJson = json.encodeToString(JsonObject.serializer(), opts)
                 val outcome = withContext(rpcIoDispatcher) { b.simulateV1(optsJson, block.value) }
                 when (outcome.kind) {

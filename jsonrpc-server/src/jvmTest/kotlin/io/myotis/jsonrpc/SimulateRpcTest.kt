@@ -78,6 +78,10 @@ class SimulateRpcTest {
         assertEquals("latest", b.asked!!.second)
         call(b, """[$opts,"0x64"]""")
         assertEquals("0x64", b.asked!!.second)
+        // A number past eth_call's 64-block window reaches the engine, which
+        // judges it (the finalized block is that far back on mainnet).
+        call(b, """[$opts,"0x14"]""")
+        assertEquals("0x14", b.asked!!.second)
     }
 
     /** Refused before the engine is asked, for good. */
