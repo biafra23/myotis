@@ -46,6 +46,7 @@ import io.myotis.engine.capi.myotis_resume
 import io.myotis.engine.capi.myotis_accept_stale_anchor
 import io.myotis.engine.capi.myotis_set_network_metering
 import io.myotis.engine.capi.myotis_set_ws_bound_periods
+import io.myotis.engine.capi.myotis_simulate_v1_json
 import io.myotis.engine.capi.myotis_start
 import io.myotis.engine.capi.myotis_status_json
 import io.myotis.engine.capi.myotis_stop
