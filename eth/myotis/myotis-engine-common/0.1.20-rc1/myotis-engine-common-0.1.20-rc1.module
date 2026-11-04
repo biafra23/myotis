@@ -1,0 +1,207 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "eth.myotis",
+    "module": "myotis-engine-common",
+    "version": "0.1.20-rc1",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "8.12"
+    }
+  },
+  "variants": [
+    {
+      "name": "apiElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 17,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-api"
+      },
+      "dependencies": [
+        {
+          "group": "eth.myotis",
+          "module": "myotis-api",
+          "version": {
+            "requires": "0.1.20-rc1"
+          },
+          "excludes": [
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-epoll"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-kqueue"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-unix-common"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-codec-native-quic"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j2-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j18-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-core"
+            }
+          ]
+        }
+      ],
+      "files": [
+        {
+          "name": "myotis-engine-common-0.1.20-rc1.jar",
+          "url": "myotis-engine-common-0.1.20-rc1.jar",
+          "size": 12151,
+          "sha512": "ad8113d6f73d6b82cd9c5e2de1e549993ef9d4ff5b0727843bc04cd04cb6078354bf54f7e3ddc311534f788d6e545a30d9d8603b93619784e7e4af9e5262a726",
+          "sha256": "8e0e5fd53a1b4f450ff52bbd880ff77f87d0849ba493da7055491d1df23d816d",
+          "sha1": "b5bbded8dc4f2eeccdbc46924b0f5763c8f4766b",
+          "md5": "7fa72ef8b74fd84eb694b554b6e8da6e"
+        }
+      ]
+    },
+    {
+      "name": "runtimeElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 17,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime"
+      },
+      "dependencies": [
+        {
+          "group": "org.slf4j",
+          "module": "slf4j-api",
+          "version": {
+            "requires": "2.0.12"
+          },
+          "excludes": [
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-epoll"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-kqueue"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-unix-common"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-codec-native-quic"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j2-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j18-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-core"
+            }
+          ]
+        },
+        {
+          "group": "eth.myotis",
+          "module": "myotis-api",
+          "version": {
+            "requires": "0.1.20-rc1"
+          },
+          "excludes": [
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-epoll"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-kqueue"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-transport-native-unix-common"
+            },
+            {
+              "group": "io.netty",
+              "module": "netty-codec-native-quic"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j2-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-slf4j18-impl"
+            },
+            {
+              "group": "org.apache.logging.log4j",
+              "module": "log4j-core"
+            }
+          ]
+        }
+      ],
+      "files": [
+        {
+          "name": "myotis-engine-common-0.1.20-rc1.jar",
+          "url": "myotis-engine-common-0.1.20-rc1.jar",
+          "size": 12151,
+          "sha512": "ad8113d6f73d6b82cd9c5e2de1e549993ef9d4ff5b0727843bc04cd04cb6078354bf54f7e3ddc311534f788d6e545a30d9d8603b93619784e7e4af9e5262a726",
+          "sha256": "8e0e5fd53a1b4f450ff52bbd880ff77f87d0849ba493da7055491d1df23d816d",
+          "sha1": "b5bbded8dc4f2eeccdbc46924b0f5763c8f4766b",
+          "md5": "7fa72ef8b74fd84eb694b554b6e8da6e"
+        }
+      ]
+    },
+    {
+      "name": "sourcesElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "myotis-engine-common-0.1.20-rc1-sources.jar",
+          "url": "myotis-engine-common-0.1.20-rc1-sources.jar",
+          "size": 11369,
+          "sha512": "81dc05e9c89c7616a212775fce7941e71e307a35ee165c93ed1bbf11b975601d1cea07bb57751abc8ca78b31966e4063c1988f2f3ee9346ea2d140f43da00a50",
+          "sha256": "ebd78e69141d567113234081545a0d846d84d52d87f1629e9b6c6ce71e339e21",
+          "sha1": "611f3fe690a1d6089a6f2c9be582bc9633ec744d",
+          "md5": "e0fd986b1be0f134ec0b3ade10877840"
+        }
+      ]
+    }
+  ]
+}
