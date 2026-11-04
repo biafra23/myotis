@@ -42,7 +42,9 @@ class NetworkConfigChiadoTest {
         assertEquals(5, C.secondsPerSlot());
         assertEquals(16, C.slotsPerEpoch());
         assertEquals(16, C.forkSchedule().slotsPerEpoch(), "schedule carries the gnosis geometry");
-        assertEquals(3L, C.wsBoundPeriods(), "Gnosis's preset and churn parameters");
+        // Gnosis's preset over a ~2.6k-validator set: the spec window is about one period.
+        assertEquals(1L, C.wsBoundPeriods());
+        assertEquals(3L, NetworkConfig.GNOSIS.wsBoundPeriods());
     }
 
     @Test

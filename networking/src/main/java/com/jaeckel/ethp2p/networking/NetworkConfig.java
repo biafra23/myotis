@@ -1060,16 +1060,23 @@ public record NetworkConfig(
      *       shrank below ~65k. Tightening to 1 period (~11.4 h) remains the
      *       strict option. Owner's call either way; raise or lower via the
      *       Settings override knowingly.</li>
-     *   <li><b>chiado: 3</b> — Gnosis's bound, for the same reason: the same
-     *       preset and the same churn parameters (CHURN_LIMIT_QUOTIENT 4096,
-     *       MAX_PER_EPOCH_ACTIVATION_EXIT_CHURN_LIMIT 64e9 in chiado/config.yaml),
-     *       over a smaller validator set, so the practical window is shorter
-     *       than Gnosis's, not longer. A testnet has nothing to protect that a
-     *       looser bound would buy, so it keeps Gnosis's number rather than a
-     *       stricter one that would park every weekend-off restart.</li>
+     *   <li><b>chiado: 1</b> (~11.4 h). Gnosis's preset and churn parameters
+     *       (chiado/config.yaml) over a far SMALLER set: 2568 active validators,
+     *       340477e9 Gwei-units of active balance (finalized state, 2026-11-04).
+     *       The Electra spec formula, MIN_VALIDATOR_WITHDRAWABILITY_DELAY (256)
+     *       + SAFETY_DECAY·T / (2·100·max(MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA, T/4096)),
+     *       gives 256 + 132 = 388 epochs; with the 64e9 exit cap Gnosis's entry
+     *       uses instead, 256 + 265 = 521 epochs — under or barely over ONE
+     *       512-epoch period either way. 1 is therefore the smallest bound the
+     *       period-granular gate can express, and Gnosis's 3 would accept an
+     *       anchor two periods past the window. The cost: a shipped Chiado
+     *       anchor goes stale within a day, so a fresh install usually meets the
+     *       STALE_ANCHOR consent (or a {@code refreshCheckpoint -Pnetwork=chiado}
+     *       first) — the fail-closed side of the trade, on a testnet.</li>
      * </ul>
      */
     public long wsBoundPeriods() {
+        if (networkId == 10200) return 1L;
         return isGnosisPreset() ? 3L : 13L;
     }
 

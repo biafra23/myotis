@@ -63,7 +63,8 @@ pub const NETWORKS: [NetworkInfo; 4] = [
         name: "chiado",
         display_name: "Chiado",
         chain_id: 10_200,
-        // No name service pinned for Chiado (`Namespace::for_chain(10200)` is none).
+        // No name tree for Chiado: `myotis_evm::ens::Namespace::for_chain(10200)`
+        // is None, so every name query is refused there (pinned below).
         has_ens: false,
         default_el_port: 30306,
         default_discv5_port: 9003,
@@ -106,6 +107,16 @@ mod tests {
     fn catalog_matches_committed_golden_sample() {
         let golden = include_str!("../../testdata/networks_catalog.json");
         assert_eq!(networks_json().trim(), golden.trim());
+    }
+
+    /// `hasEns` is what hosts gate the name UI on; the engine's own refusal is the
+    /// ENS table's. Pinned to each other so a network cannot offer names its
+    /// engine refuses, or hide names its engine serves.
+    #[test]
+    fn has_ens_follows_the_engines_name_tree_table() {
+        for n in NETWORKS {
+            assert_eq!(n.has_ens, myotis_evm::ens::has_name_tree(n.chain_id), "{}", n.name);
+        }
     }
 
     #[test]

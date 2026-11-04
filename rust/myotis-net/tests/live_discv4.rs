@@ -50,7 +50,8 @@ fn bootnodes_from_env() -> (String, Vec<SocketAddr>) {
         "mainnet" => ElConfig::mainnet(),
         "sepolia" => ElConfig::sepolia(),
         "gnosis" => ElConfig::gnosis(),
-        other => panic!("NET={other}: expected mainnet, sepolia or gnosis"),
+        "chiado" => ElConfig::chiado(),
+        other => panic!("NET={other}: expected mainnet, sepolia, gnosis or chiado"),
     };
     (net, config.bootnodes)
 }

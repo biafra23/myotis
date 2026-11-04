@@ -548,7 +548,9 @@ impl ChainConfig {
             discv5_port: 0,
             snapshot_path: None,
             cl_peer_cache_path: None,
-            ws_bound_periods: 3, // Gnosis's preset and churn parameters (see NetworkConfig.wsBoundPeriods)
+            // Gnosis's preset over ~2.6k validators: the spec window is 388-521
+            // epochs, about one period (derivation in NetworkConfig.wsBoundPeriods).
+            ws_bound_periods: 1,
             ws_policy: Arc::new(WsPolicy::default()),
             traffic: crate::traffic::TrafficMeter::new(),
             cl_fork_watch: None,
@@ -1071,12 +1073,6 @@ const GNOSIS_BOOTSTRAP_ENRS: &[&str] = &[
     "enr:-KG4QCjwDSRCD6CysnECiWR9i6LBDoETDWI-0zU9bHBbFvgwKHZBGM4LBOBLl15zPJdgPePLlUNJrcbO8l9CGY6aagQHhGV0aDKQMjfatgYAAGT__________4JpZIJ2NIJpcIS8RCAQiXNlY3AyNTZrMaEDM0NY9iNV9hZMrtkoRrPEKj7tm2TLriwZv-m1ctszvvKDdGNwgiOUg3VkcIIjlA",
 ];
 
-/// Known light-client-serving mainnet peers — mirrored with the Java
-/// `NetworkConfig.MAINNET` clPeerMultiaddrs list (same entries, same order;
-/// both parity tests pin the full strings). Provenance: originally discovered
-/// via the Lighthouse peer API 2026-03-11, re-censused via period_census
-/// 2026-09-01 (#410), re-verified and pruned 2026-09-02 (#411), re-censused and
-/// pruned again 2026-09-13 (per-entry evidence in the comments below).
 /// Pinned chiado LC-serving peer multiaddrs (Java `NetworkConfig.CHIADO.clPeerMultiaddrs`).
 /// EMPTY until a period census (`examples/period_census.rs`, the cold-start
 /// workflow's `census` scope) confirms Chiado servers worth pinning: there is no
@@ -1095,6 +1091,12 @@ const CHIADO_BOOTSTRAP_ENRS: &[&str] = &[
     "enr:-IS4QEuUku9zL0V3hFHt41fqmEdvphEvrOg0D4K_TgiiaePCDH2IPzt6B3O6NLHtgJNXk3UW68DL6KVBD4rjoW-nW9ACgmlkgnY0gmlwhDYnlGKJc2VjcDI1NmsxoQP3W66lisn2YOJF4B0QDEnURZ6tqzpi5gBy9rbMfpC70YN1ZHCCIyg",
 ];
 
+/// Known light-client-serving mainnet peers — mirrored with the Java
+/// `NetworkConfig.MAINNET` clPeerMultiaddrs list (same entries, same order;
+/// both parity tests pin the full strings). Provenance: originally discovered
+/// via the Lighthouse peer API 2026-03-11, re-censused via period_census
+/// 2026-09-01 (#410), re-verified and pruned 2026-09-02 (#411), re-censused and
+/// pruned again 2026-09-13 (per-entry evidence in the comments below).
 const MAINNET_STATIC_PEERS: &[&str] = &[
     // roost mainnet (rust/roost). FIRST for the same reason as sepolia: a
     // general-purpose beacon node shares one connection semaphore between
@@ -5051,7 +5053,7 @@ mod tests {
         assert_eq!((c.seconds_per_slot, c.slots_per_epoch), (5, 16));
         assert_eq!(c.epochs_per_sync_committee_period, 512);
         assert_eq!(c.slots_per_period(), 8192);
-        assert_eq!(c.effective_ws_bound_periods(), 3);
+        assert_eq!(c.ws_bound_periods, 1); // the spec window is ~one period, not Gnosis's 3
         assert_eq!((c.blob_params_epoch, c.blob_params_max_blobs), (948_224, 2));
         // The digest the Java computes (NetworkConfig.CHIADO.currentForkDigest):
         // Fulu over Chiado's root with the Electra-baseline blob params folded in.

@@ -138,29 +138,42 @@ pub struct Namespace {
 }
 
 impl Namespace {
-    /// The name tree a chain resolves: Genome on Gnosis Chain (100), ENS
-    /// everywhere else (the Java `EnsResolver.forChainId` twin; the host only
-    /// offers names on chains its catalog marks `hasEns`).
-    pub fn for_chain(chain_id: u64) -> Namespace {
-        if chain_id == 100 {
-            Namespace {
+    /// The name tree a chain resolves: ENS on mainnet (1), Sepolia (11155111)
+    /// and retired Holesky (17000), Genome on Gnosis Chain (100), and NONE
+    /// elsewhere — Chiado
+    /// (10200) included. The Java `EnsResolver.forChainId` twin, which throws
+    /// for the same chains; the catalog's `hasEns` is pinned to this table by
+    /// `myotis-engine`'s catalog tests. `None` is a refusal
+    /// ([`NO_NAME_SERVICE`]), never a fallback: mainnet's registry address
+    /// holds nothing on another chain, so resolving there would answer a
+    /// well-formed "no record" the caller cannot tell from a real one.
+    pub fn for_chain(chain_id: u64) -> Option<Namespace> {
+        match chain_id {
+            100 => Some(Namespace {
                 registry: GENOME_REGISTRY,
                 root: GENOME_ROOT,
                 registrar_tld: GENOME_TLD,
                 registrar: GENOME_REGISTRAR,
                 required_tld: Some(GENOME_TLD),
                 universal_resolver: None,
-            }
-        } else {
-            Namespace {
+            }),
+            // Holesky (17000) is retired and not hosted, but stays an ENS chain
+            // here as in the Java table, which still pins it.
+            1 | 11_155_111 | 17_000 => Some(Namespace {
                 registry: REGISTRY,
                 root: [0u8; 32],
                 registrar_tld: "eth",
                 registrar: BASE_REGISTRAR,
                 required_tld: None,
                 universal_resolver: Some(UNIVERSAL_RESOLVER),
-            }
+            }),
+            _ => None,
         }
+    }
+
+    /// [`Namespace::for_chain`], refusing a chain without a tree.
+    fn of_chain(chain_id: u64) -> Result<Namespace, EnsError> {
+        Self::for_chain(chain_id).ok_or(EnsError::Unsupported(NO_NAME_SERVICE))
     }
 
     /// Whether this tree serves `name`: any name for ENS; for a single-TLD tree
@@ -193,15 +206,10 @@ impl Namespace {
 /// the tree has none. `None` = the query can be tried. Hosts and the reader call
 /// it first so a refused query costs no EVM setup and no AUTO-ladder retry.
 pub fn refusal(chain_id: u64, name: Option<&str>) -> Option<EnsError> {
-    // A chain with no pinned name tree (Chiado, 10200) is REFUSED, never handed
-    // to `for_chain`'s ENS default: mainnet's registry address holds nothing on
-    // another chain, so every lookup would come back a well-formed "no record"
-    // the caller cannot tell from a real one. The Java twin refuses the same
-    // chains (`EnsResolver.forChainId` throws, the backend reports no resolver).
-    if !has_name_tree(chain_id) {
-        return Some(EnsError::Unsupported(NO_NAME_SERVICE));
-    }
-    let ns = Namespace::for_chain(chain_id);
+    let ns = match Namespace::of_chain(chain_id) {
+        Ok(ns) => ns,
+        Err(refused) => return Some(refused),
+    };
     match name {
         Some(n) if !ns.serves(n) => Some(EnsError::Unsupported(ONLY_GNO_NAMES)),
         Some(_) => None,
@@ -257,11 +265,10 @@ pub enum EnsError {
     Unsupported(&'static str),
 }
 
-/// Whether `chain_id` has a pinned name tree: ENS on mainnet and Sepolia (and
-/// Holesky, retired but still pinned in the Java `EnsResolver.forChainId`),
-/// Genome on Gnosis Chain. Every other chain is refused by [`refusal`].
+/// Whether `chain_id` has a name tree ([`Namespace::for_chain`]); every other
+/// chain is refused by [`refusal`] and by each resolution entry point.
 pub fn has_name_tree(chain_id: u64) -> bool {
-    matches!(chain_id, 1 | 11_155_111 | 17_000 | 100)
+    Namespace::for_chain(chain_id).is_some()
 }
 
 /// The refusal for a name query on a chain with no pinned name tree.
@@ -383,7 +390,7 @@ pub fn resolve_address(
     caller: &dyn EthCaller,
     name: &str,
 ) -> Result<Option<[u8; 20]>, EnsError> {
-    let node = Namespace::for_chain(caller.chain_id()).node(name)?;
+    let node = Namespace::of_chain(caller.chain_id())?.node(name)?;
     let inner = abi::encode_call_bytes32("addr(bytes32)", &node);
     let Some(raw) = resolve_record(caller, name, &inner)? else {
         return Ok(None);
@@ -430,7 +437,7 @@ pub fn resolve_ownership(
         "resolve_ownership: chain_id disagrees with the caller"
     );
     let chain_id = caller.chain_id();
-    let ns = Namespace::for_chain(chain_id);
+    let ns = Namespace::of_chain(chain_id)?;
     let node = ns.node(name)?;
     let wrapper = name_wrapper(chain_id);
     if let Some(ur) = ns.universal_resolver {
@@ -549,7 +556,7 @@ pub fn resolve_text(
     name: &str,
     key: &str,
 ) -> Result<Option<String>, EnsError> {
-    let node = Namespace::for_chain(caller.chain_id()).node(name)?;
+    let node = Namespace::of_chain(caller.chain_id())?.node(name)?;
     let inner = abi::encode_call_bytes32_string("text(bytes32,string)", &node, key);
     let Some(raw) = resolve_record(caller, name, &inner)? else {
         return Ok(None);
@@ -563,7 +570,7 @@ pub fn resolve_contenthash(
     caller: &dyn EthCaller,
     name: &str,
 ) -> Result<Option<Vec<u8>>, EnsError> {
-    let node = Namespace::for_chain(caller.chain_id()).node(name)?;
+    let node = Namespace::of_chain(caller.chain_id())?.node(name)?;
     let inner = abi::encode_call_bytes32("contenthash(bytes32)", &node);
     let Some(raw) = resolve_record(caller, name, &inner)? else {
         return Ok(None);
@@ -578,7 +585,7 @@ pub fn resolve_multicoin(
     name: &str,
     coin_type: u64,
 ) -> Result<Option<Vec<u8>>, EnsError> {
-    let node = Namespace::for_chain(caller.chain_id()).node(name)?;
+    let node = Namespace::of_chain(caller.chain_id())?.node(name)?;
     let inner = abi::encode_call_bytes32_u64("addr(bytes32,uint256)", &node, coin_type);
     let Some(raw) = resolve_record(caller, name, &inner)? else {
         return Ok(None);
@@ -592,7 +599,7 @@ pub fn resolve_pubkey(
     caller: &dyn EthCaller,
     name: &str,
 ) -> Result<Option<([u8; 32], [u8; 32])>, EnsError> {
-    let node = Namespace::for_chain(caller.chain_id()).node(name)?;
+    let node = Namespace::of_chain(caller.chain_id())?.node(name)?;
     let inner = abi::encode_call_bytes32("pubkey(bytes32)", &node);
     let Some(raw) = resolve_record(caller, name, &inner)? else {
         return Ok(None);
@@ -608,7 +615,7 @@ pub fn resolve_abi(
     name: &str,
     content_types: u64,
 ) -> Result<Option<(u64, Vec<u8>)>, EnsError> {
-    let node = Namespace::for_chain(caller.chain_id()).node(name)?;
+    let node = Namespace::of_chain(caller.chain_id())?.node(name)?;
     let inner = abi::encode_call_bytes32_u64("ABI(bytes32,uint256)", &node, content_types);
     let Some(raw) = resolve_record(caller, name, &inner)? else {
         return Ok(None);
@@ -626,7 +633,7 @@ pub fn resolve_dns_record(
     dns_name: &str,
     resource: u16,
 ) -> Result<Option<Vec<u8>>, EnsError> {
-    let node = Namespace::for_chain(caller.chain_id()).node(name)?;
+    let node = Namespace::of_chain(caller.chain_id())?.node(name)?;
     let wire = dns_encode(dns_name)?;
     let inner = abi::encode_call_bytes32_bytes_u64(
         "dnsRecord(bytes32,bytes,uint16)",
@@ -647,7 +654,7 @@ pub fn resolve_interface_implementer(
     name: &str,
     interface_id: [u8; 4],
 ) -> Result<Option<[u8; 20]>, EnsError> {
-    let node = Namespace::for_chain(caller.chain_id()).node(name)?;
+    let node = Namespace::of_chain(caller.chain_id())?.node(name)?;
     let inner = abi::encode_call_bytes32_bytes4(
         "interfaceImplementer(bytes32,bytes4)",
         &node,
@@ -686,7 +693,7 @@ pub fn reverse_resolve(
     caller: &dyn EthCaller,
     address: [u8; 20],
 ) -> Result<Option<String>, EnsError> {
-    let ns = Namespace::for_chain(caller.chain_id());
+    let ns = Namespace::of_chain(caller.chain_id())?;
     if !ns.serves_reverse() {
         // Genome keeps its reverse records in SPACE ID's own reverse scheme (an
         // `addr.reverse` node read through `tldName`/`name` with the TLD's
@@ -965,7 +972,7 @@ fn find_resolver(caller: &dyn EthCaller, name: &str) -> Result<Option<ResolverIn
         trimmed.split('.').collect()
     };
 
-    let ns = Namespace::for_chain(caller.chain_id());
+    let ns = Namespace::of_chain(caller.chain_id())?;
     for i in 0..labels.len() {
         let suffix = labels[i..].join(".");
         let suffix_node = namehash_from(&ns.root, &suffix);
@@ -1126,6 +1133,14 @@ mod tests {
             assert!(has_name_tree(chain), "{chain}");
         }
         assert_eq!(refusal(11_155_111, Some("vitalik.eth")), None);
+        // ...and every resolution entry point refuses it too, before any call: the
+        // refusal is the table's, not a guard a caller has to remember.
+        let mock = MockCaller::new().on_chain(10_200);
+        let refused = Some(EnsError::Unsupported(NO_NAME_SERVICE));
+        assert_eq!(resolve_address(&mock, "vitalik.eth").err(), refused);
+        assert_eq!(resolve_ownership(&mock, "vitalik.eth", 10_200).err(), refused);
+        assert_eq!(reverse_resolve(&mock, [0x11; 20]).err(), refused);
+        assert_eq!(*mock.calls.borrow(), 0, "refused before any call");
     }
 
     #[test]
@@ -1140,14 +1155,14 @@ mod tests {
         assert_eq!(refusal(100, Some("levvv.gno")), None);
         assert_eq!(refusal(1, Some("levvv.gno")), None);
         assert_eq!(*mock.calls.borrow(), 0, "refused before any call");
-        let ns = Namespace::for_chain(100);
+        let ns = Namespace::for_chain(100).expect("Genome tree");
         assert!(ns.serves("levvv.gno"));
         assert!(ns.serves("a.levvv.gno."));
         assert!(!ns.serves("gno"));
         assert!(!ns.serves("xgno"));
         assert!(!ns.serves("levvv.gno.eth"));
         // ENS serves any name.
-        assert!(Namespace::for_chain(1).serves("levvv.gno"));
+        assert!(Namespace::for_chain(1).expect("ENS tree").serves("levvv.gno"));
     }
 
     #[test]
