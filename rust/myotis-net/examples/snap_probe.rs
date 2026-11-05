@@ -176,8 +176,14 @@ async fn main() {
         "[snap_probe] crawl over; waiting for {} queued probes",
         handles.len()
     );
-    for h in handles {
+    // The drain can take tens of minutes after a large crawl (96 probes at a
+    // time, up to 45 s each), so report progress rather than sit silent.
+    let total = handles.len();
+    for (i, h) in handles.into_iter().enumerate() {
         let _ = h.await;
+        if (i + 1) % 100 == 0 {
+            eprintln!("[snap_probe] {}/{total} probes finished", i + 1);
+        }
     }
 
     let reports = reports.lock().await;
@@ -378,12 +384,18 @@ async fn probe_inner(
     let hello = decode_hello(&payload)?;
     r.stage = "hello";
     r.client = hello.client_id.clone();
-    r.caps = hello
-        .capabilities
-        .iter()
-        .map(|c| format!("{}/{}", c.name, c.version))
-        .collect::<Vec<_>>()
-        .join(",");
+    // Capability names are peer-controlled bytes (`from_utf8_lossy` in
+    // `decode_hello`): escape and bound them like the client id before they
+    // reach the terminal.
+    r.caps = truncate(
+        &hello
+            .capabilities
+            .iter()
+            .map(|c| format!("{}/{}", c.name, c.version))
+            .collect::<Vec<_>>()
+            .join(","),
+        120,
+    );
     let (eth_v, snap_v) = negotiate(&decode_hello(&our_hello)?, &hello);
     r.eth = eth_v;
     r.snap = snap_v;
