@@ -44,7 +44,7 @@ use crate::el::evm::{
     EnsRecordValue, EnsRootMode, GasOutcome, PoolOracle, TraceAnswer, TraceOutcome,
 };
 use crate::el::peer::{Coverage, ManagedPeer};
-use crate::el::pool::{Enode, PeerPool, PoolConfig};
+use crate::el::pool::{Enode, PeerPool, PoolConfig, PoolMemory};
 use crate::el::readstats::{pad32, AccountFact, ReadStats};
 use crate::el::receipt::DecodedReceipt;
 use crate::el::snap::fetch::AccountOutcome;
@@ -2307,9 +2307,21 @@ impl ElReader {
         base: ElConfig,
         read_stats: Arc<ReadStats>,
     ) -> Result<ElReader, String> {
-        let key = generate_node_key()?;
+        ElReader::start_carried(anchor, cache_path, base, read_stats, ElCarry::new()?).await
+    }
+
+    /// [`start_for`](Self::start_for) over what an earlier reader of the same
+    /// chain left in `carry` — its node key and its pool's dial verdicts (see
+    /// [`ElCarry`]). How a resume rebuilds the reader a pause dropped.
+    pub async fn start_carried(
+        anchor: Arc<ExecAnchor>,
+        cache_path: Option<std::path::PathBuf>,
+        base: ElConfig,
+        read_stats: Arc<ReadStats>,
+        carry: ElCarry,
+    ) -> Result<ElReader, String> {
         let cfg = ElConfig { cache_path, ..base };
-        ElReader::start_with_stats(key, anchor, cfg, read_stats).await
+        ElReader::start_inner(carry.key, anchor, cfg, read_stats, carry.pool).await
     }
 
     /// Start discovery + the peer pool for `cfg`, reading verified state against
@@ -2320,16 +2332,18 @@ impl ElReader {
         anchor: Arc<ExecAnchor>,
         cfg: ElConfig,
     ) -> Result<ElReader, String> {
-        ElReader::start_with_stats(key, anchor, cfg, Arc::new(ReadStats::new())).await
+        ElReader::start_inner(key, anchor, cfg, Arc::new(ReadStats::new()), PoolMemory::default()).await
     }
 
-    /// [`start`](Self::start) reporting into an existing shadow cache — how a
-    /// resume keeps the counters the paused reader accumulated.
-    pub async fn start_with_stats(
+    /// The one start path: discovery + the pool over `key`, reporting into
+    /// `read_stats` (a resume hands in the paused reader's, so its counters
+    /// survive), the pool over `pool_memory` (see [`ElCarry`]).
+    async fn start_inner(
         key: Arc<NodeKey>,
         anchor: Arc<ExecAnchor>,
         cfg: ElConfig,
         read_stats: Arc<ReadStats>,
+        pool_memory: PoolMemory,
     ) -> Result<ElReader, String> {
         let (tx, rx) = mpsc::channel(256);
         // Below target until the maintainer's first tick says otherwise — a
@@ -2398,6 +2412,7 @@ impl ElReader {
                 move || anchor.optimistic_head()
             })),
             Arc::clone(&cfg.traffic),
+            pool_memory,
         );
         // Gloas: the light client proves only execution block hashes; the pool
         // fetches their headers for the anchor to verify and adopt.
@@ -11333,6 +11348,38 @@ fn storage_key(slot: u64, holder: Option<[u8; 20]>) -> [u8; 32] {
             encoded[56..64].copy_from_slice(&slot.to_be_bytes());
             keccak256(&encoded)
         }
+    }
+}
+
+/// What one EL reader of a chain hands the next across an idle pause: its
+/// clearnet node key and its pool's dial verdicts ([`PoolMemory`]). With a
+/// fresh key per resume, every discv4 neighbour had to bond with an unknown
+/// node id again (an endpoint-proof ping round before it answers FindNode),
+/// and with a fresh pool the wake re-handshook peers already blacklisted as
+/// wrong-chain. Keeping the key across a pause links no more than staying
+/// awake would: it is the identity this process already showed those peers.
+/// A stop drops the carry, so a restarted handle still gets a new key; the
+/// Tor read path keeps its own ephemeral per-connection keys (`el::tor`).
+/// One cost of the shared key: a session the paused pool had already evicted
+/// but something still held (a detached push) can outlive the pause, and a
+/// resumed dial of that peer then meets geth's "already connected" — one
+/// refused dial and a transient backoff on that peer, no worse.
+/// Cheap to clone: everything in it is shared.
+#[derive(Clone)]
+pub struct ElCarry {
+    key: Arc<NodeKey>,
+    pool: PoolMemory,
+}
+
+impl ElCarry {
+    /// A carry for a chain's first reader: a fresh key, an empty memory.
+    pub fn new() -> Result<ElCarry, String> {
+        Ok(ElCarry { key: generate_node_key()?, pool: PoolMemory::default() })
+    }
+
+    /// The node key every reader started over this carry dials and discovers with.
+    pub fn node_key(&self) -> &Arc<NodeKey> {
+        &self.key
     }
 }
 
