@@ -146,7 +146,7 @@ struct EngineState {
     /// `fork_watches`; the two advisories are merged at status time.
     cl_fork_watches: Mutex<HashMap<i64, Arc<ClForkWatch>>>,
     /// Per-handle EL carry (`ElCarry`: the clearnet node key and the pool's
-    /// wrong-chain blacklist + backoff windows): created on the handle's first
+    /// wrong-chain verdicts — see `PoolMemory`): created on the handle's first
     /// spin_up and handed to every EL reader a resume rebuilds, so a wake keeps
     /// its discv4 identity and does not re-dial peers it already ruled out.
     /// Dies with the handle (a stop → start gets a new key).

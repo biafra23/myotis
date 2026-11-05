@@ -1523,18 +1523,29 @@ pub struct PeerPool {
 pub type HeadSourceFn = Box<dyn Fn() -> Option<(u64, [u8; 32])> + Send + Sync>;
 
 /// The dial verdicts worth outliving one pool: the wrong-chain blacklist and
-/// the per-address backoff windows. An idle pause drops the EL reader and its
-/// pool, and the resume builds a new one; handing it the SAME memory keeps it
-/// from spending its first dial slots re-handshaking peers already known to
-/// be on another chain, or re-dialing a peer inside a window it earned
-/// moments before the pause (geth's inbound throttle would close it anyway).
-/// The windows are absolute (`since` + `window`), so a long sleep simply finds
-/// them expired. The Java engine keeps the same sets across a pause — they
-/// live on its `ChainStack`. Cheap to clone: both halves are shared.
+/// the backoff map. An idle pause drops the EL reader and its pool, and the
+/// resume builds a new one; handing it the SAME memory keeps it from spending
+/// its first dial slots re-handshaking peers already known to be on another
+/// chain. The Java engine keeps its blacklist across a pause the same way (it
+/// lives on its `ChainStack`). Cheap to clone: both halves are shared.
+///
+/// Only the WRONG-CHAIN verdicts cross a pause: [`PeerPool::start`] drops every
+/// other backoff window from the map it is handed ([`retain_across_pause`]).
+/// A transient, busy or lagging window describes a short-term condition a
+/// pause outlasts — and it would not reliably expire during one: a window is
+/// measured on the monotonic `Instant`, which stands still while the device
+/// is suspended (`CLOCK_MONOTONIC` on Android, `CLOCK_UPTIME_RAW` on iOS), so
+/// an overnight pause could hand the wake a window with nearly all of it left.
 #[derive(Clone, Default)]
 pub struct PoolMemory {
     blacklist: Arc<Mutex<HashSet<[u8; 64]>>>,
     backoff: Arc<Mutex<HashMap<SocketAddr, Backoff>>>,
+}
+
+/// Pure: does a backoff window survive into the next pool over the same
+/// [`PoolMemory`]? Only a wrong-chain one (see the type's doc).
+fn retain_across_pause(kind: BackoffKind) -> bool {
+    kind == BackoffKind::Incompatible
 }
 
 impl PeerPool {
@@ -1571,6 +1582,12 @@ impl PeerPool {
         // Both the discv4 dialer and the maintainer dial through one shared
         // concurrency budget — and so does a host's seed-pin push.
         let dial_slots = Arc::new(Semaphore::new(pool_cfg.max_concurrent_dials));
+        // A memory handed over by a paused pool keeps its wrong-chain verdicts
+        // only (see `PoolMemory`). Uncontended: the previous pool is stopped,
+        // and nothing else holds the map; a first pool's memory is empty.
+        if let Ok(mut backoff) = memory.backoff.try_lock() {
+            backoff.retain(|_, b| retain_across_pause(b.kind));
+        }
         let mut cache = cache;
         let tor_reserve = load_tor_reserve(&mut cache, &boot_enodes);
         let inner = Arc::new(PoolInner {
@@ -4435,24 +4452,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_resumed_pool_keeps_the_blacklist_and_the_backoff_windows_of_the_paused_one() {
+    async fn a_resumed_pool_keeps_the_wrong_chain_verdicts_and_drops_the_short_term_windows() {
         let banned = NodeKey::from_secret_bytes(&myotis_core::keccak::keccak256(b"mem-banned")).unwrap();
-        let cooling = NodeKey::from_secret_bytes(&myotis_core::keccak::keccak256(b"mem-cooling")).unwrap();
+        let foreign = NodeKey::from_secret_bytes(&myotis_core::keccak::keccak256(b"mem-foreign")).unwrap();
         let banned_addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
-        let cooling_addr: SocketAddr = "127.0.0.1:10".parse().unwrap();
+        let foreign_addr: SocketAddr = "127.0.0.1:11".parse().unwrap();
+        let short_term = [
+            ("127.0.0.1:12", BackoffKind::Transient),
+            ("127.0.0.1:13", BackoffKind::Busy),
+            ("127.0.0.1:14", BackoffKind::Lagging),
+        ];
 
         let memory = PoolMemory::default();
         let paused = memory_fixture(b"mem-first", memory.clone());
         paused.inner.blacklist.lock().await.insert(banned.public_key_bytes());
-        paused.inner.record_backoff(cooling_addr, BackoffKind::Transient, Instant::now()).await;
+        let now = Instant::now();
+        paused.inner.record_backoff(foreign_addr, BackoffKind::Incompatible, now).await;
+        for (addr, kind) in short_term {
+            paused.inner.record_backoff(addr.parse().unwrap(), kind, now).await;
+        }
         paused.stop().await;
 
         let resumed = memory_fixture(b"mem-second", memory);
         assert_eq!(resumed.blacklist_count().await, 1, "the wrong-chain verdict outlives the pause");
         assert_eq!(try_dial_verdict(&resumed.inner, banned_addr, banned.public_key_bytes()).await,
             DialVerdict::Skipped);
-        assert_eq!(try_dial_verdict(&resumed.inner, cooling_addr, cooling.public_key_bytes()).await,
-            DialVerdict::Skipped, "a window earned before the pause still blocks the re-dial");
+        // The address-level wrong-chain window too (a different node id there
+        // is still skipped)…
+        assert_eq!(try_dial_verdict(&resumed.inner, foreign_addr, foreign.public_key_bytes()).await,
+            DialVerdict::Skipped);
+        // …and nothing else: those windows are measured on a clock that stands
+        // still in a device suspend, so they must not cross a pause.
+        let kept: Vec<SocketAddr> = resumed.inner.backoff.lock().await.keys().copied().collect();
+        assert_eq!(kept, vec![foreign_addr]);
         resumed.stop().await;
 
         // A pool over fresh memory knows neither.
