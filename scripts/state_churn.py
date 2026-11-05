@@ -27,7 +27,10 @@ Not traced, so the counts run slightly low: post-block system calls other than
 EIP-4788/2935, i.e. Gnosis withdrawals (a system call into the deposit
 contract) and the EIP-7002/7251 request queues. An account whose balance or
 nonce changed and changed back within the block is still counted, so the
-account side can run slightly high.
+account side can run slightly high. With `--window`, the start-value filter
+still works per block: a slot that changes in one block of the window and
+reverts in a later one stays in the proved set, so a merged window can run
+slightly high too.
 
 The RPC must serve `debug_traceBlockByNumber` and `eth_getProof` at the
 measured block. Public endpoints that did on 2026-11-05: eth.drpc.org
@@ -73,13 +76,17 @@ def rpc(url, calls):
                  "--data-binary", "@-", url],
                 input=body, capture_output=True, check=True).stdout
             out = json.loads(raw)
+            # A single error object answers the whole batch (e.g. an endpoint
+            # that refuses batches or the method); a list carries one per call.
             if isinstance(out, dict):
-                raise RuntimeError(out.get("error"))
-            errors = [r["error"] for r in out if "error" in r]
+                errors = [out.get("error") or {"message": f"not a batch response: {out}"}]
+            else:
+                errors = [r["error"] for r in out if "error" in r]
             if errors:
-                # A refusal (bad params, proof window passed) will not change on
-                # retry; only rate limits and transport failures are retried.
-                if "rate" not in str(errors[0].get("message", "")).lower():
+                # A refusal (bad params, proof window passed, method not served)
+                # will not change on retry; only rate limits and transport
+                # failures are retried.
+                if "rate" not in str(errors[0]).lower():
                     raise RpcRefused(errors[0])
                 raise RuntimeError(errors[0])
             by_id = {r["id"]: r["result"] for r in out}

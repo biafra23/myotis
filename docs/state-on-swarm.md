@@ -229,9 +229,12 @@ key at the block with `eth_getProof`. Every node on a path to a changed leaf
 has a new hash, so the union of those proofs is the set of nodes the block
 wrote, which is what a publisher must upload. `--window N` merges N blocks into
 one delta: what publishing every N-th root costs. Measured 2026-11-05 against
-eth.drpc.org and rpc.gnosischain.com, near the head. The mainnet runs predate
-the script's filter for slots a block left at their starting value, so their
-storage side may run slightly high.
+eth.drpc.org and rpc.gnosischain.com, near the head. Two biases, both small
+and both upward:
+- The mainnet runs predate the script's filter for slots a block left at
+  their starting value, so their storage side may run slightly high.
+- The filter works per block, so a merged window still counts a slot that
+  changes in one of its blocks and reverts in a later one.
 
 | | Mainnet | Gnosis |
 |---|---|---|
