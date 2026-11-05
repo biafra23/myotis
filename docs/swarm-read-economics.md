@@ -11,13 +11,19 @@ Gnosis RPC.
 
 Sources: Bee's current `master` (constants and code cited below) and a live
 `eth_call` against the SWAP price oracle on Gnosis. The throughput figures are
-**estimates** derived from those constants, not measurements.
+**estimates** derived from those constants, except where a measurement is
+named.
+
+Updated 2026-11-05. *Total free throughput* now uses the throughput `ant` (a
+Rust light node) measured on mainnet. The first version estimated
+100–200 KiB/s, which was 3–5× too low for a client holding ~100 peers.
 
 ## Short answer
 
 Swarm has no free quota that runs out. Each peer forgives a fixed amount of
 debt every second (time-based settlement, *pseudosettle*). As long as a node
-reads slower than that, reading is free indefinitely. Paying (SWAP cheques)
+reads slower than that, reading is free indefinitely. A light client holding
+about 100 peers measured **0.5–0.6 MiB/s** this way. Paying (SWAP cheques)
 lifts that speed limit. It costs roughly **0.7–0.85 BZZ per GiB**, about
 **$0.03–0.04 per GiB** at a BZZ price of about $0.04, which is approximate and
 varies a lot between price sites.
@@ -113,15 +119,42 @@ Mechanics, from `accounting.go`:
 - An **ultra-light** node (`swap-enable: false`, `full-node: false`) has no
   pay function, so it can only wait for the next refresh.
 
-### Total free throughput for a phone (estimate)
+### Total free throughput
 
-A node spreads its reads over every connected peer, so total free throughput
-scales with the number of first-hop peers. The closest few peers are the
-bottleneck: half of all chunks fall into bin 0 and route through the node's
-few bin-0 peers. With about 8 peers there and fallback to further peers when
-one is overdrafted, a light node's total is **about 100–200 KiB/s free**,
-roughly 0.3–0.7 GiB per hour, or 8–15 GiB per day of nonstop reading. A full
-node would get about ten times that, but it is not an option for a wallet:
+A node spreads its reads over every connected peer, and every peer forgives
+its own share. So total free throughput scales with the number of peers the
+node holds.
+
+**Model.** At ~250k units per chunk, one peer gives a light node about 1.8
+chunks/s, roughly 7 KiB/s. More peers also make each chunk cheaper, because
+the closest connected peer is closer to the chunk.
+
+| Peers held | Free ceiling (light node) |
+|---|---|
+| 30 | ~0.2 MiB/s |
+| 100 | ~0.7 MiB/s |
+| 400 | ~2.8 MiB/s |
+
+**Measured.** [`ant`](https://github.com/freedom-hq/ant), a Rust light node
+that announces `full_node: false`, ran on mainnet:
+
+- **Download:** a 55 MiB file three times in 92–108 s, holding 99–138 peers,
+  with its debt cleared by pseudosettle alone. That is **0.5–0.6 MiB/s**,
+  about 140 chunks/s: 1.8–2.1 GiB per hour, or 40–50 GiB per day of
+  nonstop reading. Source: `ant` PLAN.md, Appendix F.6.
+- **Upload with SWAP off:** 300 MiB in 225–270 s with 99 peers, about
+  1.1–1.3 MiB/s (`ant` PR #138). That is more than the model allows. The
+  model does not explain it.
+
+**What the first version got wrong.** It estimated 100–200 KiB/s, assuming
+about 8 bin-0 peers carry half of all chunks. A client holding ~100 peers has
+far more than that.
+
+**On a phone.** It may keep fewer peers to save battery and connections, so
+it would land between the two figures.
+
+**A full node** gets ten times the allowance per peer, but it is not an option
+for a wallet:
 
 - it has to accept inbound connections and hold a reserve (its share of the
   network's storage);
@@ -162,8 +195,9 @@ fits easily inside the free rate, and paying for all of it would cost about
 - **Cost per read.** Store one trie node per chunk, and an account proof of
   8–10 nodes is 8–10 retrievals, about 2.7 · 10⁻⁵ BZZ, which is negligible. An
   `eth_call` touching about 500 nodes costs about 0.0014 BZZ.
-- **Throughput.** On the free tier, 500 chunks at about 25 chunks/s
-  (100 KiB/s) takes around 20 seconds. Paying removes that throttle.
+- **Throughput.** On the free tier, 500 chunks take about 4 s at the
+  ~140 chunks/s measured with ~100 peers, and 10–20 s with a few dozen
+  peers. Paying removes that throttle.
 - **Latency dominates.** Each trie level depends on the one above it, so a
   proof is a chain of sequential Swarm lookups, each crossing several peers.
   Payment does not shorten that chain. The publisher's data layout has to:
@@ -193,8 +227,9 @@ fits easily inside the free rate, and paying for all of it would cost about
 
 ## Open questions
 
-- Measure the real free throughput of a light and an ultra-light node,
-  instead of deriving it from the constants above.
+- Measure the free throughput of a phone, which may hold far fewer than
+  `ant`'s ~100 peers, and of Bee's own light and ultra-light modes. `ant`'s
+  figures come from a server.
 - Measure per-chunk retrieval latency from a phone, which bounds sequential
   trie walks whether or not the node pays.
 - Who publishes state and sync-committee data to Swarm, in which layout, and
@@ -221,3 +256,6 @@ fits easily inside the free rate, and paying for all of it would cost about
 - BZZ price, approximate and inconsistent across sites (about $0.04–0.05 in
   late 2026): https://www.coingecko.com/en/coins/swarm/usd,
   https://cryptorank.io/price/swarm/usd
+- Measured free throughput of a Rust light node: `ant` PLAN.md, Appendix F
+  (https://github.com/freedom-hq/ant/blob/main/PLAN.md), and the
+  measurements in https://github.com/freedom-hq/ant/pull/138
