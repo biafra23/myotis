@@ -10,7 +10,8 @@ import java.math.BigInteger
  * real block's `timestamp` and `excessBlobGas` and the `baseFeePerBlobGas` the
  * node's own `eth_feeHistory` answered for that block (mainnet via
  * rpc.flashbots.net, Sepolia via sepolia.gateway.tenderly.co, Gnosis via
- * gnosis.drpc.org, fetched 2026-11-03), one or more per blob fee era.
+ * gnosis.drpc.org, fetched 2026-11-03; Chiado via gnosis-chiado-rpc.publicnode.com,
+ * 2026-11-04), one or more per blob fee era.
  */
 class BlobFeesTest {
 
@@ -36,6 +37,11 @@ class BlobFeesTest {
         Vector(11_155_111, 12_050_000, 1_793_644_908, 198_006_004, 22_880_417),
         // Gnosis: the 1 gwei floor.
         Vector(100, 49_080_000, 1_793_666_620, 0, 1_000_000_000),
+        // Chiado: its Cancun era with blob gas in excess (the 1_112_826 fraction
+        // over the 1 gwei floor), and the floor itself.
+        Vector(10_200, 8_098_977, 1_707_210_330, 131_072, 1_124_999_975),
+        Vector(10_200, 8_098_988, 1_707_210_385, 262_144, 1_265_624_944),
+        Vector(10_200, 23_837_766, 1_793_781_760, 0, 1_000_000_000),
     )
 
     @Test fun matchesFullNodes_inEveryEra() {

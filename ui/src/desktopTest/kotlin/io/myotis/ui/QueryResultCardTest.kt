@@ -137,6 +137,7 @@ class QueryResultCardTest {
         assertEquals("ETH", nativeCurrencySymbol("mainnet"))
         assertEquals("ETH", nativeCurrencySymbol("sepolia"))
         assertEquals("xDAI", nativeCurrencySymbol("gnosis"))
+        assertEquals("xDAI", nativeCurrencySymbol("chiado"))
         // A network the table does not know names no unit rather than a wrong one.
         assertNull(nativeCurrencySymbol("hoodi"))
         assertEquals("Balance", balanceCaption(null))

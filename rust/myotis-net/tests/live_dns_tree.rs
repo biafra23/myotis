@@ -27,11 +27,12 @@ async fn the_tree_walk_yields_dial_candidates() {
     let cfg = match net.as_str() {
         "sepolia" => ElConfig::sepolia(),
         "gnosis" => ElConfig::gnosis(),
+        "chiado" => ElConfig::chiado(),
         _ => ElConfig::mainnet(),
     };
     assert!(
         !cfg.enr_tree_urls.is_empty(),
-        "{net} publishes no EL node list — nothing to walk (Gnosis dials its pinned enodes instead)"
+        "{net} publishes no EL node list — nothing to walk (Gnosis dials its pinned enodes instead; Chiado has only its discv4 bootnodes)"
     );
     let resolver = SystemResolver::new().expect("this host has a resolver configuration");
     let filter = fork_filter_for(&cfg);

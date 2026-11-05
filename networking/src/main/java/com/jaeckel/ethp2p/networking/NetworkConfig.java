@@ -49,7 +49,7 @@ public record NetworkConfig(
                                         // fallback next to the current one, so a configured "current" fork
                                         // that hasn't yet activated on the network doesn't filter every
                                         // peer out. A policy knob — the version itself comes from the
-                                        // schedule. Off for mainnet/sepolia, on for gnosis.
+                                        // schedule. Off for mainnet/sepolia/chiado, on for gnosis.
         List<String> clPeerMultiaddrs,  // libp2p multiaddrs of known CL peers
         String beaconApiUrl,            // HTTP API URL for local beacon node (e.g. http://172.17.0.1:5052)
         long clGenesisTime,             // beacon chain genesis time (seconds since epoch) for wall-clock period estimation
@@ -617,6 +617,78 @@ public record NetworkConfig(
             )
     );
 
+    // Chiado — Gnosis Chain's testnet. EL chainId 10200; its own beacon chain on
+    // the GNOSIS preset (5 s slots, 16-slot epochs, 512-epoch periods), so every
+    // geometry helper below keys on isGnosisPreset(), not on chainId 100. Fork
+    // schedule, genesis_validators_root and genesis time are the live Chiado
+    // beacon API's (/eth/v1/config/fork_schedule, /eth/v1/beacon/genesis,
+    // 2026-11-04) and match gnosischain/configs chiado/config.yaml. Like Gnosis,
+    // Chiado has an empty BLOB_SCHEDULE, so its Fulu digest folds the
+    // Electra-baseline blob params — same rule as GNOSIS above.
+    //
+    // No roost instance and no census-confirmed light-client servers yet, so
+    // clPeerMultiaddrs is EMPTY: a cold start finds its light-client peers over
+    // discv5 from the Chiado bootnodes alone. Pin census-confirmed servers here
+    // (and in the Rust twin CHIADO_STATIC_PEERS) once a period census has run.
+    public static final NetworkConfig CHIADO = new NetworkConfig(
+            "chiado",
+            10200L,
+            Bytes32.fromHexString("ada44fd8d2ecab8b08f256af07ad3e777f17fb434f8f8e678b312f576212ba9a"),
+            Bytes32.fromHexString("ada44fd8d2ecab8b08f256af07ad3e777f17fb434f8f8e678b312f576212ba9a"), // genesis
+            // EL fork-id hash (EIP-2124) for the Osaka head, forkNext=0: CRC32 of the
+            // genesis hash folded with the Shanghai/Cancun/Prague/Osaka timestamps
+            // (1684934220, 1706724940, 1741254220, 1773653580 — Nethermind
+            // chiado.json). Matches Erigon's p2p/forkid tests for Chiado (0x71c457cd).
+            new byte[]{(byte) 0x71, (byte) 0xc4, (byte) 0x57, (byte) 0xcd},
+            0L,
+            // EL discv4 bootnodes: the four Chiado boot nodes of gnosischain/configs
+            // chiado/genesis.json (UDP-only discovery nodes — TCP port 0 — so they
+            // seed discv4 but are never dialed over RLPx).
+            List.of(
+                    new InetSocketAddress("51.75.246.2", 30303),
+                    new InetSocketAddress("57.129.70.222", 30303),
+                    new InetSocketAddress("57.128.252.123", 30303),
+                    new InetSocketAddress("54.39.148.98", 30303)
+            ),
+            // genesis_validators_root (Chiado beacon chain)
+            Bytes.fromHexString("9d642dac73058fbf39c0ae41ab1e34e4d889043cb199851ded7095bc99eb4c1e").toArrayUnsafe(),
+            // @checkpoint:chiado:begin — managed by `./gradlew refreshCheckpoint`
+            // trusted checkpoint: recent finalized chiado block root (slot 25676976, 2026-11-04, period 3134)
+            Bytes.fromHexString("47112fb5b2304eb748bcb893e4c3ad93cdca690737d874b4aa08656306e8c4f1").toArrayUnsafe(),
+            25676976L, // checkpoint slot (epoch = slot/16). Must stay in sync with the root above.
+            // @checkpoint:chiado:end
+            // Fork schedule — gnosischain/configs chiado/config.yaml *_FORK_EPOCH /
+            // *_FORK_VERSION, on 16-slot epochs (the live beacon API serves the same
+            // seven entries). Fulu (0x0600006f) active since epoch 1353216
+            // (2026-03-16); Electra's epoch is also the blob-params epoch below.
+            ForkSchedule.of(16,
+                    ForkSchedule.fork(0, 0x0000006f),       // phase0 (genesis)
+                    ForkSchedule.fork(90, 0x0100006f),      // altair
+                    ForkSchedule.fork(180, 0x0200006f),     // bellatrix
+                    ForkSchedule.fork(244224, 0x0300006f),  // capella
+                    ForkSchedule.fork(516608, 0x0400006f),  // deneb
+                    ForkSchedule.fork(948224, 0x0500006f),  // electra
+                    ForkSchedule.fork(1353216, 0x0600006f)  // fulu
+            ),
+            // EIP-7892: Chiado's BLOB_SCHEDULE is empty (live /eth/v1/config/spec), so
+            // clients fold the Electra-baseline blob params (ELECTRA_FORK_EPOCH=948224,
+            // MAX_BLOBS_PER_BLOCK_ELECTRA=2) into the Fulu digest: 0x25f9148e.
+            948224L, 2L,
+            false, // no prior-fork digest fallback: Fulu has been active since 2026-03
+            List.of(), // CL peer multiaddrs — none pinned yet (see the note above)
+            null,
+            1665396300L, // Chiado beacon genesis: 2022-10-10 10:05:00 UTC
+            List.of(), // EL ENR trees — Chiado publishes none
+            List.of(), // CL ENR trees — not pinned
+            // CL discv5 bootnodes from gnosischain/configs chiado/bootstrap_nodes.txt
+            List.of(
+                    "enr:-IS4QC9xcSNOKeUBrjOX1-qwcPDGOvRK-Aql_YnRfuYsuXElQawANMLTOz1YfrZTMI07B7DAl9hmk3ic5G7ZHQbq4HsUgmlkgnY0gmlwhDNL9gKJc2VjcDI1NmsxoQOzB8HdKe07eQBOxu5nexAWECV47zxlau23oEYqoToy9YN1ZHCCIyg",
+                    "enr:-IS4QMpCWNqXmqbtXg7vQyYBwV2xTDpgTNpgAz060TY5cpJ3JdjuwAkLG01Vf9Vlfb0jtRhJEpj0CfteG-3K_V36bmECgmlkgnY0gmlwhDmBRt6Jc2VjcDI1NmsxoQNkoifSsk1ijP3-OR9pcL2VWCSfD5_syapyrXA83GcAvYN1ZHCCIyg",
+                    "enr:-IS4QBa3hl_BcjrY4z_OvhRBx7qUMBFGkjkoedGNMXgC_fzLRBsg161SipeHWAkUnSuvBg_7529-Qfxcc7CAbokn4fMCgmlkgnY0gmlwhDmA_HuJc2VjcDI1NmsxoQL8xX-V_pyU_l3AIfVokHKMN1OMUG02vcy4AMOxdyi5jIN1ZHCCIyg",
+                    "enr:-IS4QEuUku9zL0V3hFHt41fqmEdvphEvrOg0D4K_TgiiaePCDH2IPzt6B3O6NLHtgJNXk3UW68DL6KVBD4rjoW-nW9ACgmlkgnY0gmlwhDYnlGKJc2VjcDI1NmsxoQP3W66lisn2YOJF4B0QDEnURZ6tqzpi5gBy9rbMfpC70YN1ZHCCIyg"
+            )
+    );
+
     // Frontier (genesis) fork IDs — CRC32(genesis_hash), forkNext = first fork block
     // Used when announcing block height 0 so forkId is consistent with head
     public static final byte[] MAINNET_GENESIS_FORK_HASH =
@@ -819,6 +891,7 @@ public record NetworkConfig(
             case 1 -> 20_000_000L;        // mainnet (current ~25M, 2026-05)
             case 11155111 -> 5_000_000L;  // sepolia
             case 100 -> 40_000_000L;      // gnosis (current ~43M, 2026-06)
+            case 10200 -> 20_000_000L;    // chiado (current ~23.8M, 2026-11)
             default -> 0L;
         };
     }
@@ -835,7 +908,7 @@ public record NetworkConfig(
     public java.math.BigInteger minSuggestedTipWei() {
         return switch ((int) networkId) {
             case 1, 11155111 -> java.math.BigInteger.valueOf(100_000_000L); // 0.1 gwei
-            case 100 -> java.math.BigInteger.valueOf(1_000_000L);           // gnosis: 0.001 gwei
+            case 100, 10200 -> java.math.BigInteger.valueOf(1_000_000L);    // gnosis, chiado: 0.001 gwei
             default -> java.math.BigInteger.valueOf(1_000_000L);            // cheap-chain-safe default
         };
     }
@@ -901,10 +974,11 @@ public record NetworkConfig(
             case "mainnet" -> MAINNET;
             case "sepolia" -> SEPOLIA;
             case "gnosis", "gbc", "xdai" -> GNOSIS;
+            case "chiado" -> CHIADO;
             // holesky retired: the EF shut it down in Oct 2025 (no peers, no
             // checkpoint servers). Use gnosis, or sepolia for an Ethereum testnet.
             default -> throw new IllegalArgumentException(
-                    "Unknown network: " + name + ". Supported: mainnet, sepolia, gnosis");
+                    "Unknown network: " + name + ". Supported: mainnet, sepolia, gnosis, chiado");
         };
     }
 
@@ -914,20 +988,34 @@ public record NetworkConfig(
      * (the static instance + a {@link #byName} case + this list).
      */
     public static List<NetworkConfig> allNetworks() {
-        return List.of(MAINNET, GNOSIS, SEPOLIA);
+        return List.of(MAINNET, GNOSIS, SEPOLIA, CHIADO);
+    }
+
+    /**
+     * Whether this chain's beacon chain runs the GNOSIS preset (5 s slots, 16-slot
+     * epochs, 512-epoch sync-committee periods): Gnosis Chain and its testnet
+     * Chiado. Every geometry helper keys on this, never on chainId 100 alone, so
+     * Chiado cannot silently fall back to the mainnet preset.
+     */
+    public boolean isGnosisPreset() {
+        return isGnosisPreset(networkId);
+    }
+
+    private static boolean isGnosisPreset(long networkId) {
+        return networkId == 100 || networkId == 10200;
     }
 
     /**
      * Beacon-chain slot time in seconds. Mainnet and the mainnet-preset testnets
-     * use 12; Gnosis Beacon Chain uses 5. Used for wall-clock sync-committee period
-     * estimation in the light client.
+     * use 12; the Gnosis preset (Gnosis Beacon Chain, Chiado) uses 5. Used for
+     * wall-clock sync-committee period estimation in the light client.
      */
     public int secondsPerSlot() {
-        return networkId == 100 ? 5 : 12;
+        return isGnosisPreset() ? 5 : 12;
     }
 
     /**
-     * Beacon-chain slots per epoch. Mainnet preset uses 32; Gnosis uses 16. Used for
+     * Beacon-chain slots per epoch. Mainnet preset uses 32; Gnosis and Chiado use 16. Used for
      * the Status {@code finalized_epoch} and epoch display. (Slots per sync-committee
      * period is 8192 on both presets, so that helper is shared.)
      */
@@ -936,7 +1024,7 @@ public record NetworkConfig(
     }
 
     private static int slotsPerEpochFor(long networkId) {
-        return networkId == 100 ? 16 : 32;
+        return isGnosisPreset(networkId) ? 16 : 32;
     }
 
     /**
@@ -972,10 +1060,24 @@ public record NetworkConfig(
      *       shrank below ~65k. Tightening to 1 period (~11.4 h) remains the
      *       strict option. Owner's call either way; raise or lower via the
      *       Settings override knowingly.</li>
+     *   <li><b>chiado: 1</b> (~11.4 h). Gnosis's preset and churn parameters
+     *       (chiado/config.yaml) over a far SMALLER set: 2568 active validators,
+     *       340477e9 Gwei-units of active balance (finalized state, 2026-11-04).
+     *       The Electra spec formula, MIN_VALIDATOR_WITHDRAWABILITY_DELAY (256)
+     *       + SAFETY_DECAY·T / (2·100·max(MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA, T/4096)),
+     *       gives 256 + 132 = 388 epochs; with the 64e9 exit cap Gnosis's entry
+     *       uses instead, 256 + 265 = 521 epochs — under or barely over ONE
+     *       512-epoch period either way. 1 is therefore the smallest bound the
+     *       period-granular gate can express, and Gnosis's 3 would accept an
+     *       anchor two periods past the window. The cost: a shipped Chiado
+     *       anchor goes stale within a day, so a fresh install usually meets the
+     *       STALE_ANCHOR consent (or a {@code refreshCheckpoint -Pnetwork=chiado}
+     *       first) — the fail-closed side of the trade, on a testnet.</li>
      * </ul>
      */
     public long wsBoundPeriods() {
-        return networkId == 100 ? 3L : 13L;
+        if (networkId == 10200) return 1L;
+        return isGnosisPreset() ? 3L : 13L;
     }
 
     // -------------------------------------------------------------------------
@@ -991,6 +1093,7 @@ public record NetworkConfig(
         return switch ((int) networkId) {
             case 100 -> 30304;       // gnosis
             case 11155111 -> 30305;  // sepolia
+            case 10200 -> 30306;     // chiado
             default -> 30303;        // mainnet (and unknown)
         };
     }
@@ -1000,6 +1103,7 @@ public record NetworkConfig(
         return switch ((int) networkId) {
             case 100 -> 9001;       // gnosis
             case 11155111 -> 9002;  // sepolia
+            case 10200 -> 9003;     // chiado
             default -> 9000;        // mainnet (and unknown)
         };
     }
@@ -1009,6 +1113,7 @@ public record NetworkConfig(
         return switch ((int) networkId) {
             case 100 -> 8546;       // gnosis
             case 11155111 -> 8547;  // sepolia
+            case 10200 -> 8548;     // chiado
             default -> 8545;        // mainnet (and unknown)
         };
     }
@@ -1024,7 +1129,8 @@ public record NetworkConfig(
      * which the EF retired in Oct 2025 — dead code, since {@link #byName} rejects that
      * network). UIs gate the name query path on it; plain address balance/account queries
      * work on every chain regardless. Which names a chain serves is the resolver's call:
-     * on Gnosis only {@code .gno}.
+     * on Gnosis only {@code .gno}. Chiado has none: no resolver is pinned for chainId
+     * 10200 (Genome's Chiado deployment is a test fixture only), so it answers false.
      */
     public boolean hasEns() {
         return networkId == 1 || networkId == 11155111 || networkId == 100;
@@ -1035,6 +1141,7 @@ public record NetworkConfig(
         return switch ((int) networkId) {
             case 100 -> "Gnosis Chain";
             case 11155111 -> "Sepolia";
+            case 10200 -> "Chiado";
             default -> "Ethereum Mainnet";
         };
     }

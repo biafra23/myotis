@@ -21,7 +21,7 @@ async fn main() {
     let (net, target) = match (args.next(), args.next()) {
         (Some(n), Some(t)) => (n, t),
         _ => {
-            eprintln!("usage: enr_lookup <mainnet|sepolia|gnosis> <target-enr>");
+            eprintln!("usage: enr_lookup <mainnet|sepolia|gnosis|chiado> <target-enr>");
             std::process::exit(2);
         }
     };
@@ -33,6 +33,7 @@ async fn main() {
         "mainnet" => ChainConfig::mainnet(),
         "sepolia" => ChainConfig::sepolia(),
         "gnosis" => ChainConfig::gnosis(),
+        "chiado" => ChainConfig::chiado(),
         other => {
             eprintln!("unknown network {other}");
             std::process::exit(2);

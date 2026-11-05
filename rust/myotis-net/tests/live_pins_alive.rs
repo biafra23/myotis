@@ -119,7 +119,8 @@ fn config_for_env() -> ChainConfig {
         "mainnet" => ChainConfig::mainnet(),
         "sepolia" => ChainConfig::sepolia(),
         "gnosis" => ChainConfig::gnosis(),
-        other => panic!("unknown NET {other:?} (want mainnet, sepolia or gnosis)"),
+        "chiado" => ChainConfig::chiado(),
+        other => panic!("unknown NET {other:?} (want mainnet, sepolia, gnosis or chiado)"),
     }
 }
 

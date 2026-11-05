@@ -28,6 +28,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Start daemon on another network
 ./gradlew :app:run -Pnetwork=gnosis     # Gnosis Chain (chainId 100, its own beacon chain)
 ./gradlew :app:run -Pnetwork=sepolia    # Ethereum testnet
+./gradlew :app:run -Pnetwork=chiado     # Gnosis testnet (chainId 10200, Gnosis beacon preset)
 # (holesky was retired — the EF shut it down in Oct 2025: no peers, no checkpoint servers)
 
 # Run a second network alongside mainnet (separate daemon, separate port + socket)

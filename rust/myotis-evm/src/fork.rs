@@ -1,4 +1,4 @@
-//! The per-chain fork tables — mainnet, Sepolia and Gnosis, selected by chain id
+//! The per-chain fork tables — mainnet, Sepolia, Gnosis and Chiado, selected by chain id
 //! in [`spec_for`]: `(block_number, timestamp) → revm SpecId`.
 //!
 //! Each cascade mirrors the Java `EvmFactory` one verbatim. Pre-merge forks activate by
@@ -70,6 +70,7 @@ pub fn spec_for(chain_id: u64, block_number: u64, timestamp: u64) -> Result<Spec
         1 => mainnet_spec(block_number, timestamp),
         11_155_111 => sepolia_spec(block_number, timestamp),
         100 => gnosis_spec(block_number, timestamp),
+        10_200 => chiado_spec(block_number, timestamp),
         other => Err(EvmError::UnsupportedChain { chain_id: other }),
     }
 }
@@ -143,6 +144,36 @@ fn gnosis_spec(block_number: u64, timestamp: u64) -> Result<SpecId, EvmError> {
     } else if timestamp >= GNOSIS_CANCUN_TIME {
         Ok(SpecId::CANCUN)
     } else if timestamp >= GNOSIS_SHANGHAI_TIME {
+        Ok(SpecId::SHANGHAI)
+    } else {
+        Err(EvmError::ForkTooOld {
+            block_number,
+            timestamp,
+        })
+    }
+}
+
+/// Chiado (Gnosis's testnet, chain id 10200) Shanghai activation timestamp
+/// (nethermind chiado.json eip3855TransitionTimestamp 0x646e0e4c = 2023-05-24).
+/// Chiado merged before Shanghai, so anything a beacon-anchored engine can serve
+/// is at/after it.
+pub const CHIADO_SHANGHAI_TIME: u64 = 1_684_934_220;
+/// Chiado Cancun activation timestamp (0x65ba8e4c = 2024-01-31).
+pub const CHIADO_CANCUN_TIME: u64 = 1_706_724_940;
+/// Chiado Prague activation timestamp (0x67c96e4c = 2025-03-06).
+pub const CHIADO_PRAGUE_TIME: u64 = 1_741_254_220;
+/// Chiado Osaka activation timestamp (0x69b7ce4c = 2026-03-16).
+pub const CHIADO_OSAKA_TIME: u64 = 1_773_653_580;
+
+/// The chiado cascade — all timestamp-gated (chiado merged before Shanghai).
+fn chiado_spec(block_number: u64, timestamp: u64) -> Result<SpecId, EvmError> {
+    if timestamp >= CHIADO_OSAKA_TIME {
+        Ok(SpecId::OSAKA)
+    } else if timestamp >= CHIADO_PRAGUE_TIME {
+        Ok(SpecId::PRAGUE)
+    } else if timestamp >= CHIADO_CANCUN_TIME {
+        Ok(SpecId::CANCUN)
+    } else if timestamp >= CHIADO_SHANGHAI_TIME {
         Ok(SpecId::SHANGHAI)
     } else {
         Err(EvmError::ForkTooOld {
@@ -327,6 +358,37 @@ mod tests {
         assert_eq!(spec_for(g, 30_000_000, GNOSIS_SHANGHAI_TIME).unwrap(), SpecId::SHANGHAI);
         assert!(matches!(
             spec_for(g, 30_000_000, GNOSIS_SHANGHAI_TIME - 1),
+            Err(EvmError::ForkTooOld { .. })
+        ));
+    }
+
+    #[test]
+    fn chiado_fork_times_pin_the_nethermind_hex() {
+        // Cross-base pins against nethermind chiado.json's hex timestamps — the
+        // same instants Erigon's Chiado fork-id tests step through.
+        assert_eq!(CHIADO_SHANGHAI_TIME, 0x646e_0e4c); // 1_684_934_220
+        assert_eq!(CHIADO_CANCUN_TIME, 0x65ba_8e4c); // 1_706_724_940
+        assert_eq!(CHIADO_PRAGUE_TIME, 0x67c9_6e4c); // 1_741_254_220
+        assert_eq!(CHIADO_OSAKA_TIME, 0x69b7_ce4c); // 1_773_653_580
+    }
+
+    #[test]
+    fn chiado_boundaries_map_to_their_specs() {
+        // Twin of the Java ChainAwareForkTest.chiadoUsesItsOwnSchedule.
+        let c = 10_200u64;
+        assert_eq!(spec_for(c, 20_000_000, CHIADO_OSAKA_TIME).unwrap(), SpecId::OSAKA);
+        assert_eq!(spec_for(c, 20_000_000, CHIADO_OSAKA_TIME - 1).unwrap(), SpecId::PRAGUE);
+        assert_eq!(spec_for(c, 20_000_000, CHIADO_PRAGUE_TIME).unwrap(), SpecId::PRAGUE);
+        assert_eq!(spec_for(c, 20_000_000, CHIADO_PRAGUE_TIME - 1).unwrap(), SpecId::CANCUN);
+        assert_eq!(spec_for(c, 20_000_000, CHIADO_CANCUN_TIME).unwrap(), SpecId::CANCUN);
+        assert_eq!(spec_for(c, 20_000_000, CHIADO_CANCUN_TIME - 1).unwrap(), SpecId::SHANGHAI);
+        assert_eq!(spec_for(c, 20_000_000, CHIADO_SHANGHAI_TIME).unwrap(), SpecId::SHANGHAI);
+        // Not Gnosis's table: Chiado ran Osaka a month before Gnosis did.
+        assert_eq!(spec_for(c, 20_000_000, GNOSIS_OSAKA_TIME - 1).unwrap(), SpecId::OSAKA);
+        // No Amsterdam date on Chiado: Sepolia's must not flip it.
+        assert_eq!(spec_for(c, 20_000_000, u64::MAX).unwrap(), SpecId::OSAKA);
+        assert!(matches!(
+            spec_for(c, 20_000_000, CHIADO_SHANGHAI_TIME - 1),
             Err(EvmError::ForkTooOld { .. })
         ));
     }

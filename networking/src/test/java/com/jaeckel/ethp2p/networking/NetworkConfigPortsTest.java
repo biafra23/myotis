@@ -45,6 +45,7 @@ class NetworkConfigPortsTest {
         assertTrue(nets.contains(NetworkConfig.MAINNET));
         assertTrue(nets.contains(NetworkConfig.GNOSIS));
         assertTrue(nets.contains(NetworkConfig.SEPOLIA));
+        assertTrue(nets.contains(NetworkConfig.CHIADO));
     }
 
     private static void assertNoDuplicates(List<Integer> ports, String label) {

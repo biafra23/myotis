@@ -35,7 +35,7 @@ use rpc::Router;
 )]
 struct Args {
     /// Network to follow.
-    #[arg(long, default_value = "gnosis", value_parser = ["gnosis", "mainnet", "sepolia"])]
+    #[arg(long, default_value = "gnosis", value_parser = ["gnosis", "mainnet", "sepolia", "chiado"])]
     network: String,
     /// Engine state directory (sync anchor, peers, log index).
     /// Default: ~/.local/share/myotis-rpcd/<network>.
@@ -43,7 +43,7 @@ struct Args {
     data_dir: Option<PathBuf>,
     /// Address to serve JSON-RPC on. Default: loopback, on the port the apps
     /// and the daemon use for the network (mainnet 8545, gnosis 8546, sepolia
-    /// 8547). The node signs nothing, but it is not built to face the internet.
+    /// 8547, chiado 8548). The node signs nothing, but it is not built to face the internet.
     #[arg(long, value_name = "ADDR")]
     listen: Option<SocketAddr>,
     /// Comma-separated host names a request's Host header may carry (geth's
@@ -156,7 +156,10 @@ fn run(args: Args) -> Result<(), String> {
     let network = ffi::canonical_network_name(args.network.clone())
         .ok_or_else(|| format!("unknown network '{}'", args.network))?;
     let chain_id = chain_id_of(&network)?;
-    let listen = args.listen.unwrap_or_else(|| default_listen(&network));
+    let listen = match args.listen {
+        Some(addr) => addr,
+        None => default_listen(&network)?,
+    };
     let data_dir = match args.data_dir {
         Some(d) => d,
         None => {
@@ -357,25 +360,28 @@ impl Drop for StopOnDrop {
 }
 
 /// Loopback on the per-network JSON-RPC port the Android/desktop apps and the
-/// daemon default to: one endpoint per network whichever host serves it (and
-/// so, with defaults, not both of them on one machine).
-fn default_listen(network: &str) -> SocketAddr {
-    let port = match network {
-        "mainnet" => 8545,
-        "sepolia" => 8547,
-        _ => 8546, // gnosis, the only other network --network accepts
-    };
-    SocketAddr::from(([127, 0, 0, 1], port))
+/// daemon default to — the catalog's `defaultRpcPort`, the one table every
+/// host reads: one endpoint per network whichever host serves it (and so, with
+/// defaults, not both of them on one machine).
+fn default_listen(network: &str) -> Result<SocketAddr, String> {
+    let port = catalog_field(network, "defaultRpcPort")?;
+    let port = u16::try_from(port).map_err(|_| format!("catalog port {port} for '{network}' is not a port"))?;
+    Ok(SocketAddr::from(([127, 0, 0, 1], port)))
 }
 
 /// The catalog's chain id for a canonical network name.
 fn chain_id_of(network: &str) -> Result<u64, String> {
+    catalog_field(network, "chainId")
+}
+
+/// One numeric field of `network`'s entry in the engine catalog.
+fn catalog_field(network: &str, field: &str) -> Result<u64, String> {
     let v: serde_json::Value = serde_json::from_str(&ffi::available_networks_json())
         .map_err(|e| format!("engine network catalog: {e}"))?;
     v.as_array()
         .and_then(|a| a.iter().find(|n| n["name"] == network))
-        .and_then(|n| n["chainId"].as_u64())
-        .ok_or_else(|| format!("no chain id for '{network}' in the engine catalog"))
+        .and_then(|n| n[field].as_u64())
+        .ok_or_else(|| format!("no {field} for '{network}' in the engine catalog"))
 }
 
 /// Pump the engine's tracing ring to stderr, stamped (the ring lines carry no

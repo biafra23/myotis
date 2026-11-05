@@ -96,7 +96,8 @@ fn configs_for_env() -> (ChainConfig, ElConfig) {
         "mainnet" => (ChainConfig::mainnet(), ElConfig::mainnet()),
         "sepolia" => (ChainConfig::sepolia(), ElConfig::sepolia()),
         "gnosis" => (ChainConfig::gnosis(), ElConfig::gnosis()),
-        other => panic!("unknown NET {other:?} (want mainnet, sepolia or gnosis)"),
+        "chiado" => (ChainConfig::chiado(), ElConfig::chiado()),
+        other => panic!("unknown NET {other:?} (want mainnet, sepolia, gnosis or chiado)"),
     }
 }
 

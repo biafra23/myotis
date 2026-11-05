@@ -32,6 +32,7 @@ async fn the_filter_judges_live_nodes() {
     let cfg = match net.as_str() {
         "mainnet" => ElConfig::mainnet(),
         "gnosis" => ElConfig::gnosis(),
+        "chiado" => ElConfig::chiado(),
         _ => ElConfig::sepolia(),
     };
     let filter_on = std::env::var("FILTER").map_or(true, |v| v != "off");

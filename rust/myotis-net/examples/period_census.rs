@@ -317,7 +317,8 @@ async fn main() {
         "" | "sepolia" => ChainConfig::sepolia(),
         "mainnet" => ChainConfig::mainnet(),
         "gnosis" => ChainConfig::gnosis(),
-        other => panic!("unknown NET {other:?} (want mainnet, sepolia or gnosis)"),
+        "chiado" => ChainConfig::chiado(),
+        other => panic!("unknown NET {other:?} (want mainnet, sepolia, gnosis or chiado)"),
     };
     let crawl_secs: u64 = env_number("CRAWL_SECS", 420);
     let concurrency: usize = env_number("PROBES", 24);

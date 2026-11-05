@@ -32,6 +32,11 @@ pub const MAINNET_FORK_ID_HASH: [u8; 4] = [0x07, 0xc9, 0x46, 0x2e];
 /// Gnosis fork-id hash (Fulu/Osaka head), forkNext = 0.
 pub const GNOSIS_FORK_ID_HASH: [u8; 4] = [0xcf, 0xca, 0x38, 0x7c];
 
+/// Chiado fork-id hash (Osaka head), forkNext = 0: CRC32 of the genesis hash
+/// folded with the Shanghai/Cancun/Prague/Osaka timestamps — the value Erigon's
+/// `p2p/forkid` tests expect for Chiado's first Osaka block.
+pub const CHIADO_FORK_ID_HASH: [u8; 4] = [0x71, 0xc4, 0x57, 0xcd];
+
 /// Sepolia fork-id hash (post-BPO2 / Fusaka head), forkNext = Amsterdam.
 pub const SEPOLIA_FORK_ID_HASH: [u8; 4] = [0x26, 0x89, 0x56, 0xb6];
 
@@ -46,6 +51,7 @@ pub fn fork_id_hash(network: &str) -> Option<[u8; 4]> {
         "mainnet" => Some(MAINNET_FORK_ID_HASH),
         "gnosis" => Some(GNOSIS_FORK_ID_HASH),
         "sepolia" => Some(SEPOLIA_FORK_ID_HASH),
+        "chiado" => Some(CHIADO_FORK_ID_HASH),
         _ => None,
     }
 }
@@ -54,7 +60,7 @@ pub fn fork_id_hash(network: &str) -> Option<[u8; 4]> {
 /// (0 = none) — twin of Java `NetworkConfig.forkNext`.
 pub fn fork_next(network: &str) -> Option<u64> {
     match network {
-        "mainnet" | "gnosis" => Some(0),
+        "mainnet" | "gnosis" | "chiado" => Some(0),
         "sepolia" => Some(SEPOLIA_FORK_NEXT),
         _ => None,
     }
@@ -189,6 +195,35 @@ mod tests {
             hash = successor(hash, a);
         }
         assert_eq!(hash, u32::from_be_bytes(MAINNET_FORK_ID_HASH));
+    }
+
+    /// Chiado's pin, derived offline rather than only re-pinned: the genesis CRC
+    /// folded with its four timestamp forks. Every intermediate is one of
+    /// Erigon's `p2p/forkid` Chiado vectors, so a wrong genesis byte or a slipped
+    /// timestamp fails at the step it breaks.
+    #[test]
+    fn chiado_chain_reproduces_the_pinned_fork_id() {
+        let genesis: [u8; 32] = [
+            0xad, 0xa4, 0x4f, 0xd8, 0xd2, 0xec, 0xab, 0x8b, 0x08, 0xf2, 0x56, 0xaf, 0x07, 0xad,
+            0x3e, 0x77, 0x7f, 0x17, 0xfb, 0x43, 0x4f, 0x8f, 0x8e, 0x67, 0x8b, 0x31, 0x2f, 0x57,
+            0x62, 0x12, 0xba, 0x9a,
+        ];
+        let mut hash = crc32_update(0, &genesis);
+        assert_eq!(hash, 0x50d3_9d7b, "Chiado genesis fork id");
+        // Shanghai, Cancun, Prague, Osaka (Nethermind chiado.json). Each sits on a
+        // CL fork boundary: beacon genesis 1665396300 + epoch * 16 slots * 5 s
+        // for Capella 244224, Deneb 516608, Electra 948224, Fulu 1353216.
+        for (epoch, time, want) in [
+            (244_224u64, 1_684_934_220u64, 0xa15a_4252u32),
+            (516_608, 1_706_724_940, 0x5fbc_16bc),
+            (948_224, 1_741_254_220, 0x8ba5_1786),
+            (1_353_216, 1_773_653_580, 0x71c4_57cd),
+        ] {
+            assert_eq!(time, 1_665_396_300 + epoch * 16 * 5, "fork at epoch {epoch}");
+            hash = successor(hash, time);
+            assert_eq!(hash, want, "fork id after {time}");
+        }
+        assert_eq!(hash, u32::from_be_bytes(CHIADO_FORK_ID_HASH));
     }
 
     #[test]

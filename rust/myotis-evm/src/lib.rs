@@ -17,7 +17,7 @@
 //!   overrides ([`overrides`]), and `eth_estimateGas` over the whole transaction
 //!   object ([`tx`]: geth's search for the lowest working gas limit, EIP-7702
 //!   authorization lists, access lists, fees, nonce, creation);
-//! * the per-chain [`fork`] table (mainnet, Sepolia, Gnosis) mapping
+//! * the per-chain [`fork`] table (mainnet, Sepolia, Gnosis, Chiado) mapping
 //!   `(block_number, timestamp)` to a revm `SpecId`;
 //! * ENS resolution and the CCIP-Read re-entry ([`ens`]).
 //!

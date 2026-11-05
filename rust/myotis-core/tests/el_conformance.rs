@@ -178,7 +178,8 @@ fn replay_reproduces_recorded_verdicts() {
     actual.insert("forkid.mainnet".into(), hex(&forkid::MAINNET_FORK_ID_HASH));
     actual.insert("forkid.gnosis".into(), hex(&forkid::GNOSIS_FORK_ID_HASH));
     actual.insert("forkid.sepolia".into(), hex(&forkid::SEPOLIA_FORK_ID_HASH));
-    for net in ["mainnet", "gnosis", "sepolia"] {
+    actual.insert("forkid.chiado".into(), hex(&forkid::CHIADO_FORK_ID_HASH));
+    for net in ["mainnet", "gnosis", "sepolia", "chiado"] {
         let pin = u32::from_be_bytes(forkid::fork_id_hash(net).expect("known network"));
         let next = forkid::fork_next(net).expect("known network");
         actual.insert(format!("forkid.forkNext.{net}"), next.to_string());

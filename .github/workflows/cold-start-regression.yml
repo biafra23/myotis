@@ -60,9 +60,12 @@ on:
   workflow_dispatch:
     inputs:
       network:
-        description: "Network to cold-start (gnosis is where #422 bit hardest)"
+        # chiado: only `census` is meaningful until Chiado has pinned CL servers
+        # and an oldest-servable anchor — pins-alive asserts pins exist and the
+        # full scope refuses to run without an anchor, so both fail by design.
+        description: "Network to cold-start (gnosis is where #422 bit hardest; chiado: census scope only, for now)"
         type: choice
-        options: [gnosis, mainnet, sepolia]
+        options: [gnosis, mainnet, sepolia, chiado]
         default: gnosis
       scope:
         description: "full = all three checks (release). pins-only = skip the deep walk. census = only the DHT period census (no checks)."

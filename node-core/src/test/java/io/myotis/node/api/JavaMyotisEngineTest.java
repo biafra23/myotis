@@ -49,7 +49,7 @@ class JavaMyotisEngineTest {
     void availableNetworksCarriesMetadata() {
         JavaMyotisEngine engine = new JavaMyotisEngine();
         List<NetworkInfo> nets = engine.availableNetworks();
-        assertEquals(3, nets.size());
+        assertEquals(4, nets.size());
         NetworkInfo mainnet = nets.stream().filter(n -> n.name().equals("mainnet")).findFirst().orElseThrow();
         assertEquals(1L, mainnet.chainId());
         assertTrue(mainnet.hasEns());

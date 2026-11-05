@@ -50,7 +50,7 @@ const SLOTS_PER_PERIOD: u64 = 8192;
 /// Unknown network name, or the tokio runtime never came up.
 const CREATE_FAILED: i64 = -1;
 /// A canonical catalog network this engine has no `ChainConfig` for (none today:
-/// mainnet, gnosis and sepolia are all hosted; kept for the contract).
+/// mainnet, gnosis, sepolia and chiado are all hosted; kept for the contract).
 const UNSUPPORTED_NETWORK: i64 = -2;
 /// The dataDir already holds sync state from a DIFFERENT trust anchor than the
 /// one this call names: a caller-supplied checkpoint that does not match the
@@ -208,12 +208,13 @@ fn engine() -> Option<&'static EngineState> {
 }
 
 /// Resolve a config for a canonical/alias network name: every catalog network
-/// (mainnet, sepolia, gnosis) is hosted, so `None` means the name is unknown.
+/// (mainnet, sepolia, gnosis, chiado) is hosted, so `None` means the name is unknown.
 fn config_for(network_name: &str) -> Option<ChainConfig> {
     match crate::catalog::canonical_network_name(network_name) {
         Some("mainnet") => Some(ChainConfig::mainnet()),
         Some("sepolia") => Some(ChainConfig::sepolia()),
         Some("gnosis") => Some(ChainConfig::gnosis()),
+        Some("chiado") => Some(ChainConfig::chiado()),
         _ => None,
     }
 }
@@ -283,7 +284,7 @@ pub fn set_dns_discovery(on: bool) -> bool {
 }
 
 /// `nativeCreate`: allocate a handle for a hosted network (mainnet, gnosis,
-/// sepolia). Returns the id (`>= 1`), `UNSUPPORTED_NETWORK` (-2) for a canonical
+/// sepolia, chiado). Returns the id (`>= 1`), `UNSUPPORTED_NETWORK` (-2) for a canonical
 /// network this engine doesn't host yet, `CREATE_FAILED` (-1) for an unknown
 /// name, an unavailable runtime, or an uncreatable dataDir, and
 /// `ANCHOR_MISMATCH` (-3) when the dataDir was bootstrapped from a
@@ -757,6 +758,7 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
         "mainnet" => Some(myotis_net::el::reader::ElConfig::mainnet()),
         "sepolia" => Some(myotis_net::el::reader::ElConfig::sepolia()),
         "gnosis" => Some(myotis_net::el::reader::ElConfig::gnosis()),
+        "chiado" => Some(myotis_net::el::reader::ElConfig::chiado()),
         other => {
             tracing::warn!(handle, network = other, "no EL config for this network; CL runs without EL");
             None
@@ -4388,7 +4390,7 @@ mod tests {
     #[test]
     fn cl_fork_watch_is_per_handle_reused_and_on_every_network() {
         let engine = engine().expect("engine");
-        for (i, config) in [ChainConfig::mainnet(), ChainConfig::sepolia(), ChainConfig::gnosis()]
+        for (i, config) in [ChainConfig::mainnet(), ChainConfig::sepolia(), ChainConfig::gnosis(), ChainConfig::chiado()]
             .iter()
             .enumerate()
         {
@@ -4407,7 +4409,7 @@ mod tests {
         // Issue #291: a gnosis handle self-reported "mainnet" because the key
         // was a constant. The napi/Node consumer reads this raw object, so the
         // label is the only network identity it has.
-        for network in ["mainnet", "gnosis", "sepolia"] {
+        for network in ["mainnet", "gnosis", "sepolia", "chiado"] {
             let json =
                 status_object(Lifecycle::NotStarted, network, None, 0, ElCounts::default());
             let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");

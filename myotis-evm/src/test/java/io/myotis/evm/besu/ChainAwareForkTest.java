@@ -63,6 +63,22 @@ class ChainAwareForkTest {
     }
 
     @Test
+    void chiadoUsesItsOwnSchedule() {
+        long c = 10_200L;
+        assertEquals(EvmSpecVersion.OSAKA, spec(c, 20_000_000, EvmFactory.CHIADO_OSAKA_TIME));
+        assertEquals(EvmSpecVersion.PRAGUE, spec(c, 20_000_000, EvmFactory.CHIADO_OSAKA_TIME - 1));
+        assertEquals(EvmSpecVersion.PRAGUE, spec(c, 20_000_000, EvmFactory.CHIADO_PRAGUE_TIME));
+        assertEquals(EvmSpecVersion.CANCUN, spec(c, 20_000_000, EvmFactory.CHIADO_PRAGUE_TIME - 1));
+        assertEquals(EvmSpecVersion.CANCUN, spec(c, 20_000_000, EvmFactory.CHIADO_CANCUN_TIME));
+        assertEquals(EvmSpecVersion.SHANGHAI, spec(c, 20_000_000, EvmFactory.CHIADO_CANCUN_TIME - 1));
+        assertEquals(EvmSpecVersion.SHANGHAI, spec(c, 20_000_000, EvmFactory.CHIADO_SHANGHAI_TIME));
+        // Not Gnosis's table: Chiado ran Osaka a month before Gnosis did.
+        assertEquals(EvmSpecVersion.OSAKA, spec(c, 20_000_000, EvmFactory.GNOSIS_OSAKA_TIME - 1));
+        assertThrows(IllegalArgumentException.class,
+                () -> spec(c, 20_000_000, EvmFactory.CHIADO_SHANGHAI_TIME - 1));
+    }
+
+    @Test
     void mainnetCascadeUnchanged() {
         assertEquals(EvmSpecVersion.OSAKA, spec(1, 21_000_000, EvmFactory.OSAKA_TIME));
         assertEquals(EvmSpecVersion.PRAGUE, spec(1, 21_000_000, EvmFactory.OSAKA_TIME - 1));
