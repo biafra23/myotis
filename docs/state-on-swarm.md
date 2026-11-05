@@ -72,10 +72,10 @@ cannot fake one.
   Myotis already follows carry those reads up to the head (§7.3).
 - **Volumes (measured):**
   - Mainnet rewrites about 7,400 trie nodes per block, 2.5 MiB.
-  - Gnosis rewrites about 580 nodes per block.
+  - Gnosis rewrites about 570 nodes per block.
   - Publishing once per epoch instead of every block merges repeated writes:
-    to about half on Gnosis (43–57% over three epochs) and to 57% on
-    mainnet (two epochs).
+    to 41–44% on Gnosis (three epochs) and to 57% on mainnet (two
+    epochs).
 - **Capacity is the binding constraint, not money.**
   - Swarm currently holds about 4.3 billion chunks (about 16 TiB) of unique
     data.
@@ -131,8 +131,9 @@ What SNAP does badly:
   - Myotis refuses state reads pinned more than 64 blocks below its head
     (`RpcBlockWindow.BLOCK_NUM_LAG_TOLERANCE`), because no peer could prove
     them.
-- **Few servers.** About 7,000 of 14,100 EL nodes advertise snap, nearly all
-  of them geth (devp2p issue #286, 2026-10-12). Until one answers at the
+- **Few servers.** Of 14,103 EL nodes counted, 7,014 of the 7,756 geth nodes
+  advertise snap (devp2p issue #286, 2026-10-12). Reth and Erigon releases
+  serve none, and Besu's server is off by default; Nethermind's is on. Until one answers at the
   anchored root, state reads wait (the `snapServingPeers > 0` gate in
   docs/disk-and-network-usage.md §4).
 - **Privacy.** A snap request names `keccak(address)` to the serving peer. That
@@ -200,8 +201,9 @@ Facts from Bee `master`. `B/` stands for
 - **Network capacity.**
   - Each storer keeps a reserve of 2²² chunks, about 16 GiB, and may double it
     once (`B/pkg/storer/storer.go`).
-  - Swarmscan lists 4,328 nodes, and those that report it are at storage
-    radius 10, i.e. 2¹⁰ neighbourhoods. Unique capacity is therefore about 2³² chunks:
+  - Swarmscan lists 4,328 nodes. Of the 995 that return a status, 868
+    report storage radius 10 (984 committed depth 10), i.e. 2¹⁰
+    neighbourhoods. Unique capacity is therefore about 2³² chunks:
     **4.3 billion chunks, about 16 TiB** (estimate, 2026-11-05).
   - Paid batches add up to about 8.0 billion chunk slots
     (`validChunkCount()`), most of them unused.
@@ -227,22 +229,24 @@ key at the block with `eth_getProof`. Every node on a path to a changed leaf
 has a new hash, so the union of those proofs is the set of nodes the block
 wrote, which is what a publisher must upload. `--window N` merges N blocks into
 one delta: what publishing every N-th root costs. Measured 2026-11-05 against
-eth.drpc.org and rpc.gnosischain.com, near the head.
+eth.drpc.org and rpc.gnosischain.com, near the head. The mainnet runs predate
+the script's filter for slots a block left at their starting value, so their
+storage side may run slightly high.
 
 | | Mainnet | Gnosis |
 |---|---|---|
-| Blocks sampled | 9 (26,346,923–26,347,044) | 9 (49,118,364–49,118,457) |
-| Transactions / block | 279 | 23 |
-| Accounts changed / block | 494 | 48 |
-| Slots changed / block | 913 | 82 |
-| **New trie nodes / block** | **7,397** (account 3,122, storage 4,275) | **584** (account 279, storage 305) |
-| New node bytes / block | 2,594 KiB | 185 KiB |
-| Mean node size | 359 B | 325 B |
+| Blocks sampled | 9 (26,346,923–26,347,044) | 9 (49,118,809–49,118,850) |
+| Transactions / block | 279 | 24 |
+| Accounts changed / block | 494 | 49 |
+| Slots changed / block | 913 | 76 |
+| **New trie nodes / block** | **7,397** (account 3,122, storage 4,275) | **567** (account 283, storage 285) |
+| New node bytes / block | 2,594 KiB | 182 KiB |
+| Mean node size | 359 B | 329 B |
 | Leaf or extension share of new nodes | 19% | 22% |
-| Account proof length (nodes) | 8–12, mean 8.9 | 7–9, mean 7.5 |
+| Account proof length (nodes) | 8–12, mean 8.9 | 7–9, mean 7.6 |
 | Storage proof length (nodes) | 1–11, mean 6.3 | 2–8, mean 4.6 |
-| Per day, one node per chunk | 53.3 M chunks | 10.1 M chunks |
-| **One epoch merged** | 2 epochs of 32 blocks: 134,304 and 137,581 nodes, **57%** of their blocks summed | 3 epochs of 16 blocks: 4,060–5,313 nodes, **43–57%** (mean 50%) of their blocks summed |
+| Per day, one node per chunk | 53.3 M chunks | 9.8 M chunks |
+| **One epoch merged** | 2 epochs of 32 blocks: 134,304 and 137,581 nodes, **57%** of their blocks summed | 3 epochs of 16 blocks: 3,731–3,964 nodes, **41–44%** of their blocks summed |
 
 What the numbers say:
 
@@ -254,9 +258,9 @@ What the numbers say:
   19% of the new nodes. A changed 32-byte slot costs about six new nodes
   of ~360 bytes each.
 - **Merging blocks helps where writes repeat.** On Gnosis the same accounts
-  recur from block to block. In one epoch, 16 blocks of ~48 changed accounts
-  each touched only 315 distinct accounts, and an epoch costs about half
-  (43–57%) of its blocks summed.
+  recur from block to block. 16 blocks of ~49 changed accounts each touched
+  only 279–302 distinct accounts per epoch, and an epoch costs 41–44% of its
+  blocks summed.
   Mainnet repeats less. An epoch touched 8,207 and 8,361 distinct accounts
   against ~15,800 account changes summed over its blocks, and costs 57%.
 
@@ -372,7 +376,7 @@ are byte-identical and overwrite semantics never matter.
   | Network | k | Per root | Published roots / day | Chunks / day |
   |---|---|---|---|---|
   | Mainnet, per epoch | 3 | 4,096 | 225 | 0.92 M (4% of the epoch's pages) |
-  | Gnosis, per epoch | 3 | 4,096 | 1,080 | 4.4 M, more than its 3.8 M pages |
+  | Gnosis, per epoch | 3 | 4,096 | 1,080 | 4.4 M, more than its 3.1 M pages |
 
   Gnosis therefore takes k = 2 per epoch (0.28 M a day), or k = 3 every
   fourth epoch.
@@ -413,7 +417,7 @@ are byte-identical and overwrite semantics never matter.
   | Tier | Content | Mainnet | Gnosis |
   |---|---|---|---|
   | 0 | Code | ~7 M chunks once | smaller (no count published) |
-  | 1 | Epoch churn: the pages of every node a published root added, plus its jump table | 23.8 M pages + 0.92 M jump / day | 3.8 M pages + 0.28 M jump / day |
+  | 1 | Epoch churn: the pages of every node a published root added, plus its jump table | 23.8 M pages + 0.92 M jump / day | 3.1 M pages + 0.28 M jump / day |
   | 2 | Base: every page of one root, so cold keys are walkable too | 0.76 B chunks (estimate), 18% of the network | unknown; Nethermind's flat DB is 62% of mainnet's |
 
   Without a base, tier 1 serves only keys that changed since publishing
@@ -438,7 +442,7 @@ $0.04.
 | Mainnet, every block (one node per chunk), kept 30 days | 1.6 B | 37% | 560 BZZ/day |
 | Mainnet, every epoch (pages + jump tables), kept 30 days | 743 M | 17% | 260 BZZ/day |
 | Mainnet base snapshot (tier 2) | 0.76 B | 18% | ~97,000 BZZ/yr (~$3,900) |
-| Gnosis, every epoch (pages + jump tables), kept 30 days | 122 M | 2.8% | 43 BZZ/day |
+| Gnosis, every epoch (pages + jump tables), kept 30 days | 102 M | 2.4% | 36 BZZ/day |
 
 - **The money is small.**
 - **The capacity is not.**
@@ -536,7 +540,7 @@ so two values are shown.
 |---|---|---|---|---|---|
 | Mainnet account | 8.9 | ~5 | 0.5 s | 1.5 s | 1 round trip |
 | Mainnet ERC-20 balance | 15.2 | ~8 (~10 without a storage jump table) | 0.8 s | 2.4 s | 1–2 |
-| Gnosis ERC-20 balance | 12.1 | ~8 (jump tables with k = 2) | 0.8 s | 2.4 s | 1–2 |
+| Gnosis ERC-20 balance | 12.2 | ~8 (jump tables with k = 2) | 0.8 s | 2.4 s | 1–2 |
 
 An `eth_call` walks many keys in parallel, and they share their upper levels,
 so a wave costs about one path's depth, not the sum. For comparison, the

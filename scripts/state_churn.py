@@ -7,8 +7,10 @@ the numbers in docs/state-on-swarm.md.
 For each block it collects the changed keys:
 
 - every account and storage slot a transaction changed (`prestateTracer` in
-  `diffMode`, via `debug_traceBlockByNumber`);
-- the withdrawal recipients and the fee recipient;
+  `diffMode`, via `debug_traceBlockByNumber`), less the slots the block
+  left at their starting value;
+- the fee recipient, and the withdrawal recipients except on Gnosis chains,
+  which pay withdrawals into the deposit contract, not to the recipient;
 - the EIP-4788 and EIP-2935 system slots.
 
 It then calls `eth_getProof` for every changed key at the last block of the
@@ -23,7 +25,9 @@ only every N-th root is published.
 
 Not traced, so the counts run slightly low: post-block system calls other than
 EIP-4788/2935, i.e. Gnosis withdrawals (a system call into the deposit
-contract) and the EIP-7002/7251 request queues.
+contract) and the EIP-7002/7251 request queues. An account whose balance or
+nonce changed and changed back within the block is still counted, so the
+account side can run slightly high.
 
 The RPC must serve `debug_traceBlockByNumber` and `eth_getProof` at the
 measured block. Public endpoints that did on 2026-11-05: eth.drpc.org
@@ -48,7 +52,13 @@ from concurrent.futures import ThreadPoolExecutor
 BEACON_ROOTS = "0x000f3df6d732807ef1319fb7b8bb8522d0beac02"  # EIP-4788
 HISTORY = "0x0000f90827f1c53a10cb7a02335b175320002935"  # EIP-2935
 RING = 8191  # both system contracts' ring-buffer length
+GNOSIS_CHAINS = {100, 10200}  # Gnosis, Chiado
+ZERO = "0x" + "00" * 32
 MAX_SLOTS_PER_CALL = 256
+
+
+class RpcRefused(RuntimeError):
+    """A JSON-RPC error the node will give again: not worth a retry."""
 
 
 def rpc(url, calls):
@@ -67,9 +77,15 @@ def rpc(url, calls):
                 raise RuntimeError(out.get("error"))
             errors = [r["error"] for r in out if "error" in r]
             if errors:
+                # A refusal (bad params, proof window passed) will not change on
+                # retry; only rate limits and transport failures are retried.
+                if "rate" not in str(errors[0].get("message", "")).lower():
+                    raise RpcRefused(errors[0])
                 raise RuntimeError(errors[0])
             by_id = {r["id"]: r["result"] for r in out}
             return [by_id[i] for i in range(len(calls))]
+        except RpcRefused:
+            raise
         except (subprocess.CalledProcessError, ValueError, RuntimeError, KeyError) as e:
             last = e
             time.sleep(2 * (attempt + 1))
@@ -80,20 +96,32 @@ def slot32(n):
     return "0x%064x" % n
 
 
-def changed_keys(url, number):
+def changed_keys(url, number, chain_id):
     """{address: {slot, ...}} for everything block `number` changed, and its tx count."""
     block = rpc(url, [("eth_getBlockByNumber", [hex(number), False])])[0]
     traces = rpc(url, [("debug_traceBlockByNumber", [hex(number), {
         "tracer": "prestateTracer", "tracerConfig": {"diffMode": True}}])])[0]
     keys = collections.defaultdict(set)
+    first, last = {}, {}  # (address, slot) -> value before the block / after it
     for t in traces:
         result = t["result"]
-        # diffMode lists only what changed; a slot set to zero is in `pre` alone.
-        for side in ("pre", "post"):
-            for address, account in result.get(side, {}).items():
-                keys[address.lower()].update(account.get("storage", {}).keys())
-    for w in block.get("withdrawals") or []:
-        keys[w["address"].lower()]
+        pre, post = result.get("pre", {}), result.get("post", {})
+        # diffMode lists only what a transaction changed; a slot it set to zero
+        # is in `pre` alone.
+        for address in set(pre) | set(post):
+            keys[address.lower()]
+            before = pre.get(address, {}).get("storage", {})
+            after = post.get(address, {}).get("storage", {})
+            for slot in set(before) | set(after):
+                key = (address.lower(), slot)
+                first.setdefault(key, before.get(slot, ZERO))
+                last[key] = after.get(slot, ZERO)
+    for (address, slot), value in last.items():
+        if int(value, 16) != int(first[(address, slot)], 16):
+            keys[address].add(slot)
+    if chain_id not in GNOSIS_CHAINS:
+        for w in block.get("withdrawals") or []:
+            keys[w["address"].lower()]
     keys[block["miner"].lower()]
     ts = int(block["timestamp"], 16)
     if block.get("parentBeaconBlockRoot"):
@@ -185,13 +213,14 @@ def main():
     ap.add_argument("--workers", type=int, default=1, help="batches in flight")
     args = ap.parse_args()
 
+    chain_id = int(rpc(args.rpc, [("eth_chainId", [])])[0], 16)
     first = args.first if args.first is not None else head(args.rpc) - args.head_offset
     for w in range(args.count):
         t0 = time.time()
         lo = first + w * args.window
         keys, txs = collections.defaultdict(set), 0
         for number in range(lo, lo + args.window):
-            block_keys, n = changed_keys(args.rpc, number)
+            block_keys, n = changed_keys(args.rpc, number, chain_id)
             txs += n
             for address, slots in block_keys.items():
                 keys[address].update(slots)
