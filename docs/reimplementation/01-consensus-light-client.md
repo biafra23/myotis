@@ -436,11 +436,14 @@ Java reference (`BeaconP2PService`, jvm-libp2p) is TCP-only. The **Rust engine
 additionally** listens on **QUIC** (`/ip4/0.0.0.0/udp/0/quic-v1`, the spec's primary
 transport — its own TLS 1.3 handshake and multiplexing, so neither noise nor a muxer
 applies there), both listeners on ephemeral ports, and dials a peer discovered with an
-ENR `quic`/`quic6` field at TCP first and at its QUIC address only when the TCP dial
-itself fails — not the spec's order, because against Nimbus v26.9.1 (lsquic) a QUIC
+ENR `quic`/`quic6` field in the spec's order (consensus-specs#5330): its QUIC address
+first, TCP only when the QUIC dial fails. A record with QUIC and no TCP is a QUIC-only
+candidate. A peer moves to TCP first (`reqresp::TcpFirst`) when its QUIC dial fails
+with TCP still to try, when a request times out on its QUIC connection (which is then
+closed), and when it identifies as Nimbus — against Nimbus v26.9.1 (lsquic) a QUIC
 connection answered a handful of streams and then hung until Nimbus aborted it
 (`sync::Peer::dial_addrs`; the order governs which connection is opened, an existing
-connection on either transport carries requests). **Random secp256k1 identity each
+connection on either transport carries requests, hence the close on timeout). **Random secp256k1 identity each
 start** (ephemeral PeerId) on both engines. No WebSocket / relay / DHT.
 
 ### 10.2 Req/resp protocol IDs (all `…/ssz_snappy`)

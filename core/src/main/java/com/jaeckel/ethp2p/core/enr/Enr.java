@@ -222,11 +222,19 @@ public final class Enr {
      * <p>The PeerId is derived from the secp256k1 compressed public key using
      * the libp2p identity multihash convention (protobuf-wrapped key ≤ 42 bytes).
      *
+     * <p>Without a {@code tcp} field the discv5 {@code udp} port is assumed to
+     * double as TCP (the old CL convention: same port for both) — except when
+     * the record carries a {@code quic} field. That is a QUIC-only peer
+     * (consensus-specs#5330 made TCP optional), positive evidence nothing
+     * listens on TCP there, and this engine's libp2p host is TCP-only: such a
+     * record yields no multiaddr instead of a fabricated dead one.
+     *
      * @return the multiaddr, or empty if the ENR lacks ip, tcp, or secp256k1 fields
      */
     public Optional<String> toLibp2pMultiaddr() {
-        // Prefer explicit TCP address; fall back to UDP port (CL convention: same port for both)
-        var addr = tcpAddress().or(this::udpAddress);
+        // Prefer explicit TCP address; fall back to UDP port (CL convention: same
+        // port for both) unless the record says it is QUIC-only.
+        var addr = tcpAddress().or(() -> pairs.containsKey("quic") ? Optional.empty() : udpAddress());
         var keyOpt = compressedSecp256k1();
         if (addr.isEmpty() || keyOpt.isEmpty()) return Optional.empty();
 
