@@ -404,6 +404,7 @@ and for not shipping a unique clientId on the Tor path.
 | Generic Tor-side request shapes (§6.3) | (partially) client-fingerprint pairing; fully only with adoption |
 | Fail-closed pool (§5) | silent property loss under peer starvation |
 | Tor-reachability + synced gate (§5, PoC) | selecting peers that clearnet-validate but drop Tor inbound / are unsynced → a dry Tor pool at query time |
+| Bucketed reads + one peer per bucket (§11, proposal) | (partially) address disclosure to the serving peer itself — k-anonymity within an aligned bucket, which Tor alone does not give |
 
 ## 8. Open questions for review
 
@@ -452,6 +453,12 @@ and for not shipping a unique clientId on the Tor path.
    the first thing to measure at scale. If it proves fatal, the first
    alternative to measure is a VPN-style overlay whose exit IPs are not the
    Tor exit set — see §10.
+10. **Bucketed reads (§11)** — the real account count per network and the
+    real per-block change rate (they set `b` and how much timing leaks), the
+    response caps of the snap peers actually reached (how many replies a
+    bucket takes), whether whole-bucket requests can be shaped like snap-sync
+    range requests (§6.3), and whether the Tor reserve can hold one operator
+    per bucket for a realistic wallet (§11.6).
 
 ## 9. Proof of concept — what was validated
 
@@ -595,6 +602,266 @@ Re-evaluate when any of these becomes true:
 3. **§8.9 proves fatal at scale** — if the synced-and-Tor-accepting peer
    population cannot sustain a fail-closed pool, Gnosis VPN's exit fleet is
    the first alternative to measure.
+
+## 11. Bucketed reads: hiding the address inside a range (proposal, 2026-11)
+
+> **Status: design only — nothing in this section is implemented.** Today
+> every address-carrying snap read asks for exactly one account
+> (`starting = keccak(address)`, full-range limit, small response cap —
+> §6.3), so the serving peer learns `keccak(address)` and hence the address
+> (§1). Tor (§3–§5) unlinks that from the IP; it does not hide the address
+> from the peer. This section is about hiding the address itself.
+
+### 11.1 Why not PIR (yet)
+
+Private information retrieval would hide the query entirely, and the Ethereum
+Foundation runs a workstream on it (the "Private Reads" track: the sharded-PIR
+design, ethresear.ch post 24552; the `inspire-gpu-serving` reference server and
+Rust client). As of 2026-11 it does not fit Myotis:
+
+- **Answers are unverified.** The served records are `delegate ‖ balance ‖
+  nonce`, without a proof; the EF's wallet guide states that the wallet trusts
+  the server and that answers are not checked against the state root.
+  "Verifiable PIR" (private Merkle-proof retrieval) is listed as research for
+  Q1 2027. Under *Trust* in `CLAUDE.md` that is not usable, and a PIR server
+  over HTTPS is also outside the devp2p/libp2p data-source rule.
+- **Asking for the proof separately would undo it.** Fetching the proof
+  afterwards (snap, `eth_getProof`) names the account again. A verified PIR
+  read has to carry the proof INSIDE the PIR record (the post's "Baseline 2"),
+  or fetch it level by level with one PIR query per trie level. Either needs no
+  new cryptography, but an MPT account proof is ~4.8 KB against a 60 B record
+  today, ~80× the database and roughly the server work. That cost, not
+  privacy, is why it does not exist yet. The closest academic work,
+  *Authenticated PIR* (Colombo et al., USENIX Security 2023), has a prototype
+  and costs 30–100× unauthenticated single-server PIR.
+- **A proof stops a forged answer, not a selective-failure attack.** A server
+  that corrupts some records and watches whether a client retries, falls back
+  or changes its schedule learns whether the client's record was among them.
+  Any verified PIR path must fail with the same network-visible behaviour as a
+  success: no retry, no fallback, same cadence. The same rule applies to the
+  bucket scheme below.
+
+So PIR stays a revisit item: when the EF ships proof-carrying records (or
+per-level lookups) for the MPT account trie, Myotis is well placed to consume
+it, because it already holds a verified state root per block and the proof
+verifier (`verify_account_proof`). Until then, the scheme below works against
+today's snap peers and keeps every answer verified.
+
+### 11.2 The bucket rule
+
+The account trie has (almost) no empty leaves — EIP-161 removes empty
+accounts — so the number of accounts in a range IS the anonymity set, and a
+range with one account in it hides nothing. `keccak(address)` is uniform, so a
+range covering a fraction `w` of the 256-bit key space holds about `N·w`
+accounts, with `N` the network's account count.
+
+- **Fixed, aligned buckets — never a window around the address.** A range
+  centred on `keccak(address)` names the address by its middle. Split the key
+  space into `2^b` buckets by the first `b` bits of the hash and always request
+  a WHOLE bucket: origin `prefix ‖ 00…0`, limit `prefix ‖ ff…f`. The peer learns
+  the `b`-bit prefix, which every account in the bucket shares.
+- **Size by count, not width:** `b = floor(log2(N / k))` for a target set
+  size `k`. With `N ≈ 2.7×10⁸` (an assumption, to be measured) and roughly 65 B
+  per account on the wire:
+
+  | b | buckets | accounts / bucket | reply |
+  |---|---|---|---|
+  | 14 | 16 384 | ~16 000 | ~1 MB |
+  | 16 | 65 536 | ~4 000 | ~260 KB |
+  | 18 | 262 144 | ~1 000 | ~65 KB |
+
+  Bucket sizes stay close to the mean: ±1.5 % is one standard deviation at
+  4 000, and the extremes across 65 536 buckets reach roughly ±7 %, which is
+  what the "fits in one or two replies" sizing below has to allow for.
+- **Measure `N` per network, at runtime.** Gnosis and Sepolia are far smaller
+  than mainnet, so a hard-coded `b` would give them tiny buckets. Any verified
+  account page gives an estimate: `N ≈ count · 2²⁵⁶ / (last_hash − origin)`.
+  The Rust engine has no source for such pages yet: its account requests are
+  single-key with a 4 KiB budget, and its snap quality comes from served reads
+  (`PeerCache::record_snap_served`), not from random-range probes (§4 item 2
+  describes the Java engine's). So the estimate starts from a conservative
+  compiled-in value per network and is refined from the bucket pages
+  themselves (thousands of accounts each), or from new random-range probes,
+  which leak nothing; one 4 KiB page (~60 accounts) alone is too noisy.
+- **Always fetch the whole bucket.** When a bucket spans several replies, page
+  to its end even after the target account has arrived: stopping early tells
+  the peer where the account sits. Choose `b` so a bucket usually fits in one
+  or two replies of the peers actually reached (their response caps differ by
+  client and have to be measured).
+- **Verify the whole page.** Today the reader checks a single-account boundary
+  proof only (`verify_account`, `rust/myotis-wire/src/snap/fetch.rs`). Proving
+  that the target sits inside a returned page — and that the page omits
+  nothing — needs a full snap range-proof check (both boundary proofs plus
+  every leaf rebuilt to the root, as geth's `VerifyRangeProof` does). Myotis
+  has none yet; it is the first piece of code this design needs.
+- **Storage reads are buckets too, inside each contract's storage trie.** A
+  token balance read (`GetStorageRanges`) names the token contract — which
+  stays disclosed — and buckets the storage-trie path by the same rule: for a
+  mapping entry the slot index is `keccak(pad(addr) ‖ pad(slot))`, and the
+  trie (and so `GetStorageRanges`) is keyed by `keccak(slot index)`, so it is
+  that second hash whose prefix picks the bucket. `N` is the contract's slot
+  count (estimated the same way). A small token's trie may need to be fetched
+  whole, and its anonymity set is then its holder count.
+
+### 11.3 What `k` is really worth
+
+`k` is an upper bound. Three things shrink it:
+
+1. **Plausibility.** `N` counts every account, contracts included, and a
+   contract is rarely the wallet's address, so the EOA share of a bucket is
+   the first discount. A chain-analytics adversary then weights the remaining
+   accounts by activity. If ~5 % of a bucket's accounts are recently active
+   EOAs (illustrative), a bucket of 4 000 is a set of ~200.
+2. **Timing — the dominant leak.** Mainnet changes on the order of a thousand
+   accounts per block (order of magnitude, to be measured), so a 4 000-account
+   bucket sees ~0.02 changed accounts per block. A read the wallet makes
+   BECAUSE something happened — a refresh after an incoming transfer, a nonce
+   poll after its own send — is answered by "the one account in this bucket
+   that just changed". The send case re-links the sender to the IP that Tor
+   broadcast (§4 item 5) keeps apart. **Rule: a bucket read's timing must not
+   depend on the account's activity.** Each bucket is read on its own fixed
+   schedule (§11.4 rule 5), never on an event.
+3. **Linked addresses.** A wallet's five addresses are five buckets; the five
+   accounts, one per bucket, that fund each other on-chain are usually unique.
+   Each address keeps its own Tor isolation (§3), and a wallet's buckets are
+   not queried back to back.
+
+**Decoy buckets** multiply the set by `d + 1` at `(d + 1)×` the cost, but only
+if they are drawn ONCE per address and kept: decoys re-drawn per query are
+intersected away, since the real bucket is the one that recurs.
+
+### 11.4 Peer separation: one peer, one bucket
+
+Spreading reads across peers helps only in the right form. A time window alone
+("one thing per peer per N minutes") does little over clearnet: a peer
+recognises the requester by IP and by RLPx node key — the persistent
+`nodekey.hex` key on the direct path (§6.1); only the Tor path uses a fresh key
+per connection (`el::tor`) — so address A today and address B tomorrow from
+the same IP or key are linked however far apart they are.
+
+Worse, **different queries about the SAME address multiply**. A peer that sees
+an account bucket of ~4 000 accounts and, from the same identity, a USDC
+storage bucket computes each of those 4 000 accounts' USDC slot hash and keeps
+the ones inside the storage bucket. If that bucket covers ~1/8 000 of USDC's
+slots, the real account survives (its slot is why the bucket was asked for)
+plus ~0.5 false positives: ~1.5 candidates, the address all but identified.
+Repeating the SAME bucket, by contrast, tells the peer nothing new.
+
+The rules:
+
+1. **Each bucket gets a sticky peer** (guard-style), and that peer only ever
+   sees that bucket. A bucket's disclosure set grows only when its peer leaves.
+2. **No identity ever shows one peer two different buckets.** Over Tor that
+   means not from the same circuit and ephemeral key, and not close enough in
+   time for connection timing to link them. On the direct path the IP and
+   the persistent key never change, so it would mean one bucket per peer for
+   the life of the install, with a network observer seeing every dial (§11.7)
+   — **bucket mode is therefore Tor-only**: the direct path keeps today's
+   single-account reads, and a bucket read with no Tor route fails closed.
+3. **The unit is the operator, not the node.** One operator running many nodes
+   pools what they see. Group peers by IP prefix / ASN (a heuristic — operators
+   are not visible) and count a group as one peer.
+4. **Hedging stays inside the bucket's own peers.** The read hedge
+   (`HEDGE_DELAY`, up to `MAX_HEDGED_ATTEMPTS` peers, §1) may go only to a small
+   fixed backup set for that bucket; a hedge to arbitrary peers turns slowness
+   into disclosure.
+5. **A fixed schedule per bucket, not one global queue.** Under rules 1–2 a
+   bucket's peer sees only that bucket, so a global paced queue whose idle
+   slots go to a decoy bucket hides nothing from it: the real bucket's peer
+   would still get a request only when the wallet has a reason to read, and
+   that reason lines up with on-chain changes in the bucket. Instead each
+   bucket — real or decoy — is read at its own fixed interval (with jitter
+   that ignores activity) whether or not a read is needed, and a real need
+   waits for its bucket's next slot. A new address's schedule starts after a
+   random delay, so its first request does not mark when it was added or
+   funded. This is what §11.3's timing rule needs, and it is the main cost
+   driver (§11.6).
+
+**Fail closed**, as everywhere in this document: no eligible peer for a bucket
+means the read waits or fails, never that it goes to an ineligible peer or to
+a single-account query.
+
+### 11.5 Interplay with the activity follower
+
+The activity follower (#691, `el::activity`) already removes most repeat reads:
+it fetches the verified block access list (EIP-7928) of EVERY kept block —
+nothing address-specific is requested — and answers a watched account at the
+head from them (`ElReader::followed_account`, `verifyMethod`
+`blockAccessList`), seeded from one earlier proof. So the ANSWER needs a
+bucket read only to anchor: the first read of an address, and a re-read after
+a follower gap (window passed, a BAL no peer served, a block before
+Amsterdam). The per-bucket schedule of §11.4 rule 5 still runs regardless.
+
+Three consequences:
+
+- **Gaps are not activity-driven** (a fetch failure, a window overrun), so a
+  re-anchor after one leaks little — provided it waits for its bucket's slot
+  (§11.4 rule 5) like any other bucket read.
+- **Without BALs, re-reads ARE activity-driven.** Where a host re-proves an
+  address only when a block's `logsBloom` hits it (the follower's `log`
+  coverage), the re-read's timing is exactly the leak of §11.3 item 2. In
+  bucket mode such re-proofs must also wait for the bucket's own slot,
+  decoupled from the bloom hit, at the cost of a staler balance.
+- **The per-bucket schedule runs even while the follower answers.** A bucket
+  whose peer is asked only when the follower has a gap would leak the gaps'
+  timing; the follower makes most scheduled reads REDUNDANT for the answer,
+  not unnecessary for the cover.
+
+### 11.6 Cost
+
+- **Peers.** Rule 1–2 need about one separate peer (operator) per distinct
+  bucket: `addresses × (1 + tokens tracked per address)`, plus decoys. The Tor
+  reserve holds at most `TOR_RESERVE_CAP` = 24 nodes, about a third of the
+  verified snap servers (`el::torreserve`). Three addresses with five tokens
+  each already need 18 — most of the reserve before any decoy. Churn slowly
+  widens each bucket's disclosure set.
+- **Latency.** A real read waits for its bucket's next slot, and a new
+  address's first slot comes after a random delay, each on its own peer and
+  circuit; with §8.5's Tor tail latency, the first full balance view is slow.
+  The interval trades this against bandwidth.
+- **Bandwidth.** ~260 KB per bucket read at `k ≈ 4 000` — the same order as
+  the EF's PIR lookup (~742 KB up, ~277 KB down per account) — and, because
+  the schedule runs whether or not a read is needed (§11.4 rule 5), it is a
+  constant `buckets × reply / interval`: 18 buckets read hourly are ~4.7 MB/h,
+  ~110 MB a day, whatever the wallet does. That belongs in
+  [Disk & Network Usage](disk-and-network-usage.md) once built, and it is the
+  reason for a long interval on mobile.
+- **Fingerprint.** Prefix-aligned whole-bucket requests are a new, distinctive
+  request shape (§6.3). Whether they can be made to look like snap-sync range
+  requests is open (§8.10).
+
+### 11.7 Limits
+
+- Colluding peers, or one large operator behind many IP ranges, undo §11.4.
+  Grouping by IP prefix / ASN is a heuristic, not a guarantee.
+- On the direct path a network observer sees which peers are dialled and when,
+  though not what is asked — another reason for bucket reads to go over Tor.
+- It is k-anonymity with, realistically, a few hundred plausible accounts per
+  bucket. It makes linking expensive; it does not make it impossible, as PIR
+  would.
+
+### 11.8 Implementation sketch (when picked up)
+
+1. A snap range-proof verifier in `myotis-wire` (`snap/fetch.rs`), with
+   conformance tests against geth-produced pages.
+2. A per-network `N` estimator (account trie, and per-contract storage tries),
+   starting from a compiled-in value and fed by the bucket pages and by new
+   random-range probes (the Rust engine has none today, §11.2).
+3. Bucket requests (`b` from `N` and a configured `k`), whole-bucket paging.
+4. A bucket → peer assignment in the Tor reserve (`el::torreserve`), with
+   operator grouping and per-bucket backup sets for hedging.
+5. The per-bucket scheduler (a fixed, jittered interval per real and sticky
+   decoy bucket, random first slot), which anchoring reads and
+   bloom-triggered re-proofs wait on instead of reading on demand.
+6. A host toggle, Rust-engine-only and gated behind the Tor toggle like the
+   existing Tor modes.
+
+Sources for §11.1: [Sharded PIR design for the Ethereum state
+(ethresear.ch)](https://ethresear.ch/t/sharded-pir-design-for-the-ethereum-state/24552),
+[EF Private Reads roadmap](https://reads.ethereum.foundation/roadmap/),
+[EF PIR wallet guide](https://reads.ethereum.foundation/projects/pir/wallets/),
+[inspire-gpu-serving](https://github.com/keewoolee/inspire-gpu-serving),
+[Authenticated PIR (USENIX Security '23)](https://www.usenix.org/conference/usenixsecurity23/presentation/colombo).
 
 ## Code pointers (current behavior this design touches)
 
