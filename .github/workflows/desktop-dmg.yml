@@ -57,7 +57,8 @@ jobs:
     # one .dmg per arch. jpackage stamps the .app with the architecture of the JDK it runs under,
     # NOT the host — so we can cross-build the Intel dmg on Apple Silicon by running an x86_64 JDK
     # under Rosetta 2. BOTH jobs therefore run on macos-15 (Apple Silicon; macos-14 was
-    # retired on 2026-11-02 and its jobs are cancelled unstarted since):
+    # retired, changelog date 2026-11-02, and its jobs are cancelled unstarted since
+    # 2026-11-06):
     #   arm64 → native aarch64 JDK           (dmg runs on M-series Macs)
     #   x64   → x86_64 JDK under Rosetta 2    (dmg runs on Intel Macs, macOS Ventura and back to
     #                                          Big Sur — JDK 21's floor)
