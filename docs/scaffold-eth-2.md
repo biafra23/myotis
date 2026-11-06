@@ -192,6 +192,16 @@ What to expect:
   the block `eth_blockNumber` just reported can be refused for a moment
   ("retry as the index catches up"). React Query's default retries usually
   cover it.
+- The hook's `blockData`, `transactionData` and `receiptData` options fetch the
+  block, transaction and receipt of each event by hash. Those reads reach only
+  recent blocks: up to 512 below the head for a block, and for a transaction
+  or receipt by hash only the recent window the node scans, which can be much
+  shorter (README, *Wallet API* and *Block selectors*). For an older
+  event Myotis answers `null`, and viem turns that into a not-found error (for
+  example `BlockNotFoundError`). The logs themselves still come from the index,
+  which can cover far more history. Leave those options off for a contract
+  older than a few hundred blocks, or expect the extra data only for recent
+  events.
 
 ## 5. What else differs from a hosted RPC
 
