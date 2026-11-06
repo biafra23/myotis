@@ -207,7 +207,12 @@ that was 4.5 h. **Since Denim it is 8192 × 200 ms = 27.3 min — shorter than
 the shortest proposal lag measured (29.2 min, §3.1.1).** At the moment a game
 lands, the head is already ≥ 8,760 blocks past its checkpoint, and up to
 ~22,440 just before the next one lands (74.8 min × 300 blocks/min). So with the
-bound as it is, **no L1 anchor reaches the Base head at any time**; Base needs
+bound as it is, **no L1 anchor in this sample reached the Base head at any
+point** (21 games in the first ~7 h after activation; the margin is ~2 min,
+and the proposer's cadence may still settle). The conclusion does not hang on
+that margin: a game landing in less than 27.3 min would reach the head only
+for the (27.3 − lag) minutes until the head outruns it again, a sliver of each
+20-minute cycle. Base needs
 its own bound, either time-based or a per-network block count of at least
 ~22,500 (better with margin: a delayed proposer pushes the lag up, and one of
 21 games already took 55 min). The cost is a walk ten times as long per
