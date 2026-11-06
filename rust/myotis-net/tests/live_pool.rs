@@ -73,6 +73,7 @@ async fn pool_dials_from_discovery_and_serves_a_verified_account() {
         None,
         None,
         Default::default(),
+        myotis_net::el::pool::PoolMemory::default(),
     );
 
     let mut probe = [0u8; 20];

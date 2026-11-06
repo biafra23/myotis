@@ -648,10 +648,12 @@ struct PoolInner {
     /// re-dialing a live peer or racing two dials to the same address.
     attempted: Mutex<HashSet<SocketAddr>>,
     /// Address → its cooling-off record; the pool's shortfall may shorten
-    /// the window it blocks for ([`Backoff::blocks`]).
-    backoff: Mutex<HashMap<SocketAddr, Backoff>>,
-    /// Node ids of wrong-chain peers, never dialed again this run.
-    blacklist: Mutex<HashSet<[u8; 64]>>,
+    /// the window it blocks for ([`Backoff::blocks`]). Shared through
+    /// [`PoolMemory`], so it outlives an idle pause.
+    backoff: Arc<Mutex<HashMap<SocketAddr, Backoff>>>,
+    /// Node ids of wrong-chain peers, never dialed again this run. Shared
+    /// through [`PoolMemory`], so it outlives an idle pause.
+    blacklist: Arc<Mutex<HashSet<[u8; 64]>>>,
     /// Peers evicted from `peers` whose sessions may still be open — a read or
     /// a detached clearnet push can hold the `Arc` for a while. Counted as
     /// live for Tor until closed, then stamped as a direct contact
@@ -1516,9 +1518,43 @@ pub struct PeerPool {
     inner: Arc<PoolInner>,
 }
 
+/// The pool's view of the beacon-anchored optimistic head, as
+/// `(number, hash)` — `None` until the anchor has one.
+pub type HeadSourceFn = Box<dyn Fn() -> Option<(u64, [u8; 32])> + Send + Sync>;
+
+/// The dial verdicts worth outliving one pool: the wrong-chain blacklist and
+/// the backoff map. An idle pause drops the EL reader and its pool, and the
+/// resume builds a new one; handing it the SAME memory keeps it from spending
+/// its first dial slots re-handshaking peers already known to be on another
+/// chain. The Java engine keeps its blacklist across a pause the same way (it
+/// lives on its `ChainStack`). Cheap to clone: both halves are shared.
+///
+/// Only the WRONG-CHAIN verdicts cross a pause: [`PeerPool::start`] drops every
+/// other backoff window from the map it is handed ([`retain_across_pause`]).
+/// A transient, busy or lagging window describes a short-term condition a
+/// pause outlasts — and it would not reliably expire during one: a window is
+/// measured on the monotonic `Instant`, which stands still while the device
+/// is suspended (`CLOCK_MONOTONIC` on Android, `CLOCK_UPTIME_RAW` on iOS), so
+/// an overnight pause could hand the wake a window with nearly all of it left.
+#[derive(Clone, Default)]
+pub struct PoolMemory {
+    blacklist: Arc<Mutex<HashSet<[u8; 64]>>>,
+    backoff: Arc<Mutex<HashMap<SocketAddr, Backoff>>>,
+}
+
+/// Pure: does a backoff window survive into the next pool over the same
+/// [`PoolMemory`]? Only a wrong-chain one (see the type's doc).
+fn retain_across_pause(kind: BackoffKind) -> bool {
+    kind == BackoffKind::Incompatible
+}
+
 impl PeerPool {
     /// Start the pool, consuming the discv4 candidate stream `rx`. `local_pubkey`
     /// is our node id (64-byte); `cfg` is our eth handshake parameters.
+    /// `memory` holds the blacklist and backoff windows the pool reads and
+    /// writes — [`PoolMemory::default`] for a chain's first pool, the paused
+    /// pool's for a resume.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         key: Arc<NodeKey>,
         local_pubkey: [u8; 64],
@@ -1529,8 +1565,9 @@ impl PeerPool {
         rx: mpsc::Receiver<TableEntry>,
         tx_watch: Option<crate::el::sent_tx::SharedSentTxWatch>,
         probe: Option<mpsc::Sender<SocketAddr>>,
-        head_source: Option<Box<dyn Fn() -> Option<(u64, [u8; 32])> + Send + Sync>>,
+        head_source: Option<HeadSourceFn>,
         traffic: Arc<crate::traffic::TrafficMeter>,
+        memory: PoolMemory,
     ) -> PeerPool {
         // Built before the struct literal (cfg is moved into it below).
         let served = Arc::new(ServedHeaders::with_genesis(
@@ -1545,6 +1582,12 @@ impl PeerPool {
         // Both the discv4 dialer and the maintainer dial through one shared
         // concurrency budget — and so does a host's seed-pin push.
         let dial_slots = Arc::new(Semaphore::new(pool_cfg.max_concurrent_dials));
+        // A memory handed over by a paused pool keeps its wrong-chain verdicts
+        // only (see `PoolMemory`). Uncontended: the previous pool is stopped,
+        // and nothing else holds the map; a first pool's memory is empty.
+        if let Ok(mut backoff) = memory.backoff.try_lock() {
+            backoff.retain(|_, b| retain_across_pause(b.kind));
+        }
         let mut cache = cache;
         let tor_reserve = load_tor_reserve(&mut cache, &boot_enodes);
         let inner = Arc::new(PoolInner {
@@ -1555,7 +1598,7 @@ impl PeerPool {
             pool_cfg,
             peers: Mutex::new(Vec::new()),
             attempted: Mutex::new(HashSet::new()),
-            backoff: Mutex::new(HashMap::new()),
+            backoff: memory.backoff,
             discovery_table: std::sync::Mutex::new(None),
             below_target: std::sync::Mutex::new(None),
             dns_seeder: std::sync::Mutex::new(None),
@@ -1565,7 +1608,7 @@ impl PeerPool {
             bal_unable: std::sync::Mutex::new(HashSet::new()),
             bal_hunt_cursor: std::sync::atomic::AtomicUsize::new(0),
             last_bal_hunt_log: std::sync::Mutex::new(None),
-            blacklist: Mutex::new(HashSet::new()),
+            blacklist: memory.blacklist,
             lingering: std::sync::Mutex::new(Vec::new()),
             cache: Mutex::new(cache),
             tor_reserve: std::sync::Mutex::new(tor_reserve),
@@ -1587,6 +1630,7 @@ impl PeerPool {
         });
         inner.tasks.spawn(dialer_loop(Arc::clone(&inner), rx));
         inner.tasks.spawn(maintainer_loop(Arc::clone(&inner)));
+        inner.tasks.spawn(startup_probe_loop(Arc::clone(&inner)));
         PeerPool { inner }
     }
 
@@ -2746,7 +2790,89 @@ const HEAD_PROBE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const HEAD_PROBE_PER_TICK: usize = 2;
 const PROBE_MISSES_EVICT: u32 = 3;
 
-async fn probe_unknown_heads(inner: &Arc<PoolInner>) {
+/// How often the start-up prober runs [`probe_unknown_heads`] while the pool
+/// has an anchored head and no serving peer yet.
+const STARTUP_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+/// How long the start-up prober probes, counted from the first tick that
+/// sees an anchored head; past it, the maintainer's own probe every
+/// [`MAINTAINER_INTERVAL`] is all there is.
+const STARTUP_PROBE_WINDOW: Duration = Duration::from_secs(60);
+/// How long the start-up prober waits for an anchored head at all. A resume
+/// after a long sleep can spend minutes catching up sync-committee periods
+/// before the anchor has one, and the window above must not run out during
+/// that wait; but a beacon side that never delivers must not keep a 1 s
+/// timer ticking for the pool's whole life either (a phone's CPU wakes for it).
+const STARTUP_HEAD_WAIT_MAX: Duration = Duration::from_secs(10 * 60);
+/// How soon the start-up prober may ask a peer again. The first probe can
+/// race the peer's import of the block the anchor has just adopted, and the
+/// regular [`HEAD_PROBE_MIN_INTERVAL`] would then lock that peer out for
+/// 30 s — longer than the maintainer's first tick, which used to prove it.
+/// One maintainer interval keeps the worst case at what it was.
+const STARTUP_REPROBE_INTERVAL: Duration = MAINTAINER_INTERVAL;
+
+/// What the start-up prober does on one of its ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupProbe {
+    /// No anchored head yet: nothing to probe against — look again next tick.
+    Wait,
+    /// An anchored head and nobody serving at it: probe.
+    Probe,
+    /// A peer serves, the window ran out, or the head never came: the
+    /// maintainer takes over.
+    Done,
+}
+
+/// Pure: the start-up prober's step, from the time since the pool started,
+/// the time since the prober first saw an anchored head (`None` before), and
+/// the serving count.
+fn startup_probe_step(since_start: Duration, since_head: Option<Duration>, serving: usize) -> StartupProbe {
+    match since_head {
+        None if since_start >= STARTUP_HEAD_WAIT_MAX => StartupProbe::Done,
+        None => StartupProbe::Wait,
+        Some(d) if d >= STARTUP_PROBE_WINDOW || serving > 0 => StartupProbe::Done,
+        Some(_) => StartupProbe::Probe,
+    }
+}
+
+/// Prove the first serving peer as soon as there is a head to prove it at.
+/// An eth/68 peer announces no head, so only a probe can count it as serving
+/// — and the maintainer's first probe comes a full [`MAINTAINER_INTERVAL`]
+/// after the pool starts, which a warm resume's first read used to wait out
+/// (the wake gate holds reads until a peer serves). This loop runs the same
+/// probe every [`STARTUP_PROBE_INTERVAL`] from the moment the anchor has a
+/// head until a peer serves, within [`STARTUP_PROBE_WINDOW`]. A call still
+/// asks at most [`HEAD_PROBE_PER_TICK`] peers, and any one peer at most once
+/// per [`STARTUP_REPROBE_INTERVAL`] — the same cadence the maintainer probed
+/// at before this loop existed. A peer that answers three of those without
+/// the anchored head is evicted as lagging ([`PROBE_MISSES_EVICT`]) sooner
+/// than the maintainer alone would: it runs only while NO peer serves, which
+/// is exactly when a laggard's slot is worth freeing. Spawned through
+/// `tasks`, so a stopping pool ends it.
+async fn startup_probe_loop(inner: Arc<PoolInner>) {
+    let started = Instant::now();
+    let mut head_seen: Option<Instant> = None;
+    loop {
+        tokio::time::sleep(STARTUP_PROBE_INTERVAL).await;
+        let now = Instant::now();
+        if head_seen.is_none() && inner.anchored_head().is_some() {
+            head_seen = Some(now);
+        }
+        let serving = match head_seen {
+            Some(_) => inner.count_where(is_serving).await,
+            None => 0,
+        };
+        let since_head = head_seen.map(|t| now.duration_since(t));
+        match startup_probe_step(now.duration_since(started), since_head, serving) {
+            StartupProbe::Wait => {}
+            StartupProbe::Probe => probe_unknown_heads(&inner, STARTUP_REPROBE_INTERVAL).await,
+            StartupProbe::Done => return,
+        }
+    }
+}
+
+/// Ask up to [`HEAD_PROBE_PER_TICK`] unknown-head peers for the anchored head,
+/// skipping any asked within `min_interval`.
+async fn probe_unknown_heads(inner: &Arc<PoolInner>, min_interval: Duration) {
     let Some((head, head_hash)) = inner.anchored_head() else { return };
     let now = Instant::now();
     let candidates: Vec<(SocketAddr, Arc<ManagedPeer>)> = inner
@@ -2756,7 +2882,7 @@ async fn probe_unknown_heads(inner: &Arc<PoolInner>) {
         .iter_mut()
         .filter(|p| {
             let recently =
-                p.last_probe.is_some_and(|t| now.duration_since(t) < HEAD_PROBE_MIN_INTERVAL);
+                p.last_probe.is_some_and(|t| now.duration_since(t) < min_interval);
             !recently
                 && !p.is_benched(now)
                 && !p.peer.is_closed()
@@ -2866,7 +2992,7 @@ async fn maintainer_loop(inner: Arc<PoolInner>) {
         // #465: drop peers whose fresh word says they fell far behind the
         // head, and learn the heads of peers that announce none.
         evict_lagging_peers(&inner).await;
-        probe_unknown_heads(&inner).await;
+        probe_unknown_heads(&inner, HEAD_PROBE_MIN_INTERVAL).await;
         // Keep the eth/69 advertised range honest over a connection's lifetime:
         // a peer told a narrow range at handshake would otherwise get empty
         // answers once the window slides forward. Broadcast on change (deduped).
@@ -3454,6 +3580,7 @@ mod tests {
                 None,
                 None,
                 Default::default(),
+                crate::el::pool::PoolMemory::default(),
             )
         }
 
@@ -4278,11 +4405,93 @@ mod tests {
             None,
             None,
             Default::default(),
+            PoolMemory::default(),
         );
         assert_eq!(pool.snap_peer_count().await, 0);
         assert!(pool.snap_peer().await.is_none());
         assert_eq!(pool.attempted_count().await, 0);
         pool.stop().await;
+    }
+
+    #[test]
+    fn startup_probe_waits_for_a_head_probes_until_a_peer_serves_then_stops() {
+        let s = Duration::from_secs;
+        assert_eq!(startup_probe_step(s(3), None, 0), StartupProbe::Wait, "no head: nothing to prove at");
+        assert_eq!(startup_probe_step(s(3), Some(s(1)), 0), StartupProbe::Probe);
+        assert_eq!(startup_probe_step(s(3), Some(s(1)), 1), StartupProbe::Done, "a serving peer ends it");
+        // The window counts from the head, not from the pool's start: a resume
+        // that caught up periods for minutes still gets its full window…
+        assert_eq!(startup_probe_step(s(300), Some(s(5)), 0), StartupProbe::Probe);
+        assert_eq!(startup_probe_step(s(300), Some(STARTUP_PROBE_WINDOW), 0), StartupProbe::Done);
+        // …and a head that never comes does not keep the loop alive forever.
+        assert_eq!(startup_probe_step(STARTUP_HEAD_WAIT_MAX - s(1), None, 0), StartupProbe::Wait);
+        assert_eq!(startup_probe_step(STARTUP_HEAD_WAIT_MAX, None, 0), StartupProbe::Done);
+        // It must be able to beat the maintainer's first tick, or it adds
+        // nothing, and its re-probe must not lock a peer out past that tick.
+        assert!(STARTUP_PROBE_INTERVAL < MAINTAINER_INTERVAL);
+        assert!(STARTUP_REPROBE_INTERVAL <= MAINTAINER_INTERVAL);
+        assert!(STARTUP_REPROBE_INTERVAL < HEAD_PROBE_MIN_INTERVAL);
+    }
+
+    /// A pool for the memory test below: no cache, no pins, a silent candidate stream.
+    fn memory_fixture(seed: &[u8], memory: PoolMemory) -> PeerPool {
+        let key = Arc::new(NodeKey::from_secret_bytes(&myotis_core::keccak::keccak256(seed)).unwrap());
+        let cfg = Arc::new(EthConfig {
+            network_id: 1,
+            genesis_hash: [0u8; 32],
+            fork_id_hash: [0u8; 4],
+            fork_next: 0,
+            head_hash: [0u8; 32],
+            head_number: 0,
+            listen_port: 30303,
+            genesis_header_rlp: None,
+        });
+        let (_tx, rx) = mpsc::channel(4);
+        PeerPool::start(Arc::clone(&key), key.public_key_bytes(), cfg, PoolConfig::default(),
+            ElPeerCache::disabled(), Vec::new(), rx, None, None, None, Default::default(), memory)
+    }
+
+    #[tokio::test]
+    async fn a_resumed_pool_keeps_the_wrong_chain_verdicts_and_drops_the_short_term_windows() {
+        let banned = NodeKey::from_secret_bytes(&myotis_core::keccak::keccak256(b"mem-banned")).unwrap();
+        let foreign = NodeKey::from_secret_bytes(&myotis_core::keccak::keccak256(b"mem-foreign")).unwrap();
+        let banned_addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let foreign_addr: SocketAddr = "127.0.0.1:11".parse().unwrap();
+        let short_term = [
+            ("127.0.0.1:12", BackoffKind::Transient),
+            ("127.0.0.1:13", BackoffKind::Busy),
+            ("127.0.0.1:14", BackoffKind::Lagging),
+        ];
+
+        let memory = PoolMemory::default();
+        let paused = memory_fixture(b"mem-first", memory.clone());
+        paused.inner.blacklist.lock().await.insert(banned.public_key_bytes());
+        let now = Instant::now();
+        paused.inner.record_backoff(foreign_addr, BackoffKind::Incompatible, now).await;
+        for (addr, kind) in short_term {
+            paused.inner.record_backoff(addr.parse().unwrap(), kind, now).await;
+        }
+        paused.stop().await;
+
+        let resumed = memory_fixture(b"mem-second", memory);
+        assert_eq!(resumed.blacklist_count().await, 1, "the wrong-chain verdict outlives the pause");
+        assert_eq!(try_dial_verdict(&resumed.inner, banned_addr, banned.public_key_bytes()).await,
+            DialVerdict::Skipped);
+        // The address-level wrong-chain window too (a different node id there
+        // is still skipped)…
+        assert_eq!(try_dial_verdict(&resumed.inner, foreign_addr, foreign.public_key_bytes()).await,
+            DialVerdict::Skipped);
+        // …and nothing else: those windows are measured on a clock that stands
+        // still in a device suspend, so they must not cross a pause.
+        let kept: Vec<SocketAddr> = resumed.inner.backoff.lock().await.keys().copied().collect();
+        assert_eq!(kept, vec![foreign_addr]);
+        resumed.stop().await;
+
+        // A pool over fresh memory knows neither.
+        let fresh = memory_fixture(b"mem-third", PoolMemory::default());
+        assert_eq!(fresh.blacklist_count().await, 0);
+        assert!(fresh.inner.backoff.lock().await.is_empty());
+        fresh.stop().await;
     }
 
     #[tokio::test]
@@ -4334,6 +4543,7 @@ mod tests {
             None,
             None,
             Default::default(),
+            PoolMemory::default(),
         );
         // The warm-start branch dials the cached peer, claiming its address.
         // Poll briefly (the silent listener parks the handshake, so the address
@@ -4394,6 +4604,7 @@ mod tests {
             None,
             None,
             Default::default(),
+            PoolMemory::default(),
         );
 
         // No verdict is persisted without another live peer to compare

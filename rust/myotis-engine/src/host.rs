@@ -33,7 +33,7 @@ use myotis_net::el::evm::{ReadAnchor, EnsQuery, EnsRootMode};
 use myotis_net::cl_fork_watch::{self, ClForkWatch};
 use myotis_net::el::fork_watch::{self, ForkWatch};
 use myotis_net::el::pool::Enode;
-use myotis_net::el::reader::{parse_enode, ElReader};
+use myotis_net::el::reader::{parse_enode, ElCarry, ElReader};
 use myotis_net::el::readstats::ReadStats;
 use myotis_net::{ChainConfig, SyncHandle, SyncState, SyncStatus};
 use myotis_evm::U256;
@@ -145,6 +145,12 @@ struct EngineState {
     /// at each spin-up (`ChainConfig::cl_fork_watch`). Same lifetime as
     /// `fork_watches`; the two advisories are merged at status time.
     cl_fork_watches: Mutex<HashMap<i64, Arc<ClForkWatch>>>,
+    /// Per-handle EL carry (`ElCarry`: the clearnet node key and the pool's
+    /// wrong-chain verdicts — see `PoolMemory`): created on the handle's first
+    /// spin_up and handed to every EL reader a resume rebuilds, so a wake keeps
+    /// its discv4 identity and does not re-dial peers it already ruled out.
+    /// Dies with the handle (a stop → start gets a new key).
+    el_carries: Mutex<HashMap<i64, ElCarry>>,
     /// Serializes `create` / `create_with_checkpoint` end to end (in-use guard,
     /// anchor-marker read/write, registration). Every guard in those paths is
     /// check-then-act against the filesystem and the handle map; without one
@@ -197,6 +203,7 @@ fn engine() -> Option<&'static EngineState> {
                     fee_history_cache: Mutex::new(HashMap::new()),
                     fork_watches: Mutex::new(HashMap::new()),
                     cl_fork_watches: Mutex::new(HashMap::new()),
+                    el_carries: Mutex::new(HashMap::new()),
             create_lock: Mutex::new(()),
             tearing_down: Mutex::new(std::collections::HashSet::new()),
                     usage: Mutex::new(HashMap::new()),
@@ -774,7 +781,11 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
                 traffic: Arc::clone(&config.traffic),
                 ..cfg
             };
-            ElReader::start_for(sync.exec_anchor(), el_cache_path, cfg, read_stats).await
+            // A poisoned carry map still gets a reader, over a carry of its own
+            // (which a later resume cannot reuse); a failed key generation gets
+            // none — the CL-only degraded mode, as for any reader start error.
+            let carry = el_carry_for(engine, handle).map_or_else(ElCarry::new, Ok)?;
+            ElReader::start_carried(sync.exec_anchor(), el_cache_path, cfg, read_stats, carry).await
         }) {
             Ok(r) => Some(Arc::new(r)),
             Err(e) => {
@@ -870,6 +881,9 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
                 }
                 if let Ok(mut watches) = engine.cl_fork_watches.lock() {
                     watches.remove(&handle);
+                }
+                if let Ok(mut carries) = engine.el_carries.lock() {
+                    carries.remove(&handle);
                 }
             }
             shutdown(engine, sync, reader);
@@ -1166,6 +1180,19 @@ fn fork_watch_for(
     Some(Arc::clone(watch))
 }
 
+/// The handle's EL carry, created on its first spin_up (see
+/// [`EngineState::el_carries`]). `None` for a poisoned map or a failed key
+/// generation.
+fn el_carry_for(engine: &EngineState, handle: i64) -> Option<ElCarry> {
+    let mut map = engine.el_carries.lock().ok()?;
+    if let Some(carry) = map.get(&handle) {
+        return Some(carry.clone());
+    }
+    let carry = ElCarry::new().ok()?;
+    map.insert(handle, carry.clone());
+    Some(carry)
+}
+
 /// The handle's CL fork watch — created on its first spin-up from the chain's
 /// fork schedule, genesis root, blob params and slot timing, then reused
 /// across pause/resume. On every network (no staged rollout: the CL signal
@@ -1230,6 +1257,9 @@ pub fn stop(handle: i64) {
     }
     if let Ok(mut watches) = engine.cl_fork_watches.lock() {
         watches.remove(&handle);
+    }
+    if let Ok(mut carries) = engine.el_carries.lock() {
+        carries.remove(&handle);
     }
     let ledger = engine.usage.lock().ok().and_then(|mut m| m.remove(&handle));
     if let Some(ChainEntry::Running(cfg, sync, reader)) = entry {
@@ -5001,6 +5031,26 @@ mod tests {
         assert_eq!(v["running"], false);
         assert_eq!(v["paused"], false);
         stop(id);
+    }
+
+    #[test]
+    fn the_el_carry_is_per_handle_kept_across_spin_ups_and_dies_with_the_handle() {
+        let engine = engine().expect("engine");
+        let a = create("mainnet", "");
+        let b = create("mainnet", "");
+        assert!(a >= 1 && b >= 1, "create failed: {a} {b}");
+        // Every spin_up of one handle (start, then each resume) asks for its
+        // carry: the same node key each time, so a wake keeps its identity…
+        let first = el_carry_for(engine, a).expect("carry");
+        let again = el_carry_for(engine, a).expect("carry");
+        assert!(Arc::ptr_eq(first.node_key(), again.node_key()));
+        // …and never another handle's.
+        let other = el_carry_for(engine, b).expect("carry");
+        assert!(!Arc::ptr_eq(first.node_key(), other.node_key()));
+        stop(a);
+        stop(b);
+        let carries = engine.el_carries.lock().unwrap();
+        assert!(!carries.contains_key(&a) && !carries.contains_key(&b), "a stop drops the carry");
     }
 
     #[test]

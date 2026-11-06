@@ -181,9 +181,10 @@ complete on its own.
   keeps its DNS pool across pause; the Java twin's public DNS fallbacks
   (`1.1.1.1`/`8.8.8.8`) are left out on purpose (a third party learning the
   network).
-- A warm resume's first read can cost up to one maintainer tick (~10 s) on
-  an eth/68-only pool, since proving a peer now needs a probe round-trip;
-  eth/69 peers prove at the handshake.
+- A warm resume's first read on an eth/68-only pool still needs one head
+  probe round-trip (eth/69 peers prove at the handshake), but no longer waits
+  for the maintainer's first 10 s tick: the pool's start-up prober runs it
+  every second from the moment the anchor has a head until a peer serves.
 - A dead pin costs one SYN per backoff window while the pool is below target
   or, once the anchor has a head, nobody serves at it.
 
