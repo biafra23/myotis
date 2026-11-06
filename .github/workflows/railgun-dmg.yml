@@ -62,7 +62,7 @@ jobs:
   build:
     name: Build macOS .dmg (arm64, railgun-poc)
     needs: seed
-    runs-on: macos-14
+    runs-on: macos-15
     permissions:
       contents: read
     env:

@@ -56,7 +56,8 @@ jobs:
     # jpackage bundles a single-architecture JRE and can't emit a universal binary, so we build
     # one .dmg per arch. jpackage stamps the .app with the architecture of the JDK it runs under,
     # NOT the host — so we can cross-build the Intel dmg on Apple Silicon by running an x86_64 JDK
-    # under Rosetta 2. BOTH jobs therefore run on macos-14 (Apple Silicon):
+    # under Rosetta 2. BOTH jobs therefore run on macos-15 (Apple Silicon; macos-14 was
+    # retired on 2026-11-02 and its jobs are cancelled unstarted since):
     #   arm64 → native aarch64 JDK           (dmg runs on M-series Macs)
     #   x64   → x86_64 JDK under Rosetta 2    (dmg runs on Intel Macs, macOS Ventura and back to
     #                                          Big Sur — JDK 21's floor)
@@ -103,7 +104,7 @@ jobs:
     # main it is a hard gate like the standard legs: a PoC regression (seed,
     # manifest, caches, JNA stub) must turn the run red.
     continue-on-error: ${{ matrix.flavor == 'bee-poc' && startsWith(github.ref, 'refs/tags/') }}
-    runs-on: macos-14
+    runs-on: macos-15
     permissions:
       contents: read
     env:
@@ -166,7 +167,7 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          # Both matrix legs run on arm64 macos-14; the x64 leg is a Rosetta
+          # Both matrix legs run on arm64 macos-15; the x64 leg is a Rosetta
           # cross-build. cargo builds its HOST triple regardless of the JVM's
           # arch, so the x64 leg must cross-compile explicitly or the x64 dmg
           # would bundle an arm64 dylib (dead engine toggle on Intel Macs).
