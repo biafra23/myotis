@@ -42,7 +42,9 @@ it cannot answer from verified data:
   yet, or for a contract the index does not watch;
 - `-32602` for a selector it cannot apply (`safe`, a block far behind the head);
 - `-32601` for a method it does not serve (`eth_subscribe`);
-- HTTP `403` when the page's origin is not allowed (§3).
+- HTTP `403` when the page's origin is not allowed (§3). The browser hides
+  this one from the page: script sees only a network error ("Failed to fetch"),
+  and the DevTools console says "blocked by CORS policy".
 
 Each of those becomes a request to a public endpoint, and the page shows the
 answer. Nothing on screen tells a verified number from a substituted one.
@@ -55,7 +57,9 @@ So **replace** the transport for the chains Myotis serves; don't just add to it.
 ## 2. Point the frontend at Myotis, with no fallback
 
 In `packages/nextjs/services/web3/wagmiConfig.tsx`, return a Myotis-only client
-for the chains you run a node for, and leave the rest of the function as it is:
+for the chains you run a node for, and leave the rest of the function as it is.
+Add `sepolia` to the file's existing `viem/chains` import (it already imports
+`hardhat` and `mainnet`):
 
 ```ts
 import { hardhat, mainnet, sepolia } from "viem/chains";
@@ -78,7 +82,8 @@ export const wagmiConfig = createConfig({
         chain,
         // A single transport, not fallback(): a refusal must reach the page.
         // A cold eth_call fetches state proofs from peers and can take seconds,
-        // so allow more than viem's 10 s default.
+        // so allow more than viem's 10 s default (and consider a longer
+        // pollingInterval in scaffold.config.ts, see §5).
         transport: http(myotisUrl, { timeout: 60_000 }),
         pollingInterval: scaffoldConfig.pollingInterval,
       });
@@ -109,7 +114,11 @@ matter to you.
 The JSON-RPC listener refuses web pages until you allow them
 ([web-page-access.md](web-page-access.md)). The Scaffold-ETH 2 dev server's
 origin is `http://localhost:3000`. Note the `http://`: a bare domain is read as
-`https://`.
+`https://`. Origins match exactly: if you open the page as
+`http://127.0.0.1:3000`, or Next picks another port because 3000 is busy,
+allow that origin instead. A refused page sees only "Failed to fetch". The
+refusal itself shows on the app's Status tab, in the daemon's log, and in the
+browser's DevTools.
 
 **Desktop daemon:**
 
@@ -145,13 +154,20 @@ curl -s http://127.0.0.1:8547 -H 'content-type: application/json' \
 ## 4. Events: index your contract
 
 `useScaffoldEventHistory` calls `eth_getLogs` from the contract's
-`deployedOnBlock` (block 0 if `deployedContracts.ts` has none) to the head, in
-500-block batches. `useScaffoldWatchContractEvent` polls through viem, which
+`deployedOnBlock` to the head, in 500-block batches, one after another. Make
+sure `deployedContracts.ts` records `deployedOnBlock`: without it the hook
+starts from block 0, which on Sepolia is close to 20,000 sequential requests
+before any history appears. `useScaffoldWatchContractEvent` polls through viem, which
 uses `eth_newFilter`/`eth_getFilterChanges` and falls back to `eth_getLogs`.
 Myotis serves all of these **only from the log index**, which covers just the
 contracts you put on its watch-list
-([eth-getlogs-design.md](eth-getlogs-design.md)). Add your deployed contract
-back to its deployment block:
+([eth-getlogs-design.md](eth-getlogs-design.md)). The index exists **only on
+the Rust engine**. The default `auto` selection picks it, but where the Rust
+engine cannot load (a desktop build without cargo), `auto` runs the Java
+engine. That engine answers every log query with `-32000`, and
+`build-logindex` answers "not the Rust engine". Start the daemon with
+`-Pengine=rust` to make that a startup error instead. Add your deployed
+contract back to its deployment block:
 
 ```bash
 ./gradlew :app:run -Pnetwork=sepolia \
@@ -160,9 +176,11 @@ back to its deployment block:
 ```
 
 Or use the app's **Index** tab. Choose an *earlier* block when unsure: a later
-one hides the first events, an earlier one only walks further. A freshly
-deployed challenge contract is a few hundred blocks old, so the backfill
-finishes quickly.
+one hides the first events, an earlier one only walks further.
+`build-logindex` is the daemon's only way to add a contract, and it turns on
+max speed, so the backfill competes with your page's reads for the snap peers
+while it runs. A freshly deployed challenge contract is a few hundred blocks
+old, so that is brief. The apps' Index tab keeps the default pacing.
 
 What to expect:
 
@@ -177,10 +195,15 @@ What to expect:
 
 ## 5. What else differs from a hosted RPC
 
-- **Recent state only.** Reads pinned to a block more than 64 blocks behind
-  the head are refused (`-32602`), and `safe`, `earliest` and block 0 are
-  refused as selectors. A Scaffold-ETH 2 frontend reads `latest`, so the
-  standard hooks are unaffected. A custom history view of past state is not.
+- **Recent state only.** State reads and `eth_call` pinned to a block more
+  than 64 blocks behind the head are refused with the permanent `-32602`. The
+  exception is a block at or above a head this node itself reported in the
+  last 15 minutes, which gets the retryable `-32000` (README, *Block
+  selectors*). `safe`, `earliest` and block 0 are refused as selectors for
+  these reads. This does not affect `eth_getLogs`, whose range the log index
+  clamps to the contract's watched start (§4). A Scaffold-ETH 2 frontend reads
+  `latest`, so the standard hooks are unaffected. A custom view of past state
+  is not.
 - **Latency.** A hosted RPC answers in tens of milliseconds. Myotis fetches
   state proofs from peers, so a cold `eth_call` or Multicall3 batch can take
   hundreds of milliseconds to seconds, which is why §2 raises the timeout.
