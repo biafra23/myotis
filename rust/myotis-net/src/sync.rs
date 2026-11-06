@@ -1857,7 +1857,11 @@ impl PeerPool {
     /// peer the QUIC address is REPLACED by what the record says now —
     /// learned, moved to another port, or dropped (`None`) when the operator
     /// turned QUIC off — including for a pinned static peer discovered again
-    /// with its record. Never a cache key, so no identity changes.
+    /// with its record. The QUIC side address is never a cache key; the one
+    /// identity change is a pooled QUIC-only peer whose record gains TCP — its
+    /// key moves once, from its QUIC address to the TCP one, the shape the
+    /// Java engine can dial. A QUIC-only record for a peer pooled at TCP keeps
+    /// the TCP key and learns the QUIC address as `quic`.
     fn add_with_quic(&mut self, id: PeerId, addr: Multiaddr, quic: Option<Multiaddr>) {
         self.add_inner(id, addr, quic, true);
     }

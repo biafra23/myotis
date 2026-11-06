@@ -1792,7 +1792,10 @@ fn handle_behaviour_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, even
             // is refused, that connection is the only one there is and stays.
             // Closing up front costs a reconnect; waiting costs the measured
             // stall's first timeout (10 s, 60 s for updates_by_range).
-            if is_nimbus_agent(&agent) && prefer_tcp(&ctx.tcp_first, peer_id) {
+            // Matched on the RAW agent, not the display form above: that one
+            // is never compared (`log_client_id`'s contract), so a change to
+            // the sanitizer cannot silently stop Nimbus detection.
+            if is_nimbus_agent(&info.agent_version) && prefer_tcp(&ctx.tcp_first, peer_id) {
                 if ctx.quic_conns.remove(&connection_id) {
                     tracing::debug!(peer = %peer_id, agent = ?agent,
                         "Nimbus peer on QUIC — closing that connection; dialed at TCP first from now on");
