@@ -772,6 +772,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_set_ws_bound_periods(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_simulate_v1_json(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_start_handle(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_status_json(
@@ -893,6 +895,8 @@ internal object UniffiLib {
     ): Byte
     external fun uniffi_myotis_engine_fn_func_set_ws_bound_periods(`handle`: Long,`periods`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
+    external fun uniffi_myotis_engine_fn_func_simulate_v1_json(`handle`: Long,`opts`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_start_handle(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_myotis_engine_fn_func_status_json(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1168,6 +1172,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_set_ws_bound_periods() and 0xFFFF) != 6098) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_myotis_engine_checksum_func_simulate_v1_json() and 0xFFFF) != 51602) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_start_handle() and 0xFFFF) != 14110) {
@@ -2294,6 +2301,26 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         
         FfiConverterLong.lower(`handle`),
         FfiConverterLong.lower(`periods`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * `eth_simulateV1` (ABI ≥ 55, #716): the blocks of calls `opts` (geth's
+         * `simOpts`) simulated on top of `block`: `{"status":"ok","result":[…]}`,
+         * geth's own error as `{"status":"failed","code","message"}`, `unavailable`,
+         * or the permanent `{"error","code":-32602}`; see
+         * `crate::host::simulate_v1_json`.
+         */ fun `simulateV1Json`(`handle`: kotlin.Long, `opts`: kotlin.String, `block`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_simulate_v1_json(
+    
+        
+        FfiConverterLong.lower(`handle`),
+        FfiConverterString.lower(`opts`),
+        FfiConverterString.lower(`block`),_status)
 }
     )
     }

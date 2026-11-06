@@ -935,4 +935,27 @@ class RustVerifiedReadJsonTest {
         assertThrows(EngineException.class, () -> RustChainHandle.traceFromJson("{\"error\":\"node is not running\"}"));
         assertThrows(EngineException.class, () -> RustChainHandle.traceFromJson("{\"status\":\"ok\"}"));
     }
+
+    // ---- eth_simulateV1 (simulateFromJson, ABI 55, #716) ----
+
+    @Test
+    void simulate_okCarriesGethsResultVerbatim_andEveryOtherStatusMaps() {
+        var ok = RustChainHandle.simulateFromJson("{\"status\":\"ok\",\"result\":[{\"number\":\"0x2\",\"hash\":null,"
+                + "\"calls\":[]}],\"blockNumber\":1,\"verified\":false}");
+        assertEquals(io.myotis.api.SimulateResult.Status.OK, ok.status());
+        assertEquals("[{\"number\":\"0x2\",\"hash\":null,\"calls\":[]}]", ok.resultJson());
+        var failed = RustChainHandle.simulateFromJson("{\"status\":\"failed\",\"code\":-38020,"
+                + "\"message\":\"block numbers must be in order: 2 <= 2\",\"blockNumber\":1}");
+        assertEquals(io.myotis.api.SimulateResult.Status.FAILED, failed.status());
+        assertEquals(-38020, failed.code());
+        assertEquals("block numbers must be in order: 2 <= 2", failed.detail());
+        var unavailable = RustChainHandle.simulateFromJson("{\"status\":\"unavailable\",\"reason\":\"no snap peer\"}");
+        assertEquals(io.myotis.api.SimulateResult.Status.UNAVAILABLE, unavailable.status());
+        var refused = RustChainHandle.simulateFromJson("{\"error\":\"BLOBBASEFEE is not served\",\"code\":-32602}");
+        assertEquals(io.myotis.api.SimulateResult.Status.REFUSED, refused.status());
+        // A plain error throws (→ unavailable at the adapter); drift fails closed.
+        assertThrows(EngineException.class, () -> RustChainHandle.simulateFromJson("{\"error\":\"node is not running\"}"));
+        assertThrows(EngineException.class, () -> RustChainHandle.simulateFromJson("{\"status\":\"ok\"}"));
+        assertThrows(EngineException.class, () -> RustChainHandle.simulateFromJson("{\"status\":\"failed\",\"message\":\"x\"}"));
+    }
 }

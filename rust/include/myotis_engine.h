@@ -36,7 +36,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 54
+#define MYOTIS_ABI_VERSION 55
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -335,6 +335,16 @@ char *myotis_debug_trace_call_json(int64_t handle, const char *tx_json,
                                    const char *block,
                                    const char *overrides_json,
                                    const char *tracer_json);
+/* eth_simulateV1 (ABI >= 55): the blocks of calls opts_json describes (geth's
+ * simOpts: blockStateCalls, traceTransfers, validation,
+ * returnFullTransactions) simulated on top of block (NULL = latest). Returns
+ * {"status":"ok","result":[...],"blockNumber":N,"verified":b} with geth's
+ * result (what this node does not compute, such as a simulated block's hash
+ * and state root, is null), {"status":"failed","code":C,"message"} (geth's own
+ * simulation error, with its code), {"status":"unavailable","reason"}, or the
+ * permanent {"error","code":-32602} (a parameter this node does not apply). */
+char *myotis_simulate_v1_json(int64_t handle, const char *opts_json,
+                              const char *block);
 /* A transaction's raw consensus bytes (ABI >= 53): "0x..." as a JSON string
  * (the EIP-2718 envelope for a typed transaction), found as
  * myotis_get_transaction_by_hash_json finds the transaction (a verified block,

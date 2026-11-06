@@ -239,6 +239,45 @@ pub struct TraceAnswer {
     pub finalized: bool,
 }
 
+/// An `eth_simulateV1`'s outcome (#716), mapped from the executor as
+/// [`TraceOutcome`]: a call that reverts or halts is still a result.
+#[derive(Debug)]
+pub enum SimulateOutcome {
+    /// The simulated blocks ([`myotis_evm::simulate::SimulatedBlock`]).
+    Simulated(Vec<myotis_evm::simulate::SimulatedBlock>),
+    /// No answer right now (state unavailable). The string is diagnostic.
+    Unavailable(String),
+    /// Never answerable on this build — permanent, as [`CallOutcome::Refused`].
+    Refused(String),
+    /// geth's own simulation error: the request fails with geth's `code` and
+    /// words (an out-of-order block, a failed check under `validation`, …).
+    Failed { code: i64, message: String },
+}
+
+impl SimulateOutcome {
+    /// The executor's verdict, mapped as [`TraceOutcome::from_executor`],
+    /// with geth's simulation errors passed through with their codes.
+    pub fn from_executor(
+        joined: Result<Vec<myotis_evm::simulate::SimulatedBlock>, EvmError>,
+    ) -> SimulateOutcome {
+        match joined {
+            Ok(blocks) => SimulateOutcome::Simulated(blocks),
+            Err(EvmError::Simulation { code, message }) => SimulateOutcome::Failed { code, message },
+            Err(e) if e.is_refusal() => SimulateOutcome::Refused(e.to_string()),
+            Err(e) => SimulateOutcome::Unavailable(e.to_string()),
+        }
+    }
+}
+
+/// A simulation's outcome plus the block it started from, as [`CallAnswer`].
+#[derive(Debug)]
+pub struct SimulateAnswer {
+    pub outcome: SimulateOutcome,
+    pub block_number: u64,
+    /// Started from the beacon-FINALIZED block.
+    pub finalized: bool,
+}
+
 /// An access list's outcome plus the block it ran against, as [`CallAnswer`].
 #[derive(Debug)]
 pub struct AccessListAnswer {

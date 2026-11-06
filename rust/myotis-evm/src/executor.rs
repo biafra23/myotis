@@ -47,10 +47,10 @@ use revm::primitives::Log;
 use revm::interpreter::interpreter_types::{Jumps, LoopControl};
 
 /// The accounts whose code a discovery pass needed (see [`RequestInspector`]).
-type CodeNeeded = std::cell::RefCell<std::collections::HashSet<[u8; 20]>>;
+pub(crate) type CodeNeeded = std::cell::RefCell<std::collections::HashSet<[u8; 20]>>;
 
-struct RequestInspector<'a> {
-    oracle: &'a dyn SnapStateOracle,
+pub(crate) struct RequestInspector<'a> {
+    pub(crate) oracle: &'a dyn SnapStateOracle,
     /// Records, during a discovery pass, the accounts whose code the run
     /// needed: the account each call runs the code of
     /// (`CallInputs::bytecode_address`), and the one an `EXTCODESIZE` or
@@ -59,13 +59,17 @@ struct RequestInspector<'a> {
     /// before the call runs, so the target shows there a pass earlier. The
     /// pass's wave fetches the code of these and no other (#532 review).
     /// `None` outside discovery passes.
-    code_needed: Option<&'a CodeNeeded>,
+    pub(crate) code_needed: Option<&'a CodeNeeded>,
     /// Records, for `eth_createAccessList`, every address and storage key the
     /// run touches ([`AccessListRecorder`]). `None` on every other run.
-    access_list: Option<&'a AccessListRecorder>,
+    pub(crate) access_list: Option<&'a AccessListRecorder>,
     /// Records, for `debug_traceCall`, the tracer's view of the run
     /// ([`TraceRecorder`]). `None` on every other run.
-    trace: Option<&'a TraceRecorder>,
+    pub(crate) trace: Option<&'a TraceRecorder>,
+    /// Records, for `eth_simulateV1`, each call's logs and transfers and
+    /// stops a run that reads what the simulation cannot serve
+    /// ([`SimRecorder`]). `None` on every other run.
+    pub(crate) sim: Option<&'a SimRecorder>,
 }
 
 /// The recorders a run carries beyond the request's own bookkeeping: each one
@@ -86,6 +90,18 @@ impl<CTX: ContextTr> Inspector<CTX> for RequestInspector<'_> {
                 gas: interp.gas,
             }));
             return;
+        }
+        if let Some(sim) = self.sim {
+            if sim.step(interp) {
+                // A read the simulation refuses: stop here, and every frame
+                // above stops at its next step (the run is refused).
+                interp.bytecode.set_action(InterpreterAction::Return(InterpreterResult {
+                    result: InstructionResult::Stop,
+                    output: Default::default(),
+                    gas: interp.gas,
+                }));
+                return;
+            }
         }
         if let Some(code_needed) = self.code_needed {
             let opcode = interp.bytecode.opcode();
@@ -113,6 +129,9 @@ impl<CTX: ContextTr> Inspector<CTX> for RequestInspector<'_> {
         if let Some(trace) = self.trace {
             trace.call(inputs, || inputs.input.bytes(context).to_vec());
         }
+        if let Some(sim) = self.sim {
+            sim.call(inputs);
+        }
         None
     }
 
@@ -120,11 +139,17 @@ impl<CTX: ContextTr> Inspector<CTX> for RequestInspector<'_> {
         if let Some(trace) = self.trace {
             trace.end(&outcome.result, None);
         }
+        if let Some(sim) = self.sim {
+            sim.end(&outcome.result, None);
+        }
     }
 
     fn create(&mut self, _context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
         if let Some(trace) = self.trace {
             trace.create(inputs);
+        }
+        if let Some(sim) = self.sim {
+            sim.create(inputs);
         }
         None
     }
@@ -133,17 +158,26 @@ impl<CTX: ContextTr> Inspector<CTX> for RequestInspector<'_> {
         if let Some(trace) = self.trace {
             trace.end(&outcome.result, outcome.address);
         }
+        if let Some(sim) = self.sim {
+            sim.end(&outcome.result, outcome.address);
+        }
     }
 
     fn log(&mut self, _context: &mut CTX, log: Log) {
         if let Some(trace) = self.trace {
             trace.log(&log);
         }
+        if let Some(sim) = self.sim {
+            sim.log(&log);
+        }
     }
 
     fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
         if let Some(trace) = self.trace {
             trace.selfdestruct(contract, target, value);
+        }
+        if let Some(sim) = self.sim {
+            sim.selfdestruct(contract, target, value);
         }
     }
 }
@@ -156,7 +190,7 @@ impl<CTX: ContextTr> Inspector<CTX> for RequestInspector<'_> {
 /// account, so the recipient's own slots are in. The list is kept sorted by
 /// address and key, so the same run always yields the same list (geth
 /// iterates a map and does not).
-struct AccessListRecorder {
+pub(crate) struct AccessListRecorder {
     excluded: HashSet<Address>,
     /// What the recording starts from — the list the run is made with — so
     /// each pass of the convergence loop ([`EvmExecutor::converge`]) records
@@ -274,6 +308,7 @@ use crate::error::EvmError;
 use crate::fork::spec_for;
 use crate::oracle::{OracleError, SnapStateOracle};
 use crate::overrides::StateOverrides;
+use crate::simulate::SimRecorder;
 use crate::trace::{PrestateAccount, Trace, TraceRecorder, Tracer};
 use crate::tx::{AccessListItem, Fees, TxRequest, TYPE_DYNAMIC_FEE, TYPE_LEGACY, TYPE_SET_CODE};
 
@@ -292,7 +327,7 @@ pub const VIEW_CALL_GAS: u64 = 30_000_000;
 /// ([`EvmExecutor::prefetch_wave`]), leaves it none. A shallow call stops
 /// discovering as soon as a pass finds nothing new, so the higher cap costs it
 /// nothing, and the answer never depends on it.
-const PREFETCH_ITERATION_CAP: usize = 12;
+pub(crate) const PREFETCH_ITERATION_CAP: usize = 12;
 
 /// Interpret a converged real run for the call path.
 fn finish_call(result: ExecutionResult) -> Result<Vec<u8>, EvmError> {
@@ -338,11 +373,11 @@ const VIEW_CALLER: Address = Address::ZERO;
 /// Executes view calls against verified state. Owns the shared cross-call caches,
 /// so repeated calls (e.g. a MetaMask number-pinned retry) reuse verified facts.
 pub struct EvmExecutor {
-    oracle: Arc<dyn SnapStateOracle>,
+    pub(crate) oracle: Arc<dyn SnapStateOracle>,
     proof_cache: Arc<dyn StateProofCache>,
     bytecode_cache: Arc<dyn BytecodeCache>,
     /// EVM runs so far (for [`Self::cost`]).
-    runs: std::sync::atomic::AtomicU64,
+    pub(crate) runs: std::sync::atomic::AtomicU64,
 }
 
 /// What the calls through one executor cost (#532): its EVM runs, and its
@@ -1008,7 +1043,7 @@ impl EvmExecutor {
         Ok(db.code_by_hash_ref(info.code_hash)?.eip7702_address())
     }
 
-    fn database_for_with(&self, ctx: &BlockContext, overrides: StateOverrides) -> OracleDatabase {
+    pub(crate) fn database_for_with(&self, ctx: &BlockContext, overrides: StateOverrides) -> OracleDatabase {
         // Every caller has already refused a context without a spec; a failure
         // here would only mean "no history contract", which the header walk
         // covers.
@@ -1076,6 +1111,7 @@ impl EvmExecutor {
                 code_needed,
                 access_list: recorders.access_list,
                 trace: recorders.trace,
+                sim: None,
             });
 
         let result = evm.inspect_tx(tx);
@@ -1189,7 +1225,25 @@ impl EvmExecutor {
             }
         }
         let _ = db.take_access_set(); // the prime is not part of any snapshot
+        self.converge_runs(db, ctx, cap, |code_needed| {
+            self.execute_recording(db, spec, tx, gas_limit, ctx, code_needed, recorders)
+        })
+    }
 
+    /// The prefetch convergence loop over any run: `run` makes one pass
+    /// against `db` (with `code_needed` on a discovery pass, `None` on a real
+    /// one) and the loop drives the sentinel passes, the waves and the real
+    /// runs exactly as [`Self::converge`] documents. A run is one
+    /// transaction for a call, and a whole simulation for
+    /// [`Self::simulate`](crate::simulate): either way every read goes
+    /// through `db`, so its access set is the run's.
+    pub(crate) fn converge_runs<T>(
+        &self,
+        db: &OracleDatabase,
+        ctx: &BlockContext,
+        cap: usize,
+        mut run: impl FnMut(Option<&CodeNeeded>) -> Result<T, EvmError>,
+    ) -> Result<T, EvmError> {
         let mut seen = AccessSet::default();
         let mut discovering = true;
         for iter in 0..cap {
@@ -1204,8 +1258,7 @@ impl EvmExecutor {
             db.set_sentinel(sentinel);
             let misses_before = db.sentinel_misses();
             let code_needed = CodeNeeded::default();
-            let outcome =
-                self.execute_recording(db, spec, tx, gas_limit, ctx, sentinel.then_some(&code_needed), recorders);
+            let outcome = run(sentinel.then_some(&code_needed));
             db.set_sentinel(false);
             let fresh = db.take_access_set().minus(&seen);
 
@@ -1262,7 +1315,7 @@ impl EvmExecutor {
     /// oracle; no-op on fixtures). What the caches already hold is left out, and
     /// a wave left with nothing is not made: a warm call makes none (#532
     /// review).
-    fn prefetch_wave(&self, ctx: &BlockContext, fresh: &AccessSet, code_needed: &std::collections::HashSet<[u8; 20]>) {
+    pub(crate) fn prefetch_wave(&self, ctx: &BlockContext, fresh: &AccessSet, code_needed: &std::collections::HashSet<[u8; 20]>) {
         let root = &ctx.state_root;
         let batch = |accounts: &[([u8; 20], Vec<U256>)], code_hashes: &[[u8; 32]]| {
             if !accounts.is_empty() || !code_hashes.is_empty() {
@@ -1355,7 +1408,7 @@ fn before_the_run(gas_limit: u64, error: EvmError) -> EvmError {
 /// Amsterdam block this build's fork table does not know about, refused the
 /// same way ([`EvmError::UnexpectedSlotNumber`]) rather than run under the
 /// older fork's rules.
-fn spec_for_context(ctx: &BlockContext) -> Result<SpecId, EvmError> {
+pub(crate) fn spec_for_context(ctx: &BlockContext) -> Result<SpecId, EvmError> {
     let spec = spec_for(ctx.chain_id, ctx.block_number, ctx.timestamp)?;
     let amsterdam = spec.is_enabled_in(SpecId::AMSTERDAM);
     if amsterdam && ctx.slot_number.is_none() {
@@ -1383,7 +1436,7 @@ fn spec_for_context(ctx: &BlockContext) -> Result<SpecId, EvmError> {
 /// revm). The explicit assignment restates that derivation so a revm bump that
 /// stopped making it can't silently price Amsterdam with Osaka's gas model;
 /// `amsterdam_gas_model_is_enabled_only_for_amsterdam` pins the result.
-fn view_cfg(spec: SpecId, chain_id: u64) -> CfgEnv {
+pub(crate) fn view_cfg(spec: SpecId, chain_id: u64) -> CfgEnv {
     let mut cfg = CfgEnv::new_with_spec(spec);
     cfg.chain_id = chain_id;
     let amsterdam = spec.is_enabled_in(SpecId::AMSTERDAM);
@@ -1409,7 +1462,7 @@ fn view_cfg(spec: SpecId, chain_id: u64) -> CfgEnv {
 /// different transaction (a dummy authorization for an empty type-4 list, a call
 /// to the zero address for a type-4 creation) — the silently-wrong answer
 /// [`TxRequest::validate`] refuses before we get here.
-fn tx_env(tx: &TxRequest, gas_limit: u64, chain_id: u64) -> Result<TxEnv, EvmError> {
+pub(crate) fn tx_env(tx: &TxRequest, gas_limit: u64, chain_id: u64) -> Result<TxEnv, EvmError> {
     let ty = tx.tx_type();
     // geth's pricing: a legacy `gasPrice` is both the fee cap and the tip, and a
     // missing dynamic-fee field is zero. revm reads `gas_price` as THE price below
@@ -1477,7 +1530,7 @@ fn tx_env(tx: &TxRequest, gas_limit: u64, chain_id: u64) -> Result<TxEnv, EvmErr
 /// before any state is read: the object must describe a transaction that could
 /// exist ([`TxRequest::validate`]), for this node's chain, of a type the
 /// block's fork knows.
-fn check_tx(tx: &TxRequest, ctx: &BlockContext, spec: SpecId) -> Result<(), EvmError> {
+pub(crate) fn check_tx(tx: &TxRequest, ctx: &BlockContext, spec: SpecId) -> Result<(), EvmError> {
     tx.validate().map_err(|detail| EvmError::InvalidRequest { detail })?;
     if let Some(chain_id) = tx.chain_id {
         if chain_id != U256::from(ctx.chain_id) {
@@ -1553,7 +1606,7 @@ fn with_sender_nonce(mut overrides: StateOverrides, tx: &TxRequest) -> Result<St
     Ok(overrides)
 }
 
-fn output_bytes(output: Output) -> Vec<u8> {
+pub(crate) fn output_bytes(output: Output) -> Vec<u8> {
     output.into_data().to_vec()
 }
 
@@ -1577,7 +1630,7 @@ fn map_halt(reason: HaltReason) -> EvmError {
 /// Map revm's top-level error into [`EvmError`]. A `Database` error is our
 /// [`OracleError`] (state couldn't be fetched/verified); a `Transaction` error is
 /// an envelope rejection we surface rather than swallow.
-fn map_evm_error<E: DBErrorMarker + Into<EvmError> + std::fmt::Display>(
+pub(crate) fn map_evm_error<E: DBErrorMarker + Into<EvmError> + std::fmt::Display>(
     err: revm::context::result::EVMError<E>,
 ) -> EvmError {
     use revm::context::result::EVMError;
@@ -1652,7 +1705,7 @@ mod tests {
     #[test]
     fn cancelled_instruction_sets_stop_without_running_bytecode() {
         let mut interpreter = Interpreter::default_ext();
-        RequestInspector { oracle: &CancelledOracle, code_needed: None, access_list: None, trace: None }
+        RequestInspector { oracle: &CancelledOracle, code_needed: None, access_list: None, trace: None, sim: None }
             .step(&mut interpreter, &mut Context::mainnet());
         assert!(interpreter.bytecode.action().is_some());
     }

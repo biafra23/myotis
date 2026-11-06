@@ -2435,6 +2435,212 @@ pub fn debug_trace_call_json(
     }
 }
 
+/// `eth_simulateV1` (ABI ≥ 55, #716): the blocks of calls `opts_json` (geth's
+/// `simOpts`: `blockStateCalls`, `traceTransfers`, `validation`,
+/// `returnFullTransactions`) simulated on top of `block` ([`parse_sim_opts`]).
+/// The request is applied whole or refused with the permanent
+/// `{"error","code":-32602}`, before the handle is consulted. Otherwise
+/// [`eljson::simulate_json`]: the blocks, geth's own simulation error with its
+/// code, or a retryable `unavailable`.
+pub fn simulate_v1_json(handle: i64, opts_json: &str, block: &str) -> String {
+    let (opts, full_transactions) = match parse_sim_opts(opts_json) {
+        Ok(parsed) => parsed,
+        Err(msg) => return eljson::invalid_params_json(&msg),
+    };
+    let selector = match parse_read_block(block) {
+        Ok(selector) => selector,
+        Err(json) => return json,
+    };
+    let Some(engine) = engine() else {
+        return eljson::error_json("engine unavailable");
+    };
+    let (reader, chain_id) = match snapshot_reader_evm(engine, handle) {
+        Ok(snap) => snap,
+        Err(msg) => return eljson::error_json(msg),
+    };
+    let (anchor, expected) = match simulation_anchor(selector, &reader) {
+        Ok(anchor) => anchor,
+        Err(json) => return json,
+    };
+    match engine.rt.block_on(async { reader.simulate(anchor, expected, opts, chain_id).await }) {
+        Ok(answer) => eljson::simulate_json(&answer, full_transactions),
+        Err(e) => eljson::error_json(&e),
+    }
+}
+
+/// The block a simulation starts from: exactly the one the selector names. A
+/// tag is the verified head or the finalized block; a number must be one of
+/// them, and is handed on so the reader checks the header it runs on is that
+/// block. Unlike an `eth_call` ([`read_anchor`]), a number near the head is
+/// not served from the head: a simulation's answer is built on its base —
+/// the blocks' numbers and timestamps, the first `parentHash`, `BLOCKHASH`
+/// and the base fee under `validation` — so another block would answer
+/// another request. A number behind both is refused for good (that block's
+/// state is not held); one ahead of the head is retryable.
+fn simulation_anchor(selector: BlockSelector, reader: &ElReader) -> Result<(ReadAnchor, Option<u64>), String> {
+    match selector {
+        BlockSelector::Head => Ok((ReadAnchor::Head, None)),
+        BlockSelector::Finalized => Ok((ReadAnchor::Finalized, None)),
+        BlockSelector::Number(block) => {
+            let head = reader.optimistic_block_number();
+            if head == 0 {
+                return Err(CallBlockRefusal::NoHead { block }.to_json());
+            }
+            if block == head {
+                return Ok((ReadAnchor::Head, Some(block)));
+            }
+            if block == reader.finalized_block_number() {
+                return Ok((ReadAnchor::Finalized, Some(block)));
+            }
+            if block > head {
+                return Err(eljson::error_json(&format!(
+                    "block {block:#x} ({block}) is ahead of the verified head ({head})"
+                )));
+            }
+            Err(eljson::invalid_params_json(&format!(
+                "eth_simulateV1 starts from exactly the block it names, and block {block:#x} ({block}) is \
+                 neither the verified head ({head}) nor the finalized block, whose state this node holds; \
+                 ask for 'latest' or 'finalized'"
+            )))
+        }
+    }
+}
+
+/// Parse an `eth_simulateV1` request object (geth's `simOpts`) into the
+/// executor's [`myotis_evm::simulate::SimOptions`] and whether the answer
+/// carries full transactions. Pure and unit-tested. Applied or refused, never
+/// ignored: an unknown key — of the request, of a block, of a block override,
+/// of an account override or of a withdrawal — is refused (geth refuses the
+/// override ones), as are a malformed value, a call no transaction could be
+/// ([`myotis_evm::TxRequest::validate`]), and a state override geth itself
+/// refuses (`state` with `stateDiff`) or this node cannot apply
+/// (`movePrecompileToAddress`). `null` reads as absent.
+fn parse_sim_opts(json: &str) -> Result<(myotis_evm::simulate::SimOptions, bool), String> {
+    use myotis_evm::simulate::{BlockOverrides, SimBlock, SimOptions, Withdrawal};
+    let value: serde_json::Value =
+        serde_json::from_str(json.trim()).map_err(|e| format!("invalid simulation request: {e}"))?;
+    let obj = value.as_object().ok_or("invalid simulation request: expected an object")?;
+    let present = |o: &'_ serde_json::Map<String, serde_json::Value>, k: &str| {
+        o.get(k).filter(|v| !v.is_null()).cloned()
+    };
+    let flag = |k: &str| -> Result<bool, String> {
+        match present(obj, k) {
+            None => Ok(false),
+            Some(serde_json::Value::Bool(b)) => Ok(b),
+            Some(_) => Err(format!("invalid simulation request: '{k}' must be a boolean")),
+        }
+    };
+    for key in obj.keys() {
+        if !["blockStateCalls", "traceTransfers", "validation", "returnFullTransactions"].contains(&key.as_str()) {
+            return Err(format!("invalid simulation request: '{key}' is not applied by this node"));
+        }
+    }
+    let quantity = |k: &str, v: &serde_json::Value| parse_quantity(k, v);
+    let u64_of = |k: &str, v: &serde_json::Value| -> Result<u64, String> {
+        u64::try_from(quantity(k, v)?).map_err(|_| format!("'{k}' does not fit 64 bits"))
+    };
+    let word = |k: &str, v: &serde_json::Value| -> Result<[u8; 32], String> {
+        v.as_str().and_then(parse_word32).ok_or(format!("'{k}' is not a 32-byte hex value"))
+    };
+    let address = |k: &str, v: &serde_json::Value| -> Result<[u8; 20], String> {
+        v.as_str().and_then(parse_address).ok_or(format!("'{k}' is not a 20-byte hex address"))
+    };
+    let blocks_value = present(obj, "blockStateCalls").ok_or("invalid simulation request: 'blockStateCalls' is required")?;
+    let list = blocks_value.as_array().ok_or("invalid simulation request: 'blockStateCalls' must be an array")?;
+    let mut blocks = Vec::with_capacity(list.len());
+    for (i, entry) in list.iter().enumerate() {
+        let block = entry.as_object().ok_or(format!("block {i}: expected an object"))?;
+        for key in block.keys() {
+            if !["blockOverrides", "stateOverrides", "calls"].contains(&key.as_str()) {
+                return Err(format!("block {i}: '{key}' is not applied by this node"));
+            }
+        }
+        let mut overrides = BlockOverrides::default();
+        if let Some(ov) = present(block, "blockOverrides") {
+            let ov = ov.as_object().ok_or(format!("block {i}: 'blockOverrides' must be an object"))?;
+            for (k, v) in ov {
+                if v.is_null() {
+                    continue;
+                }
+                let at = |e: String| format!("block {i}: {e}");
+                match k.as_str() {
+                    "number" => overrides.number = Some(quantity(k, v).map_err(at)?),
+                    "difficulty" => overrides.difficulty = Some(quantity(k, v).map_err(at)?),
+                    "time" => overrides.time = Some(u64_of(k, v).map_err(at)?),
+                    "gasLimit" => overrides.gas_limit = Some(u64_of(k, v).map_err(at)?),
+                    "feeRecipient" => overrides.fee_recipient = Some(address(k, v).map_err(at)?),
+                    "prevRandao" => overrides.prev_randao = Some(word(k, v).map_err(at)?),
+                    "baseFeePerGas" => overrides.base_fee_per_gas = Some(quantity(k, v).map_err(at)?),
+                    "blobBaseFee" => overrides.blob_base_fee = Some(quantity(k, v).map_err(at)?),
+                    "beaconRoot" => overrides.beacon_root = Some(word(k, v).map_err(at)?),
+                    "withdrawals" => {
+                        let items = v.as_array().ok_or(at("'withdrawals' must be an array".into()))?;
+                        let mut withdrawals = Vec::with_capacity(items.len());
+                        for item in items {
+                            let w = item.as_object().ok_or(at("a withdrawal must be an object".into()))?;
+                            for key in w.keys() {
+                                if !["index", "validatorIndex", "address", "amount"].contains(&key.as_str()) {
+                                    return Err(at(format!("unknown field \"{key}\" in withdrawal")));
+                                }
+                            }
+                            let field = |name: &str| w.get(name).ok_or(at(format!("a withdrawal needs '{name}'")));
+                            withdrawals.push(Withdrawal {
+                                index: u64_of("index", field("index")?).map_err(at)?,
+                                validator_index: u64_of("validatorIndex", field("validatorIndex")?).map_err(at)?,
+                                address: address("address", field("address")?).map_err(at)?,
+                                amount: u64_of("amount", field("amount")?).map_err(at)?,
+                            });
+                        }
+                        overrides.withdrawals = Some(withdrawals);
+                    }
+                    other => return Err(at(format!("unknown field \"{other}\" in block override"))),
+                }
+            }
+        }
+        let state_overrides = match present(block, "stateOverrides") {
+            None => myotis_evm::overrides::StateOverrides::new(),
+            Some(v) => {
+                if let Some(accounts) = v.as_object() {
+                    for (addr, account) in accounts {
+                        let set = |k: &str| account.get(k).is_some_and(|v| !v.is_null());
+                        if set("movePrecompileToAddress") {
+                            return Err(format!(
+                                "block {i}: 'movePrecompileToAddress' (for {addr}) is not applied by this node"
+                            ));
+                        }
+                        if set("state") && set("stateDiff") {
+                            return Err(format!("block {i}: account {addr} has both 'state' and 'stateDiff'"));
+                        }
+                    }
+                }
+                // A null field reads as absent, as everywhere in the request.
+                let mut cleaned = v.clone();
+                if let Some(accounts) = cleaned.as_object_mut() {
+                    for account in accounts.values_mut() {
+                        if let Some(fields) = account.as_object_mut() {
+                            fields.retain(|_, value| !value.is_null());
+                        }
+                    }
+                }
+                parse_state_overrides(&cleaned.to_string()).map_err(|e| format!("block {i}: {e}"))?
+            }
+        };
+        let mut calls = Vec::new();
+        if let Some(v) = present(block, "calls") {
+            let items = v.as_array().ok_or(format!("block {i}: 'calls' must be an array"))?;
+            for (j, call) in items.iter().enumerate() {
+                let tx = parse_tx_request(&call.to_string())
+                    .map_err(|e| format!("block {i}, call {j}: invalid transaction object: {e}"))?;
+                tx.validate().map_err(|e| format!("block {i}, call {j}: invalid transaction object: {e}"))?;
+                calls.push(tx);
+            }
+        }
+        blocks.push(SimBlock { block_overrides: overrides, state_overrides, calls });
+    }
+    let opts = SimOptions { blocks, trace_transfers: flag("traceTransfers")?, validation: flag("validation")? };
+    Ok((opts, flag("returnFullTransactions")?))
+}
+
 /// The tracer a `debug_traceCall` asks for: `tracer` names geth's
 /// `callTracer` (options `onlyTopCall`, `withLog`) or `prestateTracer`
 /// (options `disableCode`, `disableStorage`, `includeEmpty`), and
@@ -6683,6 +6889,261 @@ mod trace_config_tests {
         ] {
             let err = parse_tracer(config).unwrap_err();
             assert!(err.contains(says), "{config}: {err}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod simulate_tests {
+    use super::*;
+    use myotis_evm::cache::{NoopBytecodeCache, NoopStateProofCache};
+    use myotis_evm::oracle::FixtureSnapStateOracle;
+    use myotis_evm::simulate::SimBase;
+    use std::sync::Arc;
+
+    fn golden() -> serde_json::Value {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../testdata/evm/simulateV1-golden.json");
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn quantity(v: &serde_json::Value) -> u64 {
+        u64::from_str_radix(v.as_str().unwrap().trim_start_matches("0x"), 16).unwrap()
+    }
+
+    fn word(v: &serde_json::Value) -> [u8; 32] {
+        parse_word32(v.as_str().unwrap()).unwrap()
+    }
+
+    /// Strip what this node does not compute from one of geth's values and
+    /// check ours has `null` there: a log's or transaction's `blockHash`.
+    fn without_block_hash(mut value: serde_json::Value, ours: bool) -> serde_json::Value {
+        if let Some(obj) = value.as_object_mut() {
+            if let Some(hash) = obj.remove("blockHash") {
+                assert!(!ours || hash.is_null(), "a simulated block's hash is unknown here");
+            }
+        }
+        value
+    }
+
+    /// The recorded requests against a full node's answers (geth v1.16.7;
+    /// `rust/testdata/evm/README.md`): every field this node computes equals
+    /// geth's — each call's return data, logs, gas, status and error, each
+    /// block's header fields, transaction hashes and objects, roots and
+    /// bloom, the base fee under `validation` — and every field it does not
+    /// compute is null where geth has a value. Five differences with geth
+    /// v1.16.7 are named where they apply: four follow geth master, one
+    /// leaves out a chain id geth miscomputes.
+    #[test]
+    fn simulate_matches_a_full_nodes_answer() {
+        let golden = golden();
+        let base = &golden["base"];
+        let ctx = myotis_evm::BlockContext {
+            state_root: word(&base["stateRoot"]),
+            block_number: quantity(&base["number"]),
+            parent_hash: Some(word(&base["parentHash"])),
+            timestamp: quantity(&base["timestamp"]),
+            base_fee_per_gas: quantity(&base["baseFeePerGas"]),
+            coinbase: parse_address(base["miner"].as_str().unwrap()).unwrap(),
+            prev_randao: word(&base["mixHash"]),
+            chain_id: 1,
+            gas_limit: quantity(&base["gasLimit"]),
+            slot_number: None,
+        };
+        let sim_base = SimBase { ctx, hash: word(&base["hash"]), gas_used: quantity(&base["gasUsed"]) };
+        // The accounts the runs touch that hold a balance on mainnet (no code,
+        // no nonce); every other one is absent there.
+        let mut world = FixtureSnapStateOracle::new();
+        for (address, account) in golden["accounts"].as_object().unwrap() {
+            let balance = U256::from_str_radix(account["balance"].as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+            world = world.with_account(
+                sim_base.ctx.state_root,
+                parse_address(address).unwrap(),
+                myotis_evm::oracle::OracleAccount {
+                    nonce: 0,
+                    balance,
+                    code_hash: myotis_core::trie::EMPTY_CODE_HASH,
+                    storage_root: myotis_core::trie::EMPTY_TRIE_ROOT,
+                },
+            );
+        }
+        let executor =
+            myotis_evm::EvmExecutor::new(Arc::new(world), Arc::new(NoopStateProofCache), Arc::new(NoopBytecodeCache));
+        for case in golden["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let (opts, full) = parse_sim_opts(&case["request"][0].to_string()).unwrap();
+            let blocks = executor.simulate(&sim_base, &opts).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let ours: Vec<serde_json::Value> =
+                blocks.iter().map(|b| eljson::simulated_block_value(b, full)).collect();
+            let mut theirs = case["response"].as_array().unwrap().clone();
+            // Difference 1: geth v1.16.7's simulate tracer keeps the log
+            // indices of a frame that reverted taken. geth master frees them
+            // (`internal/ethapi/logtracer.go`, `t.count -= len(call)`), as a
+            // receipt's own indices are freed (the StateDB journal rolls
+            // `logSize` back), and this node follows master: the log after the
+            // inner call that reverted with two logs (the P → Q transfer and
+            // Q's LOG0) is two lower.
+            if name == "blocks, logs and transfers" {
+                let after_revert = &mut theirs[0]["calls"][5]["logs"][1]["logIndex"];
+                assert_eq!(after_revert, "0x5", "the recorded index after the reverted frame");
+                *after_revert = "0x3".into();
+            }
+            // Difference 4: geth v1.16.7 codes a reverted call's error -32000
+            // (`errCodeReverted`); master codes it as `eth_call` codes a revert
+            // (`revertError.ErrorCode()`, 3), and so does this node.
+            for block in theirs.iter_mut() {
+                for call in block["calls"].as_array_mut().unwrap() {
+                    if call["error"]["message"].as_str().is_some_and(|m| m.starts_with("execution reverted")) {
+                        assert_eq!(call["error"]["code"], -32000, "{name}: v1.16.7's revert code");
+                        call["error"]["code"] = 3.into();
+                    }
+                }
+            }
+            // Difference 2: geth derives a legacy transaction's chain id from
+            // its `v`, which is 0 for a simulated one, and its derivation
+            // underflows to 0x7fffffffffffffee. This node names no chain id
+            // for an unprotected legacy transaction, as `v` = 0 says.
+            for block in theirs.iter_mut() {
+                for tx in block["transactions"].as_array_mut().unwrap() {
+                    if tx.get("type").is_some_and(|t| t == "0x0") {
+                        let chain_id = tx.as_object_mut().unwrap().remove("chainId");
+                        assert_eq!(chain_id, Some("0x7fffffffffffffee".into()), "{name}: geth's legacy chainId");
+                    }
+                }
+            }
+            assert_eq!(ours.len(), theirs.len(), "{name}");
+            let unknown = ["hash", "stateRoot", "excessBlobGas", "requestsHash", "size"];
+            for (i, (mine, geth)) in ours.iter().zip(&theirs).enumerate() {
+                let (mine, geth) = (mine.as_object().unwrap(), geth.as_object().unwrap());
+                let mut keys: Vec<_> = geth.keys().collect();
+                keys.sort();
+                let mut my_keys: Vec<_> = mine.keys().collect();
+                my_keys.sort();
+                assert_eq!(my_keys, keys, "{name}, block {i}: the same fields as geth's");
+                for key in keys {
+                    if unknown.contains(&key.as_str()) || (key == "parentHash" && i > 0) {
+                        assert!(mine[key].is_null(), "{name}, block {i}: {key} is unknown here");
+                        continue;
+                    }
+                    match key.as_str() {
+                        "calls" => {
+                            let (m, g) = (mine[key].as_array().unwrap(), geth[key].as_array().unwrap());
+                            assert_eq!(m.len(), g.len(), "{name}, block {i}: calls");
+                            for (j, (m, g)) in m.iter().zip(g).enumerate() {
+                                // Difference 3: geth v1.16.7 predates `maxUsedGas`
+                                // (master's `simCallResult` has it). No run here
+                                // earns a refund, so it is the gas used.
+                                assert_eq!(m["maxUsedGas"], m["gasUsed"], "{name}, block {i}, call {j}: maxUsedGas");
+                                let strip = |call: &serde_json::Value, ours: bool| {
+                                    let mut call = call.clone();
+                                    if ours && g.get("maxUsedGas").is_none() {
+                                        call.as_object_mut().unwrap().remove("maxUsedGas");
+                                    }
+                                    let logs: Vec<_> = call["logs"]
+                                        .as_array()
+                                        .unwrap()
+                                        .iter()
+                                        .map(|log| without_block_hash(log.clone(), ours))
+                                        .collect();
+                                    call["logs"] = logs.into();
+                                    call
+                                };
+                                assert_eq!(strip(m, true), strip(g, false), "{name}, block {i}, call {j}");
+                            }
+                        }
+                        "transactions" if full => {
+                            let (m, g) = (mine[key].as_array().unwrap(), geth[key].as_array().unwrap());
+                            assert_eq!(m.len(), g.len(), "{name}, block {i}: transactions");
+                            for (j, (m, g)) in m.iter().zip(g).enumerate() {
+                                // Difference 5: geth v1.16.7's transaction
+                                // objects predate `blockTimestamp` (master's
+                                // `RPCTransaction` has it).
+                                let mut m = m.clone();
+                                assert_eq!(m["blockTimestamp"], mine["timestamp"]);
+                                if g.get("blockTimestamp").is_none() {
+                                    m.as_object_mut().unwrap().remove("blockTimestamp");
+                                }
+                                assert_eq!(
+                                    without_block_hash(m, true),
+                                    without_block_hash(g.clone(), false),
+                                    "{name}, block {i}, transaction {j}"
+                                );
+                            }
+                        }
+                        _ => assert_eq!(mine[key], geth[key], "{name}, block {i}: {key}"),
+                    }
+                }
+            }
+        }
+    }
+
+    fn opts(json: &str) -> Result<(myotis_evm::simulate::SimOptions, bool), String> {
+        parse_sim_opts(json)
+    }
+
+    #[test]
+    fn the_request_is_read_whole() {
+        let (parsed, full) = opts(
+            r#"{"blockStateCalls":[{"blockOverrides":{"number":"0x10","time":"0x20","gasLimit":"0x30",
+                "feeRecipient":"0x4242424242424242424242424242424242424242","baseFeePerGas":"0x7",
+                "blobBaseFee":"0x8","prevRandao":"0x0000000000000000000000000000000000000000000000000000000000000009",
+                "beaconRoot":"0x000000000000000000000000000000000000000000000000000000000000000a",
+                "withdrawals":[{"index":"0x1","validatorIndex":"0x2","address":"0x4242424242424242424242424242424242424242","amount":"0x3"}]},
+              "stateOverrides":{"0x1111111111111111111111111111111111111111":{"balance":"0x1"}},
+              "calls":[{"from":"0x1111111111111111111111111111111111111111","to":"0x2222222222222222222222222222222222222222","value":"0x1"}]},
+              {"calls":null}],
+              "traceTransfers":true,"validation":true,"returnFullTransactions":true}"#,
+        )
+        .unwrap();
+        assert!(full && parsed.trace_transfers && parsed.validation);
+        assert_eq!(parsed.blocks.len(), 2);
+        let ov = &parsed.blocks[0].block_overrides;
+        assert_eq!(ov.number, Some(U256::from(0x10)));
+        assert_eq!((ov.time, ov.gas_limit), (Some(0x20), Some(0x30)));
+        assert_eq!(ov.base_fee_per_gas, Some(U256::from(7)));
+        assert_eq!(ov.blob_base_fee, Some(U256::from(8)));
+        assert_eq!(ov.prev_randao.unwrap()[31], 9);
+        assert_eq!(ov.beacon_root.unwrap()[31], 10);
+        assert_eq!(ov.withdrawals.as_ref().unwrap()[0].amount, 3);
+        assert_eq!(parsed.blocks[0].state_overrides.len(), 1);
+        assert_eq!(parsed.blocks[0].calls[0].value, U256::from(1));
+        assert!(parsed.blocks[1].calls.is_empty());
+        // A null field is an absent one, `state` and `stateDiff` included.
+        let (nulls, _) = opts(
+            r#"{"blockStateCalls":[{"stateOverrides":{"0x1111111111111111111111111111111111111111":{"state":null,"stateDiff":{},"movePrecompileToAddress":null}}}],"validation":null}"#,
+        )
+        .unwrap();
+        assert!(!nulls.validation);
+        assert_eq!(nulls.blocks[0].state_overrides.len(), 1);
+    }
+
+    #[test]
+    fn what_is_not_applied_is_refused() {
+        for (json, says) in [
+            (r#"[]"#, "expected an object"),
+            (r#"{}"#, "'blockStateCalls' is required"),
+            (r#"{"blockStateCalls":[],"returnTrace":true}"#, "'returnTrace' is not applied"),
+            (r#"{"blockStateCalls":[],"validation":"yes"}"#, "must be a boolean"),
+            (r#"{"blockStateCalls":[{"calls":[],"extra":1}]}"#, "'extra' is not applied"),
+            (r#"{"blockStateCalls":[{"blockOverrides":{"slot":"0x1"}}]}"#, "unknown field \"slot\" in block override"),
+            (r#"{"blockStateCalls":[{"blockOverrides":{"time":"12"}}]}"#, "0x-hex quantity"),
+            (r#"{"blockStateCalls":[{"blockOverrides":{"withdrawals":[{"index":"0x1"}]}}]}"#, "needs 'validatorIndex'"),
+            (
+                r#"{"blockStateCalls":[{"stateOverrides":{"0x0000000000000000000000000000000000000001":{"movePrecompileToAddress":"0x1111111111111111111111111111111111111111"}}}]}"#,
+                "movePrecompileToAddress",
+            ),
+            (
+                r#"{"blockStateCalls":[{"stateOverrides":{"0x1111111111111111111111111111111111111111":{"state":{},"stateDiff":{}}}}]}"#,
+                "has both 'state' and 'stateDiff'",
+            ),
+            (
+                r#"{"blockStateCalls":[{"stateOverrides":{"0x1111111111111111111111111111111111111111":{"state":{},"stateDiff":{"0x0000000000000000000000000000000000000000000000000000000000000001":"0x0000000000000000000000000000000000000000000000000000000000000001"}}}}]}"#,
+                "has both 'state' and 'stateDiff'",
+            ),
+            (r#"{"blockStateCalls":[{"calls":[{"to":7}]}]}"#, "block 0, call 0: invalid transaction object"),
+            (r#"{"blockStateCalls":[{"calls":[{"type":"0x3"}]}]}"#, "blob transactions"),
+        ] {
+            let error = opts(json).unwrap_err();
+            assert!(error.contains(says), "{json} → {error}");
         }
     }
 }

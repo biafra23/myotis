@@ -167,6 +167,18 @@ class VerifiedReadsBackend(private val v: io.myotis.api.VerifiedReads) : RpcBack
         }
     }
 
+    override fun supportsSimulation(): Boolean = v.supportsSimulation()
+
+    override fun simulateV1(optsJson: String, block: String): RpcSimulateResult {
+        val r = v.simulateV1(optsJson, block)
+        return when (r.status()!!) {
+            io.myotis.api.SimulateResult.Status.OK -> RpcSimulateResult.ok(r.resultJson())
+            io.myotis.api.SimulateResult.Status.FAILED -> RpcSimulateResult.failed(r.code(), r.detail())
+            io.myotis.api.SimulateResult.Status.UNAVAILABLE -> RpcSimulateResult.unavailable(r.detail())
+            io.myotis.api.SimulateResult.Status.REFUSED -> RpcSimulateResult.refused(r.detail())
+        }
+    }
+
     override fun supportsProofs(): Boolean = v.supportsProofs()
 
     override fun getProof(address: ByteArray, storageKeysJson: String, block: String): String? =

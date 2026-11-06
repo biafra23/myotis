@@ -387,7 +387,14 @@ uniffi::setup_scaffolding!();
 ///      `prestateTracer`, as `{"status":"ok","trace":…}`. An additive function
 ///      — bumped so a host that serves `debug_traceCall` is never paired with
 ///      an engine that lacks it.
-pub const ABI_VERSION: i32 = 54;
+/// v55: `eth_simulateV1` (#716). `simulate_v1_json` (UniFFI and the C ABI:
+///      `myotis_simulate_v1_json`): blocks of calls simulated on top of a
+///      verified block, as geth simulates them, as
+///      `{"status":"ok","result":[…]}` with geth's `result`, or geth's own
+///      simulation error as `{"status":"failed","code","message"}`. An
+///      additive function — bumped so a host that serves `eth_simulateV1` is
+///      never paired with an engine that lacks it.
+pub const ABI_VERSION: i32 = 55;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

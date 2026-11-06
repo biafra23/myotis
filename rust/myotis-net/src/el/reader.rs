@@ -41,7 +41,7 @@ use crate::el::eth::session::EthConfig;
 use crate::el::feecache::{BlockRewards, BlockTips, FeeCache, Head, HistoryShape, Lookup};
 use crate::el::evm::{
     block_context, ReadAnchor, AccessListAnswer, AccessListOutcome, CallAnswer, CallOutcome, EnsOutcome, EnsQuery, EnsQueryOutcome,
-    EnsRecordValue, EnsRootMode, GasOutcome, PoolOracle, TraceAnswer, TraceOutcome,
+    EnsRecordValue, EnsRootMode, GasOutcome, PoolOracle, SimulateAnswer, SimulateOutcome, TraceAnswer, TraceOutcome,
 };
 use crate::el::peer::{Coverage, ManagedPeer};
 use crate::el::pool::{Enode, PeerPool, PoolConfig};
@@ -7259,6 +7259,58 @@ impl ElReader {
         })
     }
 
+    /// `eth_simulateV1` (#716): `opts`' blocks of calls on top of the
+    /// verified block `anchor` names, run by [`EvmExecutor::simulate`] over a
+    /// fresh snap-peer snapshot — the reads proven against that block's state
+    /// root, as for an `eth_call`. The executor's outcome rides in the answer;
+    /// `Err` is a setup failure (no verified header, no snap peer).
+    ///
+    /// `expected` is the block number the caller named, if it named one: the
+    /// simulation runs on exactly that block or not at all (the head may have
+    /// moved on since the caller looked — `Err`, which a retry with a fresh
+    /// number clears).
+    pub async fn simulate(
+        &self,
+        anchor: ReadAnchor,
+        expected: Option<u64>,
+        opts: myotis_evm::simulate::SimOptions,
+        chain_id: u64,
+    ) -> Result<SimulateAnswer, String> {
+        self.request(self.simulate_inner(anchor, expected, opts, chain_id)).await
+    }
+
+    async fn simulate_inner(
+        &self,
+        anchor: ReadAnchor,
+        expected: Option<u64>,
+        opts: myotis_evm::simulate::SimOptions,
+        chain_id: u64,
+    ) -> Result<SimulateAnswer, String> {
+        let started = Instant::now();
+        let (hash, header, ctx, executor) = self.evm_setup_header_at(anchor, chain_id, "simulateV1").await?;
+        if let Some(block) = expected.filter(|block| *block != header.number) {
+            return Err(format!(
+                "block {block} is no longer the block eth_simulateV1 was asked to start from (the verified \
+                 block is now {}); ask again",
+                header.number
+            ));
+        }
+        let setup = started.elapsed();
+        let block_number = ctx.block_number;
+        let base = myotis_evm::simulate::SimBase { ctx, hash, gas_used: header.gas_used };
+        let joined = super::request::blocking(move || {
+            let joined = executor.simulate(&base, &opts);
+            log_call_cost("eth_simulateV1", false, setup, started.elapsed(), &executor.cost(), joined.as_ref().err());
+            joined
+        })
+        .await?;
+        Ok(SimulateAnswer {
+            outcome: SimulateOutcome::from_executor(joined),
+            block_number,
+            finalized: anchor == ReadAnchor::Finalized,
+        })
+    }
+
     /// Verified ENS forward resolution: `name` → its address record, resolved
     /// entirely over verified `eth_call`s against the current head (the registry
     /// resolver-walk + `addr`/ENSIP-10 `resolve` in `myotis_evm::ens`). Runs the
@@ -7468,6 +7520,24 @@ impl ElReader {
         }
     }
 
+    /// [`Self::evm_setup_at`], with the verified header the context came from
+    /// and its hash: what a simulation needs beyond a call (its `parentHash`,
+    /// `BLOCKHASH` of it, its gas used).
+    async fn evm_setup_header_at(
+        &self,
+        anchor: ReadAnchor,
+        chain_id: u64,
+        what: &str,
+    ) -> Result<([u8; 32], BlockHeader, myotis_evm::BlockContext, EvmExecutor), String> {
+        let (hash, header) = match anchor {
+            ReadAnchor::Head => self.head_header(what).await?,
+            ReadAnchor::Finalized => self.finalized_header(what).await?,
+        };
+        let ctx = block_context(&header, chain_id)?;
+        let (ctx, executor) = self.evm_executor_for(ctx, what, anchor == ReadAnchor::Finalized).await?;
+        Ok((hash, header, ctx, executor))
+    }
+
     /// [`Self::evm_setup`], anchored at the beacon-FINALIZED execution block
     /// instead of the optimistic head. The header comes over a verified window
     /// anchored at the finalized block itself (`choose_window_top`: one header,
@@ -7486,6 +7556,14 @@ impl ElReader {
         chain_id: u64,
         what: &str,
     ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
+        let (_, header) = self.finalized_header(what).await?;
+        let ctx = block_context(&header, chain_id)?;
+        self.evm_executor_for(ctx, what, true).await
+    }
+
+    /// The beacon-finalized execution block's verified header and its hash,
+    /// pinned to the finalized anchor (see [`Self::evm_setup_finalized`]).
+    async fn finalized_header(&self, what: &str) -> Result<([u8; 32], BlockHeader), String> {
         let fin = self.require_finalized_execution(what)?;
         let Some((hash, header)) = self
             .verified_header_by_number(Some(fin.block_number))
@@ -7511,8 +7589,14 @@ impl ElReader {
                 fin.block_number
             ));
         }
-        let ctx = block_context(&header, chain_id)?;
-        self.evm_executor_for(ctx, what, true).await
+        Ok((hash, header))
+    }
+
+    /// The verified head's header and its hash.
+    async fn head_header(&self, what: &str) -> Result<([u8; 32], BlockHeader), String> {
+        self.verified_header_by_number(None)
+            .await?
+            .ok_or_else(|| format!("no verified head to run {what} against"))
     }
 
     /// Shared setup for the EVM reads: a [`BlockContext`](myotis_evm::BlockContext)
@@ -7524,9 +7608,7 @@ impl ElReader {
         chain_id: u64,
         what: &str,
     ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
-        let Some((_, header)) = self.verified_header_by_number(None).await? else {
-            return Err(format!("no verified head to run {what} against"));
-        };
+        let (_, header) = self.head_header(what).await?;
         let ctx = block_context(&header, chain_id)?;
         self.evm_executor_for(ctx, what, false).await
     }
@@ -11393,24 +11475,13 @@ fn next_base_fee(h: &BlockHeader) -> u128 {
     next_base_fee_calc(header_base_fee(h), h.gas_limit, h.gas_used)
 }
 
-/// Pure EIP-1559 next-base-fee arithmetic (extracted from `next_base_fee` for unit
-/// testing). `base == 0` (pre-London) → 0.
+/// EIP-1559's next base fee ([`myotis_core::fees::next_base_fee`]) after a
+/// header with `base`: `base == 0` (pre-London) → 0.
 fn next_base_fee_calc(base: u128, gas_limit: u64, gas_used: u64) -> u128 {
     if base == 0 {
         return 0;
     }
-    let gas_target = gas_limit / 2;
-    if gas_target == 0 || gas_used == gas_target {
-        return base;
-    }
-    let target = gas_target as u128;
-    if gas_used > gas_target {
-        let delta = (base.saturating_mul((gas_used - gas_target) as u128) / target / 8).max(1);
-        base.saturating_add(delta)
-    } else {
-        let delta = base.saturating_mul((gas_target - gas_used) as u128) / target / 8;
-        base.saturating_sub(delta)
-    }
+    myotis_core::fees::next_base_fee(base, gas_limit, gas_used)
 }
 
 /// The name an [`EnsQuery`] asks about; `None` for a reverse lookup.

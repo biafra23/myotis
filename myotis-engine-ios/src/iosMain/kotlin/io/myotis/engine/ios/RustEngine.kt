@@ -46,6 +46,7 @@ import io.myotis.engine.capi.myotis_resume
 import io.myotis.engine.capi.myotis_accept_stale_anchor
 import io.myotis.engine.capi.myotis_set_network_metering
 import io.myotis.engine.capi.myotis_set_ws_bound_periods
+import io.myotis.engine.capi.myotis_simulate_v1_json
 import io.myotis.engine.capi.myotis_start
 import io.myotis.engine.capi.myotis_status_json
 import io.myotis.engine.capi.myotis_stop
@@ -324,6 +325,13 @@ object RustEngine {
      *  engine does not apply. */
     fun debugTraceCallJson(handle: Long, txJson: String, block: String, stateOverrides: String, tracerJson: String): String =
         jsonCall { myotis_debug_trace_call_json(handle, txJson, block, stateOverrides, tracerJson) }
+
+    /** `eth_simulateV1` (ABI 55, #716): `{"status":"ok","result":[…]}` (geth's result),
+     *  `{"status":"failed","code","message"}` (geth's own simulation error),
+     *  `unavailable`, or the permanent -32602 envelope for a parameter this engine
+     *  does not apply. */
+    fun simulateV1Json(handle: Long, optsJson: String, block: String): String =
+        jsonCall { myotis_simulate_v1_json(handle, optsJson, block) }
 
     fun getBlockByNumberJson(handle: Long, blockTag: String, fullTransactions: Boolean): String =
         jsonCall { myotis_get_block_by_number_json(handle, blockTag, fullTransactions) }

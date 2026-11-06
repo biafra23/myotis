@@ -104,3 +104,48 @@ Only the `callTracer` is pinned this way. The same provider's `prestateTracer`
 answers differ from current geth (no `codeHash`, no coinbase entry), so that
 tracer follows geth's source (`eth/tracers/native/prestate.go`) and is covered by
 unit tests instead.
+
+## `simulateV1-golden.json`
+
+`eth_simulateV1` answers from a full node that identifies as geth
+(`eth.rpc.blxrbdn.com`, `Geth/v1.16.7`), the reference for this node's
+simulator (#716; `myotis-engine`'s
+`host::simulate_tests::simulate_matches_a_full_nodes_answer`). Recorded on
+2026-11-04 at a mainnet block near that node's head, because it keeps no older
+state. The file holds the base block's header, the two requests, geth's
+answers, and the balances of the accounts the runs touch (`accounts`).
+
+The calls run synthetic contracts installed by `stateOverrides` at vanity
+addresses (`0x5151…`, `0xc0c0…`). None of them has code or a nonce on mainnet,
+but several hold a balance, recorded with `eth_getBalance` at the base block.
+The replay builds a fixture world from those balances and nothing else, so the
+runs read the same state geth read.
+
+- **blocks, logs and transfers** (`traceTransfers`): storage carried from one
+  call to the next, a value transfer, a revert with an `Error(string)` reason,
+  an invalid opcode, and an inner call that reverts with its own logs. Then a
+  gap block, and a block with every header override. Its calls read the header
+  fields, pay a fee, read balances and create a contract.
+- **validation and full transactions** (`validation`,
+  `returnFullTransactions`): nonces, the base fee computed from the base
+  block's header, and legacy, EIP-1559 and EIP-7702 transactions (an
+  authorization with an invalid signature, skipped as on chain) shown as
+  objects.
+
+The test compares every field this node computes: calls, logs, gas,
+transaction hashes and objects, both roots, the bloom and the header fields.
+Every field it does not compute must be `null` there: `hash`, `stateRoot`,
+`excessBlobGas`, `requestsHash`, `size`, a later block's `parentHash`, and every
+`blockHash`. Five differences from v1.16.7 are deliberate, and the test names
+each one:
+
+1. A frame that reverted frees its log indices. That is geth master's simulate
+   tracer, and how a receipt's indices behave.
+2. `maxUsedGas` is present (geth master).
+3. A reverted call's `error.code` is 3, as for `eth_call` (geth master).
+4. A transaction object has `blockTimestamp` (geth master).
+5. A legacy transaction names no `chainId`. geth derives one from `v` = 0 and
+   underflows to `0x7fffffffffffffee`.
+
+To re-record, run the requests in the file against a geth node at a recent
+block, and update `base`, `accounts` and the responses together.

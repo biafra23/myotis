@@ -152,6 +152,27 @@ class RpcTraceResult private constructor(val kind: Kind, val traceJson: String?,
     }
 }
 
+/**
+ * An `eth_simulateV1` outcome (#716): geth's result (the blocks, as JSON), geth's own
+ * simulation error with its code, or why there is none. A call that reverts or halts is
+ * still [Kind.OK]: its result carries the failure.
+ */
+class RpcSimulateResult private constructor(
+    val kind: Kind,
+    val resultJson: String?,
+    val code: Int,
+    val detail: String?,
+) {
+    enum class Kind { OK, FAILED, UNAVAILABLE, REFUSED }
+
+    companion object {
+        fun ok(resultJson: String) = RpcSimulateResult(Kind.OK, resultJson, 0, null)
+        fun failed(code: Int, message: String) = RpcSimulateResult(Kind.FAILED, null, code, message)
+        fun unavailable(detail: String? = null) = RpcSimulateResult(Kind.UNAVAILABLE, null, 0, detail)
+        fun refused(detail: String) = RpcSimulateResult(Kind.REFUSED, null, 0, detail)
+    }
+}
+
 interface RpcBackend {
     fun chainId(): Long
     fun headBlockNumber(): Long?
@@ -410,6 +431,22 @@ interface RpcBackend {
         stateOverridesJson: String?,
         tracerJson: String,
     ): RpcTraceResult = RpcTraceResult.refused("this engine does not trace calls (debug_traceCall)")
+
+    /**
+     * Whether this backend simulates blocks of calls (`eth_simulateV1`, [simulateV1];
+     * #716). Consulted BEFORE dispatch, as [supportsCallTracing].
+     */
+    fun supportsSimulation(): Boolean = false
+
+    /**
+     * `eth_simulateV1` (#716): the blocks of calls [optsJson] (geth's `simOpts`, as the
+     * request carried it) simulated on top of [block] — every parameter applied or
+     * REFUSED, what the engine does not compute `null` in the result.
+     *
+     * Default: REFUSED — a backend that simulates nothing.
+     */
+    fun simulateV1(optsJson: String, block: String): RpcSimulateResult =
+        RpcSimulateResult.refused("this engine does not simulate blocks (eth_simulateV1)")
 
     /**
      * Whether this backend serves `eth_getProof` ([getProof]). Consulted BEFORE

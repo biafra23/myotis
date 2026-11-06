@@ -474,8 +474,8 @@ wrapped here: the addon has no readiness hold, so its sends reach the same
 gate at once); ABI 52 adds `blockHash` to the `requestAccountJson` and
 `ethCall*Json` results (a key addition); ABI 53 adds the raw transaction
 reads, `get_raw_transaction_by_hash_json` / `get_raw_transaction_by_block_json`
-(#715); and ABI 54 adds `debug_trace_call_json` (#716). Neither is wrapped
-here yet. It is not a drop-in artifact for a host pinned to ABI 22.
+(#715); ABI 54 adds `debug_trace_call_json` and ABI 55 `simulate_v1_json`
+(#716). None of these is wrapped here yet. It is not a drop-in artifact for a host pinned to ABI 22.
 Engine failures, admission refusal, cancellation, and deadline expiry remain
 in-band JSON errors. Node-API infrastructure failures may throw/reject.
 

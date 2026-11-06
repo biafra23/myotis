@@ -84,6 +84,8 @@ class RpcRouter internal constructor(
             "eth_getRawTransactionByBlockNumberAndIndex" to 2, "eth_getRawTransactionByBlockHashAndIndex" to 2,
             // #716: transaction, block, trace config (tracer, its options, state overrides).
             "debug_traceCall" to 3,
+            // #716: the simulation object (geth's simOpts), block.
+            "eth_simulateV1" to 2,
             // The polled filter family over the log index and the verified head (#714).
             "eth_newFilter" to 1, "eth_newBlockFilter" to 0, "eth_getFilterChanges" to 1,
             "eth_getFilterLogs" to 1, "eth_uninstallFilter" to 1,
@@ -640,6 +642,8 @@ class RpcRouter internal constructor(
             val label =
                 if (takesOverrides(method) && stateOverrideJson(root) != null) "SIMULATED"
                 else if (method == "debug_traceCall" && traceOverrideJson(root) != null) "SIMULATED"
+                // Every block it answers with is one the chain never had.
+                else if (method == "eth_simulateV1") "SIMULATED"
                 else "VERIFIED"
             // NB a code-3 REVERT response counts here too, deliberately: the
             // revert is a verified (or simulated) ANSWER, not a failure to
@@ -1766,6 +1770,42 @@ class RpcRouter internal constructor(
                             ?: return null
                     RpcTraceResult.Kind.REFUSED -> throw EngineRefused(outcome.detail ?: "refused")
                     RpcTraceResult.Kind.INFEASIBLE -> errorEnvelope(id, -32000, outcome.detail ?: "out of gas")
+                }
+            }
+            // eth_simulateV1 (#716): blocks of calls simulated on top of a block, as
+            // geth simulates them. The simulation object goes to the engine as the
+            // request carried it: the engine reads it whole and refuses (-32602)
+            // whatever it does not apply, and geth's own simulation errors come back
+            // with geth's codes. The block is read as for eth_call, a hash resolved
+            // to its number, but with no [pinServable]: the engine judges every
+            // number itself (the head's or the finalized block's own, and nothing
+            // else), and the state window would refuse the finalized block's
+            // number, more than 64 blocks back on mainnet, as for eth_getProof.
+            "eth_simulateV1" -> {
+                if (!b.supportsSimulation()) {
+                    invalid("method 'eth_simulateV1' is not supported by this node's engine (the Java engine " +
+                        "simulates no blocks — select the Rust engine)")
+                }
+                val p = root.params()
+                val opts = p?.getOrNull(0) as? JsonObject
+                    ?: invalid("invalid argument 0: expected the simulation object (blockStateCalls, …)")
+                val block = resolveHash(p.selectorAt(1, Takes.NUMBER_OR_HASH), b, "eth_simulateV1") ?: return null
+                val optsJson = json.encodeToString(JsonObject.serializer(), opts)
+                val outcome = withContext(rpcIoDispatcher) { b.simulateV1(optsJson, block.value) }
+                when (outcome.kind) {
+                    RpcSimulateResult.Kind.OK -> {
+                        // A result the backend could not shape is drift → retryable.
+                        val result = outcome.resultJson?.let { runCatching { json.parseToJsonElement(it) }.getOrNull() }
+                            as? JsonArray ?: return null
+                        resultEnvelope(id, result)
+                    }
+                    // geth's own answer about the request (an out-of-order block, a
+                    // failed check under validation, a client limit): its code, its words.
+                    RpcSimulateResult.Kind.FAILED -> errorEnvelope(id, outcome.code, outcome.detail ?: "simulation failed")
+                    RpcSimulateResult.Kind.UNAVAILABLE ->
+                        outcome.detail?.takeIf { it.isNotBlank() }?.let { throw EngineReadUnavailable(it) }
+                            ?: return null
+                    RpcSimulateResult.Kind.REFUSED -> throw EngineRefused(outcome.detail ?: "refused")
                 }
             }
             "eth_estimateGas" -> {

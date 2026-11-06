@@ -297,7 +297,7 @@ impl OracleDatabase {
 /// else; on the rare malformed-`0xEF01` error we fall back to `new_legacy`, which
 /// loads the real verified bytes as legacy code (it reverts on the invalid `0xEF`
 /// opcode at run time — exactly what a full node does) and never panics.
-fn to_bytecode(bytes: Bytes) -> Bytecode {
+pub(crate) fn to_bytecode(bytes: Bytes) -> Bytecode {
     Bytecode::new_raw_checked(bytes.clone()).unwrap_or_else(|_| Bytecode::new_legacy(bytes))
 }
 

@@ -11,7 +11,7 @@
 use myotis_evm::EvmError;
 use myotis_net::el::evm::{
     AccessListAnswer, AccessListOutcome, CallAnswer, CallOutcome, EnsOutcome, EnsQueryOutcome,
-    EnsRecordValue, GasOutcome, TraceAnswer, TraceOutcome,
+    EnsRecordValue, GasOutcome, SimulateAnswer, SimulateOutcome, TraceAnswer, TraceOutcome,
 };
 use myotis_net::el::reader::{
     FeeEstimate, FeeHistory, VerifiedAccount, VerifiedBlock, VerifiedCode, VerifiedReceipt,
@@ -887,6 +887,229 @@ pub fn trace_json(answer: &TraceAnswer) -> String {
     let ran = !matches!(answer.outcome, TraceOutcome::Unavailable(_));
     obj.insert("verified".into(), (answer.finalized && ran).into());
     serde_json::Value::Object(obj).to_string()
+}
+
+/// An `eth_simulateV1` answer (#716): `{"status":"ok","result":[…]}` with
+/// geth's `result` itself ([`simulated_block_value`]: the blocks, each with
+/// its `calls`, and the transactions as hashes or, with `full_transactions`,
+/// as objects), `{"status":"failed","code","message"}` for geth's own
+/// simulation errors (its codes: -38010 to -38026, -32602, -32603), a
+/// retryable `unavailable`, or the permanent `{"error","code":-32602}` for a
+/// refusal. Every status names the block the simulation started from
+/// (`blockNumber`, `verified`), as [`trace_json`] does.
+pub fn simulate_json(answer: &SimulateAnswer, full_transactions: bool) -> String {
+    let mut obj = serde_json::Map::new();
+    match &answer.outcome {
+        SimulateOutcome::Refused(reason) => return invalid_params_json(reason),
+        SimulateOutcome::Simulated(blocks) => {
+            obj.insert("status".into(), "ok".into());
+            obj.insert(
+                "result".into(),
+                blocks.iter().map(|block| simulated_block_value(block, full_transactions)).collect(),
+            );
+        }
+        SimulateOutcome::Failed { code, message } => {
+            obj.insert("status".into(), "failed".into());
+            obj.insert("code".into(), json_i64(*code));
+            obj.insert("message".into(), message.as_str().into());
+        }
+        SimulateOutcome::Unavailable(reason) => {
+            obj.insert("status".into(), "unavailable".into());
+            obj.insert("reason".into(), reason.as_str().into());
+        }
+    }
+    obj.insert("blockNumber".into(), json_u64(answer.block_number));
+    let ran = !matches!(answer.outcome, SimulateOutcome::Unavailable(_));
+    obj.insert("verified".into(), (answer.finalized && ran).into());
+    serde_json::Value::Object(obj).to_string()
+}
+
+/// keccak256 of the RLP of an empty list: the `sha3Uncles` of a block
+/// without uncles.
+const EMPTY_UNCLES_HASH: [u8; 32] = [
+    0x1d, 0xcc, 0x4d, 0xe8, 0xde, 0xc7, 0x5d, 0x7a, 0xab, 0x85, 0xb5, 0x67, 0xb6, 0xcc, 0xd4, 0x1a, 0xd3, 0x12, 0x45,
+    0x1b, 0x94, 0x8a, 0x74, 0x13, 0xf0, 0xa1, 0x42, 0xfd, 0x40, 0xd4, 0x93, 0x47,
+];
+
+/// One simulated block as geth's `RPCMarshalBlock` writes it, plus its
+/// `calls`. What this node does not compute is `null`, never filled in: the
+/// `hash` and `stateRoot`, a later block's `parentHash`, `excessBlobGas`,
+/// `requestsHash`, the `size` (its header holds `excessBlobGas`), and every
+/// log's and transaction's `blockHash` (see `myotis_evm::simulate`).
+pub fn simulated_block_value(block: &myotis_evm::simulate::SimulatedBlock, full_transactions: bool) -> serde_json::Value {
+    use serde_json::Value;
+    let mut obj = serde_json::Map::new();
+    obj.insert("number".into(), hex_quantity(block.number).into());
+    obj.insert("hash".into(), Value::Null);
+    obj.insert("parentHash".into(), block.parent_hash.as_ref().map_or(Value::Null, |h| hex0x(h).into()));
+    obj.insert("nonce".into(), "0x0000000000000000".into());
+    obj.insert("mixHash".into(), hex0x(&block.prev_randao).into());
+    obj.insert("sha3Uncles".into(), hex0x(&EMPTY_UNCLES_HASH).into());
+    obj.insert("logsBloom".into(), hex0x_var(&block.logs_bloom).into());
+    obj.insert("stateRoot".into(), Value::Null);
+    obj.insert("miner".into(), hex0x_var(&block.fee_recipient).into());
+    obj.insert("difficulty".into(), "0x0".into());
+    obj.insert("extraData".into(), "0x".into());
+    obj.insert("gasLimit".into(), hex_quantity(block.gas_limit).into());
+    obj.insert("gasUsed".into(), hex_quantity(block.gas_used).into());
+    obj.insert("timestamp".into(), hex_quantity(block.timestamp).into());
+    obj.insert("transactionsRoot".into(), hex0x(&block.transactions_root).into());
+    obj.insert("receiptsRoot".into(), hex0x(&block.receipts_root).into());
+    obj.insert("baseFeePerGas".into(), hex_quantity(block.base_fee_per_gas).into());
+    if let Some(root) = &block.withdrawals_root {
+        obj.insert("withdrawalsRoot".into(), hex0x(root).into());
+    }
+    if let Some(used) = block.blob_gas_used {
+        obj.insert("blobGasUsed".into(), hex_quantity(used).into());
+        obj.insert("excessBlobGas".into(), Value::Null);
+    }
+    if let Some(root) = &block.parent_beacon_block_root {
+        obj.insert("parentBeaconBlockRoot".into(), hex0x(root).into());
+    }
+    if block.has_requests_hash {
+        obj.insert("requestsHash".into(), Value::Null);
+    }
+    obj.insert("size".into(), Value::Null);
+    let transactions: Vec<Value> = block
+        .transactions
+        .iter()
+        .enumerate()
+        .map(|(index, tx)| {
+            if full_transactions {
+                simulated_tx_value(tx, block, index as u64)
+            } else {
+                hex0x(&tx.hash).into()
+            }
+        })
+        .collect();
+    obj.insert("transactions".into(), transactions.into());
+    obj.insert("uncles".into(), Value::Array(Vec::new()));
+    if let Some(withdrawals) = &block.withdrawals {
+        let list: Vec<Value> = withdrawals
+            .iter()
+            .map(|w| {
+                serde_json::json!({
+                    "index": hex_quantity(w.index),
+                    "validatorIndex": hex_quantity(w.validator_index),
+                    "address": hex0x_var(&w.address),
+                    "amount": hex_quantity(w.amount),
+                })
+            })
+            .collect();
+        obj.insert("withdrawals".into(), list.into());
+    }
+    let calls: Vec<Value> = block
+        .calls
+        .iter()
+        .zip(&block.transactions)
+        .enumerate()
+        .map(|(index, (call, tx))| {
+            let logs: Vec<Value> = call
+                .logs
+                .iter()
+                .map(|log| {
+                    serde_json::json!({
+                        "address": hex0x_var(&log.address),
+                        "topics": log.topics.iter().map(hex0x).collect::<Vec<_>>(),
+                        "data": hex0x_var(&log.data),
+                        "blockNumber": hex_quantity(block.number),
+                        "transactionHash": hex0x(&tx.hash),
+                        "transactionIndex": hex_quantity(index as u64),
+                        "blockHash": Value::Null,
+                        "blockTimestamp": hex_quantity(block.timestamp),
+                        "logIndex": hex_quantity(log.log_index),
+                        "removed": false,
+                    })
+                })
+                .collect();
+            let mut result = serde_json::Map::new();
+            result.insert("returnData".into(), hex0x_var(&call.return_data).into());
+            result.insert("logs".into(), logs.into());
+            result.insert("gasUsed".into(), hex_quantity(call.gas_used).into());
+            result.insert("maxUsedGas".into(), hex_quantity(call.max_used_gas).into());
+            result.insert("status".into(), (if call.status { "0x1" } else { "0x0" }).into());
+            if let Some(error) = &call.error {
+                let mut e = serde_json::Map::new();
+                e.insert("message".into(), error.message.as_str().into());
+                e.insert("code".into(), json_i64(error.code));
+                if let Some(data) = &error.data {
+                    e.insert("data".into(), hex0x_var(data).into());
+                }
+                result.insert("error".into(), e.into());
+            }
+            Value::Object(result)
+        })
+        .collect();
+    obj.insert("calls".into(), calls.into());
+    Value::Object(obj)
+}
+
+/// A simulated block's transaction as geth's `RPCTransaction` writes it, with
+/// the sender geth sets from the call and the unknown `blockHash` null.
+fn simulated_tx_value(
+    tx: &myotis_evm::simulate::SimTransaction,
+    block: &myotis_evm::simulate::SimulatedBlock,
+    index: u64,
+) -> serde_json::Value {
+    use serde_json::Value;
+    let mut obj = serde_json::Map::new();
+    obj.insert("blockHash".into(), Value::Null);
+    obj.insert("blockNumber".into(), hex_quantity(block.number).into());
+    obj.insert("blockTimestamp".into(), hex_quantity(block.timestamp).into());
+    obj.insert("from".into(), hex0x_var(&tx.from).into());
+    obj.insert("gas".into(), hex_quantity(tx.gas).into());
+    obj.insert("gasPrice".into(), hex_quantity_u128(tx.gas_price).into());
+    if let Some(cap) = tx.max_fee_per_gas {
+        obj.insert("maxFeePerGas".into(), hex_quantity_u128(cap).into());
+    }
+    if let Some(tip) = tx.max_priority_fee_per_gas {
+        obj.insert("maxPriorityFeePerGas".into(), hex_quantity_u128(tip).into());
+    }
+    obj.insert("hash".into(), hex0x(&tx.hash).into());
+    obj.insert("input".into(), hex0x_var(&tx.input).into());
+    obj.insert("nonce".into(), hex_quantity(tx.nonce).into());
+    obj.insert("to".into(), tx.to.as_ref().map_or(Value::Null, |to| hex0x_var(to).into()));
+    obj.insert("transactionIndex".into(), hex_quantity(index).into());
+    obj.insert("value".into(), hex_quantity_scalar(&tx.value.to_be_bytes::<32>()).into());
+    obj.insert("type".into(), hex_quantity(u64::from(tx.tx_type)).into());
+    if let Some(list) = &tx.access_list {
+        let items: Vec<Value> = list
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "address": hex0x_var(&item.address),
+                    "storageKeys": item.storage_keys.iter().map(hex0x).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        obj.insert("accessList".into(), items.into());
+    }
+    if let Some(chain_id) = tx.chain_id {
+        obj.insert("chainId".into(), hex_quantity(chain_id).into());
+    }
+    if let Some(list) = &tx.authorization_list {
+        let items: Vec<Value> = list
+            .iter()
+            .map(|auth| {
+                serde_json::json!({
+                    "chainId": hex_quantity_scalar(&auth.chain_id.to_be_bytes::<32>()),
+                    "address": hex0x_var(&auth.address),
+                    "nonce": hex_quantity(auth.nonce),
+                    "yParity": hex_quantity(u64::from(auth.y_parity)),
+                    "r": hex_quantity_scalar(&auth.r.to_be_bytes::<32>()),
+                    "s": hex_quantity_scalar(&auth.s.to_be_bytes::<32>()),
+                })
+            })
+            .collect();
+        obj.insert("authorizationList".into(), items.into());
+    }
+    obj.insert("v".into(), "0x0".into());
+    obj.insert("r".into(), "0x0".into());
+    obj.insert("s".into(), "0x0".into());
+    if tx.chain_id.is_some() {
+        obj.insert("yParity".into(), "0x0".into());
+    }
+    Value::Object(obj)
 }
 
 /// A trace as geth's tracers serialize it: `callTracer`'s `callFrame`
@@ -1916,6 +2139,35 @@ mod tests {
             full_transactions: None,
             raw_transactions: Default::default(),
         }
+    }
+
+    /// `eth_simulateV1`'s envelope: geth's result under `ok`, geth's own error
+    /// with its code under `failed`, the permanent refusal, and the block it
+    /// started from on every status. The block shapes themselves are pinned by
+    /// the golden test (`host::simulate_tests`).
+    #[test]
+    fn simulate_json_statuses() {
+        use myotis_net::el::evm::{SimulateAnswer, SimulateOutcome};
+        let answer = |outcome| SimulateAnswer { outcome, block_number: 7, finalized: true };
+        let ok: serde_json::Value =
+            serde_json::from_str(&simulate_json(&answer(SimulateOutcome::Simulated(vec![])), false)).unwrap();
+        assert_eq!(ok["status"], "ok");
+        assert_eq!(ok["result"], serde_json::json!([]));
+        assert_eq!((ok["blockNumber"].as_u64(), ok["verified"].as_bool()), (Some(7), Some(true)));
+        let failed: serde_json::Value = serde_json::from_str(&simulate_json(
+            &answer(SimulateOutcome::Failed { code: -38020, message: "block numbers must be in order: 2 <= 2".into() }),
+            false,
+        ))
+        .unwrap();
+        assert_eq!((failed["status"].as_str(), failed["code"].as_i64()), (Some("failed"), Some(-38020)));
+        assert_eq!(failed["message"], "block numbers must be in order: 2 <= 2");
+        let unavailable: serde_json::Value =
+            serde_json::from_str(&simulate_json(&answer(SimulateOutcome::Unavailable("no snap peer".into())), false))
+                .unwrap();
+        assert_eq!((unavailable["status"].as_str(), unavailable["verified"].as_bool()), (Some("unavailable"), Some(false)));
+        let refused: serde_json::Value =
+            serde_json::from_str(&simulate_json(&answer(SimulateOutcome::Refused("no".into())), false)).unwrap();
+        assert_eq!(refused["code"], INVALID_PARAMS);
     }
 
     /// geth's callTracer and prestateTracer shapes: absent fields left out as

@@ -114,6 +114,19 @@ pub enum EvmError {
     /// block's state may settle it, and no list is better than one the run
     /// did not confirm.
     AccessListNotSettled { rounds: usize },
+    /// `eth_simulateV1` failed as geth fails it: one of geth's simulation
+    /// errors (a block number or timestamp out of order, a call that fails
+    /// its nonce, fee or balance check under `validation`, the block's gas
+    /// limit reached, a client limit, …), with geth's `code` and words. A
+    /// deterministic answer about the request: hosts serve `code` as the
+    /// JSON-RPC error code, never the retryable unavailable.
+    Simulation { code: i64, message: String },
+    /// `eth_simulateV1` asked for something this node does not compute — a
+    /// simulated block's hash or blob base fee read by a call, an Amsterdam
+    /// block, withdrawals on Gnosis, a precompile overridden — and it is
+    /// refused rather than answered with a made-up value
+    /// ([`crate::simulate`]). A refusal ([`EvmError::is_refusal`]).
+    SimulationNotServed { detail: String },
 }
 
 impl EvmError {
@@ -127,6 +140,7 @@ impl EvmError {
                 | EvmError::UnexpectedSlotNumber { .. }
                 | EvmError::InvalidRequest { .. }
                 | EvmError::CallBudgetExceeded { .. }
+                | EvmError::SimulationNotServed { .. }
                 | EvmError::Oracle(OracleError::BlockHashUnsupported { .. })
         )
     }
@@ -188,6 +202,8 @@ impl EvmError {
             EvmError::RequiredBalanceOverflow { .. } => "required balance overflow",
             EvmError::CallBudgetExceeded { .. } => "call budget exceeded",
             EvmError::AccessListNotSettled { .. } => "access list not settled",
+            EvmError::Simulation { .. } => "simulation",
+            EvmError::SimulationNotServed { .. } => "simulation not served",
         }
     }
 }
@@ -266,6 +282,8 @@ impl std::fmt::Display for EvmError {
             EvmError::AccessListNotSettled { rounds } => {
                 write!(f, "the access list did not settle within {rounds} runs of the transaction")
             }
+            EvmError::Simulation { message, .. } => write!(f, "{message}"),
+            EvmError::SimulationNotServed { detail } => write!(f, "{detail}"),
         }
     }
 }
