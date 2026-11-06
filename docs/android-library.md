@@ -215,7 +215,7 @@ differs from the bindings is refused at load (the ABI version and UniFFI's
 checksums), and `Myotis.isAvailable()` says false, but a library from another
 release with the same FFI loads and runs that release's engine, its checkpoints
 and bootnodes included, with nothing to say so. The artifacts are
-built on one runner per platform from the tag's tree: macOS 14 for both Mac
+built on one runner per platform from the tag's tree: macOS 15 for both Mac
 architectures, Ubuntu 22.04 for Linux (so glibc 2.35 or newer). A signed and
 notarized macOS app with the hardened runtime may refuse a library extracted
 at run time; such an app ships the library inside its bundle, signed with it,

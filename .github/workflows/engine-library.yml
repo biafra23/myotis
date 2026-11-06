@@ -71,8 +71,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { prefix: darwin-aarch64, runner: macos-14,         target: aarch64-apple-darwin,      library: libmyotis_engine.dylib }
-          - { prefix: darwin-x86-64,  runner: macos-14,         target: x86_64-apple-darwin,       library: libmyotis_engine.dylib }
+          - { prefix: darwin-aarch64, runner: macos-15,         target: aarch64-apple-darwin,      library: libmyotis_engine.dylib }
+          - { prefix: darwin-x86-64,  runner: macos-15,         target: x86_64-apple-darwin,       library: libmyotis_engine.dylib }
           - { prefix: linux-x86-64,   runner: ubuntu-22.04,     target: x86_64-unknown-linux-gnu,  library: libmyotis_engine.so }
           - { prefix: linux-aarch64,  runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, library: libmyotis_engine.so }
     runs-on: ${{ matrix.runner }}

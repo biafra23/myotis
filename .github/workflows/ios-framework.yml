@@ -83,8 +83,9 @@ jobs:
   build:
     needs: review-gate
     # macos-15 for a recent Xcode toolchain (the Kotlin/Native iOS link needs
-    # Xcode's clang/ld for the target). macos-14's Xcode also links a static
-    # framework, but 15 tracks closer to the dev fleet's Xcode 26.
+    # Xcode's clang/ld for the target). macos-14's Xcode also linked a static
+    # framework (that image was retired on 2026-11-02), but 15 tracks closer to the
+    # dev fleet's Xcode 26.
     name: Build MyotisKit framework
     runs-on: macos-15
     permissions:
