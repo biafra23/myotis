@@ -1088,10 +1088,39 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
         }
     }
 
+    /**
+     * The cached CL peers this engine can dial: those with a TCP address. The
+     * cache file is shared with the Rust engine, which speaks QUIC too and
+     * stores a QUIC-only peer under its {@code /udp/<port>/quic-v1} address;
+     * this engine's libp2p host is TCP-only, so such an entry is skipped here
+     * — left in the file for the Rust engine, never dialed and charged a
+     * failure that would evict it for both.
+     */
+    static List<String> tcpDialable(List<String> cached) {
+        List<String> out = new ArrayList<>(cached.size());
+        for (String peer : cached) {
+            if (isTcp(peer)) out.add(peer);
+        }
+        return out;
+    }
+
+    /** {@link #tcpDialable(List)} for the cache's per-peer records. */
+    static <V> Map<String, V> tcpDialable(Map<String, V> cached) {
+        Map<String, V> out = new LinkedHashMap<>();
+        for (Map.Entry<String, V> e : cached.entrySet()) {
+            if (isTcp(e.getKey())) out.put(e.getKey(), e.getValue());
+        }
+        return out;
+    }
+
+    private static boolean isTcp(String multiaddr) {
+        return multiaddr.contains("/tcp/");
+    }
+
     /** Construct and start the beacon light client (first start only — a resume
      *  reuses the retained instance via {@code BeaconLightClient.resume()}). */
     private void buildAndStartBeacon(List<Enr> dnsClEnrs) {
-        List<String> clPeers = new ArrayList<>(clPeerCache.load());
+        List<String> clPeers = tcpDialable(clPeerCache.load());
         for (String peer : network.clPeerMultiaddrs()) {
             if (!clPeers.contains(peer)) clPeers.add(peer);
         }
@@ -1105,9 +1134,12 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
                 clPeerCache::add, clPeerCache::markFailure, network.clGenesisTime());
         blc.setBlobParameters(network.activeBlobParamsEpoch(), network.activeBlobParamsMaxBlobs());
         blc.setBeaconPreset(network.secondsPerSlot(), network.slotsPerEpoch());
-        blc.setProvenCatchUpServers(clPeerCache.servedRanges());
+        blc.setProvenCatchUpServers(tcpDialable(clPeerCache.servedRanges()));
         blc.setOnCatchUpServed(clPeerCache::recordServed);
-        blc.setProvenBootstrapPeers(clPeerCache.bootstrapPeers());
+        // Filtered too: the deepest bootstrap server becomes the cold start's
+        // first pick, and a QUIC-only key there would point at no peer this
+        // engine has — leaving the TCP server that also served unpreferred.
+        blc.setProvenBootstrapPeers(tcpDialable(clPeerCache.bootstrapPeers()));
         blc.setOnBootstrapServed(clPeerCache::recordBootstrap);
         blc.setProvenLightClient(clPeerCache.lightClientConfirmed());
         blc.setProvenNonLightClient(clPeerCache.lightClientDenied());

@@ -238,8 +238,30 @@ complete on its own.
   the same reason. mplex is in (`reqresp::build_swarm`), and so is the spec's
   primary transport, QUIC (2026-10-09): the host listens on an ephemeral
   `/udp/0/quic-v1` beside TCP, discovery turns an ENR `quic`/`quic6` field
-  into a second dial address, and a peer is dialed at TCP first, QUIC only
-  when the TCP dial fails. **Not QUIC first, measured:** pinned to zbox's
+  into a second dial address, and a peer was dialed at TCP first, QUIC only
+  when the TCP dial failed. **Since 2026-11-06 the spec's order — QUIC first,
+  TCP fallback — and QUIC-only records are candidates** (consensus-specs#5330,
+  merged 2026-07-06, made QUIC a MUST and TCP a SHOULD). Every other client
+  ships QUIC on by default now: Lighthouse since v4.5 and Grandine on its
+  stack (rust-libp2p, this host's own), Prysm since v5.2.0, Lodestar since
+  v1.42, Teku in 26.9 (whose missing TCP fallback, #11397, was fixed in
+  October). A peer is moved to TCP first (`reqresp::TcpFirst`) when its QUIC
+  dial fails with TCP still to try — Teku #11397's census found ~30 % of
+  QUIC-advertising mainnet peers answering TCP but not QUIC — when a request
+  times out on its QUIC connection (that connection is closed:
+  `reqresp::demote_stalled_quic`), and when it identifies as Nimbus (a QUIC
+  connection it identified on is closed, once). A request lost to such a
+  close is retried once, TCP first; a QUIC dial failure demotes only when
+  TCP then reaches the peer, so a blip that fails every dial demotes no one.
+  The
+  shared CL peer cache may now hold a QUIC-only key; the Java engine
+  (TCP-only) skips such entries (`ChainStack.tcpDialable`). **Owed:** re-run
+  the measurement below against zbox's Nimbus on v26.10.1+ — it vendors
+  nim-lsquic 0.11.2, which disables the no-progress abort (#180) and keeps
+  stream-less connections alive (#181); neither is known to fix stream opens
+  hanging — and drop the Nimbus rule (`reqresp::is_nimbus_agent`) if a QUIC
+  connection holds across many streams. **Why Nimbus stays TCP first,
+  measured on v26.9.1:** pinned to zbox's
   Nimbus over `udp/9001/quic-v1` alone, the handshake, identify, status and
   the first four finality polls worked (`SYNCED`), then every further
   stream open hung (`Timeout while waiting for a response`) until Nimbus
@@ -248,8 +270,7 @@ complete on its own.
   which fires when the APPLICATION (nim-libp2p's QUIC muxer) stops servicing
   streams, so the stall is on Nimbus's side; over TCP the same node served
   for as long as it was asked. Upstream candidate (status-im/nim-libp2p,
-  QUIC is new in Nimbus 26.9). Flip the order once a Nimbus release holds a
-  QUIC connection open across many streams. Still open: roost listens on TCP
+  QUIC is new in Nimbus 26.9). Still open: roost listens on TCP
   only (its relay forwards no spare UDP port and its ENR carries no `quic`
   field), and the shipped Sepolia / mainnet / gnosis pins are all `/tcp/`
   multiaddrs.
@@ -304,13 +325,10 @@ complete on its own.
   have not been run against a live Nimbus — only the Rust engine's have; one
   `-Pengine=java` run pinned to zbox's Nimbus is owed — exercising the three
   by-root responders, not only `metadata/3`.
-  **TCP-first is a dial order, not a connection choice (final PR review):**
-  `Peer::dial_addrs` decides which connection this node OPENS; a request goes
-  over whichever connection to the peer exists, and libp2p's request-response
-  offers no way to pick one by transport. So a QUIC connection — the fallback
-  after a failed TCP dial, or one a peer opened inbound to the wallet's
-  ephemeral QUIC listener — carries requests until it closes, Nimbus's stall
-  included. Options, owner's call: close a QUIC connection once a TCP dial to
-  the peer succeeds again; or no QUIC listener in the wallet (then a QUIC
-  connection exists only after TCP failed, which is the one case it is for);
-  or leave it until Nimbus holds QUIC connections and the order flips anyway.
+  **The dial order is not a connection choice (final PR review) — closed
+  2026-11-06:** `Peer::dial_addrs` decides which connection this node OPENS;
+  a request goes over whichever connection to the peer exists, and libp2p's
+  request-response offers no way to pick one by transport. So a stalled QUIC
+  connection would carry every request until it closed. It is now closed on
+  its first request timeout (`reqresp::demote_stalled_quic`), and the peer is
+  redialed TCP first.
