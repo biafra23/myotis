@@ -678,11 +678,21 @@ accounts, with `N` the network's account count.
   account page gives an estimate: `N ≈ count · 2²⁵⁶ / (last_hash − origin)`.
   The Rust engine has no source for such pages yet: its account requests are
   single-key with a 4 KiB budget, and its snap quality comes from served reads
-  (`PeerCache::record_snap_served`), not from random-range probes (§4 item 2
+  (`ElPeerCache::record_snap_served`), not from random-range probes (§4 item 2
   describes the Java engine's). So the estimate starts from a conservative
   compiled-in value per network and is refined from the bucket pages
   themselves (thousands of accounts each), or from new random-range probes,
   which leak nothing; one 4 KiB page (~60 accounts) alone is too noisy.
+- **Pin an address's bucket for its lifetime.** A refined `N` can move `b`
+  across a power of two. Re-bucketing an address from `b` to `b + 1` swaps
+  its bucket for one of the two halves, and whoever sees both — the old
+  peer, or one operator group across a peer switch (§11.4 rule 3 is only a
+  heuristic) — learns which half holds the account, the same intersection
+  §11.3 warns about for re-drawn decoys. So an address's `(b, prefix)` is
+  fixed when it is first assigned and kept; only addresses added later use
+  the refined `b`. (The other direction, `b − 1`, is the parent bucket and
+  leaks nothing, at double the reply size — the one safe correction when an
+  early estimate proves too small.)
 - **Always fetch the whole bucket.** When a bucket spans several replies, page
   to its end even after the target account has arrived: stopping early tells
   the peer where the account sits. Choose `b` so a bucket usually fits in one
@@ -750,7 +760,10 @@ Repeating the SAME bucket, by contrast, tells the peer nothing new.
 The rules:
 
 1. **Each bucket gets a sticky peer** (guard-style), and that peer only ever
-   sees that bucket. A bucket's disclosure set grows only when its peer leaves.
+   sees that bucket. Together with the backup set of rule 4, which a slow read
+   discloses the bucket to (§1: hedging discloses on slowness), that is the
+   bucket's disclosure set from the start; it grows further only when one of
+   them leaves.
 2. **No identity ever shows one peer two different buckets.** Over Tor that
    means not from the same circuit and ephemeral key, and not close enough in
    time for connection timing to link them. On the direct path the IP and
@@ -809,12 +822,17 @@ Three consequences:
 
 ### 11.6 Cost
 
-- **Peers.** Rule 1–2 need about one separate peer (operator) per distinct
-  bucket: `addresses × (1 + tokens tracked per address)`, plus decoys. The Tor
-  reserve holds at most `TOR_RESERVE_CAP` = 24 nodes, about a third of the
-  verified snap servers (`el::torreserve`). Three addresses with five tokens
-  each already need 18 — most of the reserve before any decoy. Churn slowly
-  widens each bucket's disclosure set.
+- **Peers.** Rules 1, 2 and 4 make every peer that sees a bucket exclusive to
+  it, the backup set included: `buckets × (1 + backups)` separate peers
+  (operators), with `buckets = addresses × (1 + tokens tracked per address)`
+  plus decoys. The Tor reserve holds at most `TOR_RESERVE_CAP` = 24 nodes,
+  about a third of the verified snap servers (`el::torreserve`). Three
+  addresses with five tokens each are 18 buckets: 18 peers with no backup at
+  all, 36 with one backup each — past the reserve before the first decoy. So
+  as specified the scheme does not fit today's reserve for a realistic
+  wallet: either the reserve grows well past 24, or a bucket gets no backup
+  (and a slow read waits rather than hedges). Churn slowly widens each
+  bucket's disclosure set.
 - **Latency.** A real read waits for its bucket's next slot, and a new
   address's first slot comes after a random delay, each on its own peer and
   circuit; with §8.5's Tor tail latency, the first full balance view is slow.
@@ -847,7 +865,8 @@ Three consequences:
 2. A per-network `N` estimator (account trie, and per-contract storage tries),
    starting from a compiled-in value and fed by the bucket pages and by new
    random-range probes (the Rust engine has none today, §11.2).
-3. Bucket requests (`b` from `N` and a configured `k`), whole-bucket paging.
+3. Bucket requests (`b` from `N` and a configured `k`, `(b, prefix)` pinned per
+   address at assignment), whole-bucket paging.
 4. A bucket → peer assignment in the Tor reserve (`el::torreserve`), with
    operator grouping and per-bucket backup sets for hedging.
 5. The per-bucket scheduler (a fixed, jittered interval per real and sticky
