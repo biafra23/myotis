@@ -1,7 +1,7 @@
 # A dedicated snap server? Serving verified state reads at roost scale
 
 Status: **analysis and proposal — nothing here is built.** Companion to
-[`lc-server-design.md`](../design-history/lc-server-design.md), the design behind
+[`../design-history/lc-server-design.md`](../design-history/lc-server-design.md), the design behind
 [`rust/roost`](../../rust/roost/README.md). Roost serves the light client to
 thousands of wallets from a commodity box; this document asks whether the
 execution-layer half of a wallet's traffic — the snap state reads behind
@@ -32,7 +32,7 @@ privacy. The open decisions are listed at the end; they are the owner's.
 
 ## Why roost is cheap
 
-Three properties make roost cheap, drawn from `lc-server-design.md` §Capacity
+Three properties make roost cheap, drawn from `../design-history/lc-server-design.md` §Capacity
 (identical bytes; pre-encoded responses, its items 1, 2 and 4) and §Historical
 depth (the immutable archive):
 
@@ -161,7 +161,7 @@ snap peers, `PoolConfig::default`). Ten thousand idle sessions is a memory and
 `LimitNOFILE` question, not a CPU one.
 
 What does *not* scale is the way wallets are served today. The dedicated
-sepolia node (`dedicated-sepolia-node.md` §3) is a patched geth that admits
+sepolia node (`../guides/dedicated-sepolia-node.md` §3) is a patched geth that admits
 wallets past `MaxPeers` by their RLPx Hello client id. That has the two flaws
 roost was built to escape on the CL side:
 
@@ -171,7 +171,7 @@ roost was built to escape on the CL side:
   of uplink at 1,000 wallets, for a stream the wallet uses only to spot its own
   sent transactions (`peer.rs:956`, the sent-tx watch, #531).
 - **Admission rests on a self-reported, trivially spoofable string** — the
-  objection that sank the Nimbus patch (`lc-server-design.md` §Rejected
+  objection that sank the Nimbus patch (`../design-history/lc-server-design.md` §Rejected
   alternative).
 
 So the split is the same as roost's: the node goes back to being an ordinary
@@ -193,7 +193,7 @@ makes admission by identity unnecessary: the front serves exactly what a
 wallet needs, to anyone. It does **not** make the request rate free — reads
 per second are the binding cost ([§Capacity](#capacity)), and a peer that asks
 nonstop sets it. So, as roost bounds its work per request
-(`lc-server-design.md` item 5), the front needs a per-connection request-rate
+(`../design-history/lc-server-design.md` item 5), the front needs a per-connection request-rate
 cap and a global upstream budget.
 
 The cap has to fit what wallets legitimately do, and its refusals are scored:
@@ -308,10 +308,10 @@ almost nothing, an active one costs ~100 KB per refresh, and a dapp-heavy
 session (an `eth_call` can touch dozens of slots) costs more.
 
 The hardware is a full execution node per chain — 2 TB NVMe and 32 GB RAM
-(`dedicated-sepolia-node.md` §2) — plus the front. Commodity, but not roost's
+(`../guides/dedicated-sepolia-node.md` §2) — plus the front. Commodity, but not roost's
 small box. On Gnosis the upstream cannot be geth (it does not run the chain);
 Nethermind serves snap with its FlatDb / halfpath layouts
-(`dedicated-sepolia-node.md` §1), and the 5 s slot shortens every cache
+(`../guides/dedicated-sepolia-node.md` §1), and the 5 s slot shortens every cache
 window above.
 
 ## The proofs: trust
@@ -368,7 +368,7 @@ This is where a snap server differs from roost in kind, not degree.
 - **Today that linkage is spread out.** Reads go to whichever of the wallet's
   eight pool peers the read ladder picks, run by unrelated operators, and Tor
   mode spreads account reads over a reserve of up to 24 nodes that is
-  "never a pin" (`privacy-and-tor.md`). A server that wallets pin and that
+  "never a pin" (`../how-it-works/privacy-and-tor.md`). A server that wallets pin and that
   serves them well concentrates it at one operator — which is also what makes
   it attractive to rank first.
 - **Transaction broadcast concentrates the same way.** If the front relays the
@@ -383,7 +383,7 @@ service is the better shape:
 
 | | Through a Tor exit (what ships) | Onion service |
 |---|---|---|
-| Exit problems the PoC measured (`privacy-and-tor.md` §2) | Present: reduced-policy exits refuse :30303, the rest are lossy. Listening on 443 would avoid most of it. | None — no exit at all. |
+| Exit problems the PoC measured (`../how-it-works/privacy-and-tor.md` §2) | Present: reduced-policy exits refuse :30303, the rest are lossy. Listening on 443 would avoid most of it. | None — no exit at all. |
 | Full nodes refusing Tor exits (§8.9) | Not an issue: the front sets its own limits. | Same. |
 | What the path reveals | The exit sees the server's IP and timing, not the content (RLPx is end-to-end encrypted). | No relay knows both ends. |
 | Hosting | Needs a public IP and port; zbox sits behind mobile CGNAT and relies on the netcup relay's DNAT. | Publishes outbound-only, from behind CGNAT, no relay needed. |

@@ -63,7 +63,7 @@ pub mod e10_traits;
 ```
 
 > [!NOTE]
-> **JVM lens**
+> **JVM lens**<br>
 >
 > `#[cfg(test)] mod tests` is a test class that lives in the same file, compiled only for `cargo test`, and it may see private items (like package-private access). `assert_eq!` is `assertEquals`, and a test passes if and only if it does not panic. `cargo test e05` filters by test path the way Gradle's `--tests` does.
 

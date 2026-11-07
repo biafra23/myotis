@@ -82,7 +82,7 @@ panic = "abort"
 - *[Crates, modules & features](01-primer.md#primer-modules-cargo)* **Why `myotis-rpcd` is a member.** The daemon links the engine in-process. The engine already lives under `panic = "abort"`, so the daemon gains nothing from a separate profile, and it adds only `tiny_http` and `clap` to the build.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The header comment's member list (lines 3–38) describes every member except `myotis-node`, which is in `members` on line 45.
 
@@ -251,7 +251,7 @@ snap = { version = "=1.1.1", optional = true }
 - *[Crates, modules & features](01-primer.md#primer-modules-cargo) · [Tests](01-primer.md#primer-testing)* **A feature for other crates' tests.** `test-util` exposes helpers under `#[cfg(any(test, feature = "test-util"))]`. `cfg(test)` is true only when this crate's own tests are compiled, so another crate's tests need the feature. `myotis-net` asks for it in its `[dev-dependencies]`.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > Lines 43–46 say that bare-metal builds must set `RUSTFLAGS="--cfg aes_force_soft"`. `rust/.cargo/config.toml` now sets that cfg per target, so any cargo invocation inside `rust/` gets it without an environment variable. Only an embedder building outside this tree still has to set it.
 
@@ -358,7 +358,7 @@ tor = ["myotis-net/tor"]
 ```
 
 > [!TIP]
-> **Follow the feature**
+> **Follow the feature**<br>
 >
 > `-PtorEngine` (Gradle) → `cargoBuildHost` appends `--features myotis-engine/tor` (the package/feature form, because a bare `--features tor` with `--workspace` would apply to every member), and `build-android.sh` does the same for `cargo ndk` → `myotis-engine`'s `tor = ["myotis-net/tor"]` → `myotis-net`'s `tor = ["dep:arti-client", "dep:tor-rtcompat", "dep:rustls"]` → the compiler now sees `#[cfg(feature = "tor")] pub mod tor;` in `el/mod.rs` and the first block of `set_tor_enabled` in `host.rs`. Without the feature, those lines do not exist for the compiler, and the function returns `false`.
 
@@ -601,7 +601,7 @@ uniffi = { version = "0.32", features = ["cli"] }
 ```
 
 > [!WARNING]
-> **Worth remembering**
+> **Worth remembering**<br>
 >
 > UniFFI embeds a checksum per exported function in the scaffolding, and the generated Kotlin verifies it at load time. Any change to `ffi.rs`, even a doc comment, changes a checksum, so the committed bindings must be regenerated afterwards. Regenerate them through Gradle's `uniffiGenerateKotlin`, not a direct `cargo run`: the Gradle task also masks the generated checksum comparisons to 16 bits, and the APK workflow's drift check fails on unmasked bindings.
 

@@ -6,12 +6,12 @@ A daemon that the project runs itself. It pulls light-client objects from a loca
 
 ## Rust you will practise
 
-- **An application, not a library** — `#[tokio::main]`, `anyhow::Result` with context, typed errors only where callers branch on them.
+- **An application, not a library** `#[tokio::main]`, `anyhow::Result` with context, typed errors only where callers branch on them.
 - **Minimal sharing** — state confined to one task; `Arc<LcStore>` with a `std::sync::RwLock`; lock poisoning under `panic = "unwind"`.
 - **Bytes you don't trust** — panic-free parsing with `get`, `checked_add`, `let … else`, and an append-only file format.
 
 > [!TIP]
-> **What changed since September**
+> **What changed since September**<br>
 >
 > Little, and all of it at the edges. `participation_of` in `main.rs` now picks the Gloas or pre-Gloas decoder by length, so Gloas periods are judged instead of reading as undecodable. `serve.rs` sets three new `HostConfig` fields (`listen_quic`, `cl_fork_watch`, `traffic`) to `None`. The codec, protocol names and fork-digest arithmetic roost imports from `myotis_net::{codec, protocols, status}` now live in `myotis-wire` ([Stop 5](05-wire.md)); `myotis-net` re-exports them at the old paths, so roost's imports did not change. The other six files are byte-for-byte the same.
 
@@ -1061,7 +1061,7 @@ loop {
 - *[Ownership & moves](01-primer.md#primer-ownership) · [Threads, Send & Sync](01-primer.md#primer-concurrency)* `archive`, `digests`, `external`, `published` and `ticks` are plain locals of this future. Nothing else can reach them, so they need no locks, like state confined to a single-threaded executor. `publish_refusal: Option<&'static str>` stores literals, so they can be compared to log a refusal only when it changes.
 
 > [!WARNING]
-> **Two shutdown caveats**
+> **Two shutdown caveats**<br>
 >
 > - `tokio::signal::ctrl_c()` is created afresh on each iteration, and per tokio's documentation it completes only for a Ctrl-C received *after* it was first polled. While a tick body is running, that future has already been dropped, so a Ctrl-C pressed during a tick can be missed; press it again. Creating it once and polling it by `&mut`, as with `swarm_task`, would fix that.
 > - Only SIGINT is handled. `systemctl stop` sends SIGTERM, whose default action ends the process without running this path. The append-only archive with torn-tail repair tolerates that.

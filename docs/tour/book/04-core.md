@@ -7,16 +7,16 @@ RLP, keccak-256, secp256k1 identities, block headers, ENRs, fork ids, Merkle-Pat
 ## Rust you will practise
 
 - **Borrowed views** — a `View<'a>` whose accessors return slices of the caller's buffer, next to an owned `Item` tree, and when the compiler forces a copy.
-- **no\_std and features** — `core`, `alloc` and `std` as three layers, a Cargo feature that switches between them, and how features unify across a build.
+- **no\_std and features** `core`, `alloc` and `std` as three layers, a Cargo feature that switches between them, and how features unify across a build.
 - **Errors as values** — a one-field error type, `?`, `map_err`, `ok_or_else`, and a proof verdict enum that never panics.
 
 > [!TIP]
-> **The crate's promise**
+> **The crate's promise**<br>
 >
 > “Sans-I/O by rule” (lib.rs, lines 4–7): every function is a pure function over caller-supplied bytes. There are no sockets, files, clocks or entropy. That is why key *generation* is not here, and why `k256` is built without its `std` feature. Decoding untrusted bytes never panics, because the workspace's release profile sets `panic = "abort"` and a panic would end the host process. The newer half of the promise is `no_std`: with the `std` feature off, the compiler itself refuses any use of the standard library.
 
 > [!WARNING]
-> **What changed since September**
+> **What changed since September**<br>
 >
 > The crate became `no_std` + `alloc` with a default `std` feature. `rlp.rs` grew allocation-free readers (`View`, `ViewIter`, `ListBuf`, `validate`, `raw_list_prefix`) after a 10 MiB peer frame cost 547 MB of heap (#454), plus differential tests that pin them to the decoder. `header.rs` decodes through a `View` and reads Amsterdam's two new fields. `forkid.rs` now computes CRC32 to step the pinned fork id across one known fork and to invert it. `trie.rs` can return the `eth_getProof` path, and uses a `BTreeMap` instead of a `HashMap`. `fees.rs` and `tests/rlp_alloc_bound.rs` are new.
 
@@ -833,7 +833,7 @@ pub fn activation_of(hash: u32, next: u32) -> u64 {
 - *[Borrowing & slices](01-primer.md#primer-borrowing)* `for slot in idx.iter_mut().rev()` yields `&mut u8` references into the array, last to first, and `*slot = …` writes through each one.
 
 > [!WARNING]
-> **A placement is not proof**
+> **A placement is not proof**<br>
 >
 > The module doc (lines 22–23) and the test `every_hash_places_somewhere_so_a_placement_is_not_proof` make the limit explicit: every 32-bit hash has exactly one activation below 232 that produces it. Inverting a peer's hash tells you *where* a fork would have to be, not that one exists. The test's comment adds that the fork watch votes by network and weighs dissent instead of trusting one placement.
 
@@ -963,7 +963,7 @@ fn interpret_branch(items: &[Item], path: &[u8], idx: usize) -> Step {
 *[Enums & pattern matching](01-primer.md#primer-enums-patterns)* `it @ Item::List(_)` binds the whole matched value to `it`. `Item::Bytes(child) if child.is_empty()` is a *guard*. Arms are tried top to bottom, so the unguarded `Item::Bytes(child)` at the end catches every remaining length. `it.clone()` produces an independent subtree the loop can own.
 
 > [!WARNING]
-> **Design decision**
+> **Design decision**<br>
 >
 > The `lookups` counter guarantees termination structurally, even though a keccak cycle is cryptographically infeasible (the comment on lines 107–112 says so). When the consequence of a bug is an app abort or a hang, the code prefers guarantees it can see to arguments it has to trust.
 

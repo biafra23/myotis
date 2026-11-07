@@ -164,7 +164,7 @@ CcipReadEvmExecutor( PrefetchingEvmExecutor( DefaultEvmExecutor( SnapBackedState
   follow the designator **one hop** (chains are not followed — that correctly yields invalid-opcode).
 - **BLOCKHASH is deliberately unsupported** in the Java engine (no verified block-hash provider) —
   fail fast rather than return a wrong hash. The Rust engine serves it from verified data since #664
-  (parent hash, EIP-2935 history-contract storage proof, header walk; see `verification.md` §9).
+  (parent hash, EIP-2935 history-contract storage proof, header walk; see `../how-it-works/verification.md` §9).
 - Drive the frame stack until empty; derive the outcome from the original outer frame
   (`COMPLETED_SUCCESS` → output bytes; revert reason present → `Reverted`; insufficient-gas halt →
   `OutOfGas`; else `Reverted` with a human detail).

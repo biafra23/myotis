@@ -20,7 +20,7 @@ epochs) and an **optimistic** head.
 From **Gloas** (EIP-7732) on there is no payload header to extract: the execution branch proves
 only the EL **block hash**, and number, state root etc. come from the devp2p header whose keccak
 equals it (resolved by hash — `BeaconSyncState.noteFinalizedHash` / `resolveHeader`; see
-[`glamsterdam-plan.md`](../design-history/glamsterdam-plan.md), "The EL anchor after Gloas").
+[`../design-history/glamsterdam-plan.md`](../design-history/glamsterdam-plan.md), "The EL anchor after Gloas").
 
 ---
 

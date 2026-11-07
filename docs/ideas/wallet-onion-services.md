@@ -7,8 +7,8 @@ answers one question for good on the way: **myotis's Ethereum-facing peer ids
 cannot be ed25519, but the identity of a myotis-to-myotis overlay can — and
 then a peer id *is* an onion address.** Related:
 [`inbound-connections.md`](inbound-connections.md) (accepting connections from
-full nodes; mobile kept outbound-only), [`privacy-and-tor.md`](../how-it-works/privacy-and-tor.md)
-(the Tor client in the Rust engine), [`lc-server-design.md`](../design-history/lc-server-design.md)
+full nodes; mobile kept outbound-only), [`../how-it-works/privacy-and-tor.md`](../how-it-works/privacy-and-tor.md)
+(the Tor client in the Rust engine), [`../design-history/lc-server-design.md`](../design-history/lc-server-design.md)
 (roost) and [`snap-server-design.md`](snap-server-design.md) (why snap is
 different). The open decisions at the end are the owner's.
 
@@ -46,7 +46,7 @@ different). The open decisions at the end are the owner's.
 | Phone behind CGNAT | unreachable: `inbound-connections.md` §2 has mobile "IPv4: hard no" and IPv6 only "sometimes, unreliably" | reachable **by other myotis wallets over Tor**: the phone keeps outbound circuits to its introduction points; clients meet it at a rendezvous point. Full nodes still cannot reach it |
 | Being reachable reveals the IP | yes — a listener plus an advertised address (`inbound-connections.md` §5, "reachability and Tor routing are mutually exclusive modes") | not for overlay traffic: nobody learns the phone's IP. §5's conflict stands for inbound from full nodes |
 | Authenticating the peer | a separate handshake (RLPx, Noise) over an address that proves nothing | the onion address *is* the service's public key: reaching it proves the other side holds the key |
-| Tor exits refusing or dropping traffic (`privacy-and-tor.md` §2, §8.9) | the dominant Tor-mode failure | no exit is involved |
+| Tor exits refusing or dropping traffic (`../how-it-works/privacy-and-tor.md` §2, §8.9) | the dominant Tor-mode failure | no exit is involved |
 
 `inbound-connections.md` recommends that Android never bind a listener, for
 three reasons: CGNAT, battery and Doze. An onion service binds no public
@@ -61,7 +61,7 @@ either way — see the next section.
 The Android host idle-pauses each stack five minutes after the last wallet
 request once synced, and stays awake only while charging on an unmetered
 network ("stay awake while charging", on by default;
-`disk-and-network-usage.md` §3.3). iOS suspends backgrounded apps. An onion
+`../how-it-works/disk-and-network-usage.md` §3.3). iOS suspends backgrounded apps. An onion
 service exists only while Tor runs, so a phone's service is up roughly when
 the phone is on the charger at home — which is also the only window in which
 serving costs the user neither battery nor mobile data. That window is the
@@ -203,10 +203,10 @@ reason:
 - **A myotis marker tells everyone.** Discovery records are public and
   crawled continuously. Today discovery shows only that an IP runs an
   Ethereum client, and involves none of the user's addresses
-  (`privacy-and-tor.md` §1 rates it low). A myotis entry would label that IP
+  (`../how-it-works/privacy-and-tor.md` §1 rates it low). A myotis entry would label that IP
   as a myotis wallet — a far smaller crowd — for every crawler. An onion
   entry would add the overlay identity. Tor mode does not help, because
-  discovery stays clearnet there (`privacy-and-tor.md` §4).
+  discovery stays clearnet there (`../how-it-works/privacy-and-tor.md` §4).
 - **A pong is a moment, not a window.** Even a ping that arrives proves only
   that the stack was up when it answered. The Android host idle-pauses five
   minutes after the last request (*Phones are asleep*), and a pong says
@@ -338,7 +338,7 @@ The Rust engine embeds Arti as a client (`rust/myotis-net/Cargo.toml`:
 `-PtorEngine`). Even *reading* from the overlay needs a feature today's build
 lacks: `onion-service-client` is not enabled (`rust/Cargo.lock` has no
 `tor-hsclient`), so every reading wallet needs it, and its size belongs next
-to the ~9.3 MB per ABI Arti already adds to the APK (`privacy-and-tor.md`
+to the ~9.3 MB per ABI Arti already adds to the APK (`../how-it-works/privacy-and-tor.md`
 §3). Hosting needs `onion-service-service` as well, which is opt-in, and very
 likely an
 Arti upgrade first — with the Android and iOS build work that brings — since

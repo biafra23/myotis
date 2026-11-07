@@ -7,8 +7,8 @@
 ## Rust you will practise
 
 - **One struct, many locks** — a `&self`-only API behind `Arc`: `std` vs tokio mutexes, data-less `Mutex<()>` tokens, owned guards, semaphores, `Notify`, a documented lock order.
-- **Racing and detaching** — `FuturesUnordered` + `select!`; a dropped future is cancelled, a dropped `JoinHandle` is not.
-- **Background tasks without leaks** — `self: &Arc<Self>`, a `Weak` in each follower, `'static` spawns that own their data, drop guards, paused-clock tests.
+- **Racing and detaching** `FuturesUnordered` + `select!`; a dropped future is cancelled, a dropped `JoinHandle` is not.
+- **Background tasks without leaks** `self: &Arc<Self>`, a `Weak` in each follower, `'static` spawns that own their data, drop guards, paused-clock tests.
 
 ## What changed since September
 
@@ -1561,7 +1561,7 @@ async fn answers_at_the_first_accepted_write_then_gives_the_rest_a_grace() {
 - *[Traits, generics & dyn](01-primer.md#primer-traits-generics) · [Tests](01-primer.md#primer-testing)* `fn flags<const N: usize>() -> [Arc<AtomicBool>; N]` is a const generic: the array length is a type parameter, inferred from the destructuring pattern `let [quick, inside, outside, wedged] = flags();`. `std::array::from_fn` builds each element.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The old tour listed five. All five are still there:
 >

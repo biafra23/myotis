@@ -6,9 +6,9 @@ This is where Kotlin, Swift, JavaScript and other Rust binaries meet the engine.
 
 ## Rust you will practise
 
-- **Blocking meets async** — `rt.block_on` on a foreign thread, `rt.enter()` and `rt.spawn` from outside the runtime, and why a lock must never be held across `block_on`.
-- **Ownership across a C boundary** — `CString::into_raw` / `from_raw`, `CStr`, `unsafe extern "C"` and its `# Safety` contract, and one `unsafe` call into libc.
-- **Global state** — `static OnceLock<…>`, `static AtomicU8`, `std::sync::Once`, an enum state machine inside a `Mutex<HashMap>`, and moving values out of a map.
+- **Blocking meets async** `rt.block_on` on a foreign thread, `rt.enter()` and `rt.spawn` from outside the runtime, and why a lock must never be held across `block_on`.
+- **Ownership across a C boundary** `CString::into_raw` / `from_raw`, `CStr`, `unsafe extern "C"` and its `# Safety` contract, and one `unsafe` call into libc.
+- **Global state** `static OnceLock<…>`, `static AtomicU8`, `std::sync::Once`, an enum state machine inside a `Mutex<HashMap>`, and moving values out of a map.
 
 ### Four routes, two doors
 
@@ -26,12 +26,12 @@ A `#[uniffi::export]` function stays an ordinary `pub fn`; the macro only adds a
 *Every route ends in the same `host.rs` functions. The caller's thread (a JVM, iOS, Node or rpcd thread) blocks in `rt.block_on`, while long-lived work runs on the runtime's own threads. Only strings, integers and booleans cross the boundary; compound values are JSON whose shape is pinned by golden tests on both sides.*
 
 > [!TIP]
-> **No HTTP server in this crate**
+> **No HTTP server in this crate**<br>
 >
 > The engine answers function calls, not HTTP. The JVM apps' loopback JSON-RPC listener is a port, `LoopbackRpc`, in `:myotis-engine-rust`; the `:myotis-engines` selector fills it with `KtorLoopbackRpc`. An in-process consumer of the engine library (`Myotis.newEngine()`) gets no listener at all and calls `reads()` directly. `myotis-rpcd` brings its own JSON-RPC server, in Rust. All three end in the functions on this page.
 
 > [!NOTE]
-> **What changed since September**
+> **What changed since September**<br>
 >
 > `ABI_VERSION` went from 26 to 55. The UniFFI surface grew from 38 to 55 exports and the C ABI from 40 to 58 functions: `eth_getProof`, block-hash resolution, raw transactions, the full transaction object for `eth_call` / `eth_estimateGas` / `eth_createAccessList`, `debug_traceCall`, `eth_simulateV1`, a send gate, DNS discovery, data usage, address activity and Tor storage directories. The catalog gained Chiado (four networks, all hosted), and Gnosis now has names (`.gno`). `host.rs` doubled to 7,199 lines; `EngineState` went from 7 fields to 15. `usage.rs` is new. The NULL-`to` inconsistency in `myotis_eth_call_json` that the old tour flagged was fixed in ABI 29.
 
@@ -1086,7 +1086,7 @@ let log_it = match RECENT_REFUSALS.lock() {
 *[Interior mutability](01-primer.md#primer-interior-mutability)* **Why `Option<HashMap>`.** A `static` initializer must be a constant expression. `Mutex::new` is a `const fn`, but `HashMap::new` is not (it seeds a random hasher), so the map starts as `None` and `get_or_insert_with` creates it on first use, under the lock. `OnceLock` would work too; this form keeps one lock for both the creation and every later update. This debounce keeps a polling wallet's repeated refused `eth_getLogs` filter to one log line per minute.
 
 > [!WARNING]
-> **Stale or inaccurate comments in host.rs**
+> **Stale or inaccurate comments in host.rs**<br>
 >
 > - The module doc (lines 2–5, 25–26) still calls the callers "the JNI natives (lib.rs)" and "the JNI shim". The JNI layer is gone: the callers are `ffi.rs` (UniFFI) and `capi.rs`. Many function docs still begin with the deleted `nativeXxx` names; `lib.rs` explains that history, this file does not.
 > - `status_object` (lines 3819–3820) says its key *ordering* is part of the golden contract, but it builds a `serde_json::Map`, and this build compiles `serde_json` without `preserve_order` (checked with `cargo tree -e features` on the snapshot). Keys come out in alphabetical order. The tests compare parsed values, and Java reads keys by name, so nothing breaks; only the comment is wrong. `eljson::invalid_params_json` gets this right and says so.
@@ -1370,7 +1370,7 @@ fn header_pins_the_current_abi_version() {
 - *[Iterators & closures](01-primer.md#primer-iterators-closures)* The chain `lines → filter_map(strip_prefix) → filter → filter_map(split_whitespace().next()) → collect` borrows slices of `HEADER`, a `&'static str`; nothing is allocated until `collect` builds the `Vec<&str>`.
 
 > [!WARNING]
-> **Stale or inaccurate comments in capi.rs**
+> **Stale or inaccurate comments in capi.rs**<br>
 >
 > The module doc (lines 1, 15) and `read_string`'s doc (line 22) still compare this file with "the JNI shim", which no longer exists. The functions after the test module (from line 1084) mostly lack `# Safety` sections, and `myotis_log_index_status_json`, `myotis_address_activity_json` and `myotis_read_stats_json` are declared `unsafe` although they take no pointer. That is harmless for C callers, but a Rust caller must wrap them in `unsafe { }` for nothing.
 
@@ -1583,7 +1583,7 @@ fn be_to_decimal(bytes: &[u8]) -> String {
 - *[Iterators & closures](01-primer.md#primer-iterators-closures) · [Borrowing & slices](01-primer.md#primer-borrowing)* In `be_to_decimal`, `|&b|` destructures the `&u8`, and `iter_mut()` hands out `&mut u8` so that `*byte = …` divides the big number by 10 in place: schoolbook long division, with no bignum library. `digits.to_vec()` makes the private copy that the division destroys. `u16::from` widens without loss; `as u8` narrows explicitly.
 
 > [!WARNING]
-> **Stale or inaccurate comments in eljson.rs**
+> **Stale or inaccurate comments in eljson.rs**<br>
 >
 > The doc "Serialize a broadcast transaction hash" (line 595) is still attached to `call_json`; `tx_hash_json` (line 1243) has no doc. In the same block, "a JSON-RPC null for the other two" (line 609) dates from when the call had three statuses; it has five. `invalid_params_json`'s doc (lines 40–42) lists only `eth_call` and `eth_estimateGas` as emitters; most entry points in `host.rs` now use it.
 
@@ -1694,7 +1694,7 @@ while Instant::now() < deadline {
 - *[Tests](01-primer.md#primer-testing) · [Protocol & domain](01-primer.md#primer-domain)* The example uses `assert!` and `expect` freely. It is a test tool, not engine code, so a panic simply ends the run with a message; the panic-free rule applies to the library.
 
 > [!WARNING]
-> **Other stale docs in this crate**
+> **Other stale docs in this crate**<br>
 >
 > - `lib.rs`'s module doc (line 9) lists "mainnet, Sepolia and Gnosis"; Chiado is hosted too. The old "mainnet only" wording is gone.
 > - `ringlog.rs` (line 5) says hosts poll `drain` "over JNI (`nativeDrainLogs`)". Today it is UniFFI's `drain_logs` or the C `myotis_drain_logs`.

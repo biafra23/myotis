@@ -7,8 +7,8 @@
 ## Rust you will practise
 
 - **Owning a whole state machine in one task** — Fanning out requests as futures (`join_all`, `FuturesUnordered`, `select!`, `join!`) while one task lends its state as `&mut`, with no locks.
-- **Shared knobs across clones** — `Arc<WsPolicy>` of atomics and `Arc<ClForkWatch>` with a `Mutex` inside a `Clone` config, and a `watch` channel as a `StateFlow`.
-- **Lifecycle and scopes** — `stop(self)`, abort-then-await, a `Drop` guard that frees a UDP port, and a lock guard scoped so logging happens after the lock is released.
+- **Shared knobs across clones** `Arc<WsPolicy>` of atomics and `Arc<ClForkWatch>` with a `Mutex` inside a `Clone` config, and a `watch` channel as a `StateFlow`.
+- **Lifecycle and scopes** `stop(self)`, abort-then-await, a `Drop` guard that frees a UDP port, and a lock guard scoped so logging happens after the lock is released.
 
 ## How the pieces run
 
@@ -48,7 +48,7 @@ The consensus-layer light-client driver. It defines each supported chain (`Chain
 | 4388–6124 | 44 unit tests: agent classification, the WS gate, exec-anchor feeding (including Gloas), config parity with Java for all four networks, checkpoint markers, the poll schedule, hunt triggers, pool policy, staging. |
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The module doc (lines 8–11) says this module "is the only place wall-clock time is read". That holds for the light-client path (it keeps `myotis-consensus` clock-free), but not for the crate: `cl_fork_watch.rs` reads the clock through `el::fork_watch::wall_clock_secs`, and several `el/` modules call `SystemTime::now` too. Also, the doc comment at lines 256–260 ("Mainnet — values duplicated verbatim from the Java `NetworkConfig.MAINNET`") is glued to `env_static_peers`, not to `mainnet()`, which has no doc comment of its own.
 
@@ -330,7 +330,7 @@ Ok(SyncHandle { status_rx, client, tasks: vec![sync_task], exec_anchor })
 - *[Ownership & moves](01-primer.md#primer-ownership) · [async/await & tokio](01-primer.md#primer-async)* **`stop(self)` consumes the handle**, so the compiler rejects any later use. It first tells the swarm task to shut down. The first loop then *borrows* the handles (`&self.tasks`) to abort them, and the second *moves* each `JoinHandle` out, because `.await` consumes it. Awaiting an aborted task yields `Err(JoinError::Cancelled)`, which `let _ =` discards.
 
 > [!WARNING]
-> **Gotcha**
+> **Gotcha**<br>
 >
 > Dropping a `SyncHandle` *without* calling `stop()` stops nothing. `SyncHandle` has no `Drop` impl, and a dropped `JoinHandle` merely detaches its task. `run_sync` has no exit path at all; `abort()` is the shutdown signal. That is why the engine host always calls `sync.stop().await`.
 
@@ -726,7 +726,7 @@ outstanding.remove(&peer.id);
 - *[Protocol & domain](01-primer.md#primer-domain)* The pipeline keeps at most 32 asks outstanding, at most 4 of them batch asks of up to 128 periods. Lighthouse-class peers (one update per 10 s each) each get a different look-ahead period, while the prefix period is asked at least twice. Out-of-order answers are staged with up to 3 alternates per period, and the pipeline backs off 5→10→20→25 s after idle waves. A peer whose multi-period answer applies two or more periods is promoted to "batch server" and leads selection afterwards.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The comment on `in_flight` (lines 3150–3151) says it is "Boxed because each top-up's async block is its own anonymous type." That is not quite how the type system works. Each `async` block *in the source* has its own type, but every future one source location creates, however many loop iterations run it, has that same type. `catch_up` has a single push site (line 3375), so an inferred `FuturesUnordered<_>` would compile, as it does in `poll_finality`. The box is a choice (a nameable type, room for a second push site later), not a requirement.
 
@@ -1467,7 +1467,7 @@ loop {
 - *[Ownership & moves](01-primer.md#primer-ownership)* `handle.stop().await` *moves* the handle inside a `loop`. Normally that fails with "value moved here, in previous iteration of loop". It compiles because `std::process::exit` returns the never type `!`, so no later iteration can reach the moved handle.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The header (lines 9–14) says SYNCED means "finalized within a couple of epochs of wall clock"; the gate is 5 epochs (`SYNCED_SLOT_SLACK_EPOCHS`). It also says the sync "staggers disjoint sub-ranges across the fan-out", but `catch_up`'s own doc records that the disjoint-range experiment was dropped: the prefix period is asked redundantly and only look-ahead periods are spread.
 
@@ -1642,7 +1642,7 @@ tokio::spawn(async move {
 *[Threads, Send & Sync](01-primer.md#primer-concurrency) · [Ownership & moves](01-primer.md#primer-ownership)* Compare with `lc_crawl`'s `let _permit`. Here the permit is named `permit` and released early with `drop(permit)`, because the Identify poll that follows needs only the swarm, not a probe slot. `drop` is an ordinary function that takes ownership and lets the value go out of scope. Line 316 shows a related rule: in `match std::env::var("NET").unwrap_or_default().trim() { … }` the temporary `String` lives until the end of the `match`, so borrowing it with `trim()` is fine.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The header (lines 43–46) still says reqresp "keys its outbound bookkeeping by request id alone", which is why pins are probed one at a time and why the crawl's negative buckets should be read with care. `reqresp.rs` now keys pending requests by `(protocol, id)` (its lines 1364–1372), so that caveat no longer applies; sequential pin probing still gives each pin a clean line. Also, the variable `finality_wire` (line 382) holds an `updates_by_range` request; the name was copied from `lc_crawl`.
 

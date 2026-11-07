@@ -6,7 +6,7 @@ thing looks the way it does, or explores something that does not exist yet.
 
 | Folder | What it contains | Can you rely on it for today's behaviour? |
 |---|---|---|
-| [`how-it-works/`](how-it-works/) | How Myotis behaves **now**: verification, readiness, the Status screen, data usage, Tor, the website | Yes. Kept in step with the code; a document says so when a part lags |
+| [`how-it-works/`](how-it-works/) | How Myotis behaves **now**: verification, readiness, the Status screen, data usage, Tor, the website | Yes, for what is shipped; a page's status note marks any part that is still a sketch |
 | [`guides/`](guides/) | Step-by-step instructions: using the engine library, release signing, running Myotis for Swarm Bee, the RAILGUN PoC, a dedicated Sepolia node | Yes, for the procedure; re-check versions in long-lived runbooks |
 | [`spec/`](spec/) | The language-agnostic specification of Myotis (01–05), plus the Rust port's working notes (06) and plan (07) | 01–05 yes; 06–07 are a record of how the port was done |
 | [`design-history/`](design-history/) | Designs and plans that **were built**, kept as the record of why: the log index, roost, multichain, Glamsterdam, native BLS, the Java engine's EVM and ENS phases | Partly: the design was built, but later changes are not always folded back. Check `how-it-works/` or the code |

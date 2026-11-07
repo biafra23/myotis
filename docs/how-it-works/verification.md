@@ -9,7 +9,7 @@ This document follows one answer from the single thing Myotis trusts — a check
 compiled into the binary — down to an account balance proven by a SNAP peer. It
 describes the **Rust engine** (`rust/`), which is the default engine on every host, and
 notes where the **Java engine** differs. For the language-agnostic specification see
-[reimplementation/](../spec/README.md); for what each JSON-RPC method serves, the
+[spec/](../spec/README.md); for what each JSON-RPC method serves, the
 [README](../../README.md#implemented-verified-methods).
 
 ## The chain at a glance

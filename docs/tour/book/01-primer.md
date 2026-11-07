@@ -46,7 +46,7 @@ let sync = match engine.rt.block_on(async {
 `SyncHandle::start` takes a `ChainConfig` by value because the sync loop will own it for its whole life. The engine keeps its own copy behind an `Arc` (more on that below), so it clones once: `(*config)` dereferences the `Arc` to reach the `ChainConfig`, and `.clone()` makes an owned copy. Because `cfg` is now *owned* by this block, it may be changed (`let mut`, then `cfg.cl_fork_watch = cl_watch;`) without touching the shared original, and is then moved into `start`. After that line `cfg` is gone: the sync loop owns it.
 
 > [!NOTE]
-> **JVM lens**
+> **JVM lens**<br>
 >
 > Think of a move as *handing over the only key*. In Java, `b = a` gives you two keys to one object. In Rust, `let b = a;` gives the key to `b` and melts `a`'s. There is no aliasing, so there is nothing for a garbage collector to track: the compiler knows exactly where each value dies. Kotlin's `val` and `var` map to `let` and `let mut`, with one twist: in Rust, a non-`mut` binding also forbids mutating the value's *contents*, not just reassigning the variable.
 
@@ -98,7 +98,7 @@ impl Drop for Tasks {
 ```
 
 > [!TIP]
-> **Read it line by line**
+> **Read it line by line**<br>
 >
 > - **L7**: `Tasks` is a tuple struct wrapping `Mutex<(bool, Vec<JoinHandle<()>>)>`: a “stopped” flag plus the handles of spawned tasks. The data lives *inside* the mutex.
 > - **L9**: `spawn` takes the future *by value* (`impl Future…`), because the runtime will own it. It needs `Send + 'static`; see [async](#primer-async).
@@ -156,7 +156,7 @@ impl<'a> Reader<'a> {
 `fixed(len)` checks bounds with `checked_add` (no overflow panic), then returns `&self.data[self.pos..end]`, a view into the caller's buffer, and advances `pos`. `u32()` turns four borrowed bytes into a number. Nothing is allocated until a caller explicitly asks for an owned copy with `.to_vec()` (see line 237 just above the struct).
 
 > [!NOTE]
-> **JVM lens**
+> **JVM lens**<br>
 >
 > A slice is like `ByteBuffer.slice()` or `ByteBuf.slice()` in Netty, with two guarantees Java cannot give you. The backing buffer cannot be freed or reallocated while the slice exists, and nobody can write to it while you read. In Netty you manage that by hand with `retain()`/`release()`; here the compiler does it.
 
@@ -184,7 +184,7 @@ pub fn bls_dst() -> &'static [u8] {
 ```
 
 > [!WARNING]
-> **Common confusion**
+> **Common confusion**<br>
 >
 > Lifetime annotations never change what a program does. They are claims the compiler checks. If you can't satisfy the checker, the usual fixes are to return an owned value (`Vec`/`String`), clone, or restructure so the borrow ends sooner. Adding more `'a`s rarely helps.
 
@@ -281,7 +281,7 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
 ```
 
 > [!NOTE]
-> **JVM lens**
+> **JVM lens**<br>
 >
 > `Result` is a checked exception that is part of the return type, and `?` is a one-character “rethrow”. `Option` is Kotlin's `T?`, where `?` plays the role of `?: return null`. `unwrap()` is `!!`: it panics on `None`. With `panic = "abort"`, that means “crash the host app”, so the engine code avoids it on runtime data.
 
@@ -481,7 +481,7 @@ impl crate::oracle::SnapStateOracle for Counting {
 You'll see `inner` in other places with other types, for example `LcStore { inner: RwLock<Inner> }` in roost and the Node scheduler's `State { inner: Mutex<Inner>, … }`. The name only says “wrapped”; the type says what it is.
 
 > [!NOTE]
-> **JVM lens**
+> **JVM lens**<br>
 >
 > Java hides `this`, but it's there: the JVM passes it as argument 0 of every instance method (that's what `aload_0` loads). Kotlin extension functions make the same idea visible: `fun EnrSeq.bump()` compiles to a static method whose first parameter is the receiver. Rust simply writes that parameter down, and in doing so states the access mode Java can't express: shared and read-only (`&self`), exclusive (`&mut self`), or consumed (`self`).
 
@@ -588,7 +588,7 @@ impl Drop for PendingGuard {
 `PendingGuard` is a guard. When a request future is dropped (cancelled) before its answer arrives, the guard's `drop` removes the request's entry from the pending map. `drop` can't `.await`, so it clones the `Arc` and *moves* the clone into a small spawned task (`async move`) that takes the async lock. The task owns its own reference, so it doesn't matter that the guard is gone by then.
 
 > [!NOTE]
-> **JVM lens**
+> **JVM lens**<br>
 >
 > `Drop` is `try-with-resources` / `AutoCloseable` without the `try`. It runs on every exit path, including early `return`, `?` and cancellation. `Arc` behaves like a Java reference whose GC is a counter you can reason about: you know exactly which line frees the object.
 
@@ -700,7 +700,7 @@ pub struct ManagedPeer {
 ```
 
 > [!NOTE]
-> **JVM lens**
+> **JVM lens**<br>
 >
 > `PendingMap` is the Rust version of `ConcurrentHashMap<Long, CompletableFuture<byte[]>>`: `oneshot::Sender` ≈ `complete()`, `oneshot::Receiver` ≈ `get()`. `next_id: AtomicU64` is `AtomicLong.incrementAndGet()`. `closed: Arc<AtomicBool>` is a shared `volatile boolean` that the read-loop task also holds.
 
@@ -791,7 +791,7 @@ fn wait<T>(&self, future: impl std::future::Future<Output = T>) -> Result<T, Ora
 ```
 
 > [!NOTE]
-> **Kotlin lens**
+> **Kotlin lens**<br>
 >
 > Kotlin coroutines are the closest match. `async fn` ≈ `suspend fun`, `tokio::spawn` ≈ `scope.launch`, `block_on` ≈ `runBlocking`, `spawn_blocking` ≈ `withContext(Dispatchers.IO)`, `select!` ≈ `select { }`, and a `oneshot` ≈ `CompletableDeferred`. The big difference is cancellation: Kotlin throws `CancellationException` at the next suspension point, while Rust just stops polling and runs destructors.
 

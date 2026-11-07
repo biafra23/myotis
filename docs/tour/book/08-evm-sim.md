@@ -7,8 +7,8 @@ Stop 7 showed the one verified EVM run behind `eth_call`. This stop covers what 
 ## Rust you will practise
 
 - **RefCell recorders** — state mutated through `&self`, borrow scopes that must not overlap, `drop(guard)`, and why a `Mutex` appears only where the type must be `Sync`.
-- **Enums and patterns** — `Fees`, `Tracer`, `Trace` and a recursive `Abi`; tuple matches with guards, `let … else`, `name @ Pattern`, nested or-patterns.
-- **Test-only code** — `#[cfg(test)]` modules in their own files, `cfg(any(test, feature = "fixture"))`, a crate that depends on itself, `OnceLock`, `include_str!` and `env!`.
+- **Enums and patterns** `Fees`, `Tracer`, `Trace` and a recursive `Abi`; tuple matches with guards, `let … else`, `name @ Pattern`, nested or-patterns.
+- **Test-only code** `#[cfg(test)]` modules in their own files, `cfg(any(test, feature = "fixture"))`, a crate that depends on itself, `OnceLock`, `include_str!` and `env!`.
 
 ## One run, several recorders
 
@@ -44,10 +44,10 @@ pub(crate) struct RequestInspector<'a> {
 Every field is a shared reference, `&'a`. The inspector owns nothing; the request's code owns each recorder on its stack and lends it to the inspector for the run. But recorders must change as the run goes on, and a shared reference does not allow mutation. So each recorder keeps its state in a `RefCell` and mutates it through `&self`. That is the pattern you will see in `trace.rs` and `simulate.rs`.
 
 > [!TIP]
-> **Why RefCell and not Mutex**A `RefCell<T>` checks borrows at run time: `borrow_mut()` hands out a `RefMut` guard, and a second `borrow_mut()` while the first guard lives panics. It costs a counter, not a lock, and it is not `Sync`, so a type holding one cannot be shared between threads. That fits: one EVM run executes on one blocking thread from start to end (the reader in `myotis-net` wraps each `simulate` and `trace_call` call in its `blocking` helper). If anyone tried to move a `&TraceRecorder` to another thread, compilation would fail. The oracle, by contrast, is shared across threads behind `Arc<dyn SnapStateOracle>`, whose trait requires `Send + Sync`; that is why `RecordingOracle` later in this stop uses a `Mutex`.
+> **Why RefCell and not Mutex**<br>A `RefCell<T>` checks borrows at run time: `borrow_mut()` hands out a `RefMut` guard, and a second `borrow_mut()` while the first guard lives panics. It costs a counter, not a lock, and it is not `Sync`, so a type holding one cannot be shared between threads. That fits: one EVM run executes on one blocking thread from start to end (the reader in `myotis-net` wraps each `simulate` and `trace_call` call in its `blocking` helper). If anyone tried to move a `&TraceRecorder` to another thread, compilation would fail. The oracle, by contrast, is shared across threads behind `Arc<dyn SnapStateOracle>`, whose trait requires `Send + Sync`; that is why `RecordingOracle` later in this stop uses a `Mutex`.
 
 > [!NOTE]
-> **Java/Kotlin view**An inspector is a listener interface with default no-op methods, like an `EventListener` in OkHttp. The difference is ownership: in Java the listener would keep references to its collaborators forever. Here the borrow checker proves that every recorder outlives the run that borrows it.
+> **Java/Kotlin view**<br>An inspector is a listener interface with default no-op methods, like an `EventListener` in OkHttp. The difference is ownership: in Java the listener would keep references to its collaborators forever. Here the borrow checker proves that every recorder outlives the run that borrows it.
 
 ![revm calls the hooks of one RequestInspector. It forwards each hook to the recorders that are present: code_needed for the prefetch loop's discovery passes, access_list for eth_createAccessList, trace for debug_traceCall, and sim for eth_simulateV1. Each recorder is borrowed for the run and keeps its state in a RefCell.](img/08-evm-sim-1.svg)
 
@@ -576,10 +576,10 @@ if self.chain_id == GNOSIS_CHAIN_ID && base_fee > 0 && (fee_cap > 0 || tip > 0) 
 The rest of `call` matches revm's `ExecutionResult`. `Success { output, logs: receipt_logs, .. }` renames a field while destructuring it. A revert becomes `SimCallError` with code 3, geth's decoded reason (`unpack_revert` from `trace.rs`) and the raw payload; a halt uses the top frame's last opcode for geth's wording, and adds geth's note when the gas was capped. `block_transaction` (lines 1255–1278) builds the unsigned transaction geth puts in the block, and hashes its encoding from `encode.rs`.
 
 > [!WARNING]
-> **Two derivations of a transaction type**`TxRequest::tx_type()` (in `tx.rs`) and `block_tx_type` (lines 756–767 here) answer different questions and do not agree. The first is the type revm *runs*: an authorization list makes type 4. The second is the type geth *puts in the simulated block* when the caller named none: a `gasPrice` makes a legacy transaction (type 1 if any access list is present, even an empty one) whatever else the call carries, and no fee at all makes type 2. A test pins this (`a_block_transaction_is_geths_unsigned_transaction`). The doc comment says it follows geth master's `ToTransaction`.
+> **Two derivations of a transaction type**<br> `TxRequest::tx_type()` (in `tx.rs`) and `block_tx_type` (lines 756–767 here) answer different questions and do not agree. The first is the type revm *runs*: an authorization list makes type 4. The second is the type geth *puts in the simulated block* when the caller named none: a `gasPrice` makes a legacy transaction (type 1 if any access list is present, even an empty one) whatever else the call carries, and no fee at all makes type 2. A test pins this (`a_block_transaction_is_geths_unsigned_transaction`). The doc comment says it follows geth master's `ToTransaction`.
 
 > [!WARNING]
-> **Comment slightly broader than the code**The module doc (lines 22–24) says a call capped to the remaining budget "and a failure then says so". Only a halt gets the note (lines 1220–1222). A revert carries no note, and a call whose capped gas is below the intrinsic cost fails the whole request with geth's "intrinsic gas too low" text, without the note; the test on lines 495–525 pins that message.
+> **Comment slightly broader than the code**<br>The module doc (lines 22–24) says a call capped to the remaining budget "and a failure then says so". Only a halt gets the note (lines 1220–1222). A revert carries no note, and a call whose capped gas is below the intrinsic cost fails the whole request with geth's "intrinsic gas too low" text, without the note; the test on lines 495–525 pins that message.
 
 <a id="f-myotis-evm-src-simulate-encode-rs"></a>
 
@@ -888,7 +888,7 @@ fn fetch_storage(
 ````
 
 > [!WARNING]
-> **Stale or inaccurate comments**The layout above lists the `block` fields without `parentHash`, but `to_json` writes it (line 105) and `from_json` accepts it (line 152), as an optional field for files recorded before `BLOCKHASH` was served. The order shown is a schema, not the file's order: the file's keys are sorted (the committed fixture begins with `"accounts"`), because `serde_json`'s `Map` is a sorted map unless its `preserve_order` feature is on.
+> **Stale or inaccurate comments**<br>The layout above lists the `block` fields without `parentHash`, but `to_json` writes it (line 105) and `from_json` accepts it (line 152), as an optional field for files recorded before `BLOCKHASH` was served. The order shown is a schema, not the file's order: the file's keys are sorted (the committed fixture begins with `"accounts"`), because `serde_json`'s `Map` is a sorted map unless its `preserve_order` feature is on.
 
 `rust/myotis-evm/src/fixture/world.rs` · lines 279–314
 

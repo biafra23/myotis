@@ -6,8 +6,8 @@ Every byte Myotis sends to or reads from a peer is shaped here: discv4 packets, 
 
 ## Rust you will practise
 
-- **Features and `cfg`** — `#![cfg_attr(not(feature = "std"), no_std)]`, optional dependencies, and `#[cfg]` blocks that pick one of two function bodies at compile time.
-- **Borrowed views** — `rlp::View<'a>`, `Cow<'_, RawList>` and slices that point into the caller's buffer, so a peer's message is checked and read in place.
+- **Features and `cfg`** `#![cfg_attr(not(feature = "std"), no_std)]`, optional dependencies, and `#[cfg]` blocks that pick one of two function bodies at compile time.
+- **Borrowed views** `rlp::View<'a>`, `Cow<'_, RawList>` and slices that point into the caller's buffer, so a peer's message is checked and read in place.
 - **State only `&mut` can advance** — the frame codec's keystreams, `split(self)` into two owned halves, and a handshake struct that borrows its key.
 
 ## Why a crate with no I/O
@@ -32,10 +32,10 @@ Two things follow. First, the crate builds as `no_std` + `alloc` with `--no-defa
 | `eth2` | Consensus-layer req/resp framing, `Status`/`MetaData`, fork digests, protocol ids. | `reqresp`, `sync` (stops 9–10); also `roost` |
 
 > [!TIP]
-> **What changed since September**In the old tour these files were part of `myotis-net` (stops 7 and 9 of that edition). Besides the move, three changes run through them. Peer messages are now read in place through `rlp::View` and stored in `RawList` instead of being decoded into owned trees (#454). The eth side gained eth/70 (receipts that continue across responses) and eth/71 (block access lists), and snap gained snap/2. Snappy goes through the new `snappy` module, and `hello.rs` was cut out of the RLPx transport.
+> **What changed since September**<br>In the old tour these files were part of `myotis-net` (stops 7 and 9 of that edition). Besides the move, three changes run through them. Peer messages are now read in place through `rlp::View` and stored in `RawList` instead of being decoded into owned trees (#454). The eth side gained eth/70 (receipts that continue across responses) and eth/71 (block access lists), and snap gained snap/2. Snappy goes through the new `snappy` module, and `hello.rs` was cut out of the RLPx transport.
 
 > [!NOTE]
-> **Java/Kotlin**In the Java engine these are classes in `com.jaeckel.ethp2p.networking.*` that are mostly static encoders plus Netty handlers. The Rust side keeps the encoders apart from the event loop on purpose: a Netty `ChannelHandler` is tied to Netty, while a function from `&[u8]` to `Result<T, E>` runs anywhere.
+> **Java/Kotlin**<br>In the Java engine these are classes in `com.jaeckel.ethp2p.networking.*` that are mostly static encoders plus Netty handlers. The Rust side keeps the encoders apart from the event loop on purpose: a Netty `ChannelHandler` is tied to Netty, while a function from `&[u8]` to `Result<T, E>` runs anywhere.
 
 ## The crate manifest
 
@@ -83,7 +83,7 @@ snap = { version = "=1.1.1", optional = true }
 *[Crates, modules & features](01-primer.md#primer-modules-cargo)* Every dependency is pinned with `=` and has `default-features = false`. Most RustCrypto crates turn on `std` by default; leaving one default on would pull `std` into a no\_std build and fail only on the canary. `snap` is the exception: it needs `std`, so it is optional and enabled only by this crate's `std` feature. The remaining lines of the manifest (43–48) force the software SHA-2 backend on bare-metal targets, where the SSE-enabling code cannot be compiled.
 
 > [!WARNING]
-> **Stale or inaccurate comments**The manifest says that on bare-metal targets you must build “with `RUSTFLAGS="--cfg aes_force_soft"` (the no\_std canary does…)”. The canary does not set `RUSTFLAGS`. The flag comes from per-target `rustflags` entries in `rust/.cargo/config.toml`, whose own comment says it was put there “rather than RUSTFLAGS in CI”. The effect is the same for builds inside the repo; an embedder building from outside it still has to set the cfg.
+> **Stale or inaccurate comments**<br>The manifest says that on bare-metal targets you must build “with `RUSTFLAGS="--cfg aes_force_soft"` (the no\_std canary does…)”. The canary does not set `RUSTFLAGS`. The flag comes from per-target `rustflags` entries in `rust/.cargo/config.toml`, whose own comment says it was put there “rather than RUSTFLAGS in CI”. The effect is the same for builds inside the repo; an embedder building from outside it still has to set the cfg.
 
 <a id="f-myotis-wire-src-lib-rs"></a>
 
@@ -236,7 +236,7 @@ pub fn decompress_framed(input: &[u8], limit: usize) -> Result<Vec<u8>, String> 
 *[Tests](01-primer.md#primer-testing)* The built-in codec runs in no production build that has `std`, so the tests are its only exercise on a normal machine. They run it against `snap` both ways. The property test `builtin_raw_decoder_agrees_with_snap_or_refuses` feeds 3,000 random inputs and many mutated `snap` encodings, generated with a deterministic xorshift so a failure reproduces, and asserts that the built-in decoder either returns what `snap` returns or returns `None`. The `let mut next = move || { … }` closure owns its state `x` and mutates it, which makes it an `FnMut`.
 
 > [!WARNING]
-> **Stale or inaccurate comments**The module's first line calls it “Snappy *raw* format (no framing) for RLPx message payloads”. Lines 59–186 implement the framed format for eth2 req/resp as well.
+> **Stale or inaccurate comments**<br>The module's first line calls it “Snappy *raw* format (no framing) for RLPx message payloads”. Lines 59–186 implement the framed format for eth2 req/resp as well.
 
 <a id="f-myotis-wire-src-discv4-rs"></a>
 
@@ -313,7 +313,7 @@ Ok(peers)
 *[Tests](01-primer.md#primer-testing) · [Crates, modules & features](01-primer.md#primer-modules-cargo)* `encode_packet` is private: this client never sends Neighbors, so it has no public encoder for it. Tests that play the peer's side need one, so `encode_packet_for_test` exists under `#[cfg(any(test, feature = "test-util"))]`. `myotis-net`'s discv4 tests import it under its real name with `use … as encode_packet`.
 
 > [!WARNING]
-> **Stale or inaccurate comments**The module doc, copied from the `myotis-net` original, says “The packet codec, Kademlia table, and rate limiter are pure … pinned by the … corpus”. Only the codec is in this file; `KademliaTable` and `PingRateLimiter` are still in `myotis-net/src/el/discv4.rs`. The file also ends with an orphaned `// ----` separator on line 292, where the original went on to the Kademlia section.
+> **Stale or inaccurate comments**<br>The module doc, copied from the `myotis-net` original, says “The packet codec, Kademlia table, and rate limiter are pure … pinned by the … corpus”. Only the codec is in this file; `KademliaTable` and `PingRateLimiter` are still in `myotis-net/src/el/discv4.rs`. The file also ends with an orphaned `// ----` separator on line 292, where the original went on to the Kademlia section.
 
 <a id="f-myotis-wire-src-rlpx-mod-rs"></a>
 
@@ -441,7 +441,7 @@ pub struct Initiator<'a> {
 - *[Result, ? and panics](01-primer.md#primer-error-handling)* `rlp::decode(&plain).or_else(|_| decode_prefix(&plain))?` tries the strict decode first and, only on error, a tolerant one that ignores trailing bytes, because some peers pad the ack body.
 
 > [!WARNING]
-> **Stale or inaccurate comments**The test `handshake_round_trip_matches_both_sides` is documented as “both derive matching secrets (A via process\_ack, B via derive\_secrets with swapped roles)”. The test body only derives A's secrets and checks that a second derivation gives the same result. Its own later comment (lines 274–279) explains why the responder side is not derived. The trailing `let _ = &b_eph;` does nothing.
+> **Stale or inaccurate comments**<br>The test `handshake_round_trip_matches_both_sides` is documented as “both derive matching secrets (A via process\_ack, B via derive\_secrets with swapped roles)”. The test body only derives A's secrets and checks that a second derivation gives the same result. Its own later comment (lines 274–279) explains why the responder side is not derived. The trailing `let _ = &b_eph;` does nothing.
 
 <a id="f-myotis-wire-src-rlpx-frame-rs"></a>
 
@@ -849,7 +849,7 @@ fn request_and_payload(rlp_bytes: &[u8]) -> Result<(u64, rlp::View<'_>), CoreErr
 *[Protocol & domain](01-primer.md#primer-domain)* The gossip decoders (`decode_new_pooled_tx_hashes`, `transactions_gossip_hashes`) are deliberately tolerant. They only feed the “seen in gossip” signal of the sent-transaction watch, never a trust decision, so a malformed announcement yields the hashes that can be read, or none, and at most 256 per message.
 
 > [!WARNING]
-> **Stale or inaccurate comments**The module doc links to `` [`super::session`] ``, which does not exist in this crate; the session is `myotis-net`'s `el::eth::session`. The `BlockBody` doc (line 375) says “legacy re-encoded, typed kept as the envelope”, while the code below it (lines 408–414) keeps every transaction exactly as it arrived.
+> **Stale or inaccurate comments**<br>The module doc links to `` [`super::session`] ``, which does not exist in this crate; the session is `myotis-net`'s `el::eth::session`. The `BlockBody` doc (line 375) says “legacy re-encoded, typed kept as the envelope”, while the code below it (lines 408–414) keeps every transaction exactly as it arrived.
 
 <a id="f-myotis-wire-src-eth2-mod-rs"></a>
 
@@ -1081,7 +1081,7 @@ while pos < raw.len() && items.len() < expected_count {
 *[Ownership & moves](01-primer.md#primer-ownership) · [Iterators & closures](01-primer.md#primer-iterators-closures)* The older entry point `decode_multi_chunk_response` (lines 271–281) calls this one and drops the digests with `.into_iter().map(|(_, payload)| payload).collect()`. `into_iter()` consumes the vector, so each payload `Vec` is moved out, not copied.
 
 > [!WARNING]
-> **Stale or inaccurate comments**The module doc links to `` [`crate::reqresp`] `` and `` [`crate::protocols`] ``, paths that existed in `myotis-net`. In this crate there is no `reqresp` (it stayed in `myotis-net`), and the protocols module is `crate::eth2::protocols`. The comment at line 324 justifies the `< 10` threshold with “10 bytes is the longest u64 varint”, but this `read_varint` refuses anything longer than 5 bytes. The threshold is looser than it needs to be, not wrong.
+> **Stale or inaccurate comments**<br>The module doc links to `` [`crate::reqresp`] `` and `` [`crate::protocols`] ``, paths that existed in `myotis-net`. In this crate there is no `reqresp` (it stayed in `myotis-net`), and the protocols module is `crate::eth2::protocols`. The comment at line 324 justifies the `< 10` threshold with “10 bytes is the longest u64 varint”, but this `read_varint` refuses anything longer than 5 bytes. The threshold is looser than it needs to be, not wrong.
 
 <a id="f-myotis-wire-src-snap-mod-rs"></a>
 
@@ -1211,7 +1211,7 @@ fn decode_proof(item: Option<rlp::View<'_>>) -> Result<Vec<Vec<u8>>, CoreError> 
 *[Iterators & closures](01-primer.md#primer-iterators-closures)* `nodes.clone().nth(MAX_PROOF_NODES)` looks ahead on a *copy* of the iterator: a view iterator is a few words of position state, so cloning it is cheap and leaves `nodes` at the start. If a 1025th node exists, the proof is refused before any node is copied or hashed. `<[u8]>::to_vec` is a method named as a function and passed where a closure would otherwise go.
 
 > [!WARNING]
-> **Stale or inaccurate comments**Line 24 says `OUR_SNAP_VERSIONS` must match the capabilities in `rlpx::transport::encode_hello`, “pinned by its round-trip test”. `encode_hello` now lives in `rlpx::hello` (re-exported by `transport`), and the round-trip test in `transport.rs` checks the snap capabilities against literals, not against this constant. The section comment at lines 550–555 says wiring the empty responders into an inbound read loop is future work (“EL-A7”); `myotis-net/src/el/peer.rs` already answers inbound snap requests with `encode_empty_range` and `encode_empty_codes`.
+> **Stale or inaccurate comments**<br>Line 24 says `OUR_SNAP_VERSIONS` must match the capabilities in `rlpx::transport::encode_hello`, “pinned by its round-trip test”. `encode_hello` now lives in `rlpx::hello` (re-exported by `transport`), and the round-trip test in `transport.rs` checks the snap capabilities against literals, not against this constant. The section comment at lines 550–555 says wiring the empty responders into an inbound read loop is future work (“EL-A7”); `myotis-net/src/el/peer.rs` already answers inbound snap requests with `encode_empty_range` and `encode_empty_codes`.
 
 <a id="f-myotis-wire-src-snap-fetch-rs"></a>
 
@@ -1297,7 +1297,7 @@ pub fn verify_storage(
 *[Ownership & moves](01-primer.md#primer-ownership)* `verify_bytecode(code_hash, returned: &[Vec<u8>])` borrows the peer's codes, so the matching one is returned as `code.clone()`, an owned copy.
 
 > [!WARNING]
-> **Stale or inaccurate comments**The module doc (lines 13–18) lists as “Deferred to EL-A7” peer rotation, root-unavailable marking and “answering inbound snap `Get*` with empty responses”. The managed peer it waited for now exists in `myotis-net`, and at least the last item is done: `el/peer.rs` answers inbound snap requests with the empty responders from `messages.rs`. The other two items were not checked for this stop.
+> **Stale or inaccurate comments**<br>The module doc (lines 13–18) lists as “Deferred to EL-A7” peer rotation, root-unavailable marking and “answering inbound snap `Get*` with empty responses”. The managed peer it waited for now exists in `myotis-net`, and at least the last item is done: `el/peer.rs` answers inbound snap requests with the empty responders from `messages.rs`. The other two items were not checked for this stop.
 
 ## The shims left behind in myotis-net
 

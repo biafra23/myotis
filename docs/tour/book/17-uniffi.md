@@ -6,9 +6,9 @@ You asked how the UniFFI API works and what it looks like. This stop follows one
 
 ## Rust you will practise
 
-- **Ownership without a destructor** — `RustBuffer` is a `Vec<u8>` taken apart into pointer, length and capacity, with `ManuallyDrop` and `Vec::from_raw_parts` moving ownership across the C boundary.
+- **Ownership without a destructor** `RustBuffer` is a `Vec<u8>` taken apart into pointer, length and capacity, with `ManuallyDrop` and `Vec::from_raw_parts` moving ownership across the C boundary.
 - **Code that writes code** — What a function-like macro (`setup_scaffolding!`) and an attribute macro (`#[uniffi::export]`) expand to, how `quote!` builds Rust code, and how a `const fn` computes a checksum at compile time.
-- **Traits as a conversion vocabulary** — `FfiConverter`, `Lift`, `Lower` and `LowerReturn`, generic over a crate-local tag type because of the orphan rule, derived with a `macro_rules!` macro; and `catch_unwind` versus `panic = "abort"`.
+- **Traits as a conversion vocabulary** `FfiConverter`, `Lift`, `Lower` and `LowerReturn`, generic over a crate-local tag type because of the orphan rule, derived with a `macro_rules!` macro; and `catch_unwind` versus `panic = "abort"`.
 
 ## The short answer
 
@@ -31,7 +31,7 @@ In Myotis the exported surface is deliberately simple. The 55 functions in `ffi.
 | `uniffiGenerateKotlin`, `cargoNdkAndroid`, `verifyAndroidJniLibs` | root `build.gradle.kts`, wired from `myotis-engine/build.gradle.kts` | you | Build the libraries, regenerate and patch the bindings, check the Android libraries. |
 
 > [!NOTE]
-> **If you know JNI**
+> **If you know JNI**<br>
 >
 > With JNI you declare `native` methods in Java and write a C (or Rust) function per method named `Java_pkg_Class_method`, which receives a `JNIEnv*` and converts every `jstring` by hand. Myotis did exactly that until July 2026. UniFFI removes both hand-written halves. The Kotlin `external fun` declarations are still JVM `native` methods, but JNA's `Native.register` supplies their implementation at run time: a generic dispatcher in `libjnidispatch` converts each argument according to its declared Java type and calls the C symbol with the same name. Nothing on the Rust side knows about the JVM.
 
@@ -400,7 +400,7 @@ pub unsafe extern "C" fn #ffi_rustbuffer_reserve_ident(
 *[unsafe & FFI](01-primer.md#primer-unsafe-ffi) · [Ownership & moves](01-primer.md#primer-ownership)* The four per-crate buffer functions: `ffi_myotis_engine_rustbuffer_alloc`, `_from_bytes`, `_free` and `_reserve`. Each is a two-line forwarder to `uniffi_core` (section 3). Each library gets its own copies, with the crate name in the symbol, because each `cdylib` carries its own allocator: a buffer must go back to the library that made it. Notice that `_alloc` is a safe `extern "C" fn`, while the three that receive a buffer or foreign bytes are `unsafe extern "C" fn`: they rely on the caller's promise that the buffer came from this library. The same macro emits `rust_future_*` functions (line 108) for async exports, which Myotis does not use, and a re-export hack for builds that combine several UniFFI crates in one library.
 
 > [!TIP]
-> **Why a tag type: the orphan rule**
+> **Why a tag type: the orphan rule**<br>
 >
 > Rust lets you write `impl Trait for Type` only if your crate defines the trait or the type. Otherwise two crates could provide conflicting impls. UniFFI wants every consumer crate to be able to implement its conversion traits, even for types from third crates. The trick: the traits take a type parameter, `FfiConverter<UT>`, and the generated code always uses `FfiConverter<crate::UniFfiTag>`. Because `UniFfiTag` is local to `myotis_engine`, an impl mentioning it is allowed there. For built-in types, `uniffi_core` writes blanket impls such as `unsafe impl<UT> FfiConverter<UT> for String`, which apply to every tag. Java has no orphan rule, because Java has no impls outside a class; the nearest analogy is a type-class instance.
 
@@ -484,7 +484,7 @@ pub fn lift_closure(&self, self_lift: Option<TokenStream>) -> TokenStream {
 
 Filling in both templates for `request_account_json` gives roughly the following. This listing is written by hand from the macro source, not cut from a file. The `trace!` calls and the unused ffi-buffer variant are left out.
 
-*hand-expanded and simplified: the items #\[uniffi::export\] adds next to request\_account\_jsonnot verbatim*
+*hand-expanded and simplified: the items #\[uniffi::export\] adds next to request\_account\_json not verbatim*
 
 ```text
 #[unsafe(no_mangle)]
@@ -1535,7 +1535,7 @@ panic = "abort"
 *[Result, ? and panics](01-primer.md#primer-error-handling) · [Crates, modules & features](01-primer.md#primer-modules-cargo)* **But in Myotis the catch never happens.** With `panic = "abort"` a panic does not unwind at all: the process is aborted on the spot, and `catch_unwind` has nothing to catch. This profile applies to every `--release` build of the workspace, which is how `cargoBuildHost` and `rust/build-android.sh` build the library the hosts load. Only an unwinding build (the default dev profile, for example a plain `cargo test`) would turn a panic into status code 2 and a Kotlin `InternalException`. That is why the `ffi.rs` module doc insists on "panic-free by construction": every failure in `host.rs` is returned as a sentinel or an `{"error": …}` JSON string, and none of the 55 exports returns a `Result`, so code 1 never occurs either.
 
 > [!NOTE]
-> **Two kinds of failure, two channels**
+> **Two kinds of failure, two channels**<br>
 >
 > For Myotis, the UniFFI status channel is a safety net for bugs. Ordinary failures travel *inside* the JSON: `{"error": "…"}` for "could not answer" (Java raises `EngineException`), and a complete result with `failReason` set for "answered, but could not verify". UniFFI could map a Rust `Result<String, MyError>` to a typed Kotlin exception (code 1); the engine does not use that.
 
@@ -3232,7 +3232,7 @@ The costs are real. A result is serialized to text in Rust, copied across, and p
 You do **not** need it when you change only function bodies (`host.rs`, `eljson.rs`, or the inside of an `ffi.rs` function such as the `u64::try_from` in `get_raw_transaction_by_block_json`), or anything in `capi.rs` and the C header. A payload change needs an `ABI_VERSION` bump and golden-test updates instead. Always regenerate through Gradle, never with a direct `cargo run`, so the checksum masking is applied.
 
 > [!WARNING]
-> **What forgetting looks like**
+> **What forgetting looks like**<br>
 >
 > Say you add a parameter to `request_account_json` and forget. On the desktop, the stale Kotlin compiles and the new library loads, but `uniffiCheckApiChecksums` throws for that one function, `RustEngineNative` logs "failed UniFFI validation", and the app quietly runs on the Java engine. In an Android build, `preBuild` regenerates the Kotlin, the wrapper gains the parameter, and the unchanged Java call in `RustEngineNative` no longer compiles: the failure moves to compile time, which is the better place.
 
@@ -3517,7 +3517,7 @@ fun requestAccountJson(handle: Long, address: String, block: String = ""): Strin
 | Loading | JNA at run time | linked into the app binary |
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > - `rust/myotis-engine/Cargo.toml` line 6 describes the crate as a "JNI cdylib", and lines 27–30 speak of "the JNI natives" and claim this is the only crate that pulls in tokio. The JNI layer is gone (UniFFI over JNA), and `myotis-net` depends on tokio as well.
 > - `capi.rs` line 1 calls itself a C ABI "over the same `host` functions the JNI shim wraps", and `read_string`'s doc compares itself with "the JNI shim's `read_string`". Neither shim exists any more.

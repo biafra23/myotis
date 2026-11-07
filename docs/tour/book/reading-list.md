@@ -4,7 +4,7 @@
 
 *After the tour*
 
-Every checkpoint question is tagged with the Rust concepts it tests. When a concept keeps tripping you up, read the chapters listed under it. Links that start with `file://` point to the documentation rustup installed on your Mac; in an ebook reader they may not open, so the chapter titles are given in full: find them in the same book with `rustup doc --book` (or `--std`, `--rust-by-example`).
+Every checkpoint question is tagged with the Rust concepts it tests. When a concept keeps tripping you up, read the chapters listed under it. The Rust documentation links go to doc.rust-lang.org. The same books ship with every Rust toolchain: `rustup doc --book` (or `--std`, `--rust-by-example`) opens your local copy, offline.
 
 ## By concept
 
@@ -197,20 +197,20 @@ The Ethereum knowledge the code assumes. The project's own design documents are 
 - **Repo docs**: [docs/spec/03-state-verification-and-evm.md](../../spec/03-state-verification-and-evm.md) *((online only))*
 - **Repo docs**: [docs/spec/05-engine-api-bindings.md and 07-el-implementation-plan.md](../../spec/05-engine-api-bindings.md) *((online only))*
 
-## Your offline library
+## The library
 
-Two kinds of book work without a network: your own ebooks, and the Rust documentation that rustup installs with every toolchain. When this page was built on a machine with those docs, the links below open the local copies; otherwise they point to doc.rust-lang.org. If a link doesn't open, run `rustup doc --book` (or `--std`, `--rust-by-example`, `--nomicon`) in a terminal. It opens the same pages from whichever toolchain is current.
+The Rust books below ship with every toolchain too: `rustup doc --book` opens your local copy.
 
-- **The Rust Programming Language**[local copy](https://doc.rust-lang.org/book/index.html) — The current edition. Chapter numbers here follow it: 4 ownership, 10 generics, traits and lifetimes, 15 smart pointers, 16 concurrency, 17 async, 18 trait objects, 19 patterns, 20 unsafe code and macros.
-- **Rust by Example**[local copy](https://doc.rust-lang.org/rust-by-example/index.html) — Short runnable pages. “Scoping rules” (RAII, moves, borrowing, lifetimes) is the memory-model core.
-- **The standard library docs**[local copy](https://doc.rust-lang.org/std/index.html) — For the exact types this code uses: Arc, Mutex, atomics, CString, Future. The search box works offline too.
-- **The Rustonomicon**[local copy](https://doc.rust-lang.org/nomicon/index.html) — The book on unsafe Rust. Read “FFI” and “Ownership Based Resource Management” after Stops 16 and 17.
+- **The Rust Programming Language** [online](https://doc.rust-lang.org/book/index.html) — The current edition. Chapter numbers here follow it: 4 ownership, 10 generics, traits and lifetimes, 15 smart pointers, 16 concurrency, 17 async, 18 trait objects, 19 patterns, 20 unsafe code and macros.
+- **Rust by Example** [online](https://doc.rust-lang.org/rust-by-example/index.html) — Short runnable pages. “Scoping rules” (RAII, moves, borrowing, lifetimes) is the memory-model core.
+- **The standard library docs** [online](https://doc.rust-lang.org/std/index.html) — For the exact types this code uses: Arc, Mutex, atomics, CString, Future. The search box works offline too.
+- **The Rustonomicon** [online](https://doc.rust-lang.org/nomicon/index.html) — The book on unsafe Rust. Read “FFI” and “Ownership Based Resource Management” after Stops 16 and 17.
 - **Rust for Rustaceans** (Jon Gjengset)*(EPUB · complete ·)* — Written for experienced programmers. Chapter 1 “Foundations” is the best single read on the memory model. Chapters 8, 10 and 11 cover async, concurrency and FFI.
 - **Hands-on Rust** (Herbert Wolverson)*(EPUB · complete ·)* — A game-building book. Chapter 2 is a gentle introduction to structs, vectors and enums, and Chapter 3 shows an enum-driven state machine.
 - **Command-Line Rust** and **Systems Programming with Rust** (Ken Youens-Clark)*(EPUB · early release, ch. 1–10 ·)* — These are the same book: “Systems Programming with Rust” was the early-release title. Both of your copies stop at chapter 10, so only chapters 1–10 are recommended.
 - **Programming Rust, 2nd Edition** (Blandy, Orendorff, Tindall)*(EPUB · early release, ch. 1–2 ·)* — Your copy contains only “Why Rust?” and “Basic Types”. “Basic Types” is still useful here: its sections on pointer types, slices and byte strings come up throughout this code.
-- **The Myotis docs**[on GitHub, and under docs/ in your checkout](../../README.md) — The documents the code refers to, grouped by kind: `spec/` (the re-implementation specification), `how-it-works/privacy-and-tor.md`, `design-history/lc-server-design.md`, `guides/android-library.md`. The tour quotes the code at `5263a421`, when these lived directly under `docs/`; your checkout is newer.
-- **Command Line Applications in Rust***(online only)* — rust-cli.github.io/book: argument parsing, anyhow errors, signal handling. Relevant for roost, rpcd and tor-poc. It is not installed locally.
+- **The Myotis docs** [on GitHub, and under docs/ in your checkout](../../README.md) — The documents the code refers to, grouped by kind: `spec/` (the re-implementation specification), `how-it-works/privacy-and-tor.md`, `design-history/lc-server-design.md`, `guides/android-library.md`. The tour quotes the code at `5263a421`, when these lived directly under `docs/`; your checkout is newer.
+- **Command Line Applications in Rust** *(online only)* — rust-cli.github.io/book: argument parsing, anyhow errors, signal handling. Relevant for roost, rpcd and tor-poc. It is not installed locally.
 
 ---
 

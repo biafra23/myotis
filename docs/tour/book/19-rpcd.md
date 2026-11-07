@@ -6,8 +6,8 @@ A new crate since September, and a *binary* crate: one executable that links the
 
 ## Rust you will practise
 
-- **A binary crate** — `main.rs` + `mod` files, clap's derive macros, `Result<(), String>` and `?` with `From`, `#[cfg(unix)]`/`#[cfg(windows)]`, and a drop guard that stops the engine on every exit path.
-- **Threads and channels** — `Arc`, a bounded `mpsc::sync_channel` shared through `Arc<Mutex<Receiver>>`, `try_send` giving the value back, atomics, and `Cell` for per-request state that never leaves its thread.
+- **A binary crate** `main.rs` + `mod` files, clap's derive macros, `Result<(), String>` and `?` with `From`, `#[cfg(unix)]`/`#[cfg(windows)]`, and a drop guard that stops the engine on every exit path.
+- **Threads and channels** `Arc`, a bounded `mpsc::sync_channel` shared through `Arc<Mutex<Receiver>>`, `try_send` giving the value back, atomics, and `Cell` for per-request state that never leaves its thread.
 - **Traits as seams** — A `Send + Sync` `Engine` trait with a real and a fake implementation, a generic `Router<E: Engine>`, a `Read` decorator, a `Fail` enum mapped to error codes in one place, and checked arithmetic over attacker-controlled bytes.
 
 ![A request through myotis-rpcd. An HTTP client sends a request. One of four intake threads checks the Host and Content-Type headers and parses the body; a large or chunked body is first received on a body-reader thread with a deadline. A body that names only non-blocking methods is answered by the router on the intake thread. A body that names a gated method is sent through a bounded channel to one of the read workers; if the channel is full the request is refused with 503. A read worker runs the router, which holds the request until the node is ready or the ready-wait budget runs out, then calls the engine's blocking ffi functions.](img/19-rpcd-1.svg)
@@ -719,7 +719,7 @@ fn fail_parts(&self, method: &str, fail: Fail) -> (i64, String, Option<String>) 
 | `3` | The call reverted: a verified answer, with the revert data. | `revert_fail` |
 
 > [!WARNING]
-> **The project rule behind -32602**
+> **The project rule behind -32602**<br>
 >
 > The repository's `CLAUDE.md` (section "Trust") says a parameter that can change the answer must be "APPLIED or REFUSED — never accepted and silently ignored", and that a refusal uses the permanent `-32602`, because `-32000` is documented as retryable and a client would spin on it. The rule came from `eth_call` once dropping a state override (#314). In this file you can see it everywhere: too many arguments, `params` that are not an array, `blockOverrides` (never applied, so present means refused, with a message that says "rejected, not ignored"), an unknown state-override field, `safe` and `earliest`, bare-digit block numbers, a non-boolean `fullTransactions`, both `data` and `input` set and different, blob fields, a `chainId` that is not this chain's, and a missing `eth_feeHistory` newest block. The opposite class, "not now", stays `-32000`: a block a little ahead of the head, a hash the node cannot place yet, a node that is not ready.
 
@@ -1319,7 +1319,7 @@ fn a_number_pinned_read_waits_at_most_once() {
 *[Tests](01-primer.md#primer-testing) · [Threads, Send & Sync](01-primer.md#primer-concurrency)* A timing test: with a 300 ms hold on a node that never becomes ready, a number-pinned read that passes through `pin_servable`, `in_window` and the account read takes at least 300 ms and less than 550 ms, so it waited once, not three times. The comment "each used to wait" records the bug this pins.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The doc comment on `a_block_hash_is_served_as_the_canonical_block_it_names` (lines 381–384) says the hash is resolved "through the engine's own `eth_getBlockByHash`". The router now resolves it through `resolve_block_hash` (ABI 47, header only), and the test stubs that method (`"resolve"`), not `block_hash`.
 

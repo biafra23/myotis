@@ -21,6 +21,8 @@ import subprocess
 import sys
 import tarfile
 
+if sys.version_info < (3, 12):
+    sys.exit("the tour's build needs Python 3.12 or newer (tarfile's extraction filter)")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from highlight import highlight  # noqa: E402
 

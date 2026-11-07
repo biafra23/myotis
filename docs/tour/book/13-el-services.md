@@ -6,8 +6,8 @@ The execution-layer services that sit just below the reader facade. The EVM's ne
 
 ## Rust you will practise
 
-- **Sync code that waits on async code** — `Handle::block_on` on a blocking-pool thread, borrowed futures driven by `join_all`, and `tokio::pin!` + `select!` around a request.
-- **Moving big state instead of copying it** — `mem::take`, `BTreeMap::split_off`, partial moves and the `..ix` struct update.
+- **Sync code that waits on async code** `Handle::block_on` on a blocking-pool thread, borrowed futures driven by `join_all`, and `tokio::pin!` + `select!` around a request.
+- **Moving big state instead of copying it** `mem::take`, `BTreeMap::split_off`, partial moves and the `..ix` struct update.
 - **Borrowing one field while mutating another** — disjoint field borrows inside `retain` closures, and cloning a key so a shared borrow ends before a `remove`.
 
 Seven files, three themes. Read them in this order:
@@ -71,14 +71,14 @@ impl CallOutcome {
 *[Enums & pattern matching](01-primer.md#primer-enums-patterns) · [Result, ? and panics](01-primer.md#primer-error-handling)* **Match guards, in order.** `joined` is owned, so `Err(EvmError::Reverted { data })` moves the revert payload out of the error into the new variant: no copy. The next three arms bind the whole error as `e` and test it with `if` guards; arms are tried top to bottom, so the order is the policy. A refusal (a call this build can never answer) becomes `Refused`, which the host serves as the permanent `-32602`; an infeasible call (out of gas, fee cap, funds, #509) is an answer served as geth serves it; everything else is the retryable `Unavailable`. This is the CLAUDE.md rule “applied or refused, never silently ignored” in type form. The four sibling types repeat the same match.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The doc on `CallOutcome` itself (lines 50–53) still says the Java contract treats “every other outcome (revert, halt, unavailable)” as no answer. It predates the `Refused` and `Infeasible` variants, whose own docs (and `myotis-engine`'s `call_json`) give them a permanent `-32602` and a geth-style `-32000`. Trust the variant docs. The first edition's note about this module doc listing reputation and batching as “deferred” no longer applies: the doc now describes both.
 
 #### The bridge
 
 > [!TIP]
-> **The sync→async bridge, step by step**
+> **The sync→async bridge, step by step**<br>
 >
 > - The async reader builds the oracle in `snap_oracle` (reader.rs): a snapshot of `pool.snap_peers()`, `Handle::current()` (a cloneable handle to the engine's runtime), the quality sink and the read stats. `PoolOracle::new` also calls `Operation::current()`. That task-local is visible only while the request's future is being polled, and task-locals do not reach `spawn_blocking` threads, so it is captured here, eagerly.
 > - The reader runs revm through `request::blocking(move || …)` ([Stop 12](12-el-pool.md)), on a thread from tokio's blocking pool.
@@ -553,7 +553,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 *[Result, ? and panics](01-primer.md#primer-error-handling) · [Threads, Send & Sync](01-primer.md#primer-concurrency)* `let write = || -> std::io::Result<()> { … };` is a closure with its own return type, so `?` works inside it, and one cleanup path covers all three failure points. The temp file is removed on any failure: the likely trigger is a full disk, and a leftover temp at snapshot size keeps it full. The temp name comes from `next_tmp_path`, which appends the pid and a `static SEQ: AtomicU64` counter. A `static` inside a function is still one process-wide value. Per-call names became necessary once the fsync moved out from under the index lock: two writers in one process would otherwise share a temp file, and one could truncate the other's or write into the renamed live file.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The `write_atomic` doc (lines 1015–1016) says it “is not a repo-wide primitive”. Its own module does use it alone for index files, but `myotis-engine/src/host.rs` (line 624) also calls it for a JSON file. The `SnapshotId` doc (line 1442) speaks of “one v2 snapshot file”; `of_frame` accepts v3 frames as well.
 
@@ -1238,7 +1238,7 @@ pub fn overlay(&mut self, sender: &[u8; 20], mined_count: u64, now: Instant) -> 
 - *[Result, ? and panics](01-primer.md#primer-error-handling)* `saturating_add(1)`: a nonce of `u64::MAX` must not wrap (release) or panic (debug).
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > `PendingNonceTracker::has` (line 211) says “Whether a live entry exists”. It only checks the key, so it also returns `true` for an entry past its TTL that no `overlay` call has evicted yet. It is a logging helper, so the effect is cosmetic.
 

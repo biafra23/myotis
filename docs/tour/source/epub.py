@@ -300,8 +300,14 @@ def page(title, body, file_label):
             f'<body class="{file_label}">\n{body}\n</body>\n</html>\n')
 
 
-def reading_chapter(progress_html):
+def reading_chapter(progress_html, online=False):
     lib = re.search(r'<h2 class="section-title">Your offline library</h2>.*?</ul>', progress_html, re.S).group(0)
+    if online:
+        lib = (lib.replace("Your offline library", "The library")
+                  .replace("local copy", "online")
+                  .replace('<span class="offline-ok">offline</span>', ""))
+        lib = re.sub(r'<p class="code-note">.*?</p>', '<p class="code-note">The Rust books below ship with every '
+                     'toolchain too: <code>rustup doc --book</code> opens your local copy.</p>', lib, flags=re.S)
     rows = []
     for key, c in B.CONCEPTS.items():
         items = []
@@ -318,10 +324,15 @@ def reading_chapter(progress_html):
     return (
         '<section class="stop" id="progress"><header class="stop-head"><div class="eyebrow">After the tour</div>'
         '<h1>Reading list</h1><p class="lede">Every checkpoint question is tagged with the Rust concepts it tests. '
-        'When a concept keeps tripping you up, read the chapters listed under it. Links that start with '
-        '<code>file://</code> point to the documentation rustup installed on your Mac; in an ebook reader they '
-        'may not open, so the chapter titles are given in full: find them in the same book with '
-        '<code>rustup doc --book</code> (or <code>--std</code>, <code>--rust-by-example</code>).</p></header>'
+        'When a concept keeps tripping you up, read the chapters listed under it. '
+        + ('The Rust documentation links go to doc.rust-lang.org. The same books ship with every Rust toolchain: '
+           '<code>rustup doc --book</code> (or <code>--std</code>, <code>--rust-by-example</code>) opens your '
+           'local copy, offline.' if online else
+           'The Rust documentation links open the copy rustup installed where this book was built, or '
+           'doc.rust-lang.org when there was none; in an ebook reader they may not open at all, so every '
+           'chapter title is given in full: find it with <code>rustup doc --book</code> (or <code>--std</code>, '
+           '<code>--rust-by-example</code>).')
+        + '</p></header>'
         f'<h2 class="section-title">By concept</h2>{"".join(rows)}{lib}</section>'
     )
 
@@ -439,7 +450,7 @@ def total_hours(stops):
     return round(sum(route.minutes(int(m["num"])) for m, _ in stops) / 60)
 
 
-def collect(code=None, wb=None):
+def collect(code=None, wb=None, online=False):
     """Expand every stop and assemble the book's chapters as XHTML fragments:
     [(file, title, body, nav label, part)], plus the stop metadata and counts.
     `code`/`wb` replace the excerpt renderers (markdown.py passes its own)."""
@@ -497,7 +508,7 @@ def collect(code=None, wb=None):
     progress = open(os.path.join(HERE, "shell", "progress.html"), encoding="utf-8").read()
     chapters.append(("answers.xhtml", "Checkpoint answers", to_xhtml(answers_chapter(titles)),
                      "Checkpoint answers", "Appendices"))
-    chapters.append(("reading.xhtml", "Reading list", to_xhtml(reading_chapter(progress)),
+    chapters.append(("reading.xhtml", "Reading list", to_xhtml(reading_chapter(progress, online)),
                      "Reading list", "Appendices"))
     return chapters, stops, n_q
 

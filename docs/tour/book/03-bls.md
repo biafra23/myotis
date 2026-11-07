@@ -6,8 +6,8 @@ The smallest real crate, and a good warm-up. It verifies a sync-committee aggreg
 
 ## Rust you will practise
 
-- **Slices and chunks** — `&[u8]` parameters, `chunks_exact`, and a `Vec<&T>` that borrows another `Vec`.
-- **Features and FFI** — `#[cfg(feature = "jni")]`, `#![cfg_attr(not(feature = "std"), no_std)]`, `#[no_mangle]`, `extern "system"` and lifetimes on JNI handles.
+- **Slices and chunks** `&[u8]` parameters, `chunks_exact`, and a `Vec<&T>` that borrows another `Vec`.
+- **Features and FFI** `#[cfg(feature = "jni")]`, `#![cfg_attr(not(feature = "std"), no_std)]`, `#[no_mangle]`, `extern "system"` and lifetimes on JNI handles.
 - **Never-panic style** — Early `return false`, and `Option` with `.ok()?` instead of exceptions.
 
 Some domain first. An Ethereum **sync committee** is 512 validators chosen for about 27 hours. Every slot, the members that saw the block sign its root, and their signatures are combined into one **BLS aggregate signature**. A light client checks that single signature against the participating members' public keys. That one check, `fast_aggregate_verify`, is all this crate does. BLS keys and signatures are points on the BLS12-381 curve, sent in compressed form: 48 bytes for a public key, 96 for a signature. The **DST** (domain separation tag) is a fixed byte string mixed into the hash-to-curve step, so a signature made for one scheme cannot be replayed under another. Ethereum uses the "proof of possession" (POP) variant.
@@ -92,7 +92,7 @@ use blst::BLST_ERROR;
 - *[Protocol & domain](01-primer.md#primer-domain)* **Two trust levels.** `PublicKey::uncompress` skips the subgroup check, which is expensive and repeated 512 times, because the keys arrive Merkle-proven against a header the client already trusts. The signature comes from a peer, so the final call passes `true` for `sig_groupcheck`. The crate docs (lines 11–13) say the Java path makes the same trade-off.
 
 > [!WARNING]
-> **Design decision**
+> **Design decision**<br>
 >
 > The count is capped *before* `n * PK_LEN` is computed. On a 32-bit Android device `usize` is 32 bits, so a huge count could wrap around the length check and trigger a gigantic `with_capacity`. Under the workspace's `panic = "abort"` that would end the host app, not throw an exception it could catch.
 
@@ -156,7 +156,7 @@ mod jni_shim {
 - *[Bytes, strings & formatting](01-primer.md#primer-bytes-strings)* **A signed count.** Java has no unsigned `int`, so the count arrives as `jint` (`i32`). `count.max(0) as usize` clamps a negative value to 0 before the cast; a plain `as usize` on `-1` would produce a huge number. The cap is checked here too, so an absurd count is refused before three array copies.
 
 > [!NOTE]
-> **JVM lens**
+> **JVM lens**<br>
 >
 > On the Java side this is a `static native boolean nativeFastAggregateVerify(byte[] pubkeys, int n, byte[] msg, byte[] sig)` in `NativeBlsBackend`, loaded with `System.loadLibrary("myotis_bls")`. Passing the whole committee as one flat array means a single boundary crossing per verification.
 

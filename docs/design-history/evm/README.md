@@ -5,11 +5,11 @@ Besu's standalone `evm` artifact running against a SNAP-backed `StateOracle`.
 The **Rust engine** (the default engine) has its own EVM, `rust/myotis-evm`
 (revm behind a `SnapStateOracle` trait, same proof-verified state model), which
 is where `eth_call`/`eth_estimateGas` run on most installs today; its design
-lives in `../reimplementation/03-state-verification-and-evm.md` and
-`../reimplementation/07-el-implementation-plan.md`. The phase documents below
+lives in `../../spec/03-state-verification-and-evm.md` and
+`../../spec/07-el-implementation-plan.md`. The phase documents below
 are the Java engine's history and are kept as written, with status notes where
 the code has since moved on. For cross-cutting
-documentation see `../architecture-doc.md` and `../implementation-status.md`.
+documentation see `../../how-it-works/architecture-doc.md` and `../../how-it-works/implementation-status.md`.
 
 | Document | Scope |
 |----------|-------|

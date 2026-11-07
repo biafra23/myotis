@@ -6,8 +6,8 @@ The Rust engine's EVM: `eth_call`, `eth_estimateGas`, `eth_createAccessList`, `d
 
 ## Rust you will practise
 
-- **Borrowed views, copied handles** — `Option<&'a T>` fields, small `Copy` structs passed by value, `let … else` that copies a value out of `&self`.
-- **Interior mutability, two ways** — `Mutex` guards that end at `;` or `}`, `RefCell` for one-thread recorders, `AtomicU64` counters behind `&self`.
+- **Borrowed views, copied handles** `Option<&'a T>` fields, small `Copy` structs passed by value, `let … else` that copies a value out of `&self`.
+- **Interior mutability, two ways** `Mutex` guards that end at `;` or `}`, `RefCell` for one-thread recorders, `AtomicU64` counters behind `&self`.
 - **Closures and ownership** — an `FnMut` callback that borrows, a `Copy` closure used twice, boxed `Fn` handlers that must clone what they captured.
 
 ## The shape of a call
@@ -17,7 +17,7 @@ A host asks `myotis-net`'s `ElReader` ([stop 14](14-el-reader.md)) for an answer
 The executor now has two families of entry points. The *view-call* family (`call_view`, `call_view_from`, `call_view_overridden`, `create_view`, `estimate_gas`) takes a target, calldata and value. The *transaction-object* family (`call_tx`, `estimate_tx`, `create_access_list`, `trace_call`) takes a whole `TxRequest`: gas, fees, nonce, access list, EIP-7702 authorizations. Every field the request names is applied, or the request is refused. `TxRequest` itself, the tracers and `eth_simulateV1` live in the files of [stop 8](08-evm-sim.md). This stop covers the foundation they all stand on.
 
 > [!NOTE]
-> **What changed since September**
+> **What changed since September**<br>
 >
 > The crate grew from 12 files and 4,873 lines to 26 files and 15,187. Half of that is stop 8's. In this stop's files: the error set went from 8 variants to 25, each sorted as a *refusal* or an *infeasible* answer for the JSON-RPC layer. The prefetch loop's cap went from 4 to 12, the oracle now bounds discovery in time, and waves follow the code of called contracts (issue #532). `BLOCKHASH`, which always failed before, is served from verified data (#664). The fork table gained Chiado, Osaka and Sepolia's Amsterdam rung. ENS gained Genome's `.gno` names on Gnosis, ownership reads, and ENSv2 awareness (#671).
 
@@ -156,7 +156,7 @@ impl From<OracleError> for EvmError {
 *[Box, Rc, Arc & Drop](01-primer.md#primer-smart-pointers) · [Enums & pattern matching](01-primer.md#primer-enums-patterns)* Two variants wrap another `EvmError`: `FailedWithGas { gas, error: Box<EvmError> }` and `CallFailed { supplied_gas, error: Box<EvmError> }` (lines 95 and 110). An enum's size is the size of its largest variant, so an enum that contained itself directly would need infinite size. The `Box` puts the inner error on the heap and leaves a pointer in the variant. `kind()` (lines 176–209) returns a `&'static str`, a string literal that lives for the whole program, so the caller gets a name it can log without owning anything. Its arm `EvmError::FailedWithGas { error, .. } | EvmError::CallFailed { error, .. } => error.kind()` binds the same name in both alternatives, which Rust allows only when the types agree. `kind()` exists so an info-level log line names the error without its values (an address, a balance; #532 review).
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The `ForkTooOld` doc (line 25) and its message (line 222, “pre-London blocks are not supported”) describe only mainnet. On Sepolia, Gnosis and Chiado the floor is Shanghai (see [fork.rs](#f-myotis-evm-src-fork-rs)). The old `UnsupportedChain` text that said “mainnet-only” has been fixed.
 
@@ -236,7 +236,7 @@ pub trait SnapStateOracle: Send + Sync {
 *[Ownership & moves](01-primer.md#primer-ownership)* The fixture's builders show two styles. `with_account(mut self, …) -> Self` and `with_block_hash(mut self, …) -> Self` take the builder by value and hand it back, for chaining. `with_bytecode(&mut self, …) -> [u8; 32]` borrows instead, because it returns the computed code hash.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The `OracleError` doc (lines 60–62) says the execution arms (Reverted, OutOfGas, …) are “added in a later Milestone-C slice”. They exist, in `EvmError`.
 
@@ -474,7 +474,7 @@ impl DatabaseRef for OracleDatabase {
 ```
 
 > [!TIP]
-> **Why `DatabaseRef` and not `Database`**
+> **Why `DatabaseRef` and not `Database`**<br>
 >
 > revm's `Database` trait takes `&mut self`; `DatabaseRef` has the same methods on `&self`, and revm implements it for `&T` and `Arc<T>` too. With `&self`, the executor keeps ownership of *one* database and *lends* it to every loop iteration, so everything learned in iteration 1 is still there in iteration 2. The price is what you saw above: internal state must use interior mutability. `type Error = OracleError;` is an **associated type**: each implementor picks its own error type.
 
@@ -542,7 +542,7 @@ fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
 *[Result, ? and panics](01-primer.md#primer-error-handling)* Also in this file: the access set is gas-bounded (a 30 M run touches at most about 14k slots, says the `AccessSet` doc). `verified_storage` (lines 460–493) is the three-tier slot read without overrides; `BLOCKHASH` uses it so a caller's override of the history contract cannot change a block hash, since `BLOCKHASH` reads the chain, not the hypothesis. Bytecode is re-hashed after the oracle's own check, so it is verified twice. `to_bytecode` (lines 300–302) loads bytecode starting with `0xEF01` that is not a valid EIP-7702 delegation as legacy code instead of calling revm's panicking constructor; under the workspace's `panic = "abort"` a panic would kill the host.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The `ViewCache` doc (lines 94–98) says in-flight deduplication “arrives with the async prefetch layer (a later Milestone-C slice)”. The prefetch layer (`prefetch_batch`) exists now; whether it deduplicates in flight is decided in `myotis-net`, not here, so the sentence is at least out of date. The module doc's “three tiers” (line 5) leaves out the override layer, which the struct doc on line 171 describes.
 
@@ -636,7 +636,7 @@ pub fn spec_for(chain_id: u64, block_number: u64, timestamp: u64) -> Result<Spec
 *[Enums & pattern matching](01-primer.md#primer-enums-patterns)* `match` on integers, with `other => …` binding everything else. `11_155_111` uses digit separators. The `match` is the function's value, with no `return`. Each per-chain function (lines 80–184) is an `if`/`else if` chain that is itself the tail expression; in three of them the newest rung (Osaka, or Amsterdam on Sepolia) is checked first with an early `return`.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The module doc (lines 7–8) says “Everything below London throws”. That is true for mainnet only; the other three chains fail below Shanghai.
 
@@ -1122,7 +1122,7 @@ const _: fn() = || {
 *[Traits, generics & dyn](01-primer.md#primer-traits-generics)* A **static assertion**: an unnamed constant holding a closure that never runs. The compiler still type-checks it, so if `OracleError` stopped satisfying those bounds, the crate would stop compiling. It has no run-time cost.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > Line 1661 says the assertion makes “`run` stop compiling”. No function named `run` exists any more (there is a closure parameter `run` in `converge_runs`, which is not what is meant). The module doc (lines 10–17) says the sender need not “hold a balance, or pay the base fee”; that is true of the view-call family, while the transaction-object family now checks the fee cap and the sender's funds itself. The test `sepolia_context_executes_with_its_chain_id` (line 4208) blames `build_fill()`; the code now uses `build()`, whose own comment (line 1518) is correct.
 
@@ -1472,7 +1472,7 @@ pub fn verify_reverse_claim(
 - *[Ownership & moves](01-primer.md#primer-ownership)* `claimed: String` is taken by value. The first arm moves it into `Some(claimed)`, the third into `reverse_claim`; only one arm runs, so the compiler accepts both moves.
 
 > [!NOTE]
-> **CCIP-Read, end to end**
+> **CCIP-Read, end to end**<br>
 >
 > The resolver reverts with `OffchainLookup`. `revert_outcome` (lines 925–935) checks the 4-byte selector after a length check, so `data[..4]` cannot panic, and decodes the tuple; any other revert is “no record”. `ElReader` reports an “offchain” outcome. The JVM host's `CcipDriver` (in `myotis-engine-rust`) performs the gateway request and calls back with `method:"ccipCallback"`. `ccip_callback` then runs the verified `sender.callbackFunction(response, extraData)` call and unwraps the result only if `wrapped`. A second `OffchainLookup` keeps the original `wrapped` flag, and the host enforces the recursion cap.
 

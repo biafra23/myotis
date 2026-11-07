@@ -109,7 +109,7 @@ async fn request(
 *[async/await & tokio](01-primer.md#primer-async) · [Threads, Send & Sync](01-primer.md#primer-concurrency) · [Interior mutability](01-primer.md#primer-interior-mutability)* Read this excerpt as a recap of the whole tour. `fetch_add` on an atomic, a `oneshot` channel as a single-use future, a block scoping a tokio mutex guard, a “check `closed` under the same lock” race fix, an RAII `PendingGuard` that cleans up when the future is dropped mid-flight, `timeout` producing a nested `Result`, and a `match` that turns every outcome into a `Result<Vec<u8>, String>`.
 
 > [!TIP]
-> **The memory model in five sentences**
+> **The memory model in five sentences**<br>
 >
 > - Every value has **one owner**; assignment and passing by value *move* it, unless the type is `Copy`.
 > - You can lend a value as **many `&T` or one `&mut T`**, and lifetimes are how the compiler proves no loan outlives its owner.

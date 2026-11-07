@@ -6,7 +6,7 @@ A proof of concept for `docs/privacy-and-tor.md`, run by hand against live mainn
 
 ## Rust you will practise
 
-- **Generics with defaults** — `RlpxConnection<S = TcpStream>`, trait bounds, and monomorphisation compared with Java's erased generics.
+- **Generics with defaults** `RlpxConnection<S = TcpStream>`, trait bounds, and monomorphisation compared with Java's erased generics.
 - **Ownership down the layers** — Stream → RLPx connection → eth session, each owning the one below.
 - **Explicit lifetimes** — Why `fn f<'a>(…, peers: &'a [Peer], …) -> Option<&'a Peer>` needs the annotation.
 
@@ -60,7 +60,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> RlpxConnection<S> {
 `impl<S: AsyncReadExt + AsyncWriteExt + Unpin>` reads as "for any tokio byte stream that may be moved between polls". The extension traits are implemented for every `AsyncRead`/`AsyncWrite` type, and Arti's `DataStream` implements those when its `tokio` feature is enabled. `dial` stays in a separate `impl RlpxConnection<TcpStream>` block (line 65), because only TCP can be dialled that way. Since the September tour the struct also carries `traffic: Option<Arc<TrafficMeter>>`, the data-usage counter; `handshake_over` passes `None` to the new `handshake_metered`, so tor-poc counts nothing.
 
 > [!NOTE]
-> **JVM lens**
+> **JVM lens**<br>
 >
 > It is like a protocol class written against `InputStream`/`OutputStream` that you hand a Tor socket's streams, with one difference. Java erases generics to one implementation that dispatches at run time; Rust *monomorphises*, compiling a specialised copy of the handshake for `S = DataStream` next to the `TcpStream` one, with no virtual calls. The default parameter (`S = TcpStream`) is something Java generics cannot express.
 
@@ -417,7 +417,7 @@ pub struct EthConfig {
 ```
 
 > [!WARNING]
-> **Status at this snapshot**
+> **Status at this snapshot**<br>
 >
 > It compiles again. A `cargo check --offline --locked --manifest-path rust/tor-poc/Cargo.toml` of this snapshot (rustc 1.99.0, run while writing this stop) finished without errors or warnings. It was not run against the network. The values in `mainnet_eth_config` still match `ElConfig::mainnet()` in `reader.rs` (network id 1, the genesis hash, fork id `07c9462e` with no next fork), but nothing checks that they stay in step. Also: `let _ = advertised;` near the end of `query_over_tor` (line 256) is a leftover that does nothing; `advertised` is an `Option<u64>` that was already used.
 

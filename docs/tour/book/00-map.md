@@ -33,7 +33,7 @@ Keep these in mind. Many strange-looking lines exist because of one of them.
 | 5 · verify, never trust | Every answer is proven. BLS sync-committee signatures anchor the beacon chain, the beacon chain anchors an execution block hash, the block hash anchors headers, headers anchor state roots, and Merkle-Patricia proofs anchor accounts and storage. | Stops 6, 12 and 14. A peer that cannot prove its data is skipped, and a read that cannot be proven fails. It never guesses. |
 
 > [!NOTE]
-> **JVM lens**
+> **JVM lens**<br>
 >
 > Rule 3 is the biggest culture shock. In Java, an unexpected `NullPointerException` in a background thread gets logged and the app keeps running. Here, the equivalent (`unwrap()` on a `None`) would take the whole Android process down. That is why you will see `let Some(x) = … else { return false; };` in places where Java code would simply dereference.
 

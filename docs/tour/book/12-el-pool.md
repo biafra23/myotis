@@ -7,7 +7,7 @@ How a state root a stranger handed you becomes one you may answer a wallet with,
 ## Rust you will practise
 
 - **RAII as control flow** — permits and worker counts moved into `spawn_blocking`, a `Drop` that cancels, a `Drop` that breaks an `Arc` cycle, a `Drop` that stamps a timestamp.
-- **Two kinds of semaphore permit** — `SemaphorePermit<'static>` from a `static` semaphore versus `OwnedSemaphorePermit` from an `Arc<Semaphore>`, and why both can travel into another task.
+- **Two kinds of semaphore permit** `SemaphorePermit<'static>` from a `static` semaphore versus `OwnedSemaphorePermit` from an `Arc<Semaphore>`, and why both can travel into another task.
 - **Borrowing through a guard** — deref coercion of a `MutexGuard`, copying a field out before you mutate, and `&mut *guard` to split field borrows.
 
 ## The trust chain, top to bottom
@@ -21,7 +21,7 @@ The link has three forms. The **fast path**: the peer's root is one the light cl
 *Trust flows *down* the header chain, from the attested block to the peer's block, because a `parentHash` commits a header to its parent and never to its children. The anchor is therefore the *newest* header (the optimistic head at or above the peer's block). And it is the block *hash*, not the state root, because a state root is public: a peer could copy it into a fabricated header, but cannot make another header hash to the same value. `verify.rs` holds the decision, `anchor.rs` the anchor, [`peer.rs`](11-el-transport.md#f-myotis-net-src-el-peer-rs) fetches the headers, and [the reader](14-el-reader.md) drives it.*
 
 > [!WARNING]
-> **What changed since September**
+> **What changed since September**<br>
 >
 > The header walk used to start at the *finalized* block and climb to the peer's block. That direction was unsound: a peer could name the real finalized block as the parent of a header it made up, with any state root, and the chain verified. The walk now ends at the optimistic head and checks the newest hash, and `verify.rs` carries a test for exactly that attack. Also new: the Gloas pending-hash path in the anchor, a ring of 128 recent heads, a five-second FIFO wait in front of the EVM slots, three new files (`fork_watch.rs`, `readstats.rs`, `getproof.rs`), and a pool that has nearly tripled in size (head-aware ranking, head probes, lagging eviction, scarcity backoff, DNS seeding, a BAL hunt and a Tor reserve).
 
@@ -1327,12 +1327,12 @@ impl Drop for PeerPool {
 ```
 
 > [!WARNING]
-> **An `Arc` cycle, and how it is broken**
+> **An `Arc` cycle, and how it is broken**<br>
 >
 > The loops each own an `Arc<PoolInner>`, and `PoolInner` owns the `Tasks` that own those loops' handles ([`tasks.rs`](11-el-transport.md#f-myotis-net-src-el-tasks-rs)). While the loops run, the reference count can never reach zero, so `Tasks`' own `Drop` would never fire. `Drop for PeerPool`, the outer handle, breaks the cycle by aborting the tasks. Without it, dropping the pool would leave its loops running forever. `stop()` holds the tokio `peers` guard across `peer.close().await`, which is legal for an async mutex and would not be for a `std` one. `Drop` cannot `.await`, so it uses `try_lock()` and skips a locked set rather than block in a destructor.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The doc on `all_pins` (line 800) says “the network's, then the host's that add an address”, but `union_pins` puts the host's pins first and lets them win on a shared address, as its own doc says. The doc on `PeerPool` (lines 1515–1516) mentions only “the dialer task”; `start` spawns three loops.
 
@@ -1403,7 +1403,7 @@ pub fn put(&self, number: u64, hash: [u8; 32], parent_hash: [u8; 32], raw_rlp: V
 - *[Box, Rc, Arc & Drop](01-primer.md#primer-smart-pointers)* `#[derive(Clone)] ServeContext` holds two `Arc`s, so cloning copies two pointers, not the window.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The module doc (lines 11–13) still says that “unlike Java no genesis header RLP is embedded to serve”, and the doc on `put` (lines 181–182) says “the Rust EL has no embedded genesis header to serve”. Both are out of date: `MAINNET_GENESIS_HEADER_RLP_HEX` is embedded, self-checked by `mainnet_genesis`, and served by `run_from(0, …)` and `by_hash`.
 

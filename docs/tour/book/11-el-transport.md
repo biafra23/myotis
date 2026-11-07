@@ -6,7 +6,7 @@ From an empty routing table to a verified snap peer that serves many requests at
 
 ## Rust you will practise
 
-- **Splitting ownership** — `split(self)` moves a connection's parts out: a reader owned by one task, a writer shared behind an async mutex.
+- **Splitting ownership** `split(self)` moves a connection's parts out: a reader owned by one task, a writer shared behind an async mutex.
 - **Cancellation by drop** — the `torn` flag, `PendingGuard`, `WalkClaim` and `StorageHold`: guards whose `Drop` repairs state when a future is dropped mid-await.
 - **Borrows that end early** — non-lexical lifetimes, disjoint fields and “copy out, then mutate” let a single-task actor change its own maps without locks.
 
@@ -17,7 +17,7 @@ Candidates reach the peer pool ([stop 12](12-el-pool.md)) from four sources. `di
 The pool dials a candidate with `RlpxConnection::dial`: TCP, then the EIP-8 auth/ack handshake and a stateful frame codec (the codecs are `myotis-wire`'s, [stop 5](05-wire.md)). `EthSession::handshake` exchanges Hello and Status and checks network id and genesis. The pool turns a snap-capable session into a `ManagedPeer`, and the reader, the EVM and the log index then send concurrent requests through it. Nothing a peer says is trusted until `myotis-wire`'s `snap/fetch.rs` verifies it against a trusted root. The Tor path (`tor.rs`) runs the same RLPx and eth code over an Arti stream to a node from the reserve.
 
 > [!TIP]
-> **What changed since September**
+> **What changed since September**<br>
 >
 > The RLPx crypto (`ecies`, `handshake`, `frame`), the eth and snap message codecs, snap verification and the discv4 packet codec moved to `myotis-wire` (myotis#505). Their old files under `el/` are now 4-line re-export shims, covered in [stop 5](05-wire.md). New here: the ENR fork-id filter and DNS discovery (#539), the Tor reserve, eth/70–71 and snap/2 (receipt continuations, block access lists), per-peer head tracking, close reasons, and the hedged-read send marker.
 
@@ -210,7 +210,7 @@ impl Drop for Discv4Service {
 - *[Threads, Send & Sync](01-primer.md#primer-concurrency)* A `watch` channel works as an awaitable stop flag. `Drop` sends `true` but can't wait, so the task detaches and winds down on its own; the socket closes when the task ends.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The doc on `Discv4Service` (lines 251–252) says “Dropping it does NOT stop the task; call `Discv4Service::stop`.” The `Drop` impl at lines 368–375 sends the stop signal, and even without it, dropping `stop_tx` would make `stop_rx.changed()` return an error, which the `_ =` branch in `run` also accepts. Dropping does stop the loop; it just doesn't wait for it.
 
@@ -671,7 +671,7 @@ impl Drop for WalkClaim<'_> {
 Index of the RLPx transport: `ecies`, `handshake`, `frame` and `transport`. Only the initiator side exists. The first three are now 4-line shims that re-export `myotis-wire`'s codecs at their old paths ([frame](05-wire.md#f-myotis-wire-src-rlpx-frame-rs), [handshake](05-wire.md#f-myotis-wire-src-rlpx-handshake-rs), [stop 5](05-wire.md)), so code in this crate still writes `crate::el::rlpx::frame::FrameCodec`. Only `transport` does I/O.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The module doc (lines 4–12) still describes `ecies`, `handshake` and `frame` as this crate's pure codecs pinned by `rust/testdata/el/rlpx/`, and `transport.rs` (lines 5–7) says “the crypto lives in the pure `super::ecies`/`handshake`/`frame` modules”. Since myotis#505 those modules are re-exports; the code lives in `myotis-wire/src/rlpx/`.
 
@@ -880,12 +880,12 @@ async fn recv_answering_ping<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 - *[Ownership & moves](01-primer.md#primer-ownership) · [Borrowing & slices](01-primer.md#primer-borrowing)* `recv_answering_ping` uses one `&mut` borrow for both `recv` and `send`, so reading and writing can never overlap. That's the one-request-at-a-time limitation `peer.rs` removes.
 
 > [!WARNING]
-> **Gotcha: a timeout in the middle of a frame**
+> **Gotcha: a timeout in the middle of a frame**<br>
 >
 > `await_response` (lines 293–316) wraps `recv_answering_ping` in `timeout(remaining, …)`. A timeout can cancel `read_exact` in the middle of a frame, and tokio documents `read_exact` as not cancel-safe. `EthSession` has no torn-state marker, so after such a timeout the session is out of step with the stream and must not be reused. The Tor read builds a new session for each candidate attempt and drops it when the attempt ends (`reader.rs`, around line 6410).
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The eth/69 Status comment (lines 138–146) says “unlike Java we embed no genesis header RLP, so a genesis probe still gets an empty answer”. `EthConfig::genesis_header_rlp` (lines 53–55) now carries it, the reader sets it on mainnet, and the pool seeds its served-headers window with it (`pool.rs`, around line 1577). On mainnet a genesis probe is answered; on other networks the comment still holds.
 
@@ -1348,7 +1348,7 @@ impl Drop for ManagedPeer {
 *[Protocol & domain](01-primer.md#primer-domain)* Two defenses in the eth requests are worth knowing. Headers a peer returns enter the pool's serve window only if they are the ones we asked for (by number range, or by hash): a hostile peer could otherwise pin the window at fabricated far-future numbers (lines 650–665). Block access lists are kept only when their keccak matches the commitment in the header, and a mismatch is reported as `forged` (`verified_bal_entries`, lines 1309–1320).
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The module doc's frame list (lines 13–14) says an inbound Get\* request gets an empty response because “the wallet serves no chain data”. The read loop first serves GetBlockHeaders from the pool's shared window (lines 1223–1234), and only unservable requests get the empty answer. The field doc on `eth_version` (line 323) says “66-69”; the session negotiates up to eth/71.
 

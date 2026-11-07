@@ -7,7 +7,7 @@ deployment. The roost README is the source of truth for what works and what is
 still open (the back-archive below the upstream's light-client floor; dropping
 the wallet-side pins once discovery is proven on every network). This document
 keeps the design rationale and the measurements it was sized from. Supersedes
-the CL half of `dedicated-sepolia-node.md` §8.
+the CL half of `../guides/dedicated-sepolia-node.md` §8.
 
 **Scope of the measurements: sepolia only.** Every measurement below is sepolia,
 and each network needs its own ENR, fork digest and archive (roost derives them

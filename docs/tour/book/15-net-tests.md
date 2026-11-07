@@ -6,9 +6,9 @@ The black-box test layer, with three very different kinds of code. Six **offline
 
 ## Rust you will practise
 
-- **The test harness** — `#[test]`, `#[tokio::test]`, `#[ignore]`, and why “a test fails if and only if it panics” has a surprising consequence for spawned tasks.
-- **Ownership at task boundaries** — `tokio::spawn` needs owned (`'static`) data; `join` and `buffered` can borrow; a semaphore permit lives exactly as long as its binding.
-- **A custom global allocator** — `unsafe impl GlobalAlloc`, `#[global_allocator]` and `thread_local!` counters, used to prove that a decoder does not allocate per element.
+- **The test harness** `#[test]`, `#[tokio::test]`, `#[ignore]`, and why “a test fails if and only if it panics” has a surprising consequence for spawned tasks.
+- **Ownership at task boundaries** `tokio::spawn` needs owned (`'static`) data; `join` and `buffered` can borrow; a semaphore permit lives exactly as long as its binding.
+- **A custom global allocator** `unsafe impl GlobalAlloc`, `#[global_allocator]` and `thread_local!` counters, used to prove that a decoder does not allocate per element.
 
 ### How Rust organises tests *Tests · Crates, modules & features*
 
@@ -49,7 +49,7 @@ tasks.named("check") { dependsOn(cargoTest) }
 ```
 
 > [!WARNING]
-> **A panic in a spawned task does not fail the test**
+> **A panic in a spawned task does not fail the test**<br>
 >
 > Tokio catches a panic inside a `tokio::spawn`ed task, and the task's `JoinHandle.await` returns `Err(JoinError)`. If the test ignores that `Err`, the failure is gone. This holds even under `--release`, whose workspace profile says `panic = "abort"`: Cargo ignores the `panic` setting for test targets, because the test harness needs unwinding. In production the same panic would abort the whole process.
 
@@ -671,7 +671,7 @@ outcome
 ```
 
 > [!WARNING]
-> **This assert cannot fail the test**
+> **This assert cannot fail the test**<br>
 >
 > `assert!(ok, …)` runs *inside a spawned task*. If a peer serves a broken chain, the task panics, `h.await` returns `Err(JoinError)`, and the `if let Ok(outcome)` above silently skips it. The only traces are a panic message in the output and a missing count. Header verification here is opportunistic by design (the test asserts only Status exchanges), but the `assert!` reads as if it were stronger.
 
@@ -1206,7 +1206,7 @@ while tokio::time::Instant::now() < deadline {
 - *[Enums & pattern matching](01-primer.md#primer-enums-patterns)* `parked |= s.state == SyncState::StaleAnchor;` is a sticky flag. A parked engine publishes a zeroed status (table size 0), which would otherwise be blamed on the bootnodes instead of the stale checkpoint. The pins are cleared first (`config.static_peers.clear()`), so the table can only have come from the bootnodes.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The header (lines 10–14) says a sick pin “costs up to its retries (`3 x PIN_TIMEOUT`)”. The bootstrap loop retries only after a `ResourceUnavailable` answer, so a pin that times out costs one `PIN_TIMEOUT`. A pin that bootstraps and then stalls on updates can cost far more: two update asks of up to two attempts each, every attempt up to 20 s plus 11 s waits. The total for “a couple of dozen pins is minutes” is right; the per-pin bound is not.
 
@@ -1219,7 +1219,7 @@ while tokio::time::Instant::now() < deadline {
 “The two cold-start regressions issue #422 asked us to keep.” Each test starts what a host starts on a fresh install: the CL light-client sync with no snapshot and no CL peer cache, and now also the EL reader on its execution anchor with no EL peer cache. Each then removes one more crutch and still requires SYNCED. **3b**: every CL pin is configured but unreachable. **3c**: the trust anchor is older than the weak-subjectivity bound, so catch-up has to walk many periods. NET defaults to gnosis; an unknown value panics, citing the “applied or refused” rule.
 
 > [!TIP]
-> **Why the EL reader runs too**
+> **Why the EL reader runs too**<br>
 >
 > From Gloas (EIP-7732), a light-client header proves only the execution *block hash*. SYNCED then waits until the EL peer pool has fetched the finalized execution header by that hash (`feed_exec_anchor` in `sync.rs`). Run CL-only, the dead-pins test could never pass on Sepolia after its Gloas fork; it bootstrapped, followed finality, and stayed CATCHING\_UP. So the test starts the EL half the way a host does, and the pass condition stays SYNCED, the state a host shows. Before Gloas the EL reader plays no part in SYNCED.
 
@@ -1401,7 +1401,7 @@ assert!(
 *[Bytes, strings & formatting](01-primer.md#primer-bytes-strings) · [Protocol & domain](01-primer.md#primer-domain)* `sync_start_period` is an `i64` in which −1 means “not bootstrapped”. The test checks `>= 0` *before* `as u64`, because `-1i64 as u64` silently becomes `u64::MAX`. The equality check proves the walk started at *our* anchor, and the last assert that it advanced at least one period.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > Line 144 calls the budget drift “the bug this PR fixes in `examples/live_sync.rs`”; “this PR” no longer identifies anything once merged. Lines 321–322 say each black hole is “a distinct address each, so none can collide with a live host”: the addresses are distinct only up to 254 pins (`i % 254 + 1`), and what keeps them off live hosts is the TEST-NET-3 range, not their distinctness.
 

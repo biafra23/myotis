@@ -6,9 +6,9 @@ From here on, everything is `async`. This stop covers the consensus-layer side o
 
 ## Rust you will practise
 
-- **Channels as an API** — `mpsc` commands with a `oneshot` reply inside, and a cheap-to-clone client handle.
-- **A task that owns its state** — `tokio::spawn`, `select!`, cancellation by drop, and why the actor's maps need no locks while two shared sets do.
-- **Wrapping a poll-based trait** — `Pin<&mut Self>`, `Unpin`, `Weak` references and a `Drop` that unregisters, in the traffic counters.
+- **Channels as an API** `mpsc` commands with a `oneshot` reply inside, and a cheap-to-clone client handle.
+- **A task that owns its state** `tokio::spawn`, `select!`, cancellation by drop, and why the actor's maps need no locks while two shared sets do.
+- **Wrapping a poll-based trait** `Pin<&mut Self>`, `Unpin`, `Weak` references and a `Drop` that unregisters, in the traffic counters.
 
 ## The crate: what myotis-net is for
 
@@ -80,7 +80,7 @@ myotis-net = { path = ".", features = ["fixture-recorder"] }
 ```
 
 > [!NOTE]
-> **JVM lens**
+> **JVM lens**<br>
 >
 > A Cargo feature is closer to a Gradle source set switched by a build flag than to a runtime flag. Code under `#[cfg(feature = "tor")]` does not exist in a build without it: no class to load, no dead branch, no dependency on the classpath.
 
@@ -122,7 +122,7 @@ pub use sync::{ChainConfig, SyncHandle, SyncState, SyncStatus};
 *[Crates, modules & features](01-primer.md#primer-modules-cargo)* Why re-export four libp2p items instead of the whole crate? `roost` needs exactly these to build a `HostConfig`. If it took them from its own libp2p dependency, a version mismatch would make them *different types*, because two versions of a crate never share types. The narrow list keeps the rest of libp2p out of this crate's public API. `pub mod codec;`, `protocols` and `status` are now four-line shims, each a single `pub use myotis_wire::eth2::…::*;`, so older `crate::codec::…` paths keep compiling. The real code is in [stop 5](05-wire.md).
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The module doc (lines 1–22) is out of date in three ways. Its module list omits `cl_fork_watch`, `clcache`, `el` and `traffic`, and it still lists `codec`, `protocols` and `status` as if their code lived here. It describes `reqresp` as "TCP + noise + yamux", but the host now also speaks mplex and QUIC. And "no global mutable state" (line 21) is no longer true: `traffic.rs` has a `static DISCV5: Mutex<…>`, and `el::tor`, `el::dnsdisco` and `el::request` have `static` switches and semaphores. The `ReqRespClient` doc in `reqresp.rs` repeats the claim ("no globals anywhere in this crate").
 
@@ -431,7 +431,7 @@ fn send_tracked(
 ```
 
 > [!WARNING]
-> **A real bug, and its fix in the types**
+> **A real bug, and its fix in the types**<br>
 >
 > libp2p numbers outbound requests *per behaviour*, starting at 1, and this host has thirteen request/response behaviours. When `pending` was keyed by the id alone, a new peer's auto-Status and a bootstrap request to another peer could share id 1. The second insert evicted the first, so one caller saw "service shut down", and a bootstrap caller could receive *Status bytes*. Keying by `(&'static str, OutboundRequestId)`, with `send_tracked` as the only inserter, makes a mismatched key impossible: the protocol that picks the behaviour is the protocol in the key. The fix landed in `aa123758`; the tests in `pending_request_tests` mint ids the way the behaviours do and assert that they collide. The inbound budget map `in_flight` is keyed the same way for the same reason.
 
@@ -720,12 +720,12 @@ pub trait LcResponder: Send + Sync {
 *[Interior mutability](01-primer.md#primer-interior-mutability) · [Box, Rc, Arc & Drop](01-primer.md#primer-smart-pointers)* `LocalStatus` (lines 812–829) is shared between the sync loop (writer) and the swarm task (reader) through an `Arc`, so it needs a `Mutex`. `*self.inner.lock().expect(…) = s;` assigns through the guard, and the guard lives only for that statement. `get` returns a `clone()`, so the caller never holds the lock.
 
 > [!NOTE]
-> **JVM lens**
+> **JVM lens**<br>
 >
 > `SwarmCtx` needs no lock and `LocalStatus` does, for the same reason a Java object confined to one Netty event loop needs no synchronisation while a field shared with another thread does. The difference is that Rust *checks* the confinement. Moving the `SwarmCtx` into the task makes it unreachable from anywhere else, and anything the task shares (`LocalStatus`, `AgentMap`, `TcpFirst`) has to be an `Arc` around a lock, or it will not compile.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The module doc (lines 1–15) still lists "TCP + noise XX + yamux or mplex" without QUIC, and says the `light_client_*` protocols answer `ResourceUnavailable`, which is true only without an `LcResponder`. The `RESP_TIMEOUT` doc (line 37) says updates get "the Java catch-up deadline (15 s)", but `UPDATES_TIMEOUT` is 60 s. The `respond_inbound` doc (lines 2058–2060) says "ping/goodbye → echo" and "no relay cache in this stage"; ping now returns our own sequence number, and the light-client branches serve from the responder. Lines 715, 985 and 1301 say the no-DNS fallback is "plain TCP"; it is TCP plus QUIC. Two doc comments are attached to the wrong item: the `start_host_with` doc (lines 1173–1182) sits directly above `build_swarm`'s doc, so rustdoc merges both onto `build_swarm`, and the doc for `external_address` (lines 729–735) is merged into `observe_via`'s, leaving `external_address` undocumented.
 
@@ -991,7 +991,7 @@ impl Drop for ServerDiscovery {
 *[Protocol & domain](01-primer.md#primer-domain)* Design notes from the file: "hearsay" ENRs (heard in NODES responses) are used on purpose; this found the first sepolia peer in 4 s instead of 2 min 12 s, and they are trusted only after a successful Noise handshake. `add_enr` alone is passive and fails on a bucket full of dead entries, so the re-seed also pings. The CL fork watch gets its evidence from the *routing table* once per round, not from hearsay, because a relayed record is self-declared and keys are free.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The module doc (line 6) still says candidates are a "TCP multiaddr + PeerId"; they can now be QUIC. The doc comment for `seed_bootnodes` (lines 204–207) sits above `node_id_for_peer`'s doc, so rustdoc attaches both paragraphs to `node_id_for_peer` and `seed_bootnodes` has none. The QUIC record tests live in `server_enr_tests`, although they test the client-side `filter_candidate`.
 
@@ -1116,7 +1116,7 @@ fn save(&self) {
 *[Result, ? and panics](01-primer.md#primer-error-handling)* An atomic write via temp file plus rename. `and_then` chains two fallible steps without `?`. The error is deliberately swallowed, because the file is only a performance cache. There is no file lock, so across processes (for example the Java engine) the last writer wins. `let Some(path) = &self.path else { return };` binds a *reference* into `self`.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > The test `ordering_prefers_proven_then_bootstrap` (lines 420–421) says the widest range leads because it is "the generous multi-chunk server", which is exactly what the `peers()` doc (lines 107–109) says width does *not* show.
 
@@ -1341,7 +1341,7 @@ where
 *[Traits, generics & dyn](01-primer.md#primer-traits-generics) · [Box, Rc, Arc & Drop](01-primer.md#primer-smart-pointers)* `CountingMuxer` implements libp2p's `StreamMuxer` with an **associated type**: `type Substream = CountingStream<M::Substream>`, so every substream it hands out is a counting one. `Poll<Result<T, E>>::map_ok` transforms a ready success and passes `Pending` and errors through. The `Arc::clone(&self.meter)` comes first because the closure needs its own handle while `self.inner` is borrowed mutably through the pin. It costs one atomic increment per poll, including polls that return `Pending`.
 
 > [!WARNING]
-> **Not counted**
+> **Not counted**<br>
 >
 > The module doc lists what the meters miss: IP/TCP/UDP headers, QUIC's own packet overhead and TLS handshake, EIP-1459 DNS lookups, and Tor. With several networks running, discv5's share is an even split, not a measurement.
 

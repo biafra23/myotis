@@ -224,7 +224,7 @@ examples/rn-demo/                 # bare RN app used as the validation harness
   persisted snapshot + peer caches, no checkpoint re-bootstrap) → sync
   within the budget → `myotis_pause` → reschedule. Accept the platform
   truth: after long background periods the verified head is stale until the
-  next resume (`readiness-and-verified-head-age.md` already models this).
+  next resume (`../how-it-works/readiness-and-verified-head-age.md` already models this).
   **Watchdog invariant**: every `beginBackgroundTask` is paired with an
   `endBackgroundTask` on *both* exits — in a `defer` once `myotis_pause`
   returns, and unconditionally in the expiration handler — because a

@@ -144,24 +144,37 @@ class Conv:
         return f'<a id="{i}"></a>' if i and i in self.ref_ids and not re.fullmatch(r"stop-\d\d", i) else ""
 
     # ---- inline
+    @staticmethod
+    def join(parts):
+        """Concatenate (kind, text) pieces, kind "el" or "text". The HTML separates some
+        adjacent elements with CSS (a label before a link); Markdown needs a real space.
+        Also keeps `**...?**word` bold: a closing marker after punctuation must not touch a letter."""
+        out, prev = "", None
+        for kind, text in parts:
+            if not text:
+                continue
+            if out and prev == "el" and not out[-1].isspace() and not text[0].isspace():
+                if kind == "el" or (re.search(r"[^\w\s*]\*+$", out) and text[0].isalnum()):
+                    out += " "
+            out += text
+            prev = kind
+        return out
+
     def inline(self, el, links=True):
-        out = [esc(el.text)]
-        prev_el = False
+        parts = [("text", esc(el.text))]
         for c in el:
-            piece = self.inline_el(c, links)
-            if prev_el and piece and out and out[-1] and not out[-1][-1].isspace() and not piece[0].isspace():
-                out.append(" ")
-            out.append(piece)
-            tail = esc(c.tail)
-            out.append(tail)
-            prev_el = not (c.tail and c.tail.strip())
-        return "".join(out)
+            parts.append(("el", self.inline_el(c, links)))
+            parts.append(("text", esc(c.tail)))
+        return self.join(parts)
 
     def inline_el(self, c, links=True):
         tag, cls = local(c.tag), classes(c)
         if tag == "code":
             return code_span("".join(c.itertext()))
-        if tag in ("b", "strong") or (tag == "span" and "k" in cls):
+        if tag == "span" and "k" in cls:  # a callout's label: its own line, as in the HTML
+            inner = self.inline(c, links).strip()
+            return f"**{inner}**<br>" if inner else ""
+        if tag in ("b", "strong"):
             return wrap("**", self.inline(c, links))
         if tag in ("em", "i"):
             return wrap("*", self.inline(c, links))
@@ -191,27 +204,21 @@ class Conv:
     # ---- blocks
     def mixed(self, el):
         """Children of a container: runs of text and inline elements become paragraphs."""
-        out, run = [], [esc(el.text)]
+        out, run = [], [("text", esc(el.text))]
 
         def flush():
-            p = "".join(run).strip()
+            p = self.join(run).strip()
             if p:
                 out.append(self.para(p))
             run.clear()
 
-        prev_el = False
         for c in el:
             if local(c.tag) in BLOCK_TAGS:
                 flush()
                 out.extend(self.blocks(c))
-                prev_el = False
             else:
-                piece = self.inline_el(c)
-                if prev_el and piece and run and run[-1] and not run[-1][-1].isspace() and not piece[0].isspace():
-                    run.append(" ")
-                run.append(piece)
-                prev_el = not (c.tail and c.tail.strip())
-            run.append(esc(c.tail))
+                run.append(("el", self.inline_el(c)))
+            run.append(("text", esc(c.tail)))
         flush()
         return out
 
@@ -431,7 +438,7 @@ def readme(stops_meta, md_names, n_q, total_hours):
 
 
 def main():
-    chapters, stops, n_q = E.collect(code=md_code, wb=md_wb)
+    chapters, stops, n_q = E.collect(code=md_code, wb=md_wb, online=True)
     if B.errors:
         for e in B.errors:
             print("ERROR:", e)

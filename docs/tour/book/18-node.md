@@ -6,16 +6,16 @@ A `napi-rs` addon for Electron and Node hosts, built as `myotis-node.node`. It c
 
 ## Rust you will practise
 
-- **Threads without async** — `Mutex` + `Condvar`, `std::thread`, atomics with compare-and-swap, `thread_local!` + `RefCell`.
-- **Closures that travel** — `Box<dyn FnOnce() -> String + Send>`, `move` closures, `mem::replace`, and validation that runs inside the closure.
-- **Ownership through C** — `CString` lifetimes, `Box::into_raw` → Node → `Box::from_raw`, drop guards, pointers stored as `usize`, and nested `Result`/`Option` patterns in `let … else`.
+- **Threads without async** `Mutex` + `Condvar`, `std::thread`, atomics with compare-and-swap, `thread_local!` + `RefCell`.
+- **Closures that travel** `Box<dyn FnOnce() -> String + Send>`, `move` closures, `mem::replace`, and validation that runs inside the closure.
+- **Ownership through C** `CString` lifetimes, `Box::into_raw` → Node → `Box::from_raw`, drop guards, pointers stored as `usize`, and nested `Result`/`Option` patterns in `let … else`.
 
 ![A verified read in myotis-node. On the JS thread, submit creates a Promise, pushes a Job and notifies the workers, then returns the Promise at once so the event loop keeps running. On a Myotis worker thread, take_ready waits on the Condvar until a job whose handle is free is available, then submitted runs the closure, which checks the arguments, calls the C ABI and the engine's block_on. finish posts the result through a thread-safe function without blocking, and on the JS thread complete takes the boxed result back and resolves the Promise.](img/18-node-1.svg)
 
 *The worker, not the JS thread, waits for the network. Admission allows at most 32 requests in flight per environment (including results not yet delivered), at most 4 queued or running per handle, and at most one *running* per handle, so a slow chain can't hold up another. Every request has a 90-second deadline and a cancellation flag.*
 
 > [!TIP]
-> **What changed since September**
+> **What changed since September**<br>
 >
 > `scheduler.rs` and `admission.rs` are byte-for-byte unchanged. `lib.rs` grew from 340 to 1,078 lines: 22 new exports (blocks, receipts, transactions, fee history, code, storage, `eth_getProof`, logs, the log index, the transaction-object calls, block-hash resolution, network metering, the pending-nonce overlay) and a block of small pure validators with nine unit tests. `Cargo.toml` gained one dependency, `serde_json`, used only by those validators.
 
@@ -113,7 +113,7 @@ fn c_arg(s: &str) -> std::result::Result<CString, String> {
 - *[Macros & attributes](01-primer.md#primer-macros) · [unsafe & FFI](01-primer.md#primer-unsafe-ffi)* `#![allow(unused_unsafe)]` (line 22) is a crate-level attribute (note the `!`). Some of the C functions are safe to call, but every call is wrapped in `unsafe` the same way.
 
 > [!WARNING]
-> **Stale or inaccurate comments**
+> **Stale or inaccurate comments**<br>
 >
 > Lines 68–70 are `c_arg`'s doc comment ("A JS string crossing into C…"), but the constant `NUL_INVALID_PARAMS` was later inserted between that comment and the function. A `///` comment documents the *next item*, so rustdoc now shows both paragraphs on the constant, and `c_arg` has no documentation at all.
 

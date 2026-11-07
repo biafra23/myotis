@@ -515,7 +515,7 @@ Maintaining p2p connections, syncing headers, and fetching state data has non-tr
 
 ## Feasibility of Implementation
 
-> Written before the implementation; kept as the original assessment. What happened: the JVM proof of concept was built on the Tuweni/Besu/jvm-libp2p primitives as described (the Java engine), then the whole stack was reimplemented natively in Rust (the Rust engine, now the default) for footprint and embeddability — see [reimplementation/README.md](../spec/README.md). The Portal Network client mentioned below is no longer an option (its clients are abandoned).
+> Written before the implementation; kept as the original assessment. What happened: the JVM proof of concept was built on the Tuweni/Besu/jvm-libp2p primitives as described (the Java engine), then the whole stack was reimplemented natively in Rust (the Rust engine, now the default) for footprint and embeddability — see [spec/README.md](../spec/README.md). The Portal Network client mentioned below is no longer an option (its clients are abandoned).
 
 The implementation does not start from zero. Key components are already available or have been proven feasible:
 

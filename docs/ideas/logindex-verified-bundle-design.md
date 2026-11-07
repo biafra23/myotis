@@ -38,7 +38,7 @@ The index makes two claims, and they need different witnesses:
   exist: `verify_block_receipts` and `verify_body_transactions`
   (`rust/myotis-net/src/el/reader.rs`).
 - **Absence** — no watched log was omitted from a covered range. This is the
-  load-bearing one (`eth-getlogs-design.md` §Trust model, *coverage
+  load-bearing one (`../design-history/eth-getlogs-design.md` §Trust model, *coverage
   honesty*): a wallet reads `[]` as "no events exist", so an omission
   silently corrupts its commitment tree. Before EIP-7745 the chain commits to
   exactly one absence witness: the header's `logsBloom`, which has no false
@@ -63,7 +63,7 @@ So a verifiable bundle for a watch set W over blocks [a, b] is, necessarily:
 That is byte-for-byte what the walker fetches from peers today (receipts
 first since #544, so it skips the bodies of false-positive blocks too, unless
 `BodyPolicy` asks for bodies with the receipts on a dense watch-list). The bundle changes the **transport**, not
-the data or the verification, which `architecture-doc.md` (§"Block data via
+the data or the verification, which `../how-it-works/architecture-doc.md` (§"Block data via
 IPFS or other storage") already sanctions: block data may come from IPFS, a
 CDN, a centralized API, or a USB stick, because it is verified against
 trusted headers regardless of source. The *client* never talks RPC; whether
@@ -80,14 +80,14 @@ trusts. State roots play no part.
   index must not lose. Useful only as a hardening of a *trusted* seed (a
   publisher could then withhold but not forge; see mainnet below).
 - **Historical accumulators** (`historical_summaries`; README roadmap, not
-  implemented — `implementation-status.md` §2). They would let each chunk's
+  implemented — `../how-it-works/implementation-status.md` §2). They would let each chunk's
   top header be trusted on its own, without the walk from the head down to
   it — which removes the "top-up" cost below and lets chunks verify in
   parallel and in any order. They do not remove the need for every header's
   bloom. Worth doing; a follow-up, not a prerequisite.
 - **EIP-7745** (log index committed in the header). Gives compact absence
   proofs, for blocks after activation only. Tracked as a separate follow-up
-  in `eth-getlogs-design.md`; it does nothing for existing history.
+  in `../design-history/eth-getlogs-design.md`; it does nothing for existing history.
 - **A ZK proof of the whole `eth_getLogs` computation.** The principled
   answer; proving keccak over terabytes of receipts is not practical today.
 - **A signed seed** (the tracked "signed snapshot" follow-up). Compact, but
@@ -427,7 +427,7 @@ owner's call, recorded under Open questions; the doc does not assume it.
   kind, because of how the index takes a **new watch set** — the "many
   DLCs" case this design exists for. A config push with a new address does
   not invalidate the index (pushes union and merge; the old entries' coverage
-  survives — `eth-getlogs-design.md` §Additive config), but the new entry
+  survives — `../design-history/eth-getlogs-design.md` §Additive config), but the new entry
   has no coverage, so the cursor is dropped and the walker **re-descends
   from the head** through the kept spans down to the new entry's
   `from_block`, reading **every header again** for the bloom check

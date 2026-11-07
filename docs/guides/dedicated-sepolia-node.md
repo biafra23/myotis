@@ -447,7 +447,7 @@ head.
    `"verifyMethod":"headerChain"` (CLAUDE.md's Integration-Test expectation,
    which matches the Java engine; on the default Rust engine an ordinary read
    answers `"stateRootMatch"`, see
-   [reimplementation/README.md](../spec/README.md) §3):
+   [spec/README.md](../spec/README.md) §3):
 
    ```bash
    ./gradlew :app:run -Pnetwork=sepolia -Pargs="get-account 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"

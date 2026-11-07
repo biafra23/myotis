@@ -33,9 +33,13 @@ def main():
         stale.append(name + " (no longer in solution/)")
         if not check:
             os.remove(os.path.join(START, "src", name))
-    if not check:
-        for f in ("Cargo.toml", "Cargo.lock"):
-            shutil.copyfile(os.path.join(SOL, f), os.path.join(START, f))
+    for f in ("Cargo.toml", "Cargo.lock"):
+        same = os.path.exists(os.path.join(START, f)) and \
+            open(os.path.join(SOL, f), "rb").read() == open(os.path.join(START, f), "rb").read()
+        if not same:
+            stale.append(f)
+            if not check:
+                shutil.copyfile(os.path.join(SOL, f), os.path.join(START, f))
     if check and stale:
         sys.exit(f"starter/ is out of date for: {', '.join(stale)} (run make_starter.py)")
     print("starter/ " + ("is up to date" if not stale else f"rewritten: {', '.join(stale)}"))

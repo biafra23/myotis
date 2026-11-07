@@ -6,8 +6,8 @@ SSZ decoding, `hash_tree_root`, Merkle branches, fork versions, sync-committee s
 
 ## Rust you will practise
 
-- **Enums that carry data** — `HeaderExecution` holds either a boxed payload header or a 32-byte hash, and every reader has to `match` on which one it got.
-- **Moving big values** — `Option::take` instead of cloning, a builder that consumes `self`, a consuming `restore`, and a `Box` that keeps a large variant out of line.
+- **Enums that carry data** `HeaderExecution` holds either a boxed payload header or a 32-byte hash, and every reader has to `match` on which one it got.
+- **Moving big values** `Option::take` instead of cloning, a builder that consumes `self`, a consuming `restore`, and a `Box` that keeps a large variant out of line.
 - **Borrow scopes and panics by policy** — a borrow from a `&self` method ending before a `&mut` call, `assert!` for configuration, `Err` or `false` for peer data, and `const` asserts that fail the build.
 
 ## How the files fit
@@ -37,7 +37,7 @@ Gloas is the consensus fork that brings enshrined proposer-builder separation (E
 One thing does not change: the signing domain. A signature is still verified under the fork version of the epoch of `max(signature_slot, 1) − 1`, while the wire format follows the slot's own fork with no off-by-one. At the first Gloas slot the objects are Gloas-shaped, but a signature made *at* that slot still uses the Fulu domain ([fork.rs](#f-myotis-consensus-src-fork-rs) pins both in one test).
 
 > [!TIP]
-> **What changed since September**Gloas support (`LcFork`, `HeaderExecution`, `decode_for`, the Gloas gindices, the normalized branch check, the shape gate, `verify_bootstrap` with `BootstrapReject`, snapshot v2). A new adoption rule for the next committee (`tests/next_committee_adoption.rs`). `apply_finality_update` and `FinalityOutcome`, which tell a stale but valid finality update from one that advanced the store. A doc note that `optimistic_slot` is the *signature* slot (#658). And `no_std` + `alloc` support.
+> **What changed since September**<br>Gloas support (`LcFork`, `HeaderExecution`, `decode_for`, the Gloas gindices, the normalized branch check, the shape gate, `verify_bootstrap` with `BootstrapReject`, snapshot v2). A new adoption rule for the next committee (`tests/next_committee_adoption.rs`). `apply_finality_update` and `FinalityOutcome`, which tell a stale but valid finality update from one that advanced the store. A doc note that `optimistic_slot` is the *signature* slot (#658). And `no_std` + `alloc` support.
 
 <a id="f-myotis-consensus-src-lib-rs"></a>
 
@@ -72,7 +72,7 @@ pub fn bls_dst() -> &'static [u8] {
 - *[Lifetimes](01-primer.md#primer-lifetimes) · [Tests](01-primer.md#primer-testing)* `&'static [u8]`: the DST is a byte-string literal compiled into the binary, so the reference is valid for the whole run. `#[cfg(test)] mod tests` with `super::bls_dst()` is the standard unit-test layout.
 
 > [!WARNING]
-> **Stale or inaccurate comments**The module doc still says this is “plan PR 4” and that networking “is the next stage; no I/O lives in this crate yet”. Networking landed long ago, in `myotis-net`, and this crate stays I/O-free by design: its `Cargo.toml` calls the light-client core sans-I/O.
+> **Stale or inaccurate comments**<br>The module doc still says this is “plan PR 4” and that networking “is the next stage; no I/O lives in this crate yet”. Networking landed long ago, in `myotis-net`, and this crate stays I/O-free by design: its `Cargo.toml` calls the light-client core sans-I/O.
 
 <a id="f-myotis-consensus-src-spec-rs"></a>
 
@@ -1166,7 +1166,7 @@ pub fn verify_execution_branch_at(header: &LightClientHeader, slot_fork: LcFork)
 *[Protocol & domain](01-primer.md#primer-domain)* `verify_execution_branch` (the associated function at lines 227–229, still used by the corpus tests) is kept for callers that hold no fork schedule. It now refuses a Gloas-shaped header outright, so a call site that should have moved to `verify_header` fails loudly instead of guessing.
 
 > [!WARNING]
-> **A back door around “refuses zero”**The doc on `LightClientStore::new` says the store refuses a zero period length instead of defaulting to the mainnet preset. But the struct also derives a public `Default`, which sets `slots_per_period` to 0, and the getter `slots_per_period()` (lines 53–59) maps 0 to the mainnet preset. So `LightClientStore::default()` quietly gets mainnet geometry. Nothing in the snapshot calls `default()` directly; `new` uses it only as the base for struct update syntax.
+> **A back door around “refuses zero”**<br>The doc on `LightClientStore::new` says the store refuses a zero period length instead of defaulting to the mainnet preset. But the struct also derives a public `Default`, which sets `slots_per_period` to 0, and the getter `slots_per_period()` (lines 53–59) maps 0 to the mainnet preset. So `LightClientStore::default()` quietly gets mainnet geometry. Nothing in the snapshot calls `default()` directly; `new` uses it only as the base for struct update syntax.
 
 <a id="f-myotis-consensus-src-snapshot-rs"></a>
 
@@ -1400,7 +1400,7 @@ if let Some(update) = &last_applied {
 *[Borrowing & slices](01-primer.md#primer-borrowing) · [Ownership & moves](01-primer.md#primer-ownership) · [Tests](01-primer.md#primer-testing)* New since September. In the loop above, `last_applied = Some(update)` *moves* each applied update into the `Option`; the previous value is dropped. Here `if let Some(update) = &last_applied` borrows it back out, so `update` is a `&LightClientFinalityUpdate`, which is what `apply_finality_update` takes.
 
 > [!WARNING]
-> **Stale or inaccurate comments**The module doc says the file set “is enumerated from expected.txt's own counts”. The code enumerates the directory (lines 108–116) and records the count under `updates.count`, so a mismatch shows up in the final map comparison. The effect the comment promises is real; the mechanism is different.
+> **Stale or inaccurate comments**<br>The module doc says the file set “is enumerated from expected.txt's own counts”. The code enumerates the directory (lines 108–116) and records the count under `updates.count`, so a mismatch shows up in the final map comparison. The effect the comment promises is real; the mechanism is different.
 
 <a id="f-myotis-consensus-tests-fork-boundary-rs"></a>
 

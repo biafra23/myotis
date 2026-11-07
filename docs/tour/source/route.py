@@ -85,6 +85,17 @@ LEGS = [
 NAMES = {0: "Stop 0", 22: "Workbook"}
 
 
+def eight_hours_text(eight):
+    """Where eight hours of reading end; `eight` is (leg, minutes before that leg) or None."""
+    if eight is None:
+        return "the whole route takes less than eight hours."
+    leg, before = eight
+    if leg == 1:
+        return f"eight hours take you about {hm(480)} into Leg 1."
+    done = "through Leg 1" if leg == 2 else f"through Legs 1 to {leg - 1}"
+    return f"eight hours take you {done} and about {hm(480 - before)} into Leg {leg}."
+
+
 def build():
     rows, total, cum, eight = [], 0, 0, None
     wb_ex = {1: "cursor", 2: "hex", 3: "errors", 4: "methods", 5: "registry", 6: "drop guard",
@@ -112,8 +123,7 @@ def build():
         f'cut into {len(LEGS)} legs, most of them four to seven hours long, with each workbook exercise placed right after the stop whose '
         'ideas it practises. Times come from each stop\'s own estimate: unhurried reading of the prose and every '
         'excerpt, plus two minutes per checkpoint question. On a long flight, start at Leg 1 and keep going: '
-        f'eight hours take you {"through Leg 1 and " if eight[0] == 2 else f"through Legs 1 to {eight[0] - 1} and "}'
-        f'about {hm(480 - eight[1])} into Leg {eight[0]}. Take breaks between legs, or between stops, not inside one.</p>\n'
+        + eight_hours_text(eight) + ' Take breaks between legs, or between stops, not inside one.</p>\n'
         '  <p>Everything works offline: the exercises run against your local cargo cache, and the reading list points '
         'to your EPUBs and the Rust docs rustup installed.</p>\n</div>\n'
     )
