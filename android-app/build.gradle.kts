@@ -172,7 +172,7 @@ android {
         // No signingConfig ON PURPOSE: assembleRelease writes
         // android-app-release-unsigned.apk, and only the tag-only signing job in
         // .github/workflows/android-apk.yml signs it, with the release key from the
-        // `android-release` environment's secrets (docs/android-release-signing.md).
+        // `android-release` environment's secrets (docs/guides/android-release-signing.md).
         // Signing here would put that key in the environment of the whole Gradle +
         // cargo build, third-party plugins and build scripts included.
         release {

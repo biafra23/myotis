@@ -145,7 +145,7 @@ Convert a JSON-RPC quantity to a JS number before passing `blockCount` or
 `minedNonce`.
 
 **The log index.** `eth_getLogs` is served only from an opt-in index of the
-contracts a host chooses (docs/eth-getlogs-design.md), and only inside its
+contracts a host chooses (docs/design-history/eth-getlogs-design.md), and only inside its
 verified coverage — anything else is an `{"error"}` that says how far coverage
 reaches, never an empty array:
 
@@ -192,7 +192,7 @@ the desktop, Android and iOS apps do with a file **the user picked**. Treat it
 as that same deliberate act, never as something fetched: a snapshot is the
 claim of whoever produced it, served as covered without being re-verified,
 and served logs do not say which coverage was imported
-(docs/eth-getlogs-design.md §Import, docs/seeded-log-histories.md).
+(docs/design-history/eth-getlogs-design.md §Import, docs/how-it-works/seeded-log-histories.md).
 A later config is merged with what is there, so an imported address stays in
 the index until a config names it under `unwatch`.
 
@@ -409,7 +409,7 @@ unit-tested in `smoke-gate.test.mjs` (`node --test smoke-gate.test.mjs`).
   head); while it still verifies, an ACTIVE advisory means "update soon". Its
   evidence survives `pause()`, but ages out a day after its peers were last
   seen connected (a long sleep re-derives it from the peers dialed on wake).
-- **Data usage** (ABI 50, docs/data-usage.md): `statusJson` carries
+- **Data usage** (ABI 50, docs/how-it-works/data-usage.md): `statusJson` carries
   `dataUsage` — this network's bytes on the wire since `create()`
   (`bytesIn`/`bytesOut`, split `elBytes*`/`clBytes*`) and today's, local time
   (`day`, `todayBytesIn`/`todayBytesOut`, kept across restarts in the data
@@ -441,7 +441,7 @@ no signature (the executor refusals above), ABI 34 adds `estimateGasTxJson`
 `createWithCheckpoint`, and ABI 27 makes `ethCallJson` check its `block`
 argument (see Notes), so a call an older engine answered from the head can now
 be refused; ABI 28 added `read_stats_json` (the read-fetch shadow-cache
-counters, docs/read-stats.md — not yet wrapped here); ABI 29 makes the
+counters, docs/how-it-works/read-stats.md — not yet wrapped here); ABI 29 makes the
 engine's plain-C `eth_call` refuse a NULL `to` instead of reading it as the
 empty `to` that means contract creation (this binding always passes a string,
 so nothing changes for Node callers); and ABI 30 makes `finalized` run

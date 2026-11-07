@@ -1,5 +1,5 @@
 //! ECIES for RLPx auth/ack (EL-A4), twin of the Java `rlpx.EciesCodec`
-//! (docs/reimplementation/02 §5.1, §9.2).
+//! (docs/spec/02 §5.1, §9.2).
 //!
 //! Encrypted message: `0x04 ‖ ephemeral-pubkey(65) ‖ IV(16) ‖ ciphertext ‖ MAC(32)`.
 //!

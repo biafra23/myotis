@@ -211,7 +211,7 @@ public final class JavaChainHandle implements ChainHandle, NodeStatusReads {
                 stack.rpcServing(),
                 upgradeAdvisory(stack.forkWatch(), stack.clForkWatch()),
                 // RLPx, discv4 and libp2p bytes; discv5's are not counted on this
-                // engine (docs/data-usage.md).
+                // engine (docs/how-it-works/data-usage.md).
                 stack.dataUsage(false),
                 io.myotis.engines.common.DataUsageLedger.metering());
     }

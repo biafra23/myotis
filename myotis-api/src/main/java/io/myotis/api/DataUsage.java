@@ -2,7 +2,7 @@ package io.myotis.api;
 
 /**
  * One network's data usage: the bytes its stack sent and received on the wire
- * (docs/data-usage.md says exactly which).
+ * (docs/how-it-works/data-usage.md says exactly which).
  *
  * <p>The {@code today*} figures cover one LOCAL calendar day ({@link #day}) and
  * survive a restart of the network on the same day (the engine keeps them in

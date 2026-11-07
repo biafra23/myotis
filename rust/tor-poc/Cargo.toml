@@ -1,4 +1,4 @@
-# Tor integration PROOF OF CONCEPT for docs/privacy-and-tor.md.
+# Tor integration PROOF OF CONCEPT for docs/how-it-works/privacy-and-tor.md.
 #
 # Standalone crate (its own workspace root, own Cargo.lock) — deliberately NOT a
 # member of ../Cargo.toml's workspace so the Arti dependency tree never lands in

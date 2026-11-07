@@ -7,7 +7,7 @@
 # published to GitHub Packages, merged into the `maven-repo` branch (a Maven
 # repository URL that needs no token) and attached to the release as the bare
 # AAR plus a zip of that repository, with a SHA256SUMS file. Consumer side:
-# docs/android-library.md. Which modules, and why: the `Publishing` section of
+# docs/guides/android-library.md. Which modules, and why: the `Publishing` section of
 # the root build.gradle.kts.
 #
 # The APK workflow already builds the same AAR into the Myotis app on every
@@ -424,7 +424,7 @@ jobs:
           cp "build/maven-repo/eth/myotis/myotis-engine-android/$version/myotis-engine-android-$version.aar" \
              "assets/myotis-engine-${GITHUB_REF_NAME}-android.aar"
           # The whole staged repository: unzip it and point Gradle at the
-          # directory, and no GitHub token is needed (docs/android-library.md).
+          # directory, and no GitHub token is needed (docs/guides/android-library.md).
           (cd build/maven-repo && zip -qr "../../assets/myotis-engine-${GITHUB_REF_NAME}-maven-repo.zip" eth)
           (cd assets && sha256sum myotis-engine-*.aar myotis-engine-*.zip > myotis-engine.SHA256SUMS && cat myotis-engine.SHA256SUMS)
 
@@ -449,7 +449,7 @@ jobs:
           (darwin-aarch64, darwin-x86-64, linux-x86-64, linux-aarch64): the engine's host library. A Kotlin
           Multiplatform app with iOS targets adds `eth.myotis:myotis-engine-ios:__VERSION__` (iosArm64,
           iosSimulatorArm64): the engine's C ABI as cinterop, the engine linked in. Verify downloads against
-          `myotis-engine.SHA256SUMS`. See docs/android-library.md.
+          `myotis-engine.SHA256SUMS`. See docs/guides/android-library.md.
           SECTION
           sed -i "s/__VERSION__/$version/g; s#__REPO__#${GITHUB_REPOSITORY}#g" "$section"
           # Create the release with the master notes (.github/release-notes.md)
@@ -545,7 +545,7 @@ jobs:
             cat > "$work/README.md" <<README
           # Myotis engine library — Maven repository
 
-          The \`eth.myotis\` artifacts of every release (docs/android-library.md on \`main\`),
+          The \`eth.myotis\` artifacts of every release (docs/guides/android-library.md on \`main\`),
           laid out as a Maven repository and served by raw.githubusercontent.com, so a
           build needs no GitHub token:
 

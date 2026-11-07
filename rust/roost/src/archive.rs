@@ -1,7 +1,7 @@
 //! The durable, append-only light-client archive.
 //!
 //! The two halves of roost's store have opposite recovery properties, and that
-//! is the whole reason this file exists (docs/lc-server-design.md, "The archive
+//! is the whole reason this file exists (docs/design-history/lc-server-design.md, "The archive
 //! must be durable; the live window need not be"):
 //!
 //! - **Live window** (Nimbus's floor → head): disposable. Refetchable in seconds.

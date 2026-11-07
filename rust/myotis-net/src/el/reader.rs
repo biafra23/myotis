@@ -71,7 +71,7 @@ pub struct ElConfig {
     /// runs without persistence.
     pub cache_path: Option<std::path::PathBuf>,
     /// Path to the eth_getLogs watch-list index (`dataDir/logindex[-net].db`);
-    /// `None` keeps the index memory-only (docs/eth-getlogs-design.md).
+    /// `None` keeps the index memory-only (docs/design-history/eth-getlogs-design.md).
     pub log_index_path: Option<std::path::PathBuf>,
     /// Network floor for the suggested priority fee (wei) — the Java
     /// `NetworkConfig.minSuggestedTipWei` (mainnet/sepolia 0.1 gwei; gnosis 0.001).
@@ -98,7 +98,7 @@ pub struct ElConfig {
     pub traffic: Arc<crate::traffic::TrafficMeter>,
 }
 
-/// The dedicated myotis-serving sepolia node (docs/dedicated-sepolia-node.md).
+/// The dedicated myotis-serving sepolia node (docs/guides/dedicated-sepolia-node.md).
 /// Key stable (persisted nodekey); the address is the netcup relay
 /// (188.68.32.16, static VPS) that DNATs 30405 to zbox over WireGuard — zbox
 /// itself is behind mobile CGNAT, so its own uplink rotating no longer matters.
@@ -308,7 +308,7 @@ impl ElConfig {
             min_suggested_tip_wei: 100_000_000, // 0.1 gwei
             block_time: Duration::from_secs(12),
             traffic: crate::traffic::TrafficMeter::new(),
-            // The dedicated myotis-serving node (docs/dedicated-sepolia-node.md):
+            // The dedicated myotis-serving node (docs/guides/dedicated-sepolia-node.md):
             // it admits wallets past its peer cap by RLPx Hello client-id, so
             // direct-dialing it beats waiting for discovery on a saturated
             // testnet. Mirrors the Java `NetworkConfig.SEPOLIA_EL_ENODES`.
@@ -974,7 +974,7 @@ struct SentTx {
     via_tor: bool,
 }
 
-/// Which way a rebroadcast of one of our sends goes (docs/privacy-and-tor.md).
+/// Which way a rebroadcast of one of our sends goes (docs/how-it-works/privacy-and-tor.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RebroadcastRoute {
     Tor,
@@ -1226,7 +1226,7 @@ const _: () = assert!(HEDGE_DELAY.as_millis() < LOG_INDEX_FILL_DEADLINE.as_milli
 ///    every peer at once;
 ///  - a snap query for an ADDRESS-carrying read (`get_account`/`get_storage`)
 ///    discloses `keccak(address)` to whichever peers it reaches — the §1 "core
-///    leak" in docs/privacy-and-tor.md. Sequential rotation disclosed to a new
+///    leak" in docs/how-it-works/privacy-and-tor.md. Sequential rotation disclosed to a new
 ///    peer only on FAILURE; hedging discloses to up to this many peers whenever
 ///    the first is slower than `HEDGE_DELAY` (the mobile/congested case #320 is
 ///    about), even if that first peer then answers. This cap bounds the widened
@@ -1390,7 +1390,7 @@ struct TorBroadcast {
     confirmed: bool,
 }
 
-/// Push `raw` over Tor (docs/privacy-and-tor.md §4) to every one of
+/// Push `raw` over Tor (docs/how-it-works/privacy-and-tor.md §4) to every one of
 /// `targets` at once (from [`tor_candidates`]), each push its own Tor stream
 /// with a fresh ephemeral RLPx key, all under ONE isolation token fresh to
 /// this call: whatever circuits carry them carry nothing else — no other
@@ -1737,7 +1737,7 @@ enum PoolRaceVerdict<T> {
 /// failure keep their strikes — the reasons in `RaceOutcome::errors` carry
 /// their peer position, so a per-peer excuse there would be cheap now, but a
 /// Behind peer rarely enters a race at all now that the ladder ranks it last
-/// (dropped consciously, docs/TODO.md).
+/// (dropped consciously, docs/reviews/review-follow-ups.md).
 /// `head_anchored` = the window's top was the optimistic head. Only such a
 /// window can lose the one-slot race with the peers' imports; a window
 /// anchored at the FINALIZED block (`WindowTop::Finalized`) is minutes old, so
@@ -1780,7 +1780,7 @@ fn race_served_by_winner<T>(out: &RaceOutcome<T>, served: impl Fn(&T) -> bool) -
     out.accepted.as_ref().is_some_and(|(_, v)| served(v))
 }
 
-/// Tor read fan-out bounds (docs/privacy-and-tor.md): how many eligible
+/// Tor read fan-out bounds (docs/how-it-works/privacy-and-tor.md): how many eligible
 /// snap peers a single Tor-routed read may try, and the wall-clock ceiling on the
 /// whole read. Kept small because each Tor dial is slow and many peers reject
 /// Tor-exit inbound — without these a bad-exit walk could hang the FFI call for
@@ -2051,7 +2051,7 @@ pub struct ElReader {
     pool: PeerPool,
     anchor: Arc<ExecAnchor>,
     /// Our eth handshake parameters — reused by the Tor read path
-    /// (`docs/privacy-and-tor.md`) to dial a per-address isolated circuit with a
+    /// (`docs/how-it-works/privacy-and-tor.md`) to dial a per-address isolated circuit with a
     /// fresh ephemeral identity, independent of the pool's clearnet connections.
     /// Only read on the `tor` feature; kept unconditionally so the struct shape
     /// doesn't depend on the feature.
@@ -2105,7 +2105,7 @@ pub struct ElReader {
     /// The sent-tx WATCH, shared with every peer's read loop (which marks
     /// gossip sightings) — the Java TxGossipObserver seam's equivalent.
     sent_tx_watch: crate::el::sent_tx::SharedSentTxWatch,
-    /// The opt-in eth_getLogs watch-list index (docs/eth-getlogs-design.md).
+    /// The opt-in eth_getLogs watch-list index (docs/design-history/eth-getlogs-design.md).
     /// `None` until the host supplies a config. Brief-hold lock: appends and
     /// queries are in-memory work; persistence happens on checkpoints and
     /// stop, never under a network await.
@@ -2493,7 +2493,7 @@ impl ElReader {
     /// host re-applying its shipped preset EXTENDS an imported subscription
     /// instead of replacing it. Without this, every restart's preset push
     /// would fingerprint-mismatch the imported index into a full re-index
-    /// (see docs/eth-getlogs-design.md §import). So an address this push
+    /// (see docs/design-history/eth-getlogs-design.md §import). So an address this push
     /// leaves out stays subscribed; it leaves only through
     /// [`Self::unwatch_log_index`].
     ///
@@ -3014,7 +3014,7 @@ impl ElReader {
     }
 
     /// Activate a portable log-index snapshot found at this reader's own
-    /// path (the drop-in path, docs/eth-getlogs-design.md): a
+    /// path (the drop-in path, docs/design-history/eth-getlogs-design.md): a
     /// self-describing file in the data dir IS an opt-in — someone put it
     /// there deliberately, and the daemon has no settings surface to say so
     /// otherwise. Enabled for SERVING on activation, with the downward walk
@@ -3134,7 +3134,7 @@ impl ElReader {
         }
     }
 
-    /// Import portable log-index snapshots (docs/eth-getlogs-design.md):
+    /// Import portable log-index snapshots (docs/design-history/eth-getlogs-design.md):
     /// every file must be a v2/v3 self-describing snapshot of THIS chain; they
     /// merge with the node's current index (checkpointed first so nothing
     /// in-memory is lost), the merged result is persisted and installed, and
@@ -4857,7 +4857,7 @@ impl ElReader {
 
     /// One backfill step: walk the verified header chain DOWNWARD from the
     /// index's trust cursor toward the lowest watched from_block, one batch
-    /// per tick (docs/eth-getlogs-design.md §backfill). Every header is
+    /// per tick (docs/design-history/eth-getlogs-design.md §backfill). Every header is
     /// trusted only through parent-hash linkage into the cursor (whose own
     /// trust chains back to a beacon-anchored append); candidate blocks
     /// (bloom hit) get their receipts fetched and verified against
@@ -5766,7 +5766,7 @@ impl ElReader {
     /// or nothing (CLAUDE.md §Trust).
     ///
     /// A head read of a watched account the activity follower carries
-    /// (docs/address-activity.md, *Answering from block access lists*) is
+    /// (docs/how-it-works/address-activity.md, *Answering from block access lists*) is
     /// answered from its verified BALs instead, with no request to any peer:
     /// `verifyMethod` `blockAccessList`, at the head or at most
     /// [`activity::FOLLOW_MAX_LAG`](crate::el::activity::FOLLOW_MAX_LAG)
@@ -5903,7 +5903,7 @@ impl ElReader {
         anchor: ReadAnchor,
         address: [u8; 20],
     ) -> Result<VerifiedAccount, String> {
-        // Tor mode (docs/privacy-and-tor.md): route this read — the §1 "core
+        // Tor mode (docs/how-it-works/privacy-and-tor.md): route this read — the §1 "core
         // leak" flow — over a per-address isolated Tor circuit instead of the
         // pool's clearnet connections. Fail-closed if no aged peer is available.
         #[cfg(feature = "tor")]
@@ -6287,7 +6287,7 @@ impl ElReader {
     /// `optimistic_root_at`). That is still the block the read ran against; a
     /// caller that needs it canonical NOW compares it with a hash the follower
     /// vouches for, as the activity report's `base.hash`
-    /// (docs/address-activity.md).
+    /// (docs/how-it-works/address-activity.md).
     fn proven_block_hash(&self, number: u64, state_root: &[u8; 32]) -> Option<[u8; 32]> {
         if let Some(fin) = self.anchor.finalized_execution() {
             if fin.block_number == number && &fin.state_root == state_root {
@@ -9141,7 +9141,7 @@ impl ElReader {
             tracing::info!(tx = %tx_hash, reason, "transaction not broadcast");
             SendError::Unavailable(reason.to_string())
         };
-        // Tor mode (docs/privacy-and-tor.md §4): the broadcast leaves over Tor
+        // Tor mode (docs/how-it-works/privacy-and-tor.md §4): the broadcast leaves over Tor
         // or not at all — never from the real IP as a fallback.
         #[cfg(feature = "tor")]
         if crate::el::tor::is_enabled() {
@@ -9272,7 +9272,7 @@ impl ElReader {
         };
         // A Tor-routed read answers at a fresh session's own head, never at the
         // anchored root, so it could never judge: spare the send its wait and
-        // the circuit (docs/privacy-and-tor.md).
+        // the circuit (docs/how-it-works/privacy-and-tor.md).
         #[cfg(feature = "tor")]
         if crate::el::tor::is_enabled() {
             return PreBroadcast::Unchecked("Tor reads are not at the anchored root");
@@ -15017,7 +15017,7 @@ const PERSIST_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// This bounds the constant. The asymptotics — O(n²) total bytes across a walk
 /// that grows the index linearly — are inherent to full-rewrite checkpoints and
 /// are fixed by the segmented/delta store already recorded as required before
-/// mainnet-scale mobile backfill (docs/eth-getlogs-design.md §Store).
+/// mainnet-scale mobile backfill (docs/design-history/eth-getlogs-design.md §Store).
 fn persist_interval(last_bytes: u64) -> std::time::Duration {
     // div_ceil, not truncating division: rounding the interval DOWN puts the
     // sustained rate over the budget for every size that isn't a whole

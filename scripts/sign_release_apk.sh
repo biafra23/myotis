@@ -8,7 +8,7 @@
 # environment, which only v* tags may use, and that job checks out nothing but
 # this script and the pinned certificate, so no Gradle, plugin or cargo code ever
 # runs next to the key. Setup, rotation and what to do on loss:
-# docs/android-release-signing.md.
+# docs/guides/android-release-signing.md.
 #
 # Inputs, all from the environment (the job maps the secrets of the same names):
 #   ANDROID_RELEASE_KEYSTORE_BASE64    the keystore file (PKCS12 or JKS), base64
@@ -49,7 +49,7 @@ debug_cert=760390cd58e698e9fdad45a053ec109e117f952ed355f2eab5b1ad0d5900e995
 
 # --- the pinned release certificate --------------------------------------------
 [ -f "$pin_file" ] \
-  || die "no pinned release certificate ($pin_file): commit its SHA-256 as android-app/release-signing-cert.sha256 (docs/android-release-signing.md)"
+  || die "no pinned release certificate ($pin_file): commit its SHA-256 as android-app/release-signing-cert.sha256 (docs/guides/android-release-signing.md)"
 # First line that is not a comment; keytool prints AB:CD:…, apksigner abcd…: accept both.
 pin=$(grep -v '^[[:space:]]*#' "$pin_file" | grep -m1 '[^[:space:]]' | tr -d ': \t\r' | tr 'A-F' 'a-f' || true)
 [[ "$pin" =~ ^[0-9a-f]{64}$ ]] \
@@ -60,7 +60,7 @@ pin=$(grep -v '^[[:space:]]*#' "$pin_file" | grep -m1 '[^[:space:]]' | tr -d ': 
 # --- the secrets -----------------------------------------------------------------
 for v in ANDROID_RELEASE_KEYSTORE_BASE64 ANDROID_RELEASE_KEYSTORE_PASSWORD ANDROID_RELEASE_KEY_ALIAS; do
   [ -n "${!v:-}" ] \
-    || die "$v is not set — add it to the android-release environment's secrets (docs/android-release-signing.md)"
+    || die "$v is not set — add it to the android-release environment's secrets (docs/guides/android-release-signing.md)"
 done
 # apksigner reads the passwords from the environment (env:NAME), never from argv,
 # where any process on the runner could list them.

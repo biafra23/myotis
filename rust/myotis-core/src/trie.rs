@@ -1,6 +1,6 @@
 //! Merkle-Patricia proof verification — twin of `core.trie` (Java:
 //! `MerklePatriciaProofVerifier` + `HexPrefix`). The state trust anchor for
-//! SNAP-served data (docs/reimplementation/03 §2): given a trusted `root`, an
+//! SNAP-served data (docs/spec/03 §2): given a trusted `root`, an
 //! un-hashed `key`, and the peer's RLP node list, decide
 //! Found / Absent / Invalid. Semantics are pinned cross-language by the
 //! `rust/testdata/el/mpt/` corpus — replicate-verbatim territory

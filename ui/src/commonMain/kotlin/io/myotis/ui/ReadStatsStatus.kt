@@ -2,7 +2,7 @@ package io.myotis.ui
 
 /**
  * Shared reader for the engines' read-fetch shadow-cache JSON
- * (`ChainHandle.readStatsJson()`, schema 1 — docs/read-stats.md), so every
+ * (`ChainHandle.readStatsJson()`, schema 1 — docs/how-it-works/read-stats.md), so every
  * host's Status tab renders the identical rows and a serializer change
  * degrades one pinned place instead of per-host regex copies.
  *

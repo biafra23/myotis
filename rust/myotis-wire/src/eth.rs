@@ -1,5 +1,5 @@
 //! eth/66-71 sub-protocol messages (EL-A5; eth/70-71 Rust only), twin of the Java
-//! `networking.eth.messages` package (docs/reimplementation/02 §6).
+//! `networking.eth.messages` package (docs/spec/02 §6).
 //!
 //! Pure encode/decode over bytes — the async handshake + request correlation
 //! live in [`super::session`]. Message codes are the ABSOLUTE eth codes (p2p
@@ -55,7 +55,7 @@ pub const BLOCK_ACCESS_LISTS: u64 = 0x23;
 // ---------------------------------------------------------------------------
 
 /// A decoded eth Status. eth/67-68 carries `td`; eth/69 carries block numbers
-/// instead (docs/reimplementation/02 §6.4).
+/// instead (docs/spec/02 §6.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
     pub protocol_version: u64,
@@ -210,7 +210,7 @@ pub fn decode_status(rlp_bytes: &[u8], eth_version: u64) -> Result<Status, CoreE
 }
 
 impl Status {
-    /// Compatibility gate: same network id AND genesis (docs/reimplementation/02 §6.4).
+    /// Compatibility gate: same network id AND genesis (docs/spec/02 §6.4).
     pub fn is_compatible(&self, expected_network_id: u64, expected_genesis: &[u8; 32]) -> bool {
         self.network_id == expected_network_id && &self.genesis_hash == expected_genesis
     }
@@ -658,7 +658,7 @@ pub fn decode_receipts(rlp_bytes: &[u8], requested: usize) -> Result<(u64, Vec<B
 /// function of the logs, so [`BlockReceipts::canonical`] recomputes it and
 /// re-canonicalizes (`type ‖ rlp([status, cumGas, bloom, logs])`), after which
 /// the receipts-trie check works exactly as for eth/66-68
-/// (docs/reimplementation/02 §6.6). Each receipt is checked here, so a
+/// (docs/spec/02 §6.6). Each receipt is checked here, so a
 /// malformed one fails the response as before; only the recomputation waits.
 pub fn decode_receipts69(rlp_bytes: &[u8], requested: usize) -> Result<(u64, Vec<BlockReceipts>), CoreError> {
     let (request_id, blocks_view) = request_and_payload(rlp_bytes)?;

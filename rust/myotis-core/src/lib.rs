@@ -1,5 +1,5 @@
 //! Myotis execution-layer primitives (EL-A1 of the EL phase —
-//! docs/reimplementation/07-el-implementation-plan.md).
+//! docs/spec/07-el-implementation-plan.md).
 //!
 //! Sans-I/O by rule: no sockets, filesystem, clock, or entropy. Everything here
 //! is a pure function over caller-supplied bytes, mirroring the Java `:core`

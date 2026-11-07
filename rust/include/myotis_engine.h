@@ -82,7 +82,7 @@ int64_t myotis_create_with_checkpoint(const char *network, const char *data_dir,
 /* Start the sync loop. False for an unknown/already-running handle. */
 bool myotis_start(int64_t handle);
 
-/* Toggle Tor verified-read routing (docs/privacy-and-tor.md). Returns true iff
+/* Toggle Tor verified-read routing (docs/how-it-works/privacy-and-tor.md). Returns true iff
  * this build supports Tor (built with `--features tor`); a Tor-less build
  * returns false and no-ops. Process-global, not per-handle. */
 bool myotis_set_tor_enabled(bool on);
@@ -108,7 +108,7 @@ bool myotis_set_tor_storage_dirs(const char *state_dir, const char *cache_dir);
 bool myotis_set_dns_discovery(bool on);
 
 /* The host's word on the device's current network, for the status JSON's
- * data-usage figures (docs/data-usage.md): 0 unknown, 1 unmetered, 2 metered.
+ * data-usage figures (docs/how-it-works/data-usage.md): 0 unknown, 1 unmetered, 2 metered.
  * Bytes moved from now on count as metered while it is 2. Returns false, and
  * records nothing, for any other code. Process-global, not per-handle. */
 bool myotis_set_network_metering(int32_t code);
@@ -393,7 +393,7 @@ char *myotis_check_raw_transaction_json(const char *raw_tx_hex);
 /* Release any char* returned by the functions above. NULL is a no-op. */
 void myotis_string_free(char *s);
 
-/* v21: the opt-in eth_getLogs watch-list index (docs/eth-getlogs-design.md).
+/* v21: the opt-in eth_getLogs watch-list index (docs/design-history/eth-getlogs-design.md).
  * get_logs answers only inside indexed coverage; anything else is an
  * {"error": ...} JSON — never an empty array for unindexed ranges. A filter
  * that fails to parse (malformed, a `safe` or hash selector, no address and
@@ -462,7 +462,7 @@ char *myotis_log_index_status_json(int64_t handle);
 bool myotis_set_activity_watch(int64_t handle, const char *config_json);
 char *myotis_address_activity_json(int64_t handle, int64_t after_block);
 
-/* v28: the read-fetch shadow-cache counters (docs/read-stats.md): how much of
+/* v28: the read-fetch shadow-cache counters (docs/how-it-works/read-stats.md): how much of
  * the verified account / storage / bytecode fetch traffic a cache would have
  * served, by keying, with the wall-clock it would have saved. Counts only —
  * nothing is served from it. {"error": ...} when the handle has no EL reader. */

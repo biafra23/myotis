@@ -1,5 +1,5 @@
 //! RLPx EIP-8 auth/ack handshake + session-secret derivation (EL-A4), twin of
-//! the Java `rlpx.AuthHandshake` (docs/reimplementation/02 §5.2, §9.3-4).
+//! the Java `rlpx.AuthHandshake` (docs/spec/02 §5.2, §9.3-4).
 //!
 //! Initiator-only. Load-bearing details:
 //! - auth body `[sig(65), pubkey(64), nonce(32), version(4), …padding]` — the

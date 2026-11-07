@@ -2,7 +2,7 @@
 //! `networking.eth.messages.ReceiptsMessage` (Java). Needed because eth/69
 //! (EIP-7642) receipts arrive bloomless: the bloom is a pure function of the
 //! logs, so it is recomputed before re-canonicalizing the receipt for the
-//! `receiptsRoot` check (docs/reimplementation/02 §6.6, README §11.11).
+//! `receiptsRoot` check (docs/spec/02 §6.6, README §11.11).
 
 use crate::keccak::keccak256;
 
@@ -28,7 +28,7 @@ pub fn accrue(bloom: &mut LogsBloom, item: &[u8]) {
 /// topic emitted nothing here", a safe skip), `true` is only "maybe" and
 /// must be confirmed against receiptsRoot-verified receipts. Used by the
 /// eth_getLogs indexer to skip blocks whose header bloom cannot contain any
-/// watched address (docs/eth-getlogs-design.md).
+/// watched address (docs/design-history/eth-getlogs-design.md).
 pub fn may_contain(bloom: &LogsBloom, item: &[u8]) -> bool {
     BloomProbe::of(item).may_match(bloom)
 }

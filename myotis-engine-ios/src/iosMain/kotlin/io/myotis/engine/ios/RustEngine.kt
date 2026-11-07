@@ -207,7 +207,7 @@ object RustEngine {
         return take(myotis_get_logs_json(handle, filterJson))
     }
 
-    /** Read-fetch shadow-cache counters JSON (docs/read-stats.md). */
+    /** Read-fetch shadow-cache counters JSON (docs/how-it-works/read-stats.md). */
     fun readStatsJson(handle: Long): String {
         requireAbi()
         return take(myotis_read_stats_json(handle)) ?: """{"error":"engine returned no result"}"""

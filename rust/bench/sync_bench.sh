@@ -16,7 +16,7 @@
 #                  pure-native shell (future iOS/NM-host) could save.
 #
 # Usage: rust/bench/sync_bench.sh [java|rust|native|all]   (default: all)
-# Output: appends a markdown row to docs/reimplementation/benchmarks.md and prints
+# Output: appends a markdown row to docs/spec/benchmarks.md and prints
 # a summary. Peer-bound: a single run is noisy (8-18 min observed); run 2-3x per
 # engine at similar hours for a fair read.
 set -uo pipefail

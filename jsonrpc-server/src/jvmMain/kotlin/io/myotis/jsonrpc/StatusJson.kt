@@ -59,7 +59,7 @@ internal object StatusJson {
         val reason = s.lastWakeReason()
         if (reason == null) put("lastWakeReason", JsonNull) else put("lastWakeReason", reason)
         // This network's bytes on the wire, since start and today, and the host's
-        // word on the device's network (docs/data-usage.md). Same keys and order as
+        // word on the device's network (docs/how-it-works/data-usage.md). Same keys and order as
         // the IPC shape's.
         val u = s.dataUsage()
         put("dataUsage", buildJsonObject {

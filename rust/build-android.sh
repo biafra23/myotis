@@ -2,7 +2,7 @@
 # Cross-compile the workspace's Android cdylibs (myotis-bls today; myotis-engine once
 # it grows a real JNI surface) for Android ABIs into the engine library's jniLibs, so
 # NativeBlsBackend.isAvailable() is true on-device and the ~4-15x faster BLS verify
-# kicks in. See docs/bls-rust-acceleration.md.
+# kicks in. See docs/design-history/bls-rust-acceleration.md.
 #
 # One-time setup:
 #   rustup target add aarch64-linux-android x86_64-linux-android armv7-linux-androideabi
@@ -18,7 +18,7 @@
 #
 # MYOTIS_TOR_ENGINE=1 also compiles Tor into the engine (`--features
 # myotis-engine/tor`: Arti on rustls + ring, SQLite bundled — see the TLS note in
-# myotis-net/Cargo.toml and docs/privacy-and-tor.md). It adds megabytes per ABI,
+# myotis-net/Cargo.toml and docs/how-it-works/privacy-and-tor.md). It adds megabytes per ABI,
 # so it stays off unless asked for; Gradle sets it for `-PtorEngine`.
 set -euo pipefail
 

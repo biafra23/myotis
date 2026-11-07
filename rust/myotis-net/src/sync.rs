@@ -403,7 +403,7 @@ impl ChainConfig {
             // DURABLE CONSTRAINT (survives every refresh, so it lives outside the
             // rewritten region): this pin must stay NEWER than the dedicated
             // serving node's trustedNodeSync point, or that node cannot answer
-            // the bootstrap for it (docs/dedicated-sepolia-node.md §5).
+            // the bootstrap for it (docs/guides/dedicated-sepolia-node.md §5).
             // @checkpoint:sepolia:begin — managed by `./gradlew refreshCheckpoint`
             // trusted checkpoint: recent finalized sepolia block root (slot 11523360, 2026-11-07, period 1406)
             checkpoint_root: hex32(
@@ -739,7 +739,7 @@ fn hex32(s: &str) -> [u8; 32] {
 /// census-verified server serves Gloas-era light-client data to put third
 /// (the dropped Lighthouse entries below serve none).
 const SEPOLIA_STATIC_PEERS: &[&str] = &[
-    // roost, the dedicated light-client server (rust/roost, docs/lc-server-design.md).
+    // roost, the dedicated light-client server (rust/roost, docs/design-history/lc-server-design.md).
     // FIRST on purpose: it exists because a general-purpose beacon node is
     // structurally bad at serving wallets — one connection semaphore shared
     // between inbound and outbound, and a trimmer that drops light clients
@@ -1119,7 +1119,7 @@ const MAINNET_STATIC_PEERS: &[&str] = &[
     // wallet spends its strikes-to-eviction on a node that is actually fine.
     //
     // The address is the netcup relay (see the ADDRESS note above); ENR
-    // publication (docs/lc-server-design.md §7) is what removes the need to
+    // publication (docs/design-history/lc-server-design.md §7) is what removes the need to
     // pin at all. Recovery from a RELAY move is operator-driven, not automatic:
     // behind the tunnel the address is configuration on both ends (this pin
     // and the upstream Nimbus's --nat=extip), and roost takes its external
@@ -1507,7 +1507,7 @@ impl Peer {
     /// lsquic fixes Nimbus v26.10.1 vendors (nim-lsquic 0.11.2: no
     /// no-progress abort, keep-alive on stream-less connections) are not
     /// known to cover that stall, so Nimbus stays on TCP first until a
-    /// re-measurement says otherwise (docs/TODO.md). Everyone else —
+    /// re-measurement says otherwise (docs/reviews/review-follow-ups.md). Everyone else —
     /// Lighthouse and Grandine (rust-libp2p, this host's own stack, QUIC on
     /// by default since Lighthouse v4.5), Prysm (quic-go, default since
     /// v5.2.0), Lodestar (default since v1.42), Teku (default in 26.9) —

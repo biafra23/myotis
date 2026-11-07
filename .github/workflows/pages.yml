@@ -3,7 +3,7 @@
 # site/ is a plain static page for people who USE the apps, not for developers:
 # no build step, no generator, no third-party requests. Keep it that way: the
 # same directory is meant to be uploaded unchanged to Swarm and served as
-# myotis.eth (and myotis.eth.limo for ordinary browsers) — see docs/website.md —
+# myotis.eth (and myotis.eth.limo for ordinary browsers) — see docs/how-it-works/website.md —
 # and a page that needs a build or pulls in a CDN would not survive that move.
 #
 # One-time setup, by a repository admin (this workflow cannot do it itself; the
