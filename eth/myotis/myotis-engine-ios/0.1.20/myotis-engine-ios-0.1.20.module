@@ -1,0 +1,180 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "eth.myotis",
+    "module": "myotis-engine-ios",
+    "version": "0.1.20",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "8.12"
+    }
+  },
+  "variants": [
+    {
+      "name": "metadataApiElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-metadata",
+        "org.jetbrains.kotlin.platform.type": "common"
+      },
+      "dependencies": [
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-stdlib",
+          "version": {
+            "requires": "2.2.21"
+          }
+        },
+        {
+          "group": "org.jetbrains.kotlinx",
+          "module": "kotlinx-serialization-json",
+          "version": {
+            "requires": "1.7.3"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "myotis-engine-ios-metadata-0.1.20.jar",
+          "url": "myotis-engine-ios-0.1.20.jar",
+          "size": 793,
+          "sha512": "5a103b20d6fb14d4d74e9544c4795f57a3ebab5665e82f590a38cb80dc9db562188ed4abab0c8aafe6347628958175d2761df89edcce4c1da79af3121adc9aa7",
+          "sha256": "a23735073ca1e3c8a9a140b37e5aae6bcbff62805a6f580ff8e5f790012d94e3",
+          "sha1": "ff5770653ef7ea6f51ea1130d13871c08d4678f8",
+          "md5": "8b224274b4c58282f58189f31ec57b28"
+        }
+      ]
+    },
+    {
+      "name": "metadataSourcesElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-runtime",
+        "org.jetbrains.kotlin.platform.type": "common"
+      },
+      "files": [
+        {
+          "name": "myotis-engine-ios-kotlin-0.1.20-sources.jar",
+          "url": "myotis-engine-ios-0.1.20-sources.jar",
+          "size": 30340,
+          "sha512": "c95a0f0057ad68c44d2bd9b1e0a431026cd5bb9801700403185acfeaf1209e186729de36b87e3f315d817564df3a2ee35aae99300c26dcb9c606a752b2d497d8",
+          "sha256": "2eb511a1ba6bca3048ef9f047010157c33ea54f39e1d3434a148707d399250ce",
+          "sha1": "2698a7a997ba2b9f4de4fd4871c635661c72f943",
+          "md5": "7af083546c568b7510a393662d263227"
+        }
+      ]
+    },
+    {
+      "name": "iosArm64ApiElements-published",
+      "attributes": {
+        "artifactType": "org.jetbrains.kotlin.klib",
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-api",
+        "org.jetbrains.kotlin.native.target": "ios_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "available-at": {
+        "url": "../../myotis-engine-ios-iosarm64/0.1.20/myotis-engine-ios-iosarm64-0.1.20.module",
+        "group": "eth.myotis",
+        "module": "myotis-engine-ios-iosarm64",
+        "version": "0.1.20"
+      }
+    },
+    {
+      "name": "iosArm64SourcesElements-published",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-runtime",
+        "org.jetbrains.kotlin.native.target": "ios_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "available-at": {
+        "url": "../../myotis-engine-ios-iosarm64/0.1.20/myotis-engine-ios-iosarm64-0.1.20.module",
+        "group": "eth.myotis",
+        "module": "myotis-engine-ios-iosarm64",
+        "version": "0.1.20"
+      }
+    },
+    {
+      "name": "iosArm64MetadataElements-published",
+      "attributes": {
+        "artifactType": "org.jetbrains.kotlin.klib",
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-metadata",
+        "org.jetbrains.kotlin.native.target": "ios_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "available-at": {
+        "url": "../../myotis-engine-ios-iosarm64/0.1.20/myotis-engine-ios-iosarm64-0.1.20.module",
+        "group": "eth.myotis",
+        "module": "myotis-engine-ios-iosarm64",
+        "version": "0.1.20"
+      }
+    },
+    {
+      "name": "iosSimulatorArm64ApiElements-published",
+      "attributes": {
+        "artifactType": "org.jetbrains.kotlin.klib",
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-api",
+        "org.jetbrains.kotlin.native.target": "ios_simulator_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "available-at": {
+        "url": "../../myotis-engine-ios-iossimulatorarm64/0.1.20/myotis-engine-ios-iossimulatorarm64-0.1.20.module",
+        "group": "eth.myotis",
+        "module": "myotis-engine-ios-iossimulatorarm64",
+        "version": "0.1.20"
+      }
+    },
+    {
+      "name": "iosSimulatorArm64SourcesElements-published",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-runtime",
+        "org.jetbrains.kotlin.native.target": "ios_simulator_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "available-at": {
+        "url": "../../myotis-engine-ios-iossimulatorarm64/0.1.20/myotis-engine-ios-iossimulatorarm64-0.1.20.module",
+        "group": "eth.myotis",
+        "module": "myotis-engine-ios-iossimulatorarm64",
+        "version": "0.1.20"
+      }
+    },
+    {
+      "name": "iosSimulatorArm64MetadataElements-published",
+      "attributes": {
+        "artifactType": "org.jetbrains.kotlin.klib",
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-metadata",
+        "org.jetbrains.kotlin.native.target": "ios_simulator_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "available-at": {
+        "url": "../../myotis-engine-ios-iossimulatorarm64/0.1.20/myotis-engine-ios-iossimulatorarm64-0.1.20.module",
+        "group": "eth.myotis",
+        "module": "myotis-engine-ios-iossimulatorarm64",
+        "version": "0.1.20"
+      }
+    }
+  ]
+}
