@@ -448,6 +448,9 @@ public record NetworkConfig(
             // v0.1.19): run 41739549063, 2 of 2, and both cold starts SYNCED — the
             // first fully green Sepolia run since Gloas. This Nimbus had 41 of 60
             // peers then. Details in the Rust twin (SEPOLIA_STATIC_PEERS).
+            // Release check for v0.1.20 (2026-11-07), slot 11523360 (refreshed):
+            // run 42324482192, 2 of 2, both cold starts SYNCED again; the Nimbus
+            // was back at 60 of 60 right after. Details in the Rust twin.
             // Keep this list identical to SEPOLIA_STATIC_PEERS in
             // rust/myotis-net/src/sync.rs (both parity tests pin it).
             List.of(
