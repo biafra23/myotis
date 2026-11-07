@@ -5,7 +5,7 @@
 //! Everything here is held as the **fully encoded libp2p response**
 //! (`result byte || fork digest || varint || snappy frames`), not raw SSZ.
 //! Serving is then a memcpy and a write, with no per-peer computation — which
-//! is precisely what §Capacity in docs/lc-server-design.md rests on. Every
+//! is precisely what §Capacity in docs/design-history/lc-server-design.md rests on. Every
 //! client receives identical bytes, so the snappy work happens once at ingest
 //! rather than once per wallet.
 //!

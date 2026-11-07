@@ -1,0 +1,724 @@
+<!--meta {"id":"stop-17","num":17,"title":"Deep dive: how UniFFI connects Kotlin to Rust","short":"deep dive · UniFFI","sub":"1 file · 3 lines","part":"Boundaries & binaries"} -->
+<header class="stop-head">
+  <div class="eyebrow">Stop 17 · crate <code>uniffi-bindgen</code> <span>1 file · 3 lines, plus the uniffi crates, the generated Kotlin and its callers · about 355 minutes (nearly six hours: read it in several sittings)</span></div>
+  <h1>Deep dive: how UniFFI connects Kotlin to Rust</h1>
+  <p class="lede">You asked how the UniFFI API works and what it looks like. This stop follows one call, <code>requestAccountJson</code>, from a Java caller through generated Kotlin, JNA and a macro-generated <code>extern "C"</code> function into <code>host.rs</code>, and back. On the way you will see every piece of code involved: what you write in Rust, what the macros turn it into, the <code>uniffi_core</code> runtime, the generator, the 2,384-line Kotlin file it produces, the Java that calls it, and the Gradle tasks that tie them together. You will see who allocates and who frees each buffer, which thread runs what, what a panic does, and how a checksum per function stops a stale library from being called. The stop is long on purpose. Afterwards you should be able to explain UniFFI to someone else on a whiteboard.</p>
+</header>
+
+<div class="learn">
+  <h2>Rust you will practise</h2>
+  <div><b>Ownership without a destructor</b><code>RustBuffer</code> is a <code>Vec&lt;u8&gt;</code> taken apart into pointer, length and capacity, with <code>ManuallyDrop</code> and <code>Vec::from_raw_parts</code> moving ownership across the C boundary.</div>
+  <div><b>Code that writes code</b>What a function-like macro (<code>setup_scaffolding!</code>) and an attribute macro (<code>#[uniffi::export]</code>) expand to, how <code>quote!</code> builds Rust code, and how a <code>const fn</code> computes a checksum at compile time.</div>
+  <div><b>Traits as a conversion vocabulary</b><code>FfiConverter</code>, <code>Lift</code>, <code>Lower</code> and <code>LowerReturn</code>, generic over a crate-local tag type because of the orphan rule, derived with a <code>macro_rules!</code> macro; and <code>catch_unwind</code> versus <code>panic = "abort"</code>.</div>
+</div>
+
+<section class="prose">
+  <h2>The short answer</h2>
+  <p>UniFFI is a code generator for both sides of a C interface. You write ordinary Rust functions and mark them <code>#[uniffi::export]</code>. At compile time the macro writes, for each one, a C-callable wrapper, a byte-encoded description of its signature (the <em>metadata</em>) and a checksum of that description, all as exported symbols of the compiled library. A separate tool, <code>uniffi-bindgen</code>, reads the metadata out of the compiled <code>.so</code> or <code>.dylib</code> and writes a Kotlin file: JNA declarations for the C functions, converters for each type, and one idiomatic Kotlin function per export. At run time the Kotlin side loads the library through JNA, compares every checksum with the value it was generated from, and then calls through.</p>
+  <p>So two generated halves must agree byte for byte. The Rust half is regenerated on every <code>cargo build</code>; the Kotlin half only when someone runs <code>./gradlew uniffiGenerateKotlin</code>. The checksums catch the moment they stop agreeing.</p>
+  <p>In Myotis the exported surface is deliberately simple. The 55 functions in <code>ffi.rs</code> take and return only <code>i32</code>, <code>i64</code>, <code>bool</code>, <code>String</code> and <code>Option&lt;String&gt;</code> (or return nothing). Anything compound (an account proof, a block, a status) is a JSON string. That keeps UniFFI's job small and makes its machinery easy to see.</p>
+
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Piece</th><th>Where</th><th>Written by</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td><code>#[uniffi::export] fn …</code></td><td><code>rust/myotis-engine/src/ffi.rs</code></td><td>you</td><td>The API: 55 one-line functions calling into <code>host.rs</code>.</td></tr>
+      <tr><td><code>uniffi::setup_scaffolding!()</code></td><td><code>rust/myotis-engine/src/lib.rs</code></td><td>you (one line)</td><td>Expands to the crate-wide glue: the tag type, buffer alloc/free functions, the contract version.</td></tr>
+      <tr><td>scaffolding functions, metadata, checksums</td><td>inside the compiled library</td><td><code>uniffi_macros</code>, at compile time</td><td>The C-callable side of every export.</td></tr>
+      <tr><td><code>RustBuffer</code>, <code>RustCallStatus</code>, <code>Lift</code>/<code>Lower</code>, <code>rust_call</code></td><td><code>uniffi_core</code> crate</td><td>UniFFI</td><td>The runtime the scaffolding calls.</td></tr>
+      <tr><td><code>uniffi-bindgen</code> binary</td><td><code>rust/uniffi-bindgen/</code></td><td>you (three lines)</td><td>Runs <code>uniffi_bindgen</code> against the built library.</td></tr>
+      <tr><td><code>myotis_engine.kt</code> (2,384 lines)</td><td><code>myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/</code></td><td><code>uniffi_bindgen</code>, committed</td><td>JNA declarations, converters, checksum checks, 55 Kotlin functions.</td></tr>
+      <tr><td>JNA</td><td><code>com.sun.jna</code> jar + <code>libjnidispatch</code></td><td>third party</td><td>Calls C functions from the JVM without hand-written JNI.</td></tr>
+      <tr><td><code>RustEngineNative</code>, <code>RustChainHandle</code></td><td><code>myotis-engine-rust/src/main/java/…</code></td><td>you</td><td>Load and validate the library, call the Kotlin functions, parse the JSON into <code>io.myotis.api</code> records.</td></tr>
+      <tr><td><code>uniffiGenerateKotlin</code>, <code>cargoNdkAndroid</code>, <code>verifyAndroidJniLibs</code></td><td>root <code>build.gradle.kts</code>, wired from <code>myotis-engine/build.gradle.kts</code></td><td>you</td><td>Build the libraries, regenerate and patch the bindings, check the Android libraries.</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="callout jvm">
+    <span class="k">If you know JNI</span>
+    <p>With JNI you declare <code>native</code> methods in Java and write a C (or Rust) function per method named <code>Java_pkg_Class_method</code>, which receives a <code>JNIEnv*</code> and converts every <code>jstring</code> by hand. Myotis did exactly that until July 2026. UniFFI removes both hand-written halves. The Kotlin <code>external fun</code> declarations are still JVM <code>native</code> methods, but JNA's <code>Native.register</code> supplies their implementation at run time: a generic dispatcher in <code>libjnidispatch</code> converts each argument according to its declared Java type and calls the C symbol with the same name. Nothing on the Rust side knows about the JVM.</p>
+  </div>
+</section>
+
+<figure class="diagram">
+  <div class="svg-wrap">
+  <svg class="wide-diagram" viewBox="0 0 960 760" role="img" fill="currentColor" xmlns="http://www.w3.org/2000/svg"
+       aria-label="Sequence of one requestAccountJson call. The Java caller sanitizes its strings. For each string argument, Kotlin asks Rust to allocate a RustBuffer, then writes UTF-8 bytes into it. Kotlin calls the scaffolding function with an i64, two RustBuffers and a pointer to a call status; the buffers now belong to Rust. The scaffolding lifts the buffers into Strings without copying and calls ffi.rs inside catch_unwind. host.rs blocks the caller's thread in rt.block_on while tokio worker threads do the network I/O. The JSON String is lowered into a RustBuffer that Rust stops tracking, returned to Kotlin, copied into a Kotlin String, and freed by calling back into Rust. The Java side parses the JSON. A panic in a release build aborts the process.">
+    <defs>
+      <marker id="m-stop17-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+      </marker>
+    </defs>
+    <g font-size="12">
+      <rect x="10" y="12" width="250" height="50" rx="8" stroke-width="1.5" style="fill:var(--jvm-wash);stroke:var(--jvm)"/>
+      <text x="135" y="33" text-anchor="middle" font-weight="700" style="fill:var(--jvm-ink)">Java + generated Kotlin</text>
+      <text x="135" y="51" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">RustChainHandle → myotis_engine.kt</text>
+      <rect x="275" y="12" width="100" height="50" rx="8" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)"/>
+      <text x="325" y="33" text-anchor="middle" font-weight="700">JNA</text>
+      <text x="325" y="51" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">libjnidispatch</text>
+      <rect x="390" y="12" width="220" height="50" rx="8" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="500" y="33" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">Rust: generated scaffolding</text>
+      <text x="500" y="51" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">extern "C" fn uniffi_…_fn_func_…</text>
+      <rect x="625" y="12" width="170" height="50" rx="8" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="710" y="33" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">Rust: ffi.rs → host.rs</text>
+      <text x="710" y="51" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">the engine's own code</text>
+      <rect x="810" y="12" width="140" height="50" rx="8" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)"/>
+      <text x="880" y="33" text-anchor="middle" font-weight="700">tokio workers</text>
+      <text x="880" y="51" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">"myotis-engine" threads</text>
+    </g>
+    <g stroke-width="1" stroke-dasharray="3 4" fill="none" style="stroke:var(--rule)">
+      <line x1="135" y1="62" x2="135" y2="700"/>
+      <line x1="325" y1="62" x2="325" y2="700"/>
+      <line x1="500" y1="62" x2="500" y2="700"/>
+      <line x1="710" y1="62" x2="710" y2="700"/>
+      <line x1="880" y1="62" x2="880" y2="700"/>
+    </g>
+    <g font-size="11">
+      <text x="135" y="92" text-anchor="middle">① accountVerified → gated() →</text>
+      <text x="135" y="106" text-anchor="middle" font-size="10.5">nativeRequestAccountJson(h, nz(a), nz(b))</text>
+      <text x="300" y="133" text-anchor="middle">② rustbuffer_alloc(n), once per string</text>
+      <text x="508" y="150" font-size="10.5" style="fill:var(--oxide-ink)">vec![0; n]: Rust heap</text>
+      <text x="300" y="172" text-anchor="middle" style="fill:var(--ink-2)">RustBuffer { capacity, len, data }</text>
+      <text x="135" y="202" text-anchor="middle">③ copy UTF-8 bytes into data</text>
+      <text x="135" y="216" text-anchor="middle" style="fill:var(--ink-2)">(direct ByteBuffer over native memory)</text>
+      <text x="315" y="241" text-anchor="middle">④ …_fn_func_request_account_json(i64, buf, buf, &amp;status)</text>
+      <text x="315" y="268" text-anchor="middle" font-size="10.5" style="fill:var(--oxide-ink)">both buffers now belong to Rust</text>
+      <text x="500" y="292" text-anchor="middle">⑤ try_lift: Vec::from_raw_parts</text>
+      <text x="500" y="306" text-anchor="middle">→ String, no copy</text>
+      <text x="500" y="320" text-anchor="middle" style="fill:var(--ink-2)">inside rust_call → catch_unwind</text>
+      <text x="605" y="343" text-anchor="middle">⑥ request_account_json(…)</text>
+      <text x="710" y="378" text-anchor="middle">⑦ parse, snapshot reader,</text>
+      <text x="710" y="392" text-anchor="middle">rt.block_on(reader.request(…))</text>
+      <text x="795" y="413" text-anchor="middle" font-size="10.5">drives</text>
+      <text x="880" y="440" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">peer I/O, sync loop</text>
+      <text x="795" y="458" text-anchor="middle" font-size="10.5">result</text>
+      <text x="710" y="486" text-anchor="middle" style="fill:var(--warn-ink)">caller's thread waits, ≤ 90 s</text>
+      <text x="605" y="511" text-anchor="middle">⑧ String (JSON)</text>
+      <text x="500" y="536" text-anchor="middle">lower: RustBuffer::from_vec</text>
+      <text x="500" y="550" text-anchor="middle" style="fill:var(--ink-2)">ManuallyDrop: Rust stops tracking it</text>
+      <text x="315" y="573" text-anchor="middle">⑨ RustBuffer by value; status.code stays 0</text>
+      <text x="135" y="606" text-anchor="middle">⑩ uniffiCheckCallStatus, then</text>
+      <text x="135" y="620" text-anchor="middle">FfiConverterString.lift: copy → String</text>
+      <text x="315" y="645" text-anchor="middle">⑪ rustbuffer_free(buf)</text>
+      <text x="508" y="664" font-size="10.5" style="fill:var(--ok-ink)">Vec dropped: Rust frees</text>
+      <text x="135" y="684" text-anchor="middle">⑫ parseResultOrThrow →</text>
+      <text x="135" y="698" text-anchor="middle" style="fill:var(--ink-2)">AccountProofResult or EngineException</text>
+    </g>
+    <g stroke-width="1.5" fill="none" style="stroke:currentColor">
+      <line x1="140" y1="140" x2="495" y2="140" marker-end="url(#m-stop17-arrow)"/>
+      <line x1="495" y1="178" x2="140" y2="178" stroke-dasharray="5 4" marker-end="url(#m-stop17-arrow)"/>
+      <line x1="140" y1="250" x2="495" y2="250" marker-end="url(#m-stop17-arrow)"/>
+      <line x1="505" y1="350" x2="705" y2="350" marker-end="url(#m-stop17-arrow)"/>
+      <line x1="715" y1="420" x2="875" y2="420" marker-end="url(#m-stop17-arrow)"/>
+      <line x1="875" y1="464" x2="715" y2="464" stroke-dasharray="5 4" marker-end="url(#m-stop17-arrow)"/>
+      <line x1="705" y1="518" x2="505" y2="518" stroke-dasharray="5 4" marker-end="url(#m-stop17-arrow)"/>
+      <line x1="495" y1="580" x2="140" y2="580" stroke-dasharray="5 4" marker-end="url(#m-stop17-arrow)"/>
+      <line x1="140" y1="652" x2="495" y2="652" marker-end="url(#m-stop17-arrow)"/>
+    </g>
+    <g style="fill:var(--ink-3)">
+      <circle cx="325" cy="140" r="3"/><circle cx="325" cy="178" r="3"/><circle cx="325" cy="250" r="3"/>
+      <circle cx="325" cy="580" r="3"/><circle cx="325" cy="652" r="3"/>
+    </g>
+    <rect x="650" y="560" width="300" height="128" rx="8" stroke-width="1.5" style="fill:var(--bad-wash);stroke:var(--bad)"/>
+    <g font-size="10.5">
+      <text x="664" y="580" font-weight="700" style="fill:var(--bad-ink)">If the Rust code panics</text>
+      <text x="664" y="598">Release build (panic = "abort"), as shipped:</text>
+      <text x="664" y="612">the process aborts; nothing returns.</text>
+      <text x="664" y="634">Unwinding build (dev profile): catch_unwind</text>
+      <text x="664" y="648">sets code 2 plus a message buffer, and</text>
+      <text x="664" y="662">Kotlin throws InternalException.</text>
+    </g>
+    <line x1="15" y1="722" x2="795" y2="722" stroke-width="3" style="stroke:var(--jvm)"/>
+    <line x1="815" y1="722" x2="945" y2="722" stroke-width="3" style="stroke:var(--ink-3)"/>
+    <g font-size="11">
+      <text x="405" y="742" text-anchor="middle" style="fill:var(--jvm-ink)">steps ① to ⑫ all run on ONE thread: the JVM thread that called. JNA does not switch threads.</text>
+      <text x="880" y="742" text-anchor="middle" style="fill:var(--ink-2)">the runtime's own threads</text>
+    </g>
+  </svg>
+  </div>
+  <figcaption>One verified account read, end to end. Solid arrows are calls, dashed arrows are returns, and dots mark where JNA converts. Every native call from Kotlin (②, ④, ⑪) gets its own call-status struct. Only ⑦ involves other threads: the caller's thread waits in <code>block_on</code> while the runtime's worker threads move packets.</figcaption>
+</figure>
+
+<section class="prose">
+  <h3>Who allocates, who frees</h3>
+  <p>The one rule behind every row: <strong>memory goes back to the allocator it came from</strong>. A <code>RustBuffer</code> always holds memory from Rust's allocator, so only Rust may free it, even when Kotlin decides when.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Buffer</th><th>Allocated by</th><th>Filled by</th><th>Freed by, and when</th></tr></thead>
+    <tbody>
+      <tr><td>A <code>String</code> argument (<code>address</code>, <code>block</code>)</td><td>Rust, through <code>ffi_myotis_engine_rustbuffer_alloc</code> called from Kotlin</td><td>Kotlin (UTF-8 bytes)</td><td>Rust: the bytes become the <code>String</code> parameter of <code>ffi::request_account_json</code>, which is dropped when that function returns.</td></tr>
+      <tr><td>An <code>Option&lt;String&gt;</code> argument (<code>holder</code>)</td><td>Rust, same call, sized by Kotlin's pessimistic <code>allocationSize</code></td><td>Kotlin (tag byte, length, bytes)</td><td>Rust: <code>try_lift_from_rust_buffer</code> rebuilds the <code>Vec</code>, copies the string out, and drops the <code>Vec</code> before the function runs.</td></tr>
+      <tr><td>The returned JSON</td><td>Rust (it is the <code>String</code>'s own heap buffer)</td><td>Rust</td><td>Rust, when Kotlin calls <code>ffi_myotis_engine_rustbuffer_free</code> in the <code>finally</code> of <code>FfiConverterString.lift</code>, right after copying.</td></tr>
+      <tr><td><code>error_buf</code> in the call status</td><td>Rust, only on an error or a caught panic</td><td>Rust (a message)</td><td>Rust, when Kotlin lifts the message into an exception (lift frees).</td></tr>
+      <tr><td>The call-status struct itself</td><td>JNA (native memory behind the Kotlin <code>UniffiRustCallStatus</code> object)</td><td>Rust writes into it through <code>&amp;mut</code></td><td>The JVM, when the Kotlin object is garbage-collected.</td></tr>
+      <tr><td><code>i64</code>, <code>i32</code>, <code>bool</code></td><td colspan="3">Nothing is allocated. They travel in registers. A <code>bool</code> is an <code>i8</code> (0 or 1), because JVM languages have no C <code>bool</code>.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="prose">
+  <h2>1. What you write in Rust</h2>
+  <p>Stop 16 covers these files as part of the engine (<a href="#f-myotis-engine-src-ffi-rs">ffi.rs</a>, <a href="#f-myotis-engine-src-host-rs">host.rs</a>, <a href="#f-myotis-engine-src-capi-rs">capi.rs</a>); here they are the two ends of the bridge. Start with the module doc of <code>ffi.rs</code>, which states the whole design in a few lines.</p>
+  <x-code src="myotis-engine/src/ffi.rs" from="1" to="21"></x-code>
+  <p class="code-note"><x-tags>unsafe-ffi error-handling</x-tags> Three conventions you will see enforced later: compound values cross as JSON ("transport swap only"), every function is panic-free because the workspace builds with <code>panic = "abort"</code> (section 4), and <code>null</code> in the old surface became <code>Option&lt;String&gt;</code>. The iOS C ABI shares the internals but deliberately does not use UniFFI (section 11).</p>
+  <p>Here is the function this stop follows. It is an ordinary Rust function with an attribute on top. Nothing in it mentions pointers, buffers or the JVM.</p>
+  <x-code src="myotis-engine/src/ffi.rs" from="180" to="189"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership borrowing</x-tags> <strong>Owned in, borrowed onward.</strong> UniFFI hands the function owned <code>String</code>s. The function lends them to <code>host</code> as <code>&amp;address</code> and <code>&amp;block</code> (<code>&amp;String</code> coerces to <code>&amp;str</code>). When the function returns, both <code>String</code>s go out of scope and are dropped, which is where the argument buffers Kotlin filled are finally freed. The returned <code>String</code> is moved out to the scaffolding.</li>
+    <li><x-tags>macros</x-tags> <strong>The doc comment is part of the API.</strong> The <code>///</code> lines are copied into the generated Kotlin as KDoc and, as section 2 shows, they are also part of the checksum.</li>
+  </ul>
+  <x-code src="myotis-engine/src/ffi.rs" from="191" to="201"></x-code>
+  <p class="code-note"><x-tags>enums-patterns borrowing</x-tags> The one non-trivial argument type in the surface. <code>Option&lt;String&gt;</code> becomes Kotlin's <code>String?</code>. <code>holder.as_deref()</code> turns <code>Option&lt;String&gt;</code> into <code>Option&lt;&amp;str&gt;</code> without allocating: it borrows the string inside the option, if there is one.</p>
+  <x-code src="myotis-engine/src/ffi.rs" from="47" to="52"></x-code>
+  <p class="code-note"><x-tags>lifetimes ownership</x-tags> <code>Option&lt;String&gt;</code> as a <em>return</em> type. <code>catalog::canonical_network_name</code> returns <code>Option&lt;&amp;'static str&gt;</code>, a borrowed literal. UniFFI can only hand over owned data, so <code>.map(str::to_owned)</code> copies it into a <code>String</code>. Kotlin sees <code>String?</code>.</p>
+  <x-code src="myotis-engine/src/ffi.rs" from="132" to="136"></x-code>
+  <x-code src="myotis-engine/src/ffi.rs" from="409" to="422"></x-code>
+  <ul class="concepts">
+    <li><x-tags>unsafe-ffi</x-tags> <code>stop_handle</code> returns <code>()</code>. The scaffolding then returns nothing, and the Kotlin wrapper returns <code>Unit</code> (section 6).</li>
+    <li><x-tags>bytes-strings error-handling</x-tags> The doc comment of <code>get_raw_transaction_by_block_json</code> explains a design constraint: every integer in this surface is signed, because the JVM <code>long</code> is, and UniFFI's <code>u64</code> would surface as Kotlin's <code>ULong</code>, which the Java callers cannot use comfortably. The body checks the sign with <code>u64::try_from</code> instead of a cast that would wrap. This body is also an example of an edit that does <em>not</em> change the checksum (section 10).</li>
+  </ul>
+  <x-code src="myotis-engine/src/lib.rs" from="27" to="35"></x-code>
+  <p class="code-note"><x-tags>macros modules-cargo</x-tags> <code>setup_scaffolding!</code> must be invoked at the crate root because every <code>#[uniffi::export]</code> expands to code that names <code>crate::UniFfiTag</code>, and this macro is what defines that type. Called with no argument, it takes the <em>namespace</em> from the crate name (<code>myotis_engine</code>), which ends up in every symbol name and in the Kotlin package <code>uniffi.myotis_engine</code>. Below it starts the doc of <code>ABI_VERSION</code> (now 55, line 397), a coarse hand-bumped version that section 10 puts next to UniFFI's own checks.</p>
+  <x-code src="myotis-engine/Cargo.toml" from="9" to="14" lang="toml"></x-code>
+  <x-code src="myotis-engine/Cargo.toml" from="36" to="41" lang="toml"></x-code>
+  <p class="code-note"><x-tags>modules-cargo unsafe-ffi</x-tags> <code>cdylib</code> is a C-style dynamic library (<code>.so</code>, <code>.dylib</code>, <code>.dll</code>): the artifact JNA loads. Its exported symbols are the <code>#[no_mangle]</code> functions and statics. <code>rlib</code> is the normal Rust library format that other crates link (<code>myotis-node</code> and <code>myotis-rpcd</code> do). The iOS static archive is produced separately, as the comment says. The engine depends on <code>uniffi = "0.32"</code> without the <code>cli</code> feature; only the bindgen binary needs that.</p>
+
+  <h3>Where the call lands</h3>
+  <x-code src="myotis-engine/src/host.rs" from="1537" to="1570"></x-code>
+  <ul class="concepts">
+    <li><x-tags>error-handling enums-patterns</x-tags> This is the end of the bridge, covered in detail in <a href="#stop-16">Stop 16</a>. Every failure is a <code>return eljson::error_json(…)</code> or a pre-built refusal string, never a panic and never a <code>Result</code> crossing the boundary: <code>let … else { return …; }</code> is the pattern for "parse or bail out".</li>
+    <li><x-tags>async concurrency</x-tags> <code>engine.rt.block_on(…)</code> is the only place the call meets the async world. The thread that came in from Kotlin blocks here while the runtime's worker threads move packets. The <code>async</code> block may borrow <code>reader</code> and <code>address</code> because <code>block_on</code> does not return before the future completes.</li>
+  </ul>
+</section>
+
+<section class="prose">
+  <h2>2. What the macros write</h2>
+  <p>Rust macros run inside the compiler and emit ordinary Rust code. <code>setup_scaffolding!</code> is a function-like macro invoked once. <code>#[uniffi::export]</code> is an attribute macro: it receives the function's source as tokens and returns the function plus new items next to it. Both live in the <code>uniffi_macros</code> crate, a <em>proc-macro</em> crate: a compiler plugin written in Rust, compiled for the build machine and run by <code>rustc</code>.</p>
+  <x-code src="cargo:uniffi_macros-0.32.0/src/lib.rs" from="61" to="98"></x-code>
+  <ul class="concepts">
+    <li><x-tags>macros</x-tags> <code>#[proc_macro]</code> and <code>#[proc_macro_attribute]</code> mark the entry points. Each receives a <code>TokenStream</code> (the tokens inside the parentheses, or the item under the attribute) and returns a new one. <code>syn</code> parses tokens into a syntax tree; <code>quote!</code> turns a template back into tokens.</li>
+    <li><x-tags>error-handling macros</x-tags> Errors become <code>compile_error!</code> invocations (<code>into_compile_error</code>), so a misuse shows up as an ordinary compiler error at your code, not as a crash of the macro.</li>
+    <li><x-tags>macros</x-tags> <code>do_export</code> keeps your function (<code>altered_input</code>) and appends the generated items (<code>output</code>). For a free function, <code>expand_export</code> (<code>export.rs</code>, lines 45–50) dispatches to <code>gen_fn_scaffolding</code>, shown below.</li>
+  </ul>
+
+  <h3>The crate-wide glue</h3>
+  <x-code src="cargo:uniffi_macros-0.32.0/src/setup_scaffolding.rs" from="12" to="46"></x-code>
+  <ul class="concepts">
+    <li><x-tags>macros</x-tags> <code>quote! { … }</code> builds the output tokens, and <code>#name</code> splices in a value, like a template engine for Rust code. <code>format_ident!</code> builds identifiers such as <code>ffi_myotis_engine_uniffi_contract_version</code>. <code>#UNIFFI_CONTRACT_VERSION</code> becomes the literal <code>30</code>, a constant in <code>uniffi_meta</code> 0.32 that identifies the FFI conventions of this UniFFI release.</li>
+    <li><x-tags>unsafe-ffi</x-tags> <code>#[unsafe(no_mangle)]</code> keeps the symbol name exactly as written instead of Rust's mangled form, so C (and JNA) can find it by name. It is spelled <code>unsafe(…)</code> because two crates exporting the same unmangled name would silently collide at link time. <code>extern "C"</code> selects the C calling convention.</li>
+    <li><x-tags>traits-generics</x-tags> <code>pub struct UniFfiTag;</code> is a unit struct: a type with no fields and no size. It exists only to be named as a type parameter, explained below.</li>
+  </ul>
+  <x-code src="cargo:uniffi_macros-0.32.0/src/setup_scaffolding.rs" from="63" to="106"></x-code>
+  <p class="code-note"><x-tags>unsafe-ffi ownership</x-tags> The four per-crate buffer functions: <code>ffi_myotis_engine_rustbuffer_alloc</code>, <code>_from_bytes</code>, <code>_free</code> and <code>_reserve</code>. Each is a two-line forwarder to <code>uniffi_core</code> (section 3). Each library gets its own copies, with the crate name in the symbol, because each <code>cdylib</code> carries its own allocator: a buffer must go back to the library that made it. Notice that <code>_alloc</code> is a safe <code>extern "C" fn</code>, while the three that receive a buffer or foreign bytes are <code>unsafe extern "C" fn</code>: they rely on the caller's promise that the buffer came from this library. The same macro emits <code>rust_future_*</code> functions (line 108) for async exports, which Myotis does not use, and a re-export hack for builds that combine several UniFFI crates in one library.</p>
+
+  <div class="callout rust">
+    <span class="k">Why a tag type: the orphan rule</span>
+    <p>Rust lets you write <code>impl Trait for Type</code> only if your crate defines the trait or the type. Otherwise two crates could provide conflicting impls. UniFFI wants every consumer crate to be able to implement its conversion traits, even for types from third crates. The trick: the traits take a type parameter, <code>FfiConverter&lt;UT&gt;</code>, and the generated code always uses <code>FfiConverter&lt;crate::UniFfiTag&gt;</code>. Because <code>UniFfiTag</code> is local to <code>myotis_engine</code>, an impl mentioning it is allowed there. For built-in types, <code>uniffi_core</code> writes blanket impls such as <code>unsafe impl&lt;UT&gt; FfiConverter&lt;UT&gt; for String</code>, which apply to every tag. Java has no orphan rule, because Java has no impls outside a class; the nearest analogy is a type-class instance.</p>
+  </div>
+
+  <h3>What <code>#[uniffi::export]</code> writes for one function</h3>
+  <x-code src="cargo:uniffi_macros-0.32.0/src/export/scaffolding.rs" from="237" to="270"></x-code>
+  <ul class="concepts">
+    <li><x-tags>macros unsafe-ffi</x-tags> <strong>The C entry point.</strong> One <code>pub extern "C" fn</code> per export, named by <code>uniffi_meta::fn_symbol_name</code>: <code>uniffi_&lt;crate&gt;_fn_func_&lt;name&gt;</code>. Its parameters have the <em>FFI types</em> of the Rust parameters, plus a trailing <code>call_status: &amp;mut RustCallStatus</code>. It is not declared <code>unsafe</code> even though it trusts the buffers it receives; that trust is pushed into the <code>unsafe trait</code> impls of section 3.</li>
+    <li><x-tags>iterators-closures error-handling</x-tags> <strong>Lift, call, lower.</strong> Inside <code>rust_call</code>, a successful lift calls the real function (<code>#rust_fn_call</code>), then <code>lower_return</code> turns the result into its FFI type. A failed lift becomes <code>handle_failed_lift</code>, an internal error naming the argument.</li>
+    <li><x-tags>macros</x-tags> The <code>#scaffolding_fn_ffi_buffer_version</code> splice produces nothing here: it is only generated with the <code>scaffolding-ffi-buffer-fns</code> cargo feature (lines 306–367), which Myotis does not enable. The async branch after line 270 is unused too.</li>
+  </ul>
+  <x-code src="cargo:uniffi_macros-0.32.0/src/fnsig.rs" from="187" to="212"></x-code>
+  <p class="code-note"><x-tags>iterators-closures ownership error-handling</x-tags> <strong>The lift closure.</strong> For each argument the macro emits a <code>match</code> on <code>try_lift</code>; a failure <code>return</code>s from the closure with the argument's name and the error. <code>move ||</code> makes the closure take ownership of every scaffolding parameter, so each buffer is consumed exactly once. The closure is built outside <code>rust_call</code> but only <em>called</em> inside it, so a panic during lifting is also caught (in an unwinding build).</p>
+  <p>Filling in both templates for <code>request_account_json</code> gives roughly the following. This listing is written by hand from the macro source, not cut from a file. The <code>trace!</code> calls and the unused ffi-buffer variant are left out.</p>
+<figure class="code"><figcaption class="code-cap"><span>hand-expanded and simplified: the items #[uniffi::export] adds next to request_account_json</span><span>not verbatim</span></figcaption><div class="code-scroll"><div class="code-grid"><div class="gutter" aria-hidden="true"></div><pre><code class="lang-rust">#[unsafe(no_mangle)]
+pub extern "C" fn uniffi_myotis_engine_fn_func_request_account_json(
+    handle: &lt;i64 as Lift&lt;crate::UniFfiTag&gt;&gt;::FfiType,     // = i64
+    address: &lt;String as Lift&lt;crate::UniFfiTag&gt;&gt;::FfiType, // = RustBuffer
+    block: &lt;String as Lift&lt;crate::UniFfiTag&gt;&gt;::FfiType,   // = RustBuffer
+    call_status: &amp;mut ::uniffi::RustCallStatus,
+) -&gt; &lt;String as LowerReturn&lt;crate::UniFfiTag&gt;&gt;::ReturnType { // = RustBuffer
+    let uniffi_lift_args = move || Ok((
+        match &lt;i64 as Lift&lt;crate::UniFfiTag&gt;&gt;::try_lift(handle) {
+            Ok(v) =&gt; v,
+            Err(e) =&gt; return Err(("handle", e)),
+        },
+        match &lt;String as Lift&lt;crate::UniFfiTag&gt;&gt;::try_lift(address) {
+            Ok(v) =&gt; v,
+            Err(e) =&gt; return Err(("address", e)),
+        },
+        match &lt;String as Lift&lt;crate::UniFfiTag&gt;&gt;::try_lift(block) {
+            Ok(v) =&gt; v,
+            Err(e) =&gt; return Err(("block", e)),
+        },
+    ));
+    ::uniffi::rust_call(call_status, || match uniffi_lift_args() {
+        Ok(uniffi_args) =&gt; {
+            let uniffi_result =
+                request_account_json(uniffi_args.0, uniffi_args.1, uniffi_args.2);
+            &lt;String as LowerReturn&lt;crate::UniFfiTag&gt;&gt;::lower_return(uniffi_result)
+        }
+        Err((arg_name, error)) =&gt; &lt;String as LowerReturn&lt;crate::UniFfiTag&gt;&gt;::handle_failed_lift(
+            ::uniffi::LiftArgsError { arg_name, error }),
+    })
+}
+
+// The signature as bytes, for uniffi-bindgen to read out of the library.
+const UNIFFI_META_CONST_MYOTIS_ENGINE_FUNC_REQUEST_ACCOUNT_JSON: MetadataBuffer = /* see below */;
+#[unsafe(no_mangle)]
+pub static UNIFFI_META_MYOTIS_ENGINE_FUNC_REQUEST_ACCOUNT_JSON: [u8; N] =
+    UNIFFI_META_CONST_MYOTIS_ENGINE_FUNC_REQUEST_ACCOUNT_JSON.into_array();
+
+// The checksum of those bytes, computed by the compiler.
+#[unsafe(no_mangle)]
+pub extern "C" fn uniffi_myotis_engine_checksum_func_request_account_json() -&gt; u16 {
+    const CHECKSUM: u16 = UNIFFI_META_CONST_MYOTIS_ENGINE_FUNC_REQUEST_ACCOUNT_JSON.checksum();
+    CHECKSUM
+}</code></pre></div></div></figure>
+  <ul class="concepts">
+    <li><x-tags>traits-generics</x-tags> <strong>Associated types pick the wire type.</strong> <code>&lt;String as Lift&lt;crate::UniFfiTag&gt;&gt;::FfiType</code> is "the <code>FfiType</code> that <code>String</code>'s <code>Lift</code> impl declares", which is <code>RustBuffer</code>. The macro never needs to know that; it only names the trait. Java generics cannot express a type that depends on another type like this.</li>
+    <li><x-tags>ownership</x-tags> <strong>Each argument is moved exactly once.</strong> The closure is <code>move</code>, so it takes ownership of <code>address</code> and <code>block</code>; <code>try_lift</code> consumes each <code>RustBuffer</code> and returns an owned <code>String</code>; <code>uniffi_args.1</code> moves that <code>String</code> into the call. No step copies the bytes.</li>
+    <li><x-tags>unsafe-ffi</x-tags> I checked the symbol names with <code>nm -gU</code> against a <code>libmyotis_engine.dylib</code> built from the main checkout in October: <code>_uniffi_myotis_engine_fn_func_request_account_json</code>, <code>_uniffi_myotis_engine_checksum_func_request_account_json</code> and the read-only static <code>_UNIFFI_META_MYOTIS_ENGINE_FUNC_REQUEST_ACCOUNT_JSON</code> are all there, next to the hand-written <code>_myotis_request_account_json</code> of the C ABI. One library serves both routes.</li>
+  </ul>
+
+  <h3>The metadata, and why a doc comment changes the checksum</h3>
+  <x-code src="cargo:uniffi_macros-0.32.0/src/fnsig.rs" from="300" to="310"></x-code>
+  <p class="code-note"><x-tags>macros</x-tags> This is the whole description of a function: its module path (<code>myotis_engine::ffi</code>), its name, whether it was renamed, whether it is async, the argument count, then per argument its name, type code, by-reference flag and default (<code>arg_metadata</code>, lines 532–543), then the return type and finally the doc comment (<code>concat_long_str(#docstring)</code>). <code>MetadataBuffer</code> has only <code>const fn</code> methods, so the whole chain is evaluated by the compiler into a fixed byte array.</p>
+  <x-code src="cargo:uniffi_macros-0.32.0/src/util.rs" from="101" to="137"></x-code>
+  <ul class="concepts">
+    <li><x-tags>macros unsafe-ffi</x-tags> <strong>Two artifacts from one buffer.</strong> The <code>const</code> holds the metadata at compile time. The <code>#[no_mangle] pub static</code> copies it into the binary under the name <code>UNIFFI_META_MYOTIS_ENGINE_FUNC_REQUEST_ACCOUNT_JSON</code>, where the generator will find it (section 5). The checksum function returns <code>u16</code> and is exported as <code>uniffi_myotis_engine_checksum_func_request_account_json</code>.</li>
+    <li><x-tags>traits-generics</x-tags> <strong><code>const CHECKSUM: u16 = …</code> inside the function</strong> forces the compiler to compute the hash during compilation. A plain expression might be evaluated at run time; a <code>const</code> item must be known at compile time. The comment says this also keeps the checksum function from referencing the buffer at run time.</li>
+    <li><x-tags>domain</x-tags> The checksum covers exactly the metadata bytes. So renaming a parameter, changing a type, moving the function to another module, or editing a single word of its <code>///</code> comment changes the checksum. Changing the function's <em>body</em> does not.</li>
+  </ul>
+</section>
+
+<section class="prose">
+  <h2>3. The wire vocabulary: <code>RustBuffer</code> and the converter traits</h2>
+  <h3><code>RustBuffer</code></h3>
+  <x-code src="cargo:uniffi_core-0.32.0/src/ffi/rustbuffer.rs" from="7" to="62"></x-code>
+  <ul class="concepts">
+    <li><x-tags>unsafe-ffi</x-tags> <strong>The rules, in the type's own doc comment.</strong> A <code>RustBuffer</code> is only ever made from a <code>Vec&lt;u8&gt;</code>; it has no <code>Drop</code>; it must come back to Rust to be destroyed; the foreign side may only write bytes up to <code>capacity</code> and adjust <code>len</code>; and the foreign side must never wrap its own memory in one (that is what <code>ForeignBytes</code> is for).</li>
+    <li><x-tags>unsafe-ffi</x-tags> <strong><code>#[repr(C)]</code> fixes the layout.</strong> Without it, Rust may reorder struct fields. With it, the layout is exactly a C struct <code>{ uint64_t capacity; uint64_t len; uint8_t *data; }</code>, which is what the Kotlin <code>RustBuffer</code> declares field by field (section 6). The fields are <code>pub(crate)</code>, so no other crate can build an invalid one.</li>
+    <li><x-tags>concurrency unsafe-ffi</x-tags> <code>unsafe impl Send for RustBuffer {}</code> (line 67): a struct holding a raw pointer is not <code>Send</code> by default, because the compiler cannot know who else uses the pointer. UniFFI asserts it is safe to move between threads, which async futures need.</li>
+  </ul>
+  <x-code src="cargo:uniffi_core-0.32.0/src/ffi/rustbuffer.rs" from="124" to="151"></x-code>
+  <p class="code-note"><x-tags>ownership smart-pointers unsafe-ffi</x-tags> <strong>Giving up ownership.</strong> <code>new_with_size</code> allocates a zero-filled <code>Vec</code> of the requested length; this is what Kotlin's <code>alloc</code> gets. <code>from_vec</code> records the three parts. <code>ManuallyDrop::new(v)</code> wraps the vector so that its destructor will not run when <code>v</code> goes out of scope. Without it, the <code>Vec</code> would free its buffer at the closing brace and the returned <code>RustBuffer</code> would point to freed memory. The <code>try_from(…).expect(…)</code> calls can only panic on a platform whose <code>usize</code> is wider than 64 bits.</p>
+  <x-code src="cargo:uniffi_core-0.32.0/src/ffi/rustbuffer.rs" from="153" to="192"></x-code>
+  <p class="code-note"><x-tags>ownership smart-pointers unsafe-ffi</x-tags> <strong>Taking ownership back.</strong> <code>destroy_into_vec(self)</code> consumes the buffer and rebuilds an owning <code>Vec</code> with <code>Vec::from_raw_parts(data, len, capacity)</code>, which then frees normally when dropped. It is the only place a buffer's memory is reclaimed. The checks are defensive: a null pointer is accepted only with zero length and capacity (a foreign side may send an empty buffer that way), and <code>len &lt;= capacity</code> is asserted. <code>destroy</code> is <code>drop(self.destroy_into_vec())</code>. In Java terms, <code>from_vec</code> detaches an off-heap buffer from its cleaner, and <code>destroy_into_vec</code> re-attaches it.</p>
+  <x-code src="cargo:uniffi_core-0.32.0/src/ffi/rustbuffer.rs" from="201" to="244"></x-code>
+  <p class="code-note"><x-tags>unsafe-ffi error-handling</x-tags> The runtime behind the four per-crate functions of section 2. Each wraps its work in <code>rust_call</code>, so even buffer management reports failures through a call status. <code>uniffi_rustbuffer_from_bytes</code> copies foreign memory into a new Rust buffer (<code>as_slice().to_vec()</code>); the Kotlin bindings declare it but do not use it.</p>
+
+  <h3>The conversion traits</h3>
+  <x-code src="cargo:uniffi_core-0.32.0/src/ffi_converter_traits.rs" from="5" to="51"></x-code>
+  <p class="code-note"><x-tags>traits-generics</x-tags> The module doc draws the family tree. <code>FfiConverter</code> is the general trait you implement; the generated code uses only the narrower ones: <code>Lift</code> for arguments coming in, <code>Lower</code> for values going out, <code>LowerReturn</code> for return values (which lets <code>Result</code> and <code>()</code> be handled specially), <code>LiftReturn</code>/<code>LowerError</code> for callbacks and errors, and <code>TypeId</code> for the metadata. <code>derive_ffi_traits!</code> generates the narrow impls from the general one.</p>
+  <x-code src="cargo:uniffi_core-0.32.0/src/ffi_converter_traits.rs" from="76" to="136"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics</x-tags> <strong>An associated type plus five items.</strong> <code>type FfiType</code> is the C-compatible type (a number, or <code>RustBuffer</code>). <code>lower</code> goes Rust → foreign; <code>try_lift</code> goes foreign → Rust and returns a <code>Result</code> because the foreign side might send something invalid. <code>write</code> and <code>try_read</code> serialize a value <em>into</em> a byte buffer when it is nested inside something else, such as the <code>String</code> inside an <code>Option&lt;String&gt;</code>. <code>TYPE_ID_META</code> is the type's code in the metadata.</li>
+    <li><x-tags>ownership borrowing</x-tags> <code>lower(obj: Self)</code> takes the value by value: lowering may hand ownership to the foreign side, so the Rust value must be consumed. <code>try_read(buf: &amp;mut &amp;[u8])</code> is a mutable reference to a slice: the reader moves the slice's start forward after each item without touching the bytes, like a cursor.</li>
+    <li><x-tags>traits-generics unsafe-ffi</x-tags> The trait is <code>pub unsafe trait</code>. An <code>unsafe trait</code> means implementing it is a promise the compiler cannot check, here that the impl matches what the generated foreign code does. <code>FfiType: FfiDefault</code> is a bound: every FFI type must have a placeholder value to return when a call fails (see <code>ffidefault.rs</code> in the deep dive below).</li>
+  </ul>
+  <x-code src="cargo:uniffi_core-0.32.0/src/ffi_converter_traits.rs" from="223" to="240"></x-code>
+  <x-code src="cargo:uniffi_core-0.32.0/src/ffi_converter_traits.rs" from="257" to="270"></x-code>
+  <x-code src="cargo:uniffi_core-0.32.0/src/ffi_converter_traits.rs" from="284" to="311"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics</x-tags> <strong>Default methods.</strong> <code>Lift::try_lift_from_rust_buffer</code> and <code>Lower::lower_into_rust_buffer</code> have bodies in the trait, like Java <code>default</code> methods. They are how compound values travel: write everything into a fresh <code>Vec</code>, hand it out as a <code>RustBuffer</code>; on the way in, rebuild the <code>Vec</code>, read one value, and refuse leftover bytes (<code>bail!</code> from <code>anyhow</code> returns an error early).</li>
+    <li><x-tags>error-handling</x-tags> <strong><code>LowerReturn</code></strong> returns <code>Result&lt;Self::ReturnType, RustCallError&gt;</code>. For a plain type it is always <code>Ok</code>. For a <code>Result&lt;T, E&gt;</code> return type, its impl turns <code>Err(e)</code> into <code>RustCallError::Error(buffer)</code>, which becomes status code 1 and a typed Kotlin exception. Myotis has no such export. <code>handle_failed_lift</code> has a default body: every failed lift becomes an internal error with a message.</li>
+  </ul>
+  <x-code src="cargo:uniffi_core-0.32.0/src/ffi_converter_traits.rs" from="513" to="523"></x-code>
+  <x-code src="cargo:uniffi_core-0.32.0/src/ffi_converter_traits.rs" from="566" to="575"></x-code>
+  <p class="code-note"><x-tags>macros traits-generics</x-tags> <strong>A <code>macro_rules!</code> macro deriving trait impls.</strong> This is the other kind of Rust macro: pattern-matching on tokens, with no compiler plugin. <code>derive_ffi_traits!(blanket String)</code> (in <code>ffi_converter_impls.rs</code>, line 450) expands to eight <code>unsafe impl&lt;UT&gt; … for String</code> blocks, each delegating to <code>FfiConverter</code>. The <code>LowerReturn</code> arm shows the plain case: <code>ReturnType</code> is the <code>Lower</code> type, and <code>lower_return</code> wraps <code>lower</code> in <code>Ok</code>. <code>$crate</code> refers to <code>uniffi_core</code> wherever the macro is used.</p>
+
+  <h3>The impls Myotis uses</h3>
+  <x-code src="cargo:uniffi_core-0.32.0/src/ffi_converter_impls.rs" from="39" to="79"></x-code>
+  <p class="code-note"><x-tags>macros bytes-strings</x-tags> <strong>Numbers are their own FFI type.</strong> One <code>macro_rules!</code> template stamps out the impl for all ten numeric types. <code>lower</code> and <code>try_lift</code> are the identity: an <code>i64</code> travels as an <code>i64</code>. <code>write</code> and <code>try_read</code> go through the <code>bytes</code> crate's <code>put_i64</code>/<code>get_i64</code>, which are big-endian. <code>check_remaining</code> turns a short buffer into an error instead of a panic.</p>
+  <x-code src="cargo:uniffi_core-0.32.0/src/ffi_converter_impls.rs" from="81" to="110"></x-code>
+  <p class="code-note"><x-tags>bytes-strings error-handling</x-tags> <code>bool</code> crosses as <code>i8</code> "to avoid problems with handling C-compatible boolean values on JVM-based languages". Lifting is strict: anything other than 0 or 1 is an error. The Kotlin side is lenient in the other direction (section 6).</p>
+  <x-code src="cargo:uniffi_core-0.32.0/src/ffi_converter_impls.rs" from="112" to="167"></x-code>
+  <ul class="concepts">
+    <li><x-tags>bytes-strings ownership</x-tags> <strong>Zero-copy in both directions.</strong> A Rust <code>String</code> is a <code>Vec&lt;u8&gt;</code> that is guaranteed to hold UTF-8. <code>obj.into_bytes()</code> converts it into that vector without copying, and <code>from_vec</code> hands it out. On the way in, <code>destroy_into_vec</code> rebuilds the vector and <code>String::from_utf8_unchecked</code> relabels it as a <code>String</code>, again without copying. At the top level the buffer's own <code>len</code> is the string length, so no length prefix is written.</li>
+    <li><x-tags>unsafe-ffi bytes-strings</x-tags> <strong><code>from_utf8_unchecked</code> trusts Kotlin.</strong> Rust's safe code assumes every <code>String</code> is valid UTF-8; an invalid one is undefined behavior. This lift does not check. It is sound only because the generated Kotlin encodes strings with an encoder that <em>refuses</em> malformed input (section 6). That refusal is why <code>RustEngineNative</code> sanitizes strings first (section 7).</li>
+    <li><x-tags>bytes-strings</x-tags> <strong>Nested strings are different.</strong> <code>write</code> puts a big-endian <code>i32</code> length in front of the bytes, and <code>try_read</code> copies the bytes out (<code>to_vec</code>) and <em>validates</em> them with <code>String::from_utf8</code>. The comment on <code>write</code> admits the <code>unwrap</code> could panic for a string over 2 GiB.</li>
+  </ul>
+  <x-code src="cargo:uniffi_core-0.32.0/src/ffi_converter_impls.rs" from="254" to="287"></x-code>
+  <p class="code-note"><x-tags>enums-patterns bytes-strings</x-tags> <strong><code>Option&lt;T&gt;</code></strong> cannot be one pointer, so it is always <em>serialized</em> into a <code>RustBuffer</code>: one tag byte (0 = <code>None</code>, 1 = <code>Some</code>), then <code>T</code>'s own <code>write</code> format. For <code>holder: Option&lt;String&gt;</code> that is tag, big-endian <code>i32</code> length, UTF-8 bytes. <code>impl&lt;UT, T: Lower&lt;UT&gt;&gt; Lower&lt;UT&gt; for Option&lt;T&gt;</code> reads "for any <code>T</code> that can be lowered, <code>Option&lt;T&gt;</code> can be lowered too": a generic impl with a trait bound, resolved at compile time. Any tag byte other than 0 or 1 is an error.</p>
+
+  <details class="deep"><summary>Deeper: <code>FfiDefault</code> and <code>ForeignBytes</code></summary>
+    <x-code src="cargo:uniffi_core-0.32.0/src/ffi/ffidefault.rs" from="5" to="54"></x-code>
+    <p><x-tags>traits-generics error-handling</x-tags> A C function must return <em>something</em> even when it failed. <code>FfiDefault</code> names that placeholder: <code>0</code>, <code>false</code>, <code>()</code>, a null pointer, or an empty <code>RustBuffer</code> with a null data pointer (which <code>destroy_into_vec</code> accepts as empty). The foreign side ignores it because the status says the call failed.</p>
+    <p><code>ForeignBytes</code> (<code>ffi/foreignbytes.rs</code>, lines 25–32) is the opposite of <code>RustBuffer</code>: a read-only view of memory the <em>foreign</em> side owns, valid only for the duration of one call, with an <code>i32</code> length "for compatibility with JNA". The generated Kotlin declares it, and its comment there says it is not used, because copying into a <code>RustBuffer</code> is just as cheap from the JVM.</p>
+  </details>
+</section>
+
+<section class="prose">
+  <h2>4. Errors and panics</h2>
+  <x-code src="cargo:uniffi_core-0.32.0/src/ffi/rustcalls.rs" from="18" to="53"></x-code>
+  <ul class="concepts">
+    <li><x-tags>unsafe-ffi error-handling</x-tags> <strong>An out-parameter instead of exceptions.</strong> C has no exceptions, so every scaffolding function takes a pointer to this struct. The caller initializes <code>code</code> to 0 (success) with an empty buffer. Rust overwrites it only when something went wrong.</li>
+    <li><x-tags>ownership</x-tags> The comment spells out the ownership: <code>error_buf</code> belongs to the foreign side. Rust never frees what it was given and sets it at most once, so the empty buffer it replaces cannot leak. <code>ManuallyDrop</code> here documents that this field is never dropped by Rust.</li>
+  </ul>
+  <x-code src="cargo:uniffi_core-0.32.0/src/ffi/rustcalls.rs" from="80" to="143"></x-code>
+  <p class="code-note"><x-tags>enums-patterns error-handling</x-tags> <code>#[repr(i8)]</code> gives the enum a fixed one-byte representation with the listed values: 0 success, 1 a returned <code>Err</code>, 2 an unexpected error, 3 cancelled (async only). <code>TryFrom&lt;i8&gt;</code> converts back, returning the unknown byte as the error. <code>RustCallError</code> is what the generated closure produces on failure: <code>Error(RustBuffer)</code> for a serialized <code>Err</code> value, <code>InternalError(String)</code> for everything else, such as the <code>LiftArgsError</code> message <code>"Failed to convert arg '…'"</code>.</p>
+  <x-code src="cargo:uniffi_core-0.32.0/src/ffi/rustcalls.rs" from="145" to="170"></x-code>
+  <p class="code-note"><x-tags>traits-generics iterators-closures</x-tags> <code>rust_call</code> is what every scaffolding function calls. The bounds say: the callback runs once (<code>FnOnce</code>), may be unwound through (<code>UnwindSafe</code>, a marker that the closure leaves no broken shared state behind if it panics), and returns either the value or a <code>RustCallError</code>. On failure it returns <code>R::ffi_default()</code>.</p>
+  <x-code src="cargo:uniffi_core-0.32.0/src/ffi/rustcalls.rs" from="194" to="222"></x-code>
+  <x-code src="cargo:uniffi_core-0.32.0/src/ffi/rustcalls.rs" from="223" to="251"></x-code>
+  <ul class="concepts">
+    <li><x-tags>error-handling enums-patterns</x-tags> <strong><code>catch_unwind</code></strong> runs the closure and returns <code>Err(payload)</code> if it panics, like a <code>try { } catch (Throwable t)</code> around the call. The nested patterns <code>Ok(Ok(v))</code>, <code>Ok(Err(…))</code> and <code>Err(cause)</code> separate "returned normally", "returned an error" and "panicked".</li>
+    <li><x-tags>smart-pointers error-handling</x-tags> A panic payload is a <code>Box&lt;dyn Any + Send&gt;</code>: a value of unknown type. <code>downcast_ref::&lt;&amp;'static str&gt;()</code> and <code>downcast_ref::&lt;String&gt;()</code> try the two types <code>panic!</code> usually produces, like an <code>instanceof</code> check. The message is lowered inside a second <code>catch_unwind</code> (with <code>AssertUnwindSafe</code>, a wrapper that overrides the <code>UnwindSafe</code> check), so even a panic while formatting cannot escape across the C boundary.</li>
+  </ul>
+  <x-code src="Cargo.toml" from="76" to="82" lang="toml"></x-code>
+  <p class="code-note"><x-tags>error-handling modules-cargo</x-tags> <strong>But in Myotis the catch never happens.</strong> With <code>panic = "abort"</code> a panic does not unwind at all: the process is aborted on the spot, and <code>catch_unwind</code> has nothing to catch. This profile applies to every <code>--release</code> build of the workspace, which is how <code>cargoBuildHost</code> and <code>rust/build-android.sh</code> build the library the hosts load. Only an unwinding build (the default dev profile, for example a plain <code>cargo test</code>) would turn a panic into status code 2 and a Kotlin <code>InternalException</code>. That is why the <code>ffi.rs</code> module doc insists on "panic-free by construction": every failure in <code>host.rs</code> is returned as a sentinel or an <code>{"error": …}</code> JSON string, and none of the 55 exports returns a <code>Result</code>, so code 1 never occurs either.</p>
+  <div class="callout jvm">
+    <span class="k">Two kinds of failure, two channels</span>
+    <p>For Myotis, the UniFFI status channel is a safety net for bugs. Ordinary failures travel <em>inside</em> the JSON: <code>{"error": "…"}</code> for "could not answer" (Java raises <code>EngineException</code>), and a complete result with <code>failReason</code> set for "answered, but could not verify". UniFFI could map a Rust <code>Result&lt;String, MyError&gt;</code> to a typed Kotlin exception (code 1); the engine does not use that.</p>
+  </div>
+</section>
+
+<section class="prose">
+  <h2>5. Build time: from the compiled library to Kotlin</h2>
+  <p>So far everything happened inside <code>cargo build</code>. The Kotlin half is produced by a second program that reads the result. This is the one Rust file this stop covers.</p>
+</section>
+
+<x-file path="rust/uniffi-bindgen/src/main.rs" kind="binary crate">
+  <p class="purpose">The smallest crate in the workspace: a binary whose <code>main</code> runs UniFFI's bindings generator. It exists so that the generator always comes from the same <code>uniffi</code> version as the scaffolding the engine is compiled with: both are workspace members and resolve <code>uniffi 0.32</code> through the one <code>rust/Cargo.lock</code>. Gradle's <code>uniffiGenerateKotlin</code> runs it against the built host library and writes the committed Kotlin bindings into <code>:myotis-engine-rust</code>.</p>
+  <x-code src="uniffi-bindgen/src/main.rs" from="1" to="3"></x-code>
+  <x-code src="cargo:uniffi-0.32.0/src/cli/mod.rs" from="1" to="20"></x-code>
+  <ul class="concepts">
+    <li><x-tags>cli modules-cargo</x-tags> A binary crate starts at <code>fn main()</code>. The whole program is one call into the <code>uniffi</code> crate's CLI module, which parses the arguments (<code>generate --library … --language kotlin --out-dir …</code>), prints any error with <code>{e:?}</code> (the <code>Debug</code> format, which for <code>anyhow</code> errors includes the cause chain) and exits with status 1. <code>mod swift;</code> and <code>mod uniffi_bindgen;</code> declare submodules in files next to <code>mod.rs</code>. The separate Swift entry point is unused here.</li>
+  </ul>
+  <x-code src="uniffi-bindgen/Cargo.toml" from="1" to="26" lang="toml"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo</x-tags> <code>features = ["cli"]</code> switches on the parts of <code>uniffi</code> that only a generator needs (argument parsing, <code>uniffi_bindgen</code> with its templates). The engine crate does not enable it, so none of that code ends up in <code>libmyotis_engine</code>. <code>[[bin]]</code> names the executable; <code>publish = false</code> keeps the tool off crates.io; <code>version = "0.1.0"</code> stays fixed because this is a tool, not a release artifact (workspace <code>Cargo.toml</code>).</li>
+    <li><x-tags>domain</x-tags> The comment's warning matters: regenerate through Gradle, because the Gradle task post-processes the output (below). A direct <code>cargo run -p uniffi-bindgen</code> is for looking at the output only.</li>
+  </ul>
+  <h4>Library mode: reading the metadata back out of the binary</h4>
+  <x-code src="cargo:uniffi_bindgen-0.32.0/src/macro_metadata/extract.rs" from="18" to="36"></x-code>
+  <x-code src="cargo:uniffi_bindgen-0.32.0/src/macro_metadata/extract.rs" from="279" to="283"></x-code>
+  <p class="code-note"><x-tags>unsafe-ffi bytes-strings enums-patterns</x-tags> <code>--library</code> selects UniFFI's library mode. <code>extract.rs</code> parses the compiled file with the <code>goblin</code> crate; the <code>match</code> on <code>Object::parse</code> covers ELF (Linux, Android), Mach-O (macOS, iOS), PE (Windows), static archives and COFF. It then walks the symbol table and collects every symbol whose name starts with <code>UNIFFI_META</code> (macOS prefixes symbols with <code>_</code>, hence the <code>strip_prefix</code>). The bytes of each static are the metadata buffers from section 2. The generator never parses Rust source: what it sees is what the compiler built, so the two halves cannot disagree at generation time.</p>
+  <x-code src="cargo:uniffi_meta-0.32.0/src/reader.rs" from="532" to="536"></x-code>
+  <p class="code-note"><x-tags>bytes-strings</x-tags> <code>uniffi_meta</code>'s reader decodes each buffer into a <code>FnMetadata</code> and, at the end of every item, recomputes the checksum over exactly the bytes it consumed. That number is what the generator writes into the Kotlin as the expected value.</p>
+  <x-code src="cargo:uniffi_core-0.32.0/src/metadata.rs" from="268" to="291"></x-code>
+  <p class="code-note"><x-tags>traits-generics</x-tags> <strong>The checksum hash.</strong> 64-bit FNV-1a (start at <code>0xcbf29ce484222325</code>; for each byte, XOR it in and multiply by <code>0x100000001b3</code> with <code>wrapping_mul</code>, which wraps on overflow instead of panicking in debug builds), folded to 16 bits by XOR-ing the four 16-bit quarters. It is a <code>while</code> loop because <code>for</code> loops over iterators are not allowed in a <code>const fn</code>. <code>uniffi_meta/src/metadata.rs</code> has a hand-kept copy of this function for the generator. A 16-bit checksum catches accidental drift, not tampering: each changed function has a 1-in-65,536 chance of going unnoticed.</p>
+
+<figure class="diagram">
+    <div class="svg-wrap">
+    <svg class="wide-diagram" viewBox="0 0 960 250" role="img" fill="currentColor" xmlns="http://www.w3.org/2000/svg"
+         aria-label="Build-time pipeline. ffi.rs is compiled by cargo build release; the macros put, per function, an extern C function, a UNIFFI_META static and a checksum function into the library. uniffi-bindgen in library mode reads the UNIFFI_META statics and recomputes the checksums, then writes myotis_engine.kt with the expected values; Gradle masks the comparisons to 16 bits. At load time the Kotlin compares the contract version and every checksum against the loaded library, then RustEngineNative compares ABI_VERSION.">
+      <defs>
+        <marker id="m-stop17-arrow-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+      <g font-size="12">
+        <rect x="10" y="20" width="150" height="80" rx="8" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+        <text x="85" y="46" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">ffi.rs</text>
+        <text x="85" y="66" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">55 × #[uniffi::export]</text>
+        <text x="85" y="82" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">+ setup_scaffolding!</text>
+        <rect x="185" y="20" width="230" height="80" rx="8" stroke-width="1.5" style="fill:var(--surface);stroke:var(--oxide)"/>
+        <text x="300" y="40" text-anchor="middle" font-weight="700">cargo build --release</text>
+        <text x="300" y="58" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">per function the macro emits:</text>
+        <text x="300" y="73" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">extern "C" fn, UNIFFI_META_… static,</text>
+        <text x="300" y="88" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">u16 checksum fn, computed by the compiler</text>
+        <rect x="440" y="20" width="160" height="80" rx="8" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)"/>
+        <text x="520" y="46" text-anchor="middle" font-weight="700">libmyotis_engine</text>
+        <text x="520" y="66" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">.dylib / .so / .dll</text>
+        <text x="520" y="82" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">symbols + metadata bytes</text>
+        <rect x="625" y="20" width="150" height="80" rx="8" stroke-width="1.5" style="fill:var(--surface);stroke:var(--ink-3)"/>
+        <text x="700" y="46" text-anchor="middle" font-weight="700">uniffi-bindgen</text>
+        <text x="700" y="66" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">--library: reads</text>
+        <text x="700" y="82" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">UNIFFI_META_*, rehashes</text>
+        <rect x="800" y="20" width="150" height="80" rx="8" stroke-width="1.5" style="fill:var(--jvm-wash);stroke:var(--jvm)"/>
+        <text x="875" y="46" text-anchor="middle" font-weight="700" style="fill:var(--jvm-ink)">myotis_engine.kt</text>
+        <text x="875" y="66" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">committed; expected</text>
+        <text x="875" y="82" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">checksums, masked</text>
+        <rect x="190" y="160" width="760" height="70" rx="8" stroke-width="1.5" style="fill:var(--ok-wash);stroke:var(--ok)"/>
+        <text x="570" y="184" text-anchor="middle" font-weight="700" style="fill:var(--ok-ink)">At load time (RustEngineNative → uniffiEnsureInitialized)</text>
+        <text x="570" y="204" text-anchor="middle" font-size="11">contract version 30 == 30?  ·  55 × (checksum() and 0xFFFF) == expected?  ·  all symbols bound?</text>
+        <text x="570" y="220" text-anchor="middle" font-size="11">then engineInit() == EXPECTED_ABI_VERSION (55)?  Any "no" → isAvailable() is false</text>
+      </g>
+      <g stroke-width="1.5" fill="none" style="stroke:currentColor">
+        <line x1="160" y1="60" x2="181" y2="60" marker-end="url(#m-stop17-arrow-b)"/>
+        <line x1="415" y1="60" x2="436" y2="60" marker-end="url(#m-stop17-arrow-b)"/>
+        <line x1="600" y1="60" x2="621" y2="60" marker-end="url(#m-stop17-arrow-b)"/>
+        <line x1="775" y1="60" x2="796" y2="60" marker-end="url(#m-stop17-arrow-b)"/>
+        <line x1="520" y1="100" x2="520" y2="156" stroke-dasharray="5 4" marker-end="url(#m-stop17-arrow-b)"/>
+        <line x1="875" y1="100" x2="875" y2="156" stroke-dasharray="5 4" marker-end="url(#m-stop17-arrow-b)"/>
+      </g>
+      <g font-size="10.5" style="fill:var(--ink-3)">
+        <text x="527" y="134">the library that is loaded</text>
+        <text x="868" y="134" text-anchor="end">the values generated earlier</text>
+        <text x="20" y="150">build time (top) and load time (bottom)</text>
+      </g>
+    </svg>
+    </div>
+    <figcaption>The two halves meet twice: at generation time (bindgen reads the compiled library) and at load time (Kotlin compares its constants with whatever library it actually loaded). The second check is the one that matters, because the committed Kotlin can be months older than the library next to it.</figcaption>
+  </figure>
+
+  <h4>The Gradle task that runs it, in full</h4>
+  <x-code src="repo:build.gradle.kts" from="711" to="734" lang="kotlin"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo</x-tags> <code>dependsOn(cargoBuildHost)</code>: the generator needs a fresh <code>cargo build --release</code> of the host library first. <code>hostLibNames.last()</code> is the engine library's file name for this OS. <code>cargo run --release -p uniffi-bindgen</code> builds and runs the three-line binary. <code>--no-format</code> skips running a Kotlin formatter over the output, which is why the generated wrappers have their odd indentation.</li>
+    <li><x-tags>modules-cargo</x-tags> <code>onlyIf { rustAvailable }</code>: without cargo the task skips, and the committed file stays as it is. That is the reason the file is committed at all: a JVM-only machine compiles the Kotlin without ever running Rust. <code>inputs</code> (the Rust sources and the cargo version) and <code>outputs</code> (the <code>.kt</code> file) let Gradle skip the task when nothing changed.</li>
+  </ul>
+  <x-code src="repo:build.gradle.kts" from="735" to="763" lang="kotlin"></x-code>
+  <p class="code-note"><x-tags>unsafe-ffi</x-tags> <strong>A fix applied after generation.</strong> The Rust checksum functions return <code>u16</code>, but UniFFI 0.32's Kotlin template declares them as returning <code>Int</code> (a 32-bit JVM int) and compares the full value. A 16-bit return value only occupies the low half of the return register, and the x86-64 calling conventions do not promise that the upper half is zero. The comment records a debug Linux build returning <code>0x5DB5166E</code> for checksum 5742 (<code>0x166E</code>), and a Windows build that failed every check and silently fell back to the Java engine. The <code>doLast</code> block rewrites each comparison to <code>(… and 0xFFFF) != N</code> with a regex, then checks that the number of rewritten comparisons equals the number of declared checksum functions and that none is left unmasked, so a future UniFFI with a different output shape fails the task instead of passing half-fixed. The triple-quoted <code>"""…"""</code> strings are Kotlin raw strings, so the regex needs no double escaping.</p>
+</x-file>
+
+<section class="prose">
+  <h2>6. The Kotlin side</h2>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="1" to="18" lang="kotlin"></x-code>
+  <p class="code-note"><x-tags>modules-cargo</x-tags> The generated file is 2,384 lines. Its header explains why all helper code is inline: the helpers must match the exact <code>uniffi</code> version that compiled the Rust side. Most of the file is generic support that Myotis never calls (async futures, callback interfaces, a handle map, <code>Disposable</code>). The parts this API uses are below, roughly in file order, followed by the wrapper functions.</p>
+
+  <h3>The buffer types</h3>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="34" to="86" lang="kotlin"></x-code>
+  <ul class="concepts">
+    <li><x-tags>unsafe-ffi</x-tags> <strong>The same struct, seen from JNA.</strong> A JNA <code>Structure</code> subclass describes a C struct; <code>@Structure.FieldOrder</code> fixes the field order to match Rust's <code>#[repr(C)]</code> (<code>capacity</code>, <code>len</code>, <code>data</code>). Unsigned <code>u64</code> becomes a signed <code>Long</code> because the JVM has no unsigned 64-bit type, as the comment notes. <code>@JvmField</code> makes the Kotlin properties plain Java fields, which is what JNA reads by reflection.</li>
+    <li><x-tags>unsafe-ffi</x-tags> <strong><code>ByValue</code> versus a plain <code>Structure</code>.</strong> The nested <code>ByValue</code> class tells JNA to pass and return the struct by value (copied into registers or the stack), as the Rust signatures expect for <code>RustBuffer</code>. A plain <code>Structure</code> parameter is passed as a pointer, which is how the call status travels.</li>
+    <li><x-tags>unsafe-ffi ownership</x-tags> <code>alloc</code> and <code>free</code> in the <code>companion object</code> (Kotlin's place for static members) are thin calls to the two Rust functions that <code>setup_scaffolding!</code> generated, each through <code>uniffiRustCall</code>. <code>alloc</code> also refuses a null data pointer. Kotlin never frees native memory itself.</li>
+    <li><x-tags>bytes-strings</x-tags> <code>asByteBuffer()</code> wraps the native memory in a direct <code>java.nio.ByteBuffer</code> of length <code>len</code>, without copying. Reads and writes through it touch Rust's memory directly. <code>ByteOrder.BIG_ENDIAN</code> matches the <code>bytes</code> crate on the Rust side.</li>
+  </ul>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="88" to="100" lang="kotlin"></x-code>
+  <p class="code-note"><x-tags>unsafe-ffi</x-tags> <code>ForeignBytes</code>, the Kotlin twin of the Rust struct, with the generator's own comment that it is "not actually used at the moment". Its <code>len</code> is an <code>Int</code>, matching Rust's <code>i32</code>.</p>
+
+  <h3>The converter interface</h3>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="146" to="168" lang="kotlin"></x-code>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="169" to="216" lang="kotlin"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics</x-tags> <strong>The Kotlin mirror of Rust's <code>FfiConverter</code>.</strong> <code>FfiConverter&lt;KotlinType, FfiType&gt;</code> has <code>lift</code>/<code>lower</code> for top-level values and <code>read</code>/<code>write</code> for nested ones, the same split as on the Rust side. One addition: <code>allocationSize</code>, because Kotlin must ask Rust for a buffer of a known size <em>before</em> writing into it. The comment explains the pessimistic estimate for strings (3 bytes per UTF-16 code unit).</li>
+    <li><x-tags>ownership error-handling</x-tags> <strong><code>lowerIntoRustBuffer</code></strong> asks Rust for <code>allocationSize</code> bytes, writes through a <code>ByteBuffer</code> view, then sets <code>len</code> to the number of bytes actually written with <code>writeField</code> (which also copies the field into the native struct). If writing throws, it frees the buffer before rethrowing. <strong><code>liftFromRustBuffer</code></strong> reads one value, insists that nothing is left over (the twin of Rust's leftover-bytes check), and frees the buffer in <code>finally</code>.</li>
+    <li><x-tags>traits-generics</x-tags> <code>FfiConverterRustBuffer</code> supplies <code>lift</code> and <code>lower</code> as default methods for every type that travels serialized, such as <code>String?</code>.</li>
+  </ul>
+
+  <h3>The call status and the call helpers</h3>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="220" to="262" lang="kotlin"></x-code>
+  <p class="code-note"><x-tags>error-handling unsafe-ffi</x-tags> <code>UniffiRustCallStatus</code> mirrors the Rust struct: a <code>Byte</code> code and an embedded <code>RustBuffer.ByValue</code> (a struct inside a struct, not a pointer). The three constants are the Rust enum's values. It is passed as a plain <code>Structure</code>, so JNA gives Rust a pointer to native memory it manages for this object, and Rust's <code>&amp;mut RustCallStatus</code> points there. JNA writes the Java fields into that memory before the call and reads them back after it. <code>InternalException</code> is the one exception type this API can throw.</p>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="264" to="294" lang="kotlin"></x-code>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="296" to="311" lang="kotlin"></x-code>
+  <ul class="concepts">
+    <li><x-tags>iterators-closures error-handling</x-tags> <strong>Turning the status into exceptions.</strong> <code>uniffiRustCallWithError</code> creates a fresh status object for every call, runs the native call (passed as a lambda that receives the status), then checks it. <code>inline fun</code> copies the function body into each caller at compile time, so the lambda costs no object allocation, a Kotlin feature with no Java equivalent.</li>
+    <li><x-tags>error-handling</x-tags> <code>uniffiCheckCallStatus</code> maps 1 to the error handler's exception and 2 to <code>InternalException</code> carrying the lifted message (or <code>"Rust panic"</code> if Rust could not even build one). <code>uniffiRustCall</code> uses <code>UniffiNullRustCallStatusErrorHandler</code>, which frees the buffer and reports "Unexpected CALL_ERROR", since no export returns <code>Result</code>.</li>
+    <li><x-tags>concurrency</x-tags> The comment at the top ("we usually need to be synchronized to call this safely") is generic. Each call creates its own status object, and nothing here is shared between threads, so concurrent calls from several JVM threads are fine.</li>
+  </ul>
+
+  <h3>Loading, and the integrity gate</h3>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="386" to="395" lang="kotlin"></x-code>
+  <p class="code-note"><x-tags>unsafe-ffi</x-tags> <code>findLibraryName</code> returns the system property <code>uniffi.component.myotis_engine.libraryOverride</code> if set, otherwise <code>"myotis_engine"</code>, which JNA maps to <code>libmyotis_engine.dylib</code>, <code>.so</code> or <code>myotis_engine.dll</code>. <code>RustEngineNative</code> sets the override for a development build (section 7).</p>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="653" to="676" lang="kotlin"></x-code>
+  <ul class="concepts">
+    <li><x-tags>unsafe-ffi</x-tags> <strong>JNA direct mapping.</strong> <code>Native.register(Class, name)</code> loads the library and binds every <code>external fun</code> of that class to the native symbol with the same name, eagerly: a missing symbol fails here with <code>UnsatisfiedLinkError</code>, not at the first call. Kotlin's <code>external</code> is Java's <code>native</code>.</li>
+    <li><x-tags>concurrency</x-tags> <strong>A Kotlin <code>object</code>'s <code>init</code></strong> runs in the class's static initializer, exactly once, under the JVM's class-initialization lock. If it throws, the JVM wraps the exception in <code>ExceptionInInitializerError</code>, and every later use of the class fails with <code>NoClassDefFoundError</code>. The checks are in an <code>init</code> block, so a mismatch makes the whole integrity class unusable.</li>
+    <li><x-tags>unsafe-ffi</x-tags> The checksum functions live in their own object, apart from <code>UniffiLib</code>. The generated comment explains the split: one interface with all methods once exceeded a JVM size limit for large crates, and it notes this reasoning predates direct mapping.</li>
+  </ul>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="791" to="799" lang="kotlin"></x-code>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="872" to="873" lang="kotlin"></x-code>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="908" to="915" lang="kotlin"></x-code>
+  <p class="code-note"><x-tags>unsafe-ffi</x-tags> <strong>The declarations JNA binds.</strong> Compare with the Rust scaffolding: <code>handle: i64</code> is <code>Long</code>, each <code>RustBuffer</code> is <code>RustBuffer.ByValue</code>, <code>&amp;mut RustCallStatus</code> is a plain <code>UniffiRustCallStatus</code>, and <code>bool</code> returns are <code>Byte</code>. The buffer functions follow, with <code>u64</code> sizes as <code>Long</code>. If any of these types disagreed with the Rust side, JNA would pass the wrong bits and nothing would notice except the checksums. The rest of <code>UniffiLib</code> declares the unused <code>rust_future_*</code> functions.</p>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="1016" to="1032" lang="kotlin"></x-code>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="1138" to="1140" lang="kotlin"></x-code>
+  <p class="code-note"><x-tags>macros domain</x-tags> <code>bindings_contract_version = 30</code> and the 55 numbers such as <code>48343</code> are literals the generator wrote from the metadata it read. The library loaded at run time answers <code>ffi_myotis_engine_uniffi_contract_version()</code> and <code>uniffi_myotis_engine_checksum_func_request_account_json()</code>. If either disagrees, the library was compiled from different source (or a different UniFFI) than the bindings, and the code refuses to continue. Note the <code>and 0xFFFF</code> from the Gradle post-processing, and the unhelpful message "try cleaning and rebuilding your project": in Myotis the fix is usually <code>./gradlew uniffiGenerateKotlin</code> or a rebuilt library.</p>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="1194" to="1202" lang="kotlin"></x-code>
+  <p class="code-note"><x-tags>unsafe-ffi</x-tags> <strong>The checks only run if someone asks.</strong> Mentioning an <code>object</code> forces its initialization. A plain call like <code>requestAccountJson</code> touches only <code>UniffiLib</code>, which registers its functions <em>without</em> the checksum checks. So a host must call <code>uniffiEnsureInitialized()</code> before anything else, which is the first thing <code>RustEngineNative</code> does.</p>
+
+  <h3>The type converters</h3>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="1308" to="1329" lang="kotlin"></x-code>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="1334" to="1352" lang="kotlin"></x-code>
+  <p class="code-note"><x-tags>traits-generics bytes-strings</x-tags> <code>FfiConverterLong</code> is the identity, like Rust's numeric impl, with 8-byte <code>getLong</code>/<code>putLong</code> for nested use. <code>FfiConverterBoolean</code> lowers to 1 or 0, but lifts <em>any</em> non-zero byte as <code>true</code>: more lenient than Rust's lift, which refuses anything but 0 and 1. That is harmless here, since Rust only ever sends 0 or 1.</p>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="1357" to="1409" lang="kotlin"></x-code>
+  <ul class="concepts">
+    <li><x-tags>bytes-strings ownership</x-tags> <strong><code>lift</code>, Rust → Kotlin.</strong> It copies <code>len</code> bytes out of native memory into a JVM <code>ByteArray</code>, decodes them, and in <code>finally</code> calls <code>RustBuffer.free</code>, a native call back into Rust that rebuilds and drops the <code>Vec</code>. After that line no Rust memory is referenced from Kotlin, and the <code>finally</code> frees the buffer even if decoding throws.</li>
+    <li><x-tags>bytes-strings ownership</x-tags> <strong><code>lower</code>, Kotlin → Rust.</strong> <code>toUtf8</code> encodes the UTF-16 Kotlin string into UTF-8 with <code>CodingErrorAction.REPORT</code>, so a lone surrogate throws <code>MalformedInputException</code> instead of being replaced. This is what makes Rust's unchecked lift sound. Then <code>RustBuffer.alloc</code> makes a native call into Rust for memory of exactly that size, and <code>put</code> copies the bytes into it. One string argument costs one extra native round trip.</li>
+    <li><x-tags>bytes-strings</x-tags> <strong>Top-level versus nested</strong>, as in Rust: <code>lift</code>/<code>lower</code> use the buffer's own length, while <code>read</code>/<code>write</code> use an <code>Int</code> length prefix. The comment at the top says so: <code>FfiConverterString</code> deliberately does not extend <code>FfiConverterRustBuffer</code>.</li>
+  </ul>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="1414" to="1441" lang="kotlin"></x-code>
+  <p class="code-note"><x-tags>enums-patterns bytes-strings</x-tags> <code>String?</code> uses the serialized path: <code>FfiConverterRustBuffer</code>'s default <code>lower</code> calls <code>lowerIntoRustBuffer</code>, which allocates <code>allocationSize</code> bytes (1 for the tag, plus 4 + 3 per code unit for a string), writes tag 0, or tag 1 and the prefixed string, then sets <code>len</code>. The buffer's capacity is usually larger than its length, which is why <code>RustBuffer</code> carries both: Rust must free the whole capacity.</p>
+
+  <h3>The public wrapper functions</h3>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="2089" to="2107" lang="kotlin"></x-code>
+  <ul class="concepts">
+    <li><x-tags>unsafe-ffi</x-tags> <strong>Read it inside out.</strong> Each argument is lowered (<code>FfiConverterLong.lower</code> returns the <code>Long</code> unchanged; <code>FfiConverterString.lower</code> allocates and fills a <code>RustBuffer</code>). <code>uniffiRustCall { _status -&gt; … }</code> creates a fresh status object and passes it as the last argument. <code>UniffiLib.uniffi_myotis_engine_fn_func_request_account_json</code> is the JNA-bound native function. Its <code>RustBuffer.ByValue</code> result goes to <code>FfiConverterString.lift</code>.</li>
+    <li><x-tags>modules-cargo</x-tags> <strong>A top-level function.</strong> Kotlin functions outside a class compile into a JVM class named after the file, here <code>Myotis_engineKt</code>, as static methods. That is why the Java caller writes <code>Myotis_engineKt.requestAccountJson(…)</code>. Names are converted from <code>snake_case</code> to <code>camelCase</code>, the backticks around every name protect against Kotlin keywords, and the Rust doc comment became KDoc.</li>
+  </ul>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="1945" to="1960" lang="kotlin"></x-code>
+  <x-code src="repo:myotis-engine-rust/src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt" from="2357" to="2366" lang="kotlin"></x-code>
+  <p class="code-note"><x-tags>enums-patterns</x-tags> Two variations. <code>getStorageProofJson</code> lowers its <code>String?</code> through <code>FfiConverterOptionalString</code>. <code>stopHandle</code>, whose Rust function returns <code>()</code>, has no lift at all: its body is the <code>uniffiRustCall</code> expression, which returns <code>Unit</code>.</p>
+
+  <details class="deep"><summary>Deeper: two small flaws in the generated code</summary>
+    <p><strong>A leak on a failed lowering.</strong> In <code>requestAccountJson</code>, the arguments are lowered left to right inside the call expression. If lowering <code>block</code> throws (a malformed string), the <code>RustBuffer</code> already allocated for <code>address</code> is never passed to Rust and never freed: a small native leak per failed call. As far as I can read the code, nothing in the generated file guards against this. In Myotis it cannot happen through <code>RustEngineNative</code>, which replaces every malformed string with <code>""</code> before the call (section 7).</p>
+    <p><strong>A message template.</strong> Line 292 builds <code>"Unknown rust call status: $status.code"</code>. A Kotlin string template <code>$status</code> ends at the identifier, so this prints the whole status object followed by the literal text <code>.code</code>; <code>${status.code}</code> was meant. It only matters for a status code Rust never sends.</p>
+  </details>
+</section>
+
+<section class="prose">
+  <h2>7. The Java callers</h2>
+  <x-code src="repo:myotis-engine-rust/src/main/java/io/myotis/engines/rust/RustEngineNative.java" from="8" to="48" lang="java"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain</x-tags> <strong>A static delegator.</strong> The class doc summarizes this stop from the Java side: compound values are still JSON, availability means "the bindings initialized and the ABI handshake matched", and every string argument keeps the old hand-JNI null tolerance. <code>EXPECTED_ABI_VERSION</code> is a hand-kept copy of the Rust constant; the trailing comment is its changelog.</li>
+    <li><x-tags>concurrency</x-tags> <code>private static final boolean AVAILABLE = load();</code> runs <code>load()</code> once, in the class's static initializer, under the JVM's class-initialization lock: the Java equivalent of a lazily initialized <code>static</code> in Rust.</li>
+  </ul>
+  <x-code src="repo:myotis-engine-rust/src/main/java/io/myotis/engines/rust/RustEngineNative.java" from="50" to="104" lang="java"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain</x-tags> <strong>Finding the library</strong> (lines 51–67). An explicit <code>-Dmyotis.engine.lib</code> path is forwarded to UniFFI's <code>libraryOverride</code> property. Otherwise <code>java.library.path</code>, where the run and test tasks put <code>rust/target/release</code>, is copied into <code>jna.library.path</code>, because JNA only reads the latter.</li>
+    <li><x-tags>error-handling</x-tags> <strong>Three outcomes, all non-fatal.</strong> No library on the search path gives <code>UnsatisfiedLinkError</code>, logged at info level: the normal case on a machine without cargo. A library that fails the contract or checksum check arrives as <code>ExceptionInInitializerError</code>, so the code unwraps its cause for the warning. A library that passes but reports a different <code>ABI_VERSION</code> is also refused. In every case <code>isAvailable()</code> returns <code>false</code>, and the <code>:myotis-engines</code> selector serves the Java engine instead (the comment in <code>AbiVersionMirrorTest</code>, section 10, describes this fallback). <code>engineInit()</code> also installs the ring-buffer log subscriber (<code>ffi.rs</code> lines 23–31), so the handshake is the first real call into the engine.</li>
+  </ul>
+  <x-code src="repo:myotis-engine-rust/src/main/java/io/myotis/engines/rust/RustEngineNative.java" from="106" to="133" lang="java"></x-code>
+  <p class="code-note"><x-tags>bytes-strings</x-tags> <strong>Keeping the generated encoder from throwing.</strong> <code>nz()</code> turns <code>null</code>, and any string with an unpaired surrogate (which a JSON-RPC client can send), into <code>""</code>. Without it, <code>FfiConverterString.lower</code> would throw <code>MalformedInputException</code>. The old hand-JNI layer behaved like <code>nz()</code>, and the delegator keeps that behavior. <code>wellFormed</code> is a hand-written scan instead of an encoder probe because it runs on every argument; the comment counts the cost.</p>
+  <x-code src="repo:myotis-engine-rust/src/main/java/io/myotis/engines/rust/RustEngineNative.java" from="285" to="299" lang="java"></x-code>
+  <p class="code-note"><x-tags>enums-patterns</x-tags> The two delegators this stop follows. For the optional <code>holder</code>, a malformed string becomes <code>null</code> rather than <code>""</code>, matching what the old shim did (a decode failure was <code>None</code>). Java's <code>null</code> reaches Kotlin as a <code>String?</code> that is <code>null</code>, which lowers to tag byte 0.</p>
+  <x-code src="repo:myotis-engine-rust/src/main/java/io/myotis/engines/rust/RustChainHandle.java" from="323" to="339" lang="java"></x-code>
+  <x-code src="repo:myotis-engine-rust/src/main/java/io/myotis/engines/rust/RustChainHandle.java" from="869" to="912" lang="java"></x-code>
+  <x-code src="repo:myotis-engine-rust/src/main/java/io/myotis/engines/rust/RustChainHandle.java" from="938" to="943" lang="java"></x-code>
+  <ul class="concepts">
+    <li><x-tags>concurrency domain</x-tags> <strong><code>gated(…)</code></strong> wakes a paused chain, waits (bounded) while it warms up, and counts the call as in flight so the idle timer cannot pause the chain mid-read. <code>Supplier&lt;T&gt;</code> defers the native call until the gate opens.</li>
+    <li><x-tags>error-handling domain</x-tags> <strong>Where the boundary is type-checked.</strong> <code>accountFromJson</code> fills the 23-argument <code>io.myotis.api</code> record <code>AccountProofResult</code> field by field, with defaults for missing keys, and turns a type mismatch into an <code>EngineException</code>. Field names and types are checked here, at run time, in Java, not by any compiler. The <code>// ABI &gt;= 41</code> and <code>// ABI &gt;= 52</code> comments mark keys added as payload extensions.</li>
+  </ul>
+  <x-code src="repo:myotis-engine-rust/src/main/java/io/myotis/engines/rust/RustChainHandle.java" from="1852" to="1888" lang="java"></x-code>
+  <p class="code-note"><x-tags>error-handling</x-tags> <code>parseResultOrThrow</code> in two halves: parse with minimal-json (a null, blank or malformed string throws), then turn <code>{"error": …}</code> into <code>EngineException</code>. A verification failure is <em>not</em> an error here: it is a normal result with <code>failReason</code> set.</p>
+</section>
+
+<section class="prose">
+  <h2>8. How the library reaches the JVM and Android</h2>
+  <p>JNA has to find a file called <code>libmyotis_engine.*</code> at run time. There are three situations.</p>
+  <ul>
+    <li><strong>Development (daemon, desktop app, tests).</strong> <code>cargoBuildHost</code> writes the library to <code>rust/target/release/</code>, and <code>RustEngineNative.load()</code> bridges <code>java.library.path</code> to <code>jna.library.path</code>, as shown above.</li>
+    <li><strong>A desktop consumer of the engine library.</strong> The jar does not contain the native library; a separate artifact carries it, as the consumer documentation explains:</li>
+  </ul>
+  <x-code src="repo:docs/android-library.md" from="196" to="223" lang="text"></x-code>
+  <p class="code-note"><x-tags>modules-cargo</x-tags> The natives jar puts <code>&lt;platform&gt;/libmyotis_engine.*</code> on the classpath, where JNA finds it, extracts it to a temporary file and loads it. Note the warning in the middle: a library from another release with the <em>same</em> FFI passes every check, because the checks compare shapes, not versions.</p>
+  <ul>
+    <li><strong>Android.</strong> The <code>.so</code> files are packed into the AAR and from there into the APK, where the system's dynamic linker finds them by name. In <code>RustEngineNative</code>'s words, "On Android JNA resolves the bundled jniLibs on its own."</li>
+  </ul>
+  <h3>Building the Android libraries</h3>
+  <x-code src="repo:build.gradle.kts" from="923" to="956" lang="kotlin"></x-code>
+  <x-code src="build-android.sh" from="50" to="50" lang="text"></x-code>
+  <p class="code-note"><x-tags>modules-cargo</x-tags> <code>cargoNdkAndroid</code> runs <code>rust/build-android.sh</code> when the Android toolchain is present and <code>-PskipRustEngine</code> is not set. Its inputs include the cargo, cargo-ndk and NDK versions, so a toolchain change rebuilds. <code>cargo ndk</code> cross-compiles the engine (and the BLS library) with the NDK's linker for two ABIs and writes <code>&lt;abi&gt;/libmyotis_engine.so</code> into <code>myotis-engine/src/androidMain/jniLibs</code>, the layout Android's Gradle plugin expects. Nothing there is committed. The script then deletes any other <code>.so</code> it produced and checks that every library is 16 KB aligned.</p>
+  <x-code src="repo:myotis-engine/build.gradle.kts" from="109" to="123" lang="kotlin"></x-code>
+  <p class="code-note"><x-tags>modules-cargo</x-tags> The jniLibs directory is a source of the AAR only when the Rust engine is wanted. The comment explains why the gate is on the source rather than a packaging filter: a leftover <code>.so</code> from an earlier build would otherwise ship, fail UniFFI validation on the device, and silently fall back to the Java engine.</p>
+  <h3>JNA's own native half</h3>
+  <x-code src="repo:myotis-engine/build.gradle.kts" from="146" to="181" lang="kotlin"></x-code>
+  <x-code src="repo:myotis-engine/build.gradle.kts" from="183" to="219" lang="kotlin"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo</x-tags> JNA itself needs a native library, <code>libjnidispatch.so</code>, to call anything. The plain JNA jar carries only desktop dispatchers; the Android ones ship in <code>jna-&lt;v&gt;.aar</code>. A detached configuration (<code>isCanBeConsumed = false</code>, not on any classpath) downloads that aar, and <code>extractJnaAndroidNatives</code> copies only <code>jni/&lt;abi&gt;/…</code> into this module's jniLibs, renaming paths to <code>&lt;abi&gt;/…</code>.</li>
+    <li><x-tags>modules-cargo</x-tags> The JNA jar version is pinned with <code>strictly</code>, so the published POM carries the constraint too: JNA refuses to run when its jar and its native dispatcher differ. <code>Sync</code> rather than <code>Copy</code> removes files no longer in the spec, and the <code>doLast</code> check fails the build if an ABI got no dispatcher.</li>
+  </ul>
+  <h3>The Android build regenerates the bindings</h3>
+  <x-code src="repo:myotis-engine/build.gradle.kts" from="221" to="272" lang="kotlin"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo</x-tags> <strong>Everything hangs off <code>preBuild</code></strong>, the first task of every Android build path. It always extracts the JNA dispatcher and runs the toolchain gate; unless <code>-PskipRustEngine</code> is set, it also runs <code>uniffiGenerateKotlin</code>, <code>cargoNdkAndroid</code> and <code>verifyAndroidJniLibs</code>. The comment on line 234 explains why the explicit <code>dependsOn(extractJnaAndroidNatives)</code> is needed: a task registered as a source directory does not carry a dependency through the Android plugin.</li>
+    <li><x-tags>modules-cargo</x-tags> <strong>Generated from the host library.</strong> <code>uniffiGenerateKotlin</code> depends on <code>cargoBuildHost</code>, so the Android bindings are generated from the macOS or Linux library, not from the Android <code>.so</code>. That works because the metadata comes from the source, which is the same for both targets (<code>ffi.rs</code> has no <code>#[cfg]</code>-gated exports).</li>
+    <li><x-tags>modules-cargo</x-tags> <code>mustRunAfter</code> orders tasks without adding them: the symbol check must see the fresh <code>.so</code> and the fresh <code>.kt</code>, and both expensive Rust builds wait for the cheap toolchain gate, so a machine without the NDK fails fast.</li>
+  </ul>
+  <x-code src="repo:build.gradle.kts" from="995" to="1031" lang="kotlin"></x-code>
+  <x-code src="repo:build.gradle.kts" from="1032" to="1078" lang="kotlin"></x-code>
+  <p class="code-note"><x-tags>testing bytes-strings</x-tags> <strong><code>verifyAndroidJniLibs</code></strong> collects, with a regex over the committed Kotlin, every <code>uniffi_myotis_engine_*</code> and <code>ffi_myotis_engine_*</code> name that <code>Native.register</code> will bind, then reads each built <code>.so</code> as ISO-8859-1 text (one char per byte) and checks that every name occurs. It is a build-time version of the eager binding JNA does on the device. As the comment says, it catches a missing symbol, not a changed signature under the same name; that is left to the checksums and to CI's regenerate-and-diff. It also checks that each library starts with the ELF magic bytes.</p>
+  <h3>Desktop builds do not regenerate</h3>
+  <x-code src="repo:myotis-engine-rust/build.gradle.kts" from="41" to="64" lang="kotlin"></x-code>
+  <p class="code-note"><x-tags>modules-cargo</x-tags> A <code>dependsOn</code> here would put a release cargo build in front of every JVM compile and break the rule that Rust is optional for the JVM hosts. <code>mustRunAfter</code> only orders the two tasks when both are in one build. Freshness for everyone is enforced by CI: the comment says the APK workflow regenerates the bindings and fails on any difference.</p>
+</section>
+
+<section class="prose">
+  <h2>9. Why compound values cross as JSON</h2>
+  <p>UniFFI can pass structured data. A <code>#[derive(uniffi::Record)]</code> struct becomes a Kotlin <code>data class</code>, serialized into a <code>RustBuffer</code> field by field with <code>write</code>/<code>try_read</code>, exactly as <code>Option&lt;String&gt;</code> is above. The project's design notes describe that typed mapping for the whole <code>io.myotis.api</code> contract, and then explain what was built instead:</p>
+  <x-code src="repo:docs/reimplementation/05-engine-api-bindings.md" from="31" to="50" lang="text"></x-code>
+  <p>The reasons, from the code and these notes:</p>
+  <ul>
+    <li><strong>It was a transport swap.</strong> The <code>ffi.rs</code> module doc: "TRANSPORT SWAP ONLY: these functions mirror the old hand-JNI natives 1:1". The JSON shapes already existed, Java already parsed them, and golden tests on both sides (<code>rust/testdata/…</code>, <code>RustVerifiedReadJsonTest</code> and others) pinned them. Replacing hand-JNI with UniFFI changed how bytes move, not what they mean.</li>
+    <li><strong>One schema for three routes.</strong> The iOS C ABI and the Node addon can only pass <code>char*</code>. Because the UniFFI route also passes JSON, <code>eljson.rs</code> serializes each result once for all hosts, and the same golden files cover them.</li>
+    <li><strong>A small, stable FFI surface.</strong> With only integers and strings crossing, a checksum changes only when a function is added or its parameters change. Adding a field to a result is a payload change: no signature changes, no regeneration, and older readers ignore the new key (the <code>ABI_VERSION</code> history in <code>lib.rs</code> records many such "payload extension, no signature change" steps).</li>
+  </ul>
+  <p>The costs are real. A result is serialized to text in Rust, copied across, and parsed again in Java. The compiler no longer checks that both sides agree on a field's name or type; the golden tests and the defensive parsing in <code>RustChainHandle</code> do that instead. And the <code>ABI_VERSION</code> number has to be bumped by hand for every payload change.</p>
+</section>
+
+<section class="prose">
+  <h2>10. The safety net, and when to run <code>uniffiGenerateKotlin</code></h2>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Check</th><th>What it compares</th><th>What it catches</th><th>What it misses</th></tr></thead>
+    <tbody>
+      <tr><td>Contract version</td><td>Kotlin literal 30 vs <code>ffi_myotis_engine_uniffi_contract_version()</code></td><td>Bindings and library from UniFFI versions with different FFI conventions.</td><td>Anything about Myotis's own functions.</td></tr>
+      <tr><td>Per-function checksum (55)</td><td>Kotlin literal vs <code>uniffi_myotis_engine_checksum_func_*()</code></td><td>Any change to a function's metadata: name, module, parameter names, types and order, return type, async, doc comment.</td><td>The function body; JSON payload changes; a function added to Rust but not to Kotlin (Kotlin simply cannot call it).</td></tr>
+      <tr><td>Symbol binding</td><td><code>Native.register</code> on load; <code>verifyAndroidJniLibs</code> at build</td><td>A function the Kotlin declares but the library lacks (removed, or a pre-UniFFI library).</td><td>Signature changes under the same name.</td></tr>
+      <tr><td><code>ABI_VERSION</code></td><td><code>engineInit()</code> vs <code>RustEngineNative.EXPECTED_ABI_VERSION</code> (55)</td><td>Behavior and payload changes that someone remembered to bump, for example "a proof names its block's hash" (v52).</td><td>Anything nobody bumped.</td></tr>
+      <tr><td>JSON golden tests</td><td>Fixed JSON files, parsed on both sides</td><td>Shape drift in the payloads.</td><td>Code paths without a golden file.</td></tr>
+      <tr><td>CI regenerate-and-diff</td><td>Freshly generated <code>.kt</code> vs the committed one</td><td>Forgetting to regenerate.</td><td>Only runs in the APK workflow.</td></tr>
+    </tbody>
+  </table></div>
+  <x-code src="repo:myotis-engine-rust/src/test/java/io/myotis/engines/rust/AbiVersionMirrorTest.java" from="15" to="34" lang="java"></x-code>
+  <p class="code-note"><x-tags>testing</x-tags> The checksums cannot see a hand-copied integer that fell behind, so this test reads <code>lib.rs</code> and the C header as text and compares them with <code>EXPECTED_ABI_VERSION</code>. It runs without cargo, unlike its Rust twin in <code>capi.rs</code>.</p>
+  <p><strong>Run <code>./gradlew uniffiGenerateKotlin</code></strong>, and commit the changed <code>myotis_engine.kt</code>, whenever you:</p>
+  <ul>
+    <li>add, remove or rename a <code>#[uniffi::export]</code> function in <code>ffi.rs</code>;</li>
+    <li>change a parameter's name, type or position, or the return type;</li>
+    <li>edit the <code>///</code> doc comment of an exported function, even one word;</li>
+    <li>move an exported function to another module;</li>
+    <li>upgrade <code>uniffi</code>.</li>
+  </ul>
+  <p>You do <strong>not</strong> need it when you change only function bodies (<code>host.rs</code>, <code>eljson.rs</code>, or the inside of an <code>ffi.rs</code> function such as the <code>u64::try_from</code> in <code>get_raw_transaction_by_block_json</code>), or anything in <code>capi.rs</code> and the C header. A payload change needs an <code>ABI_VERSION</code> bump and golden-test updates instead. Always regenerate through Gradle, never with a direct <code>cargo run</code>, so the checksum masking is applied.</p>
+  <div class="callout watch">
+    <span class="k">What forgetting looks like</span>
+    <p>Say you add a parameter to <code>request_account_json</code> and forget. On the desktop, the stale Kotlin compiles and the new library loads, but <code>uniffiCheckApiChecksums</code> throws for that one function, <code>RustEngineNative</code> logs "failed UniFFI validation", and the app quietly runs on the Java engine. In an Android build, <code>preBuild</code> regenerates the Kotlin, the wrapper gains the parameter, and the unchanged Java call in <code>RustEngineNative</code> no longer compiles: the failure moves to compile time, which is the better place.</p>
+  </div>
+</section>
+
+<section class="prose">
+  <h2>11. The iOS route, for contrast</h2>
+  <p>iOS does not use UniFFI. <code>capi.rs</code> exports a hand-written C interface over the same <code>host</code> functions, declared in <code>rust/include/myotis_engine.h</code>. Kotlin/Native reads that header with <code>cinterop</code> and generates Kotlin declarations for it at build time. There is no JNA, no JVM and no <code>RustBuffer</code>: strings are NUL-terminated C strings.</p>
+  <x-code src="myotis-engine/src/capi.rs" from="1" to="41"></x-code>
+  <ul class="concepts">
+    <li><x-tags>unsafe-ffi bytes-strings</x-tags> <strong>Incoming: copy and repair.</strong> <code>CStr::from_ptr</code> borrows the caller's bytes up to the NUL, <code>to_string_lossy</code> replaces invalid UTF-8 with U+FFFD instead of trusting it, and <code>into_owned</code> copies, so Rust does not depend on how long the caller keeps its buffer. Compare UniFFI's <code>from_utf8_unchecked</code>, which neither copies nor checks.</li>
+    <li><x-tags>unsafe-ffi ownership</x-tags> <strong>Outgoing: the same allocator rule.</strong> <code>CString::into_raw</code> gives up ownership exactly like <code>RustBuffer::from_vec</code>. An interior NUL makes <code>into_c</code> return null instead of panicking.</li>
+  </ul>
+  <x-code src="myotis-engine/src/capi.rs" from="44" to="52"></x-code>
+  <x-code src="myotis-engine/src/capi.rs" from="254" to="271"></x-code>
+  <x-code src="myotis-engine/src/capi.rs" from="797" to="810"></x-code>
+  <p class="code-note"><x-tags>unsafe-ffi ownership</x-tags> The same three moves as UniFFI, written by hand: a handshake (<code>myotis_init</code>, the twin of <code>engine_init</code>), a function that converts its arguments, calls <code>host</code> and hands back an owned string, and a free function. <code>myotis_string_free</code> takes the pointer back with <code>CString::from_raw</code> and drops it, like <code>rustbuffer_free</code>. Calling <code>free(3)</code> on the pointer would be undefined behavior. <code>#[no_mangle]</code> (edition 2021 spelling) here does what <code>#[unsafe(no_mangle)]</code> does in the macro output.</p>
+  <x-code src="include/myotis_engine.h" from="1" to="23" lang="c"></x-code>
+  <x-code src="include/myotis_engine.h" from="35" to="44" lang="c"></x-code>
+  <x-code src="include/myotis_engine.h" from="150" to="165" lang="c"></x-code>
+  <x-code src="include/myotis_engine.h" from="393" to="394" lang="c"></x-code>
+  <p class="code-note"><x-tags>unsafe-ffi</x-tags> The header is the hand-written equivalent of UniFFI's metadata. It states the memory contract in prose, carries the payload history in comments, and defines <code>MYOTIS_ABI_VERSION</code>, which a <code>capi.rs</code> test and <code>AbiVersionMirrorTest</code> pin to the crate constant. (Lines 19–22 are out of date; see the callout below.)</p>
+  <x-code src="repo:myotis-engine-ios/src/nativeInterop/cinterop/myotis_engine.def" from="1" to="10" lang="text"></x-code>
+  <x-code src="repo:myotis-engine-ios/src/iosMain/kotlin/io/myotis/engine/ios/RustEngine.kt" from="59" to="109" lang="kotlin"></x-code>
+  <x-code src="repo:myotis-engine-ios/src/iosMain/kotlin/io/myotis/engine/ios/RustEngine.kt" from="240" to="246" lang="kotlin"></x-code>
+  <ul class="concepts">
+    <li><x-tags>unsafe-ffi</x-tags> <strong>The hand-written twin of <code>FfiConverterString.lift</code>.</strong> <code>take</code> copies the C string into a Kotlin <code>String</code> (<code>toKString</code>) and frees it in <code>finally</code>. For the arguments, cinterop maps a <code>const char*</code> parameter to Kotlin <code>String?</code> and converts the Kotlin string to a temporary C string for the duration of the call; the Rust side copies it (<code>into_owned</code>) before that memory goes away.</li>
+    <li><x-tags>modules-cargo</x-tags> <strong>Static linking.</strong> <code>staticLibraries = libmyotis_engine.a</code> puts the Rust archive inside the cinterop klib, so the header and the library always travel together. <code>EXPECTED_ABI_VERSION</code> is the header's <code>MYOTIS_ABI_VERSION</code> macro, read by cinterop, and every public function calls <code>requireAbi()</code>, which compares it with <code>myotis_init()</code> once (<code>by lazy</code> is Kotlin's thread-safe lazy initialization).</li>
+  </ul>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th></th><th>JVM and Android (UniFFI)</th><th>iOS (C ABI)</th></tr></thead>
+    <tbody>
+      <tr><td>Rust side</td><td>generated by <code>#[uniffi::export]</code></td><td>hand-written <code>#[no_mangle] extern "C"</code> in <code>capi.rs</code></td></tr>
+      <tr><td>Foreign side</td><td>generated by <code>uniffi-bindgen</code> from the library, committed</td><td>generated by <code>cinterop</code> from the header, at build time</td></tr>
+      <tr><td>String in</td><td>Rust-allocated <code>RustBuffer</code>, filled by Kotlin, no copy in Rust, no UTF-8 check</td><td>caller's C string, copied and repaired by <code>read_string</code></td></tr>
+      <tr><td>String out</td><td><code>RustBuffer</code>, freed by <code>rustbuffer_free</code></td><td><code>char*</code>, freed by <code>myotis_string_free</code></td></tr>
+      <tr><td>Errors</td><td>call-status struct (unused in practice) + JSON</td><td>null / false / −1 + JSON</td></tr>
+      <tr><td>Stale-library guard</td><td>contract version, 55 checksums, eager binding, <code>ABI_VERSION</code></td><td><code>MYOTIS_ABI_VERSION</code> only; static linking makes a mismatch unlikely</td></tr>
+      <tr><td>Loading</td><td>JNA at run time</td><td>linked into the app binary</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<div class="callout watch">
+  <span class="k">Stale or inaccurate comments</span>
+  <ul>
+    <li><code>rust/myotis-engine/Cargo.toml</code> line 6 describes the crate as a "JNI cdylib", and lines 27–30 speak of "the JNI natives" and claim this is the only crate that pulls in tokio. The JNI layer is gone (UniFFI over JNA), and <code>myotis-net</code> depends on tokio as well.</li>
+    <li><code>capi.rs</code> line 1 calls itself a C ABI "over the same <code>host</code> functions the JNI shim wraps", and <code>read_string</code>'s doc compares itself with "the JNI shim's <code>read_string</code>". Neither shim exists any more.</li>
+    <li><code>uniffi-bindgen/Cargo.toml</code> lines 11–13 say a version skew between scaffolding and generator "is a build error by design". In the code I read, nothing fails at build time: the shared lock file keeps one <code>uniffi</code> version, and a skew would be caught at load time by the contract-version check.</li>
+    <li>The comment on <code>uniffiGenerateKotlin</code> (root <code>build.gradle.kts</code> line 714) says to re-run it "whenever <code>ffi.rs</code> changes shape". Doc comments are part of the checksummed metadata (<code>fnsig.rs</code> line 309), so a doc-only edit needs it too.</li>
+    <li><code>rust/include/myotis_engine.h</code> lines 19–22 say "there is no additional native semaphore-wait queue" for EVM execution. <code>myotis-net/src/el/request.rs</code>'s <code>blocking</code> now waits FIFO for a slot for up to <code>BLOCKING_WAIT</code> (5 s), with at most 32 waiters, before refusing.</li>
+  </ul>
+</div>
+
+<section class="prose">
+  <h3>What changed since September</h3>
+  <p>The mechanism is the same, but the surface grew from 38 to 55 exports and <code>ABI_VERSION</code> from 26 to 55. The bindings now live in <code>:myotis-engine-rust</code> (previously <code>:myotis-engines</code>). Gradle now masks the checksum comparisons to 16 bits after generation. Android builds regenerate the bindings in <code>:myotis-engine</code>'s <code>preBuild</code>, and the AAR carries JNA's Android dispatcher itself.</p>
+</section>
+
+<x-quiz>[
+  {"id": "uniffi-q1", "type": "mcq", "tags": ["ownership", "unsafe-ffi"], "q": "Kotlin receives the <code>RustBuffer</code> holding the JSON result of <code>requestAccountJson</code>. Who frees that memory, and how?", "options": ["The JVM garbage collector, once the <code>RustBuffer.ByValue</code> object is unreachable", "<code>FfiConverterString.lift</code> copies the bytes into a <code>ByteArray</code> and, in <code>finally</code>, calls <code>ffi_myotis_engine_rustbuffer_free</code>; Rust rebuilds the <code>Vec</code> with <code>from_raw_parts</code> and drops it", "Rust frees it when the scaffolding function returns, so Kotlin must copy it before the call ends", "Kotlin calls <code>free(3)</code> through JNA"], "answer": 1, "explain": "The buffer came from Rust's allocator (the <code>String</code>'s own <code>Vec</code>), so only Rust may free it. Kotlin decides when, by calling back into Rust. The GC frees only the small JVM object, not the native bytes."},
+  {"id": "uniffi-q2", "type": "mcq", "tags": ["macros", "modules-cargo"], "q": "Which of these edits to <code>ffi.rs</code> does NOT require running <code>./gradlew uniffiGenerateKotlin</code>?", "options": ["Fixing a typo in the <code>///</code> doc comment of <code>request_account_json</code>", "Renaming the parameter <code>block</code> to <code>selector</code>", "Changing the <code>match</code> inside the body of <code>get_raw_transaction_by_block_json</code>", "Moving <code>request_account_json</code> into a new module <code>ffi::reads</code>"], "answer": 2, "explain": "The checksum covers the metadata: module path, name, parameter names and types, return type and doc comment. A function's body is not part of it."},
+  {"id": "uniffi-q3", "type": "mcq", "tags": ["error-handling", "unsafe-ffi"], "q": "A bug makes <code>host::request_account_json</code> panic in the shipped Android app. What happens?", "options": ["The process aborts. The release profile sets <code>panic = \"abort\"</code>, so no unwinding happens and <code>catch_unwind</code> never gets control", "<code>catch_unwind</code> in <code>rust_call</code> catches it, sets status code 2, and Kotlin throws <code>InternalException</code>", "The function returns <code>{\"error\": \"panic\"}</code>", "JNA converts the panic into an <code>UnsatisfiedLinkError</code>"], "answer": 0, "explain": "The <code>catch_unwind</code> answer is what UniFFI does in an unwinding build, such as the dev profile. Myotis ships release builds with <code>panic = \"abort\"</code>, which is why the engine is written to be panic-free and reports failures in its JSON."},
+  {"id": "uniffi-q4", "type": "mcq", "tags": ["traits-generics", "macros"], "q": "Why are UniFFI's conversion traits generic over a tag type (<code>FfiConverter&lt;UT&gt;</code>), with <code>UniFfiTag</code> defined in each crate by <code>setup_scaffolding!</code>?", "options": ["To make the conversions faster through monomorphization", "So that Kotlin can choose the conversion at run time", "Because <code>String</code> cannot implement non-generic traits", "Because of the orphan rule: a crate may implement a foreign trait for a foreign type only if a local type appears in the impl. <code>FfiConverter&lt;crate::UniFfiTag&gt;</code> contains a local type, so each consumer crate can write impls for types it does not own"], "answer": 3, "explain": "Built-in types are covered by blanket impls in <code>uniffi_core</code> (<code>impl&lt;UT&gt; FfiConverter&lt;UT&gt; for String</code>), and the generated code always asks for <code>&lt;T as Lift&lt;crate::UniFfiTag&gt;&gt;</code>."},
+  {"id": "uniffi-q5", "type": "mcq", "tags": ["concurrency", "async"], "q": "A JSON-RPC worker thread calls <code>RustChainHandle.accountVerified</code>. On which thread does the Rust code of <code>request_account_json</code> run?", "options": ["On a JNA worker thread; the JVM thread waits on a future", "On the tokio runtime's worker threads only; the scaffolding hands the call over", "On the calling JVM thread itself. JNA calls the C function directly, and <code>host.rs</code> blocks that thread in <code>rt.block_on</code> while tokio's worker threads drive the spawned network tasks", "On the Android main thread"], "answer": 2, "explain": "There is no thread switch at the boundary. This is why the header and the docs say verified reads block for up to about 90 seconds and must be called off the UI thread."},
+  {"id": "uniffi-q6", "type": "mcq", "tags": ["unsafe-ffi", "bytes-strings"], "q": "The committed Kotlin compares checksums as <code>(lib.uniffi_myotis_engine_checksum_func_…() and 0xFFFF) != N</code>. Why the mask?", "options": ["The Rust function returns a <code>u16</code>, but the bindings read it as a 32-bit <code>Int</code>. The x86-64 calling conventions do not promise that the upper 16 bits of the return register are zero, so an unmasked compare can fail on a correct library. The root Gradle task adds the mask after generation", "The checksum is 32 bits, and only the low half is meaningful", "JNA sign-extends every return value", "UniFFI's template always masks"], "answer": 0, "explain": "UniFFI 0.32's template compares unmasked. A Linux debug build returned <code>0x5DB5166E</code> for checksum <code>0x166E</code>, and the Windows build fell back to the Java engine. The Gradle task also fails if the number of rewritten comparisons does not match the declared functions."},
+  {"id": "uniffi-q7", "type": "open", "tags": ["ownership", "unsafe-ffi", "smart-pointers"], "q": "Trace the memory of the <code>address</code> argument from the Kotlin <code>String</code> in <code>requestAccountJson</code> to the moment it is freed. Name who allocates, who writes, how ownership moves, and where the bytes are dropped.", "model": "<code>FfiConverterString.lower</code> encodes the UTF-16 string to UTF-8 (throwing on malformed input), then calls <code>RustBuffer.alloc</code>, a native call to <code>ffi_myotis_engine_rustbuffer_alloc</code>. Rust allocates <code>vec![0u8; n]</code> and turns it into a <code>RustBuffer</code> with <code>RustBuffer::from_vec</code>, which wraps the <code>Vec</code> in <code>ManuallyDrop</code> so it is not freed. Kotlin copies the bytes into that native memory. The buffer is then passed by value to <code>uniffi_myotis_engine_fn_func_request_account_json</code>, and from that point it belongs to Rust; Kotlin never frees it. The scaffolding's lift closure calls <code>String::try_lift</code>: <code>destroy_into_vec</code> rebuilds the <code>Vec</code> with <code>Vec::from_raw_parts</code>, and <code>from_utf8_unchecked</code> relabels it as a <code>String</code>, with no copy. The <code>String</code> is moved into <code>ffi::request_account_json</code>, which lends <code>&amp;address</code> to <code>host</code>. When the ffi function returns, the <code>String</code> goes out of scope and its buffer is freed by Rust's allocator.", "points": ["Rust allocates the buffer (rustbuffer_alloc), Kotlin only fills it with UTF-8 bytes", "from_vec uses ManuallyDrop so Rust stops tracking the Vec while Kotlin holds it", "passing the RustBuffer by value transfers ownership to Rust; Kotlin never frees argument buffers", "try_lift rebuilds the Vec with from_raw_parts and makes a String without copying", "the String is dropped, and the memory freed, when ffi::request_account_json returns"], "context": "myotis_engine.kt L1386-1393 FfiConverterString.lower: toUtf8 (REPORT), RustBuffer.alloc(size), asByteBuffer().put. uniffi_core rustbuffer.rs L146-151 from_vec (ManuallyDrop), L163-182 destroy_into_vec (Vec::from_raw_parts), L211-213 uniffi_rustbuffer_alloc -> new_with_size = vec![0u8; size]. ffi_converter_impls.rs L123-143: String lower = from_vec(into_bytes), try_lift = destroy_into_vec + from_utf8_unchecked. ffi.rs L186-189 request_account_json(handle, address: String, block: String) calls host::request_account_json(handle, &address, &block)."},
+  {"id": "uniffi-q8", "type": "open", "tags": ["macros", "error-handling", "unsafe-ffi"], "q": "Describe everything <code>#[uniffi::export]</code> adds to the crate for one function such as <code>request_account_json</code>, and what each item is for.", "model": "It keeps the function and adds three items. First, a <code>#[no_mangle] pub extern \"C\" fn uniffi_myotis_engine_fn_func_request_account_json</code> whose parameters are the FFI types of the Rust parameters (<code>i64</code>, <code>RustBuffer</code>, <code>RustBuffer</code>) plus <code>&amp;mut RustCallStatus</code>. Its body builds a <code>move</code> closure that lifts each argument with <code>Lift::try_lift</code> and reports which argument failed, then runs <code>uniffi::rust_call</code>, which wraps the call in <code>catch_unwind</code>, calls the real function, and lowers the result with <code>LowerReturn::lower_return</code>; failures are written into the status. Second, a metadata constant built with <code>const fn</code> calls (module path, name, async flag, arguments with names and types, return type, doc comment) and a <code>#[no_mangle]</code> static <code>UNIFFI_META_MYOTIS_ENGINE_FUNC_REQUEST_ACCOUNT_JSON</code> holding those bytes, which <code>uniffi-bindgen</code> reads from the compiled library. Third, <code>uniffi_myotis_engine_checksum_func_request_account_json() -&gt; u16</code>, returning a checksum of the metadata computed at compile time, which the Kotlin bindings compare at load.", "points": ["an extern \"C\" #[no_mangle] scaffolding function with FFI-typed parameters plus &mut RustCallStatus", "a lift closure that converts each argument and names the one that failed", "rust_call with catch_unwind around the call, and lower_return for the result", "a metadata const plus a no_mangle UNIFFI_META_ static that the bindgen reads out of the library", "a checksum function returning a compile-time u16 over the metadata bytes"], "context": "uniffi_macros export/scaffolding.rs L240-267 (gen_ffi_function, non-async); fnsig.rs L192-212 lift_closure, L300-310 metadata_expr incl. concat_long_str(docstring); util.rs L101-137 create_metadata_items (const + static UNIFFI_META_..., checksum fn with const CHECKSUM: u16 = ...checksum()); uniffi_core rustcalls.rs L164-170 rust_call, L200-251 rust_call_with_out_status."},
+  {"id": "uniffi-q9", "type": "open", "tags": ["modules-cargo", "testing", "error-handling"], "q": "You add a parameter to an exported function in <code>ffi.rs</code>, update <code>RustEngineNative</code>'s call, and forget <code>uniffiGenerateKotlin</code>. What happens in a desktop build and in an Android build, and which mechanisms notice?", "model": "In the desktop build the committed Kotlin is not regenerated, so its wrapper still has the old parameter list, and the updated Java call does not compile against it. If you had not updated the Java call, everything would compile, the fresh library would load, and at <code>uniffiEnsureInitialized()</code> the checksum for that one function would differ, so <code>uniffiCheckApiChecksums</code> throws inside <code>IntegrityCheckingUniffiLib</code>'s initializer; <code>RustEngineNative.load()</code> catches the <code>ExceptionInInitializerError</code>, logs \"failed UniFFI validation\" and reports unavailable, and the selector serves the Java engine. In an Android build, <code>:myotis-engine</code>'s <code>preBuild</code> runs <code>uniffiGenerateKotlin</code> automatically, so the bindings are regenerated; the build then works with the updated Java call, but leaves a modified <code>myotis_engine.kt</code> in the working tree. CI's regenerate-and-diff step in the APK workflow fails if the committed file is stale.", "points": ["desktop/JVM builds never regenerate the committed bindings automatically", "a stale wrapper either fails Java compilation (signature mismatch) or fails the load-time checksum check", "the checksum failure surfaces as ExceptionInInitializerError, caught in RustEngineNative.load, and isAvailable() becomes false (Java engine fallback)", "Android builds regenerate in preBuild, so the bindings match the library there", "CI's regenerate-and-diff catches a stale committed file"], "context": "myotis-engine-rust/build.gradle.kts: compileKotlin only mustRunAfter uniffiGenerateKotlin (no dependsOn). myotis-engine/build.gradle.kts L239-249 preBuild dependsOn uniffiGenerateKotlin, cargoNdkAndroid, verifyAndroidJniLibs. myotis_engine.kt L669-674 IntegrityCheckingUniffiLib init -> uniffiCheckApiChecksums; L1197-1202 uniffiEnsureInitialized. RustEngineNative.java L68-100 load(): catch Throwable, unwrap ExceptionInInitializerError, log.warn, return false."},
+  {"id": "uniffi-q10", "type": "open", "tags": ["domain", "bytes-strings"], "q": "UniFFI could pass typed records. Why does the Myotis engine pass compound values as JSON strings instead, and what does that cost?", "model": "The switch from hand-JNI to UniFFI was a transport swap only: the functions mirror the old natives one to one, and the JSON shapes were already defined, parsed by Java and pinned by golden tests on both sides. The same JSON is what the iOS C ABI and the Node addon return as <code>char*</code>, so <code>eljson.rs</code> serializes once for all hosts and one set of golden files covers them. With only integers and strings crossing, the UniFFI signatures and checksums rarely change; new result fields are payload extensions with no signature change and no regeneration. The costs: results are serialized to text and parsed again; field names and types are no longer checked by a compiler across the boundary, only by golden tests and defensive parsing in <code>RustChainHandle</code>; and payload changes must be tracked by bumping <code>ABI_VERSION</code> by hand. The typed-record mapping in docs 05 remains the documented alternative.", "points": ["a transport swap from hand-JNI: shapes already existed and were pinned by golden tests on both sides", "the same JSON serves the C ABI (iOS, Node), which can only carry char*", "the UniFFI surface stays primitives and strings, so checksums and bindings rarely change; fields can be added without a signature change", "cost: double serialization and parsing", "cost: no compile-time type checking across the boundary; golden tests, defensive parsing and manual ABI_VERSION bumps replace it"], "context": "ffi.rs L1-9 module doc 'TRANSPORT SWAP ONLY ... compound values still cross as JSON strings with the exact shapes the golden tests pin on both sides'. capi.rs L1-9 'compound values cross as JSON strings with the exact same shapes'. lib.rs ABI history: 'a payload extension, no signature change'. docs/reimplementation/05-engine-api-bindings.md: typed-record UniFFI mapping 'remains the reference path if the JSON transport is ever retired'. RustChainHandle.accountFromJson wraps type mismatches in EngineException."},
+  {"id": "uniffi-q11", "type": "mcq", "tags": ["unsafe-ffi", "bytes-strings", "traits-generics"], "q": "<code>&lt;String as FfiConverter&gt;::try_lift</code> uses <code>String::from_utf8_unchecked</code>. What makes that sound?", "options": ["Rust checks UTF-8 again later, when the string is first used", "JNA validates UTF-8 for every <code>Structure</code>", "Invalid UTF-8 in a <code>String</code> is harmless in Rust", "The generated Kotlin encodes every string with a UTF-8 encoder set to <code>CodingErrorAction.REPORT</code>, so it throws before sending malformed data. The traits are <code>unsafe trait</code> precisely because their soundness depends on the foreign code matching them"], "answer": 3, "explain": "Rust's safe <code>str</code> methods assume valid UTF-8, so an invalid <code>String</code> is undefined behavior. The guarantee comes from the other side, which is why <code>RustEngineNative</code>'s <code>nz()</code> must sanitize malformed UTF-16 instead of letting the encoder throw."},
+  {"id": "uniffi-q12", "type": "mcq", "tags": ["bytes-strings", "enums-patterns"], "q": "How does the <code>holder: Option&lt;String&gt;</code> argument of <code>get_storage_proof_json</code> cross the boundary?", "options": ["As a nullable pointer to a C string", "As two arguments: a flag and a <code>RustBuffer</code>", "Serialized into one <code>RustBuffer</code>: a tag byte (0 for <code>None</code>, 1 for <code>Some</code>), then a big-endian <code>i32</code> byte length and the UTF-8 bytes. Rust reads it with <code>try_read</code>, which validates the UTF-8 and copies", "As JSON"], "answer": 2, "explain": "Only a bare <code>String</code> gets the zero-copy treatment where the buffer's <code>len</code> is the string length. Anything compound is written with <code>write</code> and read with <code>try_read</code>, and leftover bytes are rejected."},
+  {"id": "uniffi-q13", "type": "mcq", "tags": ["unsafe-ffi", "concurrency"], "q": "<code>RustEngineNative.load()</code> calls <code>Myotis_engineKt.uniffiEnsureInitialized()</code> before <code>engineInit()</code>. What would change if that line were removed?", "options": ["Nothing: every generated wrapper checks the checksums before calling", "The checksums and the contract version would never be checked. A wrapper call touches only the <code>UniffiLib</code> object, whose <code>init</code> registers the functions without checks; the checks live in the <code>init</code> of <code>IntegrityCheckingUniffiLib</code>, which runs only when that object is referenced", "The library would not be loaded at all, so every call would throw <code>UnsatisfiedLinkError</code>", "The checks would run on every call instead of once, which is slower"], "answer": 1, "explain": "A Kotlin <code>object</code> is initialized on first use. <code>uniffiEnsureInitialized()</code> exists to force the integrity object's initialization; without it, a reshaped symbol would be called with the wrong arguments instead of failing loudly at load."},
+  {"id": "uniffi-q14", "type": "open", "tags": ["modules-cargo", "unsafe-ffi"], "q": "List what an Android build of <code>:myotis-engine</code> does, before compiling anything, so that the AAR can run the Rust engine through UniFFI, and say what would break on a device if each step were missing.", "model": "<code>preBuild</code> depends on: <code>extractJnaAndroidNatives</code>, which copies <code>libjnidispatch.so</code> for each shipped ABI out of <code>jna-&lt;v&gt;.aar</code> into the jniLibs (without it JNA cannot dispatch any native call, so the Rust engine cannot load); <code>requireAndroidRustEngine</code>, which fails fast if the Android Rust toolchain is missing unless <code>-PskipRustEngine</code> is set; <code>uniffiGenerateKotlin</code>, which rebuilds the host library and regenerates the committed bindings from it (stale bindings would fail the checksum check and fall back to the Java engine, or now fail Java compilation); <code>cargoNdkAndroid</code>, which cross-compiles <code>libmyotis_engine.so</code> for arm64-v8a and x86_64 into <code>src/androidMain/jniLibs</code> (without it there is no library to load); and <code>verifyAndroidJniLibs</code>, which checks that each <code>.so</code> is an ELF file containing every <code>uniffi_myotis_engine_*</code>/<code>ffi_myotis_engine_*</code> symbol the bindings declare (a missing symbol would make <code>Native.register</code> throw on the device). The JNA jar version is pinned with <code>strictly</code> because JNA refuses a jar and dispatcher of different versions.", "points": ["extracts libjnidispatch.so from the JNA aar into jniLibs; without it JNA cannot call anything", "regenerates the bindings with uniffiGenerateKotlin, from the host library", "cross-compiles libmyotis_engine.so per ABI with cargoNdkAndroid", "verifyAndroidJniLibs checks the .so files contain every symbol the bindings declare (otherwise Native.register fails on device)", "a failure on device means isAvailable() is false and a fallback to the Java engine (or no engine below API 33)"], "context": "myotis-engine/build.gradle.kts L146-219 (jnaAndroidNatives configuration, extractJnaAndroidNatives Sync, strictly(jnaVersion)), L221-272 (preBuild dependsOn extractJnaAndroidNatives, requireAndroidRustEngine, and unless skipRustEngine uniffiGenerateKotlin, cargoNdkAndroid, verifyAndroidJniLibs). Root build.gradle.kts L923-956 cargoNdkAndroid, L995-1078 verifyAndroidJniLibs (regex over committed bindings for uniffi_myotis_engine_\\w+|ffi_myotis_engine_\\w+, ELF magic check)."}
+]</x-quiz>
+

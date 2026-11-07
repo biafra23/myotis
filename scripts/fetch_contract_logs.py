@@ -4,7 +4,7 @@
 DEBUG / DEMO ONLY — NOT A PRODUCTION DATA PATH. The output carries no
 receipt-root proof; it is framed by ``scripts/synth_logindex.py`` into a
 snapshot the engine serves indistinguishably from logs it walked and verified
-itself. See docs/railgun-poc.md and docs/bee-rpc-service.md.
+itself. See docs/guides/railgun-poc.md and docs/guides/bee-rpc-service.md.
 
 Writes one JSON object per line, exactly as the node returned it, which is what
 ``synth_logindex.py`` expects. Resumable: a re-run continues from the last fully

@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 940 300" role="img" fill="currentColor" aria-label="A nine-byte buffer holding the RLP list cat, dog: c8 83 63 61 74 83 64 6f 67, owned by the caller. Left: rlp::decode copies it into an Item::List that owns two Item::Bytes vectors; the buffer may be dropped. Middle: View::new checks the buffer and keeps a pointer and length into it; its iterator yields Views of bytes 1 to 4 and 5 to 8; the buffer must outlive them. Right: ListBuf::push_view copies the two element encodings into one owned Vec of eight bytes with len 2: one allocation, not one per item." width="940" height="300">
+      <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="940.0" height="300.0" fill="#f8fafb" /><defs>
+        <marker id="m-core-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+        </marker>
+      </defs>
+      <text x="336" y="24" font-size="12" class="mono" style="fill:var(--ink-2)">data: &amp;[u8]  = ["cat", "dog"]  (caller owns)</text>
+      <rect x="336" y="36" width="288" height="34" rx="4" stroke-width="1.2" style="fill:var(--surface);stroke:var(--rule)" />
+      <rect x="336" y="36" width="32" height="34" style="fill:var(--ground-2)" />
+      <text x="343" y="58" font-size="12" class="mono">c8</text>
+      <text x="375" y="58" font-size="12" class="mono">83</text>
+      <text x="407" y="58" font-size="12" class="mono">63</text>
+      <text x="439" y="58" font-size="12" class="mono">61</text>
+      <text x="471" y="58" font-size="12" class="mono">74</text>
+      <text x="503" y="58" font-size="12" class="mono">83</text>
+      <text x="535" y="58" font-size="12" class="mono">64</text>
+      <text x="567" y="58" font-size="12" class="mono">6f</text>
+      <text x="599" y="58" font-size="12" class="mono">67</text>
+      <line x1="496" y1="36" x2="496" y2="70" stroke-width="1" style="stroke:var(--rule)" />
+      <line x1="368" y1="36" x2="368" y2="70" stroke-width="1" style="stroke:var(--rule)" />
+
+      
+      <path d="M350 72 C 300 110, 200 110, 160 128" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-core-arrow)" />
+      <text x="196" y="100" font-size="12" class="mono" style="fill:var(--ink-2)">rlp::decode (copies)</text>
+      <rect x="20" y="132" width="260" height="110" rx="6" style="fill:var(--jvm-wash)" />
+      <text x="32" y="152" font-size="12" class="mono" font-weight="700">Item::List(Vec&lt;Item&gt;)</text>
+      <text x="44" y="176" font-size="12" class="mono">Item::Bytes(vec![63 61 74])</text>
+      <text x="44" y="198" font-size="12" class="mono">Item::Bytes(vec![64 6f 67])</text>
+      <text x="32" y="228" font-size="11.5" style="fill:var(--ink-2)">owns copies; buffer may be dropped</text>
+
+      
+      <rect x="330" y="132" width="290" height="110" rx="6" style="fill:var(--oxide-wash)" />
+      <text x="342" y="152" font-size="12" class="mono" font-weight="700">View { raw: ptr, len 9 }</text>
+      <text x="342" y="176" font-size="12" class="mono">.as_list() yields</text>
+      <text x="354" y="196" font-size="12" class="mono">View { raw: bytes 1..5 }</text>
+      <text x="354" y="214" font-size="12" class="mono">View { raw: bytes 5..9 }</text>
+      <text x="342" y="234" font-size="11.5" style="fill:var(--ink-2)">borrows; buffer must outlive it</text>
+      <line x1="352" y1="132" x2="352" y2="73" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-core-arrow)" />
+      <line x1="432" y1="132" x2="432" y2="73" stroke="currentColor" stroke-width="1.2" stroke-dasharray="3 3" marker-end="url(#m-core-arrow)" />
+      <line x1="560" y1="132" x2="560" y2="73" stroke="currentColor" stroke-width="1.2" stroke-dasharray="3 3" marker-end="url(#m-core-arrow)" />
+
+      
+      <path d="M624 60 C 700 70, 760 100, 770 128" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-core-arrow)" />
+      <text x="700" y="92" font-size="12" class="mono" style="fill:var(--ink-2)">push_view (copies)</text>
+      <rect x="670" y="132" width="250" height="110" rx="6" style="fill:var(--ok-wash)" />
+      <text x="682" y="152" font-size="12" class="mono" font-weight="700">ListBuf {</text>
+      <text x="694" y="174" font-size="12" class="mono">payload: Vec [83 63 61 74</text>
+      <text x="795" y="192" font-size="12" class="mono">83 64 6f 67],</text>
+      <text x="694" y="210" font-size="12" class="mono">len: 2 }</text>
+      <text x="682" y="234" font-size="11.5" style="fill:var(--ink-2)">one buffer, not one Vec per item</text>
+      <text x="20" y="284" font-size="12" style="fill:var(--ink-2)">Per the docs (lines 21–25 and 289–293), the tree costs about 50 heap bytes per input byte. The other two cost what the bytes weigh.</text>
+    </svg>

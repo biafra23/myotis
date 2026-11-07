@@ -276,7 +276,7 @@ jobs:
       - name: Warn when no release certificate is pinned
         run: |
           [ -f android-app/release-signing-cert.sha256 ] \
-            || echo "::warning title=No pinned release certificate::android-app/release-signing-cert.sha256 is missing, so a v* tag cut from this tree would publish no Android APK (docs/android-release-signing.md)"
+            || echo "::warning title=No pinned release certificate::android-app/release-signing-cert.sha256 is missing, so a v* tag cut from this tree would publish no Android APK (docs/guides/android-release-signing.md)"
 
       # Only a tag needs it (sign-release below): an unsigned APK installs nowhere,
       # so on a PR or main it would only be dead artifact storage.
@@ -480,7 +480,7 @@ jobs:
     uses: ./.github/workflows/release-version-guard.yml
 
   # Sign the release APK with the Myotis release key. The ONLY job that ever holds
-  # that key, so it is kept as small as it can be (docs/android-release-signing.md):
+  # that key, so it is kept as small as it can be (docs/guides/android-release-signing.md):
   #   - the secrets live in the `android-release` ENVIRONMENT, not the repo, and
   #     that environment's deployment rule admits v* tags only, so no PR branch,
   #     whatever workflow it carries, can read them;

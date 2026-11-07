@@ -175,7 +175,7 @@ final class RustEngineNative {
     }
 
     /**
-     * Toggle Tor verified-read routing (docs/privacy-and-tor.md). Returns true iff
+     * Toggle Tor verified-read routing (docs/how-it-works/privacy-and-tor.md). Returns true iff
      * the loaded library was built with Tor support ({@code --features tor}); a
      * Tor-less library returns false and no-ops. Process-global, not per-handle.
      */
@@ -214,7 +214,7 @@ final class RustEngineNative {
 
     /**
      * The host's word on the device's current network, for the status JSON's data
-     * usage (docs/data-usage.md): 0 unknown, 1 unmetered, 2 metered. False, and
+     * usage (docs/how-it-works/data-usage.md): 0 unknown, 1 unmetered, 2 metered. False, and
      * nothing recorded, for any other code. Process-global, not per-handle.
      */
     static boolean nativeSetNetworkMetering(int code) {
@@ -490,7 +490,7 @@ final class RustEngineNative {
         return Myotis_engineKt.addressActivityJson(handle, afterBlock);
     }
 
-    /** Read-fetch shadow-cache counters JSON (docs/read-stats.md). */
+    /** Read-fetch shadow-cache counters JSON (docs/how-it-works/read-stats.md). */
     static String nativeReadStatsJson(long handle) {
         return Myotis_engineKt.readStatsJson(handle);
     }

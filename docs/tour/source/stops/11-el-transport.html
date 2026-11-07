@@ -1,0 +1,521 @@
+<!--meta {"id":"stop-11","num":11,"title":"myotis-net, part 3: execution-layer peers","short":"net · EL transport","sub":"14 files · 9,668 lines","part":"myotis-net: all the I/O"} -->
+<header class="stop-head">
+  <div class="eyebrow">Stop 11 · crate <code>myotis-net</code>, <code>src/el/</code> <span>14 files · 9,668 lines · about 180 minutes</span></div>
+  <h1>myotis-net, part 3: execution-layer peers</h1>
+  <p class="lede">From an empty routing table to a verified snap peer that serves many requests at once: discv4 discovery with its ENR fork-id filter, EIP-1459 DNS node lists, the tokio side of RLPx and the eth handshake, the managed-peer actor, the peer cache, and the Tor reserve and transport. The pure wire codecs now live in <code>myotis-wire</code> (<a href="#stop-05">stop 5</a>); this stop is the I/O that drives them. It is where generics over <code>AsyncRead</code>, hand-written cancellation safety, and “split one value into two independently owned halves” come together.</p>
+</header>
+
+<div class="learn">
+  <h2>Rust you will practise</h2>
+  <div><b>Splitting ownership</b><code>split(self)</code> moves a connection's parts out: a reader owned by one task, a writer shared behind an async mutex.</div>
+  <div><b>Cancellation by drop</b>the <code>torn</code> flag, <code>PendingGuard</code>, <code>WalkClaim</code> and <code>StorageHold</code>: guards whose <code>Drop</code> repairs state when a future is dropped mid-await.</div>
+  <div><b>Borrows that end early</b>non-lexical lifetimes, disjoint fields and “copy out, then mutate” let a single-task actor change its own maps without locks.</div>
+</div>
+
+<section class="prose">
+  <h2>The path of one peer</h2>
+  <p>Candidates reach the peer pool (<a href="#stop-12">stop 12</a>) from four sources. <code>discv4</code> walks the UDP DHT and, since #539, asks each node for its ENR first, so <code>enrfilter</code> can drop nodes of other chains before any TCP dial. <code>dnsdisco</code> walks a network's signed DNS node list on hosts that allow DNS. <code>peercache</code> replays peers that served snap before a restart. <code>torreserve</code> holds a share of those proven peers aside for Tor only.</p>
+  <p>The pool dials a candidate with <code>RlpxConnection::dial</code>: TCP, then the EIP-8 auth/ack handshake and a stateful frame codec (the codecs are <code>myotis-wire</code>'s, <a href="#stop-05">stop 5</a>). <code>EthSession::handshake</code> exchanges Hello and Status and checks network id and genesis. The pool turns a snap-capable session into a <code>ManagedPeer</code>, and the reader, the EVM and the log index then send concurrent requests through it. Nothing a peer says is trusted until <code>myotis-wire</code>'s <code>snap/fetch.rs</code> verifies it against a trusted root. The Tor path (<code>tor.rs</code>) runs the same RLPx and eth code over an Arti stream to a node from the reserve.</p>
+  <div class="callout rust"><span class="k">What changed since September</span>
+    <p>The RLPx crypto (<code>ecies</code>, <code>handshake</code>, <code>frame</code>), the eth and snap message codecs, snap verification and the discv4 packet codec moved to <code>myotis-wire</code> (myotis#505). Their old files under <code>el/</code> are now 4-line re-export shims, covered in <a href="#stop-05">stop 5</a>. New here: the ENR fork-id filter and DNS discovery (#539), the Tor reserve, eth/70–71 and snap/2 (receipt continuations, block access lists), per-peer head tracking, close reasons, and the hedged-read send marker.</p>
+  </div>
+</section>
+
+<x-file path="rust/myotis-net/src/el/mod.rs" kind="module index" twin="networking package">
+  <p class="purpose">Declares the execution-layer submodules, twins of the Java <code>com.jaeckel.ethp2p.networking</code> package. Two children are private (<code>mod feecache;</code> and <code>mod tasks;</code>), and <code>torreserve</code> is <code>pub(crate)</code>: visible inside the crate, invisible to the engine and the hosts. <code>#[cfg(feature = "tor")] pub mod tor;</code> exists only in Tor builds: a compile-time switch, not a runtime <code>if</code>. The excerpt shows the second half of the list.</p>
+  <x-code src="myotis-net/src/el/mod.rs" from="27" to="40"></x-code>
+  <p class="code-note"><x-tags>modules-cargo</x-tags> Rust visibility is per module, not per package as in Java. <code>pub(crate)</code> is roughly Java's package-private stretched to the whole crate. Code outside the crate that names <code>el::torreserve</code> does not compile, while <code>el::pool</code> can use it freely.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/tasks.rs" kind="library">
+  <p class="purpose">Owns the peer pool's background tasks. It offers a graceful shutdown (abort, then await), a hard one (abort only), and silently refuses new spawns after shutdown. <code>spawn</code> also drops handles of finished tasks (<code>retain(|task| !task.is_finished())</code>), so the list does not grow for the life of the pool. The primer shows the whole file; the notes below add the part that concerns the pool.</p>
+  <x-code src="myotis-net/src/el/tasks.rs" from="18" to="40"></x-code>
+  <ul class="concepts">
+    <li><x-tags>interior-mutability concurrency</x-tags> The “stopped” flag and the handles share <em>one</em> lock. A concurrent <code>spawn</code> therefore either lands before <code>take</code> (and is aborted) or sees the flag (and drops its future unrun). It's Java's <code>shutdownNow()</code> + <code>awaitTermination()</code>.</li>
+    <li><x-tags>async interior-mutability</x-tags> The <code>std</code> guard lives only inside the synchronous <code>take()</code>, so <code>stop()</code> never holds it across <code>.await</code>. A held <code>std</code> guard would make the future non-<code>Send</code>.</li>
+    <li><x-tags>smart-pointers ownership</x-tags> <strong>A reference cycle.</strong> The pool's loops own <code>Arc&lt;PoolInner&gt;</code>, and <code>PoolInner</code> owns this <code>Tasks</code>. While the loops run, the count never reaches zero, so <code>Tasks::drop</code> can't fire on its own. <code>PeerPool::drop</code> calls <code>abort()</code> explicitly to break the cycle.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/discv4.rs" kind="library" twin="DiscV4Service / KademliaTable">
+  <p class="purpose">Execution-layer peer discovery over UDP: discv4, a Kademlia DHT. Like the Java reference it is client-only: it pings, sends FindNode, reads Neighbors and answers Ping with Pong, but never answers FindNode. Since #539 it departs from the Java twin twice: it pings back a node that pings it while no pong from that node is on file, and it answers ENRRequest (EIP-868) from bonded nodes. Both exist so that the fork-id filter (<a href="#f-myotis-net-src-el-enrfilter-rs">enrfilter.rs</a>) can read a node's ENR before the pool dials it. The packet codec moved to <code>myotis-wire</code> and is re-exported here (<code>pub use myotis_wire::discv4::*;</code>, line 32). The table and the rate limiter are pure (time is a parameter); only <code>Discv4Service</code> owns a socket.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–32</td><td>Docs, imports, the re-exported packet codec.</td></tr>
+      <tr><td>34–146</td><td><code>KademliaTable</code>: 256 buckets × 16, XOR distance over <code>keccak256(pubkey)</code>; <code>remove</code> and <code>get</code> are new (the filter forgets foreign nodes).</td></tr>
+      <tr><td>148–195</td><td><code>PingRateLimiter</code>: 5 packets per IP per 10 s, at most 4,096 IPs remembered (fail open beyond that).</td></tr>
+      <tr><td>197–375</td><td><code>Discv4Config</code>, the filter's <code>EnrCounts</code>, the <code>Discv4Service</code> handle: <code>start</code>, accessors, <code>stop</code>, <code>Drop</code>.</td></tr>
+      <tr><td>377–425</td><td>Socket binding: dual-stack v6 with v4 fallback, and a best-effort 1 MiB receive buffer.</td></tr>
+      <tr><td>427–513</td><td><code>ServiceLoop</code> state, pending pings, and the “wide fan-out” budget (30 instead of 10 peers per refresh, 8 refreshes per below-target episode, at most once per 30 minutes).</td></tr>
+      <tr><td>515–749</td><td>The ENR exchange: constants, <code>Bond</code>, <code>PendingEnr</code>, <code>Judgement</code> (verdict plus a TCP port per address family), <code>Seen</code>, <code>EnrExchange</code>.</td></tr>
+      <tr><td>751–806</td><td><code>ServiceLoop::run</code>: the <code>select!</code> loop.</td></tr>
+      <tr><td>808–1067</td><td>Handlers for Ping, Pong and Neighbors; <code>admit</code> and <code>consider</code> decide whether a node waits for its ENR.</td></tr>
+      <tr><td>1069–1262</td><td>ENRRequest out, ENRRequest in (bond check, rate limit), ENRResponse in (verdict), and the 1 s sweep that hands over nodes whose ENR never came.</td></tr>
+      <tr><td>1264–1444</td><td><code>forget</code>, pending-ping helpers, <code>emit</code>, <code>probe</code>, <code>refresh</code>, the send helpers.</td></tr>
+      <tr><td>1446–1513</td><td>Clock, address and sampling helpers (partial Fisher–Yates).</td></tr>
+      <tr><td>1515–2536</td><td>Tests, including two real services over loopback UDP.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The table</h4>
+  <x-code src="myotis-net/src/el/discv4.rs" from="68" to="77"></x-code>
+  <p class="code-note"><x-tags>borrowing</x-tags> <code>let bucket = &amp;mut self.buckets[idx];</code> borrows one element of the vector mutably; until its last use, nothing else may touch <code>self.buckets</code>. The closure in <code>retain</code> reads <code>entry.node_id</code>, a different value, so the two borrows don't conflict. <code>bucket.push(entry)</code> then <em>moves</em> the entry into the bucket: the caller passed it by value and no longer has it. A full bucket drops its oldest entry, the same simplification the Java table makes (no ping-before-evict).</p>
+
+  <h4>Start, stop and drop</h4>
+  <x-code src="myotis-net/src/el/discv4.rs" from="265" to="305"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership async</x-tags> <strong>Actor-style ownership.</strong> Everything the loop needs is packed into <code>ServiceLoop</code> and moved into the task (<code>tokio::spawn(loop_state.run(stop_rx))</code>). The socket, the pending maps and the ENR exchange need no locks, because only that task can reach them. Two things are shared: the routing table, as <code>Arc&lt;std::sync::Mutex&lt;KademliaTable&gt;&gt;</code> (the pool reads it), and the tallies, as <code>Arc&lt;EnrCounts&gt;</code> of atomics.</li>
+    <li><x-tags>ownership</x-tags> <code>cfg</code> is taken by value, and its fields are moved out one by one: <code>cfg.fork_filter</code> in the <code>match</code>, <code>cfg.bootnodes</code> and <code>cfg.pool_below_target</code> into the struct literal. Moving fields out of a struct is allowed when the struct has no <code>Drop</code> impl; afterwards <code>cfg</code> as a whole can no longer be used.</li>
+    <li><x-tags>error-handling</x-tags> The <code>?</code> inside the <code>Some(filter) =&gt;</code> arm returns from <code>start</code> itself when our own ENR can't be signed; a <code>match</code> arm is not a function boundary.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/discv4.rs" from="360" to="375"></x-code>
+  <ul class="concepts">
+    <li><x-tags>interior-mutability async lifetimes</x-tags> In <code>stop()</code>, the guard created in the <code>if let</code> condition lives through the body (this crate is edition 2021), which means across <code>task.await</code>. That's only allowed with an async mutex, and the lock also guarantees the task is joined exactly once, even if two callers stop concurrently through <code>&amp;self</code>.</li>
+    <li><x-tags>concurrency</x-tags> A <code>watch</code> channel works as an awaitable stop flag. <code>Drop</code> sends <code>true</code> but can't wait, so the task detaches and winds down on its own; the socket closes when the task ends.</li>
+  </ul>
+  <div class="callout watch"><span class="k">Stale or inaccurate comments</span>
+    <p>The doc on <code>Discv4Service</code> (lines 251–252) says “Dropping it does NOT stop the task; call <code>Discv4Service::stop</code>.” The <code>Drop</code> impl at lines 368–375 sends the stop signal, and even without it, dropping <code>stop_tx</code> would make <code>stop_rx.changed()</code> return an error, which the <code>_ =</code> branch in <code>run</code> also accepts. Dropping does stop the loop; it just doesn't wait for it.</p>
+  </div>
+
+  <h4>The loop</h4>
+  <x-code src="myotis-net/src/el/discv4.rs" from="752" to="806"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async borrowing</x-tags> One <code>select!</code> over five cancel-safe sources: stop, the 15 s refresh tick, the 1 s ENR sweep, probe requests, and <code>recv_from</code>. When one branch wins, the losing futures and their borrows (of <code>self.socket</code>, <code>buf</code>, <code>self.probe_rx</code>) are dropped <em>before</em> its handler runs. That is why a handler may call <code>&amp;mut self</code> methods.</li>
+    <li><x-tags>enums-patterns async</x-tags> <code>Some(addr) = self.probe_rx.recv()</code>: when all senders are gone, <code>recv()</code> yields <code>None</code>, the pattern fails, and <code>select!</code> disables that branch. There is no busy loop at shutdown.</li>
+    <li><x-tags>ownership borrowing</x-tags> <code>for bootnode in self.bootnodes.clone()</code> iterates a <em>clone</em>, so the loop doesn't hold <code>&amp;self.bootnodes</code> while calling the <code>&amp;mut self</code> method <code>send_ping</code>.</li>
+    <li><x-tags>bytes-strings ownership</x-tags> <code>buf</code> is allocated once and reused. <code>parse(&amp;buf[..n])</code> borrows only the received bytes and returns an owned <code>Parsed</code> (its <code>data</code> is a <code>Vec&lt;u8&gt;</code>), so the next <code>recv_from</code> can overwrite the buffer.</li>
+    <li><x-tags>async</x-tags> <code>MissedTickBehavior::Skip</code>: after a laptop sleep, the interval fires once instead of replaying every missed tick as a burst of FindNodes.</li>
+  </ul>
+
+  <h4>The ENR exchange</h4>
+  <p>Every sighted node (its Ping, its Pong, or an entry in someone's Neighbors) goes through <code>consider</code>. With no filter configured it is handed over at once. Otherwise the exchange looks up an earlier verdict by node id. With none on file, the node becomes a <code>PendingEnr</code>: if it holds our pong, an ENRRequest goes out now; if not, we ping first and ask once it answers. The ENRResponse is decoded and its identity checked against the packet's signer (<code>decode_enr</code>). <code>ForkFilter::verdict</code> then sorts the node: <em>Foreign</em> nodes are counted and removed from the table, <em>Compatible</em> and <em>Unknown</em> ones are emitted. Every second, <code>sweep_enr</code> hands over nodes that did not answer within 3 s: the filter fails open, and the eth Status check at the handshake stays the authority. While the pool is at its target it dials nothing, so second-hand Neighbors entries skip the exchange and are handed over unjudged.</p>
+  <p>A second thread runs through the code: the TCP port. A Neighbors entry is hearsay from a relayer. A Ping's FROM endpoint is the node's own signed claim, and its ENR is its own signed record. The exchange keeps the node's own word per address family (<code>Judgement::tcp_port: [Option&lt;u32&gt;; 2]</code>) and lets hearsay replace only a port that was itself hearsay or a guess. Port 0 means “takes no TCP connections on this family”, and the pool never dials it.</p>
+  <x-code src="myotis-net/src/el/discv4.rs" from="965" to="1008"></x-code>
+  <ul class="concepts">
+    <li><x-tags>borrowing</x-tags> <strong>Copy out, then mutate.</strong> <code>enr</code> is a <code>&amp;mut</code> into <code>self.enr</code>. The first <code>match</code> turns the borrowed lookup <code>enr.verdicts.get(...)</code> into <code>Seen</code>, an enum that holds no references (<code>Judged</code> carries a copied <code>Option&lt;u32&gt;</code>). The borrow of the map ends there, and the second <code>match</code> is free to call <code>enr.verdicts.get_mut</code> or <code>remove</code>.</li>
+    <li><x-tags>borrowing</x-tags> <strong>Non-lexical lifetimes.</strong> <code>self.forget(...)</code> and <code>self.emit(...)</code> need all of <code>self</code>, while <code>enr</code> still borrows part of it. This compiles because a borrow lasts until its <em>last use</em>, not to the end of its scope: in each arm, <code>enr</code> is used for the last time before <code>self</code> is touched. In the <code>let … else</code> at the top, the <code>else</code> branch has no <code>enr</code> at all, so it may call <code>self.emit</code> directly.</li>
+    <li><x-tags>ownership</x-tags> <code>let mut entry = entry;</code> moves the parameter into a new, mutable binding. Parameters are immutable unless declared <code>mut</code>, and rebinding is the idiom for “mutable from here on”.</li>
+  </ul>
+  <p class="code-note"><x-tags>borrowing ownership</x-tags> Two more variants of the same discipline sit nearby. <code>handle_enr_response</code> (lines 1117–1211) first borrows the pending entry (<code>let Some(pending) = enr.pending.get(&amp;sender)</code>) only to check the request hash, and later <em>shadows</em> it with the owned value <code>let Some(mut pending) = enr.pending.remove(&amp;sender)</code>. <code>sweep_enr</code> (lines 1215–1262) collects the expired keys into a <code>Vec</code> before removing them, because a map can't be mutated while it is being iterated, and collects the nodes to emit into another <code>Vec</code>, because <code>self.emit</code> needs <code>&amp;mut self</code> while <code>enr</code> is still in use.</p>
+  <x-code src="myotis-net/src/el/discv4.rs" from="1288" to="1302"></x-code>
+  <p class="code-note"><x-tags>concurrency interior-mutability</x-tags> The <code>std</code> guard (<code>table</code>) is released at the end of the <code>if let</code> body, before anything else happens. The event is then <em>offered</em> with <code>try_send</code>. Blocking on a full channel would freeze every branch of the single-task loop, including stop. Dropping an event is harmless, because the table already holds the entry.</p>
+  <p class="code-note"><x-tags>domain</x-tags> An ENRRequest is answered only from a node whose pong we verified, keyed by address <em>and</em> checked against the signing key (<code>is_bonded</code>), and only within the Ping rate limit. Otherwise a spoofed source address could make us send a signed record to a victim, an amplification attack; geth applies the same <code>checkBond</code> rule. Expired requests are ignored so a captured one can't be replayed.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/enrfilter.rs" kind="library">
+  <p class="purpose">The EIP-2124 fork-id pre-filter (#539). discv4 is one DHT for every Ethereum network, so a Neighbors reply mixes mainnet, testnets, Gnosis and others; before this file the pool learned a node's chain only after a full TCP, ECIES, Hello and Status exchange. A node's ENR carries its fork id in the <code>eth</code> entry, <code>[[fork-hash, fork-next]]</code>. <code>ForkFilter</code> accepts the pinned hash and its successor, and treats a hash that could be our chain one fork <em>ahead</em> of this build (a plausible activation time, on the beacon epoch grid) as Unknown rather than Foreign, so a stale build can still reach upgraded peers and learn of the fork. The file also decodes remote ENRs and signs our own minimal one. <code>dnsdisco.rs</code> uses the same filter for its leaves.</p>
+  <x-code src="myotis-net/src/el/enrfilter.rs" from="102" to="139"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns</x-tags> Match arms are tried in order, and guards make that order part of the logic: a hash in <code>accepted</code> is Compatible before the plausibility guard is even evaluated. The last arm, <code>Some(_)</code>, catches every parsed hash that passed neither guard.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>.map(...).any(...)</code> is lazy: <code>any</code> stops at the first <code>true</code>, so at most one activation time is computed per accepted hash. Like Java streams, nothing runs until the terminal operation pulls.</li>
+    <li><x-tags>domain</x-tags> <code>forkid::activation_of</code> finds the one timestamp <code>T</code> that turns our hash into the observed one. Another chain's hash lands on an epoch boundary inside the window only by chance, which the module doc puts at about one in 25,000 per baseline.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/enrfilter.rs" from="214" to="233"></x-code>
+  <p class="code-note"><x-tags>borrowing bytes-strings domain</x-tags> <code>Enr::decode(&amp;mut &amp;raw[..])</code> passes a <em>mutable reference to a slice</em>: <code>alloy_rlp</code>'s decoder advances the slice past what it consumed, like a read cursor. The slice is a view into <code>raw</code>; no bytes are copied until <code>&lt;[u8]&gt;::to_vec</code> copies the <code>eth</code> entry out. The signer check matters: without it, a node could answer with someone else's validly signed record.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/dnsdisco.rs" kind="library" twin="networking.dns.DnsEnrResolver">
+  <p class="purpose">EIP-1459 DNS node lists for the EL pool (#539, part 3). A network publishes its node list as a Merkle tree of DNS TXT records under a domain: a signed root (<code>enrtree-root:v1 e=… l=… seq=… sig=…</code>), branch records listing child labels, and leaves that are signed ENRs. Each label is the base32 of the first 16 bytes of the keccak of its record, so a resolver can withhold records but can't add any. The walk is bounded (lookups, depth, deadline) and its order random. <code>DnsSeeder</code> walks once when first asked, then again every 4 minutes while the pool stays below target; it keeps up to 600 candidates, hands them to the dialer in batches of 10, and nudges up to 32 UDP endpoints into discv4. DNS discovery runs only where the host switched it on, and never under Tor: the query itself tells the local resolver which network this node is on.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–50</td><td>Docs (format, trust, where it runs), imports.</td></tr>
+      <tr><td>52–92</td><td>Policy: the process-wide host switch and the Tor check.</td></tr>
+      <tr><td>94–149</td><td>RFC 4648 base32 encode/decode, <code>label_of</code>.</td></tr>
+      <tr><td>151–252</td><td><code>EnrTreeUrl::parse</code>, <code>parse_root</code> (signature recovered against the URL's key).</td></tr>
+      <tr><td>254–343</td><td><code>Entry</code> (branch, node, link), <code>DnsNode</code>, <code>parse_leaf</code>.</td></tr>
+      <tr><td>345–547</td><td>The walk: <code>TxtLookup</code>, <code>WalkLimits</code>, <code>WalkReport</code>, <code>walk</code>, <code>judge</code>, <code>shuffle</code>.</td></tr>
+      <tr><td>549–604</td><td><code>SystemResolver</code> over hickory.</td></tr>
+      <tr><td>606–879</td><td><code>DnsSeeder</code>: schedule, walk, merge, round-robin batches; <code>WalkClaim</code>; <code>merge_candidates</code>.</td></tr>
+      <tr><td>881–1461</td><td>Tests against the EIP's example zone and an in-memory resolver.</td></tr>
+    </tbody>
+  </table></div>
+  <x-code src="myotis-net/src/el/dnsdisco.rs" from="76" to="92"></x-code>
+  <p class="code-note"><x-tags>modules-cargo</x-tags> Exactly one of the two <code>#[cfg]</code> blocks survives compilation, and the survivor is the function body's value. Without the <code>tor</code> feature, <code>crate::el::tor</code> doesn't exist, and the first block is never type-checked, so its reference to the missing module is not an error. <code>allowed()</code> is read before every lookup, not only when a walk starts, so switching Tor on stops a walk in flight.</p>
+
+  <h4>Parsing without copying</h4>
+  <p><code>parse_root</code> (lines 207–252) shows several <code>&amp;str</code> tools at once. <code>rsplit_once(" sig=")</code> and <code>strip_prefix</code> return sub-slices of the input, never copies. <code>let (Some(enr_root), Some(link_root), Some(seq)) = (enr_root, link_root, seq) else { … };</code> destructures three <code>Option</code>s in one <code>let … else</code>. <code>sig.try_into()</code> converts a <code>Vec&lt;u8&gt;</code> into a <code>[u8; 65]</code> and, on a wrong length, hands the vector back as the error, which <code>map_err(|v: Vec&lt;u8&gt;| …)</code> uses to report its length. The comment at lines 215–217 explains why <code>strip_prefix</code> replaced slicing by index: a record like <code>enrtree-root:v1 sig=…</code> would make <code>&amp;signed[PREFIX.len()..]</code> panic, and a DNS zone must not be able to crash the host.</p>
+
+  <h4>An async trait you can put behind <code>dyn</code></h4>
+  <x-code src="myotis-net/src/el/dnsdisco.rs" from="349" to="359"></x-code>
+  <x-code src="myotis-net/src/el/dnsdisco.rs" from="579" to="604"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics async</x-tags> The walk takes <code>resolver: &amp;dyn TxtLookup</code>, so production and tests can pass different resolvers at run time. A trait with an <code>async fn</code> can't be used as <code>dyn</code>, because each implementation's future is a different, unnamed type. The fix is to return one concrete type for all of them: <code>Pin&lt;Box&lt;dyn Future&lt;…&gt; + Send + 'a&gt;&gt;</code>, a heap-allocated future behind a pointer. It's like a Java interface method returning <code>CompletableFuture&lt;List&lt;String&gt;&gt;</code>.</li>
+    <li><x-tags>lifetimes</x-tags> <code>'a</code> ties the future to both borrows: it may use <code>self</code> and <code>name</code> until it completes, so neither may be dropped first. <code>Box::pin(async move { … })</code> moves those two references (not the resolver) into the future.</li>
+    <li><x-tags>iterators-closures bytes-strings</x-tags> TXT strings are at most 255 bytes, so a long ENR arrives in segments. The inner <code>collect::&lt;String&gt;()</code> concatenates one record's segments; <code>String::from_utf8_lossy</code> returns a <code>Cow</code> that borrows when the bytes are valid UTF-8 and allocates only when it must replace bad bytes.</li>
+  </ul>
+
+  <h4>The walk</h4>
+  <x-code src="myotis-net/src/el/dnsdisco.rs" from="451" to="496"></x-code>
+  <p class="code-note"><x-tags>iterators-closures domain</x-tags> An explicit stack replaces recursion, which an <code>async fn</code> could not do without boxing. <code>visited</code> is the loop protection: a label resolved once is never fetched again, so a label listed by two branches costs one lookup. A label that fails the depth check is <em>not</em> marked visited, so a shorter path can still reach it. <code>find(|r| label_of(r).eq_ignore_ascii_case(&amp;label))</code> picks the one record that hashes to its own name, which is the tree's integrity check. Just after the excerpt (lines 498–503), branch children are shuffled before being pushed, so a tree larger than one walk's budget is seen in a different part each time.</p>
+
+  <h4>Claiming a walk</h4>
+  <x-code src="myotis-net/src/el/dnsdisco.rs" from="722" to="745"></x-code>
+  <ul class="concepts">
+    <li><x-tags>lifetimes borrowing</x-tags> <strong>Borrowing from one of two owners.</strong> <code>resolver</code> borrows either the caller's <code>Arc</code> (the <code>Fixed</code> arm) or a freshly built <code>SystemResolver</code>. <code>let system;</code> is declared <em>before</em> the <code>match</code>, and assigned inside the arm, so the value lives until the function returns. Declared inside the arm, it would be dropped at the arm's end while <code>resolver</code> still pointed at it, and the code would not compile.</li>
+    <li><x-tags>smart-pointers traits-generics</x-tags> <code>r.as_ref()</code> turns <code>&amp;Arc&lt;dyn TxtLookup&gt;</code> into <code>&amp;dyn TxtLookup</code> without touching the reference count.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/dnsdisco.rs" from="844" to="855"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async ownership</x-tags> <strong>Cancellation by drop.</strong> <code>begin_walk_if_due</code> sets <code>walking</code>; <code>WalkClaim</code>'s <code>Drop</code> clears it. Because <code>walk_once</code> binds the guard (<code>let _claim = WalkClaim(self);</code>), the flag is cleared whether the walk returns, its future is dropped by the pool stopping, or it unwinds. Rust has no <code>finally</code>; a value's destructor is the equivalent, and it also runs on cancellation, which Java's <code>finally</code> has no notion of.</li>
+    <li><x-tags>ownership</x-tags> The name matters. <code>let _claim = …</code> keeps the guard until the end of the scope. <code>let _ = …</code> would drop it immediately, releasing the claim before the walk even started.</li>
+    <li><x-tags>lifetimes</x-tags> <code>WalkClaim&lt;'a&gt;(&amp;'a DnsSeeder)</code> borrows the seeder, so the compiler proves the guard can't outlive it. <code>impl Drop for WalkClaim&lt;'_&gt;</code> uses the anonymous lifetime: “for any lifetime”.</li>
+  </ul>
+  <p class="code-note"><x-tags>ownership interior-mutability</x-tags> Elsewhere in the seeder: <code>merge</code> calls <code>std::mem::take(&amp;mut st.pool)</code> to move the vector out of the mutex guard (leaving an empty one), passes it by value to the pure <code>merge_candidates</code>, and stores the result back. <code>take_batch</code> indexes <code>st.pool[(start + i) % len]</code> without <code>.clone()</code>, because an <code>Enode</code> is <code>(SocketAddr, [u8; 64])</code>, which is <code>Copy</code>. <code>forbidden = || !(self.policy)()</code> needs the parentheses: <code>policy</code> is a boxed closure stored in a field, and <code>self.policy()</code> would look for a method of that name.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/rlpx/mod.rs" kind="module index" twin="networking.rlpx">
+  <p class="purpose">Index of the RLPx transport: <code>ecies</code>, <code>handshake</code>, <code>frame</code> and <code>transport</code>. Only the initiator side exists. The first three are now 4-line shims that re-export <code>myotis-wire</code>'s codecs at their old paths (<a href="#f-myotis-wire-src-rlpx-frame-rs">frame</a>, <a href="#f-myotis-wire-src-rlpx-handshake-rs">handshake</a>, <a href="#stop-05">stop 5</a>), so code in this crate still writes <code>crate::el::rlpx::frame::FrameCodec</code>. Only <code>transport</code> does I/O.</p>
+  <div class="callout watch"><span class="k">Stale or inaccurate comments</span>
+    <p>The module doc (lines 4–12) still describes <code>ecies</code>, <code>handshake</code> and <code>frame</code> as this crate's pure codecs pinned by <code>rust/testdata/el/rlpx/</code>, and <code>transport.rs</code> (lines 5–7) says “the crypto lives in the pure <code>super::ecies</code>/<code>handshake</code>/<code>frame</code> modules”. Since myotis#505 those modules are re-exports; the code lives in <code>myotis-wire/src/rlpx/</code>.</p>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/rlpx/transport.rs" kind="library" twin="RLPxConnector / RLPxHandler">
+  <p class="purpose">The only RLPx code that does I/O and draws OS entropy: dial TCP, run the initiator handshake to FRAMED (10 s budget), and send or receive framed p2p messages with timeouts. Hello's codec moved to <code>myotis-wire</code> and is re-exported here (lines 25–28). <code>pub struct RlpxConnection&lt;S = TcpStream&gt;</code> (lines 55–63) holds the stream, the stateful <code>FrameCodec</code>, the peer's public key and an optional traffic meter. It is generic over its byte stream, so the same code runs over a Tor <code>DataStream</code>; a TCP connection can additionally be split into an independently owned reader and writer.</p>
+  <x-code src="myotis-net/src/el/rlpx/transport.rs" from="104" to="116"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics</x-tags> <code>RlpxConnection&lt;S = TcpStream&gt;</code> has a <strong>default type parameter</strong>: a plain <code>RlpxConnection</code> means the TCP type, so no caller had to change when Tor arrived. Java generics have no defaults.</li>
+    <li><x-tags>traits-generics</x-tags> This method sits in <code>impl RlpxConnection&lt;TcpStream&gt;</code>, together with <code>dial</code>, so it exists <em>only</em> for the TCP instantiation: only <code>TcpStream</code> has <code>into_split</code>. Erased Java generics can't express this; the closest analogue is a Kotlin extension function on <code>RlpxConnection&lt;TcpStream&gt;</code>.</li>
+    <li><x-tags>ownership smart-pointers</x-tags> <code>split(self)</code> consumes the connection and moves its fields out one by one, which is allowed because <code>RlpxConnection</code> has no <code>Drop</code> impl. The read half goes with the ingress decoder, the write half with the egress encoder. The traffic meter is cloned for the reader and moved into the writer; the 64-byte key is <code>Copy</code>. Each socket half holds an internal <code>Arc</code> of the socket, which closes when both halves are dropped.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/rlpx/transport.rs" from="136" to="185"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics async</x-tags> The surrounding <code>impl&lt;S: AsyncReadExt + AsyncWriteExt + Unpin&gt;</code>: tokio implements the <code>…Ext</code> traits for every async byte stream, so this bound means “any async stream” and brings <code>read_exact</code>, <code>write_all</code> and <code>flush</code> into scope. The code is compiled separately for each concrete <code>S</code> (monomorphization).</li>
+    <li><x-tags>borrowing lifetimes</x-tags> <code>Initiator::new(&amp;local_key, …)</code>: <code>local_key</code> is an <code>Arc&lt;NodeKey&gt;</code>, and <code>&amp;Arc&lt;NodeKey&gt;</code> deref-coerces to the <code>&amp;'a NodeKey</code> that <code>Initiator&lt;'a&gt;</code> stores. The initiator's borrow lives across several <code>.await</code>s, which is fine because the <code>Arc</code> and the borrow live inside the same future.</li>
+    <li><x-tags>ownership</x-tags> <code>mut stream: S</code> is owned by the function. <code>read_ack(&amp;mut stream)</code> lends it out for one call, and the final struct literal moves it into the returned connection.</li>
+    <li><x-tags>domain</x-tags> <code>flush()</code> before reading the ack is needed for Tor: Arti's <code>DataStream</code> buffers output, and without the flush the peer never sees the auth message.</li>
+  </ul>
+  <p class="code-note"><x-tags>async error-handling</x-tags> <code>write_frame</code> (lines 278–291) bounds every frame write by 30 s, so a peer that stops reading can't block the shared writer forever. Its <code>timeout(…, async { … }).await</code> yields a nested <code>Result</code>: the first <code>map_err</code>/<code>?</code> handles the expired timer, the second the I/O error. A timed-out write leaves the egress MAC advanced mid-frame, so it is fatal for the connection, as the comment at lines 278–280 says. <code>recv</code> waits for a frame header without limit (an idle peer is normal) but gives the body 30 s once the header has arrived. The <code>#[cfg(test)] impl</code> at lines 239–256 adds <code>from_secrets</code>, a constructor that exists only in test builds and skips the ECIES handshake.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/eth/mod.rs" kind="module index">
+  <p class="purpose">Index of eth/66–71: <code>messages</code> is a re-export shim of <a href="#f-myotis-wire-src-eth-rs">myotis-wire's eth codecs</a> (<a href="#stop-05">stop 5</a>), and <code>session</code> is the handshake and one-request-at-a-time correlation, twin of the Java <code>EthHandler</code>.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/eth/session.rs" kind="library" twin="EthHandler">
+  <p class="purpose">An eth session on one <code>RlpxConnection&lt;S&gt;</code>. <code>handshake</code> (capped at 30 s) sends our Hello, reads the peer's, picks the highest common eth version (66–71) and snap version (1 or 2), sends our Status in that version's format with the fork id in effect now, reads the peer's Status while answering Pings, and rejects the peer unless network id and genesis match. Afterwards it serves requests one at a time: headers, bodies, proof-verified snap reads, header-chain verdicts, and a transaction push confirmed by a Ping/Pong round trip. <code>into_parts</code> hands the connection to the concurrent <code>ManagedPeer</code>; the Tor path keeps using the session directly.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–67</td><td>Docs, versions, <code>EthConfig</code> and <code>fork_id_at</code>.</td></tr>
+      <tr><td>69–222</td><td><code>EthSession&lt;S&gt;</code>, <code>handshake</code>, <code>handshake_as</code> (the Tor path's client id).</td></tr>
+      <tr><td>224–367</td><td>Request ids, header and body requests, <code>await_response</code>, <code>send_transaction</code>, <code>await_pong</code>, <code>into_parts</code>.</td></tr>
+      <tr><td>369–544</td><td>snap reads and verdicts (single-shot twins of the <code>ManagedPeer</code> methods).</td></tr>
+      <tr><td>546–618</td><td><code>negotiate</code>, <code>recv_answering_ping</code>, Disconnect formatting.</td></tr>
+      <tr><td>620–931</td><td>Tests against a scripted peer over an in-memory stream.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The handshake body is <code>let fut = async { … };</code> (line 114) followed by <code>tokio::time::timeout(Duration::from_secs(30), fut)</code> (line 219). The first line only <em>creates</em> the future; it runs when <code>timeout</code> polls it. A <code>?</code> inside makes the <em>block</em>, not <code>handshake_as</code>, return <code>Err</code>, and the outer <code>.map_err(…)?</code> turns an expired timer into one more error. The block captures <code>conn</code> by value, because <code>conn</code> is moved into the <code>EthSession</code> it builds; <code>cfg</code> and <code>local_pubkey</code> are only read, so they are captured by reference.</p>
+  <x-code src="myotis-net/src/el/eth/session.rs" from="188" to="222"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns error-handling</x-tags> The <code>match</code> on the first non-Ping frame is the Status gate. A matched <code>STATUS</code> arm evaluates to the decoded status; the other two arms <code>return</code> early, so their type is <code>!</code> (“never”) and fits any arm type. Any other frame fails the handshake instead of being skipped, as geth's <code>readStatusMsg</code> does.</li>
+    <li><x-tags>error-handling</x-tags> The error strings are load-bearing: the pool blacklists a peer on the prefixes <code>"peer Status decode"</code> and <code>"incompatible peer"</code> and classifies a busy peer by <code>status_disconnect_error</code>'s text. Tests in this file pin the prefixes so a rewording breaks a test rather than the classification.</li>
+    <li><x-tags>borrowing interior-mutability</x-tags> <code>next_request_id: u64</code> is a plain counter, because request methods take <code>&amp;mut self</code>, which already guarantees exclusive access. <code>ManagedPeer</code>'s methods take <code>&amp;self</code>, so it needs an <code>AtomicU64</code>.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/eth/session.rs" from="546" to="578"></x-code>
+  <ul class="concepts">
+    <li><x-tags>iterators-closures enums-patterns</x-tags> <code>best.map_or(cap.version, |b| b.max(cap.version))</code>: “the version if nothing is set yet, otherwise the larger of the two”. A <code>Some</code> wrapped around it keeps the running maximum in an <code>Option</code>, so “no common version” stays <code>None</code>.</li>
+    <li><x-tags>ownership borrowing</x-tags> <code>recv_answering_ping</code> uses one <code>&amp;mut</code> borrow for both <code>recv</code> and <code>send</code>, so reading and writing can never overlap. That's the one-request-at-a-time limitation <code>peer.rs</code> removes.</li>
+  </ul>
+  <div class="callout watch">
+    <span class="k">Gotcha: a timeout in the middle of a frame</span>
+    <p><code>await_response</code> (lines 293–316) wraps <code>recv_answering_ping</code> in <code>timeout(remaining, …)</code>. A timeout can cancel <code>read_exact</code> in the middle of a frame, and tokio documents <code>read_exact</code> as not cancel-safe. <code>EthSession</code> has no torn-state marker, so after such a timeout the session is out of step with the stream and must not be reused. The Tor read builds a new session for each candidate attempt and drops it when the attempt ends (<code>reader.rs</code>, around line 6410).</p>
+  </div>
+  <div class="callout watch"><span class="k">Stale or inaccurate comments</span>
+    <p>The eth/69 Status comment (lines 138–146) says “unlike Java we embed no genesis header RLP, so a genesis probe still gets an empty answer”. <code>EthConfig::genesis_header_rlp</code> (lines 53–55) now carries it, the reader sets it on mainnet, and the pool seeds its served-headers window with it (<code>pool.rs</code>, around line 1577). On mainnet a genesis probe is answered; on other networks the comment still holds.</p>
+  </div>
+  <h4>Testing over an in-memory stream</h4>
+  <x-code src="myotis-net/src/el/eth/session.rs" from="718" to="759"></x-code>
+  <ul class="concepts">
+    <li><x-tags>testing traits-generics</x-tags> <code>tokio::io::duplex</code> returns two connected in-memory streams. Because <code>RlpxConnection&lt;S&gt;</code> and <code>EthSession&lt;S&gt;</code> accept any async stream, the test runs the real handshake with <code>S = DuplexStream</code>: no sockets, no ECIES, but every frame really encrypted and MAC'd.</li>
+    <li><x-tags>async ownership testing</x-tags> <code>tokio::spawn(async move { … })</code> moves <code>peer</code> and <code>script</code> into the scripted peer's task. The peer loops until our side hangs up, and the comment names the trigger: <code>into_parts</code> hands back <code>_conn</code>, which is dropped at the end of the closure, closing our end of the duplex.</li>
+    <li><x-tags>testing async</x-tags> The tests run under <code>#[tokio::test(start_paused = true)]</code>: tokio's clock is virtual and jumps ahead whenever every task is idle, so a test that leaves the handshake waiting hits its 30 s timeout instantly instead of stalling the suite.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/snap/mod.rs" kind="module index">
+  <p class="purpose">Index of snap/1 and snap/2: <code>messages</code> and <code>fetch</code> are re-export shims of <a href="#f-myotis-wire-src-snap-messages-rs">myotis-wire's snap codecs</a> and <a href="#f-myotis-wire-src-snap-fetch-rs">verification</a> (<a href="#stop-05">stop 5</a>). snap shares the eth peer's RLPx connection, and the two protocols are told apart by message code; the first snap code is <code>0x21</code>, <code>0x22</code> or <code>0x24</code> depending on the eth version. The request methods are on <code>EthSession</code> and <code>ManagedPeer</code>.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/peer.rs" kind="library" twin="EthHandler (always-listening channel)">
+  <p class="purpose">The managed-peer actor. A handshaken session is split into a reader, owned by a background task, and a writer shared behind a lock. Many requests can be in flight at once, each matched to its response by <code>(reqId, code)</code> through a map of oneshot channels. Besides delivering responses, the read loop answers Ping, serves GetBlockHeaders from the pool's shared window, answers other Get* requests with empty responses, records the peer's announced head (eth/69 BlockRangeUpdate), reports gossip sightings of our own transactions, and fails every waiter on disconnect, recording why. Much of the file defends against async cancellation. Since September it gained eth/70 receipt continuations, eth/71 and snap/2 block access lists, the per-peer head judgement (<code>KnownHead</code>, <code>Coverage</code>), close reasons and the hedged-read send marker.</p>
+
+  <figure class="diagram">
+    <div class="svg-wrap">
+    <svg class="wide-diagram" viewBox="0 0 940 340" role="img" fill="currentColor" xmlns="http://www.w3.org/2000/svg"
+         aria-label="Managed peer. split(self) turns an RlpxConnection into an RlpxReader, moved into the read-loop task as its sole owner, and an RlpxWriter placed inside an Arc tokio Mutex GuardedWriter with a torn flag, shared by request callers and by the read loop for Pong and serving. Request callers insert id and oneshot sender into the shared pending map; the read loop removes the entry for a matching response and sends the payload through the oneshot.">
+      <defs>
+        <marker id="m-stop-11-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+      <rect x="20" y="100" width="210" height="112" rx="10" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+      <text x="34" y="124" font-size="12.5" font-weight="700" class="mono">RlpxConnection</text>
+      <g font-size="11.5" class="mono" style="fill:var(--ink-2)">
+        <text x="34" y="148">stream: TcpStream</text>
+        <text x="34" y="168">codec: FrameCodec</text>
+        <text x="34" y="188">peer_pubkey, traffic</text>
+      </g>
+      <line x1="230" y1="156" x2="290" y2="156" stroke="currentColor" stroke-width="1.4"/>
+      <text x="260" y="146" text-anchor="middle" font-size="10.5" class="mono">split(self)</text>
+      <path d="M290 156 V64 H317" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop-11-arrow)"/>
+      <path d="M290 156 V236 H317" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop-11-arrow)"/>
+
+      <rect x="320" y="24" width="240" height="80" rx="10" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+      <text x="334" y="48" font-size="12.5" font-weight="700" class="mono">RlpxReader</text>
+      <text x="334" y="68" font-size="11" class="mono" style="fill:var(--ink-2)">read_half + FrameDecoder</text>
+      <text x="334" y="88" font-size="10.5" style="fill:var(--ink-3)">moved into the task: sole owner</text>
+
+      <rect x="320" y="176" width="240" height="118" rx="10" stroke-width="1.6" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="334" y="198" font-size="11" class="mono" style="fill:var(--oxide-ink)">Arc&lt;tokio::Mutex&lt;…&gt;&gt;</text>
+      <text x="334" y="220" font-size="12.5" font-weight="700" class="mono">GuardedWriter</text>
+      <text x="334" y="240" font-size="11" class="mono" style="fill:var(--ink-2)">inner: Option&lt;RlpxWriter&gt;</text>
+      <text x="334" y="258" font-size="11" class="mono" style="fill:var(--ink-2)">torn: bool</text>
+      <text x="334" y="280" font-size="10.5" style="fill:var(--ink-3)">write_half + FrameEncoder</text>
+
+      <rect x="660" y="24" width="260" height="80" rx="10" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+      <text x="674" y="48" font-size="12.5" font-weight="700">read_loop task</text>
+      <text x="674" y="68" font-size="11" style="fill:var(--ink-2)">Ping → Pong · answer Get*</text>
+      <text x="674" y="86" font-size="11" style="fill:var(--ink-2)">deliver (id, code) · fail_all on exit</text>
+
+      <rect x="660" y="140" width="222" height="70" rx="10" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+      <text x="674" y="164" font-size="12.5" font-weight="700">request callers (&amp;self)</text>
+      <text x="674" y="184" font-size="11" style="fill:var(--ink-2)">pool · reader · EVM · log index</text>
+      <text x="674" y="200" font-size="11" class="mono" style="fill:var(--ink-2)">Arc&lt;ManagedPeer&gt;</text>
+
+      <rect x="660" y="248" width="260" height="76" rx="10" stroke-width="1.6" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="674" y="270" font-size="11" class="mono" style="fill:var(--oxide-ink)">Arc&lt;tokio::Mutex&lt;HashMap&gt;&gt;</text>
+      <text x="674" y="290" font-size="12.5" font-weight="700" class="mono">PendingMap</text>
+      <text x="674" y="310" font-size="11" class="mono" style="fill:var(--ink-2)">id → Pending { want_code, tx }</text>
+
+      <line x1="560" y1="64" x2="657" y2="64" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop-11-arrow)"/>
+      <text x="608" y="56" text-anchor="middle" font-size="10.5">recv()</text>
+      <path d="M700 104 V122 H600 V190 H563" fill="none" stroke-width="1.4" style="stroke:var(--oxide)" marker-end="url(#m-stop-11-arrow)"/>
+      <text x="606" y="118" font-size="10.5" style="fill:var(--oxide-ink)">Pong / serve</text>
+      <line x1="660" y1="200" x2="563" y2="220" stroke-width="1.4" style="stroke:var(--oxide)" marker-end="url(#m-stop-11-arrow)"/>
+      <text x="612" y="224" text-anchor="middle" font-size="10.5" style="fill:var(--oxide-ink)">lock().await</text>
+      <line x1="760" y1="210" x2="760" y2="245" stroke-width="1.4" style="stroke:var(--oxide)" marker-end="url(#m-stop-11-arrow)"/>
+      <text x="768" y="232" font-size="10.5" style="fill:var(--oxide-ink)">insert(id, tx)</text>
+      <line x1="902" y1="104" x2="902" y2="245" stroke-width="1.6" style="stroke:var(--ok)" marker-end="url(#m-stop-11-arrow)"/>
+      <text x="0" y="0" font-size="10.5" text-anchor="middle" transform="translate(918 176) rotate(-90)" style="fill:var(--ok)">remove → tx.send</text>
+    </svg>
+    </div>
+    <figcaption>After <code>split</code>, reading has one owner and needs no lock, while writing is shared and serialized by an async mutex. Responses find their waiter through the shared pending map. Oxide arrows lock a shared structure; the green edge is the read loop delivering a response. Not drawn: three small <code>std::sync::Mutex</code> cells the loop and the callers share (the known head, the last-response time, the close reason) and the <code>closed</code> atomic.</figcaption>
+  </figure>
+
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–61</td><td>Docs, imports, <code>REQUEST_TIMEOUT</code>, the pending map types.</td></tr>
+      <tr><td>63–126</td><td><code>GuardedWriter</code>, the task-local send marker, <code>send_frame</code>.</td></tr>
+      <tr><td>128–172</td><td><code>deliver</code>, <code>PendingGuard</code>.</td></tr>
+      <tr><td>174–297</td><td>Pure head policy: <code>HeadSource</code>, <code>KnownHead</code>, <code>Coverage</code>, <code>coverage</code>, <code>refusing_lag</code>, <code>AnchorSource</code>.</td></tr>
+      <tr><td>299–345</td><td>The <code>ManagedPeer</code> struct.</td></tr>
+      <tr><td>347–515</td><td><code>close</code>, the spawn paths (<code>from_connection</code> splits and spawns the loop), accessors.</td></tr>
+      <tr><td>517–628</td><td><code>request</code>, BlockRangeUpdate and transaction sends.</td></tr>
+      <tr><td>630–870</td><td>eth requests: headers (only requested headers enter the shared serve window), bodies, receipts with eth/70 continuations, block access lists.</td></tr>
+      <tr><td>872–1015</td><td>snap reads, verified against the trusted root by <code>myotis-wire</code>'s <code>fetch</code>.</td></tr>
+      <tr><td>1017–1098</td><td>Header-chain verdicts.</td></tr>
+      <tr><td>1100–1265</td><td><code>Drop</code> and <code>read_loop</code>.</td></tr>
+      <tr><td>1267–1422</td><td>eth/70 and BAL helpers, <code>empty_answer</code>, <code>fail_all</code>, <code>set_close_reason</code>, <code>serve_headers</code>.</td></tr>
+      <tr><td>1424–1695</td><td>Tests.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The writer and its torn marker</h4>
+  <x-code src="myotis-net/src/el/peer.rs" from="63" to="75"></x-code>
+  <x-code src="myotis-net/src/el/peer.rs" from="107" to="126"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async</x-tags> <strong>Cancellation safety by hand.</strong> <code>torn</code> is set <em>before</em> the write's <code>.await</code>. If the caller's future is dropped mid-write (<code>write_all</code> is not cancel-safe), nothing after the <code>.await</code> runs, the flag stays set, and the next lock holder refuses the stream instead of writing after a partial frame with an already-advanced MAC.</li>
+    <li><x-tags>async error-handling</x-tags> <strong>New since September:</strong> <code>w.torn = result.is_err();</code>. A send that <em>completed</em> with an error leaves the stream just as corrupt as a cancelled one, so the marker stays set for it too, and a request already queued on the lock can't write after it.</li>
+    <li><x-tags>interior-mutability async</x-tags> The guard <code>w</code> is a <code>tokio::sync::MutexGuard</code>, held across <code>writer.send(…).await</code>. That is the point of an async mutex: one frame at a time on the wire. A <code>std</code> guard held across an <code>.await</code> would block the executor thread and make the future non-<code>Send</code>.</li>
+    <li><x-tags>enums-patterns</x-tags> <code>inner: Option&lt;RlpxWriter&gt;</code>: <code>close()</code> takes the writer out, which drops it and closes the write half; later sends see <code>None</code> and fail with “peer writer closed”.</li>
+  </ul>
+
+  <h4>A task-local mark for hedged reads</h4>
+  <x-code src="myotis-net/src/el/peer.rs" from="77" to="105"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async macros</x-tags> <code>tokio::task_local!</code> declares a value that is visible only to code polled inside a <code>scope</code>. <code>REQUEST_SENT.scope(sent, fut)</code> wraps <code>fut</code> so that anything it calls, however deep, can reach the value without it being passed as a parameter. Java's <code>ThreadLocal</code> is the closest analogue, but it would be wrong here: a tokio task can move between threads at every <code>.await</code>, and several tasks share a thread.</li>
+    <li><x-tags>smart-pointers interior-mutability</x-tags> The caller keeps one <code>Arc</code> clone, the scoped future gets the other. <code>std::sync::OnceLock</code> accepts only the first <code>set</code>, so the mark records the <em>first</em> request frame an attempt wrote. <code>try_with</code> returns an error outside a scope, which <code>let _ =</code> ignores: <code>mark_request_sent()</code> is a no-op for requests that are not part of a hedged read.</li>
+    <li><x-tags>domain</x-tags> Why it exists: every request first waits for the shared writer, which a large served response or a stuck write can hold for up to 30 s. The hedged race in <code>reader.rs</code> and <code>evm.rs</code> judges a slow peer from the moment its request actually left, not from when the attempt was created.</li>
+  </ul>
+
+  <h4>The guard that cleans up a cancelled request</h4>
+  <x-code src="myotis-net/src/el/peer.rs" from="145" to="172"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership async</x-tags> <code>PendingGuard</code> lives on the stack of the <code>request</code> future. If that future is dropped at any <code>.await</code>, the guard is dropped with it, and its <code>Drop</code> removes the orphaned map entry. Every path that completes normally sets <code>armed = false</code> first, because there the entry is already gone.</li>
+    <li><x-tags>async smart-pointers</x-tags> <code>Drop::drop</code> is synchronous and can't <code>.await</code> the async mutex, so it spawns a tiny task that can. It clones the <code>Arc</code> and copies the id into an <code>async move</code> block, because the spawned task must own everything it uses (<code>'static</code>). <code>Handle::try_current()</code> fails during runtime shutdown, when the whole map is being dropped anyway.</li>
+  </ul>
+  <p class="code-note"><x-tags>concurrency</x-tags> <code>deliver</code> (lines 128–143) is the other side: the read loop removes the entry only if it expects this <code>code</code>, sends the payload through the oneshot, and stamps <code>last_response</code> only when the send succeeded. A late answer to a cancelled request can beat its guard's spawned removal, and a frame nobody receives must not count as proof that the peer is responsive.</p>
+
+  <h4>Splitting and spawning</h4>
+  <x-code src="myotis-net/src/el/peer.rs" from="411" to="444"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership smart-pointers</x-tags> After <code>conn.split()</code>, the <code>RlpxReader</code> is <em>moved</em> into the task, so it has a sole owner and needs no lock. The <code>RlpxWriter</code> goes into <code>Arc&lt;tokio::Mutex&lt;…&gt;&gt;</code>, shared by callers and the loop. <code>Arc::clone</code> gives the task its own handle to the writer, the pending map, the closed flag and the three small cells. <code>snap_codes</code> is <code>Copy</code> (it is used again in the struct), <code>serve</code> is cloned because the struct keeps it too, and <code>tx_watch</code> and <code>anchor</code> simply move.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>peer_status.latest_block.map(|number| KnownHead { … })</code>: an eth/69 Status carries the peer's head, eth/68 doesn't, so the cell starts as <code>Some</code> or <code>None</code> without an <code>if</code>.</li>
+    <li><x-tags>interior-mutability concurrency</x-tags> Mutexes and atomics let an <code>Arc&lt;ManagedPeer&gt;</code> serve concurrent callers through <code>&amp;self</code>. <code>Send</code> and <code>Sync</code> follow automatically from the field types; nothing in the file implements them by hand.</li>
+  </ul>
+
+  <h4>One request</h4>
+  <x-code src="myotis-net/src/el/peer.rs" from="520" to="558"></x-code>
+  <ul class="concepts">
+    <li><x-tags>concurrency interior-mutability</x-tags> <strong>Check and insert under one lock.</strong> <code>fail_all</code> sets <code>closed</code> while holding the <em>same</em> pending lock. So a request either inserts before the drain (and receives its <code>Err</code>) or sees <code>closed</code> and bails. It can never hang on a dead connection.</li>
+    <li><x-tags>async smart-pointers</x-tags> No <code>.await</code> lies between the insert and arming <code>PendingGuard</code>: the block's guard is dropped at its <code>}</code>, and the next statement arms the guard. If the future is dropped at any later <code>.await</code>, the guard removes the entry.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>encode: impl FnOnce(u64) -&gt; Vec&lt;u8&gt;</code> builds the body once the id is known: a <code>LongFunction&lt;byte[]&gt;</code> that runs exactly once. Callers pass closures that borrow their own arguments, such as <code>|id| messages::encode_get_block_bodies(id, hashes)</code>.</li>
+  </ul>
+  <p class="code-note"><x-tags>error-handling async</x-tags> The rest of <code>request</code> (lines 560–597) has three outcomes after <code>timeout(REQUEST_TIMEOUT, rx)</code>: <code>Ok(Ok(result))</code> means the response arrived; <code>Ok(Err(_))</code> means the sender was dropped because a disconnect drained the map; <code>Err(_)</code> means we gave up, so the stale entry is removed. It's Java's <code>future.get(15, SECONDS)</code>, with each outcome spelled out. A <code>timeout_streak</code> atomic makes only the first timeout of a silent streak a WARN line naming the peer.</p>
+
+  <h4>The read loop</h4>
+  <p><code>read_loop</code> (line 1111) takes <code>mut reader: RlpxReader</code> by value: the task owns the reader outright. It loops on <code>reader.recv().await</code> and classifies each frame: transaction gossip, BlockRangeUpdate (only on eth/69 and later, where code <code>0x21</code> is free; on eth/68 it is the snap base), Ping, Disconnect, served headers, empty answers, and finally responses.</p>
+  <x-code src="myotis-net/src/el/peer.rs" from="1143" to="1173"></x-code>
+  <p class="code-note"><x-tags>interior-mutability async</x-tags> The sent-transaction watch is a <code>std</code> mutex (<code>SharedSentTxWatch</code>). Each guard lives inside its own block expression (<code>let (watching, unseen) = { let mut w = watch.lock().unwrap(); … };</code>) and dies at the block's <code>}</code>, so the hash decoding between the two blocks runs unlocked, and no guard spans an <code>.await</code>. Otherwise the future wouldn't be <code>Send</code>, and <code>tokio::spawn(read_loop(…))</code> wouldn't compile.</p>
+  <x-code src="myotis-net/src/el/peer.rs" from="1241" to="1265"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns iterators-closures</x-tags> <code>request_id.and_then(|id| empty_answer(code, &amp;snap_codes, id, eth_version))</code> chains two <code>Option</code>s: no request id, or not a Get* code, both end in <code>None</code>. The answer echoes the request's id, so the asking peer can match it.</li>
+    <li><x-tags>ownership</x-tags> <code>deliver(…, frame.payload)</code> moves the payload <code>Vec</code> out of the frame and on through the oneshot to the waiting request. The bytes are never copied between socket and caller.</li>
+    <li><x-tags>concurrency</x-tags> The lines after the loop are a backstop: every <code>break</code> already went through <code>fail_all</code>, but any future exit path still leaves the peer marked closed, with a reason.</li>
+  </ul>
+
+  <h4>Closing, from either side</h4>
+  <x-code src="myotis-net/src/el/peer.rs" from="1376" to="1398"></x-code>
+  <p class="code-note"><x-tags>interior-mutability concurrency</x-tags> The reason is written before the flag, so a caller that sees <code>closed</code> and then asks why always finds an answer. <code>set_close_reason</code> keeps the first reason: a write failure that follows the remote's Disconnect must not overwrite it (#539). <code>map.drain()</code> moves every <code>Pending</code> out of the map, and <code>entry.tx.send(…)</code> consumes each sender; <code>let _ =</code> ignores a requester who already gave up.</p>
+  <x-code src="myotis-net/src/el/peer.rs" from="347" to="358"></x-code>
+  <x-code src="myotis-net/src/el/peer.rs" from="1100" to="1105"></x-code>
+  <p class="code-note"><x-tags>interior-mutability smart-pointers</x-tags> In <code>close</code>, the <code>std</code> guard created in <code>let task = … .take();</code> dies at the <code>;</code>, before <code>task.await</code>. In <code>Drop</code>, <code>get_mut()</code> needs no locking at all: <code>&amp;mut self</code> already proves exclusive access, and the mutex just hands out its contents. <code>close()</code> stores with <code>Ordering::Release</code> while the rest of the file uses <code>SeqCst</code>. That is valid, just inconsistent. <code>Drop</code> only aborts the task: when the last <code>Arc&lt;ManagedPeer&gt;</code> goes, the reader is dropped with the task and the writer with the struct.</p>
+
+  <p class="code-note"><x-tags>enums-patterns domain</x-tags> <code>Coverage</code> (lines 216–231) derives <code>PartialOrd</code> and <code>Ord</code>. For an enum, the derived order is the declaration order, so <code>Covers &lt; Near &lt; Unknown &lt; Behind</code>, and the pool sorts peers for its read ladder by that order. The judgement compares the peer's head with <em>our</em> anchored head as observed at the same moment (<code>KnownHead::anchored_then</code>), so it doesn't go stale as the observation ages; an observation older than five minutes simply counts as Unknown.</p>
+  <p class="code-note"><x-tags>domain</x-tags> Two defenses in the eth requests are worth knowing. Headers a peer returns enter the pool's serve window only if they are the ones we asked for (by number range, or by hash): a hostile peer could otherwise pin the window at fabricated far-future numbers (lines 650–665). Block access lists are kept only when their keccak matches the commitment in the header, and a mismatch is reported as <code>forged</code> (<code>verified_bal_entries</code>, lines 1309–1320).</p>
+  <div class="callout watch"><span class="k">Stale or inaccurate comments</span>
+    <p>The module doc's frame list (lines 13–14) says an inbound Get* request gets an empty response because “the wallet serves no chain data”. The read loop first serves GetBlockHeaders from the pool's shared window (lines 1223–1234), and only unservable requests get the empty answer. The field doc on <code>eth_version</code> (line 323) says “66-69”; the session negotiates up to eth/71.</p>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/peercache.rs" kind="library" twin="PeerCache / FilePeerCache">
+  <p class="purpose">Persists execution-layer peers that reached a READY session, so a restart dials proven snap servers first. It reads and writes the Java engine's <code>peers[-net].cache</code> file in the same tab-separated format. On top of the snap-capability flag it keeps learned verdicts: serving quality (3 failures in a row → DENIED, any serve → CONFIRMED), reachability (5 failed connects → reported DENIED, 50 → removed), and a Rust-only <code>bal</code> token for peers that served a verified block access list. Keys are canonical, so a node seen as <code>::ffff:a.b.c.d</code> and as <code>a.b.c.d</code> holds one entry. The Tor reserve takes peers out of this cache and gives them back (<code>remove</code>, <code>restore</code>).</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–50</td><td>Docs: record format, canonical keys, capability versus quality, reachability.</td></tr>
+      <tr><td>52–136</td><td>Thresholds, <code>SnapQuality</code>, <code>CachedElPeer</code>, <code>Entry</code> and <code>absorb</code>.</td></tr>
+      <tr><td>138–290</td><td><code>ElPeerCache</code>, <code>load</code>, the tab and legacy colon parsers, <code>insert_loaded</code>.</td></tr>
+      <tr><td>292–404</td><td><code>peers</code> (dial order), BAL marks, the Tor-reserve hand-off, <code>quality_of</code>.</td></tr>
+      <tr><td>406–600</td><td><code>add</code>, the <code>record_*</code> verdicts, <code>flush</code>.</td></tr>
+      <tr><td>602–651</td><td>Key and hex helpers.</td></tr>
+      <tr><td>653–1133</td><td>Tests, including Java-format compatibility.</td></tr>
+    </tbody>
+  </table></div>
+  <x-code src="myotis-net/src/el/peercache.rs" from="126" to="135"></x-code>
+  <p class="code-note"><x-tags>enums-patterns ownership</x-tags> A <code>match</code> on a tuple with or-patterns: <code>(Confirmed, _) | (_, Confirmed)</code> reads “either side is Confirmed”, and the arms are tried in order, so Confirmed beats Denied beats Unknown. <code>SnapQuality</code> is <code>Copy</code>, so building the tuple copies both values and borrows nothing. <code>other: Entry</code> is taken by value: the second line is consumed by the merge.</p>
+  <x-code src="myotis-net/src/el/peercache.rs" from="296" to="321"></x-code>
+  <ul class="concepts">
+    <li><x-tags>iterators-closures error-handling</x-tags> Inside the <code>filter_map</code> closure, <code>parse_key(k)?</code> returns <code>None</code> from the <em>closure</em>, not from <code>peers</code>: a corrupt entry is skipped. <code>?</code> always applies to the innermost function or closure.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>sort_by_key(|(p, bal)| (rank, !*bal))</code> sorts by a tuple, compared field by field. <code>false &lt; true</code>, so <code>!bal</code> puts BAL servers first within a rank. <code>sort_by_key</code> is stable: equal keys keep their map order.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/peercache.rs" from="477" to="501"></x-code>
+  <ul class="concepts">
+    <li><x-tags>concurrency borrowing</x-tags> A single-owner type: every mutator takes <code>&amp;mut self</code>, and there is no locking inside. The pool supplies the mutex, just as a caller would guard a non-thread-safe Java class.</li>
+    <li><x-tags>borrowing</x-tags> <code>e</code> is a mutable borrow into <code>entries</code>. <code>let fails = e.fails;</code> copies the value out, so <code>e</code> is dead before <code>self.entries.remove(&amp;k)</code> needs the map mutably. Logging <code>e.fails</code> in the <code>tracing::info!</code> instead would not compile. Writing <code>self.dirty</code> while <code>e</code> is alive (the <code>else if</code> branch) is fine, since those are disjoint fields.</li>
+    <li><x-tags>modules-cargo</x-tags> <code>BTreeMap</code> (Java's <code>TreeMap</code>) makes every rewrite deterministic. <code>FAILURE_THRESHOLD</code> is <code>pub(crate)</code> so the pool can pin its own constant equal to it with a compile-time assertion.</li>
+  </ul>
+  <p class="code-note"><x-tags>domain bytes-strings</x-tags> Connect failures are only recorded while the device is demonstrably online, so an offline phone can't wipe out its own cache. <code>flush</code> is a synchronous <code>std::fs::write</code> of the whole file, best-effort: a write error leaves <code>dirty</code> set for the next try. The one key derivation, <code>key()</code>, formats <code>ip.to_canonical()</code>, which turns a v4-mapped IPv6 address into its IPv4 form.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/torreserve.rs" kind="library">
+  <p class="purpose">The Tor reserve: verified snap servers set aside for Tor reads and sends, persisted beside the peer cache as <code>peers-tor[-net].cache</code>. A node moves in from the peer cache and from then on the pool never dials it directly, so no direct session of ours can be paired with a Tor session to it. Its last direct contact is stored with it, and Tor uses it only once <code>TOR_DIRECT_SEPARATION</code> has passed. Three Tor dials in a row that the node refuses send it back to the peer cache. The reserve holds about a third of the verified peers, at most 24, and none while fewer than two are known. The Java engine has no Tor mode and never reads this file.</p>
+  <x-code src="myotis-net/src/el/torreserve.rs" from="174" to="197"></x-code>
+  <ul class="concepts">
+    <li><x-tags>iterators-closures</x-tags> <code>sort_by_cached_key</code> computes each element's key exactly once, then sorts. That matters because the last key component, <code>draw(node)</code>, is meant to be random per call. <code>sort_by_key</code> calls the key function on every comparison; a random key would then contradict itself between comparisons, and since Rust 1.81 the sort may even panic when it detects an inconsistent order. Here the draw just shuffles peers of equal rank.</li>
+    <li><x-tags>borrowing ownership</x-tags> <code>Vec&lt;(&amp;[u8; 64], &amp;Reserved)&gt;</code> holds borrows into <code>self.entries</code>; sorting them moves only pointers. <code>as_peer</code> builds owned <code>CachedElPeer</code>s at the end, so the returned vector borrows nothing. <code>BTreeMap&lt;[u8; 64], Reserved&gt;</code> works because fixed-size arrays implement <code>Ord</code>.</li>
+    <li><x-tags>iterators-closures</x-tags> In <code>surplus</code>, <code>std::cmp::Reverse</code> flips a key component's order, so the most Tor failures come first without a hand-written comparator.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/torreserve.rs" from="216" to="230"></x-code>
+  <p class="code-note"><x-tags>borrowing modules-cargo</x-tags> <code>e</code> borrows <code>self.entries</code>; <code>self.dirty = true</code> writes a different field while <code>e</code> is alive, which the compiler allows for disjoint fields. <code>self.remove(node)</code> borrows all of <code>self</code>, after <code>e</code>'s last use in the condition. <code>#[cfg(any(test, feature = "tor"))]</code> compiles the method only where it is called, so builds without Tor don't warn about dead code.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/tor.rs" kind="feature: tor">
+  <p class="purpose">Routes the sensitive flows over Tor: account reads, and the broadcast of the wallet's own transactions. Compiled only with the <code>tor</code> feature (the desktop dylib and the Android jniLibs when built with <code>-PtorEngine</code>). It keeps a lazily bootstrapped, process-wide Arti client and an on/off switch. <code>open_snap_session</code> opens a Tor stream isolated per wallet address to a node from the Tor reserve, then runs the <em>unchanged</em> RLPx and eth handshakes over it with a fresh throwaway key, a Hello that names the software without its version, and no listen port. <code>push_transaction</code> takes the isolation token from its caller (one per broadcast) and counts the push as delivered only when the peer's Pong confirms it read the frame. On Android the host must name Arti's directories first (<code>set_storage_dirs</code>).</p>
+  <x-code src="myotis-net/src/el/tor.rs" from="51" to="62"></x-code>
+  <ul class="concepts">
+    <li><x-tags>interior-mutability lifetimes</x-tags> <strong>Global state.</strong> <code>static</code> items must be <code>Sync</code> and built by a <code>const</code> expression. <code>ENABLED</code> is an atomic. <code>ISOLATION</code> is <code>Mutex&lt;Option&lt;HashMap&gt;&gt;</code> because <code>Mutex::new</code> is <code>const</code> but <code>HashMap::new</code> is not, so the map is created on first use with <code>get_or_insert_with</code> (<code>isolation_for</code>, lines 170–174). <code>STORAGE</code> (line 73) works directly, because a struct holding <code>None</code> and <code>false</code> is a constant.</li>
+    <li><x-tags>async smart-pointers</x-tags> <code>OnceCell::const_new()</code> is tokio's async lazy cell, usable in a <code>static</code>. The cell is <code>static</code>, so references into it are <code>&amp;'static</code>.</li>
+    <li><x-tags>ownership</x-tags> In <code>isolation_for</code>, <code>*map.entry(*address).or_insert_with(IsolationToken::new)</code> copies the token out of the map, which is allowed because <code>IsolationToken</code> is <code>Copy</code>; the guard is released when the function returns.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/tor.rs" from="176" to="231"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async concurrency</x-tags> <strong>A bootstrap no caller can cancel.</strong> The bootstrap runs in a task of its own (<code>tokio::spawn</code>). Callers await a <code>futures::future::Shared</code> wrapper around its <code>JoinHandle</code>: every clone of a <code>Shared</code> future resolves to the same output, which must therefore be <code>Clone</code> (here <code>Result&lt;(), String&gt;</code>). A caller whose own deadline expires drops only its clone; dropping a <code>JoinHandle</code> detaches the task rather than killing it. The previous design let a caller's timeout cancel Arti's bootstrap halfway, which the <code>StorageHold</code> comment still mentions.</li>
+    <li><x-tags>interior-mutability async</x-tags> The <code>std</code> guard <code>slot</code> lives only inside the block that computes <code>(generation, bootstrap)</code>, so it is released before <code>bootstrap.await</code>. The generation counter means a caller clears only the failed bootstrap it waited on, never a newer one another caller has started meanwhile.</li>
+    <li><x-tags>error-handling async</x-tags> <code>Ok::&lt;_, String&gt;(c)</code> names the inner async block's error type, which <code>?</code> alone can't infer. <code>get_or_try_init</code> initializes once, makes concurrent callers wait, and leaves the cell empty after a failure, so a later call can retry.</li>
+    <li><x-tags>ownership async</x-tags> <code>StorageHold</code> is another drop guard with a flag, like <code>PendingGuard</code>: it releases the claimed Arti directories unless the bootstrap succeeded and cleared <code>release</code>.</li>
+  </ul>
+  <p class="code-note"><x-tags>traits-generics error-handling</x-tags> <code>open_session</code> (lines 300–343) returns <code>EthSession&lt;arti_client::DataStream&gt;</code>: the generic stack instantiated with a Tor stream. Only <code>split()</code> is TCP-specific, so the Tor path drives an unsplit session. Its error strings carry a prefix that <code>is_peer_unreachable</code> reads: <code>"tor connect "</code> and the handshake prefixes count as a strike against the reserved node, <code>"tor circuit for "</code> (no circuit, local network down, exit policy) does not. <code>EthConfig { listen_port: 0, ..eth_cfg.clone() }</code> is struct-update syntax: a copy with one field changed.</p>
+</x-file>
+
+<x-quiz>[
+  {"id":"elt-q1","type":"open","tags":["concurrency","async","interior-mutability"],
+   "q":"Why can a <code>ManagedPeer</code> serve many requests concurrently, when an <code>EthSession</code> can only handle one at a time?",
+   "model":"An <code>EthSession</code> owns the whole connection and uses a single <code>&amp;mut self</code> for both sending and receiving (<code>recv_answering_ping</code> takes <code>&amp;mut RlpxConnection</code>), so every request has to wait for its response before the next can start. A <code>ManagedPeer</code> first <code>split</code>s the connection. The reader is moved into a background task that reads all frames, and the writer sits behind an <code>Arc&lt;tokio::Mutex&gt;</code> that callers take only for the duration of one frame write. Each request gets a unique id from an <code>AtomicU64</code> and registers a <code>oneshot</code> sender in a shared pending map. The read loop matches each response by id and code and completes the right oneshot. Because the methods take <code>&amp;self</code> and the shared state is behind locks and atomics, many callers holding an <code>Arc&lt;ManagedPeer&gt;</code> can await different responses at once.",
+   "points":["EthSession: one &mut borrow for send and recv, so strictly sequential","split: the reader is owned by the read-loop task, the writer is behind Arc&lt;tokio::Mutex>","request ids from an AtomicU64 plus a pending map of oneshot senders","the read loop routes responses by (id, code); request methods take &self"],
+   "context":"myotis-net/src/el/peer.rs: from_connection L411-444 (split, Arc clones, spawn read_loop), request L520-597 (AtomicU64 id, oneshot, insert under the pending lock), deliver L133-143. eth/session.rs recv_answering_ping L566-578 uses &mut conn for recv and send."},
+  {"id":"elt-q2","type":"mcq","tags":["traits-generics"],
+   "q":"<code>pub struct RlpxConnection&lt;S = TcpStream&gt;</code>, with <code>split</code> in <code>impl RlpxConnection&lt;TcpStream&gt;</code> and the handshake in <code>impl&lt;S: AsyncReadExt + AsyncWriteExt + Unpin&gt; RlpxConnection&lt;S&gt;</code>. What does this arrangement buy?",
+   "options":["Dynamic dispatch over streams, chosen at run time","Faster TCP, because the default parameter inlines the socket","Callers can keep writing <code>RlpxConnection</code> for TCP, the handshake and framing run unchanged over any async stream (Arti's <code>DataStream</code>, an in-memory <code>DuplexStream</code>), and <code>split</code> exists only where <code>into_split</code> does","Automatic encryption of any stream passed in"],
+   "answer":2,
+   "explain":"A default type parameter plus a trait-bounded impl, compiled per concrete type (static dispatch). An impl block for one concrete instantiation adds methods only to that type, which erased Java generics can't express."},
+  {"id":"elt-q3","type":"mcq","tags":["async","domain"],
+   "q":"<code>send_frame</code> sets <code>w.torn = true</code> before <code>writer.send(…).await</code> and afterwards sets <code>w.torn = result.is_err()</code>. What does this protect against?",
+   "options":["Two request ids colliding in the pending map","A frame write that was cancelled or failed may have left a partial frame on the wire with the egress MAC already advanced; the marker makes every later writer refuse the stream instead of appending MAC-garbage","Peers that send frames faster than the read loop can decode them","A poisoned mutex after a panic in another task"],
+   "answer":1,
+   "explain":"Cancellation in Rust is dropping the future: no exception, no cleanup callback, nothing after the <code>.await</code> runs. So the code records “a write is in progress” before the await and clears it only on a completed, successful write."},
+  {"id":"elt-q4","type":"mcq","tags":["concurrency","async"],
+   "q":"In discv4's <code>emit</code>, why is the discovered entry offered with <code>try_send</code> instead of <code>send().await</code>?",
+   "options":["<code>send</code> doesn't exist on bounded channels","<code>try_send</code> avoids cloning the entry","The whole service is one <code>select!</code> loop in one task; waiting on a full channel would stall receiving, the refresh, the ENR sweep and even stop. The event is advisory because the table already holds the entry","<code>try_send</code> retries automatically until the pool reads"],
+   "answer":2,
+   "explain":"In a single-task actor, any await inside a handler pauses every branch. Non-essential messages are offered, not forced."},
+  {"id":"elt-q5","type":"open","tags":["ownership","async"],
+   "q":"<code>DnsSeeder::walk_once</code> starts with <code>let _claim = WalkClaim(self);</code>. What does the guard do, in which situations does it do it, and what would change if the line were <code>let _ = WalkClaim(self);</code>?",
+   "model":"<code>begin_walk_if_due</code> sets <code>walking = true</code> so no two walks run at once. <code>WalkClaim</code>'s <code>Drop</code> sets <code>walking = false</code> and stamps <code>last_walk</code>. Because the guard is bound to a named variable, it lives until <code>walk_once</code>'s scope ends, so the claim is released when the walk returns normally, when its future is dropped (for example the pool stopping and cancelling the task), or when it unwinds. With <code>let _ =</code> the value is dropped immediately at the end of the statement, so the claim would be released before the walk even started and a second walk could begin concurrently.",
+   "points":["Drop clears the walking flag and records last_walk","runs on normal return, on cancellation (future dropped) and on unwind","let _claim keeps the guard alive to the end of the scope","let _ drops it at once, releasing the claim before the walk runs"],
+   "context":"myotis-net/src/el/dnsdisco.rs: begin_walk_if_due L698-714 sets st.walking; walk_once L722-725 `let _claim = WalkClaim(self); self.walk_all(probe).await`; WalkClaim L847-855 Drop sets walking=false and last_walk=Some(now)."},
+  {"id":"elt-q6","type":"mcq","tags":["lifetimes","borrowing"],
+   "q":"In <code>walk_all</code>, <code>let system;</code> is declared before the <code>match</code> and assigned inside the <code>ResolverSource::System</code> arm, whose value is <code>&amp;system</code>. Why not write <code>let system = r;</code> inside the arm?",
+   "options":["Style only; both compile","Variables can't be declared inside match arms","Declared inside the arm, <code>system</code> would be dropped at the arm's end while <code>resolver</code> still borrowed it, which is a compile error; declaring it outside makes it live until the function returns","Because <code>SystemResolver</code> is not <code>Copy</code> and can't be moved into the arm"],
+   "answer":2,
+   "explain":"This is how to borrow from one of two owners without <code>Box</code> or <code>Cow</code>: give the possibly-needed owner a longer-lived binding. Rust allows a <code>let</code> without an initializer as long as every use comes after an assignment."},
+  {"id":"elt-q7","type":"open","tags":["borrowing"],
+   "q":"In discv4's <code>consider</code>, <code>enr</code> is <code>self.enr.as_mut()</code>, a mutable borrow of part of <code>self</code>. Yet the function later calls <code>self.forget(…)</code> and <code>self.emit(…).await</code>, which need all of <code>self</code>. Why does this compile, and what role does the <code>Seen</code> enum play?",
+   "model":"A borrow lasts until its last use, not until the end of its lexical scope (non-lexical lifetimes). In each match arm, <code>enr</code> is used for the last time (for example <code>enr.skip_foreign()</code>) before <code>self.forget</code> or <code>self.emit</code> is called, so the mutable borrow has ended by then. In the <code>let … else</code> at the top, the <code>else</code> branch has no <code>enr</code> at all. <code>Seen</code> converts the borrowed lookup <code>enr.verdicts.get(&amp;entry.node_id)</code> into an owned summary: it holds no references, only a copied <code>Option&lt;u32&gt;</code>. So the shared borrow of the verdicts map ends when <code>seen</code> is computed, and the second match can call <code>get_mut</code> or <code>remove</code> on the same map.",
+   "points":["non-lexical lifetimes: a borrow ends at its last use","enr is last used before self.forget/self.emit in each arm","the else branch of let-else has no borrow of self.enr","Seen holds no references (copied Option&lt;u32>), ending the map borrow before the mutating match"],
+   "context":"myotis-net/src/el/discv4.rs consider L965-1067: `let Some(enr) = self.enr.as_mut() else { return self.emit(entry).await; };` `let seen = match enr.verdicts.get(&entry.node_id) { … Some(j) => Seen::Judged(j.tcp_port[family(&entry.ip)]), … };` then `Seen::Foreign => { enr.skip_foreign(); return self.forget(&entry.node_id); }` and `Seen::Stale => { enr.verdicts.remove(&entry.node_id); }`."},
+  {"id":"elt-q8","type":"mcq","tags":["traits-generics","async"],
+   "q":"<code>TxtLookup::txt</code> returns <code>Pin&lt;Box&lt;dyn Future&lt;Output = Result&lt;Vec&lt;String&gt;, String&gt;&gt; + Send + 'a&gt;&gt;</code> instead of being an <code>async fn</code>. Why?",
+   "options":["Boxed futures run faster than async fns","An <code>async fn</code> in a trait makes the trait unusable as <code>dyn TxtLookup</code>, because each implementation's future is a different unnamed type; one boxed future type lets <code>walk</code> take <code>&amp;dyn TxtLookup</code> and the seeder hold <code>Arc&lt;dyn TxtLookup&gt;</code>","hickory's resolver can only be called from a pinned box","<code>'a</code> would otherwise make the future <code>'static</code>"],
+   "answer":1,
+   "explain":"Returning a boxed trait-object future gives every implementation the same return type. <code>'a</code> lets the future keep borrowing <code>self</code> and <code>name</code> until it completes; <code>Send</code> lets it run on a multi-threaded runtime."},
+  {"id":"elt-q9","type":"mcq","tags":["async","concurrency","smart-pointers"],
+   "q":"In <code>tor.rs</code>, <code>client()</code> runs the Arti bootstrap inside <code>tokio::spawn</code> and hands callers a <code>Shared</code> future over the task's <code>JoinHandle</code>. What does this achieve?",
+   "options":["It runs one bootstrap per caller, in parallel","A caller whose deadline expires drops only its clone of the shared future; the task keeps running (dropping a <code>JoinHandle</code> detaches it), so a bootstrap is never cancelled halfway, and all waiting callers see the same result","It makes the Tor client thread-local","It lets the bootstrap run without a tokio runtime"],
+   "answer":1,
+   "explain":"<code>Shared</code> requires a <code>Clone</code> output, here <code>Result&lt;(), String&gt;</code>; the client itself lives in the <code>static OnceCell</code>. The generation counter makes sure a caller clears only the failed bootstrap it waited on."},
+  {"id":"elt-q10","type":"open","tags":["concurrency","async","interior-mutability"],
+   "q":"<code>ManagedPeer::request</code> inserts its pending entry while holding the pending lock and checks <code>closed</code> inside that lock, then arms a <code>PendingGuard</code>. Which two failure cases do these choices prevent?",
+   "model":"First, a lost wake-up on disconnect: <code>fail_all</code> sets <code>closed</code> and drains the map while holding the same pending lock. A request that checked <code>closed</code> without the lock could insert just after the drain and then wait 15 s on a dead connection. Under the lock, it either inserts before the drain (and receives the drain's <code>Err</code>) or sees <code>closed</code> and returns at once. Second, a leaked entry on cancellation: if the request future is dropped at a later <code>.await</code> (send or response wait), the guard's <code>Drop</code> spawns a task that removes the entry. There is no <code>.await</code> between the insert and arming the guard, so there is no window in which a cancellation could leak the entry. On normal completion the guard is disarmed because the entry is already gone.",
+   "points":["fail_all sets closed and drains under the same pending lock","a request either inserts before the drain (gets Err) or sees closed and bails","PendingGuard::drop removes the entry if the future is dropped mid-flight","no .await between insert and arming the guard; disarmed on completed paths"],
+   "context":"myotis-net/src/el/peer.rs request L520-597: `{ let mut map = self.pending.lock().await; if self.closed.load(SeqCst) { return Err(..) } map.insert(id, Pending { want_code, tx }); } let mut guard = PendingGuard { …, armed: true };` fail_all L1376-1389; PendingGuard L153-172 (Drop spawns `pending.lock().await.remove(&id)`)."},
+  {"id":"elt-q11","type":"mcq","tags":["iterators-closures"],
+   "q":"<code>TorReserve::ready</code> sorts with <code>sort_by_cached_key(|(node, e)| (e.quality.dial_rank(), e.tor_fails, draw(node)))</code>, where <code>draw</code> returns a random number. Why <code>sort_by_cached_key</code> and not <code>sort_by_key</code>?",
+   "options":["<code>sort_by_cached_key</code> is always faster","<code>sort_by_key</code> can't sort tuples","<code>sort_by_cached_key</code> computes each key once, so each node gets one random draw; <code>sort_by_key</code> recomputes keys during comparisons, which with a random key gives an inconsistent order (and recent Rust sorts may panic on that)","<code>sort_by_key</code> requires the key to be <code>Copy</code>"],
+   "answer":2,
+   "explain":"A key function must be consistent for the sort to be well defined. Caching makes a random key a fixed property of each element for the duration of one sort."},
+  {"id":"elt-q12","type":"mcq","tags":["domain"],
+   "q":"Why does discv4 answer an ENRRequest only from a node whose pong it verified, checked against the signing key, and within the Ping rate limit?",
+   "options":["To save CPU on signature checks","Because ENR records are secret","Without a bond, a spoofed source address could make us send signed records to a victim (amplification); the key check stops a spoofer from borrowing a bootnode's bond, and the rate limit stops a bonded node from asking at line rate","Because geth never sends ENRRequests"],
+   "answer":2,
+   "explain":"This is geth's <code>checkBond</code> rule. The bond is keyed by address and checked against the signer (<code>EnrExchange::is_bonded</code>), and expired requests are ignored so a captured one can't be replayed."},
+  {"id":"elt-q13","type":"open","tags":["async","smart-pointers"],
+   "q":"What does <code>scope_send_marker</code> record, how does a call deep inside <code>ManagedPeer::request</code> reach it without a parameter, and why is a <code>OnceLock</code> used?",
+   "model":"It records when the first request frame of one hedged-read attempt was actually written to the peer's socket, as opposed to when the attempt was created; the two can differ by up to the 30 s frame-write timeout because every request first waits for the shared writer. <code>scope_send_marker</code> creates an <code>Arc&lt;OnceLock&lt;Instant&gt;&gt;</code>, keeps one clone for the caller, and wraps the attempt's future with <code>REQUEST_SENT.scope(sent, fut)</code>, a tokio task-local: any code polled inside that future can reach the value. <code>mark_request_sent</code> calls <code>REQUEST_SENT.try_with</code>, which fails (ignored) outside a scope. <code>OnceLock::set</code> succeeds only the first time, so later requests of the same attempt don't move the mark.",
+   "points":["records when the attempt's first request frame was written, not when the attempt started","task_local scope: visible to code polled inside the wrapped future, no parameter passing","the Arc is shared between the caller and the scoped future","OnceLock keeps only the first set; try_with makes it a no-op outside a hedged read"],
+   "context":"myotis-net/src/el/peer.rs L77-105: `tokio::task_local! { static REQUEST_SENT: Arc&lt;std::sync::OnceLock&lt;tokio::time::Instant>>; }`, scope_send_marker returns (Arc::clone(&sent), REQUEST_SENT.scope(sent, fut)); mark_request_sent: `let _ = REQUEST_SENT.try_with(|sent| { let _ = sent.set(Instant::now()); });` called in request after send_frame succeeds (L558). Used by reader.rs L1650 and evm.rs L532."}
+]</x-quiz>

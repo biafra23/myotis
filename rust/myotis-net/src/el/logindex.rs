@@ -1,4 +1,4 @@
-//! Scoped, verified log index behind `eth_getLogs` (docs/eth-getlogs-design.md).
+//! Scoped, verified log index behind `eth_getLogs` (docs/design-history/eth-getlogs-design.md).
 //!
 //! This module is the pure state half of the feature: watch-list config,
 //! the in-memory index, coverage bookkeeping, filter matching, and the

@@ -8,7 +8,7 @@ import kotlin.jvm.JvmStatic
  * block. Entries are entered on the Index tab (or arrive baked into an
  * imported snapshot), persisted host-side per network as the JSON array this
  * object serializes, and turned into the engine config on every push — the
- * engine only ever sees the generic config JSON (docs/eth-getlogs-design.md §5).
+ * engine only ever sees the generic config JSON (docs/design-history/eth-getlogs-design.md §5).
  *
  * A `fromBlock` is a TRUST ASSERTION, not a hint: the engine clamps a query's
  * coverage requirement to it, so a value LATER than the contract's real
@@ -329,7 +329,7 @@ object LogIndexWatch {
             Entry("0x58E8dCC13BE9780fC42E8723D8EaD4CF46943dF2", 14_173_129), // tornado relayer registry
             // railgun proxy. 14_693_013 circulates as "the RAILGUN deployment block"
             // and is WRONG for a from_block: the contract's first log is at 14_737_691
-            // and nothing exists below it (docs/railgun-poc.md, "The deployment block
+            // and nothing exists below it (docs/guides/railgun-poc.md, "The deployment block
             // is load-bearing"). It is kept here as it shipped only because from_block
             // is part of the index config's fingerprint and changing it would re-key a
             // migrated user's index. The cost: the walker must also cover the 44,678

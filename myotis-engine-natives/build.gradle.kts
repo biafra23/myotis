@@ -8,7 +8,7 @@
 // holding the library at <jna-prefix>/<library>: the classpath path JNA loads
 // `myotis_engine` from when jna.library.path has none, so a consumer that puts the
 // one matching its host on the runtime classpath gets a working engine with no
-// java.library.path at all (docs/android-library.md, *Desktop*). The platforms are
+// java.library.path at all (docs/guides/android-library.md, *Desktop*). The platforms are
 // platforms.txt's lines.
 //
 // Where the libraries come from:

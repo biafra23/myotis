@@ -49,7 +49,7 @@ const FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Generic over the underlying stream `S`, defaulting to [`TcpStream`] so every
 /// clearnet caller is unchanged. The bound is any tokio byte stream, which lets
 /// the same handshake + framed channel run over a Tor `DataStream` (Arti) — see
-/// [`RlpxConnection::handshake_over`] and `docs/privacy-and-tor.md` §3. The
+/// [`RlpxConnection::handshake_over`] and `docs/how-it-works/privacy-and-tor.md` §3. The
 /// crypto (`Initiator`/`FrameCodec`) never touched the socket type; only this
 /// dialer did.
 pub struct RlpxConnection<S = TcpStream> {

@@ -1,6 +1,6 @@
 //! keccak-256 — the EXECUTION-layer hash (block hashes, node IDs, MPT paths,
 //! discv4 packet hashes). Never confuse with the consensus layer's SHA-256
-//! (docs/reimplementation README §11.6: SSZ = SHA-256 + little-endian, MPT =
+//! (docs/spec README §11.6: SSZ = SHA-256 + little-endian, MPT =
 //! keccak-256 + RLP + big-endian).
 
 use sha3::{Digest, Keccak256};

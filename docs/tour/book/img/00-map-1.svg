@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 960 610" role="img" fill="currentColor" aria-label="Crate map. Wallets and dapps reach myotis-rpcd over HTTP JSON-RPC; myotis-rpcd calls the engine's exported functions directly as a Rust library. JVM hosts reach myotis-engine through UniFFI and JNA, iOS through the plain C ABI, Node through myotis-node which calls the C ABI functions. myotis-engine starts the sync loop and the EL reader in myotis-net, which does all I/O and depends on the sans-I/O crates myotis-wire, myotis-consensus, myotis-core and myotis-evm. myotis-wire uses myotis-core and myotis-consensus; myotis-evm uses myotis-core; myotis-consensus uses myotis-bls, which the Java engine also loads through JNI. roost and tor-poc are standalone binaries built on myotis-net." width="960" height="610">
+    <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="960.0" height="610.0" fill="#f8fafb" /><defs>
+      <marker id="m0-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+      </marker>
+    </defs>
+    <g font-size="11" style="fill:var(--ink-3)">
+      <rect x="20" y="16" width="176" height="58" rx="8" stroke-width="1.4" stroke-dasharray="5 4" style="fill:none;stroke:var(--ink-3)" />
+      <rect x="206" y="16" width="176" height="58" rx="8" stroke-width="1.4" stroke-dasharray="5 4" style="fill:none;stroke:var(--ink-3)" />
+      <rect x="392" y="16" width="176" height="58" rx="8" stroke-width="1.4" stroke-dasharray="5 4" style="fill:none;stroke:var(--ink-3)" />
+      <rect x="578" y="16" width="176" height="58" rx="8" stroke-width="1.4" stroke-dasharray="5 4" style="fill:none;stroke:var(--ink-3)" />
+      <rect x="764" y="16" width="176" height="58" rx="8" stroke-width="1.4" stroke-dasharray="5 4" style="fill:none;stroke:var(--ink-3)" />
+      <text x="108" y="59" text-anchor="middle">MetaMask, Bee, dapps</text>
+      <text x="294" y="59" text-anchor="middle">desktop · daemon · Android</text>
+      <text x="480" y="59" text-anchor="middle">Kotlin/Native · :app-ios</text>
+      <text x="666" y="59" text-anchor="middle">JS loader</text>
+      <text x="852" y="59" text-anchor="middle">NativeBlsBackend</text>
+    </g>
+    <g font-size="13.5" font-weight="700">
+      <text x="108" y="40" text-anchor="middle">JSON-RPC clients</text>
+      <text x="294" y="40" text-anchor="middle">JVM hosts</text>
+      <text x="480" y="40" text-anchor="middle">iOS app</text>
+      <text x="666" y="40" text-anchor="middle">Node / Electron</text>
+      <text x="852" y="40" text-anchor="middle">Java engine</text>
+    </g>
+
+    
+    <rect x="20" y="124" width="150" height="92" rx="10" stroke-width="1.6" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+    <text x="95" y="160" text-anchor="middle" font-size="13.5" font-weight="750">myotis-rpcd</text>
+    <text x="95" y="178" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">HTTP JSON-RPC daemon</text>
+
+    <rect x="196" y="124" width="360" height="92" rx="10" stroke-width="1.6" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+    <rect x="208" y="134" width="164" height="36" rx="6" stroke-width="1.2" style="fill:var(--surface);stroke:var(--oxide)" />
+    <text x="290" y="157" text-anchor="middle" font-size="12.5" font-weight="650" class="mono">ffi.rs · UniFFI</text>
+    <rect x="388" y="134" width="156" height="36" rx="6" stroke-width="1.2" style="fill:var(--surface);stroke:var(--oxide)" />
+    <text x="466" y="157" text-anchor="middle" font-size="12.5" font-weight="650" class="mono">capi.rs · C ABI</text>
+    <text x="208" y="192" font-size="13.5" font-weight="750">myotis-engine</text>
+    <text x="208" y="208" font-size="11" style="fill:var(--ink-2)">host.rs owns the tokio runtime and the handle map</text>
+
+    <rect x="578" y="124" width="176" height="92" rx="10" stroke-width="1.6" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+    <text x="666" y="164" text-anchor="middle" font-size="13.5" font-weight="750">myotis-node</text>
+    <text x="666" y="182" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">napi-rs addon</text>
+
+    <g stroke="currentColor" stroke-width="1.4" fill="none">
+      <line x1="108" y1="74" x2="108" y2="121" marker-end="url(#m0-arrow)" />
+      <line x1="294" y1="74" x2="294" y2="131" marker-end="url(#m0-arrow)" />
+      <line x1="472" y1="74" x2="472" y2="131" marker-end="url(#m0-arrow)" />
+      <line x1="666" y1="74" x2="666" y2="121" marker-end="url(#m0-arrow)" />
+      <line x1="578" y1="152" x2="547" y2="152" marker-end="url(#m0-arrow)" />
+      <line x1="170" y1="190" x2="193" y2="190" marker-end="url(#m0-arrow)" />
+      <line x1="376" y1="216" x2="376" y2="259" marker-end="url(#m0-arrow)" />
+    </g>
+    <g font-size="11" style="fill:var(--ink-2)">
+      <text x="114" y="104">HTTP</text>
+      <text x="300" y="104">UniFFI · JNA</text>
+      <text x="478" y="104">C ABI · cinterop</text>
+      <text x="672" y="104">N-API</text>
+      <text x="384" y="243">starts SyncHandle + ElReader</text>
+    </g>
+
+    
+    <rect x="20" y="262" width="680" height="88" rx="10" stroke-width="1.6" style="fill:var(--surface);stroke:var(--ink-2)" />
+    <text x="32" y="284" font-size="13.5" font-weight="750">myotis-net <tspan font-weight="400" style="fill:var(--ink-2)">— every socket, timer and file lives here</tspan></text>
+    <text x="32" y="301" font-size="11" style="fill:var(--ink-3)">tokio · libp2p · discv4/discv5 · DNS discovery · RLPx · Tor (feature)</text>
+    <rect x="32" y="312" width="206" height="28" rx="5" style="fill:var(--ground-2)" />
+    <text x="135" y="330" text-anchor="middle" font-size="11.5">sync.rs · light-client loop</text>
+    <rect x="248" y="312" width="206" height="28" rx="5" style="fill:var(--ground-2)" />
+    <text x="351" y="330" text-anchor="middle" font-size="11.5">reqresp · discovery · fork watch</text>
+    <rect x="464" y="312" width="224" height="28" rx="5" style="fill:var(--ground-2)" />
+    <text x="576" y="330" text-anchor="middle" font-size="11.5">el/ · pool · peers · reader</text>
+
+    
+    <rect x="720" y="250" width="160" height="48" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--rule-strong)" />
+    <text x="732" y="270" font-size="13" font-weight="700">roost</text>
+    <text x="732" y="287" font-size="11" style="fill:var(--ink-3)">LC server daemon</text>
+    <rect x="720" y="306" width="160" height="48" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--rule-strong)" />
+    <text x="732" y="326" font-size="13" font-weight="700">tor-poc</text>
+    <text x="732" y="343" font-size="11" style="fill:var(--ink-3)">RLPx over Tor</text>
+    <g stroke="currentColor" stroke-width="1.4" fill="none">
+      <line x1="720" y1="274" x2="703" y2="274" marker-end="url(#m0-arrow)" />
+      <line x1="720" y1="330" x2="703" y2="330" marker-end="url(#m0-arrow)" />
+    </g>
+
+    
+    <rect x="20" y="378" width="680" height="96" rx="12" stroke-width="1.4" stroke-dasharray="6 5" style="fill:none;stroke:var(--oxide)" />
+    <text x="32" y="396" font-size="10.5" font-weight="700" letter-spacing="1.2" style="fill:var(--oxide-ink)">SANS-I/O</text>
+    <g font-size="11" style="fill:var(--ink-3)">
+      <rect x="32" y="404" width="150" height="54" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--rule-strong)" />
+      <rect x="202" y="404" width="150" height="54" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--rule-strong)" />
+      <rect x="372" y="404" width="150" height="54" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--rule-strong)" />
+      <rect x="542" y="404" width="150" height="54" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--rule-strong)" />
+      <text x="107" y="444" text-anchor="middle">SSZ · LC store · Gloas</text>
+      <text x="277" y="444" text-anchor="middle">RLPx · eth · snap · eth2</text>
+      <text x="447" y="444" text-anchor="middle">RLP · keccak · trie</text>
+      <text x="617" y="444" text-anchor="middle">revm · ENS · simulate</text>
+    </g>
+    <g font-size="13" font-weight="700">
+      <text x="107" y="426" text-anchor="middle">myotis-consensus</text>
+      <text x="277" y="426" text-anchor="middle">myotis-wire</text>
+      <text x="447" y="426" text-anchor="middle">myotis-core</text>
+      <text x="617" y="426" text-anchor="middle">myotis-evm</text>
+    </g>
+    <g stroke="currentColor" stroke-width="1.4" fill="none">
+      <line x1="107" y1="350" x2="107" y2="401" marker-end="url(#m0-arrow)" />
+      <line x1="277" y1="350" x2="277" y2="401" marker-end="url(#m0-arrow)" />
+      <line x1="447" y1="350" x2="447" y2="401" marker-end="url(#m0-arrow)" />
+      <line x1="617" y1="350" x2="617" y2="401" marker-end="url(#m0-arrow)" />
+      <line x1="202" y1="431" x2="185" y2="431" marker-end="url(#m0-arrow)" />
+      <line x1="352" y1="431" x2="369" y2="431" marker-end="url(#m0-arrow)" />
+      <line x1="542" y1="431" x2="525" y2="431" marker-end="url(#m0-arrow)" />
+      <line x1="107" y1="458" x2="107" y2="537" marker-end="url(#m0-arrow)" />
+      <path d="M920 74 V567 H185" marker-end="url(#m0-arrow)" />
+    </g>
+    <text x="114" y="377" font-size="11" style="fill:var(--ink-2)">slot numbers in</text>
+    <text x="912" y="300" text-anchor="end" font-size="11" style="fill:var(--ink-2)">JNI</text>
+
+    
+    <rect x="32" y="540" width="150" height="54" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--rule-strong)" />
+    <text x="107" y="562" text-anchor="middle" font-size="13" font-weight="700">myotis-bls</text>
+    <text x="107" y="580" text-anchor="middle" font-size="11" style="fill:var(--ink-3)">blst · aggregate verify</text>
+    <text x="520" y="560" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">sync-committee signature checks</text>
+  </svg>

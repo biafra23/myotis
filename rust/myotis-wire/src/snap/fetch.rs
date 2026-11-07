@@ -1,5 +1,5 @@
 //! Verify-on-fetch for snap/1 state (EL-A6), the security-critical half of the
-//! snap oracle (docs/reimplementation/03 §3.2, README §11.8-12).
+//! snap oracle (docs/spec/03 §3.2, README §11.8-12).
 //!
 //! Every value is verified against a TRUSTED state root via the MPT proof
 //! verifier before it is returned; the peer's "slim" account body is NEVER

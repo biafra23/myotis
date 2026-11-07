@@ -1,0 +1,527 @@
+<!--meta {"id":"stop-06","num":6,"title":"myotis-consensus: the light client as a state machine","short":"myotis-consensus","sub":"16 files · 5,103 lines","part":"Pure foundations"} -->
+<header class="stop-head">
+  <div class="eyebrow">Stop 6 · crate <code>myotis-consensus</code> <span>16 files · 5,103 lines · about 3 hours</span></div>
+  <h1>myotis-consensus: the light client as a state machine</h1>
+  <p class="lede">SSZ decoding, <code>hash_tree_root</code>, Merkle branches, fork versions, sync-committee signatures, and the store that ties them together. The store is a small state machine: it holds one committee, then two, then rotates. Every update passes a fixed sequence of gates before it may move it. Since the last edition the crate has learned the Gloas fork, where a light-client header stops carrying the execution payload. Like <code>myotis-core</code>, the crate performs no I/O and never reads a clock: <code>myotis-net</code> passes “what time is it” in as a slot number. Watch how <code>Option::take</code>, <code>Box</code>, <code>clone</code> and borrow scopes move a 24&nbsp;KB committee and a 470-byte payload header around without surprises.</p>
+</header>
+
+<div class="learn">
+  <h2>Rust you will practise</h2>
+  <div><b>Enums that carry data</b><code>HeaderExecution</code> holds either a boxed payload header or a 32-byte hash, and every reader has to <code>match</code> on which one it got.</div>
+  <div><b>Moving big values</b><code>Option::take</code> instead of cloning, a builder that consumes <code>self</code>, a consuming <code>restore</code>, and a <code>Box</code> that keeps a large variant out of line.</div>
+  <div><b>Borrow scopes and panics by policy</b>a borrow from a <code>&amp;self</code> method ending before a <code>&amp;mut</code> call, <code>assert!</code> for configuration, <code>Err</code> or <code>false</code> for peer data, and <code>const</code> asserts that fail the build.</div>
+</div>
+
+<div class="prose">
+  <h2>How the files fit</h2>
+  <p>Bytes from a peer are decoded by <code>types</code>. Before Gloas the decoders sniff the fork layout from offsets. From Gloas on they cannot, so the caller names the format with an <code>LcFork</code> value from <code>fork</code>. <code>LightClientProcessor</code> in <code>store</code> first runs the cheap gates: the sync-committee period (which also picks the verifying committee), the next-committee adoption rule, and the wire-shape check. Only then does it call <code>verify</code>, which checks the BLS aggregate through <code>myotis-bls</code> under the fork version that <code>fork</code> picks for the signature slot. <code>ssz</code> and <code>spec</code> check the Merkle branches against the gindices of the right fork, and the result updates <code>LightClientStore</code>. <code>snapshot</code> persists the store in a byte format the Java engine reads too.</p>
+  <p>The crate is now <code>no_std</code>-capable: with <code>default-features = false</code> it builds on bare-metal targets with only the <code>alloc</code> crate. That is why every module opens with an <code>alloc::…</code> import line (see <a href="#f-myotis-consensus-src-lib-rs">lib.rs</a>).</p>
+</div>
+
+<div class="prose">
+  <h2>What Gloas changes for a light client</h2>
+  <p>Gloas is the consensus fork that brings enshrined proposer-builder separation (EIP-7732) and progressive SSZ containers (EIP-7688). The code shows four consequences for a light client, and each one lands in a different file.</p>
+  <ol>
+    <li><strong>The header proves a block hash, not a payload.</strong> A Gloas beacon block body carries a signed payload <em>bid</em> instead of the execution payload. The payload itself is revealed separately and may be withheld. So a Gloas <code>LightClientHeader</code> carries only a 32-byte execution block hash, and that hash is the bid's <code>parent_block_hash</code>: the payload of the <em>parent</em>, which the chain has already imported. There is no state root, block number or timestamp in it any more. Those have to come from the execution header that this hash pins. In the code this is the new enum <code>HeaderExecution</code> in <a href="#f-myotis-consensus-src-types-rs">types.rs</a>.</li>
+    <li><strong>Everything is fixed-size, so nothing can be sniffed.</strong> With no variable-length payload header left, every Gloas container has no offsets. The only honest way to know the format is the fork of the object's slot, which the req/resp context bytes tell the caller. The decoders gained <code>decode_for(LcFork, bytes)</code>, and the store checks that each header has the shape of its attested slot's fork.</li>
+    <li><strong>The proof indices move and stop being derivable.</strong> The Gloas <code>BeaconState</code> is a progressive container. The field indices of <code>finalized_checkpoint</code>, <code>current_sync_committee</code> and <code>next_sync_committee</code> (20, 22, 23) are the same, but their generalized indices are not <code>(1 &lt;&lt; depth) + field</code> any more. <a href="#f-myotis-consensus-src-spec-rs">spec.rs</a> pins them as constants, and the store selects them by the fork of the attested slot.</li>
+    <li><strong>The transition needs a padded proof.</strong> In the first epochs after the fork, a Gloas update's finalized header is still a Fulu block. It travels in the Gloas shape, and it proves its block hash at the Deneb-era gindex 812 (depth 9), padded with two leading zero nodes to the 11-node vector. <code>ssz::verify_normalized_merkle_branch</code> accepts the padding only if the extra nodes are all zero.</li>
+  </ol>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th></th><th>Capella to Fulu (<code>LcFork::PreGloas</code>)</th><th>Gloas (<code>LcFork::Gloas</code>)</th></tr></thead>
+    <tbody>
+      <tr><td>Header execution part</td><td>whole execution payload header (584 or 680 bytes plus extra data), 4-node branch</td><td>32-byte block hash, 11-node branch; header is 496 bytes</td></tr>
+      <tr><td>Execution proof</td><td>payload header root at gindex 25</td><td>block hash at 2856; a pre-Gloas-slot header in the Gloas shape at 812, zero-padded</td></tr>
+      <tr><td>Finality branch</td><td>6 or 7 nodes, gindex 105 or 169 (derived from depth)</td><td>9 nodes, gindex 735 (constant)</td></tr>
+      <tr><td>Sync-committee branches</td><td>5 or 6 nodes, gindex 54/55 or 86/87</td><td>11 nodes, gindex 2945/2946</td></tr>
+      <tr><td>How the decoder knows the format</td><td>sniffed from leading offsets</td><td>told by the caller (fork of the attested or header slot)</td></tr>
+      <tr><td>Snapshot file</td><td>LCSS v1</td><td>LCSS v2, a shape tag per header</td></tr>
+    </tbody>
+  </table></div>
+  <p>One thing does not change: the signing domain. A signature is still verified under the fork version of the epoch of <code>max(signature_slot, 1) − 1</code>, while the wire format follows the slot's own fork with no off-by-one. At the first Gloas slot the objects are Gloas-shaped, but a signature made <em>at</em> that slot still uses the Fulu domain (<a href="#f-myotis-consensus-src-fork-rs">fork.rs</a> pins both in one test).</p>
+</div>
+
+<div class="callout rust"><span class="k">What changed since September</span>Gloas support (<code>LcFork</code>, <code>HeaderExecution</code>, <code>decode_for</code>, the Gloas gindices, the normalized branch check, the shape gate, <code>verify_bootstrap</code> with <code>BootstrapReject</code>, snapshot v2). A new adoption rule for the next committee (<code>tests/next_committee_adoption.rs</code>). <code>apply_finality_update</code> and <code>FinalityOutcome</code>, which tell a stale but valid finality update from one that advanced the store. A doc note that <code>optimistic_slot</code> is the <em>signature</em> slot (#658). And <code>no_std</code> + <code>alloc</code> support.</div>
+
+<x-file path="rust/myotis-consensus/src/lib.rs" kind="crate root" twin="consensus module">
+  <p class="purpose">Crate root: seven modules, a re-export of the BLS domain-separation tag, and two unit tests. One test asserts that <code>fast_aggregate_verify</code> returns <code>false</code> for empty input, all-zero keys, a 47-byte key and a count of 5000, without panicking. The doc comment records the crate's proof of correctness: replaying <code>rust/testdata/lc/mainnet</code> reproduces the Java verdicts in <code>expected.txt</code>.</p>
+  <x-code src="myotis-consensus/src/lib.rs" from="15" to="30"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo</x-tags> <strong>Conditional <code>no_std</code>.</strong> <code>#![cfg_attr(not(feature = "std"), no_std)]</code> applies the crate attribute <code>no_std</code> only when the <code>std</code> feature is off. <code>extern crate alloc;</code> then brings in the heap types (<code>Vec</code>, <code>String</code>, <code>Box</code>) that <code>core</code> lacks. In a <code>no_std</code> build those names are not in the prelude, so every module imports them from <code>alloc</code> with <code>#[allow(unused_imports)]</code>. In a normal <code>std</code> build the same names are already in the prelude, the import becomes redundant, and the attribute silences the warning.</li>
+    <li><x-tags>lifetimes testing</x-tags> <code>&amp;'static [u8]</code>: the DST is a byte-string literal compiled into the binary, so the reference is valid for the whole run. <code>#[cfg(test)] mod tests</code> with <code>super::bls_dst()</code> is the standard unit-test layout.</li>
+  </ul>
+  <div class="callout watch"><span class="k">Stale or inaccurate comments</span>The module doc still says this is “plan PR 4” and that networking “is the next stage; no I/O lives in this crate yet”. Networking landed long ago, in <code>myotis-net</code>, and this crate stays I/O-free by design: its <code>Cargo.toml</code> calls the light-client core sans-I/O.</div>
+</x-file>
+
+<x-file path="rust/myotis-consensus/src/spec.rs" kind="library" twin="BeaconChainSpec">
+  <p class="purpose">Mainnet-preset constants, the Gloas gindex constants, generalized-index (gindex) helpers for the pre-Gloas branch depths, and the sync-committee period math. A gindex numbers the nodes of a binary Merkle tree: the root is 1, and the children of node <em>g</em> are 2<em>g</em> and 2<em>g</em>+1. So its bit length minus one is the node's depth, which is exactly what <code>gindex_depth</code> computes.</p>
+  <x-code src="myotis-consensus/src/spec.rs" from="14" to="47"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain</x-tags> <strong>Why constants.</strong> The comment says it: the Gloas state is a progressive container, so the depth-derived formulas below give 553, 2070 and 2071 for the Gloas depths, not 735, 2945 and 2946. A unit test (<code>gloas_gindices_are_constants_not_depth_derived</code>) pins both the values and the mismatch.</li>
+    <li><x-tags>methods</x-tags> <code>pub const fn</code> can run at compile time, so <code>GLOAS_EXECUTION_BRANCH_LEN</code> is <em>computed</em> from the gindex instead of being typed in a second time. <code>leading_zeros</code> is a single CPU instruction on a <code>u64</code>.</li>
+  </ul>
+  <x-code src="myotis-consensus/src/spec.rs" from="53" to="81"></x-code>
+  <ul class="concepts">
+    <li><x-tags>error-handling</x-tags> <strong>Two kinds of failure, two tools.</strong> A bad branch depth comes from data, so it returns gindex 0, which can never verify: a safe rejection. <code>1u64 &lt;&lt; 64</code> would overflow, and with overflow checks enabled that panics.</li>
+    <li><x-tags>bytes-strings</x-tags> A function body's final expression without a semicolon is its return value: <code>checkpoint_gindex * 2 + 1</code>. The <code>u64</code> suffix fixes the literal's width before the shift. The <code>* 2 + 1</code> steps one level further down into the <code>Checkpoint</code> container, to its field 1 (<code>root</code>).</li>
+  </ul>
+  <x-code src="myotis-consensus/src/spec.rs" from="105" to="117"></x-code>
+  <p class="code-note"><x-tags>error-handling domain</x-tags> The earlier part of this doc comment (lines 92–103) explains that 8192 slots per period is right on gnosis only <em>by coincidence</em> (16-slot epochs × 512 epochs), so the period length must be configuration the wallet is <em>told</em>. A zero period is a build-time configuration mistake, so it gets <code>assert!</code>, which stays on in release builds, unlike <code>debug_assert!</code>.</p>
+</x-file>
+
+<x-file path="rust/myotis-consensus/src/ssz.rs" kind="library" twin="SszUtil">
+  <p class="purpose">Hand-written SSZ primitives: SHA-256 pair hashing, merkleization with padding, container and list roots, Merkle-branch verification (now in two flavors), and <em>checked</em> little-endian readers. Hand-written because the pre-Gloas light-client wire types are fork-polymorphic, with sizes sniffed at run time, which derive-based SSZ libraries can't express.</p>
+  <x-code src="myotis-consensus/src/ssz.rs" from="44" to="58"></x-code>
+  <ul class="concepts">
+    <li><x-tags>borrowing</x-tags> <code>layer[i] = sha256_pair(&amp;layer[2 * i], &amp;layer[2 * i + 1]);</code> The two shared borrows on the right end when the call returns, before the indexed write happens. That's why an in-place reduction compiles.</li>
+    <li><x-tags>traits-generics</x-tags> In <code>sha256_pair</code> (line 21), <code>h.finalize().into()</code> converts the digest into <code>[u8; 32]</code>. The target type is inferred from the function's return type.</li>
+  </ul>
+  <x-code src="myotis-consensus/src/ssz.rs" from="124" to="166"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership</x-tags> <code>let mut value = *leaf;</code> copies 32 bytes out of the reference, since <code>Root = [u8; 32]</code> is <code>Copy</code>, then the loop overwrites the local copy. Bit <em>i</em> of the index says whether the running value is the right or the left child at level <em>i</em>. Only the low <code>depth</code> bits are read, so passing the full gindex works.</li>
+    <li><x-tags>domain</x-tags> <strong>The normalized check is new.</strong> It accepts a branch that is <em>longer</em> than the gindex's depth only when every extra leading node is zero, then verifies the rest normally. That is how a Fulu header in the Gloas shape fits its 9-level proof into an 11-node vector.</li>
+    <li><x-tags>error-handling enums-patterns</x-tags> <code>let Some(extra) = branch.len().checked_sub(depth) else { return false; };</code> turns “shorter than the depth” (an underflow) into a rejection. <code>&amp;&amp;</code> short-circuits, so the hashing never runs on a dirty pad.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>branch[..extra].iter().all(|node| *node == [0u8; 32])</code>: a sub-slice, an iterator over references, and a closure that dereferences each one to compare the arrays by value.</li>
+  </ul>
+  <x-code src="myotis-consensus/src/ssz.rs" from="168" to="182"></x-code>
+  <p class="code-note"><x-tags>error-handling bytes-strings</x-tags> <code>data.get(offset..offset + 4)</code> is <code>None</code> when out of range. Inside <code>.map(…)</code> the slice is guaranteed to be exactly 4 bytes, so <code>try_into().unwrap()</code> cannot fail. This is an <code>unwrap</code> with a proof beside it.</p>
+</x-file>
+
+<x-file path="rust/myotis-consensus/src/types.rs" kind="library" twin="consensus.types decoders">
+  <p class="purpose">SSZ decoders and <code>hash_tree_root</code> for the light-client containers. The pre-Gloas decoders, like the Java ones, <em>sniff</em> pre-Electra vs Electra layouts from leading offsets. The Gloas decoders take an exact size and nothing else. Malformed input returns <code>Err(SszError)</code>, never panics. The unit tests reproduce panics that were fixed earlier and pin the Gloas sizes.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–31</td><td>Module doc, <code>SszError</code> (with <code>Display</code> and, under <code>std</code>, <code>std::error::Error</code>), the <code>err</code> helper.</td></tr>
+      <tr><td>33–86</td><td><code>BeaconBlockHeader</code> (112 bytes), with <code>encode</code> returning <code>[u8; Self::ENCODED_SIZE]</code>.</td></tr>
+      <tr><td>88–148</td><td><code>SyncCommittee</code> (24,624 bytes), with a hand-written <code>Debug</code>.</td></tr>
+      <tr><td>150–186</td><td><code>SyncAggregate</code> (160 bytes), <code>count_participants</code>, <code>get_bit</code>.</td></tr>
+      <tr><td>188–301</td><td><code>ExecutionPayloadHeader</code>: Deneb 584 / Electra 680 bytes; request roots are <code>Option</code>.</td></tr>
+      <tr><td>303–437</td><td><code>HeaderExecution</code>, <code>LightClientHeader</code> in both shapes, <code>read_roots</code>.</td></tr>
+      <tr><td>439–524</td><td><code>LightClientBootstrap</code>: Gloas 25,472 bytes; pre-Gloas branch of 5 or 6 nodes.</td></tr>
+      <tr><td>526–664</td><td><code>LightClientUpdate</code>: Gloas 26,424 bytes; pre-Gloas branches 5/6 and 6/7.</td></tr>
+      <tr><td>666–783</td><td><code>LightClientFinalityUpdate</code>: Gloas 1,448 bytes; pre-Gloas branch 6 or 7.</td></tr>
+      <tr><td>785–812</td><td>Compile-time proof that a Gloas object is never the size of a pre-Gloas one.</td></tr>
+      <tr><td>814–943</td><td>Tests.</td></tr>
+    </tbody>
+  </table></div>
+  <x-code src="myotis-consensus/src/types.rs" from="95" to="123"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership smart-pointers</x-tags> <strong>Heap vs inline.</strong> <code>pubkeys: Vec&lt;u8&gt;</code> is 24,576 bytes on the heap; <code>aggregate_pubkey: [u8; 48]</code> sits inside the struct. Cloning a <code>SyncCommittee</code> copies the whole <code>Vec</code>, which is why <code>store.rs</code> prefers moving committees.</li>
+    <li><x-tags>borrowing</x-tags> <code>pubkey(&amp;self, i) -&gt; &amp;[u8]</code> lends a 48-byte window into the flat buffer, with no copy.</li>
+    <li><x-tags>traits-generics</x-tags> The type derives <code>Clone, PartialEq, Eq</code> but implements <code>Debug</code> by hand (lines 144–148), the Rust spelling of overriding <code>toString()</code>, so a log line doesn't print 24 KB of hex.</li>
+  </ul>
+  <h4>One header, two shapes</h4>
+  <x-code src="myotis-consensus/src/types.rs" from="309" to="334"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns</x-tags> <strong>A sum type.</strong> In Kotlin you would write a <code>sealed class</code> with two subclasses; in Java a sealed interface with two records. A Rust <code>enum</code> variant can carry data, and a value is exactly one variant at a time. The compiler forces every <code>match</code> to handle both, so no code path can forget that a Gloas header has no state root.</li>
+    <li><x-tags>smart-pointers ownership</x-tags> <strong>Why <code>Box</code>.</strong> An enum is as large as its largest variant. An <code>ExecutionPayloadHeader</code> is about 470 bytes inline (eight roots, two <code>Vec</code> handles, six <code>u64</code>, three <code>Option&lt;Root&gt;</code>), against 32 for the hash. <code>Box&lt;ExecutionPayloadHeader&gt;</code> moves the payload to the heap and leaves an 8-byte pointer in the enum, so a Gloas header doesn't pay for space it never uses. The <code>Box</code> owns its contents: dropping the header frees them, and <code>clone()</code> deep-copies them.</li>
+    <li><x-tags>traits-generics</x-tags> <code>impl Default for HeaderExecution</code> is written by hand because <code>#[derive(Default)]</code> on an enum needs a <code>#[default]</code> unit variant. <code>Box::default()</code> builds a boxed <code>ExecutionPayloadHeader::default()</code>, which is what lets <code>LightClientHeader</code> keep its <code>#[derive(Default)]</code>.</li>
+  </ul>
+  <x-code src="myotis-consensus/src/types.rs" from="398" to="430"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns borrowing</x-tags> <code>match &amp;self.execution</code> matches through a reference, so <code>p</code> binds as <code>&amp;Box&lt;ExecutionPayloadHeader&gt;</code> and <code>h</code> as <code>&amp;Root</code>. <code>*h</code> copies the 32 bytes out. <code>p.as_ref()</code> turns the <code>&amp;Box&lt;T&gt;</code> into a plain <code>&amp;T</code>.</li>
+    <li><x-tags>enums-patterns ownership</x-tags> <code>shape()</code> writes <code>match self.execution</code> <em>without</em> <code>&amp;</code>, even though <code>self</code> is only borrowed. That compiles because the patterns use <code>_</code>, which binds nothing, so nothing is moved out. Write <code>Payload(p)</code> there and the compiler refuses: it would have to move the <code>Box</code> out of borrowed data.</li>
+    <li><x-tags>domain</x-tags> <code>shape()</code> is the shape the bytes were decoded from, <em>not</em> the fork of the header's slot. The two differ for exactly one case: a Fulu finalized header carried by a Gloas update.</li>
+  </ul>
+  <p class="code-note"><x-tags>error-handling</x-tags> <code>decode_gloas</code> just above (lines 379–396) requires <code>len() == GLOAS_SIZE</code> exactly, not “at least”. One byte short or one byte long is an <code>Err</code>: there is no tail to silently ignore. It reads the 11 branch nodes with <code>read_roots</code>, which collects into an <code>Option&lt;Vec&lt;Root&gt;&gt;</code> (lines 433–437).</p>
+  <h4>Sniffing a pre-Gloas bootstrap</h4>
+  <x-code src="myotis-consensus/src/types.rs" from="488" to="524"></x-code>
+  <ul class="concepts">
+    <li><x-tags>error-handling iterators-closures</x-tags> <code>.collect::&lt;Option&lt;_&gt;&gt;()</code> on an iterator of <code>Option&lt;Root&gt;</code> yields <code>Some(Vec)</code> if <em>every</em> read succeeded and <code>None</code> at the first gap: all or nothing, for free. <code>ok_or_else(…)?</code> turns the gap into an early <code>Err</code>.</li>
+    <li><x-tags>error-handling domain</x-tags> <code>branch_nodes</code> comes from an <strong>attacker-controlled offset</strong>, so the branch reads are checked. The fixed-position read <code>read_u32(ssz_bytes, 0).unwrap()</code> is safe because the length was checked first. Note also <code>checked_sub(…).unwrap_or(0)</code>: an underflow becomes 0, which then fails the 5-or-6 check.</li>
+  </ul>
+  <p class="code-note"><x-tags>iterators-closures</x-tags> In the payload header (lines 271–273), <code>is_electra.then(|| g(584))</code> reads the Electra request roots <em>only when</em> the flag is true. <code>bool::then</code> takes a closure, so nothing is evaluated eagerly.</p>
+  <h4>A Gloas update: offsets as constants</h4>
+  <x-code src="myotis-consensus/src/types.rs" from="562" to="594"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo</x-tags> A <code>const</code> inside a function is still a compile-time constant. Each offset is built from the previous one, so the layout reads top to bottom like the spec's container definition.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>let truncated = || SszError(…);</code> captures nothing, and a closure that captures nothing is <code>Copy</code>. That is why the same <code>truncated</code> can be passed by value to <code>ok_or_else</code> four times.</li>
+    <li><x-tags>error-handling</x-tags> The slices <code>&amp;ssz_bytes[..H]</code> and so on index directly, which would panic out of range. They cannot: every bound is a constant below the exact length checked on line 564.</li>
+  </ul>
+  <x-code src="myotis-consensus/src/types.rs" from="789" to="812"></x-code>
+  <p class="code-note"><x-tags>macros domain</x-tags> <code>const _: () = assert!(…);</code> is Rust's static assert. The expression is evaluated at compile time, and a failing <code>assert!</code> in a const context is a build error. The fact being proven is that a Gloas object is always smaller than the smallest canonical pre-Gloas one. So if the sync loop receives an object under a fork digest it does not recognize, the size alone tells the two formats apart without misreading. The comment names the consumer, <code>ChainConfig::lc_fork_of_chunk</code> in <code>myotis-net</code>.</p>
+</x-file>
+
+<x-file path="rust/myotis-consensus/src/verify.rs" kind="library" twin="SyncCommitteeVerifier + ForkData.computeDomain">
+  <p class="purpose">Signature verification in three functions: <code>compute_domain</code>, <code>compute_signing_root</code>, and <code>verify_sync_aggregate</code>. The last requires at least 2/3 participation using integer math, flattens the participating pubkeys, and makes a single <code>myotis_bls</code> call. Gloas changed nothing here: the signature still covers only the beacon header.</p>
+  <x-code src="myotis-consensus/src/verify.rs" from="33" to="68"></x-code>
+  <ul class="concepts">
+    <li><x-tags>borrowing</x-tags> A borrow-only API: every parameter is <code>&amp;</code>. The function reads and allocates only its own scratch buffer.</li>
+    <li><x-tags>ownership</x-tags> <code>pubkeys.extend_from_slice(committee.pubkey(i))</code> copies each borrowed 48-byte window into an owned, pre-sized buffer. That flat layout is exactly what <code>fast_aggregate_verify</code> expects.</li>
+    <li><x-tags>borrowing lifetimes</x-tags> <code>&amp;attested_header.hash_tree_root()</code> borrows a <em>temporary</em>. Temporaries live until the end of the enclosing statement, so the reference stays valid during the call.</li>
+    <li><x-tags>domain</x-tags> <code>participants * 3 &lt; 512 * 2</code> is the 2/3 threshold without floating point.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/myotis-consensus/src/fork.rs" kind="library" twin="ForkSchedule">
+  <p class="purpose">A network's append-only list of <code>(activation_epoch, fork_version)</code>, that chain's slots per epoch, and now the epoch at which Gloas activates. It answers two different questions. “Which version signed an aggregate at <code>signature_slot</code>?” uses the epoch of <code>max(slot, 1) − 1</code>. “Which wire format do this slot's objects use?” uses the slot's own epoch. The module docs explain the #295 bug the schedule fixed: with a single configured version, sync stalled at every fork boundary.</p>
+  <x-code src="myotis-consensus/src/fork.rs" from="37" to="52"></x-code>
+  <p class="code-note"><x-tags>enums-patterns traits-generics</x-tags> A data-less enum that derives <code>Copy</code>, <code>PartialEq</code> and <code>Eq</code> behaves like a Java enum constant: it is passed by value, compared with <code>==</code>, and costs one byte. There are only two variants because the pre-Gloas decoders still tell Capella through Fulu apart by sniffing; only Gloas has to be named.</p>
+  <x-code src="myotis-consensus/src/fork.rs" from="54" to="72"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics</x-tags> <strong>Invariants through privacy.</strong> The fields are private and <code>new</code> (lines 80–97) is the only constructor. It asserts a non-zero slot length, a non-empty list, a genesis entry at epoch 0, and strictly ascending epochs (using <code>forks.windows(2)</code>). That is what makes <code>newest()</code>'s <code>self.forks[self.forks.len() - 1]</code> safe.</li>
+    <li><x-tags>error-handling</x-tags> The constructor <em>panics</em> on invalid geometry, deliberately. These values come from compile-time constants, and a <code>Result</code> nobody could meaningfully handle would just hide the mistake.</li>
+    <li><x-tags>ownership borrowing</x-tags> <code>new(…, forks: &amp;[(u64, [u8; 4])])</code> borrows the caller's constant list and stores an owned copy (<code>forks.to_vec()</code>).</li>
+  </ul>
+  <x-code src="myotis-consensus/src/fork.rs" from="99" to="131"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership methods</x-tags> <strong>A consuming builder.</strong> <code>with_gloas_epoch(mut self, epoch) -&gt; Self</code> takes the schedule <em>by value</em>, changes one field, and hands it back. A caller writes <code>ForkSchedule::new(…).with_gloas_epoch(10)</code>. The original binding is moved into the call, so no other code can hold a half-configured copy. The <code>mut</code> belongs to the parameter binding, not to the type.</li>
+    <li><x-tags>enums-patterns</x-tags> <code>Some(gloas) if epoch &gt;= gloas =&gt; LcFork::Gloas</code> is a match arm with a <em>guard</em>. If the guard is false the arm doesn't match and <code>_</code> catches it, which also covers <code>None</code>: a chain with no Gloas date is pre-Gloas forever.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>.any(|(activation, _)| *activation == epoch)</code> destructures each borrowed tuple in the closure's parameter. <code>activation</code> is a <code>&amp;u64</code>, hence the <code>*</code>.</li>
+  </ul>
+  <x-code src="myotis-consensus/src/fork.rs" from="164" to="194"></x-code>
+  <ul class="concepts">
+    <li><x-tags>iterators-closures</x-tags> <code>(i &gt;= 1).then(|| self.forks[i - 1].1)</code> only evaluates the closure when <code>i ≥ 1</code>. <code>then_some(self.forks[i - 1].1)</code> would evaluate the argument first, underflow <code>usize</code> for <code>i == 0</code>, and crash.</li>
+    <li><x-tags>domain</x-tags> <code>signature_slot.max(1) - 1</code> is the spec's <code>max(signature_slot, 1) - 1</code>. The aggregate signs the block of the previous slot, so the first slot of a new fork's epoch still signs under the old version.</li>
+  </ul>
+  <x-code src="myotis-consensus/src/fork.rs" from="291" to="307"></x-code>
+  <p class="code-note"><x-tags>testing domain</x-tags> The two rules side by side: slot 640 is the first Gloas slot, its objects are Gloas-shaped, and a signature at that slot still verifies under version B (the fork before). The message on the second assert (“no date is not a far-future date”) records a design choice: a missing Gloas epoch is <code>None</code>, never <code>u64::MAX</code>.</p>
+</x-file>
+
+<x-file path="rust/myotis-consensus/src/store.rs" kind="library" twin="LightClientStore / LightClientProcessor">
+  <p class="purpose">Two types and a free function. <code>LightClientStore</code> is the state: finalized and optimistic headers and slots, the current and next committees, the current period, and this chain's slots per period. <code>LightClientProcessor</code> owns a store and applies updates through a fixed sequence of gates. <code>verify_execution_branch_at</code> binds a signed beacon header to the execution layer, in either shape. The single clock input (<code>force_rotate_if_past_period</code>) is a plain parameter.</p>
+
+  <figure class="diagram">
+    <div class="svg-wrap">
+    <svg class="wide-diagram" viewBox="0 0 900 230" role="img" fill="currentColor" xmlns="http://www.w3.org/2000/svg"
+         aria-label="The order of checks in process_update. Row one: 1 committee gate, 2 adoption gate, 3 shape gate, 4 BLS verify. Row two: 5 finality branch, 6 execution branches, 7 next-committee branch, 8 apply and rotate. Steps 1 to 3 are cheap and run before the expensive BLS verify.">
+      <defs>
+        <marker id="m-stop06-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+      <rect x="20" y="20" width="185" height="72" rx="9" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+      <text x="112" y="44" text-anchor="middle" font-size="13" font-weight="700">1 · Committee gate</text>
+      <text x="112" y="63" text-anchor="middle" font-size="10.5" class="mono" style="fill:var(--ink-2)">period(signature_slot)</text>
+      <text x="112" y="80" text-anchor="middle" font-size="10.5" style="fill:var(--ink-3)">P: current · P+1: held next</text>
+
+      <rect x="245" y="20" width="185" height="72" rx="9" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+      <text x="337" y="44" text-anchor="middle" font-size="13" font-weight="700">2 · Adoption gate</text>
+      <text x="337" y="63" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">only when no next is held:</text>
+      <text x="337" y="80" text-anchor="middle" font-size="10.5" style="fill:var(--ink-3)">attested in the store's period</text>
+
+      <rect x="470" y="20" width="185" height="72" rx="9" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+      <text x="562" y="44" text-anchor="middle" font-size="13" font-weight="700">3 · Shape gate</text>
+      <text x="562" y="63" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">both headers in the shape</text>
+      <text x="562" y="80" text-anchor="middle" font-size="10.5" style="fill:var(--ink-3)">of the attested slot's fork</text>
+
+      <rect x="695" y="20" width="185" height="72" rx="9" stroke-width="1.6" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="787" y="44" text-anchor="middle" font-size="13" font-weight="700">4 · BLS verify</text>
+      <text x="787" y="63" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">≥ 2/3 of 512, version of</text>
+      <text x="787" y="80" text-anchor="middle" font-size="10.5" class="mono" style="fill:var(--ink-3)">signature_slot − 1</text>
+
+      <line x1="205" y1="56" x2="242" y2="56" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop06-arrow)"/>
+      <line x1="430" y1="56" x2="467" y2="56" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop06-arrow)"/>
+      <line x1="655" y1="56" x2="692" y2="56" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop06-arrow)"/>
+      <path d="M787 92 V112 H112 V135" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop06-arrow)"/>
+
+      <rect x="20" y="138" width="185" height="72" rx="9" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+      <text x="112" y="162" text-anchor="middle" font-size="13" font-weight="700">5 · Finality branch</text>
+      <text x="112" y="181" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">in the attested state</text>
+      <text x="112" y="198" text-anchor="middle" font-size="10.5" style="fill:var(--ink-3)">Gloas 735 · before 105/169</text>
+
+      <rect x="245" y="138" width="185" height="72" rx="9" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+      <text x="337" y="162" text-anchor="middle" font-size="13" font-weight="700">6 · Execution branches</text>
+      <text x="337" y="181" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">attested and finalized,</text>
+      <text x="337" y="198" text-anchor="middle" font-size="10.5" style="fill:var(--ink-3)">each by its own slot's rule</text>
+
+      <rect x="470" y="138" width="185" height="72" rx="9" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+      <text x="562" y="162" text-anchor="middle" font-size="13" font-weight="700">7 · Next committee</text>
+      <text x="562" y="181" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">only when none is held</text>
+      <text x="562" y="198" text-anchor="middle" font-size="10.5" style="fill:var(--ink-3)">Gloas 2946 · before 55/87</text>
+
+      <rect x="695" y="138" width="185" height="72" rx="9" stroke-width="1.4" style="fill:var(--ok-wash);stroke:var(--ok)"/>
+      <text x="787" y="162" text-anchor="middle" font-size="13" font-weight="700">8 · Apply</text>
+      <text x="787" y="181" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">finalized, optimistic;</text>
+      <text x="787" y="198" text-anchor="middle" font-size="10.5" style="fill:var(--ink-3)">rotate if finalized crosses</text>
+
+      <line x1="205" y1="174" x2="242" y2="174" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop06-arrow)"/>
+      <line x1="430" y1="174" x2="467" y2="174" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop06-arrow)"/>
+      <line x1="655" y1="174" x2="692" y2="174" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop06-arrow)"/>
+    </svg>
+    </div>
+    <figcaption>The order inside <code>process_update</code>. Any failed step returns <code>false</code> and leaves the store untouched. Steps 1 to 3 are cheap and run before the BLS verify, which a doc comment in <code>tests/gloas_boundary.rs</code> puts at about 17 to 30 seconds per verify on Android's runtime (ART). <code>process_finality_update</code> runs the same order without steps 2 and 7.</figcaption>
+  </figure>
+
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>17–63</td><td>The store struct, <code>new</code> (refuses a zero period), <code>new_mainnet_preset</code>, <code>period_of</code>.</td></tr>
+      <tr><td>65–121</td><td><code>initialize</code>, monotonic header updates, and the two rotation paths.</td></tr>
+      <tr><td>123–180</td><td>Lending getters, <code>snapshot()</code>, consuming <code>restore(s)</code>.</td></tr>
+      <tr><td>182–196</td><td><code>headers_in_attested_forks_shape</code>: the shape gate as a public free function, so diagnostics in <code>myotis-net</code> (<code>period_census</code>, the live pin check) reuse it.</td></tr>
+      <tr><td>198–287</td><td><code>LightClientProcessor</code>, the two header checks, <code>verify_bootstrap</code>.</td></tr>
+      <tr><td>289–312</td><td><code>verify_finality_branch</code>: the gindex by the attested slot's fork.</td></tr>
+      <tr><td>314–455</td><td><code>process_update</code>.</td></tr>
+      <tr><td>457–470</td><td><code>committee_for</code>: the period gate and key selection in one place.</td></tr>
+      <tr><td>472–558</td><td><code>process_finality_update</code> and <code>apply_finality_update</code>.</td></tr>
+      <tr><td>560–592</td><td><code>FinalityOutcome</code>, <code>BootstrapReject</code> and its <code>Display</code>.</td></tr>
+      <tr><td>594–636</td><td><code>verify_execution_branch_at</code>.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The state and how it rotates</h4>
+  <x-code src="myotis-consensus/src/store.rs" from="65" to="74"></x-code>
+  <p class="code-note"><x-tags>ownership</x-tags> <code>initialize</code> takes the header and committee <strong>by value</strong>. It needs the header twice, so it clones once (line 70) and moves the original (line 71). After line 71, <code>header</code> can't be used. In Java, both fields would simply alias one object. The constructor above it, <code>Self { slots_per_period, ..Self::default() }</code>, uses <em>struct update syntax</em>: every field not listed comes from <code>Default</code>.</p>
+  <x-code src="myotis-consensus/src/store.rs" from="98" to="121"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership enums-patterns</x-tags> <code>self.next_sync_committee.take()</code> moves the 24 KB committee out and leaves <code>None</code>, exactly the state the store needs next, with no copy. It's <code>mem::replace(&amp;mut x, None)</code> with a friendlier name. The old current committee is dropped when it's overwritten.</li>
+    <li><x-tags>domain</x-tags> Two triggers, one effect. <code>apply_next_when_period_changes</code> rotates when an applied update's finalized slot crosses into a later period. <code>force_rotate_if_past_period</code> rotates when the caller's wall-clock estimate is past the store's period. Both need a held next committee: without one there is nothing to rotate into.</li>
+  </ul>
+
+  <figure class="diagram">
+    <div class="svg-wrap">
+    <svg class="wide-diagram" viewBox="0 0 900 250" role="img" fill="currentColor" xmlns="http://www.w3.org/2000/svg"
+         aria-label="Store state machine. Uninitialized moves to period P without next committee through initialize or restore. A verified update attested in P whose next-committee branch checks out moves it to period P with next committee held. When the finalized slot crosses into a later period, or the wall clock is past P, next is taken into current and the period increments, returning to the no-next state at P plus one.">
+      <defs>
+        <marker id="m-stop06-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+      <rect x="20" y="70" width="170" height="70" rx="10" stroke-width="1.4" stroke-dasharray="5 4" style="fill:none;stroke:var(--ink-3)"/>
+      <text x="105" y="100" text-anchor="middle" font-size="13.5" font-weight="700">Uninitialized</text>
+      <text x="105" y="119" text-anchor="middle" font-size="11" class="mono" style="fill:var(--ink-3)">current = None</text>
+
+      <rect x="330" y="70" width="210" height="70" rx="10" stroke-width="1.5" style="fill:var(--surface);stroke:var(--ink-2)"/>
+      <text x="435" y="98" text-anchor="middle" font-size="13.5" font-weight="700">Period P</text>
+      <text x="435" y="117" text-anchor="middle" font-size="11.5" class="mono">next = None</text>
+      <text x="435" y="133" text-anchor="middle" font-size="10.5" style="fill:var(--ink-3)">only P verifies (current keys)</text>
+
+      <rect x="680" y="70" width="200" height="70" rx="10" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="780" y="98" text-anchor="middle" font-size="13.5" font-weight="700">Period P</text>
+      <text x="780" y="117" text-anchor="middle" font-size="11.5" class="mono">next = Some(committee)</text>
+      <text x="780" y="133" text-anchor="middle" font-size="10.5" style="fill:var(--ink-3)">P current keys · P+1 next keys</text>
+
+      <line x1="190" y1="105" x2="327" y2="105" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop06-arrow2)"/>
+      <text x="258" y="95" text-anchor="middle" font-size="11" class="mono" style="fill:var(--ink-2)">initialize()</text>
+      <text x="258" y="124" text-anchor="middle" font-size="11" class="mono" style="fill:var(--ink-2)">restore()</text>
+
+      <line x1="540" y1="96" x2="677" y2="96" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop06-arrow2)"/>
+      <text x="608" y="46" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">an update attested in P</text>
+      <text x="608" y="62" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">verifies, and its next-</text>
+      <text x="608" y="78" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">committee branch checks</text>
+
+      <path d="M780 140 C 780 215, 435 215, 435 143" fill="none" stroke-width="1.6" style="stroke:var(--oxide)" marker-end="url(#m-stop06-arrow2)"/>
+      <text x="608" y="188" text-anchor="middle" font-size="11.5" class="mono" style="fill:var(--oxide-ink)">current = next.take(); period += 1</text>
+      <text x="608" y="206" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">finalized slot crosses a period, or wall clock is past P</text>
+      <text x="608" y="236" text-anchor="middle" font-size="11" style="fill:var(--ink-3)">(back in “next = None”, now at P+1)</text>
+    </svg>
+    </div>
+    <figcaption>Selecting the committee <em>is</em> the gate: a signature from period P is checked with the current committee, one from P+1 only with a <em>held</em> next committee, and anything else is rejected before any BLS work (#423). The middle arrow is narrower than it was in September: only an update <em>attested</em> in P may supply the next committee (see <a href="#f-myotis-consensus-tests-next-committee-adoption-rs">next_committee_adoption.rs</a>).</figcaption>
+  </figure>
+
+  <h4>The bootstrap check</h4>
+  <x-code src="myotis-consensus/src/store.rs" from="250" to="281"></x-code>
+  <ul class="concepts">
+    <li><x-tags>error-handling enums-patterns</x-tags> <code>Result&lt;(), BootstrapReject&gt;</code> is Rust's “success with no value, or one of three reasons”. The caller in <code>myotis-net/src/sync.rs</code> writes <code>if let Err(reason) = processor.verify_bootstrap(&amp;bootstrap)</code> and logs the reason through its <code>Display</code> impl (lines 584–592).</li>
+    <li><x-tags>enums-patterns</x-tags> <code>let (depth, gindex) = match fork { … };</code> A <code>match</code> is an expression, here producing a tuple that is destructured right away. The Gloas arm uses constants; the pre-Gloas arm derives both from the branch's length.</li>
+    <li><x-tags>domain</x-tags> The checkpoint pin itself (does this header's root equal the root we trust?) is the caller's job, as the doc comment says. This function proves everything else.</li>
+  </ul>
+
+  <h4>process_update, gate by gate</h4>
+  <x-code src="myotis-consensus/src/store.rs" from="314" to="339"></x-code>
+  <ul class="concepts">
+    <li><x-tags>error-handling enums-patterns</x-tags> <code>let Some(committee) = self.committee_for(sig_period) else { …; return false; };</code> binds the reference or leaves. The <code>else</code> block must diverge (return, break, panic), which the compiler checks.</li>
+    <li><x-tags>macros</x-tags> <code>tracing::debug!(store_period, sig_period, have_next = …, "…")</code> logs structured fields. A bare name like <code>store_period</code> is shorthand for <code>store_period = store_period</code>, and <code>?</code> (used further down) means “format with <code>Debug</code>”.</li>
+  </ul>
+  <x-code src="myotis-consensus/src/store.rs" from="341" to="370"></x-code>
+  <p class="code-note"><x-tags>domain</x-tags> <strong>The adoption gate (new).</strong> An update carries the next committee of its <em>attested</em> state, which is the committee of period(attested) + 1. The update that slipped through before is the last block of P−1, signed at the first slot of P. It passes the committee gate, its signature verifies against our current keys, and its next committee is genuinely committee(P), with a genuine branch. Adopting it would install committee(P) as P+1's keys at the next rotation, and every P+1 update would fail BLS from then on. The comment also explains a conscious deviation: the spec's apply step wants the <em>finalized</em> header in the store's period too, but this client adopts from the attested state so catch-up doesn't stall at a period that never finalized.</p>
+  <x-code src="myotis-consensus/src/store.rs" from="372" to="395"></x-code>
+  <ul class="concepts">
+    <li><x-tags>borrowing lifetimes</x-tags> <strong>Non-lexical lifetimes.</strong> <code>committee</code> is a <code>&amp;SyncCommittee</code> borrowed through <code>&amp;self</code>. While it is alive, nothing may mutate <code>self</code>. Its last use is the BLS call (line 383), so the borrow ends there, and the <code>&amp;mut</code> call <code>self.store.update_next_sync_committee(…)</code> on line 445 is allowed. Move a use of <code>committee</code> below line 445 and the code stops compiling. The <code>&amp;self</code> calls in between (<code>verify_finality_branch</code>, <code>verify_header</code>) are shared borrows, which may overlap freely.</li>
+    <li><x-tags>domain</x-tags> <code>used_next = sig_period != store_period</code> computes a <code>bool</code> just for the log line, so a reader of a failure knows which committee's keys were tried.</li>
+  </ul>
+  <x-code src="myotis-consensus/src/store.rs" from="421" to="455"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership</x-tags> <code>update.next_sync_committee.clone()</code> copies 24 KB because the update is only <em>borrowed</em> (<code>&amp;LightClientUpdate</code>); its fields can't be moved out. The alternative signature, <code>process_update(&amp;mut self, update: LightClientUpdate)</code>, would let the store move the committee but would force every caller to give up its update.</li>
+    <li><x-tags>domain</x-tags> The order matters: a held next committee is never overwritten. The execution branches are checked separately (step 6, lines 411–419) because the sync-committee signature does not cover the execution part of the header.</li>
+    <li><x-tags>domain</x-tags> <code>update_optimistic</code> receives the <em>signature</em> slot, not the attested header's slot. The doc on <code>optimistic_slot()</code> (lines 138–146) says why: the value orders updates, and a slot to show the user is <code>optimistic_header().beacon.slot</code> (#658).</li>
+  </ul>
+  <x-code src="myotis-consensus/src/store.rs" from="457" to="470"></x-code>
+  <p class="code-note"><x-tags>borrowing</x-tags> <code>Option&lt;&amp;SyncCommittee&gt;</code> lends, never copies. The returned reference's lifetime is tied to <code>&amp;self</code> by lifetime elision, which is exactly why the NLL point above matters.</p>
+
+  <h4>Stale is not a win</h4>
+  <x-code src="myotis-consensus/src/store.rs" from="536" to="571"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns</x-tags> A three-way answer instead of <code>bool</code>. Tuples compare field by field, so <code>(finalized, optimistic)</code> snapshots before and after tell whether anything moved.</li>
+    <li><x-tags>domain</x-tags> The doc tells the incident: on Sepolia's Gloas fork day, every Lighthouse light-client server stopped at the fork but kept answering first, with an update that still verified. Counting that as the poll's win hid the one server (roost) that was current.</li>
+  </ul>
+
+  <h4>Binding the beacon header to the execution layer</h4>
+  <x-code src="myotis-consensus/src/store.rs" from="594" to="636"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns borrowing</x-tags> <strong>Matching a tuple.</strong> <code>match (&amp;header.execution, slot_fork)</code> builds a temporary tuple of a reference and a <code>Copy</code> enum, then matches both at once. Four combinations, four arms; one of them is a flat <code>false</code>. <code>payload</code> binds as <code>&amp;Box&lt;ExecutionPayloadHeader&gt;</code>, and <code>payload.hash_tree_root()</code> works anyway because method calls auto-dereference through <code>&amp;</code> and <code>Box</code>.</li>
+    <li><x-tags>domain</x-tags> The doc bullet list is the clearest statement of the Gloas rules in the crate. Note the limit it records: Capella's own block-hash gindex (412) is not accepted, because no header this client meets is older than Deneb, and a Capella header's genuine proof simply fails here.</li>
+  </ul>
+  <p class="code-note"><x-tags>domain</x-tags> <code>verify_execution_branch</code> (the associated function at lines 227–229, still used by the corpus tests) is kept for callers that hold no fork schedule. It now refuses a Gloas-shaped header outright, so a call site that should have moved to <code>verify_header</code> fails loudly instead of guessing.</p>
+
+  <div class="callout watch"><span class="k">A back door around “refuses zero”</span>The doc on <code>LightClientStore::new</code> says the store refuses a zero period length instead of defaulting to the mainnet preset. But the struct also derives a public <code>Default</code>, which sets <code>slots_per_period</code> to 0, and the getter <code>slots_per_period()</code> (lines 53–59) maps 0 to the mainnet preset. So <code>LightClientStore::default()</code> quietly gets mainnet geometry. Nothing in the snapshot calls <code>default()</code> directly; <code>new</code> uses it only as the base for struct update syntax.</div>
+</x-file>
+
+<x-file path="rust/myotis-consensus/src/snapshot.rs" kind="library" twin="LightClientStoreSnapshot (LCSS v1/v2)">
+  <p class="purpose">A byte-exact codec for the verified store, shared with the Java engine: switching engines resumes from the same file instead of re-bootstrapping. Top-level integers are big-endian (Java <code>DataOutputStream</code>), the beacon header is embedded as SSZ, and the file is bound to its chain by the genesis validators root. Version 2 adds a one-byte shape tag per header for Gloas, and is written only when a header needs it. Any malformed, foreign or unknown-version input decodes to <code>None</code>, and the caller falls back to the checkpoint.</p>
+  <x-code src="myotis-consensus/src/snapshot.rs" from="60" to="89"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain</x-tags> <strong>Forward compatibility by restraint.</strong> v1 is chosen whenever both headers are payload-shaped, so a store that never saw Gloas writes the same bytes as before and an older build can still resume it. v2 appears only once a Gloas-shaped header is held, which is state an older build couldn't follow anyway.</li>
+    <li><x-tags>borrowing enums-patterns</x-tags> <code>match &amp;s.next_sync_committee</code> matches through a reference because <code>SyncCommittee</code> isn't <code>Copy</code>; moving it out of borrowed <code>s</code> is illegal. Compare the Electra tail in <code>write_execution</code> (line 228), where <code>e.deposit_requests_root</code> <em>is</em> <code>Copy</code> and is matched by value.</li>
+  </ul>
+  <x-code src="myotis-consensus/src/snapshot.rs" from="125" to="162"></x-code>
+  <ul class="concepts">
+    <li><x-tags>macros</x-tags> <code>debug_assert_eq!</code> documents an invariant that <code>serialize</code> guarantees, and checks it only in debug builds.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>write_branch</code> writes exactly <code>len</code> nodes whatever it is given: <code>.take(len)</code> truncates, and <code>for _ in branch.len()..len</code> zero-pads. When <code>branch.len() &gt; len</code> that range is empty, not an error: a Rust range whose start is past its end simply yields nothing.</li>
+  </ul>
+  <x-code src="myotis-consensus/src/snapshot.rs" from="164" to="192"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns</x-tags> <strong>Constants as patterns.</strong> <code>SHAPE_PAYLOAD =&gt;</code> compares against the <code>const</code>. That works because the name refers to a constant in scope. A lowercase name that isn't a constant would instead <em>bind</em> any value and match everything, which is why Rust insists on <code>UPPER_CASE</code> for constants. The <code>_ =&gt; None</code> arm refuses an unknown tag rather than guessing.</li>
+    <li><x-tags>error-handling</x-tags> <code>BeaconBlockHeader::decode(…).ok()?</code> converts a <code>Result</code> into an <code>Option</code> and then propagates <code>None</code>, so a decode error becomes “not a valid snapshot” without a message.</li>
+  </ul>
+  <x-code src="myotis-consensus/src/snapshot.rs" from="315" to="342"></x-code>
+  <p class="code-note"><x-tags>lifetimes</x-tags> This is the <code>Reader&lt;'a&gt;</code> from the primer, and the stop's clearest lifetime lesson: <code>impl&lt;'a&gt;</code> names the buffer's lifetime, and <code>fixed</code> returns slices tied to the buffer, not to <code>&amp;mut self</code>. So a returned slice may outlive the <code>&amp;mut</code> borrow of the reader, and a caller could keep it while it reads on. Helper functions take <code>r: &amp;mut Reader&lt;'_&gt;</code>, where <code>'_</code> means “some lifetime I don't need to name”. <code>self.pos.checked_add(len)?</code> makes even a wild length from a corrupt file a clean <code>None</code>.</p>
+</x-file>
+
+<div class="prose">
+  <h2>The test suite</h2>
+  <p>Eight integration tests, all network-free. Two replay the committed mainnet corpus end to end, one reads the official consensus-specs Gloas vectors, and five are regression tests for real bugs or forks (#295, #423 on two paths, the adoption rule, and Gloas). Three of them build synthetic 512-key committees and sign with real BLS through the <code>blst</code> dev-dependency; the #423 tests reuse genuinely signed updates from the mainnet corpus.</p>
+</div>
+
+<x-file path="rust/myotis-consensus/tests/lc_conformance.rs" kind="integration test" twin="LcVectorConformanceTest">
+  <p class="purpose">The plan's PR-4 exit criterion. It replays the committed mainnet corpus (bootstrap, then numbered updates, then finality updates) through Rust decode and verify, and asserts the whole verdict map equals Java's <code>expected.txt</code>. It mirrors the live loop by calling <code>force_rotate_if_past_period</code> after each applied update. A malformed oracle line panics instead of being skipped.</p>
+  <x-code src="myotis-consensus/tests/lc_conformance.rs" from="101" to="131"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership</x-tags> After line 105, <code>store</code> has been <em>moved into</em> the processor. From then on it is reached as <code>processor.store</code> (a public field).</li>
+    <li><x-tags>iterators-closures</x-tags> A directory listing becomes sorted file names in one chain: <code>filter_map(|e| e.ok())</code> drops unreadable entries, and <code>to_string_lossy().into_owned()</code> produces an owned <code>String</code>.</li>
+  </ul>
+  <x-code src="myotis-consensus/tests/lc_conformance.rs" from="154" to="162"></x-code>
+  <p class="code-note"><x-tags>borrowing ownership testing</x-tags> New since September. In the loop above, <code>last_applied = Some(update)</code> <em>moves</em> each applied update into the <code>Option</code>; the previous value is dropped. Here <code>if let Some(update) = &amp;last_applied</code> borrows it back out, so <code>update</code> is a <code>&amp;LightClientFinalityUpdate</code>, which is what <code>apply_finality_update</code> takes.</p>
+  <div class="callout watch"><span class="k">Stale or inaccurate comments</span>The module doc says the file set “is enumerated from expected.txt's own counts”. The code enumerates the directory (lines 108–116) and records the count under <code>updates.count</code>, so a mismatch shows up in the final map comparison. The effect the comment promises is real; the mechanism is different.</div>
+</x-file>
+
+<x-file path="rust/myotis-consensus/tests/fork_boundary.rs" kind="integration test" twin="verifiesAcrossForkBoundary">
+  <p class="purpose">Regression test for #295. It builds a synthetic 512-key committee with deterministic keys, hand-built Merkle trees with genuinely valid branches, and real BLS signatures. It checks that updates signed on either side of a fork boundary (slot 320 vs 321) verify under a two-entry schedule, that cross-signed updates are rejected, and that a single-version schedule stalls at the boundary. Its headers are now built as <code>HeaderExecution::Payload(Box::new(…))</code>.</p>
+  <x-code src="myotis-consensus/tests/fork_boundary.rs" from="45" to="55"></x-code>
+  <p class="code-note"><x-tags>borrowing lifetimes</x-tags> <code>prev</code> borrows <code>out</code>, and <code>out.push(next)</code> needs a mutable borrow that may <em>reallocate</em> the outer vector. It compiles only because <code>prev</code>'s last use is before the push. Use <code>prev</code> after the push and the compiler refuses. That refusal is exactly what prevents a dangling pointer into the old buffer.</p>
+</x-file>
+
+<x-file path="rust/myotis-consensus/tests/gloas_boundary.rs" kind="integration test" twin="GloasBoundaryTest">
+  <p class="purpose">The processor across the Fulu-to-Gloas boundary, with a synthetic committee, real BLS, and synthetic state and body trees that put each leaf at its Gloas gindex. It walks finality from Fulu into Gloas (including the padded 812 proof), proves a next committee at 2946 and a bootstrap at 2945 and 2856, and rejects every mismatch: the depth-derived gindex, a non-zero pad node, 812 at a Gloas slot, and wrong shapes. The last test proves that the shape gate runs <em>before</em> BLS.</p>
+  <x-code src="myotis-consensus/tests/gloas_boundary.rs" from="64" to="103"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain iterators-closures</x-tags> <strong>A sparse Merkle tree in 40 lines.</strong> Only the leaves you name exist; every other subtree is a zero leaf. <code>covers(g)</code> asks whether any named node lies below <code>g</code> by halving its gindex until it is no larger than <code>g</code>. <code>node(g)</code> recurses only into covered subtrees. That is enough to prove leaves at depths 9 and 11 against one root, as a progressive state does.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>leaves.iter().copied().collect()</code> turns a slice of <code>(u64, Root)</code> tuples into a <code>HashMap</code>: <code>collect</code> picks the <code>FromIterator</code> impl from the target type. <code>|&amp;k|</code> destructures the borrowed key in the closure's parameter.</li>
+  </ul>
+  <x-code src="myotis-consensus/tests/gloas_boundary.rs" from="308" to="348"></x-code>
+  <ul class="concepts">
+    <li><x-tags>smart-pointers interior-mutability</x-tags> <strong>Sharing a log with a subscriber.</strong> <code>Arc&lt;Mutex&lt;Vec&lt;String&gt;&gt;&gt;</code> is the Rust spelling of a thread-safe shared list. <code>log.clone()</code> clones the <code>Arc</code>, which bumps a reference count; both handles point at the same <code>Vec</code>. <code>self.0.lock().unwrap().push(…)</code> mutates it through a shared <code>&amp;self</code>, which the <code>Mutex</code> makes safe. At the end, <code>.clone()</code> on the locked guard copies the <code>Vec</code> out, and the guard drops at the end of that statement.</li>
+    <li><x-tags>traits-generics</x-tags> <code>impl Visit for Message</code> and <code>impl Subscriber for Capture</code> implement <code>tracing</code>'s traits: a minimal subscriber that keeps only each event's <code>message</code> field. <code>f: impl FnOnce() -&gt; T</code> takes any closure that runs once, and <code>with_default</code> installs the subscriber for the current thread while it runs.</li>
+  </ul>
+  <x-code src="myotis-consensus/tests/gloas_boundary.rs" from="544" to="568"></x-code>
+  <p class="code-note"><x-tags>testing domain</x-tags> <strong>Proving an order without a counter.</strong> Every misrouted update carries a genuine aggregate over the <em>wrong</em> header, so it would fail BLS if it ever got that far. The test then reads the debug log: a refusal by the gate says “wire shape” and nothing says “BLS”. A control case just above shows that a well-shaped update with the same signature does log a BLS failure. <code>for (name, mut u) in misrouted</code> consumes the array by value, and <code>mut u</code> makes each moved-out update mutable inside the loop.</p>
+</x-file>
+
+<x-file path="rust/myotis-consensus/tests/gloas_spec_vectors.rs" kind="integration test" twin="GloasSpecVectorTest">
+  <p class="purpose">The crate against consensus-specs v1.7.0-beta.2 vectors in <code>rust/testdata/lc/gloas-spec</code>. The mainnet-preset <code>ssz_static</code> containers must decode with the production Gloas decoders, and the container root recomputed from the decoded fields must equal the spec's, so every field sits where the decoder reads it. The minimal-preset vectors (32-member committee, 8-slot epochs, Gloas at epoch 3) are sliced by hand and checked with the production gindices and <code>verify_execution_branch_at</code>. The depth-derived gindices must fail on them.</p>
+  <x-code src="myotis-consensus/tests/gloas_spec_vectors.rs" from="356" to="385"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain</x-tags> <strong>Building the 812 proof by hand.</strong> The spec's upgrade of a Fulu header to the Gloas shape is the computation a serving node performs. The test does it itself: a 5-node proof of <code>block_hash</code> (field 12) inside the payload-header tree, then the payload's own 4-node branch into the body, then two zero pads in front. The vectors contain no Gloas update with a non-genesis Fulu finalized header, so this is the genuine input for that path.</li>
+    <li><x-tags>ownership iterators-closures</x-tags> <code>level = level.chunks(2).map(…).collect();</code> builds a new, half-length <code>Vec</code> and rebinds <code>level</code> to it. The old <code>Vec</code> is dropped at that moment. <code>let (mut idx, mut proof) = (12usize, Vec::new());</code> declares two mutable bindings by destructuring a tuple.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/myotis-consensus/tests/next_committee_selection.rs" kind="integration test">
+  <p class="purpose">A #423 regression test on two real mainnet updates (periods 1777 and 1778), with the store at P = 1777 holding the next committee. Each period's signature must be checked with that period's keys. Rotation installs the <em>held</em> committee, not the P+2 one an update carries. A relabelled <code>signature_slot</code> is rejected, and corrupted signatures or branches are rejected in both periods. Table-driven mutation loops cover the variants.</p>
+  <x-code src="myotis-consensus/tests/next_committee_selection.rs" from="18" to="20"></x-code>
+  <p class="code-note"><x-tags>iterators-closures</x-tags> <code>std::array::from_fn</code> calls the closure once per index; the array length (32) comes from the return type. The file also shows a <em>partial move</em>, <code>initialize(b.header, b.current_sync_committee)</code>, which moves two fields out of <code>b</code>.</p>
+</x-file>
+
+<x-file path="rust/myotis-consensus/tests/next_committee_finality.rs" kind="integration test">
+  <p class="purpose">#423 on the finality path: a next-period finality update is accepted and rotates the store; relabelled updates and periods the store can't verify are rejected; current-period updates still verify. New since September: a test that <code>apply_finality_update</code> reports <code>Advanced</code>, then <code>Stale</code> for the same update, then <code>Rejected</code> for a tampered branch, with the store unchanged after the first.</p>
+  <x-code src="myotis-consensus/tests/next_committee_finality.rs" from="30" to="38"></x-code>
+  <p class="code-note"><x-tags>ownership borrowing</x-tags> Fields cannot be moved out of <code>&amp;LightClientUpdate</code>. The two options are to clone them, as here, or to take the update by value. The <code>u64</code> slot is simply copied.</p>
+</x-file>
+
+<x-file path="rust/myotis-consensus/tests/next_committee_adoption.rs" kind="integration test" twin="LightClientProcessorTest.aCrossPeriodUpdateDoesNotSupplyTheNextCommittee">
+  <p class="purpose">The adoption rule from <code>process_update</code>, with synthetic committees and real BLS. The dangerous update is built so that <em>everything in it verifies</em>: the signature against our current committee, and the next-committee branch against the attested state. The first test asserts that the processor refuses it anyway and leaves the store as it was. The second shows the consequence end to end: after the cross-period update was offered, the store still adopts committee(P+1) from P's own update, and rotation installs that committee.</p>
+  <x-code src="myotis-consensus/tests/next_committee_adoption.rs" from="177" to="185"></x-code>
+  <x-code src="myotis-consensus/tests/next_committee_adoption.rs" from="210" to="216"></x-code>
+  <p class="code-note"><x-tags>testing domain</x-tags> The helper asserts its own premise (attested in P−1, signed in P) before returning, so the test can't pass because the fixture drifted. The module doc notes that honest servers send this update with an empty next committee, but the committee is public chain data, so any server can fill it in.</p>
+</x-file>
+
+<x-file path="rust/myotis-consensus/tests/resume_equivalence.rs" kind="integration test">
+  <p class="purpose">The deterministic half of an on-device investigation (“restored snapshot failed verification”). For <em>every</em> split point k, the test replays updates 0..k, snapshots, serializes, deserializes and restores into a fresh store, then continues. Verdicts and final state must equal an uninterrupted replay, and that baseline is itself checked against <code>expected.txt</code>, so the test can't pass vacuously. The corpus is pre-Gloas, so this exercises the v1 file format.</p>
+  <x-code src="myotis-consensus/tests/resume_equivalence.rs" from="166" to="184"></x-code>
+  <p class="code-note"><x-tags>ownership testing</x-tags> The whole resume path in a few lines. <code>snap</code> is an owned deep copy; <code>bytes</code> is only borrowed by <code>deserialize</code>; <code>restored</code> moves into the store, and the store moves into the processor. <code>replay_from(&amp;mut resumed, …)</code> lends the processor mutably, and <code>baseline_verdicts[k..].to_vec()</code> copies a sub-slice for the comparison.</p>
+</x-file>
+
+<x-quiz>[
+  {"id":"cons-q1","type":"mcq","tags":["ownership","enums-patterns"],
+   "q":"During rotation, the store does <code>self.current_sync_committee = self.next_sync_committee.take();</code>. Why <code>take()</code> rather than <code>clone()</code>?",
+   "options":["<code>clone()</code> doesn't compile for <code>Option</code>","<code>take()</code> is thread-safe","<code>clone()</code> would share the committee between the two fields","<code>take()</code> moves the committee out and leaves <code>None</code>, exactly the desired new state, without copying 24 KB"],
+   "answer":3,
+   "explain":"<code>Option::take</code> is <code>mem::replace(&amp;mut self, None)</code>: the <code>Vec</code> handle moves, the 24,576 bytes of keys stay where they are. Cloning would duplicate them and leave <code>next</code> still set, which is the wrong state."},
+  {"id":"cons-q2","type":"open","tags":["borrowing","lifetimes"],
+   "q":"In <code>process_update</code>, <code>committee</code> is a reference obtained through <code>&amp;self</code>, yet later the method calls <code>self.store.update_next_sync_committee(…)</code>, which needs <code>&amp;mut</code>. Why does this compile, and what change would break it?",
+   "model":"Rust uses non-lexical lifetimes: a borrow lasts until its <em>last use</em>, not until the end of the scope. <code>committee</code> is last used in the <code>verify_sync_aggregate</code> call (line 383), so the shared borrow of <code>self</code> has ended by the time the <code>&amp;mut</code> call runs (line 445). The calls in between, <code>verify_finality_branch</code> and <code>verify_header</code>, only take <code>&amp;self</code>, and shared borrows may overlap. Using <code>committee</code> again after the mutation, for example logging its root afterwards, would extend the shared borrow past the mutable one, and the compiler would reject it (cannot borrow as mutable because it is also borrowed as immutable).",
+   "points":["a borrow ends at its last use (non-lexical lifetimes)","committee's last use is the BLS call, before the &amp;mut call","the &amp;self calls in between are shared borrows and may overlap","using committee after the mutation would be a compile error"],
+   "context":"myotis-consensus/src/store.rs process_update: L332 let Some(committee) = self.committee_for(sig_period) else {...}; L381-387 verify::verify_sync_aggregate(&update.sync_aggregate, committee, ...); L398 self.verify_finality_branch(...) and L411 self.verify_header(...) take &self; L445-446 self.store.update_next_sync_committee(update.next_sync_committee.clone())."},
+  {"id":"cons-q3","type":"mcq","tags":["iterators-closures","error-handling"],
+   "q":"<code>read_roots</code> is <code>(0..n).map(|i| ssz::read_root(data, offset + i * 32)).collect()</code> with return type <code>Option&lt;Vec&lt;Root&gt;&gt;</code>. What does it produce when the buffer is two nodes short?",
+   "options":["<code>None</code>, because collecting into <code>Option</code> stops at the first <code>None</code>","<code>Some</code> of a vector with <code>n − 2</code> nodes","<code>Some</code> of a vector with two zero nodes at the end","It panics on the first failed read"],
+   "answer":0,
+   "explain":"<code>Option</code> implements <code>FromIterator</code> so that collecting an iterator of <code>Option&lt;T&gt;</code> yields <code>Some(collection)</code> only if every item is <code>Some</code>, and short-circuits to <code>None</code> otherwise. <code>Result</code> works the same way."},
+  {"id":"cons-q4","type":"mcq","tags":["domain"],
+   "q":"Why do the Gloas decoders take an <code>LcFork</code> from the caller instead of sniffing the layout from offsets, as the pre-Gloas decoders do?",
+   "options":["Sniffing is too slow for a phone","Gloas containers carry a version byte that only the caller can read","Every Gloas container is fixed-size with no offsets left to sniff, so the only honest source of the format is the fork of the object's slot, which the req/resp context bytes give","The Java engine sniffs and the Rust engine must differ"],
+   "answer":2,
+   "explain":"The Gloas header has no variable payload header any more, so no container has an offset field. The module doc of <code>types.rs</code> says the only honest way to tell the format is the fork of the object's slot. The <code>const</code> size asserts are a second line of defense, not the rule."},
+  {"id":"cons-q5","type":"mcq","tags":["domain"],
+   "q":"Why are the Gloas gindices (735, 2945, 2946) constants in <code>spec.rs</code>, while the pre-Gloas ones are computed from the branch length?",
+   "options":["The Gloas <code>BeaconState</code> is a progressive container, so a field's gindex is no longer <code>(1 &lt;&lt; depth) + field_index</code>; the formula gives 553, 2070 and 2071 instead","Gloas renumbered the state fields 20, 22 and 23","Constants are faster than a shift","Gloas branches have variable length, so the length cannot be used"],
+   "answer":0,
+   "explain":"The comment in <code>spec.rs</code> says the field indices did not move but the tree shape did. A unit test asserts both the constants and that the depth-derived formulas miss them, and <code>gloas_spec_vectors.rs</code> checks the same against the official vectors."},
+  {"id":"cons-q6","type":"mcq","tags":["smart-pointers","enums-patterns"],
+   "q":"<code>HeaderExecution</code> is <code>Payload(Box&lt;ExecutionPayloadHeader&gt;)</code> or <code>BlockHash(Root)</code>. What does the <code>Box</code> buy?",
+   "options":["It makes the payload shareable between threads","An enum is as large as its largest variant; boxing puts the ~470-byte payload on the heap and leaves an 8-byte pointer, so a Gloas header doesn't carry unused space","It lets two headers point at the same payload without cloning","It is required because enums can't hold structs directly"],
+   "answer":1,
+   "explain":"Enums can hold structs inline; the doc comment says the box is there because the payload is about 20 times the other variant. A <code>Box</code> is still a unique owner: cloning the header deep-copies the payload, and dropping it frees it. Sharing would need <code>Rc</code> or <code>Arc</code>."},
+  {"id":"cons-q7","type":"open","tags":["domain"],
+   "q":"A Gloas finality update arrives in the first epochs after the fork. Its attested header is at a Gloas slot, its finalized header is a Fulu block. Describe how the processor checks the finalized header's execution data, and which rules each header must satisfy.",
+   "model":"The shape gate first requires both headers to be in the shape of the attested slot's fork, so the Fulu finalized header must arrive in the Gloas shape (a block hash plus 11 branch nodes). If it arrived payload-shaped, the update is refused before BLS. <code>verify_header</code> then picks the proof by each header's <em>own</em> slot: the attested header (Gloas slot) proves its block hash at gindex 2856, while the finalized header (pre-Gloas slot) proves its block hash at the Deneb-era gindex 812, which is only 9 levels deep. Its 11-node vector therefore starts with two padding nodes, and <code>verify_normalized_merkle_branch</code> accepts the padding only if every extra leading node is zero. The finality branch itself is checked at 735, chosen by the attested slot's fork.",
+   "points":["the shape gate requires the Gloas shape for both headers, because the attested slot is Gloas","each header's execution proof is chosen by its own slot's fork (verify_header)","the Fulu header proves its block hash at 812 (depth 9) inside the 11-node vector","the two extra leading nodes must be zero (normalized branch), otherwise rejected","the finality branch uses 735, picked by the attested slot"],
+   "context":"myotis-consensus/src/store.rs: headers_in_attested_forks_shape L189-196 (attested.shape()==fork && finalized.shape()==fork, fork = lc_fork_at_slot(attested.slot)); verify_header L233-238 uses lc_fork_at_slot(header.beacon.slot); verify_execution_branch_at L611-636: BlockHash + Gloas -> 2856, BlockHash + PreGloas -> 812, branch len must be 11, verify_normalized_merkle_branch; verify_finality_branch L292-312 Gloas -> 735. ssz.rs verify_normalized_merkle_branch L151-166: extra leading nodes must be zero."},
+  {"id":"cons-q8","type":"mcq","tags":["domain"],
+   "q":"Gloas activates at epoch 20 on a 32-slot chain, so slot 640 is its first slot. An update has attested slot 640 and signature slot 640. Which format and which signing version apply?",
+   "options":["Pre-Gloas format, pre-Gloas version","Gloas format, Gloas version","Pre-Gloas format, Gloas version","Gloas format, but the signature verifies under the version before Gloas"],
+   "answer":3,
+   "explain":"The format follows the slot's own epoch (640 / 32 = 20, Gloas). The domain follows the epoch of <code>max(signature_slot, 1) − 1</code> = slot 639, epoch 19, the old fork. <code>the_lc_format_switches_at_the_gloas_epoch</code> in <code>fork.rs</code> pins exactly this."},
+  {"id":"cons-q9","type":"open","tags":["domain","testing"],
+   "q":"<code>next_committee_adoption.rs</code> builds an update whose signature and next-committee branch both genuinely verify, and expects the processor to reject it. What is the update, why is adopting its committee harmful, and which check refuses it?",
+   "model":"It is the last block of period P−1 (attested in P−1), signed at the first slot of P. Its signature period is P, so the committee gate admits it and it verifies against the store's current committee. An update carries the next committee of its attested state, which here is committee(P), the store's own current committee. If a store at P without a next committee adopted it, the next rotation would install committee(P) as the keys for P+1, and every genuine P+1 update would fail BLS: the walk would stall. <code>process_update</code> refuses it with the adoption gate: when no next committee is held, the attested period must equal the store's period. Honest servers leave the committee empty in such an update, but it is public data, so any server can fill it in.",
+   "points":["attested in P−1, signed in P, so it passes the committee gate and BLS","its next committee is committee(P), the store's own current committee","adopting it would install the wrong keys for P+1 and stall all later updates","refused because, with no next held, period(attested) must equal the store's period"],
+   "context":"myotis-consensus/src/store.rs L341-370: if self.store.next_sync_committee().is_none() { let attested_period = period_of(attested.slot); if attested_period != store_period { return false } }. tests/next_committee_adoption.rs: cross_period_update(attested P*PERIOD-1, signed +1), a_cross_period_update_does_not_supply_the_next_committee, the_store_still_rotates_into_the_right_committee_after_a_cross_period_update."},
+  {"id":"cons-q10","type":"mcq","tags":["enums-patterns","ownership"],
+   "q":"<code>shape(&amp;self)</code> writes <code>match self.execution { HeaderExecution::Payload(_) =&gt; …, HeaderExecution::BlockHash(_) =&gt; … }</code> with no <code>&amp;</code>. Why does that compile even though <code>self</code> is only borrowed?",
+   "options":["<code>match</code> always borrows its scrutinee automatically","The <code>_</code> patterns bind nothing, so nothing is moved out of the borrowed value","<code>HeaderExecution</code> is <code>Copy</code>","The compiler inserts a clone"],
+   "answer":1,
+   "explain":"Matching a place expression does not move it by itself; only a binding pattern does. <code>_</code> never binds. Writing <code>Payload(p)</code> there would try to move the <code>Box</code> out of borrowed data and fail. <code>HeaderExecution</code> is not <code>Copy</code> (it holds a <code>Box</code>)."},
+  {"id":"cons-q11","type":"mcq","tags":["macros"],
+   "q":"<code>types.rs</code> contains <code>const _: () = assert!(LightClientHeader::GLOAS_SIZE &lt; MIN_PRE_GLOAS_HEADER_SIZE);</code>. What happens if someone changes a size so the condition becomes false?",
+   "options":["The build fails, because the assert is evaluated at compile time","The program panics at startup","The assert is skipped in release builds","A warning is printed"],
+   "answer":0,
+   "explain":"A <code>const</code> item is evaluated by the compiler, and a failing <code>assert!</code> during const evaluation is a compile error. It is Rust's form of a static assert. The <code>_</code> name means the constant itself is never used."},
+  {"id":"cons-q12","type":"open","tags":["testing","smart-pointers","interior-mutability"],
+   "q":"<code>the_shape_gate_runs_before_the_bls_verify</code> cannot read a BLS call counter. How does it prove the order of the checks, and how does <code>logged_during</code> share its log with the subscriber?",
+   "model":"Every misrouted update is given a genuine aggregate signature over a different header, so it would fail BLS if it reached that step. The test captures the processor's debug log while it runs: a refusal by the shape gate logs a message containing “wire shape” and none containing “BLS”. A control case, a well-shaped update with the same foreign signature, shows that a BLS failure does log “BLS”. <code>logged_during</code> creates an <code>Arc&lt;Mutex&lt;Vec&lt;String&gt;&gt;&gt;</code>, clones the <code>Arc</code> (a reference-count increment) into the <code>Capture</code> subscriber, installs it with <code>tracing::subscriber::with_default</code> for the closure's run, and the subscriber pushes each event's message through <code>lock()</code>. Afterwards the test locks the mutex and clones the <code>Vec</code> out.",
+   "points":["misrouted updates carry a signature that would fail BLS","the log must show the shape-gate message and no BLS message","a control case proves a BLS failure would be logged","Arc clone shares one Vec; Mutex allows pushing through &amp;self","with_default installs the subscriber only while the closure runs"],
+   "context":"myotis-consensus/tests/gloas_boundary.rs: logged_during L311-348 (Capture(Arc&lt;Mutex&lt;Vec&lt;String>>>), impl Subscriber::event pushes message, tracing::subscriber::with_default(Capture(log.clone()), f)); refused_by_the_gate L351-353; test L528-576 with foreign signature and control case. store.rs logs 'update rejected: wire shape ...' and '... BLS verification failed'."},
+  {"id":"cons-q13","type":"mcq","tags":["enums-patterns","domain"],
+   "q":"Why does <code>apply_finality_update</code> return <code>FinalityOutcome</code> rather than the <code>bool</code> from <code>process_finality_update</code>?",
+   "options":["A <code>bool</code> can't cross the FFI boundary","To report which committee verified the update","A re-served update verifies but moves nothing; the sync loop must not count that as the poll's win, or a stalled server keeps outrunning a current one","To let the caller retry rejected updates"],
+   "answer":2,
+   "explain":"<code>Stale</code> means verified but not advanced: finalized and optimistic slots are unchanged. The doc cites Sepolia's Gloas fork, where stalled Lighthouse servers answered first every round and hid roost's current update."},
+  {"id":"cons-q14","type":"open","tags":["domain","enums-patterns"],
+   "q":"When does <code>snapshot::serialize</code> write format version 2 instead of 1, and why is that choice made per file rather than always writing v2?",
+   "model":"It writes v1 when both the finalized and the optimistic header are payload-shaped (<code>execution_payload().is_some()</code>), and v2 as soon as either is block-hash-shaped. In v2 every header gets a one-byte shape tag (0 = payload framing, 1 = block hash plus 11 nodes). Writing v1 whenever possible keeps the file byte-identical to what older builds and the Java v1 codec produce, so an older build can still resume a pre-Gloas store. A v2 file only appears when the store already holds Gloas state, which an older build could not follow anyway. The reader accepts both versions and refuses an unknown shape tag.",
+   "points":["v1 when both headers are payload-shaped, v2 when either is block-hash-shaped","v2 adds one shape tag byte per header","v1 stays byte-identical so older builds can still resume","an older build couldn't follow Gloas state anyway","the reader rejects unknown versions and unknown shape tags"],
+   "context":"myotis-consensus/src/snapshot.rs L16-22 doc; serialize L62-89 version choice; write_header L130-148 pushes SHAPE_PAYLOAD/SHAPE_BLOCK_HASH only in v2; read_header L164-192 match shape { SHAPE_PAYLOAD, SHAPE_BLOCK_HASH, _ => None }; deserialize L99 accepts V1 and V2 only."}
+]</x-quiz>

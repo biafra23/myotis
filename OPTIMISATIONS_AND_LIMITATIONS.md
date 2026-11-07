@@ -12,14 +12,14 @@ together.
 > several of these mechanisms (hedged reads across peers, admission and eviction of
 > snap peers by their announced head, `snapServingPeers` as the readiness gate,
 > per-anchored-head fee memoization — see the release notes from v0.1.8 on and
-> [docs/readiness-and-verified-head-age.md](docs/readiness-and-verified-head-age.md)).
+> [docs/how-it-works/readiness-and-verified-head-age.md](docs/how-it-works/readiness-and-verified-head-age.md)).
 > The limitations in Part 1 are structural and apply to both engines.
 
 **Non-negotiable invariant.** Nothing here trades away verification. The only trust
 anchor in the shipped code is the sync-committee signature chain from the embedded
 checkpoint (the two embedded historical accumulators — pre-Merge historical hashes,
 Bellatrix-era historical roots — are designed, not yet built; see
-[docs/implementation-status.md](docs/implementation-status.md)). A peer is never
+[docs/how-it-works/implementation-status.md](docs/how-it-works/implementation-status.md)). A peer is never
 trusted. Every value the wallet receives is either proven against a beacon-anchored
 state root (SNAP proof / header chain) or is an honest *error* — never fabricated data,
 never a proxied answer. The optimisations change *scheduling, caching, freshness, and

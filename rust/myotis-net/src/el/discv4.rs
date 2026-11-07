@@ -1,5 +1,5 @@
 //! discv4 — UDP Kademlia peer discovery (EL-A3), twin of the Java
-//! `networking.discv4` package (docs/reimplementation/02 §2).
+//! `networking.discv4` package (docs/spec/02 §2).
 //!
 //! Wire format:
 //! ```text
@@ -376,7 +376,7 @@ impl Drop for Discv4Service {
 
 /// discv4 NEIGHBORS packets run to the 1280-byte spec cap; a fixed 4096-byte
 /// read buffer keeps any allocator from truncating them, and a 1 MiB
-/// SO_RCVBUF absorbs reply bursts (docs/reimplementation/02 §2.3 — the
+/// SO_RCVBUF absorbs reply bursts (docs/spec/02 §2.3 — the
 /// Android/ART truncation trap).
 const RECV_BUF: usize = 4096;
 

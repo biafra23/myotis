@@ -16,7 +16,7 @@ import kotlin.concurrent.atomics.ExperimentalAtomicApi
 
 /**
  * Tells the engine whether the device's network is metered, so its data-usage figures
- * (docs/data-usage.md) can say how much went over mobile data. iOS's own words for it:
+ * (docs/how-it-works/data-usage.md) can say how much went over mobile data. iOS's own words for it:
  * a path is "expensive" on cellular or a personal hotspot and "constrained" in Low Data
  * Mode — either counts as metered; no usable path is unknown. The engine reports it back
  * on the Status screen's "Connection" row. Process-lifetime, like the engine.

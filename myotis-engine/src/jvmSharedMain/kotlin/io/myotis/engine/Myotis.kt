@@ -77,7 +77,7 @@ object Myotis {
 
     /**
      * Tor routing of account reads and of the wallet's own transaction broadcast
-     * (docs/privacy-and-tor.md): the engine's process-wide toggle, re-exported for
+     * (docs/how-it-works/privacy-and-tor.md): the engine's process-wide toggle, re-exported for
      * library consumers so the Rust module stays an implementation detail. Only a
      * library built with the Tor feature (`-PtorEngine`) can turn it on;
      * [supported] says whether this one was.

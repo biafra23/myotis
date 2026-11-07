@@ -7,7 +7,7 @@ import java.util.List;
  * JNI shim ({@code rust/myotis-bls} → {@code libmyotis_bls}). One crate builds the native
  * library for every platform: a desktop {@code .so}/{@code .dylib}/{@code .dll} for the
  * JVM daemon, and per-ABI {@code .so}s (via cargo-ndk) bundled in the Android app's
- * jniLibs. Same Java code, different binary per target — see docs/bls-rust-acceleration.md.
+ * jniLibs. Same Java code, different binary per target — see docs/design-history/bls-rust-acceleration.md.
  *
  * <p>Falls back gracefully: if the native library can't be loaded (no binary for this
  * platform), {@link #isAvailable()} is false and {@link BlsBackends} keeps the pure-Java

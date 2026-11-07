@@ -14,7 +14,7 @@ package io.myotis.desktop
  *
  * This is a DEBUG / DEMO artefact, not a production path: the seed is a full node's
  * `eth_getLogs` output framed by `scripts/synth_logindex.py`, served unverified
- * (docs/bee-rpc-service.md, *Demo only*). Only the backfill walk re-checks it, on its way
+ * (docs/guides/bee-rpc-service.md, *Demo only*). Only the backfill walk re-checks it, on its way
  * down to the contract's deployment, and this flavour ships with that walk switched off;
  * even a walk switched on never removes a log the seed invented
  * ([PocFlavour.seededIndexNotice]). It expires ~500,000 Gnosis blocks (~29 days) after its

@@ -92,7 +92,7 @@ public class BlsBackendBenchmark {
             System.out.printf("fastest warm vs Milagro warm: %.1fx%n", milagroWarm / fastestWarm);
         }
         System.out.println("NOTE: x86-64/HotSpot flatters Milagro; on Android/ART the native");
-        System.out.println("      win is far larger (see docs/bls-rust-acceleration.md).");
+        System.out.println("      win is far larger (see docs/design-history/bls-rust-acceleration.md).");
         System.out.println("===========================================================");
         System.out.println();
 

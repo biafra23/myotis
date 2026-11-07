@@ -1,5 +1,5 @@
 //! LIVE cross-check of account reads answered from block access lists
-//! (docs/address-activity.md, *Answering from block access lists*).
+//! (docs/how-it-works/address-activity.md, *Answering from block access lists*).
 //!
 //! Starts the Rust engine on a network whose blocks commit to a BAL (Sepolia
 //! since Amsterdam), watches the senders of the latest block (busy accounts,

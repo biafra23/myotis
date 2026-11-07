@@ -61,7 +61,7 @@ data class UpgradeAdvisory(
 enum class NetworkMetering { UNKNOWN, UNMETERED, METERED }
 
 /**
- * One network's bytes on the wire (docs/data-usage.md), the JVM contract's `DataUsage`.
+ * One network's bytes on the wire (docs/how-it-works/data-usage.md), the JVM contract's `DataUsage`.
  * The `today*` figures cover the local calendar day [day] and survive a restart of the
  * network on the same day; the rest count since the handle was created. A host running
  * several networks adds them up for the app's total.

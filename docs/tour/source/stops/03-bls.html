@@ -1,0 +1,125 @@
+<!--meta {"id":"stop-03","num":3,"title":"myotis-bls: BLS through blst","short":"myotis-bls","sub":"2 files · 271 lines","part":"Pure foundations"} -->
+<header class="stop-head">
+  <div class="eyebrow">Stop 3 · crate <code>myotis-bls</code> <span>2 files · 271 lines · about 40 minutes</span></div>
+  <h1>myotis-bls: BLS through blst</h1>
+  <p class="lede">The smallest real crate, and a good warm-up. It verifies a sync-committee aggregate signature with Supranational's <code>blst</code>. The Java engine calls it through JNI, and <code>myotis-consensus</code> calls it as a plain Rust function. You will see slices, a <code>Vec</code> of references that borrows another <code>Vec</code>, a JNI export that needs no <code>unsafe</code>, and, new since September, the two lines that let the crate build without the standard library.</p>
+</header>
+
+<div class="learn">
+  <h2>Rust you will practise</h2>
+  <div><b>Slices and chunks</b><code>&amp;[u8]</code> parameters, <code>chunks_exact</code>, and a <code>Vec&lt;&amp;T&gt;</code> that borrows another <code>Vec</code>.</div>
+  <div><b>Features and FFI</b><code>#[cfg(feature = "jni")]</code>, <code>#![cfg_attr(not(feature = "std"), no_std)]</code>, <code>#[no_mangle]</code>, <code>extern "system"</code> and lifetimes on JNI handles.</div>
+  <div><b>Never-panic style</b>Early <code>return false</code>, and <code>Option</code> with <code>.ok()?</code> instead of exceptions.</div>
+</div>
+
+<section class="prose">
+  <p>Some domain first. An Ethereum <strong>sync committee</strong> is 512 validators chosen for about 27 hours. Every slot, the members that saw the block sign its root, and their signatures are combined into one <strong>BLS aggregate signature</strong>. A light client checks that single signature against the participating members' public keys. That one check, <code>fast_aggregate_verify</code>, is all this crate does. BLS keys and signatures are points on the BLS12-381 curve, sent in compressed form: 48 bytes for a public key, 96 for a signature. The <strong>DST</strong> (domain separation tag) is a fixed byte string mixed into the hash-to-curve step, so a signature made for one scheme cannot be replayed under another. Ethereum uses the "proof of possession" (POP) variant.</p>
+</section>
+
+<x-file path="rust/myotis-bls/src/lib.rs" kind="library" twin="BlsVerifier / NativeBlsBackend">
+  <p class="purpose">Two public functions and a feature-gated JNI module. <code>fast_aggregate_verify</code> is the production entry: the POP ciphersuite, with the committee flattened into one <code>48 × n</code> byte buffer. It forwards to <code>fast_aggregate_verify_with_dst</code>, which exists so the conformance tests can use the NUL ciphersuite the fixtures were generated with. Any malformed input gives <code>false</code>, never a panic.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–13</td><td>Crate docs: the two consumers and the subgroup-check trade-off.</td></tr>
+      <tr><td>15–24</td><td>The <code>no_std</code> switch, <code>extern crate alloc</code>, and the imports.</td></tr>
+      <tr><td>26–31</td><td>The <code>DST</code> byte-string constant and the size limits (<code>PK_LEN</code> 48, <code>SIG_LEN</code> 96, <code>MAX_PUBKEYS</code> 4096).</td></tr>
+      <tr><td>33–45</td><td><code>fast_aggregate_verify</code>, the production entry point.</td></tr>
+      <tr><td>47–87</td><td>The verify core: cap the count, decompress the public keys (no subgroup check, because they are Merkle-proven), decompress and subgroup-check the untrusted signature, call blst.</td></tr>
+      <tr><td>89–133</td><td><code>mod jni_shim</code>, compiled only with the <code>jni</code> feature: the exported JNI symbol and a helper that copies the three Java arrays.</td></tr>
+    </tbody>
+  </table></div>
+  <h4>Building without <code>std</code></h4>
+  <x-code src="myotis-bls/src/lib.rs" from="15" to="24"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo macros</x-tags> <strong>A crate-level conditional attribute.</strong> <code>#![...]</code> with a <code>!</code> applies to the enclosing item, here the whole crate. <code>cfg_attr(condition, attr)</code> adds <code>attr</code> only when the condition holds. So the crate is <code>#![no_std]</code> exactly when the <code>std</code> feature is off, which happens only when a dependent turns the defaults off and does not ask for <code>std</code> (<a href="#stop-02">Stop 2</a> shows how <code>myotis-consensus</code> forwards it). <code>jni</code> implies <code>std</code> in the manifest, so the JNI build always has the standard library.</li>
+    <li><x-tags>modules-cargo</x-tags> <strong><code>alloc::vec::Vec</code>.</strong> <code>extern crate alloc;</code> makes the allocation layer of the standard library available by name. <code>std::vec::Vec</code> is only a re-export of <code>alloc::vec::Vec</code>, so importing it from <code>alloc</code> gives the same type in both builds, and the function bodies do not change.</li>
+  </ul>
+  <h4>The verify core</h4>
+  <x-code src="myotis-bls/src/lib.rs" from="59" to="87"></x-code>
+  <ul class="concepts">
+    <li><x-tags>borrowing</x-tags> <strong>Read-only parameters.</strong> All four byte parameters are <code>&amp;[u8]</code>: the function only reads. The caller keeps ownership, and nothing is copied at the call. A <code>&amp;[u8]</code> is a pointer plus a length, a view into someone else's bytes, a bit like a read-only <code>ByteBuffer</code> slice.</li>
+    <li><x-tags>ownership borrowing</x-tags> <strong>A vector of references into another vector.</strong> <code>pks</code> <em>owns</em> the decoded keys. <code>pk_refs: Vec&lt;&amp;PublicKey&gt;</code> is a second vector of <em>references into <code>pks</code></em>, because blst's API wants a slice of references. The compiler guarantees that <code>pks</code> outlives <code>pk_refs</code> and is not changed while <code>pk_refs</code> is in use. Drop or push to <code>pks</code> before the last use of <code>pk_refs</code> and it will not compile. Both vectors are dropped at the end of the function; no key is ever copied.</li>
+    <li><x-tags>iterators-closures</x-tags> <strong><code>chunks_exact(48)</code></strong> yields 48-byte sub-slices without copying. The length check just above guarantees there is no remainder. <code>pks.iter().collect()</code> builds the reference vector, and the target type comes from the annotation on the left.</li>
+    <li><x-tags>error-handling</x-tags> <strong>Manual early return.</strong> <code>match … { Ok(pk) =&gt; …, Err(_) =&gt; return false }</code> is the manual version of <code>?</code>. It is needed because the function returns <code>bool</code>, not <code>Result</code>, so <code>?</code> has nothing to convert the error into.</li>
+    <li><x-tags>domain</x-tags> <strong>Two trust levels.</strong> <code>PublicKey::uncompress</code> skips the subgroup check, which is expensive and repeated 512 times, because the keys arrive Merkle-proven against a header the client already trusts. The signature comes from a peer, so the final call passes <code>true</code> for <code>sig_groupcheck</code>. The crate docs (lines 11–13) say the Java path makes the same trade-off.</li>
+  </ul>
+  <div class="callout watch">
+    <span class="k">Design decision</span>
+    <p>The count is capped <em>before</em> <code>n * PK_LEN</code> is computed. On a 32-bit Android device <code>usize</code> is 32 bits, so a huge count could wrap around the length check and trigger a gigantic <code>with_capacity</code>. Under the workspace's <code>panic = "abort"</code> that would end the host app, not throw an exception it could catch.</p>
+  </div>
+  <h4>The JNI export</h4>
+  <x-code src="myotis-bls/src/lib.rs" from="89" to="133"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo</x-tags> <strong>A feature-gated module.</strong> <code>#[cfg(feature = "jni")]</code> removes the whole module when the feature is off, which is how <code>myotis-consensus</code> gets a JNI-free build. The <code>use jni::…</code> lines inside the module disappear with it, so the optional <code>jni</code> crate is never referenced.</li>
+    <li><x-tags>unsafe-ffi</x-tags> <strong>An exported symbol.</strong> <code>#[no_mangle]</code> keeps the symbol name exactly as the JVM expects (<code>Java_&lt;package&gt;_&lt;Class&gt;_&lt;method&gt;</code>), and <code>extern "system"</code> selects JNI's calling convention. There is no <code>unsafe</code> block: the <code>jni</code> crate wraps the raw pointers in typed handles.</li>
+    <li><x-tags>lifetimes</x-tags> <strong><code>'local</code>.</strong> It ties every handle (<code>JByteArray&lt;'local&gt;</code>) to this call's JNI local-reference frame. Storing one in a global for later would not compile, which rules out a whole class of JNI crash bugs at compile time. In <code>verify</code> the lifetimes are elided: the compiler fills them in, and they still cannot escape.</li>
+    <li><x-tags>borrowing</x-tags> <strong><code>&amp;mut env</code>.</strong> The export lends its <code>JNIEnv</code> to <code>verify</code> as <code>&amp;mut</code> for the duration of the call; the borrow ends when <code>verify</code> returns. In <code>jni</code> 0.21 the methods that create new local references take <code>&amp;mut self</code>, but <code>convert_byte_array</code> takes only <code>&amp;self</code>, and a <code>&amp;mut</code> reference can always be used where a shared one is wanted.</li>
+    <li><x-tags>error-handling</x-tags> <strong><code>.ok()?</code>.</strong> <code>env.convert_byte_array(&amp;pubkeys)</code> copies a Java <code>byte[]</code> into a Rust <code>Vec&lt;u8&gt;</code> and returns a <code>Result</code>. <code>.ok()</code> turns it into an <code>Option</code>, and <code>?</code> returns <code>None</code> early on failure. <code>Some(true) =&gt; JNI_TRUE, _ =&gt; JNI_FALSE</code> maps <code>None</code> and <code>Some(false)</code> alike to <code>false</code>.</li>
+    <li><x-tags>bytes-strings</x-tags> <strong>A signed count.</strong> Java has no unsigned <code>int</code>, so the count arrives as <code>jint</code> (<code>i32</code>). <code>count.max(0) as usize</code> clamps a negative value to 0 before the cast; a plain <code>as usize</code> on <code>-1</code> would produce a huge number. The cap is checked here too, so an absurd count is refused before three array copies.</li>
+  </ul>
+  <div class="callout jvm">
+    <span class="k">JVM lens</span>
+    <p>On the Java side this is a <code>static native boolean nativeFastAggregateVerify(byte[] pubkeys, int n, byte[] msg, byte[] sig)</code> in <code>NativeBlsBackend</code>, loaded with <code>System.loadLibrary("myotis_bls")</code>. Passing the whole committee as one flat array means a single boundary crossing per verification.</p>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-bls/tests/conformance.rs" kind="integration test" twin="BlsFixtureTest">
+  <p class="purpose">Replays the same fixture files the Java tests use (<code>consensus/src/test/resources/bls_fixtures.txt</code> and a captured real mainnet failure), embedded at compile time. It covers NUL-ciphersuite aggregate and single-signer vectors, and a real 511-of-512 signature that must be <em>rejected</em> on the POP path. It also checks that each aggregate vector fails under POP, which proves the DST parameter is really used, that a corrupted signature fails, and that infinity encodings are rejected. Vectors that would only test blst against itself are skipped on purpose.</p>
+  <x-code src="myotis-bls/tests/conformance.rs" from="24" to="35"></x-code>
+  <ul class="concepts">
+    <li><x-tags>bytes-strings lifetimes</x-tags> <strong><code>include_str!</code></strong> pastes the file into the binary as a <code>&amp;'static str</code>, so the test never depends on the working directory. The path is relative to the source file, and it reaches into the Java module's test resources.</li>
+    <li><x-tags>borrowing iterators-closures</x-tags> <strong>A map of views.</strong> <code>parse_kv</code> returns <code>HashMap&lt;&amp;str, &amp;str&gt;</code>: every key and value is a <em>view</em> into <code>text</code>, and no characters are copied. <code>trim</code> and <code>split_once</code> return sub-slices of their input. Lifetime elision ties the map's lifetime to <code>text</code>, which is fine here because the input is <code>'static</code>.</li>
+    <li><x-tags>testing</x-tags> <strong>An integration test.</strong> The file lives in <code>tests/</code>, so cargo compiles it as a separate crate. It can only call the crate's public API (<code>fast_aggregate_verify</code>, <code>fast_aggregate_verify_with_dst</code>, the constants). It is built with the default features, so the library it links has <code>std</code> and <code>jni</code> on.</li>
+  </ul>
+  <x-code src="myotis-bls/tests/conformance.rs" from="48" to="76"></x-code>
+  <p class="code-note"><x-tags>testing ownership</x-tags> <code>let mut bad_sig = sig.clone();</code> makes an owned copy so the test can flip one bit without touching <code>sig</code>. <code>Vec::with_capacity(n * PK_LEN)</code> plus <code>extend_from_slice</code> rebuilds the flat committee buffer the production function expects. The <code>fixture(...)</code> call returns a temporary <code>Vec&lt;u8&gt;</code>; <code>&amp;</code> borrows it for the copy, and it is dropped at the end of the statement.</p>
+</x-file>
+
+<x-quiz>[
+  {"id":"bls-q1","type":"mcq","tags":["ownership","borrowing"],
+   "q":"<code>let pk_refs: Vec&lt;&amp;PublicKey&gt; = pks.iter().collect();</code>. What does <code>pk_refs</code> contain, and what does the compiler enforce?",
+   "options":["Copies of every key; nothing is enforced","References to the keys stored in <code>pks</code>; <code>pks</code> must stay alive and unmodified while <code>pk_refs</code> is used","Pointers into the Java heap","A second owner of each key, like <code>Arc</code>"],
+   "answer":1,
+   "explain":"<code>iter()</code> yields <code>&amp;PublicKey</code> borrowed from <code>pks</code>. The borrow checker will not let <code>pks</code> be dropped, moved or pushed to while those references are in use. Pushing could reallocate the buffer and leave the references dangling."},
+  {"id":"bls-q2","type":"mcq","tags":["modules-cargo","unsafe-ffi"],
+   "q":"How does <code>myotis-consensus</code> use this crate without compiling any JNI code?",
+   "options":["It calls <code>jni_shim</code> with a null env","It depends on <code>myotis-bls</code> with <code>default-features = false</code>, so <code>#[cfg(feature = \"jni\")] mod jni_shim</code> and the <code>jni</code> dependency are compiled out","It loads the cdylib at run time","It copies the source file"],
+   "answer":1,
+   "explain":"Features are compile-time switches. With the default <code>jni</code> feature off, the module does not exist in that build, and the rlib exposes only the pure functions. Consensus turns <code>std</code> back on through its own <code>std</code> feature."},
+  {"id":"bls-q3","type":"mcq","tags":["lifetimes","unsafe-ffi"],
+   "q":"What does the <code>'local</code> lifetime on <code>JByteArray&lt;'local&gt;</code> prevent?",
+   "options":["Arrays longer than 4096 bytes","Keeping a JNI local reference after the native call has returned, for example by storing it in a global","Calling the function from Kotlin","Garbage collection of the array during the call"],
+   "answer":1,
+   "explain":"JNI local references are only valid inside the native call's frame. Encoding that in a lifetime turns \"used a stale local ref\", a classic JNI crash, into a compile error."},
+  {"id":"bls-q4","type":"open","tags":["error-handling","bytes-strings"],
+   "q":"Why does <code>fast_aggregate_verify_with_dst</code> check <code>n &gt; MAX_PUBKEYS</code> before computing <code>n * PK_LEN</code>, and why does it matter more in this project than in a typical Java library?",
+   "model":"On 32-bit targets (older Android ABIs) <code>usize</code> is 32 bits, so a huge caller-supplied <code>n</code> could overflow <code>n * 48</code>. The length comparison could then pass incorrectly, and <code>Vec::with_capacity(n)</code> could try an enormous allocation. In release builds the overflow wraps silently, and an allocation failure or panic aborts the process because of <code>panic = \"abort\"</code>. Capping first keeps all later arithmetic in range, so bad input just yields <code>false</code>. In Java, int overflow also wraps, but a failed allocation is an <code>OutOfMemoryError</code> the app may survive; here the host app dies.",
+   "points":["usize can be 32-bit (Android), so n*48 can overflow","the overflow could defeat the length check or cause a huge allocation","abort semantics: a crash ends the host app","capping first means malformed input simply returns false"],
+   "context":"myotis-bls/src/lib.rs L59-67: 'Cap n before any n * PK_LEN arithmetic or Vec::with_capacity(n): on 32-bit targets usize is 32-bit, so a huge count could overflow the length check and trigger a massive allocation.' if n == 0 || n > MAX_PUBKEYS { return false; } if pubkeys.len() != n * PK_LEN { return false; }. Workspace release profile panic = abort."},
+  {"id":"bls-q5","type":"mcq","tags":["borrowing","lifetimes","testing"],
+   "q":"Why can <code>parse_kv(text: &amp;str)</code> return <code>HashMap&lt;&amp;str, &amp;str&gt;</code> instead of <code>HashMap&lt;String, String&gt;</code>?",
+   "options":["Because <code>&amp;str</code> is always <code>'static</code>","The keys and values are sub-slices of <code>text</code>; the map borrows from it and may not outlive it, and nothing needs copying","Because <code>HashMap</code> copies the strings internally","It cannot; this is a compile error"],
+   "answer":1,
+   "explain":"<code>trim</code> and <code>split_once</code> return views into the input, and lifetime elision ties the map to <code>text</code>. Since the input is an <code>include_str!</code> constant (<code>'static</code>), the map can live as long as needed."},
+  {"id":"bls-q6","type":"mcq","tags":["modules-cargo","macros"],
+   "q":"<code>#![cfg_attr(not(feature = \"std\"), no_std)]</code> sits at the top of <code>lib.rs</code>. When is the crate <code>no_std</code>?",
+   "options":["Always; <code>cfg_attr</code> is applied unconditionally","Only when the <code>std</code> feature is off, which needs a dependent to disable the defaults and not request <code>std</code> (directly or through <code>jni</code>)","Only on Android","Only in release builds"],
+   "answer":1,
+   "explain":"<code>cfg_attr(cond, attr)</code> adds <code>attr</code> only when <code>cond</code> holds. The defaults are <code>[\"jni\", \"std\"]</code> and <code>jni</code> implies <code>std</code>, so the crate drops <code>std</code> only for a dependent that turns both off, such as <code>myotis-consensus</code> built with <code>--no-default-features</code>."},
+  {"id":"bls-q7","type":"open","tags":["modules-cargo","ownership"],
+   "q":"The verify core uses <code>Vec</code> in both the <code>std</code> and the <code>no_std</code> build, with the same code. Explain what <code>extern crate alloc;</code> and <code>use alloc::vec::Vec;</code> do, and why the function bodies did not need to change.",
+   "model":"<code>alloc</code> is the layer of the standard library that provides heap types (<code>Vec</code>, <code>Box</code>, <code>String</code>) on top of an allocator, without any OS services. A <code>no_std</code> crate does not see it automatically, so <code>extern crate alloc;</code> brings it into scope by name. <code>std::vec::Vec</code> is just a re-export of <code>alloc::vec::Vec</code>, so importing from <code>alloc</code> names the very same type in both builds. The bodies call <code>Vec::with_capacity</code>, <code>push</code>, <code>iter().collect()</code>, all of which are defined in <code>alloc</code>, so nothing else changes.",
+   "points":["alloc provides heap types without OS services","extern crate alloc makes the crate available by name, which no_std code needs","std's Vec is a re-export of alloc's Vec, so it is the same type","the methods used (with_capacity, push, collect) all live in alloc"],
+   "context":"myotis-bls/src/lib.rs L15-22: #![cfg_attr(not(feature = \"std\"), no_std)] extern crate alloc; use alloc::vec::Vec; The core uses Vec::with_capacity(n), pks.push(pk), pks.iter().collect()."},
+  {"id":"bls-q8","type":"mcq","tags":["domain","error-handling"],
+   "q":"The public keys are decompressed with <code>PublicKey::uncompress</code> and no subgroup check, but the signature is subgroup-checked. Why the difference?",
+   "options":["blst cannot subgroup-check public keys","The keys arrive Merkle-proven against a trusted header, while the signature comes from a peer and is attacker-controlled","Signatures are smaller, so checking them is cheaper and keys are skipped only for speed with no other reason","The Java side does it the other way round and this crate compensates"],
+   "answer":1,
+   "explain":"The crate docs say so: the pubkeys arrive Merkle-proven, so the per-key subgroup check is skipped (the same trade-off the Java path makes), and the attacker-controlled signature is checked through <code>sig_groupcheck = true</code>."},
+  {"id":"bls-q9","type":"open","tags":["testing","domain"],
+   "q":"The aggregate-vector test checks each vector twice: once with <code>fast_aggregate_verify_with_dst(..., NUL_DST)</code>, expecting <code>true</code>, and once with <code>fast_aggregate_verify(...)</code>, expecting <code>false</code>. What bug does the second assertion catch, and why is it needed?",
+   "model":"The fixtures were generated under the NUL ciphersuite, so the first assertion proves the plumbing (flattening, caps, decompression, subgroup policy) reproduces the recorded verdict. If <code>fast_aggregate_verify_with_dst</code> silently ignored its <code>dst</code> argument and always used one tag, the first assertion alone could not tell. Running the same vector through the production POP path and expecting a rejection proves that the DST really changes the result, so the parameter is applied, not dropped.",
+   "points":["the fixtures are NUL-ciphersuite vectors","the first assertion checks the plumbing reproduces the recorded verdict","the second catches a dst parameter that is silently ignored","a different DST must change the verdict, so POP must reject the NUL vector"],
+   "context":"myotis-bls/tests/conformance.rs aggregate_vectors_verify_under_nul_dst L48-76: assert!(fast_aggregate_verify_with_dst(&pks, n, &msg, &sig, NUL_DST)); comment 'Same vector under the WRONG (production POP) DST must fail — guards against the DST parameter being silently ignored.' assert!(!fast_aggregate_verify(&pks, n, &msg, &sig)); then a corrupted signature must be rejected."}
+]</x-quiz>

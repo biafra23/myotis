@@ -11,7 +11,7 @@
 // first) depends on one coordinate, as :app-ios depends on this project. The cinterop
 // absorbs libmyotis_engine.a (the def file's staticLibraries) into each target's
 // cinterop klib, so the consumer's framework links the engine with no extra flags and
-// no cargo of its own (docs/android-library.md, *iOS*).
+// no cargo of its own (docs/guides/android-library.md, *iOS*).
 //
 // macOS only: the cinterop needs Apple's SDK and the .a needs the Apple rustup
 // targets. Elsewhere the module disables its tasks (below) — so engine-library.yml

@@ -87,7 +87,7 @@ interface NodeController {
 
     /**
      * Re-apply Tor verified-read routing to the process-global selector after
-     * [Settings.setTorEnabled] flips the preference (docs/privacy-and-tor.md). Tor is an
+     * [Settings.setTorEnabled] flips the preference (docs/how-it-works/privacy-and-tor.md). Tor is an
      * experimental capability of the Rust engine only, so hosts that don't support it
      * (iOS for now) keep the default no-op; the desktop and Android actuals push the flag
      * to `Tor.select` (Android names Arti's storage directories first). Unlike the engine
@@ -463,7 +463,7 @@ interface Settings {
 
     /**
      * true = route account reads and the wallet's own transaction broadcasts over
-     * Tor (docs/privacy-and-tor.md) — experimental, and Rust-engine-only (Arti is
+     * Tor (docs/how-it-works/privacy-and-tor.md) — experimental, and Rust-engine-only (Arti is
      * embedded in the Rust engine). Default false. Hosts that can't support it
      * keep the default no-op getter/setter so iOS still compiles; the desktop and
      * Android actuals persist it and [NodeController.applyTorMode] pushes it down.
@@ -697,7 +697,7 @@ data class NodeSnapshot(
                                        // aggressively discovering/probing for new ones
     val elHunting: Boolean = false,    // EL hunt engaged: snap serving pool empty past the
                                        // stall window, emergency re-dials running
-    // Tor routing of reads and sends (docs/privacy-and-tor.md), Status "Tor" row.
+    // Tor routing of reads and sends (docs/how-it-works/privacy-and-tor.md), Status "Tor" row.
     // null = not applicable (Java engine / build without Tor support); otherwise
     // "off" (supported, disabled), "on" (enabled, circuit still bootstrapping),
     // or "active" (enabled AND a Tor circuit is ready — reads and sends route over Tor).
@@ -714,7 +714,7 @@ data class NodeSnapshot(
     // null only when the host could not fetch it. Parsed via [LogIndexStatus.parse].
     val logIndexJson: String? = null,
     // Raw read-fetch shadow-cache JSON (ChainHandle.readStatsJson(), schema 1 —
-    // docs/read-stats.md) for the Status tab's "Reads" rows; null when the host
+    // docs/how-it-works/read-stats.md) for the Status tab's "Reads" rows; null when the host
     // didn't fetch it. Parsed via [ReadStatsStatus.parse].
     val readStatsJson: String? = null,
     // Weak-subjectivity bound (periods) the engine enforces; 0 = host didn't say.
@@ -730,7 +730,7 @@ data class NodeSnapshot(
     // recent first — the Settings tab's "recent web pages" list and the Status tab's
     // refusal banner. Empty when the host doesn't report it.
     val webOrigins: List<WebOriginRow> = emptyList(),
-    // This network's bytes on the wire (the API's DataUsage — docs/data-usage.md),
+    // This network's bytes on the wire (the API's DataUsage — docs/how-it-works/data-usage.md),
     // Status "Data today" / "Data total" rows. null = the host doesn't report it.
     val dataUsage: DataUsageRow? = null,
     // The device network's metering as the host last told the engine (the API's

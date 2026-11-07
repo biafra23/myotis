@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 940 340" role="img" fill="currentColor" aria-label="Managed peer. split(self) turns an RlpxConnection into an RlpxReader, moved into the read-loop task as its sole owner, and an RlpxWriter placed inside an Arc tokio Mutex GuardedWriter with a torn flag, shared by request callers and by the read loop for Pong and serving. Request callers insert id and oneshot sender into the shared pending map; the read loop removes the entry for a matching response and sends the payload through the oneshot." width="940" height="340">
+      <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="940.0" height="340.0" fill="#f8fafb" /><defs>
+        <marker id="m-stop-11-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+        </marker>
+      </defs>
+      <rect x="20" y="100" width="210" height="112" rx="10" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="34" y="124" font-size="12.5" font-weight="700" class="mono">RlpxConnection</text>
+      <g font-size="11.5" class="mono" style="fill:var(--ink-2)">
+        <text x="34" y="148">stream: TcpStream</text>
+        <text x="34" y="168">codec: FrameCodec</text>
+        <text x="34" y="188">peer_pubkey, traffic</text>
+      </g>
+      <line x1="230" y1="156" x2="290" y2="156" stroke="currentColor" stroke-width="1.4" />
+      <text x="260" y="146" text-anchor="middle" font-size="10.5" class="mono">split(self)</text>
+      <path d="M290 156 V64 H317" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop-11-arrow)" />
+      <path d="M290 156 V236 H317" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop-11-arrow)" />
+
+      <rect x="320" y="24" width="240" height="80" rx="10" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="334" y="48" font-size="12.5" font-weight="700" class="mono">RlpxReader</text>
+      <text x="334" y="68" font-size="11" class="mono" style="fill:var(--ink-2)">read_half + FrameDecoder</text>
+      <text x="334" y="88" font-size="10.5" style="fill:var(--ink-3)">moved into the task: sole owner</text>
+
+      <rect x="320" y="176" width="240" height="118" rx="10" stroke-width="1.6" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="334" y="198" font-size="11" class="mono" style="fill:var(--oxide-ink)">Arc&lt;tokio::Mutex&lt;…&gt;&gt;</text>
+      <text x="334" y="220" font-size="12.5" font-weight="700" class="mono">GuardedWriter</text>
+      <text x="334" y="240" font-size="11" class="mono" style="fill:var(--ink-2)">inner: Option&lt;RlpxWriter&gt;</text>
+      <text x="334" y="258" font-size="11" class="mono" style="fill:var(--ink-2)">torn: bool</text>
+      <text x="334" y="280" font-size="10.5" style="fill:var(--ink-3)">write_half + FrameEncoder</text>
+
+      <rect x="660" y="24" width="260" height="80" rx="10" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="674" y="48" font-size="12.5" font-weight="700">read_loop task</text>
+      <text x="674" y="68" font-size="11" style="fill:var(--ink-2)">Ping → Pong · answer Get*</text>
+      <text x="674" y="86" font-size="11" style="fill:var(--ink-2)">deliver (id, code) · fail_all on exit</text>
+
+      <rect x="660" y="140" width="222" height="70" rx="10" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="674" y="164" font-size="12.5" font-weight="700">request callers (&amp;self)</text>
+      <text x="674" y="184" font-size="11" style="fill:var(--ink-2)">pool · reader · EVM · log index</text>
+      <text x="674" y="200" font-size="11" class="mono" style="fill:var(--ink-2)">Arc&lt;ManagedPeer&gt;</text>
+
+      <rect x="660" y="248" width="260" height="76" rx="10" stroke-width="1.6" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="674" y="270" font-size="11" class="mono" style="fill:var(--oxide-ink)">Arc&lt;tokio::Mutex&lt;HashMap&gt;&gt;</text>
+      <text x="674" y="290" font-size="12.5" font-weight="700" class="mono">PendingMap</text>
+      <text x="674" y="310" font-size="11" class="mono" style="fill:var(--ink-2)">id → Pending { want_code, tx }</text>
+
+      <line x1="560" y1="64" x2="657" y2="64" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop-11-arrow)" />
+      <text x="608" y="56" text-anchor="middle" font-size="10.5">recv()</text>
+      <path d="M700 104 V122 H600 V190 H563" fill="none" stroke-width="1.4" style="stroke:var(--oxide)" marker-end="url(#m-stop-11-arrow)" />
+      <text x="606" y="118" font-size="10.5" style="fill:var(--oxide-ink)">Pong / serve</text>
+      <line x1="660" y1="200" x2="563" y2="220" stroke-width="1.4" style="stroke:var(--oxide)" marker-end="url(#m-stop-11-arrow)" />
+      <text x="612" y="224" text-anchor="middle" font-size="10.5" style="fill:var(--oxide-ink)">lock().await</text>
+      <line x1="760" y1="210" x2="760" y2="245" stroke-width="1.4" style="stroke:var(--oxide)" marker-end="url(#m-stop-11-arrow)" />
+      <text x="768" y="232" font-size="10.5" style="fill:var(--oxide-ink)">insert(id, tx)</text>
+      <line x1="902" y1="104" x2="902" y2="245" stroke-width="1.6" style="stroke:var(--ok)" marker-end="url(#m-stop-11-arrow)" />
+      <text x="0" y="0" font-size="10.5" text-anchor="middle" transform="translate(918 176) rotate(-90)" style="fill:var(--ok)">remove → tx.send</text>
+    </svg>

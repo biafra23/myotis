@@ -1,7 +1,7 @@
 //! The Rust implementation of the `io.myotis.api` engine contract, exposed to the
 //! JVM via UniFFI (`ffi` — generated Kotlin bindings live in `:myotis-engine-rust`;
 //! compound records still cross as JSON, see the phase-1 plan and
-//! docs/reimplementation/05). The old hand-JNI shims are gone; the iOS hosts keep
+//! docs/spec/05). The old hand-JNI shims are gone; the iOS hosts keep
 //! consuming the plain C ABI in `capi`.
 //!
 //! The network CATALOG is answered from Rust (`engine_init` ABI handshake,
@@ -68,18 +68,18 @@ uniffi::setup_scaffolding!();
 ///      shape (block trio explicitly null) for the wallet's own broadcasts —
 ///      a payload extension, no signature change there.
 /// v20: added the Tor toggle surface (set_tor_enabled/tor_status, UniFFI +
-///      the iOS C ABI; docs/privacy-and-tor.md). The functions exist in every
+///      the iOS C ABI; docs/how-it-works/privacy-and-tor.md). The functions exist in every
 ///      build; a dylib compiled without `--features tor` reports "not supported"
 ///      (false / 0) rather than being absent.
 /// v21: added get_logs_json / set_log_index_config / log_index_status_json
-///      (the opt-in eth_getLogs watch-list index, docs/eth-getlogs-design.md).
+///      (the opt-in eth_getLogs watch-list index, docs/design-history/eth-getlogs-design.md).
 /// v22: added set_served_block_window (live per-handle eth/69 served-block
 ///      window — the Settings knob, previously a no-op on Rust chains).
 /// v23: nativeEstimateGasJson may now return `{"status":"revert","dataHex"}`
 ///      for an estimated transaction that reverts (a verified answer the host
 ///      serves as JSON-RPC code 3) — a payload extension, no signature change.
 /// v24: added import_log_index_files + export_log_index (portable log-index
-///      snapshots: the generic import/export path, docs/eth-getlogs-design.md).
+///      snapshots: the generic import/export path, docs/design-history/eth-getlogs-design.md).
 ///      set_log_index_config became ADDITIVE (unions with the stored
 ///      subscription set) — a behavior change, no signature change.
 /// v25: added set_ws_bound_periods + accept_stale_anchor (the weak-subjectivity
@@ -95,7 +95,7 @@ uniffi::setup_scaffolding!();
 ///      envelope key) when it is behind the window or not a servable selector
 ///      at all. A behavior change and a payload extension, no signature change.
 /// v28: added read_stats_json (UniFFI + the iOS C ABI): the read-fetch shadow
-///      cache's counters (docs/read-stats.md) — a measurement surface, no
+///      cache's counters (docs/how-it-works/read-stats.md) — a measurement surface, no
 ///      serving change.
 /// v29: myotis_eth_call_json refuses a NULL `to` instead of reading it as the
 ///      EMPTY `to` that means CONTRACT CREATION — running the caller's
@@ -343,7 +343,7 @@ uniffi::setup_scaffolding!();
 ///      check's round apart from the claim's, Java-engine parity); the iOS
 ///      host drives no CCIP round yet, and the Node addon leaves the round to
 ///      its caller.
-/// v50: data usage (docs/data-usage.md). The status JSON gained `dataUsage`
+/// v50: data usage (docs/how-it-works/data-usage.md). The status JSON gained `dataUsage`
 ///      (this handle's bytes since it was created, by layer, and the local
 ///      day's figures with their metered part, persisted in
 ///      `data-usage[-net].json` beside the snapshot) and `networkMetering`;
