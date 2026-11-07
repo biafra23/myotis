@@ -25,8 +25,10 @@ All paths are relative to `docs/tour/` in the Myotis repository.
   regenerates `starter/`. Stops embed workbook files with
   `<x-wb file="starter/src/…">` or `<x-wb file="solution-clean/…">` (the
   solution without its `//@begin` / `//@end` markers).
-- Outputs: `python3 build.py` writes `source/out/index.html`, `python3 epub.py`
-  writes `source/out/myotis-rust-tour.epub`, and `python3 markdown.py` writes
+- `source/VERSION`: the tour's version (see `CHANGELOG.md`); every output carries it.
+- Outputs: `python3 build.py` writes `source/out/myotis-rust-tour-<VERSION>.html`,
+  `python3 epub.py` writes `source/out/myotis-rust-tour-<VERSION>.epub`, and
+  `python3 markdown.py` writes
   the Markdown book to `book/` (committed). Run `python3 route.py` first when a
   stop's reading time changed: it rewrites the full route in Stop 0.
 - `python3 build.py --check stops/NN-x.html --scope rust/<dir>` validates one

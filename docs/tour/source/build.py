@@ -62,7 +62,7 @@ RUST = os.path.join(REPO, "rust")
 CARGO_REGISTRY = os.path.join(os.environ.get("CARGO_HOME", os.path.expanduser("~/.cargo")), "registry", "src")
 ONLINE_RUSTDOC = "https://doc.rust-lang.org/"
 # `repodoc:<path>` links name a file under the repo's docs/ as it is NOW (not at COMMIT):
-# relative links where the output lives in the checkout, GitHub otherwise.
+# GitHub in the HTML and EPUB (they get copied away from the checkout), relative in book/.
 ONLINE_REPODOC = "https://github.com/biafra23/myotis/blob/main/docs/"
 
 
@@ -139,27 +139,36 @@ def missing_hint(src):
     return ""
 
 
-def expand_code(m, where):
-    a = attrs(m.group(1))
+def excerpt(a, where):
+    """Validate an x-code tag's attributes and cut its excerpt: (src, from, to, body) with the
+    common indentation trimmed (numbering stays exact), or None after recording an error.
+    Shared by every output (build.py, epub.py, markdown.py)."""
     src = a.get("src")
     if not src:
         errors.append(f"{where}: x-code without src")
-        return ""
+        return None
     path = resolve(src)
     if not os.path.exists(path):
         errors.append(f"{where}: x-code src missing: {src}{missing_hint(src)}")
-        return ""
+        return None
     ls = lines_of(path)
     fr = int(a.get("from", "1"))
     to = int(a.get("to", str(len(ls))))
     if fr < 1 or to > len(ls) or fr > to:
         errors.append(f"{where}: x-code range {fr}-{to} out of bounds for {src} ({len(ls)} lines)")
-        return ""
+        return None
     chunk = ls[fr - 1:to]
-    # trim common indentation for readability, but keep numbering exact
     indents = [len(l) - len(l.lstrip(" ")) for l in chunk if l.strip()]
     cut = min(indents) if indents else 0
-    body = "\n".join(l[cut:] if len(l) >= cut else l.lstrip(" ") for l in chunk)
+    return src, fr, to, "\n".join(l[cut:] if len(l) >= cut else l.lstrip(" ") for l in chunk)
+
+
+def expand_code(m, where):
+    a = attrs(m.group(1))
+    cut = excerpt(a, where)
+    if cut is None:
+        return ""
+    src, fr, to, body = cut
     gutter = "\n".join(str(i) for i in range(fr, to + 1))
     lang = a.get("lang", "rust")
     shown = shown_path(src)
@@ -460,7 +469,7 @@ def main():
     for href in set(re.findall(r'href="#([^"]+)"', page)):
         if f'id="{href}"' not in page:
             errors.append(f"broken internal link #{href}")
-    page = page.replace("rustdoc:", rustdoc_base(local=True)).replace("repodoc:", "../../../")
+    page = page.replace("rustdoc:", rustdoc_base(local=True)).replace("repodoc:", ONLINE_REPODOC)
     out = os.path.join(HERE, "out", f"myotis-rust-tour-{VERSION}.html")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:

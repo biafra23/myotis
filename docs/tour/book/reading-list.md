@@ -192,10 +192,10 @@ A binary crate has a main(); daemons parse arguments, report errors with anyhow 
 
 The Ethereum knowledge the code assumes. The project's own design documents are the best source here. [Stop 0 · The map](00-map.md)
 
-- **Repo docs**: [docs/spec/01-consensus-light-client.md](../../spec/01-consensus-light-client.md) *(— sync committees, updates, the store)*
-- **Repo docs**: [docs/spec/02-execution-networking.md](../../spec/02-execution-networking.md) *(— discv4, RLPx, eth, snap)*
-- **Repo docs**: [docs/spec/03-state-verification-and-evm.md](../../spec/03-state-verification-and-evm.md)
-- **Repo docs**: [docs/spec/05-engine-api-bindings.md and 07-el-implementation-plan.md](../../spec/05-engine-api-bindings.md)
+- **Repo docs**: [docs/spec/01-consensus-light-client.md](../../spec/01-consensus-light-client.md) *(— sync committees, updates, the store)* *((online only))*
+- **Repo docs**: [docs/spec/02-execution-networking.md](../../spec/02-execution-networking.md) *(— discv4, RLPx, eth, snap)* *((online only))*
+- **Repo docs**: [docs/spec/03-state-verification-and-evm.md](../../spec/03-state-verification-and-evm.md) *((online only))*
+- **Repo docs**: [docs/spec/05-engine-api-bindings.md and 07-el-implementation-plan.md](../../spec/05-engine-api-bindings.md) *((online only))*
 
 ## Your offline library
 
@@ -209,7 +209,7 @@ Two kinds of book work without a network: your own ebooks, and the Rust document
 - **Hands-on Rust** (Herbert Wolverson)*(EPUB · complete ·)* — A game-building book. Chapter 2 is a gentle introduction to structs, vectors and enums, and Chapter 3 shows an enum-driven state machine.
 - **Command-Line Rust** and **Systems Programming with Rust** (Ken Youens-Clark)*(EPUB · early release, ch. 1–10 ·)* — These are the same book: “Systems Programming with Rust” was the early-release title. Both of your copies stop at chapter 10, so only chapters 1–10 are recommended.
 - **Programming Rust, 2nd Edition** (Blandy, Orendorff, Tindall)*(EPUB · early release, ch. 1–2 ·)* — Your copy contains only “Why Rust?” and “Basic Types”. “Basic Types” is still useful here: its sections on pointer types, slices and byte strings come up throughout this code.
-- **The Myotis docs**[docs/ in your checkout](../../README.md) — The documents the code refers to, grouped by kind: `spec/` (the re-implementation specification), `how-it-works/privacy-and-tor.md`, `design-history/lc-server-design.md`, `guides/android-library.md`. The tour quotes the code at `5263a421`, when these lived directly under `docs/`; your checkout is newer.
+- **The Myotis docs**[on GitHub, and under docs/ in your checkout](../../README.md) — The documents the code refers to, grouped by kind: `spec/` (the re-implementation specification), `how-it-works/privacy-and-tor.md`, `design-history/lc-server-design.md`, `guides/android-library.md`. The tour quotes the code at `5263a421`, when these lived directly under `docs/`; your checkout is newer.
 - **Command Line Applications in Rust***(online only)* — rust-cli.github.io/book: argument parsing, anyhow errors, signal handling. Relevant for roost, rpcd and tor-poc. It is not installed locally.
 
 ---

@@ -40,30 +40,22 @@ SVG_STYLE = (
 # ---------------------------------------------------------------- excerpt renderers
 
 
-def _excerpt(src, fr, to):
-    ls = B.lines_of(B.resolve(src))
-    chunk = ls[fr - 1:to]
-    indents = [len(l) - len(l.lstrip(" ")) for l in chunk if l.strip()]
-    cut = min(indents) if indents else 0
-    return "\n".join(l[cut:] if len(l) >= cut else l.lstrip(" ") for l in chunk)
-
-
 def md_code(m, where):
     a = B.attrs(m.group(1))
-    src = a.get("src")
-    if not src or not os.path.exists(B.resolve(src)):
-        B.errors.append(f"{where}: x-code src missing: {src}{B.missing_hint(src or '')}")
+    cut = B.excerpt(a, where)
+    if cut is None:
         return ""
-    n = len(B.lines_of(B.resolve(src)))
-    fr, to = int(a.get("from", "1")), int(a.get("to", str(n)))
-    if fr < 1 or to > n or fr > to:
-        B.errors.append(f"{where}: x-code range {fr}-{to} out of bounds for {src}")
-        return ""
+    src, fr, to, body = cut
     rng = f"lines {fr}–{to}" if fr != to else f"line {fr}"
     return (f'<figure class="mdcode" data-lang="{html.escape(a.get("lang", "rust"))}" '
             f'data-title="{html.escape(a.get("title", ""), quote=True)}" '
             f'data-path="{html.escape(B.shown_path(src), quote=True)}" data-range="{rng}">'
-            f'<pre>{html.escape(_excerpt(src, fr, to))}</pre></figure>')
+            f'<pre>{html.escape(body)}</pre></figure>')
+
+
+def wb_path(name):
+    """The real file behind a workbook name: solution-clean/ is solution/src/ without markers."""
+    return "solution/src/" + name[len("solution-clean/"):] if name.startswith("solution-clean/") else name
 
 
 def md_wb(m, where):
@@ -74,7 +66,7 @@ def md_wb(m, where):
         return ""
     return (f'<figure class="mdcode" data-lang="{html.escape(a.get("lang", "rust"))}" '
             f'data-title="{html.escape(a.get("label", ""), quote=True)}" '
-            f'data-path="docs/tour/workbook/{html.escape(a.get("file", ""), quote=True)}" data-range="">'
+            f'data-path="docs/tour/workbook/{html.escape(wb_path(a.get("file", "")), quote=True)}" data-range="">'
             f'<pre>{html.escape(text.rstrip(chr(10)))}</pre></figure>')
 
 
@@ -477,18 +469,13 @@ def main():
         with open(os.path.join(BOOK, name), "w", encoding="utf-8") as f:
             f.write(text)
         sizes.append((len(text), name))
-    hours = round(sum(_minutes(m) for m, _ in stops) / 60)
+    hours = E.total_hours(stops)
     with open(os.path.join(BOOK, "README.md"), "w", encoding="utf-8") as f:
         f.write(readme([m for m, _ in stops], md_names, n_q, hours))
     total = sum(s for s, _ in sizes)
     print(f"markdown: {len(sizes)} files, {total // 1024} KB, {len(os.listdir(IMG))} diagrams -> {os.path.relpath(BOOK)}")
     for w in sorted(set(B.warnings)):
         print("WARN:", w)
-
-
-def _minutes(meta):
-    import route
-    return route.minutes(int(meta["num"]))
 
 
 if __name__ == "__main__":

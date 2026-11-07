@@ -666,26 +666,26 @@
      "src": "Repo docs",
      "title": "docs/spec/01-consensus-light-client.md",
      "note": "sync committees, updates, the store",
-     "offline": true,
+     "offline": false,
      "href": "repodoc:spec/01-consensus-light-client.md"
     },
     {
      "src": "Repo docs",
      "title": "docs/spec/02-execution-networking.md",
      "note": "discv4, RLPx, eth, snap",
-     "offline": true,
+     "offline": false,
      "href": "repodoc:spec/02-execution-networking.md"
     },
     {
      "src": "Repo docs",
      "title": "docs/spec/03-state-verification-and-evm.md",
-     "offline": true,
+     "offline": false,
      "href": "repodoc:spec/03-state-verification-and-evm.md"
     },
     {
      "src": "Repo docs",
      "title": "docs/spec/05-engine-api-bindings.md and 07-el-implementation-plan.md",
-     "offline": true,
+     "offline": false,
      "href": "repodoc:spec/05-engine-api-bindings.md"
     }
    ]

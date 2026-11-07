@@ -179,7 +179,7 @@ Change the signature of `fixed` to `-> Option<&[u8]>` (no `'a`) and run the test
 <details>
 <summary>Solution</summary>
 
-**src/e01\_cursor.rs (solution)** · `docs/tour/workbook/solution-clean/e01_cursor.rs`
+**src/e01\_cursor.rs (solution)** · `docs/tour/workbook/solution/src/e01_cursor.rs`
 
 ```rust
 //! Exercise 1: a panic-free byte cursor (borrowing, slices, lifetimes).
@@ -336,7 +336,7 @@ mod tests {
 <details>
 <summary>Solution</summary>
 
-**src/e02\_hex.rs (solution)** · `docs/tour/workbook/solution-clean/e02_hex.rs`
+**src/e02\_hex.rs (solution)** · `docs/tour/workbook/solution/src/e02_hex.rs`
 
 ```rust
 //! Exercise 2: panic-free hex parsing with const generics (bytes and strings).
@@ -505,7 +505,7 @@ Delete the `From` impl and compile. The error at the `?` says that `?` couldn't 
 <details>
 <summary>Solution</summary>
 
-**src/e03\_errors.rs (solution)** · `docs/tour/workbook/solution-clean/e03_errors.rs`
+**src/e03\_errors.rs (solution)** · `docs/tour/workbook/solution/src/e03_errors.rs`
 
 ```rust
 //! Exercise 3: errors as values: enums, `From`, `?` and `Display`.
@@ -692,7 +692,7 @@ Uncomment `c.current();` after `finish` in the test `receivers`: "borrow of move
 <details>
 <summary>Solution</summary>
 
-**src/e04\_methods.rs (solution)** · `docs/tour/workbook/solution-clean/e04_methods.rs`
+**src/e04\_methods.rs (solution)** · `docs/tour/workbook/solution/src/e04_methods.rs`
 
 ```rust
 //! Exercise 4: methods and receivers (`&self`, `&mut self`, `self`).
@@ -895,7 +895,7 @@ Move `slow_start(&config)` inside the block, so that it runs while `map` is stil
 <details>
 <summary>Solution</summary>
 
-**src/e05\_registry.rs (solution)** · `docs/tour/workbook/solution-clean/e05_registry.rs`
+**src/e05\_registry.rs (solution)** · `docs/tour/workbook/solution/src/e05_registry.rs`
 
 ```rust
 //! Exercise 5: a thread-safe registry (Mutex, atomics, Arc, lock scope).
@@ -1120,7 +1120,7 @@ mod tests {
 <details>
 <summary>Solution</summary>
 
-**src/e06\_guard.rs (solution)** · `docs/tour/workbook/solution-clean/e06_guard.rs`
+**src/e06\_guard.rs (solution)** · `docs/tour/workbook/solution/src/e06_guard.rs`
 
 ```rust
 //! Exercise 6: an RAII drop guard (Drop, Arc, Mutex).
@@ -1272,7 +1272,7 @@ Move `Arc::clone(svc)` into the thread instead of a `Weak`. The test hangs at `j
 <details>
 <summary>Solution</summary>
 
-**src/e07\_weak.rs (solution)** · `docs/tour/workbook/solution-clean/e07_weak.rs`
+**src/e07\_weak.rs (solution)** · `docs/tour/workbook/solution/src/e07_weak.rs`
 
 ```rust
 //! Exercise 7: a background worker that must not keep its owner alive (Weak).
@@ -1409,7 +1409,7 @@ mod tests {
 <details>
 <summary>Solution</summary>
 
-**src/e08\_chain.rs (solution)** · `docs/tour/workbook/solution-clean/e08_chain.rs`
+**src/e08\_chain.rs (solution)** · `docs/tour/workbook/solution/src/e08_chain.rs`
 
 ```rust
 //! Exercise 8: verify a header chain with slices and iterators.
@@ -1588,7 +1588,7 @@ The test passes `|i| { let p = plan[i].clone(); async move { … } }`. The closu
 <details>
 <summary>Solution</summary>
 
-**src/e09\_hedge.rs (solution)** · `docs/tour/workbook/solution-clean/e09_hedge.rs`
+**src/e09\_hedge.rs (solution)** · `docs/tour/workbook/solution/src/e09_hedge.rs`
 
 ```rust
 //! Exercise 9: a hedged race with tokio (futures, select!, cancellation).
@@ -1795,7 +1795,7 @@ mod tests {
 <details>
 <summary>Solution</summary>
 
-**src/e10\_traits.rs (solution)** · `docs/tour/workbook/solution-clean/e10_traits.rs`
+**src/e10\_traits.rs (solution)** · `docs/tour/workbook/solution/src/e10_traits.rs`
 
 ```rust
 //! Exercise 10: traits, generics vs `dyn`, and a decorator.

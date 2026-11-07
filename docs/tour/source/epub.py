@@ -69,21 +69,10 @@ def code_rows(hl, first):
 
 def ep_code(m, where):
     a = B.attrs(m.group(1))
-    src = a.get("src")
-    path = B.resolve(src or "")
-    if not src or not os.path.exists(path):
-        B.errors.append(f"{where}: x-code src missing: {src}")
+    cut = B.excerpt(a, where)
+    if cut is None:
         return ""
-    ls = B.lines_of(path)
-    fr = int(a.get("from", "1"))
-    to = int(a.get("to", str(len(ls))))
-    if fr < 1 or to > len(ls) or fr > to:
-        B.errors.append(f"{where}: x-code range {fr}-{to} out of bounds for {src}")
-        return ""
-    chunk = ls[fr - 1:to]
-    indents = [len(l) - len(l.lstrip(" ")) for l in chunk if l.strip()]
-    cut = min(indents) if indents else 0
-    body = "\n".join(l[cut:] if len(l) >= cut else l.lstrip(" ") for l in chunk)
+    src, fr, to, body = cut
     lang = a.get("lang", "rust")
     shown = B.shown_path(src)
     title = a.get("title", "")
@@ -362,7 +351,7 @@ def answers_chapter(titles):
     return "".join(out)
 
 
-def about_chapter(n_stops, n_q, brand_sub):
+def about_chapter(n_stops, n_q, brand_sub, hours):
     return f'''<section class="stop" id="about"><header class="stop-head"><div class="eyebrow">Before you start</div>
 <h1>About this edition ({B.VERSION})</h1>
 <p class="lede">This is the ebook edition of the Myotis Rust Tour: a guided walk through every Rust file in
@@ -375,7 +364,7 @@ again with <code>git show 5263a421:rust/&lt;path&gt;</code>.</p>
 <p><b>How to read it.</b> Front to back. Stop 0 is a map of the workspace and ends with the full route: the
 same order in legs of a few hours, with each workbook exercise placed after the stop it practises. Stop 1 is a primer on the
 Rust ideas the rest leans on: ownership, borrowing, lifetimes, traits, smart pointers, async, and methods and
-<code>self</code>. The whole book reads in roughly fifty-five hours; an eight-hour flight covers the first leg and most of
+<code>self</code>. The whole book reads in about {hours} hours; eight hours of reading cover the first leg and most of
 the second.</p>
 <p><b>Checkpoints.</b> Each stop ends with a checkpoint. In this edition nothing is graded for you: decide on
 your answer, then follow “Answer →” to the appendix and come back with “← Back to the question”. For written
@@ -445,6 +434,11 @@ def make_cover(tmp, stats, commit):
 
 # ---------------------------------------------------------------- main
 
+def total_hours(stops):
+    import route
+    return round(sum(route.minutes(int(m["num"])) for m, _ in stops) / 60)
+
+
 def collect(code=None, wb=None):
     """Expand every stop and assemble the book's chapters as XHTML fragments:
     [(file, title, body, nav label, part)], plus the stop metadata and counts.
@@ -493,7 +487,7 @@ def collect(code=None, wb=None):
 
     chapters = []  # (file, title, xhtml body, nav label, part)
     chapters.append(("title.xhtml", "Myotis Rust Tour", to_xhtml(title_chapter(brand_sub)), None, None))
-    chapters.append(("about.xhtml", "About this edition", to_xhtml(about_chapter(len(stops), n_q, brand_sub)),
+    chapters.append(("about.xhtml", "About this edition", to_xhtml(about_chapter(len(stops), n_q, brand_sub, total_hours(stops))),
                      "About this edition", None))
     for meta, body in stops:
         body = body.replace("<x-file-index></x-file-index>", index_html)

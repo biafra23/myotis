@@ -28,6 +28,11 @@ def main():
             if not check:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 open(path, "w", encoding="utf-8").write(want)
+    wanted = set(os.listdir(os.path.join(SOL, "src")))
+    for name in sorted(set(os.listdir(os.path.join(START, "src"))) - wanted):
+        stale.append(name + " (no longer in solution/)")
+        if not check:
+            os.remove(os.path.join(START, "src", name))
     if not check:
         for f in ("Cargo.toml", "Cargo.lock"):
             shutil.copyfile(os.path.join(SOL, f), os.path.join(START, f))

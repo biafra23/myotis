@@ -16,6 +16,8 @@ def minutes(num):
     if m:
         return int(m.group(1).replace(",", ""))
     m = re.search(r"about (\d+)(½)? hours?", eb)
+    if not m:
+        raise SystemExit(f"{f}: the eyebrow needs a reading time as 'about N minutes' or 'about N hours'")
     return int(m.group(1)) * 60 + (30 if m.group(2) else 0)
 
 
