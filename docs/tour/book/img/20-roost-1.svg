@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 960 330" role="img" fill="currentColor" aria-label="roost's task layout. The main serve task fetches SSZ from Nimbus over loopback REST on a 12 second tick, appends to the archive file, and writes pre-encoded responses into a shared Arc LcStore and the status into an Arc LocalStatus. The libp2p swarm task from myotis-net answers wallets by reading the store synchronously and queues bootstrap misses that the main task later drains. The main task also watches the swarm task's JoinHandle and exits if it ends." width="960" height="330">
+    <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="960.0" height="330.0" fill="#f8fafb" /><defs>
+      <marker id="m-roost-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+      </marker>
+    </defs>
+    <g font-size="12">
+      <rect x="20" y="120" width="150" height="70" rx="8" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)" />
+      <text x="95" y="148" text-anchor="middle" font-weight="700">Nimbus</text>
+      <text x="95" y="166" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">REST 127.0.0.1:5052</text>
+
+      <rect x="240" y="50" width="250" height="140" rx="8" stroke-width="2" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="365" y="76" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">main task: serve()</text>
+      <text x="365" y="98" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">select! · 12 s tick</text>
+      <text x="365" y="116" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">rest.rs → framing.rs</text>
+      <text x="365" y="134" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">forks.rs digests · enr.rs</text>
+      <text x="365" y="152" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">owns archive, digests, …</text>
+      <text x="365" y="170" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">(plain locals, no locks)</text>
+
+      <rect x="240" y="245" width="250" height="56" rx="8" stroke-width="1.5" style="fill:var(--surface);stroke:var(--ink-3)" />
+      <text x="365" y="268" text-anchor="middle" font-weight="700">roost-archive.db</text>
+      <text x="365" y="286" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">append-only · FNV-1a · torn-tail repair</text>
+
+      <rect x="565" y="62" width="165" height="72" rx="8" stroke-width="1.5" style="fill:var(--surface);stroke:var(--oxide)" />
+      <text x="647" y="86" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">Arc&lt;LcStore&gt;</text>
+      <text x="647" y="104" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">std RwLock&lt;Inner&gt;</text>
+      <text x="647" y="120" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">pre-encoded Arc&lt;[u8]&gt;</text>
+
+      <rect x="565" y="158" width="165" height="46" rx="8" stroke-width="1.5" style="fill:var(--surface);stroke:var(--oxide)" />
+      <text x="647" y="186" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">Arc&lt;LocalStatus&gt;</text>
+
+      <rect x="790" y="50" width="150" height="140" rx="8" stroke-width="1.5" style="fill:var(--jvm-wash);stroke:var(--jvm)" />
+      <text x="865" y="76" text-anchor="middle" font-weight="700" style="fill:var(--jvm-ink)">swarm task</text>
+      <text x="865" y="96" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">myotis-net libp2p</text>
+      <text x="865" y="114" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">respond_inbound</text>
+      <text x="865" y="132" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">synchronous,</text>
+      <text x="865" y="148" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">no .await</text>
+
+      <rect x="790" y="245" width="150" height="56" rx="8" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)" />
+      <text x="865" y="268" text-anchor="middle" font-weight="700">wallets</text>
+      <text x="865" y="286" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">≤ 1024 inbound</text>
+    </g>
+    <g stroke-width="1.5" fill="none" style="stroke:currentColor">
+      <line x1="170" y1="155" x2="236" y2="155" marker-end="url(#m-roost-arrow)" />
+      <line x1="365" y1="190" x2="365" y2="241" marker-end="url(#m-roost-arrow)" />
+      <line x1="490" y1="84" x2="561" y2="84" marker-end="url(#m-roost-arrow)" />
+      <line x1="490" y1="178" x2="561" y2="180" marker-end="url(#m-roost-arrow)" />
+      <line x1="790" y1="96" x2="734" y2="96" marker-end="url(#m-roost-arrow)" />
+      <line x1="790" y1="180" x2="734" y2="180" marker-end="url(#m-roost-arrow)" />
+      <line x1="865" y1="245" x2="865" y2="194" marker-end="url(#m-roost-arrow)" />
+    </g>
+    <line x1="565" y1="122" x2="494" y2="122" stroke-width="1.3" stroke-dasharray="5 4" marker-end="url(#m-roost-arrow)" style="stroke:var(--warn)" />
+    <path d="M865,50 C865,16 365,16 365,46" stroke-width="1.3" stroke-dasharray="5 4" fill="none" marker-end="url(#m-roost-arrow)" style="stroke:var(--bad)" />
+    <g font-size="10.5" style="fill:var(--ink-3)">
+      <text x="203" y="146" text-anchor="middle">SSZ</text>
+      <text x="373" y="222">append + fsync</text>
+      <text x="526" y="76" text-anchor="middle">insert</text>
+      <text x="526" y="170" text-anchor="middle">set</text>
+      <text x="530" y="140" text-anchor="middle" style="fill:var(--warn)">misses</text>
+      <text x="762" y="88" text-anchor="middle">read</text>
+      <text x="762" y="172" text-anchor="middle">read</text>
+      <text x="873" y="224">requests</text>
+      <text x="615" y="22" text-anchor="middle" style="fill:var(--bad)">JoinHandle watched: exit if the swarm task ends</text>
+    </g>
+  </svg>

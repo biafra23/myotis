@@ -1,0 +1,249 @@
+<!--meta {"id":"stop-22","num":22,"title":"Workbook: ten exercises you can run offline","short":"Workbook","sub":"10 exercises · cargo test --offline","part":"Wrap-up"} -->
+<header class="stop-head">
+  <div class="eyebrow">Stop 22 · hands-on <span>10 exercises · about 2½ hours</span></div>
+  <h1>Workbook: ten exercises you can run offline</h1>
+  <p class="lede">Reading Rust and writing it are different skills, and the borrow checker teaches the second one fastest. Each exercise below re-builds, in 30 to 80 lines, one mechanism you met in Myotis: the snapshot cursor, the engine's handle map, the peer's drop guard, the reader's hedged race. Every exercise comes with tests. The crate needs only the standard library, tokio and futures, at the exact versions Myotis uses, and those are already in your local cargo cache, so <code>cargo test --offline</code> works with no network at all. This was verified with cargo 1.99.</p>
+</header>
+
+<div class="learn">
+  <h2>How to use this stop</h2>
+  <div><b>Write, compile, test</b>Fill in each <code>todo!()</code>, run the exercise's tests, and read every compiler error to the end: they are written to teach.</div>
+  <div><b>Hints before solutions</b>Each exercise has hints and a solution, folded away. Open the hints when you are stuck for more than ten minutes.</div>
+  <div><b>Then predict</b>Several exercises end with a "break it on purpose" step: change one line, predict the compiler error, then check.</div>
+</div>
+
+<section class="prose">
+  <h2>Setup (two minutes, works on the plane)</h2>
+  <p>The starter crate is already on your Mac, next to this tour:</p>
+  <pre class="workbook" data-copy><code class="lang-text">cd docs/tour/workbook
+cp -R starter mine        # keep a pristine copy; work in "mine"
+cd mine
+cargo test --offline e01  # one exercise: tests whose path contains "e01"
+cargo test --offline      # everything (26 tests)</code></pre>
+  <p>Or open <code>docs/tour/workbook/mine</code> in RustRover (File → Open) and use the green run arrows next to each <code>#[test]</code>. Before you start, every test fails with <code>not yet implemented: your code here</code>, and the compiler warns about unused variables and imports. Both are expected: the bodies are <code>todo!()</code>, a macro that compiles to a panic. The full solutions are in <code>docs/tour/workbook/solution</code>, and below each exercise.</p>
+  <p>If the folder is missing (a different machine), create the crate from these two files, then paste each exercise file into <code>src/</code>:</p>
+</section>
+<x-wb file="starter/Cargo.toml" lang="toml" label="Cargo.toml"></x-wb>
+<x-wb file="starter/src/lib.rs" label="src/lib.rs"></x-wb>
+
+<div class="callout jvm">
+  <span class="k">JVM lens</span>
+  <p><code>#[cfg(test)] mod tests</code> is a test class that lives in the same file, compiled only for <code>cargo test</code>, and it may see private items (like package-private access). <code>assert_eq!</code> is <code>assertEquals</code>, and a test passes if and only if it does not panic. <code>cargo test e05</code> filters by test path the way Gradle's <code>--tests</code> does.</p>
+</div>
+
+<!-- =============================================================== E01 -->
+<section class="exercise" id="ex-01">
+  <h3>1 · A panic-free byte cursor</h3>
+  <p><x-tags>borrowing lifetimes bytes-strings</x-tags> From <a href="#primer-borrowing">the primer</a> and <a href="#stop-06">Stop 6</a>: the snapshot decoder's <code>Reader&lt;'a&gt;</code>. Implement <code>fixed</code>, <code>u32_be</code>, <code>u64_le</code> and <code>prefixed</code>. The point of the exercise is the return type <code>Option&lt;&amp;'a [u8]&gt;</code>: a returned slice borrows the <em>buffer</em>, not the reader, so you can hold two of them while reading on. The tests also feed a hostile length (<code>0xffffffff</code>) and <code>usize::MAX</code>, so nothing may panic. Use <code>checked_add</code>, <code>get(a..b)</code>, <code>try_into</code> and <code>?</code>.</p>
+  <x-wb file="starter/src/e01_cursor.rs" label="src/e01_cursor.rs (starter)"></x-wb>
+  <details class="deep"><summary>Hints</summary>
+    <ul>
+      <li><code>self.pos.checked_add(len)?</code> gives you the end, or returns <code>None</code> on overflow.</li>
+      <li><code>self.data.get(self.pos..end)?</code> is the panic-free form of <code>&amp;self.data[self.pos..end]</code>.</li>
+      <li>Only move <code>pos</code> after both have succeeded.</li>
+      <li><code>slice.try_into()</code> converts <code>&amp;[u8]</code> to <code>[u8; 4]</code> and is fallible; <code>.ok()?</code> turns its <code>Result</code> into an early <code>None</code>.</li>
+    </ul>
+  </details>
+  <details class="deep"><summary>Break it on purpose</summary>
+    <p>Change the signature of <code>fixed</code> to <code>-&gt; Option&lt;&amp;[u8]&gt;</code> (no <code>'a</code>) and run the tests. The test <code>slices_borrow_the_buffer_not_the_reader</code> stops compiling with "cannot borrow <code>r</code> as mutable more than once at a time". Lifetime elision tied the result to <code>&amp;mut self</code>, so the first slice keeps the reader mutably borrowed. That is exactly the argument the primer makes about <code>snapshot.rs</code>.</p>
+  </details>
+  <details class="deep"><summary>Solution</summary>
+    <x-wb file="solution-clean/e01_cursor.rs" label="src/e01_cursor.rs (solution)"></x-wb>
+  </details>
+</section>
+
+<!-- =============================================================== E02 -->
+<section class="exercise" id="ex-02">
+  <h3>2 · Hex parsing with const generics</h3>
+  <p><x-tags>bytes-strings error-handling traits-generics</x-tags> From <a href="#stop-16">Stop 16</a> (<code>host.rs</code>'s <code>parse_hex_fixed</code>) and the multi-byte trap in the reader's <code>parse_boot_enodes</code>. <code>parse_hex_fixed::&lt;N&gt;</code> returns a stack array whose length is a compile-time parameter, something Java generics cannot express. Then write <code>to_hex</code> so that it fills one pre-sized <code>String</code> with <code>write!</code>, with no <code>format!</code> per byte.</p>
+  <x-wb file="starter/src/e02_hex.rs" label="src/e02_hex.rs (starter)"></x-wb>
+  <details class="deep"><summary>Hints</summary>
+    <ul>
+      <li><code>s.strip_prefix("0x")</code> returns <code>Option&lt;&amp;str&gt;</code>; chain <code>.or_else(…)</code> and <code>.unwrap_or(s)</code>.</li>
+      <li>Check <code>s.len() == 2 * N</code> <em>and</em> that every byte is an ASCII hex digit before slicing. <code>len()</code> counts bytes, so <code>"éé"</code> has length 4.</li>
+      <li><code>for (i, byte) in out.iter_mut().enumerate()</code> gives you <code>&amp;mut u8</code> slots to fill.</li>
+      <li>For <code>write!</code> into a <code>String</code>, you need <code>use std::fmt::Write;</code> in scope.</li>
+    </ul>
+  </details>
+  <details class="deep"><summary>Solution</summary>
+    <x-wb file="solution-clean/e02_hex.rs" label="src/e02_hex.rs (solution)"></x-wb>
+  </details>
+</section>
+
+<!-- =============================================================== E03 -->
+<section class="exercise" id="ex-03">
+  <h3>3 · Errors as values: enums, <code>From</code> and <code>?</code></h3>
+  <p><x-tags>error-handling enums-patterns traits-generics</x-tags> From <a href="#stop-07">Stop 7</a>: <code>OracleError</code> and <code>EvmError</code>. Write the <code>From</code> impl, a <code>Display</code> with one <code>match</code> covering every case, and <code>total_balance</code> using only <code>?</code>: no <code>match</code>, no <code>map_err</code>. The <code>From</code> impl is what lets <code>?</code> convert the error on its way out.</p>
+  <x-wb file="starter/src/e03_errors.rs" label="src/e03_errors.rs (starter)"></x-wb>
+  <details class="deep"><summary>Hints</summary>
+    <ul>
+      <li>Patterns can nest: <code>EvmError::Oracle(OracleError::StateUnavailable { address })</code> matches and binds in one arm.</li>
+      <li><code>write!(f, "out of gas")</code> returns the <code>fmt::Result</code> that <code>fmt</code> must return.</li>
+      <li>In <code>total_balance</code>, <code>src.balance(*a)?</code> has type <code>u64</code>. <code>*a</code> copies the 20-byte array out of the slice (arrays of <code>Copy</code> are <code>Copy</code>).</li>
+    </ul>
+  </details>
+  <details class="deep"><summary>Break it on purpose</summary>
+    <p>Delete the <code>From</code> impl and compile. The error at the <code>?</code> says that <code>?</code> couldn't convert the error to <code>EvmError</code>, and suggests implementing <code>From&lt;OracleError&gt;</code>. Then add a fourth variant to <code>EvmError</code> and watch the <code>match</code> in <code>Display</code> fail with "non-exhaustive patterns". That is the compiler keeping every error path honest.</p>
+  </details>
+  <details class="deep"><summary>Solution</summary>
+    <x-wb file="solution-clean/e03_errors.rs" label="src/e03_errors.rs (solution)"></x-wb>
+  </details>
+</section>
+
+<!-- =============================================================== E04 -->
+<section class="exercise" id="ex-04">
+  <h3>4 · Methods and receivers</h3>
+  <p><x-tags>methods ownership borrowing</x-tags> From <a href="#primer-methods">the primer's methods section</a>: roost's <code>EnrSeq</code>, and <code>SyncHandle::stop(self)</code>. The four functions differ only in how they receive the counter: not at all (<code>start</code>), shared (<code>&amp;self</code>), exclusive (<code>&amp;mut self</code>) and by value (<code>self</code>). Note the test that calls <code>Counter::bump(&amp;mut c)</code>: that is what the dot desugars to.</p>
+  <x-wb file="starter/src/e04_methods.rs" label="src/e04_methods.rs (starter)"></x-wb>
+  <details class="deep"><summary>Hints</summary>
+    <ul>
+      <li><code>checked_add(1)</code> returns an <code>Option</code>; <code>.ok_or_else(|| "overflow".to_string())?</code> turns <code>None</code> into an early <code>Err</code>.</li>
+      <li>In <code>finish(self)</code>, the whole struct is yours: return the field (<code>self.log</code>) by moving it out. You can't do that from <code>&amp;self</code>.</li>
+    </ul>
+  </details>
+  <details class="deep"><summary>Break it on purpose</summary>
+    <p>Uncomment <code>c.current();</code> after <code>finish</code> in the test <code>receivers</code>: "borrow of moved value: <code>c</code>". Then change <code>finish(self)</code> to <code>finish(&amp;self)</code> and see why returning <code>self.log</code> no longer compiles ("cannot move out of <code>self.log</code> which is behind a shared reference"). The fix the compiler suggests, <code>.clone()</code>, would copy the log, which is precisely what a consuming method avoids.</p>
+  </details>
+  <details class="deep"><summary>Solution</summary>
+    <x-wb file="solution-clean/e04_methods.rs" label="src/e04_methods.rs (solution)"></x-wb>
+  </details>
+</section>
+
+<!-- =============================================================== E05 -->
+<section class="exercise" id="ex-05">
+  <h3>5 · A thread-safe registry, and the lock scope</h3>
+  <p><x-tags>interior-mutability smart-pointers concurrency</x-tags> From <a href="#stop-16">Stop 16</a>: the engine's handle map and <code>spin_up</code>. <code>create</code> must work from eight threads at once through <code>&amp;self</code>, which is why the ids come from an atomic. <code>start</code> must copy the <code>Arc&lt;Config&gt;</code> out under the lock, <em>release</em> the lock, run the slow part, and re-check before publishing. One test calls <code>try_lock()</code> from inside <code>slow_start</code> and fails if you still hold the lock. Another stops the entry in the middle of a start, and expects your code not to bring it back.</p>
+  <x-wb file="starter/src/e05_registry.rs" label="src/e05_registry.rs (starter)"></x-wb>
+  <details class="deep"><summary>Hints</summary>
+    <ul>
+      <li><code>let config = { let map = self.handles.lock().unwrap(); match map.get(&amp;id) { … } };</code>: the guard <code>map</code> is dropped at the block's closing brace.</li>
+      <li><code>Arc::clone(c)</code> copies a pointer and increments a counter; the <code>Config</code> itself is not copied.</li>
+      <li>In <code>stop</code>, <code>remove</code> hands you the owned <code>Entry</code>; an or-pattern <code>Entry::Created(c) | Entry::Running(c, _)</code> binds <code>c</code> in both cases.</li>
+    </ul>
+  </details>
+  <details class="deep"><summary>Break it on purpose</summary>
+    <p>Move <code>slow_start(&amp;config)</code> inside the block, so that it runs while <code>map</code> is still alive. The <code>try_lock</code> assertion fails. With a plain <code>lock()</code> instead of <code>try_lock()</code>, the same thread would deadlock against itself: <code>std::sync::Mutex</code> is not reentrant, unlike Java's <code>synchronized</code>.</p>
+  </details>
+  <details class="deep"><summary>Solution</summary>
+    <x-wb file="solution-clean/e05_registry.rs" label="src/e05_registry.rs (solution)"></x-wb>
+  </details>
+</section>
+
+<!-- =============================================================== E06 -->
+<section class="exercise" id="ex-06">
+  <h3>6 · An RAII drop guard</h3>
+  <p><x-tags>smart-pointers interior-mutability error-handling</x-tags> From <a href="#stop-11">Stop 11</a>: the managed peer's <code>PendingGuard</code>. The guard registers a pending request and removes it again in <code>Drop</code>, unless the request finished through another path and the guard was disarmed. The test <code>early_return_cleans_up_and_success_keeps</code> leaves through <code>?</code>: cleanup happens anyway, with no <code>try/finally</code>.</p>
+  <x-wb file="starter/src/e06_guard.rs" label="src/e06_guard.rs (starter)"></x-wb>
+  <details class="deep"><summary>Hints</summary>
+    <ul>
+      <li><code>register</code> stores <code>Arc::clone(pending)</code> in the guard, so the guard keeps the map alive on its own; the test <code>guard_holds_its_own_arc</code> counts that.</li>
+      <li>In <code>drop</code>, prefer <code>if let Ok(mut map) = self.pending.lock()</code> to <code>unwrap()</code>: a panic inside <code>drop</code> during unwinding aborts the process.</li>
+    </ul>
+  </details>
+  <details class="deep"><summary>Solution</summary>
+    <x-wb file="solution-clean/e06_guard.rs" label="src/e06_guard.rs (solution)"></x-wb>
+  </details>
+</section>
+
+<!-- =============================================================== E07 -->
+<section class="exercise" id="ex-07">
+  <h3>7 · A worker that doesn't keep its owner alive</h3>
+  <p><x-tags>smart-pointers concurrency</x-tags> From <a href="#stop-14">Stop 14</a>: the reader's log-index appender holds a <code>Weak</code>. Spawn a thread that upgrades a <code>Weak&lt;Service&gt;</code> on every tick, does its work, drops the upgraded <code>Arc</code> <em>before</em> it sleeps, and exits when <code>upgrade()</code> returns <code>None</code>. The test drops the last strong <code>Arc</code> and then waits for the thread with <code>join()</code>. If your thread keeps a strong reference, that <code>join</code> never returns.</p>
+  <x-wb file="starter/src/e07_weak.rs" label="src/e07_weak.rs (starter)"></x-wb>
+  <details class="deep"><summary>Hints</summary>
+    <ul>
+      <li><code>Arc::downgrade(svc)</code> makes the <code>Weak</code>; move it into the thread with <code>std::thread::spawn(move || …)</code>.</li>
+      <li><code>let Some(s) = weak.upgrade() else { return done };</code> inside an inner block <code>{ … }</code>, so that <code>s</code> is dropped before <code>sleep</code>.</li>
+    </ul>
+  </details>
+  <details class="deep"><summary>Break it on purpose</summary>
+    <p>Move <code>Arc::clone(svc)</code> into the thread instead of a <code>Weak</code>. The test hangs at <code>join()</code>: the thread is now an owner, so the service never dies and the loop never ends. In the reader, the same mistake would leak an entire peer pool every time a host paused a chain. Stop the run with Ctrl-C.</p>
+  </details>
+  <details class="deep"><summary>Solution</summary>
+    <x-wb file="solution-clean/e07_weak.rs" label="src/e07_weak.rs (solution)"></x-wb>
+  </details>
+</section>
+
+<!-- =============================================================== E08 -->
+<section class="exercise" id="ex-08">
+  <h3>8 · Verify a header chain</h3>
+  <p><x-tags>iterators-closures enums-patterns domain</x-tags> From <a href="#stop-12">Stop 12</a> and <a href="#stop-14">Stop 14</a>: the header trust gate. Headers arrive newest first. The first must hash to the trusted anchor, and each must be the parent of the one before. <code>windows(2)</code> yields overlapping pairs as slices, and a slice pattern <code>let [child, parent] = w else { … }</code> names them. Then write <code>zero_prefixed</code> as a single iterator chain.</p>
+  <x-wb file="starter/src/e08_chain.rs" label="src/e08_chain.rs (starter)"></x-wb>
+  <details class="deep"><summary>Hints</summary>
+    <ul>
+      <li><code>headers.first().ok_or(ChainError::Empty)?</code> gives you the head or returns early.</li>
+      <li>Compare numbers with <code>parent.number.checked_add(1) != Some(child.number)</code> so that <code>u64::MAX</code> can't overflow.</li>
+      <li><code>headers.iter().filter(|h| h.hash[0] == 0).map(|h| h.number).collect()</code>: the return type tells <code>collect</code> to build a <code>Vec&lt;u64&gt;</code>.</li>
+    </ul>
+  </details>
+  <details class="deep"><summary>Solution</summary>
+    <x-wb file="solution-clean/e08_chain.rs" label="src/e08_chain.rs (solution)"></x-wb>
+  </details>
+</section>
+
+<!-- =============================================================== E09 -->
+<section class="exercise" id="ex-09">
+  <h3>9 · A hedged race with tokio</h3>
+  <p><x-tags>async ownership</x-tags> From <a href="#stop-14">Stop 14</a>: <code>hedged_race</code>. Start attempt 0. Whenever <code>delay</code> passes without an answer, or an attempt fails, start the next one <em>alongside</em> the running ones. Return the first <code>Ok</code>. The tests run on tokio's paused clock (<code>#[tokio::test(start_paused = true)]</code>) and assert exact elapsed times: a slow but working peer that answers at 4 s still wins, and a silent peer does not hold up the read past the hedge. This is the hardest exercise. Budget 30 to 45 minutes.</p>
+  <x-wb file="starter/src/e09_hedge.rs" label="src/e09_hedge.rs (starter)"></x-wb>
+  <details class="deep"><summary>Hints</summary>
+    <ul>
+      <li>Keep all running attempts in one <code>FuturesUnordered</code>. Because every <code>async move</code> block has its own anonymous type, push from exactly <em>one</em> place: <code>in_flight.push(async move { (idx, fut.await) })</code>.</li>
+      <li><code>tokio::select!</code> over <code>in_flight.next()</code> and <code>tokio::time::sleep(delay)</code>. A guard <code>, if next &lt; attempts</code> disables the timer branch when there is nothing left to start.</li>
+      <li>Each way the loop continues, a failure or the timer firing, is a reason to start one more attempt, so start one at the top of each turn while any remain.</li>
+      <li>You never cancel anything explicitly: <code>return</code> drops <code>in_flight</code>, and dropping a future is cancellation.</li>
+    </ul>
+  </details>
+  <details class="deep"><summary>Why the test can use the closure the way it does</summary>
+    <p>The test passes <code>|i| { let p = plan[i].clone(); async move { … } }</code>. The closure borrows <code>plan</code>, but each future it returns <em>owns</em> its clone <code>p</code>. That's needed because the futures outlive each closure call. They don't need to be <code>'static</code>, though: <code>hedged</code> awaits them in place and never spawns them, as <code>get_account</code>'s closure in the reader does.</p>
+  </details>
+  <details class="deep"><summary>Solution</summary>
+    <x-wb file="solution-clean/e09_hedge.rs" label="src/e09_hedge.rs (solution)"></x-wb>
+  </details>
+</section>
+
+<!-- =============================================================== E10 -->
+<section class="exercise" id="ex-10">
+  <h3>10 · Traits: generics, <code>dyn</code> and a decorator</h3>
+  <p><x-tags>traits-generics methods interior-mutability</x-tags> From <a href="#primer-traits-generics">the primer</a> and <a href="#stop-07">Stop 7</a>: <code>SnapStateOracle</code>, and the <code>Counting { inner, fetches }</code> wrapper in the executor tests. Implement the fixture, a generic decorator <code>Counting&lt;S&gt;</code>, one function with static dispatch (<code>total&lt;S: StateSource + ?Sized&gt;</code>) and one with dynamic dispatch over a slice of trait objects (<code>richest</code>).</p>
+  <x-wb file="starter/src/e10_traits.rs" label="src/e10_traits.rs (starter)"></x-wb>
+  <details class="deep"><summary>Hints</summary>
+    <ul>
+      <li><code>self.balances.get(&amp;address).copied()</code> turns <code>Option&lt;&amp;u64&gt;</code> into <code>Option&lt;u64&gt;</code>.</li>
+      <li><code>self.calls.fetch_add(1, Ordering::Relaxed)</code> works through <code>&amp;self</code>, because atomics are interior mutability.</li>
+      <li><code>?Sized</code> lets <code>S</code> be <code>dyn StateSource</code>, a type with no size known at compile time, which can only sit behind a pointer.</li>
+      <li><code>max_by_key(|(_, b)| *b)</code> picks the largest balance.</li>
+    </ul>
+  </details>
+  <details class="deep"><summary>Solution</summary>
+    <x-wb file="solution-clean/e10_traits.rs" label="src/e10_traits.rs (solution)"></x-wb>
+  </details>
+</section>
+
+<x-quiz>[
+  {"id":"wb-q1","type":"open","tags":["lifetimes","borrowing"],
+   "q":"Exercise 1: explain why <code>fixed(&amp;mut self, len) -&gt; Option&lt;&amp;'a [u8]&gt;</code> lets the caller keep two returned slices at once, and what goes wrong with <code>-&gt; Option&lt;&amp;[u8]&gt;</code>.",
+   "model":"<code>'a</code> is the lifetime of the borrowed buffer the reader was created over. A result typed <code>&amp;'a [u8]</code> points into that buffer and is unrelated to the temporary <code>&amp;mut self</code> borrow of the reader, so the mutable borrow ends when <code>fixed</code> returns, and the next call can borrow the reader mutably again. With <code>-&gt; Option&lt;&amp;[u8]&gt;</code>, lifetime elision ties the result to <code>&amp;mut self</code>: as long as the first slice is alive, the reader stays mutably borrowed, so a second <code>fixed</code> call is rejected (cannot borrow as mutable more than once).",
+   "points":["'a names the buffer's lifetime, not the reader's","the returned slice points into the buffer","with 'a the &mut self borrow ends when fixed returns","with elision the result keeps the reader mutably borrowed, so a second call fails to compile"],
+   "context":"workbook e01_cursor.rs: struct Reader&lt;'a> { data: &'a [u8], pos: usize }; fn fixed(&mut self, len: usize) -> Option&lt;&'a [u8]> { let end = self.pos.checked_add(len)?; let out = self.data.get(self.pos..end)?; self.pos = end; Some(out) }"},
+  {"id":"wb-q2","type":"open","tags":["interior-mutability","concurrency"],
+   "q":"Exercise 5: why must <code>start</code> release the map lock before calling <code>slow_start</code>, and why does it re-check the entry afterwards?",
+   "model":"Holding the lock during a slow start would block every other caller (create, stop, status) for the whole duration, and code inside <code>slow_start</code> that touches the registry on the same thread would deadlock, because <code>std::sync::Mutex</code> is not reentrant. So the code copies an <code>Arc&lt;Config&gt;</code> out (a cheap reference-count increment), drops the guard at the block's end, and does the slow work unlocked. While unlocked, another thread may have stopped or started the entry, so the code re-locks and publishes <code>Running</code> only if the entry is still <code>Created</code>; otherwise it returns false rather than bringing a stopped entry back.",
+   "points":["a held lock blocks all other registry calls during the slow work","std Mutex is not reentrant: re-locking on the same thread deadlocks","Arc::clone copies the config out cheaply so the guard can drop","state may change while unlocked, so publish only if still Created"],
+   "context":"workbook e05_registry.rs start(): let config = { let map = self.handles.lock().unwrap(); match map.get(&id) { Some(Entry::Created(c)) => Arc::clone(c), _ => return false } }; let started = slow_start(&config); let mut map = self.handles.lock().unwrap(); match map.get(&id) { Some(Entry::Created(_)) => { map.insert(id, Entry::Running(config, started)); true } _ => false }"},
+  {"id":"wb-q3","type":"mcq","tags":["smart-pointers","concurrency"],
+   "q":"Exercise 7: the worker thread moves a <code>Weak&lt;Service&gt;</code> into its closure. What happens if you move an <code>Arc&lt;Service&gt;</code> clone instead?",
+   "options":["Nothing changes; Arc and Weak behave the same","The thread becomes an owner: dropping the test's Arc no longer frees the service, upgrade never fails, the loop never ends and join() hangs","It doesn't compile, because Arc is not Send","The service is freed twice"],
+   "answer":1,
+   "explain":"A strong reference from a background task keeps its target alive forever. <code>Weak</code> observes without owning, and <code>upgrade()</code> returns <code>None</code> once the last owner is gone."},
+  {"id":"wb-q4","type":"open","tags":["async","ownership"],
+   "q":"Exercise 9: how are the losing attempts cancelled when <code>hedged</code> returns the first <code>Ok</code>, and why don't the futures need to be <code>'static</code>?",
+   "model":"All attempts are owned by the local <code>FuturesUnordered</code>. <code>return Some(..)</code> drops it, and with it every future still inside. A dropped future is never polled again, and its destructors run: that is cancellation in Rust, so no explicit cancel call is needed. The futures don't need <code>'static</code> because they are never spawned onto the runtime: <code>hedged</code> polls them in place while it is itself being awaited, so they can't outlive the data they borrow. <code>tokio::spawn</code> is what demands <code>'static</code>.",
+   "points":["attempts are owned by the local FuturesUnordered","returning drops it and every in-flight future (= cancellation)","no explicit cancel call; destructors run","no 'static needed: the futures are polled in place, not spawned"],
+   "context":"workbook e09_hedge.rs: in_flight = FuturesUnordered::new(); in_flight.push(async move { (idx, fut.await) }); tokio::select! { Some((idx,res)) = in_flight.next() => if let Ok(v) = res { return Some((idx, v)) } , _ = sleep(delay), if next &lt; attempts => {}, else => return None }"},
+  {"id":"wb-q5","type":"mcq","tags":["traits-generics"],
+   "q":"Exercise 10: <code>total&lt;S: StateSource + ?Sized&gt;(src: &amp;S, …)</code> is called with a <code>Counting&lt;Fixture&gt;</code> and with a <code>&amp;dyn StateSource</code>. How many copies of <code>total</code> does the compiler produce, and how is <code>balance</code> called in each?",
+   "options":["One copy; both calls go through a vtable","Two copies (monomorphisation): for Counting&lt;Fixture&gt; the call to balance is static and can be inlined; for dyn StateSource it goes through the trait object's vtable","Two copies, both using vtables","It doesn't compile, because generics can't take dyn"],
+   "answer":1,
+   "explain":"Each concrete <code>S</code> gets its own compiled copy. With <code>S = dyn StateSource</code> (allowed by <code>?Sized</code>), the copy calls through the vtable, like a Java interface call."}
+]</x-quiz>

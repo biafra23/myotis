@@ -1,0 +1,418 @@
+<!--meta {"id":"stop-05","num":5,"title":"myotis-wire: the protocols as pure functions","short":"myotis-wire","sub":"25 files · 5,821 lines","part":"Pure foundations"} -->
+<header class="stop-head">
+  <div class="eyebrow">Stop 5 · crate <code>myotis-wire</code> <span>25 files · 5,821 lines · about 2½ hours</span></div>
+  <h1>myotis-wire: the protocols as pure functions</h1>
+  <p class="lede">Every byte Myotis sends to or reads from a peer is shaped here: discv4 packets, the RLPx handshake and its encrypted frames, the eth and snap messages, the proofs that make a snap answer trustworthy, and the eth2 req/resp framing. None of it opens a socket, reads a clock or draws a random number. The crate was split out of <code>myotis-net</code> so that a host without tokio (firmware, a browser, a blocking client) can drive the same code. Along the way you will see how one crate builds with and without the standard library, and how a decoder can read a 10 MiB peer message without copying it.</p>
+</header>
+
+<div class="learn">
+  <h2>Rust you will practise</h2>
+  <div><b>Features and <code>cfg</code></b><code>#![cfg_attr(not(feature = "std"), no_std)]</code>, optional dependencies, and <code>#[cfg]</code> blocks that pick one of two function bodies at compile time.</div>
+  <div><b>Borrowed views</b><code>rlp::View&lt;'a&gt;</code>, <code>Cow&lt;'_, RawList&gt;</code> and slices that point into the caller's buffer, so a peer's message is checked and read in place.</div>
+  <div><b>State only <code>&amp;mut</code> can advance</b>the frame codec's keystreams, <code>split(self)</code> into two owned halves, and a handshake struct that borrows its key.</div>
+</div>
+
+<section class="prose">
+  <h2>Why a crate with no I/O</h2>
+  <p>Until issue #505 this code lived inside <code>myotis-net</code>, mixed in with the tokio tasks that drive it. It was already written “sans-I/O”: the codecs took entropy and time as parameters, and only a few service types touched sockets. The split made that a crate boundary. <code>myotis-wire</code> has no tokio, no sockets, no clock and no entropy. A caller passes in every random value (the ECIES ephemeral key, the IV, the EIP-8 padding) and every timestamp (a discv4 expiry). In return it gets plain functions from bytes to bytes or to typed values.</p>
+  <p>Two things follow. First, the crate builds as <code>no_std</code> + <code>alloc</code> with <code>--no-default-features</code>: it needs a heap allocator, but no operating system. The Gradle task <code>cargoBuildNoStd</code> proves it by building for <code>x86_64-unknown-none</code>, a target that has no <code>std</code> at all, and <code>cargoCheckWasm</code> checks it for <code>wasm32-unknown-unknown</code>. Second, <code>myotis-net</code> keeps working unchanged: it depends on <code>myotis-wire</code> and re-exports each moved module at its old path through tiny shim files, which you meet at the end of this stop.</p>
+
+  <figure class="diagram">
+    <div class="svg-wrap">
+    <svg class="wide-diagram" viewBox="0 0 880 360" role="img" fill="currentColor" xmlns="http://www.w3.org/2000/svg"
+         aria-label="Dependency graph. myotis-net, which owns tokio, sockets and OS entropy, and any other host with its own event loop both depend on myotis-wire. myotis-net re-exports it at the old paths. myotis-wire depends on myotis-core always, and on myotis-consensus, and through it myotis-bls and the blst C library, only with the eth2 feature.">
+      <defs>
+        <marker id="m-stop05-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+      <rect x="40" y="20" width="320" height="76" rx="10" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+      <text x="56" y="44" font-size="12.5" font-weight="700" class="mono">myotis-net</text>
+      <text x="56" y="64" font-size="11" style="fill:var(--ink-2)">tokio · sockets · timers · OS entropy</text>
+      <text x="56" y="82" font-size="10.5" style="fill:var(--ink-3)">sessions, pool, discovery services, shims</text>
+
+      <rect x="500" y="20" width="340" height="76" rx="10" stroke-width="1.4" stroke-dasharray="5 4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+      <text x="516" y="44" font-size="12.5" font-weight="700">a host with its own event loop</text>
+      <text x="516" y="64" font-size="11" style="fill:var(--ink-2)">UEFI firmware · wasm32 · a blocking client</text>
+      <text x="516" y="82" font-size="10.5" style="fill:var(--ink-3)">brings its own socket, clock and randomness</text>
+
+      <rect x="150" y="146" width="580" height="88" rx="10" stroke-width="1.6" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="168" y="170" font-size="12.5" font-weight="700" class="mono">myotis-wire</text>
+      <text x="168" y="190" font-size="11" class="mono" style="fill:var(--ink-2)">discv4 · rlpx::{ecies, handshake, frame, hello} · eth · snap::{messages, fetch} · snappy</text>
+      <text x="168" y="210" font-size="11" class="mono" style="fill:var(--oxide-ink)">eth2::{codec, status, protocols}   (feature "eth2")</text>
+      <text x="168" y="226" font-size="10.5" style="fill:var(--ink-3)">no_std + alloc without "std"</text>
+
+      <rect x="60" y="284" width="320" height="60" rx="10" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+      <text x="76" y="308" font-size="12.5" font-weight="700" class="mono">myotis-core</text>
+      <text x="76" y="328" font-size="11" style="fill:var(--ink-2)">keccak · RLP · NodeKey · header · trie</text>
+
+      <rect x="500" y="284" width="340" height="60" rx="10" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+      <text x="516" y="308" font-size="12.5" font-weight="700" class="mono">myotis-consensus → myotis-bls</text>
+      <text x="516" y="328" font-size="11" style="fill:var(--ink-2)">SSZ helpers; blst, a C library</text>
+
+      <line x1="200" y1="96" x2="300" y2="144" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop05-arrow)"/>
+      <text x="262" y="116" font-size="10.5" style="fill:var(--ink-3)">re-exports at the old paths</text>
+      <line x1="670" y1="96" x2="580" y2="144" stroke="currentColor" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#m-stop05-arrow)"/>
+      <line x1="300" y1="234" x2="230" y2="282" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop05-arrow)"/>
+      <line x1="580" y1="234" x2="660" y2="282" stroke="currentColor" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#m-stop05-arrow)"/>
+      <text x="636" y="258" font-size="10.5" class="mono" style="fill:var(--oxide-ink)">only with "eth2"</text>
+    </svg>
+    </div>
+    <figcaption>Arrows point from a crate to what it depends on. Dashed: optional.</figcaption>
+  </figure>
+
+  <h3>Where each part goes</h3>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Module</th><th>What it does</th><th>Driven by (in <code>myotis-net</code>)</th></tr></thead>
+    <tbody>
+      <tr><td><code>discv4</code></td><td>Sign, hash and parse discovery packets; decode Neighbors, Pong, ENR replies.</td><td><code>el::discv4::Discv4Service</code> (stop 11)</td></tr>
+      <tr><td><code>rlpx</code></td><td>ECIES, the EIP-8 auth/ack handshake, the encrypted frame codec, the p2p Hello.</td><td><code>el::rlpx::transport</code> (stop 11)</td></tr>
+      <tr><td><code>eth</code></td><td>eth/66–71 messages: Status, headers, bodies, receipts, transaction gossip.</td><td><code>el::eth::session</code>, <code>el::peer</code></td></tr>
+      <tr><td><code>snap</code></td><td>snap/1 and snap/2 messages, and verification of their Merkle proofs.</td><td><code>el::peer</code>, <code>el::reader</code> (stop 14)</td></tr>
+      <tr><td><code>snappy</code></td><td>Snappy raw and framed formats: the <code>snap</code> crate with <code>std</code>, a built-in codec without.</td><td>used inside this crate</td></tr>
+      <tr><td><code>eth2</code></td><td>Consensus-layer req/resp framing, <code>Status</code>/<code>MetaData</code>, fork digests, protocol ids.</td><td><code>reqresp</code>, <code>sync</code> (stops 9–10); also <code>roost</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="callout rust"><span class="k">What changed since September</span>In the old tour these files were part of <code>myotis-net</code> (stops 7 and 9 of that edition). Besides the move, three changes run through them. Peer messages are now read in place through <code>rlp::View</code> and stored in <code>RawList</code> instead of being decoded into owned trees (#454). The eth side gained eth/70 (receipts that continue across responses) and eth/71 (block access lists), and snap gained snap/2. Snappy goes through the new <code>snappy</code> module, and <code>hello.rs</code> was cut out of the RLPx transport.</div>
+
+  <div class="callout jvm"><span class="k">Java/Kotlin</span>In the Java engine these are classes in <code>com.jaeckel.ethp2p.networking.*</code> that are mostly static encoders plus Netty handlers. The Rust side keeps the encoders apart from the event loop on purpose: a Netty <code>ChannelHandler</code> is tied to Netty, while a function from <code>&amp;[u8]</code> to <code>Result&lt;T, E&gt;</code> runs anywhere.</div>
+</section>
+
+<section class="prose">
+  <h2>The crate manifest</h2>
+  <p>The manifest is the best summary of the design. Read the feature table first.</p>
+  <x-code src="myotis-wire/Cargo.toml" from="17" to="27" lang="toml"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo</x-tags> <strong>Features are additive switches.</strong> <code>default = ["std", "eth2"]</code> is what you get unless a dependent writes <code>default-features = false</code>. A feature can turn on features of dependencies (<code>"myotis-core/std"</code>) and optional dependencies (<code>"dep:snap"</code>). The question mark in <code>"myotis-consensus?/std"</code> means “turn on <code>std</code> in that crate <em>if</em> it is already enabled for another reason”, so <code>std</code> alone does not drag in the consensus crate.</li>
+    <li><x-tags>modules-cargo domain</x-tags> <strong>Why <code>eth2</code> is optional.</strong> The consensus wire needs a few SSZ helpers from <code>myotis-consensus</code>, which depends on <code>myotis-bls</code>, which compiles the <code>blst</code> C library. An execution-layer-only host can switch <code>eth2</code> off and avoid cross-compiling C for its target. The no_std canary builds exactly that combination: no <code>std</code>, no <code>eth2</code>.</li>
+    <li><x-tags>testing modules-cargo</x-tags> <code>test-util</code> exposes test helpers to <em>other</em> crates. <code>#[cfg(test)]</code> code is only compiled for this crate's own tests, so <code>myotis-net</code>'s tests could not see it. <code>myotis-net</code> turns <code>test-util</code> on in its <code>[dev-dependencies]</code> only, so production builds never contain the helpers. The comment names <code>SessionSecrets::test_pair</code>; the feature also gates <code>discv4::encode_packet_for_test</code>.</li>
+  </ul>
+  <x-code src="myotis-wire/Cargo.toml" from="28" to="41" lang="toml"></x-code>
+  <p class="code-note"><x-tags>modules-cargo</x-tags> Every dependency is pinned with <code>=</code> and has <code>default-features = false</code>. Most RustCrypto crates turn on <code>std</code> by default; leaving one default on would pull <code>std</code> into a no_std build and fail only on the canary. <code>snap</code> is the exception: it needs <code>std</code>, so it is optional and enabled only by this crate's <code>std</code> feature. The remaining lines of the manifest (43–48) force the software SHA-2 backend on bare-metal targets, where the SSE-enabling code cannot be compiled.</p>
+  <div class="callout watch"><span class="k">Stale or inaccurate comments</span>The manifest says that on bare-metal targets you must build “with <code>RUSTFLAGS="--cfg aes_force_soft"</code> (the no_std canary does…)”. The canary does not set <code>RUSTFLAGS</code>. The flag comes from per-target <code>rustflags</code> entries in <code>rust/.cargo/config.toml</code>, whose own comment says it was put there “rather than RUSTFLAGS in CI”. The effect is the same for builds inside the repo; an embedder building from outside it still has to set the cfg.</div>
+</section>
+
+<x-file path="rust/myotis-wire/src/lib.rs" kind="crate root">
+  <p class="purpose">The crate root: a doc comment that lists the five protocol areas, the <code>no_std</code> switch, and the module list. Only <code>eth2</code> is behind a feature.</p>
+  <x-code src="myotis-wire/src/lib.rs" from="18" to="28"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo</x-tags> <strong>A conditional crate attribute.</strong> <code>cfg_attr(condition, attribute)</code> applies the attribute only when the condition holds. Without the <code>std</code> feature the crate is <code>#![no_std]</code>: the implicit <code>extern crate std</code> disappears and the prelude becomes <code>core</code>'s, which has no heap types.</li>
+    <li><x-tags>modules-cargo smart-pointers</x-tags> <strong><code>extern crate alloc;</code></strong> brings in the crate that defines <code>Vec</code>, <code>String</code>, <code>Box</code> and <code>format!</code>. It needs no operating system, only a global allocator that the final binary provides. With <code>std</code> on, these are the very same types: <code>std::vec::Vec</code> is a re-export of <code>alloc::vec::Vec</code>.</li>
+    <li><x-tags>modules-cargo</x-tags> Every source file starts with the same line, <code>#[allow(unused_imports)] use alloc::{borrow::ToOwned, format, string::{String, ToString}, vec, vec::Vec};</code>. In a no_std build those names are not in scope without it. Each file copies the whole list, and not every file uses every name, so the <code>allow</code> silences the warnings for the unused ones.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/myotis-wire/src/snappy.rs" kind="library">
+  <p class="purpose">New since the old tour. Snappy is the compression both peer-to-peer stacks use: RLPx compresses each message with the <em>raw</em> format, and eth2 req/resp uses the <em>framed</em> format (a stream identifier, then checksummed chunks). With <code>std</code>, every function here forwards to the <code>snap</code> crate, exactly what <code>myotis-net</code> used before. Without <code>std</code> (the <code>snap</code> crate needs it) a small in-house codec takes over: a complete raw decoder, a literal-only raw encoder, and a framed encoder and decoder that write uncompressed chunks.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–57</td><td>Raw format: <code>compress</code>, <code>decompress_len</code>, <code>decompress</code>, each with a <code>std</code> and a built-in body.</td></tr>
+      <tr><td>59–186</td><td>Framed format: <code>compress_framed</code>, <code>decompress_framed</code>, bitwise CRC-32C, and the built-in framed codec with <code>snap</code>'s acceptance rules.</td></tr>
+      <tr><td>188–294</td><td>Varint, the literal-only encoder, and the full raw decoder.</td></tr>
+      <tr><td>296–444</td><td>Tests (with <code>std</code> only): the built-in codec against <code>snap</code> in both directions, plus a property test.</td></tr>
+    </tbody>
+  </table></div>
+  <x-code src="myotis-wire/src/snappy.rs" from="15" to="37"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo</x-tags> <strong>Two bodies, one survives.</strong> <code>#[cfg]</code> works on blocks inside a function as well as on items. After configuration only one of the two blocks remains, and it becomes the function's tail expression. That is how one signature gets two implementations with no runtime <code>if</code> and no trait.</li>
+    <li><x-tags>error-handling</x-tags> <code>compress</code> cannot fail in its signature. In the <code>std</code> body, <code>unwrap_or_else(|_| input.to_vec())</code> turns <code>snap</code>'s error into an uncompressed copy. <code>decompress_len</code> turns the error into <code>None</code> with <code>.ok()</code>.</li>
+    <li><x-tags>domain</x-tags> <strong>A literal-only encoder is still valid Snappy.</strong> Snappy output is a sequence of “literal” (copy these bytes) and “copy” (repeat earlier output) elements. An encoder that emits only literals never compresses, but every decoder accepts it. The doc comment argues that a light client's outgoing RLPx messages are a few hundred bytes, so the lost ratio does not matter, and having no match-finder leaves nothing to get wrong.</li>
+  </ul>
+  <x-code src="myotis-wire/src/snappy.rs" from="81" to="98"></x-code>
+  <ul class="concepts">
+    <li><x-tags>bytes-strings traits-generics</x-tags> <strong>Readers stack like Java <code>InputStream</code> wrappers.</strong> <code>&amp;[u8]</code> implements <code>Read</code>, <code>FrameDecoder</code> decompresses it, <code>.take(n)</code> caps it at <code>limit</code> bytes, and <code>read_to_end</code> fills a <code>Vec</code>. The <code>use std::io::Read;</code> sits inside the block, because the trait (and <code>std</code> itself) only exists in that configuration.</li>
+    <li><x-tags>domain</x-tags> <code>limit</code> is how the eth2 codec bounds memory: it passes the declared length plus one (see <a href="#f-myotis-wire-src-eth2-codec-rs">eth2/codec.rs</a>). The initial capacity is capped at 1 MiB, so a large declared limit does not allocate up front. The built-in framed decoder applies the same limit, and also refuses a chunk with more than 64 KiB of uncompressed data, as <code>snap</code> does.</li>
+  </ul>
+  <x-code src="myotis-wire/src/snappy.rs" from="258" to="294"></x-code>
+  <p class="code-note"><x-tags>borrowing bytes-strings</x-tags> This is the “copy” half of the built-in raw decoder: repeat <code>l</code> bytes starting <code>off</code> bytes back in the output. The obvious line, <code>out.extend_from_slice(&amp;out[start..start + l])</code>, does not compile: it borrows <code>out</code> immutably (the slice) and mutably (the push) at the same time, error E0502. It would also be wrong, because in Snappy a copy may overlap its own output (<code>l &gt; off</code>, for example “repeat the last byte 20 times”). The byte loop handles both: <code>let b = out[start + i];</code> copies one <code>u8</code> (a <code>Copy</code> type), so the immutable borrow ends on that line, and <code>out.push(b)</code> then has <code>out</code> to itself. <code>start + i</code> is always below <code>out.len()</code>, because the vector grows by one each round.</p>
+  <ul class="concepts">
+    <li><x-tags>error-handling</x-tags> <strong><code>?</code> on <code>Option</code>.</strong> The function returns <code>Option&lt;Vec&lt;u8&gt;&gt;</code>, so <code>input.get(pos)?</code> and <code>pos.checked_add(2)?</code> return <code>None</code> early, like Kotlin's <code>?: return null</code>. <code>get</code> instead of indexing and <code>checked_add</code> instead of <code>+</code> mean a hostile input yields <code>None</code>, never a panic or an overflow. The earlier literal arm (lines 242–257) does the same, and the function refuses a declared length above <code>max</code> before it allocates anything.</li>
+    <li><x-tags>ownership</x-tags> <code>(out.len() == len).then_some(out)</code> moves <code>out</code> into <code>Some</code> when the length is exactly right, and drops it otherwise.</li>
+  </ul>
+  <p class="code-note"><x-tags>testing</x-tags> The built-in codec runs in no production build that has <code>std</code>, so the tests are its only exercise on a normal machine. They run it against <code>snap</code> both ways. The property test <code>builtin_raw_decoder_agrees_with_snap_or_refuses</code> feeds 3,000 random inputs and many mutated <code>snap</code> encodings, generated with a deterministic xorshift so a failure reproduces, and asserts that the built-in decoder either returns what <code>snap</code> returns or returns <code>None</code>. The <code>let mut next = move || { … }</code> closure owns its state <code>x</code> and mutates it, which makes it an <code>FnMut</code>.</p>
+  <div class="callout watch"><span class="k">Stale or inaccurate comments</span>The module's first line calls it “Snappy <em>raw</em> format (no framing) for RLPx message payloads”. Lines 59–186 implement the framed format for eth2 req/resp as well.</div>
+</x-file>
+
+<x-file path="rust/myotis-wire/src/discv4.rs" kind="library" twin="networking.discv4">
+  <p class="purpose">The discv4 packet codec, moved out of <code>myotis-net::el::discv4</code>. A packet is <code>hash(32) ‖ signature(65) ‖ type(1) ‖ RLP data</code>. The file has encoders for Ping, Pong, FindNode, and the EIP-868 ENR request and response, and decoders for what comes back. The Kademlia routing table, the ping rate limiter and the UDP service stayed in <code>myotis-net</code> (<a href="#stop-11">stop 11</a>), which re-exports this module with <code>pub use myotis_wire::discv4::*;</code>.</p>
+  <x-code src="myotis-wire/src/discv4.rs" from="174" to="194"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain</x-tags> <strong>Two hashes, two jobs.</strong> The leading hash covers everything after it and only detects corruption. The signature covers <code>type ‖ data</code>, and recovering the public key from it gives the sender's node id. There is no separate “from” field to trust: the identity is whatever key signed the packet.</li>
+    <li><x-tags>bytes-strings borrowing</x-tags> The length check at the top makes every fixed range below safe to index. <code>copy_from_slice</code> copies into stack arrays (<code>[u8; 32]</code>, <code>[u8; 65]</code>); it panics on a length mismatch, which the ranges rule out. <code>packet[98..].to_vec()</code> is the one heap copy: <code>Parsed</code> owns its data, so the caller's receive buffer can be reused at once.</li>
+  </ul>
+  <x-code src="myotis-wire/src/discv4.rs" from="255" to="280"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns error-handling</x-tags> <strong><code>let … else</code>.</strong> <code>let (Ok(ip), Ok(udp), Ok(tcp), Ok(node_id)) = (…) else { break; };</code> builds a tuple of four <code>Result</code>s and binds all four values only if every one is <code>Ok</code>. Otherwise the <code>else</code> block runs, and it must leave the scope (<code>break</code>, <code>continue</code>, <code>return</code>). It reads like a guard clause in Kotlin, but it also destructures.</li>
+    <li><x-tags>domain</x-tags> <strong>Java's leniency, reproduced.</strong> A structurally broken entry stops the walk and keeps the nodes so far (<code>break</code>). An entry with a wrong IP length or a UDP port above 65535 is skipped (<code>continue</code>), because that is where Java's <code>InetAddress</code> construction throws. The cross-language corpus in <code>rust/testdata/el/discv4/</code> pins this behaviour.</li>
+    <li><x-tags>bytes-strings</x-tags> <code>udp as u16</code> is a truncating cast, safe here only because the line above already rejected values over 65535.</li>
+  </ul>
+  <p class="code-note"><x-tags>testing modules-cargo</x-tags> <code>encode_packet</code> is private: this client never sends Neighbors, so it has no public encoder for it. Tests that play the peer's side need one, so <code>encode_packet_for_test</code> exists under <code>#[cfg(any(test, feature = "test-util"))]</code>. <code>myotis-net</code>'s discv4 tests import it under its real name with <code>use … as encode_packet</code>.</p>
+  <div class="callout watch"><span class="k">Stale or inaccurate comments</span>The module doc, copied from the <code>myotis-net</code> original, says “The packet codec, Kademlia table, and rate limiter are pure … pinned by the … corpus”. Only the codec is in this file; <code>KademliaTable</code> and <code>PingRateLimiter</code> are still in <code>myotis-net/src/el/discv4.rs</code>. The file also ends with an orphaned <code>// ----</code> separator on line 292, where the original went on to the Kademlia section.</div>
+</x-file>
+
+<x-file path="rust/myotis-wire/src/rlpx/mod.rs" kind="module index" twin="networking.rlpx">
+  <p class="purpose">Declares the four RLPx modules: <code>ecies</code>, <code>handshake</code>, <code>frame</code> and <code>hello</code>. RLPx is the encrypted TCP transport under the eth and snap protocols. Only the initiator side exists, as in the Java reference. The doc comment states the contract: “the caller owns the socket and the entropy”. The tokio dialer that does own them is <code>myotis-net/src/el/rlpx/transport.rs</code> (<a href="#stop-11">stop 11</a>).</p>
+</x-file>
+
+<x-file path="rust/myotis-wire/src/rlpx/ecies.rs" kind="library" twin="EciesCodec">
+  <p class="purpose">ECIES encryption for the handshake's auth and ack messages: <code>0x04 ‖ ephemeral pubkey ‖ IV ‖ ciphertext ‖ MAC</code>, with a concat-KDF over SHA-256 (counter first), AES-128-CTR, and <code>HMAC-SHA256(SHA256(macKey), IV ‖ ct ‖ aad)</code>. The ephemeral key and IV are parameters, which keeps the tests deterministic. The file is unchanged since the old tour except for the <code>alloc</code> imports.</p>
+  <x-code src="myotis-wire/src/rlpx/ecies.rs" from="65" to="99"></x-code>
+  <ul class="concepts">
+    <li><x-tags>borrowing bytes-strings</x-tags> The IV, ciphertext and MAC are <em>views</em> into the input, and nothing is copied. The length check at the top guarantees that <code>split_at</code> and the index ranges can't panic.</li>
+    <li><x-tags>ownership</x-tags> <code>ciphertext.to_vec()</code> is the one deliberate allocation: a mutable copy that <code>apply_keystream(&amp;mut plain)</code> decrypts in place. The IV slice is copied into a fixed array because the cipher's <code>.into()</code> conversion is defined for arrays, not for slices of unknown length.</li>
+    <li><x-tags>domain</x-tags> The MAC is verified <em>before</em> anything is decrypted, and in constant time: <code>ct_eq</code> from the audited <code>subtle</code> crate returns a <code>Choice</code>, so LLVM can't turn the comparison into an early-exit loop that leaks, through timing, how many bytes matched.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/myotis-wire/src/rlpx/handshake.rs" kind="library" twin="AuthHandshake / SessionSecrets">
+  <p class="purpose">The initiator side of the EIP-8 auth/ack handshake. <code>build_auth</code> signs <code>staticShared ⊕ nonce</code> with an ephemeral key, RLP-encodes the auth body, and ECIES-encrypts it with the 2-byte size prefix as associated data. <code>process_ack</code> decrypts the reply and derives <code>aesSecret</code> and <code>macSecret</code> through a keccak chain. The raw auth and ack bytes are kept in <code>SessionSecrets</code>, because they seed the frame MACs.</p>
+  <x-code src="myotis-wire/src/rlpx/handshake.rs" from="81" to="88"></x-code>
+  <x-code src="myotis-wire/src/rlpx/handshake.rs" from="150" to="183"></x-code>
+  <ul class="concepts">
+    <li><x-tags>lifetimes</x-tags> <strong>A struct that borrows.</strong> <code>Initiator&lt;'a&gt;</code> mixes a <em>borrowed</em> field (<code>local_key: &amp;'a NodeKey</code>) with owned ones. The compiler proves that the key outlives every <code>Initiator</code> built from it. The key is only needed for one handshake, so a checked borrow is enough and no <code>Arc</code> is needed. In Java you would hold a reference and hope nobody clears the key in the meantime.</li>
+    <li><x-tags>enums-patterns error-handling</x-tags> <code>auth_wire: Option&lt;Vec&lt;u8&gt;&gt;</code> works as a precondition: calling <code>process_ack</code> before <code>build_auth</code> returns an <code>Err</code> instead of panicking. <code>.as_ref()</code> turns <code>&amp;Option&lt;Vec&lt;u8&gt;&gt;</code> into <code>Option&lt;&amp;Vec&lt;u8&gt;&gt;</code>, so the check borrows the vector instead of moving it out of <code>self</code>.</li>
+    <li><x-tags>borrowing ownership</x-tags> <code>build_auth(&amp;mut self, …)</code> records the wire bytes, while <code>process_ack(&amp;self, …)</code> only reads them, so the receiver type documents which call changes state. Because <code>process_ack</code> only borrows <code>self</code>, it cannot move <code>auth_wire</code> into the result: <code>auth_wire.clone()</code> copies it, and <code>ack_wire.to_vec()</code> copies the caller's slice. <code>SessionSecrets</code> then owns both.</li>
+    <li><x-tags>error-handling</x-tags> <code>rlp::decode(&amp;plain).or_else(|_| decode_prefix(&amp;plain))?</code> tries the strict decode first and, only on error, a tolerant one that ignores trailing bytes, because some peers pad the ack body.</li>
+  </ul>
+  <div class="callout watch"><span class="k">Stale or inaccurate comments</span>The test <code>handshake_round_trip_matches_both_sides</code> is documented as “both derive matching secrets (A via process_ack, B via derive_secrets with swapped roles)”. The test body only derives A's secrets and checks that a second derivation gives the same result. Its own later comment (lines 274–279) explains why the responder side is not derived. The trailing <code>let _ = &amp;b_eph;</code> does nothing.</div>
+</x-file>
+
+<x-file path="rust/myotis-wire/src/rlpx/frame.rs" kind="library" twin="FrameCodec">
+  <p class="purpose">The encrypted, framed channel after the handshake: <code>header ‖ header-mac ‖ body (padded to 16) ‖ body-mac</code>. It uses AES-256-CTR with a zero IV and one continuous keystream per direction, streaming Keccak-256 MACs advanced through AES-256-ECB, and Snappy for every payload except Hello. The codec splits into an egress half and an ingress half, so a reader task and a writer can each own one. Compression now goes through <a href="#f-myotis-wire-src-snappy-rs">crate::snappy</a> instead of the <code>snap</code> crate directly.</p>
+  <x-code src="myotis-wire/src/rlpx/frame.rs" from="56" to="104"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership concurrency</x-tags> <strong>Splitting one value into two.</strong> <code>split(self)</code> takes the codec by value and moves its two fields out. That is allowed because <code>FrameCodec</code> has no <code>Drop</code> impl; a type with one can't be taken apart (error E0509). Afterwards the codec no longer exists, and the halves are independent values that can go to different tasks without a lock.</li>
+    <li><x-tags>borrowing concurrency</x-tags> The doc says “NOT thread-safe”, and the types enforce it: every encode and decode method takes <code>&amp;mut self</code>, because each call advances a keystream and a MAC chain. Two concurrent users of one encoder don't compile. There is nothing like Java's <code>synchronized</code> here; exclusive access is a compile-time fact.</li>
+    <li><x-tags>borrowing</x-tags> <code>new(secrets: &amp;SessionSecrets)</code> only borrows the secrets. The ciphers copy the key material they need, so the caller keeps its <code>SessionSecrets</code>.</li>
+  </ul>
+  <x-code src="myotis-wire/src/rlpx/frame.rs" from="146" to="172"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain</x-tags> The header data must be <code>0xc2 0x80 0x80</code>, not <code>0xc0</code>. Nethermind disconnects otherwise, which is fatal on gnosis, where most nodes run Nethermind.</li>
+    <li><x-tags>domain</x-tags> <strong>Order matters, irreversibly.</strong> Encrypt the header, MAC it, encrypt the body, MAC it: each step mutates <code>self.encrypt</code> and <code>self.egress_mac</code>. A frame written only halfway therefore corrupts every later frame. That is the reason for the <code>torn</code> flag in <code>myotis-net</code>'s peer code (<a href="#stop-12">stop 12</a>).</li>
+    <li><x-tags>bytes-strings</x-tags> Above this excerpt, <code>(body_len + 15) &amp; !15</code> rounds the body up to a multiple of 16, and <code>[u8; 16]</code> lives on the stack.</li>
+  </ul>
+  <p class="code-note"><x-tags>ownership domain</x-tags> Reading the current MAC digest (<code>current_digest_16</code>, line 316) clones the hasher first, because <code>finalize()</code> takes the hasher by value and would end the chain. <code>decode_body</code> checks a peer's <em>declared</em> decompressed size with <code>snappy::decompress_len</code> before it decompresses, so a 6-byte Snappy header that claims 4 GiB can't make the process allocate 4 GiB and abort. A payload that fails this check, or fails to decompress, is passed up raw; the RLP layer above then rejects it. The bomb test builds its header with a bare <code>0xc0</code>, which also shows that the decoder never looks at the header-data bytes.</p>
+</x-file>
+
+<x-file path="rust/myotis-wire/src/rlpx/hello.rs" kind="library" twin="HelloMessage">
+  <p class="purpose">New file, moved here from <code>myotis-net::el::rlpx::transport</code>: the p2p base message codes (Hello <code>0x00</code>, Disconnect, Ping, Pong), the client id, and the Hello encoder and decoder. Hello is the first framed message in both directions. It names the client and lists its capabilities; the eth session in <code>myotis-net</code> then picks the highest eth and snap versions both sides share. <code>transport.rs</code> re-exports every item by name.</p>
+  <x-code src="myotis-wire/src/rlpx/hello.rs" from="17" to="55"></x-code>
+  <ul class="concepts">
+    <li><x-tags>macros</x-tags> <strong>A version string built by the compiler.</strong> <code>env!("CARGO_PKG_VERSION")</code> reads an environment variable that Cargo sets <em>while compiling</em>, and <code>concat!</code> joins string literals at compile time. The result is an ordinary <code>&amp;'static str</code> constant such as <code>"myotis/0.1.19"</code>. The Java engine derives its Hello id from the same Gradle version, and the build task <code>verifyCrateVersions</code> keeps the two equal.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>let cap = |name: &amp;str, ver: u64| { … };</code> is a closure that captures nothing, used as a local helper function. Its parameter types are written out because the body calls a method on <code>name</code>, and the compiler type-checks a closure's body where it is defined, before it has seen any call.</li>
+    <li><x-tags>domain</x-tags> The capability list advertises eth/66–71 and snap/1–2. eth/70 (EIP-7975, receipts that can be continued) and eth/71 (EIP-8159, block access lists) exist only in the Rust engine. <code>encode_hello_as</code> exists for the Tor path, whose Hello names the software without its version.</li>
+  </ul>
+  <p class="code-note"><x-tags>bytes-strings error-handling</x-tags> <code>decode_hello</code> (lines 79–114) first refuses a body over <code>MAX_CONTROL_MSG_SIZE</code> (16 KiB) before it builds an RLP tree (#454). It then reads strings with <code>String::from_utf8_lossy(…).into_owned()</code>: <code>from_utf8_lossy</code> returns a <code>Cow&lt;str&gt;</code> that borrows the input when it is valid UTF-8 and owns a repaired copy when it is not, and <code>into_owned()</code> turns either into a <code>String</code>. Errors become plain strings with <code>.map_err(|e| e.0)</code>: the closure owns the <code>CoreError</code> and moves its <code>String</code> field out.</p>
+</x-file>
+
+<x-file path="rust/myotis-wire/src/eth.rs" kind="library" twin="networking.eth.messages">
+  <p class="purpose">Pure encoders and decoders for the eth wire, eth/66 through eth/71, moved here from <code>myotis-net/src/el/eth/messages.rs</code>. It covers Status (eth/67–68 carry total difficulty; eth/69 carries a block range), BlockRangeUpdate, header requests and responses (outgoing <em>and</em> served to peers), block bodies, receipts (including rebuilding the canonical form from eth/69's bloom-less receipts and continuing an eth/70 response), GetBlockAccessLists, transaction broadcast, and tolerant extraction of hashes from transaction gossip. Message codes are absolute, already offset by the p2p base <code>0x10</code>. Much of the file was rewritten for #454 to read peer messages in place.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–51</td><td>Message codes, with notes on which codes are only free on which eth version.</td></tr>
+      <tr><td>53–232</td><td>Status for eth/67–68 and eth/69, BlockRangeUpdate, the compatibility gate.</td></tr>
+      <tr><td>234–364</td><td>GetBlockHeaders (inbound decode, outbound encode), BlockHeaders, <code>VerifiedHeader</code>.</td></tr>
+      <tr><td>366–422</td><td>GetBlockBodies / BlockBodies.</td></tr>
+      <tr><td>424–540</td><td>GetReceipts (eth/66 and eth/70), GetBlockAccessLists, Transactions, gossip hash extraction.</td></tr>
+      <tr><td>542–777</td><td><code>BlockReceipts</code>, the receipts decoders for eth/66–68, 69 and 70, and the eth/69 bloom recomputation.</td></tr>
+      <tr><td>779–864</td><td><code>RawList</code> and its iterator.</td></tr>
+      <tr><td>866–940</td><td>Shared helpers: request ids, the control-message size cap, <code>request_and_payload</code>, <code>kept</code>.</td></tr>
+      <tr><td>942–1533</td><td>Tests, including golden vectors shared with the Java engine.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Status: optional fields for version-specific data</h4>
+  <x-code src="myotis-wire/src/eth.rs" from="57" to="72"></x-code>
+  <p class="code-note"><x-tags>enums-patterns</x-tags> One struct serves both layouts: the eth/69-only fields are <code>Option&lt;u64&gt;</code>, <code>None</code> on 67–68. That is Kotlin's <code>Long?</code>, except that the compiler makes every reader handle the <code>None</code> case. A few lines further down, <code>HeadersOrigin</code> (lines 239–242) is a data-carrying enum, like a Kotlin sealed class: a header request starts either at a block number or at a hash. <code>decode_status</code> and the other control decoders call <code>check_control_size</code> first, so a 10 MiB “Status” is refused before it is decoded into a tree.</p>
+
+  <h4>Headers: read in place, copy what is kept</h4>
+  <x-code src="myotis-wire/src/eth.rs" from="342" to="364"></x-code>
+  <ul class="concepts">
+    <li><x-tags>borrowing lifetimes</x-tags> <strong>Zero-copy parsing.</strong> <code>request_and_payload</code> returns a <code>rlp::View</code>, a checked, borrowed window into <code>rlp_bytes</code> (<a href="#stop-04">stop 4</a> covers <code>View</code> in <code>myotis-core</code>). <code>headers.as_list()?</code> walks its elements without building anything, and <code>raw.raw()</code> is a slice of the caller's buffer. Bytes are copied only at <code>raw.raw().to_vec()</code>, for a header that is kept.</li>
+    <li><x-tags>domain</x-tags> <code>header::hash(raw.raw())</code> hashes the exact wire bytes, never a re-encoding: a block hash is keccak over what was sent.</li>
+    <li><x-tags>domain error-handling</x-tags> <strong>Check everything, keep a little.</strong> Every header is decoded, so a malformed one fails the whole response exactly as before. Only the first <code>kept(requested)</code> (the number asked for, plus one so a caller can still see a peer that over-serves) are stored. A peer that sends a million headers costs a walk, not a million allocations.</li>
+  </ul>
+
+  <h4>Receipts: the count is checked before any work</h4>
+  <x-code src="myotis-wire/src/eth.rs" from="576" to="584"></x-code>
+  <x-code src="myotis-wire/src/eth.rs" from="616" to="630"></x-code>
+  <ul class="concepts">
+    <li><x-tags>smart-pointers ownership lifetimes</x-tags> <strong><code>Cow</code>: borrow when you can, own when you must.</strong> <code>Cow&lt;'_, RawList&gt;</code> (“clone on write”) is an enum with two variants. For eth/66–68 the stored list already holds the receipts-trie values, so <code>expand</code> returns <code>Cow::Borrowed(list)</code> and copies nothing. For eth/69 every receipt must be rebuilt with its bloom, so it returns <code>Cow::Owned(out)</code>, a new list. The caller uses either as a <code>&amp;RawList</code>. The <code>'_</code> ties the borrowed case to <code>&amp;self</code>, so the borrow checker stops it from outliving the <code>BlockReceipts</code> it points into.</li>
+    <li><x-tags>domain</x-tags> <strong>Why the count comes first.</strong> eth/69 (EIP-7642) removed the 256-byte logs bloom from each receipt, because it can be recomputed from the logs. Recomputing adds 256 bytes to every receipt, however small. If the count were not checked first, a peer could send millions of tiny receipts and make the node expand them. <code>canonical</code> demands exactly the transaction count of the block's verified body; <code>canonical_at_most</code> (for a caller without the body, #544) accepts at most a bound taken from the trusted header. <code>expand</code> is private, so every way in checks a count.</li>
+    <li><x-tags>enums-patterns</x-tags> <code>len()</code> (line 562) uses an or-pattern, <code>BlockReceipts::Canonical(list) | BlockReceipts::Eth69(list) =&gt; list.len()</code>, which is allowed because both arms bind <code>list</code> with the same type.</li>
+  </ul>
+  <x-code src="myotis-wire/src/eth.rs" from="714" to="743"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns</x-tags> <strong>Slice patterns.</strong> <code>[]</code> matches an empty slice, and <code>&amp;[b] if b &lt;= 0x7f</code> matches a one-element slice and binds the byte, with a guard. One <code>match</code> checks length and content together. A multi-byte type is rejected instead of truncated to its last byte, which is what the Java code would do.</li>
+    <li><x-tags>borrowing lifetimes</x-tags> The function returns <code>(u8, [rlp::View&lt;'_&gt;; 3])</code>: an array of three views into the same <code>wire</code> buffer. <code>View</code> is <code>Copy</code> (it is just a slice reference), so returning three of them costs nothing. The elided lifetime ties them to <code>wire</code>.</li>
+    <li><x-tags>domain</x-tags> Lines like <code>status_or_state.as_bytes()?;</code> discard the value and keep only the check. The canonical form later copies these fields as they arrived (<code>canonicalize_eth69_receipt</code>), which is correct only because they were checked here.</li>
+  </ul>
+
+  <h4>RawList: a list that costs what it weighed</h4>
+  <x-code src="myotis-wire/src/eth.rs" from="790" to="814"></x-code>
+  <x-code src="myotis-wire/src/eth.rs" from="850" to="864"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership bytes-strings</x-tags> <strong>A newtype.</strong> <code>pub struct RawList(rlp::ListBuf);</code> wraps one value and keeps it private. <code>ListBuf</code> stores the items' encodings back to back in a single <code>Vec&lt;u8&gt;</code>, plus a count. The previous <code>Vec&lt;Vec&lt;u8&gt;&gt;</code> paid a heap allocation and about 50 bytes of overhead per element, which a body of millions of one-byte “transactions” turned into hundreds of MiB (#454).</li>
+    <li><x-tags>iterators-closures lifetimes traits-generics</x-tags> <strong>An iterator that lends slices.</strong> <code>RawListIter&lt;'a&gt;</code> yields <code>&amp;'a [u8]</code>, slices that borrow from the <code>RawList</code> itself. <code>impl&lt;'a&gt; IntoIterator for &amp;'a RawList</code> (lines 834–841) makes <code>for tx in &amp;list</code> work, like Java's <code>Iterable</code>. Because the iterator tracks <code>left</code>, it can implement <code>ExactSizeIterator</code>, and <code>collect()</code> can size its vector in one go.</li>
+    <li><x-tags>error-handling</x-tags> <code>item.as_bytes().unwrap_or_default()</code> cannot actually fail: every item was checked on the way in. The default for <code>&amp;[u8]</code> is the empty slice.</li>
+  </ul>
+
+  <h4>The shared helper every decoder starts with</h4>
+  <x-code src="myotis-wire/src/eth.rs" from="908" to="925"></x-code>
+  <p class="code-note"><x-tags>borrowing enums-patterns</x-tags> <code>rlp::raw_list_prefix(rlp_bytes, 2)</code> validates the whole message but collects only the first two elements as slices. The <code>let (Some(id), Some(payload)) = (…) else { … }</code> form destructures both or returns an error. The result type <code>(u64, rlp::View&lt;'_&gt;)</code> again borrows from <code>rlp_bytes</code>. The helper <code>kept</code> below it is <code>pub(crate)</code>: <code>snap::messages</code> uses it, but nothing outside the crate can, and the <code>myotis-net</code> re-export (a glob of <code>pub</code> items) does not carry it.</p>
+  <p class="code-note"><x-tags>domain</x-tags> The gossip decoders (<code>decode_new_pooled_tx_hashes</code>, <code>transactions_gossip_hashes</code>) are deliberately tolerant. They only feed the “seen in gossip” signal of the sent-transaction watch, never a trust decision, so a malformed announcement yields the hashes that can be read, or none, and at most 256 per message.</p>
+  <div class="callout watch"><span class="k">Stale or inaccurate comments</span>The module doc links to <code>[`super::session`]</code>, which does not exist in this crate; the session is <code>myotis-net</code>'s <code>el::eth::session</code>. The <code>BlockBody</code> doc (line 375) says “legacy re-encoded, typed kept as the envelope”, while the code below it (lines 408–414) keeps every transaction exactly as it arrived.</div>
+</x-file>
+
+<x-file path="rust/myotis-wire/src/eth2/mod.rs" kind="module index">
+  <p class="purpose">Declares the consensus-layer wire modules, <code>codec</code>, <code>protocols</code> and <code>status</code>, moved here from the root of <code>myotis-net</code>. The whole module exists only with the <code>eth2</code> feature (see <code>lib.rs</code>). The libp2p transport that carries these bytes stays in <code>myotis-net</code> (<a href="#stop-09">stop 9</a>); a host with its own Noise/yamux stack can use these functions directly.</p>
+</x-file>
+
+<x-file path="rust/myotis-wire/src/eth2/protocols.rs" kind="library" twin="BeaconP2PService.registerBinding">
+  <p class="purpose">The eth2 req/resp protocol ids, exactly the set and versions the Java engine speaks, plus three lookups: whether responses carry 4 context bytes (the fork digest), whether a request is a root list this node never reads, and the exact SSZ size of each request body (used by the responder to refuse inflated requests). Since the old tour it has gained three inbound-only protocols (BlocksByRoot, DataColumnSidecarsByRoot, ExecutionPayloadEnvelopesByRoot) and <code>metadata/3</code>. Their doc comments explain why: Nimbus and Lighthouse drop a peer that cannot negotiate them, and a light client answers each with zero chunks.</p>
+  <x-code src="myotis-wire/src/eth2/protocols.rs" from="53" to="77"></x-code>
+  <p class="code-note"><x-tags>enums-patterns macros bytes-strings</x-tags> <code>const</code> items can be used as <code>match</code> patterns, and for <code>&amp;str</code> the comparison is by <em>content</em>, not by reference. <code>matches!(x, A | B)</code> is a macro that expands to a <code>match</code> returning <code>bool</code>. The constants are <code>&amp;'static str</code>, string literals that live for the whole program, which is also what libp2p's <code>StreamProtocol::new</code> demands.</p>
+</x-file>
+
+<x-file path="rust/myotis-wire/src/eth2/status.rs" kind="library" twin="StatusMessage / computeForkDigest">
+  <p class="purpose">The SSZ <code>Status</code> message (92 bytes in v2, 84 in v1, which is v2 without its last field), the light-client <code>MetaData</code> (17 bytes in v2, 25 in v3), and the fork-digest math including the Fulu/EIP-7892 “BPO” variant. The tests pin the values the Java engine computes. This is the one file that needs <code>myotis-consensus</code>, for three SSZ helpers.</p>
+  <x-code src="myotis-wire/src/eth2/status.rs" from="56" to="73"></x-code>
+  <ul class="concepts">
+    <li><x-tags>bytes-strings error-handling</x-tags> Fixed-offset reads, like <code>ByteBuffer.getLong(36)</code>. <code>ssz_bytes[36..44]</code> borrows 8 bytes (indexing <em>would</em> panic if out of range), and <code>try_into()</code> turns the slice into the <code>[u8; 8]</code> that <code>u64::from_le_bytes</code> needs. The length check at the top guarantees every conversion succeeds, so each <code>.expect("length checked")</code> documents an impossible case.</li>
+    <li><x-tags>domain</x-tags> <code>decode</code> rejects an 84-byte v1 body, so the caller must pick the decoder by protocol. Trailing bytes are ignored, because only a minimum length is checked.</li>
+  </ul>
+  <x-code src="myotis-wire/src/eth2/status.rs" from="137" to="158"></x-code>
+  <p class="code-note"><x-tags>domain bytes-strings</x-tags> The fork digest is the 4-byte network tag on every eth2 message: the first 4 bytes of a hash over the fork version and the genesis validators root. Since Fulu, a “blob parameter only” fork changes the digest without a new fork version, so the active BPO epoch and blob limit are hashed and XORed in. <code>base[..4].try_into()</code> copies 4 bytes out of the 32-byte root into a <code>[u8; 4]</code>. The <code>CUSTODY_GROUP_COUNT</code> constant above it (line 99) is a deliberate overstatement of what this node stores, with the reason written out: Lighthouse bans a peer that advertises less than the custody requirement.</p>
+</x-file>
+
+<x-file path="rust/myotis-wire/src/eth2/codec.rs" kind="library" twin="ReqRespCodec">
+  <p class="purpose">Byte-level framing for eth2 req/resp, with no I/O and nothing async: varints, Snappy <em>framed</em> compression, request encode and parse, single- and multi-chunk response decode, and response encode. Every function borrows a byte slice and returns owned bytes or an error. Java-generated golden vectors keep the two engines byte-compatible. Compression now goes through <a href="#f-myotis-wire-src-snappy-rs">crate::snappy</a>, and the multi-chunk decoder now keeps each chunk's fork digest.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–40</td><td>Wire-format doc, result codes, <code>CodecError</code> (with <code>std::error::Error</code> only under <code>std</code>).</td></tr>
+      <tr><td>42–119</td><td>Varints; Snappy compress, and decompress bounded by <code>MAX_UNCOMPRESSED_PAYLOAD</code> (10 MiB).</td></tr>
+      <tr><td>121–187</td><td>Request encode (including the <code>updates_by_range</code> body) and inbound request parsing.</td></tr>
+      <tr><td>189–258</td><td>Single-chunk response decode.</td></tr>
+      <tr><td>260–451</td><td>Multi-chunk decode with per-chunk digests, <code>leading_error</code>, <code>skip_snappy_frames</code>.</td></tr>
+      <tr><td>453–479</td><td>Response encoders.</td></tr>
+      <tr><td>481–749</td><td>Tests: Java golden vectors, a real Lighthouse error response, truncated vs. corrupt input, <code>malformed_inputs_never_panic</code>.</td></tr>
+    </tbody>
+  </table></div>
+  <x-code src="myotis-wire/src/eth2/codec.rs" from="102" to="119"></x-code>
+  <p class="code-note"><x-tags>domain error-handling</x-tags> <strong>Allocation is bounded before it happens.</strong> Snappy can expand data about 21 times, so a hostile peer could turn a 16 MiB frame into hundreds of MiB. The declared length is checked against 10 MiB first, the reader is capped at <code>declared + 1</code> (one extra byte reveals an overrun), and any mismatch is rejected, as the spec requires. <code>.map_err(|e| CodecError(format!(…)))?</code> converts the <code>String</code> error from <code>snappy</code> into this module's error, then propagates it.</p>
+  <x-code src="myotis-wire/src/eth2/codec.rs" from="169" to="187"></x-code>
+  <p class="code-note"><x-tags>bytes-strings</x-tags> <strong>Narrowing safely.</strong> <code>as usize</code> truncates silently, like <code>(int) someLong</code>, and on armv7 Android <code>usize</code> is 32 bits. So the code compares in the wide type (<code>u64</code>) first. Once the values are known to be equal, the narrowing cast is provably lossless. <code>read_varint(raw, 0).ok()?</code> turns a parse error into an early <code>None</code>.</p>
+  <x-code src="myotis-wire/src/eth2/codec.rs" from="296" to="333"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns error-handling</x-tags> <strong>Truncated or corrupt?</strong> A guard such as <code>Err(e) if !items.is_empty() &amp;&amp; raw.len() - pos &lt; 10 =&gt; break</code> separates “the buffer just ended, keep what we have” from “corruption, fail the whole response”. A serve-then-corrupt peer therefore cannot earn credit for a partial answer. <code>break</code> and <code>return</code> have the never type <code>!</code>, so they fit in a <code>match</code> whose other arm yields a tuple.</li>
+    <li><x-tags>domain</x-tags> <strong>A digest per chunk.</strong> One <code>updates_by_range</code> response can span a fork, and the Gloas fork changed the wire shape of light-client updates. So each chunk's own context bytes pick its decoder. <code>ContextChunk</code> is a type alias for <code>([u8; 4], Vec&lt;u8&gt;)</code>; <code>raw[pos..pos + 4].try_into()</code> copies the 4 bytes into the array.</li>
+    <li><x-tags>async domain</x-tags> <code>tracing::info!(item = …, msg = %err_body, …)</code> records structured fields; <code>%</code> means “format with <code>Display</code>”. <code>tracing</code> is only a facade: nothing is printed unless the host installs a subscriber, which keeps the crate I/O-free. It is the reason the <code>eth2</code> feature pulls in <code>tracing</code>.</li>
+  </ul>
+  <p class="code-note"><x-tags>ownership iterators-closures</x-tags> The older entry point <code>decode_multi_chunk_response</code> (lines 271–281) calls this one and drops the digests with <code>.into_iter().map(|(_, payload)| payload).collect()</code>. <code>into_iter()</code> consumes the vector, so each payload <code>Vec</code> is moved out, not copied.</p>
+  <div class="callout watch"><span class="k">Stale or inaccurate comments</span>The module doc links to <code>[`crate::reqresp`]</code> and <code>[`crate::protocols`]</code>, paths that existed in <code>myotis-net</code>. In this crate there is no <code>reqresp</code> (it stayed in <code>myotis-net</code>), and the protocols module is <code>crate::eth2::protocols</code>. The comment at line 324 justifies the <code>&lt; 10</code> threshold with “10 bytes is the longest u64 varint”, but this <code>read_varint</code> refuses anything longer than 5 bytes. The threshold is looser than it needs to be, not wrong.</div>
+</x-file>
+
+<x-file path="rust/myotis-wire/src/snap/mod.rs" kind="module index">
+  <p class="purpose">Declares snap's two modules: <code>messages</code> (the codecs) and <code>fetch</code> (verification of what a peer returns). snap shares the eth peer's RLPx connection; the two protocols are told apart by message code, and snap's codes start right after the last eth code.</p>
+</x-file>
+
+<x-file path="rust/myotis-wire/src/snap/messages.rs" kind="library" twin="networking.snap.messages">
+  <p class="purpose">Pure snap codecs: account ranges, storage ranges (one account at a time), bytecodes, empty responses, and, new since the old tour, snap/2 (EIP-8189) and block access lists (EIP-7928): the per-block record of which accounts a block changed, and to what. A decoded “slim” account body is only the peer's <em>claim</em> and is never trusted. A single-account query asks for <code>[keccak(addr), 0xff…]</code> with a small byte budget, so the peer returns one account plus the boundary proof. Like <code>eth.rs</code>, the decoders now read in place and keep at most <code>MAX_RANGE_ENTRIES</code> entries and <code>MAX_PROOF_NODES</code> proof nodes.</p>
+  <x-code src="myotis-wire/src/snap/messages.rs" from="49" to="74"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns</x-tags> <strong>Range patterns.</strong> <code>..=68</code> matches every value up to 68, <code>69 | 70</code> either of two, and <code>_</code> the rest. Each eth version that adds messages pushes snap's base up: 0x21, then 0x22 (eth/69's BlockRangeUpdate), then 0x24 (eth/71's two access-list messages).</li>
+    <li><x-tags>ownership</x-tags> <code>SnapCodes</code> holds only <code>u64</code>s and derives <code>Copy</code>, so it is duplicated freely. <code>myotis-net</code>'s managed peer passes it around by value.</li>
+  </ul>
+  <x-code src="myotis-wire/src/snap/messages.rs" from="184" to="205"></x-code>
+  <p class="code-note"><x-tags>lifetimes borrowing</x-tags> <strong>A struct that borrows from the message.</strong> <code>SlimFields&lt;'a&gt;</code> holds <code>balance: &amp;'a [u8]</code>, a slice of the peer's message, not a copy. The slim body comes in two forms (a nested list, or a byte string wrapping that list's RLP), and <code>let body = if body.is_list() { body } else { rlp::View::new(body.as_bytes()?)? };</code> unifies them by <em>shadowing</em>: the new <code>body</code> is a view of the inner bytes. That compiles because <code>View::as_bytes</code> returns <code>&amp;'a [u8]</code>, tied to the original input, not to the temporary view. The old version of this decoder built an owned tree and had to declare a holder variable before the <code>match</code> so the borrow would live long enough; with views there is nothing to own. <code>decode_account_range</code> copies the balance (<code>to_vec()</code>) only for the entries it keeps.</p>
+  <x-code src="myotis-wire/src/snap/messages.rs" from="474" to="495"></x-code>
+  <ul class="concepts">
+    <li><x-tags>iterators-closures borrowing</x-tags> <strong>A closure that borrows mutably.</strong> <code>let mut field = |name: &amp;str| fields.next()…</code> captures the iterator <code>fields</code> by mutable reference, so <code>field</code> is an <code>FnMut</code> and must itself be <code>mut</code>. While the closure is still going to be used, nothing else may touch <code>fields</code>. After its last call (line 492), the borrow ends, which is why line 493 may call <code>fields.next()</code> directly. The compiler works this out from where the closure is last used (“non-lexical lifetimes”).</li>
+    <li><x-tags>domain error-handling</x-tags> <code>previous.is_some_and(|p| p &gt;= address)</code> compares two <code>[u8; 20]</code> arrays lexicographically, which is the address order the BAL spec requires. Out-of-order accounts are an error, never a partial answer, because these values are applied to proven state. Further down, <code>.map(|v| v.as_u64()).transpose()?</code> turns an <code>Option&lt;Result&lt;u64, _&gt;&gt;</code> into a <code>Result&lt;Option&lt;u64&gt;, _&gt;</code> so <code>?</code> can apply.</li>
+  </ul>
+  <x-code src="myotis-wire/src/snap/messages.rs" from="584" to="594"></x-code>
+  <p class="code-note"><x-tags>iterators-closures</x-tags> <code>nodes.clone().nth(MAX_PROOF_NODES)</code> looks ahead on a <em>copy</em> of the iterator: a view iterator is a few words of position state, so cloning it is cheap and leaves <code>nodes</code> at the start. If a 1025th node exists, the proof is refused before any node is copied or hashed. <code>&lt;[u8]&gt;::to_vec</code> is a method named as a function and passed where a closure would otherwise go.</p>
+  <div class="callout watch"><span class="k">Stale or inaccurate comments</span>Line 24 says <code>OUR_SNAP_VERSIONS</code> must match the capabilities in <code>rlpx::transport::encode_hello</code>, “pinned by its round-trip test”. <code>encode_hello</code> now lives in <code>rlpx::hello</code> (re-exported by <code>transport</code>), and the round-trip test in <code>transport.rs</code> checks the snap capabilities against literals, not against this constant. The section comment at lines 550–555 says wiring the empty responders into an inbound read loop is future work (“EL-A7”); <code>myotis-net/src/el/peer.rs</code> already answers inbound snap requests with <code>encode_empty_range</code> and <code>encode_empty_codes</code>.</div>
+</x-file>
+
+<x-file path="rust/myotis-wire/src/snap/fetch.rs" kind="library">
+  <p class="purpose">Security-critical verification. An account's fields come from the <em>proof leaf</em>, never from the slim body, since a peer could keep nonce and balance honest while forging storageRoot or codeHash. Storage is proven against the account's own storage root, and bytecode is accepted only if <code>keccak(code) == codeHash</code>. The file also defines the markers the reader uses to tell “the peer couldn't prove this root” apart from transport failures, and, new since the old tour, the <code>*_proof</code> variants that also return the proof path in <code>eth_getProof</code> form.</p>
+  <x-code src="myotis-wire/src/snap/fetch.rs" from="40" to="72"></x-code>
+  <ul class="concepts">
+    <li><x-tags>error-handling domain</x-tags> <strong>Errors classified by substring.</strong> These errors are <code>CoreError(String)</code>, not an enum, so the reader in <code>myotis-net</code> (<a href="#stop-14">stop 14</a>) classifies them by text. <code>is_unservable_root_error</code> means “the peer answered, but not with a valid proof at that root”: try a different root. <code>is_unknown_root_error</code> narrows it to the empty-proof case, the one a read at the finalized root forgives, because execution clients keep old roots only for a while. A garbage proof stays a strike against the peer. <code>UNKNOWN_ROOT_REASON</code> must equal the string in <code>myotis-core/src/trie.rs</code> line 92, which it does; a test pins the shapes.</li>
+  </ul>
+  <x-code src="myotis-wire/src/snap/fetch.rs" from="97" to="120"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns error-handling</x-tags> An exhaustive <code>match</code> on <code>ProofResult</code>. Each arm moves its payload (<code>leaf</code>, <code>reason</code>) out, and the <code>?</code> in the <code>Found</code> arm converts a leaf-decode failure into the function's error. A new <code>ProofResult</code> variant would break compilation here until it is handled.</li>
+    <li><x-tags>bytes-strings</x-tags> <code>format!("account {PROOF_INVALID_MARKER}: {reason}")</code> inlines a constant by name; inline format arguments work with any identifier in scope. The marker is load-bearing for the classification above.</li>
+    <li><x-tags>domain</x-tags> <code>verify_storage</code> anchors at <code>account.storage_root</code>, which comes from an account leaf that was itself proven. An empty storage trie short-circuits to zero with no proof needed.</li>
+  </ul>
+  <p class="code-note"><x-tags>ownership</x-tags> <code>verify_bytecode(code_hash, returned: &amp;[Vec&lt;u8&gt;])</code> borrows the peer's codes, so the matching one is returned as <code>code.clone()</code>, an owned copy.</p>
+  <div class="callout watch"><span class="k">Stale or inaccurate comments</span>The module doc (lines 13–18) lists as “Deferred to EL-A7” peer rotation, root-unavailable marking and “answering inbound snap <code>Get*</code> with empty responses”. The managed peer it waited for now exists in <code>myotis-net</code>, and at least the last item is done: <code>el/peer.rs</code> answers inbound snap requests with the empty responders from <code>messages.rs</code>. The other two items were not checked for this stop.</div>
+</x-file>
+
+<section class="prose">
+  <h2>The shims left behind in myotis-net</h2>
+  <p>Nine files in <code>myotis-net</code> are now four lines long. Each says where its code went and re-exports it. Here is one; the other eight differ only in the path.</p>
+  <x-code src="myotis-net/src/codec.rs" from="1" to="4"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo</x-tags> <strong>A glob re-export.</strong> <code>pub use myotis_wire::eth2::codec::*;</code> makes every <code>pub</code> item of that module visible as if it were declared in <code>myotis_net::codec</code>. Nothing is copied: <code>myotis_net::codec::CodecError</code> and <code>myotis_wire::eth2::codec::CodecError</code> are the same type, so values pass freely between code that uses either path. Items that are <code>pub(crate)</code> (such as <code>eth::kept</code>) or exist only under <code>#[cfg(test)]</code> are not carried.</li>
+    <li><x-tags>modules-cargo</x-tags> <strong>Why keep them.</strong> Many users still name the old paths: <code>roost</code> (<code>myotis_net::codec</code>, <code>myotis_net::status</code>), <code>tor-poc</code> (<code>el::snap::fetch</code>), <code>myotis-net</code>'s own examples and conformance tests, and modules inside <code>myotis-net</code> itself (<code>crate::codec</code> in <code>reqresp.rs</code> and <code>sync.rs</code>). <code>roost</code> and <code>tor-poc</code> are separate Cargo workspaces, so a path change there is easy to miss. The shims let the move land with no change to any of them.</li>
+  </ul>
+</section>
+
+<x-file path="rust/myotis-net/src/codec.rs" kind="re-export shim">
+  <p class="purpose">Re-exports <a href="#f-myotis-wire-src-eth2-codec-rs">myotis-wire's eth2/codec.rs</a> as <code>myotis_net::codec</code>. Kept for <code>roost</code> (its <code>framing.rs</code>, <code>store.rs</code> and <code>main.rs</code>), the CL examples, <code>tests/live_pins_alive.rs</code>, and <code>reqresp.rs</code> and <code>sync.rs</code> inside <code>myotis-net</code>.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/status.rs" kind="re-export shim">
+  <p class="purpose">Re-exports <a href="#f-myotis-wire-src-eth2-status-rs">eth2/status.rs</a> as <code>myotis_net::status</code>. <code>roost</code>'s <code>serve.rs</code> and <code>forks.rs</code> use the old path, as do <code>reqresp.rs</code>, <code>sync.rs</code> and <code>cl_fork_watch.rs</code> inside <code>myotis-net</code>.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/protocols.rs" kind="re-export shim">
+  <p class="purpose">Re-exports <a href="#f-myotis-wire-src-eth2-protocols-rs">eth2/protocols.rs</a> as <code>myotis_net::protocols</code>, for <code>reqresp.rs</code>, <code>sync.rs</code> and the CL examples (<code>lc_crawl</code>, <code>period_census</code>, <code>probe_updates</code>).</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/rlpx/ecies.rs" kind="re-export shim">
+  <p class="purpose">Re-exports <a href="#f-myotis-wire-src-rlpx-ecies-rs">rlpx/ecies.rs</a> at <code>myotis_net::el::rlpx::ecies</code>. The cross-language RLPx corpus test <code>tests/el_rlpx_conformance.rs</code> still imports it from here.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/rlpx/frame.rs" kind="re-export shim">
+  <p class="purpose">Re-exports <a href="#f-myotis-wire-src-rlpx-frame-rs">rlpx/frame.rs</a> at <code>el::rlpx::frame</code>. <code>transport.rs</code> next to it imports <code>FrameCodec</code> and its halves through <code>super::frame</code>, and <code>eth/session.rs</code>, <code>reader.rs</code> and the conformance test use the path too.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/rlpx/handshake.rs" kind="re-export shim">
+  <p class="purpose">Re-exports <a href="#f-myotis-wire-src-rlpx-handshake-rs">rlpx/handshake.rs</a> at <code>el::rlpx::handshake</code>, for <code>transport.rs</code> (<code>super::handshake::Initiator</code>), <code>eth/session.rs</code> and the conformance test. Note that <code>myotis-net/src/el/rlpx/mod.rs</code> still declares these three modules and <code>transport</code>; <code>hello</code> has no shim of its own, because <code>transport.rs</code> re-exports its items by name.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/eth/messages.rs" kind="re-export shim">
+  <p class="purpose">Re-exports the whole of <a href="#f-myotis-wire-src-eth-rs">eth.rs</a> as <code>el::eth::messages</code>. The new crate flattened the path (<code>myotis_wire::eth</code>, not <code>eth::messages</code>), so this shim is where the two names meet. It is the most used of the nine: <code>peer.rs</code>, <code>pool.rs</code>, <code>reader.rs</code>, <code>anchor.rs</code>, <code>sync.rs</code>, three integration tests (<code>el_eth_conformance</code>, <code>el_verify_conformance</code>, <code>el_hostile_frames</code>) and the <code>snap_probe</code> example.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/snap/fetch.rs" kind="re-export shim">
+  <p class="purpose">Re-exports <a href="#f-myotis-wire-src-snap-fetch-rs">snap/fetch.rs</a> at <code>el::snap::fetch</code>. Users include <code>tor-poc</code> (a separate workspace), <code>reader.rs</code>, <code>evm.rs</code>, <code>peer.rs</code>, the session, and the snap live tests.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/snap/messages.rs" kind="re-export shim">
+  <p class="purpose">Re-exports <a href="#f-myotis-wire-src-snap-messages-rs">snap/messages.rs</a> at <code>el::snap::messages</code>, for <code>peer.rs</code>, <code>reader.rs</code>, <code>activity.rs</code> (which uses <code>BalAccountChange</code>), the session, the conformance and hostile-frame tests, and <code>snap_probe</code>.</p>
+</x-file>
+
+<x-quiz>[
+  {"id": "wire-q1", "type": "mcq", "tags": ["modules-cargo"], "q": "Every source file in <code>myotis-wire</code> starts with <code>#[allow(unused_imports)] use alloc::{borrow::ToOwned, format, string::{String, ToString}, vec, vec::Vec};</code>. Why is this import there, and why the <code>allow</code>?", "options": ["In a <code>no_std</code> build the prelude is <code>core</code>'s and has no heap types, so they must be imported from <code>alloc</code>; every file copies the same list and not every file uses every name, so unused ones would warn", "<code>alloc::vec::Vec</code> is a different, faster type than <code>std::vec::Vec</code>", "The import is required by the <code>snap</code> crate", "It turns off the standard library for that file only"], "answer": 0, "explain": "<code>std</code> re-exports the same <code>alloc</code> types. Without <code>std</code> they are not in scope unless imported, and the shared header names more than each file needs."},
+  {"id": "wire-q2", "type": "mcq", "tags": ["modules-cargo", "domain"], "q": "What does an execution-layer-only host avoid by building <code>myotis-wire</code> without the <code>eth2</code> feature?", "options": ["The tokio runtime", "The <code>snap</code> crate", "<code>myotis-consensus</code> and, through it, <code>myotis-bls</code> and the blst C library, which would otherwise have to be cross-compiled for its target", "The RLPx frame codec"], "answer": 2, "explain": "<code>eth2</code> is the only part that needs <code>myotis-consensus</code> (for three SSZ helpers in <code>status.rs</code>). Without it, the crate's dependency tree is pure Rust."},
+  {"id": "wire-q3", "type": "mcq", "tags": ["borrowing", "bytes-strings"], "q": "In the built-in Snappy decoder, a copy element repeats <code>l</code> bytes from <code>off</code> bytes back. Why does it push one byte at a time instead of <code>out.extend_from_slice(&amp;out[start..start + l])</code>?", "options": ["Byte loops are faster than <code>extend_from_slice</code>", "<code>extend_from_slice</code> is not available without <code>std</code>", "That line borrows <code>out</code> immutably and mutably at once, which does not compile, and a copy may overlap its own output (<code>l &gt; off</code>), so the source bytes do not all exist yet when the copy starts", "To avoid integer overflow"], "answer": 2, "explain": "<code>let b = out[start + i];</code> copies a <code>u8</code>, ending the immutable borrow before <code>out.push(b)</code>. Each pushed byte can then be read by a later round, which is exactly what an overlapping copy needs."},
+  {"id": "wire-q4", "type": "open", "tags": ["ownership", "borrowing", "concurrency"], "q": "Explain <code>FrameCodec::split(self) -&gt; (FrameEncoder, FrameDecoder)</code>: what happens to ownership, why the compiler allows it, and why the encoder's and decoder's methods take <code>&amp;mut self</code>.", "model": "<code>split</code> takes the codec by value, so the caller gives it up, and moves its two fields out into a tuple. After the call the <code>FrameCodec</code> no longer exists; the encoder and decoder are independent owned values that can be moved into different tasks, the reader and the writer, with no shared state and no lock. Moving fields out of a value is only allowed because <code>FrameCodec</code> has no <code>Drop</code> impl (otherwise error E0509). The methods take <code>&amp;mut self</code> because each call advances an AES-CTR keystream and a keccak MAC chain; exclusive access is checked at compile time, so two users of one half cannot exist.", "points": ["split takes self by value and moves both fields out; the codec is gone afterwards", "the halves are independent owned values that can live in different tasks without a lock", "moving fields out is allowed because FrameCodec has no Drop impl", "&amp;mut self because every call advances the keystream and the MAC chain, so access must be exclusive"], "context": "myotis-wire/src/rlpx/frame.rs L56-104 (FrameEncoder/FrameDecoder/FrameCodec, new, split), L127-172 encode_frame(&mut self) mutating self.encrypt and self.egress_mac."},
+  {"id": "wire-q5", "type": "mcq", "tags": ["lifetimes", "borrowing"], "q": "In <code>SlimFields::read(body: rlp::View&lt;'a&gt;)</code>, the line <code>let body = if body.is_list() { body } else { rlp::View::new(body.as_bytes()?)? };</code> builds a view of the inner bytes, and the result is stored in a <code>SlimFields&lt;'a&gt;</code>. Why does this compile?", "options": ["Because <code>View::new</code> copies the bytes into a new buffer", "Because <code>View</code> implements <code>Drop</code>", "Because the compiler extends the life of temporaries automatically", "Because <code>View::as_bytes</code> returns <code>&amp;'a [u8]</code>, tied to the original input rather than to the view value, so the new view also borrows the caller's buffer for <code>'a</code>"], "answer": 3, "explain": "If <code>as_bytes</code> returned a slice tied to <code>&amp;self</code>, the inner view would borrow the old local <code>body</code>, which is shadowed and could not be returned. Tying it to <code>'a</code> makes both forms views of the same input."},
+  {"id": "wire-q6", "type": "mcq", "tags": ["smart-pointers", "ownership"], "q": "<code>BlockReceipts::canonical</code> returns <code>Cow&lt;'_, RawList&gt;</code>. What does a caller get for an eth/68 response?", "options": ["<code>Cow::Borrowed</code> pointing at the stored list, with nothing copied, because eth/66-68 receipts are already receipts-trie values", "<code>Cow::Owned</code> with a copy of the list", "An error, because only eth/69 is supported", "A <code>Box&lt;RawList&gt;</code>"], "answer": 0, "explain": "Only the eth/69 shape must be rebuilt (with a recomputed bloom), which gives <code>Cow::Owned</code>. The caller uses both through <code>&amp;RawList</code>."},
+  {"id": "wire-q7", "type": "mcq", "tags": ["domain"], "q": "Why does <code>encode_frame</code> write the header data as <code>0xc2 0x80 0x80</code> instead of an empty RLP list <code>0xc0</code>?", "options": ["It is shorter", "geth requires it for compression", "Nethermind's frame-header reader decodes an integer from the first list item and throws on <code>0xc0</code>, disconnecting on the first frame, which is fatal on gnosis, where most nodes run Nethermind", "It carries the message code"], "answer": 2, "explain": "<code>0xc2 0x80 0x80</code> is <code>rlp([0, 0])</code>, geth's zeroHeader. Our own decoder ignores those bytes, as the bomb test with a bare <code>0xc0</code> shows."},
+  {"id": "wire-q8", "type": "mcq", "tags": ["enums-patterns", "error-handling"], "q": "In <code>discv4::decode_neighbors</code>, what happens to an entry whose fields are well-formed RLP but whose IP is 5 bytes long?", "options": ["The whole packet is rejected with an error", "The walk stops and keeps the nodes decoded so far", "That entry is skipped with <code>continue</code> and the walk goes on, matching where Java's <code>InetAddress</code> construction throws", "The IP is truncated to 4 bytes"], "answer": 2, "explain": "Structural errors (the <code>let … else</code> or a short field list) <code>break</code>; a bad IP length or a UDP port over 65535 only skips the entry."},
+  {"id": "wire-q9", "type": "mcq", "tags": ["iterators-closures", "borrowing"], "q": "In <code>bal_account_changes</code>, <code>let mut field = |name: &amp;str| fields.next()…</code> captures <code>fields</code>. Why may line 493 call <code>fields.next()</code> directly?", "options": ["The closure's mutable borrow of <code>fields</code> ends after its last use on line 492, so <code>fields</code> is free again", "Closures copy the iterator they capture", "<code>fields</code> is a <code>RefCell</code>", "Line 493 runs before the closure is created"], "answer": 0, "explain": "The closure is an <code>FnMut</code> holding <code>&amp;mut fields</code>. Non-lexical lifetimes end that borrow at the closure's last use, not at the end of the block."},
+  {"id": "wire-q10", "type": "mcq", "tags": ["bytes-strings"], "q": "<code>parse_request_ssz_expecting</code> compares <code>uncompressed_len != expected as u64</code> before it ever writes <code>uncompressed_len as usize</code>. What would go wrong if it cast first?", "options": ["Nothing; the order does not matter", "The varint would be decoded twice", "It would allocate 10 MiB", "On a 32-bit target such as armv7 Android, <code>as usize</code> truncates silently, so a declared 2^32 + 32 would pass as 32"], "answer": 3, "explain": "Comparing in the wide type first makes the later narrowing provably lossless."},
+  {"id": "wire-q11", "type": "open", "tags": ["modules-cargo"], "q": "<code>myotis-net/src/codec.rs</code> is now <code>pub use myotis_wire::eth2::codec::*;</code>. What does this line do to types and visibility, and why was it worth keeping nine such files?", "model": "It re-exports every <code>pub</code> item of the wire module under the old path, without copying anything: <code>myotis_net::codec::CodecError</code> is the same type as <code>myotis_wire::eth2::codec::CodecError</code>, so values pass freely between code using either path. <code>pub(crate)</code> items such as <code>eth::kept</code> and <code>#[cfg(test)]</code> items are not carried. The shims were kept because many users still name the old paths: <code>roost</code> and <code>tor-poc</code> (separate Cargo workspaces), <code>myotis-net</code>'s examples and conformance tests, and modules inside <code>myotis-net</code> such as <code>reqresp.rs</code> and <code>sync.rs</code>. The move therefore needed no change in any of them.", "points": ["a glob re-export of the pub items under the old path; nothing is copied", "the re-exported items are the same types, so values mix freely", "pub(crate) and test-only items are not re-exported", "names at least one real user of an old path: roost, tor-poc, myotis-net tests/examples, or reqresp/sync"], "context": "myotis-net/src/codec.rs L1-4; roost/src/{framing,store,main}.rs use myotis_net::codec; tor-poc/src/main.rs uses el::snap::fetch; myotis-net/tests/el_*_conformance.rs use the el:: paths; myotis-wire/src/eth.rs L932 pub(crate) fn kept."},
+  {"id": "wire-q12", "type": "open", "tags": ["error-handling", "domain"], "q": "Both the RLPx frame decoder and the eth2 codec defend against Snappy “bombs”. Describe how each one does it and why their strategies differ.", "model": "RLPx raw Snappy declares the decoded length in a leading varint. <code>FrameDecoder::decode_body</code> reads that declaration with <code>snappy::decompress_len</code> and only decompresses when it is at most <code>MAX_FRAME_BODY_SIZE</code> (10 MiB); otherwise, or when decompression fails, it passes the raw bytes up, where the RLP decoder rejects them. eth2 req/resp carries its own declared length in the request or response header, and the spec requires it to be exact. <code>snappy_decompress</code> refuses a declared length of 0 or above 10 MiB, decompresses the framed stream with a reader capped at declared + 1 bytes, and rejects any output whose length differs. RLPx falls back to raw because some peers send control messages uncompressed; eth2 fails hard because a mismatch is a protocol violation.", "points": ["RLPx checks the declared decoded length (decompress_len) against 10 MiB before decompressing", "RLPx falls back to the raw bytes, which the layer above rejects, because some peers send uncompressed control messages", "eth2 rejects a declared length of 0 or over 10 MiB before decompressing", "eth2 caps the reader at declared + 1 and requires the output length to equal the declaration"], "context": "myotis-wire/src/rlpx/frame.rs L221-234 (decompressable via snappy::decompress_len, unwrap_or_else raw fallback); myotis-wire/src/eth2/codec.rs L102-119 snappy_decompress; myotis-wire/src/snappy.rs L81-98 decompress_framed with take(limit)."},
+  {"id": "wire-q13", "type": "open", "tags": ["lifetimes", "ownership", "borrowing"], "q": "<code>Initiator&lt;'a&gt;</code> holds <code>local_key: &amp;'a NodeKey</code>, <code>build_auth</code> takes <code>&amp;mut self</code>, and <code>process_ack</code> takes <code>&amp;self</code>. What does each of these choices express, and what copies does <code>process_ack</code> make to build its result?", "model": "The lifetime parameter says the initiator borrows the node key instead of owning it; the compiler guarantees the key outlives every <code>Initiator</code>, so no <code>Arc</code> or clone of the key is needed for a single handshake. <code>build_auth(&amp;mut self)</code> changes state: it stores the auth wire bytes in <code>auth_wire: Option&lt;Vec&lt;u8&gt;&gt;</code>. <code>process_ack(&amp;self)</code> only reads; it checks the precondition with <code>self.auth_wire.as_ref()</code> (borrowing, not moving) and returns an error if <code>build_auth</code> has not run. Because it only borrows <code>self</code>, it cannot move the stored auth bytes into <code>SessionSecrets</code>, so it clones them (<code>auth_wire.clone()</code>), and it copies the caller's ack slice with <code>ack_wire.to_vec()</code>.", "points": ["'a means the key is borrowed and must outlive the Initiator; no Arc needed", "&amp;mut self on build_auth because it records auth_wire; &amp;self on process_ack because it only reads", "as_ref() borrows the Option's content; calling process_ack first is an Err, not a panic", "process_ack clones the stored auth bytes and copies the ack slice into the owned SessionSecrets"], "context": "myotis-wire/src/rlpx/handshake.rs L81-88 struct Initiator&lt;'a>; L109-148 build_auth(&mut self) sets self.auth_wire = Some(wire.clone()); L150-183 process_ack(&self) with as_ref(), auth_wire.clone(), ack_wire.to_vec()."}
+]</x-quiz>

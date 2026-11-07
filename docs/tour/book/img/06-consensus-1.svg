@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 900 230" role="img" fill="currentColor" aria-label="The order of checks in process_update. Row one: 1 committee gate, 2 adoption gate, 3 shape gate, 4 BLS verify. Row two: 5 finality branch, 6 execution branches, 7 next-committee branch, 8 apply and rotate. Steps 1 to 3 are cheap and run before the expensive BLS verify." width="900" height="230">
+      <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="900.0" height="230.0" fill="#f8fafb" /><defs>
+        <marker id="m-stop06-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+        </marker>
+      </defs>
+      <rect x="20" y="20" width="185" height="72" rx="9" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="112" y="44" text-anchor="middle" font-size="13" font-weight="700">1 · Committee gate</text>
+      <text x="112" y="63" text-anchor="middle" font-size="10.5" class="mono" style="fill:var(--ink-2)">period(signature_slot)</text>
+      <text x="112" y="80" text-anchor="middle" font-size="10.5" style="fill:var(--ink-3)">P: current · P+1: held next</text>
+
+      <rect x="245" y="20" width="185" height="72" rx="9" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="337" y="44" text-anchor="middle" font-size="13" font-weight="700">2 · Adoption gate</text>
+      <text x="337" y="63" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">only when no next is held:</text>
+      <text x="337" y="80" text-anchor="middle" font-size="10.5" style="fill:var(--ink-3)">attested in the store's period</text>
+
+      <rect x="470" y="20" width="185" height="72" rx="9" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="562" y="44" text-anchor="middle" font-size="13" font-weight="700">3 · Shape gate</text>
+      <text x="562" y="63" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">both headers in the shape</text>
+      <text x="562" y="80" text-anchor="middle" font-size="10.5" style="fill:var(--ink-3)">of the attested slot's fork</text>
+
+      <rect x="695" y="20" width="185" height="72" rx="9" stroke-width="1.6" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="787" y="44" text-anchor="middle" font-size="13" font-weight="700">4 · BLS verify</text>
+      <text x="787" y="63" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">≥ 2/3 of 512, version of</text>
+      <text x="787" y="80" text-anchor="middle" font-size="10.5" class="mono" style="fill:var(--ink-3)">signature_slot − 1</text>
+
+      <line x1="205" y1="56" x2="242" y2="56" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop06-arrow)" />
+      <line x1="430" y1="56" x2="467" y2="56" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop06-arrow)" />
+      <line x1="655" y1="56" x2="692" y2="56" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop06-arrow)" />
+      <path d="M787 92 V112 H112 V135" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop06-arrow)" />
+
+      <rect x="20" y="138" width="185" height="72" rx="9" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="112" y="162" text-anchor="middle" font-size="13" font-weight="700">5 · Finality branch</text>
+      <text x="112" y="181" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">in the attested state</text>
+      <text x="112" y="198" text-anchor="middle" font-size="10.5" style="fill:var(--ink-3)">Gloas 735 · before 105/169</text>
+
+      <rect x="245" y="138" width="185" height="72" rx="9" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="337" y="162" text-anchor="middle" font-size="13" font-weight="700">6 · Execution branches</text>
+      <text x="337" y="181" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">attested and finalized,</text>
+      <text x="337" y="198" text-anchor="middle" font-size="10.5" style="fill:var(--ink-3)">each by its own slot's rule</text>
+
+      <rect x="470" y="138" width="185" height="72" rx="9" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="562" y="162" text-anchor="middle" font-size="13" font-weight="700">7 · Next committee</text>
+      <text x="562" y="181" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">only when none is held</text>
+      <text x="562" y="198" text-anchor="middle" font-size="10.5" style="fill:var(--ink-3)">Gloas 2946 · before 55/87</text>
+
+      <rect x="695" y="138" width="185" height="72" rx="9" stroke-width="1.4" style="fill:var(--ok-wash);stroke:var(--ok)" />
+      <text x="787" y="162" text-anchor="middle" font-size="13" font-weight="700">8 · Apply</text>
+      <text x="787" y="181" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">finalized, optimistic;</text>
+      <text x="787" y="198" text-anchor="middle" font-size="10.5" style="fill:var(--ink-3)">rotate if finalized crosses</text>
+
+      <line x1="205" y1="174" x2="242" y2="174" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop06-arrow)" />
+      <line x1="430" y1="174" x2="467" y2="174" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop06-arrow)" />
+      <line x1="655" y1="174" x2="692" y2="174" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop06-arrow)" />
+    </svg>

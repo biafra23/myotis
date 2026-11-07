@@ -1,0 +1,694 @@
+{
+ "concepts": {
+  "ownership": {
+   "label": "Ownership & moves",
+   "blurb": "Every value has exactly one owner. Passing or assigning by value moves it, and the old name can no longer be used. The value is dropped when its owner goes out of scope.",
+   "stop": "primer-ownership",
+   "stopLabel": "Stop 1 · Ownership",
+   "items": [
+    {
+     "src": "Rust Book",
+     "title": "4.1 What Is Ownership?",
+     "href": "rustdoc:book/ch04-01-what-is-ownership.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Scoping rules → RAII, Ownership and moves",
+     "href": "rustdoc:rust-by-example/scope/move.html",
+     "offline": true
+    },
+    {
+     "src": "Rust for Rustaceans (EPUB)",
+     "title": "Ch. 1 Foundations — “Memory Regions” and “Ownership”",
+     "note": "the clearest model of stack, heap and static memory",
+     "offline": true
+    },
+    {
+     "src": "Hands-on Rust (EPUB)",
+     "title": "Ch. 2 First Steps with Rust — “Moving Input to a Function”",
+     "note": "a gentle first contact with moves",
+     "offline": true
+    }
+   ]
+  },
+  "borrowing": {
+   "label": "Borrowing & slices",
+   "blurb": "&T is a shared, read-only loan; &mut T is an exclusive one. Slices (&[u8], &str) are borrowed views into a buffer somebody else owns.",
+   "stop": "primer-borrowing",
+   "stopLabel": "Stop 1 · Borrowing",
+   "items": [
+    {
+     "src": "Rust Book",
+     "title": "4.2 References and Borrowing",
+     "href": "rustdoc:book/ch04-02-references-and-borrowing.html",
+     "offline": true
+    },
+    {
+     "src": "Rust Book",
+     "title": "4.3 The Slice Type",
+     "href": "rustdoc:book/ch04-03-slices.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Scoping rules → Borrowing (incl. Aliasing)",
+     "href": "rustdoc:rust-by-example/scope/borrow.html",
+     "offline": true
+    },
+    {
+     "src": "Rust for Rustaceans (EPUB)",
+     "title": "Ch. 1 Foundations — “Borrowing and Lifetimes”: Shared References, Mutable References",
+     "offline": true
+    },
+    {
+     "src": "Programming Rust (your early-release copy)",
+     "title": "Ch. 2 Basic Types — “Arrays, Vectors, and Slices”",
+     "offline": true
+    }
+   ]
+  },
+  "lifetimes": {
+   "label": "Lifetimes",
+   "blurb": "A lifetime is the compiler's name for how long a borrow stays valid. Annotations like <'a> change no behaviour; they say which input an output borrows from.",
+   "stop": "primer-lifetimes",
+   "stopLabel": "Stop 1 · Lifetimes",
+   "items": [
+    {
+     "src": "Rust Book",
+     "title": "10.3 Validating References with Lifetimes",
+     "href": "rustdoc:book/ch10-03-lifetime-syntax.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Scoping rules → Lifetimes",
+     "href": "rustdoc:rust-by-example/scope/lifetime.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Lifetimes → Static",
+     "href": "rustdoc:rust-by-example/scope/lifetime/static_lifetime.html",
+     "note": "what 'static really means in a bound",
+     "offline": true
+    },
+    {
+     "src": "Rust for Rustaceans (EPUB)",
+     "title": "Ch. 1 Foundations — “Lifetimes”",
+     "offline": true
+    }
+   ]
+  },
+  "smart-pointers": {
+   "label": "Box, Rc, Arc & Drop",
+   "blurb": "Box<T> is one owner of a heap value. Rc<T> and Arc<T> share ownership through a reference count; Arc is the thread-safe one. Drop runs cleanup at a known point.",
+   "stop": "primer-smart-pointers",
+   "stopLabel": "Stop 1 · Smart pointers",
+   "items": [
+    {
+     "src": "Rust Book",
+     "title": "Ch. 15 Smart Pointers (15.1 Box, 15.3 Drop, 15.4 Rc)",
+     "href": "rustdoc:book/ch15-00-smart-pointers.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Std library types → Box, stack and heap",
+     "href": "rustdoc:rust-by-example/std/box.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Std library types → Arc",
+     "href": "rustdoc:rust-by-example/std/arc.html",
+     "offline": true
+    },
+    {
+     "src": "Rust for Rustaceans (EPUB)",
+     "title": "Ch. 2 Types — “Dynamically Sized Types and Wide Pointers”",
+     "note": "why Arc<dyn Trait> is two words wide",
+     "offline": true
+    },
+    {
+     "src": "Programming Rust (your early-release copy)",
+     "title": "Ch. 2 Basic Types — “Pointer Types” (References, Boxes, Raw Pointers)",
+     "offline": true
+    },
+    {
+     "src": "std docs",
+     "title": "std::sync::Arc",
+     "href": "rustdoc:std/sync/struct.Arc.html",
+     "offline": true
+    }
+   ]
+  },
+  "interior-mutability": {
+   "label": "Interior mutability",
+   "blurb": "How code holding only a shared reference (&self) can still change things: Mutex and RwLock guard the data itself, atomics update single numbers, OnceLock initialises exactly once.",
+   "stop": "primer-interior-mutability",
+   "stopLabel": "Stop 1 · Interior mutability",
+   "items": [
+    {
+     "src": "Rust Book",
+     "title": "15.5 RefCell<T> and the Interior Mutability Pattern",
+     "href": "rustdoc:book/ch15-05-interior-mutability.html",
+     "offline": true
+    },
+    {
+     "src": "Rust Book",
+     "title": "16.3 Shared-State Concurrency",
+     "href": "rustdoc:book/ch16-03-shared-state.html",
+     "offline": true
+    },
+    {
+     "src": "Rust for Rustaceans (EPUB)",
+     "title": "Ch. 1 Foundations — “Interior Mutability”",
+     "offline": true
+    },
+    {
+     "src": "Rust for Rustaceans (EPUB)",
+     "title": "Ch. 10 Concurrency — “Atomic Types”, “Memory Ordering”",
+     "offline": true
+    },
+    {
+     "src": "std docs",
+     "title": "std::sync::Mutex",
+     "href": "rustdoc:std/sync/struct.Mutex.html",
+     "offline": true
+    },
+    {
+     "src": "std docs",
+     "title": "std::sync::atomic",
+     "href": "rustdoc:std/sync/atomic/index.html",
+     "offline": true
+    }
+   ]
+  },
+  "concurrency": {
+   "label": "Threads, Send & Sync",
+   "blurb": "Send means a value may move to another thread; Sync means it may be shared between threads. The compiler checks both, which is why shared state is wrapped in Arc<Mutex<…>>.",
+   "stop": "primer-concurrency",
+   "stopLabel": "Stop 1 · Send & Sync",
+   "items": [
+    {
+     "src": "Rust Book",
+     "title": "Ch. 16 Fearless Concurrency",
+     "href": "rustdoc:book/ch16-00-concurrency.html",
+     "offline": true
+    },
+    {
+     "src": "Rust Book",
+     "title": "16.4 Extensible Concurrency with Send and Sync",
+     "href": "rustdoc:book/ch16-04-extensible-concurrency-sync-and-send.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Std misc → Channels",
+     "href": "rustdoc:rust-by-example/std_misc/channels.html",
+     "offline": true
+    },
+    {
+     "src": "Rust for Rustaceans (EPUB)",
+     "title": "Ch. 10 Concurrency (and Parallelism) — “Concurrency Models”: Shared Memory, Worker Pools, Actors",
+     "offline": true
+    },
+    {
+     "src": "Rust for Rustaceans (EPUB)",
+     "title": "Ch. 2 Types — “Marker Traits”",
+     "note": "Send and Sync are marker traits",
+     "offline": true
+    }
+   ]
+  },
+  "async": {
+   "label": "async/await & tokio",
+   "blurb": "An async fn returns a Future that does nothing until it is polled. tokio polls thousands of them on a few threads. A spawned task must own everything it uses ('static).",
+   "stop": "primer-async",
+   "stopLabel": "Stop 1 · async",
+   "items": [
+    {
+     "src": "Rust Book",
+     "title": "Ch. 17 Fundamentals of Asynchronous Programming",
+     "href": "rustdoc:book/ch17-00-async-await.html",
+     "offline": true
+    },
+    {
+     "src": "Rust Book",
+     "title": "17.6 Futures, Tasks, and Threads",
+     "href": "rustdoc:book/ch17-06-futures-tasks-threads.html",
+     "offline": true
+    },
+    {
+     "src": "Rust for Rustaceans (EPUB)",
+     "title": "Ch. 8 Asynchronous Programming — “Ergonomic Futures”, “Pin and Unpin”, “Tying It All Together with spawn”",
+     "offline": true
+    },
+    {
+     "src": "Rust for Rustaceans (EPUB)",
+     "title": "Ch. 10 Concurrency — “Asynchrony and Parallelism”",
+     "offline": true
+    },
+    {
+     "src": "std docs",
+     "title": "std::future::Future",
+     "href": "rustdoc:std/future/trait.Future.html",
+     "offline": true
+    }
+   ]
+  },
+  "methods": {
+   "label": "Methods & self",
+   "blurb": "impl blocks, receivers (&self, &mut self, self) and what the dot desugars to.",
+   "stop": "primer-methods",
+   "stopLabel": "Primer: methods and self",
+   "items": [
+    {
+     "src": "Rust Book",
+     "title": "5.3 Method Syntax",
+     "href": "rustdoc:book/ch05-03-method-syntax.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Functions → Associated functions & Methods",
+     "href": "rustdoc:rust-by-example/fn/methods.html",
+     "offline": true
+    },
+    {
+     "src": "Rust Book",
+     "title": "10.2 Traits — implementing a trait on a type",
+     "href": "rustdoc:book/ch10-02-traits.html",
+     "offline": true
+    },
+    {
+     "src": "Rust for Rustaceans (EPUB)",
+     "title": "Ch. 3 Designing Interfaces — “Borrowed vs. Owned” (choosing self, &self, &mut self)",
+     "offline": true
+    }
+   ]
+  },
+  "traits-generics": {
+   "label": "Traits, generics & dyn",
+   "blurb": "Traits are interfaces. Generics (T: Trait) are resolved at compile time; dyn Trait is resolved at run time through a vtable, like a Java interface call.",
+   "stop": "primer-traits-generics",
+   "stopLabel": "Stop 1 · Traits",
+   "items": [
+    {
+     "src": "Rust Book",
+     "title": "10.2 Defining Shared Behavior with Traits",
+     "href": "rustdoc:book/ch10-02-traits.html",
+     "offline": true
+    },
+    {
+     "src": "Rust Book",
+     "title": "18.2 Using Trait Objects to Abstract over Shared Behavior",
+     "href": "rustdoc:book/ch18-02-trait-objects.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Traits → Returning Traits with dyn",
+     "href": "rustdoc:rust-by-example/trait/dyn.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Generics → Bounds",
+     "href": "rustdoc:rust-by-example/generics/bounds.html",
+     "offline": true
+    },
+    {
+     "src": "Rust for Rustaceans (EPUB)",
+     "title": "Ch. 2 Types — “Traits and Trait Bounds” (Compilation and Dispatch)",
+     "offline": true
+    },
+    {
+     "src": "Rust for Rustaceans (EPUB)",
+     "title": "Ch. 3 Designing Interfaces — “Object Safety”, “Borrowed vs. Owned”",
+     "offline": true
+    },
+    {
+     "src": "Hands-on Rust (EPUB)",
+     "title": "Ch. 11 More Interesting Dungeons — “Creating Traits”",
+     "offline": true
+    }
+   ]
+  },
+  "enums-patterns": {
+   "label": "Enums & pattern matching",
+   "blurb": "Rust enums carry data per variant, like Kotlin sealed classes, and match must cover every case. Most state machines in this codebase are enums.",
+   "stop": "primer-enums-patterns",
+   "stopLabel": "Stop 1 · Enums",
+   "items": [
+    {
+     "src": "Rust Book",
+     "title": "Ch. 6 Enums and Pattern Matching (incl. 6.3 if let and let…else)",
+     "href": "rustdoc:book/ch06-00-enums.html",
+     "offline": true
+    },
+    {
+     "src": "Rust Book",
+     "title": "Ch. 19 Patterns and Matching",
+     "href": "rustdoc:book/ch19-00-patterns.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Flow of Control → match",
+     "href": "rustdoc:rust-by-example/flow_control/match.html",
+     "offline": true
+    },
+    {
+     "src": "Hands-on Rust (EPUB)",
+     "title": "Ch. 2 First Steps with Rust — “Categorizing with Enumerations”",
+     "offline": true
+    },
+    {
+     "src": "Hands-on Rust (EPUB)",
+     "title": "Ch. 3 Build Your First Game with Rust — “Creating Different Game Modes”",
+     "note": "an enum-driven state machine",
+     "offline": true
+    }
+   ]
+  },
+  "error-handling": {
+   "label": "Result, ? and panics",
+   "blurb": "Errors are values: Result<T, E>. The ? operator returns early and converts the error with From. A panic is a crash, and with panic = \"abort\" it takes the host process with it.",
+   "stop": "primer-error-handling",
+   "stopLabel": "Stop 1 · Errors",
+   "items": [
+    {
+     "src": "Rust Book",
+     "title": "Ch. 9 Error Handling (9.2 Result, 9.3 To panic! or Not to panic!)",
+     "href": "rustdoc:book/ch09-00-error-handling.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Error handling → Introducing ?",
+     "href": "rustdoc:rust-by-example/error/result/enter_question_mark.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Error handling → abort & unwind",
+     "href": "rustdoc:rust-by-example/error/abort_unwind.html",
+     "offline": true
+    },
+    {
+     "src": "Rust for Rustaceans (EPUB)",
+     "title": "Ch. 4 Error Handling — Enumeration vs. Opaque Errors, Propagating Errors",
+     "offline": true
+    },
+    {
+     "src": "Command-Line Rust (EPUB)",
+     "title": "Ch. 2 Test for Echo — “Using the Result Type”; Ch. 4 Head Aches — “Converting Strings into Errors”",
+     "offline": true
+    },
+    {
+     "src": "CLI book",
+     "title": "1.4 Nicer error reporting (anyhow)",
+     "href": "https://rust-cli.github.io/book/tutorial/errors.html",
+     "note": "(online only)"
+    }
+   ]
+  },
+  "iterators-closures": {
+   "label": "Iterators & closures",
+   "blurb": "Iterator chains are lazy, like Kotlin sequences. Closures borrow what they capture unless they are marked move, in which case they take ownership.",
+   "stop": "primer-iterators-closures",
+   "stopLabel": "Stop 1 · Closures",
+   "items": [
+    {
+     "src": "Rust Book",
+     "title": "Ch. 13 Functional Language Features: Iterators and Closures",
+     "href": "rustdoc:book/ch13-00-functional-features.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Functions → Closures → Capturing",
+     "href": "rustdoc:rust-by-example/fn/closures/capture.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Traits → Iterators",
+     "href": "rustdoc:rust-by-example/trait/iter.html",
+     "offline": true
+    },
+    {
+     "src": "Command-Line Rust (EPUB)",
+     "title": "Ch. 5 Word to Your Mother — “Iterating the Files”",
+     "offline": true
+    }
+   ]
+  },
+  "modules-cargo": {
+   "label": "Crates, modules & features",
+   "blurb": "A workspace holds crates, and each crate is a tree of modules. Cargo features and #[cfg] switch code on or off at compile time.",
+   "stop": "stop-02",
+   "stopLabel": "Stop 2 · The workspace",
+   "items": [
+    {
+     "src": "Rust Book",
+     "title": "Ch. 7 Packages, Crates, and Modules",
+     "href": "rustdoc:book/ch07-00-managing-growing-projects-with-packages-crates-and-modules.html",
+     "offline": true
+    },
+    {
+     "src": "Rust Book",
+     "title": "14.3 Cargo Workspaces",
+     "href": "rustdoc:book/ch14-03-cargo-workspaces.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Attributes → cfg",
+     "href": "rustdoc:rust-by-example/attribute/cfg.html",
+     "offline": true
+    },
+    {
+     "src": "Rust for Rustaceans (EPUB)",
+     "title": "Ch. 5 Project Structure — Features, Workspaces, Conditional Compilation",
+     "offline": true
+    },
+    {
+     "src": "Hands-on Rust (EPUB)",
+     "title": "Ch. 5 Build a Dungeon Crawler — “Dividing Your Code Into Modules”",
+     "offline": true
+    },
+    {
+     "src": "Command-Line Rust (EPUB)",
+     "title": "Ch. 1 Truth or Consequences — “Organizing a Rust Project Directory”",
+     "offline": true
+    }
+   ]
+  },
+  "unsafe-ffi": {
+   "label": "unsafe & FFI",
+   "blurb": "unsafe marks code whose memory safety you vouch for yourself. At an FFI boundary the compiler cannot see who owns what, so every allocation needs an agreed owner and a matching free.",
+   "stop": "stop-17",
+   "stopLabel": "Stop 17 · UniFFI deep dive",
+   "items": [
+    {
+     "src": "Rust Book",
+     "title": "20.1 Unsafe Rust (incl. “Using extern Functions to Call External Code”)",
+     "href": "rustdoc:book/ch20-01-unsafe-rust.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Std misc → Foreign Function Interface",
+     "href": "rustdoc:rust-by-example/std_misc/ffi.html",
+     "offline": true
+    },
+    {
+     "src": "Rust for Rustaceans (EPUB)",
+     "title": "Ch. 11 Foreign Function Interfaces — “Types Across Language Boundaries”, “Allocations”, “Safety”",
+     "offline": true
+    },
+    {
+     "src": "Rust for Rustaceans (EPUB)",
+     "title": "Ch. 9 Unsafe Code — “Juggling Raw Pointers”, “Panics”",
+     "offline": true
+    },
+    {
+     "src": "std docs",
+     "title": "std::ffi::CString",
+     "href": "rustdoc:std/ffi/struct.CString.html",
+     "offline": true
+    },
+    {
+     "src": "Programming Rust (your early-release copy)",
+     "title": "Ch. 2 Basic Types — “Raw Pointers”",
+     "offline": true
+    }
+   ]
+  },
+  "macros": {
+   "label": "Macros & attributes",
+   "blurb": "println!, vec!, #[derive(…)], #[tokio::main] and #[uniffi::export] are code generators that run at compile time.",
+   "stop": "primer-macros",
+   "stopLabel": "Stop 1 · Macros",
+   "items": [
+    {
+     "src": "Rust Book",
+     "title": "20.5 Macros",
+     "href": "rustdoc:book/ch20-05-macros.html",
+     "offline": true
+    },
+    {
+     "src": "Rust Book",
+     "title": "Appendix C: Derivable Traits",
+     "href": "rustdoc:book/appendix-03-derivable-traits.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Hello World → Formatted print",
+     "href": "rustdoc:rust-by-example/hello/print.html",
+     "offline": true
+    },
+    {
+     "src": "Rust for Rustaceans (EPUB)",
+     "title": "Ch. 7 Macros — Declarative vs. Procedural",
+     "offline": true
+    }
+   ]
+  },
+  "testing": {
+   "label": "Tests",
+   "blurb": "#[test] functions live next to the code (unit tests) or in tests/ (integration tests that see only the public API). #[ignore] keeps live-network tests out of the default run.",
+   "stop": "stop-15",
+   "stopLabel": "Stop 15 · The test suite",
+   "items": [
+    {
+     "src": "Rust Book",
+     "title": "Ch. 11 Writing Automated Tests (11.2 Running, 11.3 Organization)",
+     "href": "rustdoc:book/ch11-00-testing.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Testing → Integration testing",
+     "href": "rustdoc:rust-by-example/testing/integration_testing.html",
+     "offline": true
+    },
+    {
+     "src": "Rust for Rustaceans (EPUB)",
+     "title": "Ch. 6 Testing",
+     "offline": true
+    },
+    {
+     "src": "Command-Line Rust (EPUB)",
+     "title": "Ch. 1 Truth or Consequences — “Writing and Running Integration Tests”",
+     "offline": true
+    }
+   ]
+  },
+  "bytes-strings": {
+   "label": "Bytes, strings & formatting",
+   "blurb": "String owns UTF-8 text and &str borrows it. Vec<u8>, [u8; N] and &[u8] are the byte versions. Most protocol code in this project is byte slicing.",
+   "stop": "primer-bytes-strings",
+   "stopLabel": "Stop 1 · Bytes",
+   "items": [
+    {
+     "src": "Rust Book",
+     "title": "8.2 Storing UTF-8 Encoded Text with Strings",
+     "href": "rustdoc:book/ch08-02-strings.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Std library types → Strings",
+     "href": "rustdoc:rust-by-example/std/str.html",
+     "offline": true
+    },
+    {
+     "src": "Rust by Example",
+     "title": "Hello World → Formatted print",
+     "href": "rustdoc:rust-by-example/hello/print.html",
+     "offline": true
+    },
+    {
+     "src": "Programming Rust (your early-release copy)",
+     "title": "Ch. 2 Basic Types — “String Types”: Byte Strings, Strings in Memory",
+     "offline": true
+    },
+    {
+     "src": "Command-Line Rust (EPUB)",
+     "title": "Ch. 4 Head Aches — “Reading Bytes Versus Characters”",
+     "offline": true
+    }
+   ]
+  },
+  "cli": {
+   "label": "Binaries, CLIs & signals",
+   "blurb": "A binary crate has a main(); daemons parse arguments, report errors with anyhow and shut down cleanly on Ctrl-C.",
+   "stop": "stop-20",
+   "stopLabel": "Stop 20 · roost",
+   "items": [
+    {
+     "src": "Command-Line Rust (EPUB)",
+     "title": "Ch. 2 Test for Echo — “Parsing Command-Line Arguments Using clap”",
+     "offline": true
+    },
+    {
+     "src": "CLI book",
+     "title": "1.2 Parsing command line arguments",
+     "href": "https://rust-cli.github.io/book/tutorial/cli-args.html",
+     "note": "(online only)"
+    },
+    {
+     "src": "CLI book",
+     "title": "2.1 Signal handling",
+     "href": "https://rust-cli.github.io/book/in-depth/signals.html",
+     "note": "(online only)"
+    },
+    {
+     "src": "CLI book",
+     "title": "2.3 Exit codes",
+     "href": "https://rust-cli.github.io/book/in-depth/exit-code.html",
+     "note": "(online only)"
+    }
+   ]
+  },
+  "domain": {
+   "label": "Protocol & domain",
+   "blurb": "The Ethereum knowledge the code assumes. The project's own design documents are the best source here.",
+   "stop": "stop-00",
+   "stopLabel": "Stop 0 · The map",
+   "items": [
+    {
+     "src": "Repo docs",
+     "title": "docs/spec/01-consensus-light-client.md",
+     "note": "sync committees, updates, the store",
+     "offline": true,
+     "href": "repodoc:spec/01-consensus-light-client.md"
+    },
+    {
+     "src": "Repo docs",
+     "title": "docs/spec/02-execution-networking.md",
+     "note": "discv4, RLPx, eth, snap",
+     "offline": true,
+     "href": "repodoc:spec/02-execution-networking.md"
+    },
+    {
+     "src": "Repo docs",
+     "title": "docs/spec/03-state-verification-and-evm.md",
+     "offline": true,
+     "href": "repodoc:spec/03-state-verification-and-evm.md"
+    },
+    {
+     "src": "Repo docs",
+     "title": "docs/spec/05-engine-api-bindings.md and 07-el-implementation-plan.md",
+     "offline": true,
+     "href": "repodoc:spec/05-engine-api-bindings.md"
+    }
+   ]
+  }
+ }
+}
