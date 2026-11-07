@@ -4,6 +4,14 @@
 
 @namespace epub "http://www.idpf.org/2007/ops";
 
+/* Embedded JetBrains Mono (SIL OFL 1.1, fonts/OFL.txt) so code is monospaced in every reader;
+   Apple Books honours it because the package sets ibooks:specified-fonts. */
+@font-face { font-family: "JetBrains Mono"; font-style: normal; font-weight: normal; src: url("../fonts/JetBrainsMono-Regular.ttf"); }
+@font-face { font-family: "JetBrains Mono"; font-style: normal; font-weight: bold; src: url("../fonts/JetBrainsMono-Bold.ttf"); }
+@font-face { font-family: "JetBrains Mono"; font-style: italic; font-weight: normal; src: url("../fonts/JetBrainsMono-Italic.ttf"); }
+
+
+
 body { margin: 0 4%; line-height: 1.5; widows: 2; orphans: 2; }
 h1, h2, h3, h4 { font-family: "Avenir Next", "Helvetica Neue", Helvetica, sans-serif; line-height: 1.2;
   page-break-after: avoid; break-after: avoid; }
@@ -12,7 +20,7 @@ h2 { font-size: 1.25em; margin: 1.6em 0 0.5em; }
 h3 { font-size: 1.05em; margin: 1.3em 0 0.4em; }
 p { margin: 0.55em 0; }
 a { color: #b4441a; text-decoration: none; }
-code { font-family: Menlo, "SF Mono", "Courier New", monospace; font-size: 0.86em; }
+code { font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.86em; }
 ul, ol { padding-left: 1.4em; }
 li { margin: 0.2em 0; }
 hr { border: 0; border-top: 1px solid rgba(127, 127, 127, 0.4); margin: 1.5em 0; }
@@ -20,7 +28,7 @@ hr { border: 0; border-top: 1px solid rgba(127, 127, 127, 0.4); margin: 1.5em 0;
 /* ---- stop header ---- */
 .stop { page-break-before: always; break-before: page; }
 .stop-head { margin-bottom: 1.2em; }
-.eyebrow { font-family: Menlo, monospace; font-size: 0.72em; letter-spacing: 0.04em; text-transform: uppercase;
+.eyebrow { font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.72em; letter-spacing: 0.04em; text-transform: uppercase;
   color: #b4441a; margin-bottom: 0.4em; }
 .eyebrow span { display: block; color: #6b7784; text-transform: none; letter-spacing: 0; margin-top: 0.2em; }
 .eyebrow code { font-size: 1em; }
@@ -35,17 +43,17 @@ hr { border: 0; border-top: 1px solid rgba(127, 127, 127, 0.4); margin: 1.5em 0;
 /* ---- file entries ---- */
 article.file { margin-top: 2em; padding-top: 0.6em; border-top: 2px solid rgba(127, 127, 127, 0.5); }
 .file-head { margin-bottom: 0.5em; }
-.file-path { margin: 0; font-family: Menlo, monospace; font-size: 0.95em; word-wrap: break-word; }
+.file-path { margin: 0; font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.95em; word-wrap: break-word; }
 .file-path a { color: inherit; }
 .file-path .dir { color: #6b7784; font-weight: normal; }
 .chips { margin-top: 0.3em; font-size: 0.75em; }
 .chip { display: inline-block; border: 1px solid rgba(127, 127, 127, 0.5); border-radius: 3px; padding: 0 0.4em;
-  margin: 0 0.3em 0.2em 0; font-family: Menlo, monospace; }
+  margin: 0 0.3em 0.2em 0; font-family: "JetBrains Mono", Menlo, "Courier New", monospace; }
 .chip.kind { border-color: #b4441a; color: #b4441a; }
 .chip.twin { border-color: #6a4bd8; color: #6a4bd8; }
 .purpose { font-style: italic; }
 .code-note { font-size: 0.95em; }
-.mono { font-family: Menlo, monospace; }
+.mono { font-family: "JetBrains Mono", Menlo, "Courier New", monospace; }
 .section-title { font-size: 1.15em; }
 
 /* ---- concept chips ---- */
@@ -79,10 +87,10 @@ td code, th code { word-wrap: break-word; }
 /* ---- code plates ---- */
 figure { margin: 1em 0; }
 figure.code { page-break-inside: auto; }
-figure.code figcaption { font-family: Menlo, monospace; font-size: 0.68em; margin-bottom: 0.25em; word-wrap: break-word; }
+figure.code figcaption { font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.68em; margin-bottom: 0.25em; word-wrap: break-word; }
 figure.code figcaption .rng { color: #6b7784; }
 pre.code { margin: 0; padding: 0.5em 0.6em; background: #f3f5f7; color: #1b2530; border: 1px solid #d3dae1;
-  border-radius: 4px; font-family: Menlo, "SF Mono", "Courier New", monospace; font-size: 0.66em; line-height: 1.4;
+  border-radius: 4px; font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.66em; line-height: 1.4;
   white-space: pre-wrap; word-wrap: break-word; }
 pre.code code { font-size: 1em; color: #1b2530; }
 pre.code .row { display: block; }
@@ -92,7 +100,7 @@ pre.code.w2 .row { padding-left: 3ch; text-indent: -3ch; }
 pre.code.w3 .row { padding-left: 4ch; text-indent: -4ch; }
 pre.code.w4 .row { padding-left: 5ch; text-indent: -5ch; }
 pre.code.w5 .row { padding-left: 6ch; text-indent: -6ch; }
-pre { white-space: pre-wrap; word-wrap: break-word; font-family: Menlo, monospace; font-size: 0.75em; }
+pre { white-space: pre-wrap; word-wrap: break-word; font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.75em; }
 .tk-k { color: #9b3412; }
 .tk-t { color: #1d5f8a; }
 .tk-s { color: #2e6b2f; }
@@ -112,7 +120,7 @@ pre { white-space: pre-wrap; word-wrap: break-word; font-family: Menlo, monospac
   --jvm: #6a4bd8; --jvm-ink: #4f33b3; --jvm-wash: #ebe6fb; --ok: #1f7a4d; --ok-ink: #1f7a4d; --ok-wash: #dcefe4;
   --warn: #9a620a; --warn-ink: #7a4d08; --warn-wash: #f5ead3; --bad: #b42335; --bad-ink: #8f1c2a; --bad-wash: #f7dfe2; }
 .diagram svg text { font-family: "Avenir Next", "Helvetica Neue", sans-serif; }
-.diagram svg .mono { font-family: Menlo, monospace; }
+.diagram svg .mono { font-family: "JetBrains Mono", Menlo, "Courier New", monospace; }
 .diagram svg .muted { color: #6b7784; }
 .diagram figcaption, figure > figcaption { font-size: 0.85em; font-style: italic; margin-top: 0.4em; }
 
@@ -121,9 +129,9 @@ pre { white-space: pre-wrap; word-wrap: break-word; font-family: Menlo, monospac
 ol.flight li { margin: 0.4em 0; }
 
 /* ---- file index ---- */
-.index-crate { font-family: Menlo, monospace; font-size: 0.95em; }
+.index-crate { font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.95em; }
 .index-crate span { font-weight: normal; color: #6b7784; font-size: 0.85em; }
-ul.toc-files { list-style: none; padding-left: 0.5em; font-family: Menlo, monospace; font-size: 0.75em; }
+ul.toc-files { list-style: none; padding-left: 0.5em; font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.75em; }
 ul.toc-files span { color: #6b7784; }
 
 /* ---- checkpoints ---- */
@@ -152,11 +160,11 @@ ul.library small { display: block; font-size: 0.9em; }
 
 /* ---- title page & cover ---- */
 .titlepage { text-align: left; margin-top: 20%; }
-.t-kicker { font-family: Menlo, monospace; font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.08em; color: #6b7784; }
+.t-kicker { font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.08em; color: #6b7784; }
 .t-title { font-size: 2.6em; line-height: 1; margin: 0.4em 0; }
 .t-title span { color: #b4441a; }
 .t-sub { font-size: 1.15em; font-style: italic; }
-.t-meta { font-family: Menlo, monospace; font-size: 0.75em; color: #6b7784; margin-top: 2em; }
+.t-meta { font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.75em; color: #6b7784; margin-top: 2em; }
 body.cover { margin: 0; padding: 0; text-align: center; }
 .cover img { max-width: 100%; max-height: 100%; }
 nav[epub|type~="landmarks"] { display: none; }
@@ -165,5 +173,9 @@ nav[epub|type~="landmarks"] { display: none; }
 ol.route-legs { list-style: none; padding-left: 0; }
 ol.route-legs > li { border-left: 3px solid #b4441a; padding-left: 0.7em; margin: 1em 0; }
 ol.route-legs > li > b { font-family: "Avenir Next", "Helvetica Neue", sans-serif; }
-ol.route-legs .t { font-family: Menlo, monospace; font-size: 0.75em; color: #6b7784; }
+ol.route-legs .t { font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.75em; color: #6b7784; }
 ol.route-legs ul { margin-top: 0.3em; font-size: 0.95em; }
+
+/* every piece of code, whatever the reader's chosen body font */
+code, pre, kbd, samp, pre.code, pre.code code, pre.code .row, pre.code span { font-family: "JetBrains Mono", Menlo, "Courier New", monospace; }
+pre.code, pre.code code { font-variant-ligatures: none; }

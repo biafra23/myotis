@@ -592,6 +592,11 @@ def main():
     manifest = ['<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',
                 '<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>',
                 '<item id="css" href="css/book.css" media-type="text/css"/>']
+    fonts_dir = os.path.join(HERE, "fonts")
+    fonts = sorted(f for f in os.listdir(fonts_dir) if f.endswith(".ttf"))
+    for i, f in enumerate(fonts):
+        manifest.append(f'<item id="font{i}" href="fonts/{f}" media-type="font/ttf"/>')
+    manifest.append('<item id="font-license" href="fonts/OFL.txt" media-type="text/plain"/>')
     if cover:
         manifest.append('<item id="cover-img" href="images/cover.png" media-type="image/png" properties="cover-image"/>')
     for f in spine_files:
@@ -599,7 +604,7 @@ def main():
         manifest.append(f'<item id="{f.split(".")[0]}" href="{f}" media-type="application/xhtml+xml"{props}/>')
     spine = "".join(f'<itemref idref="{f.split(".")[0]}"/>' for f in spine_files)
     opf = f'''<?xml version="1.0" encoding="utf-8"?>
-<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid" xml:lang="en" prefix="schema: http://schema.org/">
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid" xml:lang="en" prefix="schema: http://schema.org/ ibooks: http://vocabulary.itunes.apple.com/rdf/ibooks/vocabulary-extensions-1.0/">
 <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
 <dc:identifier id="bookid">{book_id}</dc:identifier>
 <dc:title>Myotis Rust Tour {B.VERSION}</dc:title>
@@ -609,6 +614,7 @@ def main():
 <dc:description>A guided tour of every Rust file in the Myotis workspace (commit {B.COMMIT[:8]}) for Java and Kotlin developers, with checkpoints, a workbook and a reading list.</dc:description>
 <meta property="dcterms:modified">{now}</meta>
 <meta property="schema:version">{B.VERSION}</meta>
+<meta property="ibooks:specified-fonts">true</meta>
 {'<meta name="cover" content="cover-img"/>' if cover else ''}
 </metadata>
 <manifest>
@@ -646,6 +652,8 @@ def main():
         z.writestr("OEBPS/content.opf", opf, compress_type=zipfile.ZIP_DEFLATED)
         z.writestr("OEBPS/toc.ncx", ncx, compress_type=zipfile.ZIP_DEFLATED)
         z.writestr("OEBPS/css/book.css", css, compress_type=zipfile.ZIP_DEFLATED)
+        for f in fonts + ["OFL.txt"]:
+            z.write(os.path.join(fonts_dir, f), "OEBPS/fonts/" + f, compress_type=zipfile.ZIP_DEFLATED)
         if cover:
             z.writestr("OEBPS/images/cover.png", cover, compress_type=zipfile.ZIP_DEFLATED)
         for f, doc in files.items():

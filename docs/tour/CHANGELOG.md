@@ -15,5 +15,7 @@ The first versioned edition, quoting the code at `5263a421` (2026-11-06).
 - New since the unversioned September draft: the crates `myotis-wire` and `myotis-rpcd`, a
   primer section on methods and `self`, a deep dive into UniFFI (Stop 17), a ten-exercise
   workbook (Stop 22).
+- The EPUB embeds JetBrains Mono (SIL OFL 1.1, `source/fonts/OFL.txt`) and sets
+  `ibooks:specified-fonts`, so code is monospaced in every reader, Apple Books included.
 - Three outputs from one source: an offline HTML page with graded quizzes and saved progress,
   an EPUB, and the Markdown book in `book/`.
