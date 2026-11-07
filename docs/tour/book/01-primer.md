@@ -856,7 +856,7 @@ A binary crate has `fn main()`. An async one uses `#[tokio::main]` to start the 
 
 ## Protocol knowledge (short)
 
-You know the protocols from the Java engine. The Rust code uses the same vocabulary: slots (12 s), sync-committee periods (8,192 slots), SSZ and `hash_tree_root` on the consensus side, RLP and keccak-256 on the execution side, and never the two hashes mixed. When a term is unclear, the design docs under `docs/reimplementation/` are the reference. [Stop 0](00-map.md) lists the trust chain.
+You know the protocols from the Java engine. The Rust code uses the same vocabulary: slots (12 s), sync-committee periods (8,192 slots), SSZ and `hash_tree_root` on the consensus side, RLP and keccak-256 on the execution side, and never the two hashes mixed. When a term is unclear, the specification under `docs/spec/` (called `docs/reimplementation/` at the commit this tour quotes) are the reference. [Stop 0](00-map.md) lists the trust chain.
 
 ## Cheat sheet: Java/Kotlin → Rust
 
