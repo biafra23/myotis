@@ -94,6 +94,11 @@ jobs:
       - name: Set up the Android SDK
         if: ${{ inputs.extra_tasks != '' }}
         uses: android-actions/setup-android@v3
+        with:
+          # The action's default also asks for `tools`, which current SDK
+          # repositories no longer carry (sdkmanager: "Failed to find package
+          # 'tools'"), failing the step.
+          packages: platform-tools
 
       # -PskipRustEngine: no Android Rust toolchain needed to RESOLVE; it
       # changes no dependency. Retried once for transient repository errors —
@@ -179,12 +184,14 @@ jobs:
           if-no-files-found: error
 
       - name: Fail if the committed pins are incomplete for this host
-        if: ${{ !cancelled() && (steps.check.outcome == 'failure' || steps.contribute.outcome != 'success') }}
+        if: ${{ !cancelled() && (steps.check.outcome != 'success' || steps.contribute.outcome != 'success') }}
         env:
           CHECK: ${{ steps.check.outcome }}
           CONTRIBUTE: ${{ steps.contribute.outcome }}
         run: |
-          if [ "$CHECK" = failure ]; then
+          if [ "$CHECK" = skipped ]; then
+            echo "::error::the pin check never ran on ${{ inputs.host }}: a setup step before it failed."
+          elif [ "$CHECK" != success ]; then
             echo "::error::the committed Gradle pins do not cover ${{ inputs.host }} (see the check step)." \
                  "Once the whole chain has finished, run scripts/update_gradle_pins.sh --from-ci ${{ github.run_id }}, review the hash diff, and commit it."
           fi
