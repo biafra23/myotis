@@ -1264,7 +1264,7 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         )
         StatusRow("Beacon", s.beaconState, help = StatusHelp.BEACON)
         StatusRow("EL block", s.executionBlockNumber.toString(), help = StatusHelp.EL_BLOCK)
-        // Tor verified-read routing (docs/privacy-and-tor.md) — shown only when it
+        // Tor verified-read routing (docs/how-it-works/privacy-and-tor.md) — shown only when it
         // applies (Rust engine + a Tor-capable build); see NodeSnapshot.tor.
         s.logIndex?.let { StatusRow("Log index", it, help = StatusHelp.LOG_INDEX) }
         s.tor?.let { mode ->
@@ -1355,7 +1355,7 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         // the Reads rows follow.
         Spacer(Modifier.height(8.dp))
 
-        // The read-fetch shadow cache (docs/read-stats.md): verified state
+        // The read-fetch shadow cache (docs/how-it-works/read-stats.md): verified state
         // fetches this run, the share a sound cache keying would have served
         // (storage-root keyed slots, per-block accounts, content-addressed
         // code) with the storage time it would have saved, and how often a
@@ -1397,7 +1397,7 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
             help = StatusHelp.HEAD_AGE,
         )
         StatusRow("Uptime", "${s.uptimeSeconds}s", help = StatusHelp.UPTIME)
-        // Data usage (docs/data-usage.md): this network's bytes on the wire.
+        // Data usage (docs/how-it-works/data-usage.md): this network's bytes on the wire.
         s.dataUsage?.let { u ->
             val today = DataUsageText.Today(u.todayIn, u.todayOut, u.todayMeteredIn, u.todayMeteredOut)
             StatusRow(
@@ -2550,7 +2550,7 @@ internal fun elPeersValue(ready: Int, snap: Int, serving: Int, snap2Serving: Int
 
 /**
  * Status-tab help text, one entry per on-screen item — the in-app twin of
- * docs/status-screen.md. **Keep both in sync**: a behavior change to
+ * docs/how-it-works/status-screen.md. **Keep both in sync**: a behavior change to
  * [StatusView]/[ReadinessStrip]/[StatusTab] that changes what a row means
  * must update its string here AND the matching row in that doc.
  */
@@ -2594,7 +2594,7 @@ private object StatusHelp {
     const val BLK_ASKS = "GetBlockBodies requests other peers sent us. Served is always 0 by " +
         "design — this light client holds no bodies."
     const val READS = "Verified account/storage/code fetches that crossed the network since " +
-        "start (the read-fetch shadow cache — docs/read-stats.md)."
+        "start (the read-fetch shadow cache — docs/how-it-works/read-stats.md)."
     const val CACHEABLE = "Share of each kind's fetches a SOUND cache keying would have served " +
         "for free (storage-root for slots, per-block for accounts, content-addressing for " +
         "code), with the time it would have saved."

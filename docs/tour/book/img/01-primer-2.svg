@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 900 300" role="img" fill="currentColor" aria-label="Two tasks each own an Arc pointing to the same heap allocation, which holds a strong count of 2 and a Mutex wrapping a HashMap of pending requests. The read-loop task currently holds the MutexGuard and has mutable access to the map; the request caller waits for the lock. Cloning an Arc increments the count; dropping one decrements it and the allocation is freed at zero." width="900" height="300">
+    <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="900.0" height="300.0" fill="#f8fafb" /><defs>
+      <marker id="m1b-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+      </marker>
+    </defs>
+    <rect x="20" y="24" width="250" height="110" rx="8" stroke-width="1.3" style="fill:var(--surface);stroke:var(--rule-strong)" />
+    <text x="34" y="46" font-size="13" font-weight="700">read-loop task</text>
+    <rect x="34" y="58" width="222" height="28" rx="4" style="fill:var(--oxide-wash)" />
+    <text x="44" y="77" font-size="12" class="mono">pending: Arc&lt;Mutex&lt;…&gt;&gt;</text>
+    <rect x="34" y="94" width="222" height="28" rx="4" style="fill:var(--ok-wash)" />
+    <text x="44" y="113" font-size="12" class="mono">guard: MutexGuard</text>
+
+    <rect x="20" y="170" width="250" height="100" rx="8" stroke-width="1.3" style="fill:var(--surface);stroke:var(--rule-strong)" />
+    <text x="34" y="192" font-size="13" font-weight="700">request caller</text>
+    <rect x="34" y="204" width="222" height="28" rx="4" style="fill:var(--oxide-wash)" />
+    <text x="44" y="223" font-size="12" class="mono">pending: Arc&lt;Mutex&lt;…&gt;&gt;</text>
+    <text x="34" y="256" font-size="11.5" style="fill:var(--warn)">waiting in lock().await</text>
+
+    <rect x="470" y="20" width="410" height="260" rx="10" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+    <text x="486" y="42" font-size="10.5" letter-spacing="1" style="fill:var(--ink-3)">ONE HEAP ALLOCATION</text>
+    <text x="486" y="64" font-size="12.5" class="mono">strong count = 2 · weak = 0</text>
+    <rect x="486" y="80" width="378" height="184" rx="8" stroke-width="1.2" style="fill:var(--ground-2);stroke:var(--rule-strong)" />
+    <text x="500" y="102" font-size="12.5" class="mono" font-weight="700">Mutex</text>
+    <text x="566" y="102" font-size="11.5" style="fill:var(--ink-3)">locked by read-loop task</text>
+    <rect x="500" y="118" width="350" height="130" rx="6" stroke-width="1.2" style="fill:var(--surface);stroke:var(--oxide)" />
+    <text x="514" y="140" font-size="12.5" class="mono" font-weight="700">HashMap&lt;u64, Pending&gt;</text>
+    <text x="514" y="164" font-size="12" class="mono">7 → Pending { want_code, tx }</text>
+    <text x="514" y="184" font-size="12" class="mono">8 → Pending { want_code, tx }</text>
+    <text x="514" y="214" font-size="11.5" style="fill:var(--ink-3)">reachable only through a guard,</text>
+    <text x="514" y="232" font-size="11.5" style="fill:var(--ink-3)">so no unsynchronised access compiles</text>
+
+    <line x1="256" y1="72" x2="467" y2="60" stroke="currentColor" stroke-width="1.4" marker-end="url(#m1b-arrow)" />
+    <text x="300" y="56" font-size="11" style="fill:var(--ink-2)">Arc::clone → count + 1</text>
+    <line x1="256" y1="218" x2="467" y2="218" stroke="currentColor" stroke-width="1.4" marker-end="url(#m1b-arrow)" />
+    <text x="300" y="210" font-size="11" style="fill:var(--ink-2)">drop → count − 1, freed at 0</text>
+    <line x1="256" y1="108" x2="497" y2="150" stroke-width="1.6" style="stroke:var(--ok)" marker-end="url(#m1b-arrow)" />
+    <text x="330" y="140" font-size="11" style="fill:var(--ok)">&amp;mut access while held</text>
+  </svg>

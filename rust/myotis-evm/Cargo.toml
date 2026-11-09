@@ -3,7 +3,7 @@ name = "myotis-evm"
 version.workspace = true
 edition = "2021"
 rust-version.workspace = true
-description = "Myotis EVM: view-call / gas-estimation over SNAP-proof-verified state (revm behind a SnapStateOracle trait; sans-I/O). Grows through the EL-phase Milestone-C PRs (docs/reimplementation/07)."
+description = "Myotis EVM: view-call / gas-estimation over SNAP-proof-verified state (revm behind a SnapStateOracle trait; sans-I/O). Grows through the EL-phase Milestone-C PRs (docs/spec/07)."
 license = "MIT OR Apache-2.0"
 
 # Sans-I/O like myotis-core / myotis-consensus: no tokio, sockets, fs, clock, or
@@ -15,7 +15,7 @@ license = "MIT OR Apache-2.0"
 myotis-core = { path = "../myotis-core" }
 
 # revm — the EVM. THE one heavy EL dependency, deliberately gated to this crate
-# (docs/reimplementation/07, Milestone C). `default-features = false` + `std`
+# (docs/spec/07, Milestone C). `default-features = false` + `std`
 # only drops revm's C-building precompile backends (c-kzg, libsecp256k1, blst)
 # in favour of its pure-Rust fallbacks (k256, …). `cargo tree -p myotis-evm`
 # COMPILES only k256 for crypto — `cargo tree -i c-kzg` / `-i secp256k1-sys` print

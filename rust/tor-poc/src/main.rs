@@ -1,4 +1,4 @@
-//! Tor integration PROOF OF CONCEPT for `docs/privacy-and-tor.md`.
+//! Tor integration PROOF OF CONCEPT for `docs/how-it-works/privacy-and-tor.md`.
 //!
 //! It exercises, against the LIVE Ethereum mainnet p2p network, the load-bearing
 //! technical claims of that design doc — the ones worth de-risking before any
@@ -413,7 +413,7 @@ async fn main() -> Result<()> {
     let addresses = demo_addresses(&args)?;
     let eth_cfg = mainnet_eth_config();
 
-    println!("== Myotis Tor integration PoC (docs/privacy-and-tor.md) ==\n");
+    println!("== Myotis Tor integration PoC (docs/how-it-works/privacy-and-tor.md) ==\n");
 
     // ---- §3: boot the embedded Arti client -------------------------------
     print!("[1/3] Bootstrapping embedded Arti Tor client ... ");

@@ -1,0 +1,179 @@
+<!--meta {"id":"stop-23","num":23,"title":"Final checkpoint: one request, end to end","short":"final checkpoint","sub":"cross-cutting · no new files","part":"Wrap-up"} -->
+<header class="stop-head">
+  <div class="eyebrow">Stop 23 · final checkpoint <span>no new files · about 30 minutes</span></div>
+  <h1>Final checkpoint: one request, end to end</h1>
+  <p class="lede">A wallet on Android asks for an account balance. This stop follows that one call through every layer you've read, from Java to Rust, across threads, over the network and back, and names the memory-model decision made at each step. Then comes a final set of questions that deliberately mix topics. Your results feed the progress page, which suggests book chapters for whatever is still shaky.</p>
+</header>
+
+<figure class="diagram">
+  <div class="svg-wrap">
+  <svg class="wide-diagram" viewBox="0 0 960 372" role="img" fill="currentColor" xmlns="http://www.w3.org/2000/svg"
+       aria-label="The path of one verified account read. 1: Java RustChainHandle.requestAccount calls the generated Kotlin. 2: ffi.rs calls host.rs, which clones the Arc of the reader under the handle-map lock and releases it. 3: the caller's thread blocks in rt.block_on on reader.request; a followed account is answered from block access lists, otherwise a hedged read races snap peers. 4: ManagedPeer registers a oneshot sender under the request id and sends the frame under the writer lock. The snap peer replies; 5: the peer's read task on a runtime thread decodes the frame and completes the oneshot, waking the blocked future. 6: the account proof is verified against the state root and the root is tied to the beacon chain through the ExecAnchor, which the consensus sync task keeps updated. 7: eljson serializes the result. 8: the JSON string returns to Kotlin and is parsed into AccountProofResult.">
+    <defs>
+      <marker id="m17-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+      </marker>
+    </defs>
+    <rect x="10" y="44" width="940" height="142" rx="10" stroke-width="1" style="fill:var(--surface);stroke:var(--rule)"/>
+    <rect x="10" y="240" width="940" height="124" rx="10" stroke-width="1" style="fill:var(--surface);stroke:var(--rule)"/>
+    <g font-size="10.5" style="fill:var(--ink-3)">
+      <text x="22" y="179">caller's thread (a JVM worker): parked in block_on while the request future is polled on it</text>
+      <text x="22" y="357">tokio runtime threads · the network</text>
+    </g>
+    <g font-size="11.5">
+      <rect x="20" y="62" width="130" height="92" rx="7" stroke-width="1.5" style="fill:var(--jvm-wash);stroke:var(--jvm)"/>
+      <text x="85" y="84" text-anchor="middle" font-weight="700" style="fill:var(--jvm-ink)">① Java</text>
+      <text x="85" y="104" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">RustChainHandle</text>
+      <text x="85" y="120" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">.requestAccount</text>
+      <text x="85" y="136" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">→ Kotlin → JNA</text>
+
+      <rect x="178" y="62" width="130" height="92" rx="7" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="243" y="84" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">② ffi → host</text>
+      <text x="243" y="104" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">parse address</text>
+      <text x="243" y="120" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">lock → Arc clone</text>
+      <text x="243" y="136" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">→ unlock</text>
+
+      <rect x="336" y="62" width="130" height="92" rx="7" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="401" y="84" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">③ block_on</text>
+      <text x="401" y="104" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">followed? else</text>
+      <text x="401" y="120" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">hedged_read</text>
+      <text x="401" y="136" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">(90 s Operation)</text>
+
+      <rect x="494" y="62" width="130" height="92" rx="7" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="559" y="84" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">④ ManagedPeer</text>
+      <text x="559" y="104" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">pending[id] = tx</text>
+      <text x="559" y="120" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">send_frame</text>
+      <text x="559" y="136" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">await rx</text>
+
+      <rect x="652" y="62" width="130" height="92" rx="7" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="717" y="84" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">⑥ verify</text>
+      <text x="717" y="104" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">MPT proof</text>
+      <text x="717" y="120" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">verified_state_root</text>
+      <text x="717" y="136" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">→ VerifiedAccount</text>
+
+      <rect x="810" y="62" width="130" height="92" rx="7" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="875" y="84" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">⑦ eljson</text>
+      <text x="875" y="104" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">account_json</text>
+      <text x="875" y="120" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">→ owned String</text>
+      <text x="875" y="136" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">→ RustBuffer</text>
+
+      <rect x="336" y="264" width="120" height="66" rx="7" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)"/>
+      <text x="396" y="292" text-anchor="middle" font-weight="700">snap peer</text>
+      <text x="396" y="310" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">over RLPx/TCP</text>
+
+      <rect x="500" y="264" width="282" height="66" rx="7" stroke-width="1.5" style="fill:var(--surface);stroke:var(--oxide)"/>
+      <text x="641" y="290" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">⑤ peer read task (spawned)</text>
+      <text x="641" y="310" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">decode frame → pending.remove(id) → tx.send</text>
+
+      <rect x="810" y="264" width="130" height="66" rx="7" stroke-width="1.5" style="fill:var(--surface);stroke:var(--ink-3)"/>
+      <text x="875" y="290" text-anchor="middle" font-weight="700">ExecAnchor</text>
+      <text x="875" y="310" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">fed by CL sync task</text>
+    </g>
+    <g stroke-width="1.5" fill="none" style="stroke:currentColor">
+      <line x1="150" y1="108" x2="174" y2="108" marker-end="url(#m17-arrow)"/>
+      <line x1="308" y1="108" x2="332" y2="108" marker-end="url(#m17-arrow)"/>
+      <line x1="466" y1="108" x2="490" y2="108" marker-end="url(#m17-arrow)"/>
+      <line x1="782" y1="108" x2="806" y2="108" marker-end="url(#m17-arrow)"/>
+      <line x1="530" y1="154" x2="436" y2="260" marker-end="url(#m17-arrow)"/>
+      <line x1="456" y1="297" x2="496" y2="297" marker-end="url(#m17-arrow)"/>
+      <line x1="717" y1="264" x2="717" y2="158" marker-end="url(#m17-arrow)"/>
+      <line x1="860" y1="264" x2="770" y2="158" marker-end="url(#m17-arrow)"/>
+    </g>
+    <path d="M875,62 C875,14 85,14 85,58" stroke-width="1.3" stroke-dasharray="5 4" fill="none" marker-end="url(#m17-arrow)" style="stroke:var(--ok)"/>
+    <g font-size="10.5" style="fill:var(--ink-3)">
+      <text x="480" y="22" text-anchor="middle" style="fill:var(--ok)">⑧ JSON string back to Kotlin → parsed into AccountProofResult</text>
+      <text x="470" y="212" text-anchor="end">GetAccountRange</text>
+      <text x="476" y="289" text-anchor="middle">reply</text>
+      <text x="710" y="226" text-anchor="end">oneshot: wakes ③</text>
+      <text x="836" y="226">anchored roots</text>
+    </g>
+  </svg>
+  </div>
+  <figcaption>Only the reader's read task and the consensus sync task live on runtime threads. The request itself, including hedging and proof checks, is a future that <code>block_on</code> polls on the caller's own thread, and serialisation happens on that same thread once it returns. The <code>oneshot</code> channel is the hand-off between the two worlds.</figcaption>
+</figure>
+
+<section class="prose">
+  <h3>The steps, with the decision each one makes</h3>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Step</th><th>Where</th><th>What happens</th><th>Memory-model moment</th></tr></thead>
+    <tbody>
+      <tr><td>①</td><td>Java, generated Kotlin</td><td><code>RustChainHandle</code> calls <code>RustEngineNative.nativeRequestAccountJson(handle, address, block)</code>, which calls the generated <code>requestAccountJson</code>; that copies each string into a Rust-allocated <code>RustBuffer</code> (<a href="#stop-17">Stop 17</a> shows exactly how).</td><td>Data crosses the boundary <em>by copy</em>; no Java object is ever borrowed by Rust.</td></tr>
+      <tr><td>②</td><td><a href="#f-myotis-engine-src-ffi-rs">ffi.rs</a> → <a href="#f-myotis-engine-src-host-rs">host.rs</a></td><td>UniFFI's wrapper turns the buffers into owned <code>String</code>s. <code>request_account_json(handle, &amp;address, &amp;block)</code> parses the address and the block selector without panicking (an unknown selector is refused, never ignored); <code>snapshot_reader</code> locks the handle map, clones <code>Arc&lt;ElReader&gt;</code>, and unlocks.</td><td>Owned in, borrowed onward. The lock covers only a reference-count increment, never I/O.</td></tr>
+      <tr><td>③</td><td>host.rs, <a href="#f-myotis-net-src-el-request-rs">request.rs</a>, <a href="#f-myotis-net-src-el-reader-rs">reader.rs</a></td><td><code>engine.rt.block_on(reader.request(async { reader.get_account_pinned(anchor, address, pin).await }))</code>: an <code>Operation</code> with a 90 s budget, registered through a <code>Weak</code>. A head read of an address the reader <em>follows</em> is answered from block access lists (<a href="#f-myotis-net-src-el-activity-rs">activity.rs</a>); anything else goes to <code>get_account_proven</code>, a <code>hedged_read</code> over the snap peers (or one isolated Tor circuit when Tor is on).</td><td>A <em>borrowing</em> async block, fine because <code>block_on</code> waits for it (no <code>'static</code>). Losing attempts are cancelled by being dropped.</td></tr>
+      <tr><td>④</td><td><a href="#f-myotis-net-src-el-peer-rs">peer.rs</a></td><td><code>snap_get_account</code> → <code>request</code>: allocate an id from an atomic, insert <code>(id, oneshot::Sender)</code> into the pending map, write the frame under the writer lock, then await the <code>Receiver</code> with a timeout.</td><td><code>&amp;self</code> everywhere, with interior mutability (a tokio mutex and atomics). A <code>PendingGuard</code> removes the entry if this future is dropped.</td></tr>
+      <tr><td>⑤</td><td>peer.rs (read task)</td><td>The task spawned in <code>ManagedPeer::spawn</code> decodes the response frame, removes the pending entry by id, and sends the payload through the <code>oneshot</code>.</td><td>This task <em>owns</em> the reader half of the connection. Ownership was split at spawn time, so there's no shared socket.</td></tr>
+      <tr><td>⑥</td><td><a href="#f-myotis-wire-src-snap-fetch-rs">myotis-wire snap/fetch.rs</a>, <a href="#f-myotis-core-src-trie-rs">myotis-core trie</a>, <a href="#f-myotis-net-src-el-verify-rs">verify.rs</a>, <a href="#f-myotis-net-src-el-anchor-rs">anchor.rs</a></td><td><code>verify_account</code> (now in <code>myotis-wire</code>) checks the Merkle-Patricia proof for <code>keccak(address)</code> against the state root. <code>verified_state_root</code> ties that root to the beacon chain: <code>stateRootMatch</code> against the <code>ExecAnchor</code>, or a <code>headerChain</code> walk that must end at the attested head and link down by <code>parentHash</code> (<a href="#stop-12">Stop 12</a>).</td><td>Pure functions over borrowed slices (<code>&amp;[u8; 32]</code>, <code>&amp;[Vec&lt;u8&gt;]</code>). The anchor is shared through <code>Arc</code>, written by the <a href="#f-myotis-net-src-sync-rs">sync task</a>, and read here.</td></tr>
+      <tr><td>⑦</td><td><a href="#f-myotis-engine-src-eljson-rs">eljson.rs</a></td><td><code>account_json(&amp;address, &amp;account, …)</code> builds the exact JSON Java expects; a failed verification is still a full result with <code>failReason</code>.</td><td>Borrowed input, owned output: a new <code>String</code> that moves to the caller.</td></tr>
+      <tr><td>⑧</td><td>UniFFI, Java</td><td>The <code>String</code> is lowered into a <code>RustBuffer</code>, and Kotlin copies it and frees the buffer through Rust. Java parses it into <code>AccountProofResult</code>.</td><td>Whoever allocates, frees: the buffer goes back to Rust's allocator (compare <code>myotis_string_free</code> on the C route).</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>The same request, one level down</h3>
+  <x-code src="myotis-net/src/el/peer.rs" from="520" to="597"></x-code>
+  <p class="code-note"><x-tags>async concurrency interior-mutability</x-tags> Read this excerpt as a recap of the whole tour. <code>fetch_add</code> on an atomic, a <code>oneshot</code> channel as a single-use future, a block scoping a tokio mutex guard, a “check <code>closed</code> under the same lock” race fix, an RAII <code>PendingGuard</code> that cleans up when the future is dropped mid-flight, <code>timeout</code> producing a nested <code>Result</code>, and a <code>match</code> that turns every outcome into a <code>Result&lt;Vec&lt;u8&gt;, String&gt;</code>.</p>
+
+  <div class="callout rust">
+    <span class="k">The memory model in five sentences</span>
+    <ul>
+      <li>Every value has <strong>one owner</strong>; assignment and passing by value <em>move</em> it, unless the type is <code>Copy</code>.</li>
+      <li>You can lend a value as <strong>many <code>&amp;T</code> or one <code>&amp;mut T</code></strong>, and lifetimes are how the compiler proves no loan outlives its owner.</li>
+      <li><strong>Sharing</strong> needs a smart pointer (<code>Arc</code>), and <strong>shared mutation</strong> needs interior mutability (<code>Mutex</code>, <code>RwLock</code>, atomics). The lock <em>contains</em> the data.</li>
+      <li><strong>Values are freed when their owner goes out of scope</strong> (<code>Drop</code>). That's how guards unlock, tasks abort, files close and futures cancel.</li>
+      <li>Work handed to another thread or task must <strong>own its data</strong> (<code>Send + 'static</code>); work awaited in place may borrow.</li>
+    </ul>
+  </div>
+  <p>Next, open <a href="#progress">your progress</a>. It lists the concepts you answered weakly and the matching chapters from your EPUBs and from the Rust docs installed with rustup, all of which open offline. Before you close the browser, download your progress file there. Back on the ground, paste the summary (“Copy a summary for Claude”) into a Claude session, and we can go through your weak spots together.</p>
+</section>
+
+<x-quiz>[
+  {"id":"s17-q1","type":"mcq","tags":["async","concurrency"],
+   "q":"During a verified account read from Android, which thread polls the <code>hedged_race</code> future?",
+   "options":["A tokio worker thread, via <code>tokio::spawn</code>","The JVM caller's own thread, inside <code>engine.rt.block_on(…)</code>. Only long-lived tasks such as the peer read loop and the sync loop run on runtime threads","The Android main thread","A new OS thread per request"],
+   "answer":1,
+   "explain":"<code>block_on</code> drives the future on the calling thread, and the runtime's workers deliver I/O events and wake it."},
+  {"id":"s17-q2","type":"mcq","tags":["concurrency","async","smart-pointers"],
+   "q":"How does the response bytes' journey from the peer's read task to the waiting request work?",
+   "options":["Through a shared global buffer","The request inserted a <code>oneshot::Sender</code> into the peer's pending map under its request id. The read task removes that entry and calls <code>send</code>, which completes the <code>Receiver</code> the request is awaiting and wakes it","The read task calls the request function directly","Via a <code>Condvar</code>"],
+   "answer":1,
+   "explain":"A <code>oneshot</code> is a single-use, thread-safe hand-off: an ownership transfer of the payload between tasks."},
+  {"id":"s17-q3","type":"mcq","tags":["ownership","borrowing"],
+   "q":"Which of these is a <em>move</em>, not a borrow or a copy?",
+   "options":["<code>snap_get_account(&amp;root, &amp;address)</code>","<code>ManagedPeer::spawn(session, addr)</code>: the <code>EthSession</code> is handed over, and the old name can't be used afterwards","<code>let n = header.number;</code> for a <code>u64</code>","<code>Arc::clone(&amp;reader)</code>"],
+   "answer":1,
+   "explain":"<code>u64</code> is <code>Copy</code>, <code>Arc::clone</code> creates a new handle (the original stays), and <code>&amp;</code> borrows."},
+  {"id":"s17-q4","type":"mcq","tags":["async","ownership","lifetimes"],
+   "q":"<code>block_on(reader.request(async { reader.get_account(address).await }))</code> borrows <code>reader</code>, but <code>tokio::spawn(async { reader.get_account(address).await })</code> would not compile. Why?",
+   "options":["<code>spawn</code> needs <code>async move</code> only as a matter of style","<code>spawn</code> requires a <code>'static</code> future, because the task may outlive the current stack frame. <code>block_on</code> doesn't return until the future finishes, so borrowing locals is safe","<code>block_on</code> copies <code>reader</code>","<code>get_account</code> isn't <code>Send</code>"],
+   "answer":1,
+   "explain":"The fix for <code>spawn</code> is to move an <code>Arc</code> clone into an <code>async move</code> block."},
+  {"id":"s17-q5","type":"mcq","tags":["interior-mutability","concurrency"],
+   "q":"Which lock would you choose for a map that is updated in microseconds and read from both async and synchronous code, and never held across <code>.await</code>?",
+   "options":["<code>tokio::sync::Mutex</code>","<code>std::sync::Mutex</code> (or <code>RwLock</code>): cheap, usable from synchronous code, and safe in async code as long as the guard is dropped before any <code>.await</code>","No lock; Rust prevents data races automatically","A <code>RefCell</code>"],
+   "answer":1,
+   "explain":"Use a tokio mutex only when the critical section itself must <code>.await</code>. A <code>RefCell</code> isn't <code>Sync</code> and can't be shared between threads."},
+  {"id":"s17-q6","type":"mcq","tags":["error-handling","unsafe-ffi"],
+   "q":"Why does so much of this codebase avoid <code>unwrap()</code>, indexing and unchecked arithmetic on runtime data?",
+   "options":["Performance","The engine is built with <code>panic = \"abort\"</code> and runs inside JVM, iOS and Node hosts. Any panic would kill the host app, so failures must become <code>Option</code>/<code>Result</code> values, sentinels, or <code>{\"error\"}</code> JSON","Those features are deprecated","Clippy forbids them"],
+   "answer":1,
+   "explain":"roost is the one exception: it unwinds, and turns a panic into a supervised restart."},
+  {"id":"s17-q7","type":"mcq","tags":["smart-pointers","async"],
+   "q":"What cancels the losing attempts of a hedged read, and what cancels an in-flight request when a host calls <code>stop</code>?",
+   "options":["Explicit <code>cancel()</code> calls in both cases","Losing attempts are cancelled by being <em>dropped</em> when <code>hedged_race</code> returns. On <code>stop</code>, the shutdown watch flips, and each registered <code>Operation</code>, reached by upgrading its <code>Weak</code>, is signalled and awaited until it settles","Thread interrupts","Garbage collection"],
+   "answer":1,
+   "explain":"In Rust, dropping a future is cancellation. <code>Weak</code> lets the reader track requests without keeping them alive."},
+  {"id":"s17-q8","type":"open","tags":["ownership","borrowing","smart-pointers","interior-mutability"],
+   "q":"In your own words, compare how Java and Rust would each make the handle registry in <code>host.rs</code> (a map from id to chain state, used from many host threads) safe. Name the Rust types involved and what the compiler enforces that Java doesn't.",
+   "model":"In Java you'd use a <code>ConcurrentHashMap</code>, or a <code>HashMap</code> guarded by <code>synchronized</code>. Nothing stops code from touching the map without the lock, and entries are freely aliased references collected by the GC. In Rust the registry is <code>Mutex&lt;HashMap&lt;i64, ChainEntry&gt;&gt;</code> inside a <code>static OnceLock</code>. The data lives <em>inside</em> the mutex, so it can only be reached through the guard, and the guard unlocks when it's dropped (often at the end of a <code>{ }</code> block chosen to keep the critical section tiny). The map entry uniquely owns the <code>SyncHandle</code>. Things that must be used outside the lock (the config, the reader) are <code>Arc</code>s that callers clone out and use after unlocking. Consuming operations such as <code>stop(self)</code> force the code to <code>remove</code> the entry to gain ownership. The compiler enforces that the map is <code>Sync</code> only because of the mutex, that no reference to an entry outlives the guard, and that the moved-out <code>SyncHandle</code> can't be used again.",
+   "points":["Java: ConcurrentHashMap/synchronized, lock discipline by convention, GC-managed aliasing","Rust: static OnceLock + Mutex&lt;HashMap&lt;..&gt;&gt;; data only reachable through the guard","guard drop = unlock; block scopes keep critical sections short","Arc clones carried out of the lock; unique ownership of SyncHandle; remove to consume","compiler enforces Sync, no borrow outliving the guard, no use after move"],
+   "context":"rust/myotis-engine/src/host.rs L59-148 (ChainEntry, EngineState, static ENGINE: OnceLock&lt;Option&lt;EngineState>>), L593-617 spin_up lock scope, L722-763 pause remove/reinsert, L1894-1910 snapshot_reader."},
+  {"id":"s17-q9","type":"mcq","tags":["traits-generics","smart-pointers"],
+   "q":"<code>Arc&lt;LcStore&gt;</code> is passed where <code>Arc&lt;dyn LcResponder&gt;</code> is expected, and <code>RlpxConnection&lt;S&gt;</code> is instantiated with <code>S = DataStream</code>. Which statement is right?",
+   "options":["Both use dynamic dispatch","The first is a trait object (a pointer plus a vtable, resolved at run time). The second is a generic, monomorphised at compile time into specialised code with static calls","Both are resolved at compile time","Both require <code>unsafe</code>"],
+   "answer":1,
+   "explain":"<code>dyn Trait</code> is Rust's equivalent of calling through a Java interface; generics are closer to C++ templates."},
+  {"id":"s17-q10","type":"mcq","tags":["domain"],
+   "q":"Which statement matches the trust model you've seen across the tour?",
+   "options":["Peers are trusted once they complete the RLPx handshake","Nothing a peer says is trusted until it's checked: account and storage data by Merkle-Patricia proofs, state roots and headers by tying them to a beacon block the light client verified with sync-committee BLS signatures, starting from a pinned checkpoint. roost only relays objects that wallets verify themselves","roost is trusted because the project runs it","Local HTTP RPC is used in production for convenience"],
+   "answer":1,
+   "explain":"The only trust anchors are the embedded checkpoint (plus historical accumulators) and sync-committee signatures."}
+]</x-quiz>

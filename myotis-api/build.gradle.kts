@@ -4,7 +4,7 @@
 // :android-app) and the engine (node-core + rpc-backend + consensus + networking +
 // myotis-evm/-ens). The Java engine implements it today; a future Rust/Go engine
 // replaces everything behind it via a thin FFI binding implementing the same
-// interfaces (see docs/reimplementation/). Hosts must consume ONLY these types.
+// interfaces (see docs/spec/). Hosts must consume ONLY these types.
 //
 // HARD RULES for everything in this module (FFI-portability + Android minSdk 29):
 //   - ZERO dependencies. Only java.lang / java.util / plain records, interfaces,

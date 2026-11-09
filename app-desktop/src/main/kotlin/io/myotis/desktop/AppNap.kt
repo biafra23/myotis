@@ -10,7 +10,7 @@ import com.sun.jna.Pointer
  * the background scheduling band (kernel priority 4 — `ps -M -p <pid>` shows `4T`), and
  * on a busy host that turned the Bee PoC into an RPC endpoint that accepted connections
  * seconds late, spent 92 s in one Full GC and tripped Bee's 10-minute postage stall
- * (docs/bee-rpc-service.md, 2026-09-16). The `NSAppSleepDisabled` Info.plist key is
+ * (docs/guides/bee-rpc-service.md, 2026-09-16). The `NSAppSleepDisabled` Info.plist key is
  * ignored by current macOS (measured on 15.7: a bundle carrying it naps exactly like
  * one without), so this uses Apple's in-process mechanism instead — an NSProcessInfo
  * activity held for as long as napping is not allowed — through JNA's Objective-C

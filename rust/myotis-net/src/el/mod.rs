@@ -1,4 +1,4 @@
-//! Execution-layer networking (the EL phase, docs/reimplementation/07).
+//! Execution-layer networking (the EL phase, docs/spec/07).
 //!
 //! Twins of the Java `com.jaeckel.ethp2p.networking` module, arriving PR by
 //! PR: discv4 (EL-A3), RLPx (EL-A4), eth/66-69 (EL-A5), snap/1 (EL-A6);
@@ -27,7 +27,7 @@ pub mod request;
 mod tasks;
 pub mod receipt;
 pub mod rlpx;
-/// Tor transport for the verified-read path (docs/privacy-and-tor.md). Only
+/// Tor transport for the verified-read path (docs/how-it-works/privacy-and-tor.md). Only
 /// compiled with `--features tor`; a no-op absence otherwise.
 #[cfg(feature = "tor")]
 pub mod tor;

@@ -1,0 +1,389 @@
+<!--meta {"id":"stop-19","num":19,"title":"myotis-rpcd: a JSON-RPC daemon in Rust","short":"rpcd · JSON-RPC","sub":"8 files · 5,176 lines","part":"Boundaries & binaries"} -->
+<header class="stop-head">
+  <div class="eyebrow">Stop 19 · crate <code>myotis-rpcd</code> <span>8 files · 5,176 lines · about 155 minutes</span></div>
+  <h1>myotis-rpcd: a JSON-RPC daemon in Rust</h1>
+  <p class="lede">A new crate since September, and a <em>binary</em> crate: one executable that links the engine as a library and answers standard Ethereum JSON-RPC over HTTP, with no JVM and no upstream RPC to fall back on. It exists for hosts that only need a local endpoint: a server, a Raspberry Pi, a container, or a Swarm Bee node. Every answer is one the engine verified; anything it cannot verify is an error. The design is deliberately synchronous: the engine owns its tokio runtime and every read is a blocking call, so the daemon is a blocking HTTP server with two thread pools in front of a router that ports the strict path of the Kotlin <code>RpcRouter</code>.</p>
+</header>
+
+<div class="learn">
+  <h2>Rust you will practise</h2>
+  <div><b>A binary crate</b><code>main.rs</code> + <code>mod</code> files, clap's derive macros, <code>Result&lt;(), String&gt;</code> and <code>?</code> with <code>From</code>, <code>#[cfg(unix)]</code>/<code>#[cfg(windows)]</code>, and a drop guard that stops the engine on every exit path.</div>
+  <div><b>Threads and channels</b><code>Arc</code>, a bounded <code>mpsc::sync_channel</code> shared through <code>Arc&lt;Mutex&lt;Receiver&gt;&gt;</code>, <code>try_send</code> giving the value back, atomics, and <code>Cell</code> for per-request state that never leaves its thread.</div>
+  <div><b>Traits as seams</b>A <code>Send + Sync</code> <code>Engine</code> trait with a real and a fake implementation, a generic <code>Router&lt;E: Engine&gt;</code>, a <code>Read</code> decorator, a <code>Fail</code> enum mapped to error codes in one place, and checked arithmetic over attacker-controlled bytes.</div>
+</div>
+
+<figure class="diagram">
+  <div class="svg-wrap">
+  <svg class="wide-diagram" viewBox="0 0 960 290" role="img" fill="currentColor" xmlns="http://www.w3.org/2000/svg"
+       aria-label="A request through myotis-rpcd. An HTTP client sends a request. One of four intake threads checks the Host and Content-Type headers and parses the body; a large or chunked body is first received on a body-reader thread with a deadline. A body that names only non-blocking methods is answered by the router on the intake thread. A body that names a gated method is sent through a bounded channel to one of the read workers; if the channel is full the request is refused with 503. A read worker runs the router, which holds the request until the node is ready or the ready-wait budget runs out, then calls the engine's blocking ffi functions.">
+    <defs>
+      <marker id="m-rpcd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+      </marker>
+    </defs>
+    <g font-size="12">
+      <rect x="20" y="40" width="150" height="56" rx="8" stroke-width="1.5" style="fill:var(--surface);stroke:var(--ink-3)"/>
+      <text x="95" y="64" text-anchor="middle" font-weight="700">HTTP client</text>
+      <text x="95" y="82" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">POST / · GET / · GET /logindex</text>
+
+      <rect x="215" y="40" width="185" height="56" rx="8" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="307" y="64" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">intake ×4</text>
+      <text x="307" y="82" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">Host · Content-Type · Body::parse</text>
+
+      <rect x="215" y="200" width="185" height="56" rx="8" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)"/>
+      <text x="307" y="224" text-anchor="middle" font-weight="700">body reader</text>
+      <text x="307" y="242" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">&gt; 1 KiB or chunked · deadline</text>
+
+      <rect x="450" y="40" width="200" height="56" rx="8" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="550" y="64" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">Router (on intake)</text>
+      <text x="550" y="82" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">config · status · malformed</text>
+
+      <rect x="450" y="135" width="200" height="56" rx="8" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)"/>
+      <text x="550" y="159" text-anchor="middle" font-weight="700">sync_channel(queue)</text>
+      <text x="550" y="177" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">full → 503 "server busy"</text>
+
+      <rect x="700" y="135" width="240" height="56" rx="8" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="820" y="159" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">read workers ×16</text>
+      <text x="820" y="177" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">Router: hold ≤ --ready-wait, then read</text>
+
+      <rect x="700" y="40" width="240" height="56" rx="8" stroke-width="1.5" style="fill:var(--jvm-wash);stroke:var(--jvm)"/>
+      <text x="820" y="64" text-anchor="middle" font-weight="700" style="fill:var(--jvm-ink)">myotis_engine::ffi</text>
+      <text x="820" y="82" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">blocking reads → host.rs → block_on</text>
+    </g>
+    <g stroke-width="1.5" fill="none" style="stroke:currentColor">
+      <line x1="170" y1="68" x2="211" y2="68" marker-end="url(#m-rpcd-arrow)"/>
+      <line x1="290" y1="96" x2="290" y2="196" marker-end="url(#m-rpcd-arrow)"/>
+      <line x1="400" y1="68" x2="446" y2="68" marker-end="url(#m-rpcd-arrow)"/>
+      <line x1="400" y1="88" x2="446" y2="150" marker-end="url(#m-rpcd-arrow)"/>
+      <line x1="400" y1="228" x2="446" y2="178" marker-end="url(#m-rpcd-arrow)"/>
+      <line x1="650" y1="163" x2="696" y2="163" marker-end="url(#m-rpcd-arrow)"/>
+      <line x1="820" y1="135" x2="820" y2="100" marker-end="url(#m-rpcd-arrow)"/>
+    </g>
+    <line x1="650" y1="60" x2="696" y2="60" stroke-width="1.3" stroke-dasharray="5 4" marker-end="url(#m-rpcd-arrow)" style="stroke:var(--ink-3)"/>
+    <g font-size="10.5" style="fill:var(--ink-3)">
+      <text x="300" y="150">large body</text>
+      <text x="655" y="52">status only</text>
+      <text x="408" y="128">gated</text>
+      <text x="408" y="62">non-blocking</text>
+    </g>
+  </svg>
+  </div>
+  <figcaption>Two pools, so a health check never waits behind a read that is held for a verified head. Intake never reads from a client's socket; the read pool's size bounds concurrent engine reads, and the channel bounds how many more may wait.</figcaption>
+</figure>
+
+<section class="prose">
+  <h2>The crate at a glance</h2>
+  <p>There is no <code>lib.rs</code>: a package with only <code>src/main.rs</code> is a binary crate, and <code>cargo build -p myotis-rpcd --release</code> produces <code>target/release/myotis-rpcd</code>. The six <code>mod</code> lines at the top of <code>main.rs</code> pull in the other files; <code>rpc.rs</code> in turn declares <code>mod tests;</code>, whose source lives at <code>rpc/tests.rs</code> (the Rust 2018 layout: a module <code>rpc</code> may keep its children in a directory named after it, with no <code>mod.rs</code>). Being a workspace member, the binary inherits the workspace release profile, including <code>panic = "abort"</code>: a panic ends the process, and the data dir resumes on restart.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>File</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td><a href="#f-myotis-rpcd-src-main-rs">main.rs</a></td><td>CLI flags, startup order, the engine handle and its stop guard, signals, the log-drain and log-index threads.</td></tr>
+      <tr><td><a href="#f-myotis-rpcd-src-engine-rs">engine.rs</a></td><td>The <code>Engine</code> trait (the router's view of the engine), the real <code>FfiEngine</code>, and <code>Readiness</code>.</td></tr>
+      <tr><td><a href="#f-myotis-rpcd-src-http-rs">http.rs</a></td><td>tiny_http, the intake and read pools, Host and Content-Type checks, body limits and deadlines.</td></tr>
+      <tr><td><a href="#f-myotis-rpcd-src-rpc-rs">rpc.rs</a></td><td>The JSON-RPC router: envelopes, batches, the method table, parameter parsing, engine-JSON reading, error codes.</td></tr>
+      <tr><td><a href="#f-myotis-rpcd-src-quantity-rs">quantity.rs</a></td><td>QUANTITY and DATA hex encoding, 256-bit decimal ↔ hex without a bignum crate.</td></tr>
+      <tr><td><a href="#f-myotis-rpcd-src-checkpoint-rs">checkpoint.rs</a></td><td><code>--checkpoint-root/--checkpoint-slot</code> and the data dir's anchor marker.</td></tr>
+      <tr><td><a href="#f-myotis-rpcd-src-seeds-rs">seeds.rs</a></td><td><code>--boot-enodes</code>: parse the list, push it to the engine, quote its refusal.</td></tr>
+      <tr><td><a href="#f-myotis-rpcd-src-rpc-tests-rs">rpc/tests.rs</a></td><td>30 router tests against a recorded <code>Fake</code> engine.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="prose">
+  <h2>Cargo.toml: five dependencies</h2>
+  <p>Five dependencies, each with a comment that says why. The engine comes in as an ordinary path dependency (an rlib), so the daemon calls its functions directly as Rust: the <code>ffi</code> module's (which also carry <code>#[uniffi::export]</code> for the JVM hosts) and two <code>capi</code> ones. Nothing crosses a language boundary.</p>
+  <x-code src="myotis-rpcd/Cargo.toml" from="9" to="29" lang="toml"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo</x-tags> <strong>No HTTP framework and no async runtime.</strong> <code>tiny_http</code> is a small blocking HTTP/1.1 server: you call <code>server.recv()</code> and get a <code>Request</code>, and you answer it with <code>request.respond(response)</code>. The comment states the reasoning: every engine read blocks, so a fixed worker pool over a synchronous server is the whole design. The <code>http.rs</code> module doc adds that an async server "would only add a second runtime whose every handler is <code>spawn_blocking</code> around the same calls".</li>
+    <li><x-tags>modules-cargo cli</x-tags> <strong>Feature selection to keep the lock file small.</strong> <code>clap</code> is already in the lock through uniffi, so it costs nothing new, but its default <code>color</code> feature would add six crates, so <code>default-features = false</code> and an explicit feature list. <code>signal-hook</code> gets only <code>iterator</code>, which exists only off Windows. <code>serde</code> is listed only for <code>IgnoredAny</code> (see the call log in rpc.rs).</li>
+  </ul>
+</section>
+
+<x-file path="rust/myotis-rpcd/src/main.rs" kind="binary entry point">
+  <p class="purpose">Parses the command line, checks every input before the engine starts, creates one engine handle for one network, starts the HTTP pools, and waits for SIGINT or SIGTERM. "One engine handle per process": a second network is a second daemon on another port.</p>
+  <x-code src="myotis-rpcd/src/main.rs" from="31" to="48"></x-code>
+  <ul class="concepts">
+    <li><x-tags>macros cli</x-tags> <strong>clap's derive.</strong> <code>#[derive(Parser)]</code> generates the argument parser from the struct. Each field becomes a flag (<code>data_dir</code> → <code>--data-dir</code>), its <code>///</code> doc comment becomes the help text, and its type decides the parsing: <code>Option&lt;PathBuf&gt;</code> is an optional flag, <code>bool</code> a switch, <code>Vec&lt;PathBuf&gt;</code> a repeatable one, <code>Option&lt;SocketAddr&gt;</code> is parsed with <code>SocketAddr</code>'s <code>FromStr</code>. <code>value_parser = [...]</code> restricts the value to a list. Compare picocli's annotations, except that the code is generated at compile time.</li>
+    <li><x-tags>cli</x-tags> <code>Args::parse()</code> in <code>main</code> exits the process with a usage message on a bad command line, so <code>run</code> only ever sees valid flag syntax. Cross-flag rules are declared too: <code>--checkpoint-root</code> and <code>--checkpoint-slot</code> each <code>requires</code> the other, and <code>--import-log-index</code> requires <code>--log-index-config</code>.</li>
+  </ul>
+
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Flag</th><th>Default</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>--network</code></td><td>gnosis</td><td>gnosis, mainnet, sepolia or chiado.</td></tr>
+      <tr><td><code>--data-dir</code></td><td><code>$HOME/.local/share/myotis-rpcd/&lt;net&gt;</code></td><td>Engine state (sync anchor, peers, log index).</td></tr>
+      <tr><td><code>--listen</code></td><td>127.0.0.1 on the catalog's <code>defaultRpcPort</code></td><td>8545 mainnet, 8546 gnosis, 8547 sepolia, 8548 chiado.</td></tr>
+      <tr><td><code>--http-vhosts</code></td><td>localhost, 127.0.0.1, [::1], the listen address</td><td>Host-header allowlist; a list replaces it, <code>*</code> disables it.</td></tr>
+      <tr><td><code>--workers</code> / <code>--http-queue</code></td><td>16 / 2 × workers</td><td>Concurrent engine reads / how many more may wait.</td></tr>
+      <tr><td><code>--ready-wait</code></td><td>90 s</td><td>How long a read (or a batch) is held for readiness.</td></tr>
+      <tr><td><code>--http-body-timeout</code></td><td>10 s</td><td>Time to receive a large body, else 408.</td></tr>
+      <tr><td><code>--checkpoint-root</code> + <code>--checkpoint-slot</code></td><td>none</td><td>Bootstrap from an operator-supplied anchor.</td></tr>
+      <tr><td><code>--accept-stale-anchor</code>, <code>--ws-bound-periods</code></td><td>off / network default</td><td>Trust decisions past the weak-subjectivity bound, this run only.</td></tr>
+      <tr><td><code>--boot-enodes</code></td><td>none</td><td>EL peers to dial at start: a comma list or <code>@FILE</code>.</td></tr>
+      <tr><td><code>--log-index-config</code>, <code>--import-log-index</code></td><td>none</td><td>Enables <code>eth_getLogs</code>; imports seed snapshots.</td></tr>
+      <tr><td><code>--log-calls FILE</code>, <code>--access-log</code></td><td>off</td><td>One JSON line per request / one stderr line per request.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Startup: check everything first</h4>
+  <p><code>run</code> returns <code>Result&lt;(), String&gt;</code>. Before any flag is used it calls <code>ffi::engine_init()</code> and compares the result with <code>myotis_engine::ABI_VERSION</code>; the engine is linked statically, so a mismatch means a broken build. It then turns on EIP-1459 DNS discovery (the daemon, like the JVM daemon, may use the system resolver), resolves the network name, and reads the chain id and the default port from the engine's network catalog JSON.</p>
+  <x-code src="myotis-rpcd/src/main.rs" from="184" to="199"></x-code>
+  <ul class="concepts">
+    <li><x-tags>iterators-closures error-handling</x-tags> <strong><code>collect::&lt;Result&lt;Vec&lt;_&gt;, _&gt;&gt;()?</code></strong> turns an iterator of <code>Result</code>s into one <code>Result</code>: all <code>Ok</code> gives the vector, the first <code>Err</code> stops the iteration and is returned. Java streams have no direct equivalent; you would collect and then check.</li>
+    <li><x-tags>enums-patterns error-handling</x-tags> <strong><code>.as_deref().map(seeds::load).transpose()?</code></strong>: <code>as_deref</code> turns <code>&amp;Option&lt;String&gt;</code> into <code>Option&lt;&amp;str&gt;</code> without moving the string out of <code>args</code>; <code>map</code> gives <code>Option&lt;Result&lt;Vec&lt;String&gt;, String&gt;&gt;</code>; <code>transpose</code> flips it to <code>Result&lt;Option&lt;…&gt;, …&gt;</code>, so <code>?</code> can return the error and leave <code>None</code> when the flag is absent.</li>
+    <li><x-tags>error-handling</x-tags> The server is bound right after this (line 203), before the engine starts, "so a taken port fails in milliseconds". The same idea runs through the whole function: a typo must not cost a started engine handle.</li>
+  </ul>
+
+  <x-code src="myotis-rpcd/src/main.rs" from="206" to="256"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns</x-tags> <strong>Matching on a tuple and on sentinels.</strong> <code>match (&amp;args.checkpoint_root, args.checkpoint_slot)</code> takes the two flags apart together; the arm <code>(None, None) if bound.is_some()</code> adds a guard. On the handle, <code>-3 if checkpoint.is_some()</code> and a second <code>-3</code> arm give the same sentinel two messages, and <code>h if h &lt; 1</code> binds any other negative value. The engine's negative handles are the C ABI's in-band errors (<a href="#stop-16">Stop 16</a>); here they become readable messages.</li>
+    <li><x-tags>error-handling</x-tags> <code>bound.expect("guarded")</code> cannot fail because the guard just checked <code>is_some()</code>; <code>expect</code> documents that reasoning in the panic message.</li>
+    <li><x-tags>ownership smart-pointers</x-tags> <strong><code>StopOnDrop(handle)</code></strong> is a drop guard (below): from this line on, every <code>return Err(…)</code> and every <code>?</code> drops <code>guard</code>, which stops the handle and lets it persist its sync state.</li>
+  </ul>
+  <p>The rest of <code>run</code> (lines 257–304) applies the trust overrides, pushes the boot enodes <em>before</em> <code>start_handle</code> (the engine stashes them and dials once its EL pool is up), starts a thread that pumps the engine's log ring to stderr every 500 ms, starts a thread that retries the log-index config every 2 s until the EL reader accepts it, and builds the router with chained builder calls (<code>Router::new(…).with_ready_wait(…).with_access_log(…)</code>, each taking <code>self</code> by value and returning it).</p>
+  <x-code src="myotis-rpcd/src/main.rs" from="306" to="319"></x-code>
+  <x-code src="myotis-rpcd/src/main.rs" from="353" to="360"></x-code>
+  <ul class="concepts">
+    <li><x-tags>concurrency</x-tags> <strong>Shutdown.</strong> tiny_http's <code>unblock()</code> wakes <em>one</em> thread waiting in <code>recv()</code>, so it is called once per intake thread (<code>http::spawn</code> returns that count). Read workers still inside an engine call are not waited for: when <code>run</code> returns, <code>main</code> returns and the process exits, ending every thread.</li>
+    <li><x-tags>smart-pointers ownership</x-tags> <code>drop(guard)</code> runs <code>StopOnDrop::drop</code> now rather than at the closing brace, so the handle is stopped before the final log flush. <code>struct StopOnDrop(i64)</code> is a tuple struct; <code>self.0</code> is its field.</li>
+    <li><x-tags>cli error-handling</x-tags> In <code>main</code> (lines 129–140), an error prints the engine's remaining log lines and then the message, and calls <code>std::process::exit(1)</code>. <code>exit</code> does not run destructors of values still alive, but by then <code>run</code> has returned and its guard has already stopped the handle.</li>
+    <li><x-tags>modules-cargo</x-tags> <code>wait_for_stop_signal</code> exists twice, under <code>#[cfg(unix)]</code> (signal-hook's blocking iterator) and <code>#[cfg(windows)]</code> (a flag polled every 100 ms). Only one is compiled for any target, so both can have the same name.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/myotis-rpcd/src/engine.rs" kind="library module">
+  <p class="purpose">The seam between the router and the engine. The <code>Engine</code> trait lists what the router asks: strings in, the engine's JSON strings out. <code>FfiEngine</code> implements it over one engine handle; the tests implement it with a recorded fake, so the whole router can be tested without a running light client. <code>Readiness</code> reads the status JSON and decides whether a read should wait.</p>
+  <x-code src="myotis-rpcd/src/engine.rs" from="15" to="62"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics concurrency</x-tags> <strong><code>trait Engine: Send + Sync</code></strong> declares supertraits: any implementation must be safe to move to another thread (<code>Send</code>) and to use from several threads at once through a shared reference (<code>Sync</code>). The router is shared through an <code>Arc</code> by the intake threads, the read workers and the body readers, so it needs both, and it can only have them if its engine does. In Java terms every method of the interface must be thread-safe, but here the compiler checks it.</li>
+    <li><x-tags>borrowing</x-tags> Every method takes <code>&amp;self</code> and <code>&amp;str</code> arguments: the router lends its strings and keeps them. <code>#[allow(clippy::too_many_arguments)]</code> silences one lint for one method.</li>
+  </ul>
+  <x-code src="myotis-rpcd/src/engine.rs" from="102" to="119"></x-code>
+  <p class="code-note"><x-tags>domain</x-tags> <strong>The JVM host's <code>readyForReads</code>, ported.</strong> Ready means SYNCED, a verified head, and at least one pooled peer that can actually serve at it (<code>snapServingPeers</code>, not <code>snapPeers</code>: a pool of still-syncing peers can keep the latter positive for hours, #465). Two states say "ready" for a different reason: a running handle with no EL reader, or one parked in <code>STALE_ANCHOR</code>. Waiting cannot change either, so the read goes ahead and the engine's own refusal is the answer. <code>Readiness::parse</code> (lines 81–100) uses <code>unwrap_or_default()</code> on the JSON parse, so garbage reads as "not running", never as ready.</p>
+  <p><x-tags>ownership bytes-strings</x-tags> The <code>impl Engine for FfiEngine</code> (lines 121–217) is one line per method, for example <code>ffi::request_account_json(self.handle, address.into(), block.into())</code>. The <code>ffi</code> functions take <code>String</code> by value (the UniFFI convention), so each <code>.into()</code> allocates an owned copy of the borrowed <code>&amp;str</code>. That copy is the price of reusing the JVM-facing surface; it is negligible next to a network read.</p>
+</x-file>
+
+<x-file path="rust/myotis-rpcd/src/http.rs" kind="library module">
+  <p class="purpose">The HTTP side: a tiny_http server, four intake threads that accept and classify every request, and <code>--workers</code> read threads that serve the bodies naming a gated method. It also enforces geth's browser protections (the Host allowlist and the JSON Content-Type rule), the body limits, and a receive deadline for large bodies, so that no client can hold an intake thread.</p>
+  <x-code src="myotis-rpcd/src/http.rs" from="73" to="94"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain</x-tags> <strong>DNS rebinding.</strong> A web page can make its own domain resolve to 127.0.0.1 and then send requests to the node from the operator's browser. The browser still sends the page's domain in the <code>Host</code> header, so an allowlist of local names refuses it with 403. A missing Host header passes, as in geth, because every browser sends one. The Content-Type rule (<code>json_content_type</code>, lines 99–109) closes the other door: the cross-origin POSTs a page may send without a CORS preflight are forms and <code>text/plain</code>, and those are refused with 415.</li>
+    <li><x-tags>enums-patterns bytes-strings</x-tags> <code>match (self, host)</code> matches on a tuple, and <code>(VHosts::Any, _) | (_, None) =&gt; true</code> joins two patterns with <code>|</code>. In <code>host_name</code>, <code>&amp;h[..=i]</code> slices up to and including the <code>]</code> of an IPv6 literal; <code>rsplit_once(':')</code> splits at the last colon. Both return borrowed slices, and only <code>to_ascii_lowercase</code> allocates.</li>
+  </ul>
+
+  <h4>Two pools</h4>
+  <x-code src="myotis-rpcd/src/http.rs" from="153" to="193"></x-code>
+  <ul class="concepts">
+    <li><x-tags>concurrency smart-pointers</x-tags> <strong>A bounded channel with many consumers.</strong> <code>mpsc::sync_channel(n)</code> is a channel with room for <code>n</code> messages, like a <code>ArrayBlockingQueue</code>. Its <code>Receiver</code> can't be cloned or shared (it is not <code>Sync</code>), so the workers share it as <code>Arc&lt;Mutex&lt;Receiver&gt;&gt;</code>: one worker at a time holds the lock while it waits in <code>recv()</code>, and the guard is dropped once a request arrives, before the request is served. It is the same design as the thread pool in the final project of the Rust book.</li>
+    <li><x-tags>ownership concurrency</x-tags> <code>let (rx, router) = (rx.clone(), router.clone());</code> clones the two <code>Arc</code>s (a reference-count increment, not a copy of the data) <em>before</em> the <code>move</code> closure, so each thread owns its own handles and the originals stay usable for the next iteration. The same pattern feeds the intake threads.</li>
+    <li><x-tags>enums-patterns</x-tags> <code>let Ok((req, body)) = next else { return };</code> ends the worker when the channel is closed. <code>std::thread::spawn(move || loop { … })</code> is a closure whose whole body is a <code>loop</code> expression.</li>
+  </ul>
+  <x-code src="myotis-rpcd/src/http.rs" from="197" to="222"></x-code>
+  <p class="code-note"><x-tags>concurrency</x-tags> <strong>Never read from a client's socket on intake.</strong> tiny_http has already buffered a small body (up to 1 KiB with a Content-Length and no <code>Expect</code>; <code>body_in_memory</code>, lines 226–236). Any other body may trickle in for as long as the client likes, so it is received on a thread of its own. <code>fetch_add</code> returns the value <em>before</em> the increment, so at most <code>MAX_BODY_READS</code> (32) bodies are being received at once; past that the request is answered 503. The decrement comes after <code>respond</code>, which also drops and drains the request.</p>
+
+  <x-code src="myotis-rpcd/src/http.rs" from="238" to="287"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns</x-tags> <code>match req.method()</code> with guards: <code>tiny_http::Method::Get if req.url() == "/"</code> matches only when both hold, and the arms are tried in order, so the Content-Type refusal arm comes before the general <code>Post</code> arm.</li>
+    <li><x-tags>ownership concurrency</x-tags> <strong><code>try_send</code> gives the value back.</strong> Sending moves <code>(req, body)</code> into the channel. When the channel is full, the error <code>TrySendError::Full((req, body))</code> returns ownership of both, so the request can still be answered with 503 and an error per request in the body. Nothing is dropped unanswered, and the compiler would not let you use <code>req</code> after a successful send.</li>
+    <li><x-tags>domain</x-tags> <code>Body::parse</code> parses the JSON once; <code>body.blocking()</code> decides which pool answers it, and the router later serves the same parse (<code>handle_parsed(body)</code>), so the body is never parsed twice.</li>
+  </ul>
+  <x-code src="myotis-rpcd/src/http.rs" from="301" to="319"></x-code>
+  <p class="code-note"><x-tags>traits-generics</x-tags> <strong>A <code>Read</code> decorator.</strong> <code>impl&lt;R: Read&gt; Read for Deadline&lt;R&gt;</code> wraps any reader, like a Java <code>FilterInputStream</code>, and fails with <code>TimedOut</code> once the deadline has passed. Implementing the one required method <code>read</code> is enough: <code>read_to_string</code> is a provided method of the trait, built on top of it. In <code>read_body</code> (lines 321–349) it wraps <code>req.as_reader().take(MAX_BODY_BYTES + 1)</code>; reading one byte more than the limit is how a body that is too large is detected (413). As the doc comment says, the check runs only before each read, so a client that stops sending entirely still holds its body thread, but never an intake thread.</p>
+  <p><x-tags>testing</x-tags> The seven tests (lines 402–704) include four that start a real server on <code>127.0.0.1:0</code> (the OS picks a free port) and speak raw HTTP over a <code>TcpStream</code>: a health check answers while the only read worker is held; foreign hosts get 403 and non-JSON posts 415; a full queue gets 503 with one error per request that has an id; and six clients stalled mid-body do not block <code>GET /</code>, then get 408.</p>
+</x-file>
+
+<x-file path="rust/myotis-rpcd/src/rpc.rs" kind="library module" twin="RpcRouter">
+  <p class="purpose">The JSON-RPC router: a port of the strict (no-proxy) path of the Kotlin <code>RpcRouter</code> in <code>jsonrpc-server</code>, with the engine-JSON reading of the Rust-engine adapters (<code>IosRpcBackend</code>, <code>RustVerifiedReads</code>) folded in. A request is answered from the engine's verified surface or refused. It handles envelopes and batches, the readiness hold, the method table, every parameter, and the mapping from engine JSON to results and error codes.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–28</td><td>Module doc: the four error codes a client acts on. Imports.</td></tr>
+      <tr><td>30–122</td><td>Limits (batch 1000, window 64/16, fee history 1024/100, poll 250 ms), <code>NON_BLOCKING</code>, <code>gated</code>, the override and transaction field lists, and <code>arity</code>: the method table.</td></tr>
+      <tr><td>124–150</td><td><code>enum Fail</code>, <code>type Out</code>, <code>invalid</code>.</td></tr>
+      <tr><td>152–192</td><td><code>ReportedHeads</code>: heads this node answered <code>eth_blockNumber</code> with in the last 15 minutes.</td></tr>
+      <tr><td>194–322</td><td><code>Router</code>, <code>Budget</code>, <code>Gate</code>, <code>Body</code> (parse, <code>blocking</code>, <code>refusal</code>), <code>Logged</code>, <code>Takes</code>, <code>Selector</code>, <code>TxArgs</code>, <code>OverrideParam</code>.</td></tr>
+      <tr><td>324–501</td><td>Builder methods; <code>handle_parsed</code> (single object, batches, their limits); <code>handle_one</code> (envelope rules, dispatch, access and call logs, notifications).</td></tr>
+      <tr><td>503–571</td><td><code>fail_parts</code> (Fail → code and message), <code>ready</code>, <code>engine_ready</code> (the hold).</td></tr>
+      <tr><td>573–857</td><td><code>dispatch</code>: one arm per method.</td></tr>
+      <tr><td>859–969</td><td><code>eth_call</code>, <code>eth_estimate_gas</code>, <code>eth_create_access_list</code>, <code>check_chain_id</code>.</td></tr>
+      <tr><td>971–1099</td><td>Block pins: <code>resolve_hash</code> (#641), <code>pin_servable</code>, <code>in_window</code>, <code>account</code>.</td></tr>
+      <tr><td>1101–1137</td><td><code>OVERRIDE_UNSUPPORTED</code>, <code>Account</code>, <code>parse_account</code> (fails closed on shape drift).</td></tr>
+      <tr><td>1139–1361</td><td>Engine JSON reading: error envelopes, <code>engine_object</code>, <code>verified</code>, <code>tri_state</code>, <code>call_outcome</code>, <code>non_answer</code>, <code>access_list_outcome</code>, revert decoding.</td></tr>
+      <tr><td>1363–1852</td><td>Parameter reading: addresses, hashes, data, flags, storage words and keys, <code>parse_selector</code>, fee history, state and block overrides, <code>parse_tx</code>.</td></tr>
+      <tr><td>1854–1977</td><td>Envelopes, the <code>--log-calls</code> line, <code>shorten</code>, FNV-64, an ISO timestamp without a date library.</td></tr>
+      <tr><td>1979–1980</td><td><code>#[cfg(test)] pub(crate) mod tests;</code> → <code>rpc/tests.rs</code>.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The method table and the error codes</h4>
+  <x-code src="myotis-rpcd/src/rpc.rs" from="88" to="122"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns</x-tags> <strong><code>match</code> is an expression.</strong> <code>Some(match method { … })</code> wraps whatever the arms produce, and the last arm <code>_ =&gt; return None</code> leaves the function early instead. Arms join string patterns with <code>|</code>. One function answers two questions: "is this method served?" (<code>Some</code>) and "how many positional arguments may it take?".</li>
+    <li><x-tags>domain</x-tags> <strong>Too many arguments is an error, not a detail.</strong> <code>dispatch</code> refuses a request with more <code>params</code> than this, and a <code>params</code> that is neither absent, <code>null</code> nor an array. An extra argument the server dropped would answer a question the client did not ask. The doc and the comment on line 113 disagree slightly: <code>eth_createAccessList</code> takes a third argument (state overrides) that geth does not take, so there a request geth would refuse is served with the override applied.</li>
+  </ul>
+  <p><code>gated(method)</code> (lines 59–63) is "served and not in <code>NON_BLOCKING</code>". The seven non-blocking methods are <code>eth_chainId</code>, <code>net_version</code>, <code>web3_clientVersion</code>, <code>eth_accounts</code>, <code>net_listening</code>, <code>eth_syncing</code> and <code>myotis_status</code>: config and the status snapshot. Everything else may be held for readiness.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Method</th><th>Max args</th><th>Engine call</th></tr></thead>
+    <tbody>
+      <tr><td><code>eth_chainId</code>, <code>net_version</code>, <code>web3_clientVersion</code>, <code>eth_accounts</code>, <code>net_listening</code></td><td>0</td><td>none (config; <code>eth_accounts</code> is always <code>[]</code>)</td></tr>
+      <tr><td><code>eth_syncing</code>, <code>myotis_status</code></td><td>0</td><td><code>status_json</code></td></tr>
+      <tr><td><code>eth_blockNumber</code></td><td>0</td><td><code>head_block_number</code> (status), recorded in <code>ReportedHeads</code></td></tr>
+      <tr><td><code>eth_gasPrice</code>, <code>eth_maxPriorityFeePerGas</code></td><td>0</td><td><code>fee_estimate</code></td></tr>
+      <tr><td><code>eth_getBalance</code>, <code>eth_getTransactionCount</code></td><td>2</td><td><code>request_account</code> (+ <code>pending_nonce_overlay</code> for <code>pending</code>)</td></tr>
+      <tr><td><code>eth_getCode</code> / <code>eth_getStorageAt</code> / <code>eth_getProof</code></td><td>2 / 3 / 3</td><td><code>get_code</code> / <code>get_storage_at</code> / <code>get_proof</code></td></tr>
+      <tr><td><code>eth_call</code></td><td>4</td><td><code>eth_call</code>, <code>eth_call_overrides</code> or <code>eth_call_tx</code></td></tr>
+      <tr><td><code>eth_estimateGas</code> / <code>eth_createAccessList</code></td><td>4 / 3</td><td><code>estimate_gas_tx</code> / <code>create_access_list</code></td></tr>
+      <tr><td><code>eth_feeHistory</code></td><td>3</td><td><code>fee_history</code></td></tr>
+      <tr><td><code>eth_getBlockByNumber</code>, <code>eth_getBlockByHash</code>, <code>eth_getBlockReceipts</code></td><td>2, 2, 1</td><td><code>block_by_number</code>, <code>block_by_hash</code>, <code>block_receipts</code></td></tr>
+      <tr><td><code>eth_getTransactionReceipt</code>, <code>eth_getTransactionByHash</code></td><td>1</td><td><code>transaction_receipt</code>, <code>transaction_by_hash</code></td></tr>
+      <tr><td><code>eth_sendRawTransaction</code></td><td>1</td><td><code>ffi::check_raw_transaction_json</code> (no handle), then <code>send_raw_transaction</code></td></tr>
+      <tr><td><code>eth_getLogs</code></td><td>1</td><td><code>get_logs</code> (needs <code>--log-index-config</code>)</td></tr>
+      <tr><td>a block hash as selector (state reads, calls)</td><td></td><td><code>resolve_block_hash</code> first, then served as that number</td></tr>
+      <tr><td>anything else</td><td></td><td>none: <code>-32601</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <x-code src="myotis-rpcd/src/rpc.rs" from="124" to="150"></x-code>
+  <x-code src="myotis-rpcd/src/rpc.rs" from="503" to="538"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns error-handling</x-tags> <strong>An error enum, mapped in one place.</strong> Handlers return <code>Result&lt;String, Fail&gt;</code> (aliased <code>Out</code>), where <code>Ok</code> is the raw JSON of the result. They only say what happened; <code>fail_parts</code> decides the code and the wording. Variants can carry data, unlike a Java enum: <code>Invalid(String)</code> is a tuple variant, <code>Rpc { code, message, data }</code> a struct variant, <code>Unsupported</code> a unit variant. The <code>match</code> must cover all five, so adding a sixth breaks the build until it is mapped.</li>
+    <li><x-tags>ownership</x-tags> <code>fail_parts(&amp;self, method: &amp;str, fail: Fail)</code> takes the <code>Fail</code> by value, so <code>Fail::Invalid(why) =&gt; (-32602, why, None)</code> moves the <code>String</code> out of the enum into the tuple without copying it.</li>
+    <li><x-tags>domain</x-tags> <strong>A STALE_ANCHOR park gets its own message</strong>, because unlike "not synced" it will not resolve itself: a human must raise the bound or accept the risk.</li>
+    <li><x-tags>error-handling</x-tags> <code>invalid&lt;T&gt;(why: impl Into&lt;String&gt;) -&gt; Result&lt;T, Fail&gt;</code> (line 148) is generic in its <code>Ok</code> type, so <code>return invalid("…")</code> fits in any function returning <code>Result&lt;_, Fail&gt;</code>, and it accepts both <code>&amp;str</code> and <code>String</code>.</li>
+  </ul>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Code</th><th>Meaning</th><th>Produced by</th></tr></thead>
+    <tbody>
+      <tr><td><code>-32700</code></td><td>The body is not JSON.</td><td><code>handle_parsed</code></td></tr>
+      <tr><td><code>-32600</code></td><td>Not a valid request: an empty batch, a non-object element, <code>jsonrpc</code> not <code>"2.0"</code>, a non-string method, a bad id, or more than 1000 requests.</td><td><code>handle_parsed</code>, <code>handle_one</code></td></tr>
+      <tr><td><code>-32601</code></td><td>Not a method this node serves.</td><td><code>Fail::Unsupported</code></td></tr>
+      <tr><td><code>-32602</code></td><td>Can never be answered as asked. Do not retry.</td><td><code>Fail::Invalid</code>, <code>Fail::Refused</code> (the engine's permanent envelope), and <code>eth_getLogs</code> when the engine marks it permanent</td></tr>
+      <tr><td><code>-32000</code></td><td>Not answerable verified right now. Retryable. Also geth-worded answers (infeasible call, txpool rejection) and "server busy".</td><td><code>Fail::Unavailable</code>, <code>Fail::Rpc</code></td></tr>
+      <tr><td><code>3</code></td><td>The call reverted: a verified answer, with the revert data.</td><td><code>revert_fail</code></td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout watch">
+    <span class="k">The project rule behind -32602</span>
+    <p>The repository's <code>CLAUDE.md</code> (section "Trust") says a parameter that can change the answer must be "APPLIED or REFUSED — never accepted and silently ignored", and that a refusal uses the permanent <code>-32602</code>, because <code>-32000</code> is documented as retryable and a client would spin on it. The rule came from <code>eth_call</code> once dropping a state override (#314). In this file you can see it everywhere: too many arguments, <code>params</code> that are not an array, <code>blockOverrides</code> (never applied, so present means refused, with a message that says "rejected, not ignored"), an unknown state-override field, <code>safe</code> and <code>earliest</code>, bare-digit block numbers, a non-boolean <code>fullTransactions</code>, both <code>data</code> and <code>input</code> set and different, blob fields, a <code>chainId</code> that is not this chain's, and a missing <code>eth_feeHistory</code> newest block. The opposite class, "not now", stays <code>-32000</code>: a block a little ahead of the head, a hash the node cannot place yet, a node that is not ready.</p>
+  </div>
+
+  <h4>The readiness hold</h4>
+  <x-code src="myotis-rpcd/src/rpc.rs" from="203" to="216"></x-code>
+  <x-code src="myotis-rpcd/src/rpc.rs" from="544" to="571"></x-code>
+  <ul class="concepts">
+    <li><x-tags>interior-mutability</x-tags> <strong><code>Cell</code>: mutation through a shared reference, single thread only.</strong> Handlers receive <code>g: &amp;Gate</code>, a shared borrow, yet the gate must record that it was passed. <code>Cell&lt;bool&gt;</code> allows that without a lock: <code>passed.replace(true)</code> stores <code>true</code> and returns the old value, <code>spent.get()</code> and <code>spent.set(true)</code> copy the value in and out. <code>Cell</code> is not <code>Sync</code>, so the compiler would refuse to share a <code>Gate</code> between threads. It never needs to be: a <code>Budget</code> and its gates live on the stack of the one worker serving the body.</li>
+    <li><x-tags>lifetimes</x-tags> <strong><code>Gate&lt;'b&gt;</code> holds <code>&amp;'b Budget</code>.</strong> A struct that stores a reference must name its lifetime, and the compiler then guarantees that the gate cannot outlive the budget. <code>handle_parsed</code> creates one <code>Budget</code> per HTTP body; <code>handle_one</code> creates one <code>Gate</code> per request, borrowing it. So a batch shares one wait of at most <code>--ready-wait</code>, and each request waits at most once however many times its handler calls <code>engine_ready</code> (the pin check, the window check and the read each do).</li>
+    <li><x-tags>borrowing</x-tags> <code>engine_ready</code> returns <code>Result&lt;&amp;E, Fail&gt;</code>: on success a borrow of <code>self.engine</code>, with its lifetime tied to <code>&amp;self</code> by elision. The handlers write <code>self.engine_ready(g)?.get_code(…)</code>, so the engine can only be reached through the gate. The gate is taken lazily, at the first engine read, so a request refused on its parameters never waits.</li>
+    <li><x-tags>concurrency</x-tags> The wait is a plain poll: <code>thread::sleep(READY_POLL.min(deadline - now))</code>, re-reading the status every 250 ms. When the budget runs out, the read goes ahead anyway, so the error that comes back carries the engine's own reason. Later gated elements of the same batch then fail fast with <code>-32000</code>.</li>
+  </ul>
+
+  <h4>Dispatch</h4>
+  <x-code src="myotis-rpcd/src/rpc.rs" from="573" to="593"></x-code>
+  <x-code src="myotis-rpcd/src/rpc.rs" from="630" to="657"></x-code>
+  <ul class="concepts">
+    <li><x-tags>borrowing</x-tags> <strong>Borrowing an empty default.</strong> <code>params</code> must be a <code>&amp;Vec&lt;Value&gt;</code> borrowed from the request. For an absent <code>params</code> there is nothing to borrow, so the function first creates a local <code>empty</code> vector and borrows that. The local lives until the function returns, so the reference is valid in every arm.</li>
+    <li><x-tags>error-handling</x-tags> <strong>A pipeline of <code>?</code>.</strong> Each step either returns its value or ends the handler with a <code>Fail</code>: parse the address, parse the selector, resolve a block hash to a number, refuse a pin behind the window, then read and check the account. The <code>sel</code> variable is <em>shadowed</em>: <code>let sel = self.resolve_hash(sel, …)?</code> moves the old <code>Selector</code> into the call and binds the returned one to the same name.</li>
+    <li><x-tags>domain</x-tags> <strong>Only <code>pending</code> consults the overlay.</strong> The engine remembers this node's own unmined broadcasts. <code>pending_nonce_overlay</code> returns <code>max(mined, ours + 1)</code> or <code>-1</code> for none; <code>u64::try_from(o).unwrap_or(mined)</code> turns the <code>-1</code> back into the mined nonce. A proof of exclusion (<code>exists: false</code>) is a verified balance of 0.</li>
+  </ul>
+
+  <h4>eth_call: two engine paths</h4>
+  <x-code src="myotis-rpcd/src/rpc.rs" from="859" to="901"></x-code>
+  <p class="code-note"><x-tags>domain error-handling</x-tags> The engine has a plain call (<code>from, to, data, value</code>) and a transaction-object call that applies gas, fees, type, access and authorization lists. <code>parse_tx</code> sets <code>tx.extended</code> when the object carries anything the plain call would drop (lines 1822–1838: an explicit <code>type</code>, <code>gas</code>, any fee field, a non-empty access list, an authorization list, or a nonce on a contract creation), and then only the transaction-object call may answer. This is #314 solved structurally. <code>parse_tx(obj).or_else(|why| invalid(…))?</code> converts the parser's <code>String</code> error into a <code>Fail</code>. <code>overrides.as_deref().unwrap_or("")</code> turns <code>Option&lt;String&gt;</code> into a <code>&amp;str</code> without moving the string.</p>
+
+  <h4>Block pins</h4>
+  <x-code src="myotis-rpcd/src/rpc.rs" from="1046" to="1091"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain</x-tags> <strong>Behind, inside, ahead.</strong> The node holds state only near its verified head. A pin more than 64 blocks behind is refused for good (<code>-32602</code>): no wait will make that state appear. A pin up to 16 ahead is served from head state. Further ahead is <code>-32000</code>, because the head may yet reach it.</li>
+    <li><x-tags>domain</x-tags> <strong><code>ReportedHeads</code>.</strong> A wallet pins its reads to the number it was just handed by <code>eth_blockNumber</code>. If this node itself reported a head at or below the pin within the last 15 minutes, the pin came from this node, so it is declined retryably instead of being called invalid, even after the head moved on. The struct (lines 156–192) is a <code>Mutex&lt;VecDeque&lt;(u64, Instant)&gt;&gt;</code>, pruned by age and capped at 512 entries.</li>
+    <li><x-tags>enums-patterns</x-tags> <code>let Some(n) = sel.number else { return Ok(()) };</code>: tags have no number and pass. <code>head.saturating_sub(64)</code> stops at 0 instead of underflowing, which would panic in a debug build (and abort the daemon if overflow checks were on in release). <code>n + 64</code> in <code>in_window</code> cannot overflow for a caller's number: <code>parse_selector</code> refuses numbers above <code>i64::MAX</code> (a resolved hash's number comes from a verified header).</li>
+  </ul>
+  <p><x-tags>domain</x-tags> A 32-byte block hash goes through <code>resolve_hash</code> (lines 971–1044) first: the engine names the canonical block with that hash, header only, and the router then serves the request exactly as that number, through the same window. An engine <code>null</code> (a hash it cannot place: not reached yet, too old, or on a fork) is a retryable <code>-32000</code> naming the hash, since the node cannot tell "not yet" from "never". The resolver also checks that the engine returned the hash it was asked for and refuses block 0. <code>eth_getProof</code> is the exception: it hands the hash straight to the engine, which pins the proof to that block's root in one read, so no reorg can slip in between resolving and reading.</p>
+
+  <h4>Reading the engine's JSON</h4>
+  <x-code src="myotis-rpcd/src/rpc.rs" from="1143" to="1184"></x-code>
+  <ul class="concepts">
+    <li><x-tags>error-handling domain</x-tags> <strong>Fail closed.</strong> The engine signals errors in-band: <code>{"error": …}</code> is retryable, <code>{"error": …, "code": -32602}</code> permanent. Only an object with exactly those keys counts as an envelope. Anything that does not parse, or that is not an object, is <code>Fail::Unavailable(None)</code>, never a result. <code>verified</code> (lines 1188–1197) adds the state-read rule: no <code>verifyMethod</code> string, no answer. <code>parse_account</code> (lines 1117–1137) refuses any shape drift with <code>-32000</code>, so a malformed engine reply can never become a "verified" balance of 0.</li>
+    <li><x-tags>bytes-strings</x-tags> <code>err.as_str().map(str::to_owned).unwrap_or_else(|| err.to_string())</code>: a string error is copied as is; any other JSON value is serialised. <code>str::to_owned</code> is a function path used as a closure.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>o.get("error").is_none_or(Value::is_null)</code> is <code>true</code> when the key is absent or <code>null</code>; it reads like the Kotlin <code>o["error"]?.isNull ?: true</code>.</li>
+  </ul>
+  <p><code>tri_state</code> serves the reads that have three outcomes: a found object, the literal <code>null</code> (a <em>verified</em> "not seen", which is a valid result), or an error envelope. <code>call_outcome</code> maps the EVM's <code>status</code>: <code>ok</code> → the return data or the gas, <code>revert</code> → geth's code 3 with the payload as <code>data</code>, <code>infeasible</code> → geth's <code>-32000</code> in geth's words. A reasonless <code>infeasible</code> or a malformed hex field is shape drift: retryable, never a confident answer.</p>
+  <x-code src="myotis-rpcd/src/rpc.rs" from="1324" to="1361"></x-code>
+  <p class="code-note"><x-tags>bytes-strings error-handling</x-tags> <strong>Decoding attacker-controlled bytes.</strong> A revert payload comes from a contract, so its offsets and lengths are hostile. <code>d.get(at..at.checked_add(32)?)?</code> returns <code>None</code> instead of panicking when the range is out of bounds, and <code>checked_add</code> returns <code>None</code> on overflow. That matters because a panic aborts the whole daemon (<code>panic = "abort"</code>); the test <code>revert_reason_decoding_is_bounded</code> feeds it an offset of <code>u64::MAX</code>. <code>Error(string)</code> starts with the selector <code>08c379a0</code>, <code>Panic(uint256)</code> with <code>4e487b71</code>. The decoded text is reduced to printable ASCII, so it can neither forge log lines nor spoof a UI. Inside the closure <code>word</code>, <code>?</code> works because the closure itself returns <code>Option</code>.</p>
+
+  <h4>Parameters: applied or refused</h4>
+  <x-code src="myotis-rpcd/src/rpc.rs" from="1694" to="1736"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns</x-tags> <strong>Three states, never two.</strong> <code>OverrideParam</code> is <code>Absent</code>, <code>Valid(String)</code> or <code>Malformed(String)</code>. With an <code>Option</code>, "malformed" would have to collapse into "absent", which is exactly the silent drop the project rule forbids. An override with no actual changes (only <code>null</code> or empty entries) is <code>Absent</code>, so the plain call can serve it.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>for (addr, entry) in ov</code> iterates a <code>&amp;Map</code> and yields pairs of references. <code>changes |= !fields.is_empty();</code> is a boolean or-assignment. <code>ov.clone()</code> copies the map only once it is known to be valid.</li>
+  </ul>
+  <p><code>parse_selector</code> (lines 1476–1620) is "the ONE reading of a block selector": absent or <code>null</code> is <code>latest</code>; <code>latest</code>, <code>pending</code> and <code>finalized</code> pass as tags; <code>safe</code> and <code>earliest</code> are refused with an explanation; numbers must be <code>0x</code>-hex, nonzero and at most <code>i64::MAX</code>; and methods that take a <code>BlockNumberOrHash</code> also accept a 32-byte hash, bare or in EIP-1898's object form (<code>{"blockHash"}</code> or <code>{"blockNumber"}</code>, not both, with an optional boolean <code>requireCanonical</code>). It returns a <code>Selector</code> whose <code>value</code> is what the engine is handed: the tag, a minimal <code>0x</code>-number, or a lowercase hash.</p>
+  <p><x-tags>bytes-strings</x-tags> The envelopes (lines 1858–1885) are built with <code>format!</code>, and the result is embedded <em>verbatim</em> as already-serialised JSON, because a block with full transactions can run to megabytes and need not be parsed and re-encoded. <code>{id}</code> formats a <code>serde_json::Value</code> through its <code>Display</code>, which is its JSON text. The error object is built as a <code>Map</code>, so the message is escaped. The call log (lines 1887–1951) shortens long strings at a UTF-8 character boundary (<code>floor_char_boundary</code>), and counts the elements of a long array result by deserialising it into <code>Vec&lt;IgnoredAny&gt;</code>, which skips each element without building it.</p>
+</x-file>
+
+<x-file path="rust/myotis-rpcd/src/quantity.rs" kind="library module">
+  <p class="purpose">JSON-RPC QUANTITY and DATA encoding without a bignum dependency, ported from the Kotlin router's <code>RpcQuantities</code>. The engine hands balances and fees across as decimal strings, the wire wants minimal hex, and wei values are at most 256 bits, so schoolbook base conversion over digit arrays is enough.</p>
+  <x-code src="myotis-rpcd/src/quantity.rs" from="59" to="84"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership iterators-closures</x-tags> <strong>Long division by 16, repeated.</strong> Each pass divides the decimal digit array by 16, keeps the remainder as the next hex digit (least significant first), and replaces <code>digits</code> with the quotient. <code>quotient.split_off(start)</code> returns the part from the first nonzero digit as a new <code>Vec</code>, dropping the leading zeros; assigning it to <code>digits</code> drops the old vector. <code>out.reverse()</code> then puts the most significant digit first.</li>
+    <li><x-tags>bytes-strings</x-tags> <code>u32::from(b - b'0')</code> assumes ASCII digits: on any other byte the <code>u8</code> subtraction would underflow. Every caller checks the input first (<code>hex_quantity_decimal</code>, <code>parse_wei_quantity</code>). <code>String::from_utf8(out)</code> cannot fail on hex digits, so <code>unwrap_or_default()</code> is only a formality.</li>
+  </ul>
+  <p><code>parse_hex</code> is strict on purpose: an odd number of hex digits is refused rather than padded, because padding calldata or storage would shift it by half a byte. <code>parse_wei_quantity</code> caps the input at 80 characters before any conversion, so a huge string cannot make parsing expensive. It accepts <code>0x</code> alone as zero (a test pins that) and, for parity with Java's <code>BigInteger</code>, a <code>+</code> sign; geth refuses both.</p>
+</x-file>
+
+<x-file path="rust/myotis-rpcd/src/checkpoint.rs" kind="library module">
+  <p class="purpose">Bootstrapping from an operator-supplied checkpoint instead of the embedded one. <code>explicit</code> validates a root (32 bytes of hex) and a slot (at least 1). <code>bound_anchor</code> reads the marker the engine writes into a data dir created with a caller's checkpoint (<code>sync-anchor.json</code> on mainnet, <code>sync-anchor-&lt;net&gt;.json</code> elsewhere), so a restart without the flags resumes that anchor instead of being refused. The trust argument is in the module doc: the root picks the starting point, and the engine verifies everything after it with sync-committee signatures.</p>
+  <x-code src="myotis-rpcd/src/checkpoint.rs" from="69" to="90"></x-code>
+  <p class="code-note"><x-tags>unsafe-ffi lifetimes</x-tags> <code>ffi</code> has no wrapper for create-with-checkpoint, so this calls the C ABI function by Rust path, as the Node addon does (<a href="#stop-18">Stop 18</a>). The <code>// SAFETY:</code> comment is the convention for every <code>unsafe</code> block: it states why the call is sound. Here the three <code>CString</code>s are bound to <code>n</code>, <code>d</code> and <code>r</code>, so they outlive the call, and the engine copies them before returning. <code>CString::new</code> fails on an interior NUL byte, which becomes the engine's own sentinel <code>-1</code>. Note that <code>bound_anchor</code> mirrors the engine's private file name and its keys <code>checkpointRoot</code>/<code>checkpointSlot</code> (host.rs lines 562–620); if the engine ever renamed them, a restart would get the engine's <code>-3</code> refusal and the daemon's message for it.</p>
+</x-file>
+
+<x-file path="rust/myotis-rpcd/src/seeds.rs" kind="library module">
+  <p class="purpose"><code>--boot-enodes</code>: EL peers the operator knows to be serving snap, handed to the engine through <code>myotis_set_boot_enodes</code> (#465) so a cold start does not wait for discovery. <code>load</code> reads <code>@FILE</code> or takes the argument itself. <code>parse</code> is a pure iterator chain: <code>lines()</code>, cut each at <code>#</code>, <code>flat_map</code> over commas, <code>trim</code>, drop empties, then <code>map(str::to_string)</code> to own the results. It also drops a leading UTF-8 byte-order mark, which <code>trim</code> would not remove because it is not whitespace. The only local check is "not empty": the engine judges every URL, applies the list or refuses it as a whole, and names every bad entry at once.</p>
+  <p><x-tags>unsafe-ffi error-handling</x-tags> <code>push</code> serialises the list with serde (which escapes a NUL byte as <code>\u0000</code>, so <code>CString::new</code> cannot fail) and calls the C ABI function in an <code>unsafe</code> block with a <code>SAFETY</code> comment. The engine reports a refusal only as <code>false</code> plus a WARN line in its log ring, so <code>push</code> drains the ring and quotes the lines that contain "boot enodes refused". <code>main.rs</code> flushes the ring just before calling it, so the lines drained are the push's own. If a <code>RUST_LOG</code> filter hides WARN, the message says so instead of quoting nothing.</p>
+  <p><x-tags>testing</x-tags> Eight tests: seven that need no engine (comma lists, files with comments, BOM, empty lists, 65 entries passed through unjudged, the refusal quote, a temp file read through <code>load</code>), and one that creates a real engine handle in a temp dir, never starts it, and checks that the engine accepts two good URLs and refuses a duplicate, a garbage entry and a NUL byte by entry number.</p>
+</x-file>
+
+<x-file path="rust/myotis-rpcd/src/rpc/tests.rs" kind="unit tests">
+  <p class="purpose">Thirty router tests. The engine replies are the shapes pinned by the engine's own golden tests in <code>eljson.rs</code>, so a reshaped engine fails here too. Because this file is <code>mod tests</code> <em>inside</em> <code>rpc</code>, it sees rpc.rs's private items: <code>parse_account</code>, <code>decode_revert_reason</code>, <code>Router</code>'s fields. Privacy in Rust is per module, and a child module may use its parent's private items.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What is tested</th></tr></thead>
+    <tbody>
+      <tr><td>1–195</td><td>Engine goldens, the <code>Fake</code> engine, helpers <code>call</code>, <code>result</code>, <code>error</code>, <code>calls</code>.</td></tr>
+      <tr><td>197–380</td><td>Config methods, envelope rules, batches, balance and nonce, the pending overlay, retryable vs permanent engine errors, selectors.</td></tr>
+      <tr><td>381–543</td><td>Block hashes as pins (#641): served as the block's number, the window, nulls, drift, genesis, <code>eth_getProof</code>.</td></tr>
+      <tr><td>544–935</td><td>Code and storage, <code>eth_call</code> outcomes and paths, the type-only path, refusals by id, estimates, access lists, fees, tri-state reads, proofs, logs.</td></tr>
+      <tr><td>936–1095</td><td>Send and syncing, STALE_ANCHOR, revert decoding, the call log.</td></tr>
+      <tr><td>1096–1148</td><td>Account shape drift fails closed.</td></tr>
+      <tr><td>1149–1296</td><td>The readiness hold (once per request, once per batch, never for bad params) and body classification.</td></tr>
+    </tbody>
+  </table></div>
+  <x-code src="myotis-rpcd/src/rpc/tests.rs" from="32" to="70"></x-code>
+  <ul class="concepts">
+    <li><x-tags>testing interior-mutability</x-tags> <strong>A fake behind the trait.</strong> <code>Fake</code> answers each method with a canned reply and records every call, so a test can assert both the answer and what the engine was asked (<code>calls(&amp;r)[0] == "account(0x…,latest)"</code>). The trait's methods take <code>&amp;self</code>, so recording needs interior mutability, and the trait demands <code>Sync</code>, so it is a <code>Mutex&lt;Vec&lt;String&gt;&gt;</code> and an <code>AtomicUsize</code>, not a <code>RefCell</code>.</li>
+    <li><x-tags>ownership</x-tags> <code>fn reply(mut self, …) -&gt; Self</code> is a by-value builder: <code>Fake::new().reply("account", …).reply("resolve", "null")</code> moves the fake through each call.</li>
+    <li><x-tags>testing</x-tags> With <code>tx_through_engine</code> set, the transaction-object calls go to the <em>real</em> engine functions on the handle <code>i64::MIN</code>, which does not exist: the engine checks the request before it looks for the handle, so its real refusals (such as "requires an authorizationList") come back. <code>eth_sendRawTransaction</code> also always calls the real, handle-less <code>ffi::check_raw_transaction_json</code>, outside the trait. So <code>cargo test -p myotis-rpcd</code> links and partly exercises the whole engine.</li>
+  </ul>
+  <x-code src="myotis-rpcd/src/rpc/tests.rs" from="369" to="378"></x-code>
+  <p class="code-note"><x-tags>ownership</x-tags> <strong>Struct update syntax.</strong> <code>Router { engine: moved, ..r }</code> builds a new router with a new engine and every other field taken from <code>r</code>. Those fields are <em>moved</em> (the <code>Mutex</code> inside <code>ReportedHeads</code> is not <code>Copy</code>), so <code>r</code> can't be used afterwards. The point of the test: the reported head 1000 survives while the engine's head moves to 2000, so a pin at 1000 is now 1000 blocks behind but is still declined retryably (<code>-32000</code>), not refused.</p>
+  <x-code src="myotis-rpcd/src/rpc/tests.rs" from="1156" to="1175"></x-code>
+  <p class="code-note"><x-tags>testing concurrency</x-tags> A timing test: with a 300 ms hold on a node that never becomes ready, a number-pinned read that passes through <code>pin_servable</code>, <code>in_window</code> and the account read takes at least 300 ms and less than 550 ms, so it waited once, not three times. The comment "each used to wait" records the bug this pins.</p>
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments</span>
+    <p>The doc comment on <code>a_block_hash_is_served_as_the_canonical_block_it_names</code> (lines 381–384) says the hash is resolved "through the engine's own <code>eth_getBlockByHash</code>". The router now resolves it through <code>resolve_block_hash</code> (ABI 47, header only), and the test stubs that method (<code>"resolve"</code>), not <code>block_hash</code>.</p>
+  </div>
+</x-file>
+
+<x-quiz>[
+  {"id": "rpcd-q1", "type": "mcq", "tags": ["concurrency", "domain"], "q": "Why does myotis-rpcd answer <code>GET /</code> and <code>eth_chainId</code> on separate intake threads instead of sending every request to the read workers?", "options": ["tiny_http requires two pools", "A read may be held for up to <code>--ready-wait</code> waiting for a verified head; if every worker is held, a health check queued behind them would time out. Non-blocking methods need no engine readiness, so intake answers them at once", "Intake threads are faster because they are async", "The read workers cannot parse JSON"], "answer": 1, "explain": "<code>Body::blocking</code> classifies the body; only bodies naming a gated method go to the read pool."},
+  {"id": "rpcd-q2", "type": "mcq", "tags": ["ownership", "concurrency"], "q": "In <code>answer</code>, <code>shared.reads.try_send((req, body))</code> fails with <code>TrySendError::Full((req, body))</code>. Why can the code still respond to <code>req</code>?", "options": ["<code>req</code> was cloned before sending", "The channel keeps a copy", "A failed <code>try_send</code> returns ownership of the value inside the error, so the pattern binds <code>req</code> and <code>body</code> again", "<code>req</code> is <code>Copy</code>"], "answer": 2, "explain": "Sending moves the value. On failure it comes back in the error, so nothing is lost and every request is answered (here with 503)."},
+  {"id": "rpcd-q3", "type": "mcq", "tags": ["concurrency", "smart-pointers"], "q": "Why do the read workers share the channel's receiver as <code>Arc&lt;Mutex&lt;Receiver&gt;&gt;</code>?", "options": ["A <code>Receiver</code> can't be cloned and is not <code>Sync</code>, so several threads can only share it behind a lock; one worker at a time waits in <code>recv()</code> while holding it", "The <code>Mutex</code> makes <code>recv</code> faster", "<code>Arc</code> alone would copy the channel", "tiny_http requires it"], "answer": 0, "explain": "std's <code>mpsc</code> is multi-producer, single-consumer. The lock turns it into a work queue; the guard is dropped once a request arrives."},
+  {"id": "rpcd-q4", "type": "open", "tags": ["interior-mutability", "lifetimes"], "q": "Explain <code>Budget</code> and <code>Gate&lt;'b&gt;</code>: what each represents, why they use <code>Cell</code> rather than <code>Mutex</code>, and what the lifetime <code>'b</code> guarantees.", "model": "A <code>Budget</code> is the readiness hold one HTTP body may spend: a deadline <code>now + ready_wait</code> and a <code>spent</code> flag, created once in <code>handle_parsed</code>. A <code>Gate</code> is one request's pass through the hold, created in <code>handle_one</code> and holding <code>&amp;'b Budget</code>; its <code>passed</code> flag makes the request wait at most once however many engine reads it makes. Handlers only get <code>&amp;Gate</code>, so the flags need interior mutability; <code>Cell</code> gives it without a lock because both live on the stack of the one thread serving the body and are never shared (<code>Cell</code> is not <code>Sync</code>, so the compiler would refuse sharing). The lifetime <code>'b</code> ensures a gate can't outlive the budget it borrows.", "points": ["Budget: one per HTTP body, deadline + spent flag; a batch shares it", "Gate: one per request, passed flag, waits at most once", "Cell because handlers hold &Gate and the values never leave one thread", "Cell is not Sync, so sharing across threads would not compile", "'b: the Gate cannot outlive the Budget it borrows"], "context": "rust/myotis-rpcd/src/rpc.rs L203-216 struct Budget { deadline: Instant, spent: Cell&lt;bool> }, struct Gate&lt;'b> { budget: &'b Budget, passed: Cell&lt;bool> }; L378-381 Budget created in handle_parsed; L465-468 Gate created in handle_one; L549-571 engine_ready uses g.passed.replace(true), g.budget.spent.get()/set(true)."},
+  {"id": "rpcd-q5", "type": "mcq", "tags": ["domain", "error-handling"], "q": "The verified head is block 1000. Which answer does <code>eth_getBalance</code> give for the pin <code>\"0x100\"</code> (block 256), if this node never reported a head at or below 256?", "options": ["The balance at the head", "<code>-32000</code>, retry later", "<code>-32602</code>: more than 64 blocks behind the head, and this node holds no historical state, so no retry can help", "<code>null</code>"], "answer": 2, "explain": "<code>pin_servable</code> refuses for good. A pin up to 16 ahead would be served; further ahead is retryable <code>-32000</code>."},
+  {"id": "rpcd-q6", "type": "open", "tags": ["domain", "error-handling"], "q": "The project rule says a parameter must be applied or refused, never silently ignored. Name three places in rpc.rs where that rule decides the code, and explain why the refusal uses -32602 rather than -32000.", "model": "Examples: <code>arity</code> plus <code>dispatch</code> refuse too many positional arguments and a non-array <code>params</code>; <code>block_override_present</code> refuses any <code>blockOverrides</code> because they are never applied (<code>OVERRIDE_UNSUPPORTED</code>: rejected, not ignored); <code>state_override_param</code> returns <code>Malformed</code> for an unknown override field instead of treating it as absent; <code>parse_selector</code> refuses <code>safe</code>, <code>earliest</code>, bare digits and genesis instead of reading them as the head; <code>parse_tx</code> refuses differing <code>data</code>/<code>input</code>, blob fields and conflicting fee fields, and routes gas/fee/type fields to the transaction-object call so they are applied; <code>check_chain_id</code> refuses another chain's id. A result computed without the parameter would look correct, so the client could not detect it. -32602 is permanent; -32000 is documented as retryable, so a client would retry forever.", "points": ["names at least three concrete refusals (arity, blockOverrides, malformed state override, safe/earliest/bare digits, data≠input, chainId)", "mentions that gas/fee/type fields are routed to the transaction-object call (extended) so they are applied", "explains that a silently ignored parameter gives a plausible but wrong answer the client cannot detect", "-32602 is permanent; -32000 is retryable and would make a client spin"], "context": "rust/myotis-rpcd/src/rpc.rs L88-122 arity; L578-588 params rules in dispatch; L859-870 eth_call refuses block overrides / malformed state overrides; L1101-1103 OVERRIDE_UNSUPPORTED; L1484-1620 parse_selector; L1694-1746 state_override_param, block_override_present; L1753-1852 parse_tx (extended flag L1822-1838); L961-969 check_chain_id. src/CLAUDE.md Trust section."},
+  {"id": "rpcd-q7", "type": "mcq", "tags": ["traits-generics", "concurrency"], "q": "Why is the <code>Engine</code> trait declared as <code>pub trait Engine: Send + Sync</code>?", "options": ["So the trait can be used with <code>dyn</code>", "The router is shared by many threads through an <code>Arc</code>; it can only be <code>Send + Sync</code> if its engine is, and the supertraits make every implementation, including the test <code>Fake</code>, guarantee that", "It makes the methods non-blocking", "UniFFI requires it"], "answer": 1, "explain": "That is also why <code>Fake</code> records calls in a <code>Mutex</code> and an <code>AtomicUsize</code> instead of a <code>RefCell</code>."},
+  {"id": "rpcd-q8", "type": "open", "tags": ["smart-pointers", "error-handling"], "q": "In <code>run</code>, what does <code>let guard = StopOnDrop(handle);</code> guarantee, and why would it be defeated if <code>run</code> itself called <code>std::process::exit(1)</code> on an error?", "model": "<code>StopOnDrop</code> implements <code>Drop</code> by calling <code>ffi::stop_handle</code>. Once the guard exists, every way out of <code>run</code> drops it: a <code>return Err(…)</code>, a <code>?</code> that propagates an error, or the graceful path's explicit <code>drop(guard)</code>. So the engine handle is always stopped and persists its sync state, like a <code>finally</code> block. <code>std::process::exit</code> ends the process without unwinding the stack, so destructors of values still alive do not run; if <code>run</code> called it, the guard would never drop. That is why <code>run</code> returns <code>Result</code> and <code>main</code> calls <code>exit(1)</code> only after <code>run</code> has returned.", "points": ["Drop for StopOnDrop calls ffi::stop_handle", "every exit path (return Err, ?, explicit drop) runs it", "stopping lets the engine persist its sync state", "process::exit skips destructors of live values", "main exits only after run has returned and dropped the guard"], "context": "rust/myotis-rpcd/src/main.rs L129-140 main: if let Err(e) = run(args) { print_engine_logs(); eprintln!; std::process::exit(1) }; L254-256 let guard = StopOnDrop(handle); L315 drop(guard); L353-360 struct StopOnDrop(i64); impl Drop { ffi::stop_handle(self.0) }"},
+  {"id": "rpcd-q9", "type": "open", "tags": ["bytes-strings", "error-handling"], "q": "<code>decode_revert_reason</code> reads offsets and lengths from a revert payload. Why does it use <code>d.get(range)?</code> and <code>checked_add</code> instead of <code>&amp;d[a..b]</code> and <code>+</code>, and what would go wrong otherwise?", "model": "The payload comes from a contract, so its offset and length words are attacker-controlled. Indexing with <code>&amp;d[a..b]</code> panics when the range is out of bounds, and <code>+</code> on a huge offset overflows, which panics in debug builds. The workspace builds with <code>panic = \"abort\"</code>, so a panic would kill the whole daemon. <code>get</code> returns <code>None</code> for an out-of-range slice and <code>checked_add</code> returns <code>None</code> on overflow, and <code>?</code> turns either into \"no decoded reason\" while the raw payload is still returned as <code>data</code>. The test <code>revert_reason_decoding_is_bounded</code> pins an offset of <code>u64::MAX</code>.", "points": ["offsets/lengths in the payload are attacker-controlled", "slice indexing panics out of bounds; + can overflow", "panic = abort would end the whole daemon", "get/checked_add return None, and ? maps it to no reason (raw data still returned)"], "context": "rust/myotis-rpcd/src/rpc.rs L1324-1361 decode_revert_reason (word closure L1330-1340 uses d.get(at..at.checked_add(32)?)?, len capped at 1024, printable ASCII only); L1310-1322 revert_fail keeps data; rust/Cargo.toml [profile.release] panic = \"abort\"; rust/myotis-rpcd/src/rpc/tests.rs L993-1010."},
+  {"id": "rpcd-q10", "type": "mcq", "tags": ["domain"], "q": "An <code>eth_call</code> request carries <code>{\"to\": …, \"gas\": \"0x5208\"}</code>. Which engine function answers it, and why?", "options": ["<code>eth_call_tx</code>: <code>gas</code> makes the transaction <code>extended</code>, and the plain call has no gas parameter, so it would silently drop it", "<code>eth_call</code>: gas is ignored for calls", "<code>estimate_gas_tx</code>", "None: gas limits are refused"], "answer": 0, "explain": "The <code>extended</code> flag routes any field the plain call would drop to the transaction-object call, which applies it or refuses it."},
+  {"id": "rpcd-q11", "type": "mcq", "tags": ["ownership", "testing"], "q": "A test writes <code>let r2 = Router { engine: moved, ..r };</code>. What happens to <code>r</code>?", "options": ["Nothing; <code>..r</code> copies the fields", "Its remaining fields are moved into <code>r2</code> (they are not <code>Copy</code>), so <code>r</code> can no longer be used as a whole", "It is dropped before <code>r2</code> is built", "It becomes a reference to <code>r2</code>"], "answer": 1, "explain": "Struct update syntax moves (or copies, for <code>Copy</code> fields) the rest. The test uses it to keep the recorded <code>ReportedHeads</code> while swapping the engine."},
+  {"id": "rpcd-q12", "type": "open", "tags": ["concurrency", "domain"], "q": "A client sends a 4 KiB JSON body very slowly. Follow it through http.rs: which thread reads it, what bounds that, and what happens if it doesn't arrive within <code>--http-body-timeout</code>?", "model": "tiny_http buffers only small bodies (at most 1 KiB with a Content-Length and no Expect), so <code>body_in_memory</code> is false and <code>intake</code> does not read it: it spawns a body-reader thread and returns at once, keeping the intake thread free. That thread increments <code>body_reads</code>; if 32 bodies are already being received it answers 503 without reading. Otherwise <code>answer</code> runs with a deadline; <code>read_body</code> wraps the reader in <code>Deadline</code> (and <code>take(MAX+1)</code> for the 5 MiB limit). Each <code>read</code> first checks the deadline and fails with <code>TimedOut</code> once it has passed, which becomes HTTP 408. A client that stops sending entirely blocks that body thread in a read until it closes or sends again, but never an intake thread.", "points": ["body over 1 KiB is not in memory, so intake hands it to a body-reader thread", "at most 32 bodies are received at once; past that 503", "Deadline&lt;R> checks the time before every read; TimedOut → 408", "take(MAX_BODY_BYTES + 1) detects a body over 5 MiB (413)", "a fully stalled client holds a body thread, never an intake thread"], "context": "rust/myotis-rpcd/src/http.rs L137 MAX_BODY_READS=32; L142 TINY_HTTP_BUFFERED=1024; L203-222 intake; L226-236 body_in_memory; L301-319 Deadline; L321-349 read_body (408, 400, 413); L649-703 stalled_bodies test."},
+  {"id": "rpcd-q13", "type": "mcq", "tags": ["iterators-closures", "error-handling"], "q": "What does <code>args.import_log_index.iter().map(|p| std::fs::canonicalize(p).map_err(…)).collect::&lt;Result&lt;Vec&lt;_&gt;, _&gt;&gt;()?</code> do when the second of three paths does not exist?", "options": ["Returns a vector with two paths", "Panics", "Skips the bad path", "Stops at the second path and returns its error from <code>run</code> through <code>?</code>; the third path is never canonicalised"], "answer": 3, "explain": "Collecting into <code>Result&lt;Vec&lt;_&gt;, E&gt;</code> short-circuits on the first <code>Err</code>."}
+]</x-quiz>

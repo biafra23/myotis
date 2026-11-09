@@ -3,7 +3,7 @@
 
 DEBUG / DEMO ONLY — NOT A PRODUCTION DATA PATH. Each seed is a full node's
 ``eth_getLogs`` output, unverified (no receipt-root proof); see
-docs/railgun-poc.md and docs/bee-rpc-service.md.
+docs/guides/railgun-poc.md and docs/guides/bee-rpc-service.md.
 
 Every release ships the Bee PoC and RAILGUN PoC dmgs, and a seed is usable for
 500,000 blocks above its top (``MAX_GAP``, el/reader.rs): ~29 days on Gnosis,
@@ -350,7 +350,7 @@ def check_current(seed, cur):
         die(f"{seed.name}: {cur.meta_path.name} is chain {m.get('chainId')}, expected {seed.chain_id}")
     if str(m["filter"]["address"]).lower() != seed.address:
         die(f"{seed.name}: {cur.meta_path.name} is a fetch of {m['filter']['address']}, not {seed.address}")
-    # The RAILGUN seeds start AT the deployment block (docs/railgun-poc.md); Bee's starts
+    # The RAILGUN seeds start AT the deployment block (docs/guides/railgun-poc.md); Bee's starts
     # above it, where Bee's embedded snapshot ends. Either way the low edge never moves.
     if m["fromBlock"] < seed.deploy or (seed.asset and m["fromBlock"] != seed.deploy):
         die(f"{seed.name}: {cur.meta_path.name} starts at {m['fromBlock']}, not at the expected low edge")

@@ -1,5 +1,5 @@
 //! RLP (Recursive Length Prefix) — hand-rolled, mirroring how the Java side
-//! uses Tuweni `RLP` (docs/reimplementation/02 §1, §6).
+//! uses Tuweni `RLP` (docs/spec/02 §1, §6).
 //!
 //! Decided here per plan EL-A1: hand codec, not `alloy-rlp`. The EL wire
 //! layer needs (a) tolerant list-remainder decoding (headers grow trailing

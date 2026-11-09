@@ -899,7 +899,7 @@ pub fn get_logs_json<'env>(env: &'env Env, handle: i64, filter_json: String) -> 
 // handle's one execution slot until it finishes, that handle's reads queue
 // behind it, and `stop`/`pause` — synchronous on the JS thread — wait for it.
 
-/// Install the watch-list config (docs/eth-getlogs-design.md; the JSON the
+/// Install the watch-list config (docs/design-history/eth-getlogs-design.md; the JSON the
 /// other hosts push). `watch` is additive; an entry leaves the index only by
 /// being named under `unwatch` (ABI ≥ 37), which drops its entry, its coverage
 /// and its stored logs. Since ABI 48 an entry may name a 32-byte `topic`

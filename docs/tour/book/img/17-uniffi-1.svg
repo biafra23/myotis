@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 960 760" role="img" fill="currentColor" aria-label="Sequence of one requestAccountJson call. The Java caller sanitizes its strings. For each string argument, Kotlin asks Rust to allocate a RustBuffer, then writes UTF-8 bytes into it. Kotlin calls the scaffolding function with an i64, two RustBuffers and a pointer to a call status; the buffers now belong to Rust. The scaffolding lifts the buffers into Strings without copying and calls ffi.rs inside catch_unwind. host.rs blocks the caller's thread in rt.block_on while tokio worker threads do the network I/O. The JSON String is lowered into a RustBuffer that Rust stops tracking, returned to Kotlin, copied into a Kotlin String, and freed by calling back into Rust. The Java side parses the JSON. A panic in a release build aborts the process." width="960" height="760">
+    <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="960.0" height="760.0" fill="#f8fafb" /><defs>
+      <marker id="m-stop17-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+      </marker>
+    </defs>
+    <g font-size="12">
+      <rect x="10" y="12" width="250" height="50" rx="8" stroke-width="1.5" style="fill:var(--jvm-wash);stroke:var(--jvm)" />
+      <text x="135" y="33" text-anchor="middle" font-weight="700" style="fill:var(--jvm-ink)">Java + generated Kotlin</text>
+      <text x="135" y="51" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">RustChainHandle → myotis_engine.kt</text>
+      <rect x="275" y="12" width="100" height="50" rx="8" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)" />
+      <text x="325" y="33" text-anchor="middle" font-weight="700">JNA</text>
+      <text x="325" y="51" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">libjnidispatch</text>
+      <rect x="390" y="12" width="220" height="50" rx="8" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="500" y="33" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">Rust: generated scaffolding</text>
+      <text x="500" y="51" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">extern "C" fn uniffi_…_fn_func_…</text>
+      <rect x="625" y="12" width="170" height="50" rx="8" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="710" y="33" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">Rust: ffi.rs → host.rs</text>
+      <text x="710" y="51" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">the engine's own code</text>
+      <rect x="810" y="12" width="140" height="50" rx="8" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)" />
+      <text x="880" y="33" text-anchor="middle" font-weight="700">tokio workers</text>
+      <text x="880" y="51" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">"myotis-engine" threads</text>
+    </g>
+    <g stroke-width="1" stroke-dasharray="3 4" fill="none" style="stroke:var(--rule)">
+      <line x1="135" y1="62" x2="135" y2="700" />
+      <line x1="325" y1="62" x2="325" y2="700" />
+      <line x1="500" y1="62" x2="500" y2="700" />
+      <line x1="710" y1="62" x2="710" y2="700" />
+      <line x1="880" y1="62" x2="880" y2="700" />
+    </g>
+    <g font-size="11">
+      <text x="135" y="92" text-anchor="middle">① accountVerified → gated() →</text>
+      <text x="135" y="106" text-anchor="middle" font-size="10.5">nativeRequestAccountJson(h, nz(a), nz(b))</text>
+      <text x="300" y="133" text-anchor="middle">② rustbuffer_alloc(n), once per string</text>
+      <text x="508" y="150" font-size="10.5" style="fill:var(--oxide-ink)">vec![0; n]: Rust heap</text>
+      <text x="300" y="172" text-anchor="middle" style="fill:var(--ink-2)">RustBuffer { capacity, len, data }</text>
+      <text x="135" y="202" text-anchor="middle">③ copy UTF-8 bytes into data</text>
+      <text x="135" y="216" text-anchor="middle" style="fill:var(--ink-2)">(direct ByteBuffer over native memory)</text>
+      <text x="315" y="241" text-anchor="middle">④ …_fn_func_request_account_json(i64, buf, buf, &amp;status)</text>
+      <text x="315" y="268" text-anchor="middle" font-size="10.5" style="fill:var(--oxide-ink)">both buffers now belong to Rust</text>
+      <text x="500" y="292" text-anchor="middle">⑤ try_lift: Vec::from_raw_parts</text>
+      <text x="500" y="306" text-anchor="middle">→ String, no copy</text>
+      <text x="500" y="320" text-anchor="middle" style="fill:var(--ink-2)">inside rust_call → catch_unwind</text>
+      <text x="605" y="343" text-anchor="middle">⑥ request_account_json(…)</text>
+      <text x="710" y="378" text-anchor="middle">⑦ parse, snapshot reader,</text>
+      <text x="710" y="392" text-anchor="middle">rt.block_on(reader.request(…))</text>
+      <text x="795" y="413" text-anchor="middle" font-size="10.5">drives</text>
+      <text x="880" y="440" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">peer I/O, sync loop</text>
+      <text x="795" y="458" text-anchor="middle" font-size="10.5">result</text>
+      <text x="710" y="486" text-anchor="middle" style="fill:var(--warn-ink)">caller's thread waits, ≤ 90 s</text>
+      <text x="605" y="511" text-anchor="middle">⑧ String (JSON)</text>
+      <text x="500" y="536" text-anchor="middle">lower: RustBuffer::from_vec</text>
+      <text x="500" y="550" text-anchor="middle" style="fill:var(--ink-2)">ManuallyDrop: Rust stops tracking it</text>
+      <text x="315" y="573" text-anchor="middle">⑨ RustBuffer by value; status.code stays 0</text>
+      <text x="135" y="606" text-anchor="middle">⑩ uniffiCheckCallStatus, then</text>
+      <text x="135" y="620" text-anchor="middle">FfiConverterString.lift: copy → String</text>
+      <text x="315" y="645" text-anchor="middle">⑪ rustbuffer_free(buf)</text>
+      <text x="508" y="664" font-size="10.5" style="fill:var(--ok-ink)">Vec dropped: Rust frees</text>
+      <text x="135" y="684" text-anchor="middle">⑫ parseResultOrThrow →</text>
+      <text x="135" y="698" text-anchor="middle" style="fill:var(--ink-2)">AccountProofResult or EngineException</text>
+    </g>
+    <g stroke-width="1.5" fill="none" style="stroke:currentColor">
+      <line x1="140" y1="140" x2="495" y2="140" marker-end="url(#m-stop17-arrow)" />
+      <line x1="495" y1="178" x2="140" y2="178" stroke-dasharray="5 4" marker-end="url(#m-stop17-arrow)" />
+      <line x1="140" y1="250" x2="495" y2="250" marker-end="url(#m-stop17-arrow)" />
+      <line x1="505" y1="350" x2="705" y2="350" marker-end="url(#m-stop17-arrow)" />
+      <line x1="715" y1="420" x2="875" y2="420" marker-end="url(#m-stop17-arrow)" />
+      <line x1="875" y1="464" x2="715" y2="464" stroke-dasharray="5 4" marker-end="url(#m-stop17-arrow)" />
+      <line x1="705" y1="518" x2="505" y2="518" stroke-dasharray="5 4" marker-end="url(#m-stop17-arrow)" />
+      <line x1="495" y1="580" x2="140" y2="580" stroke-dasharray="5 4" marker-end="url(#m-stop17-arrow)" />
+      <line x1="140" y1="652" x2="495" y2="652" marker-end="url(#m-stop17-arrow)" />
+    </g>
+    <g style="fill:var(--ink-3)">
+      <circle cx="325" cy="140" r="3" /><circle cx="325" cy="178" r="3" /><circle cx="325" cy="250" r="3" />
+      <circle cx="325" cy="580" r="3" /><circle cx="325" cy="652" r="3" />
+    </g>
+    <rect x="650" y="560" width="300" height="128" rx="8" stroke-width="1.5" style="fill:var(--bad-wash);stroke:var(--bad)" />
+    <g font-size="10.5">
+      <text x="664" y="580" font-weight="700" style="fill:var(--bad-ink)">If the Rust code panics</text>
+      <text x="664" y="598">Release build (panic = "abort"), as shipped:</text>
+      <text x="664" y="612">the process aborts; nothing returns.</text>
+      <text x="664" y="634">Unwinding build (dev profile): catch_unwind</text>
+      <text x="664" y="648">sets code 2 plus a message buffer, and</text>
+      <text x="664" y="662">Kotlin throws InternalException.</text>
+    </g>
+    <line x1="15" y1="722" x2="795" y2="722" stroke-width="3" style="stroke:var(--jvm)" />
+    <line x1="815" y1="722" x2="945" y2="722" stroke-width="3" style="stroke:var(--ink-3)" />
+    <g font-size="11">
+      <text x="405" y="742" text-anchor="middle" style="fill:var(--jvm-ink)">steps ① to ⑫ all run on ONE thread: the JVM thread that called. JNA does not switch threads.</text>
+      <text x="880" y="742" text-anchor="middle" style="fill:var(--ink-2)">the runtime's own threads</text>
+    </g>
+  </svg>

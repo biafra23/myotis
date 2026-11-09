@@ -35,7 +35,7 @@ import java.util.List;
  * @param verifyMethod          "stateRootMatch" / "headerChain" / "blockAccessList" (Rust
  *                              engine: a watched account carried from an earlier proof
  *                              by verified block access lists, no proof fetched — see
- *                              docs/address-activity.md) / null
+ *                              docs/how-it-works/address-activity.md) / null
  * @param failReason            null when verified; otherwise a stable reason token
  *                              (e.g. "beaconNotSynced", "headerChainGapTooLarge")
  * @param accountHashHex        keccak256(address) — the snap trie key

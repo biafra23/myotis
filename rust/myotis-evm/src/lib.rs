@@ -7,7 +7,7 @@
 //! implementing I/O crate.
 //!
 //! This is the Rust twin of the Java `io.myotis.evm` module (see
-//! `docs/reimplementation/03` and the Milestone-C section of `…/07`). What it holds:
+//! `docs/spec/03` and the Milestone-C section of `…/07`). What it holds:
 //!
 //! * the foundation ([`SnapStateOracle`] + [`FixtureSnapStateOracle`], the
 //!   [`StateProofCache`]/[`BytecodeCache`] tiers, and [`OracleDatabase`] — the

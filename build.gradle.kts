@@ -297,7 +297,7 @@ subprojects {
 // -------------------------------------------------------------------------
 // Publishing: the engine library and the modules it is built from.
 //
-// `:myotis-engine` (the Android AAR + the desktop jar, docs/android-library.md)
+// `:myotis-engine` (the Android AAR + the desktop jar, docs/guides/android-library.md)
 // is consumed OUTSIDE this build — a separate wallet product is the first
 // consumer — so it is published as Maven artifacts, and with it every project
 // module its POMs reach: a consumer resolving the AAR needs them from the same
@@ -660,7 +660,7 @@ extra["rustReleaseDir"] = rustReleaseDir
 extra["rustTargetTriple"] = rustTargetTriple // null: the host's own triple
 extra["rustEngineLibName"] = hostLibNames.last() // lib?myotis_engine.{dylib,so,dll}
 
-// Opt-in Tor support in the engine (docs/privacy-and-tor.md): builds
+// Opt-in Tor support in the engine (docs/how-it-works/privacy-and-tor.md): builds
 // myotis-engine with `--features tor`, pulling the Arti tree into the host lib
 // (cargoBuildHost) and the Android jniLibs (cargoNdkAndroid) so the desktop and
 // Android apps can offer the runtime Settings toggle. OFF by default so CI, the
@@ -928,7 +928,7 @@ tasks.register<Exec>("cargoNdkAndroid") {
     rustToolchainPath?.let { environment("PATH", it) }
     androidNdkDir?.let { environment("ANDROID_NDK_HOME", it.absolutePath) }
     // -PtorEngine links Arti into the Android engine too (build-android.sh reads
-    // the variable; docs/privacy-and-tor.md). Set either way, so a value
+    // the variable; docs/how-it-works/privacy-and-tor.md). Set either way, so a value
     // inherited from the developer's shell cannot flip the build behind the flag.
     environment("MYOTIS_TOR_ENGINE", if (torEngine) "1" else "0")
     // Windows can't exec a .sh directly (CreateProcess error=193); route it

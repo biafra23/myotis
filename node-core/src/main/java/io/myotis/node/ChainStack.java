@@ -123,7 +123,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
     private final ClPeerCachePort clPeerCache;
     private final io.myotis.evm.ccipread.CcipGateway ccipGateway;
     private final Path syncSnapshotFile;
-    /** This stack's bytes on the wire (docs/data-usage.md): RLPx + discv4 count into
+    /** This stack's bytes on the wire (docs/how-it-works/data-usage.md): RLPx + discv4 count into
      *  its EL layer, libp2p into its CL layer. Lives as long as the stack, so a
      *  pause/resume keeps counting into the same one. */
     private final com.jaeckel.ethp2p.core.traffic.TrafficMeter traffic =
@@ -190,7 +190,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
     /** Inbound-serve counters (peers asking US for headers/bodies). Stack-owned so the
      *  numbers survive pause/resume connector rebuilds; see ServeStats. */
     private final ServeStats serveStats = new ServeStats();
-    /** The read-fetch shadow cache (docs/read-stats.md): every verified snap
+    /** The read-fetch shadow cache (docs/how-it-works/read-stats.md): every verified snap
      *  fetch — the RPC backend's oracle and the operator queries — reports here.
      *  Stack-owned for the same reason as ServeStats: the backend is rebuilt on
      *  every pause/resume and the counters must not reset with it. */
@@ -737,7 +737,7 @@ public final class ChainStack implements io.myotis.api.NodeLifecycle {
     /** Inbound-serve counters for the status surfaces. */
     public ServeStats serveStats() { return serveStats; }
 
-    /** This stack's data usage, ticked (docs/data-usage.md); {@code force} also
+    /** This stack's data usage, ticked (docs/how-it-works/data-usage.md); {@code force} also
      *  writes today's file. */
     public io.myotis.api.DataUsage dataUsage(boolean force) { return usage.tick(force); }
     public io.myotis.evm.world.ReadStats readStats() { return readStats; }

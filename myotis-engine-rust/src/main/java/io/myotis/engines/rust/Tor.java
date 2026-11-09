@@ -4,7 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Process-wide Tor verified-read routing toggle (docs/privacy-and-tor.md),
+ * Process-wide Tor verified-read routing toggle (docs/how-it-works/privacy-and-tor.md),
  * cloning the {@code Engines} / {@code BlsBackends} selector pattern — a host-UI
  * seam, deliberately NOT on the engine API (like the engine and BLS toggles).
  *

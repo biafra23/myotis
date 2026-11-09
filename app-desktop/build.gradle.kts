@@ -170,7 +170,7 @@ val beePoc: Boolean = flavourFlag("beePoc")
 // The RAILGUN PoC flavour flag (-PrailgunPoc): bundles the mainnet and Sepolia
 // RailgunSmartWallet log-index seeds so the RAILGUN Terminal Wallet can use the
 // app instead of a public RPC provider from the first minute (RailgunPoc.kt,
-// docs/railgun-poc.md). Same accept-or-refuse rule as -PbeePoc.
+// docs/guides/railgun-poc.md). Same accept-or-refuse rule as -PbeePoc.
 val railgunPoc: Boolean = flavourFlag("railgunPoc")
 
 // Exactly one flavour, or none. The two disagree about which network to enable
@@ -316,7 +316,7 @@ val prepareJnaBootLib = tasks.register("prepareJnaBootLib") {
 // ---------------------------------------------------------------------------
 // Bee PoC flavour (-PbeePoc): bundle the Gnosis PostageStamp log-index seed so
 // a Swarm Bee full node can use the app from the first minute (BeePoc.kt;
-// docs/bee-rpc-service.md, "Bee PoC desktop build"). The seed is synthesized
+// docs/guides/bee-rpc-service.md, "Bee PoC desktop build"). The seed is synthesized
 // at build time from the committed data set by scripts/synth_logindex.py and
 // staged into appResources/common/ (Compose flattens common/ next to the
 // os-arch dir) beside a manifest — coverage, expiry, sha256 — that the app
@@ -399,7 +399,7 @@ val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
 // ---------------------------------------------------------------------------
 // RAILGUN PoC flavour (-PrailgunPoc): bundle the RailgunSmartWallet log-index
 // seeds for mainnet AND Sepolia so the RAILGUN Terminal Wallet can be pointed at
-// this app instead of a public RPC provider (RailgunPoc.kt; docs/railgun-poc.md).
+// this app instead of a public RPC provider (RailgunPoc.kt; docs/guides/railgun-poc.md).
 //
 // The seed data is NOT committed, unlike the Bee flavour's. The Bee set is a
 // 3.2 MB gzip (24 MB raw) of ~39k logs; RAILGUN's mainnet one is ~438k logs over 11.4M blocks
@@ -407,7 +407,7 @@ val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
 // network's fetch from a directory given by a property — -PrailgunSeedDir for
 // mainnet (default ~/myotis-node/railgun), -PrailgunSepoliaSeedDir for Sepolia
 // (default ~/myotis-node/railgun-sepolia) — produced by the fetch described in
-// docs/railgun-poc.md, and fails with that instruction when either is not there.
+// docs/guides/railgun-poc.md, and fails with that instruction when either is not there.
 // A missing seed must never degrade into a silently seedless "RAILGUN PoC" build
 // that then backfills for days.
 // ---------------------------------------------------------------------------
@@ -433,7 +433,7 @@ fun railgunSeedDir(property: String, default: String): File = providers.gradlePr
 
 // `from_block` is the engine's "no logs below here" assertion, so a watch block above
 // the real deployment turns real history into plausible empty answers
-// (docs/railgun-poc.md spells this out).
+// (docs/guides/railgun-poc.md spells this out).
 val railgunSeeds = listOf(
     // The REAL deployment block, and the chain agrees: the proxy's first log is at
     // exactly 14737691 and a sweep from genesis found none below it.
@@ -500,7 +500,7 @@ val prepareRailgunPocSeed = tasks.register("prepareRailgunPocSeed") {
         // minute, and a missing or swapped Sepolia dir should not wait for it to say so.
         val fetches = seeds.map { s ->
             check(s.dir.isDirectory) {
-                "railgun-poc: no ${s.network} seed data at ${s.dir}. Fetch it first (docs/railgun-poc.md, " +
+                "railgun-poc: no ${s.network} seed data at ${s.dir}. Fetch it first (docs/guides/railgun-poc.md, " +
                     "\"Building the seed\"), or point -P${s.dirProperty} at a directory holding the " +
                     "fetch's .jsonl and .meta.json."
             }
@@ -754,7 +754,7 @@ tasks.withType<JavaExec>().matching { it.name == "run" || it.name == "syncSmoke"
     // -Pengine=java|rust|auto → -Dmyotis.engine (same knob as :app run).
     (project.findProperty("engine") as String?)?.let { systemProperty("myotis.engine", it) }
     // -Ptor=true → -Dmyotis.tor (dev knob to force Tor routing on at boot; needs the
-    // engine dylib built with -PtorEngine to actually route — docs/privacy-and-tor.md).
+    // engine dylib built with -PtorEngine to actually route — docs/how-it-works/privacy-and-tor.md).
     (project.findProperty("tor") as String?)?.let { systemProperty("myotis.tor", it) }
     doFirst {
         val os = System.getProperty("os.name").lowercase()

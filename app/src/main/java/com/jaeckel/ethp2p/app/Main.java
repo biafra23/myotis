@@ -412,7 +412,7 @@ public final class Main {
             // bit at runtime only (it is not in the portable snapshot), and the
             // daemon has no settings file, so without this a restart resumes the
             // downward walk — which on a node serving a single consumer is exactly
-            // what starves head-follow (docs/bee-rpc-service.md). Applied after
+            // what starves head-follow (docs/guides/bee-rpc-service.md). Applied after
             // start(), because the engine activates a drop-in index during start.
             boolean pauseBackfill = backfillPausedProperty();
             if (!handle.start()) {

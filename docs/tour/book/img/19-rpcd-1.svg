@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 960 290" role="img" fill="currentColor" aria-label="A request through myotis-rpcd. An HTTP client sends a request. One of four intake threads checks the Host and Content-Type headers and parses the body; a large or chunked body is first received on a body-reader thread with a deadline. A body that names only non-blocking methods is answered by the router on the intake thread. A body that names a gated method is sent through a bounded channel to one of the read workers; if the channel is full the request is refused with 503. A read worker runs the router, which holds the request until the node is ready or the ready-wait budget runs out, then calls the engine's blocking ffi functions." width="960" height="290">
+    <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="960.0" height="290.0" fill="#f8fafb" /><defs>
+      <marker id="m-rpcd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+      </marker>
+    </defs>
+    <g font-size="12">
+      <rect x="20" y="40" width="150" height="56" rx="8" stroke-width="1.5" style="fill:var(--surface);stroke:var(--ink-3)" />
+      <text x="95" y="64" text-anchor="middle" font-weight="700">HTTP client</text>
+      <text x="95" y="82" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">POST / · GET / · GET /logindex</text>
+
+      <rect x="215" y="40" width="185" height="56" rx="8" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="307" y="64" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">intake ×4</text>
+      <text x="307" y="82" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">Host · Content-Type · Body::parse</text>
+
+      <rect x="215" y="200" width="185" height="56" rx="8" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)" />
+      <text x="307" y="224" text-anchor="middle" font-weight="700">body reader</text>
+      <text x="307" y="242" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">&gt; 1 KiB or chunked · deadline</text>
+
+      <rect x="450" y="40" width="200" height="56" rx="8" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="550" y="64" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">Router (on intake)</text>
+      <text x="550" y="82" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">config · status · malformed</text>
+
+      <rect x="450" y="135" width="200" height="56" rx="8" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)" />
+      <text x="550" y="159" text-anchor="middle" font-weight="700">sync_channel(queue)</text>
+      <text x="550" y="177" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">full → 503 "server busy"</text>
+
+      <rect x="700" y="135" width="240" height="56" rx="8" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="820" y="159" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">read workers ×16</text>
+      <text x="820" y="177" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">Router: hold ≤ --ready-wait, then read</text>
+
+      <rect x="700" y="40" width="240" height="56" rx="8" stroke-width="1.5" style="fill:var(--jvm-wash);stroke:var(--jvm)" />
+      <text x="820" y="64" text-anchor="middle" font-weight="700" style="fill:var(--jvm-ink)">myotis_engine::ffi</text>
+      <text x="820" y="82" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">blocking reads → host.rs → block_on</text>
+    </g>
+    <g stroke-width="1.5" fill="none" style="stroke:currentColor">
+      <line x1="170" y1="68" x2="211" y2="68" marker-end="url(#m-rpcd-arrow)" />
+      <line x1="290" y1="96" x2="290" y2="196" marker-end="url(#m-rpcd-arrow)" />
+      <line x1="400" y1="68" x2="446" y2="68" marker-end="url(#m-rpcd-arrow)" />
+      <line x1="400" y1="88" x2="446" y2="150" marker-end="url(#m-rpcd-arrow)" />
+      <line x1="400" y1="228" x2="446" y2="178" marker-end="url(#m-rpcd-arrow)" />
+      <line x1="650" y1="163" x2="696" y2="163" marker-end="url(#m-rpcd-arrow)" />
+      <line x1="820" y1="135" x2="820" y2="100" marker-end="url(#m-rpcd-arrow)" />
+    </g>
+    <line x1="650" y1="60" x2="696" y2="60" stroke-width="1.3" stroke-dasharray="5 4" marker-end="url(#m-rpcd-arrow)" style="stroke:var(--ink-3)" />
+    <g font-size="10.5" style="fill:var(--ink-3)">
+      <text x="300" y="150">large body</text>
+      <text x="655" y="52">status only</text>
+      <text x="408" y="128">gated</text>
+      <text x="408" y="62">non-blocking</text>
+    </g>
+  </svg>

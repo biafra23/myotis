@@ -30,7 +30,7 @@ seed and warm peer caches. Demo/debug artefact — the seed is RPC-sourced and
 served unverified (only the backfill walk would re-check it, and the app ships
 with that walk switched off), and it stops catching up about 29
 days after its fetch (the Index tab shows the block it is usable until). See
-docs/bee-rpc-service.md.
+docs/guides/bee-rpc-service.md.
 
 **RAILGUN PoC (`Myotis-v<version>-railgun-poc-arm64.dmg`, when present)** — a separate
 app ("Myotis RAILGUN PoC", own data dir) that the RAILGUN Terminal Wallet CLI can use as
@@ -41,7 +41,7 @@ serves mainnet on port 8555 and Sepolia on 8557, not the regular app's 8545 and 
 point the wallet at `http://127.0.0.1:8555` or `http://127.0.0.1:8557`. Debug/demo
 artefact, not a production path — the seeds are RPC-sourced and unverified (no
 receipt-root proof), and each stops catching up about 69 days after its fetch (the
-Index tab shows the block it is usable until). See docs/railgun-poc.md.
+Index tab shows the block it is usable until). See docs/guides/railgun-poc.md.
 
 **Desktop Linux (`Myotis-v<version>-<arch>.deb`)** — install with
 `sudo apt install ./Myotis-v<version>-<arch>.deb` (x64 for Intel/AMD, arm64 for

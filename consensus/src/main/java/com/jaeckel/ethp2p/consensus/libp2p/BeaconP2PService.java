@@ -314,7 +314,7 @@ public class BeaconP2PService implements AutoCloseable {
     /**
      * A {@code @Sharable} Netty handler to install on every connection's channel
      * BEFORE the secure channel — so it sees the socket's bytes, noise and muxer
-     * framing included (the host's data-usage counter, docs/data-usage.md). Must be
+     * framing included (the host's data-usage counter, docs/how-it-works/data-usage.md). Must be
      * set before {@link #start()}.
      */
     public void setWireHandler(io.netty.channel.ChannelHandler handler) {

@@ -1,10 +1,14 @@
 # Cargo.lock freshness for every lock in the tree.
 #
-# Three locks exist because tor-poc and roost are deliberately NOT workspace
-# members (rust/Cargo.toml `exclude`), so each resolves its own graph:
+# Three locks exist under rust/ because tor-poc and roost are deliberately NOT
+# workspace members (rust/Cargo.toml `exclude`), so each resolves its own graph:
 #   rust/Cargo.lock          the engine workspace
 #   rust/roost/Cargo.lock    the light-client server
 #   rust/tor-poc/Cargo.lock  the Tor proof-of-concept
+# plus the Rust tour's workbook (docs/tour/workbook), a standalone crate whose
+# solution/Cargo.lock is checked here and whose starter/ is generated from
+# solution/ by make_starter.py — `--check` fails if the two differ, lock
+# included. Learners run it with `cargo test --offline --locked`.
 # Only roost.yml builds with --locked; every other cargo invocation in CI and
 # Gradle runs unlocked, so a lock that stops matching its manifests fails
 # nothing until someone's local cargo run silently repairs it and the fix lands
@@ -31,11 +35,13 @@ on:
     paths:
       - "rust/**/Cargo.toml"
       - "rust/**/Cargo.lock"
+      - "docs/tour/workbook/**"
       - ".github/workflows/cargo-locks.yml"
   pull_request:
     paths:
       - "rust/**/Cargo.toml"
       - "rust/**/Cargo.lock"
+      - "docs/tour/workbook/**"
       - ".github/workflows/cargo-locks.yml"
 
 concurrency:
@@ -55,7 +61,10 @@ jobs:
       - name: Resolve every lock without changing it
         run: |
           set -eu
-          for manifest in rust/Cargo.toml rust/roost/Cargo.toml rust/tor-poc/Cargo.toml; do
+          for manifest in rust/Cargo.toml rust/roost/Cargo.toml rust/tor-poc/Cargo.toml \
+                          docs/tour/workbook/solution/Cargo.toml; do
             echo "== $manifest"
             cargo update --workspace --locked --manifest-path "$manifest"
           done
+      - name: The workbook's starter/ matches solution/ (sources and lock)
+        run: python3 docs/tour/workbook/make_starter.py --check

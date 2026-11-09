@@ -3,7 +3,7 @@
 //!
 //! The reference pins the 4-byte fork hash and refreshes it out-of-band
 //! rather than computing the rolling `CRC32(genesisHash ‖ fork blocks/times…)`
-//! from genesis (docs/reimplementation README §6). Same here: the hash is
+//! from genesis (docs/spec README §6). Same here: the hash is
 //! pinned (07-el-implementation-plan.md decision #5), together with the one
 //! timestamp fork this build knows next (`forkNext`). What we announce is the
 //! pin until that fork passes and its successor after: [`fork_id_at`] folds
