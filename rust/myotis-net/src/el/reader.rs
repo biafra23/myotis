@@ -2134,6 +2134,14 @@ pub struct ElReader {
     /// (pipelining pays), false after a budget-truncated one (prefetch would
     /// waste the serving link). See log_index_backfill_batch.
     log_index_pipeline_full: std::sync::atomic::AtomicBool,
+    /// Whether the last batch applied at the cursor came back FULL — every
+    /// block it was asked for. Speculative backfill lanes (#297) chain only
+    /// below a full batch, so a short one means the lanes below it were
+    /// fetched for nothing. Unlike `log_index_pipeline_full` this also sees a
+    /// window cut short on the HEADERS (a peer capping its header serves below
+    /// the 1,023 asked for), which clears no chunk signal. See
+    /// `log_index_backfill_round`.
+    log_index_cursor_batch_full: std::sync::atomic::AtomicBool,
     /// Backfill THROUGHPUT of each peer's most recent batch, in milliblocks per
     /// second (blocks applied × 1000 / seconds elapsed), keyed by dial address —
     /// the walk's own record of who actually moves the cursor fastest.
@@ -2464,6 +2472,7 @@ impl ElReader {
             log_index_unwatch_owed: std::sync::atomic::AtomicBool::new(false),
             log_index_write: std::sync::Mutex::new(()),
             log_index_pipeline_full: std::sync::atomic::AtomicBool::new(true),
+            log_index_cursor_batch_full: std::sync::atomic::AtomicBool::new(true),
             log_index_peer_serve: std::sync::Mutex::new(std::collections::HashMap::new()),
             log_index_backfill_rounds: std::sync::atomic::AtomicU64::new(0),
             log_index_chunk_sizer: ChunkSizer::new(),
@@ -5205,9 +5214,16 @@ impl ElReader {
         // fetch is taken from the one batch that does apply on a link that is
         // already the bottleneck. Measured on Gnosis at ~44.38M (2026-11-09):
         // 5-of-7-candidate serves, and four lanes there walked ~25 blk/s.
+        // Likewise while the last batch at the cursor came back short for any
+        // other reason (`log_index_cursor_batch_full`): a peer that caps its
+        // header serves would otherwise break the chain below lane 0 every
+        // round without ever tripping the chunk signal.
         let lane_peers: Vec<usize> = if max_speed
             && self
                 .log_index_pipeline_full
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && self
+                .log_index_cursor_batch_full
                 .load(std::sync::atomic::Ordering::Relaxed)
         {
             let rates: Vec<Option<u64>> = match self.log_index_peer_serve.lock() {
@@ -5276,7 +5292,12 @@ impl ElReader {
                 Ok(after) => {
                     applied += 1;
                     cursor = after;
-                    if after.0 != top - count {
+                    let full = after.0 == top - count;
+                    if consumed == 1 {
+                        self.log_index_cursor_batch_full
+                            .store(full, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if !full {
                         break; // short: the next lane's top is not the cursor
                     }
                 }
@@ -5287,18 +5308,20 @@ impl ElReader {
             }
         }
         // Cancel what the chain no longer reaches. Those lanes were fetched for
-        // nothing: no measurement, but the turn counts (see
-        // `log_index_note_peer_tried`).
+        // nothing and leave no trace in the scores: no measurement, and
+        // deliberately not their turn either (`log_index_note_peer_tried`). A
+        // peer whose lane keeps being cancelled must still age into the
+        // stalest measurement, or the exploration round would never move it
+        // to the cursor lane for a fresh one.
         drop(fetches);
-        for &(_, _, peer) in lanes.iter().skip(consumed) {
-            self.log_index_note_peer_tried(peer.addr(), round);
-        }
         if cursor_lane_failed {
             // Everything hangs from the batch at the cursor, so it gets what
             // every round always gave it: every other peer, in rank order, one
             // after another — with the speculative lanes already cancelled, so
             // none of them sits out its request timeout unpolled meanwhile.
-            let count = (cur_n - target_low).min(BATCH);
+            let Some(&(_, count, _)) = lanes.first() else {
+                return (false, max_speed); // unreachable: the failed lane is lane 0
+            };
             for peer in peers.iter().skip(1) {
                 let started = std::time::Instant::now();
                 let r = self
@@ -5308,6 +5331,8 @@ impl ElReader {
                 if let Ok(after) = r {
                     applied = 1;
                     cursor = after;
+                    self.log_index_cursor_batch_full
+                        .store(after.0 == cur_n - count, std::sync::atomic::Ordering::Relaxed);
                     break;
                 }
             }
@@ -5398,7 +5423,6 @@ impl ElReader {
         top_hash: Option<[u8; 32]>,
         config: &crate::el::logindex::LogIndexConfig,
     ) -> Result<PreparedBatch, BackfillBatchError> {
-        let cur_n = top_n;
         // The `?` blames the peer (see `impl From<String> for
         // BackfillBatchError`), INCLUDING on a 15s request timeout. That is
         // deliberate, and unlike the chunk-fetch site below it is not made
@@ -5413,7 +5437,7 @@ impl ElReader {
         // exploration round promotes the STALEST measurement, so it is
         // re-measured within a bounded number of rounds (see `RESAMPLE_EVERY`).
         let window = peer
-            .get_block_headers_by_number(cur_n, count + 1, 0, true)
+            .get_block_headers_by_number(top_n, count + 1, 0, true)
             .await?;
         // The PEER does not get to choose the batch size. `max_headers` is a
         // request field an honest peer honours (geth caps at 1024, which is why
@@ -5430,9 +5454,9 @@ impl ElReader {
         let Some((top, rest)) = window.split_first() else {
             return Err(BackfillBatchError::peer("peer returned no headers"));
         };
-        if top.header.number != cur_n || top_hash.is_some_and(|h| top.hash != h) {
+        if top.header.number != top_n || top_hash.is_some_and(|h| top.hash != h) {
             return Err(BackfillBatchError::peer(
-                "peer window does not start at the trusted cursor block",
+                "peer window does not start at the requested top block",
             ));
         }
         if rest.is_empty() {
@@ -14474,11 +14498,14 @@ fn backfill_lane_plan(cursor: u64, target: u64, batch: u64, lanes: usize) -> Vec
 ///
 /// Peer 0 — the ranking's pick — always takes the lane at the cursor, so the
 /// ranking and its exploration round keep deciding who serves the batch
-/// everything hangs from. A further peer joins only if it is unmeasured
-/// (the ranking already samples those first, and a lane is a sample) or its
-/// rate reaches 1/[`BACKFILL_LANE_RATE_FLOOR`] of the best measured one: a
-/// peer that failed last time (rate 0) or crawls would hold the whole round up
-/// for one batch.
+/// everything hangs from, and who gets sampled. A further peer joins only if
+/// it is MEASURED and its rate reaches 1/[`BACKFILL_LANE_RATE_FLOOR`] of the
+/// best measured one. Lanes are applied in order, so a round waits for every
+/// lane above the first break: a peer that failed last time (rate 0), crawls,
+/// or was never measured — a fresh dial that accepts requests and never
+/// answers costs a 15 s timeout per request — would hold the whole round up
+/// for one batch. Unmeasured peers sort first in the ranking anyway, so they
+/// are still sampled, at the cursor lane, where a failure has its fallback.
 fn backfill_lane_peers(rates: &[Option<u64>], max_lanes: usize) -> Vec<usize> {
     if rates.is_empty() || max_lanes == 0 {
         return Vec::new();
@@ -14490,7 +14517,7 @@ fn backfill_lane_peers(rates: &[Option<u64>], max_lanes: usize) -> Vec<usize> {
             break;
         }
         let fast_enough = match rate {
-            None => true,
+            None => false,
             Some(r) => *r > 0 && r.saturating_mul(BACKFILL_LANE_RATE_FLOOR) >= best,
         };
         if fast_enough {
@@ -14539,16 +14566,25 @@ mod backfill_lane_tests {
     }
 
     #[test]
-    fn slow_and_failed_peers_get_no_speculative_lane() {
+    fn slow_failed_and_unmeasured_peers_get_no_speculative_lane() {
         let rates = [Some(1000), Some(0), Some(400), Some(500), None, Some(999)];
-        // 0 failed last time, 400 < 1000/2; 500 is exactly at the floor.
-        assert_eq!(backfill_lane_peers(&rates, 4), vec![0, 3, 4, 5]);
+        // 0 failed last time, 400 < 1000/2, None was never measured; 500 is
+        // exactly at the floor.
+        assert_eq!(backfill_lane_peers(&rates, 4), vec![0, 3, 5]);
     }
 
     #[test]
-    fn unmeasured_peers_are_sampled_and_lanes_are_capped() {
-        assert_eq!(backfill_lane_peers(&[None; 6], BACKFILL_LANES), vec![0, 1, 2, 3]);
-        assert_eq!(backfill_lane_peers(&[None; 6], 1), vec![0]);
+    fn an_unmeasured_peer_is_sampled_only_at_the_cursor_lane() {
+        // The ranking puts unmeasured peers first; the first of them takes the
+        // cursor lane, the measured ones behind it the speculative lanes.
+        assert_eq!(backfill_lane_peers(&[None, None, Some(800), Some(900)], 4), vec![0, 2, 3]);
+        assert_eq!(backfill_lane_peers(&[None; 6], BACKFILL_LANES), vec![0]);
+    }
+
+    #[test]
+    fn lanes_are_capped() {
+        assert_eq!(backfill_lane_peers(&[Some(5); 8], BACKFILL_LANES), vec![0, 1, 2, 3]);
+        assert_eq!(backfill_lane_peers(&[Some(5); 8], 1), vec![0]);
         assert_eq!(backfill_lane_peers(&[], 4), Vec::<usize>::new());
     }
 }
