@@ -8,7 +8,11 @@ tuweni = "2.7.2"
 # biafra23/discovery fork of ConsenSys discovery 26.4.0, branch 26.4.0-android,
 # published via JitPack. Tag 26.4.0-android.1 = fork commit e6168beb7374 — if
 # the tag ever points elsewhere, treat the served artifact as compromised — and
-# SHA-256 of the files JitPack serves for it (recheck offline against
+# SHA-256 of the files JitPack serves for it. ENFORCED since #734: the jar and
+# .module hashes below are pinned in gradle/verification-metadata.xml (they
+# matched these values when pinned, 2026-11-09), so a JitPack rebuild that
+# serves other bytes fails the build closed (Gradle resolves the .module, so the
+# .pom is not in the pinned set). Recheck offline against
 # ~/.gradle/caches/modules-2/files-2.1/com.github.biafra23/discovery/ or a
 # fresh download; the jar's class files are byte-identical to a local
 # `./gradlew publishToMavenLocal` build of the fork commit, though the jar's
@@ -51,7 +55,15 @@ milagro = "0.4.0"
 # Android needs an NDK-built blst (see docs/bls-rust-acceleration.md).
 jblst = "0.3.15"
 jvm-libp2p = "1.3.2-RELEASE"
-trueblocks-kotlin = "main-SNAPSHOT"
+# JitPack build of biafra23/trueblocks-kotlin commit d2223849c1 (main's head when
+# this was pinned, 2026-11-09). A commit-hash version, never a branch build
+# (`main-SNAPSHOT` was one): a branch version changes whenever the branch moves
+# and is re-fetched on cache expiry, so two builds of the same tag could ship
+# different bytes. The artifact's hashes are pinned in
+# gradle/verification-metadata.xml. To move it: pick the new commit, check
+# JitPack built it (https://jitpack.io/api/builds/com.github.biafra23/trueblocks-kotlin
+# lists "<10-hex>": "ok"), then rerun scripts/update_gradle_pins.sh.
+trueblocks-kotlin = "d2223849c1"
 dnsjava = "3.6.2"
 # Hyperledger Besu (myotis-evm). NOTE: 25.7+ RENAMED the maven artifactIds
 # (evm → besu-evm; internal:algorithms → internal:besu-crypto-algorithms) —

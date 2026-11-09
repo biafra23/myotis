@@ -1,0 +1,94 @@
+# Gradle dependency pins (#734, Part 1): every CI host resolves its full graph
+# against the committed lockfiles and gradle/verification-metadata.xml.
+#
+# Why one job per host: some artifacts exist per build host — Compose desktop's
+# skiko natives, Kotlin/Native's compiler bundle, aapt2 — so a pin written on
+# one machine cannot cover the others, and a host the metadata misses fails its
+# FIRST Gradle build closed (verification is strict). The four hosts here are
+# the four that run Gradle in CI: Linux x64 and arm64 (deb, engine natives),
+# macOS arm64 (dmg, iOS framework, engine natives) and Windows x64 (msi).
+#
+# Why a chain and not a matrix: each host adds its entries to the previous
+# host's file, so the last upload (`verification-metadata-merged`) is the
+# union, which `scripts/update_gradle_pins.sh --from-ci` downloads. Every host
+# still CHECKS the committed file first and fails on its own gaps; `!cancelled()`
+# keeps the chain going past a failed host so the union stays complete.
+#
+# What this does not see: an artifact resolved only while a task RUNS on a
+# host (resolveAllDependencies covers every configuration; a plugin's detached
+# one escapes it). Those fail the host's own build workflow — fix them the same
+# way: run the update script there, or add them from that run's log.
+#
+# Triggers: the files that can change the graph or its pins. Push scoped to
+# main so a branch push with an open PR runs once (under pull_request), as in
+# the other workflows; pull_request unscoped, so part PRs into feature branches
+# get it too (CLAUDE.md's multi-PR rule relies on that).
+name: gradle pins
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "gradle/**"
+      - "**/*.gradle.kts"
+      - "**/*.lockfile"
+      - "gradle.properties"
+      - "scripts/update_gradle_pins.sh"
+      - ".github/workflows/gradle-pins.yml"
+      - ".github/workflows/gradle-pins-host.yml"
+  pull_request:
+    # Same list as push (kept literal: no YAML anchors in this repo's workflows).
+    paths:
+      - "gradle/**"
+      - "**/*.gradle.kts"
+      - "**/*.lockfile"
+      - "gradle.properties"
+      - "scripts/update_gradle_pins.sh"
+      - ".github/workflows/gradle-pins.yml"
+      - ".github/workflows/gradle-pins-host.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x64:
+    uses: ./.github/workflows/gradle-pins-host.yml
+    with:
+      runner: ubuntu-latest
+      host: linux-x64
+      upload_as: verification-metadata-linux-x64
+
+  linux-arm64:
+    needs: linux-x64
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/gradle-pins-host.yml
+    with:
+      runner: ubuntu-24.04-arm
+      host: linux-arm64
+      previous: verification-metadata-linux-x64
+      upload_as: verification-metadata-linux-arm64
+
+  macos-arm64:
+    needs: linux-arm64
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/gradle-pins-host.yml
+    with:
+      runner: macos-15
+      host: macos-arm64
+      previous: verification-metadata-linux-arm64
+      upload_as: verification-metadata-macos-arm64
+
+  windows-x64:
+    needs: macos-arm64
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/gradle-pins-host.yml
+    with:
+      runner: windows-latest
+      host: windows-x64
+      previous: verification-metadata-macos-arm64
+      upload_as: verification-metadata-merged
