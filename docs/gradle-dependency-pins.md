@@ -69,6 +69,21 @@ Gradle signals a lock that pins a version the graph rejects only through its
 message text. To catch a rewording on a Gradle bump, the Linux x64 job runs a
 canary that tampers with one lock and one hash and requires both to fail.
 
+### Warm caches write incomplete pins
+
+Gradle reads a parent POM or an imported BOM only while it first parses a
+module's POM, then caches the parsed result. On a warm cache those files are
+never touched again, so `--write-verification-metadata` does not record them,
+and a check run on that cache can't see the gap. When this was set up, 13 such
+files were missing, and every one of them failed the first fresh runner.
+
+So the `gradle pins` chain runs with the Gradle cache **disabled**. Its
+merged file is the authoritative one, and its check proves that a fresh
+checkout verifies. For a complete file locally, run the script against an
+empty Gradle home:
+`GRADLE_USER_HOME=$(mktemp -d) scripts/update_gradle_pins.sh`. This downloads
+everything again.
+
 ### Hosts: why CI has to finish the job
 
 Some artifacts exist once per **build host**:

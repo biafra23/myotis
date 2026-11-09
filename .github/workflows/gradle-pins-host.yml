@@ -72,7 +72,16 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
+      # COLD cache, deliberately. Gradle reads a parent POM or an imported BOM
+      # only while it first parses a module's POM, then caches the parsed
+      # result, so a warm cache never touches those files again: pins written
+      # there miss them, and a check run there cannot notice (13 such files
+      # when this was set up — every one failed the first fresh runner). Only
+      # a cold resolution writes complete pins and proves a fresh checkout
+      # verifies.
       - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-disabled: true
 
       # -PskipRustEngine: no Android Rust toolchain needed to RESOLVE; it
       # changes no dependency. Retried once for transient repository errors —
