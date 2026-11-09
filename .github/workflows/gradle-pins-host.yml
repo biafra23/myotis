@@ -74,14 +74,26 @@ jobs:
 
       # COLD cache, deliberately. Gradle reads a parent POM or an imported BOM
       # only while it first parses a module's POM, then caches the parsed
-      # result, so a warm cache never touches those files again: pins written
-      # there miss them, and a check run there cannot notice (13 such files
-      # when this was set up — every one failed the first fresh runner). Only
-      # a cold resolution writes complete pins and proves a fresh checkout
-      # verifies.
+      # result, so a warm cache never touches those files again: a check run
+      # there cannot notice that they are unpinned (13 such files when this was
+      # set up — every one failed the first fresh runner). Only a cold check
+      # proves a fresh checkout verifies; the write step after it re-parses
+      # with --refresh-dependencies for the same reason.
       - uses: gradle/actions/setup-gradle@v4
         with:
           cache-disabled: true
+
+      # extra_tasks runs an Android resource task, which needs an SDK. Only
+      # ubuntu-latest is documented to ship one (android-apk.yml), so provision
+      # it explicitly instead of trusting each image: without it the check AND
+      # the contribute step fail here, and on the last host that means no
+      # merged file at all. AGP installs the missing platform/build-tools
+      # itself once the licenses are accepted, which this action does. Hosts
+      # without extra_tasks need none: the walk skips the Android
+      # configurations when no SDK is present.
+      - name: Set up the Android SDK
+        if: ${{ inputs.extra_tasks != '' }}
+        uses: android-actions/setup-android@v3
 
       # -PskipRustEngine: no Android Rust toolchain needed to RESOLVE; it
       # changes no dependency. Retried once for transient repository errors —
@@ -106,6 +118,9 @@ jobs:
         if: ${{ inputs.canary }}
         run: |
           set -u
+          # Restore on ANY exit: if the canary itself fails, the tampered files
+          # must not reach the contribute/upload steps that follow.
+          trap 'git checkout -- tx-history/gradle.lockfile gradle/verification-metadata.xml' EXIT
           expect_failure() {
             if out=$(./gradlew :tx-history:resolveAllDependencies -PskipRustEngine --console=plain 2>&1); then
               echo "::error::$1 passed the check — the pin-failure classifier in build.gradle.kts no longer matches"
@@ -146,8 +161,12 @@ jobs:
         run: |
           for attempt in 1 2; do
             # shellcheck disable=SC2086
+            # --refresh-dependencies: the check above just warmed this job's
+            # cache, and a warm cache never re-reads the parent POMs / BOMs it
+            # parsed, so without it this write would miss them (see the
+            # cache note on setup-gradle).
             ./gradlew resolveAllDependencies $EXTRA_TASKS --write-verification-metadata sha256 \
-              -PskipRustEngine --console=plain && exit 0
+              --refresh-dependencies -PskipRustEngine --console=plain && exit 0
             sleep 20
           done
           exit 1

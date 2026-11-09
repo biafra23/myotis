@@ -95,9 +95,15 @@ args=(-PskipRustEngine --console=plain)
 # task runs, which no walk can see — aapt2 and the lint override
 # (gradle.properties' android.experimental.lint.version) are the known ones.
 # No test task runs.
+# --refresh-dependencies: Gradle reads a parent POM or an imported BOM only
+# while it first PARSES a module's POM, then caches the parsed result, so on a
+# warm cache (this host's, or the one the lock run above just warmed) those
+# files are never accessed and never recorded — and a fresh checkout then
+# fails on them. Refreshing re-fetches and re-parses the metadata, so every
+# file a cold resolution touches is recorded.
 tasks=(resolveAllDependencies)
 [[ "$quick" == 1 ]] || tasks+=(assemble lint)
-./gradlew "${tasks[@]}" --write-verification-metadata sha256 "${args[@]}"
+./gradlew "${tasks[@]}" --write-verification-metadata sha256 --refresh-dependencies "${args[@]}"
 
 # Then a VERIFYING walk with both pins in force: proves the result is complete
 # for this host (every configuration resolves, matches its lock and has a hash).

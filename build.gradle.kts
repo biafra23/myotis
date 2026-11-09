@@ -77,16 +77,17 @@ allprojects {
         // Modules whose COORDINATES depend on the build host. Compose's
         // `compose.desktop.currentOs` is a different module per OS/arch
         // (desktop-jvm-macos-arm64, …-linux-x64, …-windows-x64), and with it
-        // skiko's runtime; Kotlin/Native's compiler bundle is one per host. A lock
-        // written on Linux would refuse every macOS and Windows build, so these
-        // stay out of the lock state. Their versions are still fixed (they follow
-        // the pinned Compose / Kotlin plugin versions) and their bytes are still
-        // pinned per host in verification-metadata.xml.
+        // skiko's runtime. A lock written on Linux would refuse every macOS and
+        // Windows build, so these stay out of the lock state. Their versions are
+        // still fixed (they follow the pinned Compose version) and their bytes
+        // are still pinned per host in verification-metadata.xml. (Kotlin/
+        // Native's compiler bundle needs no entry: it is ONE module,
+        // kotlin-native-prebuilt, locked like any other — the host is only in
+        // its artifact's classifier, which the verification metadata pins.)
         ignoredDependencies.addAll(
             listOf(
                 "org.jetbrains.compose.desktop:desktop-jvm-*",
                 "org.jetbrains.skiko:skiko-awt-runtime-*",
-                "org.jetbrains.kotlin:kotlin-native-prebuilt-*",
             ),
         )
         // DEFAULT lock mode, not STRICT: STRICT fails any configuration without

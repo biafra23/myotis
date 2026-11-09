@@ -77,18 +77,17 @@ never touched again, so `--write-verification-metadata` does not record them,
 and a check run on that cache can't see the gap. When this was set up, 13 such
 files were missing, and every one of them failed the first fresh runner.
 
-So the `gradle pins` chain runs with the Gradle cache **disabled**. Its
-merged file is the authoritative one, and its check proves that a fresh
-checkout verifies. For a complete file locally, run the script against an
-empty Gradle home:
-`GRADLE_USER_HOME=$(mktemp -d) scripts/update_gradle_pins.sh`. This downloads
-everything again.
+So every pin-**writing** run uses `--refresh-dependencies`, which re-fetches
+and re-parses the metadata. That covers the update script's hash run and the
+chain's write step, both of which follow a run that has just warmed the cache.
+The `gradle pins` **check** runs with the Gradle cache disabled: only a cold
+resolution proves that a fresh checkout verifies.
 
 ### Hosts: why CI has to finish the job
 
 Some artifacts exist once per **build host**:
 - Compose desktop's `currentOs` runtime and its skiko natives;
-- Kotlin/Native's compiler bundle;
+- Kotlin/Native's compiler bundle (its artifact; the module is the same everywhere);
 - aapt2's per-OS jar.
 
 A Linux machine never downloads the macOS ones, so it cannot pin them. The
