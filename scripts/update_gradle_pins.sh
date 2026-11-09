@@ -6,7 +6,7 @@
 #
 #   scripts/update_gradle_pins.sh            this host: locks + hashes
 #     --quick                                only the configuration walk, not
-#                                            the `assemble lint` pass after it
+#                                            the task pass after it
 #     --prune                                delete the metadata first (full
 #                                            regeneration; see the doc)
 #   scripts/update_gradle_pins.sh --from-ci [RUN]
@@ -90,10 +90,12 @@ args=(-PskipRustEngine --console=plain)
 # Then the hashes, with the NEW locks in force — a separate run on purpose:
 # without lock constraints, conflict resolution also fetches the metadata of
 # every candidate version it then discards, and those would all be pinned. The
-# walk covers every configuration; `assemble lint` follows (unless --quick)
-# because AGP resolves some tools through DETACHED configurations only while a
-# task runs, which no walk can see — aapt2 and the lint override
-# (gradle.properties' android.experimental.lint.version) are the known ones.
+# walk covers every configuration; `assemble lint :app-desktop:checkRuntime`
+# follows (unless --quick) because plugins resolve some tools through DETACHED
+# configurations only while a task runs, which no walk can see — AGP's aapt2
+# and the lint override (gradle.properties' android.experimental.lint.version),
+# and Compose's JDK version probe (checkRuntime, on every desktop package
+# build), are the known ones.
 # No test task runs.
 # --refresh-dependencies: Gradle reads a parent POM or an imported BOM only
 # while it first PARSES a module's POM, then caches the parsed result, so on a
@@ -102,7 +104,7 @@ args=(-PskipRustEngine --console=plain)
 # fails on them. Refreshing re-fetches and re-parses the metadata, so every
 # file a cold resolution touches is recorded.
 tasks=(resolveAllDependencies)
-[[ "$quick" == 1 ]] || tasks+=(assemble lint)
+[[ "$quick" == 1 ]] || tasks+=(assemble lint :app-desktop:checkRuntime)
 ./gradlew "${tasks[@]}" --write-verification-metadata sha256 --refresh-dependencies "${args[@]}"
 
 # Then a VERIFYING walk with both pins in force: proves the result is complete

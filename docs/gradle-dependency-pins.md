@@ -37,8 +37,9 @@ It runs `resolveAllDependencies`, a task in every project that resolves every
 resolvable configuration, three times:
 1. Writing the locks. Verification is `lenient` for this run only, because a
    bumped dependency has no hash yet.
-2. Writing this host's hashes with the new locks in force, plus `assemble lint`
-   (see below; `--quick` skips that). This is a separate run because without
+2. Writing this host's hashes with the new locks in force, plus a few tasks
+   whose plugins resolve tools only while they run (see below; `--quick`
+   skips them). This is a separate run because without
    lock constraints, conflict resolution also fetches the metadata of every
    candidate version it then discards. Pinning those would add some 75 entries
    nobody uses.
@@ -123,13 +124,16 @@ don't write locks on that host.
 An artifact that a plugin resolves through a *detached* configuration while a
 task runs isn't covered by the walk. AGP does this for aapt2 and for the lint
 override (`android.experimental.lint.version` in `gradle.properties`): 43
-components in all when this was set up. So the update script also runs
-`assemble lint` in write mode (`--quick` skips that). In the chain:
+components in all when this was set up. Compose does it for its JDK version
+probe in `:app-desktop:checkRuntime`, which every dmg, deb and msi build runs.
+So the update script also runs `assemble lint :app-desktop:checkRuntime` in
+write mode (`--quick` skips that). In the chain:
 - aapt2 has a jar **per OS**, so the Linux x64, Windows and macOS jobs run
   `:android-app:processDebugResources` alongside the walk. That keeps an
   Android build on a developer's Mac or Windows machine working.
-- lint is the same jar everywhere, and CI's Build and Test job runs it with
-  the pins in force on every PR.
+- lint and the probe are the same jar everywhere. CI's Build and Test job
+  runs lint with the pins in force on every PR; the probe is checked only by
+  the desktop packaging workflows.
 
 Anything else of this kind fails the build workflow that needs it, with
 Gradle's usual verification report. Pin it from that host the same way: run
