@@ -2,12 +2,15 @@
 #
 # 1. CHECK: resolve every configuration with the COMMITTED pins in force.
 #    Fails on a hash this host needs that gradle/verification-metadata.xml does
-#    not carry (or carries wrong), and on a graph that left its gradle.lockfile.
+#    not carry (or carries wrong), on a graph that left its gradle.lockfile, and
+#    on a configuration that resolves with no lock state at all.
 # 2. CONTRIBUTE: whatever the check said, start from the previous host's
 #    metadata (or the committed file on the first host), add this host's
 #    entries with --write-verification-metadata, and upload the result for the
 #    next host. The last host's upload is the union every host needs, which
-#    `scripts/update_gradle_pins.sh --from-ci` downloads.
+#    `scripts/update_gradle_pins.sh --from-ci` downloads. If the previous
+#    host's upload is missing, nothing is uploaded here: a "merged" file built
+#    from the committed one would silently drop that host's entries.
 # 3. Fail the job if step 1 failed — after the upload, so the fix is attached.
 name: gradle pins (host)
 
@@ -18,7 +21,7 @@ on:
         required: true
         type: string
       host:
-        description: Short host name, used in the artifact name
+        description: Short host name, used in messages
         required: true
         type: string
       previous:
@@ -29,6 +32,18 @@ on:
       upload_as:
         required: true
         type: string
+      extra_tasks:
+        description: >-
+          Tasks run alongside the walk, for tools AGP resolves through detached
+          configurations only while a task runs (aapt2 has a jar per OS)
+        required: false
+        type: string
+        default: ''
+      canary:
+        description: Also prove that tampered pins fail the check
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -37,10 +52,12 @@ jobs:
   pins:
     name: ${{ inputs.host }}
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
+    env:
+      EXTRA_TASKS: ${{ inputs.extra_tasks }}
     steps:
       # Git for Windows checks text files out with CRLF by default, and the
       # bash steps run ./gradlew, whose shebang would then end in \r (same
@@ -65,13 +82,49 @@ jobs:
         continue-on-error: true
         run: |
           for attempt in 1 2; do
-            ./gradlew resolveAllDependencies -PskipRustEngine --console=plain && exit 0
+            # shellcheck disable=SC2086 # EXTRA_TASKS is a task list
+            ./gradlew resolveAllDependencies $EXTRA_TASKS -PskipRustEngine --console=plain && exit 0
             echo "::warning::attempt $attempt failed; retrying in 20s"
             sleep 20
           done
           exit 1
 
+      # The check classifies Gradle's failures partly by message text (a lock
+      # that pins a version the graph rejects has no exception type of its
+      # own), so a Gradle bump that rewords it must fail HERE, not turn the
+      # check into a silent pass. One wrong hash, one wrong lock version.
+      - name: Canary — tampered pins must fail the check
+        if: ${{ inputs.canary }}
+        run: |
+          set -u
+          expect_failure() {
+            if out=$(./gradlew :tx-history:resolveAllDependencies -PskipRustEngine --console=plain 2>&1); then
+              echo "::error::$1 passed the check — the pin-failure classifier in build.gradle.kts no longer matches"
+              exit 1
+            fi
+            grep -q 'Dependency pins do not match' <<<"$out" || {
+              echo "$out" | tail -40
+              echo "::error::$1 failed, but not as a pin failure"
+              exit 1
+            }
+            git checkout -- tx-history/gradle.lockfile gradle/verification-metadata.xml
+          }
+          sed -i 's/kethereum:model:0\.86\.0=/kethereum:model:0.85.0=/' tx-history/gradle.lockfile
+          git diff --quiet tx-history/gradle.lockfile && { echo "::error::canary edit did not apply"; exit 1; }
+          expect_failure "a lock pinning another version"
+          python3 - <<'EOF'
+          import re
+          p = "gradle/verification-metadata.xml"
+          s = open(p).read()
+          i = s.index('name="trueblocks-kotlin-')
+          j = s.index('value="', i) + len('value="')
+          s = s[:j] + ("1" if s[j] == "0" else "0") + s[j + 1:]
+          open(p, "w").write(s)
+          EOF
+          expect_failure "a wrong trueblocks-kotlin hash"
+
       - name: Start from the previous host's metadata
+        id: previous
         if: ${{ !cancelled() && inputs.previous != '' }}
         uses: actions/download-artifact@v4
         with:
@@ -79,25 +132,35 @@ jobs:
           path: gradle
 
       - name: Add this host's hashes
-        if: ${{ !cancelled() }}
+        id: contribute
+        if: ${{ !cancelled() && (inputs.previous == '' || steps.previous.outcome == 'success') }}
         run: |
           for attempt in 1 2; do
-            ./gradlew resolveAllDependencies --write-verification-metadata sha256 \
+            # shellcheck disable=SC2086
+            ./gradlew resolveAllDependencies $EXTRA_TASKS --write-verification-metadata sha256 \
               -PskipRustEngine --console=plain && exit 0
             sleep 20
           done
           exit 1
 
       - uses: actions/upload-artifact@v4
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.contribute.outcome == 'success' }}
         with:
           name: ${{ inputs.upload_as }}
           path: gradle/verification-metadata.xml
           if-no-files-found: error
 
       - name: Fail if the committed pins are incomplete for this host
-        if: ${{ steps.check.outcome == 'failure' }}
+        if: ${{ !cancelled() && (steps.check.outcome == 'failure' || steps.contribute.outcome != 'success') }}
+        env:
+          CHECK: ${{ steps.check.outcome }}
+          CONTRIBUTE: ${{ steps.contribute.outcome }}
         run: |
-          echo "::error::the committed Gradle pins do not cover ${{ inputs.host }} (see the check step)." \
-               "Run scripts/update_gradle_pins.sh --from-ci ${{ github.run_id }} once the chain has finished, review the hash diff, and commit it."
+          if [ "$CHECK" = failure ]; then
+            echo "::error::the committed Gradle pins do not cover ${{ inputs.host }} (see the check step)." \
+                 "Once the whole chain has finished, run scripts/update_gradle_pins.sh --from-ci ${{ github.run_id }}, review the hash diff, and commit it."
+          fi
+          if [ "$CONTRIBUTE" != success ]; then
+            echo "::error::${{ inputs.host }} uploaded no metadata (previous host's upload missing, or the write failed), so this run has no complete merged file."
+          fi
           exit 1

@@ -89,6 +89,12 @@ allprojects {
                 "org.jetbrains.kotlin:kotlin-native-prebuilt-*",
             ),
         )
+        // DEFAULT lock mode, not STRICT: STRICT fails any configuration without
+        // lock state, which would break an IDE sync (KGP's IDE-only
+        // *DependenciesMetadata configurations never resolve in a build, so they
+        // have none). resolveAllDependencies enforces STRICT's rule instead,
+        // in the `gradle pins` check: a configuration that resolves without lock
+        // state is a pin failure there.
     }
 
     // Resolves every resolvable configuration of this project (and of its
@@ -97,9 +103,9 @@ allprojects {
     // pins. A plain build resolves only what its tasks happen to need, so pins
     // written from one would miss e.g. the test or lint classpaths and the next
     // build that needs them would fail verification. Configurations that cannot
-    // resolve on this host by design (the iOS cinterop ones off macOS, KGP's
-    // IDE-only *DependenciesMetadata, Android ones without an SDK) are reported
-    // and skipped, not fatal. A PIN failure — an artifact whose hash is missing
+    // resolve in a walk by design (KGP's commonizer inputs <sourceSet>CInterop,
+    // which match no external variant; its IDE-only *DependenciesMetadata; the
+    // Android ones without an SDK) are reported and skipped, not fatal. A PIN failure — an artifact whose hash is missing
     // or wrong, a graph that left its lock state — always fails the task: that
     // is the check the `gradle pins` workflow runs on every CI host.
     tasks.register("resolveAllDependencies") {
@@ -107,8 +113,22 @@ allprojects {
         description = "Resolve every configuration (for scripts/update_gradle_pins.sh)."
         notCompatibleWithConfigurationCache("walks every configuration of the project")
         doLast {
-            val confs = project.buildscript.configurations.filter { it.isCanBeResolved } +
-                project.configurations.filter { it.isCanBeResolved }
+            val buildscriptConfs = project.buildscript.configurations.filter { it.isCanBeResolved }
+            val confs = buildscriptConfs + project.configurations.filter { it.isCanBeResolved }
+            // Lock state as committed: every configuration named in a lockfile
+            // line (`group:name:version=confA,confB` or `empty=confC`). Only the
+            // root's buildscript classpath is locked (see `buildscript {}`).
+            fun lockedIn(file: File): Set<String> =
+                if (!file.isFile) emptySet()
+                else file.readLines()
+                    .filter { it.isNotBlank() && !it.startsWith("#") }
+                    .flatMap { it.substringAfter('=').split(',') }
+                    .map { it.trim() }
+                    .toSet()
+            val projectLocks = lockedIn(project.file("gradle.lockfile"))
+            val buildscriptLocks =
+                if (project == rootProject) lockedIn(rootProject.file("buildscript-gradle.lockfile")) else null
+            val writingLocks = gradle.startParameter.isWriteDependencyLocks
             val pinFailures = mutableListOf<String>()
             confs.forEach { conf ->
                 try {
@@ -123,12 +143,27 @@ allprojects {
                         isLenient = false
                         componentFilter { it is org.gradle.api.artifacts.component.ModuleComponentIdentifier }
                     }.files.files
+                    // A configuration that resolved must HAVE lock state (STRICT's
+                    // rule, enforced here). Checked only now: the graph walk above
+                    // does not throw on an unresolvable dependency, the file
+                    // resolution does.
+                    val locks = if (conf in buildscriptConfs) buildscriptLocks else projectLocks
+                    if (!writingLocks && locks != null && conf.name !in locks) {
+                        pinFailures += "${project.path}:${conf.name} — resolves, but has no lock state"
+                    }
                 } catch (e: Exception) {
                     val chain = generateSequence<Throwable>(e) { it.cause }.toList()
                     val causes = chain.mapNotNull { it.message }.joinToString(" <- ")
+                    // A wrong hash and an entry the lock lacks/has extra raise
+                    // dedicated exceptions; a lock that pins a version the graph
+                    // no longer accepts does NOT — it surfaces as an ordinary
+                    // "cannot find a version that satisfies the constraints"
+                    // failure, recognisable only by the lock's reason string.
                     val isPinFailure = chain.any { t ->
                         t.javaClass.simpleName.let {
                             it == "DependencyVerificationException" || it == "LockOutOfDateException"
+                        } || t.message.orEmpty().let {
+                            "dependency was locked to version" in it || "dependency lock state" in it
                         }
                     }
                     if (isPinFailure) {

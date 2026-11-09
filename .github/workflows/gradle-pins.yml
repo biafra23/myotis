@@ -12,12 +12,15 @@
 # host's file, so the last upload (`verification-metadata-merged`) is the
 # union, which `scripts/update_gradle_pins.sh --from-ci` downloads. Every host
 # still CHECKS the committed file first and fails on its own gaps; `!cancelled()`
-# keeps the chain going past a failed host so the union stays complete.
+# keeps the chain going past a failed check so the union stays complete. A host
+# that uploads nothing stops the uploads after it (gradle-pins-host.yml).
 #
-# What this does not see: an artifact resolved only while a task RUNS on a
-# host (resolveAllDependencies covers every configuration; a plugin's detached
-# one escapes it). Those fail the host's own build workflow — fix them the same
-# way: run the update script there, or add them from that run's log.
+# What the walk does not see: an artifact resolved only while a task RUNS (a
+# plugin's detached configuration). aapt2 is the per-host one, covered by
+# `extra_tasks` below; the lint override is host-independent and comes from
+# the update script's `assemble lint` pass, and ci.yml's Build and Test proves
+# it on every PR. Anything new of this kind fails the host's own build
+# workflow — pin it from there the same way.
 #
 # Triggers: the files that can change the graph or its pins. Push scoped to
 # main so a branch push with an open PR runs once (under pull_request), as in
@@ -56,23 +59,43 @@ permissions:
   contents: read
 
 jobs:
+  # aapt2 (AGP's resource compiler) is a jar PER OS, resolved through a
+  # detached configuration only while a resource task runs, so the hosts with
+  # an Android SDK run one such task alongside the walk. Linux arm64 has no
+  # aapt2 build and no SDK on its image.
   linux-x64:
     uses: ./.github/workflows/gradle-pins-host.yml
     with:
       runner: ubuntu-latest
       host: linux-x64
       upload_as: verification-metadata-linux-x64
+      extra_tasks: ":android-app:processDebugResources"
+      canary: true
+
+  windows-x64:
+    needs: linux-x64
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/gradle-pins-host.yml
+    with:
+      runner: windows-latest
+      host: windows-x64
+      previous: verification-metadata-linux-x64
+      upload_as: verification-metadata-windows-x64
+      extra_tasks: ":android-app:processDebugResources"
 
   linux-arm64:
-    needs: linux-x64
+    needs: windows-x64
     if: ${{ !cancelled() }}
     uses: ./.github/workflows/gradle-pins-host.yml
     with:
       runner: ubuntu-24.04-arm
       host: linux-arm64
-      previous: verification-metadata-linux-x64
+      previous: verification-metadata-windows-x64
       upload_as: verification-metadata-linux-arm64
 
+  # Last on a Unix host on purpose: Gradle rewrites the whole file on every
+  # --write-verification-metadata run, so the merged upload carries LF line
+  # endings whatever Windows wrote (update_gradle_pins.sh strips \r as well).
   macos-arm64:
     needs: linux-arm64
     if: ${{ !cancelled() }}
@@ -81,14 +104,5 @@ jobs:
       runner: macos-15
       host: macos-arm64
       previous: verification-metadata-linux-arm64
-      upload_as: verification-metadata-macos-arm64
-
-  windows-x64:
-    needs: macos-arm64
-    if: ${{ !cancelled() }}
-    uses: ./.github/workflows/gradle-pins-host.yml
-    with:
-      runner: windows-latest
-      host: windows-x64
-      previous: verification-metadata-macos-arm64
       upload_as: verification-metadata-merged
+      extra_tasks: ":android-app:processDebugResources"
