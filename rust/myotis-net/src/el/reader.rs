@@ -5216,8 +5216,11 @@ impl ElReader {
         // 5-of-7-candidate serves, and four lanes there walked ~25 blk/s.
         // Likewise while the last batch at the cursor came back short for any
         // other reason (`log_index_cursor_batch_full`): a peer that caps its
-        // header serves would otherwise break the chain below lane 0 every
-        // round without ever tripping the chunk signal.
+        // header serves would otherwise break the chain below its lane every
+        // round without ever tripping the chunk signal. Every applied lane
+        // writes it, speculative ones included, so whichever lane that peer
+        // serves, the next round runs one lane until a full batch at the
+        // cursor turns the lanes back on.
         let lane_peers: Vec<usize> = if max_speed
             && self
                 .log_index_pipeline_full
@@ -5293,10 +5296,13 @@ impl ElReader {
                     applied += 1;
                     cursor = after;
                     let full = after.0 == top - count;
-                    if consumed == 1 {
-                        self.log_index_cursor_batch_full
-                            .store(full, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    // Every applied lane was applied AT the cursor (the one
+                    // above it left the cursor exactly at its top), so each
+                    // one updates the flag — a peer that caps its header
+                    // serves turns the lanes off from a speculative lane just
+                    // as it does from lane 0.
+                    self.log_index_cursor_batch_full
+                        .store(full, std::sync::atomic::Ordering::Relaxed);
                     if !full {
                         break; // short: the next lane's top is not the cursor
                     }
