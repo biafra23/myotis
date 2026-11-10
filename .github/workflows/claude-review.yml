@@ -9,9 +9,9 @@
 #      API credits instead, swap the input below for
 #      anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}.
 #
-# Model strategy — Fable 5 first, the newest Opus when its limit is exhausted:
-#   Usage limits are PER MODEL, so an exhausted Fable 5 limit leaves Opus
-#   untouched. Fable 5 is the more capable reviewer, so it gets first refusal;
+# Model strategy — latest Fable first, latest Opus when its limit is exhausted:
+#   Usage limits are PER MODEL, so an exhausted Fable limit leaves Opus
+#   untouched. Fable is the more capable reviewer, so it gets first refusal;
 #   Opus covers the gap instead of the review silently not happening (which
 #   is what did happen on 2026-08-07: the job errored at turn 1 for
 #   total_cost_usd 0, having read nothing and posted nothing).
@@ -223,9 +223,18 @@ jobs:
         id: start
         run: echo "at=$(date -u -d '-2 seconds' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
-      # First choice. continue-on-error so an exhausted Fable 5 limit falls
+      # First choice. continue-on-error so an exhausted Fable limit falls
       # through to the Opus fallback job instead of failing this one.
-      - name: Review (Fable 5)
+      # `fable` is Claude Code's alias for the latest Fable, as `opus` is for
+      # the latest Opus below, so this attempt moves to each new Fable with no
+      # edit here; the full ID it used to name, `claude-fable-5`, stays on that
+      # one model. The alias resolves at run time like `opus` (see there), and
+      # an ANTHROPIC_DEFAULT_FABLE_MODEL env var overrides it the same way.
+      # Checked 2026-11-10 against Claude Code 2.1.322's model catalog: `fable`
+      # resolves to claude-fable-5-2 for the first-party API this job uses
+      # (only a gateway provider maps it to claude-fable-5); each run's
+      # "Claude Code initialized" log line names the model it got.
+      - name: Review (latest Fable)
         id: fable
         continue-on-error: true
         uses: anthropics/claude-code-action@v1
@@ -233,7 +242,7 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: ${{ steps.prompt.outputs.text }}
           claude_args: |
-            --model claude-fable-5
+            --model fable
             --effort max
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
@@ -327,30 +336,30 @@ jobs:
             # attempt is taken at its word; only a failed one stops the job.
             if [ "$OUTCOME" = success ] && [ -n "$CLAUDE_SESSION" ]; then
               echo "safe=false" >> "$GITHUB_OUTPUT"
-              echo "::warning::Listing the PR's comments failed 3 times. Fable 5 ended cleanly, so this assumes it left its review and runs no fallback. Check the PR, and re-run this workflow if it has none."
+              echo "::warning::Listing the PR's comments failed 3 times. Fable ended cleanly, so this assumes it left its review and runs no fallback. Check the PR, and re-run this workflow if it has none."
               exit 0
             fi
-            echo "::error::Listing the PR's comments failed 3 times, so whether Fable 5 left a review is unknown. Check the PR before re-running: a re-run starts a new review."
+            echo "::error::Listing the PR's comments failed 3 times, so whether Fable left a review is unknown. Check the PR before re-running: a re-run starts a new review."
             exit 1
           fi
-          echo "Fable 5: $OUTCOME; reviewer comments posted or edited since $SINCE: $left"
+          echo "Fable: $OUTCOME; reviewer comments posted or edited since $SINCE: $left"
           if [ "$left" -eq 0 ]; then
             echo "safe=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::Fable 5 left no review (step $OUTCOME) — running the Opus fallback. The step before this one shows what it was refused and how it ended."
+            echo "::warning::Fable left no review (step $OUTCOME) — running the Opus fallback. The step before this one shows what it was refused and how it ended."
           else
             echo "safe=false" >> "$GITHUB_OUTPUT"
             if [ "$OUTCOME" = failure ]; then
-              echo "::warning::Fable 5 failed after posting $left comment(s) — suppressing the Opus fallback so the PR does not get two overlapping reviews."
+              echo "::warning::Fable failed after posting $left comment(s) — suppressing the Opus fallback so the PR does not get two overlapping reviews."
             fi
           fi
 
       # Suppressing the fallback must not look like a clean review. Without
-      # this the job would go green (continue-on-error masks the Fable 5
+      # this the job would go green (continue-on-error masks the Fable
       # failure) having left only a partial review on the PR.
       - name: Fail when the review was left incomplete
         if: steps.fable.outcome == 'failure' && steps.unposted.outputs.safe != 'true'
         run: |
-          echo "::error::The Fable 5 review failed partway through, after already posting to the PR. The Opus fallback was suppressed to avoid a duplicate review, so this PR has only partial feedback — close/reopen it for a clean pass."
+          echo "::error::The Fable review failed partway through, after already posting to the PR. The Opus fallback was suppressed to avoid a duplicate review, so this PR has only partial feedback — close/reopen it for a clean pass."
           exit 1
 
   # The second attempt runs on a runner of its own. Two runs of the action in
@@ -400,7 +409,7 @@ jobs:
       # 2026-09-25 with action v1.0.234 / Claude Code 2.1.282: `opus` resolves
       # to claude-opus-5-5; each run's "Claude Code initialized" log line names
       # the model it got. To pin one Opus instead, put its full ID here.
-      - name: Review (latest Opus — Fable 5 left no review)
+      - name: Review (latest Opus — Fable left no review)
         id: opus
         uses: anthropics/claude-code-action@v1
         with:
@@ -468,6 +477,6 @@ jobs:
           fi
           echo "Reviewer comments posted or edited since $SINCE: $left"
           if [ "$left" -eq 0 ]; then
-            echo "::error::Neither Fable 5 nor the Opus fallback posted a review, so this PR has none. Each job's report step shows what its attempt was refused and how it ended. Re-run this workflow for another pass (it replays the same commit)."
+            echo "::error::Neither Fable nor the Opus fallback posted a review, so this PR has none. Each job's report step shows what its attempt was refused and how it ended. Re-run this workflow for another pass (it replays the same commit)."
             exit 1
           fi
