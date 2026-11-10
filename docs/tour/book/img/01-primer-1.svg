@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 940 330" role="img" fill="currentColor" aria-label="Java versus Rust memory. In Java two stack variables a and b both reference one heap byte array, which the garbage collector frees later. In Rust, variable a has been moved into b; b is a pointer, length and capacity on the stack that owns a heap buffer of capacity 8 holding 5 bytes; s is a slice, a pointer plus length 3, that borrows bytes 1 to 3 of the same buffer. The buffer is freed when b goes out of scope." width="940" height="330">
+    <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="940.0" height="330.0" fill="#f8fafb" /><defs>
+      <marker id="m1-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+      </marker>
+    </defs>
+    
+    <text x="20" y="26" font-size="12" font-weight="700" letter-spacing="1.2" style="fill:var(--jvm-ink)">JAVA</text>
+    <text x="20" y="46" font-size="12.5" class="mono">byte[] a = {1,2,3,4,5}; byte[] b = a;</text>
+    <rect x="20" y="66" width="130" height="118" rx="6" stroke-width="1.2" style="fill:var(--surface);stroke:var(--rule-strong)" />
+    <text x="30" y="84" font-size="10.5" letter-spacing="1" style="fill:var(--ink-3)">STACK FRAME</text>
+    <rect x="32" y="96" width="106" height="30" rx="4" style="fill:var(--jvm-wash)" />
+    <text x="42" y="116" font-size="12.5" class="mono">a  ref</text>
+    <rect x="32" y="138" width="106" height="30" rx="4" style="fill:var(--jvm-wash)" />
+    <text x="42" y="158" font-size="12.5" class="mono">b  ref</text>
+    <rect x="236" y="96" width="196" height="76" rx="6" stroke-width="1.2" style="fill:var(--surface);stroke:var(--rule-strong)" />
+    <text x="246" y="114" font-size="10.5" letter-spacing="1" style="fill:var(--ink-3)">HEAP · OBJECT</text>
+    <text x="246" y="136" font-size="12.5" class="mono">header · length 5</text>
+    <text x="246" y="158" font-size="12.5" class="mono">01 02 03 04 05</text>
+    <line x1="128" y1="111" x2="233" y2="118" stroke="currentColor" stroke-width="1.4" marker-end="url(#m1-arrow)" />
+    <line x1="128" y1="153" x2="233" y2="150" stroke="currentColor" stroke-width="1.4" marker-end="url(#m1-arrow)" />
+    <text x="20" y="214" font-size="12" style="fill:var(--ink-2)">Two live references to one array.</text>
+    <text x="20" y="232" font-size="12" style="fill:var(--ink-2)">Either may write; the GC frees it “later”.</text>
+
+    <line x1="466" y1="16" x2="466" y2="316" stroke-width="1" stroke-dasharray="3 4" style="stroke:var(--rule-strong)" />
+
+    
+    <text x="490" y="26" font-size="12" font-weight="700" letter-spacing="1.2" style="fill:var(--oxide-ink)">RUST</text>
+    <text x="490" y="46" font-size="12.5" class="mono">let a = vec![1u8,2,3,4,5]; let b = a; let s = &amp;b[1..4];</text>
+    <rect x="490" y="66" width="182" height="214" rx="6" stroke-width="1.2" style="fill:var(--surface);stroke:var(--rule-strong)" />
+    <text x="500" y="84" font-size="10.5" letter-spacing="1" style="fill:var(--ink-3)">STACK FRAME</text>
+    <rect x="502" y="94" width="158" height="30" rx="4" stroke-width="1" stroke-dasharray="3 3" style="fill:none;stroke:var(--ink-3)" />
+    <text x="512" y="114" font-size="12.5" class="mono" style="fill:var(--ink-3)">a  (moved)</text>
+    <line x1="508" y1="109" x2="652" y2="109" stroke-width="1.2" style="stroke:var(--bad)" />
+    <rect x="502" y="134" width="158" height="74" rx="4" style="fill:var(--oxide-wash)" />
+    <text x="512" y="152" font-size="12.5" class="mono" font-weight="700">b: Vec&lt;u8&gt;</text>
+    <text x="512" y="171" font-size="12" class="mono">ptr ●</text>
+    <text x="512" y="188" font-size="12" class="mono">len 5 · cap 8</text>
+    <text x="512" y="203" font-size="10.5" style="fill:var(--ink-3)">owner</text>
+    <rect x="502" y="218" width="158" height="54" rx="4" style="fill:var(--ground-2)" />
+    <text x="512" y="236" font-size="12.5" class="mono" font-weight="700">s: &amp;[u8]</text>
+    <text x="512" y="255" font-size="12" class="mono">ptr ● · len 3</text>
+    <text x="512" y="268" font-size="10.5" style="fill:var(--ink-3)">borrow</text>
+
+    <rect x="726" y="134" width="196" height="66" rx="6" stroke-width="1.2" style="fill:var(--surface);stroke:var(--rule-strong)" />
+    <text x="736" y="152" font-size="10.5" letter-spacing="1" style="fill:var(--ink-3)">HEAP · BUFFER</text>
+    <g class="mono" font-size="12">
+      <rect x="736" y="162" width="22" height="26" style="fill:var(--oxide-wash)" /><text x="747" y="180" text-anchor="middle">01</text>
+      <rect x="759" y="162" width="22" height="26" style="fill:var(--oxide-wash)" /><text x="770" y="180" text-anchor="middle">02</text>
+      <rect x="782" y="162" width="22" height="26" style="fill:var(--oxide-wash)" /><text x="793" y="180" text-anchor="middle">03</text>
+      <rect x="805" y="162" width="22" height="26" style="fill:var(--oxide-wash)" /><text x="816" y="180" text-anchor="middle">04</text>
+      <rect x="828" y="162" width="22" height="26" style="fill:var(--oxide-wash)" /><text x="839" y="180" text-anchor="middle">05</text>
+      <rect x="851" y="162" width="22" height="26" stroke-width="1" stroke-dasharray="2 2" style="fill:none;stroke:var(--rule-strong)" />
+      <rect x="874" y="162" width="22" height="26" stroke-width="1" stroke-dasharray="2 2" style="fill:none;stroke:var(--rule-strong)" />
+      <rect x="897" y="162" width="22" height="26" stroke-width="1" stroke-dasharray="2 2" style="fill:none;stroke:var(--rule-strong)" />
+    </g>
+    <path d="M556 167 C 640 130, 700 130, 745 158" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#m1-arrow)" />
+    <path d="M556 251 C 660 262, 740 236, 769 192" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#m1-arrow)" />
+    <path d="M759 202 V210 H826 V202" fill="none" stroke-width="1.4" style="stroke:var(--oxide)" />
+    <text x="792" y="226" text-anchor="middle" font-size="11" style="fill:var(--oxide-ink)">s = b[1..4]</text>
+    <text x="726" y="258" font-size="12" style="fill:var(--ink-2)">One owner. Freed exactly when</text>
+    <text x="726" y="276" font-size="12" style="fill:var(--ink-2)"><tspan class="mono">b</tspan> goes out of scope; <tspan class="mono">s</tspan> may</text>
+    <text x="726" y="294" font-size="12" style="fill:var(--ink-2)">not outlive <tspan class="mono">b</tspan> (compile-time check).</text>
+  </svg>

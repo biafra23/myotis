@@ -1,0 +1,512 @@
+<!--meta {"id":"stop-16","num":16,"title":"myotis-engine: the boundary","short":"engine · FFI boundary","sub":"9 files · 12,941 lines","part":"Boundaries & binaries"} -->
+<header class="stop-head">
+  <div class="eyebrow">Stop 16 · crate <code>myotis-engine</code> <span>9 files · 12,941 lines · about 190 minutes</span></div>
+  <h1>myotis-engine: the boundary</h1>
+  <p class="lede">This is where Kotlin, Swift, JavaScript and other Rust binaries meet the engine. Four host routes lead through two thin export files into one big file, <code>host.rs</code>. It owns the process's only engine tokio runtime and a registry of chain handles, and exposes every contract operation as a plain blocking function: strings and integers in, a JSON string, a <code>bool</code> or a negative sentinel out. Exceptions and panics never cross the boundary. The C half of the boundary is the one place in the codebase where raw pointers are handed to foreign code.</p>
+</header>
+
+<div class="learn">
+  <h2>Rust you will practise</h2>
+  <div><b>Blocking meets async</b><code>rt.block_on</code> on a foreign thread, <code>rt.enter()</code> and <code>rt.spawn</code> from outside the runtime, and why a lock must never be held across <code>block_on</code>.</div>
+  <div><b>Ownership across a C boundary</b><code>CString::into_raw</code> / <code>from_raw</code>, <code>CStr</code>, <code>unsafe extern "C"</code> and its <code># Safety</code> contract, and one <code>unsafe</code> call into libc.</div>
+  <div><b>Global state</b><code>static OnceLock&lt;…&gt;</code>, <code>static AtomicU8</code>, <code>std::sync::Once</code>, an enum state machine inside a <code>Mutex&lt;HashMap&gt;</code>, and moving values out of a map.</div>
+</div>
+
+<section class="prose">
+  <h3>Four routes, two doors</h3>
+  <p>Every host ends up in <code>host.rs</code>, but there are two doors into it. <code>ffi.rs</code> is the UniFFI surface: ordinary Rust functions marked <code>#[uniffi::export]</code>. <code>capi.rs</code> is a hand-written C ABI. Which door a host takes depends on what it can link against.</p>
+  <ul>
+    <li><strong>JVM</strong> (the Android app, the desktop app, the daemon, and the engine library <code>eth.myotis:myotis-engine</code> that a separate wallet consumes): <code>RustEngineNative</code> in <code>:myotis-engine-rust</code> calls the UniFFI-generated Kotlin in <code>myotis_engine.kt</code>, which calls <code>libmyotis_engine</code> through JNA. That reaches <code>ffi.rs</code>. Stop 17 (<a href="#stop-17">UniFFI end to end</a>) takes this route apart; here it is a black box.</li>
+    <li><strong>iOS</strong>: <code>:myotis-engine-ios</code> runs Kotlin/Native cinterop over the hand-kept header <code>rust/include/myotis_engine.h</code>. Its <code>RustEngine.kt</code> calls the <code>myotis_*</code> functions in <code>capi.rs</code>, statically linked from <code>libmyotis_engine.a</code>.</li>
+    <li><strong>Node and Electron</strong>: <code>myotis-node</code> (napi-rs, <a href="#stop-18">Stop 18</a>) links this crate as an <code>rlib</code> and calls the <code>capi</code> functions by Rust path.</li>
+    <li><strong>The standalone daemon</strong> <code>myotis-rpcd</code> (<a href="#stop-19">Stop 19</a>) is new since September. It also links the <code>rlib</code>, but calls the <code>ffi</code> functions by Rust path, as plain Rust functions. It uses <code>capi</code> only for the two functions UniFFI does not export: <code>myotis_set_boot_enodes</code> and <code>myotis_create_with_checkpoint</code>.</li>
+  </ul>
+  <p>A <code>#[uniffi::export]</code> function stays an ordinary <code>pub fn</code>; the macro only adds a C-callable twin beside it. That is why <code>myotis-rpcd</code> and the example binary at the end of this stop can call <code>ffi::create_handle(String, String)</code> directly, with no FFI in between.</p>
+</section>
+
+<figure class="diagram">
+  <div class="svg-wrap">
+  <svg class="wide-diagram" viewBox="0 0 960 400" role="img" fill="currentColor" xmlns="http://www.w3.org/2000/svg"
+       aria-label="Four host routes into the engine. The JVM calls ffi.rs through UniFFI-generated Kotlin over JNA. myotis-rpcd calls ffi.rs by Rust path. iOS calls capi.rs through a C header and cinterop. Node and Electron call capi.rs by Rust path from myotis-node. ffi.rs and capi.rs both call host.rs with strings and integers. host.rs blocks the calling thread in rt.block_on while the tokio runtime's own threads run the sync loop, EL reader and appender tasks; results are serialized by eljson.rs, data usage is kept by usage.rs, and the answer returns as a JSON string, bool or negative sentinel.">
+    <defs>
+      <marker id="m-stop16-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+      </marker>
+    </defs>
+    <g font-size="12">
+      <rect x="20" y="20" width="200" height="62" rx="8" stroke-width="1.5" style="fill:var(--jvm-wash);stroke:var(--jvm)"/>
+      <text x="120" y="42" text-anchor="middle" font-weight="700" style="fill:var(--jvm-ink)">JVM: apps + engine AAR/jar</text>
+      <text x="120" y="60" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">RustEngineNative →</text>
+      <text x="120" y="74" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">generated Kotlin</text>
+
+      <rect x="20" y="110" width="200" height="62" rx="8" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="120" y="136" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">myotis-rpcd</text>
+      <text x="120" y="154" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">Rust daemon, no JVM</text>
+
+      <rect x="20" y="200" width="200" height="62" rx="8" stroke-width="1.5" style="fill:var(--jvm-wash);stroke:var(--jvm)"/>
+      <text x="120" y="226" text-anchor="middle" font-weight="700" style="fill:var(--jvm-ink)">iOS</text>
+      <text x="120" y="244" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">myotis-engine-ios (cinterop)</text>
+
+      <rect x="20" y="290" width="200" height="62" rx="8" stroke-width="1.5" style="fill:var(--surface);stroke:var(--ink-3)"/>
+      <text x="120" y="316" text-anchor="middle" font-weight="700">Node / Electron</text>
+      <text x="120" y="334" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">myotis-node (napi-rs)</text>
+
+      <rect x="300" y="60" width="170" height="58" rx="8" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="385" y="84" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">ffi.rs</text>
+      <text x="385" y="102" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">#[uniffi::export] × 55</text>
+
+      <rect x="300" y="230" width="170" height="58" rx="8" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="385" y="254" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">capi.rs</text>
+      <text x="385" y="272" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">extern "C" × 58</text>
+
+      <rect x="540" y="130" width="180" height="120" rx="8" stroke-width="2" style="fill:var(--surface);stroke:var(--oxide)"/>
+      <text x="630" y="158" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">host.rs</text>
+      <text x="630" y="178" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">static ENGINE</text>
+      <text x="630" y="194" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">Mutex&lt;HashMap&lt;id, ChainEntry&gt;&gt;</text>
+      <text x="630" y="220" text-anchor="middle" font-size="11" font-weight="700">rt.block_on(…)</text>
+
+      <rect x="790" y="40" width="150" height="80" rx="8" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)"/>
+      <text x="865" y="64" text-anchor="middle" font-weight="700">tokio runtime</text>
+      <text x="865" y="82" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">sync loop, EL reader,</text>
+      <text x="865" y="98" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">appenders, ticker</text>
+
+      <rect x="790" y="160" width="150" height="58" rx="8" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)"/>
+      <text x="865" y="184" text-anchor="middle" font-weight="700">eljson.rs</text>
+      <text x="865" y="202" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">result → JSON</text>
+
+      <rect x="790" y="250" width="150" height="58" rx="8" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)"/>
+      <text x="865" y="274" text-anchor="middle" font-weight="700">usage.rs</text>
+      <text x="865" y="292" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">day ledger per handle</text>
+    </g>
+    <g stroke-width="1.5" fill="none" style="stroke:currentColor">
+      <line x1="220" y1="51" x2="296" y2="78" marker-end="url(#m-stop16-arrow)"/>
+      <line x1="220" y1="141" x2="296" y2="104" marker-end="url(#m-stop16-arrow)"/>
+      <line x1="220" y1="231" x2="296" y2="252" marker-end="url(#m-stop16-arrow)"/>
+      <line x1="220" y1="321" x2="296" y2="272" marker-end="url(#m-stop16-arrow)"/>
+      <path d="M470,89 C505,89 510,160 536,168" marker-end="url(#m-stop16-arrow)"/>
+      <path d="M470,259 C505,259 510,222 536,214" marker-end="url(#m-stop16-arrow)"/>
+      <line x1="720" y1="160" x2="786" y2="90" marker-end="url(#m-stop16-arrow)"/>
+      <line x1="720" y1="190" x2="786" y2="189" marker-end="url(#m-stop16-arrow)"/>
+      <line x1="720" y1="225" x2="786" y2="275" marker-end="url(#m-stop16-arrow)"/>
+    </g>
+    <path d="M600,250 C560,380 380,380 300,345" stroke-width="1.3" stroke-dasharray="5 4" fill="none" marker-end="url(#m-stop16-arrow)" style="stroke:var(--ok)"/>
+    <g font-size="10.5" style="fill:var(--ink-3)">
+      <text x="258" y="56" text-anchor="middle">JNA</text>
+      <text x="258" y="114" text-anchor="middle">Rust path</text>
+      <text x="258" y="234" text-anchor="middle">C header</text>
+      <text x="258" y="310" text-anchor="middle">Rust path</text>
+      <text x="503" y="130" text-anchor="middle">&amp;str, i64</text>
+      <text x="760" y="114" text-anchor="middle">waits</text>
+      <text x="760" y="182" text-anchor="middle">serialize</text>
+      <text x="760" y="242" text-anchor="middle">ticks</text>
+      <text x="470" y="392" text-anchor="middle" style="fill:var(--ok)">JSON String · bool · i64 sentinel</text>
+    </g>
+  </svg>
+  </div>
+  <figcaption>Every route ends in the same <code>host.rs</code> functions. The caller's thread (a JVM, iOS, Node or rpcd thread) blocks in <code>rt.block_on</code>, while long-lived work runs on the runtime's own threads. Only strings, integers and booleans cross the boundary; compound values are JSON whose shape is pinned by golden tests on both sides.</figcaption>
+</figure>
+
+<div class="callout rust">
+  <span class="k">No HTTP server in this crate</span>
+  <p>The engine answers function calls, not HTTP. The JVM apps' loopback JSON-RPC listener is a port, <code>LoopbackRpc</code>, in <code>:myotis-engine-rust</code>; the <code>:myotis-engines</code> selector fills it with <code>KtorLoopbackRpc</code>. An in-process consumer of the engine library (<code>Myotis.newEngine()</code>) gets no listener at all and calls <code>reads()</code> directly. <code>myotis-rpcd</code> brings its own JSON-RPC server, in Rust. All three end in the functions on this page.</p>
+</div>
+
+<div class="callout jvm">
+  <span class="k">What changed since September</span>
+  <p><code>ABI_VERSION</code> went from 26 to 55. The UniFFI surface grew from 38 to 55 exports and the C ABI from 40 to 58 functions: <code>eth_getProof</code>, block-hash resolution, raw transactions, the full transaction object for <code>eth_call</code> / <code>eth_estimateGas</code> / <code>eth_createAccessList</code>, <code>debug_traceCall</code>, <code>eth_simulateV1</code>, a send gate, DNS discovery, data usage, address activity and Tor storage directories. The catalog gained Chiado (four networks, all hosted), and Gnosis now has names (<code>.gno</code>). <code>host.rs</code> doubled to 7,199 lines; <code>EngineState</code> went from 7 fields to 15. <code>usage.rs</code> is new. The NULL-<code>to</code> inconsistency in <code>myotis_eth_call_json</code> that the old tour flagged was fixed in ABI 29.</p>
+</div>
+
+<x-file path="rust/myotis-engine/src/lib.rs" kind="crate root" twin="RustEngineNative.EXPECTED_ABI_VERSION">
+  <p class="purpose">Declares the modules, expands UniFFI's crate-level scaffolding, and defines <code>ABI_VERSION</code> (now 55), the number every host checks at startup. Most of the file's 406 lines are that constant's doc comment: one entry per version since v2, a changelog of every surface change. The crate is built as a <code>cdylib</code> (loaded by JNA), as an <code>rlib</code> (linked by <code>myotis-node</code> and <code>myotis-rpcd</code>), and, via Gradle, as an iOS <code>staticlib</code>. It is the library crate that <em>builds and owns</em> a tokio runtime for its hosts.</p>
+  <x-code src="myotis-engine/src/lib.rs" from="16" to="29"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo</x-tags> <strong>Visibility at the module line.</strong> Each <code>mod x;</code> pulls <code>x.rs</code> into the module tree, and that line decides its visibility. <code>pub mod capi</code> and <code>pub mod ffi</code> are reachable from other crates; <code>mod host</code>, <code>mod eljson</code> and <code>mod usage</code> are visible only inside this one, like a package whose classes are all package-private. So <code>myotis-rpcd</code> can call <code>myotis_engine::ffi::status_json</code> but not <code>myotis_engine::host::status_json</code>.</li>
+    <li><x-tags>macros unsafe-ffi</x-tags> <code>uniffi::setup_scaffolding!()</code> expands into whole items at the crate root: a tag type, checksum functions and <code>#[no_mangle]</code> glue that the generated Kotlin calls. <code>#[uniffi::export]</code> in <code>ffi.rs</code> refers back to that tag. The details are in <a href="#stop-17">Stop 17</a>.</li>
+  </ul>
+  <x-code src="myotis-engine/src/lib.rs" from="384" to="406"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain</x-tags> <strong>Bump on every shape change.</strong> The last two entries show the house rule: an <em>additive</em> function still bumps the version, "so a host that serves <code>eth_simulateV1</code> is never paired with an engine that lacks it". On the JVM the number is a backup check, because UniFFI's per-function checksums fail first when a stale library is loaded. For the iOS C ABI it is the main check: <code>RustEngine.EXPECTED_ABI_VERSION</code> is read from the header's <code>MYOTIS_ABI_VERSION</code>, and a test in <code>capi.rs</code> pins the header to this constant.</li>
+    <li><x-tags>modules-cargo</x-tags> <code>pub use</code> re-exports an item from a dependency under this crate's name. <code>MAX_PROOF_STORAGE_KEYS</code> is re-exported so <code>myotis-rpcd</code> can refuse an oversized <code>eth_getProof</code> before it reaches the engine, without depending on <code>myotis-net</code> itself. <code>bls_dst</code> is re-exported only to keep the consensus crate in the build graph.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/myotis-engine/src/catalog.rs" kind="engine" twin="NetworkConfig.allNetworks() / NetworkInfo">
+  <p class="purpose">The built-in network list: a <code>const</code> array of four records (mainnet, gnosis, sepolia, chiado), serialized to the same camelCase JSON as <code>io.myotis.api.NetworkInfo</code>, plus alias resolution (<code>xdai</code> and <code>gbc</code> → <code>gnosis</code>). The golden file <code>rust/testdata/networks_catalog.json</code> is compared byte for byte here and parsed by the Java side's <code>NetworksJsonGoldenTest</code>. A new test pins <code>has_ens</code> to the EVM crate's name-tree table, so a network cannot offer names its engine refuses. Gnosis now has names (Genome's <code>.gno</code>); Chiado has none.</p>
+  <x-code src="myotis-engine/src/catalog.rs" from="10" to="23"></x-code>
+  <x-code src="myotis-engine/src/catalog.rs" from="83" to="97"></x-code>
+  <ul class="concepts">
+    <li><x-tags>macros traits-generics</x-tags> <code>#[derive(Serialize)]</code> generates the JSON writer at compile time: Jackson without reflection. <code>rename_all = "camelCase"</code> maps <code>display_name</code> to <code>displayName</code>.</li>
+    <li><x-tags>lifetimes ownership</x-tags> Every field is <code>Copy</code>. A <code>&amp;'static str</code> is a pointer and a length into the binary's read-only data. So the whole struct is <code>Copy</code> and can live in a <code>const</code> with no heap allocation. A <code>String</code> field would own heap memory and make both impossible.</li>
+    <li><x-tags>borrowing lifetimes enums-patterns</x-tags> In <code>canonical_network_name</code>, the lowercase <code>String</code> is a temporary, borrowed only while the <code>match</code> runs. Every arm returns a <em>literal</em>, so the result can be <code>'static</code> and never points into the temporary. <code>|</code> separates alternative patterns. Input is deliberately not trimmed, so both engines reject exactly the same inputs.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/myotis-engine/src/ringlog.rs" kind="engine">
+  <p class="purpose">A process-wide ring of the last 4,096 <code>tracing</code> lines, which hosts drain on a timer into their own logs (Android's Logs tab and logcat, slf4j on desktop). Before it existed, Rust logs were invisible on Android. Pulling instead of pushing means no callbacks into the host, no Android dependencies, bounded memory, and no panics. The file is unchanged since September.</p>
+  <x-code src="myotis-engine/src/ringlog.rs" from="23" to="27"></x-code>
+  <x-code src="myotis-engine/src/ringlog.rs" from="51" to="95"></x-code>
+  <ul class="concepts">
+    <li><x-tags>interior-mutability concurrency</x-tags> <strong>A lazy, mutable global.</strong> Every <code>static</code> must be safe to share between threads. <code>OnceLock</code> creates the value exactly once (its <code>new()</code> is a <code>const fn</code>, so no startup code runs), and the <code>Mutex</code> allows changes through the shared <code>&amp;'static</code> reference. In Java terms, it's a <code>static final</code> holder whose contents can only be touched under <code>synchronized</code>, and the compiler enforces that.</li>
+    <li><x-tags>error-handling</x-tags> <code>let Ok(mut ring) = ring().lock() else { return String::new(); };</code> means a poisoned lock degrades to "no lines" instead of an <code>unwrap()</code> panic, which in this workspace (<code>panic = "abort"</code>) would kill the host app.</li>
+    <li><x-tags>traits-generics bytes-strings</x-tags> <code>impl Write for RingWriter</code> is how <code>tracing</code> writes into the ring. <code>RingWriter</code> has no fields, so it takes no memory. <code>String::from_utf8_lossy</code> returns a <code>Cow</code>: borrowed when the bytes are valid UTF-8, allocated only when something has to be replaced. <code>trimmed.to_string()</code> then makes the owned copy the ring keeps.</li>
+    <li><x-tags>domain</x-tags> <code>write</code> reports success even when it drops a line, and anything logged before <code>init()</code> is lost.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/myotis-engine/src/usage.rs" kind="engine" twin="DataUsageLedger (Java engine)">
+  <p class="purpose">New since September: data usage per handle (ABI 50, docs/data-usage.md). Each handle's <code>ChainConfig</code> carries a <code>TrafficMeter</code> from <code>myotis_net::traffic</code>, a set of byte counters that only grow. A <code>UsageLedger</code> turns those totals into per-day figures: every <code>tick</code> adds the growth since the previous tick to the current <em>local</em> day, and to the day's metered figures too when the host last said the network is metered. Today's figures are kept in <code>data-usage[-net].json</code> beside the sync snapshot, in a format the Java engine's ledger writes byte for byte, so the figures survive both a restart and an engine switch.</p>
+  <x-code src="myotis-engine/src/usage.rs" from="56" to="68"></x-code>
+  <ul class="concepts">
+    <li><x-tags>concurrency interior-mutability</x-tags> <strong>An atomic global with no lock.</strong> The metering is one byte for the whole process (it describes the device's network, not a chain), so a <code>static AtomicU8</code> holds it. Atomics are <code>Sync</code>, so a plain <code>static</code> works with no <code>OnceLock</code> or <code>Mutex</code>, and <code>AtomicU8::new</code> is a <code>const fn</code>. <code>Ordering::Relaxed</code> is enough because the value guards no other memory; Java's <code>getOpaque</code>/<code>setOpaque</code> on an <code>AtomicInteger</code> is the nearest analogue.</li>
+    <li><x-tags>enums-patterns</x-tags> <code>Metering::Unknown as u8</code> works because the enum has explicit discriminants (<code>= 0</code>, <code>= 1</code>, <code>= 2</code>) and no data. The way back, <code>from_code</code>, is a <code>match</code> returning <code>Option</code>, because an integer can hold values no variant has. <code>#[default]</code> on a variant tells <code>#[derive(Default)]</code> which one to use.</li>
+  </ul>
+  <x-code src="myotis-engine/src/usage.rs" from="146" to="185"></x-code>
+  <ul class="concepts">
+    <li><x-tags>concurrency</x-tags> <strong>Read the counter under the lock.</strong> The comment explains a race Java code would have too: the minute ticker and a status read may tick at the same moment. If each read <code>meter.snapshot()</code> before taking the lock, the later one could store an older <code>seen</code> and count bytes twice. Taking the snapshot inside the critical section orders them.</li>
+    <li><x-tags>error-handling interior-mutability</x-tags> <code>lock().unwrap_or_else(|e| e.into_inner())</code> is the other way to treat a poisoned mutex: take the guard anyway. <code>PoisonError::into_inner</code> returns it. That is safe here because the state is a few counters that cannot be left half-updated in a way that matters; <code>ringlog</code> chooses to give up instead.</li>
+    <li><x-tags>ownership borrowing</x-tags> <code>st</code> is a <code>MutexGuard&lt;LedgerState&gt;</code>; through it, <code>st.today.rx = …</code> writes into the locked state. <code>DayTotals</code> is <code>Copy</code>, so <code>today: st.today</code> in the returned snapshot copies four integers, while <code>st.day.clone()</code> must copy the <code>String</code> explicitly. The guard is dropped at the closing brace, after the return value is built.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>st.last_write.is_none_or(|t| t.elapsed() &gt;= WRITE_EVERY)</code>: true for "never written" or "written long enough ago". <code>saturating_sub</code> / <code>saturating_add</code> stop at 0 and <code>u64::MAX</code> instead of wrapping; a counter that moved backwards would otherwise wrap to a huge number.</li>
+  </ul>
+  <x-code src="myotis-engine/src/usage.rs" from="238" to="253"></x-code>
+  <p class="code-note"><x-tags>unsafe-ffi</x-tags> <strong>One call into libc.</strong> Rust's standard library has no time zones, so <code>local_day</code> asks the C library with <code>localtime_r</code>. <code>std::mem::zeroed()</code> is <code>unsafe</code> because an all-zero bit pattern is not a valid value for every type (a reference or a <code>NonZeroU32</code> would be undefined behavior); for the plain C struct <code>libc::tm</code> it is fine, which is what the <code>SAFETY:</code> comment states. <code>localtime_r</code> itself is <code>unsafe</code> because it is a foreign function taking raw pointers; <code>&amp;t</code> and <code>&amp;mut tm</code> coerce to them. <code>#[cfg(unix)]</code> removes the block entirely on other targets, where the UTC fallback below (Howard Hinnant's date algorithm) is the only path.</p>
+  <p class="code-note"><x-tags>ownership</x-tags> In <code>open_on</code> (lines 119–138), the struct literal names <code>state</code> first and <code>meter</code> last. Fields are evaluated in the order written, so <code>meter.snapshot()</code> borrows <code>meter</code> before the next field moves it into the struct. Swapping the two lines would not compile: "borrow of moved value".</p>
+</x-file>
+
+<x-file path="rust/myotis-engine/src/host.rs" kind="engine core" twin="ChainStack lifecycle (+ RustChainHandle caller)">
+  <p class="purpose">Behind every FFI entry point sits one engine for the whole process. It owns a multi-threaded tokio runtime and a registry of chain handles, and each contract operation (lifecycle, status, settings, verified reads, the EVM calls, ENS, transactions, the <code>eth_getLogs</code> index, address activity) is a blocking function. The file enforces the trust-anchor rules for data directories used by <code>create_with_checkpoint</code> (#441), applies or refuses every block selector, and parses all untrusted input without panicking. 87 of its tests sit in eight test modules; none starts networking.</p>
+
+  <h4>Section map</h4>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–62</td><td>Module doc (lifecycle, panic policy), imports, the sentinels −1 <code>CREATE_FAILED</code>, −2 <code>UNSUPPORTED_NETWORK</code>, −3 <code>ANCHOR_MISMATCH</code>.</td></tr>
+      <tr><td>64–215</td><td><code>enum ChainEntry</code>, <code>struct EngineState</code> (15 fields), <code>static ENGINE</code> and <code>engine()</code>.</td></tr>
+      <tr><td>217–291</td><td><code>config_for</code> (four networks); process-wide switches: Tor (<code>cfg(feature = "tor")</code>), Tor storage directories, DNS discovery.</td></tr>
+      <tr><td>293–672</td><td><code>create</code>, <code>create_with_checkpoint</code>, data-directory guards, anchor markers, <code>register</code> (which also opens the usage ledger).</td></tr>
+      <tr><td>674–993</td><td><code>spin_up</code> (shared by <code>start</code> and <code>resume</code>), replay of stashed host settings, <code>pause</code>, <code>shutdown</code>.</td></tr>
+      <tr><td>995–1215</td><td><code>status_json</code>, <code>ElCounts</code>, the per-handle EL and CL fork watches and the EL carry.</td></tr>
+      <tr><td>1217–1339</td><td><code>stop</code>; the data-usage glue (ledger lookup, minute ticker, network metering).</td></tr>
+      <tr><td>1341–1511</td><td>Live settings: served block window, host seed pins (<code>set_boot_enodes_json</code>), weak-subjectivity bound, stale-anchor consent.</td></tr>
+      <tr><td>1513–1800</td><td>State reads with a block selector: account, storage, code, storage-at, <code>eth_getProof</code>.</td></tr>
+      <tr><td>1802–2161</td><td>The <code>eth_call</code> family; <code>call_target</code>; <code>BlockSelector</code>, <code>parse_call_block</code>, <code>CallBlockRefusal</code>, <code>check_call_block</code>; state overrides.</td></tr>
+      <tr><td>2163–2321</td><td>ENS forward resolution and the generic record dispatch, including the CCIP-Read callback.</td></tr>
+      <tr><td>2323–2975</td><td>Gas estimates and the transaction-object calls (<code>eth_call_tx</code>, <code>eth_createAccessList</code>, <code>debug_traceCall</code>, <code>eth_simulateV1</code>) with their parsers.</td></tr>
+      <tr><td>2977–3238</td><td>Blocks, receipts, transactions, the pending-nonce overlay, block-hash resolution, raw transactions.</td></tr>
+      <tr><td>3240–3541</td><td>Send and check raw transactions, fee estimate, block receipts, fee history with a stale cache, block-target parsing.</td></tr>
+      <tr><td>3543–3804</td><td>The <code>snapshot_reader*</code> helpers, ENS query parsing, hex parsers, <code>beacon_state</code>.</td></tr>
+      <tr><td>3806–3958</td><td><code>Lifecycle</code>, <code>status_object</code>, <code>NOT_STARTED_FALLBACK</code>.</td></tr>
+      <tr><td>3960–5282</td><td><code>mod tests</code>.</td></tr>
+      <tr><td>5284–6212</td><td>The <code>eth_getLogs</code> index (config, unwatch, import/export, status, query), the address-activity watch, read stats.</td></tr>
+      <tr><td>6214–7199</td><td>Seven more test modules: log-index JSON, send gate, call target, call block, <code>getLogs</code> filter, tracer config, the <code>eth_simulateV1</code> golden.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The singleton and the state machine</h4>
+  <x-code src="myotis-engine/src/host.rs" from="64" to="87"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns</x-tags> <code>ChainEntry</code> is a sealed class with data: <code>Created(config)</code>, <code>Running(config, sync, reader?)</code>, <code>Paused(config, frozen status, read stats)</code>. The map entry is the <em>only</em> owner of the <code>SyncHandle</code>. The config, the reader and the read stats are behind <code>Arc</code>, so a caller can copy a pointer out and work without holding the lock.</li>
+    <li><x-tags>smart-pointers</x-tags> <code>Paused</code> gained an <code>Arc&lt;ReadStats&gt;</code> since September: the reader is dropped on pause, but its read counters must outlive it. Holding a second <code>Arc</code> to the same counters is all it takes; whoever drops the last <code>Arc</code> frees them.</li>
+  </ul>
+  <x-code src="myotis-engine/src/host.rs" from="154" to="175"></x-code>
+  <p class="code-note"><x-tags>concurrency domain</x-tags> <strong>One lock per concern.</strong> <code>EngineState</code> now has nine per-handle side maps beside <code>handles</code> (served window, seed pins, log-index runtime bits, activity watch, fee-history cache, the two fork watches, the EL carry, the usage ledger). Each is its own <code>Mutex&lt;HashMap&lt;i64, …&gt;&gt;</code>, so a status read touching the ledger never waits on a seed-pin push. The cost is discipline: every map must be cleared in <code>stop</code>, and the comments repeat "Dies with the handle" for that reason. Besides the <code>usage</code> map, the excerpt shows the two coarse locks: <code>create_lock</code> serializes every create, and <code>tearing_down</code> keeps a stopping handle's directory "in use" until its loop has finished writing.</p>
+  <x-code src="myotis-engine/src/host.rs" from="181" to="215"></x-code>
+  <ul class="concepts">
+    <li><x-tags>interior-mutability smart-pointers</x-tags> <code>static ENGINE: OnceLock&lt;Option&lt;EngineState&gt;&gt;</code>: <code>get_or_init</code> runs its closure once, even when several threads race. <code>None</code> means the runtime couldn't be built, so every entry point returns its failure value rather than panicking. Statics are never dropped, so the runtime lives until the process exits. <code>.as_ref()</code> turns <code>&amp;Option&lt;T&gt;</code> into <code>Option&lt;&amp;T&gt;</code>, and because the <code>Option</code> lives in a static, that reference is <code>&amp;'static</code>.</li>
+    <li><x-tags>concurrency</x-tags> Handle ids come from an <code>AtomicI64</code> starting at 1, so a valid id can't be confused with −1, and ids are never reused. Locks are taken in the order <code>create_lock</code> → <code>handles</code> → <code>tearing_down</code>.</li>
+  </ul>
+
+  <h4>Create: a named guard</h4>
+  <x-code src="myotis-engine/src/host.rs" from="300" to="331"></x-code>
+  <ul class="concepts">
+    <li><x-tags>interior-mutability ownership</x-tags> <strong>A named guard.</strong> <code>let Ok(_serial) = engine.create_lock.lock() else { … };</code> binds the guard, so the lock is held until the function returns, which serializes every create end to end. The pattern <code>_</code> would bind nothing, and the guard would be dropped, releasing the lock, at the end of the statement. (<code>_serial</code> only suppresses the unused-variable warning.) <code>Mutex&lt;()&gt;</code> guards no data; it is purely a critical section.</li>
+    <li><x-tags>error-handling</x-tags> <code>resolve_config</code> and <code>bind_persistence</code> return <code>Result&lt;_, i64&gt;</code> whose error <em>is</em> the sentinel to hand back, so <code>Err(sentinel) =&gt; return sentinel</code> passes it straight through. <code>&amp;mut config</code> lends the config so <code>bind_persistence</code> can set its snapshot and peer-cache paths.</li>
+    <li><x-tags>domain</x-tags> <strong>Fail closed.</strong> A directory that carries a caller-supplied anchor marker belongs to that anchor. A plain <code>create</code> on it returns −3, because resuming it from the embedded checkpoint would silently swap trust anchors.</li>
+  </ul>
+  <x-code src="myotis-engine/src/host.rs" from="576" to="584"></x-code>
+  <p class="code-note"><x-tags>enums-patterns error-handling</x-tags> <code>matches!(expr, pattern if guard)</code> is a <code>match</code> that yields <code>true</code> or <code>false</code>. Here only a definite <code>NotFound</code> counts as absent. <code>symlink_metadata</code> looks at the directory entry itself, so a dangling symlink is "present" (an issue reported from freedom-browser#353). Any other error, such as a permission problem, also counts as present. Uncertainty refuses.</p>
+
+  <h4>Start and resume: the lock scope</h4>
+  <x-code src="myotis-engine/src/host.rs" from="703" to="739"></x-code>
+  <ul class="concepts">
+    <li><x-tags>borrowing concurrency</x-tags> <strong>A block as a lock scope.</strong> The guard <code>map</code> lives only inside <code>let (config, read_stats) = { … };</code>. It is dropped at the <code>}</code>, so only two cheap <code>Arc</code> copies leave the locked region, and the slow start runs without the lock. Holding the map lock across <code>block_on</code> would stall every other FFI call and risk deadlock.</li>
+    <li><x-tags>smart-pointers ownership</x-tags> <strong>Two kinds of clone.</strong> <code>Arc::clone(c)</code> increments a reference count. <code>(*config).clone()</code> dereferences the <code>Arc</code> and deep-copies the whole <code>ChainConfig</code>, because <code>SyncHandle::start</code> takes it by value. The copy still shares its inner <code>Arc</code>s (the <code>WsPolicy</code>, the traffic meter), which is how a settings call later reaches the running loop.</li>
+    <li><x-tags>async</x-tags> <code>SyncHandle::start</code> is not async, but it calls <code>tokio::spawn</code>, which only works inside a runtime. <code>block_on(async { … })</code> is there purely to be <em>inside</em> the runtime while it runs. It is not an <code>async move</code> block, so it captures by reference where it can: <code>config</code> is only borrowed. <code>cl_watch</code> is still taken by value, because the block assigns it into <code>cfg</code>.</li>
+    <li><x-tags>enums-patterns</x-tags> <code>match (from, map.get(&amp;handle))</code> matches a tuple, so one match covers "the expected variant for this transition". <code>_ =&gt; return false</code> covers an unknown id or the wrong state.</li>
+  </ul>
+  <p class="code-note"><x-tags>async error-handling</x-tags> The EL reader starts in a second <code>block_on</code> (lines 776–797). Its <code>async</code> block ends in <code>?</code> and <code>.await</code>: an <code>async</code> block has its own return type, here a <code>Result</code>, so <code>?</code> inside it returns from the block, not from <code>spin_up</code>. A reader that fails to start is not fatal: the chain runs on the consensus layer alone, and status reports <code>elReaderAvailable: false</code>.</p>
+  <x-code src="myotis-engine/src/host.rs" from="843" to="893"></x-code>
+  <ul class="concepts">
+    <li><x-tags>concurrency domain</x-tags> <strong>Publish only if nothing changed.</strong> After the lock-free start, the entry is re-checked. If a concurrent <code>stop</code> removed it, or a racing start already published <code>Running</code>, the freshly built stack is shut down rather than orphaned. <code>(… Created(_)) | (… Paused(..))</code> is a single arm with two alternative patterns; <code>..</code> ignores the remaining fields.</li>
+    <li><x-tags>ownership smart-pointers</x-tags> <code>map.insert(handle, ChainEntry::Running(config, sync, reader))</code> <em>moves</em> <code>sync</code> and <code>reader</code> into the map. That is why <code>pins_reader = reader.clone()</code> is taken first: one more <code>Arc</code> (inside the <code>Option</code>) for the seed-pin replay after the publish. <code>drop(map)</code> releases the lock explicitly before that slow call.</li>
+    <li><x-tags>domain</x-tags> Lines 798–841, above this excerpt, replay what the host set while the handle was not running: the served-block window, the log-index runtime bits and the activity watch list. A pause drops the reader that held them, and no host re-pushes on resume, so the engine stashes each push per handle and re-applies it on every spin-up.</li>
+  </ul>
+
+  <h4>Pause: moving a value out of a map</h4>
+  <x-code src="myotis-engine/src/host.rs" from="929" to="981"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership enums-patterns</x-tags> <code>SyncHandle::stop(self)</code> <em>consumes</em> the handle, so <code>pause</code> must own it. <code>map.get</code> would only lend it, so the code <code>remove</code>s the entry, which moves the value out, and puts back anything that isn't <code>Running</code>. The tuple <code>(sync, reader)</code> is the block's value, carried out past the lock.</li>
+    <li><x-tags>async ownership</x-tags> <code>block_on(async move { … })</code>: the teardown block <em>owns</em> <code>sync</code> and <code>reader</code>, because it consumes them. Inside it, <code>if let Some(reader) = &amp;reader</code> only borrows (to cancel requests), and the later <code>if let Some(reader) = reader</code> moves the <code>Arc</code> out to call <code>stop</code>. Compare the borrowing <code>async { … }</code> blocks in the read path below.</li>
+    <li><x-tags>domain</x-tags> The frozen status keeps the warm store facts but zeroes the live-connection counts. <code>Paused</code> is published <em>before</em> the teardown finishes, which is why the doc forbids concurrent lifecycle calls on one handle; the Java <code>RustChainHandle</code> serializes them with <code>synchronized</code>. The ledger tick with <code>true</code> forces today's figures to disk with the rest of the warm state.</li>
+  </ul>
+
+  <h4>A background task started from a foreign thread</h4>
+  <x-code src="myotis-engine/src/host.rs" from="1291" to="1318"></x-code>
+  <ul class="concepts">
+    <li><x-tags>concurrency</x-tags> <strong><code>Once</code> inside a function.</strong> A <code>static</code> declared inside a function body is still one global; only its name is local. <code>std::sync::Once::call_once</code> runs the closure the first time and never again, which is how <code>register</code> can call <code>start_usage_ticker</code> on every create and get exactly one ticker.</li>
+    <li><x-tags>async lifetimes</x-tags> <strong>Why <code>&amp;'static EngineState</code>.</strong> <code>rt.spawn</code> needs a future that is <code>'static</code>: it may run after the caller's stack frame is gone. The <code>async move</code> block captures <code>engine</code>, a reference. That is allowed only because the reference itself is <code>'static</code> (it points into <code>static ENGINE</code>). With an ordinary <code>&amp;EngineState</code> parameter this would not compile. <code>Runtime::spawn</code> can be called from any thread; unlike <code>tokio::spawn</code>, it does not need to be inside the runtime.</li>
+    <li><x-tags>smart-pointers concurrency</x-tags> <code>tick_all_ledgers</code> clones the <code>Arc</code>s out under the lock and ticks them after the guard is gone. The temporary guard in <code>match engine.usage.lock() { … }</code> lives until the end of the <code>match</code>, so by the <code>for</code> loop it is already dropped.</li>
+  </ul>
+
+  <h4>A verified read, start to finish</h4>
+  <x-code src="myotis-engine/src/host.rs" from="1540" to="1570"></x-code>
+  <x-code src="myotis-engine/src/host.rs" from="3562" to="3580"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async borrowing</x-tags> <strong>The standard bridge.</strong> (1) Parse the input, with no panics, including the block selector. (2) <code>snapshot_reader</code> clones the <code>Arc&lt;ElReader&gt;</code> under the lock and releases it. (3) <code>read_anchor</code> applies or refuses the selector against the current head. (4) <code>engine.rt.block_on(reader.request(async { … }))</code> blocks <em>this</em> thread until the future finishes; <code>request</code> wraps it in the 90-second request budget with cancellation. (5) Turn the <code>Result</code> into JSON. The <code>async</code> block may borrow <code>reader</code> and <code>address</code>, because <code>block_on</code> doesn't return before the future completes. Unlike <code>spawn</code>, it needs no <code>'static</code>.</li>
+    <li><x-tags>error-handling</x-tags> <code>engine.handles.lock().map_err(|_| "engine lock poisoned")?</code>: poison becomes an error value, and <code>?</code> returns it. The helper's error type is <code>&amp;'static str</code>, so each state has a precise message ("handle is paused", "handle not started").</li>
+    <li><x-tags>async concurrency</x-tags> <strong>Never on a runtime thread.</strong> Calling <code>block_on</code> from one of the runtime's own worker threads makes tokio panic, which aborts the host. Every caller of this file runs on a foreign thread: a JVM, iOS, Node or rpcd thread.</li>
+    <li><x-tags>domain</x-tags> Three kinds of answer: the result JSON (a failed verification is reported <em>inside</em> it, as <code>failReason</code>), <code>{"error": …}</code> (bad input, a stopped chain, or no peers), and the literal <code>"null"</code> for an item verified not to exist. A fourth arrived with ABI 27: <code>{"error": …, "code": -32602}</code>, a <em>permanent</em> refusal of the request itself.</li>
+  </ul>
+
+  <h4>Block selectors: apply or refuse</h4>
+  <x-code src="myotis-engine/src/host.rs" from="2058" to="2080"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns</x-tags> <code>let BlockSelector::Number(block) = block else { return Ok(()); };</code> is <code>let-else</code> on an enum: if the value is a <code>Number</code>, bind its payload and continue; otherwise run the <code>else</code> block, which must leave the function. It reads like Kotlin's <code>val n = (x as? Number)?.n ?: return</code>. The new <code>block</code> shadows the old one, a common Rust idiom.</li>
+    <li><x-tags>domain error-handling</x-tags> <strong>Three refusals, two codes.</strong> <code>CallBlockRefusal::to_json</code> (just above) turns <code>Behind</code> into the permanent −32602, because the head never moves back that far, and <code>Ahead</code> and <code>NoHead</code> into the retryable <code>{"error"}</code>, because they clear as the node syncs. Calling a lagging node's answer "permanent" would tell a client to stop asking. A number inside the window still runs against <em>head</em> state; that is the documented near-head trade-off.</li>
+    <li><x-tags>bytes-strings</x-tags> <code>saturating_sub</code> and <code>saturating_add</code> keep <code>head - 64</code> from wrapping below zero near genesis and <code>head + 16</code> from wrapping at the top.</li>
+  </ul>
+  <x-code src="myotis-engine/src/host.rs" from="2091" to="2149"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain error-handling</x-tags> <strong>Apply or refuse.</strong> The <code>eth_call</code> state-override parser treats an unknown key as an <em>error</em>, not a skip, because a silently ignored override answers a different question (#314, the rule in your CLAUDE.md). <code>call_target</code> above it applies the same rule to <code>to</code>: empty means contract creation, and anything malformed is refused rather than turned into a creation.</li>
+    <li><x-tags>error-handling traits-generics</x-tags> <strong><code>?</code> converts the error.</strong> The function returns <code>Result&lt;_, String&gt;</code>, but <code>val.as_str().ok_or("override 'code' must be a hex string")?</code> produces an error of type <code>&amp;str</code>. <code>?</code> calls <code>From::from</code> on the error before returning, and <code>String</code> implements <code>From&lt;&amp;str&gt;</code>, so the literal is copied into an owned <code>String</code> only on that failure path. <code>ok_or_else(|| format!(…))</code> is used where the message needs formatting, so the work happens only when needed.</li>
+    <li><x-tags>borrowing iterators-closures</x-tags> <code>for (addr_str, entry) in map</code> iterates a <em>borrowed</em> <code>serde_json::Map</code>, so both are references into the parsed JSON; nothing is copied until <code>parsed.insert</code> builds <code>U256</code> values.</li>
+  </ul>
+  <x-code src="myotis-engine/src/host.rs" from="1472" to="1489"></x-code>
+  <p class="code-note"><x-tags>interior-mutability enums-patterns</x-tags> A live setting reaches a <em>running</em> loop through <code>c.ws_policy.bound_override_periods.store(…)</code>, an atomic behind the shared <code>Arc&lt;WsPolicy&gt;</code>. It works in all three states, and one arm lists them with <code>|</code>. In <code>Some(ChainEntry::Created(c)) | Some(ChainEntry::Running(c, _, _)) | …</code>, every alternative must bind the same names with the same types, here <code>c: &amp;Arc&lt;ChainConfig&gt;</code>. It's the same mechanism as the consent flag in <code>live_cold_start</code> (<a href="#stop-15">Stop 15</a>).</p>
+
+  <h4>A write: judged before it is sent</h4>
+  <x-code src="myotis-engine/src/host.rs" from="3252" to="3289"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain</x-tags> <strong>The order of the checks is the point.</strong> Bytes that are no transaction (#360) are refused before the engine is even asked whether it is up, so a paused node gives the same permanent −32602 as a running one. A transaction signed for another chain (#665) is refused next, from the handle's config, which exists in every state. Only then does the code need a running reader. <code>check_raw_transaction_json</code> below runs the first gate alone, with no handle, so hosts can call it before their readiness wait.</li>
+    <li><x-tags>enums-patterns error-handling</x-tags> <strong>Nested results.</strong> <code>reader.request</code> expects a future returning <code>Result&lt;T, String&gt;</code>, and <code>send_raw_transaction</code> returns <code>Result&lt;hash, SendError&gt;</code>. Wrapping it in <code>Ok(…)</code> makes <code>T</code> that whole inner result, so the match sees <code>Result&lt;Result&lt;…, SendError&gt;, String&gt;</code>. One <code>match</code> then separates all five cases, and <code>Ok(Err(SendError::Unavailable(e))) | Err(e)</code> joins the two retryable ones, since both bind <code>e: String</code>.</li>
+    <li><x-tags>modules-cargo</x-tags> <code>use myotis_net::el::reader::SendError;</code> in the middle of a function body is legal; the import is scoped to that block.</li>
+  </ul>
+
+  <h4>Hex parsing without panics</h4>
+  <x-code src="myotis-engine/src/host.rs" from="3722" to="3734"></x-code>
+  <p class="code-note"><x-tags>traits-generics bytes-strings error-handling</x-tags> <strong>Const generics.</strong> <code>parse_hex_fixed::&lt;32&gt;</code> returns a stack array <code>[u8; 32]</code>; <code>N</code> is a compile-time number, something Java generics can't express. The length check and <code>all(is_ascii_hexdigit)</code> run first, so every later slice is two ASCII bytes. <code>hex.get(a..b)?</code> still returns <code>None</code> where <code>&amp;hex[a..b]</code> could panic (on a range that is out of bounds or splits a multi-byte character), and <code>.ok()?</code> turns a parse error into <code>None</code>. Elsewhere, <code>slot as u64</code> in <code>get_storage_proof_json</code> deliberately keeps the bit pattern of a negative Java <code>long</code> (a slot index ≥ 2⁶³).</p>
+
+  <h4>Entering the runtime without blocking</h4>
+  <x-code src="myotis-engine/src/host.rs" from="5605" to="5646"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async</x-tags> <strong><code>rt.enter()</code>.</strong> <code>reader.set_activity_watch</code> is a plain function, but it may <code>tokio::spawn</code> the follower task, and that needs a "current runtime". <code>let _guard = engine.rt.enter();</code> sets this thread's current runtime until the guard is dropped at the end of the function. It is cheaper than <code>block_on(async { … })</code> when there is nothing to await. Note the name: <code>_guard</code>, not <code>_</code>, for the same reason as <code>_serial</code> above.</li>
+    <li><x-tags>concurrency</x-tags> <strong>A lock held on purpose.</strong> The <code>activity_watch</code> stash lock is taken first and held across the reader call, so pushes are applied and stashed in one order, and a resume (which takes the same lock to re-apply the list) sees all of a push or none. <code>snapshot_reader</code> takes the <code>handles</code> lock briefly inside it; <code>spin_up</code> and <code>stop</code> never hold both, so the nesting cannot deadlock.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>engine.handles.lock().is_ok_and(|map| map.contains_key(&amp;handle))</code>: <code>is_ok_and</code> consumes the <code>Result</code>, so the closure receives the guard itself by value, and the guard is dropped when the closure returns.</li>
+  </ul>
+  <x-code src="myotis-engine/src/host.rs" from="6017" to="6041"></x-code>
+  <p class="code-note"><x-tags>interior-mutability</x-tags> <strong>Why <code>Option&lt;HashMap&gt;</code>.</strong> A <code>static</code> initializer must be a constant expression. <code>Mutex::new</code> is a <code>const fn</code>, but <code>HashMap::new</code> is not (it seeds a random hasher), so the map starts as <code>None</code> and <code>get_or_insert_with</code> creates it on first use, under the lock. <code>OnceLock</code> would work too; this form keeps one lock for both the creation and every later update. This debounce keeps a polling wallet's repeated refused <code>eth_getLogs</code> filter to one log line per minute.</p>
+
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments in host.rs</span>
+    <ul>
+      <li>The module doc (lines 2–5, 25–26) still calls the callers "the JNI natives (lib.rs)" and "the JNI shim". The JNI layer is gone: the callers are <code>ffi.rs</code> (UniFFI) and <code>capi.rs</code>. Many function docs still begin with the deleted <code>nativeXxx</code> names; <code>lib.rs</code> explains that history, this file does not.</li>
+      <li><code>status_object</code> (lines 3819–3820) says its key <em>ordering</em> is part of the golden contract, but it builds a <code>serde_json::Map</code>, and this build compiles <code>serde_json</code> without <code>preserve_order</code> (checked with <code>cargo tree -e features</code> on the snapshot). Keys come out in alphabetical order. The tests compare parsed values, and Java reads keys by name, so nothing breaks; only the comment is wrong. <code>eljson::invalid_params_json</code> gets this right and says so.</li>
+      <li>The doc for <code>get_transaction_receipt_json</code> (lines 3011–3016) sits directly above <code>pending_nonce_overlay</code>'s doc, so rustdoc attaches both to <code>pending_nonce_overlay</code>, and the receipt function has none.</li>
+      <li><code>parse_block_target</code>'s doc (lines 3496–3499) says its <code>Err</code> becomes −32000. Every caller now wraps it in <code>invalid_params_json</code>, which is −32602.</li>
+      <li>Two doc links name <code>Engine::pending_served_window</code> (line 120) and <code>Engine::log_index_runtime_bits</code> (line 5357); the struct is <code>EngineState</code>.</li>
+    </ul>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-engine/src/ffi.rs" kind="FFI · JVM" twin="(deleted) nativeXxx JNI functions">
+  <p class="purpose">The UniFFI entry points used by the JVM: 55 <code>#[uniffi::export]</code> functions, nearly all a one-line call into <code>host</code>, <code>catalog</code> or <code>ringlog</code> (the exception is shown below). The file has no state, no <code>unsafe</code> and no <code>async</code>. Only the transport is UniFFI; compound values still travel as JSON. <code>create_with_checkpoint</code> and <code>set_boot_enodes_json</code> are deliberately not exported (ABI 26 and 31): the JVM hosts have no surface for them. Because the exports remain plain Rust functions, <code>myotis-rpcd</code> uses this file as its Rust API too.</p>
+  <x-code src="myotis-engine/src/ffi.rs" from="23" to="67"></x-code>
+  <ul class="concepts">
+    <li><x-tags>unsafe-ffi macros</x-tags> <strong>How a Kotlin call arrives, in one paragraph.</strong> <code>RustEngineNative</code> calls the generated <code>createHandle</code> in <code>myotis_engine.kt</code>, which encodes each string into a buffer and calls a JNA native. The wrapper that <code>#[uniffi::export]</code> generated turns the buffers back into owned <code>String</code>s and calls <code>create_handle</code>. On load, the generated Kotlin compares a checksum per function (today 44197 for <code>create_handle</code>; it was 39066 in September), so a stale <code>.so</code> fails loudly instead of crashing on a changed signature. <a href="#stop-17">Stop 17</a> follows every step.</li>
+    <li><x-tags>ownership borrowing</x-tags> <strong>Owned in, borrowed onward.</strong> UniFFI hands over owned <code>String</code>s (copied out of Kotlin memory), and <code>&amp;network</code> lends them to <code>host</code>, whose functions take <code>&amp;str</code>. The <code>String</code>s are dropped when the export returns. <code>.map(str::to_owned)</code> copies the <code>'static</code> literal into a <code>String</code> for Kotlin, and <code>None</code> becomes <code>null</code>. Further down, <code>holder.as_deref()</code> turns <code>Option&lt;String&gt;</code> into <code>Option&lt;&amp;str&gt;</code> without allocating.</li>
+    <li><x-tags>bytes-strings</x-tags> <code>max.max(0) as usize</code> clamps before casting, because a negative <code>i32</code> cast straight to <code>usize</code> would wrap around to a huge number.</li>
+    <li><x-tags>domain</x-tags> <strong>Project rule:</strong> <em>any</em> edit to this file, even to a doc comment, changes the UniFFI checksums, so run <code>./gradlew uniffiGenerateKotlin</code> afterwards. The <code>create_handle</code> doc now lists "<code>mainnet</code>, <code>sepolia</code> or <code>gnosis</code>"; Chiado is hosted too, and the doc has been copied into the generated Kotlin.</li>
+  </ul>
+  <x-code src="myotis-engine/src/ffi.rs" from="409" to="422"></x-code>
+  <p class="code-note"><x-tags>bytes-strings error-handling</x-tags> <strong>No unsigned integers on the JVM.</strong> Kotlin has <code>ULong</code>, but these bindings keep to Java-friendly signed types, so the transaction index arrives as <code>i64</code>. <code>u64::try_from(index)</code> refuses a negative one instead of reinterpreting it, and the refusal is permanent (−32602). The C twin in <code>capi.rs</code> takes <code>u64</code> directly. Compare <code>slot as u64</code> in the storage read, where reinterpreting the bits <em>is</em> the intent.</p>
+</x-file>
+
+<x-file path="rust/myotis-engine/src/capi.rs" kind="FFI · C ABI" twin="RustEngine.kt (iOS) mirrors RustEngineNative">
+  <p class="purpose">The plain C interface: 58 <code>#[no_mangle] extern "C"</code> functions declared by hand in <code>rust/include/myotis_engine.h</code>. iOS uses it through cinterop, <code>myotis-node</code> calls it by Rust path, and <code>myotis-rpcd</code> uses two of its functions. The JSON shapes and sentinels are the same as in <code>ffi.rs</code>, plus three functions UniFFI does not have: <code>myotis_create_with_checkpoint</code>, <code>myotis_set_boot_enodes</code> and <code>myotis_string_free</code>. The last line re-exports <code>submitted</code> and <code>Submission</code> from <code>myotis-net</code>: the Node scheduler uses them to carry a deadline and a cancel flag (in a thread-local) into a blocking C call.</p>
+
+  <h4>Section map</h4>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–42</td><td>Module doc (memory contract, panic policy), <code>read_string</code>, <code>into_c</code>.</td></tr>
+      <tr><td>44–132</td><td>Handshake, log drain, catalog, <code>myotis_create</code>, <code>myotis_create_with_checkpoint</code>.</td></tr>
+      <tr><td>134–252</td><td>Lifecycle and switches: start, Tor, DNS discovery, metering, status, stop, pause, served window, resume, weak-subjectivity bound, stale anchor.</td></tr>
+      <tr><td>254–795</td><td>Verified reads, the <code>eth_call</code> family, gas, ENS, blocks, transactions, fees, send and check.</td></tr>
+      <tr><td>797–810</td><td><code>myotis_string_free</code>.</td></tr>
+      <tr><td>812–1082</td><td>Tests (9), including the header pin.</td></tr>
+      <tr><td>1084–1190</td><td>Log index, seed pins, activity, read stats, import/export; the scheduler re-export.</td></tr>
+    </tbody>
+  </table></div>
+
+  <x-code src="myotis-engine/src/capi.rs" from="19" to="52"></x-code>
+  <ul class="concepts">
+    <li><x-tags>unsafe-ffi</x-tags> <strong>Raw pointers.</strong> <code>*const c_char</code> carries no ownership and no lifetime, and may be null, so every use is guarded by <code>is_null()</code>. <code>CStr::from_ptr</code> scans for the terminating NUL and <em>borrows</em> the caller's memory. <code>.into_owned()</code> copies it, so the result no longer depends on how long the C side keeps its buffer. <code>CStr</code> / <code>CString</code> relate like <code>&amp;str</code> / <code>String</code>.</li>
+    <li><x-tags>unsafe-ffi ownership</x-tags> <strong>Handing ownership to C.</strong> <code>CString::new(s)</code> takes the <code>String</code>'s buffer by move, so the text is not copied (the buffer may grow by one byte for the NUL). It fails on an interior NUL byte, which <code>into_c</code> turns into a null pointer instead of a panic. <code>into_raw()</code> gives up Rust's ownership: no Rust code will free it unless it comes back.</li>
+    <li><x-tags>unsafe-ffi</x-tags> <code>#[no_mangle] extern "C"</code> keeps the symbol name exactly <code>myotis_init</code> and uses the C calling convention. Functions that take only integers are plain <code>extern "C"</code>; functions that dereference caller pointers are <code>unsafe extern "C"</code> with a <code># Safety</code> section, because the compiler can't check the caller's promise.</li>
+    <li><x-tags>error-handling</x-tags> <strong>No panics.</strong> There's no <code>catch_unwind</code>. The workspace builds with <code>panic = "abort"</code>, and since Rust 1.81 a panic unwinding out of an <code>extern "C"</code> function aborts anyway. So every failure path returns null, <code>false</code> or −1.</li>
+  </ul>
+  <x-code src="myotis-engine/src/capi.rs" from="117" to="132"></x-code>
+  <p class="code-note"><x-tags>enums-patterns</x-tags> <code>let (Some(network), Some(data_dir), Some(root)) = (…) else { return -1; };</code> uses a tuple pattern: all three strings must be present. By contrast, most functions treat a null string as <code>""</code> via <code>unwrap_or_default()</code>.</p>
+  <x-code src="myotis-engine/src/capi.rs" from="364" to="392"></x-code>
+  <p class="code-note"><x-tags>domain error-handling</x-tags> <strong>Absent is not empty.</strong> An empty <code>to</code> means contract creation, so a NULL <code>to</code> cannot fall back to <code>""</code>: that would run the caller's calldata as init code. The old tour flagged that this function still did so; ABI 29 fixed it, and both <code>eth_call</code> wrappers now refuse NULL with the same message. The comment is also more careful than before: <code>read_string</code> replaces bad UTF-8 rather than rejecting it, and the address parser then refuses the result.</p>
+  <x-code src="myotis-engine/src/capi.rs" from="797" to="810"></x-code>
+  <p class="code-note"><x-tags>unsafe-ffi ownership</x-tags> <strong>Taking ownership back.</strong> <code>from_raw</code> rebuilds the owning <code>CString</code>, and <code>drop</code> frees it right away, where Java would wait for the garbage collector. This is sound only for a pointer that came from <code>into_raw</code> and hasn't been freed yet, which is exactly the promise the <code># Safety</code> section asks for. Calling <code>free(3)</code> on it instead would be undefined behavior. On iOS, <code>RustEngine.kt</code>'s <code>take</code> copies the string with <code>toKString()</code> and calls <code>myotis_string_free</code> in a <code>finally</code>.</p>
+  <x-code src="myotis-engine/src/capi.rs" from="841" to="879"></x-code>
+  <ul class="concepts">
+    <li><x-tags>testing macros</x-tags> <strong>A test that reads a C header.</strong> <code>include_str!</code> embeds the header's text at compile time, so the header becomes an input of the test binary: editing only the header still reruns the test. The test requires exactly one column-0 <code>#define MYOTIS_ABI_VERSION</code> and that it equals <code>crate::ABI_VERSION</code>. Bumping one without the other fails <code>cargo test</code>.</li>
+    <li><x-tags>iterators-closures</x-tags> The chain <code>lines → filter_map(strip_prefix) → filter → filter_map(split_whitespace().next()) → collect</code> borrows slices of <code>HEADER</code>, a <code>&amp;'static str</code>; nothing is allocated until <code>collect</code> builds the <code>Vec&lt;&amp;str&gt;</code>.</li>
+  </ul>
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments in capi.rs</span>
+    <p>The module doc (lines 1, 15) and <code>read_string</code>'s doc (line 22) still compare this file with "the JNI shim", which no longer exists. The functions after the test module (from line 1084) mostly lack <code># Safety</code> sections, and <code>myotis_log_index_status_json</code>, <code>myotis_address_activity_json</code> and <code>myotis_read_stats_json</code> are declared <code>unsafe</code> although they take no pointer. That is harmless for C callers, but a Rust caller must wrap them in <code>unsafe { }</code> for nothing.</p>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-engine/src/eljson.rs" kind="engine" twin="VerifiedRpcBackend.buildBlockJson / buildReceiptJson / buildTxJson">
+  <p class="purpose">Pure functions that turn verified-read results into exactly the JSON the Java, iOS and Node sides parse: account, storage, code and proof results, JSON-RPC blocks, transactions, receipts and logs, result wrappers for <code>eth_call</code>, gas, access lists, traces, simulations and ENS, fees, address activity, and the two error envelopes. About 1,300 of its 2,805 lines are tests, the Rust half of the golden contract.</p>
+
+  <h4>Section map</h4>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–57</td><td>Imports, <code>error_json</code>, <code>INVALID_PARAMS</code>, <code>invalid_params_json</code>.</td></tr>
+      <tr><td>59–203</td><td>Account, storage and code results.</td></tr>
+      <tr><td>205–537</td><td>Blocks, receipts, transactions (mined and pending), raw transactions, block receipts.</td></tr>
+      <tr><td>539–660</td><td>Fee history, fee estimate, the <code>eth_call</code> result.</td></tr>
+      <tr><td>661–815</td><td>ENS forward and record shapes.</td></tr>
+      <tr><td>816–1235</td><td>Access list, trace (<code>callTracer</code> frames), <code>eth_simulateV1</code> blocks, gas estimate.</td></tr>
+      <tr><td>1236–1305</td><td>Resolved block hash, tx hash, send rejected, <code>eth_getProof</code>.</td></tr>
+      <tr><td>1306–1443</td><td>Encoding helpers (quantities, hex, <code>be_to_decimal</code>) and <code>activity_json</code>.</td></tr>
+      <tr><td>1445–2631</td><td><code>mod tests</code>.</td></tr>
+      <tr><td>2633–2805</td><td><code>get_logs_json</code> (placed after the tests), then two more test modules.</td></tr>
+    </tbody>
+  </table></div>
+
+  <x-code src="myotis-engine/src/eljson.rs" from="26" to="57"></x-code>
+  <ul class="concepts">
+    <li><x-tags>error-handling domain</x-tags> <strong>Two kinds of failure, and now two envelopes.</strong> <code>{"error": …}</code> means transport trouble, a stopped chain or bad input, and the hosts answer it as retryable (−32000). <code>{"error": …, "code": -32602}</code> means no retry can help. A <em>verification</em> failure is neither: it is a complete result with <code>failReason</code> set and <code>verifyMethod: null</code>.</li>
+    <li><x-tags>bytes-strings traits-generics</x-tags> <strong>Key order by construction.</strong> <code>error_json</code> uses a <code>serde_json::Map</code>, whose key order depends on a feature flag. <code>invalid_params_json</code> uses <code>format!</code> so that <code>error</code> is always the first key and a host's prefix check for <code>{"error"</code> still works. <code>serde_json::Value::from(message)</code> produces a JSON string literal with correct escaping, which <code>{}</code> then prints. <code>{{</code> and <code>}}</code> are literal braces in a format string, and <code>{INVALID_PARAMS}</code> captures the constant by name (inline format arguments, Rust 1.58 and later).</li>
+    <li><x-tags>traits-generics</x-tags> <code>"error".into()</code> and <code>message.into()</code> use <code>From</code> impls to build the owned key and the JSON value. <code>mut obj</code> is needed because <code>insert</code> changes the map, and Rust variables are immutable by default.</li>
+  </ul>
+  <x-code src="myotis-engine/src/eljson.rs" from="205" to="247"></x-code>
+  <p class="code-note"><x-tags>bytes-strings enums-patterns</x-tags> <strong>Hand-built JSON</strong> for blocks, receipts, transactions, fee history and logs: a fixed field order, fields from inactive forks left out (<code>if let Some(bf) = &amp;h.base_fee_per_gas</code>), and nothing that needs escaping, because only hex, numbers and fixed text are inserted. <code>let h = &amp;b.header;</code> is a local borrow, and <code>&amp;h.parent_hash</code> passes a <code>&amp;[u8; 32]</code>. <code>String::with_capacity(1024)</code> reserves the buffer once, like <code>new StringBuilder(1024)</code>.</p>
+  <x-code src="myotis-engine/src/eljson.rs" from="613" to="648"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns</x-tags> <code>match &amp;answer.outcome</code> matches a <em>reference</em>, so each arm binds its payload by reference (<code>data: &amp;Vec&lt;u8&gt;</code>, <code>reason: &amp;String</code>) and nothing is moved out of <code>answer</code>. A refusal leaves early with <code>return invalid_params_json(reason)</code>: it ran nowhere, so it names no block.</li>
+    <li><x-tags>enums-patterns</x-tags> <code>!matches!(answer.outcome, CallOutcome::Unavailable(_))</code> asks a yes-or-no question about a variant without binding anything. <code>verified</code> is true only for a call that ran, against the finalized block.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>answer.block_hash.map(|h| …).unwrap_or(serde_json::Value::Null)</code>: an <code>Option&lt;[u8; 32]&gt;</code> becomes a JSON string or JSON null. The array is <code>Copy</code>, so <code>map</code> takes it by value without disturbing <code>answer</code>.</li>
+  </ul>
+  <x-code src="myotis-engine/src/eljson.rs" from="1347" to="1386"></x-code>
+  <ul class="concepts">
+    <li><x-tags>borrowing bytes-strings</x-tags> <code>hex0x(&amp;[u8; 32])</code> passes its argument straight to <code>hex0x_var(&amp;[u8])</code>: an array reference coerces to a slice (a pointer plus a length) with nothing copied.</li>
+    <li><x-tags>traits-generics</x-tags> <code>use std::fmt::Write;</code> inside the function lets <code>write!</code> append to a <code>String</code> in place, like <code>StringBuilder.append</code>. <code>let _ =</code> discards a <code>Result</code> that can't be an error here. The final <code>s</code> has no semicolon, so it is the return value.</li>
+    <li><x-tags>iterators-closures borrowing</x-tags> In <code>be_to_decimal</code>, <code>|&amp;b|</code> destructures the <code>&amp;u8</code>, and <code>iter_mut()</code> hands out <code>&amp;mut u8</code> so that <code>*byte = …</code> divides the big number by 10 in place: schoolbook long division, with no bignum library. <code>digits.to_vec()</code> makes the private copy that the division destroys. <code>u16::from</code> widens without loss; <code>as u8</code> narrows explicitly.</li>
+  </ul>
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments in eljson.rs</span>
+    <p>The doc "Serialize a broadcast transaction hash" (line 595) is still attached to <code>call_json</code>; <code>tx_hash_json</code> (line 1243) has no doc. In the same block, "a JSON-RPC null for the other two" (line 609) dates from when the call had three statuses; it has five. <code>invalid_params_json</code>'s doc (lines 40–42) lists only <code>eth_call</code> and <code>eth_estimateGas</code> as emitters; most entry points in <code>host.rs</code> now use it.</p>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-engine/examples/bal_follow_check.rs" kind="example binary">
+  <p class="purpose">A live cross-check, run by hand with <code>cargo run --release -p myotis-engine --example bal_follow_check -- sepolia 10</code>. It starts the engine on a network whose blocks commit to a block access list (BAL; Sepolia since Amsterdam), watches the senders of a recent block, and reads their accounts at <code>latest</code> again and again. Each answer the engine took from its BALs (<code>verifyMethod: "blockAccessList"</code>) is compared field by field with an <code>eth_getProof</code> at the same block, which always fetches a fresh snap proof. It fails on any mismatch, and also when no BAL answer carried a change, since that run compared nothing a BAL applied. The binary is also the shortest example of a Rust host: it calls the <code>ffi</code> functions as plain Rust functions.</p>
+  <x-code src="myotis-engine/examples/bal_follow_check.rs" from="27" to="59"></x-code>
+  <ul class="concepts">
+    <li><x-tags>cli modules-cargo</x-tags> An example under <code>examples/</code> is a separate binary that links the crate like an outside user would, so it sees only <code>pub</code> items: <code>myotis_engine::ffi</code>, not <code>host</code>. <code>std::env::args().skip(1)</code> drops the program name; <code>args.next()</code> then yields owned <code>String</code>s one at a time.</li>
+    <li><x-tags>ownership</x-tags> <code>ffi::create_handle(network.clone(), …)</code> must clone: the export takes its <code>String</code> by value (that is the UniFFI shape) and the code still prints <code>network</code> afterwards. <code>"latest".into()</code> builds the owned <code>String</code> the same signature needs.</li>
+    <li><x-tags>enums-patterns iterators-closures</x-tags> <code>let senders = loop { … break senders; };</code>: a <code>loop</code> is an expression, and <code>break value</code> is its result. <code>let Some(txs) = … else { continue };</code> skips a poll whose block had no transactions yet. <code>sort</code> then <code>dedup</code> removes duplicate senders, since <code>dedup</code> drops only adjacent repeats.</li>
+  </ul>
+  <x-code src="myotis-engine/examples/bal_follow_check.rs" from="66" to="112"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership iterators-closures</x-tags> <code>last.insert(address.clone(), (…))</code> returns the <em>previous</em> value as an <code>Option</code>, which is how the loop learns what the last read said without a separate lookup. <code>previous.is_some_and(|p| p != …)</code> consumes that <code>Option</code>.</li>
+    <li><x-tags>bytes-strings</x-tags> <code>account["nonce"]</code> indexes a <code>serde_json::Value</code>; a missing key yields <code>Value::Null</code> instead of panicking, and <code>as_i64()</code> then gives <code>None</code>. The proof's QUANTITYs are hex strings, parsed with <code>u128::from_str_radix</code> after <code>trim_start_matches("0x")</code>.</li>
+    <li><x-tags>testing domain</x-tags> The example uses <code>assert!</code> and <code>expect</code> freely. It is a test tool, not engine code, so a panic simply ends the run with a message; the panic-free rule applies to the library.</li>
+  </ul>
+</x-file>
+
+<div class="callout watch">
+  <span class="k">Other stale docs in this crate</span>
+  <ul>
+    <li><code>lib.rs</code>'s module doc (line 9) lists "mainnet, Sepolia and Gnosis"; Chiado is hosted too. The old "mainnet only" wording is gone.</li>
+    <li><code>ringlog.rs</code> (line 5) says hosts poll <code>drain</code> "over JNI (<code>nativeDrainLogs</code>)". Today it is UniFFI's <code>drain_logs</code> or the C <code>myotis_drain_logs</code>.</li>
+    <li>The manifest's comment on <code>myotis-net</code> says this is "the only crate that pulls in tokio/libp2p", but <code>myotis-net</code> itself depends on both (tokio pinned to the same <code>=1.52.3</code>). Its <code>description</code> still says "(JNI cdylib)".</li>
+    <li>The <code>ABI_VERSION</code> history entry v30 says <code>safe</code> "still resolves to the head". The code now refuses <code>safe</code> everywhere (<code>SAFE_TAG_REFUSAL</code>), and no later entry records the change.</li>
+  </ul>
+</div>
+
+<x-quiz>[
+  {"id":"engine-q1","type":"mcq","tags":["concurrency","smart-pointers","borrowing"],
+   "q":"In <code>spin_up</code>, the config is copied out with <code>Arc::clone(c)</code> inside <code>let (config, read_stats) = { … };</code> before <code>block_on</code>. What is the block for?",
+   "options":["It makes the clone cheaper, because a block can borrow without counting","Blocks are required around a <code>match</code> on a tuple","The mutex guard lives only inside the block and is dropped at its <code>}</code>, so the lock is released before the slow start. Holding it across <code>block_on</code> would stall every other FFI call and risk deadlock","It turns the <code>Arc</code> into a deep copy of the config"],
+   "answer":2,
+   "explain":"A guard unlocks when it is dropped, and a block is the tool for choosing when that happens. Only reference-count increments leave the locked region."},
+  {"id":"engine-q2","type":"mcq","tags":["ownership","enums-patterns"],
+   "q":"Why does <code>pause</code> use <code>map.remove(&amp;handle)</code> and then re-insert, instead of <code>map.get(&amp;handle)</code>?",
+   "options":["<code>SyncHandle::stop(self)</code> consumes the handle, so <code>pause</code> must <em>own</em> it. <code>get</code> only lends a reference. Entries that aren't <code>Running</code> are put back unchanged","<code>get</code> would take the lock a second time","To give the paused handle a new id","Because a <code>HashMap</code> cannot hold an enum with an <code>Arc</code> inside"],
+   "answer":0,
+   "explain":"Moving a value out of a collection is how Rust expresses taking it over. <code>remove</code> returns the owned value."},
+  {"id":"engine-q3","type":"mcq","tags":["async","lifetimes"],
+   "q":"<code>start_usage_ticker(engine: &amp;'static EngineState)</code> calls <code>engine.rt.spawn(async move { … tick_all_ledgers(engine) … })</code>. What would happen if the parameter were a plain <code>&amp;EngineState</code>?",
+   "options":["Nothing; <code>async move</code> copies the whole <code>EngineState</code> into the task","It would not compile: <code>spawn</code> requires a <code>'static</code> future, because the task may outlive the caller, and a future holding a non-<code>'static</code> reference is not <code>'static</code>","It would compile, but the ticker would stop when <code>register</code> returns","It would panic at runtime, because <code>spawn</code> must be called inside the runtime"],
+   "answer":1,
+   "explain":"<code>async move</code> moves the reference, not the struct. The reference is allowed into the task only because it is <code>'static</code>, which it is since it points into <code>static ENGINE</code>. <code>Runtime::spawn</code> works from any thread."},
+  {"id":"engine-q4","type":"open","tags":["async","borrowing","smart-pointers","error-handling"],
+   "q":"Walk through <code>host::request_account_json(handle, address_hex, block)</code> from the incoming strings to the returned JSON. Mention where the lock is held, what is cloned, how the block selector is handled, how the async code runs, and why the <code>async</code> block may borrow local variables.",
+   "model":"First the address and the block selector are parsed without panicking; a bad address returns <code>{\"error\"}</code>, a selector no retry can serve (such as <code>safe</code> or <code>earliest</code>) returns the permanent <code>-32602</code> envelope, both before the handle is looked up. Then <code>engine()</code> fetches the singleton. <code>snapshot_reader</code> takes the handles mutex, checks the entry is <code>Running</code> with a reader, clones the <code>Arc&lt;ElReader&gt;</code> (a reference-count increment) plus two period numbers, and the guard is dropped when it returns. <code>read_anchor</code> checks a numbered block against the current head window and maps the selector to <code>Head</code> or <code>Finalized</code>, or returns refusal JSON. The foreign calling thread then blocks in <code>engine.rt.block_on(reader.request(async { reader.get_account_pinned(anchor, address, pin).await }))</code>; <code>request</code> adds the 90 s budget and cancellation. The async block can borrow <code>reader</code> and <code>address</code> because <code>block_on</code> does not return until the future completes, so there is no <code>'static</code> requirement, unlike <code>spawn</code>. Finally <code>Ok</code> becomes <code>eljson::account_json</code> (a failed verification is still an <code>Ok</code> with <code>failReason</code>) and <code>Err</code> becomes <code>error_json</code>.",
+   "points":["address and block selector parsed first; bad input answered before the handle lookup, unservable selector as -32602","lock held only inside snapshot_reader; Arc&lt;ElReader> cloned out, guard dropped on return","read_anchor applies or refuses the selector against the current head","caller's thread blocks in rt.block_on, wrapped in reader.request's budget; borrowing is fine because block_on waits (no 'static)","Result becomes account_json or error_json; a verification failure is inside the result"],
+   "context":"rust/myotis-engine/src/host.rs L1540-1570 request_account_json (parse_address, parse_read_block, snapshot_reader, read_anchor, block_on(reader.request(async { reader.get_account_pinned(anchor, address, pin).await }))); L3562-3580 snapshot_reader (lock().map_err(..)?; match Running(config, sync, Some(reader)) => Arc::clone(reader)...); L2058-2080 check_call_block. ElReader::request = run_registered with REQUEST_BUDGET 90 s."},
+  {"id":"engine-q5","type":"mcq","tags":["unsafe-ffi","ownership"],
+   "q":"An iOS caller receives a <code>char*</code> from <code>myotis_status_json</code>. Who frees it, and how?",
+   "options":["The caller, with <code>free(3)</code>","Nobody; Rust frees it when the next call comes in","Rust frees it automatically when the function returns","The caller, by passing it to <code>myotis_string_free</code>, which rebuilds the <code>CString</code> with <code>from_raw</code> and drops it. It came from Rust's allocator via <code>into_raw</code>, so <code>free(3)</code> would be undefined behavior"],
+   "answer":3,
+   "explain":"<code>into_raw</code> and <code>from_raw</code> are a matched pair: ownership goes out to C and comes back only through the engine's own free function. <code>RustEngine.kt</code> does this in a <code>finally</code> right after copying the string."},
+  {"id":"engine-q6","type":"open","tags":["modules-cargo","unsafe-ffi","macros"],
+   "q":"<code>myotis-rpcd</code> calls <code>myotis_engine::ffi::create_handle(\"gnosis\".into(), dir)</code>, while <code>myotis-node</code> calls <code>myotis_engine::capi::myotis_create(ptr, ptr)</code> inside <code>unsafe</code>. Explain why both work, why neither can call <code>myotis_engine::host::create</code>, and what each route costs.",
+   "model":"Both crates link <code>myotis-engine</code> as an rlib. <code>#[uniffi::export]</code> leaves <code>create_handle</code> as an ordinary <code>pub fn</code> taking owned <code>String</code>s and only adds a C-callable twin, so rpcd calls it like any Rust function with no FFI and no <code>unsafe</code>. <code>capi::myotis_create</code> is a <code>pub unsafe extern \"C\" fn</code>; calling it from Rust is allowed but needs <code>unsafe</code> and C strings (<code>CString</code>), and each returned <code>*mut c_char</code> must go back through <code>myotis_string_free</code>. Neither can reach <code>host</code> because <code>lib.rs</code> declares <code>mod host;</code> without <code>pub</code>, so it is private to the crate. The ffi route costs a <code>String</code> allocation per argument (the export takes ownership); the capi route costs a C-string conversion on the way in and a copy plus explicit free on the way out.",
+   "points":["#[uniffi::export] keeps a normal pub fn, so it is callable by Rust path","capi functions are unsafe extern \"C\" and need unsafe, C strings and myotis_string_free","host is private (mod host without pub) so other crates cannot call it","ffi takes owned Strings; capi borrows C strings and returns caller-owned pointers"],
+   "context":"rust/myotis-engine/src/lib.rs L19-25 (pub mod capi; pub mod ffi; mod host;). ffi.rs L64-67 create_handle(network: String, data_dir: String) -> i64. capi.rs L93-103 myotis_create(*const c_char, *const c_char). myotis-rpcd/src/main.rs uses myotis_engine::ffi; myotis-node/src/lib.rs uses myotis_engine::capi."},
+  {"id":"engine-q7","type":"mcq","tags":["error-handling","traits-generics"],
+   "q":"<code>parse_state_overrides</code> returns <code>Result&lt;StateOverrides, String&gt;</code>, yet contains <code>val.as_str().ok_or(\"override 'code' must be a hex string\")?</code>, whose error is a <code>&amp;str</code>. Why does this compile?",
+   "options":["<code>?</code> calls <code>From::from</code> on the error before returning it, and <code>String</code> implements <code>From&lt;&amp;str&gt;</code>, so the literal is copied into a <code>String</code> on that path","<code>&amp;'static str</code> and <code>String</code> are the same type in Rust 2021","<code>ok_or</code> always returns a <code>String</code> error","The compiler inserts <code>.unwrap()</code> when the types differ"],
+   "answer":0,
+   "explain":"The conversion in <code>?</code> is what lets one function mix error sources, like a checked exception being wrapped automatically. It happens only when the error actually occurs."},
+  {"id":"engine-q8","type":"mcq","tags":["interior-mutability","ownership"],
+   "q":"In <code>create</code>, what would change if <code>let Ok(_serial) = engine.create_lock.lock() else { … };</code> were written as <code>let Ok(_) = engine.create_lock.lock() else { … };</code>?",
+   "options":["Nothing; both hold the lock until the function returns","It would not compile, because <code>_</code> is not allowed in <code>let-else</code>","With <code>_</code> nothing is bound, so the guard is dropped at the end of the statement and the lock is released immediately. The rest of <code>create</code> would run unserialized","The lock would be held forever"],
+   "answer":2,
+   "explain":"<code>_name</code> binds (and silences the unused warning); <code>_</code> does not bind at all. For RAII guards the difference is the whole point. The same applies to <code>let _guard = engine.rt.enter();</code>."},
+  {"id":"engine-q9","type":"open","tags":["async"],
+   "q":"<code>set_activity_watch_json</code> calls <code>let _guard = engine.rt.enter();</code> before <code>reader.set_activity_watch(…)</code>, while <code>spin_up</code> uses <code>engine.rt.block_on(async { SyncHandle::start(cfg) })</code>. What does each do, and why is <code>enter</code> enough in the first case?",
+   "model":"Both exist because the called code may use <code>tokio::spawn</code>, which needs a current runtime on the calling thread, and host threads (JVM, iOS, Node) have none. <code>block_on</code> runs a future to completion on the calling thread inside the runtime's context, blocking until it finishes. <code>rt.enter()</code> only sets the runtime as this thread's current one and returns a guard; while the guard lives, <code>tokio::spawn</code> and similar calls find the runtime. <code>set_activity_watch</code> is a plain (non-async) function that may spawn the follower task and has nothing to await, so entering the context is enough and cheaper. The guard must be named (<code>_guard</code>), because <code>_</code> would drop it at once and leave the context before the call.",
+   "points":["tokio::spawn needs a current runtime; foreign host threads have none","block_on drives a future to completion and blocks the thread","enter() only installs the runtime context for the guard's lifetime","set_activity_watch is not async and has nothing to await, so enter suffices","the guard must be bound to a name, not _, or the context ends immediately"],
+   "context":"rust/myotis-engine/src/host.rs L5605-5646 set_activity_watch_json (let _guard = engine.rt.enter(); reader.set_activity_watch(&watch, &unwatch)); L703-739 spin_up (engine.rt.block_on(async { let mut cfg = (*config).clone(); ... SyncHandle::start(cfg) })); L836 the same enter() in spin_up's re-apply."},
+  {"id":"engine-q10","type":"mcq","tags":["domain","error-handling"],
+   "q":"A wallet calls <code>eth_call</code> with block <code>0x10</code> while the verified head is 20,000,000. What does <code>check_call_block</code> make of it, and why that code?",
+   "options":["It runs the call against head state, since any number is accepted","<code>Ahead</code>: a retryable <code>{\"error\"}</code>, because the head will catch up","It runs the call against block 16's state, which the engine fetches","<code>Behind</code>: the permanent <code>{\"error\",\"code\":-32602}</code>, because the number is more than 64 blocks below the head, head state would answer a different question, and the head never moves back that far"],
+   "answer":3,
+   "explain":"Only numbers in [head − 64, head + 16] run, and they run against head state. Behind is permanent; Ahead and NoHead are retryable, so a merely lagging node is never told to stop being asked."},
+  {"id":"engine-q11","type":"open","tags":["concurrency","interior-mutability"],
+   "q":"In <code>UsageLedger::tick_on</code>, the comment insists that <code>self.meter.snapshot()</code> is taken <em>after</em> <code>self.state.lock()</code>. Describe the bug that would appear if the snapshot were taken before the lock, with two threads (the minute ticker and a status read).",
+   "model":"Each tick computes the growth as <code>now - seen</code> and then stores <code>seen = now</code>. Suppose thread A reads the meter (value 100), then thread B reads it (value 120), B takes the lock first, adds 120 − seen and sets <code>seen = 120</code>; then A takes the lock and sets <code>seen</code> back to 100 (its own <code>now</code>), after adding <code>100 - 120</code>, which <code>saturating_sub</code> turns into 0. The next tick then measures from 100 again, so the 20 bytes between 100 and 120 are counted twice. Reading the meter inside the critical section means the snapshots are applied in the order they were taken, so <code>seen</code> never steps back.",
+   "points":["growth is now - seen, then seen = now","two snapshots taken outside the lock can be applied in the opposite order","the older snapshot overwrites seen, so seen steps back","bytes between the two snapshots are then counted twice","taking the snapshot under the lock orders the ticks"],
+   "context":"rust/myotis-engine/src/usage.rs L146-185 tick_on: let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner()); let now = self.meter.snapshot(); let rx = now.rx().saturating_sub(st.seen.rx()); ... st.seen = now; Callers: status_json (tick(false)), the minute ticker in host.rs L1291-1318, set_network_metering, pause/stop (tick(true))."},
+  {"id":"engine-q12","type":"mcq","tags":["testing","macros"],
+   "q":"How does <code>header_pins_the_current_abi_version</code> in <code>capi.rs</code> notice that someone bumped <code>ABI_VERSION</code> but forgot the C header?",
+   "options":["It runs the C compiler on the header at test time","<code>include_str!</code> embeds <code>rust/include/myotis_engine.h</code> at compile time; the test extracts the single column-0 <code>#define MYOTIS_ABI_VERSION</code> and asserts it equals <code>crate::ABI_VERSION</code>. Because the header is a compile input, an edit to it alone also reruns the test","It loads the iOS framework and calls <code>myotis_init</code>","UniFFI's checksums cover the C header too"],
+   "answer":1,
+   "explain":"The header is hand-maintained, and iOS reads its expected ABI from it, so a mismatch would make iOS refuse a good engine or accept a stale one. <code>RustEngineNative.EXPECTED_ABI_VERSION</code> on the JVM is still a hand-kept mirror."},
+  {"id":"engine-q13","type":"mcq","tags":["interior-mutability","concurrency"],
+   "q":"The <code>eth_getLogs</code> debounce declares <code>static RECENT_REFUSALS: Mutex&lt;Option&lt;HashMap&lt;u64, Instant&gt;&gt;&gt; = Mutex::new(None);</code>. Why the <code>Option</code>?",
+   "options":["A <code>static</code> initializer must be a constant expression; <code>Mutex::new</code> is <code>const</code> but <code>HashMap::new</code> is not, so the map starts as <code>None</code> and is created on first use under the lock","So the map can be dropped when the engine stops","Because a <code>HashMap</code> inside a <code>Mutex</code> must always be optional","To make the static <code>Copy</code>"],
+   "answer":0,
+   "explain":"<code>get_or_insert_with(HashMap::new)</code> builds it lazily. <code>OnceLock</code> would also work; this form keeps creation and updates under one lock."}
+]</x-quiz>

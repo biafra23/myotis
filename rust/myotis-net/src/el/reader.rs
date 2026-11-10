@@ -71,7 +71,7 @@ pub struct ElConfig {
     /// runs without persistence.
     pub cache_path: Option<std::path::PathBuf>,
     /// Path to the eth_getLogs watch-list index (`dataDir/logindex[-net].db`);
-    /// `None` keeps the index memory-only (docs/eth-getlogs-design.md).
+    /// `None` keeps the index memory-only (docs/design-history/eth-getlogs-design.md).
     pub log_index_path: Option<std::path::PathBuf>,
     /// Network floor for the suggested priority fee (wei) — the Java
     /// `NetworkConfig.minSuggestedTipWei` (mainnet/sepolia 0.1 gwei; gnosis 0.001).
@@ -98,7 +98,7 @@ pub struct ElConfig {
     pub traffic: Arc<crate::traffic::TrafficMeter>,
 }
 
-/// The dedicated myotis-serving sepolia node (docs/dedicated-sepolia-node.md).
+/// The dedicated myotis-serving sepolia node (docs/guides/dedicated-sepolia-node.md).
 /// Key stable (persisted nodekey); the address is the netcup relay
 /// (188.68.32.16, static VPS) that DNATs 30405 to zbox over WireGuard — zbox
 /// itself is behind mobile CGNAT, so its own uplink rotating no longer matters.
@@ -308,7 +308,7 @@ impl ElConfig {
             min_suggested_tip_wei: 100_000_000, // 0.1 gwei
             block_time: Duration::from_secs(12),
             traffic: crate::traffic::TrafficMeter::new(),
-            // The dedicated myotis-serving node (docs/dedicated-sepolia-node.md):
+            // The dedicated myotis-serving node (docs/guides/dedicated-sepolia-node.md):
             // it admits wallets past its peer cap by RLPx Hello client-id, so
             // direct-dialing it beats waiting for discovery on a saturated
             // testnet. Mirrors the Java `NetworkConfig.SEPOLIA_EL_ENODES`.
@@ -974,7 +974,7 @@ struct SentTx {
     via_tor: bool,
 }
 
-/// Which way a rebroadcast of one of our sends goes (docs/privacy-and-tor.md).
+/// Which way a rebroadcast of one of our sends goes (docs/how-it-works/privacy-and-tor.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RebroadcastRoute {
     Tor,
@@ -1226,7 +1226,7 @@ const _: () = assert!(HEDGE_DELAY.as_millis() < LOG_INDEX_FILL_DEADLINE.as_milli
 ///    every peer at once;
 ///  - a snap query for an ADDRESS-carrying read (`get_account`/`get_storage`)
 ///    discloses `keccak(address)` to whichever peers it reaches — the §1 "core
-///    leak" in docs/privacy-and-tor.md. Sequential rotation disclosed to a new
+///    leak" in docs/how-it-works/privacy-and-tor.md. Sequential rotation disclosed to a new
 ///    peer only on FAILURE; hedging discloses to up to this many peers whenever
 ///    the first is slower than `HEDGE_DELAY` (the mobile/congested case #320 is
 ///    about), even if that first peer then answers. This cap bounds the widened
@@ -1390,7 +1390,7 @@ struct TorBroadcast {
     confirmed: bool,
 }
 
-/// Push `raw` over Tor (docs/privacy-and-tor.md §4) to every one of
+/// Push `raw` over Tor (docs/how-it-works/privacy-and-tor.md §4) to every one of
 /// `targets` at once (from [`tor_candidates`]), each push its own Tor stream
 /// with a fresh ephemeral RLPx key, all under ONE isolation token fresh to
 /// this call: whatever circuits carry them carry nothing else — no other
@@ -1737,7 +1737,7 @@ enum PoolRaceVerdict<T> {
 /// failure keep their strikes — the reasons in `RaceOutcome::errors` carry
 /// their peer position, so a per-peer excuse there would be cheap now, but a
 /// Behind peer rarely enters a race at all now that the ladder ranks it last
-/// (dropped consciously, docs/TODO.md).
+/// (dropped consciously, docs/reviews/review-follow-ups.md).
 /// `head_anchored` = the window's top was the optimistic head. Only such a
 /// window can lose the one-slot race with the peers' imports; a window
 /// anchored at the FINALIZED block (`WindowTop::Finalized`) is minutes old, so
@@ -1780,7 +1780,7 @@ fn race_served_by_winner<T>(out: &RaceOutcome<T>, served: impl Fn(&T) -> bool) -
     out.accepted.as_ref().is_some_and(|(_, v)| served(v))
 }
 
-/// Tor read fan-out bounds (docs/privacy-and-tor.md): how many eligible
+/// Tor read fan-out bounds (docs/how-it-works/privacy-and-tor.md): how many eligible
 /// snap peers a single Tor-routed read may try, and the wall-clock ceiling on the
 /// whole read. Kept small because each Tor dial is slow and many peers reject
 /// Tor-exit inbound — without these a bad-exit walk could hang the FFI call for
@@ -2051,7 +2051,7 @@ pub struct ElReader {
     pool: PeerPool,
     anchor: Arc<ExecAnchor>,
     /// Our eth handshake parameters — reused by the Tor read path
-    /// (`docs/privacy-and-tor.md`) to dial a per-address isolated circuit with a
+    /// (`docs/how-it-works/privacy-and-tor.md`) to dial a per-address isolated circuit with a
     /// fresh ephemeral identity, independent of the pool's clearnet connections.
     /// Only read on the `tor` feature; kept unconditionally so the struct shape
     /// doesn't depend on the feature.
@@ -2105,7 +2105,7 @@ pub struct ElReader {
     /// The sent-tx WATCH, shared with every peer's read loop (which marks
     /// gossip sightings) — the Java TxGossipObserver seam's equivalent.
     sent_tx_watch: crate::el::sent_tx::SharedSentTxWatch,
-    /// The opt-in eth_getLogs watch-list index (docs/eth-getlogs-design.md).
+    /// The opt-in eth_getLogs watch-list index (docs/design-history/eth-getlogs-design.md).
     /// `None` until the host supplies a config. Brief-hold lock: appends and
     /// queries are in-memory work; persistence happens on checkpoints and
     /// stop, never under a network await.
@@ -2134,6 +2134,14 @@ pub struct ElReader {
     /// (pipelining pays), false after a budget-truncated one (prefetch would
     /// waste the serving link). See log_index_backfill_batch.
     log_index_pipeline_full: std::sync::atomic::AtomicBool,
+    /// Whether the last batch applied at the cursor came back FULL — every
+    /// block it was asked for. Speculative backfill lanes (#297) chain only
+    /// below a full batch, so a short one means the lanes below it were
+    /// fetched for nothing. Unlike `log_index_pipeline_full` this also sees a
+    /// window cut short on the HEADERS (a peer capping its header serves below
+    /// the 1,023 asked for), which clears no chunk signal. See
+    /// `log_index_backfill_round`.
+    log_index_cursor_batch_full: std::sync::atomic::AtomicBool,
     /// Backfill THROUGHPUT of each peer's most recent batch, in milliblocks per
     /// second (blocks applied × 1000 / seconds elapsed), keyed by dial address —
     /// the walk's own record of who actually moves the cursor fastest.
@@ -2464,6 +2472,7 @@ impl ElReader {
             log_index_unwatch_owed: std::sync::atomic::AtomicBool::new(false),
             log_index_write: std::sync::Mutex::new(()),
             log_index_pipeline_full: std::sync::atomic::AtomicBool::new(true),
+            log_index_cursor_batch_full: std::sync::atomic::AtomicBool::new(true),
             log_index_peer_serve: std::sync::Mutex::new(std::collections::HashMap::new()),
             log_index_backfill_rounds: std::sync::atomic::AtomicU64::new(0),
             log_index_chunk_sizer: ChunkSizer::new(),
@@ -2493,7 +2502,7 @@ impl ElReader {
     /// host re-applying its shipped preset EXTENDS an imported subscription
     /// instead of replacing it. Without this, every restart's preset push
     /// would fingerprint-mismatch the imported index into a full re-index
-    /// (see docs/eth-getlogs-design.md §import). So an address this push
+    /// (see docs/design-history/eth-getlogs-design.md §import). So an address this push
     /// leaves out stays subscribed; it leaves only through
     /// [`Self::unwatch_log_index`].
     ///
@@ -3014,7 +3023,7 @@ impl ElReader {
     }
 
     /// Activate a portable log-index snapshot found at this reader's own
-    /// path (the drop-in path, docs/eth-getlogs-design.md): a
+    /// path (the drop-in path, docs/design-history/eth-getlogs-design.md): a
     /// self-describing file in the data dir IS an opt-in — someone put it
     /// there deliberately, and the daemon has no settings surface to say so
     /// otherwise. Enabled for SERVING on activation, with the downward walk
@@ -3134,7 +3143,7 @@ impl ElReader {
         }
     }
 
-    /// Import portable log-index snapshots (docs/eth-getlogs-design.md):
+    /// Import portable log-index snapshots (docs/design-history/eth-getlogs-design.md):
     /// every file must be a v2/v3 self-describing snapshot of THIS chain; they
     /// merge with the node's current index (checkpointed first so nothing
     /// in-memory is lost), the merged result is persisted and installed, and
@@ -4857,7 +4866,7 @@ impl ElReader {
 
     /// One backfill step: walk the verified header chain DOWNWARD from the
     /// index's trust cursor toward the lowest watched from_block, one batch
-    /// per tick (docs/eth-getlogs-design.md §backfill). Every header is
+    /// per tick (docs/design-history/eth-getlogs-design.md §backfill). Every header is
     /// trusted only through parent-hash linkage into the cursor (whose own
     /// trust chains back to a beacon-anchored append); candidate blocks
     /// (bloom hit) get their receipts fetched and verified against
@@ -5016,6 +5025,68 @@ impl ElReader {
         }
     }
 
+    /// Score one peer's backfill batch: `top` and `count` are the batch it was
+    /// asked for, `outcome` the cursor its apply left behind or why it failed.
+    fn log_index_record_backfill_batch(
+        &self,
+        addr: std::net::SocketAddr,
+        round: u64,
+        top: u64,
+        count: u64,
+        elapsed: std::time::Duration,
+        outcome: &Result<(u64, [u8; 32]), BackfillBatchError>,
+    ) {
+        match outcome {
+            // Score the peer by the THROUGHPUT the batch achieved — pure and
+            // unit-tested, see `backfill_batch_rate`. `elapsed` is the lane's
+            // own fetch, so lanes running beside it do not dilute it.
+            Ok((after, _)) => match backfill_batch_rate(top, Some(*after), count, elapsed) {
+                Some(rate) => {
+                    if let Ok(mut scores) = self.log_index_peer_serve.lock() {
+                        scores.insert(addr, PeerServeScore { rate, round });
+                    }
+                }
+                // The measurement is void. DROP any stale entry rather than
+                // keep one: the map also holds 0 to mean "failed attributably",
+                // which sorts dead last, and this peer just demonstrated it can
+                // serve the range. Keeping that 0 would demote a proven server
+                // until an exploration round rescued it. Absent means "not
+                // measured", which is exactly the honest state here.
+                None => {
+                    if let Ok(mut scores) = self.log_index_peer_serve.lock() {
+                        scores.remove(&addr);
+                    }
+                }
+            },
+            Err(e) => {
+                // Score a peer-attributable failure as zero rather than leaving
+                // it unscored: unscored means "not measured" and sorts FIRST, so
+                // a peer that always fails (pruned history, say) would otherwise
+                // cost a full round-trip ahead of every good peer, forever. The
+                // exploration round is what gives it another chance.
+                //
+                // A failure of OURS (config swapped mid-batch, gap reset) says
+                // nothing about the peer, so it must not score at all —
+                // otherwise our own bookkeeping demotes a good server. Its TURN
+                // still counts, though: see `log_index_note_peer_tried`.
+                if e.blames_peer {
+                    if let Ok(mut scores) = self.log_index_peer_serve.lock() {
+                        scores.insert(addr, PeerServeScore { rate: 0, round });
+                    }
+                } else {
+                    self.log_index_note_peer_tried(addr, round);
+                }
+                tracing::debug!(
+                    top,
+                    count,
+                    blames_peer = e.blames_peer,
+                    error = %e,
+                    "log index backfill batch failed"
+                );
+            }
+        }
+    }
+
     fn log_index_backfill_peer_order(
         &self,
         peers: Vec<std::sync::Arc<crate::el::peer::ManagedPeer>>,
@@ -5065,8 +5136,11 @@ impl ElReader {
         ordered
     }
 
-    /// One backfill round: try every pooled peer for one batch at the current
-    /// cursor. Returns (progressed, max_speed_configured).
+    /// One backfill round: fetch up to [`BACKFILL_LANES`] consecutive batches
+    /// below the cursor in parallel, one peer each (one in nice mode), and
+    /// apply them in order for as far as they chain; the batch at the cursor
+    /// falls back to every other pooled peer if its lane fails. Returns
+    /// (progressed, max_speed_configured).
     async fn log_index_backfill_round(&self, ticks: u64, backfill_ok: &mut u64) -> (bool, bool) {
         let Some((config, cursor, walk_target)) =
             self.with_log_index(|ix| (ix.config().clone(), ix.cursor, ix.walk_target()))
@@ -5093,8 +5167,6 @@ impl ElReader {
         // honest peers cap header serves at 1024 (our own served.rs agrees) —
         // so the batch is 1023 new blocks, keeping the request exactly at cap.
         const BATCH: u64 = 1023;
-        let count = (cur_n - target_low).min(BATCH);
-        let from = cur_n - count;
         let peers = self.pool.snap_peers().await;
         if peers.is_empty() {
             // Visible (rate-limited): a silently empty pool looked identical
@@ -5114,104 +5186,197 @@ impl ElReader {
             .log_index_backfill_rounds
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let peers = self.log_index_backfill_peer_order(peers, round);
-        for peer in &peers {
-            let started = std::time::Instant::now();
-            match self
-                .log_index_backfill_batch(peer, count, cur_n, cur_hash, &config, fingerprint)
-                .await
-            {
-                Ok(()) => {
-                    let elapsed = started.elapsed();
-                    let new_cursor = self.with_log_index(|ix| ix.cursor).flatten();
-                    // Score this peer by the THROUGHPUT the batch achieved —
-                    // pure and unit-tested, see `backfill_batch_rate`.
-                    match backfill_batch_rate(cur_n, new_cursor.map(|(n, _)| n), count, elapsed) {
-                        Some(rate) => {
-                            if let Ok(mut scores) = self.log_index_peer_serve.lock() {
-                                scores.insert(peer.addr(), PeerServeScore { rate, round });
-                            }
-                        }
-                        // The measurement is void — the cursor moved under the
-                        // batch (a concurrent reorg rewind, config swap or
-                        // snapshot import), so the delta is not this peer's
-                        // throughput. DROP any stale entry rather than keep
-                        // one: the map also holds 0 to mean "failed
-                        // attributably", which sorts dead last, and this peer
-                        // just demonstrated it can serve the range. Keeping
-                        // that 0 would demote a proven server until an
-                        // exploration round rescued it. Absent means "not
-                        // measured", which is exactly the honest state here.
-                        None => {
-                            if let Ok(mut scores) = self.log_index_peer_serve.lock() {
-                                scores.remove(&peer.addr());
-                            }
-                        }
+        // LANES (#297, step 2). A round used to fetch ONE batch from ONE peer
+        // while the rest of the pool idled, so the walk ran at a single peer's
+        // round-trip rate however many peers were connected (Gnosis,
+        // 2026-11-09: ~2-3 batches/s, ~1 MB/s, on a ~30 Mbit/s link). In max
+        // speed a round now plans up to `BACKFILL_LANES` consecutive batches
+        // below the cursor and fetches them AT ONCE, one peer each, the
+        // best-ranked peer on the batch at the cursor. Only the APPLY stays
+        // sequential: a lane is committed only when the lane above it left the
+        // cursor exactly at its top, number and hash — see
+        // `log_index_backfill_fetch` for why that leaves every block's trust
+        // what it was.
+        //
+        // Lanes are consumed IN ORDER as they land, and the moment the chain
+        // breaks (a lane came back short or failed) the lanes below are
+        // dropped, cancelling their requests. The round therefore never waits
+        // for a batch it cannot apply: its wall time is that of the prefix
+        // that chains, so a broken chain costs only the bandwidth the
+        // cancelled lanes had in flight.
+        //
+        // One lane only — the pre-lane round exactly — in nice mode (the
+        // background-politeness setting), and while the range TRUNCATES. The
+        // signal is the chunk pipeline's (`log_index_pipeline_full`, cleared
+        // by a budget-truncated or failed batch, set again by a clean one):
+        // where peers cut batches short, the batch at the cursor ends early
+        // every time, no lane below it ever chains, and every byte those lanes
+        // fetch is taken from the one batch that does apply on a link that is
+        // already the bottleneck. Measured on Gnosis at ~44.38M (2026-11-09):
+        // 5-of-7-candidate serves, and four lanes there walked ~25 blk/s.
+        // Likewise while the last batch at the cursor came back short for any
+        // other reason (`log_index_cursor_batch_full`): a peer that caps its
+        // header serves would otherwise break the chain below its lane every
+        // round without ever tripping the chunk signal. Every applied lane
+        // writes it, speculative ones included, so whichever lane that peer
+        // serves, the next round runs one lane until a full batch at the
+        // cursor turns the lanes back on.
+        let lane_peers: Vec<usize> = if max_speed
+            && self
+                .log_index_pipeline_full
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && self
+                .log_index_cursor_batch_full
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let rates: Vec<Option<u64>> = match self.log_index_peer_serve.lock() {
+                Ok(scores) => peers.iter().map(|p| scores.get(&p.addr()).map(|s| s.rate)).collect(),
+                Err(_) => vec![None; peers.len()],
+            };
+            backfill_lane_peers(&rates, BACKFILL_LANES)
+        } else {
+            vec![0]
+        };
+        let plan = backfill_lane_plan(cur_n, target_low, BATCH, lane_peers.len());
+        let lanes: Vec<(u64, u64, &std::sync::Arc<crate::el::peer::ManagedPeer>)> = plan
+            .iter()
+            .zip(&lane_peers)
+            .filter_map(|(&(top, count), &i)| peers.get(i).map(|p| (top, count, p)))
+            .collect();
+        // Built with a plain loop into boxed futures for the same `Send`
+        // reason as the chunk fetches (see `ChunkFetch`).
+        let mut lane_fetches: Vec<LaneFetch<'_>> = Vec::with_capacity(lanes.len());
+        for (k, &(top, count, peer)) in lanes.iter().enumerate() {
+            let config = &config;
+            lane_fetches.push(Box::pin(async move {
+                // Timed from its first poll; `buffered` below polls every lane
+                // from the start, so this is the lane's own fetch time.
+                let started = std::time::Instant::now();
+                // Only the lane at the cursor has a trusted top to check the
+                // window against at fetch time; the others are checked at
+                // apply time, against the cursor the lane above leaves.
+                let trusted_top = (k == 0).then_some(cur_hash);
+                let fetched = self
+                    .log_index_backfill_fetch(peer, count, top, trusted_top, config)
+                    .await;
+                (fetched, started.elapsed())
+            }));
+        }
+        let mut fetches = futures::StreamExt::buffered(
+            futures::stream::iter(lane_fetches),
+            lanes.len().max(1),
+        );
+        // The cursor the next lane must hang from.
+        let mut cursor = (cur_n, cur_hash);
+        let mut applied = 0u64;
+        // Lanes consumed so far, whatever became of them.
+        let mut consumed = 0usize;
+        // Whether the lane at the cursor failed and needs the fallback.
+        let mut cursor_lane_failed = false;
+        while let Some((result, elapsed)) = futures::StreamExt::next(&mut fetches).await {
+            let Some(&(top, count, peer)) = lanes.get(consumed) else {
+                break; // unreachable: one result per lane
+            };
+            consumed += 1;
+            let outcome = match result {
+                // `top.0` always matches (the fetch checks the window starts
+                // at block `top`, and reaching this lane means the one above
+                // ended exactly there), so a mismatch is the hash: this peer's
+                // header for that block is not the one the verified chain
+                // above it reached. Its batch hangs from another chain.
+                Ok(prepared) if prepared.top != cursor => Err(BackfillBatchError::peer(
+                    "speculative window does not chain to the batch above it",
+                )),
+                Ok(prepared) => self.log_index_backfill_apply(prepared, fingerprint),
+                Err(e) => Err(e),
+            };
+            self.log_index_record_backfill_batch(peer.addr(), round, top, count, elapsed, &outcome);
+            match outcome {
+                Ok(after) => {
+                    applied += 1;
+                    cursor = after;
+                    let full = after.0 == top - count;
+                    // Every applied lane was applied AT the cursor (the one
+                    // above it left the cursor exactly at its top), so each
+                    // one updates the flag — a peer that caps its header
+                    // serves turns the lanes off from a speculative lane just
+                    // as it does from lane 0.
+                    self.log_index_cursor_batch_full
+                        .store(full, std::sync::atomic::Ordering::Relaxed);
+                    if !full {
+                        break; // short: the next lane's top is not the cursor
                     }
-                    // Count SUCCESSES, not ticks: with intermittent failures a
-                    // ticks-modulo log can systematically miss the successful
-                    // ticks and stay silent while progressing. First success
-                    // logs immediately, then every 50th (~5 min when healthy).
-                    *backfill_ok += 1;
-                    if *backfill_ok % 50 == 1 {
-                        tracing::info!(
-                            cursor = new_cursor.map(|(n, _)| n).unwrap_or(cur_n),
-                            target = target_low,
-                            batches_applied = *backfill_ok,
-                            "log index backfill progress"
-                        );
-                    }
-                    // Persistence happens once per step (see the caller) —
-                    // per-batch fsyncs would eat the max-speed budget.
-                    return (true, max_speed);
                 }
-                Err(e) => {
-                    // Score a peer-attributable failure as zero rather than
-                    // leaving it unscored: unscored means "not measured" and
-                    // sorts FIRST, so a peer that always fails (pruned history,
-                    // say) would otherwise cost a full round-trip ahead of every
-                    // good peer, forever. The exploration round is what gives it
-                    // another chance.
-                    //
-                    // A failure of OURS (config swapped mid-batch, gap reset)
-                    // says nothing about the peer, so it must not score at all —
-                    // otherwise our own bookkeeping demotes a good server. Its
-                    // TURN still counts, though: see `log_index_note_peer_tried`.
-                    if e.blames_peer {
-                        if let Ok(mut scores) = self.log_index_peer_serve.lock() {
-                            scores.insert(peer.addr(), PeerServeScore { rate: 0, round });
-                        }
-                    } else {
-                        self.log_index_note_peer_tried(peer.addr(), round);
-                    }
-                    tracing::debug!(from, count, blames_peer = e.blames_peer, error = %e, "log index backfill batch failed; trying next peer");
+                Err(_) => {
+                    cursor_lane_failed = consumed == 1;
+                    break;
                 }
             }
         }
-        if ticks % 100 == 0 {
-            tracing::warn!(
-                cursor = cur_n,
+        // Cancel what the chain no longer reaches. Those lanes were fetched for
+        // nothing and leave no trace in the scores: no measurement, and
+        // deliberately not their turn either (`log_index_note_peer_tried`). A
+        // peer whose lane keeps being cancelled must still age into the
+        // stalest measurement, or the exploration round would never move it
+        // to the cursor lane for a fresh one.
+        drop(fetches);
+        if cursor_lane_failed {
+            // Everything hangs from the batch at the cursor, so it gets what
+            // every round always gave it: every other peer, in rank order, one
+            // after another — with the speculative lanes already cancelled, so
+            // none of them sits out its request timeout unpolled meanwhile.
+            let Some(&(_, count, _)) = lanes.first() else {
+                return (false, max_speed); // unreachable: the failed lane is lane 0
+            };
+            for peer in peers.iter().skip(1) {
+                let started = std::time::Instant::now();
+                let r = self
+                    .log_index_backfill_batch(peer, count, cur_n, cur_hash, &config, fingerprint)
+                    .await;
+                self.log_index_record_backfill_batch(peer.addr(), round, cur_n, count, started.elapsed(), &r);
+                if let Ok(after) = r {
+                    applied = 1;
+                    cursor = after;
+                    self.log_index_cursor_batch_full
+                        .store(after.0 == cur_n - count, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+        if applied == 0 {
+            if ticks % 100 == 0 {
+                tracing::warn!(
+                    cursor = cur_n,
+                    target = target_low,
+                    "log index backfill: no peer served the range this round (history depth?); will keep retrying"
+                );
+            }
+            return (false, max_speed);
+        }
+        // Count SUCCESSES, not ticks: with intermittent failures a
+        // ticks-modulo log can systematically miss the successful ticks and
+        // stay silent while progressing. The first success logs immediately,
+        // then one line per 50 batches (a round can apply several, so this
+        // looks for a crossed multiple rather than an exact one).
+        let before = *backfill_ok;
+        *backfill_ok += applied;
+        if before == 0 || before / 50 != *backfill_ok / 50 {
+            tracing::info!(
+                cursor = cursor.0,
                 target = target_low,
-                "log index backfill: no peer served the range this round (history depth?); will keep retrying"
+                batches_applied = *backfill_ok,
+                lanes = lanes.len(),
+                "log index backfill progress"
             );
         }
-        (false, max_speed)
+        // Persistence happens once per step (see the caller) — per-batch
+        // fsyncs would eat the max-speed budget.
+        (true, max_speed)
     }
 
-    /// Fetch and apply one descending backfill batch from one peer:
-    /// headers [from, cur_n] ascending (count+1, so the top one IS the cursor
-    /// block), full parent-hash chain check, bloom-filtered candidate fetch
-    /// verified against the header's roots ([`fetch_candidate_logs`]), then
-    /// apply top-down.
-    /// Fetch and apply one descending backfill batch from one peer. The
-    /// request is `reverse=true` starting AT the trusted cursor block, so the
-    /// trust root is the FIRST header of the response — a short serve (peers
-    /// may cap below the 1024 ceiling, or truncate on byte budget) still
-    /// yields a verifiable parent-hash-chained prefix and partial progress,
-    /// instead of failing an exact-length check forever. (`remember_served`
-    /// only tracks ascending shapes, so reverse fetches skip that side
-    /// channel — harmless.) Candidates are bloom-filtered and their logs
-    /// pre-filtered against the captured config, so transient memory is
-    /// proportional to logs that will actually be stored.
+    /// Fetch and apply one batch at the trusted cursor from one peer — the
+    /// round's fallback when the lane holding the cursor's batch failed.
+    /// Returns the cursor the batch left behind.
     async fn log_index_backfill_batch(
         &self,
         peer: &ManagedPeer,
@@ -5220,7 +5385,50 @@ impl ElReader {
         cur_hash: [u8; 32],
         config: &crate::el::logindex::LogIndexConfig,
         fingerprint: u64,
-    ) -> Result<(), BackfillBatchError> {
+    ) -> Result<(u64, [u8; 32]), BackfillBatchError> {
+        let prepared = self
+            .log_index_backfill_fetch(peer, count, cur_n, Some(cur_hash), config)
+            .await?;
+        self.log_index_backfill_apply(prepared, fingerprint)
+    }
+
+    /// Fetch and verify one descending backfill batch from one peer, without
+    /// touching the index: headers `[top_n - count, top_n]` (count+1, so the
+    /// top one IS the block the batch hangs from), full parent-hash chain
+    /// check, bloom-filtered candidate fetch verified against the headers'
+    /// roots ([`fetch_candidate_logs`]). [`Self::log_index_backfill_apply`]
+    /// commits the result.
+    ///
+    /// `top_hash` is the trusted hash of block `top_n` when the caller has one
+    /// (the batch at the cursor), and the window must then start at it. A
+    /// SPECULATIVE batch — one below the cursor's, fetched in parallel from
+    /// another peer (#297) — passes `None`: its top header is whatever the
+    /// peer served, and the batch is only as trusted as that header. It
+    /// becomes trusted, or is discarded, at apply time: the apply refuses any
+    /// batch whose top is not exactly the cursor the batch above it left, so
+    /// the parent-hash chain from the beacon-anchored cursor down through
+    /// this batch is checked in full before a single block of it is
+    /// committed. Speculation changes WHEN the link is checked, never whether.
+    /// Its receipts and bodies were verified against roots in headers that
+    /// chain to that top, so they are verified the moment the top is.
+    ///
+    /// The request is `reverse=true` starting AT the top block, so the trust
+    /// root is the FIRST header of the response — a short serve (peers may cap
+    /// below the 1024 ceiling, or truncate on byte budget) still yields a
+    /// verifiable parent-hash-chained prefix and partial progress, instead of
+    /// failing an exact-length check forever. (`remember_served` only tracks
+    /// ascending shapes, so reverse fetches skip that side channel —
+    /// harmless.) Candidates are bloom-filtered and their logs pre-filtered
+    /// against the captured config, so transient memory is proportional to
+    /// logs that will actually be stored.
+    async fn log_index_backfill_fetch(
+        &self,
+        peer: &ManagedPeer,
+        count: u64,
+        top_n: u64,
+        top_hash: Option<[u8; 32]>,
+        config: &crate::el::logindex::LogIndexConfig,
+    ) -> Result<PreparedBatch, BackfillBatchError> {
         // The `?` blames the peer (see `impl From<String> for
         // BackfillBatchError`), INCLUDING on a 15s request timeout. That is
         // deliberate, and unlike the chunk-fetch site below it is not made
@@ -5235,7 +5443,7 @@ impl ElReader {
         // exploration round promotes the STALEST measurement, so it is
         // re-measured within a bounded number of rounds (see `RESAMPLE_EVERY`).
         let window = peer
-            .get_block_headers_by_number(cur_n, count + 1, 0, true)
+            .get_block_headers_by_number(top_n, count + 1, 0, true)
             .await?;
         // The PEER does not get to choose the batch size. `max_headers` is a
         // request field an honest peer honours (geth caps at 1024, which is why
@@ -5252,9 +5460,9 @@ impl ElReader {
         let Some((top, rest)) = window.split_first() else {
             return Err(BackfillBatchError::peer("peer returned no headers"));
         };
-        if top.header.number != cur_n || top.hash != cur_hash {
+        if top.header.number != top_n || top_hash.is_some_and(|h| top.hash != h) {
             return Err(BackfillBatchError::peer(
-                "peer window does not start at the trusted cursor block",
+                "peer window does not start at the requested top block",
             ));
         }
         if rest.is_empty() {
@@ -5535,10 +5743,39 @@ impl ElReader {
             self.log_index_chunk_sizer
                 .note_clean_batch(candidates.len(), chunk_len);
         }
+        // A truncated chunk caps the span ABOVE the first unprocessed
+        // candidate — partial progress, never a lying coverage claim. The
+        // blocks below the cut are left for the next batch.
+        let blocks: Vec<(u64, [u8; 32])> = new_blocks
+            .iter()
+            .map(|vh| (vh.header.number, vh.hash))
+            .take_while(|&(n, _)| should_apply(n, stop_below))
+            .collect();
+        Ok(PreparedBatch {
+            top: (top.header.number, top.hash),
+            blocks,
+            logs_by_block,
+        })
+    }
+
+    /// Commit a [`PreparedBatch`] if — and only if — it hangs from the index's
+    /// CURRENT trust cursor under the config it was computed against; returns
+    /// the cursor it leaves behind.
+    ///
+    /// The cursor check is the trust step for a speculative batch (see
+    /// [`Self::log_index_backfill_fetch`]): the batch's blocks parent-hash
+    /// chain to its top, and its top must be the trusted cursor, block number
+    /// AND hash. For the batch fetched at the cursor it is the same recheck it
+    /// always was — the batch ran across several awaits, and a concurrent
+    /// config swap, rewind or import may have moved the cursor under it.
+    fn log_index_backfill_apply(
+        &self,
+        prepared: PreparedBatch,
+        fingerprint: u64,
+    ) -> Result<(u64, [u8; 32]), BackfillBatchError> {
+        let PreparedBatch { top, blocks, mut logs_by_block } = prepared;
         // Apply top-down (the response is already descending) so every block
-        // adjoins the low edge; the trust edge advances with each block. A
-        // truncated chunk caps the applied span ABOVE the first unprocessed
-        // candidate — partial progress, never a lying coverage claim.
+        // adjoins the low edge; the trust edge advances with each block.
         match self.log_index.lock() {
             Ok(mut slot) => {
                 let Some(ix) = slot.as_mut() else {
@@ -5552,20 +5789,23 @@ impl ElReader {
                 // whose new-address logs were "definitively" skipped. Bail
                 // unless both the trust edge and the config are the ones this
                 // batch was computed against.
-                if ix.cursor != Some((cur_n, cur_hash)) || ix.config().fingerprint() != fingerprint {
+                //
+                // A speculative batch whose top does not match is refused the
+                // same way, but the round checks the chain BEFORE calling this
+                // (and blames a peer whose top hash is wrong), so reaching this
+                // with a speculative batch means the cursor moved concurrently,
+                // which is ours.
+                if ix.cursor != Some(top) || ix.config().fingerprint() != fingerprint {
                     // OURS: we swapped the config or moved the edge under the
                     // batch. The peer served fine; do not score it for this.
                     return Err(BackfillBatchError::ours(
                         "index changed mid-batch; recomputing next tick",
                     ));
                 }
-                for vh in new_blocks {
-                    let n = vh.header.number;
-                    if !should_apply(n, stop_below) {
-                        break; // unprocessed candidate — resume here next tick
-                    }
+                let mut cursor = top;
+                for (n, hash) in blocks {
                     let logs = logs_by_block.remove(&n).unwrap_or_default();
-                    if let Err(g) = ix.backfill_block(n, vh.hash, logs) {
+                    if let Err(g) = ix.backfill_block(n, hash, logs) {
                         // A gap here means the walk state cannot resume — a
                         // shape no merge/adopt should produce (belt and
                         // braces for `walk_resumable`). Without the reset the
@@ -5585,8 +5825,9 @@ impl ElReader {
                             g.block, g.edge
                         )));
                     }
+                    cursor = (n, hash);
                 }
-                Ok(())
+                Ok(cursor)
             }
             Err(_) => Err(BackfillBatchError::ours("log index lock poisoned")),
         }
@@ -5766,7 +6007,7 @@ impl ElReader {
     /// or nothing (CLAUDE.md §Trust).
     ///
     /// A head read of a watched account the activity follower carries
-    /// (docs/address-activity.md, *Answering from block access lists*) is
+    /// (docs/how-it-works/address-activity.md, *Answering from block access lists*) is
     /// answered from its verified BALs instead, with no request to any peer:
     /// `verifyMethod` `blockAccessList`, at the head or at most
     /// [`activity::FOLLOW_MAX_LAG`](crate::el::activity::FOLLOW_MAX_LAG)
@@ -5903,7 +6144,7 @@ impl ElReader {
         anchor: ReadAnchor,
         address: [u8; 20],
     ) -> Result<VerifiedAccount, String> {
-        // Tor mode (docs/privacy-and-tor.md): route this read — the §1 "core
+        // Tor mode (docs/how-it-works/privacy-and-tor.md): route this read — the §1 "core
         // leak" flow — over a per-address isolated Tor circuit instead of the
         // pool's clearnet connections. Fail-closed if no aged peer is available.
         #[cfg(feature = "tor")]
@@ -6287,7 +6528,7 @@ impl ElReader {
     /// `optimistic_root_at`). That is still the block the read ran against; a
     /// caller that needs it canonical NOW compares it with a hash the follower
     /// vouches for, as the activity report's `base.hash`
-    /// (docs/address-activity.md).
+    /// (docs/how-it-works/address-activity.md).
     fn proven_block_hash(&self, number: u64, state_root: &[u8; 32]) -> Option<[u8; 32]> {
         if let Some(fin) = self.anchor.finalized_execution() {
             if fin.block_number == number && &fin.state_root == state_root {
@@ -9141,7 +9382,7 @@ impl ElReader {
             tracing::info!(tx = %tx_hash, reason, "transaction not broadcast");
             SendError::Unavailable(reason.to_string())
         };
-        // Tor mode (docs/privacy-and-tor.md §4): the broadcast leaves over Tor
+        // Tor mode (docs/how-it-works/privacy-and-tor.md §4): the broadcast leaves over Tor
         // or not at all — never from the real IP as a fallback.
         #[cfg(feature = "tor")]
         if crate::el::tor::is_enabled() {
@@ -9272,7 +9513,7 @@ impl ElReader {
         };
         // A Tor-routed read answers at a fresh session's own head, never at the
         // anchored root, so it could never judge: spare the send its wait and
-        // the circuit (docs/privacy-and-tor.md).
+        // the circuit (docs/how-it-works/privacy-and-tor.md).
         #[cfg(feature = "tor")]
         if crate::el::tor::is_enabled() {
             return PreBroadcast::Unchecked("Tor reads are not at the anchored root");
@@ -14206,6 +14447,154 @@ impl From<&str> for BackfillBatchError {
     }
 }
 
+/// A backfill batch fetched and verified against its OWN top header, not yet
+/// applied. See [`ElReader::log_index_backfill_fetch`] for when that top is
+/// trusted, and [`ElReader::log_index_backfill_apply`] for the check that makes
+/// it so.
+struct PreparedBatch {
+    /// `(number, hash)` of the block the window hangs from — the cursor the
+    /// index must hold for this batch to apply.
+    top: (u64, [u8; 32]),
+    /// The blocks to commit, descending from `top - 1`, parent-hash chained to
+    /// `top`, already cut above any truncation.
+    blocks: Vec<(u64, [u8; 32])>,
+    /// The watched logs found in `blocks`, verified against their headers.
+    logs_by_block: std::collections::HashMap<u64, Vec<crate::el::logindex::StoredLog>>,
+}
+
+/// One lane of a backfill round: the fetched batch (or why it failed), and how
+/// long the fetch took.
+type LaneFetch<'a> = futures::future::BoxFuture<
+    'a,
+    (Result<PreparedBatch, BackfillBatchError>, std::time::Duration),
+>;
+
+/// Most batches one max-speed backfill round fetches in parallel, one peer
+/// each (#297). Measured on Gnosis (2026-11-09) a single peer served ~1 MB/s
+/// of a ~30 Mbit/s link, so four lanes stay under it; past the downlink more
+/// lanes only slow each other down.
+const BACKFILL_LANES: usize = 4;
+
+/// A speculative lane goes only to a peer whose last batch reached at least
+/// 1/`BACKFILL_LANE_RATE_FLOOR` of the best measured rate: a round waits for
+/// its slowest lane, so one slow peer beside fast ones costs every lane its
+/// round trip.
+const BACKFILL_LANE_RATE_FLOOR: u64 = 2;
+
+/// The batches one backfill round fetches: up to `lanes` consecutive
+/// `(top, count)` windows, the first hanging from `cursor` and each next one
+/// from the bottom of the one above (`top - count`), none reaching below
+/// `target`. Pure; see [`ElReader::log_index_backfill_round`].
+fn backfill_lane_plan(cursor: u64, target: u64, batch: u64, lanes: usize) -> Vec<(u64, u64)> {
+    let mut plan = Vec::with_capacity(lanes);
+    let mut top = cursor;
+    if batch == 0 {
+        return plan;
+    }
+    while plan.len() < lanes && top > target {
+        let count = (top - target).min(batch);
+        plan.push((top, count));
+        top -= count;
+    }
+    plan
+}
+
+/// Which of the round's ranked peers (`rates[i]` = peer i's last measured
+/// rate, `None` = unmeasured) get a lane, in lane order, at most `max_lanes`.
+///
+/// Peer 0 — the ranking's pick — always takes the lane at the cursor, so the
+/// ranking and its exploration round keep deciding who serves the batch
+/// everything hangs from, and who gets sampled. A further peer joins only if
+/// it is MEASURED and its rate reaches 1/[`BACKFILL_LANE_RATE_FLOOR`] of the
+/// best measured one. Lanes are applied in order, so a round waits for every
+/// lane above the first break: a peer that failed last time (rate 0), crawls,
+/// or was never measured — a fresh dial that accepts requests and never
+/// answers costs a 15 s timeout per request — would hold the whole round up
+/// for one batch. Unmeasured peers sort first in the ranking anyway, so they
+/// are still sampled, at the cursor lane, where a failure has its fallback.
+fn backfill_lane_peers(rates: &[Option<u64>], max_lanes: usize) -> Vec<usize> {
+    if rates.is_empty() || max_lanes == 0 {
+        return Vec::new();
+    }
+    let best = rates.iter().flatten().copied().max().unwrap_or(0);
+    let mut picked = vec![0];
+    for (i, rate) in rates.iter().enumerate().skip(1) {
+        if picked.len() >= max_lanes {
+            break;
+        }
+        let fast_enough = match rate {
+            None => false,
+            Some(r) => *r > 0 && r.saturating_mul(BACKFILL_LANE_RATE_FLOOR) >= best,
+        };
+        if fast_enough {
+            picked.push(i);
+        }
+    }
+    picked
+}
+
+#[cfg(test)]
+mod backfill_lane_tests {
+    use super::{backfill_lane_peers, backfill_lane_plan, BACKFILL_LANES};
+
+    #[test]
+    fn lanes_tile_the_walk_downward_without_gaps_or_overlap() {
+        assert_eq!(
+            backfill_lane_plan(10_000, 0, 1023, 3),
+            vec![(10_000, 1023), (8_977, 1023), (7_954, 1023)]
+        );
+    }
+
+    #[test]
+    fn the_plan_stops_at_the_target_and_shortens_the_last_window() {
+        // 2,500 blocks left: two full windows and a 454-block one, and no
+        // fourth lane however many were offered.
+        assert_eq!(
+            backfill_lane_plan(3_500, 1_000, 1023, 4),
+            vec![(3_500, 1023), (2_477, 1023), (1_454, 454)]
+        );
+        assert_eq!(backfill_lane_plan(1_000, 1_000, 1023, 4), vec![]);
+        assert_eq!(backfill_lane_plan(1_001, 1_000, 1023, 4), vec![(1_001, 1)]);
+    }
+
+    #[test]
+    fn one_lane_is_the_old_single_batch_round() {
+        assert_eq!(backfill_lane_plan(5_000, 100, 1023, 1), vec![(5_000, 1023)]);
+        assert_eq!(backfill_lane_plan(5_000, 100, 1023, 0), vec![]);
+        assert_eq!(backfill_lane_plan(5_000, 100, 0, 4), vec![]);
+    }
+
+    #[test]
+    fn the_ranked_first_peer_always_takes_the_cursor_lane() {
+        // Even when it is the slowest (the exploration round promoted it).
+        assert_eq!(backfill_lane_peers(&[Some(1), Some(900), Some(1000)], 4), vec![0, 1, 2]);
+        assert_eq!(backfill_lane_peers(&[Some(0)], 4), vec![0]);
+    }
+
+    #[test]
+    fn slow_failed_and_unmeasured_peers_get_no_speculative_lane() {
+        let rates = [Some(1000), Some(0), Some(400), Some(500), None, Some(999)];
+        // 0 failed last time, 400 < 1000/2, None was never measured; 500 is
+        // exactly at the floor.
+        assert_eq!(backfill_lane_peers(&rates, 4), vec![0, 3, 5]);
+    }
+
+    #[test]
+    fn an_unmeasured_peer_is_sampled_only_at_the_cursor_lane() {
+        // The ranking puts unmeasured peers first; the first of them takes the
+        // cursor lane, the measured ones behind it the speculative lanes.
+        assert_eq!(backfill_lane_peers(&[None, None, Some(800), Some(900)], 4), vec![0, 2, 3]);
+        assert_eq!(backfill_lane_peers(&[None; 6], BACKFILL_LANES), vec![0]);
+    }
+
+    #[test]
+    fn lanes_are_capped() {
+        assert_eq!(backfill_lane_peers(&[Some(5); 8], BACKFILL_LANES), vec![0, 1, 2, 3]);
+        assert_eq!(backfill_lane_peers(&[Some(5); 8], 1), vec![0]);
+        assert_eq!(backfill_lane_peers(&[], 4), Vec::<usize>::new());
+    }
+}
+
 /// Whether `log_index_backfill_round` has any work to do this tick, given
 /// state already read out of the index under one lock hold. Pure and
 /// separately tested — the round itself needs a live pool of peers to
@@ -15017,7 +15406,7 @@ const PERSIST_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// This bounds the constant. The asymptotics — O(n²) total bytes across a walk
 /// that grows the index linearly — are inherent to full-rewrite checkpoints and
 /// are fixed by the segmented/delta store already recorded as required before
-/// mainnet-scale mobile backfill (docs/eth-getlogs-design.md §Store).
+/// mainnet-scale mobile backfill (docs/design-history/eth-getlogs-design.md §Store).
 fn persist_interval(last_bytes: u64) -> std::time::Duration {
     // div_ceil, not truncating division: rounding the interval DOWN puts the
     // sustained rate over the budget for every size that isn't a whole

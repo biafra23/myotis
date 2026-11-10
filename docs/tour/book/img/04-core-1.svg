@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 940 250" role="img" fill="currentColor" aria-label="Three nested boxes. The innermost is core: slices, arrays, Option, Result, iterators, fmt and core::error::Error. Around it is alloc: Vec, String, Box, BTreeMap, format! and vec!. Around that is std: HashMap, fs, net, thread, time and OS randomness. To the right: with the std feature on, the default, myotis-core links std like any crate. With it off, the crate is no_std, uses only core and alloc, and a bare-metal program that links it must provide a global allocator." width="940" height="250">
+    <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="940.0" height="250.0" fill="#f8fafb" /><rect x="20" y="16" width="560" height="220" rx="8" stroke-width="1.2" style="fill:var(--ground-2);stroke:var(--rule)" />
+    <text x="36" y="40" font-size="12" font-weight="700" letter-spacing="1.2" style="fill:var(--ink-2)">STD</text>
+    <text x="80" y="40" font-size="12" class="mono" style="fill:var(--ink-2)">HashMap, fs, net, thread, time, OS randomness</text>
+    <rect x="40" y="56" width="520" height="166" rx="8" stroke-width="1.2" style="fill:var(--jvm-wash);stroke:var(--rule)" />
+    <text x="56" y="80" font-size="12" font-weight="700" letter-spacing="1.2" style="fill:var(--jvm-ink)">ALLOC</text>
+    <text x="110" y="80" font-size="12" class="mono" style="fill:var(--ink)">Vec, String, Box, BTreeMap, format!, vec!</text>
+    <rect x="60" y="98" width="480" height="108" rx="8" stroke-width="1.2" style="fill:var(--oxide-wash);stroke:var(--rule)" />
+    <text x="76" y="122" font-size="12" font-weight="700" letter-spacing="1.2" style="fill:var(--oxide-ink)">CORE</text>
+    <text x="76" y="146" font-size="12" class="mono" style="fill:var(--ink)">slices, arrays, Option, Result,</text>
+    <text x="76" y="166" font-size="12" class="mono" style="fill:var(--ink)">iterators, fmt, core::error::Error</text>
+    <text x="76" y="190" font-size="11.5" style="fill:var(--ink-3)">needs nothing from the machine</text>
+    <text x="604" y="60" font-size="12" font-weight="700" style="fill:var(--ok-ink)">feature "std" ON (default)</text>
+    <text x="604" y="80" font-size="12" style="fill:var(--ink-2)">myotis-core is an ordinary crate;</text>
+    <text x="604" y="98" font-size="12" style="fill:var(--ink-2)">it links all three layers.</text>
+    <text x="604" y="140" font-size="12" font-weight="700" style="fill:var(--warn-ink)">feature "std" OFF</text>
+    <text x="604" y="160" font-size="12" style="fill:var(--ink-2)">#![no_std]: only core + alloc.</text>
+    <text x="604" y="178" font-size="12" style="fill:var(--ink-2)">A bare-metal program linking it</text>
+    <text x="604" y="196" font-size="12" style="fill:var(--ink-2)">must supply a global allocator.</text>
+  </svg>

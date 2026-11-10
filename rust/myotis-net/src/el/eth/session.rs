@@ -70,7 +70,7 @@ impl EthConfig {
 ///
 /// Generic over the RLPx stream `S` (default [`TcpStream`]) so the clearnet
 /// managed-peer path is unchanged while the Tor PoC can run the identical eth +
-/// snap flow over a Tor `DataStream` — see `docs/privacy-and-tor.md` §3/§4.
+/// snap flow over a Tor `DataStream` — see `docs/how-it-works/privacy-and-tor.md` §3/§4.
 pub struct EthSession<S = TcpStream> {
     conn: RlpxConnection<S>,
     /// Negotiated eth version (66-71).

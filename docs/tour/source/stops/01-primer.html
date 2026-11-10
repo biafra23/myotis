@@ -1,0 +1,553 @@
+<!--meta {"id":"stop-01","num":1,"title":"Rust's memory model for JVM developers","short":"Memory model primer","sub":"ownership → async","part":"Orientation"} -->
+<header class="stop-head">
+  <div class="eyebrow">Stop 1 · Orientation <span>about 60 minutes · the most important stop</span></div>
+  <h1>Rust's memory model for JVM developers</h1>
+  <p class="lede">Each idea in this stop is shown with a short excerpt from the Myotis code, not a toy example. When a later stop says “see the primer”, it means one of the sections below. If a section doesn't stick, the checkpoint at the end will say so, and the reading list will point to the right chapter.</p>
+</header>
+
+<div class="learn">
+  <h2>By the end of this stop you can</h2>
+  <div><b>Predict moves and copies</b>and say when a value is freed, without a garbage collector.</div>
+  <div><b>Read borrows and lifetimes</b>such as <code>&amp;'a [u8]</code>, <code>&amp;mut self</code> and <code>+ 'static</code>.</div>
+  <div><b>Pick the right sharing tool:</b> <code>Arc</code>, <code>Mutex</code>, atomics, channels, and know why async needs <code>Send + 'static</code>.</div>
+</div>
+
+<div class="prose">
+  <h2>The one-paragraph difference</h2>
+  <p>In Java, every object lives on the heap, variables hold references, any number of references may point at the same object, and the garbage collector frees it once nothing points at it anymore. Thread safety is your responsibility. In Rust, a value lives where you put it: in the stack frame by default, on the heap only through a type such as <code>Box</code>, <code>Vec</code>, <code>String</code> or <code>Arc</code>. Each value has <strong>exactly one owner</strong>, and it is freed the moment that owner goes away. The compiler tracks every reference (a <em>borrow</em>) and refuses to compile code that could read freed memory, or write while someone else is reading. That single rule is where the rest of this stop comes from.</p>
+</div>
+
+<figure class="diagram">
+  <div class="svg-wrap">
+  <svg class="wide-diagram" viewBox="0 0 940 330" role="img" fill="currentColor" xmlns="http://www.w3.org/2000/svg"
+       aria-label="Java versus Rust memory. In Java two stack variables a and b both reference one heap byte array, which the garbage collector frees later. In Rust, variable a has been moved into b; b is a pointer, length and capacity on the stack that owns a heap buffer of capacity 8 holding 5 bytes; s is a slice, a pointer plus length 3, that borrows bytes 1 to 3 of the same buffer. The buffer is freed when b goes out of scope.">
+    <defs>
+      <marker id="m1-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+      </marker>
+    </defs>
+    <!-- Java side -->
+    <text x="20" y="26" font-size="12" font-weight="700" letter-spacing="1.2" style="fill:var(--jvm-ink)">JAVA</text>
+    <text x="20" y="46" font-size="12.5" class="mono">byte[] a = {1,2,3,4,5}; byte[] b = a;</text>
+    <rect x="20" y="66" width="130" height="118" rx="6" stroke-width="1.2" style="fill:var(--surface);stroke:var(--rule-strong)"/>
+    <text x="30" y="84" font-size="10.5" letter-spacing="1" style="fill:var(--ink-3)">STACK FRAME</text>
+    <rect x="32" y="96" width="106" height="30" rx="4" style="fill:var(--jvm-wash)"/>
+    <text x="42" y="116" font-size="12.5" class="mono">a  ref</text>
+    <rect x="32" y="138" width="106" height="30" rx="4" style="fill:var(--jvm-wash)"/>
+    <text x="42" y="158" font-size="12.5" class="mono">b  ref</text>
+    <rect x="236" y="96" width="196" height="76" rx="6" stroke-width="1.2" style="fill:var(--surface);stroke:var(--rule-strong)"/>
+    <text x="246" y="114" font-size="10.5" letter-spacing="1" style="fill:var(--ink-3)">HEAP · OBJECT</text>
+    <text x="246" y="136" font-size="12.5" class="mono">header · length 5</text>
+    <text x="246" y="158" font-size="12.5" class="mono">01 02 03 04 05</text>
+    <line x1="128" y1="111" x2="233" y2="118" stroke="currentColor" stroke-width="1.4" marker-end="url(#m1-arrow)"/>
+    <line x1="128" y1="153" x2="233" y2="150" stroke="currentColor" stroke-width="1.4" marker-end="url(#m1-arrow)"/>
+    <text x="20" y="214" font-size="12" style="fill:var(--ink-2)">Two live references to one array.</text>
+    <text x="20" y="232" font-size="12" style="fill:var(--ink-2)">Either may write; the GC frees it “later”.</text>
+
+    <line x1="466" y1="16" x2="466" y2="316" stroke-width="1" stroke-dasharray="3 4" style="stroke:var(--rule-strong)"/>
+
+    <!-- Rust side -->
+    <text x="490" y="26" font-size="12" font-weight="700" letter-spacing="1.2" style="fill:var(--oxide-ink)">RUST</text>
+    <text x="490" y="46" font-size="12.5" class="mono">let a = vec![1u8,2,3,4,5]; let b = a; let s = &amp;b[1..4];</text>
+    <rect x="490" y="66" width="182" height="214" rx="6" stroke-width="1.2" style="fill:var(--surface);stroke:var(--rule-strong)"/>
+    <text x="500" y="84" font-size="10.5" letter-spacing="1" style="fill:var(--ink-3)">STACK FRAME</text>
+    <rect x="502" y="94" width="158" height="30" rx="4" stroke-width="1" stroke-dasharray="3 3" style="fill:none;stroke:var(--ink-3)"/>
+    <text x="512" y="114" font-size="12.5" class="mono" style="fill:var(--ink-3)">a  (moved)</text>
+    <line x1="508" y1="109" x2="652" y2="109" stroke-width="1.2" style="stroke:var(--bad)"/>
+    <rect x="502" y="134" width="158" height="74" rx="4" style="fill:var(--oxide-wash)"/>
+    <text x="512" y="152" font-size="12.5" class="mono" font-weight="700">b: Vec&lt;u8&gt;</text>
+    <text x="512" y="171" font-size="12" class="mono">ptr ●</text>
+    <text x="512" y="188" font-size="12" class="mono">len 5 · cap 8</text>
+    <text x="512" y="203" font-size="10.5" style="fill:var(--ink-3)">owner</text>
+    <rect x="502" y="218" width="158" height="54" rx="4" style="fill:var(--ground-2)"/>
+    <text x="512" y="236" font-size="12.5" class="mono" font-weight="700">s: &amp;[u8]</text>
+    <text x="512" y="255" font-size="12" class="mono">ptr ● · len 3</text>
+    <text x="512" y="268" font-size="10.5" style="fill:var(--ink-3)">borrow</text>
+
+    <rect x="726" y="134" width="196" height="66" rx="6" stroke-width="1.2" style="fill:var(--surface);stroke:var(--rule-strong)"/>
+    <text x="736" y="152" font-size="10.5" letter-spacing="1" style="fill:var(--ink-3)">HEAP · BUFFER</text>
+    <g class="mono" font-size="12">
+      <rect x="736" y="162" width="22" height="26" style="fill:var(--oxide-wash)"/><text x="747" y="180" text-anchor="middle">01</text>
+      <rect x="759" y="162" width="22" height="26" style="fill:var(--oxide-wash)"/><text x="770" y="180" text-anchor="middle">02</text>
+      <rect x="782" y="162" width="22" height="26" style="fill:var(--oxide-wash)"/><text x="793" y="180" text-anchor="middle">03</text>
+      <rect x="805" y="162" width="22" height="26" style="fill:var(--oxide-wash)"/><text x="816" y="180" text-anchor="middle">04</text>
+      <rect x="828" y="162" width="22" height="26" style="fill:var(--oxide-wash)"/><text x="839" y="180" text-anchor="middle">05</text>
+      <rect x="851" y="162" width="22" height="26" stroke-width="1" stroke-dasharray="2 2" style="fill:none;stroke:var(--rule-strong)"/>
+      <rect x="874" y="162" width="22" height="26" stroke-width="1" stroke-dasharray="2 2" style="fill:none;stroke:var(--rule-strong)"/>
+      <rect x="897" y="162" width="22" height="26" stroke-width="1" stroke-dasharray="2 2" style="fill:none;stroke:var(--rule-strong)"/>
+    </g>
+    <path d="M556 167 C 640 130, 700 130, 745 158" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#m1-arrow)"/>
+    <path d="M556 251 C 660 262, 740 236, 769 192" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#m1-arrow)"/>
+    <path d="M759 202 V210 H826 V202" fill="none" stroke-width="1.4" style="stroke:var(--oxide)"/>
+    <text x="792" y="226" text-anchor="middle" font-size="11" style="fill:var(--oxide-ink)">s = b[1..4]</text>
+    <text x="726" y="258" font-size="12" style="fill:var(--ink-2)">One owner. Freed exactly when</text>
+    <text x="726" y="276" font-size="12" style="fill:var(--ink-2)"><tspan class="mono">b</tspan> goes out of scope; <tspan class="mono">s</tspan> may</text>
+    <text x="726" y="294" font-size="12" style="fill:var(--ink-2)">not outlive <tspan class="mono">b</tspan> (compile-time check).</text>
+  </svg>
+  </div>
+  <figcaption>The Java reference and the Rust owner both point at heap bytes. The differences are how many names may use them, and who decides when they are freed. A Rust <code>Vec</code> is three machine words on the stack (pointer, length, capacity). A slice <code>&amp;[u8]</code> is two words (pointer, length) that <em>borrow</em> part of a buffer somebody else owns.</figcaption>
+</figure>
+
+<!-- ============================================================ OWNERSHIP -->
+<section class="prose" id="primer-ownership">
+  <h2>Ownership and moves</h2>
+  <p><strong>Rule:</strong> every value has one owner, a variable or a field. Assigning it, passing it to a function <em>by value</em>, or returning it <strong>moves</strong> it. The old name becomes unusable, and the compiler rejects any later use with “use of moved value”. When the owner goes out of scope, the value is dropped: its memory is freed and its <code>Drop</code> code runs.</p>
+  <p><strong>Copy types are the exception.</strong> Integers, <code>bool</code>, fixed arrays of them such as <code>[u8; 32]</code>, and shared references <code>&amp;T</code> implement <code>Copy</code>. Assigning one duplicates the bits, and the original stays usable. That's why this codebase passes 32-byte roots and 20-byte addresses around by value so freely: they are small arrays on the stack, not heap objects.</p>
+  <p><strong>Deep copies are explicit.</strong> Only <code>.clone()</code> duplicates a <code>Vec</code>, <code>String</code> or struct. When a function signature takes <code>T</code> (not <code>&amp;T</code>), it wants ownership. If you still need the value afterwards, you clone it first. Look for the phrase “the one deep clone” in <code>host.rs</code>:</p>
+</section>
+<x-code src="myotis-engine/src/host.rs" from="730" to="739"></x-code>
+<p class="code-note"><code>SyncHandle::start</code> takes a <code>ChainConfig</code> by value because the sync loop will own it for its whole life. The engine keeps its own copy behind an <code>Arc</code> (more on that below), so it clones once: <code>(*config)</code> dereferences the <code>Arc</code> to reach the <code>ChainConfig</code>, and <code>.clone()</code> makes an owned copy. Because <code>cfg</code> is now <em>owned</em> by this block, it may be changed (<code>let mut</code>, then <code>cfg.cl_fork_watch = cl_watch;</code>) without touching the shared original, and is then moved into <code>start</code>. After that line <code>cfg</code> is gone: the sync loop owns it.</p>
+
+<div class="callout jvm">
+  <span class="k">JVM lens</span>
+  <p>Think of a move as <em>handing over the only key</em>. In Java, <code>b = a</code> gives you two keys to one object. In Rust, <code>let b = a;</code> gives the key to <code>b</code> and melts <code>a</code>'s. There is no aliasing, so there is nothing for a garbage collector to track: the compiler knows exactly where each value dies. Kotlin's <code>val</code> and <code>var</code> map to <code>let</code> and <code>let mut</code>, with one twist: in Rust, a non-<code>mut</code> binding also forbids mutating the value's <em>contents</em>, not just reassigning the variable.</p>
+</div>
+
+<p class="code-note">Sometimes you need to move a value out of a place that you only borrow mutably, such as a field behind <code>&amp;mut</code>. Rust won't let you leave a hole, so <code>std::mem::take</code> swaps in an empty default and hands you the old value. You will see it in the smallest complete example of ownership in the codebase, the peer pool's task set:</p>
+<x-code src="myotis-net/src/el/tasks.rs" from="1" to="40"></x-code>
+<div class="callout rust">
+  <span class="k">Read it line by line</span>
+  <ul>
+    <li><strong>L7</strong>: <code>Tasks</code> is a tuple struct wrapping <code>Mutex&lt;(bool, Vec&lt;JoinHandle&lt;()&gt;&gt;)&gt;</code>: a “stopped” flag plus the handles of spawned tasks. The data lives <em>inside</em> the mutex.</li>
+    <li><strong>L9</strong>: <code>spawn</code> takes the future <em>by value</em> (<code>impl Future…</code>), because the runtime will own it. It needs <code>Send + 'static</code>; see <a href="#primer-async">async</a>.</li>
+    <li><strong>L10</strong>: <code>lock()</code> returns a guard. <code>unwrap_or_else(|e| e.into_inner())</code> says “if a previous holder panicked (the lock is <em>poisoned</em>), take the data anyway”.</li>
+    <li><strong>L24</strong>: <code>std::mem::take(&amp;mut tasks.1)</code> moves the whole <code>Vec</code> out and leaves an empty one behind. The caller now owns the handles.</li>
+    <li><strong>L33</strong>: <code>drop(self.take())</code> ends the taken <code>Vec</code>'s life immediately.</li>
+    <li><strong>L36–40</strong>: <code>impl Drop</code> is a destructor. When a <code>Tasks</code> value dies, for example when the pool that owns it is dropped, it aborts every task. There's no <code>close()</code> to forget.</li>
+  </ul>
+</div>
+
+<!-- ============================================================ BORROWING -->
+<section class="prose" id="primer-borrowing">
+  <h2>Borrowing: <code>&amp;T</code>, <code>&amp;mut T</code> and slices</h2>
+  <p>Most functions don't want ownership. They want to <em>look at</em> or <em>modify</em> a value for a while. That's a borrow:</p>
+  <ul>
+    <li><code>&amp;T</code> is a <strong>shared</strong> borrow. It is read-only, and any number may exist at once.</li>
+    <li><code>&amp;mut T</code> is an <strong>exclusive</strong> borrow. It may modify the value, and while it exists no other borrow of that value may exist.</li>
+  </ul>
+  <p>This “many readers <em>or</em> one writer” rule is checked at compile time. It is what makes data races impossible in safe Rust, and it is also why a method signature tells you so much. <code>fn fixed(&amp;mut self, …)</code> changes the reader's position. <code>fn check_request(&amp;self)</code> promises not to change anything visible (unless the type uses <a href="#primer-interior-mutability">interior mutability</a>).</p>
+  <p>A <strong>slice</strong> is a borrowed view into a contiguous sequence: <code>&amp;[u8]</code> for bytes, <code>&amp;str</code> for UTF-8 text. It is a pointer plus a length. Taking <code>&amp;data[a..b]</code> copies nothing; it just narrows the view. Protocol decoders in this codebase are built from exactly that move. Here is the snapshot decoder's cursor:</p>
+</section>
+<x-code src="myotis-consensus/src/snapshot.rs" from="315" to="342"></x-code>
+<p class="code-note"><code>fixed(len)</code> checks bounds with <code>checked_add</code> (no overflow panic), then returns <code>&amp;self.data[self.pos..end]</code>, a view into the caller's buffer, and advances <code>pos</code>. <code>u32()</code> turns four borrowed bytes into a number. Nothing is allocated until a caller explicitly asks for an owned copy with <code>.to_vec()</code> (see line 237 just above the struct).</p>
+<div class="callout jvm">
+  <span class="k">JVM lens</span>
+  <p>A slice is like <code>ByteBuffer.slice()</code> or <code>ByteBuf.slice()</code> in Netty, with two guarantees Java cannot give you. The backing buffer cannot be freed or reallocated while the slice exists, and nobody can write to it while you read. In Netty you manage that by hand with <code>retain()</code>/<code>release()</code>; here the compiler does it.</p>
+</div>
+
+<!-- ============================================================ LIFETIMES -->
+<section class="prose" id="primer-lifetimes">
+  <h2>Lifetimes: naming how long a borrow lives</h2>
+  <p>A lifetime is the compiler's name for “the span of code during which this reference is valid”. Usually it is inferred. You write one when a struct <em>stores</em> a reference, or when a function returns a reference and the compiler must know which input it borrows from.</p>
+  <p>In <code>Reader&lt;'a&gt;</code> above, <code>'a</code> is a <strong>parameter</strong>: “a <code>Reader</code> borrows some byte buffer for a span called <code>'a</code>, and may not outlive it”. The return type of <code>fixed</code>, <code>Option&lt;&amp;'a [u8]&gt;</code>, says the returned slice borrows from <em>that buffer</em>, not from the <code>Reader</code> itself. That distinction matters: the caller can keep several returned slices alive while calling <code>fixed</code> again, because the slices don't borrow the reader. If the signature had said <code>-&gt; Option&lt;&amp;[u8]&gt;</code>, elision would tie the result to <code>&amp;mut self</code>, and a second call would be rejected.</p>
+  <p>Three spellings you will meet everywhere:</p>
+  <ul>
+    <li><code>'_</code> means “some lifetime, infer it”, as in <code>Reader&lt;'_&gt;</code> or <code>Formatter&lt;'_&gt;</code>.</li>
+    <li><code>&amp;'static T</code> is a reference valid for the whole program: string literals, <code>static</code> items. <code>myotis-consensus</code> returns its BLS domain-separation tag as <code>&amp;'static [u8]</code>.</li>
+    <li><code>T: 'static</code> as a <strong>bound</strong> means “<code>T</code> contains no borrowed references (it owns all its data)”. It does <em>not</em> mean the value lives forever. <code>tokio::spawn</code> demands it, because a task may outlive the function that spawned it.</li>
+  </ul>
+</section>
+<x-code src="myotis-consensus/src/lib.rs" from="27" to="30"></x-code>
+<div class="callout watch">
+  <span class="k">Common confusion</span>
+  <p>Lifetime annotations never change what a program does. They are claims the compiler checks. If you can't satisfy the checker, the usual fixes are to return an owned value (<code>Vec</code>/<code>String</code>), clone, or restructure so the borrow ends sooner. Adding more <code>'a</code>s rarely helps.</p>
+</div>
+
+<!-- ============================================================ BYTES -->
+<section class="prose" id="primer-bytes-strings">
+  <h2>Bytes and strings</h2>
+  <div class="table-wrap">
+  <table class="map">
+    <thead><tr><th>Type</th><th>Owned?</th><th>Where</th><th>Java/Kotlin analogue</th></tr></thead>
+    <tbody>
+      <tr><td>[u8; 32]</td><td>yes (Copy)</td><td>inline (stack / inside struct)</td><td>a value type; <code>byte[]</code> without the heap</td></tr>
+      <tr><td>Vec&lt;u8&gt;</td><td>yes</td><td>heap buffer</td><td><code>byte[]</code> / <code>ByteArrayOutputStream</code></td></tr>
+      <tr><td>&amp;[u8]</td><td>no (borrow)</td><td>points into someone's buffer</td><td><code>ByteBuffer.slice()</code></td></tr>
+      <tr><td>String</td><td>yes</td><td>heap, always valid UTF-8</td><td><code>StringBuilder</code>-ish</td></tr>
+      <tr><td>&amp;str</td><td>no (borrow)</td><td>points into a <code>String</code> or a literal</td><td><code>String</code> (read-only)</td></tr>
+      <tr><td>b"…"</td><td>no (<code>&amp;'static [u8; N]</code>)</td><td>in the binary</td><td>a byte literal</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Converting a slice into a fixed array is fallible, because the length might be wrong. So <code>slice.try_into()</code> returns a <code>Result</code>, and you'll constantly see <code>.try_into().ok()?</code>, as in <code>Reader::root</code> above. <code>format!("{b:02x}")</code> and <code>write!(s, …)</code> are the formatting macros, the <code>String.format</code> of Rust. <a href="rustdoc:rust-by-example/hello/print.html" target="_blank" rel="noopener">Rust by Example's “Formatted print”</a> covers them.</p>
+</section>
+
+<!-- ============================================================ ERRORS -->
+<section class="prose" id="primer-error-handling">
+  <h2>Errors are values: <code>Option</code>, <code>Result</code> and <code>?</code></h2>
+  <p>Rust has no <code>null</code> and no exceptions. A value that may be missing is <code>Option&lt;T&gt;</code> (<code>Some(v)</code> or <code>None</code>). An operation that may fail returns <code>Result&lt;T, E&gt;</code> (<code>Ok(v)</code> or <code>Err(e)</code>). The <code>?</code> operator is the workhorse. On <code>None</code> or <code>Err</code> it <em>returns early</em> from the current function, and for <code>Result</code> it first converts the error with <code>From::from</code>. Reread <code>Reader::u32</code>:</p>
+</section>
+<x-code src="myotis-consensus/src/snapshot.rs" from="333" to="335"></x-code>
+<p class="code-note">From inside out: <code>self.fixed(4)?</code> returns <code>None</code> from <code>u32</code> if fewer than 4 bytes remain. <code>.try_into()</code> converts the slice to <code>[u8; 4]</code> and yields a <code>Result</code>. <code>.ok()</code> turns that into an <code>Option</code> so it fits this function's return type, and the second <code>?</code> returns <code>None</code> if the conversion failed. No panic is possible anywhere in the line. That's rule 3 from Stop 0 in action.</p>
+<p class="code-note">Error types are usually enums, and a <code>From</code> impl lets <code>?</code> convert between layers. In <code>myotis-evm</code>, any state-fetch error can bubble out of an EVM call unchanged in meaning:</p>
+<x-code src="myotis-evm/src/error.rs" from="11" to="39"></x-code>
+<p class="code-note">The enum has grown well beyond these first variants (refusals, gas answers, ENS outcomes). Further down the same file sits the one-line bridge that makes <code>?</code> work across the crate boundary:</p>
+<x-code src="myotis-evm/src/error.rs" from="170" to="174"></x-code>
+<p class="code-note">When the executor's code does <code>let acct = oracle.fetch_account(…)?;</code> inside a function returning <code>Result&lt;_, EvmError&gt;</code>, the compiler inserts <code>EvmError::from(oracle_error)</code>. The <code>match</code> in <code>Display</code> must handle every variant. Add a variant and every non-exhaustive <code>match</code> elsewhere stops compiling, which is the point.</p>
+<p class="code-note">One more pattern you'll see in the engine: <code>let … else</code>. It destructures or bails out, and the <code>else</code> block must leave the function:</p>
+<x-code src="myotis-engine/src/host.rs" from="703" to="706"></x-code>
+<div class="callout jvm">
+  <span class="k">JVM lens</span>
+  <p><code>Result</code> is a checked exception that is part of the return type, and <code>?</code> is a one-character “rethrow”. <code>Option</code> is Kotlin's <code>T?</code>, where <code>?</code> plays the role of <code>?: return null</code>. <code>unwrap()</code> is <code>!!</code>: it panics on <code>None</code>. With <code>panic = "abort"</code>, that means “crash the host app”, so the engine code avoids it on runtime data.</p>
+</div>
+
+<!-- ============================================================ ENUMS -->
+<section class="prose" id="primer-enums-patterns">
+  <h2>Enums and pattern matching</h2>
+  <p>A Rust <code>enum</code> is a <em>tagged union</em>: each variant can carry its own data, just like Kotlin's sealed classes. <code>match</code> must cover every variant; <code>_</code> is the wildcard. The engine's per-handle state machine is one enum:</p>
+</section>
+<x-code src="myotis-engine/src/host.rs" from="64" to="87"></x-code>
+<p class="code-note">A chain is <code>Created</code>, <code>Running</code> or <code>Paused</code>, and each state carries exactly the data that state needs, so a paused chain cannot have a live <code>SyncHandle</code>. The start path matches on a <em>tuple</em> of (requested transition, current state) and binds the config with a pattern:</p>
+<x-code src="myotis-engine/src/host.rs" from="711" to="726"></x-code>
+<p class="code-note">Three things at once here. The inner block <code>{ … }</code> is an expression whose value, here a tuple, becomes <code>(config, read_stats)</code>: the pattern on the left destructures it. The <code>map</code> guard dies at the closing brace, which <em>releases the lock</em> before the slow <code>block_on</code>. And <code>_ =&gt; return false</code> covers “unknown id or wrong state” without a single <code>null</code> check.</p>
+
+<!-- ============================================================ METHODS -->
+<section class="prose" id="primer-methods">
+  <h2>Methods and <code>self</code></h2>
+  <p>Rust has no classes. Data lives in a <code>struct</code> (or an <code>enum</code>), and behaviour lives in separate <code>impl</code> blocks. A function in an <code>impl</code> block whose first parameter is some form of <code>self</code> is a <strong>method</strong>, and <code>self</code> is Java's <code>this</code>. The difference is that Rust writes it in the signature, because a method has to say <em>how</em> it receives the object. This small type from roost has three kinds of function in one <code>impl</code>:</p>
+</section>
+<x-code src="roost/src/enr.rs" from="23" to="65"></x-code>
+<ul class="concepts">
+  <li><code>load(path: …) -&gt; Result&lt;Self&gt;</code> has no <code>self</code>, so it's an <strong>associated function</strong>: Java's <code>static</code> method, or a factory in a Kotlin <code>companion object</code>. You call it on the type, <code>EnrSeq::load(path)</code>. <code>Self</code> with a capital S is shorthand for the type being implemented, here <code>EnrSeq</code>. Rust has no constructors and no <code>new</code> keyword; <code>new</code>, <code>load</code> and <code>start</code> are ordinary associated functions that return <code>Self</code>.</li>
+  <li><code>current(&amp;self)</code> is a method with a <strong>shared-borrow receiver</strong>. <code>&amp;self</code> is shorthand for <code>self: &amp;Self</code>, here <code>self: &amp;EnrSeq</code>. It may read fields (<code>self.current</code>: a field and a method may share a name), and any number of callers may use the value at the same time.</li>
+  <li><code>bump(&amp;mut self)</code> ends with <code>self.current = next;</code> (line 107), so it needs an <strong>exclusive-borrow receiver</strong>. The caller must have mutable access, which is why <code>serve.rs</code> keeps the counter in a <code>let mut</code> binding.</li>
+</ul>
+
+<div class="prose">
+  <h3>What the dot does</h3>
+  <p><code>seq.bump()</code> is sugar for <code>EnrSeq::bump(&amp;mut seq)</code>. In the trait below, <code>oracle.fetch_account(&amp;root, addr)</code> is sugar for <code>SnapStateOracle::fetch_account(&amp;oracle, &amp;root, addr)</code>. The value left of the dot becomes the first argument, so <code>fetch_account</code> really has three parameters even though a call shows two. Both spellings compile and mean the same thing. roost even passes a method where a plain function is expected:</p>
+</div>
+<x-code src="roost/src/serve.rs" from="511" to="526"></x-code>
+<p class="code-note"><code>enr_seq</code> is an <code>Option&lt;EnrSeq&gt;</code>, <code>None</code> when the file is unusable. <code>.as_ref()</code> turns it into an <code>Option&lt;&amp;EnrSeq&gt;</code>, and <code>.map(EnrSeq::current)</code> calls <code>EnrSeq::current(&amp;seq)</code> on the value inside, if there is one. That only works because a method is an ordinary function whose first parameter is the receiver.</p>
+<div class="prose">
+  <p>The compiler also adjusts the receiver for you. It inserts the <code>&amp;</code> or <code>&amp;mut</code> the method asks for (<em>auto-ref</em>), and it follows references, <code>Box</code>, <code>Arc</code> and lock guards to find the method (<em>auto-deref</em>). That's why <code>reader.get_account(address)</code> works when <code>reader</code> is an <code>Arc&lt;ElReader&gt;</code>. The long form shows up only where the short one would be ambiguous or unavailable. Stop 12 writes <code>futures::StreamExt::next(&amp;mut fetches)</code> instead of importing the trait, and Stop 15 uses <code>LcStore::bootstrap(self, …)</code> to pick the type's own method over a trait method with the same name.</p>
+</div>
+<div class="table-wrap">
+<table class="map">
+  <thead><tr><th>Receiver</th><th>What it means</th><th>Java/Kotlin</th><th>In Myotis</th></tr></thead>
+  <tbody>
+    <tr><td>(none)</td><td>An associated function, called as <code>Type::name(…)</code>.</td><td><code>static</code> method, companion-object factory</td><td><code>EnrSeq::load</code>, <code>ElReader::start</code>, <code>Arc::clone(&amp;x)</code></td></tr>
+    <tr><td>&amp;self</td><td>Shared borrow: read-only, and many callers may use the value at once.</td><td>an ordinary instance method</td><td><code>EnrSeq::current</code>, <code>SnapStateOracle::fetch_account</code></td></tr>
+    <tr><td>&amp;mut self</td><td>Exclusive borrow: may change fields, and nobody else can use the value meanwhile.</td><td>a method that modifies <code>this</code>, with a guarantee Java can't give</td><td><code>EnrSeq::bump</code>, <code>Reader::fixed</code> (above)</td></tr>
+    <tr><td>self</td><td>By value: the method takes ownership, and the caller can't use the value afterwards.</td><td>no equivalent; like “don't touch it after <code>close()</code>”, but enforced</td><td><code>SyncHandle::stop(self)</code>, <code>Cancellation::finish(self, …)</code> (Stop 14)</td></tr>
+    <tr><td>mut self</td><td>By value, and the method may change its own copy, typically to return it.</td><td>a builder method</td><td><code>ForkSchedule::with_blob_schedule(mut self, …) -&gt; Self</code> (Stop 15)</td></tr>
+    <tr><td>self: Arc&lt;Self&gt;</td><td>The method needs the <code>Arc</code> itself, for example to hand a clone or a <code>Weak</code> to a task. <code>self: &amp;Arc&lt;Self&gt;</code> borrows it instead.</td><td>none</td><td>the Node scheduler's <code>worker</code> (Stop 14), <code>ElReader::ensure_log_index_appender</code> (Stop 11)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="prose">
+  <h3>Methods from traits, and <code>self.inner</code></h3>
+  <p>There are two kinds of <code>impl</code> block. <code>impl EnrSeq { … }</code> is an <em>inherent</em> impl: the type's own methods. <code>impl SnapStateOracle for Counting { … }</code> implements a trait's methods for a type. It's like <code>class Counting implements SnapStateOracle</code>, except that it's written separately from the struct, and a type can have any number of these blocks. A trait's methods can only be called where the trait is in scope, which is why <code>eljson.rs</code> writes <code>use std::fmt::Write;</code> before it calls <code>write!</code> on a <code>String</code>. Here is a test helper from <code>executor.rs</code> that wraps another oracle:</p>
+</div>
+<x-code src="myotis-evm/src/executor.rs" from="2124" to="2146"></x-code>
+<ul class="concepts">
+  <li><code>inner</code> is only a field name, a common convention for “the thing this struct wraps”. <code>self.inner</code> means “my field <code>inner</code>”, Java's <code>this.inner</code>. <code>Counting</code> is a decorator: it implements the same trait, counts every call, and forwards it to the fixture oracle it wraps.</li>
+  <li>Inside <code>fetch_account</code>, <code>self</code> is a <code>&amp;Counting</code>. <code>self.inner</code> is the field reached through that reference, and calling a <code>&amp;self</code> method on it borrows it again. Nothing is copied or moved; moving a field out of something you only borrow wouldn't compile anyway.</li>
+  <li>The counter changes even though <code>self</code> is a shared reference, because it's an <code>AtomicUsize</code>. That's <a href="#primer-interior-mutability">interior mutability</a>, which has its own section below.</li>
+  <li><code>Counting</code> is declared inside a test function. Rust allows items (structs, impls, functions) inside any block, visible only there. <code>#[derive(Default)]</code> gives it a <code>Counting::default()</code> with a default fixture and a zero counter.</li>
+</ul>
+<p class="code-note">You'll see <code>inner</code> in other places with other types, for example <code>LcStore { inner: RwLock&lt;Inner&gt; }</code> in roost and the Node scheduler's <code>State { inner: Mutex&lt;Inner&gt;, … }</code>. The name only says “wrapped”; the type says what it is.</p>
+
+<div class="callout jvm">
+  <span class="k">JVM lens</span>
+  <p>Java hides <code>this</code>, but it's there: the JVM passes it as argument 0 of every instance method (that's what <code>aload_0</code> loads). Kotlin extension functions make the same idea visible: <code>fun EnrSeq.bump()</code> compiles to a static method whose first parameter is the receiver. Rust simply writes that parameter down, and in doing so states the access mode Java can't express: shared and read-only (<code>&amp;self</code>), exclusive (<code>&amp;mut self</code>), or consumed (<code>self</code>).</p>
+</div>
+
+<!-- ============================================================ TRAITS -->
+<section class="prose" id="primer-traits-generics">
+  <h2>Traits, generics and <code>dyn</code></h2>
+  <p>A <code>trait</code> is an interface. It can have default methods and <em>supertraits</em> (requirements on implementors). Here is the contract <code>myotis-evm</code> uses to read verified state without knowing about networks:</p>
+</section>
+<x-code src="myotis-evm/src/oracle.rs" from="184" to="230"></x-code>
+<ul class="concepts">
+  <li><strong>Default methods.</strong> <code>check_request</code>, <code>wire_cost</code> and <code>keep_discovering</code> have bodies, so an implementor may skip them, exactly like Java 8 <code>default</code> interface methods. The three <code>fetch_*</code> methods end in <code>;</code>: every implementor must write them.</li>
+  <li><code>SnapStateOracle: Send + Sync</code> means every implementor must be safe to move between threads and to share between threads. That lets callers hold it in an <code>Arc&lt;dyn SnapStateOracle&gt;</code> used by several threads.</li>
+  <li><code>&amp;self</code> everywhere: every method borrows the oracle it's called on (see <a href="#primer-methods">Methods and <code>self</code></a> above). The oracle is shared, so any caching inside it must use <a href="#primer-interior-mutability">interior mutability</a>.</li>
+  <li><strong>Two ways to use a trait.</strong> A generic <code>fn run&lt;O: SnapStateOracle&gt;(o: &amp;O)</code> (or <code>impl SnapStateOracle</code> in argument position) is compiled once per concrete type. This is <em>static dispatch</em>, with no type erasure. <code>&amp;dyn SnapStateOracle</code>, <code>Box&lt;dyn …&gt;</code> and <code>Arc&lt;dyn …&gt;</code> are <em>trait objects</em>: a data pointer plus a vtable pointer, dispatched at run time exactly like a Java interface call.</li>
+  <li><code>#[derive(Clone, Debug, PartialEq, Eq)]</code>, as on <code>EvmError</code> above, asks the compiler to generate those trait impls, much like a Kotlin <code>data class</code> generates <code>equals</code>/<code>toString</code>.</li>
+</ul>
+
+<!-- ============================================================ SMART POINTERS -->
+<section class="prose" id="primer-smart-pointers">
+  <h2>Box, Arc and Drop: owning things on the heap</h2>
+  <ul>
+    <li><code>Box&lt;T&gt;</code> is <strong>one</strong> owner of a heap value. It's used for large values, recursive types, and <code>Box&lt;dyn Trait&gt;</code>.</li>
+    <li><code>Rc&lt;T&gt;</code> and <code>Arc&lt;T&gt;</code> provide <strong>shared</strong> ownership. The heap block carries a reference count. <code>Arc::clone(&amp;x)</code> only increments the count: it is cheap and copies nothing else. Each drop decrements it, and at zero the value is freed. <code>Arc</code> uses an atomic counter, so it can cross threads; this codebase uses <code>Arc</code> throughout, because nearly everything runs on a multi-threaded runtime.</li>
+    <li><code>Weak&lt;T&gt;</code> is a non-owning pointer into an <code>Arc</code>. <code>upgrade()</code> gives <code>Some(Arc)</code> only while the value still exists. <code>ElReader</code> keeps its in-flight operations as <code>Weak</code>, so the registry never keeps a finished request alive.</li>
+    <li><code>Drop</code> is the destructor trait. It runs deterministically when the last owner goes away, which makes <em>guards</em> possible: values whose whole job is to clean up when they die.</li>
+  </ul>
+  <p>Why <code>ChainEntry::Running</code> keeps its reader as <code>Option&lt;Arc&lt;ElReader&gt;&gt;</code> is explained right in the source (line 68–70, above): a verified read can take a minute, so a query clones the <code>Arc</code> out of the locked map and runs <em>outside</em> the lock. If <code>stop</code> removes the entry meanwhile, the reader stays alive until that query's clone is dropped.</p>
+</section>
+<x-code src="myotis-net/src/el/peer.rs" from="153" to="172"></x-code>
+<p class="code-note"><code>PendingGuard</code> is a guard. When a request future is dropped (cancelled) before its answer arrives, the guard's <code>drop</code> removes the request's entry from the pending map. <code>drop</code> can't <code>.await</code>, so it clones the <code>Arc</code> and <em>moves</em> the clone into a small spawned task (<code>async move</code>) that takes the async lock. The task owns its own reference, so it doesn't matter that the guard is gone by then.</p>
+<div class="callout jvm">
+  <span class="k">JVM lens</span>
+  <p><code>Drop</code> is <code>try-with-resources</code> / <code>AutoCloseable</code> without the <code>try</code>. It runs on every exit path, including early <code>return</code>, <code>?</code> and cancellation. <code>Arc</code> behaves like a Java reference whose GC is a counter you can reason about: you know exactly which line frees the object.</p>
+</div>
+
+<!-- ============================================================ INTERIOR MUTABILITY -->
+<section class="prose" id="primer-interior-mutability">
+  <h2>Interior mutability: changing things through <code>&amp;self</code></h2>
+  <p>Shared ownership (<code>Arc&lt;T&gt;</code>) only hands out <code>&amp;T</code>, and <code>&amp;T</code> forbids mutation. To change shared state, the <em>type itself</em> must coordinate access:</p>
+  <ul>
+    <li><code>Mutex&lt;T&gt;</code>: the data lives <em>inside</em> the mutex. <code>lock()</code> returns a <code>MutexGuard</code> that dereferences to <code>&amp;mut T</code> and unlocks when dropped. You physically cannot touch the data without the lock. <code>RwLock&lt;T&gt;</code> is the many-readers variant.</li>
+    <li>Atomics (<code>AtomicU64</code>, <code>AtomicBool</code>, …) handle single numbers or flags with <code>load</code>/<code>store</code>/<code>fetch_add</code> and an <code>Ordering</code> argument, which here means CPU memory ordering, not sorting.</li>
+    <li><code>OnceLock&lt;T&gt;</code>: initialise once, read forever. It's how the engine singleton is built.</li>
+    <li><code>Cell</code>/<code>RefCell</code> are the single-threaded versions, rare here (<code>myotis-node</code> uses a <code>RefCell</code> in a thread-local).</li>
+  </ul>
+</section>
+<x-code src="myotis-engine/src/host.rs" from="181" to="215"></x-code>
+<p class="code-note"><code>static ENGINE</code> is a process-global. <code>get_or_init</code> runs the closure at most once, even if several JVM threads call in at the same time; the others wait. The result is <code>Option&lt;EngineState&gt;</code> (<code>None</code> if the tokio runtime could not start), and <code>engine()</code> returns <code>Option&lt;&amp;'static EngineState&gt;</code>: a borrow valid for the rest of the program. Inside <code>EngineState</code>, every mutable part is wrapped: <code>handles: Mutex&lt;HashMap&lt;…&gt;&gt;</code>, <code>next_id: AtomicI64</code>.</p>
+
+<figure class="diagram">
+  <div class="svg-wrap">
+  <svg class="wide-diagram" viewBox="0 0 900 300" role="img" fill="currentColor" xmlns="http://www.w3.org/2000/svg"
+       aria-label="Two tasks each own an Arc pointing to the same heap allocation, which holds a strong count of 2 and a Mutex wrapping a HashMap of pending requests. The read-loop task currently holds the MutexGuard and has mutable access to the map; the request caller waits for the lock. Cloning an Arc increments the count; dropping one decrements it and the allocation is freed at zero.">
+    <defs>
+      <marker id="m1b-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+      </marker>
+    </defs>
+    <rect x="20" y="24" width="250" height="110" rx="8" stroke-width="1.3" style="fill:var(--surface);stroke:var(--rule-strong)"/>
+    <text x="34" y="46" font-size="13" font-weight="700">read-loop task</text>
+    <rect x="34" y="58" width="222" height="28" rx="4" style="fill:var(--oxide-wash)"/>
+    <text x="44" y="77" font-size="12" class="mono">pending: Arc&lt;Mutex&lt;…&gt;&gt;</text>
+    <rect x="34" y="94" width="222" height="28" rx="4" style="fill:var(--ok-wash)"/>
+    <text x="44" y="113" font-size="12" class="mono">guard: MutexGuard</text>
+
+    <rect x="20" y="170" width="250" height="100" rx="8" stroke-width="1.3" style="fill:var(--surface);stroke:var(--rule-strong)"/>
+    <text x="34" y="192" font-size="13" font-weight="700">request caller</text>
+    <rect x="34" y="204" width="222" height="28" rx="4" style="fill:var(--oxide-wash)"/>
+    <text x="44" y="223" font-size="12" class="mono">pending: Arc&lt;Mutex&lt;…&gt;&gt;</text>
+    <text x="34" y="256" font-size="11.5" style="fill:var(--warn)">waiting in lock().await</text>
+
+    <rect x="470" y="20" width="410" height="260" rx="10" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+    <text x="486" y="42" font-size="10.5" letter-spacing="1" style="fill:var(--ink-3)">ONE HEAP ALLOCATION</text>
+    <text x="486" y="64" font-size="12.5" class="mono">strong count = 2 · weak = 0</text>
+    <rect x="486" y="80" width="378" height="184" rx="8" stroke-width="1.2" style="fill:var(--ground-2);stroke:var(--rule-strong)"/>
+    <text x="500" y="102" font-size="12.5" class="mono" font-weight="700">Mutex</text>
+    <text x="566" y="102" font-size="11.5" style="fill:var(--ink-3)">locked by read-loop task</text>
+    <rect x="500" y="118" width="350" height="130" rx="6" stroke-width="1.2" style="fill:var(--surface);stroke:var(--oxide)"/>
+    <text x="514" y="140" font-size="12.5" class="mono" font-weight="700">HashMap&lt;u64, Pending&gt;</text>
+    <text x="514" y="164" font-size="12" class="mono">7 → Pending { want_code, tx }</text>
+    <text x="514" y="184" font-size="12" class="mono">8 → Pending { want_code, tx }</text>
+    <text x="514" y="214" font-size="11.5" style="fill:var(--ink-3)">reachable only through a guard,</text>
+    <text x="514" y="232" font-size="11.5" style="fill:var(--ink-3)">so no unsynchronised access compiles</text>
+
+    <line x1="256" y1="72" x2="467" y2="60" stroke="currentColor" stroke-width="1.4" marker-end="url(#m1b-arrow)"/>
+    <text x="300" y="56" font-size="11" style="fill:var(--ink-2)">Arc::clone → count + 1</text>
+    <line x1="256" y1="218" x2="467" y2="218" stroke="currentColor" stroke-width="1.4" marker-end="url(#m1b-arrow)"/>
+    <text x="300" y="210" font-size="11" style="fill:var(--ink-2)">drop → count − 1, freed at 0</text>
+    <line x1="256" y1="108" x2="497" y2="150" stroke-width="1.6" style="stroke:var(--ok)" marker-end="url(#m1b-arrow)"/>
+    <text x="330" y="140" font-size="11" style="fill:var(--ok)">&amp;mut access while held</text>
+  </svg>
+  </div>
+  <figcaption><code>Arc&lt;Mutex&lt;T&gt;&gt;</code> is the Rust spelling of “a shared object guarded by a lock”. The <code>Arc</code> answers <em>who keeps it alive</em>; the <code>Mutex</code> answers <em>who may touch it right now</em>. The example is the pending-request map in <code>el/peer.rs</code>.</figcaption>
+</figure>
+
+<!-- ============================================================ CONCURRENCY -->
+<section class="prose" id="primer-concurrency">
+  <h2>Threads, <code>Send</code> and <code>Sync</code></h2>
+  <p>Two marker traits carry thread safety in the type system. <code>Send</code> means a value may be <em>moved</em> to another thread. <code>Sync</code> means a <code>&amp;T</code> may be <em>shared</em> between threads. The compiler derives them automatically from a type's fields: <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> is both when <code>T: Send</code>, while <code>Rc</code> and <code>RefCell</code> are neither. So “forgot to synchronise” is a compile error, not a heisenbug.</p>
+  <p>Channels are the other half: <code>mpsc</code> (many producers, one consumer), <code>oneshot</code> (exactly one value), and <code>watch</code> (the latest value, observed by many). Here is how one managed peer correlates responses with requests:</p>
+</section>
+<x-code src="myotis-net/src/el/peer.rs" from="52" to="58"></x-code>
+<p class="code-note">Every outstanding request inserts a <code>Pending</code> keyed by its request id. The <code>tx</code> half of a <code>oneshot</code> channel sits in the map, and the requester awaits the <code>rx</code> half. When the read loop decodes a response, it removes the entry and sends the bytes through <code>tx</code>. The struct that owns all this shows the whole concurrency toolbox in its first fields:</p>
+<x-code src="myotis-net/src/el/peer.rs" from="299" to="321"></x-code>
+<div class="callout jvm">
+  <span class="k">JVM lens</span>
+  <p><code>PendingMap</code> is the Rust version of <code>ConcurrentHashMap&lt;Long, CompletableFuture&lt;byte[]&gt;&gt;</code>: <code>oneshot::Sender</code> ≈ <code>complete()</code>, <code>oneshot::Receiver</code> ≈ <code>get()</code>. <code>next_id: AtomicU64</code> is <code>AtomicLong.incrementAndGet()</code>. <code>closed: Arc&lt;AtomicBool&gt;</code> is a shared <code>volatile boolean</code> that the read-loop task also holds.</p>
+</div>
+
+<!-- ============================================================ ASYNC -->
+<section class="prose" id="primer-async">
+  <h2>async/await and tokio</h2>
+  <p>An <code>async fn</code> returns a <code>Future</code>: a state machine that does <strong>nothing</strong> until something polls it. <code>.await</code> polls it and, if it isn't ready, suspends the current task so the thread can run other tasks. tokio's multi-threaded runtime is the thing that polls: a few worker threads, thousands of tasks, and an I/O reactor (Netty's event loop, essentially).</p>
+  <ul>
+    <li><strong><code>tokio::spawn(fut)</code></strong> hands a future to the runtime as an independent task and returns a <code>JoinHandle</code>. The task may run on any worker thread and may outlive its creator, hence <code>Send + 'static</code>. Data it needs is <em>moved</em> in, usually through <code>async move { … }</code> and cloned <code>Arc</code>s.</li>
+    <li><strong>Cancellation is dropping.</strong> A future that is dropped is simply never polled again. It stops at its last <code>.await</code>, and its locals' destructors run. There is no exception, which is why guards such as <code>PendingGuard</code> exist, and why <code>peer.rs</code> marks a frame write as <code>torn</code> before it starts (lines 56–62): a write cancelled halfway must not be followed by another.</li>
+    <li><strong><code>tokio::select!</code></strong> waits on several futures and runs the branch of whichever finishes first, dropping the others.</li>
+    <li><strong>Two kinds of mutex.</strong> <code>std::sync::Mutex</code> is fine for short critical sections that never <code>.await</code> while locked. <code>tokio::sync::Mutex</code> (<code>lock().await</code>) is for locks held <em>across</em> an <code>.await</code>, such as the peer's frame writer, which sends over the network while locked.</li>
+  </ul>
+</section>
+<x-code src="myotis-net/src/el/request.rs" from="117" to="130"></x-code>
+<p class="code-note"><code>Operation::wait</code> wraps any future with a cooperative budget. <code>tokio::pin!</code> fixes the future in place so it can be polled <em>by reference</em> (<code>&amp;mut future</code>) on every loop iteration without being restarted. Each 10 ms the <code>sleep</code> branch wins, <code>self.check()?</code> returns <code>Err</code> if the operation was cancelled or ran out of time, and dropping out of the function drops the wrapped future. <code>biased;</code> makes <code>select!</code> poll the branches in order instead of randomly.</p>
+
+<div class="prose">
+  <h3>Crossing between blocking and async code</h3>
+  <p>FFI callers (JVM threads, iOS threads) are ordinary blocking threads, and so is revm, the EVM library. Two bridges connect them to the async world:</p>
+  <ul>
+    <li><code>runtime.block_on(fut)</code> / <code>Handle::block_on(fut)</code>: a <em>blocking</em> thread runs a future to completion. The engine uses it for every FFI call (<code>host.rs</code> line 614). It must never be called on a runtime worker thread, where it panics.</li>
+    <li><code>tokio::task::spawn_blocking(closure)</code>: async code hands blocking work to a separate thread pool and awaits the result.</li>
+  </ul>
+  <p>The EVM path uses both in sequence: the async reader <code>spawn_blocking</code>s the revm execution, and inside it, each state read <code>block_on</code>s an async network fetch.</p>
+</div>
+<x-code src="myotis-net/src/el/request.rs" from="229" to="253"></x-code>
+<p class="code-note">Note the RAII in the closure. <code>let _permit = permit;</code> moves the semaphore permit into the blocking thread. The permit is released when the closure returns and <code>_permit</code> is dropped, which caps concurrent EVM executions at <code>BLOCKING_SLOTS_MAX</code> (8) process-wide. A ninth call waits its turn in a FIFO queue for up to <code>BLOCKING_WAIT</code> (5 s) before it is refused. The <code>_worker</code> guard does the same RAII trick for the operation's bookkeeping.</p>
+<x-code src="myotis-net/src/el/evm.rs" from="900" to="907"></x-code>
+<div class="callout jvm">
+  <span class="k">Kotlin lens</span>
+  <p>Kotlin coroutines are the closest match. <code>async fn</code> ≈ <code>suspend fun</code>, <code>tokio::spawn</code> ≈ <code>scope.launch</code>, <code>block_on</code> ≈ <code>runBlocking</code>, <code>spawn_blocking</code> ≈ <code>withContext(Dispatchers.IO)</code>, <code>select!</code> ≈ <code>select { }</code>, and a <code>oneshot</code> ≈ <code>CompletableDeferred</code>. The big difference is cancellation: Kotlin throws <code>CancellationException</code> at the next suspension point, while Rust just stops polling and runs destructors.</p>
+</div>
+
+<!-- ============================================================ CLOSURES -->
+<section class="prose" id="primer-iterators-closures">
+  <h2>Closures and iterators</h2>
+  <p>A closure <code>|x| …</code> captures variables from its surroundings, by reference by default and by value with <code>move</code>. Closures that must outlive the current function (spawned tasks, <code>spawn_blocking</code>) are almost always <code>move</code>. Iterator chains are lazy like Kotlin sequences: <code>(0..len).map(|i| …).collect()</code> builds a <code>Vec</code> in one pass, and <code>tasks.1.retain(|task| !task.is_finished())</code> (in <code>tasks.rs</code> above) filters in place. The closure traits <code>Fn</code>, <code>FnMut</code> and <code>FnOnce</code> say whether a closure can be called repeatedly and whether it mutates or consumes its captures. <code>blocking(f: impl FnOnce() -&gt; T …)</code> accepts a closure that runs exactly once, so it may move captured values out.</p>
+</section>
+
+<!-- ============================================================ MACROS -->
+<section class="prose" id="primer-macros">
+  <h2>Macros and attributes</h2>
+  <p>Anything with a <code>!</code> is a macro call that expands at compile time: <code>format!</code>, <code>write!</code>, <code>vec!</code>, <code>tokio::select!</code>, <code>tokio::pin!</code>. Attributes in <code>#[…]</code> either configure the compiler or run a procedural macro:</p>
+  <ul>
+    <li><code>#[derive(Debug, Clone)]</code> generates trait impls.</li>
+    <li><code>#[cfg(test)]</code> and <code>#[cfg(feature = "tor")]</code> include code only in test builds or when a Cargo feature is on. <code>host.rs</code> has two bodies for <code>set_tor_enabled</code>, and exactly one is compiled.</li>
+    <li><code>#[tokio::test]</code>, <code>#[tokio::main]</code>, <code>#[uniffi::export]</code> and <code>#[napi]</code> rewrite the item they sit on: they start a runtime, or generate FFI glue.</li>
+  </ul>
+</section>
+<x-code src="myotis-engine/src/host.rs" from="233" to="244"></x-code>
+
+<!-- ============================================================ SHORT SECTIONS -->
+<section class="prose" id="primer-modules-cargo">
+  <h2>Crates, modules and features (short)</h2>
+  <p>A <em>crate</em> is a compilation unit, either a library or a binary. A <em>workspace</em> builds several crates together. Inside a crate, <code>mod x;</code> declares a module, which lives in <code>x.rs</code> or <code>x/mod.rs</code>. Items are private by default. <code>pub</code> exports an item, <code>pub(crate)</code> exposes it to the whole crate only, and <code>pub(super)</code> to the parent module. Cargo <em>features</em> are compile-time switches, such as <code>tor</code> or <code>jni</code>. Full treatment in <a href="#stop-02">Stop 2</a>.</p>
+</section>
+<section class="prose" id="primer-unsafe-ffi">
+  <h2><code>unsafe</code> and FFI (short)</h2>
+  <p><code>unsafe { … }</code> lets you do five extra things, the main one being dereferencing a raw pointer. You then promise the compiler the invariants it can't check. At a foreign-function boundary (<code>extern "C"</code>), ownership stops being visible to the compiler, so the API must document who allocates and who frees. The C header says it bluntly: every returned string must be released with <code>myotis_string_free</code>. Full treatment in <a href="#stop-13">Stop 13</a>.</p>
+</section>
+<section class="prose" id="primer-testing">
+  <h2>Tests (short)</h2>
+  <p>Unit tests live next to the code in a <code>#[cfg(test)] mod tests { … }</code> block and may test private items. Integration tests live in a crate's <code>tests/</code> directory and see only the public API. <code>#[ignore]</code> keeps a test out of the default run (<code>cargo test -- --ignored</code> runs it). Myotis uses that for every test that needs the live network. Full treatment in <a href="#stop-12">Stop 12</a>.</p>
+</section>
+<section class="prose" id="primer-cli">
+  <h2>Binaries and CLIs (short)</h2>
+  <p>A binary crate has <code>fn main()</code>. An async one uses <code>#[tokio::main]</code> to start the runtime. Applications often use <code>anyhow::Result</code>, a catch-all error type with context messages, where libraries define precise error enums. <code>roost</code> is the example; see <a href="#stop-15">Stop 15</a>.</p>
+</section>
+<section class="prose" id="primer-domain">
+  <h2>Protocol knowledge (short)</h2>
+  <p>You know the protocols from the Java engine. The Rust code uses the same vocabulary: slots (12 s), sync-committee periods (8,192 slots), SSZ and <code>hash_tree_root</code> on the consensus side, RLP and keccak-256 on the execution side, and never the two hashes mixed. When a term is unclear, the specification under <code>docs/spec/</code> (called <code>docs/reimplementation/</code> at the commit this tour quotes) are the reference. <a href="#stop-00">Stop 0</a> lists the trust chain.</p>
+</section>
+
+<div class="prose">
+  <h2>Cheat sheet: Java/Kotlin → Rust</h2>
+</div>
+<div class="table-wrap">
+<table class="map">
+  <thead><tr><th>You would write</th><th>Rust spelling</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>null / T?</td><td><code>Option&lt;T&gt;</code></td><td><code>?</code> ≈ <code>?: return null</code>; <code>unwrap()</code> ≈ <code>!!</code> (panics)</td></tr>
+    <tr><td>throws / try-catch</td><td><code>Result&lt;T, E&gt;</code> + <code>?</code></td><td><code>impl From&lt;A&gt; for B</code> makes <code>?</code> convert errors</td></tr>
+    <tr><td>interface</td><td><code>trait</code></td><td>generic = static dispatch; <code>dyn Trait</code> = virtual call</td></tr>
+    <tr><td>this / instance method</td><td><code>fn m(&amp;self, …)</code> in an <code>impl</code></td><td><code>x.m(a)</code> is <code>Type::m(&amp;x, a)</code>; the receiver says read, modify or consume</td></tr>
+    <tr><td>static method / companion</td><td>associated function <code>Type::f(…)</code></td><td>no <code>self</code>; <code>new</code> is a naming convention, not a keyword</td></tr>
+    <tr><td>sealed class + when</td><td><code>enum</code> + <code>match</code></td><td>exhaustive; variants carry data</td></tr>
+    <tr><td>data class</td><td><code>#[derive(Clone, Debug, PartialEq)] struct</code></td><td><code>Clone</code> is always explicit</td></tr>
+    <tr><td>synchronized / ReentrantLock</td><td><code>Mutex&lt;T&gt;</code></td><td>data inside the lock; unlock = guard dropped</td></tr>
+    <tr><td>AtomicLong / volatile</td><td><code>AtomicU64</code> / <code>AtomicBool</code></td><td>explicit <code>Ordering</code> per operation</td></tr>
+    <tr><td>shared reference + GC</td><td><code>Arc&lt;T&gt;</code></td><td>freed when the last clone drops</td></tr>
+    <tr><td>try-with-resources</td><td><code>impl Drop</code></td><td>runs on every exit path, including cancellation</td></tr>
+    <tr><td>static lazy singleton</td><td><code>static X: OnceLock&lt;T&gt;</code></td><td>initialised once, thread-safe</td></tr>
+    <tr><td>CompletableFuture</td><td><code>Future</code> / <code>oneshot</code></td><td>futures are lazy until polled</td></tr>
+    <tr><td>ExecutorService / Netty loop</td><td>tokio <code>Runtime</code></td><td><code>spawn</code>, <code>block_on</code>, <code>spawn_blocking</code></td></tr>
+    <tr><td>byte[] / ByteBuffer.slice()</td><td><code>Vec&lt;u8&gt;</code> / <code>&amp;[u8]</code></td><td>fixed sizes: <code>[u8; 32]</code> (Copy)</td></tr>
+    <tr><td>val / var</td><td><code>let</code> / <code>let mut</code></td><td>immutability is deep for owned data</td></tr>
+    <tr><td>generics (erased)</td><td>generics (monomorphised)</td><td>a specialised copy per type; bounds like <code>T: Send</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<x-quiz>[
+  {"id":"s01-q1","type":"mcq","tags":["ownership"],
+   "q":"<p><code>SyncHandle::start</code> takes <code>config: ChainConfig</code> by value. What happens here?</p><pre><code>let cfg = ChainConfig::mainnet();\nlet h = SyncHandle::start(cfg);\nprintln!(\"{}\", cfg.name);</code></pre>",
+   "options":["It prints <code>mainnet</code>","It fails to compile: <code>cfg</code> was moved into <code>start</code>","It compiles but panics at run time because <code>cfg</code> is null","It prints a copy that <code>start</code> made"],
+   "answer":1,
+   "explain":"Passing by value moves ownership into <code>start</code>. Any later use of <code>cfg</code> is a compile-time error, “borrow of moved value”. To keep using it you would pass <code>cfg.clone()</code>, which is exactly what <code>host.rs</code> does with <code>(*config).clone()</code>."},
+  {"id":"s01-q2","type":"mcq","tags":["ownership","bytes-strings"],
+   "q":"Which of these types is <code>Copy</code>, so assigning it leaves the original usable?",
+   "options":["<code>Vec&lt;u8&gt;</code>","<code>String</code>","<code>[u8; 32]</code>","<code>Arc&lt;ElReader&gt;</code>"],
+   "answer":2,
+   "explain":"A fixed-size array of <code>Copy</code> elements is itself <code>Copy</code>: the 32 bytes are duplicated bit for bit. <code>Vec</code> and <code>String</code> own heap memory, so they move. <code>Arc</code> is not <code>Copy</code> either; you duplicate it with <code>Arc::clone</code>, which bumps the reference count."},
+  {"id":"s01-q3","type":"mcq","tags":["borrowing","lifetimes"],
+   "q":"<code>Reader::fixed(&amp;mut self, len)</code> returns <code>Option&lt;&amp;'a [u8]&gt;</code>. Why <code>'a</code> rather than the lifetime of <code>&amp;mut self</code>?",
+   "options":["So the returned slice borrows the original buffer, and the caller can keep it while calling <code>fixed</code> again","Because <code>'a</code> means the slice is copied to the heap","Because lifetimes must always be named in structs","So that the slice lives for the whole program"],
+   "answer":0,
+   "explain":"<code>'a</code> is the lifetime of the <em>data</em> the reader borrows. Tying the result to <code>'a</code> means “this slice points into that data”, not into the reader. With the elided form, the slice would keep the <code>&amp;mut</code> borrow of the reader alive, and a second <code>fixed</code> call would not compile."},
+  {"id":"s01-q4","type":"open","tags":["lifetimes","borrowing"],
+   "q":"Explain in your own words what <code>struct Reader&lt;'a&gt; { data: &amp;'a [u8], pos: usize }</code> promises, and what bug this rules out that a C program could have.",
+   "model":"The struct doesn't own its bytes; it borrows a byte slice owned by someone else, for some span <code>'a</code>. The compiler then guarantees that no <code>Reader</code> outlives the buffer it reads, and that nobody mutates or frees the buffer while the reader (or any slice it returned) exists. In C, a reader struct holding a raw pointer could outlive the buffer (use-after-free), or the buffer could be reallocated underneath it. In Rust, that is a compile error. Java avoids the problem with GC instead: the array stays alive as long as any reference exists.",
+   "points":["Reader borrows (does not own) the bytes","'a ties the reader's validity to the buffer's lifetime","compiler rejects outliving the buffer / mutating it meanwhile","prevents use-after-free / dangling pointer (C); Java avoids it via GC"],
+   "context":"myotis-consensus/src/snapshot.rs L244-271: struct Reader&lt;'a> { data: &'a [u8], pos: usize } with fn fixed(&mut self, len: usize) -> Option&lt;&'a [u8]> returning &self.data[self.pos..end]."},
+  {"id":"s01-q5","type":"mcq","tags":["error-handling"],
+   "q":"In <code>Some(u32::from_be_bytes(self.fixed(4)?.try_into().ok()?))</code>, what does the <em>second</em> <code>?</code> do?",
+   "options":["Panics if the slice has the wrong length","Returns <code>None</code> from the enclosing function if the slice could not be converted to <code>[u8; 4]</code>","Converts the error into a <code>String</code>","Retries the read"],
+   "answer":1,
+   "explain":"<code>try_into()</code> yields <code>Result&lt;[u8; 4], _&gt;</code>. <code>.ok()</code> turns it into <code>Option</code>, and <code>?</code> on an <code>Option</code> returns <code>None</code> early. The first <code>?</code> handles “not enough bytes left”."},
+  {"id":"s01-q6","type":"mcq","tags":["error-handling","traits-generics"],
+   "q":"What does <code>impl From&lt;OracleError&gt; for EvmError</code> enable?",
+   "options":["Catching <code>OracleError</code> exceptions","Using <code>?</code> on a <code>Result&lt;_, OracleError&gt;</code> inside a function that returns <code>Result&lt;_, EvmError&gt;</code>; the error is converted automatically","Converting an <code>EvmError</code> back into an <code>OracleError</code>","Printing an <code>OracleError</code>"],
+   "answer":1,
+   "explain":"<code>?</code> calls <code>From::from</code> on the error before returning it, so a state-fetch failure becomes <code>EvmError::Oracle(e)</code> without any explicit mapping. <code>Display</code> is what printing needs."},
+  {"id":"s01-q7","type":"mcq","tags":["smart-pointers","interior-mutability"],
+   "q":"In <code>spin_up</code>, the code does <code>Arc::clone(c)</code> inside a block that holds <code>engine.handles.lock()</code>, then calls <code>block_on</code> after the block. Why?",
+   "options":["<code>Arc::clone</code> deep-copies the config so it can be mutated","It takes a cheap extra reference so the lock can be released <em>before</em> the slow start, and other FFI calls aren't blocked","It is required because <code>block_on</code> only accepts clones","It leaks the config on purpose"],
+   "answer":1,
+   "explain":"<code>Arc::clone</code> only increments a counter. With its own reference, the code can let the <code>MutexGuard</code> drop at the end of the block, which unlocks the map, and then do slow work without serialising every other native call behind it."},
+  {"id":"s01-q8","type":"open","tags":["interior-mutability","smart-pointers"],
+   "q":"<code>Tasks::spawn(&amp;self, …)</code> only has a shared reference, yet it pushes into a <code>Vec</code>. Explain how that is allowed, and what releases the lock.",
+   "model":"The <code>Vec</code> lives inside a <code>Mutex</code> (interior mutability). <code>&amp;self</code> gives shared access to the mutex, and <code>lock()</code> returns a <code>MutexGuard</code> that dereferences to <code>&amp;mut</code> of the inner tuple, so the push is legal while the guard exists. The lock is released automatically when the guard (<code>tasks</code>) goes out of scope at the end of the method, including on the early <code>return</code>, because the guard's <code>Drop</code> unlocks. <code>unwrap_or_else(|e| e.into_inner())</code> recovers the guard even if the mutex was poisoned.",
+   "points":["the Vec is inside a Mutex (interior mutability)","lock() yields a guard that gives &mut access","unlock happens when the guard is dropped (end of scope, any exit path)","poison recovery via into_inner (optional detail)"],
+   "context":"myotis-net/src/el/tasks.rs: pub(super) struct Tasks(Mutex&lt;(bool, Vec&lt;JoinHandle&lt;()>>)>); fn spawn(&self, future) { let mut tasks = self.0.lock().unwrap_or_else(|e| e.into_inner()); if tasks.0 { return; } tasks.1.retain(...); tasks.1.push(tokio::spawn(future)); }"},
+  {"id":"s01-q9","type":"mcq","tags":["async","concurrency","lifetimes"],
+   "q":"Why does <code>Tasks::spawn</code> require <code>impl Future&lt;Output = ()&gt; + Send + 'static</code>?",
+   "options":["Because futures must return <code>()</code> to compile","tokio may run the task on any worker thread (<code>Send</code>), and the task may outlive the caller, so it may not hold borrowed references (<code>'static</code>)","Because <code>'static</code> futures are cached forever","It is only a style convention"],
+   "answer":1,
+   "explain":"<code>tokio::spawn</code> itself has these bounds. <code>Send</code> lets the scheduler move the task between threads. <code>'static</code> means the future owns everything it touches, so no dangling borrow can appear when the spawning function returns. That's why tasks are written as <code>async move { … }</code> with cloned <code>Arc</code>s."},
+  {"id":"s01-q10","type":"mcq","tags":["async"],
+   "q":"How is an in-flight async request cancelled in Rust?",
+   "options":["By throwing <code>CancellationException</code> into it","By calling <code>future.cancel()</code>, which interrupts the thread","By dropping its future: it is never polled again, stops at its last <code>.await</code>, and its destructors run","It cannot be cancelled"],
+   "answer":2,
+   "explain":"Dropping is cancellation. Code has to be <em>cancel-safe</em>: it must not leave half-finished state at an <code>.await</code>. That's why <code>PendingGuard</code> cleans up in <code>Drop</code>, and why <code>GuardedWriter</code> sets <code>torn</code> before a frame write."},
+  {"id":"s01-q11","type":"mcq","tags":["async","interior-mutability"],
+   "q":"The peer's frame writer uses <code>tokio::sync::Mutex</code> rather than <code>std::sync::Mutex</code>. What is the reason?",
+   "options":["tokio's mutex is faster in every case","The lock is held across <code>writer.send(…).await</code>. An async mutex yields instead of blocking a worker thread, and its guard can be held across <code>.await</code> in a <code>Send</code> task","std's mutex cannot hold a <code>Vec</code>","tokio's mutex cannot be poisoned, which is required by <code>panic = \"abort\"</code>"],
+   "answer":1,
+   "explain":"Holding a std guard across an <code>.await</code> would block the thread and makes the future non-<code>Send</code>. The rule of thumb: a std mutex for short, non-awaiting critical sections; a tokio mutex when the critical section awaits."},
+  {"id":"s01-q12","type":"open","tags":["async","concurrency"],
+   "q":"The EVM (revm) is synchronous, but state has to be fetched from peers over the async network. Describe how <code>myotis-net</code> connects the two, and why the EVM must not run directly on a tokio worker thread.",
+   "model":"The async reader first moves the EVM run onto a blocking thread with <code>spawn_blocking</code> (via <code>request::blocking</code>). While executing, revm calls the synchronous <code>SnapStateOracle</code> methods. The implementation (<code>PoolOracle</code>) bridges each call back into async code with <code>Handle::block_on</code>, which drives the network fetch and verification to completion and blocks only that blocking thread. If revm ran on a worker thread, <code>block_on</code> would panic (it may not be called from an async execution context), and the blocking EVM loop would starve other tasks on that worker.",
+   "points":["spawn_blocking moves revm off the async workers","the sync oracle trait is implemented with Handle::block_on around async fetches","block_on on a runtime worker panics / blocking starves the worker","result flows back through the awaited JoinHandle"],
+   "context":"myotis-net/src/el/evm.rs module docs: PoolOracle implements the sync SnapStateOracle over the snap peer pool via Handle::block_on; ElReader::eth_call drives revm on a blocking thread so the bridge never nests block_on in a runtime worker. request.rs blocking(): spawn_blocking with a semaphore permit (8 slots)."},
+  {"id":"s01-q13","type":"mcq","tags":["smart-pointers","async"],
+   "q":"When does <code>PendingGuard::drop</code> run, and why does it spawn a task instead of removing the map entry directly?",
+   "options":["Only when the program exits; spawning makes it faster","When the guard goes out of scope, including when the request future is dropped. <code>drop</code> cannot <code>.await</code> the async mutex, so it moves an <code>Arc</code> clone into a spawned task that can","Whenever the garbage collector runs; spawning avoids pauses","Never, because guards are <code>'static</code>"],
+   "answer":1,
+   "explain":"<code>Drop::drop</code> is a synchronous function. The pending map sits behind <code>tokio::sync::Mutex</code>, whose <code>lock()</code> must be awaited, so the guard spawns a tiny <code>async move</code> task that owns its own <code>Arc</code> and does the removal."},
+  {"id":"s01-q14","type":"mcq","tags":["enums-patterns"],
+   "q":"<code>match (from, map.get(&amp;handle)) { (Created, Some(ChainEntry::Created(c))) =&gt; …, (Paused, Some(ChainEntry::Paused(c, _, stats))) =&gt; …, _ =&gt; return false }</code>. What is the final arm for?",
+   "options":["It is optional decoration","<code>match</code> must be exhaustive. <code>_</code> covers an unknown handle id (<code>None</code>) and every state/transition mismatch in one arm","It matches only <code>None</code>","It re-throws the error"],
+   "answer":1,
+   "explain":"The compiler insists that every possible value is handled. The wildcard makes “anything else → refuse” explicit, which in Java would be a pile of null checks and <code>instanceof</code> tests."},
+  {"id":"s01-q15","type":"mcq","tags":["borrowing","traits-generics"],
+   "q":"<code>fn fetch_account(&amp;self, state_root: &amp;[u8; 32], address: [u8; 20])</code> is called as <code>oracle.fetch_account(&amp;root, addr)</code>. Which statement is right?",
+   "options":["<code>self</code> isn't a real parameter; a method only receives what's in the parentheses","It has three parameters. The value left of the dot is passed as <code>self</code> (borrowed as <code>&amp;oracle</code>), so the call is the same as <code>SnapStateOracle::fetch_account(&amp;oracle, &amp;root, addr)</code>","<code>self</code> refers to a global oracle object","<code>&amp;self</code> means the method works on a copy of the oracle"],
+   "answer":1,
+   "explain":"Method-call syntax is sugar: the receiver becomes the first argument, and the compiler inserts the <code>&amp;</code> the signature asks for. That's why roost can pass <code>EnrSeq::current</code> to <code>Option::map</code> as a plain function."},
+  {"id":"s01-q16","type":"mcq","tags":["ownership","borrowing"],
+   "q":"<code>EnrSeq::bump</code> ends with <code>self.current = next;</code>. Which receiver does it need, and what does that require from the caller?",
+   "options":["<code>&amp;self</code>, and any reference to the <code>EnrSeq</code> will do","<code>&amp;mut self</code>: the caller needs mutable access, for example a <code>let mut</code> binding, and no other borrow of the value may be alive during the call","<code>self</code>, so the caller loses the value","No receiver: it's an associated function"],
+   "answer":1,
+   "explain":"Assigning to a field needs exclusive access. With <code>&amp;self</code> that's only possible for fields with interior mutability (atomics, <code>Mutex</code>). <code>self</code> would consume the counter, which the daemon needs for its whole run."},
+  {"id":"s01-q17","type":"mcq","tags":["ownership"],
+   "q":"<code>SyncHandle</code> has <code>pub async fn stop(self)</code>. What happens if code calls <code>handle.status()</code> after <code>handle.stop().await</code>?",
+   "options":["It returns the last status before the stop","It fails to compile: <code>stop</code> takes <code>self</code> by value, so <code>handle</code> was moved into it","It panics at run time","It restarts the sync loop"],
+   "answer":1,
+   "explain":"A by-value receiver consumes the object, exactly like passing it by value to any function. The compiler rejects every later use, so a stopped handle can't be used by accident. Java can only document that rule; Rust enforces it."},
+  {"id":"s01-q18","type":"open","tags":["borrowing","traits-generics","interior-mutability"],
+   "q":"The test helper <code>struct Counting { inner: FixtureSnapStateOracle, fetches: AtomicUsize }</code> implements <code>SnapStateOracle</code>. Explain what <code>self.inner.fetch_account(r, a)</code> does inside its <code>fetch_account</code>: what are <code>self</code> and <code>inner</code>, is anything copied, and how can <code>fetches</code> be incremented through <code>&amp;self</code>?",
+   "model":"<code>self</code> is the method's receiver, here <code>&amp;Counting</code>: a shared borrow of the <code>Counting</code> value the method was called on. <code>inner</code> is an ordinary field of <code>Counting</code> that holds the wrapped fixture oracle, so <code>self.inner</code> is that field, reached through the reference. Calling <code>fetch_account</code> on it borrows the field again (<code>&amp;self.inner</code>) and forwards the arguments. That's the decorator pattern, Java's <code>this.inner.fetchAccount(r, a)</code>. Nothing is copied or moved, and moving a field out of a borrowed struct wouldn't compile anyway. <code>fetches</code> is an <code>AtomicUsize</code>, whose <code>fetch_add</code> takes <code>&amp;self</code>, so it can change through a shared reference: interior mutability.",
+   "points":["self is the receiver, a shared borrow &Counting","inner is an ordinary field holding the wrapped oracle; the call forwards to it (decorator)","nothing is copied or moved; the field is borrowed again","fetches is atomic, so it can change through &self (interior mutability)"],
+   "context":"rust/myotis-evm/src/executor.rs L985-1007 (test module): #[derive(Default)] struct Counting { inner: FixtureSnapStateOracle, fetches: std::sync::atomic::AtomicUsize } impl crate::oracle::SnapStateOracle for Counting { fn fetch_account(&self, r: &[u8; 32], a: [u8; 20]) -> Result&lt;Option&lt;OracleAccount>, OracleError> { self.fetches.fetch_add(1, Ordering::SeqCst); self.inner.fetch_account(r, a) } fn fetch_storage(..) { ..; self.inner.fetch_storage(r, a, s) } fn fetch_bytecode(..) { ..; self.inner.fetch_bytecode(h) } }"}
+]</x-quiz>

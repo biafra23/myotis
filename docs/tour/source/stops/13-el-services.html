@@ -1,0 +1,412 @@
+<!--meta {"id":"stop-13","num":13,"title":"myotis-net, part 5: EVM bridge, log index and transactions","short":"net · EL services","sub":"7 files · 9,551 lines","part":"myotis-net: all the I/O"} -->
+<header class="stop-head">
+  <div class="eyebrow">Stop 13 · crate <code>myotis-net</code>, <code>src/el/</code> <span>7 files · 9,551 lines · about 155 minutes</span></div>
+  <h1>myotis-net, part 5: EVM bridge, log index and transactions</h1>
+  <p class="lede">The execution-layer services that sit just below the reader facade. The EVM's network bridge turns revm's synchronous state lookups into hedged, proof-checked snap requests. The <code>eth_getLogs</code> index, the new address-activity follower and the new fee memo are pure state machines that the reader feeds with verified data. The transaction modules decode, gate and track what the wallet sends. Almost every file here is pure and clock-injected; the one that is not, <code>evm.rs</code>, is where synchronous and asynchronous Rust meet.</p>
+</header>
+
+<div class="learn">
+  <h2>Rust you will practise</h2>
+  <div><b>Sync code that waits on async code</b><code>Handle::block_on</code> on a blocking-pool thread, borrowed futures driven by <code>join_all</code>, and <code>tokio::pin!</code> + <code>select!</code> around a request.</div>
+  <div><b>Moving big state instead of copying it</b><code>mem::take</code>, <code>BTreeMap::split_off</code>, partial moves and the <code>..ix</code> struct update.</div>
+  <div><b>Borrowing one field while mutating another</b>disjoint field borrows inside <code>retain</code> closures, and cloning a key so a shared borrow ends before a <code>remove</code>.</div>
+</div>
+
+<section class="prose">
+  <p>Seven files, three themes. Read them in this order:</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>File</th><th>Lines</th><th>What it is</th></tr></thead>
+    <tbody>
+      <tr><td><a href="#f-myotis-net-src-el-evm-rs"><code>evm.rs</code></a></td><td>2,117</td><td>The EVM's I/O half: <code>PoolOracle</code>, the outcome types, the prefetch wave.</td></tr>
+      <tr><td><a href="#f-myotis-net-src-el-logindex-rs"><code>logindex.rs</code></a></td><td>3,718</td><td>The scoped <code>eth_getLogs</code> index: watch list, coverage, store, snapshot file, merge.</td></tr>
+      <tr><td><a href="#f-myotis-net-src-el-activity-rs"><code>activity.rs</code></a></td><td>1,213</td><td>New. Which watched addresses each verified block touched (#691), and accounts carried forward without a new proof.</td></tr>
+      <tr><td><a href="#f-myotis-net-src-el-feecache-rs"><code>feecache.rs</code></a></td><td>786</td><td>New. A per-head memo for <code>eth_gasPrice</code> and <code>eth_feeHistory</code>.</td></tr>
+      <tr><td><a href="#f-myotis-net-src-el-tx-rs"><code>tx.rs</code></a></td><td>1,131</td><td>Transaction decoders and the <code>eth_sendRawTransaction</code> gate.</td></tr>
+      <tr><td><a href="#f-myotis-net-src-el-send-check-rs"><code>send_check.rs</code></a></td><td>197</td><td>New. geth's two txpool verdicts and the head-freshness rule for the pre-broadcast check.</td></tr>
+      <tr><td><a href="#f-myotis-net-src-el-sent-tx-rs"><code>sent_tx.rs</code></a></td><td>389</td><td>The sent-transaction watch and the pending-nonce overlay.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The request lifetimes (<code>request.rs</code>), the trust decision (<code>verify.rs</code>), the anchor, the peer pool and the serving window were in this stop in the first edition; they are now in <a href="#stop-12">Stop 12</a>. The reader that owns the locks, tasks and I/O around everything here is <a href="#stop-14">Stop 14</a>.</p>
+</section>
+
+<figure class="diagram">
+  <div class="svg-wrap">
+  <svg class="wide-diagram" viewBox="0 0 940 270" role="img" fill="currentColor" xmlns="http://www.w3.org/2000/svg"
+       aria-label="The sync to async bridge of eth_call. Top lane: tokio worker threads, where the async ElReader method builds a PoolOracle and the hedged snap requests run. Bottom lane: a blocking-pool thread, where request::blocking runs the revm executor. revm calls PoolOracle fetch methods synchronously; each one calls wait, which uses Handle::block_on to drive a hedged race over the call's peers. The verified value comes back down to revm. When revm finishes, the async reader receives the result by awaiting the blocking task's JoinHandle.">
+    <defs>
+      <marker id="m-13-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+      </marker>
+    </defs>
+    <rect x="10" y="22" width="920" height="102" rx="10" style="fill:var(--jvm-wash)"/>
+    <text x="24" y="40" font-size="11" font-weight="700" style="fill:var(--jvm-ink)">tokio worker threads · async</text>
+    <rect x="10" y="150" width="920" height="102" rx="10" style="fill:var(--oxide-wash)"/>
+    <text x="24" y="244" font-size="11" font-weight="700" style="fill:var(--oxide-ink)">one blocking-pool thread · synchronous</text>
+
+    <rect x="30" y="52" width="220" height="56" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+    <text x="140" y="75" text-anchor="middle" font-size="12.5" font-weight="700" class="mono">ElReader::eth_call_*</text>
+    <text x="140" y="94" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">snapshots peers, builds PoolOracle</text>
+
+    <rect x="610" y="52" width="300" height="56" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+    <text x="760" y="75" text-anchor="middle" font-size="12.5" font-weight="700" class="mono">hedged_race → snap_get_*</text>
+    <text x="760" y="94" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">peer sockets, timers, proof checks</text>
+
+    <rect x="30" y="166" width="200" height="56" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--oxide)"/>
+    <text x="130" y="189" text-anchor="middle" font-size="12.5" font-weight="700">revm executor</text>
+    <text x="130" y="208" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">myotis-evm, never awaits</text>
+
+    <rect x="300" y="166" width="220" height="56" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--oxide)"/>
+    <text x="410" y="189" text-anchor="middle" font-size="12.5" font-weight="700" class="mono">PoolOracle::fetch_*</text>
+    <text x="410" y="208" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">impl SnapStateOracle</text>
+
+    <rect x="590" y="166" width="220" height="56" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--oxide)"/>
+    <text x="700" y="189" text-anchor="middle" font-size="12.5" font-weight="700" class="mono">wait() · block_on</text>
+    <text x="700" y="208" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">this thread polls the future</text>
+
+    <line x1="110" y1="110" x2="110" y2="163" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-13-arrow)"/>
+    <text x="104" y="140" text-anchor="end" font-size="10.5">request::blocking</text>
+    <line x1="190" y1="163" x2="190" y2="111" stroke-width="1.4" stroke-dasharray="5 4" style="stroke:var(--ink-3)" marker-end="url(#m-13-arrow)"/>
+    <text x="198" y="140" font-size="10.5" style="fill:var(--ink-2)">JoinHandle.await</text>
+
+    <line x1="232" y1="194" x2="297" y2="194" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-13-arrow)"/>
+    <text x="264" y="186" text-anchor="middle" font-size="10">sync call</text>
+    <line x1="522" y1="194" x2="587" y2="194" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-13-arrow)"/>
+
+    <line x1="680" y1="163" x2="680" y2="111" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-13-arrow)"/>
+    <text x="672" y="140" text-anchor="end" font-size="10.5">drives the race</text>
+    <line x1="780" y1="111" x2="780" y2="163" stroke-width="1.4" style="stroke:var(--ok)" marker-end="url(#m-13-arrow)"/>
+    <text x="788" y="140" font-size="10.5" style="fill:var(--ok-ink)">verified leaf / value</text>
+  </svg>
+  </div>
+  <figcaption>The one rule behind the bridge: <code>Handle::block_on</code> runs only on a blocking-pool thread, never on a runtime worker. The future it drives is polled on that blocking thread; the timers and sockets it waits on are driven by the runtime. Every value is verified before it reaches revm: an account or storage proof against the call's state root, or <code>keccak(code) == code_hash</code>.</figcaption>
+</figure>
+
+<x-file path="rust/myotis-net/src/el/evm.rs" kind="library" twin="SnapBackedStateOracle">
+  <p class="purpose">The I/O half of <code>eth_call</code>, <code>eth_estimateGas</code>, <code>eth_createAccessList</code>, <code>debug_traceCall</code>, <code>eth_simulateV1</code> and ENS. <code>myotis-evm</code> (<a href="#stop-07">Stop 7</a>) is sans-I/O, and its <code>SnapStateOracle</code> trait is synchronous. <code>PoolOracle</code> implements that trait over a fixed snapshot of snap peers, one oracle per call. It verifies on fetch: account and storage proofs against the call's state root, <code>keccak(code)</code> against the code hash, and a <code>BLOCKHASH</code> answer by walking headers down from the call's verified parent. If no peer can prove a value, the fetch fails closed with an <code>OracleError</code>. The file also defines the outcome and answer types the reader returns for every EVM-backed read, the ENS query types, and <code>block_context</code>, which turns a verified header into revm's <code>BlockContext</code>.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–48</td><td>Module doc (verify on fetch, hedging, the <code>panic = "abort"</code> caveat); imports; <code>WalkKey</code>.</td></tr>
+      <tr><td>50–131</td><td><code>CallOutcome</code> (five variants) and <code>from_executor</code>; <code>ReadAnchor</code> (head or finalized); <code>CallAnswer</code>.</td></tr>
+      <tr><td>133–288</td><td><code>GasOutcome</code>, <code>AccessListOutcome</code>, <code>TraceOutcome</code>, <code>SimulateOutcome</code> (#716) and their answer structs, all mapped from <code>EvmError</code> the same way.</td></tr>
+      <tr><td>290–399</td><td>ENS: <code>EnsOutcome</code>, <code>EnsRootMode</code>, <code>EnsQuery</code> (ten query kinds), <code>EnsRecordValue</code>, <code>EnsQueryOutcome</code> (its <code>Offchain</code> variant carries a boxed CCIP-Read lookup).</td></tr>
+      <tr><td>401–461</td><td><code>block_context</code>, <code>leaf_account</code>, saturating scalar conversions.</td></tr>
+      <tr><td>463–669</td><td>The prefetch wave's machinery: the silence deadline (#320), <code>DISCOVERY_TIME_BUDGET</code>, <code>WaveFailure</code>, <strong><code>wave_request</code></strong>, <code>AttemptTally</code>, <code>ChunkLedger</code>, the chunk rotation <code>wave_peer</code>.</td></tr>
+      <tr><td>671–826</td><td><code>PoolOracle</code>'s fields; <code>WireCounters</code> and the <code>WireTimer</code> guard (#532); the pure ask-order helpers <code>next_order</code>, <code>note_losers</code>, <code>demoted</code>, <code>wave_positions</code>.</td></tr>
+      <tr><td>828–1055</td><td><code>impl PoolOracle</code>: <code>new</code>, shadow-cache notes, <strong><code>wait</code> (the bridge)</strong>, <code>record_race</code>, the per-call ladder, the memoized account <code>leaf</code>.</td></tr>
+      <tr><td>1057–1553</td><td><code>impl SnapStateOracle</code>: <code>fetch_account</code>, <code>prefetch_batch</code> (1112–1412), <code>fetch_storage</code>, <code>fetch_block_hash</code> (#664), <code>fetch_bytecode</code>.</td></tr>
+      <tr><td>1555–2117</td><td>Tests: scalar guards, the outcome mapping, the wave's silence and ledger rules, the rotation, the wire counters, the discovery budget.</td></tr>
+    </tbody>
+  </table></div>
+  <x-code src="myotis-net/src/el/evm.rs" from="76" to="89"></x-code>
+  <p class="code-note"><x-tags>enums-patterns error-handling</x-tags> <strong>Match guards, in order.</strong> <code>joined</code> is owned, so <code>Err(EvmError::Reverted { data })</code> moves the revert payload out of the error into the new variant: no copy. The next three arms bind the whole error as <code>e</code> and test it with <code>if</code> guards; arms are tried top to bottom, so the order is the policy. A refusal (a call this build can never answer) becomes <code>Refused</code>, which the host serves as the permanent <code>-32602</code>; an infeasible call (out of gas, fee cap, funds, #509) is an answer served as geth serves it; everything else is the retryable <code>Unavailable</code>. This is the CLAUDE.md rule “applied or refused, never silently ignored” in type form. The four sibling types repeat the same match.</p>
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments</span>
+    <p>The doc on <code>CallOutcome</code> itself (lines 50–53) still says the Java contract treats “every other outcome (revert, halt, unavailable)” as no answer. It predates the <code>Refused</code> and <code>Infeasible</code> variants, whose own docs (and <code>myotis-engine</code>'s <code>call_json</code>) give them a permanent <code>-32602</code> and a geth-style <code>-32000</code>. Trust the variant docs. The first edition's note about this module doc listing reputation and batching as “deferred” no longer applies: the doc now describes both.</p>
+  </div>
+
+  <h4>The bridge</h4>
+  <div class="callout rust">
+    <span class="k">The sync→async bridge, step by step</span>
+    <ul>
+      <li>The async reader builds the oracle in <code>snap_oracle</code> (reader.rs): a snapshot of <code>pool.snap_peers()</code>, <code>Handle::current()</code> (a cloneable handle to the engine's runtime), the quality sink and the read stats. <code>PoolOracle::new</code> also calls <code>Operation::current()</code>. That task-local is visible only while the request's future is being polled, and task-locals do not reach <code>spawn_blocking</code> threads, so it is captured here, eagerly.</li>
+      <li>The reader runs revm through <code>request::blocking(move || …)</code> (<a href="#stop-12">Stop 12</a>), on a thread from tokio's blocking pool.</li>
+      <li>revm calls <code>fetch_account</code>, <code>fetch_storage</code> and the rest synchronously. Each one ends in <code>wait</code>.</li>
+      <li><code>wait</code> calls <code>self.handle.block_on(…)</code>. The blocking thread polls that future itself and parks between polls; the sockets and timers it waits on are driven by the runtime's drivers and the peer connection tasks on the worker threads.</li>
+      <li><strong>Why not on a runtime worker?</strong> <code>Handle::block_on</code> panics when it is called from inside an async execution context. Even if it did not, a worker parked in it would stall every task queued on that worker.</li>
+    </ul>
+  </div>
+  <x-code src="myotis-net/src/el/evm.rs" from="900" to="907"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async traits-generics</x-tags> <code>future: impl std::future::Future&lt;Output = T&gt;</code> is argument-position <code>impl Trait</code>: an anonymous generic parameter, so each call site gets its own monomorphized <code>wait</code>. The async block captures <code>future</code> and <code>self</code> by reference or move as needed.</li>
+    <li><x-tags>async lifetimes</x-tags> <strong><code>block_on</code> needs neither <code>Send</code> nor <code>'static</code>.</strong> Its signature is just <code>fn block_on&lt;F: Future&gt;(&amp;self, future: F) -&gt; F::Output</code>, and it returns only when the future is done. So the futures handed to <code>wait</code> may borrow <code>self</code> and locals of the calling function. <code>tokio::spawn</code> would demand <code>'static</code>, because a spawned task may outlive its spawner.</li>
+    <li><x-tags>error-handling</x-tags> <code>op.wait(future)</code> (request.rs) re-checks the request's deadline and cancel flags every 10 ms while it polls <code>future</code>, and returns <code>Err(String)</code> when they fire. <code>map_err(|reason| OracleError::Cancelled { reason })</code> turns that into the oracle's error type, which revm propagates like any other state error.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/evm.rs" from="1005" to="1054"></x-code>
+  <ul class="concepts">
+    <li><x-tags>borrowing interior-mutability</x-tags> <strong>Memo first, no lock across I/O.</strong> In <code>if let Some(cached) = self.leaf_memo.lock().unwrap().get(&amp;address)</code>, the temporary <code>MutexGuard</code> lives until the end of the <code>if let</code>, and <code>cached</code> borrows through it. <code>cached.clone()</code> copies the value out before the guard drops. The network fetch below runs with no lock held; a second fetch of the same address in the same call is possible, and harmless.</li>
+    <li><x-tags>borrowing async</x-tags> <code>let peers = &amp;peers;</code> shadows the owned <code>Vec</code> with a reference. The async block given to <code>wait</code> is not <code>move</code>, so it borrows <code>peers</code>, <code>asked</code>, <code>quality</code>, <code>state_root</code> and <code>self</code>. That is legal because of the <code>block_on</code> property above.</li>
+    <li><x-tags>ownership async smart-pointers</x-tags> The closure <code>|peer: Arc&lt;ManagedPeer&gt;| async move { … }</code> is the race's per-attempt factory. <code>hedged_race</code> (reader.rs, <a href="#stop-14">Stop 14</a>) starts the first peer and adds another every <code>HEDGE_DELAY</code> (3 s) without an answer, up to three in flight; the first answer the <code>accept</code> closure approves wins. Each attempt gets its own <code>Arc</code> clone, and <code>async move</code> moves it, the <code>&amp;[u8; 32]</code> reference and a copy of <code>address</code> into the future.</li>
+    <li><x-tags>enums-patterns</x-tags> <code>out.accepted.map(|(_, outcome)| match outcome { … })</code> yields an <code>Option&lt;Option&lt;AccountLeaf&gt;&gt;</code>: the outer <code>None</code> means no peer proved anything (<code>StateUnavailable</code>), <code>Some(None)</code> means the account is proven absent. The memo stores the inner <code>Option</code>, so a proven absence is cached too.</li>
+    <li><x-tags>methods</x-tags> <code>Self::record_race(&amp;quality, peers, &amp;out, self.finalized)</code> is an associated function with no <code>self</code> parameter. It takes exactly the parts it needs, so it can be called while other parts of <code>self</code> are borrowed. It feeds the pool's reputation sink: the winner served, each miss failed (witnessed when someone else served), each loser the winner outpaced. On a finalized-root call, a miss caused by the peer not holding that old root is excused.</li>
+  </ul>
+  <p class="code-note"><x-tags>concurrency domain</x-tags> <strong>A per-call ask order.</strong> <code>order</code>, <code>lost</code> and <code>silence_reported</code> are <code>Mutex&lt;Vec&lt;…&gt;&gt;</code> fields indexed by peer id. After each race, <code>learn_order</code> moves the winner to the front and the losers to the back (<code>next_order</code>), so a dead first peer costs one hedge delay per call instead of one per state read. The helpers are pure functions over slices, which is why they can be unit-tested without peers. Two small idioms: <code>first_time</code> uses <code>!std::mem::replace(flag, true)</code>, a non-atomic “get and set”, and <code>demoted</code> uses <code>Iterator::partition</code> to split <code>&amp;usize</code> items into two <code>Vec&lt;usize&gt;</code>s (a <code>Vec&lt;T&gt;</code> of a <code>Copy</code> type can be extended from <code>&amp;T</code> items).</p>
+
+  <h4>Timing the waits</h4>
+  <x-code src="myotis-net/src/el/evm.rs" from="764" to="776"></x-code>
+  <p class="code-note"><x-tags>lifetimes ownership</x-tags> <strong>An RAII guard that borrows.</strong> <code>WireTimer&lt;'a&gt;</code> holds <code>&amp;'a AtomicU64</code>, a reference into the oracle's <code>WireCounters</code>, so the compiler guarantees the timer cannot outlive the counter it adds to. <code>impl Drop for WireTimer&lt;'_&gt;</code> uses the anonymous lifetime because the impl does not need to name it. Each fetch starts with <code>let _timer = self.wire.serial();</code>: the name <code>_timer</code> keeps the guard alive to the end of the function, and its <code>drop</code> adds the elapsed time however the function leaves, including an early <code>?</code> return. <code>Relaxed</code> ordering is enough for counters that nothing else synchronizes on. <code>u64::try_from(…).unwrap_or(u64::MAX)</code> saturates a <code>u128</code> nanosecond count instead of panicking.</p>
+
+  <h4>The prefetch wave</h4>
+  <p class="code-note"><x-tags>domain</x-tags> The executor's convergence loop runs discovery passes: an EVM run that collects the accounts, slots and code it reached, then one prefetch wave that fetches them all at once (<code>prefetch_batch</code>), so the real runs mostly hit the caches. The account items are cut into chunks of 64; each chunk is pinned to one peer per attempt, with up to three attempts across peers; every wire request needs one of 48 semaphore permits; and the whole wave is bounded at 30 s. Failures are silent per item, because the serial per-item path re-fetches whatever is missing. A chunk's first ask goes to a peer that has not lost a race or gone silent in this call (<code>wave_ladder</code>, <code>wave_peer</code>). <code>keep_discovering</code> bounds how long the loop may keep starting such passes (15 s, <code>DISCOVERY_TIME_BUDGET</code>).</p>
+  <x-code src="myotis-net/src/el/evm.rs" from="527" to="554"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async</x-tags> <strong>Polling one future across loop iterations.</strong> <code>tokio::pin!(request)</code> pins the request future on the stack. A future that has been polled may hold pointers into itself and must not move again; pinning makes <code>&amp;mut request</code> pollable, repeatedly, without moving it. Each <code>select!</code> races the request against a sleep. When the sleep wins, the request is <em>not</em> dropped (it lives outside the loop); the loop just re-evaluates the silence.</li>
+    <li><x-tags>domain concurrency</x-tags> <strong>Silence, not age.</strong> <code>sent</code> is an <code>Arc&lt;OnceLock&lt;Instant&gt;&gt;</code> that the peer code fills when the request frame is actually written (<code>scope_send_marker</code>, a task-local scope in peer.rs). The clock starts at the later of that send and the peer's last delivered response. Only after <code>WAVE_SILENCE_DEADLINE</code> (6 s) of complete silence does the function return <code>Err(Silent { … })</code>, dropping the request. A request that has not gone out yet is never cut, because dropping it inside the shared writer would tear the connection for every request on it.</li>
+    <li><x-tags>traits-generics iterators-closures</x-tags> The two <code>impl Fn</code> parameters are callbacks that the wave fills with <code>|| peer.last_response()</code> and <code>|since| self.link_heard_after(&amp;peer, since)</code>. <code>link_proven</code> records whether some <em>other</em> peer of the call delivered during this silence, which is the evidence that the silence was the peer's and not our own link.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/evm.rs" from="1224" to="1250"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async smart-pointers</x-tags> The per-future clone pattern: each <code>async move</code> future gets its own <code>Arc</code> clones (<code>peer</code>, <code>sem</code>), its own clone of <code>leaf</code> and its own <code>position</code> array. <code>join_all</code> polls them all on the one blocking thread that called <code>block_on</code>, like <code>CompletableFuture.allOf</code> without a thread pool.</li>
+    <li><x-tags>lifetimes async</x-tags> These futures still <em>borrow</em> <code>state_root</code>, <code>self</code> and the cache sinks from the enclosing frame (the <code>move</code> copies the references in). That is fine because they are never spawned, only driven to completion before <code>prefetch_batch</code> returns.</li>
+    <li><x-tags>ownership concurrency</x-tags> <code>let Ok(_permit) = sem.acquire().await else { … };</code> keeps the permit until the end of the block, after the request. Binding it to <code>_</code> instead would drop it at once, and the 48-request limit would do nothing. A closed semaphore fails the item; it never bypasses the bound.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/evm.rs" from="1406" to="1412"></x-code>
+  <p class="code-note"><x-tags>async</x-tags> Two nested cancellation layers: a 30 s <code>timeout</code> on the warm-up wave, inside <code>wait</code>'s request-level deadline. Both results are ignored on purpose (<code>let _ =</code>), because warm-up is best-effort and whatever landed in the caches stays there. When the timeout fires, the <code>wave</code> future is dropped, and with it every chunk future and every in-flight request; the peer's pending-request guard discards late answers.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/logindex.rs" kind="library">
+  <p class="purpose">The pure state behind the opt-in, scoped <code>eth_getLogs</code>. It holds a host-supplied watch list, per-entry <strong>contiguous coverage</strong>, a <code>BTreeMap</code> log store keyed by <code>(block, log_index)</code>, and the backfill walk's trust cursor. Since September a watch entry can be an <strong>address</strong> (every log the contract emits) or a <strong>topic value</strong> (#673: every log, from any emitter, that carries the value at one of the entry's topic positions, 1 to 3; that is how a token transfer names a wallet). The file also provides filter matching, an explicit unwatch, an atomically written, versioned binary snapshot (<code>MLIX</code> v2, or v3 when a topic entry exists) with portable import, export and merge, and a finality-claim sidecar. It does no networking and no verification: callers feed only logs that passed the header and <code>receiptsRoot</code> checks. The appender, the walker and the checkpoints live in reader.rs.</p>
+  <x-code src="myotis-net/src/el/logindex.rs" from="1" to="14"></x-code>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>20–177</td><td><code>WatchKey</code> (address or topic), <code>TOPIC_POSITIONS</code>, <code>WatchEntry</code> with <code>selects</code> (the one indexing rule), <code>same_restriction</code>, <code>answers</code>.</td></tr>
+      <tr><td>179–348</td><td><code>ChainTag</code>; <code>LogIndexConfig</code>: <code>watches</code>, <code>union_with</code> (a re-pushed preset extends, never replaces), <code>invalid</code>, the FNV-1a <code>fingerprint</code> (names, pacing and the pause switch excluded).</td></tr>
+      <tr><td>350–522</td><td><code>StoredLog</code>, <code>Coverage</code> (contiguous extends only), <code>InvalidWatchList</code>, <code>CoverageGap</code>, <code>LogFilter</code> (<code>matches</code>, <code>pins</code>), <code>QueryError</code>.</td></tr>
+      <tr><td>524–985</td><td><code>LogIndex</code>: <code>new</code>, <code>adopt_config</code>, <strong><code>unwatch</code></strong>, the runtime setters, <strong><code>append_block</code></strong>, <code>backfill_block</code>, <code>rewind_above</code> (reorgs), <strong><code>query</code></strong>, the bloom prefilter, <code>walk_target</code> / <code>backfill_complete</code>.</td></tr>
+      <tr><td>987–1131</td><td>Durability: <code>next_tmp_path</code>, <code>write_atomic</code>; the frame constants (v1 legacy, v2, v3); <code>fnv64</code>; the <code>Cursor&lt;'a&gt;</code> reader.</td></tr>
+      <tr><td>1133–1424</td><td><code>serialize_impl</code> (clamped at finality, optional name stripping); <code>deserialize</code> (v1, v2, v3; coverage re-paired by key); portable import; load and persist.</td></tr>
+      <tr><td>1426–1552</td><td>The finality claim: <code>SnapshotId</code>, an 80-byte <code>MLXF</code> sidecar that counts only beside the exact file it was written for.</td></tr>
+      <tr><td>1554–1766</td><td><code>MergeError</code>; canonical <code>merge</code> of imported snapshots.</td></tr>
+      <tr><td>1768–1919</td><td><code>walk_resumable</code>, the hardened <code>parse_v2</code> and <code>parse_body</code>.</td></tr>
+      <tr><td>1921–3718</td><td>Three test modules, 67 tests: a Python-generated frame pin, coverage honesty, corruption and bit flips, concurrent writers, merge, unwatch, topic entries, the bloom prefilter, finality claims.</td></tr>
+    </tbody>
+  </table></div>
+  <x-code src="myotis-net/src/el/logindex.rs" from="119" to="131"></x-code>
+  <p class="code-note"><x-tags>enums-patterns borrowing</x-tags> <strong>One rule for indexing, scanning and merging.</strong> <code>match self.key</code> reads a field through <code>&amp;self</code>, and the arms bind <code>a</code> and <code>v</code> <em>by value</em>. Moving out of a borrowed place is normally forbidden, but <code>WatchKey</code>'s arrays are <code>Copy</code>, so the bytes are simply copied. <code>topics.get(p as usize) == Some(&amp;v)</code> compares two <code>Option&lt;&amp;[u8; 32]&gt;</code>s without indexing (no panic past the log's last topic). An empty <code>topic0s</code> means “any event”.</p>
+  <x-code src="myotis-net/src/el/logindex.rs" from="710" to="748"></x-code>
+  <ul class="concepts">
+    <li><x-tags>error-handling domain</x-tags> <strong>All-or-nothing.</strong> The first loop only checks: a gap against <em>any</em> affected entry returns <code>Err</code> before anything changed. Only then are logs stored and spans extended. That is why the second <code>extend_up</code> can ignore its result with <code>let _ =</code>. An empty <code>logs</code> vector still advances coverage, which is what makes an empty answer honest.</li>
+    <li><x-tags>ownership</x-tags> <code>for log in logs</code> consumes the <code>Vec</code> by value, so each <code>StoredLog</code> (with its topics and data) is <em>moved</em> into the map, never copied. A mislabeled log is dropped, not stored under its own number.</li>
+    <li><x-tags>borrowing</x-tags> <strong>Disjoint field borrows</strong>: line 736 zips <code>self.config.watch.iter()</code> (shared) with <code>self.coverage.iter_mut()</code> (mutable) at the same time. The borrow checker allows it because they are different fields of <code>self</code>.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/logindex.rs" from="818" to="870"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain error-handling</x-tags> <strong>Coverage honesty in code.</strong> A range that is not fully indexed is <code>Err(OutOfCoverage { key, covered })</code>, never <code>[]</code>. A wallet would read <code>[]</code> as “no events” and silently corrupt event-sourced state such as a commitment tree. It is the same principle as the #314 state-override fix: a parameter is applied or refused.</li>
+    <li><x-tags>domain</x-tags> Two ways to answer: a topic entry whose value the filter pins at one of its positions answers the whole filter, whatever addresses the filter lists; otherwise every address the filter names must be an address entry that covers the range. Either way <code>scan</code> returns every stored log the filter matches, whichever entry stored it.</li>
+    <li><x-tags>enums-patterns</x-tags> <code>let WatchKey::Topic(v) = w.key else { continue; };</code> is let-else with an enum pattern: skip address entries in this loop. <code>Some(t @ QueryError::OutOfCoverage { .. }) =&gt; t</code> binds the whole matched value to <code>t</code> while testing its shape.</li>
+    <li><x-tags>iterators-closures borrowing</x-tags> <code>address_refusal</code> is a closure that borrows <code>topic_refusal</code> and clones it when called. <code>.map_err(address_refusal)?</code> passes the closure itself where a function is expected. The rule it encodes: a topic entry's “not covered yet” beats an address refusal, because the caller can wait it out.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/logindex.rs" from="872" to="890"></x-code>
+  <p class="code-note"><x-tags>iterators-closures ownership</x-tags> Only the part of the range at or after the entry's <code>from_block</code> must be covered; below it the config itself asserts there are no logs (a deployment block, a wallet's creation block). <code>self.logs.range((from, 0)..=(to, u32::MAX))</code>: tuple keys compare lexicographically, so this is a <code>TreeMap.subMap</code> scan with an inclusive per-block upper bound. <code>.cloned()</code> returns owned logs. A <code>Vec&lt;&amp;StoredLog&gt;</code> would keep the index borrowed, and in the reader locked, for as long as the caller holds the answer.</p>
+
+  <h4>Unwatch</h4>
+  <x-code src="myotis-net/src/el/logindex.rs" from="615" to="640"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership</x-tags> <strong>Rebuilding two parallel vectors in place.</strong> You cannot move a <code>Vec</code> out of a field you only reach through <code>&amp;mut self</code>. <code>std::mem::take</code> swaps an empty <code>Vec</code> in and hands back the full one. The loop then moves each <code>WatchEntry</code> either into <code>dropped</code> or back into <code>self.config.watch</code>, keeping <code>coverage</code> parallel. Nothing is cloned.</li>
+    <li><x-tags>borrowing</x-tags> <code>let (watch, coverage) = (&amp;self.config.watch, &amp;self.coverage);</code> takes shared borrows of two fields, and <code>self.logs.retain(…)</code> then borrows a third field mutably. Disjoint fields, so this compiles. (In edition 2021 a closure that wrote <code>self.config.watch</code> would also capture just that field; the local names make the split visible.)</li>
+    <li><x-tags>domain</x-tags> A log stays when no dropped entry selected it, or when a surviving entry both selects it and covers its block. A transfer from a watched wallet on a watched token belongs to both entries and outlives either one's unwatch. The fingerprint changes with the entries, which makes any backfill batch computed against the old list discard itself.</li>
+  </ul>
+
+  <h4>The snapshot file</h4>
+  <x-code src="myotis-net/src/el/logindex.rs" from="1020" to="1049"></x-code>
+  <p class="code-note"><x-tags>error-handling concurrency</x-tags> <code>let write = || -&gt; std::io::Result&lt;()&gt; { … };</code> is a closure with its own return type, so <code>?</code> works inside it, and one cleanup path covers all three failure points. The temp file is removed on any failure: the likely trigger is a full disk, and a leftover temp at snapshot size keeps it full. The temp name comes from <code>next_tmp_path</code>, which appends the pid and a <code>static SEQ: AtomicU64</code> counter. A <code>static</code> inside a function is still one process-wide value. Per-call names became necessary once the fsync moved out from under the index lock: two writers in one process would otherwise share a temp file, and one could truncate the other's or write into the renamed live file.</p>
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments</span>
+    <p>The <code>write_atomic</code> doc (lines 1015–1016) says it “is not a repo-wide primitive”. Its own module does use it alone for index files, but <code>myotis-engine/src/host.rs</code> (line 624) also calls it for a JSON file. The <code>SnapshotId</code> doc (line 1442) speaks of “one v2 snapshot file”; <code>of_frame</code> accepts v3 frames as well.</p>
+  </div>
+  <x-code src="myotis-net/src/el/logindex.rs" from="1102" to="1131"></x-code>
+  <p class="code-note"><x-tags>lifetimes traits-generics</x-tags> Another <code>Cursor&lt;'a&gt;</code>, like the consensus snapshot's <code>Reader&lt;'a&gt;</code> in <a href="#stop-06">Stop 6</a>. The explicit <code>'a</code> ties every returned slice to the <em>input bytes</em>, not to <code>&amp;mut self</code>, so the parser can keep slices while it keeps advancing the cursor. <code>fn arr&lt;const N: usize&gt;(&amp;mut self) -&gt; Option&lt;[u8; N]&gt;</code> uses <strong>const generics</strong>: <code>c.arr::&lt;32&gt;()</code> returns a <code>[u8; 32]</code>, through the standard <code>TryFrom&lt;&amp;[u8]&gt; for [u8; N]</code>. Every read is checked (<code>checked_add</code>, <code>get</code>), so a truncated file yields <code>None</code>, never a panic. <code>parse_v2</code> also caps its pre-allocations (<code>n_watch.min(1024)</code>), so a hostile count cannot make it allocate gigabytes.</p>
+
+  <h4>Merge</h4>
+  <x-code src="myotis-net/src/el/logindex.rs" from="1747" to="1764"></x-code>
+  <p class="code-note"><x-tags>ownership</x-tags> <code>for s in &amp;mut sources</code> holds each source by <code>&amp;mut</code>, and <code>std::mem::take(&amp;mut s.logs)</code> moves its whole map out, leaving an empty one. Iterating <code>taken</code> by value then <em>moves</em> each log into the output, so a store that may be gigabytes is never cloned. <code>Self { coverage, logs, cursor, ..ix }</code> is struct-update syntax: it moves the remaining field, <code>config</code>, out of <code>ix</code>, which is allowed because <code>LogIndex</code> has no <code>Drop</code> impl. The merged index is canonical (every span ends at one global high, the cursor at the deepest resumable edge), because that is the only shape the appender and walker can resume from.</p>
+  <details class="deep"><summary>Deeper: finality claims and resumable walks</summary>
+    <p>A checkpoint is clamped at finality: coverage above it is only verifiable against an in-memory tail record that does not survive a restart, so <code>serialize_clamped</code> leaves it out of the file. But a restart restores the beacon store from a snapshot that may be hours old, so the first finality after a start can trail the checkpoint, and the file alone cannot say its top was final. The sidecar <code>&lt;index&gt;.final</code> records, for one exact file (<code>SnapshotId</code>: chain tag, fingerprint, payload checksum), the finality its writer clamped it at. It never travels with an exported file.</p>
+    <p><code>walk_resumable</code> states when the single descending walk can still finish every entry from a cursor: each present span is complete or has its low at or below the cursor, and each absent span belongs to an entry starting above the global high. When that fails, <code>adopt_config</code>, <code>unwatch</code> and <code>merge</code> drop the cursor and the appender re-seeds it at the top. The doc records that getting this backwards once wedged the walker.</p>
+  </details>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/activity.rs" kind="library">
+  <p class="purpose">New since September (#691). A host watches up to 256 addresses; the follower in reader.rs (<code>ensure_activity_follower</code>) keeps the last 256 verified headers as one contiguous, parent-linked run ending at the anchored head. This module is that state and the report built from it, with no I/O. It reports two kinds of coverage. <strong>Log</strong>: each header's <code>logsBloom</code> is probed for the address as a log's emitter and as an indexed topic; a miss is definitive, a hit means “maybe”. <strong>Account</strong>: the block's access list (BAL, EIP-7928), fetched over eth/71 or snap/2 and verified against the header's <code>blockAccessListHash</code>, lists every account the block changed with its post-block values. A host then re-proves an address's state only when a block touched it. On top of that, an account proven once at block N is <em>followed</em>: each verified BAL carries its values forward, so a read near the head can be answered without a new proof.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–31</td><td>Module doc: the two kinds of coverage, and coverage honesty (every block is covered or listed as a gap, per kind).</td></tr>
+      <tr><td>33–63</td><td><code>WINDOW</code> (256), <code>FOLLOW_MARGIN</code> (8), <code>FOLLOW_MAX_LAG</code> (2), <code>MAX_WATCHED</code> (256).</td></tr>
+      <tr><td>65–165</td><td><code>BlockRecord</code>, <code>AccountValues</code>, <code>Followed</code>, <code>FollowedAnswer</code>, the <code>Carry</code> error and <strong><code>carry</code></strong>.</td></tr>
+      <tr><td>167–234</td><td><code>Touch</code>, <code>Via</code>, <code>ActivityReport</code>; <code>ActivityState</code>'s four fields.</td></tr>
+      <tr><td>236–330</td><td><code>apply</code> (additive, bounded), accessors, <strong><code>install</code></strong> (link, replace, trim).</td></tr>
+      <tr><td>332–504</td><td><code>bals_wanted</code>, <code>set_account</code>, <code>seed</code>, <strong><code>advance_followed</code></strong>, <code>followed_answer</code>, small setters.</td></tr>
+      <tr><td>506–605</td><td><strong><code>report</code></strong>, <code>gaps_of</code>, the bloom <code>probes</code>.</td></tr>
+      <tr><td>607–1213</td><td>Tests: gaps, reorgs, trimming, BAL coverage, following through BALs, ancestry.</td></tr>
+    </tbody>
+  </table></div>
+  <x-code src="myotis-net/src/el/activity.rs" from="136" to="165"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns borrowing</x-tags> <code>let Some(changed) = &amp;r.account else { … };</code> matches a pattern against a <em>reference</em>. Rust's default binding modes then bind <code>changed</code> as <code>&amp;Box&lt;[[u8; 20]]&gt;</code>, a borrow, so nothing moves out of the record. <code>binary_search</code> works through the box because the list is kept sorted.</li>
+    <li><x-tags>error-handling</x-tags> <code>Result&lt;(), Carry&gt;</code> with a two-variant error: <code>NotYet</code> (the BAL may still arrive; stop here for now) and <code>Never</code> (this account cannot be carried through this block; go back to a proof). <code>.map_err(|_| Carry::Never)?</code> converts the <code>binary_search</code> miss into it.</li>
+    <li><x-tags>domain</x-tags> A block that wrote the account's storage is <code>Never</code>: the account's storage root changed to a value the BAL does not carry, so a carried state would be wrong. The last statement recomputes <code>exists</code> by EIP-161: an account with zero nonce, zero balance, no code and an empty storage trie is not in the state.</li>
+    <li><x-tags>ownership</x-tags> <code>values: &amp;mut AccountValues</code> is an out-parameter. The callers clone first (<code>let mut next = f.values.clone();</code>) and keep the clone only on <code>Ok</code>, so a failed carry leaves the original untouched.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/activity.rs" from="296" to="330"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership</x-tags> <code>segment: Vec&lt;BlockRecord&gt;</code> is taken by value: the reader hands the records over. <code>for mut r in segment</code> moves each one out, and <code>mut</code> on the binding lets the loop edit it before it is inserted.</li>
+    <li><x-tags>ownership iterators-closures</x-tags> <strong><code>BTreeMap::split_off(&amp;k)</code></strong> moves every entry with key ≥ <code>k</code> into a new map and returns it, like Java's <code>tailMap</code> but transferring ownership. Here it pulls out the records the new segment replaces. When nothing links, <code>std::mem::take</code> takes them all. The last line, <code>self.records = self.records.split_off(&amp;floor)</code>, keeps the upper part and drops the old map (the lower part) on assignment.</li>
+    <li><x-tags>ownership</x-tags> <strong>A partial move.</strong> <code>old</code> is an owned <code>BlockRecord</code>. <code>r.account = old.account;</code> and <code>r.watched_changes = old.watched_changes;</code> move two fields out of it, and <code>old.bal_undecodable</code> is still readable afterwards because <code>bool</code> is <code>Copy</code>. Rust tracks moves per field; the rest of <code>old</code> is dropped at the end of the <code>if let</code>. This keeps an already verified BAL when the same block (same hash) is fetched again.</li>
+    <li><x-tags>borrowing</x-tags> <code>segment.windows(2).all(…)</code> checks the parent links pair by pair; a broken segment is dropped whole. <code>wrapping_add</code> avoids a debug-build overflow panic on a <code>u64::MAX</code> block number.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/activity.rs" from="399" to="430"></x-code>
+  <ul class="concepts">
+    <li><x-tags>borrowing</x-tags> <code>let records = &amp;self.records;</code> then <code>self.followed.retain(|address, f| …)</code>: a shared borrow of one field inside a closure while <code>retain</code> holds the other field mutably. <code>retain</code> hands each entry as <code>&amp;mut Followed</code>, and <code>*f = Followed { … }</code> overwrites it in place.</li>
+    <li><x-tags>iterators-closures</x-tags> The <code>return true</code> and <code>return false</code> statements return from the <em>closure</em> (keep or drop this entry), not from <code>advance_followed</code>. A followed account stops <code>FOLLOW_MARGIN</code> blocks below the top; the blocks above are applied per answer in <code>followed_answer</code>, so a shallow reorg replaces them without losing the account.</li>
+    <li><x-tags>domain</x-tags> The soundness argument, from <code>followed_answer</code>'s doc: the account was proven at a block the run holds under the proof's hash, the run is parent-linked to a block the beacon anchor vouches for, and every block in between has a BAL that hashes to its header's commitment. A BAL lists every account a block touched, so an account it does not list is unchanged.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/activity.rs" from="514" to="541"></x-code>
+  <p class="code-note"><x-tags>traits-generics borrowing domain</x-tags> <code>is_ancestor: impl Fn(u64, &amp;[u8; 32]) -&gt; bool</code> lets the reader say which blocks it knows lead to the current head, without this module knowing about the anchor. Kept blocks above the highest vouched one may be on a fork the head has left, so they count as a gap until the follower re-links the run. <code>kept: Vec&lt;&amp;BlockRecord&gt;</code> borrows into <code>self.records</code> for the rest of the function; the report it builds copies out what it needs (numbers, hashes, addresses), so the returned <code>ActivityReport</code> owns its data. <code>Box&lt;LogsBloom&gt;</code> in each record keeps the 256-byte bloom on the heap, so moving a record moves a pointer, and <code>Box&lt;[[u8; 20]]&gt;</code> (from <code>into_boxed_slice</code>) is a fixed-size heap array with no spare capacity.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/feecache.rs" kind="library">
+  <p class="purpose">New since September (#510, #532). A per-head memo for the verified fee reads, <code>eth_gasPrice</code> / <code>eth_maxPriorityFeePerGas</code> (<code>FeeEstimate</code>) and <code>eth_feeHistory</code> (<code>FeeHistory</code>), so a wallet's fee poll is answered from memory instead of re-downloading and re-verifying blocks on the request path. The soundness argument is short: every cached value is a pure function of the anchored window top <code>(number, hash)</code> it was computed against, plus the request shape. While that top is unchanged the value is <code>Fresh</code>. After the head moves it is <code>Stale</code> for at most 5 blocks and 75 s while the reader's follower task refreshes it; the base fee moves at most 12.5% per block, so a few-blocks-old fee is a better answer than a timeout. A reorg (same number, other hash) or a head that moved backwards is a <code>Miss</code>, never stale. The module is pure state; the reader holds it in a <code>std::sync::Mutex&lt;FeeCache&gt;</code> and owns the computes and the follower.</p>
+  <x-code src="myotis-net/src/el/feecache.rs" from="101" to="137"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics</x-tags> <code>Slot&lt;T&gt;</code> is generic over the cached value. Its <code>Default</code> is written by hand (lines 94–98) instead of derived, because <code>#[derive(Default)]</code> on a generic struct adds a <code>T: Default</code> bound that <code>FeeEstimate</code> need not meet. The lookup methods sit in <code>impl&lt;T: Clone&gt; Slot&lt;T&gt;</code>: the bound applies only where a value is cloned out.</li>
+    <li><x-tags>enums-patterns borrowing</x-tags> <code>let Some((at_head, value, at)) = &amp;self.cached else</code> destructures a tuple behind a reference, so all three names are borrows; <code>*at_head == head</code> dereferences to compare. <code>Lookup&lt;T&gt;</code> is the generic result: <code>Fresh(T)</code>, <code>Stale(T, Staleness)</code> or <code>Miss</code>.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>head.0.checked_sub(at_head.0).filter(|&amp;b| b &gt; 0)</code> is “strictly older” as an <code>Option</code> chain: <code>None</code> when the head went backwards (underflow) or did not move. <code>|&amp;b|</code> destructures the <code>&amp;u64</code> that <code>filter</code> passes.</li>
+    <li><x-tags>domain</x-tags> <code>store</code> drops a late compute for a top that is no longer current when the cached value is for a higher block or for the current top. A head that really moved backwards (a re-anchor, a reorg to a shorter chain) is current, so its value is stored.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/feecache.rs" from="296" to="325"></x-code>
+  <ul class="concepts">
+    <li><x-tags>borrowing</x-tags> <strong>Clone the key so the borrow ends.</strong> <code>self.histories.iter().min_by_key(…)</code> yields references into the map. <code>.map(|(k, _)| k.clone())</code> turns the victim's key into an owned value, which ends the shared borrow, so <code>self.histories.remove(&amp;victim)</code> can borrow the map mutably on the next line.</li>
+    <li><x-tags>iterators-closures</x-tags> The eviction key is a tuple <code>(bool, bool, Instant)</code>; tuples order lexicographically and <code>false &lt; true</code>. So the victim is a shape with no build in flight, then a pinned shape before a head-following one, then the least recently requested. <code>e.lock.try_lock().is_err()</code> probes whether the tokio mutex is held; the guard it would return is dropped at once.</li>
+    <li><x-tags>concurrency async smart-pointers</x-tags> <strong>Two kinds of lock.</strong> The whole <code>FeeCache</code> sits under one brief-hold <code>std</code> mutex that is never held across an <code>.await</code>. Each history shape also has an <code>Arc&lt;tokio::sync::Mutex&lt;()&gt;&gt;</code>: a lock that protects no data, used as a single-flight gate for that shape's network compute. The function returns a clone of the <code>Arc</code>, so the caller can await the gate after the <code>std</code> guard is gone.</li>
+  </ul>
+  <p class="code-note"><x-tags>macros traits-generics</x-tags> Two more details. <code>HistoryShape</code> derives <code>Eq</code> and <code>Hash</code> to be a map key, which <code>f64</code> cannot be (NaN is not equal to itself), so the percentiles are stored as their bit patterns via <code>f64::to_bits</code>. And line 60, <code>const _: () = assert!(BLOCKS_KEEP as u64 &gt; crate::el::reader::FEE_HISTORY_MAX_BLOCKS + STALE_MAX_BLOCKS);</code>, is a compile-time assertion across modules (16 &gt; 10 + 5): raising the <code>eth_feeHistory</code> clamp without growing the memo fails the build.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/tx.rs" kind="library" twin="EthTxDecoder / VerifiedRpcBackend">
+  <p class="purpose">Pure decoders over raw, consensus-encoded transactions. <code>effective_tip</code> reads just the fee fields, for gas-price suggestions. <code>decode_summary</code> returns every transaction field a receipt or <code>eth_getTransactionByHash</code> needs, including <strong>sender recovery</strong>: it rebuilds the signing preimage from the raw item bytes, for typed transactions and for legacy and EIP-155. New since September is the <code>eth_sendRawTransaction</code> gate (#360): <code>decode_sendable</code> accepts only bytes that are one strictly encoded transaction of a type this node relays, with signature values a geth peer accepts, and <code>check_chain</code> (#665) refuses a transaction signed for another chain. <code>effective_gas_price</code> and <code>contract_address</code> follow the receipt conventions.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–70</td><td><code>effective_tip</code> (saturating <code>u128</code> math) and <code>scalar_u128</code> (a <code>fold</code> over big-endian bytes).</td></tr>
+      <tr><td>72–188</td><td><code>TxSummary</code>; <code>decode_summary</code> for typed transactions 0x01–0x04; <code>typed_layout</code>, the one table of field counts (11/12/14/13) and indexes.</td></tr>
+      <tr><td>190–243</td><td><code>decode_summary_legacy</code> (v = 27/28, or EIP-155 with chainId = (v − 35) / 2).</td></tr>
+      <tr><td>245–364</td><td>The send gate: <code>BLOB_SEND_REFUSAL</code>, the secp256k1 constants, <code>decode_sendable</code>, <code>check_chain</code>.</td></tr>
+      <tr><td>366–399</td><td>Access list and EIP-7702 authorization list shapes, as geth decodes them.</td></tr>
+      <tr><td>401–488</td><td>Helpers: <code>to_field</code>, <code>recover_sender</code>, padding; <code>effective_gas_price</code>, <code>contract_address</code>.</td></tr>
+      <tr><td>490–1131</td><td>Tests: the EIP-155 spec vector, signed round trips, every refusal of the send gate in its exact words.</td></tr>
+    </tbody>
+  </table></div>
+  <x-code src="myotis-net/src/el/tx.rs" from="118" to="156"></x-code>
+  <ul class="concepts">
+    <li><x-tags>borrowing bytes-strings</x-tags> <code>let payload = &amp;raw[1..];</code> borrows the bytes after the type byte; nothing is copied. <code>rlp::raw_list_items(payload)</code> returns the raw encoded bytes of each list item, and the signing preimage is <code>type ‖ rlp(all fields except the last three)</code>, rebuilt by concatenating those raw slices. Because the slices are the canonical wire bytes, re-wrapping them is byte-exact.</li>
+    <li><x-tags>error-handling</x-tags> Every step uses <code>?</code> on an <code>Option</code>: <code>raws.get(..expected - 3)?</code> slices without the panic that <code>&amp;raws[..n]</code> could raise, and <code>.as_u64().ok()?</code> turns a <code>Result</code> into an <code>Option</code> first. Any malformed layout returns <code>None</code>, the Java decoder's <code>null</code>.</li>
+    <li><x-tags>ownership</x-tags> <code>.as_bytes().ok()?.to_vec()</code> copies the calldata out of the borrowed buffer. <code>TxSummary</code> therefore owns its data and needs no lifetime parameter, at the cost of one copy.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/tx.rs" from="293" to="345"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns</x-tags> <code>match first</code> with a range arm (<code>0xc0..=0xff</code>), a literal arm, and a nested <code>match</code> whose arms use a guard (<code>None if first &lt;= 0x7f</code>). The refusals are geth's own words, served under the permanent <code>-32602</code>, because no retry changes the bytes.</li>
+    <li><x-tags>iterators-closures borrowing</x-tags> <code>is_list</code> and <code>malformed</code> are small local closures; <code>malformed</code> borrows <code>kind</code> and is passed by name to <code>map_err</code> and <code>ok_or_else</code>. The canonical check is one <code>all</code> over <code>enumerate()</code>, with a <code>match</code> on each field's <code>as_bytes()</code> result: lists only where lists belong, and no integer with a leading zero byte.</li>
+    <li><x-tags>domain</x-tags> <strong>Why strict.</strong> Only a canonical encoding makes <code>keccak256(raw)</code> the hash peers compute for the transaction, so the hash the node answers is the transaction's own. A malformed access list would also make geth drop the peer that relayed it.</li>
+    <li><x-tags>traits-generics bytes-strings</x-tags> <code>tx.r &lt; SECP256K1_N</code> compares two <code>[u8; 32]</code> arrays. Arrays implement <code>Ord</code> lexicographically, which for equal-length big-endian numbers is numeric order. That gives 0 &lt; r &lt; n and, with <code>SECP256K1_HALF_N</code>, the EIP-2 bound s ≤ n/2, without a big-integer type.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/tx.rs" from="401" to="432"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns error-handling</x-tags> <strong><code>Option&lt;Option&lt;[u8; 20]&gt;&gt;</code></strong> keeps the two “absent” meanings apart: the outer <code>None</code> means malformed (reject the transaction), and <code>Some(None)</code> means contract creation. A caller writes <code>let to = to_field(…)?;</code>, which bails on the first and keeps the second. Java would need a sentinel or an exception. Clippy's <code>option_option</code> lint warns about this shape, so the <code>#[allow]</code> marks it as deliberate.</li>
+    <li><x-tags>borrowing bytes-strings</x-tags> The 65-byte signature is a <em>stack</em> array. <code>&amp;mut sig[..32]</code> lends one window to <code>pad32_into</code>, which writes through it. That mutable borrow ends when the call returns, so the next line can lend a different window.</li>
+    <li><x-tags>enums-patterns</x-tags> <code>Some(v @ 0..=1) =&gt; v as u8</code> matches a range and binds the value. A bad signature yields <code>from = None</code> rather than an error, as in Java.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/send_check.rs" kind="library">
+  <p class="purpose">New since September (#531). The pure half of the pre-broadcast check of <code>eth_sendRawTransaction</code>. A transaction its sender cannot pay for, or whose nonce is already used, is never mined, and the eth protocol sends no word back when a peer drops it. geth, Nethermind, Besu and Reth refuse such a transaction before answering, and wallets classify errors by geth's message text, so this module reproduces geth's two txpool verdicts in geth's order and words. The reader (<code>judge_read</code>, <a href="#stop-14">Stop 14</a>) supplies the sender's verified account, and judges only when the account was proven against the head's own state root. The check <strong>fails open</strong>: anything that stops it from judging (an undecodable or blob transaction, a stale head, a slow read, Tor-routed reads, too many reads in flight) broadcasts the transaction as before, because a node that lags the chain must never block a send.</p>
+  <x-code src="myotis-net/src/el/send_check.rs" from="50" to="96"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain</x-tags> <strong>Two clocks.</strong> A head is fresh only if its proven timestamp is within two block times plus 6 s of the wall clock <em>and</em> this node saw it advance within that bound on its own monotonic clock (<code>adopted_ago</code>). A wall clock set wrong cannot fake the second test: a stalled light client's head ages there whatever the wall clock says. A head never seen to advance (<code>None</code>, such as one restored from a snapshot) is not fresh.</li>
+    <li><x-tags>error-handling</x-tags> In <code>max_cost</code>, <code>tx.gas_price?</code> inside a <code>match</code> arm returns <code>None</code> from the whole function when the field is missing; <code>_ =&gt; return None</code> does the same for a blob transaction, whose blob fee the summary does not carry. In <code>verdict</code>, <code>max_cost(tx)?</code> then means “cost unknown: judge the nonce only”.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>(balance &lt; cost).then(|| format!(…))</code> turns a <code>bool</code> into an <code>Option</code>, building the message only when it is needed. <code>cost - balance</code> cannot underflow inside that closure, since it runs only when <code>balance &lt; cost</code>.</li>
+    <li><x-tags>domain</x-tags> A nonce above the account's is not an error: geth queues it, and wallets send several transactions in a row. Each transaction is judged alone against the balance, because this node does not see what geth's pool already holds for the sender.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/myotis-net/src/el/sent_tx.rs" kind="library" twin="SentTxTracker / PendingNonceTracker">
+  <p class="purpose">Two small, pure, clock-injected state machines for the wallet's own broadcasts. <code>SentTxTracker</code> watches each broadcast (180 s TTL) until it is seen in gossip, confirmed mined, or expired; the reader uses it for rebroadcasts and to bound receipt scans, and since #531 logs a watch that expires unseen as “likely dropped”. A re-send of a transaction the network already echoed stays seen. <code>PendingNonceTracker</code> makes <code>eth_getTransactionCount("pending")</code> return <code>max(verified mined count, own highest nonce + 1)</code> for up to 90 s. Neither is proof-backed, and neither needs to be: one only gates a rebroadcast of self-signed bytes, and the other only raises a pending answer above the verified floor. Neither is ever consulted for settled tags. The file also has the <code>0x…</code> hash formatting for the send log lines.</p>
+  <x-code src="myotis-net/src/el/sent_tx.rs" from="20" to="32"></x-code>
+  <p class="code-note"><x-tags>interior-mutability ownership</x-tags> The trackers contain no locks; their mutating methods take <code>&amp;mut self</code>, and the <em>caller</em> decides how to share them. The watch is <code>SharedSentTxWatch</code>, an <code>Arc&lt;std::sync::Mutex&lt;SentTxTracker&gt;&gt;</code> held by the reader and by every peer's read loop (gossip sightings); the guard provides <code>&amp;mut</code> through <code>DerefMut</code>. The nonce tracker lives inside the reader's <code>SentTxState</code>, behind <code>sent_txs: std::sync::Mutex&lt;SentTxState&gt;</code>. A <code>std</code> mutex fits because every access is “a brief map poke, never held across I/O”.</p>
+  <x-code src="myotis-net/src/el/sent_tx.rs" from="100" to="115"></x-code>
+  <p class="code-note"><x-tags>iterators-closures borrowing</x-tags> <code>retain</code> takes an <code>FnMut</code> closure. This one mutably borrows the local <code>unseen</code> vector while <code>retain</code> mutably borrows <code>self.watched</code>; they are different objects, so both borrows can coexist. <code>*hash</code> copies the 32-byte key out of the map entry. The boundary is inclusive (<code>&lt;=</code>), mirroring the Java <code>&gt;</code> test for expiry.</p>
+  <x-code src="myotis-net/src/el/sent_tx.rs" from="174" to="209"></x-code>
+  <ul class="concepts">
+    <li><x-tags>borrowing</x-tags> <strong>Non-lexical lifetimes across <code>match</code> arms.</strong> In <code>record</code>, the <code>get_mut</code> borrow is live only in the arms that bind <code>e</code>. In the <code>None</code> arm nothing borrowed survives, so <code>insert</code> on the same map is allowed. In <code>overlay</code>, <code>e</code> is a shared borrow, yet <code>remove</code> compiles: on the path through the <code>if</code>, <code>e</code> is never used again. On the other path <code>e</code> is used at the last line, and no <code>remove</code> happens there. The borrow checker reasons per control-flow path.</li>
+    <li><x-tags>enums-patterns</x-tags> <code>Some(e) if nonce &gt;= e.nonce</code> followed by <code>Some(_) =&gt; {}</code>: a guarded arm and its fallback, the Java <code>merge</code> with <code>&gt;=</code>.</li>
+    <li><x-tags>error-handling</x-tags> <code>saturating_add(1)</code>: a nonce of <code>u64::MAX</code> must not wrap (release) or panic (debug).</li>
+  </ul>
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments</span>
+    <p><code>PendingNonceTracker::has</code> (line 211) says “Whether a live entry exists”. It only checks the key, so it also returns <code>true</code> for an entry past its TTL that no <code>overlay</code> call has evicted yet. It is a logging helper, so the effect is cosmetic.</p>
+  </div>
+</x-file>
+
+<x-quiz>[
+  {"id":"els-q1","type":"mcq","tags":["async","concurrency"],
+   "q":"<code>PoolOracle::wait</code> calls <code>self.handle.block_on(…)</code>. Why does the reader run revm through <code>request::blocking</code> instead of calling the executor directly inside its async method?",
+   "options":["<code>block_on</code> is faster on a blocking thread","<code>Handle::block_on</code> panics when called from inside an async execution context, and a runtime worker parked in it would stall every task queued on that worker; a blocking-pool thread may block","revm requires a <code>'static</code> closure, which only <code>spawn_blocking</code> provides","Task-locals such as <code>Operation::current()</code> are only visible on blocking threads"],
+   "answer":1,
+   "explain":"The bridge parks a thread until the network answers. Only a thread that runs no async tasks may do that, and tokio enforces it with a panic. Task-locals are the opposite: they do not reach blocking threads, which is why <code>PoolOracle::new</code> captures the operation eagerly."},
+  {"id":"els-q2","type":"open","tags":["lifetimes","async"],
+   "q":"In <code>PoolOracle::leaf</code>, the async block passed to <code>wait</code> borrows <code>self</code>, <code>peers</code>, <code>asked</code> and <code>state_root</code>. <code>tokio::spawn</code> would reject such a future. Explain why it is accepted here.",
+   "model":"<code>Handle::block_on</code> has the signature <code>fn block_on&lt;F: Future&gt;(&amp;self, future: F) -&gt; F::Output</code>: no <code>Send</code> and no <code>'static</code> bound. It drives the future to completion on the calling thread and only then returns, so every borrow inside the future ends before <code>wait</code> returns, while <code>peers</code>, <code>asked</code> and <code>state_root</code> are still alive in <code>leaf</code>'s frame. <code>tokio::spawn</code> needs <code>'static</code> (and <code>Send</code>) because a spawned task may outlive the function that spawned it and run on another thread, so it may not hold borrows of that function's locals.",
+   "points":["block_on has no Send or 'static bound on its future","block_on returns only after the future has completed","the borrowed locals live in leaf's frame for the whole time the future runs","tokio::spawn needs 'static because a spawned task can outlive its spawner"],
+   "context":"myotis-net/src/el/evm.rs L900-907 wait(): self.handle.block_on(async { match &self.operation { Some(op) => op.wait(future).await..., None => Ok(future.await) } }). L1005-1054 leaf(): let (asked, peers) = self.ladder(); let peers = &peers; let fetched = self.wait(async { let out = hedged_race(peers, HEDGE_DELAY, |peer| async move { peer.snap_get_account(state_root, &address).await }, ...).await; Self::record_race(&quality, peers, &out, self.finalized).await; self.learn_order(&asked, &out); ... })?;"},
+  {"id":"els-q3","type":"mcq","tags":["ownership","concurrency"],
+   "q":"In the prefetch wave, each slot request starts with <code>let Ok(_permit) = sem.acquire().await else { … };</code>. What would change if it were written <code>let Ok(_) = sem.acquire().await else { … };</code>?",
+   "options":["Nothing; both keep the permit until the end of the block","It would not compile, because <code>_</code> cannot appear inside <code>Ok(…)</code>","<code>_</code> does not bind, so the permit is dropped at the end of that statement, before the request is sent, and the 48-request limit no longer limits anything","The semaphore would be closed after the first request"],
+   "answer":2,
+   "explain":"<code>_permit</code> is a real binding that lives to the end of the scope; <code>_</code> is a pattern that binds nothing, so the value is dropped immediately. The same distinction makes <code>let _timer = self.wire.serial();</code> time the whole fetch."},
+  {"id":"els-q4","type":"mcq","tags":["domain","error-handling"],
+   "q":"An address entry has <code>from_block</code> 100 and coverage [200, 201]. A wallet asks <code>eth_getLogs</code> for that address over [150, 201]. What does <code>LogIndex::query</code> return?",
+   "options":["<code>Err(OutOfCoverage { … })</code>, because blocks 150–199 were never processed and <code>[]</code> would falsely claim there were no events","<code>Ok([])</code>, because no logs are stored for 150–199","Only the logs for 200–201","<code>Err(UnwatchedAddress(…))</code>"],
+   "answer":0,
+   "explain":"<code>check_coverage</code> requires [max(150, 100), 201] = [150, 201] to be covered. With <code>from_block</code> 180 it would still be [180, 201], not covered either; with <code>from_block</code> 200 the range [200, 201] is covered and the stored logs are returned."},
+  {"id":"els-q5","type":"mcq","tags":["ownership"],
+   "q":"<code>LogIndex::merge</code> iterates <code>for s in &amp;mut sources</code> and calls <code>std::mem::take(&amp;mut s.logs)</code>. What does that achieve?",
+   "options":["It clears the source map and copies its contents into the output","It locks each source while its logs are read","It sorts each source's logs by block number","It moves the whole, possibly huge, map out through the <code>&amp;mut</code> reference without cloning, leaving an empty map behind; iterating it by value then moves each log into the output"],
+   "answer":3,
+   "explain":"You cannot move out of a place you only hold by <code>&amp;mut</code>. <code>mem::take</code> swaps in <code>Default::default()</code> and hands you the original. <code>unwatch</code> uses the same trick on two fields at once."},
+  {"id":"els-q6","type":"open","tags":["borrowing","ownership"],
+   "q":"Explain how <code>LogIndex::unwatch</code> rebuilds <code>config.watch</code> and <code>coverage</code> without cloning, and why the later <code>self.logs.retain(…)</code> may read <code>watch</code> and <code>coverage</code> while it mutates <code>self.logs</code>.",
+   "model":"It calls <code>std::mem::take</code> on both vectors, which moves the full vectors out of the fields (through <code>&amp;mut self</code>) and leaves empty ones behind. Iterating <code>watch.into_iter().zip(coverage)</code> by value then moves each entry and its coverage either into <code>dropped</code> or back into the (now empty) fields, so they stay parallel and nothing is copied. Afterwards <code>let (watch, coverage) = (&amp;self.config.watch, &amp;self.coverage);</code> takes shared borrows of two fields, and <code>self.logs.retain</code> takes a mutable borrow of a different field, <code>logs</code>. The borrow checker tracks borrows per field, so shared borrows of <code>config.watch</code> and <code>coverage</code> can coexist with a mutable borrow of <code>logs</code>. The closure captures those references and <code>dropped</code>.",
+   "points":["mem::take moves each Vec out of its field and leaves an empty Vec","into_iter().zip moves each entry into dropped or back into the field, keeping coverage parallel, with no clone","shared borrows of config.watch and coverage and a mutable borrow of logs are borrows of different fields","the borrow checker allows disjoint field borrows at the same time"],
+   "context":"myotis-net/src/el/logindex.rs L615-640: let watch = std::mem::take(&mut self.config.watch); let coverage = std::mem::take(&mut self.coverage); for (w, c) in watch.into_iter().zip(coverage) { if keys.contains(&w.key) { dropped.push(w); } else { self.config.watch.push(w); self.coverage.push(c); } } ... let (watch, coverage) = (&self.config.watch, &self.coverage); self.logs.retain(|_, l| { ... !dropped.iter().any(|d| d.selects(b, a, t)) || watch.iter().zip(coverage).any(|(w, c)| w.selects(b, a, t) && c.contains(b, b)) });"},
+  {"id":"els-q7","type":"mcq","tags":["borrowing"],
+   "q":"In <code>PendingNonceTracker::record</code>, the <code>None</code> arm of <code>match self.by_sender.get_mut(&amp;sender)</code> calls <code>self.by_sender.insert(…)</code>. Why is that allowed while the map is borrowed by the <code>match</code>?",
+   "options":["It is not; the code uses <code>unsafe</code>","Non-lexical lifetimes: the <code>get_mut</code> borrow is live only in the arms that bind <code>e</code>, and in the <code>None</code> arm no reference survives, so a new mutable borrow is fine","<code>insert</code> takes <code>&amp;self</code>","The map is cloned before the <code>match</code>"],
+   "answer":1,
+   "explain":"The borrow checker reasons per control-flow path: a borrow that is not used on a path does not block that path. <code>overlay</code> relies on the same rule when it calls <code>remove</code> after reading <code>e</code>."},
+  {"id":"els-q8","type":"mcq","tags":["enums-patterns"],
+   "q":"<code>tx::to_field</code> returns <code>Option&lt;Option&lt;[u8; 20]&gt;&gt;</code>. What does <code>Some(None)</code> mean?",
+   "options":["The field is malformed and the transaction must be rejected","The recipient is the zero address","An empty <code>to</code> field: the transaction creates a contract","The field was not decoded yet"],
+   "answer":2,
+   "explain":"The outer <code>None</code> is \"malformed\" and short-circuits through <code>?</code>; the inner <code>None</code> is a legitimate value, contract creation. <code>decode_sendable</code> later refuses <code>Some(None)</code> only for a type 0x4 transaction."},
+  {"id":"els-q9","type":"open","tags":["domain"],
+   "q":"The pre-broadcast check in <code>send_check.rs</code> fails open. What does that mean, why was it chosen, and how does <code>head_is_fresh</code> stop a wrong wall clock from making a stalled head look fresh?",
+   "model":"Failing open means that whenever the check cannot judge (undecodable or blob transaction, stale head, slow or unproven account read, Tor-routed reads, too many reads in flight) the transaction is broadcast as before; only a positive verdict (nonce too low, insufficient funds) refuses it. It was chosen because a light client that lags the chain must never block a send; the check only exists to report sends that can never be mined, which peers would drop silently. <code>head_is_fresh</code> needs two tests: the head's proven timestamp must be within two block times plus 6 s of the wall clock, and the node must have seen the head advance within the same bound on its own monotonic clock (<code>adopted_ago</code>). A stalled client's head ages on the monotonic clock whatever the wall clock says, and a head never seen to advance (<code>None</code>) is never fresh.",
+   "points":["fail open: when the check cannot judge, the transaction is broadcast unchanged","only a definite verdict (nonce too low / insufficient funds) refuses the send","reason: a lagging node must never block a send","freshness also requires the head to have advanced recently on the node's own monotonic clock, which a wrong wall clock cannot fake","a head never seen to advance (adopted_ago None) is not fresh"],
+   "context":"myotis-net/src/el/send_check.rs L10-17 (fails OPEN doc), L44-60: fresh_bound = 2 * block_time + 6 s; head_is_fresh(now_unix, head_timestamp, adopted_ago, block_time) = now_unix &lt;= head_timestamp + bound && adopted_ago.is_some_and(|ago| ago &lt;= bound). L85-96 verdict: nonce too low, then insufficient funds, in geth's words."},
+  {"id":"els-q10","type":"mcq","tags":["domain"],
+   "q":"A <code>Slot&lt;FeeEstimate&gt;</code> holds a value computed for top <code>(100, hash A)</code> two seconds ago. The current top is <code>(100, hash B)</code>, and the caller allows stale values. What does <code>lookup</code> return?",
+   "options":["<code>Fresh</code>, because the block number is the same","<code>Stale</code> with <code>behind</code> = 0","<code>Stale</code> with <code>behind</code> = 1","<code>Miss</code>, because the same number with another hash is a reorg, and a reorg is never served stale"],
+   "answer":3,
+   "explain":"<code>head.0.checked_sub(at_head.0).filter(|&amp;b| b &gt; 0)</code> is <code>None</code> when the number did not grow, so only a strictly older top can be stale. A fee computed on the losing fork is not a pure function of the current top."},
+  {"id":"els-q11","type":"open","tags":["domain","ownership"],
+   "q":"In <code>activity.rs</code>, explain what <code>carry</code> does with a block whose verified BAL lists the followed account with <code>storage_written</code> set, and why the callers clone <code>values</code> before they call <code>carry</code>.",
+   "model":"<code>carry</code> returns <code>Err(Carry::Never)</code>: the block wrote at least one of the account's storage slots, so its storage root changed to a value the BAL does not carry. The carried <code>AccountValues</code> (which include <code>storage_root</code>) would be wrong, so the account cannot be followed through that block; <code>advance_followed</code> drops it and <code>followed_answer</code> returns <code>None</code>, which sends the read to a fresh proof. The callers clone first (<code>let mut next = f.values.clone();</code>) because <code>carry</code> writes through a <code>&amp;mut AccountValues</code> and may update balance, nonce or code hash before it finds a reason to fail. Working on a clone and keeping it only on <code>Ok</code> makes the carry all-or-nothing.",
+   "points":["storage_written makes carry return Err(Carry::Never)","the BAL does not carry the new storage root, so the carried values would be wrong","Never drops the followed account and sends the next read to a proof","carry mutates through &mut, so callers work on a clone and keep it only on Ok"],
+   "context":"myotis-net/src/el/activity.rs L136-165 carry(values: &mut AccountValues, address, r): if not in r.account → Ok(()); find change in r.watched_changes; if change.storage_written → Err(Carry::Never); apply balance/nonce/code_hash; recompute exists. L399-430 advance_followed: let mut next = f.values.clone(); match carry(&mut next, address, r) { Ok(()) => *f = Followed { ..., values: next }, Err(NotYet) => break, Err(Never) => return false }."},
+  {"id":"els-q12","type":"open","tags":["lifetimes","ownership"],
+   "q":"<code>WireTimer&lt;'a&gt;</code> holds <code>&amp;'a AtomicU64</code> and adds elapsed time in its <code>Drop</code>. What does the lifetime guarantee, and why do the fetch methods write <code>let _timer = self.wire.serial();</code> rather than <code>let _ = self.wire.serial();</code>?",
+   "model":"The lifetime ties the timer to the <code>WireCounters</code> it borrows from: the compiler rejects any code in which a timer could outlive its counter, so <code>drop</code> can never write through a dangling reference. <code>let _timer = …</code> binds the guard to a named variable that lives until the end of the function, so <code>drop</code> runs when the fetch ends, on every path, including early returns through <code>?</code>, and adds the fetch's whole duration. <code>let _ = …</code> binds nothing, so the guard would be dropped at once and record about zero time.",
+   "points":["'a means the timer cannot outlive the AtomicU64 (the WireCounters) it points into","Drop runs on every exit path, including early ? returns","a named _timer lives to the end of the function and so times the whole fetch","let _ = drops the guard immediately, recording almost no time"],
+   "context":"myotis-net/src/el/evm.rs L764-776: struct WireTimer&lt;'a> { nanos: &'a AtomicU64, started: Instant } impl Drop for WireTimer&lt;'_> { fn drop(&mut self) { let nanos = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX); self.nanos.fetch_add(nanos, Relaxed); } }. L740-743 serial(&self) -> WireTimer&lt;'_>. fetch_account L1083: let _timer = self.wire.serial();"},
+  {"id":"els-q13","type":"mcq","tags":["traits-generics","bytes-strings"],
+   "q":"<code>decode_sendable</code> checks <code>tx.r &lt; SECP256K1_N</code>, where both sides are <code>[u8; 32]</code>. What does that comparison do?",
+   "options":["It compares the arrays element by element from the first byte (lexicographic order), which for equal-length big-endian numbers is numeric order","It compares the arrays' memory addresses","It compares only the lengths, which are always equal","It does not compile; arrays need a big-integer type for <code>&lt;</code>"],
+   "answer":0,
+   "explain":"Arrays of an <code>Ord</code> type implement <code>Ord</code> lexicographically. Big-endian puts the most significant byte first, so the first differing byte decides, exactly as in a numeric comparison."},
+  {"id":"els-q14","type":"mcq","tags":["borrowing"],
+   "q":"<code>FeeCache::history_lookup</code> picks an eviction victim with <code>self.histories.iter().min_by_key(…).map(|(k, _)| k.clone())</code> and then calls <code>self.histories.remove(&amp;victim)</code>. Why the <code>clone</code>?",
+   "options":["Because <code>HashMap::remove</code> takes ownership of the key","Because <code>HistoryShape</code> is not <code>Copy</code> and keys cannot be compared by reference","Without it, the victim would be a reference into the map, keeping the shared borrow from <code>iter()</code> alive, and the mutable borrow for <code>remove</code> would be rejected","To keep a copy of the evicted shape for logging"],
+   "answer":2,
+   "explain":"An owned key ends the iterator's borrow of the map. <code>remove</code> only needs <code>&amp;victim</code>; it is the earlier borrow that must end first."}
+]</x-quiz>

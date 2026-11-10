@@ -7,7 +7,7 @@ fall back on.
 The wallet API the README describes is the Kotlin `jsonrpc-server`, so serving
 it has meant running one of the JVM hosts. myotis-rpcd is for hosts that can't
 or won't: a server, a container, a Raspberry Pi, or a service such as a Swarm
-Bee node ([docs/bee-rpc-service.md](../../docs/bee-rpc-service.md)) that only
+Bee node ([docs/guides/bee-rpc-service.md](../../docs/guides/bee-rpc-service.md)) that only
 needs an RPC endpoint on localhost. It links the engine as a library and puts a
 thin HTTP layer in front of it.
 
@@ -159,7 +159,7 @@ second after start.
 ### eth_getLogs
 
 `eth_getLogs` needs the opt-in log index
-([docs/eth-getlogs-design.md](../../docs/eth-getlogs-design.md)).
+([docs/design-history/eth-getlogs-design.md](../../docs/design-history/eth-getlogs-design.md)).
 `--log-index-config` takes the engine's watch-list JSON, installed as soon as
 the engine's EL reader is up:
 
@@ -179,7 +179,7 @@ the engine's reason.
 the config is installed — e.g. a seed from `scripts/synth_logindex.py`. The
 import is all-or-nothing, and its logs are served as the snapshot claims them,
 so a seed is only as good as its source
-([docs/seeded-log-histories.md](../../docs/seeded-log-histories.md)).
+([docs/how-it-works/seeded-log-histories.md](../../docs/how-it-works/seeded-log-histories.md)).
 
 ### --log-calls
 

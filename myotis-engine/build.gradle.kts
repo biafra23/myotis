@@ -49,7 +49,7 @@ kotlin {
     // Android app with no toolchain two-step.
     androidTarget {
         // The AAR a consumer gets: the release variant — eth.myotis:myotis-engine-android
-        // (root build.gradle.kts, `Publishing`; docs/android-library.md).
+        // (root build.gradle.kts, `Publishing`; docs/guides/android-library.md).
         publishLibraryVariants("release")
         compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) }
     }

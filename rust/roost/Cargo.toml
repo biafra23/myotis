@@ -1,4 +1,4 @@
-# roost — the dedicated light-client server (docs/lc-server-design.md).
+# roost — the dedicated light-client server (docs/design-history/lc-server-design.md).
 #
 # Standalone crate (its own workspace root, own Cargo.lock) — deliberately NOT a
 # member of ../Cargo.toml's workspace, for the two reasons the design gates the

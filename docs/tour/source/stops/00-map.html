@@ -1,0 +1,243 @@
+<!--meta {"id":"stop-00","num":0,"title":"Start here: the map","short":"Start here: the map","sub":"how the pieces fit","part":"Orientation"} -->
+<header class="stop-head">
+  <div class="eyebrow">Stop 0 · Orientation <span>about 20 minutes</span></div>
+  <h1>Start here: the map</h1>
+  <p class="lede">The Rust workspace is a second Myotis engine behind the same <code>io.myotis.api</code> contract the Java engine implements. That's 122,922 lines in 176 files and twelve crates, twice the size of the September tour. This stop shows how the crates fit together, which way calls flow, and a route through all of it, in legs of a few hours each.</p>
+</header>
+
+<div class="learn">
+  <h2>By the end of this stop you can</h2>
+  <div><b>Name every crate</b>and say what it is for, and which ones are allowed to do I/O.</div>
+  <div><b>Trace the four entrances</b>through which Kotlin/JVM, iOS, Node and plain JSON-RPC clients reach the Rust engine.</div>
+  <div><b>State the five rules</b>that explain most of the design decisions you will see in the code.</div>
+</div>
+
+<div class="prose">
+  <h2>What you are looking at</h2>
+  <p>You already know the Java engine: <code>ChainStack</code>, <code>RLPxConnector</code>, <code>BeaconP2PService</code>, <code>MerklePatriciaProofVerifier</code>. Almost every Rust file here is a <em>twin</em> of one of those classes. Doc comments usually name the twin, and this tour shows it as a violet chip on each file. Wherever a twin exists, you can ask: “what does the Java version do here?” That makes the Rust version much easier to read.</p>
+  <p>The hosts (desktop, daemon, Android, iOS, Node) never see Rust types. They call a flat, FFI-friendly surface that passes numbers, strings and JSON documents. Behind that surface, Rust owns everything: a tokio runtime, the consensus-layer light client, the execution-layer peer pool and the EVM.</p>
+</div>
+
+<figure class="diagram">
+  <div class="svg-wrap">
+  <svg class="wide-diagram" viewBox="0 0 960 610" role="img" fill="currentColor" xmlns="http://www.w3.org/2000/svg"
+       aria-label="Crate map. Wallets and dapps reach myotis-rpcd over HTTP JSON-RPC; myotis-rpcd calls the engine's exported functions directly as a Rust library. JVM hosts reach myotis-engine through UniFFI and JNA, iOS through the plain C ABI, Node through myotis-node which calls the C ABI functions. myotis-engine starts the sync loop and the EL reader in myotis-net, which does all I/O and depends on the sans-I/O crates myotis-wire, myotis-consensus, myotis-core and myotis-evm. myotis-wire uses myotis-core and myotis-consensus; myotis-evm uses myotis-core; myotis-consensus uses myotis-bls, which the Java engine also loads through JNI. roost and tor-poc are standalone binaries built on myotis-net.">
+    <defs>
+      <marker id="m0-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+      </marker>
+    </defs>
+    <g font-size="11" style="fill:var(--ink-3)">
+      <rect x="20" y="16" width="176" height="58" rx="8" stroke-width="1.4" stroke-dasharray="5 4" style="fill:none;stroke:var(--ink-3)"/>
+      <rect x="206" y="16" width="176" height="58" rx="8" stroke-width="1.4" stroke-dasharray="5 4" style="fill:none;stroke:var(--ink-3)"/>
+      <rect x="392" y="16" width="176" height="58" rx="8" stroke-width="1.4" stroke-dasharray="5 4" style="fill:none;stroke:var(--ink-3)"/>
+      <rect x="578" y="16" width="176" height="58" rx="8" stroke-width="1.4" stroke-dasharray="5 4" style="fill:none;stroke:var(--ink-3)"/>
+      <rect x="764" y="16" width="176" height="58" rx="8" stroke-width="1.4" stroke-dasharray="5 4" style="fill:none;stroke:var(--ink-3)"/>
+      <text x="108" y="59" text-anchor="middle">MetaMask, Bee, dapps</text>
+      <text x="294" y="59" text-anchor="middle">desktop · daemon · Android</text>
+      <text x="480" y="59" text-anchor="middle">Kotlin/Native · :app-ios</text>
+      <text x="666" y="59" text-anchor="middle">JS loader</text>
+      <text x="852" y="59" text-anchor="middle">NativeBlsBackend</text>
+    </g>
+    <g font-size="13.5" font-weight="700">
+      <text x="108" y="40" text-anchor="middle">JSON-RPC clients</text>
+      <text x="294" y="40" text-anchor="middle">JVM hosts</text>
+      <text x="480" y="40" text-anchor="middle">iOS app</text>
+      <text x="666" y="40" text-anchor="middle">Node / Electron</text>
+      <text x="852" y="40" text-anchor="middle">Java engine</text>
+    </g>
+
+    <!-- boundary crates -->
+    <rect x="20" y="124" width="150" height="92" rx="10" stroke-width="1.6" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+    <text x="95" y="160" text-anchor="middle" font-size="13.5" font-weight="750">myotis-rpcd</text>
+    <text x="95" y="178" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">HTTP JSON-RPC daemon</text>
+
+    <rect x="196" y="124" width="360" height="92" rx="10" stroke-width="1.6" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+    <rect x="208" y="134" width="164" height="36" rx="6" stroke-width="1.2" style="fill:var(--surface);stroke:var(--oxide)"/>
+    <text x="290" y="157" text-anchor="middle" font-size="12.5" font-weight="650" class="mono">ffi.rs · UniFFI</text>
+    <rect x="388" y="134" width="156" height="36" rx="6" stroke-width="1.2" style="fill:var(--surface);stroke:var(--oxide)"/>
+    <text x="466" y="157" text-anchor="middle" font-size="12.5" font-weight="650" class="mono">capi.rs · C ABI</text>
+    <text x="208" y="192" font-size="13.5" font-weight="750">myotis-engine</text>
+    <text x="208" y="208" font-size="11" style="fill:var(--ink-2)">host.rs owns the tokio runtime and the handle map</text>
+
+    <rect x="578" y="124" width="176" height="92" rx="10" stroke-width="1.6" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+    <text x="666" y="164" text-anchor="middle" font-size="13.5" font-weight="750">myotis-node</text>
+    <text x="666" y="182" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">napi-rs addon</text>
+
+    <g stroke="currentColor" stroke-width="1.4" fill="none">
+      <line x1="108" y1="74" x2="108" y2="121" marker-end="url(#m0-arrow)"/>
+      <line x1="294" y1="74" x2="294" y2="131" marker-end="url(#m0-arrow)"/>
+      <line x1="472" y1="74" x2="472" y2="131" marker-end="url(#m0-arrow)"/>
+      <line x1="666" y1="74" x2="666" y2="121" marker-end="url(#m0-arrow)"/>
+      <line x1="578" y1="152" x2="547" y2="152" marker-end="url(#m0-arrow)"/>
+      <line x1="170" y1="190" x2="193" y2="190" marker-end="url(#m0-arrow)"/>
+      <line x1="376" y1="216" x2="376" y2="259" marker-end="url(#m0-arrow)"/>
+    </g>
+    <g font-size="11" style="fill:var(--ink-2)">
+      <text x="114" y="104">HTTP</text>
+      <text x="300" y="104">UniFFI · JNA</text>
+      <text x="478" y="104">C ABI · cinterop</text>
+      <text x="672" y="104">N-API</text>
+      <text x="384" y="243">starts SyncHandle + ElReader</text>
+    </g>
+
+    <!-- myotis-net -->
+    <rect x="20" y="262" width="680" height="88" rx="10" stroke-width="1.6" style="fill:var(--surface);stroke:var(--ink-2)"/>
+    <text x="32" y="284" font-size="13.5" font-weight="750">myotis-net <tspan font-weight="400" style="fill:var(--ink-2)">— every socket, timer and file lives here</tspan></text>
+    <text x="32" y="301" font-size="11" style="fill:var(--ink-3)">tokio · libp2p · discv4/discv5 · DNS discovery · RLPx · Tor (feature)</text>
+    <rect x="32" y="312" width="206" height="28" rx="5" style="fill:var(--ground-2)"/>
+    <text x="135" y="330" text-anchor="middle" font-size="11.5">sync.rs · light-client loop</text>
+    <rect x="248" y="312" width="206" height="28" rx="5" style="fill:var(--ground-2)"/>
+    <text x="351" y="330" text-anchor="middle" font-size="11.5">reqresp · discovery · fork watch</text>
+    <rect x="464" y="312" width="224" height="28" rx="5" style="fill:var(--ground-2)"/>
+    <text x="576" y="330" text-anchor="middle" font-size="11.5">el/ · pool · peers · reader</text>
+
+    <!-- standalone binaries -->
+    <rect x="720" y="250" width="160" height="48" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--rule-strong)"/>
+    <text x="732" y="270" font-size="13" font-weight="700">roost</text>
+    <text x="732" y="287" font-size="11" style="fill:var(--ink-3)">LC server daemon</text>
+    <rect x="720" y="306" width="160" height="48" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--rule-strong)"/>
+    <text x="732" y="326" font-size="13" font-weight="700">tor-poc</text>
+    <text x="732" y="343" font-size="11" style="fill:var(--ink-3)">RLPx over Tor</text>
+    <g stroke="currentColor" stroke-width="1.4" fill="none">
+      <line x1="720" y1="274" x2="703" y2="274" marker-end="url(#m0-arrow)"/>
+      <line x1="720" y1="330" x2="703" y2="330" marker-end="url(#m0-arrow)"/>
+    </g>
+
+    <!-- sans-I/O core -->
+    <rect x="20" y="378" width="680" height="96" rx="12" stroke-width="1.4" stroke-dasharray="6 5" style="fill:none;stroke:var(--oxide)"/>
+    <text x="32" y="396" font-size="10.5" font-weight="700" letter-spacing="1.2" style="fill:var(--oxide-ink)">SANS-I/O</text>
+    <g font-size="11" style="fill:var(--ink-3)">
+      <rect x="32" y="404" width="150" height="54" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--rule-strong)"/>
+      <rect x="202" y="404" width="150" height="54" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--rule-strong)"/>
+      <rect x="372" y="404" width="150" height="54" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--rule-strong)"/>
+      <rect x="542" y="404" width="150" height="54" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--rule-strong)"/>
+      <text x="107" y="444" text-anchor="middle">SSZ · LC store · Gloas</text>
+      <text x="277" y="444" text-anchor="middle">RLPx · eth · snap · eth2</text>
+      <text x="447" y="444" text-anchor="middle">RLP · keccak · trie</text>
+      <text x="617" y="444" text-anchor="middle">revm · ENS · simulate</text>
+    </g>
+    <g font-size="13" font-weight="700">
+      <text x="107" y="426" text-anchor="middle">myotis-consensus</text>
+      <text x="277" y="426" text-anchor="middle">myotis-wire</text>
+      <text x="447" y="426" text-anchor="middle">myotis-core</text>
+      <text x="617" y="426" text-anchor="middle">myotis-evm</text>
+    </g>
+    <g stroke="currentColor" stroke-width="1.4" fill="none">
+      <line x1="107" y1="350" x2="107" y2="401" marker-end="url(#m0-arrow)"/>
+      <line x1="277" y1="350" x2="277" y2="401" marker-end="url(#m0-arrow)"/>
+      <line x1="447" y1="350" x2="447" y2="401" marker-end="url(#m0-arrow)"/>
+      <line x1="617" y1="350" x2="617" y2="401" marker-end="url(#m0-arrow)"/>
+      <line x1="202" y1="431" x2="185" y2="431" marker-end="url(#m0-arrow)"/>
+      <line x1="352" y1="431" x2="369" y2="431" marker-end="url(#m0-arrow)"/>
+      <line x1="542" y1="431" x2="525" y2="431" marker-end="url(#m0-arrow)"/>
+      <line x1="107" y1="458" x2="107" y2="537" marker-end="url(#m0-arrow)"/>
+      <path d="M920 74 V567 H185" marker-end="url(#m0-arrow)"/>
+    </g>
+    <text x="114" y="377" font-size="11" style="fill:var(--ink-2)">slot numbers in</text>
+    <text x="912" y="300" text-anchor="end" font-size="11" style="fill:var(--ink-2)">JNI</text>
+
+    <!-- myotis-bls -->
+    <rect x="32" y="540" width="150" height="54" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--rule-strong)"/>
+    <text x="107" y="562" text-anchor="middle" font-size="13" font-weight="700">myotis-bls</text>
+    <text x="107" y="580" text-anchor="middle" font-size="11" style="fill:var(--ink-3)">blst · aggregate verify</text>
+    <text x="520" y="560" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">sync-committee signature checks</text>
+  </svg>
+  </div>
+  <figcaption>Dashed boxes are callers outside Rust. Solid boxes are crates, and arrows point from a caller to what it calls or depends on. Oxide fills mark the three crates that face the outside world. The dashed oxide frame is the sans-I/O core: plain functions over bytes, with no sockets, clock or files. <code>myotis-wire</code> is new since September: the wire codecs moved out of <code>myotis-net</code> into it. <code>myotis-engine</code> also depends on <code>myotis-consensus</code>, <code>myotis-evm</code> and <code>myotis-core</code> directly; those edges are left out to keep the picture readable.</figcaption>
+</figure>
+
+<div class="prose">
+  <h2>Five rules that explain most of the code</h2>
+  <p>Keep these in mind. Many strange-looking lines exist because of one of them.</p>
+</div>
+
+<div class="table-wrap">
+<table class="map">
+  <thead><tr><th>Rule</th><th>What it means</th><th>Where you will feel it</th></tr></thead>
+  <tbody>
+    <tr><td>1 · sans-I/O core</td><td><code>myotis-core</code>, <code>myotis-wire</code>, <code>myotis-consensus</code> and <code>myotis-evm</code> never open a socket, read the clock, touch the filesystem or draw randomness. They are pure functions over bytes. Two canaries in <code>./gradlew check</code> enforce it: a wasm32 build of core, wire and consensus (tokio and sockets do not compile there), and a <code>no_std</code> build of <code>myotis-core</code> for a bare-metal target.</td><td>Stops 4–8. The current time reaches the light client only as a plain slot number that <code>myotis-net</code> computes.</td></tr>
+    <tr><td>2 · one-way dependencies</td><td><code>myotis-net → myotis-wire → myotis-consensus</code>, never the other way. When protocol logic needs I/O, the I/O stays in net and passes results in as values.</td><td>Stops 9–15. Traits such as <code>SnapStateOracle</code> let a pure crate ask for data without knowing where it comes from.</td></tr>
+    <tr><td>3 · <code>panic = "abort"</code></td><td>The release profile aborts the process on a panic instead of unwinding. Inside a JVM or an iOS app, that means a Rust panic kills the whole app. So decoding untrusted bytes must never panic: code returns <code>Option</code>/<code>Result</code>, and avoids <code>unwrap()</code> and unchecked indexing on runtime data.</td><td>Everywhere, especially <code>host.rs</code>, which is “panic-free by construction”. <code>roost</code> is a server, so it opts out and uses <code>panic = "unwind"</code>.</td></tr>
+    <tr><td>4 · JSON across the boundary</td><td>Compound values cross FFI as JSON strings, not as native structs. The shapes are pinned by golden tests on both the Kotlin and the Rust side.</td><td>Stops 16 and 17: <code>eljson.rs</code>, <code>ffi.rs</code>, <code>capi.rs</code>, and how UniFFI carries them.</td></tr>
+    <tr><td>5 · verify, never trust</td><td>Every answer is proven. BLS sync-committee signatures anchor the beacon chain, the beacon chain anchors an execution block hash, the block hash anchors headers, headers anchor state roots, and Merkle-Patricia proofs anchor accounts and storage.</td><td>Stops 6, 12 and 14. A peer that cannot prove its data is skipped, and a read that cannot be proven fails. It never guesses.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout jvm">
+  <span class="k">JVM lens</span>
+  <p>Rule 3 is the biggest culture shock. In Java, an unexpected <code>NullPointerException</code> in a background thread gets logged and the app keeps running. Here, the equivalent (<code>unwrap()</code> on a <code>None</code>) would take the whole Android process down. That is why you will see <code>let Some(x) = … else { return false; };</code> in places where Java code would simply dereference.</p>
+</div>
+
+<div class="prose">
+  <h2>The route</h2>
+  <p>You get the memory-model primer first, then the workspace, then the code <em>bottom-up</em>. The order follows the Rust concepts, which get harder as you go. The pure crates teach borrowing and slices. <code>myotis-evm</code> adds traits and shared ownership. <code>myotis-net</code> is async and concurrency all the way down. The boundary crates finish with <code>unsafe</code> and FFI, including a deep dive into how UniFFI actually connects Kotlin to Rust. The workbook then makes you write the mechanisms yourself.</p>
+</div>
+
+<div class="table-wrap">
+<table class="map">
+  <thead><tr><th>Stops</th><th>Code</th><th>Rust you will practise</th></tr></thead>
+  <tbody>
+    <tr><td>1–2</td><td>Primer; workspace manifests</td><td>ownership, borrowing, lifetimes, methods and <code>self</code>, smart pointers; crates, features, profiles</td></tr>
+    <tr><td>3–8</td><td><code>myotis-bls</code>, <code>-core</code>, <code>-wire</code>, <code>-consensus</code>, <code>-evm</code> (two stops)</td><td>slices and byte parsing, <code>no_std</code>, <code>Result</code>/<code>?</code>, enums and <code>match</code>, traits and <code>Arc&lt;dyn Trait&gt;</code>, <code>Mutex</code> behind <code>&amp;self</code></td></tr>
+    <tr><td>9–15</td><td><code>myotis-net</code>: libp2p, the sync loop, EL peers, the pool and trust chain, EL services, the verified reader, tests</td><td><code>async</code>/<code>.await</code>, <code>tokio::spawn</code>, channels, <code>select!</code>, cancellation by drop, <code>Drop</code> guards, generics over <code>AsyncRead</code>, the sync/async bridge</td></tr>
+    <tr><td>16–21</td><td><code>myotis-engine</code>, the UniFFI deep dive, <code>myotis-node</code>, <code>myotis-rpcd</code>, <code>roost</code>, <code>tor-poc</code></td><td>global state with <code>OnceLock</code>, <code>extern "C"</code>, raw pointers and string ownership, proc macros, <code>anyhow</code>, servers and daemons</td></tr>
+    <tr><td>22–23</td><td>Workbook; final checkpoint</td><td>writing it yourself, then everything traced through one real request</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="prose" id="flight-plan">
+  <h2>The full route</h2>
+  <p>The whole tour reads in about 56 hours, front to back. The route below is the same order, cut into 11 legs, most of them four to seven hours long, with each workbook exercise placed right after the stop whose ideas it practises. Times come from each stop's own estimate: unhurried reading of the prose and every excerpt, plus two minutes per checkpoint question. On a long flight, start at Leg 1 and keep going: eight hours take you through Leg 1 and about 3 h 50 into Leg 2. Take breaks between legs, or between stops, not inside one.</p>
+  <p>Everything works offline: the exercises run against your local cargo cache, and the reading list points to your EPUBs and the Rust docs rustup installed.</p>
+</div>
+<ol class="route-legs"><li><b>Leg 1 · The language, then the workspace</b> <span class="t">about 4 h 10</span><ul><li><a href="#stop-00">Stop 0</a> <span class="t">20 min</span>: this map. Skim the file index; no need to read it.</li><li><a href="#stop-01">Stop 1</a> <span class="t">1 h 00</span>: the primer, including <a href="#primer-methods">methods and <code>self</code></a>. Do its checkpoint carefully: it tells you which concepts to revisit.</li><li><a href="#stop-22">Workbook exercises 1, 2, 3, 4</a> <span class="t">1 h 00</span>: cursor, hex, errors, methods: the primer's ideas in your own hands.</li><li><a href="#stop-02">Stop 2</a> <span class="t">1 h 10</span>: the manifests: crates, features, profiles, the no_std and wasm canaries.</li><li><a href="#stop-03">Stop 3</a> <span class="t">40 min</span>: the smallest real crate, a warm-up for slices and borrowed <code>Vec</code>s.</li></ul></li><li><b>Leg 2 · Bytes, hashes and wire formats</b> <span class="t">about 5 h 00</span><ul><li><a href="#stop-04">Stop 4</a> <span class="t">2 h 15</span>: RLP, Keccak, tries and proofs: borrowing slices at speed.</li><li><a href="#stop-22">Workbook exercise 8</a> <span class="t">15 min</span>: verify a header chain with slices and iterators, the shape of <code>verify.rs</code>.</li><li><a href="#stop-05">Stop 5</a> <span class="t">2 h 30</span>: every protocol as a pure function: enums, <code>Result</code> and <code>?</code> everywhere.</li></ul></li><li><b>Leg 3 · The light client and the EVM</b> <span class="t">about 6 h 15</span><ul><li><a href="#stop-06">Stop 6</a> <span class="t">3 h 00</span>: the light client as a state machine you can test without a network.</li><li><a href="#stop-07">Stop 7</a> <span class="t">3 h 00</span>: an EVM over verified state: traits, <code>Arc&lt;dyn Trait&gt;</code>, interior mutability.</li><li><a href="#stop-22">Workbook exercise 10</a> <span class="t">15 min</span>: traits, generics versus <code>dyn</code>, and a decorator like the test oracle.</li></ul></li><li><b>Leg 4 · Simulation, then the network begins</b> <span class="t">about 5 h 05</span><ul><li><a href="#stop-08">Stop 8</a> <span class="t">2 h 35</span>: transaction requests, tracers and <code>eth_simulateV1</code>.</li><li><a href="#stop-09">Stop 9</a> <span class="t">2 h 30</span>: libp2p, request/response and discovery: your first async-heavy stop.</li></ul></li><li><b>Leg 5 · Sync loop and execution-layer peers</b> <span class="t">about 6 h 45</span><ul><li><a href="#stop-10">Stop 10</a> <span class="t">3 h 00</span>: the sync loop: tasks, channels, <code>select!</code>, cancellation by drop.</li><li><a href="#stop-22">Workbook exercises 5, 6, 7</a> <span class="t">45 min</span>: a registry behind a <code>Mutex</code>, a drop guard, a worker that holds only a <code>Weak</code>.</li><li><a href="#stop-11">Stop 11</a> <span class="t">3 h 00</span>: RLPx, eth and snap sessions: an actor with a split reader and writer.</li></ul></li><li><b>Leg 6 · The pool and the services</b> <span class="t">about 5 h 55</span><ul><li><a href="#stop-12">Stop 12</a> <span class="t">3 h 20</span>: the peer pool and the trust chain from beacon anchor to Merkle proof.</li><li><a href="#stop-13">Stop 13</a> <span class="t">2 h 35</span>: the EVM bridge, the log index and transactions.</li></ul></li><li><b>Leg 7 · The verified reader and the tests</b> <span class="t">about 5 h 20</span><ul><li><a href="#stop-14">Stop 14</a> <span class="t">3 h 05</span>: the biggest file: read its section map first, then the excerpts.</li><li><a href="#stop-22">Workbook exercise 9</a> <span class="t">15 min</span>: the hedged race on a paused tokio clock, the shape of <code>hedged_race</code>.</li><li><a href="#stop-15">Stop 15</a> <span class="t">2 h 00</span>: integration tests, live probes and how <code>#[ignore]</code> keeps them out of CI.</li></ul></li><li><b>Leg 8 · The engine boundary</b> <span class="t">about 3 h 10</span><ul><li><a href="#stop-16">Stop 16</a> <span class="t">3 h 10</span>: the engine: global state, the catalog, <code>ffi.rs</code> and <code>capi.rs</code>.</li></ul></li><li><b>Leg 9 · UniFFI, end to end</b> <span class="t">about 5 h 55</span><ul><li><a href="#stop-17">Stop 17</a> <span class="t">5 h 55</span>: what the macros write, who frees which buffer, how the checksums guard it, and how the Android build regenerates the bindings. Long: read it in two or three sittings, at its section breaks.</li></ul></li><li><b>Leg 10 · The binaries</b> <span class="t">about 6 h 40</span><ul><li><a href="#stop-18">Stop 18</a> <span class="t">1 h 50</span>: the Node addon: a scheduler and admission control around the C ABI.</li><li><a href="#stop-19">Stop 19</a> <span class="t">2 h 35</span>: rpcd: a JSON-RPC daemon on the engine.</li><li><a href="#stop-20">Stop 20</a> <span class="t">2 h 15</span>: roost, the light-client server.</li></ul></li><li><b>Leg 11 · Generics over transports, and the whole picture</b> <span class="t">about 1 h 30</span><ul><li><a href="#stop-21">Stop 21</a> <span class="t">1 h 00</span>: tor-poc: the same stack over Tor, generic over the transport.</li><li><a href="#stop-23">Stop 23</a> <span class="t">30 min</span>: one request traced through every layer, and the final checkpoint.</li></ul></li></ol>
+<!--ROUTE-END--><!--ROUTE-END--><!--ROUTE-END--><!--ROUTE-END--><div class="prose">
+  <p>The other stops make good chapters for later evenings, in order. Each one stands alone, and its checkpoint keeps feeding the same reading list.</p>
+</div>
+
+<div class="prose">
+  <h2>How to use each stop</h2>
+  <ul>
+    <li><strong>Read with the code open.</strong> Every excerpt shows its real path and line numbers. They are cut from the repository at build time, from commit <code>5263a421</code> (<code>origin/main</code> on 6 November 2026). If your checkout has moved on, <code>git worktree add ../myotis-tour 5263a421</code> gives you exactly the code the tour quotes.</li>
+    <li><strong>Follow the concept chips.</strong> Oxide chips such as <x-tags>borrowing</x-tags> jump to the primer section that explains the idea.</li>
+    <li><strong>Big files get a section map:</strong> line ranges and what happens in each. Use it to jump around in your editor.</li>
+    <li><strong>Do the checkpoint at the end of each stop.</strong> Missed questions feed the <a href="#progress">reading list</a>, which points to specific chapters in your books.</li>
+  </ul>
+</div>
+
+<div class="prose">
+  <h2>Every file in the tour</h2>
+  <p>All 176 <code>.rs</code> files, grouped by crate, with their size. Each links to its entry.</p>
+</div>
+<x-file-index></x-file-index>
+
+<x-quiz>[
+  {"id":"s00-q1","type":"mcq","tags":["modules-cargo","domain"],
+   "q":"Which crate is allowed to open sockets and read the wall clock?",
+   "options":["<code>myotis-core</code>","<code>myotis-consensus</code>","<code>myotis-net</code>","<code>myotis-evm</code>"],
+   "answer":2,
+   "explain":"<code>myotis-net</code> owns all I/O. Core, wire, consensus and EVM are sans-I/O: they receive bytes and plain numbers (such as the current slot) and return values. Core, wire and consensus are additionally compiled for wasm32 as a canary, which fails as soon as tokio or sockets sneak in."},
+  {"id":"s00-q2","type":"mcq","tags":["unsafe-ffi"],
+   "q":"How does a call from the Android app reach the Rust engine, compared with a call from the iOS app?",
+   "options":["Both go through JNI hand-written in <code>lib.rs</code>","Android: UniFFI-generated Kotlin bindings over JNA into <code>ffi.rs</code>. iOS: Kotlin/Native cinterop against the plain C ABI in <code>capi.rs</code>","Android: the C ABI. iOS: UniFFI","Both call <code>myotis-node</code>"],
+   "answer":1,
+   "explain":"JVM hosts use UniFFI (the old hand-JNI shims are gone, see <code>lib.rs</code>). The iOS host has no JVM, so it links the static library and calls the <code>extern \"C\"</code> functions declared in <code>rust/include/myotis_engine.h</code>. <code>myotis-node</code> reuses those same C-ABI functions by Rust path."},
+  {"id":"s00-q3","type":"mcq","tags":["modules-cargo"],
+   "q":"Why are <code>roost</code> and <code>tor-poc</code> excluded from the workspace instead of being members?",
+   "options":["They are written in a different Rust edition","They pull large dependency trees (an HTTP stack, Arti) that no engine target should compile. <code>roost</code> also needs <code>panic = \"unwind\"</code>, which a member cannot set","Cargo does not allow binaries in workspaces","They do not depend on any workspace crate"],
+   "answer":1,
+   "explain":"Both depend on <code>myotis-net</code> by path, but as members they would make every <code>cargo build --workspace</code> compile their heavy dependencies. Profiles are workspace-wide, so only a separate workspace root lets <code>roost</code> unwind on panic. That turns a panic into a logged, supervised restart instead of an instant abort. Stop 15 shows why it still doesn't isolate a single connection."},
+  {"id":"s00-q4","type":"open","tags":["error-handling","unsafe-ffi"],
+   "q":"The release profile sets <code>panic = \"abort\"</code>. Explain what that means for a Rust panic inside the Android app, and how it changes the way the code handles untrusted bytes.",
+   "model":"With <code>panic = \"abort\"</code>, a panic does not unwind the stack. It terminates the process immediately. The Rust engine runs inside the app's process (loaded through JNA or cinterop), so a panic kills the whole Android or iOS app, and <code>catch_unwind</code> cannot help because nothing unwinds. The code therefore treats every decode of peer-supplied bytes as fallible: it returns <code>Option</code>/<code>Result</code>, uses checked arithmetic and <code>.get()</code> instead of indexing, and avoids <code>unwrap()</code>/<code>expect()</code> on runtime data. The FFI layer turns errors into sentinels or <code>{\"error\": …}</code> JSON.",
+   "points":["abort = no unwinding; the process ends immediately","the engine lives in the host's process, so the host app dies","catch_unwind cannot recover it","hence no unwrap/indexing on untrusted data; errors are values (Option/Result) mapped to sentinels/JSON"],
+   "context":"Workspace rust/Cargo.toml sets [profile.release] panic = \"abort\". myotis-engine/src/host.rs says every function there is panic-free by construction. myotis-core/src/lib.rs: decoding untrusted bytes never panics because a panic crossing JNI kills the host process."},
+  {"id":"s00-q5","type":"mcq","tags":["domain"],
+   "q":"In the trust chain, what anchors an account balance that the reader returns?",
+   "options":["The answer of the fastest peer","A Merkle-Patricia proof against a state root, whose header is linked by hash to a block that the beacon light client verified through sync-committee BLS signatures","A local HTTP call to an execution client","The peer cache on disk"],
+   "answer":1,
+   "explain":"Rule 5: signatures anchor the beacon chain, which anchors an execution block hash, which anchors headers and their state roots, which anchor MPT proofs. HTTP calls to a local client are allowed only for debugging, never in production."}
+]</x-quiz>

@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 900 230" role="img" fill="currentColor" aria-label="revm calls the hooks of one RequestInspector. It forwards each hook to the recorders that are present: code_needed for the prefetch loop's discovery passes, access_list for eth_createAccessList, trace for debug_traceCall, and sim for eth_simulateV1. Each recorder is borrowed for the run and keeps its state in a RefCell." width="900" height="230">
+      <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="900.0" height="230.0" fill="#f8fafb" /><defs>
+        <marker id="m-08-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+        </marker>
+      </defs>
+      <rect x="20" y="80" width="160" height="70" rx="10" stroke-width="1.5" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="100" y="108" text-anchor="middle" font-size="13" font-weight="700">revm run</text>
+      <text x="100" y="128" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">step · call · create · log</text>
+
+      <rect x="250" y="80" width="190" height="70" rx="10" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="345" y="108" text-anchor="middle" font-size="13" font-weight="700">RequestInspector</text>
+      <text x="345" y="128" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">Option&lt;&amp;'a Recorder&gt; × 4</text>
+
+      <rect x="530" y="12" width="350" height="40" rx="8" stroke-width="1.2" style="fill:var(--surface);stroke:var(--ink-3)" />
+      <text x="545" y="37" font-size="12"><tspan font-weight="700">code_needed</tspan><tspan style="fill:var(--ink-2)"> · prefetch discovery passes (stop 7)</tspan></text>
+      <rect x="530" y="64" width="350" height="40" rx="8" stroke-width="1.2" style="fill:var(--surface);stroke:var(--ink-3)" />
+      <text x="545" y="89" font-size="12"><tspan font-weight="700">access_list</tspan><tspan style="fill:var(--ink-2)"> · eth_createAccessList (stop 7)</tspan></text>
+      <rect x="530" y="116" width="350" height="40" rx="8" stroke-width="1.5" style="fill:var(--jvm-wash);stroke:var(--jvm)" />
+      <text x="545" y="141" font-size="12"><tspan font-weight="700">trace</tspan><tspan style="fill:var(--ink-2)"> · TraceRecorder · debug_traceCall</tspan></text>
+      <rect x="530" y="168" width="350" height="40" rx="8" stroke-width="1.5" style="fill:var(--jvm-wash);stroke:var(--jvm)" />
+      <text x="545" y="193" font-size="12"><tspan font-weight="700">sim</tspan><tspan style="fill:var(--ink-2)"> · SimRecorder · eth_simulateV1</tspan></text>
+
+      <line x1="180" y1="115" x2="247" y2="115" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-08-arrow)" />
+      <path d="M440 115 L490 115 L490 32 L527 32" fill="none" stroke="currentColor" stroke-width="1.2" marker-end="url(#m-08-arrow)" />
+      <path d="M490 84 L527 84" fill="none" stroke="currentColor" stroke-width="1.2" marker-end="url(#m-08-arrow)" />
+      <path d="M490 115 L490 136 L527 136" fill="none" stroke="currentColor" stroke-width="1.2" marker-end="url(#m-08-arrow)" />
+      <path d="M490 136 L490 188 L527 188" fill="none" stroke="currentColor" stroke-width="1.2" marker-end="url(#m-08-arrow)" />
+      <text x="20" y="200" font-size="11" style="fill:var(--ink-3)">blue: this stop</text>
+    </svg>

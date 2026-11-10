@@ -282,7 +282,7 @@ internal fun vitalsOf(s: NodeSnapshot?, deepPoolThreshold: Int, catchUp: CatchUp
 }
 
 /**
- * Today's data usage (docs/data-usage.md): the total, and beneath it the metered /
+ * Today's data usage (docs/how-it-works/data-usage.md): the total, and beneath it the metered /
  * unmetered split where the host can tell the two apart — else the two directions, so
  * a host that never knows (desktop) does not call every byte unmetered. Informational:
  * no tone. Null where the host does not report usage.

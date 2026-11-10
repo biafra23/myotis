@@ -1,0 +1,439 @@
+<!--meta {"id":"stop-04","num":4,"title":"myotis-core: bytes, hashes and tries","short":"myotis-core","sub":"14 files · 3,603 lines","part":"Pure foundations"} -->
+<header class="stop-head">
+  <div class="eyebrow">Stop 4 · crate <code>myotis-core</code> <span>14 files · 3,603 lines · about 135 minutes</span></div>
+  <h1>myotis-core: bytes, hashes and tries</h1>
+  <p class="lede">RLP, keccak-256, secp256k1 identities, block headers, ENRs, fork ids, Merkle-Patricia proofs, blooms and the EIP-1559 base fee. These are the pure primitives under every execution-layer (EL) network message. There are no threads, no <code>Arc</code> and no <code>async</code> in this crate, and since September it also compiles <strong>without the standard library</strong>. It is the best place to get comfortable with <strong>which bytes are borrowed and which are owned</strong>, and with lifetimes that point at a caller's buffer.</p>
+</header>
+
+<div class="learn">
+  <h2>Rust you will practise</h2>
+  <div><b>Borrowed views</b>a <code>View&lt;'a&gt;</code> whose accessors return slices of the caller's buffer, next to an owned <code>Item</code> tree, and when the compiler forces a copy.</div>
+  <div><b>no_std and features</b><code>core</code>, <code>alloc</code> and <code>std</code> as three layers, a Cargo feature that switches between them, and how features unify across a build.</div>
+  <div><b>Errors as values</b>a one-field error type, <code>?</code>, <code>map_err</code>, <code>ok_or_else</code>, and a proof verdict enum that never panics.</div>
+</div>
+
+<div class="callout rust">
+  <span class="k">The crate's promise</span>
+  <p>“Sans-I/O by rule” (lib.rs, lines 4–7): every function is a pure function over caller-supplied bytes. There are no sockets, files, clocks or entropy. That is why key <em>generation</em> is not here, and why <code>k256</code> is built without its <code>std</code> feature. Decoding untrusted bytes never panics, because the workspace's release profile sets <code>panic = "abort"</code> and a panic would end the host process. The newer half of the promise is <code>no_std</code>: with the <code>std</code> feature off, the compiler itself refuses any use of the standard library.</p>
+</div>
+
+<div class="callout watch">
+  <span class="k">What changed since September</span>
+  <p>The crate became <code>no_std</code> + <code>alloc</code> with a default <code>std</code> feature. <code>rlp.rs</code> grew allocation-free readers (<code>View</code>, <code>ViewIter</code>, <code>ListBuf</code>, <code>validate</code>, <code>raw_list_prefix</code>) after a 10 MiB peer frame cost 547 MB of heap (#454), plus differential tests that pin them to the decoder. <code>header.rs</code> decodes through a <code>View</code> and reads Amsterdam's two new fields. <code>forkid.rs</code> now computes CRC32 to step the pinned fork id across one known fork and to invert it. <code>trie.rs</code> can return the <code>eth_getProof</code> path, and uses a <code>BTreeMap</code> instead of a <code>HashMap</code>. <code>fees.rs</code> and <code>tests/rlp_alloc_bound.rs</code> are new.</p>
+</div>
+
+<section class="prose">
+  <h3>Cargo.toml: one feature, three layers of library</h3>
+  <p>Rust's standard library is really three crates stacked on each other. <code>core</code> needs nothing from the machine: slices, arrays, <code>Option</code>, <code>Result</code>, iterators, formatting traits. <code>alloc</code> adds what needs a heap: <code>Vec</code>, <code>String</code>, <code>Box</code>, <code>BTreeMap</code>, the <code>format!</code> and <code>vec!</code> macros. <code>std</code> adds what needs an operating system: files, sockets, threads, clocks, and <code>HashMap</code>, whose default hasher is seeded from OS randomness. A crate marked <code>#![no_std]</code> links only <code>core</code> (plus <code>alloc</code> if it asks), so it can run on firmware or a bare-metal target. There is no JVM equivalent: a Java library always gets the whole JDK.</p>
+  <p>A <strong>Cargo feature</strong> is a named compile-time switch, declared in <code>[features]</code>. Code tests it with <code>#[cfg(feature = "std")]</code>, and the compiler removes the code that is switched off before type checking. Think of a Gradle build variant, except that it works per crate and inside the source file. myotis-core declares one feature, on by default:</p>
+</section>
+
+<figure class="diagram">
+  <div class="svg-wrap">
+  <svg class="wide-diagram" viewBox="0 0 940 250" role="img" fill="currentColor" xmlns="http://www.w3.org/2000/svg"
+       aria-label="Three nested boxes. The innermost is core: slices, arrays, Option, Result, iterators, fmt and core::error::Error. Around it is alloc: Vec, String, Box, BTreeMap, format! and vec!. Around that is std: HashMap, fs, net, thread, time and OS randomness. To the right: with the std feature on, the default, myotis-core links std like any crate. With it off, the crate is no_std, uses only core and alloc, and a bare-metal program that links it must provide a global allocator.">
+    <rect x="20" y="16" width="560" height="220" rx="8" stroke-width="1.2" style="fill:var(--ground-2);stroke:var(--rule)"/>
+    <text x="36" y="40" font-size="12" font-weight="700" letter-spacing="1.2" style="fill:var(--ink-2)">STD</text>
+    <text x="80" y="40" font-size="12" class="mono" style="fill:var(--ink-2)">HashMap, fs, net, thread, time, OS randomness</text>
+    <rect x="40" y="56" width="520" height="166" rx="8" stroke-width="1.2" style="fill:var(--jvm-wash);stroke:var(--rule)"/>
+    <text x="56" y="80" font-size="12" font-weight="700" letter-spacing="1.2" style="fill:var(--jvm-ink)">ALLOC</text>
+    <text x="110" y="80" font-size="12" class="mono" style="fill:var(--ink)">Vec, String, Box, BTreeMap, format!, vec!</text>
+    <rect x="60" y="98" width="480" height="108" rx="8" stroke-width="1.2" style="fill:var(--oxide-wash);stroke:var(--rule)"/>
+    <text x="76" y="122" font-size="12" font-weight="700" letter-spacing="1.2" style="fill:var(--oxide-ink)">CORE</text>
+    <text x="76" y="146" font-size="12" class="mono" style="fill:var(--ink)">slices, arrays, Option, Result,</text>
+    <text x="76" y="166" font-size="12" class="mono" style="fill:var(--ink)">iterators, fmt, core::error::Error</text>
+    <text x="76" y="190" font-size="11.5" style="fill:var(--ink-3)">needs nothing from the machine</text>
+    <text x="604" y="60" font-size="12" font-weight="700" style="fill:var(--ok-ink)">feature "std" ON (default)</text>
+    <text x="604" y="80" font-size="12" style="fill:var(--ink-2)">myotis-core is an ordinary crate;</text>
+    <text x="604" y="98" font-size="12" style="fill:var(--ink-2)">it links all three layers.</text>
+    <text x="604" y="140" font-size="12" font-weight="700" style="fill:var(--warn-ink)">feature "std" OFF</text>
+    <text x="604" y="160" font-size="12" style="fill:var(--ink-2)">#![no_std]: only core + alloc.</text>
+    <text x="604" y="178" font-size="12" style="fill:var(--ink-2)">A bare-metal program linking it</text>
+    <text x="604" y="196" font-size="12" style="fill:var(--ink-2)">must supply a global allocator.</text>
+  </svg>
+  </div>
+  <figcaption>The three layers of Rust's standard library. myotis-core stays inside the inner two unless its <code>std</code> feature is on.</figcaption>
+</figure>
+
+<x-code src="repo:rust/myotis-core/Cargo.toml" from="23" to="32" lang="toml"></x-code>
+<ul class="concepts">
+  <li><x-tags>modules-cargo</x-tags> <strong>A feature can switch on features of dependencies.</strong> <code>std = ["sha3/std"]</code> means “when my <code>std</code> is on, turn on sha3's <code>std</code>”. sha3 is declared with <code>default-features = false</code> so that its own default does not pull <code>std</code> in behind the crate's back. <code>k256</code> (line 39) gets no <code>std</code> at all, because that chain would end in <code>getrandom</code>, an entropy source.</li>
+  <li><x-tags>modules-cargo</x-tags> <strong>Features unify.</strong> Within one build, Cargo compiles each crate once, with the union of every feature any dependent asked for. <code>myotis-wire</code> depends on myotis-core with <code>default-features = false</code> and forwards its own <code>std</code> (<code>myotis-wire/Cargo.toml</code>, lines 19 and 29). <code>myotis-net</code> and <code>myotis-evm</code> depend with defaults, so any build that contains them gets myotis-core with <code>std</code> on. Features are additive switches, never exclusions.</li>
+  <li><x-tags>modules-cargo</x-tags> <code>version.workspace = true</code> and <code>rust-version.workspace = true</code> (lines 3 and 5) inherit the values from the workspace's <code>Cargo.toml</code>, so every member reports one version and one minimum compiler.</li>
+</ul>
+<x-code src="repo:rust/myotis-core/Cargo.toml" from="41" to="53" lang="toml"></x-code>
+<p class="code-note"><x-tags>modules-cargo</x-tags> A <strong>target-specific dependency</strong>: the <code>[target.'cfg(…)'.dependencies]</code> table applies only when compiling for a matching target. myotis-core never uses sha2 itself. The entry exists to set a feature (<code>force-soft</code>) on a crate that arrives transitively through k256, and only for bare-metal targets. The comment records why: sha2's SIMD code fails at codegen there. The promise is checked by the root Gradle task <code>cargoBuildNoStd</code> (<code>build.gradle.kts</code>, lines 869–892). It runs <code>cargo build --target x86_64-unknown-none -p myotis-core -p myotis-wire --no-default-features</code>, a target that has no <code>std</code> at all. A stray <code>std::</code> import or a <code>HashMap</code> fails there and nowhere else, because every host builds the crate with <code>std</code> on.</p>
+
+<x-file path="rust/myotis-core/src/lib.rs" kind="library root" twin=":core module">
+  <p class="purpose">Turns <code>no_std</code> on when the <code>std</code> feature is off, declares the ten modules, and documents nine Java twins (lines 9–18, a handy lookup table). It defines the crate's single error type: a tuple struct holding a message, deliberately flat so it crosses FFI easily.</p>
+  <x-code src="myotis-core/src/lib.rs" from="24" to="58"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo macros</x-tags> <strong><code>#![cfg_attr(not(feature = "std"), no_std)]</code></strong> is a conditional attribute: “if the <code>std</code> feature is off, apply <code>#![no_std]</code> to this crate”. The <code>!</code> means it applies to the enclosing item, here the whole crate.</li>
+    <li><x-tags>modules-cargo</x-tags> <strong><code>extern crate alloc;</code></strong> makes the <code>alloc</code> crate nameable. Unlike <code>core</code> and <code>std</code>, it is not in scope by default, even in a <code>std</code> build. That is why every module starts with lines such as <code>use alloc::vec::Vec;</code> or <code>use alloc::format;</code>: a <code>no_std</code> crate's prelude has no <code>Vec</code>, <code>String</code> or <code>format!</code>. In a <code>std</code> build the same imports are harmless, because <code>std::vec::Vec</code> is the very same type re-exported.</li>
+    <li><x-tags>error-handling traits-generics</x-tags> A type becomes an “error” by implementing two traits, <code>Display</code> (the message) and <code>Error</code> (a marker with default methods). There is no inheritance hierarchy. It implements <code>core::error::Error</code> rather than <code>std::error::Error</code>; the comment on lines 52–53 explains these are the same trait, the <code>core</code> spelling being usable without <code>std</code>.</li>
+    <li><x-tags>traits-generics</x-tags> <code>err&lt;T&gt;(msg: impl Into&lt;String&gt;)</code> is generic twice. <code>T</code> is inferred from the caller's return type, so <code>return err("…")</code> fits any <code>Result&lt;X, CoreError&gt;</code>. <code>impl Into&lt;String&gt;</code> accepts both <code>&amp;str</code> and <code>String</code>. <code>pub(crate)</code> makes it visible to every module in this crate and invisible outside it.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/myotis-core/src/keccak.rs" kind="library" twin="Tuweni Hash.keccak256">
+  <p class="purpose">keccak-256, the execution-layer hash. The doc comment warns not to mix it with the consensus layer's SHA-256. <code>keccak256_concat</code> hashes <code>a ‖ b</code> by feeding the hasher twice, so no joined buffer is allocated.</p>
+  <x-code src="myotis-core/src/keccak.rs" from="8" to="24"></x-code>
+  <p class="code-note"><x-tags>ownership bytes-strings</x-tags> Returning <code>[u8; 32]</code> by value costs nothing on the heap: the 32 bytes are written into the caller's stack slot. In Java, <code>byte[]</code> is always a heap object. <code>copy_from_slice</code> panics only if the lengths differ, and here both are 32 by construction. The test module (line 26) is compiled only for <code>cargo test</code>, and it imports <code>format</code> and <code>String</code> from <code>alloc</code> (line 29) because, in a <code>no_std</code> test build, the prelude does not provide them.</p>
+</x-file>
+
+<x-file path="rust/myotis-core/src/fees.rs" kind="library">
+  <p class="purpose">New since September. EIP-1559's base-fee update: the next block's base fee follows from the parent's base fee, gas limit and gas used, rising when the parent was more than half full and falling when it was less. The module doc says it is the one copy for the fee estimates in <code>myotis-net</code> (<code>el/reader.rs</code>, <a href="#stop-14">stop 14</a>) and the simulated blocks in <code>myotis-evm</code> (<code>simulate.rs</code>, <a href="#stop-07">stop 7</a>).</p>
+  <x-code src="myotis-core/src/fees.rs" from="10" to="23"></x-code>
+  <ul class="concepts">
+    <li><x-tags>bytes-strings</x-tags> <strong><code>u128::from(gas_target)</code></strong> widens a <code>u64</code> through the <code>From</code> trait, which exists only for conversions that cannot lose information. <code>as</code> would also compile, but <code>as</code> truncates silently when it narrows, so <code>From</code> documents “this is lossless”.</li>
+    <li><x-tags>error-handling</x-tags> <strong>Saturating arithmetic.</strong> <code>saturating_mul</code>, <code>saturating_add</code> and <code>saturating_sub</code> clamp at <code>u128::MAX</code> or 0 instead of overflowing. In Rust a plain <code>*</code> that overflows panics in a debug build and wraps in release; Java's <code>*</code> always wraps. With saturation no input can do either. The <code>.max(1)</code> makes a rise at least one wei, which the test on line 34 attributes to geth.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/myotis-core/src/rlp.rs" kind="library" twin="Tuweni RLP / RlpItems.split">
+  <p class="purpose">A hand-written RLP codec. RLP encodes two kinds of value, byte strings and lists, each behind a one- to nine-byte header that gives its kind and length. This file now offers <strong>three ways to read</strong> the same bytes. <code>decode</code> builds an owned <code>Item</code> tree. <code>View</code> checks the bytes once, then reads them in place. <code>raw_list_items</code> and <code>raw_list_prefix</code> split a list into sub-slices of the input, because the wire layer must hash exactly the bytes a peer sent, never a re-encoding. All of them are strict about structure: minimal length prefixes, exact consumption, nesting depth at most 32, and no leading zeros in integers. The module docs (lines 4–10) explain why this is not <code>alloy-rlp</code>.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–35</td><td>Docs, imports, <code>enum Item { Bytes(Vec&lt;u8&gt;), List(Vec&lt;Item&gt;) }</code>, <code>MAX_DEPTH</code>.</td></tr>
+      <tr><td>37–109</td><td><code>Item</code>'s borrowing accessors, and the scalar readers it shares with <code>View</code>: <code>fixed_bytes</code>, <code>scalar_u64</code>, <code>fitting_long</code> (capped at <code>i64::MAX</code> for Java parity).</td></tr>
+      <tr><td>111–196</td><td><code>View&lt;'a&gt;</code> and <code>ViewIter&lt;'a&gt;</code>: a checked, borrowed item and the iterator over a list's elements.</td></tr>
+      <tr><td>198–268</td><td><code>ListBuf</code> (an owned list kept as one buffer of encodings) and <code>header</code>, the unchecked header reader the views use.</td></tr>
+      <tr><td>270–382</td><td>Public entry points: <code>decode</code>, <code>decode_at</code>, <code>validate</code>, <code>raw_list_items</code>, <code>raw_list_prefix</code>, <code>strip_bytes_header</code>, <code>is_list_prefix</code>.</td></tr>
+      <tr><td>384–529</td><td>Decoder core (<code>decode_item</code>, <code>read_long_length</code>, <code>decode_list_payload</code>), its allocation-free twin (<code>skip_item</code>, <code>skip_list_payload</code>), and <code>slice</code>, the one place sub-views are cut.</td></tr>
+      <tr><td>531–594</td><td>Encoders, which append to a caller-owned <code>&amp;mut Vec&lt;u8&gt;</code>.</td></tr>
+      <tr><td>596–656</td><td>Unit tests: spec examples, long strings, malformed inputs, 40 nested lists.</td></tr>
+      <tr><td>658–787</td><td>Differential tests (#454): every walker must give the decoder's verdict on every input.</td></tr>
+      <tr><td>789–965</td><td>Test helpers: the old <code>raw_list_items</code> as an oracle, the input generator, the corpus reader, a seeded <code>Rng</code>.</td></tr>
+    </tbody>
+  </table></div>
+
+  <figure class="diagram">
+    <div class="svg-wrap">
+    <svg class="wide-diagram" viewBox="0 0 940 300" role="img" fill="currentColor" xmlns="http://www.w3.org/2000/svg"
+         aria-label="A nine-byte buffer holding the RLP list cat, dog: c8 83 63 61 74 83 64 6f 67, owned by the caller. Left: rlp::decode copies it into an Item::List that owns two Item::Bytes vectors; the buffer may be dropped. Middle: View::new checks the buffer and keeps a pointer and length into it; its iterator yields Views of bytes 1 to 4 and 5 to 8; the buffer must outlive them. Right: ListBuf::push_view copies the two element encodings into one owned Vec of eight bytes with len 2: one allocation, not one per item.">
+      <defs>
+        <marker id="m-core-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+      <text x="336" y="24" font-size="12" class="mono" style="fill:var(--ink-2)">data: &amp;[u8]  = ["cat", "dog"]  (caller owns)</text>
+      <rect x="336" y="36" width="288" height="34" rx="4" stroke-width="1.2" style="fill:var(--surface);stroke:var(--rule)"/>
+      <rect x="336" y="36" width="32" height="34" style="fill:var(--ground-2)"/>
+      <text x="343" y="58" font-size="12" class="mono">c8</text>
+      <text x="375" y="58" font-size="12" class="mono">83</text>
+      <text x="407" y="58" font-size="12" class="mono">63</text>
+      <text x="439" y="58" font-size="12" class="mono">61</text>
+      <text x="471" y="58" font-size="12" class="mono">74</text>
+      <text x="503" y="58" font-size="12" class="mono">83</text>
+      <text x="535" y="58" font-size="12" class="mono">64</text>
+      <text x="567" y="58" font-size="12" class="mono">6f</text>
+      <text x="599" y="58" font-size="12" class="mono">67</text>
+      <line x1="496" y1="36" x2="496" y2="70" stroke-width="1" style="stroke:var(--rule)"/>
+      <line x1="368" y1="36" x2="368" y2="70" stroke-width="1" style="stroke:var(--rule)"/>
+
+      <!-- decode -->
+      <path d="M350 72 C 300 110, 200 110, 160 128" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-core-arrow)"/>
+      <text x="196" y="100" font-size="12" class="mono" style="fill:var(--ink-2)">rlp::decode (copies)</text>
+      <rect x="20" y="132" width="260" height="110" rx="6" style="fill:var(--jvm-wash)"/>
+      <text x="32" y="152" font-size="12" class="mono" font-weight="700">Item::List(Vec&lt;Item&gt;)</text>
+      <text x="44" y="176" font-size="12" class="mono">Item::Bytes(vec![63 61 74])</text>
+      <text x="44" y="198" font-size="12" class="mono">Item::Bytes(vec![64 6f 67])</text>
+      <text x="32" y="228" font-size="11.5" style="fill:var(--ink-2)">owns copies; buffer may be dropped</text>
+
+      <!-- view -->
+      <rect x="330" y="132" width="290" height="110" rx="6" style="fill:var(--oxide-wash)"/>
+      <text x="342" y="152" font-size="12" class="mono" font-weight="700">View { raw: ptr, len 9 }</text>
+      <text x="342" y="176" font-size="12" class="mono">.as_list() yields</text>
+      <text x="354" y="196" font-size="12" class="mono">View { raw: bytes 1..5 }</text>
+      <text x="354" y="214" font-size="12" class="mono">View { raw: bytes 5..9 }</text>
+      <text x="342" y="234" font-size="11.5" style="fill:var(--ink-2)">borrows; buffer must outlive it</text>
+      <line x1="352" y1="132" x2="352" y2="73" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-core-arrow)"/>
+      <line x1="432" y1="132" x2="432" y2="73" stroke="currentColor" stroke-width="1.2" stroke-dasharray="3 3" marker-end="url(#m-core-arrow)"/>
+      <line x1="560" y1="132" x2="560" y2="73" stroke="currentColor" stroke-width="1.2" stroke-dasharray="3 3" marker-end="url(#m-core-arrow)"/>
+
+      <!-- listbuf -->
+      <path d="M624 60 C 700 70, 760 100, 770 128" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-core-arrow)"/>
+      <text x="700" y="92" font-size="12" class="mono" style="fill:var(--ink-2)">push_view (copies)</text>
+      <rect x="670" y="132" width="250" height="110" rx="6" style="fill:var(--ok-wash)"/>
+      <text x="682" y="152" font-size="12" class="mono" font-weight="700">ListBuf {</text>
+      <text x="694" y="174" font-size="12" class="mono">payload: Vec [83 63 61 74</text>
+      <text x="795" y="192" font-size="12" class="mono">83 64 6f 67],</text>
+      <text x="694" y="210" font-size="12" class="mono">len: 2 }</text>
+      <text x="682" y="234" font-size="11.5" style="fill:var(--ink-2)">one buffer, not one Vec per item</text>
+      <text x="20" y="284" font-size="12" style="fill:var(--ink-2)">Per the docs (lines 21–25 and 289–293), the tree costs about 50 heap bytes per input byte. The other two cost what the bytes weigh.</text>
+    </svg>
+    </div>
+    <figcaption>Three representations of the same RLP list. Only the middle one has a lifetime parameter, because only it points into somebody else's memory.</figcaption>
+  </figure>
+
+  <h4>Owned tree</h4>
+  <x-code src="myotis-core/src/rlp.rs" from="26" to="44"></x-code>
+  <p class="code-note"><x-tags>ownership enums-patterns</x-tags> <code>Item</code> owns its bytes. It has no lifetime parameter, so a decoded tree can outlive the network frame it came from. <code>as_bytes(&amp;self) -&gt; Result&lt;&amp;[u8], _&gt;</code> lends a view <em>into the tree</em>: matching on <code>self: &amp;Item</code> binds <code>b: &amp;Vec&lt;u8&gt;</code>, which automatically dereferences to <code>&amp;[u8]</code>. The elided lifetime ties that slice to <code>&amp;self</code>, so it is valid only while the <code>Item</code> lives. The doc comment above the enum now warns that this is expensive for peer bytes and points to the alternatives below.</p>
+
+  <h4>A checked, borrowed view</h4>
+  <x-code src="myotis-core/src/rlp.rs" from="118" to="157"></x-code>
+  <ul class="concepts">
+    <li><x-tags>lifetimes borrowing</x-tags> <strong><code>View&lt;'a&gt;</code> holds one field, <code>raw: &amp;'a [u8]</code>.</strong> The <code>'a</code> is a name for “however long the caller's buffer lives”. The struct is two machine words (pointer and length), owns nothing, and derives <code>Copy</code>, so passing it by value is free and leaves the original usable.</li>
+    <li><x-tags>lifetimes</x-tags> <strong>Look at the return types.</strong> <code>raw(&amp;self) -&gt; &amp;'a [u8]</code> and <code>as_bytes(&amp;self) -&gt; Result&lt;&amp;'a [u8], _&gt;</code> name <code>'a</code> explicitly. Without the annotation the result would be tied to <code>&amp;self</code>, the borrow of the small <code>View</code> value. With it, the slice is tied to the <em>buffer</em>, and stays usable after the <code>View</code> itself has gone. Compare <code>Item::as_bytes</code> above, which must be tied to <code>&amp;self</code> because the bytes live inside the tree.</li>
+    <li><x-tags>error-handling</x-tags> <code>View::new</code> runs <code>validate</code> once. After that, the accessors trust the structure and read headers with the unchecked <code>header</code> helper. <code>.get(start..).and_then(|p| p.get(..len)).unwrap_or_default()</code> still cannot panic: if the impossible happens, it yields an empty slice (the default <code>&amp;[u8]</code>).</li>
+  </ul>
+  <x-code src="myotis-core/src/rlp.rs" from="184" to="196"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics iterators-closures</x-tags> <strong>Implementing <code>Iterator</code></strong> takes one associated type (<code>type Item = View&lt;'a&gt;</code>) and one method, <code>next</code>. Every adaptor (<code>map</code>, <code>take</code>, <code>count</code>, <code>collect</code>…) then comes for free, like a Kotlin <code>Sequence</code>. Note that <code>Item</code> here is the trait's associated type, not the <code>rlp::Item</code> enum.</li>
+    <li><x-tags>lifetimes borrowing</x-tags> <code>next(&amp;mut self)</code> borrows the iterator only for the call, yet it returns a <code>View&lt;'a&gt;</code> that lives longer. That is legal because the bytes do not belong to the iterator: <code>self.list</code> is a <code>&amp;'a [u8]</code>, and slicing it gives another <code>&amp;'a [u8]</code>. An iterator that handed out slices of its <em>own</em> buffer could not do this.</li>
+    <li><x-tags>error-handling</x-tags> Each <code>?</code> on an <code>Option</code> returns <code>None</code>, ending the iteration. <code>FusedIterator</code> is a marker trait with no methods: a promise that after the first <code>None</code> every later call also returns <code>None</code>, which some adaptors use to skip a check.</li>
+  </ul>
+  <p class="code-note"><x-tags>ownership</x-tags> <code>ListBuf</code> (lines 198–245) is the owned counterpart. It keeps the encodings of its items back to back in one <code>Vec&lt;u8&gt;</code> plus a count, and <code>iter()</code> hands out a <code>ViewIter</code> over its own buffer. Here the lifetime is elided: <code>iter(&amp;self) -&gt; ViewIter&lt;'_&gt;</code> ties the views to the <code>ListBuf</code>. In this snapshot it has no users outside its own test.</p>
+
+  <h4>The unchecked header reader</h4>
+  <x-code src="myotis-core/src/rlp.rs" from="247" to="268"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns</x-tags> <strong><code>let Some(&amp;first) = raw.first() else { return (0, 0); };</code></strong> is a let-else: bind the pattern or run the <code>else</code> block, which must leave the function. It replaces a nested <code>if let</code>.</li>
+    <li><x-tags>enums-patterns</x-tags> <code>match first</code> uses <strong>integer ranges</strong>. The five arms cover all 256 values of <code>u8</code>, and the compiler proves it, so no <code>_</code> arm is needed. The same five ranges appear in <code>decode_item</code> and <code>skip_item</code>.</li>
+    <li><x-tags>iterators-closures borrowing</x-tags> The closure <code>long</code> captures <code>raw</code> by shared reference. It folds the big-endian length bytes into a <code>usize</code>, and <code>map_or(0, …)</code> gives 0 when they are missing.</li>
+  </ul>
+
+  <h4>Where the bytes become owned</h4>
+  <x-code src="myotis-core/src/rlp.rs" from="384" to="421"></x-code>
+  <ul class="concepts">
+    <li><x-tags>borrowing ownership</x-tags> <code>payload</code> is a temporary view into <code>data</code>. <code>payload.to_vec()</code> is the exact moment bytes are copied into the tree. The new position travels back in a tuple <code>(Item, usize)</code>, like threading an <code>int offset</code> through Java code.</li>
+    <li><x-tags>error-handling</x-tags> <code>data.get(pos)</code> returns <code>Option&lt;&amp;u8&gt;</code>, and <code>Some(&amp;b)</code> copies the byte out. Plain <code>data[pos]</code> would panic on truncated input. The <code>depth</code> guard exists because a stack overflow aborts the process; there is no catchable <code>StackOverflowError</code>.</li>
+  </ul>
+  <p class="code-note"><x-tags>error-handling</x-tags> <code>skip_item</code> (lines 469–505) is the same function with every <code>Item</code> removed: the same checks in the same order with the same error strings, returning only the end offset. <code>validate</code> (lines 289–303) is <code>skip_item</code> plus the “no trailing bytes” rule, so it accepts exactly what <code>decode</code> accepts while allocating nothing. The cost of that design is duplicated logic, which the differential tests below keep honest.</p>
+
+  <h4>Zero-copy splitting, with a cap</h4>
+  <x-code src="myotis-core/src/rlp.rs" from="320" to="352"></x-code>
+  <ul class="concepts">
+    <li><x-tags>lifetimes borrowing</x-tags> Spelled out, the signature is <code>fn raw_list_prefix&lt;'a&gt;(data: &amp;'a [u8], max: usize) -&gt; Result&lt;Vec&lt;&amp;'a [u8]&gt;, CoreError&gt;</code>. Each element (<code>&amp;data[pos..next]</code>) points into the caller's frame, so the caller cannot drop the frame while using the list. The eth layer does exactly that: split a response into raw headers, hash each raw slice, then copy what it keeps.</li>
+    <li><x-tags>error-handling</x-tags> <code>checked_add(…).filter(…).ok_or_else(…)?</code> turns an overflowing or mismatched length into an <code>Err</code>. <code>*data.first().ok_or_else(…)?</code> dereferences the <code>&amp;u8</code> to copy the byte.</li>
+    <li><x-tags>domain</x-tags> <strong>Why <code>max</code>.</strong> Every element is still walked and checked, but only the first <code>max</code> are kept. A <code>Vec</code> of slices costs 16 bytes per element, and a peer can pack millions of one-byte elements into one frame. <code>raw_list_items(data)</code> (line 316) is simply <code>raw_list_prefix(data, usize::MAX)</code>. <code>myotis-wire</code>'s gossip handlers call it with a cap (<a href="#stop-05">stop 5</a>).</li>
+  </ul>
+  <p class="code-note"><x-tags>borrowing</x-tags> <code>slice</code> (lines 524–529) is where sub-views are cut for the decoder. Its guard <code>Some(end) if end &lt;= data.len()</code> makes the indexing <code>&amp;data[start..end]</code> provably in bounds.</p>
+
+  <h4>Differential tests</h4>
+  <x-code src="myotis-core/src/rlp.rs" from="661" to="681"></x-code>
+  <ul class="concepts">
+    <li><x-tags>testing iterators-closures</x-tags> <code>each_differential_input(|input| { … })</code> takes a closure of type <code>impl FnMut(&amp;[u8])</code> and calls it on about 100,000 inputs: every string of up to two bytes, nesting either side of <code>MAX_DEPTH</code>, the shared EL corpus, and seeded random trees with truncations and header mutations. <code>FnMut</code> because the closures mutate captured state (<code>rng</code> here, counters in <code>validate_agrees_with_decode</code>).</li>
+    <li><x-tags>testing error-handling</x-tags> <code>decode_item(…).map(|(_, end)| end)</code> turns <code>Result&lt;(Item, usize), _&gt;</code> into <code>Result&lt;usize, _&gt;</code>, dropping the tree. Comparing two <code>Result</code>s with <code>assert_eq!</code> compares the error messages too, so the two walkers must fail with the same text, not just both fail.</li>
+    <li><x-tags>testing</x-tags> <code>validate_agrees_with_decode</code> (lines 683–693) ends with <code>assert!(accepted &gt; 5_000 &amp;&amp; rejected &gt; 5_000)</code>. A differential test whose inputs were all rejected would pass while checking nothing; this line makes it fail instead.</li>
+  </ul>
+  <x-code src="myotis-core/src/rlp.rs" from="887" to="912"></x-code>
+  <p class="code-note"><x-tags>modules-cargo testing</x-tags> <strong>Feature gating inside a file.</strong> Two functions with the same name, each behind an opposite <code>#[cfg]</code>, so exactly one exists in any build. The <code>std</code> one reads files with <code>std::fs</code>; the <code>no_std</code> one returns nothing, and the generated inputs still run. The <code>while let Some(dir) = dirs.pop()</code> loop walks directories with an explicit stack instead of recursion, and <code>let Ok(entries) = … else { continue };</code> skips an unreadable directory. <code>env!("CARGO_MANIFEST_DIR")</code> is expanded at compile time to the crate's directory.</p>
+</x-file>
+
+<x-file path="rust/myotis-core/src/nodekey.rs" kind="library" twin="core.crypto.NodeKey">
+  <p class="purpose">The node's secp256k1 identity, built from caller-supplied secret bytes. It provides the 64-byte public key and <code>nodeId = keccak256(pubkey)</code>, signing of 32-byte prehashes as <code>r ‖ s ‖ v</code> (low-s, RFC 6979), public-key recovery, raw ECDH (the X coordinate, no KDF), and SEC1 compression. discv4, RLPx, ENR handling and <code>tor-poc</code> all use it. Unchanged since September apart from one <code>alloc</code> import.</p>
+  <x-code src="myotis-core/src/nodekey.rs" from="23" to="37"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics</x-tags> <strong>Invariant through privacy.</strong> The fields are private and the only constructor validates the scalar, so every <code>NodeKey</code> in existence is valid. The type derives nothing: it cannot be <code>Clone</code>d or printed with <code>{:?}</code>. The file does not say why.</li>
+    <li><x-tags>error-handling</x-tags> <code>.map_err(|_| CoreError(…))?</code> converts k256's error type into this crate's, then propagates it.</li>
+    <li><x-tags>bytes-strings</x-tags> <code>secret: &amp;[u8; 32]</code> puts the length in the type, so a 31-byte input is a compile error rather than a runtime check. <code>secret.into()</code> converts that array reference into k256's own fixed-size byte type.</li>
+  </ul>
+  <x-code src="myotis-core/src/nodekey.rs" from="95" to="100"></x-code>
+  <p class="code-note"><x-tags>enums-patterns</x-tags> <code>v @ 0..=1</code> matches a range and binds the matched value to <code>v</code>. The <code>match</code> is an expression producing <code>recid</code>, yet each arm can still leave the function (<code>?</code> or <code>return</code>). <code>sig65[64]</code> cannot panic, because the type guarantees 65 bytes.</p>
+</x-file>
+
+<x-file path="rust/myotis-core/src/header.rs" kind="library" twin="core.types.BlockHeader">
+  <p class="purpose">Decodes an execution block header. The 15 mandatory fields come first, then the optional fork fields are read <em>by what remains in the list</em>, not by fork detection. <code>requestsHash</code> must be a byte string and is then discarded. Since September the decoder also reads Amsterdam's <code>blockAccessListHash</code> and <code>slotNumber</code> when they are well-formed, and tolerates anything after them. <code>hash()</code> always hashes the <strong>raw</strong> bytes as received; <code>encode()</code> re-encodes only the fields through <code>parentBeaconBlockRoot</code>.</p>
+  <x-code src="myotis-core/src/header.rs" from="25" to="63"></x-code>
+  <ul class="concepts">
+    <li><x-tags>bytes-strings</x-tags> Three storage choices appear in the struct: <code>[u8; 32]</code> for roots (inline), <code>Vec&lt;u8&gt;</code> for big scalars kept as minimal big-endian bytes (Java uses <code>BigInteger</code>), and <code>Option&lt;…&gt;</code> for fork-dependent fields, where Java uses a <code>-1</code> sentinel.</li>
+    <li><x-tags>macros traits-generics</x-tags> The struct derives <code>Debug, Clone, PartialEq, Eq, Default</code> (line 25). <code>Default</code> gives a zeroed header, and the tests use it with struct-update syntax, <code>..BlockHeader::default()</code> (line 284), to fill the fields they do not name.</li>
+    <li><x-tags>domain</x-tags> <code>slot_number</code> is the beacon slot that the EVM's <code>SLOTNUM</code> opcode returns. Its doc says the EVM refuses an Amsterdam block whose slot is <code>None</code> rather than guessing.</li>
+  </ul>
+  <x-code src="myotis-core/src/header.rs" from="73" to="101"></x-code>
+  <ul class="concepts">
+    <li><x-tags>borrowing lifetimes</x-tags> <strong>Two doors, one implementation.</strong> <code>decode(&amp;[u8])</code> builds a <code>View</code> and calls <code>decode_view</code>. A caller that already holds a checked <code>View</code>, such as one header inside a peer's <code>BlockHeaders</code> response, calls <code>decode_view</code> directly and skips a second validation. <code>rlp::View&lt;'_&gt;</code> says “a view of some buffer; the name of its lifetime does not matter here”.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>let mut f = top.as_list()?;</code> is a <code>ViewIter</code> used as a cursor: each <code>f.next()</code> yields the next field, and once the list ends, the optional fields become <code>None</code>. <code>f.clone().take(15).count()</code> counts up to 15 fields on a <em>copy</em> of the cursor, so <code>f</code> itself has not moved. <code>ViewIter</code> derives <code>Clone</code> but not <code>Copy</code>, the usual choice for iterators, so a copy is always visible in the source.</li>
+    <li><x-tags>ownership lifetimes</x-tags> <strong>The header copies every field.</strong> <code>BlockHeader</code> has no lifetime parameter, so it can hold only owned data. It cannot keep the <code>&amp;'a [u8]</code> slices the view hands out, and the helpers copy each field into an array or a <code>Vec</code>. This is a choice: a <code>BlockHeader&lt;'a&gt;</code> would avoid the copies but could never outlive the frame it came from.</li>
+  </ul>
+  <x-code src="myotis-core/src/header.rs" from="139" to="147"></x-code>
+  <p class="code-note"><x-tags>iterators-closures error-handling</x-tags> <strong>Tolerant by design.</strong> <code>Option</code> combinators instead of <code>?</code>: <code>f.next()</code> may be <code>None</code>, <code>.and_then(|it| it.as_fixed_bytes(32).ok())</code> turns a wrong-sized field into <code>None</code> too, and <code>.map(|b| …)</code> copies the 32 bytes out. Nothing here can return an error. The comment above (lines 129–138) explains why: everything after <code>requestsHash</code> must stay tolerated, as the corpus vector <code>006-header-future-extra</code> pins. The slot is read only when a 32-byte hash came first.</p>
+  <x-code src="myotis-core/src/header.rs" from="219" to="227"></x-code>
+  <p class="code-note"><x-tags>error-handling ownership</x-tags> <code>ok_or_else</code> turns the <code>Option</code> into a <code>Result</code> so <code>?</code> can bail. <code>b</code> is a slice of the caller's input, and <code>copy_from_slice</code> copies it into an array this function owns and returns by value. The <code>encode</code> method (lines 176–216) drops <code>requestsHash</code> and the Amsterdam pair rather than shifting them, so a re-encode matches the input only for pre-Prague headers; its doc says so, and the test on line 316 asserts the hashes differ.</p>
+</x-file>
+
+<x-file path="rust/myotis-core/src/enr.rs" kind="library" twin="core.enr.Enr">
+  <p class="purpose">Decodes Ethereum Node Records (EIP-778) from <code>enr:</code> base64url text or raw RLP: sequence number, a sorted map of key/value pairs, and the raw encoding. Accessors parse ip, ports, the secp256k1 key and the consensus-layer <code>eth2</code> field. The list-valued <code>eth</code> fork id is re-parsed from the raw bytes on demand. The record signature is <em>not</em> verified here; the updated module doc explains that these records only seed dials, and that <code>myotis-net</code>'s own DNS walk uses the <code>enr</code> crate, which does verify. <code>base64url_decode</code> became public for that DNS walk.</p>
+  <x-code src="myotis-core/src/enr.rs" from="157" to="177"></x-code>
+  <ul class="concepts">
+    <li><x-tags>error-handling</x-tags> A chain of <code>.ok()?</code>: every <code>Result</code> becomes an <code>Option</code>, and any malformed piece yields <code>None</code>. There is not a single <code>if</code> for error handling.</li>
+    <li><x-tags>borrowing</x-tags> <code>items.get(2..)?</code> is the panic-free form of <code>&amp;items[2..]</code>. Every variable here (<code>kv</code>, <code>pair</code>, <code>outer</code>, <code>tuple</code>, <code>fork_hash</code>) is a view into the local tree <code>top</code>. Only the final 4 bytes are copied out into an owned array, and <code>top</code> is dropped when the function returns.</li>
+    <li><x-tags>smart-pointers bytes-strings</x-tags> In <code>decode</code> (line 70), <code>String::from_utf8_lossy</code> returns a <code>Cow&lt;str&gt;</code>, “clone on write”: borrowed if the bytes were valid UTF-8, owned only if characters had to be replaced. <code>.into_owned()</code> then forces a <code>String</code>. The map is a <code>BTreeMap</code>, imported from <code>alloc::collections</code>.</li>
+  </ul>
+  <x-code src="myotis-core/src/enr.rs" from="185" to="195"></x-code>
+  <p class="code-note"><x-tags>enums-patterns</x-tags> Matching on a tuple, <code>match (trimmed.len() % 4, pad)</code>, checks two values at once. <code>(_, 0)</code> accepts any length without padding; <code>(2, 2) | (3, 1)</code> are the only correct padded shapes. The rest of the function (to line 220) decodes six bits per character into a <code>u32</code> buffer and emits a byte whenever eight bits are ready.</p>
+</x-file>
+
+<x-file path="rust/myotis-core/src/forkid.rs" kind="library" twin="NetworkConfig fork-id pins / ForkIds">
+  <p class="purpose">EIP-2124 fork ids. Every node announces a 4-byte fork hash (a CRC32 over the genesis hash and every past fork's activation) and a <code>forkNext</code>, and peers disconnect on a mismatch. myotis does not compute its hash from genesis. It <strong>pins</strong> one per network (mainnet, gnosis, chiado, sepolia, lines 29–46) together with the one next fork it knows. What changed since September is that the CRC32 arithmetic now lives here too, for two narrow jobs: stepping the pin across that one known fork (<code>fork_id_at</code>), and, for <code>myotis-net</code>'s fork watch, recovering the activation that would turn our hash into a peer's unknown one (<code>activation_of</code>).</p>
+  <x-code src="myotis-core/src/forkid.rs" from="69" to="80"></x-code>
+  <p class="code-note"><x-tags>domain</x-tags> Sepolia's <code>SEPOLIA_FORK_NEXT</code> is Amsterdam at 2026-10-06 13:53:36 UTC, so a Sepolia node has announced the successor hash since then (the doc on line 45 gives it as <code>0x6c1d9423</code>), while mainnet, gnosis and chiado have <code>forkNext = 0</code> and keep their pins. Activation values below <code>TIMESTAMP_THRESHOLD</code> are block numbers and never switch here.</p>
+  <x-code src="myotis-core/src/forkid.rs" from="87" to="123"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership</x-tags> <strong>Computed at compile time.</strong> A <code>const</code> initialiser is evaluated by the compiler, and the 256-entry table ends up as data in the binary, like a Java <code>static final</code> array that needs no static initialiser. Const evaluation allows <code>while</code> but not <code>for</code>, because a <code>for</code> loop calls <code>Iterator::next</code>, a trait method that cannot run at compile time. Hence the hand-counted <code>n</code> and <code>k</code>.</li>
+    <li><x-tags>bytes-strings</x-tags> <code>!crc</code> is bitwise NOT on an integer (Java's <code>~</code>). <code>b as u32</code> widens a byte. <code>activation.to_be_bytes()</code> gives the 8 big-endian bytes EIP-2124 feeds into the CRC.</li>
+    <li><x-tags>domain</x-tags> The comment on <code>crc32_update</code> names the point: it resumes from a previous checksum, which <code>java.util.zip.CRC32</code> cannot do. So the hash after a fork follows from the hash before it plus the activation alone.</li>
+  </ul>
+  <x-code src="myotis-core/src/forkid.rs" from="143" to="160"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain</x-tags> <strong>Running CRC32 backwards.</strong> One CRC step is <code>new = T[idx] ^ (old &gt;&gt; 8)</code>. The top byte of <code>old &gt;&gt; 8</code> is zero, so the top byte of <code>new</code> is the top byte of <code>T[idx]</code>, and the 256 table entries all have distinct top bytes (<code>TOP_INDEX</code>, lines 125–135). So the target fixes each step's table index. The first loop feeds the four zero high bytes of a 32-bit activation; the second walks the target back four steps to learn the indices; the third picks each activation byte so that <code>(a ^ byte) &amp; 0xff</code> lands on its index.</li>
+    <li><x-tags>borrowing</x-tags> <code>for slot in idx.iter_mut().rev()</code> yields <code>&amp;mut u8</code> references into the array, last to first, and <code>*slot = …</code> writes through each one.</li>
+  </ul>
+  <div class="callout watch">
+    <span class="k">A placement is not proof</span>
+    <p>The module doc (lines 22–23) and the test <code>every_hash_places_somewhere_so_a_placement_is_not_proof</code> make the limit explicit: every 32-bit hash has exactly one activation below 2<sup>32</sup> that produces it. Inverting a peer's hash tells you <em>where</em> a fork would have to be, not that one exists. The test's comment adds that the fork watch votes by network and weighs dissent instead of trusting one placement.</p>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-core/src/trie.rs" kind="library" twin="MerklePatriciaProofVerifier + HexPrefix">
+  <p class="purpose">Verifies Merkle-Patricia proofs. This is the state trust anchor for everything snap peers serve. Input: a trusted root, the un-hashed key (callers pass <code>keccak(address)</code> or <code>keccak(slot)</code>), and a peer's node list. Output: <code>Found(value)</code>, <code>Absent</code> or <code>Invalid(reason)</code>. It never panics and never returns <code>Err</code>. The walk is <em>iterative</em>, unlike the recursive Java one, so a hostile proof cannot grow the stack. New since September: <code>verify_proof_path</code> also returns the nodes the walk visited, root first, in the shape <code>eth_getProof</code> (EIP-1186) lists them. The file also decodes verified account and storage leaves; per its docs, it is “THE ONLY legitimate source of <code>storage_root</code>/<code>code_hash</code>”.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–34</td><td>Docs; the well-known empty-trie and empty-code roots.</td></tr>
+      <tr><td>36–73</td><td><code>ProofResult</code>, <code>verify_proof</code> and <code>verify_proof_path</code>, two thin wrappers around one walk.</td></tr>
+      <tr><td>75–155</td><td><code>walk</code>: hash index of nodes, bounded iterative descent, a <code>visit</code> callback.</td></tr>
+      <tr><td>157–211</td><td><code>AccountLeaf</code>, <code>decode_account_leaf</code>, <code>decode_storage_leaf</code>. Stricter than Java: leading-zero scalars are rejected.</td></tr>
+      <tr><td>213–315</td><td><code>enum Step</code> and <code>interpret</code> / <code>interpret_branch</code> / <code>interpret_short</code>.</td></tr>
+      <tr><td>317–374</td><td>Hex-prefix helpers and <code>to_nibbles</code> (<code>pub(crate)</code>, reused by <code>triehash</code>).</td></tr>
+      <tr><td>376–525</td><td>Tests, including the proof-path shapes.</td></tr>
+    </tbody>
+  </table></div>
+  <p><x-tags>enums-patterns error-handling</x-tags> <code>ProofResult</code> (lines 36–46) is an error-as-data sum type, like a Kotlin sealed class with three subclasses. Callers must handle all three outcomes, and there is no exception path at all.</p>
+  <x-code src="myotis-core/src/trie.rs" from="62" to="73"></x-code>
+  <ul class="concepts">
+    <li><x-tags>iterators-closures borrowing</x-tags> <strong>A closure that borrows mutably.</strong> <code>walk</code> takes <code>mut visit: impl FnMut(&amp;[u8])</code>. <code>verify_proof</code> passes <code>|_| {}</code>, which does nothing. Here the closure <code>|node| path.push(node.to_vec())</code> captures <code>path</code> by <em>mutable</em> borrow, so while <code>walk</code> runs nobody else may touch <code>path</code>. The closure is a temporary argument, dropped when <code>walk</code> returns, which ends the borrow and makes <code>path.clear()</code> legal on the next line. A Java lambda cannot assign a captured local at all; it would mutate a list object instead, and nothing would stop two parties mutating it at once.</li>
+    <li><x-tags>ownership</x-tags> <code>node.to_vec()</code> copies each visited node: the path outlives the borrowed <code>proof_nodes</code>, so it must own its bytes. Only nodes looked up by hash are visited, so an embedded child stays inside its parent, which the doc compares to geth's <code>trie.Prove</code>.</li>
+  </ul>
+  <x-code src="myotis-core/src/trie.rs" from="113" to="155"></x-code>
+  <ul class="concepts">
+    <li><x-tags>borrowing lifetimes</x-tags> The index above this excerpt (lines 97–100) is a <code>BTreeMap&lt;[u8; 32], &amp;[u8]&gt;</code>. The <em>keys</em> are owned arrays, compared by content. The <em>values</em> are views into <code>proof_nodes</code>, so no node bytes are copied, and the map cannot outlive the node list. A Java <code>HashMap&lt;byte[], byte[]&gt;</code> would compare keys by identity, which is a classic bug.</li>
+    <li><x-tags>modules-cargo</x-tags> <strong>Why <code>BTreeMap</code>?</strong> In September this was a <code>HashMap</code>. <code>HashMap</code> exists only in <code>std</code>, since its default hasher is seeded from OS randomness, and the <code>no_std</code> build forbids it. A sorted tree map lives in <code>alloc</code>. For the handful of nodes in a proof, its O(log n) lookup costs nothing noticeable.</li>
+    <li><x-tags>borrowing</x-tags> <code>by_hash.get(&amp;expected_hash)</code> returns <code>Option&lt;&amp;&amp;[u8]&gt;</code>, a reference to the stored reference. <code>Some(n) =&gt; *n</code> copies the inner <code>&amp;[u8]</code>, which is cheap because shared references are <code>Copy</code>.</li>
+    <li><x-tags>ownership enums-patterns</x-tags> <strong>The owned state machine.</strong> <code>interpret(&amp;current, …)</code> borrows <code>current</code> only for the call and returns an <em>owned</em> <code>Step</code>. So <code>current = child;</code> is legal, and it drops the old subtree. If <code>Step::Embedded</code> held a <em>reference</em> into <code>current</code>, the assignment would be rejected. That is why the child is cloned:</li>
+  </ul>
+  <x-code src="myotis-core/src/trie.rs" from="242" to="266"></x-code>
+  <p class="code-note"><x-tags>enums-patterns</x-tags> <code>it @ Item::List(_)</code> binds the whole matched value to <code>it</code>. <code>Item::Bytes(child) if child.is_empty()</code> is a <em>guard</em>. Arms are tried top to bottom, so the unguarded <code>Item::Bytes(child)</code> at the end catches every remaining length. <code>it.clone()</code> produces an independent subtree the loop can own.</p>
+  <div class="callout watch">
+    <span class="k">Design decision</span>
+    <p>The <code>lookups</code> counter guarantees termination structurally, even though a keccak cycle is cryptographically infeasible (the comment on lines 107–112 says so). When the consequence of a bug is an app abort or a hang, the code prefers guarantees it can see to arguments it has to trust.</p>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-core/src/triehash.rs" kind="library" twin="consensus.proof.OrderedTrieRoot">
+  <p class="purpose">Builds an ordered trie root bottom-up, with keys <code>RLP(index)</code> (not hashed). This is how a block's <code>transactionsRoot</code> and <code>receiptsRoot</code> are checked against a trusted header without trusting the peer that served the body or receipts. Children under 32 bytes are inlined; larger ones are referenced by hash. Since September it accepts any iterator of slices instead of a <code>&amp;[Vec&lt;u8&gt;]</code>.</p>
+  <x-code src="myotis-core/src/triehash.rs" from="21" to="36"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics lifetimes</x-tags> <strong><code>items: impl IntoIterator&lt;Item = &amp;'a [u8]&gt;</code></strong> accepts anything that can be iterated into byte slices, such as an array of slices or <code>vec.iter().map(Vec::as_slice)</code>. The caller no longer has to build a <code>Vec&lt;Vec&lt;u8&gt;&gt;</code> first, which would copy every transaction. The named <code>'a</code> lets the slices be stored in <code>entries</code>.</li>
+    <li><x-tags>ownership borrowing</x-tags> <code>Vec&lt;(Vec&lt;u8&gt;, &amp;[u8])&gt;</code> pairs a freshly <em>owned</em> nibble key with a <em>borrowed</em> item, so no transaction bytes are copied while building.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>into_iter().enumerate().map(|(i, v)| …).collect()</code> is a Kotlin <code>mapIndexed</code>. <code>sort_by(|a, b| a.0.cmp(&amp;b.0))</code> sorts by key because the trie shape follows nibble order, not index order: <code>RLP(0) = 0x80</code> sorts after <code>RLP(1..=127)</code>. The empty check moved after <code>collect</code>, because an <code>IntoIterator</code> does not tell its length up front.</li>
+  </ul>
+  <x-code src="myotis-core/src/triehash.rs" from="56" to="65"></x-code>
+  <p class="code-note"><x-tags>ownership</x-tags> <code>let mut branch_value: &amp;[u8] = &amp;[];</code> starts as an empty <code>'static</code> slice. <code>Default::default()</code> builds an array of 16 empty <code>Vec</code>s. Keys are <code>clone</code>d into the groups because each group owns its entries, while values stay borrowed. The doc on lines 18–20 adds a warning: it allocates per item, so callers must bound how many items a peer can hand it.</p>
+</x-file>
+
+<x-file path="rust/myotis-core/src/bloom.rs" kind="library" twin="ReceiptsMessage bloom accrual">
+  <p class="purpose">The 2048-bit logs bloom. Each log address and topic sets three bits chosen by its keccak hash. eth/69 receipts arrive <em>without</em> a bloom, so it is recomputed from the logs before the receipt can be re-encoded for the <code>receiptsRoot</code> check. <code>may_contain</code> is the dual probe the <code>eth_getLogs</code> indexer uses to skip blocks: <code>false</code> means definitely absent, <code>true</code> means maybe. New since September: <code>BloomProbe</code>, which computes an item's three bits once.</p>
+  <x-code src="myotis-core/src/bloom.rs" from="36" to="56"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership methods</x-tags> <code>BloomProbe([usize; 3])</code> is a tuple struct around three bit positions, and it derives <code>Copy</code>: 24 bytes, no heap. <code>BloomProbe::of(item)</code> hashes once; <code>may_match(&amp;self, bloom)</code> then costs three bit tests. <code>myotis-net</code>'s address-activity code (<code>el/activity.rs</code>) keeps two probes per watched address, one for the address as a log's emitter and one for it as an indexed topic, and tests blooms against them.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>(0..6).step_by(2).enumerate()</code> yields <code>(0, 0), (1, 2), (2, 4)</code>: the probe slot and the hash offset. <code>self.0.iter().all(|&amp;bit| …)</code> short-circuits at the first unset bit; the <code>&amp;bit</code> pattern copies each <code>usize</code> out of the reference.</li>
+    <li><x-tags>bytes-strings</x-tags> <code>type LogsBloom = [u8; 256]</code> (line 10) is only an alias, not a new type. <code>accrue(bloom: &amp;mut LogsBloom, …)</code> (lines 18–24) modifies the caller's array in place.</li>
+  </ul>
+  <x-code src="myotis-core/src/bloom.rs" from="62" to="72"></x-code>
+  <p class="code-note"><x-tags>ownership</x-tags> <code>let snapshot = bloom;</code> <strong>copies</strong> all 256 bytes, because arrays of <code>Copy</code> elements are <code>Copy</code>. The final assertion is meaningful for exactly that reason. The same line in Java would alias the array, and the test would pass vacuously. The test lends <code>&amp;mut bloom</code> explicitly at each call.</p>
+</x-file>
+
+<x-file path="rust/myotis-core/tests/el_conformance.rs" kind="integration test" twin="ElCoreVectorConformanceTest">
+  <p class="purpose">“One corpus, two implementations, byte-identical verdicts.” The test replays <code>rust/testdata/el/core/</code> (headers, ENRs, key/sign/recover/ECDH vectors, fork-id pins) and asserts that the verdict map equals the Java-generated <code>expected.txt</code>. A missing corpus is skipped, like Java's <code>assumeTrue</code>; a present but empty oracle fails. A per-key diff is printed before the whole-map assertion, so failures are readable. Files under <code>tests/</code> are integration tests: each compiles to its own binary and sees the crate only through its public API, as <code>myotis_core::…</code>.</p>
+  <x-code src="myotis-core/tests/el_conformance.rs" from="63" to="72"></x-code>
+  <p class="code-note"><x-tags>ownership borrowing</x-tags> <code>map_or</code> <em>consumes</em> its <code>Option</code>. <code>base_fee_per_gas: Option&lt;Vec&lt;u8&gt;&gt;</code> is not <code>Copy</code>, so line 66 first borrows it with <code>as_deref()</code> (giving <code>Option&lt;&amp;[u8]&gt;</code>). Without that, the <code>Vec</code> would be moved out of <code>h</code>. <code>withdrawals_root: Option&lt;[u8; 32]&gt;</code> is <code>Copy</code>, so line 71 consumes a copy.</p>
+  <x-code src="myotis-core/tests/el_conformance.rs" from="182" to="193"></x-code>
+  <p class="code-note"><x-tags>testing domain</x-tags> New since September: chiado joins the pins, and for each network the corpus records <code>forkNext</code> and the hash once it has passed, so both engines' CRC32 must agree on the successor. <code>fork_id_at(pin, next, next).0</code> evaluates “now” at exactly the activation time and takes the first tuple field.</p>
+</x-file>
+
+<x-file path="rust/myotis-core/tests/el_mpt_conformance.rs" kind="integration test" twin="ElMptVectorConformanceTest">
+  <p class="purpose">The same golden-corpus technique for the trie code (<code>rust/testdata/el/mpt/</code>). It replays proof vectors through <code>verify_proof</code>, decodes the account and storage leaves chosen by file name, and pins ordered-trie roots and bloom accruals. Its <code>match</code> on <code>ProofResult</code> (lines 51–77) moves the <code>Vec</code> out of <code>Found(value)</code> and ignores the reason in <code>Invalid(_)</code>: only the verdict class is pinned, since error messages differ between languages. Lines are read as <code>Vec&lt;&amp;str&gt;</code> views into the file text. The only change since September is the call shape of <code>ordered_trie_root</code>: <code>[&amp;b"myotis-tx-0"[..]]</code> or <code>spanning.iter().map(Vec::as_slice)</code> (lines 81–97), where <code>Vec::as_slice</code> is a method used as a function value.</p>
+  <p><x-tags>testing enums-patterns borrowing</x-tags></p>
+</x-file>
+
+<x-file path="rust/myotis-core/tests/rlp_alloc_bound.rs" kind="integration test">
+  <p class="purpose">New since September. The regression test for #454: a 492 KB snappy frame decompressed to a 10 MiB list of one-byte elements, and building its tree cost 547 MB of heap in about ten million allocations (module doc, lines 1–4). The test installs a counting allocator and asserts that <code>validate</code>, <code>raw_list_items</code> on a nested list and <code>raw_list_prefix</code> allocate (almost) nothing on a list of just under 10 MiB. A control test first proves the counter works: an owned <code>decode</code> of 4,096 elements must show at least 4,096 allocations.</p>
+  <x-code src="myotis-core/tests/rlp_alloc_bound.rs" from="14" to="55"></x-code>
+  <ul class="concepts">
+    <li><x-tags>unsafe-ffi</x-tags> <strong>Replacing the allocator.</strong> <code>#[global_allocator]</code> on a <code>static</code> makes every heap allocation in the binary go through <code>Counting</code>. That is why this test lives in its own file: each file under <code>tests/</code> is a separate binary, so the counting allocator does not slow the other tests. <code>GlobalAlloc</code> is an <code>unsafe trait</code>: the compiler trusts an implementation to return valid memory and cannot check it, so the implementer writes <code>unsafe impl</code> and a <code>SAFETY:</code> comment saying why the contract holds. Here every call is forwarded to <code>System</code>, the platform allocator. See <a href="#primer-unsafe-ffi">the primer</a>.</li>
+    <li><x-tags>interior-mutability concurrency</x-tags> <strong>Per-thread counters.</strong> <code>thread_local!</code> gives each thread its own <code>Cell&lt;usize&gt;</code>, so tests running in parallel threads do not see each other's allocations. A <code>Cell</code> allows <code>set</code> through a shared reference without a lock, which is safe because a thread-local is never shared. The <code>const { Cell::new(0) }</code> initialiser avoids lazy setup, which could itself allocate inside the allocator. Java's <code>ThreadLocal&lt;Long&gt;</code> is the closest twin.</li>
+    <li><x-tags>error-handling</x-tags> <code>try_with</code> instead of <code>with</code>: during thread teardown the locals may already be gone, and <code>try_with</code> returns an error there instead of panicking. <code>let _ =</code> discards it on purpose.</li>
+    <li><x-tags>iterators-closures traits-generics</x-tags> <code>counted&lt;T&gt;(f: impl FnOnce() -&gt; T)</code> runs the closure once and returns the counter differences with its result. <code>FnOnce</code> is the most permissive closure bound, since a closure called once may even move what it captured. <code>ALLOCATIONS.with(Cell::get)</code> passes the method <code>Cell::get</code> as the function to apply.</li>
+  </ul>
+</x-file>
+
+<x-quiz>[
+  {"id":"core-q1","type":"mcq","tags":["ownership","borrowing","lifetimes"],
+   "q":"<code>rlp::decode</code> returns an <code>Item</code> (no lifetime); <code>rlp::raw_list_items</code> returns <code>Vec&lt;&amp;[u8]&gt;</code>. What does each mean for the caller's input buffer?",
+   "options":["Both require the buffer to stay alive","Both copy the buffer","<code>Item</code> owns copies, so the buffer may be dropped immediately; the slices borrow the buffer, so it must stay alive and unmodified while they are used","<code>Item</code> borrows the buffer; the slices own copies"],
+   "answer":2,
+   "explain":"<code>decode_item</code> calls <code>payload.to_vec()</code>, so the tree is self-contained. <code>raw_list_prefix</code> pushes <code>&amp;data[pos..next]</code>, windows into the input, and the elided lifetime ties them to it."},
+  {"id":"core-q2","type":"mcq","tags":["lifetimes","borrowing"],
+   "q":"<code>View::as_bytes(&amp;self)</code> returns <code>Result&lt;&amp;'a [u8], CoreError&gt;</code>, where <code>'a</code> is the struct's lifetime parameter. What does writing <code>'a</code> (instead of letting the lifetime be elided) allow?",
+   "options":["The returned slice may outlive the <code>View</code> value itself, as long as the underlying buffer is still alive","The slice may outlive the buffer","The slice becomes an owned copy","Nothing; elision would give the same lifetime"],
+   "answer":0,
+   "explain":"With elision the result would borrow from <code>&amp;self</code>, the small View value. Naming <code>'a</code> ties it to the buffer the View points into. <code>Item::as_bytes</code> cannot do this, because its bytes live inside the tree."},
+  {"id":"core-q3","type":"open","tags":["ownership","lifetimes"],
+   "q":"<code>BlockHeader::decode_view</code> reads every field through a <code>View</code> that borrows the caller's bytes, yet it copies each field (<code>copy_from_slice</code>, <code>to_vec</code>). Explain why, and name the alternative and its cost.",
+   "model":"<code>BlockHeader</code> has no lifetime parameter, so it can only hold owned data. The slices a <code>View</code> hands out are <code>&amp;'a [u8]</code> borrows of the caller's buffer; storing them would require the struct to be <code>BlockHeader&lt;'a&gt;</code>. So the helpers (<code>fixed32</code>, <code>any_bytes</code>, …) copy each field into an array or <code>Vec</code> the header owns. The alternative, a <code>BlockHeader&lt;'a&gt;</code> holding slices, would avoid the copies, but the borrow checker would then forbid it from outliving the frame it was decoded from, so it could not be cached or sent elsewhere after the frame is dropped. Java would keep references and let the GC keep the buffer alive.",
+   "points":["BlockHeader has no lifetime parameter, so it can hold only owned data","View's accessors return slices that borrow the caller's buffer","therefore fields are copied into [u8;32] / Vec owned by the header","a BlockHeader&lt;'a> holding slices would avoid copies but could not outlive the input buffer"],
+   "context":"myotis-core/src/header.rs L73-101: decode(rlp_bytes) -> decode_view(rlp::View::new(rlp_bytes)?); let mut f = top.as_list()?; fixed32/any_bytes L219-235 copy via copy_from_slice / to_vec. View&lt;'a> { raw: &'a [u8] } in rlp.rs L118-157."},
+  {"id":"core-q4","type":"mcq","tags":["ownership","borrowing","enums-patterns"],
+   "q":"In the trie walk, why does <code>Step::Embedded</code> carry a <em>cloned</em> <code>Item</code> rather than <code>&amp;Item</code>?",
+   "options":["Cloning is faster than borrowing","Because <code>Item</code> is <code>Copy</code>","To keep the parent alive for the garbage collector","The loop does <code>current = child;</code>. A child borrowed from <code>current</code> would make that reassignment a borrow error, so the child must be owned"],
+   "answer":3,
+   "explain":"You cannot overwrite a value while something borrowed from it is still in use. Owning the child breaks that link, and the reassignment drops the parent subtree."},
+  {"id":"core-q5","type":"mcq","tags":["modules-cargo"],
+   "q":"The trie walk's node index changed from <code>HashMap</code> to <code>BTreeMap&lt;[u8; 32], &amp;[u8]&gt;</code>. What is the reason in this crate?",
+   "options":["<code>BTreeMap</code> compares keys by content and <code>HashMap</code> by identity","<code>HashMap</code> lives in <code>std</code> (its default hasher is seeded from OS randomness), and the crate must build as <code>no_std</code> + <code>alloc</code>, where only <code>BTreeMap</code> is available","<code>BTreeMap</code> lookups are O(1)","<code>HashMap</code> cannot store references as values"],
+   "answer":1,
+   "explain":"<code>alloc::collections</code> has <code>BTreeMap</code> but no <code>HashMap</code>. The no_std canary (<code>cargoBuildNoStd</code>) names a HashMap as one of the leaks it catches. Both maps compare array keys by content."},
+  {"id":"core-q6","type":"mcq","tags":["ownership","bytes-strings"],
+   "q":"In <code>bloom.rs</code>'s test, <code>let snapshot = bloom; accrue(&amp;mut bloom, …); assert_eq!(bloom, snapshot);</code>. Why is <code>snapshot</code> unaffected by the second <code>accrue</code>?",
+   "options":["<code>snapshot</code> is a reference that the compiler freezes","<code>accrue</code> works on a copy","<code>[u8; 256]</code> is <code>Copy</code>: the assignment copied all 256 bytes","It is affected; the assert compares the same array"],
+   "answer":2,
+   "explain":"Fixed arrays are values. In Java, <code>byte[] snapshot = bloom;</code> would alias the array, and the assertion would be meaningless."},
+  {"id":"core-q7","type":"open","tags":["modules-cargo"],
+   "q":"Explain what <code>#![cfg_attr(not(feature = \"std\"), no_std)]</code> and <code>extern crate alloc;</code> in <code>lib.rs</code> do, and why nearly every module starts with imports such as <code>use alloc::vec::Vec;</code>.",
+   "model":"<code>cfg_attr</code> applies <code>#![no_std]</code> to the crate only when the <code>std</code> feature is off. The crate then links only <code>core</code>, plus <code>alloc</code> because <code>extern crate alloc;</code> brings it into scope; <code>alloc</code> is not nameable by default even in a std build. A no_std crate's prelude does not contain <code>Vec</code>, <code>String</code>, <code>format!</code> or <code>vec!</code>, so each module imports them from <code>alloc</code>. In the default std build those imports name the same types std re-exports, so they are harmless. The compiler then rejects any <code>std::</code> use in the no_std build, which the <code>cargoBuildNoStd</code> canary exercises on <code>x86_64-unknown-none</code>.",
+   "points":["cfg_attr applies no_std only when the std feature is off","extern crate alloc makes the alloc crate nameable (it is not in scope by default)","the no_std prelude lacks Vec/String/format!/vec!, hence the explicit alloc imports","in a std build the imports are the same types, so they are harmless","the no_std build makes any std use a compile error (checked by the canary build)"],
+   "context":"myotis-core/src/lib.rs L24-28; Cargo.toml [features] default = [\"std\"], std = [\"sha3/std\"]; build.gradle.kts cargoBuildNoStd builds --no-default-features for x86_64-unknown-none."},
+  {"id":"core-q8","type":"mcq","tags":["modules-cargo"],
+   "q":"<code>myotis-wire</code> depends on myotis-core with <code>default-features = false</code>; <code>myotis-net</code> depends on it with defaults. When you build <code>myotis-net</code> (which also pulls in myotis-wire), how is myotis-core compiled?",
+   "options":["Twice, once with std and once without","With <code>std</code> on: Cargo compiles it once with the union of all requested features","Without <code>std</code>, because one dependent turned the default off","The build fails because the requests conflict"],
+   "answer":1,
+   "explain":"Features are additive and unified per build. <code>default-features = false</code> only means “I do not ask for the defaults”, not “forbid them”. That is why the canary builds just myotis-core and myotis-wire."},
+  {"id":"core-q9","type":"open","tags":["domain","error-handling"],
+   "q":"Why does <code>trie.rs</code> walk proofs iteratively with a lookup counter, and why does <code>rlp.rs</code> have <code>MAX_DEPTH</code>? What would happen without these guards?",
+   "model":"Both handle attacker-controlled structure. A recursive walk or decoder descends once per nesting level, and a hostile proof or a deeply nested RLP packet could exhaust the native stack. In Rust a stack overflow is not a catchable exception: the process aborts, taking the host app with it. Making the trie walk iterative (with a lookup counter bounded by the node count) and capping RLP depth at 32 keeps memory use bounded and guarantees termination, so bad input ends as <code>Invalid</code> or <code>Err</code> instead of a crash.",
+   "points":["input structure is attacker-controlled","recursion depth grows with nesting, so the stack can be exhausted","a stack overflow aborts the process (there is no StackOverflowError to catch)","the iterative walk with a counter and the depth cap bound the work and return Invalid/Err"],
+   "context":"trie.rs docs L10-12: walk is iterative unlike Java so a hostile proof cannot grow the stack; lookups counter L115-122 bounded by node count. rlp.rs MAX_DEPTH = 32 L32-35, checked in decode_item and skip_item."},
+  {"id":"core-q10","type":"mcq","tags":["ownership"],
+   "q":"<code>forkid.rs</code> builds <code>CRC32_TABLE</code> in a <code>const</code> initialiser using <code>while</code> loops with hand-counted indices. Why not <code>for n in 0..256</code>?",
+   "options":["A <code>for</code> loop calls <code>Iterator::next</code>, a trait method that cannot run during compile-time evaluation","<code>for</code> loops are slower","Ranges cannot contain 256","<code>while</code> loops produce a smaller table"],
+   "answer":0,
+   "explain":"Const evaluation supports <code>while</code>, <code>if</code> and arithmetic, but a <code>for</code> loop desugars to iterator trait calls, which are not allowed in const contexts."},
+  {"id":"core-q11","type":"mcq","tags":["iterators-closures","borrowing"],
+   "q":"In <code>verify_proof_path</code>, <code>walk(root, key, proof_nodes, |node| path.push(node.to_vec()))</code> is followed by <code>path.clear()</code>. Why is that second use of <code>path</code> allowed?",
+   "options":["The closure captured <code>path</code> by value, so it holds a copy","<code>Vec</code> allows any number of mutable borrows","The closure was a temporary argument; it was dropped when <code>walk</code> returned, which ended its mutable borrow of <code>path</code>","<code>path.clear()</code> does not need a borrow"],
+   "answer":2,
+   "explain":"The closure borrows <code>path</code> mutably for as long as it exists. It exists only for the duration of the call, so afterwards <code>path</code> is free to be used again."},
+  {"id":"core-q12","type":"open","tags":["testing","error-handling"],
+   "q":"<code>skip_item</code> repeats every check of <code>decode_item</code> without building anything. What risk does that duplication create, how do the tests in <code>rlp.rs</code> control it, and why does <code>validate_agrees_with_decode</code> also count accepted and rejected inputs?",
+   "model":"Two copies of the same validation can drift: a check added to one and not the other would make <code>validate</code> (and every <code>View</code>) accept or reject different inputs from <code>decode</code>. The differential tests feed about 100,000 inputs (all strings up to two bytes, depth bounds, the shared corpus, seeded random trees with truncations and header mutations) through both and <code>assert_eq!</code> the full <code>Result</code>s, including error messages and end offsets. Counting both verdicts (more than 5,000 each) keeps the test from passing vacuously, for example if the generator only produced inputs that both reject.",
+   "points":["duplicated checks can drift apart, changing what validate/View accept versus decode","the tests run the same large generated + corpus input set through both","they compare whole Results, so end offsets and error messages must match","the accepted/rejected counts guard against a vacuous pass"],
+   "context":"rlp.rs skip_item L469-505 (doc: skip_item_agrees_with_decode_item pins the two together); tests L661-693; each_differential_input L823-885; assert!(accepted > 5_000 && rejected > 5_000)."},
+  {"id":"core-q13","type":"open","tags":["unsafe-ffi","interior-mutability","testing"],
+   "q":"<code>tests/rlp_alloc_bound.rs</code> counts allocations. Explain why it is a separate test file, why the counters are thread-local <code>Cell</code>s, why the <code>impl</code> is <code>unsafe</code>, and what the test <code>the_counter_sees_a_per_element_decode</code> is for.",
+   "model":"<code>#[global_allocator]</code> replaces the allocator for the whole binary, and each file under <code>tests/</code> compiles to its own binary, so the counting allocator affects only these tests. Tests run in parallel threads, so per-thread counters keep their numbers apart; a <code>Cell</code> can be updated through a shared reference without a lock because a thread-local is never shared, and the const initialiser avoids allocating inside the allocator. <code>GlobalAlloc</code> is an unsafe trait because the compiler must trust the returned memory; the impl forwards every call to <code>System</code> and documents that in a SAFETY comment. The control test checks that an owned decode of 4,096 elements registers at least 4,096 allocations, proving the counter works, so the zero-allocation assertions are not vacuous.",
+   "points":["global_allocator applies to a whole binary; each tests/ file is its own binary","thread-local counters keep parallel tests from mixing counts","Cell allows mutation through a shared reference without a lock (never shared across threads)","GlobalAlloc is unsafe to implement; the impl forwards to System","the control test proves the counter sees allocations, so the zero checks are meaningful"],
+   "context":"rlp_alloc_bound.rs L1-7 doc (own binary, per-thread counts); L14-17 thread_local! const Cell; L28-48 SAFETY comment, unsafe impl GlobalAlloc for Counting forwarding to System, #[global_allocator]; L84-92 control test allocations >= 4096."}
+]</x-quiz>

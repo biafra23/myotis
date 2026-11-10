@@ -531,7 +531,7 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
                         // Older .so vintages don't emit it; 0 = "bound unknown".
                         o.getLong("wsBoundPeriods", 0L),
                         parseAdvisory(o.get("upgradeAdvisory")),
-                        // ABI >= 50 (docs/data-usage.md). Display-only, like the
+                        // ABI >= 50 (docs/how-it-works/data-usage.md). Display-only, like the
                         // advisory: absent or malformed → NONE / UNKNOWN, never
                         // a "malformed status" failure.
                         parseDataUsage(o.get("dataUsage")),

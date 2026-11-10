@@ -1132,7 +1132,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_myotis_engine_checksum_func_pending_nonce_overlay() and 0xFFFF) != 21732) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if ((lib.uniffi_myotis_engine_checksum_func_read_stats_json() and 0xFFFF) != 19147) {
+    if ((lib.uniffi_myotis_engine_checksum_func_read_stats_json() and 0xFFFF) != 12379) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_request_account_json() and 0xFFFF) != 48343) {
@@ -1159,13 +1159,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_myotis_engine_checksum_func_set_log_index_config() and 0xFFFF) != 49994) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if ((lib.uniffi_myotis_engine_checksum_func_set_network_metering() and 0xFFFF) != 45561) {
+    if ((lib.uniffi_myotis_engine_checksum_func_set_network_metering() and 0xFFFF) != 50605) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_set_served_block_window() and 0xFFFF) != 15483) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if ((lib.uniffi_myotis_engine_checksum_func_set_tor_enabled() and 0xFFFF) != 16704) {
+    if ((lib.uniffi_myotis_engine_checksum_func_set_tor_enabled() and 0xFFFF) != 54390) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_set_tor_storage_dirs() and 0xFFFF) != 46410) {
@@ -2073,7 +2073,7 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         /**
          * Read-fetch shadow-cache counters as JSON (schema 1: `account` / `storage`
          * / `code` fetch, repeat and avoidable-cost counters plus age buckets; see
-         * docs/read-stats.md). `{"error":…}` when the handle has no EL reader.
+         * docs/how-it-works/read-stats.md). `{"error":…}` when the handle has no EL reader.
          */ fun `readStatsJson`(`handle`: kotlin.Long): kotlin.String {
             return FfiConverterString.lift(
     uniffiRustCall() { _status ->
@@ -2221,7 +2221,7 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
 
         /**
          * The host's word on the device's current network, for the data-usage
-         * figures (docs/data-usage.md): 0 unknown, 1 unmetered, 2 metered. Bytes
+         * figures (docs/how-it-works/data-usage.md): 0 unknown, 1 unmetered, 2 metered. Bytes
          * moved from now on count as metered while it is 2. False — nothing
          * recorded — for any other code. Process-global, not per-handle.
          */ fun `setNetworkMetering`(`code`: kotlin.Int): kotlin.Boolean {
@@ -2255,7 +2255,7 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     
 
         /**
-         * Toggle Tor verified-read routing (docs/privacy-and-tor.md). Returns true iff
+         * Toggle Tor verified-read routing (docs/how-it-works/privacy-and-tor.md). Returns true iff
          * this build supports Tor (`--features tor`); a Tor-less build returns false and
          * no-ops. Process-global, not per-handle.
          */ fun `setTorEnabled`(`on`: kotlin.Boolean): kotlin.Boolean {

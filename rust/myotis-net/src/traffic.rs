@@ -20,7 +20,7 @@
 //!
 //! Not counted: IP/TCP/UDP headers, EIP-1459 DNS lookups, and Tor (Arti's
 //! circuits and directory traffic are not visible to the engine) — see
-//! docs/data-usage.md.
+//! docs/how-it-works/data-usage.md.
 
 use std::io;
 use std::pin::Pin;

@@ -1,0 +1,304 @@
+<!--meta {"id":"stop-20","num":20,"title":"roost: the light-client server","short":"roost · LC server","sub":"8 files · 5,722 lines","part":"Boundaries & binaries"} -->
+<header class="stop-head">
+  <div class="eyebrow">Stop 20 · standalone crate <code>roost</code> <span>8 files · 5,722 lines · about 135 minutes</span></div>
+  <h1>roost: the light-client server</h1>
+  <p class="lede">A daemon that the project runs itself. It pulls light-client objects from a local Nimbus beacon node over loopback REST, keeps them in a durable archive plus an in-memory cache of <em>pre-encoded</em> responses, and serves them to wallets over <code>myotis-net</code>'s own libp2p stack. This is the carve-out in your CLAUDE.md: roost relays <em>self-verifying</em> objects and never has to be trusted, because every wallet checks every update against sync-committee signatures. Rust-wise it's a textbook async <em>application</em>: <code>#[tokio::main]</code>, <code>anyhow</code>, one <code>select!</code> loop, and very little shared state.</p>
+</header>
+
+<div class="learn">
+  <h2>Rust you will practise</h2>
+  <div><b>An application, not a library</b><code>#[tokio::main]</code>, <code>anyhow::Result</code> with context, typed errors only where callers branch on them.</div>
+  <div><b>Minimal sharing</b>state confined to one task; <code>Arc&lt;LcStore&gt;</code> with a <code>std::sync::RwLock</code>; lock poisoning under <code>panic = "unwind"</code>.</div>
+  <div><b>Bytes you don't trust</b>panic-free parsing with <code>get</code>, <code>checked_add</code>, <code>let … else</code>, and an append-only file format.</div>
+</div>
+
+<div class="callout rust">
+  <span class="k">What changed since September</span>
+  <p>Little, and all of it at the edges. <code>participation_of</code> in <code>main.rs</code> now picks the Gloas or pre-Gloas decoder by length, so Gloas periods are judged instead of reading as undecodable. <code>serve.rs</code> sets three new <code>HostConfig</code> fields (<code>listen_quic</code>, <code>cl_fork_watch</code>, <code>traffic</code>) to <code>None</code>. The codec, protocol names and fork-digest arithmetic roost imports from <code>myotis_net::{codec, protocols, status}</code> now live in <code>myotis-wire</code> (<a href="#stop-05">Stop 5</a>); <code>myotis-net</code> re-exports them at the old paths, so roost's imports did not change. The other six files are byte-for-byte the same.</p>
+</div>
+
+<figure class="diagram">
+  <div class="svg-wrap">
+  <svg class="wide-diagram" viewBox="0 0 960 330" role="img" fill="currentColor" xmlns="http://www.w3.org/2000/svg"
+       aria-label="roost's task layout. The main serve task fetches SSZ from Nimbus over loopback REST on a 12 second tick, appends to the archive file, and writes pre-encoded responses into a shared Arc LcStore and the status into an Arc LocalStatus. The libp2p swarm task from myotis-net answers wallets by reading the store synchronously and queues bootstrap misses that the main task later drains. The main task also watches the swarm task's JoinHandle and exits if it ends.">
+    <defs>
+      <marker id="m-roost-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+      </marker>
+    </defs>
+    <g font-size="12">
+      <rect x="20" y="120" width="150" height="70" rx="8" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)"/>
+      <text x="95" y="148" text-anchor="middle" font-weight="700">Nimbus</text>
+      <text x="95" y="166" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">REST 127.0.0.1:5052</text>
+
+      <rect x="240" y="50" width="250" height="140" rx="8" stroke-width="2" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="365" y="76" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">main task: serve()</text>
+      <text x="365" y="98" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">select! · 12 s tick</text>
+      <text x="365" y="116" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">rest.rs → framing.rs</text>
+      <text x="365" y="134" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">forks.rs digests · enr.rs</text>
+      <text x="365" y="152" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">owns archive, digests, …</text>
+      <text x="365" y="170" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">(plain locals, no locks)</text>
+
+      <rect x="240" y="245" width="250" height="56" rx="8" stroke-width="1.5" style="fill:var(--surface);stroke:var(--ink-3)"/>
+      <text x="365" y="268" text-anchor="middle" font-weight="700">roost-archive.db</text>
+      <text x="365" y="286" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">append-only · FNV-1a · torn-tail repair</text>
+
+      <rect x="565" y="62" width="165" height="72" rx="8" stroke-width="1.5" style="fill:var(--surface);stroke:var(--oxide)"/>
+      <text x="647" y="86" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">Arc&lt;LcStore&gt;</text>
+      <text x="647" y="104" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">std RwLock&lt;Inner&gt;</text>
+      <text x="647" y="120" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">pre-encoded Arc&lt;[u8]&gt;</text>
+
+      <rect x="565" y="158" width="165" height="46" rx="8" stroke-width="1.5" style="fill:var(--surface);stroke:var(--oxide)"/>
+      <text x="647" y="186" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">Arc&lt;LocalStatus&gt;</text>
+
+      <rect x="790" y="50" width="150" height="140" rx="8" stroke-width="1.5" style="fill:var(--jvm-wash);stroke:var(--jvm)"/>
+      <text x="865" y="76" text-anchor="middle" font-weight="700" style="fill:var(--jvm-ink)">swarm task</text>
+      <text x="865" y="96" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">myotis-net libp2p</text>
+      <text x="865" y="114" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">respond_inbound</text>
+      <text x="865" y="132" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">synchronous,</text>
+      <text x="865" y="148" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">no .await</text>
+
+      <rect x="790" y="245" width="150" height="56" rx="8" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)"/>
+      <text x="865" y="268" text-anchor="middle" font-weight="700">wallets</text>
+      <text x="865" y="286" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">≤ 1024 inbound</text>
+    </g>
+    <g stroke-width="1.5" fill="none" style="stroke:currentColor">
+      <line x1="170" y1="155" x2="236" y2="155" marker-end="url(#m-roost-arrow)"/>
+      <line x1="365" y1="190" x2="365" y2="241" marker-end="url(#m-roost-arrow)"/>
+      <line x1="490" y1="84" x2="561" y2="84" marker-end="url(#m-roost-arrow)"/>
+      <line x1="490" y1="178" x2="561" y2="180" marker-end="url(#m-roost-arrow)"/>
+      <line x1="790" y1="96" x2="734" y2="96" marker-end="url(#m-roost-arrow)"/>
+      <line x1="790" y1="180" x2="734" y2="180" marker-end="url(#m-roost-arrow)"/>
+      <line x1="865" y1="245" x2="865" y2="194" marker-end="url(#m-roost-arrow)"/>
+    </g>
+    <line x1="565" y1="122" x2="494" y2="122" stroke-width="1.3" stroke-dasharray="5 4" marker-end="url(#m-roost-arrow)" style="stroke:var(--warn)"/>
+    <path d="M865,50 C865,16 365,16 365,46" stroke-width="1.3" stroke-dasharray="5 4" fill="none" marker-end="url(#m-roost-arrow)" style="stroke:var(--bad)"/>
+    <g font-size="10.5" style="fill:var(--ink-3)">
+      <text x="203" y="146" text-anchor="middle">SSZ</text>
+      <text x="373" y="222">append + fsync</text>
+      <text x="526" y="76" text-anchor="middle">insert</text>
+      <text x="526" y="170" text-anchor="middle">set</text>
+      <text x="530" y="140" text-anchor="middle" style="fill:var(--warn)">misses</text>
+      <text x="762" y="88" text-anchor="middle">read</text>
+      <text x="762" y="172" text-anchor="middle">read</text>
+      <text x="873" y="224">requests</text>
+      <text x="615" y="22" text-anchor="middle" style="fill:var(--bad)">JoinHandle watched: exit if the swarm task ends</text>
+    </g>
+  </svg>
+  </div>
+  <figcaption>Only two objects are shared between tasks, and both sit behind <code>Arc</code> plus a <code>std</code> lock. Everything else the daemon changes (the archive, digests, the ENR sequence, the external address) is a plain local of the main task. The swarm answers from bytes that were encoded in advance and never waits for ingestion: a miss answers <code>ResourceUnavailable</code> and is filled on a later tick.</figcaption>
+</figure>
+
+<x-file path="rust/roost/src/main.rs" kind="binary · crate root">
+  <p class="purpose">Declares the modules, parses the command line by hand, and dispatches to four commands: <code>probe</code> (read-only upstream diagnostics), <code>ingest</code> (fill the archive without listening), <code>serve</code> (the daemon) and <code>enr</code> (print the ENR it would publish). It also holds the pure rules for “is this stored update provisional?” and <code>find_window_floor</code>, which the daemon reuses. Every error is an <code>anyhow::Error</code>.</p>
+  <x-code src="roost/src/main.rs" from="12" to="33"></x-code>
+  <x-code src="roost/src/main.rs" from="62" to="69"></x-code>
+  <x-code src="roost/src/main.rs" from="97" to="110"></x-code>
+  <x-code src="roost/src/main.rs" from="137" to="148"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async cli</x-tags> <strong><code>#[tokio::main]</code></strong> turns <code>async fn main</code> into a plain <code>main</code> that builds a multi-threaded runtime (a work-stealing pool, like <code>ForkJoinPool</code>) and <code>block_on</code>s the body. When <code>main</code> returns, the runtime is dropped, and so are any tasks still running.</li>
+    <li><x-tags>error-handling</x-tags> <strong><code>anyhow</code> in a binary.</strong> <code>Result&lt;T&gt;</code> here means <code>Result&lt;T, anyhow::Error&gt;</code>: any error plus a chain of context, like a Java <code>Exception</code> with causes. <code>?</code> converts any standard error type automatically. <code>myotis-net</code>'s <code>Result&lt;_, String&gt;</code> needs <code>.map_err(|e| anyhow!("{e}"))</code>, because <code>String</code> isn't an error type. If <code>main</code> returns <code>Err</code>, the process prints it and exits with status 1.</li>
+    <li><x-tags>enums-patterns iterators-closures</x-tags> <strong>An <code>Option</code> chain</strong> for <code>--port</code>: the bounds-checked <code>get(i)</code>, then <code>ok_or_else</code> + <code>?</code>, then <code>parse().ok()</code>, then <code>filter</code> (rejects 0), then <code>ok_or_else</code> + <code>?</code>. Each step either continues or produces a helpful error.</li>
+    <li><x-tags>borrowing ownership</x-tags> <code>command.as_deref()</code> turns <code>Option&lt;String&gt;</code> into <code>Option&lt;&amp;str&gt;</code>, so string literals work as patterns without moving <code>command</code>. <code>key_path</code> is moved in <em>two</em> arms, which compiles because only one arm ever runs: moves are tracked per control-flow path.</li>
+  </ul>
+  <x-code src="roost/src/main.rs" from="564" to="584"></x-code>
+  <p class="code-note"><x-tags>enums-patterns error-handling domain</x-tags> <strong>Choosing a decoder by length.</strong> At the Gloas fork the light-client header changed shape: it now carries only the execution block hash, and the whole update has a fixed size, <code>LightClientUpdate::GLOAS_SIZE</code>. A wallet picks the decoder from the chunk's context bytes. roost only needs the participant count, so it uses the fact the doc comment states: no pre-Gloas update has that length. <code>let fork = if … { LcFork::Gloas } else { LcFork::PreGloas };</code> is an <code>if</code> used as an expression, like Kotlin's. <code>decode_for(fork, ssz)</code> returns a <code>Result</code>; <code>.ok()</code> discards the error, and <code>.map(…)</code> reaches into the decoded update only on success. The decoded value is a temporary, dropped at the end of the statement once its count has been read. Before this change every Gloas period decoded as <code>None</code>, so <code>should_replace</code> below would have frozen the first copy ever stored.</p>
+  <x-code src="roost/src/main.rs" from="586" to="613"></x-code>
+  <p class="code-note"><x-tags>domain enums-patterns</x-tags> Pure rules with table tests. A wallet refuses an update signed by fewer than ⅔ of the 512-member committee (342 is the lowest acceptable count), so <code>ingest</code> refetches a period that isn't held, is still in progress, is stored below that bar, or can't be decoded. <code>stored.is_none_or(below_supermajority)</code> passes a <em>function</em> where a closure is expected. <code>should_replace</code> accepts only strictly more participants, which makes a rerun idempotent. <code>pub(crate)</code> exposes them to <code>serve.rs</code> only.</p>
+  <x-code src="roost/src/main.rs" from="819" to="837"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async iterators-closures</x-tags> <code>has</code> is a closure that <em>returns a future</em>. Each call creates a new, lazy future holding <code>p</code> and a reference to <code>client</code>, and nothing runs until it is awaited.</li>
+    <li><x-tags>error-handling traits-generics</x-tags> <code>Ok::&lt;bool, anyhow::Error&gt;(…)</code>: an async block can't declare its return type, so without the turbofish the <code>?</code> inside wouldn't know which error type to convert into.</li>
+    <li><x-tags>domain</x-tags> A binary search for the lowest period Nimbus still serves, which assumes the servable window has no gaps.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/roost/src/rest.rs" kind="binary">
+  <p class="purpose">roost's only upstream: an async client for Nimbus's beacon REST API. REST bypasses Nimbus's libp2p peer table and connection semaphore entirely. The four light-client endpoints are fetched as SSZ (<code>Accept: application/octet-stream</code>), so roost stays a byte cache that relays exactly what Nimbus produced. The JSON endpoints cover head and finality, <code>config/spec</code>, the genesis root, peers and addresses.</p>
+  <x-code src="roost/src/rest.rs" from="43" to="58"></x-code>
+  <x-code src="roost/src/rest.rs" from="88" to="119"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo error-handling</x-tags> <strong>A smart constructor through privacy.</strong> The fields are private, so other modules can't write <code>ChainParams { slots_per_epoch: 0, .. }</code>, and <code>from_spec</code>, which refuses missing, zero or overflowing values, is the only way in. The doc records the bug this prevents: with <code>pub</code> fields, a zero compiled and later divided by zero. It's the Java private-fields-plus-static-factory idiom, enforced by the compiler. <code>Copy</code> makes it a small value type.</li>
+    <li><x-tags>error-handling bytes-strings</x-tags> <code>checked_mul</code>, not saturating: a saturated product would make every period number 0 and silently mis-key the irreplaceable archive. <code>read</code> is a closure that borrows <code>spec</code> and declares <code>-&gt; Result&lt;u64&gt;</code>, so <code>?</code> works inside it.</li>
+  </ul>
+  <x-code src="roost/src/rest.rs" from="143" to="167"></x-code>
+  <x-code src="roost/src/rest.rs" from="225" to="269"></x-code>
+  <ul class="concepts">
+    <li><x-tags>error-handling enums-patterns</x-tags> <strong>Typed errors where a caller branches.</strong> <code>anyhow</code> is fine for failures that are only reported. <code>FetchError</code> exists because <code>serve.rs</code> must <em>decide</em>: requeue a <code>Transient</code> bootstrap, or give up on an <code>Unavailable</code> one. A variant wrapping <code>anyhow::Error</code> keeps the message chain. <code>impl std::error::Error for FetchError {}</code> is empty because every method has a default, and it lets <code>?</code> convert the error into <code>anyhow</code>.</li>
+    <li><x-tags>domain</x-tags> HTTP 408 and 429 are 4xx codes but retryable. Treating them as “unavailable” would mark a wallet's pinned checkpoint as permanently refused after a single rate-limit answer.</li>
+    <li><x-tags>async bytes-strings</x-tags> <code>while let Some(chunk) = resp.chunk().await…?</code> is the async version of an <code>InputStream.read</code> loop. A chunked response has no <code>Content-Length</code>, so the 32 MiB cap is enforced as the data arrives. <code>&amp;chunk</code> deref-coerces from <code>&amp;Bytes</code> to <code>&amp;[u8]</code>. <code>.map(str::to_string)</code> uses a method path as a function.</li>
+    <li><x-tags>async</x-tags> <code>async fn get_ssz(&amp;self, …)</code> returns a future that borrows <code>self</code>, and nothing is sent until it's awaited, unlike an eager <code>CompletableFuture</code>. There is no retry code at all: the 12-second tick simply runs failed work again.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/roost/src/store.rs" kind="binary">
+  <p class="purpose">The in-memory serving cache that the libp2p responder reads. It holds <em>fully encoded</em> libp2p responses (<code>result || digest || varint || snappy</code>), so serving is a lookup plus a copy, and compression happens once, at ingest. It also bounds bootstrap handling: a FIFO-evicted cache, a queue of misses for the background filler, and a record of roots already attempted.</p>
+  <x-code src="roost/src/store.rs" from="12" to="24"></x-code>
+  <x-code src="roost/src/store.rs" from="102" to="141"></x-code>
+  <ul class="concepts">
+    <li><x-tags>concurrency async</x-tags> <strong>Why a <code>std</code> lock.</strong> <code>respond_inbound</code> in <code>myotis-net</code> is synchronous and runs inline on the single swarm task. An async lock can't be awaited there, and a <code>block_on</code> inside a runtime worker would panic. So: <code>std::sync::RwLock</code>, and no method ever returns a guard, so none can be held across an <code>.await</code>.</li>
+    <li><x-tags>interior-mutability error-handling</x-tags> <strong>Poisoning is real here.</strong> roost unwinds on panic, so a panic while the lock is held <em>poisons</em> it, and every later <code>read().unwrap()</code> would panic too. <code>unwrap_or_else(|e| e.into_inner())</code> takes the guard anyway, which is justified because the entries are immutable byte blobs: “serving stale-but-valid bytes beats serving nothing”. Java has no equivalent; <code>finally { unlock(); }</code> just releases the lock. (The “cheap to clone” doc is stale: <code>LcStore</code> isn't <code>Clone</code>; it's shared through <code>Arc</code>.)</li>
+    <li><x-tags>lifetimes</x-tags> <code>RwLockReadGuard&lt;'_, Inner&gt;</code>: the guard borrows <code>self</code>, and <code>'_</code> lets the compiler infer the lifetime.</li>
+  </ul>
+  <x-code src="roost/src/store.rs" from="152" to="173"></x-code>
+  <p class="code-note"><x-tags>smart-pointers borrowing</x-tags> <strong>Temporaries die at the <code>;</code>.</strong> <code>self.read().updates.get(&amp;period).cloned()?</code> drops the read guard at the end of that statement, before the slow snappy decode. <code>self.write().finality = Some(wire);</code> is a one-statement critical section. <code>Arc&lt;[u8]&gt;</code> is an immutable, reference-counted slice in one allocation, and cloning it only bumps the count, like sharing a Java reference to an immutable <code>byte[]</code>. The encoding happens <em>before</em> the lock is taken. (The doc on lines 145–147 describes <code>insert_update</code> but is attached to <code>update_ssz</code>.)</p>
+  <x-code src="roost/src/store.rs" from="240" to="278"></x-code>
+  <ul class="concepts">
+    <li><x-tags>concurrency borrowing</x-tags> <strong>Read first, then write, then re-check.</strong> This runs on the swarm task for every miss, so the common “nothing to do” case needs only a shared lock. The inner <code>{ }</code> drops the read guard before the write lock is requested: <code>std</code>'s <code>RwLock</code> can't upgrade, and asking for the write lock while holding the read lock on the same thread can deadlock or panic. The state may change in the gap, hence the second check.</li>
+    <li><x-tags>borrowing interior-mutability</x-tags> <strong>A clone that satisfies the borrow checker.</strong> In <code>clear_bootstraps</code>, both field accesses go through the same guard (<code>Deref</code>/<code>DerefMut</code>). Iterating <code>inner.bootstrap_order</code> while calling <code>inner.bootstrap_attempted.remove</code> looks to the compiler like a shared and a mutable borrow of <code>inner</code> at once, so it rejects it. Cloning at most 64 roots avoids that; reborrowing <code>let i = &amp;mut *inner;</code> would allow disjoint field borrows instead.</li>
+  </ul>
+  <x-code src="roost/src/store.rs" from="331" to="368"></x-code>
+  <p class="code-note"><x-tags>bytes-strings enums-patterns</x-tags> The hot path. A caller controls <code>start</code> and <code>count</code> (both <code>u64</code>), so everything is bounded: at most 128 updates, 8 MiB in total, nothing outside the held window, and a stop at the first gap. <code>let (&amp;lowest, _) = inner.updates.iter().next()?;</code> destructures a reference in a pattern and uses <code>?</code> on an <code>Option</code>. <code>period.checked_add(1)</code> avoids overflow at <code>u64::MAX</code>, and a partial run is a legitimate answer.</p>
+  <x-code src="roost/src/store.rs" from="412" to="436"></x-code>
+  <p class="code-note"><x-tags>traits-generics smart-pointers</x-tags> <strong>Implementing another crate's trait.</strong> The orphan rule allows it because <code>LcStore</code> is local. The trait is <code>Send + Sync</code>, which holds automatically because <code>RwLock&lt;Inner&gt;</code> is. Both the inherent method and the trait method are called <code>bootstrap</code>; <code>LcStore::bootstrap(self, …)</code> picks the inherent one (which returns an <code>Arc</code>). A miss queues the root and answers <code>None</code> (<code>ResourceUnavailable</code>), and the wallet's retry hits.</p>
+</x-file>
+
+<x-file path="rust/roost/src/archive.rs" kind="binary">
+  <p class="purpose">A durable, append-only file of per-period <code>LightClientUpdate</code> SSZ plus fork digest. Periods below Nimbus's light-client floor can never be regenerated, so this file is irreplaceable. On load it checks the header (magic, version, chain id), verifies an FNV-1a checksum per record, repairs a torn tail by truncating it, and scans past corrupt regions to save the records after them. It stores raw SSZ, so a codec change never invalidates it.</p>
+  <x-code src="roost/src/archive.rs" from="91" to="130"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership concurrency</x-tags> <strong>Ownership instead of locking.</strong> <code>append(&amp;mut self)</code> requires exclusive access, so the compiler guarantees a single writer. Only <code>serve</code>'s main task holds <code>mut archive</code>: no <code>Mutex</code>, no <code>Arc</code>. Dropping the <code>Archive</code> closes the file, like an automatic try-with-resources.</li>
+    <li><x-tags>traits-generics</x-tags> <code>path: impl AsRef&lt;Path&gt;</code> accepts <code>&amp;Path</code>, <code>PathBuf</code> or <code>&amp;str</code>. The tuple return value is destructured by callers: <code>let (mut archive, records, report) = Archive::open(…)?;</code>.</li>
+  </ul>
+  <x-code src="roost/src/archive.rs" from="165" to="197"></x-code>
+  <p class="code-note"><x-tags>bytes-strings error-handling</x-tags> <code>bail!(…)</code> is shorthand for <code>return Err(anyhow!(…))</code>. A record is <code>RREC | kind | period (u64 LE) | digest | len (u32 LE) | ssz | fnv64</code>, built in memory and written with a single <code>write_all</code>. <code>flush</code> runs <code>sync_data</code> (fdatasync) once per batch; a torn tail is recoverable by design. There is no OS file lock, so nothing stops two processes from appending to the same file.</p>
+  <x-code src="roost/src/archive.rs" from="294" to="342"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns</x-tags> <strong>A data-carrying enum.</strong> <code>RecordRead::Ok { record, next }</code> has fields; <code>Torn</code> and <code>Corrupt</code> don't. Elsewhere, <code>if let RecordRead::Ok { .. } = …</code> ignores the fields.</li>
+    <li><x-tags>bytes-strings error-handling</x-tags> <strong>Panic-free parsing.</strong> <code>buf.get(a..b)</code> returns <code>None</code> where <code>buf[a..b]</code> would panic. Arithmetic overflow means <em>corrupt</em>; running out of bytes means <em>torn</em>. Both are plain values. <code>try_into().unwrap()</code> is used only on slices whose length was just checked. <code>ssz</code> is borrowed from the file buffer and copied with <code>to_vec()</code> only once the checksum matches.</li>
+    <li><x-tags>domain</x-tags> A corrupted length field in the middle of the file looks exactly like a torn tail, so <code>parse</code> first checks whether an intact record follows. Without that check it would truncate, and delete, irreplaceable records.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/roost/src/forks.rs" kind="binary">
+  <p class="purpose">Computes the 4-byte fork digest (“context bytes”) for any slot, and the 16-byte <code>ENRForkID</code>, from the chain's own <code>/eth/v1/config/spec</code>. A name→digest table won't do: since EIP-7892 the digest also mixes in the active blob parameters, so one fork name can have several digests. Forks are discovered from key names (<code>X_FORK_VERSION</code> + <code>X_FORK_EPOCH</code>). The arithmetic is <code>myotis_net::status::fork_digest_bpo</code>, the twin of Java's <code>BeaconLightClient.computeForkDigest</code>. Since the September tour that function lives in <code>myotis-wire</code>'s <code>eth2::status</code>; <code>myotis-net</code>'s <code>status</code> module is now a one-line <code>pub use</code> of it.</p>
+  <x-code src="roost/src/forks.rs" from="18" to="23"></x-code>
+  <x-code src="roost/src/forks.rs" from="88" to="97"></x-code>
+  <ul class="concepts">
+    <li><x-tags>error-handling</x-tags> <strong>Two failure policies in one return type.</strong> The outer <code>?</code>s are fatal (a failed fetch, unusable geometry). The inner <code>Result&lt;Self&gt;</code> is returned as a <em>value</em>, so the caller can fall back to the digest it observed on the wire.</li>
+    <li><x-tags>iterators-closures ownership</x-tags> <code>Result::map</code> takes an <code>FnOnce</code>, which runs at most once, so the closure may <em>move</em> the captured <code>blobs</code> vector. It only borrows <code>spec</code>. <code>params</code> is used twice because <code>ChainParams</code> is <code>Copy</code>.</li>
+  </ul>
+  <x-code src="roost/src/forks.rs" from="182" to="221"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership traits-generics</x-tags> <strong>Consuming builders.</strong> <code>fn with_blob_schedule(mut self, …) -&gt; Self</code> takes ownership, changes the value and returns it, with nothing copied. Java “withers” usually copy. That's what makes <code>from_spec(..)?.with_…(..).with_…(..)</code> chains work.</li>
+    <li><x-tags>domain</x-tags> <strong>The Gnosis lesson.</strong> Gnosis's <code>BLOB_SCHEDULE</code> is empty, so roost stamped the bare Fulu digest, and every peer answered <code>Goodbye(IrrelevantNetwork)</code>: the server was live, reachable and invisible. The implicit Electra entry fixed it. A wrong digest costs reachability, never correctness.</li>
+  </ul>
+  <x-code src="roost/src/forks.rs" from="228" to="238"></x-code>
+  <p class="code-note"><x-tags>iterators-closures</x-tags> <code>rfind</code> searches from the back of a double-ended iterator, and <code>.copied()</code> turns <code>Option&lt;&amp;Fork&gt;</code> into <code>Option&lt;Fork&gt;</code>. <code>unwrap_or(self.forks[0])</code> evaluates its argument on every call (use <code>unwrap_or_else</code> for anything expensive), and the indexing can't panic, because the private constructor refuses an empty fork list.</p>
+</x-file>
+
+<x-file path="rust/roost/src/framing.rs" kind="binary" twin="(encoder) ReqRespCodec">
+  <p class="purpose">Splits Nimbus's <code>light_client/updates</code> REST body (<code>u64 LE length | digest | SSZ</code>, repeated) into per-period chunks, trusting only the length prefix, and re-frames them as a libp2p multi-chunk response with <code>myotis-net</code>'s own encoder (<code>myotis_net::codec</code>, a re-export of <code>myotis-wire</code>'s <code>eth2::codec</code>). The digest is re-emitted as received, never derived. It uses the same protocol stack the wallets are tested against.</p>
+  <x-code src="roost/src/framing.rs" from="63" to="85"></x-code>
+  <x-code src="roost/src/framing.rs" from="121" to="183"></x-code>
+  <ul class="concepts">
+    <li><x-tags>error-handling</x-tags> <strong>A typed error in an <code>anyhow</code> binary.</strong> Every variant carries the failing offset. <code>impl std::error::Error</code> lets <code>anyhow</code> callers use <code>?</code> (<code>split_updates(..)?</code>). <code>#[derive(PartialEq, Eq)]</code> lets tests <code>assert_eq!</code> exact errors. This file spells out <code>Result&lt;_, FramingError&gt;</code> and never imports <code>anyhow</code>.</li>
+    <li><x-tags>bytes-strings</x-tags> <strong>Checked conversions.</strong> <code>usize::try_from(u64)</code> can fail on 32-bit hosts, and <code>checked_add</code> guards every offset. <code>ok_or(…)</code> builds its error value eagerly, which is fine for a small enum with no allocation; <code>ok_or_else</code> would defer it. The subtractions inside can't underflow, thanks to the loop guard and the successful <code>get</code> just before.</li>
+    <li><x-tags>ownership lifetimes</x-tags> <strong>Why copy.</strong> <code>chunk</code> borrows the caller's body. The digest is copied into a 4-byte stack array and the payload into a new <code>Vec</code>, so <code>UpdateChunk</code> owns its data, needs no lifetime parameter, and can outlive the HTTP buffer on its way into the archive and the store.</li>
+    <li><x-tags>domain</x-tags> An empty body is <code>Ok(vec![])</code>, which is how Nimbus answers for a period below its window. Chunks vary by a few bytes, so a fixed stride would be wrong.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/roost/src/serve.rs" kind="binary · daemon">
+  <p class="purpose"><code>roost serve</code>. At startup it loads the archive into the store, fills missing periods, resolves digests, starts <code>myotis-net</code>'s libp2p host with the store plugged in as the light-client responder, and joins discv5. Then, on a 12-second tick, it refreshes live objects, fills requested bootstraps and the new period, keeps <code>status</code> honest, tracks its external IP, and publishes the ENR once every gate passes.</p>
+  <x-code src="roost/src/serve.rs" from="403" to="421"></x-code>
+  <p class="code-note"><x-tags>error-handling domain</x-tags> <strong>Strict startup.</strong> The genesis root and the chain geometry are required <em>before</em> the archive is opened, because every record key depends on them. <code>for (period, rec) in &amp;records</code> iterates by reference: <code>*period</code> copies the key, and <code>&amp;rec.ssz</code> borrows the bytes. Best-effort steps (the initial fill, live objects, discovery) only log.</p>
+  <x-code src="roost/src/serve.rs" from="487" to="505"></x-code>
+  <p class="code-note"><x-tags>smart-pointers traits-generics</x-tags> <strong>Plugging the store in.</strong> <code>store.clone()</code> is an <code>Arc&lt;LcStore&gt;</code> reference-count bump, and the field type <code>Option&lt;Arc&lt;dyn LcResponder&gt;&gt;</code> coerces it into a trait object (a pointer to the data plus a vtable), like passing an object as its interface type. The spawned swarm task and this task now share the store and the status. What comes back is an actor mailbox (<code>net</code>: an <code>mpsc</code> channel with <code>oneshot</code> replies), the peer id, and the swarm task's <code>JoinHandle</code>.</p>
+  <p class="code-note"><x-tags>methods domain</x-tags> <strong>Every field, spelled out.</strong> A Rust struct literal must name every field, unless it ends with <code>..base</code> to copy the rest from another value. roost writes all seven, so when <code>myotis-net</code> added <code>listen_quic</code>, <code>cl_fork_watch</code> and <code>traffic</code>, this call stopped compiling until someone decided each one. That matters here: <code>HostConfig::default()</code> is the wallet's shape and opens an ephemeral QUIC listener, which a server must not do, because the relay forwards no UDP port for it and the ENR does not advertise one. <code>..HostConfig::default()</code> would have accepted that silently. Java has no equivalent check; a builder with a new optional setter compiles everywhere.</p>
+  <x-code src="roost/src/serve.rs" from="564" to="604"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async</x-tags> <strong><code>select!</code> in a loop.</strong> It waits for whichever future finishes first and runs only that arm; the others are dropped. Arm bodies are ordinary code in the enclosing function, not closures, so <code>return</code> leaves <code>serve</code>. <code>interval</code> fires its first tick immediately, and <code>MissedTickBehavior::Skip</code> prevents a burst of catch-up ticks after a slow one.</li>
+    <li><x-tags>async ownership</x-tags> <strong>A <code>JoinHandle</code> polled by <code>&amp;mut</code>.</strong> Passing <code>swarm_task</code> by value would move it into the first <code>select!</code>, and the next iteration wouldn't compile (“use of moved value”). Hence <code>let mut swarm_task = swarm_task;</code> and <code>&amp;mut swarm_task</code>.</li>
+    <li><x-tags>error-handling concurrency</x-tags> <strong>The real containment story.</strong> Under <code>panic = "unwind"</code>, a panic in the swarm task arrives here as a <em>value</em>: <code>Err(e) if e.is_panic()</code>. The daemon logs it and returns <code>Err</code>, so the process exits non-zero and systemd (<code>Restart=on-failure</code>) restarts it. Without this arm, the process would keep polling Nimbus with no listener, an outage no supervisor could see. All connections still drop: requests are answered on that one task.</li>
+    <li><x-tags>ownership concurrency</x-tags> <code>archive</code>, <code>digests</code>, <code>external</code>, <code>published</code> and <code>ticks</code> are plain locals of this future. Nothing else can reach them, so they need no locks, like state confined to a single-threaded executor. <code>publish_refusal: Option&lt;&amp;'static str&gt;</code> stores literals, so they can be compared to log a refusal only when it changes.</li>
+  </ul>
+  <div class="callout watch">
+    <span class="k">Two shutdown caveats</span>
+    <ul>
+      <li><code>tokio::signal::ctrl_c()</code> is created afresh on each iteration, and per tokio's documentation it completes only for a Ctrl-C received <em>after</em> it was first polled. While a tick body is running, that future has already been dropped, so a Ctrl-C pressed during a tick can be missed; press it again. Creating it once and polling it by <code>&amp;mut</code>, as with <code>swarm_task</code>, would fix that.</li>
+      <li>Only SIGINT is handled. <code>systemctl stop</code> sends SIGTERM, whose default action ends the process without running this path. The append-only archive with torn-tail repair tolerates that.</li>
+    </ul>
+  </div>
+  <x-code src="roost/src/serve.rs" from="1244" to="1281"></x-code>
+  <p class="code-note"><x-tags>error-handling enums-patterns domain</x-tags> A wallet's first request is always for its <em>own</em> pinned checkpoint, which no pre-population can guess. So a miss is queued, and here, at most 4 per tick, it is fetched. <code>match</code> on the typed <code>FetchError</code>: <code>Unavailable</code> keeps the root marked as attempted (no refetch storms), while <code>Transient</code> puts it back at the front of the queue, so one hiccup can't block that checkpoint for good. <code>store: &amp;LcStore</code> is borrowed straight through the <code>Arc</code> via deref coercion.</p>
+</x-file>
+
+<x-file path="rust/roost/src/enr.rs" kind="binary">
+  <p class="purpose">A persisted, strictly increasing ENR sequence number. The DHT keeps only the highest-sequence record per node, so a counter that reset on restart would make every later record, including an IP change, silently ignored. <code>load</code> starts at 1 if the file is missing and fails hard on a corrupt file.</p>
+  <x-code src="roost/src/enr.rs" from="36" to="47"></x-code>
+  <x-code src="roost/src/enr.rs" from="56" to="109"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns error-handling</x-tags> <code>Err(e) if e.kind() == NotFound =&gt; 1</code> is a guarded arm on an I/O error kind. <code>return Err(e).with_context(…)</code> adds a message to a plain <code>io::Error</code>. <code>.context(…)</code> on an <code>Option</code> (from <code>checked_add</code>) turns <code>None</code> into an error.</li>
+    <li><x-tags>ownership</x-tags> <strong>A scoped block</strong> limits both the <code>use std::io::Write;</code> and the <code>File</code>: the file is closed at <code>}</code>, before the rename. <code>with_context(|| …)</code> builds its message only on failure.</li>
+    <li><x-tags>domain</x-tags> <strong>Persist before use.</strong> Write the temp file, fsync it, rename it, then fsync the directory. A number that was handed out but not safely stored could be issued again after a crash, and the DHT would ignore every record until the count climbed past it. (The module doc still says publishing is “not wired up here”, which is true of this file only: <code>serve.rs</code> publishes now.)</li>
+  </ul>
+</x-file>
+
+<x-quiz>[
+  {"id":"roost-q1","type":"mcq","tags":["concurrency","error-handling","async"],
+   "q":"roost builds with <code>panic = \"unwind\"</code>. If <code>LcStore::updates_range</code> panicked while answering one wallet, what would happen?",
+   "options":["Only that wallet's connection would close","The swarm task, which answers all requests inline, would end. <code>serve</code> sees <code>JoinError::is_panic()</code>, logs it, and exits non-zero, and systemd restarts roost. Every connection drops","The panic is silently ignored","The process aborts without any log line"],
+   "answer":1,
+   "explain":"Unwinding turns the panic into a value that the daemon can handle, a supervised restart. It doesn't isolate connections, because requests are handled on one task."},
+  {"id":"roost-q2","type":"mcq","tags":["concurrency","async"],
+   "q":"Why is <code>LcStore</code> guarded by <code>std::sync::RwLock</code> rather than <code>tokio::sync::RwLock</code>?",
+   "options":["tokio has no RwLock","Its reader, <code>respond_inbound</code>, is synchronous code on the swarm task. It can't <code>.await</code> an async lock, and <code>block_on</code> inside a runtime worker would panic. The std lock is held briefly, and never across an await","std locks are faster in all cases","tokio locks can't be shared through <code>Arc</code>"],
+   "answer":1,
+   "explain":"Pick the lock that fits the calling code: synchronous callers and short critical sections mean <code>std</code>."},
+  {"id":"roost-q3","type":"mcq","tags":["concurrency","borrowing"],
+   "q":"<code>record_bootstrap_miss</code> checks under a read lock inside <code>{ }</code>, then takes the write lock and checks again. Why both?",
+   "options":["Style","The common “nothing to do” case needs only a shared lock. The block drops the read guard first, because <code>std</code>'s <code>RwLock</code> can't upgrade, and the state may change between the two locks, so it must be re-checked","The first check is debug-only","The write lock is taken on another thread"],
+   "answer":1,
+   "explain":"Double-checked locking with RAII: the closing <code>}</code> is what releases the read lock."},
+  {"id":"roost-q4","type":"mcq","tags":["ownership","borrowing","concurrency"],
+   "q":"How can <code>Archive::append(&amp;mut self, …)</code> be safe in a concurrent daemon without a <code>Mutex</code>?",
+   "options":["It isn't safe","Only the main task owns the <code>Archive</code>, and <code>&amp;mut</code> is an exclusive borrow checked at compile time. The swarm task never has a reference to it, so a second in-process writer can't exist","File writes are atomic anyway","tokio serialises all file I/O"],
+   "answer":1,
+   "explain":"Ownership can replace locking when data isn't shared. (Another <em>process</em> could still write the file; there's no OS lock.)"},
+  {"id":"roost-q5","type":"mcq","tags":["error-handling","domain"],
+   "q":"Why does <code>get_ssz_classified</code> treat HTTP 429 as <code>FetchError::Transient</code> even though it's a 4xx?",
+   "options":["All 4xx are transient","A bootstrap root is marked as attempted before the fetch, and only <code>Transient</code> failures are requeued. A 429 classified as “unavailable” would leave a wallet's pinned checkpoint permanently unserved after one rate-limit answer","429 means the server crashed","reqwest requires it"],
+   "answer":1,
+   "explain":"The typed enum exists because the caller branches on it, so the classification is a policy decision."},
+  {"id":"roost-q6","type":"mcq","tags":["modules-cargo","error-handling"],
+   "q":"<code>ChainParams</code>'s fields are private and <code>from_spec</code> is the only constructor. What does that buy?",
+   "options":["Faster access","A value that refuses zero, missing or overflowing geometry is the only kind that can exist, so <code>slot / slots_per_period</code> can't divide by zero and archive keys can't be silently wrong. With <code>pub</code> fields a zero compiled","Serialization support","It makes the type <code>Copy</code>"],
+   "answer":1,
+   "explain":"Invariants enforced by visibility are guarantees; invariants in comments are hopes."},
+  {"id":"roost-q7","type":"mcq","tags":["async","ownership"],
+   "q":"In <code>serve</code>'s loop, why is the swarm task's handle written as <code>joined = &amp;mut swarm_task</code> inside <code>select!</code>?",
+   "options":["<code>JoinHandle</code> can only be polled by reference","Passing it by value would move it into the first <code>select!</code>, and the next loop iteration wouldn't compile (use of moved value). Polling <code>&amp;mut</code> keeps the same handle across iterations","It makes the task run faster","<code>&amp;mut</code> cancels the task"],
+   "answer":1,
+   "explain":"A future polled by <code>&amp;mut</code> must be <code>Unpin</code>, which <code>JoinHandle</code> is. The <code>ctrl_c()</code> future, by contrast, is recreated each time, which is why a Ctrl-C during a tick can be missed."},
+  {"id":"roost-q8","type":"open","tags":["domain","concurrency","error-handling"],
+   "q":"A fresh wallet asks roost for a <code>light_client_bootstrap</code> at its pinned checkpoint root, which roost has never seen. Describe what happens on the swarm task and on the main task until the wallet is served, including what happens if Nimbus times out, and if Nimbus answers 404.",
+   "model":"On the swarm task, the <code>LcResponder::bootstrap</code> implementation finds nothing in the store. It calls <code>record_bootstrap_miss</code> (read-lock check, then write lock plus re-check) to queue the root, unless it was already attempted or queued, or the queue is full at 32. It answers <code>None</code>, so the wallet gets <code>ResourceUnavailable</code>, with no I/O and no await on that task. On a later 12 s tick, the main task's <code>fill_bootstrap_misses</code> takes up to 4 roots (marking them attempted) and fetches each from Nimbus over REST. On success it computes the digest and <code>insert_bootstrap</code>s the pre-encoded response, so the wallet's retry hits. On <code>FetchError::Transient</code> (a timeout, a 5xx, 408/429), the root is requeued at the front and its attempted marker cleared, so a hiccup doesn't block it for good. On <code>Unavailable</code> (404: Nimbus doesn't have it), the root stays marked as attempted and isn't fetched again, which prevents refetch storms from repeated wallet retries.",
+   "points":["swarm task: store miss → queue root (bounded, deduped) → ResourceUnavailable, no I/O","main task drains ≤4 per tick, marks attempted, fetches over REST","success → insert pre-encoded bootstrap; wallet retry hits","Transient → requeue at front (not poisoned)","Unavailable → stays attempted, never refetched"],
+   "context":"rust/roost/src/store.rs L412-432 LcResponder::bootstrap; L252-278 record_bootstrap_miss (MAX_BOOTSTRAP_MISSES 32); rust/roost/src/serve.rs L1244-1281 fill_bootstrap_misses with MISS_FETCHES_PER_TICK=4, FetchError::Unavailable keeps attempted, Transient -> requeue_bootstrap_miss; rest.rs L232-244 classification (408/429 transient)."},
+  {"id":"roost-q9","type":"mcq","tags":["domain","error-handling"],
+   "q":"Why does <code>EnrSeq::bump</code> persist the new number (fsync file, rename, fsync directory) <em>before</em> returning it?",
+   "options":["For logging","If roost crashed after publishing a record but before persisting, a restart would reuse a sequence number the network already saw, and the DHT ignores records that don't out-rank the one it has","Because rename is slow","To save memory"],
+   "answer":1,
+   "explain":"Persist before use. Durability of the <em>name</em> change needs the directory fsync too."},
+  {"id":"roost-q10","type":"mcq","tags":["ownership","lifetimes"],
+   "q":"Why does <code>UpdateChunk</code> own <code>ssz: Vec&lt;u8&gt;</code> instead of borrowing a <code>&amp;[u8]</code> from the REST body?",
+   "options":["Borrowing is slower","The chunks outlive the HTTP response buffer on their way to the archive and the store. A borrowing struct would need a lifetime parameter tied to <code>body</code>, and couldn't outlive it","<code>&amp;[u8]</code> can't be stored in a struct","To enable <code>Clone</code>"],
+   "answer":1,
+   "explain":"Owning data frees a type from lifetime parameters, at the cost of one copy."},
+  {"id":"roost-q11","type":"mcq","tags":["borrowing","interior-mutability"],
+   "q":"In <code>clear_bootstraps</code>, why iterate over <code>inner.bootstrap_order.clone()</code>?",
+   "options":["To sort it","Both field accesses go through the same write guard (<code>DerefMut</code>), so iterating one field while mutating another looks like a shared and a mutable borrow of <code>inner</code> at once. Cloning (at most 64 roots) sidesteps that; <code>let i = &amp;mut *inner;</code> would allow disjoint field borrows","The clone is required by <code>VecDeque</code>","To avoid holding the lock"],
+   "answer":1,
+   "explain":"Through a guard, the compiler sees one borrow of the whole guard, not separate fields."},
+  {"id":"roost-q12","type":"mcq","tags":["methods","domain"],
+   "q":"<code>serve</code> builds its <code>HostConfig</code> by naming all seven fields, including <code>listen_quic: None</code>, instead of writing <code>..HostConfig::default()</code> for the ones it does not care about. What does that buy?",
+   "options":["Nothing; the two forms always produce the same value","When <code>myotis-net</code> adds a field, this literal stops compiling until roost decides the value. With <code>..HostConfig::default()</code> roost would silently inherit the wallet's defaults, such as an ephemeral QUIC listener a server must not open","It makes the struct <code>Copy</code>","<code>..default()</code> is not allowed for structs with <code>Option</code> fields"],
+   "answer":1,
+   "explain":"A struct literal without <code>..base</code> must list every field, so a new field is a compile error at each construction site. <code>HostConfig::default()</code> is the wallet's shape: <code>listen_quic</code> is <code>Some(/ip4/0.0.0.0/udp/0/quic-v1)</code> there, while roost's relay forwards no UDP port and its ENR advertises no QUIC."},
+  {"id":"roost-q13","type":"open","tags":["enums-patterns","error-handling","domain"],
+   "q":"<code>participation_of</code> now chooses between <code>LcFork::Gloas</code> and <code>LcFork::PreGloas</code> by the length of the SSZ bytes. Explain why roost may decide this way when a wallet does not, what <code>.ok().map(…)</code> does with the result, and what went wrong for Gloas periods before the change.",
+   "model":"A Gloas <code>LightClientUpdate</code> has a fixed size (<code>GLOAS_SIZE</code>), and according to the doc comment no pre-Gloas update has that length, so the length alone identifies the shape. A wallet decodes by the chunk's context bytes because it must verify the update in the right fork's layout. roost only needs the sync-aggregate participant count to judge whether a stored update is provisional. <code>decode_for</code> returns a <code>Result</code>; <code>.ok()</code> turns it into an <code>Option</code> and drops the error, and <code>.map(|u| u.sync_aggregate.count_participants())</code> reads the count only when decoding succeeded, so an undecodable record gives <code>None</code>. Before the change the pre-Gloas decoder rejected every Gloas update, so it read as <code>None</code>. <code>should_replace</code> never lets an undecodable fresh chunk replace anything, so a Gloas period was stored once and never replaced by a better copy.",
+   "points":["the Gloas update is fixed-size and no pre-Gloas update has that length","roost only needs the participant count, not a verified decode by context bytes","decode_for gives a Result; .ok() makes it an Option and .map reads the count only on success","before, Gloas updates read as None, and should_replace never replaces with an undecodable chunk, so the first copy stayed forever"],
+   "context":"rust/roost/src/main.rs L564-584 participation_of: let fork = if ssz.len() == LightClientUpdate::GLOAS_SIZE { LcFork::Gloas } else { LcFork::PreGloas }; LightClientUpdate::decode_for(fork, ssz).ok().map(|u| u.sync_aggregate.count_participants()). Doc: 'without this every Gloas period would read as undecodable — stored once and never replaced by a better copy'. should_replace: (_, None) => false."}
+]</x-quiz>

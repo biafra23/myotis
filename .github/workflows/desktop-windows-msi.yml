@@ -7,7 +7,7 @@ name: Desktop MSI (Windows)
 # starts, loads the bundled Rust engine, serves JSON-RPC and uninstalls cleanly.
 # It does not prove the app syncs from a home connection: the Windows addon
 # smoke found peers over UDP but held no TCP connections from Azure
-# (docs/TODO.md, `smoke-windows`). Download the msi from the run's artifacts;
+# (docs/reviews/review-follow-ups.md, `smoke-windows`). Download the msi from the run's artifacts;
 # adding it to a release job (and a paragraph to the release notes every
 # publisher shares, .github/release-notes.md) is a follow-up once it has been
 # tried on a real Windows machine.

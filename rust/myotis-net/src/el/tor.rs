@@ -1,5 +1,5 @@
 //! Tor transport for the verified-read path and the transaction broadcast
-//! (`docs/privacy-and-tor.md`).
+//! (`docs/how-it-works/privacy-and-tor.md`).
 //!
 //! Feature-gated (`tor`): only a host that builds `myotis-net` with
 //! `--features tor` (`-PtorEngine`: the desktop dylib, the Android jniLibs)
@@ -45,7 +45,7 @@ use crate::el::rlpx::transport::RlpxConnection;
 
 /// The client id a Tor-side Hello advertises: the software's name without its
 /// version, so a peer cannot match a Tor session to a direct one (which says
-/// `myotis/<version>`) by version — docs/privacy-and-tor.md §6.3.
+/// `myotis/<version>`) by version — docs/how-it-works/privacy-and-tor.md §6.3.
 pub const TOR_CLIENT_ID: &str = "myotis";
 
 /// Process-wide Tor on/off, flipped by the host (JNI `myotis_set_tor_enabled`).

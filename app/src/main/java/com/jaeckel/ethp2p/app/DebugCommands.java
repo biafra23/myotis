@@ -17,7 +17,7 @@ import java.io.IOException;
  * index — an explorer/debugging aid that is UNVERIFIED on this path (each returned
  * tx says {@code "verified":false}) and depends on engine internals (the raw
  * RLPxConnector inside {@link TxHistoryService}). It is a documented exemption from
- * the "hosts consume only {@code io.myotis.api}" rule (see docs/reimplementation):
+ * the "hosts consume only {@code io.myotis.api}" rule (see docs/spec):
  * not part of the engine contract, not required of a re-implementation, and
  * constructed at the composition root where the internals are still in reach.
  *

@@ -139,7 +139,7 @@ pub extern "C" fn myotis_start(handle: i64) -> bool {
 }
 
 /// Toggle Tor verified-read routing (`set_tor_enabled` twin,
-/// docs/privacy-and-tor.md). Returns true iff this build supports Tor
+/// docs/how-it-works/privacy-and-tor.md). Returns true iff this build supports Tor
 /// (`--features tor`); a Tor-less build returns false and no-ops.
 #[no_mangle]
 pub extern "C" fn myotis_set_tor_enabled(on: bool) -> bool {

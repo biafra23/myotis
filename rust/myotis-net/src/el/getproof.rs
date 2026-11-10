@@ -3,7 +3,7 @@
 //!
 //! The proofs are the ones every account and storage read fetches over snap
 //! and verifies against a beacon-attested state root
-//! (docs/snap-server-design.md, *Measured*): a single-key snap response
+//! (docs/ideas/snap-server-design.md, *Measured*): a single-key snap response
 //! carries `trie.Prove(key)` plus a page of neighbours and the page's other
 //! boundary path, and [`myotis_core::trie::verify_proof_path`] keeps only the
 //! walk to the key — the list `eth_getProof` returns.

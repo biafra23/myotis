@@ -1,6 +1,6 @@
 //! Execution-layer block header — twin of `core.types.BlockHeader` (Java).
 //!
-//! RLP field order (docs/reimplementation/02 §1.2): parentHash, ommersHash,
+//! RLP field order (docs/spec/02 §1.2): parentHash, ommersHash,
 //! beneficiary(20), stateRoot, transactionsRoot, receiptsRoot, logsBloom(256),
 //! difficulty, number, gasLimit, gasUsed, timestamp, extraData,
 //! mixHash/prevRandao, nonce(8), then OPTIONAL trailing fields parsed only

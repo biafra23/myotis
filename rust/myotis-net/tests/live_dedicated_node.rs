@@ -1,4 +1,4 @@
-//! Live diagnostic against the dedicated sepolia node (docs/dedicated-sepolia-node.md):
+//! Live diagnostic against the dedicated sepolia node (docs/guides/dedicated-sepolia-node.md):
 //! dial it directly and run the exact request shapes the log-index backfill
 //! walker uses — reverse header window from a recent block, then bodies +
 //! receipts for a chunk — printing where (if anywhere) the node stops serving.

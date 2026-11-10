@@ -1,4 +1,4 @@
-//! The Tor reserve (docs/privacy-and-tor.md §5): verified peers set aside for
+//! The Tor reserve (docs/how-it-works/privacy-and-tor.md §5): verified peers set aside for
 //! Tor reads and sends, persisted next to the peer cache as
 //! `peers-tor[-net].cache` — the Tor-only sidecar §5 calls for.
 //!

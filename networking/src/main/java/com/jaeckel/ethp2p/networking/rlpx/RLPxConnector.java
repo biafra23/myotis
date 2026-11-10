@@ -636,7 +636,7 @@ public final class RLPxConnector implements AutoCloseable {
 
     /**
      * Count every RLPx session's socket bytes — handshake and frames — into
-     * {@code counter} (the stack's data usage, docs/data-usage.md). Applies to
+     * {@code counter} (the stack's data usage, docs/how-it-works/data-usage.md). Applies to
      * connections opened after the call.
      */
     public void setTrafficCounter(com.jaeckel.ethp2p.core.traffic.TrafficMeter.Counter counter) {

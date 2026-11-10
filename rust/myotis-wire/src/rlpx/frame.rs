@@ -1,5 +1,5 @@
 //! RLPx framed channel (EL-A4), twin of the Java `rlpx.FrameCodec`
-//! (docs/reimplementation/02 §5.3, §9.5-6).
+//! (docs/spec/02 §5.3, §9.5-6).
 //!
 //! Frame: `header(16) ‖ header-mac(16) ‖ body(padded to 16) ‖ body-mac(16)`.
 //! Header (16, encrypted): `body-size(3 BE) ‖ rlp([0, 0]) = 0xc2 0x80 0x80 ‖

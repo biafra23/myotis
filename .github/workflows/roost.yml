@@ -1,4 +1,4 @@
-# roost — the dedicated light-client server (docs/lc-server-design.md).
+# roost — the dedicated light-client server (docs/design-history/lc-server-design.md).
 #
 # It needs its own workflow because it is deliberately NOT a workspace member
 # (rust/Cargo.toml `exclude`), so `cargo test --workspace` in node-binding.yml

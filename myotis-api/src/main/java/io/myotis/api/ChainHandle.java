@@ -221,7 +221,7 @@ public interface ChainHandle {
      * engine (ABI 48) an entry may name a 32-byte {@code "topic"} (with
      * {@code "positions"}, 1–3) in place of {@code "address"}: every log from
      * any emitter carrying that value there, and {@code unwatch} takes such
-     * values too (docs/eth-getlogs-design.md §6). {@code true}
+     * values too (docs/design-history/eth-getlogs-design.md §6). {@code true}
      * means the push is done and its unwatch durable; {@code false} also
      * covers an unwatch whose checkpoint could not be written (repeat the
      * push).
@@ -284,7 +284,7 @@ public interface ChainHandle {
     }
 
     /**
-     * Read-fetch shadow-cache counters as JSON (schema 1; docs/read-stats.md):
+     * Read-fetch shadow-cache counters as JSON (schema 1; docs/how-it-works/read-stats.md):
      * how much of this chain's verified account / storage / bytecode fetch
      * traffic a cache — and which keying — would have served, with the
      * wall-clock it would have saved. A measurement surface: nothing is ever

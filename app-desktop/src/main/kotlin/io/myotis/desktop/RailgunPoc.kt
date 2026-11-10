@@ -29,7 +29,7 @@ package io.myotis.desktop
  *
  * This is a DEBUG / DEMO artefact, not a production path: each seed is a full node's
  * `eth_getLogs` output framed by `scripts/synth_logindex.py`, served unverified
- * (docs/railgun-poc.md) — and, being complete, never re-checked: the walk that could pass
+ * (docs/guides/railgun-poc.md) — and, being complete, never re-checked: the walk that could pass
  * through it has nothing to cover below it ([PocFlavour.seededIndexNotice]). It expires
  * ~500,000 blocks (~69 days on either network) after its fetch — the manifest carries the
  * block it is usable until.
