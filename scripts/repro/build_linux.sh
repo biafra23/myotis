@@ -31,7 +31,9 @@ if [[ -z "$version" ]]; then
 fi
 flag=-PpublishRelease
 [[ -z "$version" ]] || flag="-PpublishRelease=$version"
-echo "build_linux.sh: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH, engine library version: ${version:-the tree's release version}"
+# No apostrophe inside ${...:-...}: bash versions disagree on whether one opens
+# a quote there, even within double quotes.
+echo "build_linux.sh: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH, engine library version: ${version:-the release version of the tree}"
 
 for attempt in 1 2 3; do
     rm -rf build/maven-repo
