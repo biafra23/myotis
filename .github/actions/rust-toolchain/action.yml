@@ -6,6 +6,11 @@
 #
 # Being the default matters for cargo calls made from outside rust/ (with
 # --manifest-path), where rust-toolchain.toml does not apply.
+#
+# The install is rustup's MINIMAL profile (rustc with rustdoc, cargo, rust-std).
+# A job that runs clippy or rustfmt must ask for it in `components`: the old
+# dtolnay@stable steps reused the runner image's preinstalled stable toolchain,
+# which carried both, so no workflow used to say so.
 name: Rust toolchain (pinned)
 description: Install the rustc version pinned in rust/rust-toolchain.toml
 inputs:

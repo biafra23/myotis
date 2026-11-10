@@ -48,7 +48,12 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      # clippy explicitly: the pinned toolchain is a fresh minimal install
+      # (rustc, cargo, rust-std), where @stable reused the image's toolchain,
+      # which happened to carry clippy.
       - uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust/roost
