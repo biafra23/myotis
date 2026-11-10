@@ -13,7 +13,10 @@
 # Do not `docker build` this by hand: docker/builder/build.sh passes the build
 # args, reading the versions from the files that pin them for the build itself
 # (docker/builder/pins.env lists which). docker/builder/check.sh verifies the
-# result against the same pins.
+# result against the same pins. The image built from a set of pins is published
+# once, and docker/builder/image.lock names it by digest: docker/builder/pull.sh
+# gets that one instead of building. Changing this file changes the image's key
+# (`build.sh --print-key`), so image.lock moves with it.
 #
 # linux/amd64 only: the artifacts built in it are the Android APKs and engine
 # library, the Linux x86_64 host libraries and the .deb.
@@ -165,3 +168,8 @@ RUN curl -fsSL --retry 5 -o /tmp/platform.zip \
 # build input, and the image cannot be installed into, by design).
 ENV PATH=/opt/jdk/bin:/opt/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENV LANG=C.UTF-8
+
+# Where the published image comes from (ghcr.io links a package to the
+# repository this names).
+LABEL org.opencontainers.image.source="https://github.com/biafra23/myotis" \
+      org.opencontainers.image.description="Myotis builder image: the pinned toolchain of the Android release artifacts (docker/builder)"
