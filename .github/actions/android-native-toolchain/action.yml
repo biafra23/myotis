@@ -40,15 +40,25 @@ runs:
         sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
         [ -x "$sdkmanager" ] || { echo "::error::no sdkmanager under \$ANDROID_HOME ($ANDROID_HOME)"; exit 1; }
         # A no-op when the image already ships them (ubuntu-24.04 ships both).
-        yes | "$sdkmanager" "ndk;$NDK" "build-tools;$BT" >/dev/null
+        # Licence answers from a process substitution, not `yes |`: yes dies of
+        # SIGPIPE when sdkmanager exits, and under pipefail (GitHub's bash
+        # default) that fails the step even though the install worked.
+        "$sdkmanager" "ndk;$NDK" "build-tools;$BT" >/dev/null < <(yes)
         home="$ANDROID_HOME/ndk/$NDK"
         rev=$(sed -n 's/^Pkg.Revision *= *//p' "$home/source.properties" | tr -d '\r ')
         [ "$rev" = "$NDK" ] || { echo "::error::$home is NDK '$rev', expected $NDK"; exit 1; }
         [ -x "$ANDROID_HOME/build-tools/$BT/apksigner" ] || { echo "::error::build-tools $BT did not install"; exit 1; }
         echo "ndk-home=$home" >> "$GITHUB_OUTPUT"
+        # The image's ANDROID_NDK_HOME names its own default NDK (27.3 when this
+        # was written); point it at the pinned one for every later step, so a
+        # direct rust/build-android.sh or cargo-ndk call gets it too, not only
+        # Gradle's cargoNdkAndroid (which checks the version itself).
+        echo "ANDROID_NDK_HOME=$home" >> "$GITHUB_ENV"
         echo "NDK $rev at $home; build-tools $BT"
 
-    - uses: taiki-e/install-action@v2
+    # By commit, not @v2 (#734): the installer of the pinned cargo-ndk must not
+    # move under us either.
+    - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39  # v2.90.3
       with:
         tool: cargo-ndk@${{ steps.pins.outputs.cargo-ndk }}
 

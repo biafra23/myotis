@@ -43,6 +43,8 @@ on:
       - 'scripts/check_engine_library.sh'
       - 'scripts/merge_maven_repo.py'
       - '.github/workflows/engine-library.yml'
+      - '.github/actions/android-native-toolchain/**'
+      - '.github/actions/rust-toolchain/**'
       - '.github/actions/stage-engine-library/**'
       - '.github/workflows/release-version-guard.yml'
   workflow_dispatch:

@@ -25,6 +25,8 @@ on:
       - "rust/myotis-core/**"
       - "rust/myotis-evm/**"
       - ".github/workflows/roost.yml"
+      - ".github/actions/rust-toolchain/**"
+      - "rust/rust-toolchain.toml"
   pull_request:
     paths:
       - "rust/roost/**"
@@ -34,6 +36,8 @@ on:
       - "rust/myotis-core/**"
       - "rust/myotis-evm/**"
       - ".github/workflows/roost.yml"
+      - ".github/actions/rust-toolchain/**"
+      - "rust/rust-toolchain.toml"
 
 jobs:
   test:

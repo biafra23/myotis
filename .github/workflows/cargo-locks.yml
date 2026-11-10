@@ -34,11 +34,15 @@ on:
       - "rust/**/Cargo.toml"
       - "rust/**/Cargo.lock"
       - ".github/workflows/cargo-locks.yml"
+      - ".github/actions/rust-toolchain/**"
+      - "rust/rust-toolchain.toml"
   pull_request:
     paths:
       - "rust/**/Cargo.toml"
       - "rust/**/Cargo.lock"
       - ".github/workflows/cargo-locks.yml"
+      - ".github/actions/rust-toolchain/**"
+      - "rust/rust-toolchain.toml"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

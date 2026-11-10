@@ -33,6 +33,8 @@ on:
   pull_request:
     paths:
       - ".github/workflows/desktop-windows-msi.yml"
+      - ".github/actions/rust-toolchain/**"
+      - "rust/rust-toolchain.toml"
       - "app-desktop/build.gradle.kts"
       - "app-desktop/src/main/kotlin/io/myotis/desktop/Main.kt"
       - "app-desktop/src/main/resources/logback-desktop.xml"

@@ -45,6 +45,7 @@ on:
       - "rust/.cargo/**"
       - "rust/rust-toolchain.toml"
       - ".github/workflows/no-std-canary.yml"
+      - ".github/actions/rust-toolchain/**"
   pull_request:
     paths:
       - "rust/myotis-core/**"
@@ -56,6 +57,7 @@ on:
       - "rust/.cargo/**"
       - "rust/rust-toolchain.toml"
       - ".github/workflows/no-std-canary.yml"
+      - ".github/actions/rust-toolchain/**"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

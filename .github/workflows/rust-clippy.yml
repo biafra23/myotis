@@ -38,12 +38,14 @@ on:
       - "!rust/roost/**"
       - "!rust/tor-poc/**"
       - ".github/workflows/rust-clippy.yml"
+      - ".github/actions/rust-toolchain/**"
   pull_request:
     paths:
       - "rust/**"
       - "!rust/roost/**"
       - "!rust/tor-poc/**"
       - ".github/workflows/rust-clippy.yml"
+      - ".github/actions/rust-toolchain/**"
   # Fridays: Rust stable releases ship on Thursdays, so a new release's
   # deny-level lints show up on main within a day, whatever the diffs touch.
   schedule:

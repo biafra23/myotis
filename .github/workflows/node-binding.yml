@@ -15,7 +15,7 @@ on:
   push:
     branches: [ "main" ]
     tags: [ "v*" ]
-    paths: ['rust/**', '.github/workflows/node-binding.yml']
+    paths: ['rust/**', '.github/workflows/node-binding.yml', '.github/actions/rust-toolchain/**']
   workflow_dispatch:
 
 # Cancel a superseded run when new commits land on the same branch/PR. The

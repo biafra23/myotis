@@ -677,8 +677,11 @@ fun rustTool(name: String): String {
 
 // Probed from rust/ so rust-toolchain.toml governs which toolchain rustup
 // reports — probing the repo root would measure the rustup DEFAULT toolchain,
-// not the one the builds actually run. (If rustup has no stable installed,
-// the probe exits non-zero → "" → Rust is skipped, not downloaded.)
+// not the one the builds actually run. That file pins an exact rustc (#734), so
+// on a machine that lacks it this first probe is where rustup installs it (a
+// one-time download, which blocks configuration while it runs). If rustup
+// cannot (offline, RUSTUP_AUTO_INSTALL=0), the probe exits non-zero → "" →
+// Rust is skipped, and the Android gate names the pinned toolchain.
 fun probeTool(vararg cmd: String): String =
     providers.of(ToolProbe::class) {
         // rustTool resolves the executable itself; the PATH override covers
@@ -752,7 +755,14 @@ fun findAndroidNdk(): File? {
         ?: System.getenv("ANDROID_SDK_ROOT")
         ?: return null
     val dir = File(sdkDir, "ndk/$pinnedNdkVersion")
-    return dir.takeIf { it.isDirectory && ndkRevision(it) == pinnedNdkVersion }
+    if (!dir.isDirectory) return null
+    val rev = ndkRevision(dir)
+    if (rev == pinnedNdkVersion) return dir
+    // Present under the pinned name but not that NDK (a partial install, a
+    // hand-copied directory): say so, or sdkmanager's "already installed"
+    // would leave the developer guessing.
+    rejectedNdks += "$dir has ${if (rev == null) "no readable source.properties" else "Pkg.Revision $rev"}"
+    return null
 }
 val androidNdkDir = findAndroidNdk()
 
@@ -1113,7 +1123,11 @@ tasks.register("requireAndroidRustEngine") {
         }
         if (!androidRustToolchainReady) {
             val missing = buildList {
-                if (cargoVersion.isEmpty()) add("cargo/rustc (need $minRustVersion or newer)")
+                if (cargoVersion.isEmpty()) add(
+                    "cargo/rustc — with rustup, the toolchain rust/rust-toolchain.toml pins " +
+                        "(`cd rust && rustup toolchain install` fetches it; offline or with " +
+                        "RUSTUP_AUTO_INSTALL=0 rustup cannot); without rustup, $minRustVersion or newer",
+                )
                 else if (!rustAvailable) add("a newer rustc (need $minRustVersion+; found \"$cargoVersion\")")
                 val installCargoNdk = "`cargo install cargo-ndk --version $pinnedCargoNdkVersion --locked`"
                 if (cargoNdkVersion.isEmpty()) add("cargo-ndk $pinnedCargoNdkVersion ($installCargoNdk)")

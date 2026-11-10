@@ -40,6 +40,7 @@ on:
       - 'settings.gradle.kts'
       - 'gradle/libs.versions.toml'
       - '.github/workflows/ios-framework.yml'
+      - '.github/actions/rust-toolchain/**'
   pull_request:
     paths: *fw_paths
   # On demand for a branch the PR job skips (a part PR into a feature branch —

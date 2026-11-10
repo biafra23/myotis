@@ -33,7 +33,10 @@ runs:
           exit 1
         fi
         echo "channel=$channel" >> "$GITHUB_OUTPUT"
-    - uses: dtolnay/rust-toolchain@master
+    # By commit, not @master: what installs the pinned rustc must not move
+    # either (#734). Moving it is a reviewed edit of this line.
+    - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master, 2026-11
+
       with:
         toolchain: ${{ steps.pin.outputs.channel }}
         targets: ${{ inputs.targets }}

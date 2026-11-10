@@ -522,7 +522,8 @@ jobs:
           set -euo pipefail
           v=$(sed -n 's/^android-build-tools *= *"\([^"]*\)".*/\1/p' gradle/libs.versions.toml)
           [ -n "$v" ] || { echo "::error::no android-build-tools pin in gradle/libs.versions.toml"; exit 1; }
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;$v" >/dev/null
+          # Licences from a process substitution: `yes |` fails under pipefail.
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;$v" >/dev/null < <(yes)
 
       - name: Download the unsigned release APK
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
@@ -613,9 +614,11 @@ jobs:
           # The pinned build-tools (gradle/libs.versions.toml, #734), the same
           # version that signed the APK — not the newest the image happens to ship.
           bt_version=$(sed -n 's/^android-build-tools *= *"\([^"]*\)".*/\1/p' gradle/libs.versions.toml)
+          [ -n "$bt_version" ] || { echo "::error::no android-build-tools pin in gradle/libs.versions.toml"; exit 1; }
           build_tools="$ANDROID_HOME/build-tools/$bt_version/"
+          # Licences from a process substitution: `yes |` fails under pipefail.
           [ -x "${build_tools}aapt2" ] \
-            || yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;$bt_version" >/dev/null
+            || "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;$bt_version" >/dev/null < <(yes)
           aapt2="${build_tools}aapt2"
           shopt -s nullglob
           # variant, expected package, asset suffix. The package check is the
