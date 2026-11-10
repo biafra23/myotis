@@ -8,12 +8,14 @@
 #     differs in length and content, not just a prefix);
 #   - CARGO_HOME and GRADLE_USER_HOME: b gets empty ones of its own, so the
 #     crate sources and the Gradle caches sit at other paths;
+#   - on Linux, the user: both legs build in the builder image
+#     (docker/builder/), leg b as another uid with another home;
 #   - the time zone (UTC vs. Asia/Kathmandu, +05:45: a local-time stamp shows),
 #     the locale and the umask (022 vs. 002; Windows has no umask, and its leg
 #     b sets the system time zone instead of TZ);
 #   - the wall clock: the two jobs start, build and finish at different times.
-# The builder's USER is not varied yet: on a hosted runner the toolchains are
-# installed for the runner account. The builder container (Part 5b) varies it.
+# On macOS and Windows the user is not varied: there the toolchains are
+# installed for the runner account.
 #
 # What is compared (issue #734, decision D-d):
 #   tier 1, bit-for-bit — the unsigned release APK; the engine library as
@@ -25,11 +27,21 @@
 #     Windows msi (its files, extracted by an administrative install).
 # The verdict is a SHA-256 manifest per platform (scripts/repro/compare.py);
 # diffoscope only explains a difference, as an HTML report per differing file
-# in the run's `repro-report-<platform>` artifact.
+# in the run's `repro-report-<platform>-<leg>-vs-<leg>` artifact.
+#
+# Linux has a third leg, r: the same build on the hosted runner's toolchain, as
+# android-apk.yml and engine-library.yml install it, not in the image.
+# `Compare linux image vs runner toolchain` (a against r) REPORTS whether the
+# image and that toolchain give the same bytes. It is a proxy for "what a tag
+# publishes is what a third party rebuilds in the image", not the proof: the
+# release workflows run other Gradle invocations and stage natives from four
+# runners. The proof is the image build against the published assets
+# themselves (their SHA256SUMS, a later part of #734).
 #
 # WHAT FAILS THE RUN (owner's decision, 2026-11-10: Android first): the Android
 # artifacts — the APKs (android/) and the engine library (maven-repo/: the AAR,
-# its jars, natives jars and metadata) — and a missing Linux leg. Everything
+# its jars, natives jars and metadata) — in `Compare linux` (a against b), and
+# a missing leg a or b. Everything
 # else is built twice, compared and REPORTED in the same way, marked "(not
 # gated)", and does not fail yet: the Linux .deb and host libraries, and all of
 # macOS/iOS and Windows. The first runs found them close but not there (the
@@ -64,6 +76,7 @@ on:
     paths:
       - '.github/workflows/reproducible-builds.yml'
       - 'scripts/repro/**'
+      - 'docker/builder/**'
       - 'scripts/check_16k_alignment.py'
       - 'scripts/repro_zip.sh'
       - 'scripts/normalize_maven_metadata.py'
@@ -87,20 +100,171 @@ env:
   GRADLE_OPTS: -Dorg.gradle.daemon=false
 
 jobs:
+  # The builder image (#734 D-c): ONE image per run, built from its Dockerfile
+  # or reused from an earlier build of the same pins (the cache steps below say
+  # why), checked against the pins either way, and handed to Linux legs a and b
+  # as an artifact, so both build in the very same image.
+  builder-image:
+    name: Builder image
+    if: ${{ github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds') }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      # An image built from the SAME pins before is reused, from the Actions
+      # cache: building it needs snapshot.ubuntu.com, which refuses requests for
+      # minutes at a time (two of the first five builds died on its 503s), and
+      # this comparison is a condition of merging into main. The key is every
+      # input of the image: the resolved build args (each pin, read from its one
+      # source) and the files of docker/builder. Reused or built, check.sh
+      # holds the image to the pins, apt package list included. That the image
+      # still BUILDS from its pins is the `builder image` workflow's question,
+      # which never reads this cache.
+      - name: Key the image by everything that determines it
+        id: key
+        run: |
+          set -euo pipefail
+          hash=$({ docker/builder/build.sh --print-args; sha256sum docker/builder/*; } | sha256sum | cut -d' ' -f1)
+          echo "key=builder-image-$hash" >> "$GITHUB_OUTPUT"
+
+      - name: Look for an image built from these pins
+        id: cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ runner.temp }}/builder-image.tar.zst
+          key: ${{ steps.key.outputs.key }}
+
+      - name: Load the image
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: zstd -dc "$RUNNER_TEMP/builder-image.tar.zst" | docker load
+
+      - name: Build the image
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: docker/builder/build.sh
+
+      - name: Check the image against its pins
+        run: docker/builder/check.sh
+
+      - name: Save the image
+        run: |
+          set -euo pipefail
+          [ -f "$RUNNER_TEMP/builder-image.tar.zst" ] \
+            || docker save myotis-builder:local | zstd -T0 -3 -q -o "$RUNNER_TEMP/builder-image.tar.zst"
+          ls -lh "$RUNNER_TEMP/builder-image.tar.zst"
+          docker image inspect --format '{{.Id}}' myotis-builder:local | tee "$RUNNER_TEMP/builder-image.id"
+
+      # After check.sh: an image that does not match its pins is never cached.
+      - name: Keep the image for the next run with these pins
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ runner.temp }}/builder-image.tar.zst
+          key: ${{ steps.key.outputs.key }}
+
+      - name: Upload the image
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: builder-image
+          path: |
+            ${{ runner.temp }}/builder-image.tar.zst
+            ${{ runner.temp }}/builder-image.id
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
   linux:
     name: Linux + Android (leg ${{ matrix.leg }})
+    needs: builder-image
     if: ${{ github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
+        # Both build in the builder image and differ in everything else.
         leg: [ a, b ]
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           # Full history: :ui stamps the version from the nearest v* tag.
+          fetch-depth: 0
+
+      # The toolchain is the builder image (#734 D-c), not this runner's: the
+      # JDK, rustc, the NDK, build-tools and cargo-ndk, each by digest or hash
+      # (docker/builder/), as the builder-image job built and checked it.
+      - name: Download the builder image
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: builder-image
+          path: ${{ runner.temp }}/builder-image
+
+      - name: Load the builder image
+        run: |
+          set -euo pipefail
+          zstd -dc "$RUNNER_TEMP/builder-image/builder-image.tar.zst" | docker load
+          rm "$RUNNER_TEMP/builder-image/builder-image.tar.zst"
+          want=$(cat "$RUNNER_TEMP/builder-image/builder-image.id")
+          got=$(docker image inspect --format '{{.Id}}' myotis-builder:local)
+          [ "$got" = "$want" ] || { echo "::error::loaded image $got, the builder-image job built $want"; exit 1; }
+          echo "builder image $got"
+
+      # From here on the legs differ in path, homes, user, time zone, locale
+      # and umask.
+      - name: Set up leg ${{ matrix.leg }}
+        id: leg
+        env:
+          LEG: ${{ matrix.leg }}
+        run: scripts/repro/setup_leg.sh "$LEG"
+
+      # Inside the image, as the leg's uid and user name, with the checkout at
+      # its own path. The main checkout is mounted too: leg b's worktree keeps
+      # its git data there (:ui reads the version from git). Only what is
+      # named here reaches the build (docker/builder/run.sh).
+      - name: Build
+        working-directory: ${{ steps.leg.outputs.src }}
+        run: |
+          "$GITHUB_WORKSPACE/docker/builder/run.sh" --user "$REPRO_RUN_AS" --name "$REPRO_USER_NAME" \
+            --home "$REPRO_HOME" --cargo-home "$CARGO_HOME" --gradle-home "$GRADLE_USER_HOME" \
+            --mount "$GITHUB_WORKSPACE" \
+            --env "TZ=$TZ" --env "LANG=$LANG" --env "LC_ALL=$LC_ALL" --env "REPRO_UMASK=$REPRO_UMASK" \
+            --env "GITHUB_REF=$GITHUB_REF" --env "GITHUB_REF_NAME=$GITHUB_REF_NAME" \
+            --env "GRADLE_OPTS=$GRADLE_OPTS" \
+            -- scripts/repro/build_linux.sh
+
+      # As a tarball: an uploaded artifact keeps neither file modes nor
+      # symlinks, and the comparison checks both.
+      - name: Collect
+        working-directory: ${{ steps.leg.outputs.src }}
+        run: |
+          set -euo pipefail
+          scripts/repro/collect.sh linux . "$RUNNER_TEMP/repro-out"
+          tar -C "$RUNNER_TEMP/repro-out" -cf "$RUNNER_TEMP/repro-linux.tar" .
+
+      - name: Upload leg ${{ matrix.leg }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: repro-linux-${{ matrix.leg }}
+          path: ${{ runner.temp }}/repro-linux.tar
+          if-no-files-found: error
+
+  # Leg r: the same build on the hosted runner's toolchain, installed as
+  # android-apk.yml and engine-library.yml install it. A PROXY for a release,
+  # not a release: those workflows run other Gradle invocations, with caches,
+  # and stage the natives of four runners. Its comparison with leg a is
+  # reported, not gated (see the compare matrix). No `needs`: it does not use
+  # the image.
+  linux-release-toolchain:
+    name: Linux + Android (leg r, runner toolchain)
+    if: ${{ github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds') }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 150
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
           fetch-depth: 0
 
       - name: Set up JDK 21
@@ -117,51 +281,23 @@ jobs:
       - name: Install the pinned NDK, build-tools and cargo-ndk
         uses: ./.github/actions/android-native-toolchain
 
-      # After the toolchains (installed the same way in both legs): from here on
-      # the legs differ in path, homes, time zone, locale and umask.
-      - name: Set up leg ${{ matrix.leg }}
+      - name: Set up leg r
         id: leg
-        env:
-          LEG: ${{ matrix.leg }}
-        run: scripts/repro/setup_leg.sh "$LEG"
+        run: scripts/repro/setup_leg.sh r
 
       - name: Build
-        working-directory: ${{ steps.leg.outputs.src }}
-        run: |
-          set -euo pipefail
-          umask "$REPRO_UMASK"
-          chmod +x gradlew
-          # As stage-engine-library: the tag's version on a tag (v0.2.0-rc1
-          # stages 0.2.0-rc1), the bare release version otherwise.
-          flag=-PpublishRelease
-          [[ "$GITHUB_REF" != refs/tags/v* ]] || flag="-PpublishRelease=${GITHUB_REF_NAME#v}"
-          for attempt in 1 2 3; do
-            rm -rf build/maven-repo
-            ./gradlew "$flag" cargoBuildHost \
-              :android-app:assembleRelease :android-app:assembleDebug \
-              :app-desktop:packageDeb publishAllPublicationsToStagingRepository \
-              --stacktrace && break
-            [ "$attempt" -lt 3 ] || { echo "::error::build failed after 3 attempts"; exit 1; }
-            echo "::warning::build attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
-            sleep 25
-          done
-          python3 -I scripts/normalize_maven_metadata.py build/maven-repo
-          (cd rust && . ./repro-env.sh && cargo build --locked -p myotis-node --release --target x86_64-unknown-linux-gnu)
-          python3 -I scripts/check_16k_alignment.py android-app/build/outputs/apk/release/*.apk
+        run: scripts/repro/build_linux.sh
 
-      # As a tarball: an uploaded artifact keeps neither file modes nor
-      # symlinks, and the comparison checks both.
       - name: Collect
-        working-directory: ${{ steps.leg.outputs.src }}
         run: |
           set -euo pipefail
           scripts/repro/collect.sh linux . "$RUNNER_TEMP/repro-out"
           tar -C "$RUNNER_TEMP/repro-out" -cf "$RUNNER_TEMP/repro-linux.tar" .
 
-      - name: Upload leg ${{ matrix.leg }}
+      - name: Upload leg r
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: repro-linux-${{ matrix.leg }}
+          name: repro-linux-r
           path: ${{ runner.temp }}/repro-linux.tar
           if-no-files-found: error
 
@@ -332,8 +468,8 @@ jobs:
           if-no-files-found: error
 
   compare:
-    name: Compare ${{ matrix.platform }}
-    needs: [ linux, macos, windows ]
+    name: Compare ${{ matrix.name }}
+    needs: [ linux, linux-release-toolchain, macos, windows ]
     # Also when a build leg failed: its platform then fails here with "leg
     # missing" instead of the whole comparison quietly not running.
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds')) }}
@@ -343,29 +479,54 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # compare.py's gate per platform: what FAILS the run. See the header.
-          - platform: linux
+          # Which two legs, and compare.py's gate: what FAILS the run. See the
+          # header.
+          - name: linux
+            platform: linux
+            first: a
+            second: b
             gate: "--gate android/* --gate maven-repo/*"
-          - platform: macos
+          # The image build against a build on the hosted runner's toolchain
+          # (leg r). REPORTED, NOT GATED: whether this comparison fails the run,
+          # and on which paths, is the owner's decision (the gate is Android
+          # first, legs a and b; CLAUDE.md). If it is gated one day, not on the
+          # Linux natives jar: it carries a host library linked by the
+          # builder's own gcc and glibc (the hosted image's moves with Ubuntu's
+          # updates), and the RELEASE's Linux natives come from neither side
+          # here but from ubuntu-22.04 (engine-library.yml, a glibc 2.35 floor).
+          - name: linux image vs runner toolchain
+            platform: linux
+            first: a
+            second: r
             gate: "--report-only"
-          - platform: windows
+          - name: macos
+            platform: macos
+            first: a
+            second: b
+            gate: "--report-only"
+          - name: windows
+            platform: windows
+            first: a
+            second: b
             gate: "--report-only"
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
-      - name: Download leg a
+      # Into tars/a and tars/b whichever legs they are: compare.py's "leg a"
+      # is matrix.first and its "leg b" is matrix.second.
+      - name: Download leg ${{ matrix.first }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         continue-on-error: true
         with:
-          name: repro-${{ matrix.platform }}-a
+          name: repro-${{ matrix.platform }}-${{ matrix.first }}
           path: tars/a
 
-      - name: Download leg b
+      - name: Download leg ${{ matrix.second }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         continue-on-error: true
         with:
-          name: repro-${{ matrix.platform }}-b
+          name: repro-${{ matrix.platform }}-${{ matrix.second }}
           path: tars/b
 
       # -p: the modes as the leg recorded them, not this runner's umask.
@@ -376,10 +537,14 @@ jobs:
         env:
           PLATFORM: ${{ matrix.platform }}
           GATE: ${{ matrix.gate }}
+          FIRST: ${{ matrix.first }}
+          SECOND: ${{ matrix.second }}
         run: |
           set -euo pipefail
-          for leg in a b; do
-            tar="tars/$leg/repro-$PLATFORM.tar"
+          # tars/a holds leg $FIRST, tars/b leg $SECOND.
+          for pair in "a:$FIRST" "b:$SECOND"; do
+            dir=${pair%%:*} leg=${pair##*:}
+            tar="tars/$dir/repro-$PLATFORM.tar"
             if [ ! -f "$tar" ]; then
               if [ "$GATE" = "--report-only" ]; then
                 echo "::warning::leg $leg of $PLATFORM produced no artifacts (its build failed): nothing to compare"
@@ -388,8 +553,8 @@ jobs:
               fi
               echo "::error::leg $leg of $PLATFORM produced no artifacts (its build failed)"; exit 1
             fi
-            mkdir -p "legs/$leg"
-            tar -C "legs/$leg" -xpf "$tar"
+            mkdir -p "legs/$dir"
+            tar -C "legs/$dir" -xpf "$tar"
           done
 
       # The archive's diffoscope: only to explain a difference, so the runner
@@ -406,14 +571,17 @@ jobs:
         if: ${{ steps.unpack.outputs.skip != 'true' }}
         env:
           GATE: ${{ matrix.gate }}
+          FIRST: ${{ matrix.first }}
+          SECOND: ${{ matrix.second }}
         run: |
           set -f
-          python3 -I scripts/repro/compare.py legs/a legs/b report scripts/repro/known-differences.txt $GATE
+          python3 -I scripts/repro/compare.py legs/a legs/b report scripts/repro/known-differences.txt \
+            --labels "$FIRST" "$SECOND" $GATE
 
       - name: Upload the report
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: repro-report-${{ matrix.platform }}
+          name: repro-report-${{ matrix.platform }}-${{ matrix.first }}-vs-${{ matrix.second }}
           path: report
           if-no-files-found: ignore

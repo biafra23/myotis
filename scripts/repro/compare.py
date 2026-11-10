@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Compare two rebuild legs' artifact trees (#734, Part 5a).
 
-    compare.py A_DIR B_DIR REPORT_DIR [KNOWN_DIFFERENCES] [--gate GLOB]... [--report-only]
+    compare.py A_DIR B_DIR REPORT_DIR [KNOWN_DIFFERENCES] [--gate GLOB]... [--no-gate GLOB]...
+               [--report-only] [--labels FIRST SECOND]
 
 Both trees come from scripts/repro/collect.sh, carried as tarballs (an
 uploaded artifact keeps neither modes nor symlinks). The VERDICT is a SHA-256
@@ -19,7 +20,10 @@ list shrinks as fixes land instead of hiding new regressions.
 
 --gate GLOB (repeatable) limits what FAILS to the matching paths: every other
 difference is still listed, marked "(not gated)", and does not fail. Without
---gate everything is gated. --report-only gates nothing (a platform whose
+--gate everything is gated. --no-gate GLOB takes matching paths back out of
+the gate (it wins over --gate): for a comparison whose two sides are not
+expected to agree on them. --labels names the two legs in the output (default
+a and b). --report-only gates nothing (a platform whose
 artifacts are compared and reported but not yet held to reproducibility).
 reproducible-builds.yml gates the Android artifacts today (owner's decision,
 2026-11-10; desktop and Apple join in a later part of #734).
@@ -90,7 +94,7 @@ def load_known(path):
     return known
 
 
-def main(a, b, report, known_file=None, gates=None, report_only=False):
+def main(a, b, report, known_file=None, gates=None, report_only=False, no_gates=None, labels=("a", "b")):
     os.makedirs(report, exist_ok=True)
     ma, mb = manifest(a), manifest(b)
     if not ma or not mb:
@@ -118,7 +122,7 @@ def main(a, b, report, known_file=None, gates=None, report_only=False):
     unexplained = [r for r in differ if r not in known_hits]
 
     def gated(rel):
-        if report_only:
+        if report_only or any(fnmatch.fnmatchcase(rel, g) for g in no_gates or ()):
             return False
         return not gates or any(fnmatch.fnmatchcase(rel, g) for g in gates)
 
@@ -126,11 +130,14 @@ def main(a, b, report, known_file=None, gates=None, report_only=False):
     mark = lambda r: "" if gated(r) else "  (not gated)"
     scope = ("nothing gated (report only)" if report_only
              else "gated: " + ", ".join(gates) if gates else "everything gated")
-    lines = [f"{len(ma)} files in leg a, {len(mb)} in leg b; "
-             f"{len(unexplained)} differ, {len(only_a)} only in a, {len(only_b)} only in b, "
+    if no_gates and not report_only:
+        scope += " except " + ", ".join(no_gates)
+    la, lb = labels
+    lines = [f"{len(ma)} files in leg {la}, {len(mb)} in leg {lb}; "
+             f"{len(unexplained)} differ, {len(only_a)} only in {la}, {len(only_b)} only in {lb}, "
              f"{len(known_hits)} known differences; {scope}; {len(failing)} failing"]
-    lines += [f"ONLY IN A  {r}{mark(r)}" for r in only_a]
-    lines += [f"ONLY IN B  {r}{mark(r)}" for r in only_b]
+    lines += [f"ONLY IN {la.upper()}  {r}{mark(r)}" for r in only_a]
+    lines += [f"ONLY IN {lb.upper()}  {r}{mark(r)}" for r in only_b]
     lines += [f"DIFFERS    {r}{mark(r)}" for r in unexplained]
     lines += [f"KNOWN      {r}: {why}" for r, why in sorted(known_hits.items())]
     # "No longer seen" only where the pattern applies to this platform's tree
@@ -187,15 +194,20 @@ def main(a, b, report, known_file=None, gates=None, report_only=False):
 
 
 if __name__ == "__main__":
-    args, gates, report_only = [], [], False
+    args, gates, no_gates, report_only, labels = [], [], [], False, ("a", "b")
     it = iter(sys.argv[1:])
     for arg in it:
         if arg == "--gate":
             gates.append(next(it, None) or sys.exit("compare.py: --gate needs a glob"))
+        elif arg == "--no-gate":
+            no_gates.append(next(it, None) or sys.exit("compare.py: --no-gate needs a glob"))
         elif arg == "--report-only":
             report_only = True
+        elif arg == "--labels":
+            labels = (next(it, None), next(it, None))
+            all(labels) or sys.exit("compare.py: --labels needs two names")
         else:
             args.append(arg)
     if len(args) not in (3, 4):
         sys.exit(__doc__)
-    main(*args, gates=gates or None, report_only=report_only)
+    main(*args, gates=gates or None, report_only=report_only, no_gates=no_gates or None, labels=labels)

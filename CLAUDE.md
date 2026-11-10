@@ -190,6 +190,37 @@ Key Gradle modules:
   hashes the `gradle pins` workflow collects). Review the hash diff like code.
   Never "fix" a verification failure you did not cause by re-pinning — bytes
   changed under a pinned version. docs/guides/gradle-dependency-pins.md.
+- **The builder image is the reference toolchain for the Linux and Android
+  artifacts** (`docker/builder/`, #734): base image by digest, apt from one
+  snapshot, the JDK / rustup / Android command-line tools by SHA-256, and
+  rustc, the NDK, build-tools and cargo-ndk at the versions the build pins,
+  which `build.sh` reads from their one source each (`.java-version`,
+  `rust/rust-toolchain.toml`, `gradle/libs.versions.toml`). Bumping the JDK
+  therefore also moves `JDK_VERSION` / `JDK_BUILD` / `JDK_SHA256` in
+  `docker/builder/pins.env`, in the same change; `build.sh` refuses a mismatch
+  and the `builder image` workflow fails the PR. It is what a third party
+  rebuilds a release's ANDROID artifacts in (`docker/builder/build.sh`, then
+  `docker/builder/run.sh -- scripts/repro/build_linux.sh`; `run.sh` gives the
+  build its own HOME, cargo home and Gradle home and none of the caller's
+  environment) and what `reproducible-builds.yml`'s Linux legs a and b build
+  in (that run reuses an image already built from the same pins, from the
+  Actions cache, and checks it against them; the `builder image` workflow
+  builds it from scratch on every change to a pin, and weekly). **The release workflows themselves still build on the hosted runner**
+  (`android-apk.yml`, `engine-library.yml`: the same pinned versions, installed
+  by the setup actions); the comparison's leg r builds on that toolchain, and
+  `Compare linux image vs runner toolchain` REPORTS whether it and the image
+  give the same bytes. It is not gated (the gate is the owner's), and it is a
+  proxy: the proof that a published artifact is the image's is a comparison
+  with the published assets themselves. **The image is not the builder of the
+  Linux host libraries a release ships**: those come from `ubuntu-22.04`
+  runners on purpose (a glibc 2.35 floor), so their natives jars, the `.deb`
+  and the Node addon are outside what the image reproduces until #734's
+  desktop part pins a builder for them.
+  The image's apt packages are listed in `docker/builder/apt-packages.txt`,
+  which `check.sh` compares with the built image: moving `APT_SNAPSHOT` or the
+  package list moves that file in the same change, and its diff is reviewed
+  like a dependency bump. Never install or upgrade a tool inside an image
+  build of the artifacts: the image is read-only at run time on purpose.
 - **Tuweni 2.7.2** (upstream `io.consensys.tuweni`, Maven Central; original `org.apache.tuweni` packages) — RLP encoding, SECP256K1, byte utilities.
 - **Netty 4.2.x** — NIO-only (no epoll/kqueue). 4-thread `NioEventLoopGroup` for RLPx.
 - **BouncyCastle** — SECP256K1 crypto provider
@@ -427,7 +458,8 @@ the post-merge run on `main`.
 into `main`** (owner ruling, 2026-11-10). "Reproducible" is what
 `reproducible-builds.yml` GATES (#734): the artifact built twice — two
 runners, different checkout path, `CARGO_HOME`, `GRADLE_USER_HOME`, time zone,
-locale, umask and wall clock — comes out bit-for-bit identical, apart from the
+locale, umask and wall clock, and on Linux, where both builds run in the
+builder image, another user — comes out bit-for-bit identical, apart from the
 entries in `scripts/repro/known-differences.txt` (none today).
 
 **The gate is Android first** (owner's decision, 2026-11-10): the unsigned
@@ -460,7 +492,7 @@ owner.
   docs, tests or CI that builds nothing shipped needs no run.
 - **A red comparison is a blocker, like red CI** (a gated artifact differs):
   find the leak (the run's
-  `repro-report-<platform>` artifact names every differing file, with a
+  `repro-report-<platform>-<leg>-vs-<leg>` artifact names every differing file, with a
   diffoscope report) and fix it on the PR's own branch. **Never make it green
   by adding a pattern to `known-differences.txt`, or by loosening
   `scripts/repro/compare.py` / `collect.sh`** — that accepts a

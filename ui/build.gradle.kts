@@ -225,6 +225,10 @@ kotlin {
 android {
     namespace = "io.myotis.ui"
     compileSdk = 35
+    // The pinned build-tools, as :android-app and :myotis-engine (#734): without
+    // this AGP falls back to its own default version, which the hosted runner
+    // happens to preinstall and the builder image (docker/builder/) does not.
+    buildToolsVersion = libs.versions.android.build.tools.get()
     defaultConfig {
         minSdk = 29
     }
