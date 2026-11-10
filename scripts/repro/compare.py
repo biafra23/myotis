@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare two rebuild legs' artifact trees (#734, Part 5a).
 
-    compare.py A_DIR B_DIR REPORT_DIR [KNOWN_DIFFERENCES]
+    compare.py A_DIR B_DIR REPORT_DIR [KNOWN_DIFFERENCES] [--gate GLOB]... [--report-only]
 
 Both trees come from scripts/repro/collect.sh, carried as tarballs (an
 uploaded artifact keeps neither modes nor symlinks). The VERDICT is a SHA-256
@@ -16,6 +16,13 @@ globs, that are known not to reproduce yet, each with its reason: a matching
 difference is reported as KNOWN and does not fail; anything else still does.
 A listed pattern that no longer matches any difference is reported, so the
 list shrinks as fixes land instead of hiding new regressions.
+
+--gate GLOB (repeatable) limits what FAILS to the matching paths: every other
+difference is still listed, marked "(not gated)", and does not fail. Without
+--gate everything is gated. --report-only gates nothing (a platform whose
+artifacts are compared and reported but not yet held to reproducibility).
+reproducible-builds.yml gates the Android artifacts today (owner's decision,
+2026-11-10; desktop and Apple join in a later part of #734).
 Stdlib only.
 """
 import fnmatch
@@ -83,7 +90,7 @@ def load_known(path):
     return known
 
 
-def main(a, b, report, known_file=None):
+def main(a, b, report, known_file=None, gates=None, report_only=False):
     os.makedirs(report, exist_ok=True)
     ma, mb = manifest(a), manifest(b)
     if not ma or not mb:
@@ -109,12 +116,22 @@ def main(a, b, report, known_file=None):
     only_a = [r for r in only_a if r not in known_hits]
     only_b = [r for r in only_b if r not in known_hits]
     unexplained = [r for r in differ if r not in known_hits]
+
+    def gated(rel):
+        if report_only:
+            return False
+        return not gates or any(fnmatch.fnmatchcase(rel, g) for g in gates)
+
+    failing = [r for r in only_a + only_b + unexplained if gated(r)]
+    mark = lambda r: "" if gated(r) else "  (not gated)"
+    scope = ("nothing gated (report only)" if report_only
+             else "gated: " + ", ".join(gates) if gates else "everything gated")
     lines = [f"{len(ma)} files in leg a, {len(mb)} in leg b; "
              f"{len(unexplained)} differ, {len(only_a)} only in a, {len(only_b)} only in b, "
-             f"{len(known_hits)} known differences"]
-    lines += [f"ONLY IN A  {r}" for r in only_a]
-    lines += [f"ONLY IN B  {r}" for r in only_b]
-    lines += [f"DIFFERS    {r}" for r in unexplained]
+             f"{len(known_hits)} known differences; {scope}; {len(failing)} failing"]
+    lines += [f"ONLY IN A  {r}{mark(r)}" for r in only_a]
+    lines += [f"ONLY IN B  {r}{mark(r)}" for r in only_b]
+    lines += [f"DIFFERS    {r}{mark(r)}" for r in unexplained]
     lines += [f"KNOWN      {r}: {why}" for r, why in sorted(known_hits.items())]
     # "No longer seen" only where the pattern applies to this platform's tree
     # (the .deb's entry means nothing to the Windows legs).
@@ -131,8 +148,10 @@ def main(a, b, report, known_file=None):
     # MAX_EXPLAINED (the summary lists them all), each within a time limit, all
     # within EXPLAIN_BUDGET so the job ends inside its timeout.
     started = time.monotonic()
-    # Unexplained differences first; the known ones after, while time is left.
-    for n, rel in enumerate(unexplained + [r for r in differ if r in known_hits]):
+    # Failing differences first, then the other unexplained ones, then the
+    # known ones, while time is left.
+    queue = sorted(unexplained, key=lambda r: not gated(r)) + [r for r in differ if r in known_hits]
+    for n, rel in enumerate(queue):
         if diffoscope is None:
             break
         if n == MAX_EXPLAINED or time.monotonic() - started > EXPLAIN_BUDGET:
@@ -156,15 +175,27 @@ def main(a, b, report, known_file=None):
         lines.append("(diffoscope not installed: no per-file report)")
 
     print(write_summary(report, lines), end="")
-    if only_a or only_b or unexplained:
+    if failing:
         sys.exit(1)
-    if known_hits:
+    ungated = len(only_a) + len(only_b) + len(unexplained)
+    if ungated:
+        print(f"the gated artifacts reproduce; {ungated} difference(s) outside the gate (reported above, not failing)")
+    elif known_hits:
         print(f"no unexplained differences; {len(known_hits)} known (listed above with their reasons)")
     else:
         print("all artifacts are identical across the two builds")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) not in (4, 5):
+    args, gates, report_only = [], [], False
+    it = iter(sys.argv[1:])
+    for arg in it:
+        if arg == "--gate":
+            gates.append(next(it, None) or sys.exit("compare.py: --gate needs a glob"))
+        elif arg == "--report-only":
+            report_only = True
+        else:
+            args.append(arg)
+    if len(args) not in (3, 4):
         sys.exit(__doc__)
-    main(*sys.argv[1:])
+    main(*args, gates=gates or None, report_only=report_only)

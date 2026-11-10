@@ -25,8 +25,16 @@
 #     Windows msi (its files, extracted by an administrative install).
 # The verdict is a SHA-256 manifest per platform (scripts/repro/compare.py);
 # diffoscope only explains a difference, as an HTML report per differing file
-# in the run's `repro-report-<platform>` artifact. Any difference, missing
-# file or failed leg fails the run.
+# in the run's `repro-report-<platform>` artifact.
+#
+# WHAT FAILS THE RUN (owner's decision, 2026-11-10: Android first): the Android
+# artifacts — the APKs (android/) and the engine library (maven-repo/: the AAR,
+# its jars, natives jars and metadata) — and a missing Linux leg. Everything
+# else is built twice, compared and REPORTED in the same way, marked "(not
+# gated)", and does not fail yet: the Linux .deb and host libraries, and all of
+# macOS/iOS and Windows. The first runs found them close but not there (the
+# desktop installers' payload, the macOS dylibs and the MyotisKit binaries);
+# they join the gate in a later part of #734, one `--gate` at a time below.
 #
 # Not on every pull request: a full rebuild of every platform, twice, is the
 # most expensive workflow in the repository, and what it checks moves only with
@@ -334,7 +342,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [ linux, macos, windows ]
+        include:
+          # compare.py's gate per platform: what FAILS the run. See the header.
+          - platform: linux
+            gate: "--gate android/* --gate maven-repo/*"
+          - platform: macos
+            gate: "--report-only"
+          - platform: windows
+            gate: "--report-only"
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -354,14 +369,25 @@ jobs:
           path: tars/b
 
       # -p: the modes as the leg recorded them, not this runner's umask.
+      # A missing leg fails a gated platform; on a report-only one its own
+      # build job is already red, and there is nothing to compare.
       - name: Unpack both legs
+        id: unpack
         env:
           PLATFORM: ${{ matrix.platform }}
+          GATE: ${{ matrix.gate }}
         run: |
           set -euo pipefail
           for leg in a b; do
             tar="tars/$leg/repro-$PLATFORM.tar"
-            [ -f "$tar" ] || { echo "::error::leg $leg of $PLATFORM produced no artifacts (its build failed)"; exit 1; }
+            if [ ! -f "$tar" ]; then
+              if [ "$GATE" = "--report-only" ]; then
+                echo "::warning::leg $leg of $PLATFORM produced no artifacts (its build failed): nothing to compare"
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "::error::leg $leg of $PLATFORM produced no artifacts (its build failed)"; exit 1
+            fi
             mkdir -p "legs/$leg"
             tar -C "legs/$leg" -xpf "$tar"
           done
@@ -374,8 +400,15 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends diffoscope-minimal unzip >/dev/null
           diffoscope --version
 
+      # $GATE unquoted on purpose: it is a list of compare.py arguments. set -f
+      # keeps the shell from expanding the globs in it.
       - name: Compare the two legs
-        run: python3 -I scripts/repro/compare.py legs/a legs/b report scripts/repro/known-differences.txt
+        if: ${{ steps.unpack.outputs.skip != 'true' }}
+        env:
+          GATE: ${{ matrix.gate }}
+        run: |
+          set -f
+          python3 -I scripts/repro/compare.py legs/a legs/b report scripts/repro/known-differences.txt $GATE
 
       - name: Upload the report
         if: ${{ always() }}
