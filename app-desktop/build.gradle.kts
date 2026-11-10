@@ -4,6 +4,14 @@
 
 import org.gradle.api.tasks.PathSensitivity
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
+import java.nio.file.FileSystems
+import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermissions
+import java.security.MessageDigest
+import java.time.LocalDateTime
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+import java.util.zip.ZipOutputStream
 
 plugins {
     alias(libs.plugins.kotlin.jvm)
@@ -734,6 +742,112 @@ compose.desktop {
                 // (generateMacIcon writes only the macOS .icns).
             }
         }
+    }
+}
+
+// === Reproducible app image (#734, Part 5a) ==================================
+// Every installer (dmg, deb, msi) is jpackage'd from createDistributable's app
+// image (the Compose plugin sets each package task's appImage from it), and that
+// image was not reproducible:
+//   - The plugin REWRITES jars into it: the skiko runtime jar on every OS (to
+//     take its native library out) and, on macOS, every jar (to sign the native
+//     libraries inside). Its copyZipEntry builds each entry as
+//     `new ZipEntry(name)`, so ZipOutputStream stamps the wall clock, in local
+//     time; and the skiko jar's file name is a hash of that content.
+//   - jpackage writes the image under the builder's umask.
+// Found by reproducible-builds.yml's two legs. So, before any installer is made:
+// every jar is rewritten with Gradle's own fixed entry time (names, contents,
+// order and compression unchanged), the skiko jar is renamed by the hash of its
+// now-stable content (the plugin's own naming) with the launcher .cfg line that
+// lists it, modes are normalized to 644/755, and on macOS the bundle's ad-hoc
+// signature, which seals the jars, is applied again and verified.
+val reproducibleZipTime: LocalDateTime =
+    LocalDateTime.of(1980, 2, 1, 0, 0) // Gradle's constant for reproducible archives
+
+fun rewriteJarWithFixedTimes(jar: File) {
+    val tmp = File(jar.parentFile, jar.name + ".repro-tmp")
+    ZipFile(jar).use { zin ->
+        ZipOutputStream(tmp.outputStream().buffered()).use { zout ->
+            for (entry in zin.entries()) {
+                val copy = ZipEntry(entry.name).apply {
+                    // setTimeLocal, not setTime: no time-zone conversion, no
+                    // extended-timestamp field.
+                    setTimeLocal(reproducibleZipTime)
+                    comment = entry.comment
+                    extra = entry.extra
+                    method = entry.method
+                    if (entry.method == ZipEntry.STORED) {
+                        size = entry.size
+                        compressedSize = entry.compressedSize
+                        crc = entry.crc
+                    }
+                }
+                zout.putNextEntry(copy)
+                zin.getInputStream(entry).use { it.copyTo(zout) }
+                zout.closeEntry()
+            }
+        }
+    }
+    if (!jar.delete() || !tmp.renameTo(jar)) throw GradleException("could not replace $jar")
+}
+
+// The Compose plugin's name hash: MD5 of the content, each byte as unpadded hex.
+fun composeContentHash(f: File): String =
+    MessageDigest.getInstance("MD5").digest(f.readBytes())
+        .joinToString("") { Integer.toHexString(it.toInt() and 0xff) }
+
+fun normalizeAppImage(root: File, isMac: Boolean, logger: org.gradle.api.logging.Logger) {
+    val jars = root.walkTopDown().filter { it.isFile && it.name.endsWith(".jar") }.toList()
+    jars.forEach(::rewriteJarWithFixedTimes)
+
+    val skiko = Regex("""(skiko-awt-runtime-[a-z0-9-]+?-[0-9][0-9.]*)-[0-9a-f]{20,40}\.jar""")
+    val renamed = mutableMapOf<String, String>()
+    jars.filter { skiko.matches(it.name) }.forEach { jar ->
+        val stable = skiko.matchEntire(jar.name)!!.groupValues[1] + "-" + composeContentHash(jar) + ".jar"
+        if (stable != jar.name) {
+            if (!jar.renameTo(File(jar.parentFile, stable))) throw GradleException("could not rename $jar")
+            renamed[jar.name] = stable
+        }
+    }
+    root.walkTopDown().filter { it.isFile && it.name.endsWith(".cfg") }.forEach { cfg ->
+        var text = cfg.readText()
+        renamed.forEach { (old, new) -> text = text.replace(old, new) }
+        cfg.writeText(text)
+    }
+
+    // POSIX modes where the file system has them (not the msi's NTFS image).
+    if (FileSystems.getDefault().supportedFileAttributeViews().contains("posix")) {
+        val dirMode = PosixFilePermissions.fromString("rwxr-xr-x")
+        val fileMode = PosixFilePermissions.fromString("rw-r--r--")
+        root.walkTopDown().forEach { f ->
+            val p = f.toPath()
+            if (Files.isSymbolicLink(p)) return@forEach
+            Files.setPosixFilePermissions(
+                p, if (f.isDirectory || f.canExecute()) dirMode else fileMode,
+            )
+        }
+    }
+
+    if (isMac) {
+        root.listFiles { f -> f.isDirectory && f.name.endsWith(".app") }.orEmpty().forEach { app ->
+            fun run(vararg cmd: String) {
+                val proc = ProcessBuilder(*cmd).redirectErrorStream(true).start()
+                val out = proc.inputStream.bufferedReader().readText()
+                if (proc.waitFor() != 0) throw GradleException("${cmd.joinToString(" ")} failed:\n$out")
+            }
+            // Ad-hoc, as jpackage signed it: no identity is configured (macOS.signing
+            // stays off; notarization is a follow-up), so this restores the same seal.
+            run("codesign", "--force", "--deep", "--sign", "-", app.absolutePath)
+            run("codesign", "--verify", "--deep", "--strict", app.absolutePath)
+        }
+    }
+    logger.lifecycle("reproducible app image: ${jars.size} jars normalized, ${renamed.size} renamed, in $root")
+}
+
+tasks.withType<org.jetbrains.compose.desktop.application.tasks.AbstractJPackageTask>().configureEach {
+    if (targetFormat == TargetFormat.AppImage) {
+        val mac = isMacHost
+        doLast { normalizeAppImage(destinationDir.get().asFile, mac, logger) }
     }
 }
 

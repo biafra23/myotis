@@ -213,6 +213,19 @@ jobs:
             done <<< "$engines"
           done
 
+      # Every .so the APKs ship (the Rust engine and JNA's dispatcher) must have
+      # 16 KB-aligned LOAD segments, or Android 15+ devices with 16 KB pages
+      # refuse to load it. rust/build-android.sh checked this, but the Gradle
+      # cargoNdkAndroid path the APKs are built from had no check, and since
+      # #734 Part 4b the alignment flag reaches the linker through a MERGE of
+      # per-target rustflags, which a RUSTFLAGS would silently replace.
+      - name: Verify the APKs' native libraries are 16 KB aligned
+        run: |
+          set -euo pipefail
+          python3 -I scripts/check_16k_alignment.py \
+            "$(ls android-app/build/outputs/apk/debug/*.apk | head -n1)" \
+            "$(ls android-app/build/outputs/apk/release/*.apk | head -n1)"
+
       # minSdk JDK-API gate — enforcement for CLAUDE.md's "minSdk 29 JDK-API
       # budget"; the script's docstring is the full story. The platform install
       # feeds its api-versions canary: pre-36.1 databases don't record every

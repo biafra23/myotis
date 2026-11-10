@@ -413,6 +413,59 @@ event, which these workflows do not run on — so push a commit or dispatch the
 three workflows before it merges, or the first artifact build of that head is
 the post-merge run on `main`.
 
+## No merge into `main` may break reproducibility
+
+**A PR whose merge would make a release build non-reproducible does not merge
+into `main`** (owner ruling, 2026-11-10). "Reproducible" is what
+`reproducible-builds.yml` GATES (#734): the artifact built twice — two
+runners, different checkout path, `CARGO_HOME`, `GRADLE_USER_HOME`, time zone,
+locale, umask and wall clock — comes out bit-for-bit identical, apart from the
+entries in `scripts/repro/known-differences.txt` (none today).
+
+**The gate is Android first** (owner's decision, 2026-11-10): the unsigned
+release APK, the debug APK (by payload: its debug-key signature differs by
+design) and the engine library as staged (the AAR, its jars, natives jars,
+poms and metadata) — `android/` and `maven-repo/` in the Linux comparison.
+The rest is built twice and compared in the same run but only REPORTED,
+marked "(not gated)": the Linux `.deb` and host libraries, the Windows msi and
+DLLs, the macOS dmg and dylibs, the xcframeworks. They were close but not
+reproducible when the gate was set (the desktop installers' payload, the macOS
+dylibs, the MyotisKit binaries) and join it in a later part of #734, by adding
+a `--gate` in the workflow's `compare` matrix. Until then a difference there
+is information, not a blocker; do not widen or narrow the gate without the
+owner.
+
+- **Before reporting a PR into `main` "ready to merge", its head has a green
+  `reproducible builds` run** whenever the PR can change what a release build
+  produces: build scripts and plugins (`*.gradle.kts`, `gradle/`,
+  `gradle.properties`), dependencies and their pins, toolchain pins
+  (`rust/rust-toolchain.toml`, `.java-version`, `.xcode-version`, the NDK /
+  build-tools / cargo-ndk pins), `rust/.cargo/`, `rust/*.sh`, Cargo manifests
+  and locks, packaging and signing configuration, the release workflows, or
+  code that runs at build time (build scripts, macros, codegen, embedded
+  resources). The workflow runs by itself on a PR that changes it or its
+  scripts; for any other PR, dispatch it on the PR's branch (Actions tab, or
+  `gh api repos/<owner>/<repo>/actions/workflows/reproducible-builds.yml/dispatches
+  -f ref=<branch>`) and wait for its `Compare` jobs (`Compare linux` carries the
+  gate). When unsure whether a
+  change can reach a release artifact, dispatch it. A PR that touches only
+  docs, tests or CI that builds nothing shipped needs no run.
+- **A red comparison is a blocker, like red CI** (a gated artifact differs):
+  find the leak (the run's
+  `repro-report-<platform>` artifact names every differing file, with a
+  diffoscope report) and fix it on the PR's own branch. **Never make it green
+  by adding a pattern to `known-differences.txt`, or by loosening
+  `scripts/repro/compare.py` / `collect.sh`** — that accepts a
+  non-reproducible artifact, which is the owner's call (*Deferred*, with the
+  cause and the options). An entry whose cause is fixed is REMOVED (the
+  comparison names patterns that no longer match).
+- **The weekly run on `main` is the backstop**, and a `v*` tag runs the same
+  check as the release's own proof. A red weekly or tag run means `main` is
+  not reproducible: report it to the owner, and its fix is the next PR into
+  `main`, before anything that could hide or compound it.
+- This adds a condition to "ready to merge"; it changes nothing about who
+  merges. The merge into `main` stays the owner's.
+
 ## Releases — ask before cutting one
 
 When the user asks for a release (a `v*` tag, a version bump, "cut a release"),

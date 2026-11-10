@@ -188,6 +188,14 @@ android {
         // cargo build, third-party plugins and build scripts included.
         release {
             isMinifyEnabled = false
+            // AGP writes META-INF/version-control-info.textproto from the git
+            // checkout: the commit in a clone, `NO_VALID_GIT_FOUND` in a source
+            // tarball or a git worktree. So the APK's bytes depended on HOW the
+            // tree was checked out, which a rebuilder cannot be asked to match
+            // (#734, Part 5a: the two legs differed in exactly this file). The
+            // commit is the release's; its provenance is the release
+            // attestation, not a file inside the APK.
+            vcsInfo { include = false }
         }
     }
 

@@ -43,6 +43,7 @@ on:
       - 'scripts/check_engine_library.sh'
       - 'scripts/merge_maven_repo.py'
       - 'scripts/normalize_maven_metadata.py'
+      - 'scripts/check_16k_alignment.py'
       - 'scripts/repro_zip.sh'
       - '.github/workflows/engine-library.yml'
       - '.java-version'

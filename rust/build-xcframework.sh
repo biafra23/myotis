@@ -77,5 +77,7 @@ xcodebuild -create-xcframework \
   -library "$here/target/$DEVICE/release/$libname" -headers "$hdrs" \
   -library "$out/sim/$libname" -headers "$hdrs" \
   -output "$framework"
+# xcodebuild lists the slices in no fixed order (#734, Part 5a).
+python3 -I "$here/../scripts/normalize_xcframework.py" "$framework"
 
 echo "==> Done: $framework"

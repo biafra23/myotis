@@ -138,12 +138,17 @@ runs:
       shell: bash
       run: scripts/check_engine_library.sh build/maven-repo
 
-    # What a desktop consumer gets: the engine jar and this runner's natives jar
-    # (linux-x86-64, from the staged set, not a local build) on the classpath and
-    # no library path — the engine must load, with bindings and library agreeing.
-    # The staging step's -PpublishRelease flag too: without it the modules' version
-    # changes, their jars are rebuilt under it, and the tag's GitHub Packages publish
-    # would then build them a third time — other bytes than the staged ones.
+    # The AAR's jniLibs are what a consumer's APK ships: 16 KB-aligned LOAD
+    # segments, or Android 15+ devices with 16 KB pages refuse to load them
+    # (#734 Part 5a; the alignment flag rides a rustflags MERGE since Part 4b).
+    - name: Check the AAR's native libraries are 16 KB aligned
+      shell: bash
+      run: |
+        set -euo pipefail
+        mapfile -t aars < <(find build/maven-repo/eth/myotis -name '*.aar' | LC_ALL=C sort)
+        [ "${#aars[@]}" -gt 0 ] || { echo "::error::no AAR in build/maven-repo"; exit 1; }
+        python3 -I scripts/check_16k_alignment.py "${aars[@]}"
+
     # Gradle stamps every maven-metadata.xml with the publish's wall-clock
     # <lastUpdated> (and checksum sidecars of it), the one thing that made the
     # staged repository differ between two builds of one tag (#734 D8; two
@@ -153,6 +158,12 @@ runs:
       shell: bash
       run: python3 -I scripts/normalize_maven_metadata.py build/maven-repo
 
+    # What a desktop consumer gets: the engine jar and this runner's natives jar
+    # (linux-x86-64, from the staged set, not a local build) on the classpath and
+    # no library path — the engine must load, with bindings and library agreeing.
+    # The staging step's -PpublishRelease flag too: without it the modules' version
+    # changes, their jars are rebuilt under it, and the tag's GitHub Packages publish
+    # would then build them a third time — other bytes than the staged ones.
     - name: Load the engine from the natives jar
       shell: bash
       env:
