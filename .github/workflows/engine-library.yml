@@ -390,6 +390,29 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./gradlew "-PpublishRelease=${GITHUB_REF_NAME#v}" -PengineNativesDir=build/engine-natives publishAllPublicationsToGitHubPackagesRepository --stacktrace
 
+      # Published == staged (#734 D8). The publish above is a SECOND Gradle run;
+      # it uploads the staged bytes only as long as nothing re-ran in between.
+      # Read every published artifact back and compare it with the staged copy
+      # that the checks above passed and that the zip and the maven-repo branch
+      # carry. maven-metadata* is excluded: the registry keeps its own.
+      - name: Check the published bytes are the staged ones
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF_NAME#v}"
+          tmp=$(mktemp -d); n=0
+          while IFS= read -r f; do
+            rel=${f#build/maven-repo/}
+            curl -fsS -u "${GITHUB_ACTOR}:${GITHUB_TOKEN}" -o "$tmp/x" \
+              "https://maven.pkg.github.com/${GITHUB_REPOSITORY}/$rel" \
+              || { echo "::error::$rel is not on GitHub Packages"; exit 1; }
+            cmp -s "$f" "$tmp/x" || { echo "::error::$rel on GitHub Packages differs from the staged, checked copy"; exit 1; }
+            n=$((n + 1))
+          done < <(find build/maven-repo/eth/myotis -path "*/$v/*" -type f ! -name 'maven-metadata*' | LC_ALL=C sort)
+          [ "$n" -gt 0 ] || { echo "::error::no staged files for $v"; exit 1; }
+          echo "all $n published files match the staged publication"
+
       # The iOS module went up from the ios-engine job (Gradle here has it
       # disabled): make sure it is there, or a re-run of this job alone after a
       # deleted version would publish everything but it, all green.

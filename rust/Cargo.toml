@@ -80,3 +80,10 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
+# Stated, not inherited (#734 D2): these are cargo's current release defaults
+# (no debug info, which cargo then strips from the output), written out so a
+# change of cargo's defaults cannot silently change the shipped bytes. The
+# exported symbols the hosts load (JNI, UniFFI, the C ABI) live in .dynsym and
+# are not touched; staticlibs are never stripped by cargo.
+debug = false
+strip = "debuginfo"

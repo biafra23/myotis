@@ -23,7 +23,7 @@ stamp=$(TZ=UTC date -d "@$sde" +%Y%m%d%H%M.%S 2>/dev/null || TZ=UTC date -r "$sd
 # u=rw, go=r for files, plus x for directories and files already executable
 # (644/755 whatever umask wrote them; symlinks are left alone).
 normalize() {
-    chmod -R u=rwX,go=rX "$1"
+    chmod -R u=rwX,go=rX,a-s "$1"
     TZ=UTC find "$1" -exec touch -h -t "$stamp" {} +
 }
 

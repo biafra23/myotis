@@ -112,10 +112,23 @@ abstract class AppVersionSource : ValueSource<String, AppVersionSource.Params> {
     }
 }
 
-val uiAppVersion: Provider<String> = providers.of(AppVersionSource::class) {
-    parameters.repoDir.fileValue(rootDir)
-    parameters.projectVersion.set(project.version.toString())
+// -PappVersion=X.Y.Z overrides the git-derived value (#734 D4). The derivation
+// above is deterministic per checkout KIND, not per commit: a full clone of a
+// tag says X.Y.Z, a source tarball says the root version (-SNAPSHOT), a shallow
+// clone without tags says <x>-<sha>. A rebuild that wants the release's bytes
+// states the version instead of depending on how the source was fetched
+// (docs/reproducible-builds.md, Part 5). Shape-checked like the tags it stands
+// for, so it cannot inject into the generated Kotlin literal.
+val explicitAppVersion: String? = providers.gradleProperty("appVersion").orNull?.trim()?.also {
+    require(Regex("""^\d+(\.\d+)*$""").matches(it)) {
+        "-PappVersion=$it: expected a release version like 0.1.21 (no v prefix, no suffix)"
+    }
 }
+val uiAppVersion: Provider<String> = explicitAppVersion?.let { providers.provider { it } }
+    ?: providers.of(AppVersionSource::class) {
+        parameters.repoDir.fileValue(rootDir)
+        parameters.projectVersion.set(project.version.toString())
+    }
 
 val generateUiBuildInfo by tasks.registering {
     val outDir = layout.buildDirectory.dir("generated/buildInfo/kotlin")

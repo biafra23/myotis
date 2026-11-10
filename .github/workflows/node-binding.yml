@@ -72,7 +72,9 @@ jobs:
           workspaces: rust
       - name: Build
         working-directory: rust
-        run: cargo build --locked -p myotis-node --release --target ${{ matrix.target }}
+        shell: bash
+        # Fixed source-path prefixes in the shipped addon (#734 D2).
+        run: . ./repro-env.sh && cargo build --locked -p myotis-node --release --target ${{ matrix.target }}
       - name: Rename to .node
         shell: bash
         run: cp "${{ matrix.built }}" "${{ matrix.artifact }}"

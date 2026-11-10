@@ -144,6 +144,15 @@ runs:
     # The staging step's -PpublishRelease flag too: without it the modules' version
     # changes, their jars are rebuilt under it, and the tag's GitHub Packages publish
     # would then build them a third time — other bytes than the staged ones.
+    # Gradle stamps every maven-metadata.xml with the publish's wall-clock
+    # <lastUpdated> (and checksum sidecars of it), the one thing that made the
+    # staged repository differ between two builds of one tag (#734 D8; two
+    # local release stagings were byte-identical in all 310 files after this).
+    # Before anything consumes build/maven-repo: the zip, the maven-repo branch.
+    - name: Make the staged metadata deterministic
+      shell: bash
+      run: python3 -I scripts/normalize_maven_metadata.py build/maven-repo
+
     - name: Load the engine from the natives jar
       shell: bash
       env:
