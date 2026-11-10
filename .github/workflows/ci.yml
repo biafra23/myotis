@@ -40,13 +40,13 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      # Current stable, like every other Rust lane. The Gradle gate skips any
-      # toolchain below the workspace rust-version (rust/Cargo.toml), and that
-      # floor moves with the dependency graph. Leaning on the image's preinstalled
-      # Rust would let a floor bump that outpaces the image turn cargoTest and
-      # verifyRustVersionFloor into a quiet skip here, with `build` still green.
+      # The rustc rust/rust-toolchain.toml pins, like every Rust lane (#734).
+      # Not the image's preinstalled Rust: the Gradle gate skips any toolchain
+      # below the workspace rust-version (rust/Cargo.toml), so a floor bump that
+      # outpaced the image would turn cargoTest and verifyRustVersionFloor into
+      # a quiet skip here, with `build` still green.
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/rust-toolchain
 
       # The Android launcher / status-bar icons are GENERATED from assets/myotis_logo.svg
       # and committed (android-app/src/main/res: ic_launcher_foreground, ic_stat_myotis,

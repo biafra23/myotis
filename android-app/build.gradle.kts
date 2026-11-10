@@ -96,6 +96,12 @@ val derivedVersionCode: Int = rootProject.extra["releaseBuildNumber"] as Int
 android {
     namespace = "com.jaeckel.ethp2p.android"
     compileSdk = 35
+    // Pinned exactly (#734): AGP strips the packaged .so files with this NDK's
+    // llvm-strip (an unpinned NDK leaves them unstripped or strips them with
+    // whatever is installed), and build-tools is the same version
+    // scripts/sign_release_apk.sh signs with. Both from gradle/libs.versions.toml.
+    ndkVersion = libs.versions.android.ndk.get()
+    buildToolsVersion = libs.versions.android.build.tools.get()
     // The app has NO jniLibs of its own: every native lib it ships (the engine,
     // native BLS, JNA's dispatcher) arrives inside the engine library's AAR. Said
     // explicitly because AGP's default src/main/jniLibs is where cargoNdkAndroid

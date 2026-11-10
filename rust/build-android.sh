@@ -5,13 +5,17 @@
 # kicks in. See docs/bls-rust-acceleration.md.
 #
 # One-time setup:
-#   rustup target add aarch64-linux-android x86_64-linux-android armv7-linux-androideabi
-#   cargo install cargo-ndk
-#   export ANDROID_NDK_HOME=<sdk>/ndk/<version>   # r28+ recommended, e.g. 28.2.13676358
+#   rustup target add aarch64-linux-android x86_64-linux-android   (inside rust/)
+#   cargo install cargo-ndk --version <cargo-ndk> --locked
+#   sdkmanager "ndk;<android-ndk>"; export ANDROID_NDK_HOME=<sdk>/ndk/<android-ndk>
+# with <cargo-ndk> and <android-ndk> the EXACT versions pinned in
+# gradle/libs.versions.toml (#734). `./gradlew cargoNdkAndroid` finds and checks
+# both itself and refuses any other version; run directly, this script uses
+# whatever ANDROID_NDK_HOME and cargo-ndk you give it.
 #
-# Prefer NDK r28 or newer: it defaults to 16 KB-aligned LOAD segments (required by
-# Android 15+ devices with 16 KB memory pages). On older NDKs .cargo/config.toml still
-# forces the alignment via -Wl,-z,max-page-size=16384, and the check at the end of this
+# The pinned NDK is r28 or newer, which defaults to 16 KB-aligned LOAD segments
+# (required by Android 15+ devices with 16 KB memory pages). .cargo/config.toml forces
+# the alignment too via -Wl,-z,max-page-size=16384, and the check at the end of this
 # script fails the build if anything slips through.
 #
 # Then: rust/build-android.sh
@@ -25,7 +29,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 jniLibs="$here/../myotis-engine/src/androidMain/jniLibs"
 
-: "${ANDROID_NDK_HOME:?set ANDROID_NDK_HOME to your NDK path (e.g. \$ANDROID_SDK/ndk/27.0.11718014)}"
+: "${ANDROID_NDK_HOME:?set ANDROID_NDK_HOME to the pinned NDK (\$ANDROID_SDK/ndk/<android-ndk from gradle/libs.versions.toml>)}"
 
 # arm64-v8a covers all modern phones; x86_64 covers the emulator. Add armeabi-v7a for
 # very old 32-bit devices if you still target them.
@@ -47,7 +51,7 @@ case "${MYOTIS_TOR_ENGINE:-0}" in
     *) echo "MYOTIS_TOR_ENGINE must be 0 or 1 (got '${MYOTIS_TOR_ENGINE}')" >&2; exit 1 ;;
 esac
 # shellcheck disable=SC2086 # $tor_features is empty or two words, split on purpose
-cargo ndk -t arm64-v8a -t x86_64 -o "$jniLibs" build --release -p myotis-bls -p myotis-engine $tor_features
+cargo ndk -t arm64-v8a -t x86_64 -o "$jniLibs" build --locked --release -p myotis-bls -p myotis-engine $tor_features
 
 # cargo-ndk copies EVERY dynamic library the build graph produces, including
 # hash-named dependency artifacts (e.g. libif_watch-<hash>.so) that

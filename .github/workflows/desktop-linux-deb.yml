@@ -76,7 +76,7 @@ jobs:
       # source here. prepareRustAppResources fails the build if the lib is
       # missing, so this step is REQUIRED, not optional.
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/rust-toolchain
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2

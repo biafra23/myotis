@@ -107,7 +107,7 @@ jobs:
           architecture: 'aarch64'
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/rust-toolchain
         with:
           # Both iOS triples the framework embeds. The runner is Apple Silicon,
           # so device (aarch64-apple-ios) and arm64 simulator

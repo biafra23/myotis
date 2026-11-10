@@ -90,7 +90,7 @@ jobs:
           distribution: 'temurin'
 
       - name: Set up Rust (${{ matrix.target }})
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/rust-toolchain
         with:
           targets: ${{ matrix.target }}
 
@@ -177,7 +177,7 @@ jobs:
           architecture: 'aarch64'
 
       - name: Set up Rust (iOS targets)
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/rust-toolchain
         with:
           targets: aarch64-apple-ios, aarch64-apple-ios-sim
 

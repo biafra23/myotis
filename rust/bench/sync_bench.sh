@@ -110,7 +110,7 @@ bench_daemon() {
 bench_native() {
   local bin="$REPO/rust/target/release/examples/live_sync"
   local log="/tmp/bench-native.log"
-  [ -x "$bin" ] || { echo "FAIL no-binary (cargo build --release -p myotis-net --examples)"; return 1; }
+  [ -x "$bin" ] || { echo "FAIL no-binary (cargo build --locked --release -p myotis-net --examples)"; return 1; }
   RUST_LOG=info "$bin" >"$log" 2>&1 &   # runs until SYNCED (not --once, so we can sample steady state)
   local pid=$! t0 peak=0
   t0=$(now_ms)

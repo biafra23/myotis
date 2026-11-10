@@ -1,0 +1,61 @@
+# The ONE way a workflow sets up the Android native toolchain (#734, Part 2):
+# exactly the NDK, build-tools and cargo-ndk versions pinned in
+# gradle/libs.versions.toml. The Gradle side accepts nothing else
+# (cargoNdkAndroid's gate in the root build.gradle.kts; ndkVersion /
+# buildToolsVersion in :android-app and :myotis-engine), so a runner image that
+# changes its default NDK — ANDROID_NDK_HOME points at it, and it was 27.3 when
+# this was written — no longer changes what CI compiles.
+#
+# Needs an Android SDK with cmdline-tools at $ANDROID_HOME (GitHub's ubuntu
+# images ship one) and the Rust toolchain set up before it (cargo-ndk is a cargo
+# subcommand).
+name: Android native toolchain (pinned)
+description: Install the NDK, build-tools and cargo-ndk versions pinned in gradle/libs.versions.toml
+outputs:
+  ndk-version:
+    value: ${{ steps.pins.outputs.ndk }}
+  ndk-home:
+    description: The pinned NDK's directory
+    value: ${{ steps.sdk.outputs.ndk-home }}
+runs:
+  using: composite
+  steps:
+    - id: pins
+      shell: bash
+      run: |
+        pin() { sed -n "s/^$1 *= *\"\([^\"]*\)\".*/\1/p" gradle/libs.versions.toml; }
+        ndk=$(pin android-ndk) bt=$(pin android-build-tools) cargo_ndk=$(pin cargo-ndk)
+        for name in ndk bt cargo_ndk; do
+          [ -n "${!name}" ] || { echo "::error file=gradle/libs.versions.toml::no $name pin"; exit 1; }
+        done
+        { echo "ndk=$ndk"; echo "bt=$bt"; echo "cargo-ndk=$cargo_ndk"; } >> "$GITHUB_OUTPUT"
+
+    - id: sdk
+      shell: bash
+      env:
+        NDK: ${{ steps.pins.outputs.ndk }}
+        BT: ${{ steps.pins.outputs.bt }}
+      run: |
+        set -euo pipefail
+        sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+        [ -x "$sdkmanager" ] || { echo "::error::no sdkmanager under \$ANDROID_HOME ($ANDROID_HOME)"; exit 1; }
+        # A no-op when the image already ships them (ubuntu-24.04 ships both).
+        yes | "$sdkmanager" "ndk;$NDK" "build-tools;$BT" >/dev/null
+        home="$ANDROID_HOME/ndk/$NDK"
+        rev=$(sed -n 's/^Pkg.Revision *= *//p' "$home/source.properties" | tr -d '\r ')
+        [ "$rev" = "$NDK" ] || { echo "::error::$home is NDK '$rev', expected $NDK"; exit 1; }
+        [ -x "$ANDROID_HOME/build-tools/$BT/apksigner" ] || { echo "::error::build-tools $BT did not install"; exit 1; }
+        echo "ndk-home=$home" >> "$GITHUB_OUTPUT"
+        echo "NDK $rev at $home; build-tools $BT"
+
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-ndk@${{ steps.pins.outputs.cargo-ndk }}
+
+    - shell: bash
+      env:
+        WANT: ${{ steps.pins.outputs.cargo-ndk }}
+      run: |
+        got=$(cargo ndk --version)
+        [ "$got" = "cargo-ndk $WANT" ] || { echo "::error::cargo ndk --version says '$got', expected cargo-ndk $WANT"; exit 1; }
+        echo "$got"
