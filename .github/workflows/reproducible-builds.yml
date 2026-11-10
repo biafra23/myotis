@@ -374,10 +374,12 @@ jobs:
           # app/.package afresh for the dmg, with whatever umask it runs under
           # (775 and 664 under leg b's 002), and nothing after it can put them
           # right inside the image. Everything packageDmg takes in was built
-          # above, under the leg's own umask. A second Gradle run, and a new
-          # JVM for it (GRADLE_OPTS above: no daemon), because a JVM cannot
-          # change its umask; the dmg task checks the one it runs under.
-          (umask 022 && gradle :app-desktop:packageDmg)
+          # above, under the leg's own umask, and stays that way: the image
+          # task is excluded, so this run can only read the image, never
+          # rebuild it under 022. A second Gradle run, and a new JVM for it
+          # (GRADLE_OPTS above: no daemon), because a JVM cannot change its
+          # umask; the dmg task checks the one it runs under.
+          (umask 022 && gradle :app-desktop:packageDmg -x :app-desktop:createDistributable)
           rust/build-xcframework.sh
           (cd rust && . ./repro-env.sh && cargo build --locked -p myotis-node --release --target aarch64-apple-darwin)
 

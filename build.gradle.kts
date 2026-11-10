@@ -88,15 +88,43 @@ allprojects {
     tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinNativeCompile>().configureEach {
         compilerOptions.freeCompilerArgs.add("-Xklib-relative-path-base=${rootDir.absolutePath}")
     }
-    // The link joins those relative paths with ITS working directory, the Gradle
-    // daemon's (under GRADLE_USER_HOME), and writes them into the framework's
-    // debug info: map that, and the root, to one fixed prefix.
-    tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinNativeLink>().configureEach {
-        val daemonDir = System.getProperty("user.dir")
-        toolOptions.freeCompilerArgs.addAll(
-            "-Xdebug-prefix-map=$daemonDir=/myotis",
-            "-Xdebug-prefix-map=${rootDir.absolutePath}=/myotis",
-        )
+    // The link turns those relative paths back into absolute ones and writes
+    // them into the framework's debug info (the light debug info a release
+    // framework carries for stack traces), together with its own output path
+    // as the compile unit's name: the checkout path and GRADLE_USER_HOME, in
+    // every MyotisKit binary (#734, Part 5d: the two legs differed in exactly
+    // these strings, and in the offsets after them). Two prefixes, mapped to
+    // one fixed root:
+    //   - the directory the compiler resolves a relative path against. It runs
+    //     inside this JVM, and a JVM resolves against the directory it was
+    //     STARTED in (for a Gradle daemon, GRADLE_USER_HOME/daemon/<version>),
+    //     whatever `user.dir` says later: Gradle sets that property to the
+    //     project directory for each build, which is why reading it here
+    //     mapped nothing. File("").absolutePath asks the question the way the
+    //     compiler does;
+    //   - the repository root, for the output path.
+    // Release binaries only: a debug framework keeps the real paths lldb and
+    // Xcode look sources up by.
+    // On the binaries, not on the link tasks: the Kotlin plugin SETS a link
+    // task's toolOptions.freeCompilerArgs when it registers the task, after an
+    // action added here has run, so arguments added to the task from this
+    // block never reached the compiler (which is how Part 5a's version of this
+    // looked right and did nothing).
+    plugins.withId("org.jetbrains.kotlin.multiplatform") {
+        val startDir = File("").absolutePath
+        val root = rootDir.absolutePath
+        extensions.configure<org.jetbrains.kotlin.gradle.dsl.KotlinMultiplatformExtension> {
+            targets.withType<org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget>().configureEach {
+                binaries.configureEach {
+                    if (buildType == org.jetbrains.kotlin.gradle.plugin.mpp.NativeBuildType.RELEASE) {
+                        freeCompilerArgs += listOf(
+                            "-Xdebug-prefix-map=$startDir=/myotis",
+                            "-Xdebug-prefix-map=$root=/myotis",
+                        )
+                    }
+                }
+            }
+        }
     }
 
     // === Pinned dependency graph (#734, Part 1) ==============================
