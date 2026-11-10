@@ -3,10 +3,11 @@
 
     compare.py A_DIR B_DIR REPORT_DIR
 
-Both trees come from scripts/repro/collect.sh. The VERDICT is a SHA-256
-manifest of every file (relative path + hash) and every symlink target: equal
-manifests pass, anything else fails, and the verdict never depends on which
-tools happen to be installed. diffoscope only EXPLAINS a failure: for each file
+Both trees come from scripts/repro/collect.sh, carried as tarballs (an
+uploaded artifact keeps neither modes nor symlinks). The VERDICT is a SHA-256
+manifest of every file (relative path, permission bits and hash) and every
+symlink target: equal manifests pass, anything else fails, and the verdict
+never depends on which tools happen to be installed. diffoscope only EXPLAINS a failure: for each file
 that differs it writes REPORT_DIR/<path>.html (and a text summary), if
 diffoscope is on PATH. REPORT_DIR always gets both manifests and summary.txt.
 Stdlib only.
@@ -14,8 +15,13 @@ Stdlib only.
 import hashlib
 import os
 import shutil
+import stat
 import subprocess
 import sys
+
+
+MAX_EXPLAINED = 25
+EXPLAIN_TIMEOUT = 600  # seconds per file
 
 
 def manifest(root):
@@ -32,7 +38,9 @@ def manifest(root):
                 with open(path, "rb") as f:
                     for chunk in iter(lambda: f.read(1 << 20), b""):
                         h.update(chunk)
-                entries[rel] = h.hexdigest()
+                # The mode too: a .app's files ship with theirs, and leg b builds
+                # under another umask to catch exactly that leak.
+                entries[rel] = f"{h.hexdigest()} {stat.S_IMODE(os.lstat(path).st_mode):04o}"
     return entries
 
 
@@ -60,16 +68,26 @@ def main(a, b, report):
     lines += [f"DIFFERS    {r}" for r in differ]
 
     diffoscope = shutil.which("diffoscope")
-    for rel in differ:
+    # One systematic leak can make hundreds of files differ: explain the first
+    # MAX_EXPLAINED (the summary lists them all), each within a time limit.
+    for n, rel in enumerate(differ):
         if diffoscope is None:
+            break
+        if n == MAX_EXPLAINED:
+            lines.append(f"(diffoscope reports only the first {MAX_EXPLAINED} of {len(differ)} differing files)")
             break
         out = os.path.join(report, rel + ".html")
         os.makedirs(os.path.dirname(out), exist_ok=True)
         # Exit 1 means "differences found", which is the expected case here.
-        r = subprocess.run([diffoscope, "--html", out, "--text", out[:-5] + ".txt",
-                            "--max-report-size", str(50 << 20),
-                            os.path.join(a, rel), os.path.join(b, rel)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        try:
+            r = subprocess.run([diffoscope, "--html", out, "--text", out[:-5] + ".txt",
+                                "--max-report-size", str(50 << 20),
+                                os.path.join(a, rel), os.path.join(b, rel)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                               timeout=EXPLAIN_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            lines.append(f"  (diffoscope timed out after {EXPLAIN_TIMEOUT}s on {rel})")
+            continue
         if r.returncode not in (0, 1):
             lines.append(f"  (diffoscope failed on {rel}: {r.stderr.strip()[-300:]})")
     if differ and diffoscope is None:

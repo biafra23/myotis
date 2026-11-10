@@ -15,7 +15,8 @@
 # Writes the variables to $GITHUB_ENV and the build directory to the step
 # output `src`. On Windows the path stays short (MAX_PATH; Gradle and cargo
 # nest deep under it) and the time zone is the system's (tzutil), since the
-# JVM there ignores TZ.
+# JVM there ignores TZ. Windows has no umask: REPRO_UMASK is set but has no
+# effect there.
 set -euo pipefail
 
 leg=${1:?usage: setup_leg.sh a|b}
@@ -54,7 +55,9 @@ b)
 esac
 
 {
-    echo "TZ=$tz"
+    # Not on Windows: the MSVC runtime reads TZ as "NAME+hh" and would turn
+    # Asia/Kathmandu into UTC; the system zone (tzutil above) is what counts there.
+    $windows || echo "TZ=$tz"
     echo "LANG=$lang"
     echo "LC_ALL=$lang"
     echo "REPRO_UMASK=$mask"

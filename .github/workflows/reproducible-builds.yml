@@ -9,7 +9,8 @@
 #   - CARGO_HOME and GRADLE_USER_HOME: b gets empty ones of its own, so the
 #     crate sources and the Gradle caches sit at other paths;
 #   - the time zone (UTC vs. Asia/Kathmandu, +05:45: a local-time stamp shows),
-#     the locale and the umask (022 vs. 002);
+#     the locale and the umask (022 vs. 002; Windows has no umask, and its leg
+#     b sets the system time zone instead of TZ);
 #   - the wall clock: the two jobs start, build and finish at different times.
 # The builder's USER is not varied yet: on a hosted runner the toolchains are
 # installed for the runner account. The builder container (Part 5b) varies it.
@@ -35,15 +36,24 @@
 # this machinery itself (the workflow or scripts/repro/), which must prove it
 # still compares before it lands. That PR trigger is also the only way to run a
 # NEW copy of this file: GitHub dispatches only workflows on the default branch.
+# Like the other artifact builds (CLAUDE.md, multi-PR plans), it skips a PR
+# whose base is not main, unless the PR carries the `reproducible-builds`
+# label: the explicit per-PR opt-in that stands in for the dispatch a part PR
+# would otherwise use, which a workflow that is not on main yet cannot get.
 name: reproducible builds
 
 on:
   push:
     tags: [ "v*" ]
   pull_request:
+    # `labeled` so adding the opt-in label below starts a run.
+    types: [ opened, synchronize, reopened, labeled ]
     paths:
       - '.github/workflows/reproducible-builds.yml'
       - 'scripts/repro/**'
+      - 'scripts/check_16k_alignment.py'
+      - 'scripts/repro_zip.sh'
+      - 'scripts/normalize_maven_metadata.py'
   schedule:
     - cron: "41 2 * * 1"  # Mondays 02:41 UTC
   workflow_dispatch:
@@ -51,10 +61,12 @@ on:
 permissions:
   contents: read
 
-# A PR's newer push supersedes its older run; a tag's or main's run is never
-# cancelled (each is a release's or a week's proof).
+# A PR's newer push supersedes its older run; a tag's, the schedule's or a
+# dispatch's run is never cancelled (each is a release's or a week's proof),
+# and the event is in the group so a dispatch on main cannot queue-cancel the
+# weekly run (GitHub keeps one pending run per group).
 concurrency:
-  group: reproducible-builds-${{ github.ref }}
+  group: reproducible-builds-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -64,6 +76,7 @@ env:
 jobs:
   linux:
     name: Linux + Android (leg ${{ matrix.leg }})
+    if: ${{ github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 150
     strategy:
@@ -105,9 +118,13 @@ jobs:
           set -euo pipefail
           umask "$REPRO_UMASK"
           chmod +x gradlew
+          # As stage-engine-library: the tag's version on a tag (v0.2.0-rc1
+          # stages 0.2.0-rc1), the bare release version otherwise.
+          flag=-PpublishRelease
+          [[ "$GITHUB_REF" != refs/tags/v* ]] || flag="-PpublishRelease=${GITHUB_REF_NAME#v}"
           for attempt in 1 2 3; do
             rm -rf build/maven-repo
-            ./gradlew -PpublishRelease cargoBuildHost \
+            ./gradlew "$flag" cargoBuildHost \
               :android-app:assembleRelease :android-app:assembleDebug \
               :app-desktop:packageDeb publishAllPublicationsToStagingRepository \
               --stacktrace && break
@@ -116,22 +133,28 @@ jobs:
             sleep 25
           done
           python3 -I scripts/normalize_maven_metadata.py build/maven-repo
-          (cd rust && . ./repro-env.sh && cargo build --locked -p myotis-node --release)
+          (cd rust && . ./repro-env.sh && cargo build --locked -p myotis-node --release --target x86_64-unknown-linux-gnu)
           python3 -I scripts/check_16k_alignment.py android-app/build/outputs/apk/release/*.apk
 
+      # As a tarball: an uploaded artifact keeps neither file modes nor
+      # symlinks, and the comparison checks both.
       - name: Collect
         working-directory: ${{ steps.leg.outputs.src }}
-        run: scripts/repro/collect.sh linux . "$RUNNER_TEMP/repro-out"
+        run: |
+          set -euo pipefail
+          scripts/repro/collect.sh linux . "$RUNNER_TEMP/repro-out"
+          tar -C "$RUNNER_TEMP/repro-out" -cf "$RUNNER_TEMP/repro-linux.tar" .
 
       - name: Upload leg ${{ matrix.leg }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: repro-linux-${{ matrix.leg }}
-          path: ${{ runner.temp }}/repro-out
+          path: ${{ runner.temp }}/repro-linux.tar
           if-no-files-found: error
 
   macos:
     name: macOS + iOS (leg ${{ matrix.leg }})
+    if: ${{ github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds') }}
     runs-on: macos-15
     timeout-minutes: 150
     strategy:
@@ -186,21 +209,27 @@ jobs:
             sleep 25
           done
           rust/build-xcframework.sh
-          (cd rust && . ./repro-env.sh && cargo build --locked -p myotis-node --release)
+          (cd rust && . ./repro-env.sh && cargo build --locked -p myotis-node --release --target aarch64-apple-darwin)
 
+      # As a tarball: an uploaded artifact keeps neither file modes nor
+      # symlinks, and the comparison checks both.
       - name: Collect
         working-directory: ${{ steps.leg.outputs.src }}
-        run: scripts/repro/collect.sh macos . "$RUNNER_TEMP/repro-out"
+        run: |
+          set -euo pipefail
+          scripts/repro/collect.sh macos . "$RUNNER_TEMP/repro-out"
+          tar -C "$RUNNER_TEMP/repro-out" -cf "$RUNNER_TEMP/repro-macos.tar" .
 
       - name: Upload leg ${{ matrix.leg }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: repro-macos-${{ matrix.leg }}
-          path: ${{ runner.temp }}/repro-out
+          path: ${{ runner.temp }}/repro-macos.tar
           if-no-files-found: error
 
   windows:
     name: Windows (leg ${{ matrix.leg }})
+    if: ${{ github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds') }}
     runs-on: windows-2025
     timeout-minutes: 150
     strategy:
@@ -267,17 +296,22 @@ jobs:
             echo "::warning::build attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
             sleep 25
           done
-          (cd rust && . ./repro-env.sh && cargo build --locked -p myotis-node --release)
+          (cd rust && . ./repro-env.sh && cargo build --locked -p myotis-node --release --target x86_64-pc-windows-msvc)
 
+      # As a tarball: an uploaded artifact keeps neither file modes nor
+      # symlinks, and the comparison checks both.
       - name: Collect
         working-directory: ${{ steps.leg.outputs.src }}
-        run: scripts/repro/collect.sh windows . "$RUNNER_TEMP/repro-out"
+        run: |
+          set -euo pipefail
+          scripts/repro/collect.sh windows . "$RUNNER_TEMP/repro-out"
+          tar -C "$RUNNER_TEMP/repro-out" -cf "$RUNNER_TEMP/repro-windows.tar" .
 
       - name: Upload leg ${{ matrix.leg }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: repro-windows-${{ matrix.leg }}
-          path: ${{ runner.temp }}/repro-out
+          path: ${{ runner.temp }}/repro-windows.tar
           if-no-files-found: error
 
   compare:
@@ -285,8 +319,9 @@ jobs:
     needs: [ linux, macos, windows ]
     # Also when a build leg failed: its platform then fails here with "leg
     # missing" instead of the whole comparison quietly not running.
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds')) }}
     runs-on: ubuntu-26.04
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -300,19 +335,26 @@ jobs:
         continue-on-error: true
         with:
           name: repro-${{ matrix.platform }}-a
-          path: legs/a
+          path: tars/a
 
       - name: Download leg b
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         continue-on-error: true
         with:
           name: repro-${{ matrix.platform }}-b
-          path: legs/b
+          path: tars/b
 
-      - name: Both legs built
+      # -p: the modes as the leg recorded them, not this runner's umask.
+      - name: Unpack both legs
+        env:
+          PLATFORM: ${{ matrix.platform }}
         run: |
+          set -euo pipefail
           for leg in a b; do
-            [ -d "legs/$leg" ] || { echo "::error::leg $leg of ${{ matrix.platform }} produced no artifacts (its build failed)"; exit 1; }
+            tar="tars/$leg/repro-$PLATFORM.tar"
+            [ -f "$tar" ] || { echo "::error::leg $leg of $PLATFORM produced no artifacts (its build failed)"; exit 1; }
+            mkdir -p "legs/$leg"
+            tar -C "legs/$leg" -xpf "$tar"
           done
 
       # The archive's diffoscope: only to explain a difference, so the runner

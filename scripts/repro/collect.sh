@@ -29,7 +29,10 @@ one() {
     printf '%s\n' "${matches[0]}"
 }
 
-# put SRC_FILE DEST: copy one artifact into OUT
+# put SRC_FILE DEST: copy one artifact into OUT. A plain cp, so the copy's mode
+# is the collect step's (a downloaded file carries no mode; only the bytes ship).
+# Where modes DO ship, they are kept: the .app's files (ditto) and every APK
+# entry's attributes (the .entries listing). compare.py hashes modes too.
 put() { mkdir -p "$(dirname "$out/$2")"; cp "$1" "$out/$2"; echo "  $2"; }
 
 # A zip's entries (name, CRC, sizes, method, order) plus their extracted bytes,
@@ -45,7 +48,8 @@ with zipfile.ZipFile(apk) as z, open(dest + ".entries", "w") as listing:
     for i in z.infolist():
         if sig.match(i.filename):
             continue
-        listing.write(f"{i.filename}\t{i.CRC:08x}\t{i.compress_size}\t{i.file_size}\t{i.compress_type}\n")
+        listing.write(f"{i.filename}\t{i.CRC:08x}\t{i.compress_size}\t{i.file_size}"
+                      f"\t{i.compress_type}\t{i.external_attr:08x}\t{i.create_system}\n")
         if not i.is_dir():
             path = os.path.join(dest, i.filename)
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -63,7 +67,7 @@ linux)
     zip_payload "$(one 'android-app/build/outputs/apk/debug/*.apk')" android/app-debug-payload
     put "$(one 'app-desktop/build/compose/binaries/main/deb/*.deb')" desktop/myotis.deb
     put rust/target/release/libmyotis_engine.so host/libmyotis_engine.so
-    put rust/target/release/libmyotis_node.so host/libmyotis_node.so
+    put rust/target/x86_64-unknown-linux-gnu/release/libmyotis_node.so host/libmyotis_node.so
     # The engine library exactly as engine-library.yml stages it (normalized
     # metadata included), i.e. what the Maven-repository zip and the
     # maven-repo branch carry.
@@ -71,14 +75,16 @@ linux)
     ;;
 macos)
     put rust/target/release/libmyotis_engine.dylib host/libmyotis_engine.dylib
-    put rust/target/release/libmyotis_node.dylib host/libmyotis_node.dylib
+    put rust/target/aarch64-apple-darwin/release/libmyotis_node.dylib host/libmyotis_node.dylib
     # The xcframeworks as the release ships them (scripts/repro_zip.sh), and
-    # their trees, so a difference is reported per file rather than "zip differs".
+    # their trees, so a difference is reported per file rather than "zip differs"
+    # (the tree is a plain cp: its modes ship normalized, through the zip).
+    mkdir -p "$out/ios/tree"
     for xc in rust/target/ios-xcframework/MyotisEngine.xcframework app-ios/build/XCFrameworks/release/MyotisKit.xcframework; do
         [[ -d "$xc" ]] || { echo "collect.sh: missing $xc" >&2; exit 1; }
         name=$(basename "$xc")
         scripts/repro_zip.sh "$(dirname "$xc")" "$name" "$out/ios/$name.zip"
-        mkdir -p "$out/ios/tree" && cp -R "$xc" "$out/ios/tree/" && echo "  ios/$name.zip + ios/tree/$name"
+        cp -R "$xc" "$out/ios/tree/" && echo "  ios/$name.zip + ios/tree/$name"
     done
     # Tier 2: the dmg's .app, not the disk image around it.
     dmg=$(one 'app-desktop/build/compose/binaries/main/dmg/*.dmg')
@@ -92,7 +98,7 @@ macos)
     ;;
 windows)
     put rust/target/release/myotis_engine.dll host/myotis_engine.dll
-    put rust/target/release/myotis_node.dll host/myotis_node.dll
+    put rust/target/x86_64-pc-windows-msvc/release/myotis_node.dll host/myotis_node.dll
     # Tier 2: the msi's files, extracted by an administrative install (no
     # registry, no install), not the msi database around them.
     msi=$(one 'app-desktop/build/compose/binaries/main/msi/*.msi')

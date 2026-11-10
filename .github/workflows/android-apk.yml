@@ -213,12 +213,6 @@ jobs:
             done <<< "$engines"
           done
 
-      # minSdk JDK-API gate — enforcement for CLAUDE.md's "minSdk 29 JDK-API
-      # budget"; the script's docstring is the full story. The platform install
-      # feeds its api-versions canary: pre-36.1 databases don't record every
-      # policed API (Files.readString first appears in the 36.1 database), and
-      # the script refuses to scan against a database that old (exit 2). Both
-      # APKs ship, and each variant is dexed on its own, so both are scanned.
       # Every .so the APKs ship (the Rust engine and JNA's dispatcher) must have
       # 16 KB-aligned LOAD segments, or Android 15+ devices with 16 KB pages
       # refuse to load it. rust/build-android.sh checked this, but the Gradle
@@ -232,6 +226,12 @@ jobs:
             "$(ls android-app/build/outputs/apk/debug/*.apk | head -n1)" \
             "$(ls android-app/build/outputs/apk/release/*.apk | head -n1)"
 
+      # minSdk JDK-API gate — enforcement for CLAUDE.md's "minSdk 29 JDK-API
+      # budget"; the script's docstring is the full story. The platform install
+      # feeds its api-versions canary: pre-36.1 databases don't record every
+      # policed API (Files.readString first appears in the 36.1 database), and
+      # the script refuses to scan against a database that old (exit 2). Both
+      # APKs ship, and each variant is dexed on its own, so both are scanned.
       - name: Verify minSdk JDK-API compatibility
         run: |
           set -euo pipefail
