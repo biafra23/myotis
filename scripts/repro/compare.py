@@ -116,7 +116,11 @@ def main(a, b, report, known_file=None):
     lines += [f"ONLY IN B  {r}" for r in only_b]
     lines += [f"DIFFERS    {r}" for r in unexplained]
     lines += [f"KNOWN      {r}: {why}" for r, why in sorted(known_hits.items())]
-    lines += [f"(known difference no longer seen, remove it: {p})" for p, _ in known if p not in used]
+    # "No longer seen" only where the pattern applies to this platform's tree
+    # (the .deb's entry means nothing to the Windows legs).
+    present = set(ma) | set(mb)
+    lines += [f"(known difference no longer seen, remove it: {p})" for p, _ in known
+              if p not in used and any(fnmatch.fnmatchcase(r, p) for r in present)]
 
     # The verdict and the full list first, so a job killed while diffoscope
     # runs still ships them; rewritten below with diffoscope's notes.
