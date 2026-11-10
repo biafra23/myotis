@@ -173,6 +173,13 @@ Key Gradle modules:
 
 ## Key Dependencies
 
+- **Every Gradle dependency is pinned by version AND hash** (#734): per-project
+  `gradle.lockfile`s plus `gradle/verification-metadata.xml`, both strict, so a
+  new or bumped dependency fails the build until its pins are regenerated with
+  `scripts/update_gradle_pins.sh` (then `--from-ci` for the macOS/Windows/arm64
+  hashes the `gradle pins` workflow collects). Review the hash diff like code.
+  Never "fix" a verification failure you did not cause by re-pinning — bytes
+  changed under a pinned version. docs/gradle-dependency-pins.md.
 - **Tuweni 2.7.2** (upstream `io.consensys.tuweni`, Maven Central; original `org.apache.tuweni` packages) — RLP encoding, SECP256K1, byte utilities.
 - **Netty 4.2.x** — NIO-only (no epoll/kqueue). 4-thread `NioEventLoopGroup` for RLPx.
 - **BouncyCastle** — SECP256K1 crypto provider
