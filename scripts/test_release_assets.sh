@@ -243,7 +243,7 @@ published; keep="$T/kept"; mkdir -p "$keep"
 bash $V v1 "$keep" > /dev/null 2>&1; rc=$?
 check "a given directory keeps the downloaded assets" '[ $rc = 0 ] && [ -f "$keep/a.apk" ] && [ -f "$keep/SHA256SUMS" ]'
 # A publisher is re-run: the asset and SHA256SUMS change on the release.
-printf rebuilt > "$T/in/a2/a.apk" 2> /dev/null || { mkdir -p "$T/in/a2"; printf rebuilt > "$T/in/a2/a.apk"; }
+mkdir -p "$T/in/a2"; printf rebuilt > "$T/in/a2/a.apk"
 bash $R v1 "$T/in/a2/a.apk" > /dev/null; bash $R --checksums v1 > /dev/null
 bash $V v1 "$keep" > "$STUB_DIR/out" 2>&1; rc=$?
 check "a kept directory is checked against the release as it is now, not as it was" \
