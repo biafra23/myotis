@@ -45,11 +45,11 @@ tick() { # FILE: true while its counter is above 0, counting it down
   echo $((c - 1)) > "$1"
 }
 case "$1 ${2:-}" in
-  "api repos/{owner}/{repo}/releases/tags/"*)
+  "api repos/"*"/releases/tags/"*)
     [ -f "$d/exists" ] || { echo "Not Found" >&2; exit 1; }
     echo 42 ;;
   "api --paginate")
-    case "$3" in "repos/{owner}/{repo}/releases/42/assets?per_page=100") ;; *) exit 97 ;; esac
+    case "$3" in "repos/"*"/releases/42/assets?per_page=100") ;; *) exit 97 ;; esac
     for f in "$d"/assets/*; do
       [ -f "$f" ] || continue
       n=$(basename "$f"); state=uploaded; digest=$(sha "$f")
@@ -81,9 +81,6 @@ case "$1 ${2:-}" in
       *" --dir "*) # into the directory after --dir (verify_release.sh):
         dest=$(a=("$@"); for i in "${!a[@]}"; do [ "${a[$i]}" != --dir ] || echo "${a[$((i + 1))]}"; done)
         case " $* " in
-          *" --pattern SHA256SUMS "*) # that one asset
-            [ -f "$d/assets/SHA256SUMS" ] || { echo "no assets match the file pattern" >&2; exit 1; }
-            cp "$d/assets/SHA256SUMS" "$dest/" ;;
           *" --skip-existing "*) # every asset the directory does not have
             for f in "$d"/assets/*; do [ -e "$dest/$(basename "$f")" ] || cp "$f" "$dest/"; done ;;
           *) exit 96 ;;
@@ -247,7 +244,28 @@ mkdir -p "$T/in/a2"; printf rebuilt > "$T/in/a2/a.apk"
 bash $R v1 "$T/in/a2/a.apk" > /dev/null; bash $R --checksums v1 > /dev/null
 bash $V v1 "$keep" > "$STUB_DIR/out" 2>&1; rc=$?
 check "a kept directory is checked against the release as it is now, not as it was" \
-  '[ $rc = 0 ] && cmp -s "$keep/a.apk" "$T/in/a2/a.apk" && grep -q "a.apk in .* is not what the release lists" "$STUB_DIR/out"'
+  '[ $rc = 0 ] && cmp -s "$keep/a.apk" "$T/in/a2/a.apk" && grep -q "a.apk in .* is not what the release serves now" "$STUB_DIR/out"'
+
+# A directory of the user's own: other files, a dotfile, a subdirectory.
+published; mine="$T/mine"; mkdir -p "$mine/sub"
+printf holiday > "$mine/photo.jpg"; printf secret > "$mine/.netrc"; printf x > "$mine/sub/notes.txt"
+bash $V v1 "$mine" > "$STUB_DIR/out" 2>&1; rc=$?
+check "files in DIR that are not the release's are neither deleted nor checked" \
+  '[ $rc = 0 ] && [ "$(cat "$mine/photo.jpg")" = holiday ] && [ "$(cat "$mine/.netrc")" = secret ] && [ -f "$mine/sub/notes.txt" ] && grep -q "all 2 listed files match" "$STUB_DIR/out"'
+rm "$STUB_DIR/assets/SHA256SUMS"
+bash $V v1 "$mine" > "$STUB_DIR/out" 2>&1; rc=$?
+check "nor when the release has no SHA256SUMS: it fails, and DIR keeps its files" \
+  '[ $rc = 1 ] && grep -q "no SHA256SUMS" "$STUB_DIR/out" && [ -f "$mine/photo.jpg" ] && [ -f "$mine/.netrc" ] && [ -f "$mine/a.apk" ]'
+rm "$STUB_DIR/exists"
+bash $V v1 "$mine" > "$STUB_DIR/out" 2>&1; rc=$?
+check "nor for a tag with no release" '[ $rc = 1 ] && grep -q "no release for tag" "$STUB_DIR/out" && [ -f "$mine/photo.jpg" ] && [ -f "$mine/a.apk" ]'
+
+# An asset that left the release: the kept copy is not an asset any more.
+published; gone="$T/gone"; mkdir -p "$gone"
+bash $V v1 "$gone" > /dev/null 2>&1
+rm "$STUB_DIR/assets/b.dmg"
+bash $V v1 "$gone" > "$STUB_DIR/out" 2>&1; rc=$?
+check "a kept copy of an asset the release no longer has does not stand in for it" '[ $rc = 1 ] && grep -q "< b.dmg" "$STUB_DIR/out"'
 
 fresh; bash $R --checksums v1 > /dev/null 2>&1; printf '%s  %s\n' "$(printf gone | { sha256sum 2> /dev/null || shasum -a 256; } | cut -d" " -f1)" gone.apk > "$STUB_DIR/assets/SHA256SUMS"
 bash $V v1 > "$STUB_DIR/out" 2>&1; rc=$?

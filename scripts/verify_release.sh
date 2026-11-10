@@ -4,11 +4,14 @@
 #   scripts/verify_release.sh [--no-attestations] <tag> [DIR]
 #
 # Downloads every asset of the release into DIR (default: a temporary
-# directory, removed afterwards), then checks, in this order. With a DIR, files
-# already there are reused, so a re-run does not download 2 GB again: but
-# SHA256SUMS is always fetched afresh, and a file there that it does not list
-# with that hash (an asset replaced since, a truncated download) is fetched
-# again, so what is checked is what the release serves now.
+# directory, removed afterwards), then checks, in this order. The assets are
+# the ones the release lists (GitHub's API: name and SHA-256 of each), not
+# whatever DIR holds. With a DIR, a file there that has an asset's name and
+# the SHA-256 the release records for it is reused, so a re-run does not
+# download 2 GB again; one with an asset's name and other bytes (an asset
+# replaced since, a truncated download) is fetched again. NO OTHER FILE IN DIR
+# IS TOUCHED OR LOOKED AT: pointing this at a directory that holds other
+# things is safe.
 #
 #   1. SHA256SUMS is there, lists every asset except itself and nothing that is
 #      not an asset, and every hash matches (`sha256sum -c`).
@@ -49,25 +52,35 @@ failures=0
 bad() { echo "FAIL  $*"; failures=$((failures + 1)); }
 
 echo "release $tag of $repo, assets in $dir"
-# The release's SHA256SUMS as it is now, never a kept one; then drop every kept
-# file it does not vouch for, so the download below fetches the current one.
-rm -f "$dir/SHA256SUMS"
-gh release download "$tag" --repo "$repo" --dir "$dir" --pattern SHA256SUMS 2>/dev/null || true
-for f in "$dir"/* "$dir"/.[!.]*; do
-  [ -f "$f" ] && [ "$(basename "$f")" != SHA256SUMS ] || continue
-  if [ ! -f "$dir/SHA256SUMS" ] || ! grep -qxF "$(sha "$f")  $(basename "$f")" "$dir/SHA256SUMS"; then
-    echo "      $(basename "$f") in $dir is not what the release lists: fetching it again"
-    rm -f "$f"
+# What the release HAS: each asset's name, state and the SHA-256 GitHub
+# recorded for it. Everything below goes by this list and by nothing else, so
+# with a DIR of your own (your Downloads, say) only files that carry a release
+# asset's name are ever looked at, replaced or checked; any other file there is
+# left alone and ignored.
+rid=$(gh api "repos/$repo/releases/tags/$tag" --jq .id) \
+  || { echo "verify_release.sh: no release for tag $tag in $repo (or it cannot be read)" >&2; exit 1; }
+listing=$(gh api --paginate "repos/$repo/releases/$rid/assets?per_page=100" \
+  --jq '.[] | [.name, .state, ((.digest // "") | sub("^sha256:"; ""))] | @tsv')
+[ -n "$listing" ] || { echo "verify_release.sh: the release of $tag has no assets" >&2; exit 1; }
+names=$(printf '%s\n' "$listing" | cut -f1 | LC_ALL=C sort)
+assets=$(printf '%s\n' "$names" | { grep -vx SHA256SUMS || true; })
+has() { printf '%s\n' "$names" | grep -qxF "$1"; }
+
+# A kept copy of an asset is reused only when it is the bytes the release
+# serves now (GitHub's digest); otherwise that one file is fetched again.
+while IFS=$'\t' read -r name state digest; do
+  case "$name" in */*|""|.|..) echo "verify_release.sh: refusing the asset name '$name'" >&2; exit 1 ;; esac
+  [ "$state" = uploaded ] || bad "$name is on the release but not fully uploaded (state: $state)"
+  if [ -f "$dir/$name" ] && { [ -z "$digest" ] || [ "$(sha "$dir/$name")" != "$digest" ]; }; then
+    echo "      $name in $dir is not what the release serves now: fetching it again"
+    rm -f "$dir/$name"
   fi
-done
+done <<< "$listing"
 gh release download "$tag" --repo "$repo" --dir "$dir" --skip-existing
 cd "$dir"
-# Every asset, dotfiles included; names have no whitespace (release-assets.sh
-# refuses them).
-assets=$(ls -A | { grep -vx SHA256SUMS || true; } | LC_ALL=C sort)
 
 # --- 1. SHA256SUMS ------------------------------------------------------------
-if [ ! -f SHA256SUMS ]; then
+if ! has SHA256SUMS; then
   bad "the release has no SHA256SUMS"
 else
   listed=$(sed 's/^[0-9a-f]\{64\}  //' SHA256SUMS | LC_ALL=C sort)
@@ -101,13 +114,13 @@ fi
 
 # --- 3. the signed APK is the unsigned APK plus its signature -----------------
 signed="Myotis-$tag-android.apk" unsigned="Myotis-$tag-android-unsigned.apk"
-if [ -f "$signed" ] && [ -f "$unsigned" ]; then
+if has "$signed" && has "$unsigned"; then
   if out=$(python3 "$here/repro/compare_signed_apk.py" "$signed" "$unsigned" 2>&1); then
     echo "ok    $out"
   else
     bad "$out"
   fi
-elif [ -f "$signed" ]; then
+elif has "$signed"; then
   bad "the release has $signed but no $unsigned to check it against"
 else
   echo "skip  signed against unsigned APK: the release has no $signed"
