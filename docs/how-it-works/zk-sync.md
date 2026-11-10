@@ -76,6 +76,9 @@ anchor is past the bound still parks in `STALE_ANCHOR`, and a proof never
 releases a park.
 
 Networks: mainnet, sepolia and gnosis (Colibri has no proof chain for chiado).
+The fetch goes out in the clear, even with Tor routing on. It carries no
+address, but tells the prover which network this IP runs and when
+([privacy-and-tor.md](privacy-and-tor.md) §2).
 `MYOTIS_ZK_SYNC=0` turns it off. The cold-start release checks
 (`live_cold_start`) always turn it off, because they exist to prove the walk
 still works. The Java engine has no ZK path and always walks.

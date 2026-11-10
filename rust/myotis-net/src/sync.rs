@@ -2353,6 +2353,7 @@ async fn run_sync(
     let embedded_checkpoint_period = checkpoint_period;
     let mut resume = ResumeGuard::fresh();
     let mut zk_backoff = crate::zksync::ZkBackoff::new();
+    let mut zk_proven: Option<myotis_consensus::zk::ProvenCommittee> = None;
     // Deserialize the snapshot ONCE, up front: the weak-subjectivity gate below
     // must judge the BEST available anchor (embedded checkpoint vs persisted
     // snapshot) BEFORE anything is restored from it, and the strictly-newer
@@ -2417,6 +2418,7 @@ async fn run_sync(
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         if parked {
+            discard_unused_fresh_anchor(&config);
             tracing::warn!(anchor_period,
                 "stale anchor released (bound raised or risk accepted) — syncing forward");
             // Replace the lingering StaleAnchor on the status watch IMMEDIATELY:
@@ -2491,6 +2493,8 @@ async fn run_sync(
                 publish_status(&config, &client, &processor, &pool, &status_tx, &anchor, hunt.hunting).await;
                 continue;
             }
+        } else {
+            discard_unused_fresh_anchor(&config);
         }
 
         let seen = (processor.store.current_period(), processor.store.finalized_slot());
@@ -2562,7 +2566,7 @@ async fn run_sync(
                 wall_period >= checkpoint_period.saturating_add(zk.min_gap_periods)
             }) && zk_backoff.due(Instant::now())
             {
-                match try_zk_start(&config, &client, &mut pool, &hunt.confirmed, wall_period).await {
+                match try_zk_start(&config, &client, &mut pool, &hunt.confirmed, wall_period, &mut zk_proven).await {
                     Ok(fresh) => {
                         zk_backoff.succeeded();
                         processor = fresh;
@@ -2666,7 +2670,7 @@ async fn run_sync(
                 wall_period >= processor.store.current_period().saturating_add(zk.min_gap_periods)
             }) && zk_backoff.due(Instant::now())
             {
-                match try_zk_start(&config, &client, &mut pool, &hunt.confirmed, wall_period).await {
+                match try_zk_start(&config, &client, &mut pool, &hunt.confirmed, wall_period, &mut zk_proven).await {
                     Ok(fresh) => {
                         zk_backoff.succeeded();
                         tracing::info!(from_period = processor.store.current_period(), to_period = wall_period,
@@ -2801,6 +2805,16 @@ fn reanchor(config: &mut ChainConfig, root: [u8; 32], slot: u64) -> u64 {
     spec::compute_sync_committee_period_with(slot, config.slots_per_period())
 }
 
+/// A fresh anchor the host queued for a park that then ended some other way
+/// (consent, a raised bound) answers a question nobody is asking any more:
+/// drop it, so a later, unrelated park never re-anchors without a new request.
+fn discard_unused_fresh_anchor(config: &ChainConfig) {
+    if let Some((root, slot)) = config.ws_policy.take_fresh_anchor() {
+        tracing::info!(root = %hex_str(&root), slot,
+            "discarding a fresh anchor that arrived after the park ended");
+    }
+}
+
 fn persist_snapshot(
     config: &ChainConfig,
     processor: &LightClientProcessor,
@@ -2859,27 +2873,35 @@ async fn try_zk_start(
     pool: &mut PeerPool,
     hunt_confirmed: &HashSet<PeerId>,
     period: u64,
+    proven_cache: &mut Option<myotis_consensus::zk::ProvenCommittee>,
 ) -> Result<LightClientProcessor, (String, Duration)> {
     let Some(zk) = config.zk_sync.as_ref() else {
         return Err(("ZK sync not configured".into(), crate::zksync::ZkBackoff::LONG));
     };
-    let proven = crate::zksync::fetch_proven_committee(config, zk, period).await.map_err(|e| {
-        // A 404 is the period's proof not published yet (proving lags the
-        // period start): soon. Anything else: rarely.
-        let wait = if e.contains("HTTP 404") {
-            crate::zksync::ZkBackoff::SHORT
-        } else {
-            crate::zksync::ZkBackoff::LONG
-        };
-        (format!("no verified proof for period {period}: {e}"), wait)
-    })?;
+    // Peers first: without one, the proof could not be used anyway.
+    if pool.is_empty() {
+        return Err(("no peers yet".into(), crate::zksync::ZkBackoff::SHORT));
+    }
+    // A verified committee stays valid for its whole period, so the retries
+    // a period boundary or a slow peer pool cause reuse it instead of
+    // fetching and verifying the same proof every minute.
+    let proven = match proven_cache.take().filter(|p| p.period == period) {
+        Some(p) => p,
+        None => crate::zksync::fetch_proven_committee(config, zk, period).await.map_err(|e| {
+            // A 404 is the period's proof not published yet (proving lags the
+            // period start): soon. Anything else: rarely.
+            let wait = if e.contains("HTTP 404") {
+                crate::zksync::ZkBackoff::SHORT
+            } else {
+                crate::zksync::ZkBackoff::LONG
+            };
+            (format!("no verified proof for period {period}: {e}"), wait)
+        })?,
+    };
     tracing::info!(period, attested_slot = proven.attested_header.slot,
         "ZK start: committee proven from the network's Colibri anchor — \
          asking peers for a finality update it signed");
 
-    if pool.is_empty() {
-        return Err(("no peers yet".into(), crate::zksync::ZkBackoff::SHORT));
-    }
     let mut prefer = client.lc_update_servers().await;
     prefer.extend(hunt_confirmed.iter().copied());
     let peers = pool.candidates(16, false, false, &prefer, &HashSet::new());
@@ -2924,6 +2946,7 @@ async fn try_zk_start(
             }
         }
     }
+    *proven_cache = Some(proven);
     Err((
         match last_reject {
             Some(e) => format!("no usable finality update ({e})"),

@@ -512,11 +512,13 @@ private fun StaleAnchorDialog(
                     "alone cannot tell it from the real chain. Syncing is paused, and " +
                     "verified reads stay unavailable, until you decide.\n\n" +
                     "Safest: update the app (a fresh build carries a fresh checkpoint). " +
-                    "Or fetch a fresh checkpoint: Myotis asks independent checkpoint-sync " +
-                    "servers for the block the chain finalized most recently and starts over " +
-                    "from it — only if servers of at least two different operators agree. You " +
-                    "then trust those servers for the starting point; everything after it is " +
-                    "verified as usual. Alternatively raise the bound in Settings, or sync " +
+                    (if (s.engine == "java") "" else
+                        "Or fetch a fresh checkpoint: Myotis asks independent checkpoint-sync " +
+                        "servers for the block the chain finalized most recently and starts " +
+                        "over from it — only if servers of at least two different operators " +
+                        "agree. You then trust those servers for the starting point; " +
+                        "everything after it is verified as usual. ") +
+                    "Alternatively raise the bound in Settings, or sync " +
                     "anyway if you trust your network and peers — for this run only." +
                     when {
                         fetching -> "\n\nAsking checkpoint-sync servers…"
@@ -527,7 +529,8 @@ private fun StaleAnchorDialog(
         },
         confirmButton = {
             Column(horizontalAlignment = Alignment.End) {
-                TextButton(
+                // The Java engine has no checkpointz path: no button to refuse later.
+                if (s.engine != "java") TextButton(
                     enabled = !fetching,
                     onClick = {
                         fetching = true

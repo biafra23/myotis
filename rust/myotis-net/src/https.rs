@@ -49,12 +49,17 @@ impl std::fmt::Display for HttpError {
     }
 }
 
-/// [`get_blocking`] on tokio's blocking pool.
+/// [`get_blocking`] on tokio's blocking pool, the WHOLE exchange bounded by
+/// `deadline` — name resolution included, which the system resolver does not
+/// bound (a stuck lookup keeps its blocking thread until the resolver gives up,
+/// but the caller is answered on time).
 pub async fn get(url: &str, accept: &str, max_body: usize, deadline: Duration) -> Result<Response, HttpError> {
     let (url, accept) = (url.to_string(), accept.to_string());
-    tokio::task::spawn_blocking(move || get_blocking(&url, &accept, max_body, deadline))
-        .await
-        .map_err(|e| HttpError::Io(e.to_string()))?
+    let task = tokio::task::spawn_blocking(move || get_blocking(&url, &accept, max_body, deadline));
+    match tokio::time::timeout(deadline, task).await {
+        Ok(joined) => joined.map_err(|e| HttpError::Io(e.to_string()))?,
+        Err(_) => Err(HttpError::Connect("deadline".into())),
+    }
 }
 
 /// GET `url`, returning whatever status the server answered with (callers
