@@ -1,10 +1,13 @@
 package io.myotis.engine
 
+import io.myotis.api.ChainHandle
 import io.myotis.api.EngineException
 import io.myotis.api.MyotisEngine
 import io.myotis.api.ports.DnsServers
 import io.myotis.engine.ports.DefaultEnginePorts
 import io.myotis.engines.rust.RustMyotisEngine
+import io.myotis.logindex.LogIndexDownloads
+import io.myotis.logindex.LogIndexPresets
 import java.nio.file.Path
 
 /**
@@ -107,5 +110,86 @@ object Myotis {
          * apply it (unsupported build, library not available); on stays a no-op then.
          */
         fun select(on: Boolean): Boolean = io.myotis.engines.rust.Tor.select(on)
+    }
+
+    /**
+     * The log index's PREDEFINED CONTRACTS — RAILGUN, Swarm, Privacy Pools and
+     * Tornado Cash ([LogIndexPresets]) — and the trigger that downloads and
+     * verifies their history on a running handle: the same catalog and estimates
+     * the Myotis apps' Index tab shows (docs/how-it-works/log-index-presets.md).
+     *
+     * ```kotlin
+     * val est = Myotis.LogIndex.estimate(handle, listOf("railgun-mainnet"))
+     * // show est.downloadBytes / est.storageBytes (LogIndexDownloads.formatBytes) and,
+     * // when est.cheaperTogether, that adding them together saves est.savedBytes
+     * Myotis.LogIndex.download(handle, listOf("railgun-mainnet"))  // unmetered only
+     * engine.setNetworkMetering(NetworkMetering.METERED)           // the host's word
+     * ```
+     *
+     * "Unmetered only" is the default and the ENGINE enforces it: while the host
+     * reports a metered network (`MyotisEngine.setNetworkMetering`) the backfill
+     * walk waits — head-follow keeps running — and `logIndexStatusJson` carries
+     * `"meteredHold":true`. A host that never reports metering is never held.
+     */
+    object LogIndex {
+        /** The presets offered on [handle]'s network (empty for one without any). */
+        @JvmStatic
+        fun presets(handle: ChainHandle): List<LogIndexPresets.Preset> =
+            LogIndexPresets.forNetwork(handle.networkName())
+
+        /**
+         * The download and disk estimate for [presetIds] on [handle]'s network, at
+         * its current verified head (the presets' census head while it has none).
+         *
+         * @throws IllegalArgumentException for an unknown id or one of another network
+         */
+        @JvmStatic
+        fun estimate(handle: ChainHandle, presetIds: List<String>): LogIndexDownloads.Estimate =
+            LogIndexDownloads.estimate(resolve(handle, presetIds), headOf(handle))
+
+        /**
+         * Start downloading and verifying [presetIds]: one config push
+         * (`ChainHandle.setLogIndexConfig`) that adds their contracts to the
+         * handle's index. Additive — what the index already watches stays. A push
+         * also carries the index's runtime bits; each one left null keeps what the
+         * engine's status reports now, or its default for an index with none:
+         * [allowMetered] false (unmetered only), [maxSpeed] false, [backfillPaused]
+         * false. Returns the engine's answer: false = refused, nothing changed.
+         *
+         * @throws IllegalArgumentException for an unknown id or one of another network
+         */
+        @JvmStatic
+        @JvmOverloads
+        fun download(
+            handle: ChainHandle,
+            presetIds: List<String>,
+            allowMetered: Boolean? = null,
+            maxSpeed: Boolean? = null,
+            backfillPaused: Boolean? = null,
+        ): Boolean {
+            val presets = resolve(handle, presetIds)
+            val status = runCatching { handle.logIndexStatusJson() }.getOrNull().orEmpty()
+            fun current(key: String) = status.contains("\"$key\":true")
+            return handle.setLogIndexConfig(
+                LogIndexDownloads.configJson(
+                    presets,
+                    maxSpeed = maxSpeed ?: current("maxSpeed"),
+                    allowMetered = allowMetered ?: current("allowMetered"),
+                    backfillPaused = backfillPaused ?: current("backfillPaused"),
+                ),
+            )
+        }
+
+        private fun resolve(handle: ChainHandle, ids: List<String>): List<LogIndexPresets.Preset> {
+            val network = handle.networkName()
+            return ids.map { id ->
+                val p = requireNotNull(LogIndexPresets.byId(id)) { "unknown log-index preset: $id" }
+                require(p.network == network) { "preset $id is for ${p.network}, the handle is $network" }
+                p
+            }
+        }
+
+        private fun headOf(handle: ChainHandle): Long? =
+            runCatching { handle.status().executionBlockNumber() }.getOrNull()?.takeIf { it > 0 }
     }
 }

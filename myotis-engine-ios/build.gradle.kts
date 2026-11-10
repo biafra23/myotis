@@ -60,6 +60,10 @@ kotlin {
         // (iosSimulatorArm64Test, ios-framework.yml) with a fake behind the seam.
         commonMain.dependencies {
             implementation(libs.kotlinx.serialization.json)
+            // The log index's predefined contracts and the config push that starts
+            // one (io.myotis.logindex) — `api`, as in :myotis-engine: an embedding
+            // app names them.
+            api(project(":myotis-logindex-presets"))
         }
         commonTest.dependencies {
             implementation(kotlin("test"))

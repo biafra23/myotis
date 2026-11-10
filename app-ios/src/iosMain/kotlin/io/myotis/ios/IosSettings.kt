@@ -109,6 +109,10 @@ class IosSettings : Settings {
         getBool("$K_LOG_INDEX_PAUSED_PREFIX$network", false)
     override fun setLogIndexBackfillPaused(network: String, on: Boolean) =
         defaults.setBool(on, "$K_LOG_INDEX_PAUSED_PREFIX$network")
+    override fun logIndexAllowMetered(network: String): Boolean =
+        getBool("$K_LOG_INDEX_METERED_PREFIX$network", false)
+    override fun setLogIndexAllowMetered(network: String, on: Boolean) =
+        defaults.setBool(on, "$K_LOG_INDEX_METERED_PREFIX$network")
     override fun logIndexConfigured(network: String): Boolean =
         defaults.objectForKey("$K_LOG_INDEX_PREFIX$network") != null
     override fun logIndexWatchJson(network: String): String {
@@ -152,6 +156,7 @@ class IosSettings : Settings {
         const val K_LOG_INDEX_PREFIX = "logIndex."
         const val K_LOG_INDEX_SPEED_PREFIX = "logIndex.maxSpeed."
         const val K_LOG_INDEX_PAUSED_PREFIX = "logIndex.backfillPaused."
+        const val K_LOG_INDEX_METERED_PREFIX = "logIndex.allowMetered."
         const val K_LOG_INDEX_WATCH_PREFIX = "logIndex.watch."
         const val K_CUSTOM_TOKENS_PREFIX = "tokens.custom."
         const val K_SNAP = "snapTarget"

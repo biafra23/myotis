@@ -185,6 +185,34 @@ engine cannot see that; tell it on every connectivity change with
 (from `ConnectivityManager`'s `NET_CAPABILITY_NOT_METERED`). Add the networks
 up for the app's total. docs/how-it-works/data-usage.md has what is and is not counted.
 
+**Log history for a protocol (`eth_getLogs`).** The engine indexes the logs of
+the contracts it is told to watch, each verified against its block's
+`receiptsRoot` — the walk down to a contract's creation block is a one-time
+download. `Myotis.LogIndex` offers the predefined contracts the Myotis apps'
+Index tab offers (RAILGUN, Swarm, Privacy Pools, Tornado Cash; catalog in
+`io.myotis.logindex.LogIndexPresets`, re-exported by the AAR) and the trigger
+that starts one:
+
+```kotlin
+val presets = Myotis.LogIndex.presets(handle)            // this network's, e.g. "railgun-mainnet"
+val est = Myotis.LogIndex.estimate(handle, listOf("railgun-mainnet"))
+// Tell the user before starting: est.downloadBytes, est.storageBytes (peak est.peakDiskBytes),
+// as LogIndexDownloads.formatBytes(...). est.cheaperTogether: adding several now saves
+// est.savedBytes over adding them one by one later (each later addition re-walks the chain).
+Myotis.LogIndex.download(handle, listOf("railgun-mainnet"))   // keeps the index's bits; unmetered only by default
+// then handle.reads().getLogs(filterJson) once handle.logIndexStatusJson() shows the range covered
+```
+
+`download` is one additive config push (`ChainHandle.setLogIndexConfig`; the
+JSON is `LogIndexDownloads.configJson`), so it adds to whatever the index
+already watches. **Unmetered only is the default, and the engine enforces it**:
+while the host reports `NetworkMetering.METERED` (above), the walk waits — the
+head is still followed — and the status JSON says `"meteredHold":true`; pass
+`allowMetered = true` to let it run on mobile data. A host that never reports
+metering is never held. The iOS module re-exports the same catalog: there,
+`handle.setLogIndexConfig(LogIndexDownloads.configJson(presets))` is the
+trigger. docs/how-it-works/log-index-presets.md has the figures and the model.
+
 The contract is Java 17 and FFI-flat (byte arrays, strings, longs, flat records,
 blocking calls); `docs/spec/05-engine-api-bindings.md` documents it.
 Log lines from the engine come out of `Myotis.drainLogs(max)`; Tor routing of

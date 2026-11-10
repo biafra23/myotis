@@ -35,6 +35,7 @@ that gets built moves to `design-history/`, and its user-facing behaviour gets a
 - [balance-watch.md](how-it-works/balance-watch.md): the Watch tab.
 - [privacy-and-tor.md](how-it-works/privacy-and-tor.md): privacy and Tor routing; the production path and what is still sketched.
 - [seeded-log-histories.md](how-it-works/seeded-log-histories.md): the bounded trust exception for seeded log histories.
+- [log-index-presets.md](how-it-works/log-index-presets.md): the log index's predefined contracts (RAILGUN, Swarm, Privacy Pools, Tornado Cash), what they cost to download and store, and the metered-network hold.
 - [website.md](how-it-works/website.md): the website in `site/`, where it is served and how it is published.
 
 ## guides/
