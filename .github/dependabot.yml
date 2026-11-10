@@ -1,0 +1,51 @@
+# Dependency updates as reviewed PRs (#734, Part 3, decision D-e). Every pin in
+# this repo is exact — actions by commit SHA, crates by Cargo.lock, Gradle
+# modules by lockfile + verification-metadata.xml — so nothing moves on its own;
+# this is how the pins move ON PURPOSE.
+#
+# Gradle PRs need their pins regenerated (Dependabot edits the catalog but not
+# the lockfiles or the hash list): gradle-pins-dependabot.yml does that on the
+# Linux host and pushes the result to the PR branch; per-host hashes, if a bump
+# needs any, come from the `gradle pins` check's merged artifact
+# (scripts/update_gradle_pins.sh --from-ci). Review the hash diff like code.
+#
+# Not covered by any ecosystem here, so bumped by hand in a reviewed PR:
+# rust/rust-toolchain.toml, gradle/libs.versions.toml's android-ndk /
+# android-build-tools / cargo-ndk, .java-version, .xcode-version, the runner
+# image labels, and the test-only interpreters that still float on purpose
+# (setup-python `3.x` in mm-replay-tests.yml, Node `20` in smoke-gate-tests.yml:
+# neither touches a shipped artifact). claude-review.yml is excluded (see the github-actions entry).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directories:
+      - "/"
+      - "/.github/actions/*"
+    # claude-review.yml must equal main's copy or the automated review skips
+    # the PR (its header) — so a grouped bump that touched it would land every
+    # other action move unreviewed. Its actions are moved by hand, in their
+    # own PR into main.
+    exclude-paths:
+      - ".github/workflows/claude-review.yml"
+    ignore:
+      - dependency-name: "anthropics/claude-code-action"
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directories:
+      - "/rust"
+      - "/rust/roost"
+      - "/rust/tor-poc"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: gradle
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

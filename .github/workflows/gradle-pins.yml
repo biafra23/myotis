@@ -66,7 +66,7 @@ jobs:
   linux-x64:
     uses: ./.github/workflows/gradle-pins-host.yml
     with:
-      runner: ubuntu-latest
+      runner: ubuntu-26.04
       host: linux-x64
       upload_as: verification-metadata-linux-x64
       extra_tasks: ":android-app:processDebugResources"
@@ -77,7 +77,7 @@ jobs:
     if: ${{ !cancelled() }}
     uses: ./.github/workflows/gradle-pins-host.yml
     with:
-      runner: windows-latest
+      runner: windows-2025
       host: windows-x64
       previous: verification-metadata-linux-x64
       upload_as: verification-metadata-windows-x64

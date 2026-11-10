@@ -140,6 +140,22 @@ Gradle's usual verification report. Pin it from that host the same way: run
 the update script there, or run that build once with
 `--write-verification-metadata sha256` and commit the additions.
 
+### Dependabot
+
+Dependabot (`.github/dependabot.yml`) opens weekly PRs for Gradle, Cargo and
+the GitHub Actions pins. A Gradle PR changes the catalog but not the pins, so
+`gradle-pins-dependabot.yml` runs `scripts/update_gradle_pins.sh` on Linux and
+pushes the regenerated lockfiles and hashes to the PR branch:
+
+- The job that runs the update script, and so the bumped plugins' code, holds
+  a read-only token.
+- A second job, which can write, accepts nothing from it but pin files,
+  checked by path.
+- It then dispatches Build and Test and `gradle pins` on the new head.
+
+If the bump has per-host artifacts, `gradle pins` names them and uploads the
+merged file: run step 3 above. Either way, review the hash diff before merging.
+
 ### Pruning
 
 `--write-verification-metadata` only ever **adds** entries. That's what lets

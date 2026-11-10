@@ -16,7 +16,7 @@ on:
   push:
     branches: [ "main" ]
     tags: [ "v*" ]
-    paths: ['rust/**', '.github/workflows/ios-xcframework.yml', '.github/actions/rust-toolchain/**']
+    paths: ['rust/**', '.github/workflows/ios-xcframework.yml', '.github/actions/rust-toolchain/**', '.github/actions/select-xcode/**', '.xcode-version']
   workflow_dispatch:
 
 concurrency:
@@ -26,9 +26,12 @@ concurrency:
 jobs:
   build:
     name: Build MyotisEngine.xcframework
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      # One Xcode for every macOS leg, from .xcode-version (#734).
+      - name: Select the pinned Xcode
+        uses: ./.github/actions/select-xcode
       # The pinned toolchain (rust/rust-toolchain.toml, #734) WITH the iOS
       # targets. A bare `rustup target add` from the repo root adds them to the
       # image's DEFAULT toolchain, while build-xcframework.sh builds in rust/,
@@ -37,7 +40,7 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: rust
       - name: Build xcframework
@@ -52,7 +55,7 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent \
             MyotisEngine.xcframework MyotisEngine.xcframework.zip
           shasum -a 256 MyotisEngine.xcframework.zip | tee MyotisEngine.xcframework.zip.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: MyotisEngine.xcframework.zip
           path: |
@@ -87,15 +90,15 @@ jobs:
     # skipped underneath it — both run on a tag ref, both skip otherwise.
     needs: [build, version-guard]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:
       # Checked out because the ABI version is read from its source of truth
       # in myotis-engine; this also gives gh its repo context.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - name: Download xcframework artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: MyotisEngine.xcframework.zip
           path: dist
