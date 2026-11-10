@@ -10,8 +10,9 @@ versions bring. So the new file must
 
   * keep the <configuration> block exactly (verify-metadata, verify-signatures,
     trusted artifacts and keys): a bump never needs to loosen verification;
-  * keep every existing artifact with exactly the checksums it had: a bump never
-    needs to re-hash a version that was already pinned.
+  * keep every existing artifact entry exactly — the same checksums, no
+    <also-trust> alternates added, no duplicate entries: a bump never needs to
+    re-hash or widen a version that was already pinned.
 
 Anything else (verification turned off, a trusted-artifact wildcard added, a
 pinned hash replaced) exits 1 and names the change. Stdlib only; run with -I.
@@ -31,17 +32,20 @@ def canonical(elem):
 
 
 def artifacts(root):
-    """(group, name, version, artifact) -> frozenset of (algorithm, value)."""
+    """(group, name, version, artifact) -> [canonical <artifact> element, ...].
+
+    The WHOLE element, not just its direct checksum children: Gradle nests
+    alternate accepted values inside a checksum (<sha256 value=…><also-trust
+    value=…/></sha256>), and an added also-trust would widen what an
+    already-pinned artifact may be while its direct children compare equal.
+    A list, because Gradle merges duplicate entries and a dict would keep only
+    the last copy.
+    """
     out = {}
     for comp in root.iter(NS + "component"):
         key = (comp.get("group"), comp.get("name"), comp.get("version"))
         for art in comp.findall(NS + "artifact"):
-            sums = frozenset(
-                (child.tag[len(NS):], child.get("value"))
-                for child in art
-                if child.get("value") is not None
-            )
-            out[key + (art.get("name"),)] = sums
+            out.setdefault(key + (art.get("name"),), []).append(canonical(art))
     return out
 
 
@@ -56,12 +60,19 @@ def main(old_path, new_path):
         problems.append("the <configuration> block changed (verification settings, trusted artifacts or keys)")
 
     old_arts, new_arts = artifacts(old), artifacts(new)
-    for key, sums in sorted(old_arts.items()):
+    for key, copies in sorted(new_arts.items()):
+        if len(copies) > 1:
+            problems.append("artifact listed more than once: {}:{}:{} {}".format(*key))
+    for key, copies in sorted(old_arts.items()):
         label = "{}:{}:{} {}".format(*key)
         if key not in new_arts:
             problems.append("pinned artifact removed: " + label)
-        elif new_arts[key] != sums:
-            problems.append("pinned checksum changed: " + label)
+        elif new_arts[key] != copies:
+            # Byte-for-byte (canonically) the same entry: same checksums, no
+            # also-trust added, origin and all. A legitimate also-trust (Gradle
+            # writes one when two hosts saw different bytes) lands here too —
+            # and belongs in the reviewed --from-ci lane, not an automatic push.
+            problems.append("pinned artifact entry changed: " + label)
 
     if problems:
         for p in problems:
