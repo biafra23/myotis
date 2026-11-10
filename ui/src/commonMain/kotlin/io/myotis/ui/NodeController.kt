@@ -68,6 +68,17 @@ interface NodeController {
     fun acceptStaleAnchor(network: String) {}
 
     /**
+     * The stale-anchor dialog's "Fetch fresh checkpoint" action: ask [network]'s
+     * checkpoint-sync servers for the chain's current finalized checkpoint and, when
+     * servers of at least two independent operators agree on it, re-anchor the parked
+     * network on it (the stale anchor is discarded, not synced forward from). BLOCKING —
+     * one network round of up to ~15 s; call it off the main thread. The default
+     * refuses, so a host or engine without it shows why instead of doing nothing.
+     */
+    fun refreshAnchorFromCheckpointz(network: String): FreshAnchorResult =
+        FreshAnchorResult(applied = false, message = "Not available with this engine.")
+
+    /**
      * Re-apply the BLS backend to the process-global selector after [Settings.setNativeBlsEnabled]
      * flips the preference (Android: native blst ⇄ pure-Java Milagro). Takes effect immediately —
      * the decompressed-pubkey cache is process-global so the swap is cheap. Desktop currently has
@@ -784,3 +795,23 @@ data class PeerRow(
     val snapSupported: Boolean,
     val clientId: String?,          // null until the peer sends Hello
 )
+
+/**
+ * The outcome of [NodeController.refreshAnchorFromCheckpointz], ready for the dialog:
+ * [message] names the agreeing operators when [applied], the reason otherwise.
+ */
+data class FreshAnchorResult(val applied: Boolean, val message: String) {
+    companion object {
+        /** The one wording every host shows, from the engine contract's `AnchorRefresh` fields. */
+        fun of(applied: Boolean, operators: List<String>, slot: Long, error: String?): FreshAnchorResult =
+            if (applied) {
+                FreshAnchorResult(
+                    true,
+                    "Re-anchored on the checkpoint at slot $slot that ${operators.size} independent " +
+                        "operators agree on (${operators.joinToString()}). Syncing from it…",
+                )
+            } else {
+                FreshAnchorResult(false, "No fresh checkpoint: ${error ?: "refused"}.")
+            }
+    }
+}

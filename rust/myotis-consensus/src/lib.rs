@@ -23,6 +23,7 @@ pub mod ssz;
 pub mod store;
 pub mod types;
 pub mod verify;
+pub mod zk;
 
 /// The production BLS DST (re-exported for callers that log/compare it).
 pub fn bls_dst() -> &'static [u8] {

@@ -131,11 +131,25 @@ impl SyncCommittee {
         ssz::merkleize(&[c0, c1])
     }
 
-    pub fn hash_tree_root(&self) -> Root {
+    /// hash_tree_root of `Vector[BLSPubkey, 512]` over 512 × 48 concatenated
+    /// pubkeys — the committee's `pubkeys` field root alone, the value the ZK
+    /// sync proofs commit to (`zk.rs`). A buffer of any other length hashes as
+    /// if zero-padded or truncated to 512 keys; callers pass a decoded committee.
+    pub fn pubkeys_root_of(pubkeys: &[u8]) -> Root {
         let pubkey_roots: Vec<Root> = (0..SYNC_COMMITTEE_SIZE)
-            .map(|i| Self::pubkey_root(self.pubkey(i)))
+            .map(|i| {
+                let mut pk = [0u8; PUBKEY_SIZE];
+                if let Some(src) = pubkeys.get(i * PUBKEY_SIZE..(i + 1) * PUBKEY_SIZE) {
+                    pk.copy_from_slice(src);
+                }
+                Self::pubkey_root(&pk)
+            })
             .collect();
-        let pubkeys_vector_root = ssz::merkleize(&pubkey_roots);
+        ssz::merkleize(&pubkey_roots)
+    }
+
+    pub fn hash_tree_root(&self) -> Root {
+        let pubkeys_vector_root = Self::pubkeys_root_of(&self.pubkeys);
         let aggregate_root = Self::pubkey_root(&self.aggregate_pubkey);
         ssz::container_root(&[pubkeys_vector_root, aggregate_root])
     }

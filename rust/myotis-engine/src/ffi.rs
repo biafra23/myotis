@@ -155,6 +155,15 @@ pub fn accept_stale_anchor(handle: i64) -> bool {
     crate::host::accept_stale_anchor(handle)
 }
 
+/// Recover a STALE_ANCHOR park from a fresh checkpoint two or more independent
+/// checkpoint-sync operators agree on. Blocking (HTTPS); JSON
+/// `{"applied":true,"root","slot","epoch","operators"}` or
+/// `{"applied":false,"error"}` (see `host::refresh_anchor_from_checkpointz`).
+#[uniffi::export]
+pub fn refresh_anchor_from_checkpointz(handle: i64) -> String {
+    crate::host::refresh_anchor_from_checkpointz(handle)
+}
+
 /// Live-set the eth/69 served-block window (the Settings knob). Clamped to
 /// [1, 4096]; applied immediately on a RUNNING handle's EL reader, stashed for
 /// the next spin_up when the handle isn't running. False only for an unknown

@@ -251,6 +251,17 @@ pub extern "C" fn myotis_accept_stale_anchor(handle: i64) -> bool {
     crate::host::accept_stale_anchor(handle)
 }
 
+/// Recover a STALE_ANCHOR park from a fresh checkpoint that checkpoint-sync
+/// servers of two or more independent operators agree on
+/// (`nativeRefreshAnchorFromCheckpointz` twin). Blocking — one HTTPS round, up
+/// to ~15 s; never call from the UI thread. JSON
+/// `{"applied":true,"root","slot","epoch","operators"}` or
+/// `{"applied":false,"error"}`; release with `myotis_string_free`.
+#[no_mangle]
+pub extern "C" fn myotis_refresh_anchor_from_checkpointz(handle: i64) -> *mut c_char {
+    into_c(crate::host::refresh_anchor_from_checkpointz(handle))
+}
+
 /// Verified account read (`nativeRequestAccountJson` twin). Blocking — may take
 /// up to ~90 s for a header-chain walk; never call from the UI thread. `block`
 /// (ABI ≥ 32) is the RPC block selector the engine applies or refuses: NULL or

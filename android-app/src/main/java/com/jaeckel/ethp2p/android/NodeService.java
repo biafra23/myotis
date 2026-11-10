@@ -877,6 +877,18 @@ public final class NodeService extends Service {
         }
     }
 
+    /** The stale-anchor dialog's "Fetch fresh checkpoint": re-anchor {@code network}'s
+     *  STALE_ANCHOR park on a checkpointz-agreed fresh checkpoint. Blocking (network
+     *  round) — the handle is read under the lock, the call runs outside it. */
+    public io.myotis.api.AnchorRefresh refreshAnchorFromCheckpointz(String network) {
+        ChainHandle h;
+        synchronized (handles) {
+            h = handles.get(network);
+        }
+        if (h == null) return io.myotis.api.AnchorRefresh.refused(network + " is not running");
+        return h.refreshAnchorFromCheckpointz();
+    }
+
     /** Currently live networks (a chip per entry), in display order. */
     public List<String> liveNetworks() {
         List<String> out = new ArrayList<>();

@@ -466,6 +466,29 @@ internal object EngineDecoding {
         }
     }
 
+    // ---- the checkpointz recovery ----
+
+    /** `{"applied":true,"root","slot","epoch","operators"}` or `{"applied":false,"error"}`. */
+    fun anchorRefresh(payload: String?): AnchorRefresh {
+        val o = parseObject(payload, "anchor refresh")
+        val applied = (o["applied"] as? JsonPrimitive)?.booleanOrNull ?: false
+        if (!applied) {
+            val why = (o["error"] as? JsonPrimitive)?.takeIf { it.isString }?.content ?: "refused"
+            return AnchorRefresh(false, null, 0, 0, emptyList(), why)
+        }
+        return fields("anchor refresh") {
+            AnchorRefresh(
+                applied = true,
+                root = o.requiredString("root"),
+                slot = o.requiredLong("slot"),
+                epoch = o.requiredLong("epoch"),
+                operators = (o["operators"] as? JsonArray)
+                    ?.map { (it as JsonPrimitive).content } ?: emptyList(),
+                error = null,
+            )
+        }
+    }
+
     // ---- the envelope ----
 
     private fun parse(payload: String?, what: String): JsonElement {

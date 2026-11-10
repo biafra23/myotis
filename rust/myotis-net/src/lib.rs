@@ -31,15 +31,18 @@
 // surface.
 pub use libp2p::{identity, multiaddr, Multiaddr, PeerId};
 
+pub mod checkpointz;
 pub mod cl_fork_watch;
 pub mod clcache;
 pub mod codec;
 pub mod discovery;
+pub mod https;
 pub mod el;
 pub mod protocols;
 pub mod reqresp;
 pub mod status;
 pub mod sync;
 pub mod traffic;
+pub mod zksync;
 
 pub use sync::{ChainConfig, SyncHandle, SyncState, SyncStatus};

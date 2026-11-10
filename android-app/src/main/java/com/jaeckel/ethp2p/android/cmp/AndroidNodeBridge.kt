@@ -132,6 +132,11 @@ class AndroidNodeController(
     override fun setWsBoundPeriods(periods: Int) { serviceProvider()?.setWsBoundPeriods(periods) }
     override fun applyWebAccess() { serviceProvider()?.applyWebAccess() }
     override fun acceptStaleAnchor(network: String) { serviceProvider()?.acceptStaleAnchor(network) }
+    override fun refreshAnchorFromCheckpointz(network: String): io.myotis.ui.FreshAnchorResult {
+        val r = serviceProvider()?.refreshAnchorFromCheckpointz(network)
+            ?: return io.myotis.ui.FreshAnchorResult(false, "No fresh checkpoint: the node service is not running.")
+        return io.myotis.ui.FreshAnchorResult.of(r.applied(), r.operators(), r.slot(), r.error())
+    }
     override fun applyLogIndex(network: String) { serviceProvider()?.applyLogIndex(network) }
 
     override val canImportLogIndex: Boolean get() = pickFiles != null

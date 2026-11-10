@@ -533,6 +533,65 @@ impl LightClientProcessor {
         true
     }
 
+    /// Initialize the store from a committee proven by other means than a
+    /// bootstrap — the ZK sync path (`crate::zk`), whose proof yields the
+    /// committee of `committee_period` but no header. The header comes from
+    /// `update`, which must be one the committee itself signed and whose
+    /// finalized header is in that same period, so the store starts exactly
+    /// where a bootstrap at that finalized header would have put it: current
+    /// committee = the proven one, period = its period, finalized and
+    /// optimistic headers = the update's.
+    ///
+    /// Checked like any finality update — wire shape, ≥2/3 sync-aggregate BLS
+    /// signature under the signature slot's fork, finality branch, both
+    /// execution branches — with the committee supplied instead of read from
+    /// the store. Refuses (store untouched) when the store is already
+    /// initialized: this replaces a bootstrap, it never overrides a store.
+    pub fn initialize_from_proven_committee(
+        &mut self,
+        committee: SyncCommittee,
+        committee_period: u64,
+        update: &LightClientFinalityUpdate,
+    ) -> Result<(), ProvenInitReject> {
+        if self.store.is_initialized() {
+            return Err(ProvenInitReject::AlreadyInitialized);
+        }
+        if self.store.period_of(update.signature_slot) != committee_period {
+            return Err(ProvenInitReject::SignedInAnotherPeriod);
+        }
+        // A finalized header from the period before (the first epochs of a
+        // period, before finality crossed the boundary) would leave the store's
+        // period one behind its committee.
+        if self.store.period_of(update.finalized_header.beacon.slot) != committee_period {
+            return Err(ProvenInitReject::FinalizedInAnotherPeriod);
+        }
+        if !self.update_shape_ok(&update.attested_header, &update.finalized_header) {
+            return Err(ProvenInitReject::Invalid);
+        }
+        let fork_version = self.fork_schedule.version_for_signature_slot(update.signature_slot);
+        if !verify::verify_sync_aggregate(
+            &update.sync_aggregate,
+            &committee,
+            &update.attested_header.beacon,
+            &fork_version,
+            &self.genesis_validators_root,
+        ) {
+            return Err(ProvenInitReject::Signature);
+        }
+        if !self.verify_finality_branch(
+            &update.attested_header,
+            &update.finalized_header,
+            &update.finality_branch,
+        ) || !self.verify_header(&update.attested_header)
+            || !self.verify_header(&update.finalized_header)
+        {
+            return Err(ProvenInitReject::Invalid);
+        }
+        self.store.initialize(update.finalized_header.clone(), committee);
+        self.store.update_optimistic(&update.attested_header, update.signature_slot);
+        Ok(())
+    }
+
     /// [`process_finality_update`](Self::process_finality_update), telling a
     /// verified update that ADVANCED the store apart from one that verified
     /// but moved nothing — the store already held a finalized and an
@@ -568,6 +627,35 @@ pub enum FinalityOutcome {
     Stale,
     /// Did not verify (period, shape, signature or branch).
     Rejected,
+}
+
+/// Why [`LightClientProcessor::initialize_from_proven_committee`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvenInitReject {
+    /// The store already holds a committee.
+    AlreadyInitialized,
+    /// The update was not signed in the proven committee's period.
+    SignedInAnotherPeriod,
+    /// Its finalized header is not in that period yet (retry later).
+    FinalizedInAnotherPeriod,
+    /// The committee's signature does not verify (or is under 2/3).
+    Signature,
+    /// Shape, finality branch or execution branch invalid.
+    Invalid,
+}
+
+impl core::fmt::Display for ProvenInitReject {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            ProvenInitReject::AlreadyInitialized => "store already initialized",
+            ProvenInitReject::SignedInAnotherPeriod => "update not signed in the committee's period",
+            ProvenInitReject::FinalizedInAnotherPeriod => {
+                "finalized header not in the committee's period yet"
+            }
+            ProvenInitReject::Signature => "sync-aggregate signature invalid for the committee",
+            ProvenInitReject::Invalid => "update shape or branches invalid",
+        })
+    }
 }
 
 /// Why [`LightClientProcessor::verify_bootstrap`] refused a bootstrap.

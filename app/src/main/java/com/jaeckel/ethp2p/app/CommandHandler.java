@@ -98,6 +98,7 @@ public class CommandHandler {
                 case "stop"                    -> handleStop();
                 case "beacon-status"           -> handleBeaconStatus();
                 case "accept-stale-anchor"     -> handleAcceptStaleAnchor();
+                case "refresh-anchor"          -> handleRefreshAnchor();
                 case "import-logindex"         -> handleImportLogIndex(jsonLine);
                 case "export-logindex"         -> handleExportLogIndex(jsonLine);
                 case "build-logindex"          -> handleBuildLogIndex(jsonLine);
@@ -249,6 +250,33 @@ public class CommandHandler {
                 + ",\"note\":\"syncing forward from the stale anchor for THIS RUN — the"
                 + " long-range-attack guarantee is weakened until the store catches up"
                 + " under BLS verification\"}";
+    }
+
+    /**
+     * The other way out of {@code STALE_ANCHOR}: re-anchor on a fresh finalized
+     * checkpoint that checkpoint-sync servers of at least two independent operators
+     * agree on (the stale anchor is discarded, not walked forward from). The engine
+     * refuses unless parked; the Java engine refuses outright.
+     */
+    private String handleRefreshAnchor() {
+        io.myotis.api.AnchorRefresh r = handle.refreshAnchorFromCheckpointz();
+        if (!r.applied()) {
+            return "{\"ok\":true,\"applied\":false,\"note\":" + jsonQuote(r.error()) + "}";
+        }
+        StringBuilder ops = new StringBuilder();
+        for (String op : r.operators()) {
+            if (ops.length() > 0) ops.append(',');
+            ops.append(jsonQuote(op));
+        }
+        return "{\"ok\":true,\"applied\":true,\"root\":" + jsonQuote(r.root())
+                + ",\"slot\":" + r.slot() + ",\"epoch\":" + r.epoch()
+                + ",\"operators\":[" + ops + "]"
+                + ",\"note\":\"re-anchored on the checkpoint these operators agree on — the anchor"
+                + " is their word; everything after it is verified as usual\"}";
+    }
+
+    private static String jsonQuote(String s) {
+        return s == null ? "null" : "\"" + escapeJson(s) + "\"";
     }
 
     private String handleBeaconStatus() {

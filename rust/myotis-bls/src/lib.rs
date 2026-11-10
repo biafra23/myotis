@@ -86,6 +86,28 @@ pub fn fast_aggregate_verify_with_dst(
     sig.fast_aggregate_verify(true, message, dst, &pk_refs) == BLST_ERROR::BLST_SUCCESS
 }
 
+/// `eth_aggregate_pubkeys`: the compressed aggregate of `48 * n` concatenated
+/// compressed G1 pubkeys, each one decompressed AND subgroup-checked (the spec's
+/// `KeyValidate`). `None` on any malformed input — a bad length, a count outside
+/// [1, 4096], a point off the curve or outside the subgroup.
+///
+/// The sync committee's `aggregate_pubkey` field is exactly this over its
+/// `pubkeys`, so a committee whose pubkeys arrive without it (the ZK sync path,
+/// whose proof commits to the pubkeys root alone) can be completed into the
+/// spec container bit for bit.
+pub fn aggregate_pubkeys(pubkeys: &[u8]) -> Option<[u8; PK_LEN]> {
+    if pubkeys.is_empty() || pubkeys.len() % PK_LEN != 0 || pubkeys.len() / PK_LEN > MAX_PUBKEYS {
+        return None;
+    }
+    let mut pks: Vec<PublicKey> = Vec::with_capacity(pubkeys.len() / PK_LEN);
+    for chunk in pubkeys.chunks_exact(PK_LEN) {
+        pks.push(PublicKey::key_validate(chunk).ok()?);
+    }
+    let refs: Vec<&PublicKey> = pks.iter().collect();
+    let agg = blst::min_pk::AggregatePublicKey::aggregate(&refs, false).ok()?;
+    Some(agg.to_public_key().compress())
+}
+
 #[cfg(feature = "jni")]
 mod jni_shim {
     use jni::objects::{JByteArray, JClass};

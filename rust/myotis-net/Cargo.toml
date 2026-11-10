@@ -49,6 +49,21 @@ alloy-rlp = "=0.3.16"
 # same features — no new download.
 hickory-resolver = { version = "=0.25.2", default-features = false, features = ["system-config", "tokio"] }
 snap = "=1.1.1"
+# HTTPS for the two non-p2p sources the engine reads (src/https.rs): Colibri's
+# ZK sync proofs (self-verifying — src/zksync.rs) and the checkpointz finalized
+# roots a host may ask for at a STALE_ANCHOR park (src/checkpointz.rs). rustls
+# with ring is already in every target's tree through libp2p-quic, at exactly
+# these features; webpki-roots (Mozilla's root store, data only) is the one new
+# crate. On Android it is ALSO the rustls tor-rtcompat links:
+# install_default() (el/tor.rs) writes THIS crate's process-default static, so
+# a second rustls version would leave Arti's copy without a provider — and its
+# RustlsProvider::new panics (an abort under the workspace profile) on the
+# first Tor read. After an Arti bump, check that `cargo tree --target
+# aarch64-linux-android -p myotis-net --features tor -i rustls` still resolves
+# (it errors out when there are two versions). src/https.rs never relies on
+# the process default: it names the ring provider itself.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+webpki-roots = "=1.0.11"
 tracing = "=0.1.44"
 futures = "=0.3.32"
 async-trait = "=0.1.89"
@@ -81,16 +96,8 @@ tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio"
 [target.'cfg(target_os = "android")'.dependencies]
 arti-client = { version = "0.44", default-features = false, features = ["tokio", "rustls", "static-sqlite"], optional = true }
 tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio", "rustls"], optional = true }
-# Must stay the rustls tor-rtcompat links: install_default() (el/tor.rs) writes
-# THIS crate's process-default static, so a second rustls version would leave
-# Arti's copy without a provider — and its RustlsProvider::new panics (an abort
-# under the workspace profile) on the first Tor read. After an Arti bump, check
-# that `cargo tree --target aarch64-linux-android -p myotis-net --features tor
-# -i rustls` still resolves (it errors out when there are two versions).
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
-
 [features]
-tor = ["dep:arti-client", "dep:tor-rtcompat", "dep:rustls"]
+tor = ["dep:arti-client", "dep:tor-rtcompat"]
 # The EVM fixture recorder's seam (`ElReader::head_evm_oracle`) and
 # myotis-evm's recorded-world files, for examples/record_shield_fixture.rs.
 # Test tooling: on only through this crate's own dev-dependency below.

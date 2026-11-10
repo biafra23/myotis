@@ -267,6 +267,7 @@ fun NodeScreen(
                         controller.acceptStaleAnchor(staleNet)
                         staleDismissed = staleDismissed + staleNet
                     },
+                    onFetchFresh = { controller.refreshAnchorFromCheckpointz(staleNet) },
                     onDismiss = { staleDismissed = staleDismissed + staleNet },
                 )
             }
@@ -483,8 +484,14 @@ private fun StaleAnchorDialog(
     network: String,
     s: NodeSnapshot,
     onAccept: () -> Unit,
+    // Blocking (a network round): run off the main thread, outcome shown in place.
+    // An applied anchor releases the park, which closes the dialog on its own.
+    onFetchFresh: () -> FreshAnchorResult,
     onDismiss: () -> Unit,
 ) {
+    val scope = rememberCoroutineScope()
+    var fetching by remember(network) { mutableStateOf(false) }
+    var fetchResult by remember(network) { mutableStateOf<FreshAnchorResult?>(null) }
     val agePeriods = (s.syncTargetPeriod - s.syncCurrentPeriod).coerceAtLeast(0)
     // Rough period length per chain, for a human-scale age (exact math stays in
     // periods — this is display only): mainnet preset ~27.3 h, the Gnosis preset
@@ -505,11 +512,35 @@ private fun StaleAnchorDialog(
                     "alone cannot tell it from the real chain. Syncing is paused, and " +
                     "verified reads stay unavailable, until you decide.\n\n" +
                     "Safest: update the app (a fresh build carries a fresh checkpoint). " +
-                    "Alternatively raise the bound in Settings, or sync anyway if you " +
-                    "trust your network and peers — for this run only.",
+                    "Or fetch a fresh checkpoint: Myotis asks independent checkpoint-sync " +
+                    "servers for the block the chain finalized most recently and starts over " +
+                    "from it — only if servers of at least two different operators agree. You " +
+                    "then trust those servers for the starting point; everything after it is " +
+                    "verified as usual. Alternatively raise the bound in Settings, or sync " +
+                    "anyway if you trust your network and peers — for this run only." +
+                    when {
+                        fetching -> "\n\nAsking checkpoint-sync servers…"
+                        fetchResult != null -> "\n\n" + fetchResult!!.message
+                        else -> ""
+                    },
             )
         },
-        confirmButton = { TextButton(onClick = onAccept) { Text("Sync anyway (accept risk)") } },
+        confirmButton = {
+            Column(horizontalAlignment = Alignment.End) {
+                TextButton(
+                    enabled = !fetching,
+                    onClick = {
+                        fetching = true
+                        fetchResult = null
+                        scope.launch {
+                            fetchResult = withContext(Dispatchers.Default) { onFetchFresh() }
+                            fetching = false
+                        }
+                    },
+                ) { Text("Fetch fresh checkpoint") }
+                TextButton(onClick = onAccept, enabled = !fetching) { Text("Sync anyway (accept risk)") }
+            }
+        },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Stay paused") } },
     )
 }

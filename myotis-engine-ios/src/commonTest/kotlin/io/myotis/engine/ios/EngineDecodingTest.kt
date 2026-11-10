@@ -618,4 +618,28 @@ class EngineDecodingTest {
         val e = assertFailsWith<EngineException> { EngineDecoding.ensAddress("a.eth", """{"error":"no snap peer"}""") }
         assertTrue(e.message!!.contains("no snap peer"))
     }
+
+    // ---- the checkpointz recovery (host.rs anchor_refresh_json_shape's literal) ----
+
+    @Test
+    fun anAppliedAnchorRefreshDecodes() {
+        val r = EngineDecoding.anchorRefresh(
+            """{"applied":true,"root":"0x1111111111111111111111111111111111111111111111111111111111111111",""" +
+                """"slot":15626560,"epoch":488330,"operators":["attestant.io","sigp.io"]}""",
+        )
+        assertTrue(r.applied)
+        assertEquals("0x" + "11".repeat(32), r.root)
+        assertEquals(15626560L, r.slot)
+        assertEquals(488330L, r.epoch)
+        assertEquals(listOf("attestant.io", "sigp.io"), r.operators)
+        assertNull(r.error)
+    }
+
+    @Test
+    fun aRefusedAnchorRefreshCarriesItsReason() {
+        val r = EngineDecoding.anchorRefresh("""{"applied":false,"error":"unknown handle"}""")
+        assertFalse(r.applied)
+        assertEquals("unknown handle", r.error)
+        assertTrue(r.operators.isEmpty())
+    }
 }

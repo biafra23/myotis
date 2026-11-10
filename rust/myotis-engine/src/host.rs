@@ -1514,6 +1514,94 @@ pub fn accept_stale_anchor(handle: i64) -> bool {
     }
 }
 
+/// `nativeRefreshAnchorFromCheckpointz`: the third answer to a STALE_ANCHOR
+/// park, next to "raise the bound" and "sync anyway" — fetch a fresh finalized
+/// checkpoint from the network's checkpoint-sync servers and re-anchor on it
+/// (docs/how-it-works/zk-sync.md, *Fresh checkpoint*). Blocking (one HTTPS
+/// round to every server, ≤ ~15 s); call it off the UI thread.
+///
+/// Applied only when the handle is RUNNING and PARKED in STALE_ANCHOR, and
+/// only when servers of at least two independent operators name the same
+/// finalized root (`myotis_net::checkpointz`). The root is those operators'
+/// word — the engine cannot verify an anchor — so the result names them for
+/// the host to show. A root whose own period is past the bound, or in the
+/// future, is refused. Returns JSON: `{"applied":true,"root":"0x…","slot":n,
+/// "epoch":n,"operators":["…"]}` or `{"applied":false,"error":"…"}`. The park
+/// takes it within a second; status then leaves STALE_ANCHOR for
+/// BOOTSTRAPPING.
+pub fn refresh_anchor_from_checkpointz(handle: i64) -> String {
+    let refuse = |why: &str| format!("{{\"applied\":false,\"error\":{}}}", json_string(why));
+    let Some(engine) = engine() else { return refuse("engine unavailable") };
+    let config = {
+        let Ok(map) = engine.handles.lock() else { return refuse("engine unavailable") };
+        match map.get(&handle) {
+            Some(ChainEntry::Running(c, sync, _)) => {
+                if sync.status().state != SyncState::StaleAnchor {
+                    return refuse("not parked at a stale anchor");
+                }
+                Arc::clone(c)
+            }
+            Some(_) => return refuse("network is not running"),
+            None => return refuse("unknown handle"),
+        }
+    };
+    if config.checkpointz_servers.is_empty() {
+        return refuse("no checkpoint-sync servers configured for this network");
+    }
+    let fetched = engine.rt.block_on(myotis_net::checkpointz::fetch_agreed(
+        &config.checkpointz_servers,
+        config.slots_per_epoch,
+    ));
+    let fresh = match fetched {
+        Ok(f) => f,
+        Err(e) => return refuse(&e),
+    };
+    if fresh.slot > config.wall_clock_slot() {
+        return refuse("agreed checkpoint is ahead of this device's clock");
+    }
+    let period = fresh.slot / config.slots_per_period();
+    if myotis_net::sync::ws_anchor_stale(period, config.wall_clock_period(), config.effective_ws_bound_periods()) {
+        return refuse("agreed checkpoint is itself past the weak-subjectivity bound");
+    }
+    match config.ws_policy.fresh_anchor.lock() {
+        Ok(mut slot) => *slot = Some((fresh.root, fresh.slot)),
+        Err(_) => return refuse("engine unavailable"),
+    }
+    tracing::warn!(handle, slot = fresh.slot, operators = ?fresh.operators,
+        "fresh anchor from checkpointz agreement handed to the parked sync loop");
+    anchor_refresh_json(&fresh)
+}
+
+/// The applied shape of [`refresh_anchor_from_checkpointz`] — pinned by
+/// `anchor_refresh_json_shape` and decoded by the JVM (`RustChainHandle.parseAnchorRefresh`)
+/// and iOS (`EngineDecoding.anchorRefresh`) sides from the same literal.
+fn anchor_refresh_json(fresh: &myotis_net::checkpointz::FreshCheckpoint) -> String {
+    let ops: Vec<String> = fresh.operators.iter().map(|o| json_string(o)).collect();
+    format!(
+        "{{\"applied\":true,\"root\":\"0x{}\",\"slot\":{},\"epoch\":{},\"operators\":[{}]}}",
+        fresh.root.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        fresh.slot,
+        fresh.epoch,
+        ops.join(",")
+    )
+}
+
+/// A JSON string literal (quotes, backslashes and control characters escaped).
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Parse a verified read's RPC block selector — BEFORE the handle lookup: a
 /// selector no retry can serve (`earliest`, a block hash, garbage) is refused
 /// as invalid params, the request's own fault, whatever state the handle is
@@ -5123,6 +5211,30 @@ mod tests {
         .unwrap();
         assert_eq!(v["currentPeriod"], 1777);
         assert_eq!(v["targetPeriod"], 1777);
+    }
+
+    #[test]
+    fn anchor_refresh_json_shape() {
+        let fresh = myotis_net::checkpointz::FreshCheckpoint {
+            root: [0x11; 32],
+            epoch: 488_330,
+            slot: 15_626_560,
+            operators: vec!["attestant.io".into(), "sigp.io".into()],
+        };
+        assert_eq!(
+            anchor_refresh_json(&fresh),
+            r#"{"applied":true,"root":"0x1111111111111111111111111111111111111111111111111111111111111111","slot":15626560,"epoch":488330,"operators":["attestant.io","sigp.io"]}"#
+        );
+        // Refusals: an unknown handle is refused before any network I/O.
+        assert_eq!(
+            refresh_anchor_from_checkpointz(987_654_321),
+            if engine().is_some() {
+                r#"{"applied":false,"error":"unknown handle"}"#
+            } else {
+                r#"{"applied":false,"error":"engine unavailable"}"#
+            }
+        );
+        assert_eq!(json_string("a\"b\\c\n"), r#""a\"b\\c\u000a""#);
     }
 
     #[test]

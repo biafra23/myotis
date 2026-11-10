@@ -61,6 +61,20 @@ data class UpgradeAdvisory(
 enum class NetworkMetering { UNKNOWN, UNMETERED, METERED }
 
 /**
+ * The outcome of [ChainHandle.refreshAnchorFromCheckpointz], the JVM contract's
+ * `AnchorRefresh`: when [applied], the parked network bootstraps from [root], a
+ * finalized checkpoint the [operators] agree on; otherwise [error] says why not.
+ */
+data class AnchorRefresh(
+    val applied: Boolean,
+    val root: String?,
+    val slot: Long,
+    val epoch: Long,
+    val operators: List<String>,
+    val error: String?,
+)
+
+/**
  * One network's bytes on the wire (docs/how-it-works/data-usage.md), the JVM contract's `DataUsage`.
  * The `today*` figures cover the local calendar day [day] and survive a restart of the
  * network on the same day; the rest count since the handle was created. A host running

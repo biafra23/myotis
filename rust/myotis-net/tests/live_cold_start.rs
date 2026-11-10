@@ -91,14 +91,20 @@ use myotis_net::{ChainConfig, SyncHandle, SyncState, SyncStatus};
 /// for is a green result that means something else (CLAUDE.md: a parameter
 /// that can change the answer must be applied or refused, never accepted and
 /// silently ignored).
+///
+/// ZK sync is OFF here, always: a ZK start skips the bootstrap at the anchor
+/// and the update walk from it — the two things these checks exist to prove a
+/// fresh install can still do when Colibri's provers are unreachable.
 fn configs_for_env() -> (ChainConfig, ElConfig) {
-    match net_from_env().as_str() {
+    let (mut cl, el) = match net_from_env().as_str() {
         "mainnet" => (ChainConfig::mainnet(), ElConfig::mainnet()),
         "sepolia" => (ChainConfig::sepolia(), ElConfig::sepolia()),
         "gnosis" => (ChainConfig::gnosis(), ElConfig::gnosis()),
         "chiado" => (ChainConfig::chiado(), ElConfig::chiado()),
         other => panic!("unknown NET {other:?} (want mainnet, sepolia, gnosis or chiado)"),
-    }
+    };
+    cl.zk_sync = None;
+    (cl, el)
 }
 
 /// `NET`, defaulting to gnosis. [`configs_for_env`] refuses an unknown value.

@@ -44,6 +44,7 @@ import io.myotis.engine.capi.myotis_request_account_json
 import io.myotis.engine.capi.myotis_resolve_block_hash_json
 import io.myotis.engine.capi.myotis_resume
 import io.myotis.engine.capi.myotis_accept_stale_anchor
+import io.myotis.engine.capi.myotis_refresh_anchor_from_checkpointz
 import io.myotis.engine.capi.myotis_set_network_metering
 import io.myotis.engine.capi.myotis_set_ws_bound_periods
 import io.myotis.engine.capi.myotis_simulate_v1_json
@@ -163,6 +164,14 @@ object RustEngine {
     fun acceptStaleAnchor(handle: Long): Boolean {
         requireAbi()
         return myotis_accept_stale_anchor(handle)
+    }
+
+    /** Re-anchor a STALE_ANCHOR park on a checkpointz-agreed fresh checkpoint
+     *  (ABI >= 57). Blocking — never call from the main thread. */
+    fun refreshAnchorFromCheckpointz(handle: Long): String {
+        requireAbi()
+        return take(myotis_refresh_anchor_from_checkpointz(handle))
+            ?: """{"applied":false,"error":"native failure"}"""
     }
 
     /** Replace this handle's host-supplied EL seed pins (ABI >= 31, #465): a

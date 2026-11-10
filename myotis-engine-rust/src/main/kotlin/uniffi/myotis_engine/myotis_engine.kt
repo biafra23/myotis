@@ -746,6 +746,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_read_stats_json(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_refresh_anchor_from_checkpointz(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_request_account_json(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_resolve_block_hash_json(
@@ -868,6 +870,8 @@ internal object UniffiLib {
     external fun uniffi_myotis_engine_fn_func_pending_nonce_overlay(`handle`: Long,`addressHex`: RustBuffer.ByValue,`minedNonce`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
     external fun uniffi_myotis_engine_fn_func_read_stats_json(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_myotis_engine_fn_func_refresh_anchor_from_checkpointz(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_request_account_json(`handle`: Long,`address`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1133,6 +1137,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_read_stats_json() and 0xFFFF) != 12379) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_myotis_engine_checksum_func_refresh_anchor_from_checkpointz() and 0xFFFF) != 25078) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_request_account_json() and 0xFFFF) != 48343) {
@@ -2078,6 +2085,23 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
             return FfiConverterString.lift(
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_myotis_engine_fn_func_read_stats_json(
+    
+        
+        FfiConverterLong.lower(`handle`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Recover a STALE_ANCHOR park from a fresh checkpoint two or more independent
+         * checkpoint-sync operators agree on. Blocking (HTTPS); JSON
+         * `{"applied":true,"root","slot","epoch","operators"}` or
+         * `{"applied":false,"error"}` (see `host::refresh_anchor_from_checkpointz`).
+         */ fun `refreshAnchorFromCheckpointz`(`handle`: kotlin.Long): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_refresh_anchor_from_checkpointz(
     
         
         FfiConverterLong.lower(`handle`),_status)

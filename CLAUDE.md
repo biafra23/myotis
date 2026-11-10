@@ -800,6 +800,13 @@ that produced this note.
   leaves out of its tree; it does not surface a withheld or altered one, so
   the wallet's displayed balance rests on the publisher. Scope and limits: the
   carve-out under *Data sources*.
+- **Two more, on the owner's request (2026-11-10), Rust engine only:** a sync
+  committee proven by Colibri's ZK proof chain, which is cryptographically
+  verified but anchored at Colibri's pinned anchor committee rather than the
+  embedded checkpoint; and, only on the user's explicit request at a
+  `STALE_ANCHOR` park, a fresh checkpoint that at least two independent
+  checkpoint-sync operators agree on. Scope and limits: the carve-out under
+  *Data sources*.
 - **A parameter that can change the answer must be APPLIED or REFUSED — never
   accepted and silently ignored.** A well-formed result computed against
   something other than what the caller asked for is indistinguishable from a
@@ -864,6 +871,32 @@ that produced this note.
     does this rule let this repo's own tooling GENERATE a seed from a node
     over JSON-RPC — that stays open, and the RAILGUN PoC's seed stays DEBUG /
     DEMO (docs/guides/railgun-poc.md).
+- **Carve-out for ZK sync and fresh checkpoints (owner's request,
+  2026-11-10; docs/how-it-works/zk-sync.md).** The Rust engine reads two
+  HTTPS sources beside its peers, through its one HTTP client
+  (`rust/myotis-net/src/https.rs`: pinned URLs, no redirects, Mozilla roots):
+  - **Colibri's ZK sync proofs** (`<net>.colibri-proof.tech`, used with the
+    Colibri team's permission). They are self-verifying: the SP1 program, the
+    Groth16 key, the anchor committee, the period, the committee root and the
+    signing domain are all pinned or recomputed locally, so a server can
+    withhold a proof but never forge one, and every failure falls back to the
+    light-client update walk. The trade is the anchor. The proof chain starts
+    at Colibri's anchor committee, which is older than the weak-subjectivity
+    bound, so a long-range forgery signed by an old committee's exited keys is
+    exposure the walk from the embedded checkpoint does not have. ZK sync runs
+    only past the WS gate on Myotis's own anchor. A Colibri program rotation
+    moves the pins in a reviewed release, never at runtime.
+    `MYOTIS_ZK_SYNC=0` turns it off, and the cold-start release checks always
+    do (they test the walk).
+  - **Checkpointz finalized roots**, ONLY on the user's explicit request at a
+    `STALE_ANCHOR` park (`refreshAnchorFromCheckpointz`). Never automatic, and
+    never applied to a store that is not parked. The root is accepted only when
+    ≥ 2 operators (registrable domains) agree and none disagrees, the same gate
+    as `./gradlew refreshCheckpoint`. It is their word, as the embedded anchor
+    is the release's, and the host must say so.
+
+  Neither crosses into the **wallet's reads**: account, storage and call data
+  still come only from devp2p peers, verified as before.
 - **TrueBlocks Unchained Index mainnet publishing appears stalled.** The designated
   publisher (`publisher.unchainedindex.eth`) last published a mainnet manifest indexed
   to ~block 23.0M (mid-2025); as of mid-2026 that is ~a year behind the head, and the

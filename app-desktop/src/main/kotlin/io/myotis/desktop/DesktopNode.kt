@@ -276,6 +276,13 @@ class DesktopNodeController(
         engine.get(network)?.acceptStaleAnchor()
     }
 
+    override fun refreshAnchorFromCheckpointz(network: String): io.myotis.ui.FreshAnchorResult {
+        val handle = engine.get(network)
+            ?: return io.myotis.ui.FreshAnchorResult(false, "No fresh checkpoint: $network is not running.")
+        val r = handle.refreshAnchorFromCheckpointz()
+        return io.myotis.ui.FreshAnchorResult.of(r.applied(), r.operators(), r.slot(), r.error())
+    }
+
     override fun applyBlsBackend() {
         // No-op on desktop: there's no bundled native blst library yet (the macOS dylib is a
         // follow-up — see the CMP plan), so desktop always runs the pure-Java Milagro backend

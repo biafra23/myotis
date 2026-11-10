@@ -134,6 +134,20 @@ public interface ChainHandle {
     void acceptStaleAnchor();
 
     /**
+     * The other way out of {@link BeaconState#STALE_ANCHOR}: fetch a fresh
+     * finalized checkpoint from the network's checkpoint-sync servers and
+     * re-anchor on it — applied only when servers of at least two independent
+     * operators name the same root, and only while this stack is parked.
+     * Unlike {@link #acceptStaleAnchor()} the stale anchor is discarded, not
+     * walked forward from; the trust moves to the agreeing operators for the
+     * anchor itself (see {@link AnchorRefresh}). Blocking (network round, up to
+     * ~15 s): never call from a UI thread. An engine without it refuses.
+     */
+    default AnchorRefresh refreshAnchorFromCheckpointz() {
+        return AnchorRefresh.refused("not supported by this engine");
+    }
+
+    /**
      * Clear the live dial bookkeeping — backoff entries and this session's
      * blacklist — so discovery re-dials from a fresh slate. On-disk peer-cache
      * FILES are host-owned; deleting those is the host's job.

@@ -64,6 +64,8 @@ class TypedEngineTest {
         override fun resume(handle: Long) = true
         override fun setWsBoundPeriods(handle: Long, periods: Long) = true
         override fun acceptStaleAnchor(handle: Long) = true
+        var anchorRefreshJson = """{"applied":false,"error":"not parked at a stale anchor"}"""
+        override fun refreshAnchorFromCheckpointz(handle: Long) = anchorRefreshJson
         override fun statusJson(handle: Long) = status
         var metering = 0
         override fun setNetworkMetering(code: Int): Boolean {

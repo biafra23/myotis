@@ -854,6 +854,30 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     }
 
     @Override
+    public io.myotis.api.AnchorRefresh refreshAnchorFromCheckpointz() {
+        return parseAnchorRefresh(RustEngineNative.nativeRefreshAnchorFromCheckpointz(handle));
+    }
+
+    /** The engine's {@code refresh_anchor_from_checkpointz} JSON as the API record. */
+    static io.myotis.api.AnchorRefresh parseAnchorRefresh(String json) {
+        try {
+            JsonObject o = Json.parse(json).asObject();
+            if (!o.getBoolean("applied", false)) {
+                return io.myotis.api.AnchorRefresh.refused(o.getString("error", "refused"));
+            }
+            List<String> ops = new java.util.ArrayList<>();
+            JsonValue arr = o.get("operators");
+            if (arr != null && arr.isArray()) {
+                for (JsonValue v : arr.asArray()) ops.add(v.asString());
+            }
+            return new io.myotis.api.AnchorRefresh(true, o.getString("root", null),
+                    o.getLong("slot", 0), o.getLong("epoch", 0), ops, null);
+        } catch (RuntimeException e) {
+            return io.myotis.api.AnchorRefresh.refused("malformed engine answer: " + e.getMessage());
+        }
+    }
+
+    @Override
     public void clearPeerState() {
         // The Rust engine owns its peer caches as files under the data dir and exports
         // no clear over the FFI, so there is nothing to forward: the hosts' "Clear peer
