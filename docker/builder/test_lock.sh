@@ -41,7 +41,8 @@ case "$1" in
   buildx) # buildx imagetools inspect REF --format ...: the registry's digest for REF
     [ ! -f "$d/registry_down" ] || { echo "503 Service Unavailable" >&2; exit 1; }
     [ -f "$d/registry/$(f "$4")" ] || { echo "manifest unknown" >&2; exit 1; }
-    printf '{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"%s","size":856}\n' "$(cat "$d/registry/$(f "$4")")" ;;
+    # As buildx prints it: indented, one field per line, a space after the colon.
+    printf '{\n  "mediaType": "application/vnd.oci.image.index.v1+json",\n  "digest": "%s",\n  "size": 856\n}\n' "$(cat "$d/registry/$(f "$4")")" ;;
   *) exit 98 ;;
 esac
 STUB

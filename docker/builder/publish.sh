@@ -44,11 +44,16 @@ ref="$repository:$key"
 locked_key=$( [[ -f "$lock" ]] && sed -n 's/^key=//p' "$lock" || true)
 
 # The digest the registry serves for a reference; empty (status 1) when it
-# cannot be read.
+# cannot be read. buildx prints the descriptor as indented JSON, one field per
+# line ("digest": "sha256:..."); the first run against a real registry found
+# that out, after the push.
 remote_digest() {
     local d
     d=$(docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>/dev/null \
-        | sed -n 's/.*"digest":"\(sha256:[0-9a-f]\{64\}\)".*/\1/p' | head -n1) || true
+        | sed -n 's/.*"digest":[[:space:]]*"\(sha256:[0-9a-f]\{64\}\)".*/\1/p' | head -n1) || true
+    # And its plain report ("Digest:    sha256:..."), should the JSON's shape move again.
+    [[ -n "$d" ]] || d=$(docker buildx imagetools inspect "$1" 2>/dev/null \
+        | sed -n 's/^Digest:[[:space:]]*\(sha256:[0-9a-f]\{64\}\)[[:space:]]*$/\1/p' | head -n1) || true
     [[ -n "$d" ]] && printf '%s\n' "$d"
 }
 
