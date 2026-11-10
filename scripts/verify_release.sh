@@ -170,4 +170,5 @@ else
 fi
 
 [ "$failures" -eq 0 ] || { echo "verify_release.sh: $failures check(s) failed for $tag" >&2; exit 1; }
-echo "release $tag: its checksums, attestations and signed APK all check out"
+if $attest; then echo "release $tag: its checksums, attestations and signed APK all check out"
+else echo "release $tag: its checksums check out (attestations were not checked)"; fi
