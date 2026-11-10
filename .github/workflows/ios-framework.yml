@@ -206,9 +206,9 @@ jobs:
           echo "tested: $(ls "$results"/*.xml | wc -l) suites"
 
       # Zip + checksum the xcframework for upload (the bundle is a directory;
-      # it survives artifact round-trips only zipped). ditto is Apple's
-      # bundle-preserving archiver — matches the sibling MyotisEngine workflow.
-      # Tag builds only — nothing to publish otherwise.
+      # it survives artifact round-trips only zipped), with scripts/repro_zip.sh
+      # like the sibling MyotisEngine workflow (why not ditto: the in-step
+      # comment). Tag builds only — nothing to publish otherwise.
       - name: Package xcframework
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
