@@ -6,8 +6,8 @@
 #   apt packages          from snapshot.ubuntu.com at one instant (APT_SNAPSHOT)
 #   Temurin JDK           by SHA-256
 #   rustup-init           by SHA-256; rustc by exact version
-#   Android cmdline-tools by SHA-256; the NDK and build-tools by exact version,
-#                         the platform by API level and checked revision
+#   Android cmdline-tools by SHA-256; the NDK and build-tools by exact version;
+#                         the platform's archive by SHA-256
 #   cargo-ndk             by exact version, built --locked
 #
 # Do not `docker build` this by hand: docker/builder/build.sh passes the build
@@ -104,6 +104,8 @@ ARG ANDROID_NDK
 ARG ANDROID_BUILD_TOOLS
 ARG ANDROID_PLATFORM
 ARG ANDROID_PLATFORM_REVISION
+ARG ANDROID_PLATFORM_ARCHIVE
+ARG ANDROID_PLATFORM_SHA256
 ENV ANDROID_HOME=/opt/android-sdk
 ENV ANDROID_SDK_ROOT=/opt/android-sdk
 ENV ANDROID_NDK_HOME=/opt/android-sdk/ndk/${ANDROID_NDK}
@@ -116,12 +118,25 @@ RUN curl -fsSL --retry 5 -o /tmp/clt.zip \
  && rm /tmp/clt.zip \
  && sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
  && "$sdkmanager" --licenses >/dev/null < <(yes) \
- && "$sdkmanager" "ndk;${ANDROID_NDK}" "build-tools;${ANDROID_BUILD_TOOLS}" \
-      "platforms;android-${ANDROID_PLATFORM}" >/dev/null < <(yes) \
- && rev=$(sed -n 's/^Pkg.Revision *= *//p' "$ANDROID_HOME/platforms/android-${ANDROID_PLATFORM}/source.properties" | tr -d '\r ') \
- && [ "$rev" = "${ANDROID_PLATFORM_REVISION}" ] \
-    || { echo "platforms;android-${ANDROID_PLATFORM} is revision '$rev', pins.env expects ${ANDROID_PLATFORM_REVISION}: Google published a new one (android.jar is a compile input); review and move the pin" >&2; exit 1; } \
+ && "$sdkmanager" "ndk;${ANDROID_NDK}" "build-tools;${ANDROID_BUILD_TOOLS}" >/dev/null < <(yes) \
  && rm -rf /root/.android
+
+# The platform (android.jar is a compile input of the APK and the AAR) by the
+# SHA-256 of its archive, NOT through sdkmanager: sdkmanager takes a platform by
+# API level and installs whatever revision is current, so the day Google
+# publishes another one, an image built from an already-released tag would
+# either differ or, with only a revision check, stop building. The NDK and
+# build-tools above are exact versions, which Google does not republish.
+RUN curl -fsSL --retry 5 -o /tmp/platform.zip \
+      "https://dl.google.com/android/repository/${ANDROID_PLATFORM_ARCHIVE}" \
+ && echo "${ANDROID_PLATFORM_SHA256}  /tmp/platform.zip" | sha256sum -c - \
+ && mkdir -p "$ANDROID_HOME/platforms" \
+ && unzip -q /tmp/platform.zip -d "$ANDROID_HOME/platforms" \
+ && rm /tmp/platform.zip \
+ && props="$ANDROID_HOME/platforms/android-${ANDROID_PLATFORM}/source.properties" \
+ && rev=$(sed -n 's/^Pkg.Revision *= *//p' "$props" | tr -d '\r ') \
+ && { [ "$rev" = "${ANDROID_PLATFORM_REVISION}" ] \
+      || { echo "${ANDROID_PLATFORM_ARCHIVE} unpacked to revision '$rev' at $props, pins.env says ${ANDROID_PLATFORM_REVISION}" >&2; exit 1; }; }
 
 # No `chmod -R a+rX /opt` layer: it would copy every file under /opt into a
 # second layer and double the image. Root's umask 022 already leaves /opt

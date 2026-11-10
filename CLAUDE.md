@@ -199,15 +199,26 @@ Key Gradle modules:
   therefore also moves `JDK_VERSION` / `JDK_BUILD` / `JDK_SHA256` in
   `docker/builder/pins.env`, in the same change; `build.sh` refuses a mismatch
   and the `builder image` workflow fails the PR. It is what a third party
-  rebuilds a release in (`docker/builder/build.sh`, then
-  `docker/builder/run.sh -- scripts/repro/build_linux.sh`) and what
-  `reproducible-builds.yml`'s Linux legs a and b build in. **The release
-  workflows themselves still build on the hosted runner** (`android-apk.yml`,
-  `engine-library.yml`: the same pinned versions, installed by the setup
-  actions); the comparison's leg r builds that way, and `Compare linux image
-  vs release toolchain` is what holds the two to the same Android bytes. Never
-  install or upgrade a tool inside an image build of the artifacts: the image
-  is read-only at run time on purpose.
+  rebuilds a release's ANDROID artifacts in (`docker/builder/build.sh`, then
+  `docker/builder/run.sh -- scripts/repro/build_linux.sh`; `run.sh` gives the
+  build its own HOME, cargo home and Gradle home and none of the caller's
+  environment) and what `reproducible-builds.yml`'s Linux legs a and b build
+  in. **The release workflows themselves still build on the hosted runner**
+  (`android-apk.yml`, `engine-library.yml`: the same pinned versions, installed
+  by the setup actions); the comparison's leg r builds on that toolchain, and
+  `Compare linux image vs runner toolchain` REPORTS whether it and the image
+  give the same bytes. It is not gated (the gate is the owner's), and it is a
+  proxy: the proof that a published artifact is the image's is a comparison
+  with the published assets themselves. **The image is not the builder of the
+  Linux host libraries a release ships**: those come from `ubuntu-22.04`
+  runners on purpose (a glibc 2.35 floor), so their natives jars, the `.deb`
+  and the Node addon are outside what the image reproduces until #734's
+  desktop part pins a builder for them.
+  The image's apt packages are listed in `docker/builder/apt-packages.txt`,
+  which `check.sh` compares with the built image: moving `APT_SNAPSHOT` or the
+  package list moves that file in the same change, and its diff is reviewed
+  like a dependency bump. Never install or upgrade a tool inside an image
+  build of the artifacts: the image is read-only at run time on purpose.
 - **Tuweni 2.7.2** (upstream `io.consensys.tuweni`, Maven Central; original `org.apache.tuweni` packages) — RLP encoding, SECP256K1, byte utilities.
 - **Netty 4.2.x** — NIO-only (no epoll/kqueue). 4-thread `NioEventLoopGroup` for RLPx.
 - **BouncyCastle** — SECP256K1 crypto provider
@@ -443,12 +454,11 @@ the post-merge run on `main`.
 
 **A PR whose merge would make a release build non-reproducible does not merge
 into `main`** (owner ruling, 2026-11-10). "Reproducible" is what
-`reproducible-builds.yml` GATES (#734): the artifact built twice in the
-builder image — two runners, different checkout path, user, `CARGO_HOME`,
-`GRADLE_USER_HOME`, time zone, locale, umask and wall clock — comes out
-bit-for-bit identical, and identical again to a build on the hosted runner's
-toolchain, the way the release workflows build; apart from the entries in
-`scripts/repro/known-differences.txt` (none today).
+`reproducible-builds.yml` GATES (#734): the artifact built twice — two
+runners, different checkout path, `CARGO_HOME`, `GRADLE_USER_HOME`, time zone,
+locale, umask and wall clock, and on Linux, where both builds run in the
+builder image, another user — comes out bit-for-bit identical, apart from the
+entries in `scripts/repro/known-differences.txt` (none today).
 
 **The gate is Android first** (owner's decision, 2026-11-10): the unsigned
 release APK, the debug APK (by payload: its debug-key signature differs by
@@ -474,9 +484,8 @@ owner.
   resources). The workflow runs by itself on a PR that changes it or its
   scripts; for any other PR, dispatch it on the PR's branch (Actions tab, or
   `gh api repos/<owner>/<repo>/actions/workflows/reproducible-builds.yml/dispatches
-  -f ref=<branch>`) and wait for its `Compare` jobs (`Compare linux` and
-  `Compare linux image vs release toolchain` carry the gate). When unsure
-  whether a
+  -f ref=<branch>`) and wait for its `Compare` jobs (`Compare linux` carries the
+  gate). When unsure whether a
   change can reach a release artifact, dispatch it. A PR that touches only
   docs, tests or CI that builds nothing shipped needs no run.
 - **A red comparison is a blocker, like red CI** (a gated artifact differs):

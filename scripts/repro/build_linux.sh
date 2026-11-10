@@ -4,14 +4,21 @@
 #   scripts/repro/build_linux.sh [VERSION]      in the checkout root
 #
 # What reproducible-builds.yml's Linux legs run, inside the builder image
-# (docker/builder/run.sh), and what a third party runs to rebuild a release:
-# the unsigned release APK and the debug APK, the engine library as staged
-# (AAR, jars, natives jars, metadata), the Linux host libraries and Node addon,
-# and the .deb. scripts/repro/collect.sh gathers them afterwards.
+# (docker/builder/run.sh), and what a third party runs to rebuild a release's
+# ANDROID artifacts: the unsigned release APK, the debug APK and the engine
+# library as staged (the AAR and its jars, poms and metadata).
+# scripts/repro/collect.sh gathers them afterwards.
+#
+# It also builds the Linux host libraries, the Node addon, the .deb and a
+# Linux natives jar, which the comparison reports. Those are NOT the release's
+# bytes when built in the image: a release builds its Linux host libraries on
+# ubuntu-22.04 (engine-library.yml, for a glibc 2.35 floor) and stages the
+# natives of four platforms, and jpackage derives the .deb's Depends from the
+# build host's installed libraries.
 #
 # The inputs a release build has, with the defaults a rebuild needs, so that
-# running this on a checkout of a tag gives the release's bytes without any
-# further setup:
+# running this on a checkout of a tag gives the release's Android bytes without
+# any further setup:
 #   SOURCE_DATE_EPOCH  default: the commit time (dpkg-deb clamps the .deb's
 #                      mtimes to it; the wall clock otherwise)
 #   VERSION            the version the engine library is staged at, as
@@ -26,7 +33,7 @@ export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}"
 version=${1:-}
 if [[ -z "$version" && "${GITHUB_REF:-}" == refs/tags/v* ]]; then version=${GITHUB_REF_NAME#v}; fi
 if [[ -z "$version" ]]; then
-    tag=$(git describe --tags --exact-match --match 'v*' 2>/dev/null || true)
+    tag=$(git describe --tags --exact-match --match 'v[0-9]*' 2>/dev/null || true)
     version=${tag#v}
 fi
 flag=-PpublishRelease

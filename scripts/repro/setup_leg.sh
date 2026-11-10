@@ -28,8 +28,8 @@ $windows && tmp=$(cygpath -m "$RUNNER_TEMP")
 
 case "$leg" in
 a|r)
-    # r (Linux only) is the RELEASE's way: the hosted runner's toolchain, as
-    # android-apk.yml and engine-library.yml build today, in the job's checkout.
+    # r (Linux only) builds on the hosted runner's toolchain, as android-apk.yml
+    # and engine-library.yml install it, in the job's checkout.
     src=$(pwd)
     $windows && src=$(cygpath -m "$src")
     tz=UTC lang=C.UTF-8 mask=022

@@ -34,6 +34,25 @@ check "NDK" "$(want ANDROID_NDK)" "$(revision '$ANDROID_NDK_HOME')"
 check "build-tools (the only one)" "$(want ANDROID_BUILD_TOOLS)" "$(in_image 'ls "$ANDROID_HOME/build-tools" | tr "\n" " " | sed "s/ $//"')"
 check "platform (the only one)" "android-$(want ANDROID_PLATFORM)" "$(in_image 'ls "$ANDROID_HOME/platforms" | tr "\n" " " | sed "s/ $//"')"
 check "platform revision" "$(want ANDROID_PLATFORM_REVISION)" "$(revision "\$ANDROID_HOME/platforms/android-$(want ANDROID_PLATFORM)")"
+# What apt INSTALLED, not only where it points: every package and version in
+# the image against the committed list. A package from another state of the
+# archive (the bootstrap fetch runs without TLS verification), or a toolchain
+# package that moved, shows as a diff here; and a red comparison can be traced
+# to gcc, binutils or libc by reading the list's history.
+list="$here/apt-packages.txt"
+actual=$(in_image "dpkg-query -W -f '\${Package}=\${Version}\n' | LC_ALL=C sort")
+if [[ ! -f "$list" ]]; then
+    echo "  FAIL apt packages: $list does not exist. The image has these; review and commit them:"
+    echo "----- BEGIN apt-packages.txt -----"; printf '%s\n' "$actual"; echo "----- END apt-packages.txt -----"
+    fail=1
+elif [[ "$actual" == "$(grep -v '^#' "$list")" ]]; then
+    echo "  ok   apt packages: $(printf '%s\n' "$actual" | wc -l | tr -d ' ') packages match apt-packages.txt"
+else
+    echo "  FAIL apt packages differ from apt-packages.txt (< committed, > image):"
+    diff <(grep -v '^#' "$list") <(printf '%s\n' "$actual") | sed 's/^/    /' || true
+    echo "----- BEGIN apt-packages.txt -----"; printf '%s\n' "$actual"; echo "----- END apt-packages.txt -----"
+    fail=1
+fi
 check "apt sources (the only ones)" "https://snapshot.ubuntu.com/ubuntu/$(want APT_SNAPSHOT)" \
     "$(in_image 'cat /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null | sed -n "s/^URIs: //p; s/^deb [^ ]* \([^ ]*\).*/\1/p" | sort -u | tr "\n" " " | sed "s/ $//"')"
 check "en_US.UTF-8 locale" "en_US.utf8" "$(in_image 'locale -a | grep -ix "en_US.utf8"')"
