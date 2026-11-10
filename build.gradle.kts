@@ -398,6 +398,7 @@ subprojects {
     //   myotis-engine-ios → kotlin-multiplatform (the engine library's iOS cinterop)
     //   jsonrpc-server → kotlin-multiplatform (JVM hosts + the iOS RPC listener)
     //   myotis-rpc-policy → kotlin-multiplatform (the serving policy those share)
+    //   myotis-logindex-presets → kotlin-multiplatform (the log index's predefined contracts)
     //   myotis-engine  → kotlin-multiplatform + com.android.library (the engine library: AAR + desktop jar)
     // Excludes shared by EVERY module (Android plugin modules included):
     // - native Netty transports, for Android compatibility;
@@ -421,7 +422,7 @@ subprojects {
         exclude(group = "org.apache.logging.log4j", module = "log4j-core")
     }
 
-    if (name in setOf("android-app", "ui", "app-desktop", "app-ios", "jsonrpc-server", "myotis-rpc-policy", "myotis-engine", "myotis-engine-ios")) {
+    if (name in setOf("android-app", "ui", "app-desktop", "app-ios", "jsonrpc-server", "myotis-rpc-policy", "myotis-logindex-presets", "myotis-engine", "myotis-engine-ios")) {
         return@subprojects
     }
 
@@ -518,6 +519,7 @@ val publishedArtifactIds = mapOf(
     "myotis-engine-common" to "myotis-engine-common",
     "myotis-engine-ports" to "myotis-engine-ports",
     "myotis-rpc-policy" to "myotis-rpc-policy",
+    "myotis-logindex-presets" to "myotis-logindex-presets",
     "myotis-engine-rust" to "myotis-engine-rust",
     "myotis-engine" to "myotis-engine",
     // One artifact per desktop platform (myotis-engine-natives-<jna-prefix>); the
@@ -532,6 +534,7 @@ val publishedDescriptions = mapOf(
     "myotis-engine-common" to "The lifecycle primitives the Myotis engine handles wire (WakeGate, SleepMetrics)",
     "myotis-engine-ports" to "The Myotis engine library's default port actuals: node-key file, file-backed peer caches, HttpURLConnection CCIP gateway",
     "myotis-rpc-policy" to "The JSON-RPC serving policy (block window, web-page access) with no server attached",
+    "myotis-logindex-presets" to "The log index's predefined contracts (RAILGUN, Swarm, Privacy Pools, Tornado Cash), their download and disk estimates and the config push that starts them",
     "myotis-engine-rust" to "The Myotis Rust engine behind the engine contract, over UniFFI bindings and JNA",
     "myotis-engine" to "The Myotis engine library: the Rust light-client engine for Android (AAR) and desktop JVM (jar)",
     "myotis-engine-natives" to "The Myotis Rust engine's host library for one desktop platform, at JNA's classpath path",
@@ -561,7 +564,7 @@ configure(subprojects.filter { it.name in publishedArtifactIds }) {
     // modules need theirs created. `java` is applied by the
     // subprojects block above, so the component exists here; `java-library` in
     // the module's own script extends the same component with `api`.
-    if (name !in setOf("myotis-rpc-policy", "myotis-engine", "myotis-engine-natives", "myotis-engine-ios")) {
+    if (name !in setOf("myotis-rpc-policy", "myotis-logindex-presets", "myotis-engine", "myotis-engine-natives", "myotis-engine-ios")) {
         extensions.configure<JavaPluginExtension> { withSourcesJar() }
         extensions.configure<PublishingExtension> {
             publications.create<MavenPublication>("maven") {

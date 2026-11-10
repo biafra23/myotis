@@ -288,6 +288,11 @@ object LogIndexWatch {
      * push hands it to [delivered]. A null push carries none — the Index tab
      * makes sure a removal that has to reach the engine is not stuck behind
      * one (it records the engine's own state as this host's settings first).
+     *
+     * [allowMetered] lets the backfill walk run on a metered network (engine
+     * ABI ≥ 56; [Settings.logIndexAllowMetered]). It is written only when true:
+     * the engine reads an absent key as false — "unmetered only", the default —
+     * so a host that never allows it pushes the exact JSON it always did.
      */
     @JvmStatic
     @JvmOverloads
@@ -297,6 +302,7 @@ object LogIndexWatch {
         maxSpeed: Boolean = false,
         configured: Boolean = false,
         backfillPaused: Boolean = false,
+        allowMetered: Boolean = false,
     ): String? {
         if (!enabled && !configured) return null
         val entries = parse(watchJson)
@@ -308,7 +314,8 @@ object LogIndexWatch {
         val unwatch = unwatched(watchJson).takeIf { it.isNotEmpty() }
             ?.joinToString(",", ""","unwatch":[""", "]") { "\"$it\"" }
             .orEmpty()
-        return """{"enabled":$enabled,"maxSpeed":$maxSpeed,"backfillPaused":$backfillPaused,"watch":[$watch]$unwatch}"""
+        val metered = if (allowMetered) ""","allowMetered":true""" else ""
+        return """{"enabled":$enabled,"maxSpeed":$maxSpeed,"backfillPaused":$backfillPaused$metered,"watch":[$watch]$unwatch}"""
     }
 
     /**

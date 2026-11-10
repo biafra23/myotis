@@ -561,6 +561,15 @@ interface Settings {
     fun logIndexBackfillPaused(network: String): Boolean = false
     fun setLogIndexBackfillPaused(network: String, on: Boolean) {}
 
+    /** Whether the log index's backfill walk may download on a METERED network
+     *  (mobile data, a hotspot), per network. False — "unmetered only" — is the
+     *  default: the walk is the index's one bulk download (a mainnet protocol's
+     *  history is hundreds of GB), and the engine holds it while the host reports
+     *  a metered network unless this is on. Head-follow runs either way. Pushed
+     *  as the config's `allowMetered` (engine ABI ≥ 56). Defaults keep hosts compiling. */
+    fun logIndexAllowMetered(network: String): Boolean = false
+    fun setLogIndexAllowMetered(network: String, on: Boolean) {}
+
     /**
      * Whether this host persists the balance watch's list and state AND checks them
      * ([NodeController.checkWatched], its own schedule) — the Watch tab shows only then:

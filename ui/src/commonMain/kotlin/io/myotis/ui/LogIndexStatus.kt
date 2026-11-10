@@ -60,6 +60,12 @@ object LogIndexStatus {
         val backfillPaused: Boolean = false,
         /** The pacing bit as the engine holds it (`maxSpeed` in its status). */
         val maxSpeed: Boolean = false,
+        /** Whether the walk may download on a metered network (`allowMetered`, engine ABI ≥ 56). */
+        val allowMetered: Boolean = false,
+        /** True while the engine holds the walk because the device's network is
+         *  metered and [allowMetered] is off (`meteredHold`). Like a pause, the
+         *  remaining count is then a standing distance, not progress. */
+        val meteredHold: Boolean = false,
     )
 
     /**
@@ -114,7 +120,12 @@ object LogIndexStatus {
         val eta = Regex("\"etaSeconds\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
         val headGap = Regex("\"headGap\":(\\d+)").find(json)?.groupValues?.get(1)?.toLongOrNull()
         val maxSpeed = json.contains("\"maxSpeed\":true")
-        return Parsed(enabled, logCount, entries, targetLow, remaining, bps, eta, headGap, backfillPaused, maxSpeed)
+        val allowMetered = json.contains("\"allowMetered\":true")
+        val meteredHold = json.contains("\"meteredHold\":true")
+        return Parsed(
+            enabled, logCount, entries, targetLow, remaining, bps, eta, headGap, backfillPaused, maxSpeed,
+            allowMetered, meteredHold,
+        )
     }
 
     /** The head-side line: while coverage trails the head `latest` resolves
@@ -205,6 +216,14 @@ object LogIndexStatus {
             val head = headLine(p)
             val base = "backfill paused — ${grouped(remaining)} blocks below the covered range " +
                 "stay unindexed and queries there are refused"
+            return if (head != null) "$base; $head" else base
+        }
+        // Held for the metered network: waiting, not walking — and it resumes on
+        // its own once the device is on Wi-Fi (or metered downloads are allowed).
+        if (p.meteredHold) {
+            val head = headLine(p)
+            val base = "backfill waiting for an unmetered network — ${grouped(remaining)} blocks " +
+                "to go; it continues on Wi-Fi, or allow downloads on metered connections"
             return if (head != null) "$base; $head" else base
         }
         val eta = p.etaSeconds
