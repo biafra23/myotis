@@ -747,8 +747,8 @@ compose.desktop {
 
 // === Reproducible app image (#734, Part 5a) ==================================
 // Every installer (dmg, deb, msi) is jpackage'd from createDistributable's app
-// image (the Compose plugin sets each package task's appImage from it), and that
-// image was not reproducible:
+// image (the plugin wires the dmg to it; the deb and the msi are wired below),
+// and that image was not reproducible:
 //   - The plugin REWRITES jars into it: the skiko runtime jar on every OS (to
 //     take its native library out) and, on macOS, every jar (to sign the native
 //     libraries inside). Its copyZipEntry builds each entry as
@@ -848,6 +848,18 @@ tasks.withType<org.jetbrains.compose.desktop.application.tasks.AbstractJPackageT
     if (targetFormat == TargetFormat.AppImage) {
         val mac = isMacHost
         doLast { normalizeAppImage(destinationDir.get().asFile, mac, logger) }
+    }
+    // The plugin packages the dmg from that image, but the deb and the msi from
+    // scratch (`--input`, its own working dir), rewriting the skiko jar again:
+    // the plugin sets appImage only for macOS. Point them at the normalized
+    // image too, so every installer carries the same, reproducible payload
+    // (jpackage builds a deb or an msi from an app image like a dmg).
+    if (targetFormat == TargetFormat.Deb || targetFormat == TargetFormat.Msi) {
+        val image = tasks.named<org.jetbrains.compose.desktop.application.tasks.AbstractJPackageTask>(
+            if (name.contains("Release")) "createReleaseDistributable" else "createDistributable",
+        )
+        dependsOn(image)
+        appImage.set(image.flatMap { it.destinationDir.dir(appName) })
     }
 }
 
