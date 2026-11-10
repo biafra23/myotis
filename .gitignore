@@ -36,6 +36,11 @@ nodekey.hex
 nodekey-*.hex
 app/peers.cache
 *.cache
+# Go engine: runtime data dirs (nodekey = the secp256k1 secret + enode leveldb)
+# and the binary a plain `go build ./cmd/myotis-go` drops next to it.
+/go/data/
+/go/myotis-go-data/
+/go/myotis-go
 # Persisted light-client sync snapshots (per-network runtime state) + their .roots accumulators
 *.snapshot
 *.snapshot.roots

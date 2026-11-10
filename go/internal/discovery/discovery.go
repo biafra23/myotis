@@ -3,9 +3,17 @@
 // geth's) seeded with the pinned bootnodes, plus the EIP-1459 DNS tree as a
 // discovery-independent candidate source (docs/spec/02 §2 and §4).
 //
-// Like the rest of the engine this is a dialer only — candidates are reported
-// upward for the (later) RLPx layer to dial; nothing here accepts inbound
-// connections.
+// The engine never accepts inbound TCP — candidates are reported upward for
+// the (later) RLPx layer to dial. One deliberate departure from the spec's
+// "client/dialer only" note (§2.3: the references do not respond to FindNode):
+// reusing geth's discover.ListenV4 means this node DOES answer FINDNODE from
+// bonded peers out of its table, and it advertises its UDP port so peers keep
+// it in their tables. ListenV4 has no responder-side switch, and being a
+// well-connected DHT participant is what makes our own lookups return good
+// sets; the cost is inbound UDP discv4 traffic. The Rust twin is stricter
+// (it never answers FindNode, though since #539 it does answer ENRRequest).
+// No fork-id filtering of candidates here yet — the (later) RLPx layer
+// rejects foreign chains at eth Status, like enrfilter.rs does upstream.
 package discovery
 
 import (
@@ -28,9 +36,26 @@ import (
 type Source string
 
 const (
+	// SourceDiscv4 is a routing-table node that passed a revalidation ping —
+	// the only liveness-proven source.
 	SourceDiscv4 Source = "discv4"
+	// SourceLookup is a node surfaced by an iterative lookup (geth's
+	// RandomNodes feed): seen in a Neighbors response, not pinged yet. This
+	// is also the pump that keeps geth's lookups running.
+	SourceLookup Source = "discv4-lookup"
 	SourceDNS    Source = "dns"
 )
+
+// sourceRank orders sources for endpoint precedence: a liveness-proven
+// endpoint must never be replaced by a later unproven sample of the same
+// node (the DNS tree lags; every source re-delivers what it already
+// delivered). Same rank: last writer wins among unproven sources.
+func sourceRank(src Source) int {
+	if src == SourceDiscv4 {
+		return 2
+	}
+	return 1
+}
 
 // Candidate is one discovered peer with a dialable TCP endpoint.
 type Candidate struct {
@@ -67,10 +92,11 @@ type Service struct {
 
 	mu         sync.Mutex
 	candidates map[enode.ID]Candidate
-	// dnsIt is the live DNS-tree iterator, if any. Close() must call its
-	// Close: geth's randomIterator.Next() blocks inside the iterator and
-	// only returns false once the iterator itself is closed.
-	dnsIt enode.Iterator
+	// dnsIt / lookupIt are the live blocking iterators, if any. Close() must
+	// call their Close: both iterators' Next() block inside the iterator and
+	// only return false once the iterator itself is closed.
+	dnsIt    enode.Iterator
+	lookupIt enode.Iterator
 
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -142,8 +168,9 @@ func Start(cfg Config) (*Service, error) {
 		candidates: make(map[enode.ID]Candidate),
 		stop:       make(chan struct{}),
 	}
-	s.done.Add(2)
+	s.done.Add(3)
 	go s.watchTable()
+	go s.pumpLookups()
 	go s.walkDNSTree()
 	s.log.Info("discovery started",
 		"enr", tab.Self().String(),
@@ -157,10 +184,13 @@ func Start(cfg Config) (*Service, error) {
 func (s *Service) Close() {
 	s.stopOnce.Do(func() {
 		close(s.stop)
-		// Release a walkDNSTree stuck inside the iterator's blocking Next().
+		// Release pumps stuck inside a blocking iterator Next().
 		s.mu.Lock()
 		if s.dnsIt != nil {
 			s.dnsIt.Close()
+		}
+		if s.lookupIt != nil {
+			s.lookupIt.Close()
 		}
 		s.mu.Unlock()
 		s.done.Wait()
@@ -197,18 +227,19 @@ func (s *Service) snapshot() []Candidate {
 }
 
 // addCandidate records a peer with a dialable TCP endpoint (the RLPx layer
-// can only dial those). A known peer whose ENR moved (the DNS tree lags and
-// carries stale endpoints; discv4 proves the live one) replaces the stored
-// record and re-fires OnDiscovered.
-func (s *Service) addCandidate(src Source, n *enode.Node) {
+// can only dial those) and reports whether the pool changed. A known peer
+// whose ENR moved is replaced — and OnDiscovered re-fired — only by a source
+// at least as trustworthy as the one holding the record (see sourceRank), so
+// a late DNS sample can never overwrite an endpoint discv4 proved.
+func (s *Service) addCandidate(src Source, n *enode.Node) bool {
 	if n.TCP() == 0 || n.IP() == nil || n.IP().IsUnspecified() {
-		return
+		return false
 	}
 	c, fire := func() (Candidate, bool) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		old, known := s.candidates[n.ID()]
-		if known && endpointOf(old.Node) == endpointOf(n) {
+		if known && (endpointOf(old.Node) == endpointOf(n) || sourceRank(src) < sourceRank(old.Source)) {
 			return Candidate{}, false
 		}
 		c := Candidate{
@@ -226,6 +257,7 @@ func (s *Service) addCandidate(src Source, n *enode.Node) {
 	if fire && s.cfg.OnDiscovered != nil {
 		s.cfg.OnDiscovered(c)
 	}
+	return fire
 }
 
 func endpointOf(n *enode.Node) string {
@@ -253,17 +285,45 @@ func (s *Service) watchTable() {
 	}
 }
 
-// walkDNSTree streams the EIP-1459 list into the candidate pool (geth's
-// dnsdisc client verifies the tree root signature against the key in the URL).
-// NewIterator returns a randomIterator, which is a continuous sampler, not a
-// one-shot walk: it delivers randomly sampled leaves (duplicates included —
-// addCandidate dedups by node id) at the client's rate limit, re-syncing the
-// tree itself, and returns false only after Close(). Close() unblocks it via
-// the iterator stored on the service; the outer loop only restarts after a
-// failed start or an unexpected end.
+// pumpLookups consumes geth's RandomNodes feed — the dialer-grade discv4
+// source and, like geth's own dialer, the thing that keeps iterative lookups
+// running (the table alone only self-refreshes every ~RefreshInterval and
+// caps at ~one table's worth). Nodes here come from Neighbors responses and
+// are not yet pinged; watchTable upgrades them once a revalidation pong
+// proves liveness.
+func (s *Service) pumpLookups() {
+	defer s.done.Done()
+	it := s.tab.RandomNodes()
+	if s.registerIt(&s.lookupIt, it) {
+		it.Close()
+		return
+	}
+	defer func() {
+		s.clearIt(&s.lookupIt, it)
+		it.Close()
+	}()
+	for it.Next() {
+		s.addCandidate(SourceLookup, it.Node())
+	}
+}
+
+// DNS-tree walk policy. geth's randomIterator is a continuous sampler, not a
+// one-shot walk — sampled forever it is a permanent ~3/s background of DNS
+// TXT queries long after every leaf is known. So the walk is bounded, like
+// the references (docs/spec/02 §4): sample until a full sweep produced no
+// new candidate (dnsIdleNoNew tells a sweep is over — at the client's rate
+// limit, a quiet window covers a full pass of the EF list), then idle and
+// re-walk only periodically, and only while the tree keeps offering new
+// nodes. This engine has no Tor mode yet; when it lands, the DNS walk must
+// go off under Tor like it does in the Rust engine.
+const (
+	dnsIdleNoNew   = 5 * time.Minute  // quiet window that counts a sweep as done
+	dnsRewalkEvery = 30 * time.Minute // idle period between re-walks
+	dnsRetryAfter  = time.Minute      // retry after a failed iterator start
+)
+
 func (s *Service) walkDNSTree() {
 	defer s.done.Done()
-	const backoff = time.Minute
 	for {
 		select {
 		case <-s.stop:
@@ -274,37 +334,59 @@ func (s *Service) walkDNSTree() {
 		cl := dnsdisc.NewClient(dnsdisc.Config{})
 		it, err := cl.NewIterator(s.cfg.Network.ENRTreeURL)
 		if err != nil {
-			s.log.Warn("dns tree walk failed to start", "err", err, "retryIn", backoff)
-			if !s.sleep(backoff) {
+			s.log.Warn("dns tree walk failed to start", "err", err, "retryIn", dnsRetryAfter)
+			if !s.sleep(dnsRetryAfter) {
 				return
 			}
 			continue
 		}
-
-		s.mu.Lock()
-		s.dnsIt = it
-		stopping := isClosed(s.stop)
-		s.mu.Unlock()
-		if stopping {
+		if s.registerIt(&s.dnsIt, it) {
 			// Close() already ran its iterator hook against the previous nil;
 			// release this one ourselves.
 			it.Close()
 			return
 		}
 
+		sampled, fresh := 0, 0
+		lastNew := time.Now()
 		for it.Next() {
-			s.addCandidate(SourceDNS, it.Node())
+			sampled++
+			if s.addCandidate(SourceDNS, it.Node()) {
+				fresh++
+				lastNew = time.Now()
+			} else if time.Since(lastNew) > dnsIdleNoNew {
+				break // a full sweep delivered nothing new: walk done
+			}
 		}
-		s.mu.Lock()
-		if s.dnsIt == it {
-			s.dnsIt = nil
-		}
-		s.mu.Unlock()
-		it.Close() // idempotent; unblocks nothing if Next already returned
+		s.clearIt(&s.dnsIt, it)
+		it.Close()
+		s.log.Info("dns tree sweep finished", "sampled", sampled, "newCandidates", fresh)
 
-		if !s.sleep(backoff) {
+		retry := dnsRewalkEvery
+		if fresh > 0 && sampled >= fresh {
+			retry = dnsRetryAfter // the iterator ended early while the tree still fed us new nodes
+		}
+		if !s.sleep(retry) {
 			return
 		}
+	}
+}
+
+// registerIt stores it as the service's live iterator and reports whether the
+// service is already stopping (the caller must then Close it itself — Close()
+// may already have looked at a nil field).
+func (s *Service) registerIt(field *enode.Iterator, it enode.Iterator) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	*field = it
+	return isClosed(s.stop)
+}
+
+func (s *Service) clearIt(field *enode.Iterator, it enode.Iterator) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if *field == it {
+		*field = nil
 	}
 }
 

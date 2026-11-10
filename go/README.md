@@ -11,8 +11,13 @@ Scope, deliberately small (owner's brief, 2026-11-10):
   `ElConfig::mainnet` and geth's `params/bootnodes.go` (the pin test fails on a
   partial re-sync);
 - **no EVM** — snap state + verification only, no local execution;
-- **client/dialer only** — discovery dials and reads, never serves
-  (docs/spec/02-execution-networking.md §Scope note).
+- **client/dialer only** for TCP — the engine dials, never accepts. One
+  deliberate exception on the UDP side: reusing geth's discv4 node means we
+  *do* answer FINDNODE from bonded peers (the references deliberately
+  don't — `docs/spec/02-execution-networking.md` §2.3); `ListenV4` has no
+  switch for the responder half, and being a good DHT citizen makes our own
+  lookups return better sets. Decision, not accident — see the
+  `internal/discovery` package doc.
 
 Build blocks: the heavy, settled plumbing comes from go-ethereum (RLP, RLPx,
 discv4, EIP-1459, secp256k1, and the range-proof verifier for the snap part);

@@ -1,6 +1,32 @@
 package chain
 
-import "testing"
+import (
+	"bufio"
+	"encoding/hex"
+	"net"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+// seedEndpoint formats a seed node the way the engines' pin tests compare
+// them: the discv4 endpoint — "ip:udp", falling back to TCP — because that is
+// what discv4 pings and what the Rust ElConfig::mainnet comment pins ("each
+// record's ip and udp fields").
+func seedEndpoint(t *testing.T, raw string) string {
+	t.Helper()
+	n, err := ParseBootnode(raw)
+	if err != nil {
+		t.Fatalf("bootnode %q: %v", raw, err)
+	}
+	port := n.UDP()
+	if port == 0 {
+		port = n.TCP()
+	}
+	return net.JoinHostPort(n.IP().String(), strconv.Itoa(port))
+}
 
 // TestMainnetPins pins the mainnet constants as strings, the way the Rust
 // engine's mainnet_config_pins_known_values and the Java
@@ -16,9 +42,6 @@ func TestMainnetPins(t *testing.T) {
 	}
 	if got := m.GenesisHash.Hex(); got != "0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3" {
 		t.Errorf("GenesisHash = %s", got)
-	}
-	if m.ForkIDHash != [4]byte{0x07, 0xc9, 0x46, 0x2e} || m.ForkNext != 0 {
-		t.Errorf("fork id = %x/%d, want 07c9462e/0", m.ForkIDHash, m.ForkNext)
 	}
 	const wantTree = "enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE@all.mainnet.ethdisco.net"
 	if m.ENRTreeURL != wantTree {
@@ -40,11 +63,7 @@ func TestMainnetPins(t *testing.T) {
 		t.Fatalf("got %d bootnodes, want %d", len(m.Bootnodes), len(want))
 	}
 	for i, raw := range m.Bootnodes {
-		n, err := ParseBootnode(raw)
-		if err != nil {
-			t.Fatalf("bootnode %d (%s): %v", i, raw, err)
-		}
-		if got := SeedEndpoint(n); got != want[i] {
+		if got := seedEndpoint(t, raw); got != want[i] {
 			t.Errorf("bootnode %d endpoint = %s, want %s", i, got, want[i])
 		}
 	}
@@ -63,8 +82,73 @@ func TestParseBootnodeIdentities(t *testing.T) {
 		}
 		id := n.ID().String()
 		if id == "" || seen[id] {
-			t.Errorf("duplicate or empty node id for %s: %q", SeedEndpoint(n), id)
+			t.Errorf("duplicate or empty node id for %s: %q", seedEndpoint(t, raw), id)
 		}
 		seen[id] = true
+	}
+}
+
+// corpusKeys reads the shared EL conformance corpus — the same key=value file
+// that forces the Rust and Java engine pins together — from the repo root
+// relative to this package.
+func corpusKeys(t *testing.T) map[string]string {
+	t.Helper()
+	path := filepath.FromSlash("../../../rust/testdata/el/core/expected.txt")
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open corpus %s: %v", path, err)
+	}
+	defer f.Close()
+	keys := map[string]string{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		if k, v, ok := strings.Cut(sc.Text(), "="); ok {
+			keys[k] = v
+		}
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return keys
+}
+
+// TestMainnetForkIDMatchesCorpus binds the pinned fork id to the corpus
+// instead of a second copy of itself: when mainnet's fork schedule moves, the
+// corpus moves (it forces Rust and Java) and this test goes red with it,
+// instead of the Go engine quietly announcing a superseded fork id and being
+// disconnected by every peer.
+func TestMainnetForkIDMatchesCorpus(t *testing.T) {
+	m := Mainnet()
+	keys := corpusKeys(t)
+
+	wantHash, ok := keys["forkid.mainnet"]
+	if !ok {
+		t.Fatal("corpus has no forkid.mainnet key")
+	}
+	wantBytes, err := hex.DecodeString(wantHash)
+	if err != nil || len(wantBytes) != 4 {
+		t.Fatalf("corpus forkid.mainnet = %q, want 8 hex chars", wantHash)
+	}
+	if m.ForkIDHash != ([4]byte)(wantBytes) {
+		t.Errorf("ForkIDHash = %x, corpus says %s", m.ForkIDHash, wantHash)
+	}
+	if wantNext, ok := keys["forkid.forkNext.mainnet"]; !ok || wantNext != "0" || m.ForkNext != 0 {
+		t.Errorf("ForkNext = %d, corpus says %q", m.ForkNext, wantNext)
+	}
+}
+
+// TestMainnetForkIDNotSuperseded is the forward tripwire: the corpus records
+// the NEXT scheduled fork (forkid.afterNext.mainnet); "none" means the pinned
+// id is current. The day a fork gets scheduled on mainnet, this test fails in
+// the Go engine too, telling the author to move the pin (real CRC32 fork-id
+// computation would retire it).
+func TestMainnetForkIDNotSuperseded(t *testing.T) {
+	keys := corpusKeys(t)
+	after, ok := keys["forkid.afterNext.mainnet"]
+	if !ok {
+		t.Fatal("corpus has no forkid.afterNext.mainnet key")
+	}
+	if after != "none" {
+		t.Errorf("mainnet has a fork scheduled (next fork id %s); the pinned ForkIDHash/ForkNext in chain.go must move", after)
 	}
 }

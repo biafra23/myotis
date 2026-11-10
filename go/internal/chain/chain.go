@@ -2,20 +2,17 @@
 // definition per network. Mainnet only for now.
 //
 // The constants mirror the Rust engine's ElConfig::mainnet
-// (rust/myotis-net/src/el/reader.rs) and geth's params/bootnodes.go; the pin
-// test keeps the three in lockstep the way the repo's twin tests do elsewhere.
+// (rust/myotis-net/src/el/reader.rs) and geth's params/bootnodes.go. The pin
+// test binds the fork id to the shared conformance corpus
+// (rust/testdata/el/core/expected.txt, which forces Rust and Java together),
+// pins the bootnode endpoints as strings, and trips when the corpus
+// schedules the next fork; the bootnodes also carry a CLAUDE.md release
+// checklist entry.
 package chain
 
 import (
-	"encoding/base64"
-	"fmt"
-	"net"
-	"strings"
-
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/p2p/enode"
-	"github.com/ethereum/go-ethereum/p2p/enr"
-	"github.com/ethereum/go-ethereum/rlp"
 )
 
 // Network is one chain's pinned configuration.
@@ -44,8 +41,10 @@ func Mainnet() *Network {
 		Name:        "mainnet",
 		NetworkID:   1,
 		GenesisHash: common.HexToHash("0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3"),
-		// Pinned 2026-11 from the Rust engine's ElConfig::mainnet; valid for
-		// every fork from [07c9462e]'s first block until the next fork block.
+		// Matches the corpus keys forkid.mainnet / forkid.forkNext.mainnet;
+		// TestMainnetPins fails if the corpus moves or schedules a next fork
+		// (TestMainnetForkIDNotSuperseded), which is when this pin must be
+		// updated — peers validate our fork id and drop mismatches.
 		ForkIDHash: [4]byte{0x07, 0xc9, 0x46, 0x2e},
 		ForkNext:   0,
 		// go-ethereum params/bootnodes.go MainnetBootnodes as of 2026-11-10
@@ -71,38 +70,8 @@ func Mainnet() *Network {
 	}
 }
 
-// ParseBootnode turns one Bootnodes entry ("enr:…" or "enode://…") into a node.
+// ParseBootnode turns one Bootnodes entry ("enr:…" or "enode://…") into a
+// node, deriving the id from the record's secp256k1 key.
 func ParseBootnode(raw string) (*enode.Node, error) {
-	if rest, ok := strings.CutPrefix(raw, "enr:"); ok {
-		rawRec, err := base64.RawURLEncoding.DecodeString(rest)
-		if err != nil {
-			return nil, fmt.Errorf("decode ENR %q: %w", raw, err)
-		}
-		var rec enr.Record
-		if err := rlp.DecodeBytes(rawRec, &rec); err != nil {
-			return nil, fmt.Errorf("decode ENR %q: %w", raw, err)
-		}
-		n, err := enode.New(enode.V4ID{}, &rec)
-		if err != nil {
-			return nil, fmt.Errorf("build node from ENR %q: %w", raw, err)
-		}
-		return n, nil
-	}
-	n, err := enode.ParseV4(raw)
-	if err != nil {
-		return nil, fmt.Errorf("parse bootnode %q: %w", raw, err)
-	}
-	return n, nil
-}
-
-// SeedEndpoint formats a seed node the way the engines' pin tests compare
-// them: "ip:port" where the port is the TCP one when the record names it, and
-// the UDP one otherwise (discv4 pings the UDP port; the NodeOps records carry
-// no TCP port at all).
-func SeedEndpoint(n *enode.Node) string {
-	port := n.TCP()
-	if port == 0 {
-		port = n.UDP()
-	}
-	return net.JoinHostPort(n.IP().String(), fmt.Sprint(port))
+	return enode.Parse(enode.ValidSchemes, raw)
 }

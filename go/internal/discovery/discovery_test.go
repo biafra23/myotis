@@ -87,6 +87,44 @@ func TestAddCandidateUpdatesMovedEndpoint(t *testing.T) {
 	}
 }
 
+// The reviewer's flap scenario: DNS (lagging) and the discv4 table (live
+// proof) both re-deliver their copy of the same node forever. The proven
+// endpoint must win permanently — the stale DNS sample must never overwrite
+// it or re-fire.
+func TestProvenEndpointSurvivesStaleDNSResampling(t *testing.T) {
+	var mu sync.Mutex
+	var fired []Candidate
+	s := &Service{
+		log:        slog.New(slog.DiscardHandler),
+		candidates: map[enode.ID]Candidate{},
+		cfg:        Config{OnDiscovered: func(c Candidate) { mu.Lock(); fired = append(fired, c); mu.Unlock() }},
+	}
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := enode.NewV4(&key.PublicKey, net.ParseIP("203.0.113.1"), 30303, 30303)
+	live := enode.NewV4(&key.PublicKey, net.ParseIP("203.0.113.2"), 30304, 30304)
+
+	s.addCandidate(SourceDNS, stale)
+	s.addCandidate(SourceDiscv4, live) // proven upgrade, fires
+	for range 5 {
+		s.addCandidate(SourceDNS, stale)   // stale sampler round: must not overwrite
+		s.addCandidate(SourceDiscv4, live) // table tick: unchanged, silent
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(fired) != 2 {
+		t.Fatalf("OnDiscovered fired %d times, want 2 (one update, then stable)", len(fired))
+	}
+	c := s.candidates[live.ID()]
+	if c.Source != SourceDiscv4 || c.Node.TCP() != 30304 {
+		t.Errorf("stored candidate = %s %s, want discv4 proven endpoint", c.Source, c.Node.IP())
+	}
+}
+
 func TestCandidateDialEndpoint(t *testing.T) {
 	n := node(t, "203.0.113.9", 30304, 30303)
 	addr := net.JoinHostPort(n.IP().String(), strconv.Itoa(n.TCP()))

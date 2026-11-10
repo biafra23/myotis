@@ -1,8 +1,12 @@
 name: Go engine
 
 on:
-  # Push scope mirrors ci.yml's convention (main + the Go feature branch); the
-  # path filter keeps Gradle/Rust work from paying for this job and vice versa.
+  # Unlike ci.yml (push to main + tags only, to avoid double-building a branch
+  # that has an open PR), this workflow also builds pushes to the Go feature
+  # branch directly: there are no Gradle-heavy costs to duplicate here, and
+  # the branch gains its branch-protection signal before part PRs open.
+  # The path filter keeps Gradle/Rust work from paying for this job and vice
+  # versa.
   push:
     branches: [ "main", "feature/go-engine" ]
     paths:
@@ -18,7 +22,9 @@ on:
 
 jobs:
   build:
-    name: Build and Test
+    # Distinct from ci.yml's "Build and Test" — required-check matching is by
+    # name, and this job is path-filtered so it is absent on most PRs.
+    name: Go build and test
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -52,4 +58,6 @@ jobs:
 
       - name: Test
         working-directory: go
-        run: go test ./...
+        # -race: the discovery package is goroutines + mutexes + a
+        # close/iterator handshake; keep the race detector on it.
+        run: go test -race ./...
