@@ -861,6 +861,44 @@ tasks.withType<org.jetbrains.compose.desktop.application.tasks.AbstractJPackageT
         dependsOn(image)
         appImage.set(image.flatMap { it.destinationDir.dir(appName) })
     }
+    // What the plugin leaves out with an app image, and the deb needs: --icon.
+    // jpackage writes the launcher's .desktop file (and with it the xdg-utils
+    // dependency and the menu registration in postinst) only for a launcher
+    // with an icon of its own or an explicit shortcut, and the plugin passes
+    // --icon only when it builds from scratch. Without this line the deb
+    // installs an app no application menu lists; with it, its contents are
+    // those of the from-scratch deb. (The msi takes its icons from the .ico
+    // files in the image, and its shortcuts from options the plugin passes in
+    // both cases.) Quoted like the plugin's own arguments: they go through an
+    // @argfile.
+    if (targetFormat == TargetFormat.Deb) {
+        freeArgs.addAll(iconFile.map { listOf("--icon", "\"${it.asFile.absolutePath}\"") })
+    }
+    // The umask is an input of the dmg, so it is checked, not assumed: jpackage
+    // creates the .app's directories and its app/.package afresh for the dmg,
+    // with the umask of the process that runs it (775 and 664 under 002), and
+    // nothing can put them right inside the finished image. Probed here, in the
+    // JVM that starts jpackage: a daemon keeps the umask it was started with,
+    // whatever the shell that calls it says. Every other task's output is
+    // normalized or carries no modes, so this is the one place the umask shows.
+    if (targetFormat == TargetFormat.Dmg) {
+        doFirst {
+            val probe = temporaryDir.resolve("umask-probe").toPath()
+            Files.deleteIfExists(probe)
+            Files.createDirectory(probe)
+            val mode = PosixFilePermissions.toString(
+                Files.getPosixFilePermissions(probe),
+            )
+            Files.delete(probe)
+            if (mode != "rwxr-xr-x") {
+                throw GradleException(
+                    "$path needs umask 022: jpackage creates the dmg's directories with the umask " +
+                        "of this Gradle process, which creates them $mode. Run `umask 022` first " +
+                        "(and stop a Gradle daemon started under another umask: ./gradlew --stop).",
+                )
+            }
+        }
+    }
 }
 
 // Dev runs load the Rust engine lib via an ABSOLUTE path (-Dmyotis.engine.lib), set

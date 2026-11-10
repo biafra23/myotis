@@ -12,7 +12,12 @@
 #     (docker/builder/), leg b as another uid with another home;
 #   - the time zone (UTC vs. Asia/Kathmandu, +05:45: a local-time stamp shows),
 #     the locale and the umask (022 vs. 002; Windows has no umask, and its leg
-#     b sets the system time zone instead of TZ);
+#     b sets the system time zone instead of TZ). One step is exempt from the
+#     umask: jpackage's dmg takes its directory modes from the umask of the
+#     process and nothing can normalize them afterwards, so the dmg is DEFINED
+#     as packaged under 022 (the build refuses another), and both macOS legs
+#     run that one task under it. Everything the dmg takes in is still built
+#     under the leg's own umask;
 #   - the wall clock: the two jobs start, build and finish at different times.
 # On macOS and Windows the user is not varied: there the toolchains are
 # installed for the runner account.
@@ -98,7 +103,10 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # Gradle runs once per leg on a fresh home: no daemon to keep, nothing to cache.
+  # No daemon: every Gradle run is a fresh JVM on a fresh home, with nothing to
+  # cache. The macOS leg relies on it: it runs Gradle a second time under
+  # another umask, which a daemon kept from the first run would not have (the
+  # dmg task checks, so that would fail the leg, not skew the comparison).
   GRADLE_OPTS: -Dorg.gradle.daemon=false
 
 jobs:
@@ -366,7 +374,9 @@ jobs:
           # app/.package afresh for the dmg, with whatever umask it runs under
           # (775 and 664 under leg b's 002), and nothing after it can put them
           # right inside the image. Everything packageDmg takes in was built
-          # above, under the leg's own umask.
+          # above, under the leg's own umask. A second Gradle run, and a new
+          # JVM for it (GRADLE_OPTS above: no daemon), because a JVM cannot
+          # change its umask; the dmg task checks the one it runs under.
           (umask 022 && gradle :app-desktop:packageDmg)
           rust/build-xcframework.sh
           (cd rust && . ./repro-env.sh && cargo build --locked -p myotis-node --release --target aarch64-apple-darwin)

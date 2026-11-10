@@ -7,15 +7,22 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     if std::env::var("CARGO_CFG_TARGET_VENDOR").as_deref() == Ok("apple") {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-install_name,@rpath/libmyotis_engine.dylib");
-        // And no debug map (#734, Part 5d). The linker writes one stab per
-        // input object (its path and mtime: for an LTO build, a temporary
-        // directory with a random name) and derives the dylib's LC_UUID from
-        // what it wrote, stabs included. The release profile then strips them
-        // (strip = "debuginfo", an external `strip -S` on Apple targets), which
-        // leaves a UUID computed from bytes that are no longer there: two
-        // builds differed in the UUID, the ad-hoc signature that names it, and
-        // nothing else. -S makes the linker not write the stabs, so the UUID
-        // is a function of what ships.
-        println!("cargo:rustc-cdylib-link-arg=-Wl,-S");
+        // And, for a build without debug info, no debug map (#734, Part 5d).
+        // Observed: two release builds of this dylib differed in LC_UUID and
+        // in the ad-hoc signature that names it, and in nothing else. The
+        // working explanation: the linker writes one stab per input object
+        // that has DWARF (std's do, even when ours have none), with the
+        // object's path and mtime, and derives the UUID from its output, stabs
+        // included; the release profile then strips them (strip = "debuginfo",
+        // an external `strip -S` on Apple targets), which leaves a UUID
+        // computed from bytes that are no longer there. -S makes the linker
+        // not write the stabs, so the UUID is a function of what ships.
+        // Only without debug info (DEBUG is the profile's `debug`, as cargo
+        // hands it to build scripts): a dev build, or a release build with
+        // debug info asked for, keeps the map lldb, dsymutil and backtraces
+        // read. myotis-bls and myotis-node do the same and point here.
+        if std::env::var("DEBUG").as_deref() != Ok("true") {
+            println!("cargo:rustc-cdylib-link-arg=-Wl,-S");
+        }
     }
 }
