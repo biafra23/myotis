@@ -413,6 +413,47 @@ event, which these workflows do not run on — so push a commit or dispatch the
 three workflows before it merges, or the first artifact build of that head is
 the post-merge run on `main`.
 
+## No merge into `main` may break reproducibility
+
+**A PR whose merge would make a release build non-reproducible does not merge
+into `main`** (owner ruling, 2026-11-10). "Reproducible" is what
+`reproducible-builds.yml` checks (#734): every release artifact built twice —
+two runners, different checkout path, `CARGO_HOME`, `GRADLE_USER_HOME`, time
+zone, locale, umask and wall clock — comes out bit-for-bit identical (tier 1:
+unsigned APKs, the engine library, the Rust host libraries and Node addon, the
+`.deb`, the xcframeworks) or with identical payloads (the debug APK, the dmg's
+`.app`, the msi's files), apart from the entries in
+`scripts/repro/known-differences.txt`.
+
+- **Before reporting a PR into `main` "ready to merge", its head has a green
+  `reproducible builds` run** whenever the PR can change what a release build
+  produces: build scripts and plugins (`*.gradle.kts`, `gradle/`,
+  `gradle.properties`), dependencies and their pins, toolchain pins
+  (`rust/rust-toolchain.toml`, `.java-version`, `.xcode-version`, the NDK /
+  build-tools / cargo-ndk pins), `rust/.cargo/`, `rust/*.sh`, Cargo manifests
+  and locks, packaging and signing configuration, the release workflows, or
+  code that runs at build time (build scripts, macros, codegen, embedded
+  resources). The workflow runs by itself on a PR that changes it or its
+  scripts; for any other PR, dispatch it on the PR's branch (Actions tab, or
+  `gh api repos/<owner>/<repo>/actions/workflows/reproducible-builds.yml/dispatches
+  -f ref=<branch>`) and wait for its three `Compare` jobs. When unsure whether a
+  change can reach a release artifact, dispatch it. A PR that touches only
+  docs, tests or CI that builds nothing shipped needs no run.
+- **A red comparison is a blocker, like red CI**: find the leak (the run's
+  `repro-report-<platform>` artifact names every differing file, with a
+  diffoscope report) and fix it on the PR's own branch. **Never make it green
+  by adding a pattern to `known-differences.txt`, or by loosening
+  `scripts/repro/compare.py` / `collect.sh`** — that accepts a
+  non-reproducible artifact, which is the owner's call (*Deferred*, with the
+  cause and the options). An entry whose cause is fixed is REMOVED (the
+  comparison names patterns that no longer match).
+- **The weekly run on `main` is the backstop**, and a `v*` tag runs the same
+  check as the release's own proof. A red weekly or tag run means `main` is
+  not reproducible: report it to the owner, and its fix is the next PR into
+  `main`, before anything that could hide or compound it.
+- This adds a condition to "ready to merge"; it changes nothing about who
+  merges. The merge into `main` stays the owner's.
+
 ## Releases — ask before cutting one
 
 When the user asks for a release (a `v*` tag, a version bump, "cut a release"),
