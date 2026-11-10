@@ -107,6 +107,16 @@ class BeePocTest {
         val newerSeed = newer.resolve(gnosis.seedFile)
         Files.setPosixFilePermissions(newerSeed, emptySet())
         try {
+            // The permission only makes the file unreadable for a user it applies to.
+            // root (a container build, a CI image that runs as root) reads it anyway,
+            // the re-seed then SUCCEEDS, and the test would fail for a reason that has
+            // nothing to do with the code under test. Asked of the file itself, not of
+            // the user name, so any process that bypasses the mode is covered; inside
+            // the try, so the mode is restored for @TempDir's cleanup either way.
+            org.junit.jupiter.api.Assumptions.assumeFalse(
+                Files.isReadable(newerSeed),
+                "this process can read a file with no permission bits (root?): the failure this test needs cannot be staged",
+            )
             // sha256 is computed by streaming the file, which the permission denies too:
             // that surfaces as FAILED via the checksum path or the copy path, and either
             // way the previous index must survive.
