@@ -206,16 +206,20 @@ jobs:
           echo "tested: $(ls "$results"/*.xml | wc -l) suites"
 
       # Zip + checksum the xcframework for upload (the bundle is a directory;
-      # it survives artifact round-trips only zipped). ditto is Apple's
-      # bundle-preserving archiver — matches the sibling MyotisEngine workflow.
-      # Tag builds only — nothing to publish otherwise.
+      # it survives artifact round-trips only zipped), with scripts/repro_zip.sh
+      # like the sibling MyotisEngine workflow (why not ditto: the in-step
+      # comment). Tag builds only — nothing to publish otherwise.
       - name: Package xcframework
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           set -eu
           xc="app-ios/build/XCFrameworks/release/MyotisKit.xcframework"
           test -d "$xc" || { echo "::error::missing $xc"; exit 1; }
-          ditto -c -k --sequesterRsrc --keepParent "$xc" MyotisKit.xcframework.zip
+          # Reproducibly (#734 D7), not with ditto: ditto records each file's
+          # build-time mtime as a LOCAL-time DOS stamp, the builder's uid/gid
+          # and any xattrs. repro_zip.sh keeps the same layout (the
+          # .xcframework directory at the archive root, symlinks as links).
+          scripts/repro_zip.sh "$(dirname "$xc")" "$(basename "$xc")" MyotisKit.xcframework.zip
           shasum -a 256 MyotisKit.xcframework.zip | tee MyotisKit.xcframework.zip.sha256
           ls -lh MyotisKit.xcframework.zip
 
