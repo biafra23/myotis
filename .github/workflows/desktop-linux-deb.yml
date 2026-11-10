@@ -89,6 +89,13 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
+      # The commit time: dpkg-deb (which jpackage drives) clamps every member's
+      # mtime in the .deb to it, instead of stamping the build's wall clock, so
+      # a rebuild of the tag produces the same package metadata (#734, Part 5a;
+      # reproducible-builds.yml sets the same value).
+      - name: Pin SOURCE_DATE_EPOCH to the commit time
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
       # Compose Desktop's packageDeb wraps jpackage (jlink'd JRE + app → .deb).
       # NON-minified (main, not main-release): the Java backend (Netty / Besu /
       # BouncyCastle / libp2p) is reflection-heavy and proguard would break it.

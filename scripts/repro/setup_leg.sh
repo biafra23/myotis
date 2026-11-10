@@ -55,6 +55,10 @@ b)
 esac
 
 {
+    # The commit time, as the release workflows set it: dpkg-deb clamps the
+    # .deb's member mtimes to it (the wall clock otherwise), and the archive
+    # scripts (repro_zip.sh, normalize_maven_metadata.py) use it.
+    echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct "$GITHUB_SHA")"
     # Not on Windows: the MSVC runtime reads TZ as "NAME+hh" and would turn
     # Asia/Kathmandu into UTC; the system zone (tzutil above) is what counts there.
     $windows || echo "TZ=$tz"

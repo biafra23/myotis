@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare two rebuild legs' artifact trees (#734, Part 5a).
 
-    compare.py A_DIR B_DIR REPORT_DIR
+    compare.py A_DIR B_DIR REPORT_DIR [KNOWN_DIFFERENCES]
 
 Both trees come from scripts/repro/collect.sh, carried as tarballs (an
 uploaded artifact keeps neither modes nor symlinks). The VERDICT is a SHA-256
@@ -10,8 +10,15 @@ symlink target: equal manifests pass, anything else fails, and the verdict
 never depends on which tools happen to be installed. diffoscope only EXPLAINS a failure: for each file
 that differs it writes REPORT_DIR/<path>.html (and a text summary), if
 diffoscope is on PATH. REPORT_DIR always gets both manifests and summary.txt.
+
+KNOWN_DIFFERENCES (scripts/repro/known-differences.txt) lists paths, as
+globs, that are known not to reproduce yet, each with its reason: a matching
+difference is reported as KNOWN and does not fail; anything else still does.
+A listed pattern that no longer matches any difference is reported, so the
+list shrinks as fixes land instead of hiding new regressions.
 Stdlib only.
 """
+import fnmatch
 import hashlib
 import os
 import shutil
@@ -64,7 +71,19 @@ def write_manifest(entries, path):
             f.write(f"{entries[rel]}  {rel}\n")
 
 
-def main(a, b, report):
+def load_known(path):
+    known = []
+    if path:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if line.strip() and not line.lstrip().startswith("#"):
+                    pattern, _, reason = line.partition("\t")
+                    known.append((pattern.strip(), reason.strip() or "(no reason given)"))
+    return known
+
+
+def main(a, b, report, known_file=None):
     os.makedirs(report, exist_ok=True)
     ma, mb = manifest(a), manifest(b)
     if not ma or not mb:
@@ -72,14 +91,32 @@ def main(a, b, report):
     write_manifest(ma, os.path.join(report, "SHA256SUMS.a"))
     write_manifest(mb, os.path.join(report, "SHA256SUMS.b"))
 
+    known = load_known(known_file)
+    used = set()
+
+    def reason(rel):
+        for pattern, why in known:
+            if fnmatch.fnmatchcase(rel, pattern):
+                used.add(pattern)
+                return why
+        return None
+
     only_a = sorted(set(ma) - set(mb))
     only_b = sorted(set(mb) - set(ma))
     differ = sorted(r for r in set(ma) & set(mb) if ma[r] != mb[r])
+    known_hits = {r: reason(r) for r in only_a + only_b + differ}
+    known_hits = {r: why for r, why in known_hits.items() if why}
+    only_a = [r for r in only_a if r not in known_hits]
+    only_b = [r for r in only_b if r not in known_hits]
+    unexplained = [r for r in differ if r not in known_hits]
     lines = [f"{len(ma)} files in leg a, {len(mb)} in leg b; "
-             f"{len(differ)} differ, {len(only_a)} only in a, {len(only_b)} only in b"]
+             f"{len(unexplained)} differ, {len(only_a)} only in a, {len(only_b)} only in b, "
+             f"{len(known_hits)} known differences"]
     lines += [f"ONLY IN A  {r}" for r in only_a]
     lines += [f"ONLY IN B  {r}" for r in only_b]
-    lines += [f"DIFFERS    {r}" for r in differ]
+    lines += [f"DIFFERS    {r}" for r in unexplained]
+    lines += [f"KNOWN      {r}: {why}" for r, why in sorted(known_hits.items())]
+    lines += [f"(known difference no longer seen, remove it: {p})" for p, _ in known if p not in used]
 
     # The verdict and the full list first, so a job killed while diffoscope
     # runs still ships them; rewritten below with diffoscope's notes.
@@ -90,7 +127,8 @@ def main(a, b, report):
     # MAX_EXPLAINED (the summary lists them all), each within a time limit, all
     # within EXPLAIN_BUDGET so the job ends inside its timeout.
     started = time.monotonic()
-    for n, rel in enumerate(differ):
+    # Unexplained differences first; the known ones after, while time is left.
+    for n, rel in enumerate(unexplained + [r for r in differ if r in known_hits]):
         if diffoscope is None:
             break
         if n == MAX_EXPLAINED or time.monotonic() - started > EXPLAIN_BUDGET:
@@ -114,12 +152,15 @@ def main(a, b, report):
         lines.append("(diffoscope not installed: no per-file report)")
 
     print(write_summary(report, lines), end="")
-    if only_a or only_b or differ:
+    if only_a or only_b or unexplained:
         sys.exit(1)
-    print("all artifacts are identical across the two builds")
+    if known_hits:
+        print(f"no unexplained differences; {len(known_hits)} known (listed above with their reasons)")
+    else:
+        print("all artifacts are identical across the two builds")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
+    if len(sys.argv) not in (4, 5):
         sys.exit(__doc__)
     main(*sys.argv[1:])

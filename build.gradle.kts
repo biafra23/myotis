@@ -81,6 +81,14 @@ allprojects {
         dirPermissions { unix("rwxr-xr-x") }
     }
 
+    // Kotlin/Native klibs record each source file's ABSOLUTE path in their IR
+    // (default/ir/fileEntries.knf), so a published iOS klib carried the
+    // checkout path: the two legs of reproducible-builds.yml differed in
+    // exactly that (#734, Part 5a). Relative to the repository root instead.
+    tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinNativeCompile>().configureEach {
+        compilerOptions.freeCompilerArgs.add("-Xklib-relative-path-base=${rootDir.absolutePath}")
+    }
+
     // === Pinned dependency graph (#734, Part 1) ==============================
     // Every resolvable configuration of every project is LOCKED: the exact
     // module versions it resolved to are committed in the project's
