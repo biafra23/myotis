@@ -7,7 +7,7 @@
 # installed. Leg a builds there as it is. Leg b differs in everything a
 # reproducible build must not depend on: it builds in a git worktree of the
 # same commit at another, deeper path, with an empty CARGO_HOME and
-# GRADLE_USER_HOME of its own, another time zone (+05:45, so a local-time stamp
+# GRADLE_USER_HOME of its own, on Linux another user (uid), another time zone (+05:45, so a local-time stamp
 # cannot hide behind a whole-hour offset), another locale and another umask.
 # The worktree keeps the history and tags (:ui derives the version from the
 # nearest v* tag) and leaves no copy step that could itself normalize mtimes.
@@ -53,6 +53,26 @@ b)
 *)
     echo "setup_leg.sh: leg must be a or b, got '$leg'" >&2; exit 2 ;;
 esac
+
+# Linux builds in the builder image (docker/builder/run.sh), as a uid of its
+# own with no home in the image: BOTH legs get a writable HOME, CARGO_HOME and
+# GRADLE_USER_HOME (at different paths), and leg b runs as another uid, which
+# owns everything it writes. REPRO_HOME, not HOME: the job's own steps keep
+# the runner's.
+if [[ "$(uname -s)" == Linux ]]; then
+    mkdir -p "$tmp/home-$leg" "$tmp/cargo-home-$leg" "$tmp/gradle-home-$leg"
+    run_as="$(id -u):$(id -g)"
+    if [[ "$leg" == b ]]; then
+        run_as=4242:4242
+        sudo chown -R "$run_as" "$src" "$tmp/home-$leg" "$tmp/cargo-home-$leg" "$tmp/gradle-home-$leg"
+    fi
+    {
+        echo "REPRO_HOME=$tmp/home-$leg"
+        echo "CARGO_HOME=$tmp/cargo-home-$leg"
+        echo "GRADLE_USER_HOME=$tmp/gradle-home-$leg"
+        echo "REPRO_RUN_AS=$run_as"
+    } >> "$GITHUB_ENV"
+fi
 
 {
     # The commit time, as the release workflows set it: dpkg-deb clamps the

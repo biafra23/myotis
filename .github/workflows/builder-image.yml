@@ -1,0 +1,69 @@
+# The builder image (#734, Part 5b): build it from its pins and check it.
+#
+# docker/builder/ pins the toolchain of the Linux and Android release builds
+# (base image by digest, apt by snapshot, the JDK / rustup / Android
+# command-line tools by SHA-256, rustc / the NDK / build-tools / cargo-ndk by
+# exact version). This workflow answers one question on every change that can
+# affect it: does the image still BUILD from those pins, and is every tool in it
+# the version the build pins? docker/builder/check.sh compares each tool, run
+# inside the image as an unprivileged uid, with `build.sh --print-args`.
+#
+# It runs on a change to the image's own files AND to any file build.sh reads a
+# version from: bumping .java-version without the new build number and hash in
+# docker/builder/pins.env fails here, on that PR, not at the next
+# reproducible-builds run (which builds the same image, twice, and builds the
+# artifacts in it).
+#
+# pull_request is unscoped (any base branch), like ci.yml: this is a check, not
+# an artifact build, and a part PR that moves a pin needs it. Nothing is
+# published: the image is rebuilt from its Dockerfile wherever it is used.
+name: builder image
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+    paths: &paths
+      - 'docker/builder/**'
+      - '.java-version'
+      - 'rust/rust-toolchain.toml'
+      - 'gradle/libs.versions.toml'
+      - 'android-app/build.gradle.kts'
+      - 'myotis-engine/build.gradle.kts'
+      - '.github/workflows/builder-image.yml'
+  pull_request:
+    paths: *paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: builder-image-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build and check the builder image
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      - name: Build the image from its pins
+        run: docker/builder/build.sh
+
+      - name: Check every tool against the pins
+        run: docker/builder/check.sh
+
+      - name: Record what was built
+        run: |
+          {
+            echo "### Builder image"
+            echo '```'
+            docker/builder/build.sh --print-args
+            echo "image id: $(docker image inspect --format '{{.Id}}' myotis-builder:local)"
+            echo "size: $(docker image inspect --format '{{.Size}}' myotis-builder:local | numfmt --to=iec)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

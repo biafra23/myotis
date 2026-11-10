@@ -190,6 +190,18 @@ Key Gradle modules:
   hashes the `gradle pins` workflow collects). Review the hash diff like code.
   Never "fix" a verification failure you did not cause by re-pinning — bytes
   changed under a pinned version. docs/guides/gradle-dependency-pins.md.
+- **The Linux and Android release toolchain is the builder image**
+  (`docker/builder/`, #734): base image by digest, apt from one snapshot, the
+  JDK / rustup / Android command-line tools by SHA-256, and rustc, the NDK,
+  build-tools and cargo-ndk at the versions the build pins, which `build.sh`
+  reads from their one source each (`.java-version`,
+  `rust/rust-toolchain.toml`, `gradle/libs.versions.toml`). Bumping the JDK
+  therefore also moves `JDK_VERSION` / `JDK_BUILD` / `JDK_SHA256` in
+  `docker/builder/pins.env`, in the same change; `build.sh` refuses a mismatch
+  and the `builder image` workflow fails the PR. `reproducible-builds.yml`'s
+  Linux legs build in it (`docker/builder/run.sh -- scripts/repro/build_linux.sh`,
+  the command a third party runs to rebuild a release). Never install or
+  upgrade a tool inside a build: the image is read-only at run time on purpose.
 - **Tuweni 2.7.2** (upstream `io.consensys.tuweni`, Maven Central; original `org.apache.tuweni` packages) — RLP encoding, SECP256K1, byte utilities.
 - **Netty 4.2.x** — NIO-only (no epoll/kqueue). 4-thread `NioEventLoopGroup` for RLPx.
 - **BouncyCastle** — SECP256K1 crypto provider
