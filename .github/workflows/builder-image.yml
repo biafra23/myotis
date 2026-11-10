@@ -1,28 +1,53 @@
-# The builder image (#734, Part 5b): build it from its pins and check it.
+# The builder image (#734): publish it once per set of pins, and hold the
+# committed lock to what is published.
 #
-# docker/builder/ pins the toolchain of the Linux and Android release builds
-# (base image by digest, apt by snapshot, the JDK / rustup / Android
-# command-line tools by SHA-256, rustc / the NDK / build-tools / cargo-ndk by
-# exact version). This workflow answers one question on every change that can
-# affect it: does the image still BUILD from those pins, and is every tool in it
-# the version the build pins? docker/builder/check.sh compares each tool, run
-# inside the image as an unprivileged uid, with `build.sh --print-args`.
+# docker/builder/ pins the toolchain of the Android release builds (base image
+# by digest, apt by snapshot, the JDK / rustup / Android command-line tools by
+# SHA-256, rustc / the NDK / build-tools / cargo-ndk by exact version).
+# docker/builder/check.sh compares each tool in an image, run as an
+# unprivileged uid, with `build.sh --print-args`.
 #
-# It runs on a change to the image's own files AND to any file build.sh reads a
-# version from: bumping .java-version without the new build number and hash in
-# docker/builder/pins.env fails here, on that PR, not at the next
-# reproducible-builds run (which builds the artifacts in this image).
+# THE IMAGE IS PUBLISHED (owner's decision, 2026-11-10) to the repository
+# pins.env names (IMAGE_REPOSITORY), once per set of pins, and
+# docker/builder/image.lock names it by digest for the pins of the tree it is
+# committed in. A build that needs the image pulls that digest
+# (docker/builder/pull.sh) instead of rebuilding it: reproducible-builds.yml
+# on every run, and anyone rebuilding a release. Rebuilding needs
+# snapshot.ubuntu.com, which refuses requests for minutes at a time.
 #
-# And weekly, because the image's sources can go away without any pin moving
-# (a snapshot the service drops, an archive taken off a download server), and
-# reproducible-builds.yml would not notice: it reuses an image already built
-# from the same pins. This workflow never does; a red weekly run here means the
-# image can no longer be rebuilt from its pins, by us or by a third party.
-# (One red run alone may be snapshot.ubuntu.com refusing requests: re-run it.)
+# What a run does depends on the pins, and it runs on a change to the image's
+# own files AND to any file build.sh reads a version from (bumping
+# .java-version without the new build number and hash in pins.env fails here,
+# on that PR):
+#   - the pins have an image (image.lock's key is this tree's): pull it by
+#     digest, check it, and check that the registry still serves that digest
+#     under the key. NOTHING IS BUILT: that the image builds from these pins
+#     was shown when it was published;
+#   - the pins moved: build the image from them, check it, push it as
+#     <repository>:<key>, and FAIL with the lines image.lock must carry.
+#     Committing them is the second half of moving a pin (like
+#     apt-packages.txt), and goes green. An image already published for a key
+#     is never replaced (docker/builder/publish.sh says how that is held);
+#   - weekly, and on a dispatch with `from-pins`: build from the pins, never
+#     pull, publish nothing. The image's sources can go away without any pin
+#     moving (a snapshot the service drops, an archive taken off a download
+#     server), and nothing else would notice. A red run here means the image
+#     can no longer be rebuilt from its pins, by us or by a third party. (One
+#     red run alone may be snapshot.ubuntu.com refusing requests: re-run it.)
+# The key (`build.sh --print-key`) is the resolved build args and the
+# Dockerfile, i.e. what the image is made from. apt-packages.txt and check.sh
+# are not in it: they describe and check the image, and a change to either is
+# checked against the published one.
+#
+# A pull request from a fork has no token to push with: it pulls or builds,
+# checks, and runs the lock check without pushing (PUBLISH_PUSH=false), so a
+# fork that moves a pin is told to have the workflow run from a branch of the
+# repository, and one that edits the lock is held to the registry like anyone.
+# (While the package is private a fork cannot read it, and that step fails
+# saying so.)
 #
 # pull_request is unscoped (any base branch), like ci.yml: this is a check, not
-# an artifact build, and a part PR that moves a pin needs it. Nothing is
-# published: the image is rebuilt from its Dockerfile wherever it is used.
+# an artifact build, and a part PR that moves a pin needs it.
 name: builder image
 
 on:
@@ -44,10 +69,17 @@ on:
     # Mondays 01:17 UTC, ahead of the weekly reproducible-builds run (02:41).
     - cron: '17 1 * * 1'
   workflow_dispatch:
+    inputs:
+      from-pins:
+        description: "Build from the pins instead of pulling the published image (publishes nothing)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+# A PR's newer push supersedes its older run. One cancelled between its push
+# and its report loses nothing: the next finds the image under its key.
 concurrency:
   group: builder-image-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -56,24 +88,79 @@ jobs:
   build:
     name: Build and check the builder image
     runs-on: ubuntu-26.04
-    timeout-minutes: 45
+    # A build from the pins can spend half an hour retrying the snapshot service.
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      # Pushes ghcr.io/<owner>/myotis-builder:<key>. A fork's token is read-only
+      # whatever is asked for here.
+      packages: write
+    env:
+      # Whether this run may push, and can count on reading the package.
+      OURS: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
 
-      - name: Build the image from its pins
-        run: docker/builder/build.sh
+      # publish.sh and pull.sh against a stubbed docker: seconds, and before
+      # the half hour an image build can take.
+      - name: Test the lock scripts
+        run: docker/builder/test_lock.sh
+
+      - name: Log in to the registry
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      # pull.sh exits 3 when image.lock is not for this tree's pins (they moved,
+      # or there is no lock yet), and 1 when the locked image cannot be pulled:
+      # red for us, and for a fork the reason to build instead.
+      - name: Pull the image for these pins, or build it
+        id: image
+        env:
+          FROM_PINS: ${{ github.event_name == 'schedule' || inputs.from-pins == true }}
+        run: |
+          set -euo pipefail
+          how=built
+          if [ "$FROM_PINS" = true ]; then
+            echo "building from the pins, whatever is published"
+            docker/builder/build.sh
+          else
+            rc=0; docker/builder/pull.sh || rc=$?
+            if [ "$rc" = 0 ]; then how=pulled
+            elif [ "$rc" = 3 ] || [ "$OURS" != true ]; then docker/builder/build.sh
+            else exit "$rc"; fi
+          fi
+          echo "how=$how" >> "$GITHUB_OUTPUT"
 
       - name: Check every tool against the pins
         run: docker/builder/check.sh
 
-      - name: Record what was built
+      # After check.sh: an image that does not match its pins is never
+      # published. Fails, with the lines to commit, until image.lock names the
+      # published digest. A fork's run checks the same without pushing.
+      - name: Publish the image, and hold image.lock to it
+        if: ${{ github.event_name != 'schedule' && inputs.from-pins != true }}
+        env:
+          PUBLISH_PUSH: ${{ env.OURS }}
+        run: docker/builder/publish.sh
+
+      - name: Record the image
+        if: ${{ always() }}
+        env:
+          HOW: ${{ steps.image.outputs.how }}
         run: |
           {
-            echo "### Builder image"
+            echo "### Builder image (${HOW:-not obtained})"
             echo '```'
             docker/builder/build.sh --print-args
-            echo "image id: $(docker image inspect --format '{{.Id}}' myotis-builder:local)"
-            echo "size: $(docker image inspect --format '{{.Size}}' myotis-builder:local | numfmt --to=iec)"
+            echo "key: $(docker/builder/build.sh --print-key)"
+            echo "image id: $(docker image inspect --format '{{.Id}}' myotis-builder:local 2>/dev/null || echo none)"
+            echo "size: $(docker image inspect --format '{{.Size}}' myotis-builder:local 2>/dev/null | numfmt --to=iec || true)"
+            [ ! -f docker/builder/image.lock ] || grep -v '^#' docker/builder/image.lock
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

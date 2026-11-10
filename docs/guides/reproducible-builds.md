@@ -145,6 +145,22 @@ docker/builder/check.sh              # every tool in it is the pinned version
 docker/builder/run.sh -- scripts/repro/build_linux.sh
 ```
 
+Instead of building the image you can pull the one the project published for
+exactly these pins. `docker/builder/image.lock`, in the tag's tree, names it by
+digest:
+
+```bash
+docker/builder/pull.sh               # in place of build.sh; then check.sh and run.sh as above
+```
+
+The two are a choice of whom to trust. `build.sh` trusts only the sources the
+Dockerfile pins by digest and hash, and needs `snapshot.ubuntu.com` to answer,
+which it does not always. `pull.sh` trusts whoever published the image: it is
+the same image for everyone, and `check.sh` holds it to the pins (every tool's
+version, the apt package list), but nothing compares it byte for byte with a
+build from the Dockerfile, because an image build is not repeatable bit for
+bit. CI pulls. For the strongest check, build.
+
 `run.sh` mounts the checkout at its own path, runs as your user with a
 read-only image, and gives the build its own `HOME`, cargo home and Gradle
 home and nothing of your environment. `build_linux.sh` takes the version from
@@ -214,11 +230,13 @@ in `android-app/release-signing-cert.sha256`
   `repro-report-<platform>-<leg>-vs-<leg>` artifact. Fix the leak; do not add
   it to `scripts/repro/known-differences.txt`, which is empty and meant to
   stay so.
-- The image is rebuilt from its pins on every change to one of them and
-  weekly (`builder image`); the comparison reuses an image already built from
-  the same pins. Moving `APT_SNAPSHOT` or the package list moves
-  `docker/builder/apt-packages.txt` in the same change: `check.sh` prints the
-  new list when it differs.
+- The image is published once per set of pins, and `docker/builder/image.lock`
+  names it by digest; the comparison pulls that. Moving a pin moves the lock
+  in the same change: the `builder image` workflow builds and publishes the new
+  image and fails with the lines to commit. It also builds from the pins
+  weekly, to notice when that stops working. Moving `APT_SNAPSHOT` or the
+  package list moves `docker/builder/apt-packages.txt` too: `check.sh` prints
+  the new list when it differs.
 - Every release asset is uploaded through `.github/release-assets.sh` and
   attested in the same job, whose last step
   (`release-assets.sh --checksums`) is what keeps `SHA256SUMS` complete.

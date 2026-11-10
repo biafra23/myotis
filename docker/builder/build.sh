@@ -10,13 +10,17 @@
 # producing an image that is not the one the build expects.
 #
 # `--print-args` prints the resolved build args and exits (what check.sh and
-# the workflow compare the finished image against).
+# the workflow compare the finished image against). `--print-key` prints the
+# image's KEY and exits: the SHA-256 of everything that determines the image,
+# i.e. those build args and the Dockerfile. Two trees with the same key build
+# the same image, so the key names the published image (image.lock, pull.sh).
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd "$here/../.." && pwd)
-print_only=false
+print_only=false print_key=false
 [[ "${1:-}" == "--print-args" ]] && { print_only=true; shift; }
+[[ "${1:-}" == "--print-key" ]] && { print_key=true; shift; }
 tag=${1:-myotis-builder:local}
 
 set -a
@@ -59,6 +63,11 @@ args=(
 )
 if $print_only; then
     printf '%s\n' "${args[@]}"
+    exit 0
+fi
+if $print_key; then
+    if command -v sha256sum >/dev/null 2>&1; then sum() { sha256sum; }; else sum() { shasum -a 256; }; fi
+    { printf '%s\n' "${args[@]}"; sum < "$here/Dockerfile"; } | sum | cut -d' ' -f1
     exit 0
 fi
 
