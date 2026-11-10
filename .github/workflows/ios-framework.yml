@@ -215,6 +215,9 @@ jobs:
           set -eu
           xc="app-ios/build/XCFrameworks/release/MyotisKit.xcframework"
           test -d "$xc" || { echo "::error::missing $xc"; exit 1; }
+          # One mtime for every file first (#734 D7): ditto records them, and
+          # each build writes the framework at a different time.
+          scripts/repro_zip.sh --normalize "$xc"
           ditto -c -k --sequesterRsrc --keepParent "$xc" MyotisKit.xcframework.zip
           shasum -a 256 MyotisKit.xcframework.zip | tee MyotisKit.xcframework.zip.sha256
           ls -lh MyotisKit.xcframework.zip

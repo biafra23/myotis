@@ -436,7 +436,9 @@ jobs:
              "assets/myotis-engine-${GITHUB_REF_NAME}-android.aar"
           # The whole staged repository: unzip it and point Gradle at the
           # directory, and no GitHub token is needed (docs/android-library.md).
-          (cd build/maven-repo && zip -qr "../../assets/myotis-engine-${GITHUB_REF_NAME}-maven-repo.zip" eth)
+          # Reproducibly (#734 D7): one mtime, sorted entries, no extra
+          # attributes — a plain `zip -r` made a new zip for the same tree.
+          scripts/repro_zip.sh build/maven-repo eth "assets/myotis-engine-${GITHUB_REF_NAME}-maven-repo.zip"
           (cd assets && sha256sum myotis-engine-*.aar myotis-engine-*.zip > myotis-engine.SHA256SUMS && cat myotis-engine.SHA256SUMS)
 
       - name: Publish to GitHub Release

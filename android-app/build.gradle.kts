@@ -80,6 +80,23 @@ val rpcUpstream: String = run {
     if (lp.exists()) lp.inputStream().use { props.load(it) }
     props.getProperty("rpc.upstream", "")
 }
+// A RELEASE build refuses a local upstream (#734 D5): the value lands in
+// BuildConfig, so a builder's gitignored local.properties would change the
+// release APK's bytes — and ship an unverified proxy in a release. Refused, not
+// silently dropped: a developer who set it is told why (CLAUDE.md's
+// apply-or-refuse rule). Debug builds keep it.
+tasks.matching { it.name == "preReleaseBuild" }.configureEach {
+    val upstream = rpcUpstream
+    doFirst {
+        if (upstream.isNotEmpty()) {
+            throw GradleException(
+                "rpc.upstream is set in local.properties, but a release APK must not carry an " +
+                    "upstream proxy (it would differ from every other build of this commit, and " +
+                    "serve unverified data). Remove it for release builds; debug builds keep it.",
+            )
+        }
+    }
+}
 
 // Derived from the project version so a release sweep can't leave the app
 // reporting a stale version in Settings → Apps, the same way :app-desktop
@@ -184,6 +201,16 @@ android {
         release {
             isMinifyEnabled = false
         }
+    }
+
+    // AGP otherwise embeds an encrypted block of dependency information, signed
+    // with a Google key, in the APK and the bundle: bytes no one else can
+    // reproduce or read (#734 D5; F-Droid's reproducible-build verifier rejects
+    // it for the same reason). The dependency list is public anyway — the
+    // lockfiles and verification metadata pin it.
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
     }
 
     testOptions {

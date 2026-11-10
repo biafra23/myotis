@@ -80,7 +80,9 @@ import argparse
 import gzip
 import hashlib
 import json
+import os
 import struct
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -97,6 +99,29 @@ U32_MAX = (1 << 32) - 1
 # name its genesis explicitly (the engine compares both, so a mismatch is a
 # refused import that names only the ids).
 KNOWN_GENESIS = {100: "0x4f1dd23188aab3a76b463e4af801b52b1248ef073c648cbdc4c9333d3da79756"}
+
+
+def _build_time():
+    """The manifest's builtAtUtc, deterministic for a given commit (#734 D6).
+
+    Not the wall clock: this runs inside the desktop build (:app-desktop frames
+    the Bee and RAILGUN seeds into the dmg), so now() made every build's bundled
+    manifest — and so the dmg — differ. SOURCE_DATE_EPOCH if set (the
+    reproducible-builds.org convention), else the checkout's HEAD commit time,
+    else (a source tarball, no git) no stamp at all. Nothing reads the value;
+    it is provenance for a human.
+    """
+    sde = os.environ.get("SOURCE_DATE_EPOCH", "").strip()
+    if sde:
+        return datetime.fromtimestamp(int(sde), timezone.utc)
+    try:
+        ct = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parent), "log", "-1", "--format=%ct"],
+            capture_output=True, text=True, check=True, timeout=30,
+        ).stdout.strip()
+        return datetime.fromtimestamp(int(ct), timezone.utc) if ct else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
 
 
 def die(msg: str) -> "NoReturn":  # noqa: F821 - typing.NoReturn without the import
@@ -518,8 +543,10 @@ def main() -> int:
             f"logs={stats['logs_kept']}",
             f"sha256={hashlib.sha256(data).hexdigest()}",
             f"source={Path(args.meta).name if args.meta else '-'}",
-            f"builtAtUtc={datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')}",
         ]
+        built = _build_time()
+        if built is not None:
+            lines.append(f"builtAtUtc={built.isoformat(timespec='seconds').replace('+00:00', 'Z')}")
         Path(args.manifest).write_text("\n".join(lines) + "\n", encoding="utf-8")
         print(f"wrote {args.manifest}", file=sys.stderr)
     print(json.dumps(info, indent=2))

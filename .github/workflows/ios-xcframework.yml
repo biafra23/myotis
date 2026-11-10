@@ -52,6 +52,9 @@ jobs:
           # ditto preserves the framework bundle structure the way Xcode and
           # SwiftPM binaryTarget consumers expect (plain zip loses resource
           # forks / symlink layout on some setups).
+          # One mtime for every file first (#734 D7): ditto records them, and
+          # each build writes the framework at a different time.
+          ../../../scripts/repro_zip.sh --normalize MyotisEngine.xcframework
           ditto -c -k --sequesterRsrc --keepParent \
             MyotisEngine.xcframework MyotisEngine.xcframework.zip
           shasum -a 256 MyotisEngine.xcframework.zip | tee MyotisEngine.xcframework.zip.sha256
