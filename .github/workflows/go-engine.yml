@@ -1,0 +1,55 @@
+name: Go engine
+
+on:
+  # Push scope mirrors ci.yml's convention (main + the Go feature branch); the
+  # path filter keeps Gradle/Rust work from paying for this job and vice versa.
+  push:
+    branches: [ "main", "feature/go-engine" ]
+    paths:
+      - "go/**"
+      - ".github/workflows/go-engine.yml"
+  # pull_request unscoped (any base branch), like every other workflow here:
+  # part PRs into feature/go-engine must get these checks too.
+  pull_request:
+    paths:
+      - "go/**"
+      - ".github/workflows/go-engine.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      - name: Check formatting
+        working-directory: go
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"; echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        working-directory: go
+        run: go vet ./...
+
+      - name: Build
+        working-directory: go
+        run: go build ./...
+
+      - name: Test
+        working-directory: go
+        run: go test ./...
