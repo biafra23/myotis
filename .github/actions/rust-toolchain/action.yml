@@ -1,0 +1,48 @@
+# The ONE way a workflow installs Rust (#734, Part 2): the exact toolchain
+# rust/rust-toolchain.toml pins, set as rustup's default, plus any targets and
+# components the job needs. Workflows must not use dtolnay/rust-toolchain
+# directly: `@stable` installs whatever is current on the day of the run, so two
+# runs of one commit could compile with different rustc versions.
+#
+# Being the default matters for cargo calls made from outside rust/ (with
+# --manifest-path), where rust-toolchain.toml does not apply.
+#
+# The install is rustup's MINIMAL profile (rustc with rustdoc, cargo, rust-std).
+# A job that runs clippy or rustfmt must ask for it in `components`: the old
+# dtolnay@stable steps reused the runner image's preinstalled stable toolchain,
+# which carried both, so no workflow used to say so.
+name: Rust toolchain (pinned)
+description: Install the rustc version pinned in rust/rust-toolchain.toml
+inputs:
+  targets:
+    description: Comma-separated rustup targets to add
+    required: false
+    default: ''
+  components:
+    description: Comma-separated rustup components to add
+    required: false
+    default: ''
+outputs:
+  version:
+    description: The installed toolchain, e.g. 1.99.1
+    value: ${{ steps.pin.outputs.channel }}
+runs:
+  using: composite
+  steps:
+    - id: pin
+      shell: bash
+      run: |
+        channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust/rust-toolchain.toml)
+        if ! [[ "$channel" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "::error file=rust/rust-toolchain.toml::channel must be an exact x.y.z version (got '$channel')"
+          exit 1
+        fi
+        echo "channel=$channel" >> "$GITHUB_OUTPUT"
+    # By commit, not @master: what installs the pinned rustc must not move
+    # either (#734). Moving it is a reviewed edit of this line.
+    - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master, 2026-11
+
+      with:
+        toolchain: ${{ steps.pin.outputs.channel }}
+        targets: ${{ inputs.targets }}
+        components: ${{ inputs.components }}

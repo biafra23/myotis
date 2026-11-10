@@ -103,11 +103,11 @@ jobs:
       # binary (the recurring failure mode: an ABI-compatible but feature-stale
       # .so that fails UniFFI validation on-device and silently falls back to
       # Java). This job provides the required toolchain: the Android rustup
-      # targets below, cargo-ndk, and the runner's preinstalled NDK (found via
-      # ANDROID_NDK_HOME / $ANDROID_HOME/ndk). No -PskipRustEngine here — the
-      # shipped APK must carry the engine.
+      # targets below, and the NDK, build-tools and cargo-ndk versions pinned in
+      # gradle/libs.versions.toml (#734 — not the image's default NDK). No
+      # -PskipRustEngine here — the shipped APK must carry the engine.
       - name: Set up Rust (Android targets)
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/rust-toolchain
         with:
           targets: aarch64-linux-android,x86_64-linux-android
 
@@ -119,10 +119,8 @@ jobs:
           # only this job saves it, so the smoke job adds no second cache.
           shared-key: android-rust
 
-      - name: Install cargo-ndk
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-ndk
+      - name: Install the pinned NDK, build-tools and cargo-ndk
+        uses: ./.github/actions/android-native-toolchain
 
       # The assemble step below already builds the engine via preBuild, but run it
       # explicitly first so a toolchain problem fails here with a clear step name.
@@ -371,7 +369,7 @@ jobs:
       # The Rust engine, same toolchain as the build job: the app's preBuild runs
       # cargoNdkAndroid for both APK ABIs (the device itself is x86_64).
       - name: Set up Rust (Android targets)
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/rust-toolchain
         with:
           targets: aarch64-linux-android,x86_64-linux-android
 
@@ -385,10 +383,8 @@ jobs:
           shared-key: android-rust
           save-if: false
 
-      - name: Install cargo-ndk
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-ndk
+      - name: Install the pinned NDK, build-tools and cargo-ndk
+        uses: ./.github/actions/android-native-toolchain
 
       # AGP's managed-device setup downloads the emulator + the API-29 system
       # image (several hundred MB, a couple of minutes) into the runner's
@@ -506,15 +502,28 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Check out the signing script and the pinned certificate only
+      - name: Check out the signing script, the pinned certificate and the version catalog only
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
+          # The catalog only for its android-build-tools pin, which the script
+          # reads with sed (#734): data, not code that runs here.
           sparse-checkout: |
             scripts/sign_release_apk.sh
             android-app/release-signing-cert.sha256
+            gradle/libs.versions.toml
           sparse-checkout-cone-mode: false
           # Nothing here talks to git again: keep the token out of .git/config.
           persist-credentials: false
+
+      # The signer is the PINNED build-tools (gradle/libs.versions.toml), not
+      # whatever the image ships: the runner's own sdkmanager, no action.
+      - name: Install the pinned build-tools
+        run: |
+          set -euo pipefail
+          v=$(sed -n 's/^android-build-tools *= *"\([^"]*\)".*/\1/p' gradle/libs.versions.toml)
+          [ -n "$v" ] || { echo "::error::no android-build-tools pin in gradle/libs.versions.toml"; exit 1; }
+          # Licences from a process substitution: `yes |` fails under pipefail.
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;$v" >/dev/null < <(yes)
 
       - name: Download the unsigned release APK
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
@@ -570,9 +579,12 @@ jobs:
       - name: Check out the release notes
         uses: actions/checkout@v4
         with:
+          # Plus the version catalog, for the pinned android-build-tools the
+          # badging check below reads with sed (#734).
           sparse-checkout: |
             .github/release-notes.md
             .github/release-notes.sh
+            gradle/libs.versions.toml
           sparse-checkout-cone-mode: false
           # gh takes the token from the publish step's env; keep the job's
           # write token out of .git/config.
@@ -599,9 +611,14 @@ jobs:
           # otherwise create the release in the next step and then fail its upload.
           printf '%s' "${GITHUB_REF_NAME}" | grep -Eq '^v[A-Za-z0-9._-]+$' \
             || { echo "::error::'${GITHUB_REF_NAME}' is not a valid release tag (expected v<version>)"; exit 1; }
-          # Numbered stable releases only (not rc builds or a `current` symlink).
-          build_tools=$(ls -d "$ANDROID_HOME"/build-tools/*/ \
-            | grep -E '/[0-9]+\.[0-9]+\.[0-9]+/$' | sort -V | tail -n1)
+          # The pinned build-tools (gradle/libs.versions.toml, #734), the same
+          # version that signed the APK — not the newest the image happens to ship.
+          bt_version=$(sed -n 's/^android-build-tools *= *"\([^"]*\)".*/\1/p' gradle/libs.versions.toml)
+          [ -n "$bt_version" ] || { echo "::error::no android-build-tools pin in gradle/libs.versions.toml"; exit 1; }
+          build_tools="$ANDROID_HOME/build-tools/$bt_version/"
+          # Licences from a process substitution: `yes |` fails under pipefail.
+          [ -x "${build_tools}aapt2" ] \
+            || "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;$bt_version" >/dev/null < <(yes)
           aapt2="${build_tools}aapt2"
           shopt -s nullglob
           # variant, expected package, asset suffix. The package check is the

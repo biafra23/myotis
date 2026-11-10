@@ -15,7 +15,7 @@ on:
   push:
     branches: [ "main" ]
     tags: [ "v*" ]
-    paths: ['rust/**', '.github/workflows/node-binding.yml']
+    paths: ['rust/**', '.github/workflows/node-binding.yml', '.github/actions/rust-toolchain/**']
   workflow_dispatch:
 
 # Cancel a superseded run when new commits land on the same branch/PR. The
@@ -61,7 +61,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
@@ -69,7 +69,7 @@ jobs:
           workspaces: rust
       - name: Build
         working-directory: rust
-        run: cargo build -p myotis-node --release --target ${{ matrix.target }}
+        run: cargo build --locked -p myotis-node --release --target ${{ matrix.target }}
       - name: Rename to .node
         shell: bash
         run: cp "${{ matrix.built }}" "${{ matrix.artifact }}"
@@ -244,13 +244,13 @@ jobs:
     timeout-minutes: 100
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
       - name: Unit tests (whole workspace)
         working-directory: rust
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
       - uses: actions/download-artifact@v4
         with:
           name: myotis-node.win32-x64-msvc.node

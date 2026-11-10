@@ -677,8 +677,11 @@ fun rustTool(name: String): String {
 
 // Probed from rust/ so rust-toolchain.toml governs which toolchain rustup
 // reports — probing the repo root would measure the rustup DEFAULT toolchain,
-// not the one the builds actually run. (If rustup has no stable installed,
-// the probe exits non-zero → "" → Rust is skipped, not downloaded.)
+// not the one the builds actually run. That file pins an exact rustc (#734), so
+// on a machine that lacks it this first probe is where rustup installs it (a
+// one-time download, which blocks configuration while it runs). If rustup
+// cannot (offline, RUSTUP_AUTO_INSTALL=0), the probe exits non-zero → "" →
+// Rust is skipped, and the Android gate names the pinned toolchain.
 fun probeTool(vararg cmd: String): String =
     providers.of(ToolProbe::class) {
         // rustTool resolves the executable itself; the PATH override covers
@@ -688,8 +691,15 @@ fun probeTool(vararg cmd: String): String =
         rustToolchainPath?.let { parameters.path.set(it) }
     }.get()
 
+// Every cargo invocation below passes --locked (#734): rust/Cargo.lock is the
+// pinned dependency graph, and an unlocked build that finds it stale silently
+// resolves new versions and rewrites it, so two builds of one commit could link
+// different crates. With --locked a stale lock fails the build instead; refresh
+// it on purpose with `cargo update` and review the lock diff.
 val cargoVersion = probeTool("cargo", "--version") // "cargo 1.96.0 (…)" or ""
 val cargoNdkVersion = if (cargoVersion.isEmpty()) "" else probeTool("cargo", "ndk", "--version")
+// "cargo-ndk 4.1.2" → "4.1.2"; cargoNdkAndroid accepts only the catalog's version.
+val cargoNdkVersionNumber: String = Regex("""(\d+\.\d+\.\d+)""").find(cargoNdkVersion)?.value ?: ""
 
 // Minimum toolchain: the workspace's `rust-version` (rust/Cargo.toml
 // [workspace.package]), read rather than restated so the gate and cargo can't
@@ -715,11 +725,26 @@ fun rustVersionAtLeast(version: String, floor: String): Boolean {
 val rustAvailable = Regex("""cargo (\d+\.\d+\.\d+)""").find(cargoVersion)
     ?.let { rustVersionAtLeast(it.groupValues[1], minRustVersion) } ?: false
 
-// NDK for cargoNdkAndroid: $ANDROID_NDK_HOME, else the newest ndk/<version>
-// under the SDK from local.properties / $ANDROID_HOME / $ANDROID_SDK_ROOT.
+// NDK for cargoNdkAndroid: EXACTLY the catalog's android-ndk version (#734) —
+// $ANDROID_NDK_HOME if it is that version, else <sdk>/ndk/<version> from
+// local.properties / $ANDROID_HOME / $ANDROID_SDK_ROOT. Never "the newest
+// ndk/* there is": a different NDK compiles different .so bytes, so a machine
+// without the pinned one gets a toolchain error naming it, not a quiet swap.
+val pinnedNdkVersion: String = libs.versions.android.ndk.get()
+val pinnedCargoNdkVersion: String = libs.versions.cargo.ndk.get()
+// An NDK's own version, from its source.properties (Pkg.Revision = 29.0.14206865).
+fun ndkRevision(dir: File): String? = dir.resolve("source.properties").takeIf { it.isFile }?.let { f ->
+    Properties().apply { f.inputStream().use { load(it) } }.getProperty("Pkg.Revision")?.trim()
+}
+// Where an NDK was found but rejected — named in the toolchain error.
+val rejectedNdks = mutableListOf<String>()
 fun findAndroidNdk(): File? {
     System.getenv("ANDROID_NDK_HOME")?.let { p ->
-        File(p).takeIf { it.isDirectory }?.let { return it }
+        File(p).takeIf { it.isDirectory }?.let { dir ->
+            val rev = ndkRevision(dir)
+            if (rev == pinnedNdkVersion) return dir
+            rejectedNdks += "\$ANDROID_NDK_HOME=$dir is NDK ${rev ?: "<unknown>"}"
+        }
     }
     // java.util.Properties for real unescaping — Windows local.properties
     // writes sdk.dir=C\:\\Users\\… which a raw line split would mangle.
@@ -729,17 +754,15 @@ fun findAndroidNdk(): File? {
         ?: System.getenv("ANDROID_HOME")
         ?: System.getenv("ANDROID_SDK_ROOT")
         ?: return null
-    val numericVersion = Comparator<File> { a, b ->
-        val pa = a.name.split('.')
-        val pb = b.name.split('.')
-        (0 until maxOf(pa.size, pb.size)).asSequence()
-            .map { i ->
-                (pa.getOrNull(i)?.toLongOrNull() ?: -1L)
-                    .compareTo(pb.getOrNull(i)?.toLongOrNull() ?: -1L)
-            }
-            .firstOrNull { it != 0 } ?: 0
-    }
-    return File(sdkDir, "ndk").listFiles()?.filter { it.isDirectory }?.maxWithOrNull(numericVersion)
+    val dir = File(sdkDir, "ndk/$pinnedNdkVersion")
+    if (!dir.isDirectory) return null
+    val rev = ndkRevision(dir)
+    if (rev == pinnedNdkVersion) return dir
+    // Present under the pinned name but not that NDK (a partial install, a
+    // hand-copied directory): say so, or sdkmanager's "already installed"
+    // would leave the developer guessing.
+    rejectedNdks += "$dir has ${if (rev == null) "no readable source.properties" else "Pkg.Revision $rev"}"
+    return null
 }
 val androidNdkDir = findAndroidNdk()
 
@@ -817,7 +840,7 @@ tasks.register<Exec>("cargoBuildHost") {
     rustToolchainPath?.let { environment("PATH", it) }
     commandLine(
         buildList {
-            addAll(listOf(rustTool("cargo"), "build", "--release", "--workspace"))
+            addAll(listOf(rustTool("cargo"), "build", "--locked", "--release", "--workspace"))
             // Enable Tor only on the engine crate (package/feature form — a bare
             // `--features tor` with `--workspace` would try every member).
             if (torEngine) addAll(listOf("--features", "myotis-engine/tor"))
@@ -848,7 +871,7 @@ tasks.register<Exec>("uniffiGenerateKotlin") {
     workingDir = file("rust")
     rustToolchainPath?.let { environment("PATH", it) }
     commandLine(
-        rustTool("cargo"), "run", "--release", "-p", "uniffi-bindgen", "--",
+        rustTool("cargo"), "run", "--locked", "--release", "-p", "uniffi-bindgen", "--",
         "generate", "--library", "$rustReleaseDir/${hostLibNames.last()}".removePrefix("rust/"),
         "--language", "kotlin", "--no-format",
         "--out-dir", project(":myotis-engine-rust").projectDir.resolve("src/main/kotlin").absolutePath,
@@ -894,7 +917,7 @@ val cargoTest = tasks.register<Exec>("cargoTest") {
     onlyIf { rustAvailable }
     workingDir = file("rust")
     rustToolchainPath?.let { environment("PATH", it) }
-    commandLine(rustTool("cargo"), "test", "--workspace")
+    commandLine(rustTool("cargo"), "test", "--locked", "--workspace")
     // No declared outputs: cargo's own incrementalism makes a no-change rerun
     // cheap, and test verdicts aren't files Gradle could fingerprint.
 }
@@ -984,7 +1007,7 @@ val cargoCheckWasm = tasks.register<Exec>("cargoCheckWasm") {
     workingDir = file("rust")
     rustToolchainPath?.let { environment("PATH", it) }
     commandLine(
-        rustTool("cargo"), "check", "--target", "wasm32-unknown-unknown",
+        rustTool("cargo"), "check", "--locked", "--target", "wasm32-unknown-unknown",
         "-p", "myotis-consensus", "-p", "myotis-core", "-p", "myotis-wire",
     )
     // No declared outputs, same rationale as cargoTest: cargo's own
@@ -1010,7 +1033,7 @@ val cargoBuildNoStd = tasks.register<Exec>("cargoBuildNoStd") {
     workingDir = file("rust")
     rustToolchainPath?.let { environment("PATH", it) }
     commandLine(
-        rustTool("cargo"), "build", "--target", "x86_64-unknown-none",
+        rustTool("cargo"), "build", "--locked", "--target", "x86_64-unknown-none",
         "-p", "myotis-core", "-p", "myotis-wire", "--no-default-features",
     )
     // No declared outputs, same rationale as cargoTest.
@@ -1042,7 +1065,7 @@ val skipRustEngine = project.hasProperty("skipRustEngine") &&
 extra["myotis.skipRustEngine"] = skipRustEngine
 val androidRustTargets = listOf("aarch64-linux-android", "x86_64-linux-android")
 val androidRustToolchainReady = rustAvailable &&
-    cargoNdkVersion.isNotEmpty() &&
+    cargoNdkVersionNumber == pinnedCargoNdkVersion &&
     androidNdkDir != null &&
     androidRustTargets.all { it in installedRustupTargets }
 
@@ -1100,10 +1123,20 @@ tasks.register("requireAndroidRustEngine") {
         }
         if (!androidRustToolchainReady) {
             val missing = buildList {
-                if (cargoVersion.isEmpty()) add("cargo/rustc (need $minRustVersion or newer)")
+                if (cargoVersion.isEmpty()) add(
+                    "cargo/rustc — with rustup, the toolchain rust/rust-toolchain.toml pins " +
+                        "(`cd rust && rustup toolchain install` fetches it; offline or with " +
+                        "RUSTUP_AUTO_INSTALL=0 rustup cannot); without rustup, $minRustVersion or newer",
+                )
                 else if (!rustAvailable) add("a newer rustc (need $minRustVersion+; found \"$cargoVersion\")")
-                if (cargoNdkVersion.isEmpty()) add("cargo-ndk (`cargo install cargo-ndk`)")
-                if (androidNdkDir == null) add("the Android NDK r28+ (set ANDROID_NDK_HOME, or install it under <sdk>/ndk/)")
+                val installCargoNdk = "`cargo install cargo-ndk --version $pinnedCargoNdkVersion --locked`"
+                if (cargoNdkVersion.isEmpty()) add("cargo-ndk $pinnedCargoNdkVersion ($installCargoNdk)")
+                else if (cargoNdkVersionNumber != pinnedCargoNdkVersion) add("cargo-ndk $pinnedCargoNdkVersion, the pinned version (found \"$cargoNdkVersion\"; $installCargoNdk)")
+                if (androidNdkDir == null) add(
+                    "the Android NDK $pinnedNdkVersion, the pinned version (`sdkmanager \"ndk;$pinnedNdkVersion\"`, " +
+                        "or point ANDROID_NDK_HOME at it" +
+                        (if (rejectedNdks.isEmpty()) ")" else "; rejected: ${rejectedNdks.joinToString()})"),
+                )
                 val tgts = androidRustTargets.filterNot { it in installedRustupTargets }
                 if (tgts.isNotEmpty()) add("Android rustup targets (`rustup target add ${tgts.joinToString(" ")}`)")
             }
@@ -1223,7 +1256,7 @@ fun registerCargoBuildIos(taskName: String, triple: String) =
         // blst's ___chkstk_darwin stays undefined there. In the staticlib the symbol
         // simply stays unresolved until the app link, where Xcode's clang provides it.
         commandLine(
-            rustTool("cargo"), "rustc", "--release", "--target", triple, "-p", "myotis-engine",
+            rustTool("cargo"), "rustc", "--locked", "--release", "--target", triple, "-p", "myotis-engine",
             "--crate-type", "staticlib",
         )
         inputs.files(rustSources).withPathSensitivity(PathSensitivity.RELATIVE)
@@ -1289,7 +1322,7 @@ gradle.taskGraph.whenReady {
     listOf("cargoBuildIosDevice" to "aarch64-apple-ios", "cargoBuildIosSim" to "aarch64-apple-ios-sim")
         .forEach { (task, triple) ->
             if (allTasks.any { it.name == task } && (!isMacHost || rustSkipNote != null || triple !in installedRustupTargets)) {
-                val prereqs = "needs macOS + cargo + `rustup target add --toolchain stable $triple`"
+                val prereqs = "needs macOS + cargo + `(cd rust && rustup target add $triple)` (the toolchain rust/rust-toolchain.toml pins)"
                 logger.warn(
                     if (iosFrameworkBuildable)
                         "[rust] $task skipped ($prereqs) — the iOS framework will embed the EXISTING " +

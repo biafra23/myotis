@@ -16,7 +16,7 @@ on:
   push:
     branches: [ "main" ]
     tags: [ "v*" ]
-    paths: ['rust/**', '.github/workflows/ios-xcframework.yml']
+    paths: ['rust/**', '.github/workflows/ios-xcframework.yml', '.github/actions/rust-toolchain/**']
   workflow_dispatch:
 
 concurrency:
@@ -29,8 +29,14 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install iOS rust targets
-        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+      # The pinned toolchain (rust/rust-toolchain.toml, #734) WITH the iOS
+      # targets. A bare `rustup target add` from the repo root adds them to the
+      # image's DEFAULT toolchain, while build-xcframework.sh builds in rust/,
+      # where the pin selects 1.99.1 — which then has no iOS std the day the
+      # image's stable moves on.
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust

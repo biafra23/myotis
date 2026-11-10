@@ -16,11 +16,13 @@
 # been red from day one. Ratchet from here instead of jumping: clear a group,
 # then deny it (`-D clippy::perf`), and end at `-D warnings` as roost.yml has.
 #
-# Real stable, like the sibling Rust lanes (dtolnay@stable), so a new release
-# can surface a new deny-level lint here. The weekly run on main is what makes
-# it surface on main first, rather than on whichever PR next touches rust/.
-# That is this lane doing its job: a deny-level hit names wrong code — fix it
-# rather than pin the toolchain.
+# The rustc rust/rust-toolchain.toml pins, like every Rust lane (#734, decision
+# D-a). This lane used to track real stable so that a new release surfaced a new
+# deny-level lint here first; with every lane on the pinned rustc, nothing sees a
+# new release until a reviewed PR bumps rust-toolchain.toml, and that PR is where
+# a new lint surfaces now — this lane runs on it (rust/** path filter). A
+# deny-level hit still names wrong code: fix it in that PR rather than hold the
+# bump back. The weekly run on main keeps checking the pinned toolchain.
 #
 # Default features only: `myotis-engine/tor` would pull the Arti tree into CI,
 # which rust/Cargo.toml rules out.
@@ -36,14 +38,19 @@ on:
       - "!rust/roost/**"
       - "!rust/tor-poc/**"
       - ".github/workflows/rust-clippy.yml"
+      - ".github/actions/rust-toolchain/**"
   pull_request:
     paths:
       - "rust/**"
       - "!rust/roost/**"
       - "!rust/tor-poc/**"
       - ".github/workflows/rust-clippy.yml"
-  # Fridays: Rust stable releases ship on Thursdays, so a new release's
-  # deny-level lints show up on main within a day, whatever the diffs touch.
+      - ".github/actions/rust-toolchain/**"
+  # Weekly. It used to catch a new Rust stable's deny-level lints the day after
+  # its Thursday release; with the toolchain pinned (#734) that happens in the
+  # PR that bumps rust/rust-toolchain.toml. What a weekly re-run of an unchanged
+  # toolchain, lock and tree can still catch is rot around them: a runner-image
+  # or registry change that breaks the lane before a PR needs it.
   schedule:
     - cron: "23 6 * * 5"
   workflow_dispatch:
@@ -61,7 +68,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-toolchain
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -79,4 +86,4 @@ jobs:
       # -PtorEngine build on an exactly-floor toolchain is the one path it misses.
       - name: Clippy (fails on deny-level lints and on code above the MSRV; other warnings are reported only)
         working-directory: rust
-        run: cargo clippy --workspace --all-targets --keep-going -- -D clippy::incompatible_msrv
+        run: cargo clippy --locked --workspace --all-targets --keep-going -- -D clippy::incompatible_msrv

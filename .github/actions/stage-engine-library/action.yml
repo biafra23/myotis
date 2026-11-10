@@ -6,8 +6,8 @@
 # the staging retry or the verification never has to be applied twice.
 #
 # The AAR builds the Rust engine FROM SOURCE (:myotis-engine's preBuild chain),
-# so this sets up the Android rustup targets, cargo-ndk and the runner's NDK as
-# android-apk.yml does. No -PskipRustEngine — a published AAR without the
+# so this sets up the Android rustup targets and the pinned NDK, build-tools and
+# cargo-ndk as android-apk.yml does. No -PskipRustEngine — a published AAR without the
 # engine is a library that loads nothing.
 name: Stage the engine library
 description: Build the eth.myotis publication into build/maven-repo and check it
@@ -57,7 +57,7 @@ runs:
       run: chmod +x gradlew
 
     - name: Set up Rust (Android targets)
-      uses: dtolnay/rust-toolchain@stable
+      uses: ./.github/actions/rust-toolchain
       with:
         targets: aarch64-linux-android,x86_64-linux-android
 
@@ -68,10 +68,8 @@ runs:
         shared-key: engine-library-rust
         save-if: ${{ inputs.save-rust-cache }}
 
-    - name: Install cargo-ndk
-      uses: taiki-e/install-action@v2
-      with:
-        tool: cargo-ndk
+    - name: Install the pinned NDK, build-tools and cargo-ndk
+      uses: ./.github/actions/android-native-toolchain
 
     # Retry to ride out transient dependency-resolution blips, as the APK build
     # does. The staging repository is wiped first: Gradle's publish only adds,

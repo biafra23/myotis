@@ -6,8 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 # Build all modules. NOTE: :android-app builds the Rust engine from source by
-# default, so a full build needs the Android Rust toolchain (cargo + cargo-ndk +
-# NDK r28+ + the aarch64/x86_64-linux-android rustup targets). Without it, add
+# default, so a full build needs the Android Rust toolchain (cargo + the cargo-ndk
+# and NDK versions pinned in gradle/libs.versions.toml + the
+# aarch64/x86_64-linux-android rustup targets). Without it, add
 # -PskipRustEngine to build the app on the Java engine, which boots only on
 # Android 13 / API 33+ (see the Rust section below).
 ./gradlew build                  # add -PskipRustEngine without the Android Rust toolchain
@@ -51,7 +52,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ./gradlew cargoNdkAndroid  # Android jniLibs, built from source (needs cargo-ndk + NDK + Android rustup targets)
 
 # The Android engine library (:myotis-engine, the AAR the Android app consumes)
-# builds the Rust engine FROM SOURCE by default — cargo + cargo-ndk + NDK r28+ +
+# builds the Rust engine FROM SOURCE by default — cargo + the pinned cargo-ndk and
+# NDK (gradle/libs.versions.toml) +
 # `rustup target add aarch64-linux-android x86_64-linux-android` are REQUIRED to
 # build it, and so :android-app. There is no committed .so (so nothing can drift);
 # an Android build also regenerates the committed UniFFI bindings (:myotis-engine-rust)
@@ -61,8 +63,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ./gradlew :android-app:assembleDebug -PskipRustEngine  # Java engine only (no Rust engine / native BLS); boots on API 33+ only
 
 # iOS (macOS only; needs Xcode 26+ and the rustup targets on the toolchain the
-# workspace's rust-toolchain.toml selects — i.e.
-# `rustup target add --toolchain stable aarch64-apple-ios aarch64-apple-ios-sim`).
+# workspace's rust-toolchain.toml pins — run inside rust/ so they land on it:
+# `(cd rust && rustup target add aarch64-apple-ios aarch64-apple-ios-sim)`).
 # Cargo stays optional here too: without the toolchain (and with no previously
 # built libmyotis_engine.a) :myotis-engine-ios and :app-ios disable their tasks with a warning
 # instead of failing the build — the full toolchain is required only to actually

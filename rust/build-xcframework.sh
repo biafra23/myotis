@@ -44,7 +44,7 @@ echo "==> Building release staticlibs"
 # slices, which is the documented path (see the Cargo.toml comment).
 for t in "$DEVICE" "$SIM_ARM" "$SIM_X86"; do
   echo "    - $t"
-  cargo rustc -p myotis-engine --release --crate-type staticlib --target "$t"
+  cargo rustc --locked -p myotis-engine --release --crate-type staticlib --target "$t"
 done
 
 echo "==> Staging header + modulemap"

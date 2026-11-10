@@ -166,7 +166,7 @@ jobs:
       # source here. prepareRustAppResources fails the build if the lib is
       # missing, so this step is REQUIRED, not optional.
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/rust-toolchain
         with:
           # Both matrix legs run on arm64 macos-15; the x64 leg is a Rosetta
           # cross-build. cargo builds its HOST triple regardless of the JVM's

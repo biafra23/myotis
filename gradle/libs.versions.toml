@@ -76,6 +76,18 @@ besu = "26.4.0"
 # jar and Android @aar can't drift apart under conflict resolution.
 jna = "5.18.1"
 agp = "8.7.3"
+# Android NATIVE toolchain, pinned exactly (#734, Part 2). The single source for
+# Gradle (ndkVersion/buildToolsVersion in :android-app and :myotis-engine, and the
+# root cargoNdkAndroid gate), for CI (.github/actions/android-native-toolchain
+# installs these) and for scripts/sign_release_apk.sh. A floating NDK or
+# cargo-ndk changes the shipped .so bytes, a floating build-tools the signer.
+# NDK r28+ is required for 16 KB-aligned LOAD segments by default (Android 15+
+# 16 KB-page devices; rust/build-android.sh checks it); 29.0 is the newest r29
+# and preinstalled on GitHub's ubuntu-24.04 image. Bumping any of the three is a
+# reviewed PR that rebuilds the APK (android-apk.yml).
+android-ndk = "29.0.14206865"
+android-build-tools = "37.0.0"
+cargo-ndk = "4.1.2"
 # Kotlin 2.2.21 is the FLOOR for the iOS target: it's the first release whose
 # Kotlin/Native supports Xcode 26 (required to link against the iOS 26 SDK).
 kotlin = "2.2.21"
