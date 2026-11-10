@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -47,10 +48,12 @@ type Config struct {
 	Network *chain.Network
 	// Key is the node's persistent identity (nodekey.Load).
 	Key *ecdsa.PrivateKey
-	// ListenPort is the UDP port discv4 binds; 0 picks an ephemeral port.
+	// ListenPort is the UDP port discv4 binds; 0 selects the network's
+	// default port, -1 binds an ephemeral one.
 	ListenPort int
-	// OnDiscovered, when set, is called once per new candidate from a service
-	// goroutine. It must not block.
+	// OnDiscovered, when set, is called from a service goroutine for each
+	// newly seen candidate and again whenever a known candidate's TCP
+	// endpoint changes. It must not block.
 	OnDiscovered func(Candidate)
 	Logger       *slog.Logger
 }
@@ -64,6 +67,10 @@ type Service struct {
 
 	mu         sync.Mutex
 	candidates map[enode.ID]Candidate
+	// dnsIt is the live DNS-tree iterator, if any. Close() must call its
+	// Close: geth's randomIterator.Next() blocks inside the iterator and
+	// only returns false once the iterator itself is closed.
+	dnsIt enode.Iterator
 
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -90,11 +97,20 @@ func Start(cfg Config) (*Service, error) {
 	}
 	localNode := enode.NewLocalNode(nodeDB, cfg.Key)
 
-	addr := net.UDPAddr{Port: port}
-	conn, err := net.ListenUDP("udp", &addr)
+	bindPort := port
+	if bindPort < 0 {
+		bindPort = 0 // ask the OS for a free port
+	}
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: bindPort})
 	if err != nil {
 		nodeDB.Close()
-		return nil, fmt.Errorf("bind udp :%d: %w", port, err)
+		return nil, fmt.Errorf("bind udp :%d: %w", bindPort, err)
+	}
+	// Advertise the real bound port in our ENR (the PING/PONG payload peers
+	// put in their routing tables); without it they see an address-less
+	// record and can't point lookups back at us.
+	if udpAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		localNode.SetFallbackUDP(udpAddr.Port)
 	}
 
 	seeds := make([]*enode.Node, 0, len(cfg.Network.Bootnodes))
@@ -141,6 +157,12 @@ func Start(cfg Config) (*Service, error) {
 func (s *Service) Close() {
 	s.stopOnce.Do(func() {
 		close(s.stop)
+		// Release a walkDNSTree stuck inside the iterator's blocking Next().
+		s.mu.Lock()
+		if s.dnsIt != nil {
+			s.dnsIt.Close()
+		}
+		s.mu.Unlock()
 		s.done.Wait()
 		s.tab.Close()
 		s.nodeDB.Close()
@@ -174,28 +196,40 @@ func (s *Service) snapshot() []Candidate {
 	return out
 }
 
-// addCandidate records a peer and fires OnDiscovered the first time it is
-// seen with a TCP endpoint (the RLPx layer can only dial those).
+// addCandidate records a peer with a dialable TCP endpoint (the RLPx layer
+// can only dial those). A known peer whose ENR moved (the DNS tree lags and
+// carries stale endpoints; discv4 proves the live one) replaces the stored
+// record and re-fires OnDiscovered.
 func (s *Service) addCandidate(src Source, n *enode.Node) {
 	if n.TCP() == 0 || n.IP() == nil || n.IP().IsUnspecified() {
 		return
 	}
-	s.mu.Lock()
-	c, known := s.candidates[n.ID()]
-	if !known {
-		c = Candidate{
+	c, fire := func() (Candidate, bool) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		old, known := s.candidates[n.ID()]
+		if known && endpointOf(old.Node) == endpointOf(n) {
+			return Candidate{}, false
+		}
+		c := Candidate{
 			ID:        n.ID(),
 			Node:      n,
 			Source:    src,
 			FirstSeen: time.Now(),
 		}
+		if known {
+			c.FirstSeen = old.FirstSeen
+		}
 		s.candidates[n.ID()] = c
-	}
-	s.mu.Unlock()
-
-	if !known && s.cfg.OnDiscovered != nil {
+		return c, true
+	}()
+	if fire && s.cfg.OnDiscovered != nil {
 		s.cfg.OnDiscovered(c)
 	}
+}
+
+func endpointOf(n *enode.Node) string {
+	return net.JoinHostPort(n.IP().String(), strconv.Itoa(n.TCP()))
 }
 
 // watchTable polls the discv4 routing table for live nodes.
@@ -219,12 +253,17 @@ func (s *Service) watchTable() {
 	}
 }
 
-// walkDNSTree iterates the EIP-1459 list (geth's dnsdisc client verifies the
-// tree root signature against the key in the URL; leaves are trusted as the
-// tree operator signs them) and re-walks when the iterator ends.
+// walkDNSTree streams the EIP-1459 list into the candidate pool (geth's
+// dnsdisc client verifies the tree root signature against the key in the URL).
+// NewIterator returns a randomIterator, which is a continuous sampler, not a
+// one-shot walk: it delivers randomly sampled leaves (duplicates included —
+// addCandidate dedups by node id) at the client's rate limit, re-syncing the
+// tree itself, and returns false only after Close(). Close() unblocks it via
+// the iterator stored on the service; the outer loop only restarts after a
+// failed start or an unexpected end.
 func (s *Service) walkDNSTree() {
 	defer s.done.Done()
-	backoff := time.Minute
+	const backoff = time.Minute
 	for {
 		select {
 		case <-s.stop:
@@ -241,25 +280,40 @@ func (s *Service) walkDNSTree() {
 			}
 			continue
 		}
-		// geth's dnsdisc iterator refreshes the tree itself and only stops
-		// when closed or the service exits; the outer loop just restarts it
-		// if it ever ends on its own.
-		count := 0
-		for it.Next() {
-			select {
-			case <-s.stop:
-				it.Close()
-				return
-			default:
-			}
-			s.addCandidate(SourceDNS, it.Node())
-			count++
+
+		s.mu.Lock()
+		s.dnsIt = it
+		stopping := isClosed(s.stop)
+		s.mu.Unlock()
+		if stopping {
+			// Close() already ran its iterator hook against the previous nil;
+			// release this one ourselves.
+			it.Close()
+			return
 		}
-		it.Close()
-		s.log.Info("dns tree walk finished", "nodes", count)
+
+		for it.Next() {
+			s.addCandidate(SourceDNS, it.Node())
+		}
+		s.mu.Lock()
+		if s.dnsIt == it {
+			s.dnsIt = nil
+		}
+		s.mu.Unlock()
+		it.Close() // idempotent; unblocks nothing if Next already returned
+
 		if !s.sleep(backoff) {
 			return
 		}
+	}
+}
+
+func isClosed(ch chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
 	}
 }
 

@@ -26,7 +26,7 @@ func main() {
 	}
 	var (
 		dataDir    = flag.String("datadir", defaultDir, "directory for the node key and peer database")
-		listenPort = flag.Int("port", chain.Mainnet().ListenPort, "discv4 UDP port")
+		listenPort = flag.Int("port", chain.Mainnet().ListenPort, "discv4 UDP port (0 = network default, -1 = ephemeral)")
 		runFor     = flag.Duration("run-for", 0, "exit after this duration (0 = run until interrupted)")
 		quiet      = flag.Bool("quiet", false, "log only new peers, not the periodic summary")
 	)

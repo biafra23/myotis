@@ -459,7 +459,9 @@ asset workflow and a stronger action than the merge this file already forbids.
 2. **Re-sync the mainnet discv4 bootnodes from go-ethereum?** Source of
    truth is geth's `params/bootnodes.go` `MainnetBootnodes`. Pin sites:
    `NetworkConfig.MAINNET`, `ElConfig::mainnet()`
-   (`rust/myotis-net/src/el/reader.rs`), `rust/tor-poc` (with pubkeys), and
+   (`rust/myotis-net/src/el/reader.rs`), `rust/tor-poc` (with pubkeys),
+   `go/internal/chain/chain.go` (with its `TestMainnetPins`; run
+   `go test ./...` under `go/` after the edit — Gradle CI doesn't), and
    any other verbatim copy — do not trust this list, `grep -rn` the tree for
    one of the current addresses before and after the edit until zero copies
    of the old ones remain. Since #414 the `myotis-net` live tests read
