@@ -30,7 +30,7 @@ differs.
 |---|---|---|
 | Android app, unsigned | `Myotis-<tag>-android-unsigned.apk` | **Gated.** Bit for bit. |
 | Android app, signed | `Myotis-<tag>-android.apk` | The unsigned APK plus a signature, and nothing else ([below](#the-signed-apk)). The signature itself needs the release key and is not reproducible by design. |
-| Android debug app | `Myotis-<tag>-android-debug.apk` | **Gated**, by payload: every entry of the APK. Its signature is left out: every build machine signs with its own generated debug key. |
+| Android debug app | `Myotis-<tag>-android-debug.apk` | **Gated**, by payload: every entry of the APK. Its signature files are left out of the comparison. The signer is the one public debug key in the tree (`android-app/debug.keystore`), the same on every machine. |
 | Engine library | `myotis-engine-<tag>-android.aar`, `myotis-engine-<tag>-maven-repo.zip` | **Gated**, as staged: the AAR, its jars, poms and metadata. In the zip, the natives jars for macOS and Linux and the iOS module come from other builders (see below). |
 | Linux desktop | `Myotis-<tag>-<arch>.deb` | Compared and reported, not gated yet. |
 | macOS desktop | `Myotis-<tag>-<arch>.dmg` | Compared and reported, not gated yet. Unsigned, not notarized. |
@@ -92,12 +92,17 @@ gh attestation verify Myotis-v0.1.21-android.apk \
   --repo biafra23/myotis --source-ref refs/tags/v0.1.21
 ```
 
-It fails if the file is not the one a workflow of this repository attested
-for that tag. To check a whole release at once, checksums included:
+It fails if the file is not one a workflow of this repository attested for
+that tag. To check a whole release at once, checksums included:
 
 ```bash
 scripts/verify_release.sh v0.1.21
 ```
+
+That is stricter than the single command above: for each asset it also asks
+for the commit the tag points at (`--source-digest`) and for the workflow that
+is supposed to build that asset (`--signer-workflow`, e.g. `android-apk.yml`
+for the APKs).
 
 That is what the `verify release` workflow runs on every tag, once the
 publishing workflows are done.
@@ -166,10 +171,12 @@ diffoscope android-app/build/outputs/apk/release/android-app-release-unsigned.ap
   Myotis-v0.1.21-android-unsigned.apk
 ```
 
-The debug APK is compared by content, since its signature differs on every
-build: `scripts/repro/collect.sh` extracts both sides the same way, and
+The debug APK is compared by content: `scripts/repro/collect.sh` extracts
+every entry of both sides the same way, leaving out the signature files, and
 `scripts/repro/compare.py` compares the two trees. That is the comparison CI
-makes.
+makes. (It is signed with the public debug key in the tree, the same for
+everyone, so the whole file may well match too; the comparison does not
+depend on it.)
 
 ### The signed APK
 

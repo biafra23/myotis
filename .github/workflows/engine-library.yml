@@ -340,23 +340,21 @@ jobs:
   # repository's Packages page. Then "Re-run all jobs", not "Re-run failed
   # jobs": eth.myotis:myotis-engine-ios is published by the ios-engine job,
   # which a failed-jobs re-run leaves out (the step after the Gradle publish
-  # fails the run if the module is missing). The release assets re-upload
-  # with --clobber.
+  # fails the run if the module is missing). The release assets are NOT part
+  # of that: the `release` job below attaches them from the staged repository
+  # this job uploads, and "Re-run failed jobs" re-runs it alone.
   publish:
-    name: Publish to GitHub Packages and the release
+    name: Publish to GitHub Packages
     needs: [version-guard, host-natives, ios-engine]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     permissions:
-      # gh release create/upload/edit needs write access to Releases; the Maven
-      # publish needs write access to Packages.
-      contents: write
+      # Read-only on the repository: the release upload and its attestation
+      # are the `release` job's, which runs no build (#734). The Maven publish
+      # needs write access to Packages.
+      contents: read
       packages: write
-      # The build-provenance attestation of the uploaded assets (#734): an OIDC
-      # token for the Sigstore certificate, and the attestation's storage.
-      id-token: write
-      attestations: write
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -458,7 +456,67 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
+  # The release's assets: the AAR, the Maven-repository zip and their checksum
+  # file, with their build-provenance attestation (#734).
+  #
+  # Its own job, like maven-repo-branch below and for the same reason: it is
+  # keyed on the staged repository the publish job uploads once the version is
+  # on GitHub Packages, so it runs whenever that job got that far, and a
+  # failure HERE (a release upload blip, Sigstore having a bad minute) is
+  # repaired with "re-run failed jobs", which re-runs this job alone and never
+  # the Packages publish that would refuse its own version. And it runs no
+  # build: the job that holds the attestation permissions only downloads an
+  # artifact, zips it and uploads, as the other publishers' release jobs do.
+  # The zip is made here, from the same tree: repro_zip.sh gives every entry
+  # one mtime and fixed modes, so it does not matter that an artifact carries
+  # neither.
+  release:
+    name: Attach the engine library to the release
+    needs: publish
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    permissions:
+      # gh release create/upload/edit needs write access to Releases.
+      contents: write
+      # The build-provenance attestation of the uploaded assets (#734): an OIDC
+      # token for the Sigstore certificate, and the attestation's storage.
+      id-token: write
+      attestations: write
+    steps:
+      # The release notes and the scripts that write them and upload, plus the
+      # zip script, from the commit being released (its commit time is the
+      # zip's one mtime).
+      - name: Check out the release scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          sparse-checkout: |
+            .github/release-notes.md
+            .github/release-notes.sh
+            .github/release-assets.sh
+            scripts/repro_zip.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      # Absent when the publish job failed before the version reached GitHub
+      # Packages: then there is nothing to attach, and this job says so
+      # instead of failing. After a SUCCESSFUL publish a download failure is a
+      # real error and fails the job, for "re-run failed jobs" to retry.
+      - name: Download the staged repository
+        id: staged
+        continue-on-error: ${{ needs.publish.result != 'success' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: engine-library-maven-repo-release-${{ github.sha }}
+          path: build/maven-repo
+
+      - name: Nothing to attach
+        if: steps.staged.outcome != 'success'
+        run: |
+          echo "the publish job did not reach GitHub Packages for ${GITHUB_REF_NAME} (its result: ${{ needs.publish.result }}); no engine-library assets go on the release" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Assemble the release assets
+        if: steps.staged.outcome == 'success'
         run: |
           set -euo pipefail
           # The tag goes into the asset file names (as for the APK and the dmg).
@@ -480,8 +538,10 @@ jobs:
           (cd assets && sha256sum myotis-engine-*.aar myotis-engine-*.zip > myotis-engine.SHA256SUMS && cat myotis-engine.SHA256SUMS)
 
       - name: Publish to GitHub Release
+        if: steps.staged.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -eu
           tag="${GITHUB_REF_NAME}"
@@ -515,6 +575,7 @@ jobs:
           bash .github/release-notes.sh append "$tag" "$section"
 
       - name: Attest the engine library's build provenance
+        if: steps.staged.outcome == 'success'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
           subject-checksums: ${{ runner.temp }}/release-assets.SHA256SUMS
@@ -523,7 +584,7 @@ jobs:
       # all publishers share, kept apart from this job's own upload and
       # attestation (.github/release-assets.sh).
       - name: List the release's assets in SHA256SUMS
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.staged.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}

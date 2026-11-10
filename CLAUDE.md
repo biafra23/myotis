@@ -709,9 +709,10 @@ asset workflow and a stronger action than the merge this file already forbids.
    - **`verify release`** waits for the publishers, then checks the finished
      release from the outside (`scripts/verify_release.sh <tag>`): its
      `SHA256SUMS` lists every asset and every hash matches, every asset has a
-     build-provenance attestation from this repository for a run on the tag's
-     ref, and the signed APK is the published unsigned APK plus its signature
-     and nothing else.
+     build-provenance attestation from this repository, by the workflow that
+     builds that asset, for a run on the tag's ref at the tag's commit, and
+     the signed APK is the published unsigned APK plus its signature and
+     nothing else.
    - **`reproducible builds`** rebuilds the tag twice (the gate of the section
      above), and its `Compare the image build with the published assets` job
      sets the rebuild in the builder image next to the Android assets the
@@ -735,8 +736,16 @@ keeps the release's one `SHA256SUMS` complete across the nine publishers. A
 new publisher has all three and joins the list in
 `release-version-guard.yml`'s header. `scripts/test_release_assets.sh` (run by
 CI) fails on a bare upload, or an upload without the checksums step, in any
-workflow. docs/guides/reproducible-builds.md is the page for someone checking
-a release.
+workflow, and the verifier knows which workflow builds which asset
+(`workflow_of` in `scripts/verify_release.sh`): a new publisher adds its
+family there too. **None of this path runs before a tag, so rehearse it**:
+the `release rehearsal` workflow sends a dummy file through the same steps on
+a draft release (upload, attestation at the pinned action, `--checksums`,
+`gh attestation verify` with the verifier's flags) and deletes the draft. It
+runs by itself on a PR that changes the scripts; dispatch it before a tag
+whenever the runner image, `gh` or the attestation action has moved since the
+last release. docs/guides/reproducible-builds.md is the page for someone
+checking a release.
 
 ## Demo bundles build on merge to `main`, never on PRs
 

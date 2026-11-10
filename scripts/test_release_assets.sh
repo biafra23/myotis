@@ -45,9 +45,10 @@ tick() { # FILE: true while its counter is above 0, counting it down
   echo $((c - 1)) > "$1"
 }
 case "$1 ${2:-}" in
-  "api repos/"*"/releases/tags/"*)
-    [ -f "$d/exists" ] || { echo "Not Found" >&2; exit 1; }
+  "release view")
+    [ -f "$d/exists" ] || { echo "release not found" >&2; exit 1; }
     echo 42 ;;
+  "api repos/"*"/commits/tags/"*) echo "$COMMIT" ;;
   "api --paginate")
     case "$3" in "repos/"*"/releases/42/assets?per_page=100") ;; *) exit 97 ;; esac
     for f in "$d"/assets/*; do
@@ -90,8 +91,13 @@ case "$1 ${2:-}" in
         cat "$d/assets/SHA256SUMS" ;;
     esac ;;
   "attestation verify")
+    if [ "$3" = --help ]; then
+      [ -f "$d/old_gh" ] && echo "  --repo  --owner" || echo "  --repo  --source-ref  --source-digest  --signer-workflow"
+      exit 0
+    fi
     [ ! -f "$d/unattested/$3" ] || { echo "no attestations found for $3" >&2; exit 1; }
-    case " $* " in *" --source-ref refs/tags/v1 "*) ;; *) echo "wrong --source-ref" >&2; exit 1 ;; esac ;;
+    case " $* " in *" --source-ref refs/tags/v1 --source-digest $COMMIT "*) ;; *) echo "wrong source" >&2; exit 1 ;; esac
+    echo "$*" | sed 's/.*--signer-workflow //' >> "$d/signers" ;;
   *) exit 98 ;;
 esac
 STUB
@@ -114,31 +120,31 @@ complete() {
   (cd "$STUB_DIR/assets" && { if command -v sha256sum >/dev/null 2>&1; then sha256sum -c SHA256SUMS; else shasum -a 256 -c SHA256SUMS; fi; } > /dev/null 2>&1) \
     && [ "$(sed 's/^[0-9a-f]*  //' "$STUB_DIR/assets/SHA256SUMS")" = "$(cd "$STUB_DIR/assets" && ls | grep -vx SHA256SUMS | LC_ALL=C sort)" ]
 }
-mkdir -p "$T/in"; printf one > "$T/in/a.apk"; printf two > "$T/in/b.dmg"
+mkdir -p "$T/in"; printf one > "$T/in/Myotis-v1-arm64.dmg"; printf two > "$T/in/Myotis-v1-x64.deb"
 
 # --- the upload form ----------------------------------------------------------
 fresh
-bash $R v1 "$T/in/a.apk" "$T/in/b.dmg" > /dev/null; rc=$?
-check "uploads the files" '[ $rc = 0 ] && cmp -s "$T/in/a.apk" "$STUB_DIR/assets/a.apk" && cmp -s "$T/in/b.dmg" "$STUB_DIR/assets/b.dmg"'
+bash $R v1 "$T/in/Myotis-v1-arm64.dmg" "$T/in/Myotis-v1-x64.deb" > /dev/null; rc=$?
+check "uploads the files" '[ $rc = 0 ] && cmp -s "$T/in/Myotis-v1-arm64.dmg" "$STUB_DIR/assets/Myotis-v1-arm64.dmg" && cmp -s "$T/in/Myotis-v1-x64.deb" "$STUB_DIR/assets/Myotis-v1-x64.deb"'
 check "the attestation subjects are the uploaded files, in sha256sum format" \
-  '[ "$(sed "s/^[0-9a-f]\{64\}  //" "$RELEASE_ASSETS_SUBJECTS" | tr "\n" " ")" = "a.apk b.dmg " ]'
+  '[ "$(sed "s/^[0-9a-f]\{64\}  //" "$RELEASE_ASSETS_SUBJECTS" | tr "\n" " ")" = "Myotis-v1-arm64.dmg Myotis-v1-x64.deb " ]'
 check "the upload form leaves SHA256SUMS to --checksums" '[ "$(writes)" = 0 ]'
 
-fresh; touch "$STUB_DIR/corrupt/a.apk"
-bash $R v1 "$T/in/a.apk" > /dev/null 2> "$STUB_DIR/err"; rc=$?
+fresh; touch "$STUB_DIR/corrupt/Myotis-v1-arm64.dmg"
+bash $R v1 "$T/in/Myotis-v1-arm64.dmg" > /dev/null 2> "$STUB_DIR/err"; rc=$?
 check "an asset whose digest is not the built file's fails, and is not a subject" \
-  '[ $rc = 1 ] && grep -q "::error::.*a.apk" "$STUB_DIR/err" && [ ! -f "$RELEASE_ASSETS_SUBJECTS" ]'
+  '[ $rc = 1 ] && grep -q "::error::.*Myotis-v1-arm64.dmg" "$STUB_DIR/err" && [ ! -f "$RELEASE_ASSETS_SUBJECTS" ]'
 
-fresh; echo 3 > "$STUB_DIR/pending/a.apk"
-bash $R v1 "$T/in/a.apk" > /dev/null; rc=$?
+fresh; echo 3 > "$STUB_DIR/pending/Myotis-v1-arm64.dmg"
+bash $R v1 "$T/in/Myotis-v1-arm64.dmg" > /dev/null; rc=$?
 check "a digest that arrives late is waited for" '[ $rc = 0 ] && [ -f "$RELEASE_ASSETS_SUBJECTS" ]'
 
-fresh; echo 99 > "$STUB_DIR/pending/a.apk"
-bash $R v1 "$T/in/a.apk" > /dev/null 2> "$STUB_DIR/err"; rc=$?
+fresh; echo 99 > "$STUB_DIR/pending/Myotis-v1-arm64.dmg"
+bash $R v1 "$T/in/Myotis-v1-arm64.dmg" > /dev/null 2> "$STUB_DIR/err"; rc=$?
 check "a digest that never arrives fails" '[ $rc = 1 ] && grep -q "no digest" "$STUB_DIR/err"'
 
 fresh; rm "$STUB_DIR/exists"
-bash $R v1 "$T/in/a.apk" > /dev/null 2> "$STUB_DIR/err"; rc=$?
+bash $R v1 "$T/in/Myotis-v1-arm64.dmg" > /dev/null 2> "$STUB_DIR/err"; rc=$?
 check "a tag with no release fails before anything is uploaded" '[ $rc = 1 ] && ! grep -q "release upload" "$STUB_DIR/log"'
 
 fresh
@@ -155,19 +161,19 @@ bash $R v1 > /dev/null 2>&1; rc=$?
 check "no file is a usage error" '[ $rc = 2 ]'
 bash $R --checksums > /dev/null 2>&1; rc=$?
 check "--checksums without a tag is a usage error" '[ $rc = 2 ]'
-bash $R --checksums v1 "$T/in/a.apk" > /dev/null 2>&1; rc=$?
+bash $R --checksums v1 "$T/in/Myotis-v1-arm64.dmg" > /dev/null 2>&1; rc=$?
 check "--checksums takes no files" '[ $rc = 2 ]'
 
 # --- --checksums --------------------------------------------------------------
 # The release as a publisher leaves it before its last step.
-uploaded() { fresh; bash $R v1 "$T/in/a.apk" "$T/in/b.dmg" > /dev/null; }
+uploaded() { fresh; bash $R v1 "$T/in/Myotis-v1-arm64.dmg" "$T/in/Myotis-v1-x64.deb" > /dev/null; }
 
 uploaded; printf other > "$STUB_DIR/assets/zz-other.deb"
 bash $R --checksums v1 > /dev/null; rc=$?
 check "SHA256SUMS lists every asset, another publisher's included, and verifies" \
   '[ $rc = 0 ] && complete && [ "$(wc -l < "$STUB_DIR/assets/SHA256SUMS" | tr -d " ")" = 3 ]'
 check "SHA256SUMS is sorted by name and does not list itself" \
-  '[ "$(sed "s/^[0-9a-f]*  //" "$STUB_DIR/assets/SHA256SUMS" | tr "\n" " ")" = "a.apk b.dmg zz-other.deb " ]'
+  '[ "$(sed "s/^[0-9a-f]*  //" "$STUB_DIR/assets/SHA256SUMS" | tr "\n" " ")" = "Myotis-v1-arm64.dmg Myotis-v1-x64.deb zz-other.deb " ]'
 check "one write is enough when nobody else writes" '[ "$(writes)" = 1 ]'
 bash $R --checksums v1 > /dev/null; rc=$?
 check "a re-run writes nothing when SHA256SUMS is complete" '[ $rc = 0 ] && [ "$(writes)" = 1 ]'
@@ -179,7 +185,7 @@ check "another publisher's asset still uploading is waited for, not left out" '[
 uploaded; printf dead > "$STUB_DIR/assets/zz-dead.dmg"; echo 9999 > "$STUB_DIR/uploading/zz-dead.dmg"
 bash $R --checksums v1 > "$STUB_DIR/out" 2>&1; rc=$?
 check "an upload that never finishes does not block: it is left out, with a warning" \
-  '[ $rc = 0 ] && grep -q "::warning::.*leaves out zz-dead.dmg" "$STUB_DIR/out" && [ "$(sed "s/^[0-9a-f]*  //" "$STUB_DIR/assets/SHA256SUMS" | tr "\n" " ")" = "a.apk b.dmg " ]'
+  '[ $rc = 0 ] && grep -q "::warning::.*leaves out zz-dead.dmg" "$STUB_DIR/out" && [ "$(sed "s/^[0-9a-f]*  //" "$STUB_DIR/assets/SHA256SUMS" | tr "\n" " ")" = "Myotis-v1-arm64.dmg Myotis-v1-x64.deb " ]'
 
 uploaded; touch "$STUB_DIR/stale_writer"
 bash $R --checksums v1 > /dev/null; rc=$?
@@ -200,34 +206,46 @@ check "--checksums for a tag with no release fails" '[ $rc = 1 ]'
 
 # --- scripts/verify_release.sh, on the release the script above leaves -------
 V=scripts/verify_release.sh
-export GH_REPO=owner/repo
-published() { fresh; bash $R v1 "$T/in/a.apk" "$T/in/b.dmg" > /dev/null; bash $R --checksums v1 > /dev/null; }
+export GH_REPO=owner/repo COMMIT=0123456789abcdef0123456789abcdef01234567
+published() { fresh; bash $R v1 "$T/in/Myotis-v1-arm64.dmg" "$T/in/Myotis-v1-x64.deb" > /dev/null; bash $R --checksums v1 > /dev/null; }
 
 published
 bash $V v1 > "$STUB_DIR/out" 2>&1; rc=$?
 check "a release published through the script verifies" \
   '[ $rc = 0 ] && grep -q "all 2 listed files match" "$STUB_DIR/out" && grep -q "2 asset(s) have a build-provenance attestation" "$STUB_DIR/out"'
 
+check "each asset is verified against the workflow that builds it, at the tag's commit" \
+  '[ "$(sort "$STUB_DIR/signers" | tr "\n" " ")" = "owner/repo/.github/workflows/desktop-dmg.yml owner/repo/.github/workflows/desktop-linux-deb.yml " ]'
+
+published; printf x > "$T/in/mystery.bin"; bash $R v1 "$T/in/mystery.bin" > /dev/null; bash $R --checksums v1 > /dev/null
+bash $V v1 > "$STUB_DIR/out" 2>&1; rc=$?
+check "an asset no release workflow is known to publish fails" '[ $rc = 1 ] && grep -q "no workflow is known to publish mystery.bin" "$STUB_DIR/out"'
+
+published; touch "$STUB_DIR/old_gh"
+bash $V v1 > "$STUB_DIR/out" 2>&1; rc=$?
+check "a gh without the flags is named as the problem, not reported as missing attestations" \
+  '[ $rc = 1 ] && grep -q "has no .gh attestation verify --source-ref" "$STUB_DIR/out" && ! grep -q "^FAIL" "$STUB_DIR/out"'
+
 published; printf late > "$STUB_DIR/assets/late.bin"
 bash $V v1 > "$STUB_DIR/out" 2>&1; rc=$?
 check "an asset SHA256SUMS does not list fails" '[ $rc = 1 ] && grep -q "> late.bin" "$STUB_DIR/out"'
 
-published; rm "$STUB_DIR/assets/b.dmg"
+published; rm "$STUB_DIR/assets/Myotis-v1-x64.deb"
 bash $V v1 > "$STUB_DIR/out" 2>&1; rc=$?
-check "a listed file the release does not have fails" '[ $rc = 1 ] && grep -q "< b.dmg" "$STUB_DIR/out"'
+check "a listed file the release does not have fails" '[ $rc = 1 ] && grep -q "< Myotis-v1-x64.deb" "$STUB_DIR/out"'
 
-published; printf tampered > "$STUB_DIR/assets/a.apk"
+published; printf tampered > "$STUB_DIR/assets/Myotis-v1-arm64.dmg"
 bash $V v1 > "$STUB_DIR/out" 2>&1; rc=$?
-check "an asset whose bytes changed after it was listed fails" '[ $rc = 1 ] && grep -q "a.apk: FAILED" "$STUB_DIR/out"'
+check "an asset whose bytes changed after it was listed fails" '[ $rc = 1 ] && grep -q "Myotis-v1-arm64.dmg: FAILED" "$STUB_DIR/out"'
 
 published; rm "$STUB_DIR/assets/SHA256SUMS"
 bash $V v1 > "$STUB_DIR/out" 2>&1; rc=$?
 check "a release without SHA256SUMS fails" '[ $rc = 1 ] && grep -q "no SHA256SUMS" "$STUB_DIR/out"'
 
-published; touch "$STUB_DIR/unattested/b.dmg"
+published; touch "$STUB_DIR/unattested/Myotis-v1-x64.deb"
 bash $V v1 > "$STUB_DIR/out" 2>&1; rc=$?
 check "an asset without an attestation fails, and the others are still checked" \
-  '[ $rc = 1 ] && grep -q "no valid attestation for b.dmg" "$STUB_DIR/out" && grep -q "1 asset(s) have" "$STUB_DIR/out"'
+  '[ $rc = 1 ] && grep -q "no valid attestation for Myotis-v1-x64.deb" "$STUB_DIR/out" && grep -q "1 asset(s) have" "$STUB_DIR/out"'
 bash $V --no-attestations v1 > "$STUB_DIR/out" 2>&1; rc=$?
 check "--no-attestations skips that check" '[ $rc = 0 ] && grep -q "^skip  attestations" "$STUB_DIR/out"'
 
@@ -238,13 +256,13 @@ check "a signed APK with no unsigned twin fails" '[ $rc = 1 ] && grep -q "no Myo
 
 published; keep="$T/kept"; mkdir -p "$keep"
 bash $V v1 "$keep" > /dev/null 2>&1; rc=$?
-check "a given directory keeps the downloaded assets" '[ $rc = 0 ] && [ -f "$keep/a.apk" ] && [ -f "$keep/SHA256SUMS" ]'
+check "a given directory keeps the downloaded assets" '[ $rc = 0 ] && [ -f "$keep/Myotis-v1-arm64.dmg" ] && [ -f "$keep/SHA256SUMS" ]'
 # A publisher is re-run: the asset and SHA256SUMS change on the release.
-mkdir -p "$T/in/a2"; printf rebuilt > "$T/in/a2/a.apk"
-bash $R v1 "$T/in/a2/a.apk" > /dev/null; bash $R --checksums v1 > /dev/null
+mkdir -p "$T/in/a2"; printf rebuilt > "$T/in/a2/Myotis-v1-arm64.dmg"
+bash $R v1 "$T/in/a2/Myotis-v1-arm64.dmg" > /dev/null; bash $R --checksums v1 > /dev/null
 bash $V v1 "$keep" > "$STUB_DIR/out" 2>&1; rc=$?
 check "a kept directory is checked against the release as it is now, not as it was" \
-  '[ $rc = 0 ] && cmp -s "$keep/a.apk" "$T/in/a2/a.apk" && grep -q "a.apk in .* is not what the release serves now" "$STUB_DIR/out"'
+  '[ $rc = 0 ] && cmp -s "$keep/Myotis-v1-arm64.dmg" "$T/in/a2/Myotis-v1-arm64.dmg" && grep -q "Myotis-v1-arm64.dmg in .* is not what the release serves now" "$STUB_DIR/out"'
 
 # A directory of the user's own: other files, a dotfile, a subdirectory.
 published; mine="$T/mine"; mkdir -p "$mine/sub"
@@ -255,17 +273,17 @@ check "files in DIR that are not the release's are neither deleted nor checked" 
 rm "$STUB_DIR/assets/SHA256SUMS"
 bash $V v1 "$mine" > "$STUB_DIR/out" 2>&1; rc=$?
 check "nor when the release has no SHA256SUMS: it fails, and DIR keeps its files" \
-  '[ $rc = 1 ] && grep -q "no SHA256SUMS" "$STUB_DIR/out" && [ -f "$mine/photo.jpg" ] && [ -f "$mine/.netrc" ] && [ -f "$mine/a.apk" ]'
+  '[ $rc = 1 ] && grep -q "no SHA256SUMS" "$STUB_DIR/out" && [ -f "$mine/photo.jpg" ] && [ -f "$mine/.netrc" ] && [ -f "$mine/Myotis-v1-arm64.dmg" ]'
 rm "$STUB_DIR/exists"
 bash $V v1 "$mine" > "$STUB_DIR/out" 2>&1; rc=$?
-check "nor for a tag with no release" '[ $rc = 1 ] && grep -q "no release for tag" "$STUB_DIR/out" && [ -f "$mine/photo.jpg" ] && [ -f "$mine/a.apk" ]'
+check "nor for a tag with no release" '[ $rc = 1 ] && grep -q "no release for tag" "$STUB_DIR/out" && [ -f "$mine/photo.jpg" ] && [ -f "$mine/Myotis-v1-arm64.dmg" ]'
 
 # An asset that left the release: the kept copy is not an asset any more.
 published; gone="$T/gone"; mkdir -p "$gone"
 bash $V v1 "$gone" > /dev/null 2>&1
-rm "$STUB_DIR/assets/b.dmg"
+rm "$STUB_DIR/assets/Myotis-v1-x64.deb"
 bash $V v1 "$gone" > "$STUB_DIR/out" 2>&1; rc=$?
-check "a kept copy of an asset the release no longer has does not stand in for it" '[ $rc = 1 ] && grep -q "< b.dmg" "$STUB_DIR/out"'
+check "a kept copy of an asset the release no longer has does not stand in for it" '[ $rc = 1 ] && grep -q "< Myotis-v1-x64.deb" "$STUB_DIR/out"'
 
 fresh; bash $R --checksums v1 > /dev/null 2>&1; printf '%s  %s\n' "$(printf gone | { sha256sum 2> /dev/null || shasum -a 256; } | cut -d" " -f1)" gone.apk > "$STUB_DIR/assets/SHA256SUMS"
 bash $V v1 > "$STUB_DIR/out" 2>&1; rc=$?
@@ -273,6 +291,12 @@ check "a release that has only SHA256SUMS fails with a reason, not silently" '[ 
 
 # Every publisher goes through the script: a bare `gh release upload` in a
 # workflow would publish an asset SHA256SUMS may never list.
+# And the verifier knows every publishing workflow (workflow_of): an asset of
+# one it does not know would fail `verify release` on the next tag.
+unknown=$(for wf in $(grep -l 'release-assets.sh "' .github/workflows/*.yml); do
+  [ "$(basename "$wf")" = release-rehearsal.yml ] || grep -q "echo $(basename "$wf") ;;" $V || echo "$wf"; done)
+check "verify_release.sh names every publishing workflow" '[ -z "$unknown" ]'
+[ -z "$unknown" ] || echo "$unknown"
 # And every job that uploads through it also lists the release in SHA256SUMS.
 nosums=$(for wf in $(grep -l 'release-assets.sh "' .github/workflows/*.yml); do grep -q 'release-assets.sh --checksums' "$wf" || echo "$wf"; done)
 check "every workflow that uploads also runs --checksums" '[ -z "$nosums" ]'

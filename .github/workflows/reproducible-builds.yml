@@ -490,6 +490,10 @@ jobs:
     if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 300
+    permissions:
+      contents: read
+      # To see when the two publishing workflows are done (the wait below).
+      actions: read
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -514,6 +518,11 @@ jobs:
             || { echo "::error::leg a produced no artifacts (its build failed): nothing to set next to the published assets"; exit 1; }
           mkdir -p legs/a
           tar -C legs/a -xpf tars/a/repro-linux.tar
+          # Only what the published side can have: the Android artifacts and
+          # the engine library. A leg also carries the .deb with its whole
+          # payload and the host libraries, which would fill the report with
+          # "only in image" lines ahead of the ones that matter.
+          rm -r legs/a/desktop legs/a/host
 
       # Before the wait, not after it: a missing tool should fail in the first
       # minute. unzip unpacks the Maven-repository zip (collect.sh published);
@@ -524,21 +533,41 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends diffoscope-minimal unzip >/dev/null
           diffoscope --version
 
-      # The three assets come from two workflows with no ordering between them
-      # or with this one. SHA256SUMS lists an asset once its publisher has
-      # uploaded it and checked the release serves its bytes
-      # (.github/release-assets.sh). Polled once a minute for up to four hours.
+      # The three assets come from two workflows (Android APK, Engine library)
+      # with no ordering between them or with this one. SHA256SUMS lists an
+      # asset once its publisher has uploaded it, checked the release serves
+      # its bytes, and run its last step (.github/release-assets.sh). Polled
+      # once a minute, for up to four hours, but not past the point where the
+      # answer is known: once both workflows' runs for this tag are done and
+      # an asset is still not listed, it is not coming (a tag the version
+      # guard refused, a signing job that refused, a failed publish).
       - name: Wait for the release's Android assets
         run: |
           set -euo pipefail
           want="Myotis-$TAG-android-unsigned.apk Myotis-$TAG-android-debug.apk myotis-engine-$TAG-maven-repo.zip"
-          for minute in $(seq 1 240); do
+          missing_now() {
+            local sums name
             sums=$(gh release download "$TAG" --pattern SHA256SUMS --output - 2>/dev/null || true)
             missing=""
             for name in $want; do
-              printf '%s\n' "$sums" | grep -q "  $name\$" || missing="$missing $name"
+              printf '%s\n' "$sums" | grep -qF "  $name" || missing="$missing $name"
             done
+          }
+          for minute in $(seq 1 240); do
+            missing_now
             [ -n "$missing" ] || { echo "all three are published"; exit 0; }
+            # Not in the first minutes: the tag's other runs may not be listed yet.
+            if [ "$minute" -ge 5 ] && runs=$(gh api --paginate "repos/$GH_REPO/actions/runs?head_sha=$GITHUB_SHA&event=push&per_page=100" \
+                 --jq ".workflow_runs[] | select(.head_branch == \"$TAG\" and (.name == \"Android APK\" or .name == \"Engine library\")) | [.name, .status] | @tsv"); then
+              done_runs=$(printf '%s\n' "$runs" | awk -F'\t' '$2 == "completed" { print $1 }' | sort -u | wc -l)
+              running=$(printf '%s\n' "$runs" | awk -F'\t' '$1 != "" && $2 != "completed"' | wc -l)
+              if [ "$done_runs" -eq 2 ] && [ "$running" -eq 0 ]; then
+                missing_now   # once more: the last step of a run that just ended
+                [ -n "$missing" ] || { echo "all three are published"; exit 0; }
+                echo "::error::the Android APK and Engine library runs of $TAG are done, and the release still lacks:$missing"
+                exit 1
+              fi
+            fi
             [ $((minute % 10)) -ne 1 ] || echo "minute $minute: not in the release's SHA256SUMS yet:$missing"
             sleep 60
           done
@@ -558,12 +587,26 @@ jobs:
         run: |
           python3 -I scripts/repro/compare.py legs/a legs/published report scripts/repro/known-differences.txt \
             --labels image published --report-only
+          # The two answers this job exists for, spelled out from the two
+          # manifests (compare.py writes "<sha256> <mode>  <path>" lines), ahead
+          # of the full list.
+          verdict() { # LABEL PATH-REGEX
+            local a b
+            a=$(awk -v g="$2" '{ p = $0; sub(/^[^ ]+ [^ ]+  /, "", p) } p ~ g { print $1 }' report/SHA256SUMS.a | sort -u)
+            b=$(awk -v g="$2" '{ p = $0; sub(/^[^ ]+ [^ ]+  /, "", p) } p ~ g { print $1 }' report/SHA256SUMS.b | sort -u)
+            if [ -z "$a" ] || [ -z "$b" ]; then echo "- **$1: not compared** (missing on one side)"
+            elif [ "$a" = "$b" ]; then echo "- **$1: identical** (\`$a\`)"
+            else echo "- **$1: DIFFERENT** (image \`$a\`, published \`$b\`)"; fi
+          }
           {
             echo "### The image build of $TAG against its published Android assets (not gated)"
+            verdict "Unsigned release APK" '^android/app-release-unsigned[.]apk$'
+            verdict "Engine library AAR" '^maven-repo/eth/myotis/myotis-engine-android/[^/]+/myotis-engine-android-[^/]+[.]aar$'
+            echo
             echo '```'
-            head -n 60 report/summary.txt
+            head -n 80 report/summary.txt
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the report
         if: ${{ always() }}

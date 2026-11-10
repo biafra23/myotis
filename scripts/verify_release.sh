@@ -15,9 +15,11 @@
 #
 #   1. SHA256SUMS is there, lists every asset except itself and nothing that is
 #      not an asset, and every hash matches (`sha256sum -c`).
-#   2. Every asset has a build-provenance attestation, signed for a workflow of
-#      this repository that ran on the tag's own ref
-#      (`gh attestation verify --repo … --source-ref refs/tags/<tag>`). An asset
+#   2. Every asset has a build-provenance attestation that names: this
+#      repository; the tag's own ref; the COMMIT the tag points at (a tag that
+#      was moved leaves assets of its earlier commit behind, under the same ref
+#      name); and the workflow that is supposed to build that asset (the APKs
+#      android-apk.yml, the debs desktop-linux-deb.yml, and so on). An asset
 #      uploaded from another ref (a workflow dispatched on a branch, onto an
 #      existing release) fails here: that is the point.
 #   3. The signed release APK is the unsigned one plus its signature and
@@ -32,7 +34,9 @@
 # network path to Sigstore). The `verify release` workflow runs this on every
 # tag, once the tag's publishing workflows are done, and on dispatch for any tag.
 #
-# Needs gh (2.49 or newer for `gh attestation`), python3, sha256sum or shasum.
+# Needs gh (one whose `gh attestation verify` has --source-ref,
+# --source-digest and --signer-workflow: checked before anything is verified),
+# python3, sha256sum or shasum.
 # Env: GH_TOKEN; GH_REPO outside a checkout of the repository.
 set -euo pipefail
 
@@ -57,7 +61,8 @@ echo "release $tag of $repo, assets in $dir"
 # with a DIR of your own (your Downloads, say) only files that carry a release
 # asset's name are ever looked at, replaced or checked; any other file there is
 # left alone and ignored.
-rid=$(gh api "repos/$repo/releases/tags/$tag" --jq .id) \
+# (`gh release view` also finds a draft by its tag name, for the rehearsal.)
+rid=$(gh release view "$tag" --repo "$repo" --json databaseId --jq .databaseId) \
   || { echo "verify_release.sh: no release for tag $tag in $repo (or it cannot be read)" >&2; exit 1; }
 listing=$(gh api --paginate "repos/$repo/releases/$rid/assets?per_page=100" \
   --jq '.[] | [.name, .state, ((.digest // "") | sub("^sha256:"; ""))] | @tsv')
@@ -97,17 +102,53 @@ else
 fi
 
 # --- 2. attestations ----------------------------------------------------------
+# The workflow that is supposed to build each asset: an attestation signed for
+# another workflow of the repository does not count. One line per publisher of
+# release-version-guard.yml's list; a new publisher adds its family here, and
+# an asset that matches none FAILS (scripts/test_release_assets.sh checks that
+# every publishing workflow is named).
+workflow_of() {
+  case "$1" in
+    Myotis-*-android.apk|Myotis-*-android-unsigned.apk|Myotis-*-android-debug.apk) echo android-apk.yml ;;
+    Myotis-*-railgun-poc-*.dmg) echo railgun-dmg.yml ;;
+    Myotis-*.dmg) echo desktop-dmg.yml ;;
+    Myotis-*.deb) echo desktop-linux-deb.yml ;;
+    myotis-engine-*.aar|myotis-engine-*.zip|myotis-engine.SHA256SUMS) echo engine-library.yml ;;
+    MyotisKit.xcframework.zip|MyotisKit.xcframework.zip.sha256) echo ios-framework.yml ;;
+    MyotisEngine.xcframework.zip|MyotisEngine.xcframework.zip.sha256) echo ios-xcframework.yml ;;
+    myotis-node.*) echo node-binding.yml ;;
+    *.jar) echo ci.yml ;;
+    *) return 1 ;;
+  esac
+}
 if $attest; then
+  # The flags this needs arrived in gh one by one; an older gh would fail every
+  # asset with "unknown flag", which reads like a missing attestation.
+  usage=$(gh attestation verify --help 2>&1 || true)
+  for flag in --source-ref --source-digest --signer-workflow; do
+    printf '%s' "$usage" | grep -q -- "$flag" \
+      || { echo "verify_release.sh: this gh ($(gh --version | head -n1)) has no \`gh attestation verify $flag\`: update gh, or pass --no-attestations" >&2; exit 1; }
+  done
+  # The commit the tag points at (peeled, for an annotated tag). A tag that
+  # was moved leaves assets of its earlier commit behind: same ref name, other
+  # commit, and --source-ref alone would accept them.
+  commit=$(gh api "repos/$repo/commits/tags/$tag" --jq .sha) \
+    || { echo "verify_release.sh: cannot resolve the commit of tag $tag in $repo" >&2; exit 1; }
   n=0
   for f in $assets; do
-    if out=$(gh attestation verify "$f" --repo "$repo" --source-ref "refs/tags/$tag" 2>&1); then
+    if ! wf=$(workflow_of "$f"); then
+      bad "no workflow is known to publish $f (scripts/verify_release.sh, workflow_of): not an asset of a release workflow, or a new one that was not added"
+      continue
+    fi
+    if out=$(gh attestation verify "$f" --repo "$repo" --source-ref "refs/tags/$tag" --source-digest "$commit" \
+               --signer-workflow "$repo/.github/workflows/$wf" 2>&1); then
       n=$((n + 1))
     else
-      bad "no valid attestation for $f from refs/tags/$tag of $repo:"
+      bad "no valid attestation for $f by $wf at refs/tags/$tag ($commit) of $repo:"
       printf '%s\n' "$out" | tail -n 3 | sed 's/^/        /'
     fi
   done
-  echo "ok    $n asset(s) have a build-provenance attestation from refs/tags/$tag of $repo"
+  echo "ok    $n asset(s) have a build-provenance attestation by their own workflow, from $tag's commit $commit"
 else
   echo "skip  attestations (--no-attestations)"
 fi

@@ -79,8 +79,10 @@ trap 'rm -rf "$tmp"' EXIT
 
 # name <TAB> state <TAB> sha256 hex ('' until GitHub has computed it), one
 # asset per line. By release id, paginated: the release object's own `assets`
-# array is not.
-rid=$(gh api "repos/{owner}/{repo}/releases/tags/$tag" --jq .id) || fail "no release for tag $tag"
+# array is not. The id through `gh release view`, which also finds a DRAFT by
+# its tag name (the API's releases/tags/<tag> does not): the rehearsal
+# workflow runs this script against a draft, which publishes nothing.
+rid=$(gh release view "$tag" --json databaseId --jq .databaseId) || fail "no release for tag $tag"
 assets() {
   gh api --paginate "repos/{owner}/{repo}/releases/$rid/assets?per_page=100" \
     --jq '.[] | [.name, .state, ((.digest // "") | sub("^sha256:"; ""))] | @tsv'
