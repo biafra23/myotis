@@ -13,6 +13,13 @@ pinned NDK's default; since #734 Part 4b the flag reaches the linker through a
 MERGE of per-target rustflags (a RUSTFLAGS would drop it), so this check pins
 that merge on every build that ships the libs, not only rust/build-android.sh.
 
+In an .apk, a library stored UNCOMPRESSED (AGP's default at minSdk >= 23:
+no useLegacyPackaging, so extractNativeLibs=false) is mmapped straight out of
+the APK, so its zip data must ALSO start on a 16 KB boundary (zipalign -P 16;
+AGP 8.5.1+ does it, this checks it). A compressed library is extracted at
+install, where only p_align matters. Not for an .aar: the consumer's AGP
+repacks jni/ into its own APK.
+
 Fail-closed: a PATH with no .so at all is an error, never a vacuous pass.
 Stdlib only.
 """
@@ -44,20 +51,39 @@ def load_aligns(name, d):
             if struct.unpack_from(end + "I", d, phoff + i * phentsize)[0] == PT_LOAD]
 
 
+def data_offset(fh, info):
+    """Where an entry's data starts: its LOCAL header's name and extra lengths
+    (the central directory's extra field can differ from the local one)."""
+    fh.seek(info.header_offset)
+    local = fh.read(30)
+    if local[:4] != b"PK\x03\x04":
+        sys.exit(f"check_16k_alignment: bad local header for {info.filename}")
+    name_len, extra_len = struct.unpack_from("<HH", local, 26)
+    return info.header_offset + 30 + name_len + extra_len
+
+
 def libraries(path):
-    """Yield (display name, bytes) for every .so under PATH."""
+    """Yield (display name, bytes, problem or None) for every .so under PATH."""
     if os.path.isdir(path):
         for root, _, files in sorted(os.walk(path)):
             for f in sorted(files):
                 if f.endswith(".so"):
                     p = os.path.join(root, f)
                     with open(p, "rb") as fh:
-                        yield os.path.relpath(p, path), fh.read()
+                        yield os.path.relpath(p, path), fh.read(), None
     elif zipfile.is_zipfile(path):
-        with zipfile.ZipFile(path) as z:
-            for n in sorted(z.namelist()):
-                if n.endswith(".so") and (n.startswith("lib/") or n.startswith("jni/")):
-                    yield n, z.read(n)
+        apk = path.endswith(".apk")
+        with zipfile.ZipFile(path) as z, open(path, "rb") as fh:
+            for info in sorted(z.infolist(), key=lambda i: i.filename):
+                n = info.filename
+                if not (n.endswith(".so") and (n.startswith("lib/") or n.startswith("jni/"))):
+                    continue
+                problem = None
+                if apk and info.compress_type == zipfile.ZIP_STORED:
+                    off = data_offset(fh, info)
+                    if off % MIN_ALIGN:
+                        problem = f"stored at zip offset {off:#x}, not 16 KB aligned"
+                yield n, z.read(n), problem
     else:
         sys.exit(f"check_16k_alignment: {path} is neither a directory nor an apk/aar")
 
@@ -66,11 +92,12 @@ def main(paths):
     bad = []
     for path in paths:
         seen = 0
-        for name, data in libraries(path):
+        for name, data, problem in libraries(path):
             seen += 1
             aligns = load_aligns(name, data)
-            ok = bool(aligns) and all(a >= MIN_ALIGN for a in aligns)
-            print(f"  {path}: {name}: LOAD align {[hex(a) for a in aligns]} -> {'OK' if ok else 'NOT 16 KB'}")
+            ok = bool(aligns) and all(a >= MIN_ALIGN for a in aligns) and problem is None
+            print(f"  {path}: {name}: LOAD align {[hex(a) for a in aligns]}"
+                  f"{'; ' + problem if problem else ''} -> {'OK' if ok else 'NOT 16 KB'}")
             if not ok:
                 bad.append(f"{path}:{name}")
         if not seen:

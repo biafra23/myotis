@@ -18,16 +18,23 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 
 
 MAX_EXPLAINED = 25
 EXPLAIN_TIMEOUT = 600  # seconds per file
+EXPLAIN_BUDGET = 30 * 60  # seconds for all of them: the job's timeout is 90 min
 
 
 def manifest(root):
     entries = {}
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames.sort()
+        # Directories too: their modes ship in a .app, and an empty directory
+        # present in one leg only must not pass unseen.
+        if dirpath != root:
+            rel = os.path.relpath(dirpath, root).replace(os.sep, "/") + "/"
+            entries[rel] = f"dir {stat.S_IMODE(os.lstat(dirpath).st_mode):04o}"
         for name in sorted(filenames + [d for d in dirnames if os.path.islink(os.path.join(dirpath, d))]):
             path = os.path.join(dirpath, name)
             rel = os.path.relpath(path, root).replace(os.sep, "/")
@@ -42,6 +49,13 @@ def manifest(root):
                 # under another umask to catch exactly that leak.
                 entries[rel] = f"{h.hexdigest()} {stat.S_IMODE(os.lstat(path).st_mode):04o}"
     return entries
+
+
+def write_summary(report, lines):
+    summary = "\n".join(lines) + "\n"
+    with open(os.path.join(report, "summary.txt"), "w") as f:
+        f.write(summary)
+    return summary
 
 
 def write_manifest(entries, path):
@@ -67,14 +81,20 @@ def main(a, b, report):
     lines += [f"ONLY IN B  {r}" for r in only_b]
     lines += [f"DIFFERS    {r}" for r in differ]
 
+    # The verdict and the full list first, so a job killed while diffoscope
+    # runs still ships them; rewritten below with diffoscope's notes.
+    write_summary(report, lines)
+
     diffoscope = shutil.which("diffoscope")
     # One systematic leak can make hundreds of files differ: explain the first
-    # MAX_EXPLAINED (the summary lists them all), each within a time limit.
+    # MAX_EXPLAINED (the summary lists them all), each within a time limit, all
+    # within EXPLAIN_BUDGET so the job ends inside its timeout.
+    started = time.monotonic()
     for n, rel in enumerate(differ):
         if diffoscope is None:
             break
-        if n == MAX_EXPLAINED:
-            lines.append(f"(diffoscope reports only the first {MAX_EXPLAINED} of {len(differ)} differing files)")
+        if n == MAX_EXPLAINED or time.monotonic() - started > EXPLAIN_BUDGET:
+            lines.append(f"(diffoscope explained only the first {n} of {len(differ)} differing files)")
             break
         out = os.path.join(report, rel + ".html")
         os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -84,7 +104,7 @@ def main(a, b, report):
                                 "--max-report-size", str(50 << 20),
                                 os.path.join(a, rel), os.path.join(b, rel)],
                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-                               timeout=EXPLAIN_TIMEOUT)
+                               timeout=min(EXPLAIN_TIMEOUT, max(1, EXPLAIN_BUDGET - (time.monotonic() - started))))
         except subprocess.TimeoutExpired:
             lines.append(f"  (diffoscope timed out after {EXPLAIN_TIMEOUT}s on {rel})")
             continue
@@ -93,10 +113,7 @@ def main(a, b, report):
     if differ and diffoscope is None:
         lines.append("(diffoscope not installed: no per-file report)")
 
-    summary = "\n".join(lines) + "\n"
-    with open(os.path.join(report, "summary.txt"), "w") as f:
-        f.write(summary)
-    print(summary, end="")
+    print(write_summary(report, lines), end="")
     if only_a or only_b or differ:
         sys.exit(1)
     print("all artifacts are identical across the two builds")

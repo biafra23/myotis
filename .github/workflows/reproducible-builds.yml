@@ -40,6 +40,11 @@
 # whose base is not main, unless the PR carries the `reproducible-builds`
 # label: the explicit per-PR opt-in that stands in for the dispatch a part PR
 # would otherwise use, which a workflow that is not on main yet cannot get.
+# The label reaches only a PR that also matches the paths below (a `labeled`
+# event is path-filtered too): a part PR that changes other build inputs (the
+# root build, rust/.cargo/config.toml, rust/build-*.sh, repro-env.sh) gets a
+# run once this file is on main and can be dispatched, or by touching one of
+# these paths. Not widened: every PR into main would then run it.
 name: reproducible builds
 
 on:
