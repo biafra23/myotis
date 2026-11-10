@@ -236,10 +236,13 @@ fn dechunk(mut data: &[u8], max_body: usize) -> Result<Vec<u8>, HttpError> {
         if size == 0 {
             return Ok(out);
         }
-        if out.len() + size > max_body {
+        // `size` is the server's number, up to usize::MAX: compare without
+        // adding to it, or a wrapped sum passes both guards and the slice
+        // below panics (an abort under the workspace's release profile).
+        if size > max_body.saturating_sub(out.len()) {
             return Err(HttpError::BadResponse("body too large"));
         }
-        if data.len() < size + 2 {
+        if data.len() < 2 || data.len() - 2 < size {
             return Err(HttpError::BadResponse("truncated chunk"));
         }
         out.extend_from_slice(&data[..size]);
@@ -286,6 +289,26 @@ mod tests {
         assert_eq!(parse_response(raw, 10).unwrap(), Response { status: 404, body: b"abcde".to_vec() });
         assert!(parse_response(raw, 4).is_err());
         assert!(parse_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab", 10).is_err());
+    }
+
+    #[test]
+    fn a_huge_chunk_size_is_refused_not_wrapped() {
+        // After a non-empty first chunk, `len + size` would wrap to 0 and
+        // `size + 2` to 1 (#761 review): both guards must still refuse.
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\nffffffffffffffff\r\nx";
+        assert_eq!(parse_response(raw, 64 * 1024), Err(HttpError::BadResponse("body too large")));
+        // A size the body cap admits must still be refused as truncated, with
+        // `size + 2` (which would wrap) never computed.
+        let near_max = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n{:x}\r\nx",
+            usize::MAX - 1
+        );
+        assert_eq!(
+            parse_response(near_max.as_bytes(), usize::MAX),
+            Err(HttpError::BadResponse("truncated chunk"))
+        );
+        let first = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\nx";
+        assert!(parse_response(first, usize::MAX).is_err());
     }
 
     #[test]

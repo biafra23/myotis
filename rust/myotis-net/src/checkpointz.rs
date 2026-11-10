@@ -151,13 +151,17 @@ pub(crate) fn parse_finalized(body: &[u8]) -> Option<(u64, [u8; 32])> {
     };
     let epoch: u64 = string_field(obj, "epoch")?.parse().ok()?;
     let root_hex = string_field(obj, "root")?;
-    let root_hex = root_hex.strip_prefix("0x").unwrap_or(root_hex);
-    if root_hex.len() != 64 {
+    // Bytes, not str slices: a 64-byte root with a multi-byte character would
+    // pass the length check and panic on a non-boundary slice (#761 review),
+    // and from_str_radix would accept a sign ("+f").
+    let root_hex = root_hex.strip_prefix("0x").unwrap_or(root_hex).as_bytes();
+    if root_hex.len() != 64 || !root_hex.iter().all(u8::is_ascii_hexdigit) {
         return None;
     }
+    let nibble = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
     let mut root = [0u8; 32];
     for (i, b) in root.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&root_hex[2 * i..2 * i + 2], 16).ok()?;
+        *b = (nibble(root_hex[2 * i]) << 4) | nibble(root_hex[2 * i + 1]);
     }
     (root != [0u8; 32]).then_some((epoch, root))
 }
@@ -188,6 +192,15 @@ mod tests {
         assert_eq!(parse_finalized(BODY.as_bytes()), Some((9, [0x33; 32])));
         assert_eq!(parse_finalized(b"{\"data\":{}}"), None);
         assert_eq!(parse_finalized(b"not json"), None);
+    }
+
+    #[test]
+    fn a_root_that_is_not_ascii_hex_is_refused_not_sliced() {
+        // 'a' + 'é' (2 bytes) + 61 ASCII digits = 64 bytes (#761 review).
+        let body = format!(r#"{{"data":{{"finalized":{{"epoch":"1","root":"0xaé{}"}}}}}}"#, "0".repeat(61));
+        assert_eq!(parse_finalized(body.as_bytes()), None);
+        let signed = format!(r#"{{"data":{{"finalized":{{"epoch":"1","root":"0x+f{}"}}}}}}"#, "0".repeat(62));
+        assert_eq!(parse_finalized(signed.as_bytes()), None);
     }
 
     fn a(op: &str, epoch: u64, r: u8) -> Answer {
