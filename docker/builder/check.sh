@@ -33,6 +33,16 @@ check "cargo-ndk" "cargo-ndk $(want CARGO_NDK_VERSION)" "$(in_image 'cargo ndk -
 check "NDK" "$(want ANDROID_NDK)" "$(revision '$ANDROID_NDK_HOME')"
 check "build-tools (the only one)" "$(want ANDROID_BUILD_TOOLS)" "$(in_image 'ls "$ANDROID_HOME/build-tools" | tr "\n" " " | sed "s/ $//"')"
 check "platform (the only one)" "android-$(want ANDROID_PLATFORM)" "$(in_image 'ls "$ANDROID_HOME/platforms" | tr "\n" " " | sed "s/ $//"')"
+# The Android tools must RUN as another uid, not merely be there: sdkmanager
+# installs executables owner-only, and the first build in the image died at
+# "clang: Permission denied" with every version check above green.
+check "NDK clang runs" "ok" "$(in_image '"$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --version >/dev/null && echo ok' 2>&1 | tail -1)"
+check "build-tools run (aapt2, d8, apksigner)" "ok" \
+    "$(in_image 'bt="$ANDROID_HOME/build-tools/'"$(want ANDROID_BUILD_TOOLS)"'"; "$bt/aapt2" version >/dev/null 2>&1 && "$bt/d8" --version >/dev/null && "$bt/apksigner" --version >/dev/null && echo ok' 2>&1 | tail -1)"
+# And nothing else under /opt is closed to it: every file readable, and
+# executable (searchable, for a directory) wherever its owner may.
+check "/opt open to any uid" "" \
+    "$(in_image 'find /opt ! -type l \( ! -perm -o=r -o \( -perm -u=x ! -perm -o=x \) \) -print 2>&1 | head -5 | tr "\n" " "' || true)"
 check "platform revision" "$(want ANDROID_PLATFORM_REVISION)" "$(revision "\$ANDROID_HOME/platforms/android-$(want ANDROID_PLATFORM)")"
 # What apt INSTALLED, not only where it points: every package and version in
 # the image against the committed list. A package from another state of the

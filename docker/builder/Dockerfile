@@ -109,6 +109,10 @@ ARG ANDROID_PLATFORM_SHA256
 ENV ANDROID_HOME=/opt/android-sdk
 ENV ANDROID_SDK_ROOT=/opt/android-sdk
 ENV ANDROID_NDK_HOME=/opt/android-sdk/ndk/${ANDROID_NDK}
+# The chmod is IN this layer, and needed: sdkmanager unpacks an executable as
+# executable by its owner only, whatever the archive says (the NDK's zip has
+# clang at 755), so the first build in the image, which runs as another uid,
+# failed at "clang: Permission denied". check.sh runs these tools as one.
 RUN curl -fsSL --retry 5 -o /tmp/clt.zip \
       "https://dl.google.com/android/repository/commandlinetools-linux-${ANDROID_CMDLINE_TOOLS}_latest.zip" \
  && echo "${ANDROID_CMDLINE_TOOLS_SHA256}  /tmp/clt.zip" | sha256sum -c - \
@@ -119,6 +123,7 @@ RUN curl -fsSL --retry 5 -o /tmp/clt.zip \
  && sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
  && "$sdkmanager" --licenses >/dev/null < <(yes) \
  && "$sdkmanager" "ndk;${ANDROID_NDK}" "build-tools;${ANDROID_BUILD_TOOLS}" >/dev/null < <(yes) \
+ && chmod -R a+rX "$ANDROID_HOME" \
  && rm -rf /root/.android
 
 # The platform (android.jar is a compile input of the APK and the AAR) by the
@@ -138,8 +143,17 @@ RUN curl -fsSL --retry 5 -o /tmp/platform.zip \
  && { [ "$rev" = "${ANDROID_PLATFORM_REVISION}" ] \
       || { echo "${ANDROID_PLATFORM_ARCHIVE} unpacked to revision '$rev' at $props, pins.env says ${ANDROID_PLATFORM_REVISION}" >&2; exit 1; }; }
 
-# No `chmod -R a+rX /opt` layer: it would copy every file under /opt into a
-# second layer and double the image. Root's umask 022 already leaves /opt
-# readable by any uid, and check.sh runs every tool as an unprivileged one.
+# No `chmod -R a+rX /opt` layer of its own: it would copy every file under
+# /opt into a second layer and double the image. tar and unzip keep the
+# archives' modes under root's umask 022; the one installer that does not
+# (sdkmanager) is corrected in its own layer above. check.sh holds all of /opt
+# to "readable, and executable where the owner can execute, by any uid".
+#
+# Two warnings from the Android Gradle plugin are expected in this image and
+# harmless: "Exception while marshalling .../platforms/android-NN/package.xml.
+# Probably the SDK is read-only" (the platform is unpacked from its archive, so
+# it has no package.xml, and the plugin cannot write one), and "platform-tools
+# package is not installed, and automatic installation failed" (adb is no
+# build input, and the image cannot be installed into, by design).
 ENV PATH=/opt/jdk/bin:/opt/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENV LANG=C.UTF-8
