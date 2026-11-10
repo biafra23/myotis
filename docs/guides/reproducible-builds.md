@@ -51,6 +51,10 @@ Two limits to state plainly:
   `Compare the image build with the published assets` job of the tag's
   `reproducible builds` run. It is reported in that run's summary. Read it for
   the release you are checking, or make the comparison yourself (step 3).
+  Between tags, every run also builds once on the hosted runner's toolchain,
+  the one the release workflows use, and reports it against the image build:
+  when the image first built (2026-11-10), every Android artifact was identical
+  between the two.
 - **The Linux host libraries a release ships are not built in the builder
   image.** They come from `ubuntu-22.04` runners, for a glibc 2.35 floor, so
   the Linux natives jar inside the engine library zip, the `.deb` and the Node
