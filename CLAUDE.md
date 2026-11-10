@@ -237,9 +237,18 @@ step skipped and none treated as optional or "only if asked"**:
    typing "please address the comment" for each one (owner ruling,
    2026-10-09, after a day of exactly that; a memory note had not made it
    stick, which is why it is here, in the step every PR goes through).
-   Elsewhere, use whatever the host offers to watch a PR
-   (`subscribe_pr_activity`). Then wait for CI + review feedback; do not
-   consider the task done at "pushed".
+   **In a claude.ai/code cloud session**, the same moment calls
+   `subscribe_pr_activity` (owner, repo, PR number) — that IS the session's
+   Auto-fix switch, and it is per PR and off by default there too. Do it
+   **without asking and without telling the owner to flip Auto-fix in the
+   UI**: this paragraph is the owner's standing, explicit request to turn on
+   auto-fix for EVERY PR a session opens in this repo (owner ruling,
+   2026-11-10, #745, after cloud sessions began stopping at "PR created" and
+   asking for the toggle). If the result says another Claude session already
+   watches the PR, this session gets no events: say so in the report, naming
+   that session, instead of reporting this session as watching it. Any other
+   host: use whatever it offers to watch a PR. Then wait
+   for CI + review feedback; do not consider the task done at "pushed".
 5. **Address the PR comments** — drive the PR to green and answer every review
    comment per the rules below, then keep watching until it is merged or closed.
    **MERGING IS THE OWNER'S ACTION — NEVER MERGE A PR YOURSELF** (owner ruling,
