@@ -305,7 +305,9 @@ jobs:
         run: |
           set -euo pipefail
           scripts/repro/collect.sh windows . "$RUNNER_TEMP/repro-out"
-          tar -C "$RUNNER_TEMP/repro-out" -cf "$RUNNER_TEMP/repro-windows.tar" .
+          # --force-local: Git Bash's GNU tar reads the colon in D:\a\_temp as
+          # a remote host:file archive otherwise (actions/toolkit passes it too).
+          tar --force-local -C "$RUNNER_TEMP/repro-out" -cf "$RUNNER_TEMP/repro-windows.tar" .
 
       - name: Upload leg ${{ matrix.leg }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
