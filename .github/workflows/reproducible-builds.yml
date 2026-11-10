@@ -129,7 +129,11 @@ jobs:
       - name: Log in to the registry
         env:
           TOKEN: ${{ github.token }}
-        run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        run: |
+          # Not fatal: a login the registry did not answer shows up as a failed
+          # pull below, which builds instead (and a public package pulls without it).
+          printf '%s' "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin \
+            || echo "::warning::could not log in to ghcr.io; trying the pull without it"
 
       # A locked image that cannot be pulled (pull.sh tries three times; a
       # fork may not be able to read the package at all) is built too, with a

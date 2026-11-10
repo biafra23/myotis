@@ -37,6 +37,11 @@ locked_key=$(sed -n 's/^key=//p' "$lock")
 image=$(sed -n 's/^image=//p' "$lock")
 [[ "$image" =~ ^[a-z0-9./_-]+@sha256:[0-9a-f]{64}$ ]] \
     || { echo "pull.sh: $lock has no image=<repository>@sha256:<digest> line" >&2; exit 1; }
+# Only the project's own package: a lock is one edited line away from naming
+# any image at all, and this script's caller goes on to run it.
+repository=$(sed -n 's/^IMAGE_REPOSITORY=//p' "$here/pins.env")
+[[ -n "$repository" && "${image%@*}" == "$repository" ]] \
+    || { echo "pull.sh: $lock names ${image%@*}, not ${repository:-<no IMAGE_REPOSITORY in pins.env>}: refusing to pull it" >&2; exit 1; }
 if [[ "$locked_key" != "$key" ]]; then
     echo "pull.sh: image.lock is for pins $locked_key, this tree's are $key:" >&2
     echo "         a pin moved and the published image has not followed. Build it with build.sh." >&2
