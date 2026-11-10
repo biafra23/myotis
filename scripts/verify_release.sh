@@ -44,6 +44,8 @@ attest=true
 [ "${1:-}" != "--no-attestations" ] || { attest=false; shift; }
 [ $# -ge 1 ] && [ $# -le 2 ] || { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//;/^set -euo/d' >&2; exit 2; }
 tag=$1
+printf '%s' "$tag" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' \
+  || { echo "verify_release.sh: '$tag' is not a usable release tag" >&2; exit 2; }
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 if [ $# -eq 2 ]; then dir=$2; mkdir -p "$dir"
 else dir=$(mktemp -d); trap 'rm -rf "$dir"' EXIT; fi

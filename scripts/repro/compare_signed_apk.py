@@ -159,7 +159,11 @@ def main(argv):
     with open(unsigned_name, "rb") as f:
         unsigned = f.read()
     try:
-        added, block, pad = compare(signed, unsigned, signed_name, unsigned_name)
+        try:
+            added, block, pad = compare(signed, unsigned, signed_name, unsigned_name)
+        except (struct.error, IndexError) as e:
+            # A record cut short: a truncated or damaged file, on either side.
+            raise Mismatch(f"a zip record is truncated or malformed ({e})") from None
     except Mismatch as e:
         print(f"compare_signed_apk.py: {signed_name} is NOT {unsigned_name} plus a signature: {e}", file=sys.stderr)
         return 1

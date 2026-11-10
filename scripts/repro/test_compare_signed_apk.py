@@ -135,5 +135,25 @@ class CompareSignedApk(unittest.TestCase):
         self.assertIn("size fields disagree", verdict(bytes(signed)))
 
 
+    def test_a_truncated_file_is_a_mismatch_not_a_traceback(self):
+        import contextlib
+        import tempfile
+        signed = sign(UNSIGNED)
+        cd = struct.unpack("<I", signed[signed.rfind(b"PK\x05\x06") + 16:][:4])[0]
+        # The end record survives, the central directory it points at is cut short.
+        damaged = signed[:cd + 20] + signed[signed.rfind(b"PK\x05\x06"):]
+        with tempfile.TemporaryDirectory() as d:
+            s_path, u_path = os.path.join(d, "s.apk"), os.path.join(d, "u.apk")
+            with open(s_path, "wb") as f:
+                f.write(damaged)
+            with open(u_path, "wb") as f:
+                f.write(UNSIGNED)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = c.main(["compare_signed_apk.py", s_path, u_path])
+        self.assertEqual(rc, 1)
+        self.assertIn("is NOT", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

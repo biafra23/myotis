@@ -62,6 +62,10 @@ mode=upload
 if [ "${1:-}" = "--checksums" ]; then mode=checksums; shift; [ $# -eq 1 ] || usage
 else [ $# -ge 2 ] || usage; fi
 tag=$1; shift
+# One check for every caller: the tag goes into gh arguments and API paths
+# (`gh release upload` reads what follows a `#` in a path as a label, and the
+# version guard admits any v<version>-<suffix>).
+printf '%s' "$tag" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' || fail "'$tag' is not a usable release tag"
 
 if command -v sha256sum >/dev/null 2>&1; then sha() { sha256sum "$1" | cut -d' ' -f1; }
 else sha() { shasum -a 256 "$1" | cut -d' ' -f1; }; fi

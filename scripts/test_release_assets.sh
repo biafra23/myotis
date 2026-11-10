@@ -159,6 +159,8 @@ check "SHA256SUMS itself is refused as an upload" '[ $rc = 1 ] && [ ! -f "$STUB_
 rm "$T/in/SHA256SUMS" "$T/in/with space.apk"
 bash $R v1 > /dev/null 2>&1; rc=$?
 check "no file is a usage error" '[ $rc = 2 ]'
+bash $R 'v1#x' "$T/in/Myotis-v1-arm64.dmg" > /dev/null 2>&1; rc=$?
+check "a tag gh would read as a path with a label is refused" '[ $rc = 1 ] && [ ! -f "$STUB_DIR/log" ]'
 bash $R --checksums > /dev/null 2>&1; rc=$?
 check "--checksums without a tag is a usage error" '[ $rc = 2 ]'
 bash $R --checksums v1 "$T/in/Myotis-v1-arm64.dmg" > /dev/null 2>&1; rc=$?
@@ -297,6 +299,13 @@ unknown=$(for wf in $(grep -l 'release-assets.sh "' .github/workflows/*.yml); do
   [ "$(basename "$wf")" = release-rehearsal.yml ] || grep -q "echo $(basename "$wf") ;;" $V || echo "$wf"; done)
 check "verify_release.sh names every publishing workflow" '[ -z "$unknown" ]'
 [ -z "$unknown" ] || echo "$unknown"
+# And attests what it uploads, with the two permissions that takes: a
+# publisher without them would first be caught by `verify release`, after it
+# had published.
+noattest=$(for wf in $(grep -l 'release-assets.sh "' .github/workflows/*.yml); do
+  grep -q 'uses: actions/attest-build-provenance@' "$wf" && grep -q 'id-token: write' "$wf" && grep -q 'attestations: write' "$wf" || echo "$wf"; done)
+check "every workflow that uploads also attests, with id-token and attestations write" '[ -z "$noattest" ]'
+[ -z "$noattest" ] || echo "$noattest"
 # And every job that uploads through it also lists the release in SHA256SUMS.
 nosums=$(for wf in $(grep -l 'release-assets.sh "' .github/workflows/*.yml); do grep -q 'release-assets.sh --checksums' "$wf" || echo "$wf"; done)
 check "every workflow that uploads also runs --checksums" '[ -z "$nosums" ]'

@@ -3,8 +3,8 @@ Pre-release build of the Myotis wallet apps.
 **Checking a download** — `SHA256SUMS` lists the SHA-256 of every file on this page:
 `sha256sum -c SHA256SUMS --ignore-missing` next to what you downloaded. Each file also
 carries a build-provenance attestation that names the workflow run and the commit it
-was built from: `gh attestation verify <file> --repo biafra23/myotis`. What can be
-rebuilt bit for bit, and how: docs/guides/reproducible-builds.md.
+was built from: `gh attestation verify <file> --repo biafra23/myotis`. What a rebuild
+is checked against, and how to make one: docs/guides/reproducible-builds.md.
 
 **Android (`*-android.apk`)** — the Myotis app, signed with Myotis's own release key
 (its certificate's SHA-256 is in `android-app/release-signing-cert.sha256` in the
@@ -13,9 +13,10 @@ only ever install Myotis, and its updates, from this releases page.
 
 **Android unsigned (`*-android-unsigned.apk`)** — not installable: Android refuses an
 unsigned APK. It is the release app as the build left it, before the signature was
-added, published so the build can be checked. A rebuild of this tag reproduces this
-file bit for bit, and the signed app is this file plus a signing block
-(docs/guides/reproducible-builds.md).
+added, published so the build can be checked: it is the file a rebuild of this tag
+in the pinned builder image is meant to reproduce bit for bit, and the signed app is
+this file plus its signature. Whether the rebuild matched for this release is in the
+summary of the tag's `reproducible builds` run (docs/guides/reproducible-builds.md).
 
 **Android debug (`*-android-debug.apk`)** — a separate test app ("Myotis Debug", amber
 icon, package `com.jaeckel.ethp2p.android.debug`), signed with the publicly known debug
