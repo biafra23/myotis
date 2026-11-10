@@ -48,12 +48,9 @@ preset uses the chain's values.
 
 Nothing downstream re-checks a from-block — the walk only descends to it — so
 each one was also re-bisected against a second, independent endpoint
-(2026-11-10). 44 of the 51 contracts were, and all 44 agree (RAILGUN mainnet
-returns its 14,693,013 creation block there, as expected). Seven Tornado Cash Sepolia
-pools — 10 ETH, 100 DAI, and the 0.01/0.03/0.3/3/30 ETH pools — rest on one
-endpoint so far, because the second one rate-limited before reaching them. They
-sit in the same two deployment batches as their confirmed siblings (blocks
-5,594,400–406 and 11,949,077–082). Confirming them is part of #752.
+(2026-11-10): all 51 contracts agree with the catalog (RAILGUN mainnet returns
+its 14,693,013 creation block there, as expected for its documented
+exception).
 
 A pool registered after the catalog was written is not in it. A client reading
 one gets the index's ordinary refusal for an unwatched address (`-32000`),
