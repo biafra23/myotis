@@ -51,12 +51,12 @@ concurrency:
 jobs:
   locked:
     name: Cargo.lock files resolve under --locked
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - uses: ./.github/actions/rust-toolchain
       - name: Resolve every lock without changing it
         run: |

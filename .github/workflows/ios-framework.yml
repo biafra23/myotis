@@ -40,6 +40,9 @@ on:
       - 'settings.gradle.kts'
       - 'gradle/libs.versions.toml'
       - '.github/workflows/ios-framework.yml'
+      - '.java-version'
+      - '.xcode-version'
+      - '.github/actions/select-xcode/**'
       - '.github/actions/rust-toolchain/**'
   pull_request:
     paths: *fw_paths
@@ -93,17 +96,20 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           # Full history: :ui (bundled into the framework) stamps its on-screen
           # version from the nearest v* tag via `git describe`, which needs
           # HEAD's history to reach that tag — same reason as the desktop dmg.
           fetch-depth: 0
+      # One Xcode for every macOS leg, from .xcode-version (#734).
+      - name: Select the pinned Xcode
+        uses: ./.github/actions/select-xcode
 
       - name: Set up JDK 21 (aarch64)
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4.9.1
         with:
-          java-version: '21'
+          java-version-file: .java-version  # exact Temurin build, one place (#734)
           distribution: 'temurin'
           architecture: 'aarch64'
 
@@ -117,12 +123,12 @@ jobs:
           targets: aarch64-apple-ios, aarch64-apple-ios-sim
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: rust
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a  # v4.4.3
 
       - name: Make gradlew executable
         run: chmod +x gradlew
@@ -215,7 +221,7 @@ jobs:
 
       - name: Upload xcframework artifact
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: myotis-ios-xcframework-${{ github.sha }}
           path: |
@@ -241,7 +247,7 @@ jobs:
     name: Publish xcframework to release
     needs: [build, version-guard]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:
@@ -249,7 +255,7 @@ jobs:
       # (.github/release-notes.*), from the commit being released. First, so
       # the artifacts below land in the checked-out workspace, not under it.
       - name: Check out the release notes
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           sparse-checkout: |
             .github/release-notes.md
@@ -259,7 +265,7 @@ jobs:
           # write token out of .git/config.
           persist-credentials: false
       - name: Download xcframework artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: myotis-ios-xcframework-${{ github.sha }}
 

@@ -15,7 +15,7 @@ on:
   push:
     branches: [ "main" ]
     tags: [ "v*" ]
-    paths: ['rust/**', '.github/workflows/node-binding.yml', '.github/actions/rust-toolchain/**']
+    paths: ['rust/**', '.github/workflows/node-binding.yml', '.github/actions/rust-toolchain/**', '.github/actions/select-xcode/**', '.xcode-version']
   workflow_dispatch:
 
 # Cancel a superseded run when new commits land on the same branch/PR. The
@@ -33,7 +33,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             target: x86_64-unknown-linux-gnu
             artifact: myotis-node.linux-x64-gnu.node
             built: rust/target/x86_64-unknown-linux-gnu/release/libmyotis_node.so
@@ -41,18 +41,18 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact: myotis-node.linux-arm64-gnu.node
             built: rust/target/aarch64-unknown-linux-gnu/release/libmyotis_node.so
-          - os: macos-latest
+          - os: macos-15
             target: aarch64-apple-darwin
             artifact: myotis-node.darwin-arm64.node
             built: rust/target/aarch64-apple-darwin/release/libmyotis_node.dylib
           # x64 macOS is cross-compiled from the arm64 runner — GitHub's
           # Intel-mac (macos-13) runners are scarce enough to starve the
           # whole matrix (and smoke-windows behind it) in the queue.
-          - os: macos-latest
+          - os: macos-15
             target: x86_64-apple-darwin
             artifact: myotis-node.darwin-x64.node
             built: rust/target/x86_64-apple-darwin/release/libmyotis_node.dylib
-          - os: windows-latest
+          - os: windows-2025
             target: x86_64-pc-windows-msvc
             artifact: myotis-node.win32-x64-msvc.node
             built: rust/target/x86_64-pc-windows-msvc/release/myotis_node.dll
@@ -60,11 +60,14 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      # One Xcode for every macOS leg, from .xcode-version (#734).
+      - name: Select the pinned Xcode
+        uses: ./.github/actions/select-xcode
       - uses: ./.github/actions/rust-toolchain
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: rust
       - name: Build
@@ -84,7 +87,7 @@ jobs:
         env:
           MYOTIS_NODE_ADDON: ${{ github.workspace }}/${{ matrix.artifact }}
         run: node --test addon-api.test.mjs
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
@@ -118,7 +121,7 @@ jobs:
     # marker-guarded notes append), and the smoke jobs below exclude tag refs
     # so a republish never drags the 100-minute smokes along.
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       # gh release create/upload/edit needs write access to Releases.
       contents: write
@@ -126,9 +129,9 @@ jobs:
       # Checked out (unlike the android release job) because the ABI version
       # is read from its source of truth in myotis-engine; this also gives gh
       # its repo context.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - name: Download addon artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           pattern: 'myotis-node.*.node'
           merge-multiple: true
@@ -197,15 +200,15 @@ jobs:
     needs: build
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 100
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: myotis-node.linux-x64-gnu.node
       - name: Restore sync snapshot cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:
           path: myotis-data
           key: myotis-smoke-data-linux-${{ github.run_id }}
@@ -240,22 +243,22 @@ jobs:
     needs: build
     permissions:
       contents: read
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 100
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: rust
       - name: Unit tests (whole workspace)
         working-directory: rust
         run: cargo test --locked --workspace
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: myotis-node.win32-x64-msvc.node
       - name: Restore sync snapshot cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:
           path: myotis-data
           key: myotis-smoke-data-win-${{ github.run_id }}

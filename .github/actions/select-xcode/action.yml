@@ -1,0 +1,24 @@
+# Select the Xcode pinned in .xcode-version (#734, Part 3) on a macOS runner.
+# Without it every macOS leg built with its image's DEFAULT Xcode, which the
+# image changes on its own schedule: on macos-15 that was 16.4 while macos-26
+# defaulted to 26.6, so two legs of one commit compiled with different SDKs and
+# clang. One version for every leg, from one file, failing closed when the
+# image no longer ships it (bump .xcode-version in a reviewed PR then).
+# A no-op outside macOS, so matrix jobs can call it unconditionally.
+name: Select the pinned Xcode
+description: xcode-select the Xcode version in .xcode-version
+runs:
+  using: composite
+  steps:
+    - if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        set -euo pipefail
+        v=$(tr -d ' \r\n' < .xcode-version)
+        [[ "$v" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { echo "::error file=.xcode-version::expected an Xcode version like 26.3, got '$v'"; exit 1; }
+        app="/Applications/Xcode_$v.app"
+        [ -d "$app" ] || { echo "::error::$app is not on this runner image ($(ls -d /Applications/Xcode_*.app | xargs -n1 basename | tr '\n' ' '))"; exit 1; }
+        sudo xcode-select -s "$app/Contents/Developer"
+        got=$(xcodebuild -version | head -1)
+        [ "$got" = "Xcode $v" ] || { echo "::error::xcodebuild reports '$got' after selecting $app"; exit 1; }
+        echo "$got ($(xcodebuild -version | tail -1)) at $app"

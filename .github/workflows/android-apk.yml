@@ -60,13 +60,13 @@ jobs:
   build:
     name: Build APKs (debug + unsigned release)
     needs: review-gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           submodules: recursive
           # Full history: :ui stamps the app's on-screen version from the nearest
@@ -85,15 +85,15 @@ jobs:
           fetch-depth: 0
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4.9.1
         with:
-          java-version: '21'
+          java-version-file: .java-version  # exact Temurin build, one place (#734)
           distribution: 'temurin'
 
       # Robust Gradle dependency + plugin caching (restores the base-branch cache
       # so AGP / Besu / JitPack-fork artifacts come from cache, not flaky repos).
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a  # v4.4.3
 
       - name: Make gradlew executable
         run: chmod +x gradlew
@@ -112,7 +112,7 @@ jobs:
           targets: aarch64-linux-android,x86_64-linux-android
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: rust
           # Shared with boot-smoke-api29 (same toolchain, same preBuild chain);
@@ -158,7 +158,7 @@ jobs:
             exit 1
           }
 
-      # The ubuntu-latest runner ships an Android SDK via $ANDROID_HOME, which
+      # The ubuntu-26.04 runner ships an Android SDK via $ANDROID_HOME, which
       # AGP picks up automatically when local.properties is absent. No extra
       # sdkmanager calls needed for compileSdk 34.
 
@@ -230,7 +230,7 @@ jobs:
           done
 
       - name: Upload the debug APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: android-app-debug-${{ github.sha }}
           path: android-app/build/outputs/apk/debug/*.apk
@@ -280,7 +280,7 @@ jobs:
       # so on a PR or main it would only be dead artifact storage.
       - name: Upload the unsigned release APK
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: android-app-release-unsigned-${{ github.sha }}
           path: android-app/build/outputs/apk/release/*.apk
@@ -314,7 +314,7 @@ jobs:
     # cold. It also spends no emulator time on a commit whose build is broken.
     # The cost is wall-clock: it starts only once the build job finishes.
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     # Skip on release tags: nothing consumes this job's result there (release
@@ -346,9 +346,9 @@ jobs:
       # probe degrades to its fallback label instead of failing without it.
       # (No `chmod +x gradlew` either — the executable bit is committed.)
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
-      # The emulator needs hardware virtualization; ubuntu-latest runners expose
+      # The emulator needs hardware virtualization; ubuntu-26.04 runners expose
       # /dev/kvm but root-only by default. This is the standard "enable KVM" udev
       # rule from the android-emulator-runner docs.
       - name: Enable KVM
@@ -358,13 +358,13 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4.9.1
         with:
-          java-version: '21'
+          java-version-file: .java-version  # exact Temurin build, one place (#734)
           distribution: 'temurin'
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a  # v4.4.3
 
       # The Rust engine, same toolchain as the build job: the app's preBuild runs
       # cargoNdkAndroid for both APK ABIs (the device itself is x86_64).
@@ -374,7 +374,7 @@ jobs:
           targets: aarch64-linux-android,x86_64-linux-android
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: rust
           # The build job's cache, saved by that job earlier in this same run
@@ -449,7 +449,7 @@ jobs:
       # the device) should say so, not vanish.
       - name: Upload managed-device test results
         if: failure() || cancelled()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: api29-boot-smoke-results-${{ github.sha }}
           path: |
@@ -497,7 +497,7 @@ jobs:
     name: Sign the release APK
     needs: [build, version-guard]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     environment: android-release
     permissions:
       contents: read
@@ -568,7 +568,7 @@ jobs:
     # otherwise all three are skipped.
     needs: [build, sign-release, version-guard]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       # gh release create/upload needs write access to Releases (repo contents).
       contents: write
@@ -577,7 +577,7 @@ jobs:
       # (.github/release-notes.*), from the commit being released. First, so
       # the artifacts below land in the checked-out workspace, not under it.
       - name: Check out the release notes
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           # Plus the version catalog, for the pinned android-build-tools the
           # badging check below reads with sed (#734).
@@ -590,13 +590,13 @@ jobs:
           # write token out of .git/config.
           persist-credentials: false
       - name: Download the debug APK
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: android-app-debug-${{ github.sha }}
           path: apk/debug
 
       - name: Download the signed release APK
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: android-app-release-${{ github.sha }}
           path: apk/release
