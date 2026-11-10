@@ -14,7 +14,10 @@ on:
   # this workflow existed, without moving the tag). Note the assets then come
   # from the dispatched branch tip, not the tag commit — which is why such a
   # backfill names them after the version they were built as, not after the
-  # tag (see the publish job).
+  # tag (see the publish job). Since #734 the release's evidence shows it too:
+  # the debs' attestation names the dispatched ref, and `verify release`, which
+  # accepts only assets built from the tag's own ref, fails for that release
+  # afterwards. The publish step warns.
   workflow_dispatch:
     inputs:
       release-tag:
@@ -298,6 +301,12 @@ jobs:
           # to gh, so a stray value (e.g. leading '-') can't be parsed as a flag.
           printf '%s' "$tag" | grep -Eq '^v[A-Za-z0-9._-]+$' \
             || { echo "::error::'$tag' is not a valid release tag (expected v<version>)"; exit 1; }
+          # A backfill from another ref is not the tag's build, and the release's
+          # evidence says so (#734): these debs are attested for THIS ref, and
+          # `verify release` accepts only assets built from the tag's own ref.
+          if [ "${GITHUB_REF}" != "refs/tags/$tag" ]; then
+            echo "::warning title=Backfill from another ref::these debs are built from ${GITHUB_REF}, not refs/tags/$tag. Their attestation names that ref, so \`verify release\` fails for $tag from now on (on a release older than SHA256SUMS it fails anyway). Dispatch on the tag itself to republish the tag's own build."
+          fi
           # When the version guard RAN, it validated GITHUB_REF_NAME — so its
           # green verdict only covers an upload to that same tag. Assert that
           # identity here, in shell, where the comparison is case-SENSITIVE like
@@ -348,10 +357,27 @@ jobs:
           # (On workflow_dispatch the release for the given tag normally already
           # exists, so this is view-then-upload.)
           bash .github/release-notes.sh create "$tag"
-          # Upload, check the release serves these bytes, keep SHA256SUMS complete.
+          # Upload, and check that the release serves these bytes.
           bash .github/release-assets.sh "$tag" "${debs[@]}"
 
       - name: Attest the debs' build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
           subject-checksums: ${{ runner.temp }}/release-assets.SHA256SUMS
+
+      # Last, and also when the attestation failed: SHA256SUMS is the one file
+      # all publishers share, kept apart from this job's own upload and
+      # attestation (.github/release-assets.sh).
+      - name: List the release's assets in SHA256SUMS
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG_INPUT: ${{ inputs.release-tag }}
+        run: |
+          set -eu
+          # The same tag as the publish step, checked the same way.
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then tag="${RELEASE_TAG_INPUT}"; else tag="${GITHUB_REF_NAME}"; fi
+          printf '%s' "$tag" | grep -Eq '^v[A-Za-z0-9._-]+$' \
+            || { echo "::error::'$tag' is not a valid release tag (expected v<version>)"; exit 1; }
+          bash .github/release-assets.sh --checksums "$tag"

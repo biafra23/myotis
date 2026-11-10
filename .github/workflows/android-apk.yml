@@ -256,8 +256,9 @@ jobs:
           # fix since it hit exactly that.)
           overwrite: true
 
-      # sign_release_apk.sh otherwise first runs on a hosted runner at a real
-      # tag. Rehearse it on every run with a throwaway key, so runner-image drift
+      # sign_release_apk.sh, and the release job's signed-against-unsigned
+      # check, otherwise first run on a hosted runner at a real
+      # tag. Rehearse them on every run with a throwaway key, so runner-image drift
       # (which build-tools dir it picks, apksigner's --alignment-preserved,
       # aapt2's badging format, the JDK behind apksigner) fails here instead.
       # The throwaway pin goes in through ANDROID_RELEASE_CERT_PIN_FILE, so the
@@ -279,6 +280,11 @@ jobs:
           ANDROID_RELEASE_KEYSTORE_PASSWORD="$REHEARSAL_PW" \
           ANDROID_RELEASE_KEY_ALIAS=rehearsal \
             scripts/sign_release_apk.sh "$apk" "$t/signed.apk"
+          # And the check the release job makes between the two APKs it
+          # publishes (#734): the signed one is the unsigned one plus its
+          # signature and nothing else. Here it meets the pinned apksigner's
+          # real output on every run, not first at a tag.
+          python3 scripts/repro/compare_signed_apk.py "$t/signed.apk" "$apk"
           rm -rf "$t"
 
       # sign-release refuses a tag whose tree has no pinned release certificate,
@@ -701,10 +707,20 @@ jobs:
           # Create the release with the master notes (.github/release-notes.md),
           # unless another publisher already did — see .github/release-notes.sh.
           bash .github/release-notes.sh create "$tag"
-          # Upload, check the release serves these bytes, keep SHA256SUMS complete.
+          # Upload, and check that the release serves these bytes.
           bash .github/release-assets.sh "$tag" apk/Myotis-*.apk
 
       - name: Attest the APKs' build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
           subject-checksums: ${{ runner.temp }}/release-assets.SHA256SUMS
+
+      # Last, and also when the attestation failed: SHA256SUMS is the one file
+      # all publishers share, kept apart from this job's own upload and
+      # attestation (.github/release-assets.sh).
+      - name: List the release's assets in SHA256SUMS
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: bash .github/release-assets.sh --checksums "${GITHUB_REF_NAME}"

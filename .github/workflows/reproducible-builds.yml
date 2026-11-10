@@ -502,6 +502,7 @@ jobs:
 
       - name: Download leg a
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        continue-on-error: true
         with:
           name: repro-linux-a
           path: tars/a
@@ -509,8 +510,19 @@ jobs:
       - name: Unpack leg a
         run: |
           set -euo pipefail
+          [ -f tars/a/repro-linux.tar ] \
+            || { echo "::error::leg a produced no artifacts (its build failed): nothing to set next to the published assets"; exit 1; }
           mkdir -p legs/a
           tar -C legs/a -xpf tars/a/repro-linux.tar
+
+      # Before the wait, not after it: a missing tool should fail in the first
+      # minute. unzip unpacks the Maven-repository zip (collect.sh published);
+      # diffoscope only explains a difference, the verdict is the hash manifest.
+      - name: Install unzip and diffoscope
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends diffoscope-minimal unzip >/dev/null
+          diffoscope --version
 
       # The three assets come from two workflows with no ordering between them
       # or with this one. SHA256SUMS lists an asset once its publisher has
@@ -541,12 +553,6 @@ jobs:
             --pattern "myotis-engine-$TAG-maven-repo.zip"
           (cd published-assets && sha256sum -c --ignore-missing SHA256SUMS)
           scripts/repro/collect.sh published published-assets legs/published
-
-      - name: Install diffoscope
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends diffoscope-minimal unzip >/dev/null
-          diffoscope --version
 
       - name: Compare the image build with the published assets
         run: |

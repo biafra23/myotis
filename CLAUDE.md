@@ -725,15 +725,18 @@ asset workflow and a stronger action than the merge this file already forbids.
    a release whose published bytes are wrong is the owner's decision.
 
 **Every release asset goes through `.github/release-assets.sh`, never a bare
-`gh release upload`** (#734). The script uploads, checks that the release
-serves the bytes the job built, and keeps the release's one `SHA256SUMS`
-complete across the nine publishers; the job's next step attests the uploaded
-files (`actions/attest-build-provenance`, `subject-checksums` from the file the
-script writes; the job needs `id-token: write` and `attestations: write`). A
-new publisher does both, and joins the list in `release-version-guard.yml`'s
-header. `scripts/test_release_assets.sh` (run by CI) fails on a bare upload in
-any workflow. docs/guides/reproducible-builds.md is the page for someone
-checking a release.
+`gh release upload`** (#734). A publishing job has three steps for it, in this
+order: the script uploads and checks that the release serves the bytes the job
+built; `actions/attest-build-provenance` attests those files
+(`subject-checksums` from the file the script writes; the job needs
+`id-token: write` and `attestations: write`); and
+`release-assets.sh --checksums <tag>`, last and with `if: ${{ !cancelled() }}`,
+keeps the release's one `SHA256SUMS` complete across the nine publishers. A
+new publisher has all three and joins the list in
+`release-version-guard.yml`'s header. `scripts/test_release_assets.sh` (run by
+CI) fails on a bare upload, or an upload without the checksums step, in any
+workflow. docs/guides/reproducible-builds.md is the page for someone checking
+a release.
 
 ## Demo bundles build on merge to `main`, never on PRs
 

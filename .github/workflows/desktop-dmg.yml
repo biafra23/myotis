@@ -459,7 +459,7 @@ jobs:
           # Create the release with the master notes (.github/release-notes.md),
           # unless another publisher already did — see .github/release-notes.sh.
           bash .github/release-notes.sh create "$tag"
-          # Upload, check the release serves these bytes, keep SHA256SUMS complete.
+          # Upload, and check that the release serves these bytes.
           bash .github/release-assets.sh "$tag" "dmg/Myotis-${tag}-arm64.dmg" "dmg/Myotis-${tag}-x64.dmg"
           if [ -f "dmg/Myotis-${tag}-bee-poc-arm64.dmg" ]; then
             bash .github/release-assets.sh "$tag" "dmg/Myotis-${tag}-bee-poc-arm64.dmg"
@@ -471,3 +471,13 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
           subject-checksums: ${{ runner.temp }}/release-assets.SHA256SUMS
+
+      # Last, and also when the attestation failed: SHA256SUMS is the one file
+      # all publishers share, kept apart from this job's own upload and
+      # attestation (.github/release-assets.sh).
+      - name: List the release's assets in SHA256SUMS
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: bash .github/release-assets.sh --checksums "${GITHUB_REF_NAME}"

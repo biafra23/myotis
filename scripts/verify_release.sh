@@ -4,8 +4,11 @@
 #   scripts/verify_release.sh [--no-attestations] <tag> [DIR]
 #
 # Downloads every asset of the release into DIR (default: a temporary
-# directory, removed afterwards; an existing DIR's files are reused, so a
-# re-run does not download 2 GB again), then checks, in this order:
+# directory, removed afterwards), then checks, in this order. With a DIR, files
+# already there are reused, so a re-run does not download 2 GB again: but
+# SHA256SUMS is always fetched afresh, and a file there that it does not list
+# with that hash (an asset replaced since, a truncated download) is fetched
+# again, so what is checked is what the release serves now.
 #
 #   1. SHA256SUMS is there, lists every asset except itself and nothing that is
 #      not an asset, and every hash matches (`sha256sum -c`).
@@ -39,28 +42,38 @@ if [ $# -eq 2 ]; then dir=$2; mkdir -p "$dir"
 else dir=$(mktemp -d); trap 'rm -rf "$dir"' EXIT; fi
 repo=${GH_REPO:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}
 
-if command -v sha256sum >/dev/null 2>&1; then check() { sha256sum -c "$@"; }
-else check() { shasum -a 256 -c "$@"; }; fi
+if command -v sha256sum >/dev/null 2>&1; then check() { sha256sum -c "$@"; }; sha() { sha256sum "$1" | cut -d' ' -f1; }
+else check() { shasum -a 256 -c "$@"; }; sha() { shasum -a 256 "$1" | cut -d' ' -f1; }; fi
 
 failures=0
 bad() { echo "FAIL  $*"; failures=$((failures + 1)); }
 
 echo "release $tag of $repo, assets in $dir"
-# --skip-existing: a re-run with a DIR keeps what it has. The hashes below are
-# checked either way, so a stale or truncated file cannot pass.
+# The release's SHA256SUMS as it is now, never a kept one; then drop every kept
+# file it does not vouch for, so the download below fetches the current one.
+rm -f "$dir/SHA256SUMS"
+gh release download "$tag" --repo "$repo" --dir "$dir" --pattern SHA256SUMS 2>/dev/null || true
+for f in "$dir"/* "$dir"/.[!.]*; do
+  [ -f "$f" ] && [ "$(basename "$f")" != SHA256SUMS ] || continue
+  if [ ! -f "$dir/SHA256SUMS" ] || ! grep -qxF "$(sha "$f")  $(basename "$f")" "$dir/SHA256SUMS"; then
+    echo "      $(basename "$f") in $dir is not what the release lists: fetching it again"
+    rm -f "$f"
+  fi
+done
 gh release download "$tag" --repo "$repo" --dir "$dir" --skip-existing
 cd "$dir"
+# Every asset, dotfiles included; names have no whitespace (release-assets.sh
+# refuses them).
+assets=$(ls -A | { grep -vx SHA256SUMS || true; } | LC_ALL=C sort)
 
 # --- 1. SHA256SUMS ------------------------------------------------------------
 if [ ! -f SHA256SUMS ]; then
   bad "the release has no SHA256SUMS"
 else
   listed=$(sed 's/^[0-9a-f]\{64\}  //' SHA256SUMS | LC_ALL=C sort)
-  # `ls -A`: asset names have no whitespace (release-assets.sh refuses them).
-  present=$(ls -A | grep -vx SHA256SUMS | LC_ALL=C sort)
-  if [ "$listed" != "$present" ]; then
+  if [ "$listed" != "$assets" ]; then
     bad "SHA256SUMS and the release's assets are not the same set (< listed, > published):"
-    diff <(printf '%s\n' "$listed") <(printf '%s\n' "$present") | grep '^[<>]' | sed 's/^/        /' || true
+    diff <(printf '%s\n' "$listed") <(printf '%s\n' "$assets") | grep '^[<>]' | sed 's/^/        /' || true
   fi
   if out=$(check SHA256SUMS 2>&1); then
     echo "ok    SHA256SUMS: all $(wc -l < SHA256SUMS | tr -d ' ') listed files match"
@@ -73,8 +86,7 @@ fi
 # --- 2. attestations ----------------------------------------------------------
 if $attest; then
   n=0
-  for f in *; do
-    [ "$f" != SHA256SUMS ] || continue
+  for f in $assets; do
     if out=$(gh attestation verify "$f" --repo "$repo" --source-ref "refs/tags/$tag" 2>&1); then
       n=$((n + 1))
     else

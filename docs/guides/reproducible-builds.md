@@ -65,11 +65,12 @@ release. Download it next to what you downloaded:
 sha256sum -c SHA256SUMS --ignore-missing
 ```
 
-(`shasum -a 256 -c` on macOS.) It is written by the release workflows
-themselves: each one uploads its assets, asks GitHub for the SHA-256 it
-recorded for each, and fails unless that is the hash of the file the job
-built. So a line in `SHA256SUMS` is a file a build job produced, not a hash of
-whatever the release happened to hold.
+(`shasum -a 256 -c` on macOS.) The release workflows write it from the SHA-256
+GitHub records for each asset. Before that, each workflow checks its own
+uploads: the hash GitHub recorded must be the hash of the file the job built,
+or the job fails. `SHA256SUMS` lists whatever the release holds, so a file
+someone added by hand would be listed too; what such a file would lack is the
+attestation of the next section.
 
 A checksum file from the same page as the download protects against a broken
 download and a swapped single asset. It does not protect against someone who
@@ -207,5 +208,6 @@ in `android-app/release-signing-cert.sha256`
   the same pins. Moving `APT_SNAPSHOT` or the package list moves
   `docker/builder/apt-packages.txt` in the same change: `check.sh` prints the
   new list when it differs.
-- Every release asset is uploaded through `.github/release-assets.sh`, which
-  is what keeps `SHA256SUMS` complete, and attested in the same job.
+- Every release asset is uploaded through `.github/release-assets.sh` and
+  attested in the same job, whose last step
+  (`release-assets.sh --checksums`) is what keeps `SHA256SUMS` complete.
