@@ -394,7 +394,15 @@ uniffi::setup_scaffolding!();
 ///      simulation error as `{"status":"failed","code","message"}`. An
 ///      additive function — bumped so a host that serves `eth_simulateV1` is
 ///      never paired with an engine that lacks it.
-pub const ABI_VERSION: i32 = 55;
+/// v56: metered-download hold for the log index's backfill walk. The config
+///      push takes `allowMetered` (strict boolean, absent = false): while the
+///      host reports a METERED network (`set_network_metering`) the walk waits
+///      unless it is true; head-follow keeps running. The status JSON carries
+///      `allowMetered` and `meteredHold` right after `backfillPaused`. A
+///      payload extension, no signature change — bumped so a host that offers
+///      "unmetered only" is never paired with an engine that would accept the
+///      key and ignore it.
+pub const ABI_VERSION: i32 = 56;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

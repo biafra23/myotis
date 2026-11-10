@@ -2044,6 +2044,44 @@ impl FeeEstimate {
 }
 
 /// A running EL reader: owns discv4 + the peer pool, borrows the beacon anchor.
+/// The device's network is metered — the host's word, engine-wide (it is the
+/// device's network, not a chain's). Set by the engine wherever the host
+/// reports metering (`myotis-engine`'s `set_network_metering`); read by every
+/// reader's backfill walk ([`ElReader::log_index_metered_hold`]). A global for
+/// the same reason the engine's own metering is: one device, one network.
+static DEVICE_METERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record whether the device's network is metered (see [`DEVICE_METERED`]).
+/// "Unknown" is not metered — a host that never reports (the daemon, the
+/// desktop) keeps every walk running, as before.
+pub fn set_device_metered(metered: bool) {
+    DEVICE_METERED.store(metered, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What [`set_device_metered`] last recorded.
+pub fn device_metered() -> bool {
+    DEVICE_METERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The metered-hold rule, pure: the walk waits exactly while the network is
+/// metered and the index was not allowed to download on one.
+pub fn metered_hold(metered: bool, allow_metered: bool) -> bool {
+    metered && !allow_metered
+}
+
+#[cfg(test)]
+mod metered_hold_tests {
+    use super::metered_hold;
+
+    #[test]
+    fn the_walk_waits_only_on_a_metered_network_it_was_not_allowed_on() {
+        assert!(metered_hold(true, false), "metered and not allowed: hold");
+        assert!(!metered_hold(true, true), "metered but allowed: walk");
+        assert!(!metered_hold(false, false), "unmetered or unknown: walk");
+        assert!(!metered_hold(false, true));
+    }
+}
+
 pub struct ElReader {
     request_shutdown: tokio::sync::watch::Sender<bool>,
     requests: std::sync::Mutex<Vec<std::sync::Weak<super::request::Operation>>>,
@@ -2194,6 +2232,12 @@ pub struct ElReader {
     /// In-progress head-gap bridge (see [`Self::log_index_bridge_step`]).
     /// `None` whenever the coverage edge is within the appender's reach.
     log_index_bridge: std::sync::Mutex<Option<BridgePlan>>,
+    /// Whether the backfill walk may run while the device's network is
+    /// metered ([`device_metered`]). Off by default: the walk is the one bulk
+    /// download the log index makes (a mainnet contract's history is hundreds
+    /// of GB of receipts), so it waits for an unmetered network unless the
+    /// host's push says `allowMetered`. See [`Self::log_index_metered_hold`].
+    log_index_allow_metered: std::sync::atomic::AtomicBool,
     /// `(number, hash)` for every block THIS RUN appended above finality,
     /// ascending — the tail's own record of what it claimed, which is what
     /// makes a reorg detectable (compare against the canonical chain) and a
@@ -2466,6 +2510,7 @@ impl ElReader {
             log_index: std::sync::Mutex::new(None),
             log_index_rate: std::sync::Mutex::new(None),
             log_index_bridge: std::sync::Mutex::new(None),
+            log_index_allow_metered: std::sync::atomic::AtomicBool::new(false),
             log_index_tail: std::sync::Mutex::new(Vec::new()),
             log_index_claim: std::sync::Mutex::new(RestartClaimState::default()),
             log_index_persist: PersistClock::new(),
@@ -4897,6 +4942,19 @@ impl ElReader {
         if self.with_log_index(|ix| ix.config().backfill_paused) == Some(true) {
             return;
         }
+        // The metered hold: like the OFF switch, but the device's network
+        // decides, not the host's setting — the walk waits (cursor and
+        // coverage untouched) until the host reports an unmetered network or
+        // pushes `allowMetered`. Head-follow keeps running: it is what keeps
+        // head-reaching queries answerable, and it costs a few blocks a tick.
+        if self.log_index_metered_hold() {
+            // Restart the rate window: held time is not walking time, and a rate
+            // measured across it would understate the ETA once the walk resumes.
+            if let Ok(mut rate) = self.log_index_rate.lock() {
+                *rate = None;
+            }
+            return;
+        }
         if let (Some(edge), Some(head)) = (
             self.with_log_index(|ix| ix.append_edge()).flatten(),
             self.head_block_number(),
@@ -5884,6 +5942,24 @@ impl ElReader {
             },
             Err(_) => false,
         }
+    }
+
+    /// Let the backfill walk run on a metered network (the host's push,
+    /// `allowMetered`; re-applied on every resume like the runtime bits).
+    pub fn set_log_index_allow_metered(&self, allow: bool) {
+        self.log_index_allow_metered.store(allow, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// What [`Self::set_log_index_allow_metered`] last set (false by default).
+    pub fn log_index_allow_metered(&self) -> bool {
+        self.log_index_allow_metered.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the backfill walk is held for the metered network right now:
+    /// the host reported one ([`set_device_metered`]) and did not allow
+    /// metered downloads for this index.
+    pub fn log_index_metered_hold(&self) -> bool {
+        metered_hold(device_metered(), self.log_index_allow_metered())
     }
 
     /// Count of live snap peers (for host status).

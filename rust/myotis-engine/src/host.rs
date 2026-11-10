@@ -110,7 +110,7 @@ struct EngineState {
     /// (host threads only; no runtime task takes it).
     boot_enodes_apply: Mutex<()>,
     /// Per-handle LAST-PUSHED log-index runtime bits, as
-    /// `(enabled, max_speed, backfill_paused)`. None of the three is in the
+    /// `(enabled, max_speed, backfill_paused, allow_metered)`. None of them is in the
     /// portable snapshot, and a pause drops the EL reader with the index in it,
     /// so a resume re-activates from disk at the ACTIVATION defaults — enabled,
     /// walk paused — no matter what the host last said, and no host re-pushes on
@@ -118,7 +118,7 @@ struct EngineState {
     /// for, and re-enables an index a host turned off. Re-applied by every
     /// spin_up (start AND resume) after activation, exactly like
     /// [`Engine::pending_served_window`]. Dies with the handle.
-    log_index_runtime_bits: Mutex<HashMap<i64, (bool, bool, bool)>>,
+    log_index_runtime_bits: Mutex<HashMap<i64, (bool, bool, bool, bool)>>,
     /// Per-handle address-activity watch list (#691), as the pushes left it.
     /// The list lives in the EL reader, which a pause drops, and no host
     /// re-pushes on resume: re-applied by every spin_up (start AND resume),
@@ -823,8 +823,9 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
         // an index the host turned off — the latter silently, since a disabled
         // index leaves its file in place for activation to find.
         if let Ok(bits) = engine.log_index_runtime_bits.lock() {
-            if let Some(&(enabled, max_speed, backfill_paused)) = bits.get(&handle) {
+            if let Some(&(enabled, max_speed, backfill_paused, allow_metered)) = bits.get(&handle) {
                 reader.apply_log_index_runtime_bits(enabled, max_speed, backfill_paused);
+                reader.set_log_index_allow_metered(allow_metered);
             }
         }
         // And the activity watch list: the resumed reader starts empty, and
@@ -1330,6 +1331,9 @@ pub fn set_network_metering(code: i32) -> bool {
         tick_all_ledgers(engine);
     }
     crate::usage::set_metering(m);
+    // The log index's backfill walk holds on a metered network unless the
+    // host's push allowed it (`allowMetered`, ElReader::log_index_metered_hold).
+    myotis_net::el::reader::set_device_metered(m == Metering::Metered);
     true
 }
 
@@ -5335,8 +5339,17 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
         );
         return false;
     };
+    // Whether the backfill walk may run on a metered network. Absent = false:
+    // the walk is the index's one bulk download, so "unmetered only" is the
+    // default (a host that never reports metering — the daemon, the desktop —
+    // is never metered, so nothing changes there). Strict like the other
+    // bits: a malformed value refuses the push rather than defaulting.
+    let Some(allow_metered) = strict_bool(&v, "allowMetered", false) else {
+        tracing::warn!("log-index config refused: `allowMetered` is not a boolean; ignoring the push");
+        return false;
+    };
     let enabled = config.enabled;
-    let bits = (config.enabled, config.max_speed, config.backfill_paused);
+    let bits = (config.enabled, config.max_speed, config.backfill_paused, allow_metered);
     let Some(engine) = engine() else {
         return false;
     };
@@ -5353,6 +5366,7 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
     }
     let installed = reader.set_log_index_config(config);
     if installed {
+        reader.set_log_index_allow_metered(allow_metered);
         // Remember what the host asked for, so a resume re-applies it instead of
         // the activation defaults (see `Engine::log_index_runtime_bits`). Written
         // under the handles lock, and only while the handle is still Running, so a
@@ -5588,7 +5602,11 @@ pub fn log_index_status_json(handle: i64) -> String {
     // gap to finality instead would show "caught up" through the whole band
     // where queries still fail.
     let head = reader.head_block_number().unwrap_or(0);
-    let status = reader.with_log_index(|ix| build_log_index_status(ix, rate_bps, head));
+    let metered = MeteredBits {
+        allow_metered: reader.log_index_allow_metered(),
+        hold: reader.log_index_metered_hold(),
+    };
+    let status = reader.with_log_index(|ix| build_log_index_status(ix, rate_bps, head, metered));
     status.unwrap_or_else(|| "{\"enabled\":false,\"logCount\":0,\"entries\":[]}".to_string())
 }
 
@@ -5731,12 +5749,22 @@ pub fn read_stats_json(handle: i64) -> String {
     }
 }
 
+/// The metered-download state the status reports (ABI 56): whether the host
+/// allowed the backfill walk on a metered network, and whether it is held for
+/// one right now.
+#[derive(Clone, Copy, Debug, Default)]
+struct MeteredBits {
+    allow_metered: bool,
+    hold: bool,
+}
+
 /// Pure status serializer (unit-tested): fixed key order, no whitespace —
 /// the Kotlin LogIndexStatus parser and its golden test pin this shape.
 fn build_log_index_status(
     ix: &myotis_net::el::logindex::LogIndex,
     rate_bps: Option<f64>,
     head: u64,
+    metered: MeteredBits,
 ) -> String {
     {
         let mut s = String::from("{\"enabled\":");
@@ -5751,6 +5779,10 @@ fn build_log_index_status(
         s.push_str(if ix.config().max_speed { "true" } else { "false" });
         s.push_str(",\"backfillPaused\":");
         s.push_str(if ix.config().backfill_paused { "true" } else { "false" });
+        s.push_str(",\"allowMetered\":");
+        s.push_str(if metered.allow_metered { "true" } else { "false" });
+        s.push_str(",\"meteredHold\":");
+        s.push_str(if metered.hold { "true" } else { "false" });
         // Backfill progress for the hosts' Index tab: the walk target, blocks
         // remaining to it, and — once the walker has a measured rate — an ETA.
         // All optional-by-context so the shape stays honest: nothing indexed
@@ -6213,7 +6245,7 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
 
 #[cfg(test)]
 mod log_index_json_tests {
-    use super::{build_log_index_status, parse_log_index_config, parse_log_index_unwatch};
+    use super::{build_log_index_status, parse_log_index_config, parse_log_index_unwatch, strict_bool, MeteredBits};
 
     fn cfg(json: &str) -> Option<myotis_net::el::logindex::LogIndexConfig> {
         parse_log_index_config(&serde_json::from_str(json).unwrap())
@@ -6314,7 +6346,7 @@ mod log_index_json_tests {
         };
         let mut ix = LogIndex::new(LogIndexConfig { enabled: true, watch: vec![w], ..Default::default() }).unwrap();
         ix.append_block(3, [0; 32], vec![]).unwrap();
-        let json = build_log_index_status(&ix, None, 3);
+        let json = build_log_index_status(&ix, None, 3, MeteredBits::default());
         assert!(
             json.contains(&format!(
                 r#"{{"topic":"0x{}","positions":[1,2],"fromBlock":3,"name":"me","coveredLow":3,"coveredHigh":3,"restricted":true}}"#,
@@ -6401,10 +6433,49 @@ mod log_index_json_tests {
         // Status carries the name for named entries and omits the key for
         // unnamed ones (shape-stable for pre-name hosts).
         let ix = myotis_net::el::logindex::LogIndex::new(named).unwrap();
-        let s = build_log_index_status(&ix, None, 0);
+        let s = build_log_index_status(&ix, None, 0, MeteredBits::default());
         assert!(s.contains("\"name\":\"tornado.registry.eth\""), "{s}");
         let ix = myotis_net::el::logindex::LogIndex::new(unnamed).unwrap();
-        assert!(!build_log_index_status(&ix, None, 0).contains("\"name\""));
+        assert!(!build_log_index_status(&ix, None, 0, MeteredBits::default()).contains("\"name\""));
+    }
+
+    #[test]
+    fn status_json_carries_the_metered_download_state() {
+        let w = myotis_net::el::logindex::WatchEntry {
+            key: myotis_net::el::logindex::WatchKey::Address([0x11; 20]),
+            positions: vec![],
+            from_block: 100,
+            topic0s: vec![],
+            name: String::new(),
+        };
+        let cfg = myotis_net::el::logindex::LogIndexConfig {
+            enabled: true,
+            max_speed: false,
+            backfill_paused: false,
+            watch: vec![w],
+        };
+        let ix = myotis_net::el::logindex::LogIndex::new(cfg).unwrap();
+        // Default: unmetered only, nothing held — and the keys sit right after
+        // backfillPaused in the fixed order the Kotlin parser reads.
+        let s = build_log_index_status(&ix, None, 0, MeteredBits::default());
+        assert!(
+            s.contains("\"backfillPaused\":false,\"allowMetered\":false,\"meteredHold\":false"),
+            "{s}"
+        );
+        let held = build_log_index_status(&ix, None, 0, MeteredBits { allow_metered: false, hold: true });
+        assert!(held.contains("\"meteredHold\":true"), "{held}");
+        let allowed = build_log_index_status(&ix, None, 0, MeteredBits { allow_metered: true, hold: false });
+        assert!(allowed.contains("\"allowMetered\":true,\"meteredHold\":false"), "{allowed}");
+    }
+
+    #[test]
+    fn allow_metered_is_strict_and_defaults_to_unmetered_only() {
+        let v = |j: &str| serde_json::from_str::<serde_json::Value>(j).unwrap();
+        assert_eq!(strict_bool(&v(r#"{"enabled":true}"#), "allowMetered", false), Some(false));
+        assert_eq!(strict_bool(&v(r#"{"allowMetered":true}"#), "allowMetered", false), Some(true));
+        assert_eq!(strict_bool(&v(r#"{"allowMetered":null}"#), "allowMetered", false), Some(false));
+        // A string is refused (the push is ignored), never read as a default.
+        assert_eq!(strict_bool(&v(r#"{"allowMetered":"true"}"#), "allowMetered", false), None);
     }
 
     #[test]
@@ -6424,7 +6495,7 @@ mod log_index_json_tests {
         };
         let mut ix = myotis_net::el::logindex::LogIndex::new(cfg).unwrap();
         ix.cursor = Some((600, [0u8; 32]));
-        let s = build_log_index_status(&ix, Some(9.44), 0);
+        let s = build_log_index_status(&ix, Some(9.44), 0, MeteredBits::default());
         assert!(s.contains("\"maxSpeed\":true"), "{s}");
         // The pause bit rides next to maxSpeed in the fixed key order the
         // Kotlin parser and its golden test pin.
@@ -6435,7 +6506,7 @@ mod log_index_json_tests {
         // eta = 500 / 9.44 = 52.966 -> 53
         assert!(s.contains("\"etaSeconds\":53"), "{s}");
         // No rate -> no ETA keys, remaining still present.
-        let s2 = build_log_index_status(&ix, None, 0);
+        let s2 = build_log_index_status(&ix, None, 0, MeteredBits::default());
         assert!(s2.contains("\"blocksRemaining\":500"), "{s2}");
         assert!(!s2.contains("etaSeconds"), "{s2}");
         // An unrestricted entry's shape is untouched by the `restricted` key.
@@ -6462,7 +6533,7 @@ mod log_index_json_tests {
         };
         let mut ix = myotis_net::el::logindex::LogIndex::new(cfg).unwrap();
         ix.append_block(200, [2; 32], vec![]).unwrap();
-        let s = build_log_index_status(&ix, None, 0);
+        let s = build_log_index_status(&ix, None, 0, MeteredBits::default());
         assert!(
             s.ends_with(
                 "\"entries\":[{\"address\":\"0x1111111111111111111111111111111111111111\",\"fromBlock\":100,\
@@ -6505,7 +6576,7 @@ mod log_index_json_tests {
         // seeded it near the head sometime after the seed installed (the seed
         // itself ships no cursor; see the doc comment above).
         ix.cursor = Some((5000, [0u8; 32]));
-        let s = build_log_index_status(&ix, Some(9.44), 0);
+        let s = build_log_index_status(&ix, Some(9.44), 0, MeteredBits::default());
         assert!(s.contains("\"targetLow\":100"), "{s}");
         assert!(s.contains("\"blocksRemaining\":0"), "{s}");
         // Nothing left to estimate a rate or an ETA for.
@@ -6559,7 +6630,7 @@ mod log_index_json_tests {
         assert_eq!(ix.coverage_of(&myotis_net::el::logindex::WatchKey::Address(addr_a)).unwrap().span, Some((1, 20)), "sanity: A still complete");
         assert_eq!(ix.coverage_of(&myotis_net::el::logindex::WatchKey::Address(addr_b)).unwrap().span, Some((20, 20)), "sanity: B seeded, not backfilled");
 
-        let s = build_log_index_status(&ix, None, 0);
+        let s = build_log_index_status(&ix, None, 0, MeteredBits::default());
         // targetLow is unaffected — still the minimum from_block over every
         // entry (its meaning is pinned in LogIndexStatus.kt).
         assert!(s.contains("\"targetLow\":1"), "{s}");

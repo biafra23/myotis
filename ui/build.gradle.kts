@@ -190,6 +190,9 @@ kotlin {
                 // new artifact in any host — :jsonrpc-server, which all three bundle, already
                 // ships it.
                 implementation(libs.kotlinx.serialization.json)
+                // The Index tab's predefined contracts and their download estimates —
+                // one catalog with the engine library's, so the from-blocks cannot drift.
+                implementation(project(":myotis-logindex-presets"))
             }
         }
         // CacheFileStats' stat/read actuals are plain java.nio, identical on the

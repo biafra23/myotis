@@ -85,6 +85,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.myotis.logindex.LogIndexDownloads
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -2928,6 +2929,8 @@ private fun IndexTab(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         var collecting by remember(network) { mutableStateOf(settings.logIndexEnabled(network)) }
+        // Hoisted: the preset section above the switch reads it too.
+        var backfillPaused by remember(network) { mutableStateOf(settings.logIndexBackfillPaused(network)) }
         // The persisted watch store. The tab is not its only writer — a host
         // changes it from its own thread (an import's contracts are added, a
         // delivered removal's marker dropped; see LogIndexWatch) — so it is
@@ -3036,6 +3039,48 @@ private fun IndexTab(
                 "against receipt roots, backfilled to the block you set. Runs on the Rust " +
                 "engine only.",
         )
+
+        // ---- Predefined contracts: a protocol's history in one step. ----
+        // Adding one is adding its contracts to the list below, then the same
+        // verified backfill as for a contract typed in by hand. It is the opt-in:
+        // collection switches on, like an import.
+        // An address the engine indexes under a topic restriction counts as present:
+        // the presets carry no topics, so pushing it unrestricted would be a topic
+        // conflict, which the engine answers by replacing the whole index (the same
+        // reason "Add contract" refuses one below).
+        // Address → the fromBlock it is listed (or restricted-indexed) from, so a
+        // preset contract typed in from a LATER block reads as only partly covered.
+        val presetListed = remember(watch, parsed) {
+            parsed?.entries.orEmpty().filter { it.restricted }.associate { it.address to it.fromBlock } +
+                watch.associate { it.address.lowercase() to it.fromBlock }
+        }
+        LogIndexPresetSection(
+            settings = settings,
+            network = network,
+            listed = presetListed,
+            indexHoldsContracts = watch.isNotEmpty() || parsed?.entries?.isNotEmpty() == true,
+            headBlock = snapshot?.executionBlockNumber?.takeIf { it > 0 },
+            networkMetering = snapshot?.networkMetering,
+            backfillPaused = backfillPaused,
+            onAllowMeteredChanged = { on ->
+                settings.setLogIndexAllowMetered(network, on)
+                // A runtime bit like the pause: re-pushed, coverage untouched.
+                if (collecting || settings.logIndexConfigured(network)) controller.applyLogIndex(network)
+            },
+            onAdd = { presets ->
+                val entries = LogIndexDownloads.watchEntries(presets, presetListed.keys)
+                edit { json ->
+                    entries.fold(json) { acc, c -> LogIndexWatch.watch(acc, LogIndexWatch.Entry(c.address, c.fromBlock)) }
+                }
+                if (!collecting) {
+                    collecting = true
+                    settings.setLogIndexEnabled(network, true)
+                }
+                controller.applyLogIndex(network)
+                onLogIndexChanged()
+            },
+        )
+        HorizontalDivider()
 
         // ---- The watch list: the user's entries, persisted host-side. ----
         watch.forEach { entry ->
@@ -3201,9 +3246,6 @@ private fun IndexTab(
                 if (maxSpeed) "Backfills as fast as peers serve — heavier on network and battery."
                 else "Nice background pace — one small batch every few seconds.",
             )
-            var backfillPaused by remember(network) {
-                mutableStateOf(settings.logIndexBackfillPaused(network))
-            }
             SwitchRow(
                 label = "Pause backfill on $network",
                 checked = backfillPaused,

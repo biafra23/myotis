@@ -598,7 +598,11 @@ post-create call rather than a `create_handle` signature break:
   built-in preset (the kohaku contract set per network), since 2026-08-20 the
   user's own entries (`LogIndexWatch`, entered on the Index tab (Settings → Expert mode) and persisted
   per network). `watch` is additive and `unwatch` is the unsubscribe — see
-  §Import, *Unsubscribe*.
+  §Import, *Unsubscribe*. `"allowMetered": bool?` (ABI 56, absent = false)
+  lets the backfill walk run while the host reports a metered network; without
+  it the walk is held there and the status says `"meteredHold":true` —
+  docs/how-it-works/log-index-presets.md, which also covers the predefined
+  contracts the Index tab offers.
 - Hosts: the `Settings` seam gains logIndex getters/setters next to
   `servedBlockWindow` (`ui/.../NodeController.kt:315`); persisted by each
   host's `Settings` actual; applied on (re)start via `RustChainHandle` right
