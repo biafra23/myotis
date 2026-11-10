@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Set up one leg of reproducible-builds.yml (#734, Part 5a).
 #
-#   scripts/repro/setup_leg.sh a|b
+#   scripts/repro/setup_leg.sh a|b|r
 #
 # Run in the job's checkout ($GITHUB_WORKSPACE) after the toolchains are
 # installed. Leg a builds there as it is. Leg b differs in everything a
@@ -19,7 +19,7 @@
 # effect there.
 set -euo pipefail
 
-leg=${1:?usage: setup_leg.sh a|b}
+leg=${1:?usage: setup_leg.sh a|b|r}
 : "${GITHUB_ENV:?not in a GitHub Actions job}" "${GITHUB_OUTPUT:?}" "${RUNNER_TEMP:?}" "${GITHUB_SHA:?}"
 windows=false
 command -v cygpath >/dev/null 2>&1 && windows=true
@@ -27,7 +27,9 @@ tmp=$RUNNER_TEMP
 $windows && tmp=$(cygpath -m "$RUNNER_TEMP")
 
 case "$leg" in
-a)
+a|r)
+    # r (Linux only) is the RELEASE's way: the hosted runner's toolchain, as
+    # android-apk.yml and engine-library.yml build today, in the job's checkout.
     src=$(pwd)
     $windows && src=$(cygpath -m "$src")
     tz=UTC lang=C.UTF-8 mask=022
@@ -51,19 +53,19 @@ b)
     fi
     ;;
 *)
-    echo "setup_leg.sh: leg must be a or b, got '$leg'" >&2; exit 2 ;;
+    echo "setup_leg.sh: leg must be a, b or r, got '$leg'" >&2; exit 2 ;;
 esac
 
 # Linux builds in the builder image (docker/builder/run.sh), as a uid of its
-# own with no home in the image: BOTH legs get a writable HOME, CARGO_HOME and
-# GRADLE_USER_HOME (at different paths), and leg b runs as another uid, which
-# owns everything it writes. REPRO_HOME, not HOME: the job's own steps keep
+# own with no home in the image: legs a and b get a writable HOME, CARGO_HOME
+# and GRADLE_USER_HOME (at different paths), and leg b runs as another uid
+# under another user name, which owns everything it writes. REPRO_HOME, not HOME: the job's own steps keep
 # the runner's.
-if [[ "$(uname -s)" == Linux ]]; then
+if [[ "$(uname -s)" == Linux && "$leg" != r ]]; then
     mkdir -p "$tmp/home-$leg" "$tmp/cargo-home-$leg" "$tmp/gradle-home-$leg"
-    run_as="$(id -u):$(id -g)"
+    run_as="$(id -u):$(id -g)" user_name=builder
     if [[ "$leg" == b ]]; then
-        run_as=4242:4242
+        run_as=4242:4242 user_name=someone-else
         sudo chown -R "$run_as" "$src" "$tmp/home-$leg" "$tmp/cargo-home-$leg" "$tmp/gradle-home-$leg"
     fi
     {
@@ -71,6 +73,7 @@ if [[ "$(uname -s)" == Linux ]]; then
         echo "CARGO_HOME=$tmp/cargo-home-$leg"
         echo "GRADLE_USER_HOME=$tmp/gradle-home-$leg"
         echo "REPRO_RUN_AS=$run_as"
+        echo "REPRO_USER_NAME=$user_name"
     } >> "$GITHUB_ENV"
 fi
 

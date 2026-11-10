@@ -37,7 +37,7 @@ done
     echo "          Move JDK_VERSION, JDK_BUILD and JDK_SHA256 there in the same change." >&2
     exit 1
 }
-for f in android-app/build.gradle.kts myotis-engine/build.gradle.kts; do
+for f in android-app/build.gradle.kts myotis-engine/build.gradle.kts ui/build.gradle.kts; do
     sdk=$(sed -n 's/^ *compileSdk *= *\([0-9]*\).*/\1/p' "$root/$f" | head -n1)
     [[ "$sdk" == "$ANDROID_PLATFORM" ]] || {
         echo "build.sh: $f has compileSdk $sdk, but pins.env's ANDROID_PLATFORM is $ANDROID_PLATFORM" >&2
@@ -53,7 +53,8 @@ args=(
     "RUST_VERSION=$rust" "CARGO_NDK_VERSION=$cargo_ndk"
     "ANDROID_CMDLINE_TOOLS=$ANDROID_CMDLINE_TOOLS"
     "ANDROID_CMDLINE_TOOLS_SHA256=$ANDROID_CMDLINE_TOOLS_SHA256"
-    "ANDROID_NDK=$ndk" "ANDROID_BUILD_TOOLS=$build_tools" "ANDROID_PLATFORM=$ANDROID_PLATFORM"
+    "ANDROID_NDK=$ndk" "ANDROID_BUILD_TOOLS=$build_tools"
+    "ANDROID_PLATFORM=$ANDROID_PLATFORM" "ANDROID_PLATFORM_REVISION=$ANDROID_PLATFORM_REVISION"
 )
 if $print_only; then
     printf '%s\n' "${args[@]}"

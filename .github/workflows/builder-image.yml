@@ -30,6 +30,7 @@ on:
       - 'gradle/libs.versions.toml'
       - 'android-app/build.gradle.kts'
       - 'myotis-engine/build.gradle.kts'
+      - 'ui/build.gradle.kts'
       - '.github/workflows/builder-image.yml'
   pull_request:
     paths: *paths
