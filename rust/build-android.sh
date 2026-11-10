@@ -66,48 +66,8 @@ find "$jniLibs" -name 'libmyotis_*.so' -exec ls -la {} \;
 
 # Fail loudly if any PT_LOAD segment is <16 KB aligned — a 4 KB-aligned .so is
 # rejected by the dynamic linker on 16 KB-page devices, and the symptom (BLS
-# silently falling back to the slow JVM backend) is easy to miss. Guards against
-# an NDK/flag regression silently shipping a misaligned lib.
+# silently falling back to the slow JVM backend) is easy to miss. Every .so that
+# survives the prune above is checked, and an empty jniLibs fails. The same
+# script checks the APKs in android-apk.yml (#734).
 echo "checking 16 KB alignment:"
-python3 - "$jniLibs" <<'PY'
-import struct, sys, glob, os
-bad = []
-# *.so, not libmyotis_*.so: anything that survives the prune above must at
-# least pass the alignment gate rather than ship unchecked.
-files = glob.glob(os.path.join(sys.argv[1], "*", "*.so"))
-if not files:
-    # Zero matches means jniLibs is empty/stale (wrong path, or cargo-ndk's
-    # output layout changed) — a vacuous pass here would green-light a build
-    # with no libs at all.
-    sys.exit(f"FAIL: no .so files found under {sys.argv[1]}")
-for f in files:
-    with open(f, "rb") as fh:
-        d = fh.read()
-    if d[:4] != b"\x7fELF":
-        sys.exit(f"not an ELF file: {f}")
-    end = "<" if d[5] == 1 else ">"
-    # Handle both classes: arm64-v8a / x86_64 are ELF64, but armeabi-v7a (32-bit,
-    # mentioned in the build comments) is ELF32 with different header offsets.
-    if d[4] == 2:   # ELFCLASS64
-        phoff = struct.unpack_from(end + "Q", d, 0x20)[0]
-        phentsize = struct.unpack_from(end + "H", d, 0x36)[0]
-        phnum = struct.unpack_from(end + "H", d, 0x38)[0]
-        align_off, align_fmt = 0x30, end + "Q"   # p_align in Elf64_Phdr
-    else:           # ELFCLASS32
-        phoff = struct.unpack_from(end + "I", d, 0x1C)[0]
-        phentsize = struct.unpack_from(end + "H", d, 0x2A)[0]
-        phnum = struct.unpack_from(end + "H", d, 0x2C)[0]
-        align_off, align_fmt = 0x1C, end + "I"     # p_align in Elf32_Phdr
-    aligns = [struct.unpack_from(align_fmt, d, phoff + i * phentsize + align_off)[0]
-              for i in range(phnum)
-              if struct.unpack_from(end + "I", d, phoff + i * phentsize)[0] == 1]  # PT_LOAD
-    ok = all(a >= 0x4000 for a in aligns)
-    abi = os.path.basename(os.path.dirname(f))
-    print(f"  {abi}: LOAD align {[hex(a) for a in aligns]} -> {'OK' if ok else 'NOT 16 KB'}")
-    if not ok:
-        bad.append(abi)
-if bad:
-    sys.exit(f"FAIL: not 16 KB aligned: {bad}. "
-             "Ensure NDK is installed and .cargo/config.toml is in effect.")
-print("  all 16 KB aligned")
-PY
+python3 -I "$here/../scripts/check_16k_alignment.py" "$jniLibs"
