@@ -156,4 +156,4 @@ engine's hold rule are unit-tested (`:myotis-logindex-presets:jvmTest`,
 itself needs devp2p and libp2p peers, which a cloud session's network does not
 reach; the end-to-end plan — a measured walk per network against the estimates,
 the metered hold on a real phone, an embedding app through the AAR — is tracked
-in the issue linked from the PR that added this page.
+in [#752](https://github.com/biafra23/myotis/issues/752).
