@@ -36,7 +36,9 @@
 # publishes is what a third party rebuilds in the image", not the proof: the
 # release workflows run other Gradle invocations and stage natives from four
 # runners. The proof is the image build against the published assets
-# themselves (their SHA256SUMS, a later part of #734).
+# themselves: on a `v*` tag, `Compare the image build with the published
+# assets` (the `published` job) waits for the release's Android assets and
+# compares leg a with them. Reported, not gated, like leg r.
 #
 # WHAT FAILS THE RUN (owner's decision, 2026-11-10: Android first): the Android
 # artifacts — the APKs (android/) and the engine library (maven-repo/: the AAR,
@@ -466,6 +468,104 @@ jobs:
           name: repro-windows-${{ matrix.leg }}
           path: ${{ runner.temp }}/repro-windows.tar
           if-no-files-found: error
+
+  # A `v*` tag only: the rebuild in the builder image (leg a) against the
+  # Android assets the tag's release PUBLISHED, which the release workflows
+  # built on the hosted runner (android-apk.yml, engine-library.yml). This is
+  # the comparison the header calls the proof: not "two rebuilds agree" but
+  # "what people download is what the image builds". The unsigned release APK,
+  # the debug APK's payload and the engine library as staged are laid out like
+  # a leg's (collect.sh published) and compared by compare.py.
+  #
+  # REPORTED, NOT GATED, like the leg r comparison and for the same reason:
+  # what fails a run is the owner's decision (CLAUDE.md). The Maven-repository
+  # zip also carries what a linux leg does not build (the other platforms'
+  # natives jars, the iOS module), listed as "only in published", and a Linux
+  # natives jar from another builder (ubuntu-22.04). The job still FAILS when
+  # the comparison cannot be made: no leg a, or the assets never appear.
+  # The release's checksums and attestations are `verify release`'s job.
+  published:
+    name: Compare the image build with the published assets
+    needs: [ linux ]
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 300
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Download leg a
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: repro-linux-a
+          path: tars/a
+
+      - name: Unpack leg a
+        run: |
+          set -euo pipefail
+          mkdir -p legs/a
+          tar -C legs/a -xpf tars/a/repro-linux.tar
+
+      # The three assets come from two workflows with no ordering between them
+      # or with this one. SHA256SUMS lists an asset once its publisher has
+      # uploaded it and checked the release serves its bytes
+      # (.github/release-assets.sh). Polled once a minute for up to four hours.
+      - name: Wait for the release's Android assets
+        run: |
+          set -euo pipefail
+          want="Myotis-$TAG-android-unsigned.apk Myotis-$TAG-android-debug.apk myotis-engine-$TAG-maven-repo.zip"
+          for minute in $(seq 1 240); do
+            sums=$(gh release download "$TAG" --pattern SHA256SUMS --output - 2>/dev/null || true)
+            missing=""
+            for name in $want; do
+              printf '%s\n' "$sums" | grep -q "  $name\$" || missing="$missing $name"
+            done
+            [ -n "$missing" ] || { echo "all three are published"; exit 0; }
+            [ $((minute % 10)) -ne 1 ] || echo "minute $minute: not in the release's SHA256SUMS yet:$missing"
+            sleep 60
+          done
+          echo "::error::never published for $TAG:$missing"
+          exit 1
+
+      - name: Download them and lay them out like a leg
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --dir published-assets --pattern SHA256SUMS \
+            --pattern "Myotis-$TAG-android-unsigned.apk" --pattern "Myotis-$TAG-android-debug.apk" \
+            --pattern "myotis-engine-$TAG-maven-repo.zip"
+          (cd published-assets && sha256sum -c --ignore-missing SHA256SUMS)
+          scripts/repro/collect.sh published published-assets legs/published
+
+      - name: Install diffoscope
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends diffoscope-minimal unzip >/dev/null
+          diffoscope --version
+
+      - name: Compare the image build with the published assets
+        run: |
+          python3 -I scripts/repro/compare.py legs/a legs/published report scripts/repro/known-differences.txt \
+            --labels image published --report-only
+          {
+            echo "### The image build of $TAG against its published Android assets (not gated)"
+            echo '```'
+            head -n 60 report/summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: repro-report-linux-image-vs-published
+          path: report
+          if-no-files-found: ignore
 
   compare:
     name: Compare ${{ matrix.name }}

@@ -43,6 +43,17 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      # The two scripts every release publisher goes through (.github/
+      # release-notes.sh, .github/release-assets.sh) and the release verifier,
+      # against a stubbed `gh`, and the signed-against-unsigned APK check on
+      # synthetic APKs. Their failure modes otherwise surface only on a real
+      # tag. Seconds.
+      - name: Test the release scripts
+        run: |
+          scripts/test_release_notes.sh
+          scripts/test_release_assets.sh
+          python3 scripts/repro/test_compare_signed_apk.py
+
       # The rustc rust/rust-toolchain.toml pins, like every Rust lane (#734).
       # Not the image's preinstalled Rust: the Gradle gate skips any toolchain
       # below the workspace rust-version (rust/Cargo.toml), so a floor bump that
@@ -110,6 +121,10 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
+      # The build-provenance attestation of the uploaded assets (#734): an OIDC
+      # token for the Sigstore certificate, and the attestation's storage.
+      id-token: write
+      attestations: write
 
     steps:
       - name: Checkout code
@@ -139,14 +154,28 @@ jobs:
           echo "::error::Gradle build failed after 3 attempts"
           exit 1
 
+      # Creates the release (or adds its generated notes to the one another
+      # publisher created). The jars go up in the next step, through the script
+      # every publisher uploads with (#734).
       - name: Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
         with:
           generate_release_notes: true
-          files: |
-            app/build/libs/*.jar
-            core/build/libs/*.jar
-            networking/build/libs/*.jar
-            consensus/build/libs/*.jar
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload the jars
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          jars=(app/build/libs/*.jar core/build/libs/*.jar networking/build/libs/*.jar consensus/build/libs/*.jar)
+          [ "${#jars[@]}" -gt 0 ] || { echo "::error::no jars to publish"; exit 1; }
+          # Upload, check the release serves these bytes, keep SHA256SUMS complete.
+          bash .github/release-assets.sh "${GITHUB_REF_NAME}" "${jars[@]}"
+
+      - name: Attest the jars' build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/release-assets.SHA256SUMS

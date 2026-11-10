@@ -1,0 +1,95 @@
+# Verify a release's evidence about its own assets (#734, Part 5c).
+#
+# Nine workflows publish to a `v*` tag's release, with no ordering between
+# them. Each uploads through .github/release-assets.sh (which keeps the
+# release's SHA256SUMS complete) and attests what it uploaded. This workflow is
+# the check from the OUTSIDE, on the finished release, the way a user would:
+# scripts/verify_release.sh downloads every asset and fails unless
+#
+#   - SHA256SUMS lists every asset, and nothing else, and every hash matches;
+#   - every asset has a build-provenance attestation from this repository,
+#     signed for a run on the tag's own ref;
+#   - the signed release APK is the unsigned one plus its signature.
+#
+# On a tag it first waits for the tag's other workflow runs, so it sees the
+# release as it ends up; `reproducible builds` is not waited for (it publishes
+# nothing, and its tag run is the longest). A publisher that FAILED leaves its
+# assets out: the release is then incomplete, and its own red run says so; this
+# check covers what is published. On dispatch it verifies any tag at once (a
+# release from before this workflow has no SHA256SUMS and fails, as it should).
+#
+# What it does not show is that the assets can be rebuilt: that is the tag's
+# `reproducible builds` run (docs/guides/reproducible-builds.md).
+#
+# A release is done when this run and that one are green. CLAUDE.md, Releases.
+name: verify release
+
+on:
+  push:
+    tags: [ "v*" ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to verify (e.g. v0.1.21)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  # To see when the tag's other workflow runs are done.
+  actions: read
+  # gh attestation verify reads the repository's attestations.
+  attestations: read
+
+concurrency:
+  group: verify-release-${{ github.event_name }}-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify the release's checksums and attestations
+    runs-on: ubuntu-26.04
+    timeout-minutes: 300
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Check the tag's shape
+        run: |
+          printf '%s' "$TAG" | grep -Eq '^v[A-Za-z0-9._-]+$' \
+            || { echo "::error::'$TAG' is not a release tag (expected v<version>)"; exit 1; }
+
+      # Every run this tag push started, except this one and the rebuild
+      # comparison. Polled once a minute for up to four hours (the dmg legs
+      # take about 40 minutes; a queue for macOS runners can add more).
+      - name: Wait for the tag's publishing workflows
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          for minute in $(seq 1 240); do
+            # A failed listing is not "nothing is running": ask again.
+            if ! runs=$(gh api --paginate "repos/$GH_REPO/actions/runs?head_sha=$GITHUB_SHA&event=push&per_page=100" \
+              --jq ".workflow_runs[] | select(.head_branch == \"$TAG\" and .id != $GITHUB_RUN_ID and .name != \"reproducible builds\") | [.status, (.conclusion // \"\"), .name] | @tsv"); then
+              sleep 60; continue
+            fi
+            running=$(printf '%s\n' "$runs" | awk -F'\t' '$1 != "" && $1 != "completed" { print $3 }' | sort -u | paste -sd, -)
+            # Not in the first minutes: the tag's other runs may not be listed yet.
+            if [ -z "$running" ] && [ "$minute" -ge 5 ]; then
+              printf '%s\n' "$runs" | awk -F'\t' '$1 == "completed" && $2 != "success" && $2 != "skipped" { print "::warning::" $3 " ended " $2 ": its assets may be missing from the release" }' | sort -u
+              echo "every other run of $TAG is done"
+              exit 0
+            fi
+            [ $((minute % 10)) -ne 1 ] || echo "minute $minute: waiting for $running"
+            sleep 60
+          done
+          echo "::error::still running after four hours: ${running:-(the runs could not be listed)}"
+          exit 1
+
+      - name: Verify the release
+        run: scripts/verify_release.sh "$TAG"

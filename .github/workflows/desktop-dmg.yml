@@ -390,9 +390,14 @@ jobs:
     permissions:
       # gh release create/upload needs write access to Releases (repo contents).
       contents: write
+      # The build-provenance attestation of the uploaded assets (#734): an OIDC
+      # token for the Sigstore certificate, and the attestation's storage.
+      id-token: write
+      attestations: write
     steps:
-      # Only the shared release notes and the script that writes them
-      # (.github/release-notes.*), from the commit being released. First, so
+      # Only the shared release notes, the script that writes them
+      # (.github/release-notes.*) and the one that uploads
+      # (.github/release-assets.sh), from the commit being released. First, so
       # the artifacts below land in the checked-out workspace, not under it.
       - name: Check out the release notes
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -400,6 +405,7 @@ jobs:
           sparse-checkout: |
             .github/release-notes.md
             .github/release-notes.sh
+            .github/release-assets.sh
           sparse-checkout-cone-mode: false
           # gh takes the token from the publish step's env; keep the job's
           # write token out of .git/config.
@@ -453,9 +459,15 @@ jobs:
           # Create the release with the master notes (.github/release-notes.md),
           # unless another publisher already did — see .github/release-notes.sh.
           bash .github/release-notes.sh create "$tag"
-          gh release upload "$tag" "dmg/Myotis-${tag}-arm64.dmg" "dmg/Myotis-${tag}-x64.dmg" --clobber
+          # Upload, check the release serves these bytes, keep SHA256SUMS complete.
+          bash .github/release-assets.sh "$tag" "dmg/Myotis-${tag}-arm64.dmg" "dmg/Myotis-${tag}-x64.dmg"
           if [ -f "dmg/Myotis-${tag}-bee-poc-arm64.dmg" ]; then
-            gh release upload "$tag" "dmg/Myotis-${tag}-bee-poc-arm64.dmg" --clobber
+            bash .github/release-assets.sh "$tag" "dmg/Myotis-${tag}-bee-poc-arm64.dmg"
           else
             echo "::warning::no Bee PoC dmg produced for this tag — release published without it"
           fi
+
+      - name: Attest the dmgs' build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/release-assets.SHA256SUMS

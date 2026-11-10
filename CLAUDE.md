@@ -703,6 +703,38 @@ asset workflow and a stronger action than the merge this file already forbids.
    publish, which makes no commit. Details: docs/guides/railgun-poc.md (*Refreshing the seed*),
    docs/guides/bee-rpc-service.md (*seeding from a full node*).
 
+6. **After the tag: a release is done when its two evidence runs are green.
+   MANDATORY to check and report, not a question** (#734). A tag push starts
+   them by itself, next to the nine publishing workflows:
+   - **`verify release`** waits for the publishers, then checks the finished
+     release from the outside (`scripts/verify_release.sh <tag>`): its
+     `SHA256SUMS` lists every asset and every hash matches, every asset has a
+     build-provenance attestation from this repository for a run on the tag's
+     ref, and the signed APK is the published unsigned APK plus its signature
+     and nothing else.
+   - **`reproducible builds`** rebuilds the tag twice (the gate of the section
+     above), and its `Compare the image build with the published assets` job
+     sets the rebuild in the builder image next to the Android assets the
+     release published. That job REPORTS (the gate is the owner's): read its
+     summary and pass on to the owner whether the unsigned APK and the AAR
+     are identical, and what differs if not.
+
+   Report a red run to the owner at once, with what failed. Neither is fixed
+   by moving or re-pushing the tag: a publisher that failed is re-run (every
+   upload is idempotent), `verify release` is then dispatched for the tag, and
+   a release whose published bytes are wrong is the owner's decision.
+
+**Every release asset goes through `.github/release-assets.sh`, never a bare
+`gh release upload`** (#734). The script uploads, checks that the release
+serves the bytes the job built, and keeps the release's one `SHA256SUMS`
+complete across the nine publishers; the job's next step attests the uploaded
+files (`actions/attest-build-provenance`, `subject-checksums` from the file the
+script writes; the job needs `id-token: write` and `attestations: write`). A
+new publisher does both, and joins the list in `release-version-guard.yml`'s
+header. `scripts/test_release_assets.sh` (run by CI) fails on a bare upload in
+any workflow. docs/guides/reproducible-builds.md is the page for someone
+checking a release.
+
 ## Demo bundles build on merge to `main`, never on PRs
 
 The demo / PoC installers — the RAILGUN PoC dmg (`railgun-dmg.yml`), the Bee

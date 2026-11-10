@@ -2,6 +2,7 @@
 # Collect one rebuild leg's artifacts for comparison (#734, Part 5a).
 #
 #   scripts/repro/collect.sh PLATFORM SRC OUT     PLATFORM: linux | macos | windows
+#   scripts/repro/collect.sh published DIR OUT    DIR: a release's downloaded assets
 #
 # Copies what reproducible-builds.yml built in the checkout SRC into OUT, under
 # names that do not depend on the leg (no checkout path, no runner name), so two
@@ -121,6 +122,19 @@ windows)
     find "$dest" -maxdepth 1 -name '*.msi' -delete
     [[ -n "$(find "$dest" -type f -print -quit)" ]] || { echo "collect.sh: the msi extracted no files" >&2; exit 1; }
     echo "  desktop/msi-payload/ (payload)"
+    ;;
+published)
+    # Not a build: the Android assets a RELEASE published, laid out like a
+    # linux leg's, so compare.py sets a rebuild next to what people download
+    # (#734, Part 5c). The Maven-repository zip is the staged repository of
+    # engine-library.yml: it also carries the other platforms' natives jars and
+    # the iOS module, which a linux leg does not build.
+    put "$(one 'Myotis-*-android-unsigned.apk')" android/app-release-unsigned.apk
+    zip_payload "$(one 'Myotis-*-android-debug.apk')" android/app-debug-payload
+    mkdir -p "$out/maven-repo"
+    unzip -q "$(one 'myotis-engine-*-maven-repo.zip')" -d "$out/maven-repo"
+    [[ -d "$out/maven-repo/eth/myotis" ]] || { echo "collect.sh: the Maven-repository zip has no eth/myotis" >&2; exit 1; }
+    echo "  maven-repo/"
     ;;
 *)
     echo "collect.sh: unknown platform '$platform'" >&2; exit 2 ;;

@@ -353,6 +353,10 @@ jobs:
       # publish needs write access to Packages.
       contents: write
       packages: write
+      # The build-provenance attestation of the uploaded assets (#734): an OIDC
+      # token for the Sigstore certificate, and the attestation's storage.
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -505,9 +509,15 @@ jobs:
           # another publisher created the release, re-appended when a concurrent
           # edit dropped it (.github/release-notes.sh explains the race).
           bash .github/release-notes.sh create "$tag" "$section"
-          gh release upload "$tag" \
-            assets/myotis-engine-*.aar assets/myotis-engine-*.zip assets/myotis-engine.SHA256SUMS --clobber
+          # Upload, check the release serves these bytes, keep SHA256SUMS complete.
+          bash .github/release-assets.sh "$tag" \
+            assets/myotis-engine-*.aar assets/myotis-engine-*.zip assets/myotis-engine.SHA256SUMS
           bash .github/release-notes.sh append "$tag" "$section"
+
+      - name: Attest the engine library's build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/release-assets.SHA256SUMS
 
   # The same staged repository as a Maven repository URL that needs no token:
   # merged into the `maven-repo` branch (an orphan branch holding nothing but
