@@ -5,10 +5,18 @@ AUTHORING TOOL ONLY. It reads public chain data over a JSON-RPC endpoint the
 caller names, to produce the CONSTANTS the presets ship — each contract's
 creation block, the log count, the share of blocks whose header bloom matches a
 watch set, and the size of a matching block's receipts. Nothing it prints is
-served to a wallet: the catalog's from-blocks are re-checked by the backfill walk
-itself (a from-block above the real deployment is the one wrong direction, and
-this script picks the CREATION block, found by eth_getCode bisection), and the
-size figures are estimates the UI labels as such. CLAUDE.md's data-source rule
+served to a wallet: the walk verifies every log it stores against its block's
+receiptsRoot, and the size figures are estimates the UI labels as such.
+
+The from-blocks are the one output nothing downstream re-checks. The walk only
+descends TO a contract's fromBlock and cannot notice that the contract existed
+below it, so a from-block above the real deployment silently hides that history
+(LogIndexPresets' KDoc). The guards are here, at authoring time: this script
+picks the CREATION block by eth_getCode bisection (the safe direction — at worst
+it walks a few empty blocks), and every value is cross-checked against a second
+reference — the repo's existing pins, the protocol client's own config, or, for
+a contract with neither, a second run of this script against an independent
+endpoint. A single endpoint's answer is not enough on its own. CLAUDE.md's data-source rule
 (devp2p/libp2p only) governs what the wallet serves; it is why no default
 endpoint is configured here — the caller names one, per network.
 
