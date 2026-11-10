@@ -46,8 +46,11 @@ on:
       - "!rust/tor-poc/**"
       - ".github/workflows/rust-clippy.yml"
       - ".github/actions/rust-toolchain/**"
-  # Fridays: Rust stable releases ship on Thursdays, so a new release's
-  # deny-level lints show up on main within a day, whatever the diffs touch.
+  # Weekly. It used to catch a new Rust stable's deny-level lints the day after
+  # its Thursday release; with the toolchain pinned (#734) that happens in the
+  # PR that bumps rust/rust-toolchain.toml. What a weekly re-run of an unchanged
+  # toolchain, lock and tree can still catch is rot around them: a runner-image
+  # or registry change that breaks the lane before a PR needs it.
   schedule:
     - cron: "23 6 * * 5"
   workflow_dispatch:
