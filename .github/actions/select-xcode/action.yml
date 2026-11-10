@@ -19,6 +19,9 @@ runs:
         app="/Applications/Xcode_$v.app"
         [ -d "$app" ] || { echo "::error::$app is not on this runner image ($(ls -d /Applications/Xcode_*.app | xargs -n1 basename | tr '\n' ' '))"; exit 1; }
         sudo xcode-select -s "$app/Contents/Developer"
-        got=$(xcodebuild -version | head -1)
+        # Captured once and split in the shell: `xcodebuild -version | head -1`
+        # can die of SIGPIPE (141) under pipefail when head exits first.
+        out=$(xcodebuild -version)
+        got=${out%%$'\n'*}
         [ "$got" = "Xcode $v" ] || { echo "::error::xcodebuild reports '$got' after selecting $app"; exit 1; }
-        echo "$got ($(xcodebuild -version | tail -1)) at $app"
+        echo "$got (${out##*$'\n'}) at $app"

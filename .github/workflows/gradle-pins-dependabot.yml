@@ -8,14 +8,25 @@
 #
 # Two jobs, on purpose. Regenerating pins RESOLVES and BUILDS with the bumped
 # versions — a new plugin's code runs here — so that job gets a read-only
-# token. Only the second job can write, and it accepts nothing from the first
-# but pin files (lockfiles and the hash list), checked by path before commit.
+# token. Only the second job can write, and it treats the first job's output
+# as untrusted data: pin files only (checked by path), and a hash list that
+# may only GROW (scripts/check_pins_additive.py: the verification settings
+# unchanged, every already-pinned checksum unchanged). A bump never needs
+# more; a plugin that tried to loosen verification fails the job.
+#
+# The commit lands on exactly the head the pins were generated for: the
+# commit job checks out that sha, so a branch that moved in between rejects
+# the push instead of getting another commit's pins.
 #
 # A push made with GITHUB_TOKEN starts no workflow, so the commit job then
-# dispatches Build and Test and `gradle pins` on the branch; their runs attach
-# to the new head as its checks. `gradle pins` names any per-host hash the
-# Linux host could not record and uploads the merged file: apply it with
+# dispatches the PR's gating workflows on the branch; their runs attach to the
+# new head as its checks. `gradle pins` names any per-host hash the Linux host
+# could not record and uploads the merged file: apply it with
 # `scripts/update_gradle_pins.sh --from-ci` (docs/gradle-dependency-pins.md).
+#
+# Known cost: once a commit by someone else is on its branch, Dependabot stops
+# rebasing that PR by itself. Comment `@dependabot rebase` (or `recreate`,
+# which drops the pin commit, and this workflow runs again).
 name: gradle pins (Dependabot)
 
 on:
@@ -47,6 +58,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
+          # The commit job's additive check compares against this head.
       - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4.9.1
         with:
           java-version-file: .java-version
@@ -57,8 +69,9 @@ jobs:
       - name: Collect the pin files
         run: |
           set -euo pipefail
+          # "<status> <path>" per line; D = the bump removed that lockfile.
           git status --porcelain -- gradle/verification-metadata.xml '*.lockfile' \
-            | awk '{print $2}' > changed.txt
+            | awk '{print ($1 == "D" ? "D" : "M"), $2}' > changed.txt
           echo "changed pin files:"; cat changed.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
@@ -77,9 +90,11 @@ jobs:
       contents: write
       actions: write
     steps:
+      # The exact head the pins were generated for (not the branch tip): if
+      # the branch moved since, the push below is a non-fast-forward and fails.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
-          ref: ${{ github.head_ref }}
+          ref: ${{ github.event.pull_request.head.sha }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: regenerated-pins
@@ -92,19 +107,32 @@ jobs:
         run: |
           set -euo pipefail
           [ -s "$PINS/changed.txt" ] || { echo "pins already current"; exit 0; }
-          while read -r f; do
+          while read -r status f; do
             # Pin files and nothing else: the regenerate job ran untrusted
             # build code, so its artifact is data to check, not to copy.
             [[ "$f" =~ ^(gradle/verification-metadata\.xml|([A-Za-z0-9_][A-Za-z0-9_.-]*/)?(buildscript-|settings-)?gradle\.lockfile)$ ]] \
               || { echo "::error::refusing non-pin file from the regenerate job: $f"; exit 1; }
-            install -D -m 0644 "$PINS/$f" "$f"
+            if [ "$status" = D ]; then
+              [ "$f" != gradle/verification-metadata.xml ] || { echo "::error::the regenerate job deleted the hash list"; exit 1; }
+              git rm -q -- "$f"
+            else
+              if [ "$f" = gradle/verification-metadata.xml ]; then
+                python3 -I scripts/check_pins_additive.py "$f" "$PINS/$f" \
+                  || { echo "::error::the regenerated hash list is not purely additive — refusing it (see above)"; exit 1; }
+              fi
+              install -D -m 0644 "$PINS/$f" "$f"
+            fi
           done < "$PINS/changed.txt"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -- gradle/verification-metadata.xml $(git ls-files -mo --exclude-standard -- '*.lockfile')
           git diff --cached --quiet && { echo "nothing to commit"; exit 0; }
           git commit -m "Regenerate Gradle pins (scripts/update_gradle_pins.sh)"
-          git push origin "HEAD:$BRANCH"
-          # GITHUB_TOKEN pushes start no workflow; dispatch the checks the new
-          # head needs (they attach to it as its check runs).
-          for w in ci.yml gradle-pins.yml; do gh workflow run "$w" --ref "$BRANCH"; done
+          git push origin "HEAD:refs/heads/$BRANCH"
+          # GITHUB_TOKEN pushes start no workflow; dispatch the PR's gating
+          # workflows on the new head (each takes workflow_dispatch; their runs
+          # attach to it as its check runs). claude-review runs once per PR, on
+          # open, and so is not among them.
+          for w in ci.yml gradle-pins.yml android-apk.yml desktop-dmg.yml desktop-windows-msi.yml ios-framework.yml; do
+            gh workflow run "$w" --ref "$BRANCH"
+          done
