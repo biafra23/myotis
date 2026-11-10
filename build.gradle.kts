@@ -745,16 +745,26 @@ val reproducibleRustEnv: Map<String, String> = run {
         "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc",
         "x86_64-unknown-none", "wasm32-unknown-unknown",
     )).filter { it.isNotEmpty() }.distinct()
+    // APPENDED to whatever the environment already holds, not replacing it: a
+    // developer's own target rustflags / CFLAGS keep working.
+    fun withExisting(key: String, value: String) = key to
+        (System.getenv(key)?.takeIf { it.isNotBlank() }?.let { "$it $value" } ?: value)
     triples.flatMap { t ->
         listOfNotNull(
-            "CARGO_TARGET_${t.uppercase().replace('-', '_')}_RUSTFLAGS" to rustflags,
-            if (t.endsWith("-msvc")) null else "CFLAGS_${t.replace('-', '_')}" to cflags,
+            withExisting("CARGO_TARGET_${t.uppercase().replace('-', '_')}_RUSTFLAGS", rustflags),
+            if (t.endsWith("-msvc")) null else withExisting("CFLAGS_${t.replace('-', '_')}", cflags),
         )
-    }.toMap()
+    }.toMap() + ("MYOTIS_REPRO_ENV" to "gradle")  // rust/repro-env.sh then leaves these alone
+}
+if (!System.getenv("RUSTFLAGS").isNullOrBlank() || !System.getenv("CARGO_ENCODED_RUSTFLAGS").isNullOrBlank()) {
+    logger.warn("[rust] RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS is set: cargo then IGNORES every per-target rustflags, " +
+        "so the Rust libs keep this machine's source paths (#734 D2) and Android loses its page-size flag.")
 }
 tasks.withType<Exec>().configureEach {
     if (name.startsWith("cargo") || name == "uniffiGenerateKotlin" || name == "verifyRustVersionFloor") {
         environment(reproducibleRustEnv)
+        // An input, so outputs built without (or with other) prefixes are not UP-TO-DATE.
+        inputs.property("reproducibleRustEnv", reproducibleRustEnv.toSortedMap().toString())
     }
 }
 

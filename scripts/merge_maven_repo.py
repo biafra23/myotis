@@ -85,6 +85,13 @@ def merge_metadata(existing: Path, staged: Path) -> bytes:
         el = new.find("./versioning/" + tag)
         if el is not None:
             el.text = newest
+    # The staged stamp is the release's COMMIT time (normalize_maven_metadata.py,
+    # #734), so a hotfix tag cut from an older commit would move the branch's
+    # lastUpdated backwards; caches that compare it would keep the stale list.
+    # Keep the later of the two (same-width yyyyMMddHHmmss, so text order works).
+    new_lu, old_lu = new.find("./versioning/lastUpdated"), old.find("./versioning/lastUpdated")
+    if new_lu is not None and old_lu is not None and (old_lu.text or "") > (new_lu.text or ""):
+        new_lu.text = old_lu.text
     # Keep the 2-space, one-element-per-line layout Gradle writes.
     ET.indent(new, space="  ")
     return b'<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(new, encoding="utf-8") + b"\n"
