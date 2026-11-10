@@ -1,0 +1,111 @@
+# Rehearse the release-asset path against GitHub itself (#734, Part 5c).
+#
+# The nine publishing jobs, `verify release` and their scripts run only on a
+# `v*` tag, where a failure that needs a code change cannot be repaired by a
+# re-run: tag runs use the tagged tree. This workflow sends a dummy file
+# through the same steps, in the same order, without publishing anything:
+#
+#   - a DRAFT release under a non-`v*` name (a draft is visible only to people
+#     with write access, creates no tag and notifies nobody), deleted at the end;
+#   - .github/release-assets.sh uploads to it and checks GitHub's recorded
+#     SHA-256 against the file (is `digest` there for a fresh upload, in time?);
+#   - actions/attest-build-provenance, at the pinned SHA the publishers use (is
+#     it resolvable, and may this repository attest?);
+#   - release-assets.sh --checksums writes SHA256SUMS;
+#   - `gh attestation verify` with every flag scripts/verify_release.sh passes
+#     (does the runner's gh have them?);
+#   - scripts/verify_release.sh checks the draft's checksums. Its attestation
+#     step is not run here: it asks for the tag's own ref and commit and for
+#     the asset's own workflow, which a rehearsal cannot be.
+#
+# It runs on a pull request that changes this path (not from a fork: a fork's
+# token can do none of it) and on dispatch. Like the signing rehearsal in
+# android-apk.yml: "so runner-image drift [...] fails here instead".
+name: release rehearsal
+
+on:
+  pull_request:
+    paths:
+      - '.github/release-assets.sh'
+      - 'scripts/verify_release.sh'
+      - 'scripts/test_release_assets.sh'
+      - '.github/workflows/release-rehearsal.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-rehearsal-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false  # a cancelled run would leave its draft behind
+
+jobs:
+  rehearse:
+    name: Upload, attest, list and verify on a draft release
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      # Creates and deletes the draft release.
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      # Not a `v*` name: no release workflow, and no tag guard, ever sees it.
+      DRAFT: rehearsal-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Create the draft release
+        run: |
+          gh release create "$DRAFT" --draft \
+            --title "Release rehearsal $DRAFT (deleted when its run ends)" \
+            --notes "Created by the release rehearsal workflow, run $GITHUB_RUN_ID. Publishes nothing; safe to delete."
+
+      - name: Upload two files through release-assets.sh
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # Two sizes, one of them more than a single upload chunk's worth.
+          printf 'rehearsal %s\n' "$DRAFT" > out/rehearsal-small.txt
+          head -c 20000000 /dev/urandom > out/rehearsal-large.bin
+          bash .github/release-assets.sh "$DRAFT" out/rehearsal-small.txt out/rehearsal-large.bin
+
+      # The step every publisher has, at the same pinned commit.
+      - name: Attest them
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/release-assets.SHA256SUMS
+
+      - name: List the release's assets in SHA256SUMS
+        run: bash .github/release-assets.sh --checksums "$DRAFT"
+
+      # The flags verify_release.sh uses, with this run's own ref, commit and
+      # workflow in place of a tag's. A few tries: an attestation can take a
+      # moment to be served.
+      - name: Verify the attestations with the verifier's flags
+        run: |
+          set -euo pipefail
+          gh --version | head -n1
+          for f in out/rehearsal-small.txt out/rehearsal-large.bin; do
+            for attempt in 1 2 3 4 5; do
+              if gh attestation verify "$f" --repo "$GH_REPO" --source-ref "$GITHUB_REF" --source-digest "$GITHUB_SHA" \
+                   --signer-workflow "$GH_REPO/.github/workflows/release-rehearsal.yml"; then break; fi
+              [ "$attempt" -lt 5 ] || { echo "::error::no valid attestation for $f"; exit 1; }
+              sleep 10
+            done
+          done
+
+      - name: Verify the draft's checksums from the outside
+        run: scripts/verify_release.sh --no-attestations "$DRAFT"
+
+      - name: Delete the draft release
+        if: ${{ always() }}
+        run: |
+          gh release delete "$DRAFT" --yes \
+            || echo "::warning::could not delete the draft release $DRAFT: delete it by hand (Releases, drafts)"
