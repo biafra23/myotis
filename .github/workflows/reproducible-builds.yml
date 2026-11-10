@@ -131,17 +131,21 @@ jobs:
           TOKEN: ${{ github.token }}
         run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
-      # A pull request from a fork may not be able to read the package: for
-      # it, a failed pull is also a reason to build.
+      # A locked image that cannot be pulled (pull.sh tries three times; a
+      # fork may not be able to read the package at all) is built too, with a
+      # warning: a tag's proof should not hinge on the registry's minute any
+      # more than on the snapshot service's. That the lock is pullable is the
+      # `builder image` workflow's check, where it is an error.
       - name: Pull the image for these pins, or build it
-        env:
-          OURS: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         run: |
           set -euo pipefail
           rc=0; docker/builder/pull.sh || rc=$?
-          if [ "$rc" = 0 ]; then :
-          elif [ "$rc" = 3 ] || [ "$OURS" != true ]; then docker/builder/build.sh
-          else exit "$rc"; fi
+          case "$rc" in
+            0) ;;
+            3) docker/builder/build.sh ;;
+            *) echo "::warning::the published builder image could not be pulled; building it from its pins instead"
+               docker/builder/build.sh ;;
+          esac
 
       - name: Check the image against its pins
         run: docker/builder/check.sh

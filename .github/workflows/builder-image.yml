@@ -40,6 +40,10 @@
 #     apt-packages.txt), and goes green. An image already published for a key
 #     is never replaced;
 #   - weekly: build from the pins, never pull, publish nothing. See above.
+# The key (`build.sh --print-key`) is the resolved build args and the
+# Dockerfile, i.e. what the image is made from. apt-packages.txt and check.sh
+# are not in it: they describe and check the image, and a change to either is
+# checked against the published one.
 # A pull request from a fork has no token to push with and may not be able to
 # read the package: it builds and checks, as before the image was published.
 name: builder image
@@ -67,13 +71,11 @@ on:
 permissions:
   contents: read
 
-# Not cancelled mid-run, also on a PR: a run that was cancelled between its
-# push and its report would leave an image published that nobody was told the
-# digest of (the next run finds it under its key, so nothing is lost, but
-# there is no reason to race it either).
+# A PR's newer push supersedes its older run. One cancelled between its push
+# and its report loses nothing: the next finds the image under its key.
 concurrency:
   group: builder-image-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:

@@ -38,7 +38,10 @@ case "$1" in
     esac ;;
   tag) [ -f "$d/local/$(f "$2")" ] && cp "$d/local/$(f "$2")" "$d/local/$(f "$3")" || : > "$d/local/$(f "$3")" ;;
   push) cat "$d/next_digest" > "$d/registry/$(f "$2")"; cp "$d/registry/$(f "$2")" "$d/local/$(f "$2")"; echo x >> "$d/pushes" ;;
-  image) ref=${@: -1}; echo "${ref%%[:@]*}@$(cat "$d/local/$(f "$ref")")" ;;
+  buildx) # buildx imagetools inspect REF --format ...: the registry's digest for REF
+    [ ! -f "$d/registry_down" ] || { echo "503 Service Unavailable" >&2; exit 1; }
+    [ -f "$d/registry/$(f "$4")" ] || { echo "manifest unknown" >&2; exit 1; }
+    printf '{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"%s","size":856}\n' "$(cat "$d/registry/$(f "$4")")" ;;
   *) exit 98 ;;
 esac
 STUB
@@ -76,6 +79,11 @@ lock "0000" "$R@$D1"
 "$B/publish.sh" $R > /dev/null 2>&1; rc=$?
 check "a lock for other pins fails" '[ $rc = 1 ]'
 
+touch "$STUB/registry_down"; lock "$KEY" "$R@$D1"
+PUBLISH_RETRY_PAUSE=0 "$B/publish.sh" $R > "$STUB/out" 2>&1; rc=$?
+check "with the lock claiming the key, a registry that does not answer is an error, never a second push" \
+  '[ $rc = 1 ] && [ "$(pushes)" = 1 ] && grep -q "Not publishing again" "$STUB/out"'
+
 fresh
 PUBLISH_PUSH=false "$B/publish.sh" $R > /dev/null 2>&1; rc=$?
 check "a run that may not push fails without pushing when nothing is published" '[ $rc = 1 ] && [ "$(pushes)" = 0 ]'
@@ -90,8 +98,10 @@ lock "$KEY" "$R:latest"
 "$B/pull.sh" > /dev/null 2>&1; rc=$?
 check "pull.sh refuses a lock that names a tag, not a digest" '[ $rc = 1 ] && [ ! -f "$STUB/log" ]'
 lock "$KEY" "$R@$D1"
-"$B/pull.sh" > /dev/null 2>&1; rc=$?
-check "pull.sh fails when the locked digest cannot be pulled" '[ $rc = 1 ]'
+PULL_RETRY_PAUSE=0 "$B/pull.sh" > "$STUB/out" 2>&1; rc=$?
+check "pull.sh fails when the locked digest cannot be pulled" '[ $rc = 1 ] && grep -q "build.sh builds the same image" "$STUB/out"'
+check "it tried three times and says what to do instead" \
+  '[ "$(grep -c "^docker pull" "$STUB/log")" = 3 ]'
 echo "$D1" > "$STUB/registry/published"
 "$B/pull.sh" > /dev/null 2>&1; rc=$?
 check "pull.sh pulls the locked digest and tags it" \

@@ -20,8 +20,17 @@
 #
 # An image already published under this key is NOT replaced (a rebuild has
 # other bytes, and a lock someone committed would stop matching): its digest
-# is the one the lock must name. PUBLISH_PUSH=false checks without pushing
-# (a pull request from a fork has no token to push with).
+# is the one the lock must name. The digest is always the REGISTRY's answer for
+# the tag (`docker buildx imagetools inspect`), never the local image store's,
+# which can know several digests for one image, or none right after a push.
+#
+# When the committed lock already claims this key, the image IS published and
+# this script never pushes: a tag it cannot read is then an error, not a
+# reason to publish again. Only for a key the lock does not claim yet does an
+# unreadable tag mean "not published".
+#
+# PUBLISH_PUSH=false checks without pushing (a pull request from a fork has no
+# token to push with).
 #
 # Works with bash 3.2.
 set -euo pipefail
@@ -32,22 +41,35 @@ repository=$1 tag=${2:-myotis-builder:local}
 lock="$here/image.lock"
 key=$("$here/build.sh" --print-key)
 ref="$repository:$key"
+locked_key=$( [[ -f "$lock" ]] && sed -n 's/^key=//p' "$lock" || true)
 
-digest_of() { docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$1" | sed -n "s|^$repository@||p" | head -n1; }
+# The digest the registry serves for a reference; empty (status 1) when it
+# cannot be read.
+remote_digest() {
+    local d
+    d=$(docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>/dev/null \
+        | sed -n 's/.*"digest":"\(sha256:[0-9a-f]\{64\}\)".*/\1/p' | head -n1) || true
+    [[ -n "$d" ]] && printf '%s\n' "$d"
+}
 
-if docker pull --platform linux/amd64 "$ref" >/dev/null 2>&1; then
+if [[ "$locked_key" == "$key" ]]; then
+    digest=""
+    for attempt in 1 2 3; do
+        digest=$(remote_digest "$ref") && break
+        [[ $attempt -eq 3 ]] || sleep "${PUBLISH_RETRY_PAUSE:-20}"
+    done
+    [[ -n "$digest" ]] || { echo "publish.sh: image.lock says $ref is published, but the registry does not answer for it. Not publishing again; re-run." >&2; exit 1; }
+elif digest=$(remote_digest "$ref"); then
     echo "publish.sh: $ref is already published; not replacing it"
-    digest=$(digest_of "$ref")
 elif [[ "${PUBLISH_PUSH:-true}" == "true" ]]; then
     docker tag "$tag" "$ref"
     docker push "$ref"
-    digest=$(digest_of "$ref")
+    digest=$(remote_digest "$ref") || { echo "publish.sh: pushed $ref but could not read its digest back; re-run" >&2; exit 1; }
 else
     echo "publish.sh: $ref is not published, and this run may not push (PUBLISH_PUSH=false)." >&2
     echo "            Run the workflow from a branch of the repository itself." >&2
     exit 1
 fi
-[[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "publish.sh: could not read the digest of $ref" >&2; exit 1; }
 
 want=$(printf 'key=%s\nimage=%s@%s\n' "$key" "$repository" "$digest")
 have=$( [[ -f "$lock" ]] && grep -v '^#' "$lock" | sed '/^$/d' || true)

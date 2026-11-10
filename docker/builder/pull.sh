@@ -43,6 +43,16 @@ if [[ "$locked_key" != "$key" ]]; then
     exit 3
 fi
 
-docker pull --platform linux/amd64 "$image"
+# A registry has bad minutes too: three tries before giving up.
+for attempt in 1 2 3; do
+    docker pull --platform linux/amd64 "$image" && break
+    if [[ $attempt -eq 3 ]]; then
+        echo "pull.sh: could not pull $image." >&2
+        echo "         If the registry says 'denied' or 'unauthorized', the package is not public (or you are not" >&2
+        echo "         logged in to it). Either way, build.sh builds the same image from its pins." >&2
+        exit 1
+    fi
+    sleep "${PULL_RETRY_PAUSE:-20}"
+done
 docker tag "$image" "$tag"
 echo "pulled $image as $tag"
