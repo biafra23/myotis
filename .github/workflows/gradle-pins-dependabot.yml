@@ -27,7 +27,7 @@
 # dispatches the PR's gating workflows on the branch; their runs attach to the
 # new head as its checks. `gradle pins` names any per-host hash the Linux host
 # could not record and uploads the merged file: apply it with
-# `scripts/update_gradle_pins.sh --from-ci` (docs/gradle-dependency-pins.md).
+# `scripts/update_gradle_pins.sh --from-ci` (docs/guides/gradle-dependency-pins.md).
 #
 # Known cost: once a commit by someone else is on its branch, Dependabot stops
 # rebasing that PR by itself. Comment `@dependabot rebase` (or `recreate`,

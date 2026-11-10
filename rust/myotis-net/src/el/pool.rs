@@ -137,7 +137,7 @@ const ONLINE_SIGNAL_MAX_AGE: Duration = Duration::from_secs(2 * 60);
 
 /// How long a peer must have gone without a direct dial or session from us
 /// before a Tor read or send may reach it, and how long the pool then leaves a
-/// peer it reached over Tor undialed directly (docs/privacy-and-tor.md §5): a
+/// peer it reached over Tor undialed directly (docs/how-it-works/privacy-and-tor.md §5): a
 /// peer that sees both inside this window could pair them by timing.
 pub(crate) const TOR_DIRECT_SEPARATION: Duration = Duration::from_secs(10 * 60);
 
@@ -1715,7 +1715,7 @@ impl PeerPool {
     }
 
     /// The peers a Tor read (`snap_only`) or send may dial, best first
-    /// (docs/privacy-and-tor.md §5): nodes of the Tor reserve
+    /// (docs/how-it-works/privacy-and-tor.md §5): nodes of the Tor reserve
     /// (`el::torreserve`) — verified peers the pool never dials directly —
     /// whose last direct contact is [`TOR_DIRECT_SEPARATION`] behind, by the
     /// reserve's persisted stamp and this process's contact log alike; never
@@ -2106,7 +2106,7 @@ fn within_separation(at: Instant, now: Instant) -> bool {
 
 /// When each node (by id) last had a contact of one kind with us. Process-wide,
 /// not per pool, so a pool restart (a network paused and resumed, an engine
-/// switch) keeps it; a process restart forgets it (docs/privacy-and-tor.md §5).
+/// switch) keeps it; a process restart forgets it (docs/how-it-works/privacy-and-tor.md §5).
 #[derive(Default)]
 struct ContactLog {
     at: HashMap<[u8; 64], Instant>,
@@ -2536,7 +2536,7 @@ async fn try_dial_with(
     }
     // Claim the address (bounded), or skip if in-flight/connected already —
     // or if the node is in the Tor reserve (never dialed directly, Tor mode on
-    // or off; docs/privacy-and-tor.md §5), or was reached over Tor lately: a
+    // or off; docs/how-it-works/privacy-and-tor.md §5), or was reached over Tor lately: a
     // direct dial now could pair the two by timing. The checks and the
     // direct-contact stamp happen under the claim lock, the one
     // `PeerPool::claim_for_tor` and the reserve's fill take, so a Tor claim, a
@@ -2785,7 +2785,7 @@ async fn evict_lagging_peers(inner: &Arc<PoolInner>) {
 /// transport failure is an ordinary unwitnessed read failure. Bounded per tick
 /// and per peer; spawned through `tasks` so a stopping pool never has a probe
 /// writing to a peer it is closing. A probe carries no address, so it widens
-/// no disclosure (docs/privacy-and-tor.md).
+/// no disclosure (docs/how-it-works/privacy-and-tor.md).
 const HEAD_PROBE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const HEAD_PROBE_PER_TICK: usize = 2;
 const PROBE_MISSES_EVICT: u32 = 3;

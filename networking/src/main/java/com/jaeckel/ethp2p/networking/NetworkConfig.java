@@ -323,7 +323,7 @@ public record NetworkConfig(
             // wouldn't help us sync to the current head anyway).
             false,
             // CL peer multiaddrs for sepolia. First entry is roost, the
-            // dedicated light-client server (rust/roost, docs/lc-server-design.md).
+            // dedicated light-client server (rust/roost, docs/design-history/lc-server-design.md).
             // It is first because it exists precisely for this: a general-purpose
             // beacon node is structurally bad at serving wallets — one connection
             // semaphore shared between inbound and outbound, and a trimmer that
@@ -935,7 +935,7 @@ public record NetworkConfig(
         };
     }
 
-    /** Sepolia EL enodes: the dedicated myotis-serving node (docs/dedicated-sepolia-node.md).
+    /** Sepolia EL enodes: the dedicated myotis-serving node (docs/guides/dedicated-sepolia-node.md).
      *
      *  <p>Unlike Gnosis's entries this is NOT a discovery gap-filler — sepolia has an
      *  enrtree. It is pinned because discovery is a lottery we lose exactly when it

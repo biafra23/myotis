@@ -1,0 +1,398 @@
+<!--meta {"id":"stop-09","num":9,"title":"myotis-net, part 1: libp2p, req/resp and discovery","short":"net · CL peers","sub":"5 files · 5,586 lines","part":"myotis-net: all the I/O"} -->
+<header class="stop-head">
+  <div class="eyebrow">Stop 9 · crate <code>myotis-net</code> <span>5 files · 5,586 lines · about 150 minutes</span></div>
+  <h1>myotis-net, part 1: libp2p, req/resp and discovery</h1>
+  <p class="lede">From here on, everything is <code>async</code>. This stop covers the consensus-layer side of the crate that does all of Myotis's I/O: the libp2p host that speaks the eth2 req/resp protocols, discv5 discovery, the on-disk peer cache shared with the Java engine, and the new byte counters. The central idea is an <strong>actor</strong>: one tokio task owns all network state, and everyone else talks to it through channels. The byte-level framing (varints, snappy, Status SSZ, protocol IDs) moved to <code>myotis-wire</code>; it is covered in <a href="#stop-05">stop 5</a>.</p>
+</header>
+
+<div class="learn">
+  <h2>Rust you will practise</h2>
+  <div><b>Channels as an API</b><code>mpsc</code> commands with a <code>oneshot</code> reply inside, and a cheap-to-clone client handle.</div>
+  <div><b>A task that owns its state</b><code>tokio::spawn</code>, <code>select!</code>, cancellation by drop, and why the actor's maps need no locks while two shared sets do.</div>
+  <div><b>Wrapping a poll-based trait</b><code>Pin&lt;&amp;mut Self&gt;</code>, <code>Unpin</code>, <code>Weak</code> references and a <code>Drop</code> that unregisters, in the traffic counters.</div>
+</div>
+
+<section class="prose">
+  <h2>The crate: what myotis-net is for</h2>
+  <p><code>myotis-net</code> is the I/O crate of the workspace. Everything that touches a socket, a clock, the file system or the tokio runtime lives here, and the verification crates below it stay "sans-I/O": they take bytes and slot numbers and return verdicts. This stop and the six after it all read this one crate. It has two halves. The <strong>consensus layer</strong> (CL), in the crate root, finds beacon nodes over discv5, talks to them over libp2p and runs the light-client sync loop (<a href="#stop-10">stop 10</a>). The <strong>execution layer</strong> (EL), under <code>src/el/</code>, speaks devp2p to execution clients (stops 11 to 14).</p>
+  <p>The manifest makes the layering explicit. Path dependencies point one way only: down to the sans-I/O crates.</p>
+  <x-code src="myotis-net/Cargo.toml" from="9" to="22" lang="toml"></x-code>
+  <p>Then come the external dependencies, pinned with <code>=</code>. A plain <code>"0.56.0"</code> in Cargo means "0.56.0 or any semver-compatible later version"; <code>"=0.56.0"</code> means exactly that version. The lockfile pins anyway; the <code>=</code> documents that interop with live peers depends on the exact wire behaviour of these releases.</p>
+  <x-code src="myotis-net/Cargo.toml" from="24" to="33" lang="toml"></x-code>
+  <p>The rest of the list, in short: <code>libp2p-mplex</code> (the second TCP stream multiplexer, more below), <code>discv5</code> (sigp's discovery), <code>alloy-rlp</code> and <code>hickory-resolver</code> (both used by the EL discovery code), <code>snap</code>, <code>tracing</code>, <code>futures</code>, <code>async-trait</code>, and <code>socket2</code> plus <code>getrandom</code> for the EL's UDP socket.</p>
+  <p>The crate has two features:</p>
+  <x-code src="myotis-net/Cargo.toml" from="92" to="97" lang="toml"></x-code>
+  <ul>
+    <li><strong><code>tor</code></strong> is off by default. It turns on three optional dependencies (<code>dep:arti-client</code> and friends), and the manifest picks Arti's TLS backend per target with two <code>[target.'cfg(…)'.dependencies]</code> tables: native-tls off Android, rustls on Android, where the NDK has no OpenSSL. Every <code>#[cfg(feature = "tor")]</code> in the crate sits under <code>src/el/</code>. None of the five files in this stop changes with it.</li>
+    <li><strong><code>fixture-recorder</code></strong> is test tooling. It is switched on by a small Cargo trick: the crate lists <em>itself</em> as a dev-dependency with the feature on, so tests and examples see it while the shipped library never does.</li>
+  </ul>
+  <x-code src="myotis-net/Cargo.toml" from="103" to="106" lang="toml"></x-code>
+  <div class="callout jvm">
+    <span class="k">JVM lens</span>
+    <p>A Cargo feature is closer to a Gradle source set switched by a build flag than to a runtime flag. Code under <code>#[cfg(feature = "tor")]</code> does not exist in a build without it: no class to load, no dead branch, no dependency on the classpath.</p>
+  </div>
+</section>
+
+<x-file path="rust/myotis-net/src/lib.rs" kind="crate root">
+  <p class="purpose">The crate root and its rules: all consensus-layer I/O lives here, the dependency on <code>myotis_consensus</code> runs one way only, every clock read happens in this crate, and logging goes through <code>tracing</code>. Below the doc comment are four narrow libp2p re-exports, the module list, and a re-export of the sync loop's public types. <code>traffic</code> is new since September, as is <code>cl_fork_watch</code>, the consensus-layer fork detector that this stop's files feed (it is read with the sync loop).</p>
+  <x-code src="myotis-net/src/lib.rs" from="24" to="45"></x-code>
+  <p class="code-note"><x-tags>modules-cargo</x-tags> Why re-export four libp2p items instead of the whole crate? <code>roost</code> needs exactly these to build a <code>HostConfig</code>. If it took them from its own libp2p dependency, a version mismatch would make them <em>different types</em>, because two versions of a crate never share types. The narrow list keeps the rest of libp2p out of this crate's public API. <code>pub mod codec;</code>, <code>protocols</code> and <code>status</code> are now four-line shims, each a single <code>pub use myotis_wire::eth2::…::*;</code>, so older <code>crate::codec::…</code> paths keep compiling. The real code is in <a href="#stop-05">stop 5</a>.</p>
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments</span>
+    <p>The module doc (lines 1–22) is out of date in three ways. Its module list omits <code>cl_fork_watch</code>, <code>clcache</code>, <code>el</code> and <code>traffic</code>, and it still lists <code>codec</code>, <code>protocols</code> and <code>status</code> as if their code lived here. It describes <code>reqresp</code> as "TCP + noise + yamux", but the host now also speaks mplex and QUIC. And "no global mutable state" (line 21) is no longer true: <code>traffic.rs</code> has a <code>static DISCV5: Mutex&lt;…&gt;</code>, and <code>el::tor</code>, <code>el::dnsdisco</code> and <code>el::request</code> have <code>static</code> switches and semaphores. The <code>ReqRespClient</code> doc in <code>reqresp.rs</code> repeats the claim ("no globals anywhere in this crate").</p>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-net/src/reqresp.rs" kind="library" twin="BeaconP2PService (behaviour, not structure)">
+  <p class="purpose">The libp2p host. It runs TCP (with Noise and either yamux or mplex) and QUIC side by side, with a secp256k1 identity, Identify, a gossipsub with <em>no</em> subscriptions, and one <code>request_response</code> behaviour per eth2 protocol. A single tokio task, the <strong>swarm task</strong>, owns all network state. Callers hold a cloneable <code>ReqRespClient</code> that sends commands over a channel and awaits one-shot replies. For outbound requests the host only moves raw bytes; <code>sync.rs</code> parses them. For inbound requests it answers status, ping, metadata, goodbye and three "by root" protocols itself, and delegates light-client requests to an optional <code>LcResponder</code>, which is how <code>roost</code> reuses this host as a server.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–109</td><td>Module doc, imports, timeouts (10 s, 60 s for updates), quiet windows, size caps, the in-flight response budget.</td></tr>
+      <tr><td>111–279</td><td>Stream codec: <code>Eth2Protocol</code>, <code>Eth2Codec</code>, <code>read_capped</code>, <code>drain_capped</code>, <code>read_until_quiet</code>, the <code>#[async_trait]</code> <code>Codec</code> impl.</td></tr>
+      <tr><td>281–418</td><td><code>#[derive(NetworkBehaviour)] Behaviour</code> (16 sub-behaviours, 13 of them request/response) and its constructor: connection limits, Identify agent string, anonymous gossipsub, which protocols are advertised in which direction.</td></tr>
+      <tr><td>420–490</td><td><code>RequestError</code> and <code>Command</code>, the swarm task's inbox messages.</td></tr>
+      <tr><td>492–567</td><td>Two sets shared outside the task: <code>AgentMap</code> (Identify agent per peer, for <code>client=</code> log labels) and <code>TcpFirst</code> (peers dialled at TCP before QUIC), with <code>dial_order</code>, <code>is_quic</code>, <code>is_nimbus_agent</code>.</td></tr>
+      <tr><td>569–829</td><td><code>ReqRespClient</code>: <code>request_raw_at</code> (the address walk and the one retry), <code>request_in_order</code>, <code>request_raw_once</code>, the small query commands; <code>CatchupPeerMeta</code>; <code>LocalStatus</code>.</td></tr>
+      <tr><td>831–1095</td><td>External-address types and quorum, <code>is_routable</code>, multiaddr helpers, <code>resolve_dial_addrs</code> (DNS in the client, not the swarm), <code>Observation</code>.</td></tr>
+      <tr><td>1097–1162</td><td>The <code>LcResponder</code> trait and <code>HostConfig</code> (now with <code>listen_quic</code>, <code>cl_fork_watch</code>, <code>traffic</code>).</td></tr>
+      <tr><td>1164–1343</td><td><code>start_host</code>, <code>build_swarm</code> (the hand-built TCP+QUIC transport with byte counting; a DNS and a no-DNS variant), <code>start_host_with</code>, which spawns the task.</td></tr>
+      <tr><td>1345–1459</td><td>Task state: <code>Pending</code>, <code>QueuedRequest</code>, <code>SwarmCtx</code>.</td></tr>
+      <tr><td>1461–1535</td><td><code>run_swarm</code>: the <code>select!</code> event loop.</td></tr>
+      <tr><td>1537–1648</td><td>Dispatch: <code>submit_request</code>, <code>behaviour_for</code>, <code>send_tracked</code>, <code>fail_queued</code>, <code>mark_status_done</code>.</td></tr>
+      <tr><td>1650–1831</td><td>Connection lifecycle (auto-Status on connect, clean-up on close, the "dropped without goodbye" line), Identify handling including the Nimbus rule.</td></tr>
+      <tr><td>1833–2056</td><td><code>on_rr_event</code> (inbound budget, outbound failures), <code>demote_stalled_quic</code>, <code>complete</code> (reply delivery and the auto-Status state machine), peer-Status logging.</td></tr>
+      <tr><td>2058–2265</td><td><code>respond_inbound</code> (the responder), the external-address tally, budget release.</td></tr>
+      <tr><td>2267–3506</td><td>Tests: address quorum; the <code>/meshsub/</code> regression; mplex, yamux and QUIC reachability; zero-chunk answers; QUIC-to-TCP fall-through; DNS handling; TCP-first and Nimbus rules; request-id collisions; a late auto-Status failure.</td></tr>
+    </tbody>
+  </table></div>
+
+  <figure class="diagram">
+    <div class="svg-wrap">
+    <svg class="wide-diagram" viewBox="0 0 900 420" role="img" fill="currentColor" xmlns="http://www.w3.org/2000/svg"
+         aria-label="Request round trip. On the caller's side, request_raw_at walks the peer's addresses one at a time and resolves DNS names. Each attempt sends Command::Request carrying a oneshot sender over the mpsc channel to the swarm task. If the peer has no completed Status exchange, the task parks the request and dials. The task sends an automatic Status request; the peer answers; the parked request is released. The task sends the request on the protocol's behaviour and stores the reply sender under the protocol and request id. The peer's response chunks arrive and complete() removes the sender and sends the bytes back through the oneshot to the waiting caller.">
+      <defs>
+        <marker id="m-09-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+      <rect x="40" y="14" width="200" height="40" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+      <text x="140" y="39" text-anchor="middle" font-size="13" font-weight="700">sync-loop task</text>
+      <rect x="340" y="14" width="220" height="40" rx="8" stroke-width="1.6" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="450" y="32" text-anchor="middle" font-size="13" font-weight="700">swarm task</text>
+      <text x="450" y="47" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">owns Swarm + SwarmCtx</text>
+      <rect x="680" y="14" width="200" height="40" rx="8" stroke-width="1.4" stroke-dasharray="5 4" style="fill:none;stroke:var(--ink-3)"/>
+      <text x="780" y="39" text-anchor="middle" font-size="13" font-weight="700">remote beacon node</text>
+
+      <line x1="140" y1="54" x2="140" y2="406" stroke-width="1" stroke-dasharray="3 4" style="stroke:var(--rule)"/>
+      <line x1="450" y1="54" x2="450" y2="406" stroke-width="1" stroke-dasharray="3 4" style="stroke:var(--rule)"/>
+      <line x1="780" y1="54" x2="780" y2="406" stroke-width="1" stroke-dasharray="3 4" style="stroke:var(--rule)"/>
+
+      <rect x="20" y="66" width="240" height="40" rx="5" style="fill:var(--ground-2)"/>
+      <text x="140" y="82" text-anchor="middle" font-size="10.5" class="mono">request_raw_at: QUIC, then TCP</text>
+      <text x="140" y="97" text-anchor="middle" font-size="10.5">one address at a time · DNS resolved here</text>
+
+      <line x1="140" y1="126" x2="446" y2="126" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-09-arrow)"/>
+      <text x="295" y="118" text-anchor="middle" font-size="11" class="mono">Command::Request { …, reply }</text>
+      <text x="295" y="140" text-anchor="middle" font-size="10.5" style="fill:var(--ink-3)">mpsc (256) · reply = oneshot::Sender</text>
+
+      <rect x="462" y="152" width="190" height="34" rx="5" style="fill:var(--ground-2)"/>
+      <text x="557" y="166" text-anchor="middle" font-size="10.5">no Status yet? park in</text>
+      <text x="557" y="180" text-anchor="middle" font-size="10.5" class="mono">ctx.queued · dial</text>
+
+      <line x1="450" y1="210" x2="776" y2="210" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-09-arrow)"/>
+      <text x="615" y="203" text-anchor="middle" font-size="11">auto Status v2 request</text>
+      <line x1="780" y1="240" x2="454" y2="240" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-09-arrow)"/>
+      <text x="615" y="233" text-anchor="middle" font-size="11">Status reply → mark_status_done → release</text>
+
+      <line x1="450" y1="280" x2="776" y2="280" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-09-arrow)"/>
+      <text x="615" y="273" text-anchor="middle" font-size="11">request bytes on the protocol's behaviour</text>
+      <text x="615" y="296" text-anchor="middle" font-size="10.5" class="mono" style="fill:var(--oxide-ink)">pending[(protocol, id)] = reply</text>
+      <line x1="780" y1="324" x2="454" y2="324" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-09-arrow)"/>
+      <text x="615" y="317" text-anchor="middle" font-size="11">response chunks (read_until_quiet)</text>
+
+      <line x1="450" y1="366" x2="144" y2="366" stroke-width="1.6" style="stroke:var(--ok)" marker-end="url(#m-09-arrow)"/>
+      <text x="295" y="358" text-anchor="middle" font-size="11" class="mono">complete(): pending.remove → reply.send(Ok(bytes))</text>
+      <text x="140" y="392" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">rx.await → myotis-wire codec → myotis-consensus</text>
+    </svg>
+    </div>
+    <figcaption>One owner for all network state. The caller never touches the <code>Swarm</code>; it hands over a <code>oneshot::Sender</code> and awaits the matching receiver. If the swarm task dies, every sender it held is dropped, and each waiting caller sees <code>RequestError::Shutdown</code> instead of hanging. The address walk (QUIC first, TCP on a dial failure) runs on the caller's side, one <code>Command::Request</code> per attempt.</figcaption>
+  </figure>
+
+  <h4>The caller's side</h4>
+  <x-code src="myotis-net/src/reqresp.rs" from="705" to="727"></x-code>
+  <ul class="concepts">
+    <li><x-tags>concurrency smart-pointers</x-tags> <code>#[derive(Clone)] ReqRespClient</code> is cheap to clone: an <code>mpsc::Sender</code> (itself a handle) plus three <code>Arc</code>s (the agent map, the TCP-first set and a DNS memo). Every clone talks to the same task.</li>
+    <li><x-tags>async ownership</x-tags> <code>let (reply, rx) = oneshot::channel();</code> then <code>reply</code> is <em>moved</em> into the command, so the task now owns the right to answer. <code>self.tx.send(…).await</code> suspends while the 256-slot inbox is full, like <code>BlockingQueue.put</code> but without blocking a thread.</li>
+    <li><x-tags>error-handling</x-tags> <code>rx.await</code> yields <code>Result&lt;Result&lt;Vec&lt;u8&gt;, RequestError&gt;, RecvError&gt;</code>. <code>.map_err(|_| RequestError::Shutdown)?</code> unwraps the outer layer, and the inner <code>Result</code> is the function's return value as it is.</li>
+    <li><x-tags>async interior-mutability</x-tags> DNS is resolved here, in async context, because the swarm task's dial path is synchronous and Android lacks <code>/etc/resolv.conf</code>. Inside <code>resolve_dial_addrs</code> the memo is a <code>std</code> mutex that is only locked <em>after</em> <code>lookup_host(…).await</code> has returned. A <code>std</code> guard is not <code>Send</code>, so holding one across an <code>.await</code> would make this future unusable in <code>tokio::spawn</code>.</li>
+  </ul>
+
+  <h4>The address walk: QUIC first, TCP as the fallback</h4>
+  <p>The consensus p2p spec now makes QUIC the primary transport and TCP the fallback, so a discovered peer can come with two addresses (<code>sync::Peer::dial_addrs</code> orders them QUIC first). <code>request_raw_at</code> tries them one at a time, and moves on only when the <em>dial</em> failed. A request that reached a connection and then failed is the peer's answer.</p>
+  <x-code src="myotis-net/src/reqresp.rs" from="672" to="700"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership iterators-closures</x-tags> <code>addrs.into_iter()</code> consumes the <code>Vec</code>: each <code>addr</code> is moved into <code>request_raw_once</code>, so no address is copied. <code>wire</code> is needed by every attempt, so each call gets <code>wire.clone()</code> and the original stays here. The <code>mut addrs</code> parameter means "I own this vector and may reorder it", which <code>dial_order</code> does in place through <code>&amp;mut addrs</code>.</li>
+    <li><x-tags>enums-patterns</x-tags> <code>outcome == Err(RequestError::DialFailure)</code> compares a whole <code>Result</code>. That works because <code>RequestError</code> derives <code>PartialEq</code>, and <code>Result&lt;T, E&gt;</code> is <code>PartialEq</code> when both <code>T</code> and <code>E</code> are.</li>
+    <li><x-tags>domain</x-tags> A peer is put on <code>TcpFirst</code> only when QUIC failed <em>and</em> TCP then reached it. A blip that fails every dial (no network) does not demote a healthy QUIC peer for good.</li>
+  </ul>
+  <x-code src="myotis-net/src/reqresp.rs" from="536" to="567"></x-code>
+  <ul class="concepts">
+    <li><x-tags>iterators-closures traits-generics</x-tags> <code>addrs.sort_by_key(is_quic)</code> passes a <em>function item</em> where a closure is expected. The key is a <code>bool</code>, and <code>false &lt; true</code>, so TCP addresses (key <code>false</code>) move to the front. <code>sort_by_key</code> is a stable sort, so the order within each transport stays the caller's.</li>
+    <li><x-tags>interior-mutability error-handling</x-tags> <code>TcpFirst</code> is an <code>Arc&lt;std::sync::RwLock&lt;HashSet&lt;PeerId&gt;&gt;&gt;</code>, shared by the client (which writes on a QUIC dial failure) and the swarm task (which writes on a QUIC timeout or a Nimbus agent). A <code>std</code> lock is fine because no critical section awaits. <code>.unwrap_or_else(|e| e.into_inner())</code> handles <em>poisoning</em>: if a thread panicked while holding the lock, <code>lock()</code>/<code>read()</code> return <code>Err(PoisonError)</code>, and <code>into_inner()</code> takes the guard anyway. For a dial-order hint that is the right call; Java has no equivalent because its locks don't track panics.</li>
+    <li><x-tags>bytes-strings</x-tags> <code>agent.get(..6)</code> returns <code>Option&lt;&amp;str&gt;</code>: <code>None</code> if the string is shorter than six bytes or byte 6 is not a character boundary. Slicing with <code>&amp;agent[..6]</code> would panic in both cases. The agent string is chosen by the remote peer, so it must never be able to panic this host.</li>
+    <li><x-tags>borrowing</x-tags> In <code>prefer_tcp</code>, <code>let mut set = set.write()…;</code> shadows the parameter: the first <code>set</code> is the <code>&amp;TcpFirst</code>, the new one is the write guard. The guard drops at the closing brace, after the <code>&amp;&amp;</code> expression is evaluated.</li>
+  </ul>
+  <x-code src="myotis-net/src/reqresp.rs" from="630" to="659"></x-code>
+  <p class="code-note"><x-tags>ownership enums-patterns</x-tags> <strong>Clone because you might need it again.</strong> <code>request_in_order</code> takes <code>addrs</code> and <code>wire</code> by value. To be able to retry, the first call gets <code>addrs.clone()</code> and <code>wire.clone()</code>, and the retry consumes the originals. The match arm <code>Err(RequestError::Timeout | RequestError::ConnectionClosed) if …</code> is an or-pattern nested inside <code>Err</code>, followed by a guard. The retry happens only when the swarm demoted the peer <em>while this request was out</em>: the request was lost to a connection this node closed (see <code>demote_stalled_quic</code> below), not refused by the peer.</p>
+
+  <h4>The owner's side</h4>
+  <x-code src="myotis-net/src/reqresp.rs" from="1330" to="1343"></x-code>
+  <x-code src="myotis-net/src/reqresp.rs" from="1461" to="1492"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership concurrency</x-tags> <code>tokio::spawn(run_swarm(swarm, rx, …))</code> <em>moves</em> the <code>Swarm</code> and the receiver into the task. <code>SwarmCtx</code>'s plain <code>HashMap</code>s need no locks because only this task can reach them. The Java analogue is a Netty <code>EventLoop</code> fed from a <code>BlockingQueue&lt;Command&gt;</code>. The two exceptions, <code>agents</code> and <code>tcp_first</code>, are created here as <code>Arc::default()</code> and cloned: one copy goes into the task, one into the client.</li>
+    <li><x-tags>async</x-tags> <code>tokio::select!</code> waits for whichever is ready first, the next command or the next swarm event (the <code>event = swarm.select_next_some()</code> arm at line 1532, after the remaining command arms), and drops the other future. Both are cancellation-safe, so nothing is lost. Because the futures are dropped before the handler body runs, the handler may take <code>&amp;mut swarm</code>. The handlers never <code>.await</code>, which keeps the loop responsive.</li>
+    <li><x-tags>ownership enums-patterns</x-tags> <code>ctx.pending.drain()</code> hands each stored <code>Pending</code> back by value. <code>if let Pending::External(reply) = p</code> takes the sender out, and <code>let _ = reply.send(…)</code> ignores a caller who has already gone away. <code>rx.recv()</code> returns <code>None</code> once every client clone is dropped, so the task also ends when nobody can reach it.</li>
+    <li><x-tags>enums-patterns</x-tags> <code>enum Pending</code> works like a sealed interface. An outcome completes either an external caller's oneshot or one of the two automatic Status exchanges.</li>
+  </ul>
+
+  <h4>The request-id collision fix</h4>
+  <x-code src="myotis-net/src/reqresp.rs" from="1585" to="1631"></x-code>
+  <div class="callout watch">
+    <span class="k">A real bug, and its fix in the types</span>
+    <p>libp2p numbers outbound requests <em>per behaviour</em>, starting at 1, and this host has thirteen request/response behaviours. When <code>pending</code> was keyed by the id alone, a new peer's auto-Status and a bootstrap request to another peer could share id 1. The second insert evicted the first, so one caller saw "service shut down", and a bootstrap caller could receive <em>Status bytes</em>. Keying by <code>(&amp;'static str, OutboundRequestId)</code>, with <code>send_tracked</code> as the only inserter, makes a mismatched key impossible: the protocol that picks the behaviour is the protocol in the key. The fix landed in <code>aa123758</code>; the tests in <code>pending_request_tests</code> mint ids the way the behaviours do and assert that they collide. The inbound budget map <code>in_flight</code> is keyed the same way for the same reason.</p>
+  </div>
+  <ul class="concepts">
+    <li><x-tags>lifetimes borrowing</x-tags> <code>behaviour_for&lt;'a&gt;(swarm: &amp;'a mut Swarm&lt;…&gt;, …) -&gt; Option&lt;&amp;'a mut RR&gt;</code> returns a mutable borrow <em>into</em> the swarm, tied to the input by <code>'a</code>. In <code>send_tracked</code> that borrow (<code>rr</code>) is last used on the <code>send_request_with_addresses</code> line, so the next line may use <code>ctx</code> freely. <code>Some(match … { …, _ =&gt; return None })</code> shows <code>return</code> inside an expression.</li>
+    <li><x-tags>ownership</x-tags> <code>on_outcome</code> is either moved into the map or consumed on the error path, never copied. A reply sender therefore has exactly one owner at every moment.</li>
+  </ul>
+  <x-code src="myotis-net/src/reqresp.rs" from="1944" to="2000"></x-code>
+  <p class="code-note"><x-tags>enums-patterns</x-tags> <code>Some(Pending::AutoStatusV2(peer_id) | Pending::AutoStatusV1(peer_id)) if !ctx.connected.contains(&amp;peer_id)</code> is an <strong>or-pattern that binds the same name in both alternatives</strong>, plus a guard. Arms are tried in order, so this "stale outcome" arm catches both kinds before the specific arms below it. A v1-only peer answers v2 with <code>UnsupportedProtocol</code>, and the host falls back to v1. Any other failure still settles the peer, so its parked requests are released rather than starved.</p>
+
+  <h4>A stalled QUIC connection is closed, not just avoided</h4>
+  <x-code src="myotis-net/src/reqresp.rs" from="1925" to="1942"></x-code>
+  <p class="code-note"><x-tags>domain concurrency</x-tags> libp2p's request-response hands a request to any established connection to the peer and cannot steer it by transport. So when a request times out on a QUIC connection (the doc comment above the function records the stall measured against Nimbus), the only cure is to close that connection; the next request dials afresh, TCP first. <code>quic_conns.remove</code> returns whether the id was there, which makes the function idempotent: other requests timing out on the same connection in the same poll do nothing. The Identify handler applies the same rule up front to any peer whose agent is Nimbus.</p>
+
+  <h4>Reading a response until the peer goes quiet</h4>
+  <x-code src="myotis-net/src/reqresp.rs" from="164" to="218"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics async</x-tags> <code>T: AsyncRead + Unpin + Send</code>: any async byte stream that can be polled through <code>&amp;mut</code> (<code>Unpin</code>) and moved between threads (<code>Send</code>). The whole function compiles to a state machine; its 16 KiB <code>chunk</code> buffer lives inside the future, not on a thread stack.</li>
+    <li><x-tags>async</x-tags> <code>tokio::time::timeout_at(wake_at, io.read(&amp;mut chunk))</code>: if the timer wins, the unfinished <code>read</code> future is <em>dropped</em>, which is cancellation, and no data is lost because a pending read hasn't consumed anything. Before the first byte there is no timer at all. The behaviour-level request timeout (10 s, or 60 s for updates) is the deadline then, which keeps slow, rate-limited servers usable.</li>
+    <li><x-tags>domain</x-tags> <code>budget</code> is set only for <code>updates_by_range</code> (55 s, under the 60 s behaviour timeout). When it runs out with data buffered, the read completes with the whole chunks that arrived instead of letting the behaviour timeout discard them and charge the peer a failure.</li>
+    <li><x-tags>error-handling</x-tags> An error <em>after</em> data arrived keeps the buffered response instead of discarding it. The codec in <code>myotis-wire</code> validates it later.</li>
+  </ul>
+  <p>The request side has a newer twin, <code>drain_capped</code>. The three "by root" protocols (blocks, data-column sidecars, payload envelopes) are inbound only and always answered with zero chunks, so their request body is never read: <code>futures::io::copy(io.take(cap + 1), &amp;mut sink())</code> reads it to EOF and throws it away, up to 256 KiB, without buffering. A light client serves these at all because Nimbus asks every new peer for blocks (and later columns and envelopes) by root, and ends its peer loop, disconnecting, when the protocol cannot be negotiated. The answer is zero chunks rather than <code>ResourceUnavailable</code> because, per the comment in <code>respond_inbound</code>, Nimbus treats an error chunk as a failed request too (the protocol docs are in <a href="#f-myotis-wire-src-eth2-protocols-rs">myotis-wire's protocols.rs</a>).</p>
+
+  <h4>The behaviour, gossipsub and the Lighthouse ban</h4>
+  <x-code src="myotis-net/src/reqresp.rs" from="308" to="344"></x-code>
+  <ul class="concepts">
+    <li><x-tags>macros</x-tags> <code>#[derive(NetworkBehaviour)]</code> generates the combined behaviour impl plus a <code>BehaviourEvent</code> enum with one variant per field (<code>BehaviourEvent::StatusV2</code>, <code>…::Gossipsub</code>, …). <code>handle_behaviour_event</code> matches on exactly those variants.</li>
+    <li><x-tags>domain</x-tags> <strong>The gossipsub with no subscriptions is still there</strong>, and still only so that <code>/meshsub/</code> negotiates. Lighthouse reports a peer whose gossipsub upgrade fails as <code>PeerAction::Fatal</code>: the peer id is banned for 12 h, and the whole IP once more than five of its peer ids are banned. That was #422. The test <code>meshsub_negotiates_without_any_subscription</code> plays Lighthouse (a subscribed swarm) against this host and fails on <code>GossipsubNotSupported</code>. If you test from a machine that ran a pre-gossipsub build, the bans can outlive the fix by 12 hours, and a banned host sees healthy nodes as "dial failed" (the repo's <code>CLAUDE.md</code> records this caveat for the cold-start checks).</li>
+    <li><x-tags>domain</x-tags> <code>metadata_v3</code> is new: post-Fulu peers ask for v3, and Nimbus drops a peer that cannot answer. <code>updates</code> is advertised outbound-only for a wallet (advertising a protocol you cannot serve gets you sent Goodbye) and <code>Full</code> for a serving host.</li>
+  </ul>
+
+  <h4>TCP with two muxers, QUIC beside it, and every byte counted</h4>
+  <x-code src="myotis-net/src/reqresp.rs" from="1231" to="1254"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain</x-tags> <strong>Why mplex.</strong> The spec says a TCP client MUST support mplex and MAY support yamux, with yamux preferred where both exist. Nimbus and Lodestar speak only mplex on TCP. A yamux-only host (this one, until recently) completed Noise with every Nimbus node and then died on the muxer proposal, which made Nimbus nodes look dead. <code>SelectUpgrade::new(yamux, mplex)</code> offers both, and its argument order is the preference order. The test pair <code>a_yamux_only_host_cannot_connect_to_an_mplex_only_peer</code> / <code>the_host_connects_to_an_mplex_only_peer_like_nimbus</code> pins both sides.</li>
+    <li><x-tags>iterators-closures smart-pointers</x-tags> <strong>A <code>move</code> closure that clones on every call.</strong> <code>.map(move |stream, _| …)</code> moves <code>tcp_meter</code> (an <code>Arc</code>) into the closure. The closure runs once per connection, so it cannot give its captured <code>Arc</code> away; it calls <code>Arc::clone(&amp;tcp_meter)</code> each time, and each <code>CountingStream</code> owns one strong reference.</li>
+    <li><x-tags>traits-generics</x-tags> The TCP stack and the QUIC stack produce different output types. <code>StreamMuxerBox::new(c)</code> erases each muxer to one boxed type, and <code>or_transport</code> combines the two into a transport that tries TCP or QUIC by address; its output is an <code>Either</code>, flattened by <code>into_inner()</code>. The return type <code>Result&lt;_, Box&lt;dyn Error + Send + Sync&gt;&gt;</code> lets <code>?</code> convert the Noise config error. QUIC brings its own TLS 1.3 and its own streams, so neither Noise nor a muxer applies there.</li>
+  </ul>
+  <p>The two <code>if dns</code> branches after this closure build the same swarm with and without <code>.with_dns()</code>. They are separate chains because each builder step consumes the builder and changes its type, so a failed DNS step cannot hand the builder back. <code>start_host_with</code> tries with DNS first and falls back with a warning; Android has no <code>/etc/resolv.conf</code>.</p>
+
+  <h4>The responder: synchronous by design</h4>
+  <x-code src="myotis-net/src/reqresp.rs" from="1097" to="1117"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics concurrency</x-tags> <code>HostConfig</code> holds <code>Option&lt;Arc&lt;dyn LcResponder&gt;&gt;</code>: a shared, thread-safe trait object, like an injected Java interface. <code>Send + Sync</code> as supertraits make every implementation safe to call from the swarm task. The methods are plain <code>fn</code>, not <code>async fn</code>, because <code>respond_inbound</code> runs inline in the event loop; an I/O fetch there would stall every connection. A miss returns <code>None</code>, answered as <code>ResourceUnavailable</code>.</li>
+    <li><x-tags>domain</x-tags> Two responder details changed. Ping now answers with <em>our</em> metadata sequence number instead of echoing the caller's, so peers re-fetch our real metadata. A Goodbye is answered and then the peer is disconnected, so a public responder does not collect dead connections.</li>
+    <li><x-tags>domain error-handling</x-tags> A serving host also caps response bytes queued but not yet written at 64 MiB across all connections (<code>MAX_IN_FLIGHT_RESPONSE_BYTES</code>). In <code>on_rr_event</code>, a response that would overflow is swapped for <code>ResourceUnavailable</code>; both terminal events, <code>ResponseSent</code> and <code>InboundFailure</code>, release the bytes. Missing either would leak budget until the responder refused everything.</li>
+  </ul>
+
+  <h4>Shared status</h4>
+  <p class="code-note"><x-tags>interior-mutability smart-pointers</x-tags> <code>LocalStatus</code> (lines 812–829) is shared between the sync loop (writer) and the swarm task (reader) through an <code>Arc</code>, so it needs a <code>Mutex</code>. <code>*self.inner.lock().expect(…) = s;</code> assigns through the guard, and the guard lives only for that statement. <code>get</code> returns a <code>clone()</code>, so the caller never holds the lock.</p>
+  <div class="callout jvm">
+    <span class="k">JVM lens</span>
+    <p><code>SwarmCtx</code> needs no lock and <code>LocalStatus</code> does, for the same reason a Java object confined to one Netty event loop needs no synchronisation while a field shared with another thread does. The difference is that Rust <em>checks</em> the confinement. Moving the <code>SwarmCtx</code> into the task makes it unreachable from anywhere else, and anything the task shares (<code>LocalStatus</code>, <code>AgentMap</code>, <code>TcpFirst</code>) has to be an <code>Arc</code> around a lock, or it will not compile.</p>
+  </div>
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments</span>
+    <p>The module doc (lines 1–15) still lists "TCP + noise XX + yamux or mplex" without QUIC, and says the <code>light_client_*</code> protocols answer <code>ResourceUnavailable</code>, which is true only without an <code>LcResponder</code>. The <code>RESP_TIMEOUT</code> doc (line 37) says updates get "the Java catch-up deadline (15 s)", but <code>UPDATES_TIMEOUT</code> is 60 s. The <code>respond_inbound</code> doc (lines 2058–2060) says "ping/goodbye → echo" and "no relay cache in this stage"; ping now returns our own sequence number, and the light-client branches serve from the responder. Lines 715, 985 and 1301 say the no-DNS fallback is "plain TCP"; it is TCP plus QUIC. Two doc comments are attached to the wrong item: the <code>start_host_with</code> doc (lines 1173–1182) sits directly above <code>build_swarm</code>'s doc, so rustdoc merges both onto <code>build_swarm</code>, and the doc for <code>external_address</code> (lines 729–735) is merged into <code>observe_via</code>'s, leaving <code>external_address</code> undocumented.</p>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-net/src/discovery.rs" kind="library" twin="DiscV5Service (as wired by ChainStack)">
+  <p class="purpose">discv5 discovery for the consensus layer, in two modes. <strong>Client mode</strong> (<code>spawn</code>) runs two tasks: a lookup loop (FINDNODE every 15 s, or every 2 s while the sync loop hunts for light-client servers) and a consumer of every ENR heard in NODES responses. Both emit fork-matched dial candidates on an <code>mpsc</code> channel, now with a QUIC address where the record has one. <strong>Server mode</strong> (<code>spawn_server</code>, <code>publish</code>) lets <code>roost</code> join the DHT and publish a signed record under a persisted sequence number.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–26</td><td>Module doc, imports, <code>RESEED_EMPTY_ROUNDS</code>.</td></tr>
+      <tr><td>27–98</td><td><code>DiscoveredPeer</code> (now with <code>quic</code>), <code>AcceptedForkDigests</code>, <code>rotate_seen_if_changed</code>.</td></tr>
+      <tr><td>99–202</td><td><code>DiscoveryConfig</code> (now with <code>cl_fork_watch</code> and <code>traffic</code>), <code>spawn</code>.</td></tr>
+      <tr><td>204–241</td><td><code>node_id_for_peer</code>, <code>seed_bootnodes</code>.</td></tr>
+      <tr><td>243–395</td><td><code>run_lookups</code>: pinned targets first, the seq gate for pinned records, fork-watch evidence from the routing table, the empty-table re-seed, the hunt cadence.</td></tr>
+      <tr><td>397–437</td><td><code>reseed</code>, <code>reseed_due</code>.</td></tr>
+      <tr><td>439–527</td><td><code>consume_discovered</code>, <code>Heard</code>, <code>classify_heard</code>.</td></tr>
+      <tr><td>529–637</td><td><code>filter_candidate</code> (TCP and/or QUIC), the <code>eth2</code> field readers, <code>note_enr</code>, RLP short-string decode, <code>enr_to_peer_id</code>.</td></tr>
+      <tr><td>639–740</td><td>Client tests.</td></tr>
+      <tr><td>741–971</td><td>Server ENR: <code>discv5_key_from_libp2p</code>, <code>build_server_enr</code>; tests, including the QUIC-field and QUIC-only record tests.</td></tr>
+      <tr><td>972–1215</td><td>Server discv5: <code>ServerDiscovery</code> + <code>Drop</code>, <code>spawn_server</code>, maintenance, <code>publish</code>, lifecycle test.</td></tr>
+    </tbody>
+  </table></div>
+  <x-code src="myotis-net/src/discovery.rs" from="54" to="74"></x-code>
+  <ul class="concepts">
+    <li><x-tags>smart-pointers traits-generics iterators-closures</x-tags> <code>Dynamic(Arc&lt;dyn Fn() -&gt; Vec&lt;[u8; 4]&gt; + Send + Sync&gt;)</code> is a thread-safe <code>Supplier</code> stored in an enum variant. It is re-read for every candidate, so a fork that activates at a future epoch switches the filter without a restart. <code>Arc</code> rather than <code>Box</code> keeps the enum <code>Clone</code>able.</li>
+    <li><x-tags>borrowing</x-tags> <code>match self</code> on <code>&amp;self</code> binds <code>v</code> and <code>f</code> by reference, so <code>v.clone()</code> is needed to return an owned <code>Vec</code>. <code>f()</code> calls through the reference. <code>impl From&lt;Vec&lt;[u8; 4]&gt;&gt;</code> lets callers write <code>vec.into()</code>.</li>
+  </ul>
+  <x-code src="myotis-net/src/discovery.rs" from="156" to="201"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership concurrency</x-tags> One owner means a move; two owners means an <code>Arc</code>. The <code>Discv5</code> instance is moved into <code>run_lookups</code>, while the routing-table size counter is shared: <code>Arc::clone(&amp;table_size)</code> goes to the task and the original is returned to the caller for the UI. <code>AtomicUsize</code> is Java's <code>AtomicLong</code>; <code>Relaxed</code> ordering is fine for a metric.</li>
+    <li><x-tags>smart-pointers</x-tags> <code>config.traffic.as_ref().map(crate::traffic::Discv5Share::join)</code>: <code>as_ref()</code> turns <code>&amp;Option&lt;Arc&lt;_&gt;&gt;</code> into <code>Option&lt;&amp;Arc&lt;_&gt;&gt;</code>, which is exactly what <code>join(meter: &amp;Arc&lt;TrafficMeter&gt;)</code> takes, so the function path can be passed directly. The resulting share is moved into the lookup task as <code>_traffic_share</code>: it lives as long as the task, and its <code>Drop</code> unregisters the meter when the task ends (see <a href="#f-myotis-net-src-traffic-rs">traffic.rs</a>).</li>
+    <li><x-tags>async error-handling</x-tags> Every start-up step is fallible and mapped to a <code>String</code> error. Discovery failing is reported, not panicked, just as the Java engine treats discv5 as non-essential.</li>
+  </ul>
+  <x-code src="myotis-net/src/discovery.rs" from="316" to="344"></x-code>
+  <ul class="concepts">
+    <li><x-tags>concurrency async borrowing</x-tags> <strong>Where each guard dies.</strong> Every <code>seen.lock()</code> here is a <em>temporary</em>. On line 318 the guard lives until the end of the statement; on line 332 it lives until the end of the <code>if</code> condition. So no guard is alive at <code>find_node(target).await</code> or at <code>tx.send(peer).await</code>. If one were, the future would hold a non-<code>Send</code> <code>std::sync::MutexGuard</code> across an <code>.await</code>, and <code>tokio::spawn(run_lookups(…))</code> would not compile.</li>
+    <li><x-tags>borrowing enums-patterns</x-tags> <code>match pinned_seq.get(&amp;id)</code> borrows the map, yet the <code>_</code> arm calls <code>pinned_seq.insert</code>. This compiles because <code>Some(&amp;last)</code> <em>copies</em> the <code>u64</code> out of the reference, and the <code>_</code> arm uses no reference at all, so the borrow is already over (non-lexical lifetimes).</li>
+    <li><x-tags>domain</x-tags> A pinned server (roost) is re-emitted only on a strictly newer ENR sequence number. That heals a stale pinned address when roost republishes, and a table serving an <em>older</em> record cannot move the pool's address backwards.</li>
+  </ul>
+  <x-code src="myotis-net/src/discovery.rs" from="451" to="495"></x-code>
+  <ul class="concepts">
+    <li><x-tags>concurrency interior-mutability</x-tags> <code>seen: Arc&lt;std::sync::Mutex&lt;HashSet&lt;NodeId&gt;&gt;&gt;</code> is shared by the two tasks to avoid duplicate emits. The critical section runs from check to <code>try_send</code> to insert: Java's <code>synchronized (seen) { check; offer; add }</code>. A <code>std</code> mutex is fine because nothing inside <code>.await</code>s. <code>try_send</code> never blocks, and the guard is dropped at the end of the loop body.</li>
+    <li><x-tags>async</x-tags> <code>send().await</code> waits like <code>put</code>; <code>try_send</code> fails immediately like <code>offer</code>. A node dropped on a full channel is deliberately <em>not</em> marked seen, so it is emitted the next time it is heard. The <code>tx.capacity() == 0</code> shortcut skips even the key decode while the channel is full.</li>
+    <li><x-tags>enums-patterns testing</x-tags> The decision itself moved into a pure function, <code>classify_heard</code>, which returns <code>Heard::Skip</code>, <code>NeverCandidate</code> or <code>Emit(peer)</code>. It only <em>reads</em> <code>seen</code>; the caller writes it, because only the caller knows whether the send landed. Pure decisions are easy to test (<code>a_heard_node_is_emitted_once_and_pins_are_left_to_the_lookup_path</code>).</li>
+    <li><x-tags>enums-patterns</x-tags> <code>let Event::Discovered(enr) = event else { continue };</code> works in loops too: the <code>else</code> branch may <code>continue</code>. <code>&amp;guard</code> is accepted where <code>&amp;HashSet</code> is expected, because of deref coercion.</li>
+  </ul>
+  <x-code src="myotis-net/src/discovery.rs" from="531" to="568"></x-code>
+  <ul class="concepts">
+    <li><x-tags>iterators-closures enums-patterns</x-tags> Two small closures keep the endpoint logic flat. <code>quic_port</code> reads a field, ignores one that does not decode (<code>.and_then(|r| r.ok())</code>) and treats port 0 as absent. <code>endpoint</code> accepts an IP only if it has at least one transport. <code>endpoint(v4…).or_else(|| endpoint(v6…))?</code> prefers IPv4 and evaluates the IPv6 side only if needed.</li>
+    <li><x-tags>enums-patterns domain</x-tags> The final <code>match (tcp, quic)</code> on a tuple of options states the rule directly: TCP present means TCP is the cache identity <code>addr</code> and QUIC rides along; QUIC alone means the QUIC address <em>is</em> <code>addr</code>. The <code>(None, None)</code> arm cannot happen after <code>endpoint</code>, but the compiler requires every case to be handled.</li>
+  </ul>
+  <x-code src="myotis-net/src/discovery.rs" from="1021" to="1027"></x-code>
+  <p class="code-note"><x-tags>smart-pointers async</x-tags> <strong>A tokio task is not tied to its handle.</strong> Dropping a <code>JoinHandle</code> only <em>detaches</em> the task. So <code>Drop</code> aborts it explicitly. That drops the task's <code>Arc&lt;Discv5&gt;</code>, the last clone goes away, and discv5's own <code>Drop</code> shuts the service and its UDP socket down. In client mode, <code>sync.rs</code> wraps the handle in a <code>DiscoveryGuard</code> that does the same.</p>
+  <p class="code-note"><x-tags>domain</x-tags> Design notes from the file: "hearsay" ENRs (heard in NODES responses) are used on purpose; this found the first sepolia peer in 4 s instead of 2 min 12 s, and they are trusted only after a successful Noise handshake. <code>add_enr</code> alone is passive and fails on a bucket full of dead entries, so the re-seed also pings. The CL fork watch gets its evidence from the <em>routing table</em> once per round, not from hearsay, because a relayed record is self-declared and keys are free.</p>
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments</span>
+    <p>The module doc (line 6) still says candidates are a "TCP multiaddr + PeerId"; they can now be QUIC. The doc comment for <code>seed_bootnodes</code> (lines 204–207) sits above <code>node_id_for_peer</code>'s doc, so rustdoc attaches both paragraphs to <code>node_id_for_peer</code> and <code>seed_bootnodes</code> has none. The QUIC record tests live in <code>server_enr_tests</code>, although they test the client-side <code>filter_candidate</code>.</p>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-net/src/clcache.rs" kind="library" twin="FileClPeerCache / CLPeerCache">
+  <p class="purpose">Reads and writes the <em>same</em> <code>cl-peers[-net].cache</code> file the Java hosts keep, so proven light-client servers survive restarts and engine switches. On disk: one tab-separated line per peer with tokens for served period ranges, deepest bootstrap, and <code>lc</code>/<code>nolc</code>. In memory: a plain struct where ranges only widen, three failures evict a peer, and changes only set <code>dirty</code>, so <code>flush</code> writes once per sync round. The only change since September is the Java twin's name in line 2.</p>
+  <x-code src="myotis-net/src/clcache.rs" from="1" to="40"></x-code>
+  <x-code src="myotis-net/src/clcache.rs" from="142" to="159"></x-code>
+  <ul class="concepts">
+    <li><x-tags>borrowing</x-tags> <code>let before = self.served.get(addr).copied();</code>. Without <code>.copied()</code>, <code>before</code> would be an <code>Option&lt;&amp;(u64, u64)&gt;</code> still borrowing <code>self.served</code>, and the <code>&amp;mut self</code> call on the next line would not compile. Copying the pair out ends the borrow.</li>
+    <li><x-tags>bytes-strings traits-generics</x-tags> <code>HashSet::insert</code> and <code>remove</code> return whether something changed, like Java's <code>Set.add</code>, and <code>changed |=</code> accumulates the result. <code>self.served.get(addr)</code> accepts a <code>&amp;str</code> for a <code>String</code> key, because <code>String: Borrow&lt;str&gt;</code>. <code>Vec::contains</code> has no such flexibility, which is why <code>ensure</code> and <code>mark_failure</code> write <code>self.peers.contains(&amp;addr.to_string())</code> and allocate a <code>String</code> just to compare.</li>
+    <li><x-tags>concurrency borrowing</x-tags> <strong>No synchronisation at all.</strong> The mutators take <code>&amp;mut self</code>, and <code>run_sync</code> owns the cache as a local variable, so the compiler guarantees a single writer. It's a non-thread-safe Java object confined to one thread, except the confinement is proven. <code>run_sync</code> builds it with <code>.map(ClPeerCache::load).unwrap_or_else(ClPeerCache::disabled)</code>, passing both associated functions as values.</li>
+  </ul>
+  <x-code src="myotis-net/src/clcache.rs" from="276" to="308"></x-code>
+  <p class="code-note"><x-tags>error-handling</x-tags> An atomic write via temp file plus rename. <code>and_then</code> chains two fallible steps without <code>?</code>. The error is deliberately swallowed, because the file is only a performance cache. There is no file lock, so across processes (for example the Java engine) the last writer wins. <code>let Some(path) = &amp;self.path else { return };</code> binds a <em>reference</em> into <code>self</code>.</p>
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments</span>
+    <p>The test <code>ordering_prefers_proven_then_bootstrap</code> (lines 420–421) says the widest range leads because it is "the generous multi-chunk server", which is exactly what the <code>peers()</code> doc (lines 107–109) says width does <em>not</em> show.</p>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-net/src/traffic.rs" kind="library">
+  <p class="purpose">New since September. Byte counters per network stack, split into an execution-layer and a consensus-layer pair, so a host running several networks can show each one's data usage (the engine's <code>usage.rs</code> turns the totals into a ledger). A <code>TrafficMeter</code> lives in <code>ChainConfig</code> and is handed to every socket the stack opens. For this stop's half: libp2p TCP is counted on the raw socket, below Noise and the muxer; QUIC is counted per substream above QUIC, because libp2p does not expose its socket; and discv5, which only counts process-wide, has its growth shared out among the meters whose discovery is running.</p>
+  <x-code src="myotis-net/src/traffic.rs" from="31" to="53"></x-code>
+  <p class="code-note"><x-tags>concurrency interior-mutability</x-tags> <code>add_rx</code> takes <code>&amp;self</code>, not <code>&amp;mut self</code>, and still changes the count: <code>AtomicU64</code> is interior mutability without a lock, like Java's <code>AtomicLong</code>. That is what lets many connections share one meter through an <code>Arc</code> (which only ever hands out <code>&amp;T</code>). <code>Relaxed</code> ordering guarantees each counter's own updates are not lost, and nothing more, which is all a statistic needs.</p>
+
+  <h4>discv5: one global counter, shared out with weak references</h4>
+  <x-code src="myotis-net/src/traffic.rs" from="100" to="146"></x-code>
+  <ul class="concepts">
+    <li><x-tags>concurrency interior-mutability</x-tags> <code>static DISCV5: Mutex&lt;Discv5Ledger&gt; = Mutex::new(…)</code> is a global initialised at compile time. That is allowed because <code>Mutex::new</code> and <code>Vec::new</code> are <code>const fn</code>. A <code>static</code> must be <code>Sync</code>, and the <code>Mutex</code> is what makes the ledger so. This is the crate's answer to an external global: the <code>discv5</code> crate's own metrics are process-wide.</li>
+    <li><x-tags>smart-pointers</x-tags> <strong><code>Weak</code> is Java's <code>WeakReference</code>, with explicit counting.</strong> The ledger keeps <code>Weak&lt;TrafficMeter&gt;</code>, so being registered does not keep a meter alive. <code>retain(|w| w.strong_count() &gt; 0)</code> prunes dead entries, and <code>filter_map(Weak::upgrade)</code> turns each live one into a temporary <code>Arc</code> for the duration of the update. The <code>live</code> vector drops those <code>Arc</code>s at the end of the function.</li>
+    <li><x-tags>bytes-strings</x-tags> <code>saturating_sub</code> clamps at 0. A plain <code>-</code> that underflows panics in debug and test builds, where overflow checks are on, and wraps silently in release. The split is even, with the remainder to the first meter; the test <code>discv5_growth_is_shared_by_the_live_meters_only</code> checks the arithmetic, including a dropped meter and nobody live.</li>
+    <li><x-tags>error-handling</x-tags> <code>DISCV5.lock().unwrap_or_else(|e| e.into_inner())</code> again takes the guard even if a panicking thread poisoned the lock. A wrong byte count is better than a panic in a status read.</li>
+  </ul>
+  <x-code src="myotis-net/src/traffic.rs" from="148" to="172"></x-code>
+  <p class="code-note"><x-tags>smart-pointers ownership</x-tags> <strong>Registration as a value.</strong> <code>Discv5Share::join</code> registers the meter and returns a token; dropping the token unregisters it. It is the RAII shape of Java's try-with-resources, except no <code>try</code> block is needed: the owner (the lookup task) simply holds the token, and when the task ends or is aborted, Rust drops it. <code>Arc::downgrade(meter)</code> is called twice, once for the ledger and once for the token, and <code>w.ptr_eq(&amp;self.meter)</code> finds the token's own entry by pointer identity, like <code>==</code> on Java references. <code>swap_remove</code> is O(1) because order does not matter. Both paths flush first, so bytes from before the change go to the meters that were live then.</p>
+
+  <h4>libp2p: wrapping a poll-based stream</h4>
+  <x-code src="myotis-net/src/traffic.rs" from="176" to="215"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async traits-generics</x-tags> <strong>What <code>poll_read</code> is.</strong> Under every <code>.await</code> on a byte stream there is a <code>poll_read</code> that returns at once with <code>Poll::Ready(result)</code> or <code>Poll::Pending</code> (after registering the waker in <code>cx</code>). A wrapper implements the same trait and forwards each call; here it adds the byte count when the inner call is <code>Ready(Ok(n))</code>. It is the decorator pattern, as with a Java <code>FilterInputStream</code>.</li>
+    <li><x-tags>async smart-pointers</x-tags> <strong><code>Pin&lt;&amp;mut Self&gt;</code> and <code>Unpin</code>.</strong> Poll methods take the receiver pinned, a promise that the value will not move in memory, which self-referential futures need. To call the inner stream's <code>poll_read</code>, the wrapper needs a <code>Pin&lt;&amp;mut S&gt;</code>. <code>Pin::new(&amp;mut self.inner)</code> builds one, and it is only allowed because the impl requires <code>S: Unpin</code> ("safe to move even when pinned"). With that bound no <code>unsafe</code> pin projection is needed.</li>
+    <li><x-tags>traits-generics</x-tags> <code>layer: fn(&amp;TrafficMeter) -&gt; &amp;ByteCounter</code> is a plain function pointer (no closure, no allocation) that picks which counter to use. The elided lifetimes mean "the returned reference borrows from the argument". <code>(self.layer)(&amp;self.meter)</code> needs the parentheses so Rust calls the field instead of looking for a method named <code>layer</code>. Line 295 defines <code>cl</code>, which <code>build_swarm</code> passes.</li>
+  </ul>
+  <x-code src="myotis-net/src/traffic.rs" from="260" to="292"></x-code>
+  <p class="code-note"><x-tags>traits-generics smart-pointers</x-tags> <code>CountingMuxer</code> implements libp2p's <code>StreamMuxer</code> with an <strong>associated type</strong>: <code>type Substream = CountingStream&lt;M::Substream&gt;</code>, so every substream it hands out is a counting one. <code>Poll&lt;Result&lt;T, E&gt;&gt;::map_ok</code> transforms a ready success and passes <code>Pending</code> and errors through. The <code>Arc::clone(&amp;self.meter)</code> comes first because the closure needs its own handle while <code>self.inner</code> is borrowed mutably through the pin. It costs one atomic increment per poll, including polls that return <code>Pending</code>.</p>
+  <div class="callout watch">
+    <span class="k">Not counted</span>
+    <p>The module doc lists what the meters miss: IP/TCP/UDP headers, QUIC's own packet overhead and TLS handshake, EIP-1459 DNS lookups, and Tor. With several networks running, discv5's share is an even split, not a measurement.</p>
+  </div>
+</x-file>
+
+<x-quiz>[
+  {"id":"netcl-q1","type":"open","tags":["async","concurrency","ownership"],
+   "q":"Describe how a response gets from the network back to the code that called <code>ReqRespClient::request_raw_at</code>. Which task owns what at each step?",
+   "model":"<code>request_raw_at</code> walks the addresses in order (<code>request_in_order</code>). For each attempt, <code>request_raw_once</code> resolves DNS, creates a <code>oneshot</code> channel and moves its sender into a <code>Command::Request</code>, which it sends over the bounded <code>mpsc</code> inbox to the swarm task, then awaits the receiver. The swarm task owns the <code>Swarm</code> and <code>SwarmCtx</code>. If the peer hasn't finished its Status exchange, the request (with its sender) is parked in <code>ctx.queued</code> and the peer is dialled. Otherwise <code>send_tracked</code> sends the bytes on the protocol's behaviour and stores the sender in <code>ctx.pending[(protocol, id)]</code>. When the response or failure event arrives, <code>complete</code> removes the sender from the map and calls <code>send(result)</code>, which wakes the caller's <code>rx.await</code>. If the task dies, its stored senders are dropped and the caller gets <code>RequestError::Shutdown</code>.",
+   "points":["the oneshot sender is moved into a Command sent over the mpsc channel","the swarm task owns Swarm and SwarmCtx and parks the request if Status is not done","the sender is stored in pending keyed by (protocol, request id)","complete() removes it and sends; a dropped sender becomes RequestError::Shutdown"],
+   "context":"myotis-net/src/reqresp.rs: request_raw_once L705-728 (oneshot + mpsc send); run_swarm L1461-1535 (select! loop); submit_request parks in ctx.queued; send_tracked L1612-1631 inserts pending[(protocol, id)]; complete L1944 removes and replies."},
+  {"id":"netcl-q2","type":"mcq","tags":["interior-mutability","concurrency","smart-pointers"],
+   "q":"Why does <code>SwarmCtx</code> hold plain <code>HashMap</code>s, while <code>LocalStatus</code>, <code>AgentMap</code> and <code>TcpFirst</code> wrap their data in a lock?",
+   "options":["<code>SwarmCtx</code> only holds <code>Copy</code> types","tokio synchronises all task state automatically","<code>SwarmCtx</code> is moved into the one swarm task and only used there through <code>&amp;mut</code>; the other three are shared with the client or the sync loop through an <code>Arc</code>, which only gives out <code>&amp;T</code>, so mutation needs interior mutability","The locked types are larger than 4 KiB"],
+   "answer":2,
+   "explain":"Exclusive ownership needs no lock, and the compiler enforces it. Shared ownership (<code>Arc</code>) only hands out shared references, so changing the data needs a <code>Mutex</code>, an <code>RwLock</code> or an atomic."},
+  {"id":"netcl-q3","type":"mcq","tags":["concurrency","domain"],
+   "q":"What went wrong when <code>pending</code> was keyed by <code>OutboundRequestId</code> alone?",
+   "options":["Each request/response behaviour numbers its requests from 1, so ids from different protocols collided; a second insert evicted the first entry and a reply could reach the wrong caller","Ids overflowed after 2^64 requests","The map grew without bound","Requests were sent twice"],
+   "answer":0,
+   "explain":"Keying by <code>(protocol, id)</code>, with <code>send_tracked</code> as the single insertion point, makes the key always name the behaviour that issued the id (commit <code>aa123758</code>)."},
+  {"id":"netcl-q4","type":"mcq","tags":["async","interior-mutability"],
+   "q":"In <code>resolve_dial_addrs</code>, the DNS memo (a <code>std::sync::Mutex</code>) is locked only after <code>lookup_host(…).await</code> has returned. What would go wrong if the guard were held across that <code>.await</code>?",
+   "options":["The lookup would be slower","Nothing","A <code>std</code> <code>MutexGuard</code> is not <code>Send</code>, so the future would not be <code>Send</code> and could not run inside <code>tokio::spawn</code>; it would also block other users for the whole lookup","The mutex would be poisoned"],
+   "answer":2,
+   "explain":"The compiler rejects non-<code>Send</code> futures in <code>tokio::spawn</code>. The general rule: never hold a <code>std</code> lock across an <code>.await</code>; use a tokio mutex if you must."},
+  {"id":"netcl-q5","type":"mcq","tags":["async","ownership"],
+   "q":"What does dropping the <code>JoinHandle</code> returned by <code>tokio::spawn</code> do to the task?",
+   "options":["It cancels the task","It blocks until the task finishes","It panics","It detaches the task, which keeps running; stopping it needs <code>abort()</code>, which is why <code>ServerDiscovery</code> and <code>DiscoveryGuard</code> abort in <code>Drop</code>"],
+   "answer":3,
+   "explain":"Unlike a dropped future, a spawned task belongs to the runtime. <code>JoinHandle::abort</code> cancels it at its next <code>.await</code>, dropping everything it owns (here the last <code>Arc&lt;Discv5&gt;</code>)."},
+  {"id":"netcl-q6","type":"mcq","tags":["domain"],
+   "q":"The host runs a gossipsub behaviour but never subscribes to a topic. Why is it there?",
+   "options":["To receive finality updates by gossip","So that the <code>/meshsub/</code> protocol negotiates: Lighthouse treats a failed gossipsub upgrade as fatal and bans the peer id for 12 h, and the whole IP after more than five banned ids","Because libp2p requires at least one pub/sub behaviour","To publish the wallet's own Status"],
+   "answer":1,
+   "explain":"The doc on <code>Behaviour::gossipsub</code> and the test <code>meshsub_negotiates_without_any_subscription</code> pin this. Negotiating the protocol is all Lighthouse checks; the mesh is never joined."},
+  {"id":"netcl-q7","type":"mcq","tags":["borrowing","concurrency"],
+   "q":"<code>ClPeerCache</code> has no lock inside. What prevents two writers from corrupting it?",
+   "options":["Its mutators take <code>&amp;mut self</code>, and the sync loop owns it as a local variable, so the compiler guarantees one writer; sharing it would require something like <code>Arc&lt;Mutex&lt;_&gt;&gt;</code>","Nothing; it's a bug","A file lock","tokio serialises all tasks"],
+   "answer":0,
+   "explain":"<code>&amp;mut</code> is exclusive by construction. Across processes, only the atomic temp-file plus rename protects the file, and the last writer wins."},
+  {"id":"netcl-q8","type":"open","tags":["async","concurrency","interior-mutability"],
+   "q":"In <code>consume_discovered</code>, a <code>std::sync::Mutex</code> guard is held while calling <code>tx.try_send(peer)</code>. Explain why that is acceptable, and why <code>tx.send(peer).await</code> would not be.",
+   "model":"<code>try_send</code> is synchronous and never blocks: it either enqueues immediately or fails with <code>Full</code>/<code>Closed</code>. The critical section (check <code>seen</code> via <code>classify_heard</code>, send, insert into <code>seen</code>) therefore stays short and contains no <code>.await</code>, so holding a <code>std</code> mutex there is safe and keeps check and insert atomic with respect to the lookup task. <code>send(peer).await</code> could suspend while the channel is full. Holding a <code>std</code> guard across that <code>.await</code> would block the lookup task, which needs the same lock, and would make the future non-<code>Send</code>, which <code>tokio::spawn</code> rejects. On <code>Full</code> the code deliberately does not mark the peer as seen, so it is emitted again when it is next heard.",
+   "points":["try_send never blocks, so there is no await inside the critical section","a std guard held across an await would block the other task that needs the lock","a std guard is not Send, so the future would not be Send and tokio::spawn rejects it","check, send and insert stay atomic; on Full the node is not marked seen"],
+   "context":"myotis-net/src/discovery.rs L451-495: comment 'try_send never blocks, so holding a std mutex across it is fine; nothing awaits while it is held.'; seen: Arc&lt;std::sync::Mutex&lt;HashSet&lt;NodeId>>> shared with run_lookups."},
+  {"id":"netcl-q9","type":"mcq","tags":["iterators-closures","traits-generics"],
+   "q":"<code>dial_order</code> runs <code>addrs.sort_by_key(is_quic)</code> for a peer on <code>TcpFirst</code>. What is the result?",
+   "options":["QUIC addresses first, because <code>true</code> sorts before <code>false</code>","TCP addresses first, because <code>false &lt; true</code>; the sort is stable, so the order within each transport is kept","A random order, because <code>sort_by_key</code> is unstable","It does not compile: <code>sort_by_key</code> needs a closure, not a function name"],
+   "answer":1,
+   "explain":"A function item can be passed wherever a closure with a matching signature is expected. <code>bool</code> implements <code>Ord</code> with <code>false &lt; true</code>, and <code>sort_by_key</code> is stable (use <code>sort_unstable_by_key</code> for the faster unstable variant)."},
+  {"id":"netcl-q10","type":"open","tags":["smart-pointers","ownership"],
+   "q":"<code>Discv5Ledger::live</code> stores <code>Weak&lt;TrafficMeter&gt;</code>, not <code>Arc&lt;TrafficMeter&gt;</code>, and <code>Discv5Share</code> implements <code>Drop</code>. Explain what each choice buys, and what happens to discv5 bytes when a meter's network stops.",
+   "model":"A <code>Weak</code> does not count as an owner, so registering a meter in the global ledger does not keep it alive: when the network's last <code>Arc&lt;TrafficMeter&gt;</code> goes away, the meter is freed even if it is still listed. <code>share_growth</code> prunes such entries with <code>strong_count() &gt; 0</code> and uses <code>Weak::upgrade</code> to get a temporary <code>Arc</code> for each live one. With <code>Arc</code> entries the static would keep every meter alive forever. <code>Discv5Share</code> is a token held by the discovery lookup task: its <code>Drop</code> runs when the task ends or is aborted, flushes the pending growth to the meters live until then, and removes its own entry (found with <code>ptr_eq</code>). From then on that meter receives no discv5 bytes; growth with no live meter is dropped.",
+   "points":["Weak does not keep the meter alive, unlike Arc in a static","upgrade() gives a temporary Arc for live meters; dead entries are pruned via strong_count","Drop on the share token unregisters automatically when the owning task ends or is aborted","Drop flushes first, so earlier bytes go to the meters live at that time"],
+   "context":"myotis-net/src/traffic.rs L100-172: static DISCV5: Mutex&lt;Discv5Ledger>; share_growth retains strong_count() > 0, filter_map(Weak::upgrade); Discv5Share::join pushes Arc::downgrade(meter); Drop flushes then swap_removes the entry where w.ptr_eq(&self.meter). discovery.rs: the share is moved into run_lookups as _traffic_share."},
+  {"id":"netcl-q11","type":"mcq","tags":["traits-generics","async"],
+   "q":"Why are the <code>LcResponder</code> methods plain <code>fn</code> returning <code>Option&lt;Vec&lt;u8&gt;&gt;</code>, not <code>async fn</code>?",
+   "options":["Traits cannot contain async methods","They are called from <code>respond_inbound</code>, which runs inline on the swarm task; an implementation that did I/O there would stall every connection, so it must be a cache read, and a miss is answered with <code>ResourceUnavailable</code>","Because <code>roost</code> has no tokio runtime","To avoid the <code>Send</code> bound"],
+   "answer":1,
+   "explain":"The event loop handlers never <code>.await</code>. The trait's doc spells out the contract: a pure cache read, <code>None</code> on a miss."},
+  {"id":"netcl-q12","type":"mcq","tags":["domain","testing"],
+   "q":"Before mplex was added, the Rust host could not reach Nimbus nodes. Why does the test helper <code>dial_outcome</code> wait for an Identify answer instead of <code>ConnectionEstablished</code>?",
+   "options":["Identify arrives earlier","<code>ConnectionEstablished</code> is never emitted for TCP","The dialer negotiates the muxer optimistically and reports the connection established even with no muxer in common; only a completed stream (the Identify exchange) proves a muxer was agreed","Identify carries the fork digest"],
+   "answer":2,
+   "explain":"The live Nimbus log showed exactly that shape: connection established, then closed with a decode error. The control test <code>a_yamux_only_host_cannot_connect_to_an_mplex_only_peer</code> keeps the helper honest."},
+  {"id":"netcl-q13","type":"open","tags":["ownership","enums-patterns"],
+   "q":"<code>request_raw_at</code> calls <code>self.request_in_order(peer, addrs.clone(), protocol, wire.clone())</code> and may call it a second time. Why the clones, and exactly when does the retry happen?",
+   "model":"<code>request_in_order</code> takes <code>addrs</code> and <code>wire</code> by value and consumes them. To be able to call it again, the first call must get copies, and the retry then moves the originals in. The retry happens only on <code>Err(Timeout)</code> or <code>Err(ConnectionClosed)</code>, and only if the peer was not on <code>TcpFirst</code> before the request, this walk did not put it there itself, and it is on <code>TcpFirst</code> now. That combination means the swarm task demoted the peer while the request was out (a QUIC timeout it closed with <code>demote_stalled_quic</code>, or a Nimbus agent), so the request was lost to a close made by this node. It is retried once, TCP first; any other outcome is returned unchanged.",
+   "points":["request_in_order takes Vec arguments by value, so a retry needs copies made before the first call","the retry moves the original addrs and wire, so they are not cloned twice","retry only on Timeout or ConnectionClosed","only when the peer became TcpFirst during this request, by the swarm, not before and not by this walk; at most once"],
+   "context":"myotis-net/src/reqresp.rs L630-659: let demoted_before = self.is_tcp_first(&peer); let (outcome, demoted_here) = self.request_in_order(peer, addrs.clone(), protocol, wire.clone()).await; match outcome { Err(RequestError::Timeout | RequestError::ConnectionClosed) if !demoted_before && !demoted_here && self.is_tcp_first(&peer) => self.request_in_order(peer, addrs, protocol, wire).await.0, outcome => outcome }"},
+  {"id":"netcl-q14","type":"mcq","tags":["error-handling","interior-mutability"],
+   "q":"Several locks in this stop are taken with <code>.lock().unwrap_or_else(|e| e.into_inner())</code> or <code>.read().unwrap_or_else(|e| e.into_inner())</code>. What does that do?",
+   "options":["It retries until the lock is free","It returns a default value when the lock is busy","It converts the lock into a tokio lock","If another thread panicked while holding the lock, the lock is poisoned and returns <code>Err(PoisonError)</code>; <code>into_inner()</code> takes the guard anyway, accepting data that a panic may have left half-updated"],
+   "answer":3,
+   "explain":"<code>std</code> locks record a panic in a critical section. For log labels, dial-order hints and byte counters a possibly inconsistent value is harmless, so the code proceeds instead of propagating the panic with <code>unwrap()</code>."}
+]</x-quiz>

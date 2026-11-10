@@ -93,7 +93,7 @@ Key Gradle modules:
   as release assets
   (`engine-library.yml`; `publishAllPublicationsToStagingRepository` +
   `scripts/check_engine_library.sh` verify the set; `publishToMavenLocal` for a
-  consumer under development). docs/android-library.md is the consumer page.
+  consumer under development). docs/guides/android-library.md is the consumer page.
   `io.myotis.engine.Myotis` is the entry point (`newEngine()`: the Rust engine
   with no loopback listener, for an in-process consumer); it re-exports
   `:myotis-api`, keeping `:myotis-engine-rust` implementation-only (host
@@ -152,7 +152,7 @@ Key Gradle modules:
   FFI-portable types only (byte[], String, long, double[], enums, flat records;
   blocking methods). Implemented by **node-core**'s `io.myotis.node.api` adapters
   (`JavaMyotisEngine`/`JavaChainHandle` over `ChainStack`/`NodeRegistry`). Designed so a Rust engine can replace the Java one behind the same
-  surface — see docs/reimplementation/05-engine-api-bindings.md.
+  surface — see docs/spec/05-engine-api-bindings.md.
 - **core** — Cryptographic identity (`NodeKey`), data types (`BlockHeader`), ENR decoding
 - **networking** — Three protocol layers, all Netty-based:
   - `discv4` — UDP peer discovery using Kademlia DHT (ping/pong/findnode/neighbors)
@@ -181,7 +181,7 @@ Key Gradle modules:
   `scripts/update_gradle_pins.sh` (then `--from-ci` for the macOS/Windows/arm64
   hashes the `gradle pins` workflow collects). Review the hash diff like code.
   Never "fix" a verification failure you did not cause by re-pinning — bytes
-  changed under a pinned version. docs/gradle-dependency-pins.md.
+  changed under a pinned version. docs/guides/gradle-dependency-pins.md.
 - **Tuweni 2.7.2** (upstream `io.consensys.tuweni`, Maven Central; original `org.apache.tuweni` packages) — RLP encoding, SECP256K1, byte utilities.
 - **Netty 4.2.x** — NIO-only (no epoll/kqueue). 4-thread `NioEventLoopGroup` for RLPx.
 - **BouncyCastle** — SECP256K1 crypto provider
@@ -212,7 +212,7 @@ Key Gradle modules:
   the Settings toggles for the BLS backend (`BlsBackends`), the
   engine (`Engines`), and Tor routing of account reads and of the wallet's
   own transaction broadcast (`Tor` —
-  docs/privacy-and-tor.md; Rust-engine-only, gated behind the Rust-engine
+  docs/how-it-works/privacy-and-tor.md; Rust-engine-only, gated behind the Rust-engine
   toggle, and behind the `-PtorEngine` build flag that links Arti into the host
   dylib and the Android jniLibs), the Rust log drain (`Engines.drainRustLogs` —
   hosts pump the engine's tracing ring into their log pipeline), and the Status
@@ -246,9 +246,18 @@ step skipped and none treated as optional or "only if asked"**:
    typing "please address the comment" for each one (owner ruling,
    2026-10-09, after a day of exactly that; a memory note had not made it
    stick, which is why it is here, in the step every PR goes through).
-   Elsewhere, use whatever the host offers to watch a PR
-   (`subscribe_pr_activity`). Then wait for CI + review feedback; do not
-   consider the task done at "pushed".
+   **In a claude.ai/code cloud session**, the same moment calls
+   `subscribe_pr_activity` (owner, repo, PR number) — that IS the session's
+   Auto-fix switch, and it is per PR and off by default there too. Do it
+   **without asking and without telling the owner to flip Auto-fix in the
+   UI**: this paragraph is the owner's standing, explicit request to turn on
+   auto-fix for EVERY PR a session opens in this repo (owner ruling,
+   2026-11-10, #745, after cloud sessions began stopping at "PR created" and
+   asking for the toggle). If the result says another Claude session already
+   watches the PR, this session gets no events: say so in the report, naming
+   that session, instead of reporting this session as watching it. Any other
+   host: use whatever it offers to watch a PR. Then wait
+   for CI + review feedback; do not consider the task done at "pushed".
 5. **Address the PR comments** — drive the PR to green and answer every review
    comment per the rules below, then keep watching until it is merged or closed.
    **MERGING IS THE OWNER'S ACTION — NEVER MERGE A PR YOURSELF** (owner ruling,
@@ -598,8 +607,8 @@ asset workflow and a stronger action than the merge this file already forbids.
    runner can reach them. The reminder is one: on a PR that changes the root
    `version`, the `PoC seeds` check (`poc-seeds.yml`) stays red until every
    seed was fetched within 72 hours — re-run it by hand after the RAILGUN
-   publish, which makes no commit. Details: docs/railgun-poc.md (*Refreshing the seed*),
-   docs/bee-rpc-service.md (*seeding from a full node*).
+   publish, which makes no commit. Details: docs/guides/railgun-poc.md (*Refreshing the seed*),
+   docs/guides/bee-rpc-service.md (*seeding from a full node*).
 
 ## Demo bundles build on merge to `main`, never on PRs
 
@@ -807,7 +816,7 @@ that produced this note.
 - the only sources for data are devp2p and libp2p calling a local client via http may only be used for debugging purposes it is not an option for production
 - **Carve-out for myotis-operated serving infrastructure (owner's decision,
   2026-08-08).** The rule above governs the **wallet**. `roost`, the dedicated
-  light-client server (`rust/roost`, docs/lc-server-design.md), MAY source
+  light-client server (`rust/roost`, docs/design-history/lc-server-design.md), MAY source
   *self-verifying* consensus objects — LC bootstrap, updates, finality and
   optimistic updates — from a local beacon node over loopback REST, and does
   NOT verify them itself. The verification happens in myotis: a bootstrap is
@@ -845,7 +854,7 @@ that produced this note.
   seed that withholds or alters a commitment understates the balance with no
   error; a replaced Shield ciphertext or a withheld nullifier overstates it.
   Detail, the client-side checks that would close most of it, and the
-  preconditions: docs/seeded-log-histories.md.
+  preconditions: docs/how-it-works/seeded-log-histories.md.
   Two boundaries this carve-out does **not** cross:
   - **The client's root check is load-bearing, and must actually run.** No
     on-chain root, or a client that skips the check, keeps the walk — kohaku's
@@ -855,7 +864,7 @@ that produced this note.
     seed is not a production path until the index marks its provenance. Nor
     does this rule let this repo's own tooling GENERATE a seed from a node
     over JSON-RPC — that stays open, and the RAILGUN PoC's seed stays DEBUG /
-    DEMO (docs/railgun-poc.md).
+    DEMO (docs/guides/railgun-poc.md).
 - **TrueBlocks Unchained Index mainnet publishing appears stalled.** The designated
   publisher (`publisher.unchainedindex.eth`) last published a mainnet manifest indexed
   to ~block 23.0M (mid-2025); as of mid-2026 that is ~a year behind the head, and the

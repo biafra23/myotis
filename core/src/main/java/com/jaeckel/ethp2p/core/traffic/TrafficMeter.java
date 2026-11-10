@@ -4,7 +4,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * One network stack's bytes on the wire, by layer — the Java engine's twin of the
- * Rust engine's {@code myotis_net::traffic::TrafficMeter} (docs/data-usage.md).
+ * Rust engine's {@code myotis_net::traffic::TrafficMeter} (docs/how-it-works/data-usage.md).
  * Monotonic: the counts only ever grow.
  */
 public final class TrafficMeter {

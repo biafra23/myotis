@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 900 300" role="img" fill="currentColor" aria-label="Prefetch loop. Run revm, in sentinel mode while still discovering, where missing state becomes a counted zero placeholder. A sentinel run that handed out no placeholder and did not fail is the answer at once. Otherwise diff the accessed state against what was already seen. If nothing new was touched, a real run returns its answer and a sentinel run ends discovery. Otherwise fetch all fresh reads, plus the code of contracts the run called or inspected, in one parallel verified wave into the shared caches, and run again. At most twelve iterations; discovery also ends at the oracle's time bound or two runs before the cap. Hitting the cap fails with IterationLimitExceeded." width="900" height="300">
+      <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="900.0" height="300.0" fill="#f8fafb" /><defs>
+        <marker id="m-stop07-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+        </marker>
+      </defs>
+      <rect x="20" y="80" width="210" height="76" rx="10" stroke-width="1.5" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="125" y="106" text-anchor="middle" font-size="13" font-weight="700">run revm</text>
+      <text x="125" y="125" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">sentinel while discovering:</text>
+      <text x="125" y="141" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">miss → zero, counted, uncached</text>
+
+      <rect x="280" y="80" width="190" height="76" rx="10" stroke-width="1.5" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="375" y="106" text-anchor="middle" font-size="13" font-weight="700">diff accesses</text>
+      <text x="375" y="125" text-anchor="middle" font-size="11" class="mono" style="fill:var(--ink-2)">fresh = touched − seen</text>
+      <text x="375" y="141" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">accounts · slots · code</text>
+
+      <path d="M580 80 L640 118 L580 156 L520 118 Z" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="580" y="114" text-anchor="middle" font-size="11.5" font-weight="700">fresh</text>
+      <text x="580" y="129" text-anchor="middle" font-size="11.5" font-weight="700">empty?</text>
+
+      <rect x="690" y="80" width="190" height="76" rx="10" stroke-width="1.5" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="785" y="104" text-anchor="middle" font-size="13" font-weight="700">prefetch wave</text>
+      <text x="785" y="122" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">fresh reads + code of called</text>
+      <text x="785" y="137" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">contracts, in parallel, verified,</text>
+      <text x="785" y="151" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">into the shared caches</text>
+
+      <rect x="490" y="226" width="180" height="46" rx="10" stroke-width="1.5" style="fill:var(--ok-wash);stroke:var(--ok)" />
+      <text x="580" y="254" text-anchor="middle" font-size="12.5" font-weight="700">answer (result / revert)</text>
+
+      <line x1="230" y1="118" x2="277" y2="118" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop07-arrow)" />
+      <line x1="470" y1="118" x2="517" y2="118" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop07-arrow)" />
+      <line x1="640" y1="118" x2="687" y2="118" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop07-arrow)" />
+      <text x="664" y="110" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">no</text>
+      <line x1="580" y1="156" x2="580" y2="223" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop07-arrow)" />
+      <text x="590" y="182" font-size="11" style="fill:var(--ink-2)">yes · real run: answer</text>
+      <text x="590" y="198" font-size="11" style="fill:var(--ink-2)">(sentinel run: discovery ends)</text>
+      <path d="M125 156 V249 H487" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop07-arrow)" />
+      <text x="140" y="196" font-size="11" style="fill:var(--ink-2)">sentinel run with no placeholder</text>
+      <text x="140" y="212" font-size="11" style="fill:var(--ink-2)">and no error: answer at once</text>
+      <path d="M785 80 V46 H125 V77" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop07-arrow)" />
+      <text x="455" y="38" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">next iteration · at most 12 · discovery stops at an empty diff, at the oracle's time bound, or two runs before the cap</text>
+      <text x="20" y="290" font-size="11" style="fill:var(--ink-3)">a real run's error is the answer · cap reached →</text>
+      <text x="292" y="290" font-size="11" class="mono" style="fill:var(--bad)">IterationLimitExceeded</text>
+    </svg>

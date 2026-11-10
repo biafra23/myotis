@@ -2,7 +2,7 @@ package io.myotis.ui
 
 /**
  * Data-usage wording shared by the Status screen and the Android node notification
- * (docs/data-usage.md). Pure text over the engine's figures, so every host words the
+ * (docs/how-it-works/data-usage.md). Pure text over the engine's figures, so every host words the
  * same numbers the same way.
  */
 object DataUsageText {

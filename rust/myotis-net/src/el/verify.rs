@@ -1,6 +1,6 @@
 //! The verified-read trust anchor (EL-A7), twin of the Java
 //! `node-core.VerifiedAccountQuery`/`VerifiedStorageQuery` ladder
-//! (docs/reimplementation/04 §2.1, README §3). Ties a peer-served state root
+//! (docs/spec/04 §2.1, README §3). Ties a peer-served state root
 //! to the beacon chain via `stateRootMatch` (fast path) or the `headerChain`
 //! walk, producing the exact `verifyMethod`/`failReason` tokens the operator
 //! tooling and integration tests grep for.

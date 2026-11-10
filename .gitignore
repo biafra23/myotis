@@ -7,7 +7,7 @@ build/
 local.properties
 
 # Signing keys. The release key lives only in the android-release environment's
-# secrets (docs/android-release-signing.md); the debug keystore is committed on
+# secrets (docs/guides/android-release-signing.md); the debug keystore is committed on
 # purpose and tracked, which an ignore rule does not undo.
 *.p12
 *.jks

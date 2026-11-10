@@ -16,7 +16,7 @@ import java.util.regex.Pattern;
 
 /**
  * One network's data usage by local day — the Java engine's twin of the Rust
- * engine's {@code usage::UsageLedger} (docs/data-usage.md), with the same file.
+ * engine's {@code usage::UsageLedger} (docs/how-it-works/data-usage.md), with the same file.
  *
  * <p>The byte counts come from a {@link Meter} that only ever grows. Each
  * {@link #tick} adds its growth since the previous tick to the current LOCAL day,

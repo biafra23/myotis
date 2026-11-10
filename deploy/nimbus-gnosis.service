@@ -19,7 +19,7 @@ User=nimbus
 # NO --history FLAG, so the default (prune) applies. Archive mode on a chain
 # this size is a multi-day, multi-hundred-GB commitment that buys a permanently
 # slower startup, and it is not how the deep archive is meant to be held:
-# docs/lc-server-design.md keeps periods below this node's floor in roost's own
+# docs/design-history/lc-server-design.md keeps periods below this node's floor in roost's own
 # ~36 MB append-only archive instead.
 #
 # discv5 stays ON and peer limits stay stock. The sepolia node runs unlisted with

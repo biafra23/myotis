@@ -1,5 +1,5 @@
 //! snap sub-protocol messages (EL-A6), twin of the Java
-//! `networking.snap.messages` package (docs/reimplementation/02 §7).
+//! `networking.snap.messages` package (docs/spec/02 §7).
 //!
 //! Pure encode/decode; the verify-on-fetch flow lives in [`super::fetch`].
 //! Snap uses `GetAccountRange`/`GetStorageRanges` (which return full

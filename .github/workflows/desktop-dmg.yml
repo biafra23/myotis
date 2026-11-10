@@ -81,7 +81,7 @@ jobs:
       # Two flavours: the regular app, and the Bee PoC build (-PbeePoc) that
       # bundles the Gnosis PostageStamp log-index seed so a Swarm Bee full node
       # can use it from the first minute (app-desktop/build.gradle.kts,
-      # docs/bee-rpc-service.md). The PoC leg (arm64) runs on pushes to main
+      # docs/guides/bee-rpc-service.md). The PoC leg (arm64) runs on pushes to main
       # and on release tags, NOT on PRs — the rule for every demo bundle
       # (CLAUDE.md, "Demo bundles"; railgun-dmg.yml is the other one): a merge
       # to main refreshes the artifact the demo machine pulls, while on a PR

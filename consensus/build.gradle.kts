@@ -29,7 +29,7 @@ dependencies {
     // proof tests build fixtures with it, so BouncyCastle must be on the test path.
     testImplementation(libs.bouncycastle)
     // BLS acceleration benchmark: jblst (blst JNI) vs the pure-Java Milagro path.
-    // Test scope only — not shipped; see docs/bls-rust-acceleration.md.
+    // Test scope only — not shipped; see docs/design-history/bls-rust-acceleration.md.
     testImplementation(libs.jblst)
     testRuntimeOnly(libs.logback.classic)
 }

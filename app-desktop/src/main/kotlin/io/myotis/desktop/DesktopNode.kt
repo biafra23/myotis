@@ -464,7 +464,7 @@ class DesktopNodeController(
 
     override fun applyTorMode() {
         // Push the persisted Tor preference to the process-global Rust-engine flag
-        // (docs/privacy-and-tor.md). Tor is Rust-engine-only and experimental: Tor.select
+        // (docs/how-it-works/privacy-and-tor.md). Tor is Rust-engine-only and experimental: Tor.select
         // returns whether the loaded engine build actually supports it, which we log so a
         // silently-unsupported build is visible. Unlike the engine choice, the Tor flag is
         // LIVE — ElReader checks it per read, so a flip takes effect on the next read of an
@@ -908,7 +908,7 @@ class DesktopNodeController(
         engine.hostedNetworks().mapNotNull { name -> engine.get(name)?.let { webOriginRows(name, it) } }
 
     /**
-     * Tor routing state for the Status row (docs/privacy-and-tor.md), or null when it
+     * Tor routing state for the Status row (docs/how-it-works/privacy-and-tor.md), or null when it
      * doesn't apply: Tor is a Rust-engine-only capability, and a Rust build without
      * `--features tor` reports no support (status bit0 clear). Otherwise: "off" (supported
      * but disabled), "on" (enabled, circuit still bootstrapping), "active" (circuit ready).
@@ -1003,7 +1003,7 @@ class DesktopSettings(
     // Default off = the selector's `auto` mode (Rust engine where it can serve, Java
     // fallback). On = force the Java engine — the opt-out, now that Rust is primary.
     private var preferJava = false
-    // Tor verified-read routing (docs/privacy-and-tor.md) — experimental, Rust-engine-only,
+    // Tor verified-read routing (docs/how-it-works/privacy-and-tor.md) — experimental, Rust-engine-only,
     // off by default. Persists independently; applyTorMode() pushes it to the Rust engine.
     private var torRouting = false
     // Expert mode (Logs/Index tabs, full Status rows, advanced settings); off by default.

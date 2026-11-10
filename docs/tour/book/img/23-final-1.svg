@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 960 372" role="img" fill="currentColor" aria-label="The path of one verified account read. 1: Java RustChainHandle.requestAccount calls the generated Kotlin. 2: ffi.rs calls host.rs, which clones the Arc of the reader under the handle-map lock and releases it. 3: the caller's thread blocks in rt.block_on on reader.request; a followed account is answered from block access lists, otherwise a hedged read races snap peers. 4: ManagedPeer registers a oneshot sender under the request id and sends the frame under the writer lock. The snap peer replies; 5: the peer's read task on a runtime thread decodes the frame and completes the oneshot, waking the blocked future. 6: the account proof is verified against the state root and the root is tied to the beacon chain through the ExecAnchor, which the consensus sync task keeps updated. 7: eljson serializes the result. 8: the JSON string returns to Kotlin and is parsed into AccountProofResult." width="960" height="372">
+    <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="960.0" height="372.0" fill="#f8fafb" /><defs>
+      <marker id="m17-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+      </marker>
+    </defs>
+    <rect x="10" y="44" width="940" height="142" rx="10" stroke-width="1" style="fill:var(--surface);stroke:var(--rule)" />
+    <rect x="10" y="240" width="940" height="124" rx="10" stroke-width="1" style="fill:var(--surface);stroke:var(--rule)" />
+    <g font-size="10.5" style="fill:var(--ink-3)">
+      <text x="22" y="179">caller's thread (a JVM worker): parked in block_on while the request future is polled on it</text>
+      <text x="22" y="357">tokio runtime threads · the network</text>
+    </g>
+    <g font-size="11.5">
+      <rect x="20" y="62" width="130" height="92" rx="7" stroke-width="1.5" style="fill:var(--jvm-wash);stroke:var(--jvm)" />
+      <text x="85" y="84" text-anchor="middle" font-weight="700" style="fill:var(--jvm-ink)">① Java</text>
+      <text x="85" y="104" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">RustChainHandle</text>
+      <text x="85" y="120" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">.requestAccount</text>
+      <text x="85" y="136" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">→ Kotlin → JNA</text>
+
+      <rect x="178" y="62" width="130" height="92" rx="7" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="243" y="84" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">② ffi → host</text>
+      <text x="243" y="104" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">parse address</text>
+      <text x="243" y="120" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">lock → Arc clone</text>
+      <text x="243" y="136" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">→ unlock</text>
+
+      <rect x="336" y="62" width="130" height="92" rx="7" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="401" y="84" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">③ block_on</text>
+      <text x="401" y="104" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">followed? else</text>
+      <text x="401" y="120" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">hedged_read</text>
+      <text x="401" y="136" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">(90 s Operation)</text>
+
+      <rect x="494" y="62" width="130" height="92" rx="7" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="559" y="84" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">④ ManagedPeer</text>
+      <text x="559" y="104" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">pending[id] = tx</text>
+      <text x="559" y="120" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">send_frame</text>
+      <text x="559" y="136" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">await rx</text>
+
+      <rect x="652" y="62" width="130" height="92" rx="7" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="717" y="84" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">⑥ verify</text>
+      <text x="717" y="104" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">MPT proof</text>
+      <text x="717" y="120" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">verified_state_root</text>
+      <text x="717" y="136" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">→ VerifiedAccount</text>
+
+      <rect x="810" y="62" width="130" height="92" rx="7" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="875" y="84" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">⑦ eljson</text>
+      <text x="875" y="104" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">account_json</text>
+      <text x="875" y="120" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">→ owned String</text>
+      <text x="875" y="136" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">→ RustBuffer</text>
+
+      <rect x="336" y="264" width="120" height="66" rx="7" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)" />
+      <text x="396" y="292" text-anchor="middle" font-weight="700">snap peer</text>
+      <text x="396" y="310" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">over RLPx/TCP</text>
+
+      <rect x="500" y="264" width="282" height="66" rx="7" stroke-width="1.5" style="fill:var(--surface);stroke:var(--oxide)" />
+      <text x="641" y="290" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">⑤ peer read task (spawned)</text>
+      <text x="641" y="310" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">decode frame → pending.remove(id) → tx.send</text>
+
+      <rect x="810" y="264" width="130" height="66" rx="7" stroke-width="1.5" style="fill:var(--surface);stroke:var(--ink-3)" />
+      <text x="875" y="290" text-anchor="middle" font-weight="700">ExecAnchor</text>
+      <text x="875" y="310" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">fed by CL sync task</text>
+    </g>
+    <g stroke-width="1.5" fill="none" style="stroke:currentColor">
+      <line x1="150" y1="108" x2="174" y2="108" marker-end="url(#m17-arrow)" />
+      <line x1="308" y1="108" x2="332" y2="108" marker-end="url(#m17-arrow)" />
+      <line x1="466" y1="108" x2="490" y2="108" marker-end="url(#m17-arrow)" />
+      <line x1="782" y1="108" x2="806" y2="108" marker-end="url(#m17-arrow)" />
+      <line x1="530" y1="154" x2="436" y2="260" marker-end="url(#m17-arrow)" />
+      <line x1="456" y1="297" x2="496" y2="297" marker-end="url(#m17-arrow)" />
+      <line x1="717" y1="264" x2="717" y2="158" marker-end="url(#m17-arrow)" />
+      <line x1="860" y1="264" x2="770" y2="158" marker-end="url(#m17-arrow)" />
+    </g>
+    <path d="M875,62 C875,14 85,14 85,58" stroke-width="1.3" stroke-dasharray="5 4" fill="none" marker-end="url(#m17-arrow)" style="stroke:var(--ok)" />
+    <g font-size="10.5" style="fill:var(--ink-3)">
+      <text x="480" y="22" text-anchor="middle" style="fill:var(--ok)">⑧ JSON string back to Kotlin → parsed into AccountProofResult</text>
+      <text x="470" y="212" text-anchor="end">GetAccountRange</text>
+      <text x="476" y="289" text-anchor="middle">reply</text>
+      <text x="710" y="226" text-anchor="end">oneshot: wakes ③</text>
+      <text x="836" y="226">anchored roots</text>
+    </g>
+  </svg>

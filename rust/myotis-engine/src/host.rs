@@ -227,7 +227,7 @@ fn config_for(network_name: &str) -> Option<ChainConfig> {
 }
 
 /// `nativeSetTorEnabled`: turn Tor verified-read routing on/off
-/// (docs/privacy-and-tor.md). Returns `true` when this engine build actually
+/// (docs/how-it-works/privacy-and-tor.md). Returns `true` when this engine build actually
 /// supports Tor (`--features tor`), `false` when it doesn't — so a host can grey
 /// out the toggle rather than pretend it works. A no-op when Tor isn't compiled.
 pub fn set_tor_enabled(on: bool) -> bool {
@@ -752,7 +752,7 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
         .and_then(|p| p.parent())
         .map(|dir| dir.join(format!("peers{el_suffix}.cache")));
     // The eth_getLogs watch-list index, same dataDir + suffix convention
-    // (docs/eth-getlogs-design.md). None (no dataDir) → memory-only index.
+    // (docs/design-history/eth-getlogs-design.md). None (no dataDir) → memory-only index.
     let log_index_path = config
         .snapshot_path
         .as_deref()
@@ -3909,7 +3909,7 @@ fn status_object(
             None => serde_json::Value::Null,
         },
     );
-    // Data usage (docs/data-usage.md): this handle's bytes since it was
+    // Data usage (docs/how-it-works/data-usage.md): this handle's bytes since it was
     // created, by layer, and the local day's figures with their metered part.
     obj.insert(
         "dataUsage".into(),
@@ -5282,7 +5282,7 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// eth_getLogs (docs/eth-getlogs-design.md): watch-list config install, index
+// eth_getLogs (docs/design-history/eth-getlogs-design.md): watch-list config install, index
 // status, and the coverage-honest query. All JSON in / JSON out, panic-free.
 // ---------------------------------------------------------------------------
 

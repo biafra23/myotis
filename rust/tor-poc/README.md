@@ -1,7 +1,7 @@
 # tor-poc — Tor integration proof of concept
 
 A runnable proof of concept for the network-privacy design in
-[`docs/privacy-and-tor.md`](../../docs/privacy-and-tor.md). It exercises the
+[`docs/how-it-works/privacy-and-tor.md`](../../docs/how-it-works/privacy-and-tor.md). It exercises the
 load-bearing technical claims of that design against the **live Ethereum
 mainnet**, so we know they hold before committing to a production build.
 

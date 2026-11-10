@@ -1,6 +1,6 @@
 name: RAILGUN PoC DMG (macOS arm64)
 
-# The RAILGUN PoC flavour's installer (docs/railgun-poc.md). Separate from
+# The RAILGUN PoC flavour's installer (docs/guides/railgun-poc.md). Separate from
 # desktop-dmg.yml because this flavour's seeds are NOT in the repo: mainnet's is
 # ~438k logs over 11.4M blocks, ~589 MB raw (~120 MB gzipped), which is over
 # GitHub's per-file limit for the tree and does not belong in a clone anyway.
@@ -53,7 +53,7 @@ jobs:
             # here is the asset missing, not a network blip.
             code=$(curl --silent --head --location --output /dev/null --write-out '%{http_code}' --retry 3 "$url" || echo 000)
             [ "$code" = "200" ] || {
-              echo "::error::the seed asset is not reachable (HTTP $code): $url — publish it to the railgun-seed release, or set RAILGUN_SEED_URL / RAILGUN_SEPOLIA_SEED_URL (docs/railgun-poc.md, CI)"
+              echo "::error::the seed asset is not reachable (HTTP $code): $url — publish it to the railgun-seed release, or set RAILGUN_SEED_URL / RAILGUN_SEPOLIA_SEED_URL (docs/guides/railgun-poc.md, CI)"
               exit 1
             }
           done

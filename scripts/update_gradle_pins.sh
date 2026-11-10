@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Regenerate the Gradle dependency pins (#734): the per-project lockfiles
 # (gradle.lockfile, buildscript-gradle.lockfile, settings-gradle.lockfile) and
-# gradle/verification-metadata.xml. docs/gradle-dependency-pins.md is the
+# gradle/verification-metadata.xml. docs/guides/gradle-dependency-pins.md is the
 # narrative; this is the one command it points to.
 #
 #   scripts/update_gradle_pins.sh            this host: locks + hashes

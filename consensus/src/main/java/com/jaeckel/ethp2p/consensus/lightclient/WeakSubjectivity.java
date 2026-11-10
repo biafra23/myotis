@@ -51,7 +51,7 @@ public final class WeakSubjectivity {
      * {@code wallClockPeriod}. A wall clock behind the anchor (negative age — clock
      * skew) is treated as fresh: a backwards clock can only make the check
      * <i>more</i> permissive, and defending the device clock is outside this
-     * threat model (documented in docs/readiness-and-verified-head-age.md).
+     * threat model (documented in docs/how-it-works/readiness-and-verified-head-age.md).
      */
     public static boolean isStale(long anchorPeriod, long wallClockPeriod, long boundPeriods) {
         return wallClockPeriod - anchorPeriod > boundPeriods;

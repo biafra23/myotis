@@ -14,7 +14,7 @@ license = "MIT OR Apache-2.0"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# Tor verified-read routing (docs/privacy-and-tor.md) — OFF by default. `-PtorEngine`
+# Tor verified-read routing (docs/how-it-works/privacy-and-tor.md) — OFF by default. `-PtorEngine`
 # enables it in the host dylib (`cargoBuildHost`) and the Android jniLibs
 # (`cargoNdkAndroid`, via build-android.sh's MYOTIS_TOR_ENGINE) so the desktop and
 # Android apps can offer the Settings toggle; iOS builds never do. The

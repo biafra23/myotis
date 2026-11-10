@@ -1,0 +1,407 @@
+<!--meta {"id":"stop-14","num":14,"title":"myotis-net, part 6: the verified reader","short":"net · verified reader","sub":"reader.rs · 18,846 lines","part":"myotis-net: all the I/O"} -->
+<header class="stop-head">
+  <div class="eyebrow">Stop 14 · crate <code>myotis-net</code>, <code>src/el/reader.rs</code> <span>1 file · 18,846 lines · about 185 minutes</span></div>
+  <h1>myotis-net, part 6: the verified reader</h1>
+  <p class="lede"><code>ElReader</code> is where the execution layer comes together. It combines discv4, the peer pool and the beacon-fed <code>ExecAnchor</code> into verified wallet reads (accounts, storage, proofs, code, <code>eth_call</code> and friends, ENS, blocks, receipts, fees, transactions), the transaction send path, and the engine behind the <code>eth_getLogs</code> index. Since September the file has more than doubled, to 18,846 lines. Most of the growth is new subsystems: a per-head fee memo with a background follower, an address-activity follower that reads block access lists, a judged and Tor-capable send path, finalized-state reads, and a log index that survives restarts with a finality claim. Read it with the section map. This stop is about how it is <em>built</em>: which lock guards what, which tasks own what, and how work is cancelled.</p>
+</header>
+
+<div class="learn">
+  <h2>Rust you will practise</h2>
+  <div><b>One struct, many locks</b>a <code>&amp;self</code>-only API behind <code>Arc</code>: <code>std</code> vs tokio mutexes, data-less <code>Mutex&lt;()&gt;</code> tokens, owned guards, semaphores, <code>Notify</code>, a documented lock order.</div>
+  <div><b>Racing and detaching</b><code>FuturesUnordered</code> + <code>select!</code>; a dropped future is cancelled, a dropped <code>JoinHandle</code> is not.</div>
+  <div><b>Background tasks without leaks</b><code>self: &amp;Arc&lt;Self&gt;</code>, a <code>Weak</code> in each follower, <code>'static</code> spawns that own their data, drop guards, paused-clock tests.</div>
+</div>
+
+<section class="prose">
+  <h2>What changed since September</h2>
+  <p>The old tour read this file at 8,914 lines. The structure it described is still there (configuration, result types, hedging, the struct, construction, state reads, EVM reads, blocks, writes, receipts, the log index, tests), but each part grew and several new parts arrived:</p>
+  <ul>
+    <li><strong>Finalized reads.</strong> Most reads take a <code>ReadAnchor</code> (<code>Head</code> or <code>Finalized</code>). A finalized read is proven against the beacon-finalized state root with no fallback to any other root. <code>eth_getProof</code> (<code>get_proof</code>) is new.</li>
+    <li><strong>More EVM entry points.</strong> <code>eth_call</code> for a full transaction object, <code>eth_createAccessList</code>, <code>trace_call</code> and <code>simulate</code>, all on the same setup.</li>
+    <li><strong>The send path judges and detaches.</strong> <code>send_raw_transaction</code> refuses non-transactions and other chains' transactions, refuses a transaction the sender provably cannot pay for (a pre-broadcast check on fresh, verified state), answers at the first peer write that lands (<code>first_accepted</code>), and in Tor mode sends only over Tor.</li>
+    <li><strong>The fee memo.</strong> Fee reads are answered from a per-head memo, kept fresh by a fee follower task, with single-flight computes and bounded waits.</li>
+    <li><strong>The address-activity follower</strong> (#691) keeps verified headers for watched addresses and answers some account reads from block access lists (BALs) with no peer request at all.</li>
+    <li><strong>Peer bookkeeping in races.</strong> A hedged race now also reports peers the winner <em>outpaced</em>, and block/receipt reads defer strikes during tip lag.</li>
+    <li><strong>Log index.</strong> Receipts-first candidate fetches, a separate chunk sizer for the head side, unwatch, a restart finality claim, and many more pure policy functions with their own test modules.</li>
+    <li><strong>Pause and resume.</strong> <code>ElCarry</code> carries the node key and pool memory from a paused reader to the one that resumes it.</li>
+  </ul>
+</section>
+
+<x-file path="rust/myotis-net/src/el/reader.rs" kind="library" twin="VerifiedAccountQuery / VerifiedRpcBackend">
+  <p class="purpose">One <code>ElReader</code> per hosted chain. It owns a discv4 service and a snap/eth <code>PeerPool</code>, and shares the light client's <code>ExecAnchor</code>, the only trust bridge from consensus to execution. <strong>State reads</strong> check Merkle-Patricia proofs against a state root, then tie that root to the beacon chain (<code>stateRootMatch</code> or <code>headerChain</code>). An unverifiable state read still returns <code>Ok</code>, with the reason in <code>fail_reason</code>. <strong>Block, receipt, fee and transaction reads</strong> check that a header window hash-links to a beacon-anchored block (the optimistic head, or the finalized block), then check the trie roots. For those reads, returning a result at all <em>is</em> the verification. The file also holds the send path and the whole log-index engine.</p>
+  <x-code src="myotis-net/src/el/reader.rs" from="1" to="20"></x-code>
+  <p class="code-note"><x-tags>domain</x-tags> The module doc still describes the five-step state-read ladder. Step 2 is new since September: a read picks either the optimistic root (head read) or the finalized root (<code>finalized</code> tag). The doc explains why a finalized read can fail: geth keeps about 128 recent states, and finality trails the head by 64–96 blocks, so a finality delay pushes the finalized state out of what peers still hold.</p>
+
+  <h4>Section map</h4>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–51</td><td>Module doc (the read ladder), imports.</td></tr>
+      <tr><td>53–192</td><td><code>ElConfig</code>; the dedicated Sepolia enode; <code>parse_enode</code> (strict, for host-pushed pins) and <code>parse_boot_enodes</code> (lenient, for shipped pins); <code>fork_filter_for</code> (the discv4 fork-id filter on the chain's epoch grid).</td></tr>
+      <tr><td>194–388</td><td><code>impl ElConfig</code>: <code>mainnet()</code> (bootnodes re-synced from geth 2026-10-04, EIP-1459 DNS tree), <code>sepolia()</code>, <code>gnosis()</code>, and the new <code>chiado()</code>.</td></tr>
+      <tr><td>390–470</td><td><code>SendError</code> (Refused / Rejected / Unavailable), <code>judge_read</code> and <code>PreBroadcast</code>: the pre-broadcast verdict on the sender's account.</td></tr>
+      <tr><td>472–640</td><td>Result types: <code>VerifiedAccount</code>, <code>VerifiedStorage</code>, <code>VerifiedCode</code>, <code>VerifiedBlock</code>; <code>account_fact</code>, <code>StorageSnapCost</code> (shadow-cache inputs), <code>BlockDepth</code>.</td></tr>
+      <tr><td>641–700</td><td>Block lookback (512), hash-scan depth (64), the tip-lag retry policy, <code>all_tip_lag</code>, <code>PoolReadError</code> (Fatal vs TipLag with deferred strikes).</td></tr>
+      <tr><td>702–810</td><td>Receipt-scan constants (lookback, per-poll cap, TTL, deadline, bodies in flight), <code>VerifiedReceipt</code>, <code>VerifiedTransaction</code>, LRU caps, the 20 s rebroadcast interval.</td></tr>
+      <tr><td>811–950</td><td>Log-index head-follow constants (<code>APPEND_WINDOW</code>, stall ticks, bridge and tail limits, backfill yield), <code>backfill_should_yield</code>, <code>AppendStall</code>.</td></tr>
+      <tr><td>951–1022</td><td><code>SentTxState</code>, <code>SentTx</code>, <code>RebroadcastRoute</code> and <code>rebroadcast_route</code>, <code>tor_routing_on</code>, with a test.</td></tr>
+      <tr><td>1023–1152</td><td><code>UnwatchError</code>, <code>BridgePlan</code> (descend, then ascend), <code>TxLookup</code>, <code>Found</code>, <code>raw_at</code> (+ test), <code>TxLocation</code>, <code>TxScanState</code>, the tip sample size.</td></tr>
+      <tr><td>1153–1298</td><td>Hedging constants: <code>HEDGE_DELAY</code> (3 s), <code>BULK_HEDGE_DELAY</code> (6 s) and <code>block_hedge_delay</code>, the 5 s on-demand fill deadline with compile-time <code>const _: () = assert!(…)</code> checks, <code>MAX_HEDGED_ATTEMPTS</code> (3), <code>RaceOutcome</code>.</td></tr>
+      <tr><td>1299–1589</td><td>Broadcast helpers: <code>first_accepted</code>, <code>rotated_take</code>, <code>tor_candidates</code>, <code>TorBroadcast</code>, <code>tor_broadcast</code>, <code>broadcast_pushes</code> (+ paused-clock tests), <code>TorRebroadcastGuard</code>.</td></tr>
+      <tr><td>1590–1787</td><td><strong><code>hedged_race</code></strong>; <code>BlockAttempt</code>; <code>PoolRaceVerdict</code> and <code>pool_race_verdict</code> (who gets struck, excused or credited); <code>race_served_by_winner</code>.</td></tr>
+      <tr><td>1788–2045</td><td>Tor bounds; fee and activity constants; <code>ActivityBalStats</code>; <code>FeeHistoryError</code>, <code>BlockFromError</code>, <code>FeeBuildError</code> (no <code>From&lt;String&gt;</code>, on purpose); <code>summarize_peer_failures</code>; <code>FeeHistory</code>, <code>FeeEstimate::raised_for</code>.</td></tr>
+      <tr><td>2046–2275</td><td>The <strong><code>ElReader</code> struct</strong> (47 fields), <code>TxScanMap</code>, the EVM proof-cache size, the ENS attempt deadline.</td></tr>
+      <tr><td>2276–2521</td><td>Request budgets (<code>request</code>, <code>request_with_budget</code>, <code>cancel_requests</code>); construction (<code>start_mainnet</code>, <code>start_for</code>, <code>start_carried</code>, <code>start</code>, <code>start_inner</code>).</td></tr>
+      <tr><td>2522–3300</td><td>Log-index configuration: <code>set_log_index_config</code> (additive union, refused push is a no-op), <code>unwatch_log_index</code>, activation from disk, <code>export_log_index</code>, <code>import_log_index</code>.</td></tr>
+      <tr><td>3301–3458</td><td><code>stop_log_index_appender</code>, <strong><code>ensure_log_index_appender</code></strong> (the 6 s background task), <code>log_index_name_tick</code> (ENS reverse names for unnamed entries).</td></tr>
+      <tr><td>3459–3678</td><td>The finalized per-block append tick; <code>advance_log_index_tail_now</code> (the on-demand fill, 5 s deadline).</td></tr>
+      <tr><td>3679–4059</td><td>The optimistic tail: <code>log_index_tail_tick</code> (reorg detection against its own record, rewind), <code>log_index_rewind_to</code>.</td></tr>
+      <tr><td>4060–4436</td><td>Checkpoints: <code>persist_log_index</code>, clamp, restart-claim bookkeeping (<code>write_own_checkpoint</code>, <code>publish_finality_claim</code>, <code>settle_restart_claim</code>), chain tag, bridge and tail-record clearing.</td></tr>
+      <tr><td>4437–4866</td><td>The head-gap bridge: <code>log_index_bridge_step</code>, <code>bridge_fetch_logs</code>, <code>fetch_logs_for_known_headers</code>.</td></tr>
+      <tr><td>4867–5597</td><td>The descending backfill: step, peer ranking, round, and <code>log_index_backfill_batch</code> with its pipelined chunk fetches.</td></tr>
+      <tr><td>5598–5748</td><td>Status accessors: backfill rate, <code>with_log_index</code>, runtime bits, pool counts, anchor numbers and slots.</td></tr>
+      <tr><td>5750–6358</td><td>Account reads: <code>get_account</code> / <code>_pinned</code> / <code>_following</code>, answers from the activity follower (<code>followed_account</code>, <code>seed_followed</code>), <code>get_account_proven</code>, <strong><code>hedged_read</code></strong>, <code>settle_pool_race</code>, the per-peer fetch, finalized anchor selection, root choice, verdict, result building.</td></tr>
+      <tr><td>6359–6554</td><td>The Tor account read (<code>get_account_over_tor</code>), feature-gated, fail-closed.</td></tr>
+      <tr><td>6555–6936</td><td>Storage reads; <code>get_proof</code> (<code>eth_getProof</code>, new), <code>confirm_recent_head</code>, <code>proof_from</code>.</td></tr>
+      <tr><td>6937–7012</td><td>Code reads: <code>get_code</code>, <code>get_code_pinned</code>, <code>fetch_bytecode</code>.</td></tr>
+      <tr><td>7013–7335</td><td>EVM calls, each a public wrapper over an <code>_inner</code>: create, overridden, transaction object, <code>estimate_gas_tx</code>, <code>create_access_list</code>, <code>trace_call</code>, <code>simulate</code>.</td></tr>
+      <tr><td>7336–7525</td><td>ENS: forward resolution, the <code>Auto</code>/<code>Finalized</code>/<code>Optimistic</code> root ladder, the CCIP-Read callback, <code>call_answer</code>.</td></tr>
+      <tr><td>7526–7701</td><td>EVM setup: head or finalized header, <code>evm_executor_for</code>, <code>snap_oracle</code>, the fixture-recorder seam.</td></tr>
+      <tr><td>7702–8062</td><td>Blocks: by number, verified headers, <code>resolve_block_hash</code>, <code>head_anchored_header_window</code>, the hedged block read and the per-peer serve.</td></tr>
+      <tr><td>8063–8456</td><td>The fee memo: <code>fee_estimate</code>, <code>bounded_fee_compute</code>, <code>wait_for_fee</code>, single-flight refresh, the peer ladder, the fee follower task.</td></tr>
+      <tr><td>8457–8805</td><td>Address activity (#691): <code>set_activity_watch</code>, <code>activity_report</code>, the follower task, the BAL pass, teardown.</td></tr>
+      <tr><td>8806–9097</td><td><code>fee_history</code>: plan, refresh, build, per-peer build.</td></tr>
+      <tr><td>9098–9470</td><td>Writes: <code>send_raw_transaction</code>, <code>send_judged</code>, <code>record_sent</code>, <code>pre_broadcast_check</code>, the pending-nonce overlay, clearnet and Tor rebroadcast.</td></tr>
+      <tr><td>9471–9893</td><td>Transaction and receipt reads, raw transactions, block receipts, the block-hash LRU, strike banking, the anchored head.</td></tr>
+      <tr><td>9894–10196</td><td>The receipt scan: <code>locate_mined_tx</code>, <code>scan_window</code>, <code>tx_scan_state</code>, canonicality re-checks, per-peer scan.</td></tr>
+      <tr><td>10197–10224</td><td><strong><code>stop</code></strong>; the end of <code>impl ElReader</code>.</td></tr>
+      <tr><td>10226–10600</td><td>Free functions: receipt builders, <code>WindowTop</code>, <code>choose_window_top</code>, <strong><code>fetch_anchored_window</code></strong> (the header trust gate), bounded body streams, root checks, the watched-log test.</td></tr>
+      <tr><td>10601–10943</td><td>Receipts-first candidate chunks: <code>CandidateScan</code>, <code>CandidateChunk</code>, the <code>CandidateSource</code> trait, <code>fetch_candidate_logs</code>, <code>BodyPolicy</code>.</td></tr>
+      <tr><td>10944–11342</td><td><code>log_call_cost</code>, <code>await_bounded</code>, <code>FeeFailOnDrop</code>, fee math (tips, reward inputs, gas-weighted percentiles).</td></tr>
+      <tr><td>11343–11690</td><td><code>fresh_head</code>, verdict helpers, <code>storage_key</code>, <code>ElCarry</code>, <code>generate_node_key</code>, base-fee math, ENS and CCIP helpers.</td></tr>
+      <tr><td>11691–13868</td><td><code>mod tests</code>: 95 tests, with nested modules for failure summaries, finalized anchors, tip lag, hedged reads (paused clock), bounded fee waits, reward inputs, receipt-scan bodies.</td></tr>
+      <tr><td>13869–15156</td><td>Log-index pure policy: stored-log conversion, tail rules, the restart claim, bridge chunks, <code>BackfillBatchError</code>, peer ranking, <code>ChunkSizer</code>, persist cadence, <code>checkpoint_bytes</code>.</td></tr>
+      <tr><td>15157–18846</td><td>Fourteen more test modules for that policy, then <code>first_accepted_tests</code> and <code>pre_broadcast_tests</code>.</td></tr>
+    </tbody>
+  </table></div>
+  <p class="code-note"><x-tags>testing modules-cargo</x-tags> About 13,000 lines are production code and 5,900 are tests: 185 <code>#[test]</code> and 80 <code>#[tokio::test]</code> functions in 20 <code>#[cfg(test)]</code> modules, 31 of them on tokio's paused clock. Many test modules sit right after the pure function they test, so the file alternates between code and tests in its second half.</p>
+
+  <h4>The struct: a map of the memory model</h4>
+  <p>Hosts hold the reader as <code>Arc&lt;ElReader&gt;</code> (<code>host.rs</code> keeps an <code>Option&lt;Arc&lt;ElReader&gt;&gt;</code> per running chain). <code>ElReader</code> is not <code>Clone</code>, and almost every method takes <code>&amp;self</code>. So every field that changes after construction is behind something that allows mutation through a shared reference: a mutex, an atomic, a semaphore. In Java terms, every field is <code>final</code>, and the mutable ones are <code>final</code> references to synchronized objects. Sorted by the kind of guard:</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Guard</th><th>Fields</th><th>Why that guard</th></tr></thead>
+    <tbody>
+      <tr><td>none (set once)</td><td><code>discovery</code>, <code>pool</code>, <code>min_suggested_tip_wei</code>, <code>block_time</code>, <code>chain_id</code>, <code>log_index_path</code></td><td>Owned values. <code>discovery</code> and <code>pool</code> lock internally.</td></tr>
+      <tr><td><code>Arc&lt;…&gt;</code></td><td><code>anchor</code>, <code>eth_cfg</code>, <code>evm_proof_cache</code>, <code>evm_bytecode_cache</code>, <code>read_stats</code>, <code>sent_tx_watch</code></td><td>Shared with other owners: the beacon loop, every <code>eth_call</code> executor, every peer read loop.</td></tr>
+      <tr><td><code>std::sync::Mutex</code>, brief holds</td><td><code>requests</code>, <code>tx_scans</code>, <code>block_hash_numbers</code>, <code>unplaced_hashes</code>, <code>sent_txs</code>, <code>log_index</code>, <code>log_index_peer_serve</code>, <code>log_index_rate</code>, <code>log_index_bridge</code>, <code>log_index_tail</code>, <code>log_index_claim</code>, <code>fee_cache</code>, <code>activity</code>, <code>activity_bal_liars</code>, <code>activity_bal_stats</code>, and the four task slots</td><td>In-memory work only, never held across an <code>.await</code>.</td></tr>
+      <tr><td><code>std::sync::Mutex&lt;()&gt;</code></td><td><code>log_index_write</code></td><td>Guards no data: a token that serialises checkpoint writes.</td></tr>
+      <tr><td><code>tokio::sync::Mutex&lt;()&gt;</code></td><td><code>log_index_drive</code>, <code>fee_fill</code>, <code>fee_estimate_compute</code> (in an <code>Arc</code>)</td><td>Held across network awaits on purpose: they serialise slow work.</td></tr>
+      <tr><td>atomics</td><td><code>log_index_unwatch_owed</code>, <code>log_index_pipeline_full</code>, <code>log_index_backfill_rounds</code></td><td>Single flags and counters.</td></tr>
+      <tr><td>locks inside the type</td><td><code>log_index_persist</code> (<code>PersistClock</code>), the two <code>ChunkSizer</code>s (atomics), <code>log_index_body_policy</code></td><td>Small helper types that are themselves <code>&amp;self</code>-mutable.</td></tr>
+      <tr><td><code>Arc&lt;Semaphore&gt;</code>, <code>Notify</code>, <code>watch::Sender</code></td><td><code>fee_compute_permits</code>, <code>send_check_permits</code>, <code>fee_stored</code>, <code>request_shutdown</code></td><td>Bounding detached work, waking waiters, broadcasting shutdown.</td></tr>
+    </tbody>
+  </table></div>
+  <x-code src="myotis-net/src/el/reader.rs" from="2046" to="2107"></x-code>
+  <ul class="concepts">
+    <li><x-tags>interior-mutability smart-pointers</x-tags> <strong>The cancellation pair.</strong> <code>request_shutdown</code> is a tokio <code>watch::Sender&lt;bool&gt;</code>: every registered operation subscribes to it. <code>requests</code> holds <code>Weak&lt;Operation&gt;</code>s, so the registry never keeps a finished request alive. Only <code>stop()</code> upgrades them, to wait for the live ones.</li>
+    <li><x-tags>interior-mutability concurrency</x-tags> <code>tx_scans: std::sync::Mutex&lt;TxScanMap&gt;</code> <strong>nests the two mutex kinds</strong>. The outer <code>std</code> lock guards only the map and is held for a few statements. Each entry is an <code>Arc&lt;tokio::sync::Mutex&lt;TxScanState&gt;&gt;</code> that serialises the slow network scan for <em>one</em> transaction hash, so different transactions proceed in parallel.</li>
+    <li><x-tags>modules-cargo</x-tags> <code>#[cfg_attr(not(feature = "tor"), allow(dead_code))]</code> applies an attribute only when a condition holds, here to silence a warning in non-Tor builds. Its comment is still stale: <code>eth_cfg</code> is read outside Tor code too (the restart-claim chain tag, ENS naming, a log line).</li>
+  </ul>
+  <x-code src="myotis-net/src/el/reader.rs" from="2123" to="2132"></x-code>
+  <p class="code-note"><x-tags>interior-mutability</x-tags> <code>log_index_write: std::sync::Mutex&lt;()&gt;</code> guards <em>no data</em>. Its guard means “a checkpoint write is in progress”. The documented lock order (before <code>log_index</code>, never after) prevents deadlocks: two threads that take the same two locks in the same order can never each hold the one the other waits for. Java has no direct equivalent of a mutex that protects nothing; the nearest is a dedicated <code>Object</code> used only for <code>synchronized</code> blocks.</p>
+  <x-code src="myotis-net/src/el/reader.rs" from="2205" to="2228"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async interior-mutability</x-tags> <code>log_index_drive</code> is an <em>async</em> mutex held across network awaits, so two coverage-advancing ticks (the background appender and an on-demand fill from a host thread) never interleave. A <code>std</code> guard held across an <code>.await</code> would block a runtime worker thread, and tokio would not be able to run other tasks on it meanwhile.</li>
+    <li><x-tags>smart-pointers async</x-tags> <code>fee_estimate_compute</code> is an <code>Arc&lt;tokio::sync::Mutex&lt;()&gt;&gt;</code> because a read hands its <em>owned</em> guard (<code>OwnedMutexGuard</code>) to a spawned compute. An owned guard keeps its own <code>Arc</code> to the mutex, so it has no lifetime tied to <code>&amp;self</code> and can move into a <code>'static</code> task.</li>
+    <li><x-tags>concurrency</x-tags> Each background task sits in a <code>std::sync::Mutex&lt;Option&lt;JoinHandle&lt;()&gt;&gt;&gt;</code> slot: <code>Some</code> while it may run, <code>take()</code>n by the stop path to abort it.</li>
+  </ul>
+
+  <h4>Construction</h4>
+  <x-code src="myotis-net/src/el/reader.rs" from="2316" to="2325"></x-code>
+  <p class="code-note"><x-tags>ownership</x-tags> <code>ElConfig { cache_path, ..base }</code> is struct-update syntax: take <code>cache_path</code> from the local, and every other field from <code>base</code>. It <em>moves</em> those fields out of <code>base</code>, so <code>base</code> cannot be used afterwards (Kotlin's <code>copy(cacheField = …)</code> copies instead). <code>carry.key</code> and <code>carry.pool</code> are moved out of <code>carry</code> the same way. <code>ElCarry</code> (line 11451) is what a pause leaves for the resume: the clearnet node key and the pool's dial verdicts, so neighbours do not have to bond with a new node id after every wake.</p>
+  <x-code src="myotis-net/src/el/reader.rs" from="2391" to="2431"></x-code>
+  <ul class="concepts">
+    <li><x-tags>concurrency</x-tags> Earlier in <code>start_inner</code>, <code>mpsc::channel(256)</code> is created: discv4 gets the sender, and the pool gets the receiver (<code>rx</code> here), a stream of candidates to dial.</li>
+    <li><x-tags>smart-pointers iterators-closures</x-tags> <code>Some(Box::new({ let anchor = Arc::clone(&amp;anchor); move || anchor.optimistic_head() }))</code>: a block expression clones the <code>Arc</code> <em>first</em>, and the <code>move</code> closure then owns that clone. The original <code>anchor</code> is still available below (<code>start_anchor_resolver</code>, the struct literal). The boxed closure becomes the pool's head source.</li>
+    <li><x-tags>async</x-tags> <code>request_shutdown: tokio::sync::watch::channel(false).0</code> keeps the sender and drops the first receiver at once. That is fine: receivers are created later with <code>subscribe()</code>, and <code>cancel_requests</code> uses <code>send_replace</code>, which stores the value even when no receiver exists (plain <code>send</code> would return an error then).</li>
+  </ul>
+
+  <h4>Request budgets and stop</h4>
+  <x-code src="myotis-net/src/el/reader.rs" from="2276" to="2288"></x-code>
+  <p class="code-note"><x-tags>async smart-pointers</x-tags> Every host-facing read runs inside <code>request()</code>: a 90 s <code>Operation</code> (<code>request::REQUEST_BUDGET</code>) registered weakly in <code>requests</code> (see <a href="#f-myotis-net-src-el-request-rs">request.rs</a>). The future is passed <em>by value</em> as <code>impl Future</code>: the operation owns it, and dropping it at the deadline cancels it. <code>request_with_budget</code> is the same with another budget; the fee follower, the detached pre-broadcast read and ENS use it.</p>
+  <x-code src="myotis-net/src/el/reader.rs" from="10197" to="10223"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async</x-tags> <strong>The order matters.</strong> First the shutdown flag, so every registered operation and every follower sees it. Then the three producers are aborted <em>and awaited</em>, so none of them starts new work while the requests drain. Then each live request is upgraded from its <code>Weak</code> (<code>filter_map(std::sync::Weak::upgrade)</code>) and awaited to <code>settled()</code>. Then the appender slot is aborted once more, without awaiting, in case something started it again during the drain. Then the final, unthrottled checkpoint, and only then the pool and discovery.</li>
+    <li><x-tags>error-handling</x-tags> <code>self.requests.lock().map(…).unwrap_or_default()</code> treats a poisoned lock as an empty list instead of panicking. The workspace builds with <code>panic = "abort"</code>, so a panic would kill the host app.</li>
+  </ul>
+
+  <h4>Background tasks: the appender and the followers</h4>
+  <x-code src="myotis-net/src/el/reader.rs" from="3322" to="3380"></x-code>
+  <ul class="concepts">
+    <li><x-tags>smart-pointers ownership</x-tags> <strong><code>self: &amp;Arc&lt;Self&gt;</code></strong> is an explicit receiver type. The method needs the <code>Arc</code> itself to call <code>Arc::downgrade(self)</code>; a plain <code>&amp;self</code> is a reference to the <code>ElReader</code> inside the allocation and cannot produce a <code>Weak</code>. Callers must hold an <code>Arc&lt;ElReader&gt;</code> to call it.</li>
+    <li><x-tags>smart-pointers async</x-tags> <strong>A <code>Weak</code> in a spawned task.</strong> A strong <code>Arc</code> captured by the task would keep the reader, and all its networking, alive for as long as the loop runs. <code>weak.upgrade()</code> yields a strong <code>Arc</code> for one tick, or <code>None</code> once every strong reference is gone, which ends the loop. The comment still justifies this with an <code>Arc::try_unwrap</code> teardown that no host uses any more (<code>host.rs</code> calls <code>reader.stop().await</code>). The <code>Weak</code> is still right: it means a host that drops the reader without calling <code>stop()</code> does not leak a running appender.</li>
+    <li><x-tags>async error-handling</x-tags> <code>rt.spawn</code> on an explicit runtime <code>Handle</code>, because this synchronous method may be called from an FFI thread, where a bare <code>tokio::spawn</code> would panic (no runtime), and a panic means an abort.</li>
+    <li><x-tags>async interior-mutability</x-tags> <code>let _drive = reader.log_index_drive.lock().await;</code> inside a block: the async guard is held across the append tick's awaits and released at the block's <code>}</code>, so the backfill step and the naming pass run <em>outside</em> it. <code>_drive</code> is a real binding; the pattern <code>_</code> alone would drop the guard at once.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/reader.rs" from="3662" to="3677"></x-code>
+  <p class="code-note"><x-tags>async</x-tags> The on-demand fill takes the same <code>log_index_drive</code> lock, re-checks coverage under it (another caller may just have filled it), and runs one append tick. <code>tokio::time::timeout(…, fill)</code> drops <code>fill</code> after 5 s. Dropping a future at an <code>.await</code> is safe here because, as the comment says, coverage only changes synchronously under the index lock, never half-way through an await.</p>
+  <p>The fee follower (<code>ensure_fee_follower</code>, line 8340) and the activity follower (<code>ensure_activity_follower</code>, line 8513) use the same shape: a task slot, an idempotence check with <code>is_finished()</code>, a <code>Weak</code> that is upgraded per tick, and a <code>tokio::time::interval</code> with <code>MissedTickBehavior::Delay</code>. Two differences: they use <code>Handle::try_current()</code> and quietly do nothing outside a runtime, and they check <code>request_shutdown</code> first, so a read racing <code>stop()</code> cannot restart them. Both end themselves when their demand goes away (no fee reads being polled, an empty watch list), and the next read or push respawns them.</p>
+  <x-code src="myotis-net/src/el/reader.rs" from="8555" to="8578"></x-code>
+  <x-code src="myotis-net/src/el/reader.rs" from="8778" to="8790"></x-code>
+  <ul class="concepts">
+    <li><x-tags>interior-mutability iterators-closures</x-tags> <code>self.activity.lock().map(|s| { … })</code>: <code>lock()</code> returns <code>Result&lt;MutexGuard, PoisonError&gt;</code>, and <code>map</code> moves the guard <code>s</code> into the closure. The guard is dropped when the closure returns, so the lock is held only for that expression, and <code>set_bal_demand(false)</code> runs under it on purpose (a push refilling the list must win).</li>
+    <li><x-tags>enums-patterns</x-tags> <code>s.is_active().then(|| s.top())</code> turns a <code>bool</code> into an <code>Option</code>; together with <code>let Ok(top) = … else</code> and <code>let Some(top) = top else</code> the tick separates “lock poisoned”, “list empty” and “nothing kept yet” (<code>top</code> is itself an <code>Option</code>).</li>
+    <li><x-tags>concurrency</x-tags> <code>for slot in [&amp;self.activity_task, &amp;self.activity_bal_task]</code> iterates an array of two references. The follower is stopped first, so it cannot spawn a new BAL pass after the BAL slot is emptied.</li>
+  </ul>
+
+  <h4>Hedged reads</h4>
+  <figure class="diagram">
+    <div class="svg-wrap">
+    <svg class="wide-diagram" viewBox="0 0 900 230" role="img" fill="currentColor" xmlns="http://www.w3.org/2000/svg"
+         aria-label="Hedged read timeline over seconds. Peer A starts at 0 seconds and is slow. At 3 seconds, the hedge delay, peer B is started alongside A. B fails at 3.5 seconds, which immediately starts peer C. A answers with a verdict at 4 seconds and is accepted; C, still in flight, is dropped and cancelled without being counted as good, bad or outpaced. B gets a strike, A is recorded as served.">
+      <defs>
+        <marker id="m-14-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+      <g font-size="10.5" style="fill:var(--ink-3)">
+        <line x1="100" y1="190" x2="860" y2="190" stroke-width="1" style="stroke:var(--rule)"/>
+        <line x1="100" y1="186" x2="100" y2="194" style="stroke:var(--rule)"/><text x="100" y="208" text-anchor="middle">0 s</text>
+        <line x1="200" y1="186" x2="200" y2="194" style="stroke:var(--rule)"/><text x="200" y="208" text-anchor="middle">1</text>
+        <line x1="300" y1="186" x2="300" y2="194" style="stroke:var(--rule)"/><text x="300" y="208" text-anchor="middle">2</text>
+        <line x1="400" y1="186" x2="400" y2="194" style="stroke:var(--rule)"/><text x="400" y="208" text-anchor="middle">3</text>
+        <line x1="500" y1="186" x2="500" y2="194" style="stroke:var(--rule)"/><text x="500" y="208" text-anchor="middle">4</text>
+        <line x1="600" y1="186" x2="600" y2="194" style="stroke:var(--rule)"/><text x="600" y="208" text-anchor="middle">5</text>
+        <line x1="700" y1="186" x2="700" y2="194" style="stroke:var(--rule)"/><text x="700" y="208" text-anchor="middle">6</text>
+      </g>
+      <text x="20" y="62" font-size="12" font-weight="700">peer A</text>
+      <text x="20" y="112" font-size="12" font-weight="700">peer B</text>
+      <text x="20" y="162" font-size="12" font-weight="700">peer C</text>
+
+      <line x1="400" y1="24" x2="400" y2="184" stroke-width="1" stroke-dasharray="4 4" style="stroke:var(--oxide)"/>
+      <text x="404" y="34" font-size="10.5" style="fill:var(--oxide-ink)">HEDGE_DELAY: start one more</text>
+      <line x1="500" y1="44" x2="500" y2="184" stroke-width="1" stroke-dasharray="4 4" style="stroke:var(--ok)"/>
+
+      <rect x="100" y="50" width="400" height="16" rx="3" style="fill:var(--ok-wash)"/>
+      <rect x="100" y="50" width="400" height="16" rx="3" stroke-width="1.2" style="fill:none;stroke:var(--ok)"/>
+      <text x="508" y="62" font-size="11" style="fill:var(--ok)">answers with a verdict → accepted, record_snap_served</text>
+
+      <rect x="400" y="100" width="50" height="16" rx="3" style="fill:var(--bad-wash)"/>
+      <rect x="400" y="100" width="50" height="16" rx="3" stroke-width="1.2" style="fill:none;stroke:var(--bad)"/>
+      <text x="458" y="112" font-size="11" style="fill:var(--bad)">fails → missed (a strike), and the loop starts C at once</text>
+
+      <rect x="450" y="150" width="50" height="16" rx="3" stroke-width="1.2" style="fill:var(--surface);stroke:var(--ink-2)"/>
+      <rect x="500" y="150" width="110" height="16" rx="3" stroke-width="1.2" stroke-dasharray="4 3" style="fill:none;stroke:var(--ink-3)"/>
+      <text x="618" y="162" font-size="11" style="fill:var(--ink-2)">dropped when A wins: cancelled, in no list</text>
+    </svg>
+    </div>
+    <figcaption>At most 3 attempts are in flight at once, both to limit load and because every attempt discloses <code>keccak(address)</code> to one more peer. A slow peer is never abandoned: hedging starts another <em>alongside</em> it, so a slow but working answer still wins. This is an illustrative run, traced through the loop below. C is not reported as <em>outpaced</em>: its request went out after A's, so its slowness proves nothing. A loser counts as outpaced only if its request went out no later than the winner's and has been with its peer for at least the hedge delay.</figcaption>
+  </figure>
+  <x-code src="myotis-net/src/el/reader.rs" from="1615" to="1658"></x-code>
+  <x-code src="myotis-net/src/el/reader.rs" from="1659" to="1703"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics async</x-tags> A generic async higher-order function: <code>make: impl FnMut(P) -&gt; Fut</code> with <code>where Fut: Future&lt;Output = Result&lt;T, String&gt;&gt;</code>. Every <code>async move</code> block has its own anonymous type, so there is exactly <em>one</em> push site into the <code>FuturesUnordered</code>. Two different blocks could not share the collection without boxing.</li>
+    <li><x-tags>async</x-tags> <code>make(…)</code> only <em>creates</em> a future; nothing runs until it is polled. <code>scope_send_marker</code> wraps it in a tokio task-local scope that records when the request frame actually left (a <code>OnceLock&lt;Instant&gt;</code> shared through an <code>Arc</code>); that timestamp decides who was outpaced. The wrapper <code>async move { (idx, fut.await) }</code> owns the future and tags the result with the peer index.</li>
+    <li><x-tags>async</x-tags> <code>select!</code> races the next completed attempt against a fresh <code>sleep(delay)</code>, created anew on every loop pass, so the hedge timer restarts whenever an attempt finishes. The <code>if</code> guard disables the timer arm when no more peers may be started, and <code>else =&gt; break</code> handles “all branches disabled”.</li>
+    <li><x-tags>async ownership</x-tags> <strong>Cancellation by drop.</strong> <code>return out;</code> drops <code>in_flight</code>, and with it every attempt still running. There are no <code>cancel()</code> calls; in Java you would call <code>future.cancel(true)</code> on each. The doc comment above warns that a dropped attempt can leave that peer's writer torn (it condemns the connection), a price paid only once the answer is in hand. For the same reason the losers are not polled again after the winner arrives.</li>
+    <li><x-tags>enums-patterns</x-tags> <code>out.fallback.get_or_insert(value)</code> keeps the <em>first</em> non-accepted answer as a fallback.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/reader.rs" from="5901" to="5956"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo</x-tags> <code>#[cfg(feature = "tor")]</code> on an <code>if</code> statement: in Tor builds with Tor switched on, the read goes over an isolated Tor circuit instead (<code>get_account_over_tor</code>, line 6366), with no hedging. It fails closed: no ready Tor peer means an error, never a clearnet fallback. Finalized reads are refused under Tor.</li>
+    <li><x-tags>borrowing async</x-tags> <code>|peer| async move { self.get_account_from(&amp;peer, address, fin).await }</code>: the future <em>borrows</em> <code>self</code>. That is fine because the race is awaited inside this method and never spawned, so no <code>'static</code> bound applies. <code>address</code> (<code>[u8; 20]</code>) and <code>fin</code> (<code>Option&lt;FinalizedExecution&gt;</code>, which derives <code>Copy</code>) are copied into each future. That is also why the closure can be <code>FnMut</code>: it gives nothing away when it is called.</li>
+    <li><x-tags>traits-generics</x-tags> Four closures, four roles: <code>accept</code> ends the race (a verdict, or a <em>global</em> failure such as “beacon not synced” that no other peer could fix); <code>served</code> says whether that answer earns credit; <code>excused</code> forgives a finalized read's empty proof (the peer is not obliged to keep an old root); the last is the label for error messages.</li>
+    <li><x-tags>domain</x-tags> Only a verified head read feeds the shadow cache (<code>read_stats.observe_account</code>). <code>get_account_following</code>, which calls this, first tries the activity follower and, after a verified head proof, seeds it (<code>seed_followed</code>): a watched account can then be answered from verified block access lists with <code>verifyMethod</code> <code>blockAccessList</code> and no peer request.</li>
+  </ul>
+  <p class="code-note"><x-tags>domain</x-tags> <code>hedged_read</code> (line 5988) applies the outcome to the pool: misses that were not excused are banked as failures (witnessed only if another peer served), outpaced peers are reported with <code>record_snap_outpaced</code>, and the winner gets <code>record_snap_served</code> only if its answer was a serve. Block and receipt reads use <code>settle_pool_race</code> instead, whose tip-lag arm hands strikes back to the caller unbanked, so a retry that succeeds strikes nobody.</p>
+
+  <h4>EVM reads</h4>
+  <x-code src="myotis-net/src/el/reader.rs" from="7083" to="7107"></x-code>
+  <x-code src="myotis-net/src/el/reader.rs" from="7635" to="7649"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async concurrency</x-tags> The sync-to-async bridge from the reader's side. <code>snap_oracle</code> runs in async code, so <code>Handle::current()</code> works, and it stores the handle in the oracle. Then <code>request::blocking(move || …)</code> moves the executor, calldata, context and overrides onto a blocking thread, where the oracle's <code>block_on</code> is legal. <code>blocking</code> limits native work to 8 slots with a bounded FIFO wait, and the closure must be <code>Send + 'static</code>, which the <code>move</code> provides.</li>
+    <li><x-tags>error-handling enums-patterns</x-tags> The <code>?</code> after <code>.await</code> covers only <code>blocking</code>'s own failures: no free slot, a cancelled or expired request, a join error. <code>joined</code> is the EVM's <code>Result</code>, which <code>call_answer</code> maps into a <code>CallOutcome</code> and labels with the block hash only if the call actually ran.</li>
+    <li><x-tags>smart-pointers traits-generics</x-tags> <strong>Unsizing coercion.</strong> <code>Arc&lt;InMemoryStateProofCache&gt;</code> becomes <code>Arc&lt;dyn StateProofCache&gt;</code> at the constructor call. Binding the concrete clones to variables first matters: <code>Arc::clone(&amp;x)</code> written directly in a <code>dyn</code>-typed position would be inferred as <code>Arc::&lt;dyn …&gt;::clone</code> and fail to type-check.</li>
+    <li><x-tags>domain</x-tags> <code>evm_setup_at</code> picks the head or the finalized header. The finalized header comes over a window anchored at the finalized block itself and is then cross-checked against the anchor's own hash and state root (<code>finalized_header</code>, line 7581).</li>
+  </ul>
+
+  <h4>The header trust gate</h4>
+  <x-code src="myotis-net/src/el/reader.rs" from="10353" to="10365"></x-code>
+  <x-code src="myotis-net/src/el/reader.rs" from="10375" to="10419"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain error-handling</x-tags> “The sole gate that turns peer-supplied headers into trusted ones”, with seven callers. The window must have the exact length, start at the requested number, end at the anchored hash, and be parent-linked throughout. New since September: the anchor is a <code>WindowTop</code>, either the optimistic head or the <em>finalized</em> block. A read at or below finality anchors at the finalized block, which every roughly synced peer holds, so it no longer depends on the head.</li>
+    <li><x-tags>error-handling</x-tags> The error messages differ on purpose. A <em>short</em> window looks like tip lag (the peer has not imported that far yet, so a retry is reasonable), while an over-served window is a protocol violation. <code>all_tip_lag</code> (line 676) string-matches these messages, and the comment there names the coupling.</li>
+    <li><x-tags>enums-patterns</x-tags> <code>top.number().checked_sub(from).map(|span| span + 1)</code> with <code>let Some(count) = … else</code>: subtraction that would underflow becomes <code>None</code> instead of wrapping (in release builds) or panicking (in debug builds).</li>
+    <li><x-tags>domain</x-tags> Only a head-anchored window counts as proof of the peer's head (<code>note_head_served</code>), which the read ladder then ranks peers by.</li>
+  </ul>
+
+  <h4>Writes: judged, detached, and Tor-only in Tor mode</h4>
+  <x-code src="myotis-net/src/el/reader.rs" from="9098" to="9113"></x-code>
+  <p class="code-note"><x-tags>error-handling domain</x-tags> Three refusals before anything goes out. Bytes that are not a sendable transaction, and a transaction signed for another chain, are <code>SendError::Refused</code> (hosts answer the permanent <code>-32602</code>). A transaction the sender provably cannot pay for, or whose nonce is used, is <code>Rejected</code> in geth's own words, so wallets classify it as they would geth's. The method takes <code>self: &amp;Arc&lt;Self&gt;</code> because the pre-broadcast check spawns a task that needs its own <code>Arc</code>.</p>
+  <x-code src="myotis-net/src/el/reader.rs" from="9265" to="9306"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async smart-pointers</x-tags> <strong>Detached, not cut.</strong> The account read is <code>tokio::spawn</code>ed, so it must be <code>'static</code>: it gets its own <code>Arc</code> (<code>let reader = Arc::clone(self)</code>) and an owned semaphore permit (<code>try_acquire_owned</code> on an <code>Arc&lt;Semaphore&gt;</code>). <code>timeout(ACCOUNT_READ_BUDGET, read)</code> wraps the <code>JoinHandle</code>. When it expires, the handle is dropped, and <strong>dropping a <code>JoinHandle</code> does not cancel the task</strong>; it only detaches it. Contrast <code>hedged_race</code>, where dropping the <em>futures</em> cancels them. The comment says why it matters: a read dropped mid-request can tear the connection the broadcast is about to use.</li>
+    <li><x-tags>concurrency</x-tags> <code>let _permit = permit;</code> moves the permit into the task, so it is released when the task ends, whenever that is. At most <code>send_check::DETACHED_READS_MAX</code> such reads run; past that, the send goes out unchecked. The detached read is still registered via <code>request_with_budget</code>, so <code>stop()</code> cancels and drains it.</li>
+    <li><x-tags>error-handling</x-tags> <code>joined.unwrap_or_else(|e| Err(…))</code> flattens the <code>JoinError</code> (the task was aborted) into the read's own <code>Result</code>. Every reason not to judge becomes <code>PreBroadcast::Unchecked</code>, and the send goes out as before: the check only ever adds refusals on proven state.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/reader.rs" from="1314" to="1351"></x-code>
+  <x-code src="myotis-net/src/el/reader.rs" from="9184" to="9221"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async ownership</x-tags> <code>first_accepted</code> spawns every write as its own task (hence <code>Fut: Send + 'static</code>) and returns at the first success. The raw transaction is shared as <code>Arc&lt;[u8]&gt;</code>, one allocation for all peers, each task holding a clone. Each task's <code>select!</code> has three arms: the write, “another write landed, then <code>grace</code> elapsed”, and shutdown. So writes are never cut before one has landed, and are cut <code>grace</code> after.</li>
+    <li><x-tags>concurrency</x-tags> <code>drop(tx)</code> after the loop is load-bearing. <code>rx.recv()</code> returns <code>None</code> only once <em>every</em> sender is gone; the tasks hold clones, and this local original would otherwise keep the channel open forever. A <code>watch</code> channel (<code>landed</code>) broadcasts “one landed” to all tasks; <code>subscribe()</code> gives each its own receiver.</li>
+    <li><x-tags>interior-mutability borrowing</x-tags> <code>matches!(self.sent_txs.lock().unwrap().bytes.get(&amp;hash), …)</code>: the <code>MutexGuard</code> is a temporary, dropped at the end of the <code>let</code> statement, before the <code>.await</code> on the next lines. That matters: a <code>std</code> guard alive across an <code>.await</code> would make the future non-<code>Send</code>.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/reader.rs" from="9357" to="9422"></x-code>
+  <ul class="concepts">
+    <li><x-tags>interior-mutability borrowing</x-tags> <strong>Collect under the lock, act outside it.</strong> Each <code>let x = { let mut g = m.lock().unwrap(); …; value };</code> block drops its guard at the <code>}</code>. The network sends happen with no lock held.</li>
+    <li><x-tags>modules-cargo</x-tags> <code>#[cfg(not(feature = "tor"))] drop(over_tor);</code>: without the Tor feature the Tor branch is compiled out, so this explicit <code>drop</code> is the only use of <code>over_tor</code> and keeps the build free of an unused-variable warning.</li>
+    <li><x-tags>async ownership</x-tags> The clearnet rebroadcast is a detached <code>tokio::spawn</code> that must be <code>'static</code>, so it owns everything: <code>work: Vec&lt;Vec&lt;u8&gt;&gt;</code> and <code>peers: Vec&lt;Arc&lt;ManagedPeer&gt;&gt;</code> are moved in. The wallet's receipt poll triggers the rebroadcast but never waits for it. Each send is bounded by a 5 s <code>timeout</code>.</li>
+    <li><x-tags>error-handling</x-tags> <code>.lock().unwrap()</code> here vs <code>if let Ok</code> / <code>map_err</code> elsewhere: two lock-poison styles in one file. A lock is poisoned only when a thread panics while holding it <em>and the program keeps running</em>. Under <code>panic = "abort"</code> that cannot happen, so these <code>unwrap()</code>s cannot fire in production.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/reader.rs" from="1555" to="1573"></x-code>
+  <x-code src="myotis-net/src/el/reader.rs" from="9428" to="9469"></x-code>
+  <ul class="concepts">
+    <li><x-tags>smart-pointers concurrency</x-tags> <strong>A drop guard for a flag.</strong> <code>TorRebroadcastGuard::claim</code> uses <code>compare_exchange(false, true, …)</code>: it succeeds for exactly one caller while the flag is clear, and returns a guard whose <code>Drop</code> clears it. The guard is moved into the spawned task (<code>let _guard = guard;</code>), so the flag stays set until that task ends, or is dropped, however it ends. Java would need a <code>try/finally</code> around the whole round.</li>
+    <li><x-tags>domain</x-tags> A Tor rebroadcast round walks on through the pool: <code>round.wrapping_mul(TOR_MAX_CANDIDATES)</code> is the offset into the eligible peers, so each round reaches peers the earlier ones did not. Only target <em>identities</em> go into the task, not the pool's peer handles; each push is a fresh Tor stream with an ephemeral key. A send that first went over Tor is never pushed from the real IP (<code>rebroadcast_route</code>).</li>
+  </ul>
+  <x-code src="myotis-net/src/el/reader.rs" from="10024" to="10050"></x-code>
+  <p class="code-note"><x-tags>interior-mutability smart-pointers</x-tags> The receipt scan's per-transaction cursor. <code>st.try_lock()</code> inside <code>retain</code>: an entry whose tokio lock is currently held is in use, so it is kept regardless of age. <code>Arc::clone(scans.map.entry(tx_hash).or_insert_with(…))</code> returns a handle to the per-transaction mutex, and the caller (<code>locate_mined_tx</code>) locks it <em>after</em> this function has returned and the map guard is gone. <code>map_err(|_| "engine lock poisoned")?</code> turns poison into an error rather than a panic.</p>
+
+  <h4>The fee memo: single flight, bounded waits</h4>
+  <p>Fee reads (<code>eth_gasPrice</code>, <code>eth_maxPriorityFeePerGas</code>, <code>eth_feeHistory</code>) used to compute on every call, up to the 90 s budget, while wallets give up after about 10 s. Now <code>fee_estimate</code> looks in a per-head memo (<code>el::feecache</code>). A fresh hit is returned. A stale hit (a previous head's value) is returned raised by the most the base fee can have grown since (12.5% per block). Only a miss starts a compute.</p>
+  <x-code src="myotis-net/src/el/reader.rs" from="8086" to="8105"></x-code>
+  <x-code src="myotis-net/src/el/reader.rs" from="8122" to="8157"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async smart-pointers</x-tags> <code>Arc::clone(&amp;self.fee_estimate_compute).try_lock_owned()</code> either takes the single-flight lock now, as an <code>OwnedMutexGuard</code>, or fails at once. The winner moves the guard into its compute (<code>move |r| async move { … flight … }</code>); everyone else waits for the result instead of queueing behind the lock.</li>
+    <li><x-tags>traits-generics async</x-tags> <code>bounded_fee_compute</code> takes <code>F: FnOnce(Arc&lt;Self&gt;) -&gt; Fut + Send + 'static</code>. The closure is <code>'static</code> because it is moved into <code>tokio::spawn</code>; its future <code>Fut</code> need only be <code>Send</code>, because it is created and awaited inside the task. The compute receives its own <code>Arc&lt;ElReader&gt;</code> (<code>r</code>) instead of borrowing <code>&amp;self</code>, which a <code>'static</code> task could not hold. <code>await_bounded</code> then waits at most 5 s; giving up drops only the <code>JoinHandle</code>, and the compute runs on to fill the memo for the next poll.</li>
+    <li><x-tags>concurrency async</x-tags> <strong>No lost wake-ups.</strong> <code>wait_for_fee</code> creates the <code>notified()</code> future, pins it (<code>tokio::pin!</code>, because <code>Notified</code> must not move once registered) and enables it <em>before</em> it checks <code>settled()</code>. <code>notify_waiters</code> stores no permit, so a store that landed between the check and the await would otherwise be missed, and the read would sleep until its deadline. Java's <code>Condition.await</code> has the same trap, solved by checking under the lock.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/reader.rs" from="8199" to="8233"></x-code>
+  <x-code src="myotis-net/src/el/reader.rs" from="11006" to="11030"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership async</x-tags> <strong>Drop order as a design tool.</strong> Locals are dropped in reverse order of declaration, and an <code>async fn</code>'s parameters are bound before its body, so they are dropped after its locals. <code>on_drop</code> is a local and <code>_flight</code> a parameter: if this future is dropped mid-ladder (a budget cut, a stop), <code>on_drop</code> records the failure and wakes the waiters <em>before</em> the single-flight lock is released. A caller queued on that lock then sees “just failed” and does not rerun the ladder.</li>
+    <li><x-tags>lifetimes traits-generics</x-tags> <code>FeeFailOnDrop&lt;'a, F: Fn(&amp;mut FeeCache)&gt;</code> borrows the reader for <code>'a</code> and stores the recording closure by value; it is a stack guard, never stored or spawned. <code>disarm()</code> on the success path turns the <code>Drop</code> into a no-op, like a Java <code>finally</code> with a “completed normally” flag.</li>
+    <li><x-tags>concurrency</x-tags> <code>_flight</code> is named, so the guard lives until the function returns. A parameter written as <code>_: OwnedMutexGuard&lt;()&gt;</code> would drop it at once.</li>
+  </ul>
+
+  <h4>The log-index engine</h4>
+  <p class="code-note"><x-tags>domain</x-tags> A 6 s appender task keeps the index current along four paths. (1) A finalized per-block appender. (2) A head-gap bridge that takes over when the gap exceeds <code>APPEND_WINDOW</code> (128 blocks) or the edge has not moved for three ticks; it first walks down from the finalized anchor, then back up, and its <code>BridgePlan</code> is <code>take()</code>n out of a <code>std</code> mutex before the network I/O and put back afterwards. (3) An optimistic tail above finality, the only part that can reorg; it keeps its own <code>(number, hash)</code> record and rewinds on a mismatch. (4) A descending backfill, with peers ranked by measured throughput and chunk requests pipelined through <code>futures::StreamExt::buffered</code>. New since September: candidates fetch receipts first and bodies only for blocks that hold a watched log; the head side has its own chunk sizer; entries can be unwatched; and a checkpoint records a finality claim, so a restart keeps coverage it proved final instead of re-walking it.</p>
+  <x-code src="myotis-net/src/el/reader.rs" from="4095" to="4123"></x-code>
+  <x-code src="myotis-net/src/el/reader.rs" from="4124" to="4138"></x-code>
+  <ul class="concepts">
+    <li><x-tags>interior-mutability concurrency</x-tags> <code>let Ok(_writing) = self.log_index_write.try_lock() else { return false; };</code> skips instead of waiting: whoever holds the lock is writing a <em>newer</em> snapshot anyway. <code>try_lock</code> returns <code>Err</code> both for “held” and for “poisoned”, and both mean skip here.</li>
+    <li><x-tags>interior-mutability</x-tags> The <code>(bytes, clamp)</code> block serialises under the index lock and releases it at the <code>}</code>, before the slow write and fsync, so the appender, the walker and every <code>eth_getLogs</code> are not blocked by the disk. Lock order inside: checkpoint lock, then index lock, then (in <code>checkpoint_clamp_for</code>) the tail and claim locks.</li>
+  </ul>
+  <p class="code-note"><x-tags>interior-mutability error-handling</x-tags> <code>unwatch_log_index</code> (line 2902) shows the same order with a twist. It first answers the common “nothing to drop” case under the index lock <em>alone</em>, so a repeated unwatch does not queue behind a multi-gigabyte import holding the checkpoint lock. Only then does it take the checkpoint lock and the index lock again, in the documented order, and re-read the state under both. The “unwatch owed” atomic is set <em>before</em> the write attempt, so no outcome can leave it unset; the write that lands clears it.</p>
+  <x-code src="myotis-net/src/el/reader.rs" from="10773" to="10800"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics async</x-tags> <strong>Async methods in a trait.</strong> The trait declares <code>fn receipts(&amp;self, …) -&gt; impl Future&lt;Output = …&gt; + Send</code> (return-position <code>impl Trait</code> in a trait), and the impl writes plain <code>async fn</code>. The explicit form is what lets the trait promise <code>+ Send</code>, which the spawned appender task needs; a bare <code>async fn</code> in the trait could not say that. The trait exists only so <code>fetch_candidate_logs</code> can be tested against a scripted peer.</li>
+    <li><x-tags>traits-generics</x-tags> <code>trait CandidateSource: Sync</code> is a supertrait bound: every implementor must be <code>Sync</code>, so a <code>&amp;P</code> may be held across awaits in a <code>Send</code> future.</li>
+  </ul>
+  <x-code src="myotis-net/src/el/reader.rs" from="5352" to="5375"></x-code>
+  <p class="code-note"><x-tags>lifetimes async</x-tags> <code>ChunkFetch&lt;'a&gt;</code> (line 10804) is a <code>BoxFuture&lt;'a, …&gt;</code>: a heap-allocated, type-erased, <code>Send</code> future that may borrow for <code>'a</code>. The comment explains why the loop boxes instead of writing <code>chunks().map(|c| async move { … })</code>: a closure returning a future that borrows the header slices is “not general enough” over their lifetime for the spawned task's <code>Send</code> bound, a known limitation of how the compiler checks such closures. <code>buffered(depth)</code> then polls up to <code>depth</code> fetches at once and yields results <em>in order</em>, which the truncation logic depends on. Dropping the stream on a failure cancels the fetches still in flight.</p>
+  <x-code src="myotis-net/src/el/reader.rs" from="14189" to="14207"></x-code>
+  <p class="code-note"><x-tags>error-handling traits-generics</x-tags> <code>From</code> impls decide what a bare <code>?</code> means. In the backfill batch every <code>String</code> error becomes a <em>peer</em>-blamed failure, so the few failures that are the engine's own fault are built explicitly with <code>BackfillBatchError::ours</code>. Compare <code>FeeBuildError</code> (line 1944), which deliberately has <em>no</em> <code>From&lt;String&gt;</code>: there, a <code>?</code> on a plain <code>String</code> error fails to compile, so every site must state whose fault it is. A wrongly blamed check once struck every snap peer on every fee-history build.</p>
+  <x-code src="myotis-net/src/el/reader.rs" from="13979" to="13987"></x-code>
+  <p class="code-note"><x-tags>domain testing</x-tags> The restart claim, as one pure function. After a restart the beacon store resumes from a snapshot written once per sync-committee period, so its finality can sit hours below a checkpoint this node already proved final. The claim (<code>RestartClaimState</code>, under <code>log_index_claim</code>) lets the tail hold that coverage instead of rewinding it. It ends when the anchor catches up (<code>Subsumed</code>), or when a current finality verified <em>after</em> the claim was first weighed sits more than 512 blocks below it (<code>Contradicted</code>). Decisions like this one are free functions marked “Pure — unit-tested”, so the tests need no peers; <code>restart_claim_reader_tests</code> goes one step further and starts an offline <code>ElReader</code> with no bootnodes.</p>
+
+  <h4>Testing on a virtual clock</h4>
+  <x-code src="myotis-net/src/el/reader.rs" from="11998" to="12012"></x-code>
+  <x-code src="myotis-net/src/el/reader.rs" from="18265" to="18292"></x-code>
+  <ul class="concepts">
+    <li><x-tags>testing async</x-tags> <code>#[tokio::test(start_paused = true)]</code> runs the test on tokio's paused clock: when every task is waiting on a timer, time jumps forward instantly. <code>started.elapsed()</code> can then be asserted <em>exactly</em> (4 s, 20 ms) in a test that takes milliseconds. This needs tokio's <code>test-util</code> feature, which <code>myotis-net</code> enables only for dev builds (<a href="#stop-02">Stop 2</a>).</li>
+    <li><x-tags>testing</x-tags> <code>let (_stop, shutdown) = watch::channel(false);</code> keeps the sender alive in <code>_stop</code>. Writing <code>let (_, shutdown)</code> would drop the sender at once, and <code>first_accepted</code> treats a dropped sender as a shutdown, so every write would be cut. The <code>broadcast_pushes</code> tests solve the same problem with <code>std::mem::forget(tx)</code>.</li>
+    <li><x-tags>traits-generics testing</x-tags> <code>fn flags&lt;const N: usize&gt;() -&gt; [Arc&lt;AtomicBool&gt;; N]</code> is a const generic: the array length is a type parameter, inferred from the destructuring pattern <code>let [quick, inside, outside, wedged] = flags();</code>. <code>std::array::from_fn</code> builds each element.</li>
+  </ul>
+
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments</span>
+    <p>The old tour listed five. All five are still there:</p>
+    <ul>
+      <li>The <code>eth_cfg</code> field doc (line 2056) says it is “only read on the <code>tor</code> feature”, but lines 3050, 3434 and 4371 read it outside Tor code.</li>
+      <li>Comments name functions that do not exist: <code>log_index_note_chunk_served</code> (line 14639; the sizer's entry points are now <code>ChunkSizer::note_*</code>) and <code>note_checkpoint_on_disk</code> (a test comment at line 17266; the methods are <code>note_checkpoint_written</code> and <code>note_checkpoint_adopted</code>).</li>
+      <li>The <code>Arc::try_unwrap</code> teardown is mentioned at lines 3310, 3335 and 3386. No code in the workspace calls <code>try_unwrap</code>; hosts call <code>reader.stop().await</code>.</li>
+      <li>Two “future work” notes describe implemented features: the receipt doc (lines 9486–9492) says the own-transaction reachback “lands with the sent-tx slice”, but <code>locate_mined_tx</code> does it at line 9931; the transaction-by-hash doc (lines 9543–9545) says the same of the pending answer, which <code>TxLookup::Pending</code> provides.</li>
+      <li>The peer-ranking doc (lines 4979–4993) sits on <code>log_index_note_peer_tried</code> and merges with that function's own doc; it belongs to <code>log_index_backfill_peer_order</code> (line 5019), which has none.</li>
+    </ul>
+    <p>New ones:</p>
+    <ul>
+      <li><code>all_tip_lag</code>'s doc (line 671) says <code>fetch_anchored_window</code> has six callers; it has seven, as that function's own doc says.</li>
+      <li><code>log_index_backfill_batch</code> has two stacked doc paragraphs (lines 5200–5214). The first says the headers are fetched “ascending”, the second, correctly, that the request is <code>reverse=true</code> from the cursor (line 5245).</li>
+      <li>On <code>account_from_tor_session</code> the <code>#[cfg(feature = "tor")]</code> attribute sits in the middle of the doc comment (line 6486). It still compiles into one doc, but it reads as if the last paragraph were separate.</li>
+    </ul>
+  </div>
+</x-file>
+
+<x-quiz>[
+  {"id":"reader-q1","type":"mcq","tags":["smart-pointers","async"],
+   "q":"The log-index appender, the fee follower and the activity follower each hold a <code>Weak&lt;ElReader&gt;</code> and call <code>upgrade()</code> once per tick. Hosts now call <code>reader.stop().await</code>, which aborts these tasks. What does the <code>Weak</code> still buy?",
+   "options":["Nothing; it is left over from the <code>Arc::try_unwrap</code> design","A <code>Weak</code> is cheaper to clone than an <code>Arc</code>","If a host drops its last <code>Arc</code> without calling <code>stop()</code>, the task's next <code>upgrade()</code> returns <code>None</code> and the loop ends; a strong <code>Arc</code> in the task would keep the reader and its networking alive for as long as the loop runs","It lets the task mutate the reader without a lock"],
+   "answer":2,
+   "explain":"A task that owns a strong reference to its owner keeps it alive. The <code>Weak</code> makes the task's lifetime follow the host's references; <code>stop()</code> is the fast, deterministic path."},
+  {"id":"reader-q2","type":"mcq","tags":["smart-pointers","ownership"],
+   "q":"<code>send_raw_transaction</code> and <code>pre_broadcast_check</code> take <code>self: &amp;Arc&lt;Self&gt;</code>. Why?",
+   "options":["The pre-broadcast check spawns a <code>'static</code> task that needs its own owned reference to the reader, and only an <code>&amp;Arc&lt;Self&gt;</code> receiver lets the method call <code>Arc::clone(self)</code>","Async methods must take <code>Arc&lt;Self&gt;</code>","It makes the method thread-safe","It lets the method replace the reader"],
+   "answer":0,
+   "explain":"<code>tokio::spawn</code> requires <code>'static</code>, so the task cannot borrow <code>&amp;self</code>. With a plain <code>&amp;self</code> receiver there is no <code>Arc</code> to clone."},
+  {"id":"reader-q3","type":"open","tags":["async","ownership"],
+   "q":"In <code>hedged_race</code>, how are the losing attempts cancelled once a winner is found, and what does the doc comment warn this can cost?",
+   "model":"All attempts live in a local <code>FuturesUnordered</code> (<code>in_flight</code>). When an accepted answer arrives, the function <code>return</code>s, which drops <code>in_flight</code> and every future inside it. Dropping a future is cancellation in Rust: it is never polled again, and the destructors of what it holds run. No explicit cancel calls are needed. The cost: an attempt dropped in the middle of a frame write leaves that peer's writer marked torn, which condemns the connection (<code>fail_all</code>). The code accepts that trade only once it has the answer, and does not poll the losers again after the winner arrives, so no loser starts a new request that would then be cut.",
+   "points":["attempts are owned by a local FuturesUnordered","returning drops it, and every in-flight future is dropped, which cancels it","no explicit cancel call; destructors run","a mid-write cancellation can tear that peer's connection (torn writer, fail_all)"],
+   "context":"myotis-net/src/el/reader.rs L1615-1703 hedged_race: in_flight = FuturesUnordered; on accept: out.accepted = Some(..); return out; doc L1601-1614: remaining in-flight attempts are dropped mid-request, which can leave a loser's writer marked torn (ManagedPeer::fail_all); losers are not polled again in the winner's wakeup."},
+  {"id":"reader-q4","type":"mcq","tags":["borrowing","async","lifetimes"],
+   "q":"In <code>get_account_proven</code>, the closure <code>|peer| async move { self.get_account_from(&amp;peer, address, fin).await }</code> produces futures that borrow <code>self</code>. Why does this compile without a <code>'static</code> bound?",
+   "options":["<code>self</code> is always <code>'static</code>","<code>async move</code> makes everything inside it <code>'static</code>","The compiler clones the reader into each future","The futures are never spawned: <code>hedged_read</code> drives them to completion inside this method, so they only need to live as long as the borrowed locals, and <code>address</code> and <code>fin</code> are <code>Copy</code> and copied in"],
+   "answer":3,
+   "explain":"<code>'static</code> is required by <code>tokio::spawn</code> because a spawned task may outlive its creator. Futures awaited in place may borrow freely."},
+  {"id":"reader-q5","type":"mcq","tags":["async","concurrency"],
+   "q":"<code>pre_broadcast_check</code> spawns the account read and then does <code>tokio::time::timeout(ACCOUNT_READ_BUDGET, read)</code> on its <code>JoinHandle</code>. What happens to the read when the timeout fires?",
+   "options":["It is cancelled, because the timeout drops what it wraps","It keeps running: dropping a <code>JoinHandle</code> detaches the task rather than cancelling it, and the read is still bounded by its own registered budget and by <code>stop()</code>","It panics, because a <code>JoinHandle</code> must be awaited","It is aborted and its peer connection is torn"],
+   "answer":1,
+   "explain":"The timeout drops the handle, not the task. That is the point here: a read cut mid-request could tear the connection the broadcast is about to use. Contrast dropping a future, which does cancel it."},
+  {"id":"reader-q6","type":"open","tags":["ownership","async","interior-mutability"],
+   "q":"In <code>fee_estimate_refresh_locked</code>, the single-flight guard arrives as the parameter <code>_flight</code>, and the body declares <code>let mut on_drop = FeeFailOnDrop::new(…)</code>. Explain why the comment says the local is “dropped before the <code>_flight</code> parameter”, and what would go wrong in the other order.",
+   "model":"Locals are dropped in reverse declaration order, and an async fn binds its parameters before the body's locals, so parameters are dropped last. If the future is dropped mid-ladder (a budget cut or a stop), <code>on_drop</code> is still armed: its <code>Drop</code> records the failure in the fee memo and calls <code>notify_waiters</code>. Only after that is <code>_flight</code> dropped, releasing the single-flight lock. A caller queued on that lock therefore finds “just failed” and returns the retryable error instead of rerunning the peer ladder. In the other order, the lock would be released first, the queued caller could see no failure recorded, and it would start a duplicate ladder. On success <code>disarm()</code> makes the guard a no-op, and the result is stored normally.",
+   "points":["locals drop in reverse declaration order; async fn parameters are dropped after the body's locals","the armed guard records the failure and wakes waiters when the future is dropped mid-ladder","only then is the single-flight lock released","a queued caller then sees the recorded failure and does not rerun the ladder","disarm() on the success path turns the Drop into a no-op"],
+   "context":"myotis-net/src/el/reader.rs L8199-8233 fee_estimate_refresh_locked(&self, requested: Head, _flight: OwnedMutexGuard&lt;()>): comment 'A local, so dropped before the `_flight` parameter: a ladder cut mid-way records its failure before the lock is released.' let mut on_drop = FeeFailOnDrop::new(self, move |c| c.estimate.record_failure(head, Instant::now())); ... on_drop.disarm(). L11006-11030 FeeFailOnDrop Drop: if armed { with_fee_cache(record); fee_stored.notify_waiters(); }"},
+  {"id":"reader-q7","type":"mcq","tags":["concurrency","async"],
+   "q":"<code>wait_for_fee</code> creates <code>self.fee_stored.notified()</code>, pins and enables it, and only then calls <code>settled()</code>. Why this order?",
+   "options":["So that a store that lands between the check and the await is not missed: <code>notify_waiters</code> stores no permit and only wakes futures already registered","Because <code>Notify</code> must be pinned before any method call on the reader","To make the wait FIFO","Because <code>settled()</code> holds the fee-cache lock and must run after the wait"],
+   "answer":0,
+   "explain":"Check-then-wait without prior registration is the classic lost wake-up. Registering first means any notification after the check wakes this waiter."},
+  {"id":"reader-q8","type":"mcq","tags":["interior-mutability","concurrency"],
+   "q":"<code>tx_scans</code> is a <code>std::sync::Mutex</code> holding a map of <code>Arc&lt;tokio::sync::Mutex&lt;TxScanState&gt;&gt;</code>. Why two kinds of mutex?",
+   "options":["An accident of history","tokio mutexes cannot be stored in maps","The std lock guards only the map and is held briefly, never across <code>.await</code>; each per-transaction tokio lock is held across the slow network scan, so concurrent polls for the same transaction do not duplicate work while different transactions proceed in parallel","std mutexes are async-aware"],
+   "answer":2,
+   "explain":"Choose the lock by how long it is held: a std mutex for quick in-memory work, a tokio mutex for critical sections that <code>.await</code>."},
+  {"id":"reader-q9","type":"mcq","tags":["domain"],
+   "q":"What must <code>fetch_anchored_window</code> establish before any header in the window is trusted?",
+   "options":["That at least two peers returned the same headers","Exact length and start number, that the last header's hash equals the anchored hash (optimistic head or finalized block), and that every header is parent-linked to the next","That the headers are recent","That the peer is pinned"],
+   "answer":1,
+   "explain":"This is the single gate for block, receipt, fee, transaction and block-hash reads. The anchored hash is attested by the light client, and the parent links extend that trust backwards."},
+  {"id":"reader-q10","type":"open","tags":["interior-mutability","concurrency"],
+   "q":"<code>persist_log_index</code> starts with <code>self.log_index_write.try_lock()</code> on a <code>Mutex&lt;()&gt;</code>, then serialises the index inside a block that holds <code>self.log_index</code>, then writes the bytes. Explain the lock, the <code>try_lock</code>, and the block.",
+   "model":"<code>log_index_write</code> guards no data: holding it means “a checkpoint write is in progress”, so checkpoints are totally ordered and the newest bytes land last. The documented order is checkpoint lock before index lock, which prevents deadlock. <code>try_lock</code> skips instead of waiting, because the other holders are slow (an import merging gigabytes) and whoever holds it is writing a newer snapshot anyway; the clock is left untouched so the next tick tries again. The block takes the index lock only to serialise, and the guard drops at its closing brace, so the slow write and fsync happen without the index lock, and the appender, the walker and getLogs queries are not stalled. <code>_writing</code> is a named binding, so it stays held until the function returns.",
+   "points":["Mutex&lt;()> is a token that serialises checkpoint writes; it protects no data","lock order: checkpoint lock before the index lock","try_lock skips because the holder writes a newer snapshot and waiting would stall the appender","the index guard is dropped at the end of the block, before the write and fsync","_writing (not _) keeps the token held to the end of the function"],
+   "context":"myotis-net/src/el/reader.rs L4095-4140 persist_log_index: let Ok(_writing) = self.log_index_write.try_lock() else { return false; }; if respect_throttle && !is_due() return false; let (bytes, clamp) = { let Ok(slot) = self.log_index.lock() ...; (checkpoint_bytes(ix, ..), clamp) }; write_own_checkpoint(path, &bytes, clamp). Field doc L2123-2132: LOCK ORDER: acquired BEFORE log_index, never after."},
+  {"id":"reader-q11","type":"mcq","tags":["lifetimes","async","traits-generics"],
+   "q":"The backfill batch builds its chunk fetches in a plain loop as <code>Box::pin(async move { … })</code> into a <code>Vec&lt;ChunkFetch&lt;'_&gt;&gt;</code>, instead of <code>candidates.chunks(n).map(|c| async move { … })</code>. According to the comment, why?",
+   "options":["Boxed futures run faster","<code>buffered</code> only accepts boxed futures","A closure returning a future that borrows the header slices is not general enough over their lifetime for the spawned appender task's <code>Send</code> bound; boxing each future into a named <code>BoxFuture</code> type avoids that","So the fetches start immediately, before <code>buffered</code> polls them"],
+   "answer":2,
+   "explain":"It is a compiler limitation around closures that return borrowing futures. The boxes cost one allocation per chunk, and nothing runs until <code>buffered</code> polls them."},
+  {"id":"reader-q12","type":"mcq","tags":["testing","async"],
+   "q":"A <code>first_accepted</code> test writes <code>let (_stop, shutdown) = watch::channel(false);</code>. What would change with <code>let (_, shutdown) = …</code>?",
+   "options":["Nothing; both ignore the sender","The sender would be dropped at once, and <code>first_accepted</code> treats a dropped sender as a shutdown, so every write would be cut and the call would return <code>false</code>","The test would not compile","The paused clock would stop advancing"],
+   "answer":1,
+   "explain":"<code>_</code> is not a binding, so the value is dropped immediately. <code>_stop</code> is a binding that lives to the end of the scope. <code>wait_for</code> on a closed channel returns an error, and that <code>select!</code> arm then cuts the write."},
+  {"id":"reader-q13","type":"open","tags":["error-handling","traits-generics"],
+   "q":"<code>BackfillBatchError</code> implements <code>From&lt;String&gt;</code> and <code>From&lt;&amp;str&gt;</code>, while <code>FeeBuildError</code> deliberately implements neither. What does each choice mean for a bare <code>?</code> on a <code>Result&lt;_, String&gt;</code>, and why does the difference matter?",
+   "model":"The <code>?</code> operator converts the error with <code>From::from</code> into the function's error type. In the backfill batch, that conversion builds <code>BackfillBatchError::peer</code>, so every bare <code>?</code> blames the peer, and the few failures that are the engine's own fault must be built explicitly with <code>BackfillBatchError::ours</code>. <code>FeeBuildError</code> has no such conversion, so a <code>?</code> on a <code>String</code> error does not compile: every site must state whether it is the peer's fault (<code>Peer</code>) or ours (<code>Ours</code>). The difference matters because blame drives peer strikes and eviction: a check that was wrong on our side once struck every snap peer on every fee-history build, and the missing <code>From</code> makes that mistake a compile error.",
+   "points":["? converts the error with From::from into the function's error type","in the backfill, a bare ? therefore blames the peer; our own faults use BackfillBatchError::ours","FeeBuildError has no From&lt;String>, so a bare ? on a String error fails to compile","every fee-build site must state Peer or Ours, because blame drives strikes and eviction"],
+   "context":"myotis-net/src/el/reader.rs L14165-14207 BackfillBatchError { message, blames_peer } with fn peer / fn ours; impl From&lt;String> and From&lt;&str> -> Self::peer. L1919-1956 FeeBuildError { Peer(String), Ours(String) }: 'Deliberately no From&lt;String>: every site in the build states its side, so a ? on a String result added after a root check fails to compile instead of silently blaming the peer (PR #578 review).'"},
+  {"id":"reader-q14","type":"open","tags":["async","smart-pointers"],
+   "q":"Describe the order of <code>ElReader::stop()</code> and why each step comes where it does.",
+   "model":"First <code>cancel_requests()</code> flips the shutdown watch, so every registered operation and every follower sees the stop. Then the log-index appender, the fee follower and the activity follower are aborted and awaited, so their per-tick strong <code>Arc</code>s are gone and none of them starts new work during the drain; the followers also refuse to respawn once the flag is set. Then the fee stats are flushed to the log. Then each live request is upgraded from its <code>Weak</code> in the registry and awaited until it has settled. Then the appender slot is aborted once more, without awaiting, in case it was started again meanwhile. Then a final checkpoint is written off the throttle (<code>respect_throttle = false</code>), and only after that are the pool and discovery stopped, since the requests and the checkpoint may still need them.",
+   "points":["the shutdown flag is set first so operations and followers see it","producers (appender, fee and activity followers) are aborted and awaited before the drain","live requests are found by upgrading Weak&lt;Operation> and awaited to settled()","a final unthrottled checkpoint is written","the pool and discovery are stopped last"],
+   "context":"myotis-net/src/el/reader.rs L10198-10223 stop: cancel_requests(); stop_log_index_appender().await; stop_fee_follower().await; stop_activity_follower().await; log_fee_summary(flush); requests.lock().map(|r| r.iter().filter_map(Weak::upgrade).collect()); for r in requests { r.settled().await }; log_index_task abort; persist_log_index(finalized, false); pool.stop().await; discovery.stop().await. ensure_fee_follower/ensure_activity_follower return early if *request_shutdown.borrow()."}
+]</x-quiz>

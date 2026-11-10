@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 960 250" role="img" fill="currentColor" aria-label="Build-time pipeline. ffi.rs is compiled by cargo build release; the macros put, per function, an extern C function, a UNIFFI_META static and a checksum function into the library. uniffi-bindgen in library mode reads the UNIFFI_META statics and recomputes the checksums, then writes myotis_engine.kt with the expected values; Gradle masks the comparisons to 16 bits. At load time the Kotlin compares the contract version and every checksum against the loaded library, then RustEngineNative compares ABI_VERSION." width="960" height="250">
+      <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="960.0" height="250.0" fill="#f8fafb" /><defs>
+        <marker id="m-stop17-arrow-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+        </marker>
+      </defs>
+      <g font-size="12">
+        <rect x="10" y="20" width="150" height="80" rx="8" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+        <text x="85" y="46" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">ffi.rs</text>
+        <text x="85" y="66" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">55 × #[uniffi::export]</text>
+        <text x="85" y="82" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">+ setup_scaffolding!</text>
+        <rect x="185" y="20" width="230" height="80" rx="8" stroke-width="1.5" style="fill:var(--surface);stroke:var(--oxide)" />
+        <text x="300" y="40" text-anchor="middle" font-weight="700">cargo build --release</text>
+        <text x="300" y="58" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">per function the macro emits:</text>
+        <text x="300" y="73" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">extern "C" fn, UNIFFI_META_… static,</text>
+        <text x="300" y="88" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">u16 checksum fn, computed by the compiler</text>
+        <rect x="440" y="20" width="160" height="80" rx="8" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)" />
+        <text x="520" y="46" text-anchor="middle" font-weight="700">libmyotis_engine</text>
+        <text x="520" y="66" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">.dylib / .so / .dll</text>
+        <text x="520" y="82" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">symbols + metadata bytes</text>
+        <rect x="625" y="20" width="150" height="80" rx="8" stroke-width="1.5" style="fill:var(--surface);stroke:var(--ink-3)" />
+        <text x="700" y="46" text-anchor="middle" font-weight="700">uniffi-bindgen</text>
+        <text x="700" y="66" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">--library: reads</text>
+        <text x="700" y="82" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">UNIFFI_META_*, rehashes</text>
+        <rect x="800" y="20" width="150" height="80" rx="8" stroke-width="1.5" style="fill:var(--jvm-wash);stroke:var(--jvm)" />
+        <text x="875" y="46" text-anchor="middle" font-weight="700" style="fill:var(--jvm-ink)">myotis_engine.kt</text>
+        <text x="875" y="66" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">committed; expected</text>
+        <text x="875" y="82" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">checksums, masked</text>
+        <rect x="190" y="160" width="760" height="70" rx="8" stroke-width="1.5" style="fill:var(--ok-wash);stroke:var(--ok)" />
+        <text x="570" y="184" text-anchor="middle" font-weight="700" style="fill:var(--ok-ink)">At load time (RustEngineNative → uniffiEnsureInitialized)</text>
+        <text x="570" y="204" text-anchor="middle" font-size="11">contract version 30 == 30?  ·  55 × (checksum() and 0xFFFF) == expected?  ·  all symbols bound?</text>
+        <text x="570" y="220" text-anchor="middle" font-size="11">then engineInit() == EXPECTED_ABI_VERSION (55)?  Any "no" → isAvailable() is false</text>
+      </g>
+      <g stroke-width="1.5" fill="none" style="stroke:currentColor">
+        <line x1="160" y1="60" x2="181" y2="60" marker-end="url(#m-stop17-arrow-b)" />
+        <line x1="415" y1="60" x2="436" y2="60" marker-end="url(#m-stop17-arrow-b)" />
+        <line x1="600" y1="60" x2="621" y2="60" marker-end="url(#m-stop17-arrow-b)" />
+        <line x1="775" y1="60" x2="796" y2="60" marker-end="url(#m-stop17-arrow-b)" />
+        <line x1="520" y1="100" x2="520" y2="156" stroke-dasharray="5 4" marker-end="url(#m-stop17-arrow-b)" />
+        <line x1="875" y1="100" x2="875" y2="156" stroke-dasharray="5 4" marker-end="url(#m-stop17-arrow-b)" />
+      </g>
+      <g font-size="10.5" style="fill:var(--ink-3)">
+        <text x="527" y="134">the library that is loaded</text>
+        <text x="868" y="134" text-anchor="end">the values generated earlier</text>
+        <text x="20" y="150">build time (top) and load time (bottom)</text>
+      </g>
+    </svg>

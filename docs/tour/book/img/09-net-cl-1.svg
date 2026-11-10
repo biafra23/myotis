@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 900 420" role="img" fill="currentColor" aria-label="Request round trip. On the caller's side, request_raw_at walks the peer's addresses one at a time and resolves DNS names. Each attempt sends Command::Request carrying a oneshot sender over the mpsc channel to the swarm task. If the peer has no completed Status exchange, the task parks the request and dials. The task sends an automatic Status request; the peer answers; the parked request is released. The task sends the request on the protocol's behaviour and stores the reply sender under the protocol and request id. The peer's response chunks arrive and complete() removes the sender and sends the bytes back through the oneshot to the waiting caller." width="900" height="420">
+      <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="900.0" height="420.0" fill="#f8fafb" /><defs>
+        <marker id="m-09-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+        </marker>
+      </defs>
+      <rect x="40" y="14" width="200" height="40" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="140" y="39" text-anchor="middle" font-size="13" font-weight="700">sync-loop task</text>
+      <rect x="340" y="14" width="220" height="40" rx="8" stroke-width="1.6" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="450" y="32" text-anchor="middle" font-size="13" font-weight="700">swarm task</text>
+      <text x="450" y="47" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">owns Swarm + SwarmCtx</text>
+      <rect x="680" y="14" width="200" height="40" rx="8" stroke-width="1.4" stroke-dasharray="5 4" style="fill:none;stroke:var(--ink-3)" />
+      <text x="780" y="39" text-anchor="middle" font-size="13" font-weight="700">remote beacon node</text>
+
+      <line x1="140" y1="54" x2="140" y2="406" stroke-width="1" stroke-dasharray="3 4" style="stroke:var(--rule)" />
+      <line x1="450" y1="54" x2="450" y2="406" stroke-width="1" stroke-dasharray="3 4" style="stroke:var(--rule)" />
+      <line x1="780" y1="54" x2="780" y2="406" stroke-width="1" stroke-dasharray="3 4" style="stroke:var(--rule)" />
+
+      <rect x="20" y="66" width="240" height="40" rx="5" style="fill:var(--ground-2)" />
+      <text x="140" y="82" text-anchor="middle" font-size="10.5" class="mono">request_raw_at: QUIC, then TCP</text>
+      <text x="140" y="97" text-anchor="middle" font-size="10.5">one address at a time · DNS resolved here</text>
+
+      <line x1="140" y1="126" x2="446" y2="126" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-09-arrow)" />
+      <text x="295" y="118" text-anchor="middle" font-size="11" class="mono">Command::Request { …, reply }</text>
+      <text x="295" y="140" text-anchor="middle" font-size="10.5" style="fill:var(--ink-3)">mpsc (256) · reply = oneshot::Sender</text>
+
+      <rect x="462" y="152" width="190" height="34" rx="5" style="fill:var(--ground-2)" />
+      <text x="557" y="166" text-anchor="middle" font-size="10.5">no Status yet? park in</text>
+      <text x="557" y="180" text-anchor="middle" font-size="10.5" class="mono">ctx.queued · dial</text>
+
+      <line x1="450" y1="210" x2="776" y2="210" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-09-arrow)" />
+      <text x="615" y="203" text-anchor="middle" font-size="11">auto Status v2 request</text>
+      <line x1="780" y1="240" x2="454" y2="240" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-09-arrow)" />
+      <text x="615" y="233" text-anchor="middle" font-size="11">Status reply → mark_status_done → release</text>
+
+      <line x1="450" y1="280" x2="776" y2="280" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-09-arrow)" />
+      <text x="615" y="273" text-anchor="middle" font-size="11">request bytes on the protocol's behaviour</text>
+      <text x="615" y="296" text-anchor="middle" font-size="10.5" class="mono" style="fill:var(--oxide-ink)">pending[(protocol, id)] = reply</text>
+      <line x1="780" y1="324" x2="454" y2="324" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-09-arrow)" />
+      <text x="615" y="317" text-anchor="middle" font-size="11">response chunks (read_until_quiet)</text>
+
+      <line x1="450" y1="366" x2="144" y2="366" stroke-width="1.6" style="stroke:var(--ok)" marker-end="url(#m-09-arrow)" />
+      <text x="295" y="358" text-anchor="middle" font-size="11" class="mono">complete(): pending.remove → reply.send(Ok(bytes))</text>
+      <text x="140" y="392" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">rx.await → myotis-wire codec → myotis-consensus</text>
+    </svg>
