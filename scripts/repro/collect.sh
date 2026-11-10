@@ -104,7 +104,11 @@ linux)
     dpkg-deb --fsys-tarfile "$deb" | tar -xpf - -C "$out/desktop/deb-payload"
     dpkg-deb --control "$deb" "$out/desktop/deb-payload/DEBIAN"
     # TZ=UTC: tar prints mtimes in local time, and leg b's zone is another.
-    dpkg-deb --fsys-tarfile "$deb" | TZ=UTC tar -tvf - --full-time --numeric-owner | LC_ALL=C sort -k6 > "$out/desktop/deb-payload.entries"
+    # No size column: the payload's bytes are compared above, and the launcher
+    # .cfg's raw size follows the skiko jar's hash name (known-differences.txt),
+    # whose length varies (the plugin drops the hash's leading zeros).
+    dpkg-deb --fsys-tarfile "$deb" | TZ=UTC tar -tvf - --full-time --numeric-owner \
+        | awk '{ $3 = ""; print }' | LC_ALL=C sort -k6 > "$out/desktop/deb-payload.entries"
     normalize_payload "$out/desktop/deb-payload"
     sed -i -E 's/(skiko-awt-runtime-[a-z0-9-]+-[0-9][0-9.]*)-[0-9a-f]{20,40}\.jar/\1-CONTENTHASH.jar/' "$out/desktop/deb-payload.entries"
     echo "  desktop/deb-payload/ (payload) + desktop/deb-payload.entries"
