@@ -115,10 +115,15 @@ expect myotis-rpc-policy-jvm .jar
 # by the root module metadata, so a KMP consumer with an iOS target resolves them.
 expect myotis-rpc-policy-iosarm64 .klib
 expect myotis-rpc-policy-iossimulatorarm64 .klib
+# The preset catalog: KMP like the policy module, `api` of the engine library.
+expect myotis-logindex-presets-jvm .jar
+expect myotis-logindex-presets-iosarm64 .klib
+expect myotis-logindex-presets-iossimulatorarm64 .klib
 expect myotis-engine-jvm .jar
 expect myotis-engine-android .aar
 for a in myotis-api myotis-engine-common myotis-engine-ports myotis-engine-rust \
          myotis-rpc-policy myotis-rpc-policy-jvm myotis-rpc-policy-iosarm64 myotis-rpc-policy-iossimulatorarm64 \
+         myotis-logindex-presets myotis-logindex-presets-jvm myotis-logindex-presets-iosarm64 myotis-logindex-presets-iossimulatorarm64 \
          myotis-engine myotis-engine-jvm myotis-engine-android; do
     expect "$a" .pom
     expect "$a" .module

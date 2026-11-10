@@ -352,6 +352,18 @@ public final class NodeService extends Service {
         prefs(c).edit().putBoolean("logIndex.backfillPaused." + canonicalNetwork(network), on).apply();
     }
 
+    /** Whether the log index's backfill walk may download on a metered network (see
+     *  {@code Settings.logIndexAllowMetered}). Off by default: "unmetered only" — this
+     *  host reports metering to the engine (NET_CAPABILITY_NOT_METERED), which holds the
+     *  walk on mobile data unless this is on. */
+    public static boolean logIndexAllowMetered(android.content.Context c, String network) {
+        return prefs(c).getBoolean("logIndex.allowMetered." + canonicalNetwork(network), false);
+    }
+
+    public static void setLogIndexAllowMetered(android.content.Context c, String network, boolean on) {
+        prefs(c).edit().putBoolean("logIndex.allowMetered." + canonicalNetwork(network), on).apply();
+    }
+
     public static void setLogIndexEnabled(android.content.Context c, String network, boolean on) {
         prefs(c).edit().putBoolean("logIndex." + canonicalNetwork(network), on).apply();
     }
@@ -490,7 +502,8 @@ public final class NodeService extends Service {
             boolean enabled = logIndexEnabled(this, net);
             String json = io.myotis.ui.LogIndexWatch.configJson(
                     logIndexWatchJson(this, net), enabled, logIndexMaxSpeed(this, net),
-                    logIndexConfigured(this, net), logIndexBackfillPaused(this, net));
+                    logIndexConfigured(this, net), logIndexBackfillPaused(this, net),
+                    logIndexAllowMetered(this, net));
             if (json == null) {
                 return; // nothing to say (no entries, never configured) — engine stays honestly unconfigured
             }

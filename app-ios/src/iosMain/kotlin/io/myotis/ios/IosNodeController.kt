@@ -201,7 +201,8 @@ class IosNodeController(
             settings.logIndexWatchJson(net), settings.logIndexEnabled(net),
             settings.logIndexMaxSpeed(net),
             configured = settings.logIndexConfigured(net),
-            backfillPaused = settings.logIndexBackfillPaused(net)) ?: return
+            backfillPaused = settings.logIndexBackfillPaused(net),
+            allowMetered = settings.logIndexAllowMetered(net)) ?: return
         // No push lock here, unlike the JVM hosts: every caller — boot, the
         // settings pokes, an import — runs on the single-threaded lifecycleLane,
         // so pushes are built and applied one at a time, in order.

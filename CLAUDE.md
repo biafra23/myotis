@@ -145,6 +145,14 @@ Key Gradle modules:
   `WebOrigins`, the web-page policy's pure half of #502): a dependency-free Kotlin
   Multiplatform module, one definition for the Rust engine, the router in
   `:jsonrpc-server`, the iOS backend and the UI's normalizer parity test.
+- **myotis-logindex-presets** — the log index's PREDEFINED CONTRACTS
+  (`io.myotis.logindex`: `LogIndexPresets` — RAILGUN, Swarm, Privacy Pools,
+  Tornado Cash per network, each from its creation block — and
+  `LogIndexDownloads`: download/disk estimates, "cheaper together", the config
+  push): dependency-free Kotlin Multiplatform like `:myotis-rpc-policy`, one
+  catalog for the Index tab (`:ui`) and for embedding apps (`api` of
+  `:myotis-engine` and `:myotis-engine-ios`; `Myotis.LogIndex` is the JVM
+  trigger). docs/how-it-works/log-index-presets.md.
 - **myotis-api** — THE ENGINE CONTRACT: zero-dependency Java-17 interfaces
   (`io.myotis.api` + `io.myotis.api.ports`) every host consumes exclusively.
   FFI-portable types only (byte[], String, long, double[], enums, flat records;

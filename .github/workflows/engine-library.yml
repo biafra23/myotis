@@ -35,6 +35,7 @@ on:
       - 'myotis-engine-common/**'
       - 'myotis-engine-ports/**'
       - 'myotis-rpc-policy/**'
+      - 'myotis-logindex-presets/**'
       - 'myotis-engine-rust/**'
       - 'myotis-engine/**'
       - 'myotis-engine-natives/**'

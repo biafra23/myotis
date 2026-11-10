@@ -184,6 +184,24 @@ class DesktopSettingsPersistenceTest {
     }
 
     @Test
+    fun `metered downloads round-trip per network and do not read as an enabled index`(@TempDir dir: Path) {
+        val file = dir.resolve("settings.properties")
+        val first = DesktopSettings(nets, file)
+        assertFalse(first.logIndexAllowMetered("gnosis"), "unmetered only is the default")
+        first.setLogIndexAllowMetered("gnosis", true)
+        val second = DesktopSettings(nets, file)
+        assertTrue(second.logIndexAllowMetered("gnosis"))
+        assertFalse(second.logIndexAllowMetered("mainnet"))
+        // `logIndex.allowMetered.gnosis` shares the `logIndex.` prefix of the enabled
+        // flag: it must not configure a network called "allowMetered.gnosis".
+        assertFalse(second.logIndexConfigured("allowMetered.gnosis"))
+        assertFalse(second.logIndexConfigured("gnosis"))
+        second.setLogIndexEnabled("gnosis", true)
+        second.setLogIndexWatchJson("gnosis", """[{"address":"0x45a1502382541cD610CC9068e88727426b696293","fromBlock":7}]""")
+        assertTrue(logIndexConfigJson(second, "gnosis")!!.contains("\"allowMetered\":true"))
+    }
+
+    @Test
     fun `a removed contract's marker survives a restart`(@TempDir dir: Path) {
         // The marker is what makes the next config push name the address under
         // `unwatch`. A removal made while the network was stopped exists ONLY as
