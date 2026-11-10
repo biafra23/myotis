@@ -42,6 +42,8 @@ on:
       - 'rust/**'
       - 'scripts/check_engine_library.sh'
       - 'scripts/merge_maven_repo.py'
+      - 'scripts/normalize_maven_metadata.py'
+      - 'scripts/repro_zip.sh'
       - '.github/workflows/engine-library.yml'
       - '.java-version'
       - '.xcode-version'
@@ -427,7 +429,7 @@ jobs:
           tmp=$(mktemp -d); n=0
           while IFS= read -r f; do
             rel=${f#build/maven-repo/}
-            curl -fsS -u "${GITHUB_ACTOR}:${GITHUB_TOKEN}" -o "$tmp/x" \
+            curl -fsSL -u "${GITHUB_ACTOR}:${GITHUB_TOKEN}" -o "$tmp/x" \
               "https://maven.pkg.github.com/${GITHUB_REPOSITORY}/$rel" \
               || { echo "::error::$rel is not on GitHub Packages"; exit 1; }
             cmp -s "$f" "$tmp/x" || { echo "::error::$rel on GitHub Packages differs from the staged, checked copy"; exit 1; }

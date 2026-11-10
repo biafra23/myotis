@@ -36,12 +36,15 @@ if command -v cygpath >/dev/null 2>&1; then
 fi
 _repro_rustflags="--remap-path-prefix=$_repro_cargo_home/registry/src=/cargo/registry/src --remap-path-prefix=$_repro_cargo_home/git/checkouts=/cargo/git/checkouts --remap-path-prefix=$_repro_rust=/myotis/rust"
 _repro_cflags="-ffile-prefix-map=$_repro_cargo_home/registry/src=/cargo/registry/src -ffile-prefix-map=$_repro_cargo_home/git/checkouts=/cargo/git/checkouts -ffile-prefix-map=$_repro_rust=/myotis/rust"
+_repro_seen=" "  # the host is usually in the list too: visit it once, like Gradle's distinct()
 for _repro_t in $(rustc -vV 2>/dev/null | sed -n 's/^host: //p') \
     aarch64-linux-android x86_64-linux-android armv7-linux-androideabi \
     aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios \
     aarch64-apple-darwin x86_64-apple-darwin \
     x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc \
     x86_64-unknown-none wasm32-unknown-unknown; do
+    case "$_repro_seen" in *" $_repro_t "*) continue ;; esac
+    _repro_seen="$_repro_seen$_repro_t "
     # Appended to an existing value, like Gradle's twin.
     _repro_k="CARGO_TARGET_$(printf '%s' "$_repro_t" | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
     export "$_repro_k=${!_repro_k:+${!_repro_k} }$_repro_rustflags"
@@ -51,4 +54,4 @@ for _repro_t in $(rustc -vV 2>/dev/null | sed -n 's/^host: //p') \
            export "$_repro_k=${!_repro_k:+${!_repro_k} }$_repro_cflags" ;;
     esac
 done
-unset _repro_rust _repro_cargo_home _repro_rustflags _repro_cflags _repro_t _repro_k
+unset _repro_rust _repro_cargo_home _repro_rustflags _repro_cflags _repro_t _repro_k _repro_seen

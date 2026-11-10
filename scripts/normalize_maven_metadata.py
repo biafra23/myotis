@@ -35,6 +35,8 @@ def epoch():
 def main(repo):
     stamp = time.strftime("%Y%m%d%H%M%S", time.gmtime(epoch()))
     files = sorted(Path(repo).rglob("maven-metadata.xml"))
+    if not files:  # a wrong REPO_DIR must not pass as "nothing to normalize"
+        sys.exit(f"normalize_maven_metadata: no maven-metadata.xml under {repo}")
     for meta in files:
         text = meta.read_text(encoding="utf-8")
         new, n = re.subn(r"<lastUpdated>\d{14}</lastUpdated>", f"<lastUpdated>{stamp}</lastUpdated>", text)
