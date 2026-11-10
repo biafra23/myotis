@@ -748,7 +748,8 @@ val reproducibleRustEnv: Map<String, String> = run {
     // APPENDED to whatever the environment already holds, not replacing it: a
     // developer's own target rustflags / CFLAGS keep working.
     fun withExisting(key: String, value: String) = key to
-        (System.getenv(key)?.takeIf { it.isNotBlank() }?.let { "$it $value" } ?: value)
+        // Idempotent: a shell that sourced rust/repro-env.sh already carries the block.
+        (System.getenv(key)?.takeIf { it.isNotBlank() }?.let { if (value in it) it else "$it $value" } ?: value)
     triples.flatMap { t ->
         listOfNotNull(
             withExisting("CARGO_TARGET_${t.uppercase().replace('-', '_')}_RUSTFLAGS", rustflags),

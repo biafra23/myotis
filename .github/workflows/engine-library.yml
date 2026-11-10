@@ -392,6 +392,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./gradlew "-PpublishRelease=${GITHUB_REF_NAME#v}" -PengineNativesDir=build/engine-natives publishAllPublicationsToGitHubPackagesRepository --stacktrace
 
+      # The iOS module went up from the ios-engine job (Gradle here has it
+      # disabled): make sure it is there, or a re-run of this job alone after a
+      # deleted version would publish everything but it, all green.
       - name: Check the iOS module is on GitHub Packages
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -404,14 +407,6 @@ jobs:
               || { echo "::error::eth.myotis:$a:$v is not on GitHub Packages — re-run ALL jobs (the ios-engine job publishes it)"; exit 1; }
           done
 
-      # The staged repository, for the maven-repo job below — uploaded the
-      # moment the version is irrevocably on GitHub Packages, so "the artifact
-      # exists" means exactly "this version is published and belongs on the
-      # branch": a failure later in this job (a release upload blip) still gets
-      # the branch published, and a failure earlier does not. Overwritable: a
-      # re-run of this job (after deleting the package versions, see the job's
-      # note) uploads it again under the same run. Kept the default 90 days:
-      # that is how long "re-run failed jobs" can repair the branch job alone.
       # Published == staged (#734 D8). The publish above is a SECOND Gradle run;
       # it uploads the staged bytes only as long as nothing re-ran in between.
       # Read every published artifact back and compare it with the staged copy
@@ -420,6 +415,8 @@ jobs:
       # registry keeps its own maven-metadata, and checksum sidecars derive
       # from the files (GitHub Packages need not store .sha256/.sha512). After
       # the iOS check, so a missing iOS module still gets that step's hint.
+      # Before the upload below on purpose: a version whose published bytes
+      # are not the checked ones does not go onto the maven-repo branch.
       - name: Check the published bytes are the staged ones
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -439,9 +436,14 @@ jobs:
           [ "$n" -gt 0 ] || { echo "::error::no staged files for $v"; exit 1; }
           echo "all $n published files match the staged publication"
 
-      # The iOS module went up from the ios-engine job (Gradle here has it
-      # disabled): make sure it is there, or a re-run of this job alone after a
-      # deleted version would publish everything but it, all green.
+      # The staged repository, for the maven-repo job below — uploaded the
+      # moment the version is irrevocably on GitHub Packages and its bytes are
+      # checked, so "the artifact exists" means exactly "this version is
+      # published and belongs on the branch": a failure later in this job (a release upload blip) still gets
+      # the branch published, and a failure earlier does not. Overwritable: a
+      # re-run of this job (after deleting the package versions, see the job's
+      # note) uploads it again under the same run. Kept the default 90 days:
+      # that is how long "re-run failed jobs" can repair the branch job alone.
       - name: Upload the staged repository for the maven-repo branch
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:

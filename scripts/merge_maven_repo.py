@@ -15,7 +15,7 @@ So: every file under a version directory is copied as is (checksums included —
 Gradle wrote them); an artifact-level maven-metadata.xml the target already has
 is MERGED — the union of both version lists in order, `latest` / `release` the
 newest version of the union by Maven's ordering (a hotfix of an older line does
-not move them backwards), `lastUpdated` from the staged side — and its four
+not move them backwards), `lastUpdated` the later of the two stamps — and its four
 checksum files (.md5/.sha1/.sha256/.sha512, the set Gradle writes) are
 regenerated, since a checksum that no longer matches is a resolution error in
 Gradle, while a missing one is tolerated. A metadata file the target does not
