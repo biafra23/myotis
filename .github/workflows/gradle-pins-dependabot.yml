@@ -11,8 +11,13 @@
 # token. Only the second job can write, and it treats the first job's output
 # as untrusted data: pin files only (checked by path), and a hash list that
 # may only GROW (scripts/check_pins_additive.py: the verification settings
-# unchanged, every already-pinned checksum unchanged). A bump never needs
-# more; a plugin that tried to loosen verification fails the job.
+# unchanged, every already-pinned entry unchanged). A bump never needs more;
+# a plugin that tried to loosen verification fails the job. The LOCKFILES get
+# the path check only: their content is what the bumped build resolved, and a
+# compromised plugin could repin any module to another published version
+# (whose real hashes then pass the additive check). No cheap invariant tells
+# that from a legitimate transitive move, so the lockfile diff is part of what
+# the human review must read, line by line, with the hash diff.
 #
 # The commit lands on exactly the head the pins were generated for: the
 # commit job checks out that sha, so a branch that moved in between rejects

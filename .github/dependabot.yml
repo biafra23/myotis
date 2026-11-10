@@ -11,8 +11,10 @@
 #
 # Not covered by any ecosystem here, so bumped by hand in a reviewed PR:
 # rust/rust-toolchain.toml, gradle/libs.versions.toml's android-ndk /
-# android-build-tools / cargo-ndk, .java-version, .xcode-version and the runner
-# image labels. claude-review.yml is excluded (see the github-actions entry).
+# android-build-tools / cargo-ndk, .java-version, .xcode-version, the runner
+# image labels, and the test-only interpreters that still float on purpose
+# (setup-python `3.x` in mm-replay-tests.yml, Node `20` in smoke-gate-tests.yml:
+# neither touches a shipped artifact). claude-review.yml is excluded (see the github-actions entry).
 version: 2
 updates:
   - package-ecosystem: github-actions
