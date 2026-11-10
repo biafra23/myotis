@@ -38,7 +38,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 # hash against it. Every fetch after that verifies TLS too. Release files of a
 # past snapshot are past their Valid-Until by design. The service is slow and
 # sheds load with 503s (the first image build lost 30 packages to them after 15
-# minutes), so apt retries each fetch, with its backoff.
+# minutes), so apt retries each fetch, with its backoff. That is not enough when
+# it refuses everything for minutes (a later build got 503 on all three InRelease
+# files through ten retries each): `apt-get update` then EXITS 0 with no index,
+# and the install after it fails for a reason that reads like a missing package.
+# So an update that misses any index is an error (Error-Mode=any), and each apt
+# step as a whole is tried again, with longer pauses (14 minutes in all).
 ARG APT_SNAPSHOT
 RUN . /etc/os-release \
  && printf '%s\n' \
@@ -53,11 +58,14 @@ RUN . /etc/os-release \
       'Acquire::Retries "10";' \
       'Acquire::https::Timeout "120";' \
       > /etc/apt/apt.conf.d/99snapshot \
+ && again() { local n=0; until "$@"; do n=$((n + 1)); [ "$n" -lt 8 ] || return 1; \
+      echo "attempt $n of: $* failed; again in $((n * 30)) s" >&2; sleep $((n * 30)); done; } \
+ && all="-o APT::Update::Error-Mode=any" \
  && notls="-o Acquire::https::Verify-Peer=false -o Acquire::https::Verify-Host=false" \
- && apt-get $notls update -q \
- && apt-get $notls install -y -q --no-install-recommends ca-certificates \
- && apt-get update -q \
- && apt-get install -y -q --no-install-recommends \
+ && again apt-get $notls $all update -q \
+ && again apt-get $notls install -y -q --no-install-recommends ca-certificates \
+ && again apt-get $all update -q \
+ && again apt-get install -y -q --no-install-recommends \
       curl git unzip zip xz-utils python3 file \
       gcc g++ libc6-dev make pkg-config binutils \
       fakeroot dpkg-dev \

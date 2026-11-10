@@ -100,11 +100,10 @@ env:
   GRADLE_OPTS: -Dorg.gradle.daemon=false
 
 jobs:
-  # The builder image (#734 D-c), built ONCE per run from its Dockerfile, so it
-  # is proven buildable from its pins on every run, checked against them, and
-  # handed to Linux legs a and b as an artifact: both then build in the very
-  # same image, and the snapshot service its apt packages come from is asked
-  # once, not once per leg.
+  # The builder image (#734 D-c): ONE image per run, built from its Dockerfile
+  # or reused from an earlier build of the same pins (the cache steps below say
+  # why), checked against the pins either way, and handed to Linux legs a and b
+  # as an artifact, so both build in the very same image.
   builder-image:
     name: Builder image
     if: ${{ github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds') }}
@@ -114,17 +113,55 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
-      - name: Build and check the image
+      # An image built from the SAME pins before is reused, from the Actions
+      # cache: building it needs snapshot.ubuntu.com, which refuses requests for
+      # minutes at a time (two of the first five builds died on its 503s), and
+      # this comparison is a condition of merging into main. The key is every
+      # input of the image: the resolved build args (each pin, read from its one
+      # source) and the files of docker/builder. Reused or built, check.sh
+      # holds the image to the pins, apt package list included. That the image
+      # still BUILDS from its pins is the `builder image` workflow's question,
+      # which never reads this cache.
+      - name: Key the image by everything that determines it
+        id: key
         run: |
-          docker/builder/build.sh
-          docker/builder/check.sh
+          set -euo pipefail
+          hash=$({ docker/builder/build.sh --print-args; sha256sum docker/builder/*; } | sha256sum | cut -d' ' -f1)
+          echo "key=builder-image-$hash" >> "$GITHUB_OUTPUT"
+
+      - name: Look for an image built from these pins
+        id: cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ runner.temp }}/builder-image.tar.zst
+          key: ${{ steps.key.outputs.key }}
+
+      - name: Load the image
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: zstd -dc "$RUNNER_TEMP/builder-image.tar.zst" | docker load
+
+      - name: Build the image
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: docker/builder/build.sh
+
+      - name: Check the image against its pins
+        run: docker/builder/check.sh
 
       - name: Save the image
         run: |
           set -euo pipefail
-          docker save myotis-builder:local | zstd -T0 -3 -q -o "$RUNNER_TEMP/builder-image.tar.zst"
+          [ -f "$RUNNER_TEMP/builder-image.tar.zst" ] \
+            || docker save myotis-builder:local | zstd -T0 -3 -q -o "$RUNNER_TEMP/builder-image.tar.zst"
           ls -lh "$RUNNER_TEMP/builder-image.tar.zst"
           docker image inspect --format '{{.Id}}' myotis-builder:local | tee "$RUNNER_TEMP/builder-image.id"
+
+      # After check.sh: an image that does not match its pins is never cached.
+      - name: Keep the image for the next run with these pins
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ runner.temp }}/builder-image.tar.zst
+          key: ${{ steps.key.outputs.key }}
 
       - name: Upload the image
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2

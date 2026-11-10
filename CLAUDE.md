@@ -203,7 +203,9 @@ Key Gradle modules:
   `docker/builder/run.sh -- scripts/repro/build_linux.sh`; `run.sh` gives the
   build its own HOME, cargo home and Gradle home and none of the caller's
   environment) and what `reproducible-builds.yml`'s Linux legs a and b build
-  in. **The release workflows themselves still build on the hosted runner**
+  in (that run reuses an image already built from the same pins, from the
+  Actions cache, and checks it against them; the `builder image` workflow
+  builds it from scratch on every change to a pin, and weekly). **The release workflows themselves still build on the hosted runner**
   (`android-apk.yml`, `engine-library.yml`: the same pinned versions, installed
   by the setup actions); the comparison's leg r builds on that toolchain, and
   `Compare linux image vs runner toolchain` REPORTS whether it and the image
