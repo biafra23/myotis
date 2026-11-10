@@ -3947,6 +3947,9 @@ dependencies = [
 name = "myotis-consensus"
 version = "0.1.20"
 dependencies = [
+ "ark-bn254",
+ "ark-ec",
+ "ark-ff 0.6.0",
  "myotis-bls",
  "sha2 0.10.9",
  "tracing",
@@ -3985,10 +3988,12 @@ dependencies = [
  "myotis-core",
  "myotis-evm",
  "myotis-wire",
+ "rustls",
  "snap",
  "socket2 0.5.10",
  "tokio",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -8048,6 +8053,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af46dad42aa37be3b4a116fe613365f991b8bdae6cd6ce82d84fa9f9e8f70ae4"
 dependencies = [
  "web-time",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]
