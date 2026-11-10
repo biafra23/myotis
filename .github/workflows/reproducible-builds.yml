@@ -102,49 +102,56 @@ env:
   GRADLE_OPTS: -Dorg.gradle.daemon=false
 
 jobs:
-  # The builder image (#734 D-c): ONE image per run, built from its Dockerfile
-  # or reused from an earlier build of the same pins (the cache steps below say
-  # why), checked against the pins either way, and handed to Linux legs a and b
-  # as an artifact, so both build in the very same image.
+  # The builder image (#734 D-c): ONE image per run, the published one for
+  # these pins (the steps below say why not a build), checked against the pins,
+  # and handed to Linux legs a and b as an artifact, so both build in the very
+  # same image.
   builder-image:
     name: Builder image
     if: ${{ github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds') }}
     runs-on: ubuntu-26.04
-    timeout-minutes: 60
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      # Reads ghcr.io/<owner>/myotis-builder.
+      packages: read
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
-      # An image built from the SAME pins before is reused, from the Actions
-      # cache: building it needs snapshot.ubuntu.com, which refuses requests for
-      # minutes at a time (two of the first five builds died on its 503s), and
-      # this comparison is a condition of merging into main. The key is every
-      # input of the image: the resolved build args (each pin, read from its one
-      # source) and the files of docker/builder. Reused or built, check.sh
-      # holds the image to the pins, apt package list included. That the image
-      # still BUILDS from its pins is the `builder image` workflow's question,
-      # which never reads this cache.
-      - name: Key the image by everything that determines it
-        id: key
+      # The image published for these pins, by the digest docker/builder/
+      # image.lock names (pull.sh), not a build: a build needs
+      # snapshot.ubuntu.com, which refuses requests for minutes at a time (two
+      # of the first five builds died on its 503s), and this comparison is a
+      # condition of merging into main. Only when the pins have moved and the
+      # lock has not followed yet (pull.sh exits 3: a PR in the middle of
+      # moving a pin) is it built here. Pulled or built, check.sh holds it to
+      # the pins, apt package list included. That the image still BUILDS from
+      # its pins is the `builder image` workflow's question.
+      - name: Log in to the registry
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          # Not fatal: a login the registry did not answer shows up as a failed
+          # pull below, which builds instead (and a public package pulls without it).
+          printf '%s' "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin \
+            || echo "::warning::could not log in to ghcr.io; trying the pull without it"
+
+      # A locked image that cannot be pulled (pull.sh tries three times; a
+      # fork may not be able to read the package at all) is built too, with a
+      # warning: a tag's proof should not hinge on the registry's minute any
+      # more than on the snapshot service's. That the lock is pullable is the
+      # `builder image` workflow's check, where it is an error.
+      - name: Pull the image for these pins, or build it
         run: |
           set -euo pipefail
-          hash=$({ docker/builder/build.sh --print-args; sha256sum docker/builder/*; } | sha256sum | cut -d' ' -f1)
-          echo "key=builder-image-$hash" >> "$GITHUB_OUTPUT"
-
-      - name: Look for an image built from these pins
-        id: cache
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
-        with:
-          path: ${{ runner.temp }}/builder-image.tar.zst
-          key: ${{ steps.key.outputs.key }}
-
-      - name: Load the image
-        if: steps.cache.outputs.cache-hit == 'true'
-        run: zstd -dc "$RUNNER_TEMP/builder-image.tar.zst" | docker load
-
-      - name: Build the image
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: docker/builder/build.sh
+          rc=0; docker/builder/pull.sh || rc=$?
+          case "$rc" in
+            0) ;;
+            3) docker/builder/build.sh ;;
+            *) echo "::warning::the published builder image could not be pulled; building it from its pins instead"
+               docker/builder/build.sh ;;
+          esac
 
       - name: Check the image against its pins
         run: docker/builder/check.sh
@@ -152,18 +159,9 @@ jobs:
       - name: Save the image
         run: |
           set -euo pipefail
-          [ -f "$RUNNER_TEMP/builder-image.tar.zst" ] \
-            || docker save myotis-builder:local | zstd -T0 -3 -q -o "$RUNNER_TEMP/builder-image.tar.zst"
+          docker save myotis-builder:local | zstd -T0 -3 -q -o "$RUNNER_TEMP/builder-image.tar.zst"
           ls -lh "$RUNNER_TEMP/builder-image.tar.zst"
           docker image inspect --format '{{.Id}}' myotis-builder:local | tee "$RUNNER_TEMP/builder-image.id"
-
-      # After check.sh: an image that does not match its pins is never cached.
-      - name: Keep the image for the next run with these pins
-        if: steps.cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
-        with:
-          path: ${{ runner.temp }}/builder-image.tar.zst
-          key: ${{ steps.key.outputs.key }}
 
       - name: Upload the image
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2

@@ -203,9 +203,20 @@ Key Gradle modules:
   `docker/builder/run.sh -- scripts/repro/build_linux.sh`; `run.sh` gives the
   build its own HOME, cargo home and Gradle home and none of the caller's
   environment) and what `reproducible-builds.yml`'s Linux legs a and b build
-  in (that run reuses an image already built from the same pins, from the
-  Actions cache, and checks it against them; the `builder image` workflow
-  builds it from scratch on every change to a pin, and weekly). **The release workflows themselves still build on the hosted runner**
+  in. **The image is published** (owner's decision, 2026-11-10), once per set
+  of pins, to `ghcr.io/biafra23/myotis-builder`, and
+  `docker/builder/image.lock` names it by digest together with the key of the
+  pins it was built from (`build.sh --print-key`: the build args and the
+  Dockerfile). The comparison, and anyone who prefers not to build it, gets
+  that digest with `docker/builder/pull.sh` and checks it with `check.sh`;
+  building needs `snapshot.ubuntu.com`, which refuses requests for minutes at
+  a time. **Moving a pin therefore moves `image.lock` in the same change**,
+  like `apt-packages.txt`: the `builder image` workflow builds the new image
+  from the pins, publishes it and fails with the lines to commit; nothing
+  is hand-written, and an image already published for a key is never
+  replaced (`publish.sh` pushes only when the registry has said the key's tag
+  does not exist). The same workflow builds from the pins weekly, without
+  pulling, so "the image can still be built" stays observed. **The release workflows themselves still build on the hosted runner**
   (`android-apk.yml`, `engine-library.yml`: the same pinned versions, installed
   by the setup actions); the comparison's leg r builds on that toolchain, and
   `Compare linux image vs runner toolchain` REPORTS whether it and the image
