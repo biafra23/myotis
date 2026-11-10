@@ -10,12 +10,8 @@
 #
 # Format: <fnmatch pattern> TAB <reason>. `*` matches across `/`.
 
-# The Compose Gradle plugin (1.9.3) rewrites the skiko runtime jar when it
-# packages the desktop app (AbstractJPackageTask.unpackSkikoForCurrentOS, to
-# take the native library out), and its copyZipEntry builds each entry as
-# new ZipEntry(name) without the source entry's time, so ZipOutputStream
-# stamps the WALL CLOCK, in local time. Nothing in our build runs between that
-# rewrite and jpackage. The jar's name carries its content hash, which collect.sh
-# normalizes to -CONTENTHASH so the .cfg that lists it is still compared exactly.
-desktop/*skiko-awt-runtime-*-CONTENTHASH.jar	Compose plugin 1.9.3 rewrites this jar with wall-clock entry times (FileUtilsKt.copyZipEntry drops ZipEntry.time); upstream fix needed
-desktop/myotis.deb	contains the skiko runtime jar above; its payload is compared file by file in desktop/deb-payload/
+# (none: every artifact reproduces)
+#
+# History: the Compose plugin's wall-clock jar rewrite (the skiko runtime jar
+# everywhere, every jar on macOS) was listed here until app-desktop's
+# normalizeAppImage fixed it in our build (#734, Part 5a).

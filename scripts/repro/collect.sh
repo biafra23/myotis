@@ -59,36 +59,6 @@ PY
     echo "  $2/ (payload) + $2.entries"
 }
 
-# A desktop payload names each runtime jar <name>-<content hash>.jar (the
-# Compose plugin, which also lists the names in the launcher's .cfg). The
-# skiko runtime jar's content is not reproducible yet (known-differences.txt),
-# so neither is its name: give it a fixed one here, in the tree and in every
-# .cfg, so its CONTENT is compared and the .cfg's other lines still are.
-normalize_payload() {
-    python3 -I - "$1" <<'PY'
-import os, re, sys
-root = sys.argv[1]
-pat = re.compile(r"(skiko-awt-runtime-[a-z0-9-]+?-[0-9][0-9.]*)-[0-9a-f]{20,40}\.jar")
-renamed = {}
-for dirpath, _, files in os.walk(root):
-    for f in files:
-        m = pat.fullmatch(f)
-        if m:
-            new = m.group(1) + "-CONTENTHASH.jar"
-            os.rename(os.path.join(dirpath, f), os.path.join(dirpath, new))
-            renamed[f] = new
-for dirpath, _, files in os.walk(root):
-    for f in files:
-        if f.endswith(".cfg"):
-            p = os.path.join(dirpath, f)
-            text = open(p, encoding="utf-8").read()
-            for old, new in renamed.items():
-                text = text.replace(old, new)
-            open(p, "w", encoding="utf-8").write(text)
-print(f"  (normalized {len(renamed)} skiko jar name(s) in {root})")
-PY
-}
-
 cd "$src"
 echo "collecting $platform artifacts from $src into $out:"
 case "$platform" in
@@ -104,13 +74,9 @@ linux)
     dpkg-deb --fsys-tarfile "$deb" | tar -xpf - -C "$out/desktop/deb-payload"
     dpkg-deb --control "$deb" "$out/desktop/deb-payload/DEBIAN"
     # TZ=UTC: tar prints mtimes in local time, and leg b's zone is another.
-    # No size column: the payload's bytes are compared above, and the launcher
-    # .cfg's raw size follows the skiko jar's hash name (known-differences.txt),
-    # whose length varies (the plugin drops the hash's leading zeros).
+    # No size column: the payload's bytes are compared file by file above.
     dpkg-deb --fsys-tarfile "$deb" | TZ=UTC tar -tvf - --full-time --numeric-owner \
         | awk '{ $3 = ""; print }' | LC_ALL=C sort -k6 > "$out/desktop/deb-payload.entries"
-    normalize_payload "$out/desktop/deb-payload"
-    sed -i -E 's/(skiko-awt-runtime-[a-z0-9-]+-[0-9][0-9.]*)-[0-9a-f]{20,40}\.jar/\1-CONTENTHASH.jar/' "$out/desktop/deb-payload.entries"
     echo "  desktop/deb-payload/ (payload) + desktop/deb-payload.entries"
     put rust/target/release/libmyotis_engine.so host/libmyotis_engine.so
     put rust/target/x86_64-unknown-linux-gnu/release/libmyotis_node.so host/libmyotis_node.so
@@ -140,7 +106,6 @@ macos)
     mkdir -p "$out/desktop/dmg-app"
     ditto --noextattr --noqtn "$app" "$out/desktop/dmg-app/$(basename "$app")"
     hdiutil detach "$mnt" >/dev/null
-    normalize_payload "$out/desktop/dmg-app"
     echo "  desktop/dmg-app/$(basename "$app") (payload)"
     ;;
 windows)
@@ -155,7 +120,6 @@ windows)
     # The administrative install also drops a copy of the msi database itself.
     find "$dest" -maxdepth 1 -name '*.msi' -delete
     [[ -n "$(find "$dest" -type f -print -quit)" ]] || { echo "collect.sh: the msi extracted no files" >&2; exit 1; }
-    normalize_payload "$dest"
     echo "  desktop/msi-payload/ (payload)"
     ;;
 *)
