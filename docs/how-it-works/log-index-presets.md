@@ -123,7 +123,13 @@ blocks a tick and is what keeps head-reaching queries answerable. Downloads
 resume on their own when the device is back on Wi-Fi. Not held: the head
 bridge that closes a gap after downtime or above an imported seed (at most
 500,000 blocks, `BRIDGE_MAX_GAP`) — it is what makes head queries answerable
-again, so it runs on any network. An engine before ABI 56 ignores
+again, so it runs on any network. It is not small: the bridge fetches the
+receipts of every bloom candidate in the gap, so by this page's figures a day
+offline is ~7,200 mainnet blocks, ~440 MB with the Tornado Cash preset (71 % ×
+~86 KB), and a gap near the bound is tens of GB. The metered copy says so.
+Holding the bridge too past some gap size is an open design question, not done
+here: it trades data on mobile networks against head queries staying refused
+until the device is back on Wi-Fi. An engine before ABI 56 ignores
 `allowMetered` and holds nothing; an embedding app must not promise
 "unmetered only" on one.
 

@@ -228,7 +228,10 @@ object LogIndexDownloads {
     @JvmStatic
     fun formatBytes(b: Long): String {
         val units = listOf("B" to 1L, "KB" to 1_000L, "MB" to 1_000_000L, "GB" to 1_000_000_000L, "TB" to 1_000_000_000_000L)
-        val (name, unit) = units.last { b >= it.second || it.second == 1L }
+        var i = units.indexOfLast { b >= it.second || it.second == 1L }
+        // A value that rounds up to 1000 of a unit is shown in the next one ("1.0 GB", not "1000 MB").
+        if (i in 1 until units.lastIndex && (b * 10 + units[i].second / 2) / units[i].second >= 10_000) i++
+        val (name, unit) = units[i]
         if (unit == 1L) return "$b B"
         val tenths = (b * 10 + unit / 2) / unit
         return if (tenths >= 1000) "${tenths / 10} $name" else "${tenths / 10}.${tenths % 10} $name"

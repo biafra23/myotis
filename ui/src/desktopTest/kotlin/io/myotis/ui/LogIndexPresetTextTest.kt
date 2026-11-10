@@ -57,6 +57,16 @@ class LogIndexPresetTextTest {
     }
 
     @Test
+    fun `a preset contract listed from a later block is not labelled as fully added`() {
+        val sw = LogIndexPresets.byId("swarm-gnosis")!!
+        val full = sw.contracts.associate { it.address.lowercase() to it.fromBlock }
+        assertEquals(" — added", LogIndexPresetText.addedSuffix(sw, full))
+        assertEquals(" — added", LogIndexPresetText.addedSuffix(sw, full.mapValues { it.value - 10 }))
+        val later = full + (sw.contracts[0].address.lowercase() to 47_000_000L)
+        assertTrue(LogIndexPresetText.addedSuffix(sw, later).contains("earlier history not covered"))
+    }
+
+    @Test
     fun `allowMetered rides the push only when on`() {
         val watch = """[{"address":"0x1111111111111111111111111111111111111111","fromBlock":5}]"""
         val off = LogIndexWatch.configJson(watch, enabled = true)!!

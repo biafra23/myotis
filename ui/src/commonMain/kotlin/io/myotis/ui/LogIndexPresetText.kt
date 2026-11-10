@@ -72,13 +72,32 @@ object LogIndexPresetText {
             "Downloads also run on metered connections (mobile data, hotspots) — mind your data plan."
         networkMetering == "METERED" ->
             "This device is on a metered connection now: the download waits until it is on an " +
-                "unmetered one (Wi-Fi). New logs at the head are still followed."
+                "unmetered one (Wi-Fi). $HEAD_NOTE"
         networkMetering == null || networkMetering == "UNKNOWN" ->
             "Unmetered only. This device does not report metered connections, so downloads are " +
                 "never held here."
         else ->
             "Unmetered only: on a metered connection (mobile data, a hotspot) the download waits " +
-                "for Wi-Fi. New logs at the head are still followed."
+                "for Wi-Fi. $HEAD_NOTE"
+    }
+
+    /** What still runs on a metered network: head-follow, and the catch-up after time offline. */
+    private const val HEAD_NOTE =
+        "New blocks at the head are still followed, including the catch-up after time offline — " +
+            "for a large mainnet preset that can be hundreds of MB per day the device was off."
+
+
+    /**
+     * The label suffix of a preset whose contracts are all listed. "— added",
+     * unless one of them is listed from a LATER block than the preset's: the
+     * index then covers less history than the preset stands for, and the
+     * fromBlock is a trust assertion (below it the index answers empty), so the
+     * label must not claim the preset's coverage. Not re-added either way —
+     * the same address under another fromBlock is another index fingerprint.
+     */
+    fun addedSuffix(p: Preset, listed: Map<String, Long>): String {
+        val later = p.contracts.any { c -> (listed[c.address.lowercase()] ?: return@any false) > c.fromBlock }
+        return if (later) " — added from a later block: earlier history not covered" else " — added"
     }
 
     /** The presets of [network] whose contracts are not all in the watch list yet. */

@@ -3048,9 +3048,11 @@ private fun IndexTab(
         // the presets carry no topics, so pushing it unrestricted would be a topic
         // conflict, which the engine answers by replacing the whole index (the same
         // reason "Add contract" refuses one below).
+        // Address → the fromBlock it is listed (or restricted-indexed) from, so a
+        // preset contract typed in from a LATER block reads as only partly covered.
         val presetListed = remember(watch, parsed) {
-            watch.mapTo(HashSet()) { it.address.lowercase() } +
-                parsed?.entries.orEmpty().filter { it.restricted }.map { it.address }
+            parsed?.entries.orEmpty().filter { it.restricted }.associate { it.address to it.fromBlock } +
+                watch.associate { it.address.lowercase() to it.fromBlock }
         }
         LogIndexPresetSection(
             settings = settings,
@@ -3066,7 +3068,7 @@ private fun IndexTab(
                 if (collecting || settings.logIndexConfigured(network)) controller.applyLogIndex(network)
             },
             onAdd = { presets ->
-                val entries = LogIndexDownloads.watchEntries(presets, presetListed)
+                val entries = LogIndexDownloads.watchEntries(presets, presetListed.keys)
                 edit { json ->
                     entries.fold(json) { acc, c -> LogIndexWatch.watch(acc, LogIndexWatch.Entry(c.address, c.fromBlock)) }
                 }

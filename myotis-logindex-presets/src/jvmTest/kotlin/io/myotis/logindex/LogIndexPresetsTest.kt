@@ -138,5 +138,8 @@ class LogIndexPresetsTest {
         assertEquals("12.4 MB", LogIndexDownloads.formatBytes(12_400_000))
         assertEquals("250 GB", LogIndexDownloads.formatBytes(250_000_000_000))
         assertEquals("1.2 TB", LogIndexDownloads.formatBytes(1_200_000_000_000))
+        // Rounding up across a unit boundary moves to the next unit.
+        assertEquals("1.0 GB", LogIndexDownloads.formatBytes(999_950_000))
+        assertEquals("999 MB", LogIndexDownloads.formatBytes(999_400_000))
     }
 }

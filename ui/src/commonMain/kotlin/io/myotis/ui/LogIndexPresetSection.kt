@@ -43,8 +43,9 @@ internal const val INDEX_ALLOW_METERED_TAG = "index-allow-metered"
 internal fun LogIndexPresetSection(
     settings: Settings,
     network: String,
-    /** The watch list's addresses, lowercased: a preset whose contracts are all in it is added. */
-    listed: Set<String>,
+    /** The watch list's addresses (lowercased) → their fromBlock: a preset whose
+     *  contracts are all in it is added. */
+    listed: Map<String, Long>,
     /** Whether the index already watches anything — then adding starts a re-walk for the new ones. */
     indexHoldsContracts: Boolean,
     /** The verified head, for the estimates; null while unknown (the census head is used). */
@@ -67,7 +68,7 @@ internal fun LogIndexPresetSection(
         }
         return
     }
-    val addable = remember(network, listed) { LogIndexPresetText.addable(network, listed) }
+    val addable = remember(network, listed) { LogIndexPresetText.addable(network, listed.keys) }
     var selected by remember(network) { mutableStateOf(emptySet<String>()) }
     // A preset that got added (here, or by hand) leaves the selection.
     val selection = addable.filter { it.id in selected }
@@ -98,7 +99,7 @@ internal fun LogIndexPresetSection(
         ) {
             Checkbox(checked = done || p.id in selected, onCheckedChange = null, enabled = !done)
             Column(Modifier.weight(1f)) {
-                Text(p.title + if (done) " — added" else "")
+                Text(p.title + if (done) LogIndexPresetText.addedSuffix(p, listed) else "")
                 Text(p.summary, style = MaterialTheme.typography.bodySmall)
                 Text(
                     LogIndexPresetText.presetLine(p, single),
