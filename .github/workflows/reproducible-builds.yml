@@ -98,8 +98,46 @@ env:
   GRADLE_OPTS: -Dorg.gradle.daemon=false
 
 jobs:
+  # The builder image (#734 D-c), built ONCE per run from its Dockerfile, so it
+  # is proven buildable from its pins on every run, checked against them, and
+  # handed to Linux legs a and b as an artifact: both then build in the very
+  # same image, and the snapshot service its apt packages come from is asked
+  # once, not once per leg.
+  builder-image:
+    name: Builder image
+    if: ${{ github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds') }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      - name: Build and check the image
+        run: |
+          docker/builder/build.sh
+          docker/builder/check.sh
+
+      - name: Save the image
+        run: |
+          set -euo pipefail
+          docker save myotis-builder:local | zstd -T0 -3 -q -o "$RUNNER_TEMP/builder-image.tar.zst"
+          ls -lh "$RUNNER_TEMP/builder-image.tar.zst"
+          docker image inspect --format '{{.Id}}' myotis-builder:local | tee "$RUNNER_TEMP/builder-image.id"
+
+      - name: Upload the image
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: builder-image
+          path: |
+            ${{ runner.temp }}/builder-image.tar.zst
+            ${{ runner.temp }}/builder-image.id
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
   linux:
     name: Linux + Android (leg ${{ matrix.leg }})
+    needs: builder-image
     if: ${{ github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 150
@@ -120,13 +158,24 @@ jobs:
 
       # The toolchain is the builder image (#734 D-c), not this runner's: the
       # JDK, rustc, the NDK, build-tools and cargo-ndk, each by digest or hash
-      # (docker/builder/). Built from its Dockerfile here, so the image is
-      # proven buildable from its pins on every run, then checked against them.
-      - name: Build the builder image
+      # (docker/builder/), as the builder-image job built and checked it.
+      - name: Download the builder image
+        if: ${{ matrix.leg != 'r' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: builder-image
+          path: ${{ runner.temp }}/builder-image
+
+      - name: Load the builder image
         if: ${{ matrix.leg != 'r' }}
         run: |
-          docker/builder/build.sh
-          docker/builder/check.sh
+          set -euo pipefail
+          zstd -dc "$RUNNER_TEMP/builder-image/builder-image.tar.zst" | docker load
+          rm "$RUNNER_TEMP/builder-image/builder-image.tar.zst"
+          want=$(cat "$RUNNER_TEMP/builder-image/builder-image.id")
+          got=$(docker image inspect --format '{{.Id}}' myotis-builder:local)
+          [ "$got" = "$want" ] || { echo "::error::loaded image $got, the builder-image job built $want"; exit 1; }
+          echo "builder image $got"
 
       # Leg r only: the toolchain the release workflows install.
       - name: Set up JDK 21 (release toolchain)

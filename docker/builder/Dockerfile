@@ -36,7 +36,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 # peer verification. That costs no integrity: apt checks the Release file's
 # signature against the archive keyring in the base image and every package's
 # hash against it. Every fetch after that verifies TLS too. Release files of a
-# past snapshot are past their Valid-Until by design.
+# past snapshot are past their Valid-Until by design. The service is slow and
+# sheds load with 503s (the first image build lost 30 packages to them after 15
+# minutes), so apt retries each fetch, with its backoff.
 ARG APT_SNAPSHOT
 RUN . /etc/os-release \
  && printf '%s\n' \
@@ -46,12 +48,16 @@ RUN . /etc/os-release \
       "Components: main universe" \
       "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg" \
       > /etc/apt/sources.list.d/ubuntu.sources \
- && echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99snapshot \
+ && printf '%s\n' \
+      'Acquire::Check-Valid-Until "false";' \
+      'Acquire::Retries "10";' \
+      'Acquire::https::Timeout "120";' \
+      > /etc/apt/apt.conf.d/99snapshot \
  && notls="-o Acquire::https::Verify-Peer=false -o Acquire::https::Verify-Host=false" \
- && apt-get $notls update -qq \
- && apt-get $notls install -y -qq --no-install-recommends ca-certificates \
- && apt-get update -qq \
- && apt-get install -y -qq --no-install-recommends \
+ && apt-get $notls update -q \
+ && apt-get $notls install -y -q --no-install-recommends ca-certificates \
+ && apt-get update -q \
+ && apt-get install -y -q --no-install-recommends \
       curl git unzip zip xz-utils python3 file \
       gcc g++ libc6-dev make pkg-config binutils \
       fakeroot dpkg-dev \
