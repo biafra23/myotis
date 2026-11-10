@@ -333,7 +333,8 @@ engine, and a few commands exist on one engine only:
 
 | Command | Engine | Requires |
 |---------|--------|----------|
-| `status`, `beacon-status`, `pause`, `resume`, `accept-stale-anchor`, `refresh-anchor`, `read-stats`, `stop` | both | daemon running (`beacon-status` progresses `SYNCING` → `CATCHING_UP` → `SYNCED`) |
+| `status`, `beacon-status`, `pause`, `resume`, `accept-stale-anchor`, `read-stats`, `stop` | both | daemon running (`beacon-status` progresses `SYNCING` → `CATCHING_UP` → `SYNCED`) |
+| `refresh-anchor` | Rust (the Java engine refuses it) | daemon parked in `STALE_ANCHOR`: re-anchors on a finalized checkpoint a majority of the checkpoint-sync operators agree on |
 | `peers` | both — the Rust engine returns empty peer lists; use the counts in `status` | daemon running |
 | `dial <enode>` | Java | daemon running |
 | `get-headers`, `get-block` | Java | at least one peer in `READY` state (check with `peers`) |

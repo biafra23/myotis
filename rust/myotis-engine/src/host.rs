@@ -1571,6 +1571,20 @@ pub fn refresh_anchor_from_checkpointz(handle: i64) -> String {
         Ok(mut slot) => *slot = Some((fresh.root, fresh.slot)),
         Err(_) => return refuse("engine unavailable"),
     }
+    // The park may have ended during the HTTPS round (consent, a raised bound):
+    // the loop then discards the anchor, so take it back and say so rather
+    // than report a re-anchor that will not happen. A park ending after this
+    // re-check is the loop's to discard, logged there.
+    let still_parked = engine.handles.lock().ok().is_some_and(|map| {
+        matches!(map.get(&handle), Some(ChainEntry::Running(_, sync, _))
+            if sync.status().state == SyncState::StaleAnchor)
+    });
+    if !still_parked {
+        if let Ok(mut slot) = config.ws_policy.fresh_anchor.lock() {
+            *slot = None;
+        }
+        return refuse("the stale-anchor park ended while the servers were asked");
+    }
     tracing::warn!(handle, slot = fresh.slot, operators = ?fresh.operators,
         "fresh anchor from checkpointz agreement handed to the parked sync loop");
     anchor_refresh_json(&fresh)
