@@ -181,10 +181,12 @@ jobs:
           java-version-file: .java-version
           distribution: 'temurin'
 
+      # The three build-xcframework.sh builds (device, arm64 and x86_64
+      # simulator), as ios-xcframework.yml installs them.
       - name: Set up Rust (host + iOS targets)
         uses: ./.github/actions/rust-toolchain
         with:
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
 
       - name: Set up leg ${{ matrix.leg }}
         id: leg
