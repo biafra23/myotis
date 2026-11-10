@@ -485,6 +485,10 @@ pub fn create_with_checkpoint(
     }
     config.checkpoint_root = root;
     config.checkpoint_slot = checkpoint_slot;
+    // The caller chose its trust root: the store must descend from it. A ZK
+    // start would initialize from Colibri's proof chain instead and never
+    // request this root (#761 review) — accepted and not applied.
+    config.zk_sync = None;
     register(engine, config)
 }
 

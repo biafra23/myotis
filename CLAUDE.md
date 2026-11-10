@@ -800,7 +800,8 @@ that produced this note.
   leaves out of its tree; it does not surface a withheld or altered one, so
   the wallet's displayed balance rests on the publisher. Scope and limits: the
   carve-out under *Data sources*.
-- **Two more, on the owner's request (2026-11-10), Rust engine only:** a sync
+- **Two more, on the owner's request (2026-11-10), Rust engine (its persisted
+  store is the snapshot the Java engine also resumes):** a sync
   committee proven by Colibri's ZK proof chain, which is cryptographically
   verified but anchored at Colibri's pinned anchor committee rather than the
   embedded checkpoint; and, only on the user's explicit request at a
@@ -884,19 +885,31 @@ that produced this note.
     at Colibri's anchor committee, which is older than the weak-subjectivity
     bound, so a long-range forgery signed by an old committee's exited keys is
     exposure the walk from the embedded checkpoint does not have. ZK sync runs
-    only past the WS gate on Myotis's own anchor. A Colibri program rotation
-    moves the pins in a reviewed release, never at runtime.
-    `MYOTIS_ZK_SYNC=0` turns it off, and the cold-start release checks always
-    do (they test the walk).
+    only past the WS gate on Myotis's own anchor, but that gate is a staleness
+    check, not a bound: on this path the embedded checkpoint root is not
+    applied at all. The roots of trust become `zk::anchors::*`, the SP1 Groth16
+    key (with `VK_ROOT` and the selector) and `PROGRAM_VKEY_HASH` (taken from
+    Colibri v0.1.2; no reproducible build from source is recorded). A Colibri
+    program rotation moves the pins in a reviewed release, never at runtime.
+    It does not run under Tor (#539's DNS rule), nor for a caller-supplied or
+    checkpointz root (the chosen root must be applied).
+    `MYOTIS_ZK_SYNC=0` turns it off for a process whose environment someone
+    controls, but it does not undo a store already persisted from a proof, and
+    that snapshot is the file the Java engine also resumes. The cold-start
+    release checks always turn it off (they test the walk).
   - **Checkpointz finalized roots**, ONLY on the user's explicit request at a
     `STALE_ANCHOR` park (`refreshAnchorFromCheckpointz`). Never automatic, and
     never applied to a store that is not parked. The root is accepted only when
-    ≥ 2 operators (registrable domains) agree and none disagrees, the same gate
-    as `./gradlew refreshCheckpoint`. It is their word, as the embedded anchor
-    is the release's, and the host must say so.
+    a strict majority of the operators that answered, and at least 2
+    (registrable domains), name it, and no answer names a different root for
+    that epoch. This is weaker than `./gradlew refreshCheckpoint`, which requires
+    every responder to agree at one slot. It is their word, as the embedded
+    anchor is the release's, and the host must say so.
 
-  Neither crosses into the **wallet's reads**: account, storage and call data
-  still come only from devp2p peers, verified as before.
+  Neither changes the **transport** of the wallet's reads: account, storage and
+  call data still come only from devp2p peers. But every one of them is
+  verified against the store these sources initialize, so for the root of
+  trust they do count.
 - **TrueBlocks Unchained Index mainnet publishing appears stalled.** The designated
   publisher (`publisher.unchainedindex.eth`) last published a mainnet manifest indexed
   to ~block 23.0M (mid-2025); as of mid-2026 that is ~a year behind the head, and the

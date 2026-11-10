@@ -5,11 +5,14 @@
 //! What Colibri does when it has no state is the same idea in its simplest
 //! form: ask one checkpointz server for `/eth/v1/beacon/states/head/finality_checkpoints`
 //! and trust the finalized root it names. This module asks EVERY configured
-//! server and accepts a root only when servers of at least
-//! [`MIN_AGREEING_OPERATORS`] distinct operators (registrable domains — two
-//! hostnames of one operator are one voice) name the same finalized epoch and
-//! root, and none names a different root for that epoch. That is the same gate
-//! `./gradlew refreshCheckpoint` applies before it writes the embedded anchor.
+//! server and accepts a root only when it is named by a strict majority of the
+//! operators that answered, and by at least [`MIN_AGREEING_OPERATORS`]
+//! (registrable domains — two hostnames of one operator are one voice); any two
+//! answers naming different roots for one epoch refuse the round, and an
+//! `execution_optimistic` answer does not count. `./gradlew refreshCheckpoint`
+//! is stricter still (every responder must return the same root at one slot);
+//! this gate tolerates a server one epoch behind, which a device asking at an
+//! arbitrary moment routinely meets.
 //!
 //! **Trust.** The root is NOT verified by this engine — it cannot be, that is
 //! what an anchor is. It is the agreeing operators' word, exactly as the
@@ -54,6 +57,11 @@ pub async fn fetch_agreed(servers: &[String], slots_per_epoch: u64) -> Result<Fr
     let mut failures = Vec::new();
     for (base, res) in futures::future::join_all(futures).await {
         match res {
+            // An optimistic node has not verified its own head: its finality
+            // is not an answer.
+            Ok(r) if r.status == 200 && is_optimistic(&r.body) => {
+                failures.push(format!("{base}: execution_optimistic answer"))
+            }
             Ok(r) if r.status == 200 => match parse_finalized(&r.body) {
                 Some((epoch, root)) => {
                     tracing::info!(server = %base, epoch, root = %hex(&root), "checkpointz answer");
@@ -86,8 +94,12 @@ pub(crate) struct Answer {
     pub root: [u8; 32],
 }
 
-/// The newest (epoch, root) that at least [`MIN_AGREEING_OPERATORS`] operators
-/// name. Any epoch for which two answers name DIFFERENT roots refuses the whole
+/// The (epoch, root) named by the most operators, accepted only when that is
+/// at least [`MIN_AGREEING_OPERATORS`] AND a strict majority of all the
+/// operators that answered. A lagging minority (a server one epoch behind) is
+/// tolerated; a minority naming another epoch can never override the rest —
+/// every answer votes against every other, not only those for the same epoch.
+/// Any epoch for which two answers name DIFFERENT roots refuses the whole
 /// round: one of them is lying or forked, and picking either would be a guess.
 pub(crate) fn agree(answers: &[Answer]) -> Result<(u64, [u8; 32], Vec<String>), String> {
     for a in answers {
@@ -98,23 +110,41 @@ pub(crate) fn agree(answers: &[Answer]) -> Result<(u64, [u8; 32], Vec<String>), 
             ));
         }
     }
-    let mut epochs: Vec<u64> = answers.iter().map(|a| a.epoch).collect();
-    epochs.sort_unstable();
-    epochs.dedup();
-    for epoch in epochs.into_iter().rev() {
-        let mut ops: Vec<String> = answers.iter().filter(|a| a.epoch == epoch).map(|a| a.operator.clone()).collect();
+    let mut all_ops: Vec<&str> = answers.iter().map(|a| a.operator.as_str()).collect();
+    all_ops.sort_unstable();
+    all_ops.dedup();
+    let mut candidates: Vec<(u64, [u8; 32])> = answers.iter().map(|a| (a.epoch, a.root)).collect();
+    candidates.sort_unstable();
+    candidates.dedup();
+    let support = |c: &(u64, [u8; 32])| {
+        let mut ops: Vec<String> = answers
+            .iter()
+            .filter(|a| (a.epoch, a.root) == *c)
+            .map(|a| a.operator.clone())
+            .collect();
         ops.sort();
         ops.dedup();
-        if ops.len() >= MIN_AGREEING_OPERATORS {
-            let root = answers.iter().find(|a| a.epoch == epoch).map(|a| a.root).unwrap();
-            return Ok((epoch, root, ops));
+        ops
+    };
+    // Most supporters first; among equals, the newer epoch.
+    let best = candidates
+        .iter()
+        .map(|c| (c, support(c)))
+        .max_by(|(ca, oa), (cb, ob)| oa.len().cmp(&ob.len()).then(ca.0.cmp(&cb.0)));
+    match best {
+        Some((c, ops)) if ops.len() >= MIN_AGREEING_OPERATORS && ops.len() * 2 > all_ops.len() => {
+            Ok((c.0, c.1, ops))
         }
+        Some((c, ops)) => Err(format!(
+            "no finalized checkpoint has a majority: the best, epoch {}, is named by {} of {} \
+             operators (needs at least {MIN_AGREEING_OPERATORS} and more than half) — servers \
+             may be between epochs, try again in a minute",
+            c.0,
+            ops.len(),
+            all_ops.len()
+        )),
+        None => Err("no checkpoint-sync server answered".into()),
     }
-    Err(format!(
-        "fewer than {MIN_AGREEING_OPERATORS} independent operators agree on a finalized checkpoint \
-         ({} answered)",
-        answers.len()
-    ))
 }
 
 /// `https://a.b.example.org/...` → `example.org`: the voice a server counts as.
@@ -131,6 +161,14 @@ pub(crate) fn operator_of(base: &str) -> String {
     } else {
         labels[labels.len() - 2..].join(".")
     }
+}
+
+/// `"execution_optimistic": true` anywhere in the answer.
+pub(crate) fn is_optimistic(body: &[u8]) -> bool {
+    let Ok(s) = std::str::from_utf8(body) else { return false };
+    let Some(i) = s.find("\"execution_optimistic\"") else { return false };
+    let after = s[i + "\"execution_optimistic\"".len()..].trim_start();
+    after.strip_prefix(':').is_some_and(|v| v.trim_start().starts_with("true"))
 }
 
 /// `data.finalized.{epoch, root}` from a `finality_checkpoints` answer. Parsed
@@ -216,11 +254,31 @@ mod tests {
     }
 
     #[test]
-    fn the_newest_agreed_epoch_wins_and_a_lagging_server_is_not_a_conflict() {
+    fn a_majority_wins_and_a_lagging_server_is_not_a_conflict() {
         let got = agree(&[a("x.io", 6, 2), a("y.io", 5, 1), a("z.io", 5, 1)]).unwrap();
         assert_eq!((got.0, got.1), (5, [1; 32]));
         let got = agree(&[a("x.io", 6, 2), a("y.io", 6, 2), a("z.io", 5, 1)]).unwrap();
         assert_eq!((got.0, got.1), (6, [2; 32]));
+    }
+
+    #[test]
+    fn a_minority_naming_another_epoch_cannot_override_the_rest() {
+        // #761 review: two operators at an epoch nobody else reports must not
+        // win over seven at the epoch before.
+        let mut answers: Vec<Answer> = (0..7).map(|i| a(&format!("h{i}.io"), 5, 1)).collect();
+        answers.push(a("evil1.io", 6, 9));
+        answers.push(a("evil2.io", 6, 9));
+        let got = agree(&answers).unwrap();
+        assert_eq!((got.0, got.1, got.2.len()), (5, [1; 32], 7));
+        // Two of five is no majority, even when they are the only pair.
+        let split = [a("v.io", 6, 2), a("w.io", 6, 2), a("x.io", 5, 1), a("y.io", 4, 3), a("z.io", 7, 4)];
+        assert!(agree(&split).unwrap_err().contains("majority"));
+    }
+
+    #[test]
+    fn optimistic_answers_are_recognised() {
+        assert!(is_optimistic(br#"{"execution_optimistic": true,"data":{}}"#));
+        assert!(!is_optimistic(BODY.as_bytes()));
     }
 
     #[test]

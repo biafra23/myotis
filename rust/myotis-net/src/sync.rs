@@ -2562,9 +2562,11 @@ async fn run_sync(
             // — exactly the requests fewest servers answer. Reached only past
             // the weak-subjectivity gate above, like the walk it replaces.
             let wall_period = config.wall_clock_period();
-            if config.zk_sync.as_ref().is_some_and(|zk| {
-                wall_period >= checkpoint_period.saturating_add(zk.min_gap_periods)
-            }) && zk_backoff.due(Instant::now())
+            if crate::zksync::allowed()
+                && config.zk_sync.as_ref().is_some_and(|zk| {
+                    wall_period >= checkpoint_period.saturating_add(zk.min_gap_periods)
+                })
+                && zk_backoff.due(Instant::now())
             {
                 match try_zk_start(&config, &client, &mut pool, &hunt.confirmed, wall_period, &mut zk_proven).await {
                     Ok(fresh) => {
@@ -2666,9 +2668,11 @@ async fn run_sync(
             // initialized; the walk runs whenever it is not. Past the in-run
             // weak-subjectivity re-check above, so a held committee older than
             // the bound still needs consent first.
-            if config.zk_sync.as_ref().is_some_and(|zk| {
-                wall_period >= processor.store.current_period().saturating_add(zk.min_gap_periods)
-            }) && zk_backoff.due(Instant::now())
+            if crate::zksync::allowed()
+                && config.zk_sync.as_ref().is_some_and(|zk| {
+                    wall_period >= processor.store.current_period().saturating_add(zk.min_gap_periods)
+                })
+                && zk_backoff.due(Instant::now())
             {
                 match try_zk_start(&config, &client, &mut pool, &hunt.confirmed, wall_period, &mut zk_proven).await {
                     Ok(fresh) => {
@@ -2802,6 +2806,9 @@ fn reanchor(config: &mut ChainConfig, root: [u8; 32], slot: u64) -> u64 {
          (checkpointz agreement) — discarding the stale state, bootstrapping from it");
     config.checkpoint_root = root;
     config.checkpoint_slot = slot;
+    // The user chose this root: the store must descend from it, so no ZK
+    // start may overtake a slow bootstrap from it for the rest of this run.
+    config.zk_sync = None;
     spec::compute_sync_committee_period_with(slot, config.slots_per_period())
 }
 

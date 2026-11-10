@@ -73,15 +73,30 @@ finality update, and stays on the wallet's own anchor.
 
 ZK sync runs only **after** the weak-subjectivity gate. An install whose own
 anchor is past the bound still parks in `STALE_ANCHOR`, and a proof never
-releases a park.
+releases a park. That gate is a staleness check, not a bound on the proof: on
+the ZK path the store does not descend from the anchor the gate judged, and
+the embedded checkpoint root is **not applied at all** (see *Trust* below).
+
+**When it does not run:**
+- A **caller-supplied root** (`createWithCheckpoint`, `myotis-rpcd
+  --checkpoint-root`) and the **fresh checkpoint** below each turn ZK sync off
+  for that run. Whoever chose the root chose the trust root, so the store must
+  descend from it, and a proof must not overtake a slow bootstrap from it.
+- **Tor routing on.** The fetch resolves `<net>.colibri-proof.tech` through the
+  system resolver and names it in clear SNI. That is the same disclosure #539
+  keeps the EIP-1459 DNS walk from making under Tor, so the walk runs instead.
+- `MYOTIS_ZK_SYNC=0`. This only affects a process whose environment someone
+  controls (the daemon, a developer). No host offers a switch yet, and it does
+  not undo a store already persisted from a proof: the next start resumes that
+  snapshot, which carries no provenance mark.
+- The cold-start release checks (`live_cold_start`) always turn it off,
+  because they exist to prove the walk still works.
 
 Networks: mainnet, sepolia and gnosis (Colibri has no proof chain for chiado).
-The fetch goes out in the clear, even with Tor routing on. It carries no
-address, but tells the prover which network this IP runs and when
-([privacy-and-tor.md](privacy-and-tor.md) §2).
-`MYOTIS_ZK_SYNC=0` turns it off. The cold-start release checks
-(`live_cold_start`) always turn it off, because they exist to prove the walk
-still works. The Java engine has no ZK path and always walks.
+Otherwise the fetch carries no address, but tells the prover which network this
+IP runs and when ([privacy-and-tor.md](privacy-and-tor.md) §2). The Java engine
+has no ZK path. It does, however, resume the same snapshot file, so after one ZK
+start an engine switch resumes a store that descends from Colibri's anchor.
 
 ### Trust: what changes
 
@@ -96,7 +111,16 @@ anyway:
   it checks ≥ 2/3 participation and binds the leaf to `next_sync_committee`.
 
 It does **not** trust the servers. They can withhold a proof, which means a
-walk instead, but they cannot make a wrong one verify.
+walk instead, but they cannot make a wrong one verify. (Neither can they crash
+the engine: the HTTP and JSON parsers refuse hostile sizes and encodings, #761.)
+
+Put plainly: on this path the roots of trust are `zk::anchors::*`, the SP1
+Groth16 key with `VK_ROOT` and the selector, and `PROGRAM_VKEY_HASH`. The
+embedded checkpoint is only the staleness clock the gate reads. This PR does not
+record a reproducible build of Colibri's guest from source that yields
+`PROGRAM_VKEY_HASH`; it is taken from Colibri v0.1.2's committed ELF and
+constants. The wallet's verified reads still travel over devp2p, but every one
+of them is checked against the store these sources initialize.
 
 **The weak-subjectivity caveat.** The walk Myotis does itself passes only
 through committees inside the weak-subjectivity window of its own anchor. The
@@ -110,8 +134,8 @@ checkpointz cross-check when its client crosses the bound. Myotis bounds it
 only by the weak-subjectivity gate on its *own* anchor, and that gate does not
 cover the committees between Colibri's anchor and Myotis's. Myotis accepts this
 exposure for the faster, peer-light cold start (the owner's request,
-2026-11-10; CLAUDE.md *Trust*). `MYOTIS_ZK_SYNC=0` restores the walk-only
-model.
+2026-11-10; CLAUDE.md *Trust*). `MYOTIS_ZK_SYNC=0` keeps a *fresh* start on the
+walk; it does not demote a store a proof already initialized (above).
 
 ### Anchor provenance
 
@@ -150,11 +174,16 @@ It is stricter than Colibri's version (`rust/myotis-net/src/checkpointz.rs`):
 - It asks **every** configured server: checkpointz instances and public beacon
   APIs, the union of Colibri's list and the one `./gradlew refreshCheckpoint`
   uses.
-- It accepts a root only when servers of **at least two operators** name the
-  same finalized epoch and root. Operators are counted by registrable domain,
-  so two hostnames of one operator are one voice.
+- It accepts the root named by the most operators, and only when that is
+  **a strict majority of the operators that answered and at least two**.
+  Operators are counted by registrable domain, so two hostnames of one operator
+  are one voice. A server one epoch behind is outvoted, not a conflict. A
+  minority naming another epoch can never override the rest.
 - It refuses the round outright if any two servers name **different** roots
-  for the same epoch.
+  for the same epoch, and it does not count an `execution_optimistic` answer.
+- This is weaker than `./gradlew refreshCheckpoint`, which makes every
+  responder return the same root at one slot. The on-device gate has to
+  tolerate a server that lags by an epoch.
 - It refuses a root that is itself past the bound or ahead of the device's
   clock.
 - It applies only while the network is **parked**, so it never replaces a
@@ -162,7 +191,9 @@ It is stricter than Colibri's version (`rust/myotis-net/src/checkpointz.rs`):
 
 The parked loop then discards the stale state and bootstraps from the new root,
 exactly as from the embedded checkpoint: Merkle-pinned to the root, then
-BLS-verified forward. Its verified state is persisted, so a restart resumes it.
+BLS-verified forward. ZK sync stays off for the rest of that run, so a proof
+cannot overtake the bootstrap. Its verified state is persisted, so a restart
+resumes it.
 
 **Trust.** This one *is* a trust decision. No engine can verify an anchor, so
 the root is the agreeing operators' word. That is the same standing as the

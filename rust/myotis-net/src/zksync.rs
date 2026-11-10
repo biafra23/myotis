@@ -54,6 +54,22 @@ impl ZkSyncConfig {
 
 const FETCH_DEADLINE: Duration = Duration::from_secs(20);
 
+/// Whether a ZK start may run at all right now: never while Tor routing is on.
+/// The fetch resolves `<net>.colibri-proof.tech` through the system resolver and
+/// names it in clear SNI, the same disclosure of "this node runs network X"
+/// that #539 keeps the EIP-1459 DNS walk from making under Tor
+/// (`el::dnsdisco::allowed`). The update walk is the fallback either way.
+pub fn allowed() -> bool {
+    #[cfg(feature = "tor")]
+    {
+        !crate::el::tor::is_enabled()
+    }
+    #[cfg(not(feature = "tor"))]
+    {
+        true
+    }
+}
+
 /// Fetch the proof of `period`'s committee and verify it. `Err` carries a
 /// one-line reason for the log; every failure means "walk instead".
 pub async fn fetch_proven_committee(config: &ChainConfig, zk_config: &ZkSyncConfig, period: u64) -> Result<ProvenCommittee, String> {
