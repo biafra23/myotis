@@ -16,10 +16,15 @@
 # 40-minute dmg leg. (Those legs still run to completion — Actions has no
 # cross-job fail-fast.)
 #
-# Keep that list exhaustive: every workflow that uploads to a release (`gh release
-# upload`, `gh release create <tag> <files>`, action-gh-release) belongs in it and
-# must call this guard. An audit reads this list — while it was stale,
-# ios-xcframework published unguarded.
+# Keep that list exhaustive: every workflow that uploads to a release belongs in
+# it and must call this guard. An audit reads this list — while it was stale,
+# ios-xcframework published unguarded. Each of them uploads through
+# .github/release-assets.sh, never with a bare `gh release upload`, `gh release
+# create <tag> <files>` or action-gh-release `files:` (#734): the script checks
+# that the release serves the bytes the job built, the job then attests the
+# uploaded files' provenance, and its last step (`release-assets.sh
+# --checksums`) keeps the release's SHA256SUMS complete.
+# scripts/test_release_assets.sh fails on a bare upload in any workflow.
 #
 # GitHub has no cross-workflow job dependencies, so "one shared guard" means one
 # shared *definition*: this file is the single source of the check, instantiated

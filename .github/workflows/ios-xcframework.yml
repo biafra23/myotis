@@ -95,6 +95,10 @@ jobs:
     runs-on: ubuntu-26.04
     permissions:
       contents: write
+      # The build-provenance attestation of the uploaded assets (#734): an OIDC
+      # token for the Sigstore certificate, and the attestation's storage.
+      id-token: write
+      attestations: write
     steps:
       # Checked out because the ABI version is read from its source of truth
       # in myotis-engine; this also gives gh its repo context.
@@ -128,7 +132,23 @@ jobs:
           # another publisher created the release, re-appended when a concurrent
           # edit dropped it (.github/release-notes.sh explains the race).
           bash .github/release-notes.sh create "$tag" "$section"
-          gh release upload "$tag" --clobber \
+          # Upload, and check that the release serves these bytes.
+          bash .github/release-assets.sh "$tag" \
             dist/MyotisEngine.xcframework.zip \
             dist/MyotisEngine.xcframework.zip.sha256
           bash .github/release-notes.sh append "$tag" "$section"
+
+      - name: Attest the MyotisEngine xcframework's build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/release-assets.SHA256SUMS
+
+      # Last, and also when the attestation failed: SHA256SUMS is the one file
+      # all publishers share, kept apart from this job's own upload and
+      # attestation (.github/release-assets.sh).
+      - name: List the release's assets in SHA256SUMS
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: bash .github/release-assets.sh --checksums "${GITHUB_REF_NAME}"

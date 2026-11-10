@@ -49,6 +49,7 @@ that gets built moves to `design-history/`, and its user-facing behaviour gets a
 - [railgun-android.md](guides/railgun-android.md): importing the RAILGUN seed on Android.
 - [dedicated-sepolia-node.md](guides/dedicated-sepolia-node.md): a runbook for a Sepolia EL+CL node that always serves Myotis clients.
 - [gradle-dependency-pins.md](guides/gradle-dependency-pins.md): the Gradle dependency pins (lockfiles + verification hashes) and regenerating them after a dependency change.
+- [reproducible-builds.md](guides/reproducible-builds.md): checking a release: its checksums and build attestations, and rebuilding the Android artifacts bit for bit in the pinned builder image.
 
 ## spec/
 
