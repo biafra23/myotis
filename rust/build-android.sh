@@ -27,6 +27,8 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
+# Fixed source-path prefixes in the shipped libs (#734 D2; the file says why).
+. "$here/repro-env.sh"
 jniLibs="$here/../myotis-engine/src/androidMain/jniLibs"
 
 : "${ANDROID_NDK_HOME:?set ANDROID_NDK_HOME to the pinned NDK (\$ANDROID_SDK/ndk/<android-ndk from gradle/libs.versions.toml>)}"

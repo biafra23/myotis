@@ -22,7 +22,14 @@ std = []
 
 [dependencies]
 # Supranational blst: the BLS12-381 lib every major Ethereum CL client ships (C + asm).
-blst = "0.3"
+# `portable` (#734 D3): without it blst's build.rs enables ADX instructions on
+# x86_64 when the BUILD machine's CPU has them (is_x86_feature_detected!), so
+# the shipped x86_64 libs depended on which runner built them — and crashed
+# with SIGILL on CPUs without ADX (Intel before Broadwell, AMD before Zen).
+# Portable compiles without ISA extensions and picks the ADX path at RUN time.
+# Set on every crate that depends on blst: features unify per build, and a
+# build that pulls in only one of them must still get it.
+blst = { version = "0.3", features = ["portable"] }
 # JNI bindings so the JVM/Android can call in (optional — see the `jni` feature).
 jni = { version = "0.21", default-features = false, optional = true }
 

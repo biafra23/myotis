@@ -715,6 +715,60 @@ fun probeTool(vararg cmd: String): String =
 // it on purpose with `cargo update` and review the lock diff.
 val cargoVersion = probeTool("cargo", "--version") // "cargo 1.96.0 (…)" or ""
 val cargoNdkVersion = if (cargoVersion.isEmpty()) "" else probeTool("cargo", "ndk", "--version")
+// Path remapping for every cargo task (#734 D2) — the Kotlin twin of
+// rust/repro-env.sh (keep them in step; that file has the full why). Rust
+// embeds absolute source paths in panic locations (726 `$CARGO_HOME/registry`
+// paths in a release libmyotis_engine.so), so the shipped bytes depended on the
+// builder's home directory. CARGO_TARGET_<TRIPLE>_RUSTFLAGS is MERGED by cargo
+// with rust/.cargo/config.toml's per-target flags (RUSTFLAGS would replace the
+// Android page-size flag); CFLAGS_<triple> covers C built by the cc crate (not
+// MSVC: cl.exe has no -ffile-prefix-map). Set on EVERY cargo task alike, not
+// just the shipping ones: tasks with different rustflags would rebuild each
+// other's target/ from scratch whenever they alternate.
+val rustHostTriple: String = Regex("""(?m)^host: (\S+)$""")
+    .find(if (cargoVersion.isEmpty()) "" else probeTool("rustc", "-vV"))?.groupValues?.get(1) ?: ""
+val reproducibleRustEnv: Map<String, String> = run {
+    val cargoHome = System.getenv("CARGO_HOME")?.takeIf { it.isNotBlank() }
+        ?: File(System.getProperty("user.home"), ".cargo").path
+    val rustDir = file("rust").absolutePath
+    val maps = listOf(
+        "$cargoHome${File.separator}registry${File.separator}src" to "/cargo/registry/src",
+        "$cargoHome${File.separator}git${File.separator}checkouts" to "/cargo/git/checkouts",
+        rustDir to "/myotis/rust",
+    )
+    val rustflags = maps.joinToString(" ") { (from, to) -> "--remap-path-prefix=$from=$to" }
+    val cflags = maps.joinToString(" ") { (from, to) -> "-ffile-prefix-map=$from=$to" }
+    val triples = (listOf(rustHostTriple) + listOf(
+        "aarch64-linux-android", "x86_64-linux-android", "armv7-linux-androideabi",
+        "aarch64-apple-ios", "aarch64-apple-ios-sim", "x86_64-apple-ios",
+        "aarch64-apple-darwin", "x86_64-apple-darwin",
+        "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc",
+        "x86_64-unknown-none", "wasm32-unknown-unknown",
+    )).filter { it.isNotEmpty() }.distinct()
+    // APPENDED to whatever the environment already holds, not replacing it: a
+    // developer's own target rustflags / CFLAGS keep working.
+    fun withExisting(key: String, value: String) = key to
+        // Idempotent: a shell that sourced rust/repro-env.sh already carries the block.
+        (System.getenv(key)?.takeIf { it.isNotBlank() }?.let { if (value in it) it else "$it $value" } ?: value)
+    triples.flatMap { t ->
+        listOfNotNull(
+            withExisting("CARGO_TARGET_${t.uppercase().replace('-', '_')}_RUSTFLAGS", rustflags),
+            if (t.endsWith("-msvc")) null else withExisting("CFLAGS_${t.replace('-', '_')}", cflags),
+        )
+    }.toMap() + ("MYOTIS_REPRO_ENV" to "gradle")  // rust/repro-env.sh then leaves these alone
+}
+if (!System.getenv("RUSTFLAGS").isNullOrBlank() || !System.getenv("CARGO_ENCODED_RUSTFLAGS").isNullOrBlank()) {
+    logger.warn("[rust] RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS is set: cargo then IGNORES every per-target rustflags, " +
+        "so the Rust libs keep this machine's source paths (#734 D2) and Android loses its page-size flag.")
+}
+tasks.withType<Exec>().configureEach {
+    if (name.startsWith("cargo") || name == "uniffiGenerateKotlin" || name == "verifyRustVersionFloor") {
+        environment(reproducibleRustEnv)
+        // An input, so outputs built without (or with other) prefixes are not UP-TO-DATE.
+        inputs.property("reproducibleRustEnv", reproducibleRustEnv.toSortedMap().toString())
+    }
+}
+
 // "cargo-ndk 4.1.2" → "4.1.2"; cargoNdkAndroid accepts only the catalog's version.
 val cargoNdkVersionNumber: String = Regex("""(\d+\.\d+\.\d+)""").find(cargoNdkVersion)?.value ?: ""
 

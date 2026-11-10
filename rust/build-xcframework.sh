@@ -25,6 +25,8 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
+# Fixed source-path prefixes in the shipped libs (#734 D2; the file says why).
+. "$here/repro-env.sh"
 out="$here/target/ios-xcframework"
 hdrs="$out/headers"
 framework="$out/MyotisEngine.xcframework"
