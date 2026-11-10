@@ -80,24 +80,6 @@ val rpcUpstream: String = run {
     if (lp.exists()) lp.inputStream().use { props.load(it) }
     props.getProperty("rpc.upstream", "")
 }
-// A RELEASE build refuses a local upstream (#734 D5): the value lands in
-// BuildConfig, so a builder's gitignored local.properties would change the
-// release APK's bytes — and ship an unverified proxy in a release. Refused, not
-// silently dropped: a developer who set it is told why (CLAUDE.md's
-// apply-or-refuse rule). Debug builds keep it.
-tasks.matching { it.name == "preReleaseBuild" }.configureEach {
-    val upstream = rpcUpstream
-    doFirst {
-        if (upstream.isNotEmpty()) {
-            throw GradleException(
-                "rpc.upstream is set in local.properties, but a release APK must not carry an " +
-                    "upstream proxy (it would differ from every other build of this commit, and " +
-                    "serve unverified data). Remove it for release builds; debug builds keep it.",
-            )
-        }
-    }
-}
-
 // Derived from the project version so a release sweep can't leave the app
 // reporting a stale version in Settings → Apps, the same way :app-desktop
 // derives its installer versions. 0.1.4-SNAPSHOT -> 0.1.4.
@@ -134,7 +116,11 @@ android {
         targetSdk = 34
         versionCode = derivedVersionCode // see derivedVersionCode above
         versionName = releaseVersion
-        buildConfigField("String", "RPC_UPSTREAM", "\"$rpcUpstream\"")
+        // Empty by default: a RELEASE never carries a proxy (#734 D5). The
+        // value comes from a builder's gitignored local.properties, so in a
+        // release it would make the APK differ from every other build of the
+        // commit — and ship an unverified upstream. Debug builds get it below.
+        buildConfigField("String", "RPC_UPSTREAM", "\"\"")
         // -PtorEngine (root build.gradle.kts): whether these jniLibs were built with
         // Arti. Lets a Tor-less APK answer "no Tor" without loading the engine library.
         buildConfigField("boolean", "TOR_ENGINE", (rootProject.extra["torEngine"] as Boolean).toString())
@@ -191,6 +177,8 @@ android {
         debug {
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
+            // local.properties' rpc.upstream, debug-only (see defaultConfig).
+            buildConfigField("String", "RPC_UPSTREAM", "\"$rpcUpstream\"")
         }
         // No signingConfig ON PURPOSE: assembleRelease writes
         // android-app-release-unsigned.apk, and only the tag-only signing job in

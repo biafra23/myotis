@@ -70,6 +70,10 @@ allprojects {
     // its entries in a fixed order and gives every entry the same permissions,
     // so two builds of one tree produce the same bytes (Gradle 9's defaults;
     // on 8.12 all three were off and a jar rebuilt seconds later differed).
+    // The fixed modes replace the builder's umask; no archive here ships an
+    // executable today. One that does sets the mode on that child spec
+    // (`filePermissions { unix("rwxr-xr-x") }` inside its from/into block),
+    // which overrides this.
     tasks.withType<AbstractArchiveTask>().configureEach {
         isPreserveFileTimestamps = false
         isReproducibleFileOrder = true

@@ -49,14 +49,13 @@ jobs:
         run: |
           set -eu
           cd rust/target/ios-xcframework
-          # ditto preserves the framework bundle structure the way Xcode and
-          # SwiftPM binaryTarget consumers expect (plain zip loses resource
-          # forks / symlink layout on some setups).
-          # One mtime for every file first (#734 D7): ditto records them, and
-          # each build writes the framework at a different time.
-          ../../../scripts/repro_zip.sh --normalize MyotisEngine.xcframework
-          ditto -c -k --sequesterRsrc --keepParent \
-            MyotisEngine.xcframework MyotisEngine.xcframework.zip
+          # Reproducibly (#734 D7), not with ditto: ditto records each file's
+          # build-time mtime as a LOCAL-time DOS stamp, the builder's uid/gid
+          # and any xattrs. repro_zip.sh keeps the bundle layout SwiftPM
+          # binaryTarget consumers expect: the .xcframework directory at the
+          # archive root, symlinks stored as links (zip -y). The framework
+          # carries no resource forks for ditto's --sequesterRsrc to keep.
+          ../../../scripts/repro_zip.sh . MyotisEngine.xcframework MyotisEngine.xcframework.zip
           shasum -a 256 MyotisEngine.xcframework.zip | tee MyotisEngine.xcframework.zip.sha256
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
