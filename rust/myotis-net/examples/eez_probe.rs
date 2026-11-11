@@ -80,6 +80,24 @@ const DEFAULT_SLOTS: &str = "0,360894a13ba1a3210667c828492db98dca3e2076cc3735a92
 /// blocks behind the head was served, one 6,144 behind was not.)
 const DEFAULT_DEPTHS: &str = "128,1024,2048,4096,8192,16384,20000";
 
+/// The prefixes of `EthSession`'s `String` errors this probe branches on.
+/// Matched as PREFIXES, never substrings (the house rule in `pool.rs`: a
+/// peer's client id is echoed into other error texts). No test pins the
+/// wording, so each producer in `el/eth/session.rs` carries a note naming
+/// this file.
+mod session_err {
+    /// A Disconnect in answer to our Hello.
+    pub const HELLO_DISCONNECT: &str = "peer disconnected during handshake";
+    /// A Disconnect frame while a response was awaited.
+    pub const DISCONNECT: &str = "peer disconnected: ";
+    /// A request's own deadline: the session is still usable. NOT the
+    /// transport's `rlpx … timed out`, which is fatal for the connection.
+    pub const REQUEST_TIMEOUT: &str = "timed out awaiting";
+    /// A response the decoder refused: the peer answered, the session stands.
+    pub const HEADERS_DECODE: &str = "BlockHeaders decode";
+    pub const ACCOUNT_DECODE: &str = "AccountRange decode";
+}
+
 /// Where the fork id our Status carries came from — it decides how much a
 /// passed EIP-2124 check says.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -94,7 +112,11 @@ enum ForkSource {
 
 #[derive(Clone)]
 struct Knobs {
+    /// The peer's TCP (RLPx) endpoint.
     addr: SocketAddr,
+    /// Its UDP (discv4) endpoint: `addr`, unless the enode carries
+    /// `?discport=<udp port>`.
+    discv4_addr: SocketAddr,
     pubkey: [u8; 64],
     network_id: u64,
     genesis: [u8; 32],
@@ -119,6 +141,15 @@ impl Knobs {
         let enode = var("EEZ_ENODE").unwrap_or_else(|| DEFAULT_ENODE.into());
         let (addr, pubkey) = myotis_net::el::reader::parse_enode(enode.trim())
             .map_err(|e| format!("EEZ_ENODE: {e}"))?;
+        // `parse_enode` accepts `?discport=` (digits only) and drops it: the
+        // pool dials TCP. The crawl is the one place here that speaks UDP.
+        let discv4_addr = match enode.trim().split_once("?discport=") {
+            Some((_, port)) => match port.parse::<u16>() {
+                Ok(port) if port != 0 => SocketAddr::new(addr.ip(), port),
+                _ => return Err(format!("EEZ_ENODE: discport {port} is not a UDP port")),
+            },
+            None => addr,
+        };
         let genesis: [u8; 32] = hex_fixed(
             &var("EEZ_GENESIS").unwrap_or_else(|| DEFAULT_GENESIS.into()),
             false,
@@ -159,6 +190,7 @@ impl Knobs {
         }
         Ok(Knobs {
             addr,
+            discv4_addr,
             pubkey,
             network_id: num("EEZ_NETWORK_ID", DEFAULT_NETWORK_ID)?,
             genesis,
@@ -232,9 +264,13 @@ fn hex(b: &[u8]) -> String {
 
 /// How one connection to the target ended.
 enum Outcome {
-    /// The session ran. `ok` = every core step (header, account, storage,
-    /// bytecode) verified.
-    Ran { ok: bool },
+    /// The session ran. `ok` = every core step that could run (header,
+    /// account, storage, bytecode) verified; `skipped` names the steps the
+    /// account gave nothing to run on.
+    Ran {
+        ok: bool,
+        skipped: Option<&'static str>,
+    },
     /// No TCP / RLPx session at all: nothing a second connection would add.
     DialFailed(String),
     /// The eth handshake failed before the peer's Status was read.
@@ -276,11 +312,12 @@ async fn main() -> ExitCode {
         hex(&knobs.genesis)
     );
 
-    let ok = match probe_once(&key, &knobs).await {
-        Outcome::Ran { ok } => ok,
+    let failed = (false, None);
+    let (ok, skipped) = match probe_once(&key, &knobs).await {
+        Outcome::Ran { ok, skipped } => (ok, skipped),
         Outcome::DialFailed(e) => {
             println!("\nFAILED  dial: {e}");
-            false
+            failed
         }
         Outcome::ForkIdRejected {
             peer_hash,
@@ -299,14 +336,14 @@ async fn main() -> ExitCode {
             knobs.fork_next = peer_next;
             knobs.fork_source = ForkSource::Learned;
             match probe_once(&key, &knobs).await {
-                Outcome::Ran { ok } => ok,
+                Outcome::Ran { ok, skipped } => (ok, skipped),
                 Outcome::DialFailed(e) | Outcome::HandshakeFailed(e) => {
                     println!("\nFAILED  second connection: {e}");
-                    false
+                    failed
                 }
                 Outcome::ForkIdRejected { error, .. } => {
                     println!("\nFAILED  second connection: {error}");
-                    false
+                    failed
                 }
             }
         }
@@ -315,7 +352,7 @@ async fn main() -> ExitCode {
             // `EthSession::handshake`'s wording for a Disconnect in answer to
             // our Hello (too many peers, already connected, …): the peer sent
             // no Status and would send none to a second Hello either.
-            if e.starts_with("peer disconnected during handshake") {
+            if e.starts_with(session_err::HELLO_DISCONNECT) {
                 println!("        The peer refused the connection at Hello; a second one would be refused the same way. Try again later.");
             } else {
                 pause_before_reconnect(&knobs, "read the peer's Status without sending ours").await;
@@ -323,7 +360,7 @@ async fn main() -> ExitCode {
                     println!("FAILED  diagnostic pass: {e}");
                 }
             }
-            false
+            failed
         }
     };
 
@@ -340,7 +377,14 @@ async fn main() -> ExitCode {
             knobs.fork_next
         );
     }
-    println!("\n=== {} ===", if ok { "PASS" } else { "FAIL" });
+    match (ok, skipped) {
+        // Exit 0, but not the full check: a scripted caller reads this line.
+        (true, Some(what)) => println!(
+            "\n=== PASS, PARTIAL: {what} not exercised (the account has none) — pick another EEZ_ACCOUNT ==="
+        ),
+        (true, None) => println!("\n=== PASS ==="),
+        (false, _) => println!("\n=== FAIL ==="),
+    }
     if ok {
         ExitCode::SUCCESS
     } else {
@@ -435,14 +479,20 @@ async fn probe_once(key: &Arc<NodeKey>, knobs: &Knobs) -> Outcome {
         }
         Err(e) => {
             println!("FAILED  {}", e.into_string());
-            return Outcome::Ran { ok: false };
+            return Outcome::Ran {
+                ok: false,
+                skipped: None,
+            };
         }
     };
     let core = match core_reads(&mut session, knobs, head).await {
         Ok(core) => core,
         Err(e) => {
             println!("FAILED  {e}");
-            return Outcome::Ran { ok: false };
+            return Outcome::Ran {
+                ok: false,
+                skipped: None,
+            };
         }
     };
     if !fork_matches {
@@ -451,6 +501,7 @@ async fn probe_once(key: &Arc<NodeKey>, knobs: &Knobs) -> Outcome {
     sweep(&mut session, knobs, core.head_number, started).await;
     Outcome::Ran {
         ok: core.all_verified,
+        skipped: core.skipped,
     }
 }
 
@@ -488,6 +539,8 @@ struct Core {
     /// The peer's head block number, the sweep's reference point.
     head_number: u64,
     all_verified: bool,
+    /// The steps the account gave nothing to run on, if any.
+    skipped: Option<&'static str>,
 }
 
 /// Why a header could not be had — the two cases call for different next steps.
@@ -517,8 +570,7 @@ async fn header_by_hash(
         .get_block_headers_by_hash(hash, 1)
         .await
         .map_err(|e| {
-            // The session's own prefix for a response its decoder refused.
-            if e.starts_with("BlockHeaders decode") {
+            if e.starts_with(session_err::HEADERS_DECODE) {
                 HeaderError::Answer(format!("{what} header: {e}\n        FINDING: Myotis's BlockHeader decoder does not accept this chain's header layout"))
             } else {
                 HeaderError::Session(format!("{what} header: {e}"))
@@ -622,15 +674,26 @@ async fn core_reads(
             return Ok(Core {
                 head_number,
                 all_verified: true,
+                skipped: Some("storage and bytecode"),
             });
         }
     };
 
     let storage_ok = read_storage(session, knobs, &root, &leaf).await;
     let code_ok = read_bytecode(session, &leaf).await;
+    let skipped = match (
+        leaf.storage_root == EMPTY_TRIE_ROOT,
+        leaf.code_hash == EMPTY_CODE_HASH,
+    ) {
+        (true, true) => Some("storage and bytecode"),
+        (true, false) => Some("storage"),
+        (false, true) => Some("bytecode"),
+        (false, false) => None,
+    };
     Ok(Core {
         head_number,
         all_verified: storage_ok && code_ok,
+        skipped,
     })
 }
 
@@ -695,12 +758,15 @@ async fn read_bytecode(session: &mut EthSession, leaf: &AccountLeaf) -> bool {
 ///
 /// Keep the depths ASCENDING: a peer that drops the session at the first root
 /// it does not serve ends the sweep there, and a deeper one is moot anyway.
+/// The exception is the re-run that settles a DROPPED verdict, with that depth
+/// first.
 async fn sweep(session: &mut EthSession, knobs: &Knobs, head: u64, started: Instant) {
     if knobs.depths.is_empty() {
         return;
     }
     println!("\n--- snap serving window, depths below head #{head} (the head moves on meanwhile, so each depth is a lower bound) ---");
-    for &depth in &knobs.depths {
+    for (i, &depth) in knobs.depths.iter().enumerate() {
+        let first = i == 0;
         let Some(number) = head.checked_sub(depth) else {
             println!(
                 "{} depth {depth:>6}  skipped: deeper than the chain",
@@ -734,7 +800,9 @@ async fn sweep(session: &mut EthSession, knobs: &Knobs, head: u64, started: Inst
                 println!("{} depth {depth:>6}  #{number}: header: {e}", age(started));
                 // No answer in time, or one the decoder refused: the session
                 // is still there. Anything else took it down.
-                if !(e.contains("timed out") || e.contains("decode")) {
+                if !(e.starts_with(session_err::REQUEST_TIMEOUT)
+                    || e.starts_with(session_err::HEADERS_DECODE))
+                {
                     session_lost(started);
                     return;
                 }
@@ -766,26 +834,37 @@ async fn sweep(session: &mut EthSession, knobs: &Knobs, head: u64, started: Inst
                     age(started)
                 )
             }
-            Err(e) if e.contains("timed out") => {
+            Err(e) if e.starts_with(session_err::REQUEST_TIMEOUT) => {
                 println!(
                     "{} depth {depth:>6}  #{number}: no answer ({e})",
                     age(started)
                 )
             }
-            // `EthSession`'s wording for a Disconnect frame. Observed on the
-            // default target (Nethermind): a Disconnect, reason 16, is what a
-            // root it does not serve gets — where geth sends an empty proof.
-            // Why it does not serve that root is not something this shows.
-            Err(e) if e.starts_with("peer disconnected") => {
+            // A Disconnect where the AccountRange was due. Observed on the
+            // default target (Nethermind): reason 16 is what a root it does
+            // not serve gets — where geth sends an empty proof. But a
+            // Disconnect by itself does not say that: the peer may be done
+            // with us for a reason of its own (too many peers, a peer that
+            // answers none of its requests). So the verdict stays neutral and
+            // the output says how to tell.
+            Err(e) if e.starts_with(session_err::DISCONNECT) => {
                 println!(
-                    "{} depth {depth:>6}  #{number}: NOT served — {e}, in place of an answer",
+                    "{} depth {depth:>6}  #{number}: DROPPED — {e}, where the AccountRange was due",
                     age(started)
+                );
+                println!(
+                    "              Ambiguous by itself: the peer may not serve this root, or may be done with us for another reason. {}",
+                    if first {
+                        "It was the first depth asked, so the request rather than the session's age is the likely cause."
+                    } else {
+                        "Re-run with this depth FIRST in EEZ_DEPTHS: dropped again at once = the root."
+                    }
                 );
                 session_lost(started);
                 return;
             }
             // The peer answered, undecodably: the session is still there.
-            Err(e) if e.contains("decode") => {
+            Err(e) if e.starts_with(session_err::ACCOUNT_DECODE) => {
                 println!(
                     "{} depth {depth:>6}  #{number}: unusable answer: {e}",
                     age(started)
@@ -800,11 +879,10 @@ async fn sweep(session: &mut EthSession, knobs: &Knobs, head: u64, started: Inst
     }
 }
 
-/// A disconnect mid-sweep is ambiguous by itself: the peer may object to the
-/// request, or simply be done with a peer that serves nothing — the one-shot
-/// `EthSession` never answers the peer's own requests (Nethermind probes a new
-/// peer's head). The session's age is what tells the two apart across runs
-/// with the depths in a different order.
+/// The session's age at its end is what tells "dropped for this request" from
+/// "dropped for being a peer that serves nothing" across runs with the depths
+/// in a different order — the one-shot `EthSession` never answers the peer's
+/// own requests (Nethermind probes a new peer's head).
 fn session_lost(started: Instant) {
     println!(
         "{} session lost; the sweep ends here (t = seconds since the RLPx handshake)",
@@ -919,15 +997,15 @@ struct CrawlReport {
 /// asking each for the account at its own head (unanchored, as above).
 async fn crawl(key: &Arc<NodeKey>, knobs: &Knobs) {
     println!(
-        "\n--- discv4 crawl from {} alone, {} s ---",
-        knobs.addr, knobs.crawl_secs
+        "\n--- discv4 crawl from {} (UDP) alone, {} s ---",
+        knobs.discv4_addr, knobs.crawl_secs
     );
     let (tx, mut rx) = tokio::sync::mpsc::channel::<TableEntry>(1024);
     let discovery = match Discv4Service::start(
         Arc::clone(key),
         Discv4Config {
             bind_port: 0,
-            bootnodes: vec![knobs.addr],
+            bootnodes: vec![knobs.discv4_addr],
             ..Default::default()
         },
         tx,
@@ -998,6 +1076,14 @@ async fn crawl(key: &Arc<NodeKey>, knobs: &Knobs) {
         let _ = h.await;
     }
 
+    if entries == 0 {
+        // Not "no other node exists": nothing was asked of anyone.
+        println!(
+            "The seed never answered discv4 at {} (UDP): nothing was crawled, so this says nothing about the chain's other nodes. Is that its discovery port (`?discport=` in EEZ_ENODE)?",
+            knobs.discv4_addr
+        );
+        return;
+    }
     let reports = reports.lock().await;
     let on_chain = reports.iter().filter(|r| r.on_chain).count();
     let offer = reports
@@ -1024,13 +1110,26 @@ async fn crawl(key: &Arc<NodeKey>, knobs: &Knobs) {
     }
     let mut others: BTreeMap<String, usize> = BTreeMap::new();
     for r in reports.iter().filter(|r| !r.on_chain) {
-        *others.entry(truncate(&r.verdict, 60)).or_default() += 1;
+        *others.entry(histogram_key(&r.verdict)).or_default() += 1;
     }
     if !others.is_empty() {
         println!("not on this chain, by verdict (first 60 chars):");
         for (verdict, count) in &others {
             println!("  {count:>4}  {verdict}");
         }
+    }
+}
+
+/// A verdict's histogram row: its first 60 characters — except a Disconnect
+/// after our Status, whose text quotes the peer's client id before the reason
+/// (`status_disconnect_error`): there the reason is the row, not the client.
+fn histogram_key(verdict: &str) -> String {
+    const STATUS_DISCONNECT: &str = "peer disconnected after our Status";
+    match verdict.rfind("reason=") {
+        Some(i) if verdict.starts_with(STATUS_DISCONNECT) => {
+            truncate(&format!("{STATUS_DISCONNECT}: {}", &verdict[i..]), 60)
+        }
+        _ => truncate(verdict, 60),
     }
 }
 
