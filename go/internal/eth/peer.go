@@ -143,14 +143,24 @@ func Dial(ctx context.Context, key *ecdsa.PrivateKey, node *enode.Node, netw *ch
 	return p, nil
 }
 
-// Close sends a polite Disconnect and tears the connection down.
+// Close sends a polite Disconnect and tears the connection down. Safe to
+// call after the peer already died on its own.
 func (p *Peer) Close() {
+	_ = p.write(p.conn, msgDisconnect, mustRLP(uint(discQuit)))
+	p.markDead()
+	p.done.Wait()
+	p.failAllPending(ErrPeerClosed)
+}
+
+// Dead is closed when the peer is gone — either Close()d by us or when the
+// read side ends (peer disconnect, timeout, frame error). Callers hold this
+// to evict dead peers from their own bookkeeping.
+func (p *Peer) Dead() <-chan struct{} { return p.closed }
+
+func (p *Peer) markDead() {
 	p.closeOnce.Do(func() {
 		close(p.closed)
-		p.write(p.conn, msgDisconnect, mustRLP(uint(0))) // quit
 		p.conn.Close()
-		p.failAllPending(ErrPeerClosed)
-		p.done.Wait()
 	})
 }
 
@@ -289,9 +299,8 @@ func (p *Peer) GetBlockHeaders(fromHash common.Hash, amount uint32) ([]Header, e
 	case <-p.closed:
 		return nil, ErrPeerClosed
 	}
-	if resp.ReqID != reqID {
-		return nil, fmt.Errorf("eth: response req id %d for request %d", resp.ReqID, reqID)
-	}
+	// No second reqID check needed: readLoop routed this payload to us by
+	// exactly that id (firstRequestID).
 	return p.verifyBackwardChain(fromHash, resp.Headers)
 }
 
@@ -317,8 +326,8 @@ func (p *Peer) verifyBackwardChain(fromHash common.Hash, raws []rlp.RawValue) ([
 		if re, err := rlp.EncodeToBytes(&h); err != nil || crypto.Keccak256Hash(re) != hash {
 			return nil, fmt.Errorf("eth: header %d is not canonically encoded (hash %s)", i, hash)
 		}
-		if h.Number == nil {
-			return nil, fmt.Errorf("eth: header %d has no number", i)
+		if h.Number == nil || !h.Number.IsUint64() {
+			return nil, fmt.Errorf("eth: header %d has no sane block number", i)
 		}
 		out = append(out, Header{
 			Hash: hash, Raw: raw, Number: h.Number.Uint64(),
@@ -362,7 +371,7 @@ func (p *Peer) keepalive() {
 
 func (p *Peer) readLoop() {
 	defer p.done.Done()
-	defer p.conn.Close()
+	defer p.markDead() // a peer that vanishes on its own is Dead() too
 	for {
 		code, payload, _, err := p.conn.Read()
 		if err != nil {

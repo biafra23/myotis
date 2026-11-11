@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/biafra23/myotis/go/internal/chain"
 )
 
 // TestCRC32CheckValue — the standard IEEE check string, same assertion as the
@@ -49,15 +51,10 @@ func TestMainnetChainReproducesThePinnedForkId(t *testing.T) {
 	}
 	var want [4]byte
 	binary.BigEndian.PutUint32(want[:], hash)
-	if want != pinnedMainnetHash() {
-		t.Errorf("internal/chain pin = %x, chain says %x", pinnedMainnetHash(), want)
+	if p := chain.Mainnet().ForkIDHash; want != p {
+		t.Errorf("internal/chain pin = %x, chain derivation says %x", p, want)
 	}
 }
-
-// pinnedMainnetHash reads the pin from internal/chain without importing it
-// (chain imports no forkid today; the pin test there checks the corpus, this
-// one checks the arithmetic — both point at the same four bytes).
-func pinnedMainnetHash() [4]byte { return [4]byte{0x07, 0xc9, 0x46, 0x2e} }
 
 // TestPinMatchesCorpus re-asserts the four bytes against the shared
 // conformance corpus from the forkid package side too.
@@ -111,6 +108,13 @@ func TestAccept(t *testing.T) {
 	}
 	if Accept(mine, foreign) {
 		t.Error("unrelated hash must be refused")
+	}
+	// EIP-2124 / geth forkid.IsValid: same hash accepts whatever Next the
+	// peer announces — a geth that already knows the fork after our Next
+	// must not be dropped.
+	aheadNext := ID{Hash: mine.Hash, Next: mine.Next + 1_000_000}
+	if !Accept(mine, aheadNext) {
+		t.Error("same hash with a later announced Next must be accepted")
 	}
 	// Past Amsterdam our own resolved id equals the ahead-peer's; a stale
 	// one-behind announcement (same) is then correctly refused.

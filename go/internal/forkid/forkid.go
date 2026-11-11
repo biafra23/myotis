@@ -45,21 +45,23 @@ func (id ID) IDAt(now uint64) ID {
 }
 
 // Accept reports whether a peer's fork id is compatible with ours under
-// EIP-2124: same hash, or a hash reachable from ours by folding one known
-// activation (the peer is one fork ahead of our pin), and the nexts agree.
-// This is the minimum courtesy gate — a peer whose id we cannot relate to
-// would drop us anyway; the trust anchor for headers is the light client,
-// not this field.
+// EIP-2124: same hash — regardless of what Next they announce, per the EIP
+// and geth's forkid.IsValid, which short-circuits on hash equality; peers
+// fill Next with whatever future activation THEY know — or a hash reachable
+// from ours by folding one known activation (the peer is one fork ahead of
+// our pin). This is the minimum courtesy gate — a peer whose id we cannot
+// relate to would drop us anyway; the trust anchor for headers is the light
+// client, not this field (the Rust twin only checks network + genesis,
+// myotis-wire eth.rs is_compatible).
 func Accept(mine, theirs ID) bool {
 	if theirs.Hash == mine.Hash {
-		return theirs.Next == mine.Next
+		return true
 	}
-	// Peer one known timestamp fork ahead: our successor equals their hash
-	// and their Next is past it.
+	// Peer one known timestamp fork ahead: our successor equals their hash.
 	if mine.Next >= TimestampThreshold {
 		var succ [4]byte
 		binary.BigEndian.PutUint32(succ[:], Successor(binary.BigEndian.Uint32(mine.Hash[:]), mine.Next))
-		if succ == theirs.Hash && (theirs.Next == 0 || theirs.Next > mine.Next) {
+		if succ == theirs.Hash {
 			return true
 		}
 	}

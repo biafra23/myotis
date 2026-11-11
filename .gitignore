@@ -70,3 +70,7 @@ __pycache__/
 
 # The Bee PoC ships warm Gnosis peer caches (public enodes / multiaddrs) next to its seed.
 !data/bee/gnosis/*.cache
+
+# Vim swap files
+*.swp
+*.swo

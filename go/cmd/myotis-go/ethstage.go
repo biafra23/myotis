@@ -24,34 +24,22 @@ const (
 	// growing.
 	dialRetryEvery = 3 * time.Minute
 	dialTick       = 2 * time.Second
+	// A tried candidate that has not been dialable-and-due for this long is
+	// stale enough to drop; discovery keeps re-offering anyone still alive.
+	candidateTTL = time.Hour
 )
-
-// dialPriority orders candidates: liveness-proven discv4 peers first (they
-// answered a ping minutes ago), then lookup-seen, then DNS leaves (which may
-// lag months behind). Public mainnet nodes reject inbound as full
-// (disconnect 0x04) routinely — getting two ready peers is a retry loop, and
-// the retry loop wants the best-first ordering.
-func dialPriority(src discovery.Source) int {
-	switch src {
-	case discovery.SourceDiscv4:
-		return 0
-	case discovery.SourceLookup:
-		return 1
-	default:
-		return 2
-	}
-}
 
 type dialCandidate struct {
 	node     *enode.Node
-	priority int
+	priority int // lower dials first
 	lastDial time.Time
 	attempts int
 }
 
 // ethStage keeps a small set of READY eth peers by dialing discovered
-// candidates, and once one is up fetches a verified backward header chain
-// from its Status head (printed once).
+// candidates (evicting them when they die, which eth peers do routinely),
+// and drives one verified backward header chain read from the first peer
+// that stays up long enough (retried through later peers if one fails).
 type ethStage struct {
 	key  *ecdsa.PrivateKey
 	netw *chain.Network
@@ -61,6 +49,7 @@ type ethStage struct {
 	cands     map[enode.ID]*dialCandidate
 	ready     map[enode.ID]*eth.Peer
 	dialing   map[enode.ID]bool
+	proving   bool
 	chainDone bool
 }
 
@@ -87,7 +76,9 @@ func (e *ethStage) offer(c discovery.Candidate) {
 		old.node = c.Node // endpoint may have been refreshed
 		return
 	}
-	e.cands[c.ID] = &dialCandidate{node: c.Node, priority: dialPriority(c.Source)}
+	// Same ordering the discovery pool uses for endpoint precedence
+	// (liveness-proven discv4 > lookup-seen > DNS): negate its rank.
+	e.cands[c.ID] = &dialCandidate{node: c.Node, priority: -discovery.SourceRank(c.Source)}
 }
 
 // run dials until ctx ends. Close must be called to release peers.
@@ -99,20 +90,27 @@ func (e *ethStage) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			for _, c := range e.pickDials(time.Now()) {
+			now := time.Now()
+			e.pruneCandidates(now)
+			for _, c := range e.pickDials(now) {
 				go e.dial(ctx, c)
 			}
 		}
 	}
 }
 
-// pickDials chooses up to the free dial slots' worth of best-first,
-// not-recently-tried candidates and marks them as dialed-now (so one tick
-// cannot double-dial).
+// pickDials fills the free dial slots best-first with not-recently-tried
+// candidates and marks them dialed-now (so one tick cannot double-dial).
+// The slot budget is the dial concurrency, not the ready target — with
+// public peers rejecting most dials, several must be in flight while the
+// ready set is still short.
 func (e *ethStage) pickDials(now time.Time) []*enode.Node {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	slots := targetEthPeers - len(e.ready) - len(e.dialing)
+	if len(e.ready) >= targetEthPeers {
+		return nil
+	}
+	slots := maxConcurrentDials - len(e.dialing)
 	if slots <= 0 {
 		return nil
 	}
@@ -134,7 +132,7 @@ func (e *ethStage) pickDials(now time.Time) []*enode.Node {
 	})
 	var out []*enode.Node
 	for _, c := range pool {
-		if len(out) >= min(slots, maxConcurrentDials) {
+		if len(out) >= slots {
 			break
 		}
 		c.lastDial = now
@@ -143,6 +141,18 @@ func (e *ethStage) pickDials(now time.Time) []*enode.Node {
 		out = append(out, c.node)
 	}
 	return out
+}
+
+// pruneCandidates drops long-stale tried candidates so the pool cannot grow
+// without bound; live peers return through discovery's re-fires.
+func (e *ethStage) pruneCandidates(now time.Time) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for id, c := range e.cands {
+		if c.attempts > 0 && now.Sub(c.lastDial) > candidateTTL && e.ready[id] == nil {
+			delete(e.cands, id)
+		}
+	}
 }
 
 func (e *ethStage) dial(ctx context.Context, node *enode.Node) {
@@ -163,12 +173,27 @@ func (e *ethStage) dial(ctx context.Context, node *enode.Node) {
 		return
 	}
 	e.ready[peer.ID] = peer
-	first := !e.chainDone
-	e.chainDone = true
+	startProve := !e.chainDone && !e.proving
+	if startProve {
+		e.proving = true
+	}
 	e.mu.Unlock()
-
-	if first {
+	go e.watchPeer(peer)
+	if startProve {
 		go e.proveHeaderRead(peer)
+	}
+}
+
+// watchPeer frees the ready slot when the peer dies so the dial loop can
+// refill it — eth peers churn constantly.
+func (e *ethStage) watchPeer(p *eth.Peer) {
+	<-p.Dead()
+	e.mu.Lock()
+	wasReady := e.ready[p.ID] == p
+	delete(e.ready, p.ID)
+	e.mu.Unlock()
+	if wasReady {
+		e.log.Debug("ready peer gone", "peer", p.ID.TerminalString(), "client", p.ClientID)
 	}
 }
 
@@ -182,13 +207,20 @@ func (e *ethStage) attempts(id enode.ID) int {
 }
 
 // proveHeaderRead walks headerSample headers backward from the peer's Status
-// head with full link verification, and logs the result. A part-3 anchor will
-// replace "the peer's own head" as the trust root; until then this proves the
-// read path end to end.
+// head with full link verification, and logs the result. A part-3 anchor
+// will replace "the peer's own head" as the trust root; until then this
+// proves the read path end to end. Only a SUCCESS retires the one-shot: a
+// failed attempt hands the job to the next ready peer.
 func (e *ethStage) proveHeaderRead(p *eth.Peer) {
 	headers, err := p.GetBlockHeaders(p.Status.BestHash, headerSample)
+	e.mu.Lock()
+	e.proving = false
+	if err == nil {
+		e.chainDone = true
+	}
+	e.mu.Unlock()
 	if err != nil {
-		e.log.Warn("header read failed", "peer", p.ID.TerminalString(), "err", err)
+		e.log.Warn("header read failed; a later peer will retry", "peer", p.ID.TerminalString(), "err", err)
 		return
 	}
 	oldest, newest := headers[len(headers)-1], headers[0]
@@ -206,9 +238,15 @@ func (e *ethStage) count() int {
 
 func (e *ethStage) Close() {
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	peers := make([]*eth.Peer, 0, len(e.ready))
 	for id, p := range e.ready {
-		p.Close()
+		peers = append(peers, p)
 		delete(e.ready, id)
+	}
+	e.mu.Unlock()
+	// Close outside the lock: it blocks on per-peer teardown and must not
+	// stall discovery's offer() callbacks behind dying connections.
+	for _, p := range peers {
+		p.Close()
 	}
 }

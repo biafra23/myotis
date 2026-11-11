@@ -46,11 +46,11 @@ const (
 	SourceDNS    Source = "dns"
 )
 
-// sourceRank orders sources for endpoint precedence: a liveness-proven
+// SourceRank orders sources for endpoint precedence: a liveness-proven
 // endpoint must never be replaced by a later unproven sample of the same
 // node (the DNS tree lags; every source re-delivers what it already
 // delivered). Same rank: last writer wins among unproven sources.
-func sourceRank(src Source) int {
+func SourceRank(src Source) int {
 	if src == SourceDiscv4 {
 		return 2
 	}
@@ -229,7 +229,7 @@ func (s *Service) snapshot() []Candidate {
 // addCandidate records a peer with a dialable TCP endpoint (the RLPx layer
 // can only dial those) and reports whether the pool changed. A known peer
 // whose ENR moved is replaced — and OnDiscovered re-fired — only by a source
-// at least as trustworthy as the one holding the record (see sourceRank), so
+// at least as trustworthy as the one holding the record (see SourceRank), so
 // a late DNS sample can never overwrite an endpoint discv4 proved.
 func (s *Service) addCandidate(src Source, n *enode.Node) bool {
 	if n.TCP() == 0 || n.IP() == nil || n.IP().IsUnspecified() {
@@ -239,7 +239,7 @@ func (s *Service) addCandidate(src Source, n *enode.Node) bool {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		old, known := s.candidates[n.ID()]
-		if known && (endpointOf(old.Node) == endpointOf(n) || sourceRank(src) < sourceRank(old.Source)) {
+		if known && (endpointOf(old.Node) == endpointOf(n) || SourceRank(src) < SourceRank(old.Source)) {
 			return Candidate{}, false
 		}
 		c := Candidate{
