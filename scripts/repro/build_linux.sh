@@ -10,7 +10,8 @@
 # scripts/repro/collect.sh gathers them afterwards.
 #
 # It also builds the Linux host libraries, the Node addon, the .deb and a
-# Linux natives jar, which the comparison reports. Those are NOT the release's
+# Linux natives jar, which the comparison of two such builds holds to the same
+# bytes like everything else. Those are NOT the release's
 # bytes when built in the image: a release builds its Linux host libraries on
 # ubuntu-22.04 (engine-library.yml, for a glibc 2.35 floor) and stages the
 # natives of four platforms, and jpackage derives the .deb's Depends from the

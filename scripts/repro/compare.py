@@ -23,8 +23,8 @@ difference is still listed, marked "(not gated)", and does not fail. Without
 --gate everything is gated. --no-gate GLOB takes matching paths back out of
 the gate (it wins over --gate): for a comparison whose two sides are not
 expected to agree on them. --labels names the two legs in the output (default
-a and b). --report-only gates nothing (a platform whose
-artifacts are compared and reported but not yet held to reproducibility).
+a and b). --report-only gates nothing (a comparison whose second side is not
+a second build of the same kind: every difference is listed, none fails).
 reproducible-builds.yml gates everything in its three a-against-b comparisons
 (owner's decisions: Android first, 2026-11-10; all of it, 2026-11-11) and
 reports the two that have another second side.

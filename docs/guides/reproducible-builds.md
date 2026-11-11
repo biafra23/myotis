@@ -20,8 +20,8 @@ The first two say who built it. Only the third says **what** was built.
 ## What reproduces, and what does not yet
 
 "Reproduces" means: built twice, on two machines, from different directories,
-as different users, in different time zones and locales and at different
-times, the result is identical, bit for bit. `reproducible-builds.yml` does
+in different time zones and locales and at different times (and on Linux as
+different users), the result is identical, bit for bit. `reproducible-builds.yml` does
 exactly that on every `v*` tag, weekly on `main`, and before a pull request
 that can change a release build is merged, and fails when the two builds
 differ in anything they produce ("gated", below).
@@ -32,11 +32,11 @@ differ in anything they produce ("gated", below).
 | Android app, signed | `Myotis-<tag>-android.apk` | The unsigned APK plus a signature, and nothing else ([below](#the-signed-apk)). The signature itself needs the release key and is not reproducible by design. |
 | Android debug app | `Myotis-<tag>-android-debug.apk` | **Gated**, by payload: every entry of the APK. Its signature files are left out of the comparison. The signer is the one public debug key in the tree (`android-app/debug.keystore`), the same on every machine. |
 | Engine library | `myotis-engine-<tag>-android.aar`, `myotis-engine-<tag>-maven-repo.zip` | **Gated**, as staged: the AAR, its jars, poms and metadata. In the zip, the natives jars for macOS and Linux and the iOS module come from other builders (see below). |
-| Linux desktop | `Myotis-<tag>-<arch>.deb` | **Gated**, as a file and by its contents, as built in the builder image (the release's own `.deb` comes from another builder, see below). |
-| macOS desktop | `Myotis-<tag>-<arch>.dmg` | **Gated**, by content: every file of the `.app` in the image, not the dmg container. Packaged under umask 022 (see below). Unsigned, not notarized. |
+| Linux desktop | `Myotis-<tag>-<arch>.deb` | **Gated** for x64, as a file and by its contents, as built in the builder image. The arm64 `.deb` is not rebuilt, and the release's own `.deb`s come from other builders (see below). |
+| macOS desktop | `Myotis-<tag>-<arch>.dmg` | **Gated** for arm64, by content: every file of the `.app` in the image, not the dmg container. Packaged under umask 022 (see below). The x64 dmg (Intel) is not rebuilt. Unsigned, not notarized. |
 | Windows desktop | (no release asset yet) | **Gated**, by content: the files the msi installs. |
 | iOS frameworks | `MyotisEngine.xcframework.zip`, `MyotisKit.xcframework.zip` | **Gated.** Bit for bit, the zips and their trees. |
-| Node addon | `myotis-node.<platform>.node` | **Gated**, as each platform's two legs build it. |
+| Node addon | `myotis-node.<platform>.node` | **Gated** for three of the five published: Linux x64, macOS arm64, Windows x64. Linux arm64 and macOS x64 are not rebuilt. |
 | Daemon jars | `*-SNAPSHOT.jar` | Not compared. |
 
 Android came first, on purpose: it is the artifact that holds a wallet. The
@@ -45,7 +45,22 @@ differences were fixed and a comparison had come out clean on all three
 platforms. A difference now fails the run on any of them, with a diffoscope
 report per differing file.
 
-Three limits to state plainly:
+Five limits to state plainly:
+
+- **"Gated" means: two builds in CI agree.** For the Android artifacts those
+  two builds run in the pinned builder image, which anyone can pull, and on a
+  tag the result is also set next to what the release published. For the
+  desktop and Apple rows neither is true yet: the two builds run on GitHub's
+  hosted runners of the day (with Xcode, the JDK, rustc and WiX pinned on
+  them; the rest of the image is shared by both builds, so it is not varied),
+  there is no pinned builder to rebuild them in, and nothing compares a
+  rebuild with the published dmg, xcframework zips or addons. So for those
+  rows the gate shows that the build does not depend on where and when it
+  runs. It does not yet let you reproduce the published file yourself.
+- **One architecture per platform is built twice.** A release also ships the
+  Intel dmg, the arm64 `.deb` and two more Node addons, built the same way
+  from the same tree by another leg of the release workflows; those are not
+  part of the comparison.
 
 - **One step does not vary its umask: packaging the dmg.** jpackage creates
   the directories inside the dmg with the umask of its own process, and
@@ -64,9 +79,10 @@ Three limits to state plainly:
   when the image first built (2026-11-10), every Android artifact was identical
   between the two.
 - **The Linux host libraries a release ships are not built in the builder
-  image.** They come from `ubuntu-22.04` runners, for a glibc 2.35 floor, so
-  the Linux natives jar inside the engine library zip, the `.deb` and the Node
-  addon are outside what the image reproduces today.
+  image.** The natives jars inside the engine library zip come from
+  `ubuntu-22.04` runners, for a glibc 2.35 floor; the released `.deb`s and
+  the Linux Node addons from `ubuntu-26.04` and `ubuntu-24.04-arm` runners.
+  All of them are outside what the image reproduces today.
 
 ## 1. Checksums
 
