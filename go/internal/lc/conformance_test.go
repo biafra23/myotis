@@ -2,6 +2,8 @@ package lc
 
 import (
 	"bufio"
+	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -38,7 +40,15 @@ func TestLCCorpus(t *testing.T) {
 	root := boot.Header.Beacon.Root()
 	record("bootstrap.headerRoot", hexStr(root[:]))
 	record("bootstrap.slot", itoa(boot.Header.Beacon.Slot))
-	store, err := NewFromBootstrap(boot, fork, consensus)
+	// The checkpoint pin runs INSIDE NewFromBootstrap (spec §9.1 step 1).
+	// The corpus bootstrap is from period 1777, not this build's embedded
+	// anchor, so the corpus's own recorded header root stands in as the
+	// trusted root — and a WRONG root must be refused outright.
+	trusted := hexBytes(t, expected["bootstrap.headerRoot"])
+	if _, err := NewFromBootstrap(boot, fork, consensus, hexBytes(t, expected["genesisValidatorsRoot"])); err == nil {
+		t.Error("NewFromBootstrap accepted a bootstrap whose header root is not the trusted root")
+	}
+	store, err := NewFromBootstrap(boot, fork, consensus, trusted)
 	if err != nil {
 		t.Fatalf("bootstrap: %v", err)
 	}
@@ -53,9 +63,19 @@ func TestLCCorpus(t *testing.T) {
 		if err != nil {
 			t.Fatalf("decode %s: %v", filepath.Base(f), err)
 		}
-		applied := store.ProcessUpdate(u) == nil
+		err = store.ProcessUpdate(u)
+		applied := err == nil
 		record("update."+itoa(uint64(i))+".applied", boolStr(applied))
 		record("update."+itoa(uint64(i))+".finalizedSlot", itoa(store.Finalized.Slot))
+		// 099 is 018 replayed after the rotation: expected.txt says the
+		// APPLICABILITY gate kills it (#423 order — before BLS). Asserting
+		// the sentinel, not just the rejection, pins that no later gate
+		// fired instead.
+		if strings.Contains(filepath.Base(f), "099-") {
+			if !errors.Is(err, ErrPeriodGate) {
+				t.Errorf("099-update rejected by something other than the period gate: %v", err)
+			}
+		}
 		if applied {
 			store.ForceRotateIfPastPeriod(slotEstimate)
 		}
@@ -63,6 +83,7 @@ func TestLCCorpus(t *testing.T) {
 
 	finalityFiles := corpusFiles(t, corpus, "-finality.ssz")
 	record("finality.count", itoa(uint64(len(finalityFiles))))
+	var appliedFinality *FinalityUpdate
 	for i, f := range finalityFiles {
 		fu, err := DecodeFinalityUpdate(readCorpus(t, f))
 		if err != nil {
@@ -71,6 +92,26 @@ func TestLCCorpus(t *testing.T) {
 		outcome, err := store.ProcessFinalityUpdate(fu)
 		applied := err == nil && outcome == Advanced
 		record("finality."+itoa(uint64(i))+".applied", boolStr(applied))
+		// expected.txt: 001-finality "the period gate rejects it before
+		// BLS — it failed BLS under the pre-#423 processor". Only the
+		// sentinel tells those apart.
+		if strings.Contains(filepath.Base(f), "001-") {
+			if outcome != Rejected || !errors.Is(err, ErrPeriodGate) {
+				t.Errorf("001-finality: outcome %v err %v, want Rejected + period gate", outcome, err)
+			}
+		}
+		if applied {
+			appliedFinality = fu
+		}
+	}
+	// The Rust replay asserts (lc_conformance.rs) that re-serving the
+	// applied finality update verifies but moves nothing: Stale, not
+	// Rejected, not Advanced.
+	if appliedFinality == nil {
+		t.Fatal("no finality update applied; the re-serve check would not run")
+	}
+	if outcome, err := store.ProcessFinalityUpdate(appliedFinality); err != nil || outcome != Stale {
+		t.Errorf("re-serving the applied finality update: outcome %v err %v, want Stale", outcome, err)
 	}
 
 	record("final.finalizedSlot", itoa(store.Finalized.Slot))
@@ -141,13 +182,24 @@ func corpusFiles(t *testing.T, dir, suffix string) []string {
 	return keep
 }
 
-func readCorpus(t *testing.T, path string) []byte {
+func readCorpus(t testing.TB, path string) []byte {
 	t.Helper()
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read corpus file: %v", err)
 	}
 	return b
+}
+
+func hexBytes(t *testing.T, s string) hash32 {
+	t.Helper()
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != 32 {
+		t.Fatalf("bad 32-byte hex in corpus: %q", s)
+	}
+	var h hash32
+	copy(h[:], b)
+	return h
 }
 
 func hexStr(b []byte) string {

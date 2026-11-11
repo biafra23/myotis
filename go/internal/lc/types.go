@@ -29,9 +29,12 @@ type branchGeom struct {
 var (
 	geomDeneb = branchGeom{105, 6, 54, 5, 55, 5, 25, 4}
 	// Fulu speaks Electra geometry (the widened state); with no Gloas epoch
-	// pinned for mainnet, this is the head geometry.
+	// pinned for mainnet, this is the head geometry. Gloas's fixed
+	// geometry (735/9, 2945/11, 2946/11, 2856/11 — spec.rs:25-36) gets a
+	// var here the day a Gloas epoch is pinned in chain/lc.go; until then
+	// the numbers live only in this comment, so no unselected geometry
+	// masquerades as a live gate (PR #769 review).
 	geomElectra = branchGeom{169, 7, 86, 6, 87, 6, 25, 4}
-	geomGloas   = branchGeom{735, 9, 2945, 11, 2946, 11, 2856, 11}
 )
 
 // ForkSchedule serves the per-slot fork version the signing domain needs.
@@ -205,6 +208,16 @@ func execHeaderRoot(eph []byte) (hash32, error) {
 	if off >= fixed && off <= len(eph) {
 		extra = eph[off:]
 	}
+	// extra_data is ByteList[32] and this region runs to the end of
+	// whatever the peer sent (bootstrap/finalized headers own the buffer
+	// tail): an oversized one must be REJECTED here — listRoot panics on
+	// it, and this is the one length taken from the buffer rather than
+	// sniffed from an offset (PR #769 review). The Rust twin does not
+	// panic here either: merkleize widens the limit and the
+	// execution-branch check rejects downstream.
+	if len(extra) > 32 {
+		return hash32{}, fmt.Errorf("%w: extra_data is %d bytes (max 32)", ErrShape, len(extra))
+	}
 	at := func(i, n int) []byte { return eph[i : i+n] }
 	u64 := func(i int) hash32 { return uint64Root(binary.LittleEndian.Uint64(eph[i : i+8])) }
 	push := func(b []byte) hash32 { var h hash32; copy(h[:], b); return h }
@@ -246,11 +259,6 @@ type lcHeader struct {
 	// records this field, not the EPH root).
 	ExecStateRoot hash32
 	Branch        []hash32
-}
-
-func (h *lcHeader) Root() hash32 {
-	return containerRoot(h.Beacon.Root(), h.Exec,
-		merkleize(h.Branch, nextPow2(uint64(len(h.Branch)))))
 }
 
 // parseLCHeader parses a LightClientHeader from its BOUNDED region (the
@@ -380,7 +388,12 @@ func DecodeUpdate(b []byte) (*Update, error) {
 		return nil, err
 	}
 	slot := binary.LittleEndian.Uint64(b[pos+160 : pos+168])
-	if attOff > finOff || finOff > len(b) {
+	// Both stored offsets must sit at or past the end of the fixed part
+	// just read (the Rust finality decoder's actual_fixed bound,
+	// types.rs:759-764): on a 32-bit int, int(uint32) goes negative for
+	// offsets ≥ 2³¹ and a bare `attOff > finOff` check would let a
+	// negative slice index through.
+	if attOff < pos+168 || attOff > finOff || finOff < pos+168 || finOff > len(b) {
 		return nil, ErrShape
 	}
 	attested, err := parseLCHeader(b[attOff:finOff])
@@ -438,7 +451,8 @@ func DecodeFinalityUpdate(b []byte) (*FinalityUpdate, error) {
 		return nil, err
 	}
 	slot := binary.LittleEndian.Uint64(b[pos+160 : pos+168])
-	if attOff > finOff || finOff > len(b) {
+	// Same fixed-part lower bound as DecodeUpdate (types.rs:759-764).
+	if attOff < pos+168 || attOff > finOff || finOff < pos+168 || finOff > len(b) {
 		return nil, ErrShape
 	}
 	attested, err := parseLCHeader(b[attOff:finOff])
@@ -466,12 +480,20 @@ func readRoots(b []byte, off, n int) ([]hash32, error) {
 	return out, nil
 }
 
-// shapeOk checks the two headers against the ATTESTED slot's fork
-// geometry — the store's shape gate (update_shape_ok): branch lengths and
-// execution proof family must agree with the fork the attester lived in.
-func shapeOk(attested, finalized *lcHeader, geom branchGeom, finalityLen, nextLen int) bool {
+// finalityShapeOk is the store's shape gate shared by both processor
+// paths (update_shape_ok / headers_in_attested_forks_shape): both
+// headers' execution-branch family and the finality-branch length must
+// agree with the fork the attester lived in.
+func finalityShapeOk(attested, finalized *lcHeader, geom branchGeom, finalityLen int) bool {
 	return len(attested.Branch) == int(geom.ExecLen) &&
 		len(finalized.Branch) == int(geom.ExecLen) &&
-		finalityLen == int(geom.FinalizedLen) &&
+		finalityLen == int(geom.FinalizedLen)
+}
+
+// shapeOk adds the update path's next-committee branch to
+// finalityShapeOk. Both are wired: ProcessUpdate calls shapeOk,
+// ProcessFinalityUpdate calls finalityShapeOk.
+func shapeOk(attested, finalized *lcHeader, geom branchGeom, finalityLen, nextLen int) bool {
+	return finalityShapeOk(attested, finalized, geom, finalityLen) &&
 		nextLen == int(geom.NextLen)
 }

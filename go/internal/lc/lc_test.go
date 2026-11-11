@@ -93,8 +93,11 @@ func TestSignatureSlotOffByOne(t *testing.T) {
 	if v := fork.VersionForSignatureSlot(364032 * chain.SlotsPerEpoch); v != (c.Forks[4].Version) {
 		t.Fatalf("boundary slot: got %x, want Deneb %x", v, c.Forks[4].Version)
 	}
-	if v := fork.VersionForSignatureSlot(364032*chain.SlotsPerEpoch + chain.SlotsPerEpoch); v != (c.Forks[5].Version) {
-		t.Fatalf("one epoch in: got %x, want Electra %x", v, c.Forks[5].Version)
+	// Adjacent slot, as the Rust twin tests it (fork.rs:227-228): an
+	// epoch-later check would also pass under (slot-32)/32 and every
+	// other wrong-but-similar rule.
+	if v := fork.VersionForSignatureSlot(364032*chain.SlotsPerEpoch + 1); v != (c.Forks[5].Version) {
+		t.Fatalf("one slot in: got %x, want Electra %x", v, c.Forks[5].Version)
 	}
 	// And slot 0 must not underflow.
 	if v := fork.VersionForSignatureSlot(0); v != (c.Forks[0].Version) {

@@ -30,18 +30,34 @@ func SigningRoot(objectRoot, domain [32]byte) [32]byte {
 	return containerRoot(objectRoot, domain)
 }
 
-// VerifySyncAggregate is the spec's fast_aggregate_verify with the two
-// myotis-bls asymmetries kept exact (lib.rs:69-86): committee pubkeys are
+// VerifySyncAggregate takes the same inputs as its Rust twin
+// (verify.rs:36 — aggregate, committee, attested beacon header, fork
+// version, genesis validators root) and derives the domain and signing
+// root ITSELF: those parameters define what is signed, so accepting them
+// and verifying a caller-computed root instead would be the Trust
+// section's forbidden "accepted and silently ignored" — a caller could
+// hand a root built under another fork version and get a verdict for it
+// with no sign. The signed object is the BEACON header root, as the Rust
+// processor passes attested_header.beacon into this function.
+//
+// The check is the spec's fast_aggregate_verify with the two myotis-bls
+// asymmetries kept exact (lib.rs:69-86): committee pubkeys are
 // Merkle-proven, so they get NO per-key subgroup check; the aggregate
 // signature is peer-supplied and MUST be subgroup-checked. The
 // participation gate (2/3 of 512, as *3 ≥ 512*2) runs before any curve
 // arithmetic.
-func VerifySyncAggregate(committee *SyncCommittee, agg *SyncAggregate, signingRoot [32]byte, genesisValidatorsRoot [32]byte, forkVersion [4]byte) error {
+func VerifySyncAggregate(committee *SyncCommittee, agg *SyncAggregate, attested *BeaconBlockHeader, forkVersion [4]byte, genesisValidatorsRoot [32]byte) error {
+	signingRoot := SigningRoot(attested.Root(),
+		ComputeDomain(DomainSyncCommittee, forkVersion, genesisValidatorsRoot))
 	n := agg.Participants()
 	if n*3 < SyncCommitteeSize*2 {
 		return fmt.Errorf("lc: participation %d below the 2/3 bar", n)
 	}
 	if n > MaxPubkeys {
+		// Tripwire, not a live bound: a 64-byte participation bitvector
+		// caps n at 512. It guards the curve arithmetic if the committee
+		// or bitvector is ever widened past MAX_PUBKEYS without this
+		// function following.
 		return fmt.Errorf("lc: %d participants over MAX_PUBKEYS", n)
 	}
 	if len(committee.Pubkeys) != SyncCommitteeSize {

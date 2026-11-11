@@ -1,8 +1,11 @@
 // Consensus-layer pins, one definition per network, twin of the Rust
 // engine's ChainConfig::mainnet (rust/myotis-net/src/sync.rs). Like the EL
-// pins these move only with the release checklist: the checkpoint is
-// refreshed by ./gradlew refreshCheckpoint, which writes both engines from
-// one fetch.
+// pins these move only with the release checklist. NOTE: ./gradlew
+// refreshCheckpoint rewrites the JAVA and RUST marker regions only — it
+// does not write this file. The checkpoint pin here is kept honest by
+// TestCheckpointMatchesRustEngine (lc_drift_test.go), which compares it
+// against sync.rs's @checkpoint:mainnet region, so a release refresh
+// turns the Go build red until this pin moves with the others.
 package chain
 
 import "github.com/ethereum/go-ethereum/common"
