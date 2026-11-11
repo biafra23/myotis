@@ -116,7 +116,7 @@ dependencies = ["unreachable"]
             "name": "The app", "description": "made up",
             "gradle": [("proj", ["runtimeClasspath"])],
             "cargo": [("rust/Cargo.lock", ["ours"])],
-            "host_modules": True, "jdk": True,
+            "hosts": ["linux-x64", "macos-arm64"], "jdk": True,
         },
         "native": {
             "name": "The addon", "description": "made up",
@@ -201,6 +201,18 @@ class MadeUp(unittest.TestCase):
         self.assertIn(("myotis:pinned-file:sha256:variants-4.0-linux.jar", sha("d")), self.properties(variants))
         self.assertIn(("myotis:pinned-file:sha256:variants-4.0.jar", sha("c")), self.properties(variants))
 
+    def test_a_build_only_module_is_left_out_and_the_document_says_so(self):
+        with mock.patch.dict(sbom.PRODUCTS["app"], {"build_only": {"g.one:root": "read by the build"}}):
+            document = self.build()
+        self.assertNotIn("pkg:maven/g.one/root@3.0", [c["bom-ref"] for c in document["components"]])
+        self.assertIn({"name": "myotis:sbom:left-out", "value": "g.one:root: read by the build"},
+                      document["metadata"]["properties"])
+
+    def test_a_build_only_module_that_is_not_locked_is_an_error(self):
+        with mock.patch.dict(sbom.PRODUCTS["app"], {"build_only": {"g.one:gone": "why"}}):
+            with self.assertRaisesRegex(sbom.SbomError, "leaves out g.one:gone as build-only, and locks no such"):
+                self.build()
+
     def test_a_configuration_that_is_gone_is_an_error_not_an_empty_list(self):
         self.tree.write("proj/gradle.lockfile", "g.one:lib:1.0=compileClasspath\n")
         with self.assertRaisesRegex(sbom.SbomError, "no lock state for the configuration 'runtimeClasspath'"):
@@ -221,11 +233,21 @@ class MadeUp(unittest.TestCase):
         self.assertIn("pkg:maven/g.ui/ui-host-macos-arm64@5.0", refs)
         self.assertNotIn("pkg:maven/g.ui/ui-host-macos-arm64@4.9", refs)
 
-    def test_host_modules_that_are_not_pinned_are_an_error(self):
-        pinned = {k: v for k, v in Tree.PINNED.items() if not (k[1].startswith("ui-host-") and k[2] == "5.0")}
+    def test_a_host_the_product_is_built_for_and_nothing_pins_is_an_error(self):
+        pinned = {k: v for k, v in Tree.PINNED.items() if k != ("g.ui", "ui-host-macos-arm64", "5.0")}
         self.tree.write("gradle/verification-metadata.xml", metadata(pinned))
-        with self.assertRaisesRegex(sbom.SbomError, "pins no g.ui:ui-host-<host>:5.0"):
+        with self.assertRaisesRegex(sbom.SbomError, "is built for macos-arm64, and .* pins no g.ui:ui-host-macos-arm64:5.0"):
             self.build()
+
+    def test_a_pinned_host_the_product_does_not_state_is_an_error(self):
+        pinned = {**Tree.PINNED, ("g.ui", "ui-host-macos-x64", "5.0"): {"ui-host-macos-x64-5.0.jar": sha("9")}}
+        self.tree.write("gradle/verification-metadata.xml", metadata(pinned))
+        with self.assertRaisesRegex(sbom.SbomError, "pins g.ui:ui-host-macos-x64:5.0, and macos-x64 is not among"):
+            self.build()
+
+    def test_the_document_says_which_hosts(self):
+        self.assertIn({"name": "myotis:sbom:hosts", "value": "with the per-host modules of: linux-x64, macos-arm64"},
+                      self.build()["metadata"]["properties"])
 
     def test_host_modules_need_one_version_of_the_module_they_follow(self):
         self.tree.write("proj/gradle.lockfile", Tree.LOCK + "g.ui:ui-core:4.9=otherRuntime\n")
@@ -336,8 +358,13 @@ class MadeUp(unittest.TestCase):
 
     def test_a_timestamp_only_when_one_is_given(self):
         self.assertEqual(self.build(timestamp=0)["metadata"]["timestamp"], "1970-01-01T00:00:00Z")
-        # ... and it is not part of what the serial number names.
-        self.assertEqual(self.build(timestamp=0)["serialNumber"], self.build()["serialNumber"])
+
+    def test_two_documents_that_differ_have_two_serial_numbers(self):
+        # A serial number and `version` identify a BOM: the same pins at
+        # another commit time are another document.
+        self.assertEqual(self.build(timestamp=5)["serialNumber"], self.build(timestamp=5)["serialNumber"])
+        self.assertNotEqual(self.build(timestamp=5)["serialNumber"], self.build(timestamp=6)["serialNumber"])
+        self.assertNotEqual(self.build(timestamp=5)["serialNumber"], self.build()["serialNumber"])
 
     def test_the_version_is_the_trees_without_snapshot(self):
         self.assertEqual(sbom.release_version(self.tree.root), "1.2.3")
@@ -404,9 +431,22 @@ class MadeUp(unittest.TestCase):
                 self.assertFalse(out.exists())
 
     def test_a_source_date_epoch_that_is_not_a_number_is_refused(self):
-        code, _, stderr = self.run_main("--out", str(self.tree.root / "out"), epoch="yesterday")
-        self.assertEqual(code, 1)
-        self.assertIn("SOURCE_DATE_EPOCH is 'yesterday'", stderr)
+        for epoch in ("yesterday", ""):  # empty: `export X=$(a command that failed)`
+            code, _, stderr = self.run_main("--out", str(self.tree.root / "out"), epoch=epoch)
+            with self.subTest(epoch=epoch):
+                self.assertEqual(code, 1)
+                self.assertIn(f"SOURCE_DATE_EPOCH is {epoch!r}", stderr)
+                self.assertFalse((self.tree.root / "out").exists())
+
+    def test_the_files_carry_nothing_of_the_host_that_wrote_them(self):
+        out = self.tree.root / "out"
+        self.assertEqual(self.run_main("--out", str(out))[0], 0)
+        for path in out.iterdir():
+            data = path.read_bytes()
+            with self.subTest(file=path.name):
+                self.assertNotIn(b"\r", data)
+                self.assertNotIn(b"\\\\", data)  # a backslash, as JSON writes one: a Windows path
+                self.assertNotIn(str(self.tree.root).encode(), data)
 
     def test_a_tag_that_is_not_a_tag_name_and_an_unknown_product_are_refused(self):
         self.assertEqual(self.run_main("--tag", "../x", "--out", str(self.tree.root / "out"))[0], 1)
@@ -444,6 +484,32 @@ class RealTree(unittest.TestCase):
         tooling = "pkg:maven/androidx.compose.ui/ui-tooling@"
         self.assertTrue(any(ref.startswith(tooling) for ref in debug - release), sorted(debug - release))
         self.assertFalse(any(ref.startswith(tooling) for ref in release))
+
+    def test_what_is_compiled_into_the_apk_without_being_on_its_classpath(self):
+        # Named here on purpose, not derived from PRODUCTS: the round trip
+        # above checks the documents against the table, and cannot see a
+        # configuration the table does not name. Core-library desugaring is on
+        # for the app (android-app/build.gradle.kts), so L8 puts
+        # desugar_jdk_libs into both APKs' dex.
+        build = (REPO / "android-app/build.gradle.kts").read_text()
+        self.assertIn("isCoreLibraryDesugaringEnabled = true", build)
+        for key in ("android", "android-debug"):
+            components = {c["name"]: c for c in self.documents[key]["components"] if c.get("group") == "com.android.tools"}
+            with self.subTest(product=key):
+                self.assertRegex(components["desugar_jdk_libs"]["hashes"][0]["content"], r"^[0-9a-f]{64}$")
+                self.assertNotIn("desugar_jdk_libs_configuration", components)
+                left_out = [p["value"] for p in self.documents[key]["metadata"]["properties"]
+                            if p["name"] == "myotis:sbom:left-out"]
+                self.assertEqual(len(left_out), 1)
+                self.assertTrue(left_out[0].startswith("com.android.tools:desugar_jdk_libs_configuration: "))
+
+    def test_the_ios_framework_names_the_kotlin_native_distribution_it_links(self):
+        # Named here like the desugaring library: linked into MyotisKit's
+        # binary, on no classpath.
+        native = [c for c in self.documents["ios"]["components"] if c["name"] == "kotlin-native-prebuilt"]
+        self.assertEqual(len(native), 1)
+        files = [p["name"] for p in native[0]["properties"] if p["name"].startswith("myotis:pinned-file:sha256:")]
+        self.assertTrue(any("macos-aarch64" in name for name in files), files)
 
     def test_the_engine_library_lists_its_ios_modules_klibs(self):
         pinned_by = {p["value"] for c in self.documents["engine-library"]["components"]
@@ -485,6 +551,10 @@ class RealTree(unittest.TestCase):
                     coordinate, locked_for = line.split("=", 1)
                     if set(configurations) & set(locked_for.split(",")):
                         group, name, version = coordinate.split(":")
+                        if f"{group}:{name}" in product.get("build_only", {}):
+                            with self.subTest(product=key, left_out=coordinate):
+                                self.assertNotIn(f"pkg:maven/{group}/{name}@{version}", refs)
+                            continue
                         with self.subTest(product=key, component=coordinate):
                             self.assertIn(f"pkg:maven/{group}/{name}@{version}", refs)
 
@@ -508,7 +578,15 @@ class RealTree(unittest.TestCase):
     def test_the_desktop_app_lists_each_hosts_modules_and_its_jdk(self):
         components = self.documents["desktop"]["components"]
         hosts = {p["value"] for c in components for p in c["properties"] if p["name"] == "myotis:host"}
-        self.assertTrue({"linux-x64", "linux-arm64", "macos-arm64", "windows-x64"} <= hosts, hosts)
+        # Named here, not read from PRODUCTS. The installers a release builds:
+        # the dmg (arm64), the deb (x64 and arm64), the msi. The Intel dmg
+        # (macos-x64) is missing on purpose until its modules are pinned: add
+        # it here in the change that pins them.
+        self.assertEqual(hosts, {"linux-x64", "linux-arm64", "macos-arm64", "windows-x64"})
+        for _, prefix, _ in sbom.HOST_MODULES:
+            listed = {c["name"][len(prefix):] for c in components if c["name"].startswith(prefix)}
+            with self.subTest(modules=prefix):
+                self.assertEqual(listed, hosts)
         java = (REPO / ".java-version").read_text().strip()
         self.assertIn(f"myotis:toolchain:temurin-jdk@{java}", [c["bom-ref"] for c in components])
 

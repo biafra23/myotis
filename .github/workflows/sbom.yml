@@ -58,7 +58,10 @@ jobs:
       - name: Generate
         run: |
           set -euo pipefail
-          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          # Assigned, then exported: `export X=$(cmd)` has export's status, and
+          # a failed git log would leave the documents without a timestamp.
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
           args=()
           [ "$GITHUB_REF_TYPE" != tag ] || args=(--tag "$GITHUB_REF_NAME")
           python3 scripts/sbom.py --out sbom "${args[@]}"

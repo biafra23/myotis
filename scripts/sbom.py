@@ -20,12 +20,16 @@ downloaded: the inputs are the files that already pin the build,
 
 So an SBOM says exactly what the pins of the tagged tree say, it is the same
 bytes for the same tree (no clock unless SOURCE_DATE_EPOCH is set, no host),
-and a dependency bump changes it without anyone remembering to.
+and a dependency bump changes it without anyone remembering to. Python 3.11
+or newer, standard library only.
 
 What that makes each part:
 
   Gradle  EXACT. A product's components are the modules its project's runtime
-          configuration is locked to, nothing more.
+          configuration is locked to, plus those of a configuration whose
+          modules are compiled into it without being on that classpath (the
+          Android apps' coreLibraryDesugaring), minus the ones named as
+          build-only, which the document lists as left out.
   Cargo   A SUPERSET. Cargo.lock records one graph for all targets and all
           dependency kinds, so "reachable from the product's crates" includes
           build dependencies, the dev dependencies of the workspace's own
@@ -42,12 +46,16 @@ A product names the configuration it is locked by; one that no longer exists
 an SBOM that silently lost a product's components would read like a clean one.
 """
 
+import sys
+
+if sys.version_info < (3, 11):  # tomllib
+    sys.exit("sbom.py: needs Python 3.11 or newer")
+
 import argparse
 import hashlib
 import json
 import os
 import re
-import sys
 import tomllib
 import urllib.parse
 import uuid
@@ -71,15 +79,28 @@ HOST_MODULES = [
 ]
 
 # What a release ships. `gradle`: (project directory, the configurations whose
-# lock state is what the product runs with). `cargo`: (lockfile, the workspace
-# crates the product links). `host_modules`: it bundles the per-host modules
-# above. `jdk`: it bundles a JDK runtime image (jlink, from .java-version).
+# lock state is what the product is made of: its runtime classpath, and any
+# other configuration whose modules end up INSIDE it). `build_only`: modules of
+# those configurations that the build reads and does not ship, each with the
+# reason, which the document repeats. `cargo`: (lockfile, the workspace crates
+# the product links). `hosts`: the hosts it is built for, when it bundles the
+# per-host modules above; they must be exactly the hosts the verification
+# metadata pins those modules for. `jdk`: it bundles a JDK runtime image
+# (jlink, from .java-version).
+#
+# coreLibraryDesugaring, for the Android apps: L8 compiles desugar_jdk_libs
+# into the APK's dex (the j$.* classes), and it is on no runtime classpath.
+DESUGARING = {
+    "com.android.tools:desugar_jdk_libs_configuration":
+        "the rules D8 and L8 desugar by: read by the build, not in the APK",
+}
 PRODUCTS = {
     "android": {
         "name": "Myotis for Android",
         "description": "The Android app: Myotis-<tag>-android.apk and the same app before its signature, "
                        "-android-unsigned.apk.",
-        "gradle": [("android-app", ["releaseRuntimeClasspath"])],
+        "gradle": [("android-app", ["releaseRuntimeClasspath", "coreLibraryDesugaring"])],
+        "build_only": DESUGARING,
         "cargo": [("rust/Cargo.lock", ["myotis-engine", "myotis-bls"])],
     },
     # Its own document: the debug variant's classpath is not the release one
@@ -87,7 +108,8 @@ PRODUCTS = {
     "android-debug": {
         "name": "Myotis for Android, debug app",
         "description": "The debug app, Myotis-<tag>-android-debug.apk.",
-        "gradle": [("android-app", ["debugRuntimeClasspath"])],
+        "gradle": [("android-app", ["debugRuntimeClasspath", "coreLibraryDesugaring"])],
+        "build_only": DESUGARING,
         "cargo": [("rust/Cargo.lock", ["myotis-engine", "myotis-bls"])],
     },
     "desktop": {
@@ -96,13 +118,19 @@ PRODUCTS = {
                        "Myotis-<tag>-<arch>.deb, the Windows msi.",
         "gradle": [("app-desktop", ["runtimeClasspath"])],
         "cargo": [("rust/Cargo.lock", ["myotis-engine"])],
-        "host_modules": True,
+        # The dmg (arm64), the deb (x64, arm64) and the msi. Not here yet:
+        # macos-x64, the Intel dmg, whose modules the verification metadata
+        # does not pin (so this tree cannot build that dmg either). It joins
+        # this list in the change that pins them; the generator refuses a
+        # pinned host that is not stated here, so the two cannot drift apart.
+        "hosts": ["linux-arm64", "linux-x64", "macos-arm64", "windows-x64"],
         "jdk": True,
     },
     "daemon": {
         "name": "Myotis daemon",
-        "description": "The daemon and its library jars (app, core, networking, consensus) with the "
-                       "classpath the daemon runs on.",
+        "description": "What the daemon runs with: the classpath of the published jars (app, core, "
+                       "networking, consensus) and the Rust engine it loads. The jars are thin: none of "
+                       "these components is inside them.",
         "gradle": [("app", ["runtimeClasspath"])],
         "cargo": [("rust/Cargo.lock", ["myotis-engine", "myotis-bls"])],
     },
@@ -119,7 +147,11 @@ PRODUCTS = {
         "name": "Myotis for iOS",
         "description": "MyotisKit.xcframework.zip (the Kotlin/Native framework with the Rust engine) and "
                        "MyotisEngine.xcframework.zip (the Rust engine alone: the cargo components).",
-        "gradle": [("app-ios", ["iosArm64CompileKlibraries", "iosSimulatorArm64CompileKlibraries"])],
+        # kotlinNativeBundleConfiguration: the Kotlin/Native distribution, whose
+        # runtime (memory manager, standard library) is linked into the
+        # framework binary and is on no klib classpath.
+        "gradle": [("app-ios", ["iosArm64CompileKlibraries", "iosSimulatorArm64CompileKlibraries",
+                                "kotlinNativeBundleConfiguration"])],
         "cargo": [("rust/Cargo.lock", ["myotis-engine"])],
     },
     "node": {
@@ -132,7 +164,7 @@ PRODUCTS = {
 
 # The files of a module that are its payload (the rest of what the verification
 # metadata pins for it is the build's own metadata: .pom, .module).
-BINARY_SUFFIXES = (".jar", ".aar", ".klib")
+BINARY_SUFFIXES = (".jar", ".aar", ".klib", ".tar.gz", ".zip")
 
 
 class SbomError(Exception):
@@ -217,7 +249,7 @@ def maven_component(coordinate, pinned, pinned_by, extra=()):
 def gradle_components(root, product, pinned):
     members = {}  # coordinate -> {source, ...}
     for project, configurations in product["gradle"]:
-        lockfile = Path(project) / "gradle.lockfile"
+        lockfile = f"{project}/gradle.lockfile"  # as written into the document: never a host's separator
         locked = read_lockfile(root / lockfile)
         for configuration in configurations:
             if configuration not in locked:
@@ -226,23 +258,40 @@ def gradle_components(root, product, pinned):
                     f"{product['name']} is defined by (scripts/sbom.py, PRODUCTS): renamed or gone?")
             for coordinate in locked[configuration]:
                 members.setdefault(coordinate, set()).add(f"{lockfile}#{configuration}")
+    for module in product.get("build_only", {}):
+        build_only = [c for c in members if f"{c[0]}:{c[1]}" == module]
+        if not build_only:
+            # A filter that matches nothing is a filter nobody is checking.
+            raise SbomError(f"{product['name']} leaves out {module} as build-only, and locks no such module "
+                            "(scripts/sbom.py, PRODUCTS): renamed or gone?")
+        for coordinate in build_only:
+            del members[coordinate]
     components = [maven_component(c, pinned, sources) for c, sources in members.items()]
-    if product.get("host_modules"):
+    if product.get("hosts"):
+        stated = set(product["hosts"])
         for group, prefix, follows in HOST_MODULES:
             locked_at = sorted(v for g, n, v in members if f"{g}:{n}" == follows)
             if len(locked_at) != 1:
                 raise SbomError(
                     f"{product['name']} bundles {group}:{prefix}<host>, which follows the version of {follows}, "
                     f"and locks that at {', '.join(locked_at) or 'no version'}: one version is needed to pick them")
-            hosts = sorted(k for k in pinned
-                           if k[0] == group and k[1].startswith(prefix) and k[2] == locked_at[0])
-            if not hosts:
+            by_host = {k[1][len(prefix):]: k for k in pinned
+                       if k[0] == group and k[1].startswith(prefix) and k[2] == locked_at[0]}
+            # Both ways, so neither list can fall behind the other: a host the
+            # product is built for and no pin covers would be missing from the
+            # document without a word, and so would a host that was pinned and
+            # never added to the product.
+            for host in sorted(stated - set(by_host)):
                 raise SbomError(
-                    f"gradle/verification-metadata.xml pins no {group}:{prefix}<host>:{locked_at[0]}")
-            for coordinate in hosts:
+                    f"{product['name']} is built for {host}, and gradle/verification-metadata.xml pins no "
+                    f"{group}:{prefix}{host}:{locked_at[0]}")
+            for host in sorted(set(by_host) - stated):
+                raise SbomError(
+                    f"gradle/verification-metadata.xml pins {group}:{prefix}{host}:{locked_at[0]}, and {host} is "
+                    f"not among the hosts {product['name']} is built for (scripts/sbom.py, PRODUCTS)")
+            for host in sorted(by_host):
                 components.append(maven_component(
-                    coordinate, pinned, {"gradle/verification-metadata.xml"},
-                    extra=[("myotis:host", coordinate[1][len(prefix):])]))
+                    by_host[host], pinned, {"gradle/verification-metadata.xml"}, extra=[("myotis:host", host)]))
     return components
 
 
@@ -384,6 +433,11 @@ def build(root, key, version, timestamp=None, pinned=None):
     if sources:
         properties.append(("myotis:sbom:gradle",
                            "exact: the modules these configurations are locked to: " + "; ".join(sources)))
+    if product.get("hosts"):
+        properties.append(("myotis:sbom:hosts",
+                           "with the per-host modules of: " + ", ".join(sorted(product["hosts"]))))
+    for module, why in sorted(product.get("build_only", {}).items()):
+        properties.append(("myotis:sbom:left-out", f"{module}: {why}"))
     if crates:
         properties.append(("myotis:sbom:cargo",
                            "a superset: every package reachable from these workspace crates, for all targets "
@@ -408,9 +462,12 @@ def build(root, key, version, timestamp=None, pinned=None):
     }
     metadata["properties"] = [{"name": n, "value": v} for n, v in properties]
 
-    # A serial number that is a function of the content: the same tree gives
-    # the same document, and any other content another number.
-    content = json.dumps([key, version, components], sort_keys=True, separators=(",", ":"))
+    # A serial number that is a function of the whole document: the same tree
+    # and commit time give the same number, and anything else that differs
+    # (another commit's timestamp with the same pins, a release candidate and
+    # its release) another one, since a serial number and `version` together
+    # are what identifies a BOM.
+    content = json.dumps([metadata, components], sort_keys=True, separators=(",", ":"))
     serial = uuid.uuid5(uuid.NAMESPACE_URL, f"{REPOSITORY}/sbom/{hashlib.sha256(content.encode()).hexdigest()}")
     return {
         "bomFormat": "CycloneDX",
@@ -449,9 +506,11 @@ def main(argv=None):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", tag):
             raise SbomError(f"{tag!r} is not a tag name")
         epoch = os.environ.get("SOURCE_DATE_EPOCH")
-        if epoch and not re.fullmatch(r"\d+", epoch):
+        if epoch is not None and not re.fullmatch(r"\d+", epoch):
+            # Set and empty is a command that failed (`export X=$(git log ...)`),
+            # not a wish for no timestamp: that is the variable not being set.
             raise SbomError(f"SOURCE_DATE_EPOCH is {epoch!r}, not a number of seconds")
-        timestamp = int(epoch) if epoch else None
+        timestamp = int(epoch) if epoch is not None else None
         pinned = None
         if any(PRODUCTS[key]["gradle"] for key in keys):
             pinned = read_verification_metadata(args.root / "gradle/verification-metadata.xml")
@@ -468,7 +527,8 @@ def main(argv=None):
     args.out.mkdir(parents=True, exist_ok=True)
     for key, document in documents:
         path = args.out / asset_name(tag, key)
-        path.write_text(json.dumps(document, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        path.write_text(json.dumps(document, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
+                        newline="\n")  # the same bytes on Windows
         print(f"{path}: {len(document['components'])} components")
     return 0
 

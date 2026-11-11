@@ -231,7 +231,7 @@ one file per product:
 | `Myotis-<tag>-android.cdx.json` | the Android app (the signed and the unsigned APK) |
 | `Myotis-<tag>-android-debug.cdx.json` | the Android debug app, whose classpath also has the Compose tooling |
 | `Myotis-<tag>-desktop.cdx.json` | the desktop app in its installers (dmg, deb, msi) |
-| `Myotis-<tag>-daemon.cdx.json` | the daemon and its library jars |
+| `Myotis-<tag>-daemon.cdx.json` | what the daemon runs with (its jars are thin: none of it is inside them) |
 | `Myotis-<tag>-engine-library.cdx.json` | the engine library (AAR, desktop jar, natives jars, the iOS module) |
 | `Myotis-<tag>-ios.cdx.json` | `MyotisKit.xcframework.zip` and `MyotisEngine.xcframework.zip` |
 | `Myotis-<tag>-node.cdx.json` | the Node.js addon |
@@ -240,7 +240,7 @@ They are **generated from the pins of the tagged tree, not from a build**
 (`scripts/sbom.py`): the Gradle lockfiles and `gradle/verification-metadata.xml`,
 `rust/Cargo.lock`, `.java-version` and `rust/rust-toolchain.toml`. So they say
 what the build is held to, and you can regenerate them from a checkout of the
-tag without building anything and compare:
+tag without building anything and compare (Python 3.11 or newer, nothing else):
 
 ```bash
 git checkout v0.1.21
@@ -252,11 +252,16 @@ What that makes each part, and what is missing:
 
 - **Maven components are exact.** They are the modules the product's runtime
   configuration is locked to (for example `android-app/gradle.lockfile`,
-  `releaseRuntimeClasspath`), and a build fails on any other version. Each has
+  `releaseRuntimeClasspath`), and a build fails on any other version. For the
+  Android apps that includes `desugar_jdk_libs`, which is compiled into the
+  APK without being on the classpath; the rules file it is desugared by is
+  read by the build only, and each document names what it leaves out for that
+  reason (`myotis:sbom:left-out`). Each has
   the SHA-256 the build verifies the file against, where the module has one
   payload file; where it has several (variants, one per host), each pinned file
   is named in the component's properties. The desktop app also lists the
-  Compose and skiko modules of every host it is built for.
+  Compose and skiko modules of each host its document names
+  (`myotis:sbom:hosts`): the hosts those modules are pinned for.
 - **Rust components are a superset.** `Cargo.lock` records one graph for all
   targets and all kinds of dependency, so the list is every crate reachable
   from the product's own crates: build dependencies, optional ones (Arti,
