@@ -31,6 +31,9 @@ func (s *Session) snapCodes() (snapwire.Codes, error) {
 // capability — the gate a read pool filters peers with.
 func (s *Session) HasSnap() bool { return s.Snap != nil }
 
+// ID names the peer for reporting (satisfies snapread.Peer).
+func (s *Session) ID() string { return s.PeerID.String() }
+
 // GetAccountRange requests the account range [startingHash, limitHash)
 // at stateRoot (single-key lookups: starting = keccak(address),
 // limit = 0xff…ff) and returns the decoded response. The proof inside
