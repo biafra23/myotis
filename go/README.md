@@ -44,7 +44,7 @@ reference.
    finality anchors: the SSZ containers, merkleization, sync-committee BLS
    (blst) and the update processor, ported from `rust/myotis-consensus` and
    replayed byte-for-byte against the shared corpus `rust/testdata/lc/mainnet`
-3b. CL fetch (this PR) — the beacon peer path over libp2p: the eth2 req/resp
+3b. CL fetch (PR #770) — the beacon peer path over libp2p: the eth2 req/resp
    wire (`internal/clwire`: ssz_snappy framing pinned to the Java golden
    vectors, Status v1/v2, the Fulu/EIP-7892 fork digest incl. the BPO fold),
    discv5 CL discovery with the eth2 ENR filter (`internal/clsync`), and a
