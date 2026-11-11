@@ -214,6 +214,9 @@ jobs:
           RUST_TARGET: aarch64-apple-darwin
         run: |
           GRADLE_ARGS="-Porg.gradle.java.installations.auto-detect=false -Porg.gradle.java.installations.auto-download=false -Porg.gradle.java.installations.paths=$JAVA_HOME"
+          # Stated, not inherited (#734): jpackage creates the .app's directories
+          # for the dmg with the umask it runs under (see desktop-dmg.yml).
+          umask 022
           for attempt in 1 2 3; do
             ./gradlew :app-desktop:packageDmg --stacktrace $GRADLE_ARGS \
               -PrailgunPoc -PrailgunSeedDir="$SEED_DIR" -PrailgunSepoliaSeedDir="$SEPOLIA_SEED_DIR" && exit 0

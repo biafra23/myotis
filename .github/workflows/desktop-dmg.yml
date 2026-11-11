@@ -207,6 +207,11 @@ jobs:
           # down the arm64 leg's first CI run).
           RUST_TARGET: ${{ matrix.arch == 'x64' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin' }}
         run: |
+          # Stated, not inherited (#734): jpackage creates the .app's directories
+          # for the dmg with the umask it runs under, so the umask is an input of
+          # the dmg. 022 is what the runner has anyway, and what
+          # reproducible-builds.yml packages both its legs with.
+          umask 022
           GRADLE_ARGS="-Porg.gradle.java.installations.auto-detect=false -Porg.gradle.java.installations.auto-download=false -Porg.gradle.java.installations.paths=$JAVA_HOME"
           FLAVOR_ARGS="${{ matrix.gradle-args }}"
           for attempt in 1 2 3; do

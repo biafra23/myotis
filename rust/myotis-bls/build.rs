@@ -7,5 +7,11 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     if std::env::var("CARGO_CFG_TARGET_VENDOR").as_deref() == Ok("apple") {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-install_name,@rpath/libmyotis_bls.dylib");
+        // And, for a build without debug info, no debug map, so that LC_UUID
+        // is a function of what ships (#734, Part 5d): see
+        // myotis-engine/build.rs, which has the reasoning.
+        if std::env::var("DEBUG").as_deref() != Ok("true") {
+            println!("cargo:rustc-cdylib-link-arg=-Wl,-S");
+        }
     }
 }
