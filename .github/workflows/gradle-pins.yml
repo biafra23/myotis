@@ -65,9 +65,10 @@ permissions:
 
 jobs:
   # aapt2 (AGP's resource compiler) is a jar PER OS, resolved through a
-  # detached configuration only while a resource task runs, so the hosts with
-  # an Android SDK run one such task alongside the walk. Linux arm64 has no
-  # aapt2 build and no SDK on its image.
+  # detached configuration only while a resource task runs, so one host per OS
+  # runs one such task alongside the walk: Linux x64, Windows and macOS arm64.
+  # Linux arm64 has no aapt2 build and no SDK on its image; macOS x64 needs
+  # none of its own, the jar being per OS and not per architecture.
   linux-x64:
     uses: ./.github/workflows/gradle-pins-host.yml
     with:

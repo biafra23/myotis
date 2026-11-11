@@ -131,8 +131,9 @@ components in all when this was set up. Compose does it for its JDK version
 probe in `:app-desktop:checkRuntime`, which every dmg, deb and msi build runs.
 So the update script also runs `assemble lint :app-desktop:checkRuntime` in
 write mode (`--quick` skips that). In the chain:
-- aapt2 has a jar **per OS**, so the Linux x64, Windows and macOS jobs run
-  `:android-app:processDebugResources` alongside the walk. That keeps an
+- aapt2 has a jar **per OS**, so the Linux x64, Windows and macOS arm64 jobs
+  run `:android-app:processDebugResources` alongside the walk (the macOS x64
+  job does not: the jar is per OS, not per architecture). That keeps an
   Android build on a developer's Mac or Windows machine working.
 - lint and the probe are the same jar everywhere. CI's Build and Test job
   runs lint with the pins in force on every PR; the probe is checked only by
