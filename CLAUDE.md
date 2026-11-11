@@ -431,7 +431,11 @@ asset workflow and a stronger action than the merge this file already forbids.
    `./gradlew refreshCheckpoint -Pnetwork=<net>` writes both engines from one
    fetch) age toward the weak-subjectivity bound (13 periods on mainnet, 3 on
    gnosis). A fresh install past the bound parks in `STALE_ANCHOR` until the
-   host consents.
+   host consents. The Go engine (feature branch, `go/internal/chain/lc.go`)
+   carries a third copy that the task does NOT write: move it by hand in the
+   same commit, and remember that until the merge only `mainnet` exists there
+   — after the merge, the `go test ./internal/chain` drift test
+   (`TestCheckpointMatchesRustEngine`) fails the Go CI if the copy lags.
 
    **A shipped anchor's remaining freshness is NOT a release deadline, and
    nothing may gate a tag on it** (owner ruling, 2026-09-24). Gnosis periods are

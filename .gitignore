@@ -41,6 +41,7 @@ app/peers.cache
 /go/data/
 /go/myotis-go-data/
 /go/myotis-go
+/go/myotis-lc
 # Persisted light-client sync snapshots (per-network runtime state) + their .roots accumulators
 *.snapshot
 *.snapshot.roots

@@ -40,7 +40,23 @@ reference.
    against the pinned genesis hash (`internal/rlpx`, `internal/ethwire`,
    `internal/transport`; the codec replays the shared conformance corpus in
    `rust/testdata/el/rlpx` byte-for-byte)
-3. consensus light client — embedded checkpoint → BLS-verified finality anchors
+3. consensus light client (PR #769) — embedded checkpoint → BLS-verified
+   finality anchors: the SSZ containers, merkleization, sync-committee BLS
+   (blst) and the update processor, ported from `rust/myotis-consensus` and
+   replayed byte-for-byte against the shared corpus `rust/testdata/lc/mainnet`
+3b. CL fetch (this PR) — the beacon peer path over libp2p: the eth2 req/resp
+   wire (`internal/clwire`: ssz_snappy framing pinned to the Java golden
+   vectors, Status v1/v2, the Fulu/EIP-7892 fork digest incl. the BPO fold),
+   discv5 CL discovery with the eth2 ENR filter (`internal/clsync`), and a
+   bootstrap → catch-up → finality-poll loop (`cmd/myotis-lc`) whose every
+   answer goes through the part-3 processor — checkpoint pin, period gate,
+   BLS, Merkle branches. Live-smoke verified against roost + Lighthouse pins.
+   Deliberate 3b cuts, all documented: TCP+Noise+yamux only (no QUIC, no
+   mplex → Nimbus), identify's observed-address discovery off (the
+   identify service itself runs and answers, with the eth2 twin's
+   `eth2/1.0.0` protocol-version field; 3c builds the LC-server peer
+   tier from the protocol lists it already collects), no LCSS
+   snapshot persistence yet (cold start re-bootstraps).
 4. snap reads — GetAccountRange/GetStorageRanges/GetByteCodes verified against
    the anchor's state root; a `get-account`-style read
 5. final integration PR to `main`

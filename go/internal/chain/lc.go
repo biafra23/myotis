@@ -45,10 +45,16 @@ func ConsensusMainnet() *Consensus {
 	return &Consensus{
 		GenesisTime:           1606824023,
 		GenesisValidatorsRoot: common.HexToHash("0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"),
-		// @checkpoint:mainnet — slot 15599168 (period 1904), taken
-		// 2026-11-07, the same anchor both other engines ship.
-		CheckpointRoot: common.HexToHash("0x935911763d6fcca100fd42f951f1407a9967414bf38ee85992c00e5e003ca373"),
-		CheckpointSlot: 15599168,
+		// @checkpoint:mainnet — slot 15632128 (period 1908), taken
+		// 2026-11-11, the same anchor both other engines ship
+		// (TestCheckpointMatchesRustEngine keeps the three in lockstep).
+		CheckpointRoot: common.HexToHash("0x90270c791df9079fb67d02077398bf7937274a1b2bfd54abc778a55fbe719e78"),
+		CheckpointSlot: 15632128,
+		// BPO2 (Fusaka) blob schedule entry (EIP-7892), the params folded
+		// into the fork digest from that epoch on — sync.rs:334-336. With
+		// the default (epoch 0) the pre-Fulu digest formula stands.
+		BlobParamsEpoch:    419072,
+		BlobParamsMaxBlobs: 21,
 		// Epoch → version (EIP-7801 names aside, these are the fork
 		// versions mainnet actually activates; Fulu epoch 411392 is the
 		// head). Mainnet has NO scheduled Gloas epoch — the shape switch
@@ -72,6 +78,23 @@ type Consensus struct {
 	CheckpointRoot        common.Hash
 	CheckpointSlot        uint64
 	Forks                 []ForkAt
+	// BPO blob schedule folded into the Fulu fork digest (EIP-7892);
+	// epoch 0 = no BPO, pre-Fulu formula.
+	BlobParamsEpoch    uint64
+	BlobParamsMaxBlobs uint64
+}
+
+// ForkVersionAtEpoch is the fork version active at Epoch (the plain
+// wire-shape lookup WITHOUT the signature-slot off-by-one, which lives
+// in lc.ForkSchedule).
+func (c *Consensus) ForkVersionAtEpoch(epoch uint64) [4]byte {
+	v := c.Forks[0].Version
+	for _, fa := range c.Forks {
+		if epoch >= fa.Epoch {
+			v = fa.Version
+		}
+	}
+	return v
 }
 
 // SlotAt returns the current slot from the wall clock (unix seconds).
