@@ -96,7 +96,7 @@ pub fn fast_aggregate_verify_with_dst(
 /// whose proof commits to the pubkeys root alone) can be completed into the
 /// spec container bit for bit.
 pub fn aggregate_pubkeys(pubkeys: &[u8]) -> Option<[u8; PK_LEN]> {
-    if pubkeys.is_empty() || pubkeys.len() % PK_LEN != 0 || pubkeys.len() / PK_LEN > MAX_PUBKEYS {
+    if pubkeys.is_empty() || !pubkeys.len().is_multiple_of(PK_LEN) || pubkeys.len() / PK_LEN > MAX_PUBKEYS {
         return None;
     }
     let mut pks: Vec<PublicKey> = Vec::with_capacity(pubkeys.len() / PK_LEN);

@@ -132,6 +132,7 @@ class AndroidNodeController(
     override fun setWsBoundPeriods(periods: Int) { serviceProvider()?.setWsBoundPeriods(periods) }
     override fun applyWebAccess() { serviceProvider()?.applyWebAccess() }
     override fun acceptStaleAnchor(network: String) { serviceProvider()?.acceptStaleAnchor(network) }
+    override fun applyStaleAnchorChoice(choice: io.myotis.ui.StaleAnchorChoice) { serviceProvider()?.applyStaleAnchorChoice() }
     override fun fetchZkProofForStaleAnchor(network: String): io.myotis.ui.FreshAnchorResult {
         val r = serviceProvider()?.fetchZkProofForStaleAnchor(network)
             ?: return io.myotis.ui.FreshAnchorResult(false, "No ZK proof: the node service is not running.")

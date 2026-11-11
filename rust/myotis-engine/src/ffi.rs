@@ -155,6 +155,14 @@ pub fn accept_stale_anchor(handle: i64) -> bool {
     crate::host::accept_stale_anchor(handle)
 }
 
+/// The remembered answer to a STALE_ANCHOR park, applied by the sync loop even
+/// with no UI open: 0 ask, 1 ZK proof, 2 fresh checkpoint, 3 continue anyway.
+/// False for an unknown handle or code.
+#[uniffi::export]
+pub fn set_stale_anchor_policy(handle: i64, policy: i32) -> bool {
+    crate::host::set_stale_anchor_policy(handle, policy)
+}
+
 /// Recover a STALE_ANCHOR park from a fresh checkpoint every answering
 /// checkpoint-sync server names (two or more operators). Blocking (HTTPS); JSON
 /// `{"applied":true,"root","slot","epoch","operators"}` or

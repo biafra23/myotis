@@ -770,6 +770,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_set_served_block_window(
     ): Int
+    external fun uniffi_myotis_engine_checksum_func_set_stale_anchor_policy(
+    ): Int
     external fun uniffi_myotis_engine_checksum_func_set_tor_enabled(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_set_tor_storage_dirs(
@@ -896,6 +898,8 @@ internal object UniffiLib {
     external fun uniffi_myotis_engine_fn_func_set_network_metering(`code`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_myotis_engine_fn_func_set_served_block_window(`handle`: Long,`blocks`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
+    external fun uniffi_myotis_engine_fn_func_set_stale_anchor_policy(`handle`: Long,`policy`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_myotis_engine_fn_func_set_tor_enabled(`on`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
@@ -1177,6 +1181,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_set_served_block_window() and 0xFFFF) != 15483) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_myotis_engine_checksum_func_set_stale_anchor_policy() and 0xFFFF) != 12025) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_set_tor_enabled() and 0xFFFF) != 54390) {
@@ -2297,6 +2304,23 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         
         FfiConverterLong.lower(`handle`),
         FfiConverterInt.lower(`blocks`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * The remembered answer to a STALE_ANCHOR park, applied by the sync loop even
+         * with no UI open: 0 ask, 1 ZK proof, 2 fresh checkpoint, 3 continue anyway.
+         * False for an unknown handle or code.
+         */ fun `setStaleAnchorPolicy`(`handle`: kotlin.Long, `policy`: kotlin.Int): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_myotis_engine_fn_func_set_stale_anchor_policy(
+    
+        
+        FfiConverterLong.lower(`handle`),
+        FfiConverterInt.lower(`policy`),_status)
 }
     )
     }

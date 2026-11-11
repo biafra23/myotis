@@ -48,6 +48,15 @@ class RustAnchorRefreshJsonTest {
         assertEquals("unknown handle", no.error());
     }
 
+    /** The ordinals ARE the engine's codes (myotis-net `StalePolicy`): pinned. */
+    @Test
+    void stalePolicyOrdinalsAreTheEngineCodes() {
+        assertEquals(0, io.myotis.api.StaleAnchorPolicy.ASK.ordinal());
+        assertEquals(1, io.myotis.api.StaleAnchorPolicy.ZK_PROOF.ordinal());
+        assertEquals(2, io.myotis.api.StaleAnchorPolicy.CHECKPOINT.ordinal());
+        assertEquals(3, io.myotis.api.StaleAnchorPolicy.CONTINUE.ordinal());
+    }
+
     @Test
     void malformedIsARefusalNotACrash() {
         AnchorRefresh r = RustChainHandle.parseAnchorRefresh("not json");

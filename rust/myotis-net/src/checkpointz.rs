@@ -93,6 +93,24 @@ pub async fn fetch_agreed(servers: &[String], slots_per_epoch: u64) -> Result<Fr
     Ok(FreshCheckpoint { root, epoch, slot, operators })
 }
 
+/// [`fetch_agreed`] over `config`'s servers, plus the checks every caller
+/// needs before handing the root to a park: not ahead of this device's clock,
+/// and not itself past the weak-subjectivity bound.
+pub async fn fetch_checked(config: &crate::sync::ChainConfig) -> Result<FreshCheckpoint, String> {
+    if config.checkpointz_servers.is_empty() {
+        return Err("no checkpoint-sync servers configured for this network".into());
+    }
+    let fresh = fetch_agreed(&config.checkpointz_servers, config.slots_per_epoch).await?;
+    if fresh.slot > config.wall_clock_slot() {
+        return Err("agreed checkpoint is ahead of this device's clock".into());
+    }
+    let period = fresh.slot / config.slots_per_period();
+    if crate::sync::ws_anchor_stale(period, config.wall_clock_period(), config.effective_ws_bound_periods()) {
+        return Err("agreed checkpoint is itself past the weak-subjectivity bound".into());
+    }
+    Ok(fresh)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Answer {
     /// The server's base URL, as an outlier is named.

@@ -60,6 +60,10 @@ data class UpgradeAdvisory(
  */
 enum class NetworkMetering { UNKNOWN, UNMETERED, METERED }
 
+/** The remembered answer to a stale-anchor park, the JVM contract's `StaleAnchorPolicy`;
+ *  the ordinals are the engine's codes. */
+enum class StaleAnchorPolicy { ASK, ZK_PROOF, CHECKPOINT, CONTINUE }
+
 /** The outcome of [ChainHandle.fetchZkProofForStaleAnchor], the JVM contract's `ZkRelease`. */
 data class ZkRelease(val applied: Boolean, val period: Long, val error: String?)
 

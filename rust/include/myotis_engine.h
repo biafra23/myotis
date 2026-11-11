@@ -36,7 +36,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 58
+#define MYOTIS_ABI_VERSION 59
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -164,6 +164,13 @@ char *myotis_refresh_anchor_from_checkpointz(int64_t handle);
  * {"applied":false,"error":".."} means no usable proof is available now (offer
  * the remaining choices). Release with myotis_string_free. */
 char *myotis_fetch_zk_proof_for_stale_anchor(int64_t handle);
+
+/* (ABI >= 59) The user's remembered answer to a STALE_ANCHOR park, applied by
+ * the sync loop itself at every park (no UI needed): 0 ask (default), 1 ZK
+ * proof, 2 fresh checkpoint, 3 continue anyway. A ZK proof or checkpoint that
+ * fails leaves the park for the user and is retried every 10 minutes. Live;
+ * settable before start. False for an unknown handle or code. */
+bool myotis_set_stale_anchor_policy(int64_t handle, int32_t policy);
 
 /* Verified reads — JSON results; {"error": "..."} on transport/not-running/
  * bad-input failures; verification failures carry a `failReason` inside the

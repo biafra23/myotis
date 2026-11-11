@@ -1496,6 +1496,34 @@ pub fn set_ws_bound_periods(handle: i64, periods: i64) -> bool {
     }
 }
 
+/// `nativeSetStaleAnchorPolicy`: the user's remembered answer to a STALE_ANCHOR
+/// park — 0 ask (default), 1 ZK proof, 2 fresh checkpoint, 3 continue anyway —
+/// applied by the sync loop itself at every park, so it works with no UI open
+/// (`myotis_net::sync::StalePolicy`). Same shared-`WsPolicy` reach as the bound
+/// setter: live on a running or parked loop, kept across pause/resume, settable
+/// before start. False for an unknown handle or code.
+pub fn set_stale_anchor_policy(handle: i64, policy: i32) -> bool {
+    let Some(engine) = engine() else { return false };
+    let Some(p) = myotis_net::sync::StalePolicy::from_code(policy as i64) else { return false };
+    let map = match engine.handles.lock() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    match map.get(&handle) {
+        Some(ChainEntry::Created(c)) | Some(ChainEntry::Running(c, _, _))
+        | Some(ChainEntry::Paused(c, ..)) => {
+            let was = c.ws_policy.stale_policy.swap(p as u8, std::sync::atomic::Ordering::Relaxed);
+            // Leaving a remembered "continue" withdraws the consent it gave this run,
+            // so a later park asks (or applies the new choice) instead of continuing.
+            if was == myotis_net::sync::StalePolicy::Continue as u8 && p != myotis_net::sync::StalePolicy::Continue {
+                c.ws_policy.accept_stale_anchor.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            true
+        }
+        None => false,
+    }
+}
+
 /// `nativeAcceptStaleAnchor`: one-shot consent to sync forward from an anchor
 /// older than the weak-subjectivity bound — releases a STALE_ANCHOR park for
 /// the rest of this run (same shared-`WsPolicy` reach as the bound setter).
@@ -1541,24 +1569,10 @@ pub fn refresh_anchor_from_checkpointz(handle: i64) -> String {
         Ok(c) => c,
         Err(why) => return refuse(why),
     };
-    if config.checkpointz_servers.is_empty() {
-        return refuse("no checkpoint-sync servers configured for this network");
-    }
-    let fetched = engine.rt.block_on(myotis_net::checkpointz::fetch_agreed(
-        &config.checkpointz_servers,
-        config.slots_per_epoch,
-    ));
-    let fresh = match fetched {
+    let fresh = match engine.rt.block_on(myotis_net::checkpointz::fetch_checked(&config)) {
         Ok(f) => f,
         Err(e) => return refuse(&e),
     };
-    if fresh.slot > config.wall_clock_slot() {
-        return refuse("agreed checkpoint is ahead of this device's clock");
-    }
-    let period = fresh.slot / config.slots_per_period();
-    if myotis_net::sync::ws_anchor_stale(period, config.wall_clock_period(), config.effective_ws_bound_periods()) {
-        return refuse("agreed checkpoint is itself past the weak-subjectivity bound");
-    }
     match config.ws_policy.fresh_anchor.lock() {
         Ok(mut slot) => *slot = Some((fresh.root, fresh.slot)),
         Err(_) => return refuse("engine unavailable"),

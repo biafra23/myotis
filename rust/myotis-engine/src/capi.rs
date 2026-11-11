@@ -262,6 +262,14 @@ pub extern "C" fn myotis_refresh_anchor_from_checkpointz(handle: i64) -> *mut c_
     into_c(crate::host::refresh_anchor_from_checkpointz(handle))
 }
 
+/// The remembered answer to a STALE_ANCHOR park (`nativeSetStaleAnchorPolicy`
+/// twin): 0 ask, 1 ZK proof, 2 fresh checkpoint, 3 continue anyway — applied by
+/// the sync loop itself at every park. False for an unknown handle or code.
+#[no_mangle]
+pub extern "C" fn myotis_set_stale_anchor_policy(handle: i64, policy: i32) -> bool {
+    crate::host::set_stale_anchor_policy(handle, policy)
+}
+
 /// Resolve a STALE_ANCHOR park with Colibri's ZK proof of the current period's
 /// committee, on the user's request (`nativeFetchZkProofForStaleAnchor` twin).
 /// Blocking — one HTTPS round; never call from the UI thread. JSON

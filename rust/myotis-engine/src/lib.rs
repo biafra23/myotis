@@ -416,7 +416,12 @@ uniffi::setup_scaffolding!();
 ///      in the call, then applied by the parked loop. An additive function —
 ///      bumped so a host that offers "Fetch ZK proof" is never paired with an
 ///      engine that lacks it.
-pub const ABI_VERSION: i32 = 58;
+/// v59: `set_stale_anchor_policy` (UniFFI and the C ABI:
+///      `myotis_set_stale_anchor_policy`): the remembered answer to a
+///      STALE_ANCHOR park, applied by the sync loop itself, so it works with no
+///      UI open. An additive function — bumped so a host that pushes it is never
+///      paired with an engine that would not apply it.
+pub const ABI_VERSION: i32 = 59;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

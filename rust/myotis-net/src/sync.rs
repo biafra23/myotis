@@ -169,7 +169,44 @@ pub struct WsPolicy {
     /// short; a committee whose period the wall clock has left is dropped.
     /// Like `fresh_anchor`, dropped when the park ends some other way.
     pub zk_release: std::sync::Mutex<Option<myotis_consensus::zk::ProvenCommittee>>,
+    /// The user's remembered answer to a STALE_ANCHOR park ([`StalePolicy`] as
+    /// a `u8`), applied BY THE LOOP at every park, so it works with no UI open
+    /// (an Android service in the background, the daemon). The host pushes it
+    /// from its stored setting; 0 = ask (the default: wait for the user).
+    pub stale_policy: std::sync::atomic::AtomicU8,
 }
+
+/// What the loop does by itself when it parks in STALE_ANCHOR — the user's
+/// remembered choice (docs/how-it-works/zk-sync.md, *At a stale-anchor park*).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StalePolicy {
+    /// Wait for the user (the default).
+    Ask = 0,
+    /// Fetch Colibri's ZK proof of the current committee and leave from it.
+    ZkProof = 1,
+    /// Re-anchor on a checkpoint every answering checkpoint-sync server names.
+    Checkpoint = 2,
+    /// Sync forward from the stale anchor (the consent, given in advance).
+    Continue = 3,
+}
+
+impl StalePolicy {
+    pub fn from_code(code: i64) -> Option<Self> {
+        match code {
+            0 => Some(Self::Ask),
+            1 => Some(Self::ZkProof),
+            2 => Some(Self::Checkpoint),
+            3 => Some(Self::Continue),
+            _ => None,
+        }
+    }
+}
+
+/// How often a park retries a remembered ZK proof or checkpoint that failed —
+/// a proof can be minutes from publication, servers can disagree for a while.
+/// Meanwhile the park stays, and an open UI offers the remaining choices.
+const AUTO_RESOLVE_RETRY: Duration = Duration::from_secs(10 * 60);
 
 /// How often a park retries a queued ZK release while no peer has yet served
 /// a finality update the proven committee signed.
@@ -627,8 +664,11 @@ impl ChainConfig {
             ws_policy: Arc::new(WsPolicy::default()),
             zk_sync: None,
             checkpointz_servers: vec![
+                // Not rpc-gbc.chiadochain.net: on 2026-11-10/11 it reported a finalized
+                // epoch ~200 epochs behind the other two, so the unanimous gate refused
+                // every chiado fetch (#761, owner's call). Same operator as the
+                // checkpoint host anyway, so it never added a voice.
                 "https://checkpoint.chiadochain.net".to_string(),
-                "https://rpc-gbc.chiadochain.net".to_string(),
                 "https://gnosis-chiado-beacon-api.publicnode.com".to_string(),
             ],
             traffic: crate::traffic::TrafficMeter::new(),
@@ -2378,6 +2418,7 @@ async fn run_sync(
     // restored over it.
     let mut zk_released = false;
     let mut zk_park_last_try: Option<Instant> = None;
+    let mut auto_last_try: Option<(Instant, StalePolicy)> = None;
     // Deserialize the snapshot ONCE, up front: the weak-subjectivity gate below
     // must judge the BEST available anchor (embedded checkpoint vs persisted
     // snapshot) BEFORE anything is restored from it, and the strictly-newer
@@ -2414,6 +2455,7 @@ async fn run_sync(
             // construction (it is what parked us), is then refused by the
             // strictly-newer resume rule below.
             if parked {
+                auto_resolve_park(&config, &mut auto_last_try).await;
                 if let Some((root, slot)) = config.ws_policy.take_fresh_anchor() {
                     checkpoint_period = reanchor(&mut config, root, slot);
                     last_persisted_period = embedded_checkpoint_period;
@@ -2522,6 +2564,7 @@ async fn run_sync(
         // weak-subjectivity gates below: drop the held store — its committee
         // is the stale anchor — and bootstrap from the fresh root.
         if status_tx.borrow().state == SyncState::StaleAnchor {
+            auto_resolve_park(&config, &mut auto_last_try).await;
             if let Some((root, slot)) = config.ws_policy.take_fresh_anchor() {
                 checkpoint_period = reanchor(&mut config, root, slot);
                 last_persisted_period = embedded_checkpoint_period;
@@ -2877,6 +2920,75 @@ fn discard_unused_fresh_anchor(config: &ChainConfig) {
     }
     if config.ws_policy.clear_zk_release() {
         tracing::info!("discarding a ZK proof that arrived after the park ended");
+    }
+}
+
+/// Apply the user's remembered choice at a park ([`WsPolicy::stale_policy`]):
+/// `Continue` consents; `ZkProof` and `Checkpoint` fetch and verify exactly
+/// as the explicit FFI calls do and queue the result for the park to consume
+/// (the same `zk_release` / `fresh_anchor` slots). A failure leaves the park in
+/// place — the user decides — and is retried every [`AUTO_RESOLVE_RETRY`].
+async fn auto_resolve_park(config: &ChainConfig, last_try: &mut Option<(Instant, StalePolicy)>) {
+    let policy = StalePolicy::from_code(config.ws_policy.stale_policy.load(Ordering::Relaxed) as i64);
+    match policy {
+        Some(StalePolicy::Continue) => {
+            if !config.ws_policy.accept_stale_anchor.swap(true, Ordering::Relaxed) {
+                tracing::warn!("STALE ANCHOR: the user's remembered choice is 'continue anyway' — \
+                    syncing forward from the stale anchor");
+            }
+        }
+        Some(p @ (StalePolicy::ZkProof | StalePolicy::Checkpoint)) => {
+            // The retry clock is per choice: switching to the other fetch runs it now.
+            if last_try.is_some_and(|(t, q)| q == p && t.elapsed() < AUTO_RESOLVE_RETRY) {
+                return;
+            }
+            *last_try = Some((Instant::now(), p));
+            // Under Tor neither fetch runs unattended: both resolve and name their
+            // host in the clear (#539), and only an explicit click may accept that
+            // (docs/how-it-works/privacy-and-tor.md). The park waits for the user.
+            if !crate::zksync::allowed() {
+                tracing::warn!(choice = ?p, "STALE ANCHOR: remembered choice not applied while Tor \
+                    routing is on (the fetch would leave in the clear) — waiting for the user");
+                return;
+            }
+            if p == StalePolicy::ZkProof {
+                if config.ws_policy.zk_release.lock().ok().is_some_and(|q| q.is_some()) {
+                    return;
+                }
+                let Some(zk) = config.zk_sync.as_ref() else {
+                    tracing::warn!("STALE ANCHOR: remembered choice 'ZK proof', but this network \
+                        has no ZK proof source on this run — waiting for the user");
+                    return;
+                };
+                let period = config.wall_clock_period();
+                match crate::zksync::fetch_proven_committee(config, zk, period).await {
+                    Ok(proven) => {
+                        if let Ok(mut q) = config.ws_policy.zk_release.lock() {
+                            *q = Some(proven);
+                        }
+                        tracing::warn!(period, "STALE ANCHOR: remembered choice 'ZK proof' — \
+                            proof verified, leaving the park from it");
+                    }
+                    Err(e) => tracing::warn!(error = %e, retry_in_s = AUTO_RESOLVE_RETRY.as_secs(),
+                        "STALE ANCHOR: remembered choice 'ZK proof', but no proof is available — \
+                         waiting for the user (the remaining choices)"),
+                }
+            } else {
+                match crate::checkpointz::fetch_checked(config).await {
+                    Ok(fresh) => {
+                        if let Ok(mut slot) = config.ws_policy.fresh_anchor.lock() {
+                            *slot = Some((fresh.root, fresh.slot));
+                        }
+                        tracing::warn!(slot = fresh.slot, operators = ?fresh.operators,
+                            "STALE ANCHOR: remembered choice 'fresh checkpoint' — re-anchoring");
+                    }
+                    Err(e) => tracing::warn!(error = %e, retry_in_s = AUTO_RESOLVE_RETRY.as_secs(),
+                        "STALE ANCHOR: remembered choice 'fresh checkpoint' refused — waiting \
+                         for the user"),
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -4805,6 +4917,38 @@ async fn publish_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_policy_codes_round_trip_and_refuse_unknowns() {
+        for p in [StalePolicy::Ask, StalePolicy::ZkProof, StalePolicy::Checkpoint, StalePolicy::Continue] {
+            assert_eq!(StalePolicy::from_code(p as u8 as i64), Some(p));
+        }
+        assert_eq!(StalePolicy::from_code(4), None);
+        assert_eq!(StalePolicy::from_code(-1), None);
+    }
+
+    #[tokio::test]
+    async fn a_remembered_continue_consents_at_the_park_and_ask_does_nothing() {
+        let config = ChainConfig::chiado();
+        let mut last = None;
+        auto_resolve_park(&config, &mut last).await;
+        assert!(!config.ws_policy.accept_stale_anchor.load(Ordering::Relaxed), "ask waits for the user");
+        config.ws_policy.stale_policy.store(StalePolicy::Continue as u8, Ordering::Relaxed);
+        auto_resolve_park(&config, &mut last).await;
+        assert!(config.ws_policy.accept_stale_anchor.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn a_remembered_zk_proof_without_a_source_waits_for_the_user() {
+        // chiado has no Colibri proof chain: nothing is queued, nothing consents.
+        let config = ChainConfig::chiado();
+        config.ws_policy.stale_policy.store(StalePolicy::ZkProof as u8, Ordering::Relaxed);
+        let mut last = None;
+        auto_resolve_park(&config, &mut last).await;
+        assert!(config.ws_policy.zk_release.lock().unwrap().is_none());
+        assert!(!config.ws_policy.accept_stale_anchor.load(Ordering::Relaxed));
+        assert!(last.is_some(), "the retry clock started");
+    }
 
     #[test]
     fn lighthouse_agents_get_single_period_requests() {

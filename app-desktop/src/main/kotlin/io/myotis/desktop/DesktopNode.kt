@@ -191,6 +191,9 @@ class DesktopNodeController(
                         // Weak-subjectivity bound override rides the same pre-start
                         // apply + lock: the cold-start gate must judge with it.
                         handle.setWsBoundPeriods(settings.wsBoundPeriods().toLong())
+                        // The remembered stale-anchor answer too: the engine applies it
+                        // at the cold-start park itself, with or without the window open.
+                        handle.setStaleAnchorPolicy(stalePolicyOf(settings.staleAnchorChoice()))
                         // Web page access (#502) too: the listener's first request must
                         // already be judged by the persisted policy, never the default.
                         applyWebAccessTo(handle)
@@ -275,6 +278,15 @@ class DesktopNodeController(
     override fun acceptStaleAnchor(network: String) {
         engine.get(network)?.acceptStaleAnchor()
     }
+
+    override fun applyStaleAnchorChoice(choice: io.myotis.ui.StaleAnchorChoice) {
+        // Same lock as the boot path's pre-start apply (see setWsBoundPeriods).
+        synchronized(servedWindowApplyLock) {
+            engine.hostedNetworks().forEach { engine.get(it)?.setStaleAnchorPolicy(stalePolicyOf(choice)) }
+        }
+    }
+
+    private fun stalePolicyOf(c: io.myotis.ui.StaleAnchorChoice) = io.myotis.api.StaleAnchorPolicy.valueOf(c.name)
 
     override fun fetchZkProofForStaleAnchor(network: String): io.myotis.ui.FreshAnchorResult {
         val handle = engine.get(network)

@@ -896,7 +896,8 @@ that produced this note.
     `STALE_ANCHOR` park it is also an explicit user choice ("Fetch ZK proof",
     `fetchZkProofForStaleAnchor`), next to the checkpointz fetch and continuing
     anyway; the explicit fetches run even under Tor, and any of the three may be
-    remembered by the host (owner's request, 2026-11-11).
+    remembered and is then applied by the engine itself, also headless — a
+    remembered fetch never unattended under Tor (owner's request, 2026-11-11).
     `MYOTIS_ZK_SYNC=0` turns it off for a process whose environment someone
     controls, but it does not undo a store already persisted from a proof, and
     that snapshot is the file the Java engine also resumes. The cold-start

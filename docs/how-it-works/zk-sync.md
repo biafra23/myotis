@@ -182,17 +182,30 @@ When a network's own anchor is past the weak-subjectivity bound, it parks in
   Settings → *When the sync anchor is too old* (Ask me / ZK proof / Fresh
   checkpoint / Continue anyway). At the next park:
   - a remembered **continue** consents without showing the dialog;
-  - a remembered **ZK proof** or **checkpoint** runs as soon as the dialog
-    opens. If it fails (no proof, or the checkpoint servers do not all agree),
-    the dialog stays with the remaining choices, and any of those can be
-    remembered in its place.
-- **The app must be open** for a remembered choice to apply. The choice lives in
-  the shared UI, so a headless node (Android service with no UI open, the
-  daemon) stays parked until the app is opened or a daemon command is sent.
+  - a remembered **ZK proof** or **checkpoint** is fetched at once. If it fails
+    (no proof, or the checkpoint servers do not all agree), the dialog stays
+    with the remaining choices, and any of those can be remembered in its place.
+- **Headless: the engine applies it.** The host hands the remembered choice to
+  the engine (`ChainHandle.setStaleAnchorPolicy` / `myotis_set_stale_anchor_policy`,
+  ABI 59) before each network starts and whenever it changes, and the sync loop
+  applies it at every park by itself — with no window or Activity open, as in
+  the Android service or the desktop app minimized. A remembered fetch that
+  fails is logged and retried every 10 minutes (the ZK proof's own retries are
+  faster once one is queued) until it succeeds, the bound is raised, or the user
+  answers otherwise. With the UI open, the dialog's own fetch may run alongside
+  the engine's; both apply the same verified result. The daemon takes the same
+  policy at start: `-PstaleAnchorPolicy=ask|zk_proof|checkpoint|continue`
+  (`-Dmyotis.beacon.staleAnchorPolicy`), an unknown value — or a fetch the
+  engine lacks (the Java engine) — refusing the start. Switching a remembered
+  "continue" to another choice withdraws the consent it gave for the run.
 - **Under Tor**, both fetches still run when the user picks them. They are
   explicit requests, unlike the automatic ZK start, which Tor turns off; both
-  go out in the clear ([privacy-and-tor.md](privacy-and-tor.md) §2).
-- The **Java engine** has neither fetch: its dialog offers only "continue".
+  go out in the clear ([privacy-and-tor.md](privacy-and-tor.md) §2). A
+  REMEMBERED fetch is not applied by the engine while Tor is on: the park waits
+  and the dialog asks, so nothing leaves in the clear without a click.
+- The **Java engine** has neither fetch: its dialog offers only "continue", and of
+  the remembered choices it applies only "continue" (as a pre-consent for the run);
+  `setStaleAnchorPolicy` returns false for the other two.
 
 ## Fresh checkpoint (the STALE_ANCHOR option)
 
@@ -226,7 +239,9 @@ It is stricter than Colibri's version (`rust/myotis-net/src/checkpointz.rs`):
   never something to outvote.)
 - In practice: on 2026-11-11 mainnet (8 operators), sepolia (3) and gnosis (2)
   were unanimous. Chiado was refused, because `rpc-gbc.chiadochain.net` reported
-  a finalized epoch about 200 epochs older than the other two.
+  a finalized epoch about 200 epochs older than the other two. That server has
+  been dropped from chiado's list, which keeps `checkpoint.chiadochain.net` and
+  publicnode, two operators. (`./gradlew refreshCheckpoint` keeps its own list.)
 - It refuses a root that is itself past the bound or ahead of the device's
   clock.
 - It applies only while the network is **parked**, so it never replaces a

@@ -284,7 +284,10 @@ fun NodeScreen(
                     network = staleNet,
                     s = staleSnap,
                     savedChoice = savedChoice,
-                    onRemember = { settings.setStaleAnchorChoice(it) },
+                    onRemember = {
+                        settings.setStaleAnchorChoice(it)
+                        controller.applyStaleAnchorChoice(it)
+                    },
                     onContinue = {
                         controller.acceptStaleAnchor(staleNet)
                         staleDismissed = staleDismissed + staleNet
@@ -497,7 +500,7 @@ internal const val READINESS_STRIP_TAG = "readiness-strip"
 
 /** Settings: what to do when a network's sync anchor is past the weak-subjectivity bound. */
 @Composable
-private fun StaleAnchorChoiceSection(settings: Settings) {
+private fun StaleAnchorChoiceSection(settings: Settings, controller: NodeController) {
     var choice by remember { mutableStateOf(settings.staleAnchorChoice()) }
     SettingsSection("When the sync anchor is too old")
     // Four chips outgrow a phone's width: scroll rather than clip the last one.
@@ -514,7 +517,11 @@ private fun StaleAnchorChoiceSection(settings: Settings) {
         ).forEach { (c, label) ->
             FilterChip(
                 selected = choice == c,
-                onClick = { choice = c; settings.setStaleAnchorChoice(c) },
+                onClick = {
+                    choice = c
+                    settings.setStaleAnchorChoice(c)
+                    controller.applyStaleAnchorChoice(c)
+                },
                 label = { Text(label) },
             )
         }
@@ -525,8 +532,9 @@ private fun StaleAnchorChoiceSection(settings: Settings) {
             "dialog asks with the remaining choices. Fresh checkpoint: start over from the block " +
             "every answering checkpoint-sync server names — if one differs, the dialog shows " +
             "the outlier. Continue anyway: sync forward from the old anchor without asking " +
-            "(the long-range risk accepted every time). Applied while the app is open: at " +
-            "the next park, and to networks parked now unless you told them to stay paused.",
+            "(the long-range risk accepted every time). Applied by the node itself, also with " +
+            "the app in the background: at the next park, and to networks parked now. A " +
+            "remembered fetch that fails is retried every 10 minutes until you choose otherwise.",
     )
 }
 
@@ -807,7 +815,7 @@ private fun SettingsTab(
         // "Remember my choice"): in both modes, because a user who ticked it must be
         // able to undo it. Applies at the next park; persisted at once.
         HorizontalDivider()
-        StaleAnchorChoiceSection(settings)
+        StaleAnchorChoiceSection(settings, controller)
 
         // Power: the rows that trade responsiveness for battery or CPU, one per host that
         // has such a knob — macOS App Nap, Android's idle controller. Linux has neither

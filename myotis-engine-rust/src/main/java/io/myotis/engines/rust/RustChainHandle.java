@@ -859,6 +859,13 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     }
 
     @Override
+    public boolean setStaleAnchorPolicy(io.myotis.api.StaleAnchorPolicy policy) {
+        boolean ok = RustEngineNative.nativeSetStaleAnchorPolicy(handle, policy.ordinal());
+        if (!ok) log.warn("[engines] setStaleAnchorPolicy({}) dropped: unknown handle {}", policy, handle);
+        return ok;
+    }
+
+    @Override
     public io.myotis.api.ZkRelease fetchZkProofForStaleAnchor() {
         return parseZkRelease(RustEngineNative.nativeFetchZkProofForStaleAnchor(handle));
     }

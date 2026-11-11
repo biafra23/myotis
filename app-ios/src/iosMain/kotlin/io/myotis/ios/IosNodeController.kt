@@ -288,6 +288,8 @@ class IosNodeController(
         // Weak-subjectivity bound override lands BEFORE start() so the cold-start
         // gate judges with it (0 = the network default, applied engine-side).
         RustEngine.setWsBoundPeriods(handle, settings.wsBoundPeriods().toLong())
+        // The remembered stale-anchor answer, applied by the engine at the park itself.
+        RustEngine.setStaleAnchorPolicy(handle, stalePolicyCode(settings.staleAnchorChoice()))
         if (!RustEngine.start(handle)) {
             RustEngine.stop(handle)
             logs.append("ERROR failed to start the $net stack")
@@ -392,6 +394,15 @@ class IosNodeController(
             RustEngine.setWsBoundPeriods(it, periods.toLong())
         }
     }
+
+    override fun applyStaleAnchorChoice(choice: io.myotis.ui.StaleAnchorChoice) {
+        val code = stalePolicyCode(choice)
+        locked { handles.values.toList() }.forEach { RustEngine.setStaleAnchorPolicy(it, code) }
+    }
+
+    /** By name, so the UI enum and the engine's codes cannot drift by reordering. */
+    private fun stalePolicyCode(c: io.myotis.ui.StaleAnchorChoice) =
+        io.myotis.engine.ios.StaleAnchorPolicy.valueOf(c.name).ordinal
 
     override fun acceptStaleAnchor(network: String) {
         val net = canonical(network)

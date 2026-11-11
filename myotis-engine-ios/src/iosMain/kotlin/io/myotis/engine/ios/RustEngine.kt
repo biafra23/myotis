@@ -47,6 +47,7 @@ import io.myotis.engine.capi.myotis_accept_stale_anchor
 import io.myotis.engine.capi.myotis_fetch_zk_proof_for_stale_anchor
 import io.myotis.engine.capi.myotis_refresh_anchor_from_checkpointz
 import io.myotis.engine.capi.myotis_set_network_metering
+import io.myotis.engine.capi.myotis_set_stale_anchor_policy
 import io.myotis.engine.capi.myotis_set_ws_bound_periods
 import io.myotis.engine.capi.myotis_simulate_v1_json
 import io.myotis.engine.capi.myotis_start
@@ -165,6 +166,12 @@ object RustEngine {
     fun acceptStaleAnchor(handle: Long): Boolean {
         requireAbi()
         return myotis_accept_stale_anchor(handle)
+    }
+
+    /** The remembered stale-anchor answer (ABI >= 59): 0 ask, 1 ZK proof, 2 checkpoint, 3 continue. */
+    fun setStaleAnchorPolicy(handle: Long, policy: Int): Boolean {
+        requireAbi()
+        return myotis_set_stale_anchor_policy(handle, policy)
     }
 
     /** Leave a STALE_ANCHOR park from Colibri's verified ZK proof of the current

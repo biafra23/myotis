@@ -123,6 +123,11 @@ class ChainHandle internal constructor(
      *  period's committee, fetched and verified, then applied by the parked network (the JVM
      *  contract's `fetchZkProofForStaleAnchor`). Not [ZkRelease.applied] means no usable proof
      *  now — offer the remaining choices. Blocking: never call it on the main thread. */
+    /** The user's remembered answer to a stale-anchor park, applied by the engine at every
+     *  park, also with no UI open (the JVM contract's `setStaleAnchorPolicy`). Live; may be
+     *  set before start. False only for a handle the engine no longer knows. */
+    fun setStaleAnchorPolicy(policy: StaleAnchorPolicy): Boolean = native.setStaleAnchorPolicy(handle, policy.ordinal)
+
     fun fetchZkProofForStaleAnchor(): ZkRelease =
         EngineDecoding.zkRelease(native.fetchZkProofForStaleAnchor(handle))
 

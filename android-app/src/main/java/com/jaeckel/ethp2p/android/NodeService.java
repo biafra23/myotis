@@ -886,6 +886,23 @@ public final class NodeService extends Service {
         }
     }
 
+    /** Hand the persisted stale-anchor choice to every live stack (the caller persisted
+     *  it first); each engine applies it at its next park, and at a park now. */
+    public void applyStaleAnchorChoice() {
+        io.myotis.api.StaleAnchorPolicy p = stalePolicy(this);
+        synchronized (handles) {
+            for (ChainHandle h : handles.values()) h.setStaleAnchorPolicy(p);
+        }
+    }
+
+    private static io.myotis.api.StaleAnchorPolicy stalePolicy(android.content.Context c) {
+        try {
+            return io.myotis.api.StaleAnchorPolicy.valueOf(staleAnchorChoice(c));
+        } catch (IllegalArgumentException e) {
+            return io.myotis.api.StaleAnchorPolicy.ASK;
+        }
+    }
+
     /** The stale-anchor dialog's "Fetch ZK proof": leave {@code network}'s STALE_ANCHOR
      *  park from Colibri's verified proof of the current committee. Blocking (network
      *  round) — the handle is read under the lock, the call runs outside it. */
@@ -2707,6 +2724,9 @@ public final class NodeService extends Service {
                     // Weak-subjectivity bound override rides the same pre-start apply
                     // + monitor: the cold-start gate must judge with it.
                     handle.setWsBoundPeriods(wsBoundPeriods(this));
+                    // The remembered stale-anchor answer: the engine applies it at the
+                    // cold-start park itself, with or without an Activity on screen.
+                    handle.setStaleAnchorPolicy(stalePolicy(this));
                     // Web page access (#502) too: the listener's first request must be
                     // judged by the persisted policy, never the engine default.
                     applyWebAccessTo(handle);

@@ -89,6 +89,15 @@ interface NodeController {
         FreshAnchorResult(applied = false, message = "No ZK proof: not available with this engine.")
 
     /**
+     * Hand the remembered stale-anchor choice ([Settings.staleAnchorChoice], persisted by
+     * the caller first) to every running network's engine, which then applies it at each
+     * park ITSELF — with no UI open, as in a background service. Hosts also apply the
+     * persisted choice before each network starts. The default does nothing (a host
+     * without the engine seam keeps the dialog-only behaviour).
+     */
+    fun applyStaleAnchorChoice(choice: StaleAnchorChoice) {}
+
+    /**
      * Re-apply the BLS backend to the process-global selector after [Settings.setNativeBlsEnabled]
      * flips the preference (Android: native blst ⇄ pure-Java Milagro). Takes effect immediately —
      * the decompressed-pubkey cache is process-global so the swap is cheap. Desktop currently has
