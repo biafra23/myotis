@@ -57,8 +57,39 @@ reference.
    `eth2/1.0.0` protocol-version field; 3c builds the LC-server peer
    tier from the protocol lists it already collects), no LCSS
    snapshot persistence yet (cold start re-bootstraps).
-4. snap reads — GetAccountRange/GetStorageRanges/GetByteCodes verified against
-   the anchor's state root; a `get-account`-style read
+4. snap reads (PR pending) — the state trust anchor and the read path:
+   the MPT proof verifier (`internal/mpt`, replaying the shared
+   `rust/testdata/el/mpt/` corpus), the snap wire + verify-on-fetch
+   (`internal/snapwire`: dynamic codes per negotiated eth version, both
+   slim-body forms, "proof invalid" / "empty proof for non-empty root"
+   as load-bearing classification channels; replays
+   `rust/testdata/el/snap/` against Java's goldens), the range requests
+   on a READY session (`internal/transport`: a GetAccountRange on 0x21
+   answered on 0x22 proven in-process end-to-end), and the reader
+   (`internal/snapread`: sequential attempts capped at 3 — the
+   address-disclosure bound — storage anchored at the PROVEN
+   storageRoot, code keccak-checked against the PROVEN codeHash,
+   transport / pruned-root / bad-proof taxonomy). `myotis-go
+   -get-account <addr> [-slot <n>]` runs the light client in parallel
+   with EL dialing and prints the account only once the proof verifies
+   against the LC-anchored finalized exec state root.
+   Deliberate cuts, documented in the code: FINALIZED-anchor reads only
+   (the Rust twin's optimistic-head read — `ProcessOptimisticUpdate` +
+   the optimistic-update poll — is the next increment; a peer on a
+   pruned state scheme answers a finalized-root read with an EMPTY
+   proof, and that is precisely the `pruned-root` case the reader
+   rotates past — observed live), and no hedged reads (sequential
+   only; HEDGE_DELAY 3 s racing is 3c).
+   Live-smoke verified 2026-11-11 from this machine: the LC finality
+   poll advanced the anchor in real time (slot 15633728 → 15633856
+   during the run), the first READY Geth answered the read with an
+   empty proof (`pruned-root`, rotated past), the second — a snap/2
+   peer on eth/71, exercising the 0x24 base codes for real — served
+   it, and the account came back proven: nonce and balance from the
+   MPT leaf at the anchored finalized exec state root
+   (verifyMethod=snapProof→lcAnchor), its empty storageRoot then
+   short-circuiting the `-slot 0` read to a provable zero anchored at
+   the PROVEN storageRoot, with no JSON-RPC anywhere in sight.
 5. final integration PR to `main`
 
 ## Run
@@ -69,6 +100,9 @@ go run ./cmd/myotis-go -datadir ./data          # discover + dial until Ctrl-C
 go run ./cmd/myotis-go -run-for 90s              # smoke: report after 90s
 go run ./cmd/myotis-go -dial=false               # discovery only
 go run ./cmd/myotis-go -loglevel debug           # per-dial failure detail
+go run ./cmd/myotis-go -get-account 0xd8dA…045   # light client + snap peer → VERIFIED account
+go run ./cmd/myotis-go -get-account 0xd8dA…045 -slot 0   # …and a two-hop storage read
+go run ./cmd/myotis-lc -once                     # LC alone: bootstrap → catch-up → one finality advance
 ```
 
 ## Test

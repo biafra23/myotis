@@ -1,17 +1,22 @@
-// Command myotis-go is the Go engine. As of this revision it discovers
-// mainnet execution-layer peers (discv4 + EIP-1459), dials them over RLPx,
-// and completes the eth handshake — then proves the framed channel works by
-// asking one for the genesis header and checking it against the pinned
-// genesis hash. The consensus light client and verified snap reads land as
-// the following parts on feature/go-engine.
+// Command myotis-go is the Go engine. It discovers mainnet execution-layer
+// peers (discv4 + EIP-1459), dials them over RLPx, and completes the eth
+// handshake — proving the framed channel by pulling the genesis header and
+// hashing it against the pin. With -get-account it ALSO runs the beacon
+// light client (the part-3/3b path, bootstrap → catch-up → finality poll,
+// every header BLS-verified) in parallel, and once both halves are up it
+// answers the account over snap — NONCE, BALANCE AND ROOTS PROVEN against
+// the light client's anchored finalized execution state root, never taken
+// from a peer's word.
 package main
 
 import (
 	"context"
 	"crypto/ecdsa"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"net"
 	"os"
 	"os/signal"
@@ -21,9 +26,13 @@ import (
 	"time"
 
 	"github.com/biafra23/myotis/go/internal/chain"
+	"github.com/biafra23/myotis/go/internal/clsync"
 	"github.com/biafra23/myotis/go/internal/discovery"
+	"github.com/biafra23/myotis/go/internal/lc"
 	"github.com/biafra23/myotis/go/internal/nodekey"
+	"github.com/biafra23/myotis/go/internal/snapread"
 	"github.com/biafra23/myotis/go/internal/transport"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 )
@@ -42,8 +51,14 @@ func main() {
 		maxReady   = flag.Int("max-ready", 8, "cap on live READY sessions; waiting candidates are held in a backlog and dialed when a slot frees")
 		logLevel   = flag.String("loglevel", "info", "log level: info|debug (debug lists each dial failure)")
 		quiet      = flag.Bool("quiet", false, "log only new peers, not the periodic summary")
+		getAccount = flag.String("get-account", "", "hex address: run the light client, wait for a snap peer, and print this account VERIFIED against the anchored finalized state root, then exit")
+		slot       = flag.String("slot", "", "with -get-account: 32-byte hex storage slot to read too (two-hop, anchored at the PROVEN storageRoot)")
 	)
 	flag.Parse()
+	if *slot != "" && *getAccount == "" {
+		logFat := func(a ...any) { fmt.Fprintln(os.Stderr, a...); os.Exit(2) }
+		logFat("-slot requires -get-account")
+	}
 
 	lvl := new(slog.LevelVar)
 	if *logLevel == "debug" {
@@ -51,14 +66,38 @@ func main() {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
 
-	if err := run(*dataDir, *listenPort, *runFor, *dialPeers, *maxDials, *maxReady, *quiet, log); err != nil {
+	err := run(*dataDir, *listenPort, *runFor, *dialPeers, *maxDials, *maxReady, *quiet, log, *getAccount, *slot)
+	if err != nil {
 		log.Error("myotis-go: " + err.Error())
 		os.Exit(1)
 	}
 }
 
-func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, maxDials, maxReady int, quiet bool, log *slog.Logger) error {
+func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, maxDials, maxReady int, quiet bool, log *slog.Logger, getAccount, slotHex string) error {
 	netCfg := chain.Mainnet() // the one network for now
+	var wantAddr common.Address
+	if getAccount != "" {
+		if !common.IsHexAddress(getAccount) {
+			return fmt.Errorf("-get-account: %q is not a hex address", getAccount)
+		}
+		wantAddr = common.HexToAddress(getAccount)
+	}
+	var wantSlot [32]byte
+	if slotHex != "" {
+		// A slot INDEX (short or odd hex, e.g. "0") is left-padded to
+		// the 32-byte key the trie uses — the Java CLI's
+		// "get-storage <addr> <index>" ergonomics; anything wider than
+		// a word stays an error.
+		h := strings.TrimPrefix(slotHex, "0x")
+		if len(h)%2 == 1 {
+			h = "0" + h
+		}
+		b, err := hex.DecodeString(h)
+		if err != nil || len(b) > 32 {
+			return fmt.Errorf("-slot: want ≤32 hex bytes, got %q (%v)", slotHex, err)
+		}
+		copy(wantSlot[32-len(b):], b)
+	}
 
 	key, err := nodekey.Load(dataDir)
 	if err != nil {
@@ -110,12 +149,39 @@ func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, m
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// -get-account mode: the beacon light client runs in parallel with
+	// EL discovery/dialing; the read fires when BOTH are up. Without the
+	// flag, no libp2p host is created at all — discovery/dial mode is
+	// untouched.
+	var (
+		anchors   = make(chan lcAnchor, 1) // latest-wins (trySend below)
+		lcFailure = make(chan error, 1)
+	)
+	if getAccount != "" {
+		lcCtx, lcStop := context.WithCancel(ctx)
+		defer lcStop()
+		logf := func(f string, a ...any) { log.Info(fmt.Sprintf(f, a...)) }
+		go func() { lcFailure <- runLightClient(lcCtx, logf, anchors) }()
+	}
+	var latest lcAnchor
+	haveAnchor := false
+
 	var deadline <-chan time.Time
 	if runFor > 0 {
 		t := time.NewTimer(runFor)
 		defer t.Stop()
 		deadline = t.C
+	} else if getAccount != "" {
+		// A bounded window for the read mode: an honest failure beats
+		// hanging until interrupted when no anchor or snap peer ever
+		// arrives (the same honesty as myotis-lc -once's exit code).
+		t := time.NewTimer(10 * time.Minute)
+		defer t.Stop()
+		deadline = t.C
 	}
+
+	reads := time.NewTicker(2 * time.Second)
+	defer reads.Stop()
 
 	summary := time.NewTicker(30 * time.Second)
 	defer summary.Stop()
@@ -126,13 +192,183 @@ func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, m
 			return nil
 		case <-deadline:
 			report(disc, dialer, log)
+			if getAccount != "" {
+				return fmt.Errorf("read window expired before an anchor + snap peer could serve %s", wantAddr.Hex())
+			}
 			return nil
+		case err := <-lcFailure:
+			// The LC gave up (bootstrap/catch-up refused within the
+			// budget): the read can never be VERIFIED, so neither can
+			// the command quietly succeed.
+			report(disc, dialer, log)
+			return fmt.Errorf("light client: %w", err)
+		case a := <-anchors:
+			latest, haveAnchor = a, true
+			if getAccount == "" {
+				continue
+			}
+			if err := verifiedRead(dialer, log, a, wantAddr, wantSlot, slotHex != ""); err != nil {
+				// Ordinary retry: the anchor may predate a peer's state
+				// window, or every dial so far lacked snap. The next
+				// poll cycle re-publishes and more peers arrive.
+				log.Debug("verified read deferred", "reason", err)
+				continue
+			}
+			return nil
+		case <-reads.C:
+			// Re-try with the ALREADY-held anchor when new peers arrive
+			// between LC cycles: the anchor channel only fires on LC
+			// cycles, and a snap peer READYing right after one would
+			// otherwise wait a full slot.
+			if getAccount != "" && haveAnchor {
+				if err := verifiedRead(dialer, log, latest, wantAddr, wantSlot, slotHex != ""); err == nil {
+					return nil
+				}
+			}
 		case <-summary.C:
 			if !quiet {
 				report(disc, dialer, log)
 			}
 		}
 	}
+}
+
+// lcAnchor is one snapshot of the light client's trust position: the
+// finalized slot and the execution payload's OWN state_root field it
+// commits to (lc.Store.FinalizedStateRoot — the only root a snap read
+// may query).
+type lcAnchor struct {
+	slot      uint64
+	stateRoot [32]byte
+}
+
+// publishAnchor keeps the buffered channel at exactly the newest
+// anchor: drain-then-send, dropping a stale unconsumed snapshot — a
+// reader that wakes late wants the FRESHEST root, not one queued
+// behind it.
+func publishAnchor(anchors chan lcAnchor, a lcAnchor) {
+	select {
+	case <-anchors:
+	default:
+	}
+	select {
+	case anchors <- a:
+	default:
+	}
+}
+
+// runLightClient bootstraps the LC over libp2p (static pins, the same
+// set myotis-lc dials), walks the committee chain, and keeps the
+// anchor fresh on the myotis-lc steady loop — every answer through
+// the part-3 processor (checkpoint pin, period gate, BLS, Merkle
+// branches). onAnchor fires after bootstrap/catch-up and after every
+// steady cycle. This is the same loop as cmd/myotis-lc's; when a
+// second consumer appeared the honest move is to say so in a comment
+// and re-unify the two in 3c rather than contort the merged main.
+func runLightClient(ctx context.Context, logf func(string, ...any), anchors chan lcAnchor) error {
+	c := chain.ConsensusMainnet()
+	h, err := clsync.NewHost()
+	if err != nil {
+		return fmt.Errorf("libp2p host: %w", err)
+	}
+	defer h.Close()
+	syncer := clsync.NewSyncer(c, h, logf)
+	clsync.InstallGossipSubHold(h)
+	clsync.ServeInstall(h, syncer.LocalStatus)
+
+	bootCtx, cancel := context.WithTimeout(ctx, 4*time.Minute)
+	defer cancel()
+	st, err := syncer.RunBootstrap(bootCtx)
+	if err != nil {
+		return fmt.Errorf("bootstrap: %w", err)
+	}
+	if err := syncer.RunCatchUp(bootCtx, st); err != nil {
+		return fmt.Errorf("catch-up: %w", err)
+	}
+	publishAnchor(anchors, snapshot(st))
+
+	for ctx.Err() == nil {
+		if err := syncer.RunCatchUp(ctx, st); err != nil {
+			logf("re-catch-up: %v", err)
+		} else if chain.SyncCommitteePeriod(syncer.Consensus.SlotAt(time.Now().Unix())) > st.Period() {
+			logf("committee behind wall clock after re-catch-up; skipping finality poll this cycle")
+		} else if outcome, err := syncer.PollFinality(ctx, st); err != nil {
+			logf("finality poll: %v", err)
+		} else {
+			logf("finality poll: outcome %v, finalized slot %d", outcome, st.Finalized.Slot)
+		}
+		publishAnchor(anchors, snapshot(st))
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Duration(chain.SecondsPerSlot) * time.Second):
+		}
+	}
+	return ctx.Err()
+}
+
+func snapshot(st *lc.Store) lcAnchor {
+	return lcAnchor{slot: st.Finalized.Slot, stateRoot: st.FinalizedStateRoot()}
+}
+
+// snapPeers hands the reader the live snap-capable sessions
+// (cap-bounded by snapread itself).
+func (d *dialer) snapPeers() []snapread.Peer {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var out []snapread.Peer
+	for _, s := range d.ready {
+		if s.HasSnap() {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// verifiedRead fires once the read has both halves: an anchored state
+// root and at least one snap session. Its output NEVER includes a
+// peer's claim without saying so — every printed field comes from a
+// proof leaf, verified against the snapshot's root.
+func verifiedRead(d *dialer, log *slog.Logger, a lcAnchor, addr common.Address, slot [32]byte, wantSlot bool) error {
+	peers := d.snapPeers()
+	if len(peers) == 0 {
+		return fmt.Errorf("no snap-capable READY peers yet (anchor is ready: slot %d)", a.slot)
+	}
+	out, err := snapread.Account(peers, a.stateRoot, addr)
+	if err != nil {
+		return err
+	}
+	attrs := []any{
+		"account", addr.Hex(),
+		"verifiedAt", fmt.Sprintf("0x%x", a.stateRoot),
+		"lcFinalizedSlot", a.slot,
+		"peers", len(peers),
+	}
+	if out.Absent() {
+		attrs = append(attrs, "account", "PROVEN ABSENT (empty account)")
+		log.Info("verified account read", attrs...)
+		return nil
+	}
+	a2 := out.Account
+	attrs = append(attrs,
+		"nonce", a2.Nonce,
+		"balanceWei", new(big.Int).SetBytes(a2.Balance).String(),
+		"storageRoot", fmt.Sprintf("0x%x", a2.StorageRoot),
+		"codeHash", fmt.Sprintf("0x%x", a2.CodeHash),
+		"verifyMethod", "snapProof→lcAnchor",
+	)
+	log.Info("verified account read", attrs...)
+	if wantSlot {
+		v, err := snapread.Slot(peers, a.stateRoot, addr, slot)
+		if err != nil {
+			return fmt.Errorf("slot read: %w", err)
+		}
+		log.Info("verified storage read",
+			"account", addr.Hex(), "slot", fmt.Sprintf("0x%x", slot),
+			"value", fmt.Sprintf("0x%x", v),
+			"anchoredAt", fmt.Sprintf("0x%x", a2.StorageRoot), // the PROVEN one
+			"verifyMethod", "snapProof→provenStorageRoot")
+	}
+	return nil
 }
 
 func report(disc *discovery.Service, dialer *dialer, log *slog.Logger) {
