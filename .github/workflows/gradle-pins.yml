@@ -4,9 +4,14 @@
 # Why one job per host: some artifacts exist per build host — Compose desktop's
 # skiko natives, Kotlin/Native's compiler bundle, aapt2 — so a pin written on
 # one machine cannot cover the others, and a host the metadata misses fails its
-# FIRST Gradle build closed (verification is strict). The four hosts here are
-# the four that run Gradle in CI: Linux x64 and arm64 (deb, engine natives),
-# macOS arm64 (dmg, iOS framework, engine natives) and Windows x64 (msi).
+# FIRST Gradle build closed (verification is strict). The five hosts here are
+# the five that run Gradle in CI: Linux x64 and arm64 (deb, engine natives),
+# macOS arm64 (dmg, iOS framework, engine natives), macOS x64 (the Intel dmg)
+# and Windows x64 (msi). A host is the JVM Gradle runs on: the Intel dmg is
+# built on an Apple Silicon runner by an x86_64 JDK under Rosetta 2
+# (desktop-dmg.yml), and that JDK resolves the macos-x64 Compose and skiko
+# modules. That leg runs only on `main` and on tags, so nothing else in CI
+# would show a missing pin of it before a merge: this chain is what does.
 #
 # Why a chain and not a matrix: each host adds its entries to the previous
 # host's file, so the last upload (`verification-metadata-merged`) is the
@@ -60,9 +65,10 @@ permissions:
 
 jobs:
   # aapt2 (AGP's resource compiler) is a jar PER OS, resolved through a
-  # detached configuration only while a resource task runs, so the hosts with
-  # an Android SDK run one such task alongside the walk. Linux arm64 has no
-  # aapt2 build and no SDK on its image.
+  # detached configuration only while a resource task runs, so one host per OS
+  # runs one such task alongside the walk: Linux x64, Windows and macOS arm64.
+  # Linux arm64 has no aapt2 build and no SDK on its image; macOS x64 needs
+  # none of its own, the jar being per OS and not per architecture.
   linux-x64:
     uses: ./.github/workflows/gradle-pins-host.yml
     with:
@@ -93,16 +99,30 @@ jobs:
       previous: verification-metadata-windows-x64
       upload_as: verification-metadata-linux-arm64
 
-  # Last on a Unix host on purpose: Gradle rewrites the whole file on every
-  # --write-verification-metadata run, so the merged upload carries LF line
-  # endings whatever Windows wrote (update_gradle_pins.sh strips \r as well).
-  macos-arm64:
+  # The Intel-Mac host: the same runner as macos-arm64, with an x86_64 JDK
+  # (see the header). No aapt2 task: its jar is per OS, not per architecture,
+  # and macos-arm64 below pins it.
+  macos-x64:
     needs: linux-arm64
     if: ${{ !cancelled() }}
     uses: ./.github/workflows/gradle-pins-host.yml
     with:
       runner: macos-15
-      host: macos-arm64
+      host: macos-x64
+      java_architecture: x64
       previous: verification-metadata-linux-arm64
+      upload_as: verification-metadata-macos-x64
+
+  # Last on a Unix host on purpose: Gradle rewrites the whole file on every
+  # --write-verification-metadata run, so the merged upload carries LF line
+  # endings whatever Windows wrote (update_gradle_pins.sh strips \r as well).
+  macos-arm64:
+    needs: macos-x64
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/gradle-pins-host.yml
+    with:
+      runner: macos-15
+      host: macos-arm64
+      previous: verification-metadata-macos-x64
       upload_as: verification-metadata-merged
       extra_tasks: ":android-app:processDebugResources"

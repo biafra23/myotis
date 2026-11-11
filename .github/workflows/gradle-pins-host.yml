@@ -44,6 +44,14 @@ on:
         required: false
         type: boolean
         default: false
+      java_architecture:
+        description: >-
+          Architecture of the JDK Gradle runs on, when it is not the runner's:
+          'x64' on an Apple Silicon runner is the Intel-Mac host (the JDK runs
+          under Rosetta 2, as in desktop-dmg.yml's x64 leg). '' = the runner's.
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -72,10 +80,42 @@ jobs:
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
+      # An x86_64 JDK on an Apple Silicon runner needs Rosetta 2. Same step as
+      # desktop-dmg.yml's x64 leg, and for its reason: fail HERE and loudly if
+      # Rosetta is unavailable, tolerating only the already-installed answer.
+      - name: Install Rosetta 2
+        if: ${{ inputs.java_architecture == 'x64' && runner.os == 'macOS' }}
+        run: |
+          set -o pipefail
+          if ! softwareupdate --install-rosetta --agree-to-license 2>&1 | tee /tmp/rosetta.log; then
+            grep -qiE "already installed|already been installed" /tmp/rosetta.log \
+              || { echo "::error::Rosetta 2 install failed"; exit 1; }
+            echo "Rosetta 2 already installed, continuing."
+          fi
+
+      # The host of a Gradle build is the JVM it runs on, not the machine:
+      # Compose's `currentOs` reads os.arch, so an x64 JDK here resolves the
+      # macos-x64 modules. An empty architecture is the runner's own.
       - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4.9.1
         with:
           java-version-file: .java-version  # exact Temurin release, one place (#734)
           distribution: 'temurin'
+          architecture: ${{ inputs.java_architecture }}
+
+      # Say which host this is, from the JVM's side: a JDK of the wrong
+      # architecture would walk another host's graph and pin nothing new.
+      - name: Check the JVM is the host this job is for
+        id: jvm
+        if: ${{ inputs.java_architecture != '' }}
+        env:
+          WANT: ${{ inputs.java_architecture }}
+        run: |
+          arch=$(java -XshowSettings:properties -version 2>&1 | sed -n 's/^ *os\.arch = //p')
+          echo "os.arch of the JDK Gradle will run on: $arch"
+          case "$WANT:$arch" in
+            x64:x86_64|x64:amd64|aarch64:aarch64) ;;
+            *) echo "::error::the JDK is $arch, and this host is meant to be $WANT"; exit 1 ;;
+          esac
 
       # COLD cache, deliberately. Gradle reads a parent POM or an imported BOM
       # only while it first parses a module's POM, then caches the parsed
@@ -165,9 +205,18 @@ jobs:
           name: ${{ inputs.previous }}
           path: gradle
 
+      # Not when this job could not establish the JVM it is for (the guard
+      # above failed, or was skipped because Rosetta or setup-java failed
+      # before it): the walk would then run on the runner's own JDK, add
+      # another host's entries, and hand the next host a file that looks like
+      # this host's contribution. Nothing is uploaded instead, and the chain
+      # stops here, as it does for a missing previous upload.
       - name: Add this host's hashes
         id: contribute
-        if: ${{ !cancelled() && (inputs.previous == '' || steps.previous.outcome == 'success') }}
+        if: >-
+          ${{ !cancelled()
+              && (inputs.java_architecture == '' || steps.jvm.outcome == 'success')
+              && (inputs.previous == '' || steps.previous.outcome == 'success') }}
         run: |
           for attempt in 1 2; do
             # shellcheck disable=SC2086
@@ -201,6 +250,6 @@ jobs:
                  "Once the whole chain has finished, run scripts/update_gradle_pins.sh --from-ci ${{ github.run_id }}, review the hash diff, and commit it."
           fi
           if [ "$CONTRIBUTE" != success ]; then
-            echo "::error::${{ inputs.host }} uploaded no metadata (previous host's upload missing, or the write failed), so this run has no complete merged file."
+            echo "::error::${{ inputs.host }} uploaded no metadata (previous host's upload missing, the JVM is not the one this host is for, or the write failed), so this run has no complete merged file."
           fi
           exit 1

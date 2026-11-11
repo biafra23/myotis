@@ -579,10 +579,9 @@ class RealTree(unittest.TestCase):
         components = self.documents["desktop"]["components"]
         hosts = {p["value"] for c in components for p in c["properties"] if p["name"] == "myotis:host"}
         # Named here, not read from PRODUCTS. The installers a release builds:
-        # the dmg (arm64), the deb (x64 and arm64), the msi. The Intel dmg
-        # (macos-x64) is missing on purpose until its modules are pinned: add
-        # it here in the change that pins them.
-        self.assertEqual(hosts, {"linux-x64", "linux-arm64", "macos-arm64", "windows-x64"})
+        # the dmg (arm64, and x64 for Intel Macs: desktop-dmg.yml's matrix),
+        # the deb (x64 and arm64), the msi.
+        self.assertEqual(hosts, {"linux-x64", "linux-arm64", "macos-arm64", "macos-x64", "windows-x64"})
         for _, prefix, _ in sbom.HOST_MODULES:
             listed = {c["name"][len(prefix):] for c in components if c["name"].startswith(prefix)}
             with self.subTest(modules=prefix):
