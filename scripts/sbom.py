@@ -118,12 +118,12 @@ PRODUCTS = {
                        "Myotis-<tag>-<arch>.deb, the Windows msi.",
         "gradle": [("app-desktop", ["runtimeClasspath"])],
         "cargo": [("rust/Cargo.lock", ["myotis-engine"])],
-        # The dmg (arm64), the deb (x64, arm64) and the msi. Not here yet:
-        # macos-x64, the Intel dmg, whose modules the verification metadata
-        # does not pin (so this tree cannot build that dmg either). It joins
-        # this list in the change that pins them; the generator refuses a
+        # The dmg (arm64, and x64 for Intel Macs), the deb (x64, arm64) and
+        # the msi. A host is the JVM Gradle runs on: the Intel dmg is built by
+        # an x86_64 JDK on an Apple Silicon runner. The generator refuses a
+        # host stated here that the verification metadata does not pin, and a
         # pinned host that is not stated here, so the two cannot drift apart.
-        "hosts": ["linux-arm64", "linux-x64", "macos-arm64", "windows-x64"],
+        "hosts": ["linux-arm64", "linux-x64", "macos-arm64", "macos-x64", "windows-x64"],
         "jdk": True,
     },
     "daemon": {
