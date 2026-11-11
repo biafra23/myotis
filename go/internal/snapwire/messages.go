@@ -30,9 +30,9 @@ import (
 	"github.com/biafra23/myotis/go/internal/rlpcode"
 )
 
-// OurSnapVersions must match the snap capabilities in our RLPx HELLO
-// (the transport's own pin, like Rust's encode_hello round-trip test).
-var OurSnapVersions = []uint64{1, 2}
+// The versions we speak live with the HELLO encoder (ethwire
+// OurSnapVersions) — one definition, like the Rust pin between
+// OUR_SNAP_VERSIONS and encode_hello.
 
 // Codes are the absolute wire codes for the snap messages, derived
 // from the negotiated eth protocol length. Offsets from base are fixed

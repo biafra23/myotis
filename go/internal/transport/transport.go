@@ -380,10 +380,30 @@ func (s *Session) GetBlockHeadersByNumber(origin, count uint64) ([][]byte, error
 		int(count), fmt.Sprintf("headers from #%d", origin))
 }
 
-// getHeaders runs one single-flight request: the reader goroutine delivers
-// the response frame to this call only (matched by request id), or the
-// call times out / the session dies.
 func (s *Session) getHeaders(requestID uint64, req []byte, expect int, what string) ([][]byte, error) {
+	payload, err := s.requestFrame(requestID, ethwire.GetBlockHeaders, req, ethwire.BlockHeaders, what)
+	if err != nil {
+		return nil, err
+	}
+	id, headers, err := ethwire.DecodeBlockHeaders(payload, expect)
+	if err != nil {
+		return nil, err
+	}
+	// Responses are correlated by request id; a foreign id (we only get
+	// here for our own) or an over-long list is already refused above.
+	if id != requestID {
+		return nil, fmt.Errorf("transport: %s response id %d ≠ requested %d", what, id, requestID)
+	}
+	return headers, nil
+}
+
+// requestFrame runs one single-flight request: the reader goroutine
+// delivers the response frame to this call only (matched by request
+// id), or the call times out / the session dies. It checks the
+// response CODE and hands back the payload; decoding and the id match
+// are the typed caller's (headers in transport.go, the snap range
+// reads in snap.go).
+func (s *Session) requestFrame(requestID, sendCode uint64, req []byte, wantCode uint64, what string) ([]byte, error) {
 	s.flightMu.Lock() // single-flight: one outstanding request per session
 	defer s.flightMu.Unlock()
 
@@ -398,7 +418,7 @@ func (s *Session) getHeaders(requestID uint64, req []byte, expect int, what stri
 	}()
 
 	deadline := time.Now().Add(s.requestTimeout)
-	if err := s.send(ethwire.GetBlockHeaders, req, deadline); err != nil {
+	if err := s.send(sendCode, req, deadline); err != nil {
 		return nil, err
 	}
 	timer := time.NewTimer(s.requestTimeout)
@@ -411,19 +431,10 @@ func (s *Session) getHeaders(requestID uint64, req []byte, expect int, what stri
 	case <-timer.C:
 		return nil, fmt.Errorf("transport: timed out awaiting %s", what)
 	}
-	if frame.MessageCode != ethwire.BlockHeaders {
-		return nil, fmt.Errorf("transport: %s: expected BlockHeaders, got 0x%02x", what, frame.MessageCode)
+	if frame.MessageCode != wantCode {
+		return nil, fmt.Errorf("transport: %s: expected 0x%02x, got 0x%02x", what, wantCode, frame.MessageCode)
 	}
-	id, headers, err := ethwire.DecodeBlockHeaders(frame.Payload, expect)
-	if err != nil {
-		return nil, err
-	}
-	// Responses are correlated by request id; a foreign id (we only get
-	// here for our own) or an over-long list is already refused above.
-	if id != requestID {
-		return nil, fmt.Errorf("transport: %s response id %d ≠ requested %d", what, id, requestID)
-	}
-	return headers, nil
+	return frame.Payload, nil
 }
 
 // send frames and writes one message (serialized: the egress keystream is
