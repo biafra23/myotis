@@ -71,9 +71,11 @@ func newMockGeth(t *testing.T, m mockEth) (*p2p.Server, *enode.Node) {
 // strips the capability's base offset (0x10), so eth Status arrives as 0x00
 // and messages sent here are re-based on the wire.
 const (
-	relStatus          = 0x00
-	relGetBlockHeaders = 0x03
-	relBlockHeaders    = 0x04
+	relStatus            = 0x00
+	relTransactions      = 0x02
+	relGetBlockHeaders   = 0x03
+	relBlockHeaders      = 0x04
+	relNewPooledTxHashes = 0x08
 )
 
 func (m mockEth) run(_ *p2p.Peer, rw p2p.MsgReadWriter) error {
@@ -136,6 +138,22 @@ func (m mockEth) run(_ *p2p.Peer, rw p2p.MsgReadWriter) error {
 			}
 			if err := p2p.Send(rw, relBlockHeaders, []any{req.ReqID, raws}); err != nil {
 				return err
+			}
+			// Immediately follow with gossip, the way a real peer does:
+			// the read loop's next Read must not overwrite the answer
+			// still being decoded by the requester (it aliases the
+			// shared snappy buffer otherwise). -race catches it here;
+			// TestDeliverResponseCopiesPayload pins it deterministically.
+			for _, gossip := range []struct {
+				code uint64
+				body any
+			}{
+				{relTransactions, []any{}},
+				{relNewPooledTxHashes, []any{[]byte{0x01, 0x02}, []byte{0x03, 0x04}}},
+			} {
+				if err := p2p.Send(rw, gossip.code, gossip.body); err != nil {
+					return err
+				}
 			}
 		default:
 			_, _ = io.Copy(io.Discard, msg.Payload)

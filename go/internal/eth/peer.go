@@ -6,8 +6,10 @@ import (
 	"crypto/ecdsa"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,7 +17,6 @@ import (
 	"github.com/biafra23/myotis/go/internal/chain"
 	"github.com/biafra23/myotis/go/internal/forkid"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/rlpx"
@@ -32,6 +33,12 @@ const (
 )
 
 var ErrPeerClosed = errors.New("eth: peer closed")
+
+// ErrBadAnswer marks a peer whose ANSWER failed protocol validation —
+// undecodable, over-served, or failing the hash-link checks. Callers use it
+// to tell "this peer lied/broke, drop it" apart from transport failure or a
+// timeout, where the peer may still be worth keeping.
+var ErrBadAnswer = errors.New("eth: bad answer from peer")
 
 // Header is one verified header: the raw RLP as received plus its recomputed
 // hash (docs/spec/02 §6.6 — hash = keccak256 of the canonical RLP; a
@@ -130,7 +137,16 @@ func Dial(ctx context.Context, key *ecdsa.PrivateKey, node *enode.Node, netw *ch
 		rc.Close()
 		return nil, err
 	}
-	if err := rc.SetDeadline(time.Time{}); err != nil { // hand deadline control to the keepalive
+	// Hand deadline control over: clear the handshake deadline on both
+	// directions, then arm the READ side with the idle timeout. Writes arm
+	// their own deadline per send (p.write). The read loop re-arms on every
+	// inbound frame — the keepalive must not arm it too, or a peer that
+	// receives our Pings but never speaks would never expire.
+	if err := rc.SetDeadline(time.Time{}); err != nil {
+		rc.Close()
+		return nil, err
+	}
+	if err := rc.SetReadDeadline(time.Now().Add(idleTimeout)); err != nil {
 		rc.Close()
 		return nil, err
 	}
@@ -146,7 +162,7 @@ func Dial(ctx context.Context, key *ecdsa.PrivateKey, node *enode.Node, netw *ch
 // Close sends a polite Disconnect and tears the connection down. Safe to
 // call after the peer already died on its own.
 func (p *Peer) Close() {
-	_ = p.write(p.conn, msgDisconnect, mustRLP(uint(discQuit)))
+	_ = p.write(p.conn, msgDisconnect, mustRLP([]uint{uint(discQuit)}))
 	p.markDead()
 	p.done.Wait()
 	p.failAllPending(ErrPeerClosed)
@@ -182,13 +198,24 @@ func (p *Peer) sendHello(key *ecdsa.PrivateKey) error {
 	return p.write(p.conn, msgHello, mustRLP(h))
 }
 
+// Size bounds for control messages and response elements (spec §9.12:
+// refuse oversized control frames BEFORE decoding them — a hostile
+// Capabilities list or ClientID must not cost an unbounded parse/log).
+const (
+	maxControlMsg  = 16 * 1024 // Hello / Status / Disconnect, like the Rust engine
+	maxHeaderBytes = 64 * 1024 // one header element inside a BlockHeaders answer
+)
+
 func (p *Peer) readHello() (ethVersions []uint, clientID string, err error) {
 	code, payload, _, err := p.conn.Read()
 	if err != nil {
 		return nil, "", fmt.Errorf("eth: read hello: %w", err)
 	}
 	if code != msgHello {
-		return nil, "", fmt.Errorf("eth: expected hello (0x00), got 0x%02x%s", code, disconnectReason(payload))
+		return nil, "", fmt.Errorf("eth: expected hello (0x00), got 0x%02x (%s)", code, disconnectReason(payload))
+	}
+	if len(payload) > maxControlMsg {
+		return nil, "", fmt.Errorf("eth: hello frame %d bytes over the %d cap", len(payload), maxControlMsg)
 	}
 	var h helloMsg
 	if err := rlp.DecodeBytes(payload, &h); err != nil {
@@ -199,7 +226,7 @@ func (p *Peer) readHello() (ethVersions []uint, clientID string, err error) {
 			ethVersions = append(ethVersions, c.Version)
 		}
 	}
-	return ethVersions, h.ClientID, nil
+	return ethVersions, strings.TrimSpace(h.ClientID), nil
 }
 
 func (p *Peer) exchangeStatus(netw *chain.Network) error {
@@ -216,8 +243,10 @@ func (p *Peer) exchangeStatus(netw *chain.Network) error {
 		return fmt.Errorf("eth: send status: %w", err)
 	}
 
+	// The loop below only reads, so this bounds the READ wait; our Status
+	// write already armed its own deadline inside p.write.
 	deadline := time.Now().Add(handshakeTotal)
-	if err := p.conn.SetWriteDeadline(deadline); err != nil {
+	if err := p.conn.SetReadDeadline(deadline); err != nil {
 		return err
 	}
 	for {
@@ -227,6 +256,9 @@ func (p *Peer) exchangeStatus(netw *chain.Network) error {
 		}
 		switch code {
 		case msgStatus:
+			if len(payload) > maxControlMsg {
+				return fmt.Errorf("eth: status frame %d bytes over the %d cap", len(payload), maxControlMsg)
+			}
 			var got status68
 			if err := rlp.DecodeBytes(payload, &got); err != nil {
 				return fmt.Errorf("eth: decode status: %w", err)
@@ -254,7 +286,7 @@ func (p *Peer) exchangeStatus(netw *chain.Network) error {
 			}
 			return nil
 		case msgDisconnect:
-			return fmt.Errorf("eth: peer disconnected during status%s", disconnectReason(payload))
+			return fmt.Errorf("eth: peer disconnected during status (%s)", disconnectReason(payload))
 		default:
 			// Some peers start gossiping immediately; ignore until Status.
 		}
@@ -281,17 +313,20 @@ func (p *Peer) GetBlockHeaders(fromHash common.Hash, amount uint32) ([]Header, e
 		return nil, err
 	}
 
-	var resp struct {
-		ReqID   uint64
-		Headers []rlp.RawValue
-	}
+	var raws [][]byte
 	select {
 	case raw, ok := <-ch:
 		if !ok {
 			return nil, ErrPeerClosed
 		}
-		if err := rlp.DecodeBytes([]byte(raw), &resp); err != nil {
-			return nil, fmt.Errorf("eth: decode BlockHeaders: %w", err)
+		// Walk the answer element-by-element instead of DecodeBytes:
+		// a 16 MiB list of small elements would materialise as a
+		// ~1 GB owned tree first (spec §9.12, #454). Bound by what
+		// we asked for, not a global constant — callers may rely on
+		// len(result) <= amount.
+		raws, err = walkBlockHeaders(raw, amount)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrBadAnswer, err)
 		}
 	case <-time.After(requestTimeout):
 		p.unregisterRequest(reqID)
@@ -299,9 +334,55 @@ func (p *Peer) GetBlockHeaders(fromHash common.Hash, amount uint32) ([]Header, e
 	case <-p.closed:
 		return nil, ErrPeerClosed
 	}
+	if uint32(len(raws)) > amount {
+		return nil, fmt.Errorf("%w: asked %d headers, peer sent %d", ErrBadAnswer, amount, len(raws))
+	}
 	// No second reqID check needed: readLoop routed this payload to us by
 	// exactly that id (firstRequestID).
-	return p.verifyBackwardChain(fromHash, resp.Headers)
+	return p.verifyBackwardChain(fromHash, raws)
+}
+
+// walkBlockHeaders reads [reqId, [header…]] off the stream, taking at most
+// amount+1 raw headers: one MORE than requested is refused without the
+// decoder pre-allocating the whole (possibly enormous) list, so an
+// over-serving peer stays visible and cheap (#454).
+func walkBlockHeaders(raw rlp.RawValue, amount uint32) ([][]byte, error) {
+	s := rlp.NewStream(bytes.NewReader(raw), uint64(len(raw))+1)
+	if _, err := s.List(); err != nil {
+		return nil, fmt.Errorf("decode envelope: %w", err)
+	}
+	var reqID uint64
+	if err := s.Decode(&reqID); err != nil { // routed already; read for position
+		return nil, fmt.Errorf("decode request id: %w", err)
+	}
+	if _, err := s.List(); err != nil {
+		return nil, fmt.Errorf("decode header list: %w", err)
+	}
+	var out [][]byte
+	for {
+		item, err := s.Raw()
+		if err == rlp.EOL {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("decode header element: %w", err)
+		}
+		if uint32(len(out)) >= amount+1 {
+			return nil, fmt.Errorf("peer sent more than the %d requested headers", amount)
+		}
+		if len(item) > maxHeaderBytes {
+			return nil, fmt.Errorf("header element %d bytes over the %d cap", len(item), maxHeaderBytes)
+		}
+		// Raw() returns a slice the caller keeps; nothing reuses it here.
+		out = append(out, item)
+	}
+	if err := s.ListEnd(); err != nil {
+		return nil, fmt.Errorf("close header list: %w", err)
+	}
+	if err := s.ListEnd(); err != nil {
+		return nil, fmt.Errorf("close envelope: %w", err)
+	}
+	return out, nil
 }
 
 // verifyBackwardChain recomputes every header hash from its raw RLP (and
@@ -309,44 +390,114 @@ func (p *Peer) GetBlockHeaders(fromHash common.Hash, amount uint32) ([]Header, e
 // first header hashes to the requested head, each next one is the previous
 // one's parent, numbers step by one. Anchoring to a trusted root is the
 // light client's job (part 3), not this function's.
-func (p *Peer) verifyBackwardChain(fromHash common.Hash, raws []rlp.RawValue) ([]Header, error) {
+func (p *Peer) verifyBackwardChain(fromHash common.Hash, raws [][]byte) ([]Header, error) {
 	if len(raws) == 0 {
-		return nil, errors.New("eth: peer returned no headers")
-	}
-	if len(raws) > 4096 {
-		return nil, fmt.Errorf("eth: peer sent %d headers, more than the 4096 cap", len(raws))
+		return nil, fmt.Errorf("%w: peer returned no headers", ErrBadAnswer)
 	}
 	out := make([]Header, 0, len(raws))
 	for i, raw := range raws {
-		var h types.Header
-		if err := rlp.DecodeBytes(raw, &h); err != nil {
-			return nil, fmt.Errorf("eth: header %d undecodable: %w", i, err)
+		hc, err := headerCore(raw)
+		if err != nil {
+			return nil, fmt.Errorf("%w: header %d undecodable: %v", ErrBadAnswer, i, err)
 		}
+		// The identity hash is keccak over the RAW bytes — never over a
+		// re-encode of what we understood — so unknown future fields are
+		// covered by the hash while still being tolerated (§6.6).
 		hash := crypto.Keccak256Hash(raw)
-		if re, err := rlp.EncodeToBytes(&h); err != nil || crypto.Keccak256Hash(re) != hash {
-			return nil, fmt.Errorf("eth: header %d is not canonically encoded (hash %s)", i, hash)
-		}
-		if h.Number == nil || !h.Number.IsUint64() {
-			return nil, fmt.Errorf("eth: header %d has no sane block number", i)
-		}
 		out = append(out, Header{
-			Hash: hash, Raw: raw, Number: h.Number.Uint64(),
-			Time: h.Time, StateRoot: h.Root, ParentHash: h.ParentHash,
+			Hash: hash, Raw: raw, Number: hc.Number,
+			Time: hc.Time, StateRoot: hc.StateRoot, ParentHash: hc.ParentHash,
 		})
 	}
 	if out[0].Hash != fromHash {
-		return nil, fmt.Errorf("eth: head mismatch: asked %s, first header is %s", fromHash, out[0].Hash)
+		return nil, fmt.Errorf("%w: head mismatch: asked %s, first header is %s", ErrBadAnswer, fromHash, out[0].Hash)
 	}
 	for i := 1; i < len(out); i++ {
 		prev := out[i-1]
 		if out[i].Hash != prev.ParentHash {
-			return nil, fmt.Errorf("eth: broken chain at %d: hash %s != parent %s", prev.Number, out[i].Hash, prev.ParentHash)
+			return nil, fmt.Errorf("%w: broken chain at %d: hash %s != parent %s", ErrBadAnswer, prev.Number, out[i].Hash, prev.ParentHash)
 		}
 		if out[i].Number+1 != prev.Number {
-			return nil, fmt.Errorf("eth: number jump %d → %d", prev.Number, out[i].Number)
+			return nil, fmt.Errorf("%w: number jump %d → %d", ErrBadAnswer, prev.Number, out[i].Number)
 		}
 	}
 	return out, nil
+}
+
+// headerFields are the four header fields this layer verifies with; they are
+// read by walking the RLP list, NOT via geth's types.Header. A struct
+// decode rejects any element the pinned geth doesn't declare ("input list
+// has too many elements"), which would make the next header-extending fork
+// (Amsterdam's blockAccessListHash/slotNumber, live on Sepolia since
+// 2026-10-06) unreadable no matter that forkid.IDAt keeps announcing the
+// right fork id across it. Spec §6.6 asks for tolerance; the Rust twin walks
+// the same way (myotis-core/src/header.rs). Canonicality comes from the
+// stream itself: RLP uints must be minimally encoded (this also rejects a
+// number beyond uint64 — the old IsUint64 guard), and common.Hash decoding
+// requires exactly 32 bytes.
+type headerFields struct {
+	ParentHash common.Hash
+	StateRoot  common.Hash
+	Number     uint64
+	Time       uint64
+}
+
+// Field indices inside the header list (Frontier layout; every fork so far
+// only APPENDED): parentHash=0, stateRoot=3, number=8, timestamp=11.
+func headerCore(raw []byte) (headerFields, error) {
+	var hc headerFields
+	s := rlp.NewStream(bytes.NewReader(raw), maxHeaderBytes)
+	if _, err := s.List(); err != nil {
+		return hc, err
+	}
+	read := func(idx int, dst any) error {
+		if err := s.Decode(dst); err != nil {
+			return fmt.Errorf("field %d: %w", idx, err)
+		}
+		return nil
+	}
+	skip := func(idx int) error {
+		if _, err := s.Raw(); err != nil {
+			return fmt.Errorf("field %d: %w", idx, err)
+		}
+		return nil
+	}
+	steps := []func() error{
+		func() error { return read(0, &hc.ParentHash) },
+		func() error { return skip(1) },
+		func() error { return skip(2) },
+		func() error { return read(3, &hc.StateRoot) },
+		func() error { return skip(4) },
+		func() error { return skip(5) },
+		func() error { return skip(6) },
+		func() error { return skip(7) },
+		func() error { return read(8, &hc.Number) },
+		func() error { return skip(9) },
+		func() error { return skip(10) },
+		func() error { return read(11, &hc.Time) },
+	}
+	for _, st := range steps {
+		if err := st(); err != nil {
+			return hc, err
+		}
+	}
+	// Consume the tail: unknown future fields are tolerated, but the list
+	// must end cleanly and nothing may trail it (corpus case
+	// 093-header-trailing-byte: trailing bytes are a decode error).
+	for {
+		if _, err := s.Raw(); err == rlp.EOL {
+			break
+		} else if err != nil {
+			return hc, fmt.Errorf("tail: %w", err)
+		}
+	}
+	if err := s.ListEnd(); err != nil {
+		return hc, fmt.Errorf("list end: %w", err)
+	}
+	if _, err := s.Raw(); err != io.EOF {
+		return hc, errors.New("trailing bytes after header list")
+	}
+	return hc, nil
 }
 
 func (p *Peer) keepalive() {
@@ -358,13 +509,18 @@ func (p *Peer) keepalive() {
 		case <-p.closed:
 			return
 		case <-tick.C:
+			// No read-deadline arming here: the deadline must expire on
+			// SILENCE, and every inbound frame re-arms it in readLoop. A
+			// live peer answers our Ping with a Pong; arming on our own
+			// successful write instead (as this once did) would keep a
+			// black-holed peer — whose writes only hit the kernel buffer
+			// — alive forever, and its slot in the stage's ready set
+			// with it.
 			if err := p.write(p.conn, msgPing, mustRLP([]any{})); err != nil {
 				p.log.Debug("keepalive ping failed, dropping peer", "err", err)
 				p.conn.Close()
 				return
 			}
-			// Any silence beyond idleTimeout kills the read side.
-			_ = p.conn.SetReadDeadline(time.Now().Add(idleTimeout))
 		}
 	}
 }
@@ -390,17 +546,14 @@ func (p *Peer) readLoop() {
 				p.log.Debug("bad response payload", "code", code, "err", err)
 				continue
 			}
-			// Deliver the full payload; the requester decodes its own shape.
-			if ch := p.takePending(id); ch != nil {
-				ch <- rlp.RawValue(payload)
-				close(ch)
-			} // else: late answer after a timeout, drop
+			p.deliverResponse(id, payload) // else: late answer after a timeout, drop
 		case msgPing:
 			_ = p.write(p.conn, msgPong, mustRLP([]any{}))
 		case msgPong, msgNewBlockHashes, msgTransactions, msgNewBlock, msgNewPooledTxHashes:
 			// Wallet ignores gossip/mempool (spec §6.3).
 		case msgDisconnect:
-			p.log.Debug("peer disconnected")
+			// The one log that explains why a READY peer dropped us.
+			p.log.Debug("peer disconnected", "reason", disconnectReason(payload))
 			return
 		case msgGetBlockHeaders, msgGetBlockBodies, msgGetReceipts, msgGetPooledTxs:
 			// Answer empty so peers keep the connection (spec §Scope).
@@ -442,6 +595,20 @@ func firstRequestID(payload []byte) (uint64, error) {
 	return id, nil
 }
 
+// deliverResponse hands a routed response payload to its requester. The
+// CLONE is load-bearing: rlpx.Conn.Read returns a buffer valid only until
+// the next Read (with snappy on, it is the shared decompression buffer),
+// and readLoop turns straight back around to Read — a chatty peer's next
+// frame would otherwise overwrite the answer under the requester's
+// decoder. geth's own transport copies at the same seam (p2p/transport.go
+// ReadMsg) for the same reason.
+func (p *Peer) deliverResponse(id uint64, payload []byte) {
+	if ch := p.takePending(id); ch != nil {
+		ch <- rlp.RawValue(bytes.Clone(payload))
+		close(ch)
+	}
+}
+
 func (p *Peer) registerRequest(id uint64) chan rlp.RawValue {
 	ch := make(chan rlp.RawValue, 1)
 	p.pendMu.Lock()
@@ -473,8 +640,12 @@ func (p *Peer) failAllPending(err error) {
 	}
 }
 
+// disconnect sends the wire form devp2p mandates: a ONE-element list
+// ([reason]), same as geth's rlp.Encode([]DiscReason{r}). A bare uint is
+// what this function used to send, which spec-conformant peers (geth
+// included) failed to parse and recorded as reason 0.
 func (p *Peer) disconnect(reason uint) {
-	_ = p.write(p.conn, msgDisconnect, mustRLP(reason))
+	_ = p.write(p.conn, msgDisconnect, mustRLP([]uint{reason}))
 }
 
 // write serializes onto the connection and arms a write deadline.
@@ -490,25 +661,42 @@ func (p *Peer) write(rc *rlpx.Conn, code uint64, data []byte) error {
 	return nil
 }
 
-// disconnectReason renders a Disconnect payload for logs: the RLP uint
-// reason when decodable, the raw bytes otherwise.
+// disconnectReason renders a Disconnect payload for logs. The devp2p wire
+// form is a ONE-element list ([reason] — geth's `c104` = too-many-peers),
+// so a list is tried first; some clients historically sent the bare uint,
+// which is accepted as the fallback. The returned string carries no
+// leading space — callers format it. Hex output is capped: the payload can
+// be any frame a peer sends under the Disconnect code.
 func disconnectReason(payload []byte) string {
+	var rs []uint
+	if err := rlp.DecodeBytes(payload, &rs); err == nil && len(rs) == 1 {
+		return namedReason(rs[0])
+	}
 	var r uint
 	if err := rlp.DecodeBytes(payload, &r); err == nil {
-		// geth's DiscReason table (p2p/peer_error.go).
-		names := map[uint]string{
-			0x00: "disconnect-requested", 0x01: "network-error", 0x02: "protocol-error",
-			0x03: "useless-peer", 0x04: "too-many-peers", 0x05: "already-connected",
-			0x06: "incompatible-version", 0x07: "invalid-identity", 0x08: "quitting",
-			0x09: "unexpected-identity", 0x0a: "self-connect", 0x0b: "read-timeout",
-			0x10: "subprotocol-error",
-		}
-		if n, ok := names[r]; ok {
-			return fmt.Sprintf(" (reason 0x%02x %s)", r, n)
-		}
-		return fmt.Sprintf(" (reason 0x%02x)", r)
+		return namedReason(r)
 	}
-	return fmt.Sprintf(" (payload %x)", payload)
+	hexed := payload
+	suffix := ""
+	if len(hexed) > 32 {
+		hexed, suffix = hexed[:32], fmt.Sprintf("… (%d bytes)", len(payload))
+	}
+	return fmt.Sprintf("payload %x%s", hexed, suffix)
+}
+
+func namedReason(r uint) string {
+	// geth's DiscReason table (p2p/peer_error.go).
+	names := map[uint]string{
+		0x00: "disconnect-requested", 0x01: "network-error", 0x02: "protocol-error",
+		0x03: "useless-peer", 0x04: "too-many-peers", 0x05: "already-connected",
+		0x06: "incompatible-version", 0x07: "invalid-identity", 0x08: "quitting",
+		0x09: "unexpected-identity", 0x0a: "self-connect", 0x0b: "read-timeout",
+		0x10: "subprotocol-error",
+	}
+	if n, ok := names[r]; ok {
+		return fmt.Sprintf("reason 0x%02x %s", r, n)
+	}
+	return fmt.Sprintf("reason 0x%02x", r)
 }
 
 func mustRLP(v any) []byte {

@@ -31,21 +31,31 @@ func TestAddCandidateFiltersAndDedups(t *testing.T) {
 
 	good := node(t, "203.0.113.7", 30303, 30303)
 	s.addCandidate(SourceDNS, good)
-	s.addCandidate(SourceDiscv4, good) // dedup: same id, no second fire
+	s.addCandidate(SourceDNS, good) // dedup: same id, same endpoint, same rank → no second fire
+	s.addCandidate(SourceDiscv4, good) // SAME endpoint but a SOURCE UPGRADE → re-fires once:
+	// the consumer needs "the table now proves what DNS only sampled" to
+	// reorder dial priorities; without this it never hears of this node
+	// again while the endpoint holds.
 
 	noTCP := node(t, "203.0.113.8", 0, 30303) // discovery-only record: not dialable
 	s.addCandidate(SourceDNS, noTCP)
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(fired) != 1 {
-		t.Fatalf("OnDiscovered fired %d times, want 1", len(fired))
+	if len(fired) != 2 {
+		t.Fatalf("OnDiscovered fired %d times, want 2 (first sight + rank upgrade)", len(fired))
 	}
 	if fired[0].Source != SourceDNS || fired[0].ID != good.ID() {
 		t.Errorf("fired with %+v", fired[0])
 	}
+	if fired[1].Source != SourceDiscv4 {
+		t.Errorf("re-fire carried source %q, want the upgraded %q", fired[1].Source, SourceDiscv4)
+	}
 	if c := s.candidates[good.ID()]; c.FirstSeen.IsZero() {
 		t.Error("candidate not recorded")
+	}
+	if c := s.candidates[good.ID()]; c.Source != SourceDiscv4 {
+		t.Errorf("stored source = %q, want the upgrade kept", c.Source)
 	}
 }
 

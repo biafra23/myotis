@@ -227,10 +227,14 @@ func (s *Service) snapshot() []Candidate {
 }
 
 // addCandidate records a peer with a dialable TCP endpoint (the RLPx layer
-// can only dial those) and reports whether the pool changed. A known peer
-// whose ENR moved is replaced — and OnDiscovered re-fired — only by a source
-// at least as trustworthy as the one holding the record (see SourceRank), so
-// a late DNS sample can never overwrite an endpoint discv4 proved.
+// can only dial those) and reports whether the pool changed enough to
+// re-fire OnDiscovered. Two changes fire: the ENR moved (replaced only by a
+// source at least as trustworthy as the one holding the record — see
+// SourceRank, so a late DNS sample can never overwrite an endpoint discv4
+// proved), or the SOURCE was upgraded at an unchanged endpoint (the table
+// proved a node the DNS tree sampled first — the consumer needs that
+// promotion to reorder its dial priorities, and it otherwise never hears
+// about this node again while the endpoint holds).
 func (s *Service) addCandidate(src Source, n *enode.Node) bool {
 	if n.TCP() == 0 || n.IP() == nil || n.IP().IsUnspecified() {
 		return false
@@ -239,8 +243,15 @@ func (s *Service) addCandidate(src Source, n *enode.Node) bool {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		old, known := s.candidates[n.ID()]
-		if known && (endpointOf(old.Node) == endpointOf(n) || SourceRank(src) < SourceRank(old.Source)) {
-			return Candidate{}, false
+		if known {
+			sameEndpoint := endpointOf(old.Node) == endpointOf(n)
+			rankUp := SourceRank(src) > SourceRank(old.Source)
+			if SourceRank(src) < SourceRank(old.Source) {
+				return Candidate{}, false
+			}
+			if sameEndpoint && !rankUp {
+				return Candidate{}, false
+			}
 		}
 		c := Candidate{
 			ID:        n.ID(),
