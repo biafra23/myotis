@@ -35,7 +35,7 @@ reference.
 ## Parts (feature/go-engine)
 
 1. discovery — discv4 + EIP-1459 DNS tree, candidate reporting (PR #757)
-2. RLPx + eth handshake — ECIES, framed channel, Status/fork-id, and the
+2. RLPx + eth handshake (PR #767) — ECIES, framed channel, Status/fork-id, and the
    first verified read: a genesis header fetched from READY peers and hashed
    against the pinned genesis hash (`internal/rlpx`, `internal/ethwire`,
    `internal/transport`; the codec replays the shared conformance corpus in
