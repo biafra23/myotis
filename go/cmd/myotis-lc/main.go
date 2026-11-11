@@ -31,6 +31,11 @@ func main() {
 	timeout := flag.Duration("timeout", 5*time.Minute, "overall budget")
 	probeRange := flag.Int("probe-range", 0, "after catch-up, ask peers for the last N periods of updates (wire probe)")
 	flag.Parse()
+	// Validate BEFORE any uint64 conversion: a negative would wrap to
+	// ~1.8e19 and a huge N exceeds the batch cap servers honor anyway.
+	if *probeRange < 0 || *probeRange > 128 {
+		log.Fatalf("-probe-range must be in [0, 128], got %d", *probeRange)
+	}
 
 	logger := log.New(os.Stderr, "", log.Ltime)
 	logf := func(f string, a ...any) { logger.Printf(f, a...) }
@@ -43,22 +48,11 @@ func main() {
 	defer h.Close()
 
 	syncer := clsync.NewSyncer(c, h, logf)
-	// Our Status answers with the live store view once it exists.
+	// The Syncer owns the store; ServeInstall answers inbound Status
+	// through it (LocalStatus reads it under lock) so a poll
+	// goroutine mutating the store can never tear what we announce.
 	clsync.InstallGossipSubHold(h)
-	var lcStore *lc.Store
-	clsync.ServeInstall(h, func() *clwire.StatusMessage {
-		wall := time.Now().Unix()
-		slot := c.SlotAt(wall)
-		m := &clwire.StatusMessage{
-			ForkDigest: clwire.CurrentForkDigest(c, wall),
-			HeadSlot:   slot,
-		}
-		if lcStore != nil {
-			m.FinalizedEpoch = lcStore.Finalized.Slot / chain.SlotsPerEpoch
-			m.FinalizedRoot = lcStore.Finalized.StateRoot
-		}
-		return m
-	})
+	clsync.ServeInstall(h, syncer.LocalStatus)
 
 	if *discPort > 0 {
 		peers := make(chan peer.AddrInfo, 64)
@@ -85,7 +79,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("bootstrap: %v", err)
 	}
-	lcStore = st
 
 	if err := syncer.RunCatchUp(ctx, st); err != nil {
 		log.Fatalf("catch-up: %v", err)

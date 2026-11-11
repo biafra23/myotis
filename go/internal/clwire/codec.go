@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/golang/snappy"
 )
@@ -157,10 +158,12 @@ func DecodeResponse(raw []byte, hasContext bool) (DecodeResult, error) {
 	res := DecodeResult{ResultCode: raw[0]}
 	pos := 1
 	if res.ResultCode != ResultSuccess {
-		msg := ""
-		if pos+4 < len(raw) {
-			msg = string(raw[pos:])
-		}
+		// Error chunks carry NO context bytes: result || varint(len) ||
+		// snappy(msg). Reading them raw would surface "\x0eÿ\x06\x00\x00sNaPpY…"
+		// where the server plainly said "Database error" — and telling
+		// "answered ServerError: Database error" apart from "sent bytes
+		// that do not decode" is the whole point of asking (codec.rs:380-407).
+		msg := decodeErrorChunkMessage(raw, pos)
 		var kind string
 		switch res.ResultCode {
 		case ResultInvalidRequest:
@@ -201,6 +204,29 @@ func DecodeResponse(raw []byte, hasContext bool) (DecodeResult, error) {
 	}
 	res.Payload = payload
 	return res, nil
+}
+
+// decodeErrorChunkMessage best-effort decodes an error chunk's message
+// at raw[start:]: varint(len) || snappy(msg), falling back to raw UTF-8
+// when the snappy frame is missing or corrupt. The eth2 spec caps error
+// strings at 256 bytes, so the declared length is trusted only up to
+// that ceiling (decode_error_chunk_message, codec.rs:390-407).
+func decodeErrorChunkMessage(raw []byte, start int) string {
+	if start >= len(raw) {
+		return ""
+	}
+	declared, msgStart, err := ReadVarint(raw, start)
+	if err != nil || msgStart >= len(raw) {
+		return ""
+	}
+	bound := min(int(declared), 256)
+	if bound > 0 {
+		if msg, err := DecompressFramed(raw[msgStart:], bound); err == nil {
+			return strings.TrimSpace(string(msg))
+		}
+		return "[raw] " + strings.TrimSpace(string(raw[msgStart:]))
+	}
+	return ""
 }
 
 // EncodeSuccessResponse builds a response chunk (the responder half —

@@ -8,6 +8,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/p2p/enode"
+	"github.com/ethereum/go-ethereum/p2p/enr"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -38,13 +39,25 @@ func StartDiscV5(udpPort int, digestFunc func() [4]byte, out chan<- peer.AddrInf
 		return nil, err
 	}
 	local := enode.NewLocalNode(db, key)
+	// A LocalNode with no endpoint in its ENR makes geth's v5 handshake
+	// nil-deref on the ID-signature (v5wire/crypto.go:79 with a record
+	// whose identity was never re-signed after the endpoint went
+	// missing): bind our own declared endpoint explicitly.
+	local.Set(enr.IPv4(net.IPv4(127, 0, 0, 1)))
+	local.Set(enr.UDP(udpPort))
 	var bootnodes []*enode.Node
 	for _, s := range MainnetBootstrapENRs {
 		if n, err := enode.Parse(enode.ValidSchemes, s); err == nil {
 			bootnodes = append(bootnodes, n)
 		}
 	}
-	disc, err := discover.ListenV5(conn, local, discover.Config{Bootnodes: bootnodes})
+	// Config.PrivateKey is the codec's handshake-signing key — pass it
+	// or geth nil-derefs in makeIDSignature the first time a peer
+	// WHOAREYOUs us (live-verified: the v5 handshake panics without it).
+	disc, err := discover.ListenV5(conn, local, discover.Config{
+		PrivateKey: key,
+		Bootnodes:  bootnodes,
+	})
 	if err != nil {
 		conn.Close()
 		db.Close()
@@ -52,7 +65,14 @@ func StartDiscV5(udpPort int, digestFunc func() [4]byte, out chan<- peer.AddrInf
 	}
 	stop := make(chan struct{})
 	go func() {
-		seen := make(map[enode.ID]bool)
+		// Keyed by the digest the record was last evaluated against, not
+		// a plain bool (the Rust twin rotates its seen set on digest
+		// change, discovery.rs:82-95): an ENR pruning at yesterday's
+		// fork digest must become a candidate again once ours moves — a
+		// blanket seen=true would drop it forever. Marking only on
+		// acceptance has the same effect for refusals, which is fine:
+		// they get re-checked every tick until they pass.
+		seen := make(map[enode.ID][4]byte)
 		// Steady 15 s lookup cadence (discovery.rs:26 LOOKUP_INTERVAL);
 		// hunt-mode 2 s is a 3c refinement.
 		tick := time.NewTicker(15 * time.Second)
@@ -65,14 +85,15 @@ func StartDiscV5(udpPort int, digestFunc func() [4]byte, out chan<- peer.AddrInf
 				return
 			case <-tick.C:
 			}
+			digest := digestFunc()
 			for _, n := range disc.Lookup(randomID()) {
-				if seen[n.ID()] {
+				if seen[n.ID()] == digest {
 					continue
 				}
-				seen[n.ID()] = true
-				if !acceptedForDial(n, digestFunc()) {
+				if !acceptedForDial(n, digest) {
 					continue
 				}
+				seen[n.ID()] = digest
 				if info, ok := enrPeerInfo(n); ok {
 					select {
 					case out <- info:

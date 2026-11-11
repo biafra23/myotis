@@ -136,8 +136,17 @@ func ServeInstall(h host.Host, statusFunc func() *clwire.StatusMessage) {
 }
 
 // parseRequestSsz decodes an inbound request body (varint || frames)
-// with no expected-length pin (we answer several protocols here).
+// with no expected-length pin (we answer several protocols here). A
+// bare 0x00 is the ENCODING of an empty request (varint(0), no snappy
+// data — metadata/ping carry none), not a malformed one: rejecting it
+// stream-reset us in the eyes of any peer that asks politely.
 func parseRequestSsz(raw []byte) ([]byte, error) {
+	if len(raw) == 0 {
+		return nil, clwire.ErrCodec
+	}
+	if len(raw) == 1 && raw[0] == 0x00 {
+		return nil, nil
+	}
 	if len(raw) < 2 {
 		return nil, clwire.ErrCodec
 	}
@@ -230,4 +239,23 @@ func readAllCapped(r io.Reader, cap int) ([]byte, error) {
 		return nil, fmt.Errorf("clsync: response exceeds %d bytes", cap)
 	}
 	return out, nil
+}
+
+// NewListeningHostForTest is NewHost with a loopback listener, so two
+// in-process hosts can actually connect (both production hosts are
+// outbound-only; this exists for the full-duplex surface test).
+func NewListeningHostForTest() (host.Host, error) {
+	priv, _, err := crypto.GenerateKeyPair(crypto.Secp256k1, 256)
+	if err != nil {
+		return nil, err
+	}
+	return libp2p.New(
+		libp2p.Identity(priv),
+		libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"),
+		libp2p.NoTransports,
+		libp2p.Transport(tcp.NewTCPTransport),
+		libp2p.Security(noise.ID, noise.New),
+		libp2p.Muxer(yamux.ID, yamux.DefaultTransport),
+		libp2p.DisableIdentifyAddressDiscovery(),
+	)
 }

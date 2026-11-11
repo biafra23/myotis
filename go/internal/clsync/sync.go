@@ -11,6 +11,7 @@ import (
 	"github.com/biafra23/myotis/go/internal/clwire"
 	"github.com/biafra23/myotis/go/internal/lc"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	ma "github.com/multiformats/go-multiaddr"
 )
@@ -27,20 +28,32 @@ var ErrStaleAnchor = errors.New("clsync: checkpoint anchor is past the weak-subj
 const maxCatchUpRounds = 24
 
 type peerState struct {
-	info     peer.AddrInfo
-	earliest uint64 // from Status (0 = unknown)
-	used     int
+	info peer.AddrInfo
+	// earliest is the peer's earliest_available_slot from Status
+	// (0 = unknown): a server that pruned older history. The catch-up
+	// loop skips peers that provably cannot answer the asked range.
+	earliest uint64
+	// statused marks "Status exchanged on the CURRENT connection" —
+	// cleared implicitly by tracking Connectedness (see ensureStatus).
+	statused bool
 }
 
-// Syncer runs the light-client loop over a peer pool. It owns no
-// goroutines: callers drive RunBootstrap/RunCatchUp/PollFinality.
+// Syncer runs the light-client loop over a peer pool. It owns the
+// store: RunBootstrap installs it, the loops mutate it, and
+// LocalStatus reads it — all through these methods, under procMu, so
+// the inbound Status responder never sees a torn store (PR #769
+// review: main used to write the store pointer unlocked).
 type Syncer struct {
 	Consensus *chain.Consensus
 	H         host.Host
 	Logf      func(string, ...any)
-	peersMu   sync.Mutex
-	peers     map[peer.ID]*peerState
-	order     []peer.ID
+
+	peersMu sync.Mutex
+	peers   map[peer.ID]*peerState
+	order   []peer.ID
+
+	procMu sync.Mutex
+	store  *lc.Store
 }
 
 func NewSyncer(c *chain.Consensus, h host.Host, logf func(string, ...any)) *Syncer {
@@ -69,6 +82,9 @@ func (s *Syncer) AddPeer(info peer.AddrInfo) {
 	s.order = append(s.order, info.ID)
 }
 
+// peerList returns a stable snapshot; callers must index THIS slice
+// (the PR #769 review caught a double-snapshot that could panic when
+// AddPeer grew the list between two calls).
 func (s *Syncer) peerList() []*peerState {
 	s.peersMu.Lock()
 	defer s.peersMu.Unlock()
@@ -85,16 +101,61 @@ func (s *Syncer) ourDigest() [4]byte {
 	return clwire.CurrentForkDigest(s.Consensus, time.Now().Unix())
 }
 
-// ourStatus is what ExchangeStatus sends first. Head/finalized are the
-// wall-clock view (the store's own finalized head is filled in by the
-// caller once one exists); digest + slot is what peers actually gate on.
-func (s *Syncer) ourStatus() *clwire.StatusMessage {
-	wall := time.Now().Unix()
-	return &clwire.StatusMessage{
-		ForkDigest:     clwire.CurrentForkDigest(s.Consensus, wall),
-		FinalizedEpoch: s.Consensus.SlotAt(wall) / chain.SlotsPerEpoch,
-		HeadSlot:       s.Consensus.SlotAt(wall),
+// LocalStatus is the Status WE announce — inbound answer and outbound
+// first-exchange alike. Pre-bootstrap it is the EMBEDDED CHECKPOINT
+// for both roots at the checkpoint slot, exactly as the Rust twin
+// initializes (sync.rs:1377-1387): Lighthouse's relevance check
+// goodbyes peers announcing zero roots, and a wall-clock slot with a
+// root nobody knows fails the same check. Post-bootstrap it is the
+// store's verified finalized header (BLOCK root — the header hash, not
+// its state root) with the head being the newer of finalized and
+// optimistic (sync.rs:4183-4197).
+func (s *Syncer) LocalStatus() *clwire.StatusMessage {
+	c := s.Consensus
+	s.procMu.Lock()
+	st := s.store
+	var fin, opt *lc.BeaconBlockHeader
+	if st != nil {
+		fin, opt = st.Finalized, st.Optimistic
 	}
+	s.procMu.Unlock()
+
+	m := &clwire.StatusMessage{ForkDigest: s.ourDigest()}
+	switch {
+	case fin != nil && opt != nil && opt.Slot >= fin.Slot:
+		m.FinalizedRoot = fin.Root()
+		m.FinalizedEpoch = fin.Slot / chain.SlotsPerEpoch
+		m.HeadRoot, m.HeadSlot = opt.Root(), opt.Slot
+	case fin != nil:
+		m.FinalizedRoot = fin.Root()
+		m.FinalizedEpoch = fin.Slot / chain.SlotsPerEpoch
+		m.HeadRoot, m.HeadSlot = fin.Root(), fin.Slot
+	default:
+		m.FinalizedRoot = [32]byte(c.CheckpointRoot)
+		m.FinalizedEpoch = c.CheckpointSlot / chain.SlotsPerEpoch
+		m.HeadRoot, m.HeadSlot = [32]byte(c.CheckpointRoot), c.CheckpointSlot
+	}
+	return m
+}
+
+// ensureStatus guarantees the mandatory Status exchange on the
+// CURRENT connection before any other request. The Rust twin sends
+// Status on every ConnectionEstablished (reqresp.rs:1680-1688,
+// §13.6); a re-dialed connection that skipped it can be Goodbye'd by
+// the same policy this repo's own servers apply. The exchange also
+// refreshes the peer's earliest_available_slot.
+func (s *Syncer) ensureStatus(ctx context.Context, p *peerState) error {
+	if s.H.Network().Connectedness(p.info.ID) == network.Connected && p.statused {
+		return nil
+	}
+	st, err := ExchangeStatus(ctx, s.H, p.info, s.LocalStatus())
+	if err != nil {
+		p.statused = false
+		return err
+	}
+	p.earliest = st.EarliestAvailableSlot
+	p.statused = true
+	return nil
 }
 
 // checkStartGate is weak-subjectivity layer 1: refuse a cold start
@@ -126,13 +187,12 @@ func (s *Syncer) RunBootstrap(ctx context.Context) (*lc.Store, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		status, err := ExchangeStatus(ctx, s.H, p.info, s.ourStatus())
-		if err != nil {
+		p.statused = false
+		if err := s.ensureStatus(ctx, p); err != nil {
 			s.Logf("bootstrap: status with %s failed: %v", p.info.ID, err)
 			lastErr = err
 			continue
 		}
-		p.earliest = status.EarliestAvailableSlot
 		resp, err := Request(ctx, s.H, p.info, clwire.Bootstrap, req, respTimeout)
 		if err != nil {
 			s.Logf("bootstrap: request to %s failed: %v", p.info.ID, err)
@@ -160,11 +220,35 @@ func (s *Syncer) RunBootstrap(ctx context.Context) (*lc.Store, error) {
 			lastErr = err
 			continue
 		}
+		s.procMu.Lock()
+		s.store = store
+		s.procMu.Unlock()
 		s.Logf("bootstrap ok from %s: slot %d period %d", p.info.ID,
 			boot.Header.Beacon.Slot, store.Period())
 		return store, nil
 	}
 	return nil, fmt.Errorf("clsync: bootstrap exhausted all peers: %w", lastErr)
+}
+
+// pickPeer round-robins through ONE snapshot (no double-snapshot race)
+// and skips peers whose advertised earliest_available_slot proves they
+// pruned the asked range (0-earliest semantics: earliest > the period
+// range's start slot means "cannot answer"). A pool where everyone is
+// skipped still serves the round-robin pick rather than stalling — the
+// skip is a preference, as in the Rust candidate tiering (#291).
+func (s *Syncer) pickPeer(round int, startPeriod uint64) (*peerState, bool) {
+	peers := s.peerList()
+	if len(peers) == 0 {
+		return nil, false
+	}
+	startSlot := startPeriod * chain.SlotsPerSyncCommitteePeriod
+	for i := range peers {
+		p := peers[(round+i)%len(peers)]
+		if p.earliest == 0 || p.earliest <= startSlot {
+			return p, true
+		}
+	}
+	return peers[round%len(peers)], false
 }
 
 // RunCatchUp walks periods forward with updates_by_range until the
@@ -186,23 +270,34 @@ func (s *Syncer) RunCatchUp(ctx context.Context, store *lc.Store) error {
 		}
 		start := store.Period() + 1
 		count := min(wallPeriod-store.Period(), 128)
-		peer := s.peerList()[round%s.numPeers()]
+		p, served := s.pickPeer(round, start)
+		if p == nil {
+			return errors.New("clsync: catch-up has no peers")
+		}
+		if !served {
+			s.Logf("catch-up: all peers pruned before period %d; asking %s anyway", start, p.info.ID)
+		}
+		if err := s.ensureStatus(ctx, p); err != nil {
+			s.Logf("catch-up: status with %s failed: %v", p.info.ID, err)
+			continue
+		}
 		req := clwire.EncodeUpdatesByRangeRequest(start, uint64(count))
-		resp, err := Request(ctx, s.H, peer.info, clwire.UpdatesByRange, req, updatesTimeout)
+		resp, err := Request(ctx, s.H, p.info, clwire.UpdatesByRange, req, updatesTimeout)
 		if err != nil {
-			s.Logf("catch-up: ask %s +%d×%d failed: %v", peer.info.ID, start, count, err)
+			s.Logf("catch-up: ask %s +%d×%d failed: %v", p.info.ID, start, count, err)
 			continue
 		}
 		chunks, err := clwire.DecodeMultiChunk(resp, int(count))
 		if err != nil {
-			s.Logf("catch-up: %s batch undecodable: %v", peer.info.ID, err)
+			s.Logf("catch-up: %s batch undecodable: %v", p.info.ID, err)
 			continue
 		}
 		applied := 0
+		s.procMu.Lock()
 		for _, ch := range chunks {
 			u, err := lc.DecodeUpdate(ch.Payload)
 			if err != nil {
-				s.Logf("catch-up: %s update undecodable: %v", peer.info.ID, err)
+				s.Logf("catch-up: %s update undecodable: %v", p.info.ID, err)
 				continue
 			}
 			if err := store.ProcessUpdate(u); err != nil {
@@ -214,19 +309,13 @@ func (s *Syncer) RunCatchUp(ctx context.Context, store *lc.Store) error {
 			applied++
 			store.ForceRotateIfPastPeriod(wallSlot)
 		}
+		s.procMu.Unlock()
 		s.Logf("catch-up: %s +%d×%d → %d/%d applied, store period %d, finalized slot %d",
-			peer.info.ID, start, count, applied, len(chunks), store.Period(), store.Finalized.Slot)
+			p.info.ID, start, count, applied, len(chunks), store.Period(), store.Finalized.Slot)
 		if applied == 0 {
 			time.Sleep(time.Second) // pace the retry, don't hammer
 		}
 	}
-}
-
-func (s *Syncer) numPeers() int {
-	if n := len(s.peerList()); n > 0 {
-		return n
-	}
-	return 1
 }
 
 // PollFinality asks one peer for the current finality update and runs
@@ -237,7 +326,7 @@ func (s *Syncer) numPeers() int {
 func (s *Syncer) PollFinality(ctx context.Context, store *lc.Store) (lc.FinalityOutcome, error) {
 	var lastErr error
 	for _, p := range s.peerList() {
-		if _, err := ExchangeStatus(ctx, s.H, p.info, s.ourStatus()); err != nil {
+		if err := s.ensureStatus(ctx, p); err != nil {
 			lastErr = err
 			continue
 		}
@@ -258,7 +347,9 @@ func (s *Syncer) PollFinality(ctx context.Context, store *lc.Store) (lc.Finality
 			lastErr = err
 			continue
 		}
+		s.procMu.Lock()
 		outcome, err := store.ProcessFinalityUpdate(u)
+		s.procMu.Unlock()
 		if err != nil {
 			lastErr = err
 			continue
@@ -295,6 +386,10 @@ func (s *Syncer) ProbeUpdates(ctx context.Context, store *lc.Store, n uint64) {
 	}
 	req := clwire.EncodeUpdatesByRangeRequest(start, n)
 	for _, p := range s.peerList() {
+		if err := s.ensureStatus(ctx, p); err != nil {
+			s.Logf("probe: %s status: %v", p.info.ID, err)
+			continue
+		}
 		resp, err := Request(ctx, s.H, p.info, clwire.UpdatesByRange, req, updatesTimeout)
 		if err != nil {
 			s.Logf("probe: %s: %v", p.info.ID, err)
@@ -306,6 +401,7 @@ func (s *Syncer) ProbeUpdates(ctx context.Context, store *lc.Store, n uint64) {
 			continue
 		}
 		var decoded, periodGated, otherRejects, applied int
+		s.procMu.Lock()
 		for _, ch := range chunks {
 			u, err := lc.DecodeUpdate(ch.Payload)
 			if err != nil {
@@ -324,6 +420,7 @@ func (s *Syncer) ProbeUpdates(ctx context.Context, store *lc.Store, n uint64) {
 			}
 			applied++
 		}
+		s.procMu.Unlock()
 		s.Logf("probe: %s asked %d periods from %d: %d chunks, %d decoded, %d period-gated, %d other-rejects, %d applied",
 			p.info.ID, n, start, len(chunks), decoded, periodGated, otherRejects, applied)
 	}

@@ -157,11 +157,24 @@ func TestResponseChunks(t *testing.T) {
 	}
 
 	// The byte-for-byte Lighthouse ServerError chunk from the Rust test.
+	// The MESSAGE must surface decoded ("…ServerError — Database error"),
+	// not the raw varint+snappy bytes — "answered ServerError: Database
+	// error" vs "sent bytes that do not decode" is the distinction a
+	// census depends on.
 	wire := mustHex(t, "020eff060000734e6150705901120000d0fe5d49")
 	wire = append(wire, []byte("Database error")...)
 	_, err = DecodeResponse(wire, true)
 	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("ServerError")) {
 		t.Fatalf("real server error not surfaced: %v", err)
+	}
+	if !bytes.Contains([]byte(err.Error()), []byte("Database error")) {
+		t.Fatalf("error message not decompressed, surfaced raw: %v", err)
+	}
+
+	// Corrupt error framing still surfaces, marked raw, never lost.
+	_, err = DecodeResponse(append([]byte{0x02, 0x05}, []byte("plain")...), false)
+	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("[raw] plain")) {
+		t.Fatalf("raw fallback for corrupt error frame: %v", err)
 	}
 
 	// Multi-chunk: chunks of distinct sizes back to back, per-chunk
