@@ -39,7 +39,7 @@ func main() {
 		runFor     = flag.Duration("run-for", 0, "exit after this duration (0 = run until interrupted)")
 		dialPeers  = flag.Bool("dial", true, "dial discovered peers over RLPx (false = discovery only)")
 		maxDials   = flag.Int("max-concurrent-dials", 4, "concurrent outbound dials (min 1)")
-		maxReady   = flag.Int("max-ready", 8, "cap on live READY sessions; candidates wait until a slot frees")
+		maxReady   = flag.Int("max-ready", 8, "cap on live READY sessions; waiting candidates are held in a backlog and dialed when a slot frees")
 		logLevel   = flag.String("loglevel", "info", "log level: info|debug (debug lists each dial failure)")
 		quiet      = flag.Bool("quiet", false, "log only new peers, not the periodic summary")
 	)
@@ -161,20 +161,34 @@ type dialer struct {
 	tcpPort  uint16
 	maxReady int // cap live sessions; the CLI is a demo, not a peer pool
 
-	queue chan *enode.Node
+	// ctx is cancelled by close(); workers and every dial derive from it,
+	// so shutdown stops the dial wall instead of draining a queued 256
+	// candidates through 30-second handshakes after the report printed.
+	ctx    context.Context
+	cancel context.CancelFunc
+	wake   chan struct{} // nudge: "backlog or slots moved, look again"
 
 	mu        sync.Mutex
 	closed    bool
-	attempted map[enode.ID]bool
+	attempted map[string]bool // id‖endpoint — a moved node gets a fresh dial
+	backlog   map[enode.ID]*enode.Node
+	order     []enode.ID // FIFO over backlog
 	ready     map[enode.ID]*transport.Session
 	clients   map[string]int
 	failures  map[string]int // dial-failure reason class → count
-	dropped   int            // candidates discarded with a full queue (retryable)
+	dialed    int            // candidates actually dialed
+	dropped   int            // candidates discarded with a full backlog
 	gone      int            // READY sessions evicted after the peer died
 
 	wg        sync.WaitGroup
 	closeOnce sync.Once
 }
+
+// backlogCap bounds the waiting list. Discovery fires OnDiscovered once per
+// (id, endpoint) and never re-fires, so dropping a candidate at a full
+// backlog or a full ready-set would lose it for the life of the process —
+// the backlog is what makes "wait until a slot frees" true.
+const backlogCap = 512
 
 func newDialer(key *ecdsa.PrivateKey, netCfg *chain.Network, workers, maxReady int, tcpPort uint16, log *slog.Logger) *dialer {
 	if workers < 1 {
@@ -184,14 +198,18 @@ func newDialer(key *ecdsa.PrivateKey, netCfg *chain.Network, workers, maxReady i
 	if maxReady < 1 {
 		maxReady = 1
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	d := &dialer{
 		key:       key,
 		network:   netCfg,
 		log:       log.With("component", "dialer"),
 		tcpPort:   tcpPort,
 		maxReady:  maxReady,
-		queue:     make(chan *enode.Node, 256),
-		attempted: map[enode.ID]bool{},
+		ctx:       ctx,
+		cancel:    cancel,
+		wake:      make(chan struct{}, 1),
+		attempted: map[string]bool{},
+		backlog:   map[enode.ID]*enode.Node{},
 		ready:     map[enode.ID]*transport.Session{},
 		clients:   map[string]int{},
 		failures:  map[string]int{},
@@ -203,42 +221,65 @@ func newDialer(key *ecdsa.PrivateKey, netCfg *chain.Network, workers, maxReady i
 	return d
 }
 
+func attemptKey(n *enode.Node) string {
+	return n.ID().String() + "|" + net.JoinHostPort(n.IP().String(), fmt.Sprint(n.TCP()))
+}
+
 func (d *dialer) enqueue(n *enode.Node) {
-	// The non-blocking send runs UNDER d.mu, and close() closes the channel
-	// under the same lock: a send can then never interleave between close's
-	// flag and close(d.queue) — the race that panicked a
-	// send-on-closed-channel at shutdown in the first smoke (defer
-	// ordering is belt; this is braces).
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.closed || d.attempted[n.ID()] {
+	if d.closed {
+		d.mu.Unlock()
 		return
 	}
-	// At the live-session cap, hold the candidate un-attempted: a slot
-	// frees when a peer dies, and discovery re-fires it.
-	if len(d.ready) >= d.maxReady {
-		return
+	if id := n.ID(); d.backlog[id] != nil {
+		d.backlog[id] = n // a moved endpoint replaces the waiting one
+	} else if len(d.order) >= backlogCap {
+		d.dropped++
+	} else if d.attempted[attemptKey(n)] {
+		// already dialed at this exact endpoint
+	} else {
+		d.backlog[id] = n
+		d.order = append(d.order, id)
 	}
+	d.mu.Unlock()
+	d.signal()
+}
+
+func (d *dialer) signal() {
 	select {
-	case d.queue <- n:
-		// Mark attempted only once the candidate is actually queued —
-		// marking before a dropped send made queue-full candidates
-		// permanently un-retryable while still counting as "attempted".
-		d.attempted[n.ID()] = true
-	default:
-		d.dropped++ // queue full; the node stays un-attempted for re-fire
+	case d.wake <- struct{}{}:
+	default: // a pending nudge already promises a re-look
 	}
 }
 
 func (d *dialer) work() {
 	defer d.wg.Done()
-	for node := range d.queue {
-		d.dialOnce(node)
+	for {
+		select {
+		case <-d.ctx.Done():
+			return
+		case <-d.wake:
+		}
+		for {
+			d.mu.Lock()
+			if d.closed || len(d.order) == 0 || len(d.ready) >= d.maxReady {
+				d.mu.Unlock()
+				break
+			}
+			id := d.order[0]
+			d.order = d.order[1:]
+			node := d.backlog[id]
+			delete(d.backlog, id)
+			d.attempted[attemptKey(node)] = true
+			d.dialed++
+			d.mu.Unlock()
+			d.dialOnce(node)
+		}
 	}
 }
 
 func (d *dialer) dialOnce(node *enode.Node) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(d.ctx, 30*time.Second)
 	defer cancel()
 	sess, err := transport.Dial(ctx, transport.Config{
 		LocalKey:         d.key,
@@ -278,7 +319,17 @@ func (d *dialer) dialOnce(node *enode.Node) {
 		return
 	}
 
+	// Hard cap at insert: workers may race past the dequeue-time check, so
+	// a surplus READY session is closed rather than kept — -max-ready means
+	// max-ready, not "max-ready plus whatever was in flight".
 	d.mu.Lock()
+	if len(d.ready) >= d.maxReady {
+		d.mu.Unlock()
+		d.log.Debug("ready set full, closing surplus session", "id", node.ID().String())
+		sess.Close()
+		d.signal() // a dial slot freed; another worker may proceed
+		return
+	}
 	d.ready[node.ID()] = sess
 	d.clients[sess.ClientID]++
 	ready := len(d.ready)
@@ -291,25 +342,38 @@ func (d *dialer) dialOnce(node *enode.Node) {
 	go func(id enode.ID, s *transport.Session) {
 		<-s.Done()
 		d.mu.Lock()
+		freed := false
 		if cur, ok := d.ready[id]; ok && cur == s {
 			delete(d.ready, id)
 			d.gone++
+			freed = true
 		}
 		d.mu.Unlock()
 		s.Close()
+		if freed {
+			d.signal() // a ready slot freed: drain the backlog into it
+		}
 	}(node.ID(), sess)
 	snap := "no"
 	if sess.Snap != nil {
 		snap = fmt.Sprintf("snap/%d", *sess.Snap)
 	}
-	d.log.Info("peer READY",
+	attrs := []any{
 		"id", node.ID().String(),
 		"client", sess.ClientID,
 		"eth", fmt.Sprintf("eth/%d", sess.EthVersion),
 		"snap", snap,
-		"peerHeight", peerHeight(sess),
 		"genesis", "verified",
-		"readyPeers", ready)
+		"readyPeers", ready,
+	}
+	// The height is the peer's CLAIM, checked against nothing — name it so
+	// it cannot read as verified next to genesis=verified, and omit it for
+	// eth/67-68 Statuses, which carry no block number at all (0 there
+	// would mean "unknown", not "height zero").
+	if sess.PeerStatus != nil && sess.PeerStatus.LatestBlock != nil {
+		attrs = append(attrs, "claimedHeight", *sess.PeerStatus.LatestBlock)
+	}
+	d.log.Info("peer READY", attrs...)
 }
 
 func hashOf(headers [][]byte) string {
@@ -318,13 +382,6 @@ func hashOf(headers [][]byte) string {
 	}
 	h := crypto.Keccak256Hash(headers[0])
 	return fmt.Sprintf("%x", h[:8])
-}
-
-func peerHeight(s *transport.Session) uint64 {
-	if s.PeerStatus != nil && s.PeerStatus.LatestBlock != nil {
-		return *s.PeerStatus.LatestBlock
-	}
-	return 0 // eth/67-68 Status carries no block number
 }
 
 func (d *dialer) stats() (ready int, outcome []string, clients []string) {
@@ -337,10 +394,11 @@ func (d *dialer) stats() (ready int, outcome []string, clients []string) {
 	// plus the two non-dial outcomes (queue drops are retryable, so they
 	// intentionally do NOT appear in dialsAttempted).
 	outcome = append(outcome,
-		fmt.Sprintf("attempted=%d", len(d.attempted)),
+		fmt.Sprintf("dialed=%d", d.dialed),
 		fmt.Sprintf("failed=%d", sum(d.failures)),
 		fmt.Sprintf("died=%d", d.gone),
-		fmt.Sprintf("queueDropped=%d", d.dropped),
+		fmt.Sprintf("backlog=%d", len(d.order)),
+		fmt.Sprintf("backlogDropped=%d", d.dropped),
 	)
 	for f, n := range d.failures {
 		outcome = append(outcome, "  "+f+"="+fmt.Sprint(n))
@@ -393,9 +451,12 @@ func containsAny(s string, subs ...string) bool {
 
 func (d *dialer) close() {
 	d.closeOnce.Do(func() {
+		// Cancel first: in-flight dials die with the context (transport
+		// closes the socket on ctx), and workers stop pulling from the
+		// backlog — no dial wall of queued candidates after the report.
+		d.cancel()
 		d.mu.Lock()
 		d.closed = true
-		close(d.queue)
 		d.mu.Unlock()
 		d.wg.Wait()
 		d.mu.Lock()

@@ -35,6 +35,12 @@ var (
 	// write side is shared with requests; a stuck peer must not stall the
 	// reader).
 	pongWriteTimeout = 5 * time.Second
+	// frameBodyTimeout bounds the time between an accepted frame header and
+	// its body MAC (Rust FRAME_BODY_TIMEOUT, myotis-net el/rlpx/transport.rs):
+	// a peer that announces a 10 MiB body and then idles must not pin the
+	// buffer and the session forever. Waiting for the NEXT header stays
+	// unbounded — idle peers are normal.
+	frameBodyTimeout = 30 * time.Second
 )
 
 // Config is one dial: our identity + the pinned network + the candidate.
@@ -134,6 +140,12 @@ func Dial(ctx context.Context, cfg Config) (*Session, error) {
 			conn.Close()
 		}
 	}()
+	// Make ctx cancellation (caller shutdown) actually bound the handshake,
+	// not just its deadline: cancelling closes the socket under the
+	// handshake's blocking reads. Released once the session is READY — from
+	// then on the caller's dial ctx must not kill a live session.
+	stopCancel := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stopCancel()
 
 	deadline := time.Now().Add(hsTimeout)
 	if dl, yes := ctx.Deadline(); yes && dl.Before(deadline) {
@@ -358,6 +370,10 @@ func (s *Session) GetBlockHeadersByHash(origin common.Hash, count uint64) ([][]b
 }
 
 // GetBlockHeadersByNumber requests `count` ascending headers from origin.
+// Like GetBlockHeadersByHash it returns the peer's RAW bytes, unverified: a
+// by-number request carries no hash to check against, so the caller owns
+// the verification — an anchored hash for the first header, or a parent-
+// hash chain from one (part 4's verified reads do exactly this).
 func (s *Session) GetBlockHeadersByNumber(origin, count uint64) ([][]byte, error) {
 	id := s.requestID.Add(1)
 	return s.getHeaders(id, ethwire.EncodeGetBlockHeadersByNumber(id, origin, count, 0, false),
@@ -441,6 +457,15 @@ func (s *Session) recv(deadline time.Time) (*rlpx.DecodedFrame, error) {
 	bodyLen, err := s.codec.DecodeHeader(head, headMac)
 	if err != nil {
 		return nil, err
+	}
+	// From here the header COMMITS us to reading bodyLen bytes: bound that
+	// stretch even for the deadline-less reader, so an announced-but-never-
+	// sent body times out instead of pinning the buffer (frameBodyTimeout;
+	// the next recv's SetReadDeadline clears it again).
+	if deadline.IsZero() {
+		if err := s.conn.SetReadDeadline(time.Now().Add(frameBodyTimeout)); err != nil {
+			return nil, err
+		}
 	}
 	padded := bodyLen
 	if pad := padded % 16; pad != 0 {

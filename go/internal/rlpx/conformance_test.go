@@ -28,9 +28,6 @@ func TestRLPXCorpus(t *testing.T) {
 	// go/internal/rlpx → repo root is three levels up.
 	corpus := filepath.Join("..", "..", "..", "rust", "testdata", "el", "rlpx")
 	expected := parseExpected(t, filepath.Join(corpus, "expected.txt"))
-	if len(expected) == 0 {
-		t.Skipf("corpus not present at %s", corpus)
-	}
 
 	actual := map[string]string{}
 
@@ -158,7 +155,10 @@ func parseExpected(t *testing.T, path string) map[string]string {
 	t.Helper()
 	f, err := os.Open(path)
 	if err != nil {
-		return nil
+		// Fail CLOSED: this is the cross-language pin the PR exists to
+		// provide — a corpus that moved must red the build, not skip
+		// green (corpusKeys in internal/chain does the same).
+		t.Fatalf("open corpus %s: %v", path, err)
 	}
 	defer f.Close()
 	out := map[string]string{}

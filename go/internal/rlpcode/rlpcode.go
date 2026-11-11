@@ -1,11 +1,11 @@
 // Package rlpcode is the small RLP toolkit shared by the rlpx and ethwire
 // packages: canonical minimal-integer encodings, list assembly, and a
 // tolerant item walker for decoding peer-produced messages. Encoding leans
-// on go-ethereum's canonical rlp package (docs/spec/07 decision: settled
-// plumbing from geth); the walker exists because control messages arrive as
-// raw RLP we must inspect field by field. geth's rlp.Split already
-// distinguishes Byte/String/List and hands back content, so the walker is
-// thin on purpose.
+// on go-ethereum's canonical rlp package — the "prefer settled geth
+// plumbing" principle of docs/spec/README.md §7; the walker exists because
+// control messages arrive as raw RLP we must inspect field by field.
+// geth's rlp.Split already distinguishes Byte/String/List and hands back
+// content, so the walker is thin on purpose.
 package rlpcode
 
 import (

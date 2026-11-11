@@ -19,11 +19,18 @@ Scope, deliberately small (owner's brief, 2026-11-10):
   lookups return better sets. Decision, not accident — see the
   `internal/discovery` package doc.
 
-Build blocks: the heavy, settled plumbing comes from go-ethereum (RLP, RLPx,
-discv4, EIP-1459, secp256k1, and the range-proof verifier for the snap part);
-everything that makes it *Myotis* — the message handling, verification
-policy, anchoring — is this module's own code, guided by `docs/spec/` and
-`rust/` as the reference.
+Build blocks: much of the heavy, settled plumbing comes from go-ethereum
+(RLP, discv4, EIP-1459, secp256k1, and the range-proof verifier for the snap
+part). The **RLPx wire layer is the deliberate exception** (hand-ported,
+PR #767): ECIES, the EIP-8 handshake and the frame codec are this module's
+own code, ported from `myotis-wire` and pinned byte-for-byte to the shared
+cross-language corpus in `rust/testdata/el/rlpx/` — which needs injectable
+entropy and exercises the raw-snappy fallback and the frame caps the
+library's `p2p/rlpx` does not expose. Whether to keep the port or wrap
+`go-ethereum/p2p/rlpx` instead is an open owner decision. Everything that
+makes it *Myotis* — the message handling, verification policy, anchoring —
+is this module's own code, guided by `docs/spec/` and `rust/` as the
+reference.
 
 ## Parts (feature/go-engine)
 

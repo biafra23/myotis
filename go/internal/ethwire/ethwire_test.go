@@ -2,6 +2,7 @@ package ethwire
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/biafra23/myotis/go/internal/rlpcode"
@@ -165,6 +166,51 @@ func TestGetBlockHeadersEncode(t *testing.T) {
 	}
 	if amt, _ := rlpcode.U64(query[1]); amt != 1 {
 		t.Errorf("amount = %d", amt)
+	}
+}
+
+func TestLeadingRequestIDReadsOnlyTheHead(t *testing.T) {
+	// A real response shape.
+	body := rlpcode.List(rlpcode.Uint(7), rlpcode.List(rlpcode.Bytes([]byte{0xba, 0xbe})))
+	if id, ok := LeadingRequestID(body); !ok || id != 7 {
+		t.Fatalf("id=%d ok=%v", id, ok)
+	}
+	// Gossip (a bare byte-string, no list) routes nowhere.
+	if _, ok := LeadingRequestID(rlpcode.Bytes([]byte{0x01})); ok {
+		t.Fatal("byte string must not route as a response")
+	}
+	// The allocation-shape case (spec 02 §9 item 12): a 10 MiB list of
+	// 10.4M one-byte elements — exactly what a hostile peer sends to make an
+	// Items()-walking reader allocate hundreds of MB per frame. Reading the
+	// head must be O(1): a full walk here still returns 1, so this pins the
+	// RESULT on a payload whose full walk would dwarf the frame itself;
+	// memory.NewTestAllocator-style counting is overkill for a CLI engine.
+	huge := bytes.Repeat([]byte{0x01}, 10*1024*1024)
+	framed := append([]byte{0xfa, byte(len(huge) >> 16), byte(len(huge) >> 8), byte(len(huge))}, huge...)
+	if id, ok := LeadingRequestID(framed); !ok || id != 1 {
+		t.Fatalf("huge list: id=%d ok=%v", id, ok)
+	}
+	// The BlockHeaders OUTER list is bounded too: a peer cannot smuggle a
+	// million top-level elements past a "2-field" message.
+	over := append([]byte{0xfa, byte(len(huge) >> 16), byte(len(huge) >> 8), byte(len(huge))}, huge...)
+	if _, _, err := DecodeBlockHeaders(over, 1); err == nil {
+		t.Fatal("over-long outer list must be refused")
+	}
+}
+
+func TestDescribeDisconnectBoundsAndShapes(t *testing.T) {
+	if got := DescribeDisconnect(rlpcode.List(rlpcode.Uint(0x04))); got != "reason 0x04 (TooManyPeers)" {
+		t.Fatalf("list shape: %q", got)
+	}
+	// The bare-reason shape some peers send (this is what logged "reason ?"
+	// for one live peer).
+	if got := DescribeDisconnect(rlpcode.Uint(0x04)); got != "reason 0x04 (TooManyPeers)" {
+		t.Fatalf("bare shape: %q", got)
+	}
+	// Oversized payloads are refused before any tree decode (Rust
+	// describe_disconnect caps likewise).
+	if got := DescribeDisconnect(bytes.Repeat([]byte{0x01}, maxControlMsgSize+1)); got == "reason ?" || !strings.Contains(got, "oversized") {
+		t.Fatalf("oversized: %q", got)
 	}
 }
 

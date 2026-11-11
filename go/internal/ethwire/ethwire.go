@@ -8,6 +8,7 @@ package ethwire
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/biafra23/myotis/go/internal/rlpcode"
@@ -345,7 +346,10 @@ func encodeGetHeaders(requestID uint64, origin rlp.RawValue, amount, skip uint64
 // the walk allocates a sub-slice per item. Each header's own hash is the
 // caller's to verify against a pin.
 func DecodeBlockHeaders(body []byte, maxHeaders int) (requestID uint64, headers [][]byte, err error) {
-	items, err := rlpcode.Items(body)
+	// The OUTER list is bounded too (2 = id + header list): walking it
+	// unbounded would allocate a sub-slice per top-level element of a
+	// hostile frame before the inner bound is ever reached.
+	items, err := rlpcode.ItemsBounded(body, 2)
 	if err != nil {
 		return 0, nil, fmt.Errorf("block headers: %w", err)
 	}
@@ -364,25 +368,44 @@ func DecodeBlockHeaders(body []byte, maxHeaders int) (requestID uint64, headers 
 // LeadingRequestID reads the request id off an eth/66+ response payload
 // ([reqId, …]) without decoding the rest — the background reader routes
 // responses with it. ok=false on anything that is not a response (gossip).
+// It splits off ONLY the head item: a full Items() walk here would build
+// one sub-slice per element of every peer frame (hundreds of MB for a
+// 10 MiB list of tiny elements), which is exactly why the Rust twin's
+// leading_request_id reads the raw list prefix (myotis-wire eth.rs,
+// docs/spec/02 §9 item 12). Trailing bytes after the list are tolerated
+// here — routing is harmless, and the response decoder still refuses
+// them.
 func LeadingRequestID(payload []byte) (id uint64, ok bool) {
-	items, err := rlpcode.Items(payload)
-	if err != nil || len(items) == 0 {
+	kind, content, _, err := rlp.Split(payload)
+	if err != nil || kind != rlp.List || len(content) == 0 {
 		return 0, false
 	}
-	id, err = rlpcode.U64(items[0])
+	head, _, err := rlpcode.SplitItem(content)
 	if err != nil {
 		return 0, false
 	}
-	return id, true
+	id, err = rlpcode.U64(head)
+	return id, err == nil
 }
 
-// DescribeDisconnect renders a Disconnect payload for logs.
+// DescribeDisconnect renders a Disconnect payload for logs. Like the Rust
+// describe_disconnect it refuses anything over the control-message cap
+// before decoding a tree, and accepts both wire shapes — [reason] and the
+// bare reason some peers send.
 func DescribeDisconnect(payload []byte) string {
-	items, err := rlpcode.Items(payload)
-	if err != nil || len(items) == 0 {
-		return "reason ?"
+	if len(payload) > maxControlMsgSize {
+		return fmt.Sprintf("oversized (%d bytes)", len(payload))
 	}
-	reason, err := rlpcode.U64(items[0])
+	var reasonItem []byte
+	if kind, content, _, err := rlp.Split(payload); err == nil && kind == rlp.List {
+		reasonItem, _, err = rlpcode.SplitItem(content)
+		if err != nil {
+			return "reason ?"
+		}
+	} else {
+		reasonItem = payload
+	}
+	reason, err := rlpcode.U64(reasonItem)
 	if err != nil {
 		return "reason ?"
 	}
@@ -417,10 +440,13 @@ func hashItem(item []byte) (common.Hash, error) {
 }
 
 func lossyUTF8(b []byte) string {
-	if !utf8.Valid(b) {
-		// Debug-escape: peer-controlled text reaching host log drains must not
-		// forge log lines (the Rust twin Debug-escapes client_id for this).
+	// Debug-escape whenever the string could forge a log line: control
+	// characters (newline foremost) are valid UTF-8, so validity alone is
+	// not the property that keeps host log drains honest (the Rust twin
+	// Debug-escapes client_id at each log site).
+	s := string(b)
+	if !utf8.Valid(b) || strings.ContainsFunc(s, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
 		return fmt.Sprintf("%q", b)
 	}
-	return string(b)
+	return s
 }

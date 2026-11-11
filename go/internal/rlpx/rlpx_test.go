@@ -205,6 +205,48 @@ func TestSnappyLengthBombFallsBackToRaw(t *testing.T) {
 	}
 }
 
+func TestOversizedSnappyDeclaredLengthTakesRawPath(t *testing.T) {
+	// The case EncodeFrame cannot produce: a frame whose PAYLOAD REGION is
+	// itself a snappy block declaring more than the cap. EncodeFrame
+	// re-compresses, so its decoder always sees an honest declared length —
+	// hand-frame the region like the Rust twin does, or the
+	// `n <= MaxFrameBodySize` branch in decodeBody is never executed.
+	bomb := []byte{0xff, 0xff, 0xff, 0xff, 0x0f, 'x'} // declares ~4 GiB
+	if n, ok := snappyLen(bomb); !ok || n <= MaxFrameBodySize {
+		t.Fatalf("expected a >cap declared length, got %d ok=%v", n, ok)
+	}
+	a, b := testPair(t)
+
+	coded := append(minimalInt(0x10), bomb...)
+	bodyLen := len(coded)
+	coded = append(coded, make([]byte, (16-bodyLen%16)%16)...)
+
+	header := make([]byte, 16)
+	header[0] = byte(bodyLen >> 16)
+	header[1] = byte(bodyLen >> 8)
+	header[2] = byte(bodyLen)
+	header[3], header[4], header[5] = 0xc2, 0x80, 0x80
+	a.enc.encrypt.XORKeyStream(header, header)
+	headerMAC := a.enc.egressMAC.updateHeader(header)
+	a.enc.encrypt.XORKeyStream(coded, coded)
+	bodyMAC := a.enc.egressMAC.updateBody(coded)
+	frame := append(append(append(append([]byte{}, header...), headerMAC...), coded...), bodyMAC...)
+
+	n, err := b.DecodeHeader(frame[:16], frame[16:32])
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := b.DecodeBody(frame[32:32+len(coded)], frame[32+len(coded):], n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The declared ~4 GiB was refused before decoding: the payload is the
+	// raw region (fallback), not a 4 GiB allocation.
+	if !bytes.Equal(d.Payload, bomb) {
+		t.Fatalf("raw fallback expected, got %x", d.Payload)
+	}
+}
+
 func TestHandshakeRoundTripMatchesBothSides(t *testing.T) {
 	aStatic := mustKey(t, "hs:A-static")
 	bStatic := mustKey(t, "hs:B-static")
