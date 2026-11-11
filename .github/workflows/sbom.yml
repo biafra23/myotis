@@ -134,8 +134,8 @@ jobs:
           section=$(mktemp)
           cat > "$section" <<'SECTION'
           **SBOMs (`Myotis-v<version>-<product>.cdx.json`)** — what each product is
-          made of, as CycloneDX 1.5: `android`, `desktop`, `daemon`,
-          `engine-library`, `ios`, `node`. Generated from the pins of this tag (the
+          made of, as CycloneDX 1.5: `android`, `android-debug`, `desktop`,
+          `daemon`, `engine-library`, `ios`, `node`. Generated from the pins of this tag (the
           Gradle lockfiles and verification metadata, `Cargo.lock`, the JDK and Rust
           versions), not from a build: the Maven components are exactly the locked
           runtime classpath, each with the SHA-256 the build verifies; the Rust

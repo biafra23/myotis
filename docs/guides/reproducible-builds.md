@@ -228,10 +228,11 @@ one file per product:
 
 | File | Product |
 |---|---|
-| `Myotis-<tag>-android.cdx.json` | the Android app (all three APKs) |
+| `Myotis-<tag>-android.cdx.json` | the Android app (the signed and the unsigned APK) |
+| `Myotis-<tag>-android-debug.cdx.json` | the Android debug app, whose classpath also has the Compose tooling |
 | `Myotis-<tag>-desktop.cdx.json` | the desktop app in its installers (dmg, deb, msi) |
 | `Myotis-<tag>-daemon.cdx.json` | the daemon and its library jars |
-| `Myotis-<tag>-engine-library.cdx.json` | the engine library (AAR, desktop jar, natives jars) |
+| `Myotis-<tag>-engine-library.cdx.json` | the engine library (AAR, desktop jar, natives jars, the iOS module) |
 | `Myotis-<tag>-ios.cdx.json` | `MyotisKit.xcframework.zip` and `MyotisEngine.xcframework.zip` |
 | `Myotis-<tag>-node.cdx.json` | the Node.js addon |
 

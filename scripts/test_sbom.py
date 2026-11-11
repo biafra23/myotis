@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -226,6 +227,15 @@ class MadeUp(unittest.TestCase):
         with self.assertRaisesRegex(sbom.SbomError, "pins no g.ui:ui-host-<host>:5.0"):
             self.build()
 
+    def test_host_modules_need_one_version_of_the_module_they_follow(self):
+        self.tree.write("proj/gradle.lockfile", Tree.LOCK + "g.ui:ui-core:4.9=otherRuntime\n")
+        self.tree.write("gradle/verification-metadata.xml",
+                        metadata({**Tree.PINNED, ("g.ui", "ui-core", "4.9"): {"ui-core-4.9.jar": sha("8")}}))
+        both = {"gradle": [("proj", ["runtimeClasspath", "otherRuntime"])]}
+        with mock.patch.dict(sbom.PRODUCTS["app"], both):
+            with self.assertRaisesRegex(sbom.SbomError, "locks that at 4.9, 5.0: one version is needed"):
+                self.build()
+
     def test_a_product_without_host_modules_gets_none(self):
         self.assertFalse([r for r in self.components("native") if "ui-host" in r])
 
@@ -250,6 +260,21 @@ class MadeUp(unittest.TestCase):
         git = self.components()[ref]
         self.assertNotIn("hashes", git)
         self.assertIn(("myotis:cargo:source", "git+https://example.org/x.git?rev=abc#abcdef"), self.properties(git))
+
+    def test_a_crate_two_lockfiles_pin_is_one_component_pinned_by_both(self):
+        self.tree.write("other/Cargo.lock", Tree.CARGO)
+        two = {"cargo": [("rust/Cargo.lock", ["ours"]), ("other/Cargo.lock", ["ours"])]}
+        with mock.patch.dict(sbom.PRODUCTS["native"], two):
+            leaf = self.components("native")["pkg:cargo/leaf@0.3.0"]
+        self.assertEqual([v for n, v in self.properties(leaf) if n == "myotis:pinned-by"],
+                         ["other/Cargo.lock", "rust/Cargo.lock"])
+
+    def test_one_name_and_version_with_two_checksums_is_an_error(self):
+        self.tree.write("other/Cargo.lock", Tree.CARGO.replace(sha("4"), sha("9")))
+        two = {"cargo": [("rust/Cargo.lock", ["ours"]), ("other/Cargo.lock", ["ours"])]}
+        with mock.patch.dict(sbom.PRODUCTS["native"], two):
+            with self.assertRaisesRegex(sbom.SbomError, "pkg:cargo/leaf@0.3.0 is not the package another lockfile pins"):
+                self.build("native")
 
     def test_a_crate_that_is_gone_is_an_error(self):
         with mock.patch.dict(sbom.PRODUCTS["native"], {"cargo": [("rust/Cargo.lock", ["renamed"])]}):
@@ -319,10 +344,13 @@ class MadeUp(unittest.TestCase):
 
     # --- The command
 
-    def run_main(self, *argv, env=None):
+    def run_main(self, *argv, epoch=None):
+        """main() on the made-up tree, with SOURCE_DATE_EPOCH set to `epoch` or not set at all."""
+        environment = {k: v for k, v in os.environ.items() if k != "SOURCE_DATE_EPOCH"}
+        if epoch is not None:
+            environment["SOURCE_DATE_EPOCH"] = epoch
         out, err = io.StringIO(), io.StringIO()
-        with mock.patch.dict(os.environ, env or {}, clear=False), redirect_stdout(out), redirect_stderr(err):
-            os.environ.pop("SOURCE_DATE_EPOCH", None) if env is None else None
+        with mock.patch.dict(os.environ, environment, clear=True), redirect_stdout(out), redirect_stderr(err):
             try:
                 code = sbom.main(["--root", str(self.tree.root), *argv])
             except SystemExit as exit_:
@@ -346,17 +374,39 @@ class MadeUp(unittest.TestCase):
 
     def test_source_date_epoch_is_the_timestamp(self):
         out = self.tree.root / "out"
-        self.assertEqual(self.run_main("--out", str(out), "native", env={"SOURCE_DATE_EPOCH": "86400"})[0], 0)
+        self.assertEqual(self.run_main("--out", str(out), "native", epoch="86400")[0], 0)
         document = json.loads((out / "Myotis-v1.2.3-native.cdx.json").read_text())
         self.assertEqual(document["metadata"]["timestamp"], "1970-01-02T00:00:00Z")
 
     def test_an_error_is_one_line_and_exit_1_and_no_file(self):
         self.tree.write("proj/gradle.lockfile", "g.one:lib:1.0=compileClasspath\n")
         out = self.tree.root / "out"
-        code, _, stderr = self.run_main("--out", str(out), "app")
+        # "native" comes first and is fine; "app" is not: neither is written.
+        code, _, stderr = self.run_main("--out", str(out), "native", "app")
         self.assertEqual(code, 1)
         self.assertRegex(stderr, r"^sbom\.py: proj/gradle\.lockfile has no lock state")
-        self.assertEqual(list(out.iterdir()), [])
+        self.assertEqual(stderr.count("\n"), 1)
+        self.assertFalse(out.exists())
+
+    def test_pins_that_cannot_be_read_are_the_same_refusal(self):
+        out = self.tree.root / "out"
+        for relative, text in ((".java-version", None), ("rust/Cargo.lock", "[[package\n"),
+                               ("gradle/verification-metadata.xml", "<not xml")):
+            tree = Tree(self.directory.name)  # every file back as it was
+            if text is None:
+                (tree.root / relative).unlink()
+            else:
+                tree.write(relative, text)
+            code, _, stderr = self.run_main("--out", str(out))
+            with self.subTest(file=relative):
+                self.assertEqual(code, 1)
+                self.assertRegex(stderr, r"^sbom\.py: cannot read the pins: ")
+                self.assertFalse(out.exists())
+
+    def test_a_source_date_epoch_that_is_not_a_number_is_refused(self):
+        code, _, stderr = self.run_main("--out", str(self.tree.root / "out"), epoch="yesterday")
+        self.assertEqual(code, 1)
+        self.assertIn("SOURCE_DATE_EPOCH is 'yesterday'", stderr)
 
     def test_a_tag_that_is_not_a_tag_name_and_an_unknown_product_are_refused(self):
         self.assertEqual(self.run_main("--tag", "../x", "--out", str(self.tree.root / "out"))[0], 1)
@@ -369,7 +419,36 @@ class RealTree(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.version = sbom.release_version(REPO)
-        cls.documents = {key: sbom.build(REPO, key, cls.version) for key in sbom.PRODUCTS}
+        pinned = sbom.read_verification_metadata(REPO / "gradle/verification-metadata.xml")
+        cls.documents = {key: sbom.build(REPO, key, cls.version, pinned=pinned) for key in sbom.PRODUCTS}
+
+    def test_two_processes_with_other_hash_seeds_write_the_same_bytes(self):
+        # In one process a set iterates the same way twice; what must not leak
+        # into the files is the order it happens to have in THIS process.
+        with tempfile.TemporaryDirectory() as directory:
+            for seed in ("1", "2"):
+                environment = {**os.environ, "PYTHONHASHSEED": seed, "SOURCE_DATE_EPOCH": "1700000000"}
+                subprocess.run([sys.executable, str(REPO / "scripts/sbom.py"), "--out", f"{directory}/{seed}"],
+                               check=True, env=environment, stdout=subprocess.DEVNULL)
+            first, second = Path(directory, "1"), Path(directory, "2")
+            names = sorted(p.name for p in first.iterdir())
+            self.assertEqual(names, sorted(sbom.asset_name(f"v{self.version}", key) for key in sbom.PRODUCTS))
+            for name in names:
+                with self.subTest(file=name):
+                    self.assertEqual((first / name).read_bytes(), (second / name).read_bytes())
+
+    def test_the_debug_app_is_described_by_its_own_classpath(self):
+        release = {c["bom-ref"] for c in self.documents["android"]["components"]}
+        debug = {c["bom-ref"] for c in self.documents["android-debug"]["components"]}
+        # The Compose tooling ships in the debug app only (ui-tooling-preview is in both).
+        tooling = "pkg:maven/androidx.compose.ui/ui-tooling@"
+        self.assertTrue(any(ref.startswith(tooling) for ref in debug - release), sorted(debug - release))
+        self.assertFalse(any(ref.startswith(tooling) for ref in release))
+
+    def test_the_engine_library_lists_its_ios_modules_klibs(self):
+        pinned_by = {p["value"] for c in self.documents["engine-library"]["components"]
+                     for p in c["properties"] if p["name"] == "myotis:pinned-by"}
+        self.assertIn("myotis-engine-ios/gradle.lockfile#iosArm64CompileKlibraries", pinned_by)
 
     def test_every_product_has_components_of_what_it_is_defined_by(self):
         for key, product in sbom.PRODUCTS.items():
@@ -420,9 +499,10 @@ class RealTree(unittest.TestCase):
         # dependencyLocking.ignoredDependencies in the root build: a pattern
         # added there and not here would leave its modules out of every SBOM.
         text = (REPO / "build.gradle.kts").read_text()
-        block = text[text.index("ignoredDependencies.addAll("):]
-        block = block[:block.index("),\n        )")]
-        ignored = sorted(re.findall(r'"([^"]+)"', block))
+        block = re.search(r"ignoredDependencies\.addAll\(\s*listOf\(([^)]*)\)", text)
+        self.assertIsNotNone(block, "build.gradle.kts: no `ignoredDependencies.addAll(listOf(...))` to compare "
+                                    "sbom.HOST_MODULES with")
+        ignored = sorted(re.findall(r'"([^"]+)"', block.group(1)))
         self.assertEqual(ignored, sorted(f"{group}:{prefix}*" for group, prefix, _ in sbom.HOST_MODULES))
 
     def test_the_desktop_app_lists_each_hosts_modules_and_its_jdk(self):

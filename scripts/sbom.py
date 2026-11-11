@@ -5,7 +5,8 @@
     scripts/sbom.py --list
 
 One CycloneDX 1.5 JSON document per shipped product (PRODUCTS below), written
-to DIR as Myotis-<tag>-<product>.cdx.json. Nothing is built and nothing is
+to DIR as Myotis-<tag>-<product>.cdx.json (all of them, or none: an error
+writes no file). Nothing is built and nothing is
 downloaded: the inputs are the files that already pin the build,
 
   - <project>/gradle.lockfile       the modules Gradle may resolve, per
@@ -76,8 +77,17 @@ HOST_MODULES = [
 PRODUCTS = {
     "android": {
         "name": "Myotis for Android",
-        "description": "The Android app: Myotis-<tag>-android.apk, -android-unsigned.apk and -android-debug.apk.",
+        "description": "The Android app: Myotis-<tag>-android.apk and the same app before its signature, "
+                       "-android-unsigned.apk.",
         "gradle": [("android-app", ["releaseRuntimeClasspath"])],
+        "cargo": [("rust/Cargo.lock", ["myotis-engine", "myotis-bls"])],
+    },
+    # Its own document: the debug variant's classpath is not the release one
+    # (the Compose tooling comes with it).
+    "android-debug": {
+        "name": "Myotis for Android, debug app",
+        "description": "The debug app, Myotis-<tag>-android-debug.apk.",
+        "gradle": [("android-app", ["debugRuntimeClasspath"])],
         "cargo": [("rust/Cargo.lock", ["myotis-engine", "myotis-bls"])],
     },
     "desktop": {
@@ -98,9 +108,11 @@ PRODUCTS = {
     },
     "engine-library": {
         "name": "Myotis engine library",
-        "description": "eth.myotis:myotis-engine as published: the Android AAR, the desktop jar and the "
-                       "natives jars (myotis-engine-<tag>-android.aar, myotis-engine-<tag>-maven-repo.zip).",
-        "gradle": [("myotis-engine", ["releaseRuntimeClasspath", "jvmRuntimeClasspath"])],
+        "description": "eth.myotis:myotis-engine as published: the Android AAR, the desktop jar, the natives "
+                       "jars and the iOS module (myotis-engine-<tag>-android.aar, "
+                       "myotis-engine-<tag>-maven-repo.zip).",
+        "gradle": [("myotis-engine", ["releaseRuntimeClasspath", "jvmRuntimeClasspath"]),
+                   ("myotis-engine-ios", ["iosArm64CompileKlibraries", "iosSimulatorArm64CompileKlibraries"])],
         "cargo": [("rust/Cargo.lock", ["myotis-engine", "myotis-bls"])],
     },
     "ios": {
@@ -216,15 +228,17 @@ def gradle_components(root, product, pinned):
                 members.setdefault(coordinate, set()).add(f"{lockfile}#{configuration}")
     components = [maven_component(c, pinned, sources) for c, sources in members.items()]
     if product.get("host_modules"):
-        versions = {f"{g}:{n}": v for g, n, v in members}
         for group, prefix, follows in HOST_MODULES:
-            if follows not in versions:
-                raise SbomError(f"{product['name']} bundles {group}:{prefix}<host> but does not lock {follows}")
+            locked_at = sorted(v for g, n, v in members if f"{g}:{n}" == follows)
+            if len(locked_at) != 1:
+                raise SbomError(
+                    f"{product['name']} bundles {group}:{prefix}<host>, which follows the version of {follows}, "
+                    f"and locks that at {', '.join(locked_at) or 'no version'}: one version is needed to pick them")
             hosts = sorted(k for k in pinned
-                           if k[0] == group and k[1].startswith(prefix) and k[2] == versions[follows])
+                           if k[0] == group and k[1].startswith(prefix) and k[2] == locked_at[0])
             if not hosts:
                 raise SbomError(
-                    f"gradle/verification-metadata.xml pins no {group}:{prefix}<host>:{versions[follows]}")
+                    f"gradle/verification-metadata.xml pins no {group}:{prefix}<host>:{locked_at[0]}")
             for coordinate in hosts:
                 components.append(maven_component(
                     coordinate, pinned, {"gradle/verification-metadata.xml"},
@@ -235,7 +249,7 @@ def gradle_components(root, product, pinned):
 # --- Cargo --------------------------------------------------------------------
 
 def cargo_components(root, product):
-    components = {}
+    crates = {}  # purl -> (name, version, source, checksum, {lockfile, ...})
     for lockfile, roots in product["cargo"]:
         path = root / lockfile
         if not path.is_file():
@@ -277,20 +291,26 @@ def cargo_components(root, product):
                 continue  # one of the workspace's own crates: part of the product itself
             name, version, source = key
             purl = f"pkg:cargo/{quote(name)}@{quote(version)}"
-            properties = [("myotis:pinned-by", lockfile)]
             if source != CRATES_IO:
                 # Another registry, or a git revision: the same name and version
                 # there is another package, so the source is part of its identity.
                 purl += "?" + ("vcs_url=" if source.startswith("git+") else "repository_url=") + quote(source)
-                properties.append(("myotis:cargo:source", source))
-            component = {"type": "library", "bom-ref": purl, "name": name, "version": version, "purl": purl}
-            if "checksum" in package:
-                component["hashes"] = [{"alg": "SHA-256", "content": package["checksum"]}]
-            component["properties"] = [{"name": n, "value": v} for n, v in properties]
-            if purl in components and components[purl] != component:
-                raise SbomError(f"{lockfile}: two different packages are both {purl}")
-            components[purl] = component
-    return list(components.values())
+            crate = crates.setdefault(purl, (name, version, source, package.get("checksum"), set()))
+            if crate[:4] != (name, version, source, package.get("checksum")):
+                raise SbomError(f"{lockfile}: {purl} is not the package another lockfile pins under that name "
+                                f"(checksum {package.get('checksum')} here, {crate[3]} there)")
+            crate[4].add(lockfile)
+    components = []
+    for purl, (name, version, source, checksum, lockfiles) in crates.items():
+        component = {"type": "library", "bom-ref": purl, "name": name, "version": version, "purl": purl}
+        if checksum:
+            component["hashes"] = [{"alg": "SHA-256", "content": checksum}]
+        properties = [("myotis:pinned-by", lockfile) for lockfile in sorted(lockfiles)]
+        if source != CRATES_IO:
+            properties.append(("myotis:cargo:source", source))
+        component["properties"] = [{"name": n, "value": v} for n, v in properties]
+        components.append(component)
+    return components
 
 
 # --- The toolchains whose code ends up inside the product ----------------------
@@ -340,10 +360,15 @@ def release_version(root):
     return found[0].removesuffix("-SNAPSHOT")
 
 
-def build(root, key, version, timestamp=None):
-    """The CycloneDX document of one product, as a dict."""
+def build(root, key, version, timestamp=None, pinned=None):
+    """The CycloneDX document of one product, as a dict.
+
+    `pinned`: read_verification_metadata's result, for a caller that builds
+    several products and wants the file parsed once.
+    """
     product = PRODUCTS[key]
-    pinned = read_verification_metadata(root / "gradle/verification-metadata.xml") if product["gradle"] else {}
+    if pinned is None and product["gradle"]:
+        pinned = read_verification_metadata(root / "gradle/verification-metadata.xml")
     components = (gradle_components(root, product, pinned) + cargo_components(root, product)
                   + toolchain_components(root, product))
     components.sort(key=lambda c: c["bom-ref"])
@@ -417,22 +442,34 @@ def main(argv=None):
     unknown = [p for p in args.products if p not in PRODUCTS]
     if unknown:
         parser.error(f"no such product: {', '.join(unknown)} (--list names them)")
+    keys = args.products or list(PRODUCTS)
     try:
         version = release_version(args.root)
         tag = args.tag or f"v{version}"
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", tag):
             raise SbomError(f"{tag!r} is not a tag name")
         epoch = os.environ.get("SOURCE_DATE_EPOCH")
+        if epoch and not re.fullmatch(r"\d+", epoch):
+            raise SbomError(f"SOURCE_DATE_EPOCH is {epoch!r}, not a number of seconds")
         timestamp = int(epoch) if epoch else None
-        args.out.mkdir(parents=True, exist_ok=True)
-        for key in args.products or PRODUCTS:
-            document = build(args.root, key, version, timestamp)
-            path = args.out / asset_name(tag, key)
-            path.write_text(json.dumps(document, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-            print(f"{path}: {len(document['components'])} components")
+        pinned = None
+        if any(PRODUCTS[key]["gradle"] for key in keys):
+            pinned = read_verification_metadata(args.root / "gradle/verification-metadata.xml")
+        # Every document first, then the files: a product that cannot be
+        # described leaves no half of a set behind.
+        documents = [(key, build(args.root, key, version, timestamp, pinned)) for key in keys]
     except SbomError as error:
         print(f"sbom.py: {error}", file=sys.stderr)
         return 1
+    except (OSError, tomllib.TOMLDecodeError, ET.ParseError) as error:
+        # A pin file that is missing or does not parse: the same refusal.
+        print(f"sbom.py: cannot read the pins: {error}", file=sys.stderr)
+        return 1
+    args.out.mkdir(parents=True, exist_ok=True)
+    for key, document in documents:
+        path = args.out / asset_name(tag, key)
+        path.write_text(json.dumps(document, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"{path}: {len(document['components'])} components")
     return 0
 
 
