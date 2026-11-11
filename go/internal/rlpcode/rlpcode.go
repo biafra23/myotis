@@ -78,6 +78,14 @@ func SplitItem(b []byte) (item, rest []byte, err error) {
 // encoded). A non-list input or trailing bytes after the list are errors —
 // a message frame body must not carry a second top-level item.
 func Items(b []byte) ([][]byte, error) {
+	return ItemsBounded(b, -1)
+}
+
+// ItemsBounded is Items with a cap on the item count (max < 0 = unbounded):
+// a lying peer cannot make the walk allocate one sub-slice per item past the
+// caller's expected maximum (the Rust decode_block_headers(payload, requested)
+// bound).
+func ItemsBounded(b []byte, max int) ([][]byte, error) {
 	kind, content, rest, err := rlp.Split(b)
 	if err != nil {
 		return nil, err
@@ -90,6 +98,9 @@ func Items(b []byte) ([][]byte, error) {
 	}
 	items := make([][]byte, 0, 8)
 	for len(content) > 0 {
+		if max >= 0 && len(items) == max {
+			return nil, fmt.Errorf("rlpcode: more than %d items", max)
+		}
 		it, next, err := SplitItem(content)
 		if err != nil {
 			return nil, err
@@ -159,16 +170,4 @@ func U64(item []byte) (uint64, error) {
 		}
 		return v, nil
 	}
-}
-
-// Bool decodes an integer item as a boolean (0 or 1).
-func Bool(item []byte) (bool, error) {
-	v, err := U64(item)
-	if err != nil {
-		return false, err
-	}
-	if v > 1 {
-		return false, errors.New("rlpcode: boolean item > 1")
-	}
-	return v == 1, nil
 }

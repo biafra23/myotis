@@ -38,7 +38,8 @@ func main() {
 		listenPort = flag.Int("port", chain.Mainnet().ListenPort, "discv4 UDP port (0 = network default, -1 = ephemeral)")
 		runFor     = flag.Duration("run-for", 0, "exit after this duration (0 = run until interrupted)")
 		dialPeers  = flag.Bool("dial", true, "dial discovered peers over RLPx (false = discovery only)")
-		maxDials   = flag.Int("max-concurrent-dials", 4, "concurrent outbound dials")
+		maxDials   = flag.Int("max-concurrent-dials", 4, "concurrent outbound dials (min 1)")
+		maxReady   = flag.Int("max-ready", 8, "cap on live READY sessions; candidates wait until a slot frees")
 		logLevel   = flag.String("loglevel", "info", "log level: info|debug (debug lists each dial failure)")
 		quiet      = flag.Bool("quiet", false, "log only new peers, not the periodic summary")
 	)
@@ -50,13 +51,13 @@ func main() {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
 
-	if err := run(*dataDir, *listenPort, *runFor, *dialPeers, *maxDials, *quiet, log); err != nil {
+	if err := run(*dataDir, *listenPort, *runFor, *dialPeers, *maxDials, *maxReady, *quiet, log); err != nil {
 		log.Error("myotis-go: " + err.Error())
 		os.Exit(1)
 	}
 }
 
-func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, maxDials int, quiet bool, log *slog.Logger) error {
+func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, maxDials, maxReady int, quiet bool, log *slog.Logger) error {
 	netCfg := chain.Mainnet() // the one network for now
 
 	key, err := nodekey.Load(dataDir)
@@ -67,7 +68,19 @@ func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, m
 		"nodeId", fmt.Sprintf("%x", nodekey.NodeID(&key.PublicKey)),
 		"datadir", dataDir)
 
-	dialer := newDialer(key, netCfg, maxDials, log)
+	// What our Hello advertises as our TCP port: the operator's port when
+	// it is a real one, 0 when the socket is ephemeral — never the
+	// network's constant, which is wrong whenever -port moved.
+	advertiseTCP := uint16(0)
+	switch {
+	case listenPort < 0: // ephemeral: nothing to advertise
+	case listenPort == 0:
+		advertiseTCP = uint16(netCfg.ListenPort)
+	default:
+		advertiseTCP = uint16(listenPort)
+	}
+
+	dialer := newDialer(key, netCfg, maxDials, maxReady, advertiseTCP, log)
 	// LIFO matters: register dialer.close BEFORE disc's defer so disc.Close
 	// runs first — discovery must stop firing OnDiscovered before the dialer
 	// queue closes (enqueue's closed-flag is the second belt on that).
@@ -128,11 +141,10 @@ func report(disc *discovery.Service, dialer *dialer, log *slog.Logger) {
 	for src, n := range bySource {
 		peers = append(peers, slog.Any(string(src), n))
 	}
-	ready, attempted, clients, failures := dialer.stats()
+	ready, outcome, clients := dialer.stats()
 	log.Info("summary",
 		"tableNodes", table, "liveNodes", live, "dialablePeers", peers,
-		"readyPeers", ready, "dialsAttempted", attempted, "clients", clients,
-		"dialFailures", failures)
+		"readyPeers", ready, "dialOutcomes", outcome, "everReadyClients", clients)
 }
 
 // dialer dials discovered candidates with bounded concurrency, keeps one
@@ -144,6 +156,11 @@ type dialer struct {
 	network *chain.Network
 	log     *slog.Logger
 
+	// tcpPort is advertised in our Hello (what a peer would dial to reach
+	// us); 0 = ephemeral/no-listen, honest per finding (transport.Config).
+	tcpPort  uint16
+	maxReady int // cap live sessions; the CLI is a demo, not a peer pool
+
 	queue chan *enode.Node
 
 	mu        sync.Mutex
@@ -152,16 +169,27 @@ type dialer struct {
 	ready     map[enode.ID]*transport.Session
 	clients   map[string]int
 	failures  map[string]int // dial-failure reason class → count
+	dropped   int            // candidates discarded with a full queue (retryable)
+	gone      int            // READY sessions evicted after the peer died
 
 	wg        sync.WaitGroup
 	closeOnce sync.Once
 }
 
-func newDialer(key *ecdsa.PrivateKey, netCfg *chain.Network, workers int, log *slog.Logger) *dialer {
+func newDialer(key *ecdsa.PrivateKey, netCfg *chain.Network, workers, maxReady int, tcpPort uint16, log *slog.Logger) *dialer {
+	if workers < 1 {
+		log.Warn("max-concurrent-dials < 1 makes no dials; using 4", "requested", workers)
+		workers = 4
+	}
+	if maxReady < 1 {
+		maxReady = 1
+	}
 	d := &dialer{
 		key:       key,
 		network:   netCfg,
 		log:       log.With("component", "dialer"),
+		tcpPort:   tcpPort,
+		maxReady:  maxReady,
 		queue:     make(chan *enode.Node, 256),
 		attempted: map[enode.ID]bool{},
 		ready:     map[enode.ID]*transport.Session{},
@@ -186,10 +214,19 @@ func (d *dialer) enqueue(n *enode.Node) {
 	if d.closed || d.attempted[n.ID()] {
 		return
 	}
-	d.attempted[n.ID()] = true
+	// At the live-session cap, hold the candidate un-attempted: a slot
+	// frees when a peer dies, and discovery re-fires it.
+	if len(d.ready) >= d.maxReady {
+		return
+	}
 	select {
 	case d.queue <- n:
-	default: // queue full: next candidates will come, discovery keeps firing
+		// Mark attempted only once the candidate is actually queued —
+		// marking before a dropped send made queue-full candidates
+		// permanently un-retryable while still counting as "attempted".
+		d.attempted[n.ID()] = true
+	default:
+		d.dropped++ // queue full; the node stays un-attempted for re-fire
 	}
 }
 
@@ -204,9 +241,10 @@ func (d *dialer) dialOnce(node *enode.Node) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	sess, err := transport.Dial(ctx, transport.Config{
-		LocalKey: d.key,
-		Network:  d.network,
-		Node:     node,
+		LocalKey:         d.key,
+		Network:          d.network,
+		Node:             node,
+		AdvertiseTCPPort: d.tcpPort,
 	})
 	if err != nil {
 		d.mu.Lock()
@@ -222,12 +260,20 @@ func (d *dialer) dialOnce(node *enode.Node) {
 	// keccak256(rlp) == the pin (docs/spec/02 §6.4: peers are checked,
 	// never trusted — this is the first instance of that in the Go engine).
 	headers, err := sess.GetBlockHeadersByHash(d.network.GenesisHash, 1)
-	if err != nil || len(headers) != 1 || crypto.Keccak256Hash(headers[0]) != d.network.GenesisHash {
-		reason := "no header"
-		if err != nil {
-			reason = err.Error()
-		}
-		d.log.Warn("ready peer failed the genesis probe", "id", node.ID().String(), "reason", reason)
+	switch {
+	case err != nil:
+		d.mu.Lock()
+		d.failures["probe-error"]++
+		d.mu.Unlock()
+		d.log.Warn("ready peer failed the genesis probe", "id", node.ID().String(), "reason", err)
+		sess.Close()
+		return
+	case len(headers) != 1 || crypto.Keccak256Hash(headers[0]) != d.network.GenesisHash:
+		d.mu.Lock()
+		d.failures["probe-wrong-header"]++
+		d.mu.Unlock()
+		d.log.Warn("ready peer failed the genesis probe", "id", node.ID().String(),
+			"reason", fmt.Sprintf("got %d header(s), keccak(rlp) %s", len(headers), hashOf(headers)))
 		sess.Close()
 		return
 	}
@@ -237,6 +283,21 @@ func (d *dialer) dialOnce(node *enode.Node) {
 	d.clients[sess.ClientID]++
 	ready := len(d.ready)
 	d.mu.Unlock()
+
+	// Evict promptly when the peer dies (session reader reports it): a
+	// readyPeers count must be live connections, not a census of everyone
+	// who ever said hello (peers ping-timeout-disconnect silent clients,
+	// and even honest ones move on).
+	go func(id enode.ID, s *transport.Session) {
+		<-s.Done()
+		d.mu.Lock()
+		if cur, ok := d.ready[id]; ok && cur == s {
+			delete(d.ready, id)
+			d.gone++
+		}
+		d.mu.Unlock()
+		s.Close()
+	}(node.ID(), sess)
 	snap := "no"
 	if sess.Snap != nil {
 		snap = fmt.Sprintf("snap/%d", *sess.Snap)
@@ -251,6 +312,14 @@ func (d *dialer) dialOnce(node *enode.Node) {
 		"readyPeers", ready)
 }
 
+func hashOf(headers [][]byte) string {
+	if len(headers) == 0 {
+		return "—"
+	}
+	h := crypto.Keccak256Hash(headers[0])
+	return fmt.Sprintf("%x", h[:8])
+}
+
 func peerHeight(s *transport.Session) uint64 {
 	if s.PeerStatus != nil && s.PeerStatus.LatestBlock != nil {
 		return *s.PeerStatus.LatestBlock
@@ -258,16 +327,33 @@ func peerHeight(s *transport.Session) uint64 {
 	return 0 // eth/67-68 Status carries no block number
 }
 
-func (d *dialer) stats() (ready, attempted int, clients, failures []string) {
+func (d *dialer) stats() (ready int, outcome []string, clients []string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for c, n := range d.clients {
 		clients = append(clients, fmt.Sprintf("%s×%d", c, n))
 	}
+	// One accounting line: attempted dials split into live, died, failed,
+	// plus the two non-dial outcomes (queue drops are retryable, so they
+	// intentionally do NOT appear in dialsAttempted).
+	outcome = append(outcome,
+		fmt.Sprintf("attempted=%d", len(d.attempted)),
+		fmt.Sprintf("failed=%d", sum(d.failures)),
+		fmt.Sprintf("died=%d", d.gone),
+		fmt.Sprintf("queueDropped=%d", d.dropped),
+	)
 	for f, n := range d.failures {
-		failures = append(failures, fmt.Sprintf("%s=%d", f, n))
+		outcome = append(outcome, "  "+f+"="+fmt.Sprint(n))
 	}
-	return len(d.ready), len(d.attempted), clients, failures
+	return len(d.ready), outcome, clients
+}
+
+func sum(m map[string]int) int {
+	var t int
+	for _, n := range m {
+		t += n
+	}
+	return t
 }
 
 // classifyDialError buckets dial failures so the summary shows the shape of

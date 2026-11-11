@@ -1,8 +1,8 @@
 // Package transport dials a discovered peer and drives the connection to a
 // READY eth session: the EIP-8 RLPx handshake, the framed channel, the p2p
 // Hello capability negotiation and the eth Status gate (docs/spec/02 §5-§6).
-// Twin of myotis-net's RlpxConnection + EthSession::handshake — dialer-only,
-// like every reference path.
+// Twin of myotis-net's RlpxConnection + EthSession — dialer-only, like every
+// reference path.
 package transport
 
 import (
@@ -31,6 +31,10 @@ var (
 	DefaultDialTimeout      = 10 * time.Second
 	DefaultHandshakeTimeout = 30 * time.Second
 	DefaultRequestTimeout   = 15 * time.Second
+	// pongWriteTimeout bounds a Pong write from the reader goroutine (the
+	// write side is shared with requests; a stuck peer must not stall the
+	// reader).
+	pongWriteTimeout = 5 * time.Second
 )
 
 // Config is one dial: our identity + the pinned network + the candidate.
@@ -43,20 +47,32 @@ type Config struct {
 	HandshakeTimeout time.Duration // 0 → DefaultHandshakeTimeout
 	RequestTimeout   time.Duration // 0 → DefaultRequestTimeout
 
+	// AdvertiseTCPPort is what our Hello names as our TCP port — the port a
+	// peer would dial to reach us. The engine does not listen, so the CLI
+	// passes the operator's configured port when it is a real one and 0
+	// when the socket is ephemeral; never the network's constant, which is
+	// a wrong-on-the-wire value whenever the operator moved off it.
+	AdvertiseTCPPort uint16
+
 	// Rand is the entropy source for the handshake ephemerals; nil →
 	// crypto/rand. Tests inject fixed material.
 	Rand io.Reader
 }
 
-// Session is a READY eth session on one peer connection. Requests are
-// single-flight (one request/response at a time), like the Rust one-shot
-// EthSession; the read side answers pings transparently and ignores gossip.
+// Session is a READY eth session on one peer connection. A background
+// reader owns the ingress: it answers pings (geth drops silent peers on
+// ping-timeout), routes responses to the caller, and signals Done when the
+// connection dies — so a session in a pool never silently rots. Requests
+// are single-flight (one request/response at a time), like the Rust
+// one-shot EthSession.
 type Session struct {
 	conn  net.Conn
 	codec *rlpx.FrameCodec
 
 	writeMu sync.Mutex // serializes all frame writes (keystream is positional)
-	readMu  sync.Mutex // serializes all frame reads (keccak MAC chain too)
+	// readMu only covers the handshake-phase reads that run before the
+	// reader goroutine starts; after READY the reader is the sole reader.
+	readMu sync.Mutex
 
 	requestID atomic.Uint64
 
@@ -68,12 +84,30 @@ type Session struct {
 	PeerStatus *ethwire.Status
 
 	requestTimeout time.Duration
+
+	// Reader → waiters.
+	done      chan struct{} // closed when the connection dies (any cause)
+	closeOnce sync.Once
+	closeErr  error // why it died (nil → local Close); guarded by errMu after close
+	errMu     sync.Mutex
+
+	// flightMu serializes requests (single-flight, one outstanding per
+	// session); reqMu guards only the pending map. They MUST be distinct:
+	// the waiter holds flightMu across its select, and the reader goroutine
+	// needs reqMu to deliver the very response it is waiting for — one lock
+	// for both deadlocks every request.
+	flightMu sync.Mutex
+	reqMu    sync.Mutex                         // guards pending
+	pending  map[uint64]chan *rlpx.DecodedFrame // request id → response
 }
 
-// Dial connects and drives HANDSHAKE → READY. A peer failing the network-id /
-// genesis gate, the fork-id expectation, or any framing check returns an
-// error; the caller drops it and dials the next candidate. Closing the ctx
-// bounds the whole exchange.
+// Dial connects and drives HANDSHAKE → READY. A peer failing the network-id
+// + genesis gate or any framing check returns an error; the caller drops it
+// and dials the next candidate. The fork id flows the other way at this
+// stage (peers validate OUR pinned fork id and drop mismatches, see the
+// chain.Network pin comment); we record the peer's for later use, like the
+// Rust session, but do not gate on it — a peer announcing a newer fork
+// branch is not a protocol violation. Closing the ctx bounds the handshake.
 func Dial(ctx context.Context, cfg Config) (*Session, error) {
 	if cfg.Network == nil || cfg.Node == nil || cfg.LocalKey == nil {
 		return nil, errors.New("transport: incomplete dial config")
@@ -165,12 +199,14 @@ func Dial(ctx context.Context, cfg Config) (*Session, error) {
 		codec:          codec,
 		requestTimeout: orDefault(cfg.RequestTimeout, DefaultRequestTimeout),
 		PeerID:         cfg.Node.ID(),
+		done:           make(chan struct{}),
+		pending:        map[uint64]chan *rlpx.DecodedFrame{},
 	}
 	s.requestID.Store(randomRequestID(randSrc))
 
 	// --- p2p Hello ---
 	localPub64 := crypto.FromECDSAPub(&cfg.LocalKey.PublicKey)[1:]
-	if err := s.send(ethwire.P2PHello, ethwire.EncodeHello(localPub64, uint16(cfg.Network.ListenPort)), deadline); err != nil {
+	if err := s.send(ethwire.P2PHello, ethwire.EncodeHello(localPub64, cfg.AdvertiseTCPPort), deadline); err != nil {
 		return nil, err
 	}
 	first, err := s.recv(deadline)
@@ -204,8 +240,7 @@ func Dial(ctx context.Context, cfg Config) (*Session, error) {
 	var status []byte
 	if ethVersion >= 69 {
 		// We hold no headers yet, so we SERVE only [0,0] (genesis window);
-		// claiming more invites header requests we cannot answer (#694's
-		// lesson, docs/spec/02 §6.4).
+		// claiming more invites header requests we cannot answer.
 		status = ethwire.EncodeStatus69(ethVersion, cfg.Network.NetworkID, genesis, genesis, cfg.Network.ForkIDHash, cfg.Network.ForkNext, 0, 0)
 	} else {
 		// Post-Merge td is empty; a light client may send genesis as best
@@ -225,64 +260,155 @@ func Dial(ctx context.Context, cfg Config) (*Session, error) {
 	}
 	s.PeerStatus = peerStatus
 
-	// Steady state: no handshake-wide deadline; requests set their own.
+	// Steady state: the reader goroutine owns the ingress, with no
+	// deadline; requests set their own write deadlines.
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		return nil, err
 	}
+	go s.readLoop()
 	ok = true
 	return s, nil
 }
 
+// Done closes when the session dies — peer disconnect, read error, or
+// Close. Pool owners select on it to evict dead sessions promptly, so a
+// "READY peers" count reflects live connections, not a historical census.
+func (s *Session) Done() <-chan struct{} { return s.done }
+
+// Err reports why the session died after Done fired ("local close" when we
+// closed it).
+func (s *Session) Err() error {
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	if s.closeErr != nil {
+		return s.closeErr
+	}
+	select {
+	case <-s.done:
+		return errors.New("transport: session closed")
+	default:
+		return nil
+	}
+}
+
+// Close tears down the connection; Done fires and any waiting request
+// unblocks with an error.
+func (s *Session) Close() error {
+	return s.shutdown(errors.New("transport: local close"))
+}
+
+func (s *Session) shutdown(reason error) error {
+	var err error
+	s.closeOnce.Do(func() {
+		s.errMu.Lock()
+		s.closeErr = reason
+		s.errMu.Unlock()
+		err = s.conn.Close()
+		close(s.done)
+	})
+	return err
+}
+
+// readLoop is the steady-state ingress owner: answer pings (silent peers
+// get dropped by geth on ping-timeout), route responses to their
+// single-flight waiter, skip gossip, and end the session on any disconnect
+// or read error.
+func (s *Session) readLoop() {
+	for {
+		frame, err := s.recv(time.Time{})
+		if err != nil {
+			s.shutdown(fmt.Errorf("transport: read: %w", err))
+			return
+		}
+		switch frame.MessageCode {
+		case ethwire.P2PPing:
+			// Pong body is an empty RLP list.
+			if err := s.send(ethwire.P2PPong, []byte{0xc0}, time.Now().Add(pongWriteTimeout)); err != nil {
+				s.shutdown(fmt.Errorf("transport: pong write: %w", err))
+				return
+			}
+		case ethwire.P2PDisconnect:
+			s.shutdown(fmt.Errorf("transport: peer disconnected: %s", ethwire.DescribeDisconnect(frame.Payload)))
+			return
+		default:
+			if id, ok := ethwire.LeadingRequestID(frame.Payload); ok {
+				s.reqMu.Lock()
+				ch, waiting := s.pending[id]
+				s.reqMu.Unlock()
+				if waiting {
+					select {
+					case ch <- frame:
+					default: // waiter already timed out; drop
+					}
+				}
+			}
+			// Gossip (NewPooledTransactionHashes, NewBlock, …) is skipped
+			// — the wallet never serves it (docs/spec/02 §6.5).
+		}
+	}
+}
+
 // GetBlockHeadersByHash requests up to `count` headers starting at hash
-// (fork/genesis probes) and returns their raw RLP. Each header's hash is the
-// caller's to verify against a pin.
+// (fork/genesis probes) and returns their raw RLP. Each header's hash is
+// the caller's to verify against a pin.
 func (s *Session) GetBlockHeadersByHash(origin common.Hash, count uint64) ([][]byte, error) {
 	id := s.requestID.Add(1)
 	return s.getHeaders(id, ethwire.EncodeGetBlockHeadersByHash(id, origin, count, 0, false),
-		fmt.Sprintf("headers by hash %s", origin))
+		int(count), fmt.Sprintf("headers by hash %s", origin))
 }
 
 // GetBlockHeadersByNumber requests `count` ascending headers from origin.
 func (s *Session) GetBlockHeadersByNumber(origin, count uint64) ([][]byte, error) {
 	id := s.requestID.Add(1)
 	return s.getHeaders(id, ethwire.EncodeGetBlockHeadersByNumber(id, origin, count, 0, false),
-		fmt.Sprintf("headers from #%d", origin))
+		int(count), fmt.Sprintf("headers from #%d", origin))
 }
 
-func (s *Session) getHeaders(requestID uint64, req []byte, what string) ([][]byte, error) {
+// getHeaders runs one single-flight request: the reader goroutine delivers
+// the response frame to this call only (matched by request id), or the
+// call times out / the session dies.
+func (s *Session) getHeaders(requestID uint64, req []byte, expect int, what string) ([][]byte, error) {
+	s.flightMu.Lock() // single-flight: one outstanding request per session
+	defer s.flightMu.Unlock()
+
+	ch := make(chan *rlpx.DecodedFrame, 1)
+	s.reqMu.Lock()
+	s.pending[requestID] = ch
+	s.reqMu.Unlock()
+	defer func() {
+		s.reqMu.Lock()
+		delete(s.pending, requestID)
+		s.reqMu.Unlock()
+	}()
+
 	deadline := time.Now().Add(s.requestTimeout)
 	if err := s.send(ethwire.GetBlockHeaders, req, deadline); err != nil {
 		return nil, err
 	}
-	for {
-		frame, err := s.recv(deadline)
-		if err != nil {
-			return nil, fmt.Errorf("transport: awaiting %s: %w", what, err)
-		}
-		switch frame.MessageCode {
-		case ethwire.BlockHeaders:
-			id, headers, err := ethwire.DecodeBlockHeaders(frame.Payload)
-			if err != nil {
-				return nil, err
-			}
-			// Responses are correlated by request id; a foreign id is
-			// another exchange's answer (or a lie) — skip it, like the
-			// Rust await loop, rather than serve it as ours.
-			if id != requestID {
-				continue
-			}
-			return headers, nil
-		case ethwire.P2PDisconnect:
-			return nil, fmt.Errorf("transport: peer disconnected while awaiting %s: %s", what, ethwire.DescribeDisconnect(frame.Payload))
-		default:
-			// Gossip and unrelated messages are skipped — the wallet
-			// never serves them (docs/spec/02 §6.5).
-		}
+	timer := time.NewTimer(s.requestTimeout)
+	defer timer.Stop()
+	var frame *rlpx.DecodedFrame
+	select {
+	case frame = <-ch:
+	case <-s.done:
+		return nil, s.Err()
+	case <-timer.C:
+		return nil, fmt.Errorf("transport: timed out awaiting %s", what)
 	}
+	if frame.MessageCode != ethwire.BlockHeaders {
+		return nil, fmt.Errorf("transport: %s: expected BlockHeaders, got 0x%02x", what, frame.MessageCode)
+	}
+	id, headers, err := ethwire.DecodeBlockHeaders(frame.Payload, expect)
+	if err != nil {
+		return nil, err
+	}
+	// Responses are correlated by request id; a foreign id (we only get
+	// here for our own) or an over-long list is already refused above.
+	if id != requestID {
+		return nil, fmt.Errorf("transport: %s response id %d ≠ requested %d", what, id, requestID)
+	}
+	return headers, nil
 }
-
-// Close tears down the connection.
-func (s *Session) Close() error { return s.conn.Close() }
 
 // send frames and writes one message (serialized: the egress keystream is
 // position-dependent).
@@ -296,10 +422,9 @@ func (s *Session) send(code uint64, payload []byte, deadline time.Time) error {
 	return err
 }
 
-// recv reads and opens exactly one frame.
+// recv reads and opens exactly one frame. deadline is the zero time for
+// "no deadline" (the reader loop); handshake-phase calls pass a real one.
 func (s *Session) recv(deadline time.Time) (*rlpx.DecodedFrame, error) {
-	// Reads never overlap (single caller at a time), so one lock covers the
-	// deadline + the full frame read.
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 	if err := s.conn.SetReadDeadline(deadline); err != nil {

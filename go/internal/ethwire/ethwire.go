@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/biafra23/myotis/go/internal/rlpcode"
+	"github.com/biafra23/myotis/go/internal/rlpx"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/rlp"
 )
@@ -27,10 +28,9 @@ const (
 // Request/Response multiplexing of eth/66+). Only the subset the verified
 // read path needs is named; the rest are decoded-and-skipped.
 const (
-	StatusMsg          uint64 = 0x10
-	GetBlockHeaders    uint64 = 0x13
-	BlockHeaders       uint64 = 0x14
-	BlockRangeUpdate69 uint64 = 0x21
+	StatusMsg       uint64 = 0x10
+	GetBlockHeaders uint64 = 0x13
+	BlockHeaders    uint64 = 0x14
 )
 
 // ClientID is the identity our Hello advertises. The Rust engine derives its
@@ -82,11 +82,9 @@ func EncodeHello(nodePubkey64 []byte, listenPort uint16) []byte {
 	)
 }
 
-// maxControlMsgSize mirrors rlpx.MaxFrame's cap for tree-decoded control
-// messages (#454): a 10 MiB Hello could cost ~0.5 GB to decode, real ones
-// are a few hundred bytes. (Declared here, not imported from rlpx, to keep
-// ethwire free of a transport dependency.)
-const maxControlMsgSize = 16 * 1024
+// maxControlMsgSize is rlpx's cap for tree-decoded control messages (#454),
+// imported so there is ONE constant for it (frame geometry lives in rlpx).
+const maxControlMsgSize = rlpx.MaxControlMsgSize
 
 // DecodeHello parses a peer Hello. Oversized Hellos are refused before their
 // tree is walked.
@@ -342,8 +340,11 @@ func encodeGetHeaders(requestID uint64, origin rlp.RawValue, amount, skip uint64
 
 // DecodeBlockHeaders parses a BlockHeaders (0x14) response:
 // [requestId, [rawHeaderRLP…]], returning the request id and the raw headers.
-// Each header's own hash is the caller's to verify (that is part 4's job).
-func DecodeBlockHeaders(body []byte) (requestID uint64, headers [][]byte, err error) {
+// maxHeaders bounds the item count like the Rust decode_block_headers does:
+// a peer answering a 1-header request with a 10 MiB list is refused before
+// the walk allocates a sub-slice per item. Each header's own hash is the
+// caller's to verify against a pin.
+func DecodeBlockHeaders(body []byte, maxHeaders int) (requestID uint64, headers [][]byte, err error) {
 	items, err := rlpcode.Items(body)
 	if err != nil {
 		return 0, nil, fmt.Errorf("block headers: %w", err)
@@ -354,10 +355,25 @@ func DecodeBlockHeaders(body []byte) (requestID uint64, headers [][]byte, err er
 	if requestID, err = rlpcode.U64(items[0]); err != nil {
 		return 0, nil, fmt.Errorf("block headers: request id: %w", err)
 	}
-	if headers, err = rlpcode.Items(items[1]); err != nil {
+	if headers, err = rlpcode.ItemsBounded(items[1], maxHeaders); err != nil {
 		return 0, nil, fmt.Errorf("block headers: list: %w", err)
 	}
 	return requestID, headers, nil
+}
+
+// LeadingRequestID reads the request id off an eth/66+ response payload
+// ([reqId, …]) without decoding the rest — the background reader routes
+// responses with it. ok=false on anything that is not a response (gossip).
+func LeadingRequestID(payload []byte) (id uint64, ok bool) {
+	items, err := rlpcode.Items(payload)
+	if err != nil || len(items) == 0 {
+		return 0, false
+	}
+	id, err = rlpcode.U64(items[0])
+	if err != nil {
+		return 0, false
+	}
+	return id, true
 }
 
 // DescribeDisconnect renders a Disconnect payload for logs.

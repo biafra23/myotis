@@ -35,6 +35,11 @@ type scriptedPeer struct {
 	networkID  uint64
 	genesis    common.Hash
 	mangle     bool // reply a wrong genesis to exercise the chain gate
+
+	// pongDone closes once the peer has verified our answer to its
+	// post-handshake Ping; the test waits on it so the assertion cannot
+	// race the deferred Close.
+	pongDone chan struct{}
 }
 
 // peerHello hand-builds a Hello advertising only eth/<version> — the wire
@@ -114,9 +119,13 @@ func (p *scriptedPeer) run() {
 	aEph64 := rec[1:] // the initiator's ephemeral pubkey, recovered
 
 	// --- ack ---
+	// (t.Errorf, not t.Fatal: this runs on the acceptor goroutine, and
+	// Fatal from a non-test goroutine only kills that goroutine — turning a
+	// clear failure into a mysterious dial timeout.)
 	bEphSecret, err := crypto.HexToECDSA("e238eb8e04fee6511ab04c6dd3c89ce097b11f25d584863ac2b6d5b35b1847e4")
 	if err != nil {
-		t.Fatal(err)
+		t.Errorf("peer: fixed ephemeral: %v", err)
+		return
 	}
 	var bNonce [32]byte
 	copy(bNonce[:], crypto.Keccak256([]byte("scripted-b-nonce")))
@@ -237,9 +246,40 @@ func (p *scriptedPeer) run() {
 		return
 	}
 	send(ethwire.BlockHeaders, rlpcode.List(reqItems[0], rlpcode.List(rlpcode.Bytes([]byte{0xba, 0xbe}))))
+
+	// Post-handshake, the session's background reader must answer pings —
+	// geth ping-timeout-drops silent clients, so a "READY" session that
+	// ignores Ping is a lie that lasts ~90 s. This phase reads LOUDLY (with
+	// a deadline and reported errors): the silent-teardown path above only
+	// applies while the test's assertions are still ahead. The chain-gate
+	// test runs without a pongDone: its dial fails at the gate, so by now
+	// our side is closed and a Ping would only trip a spurious write error.
+	if p.pongDone == nil {
+		return
+	}
+	defer close(p.pongDone) // any exit path: the test's wait must not hang
+	send(ethwire.P2PPing, []byte{0xc0})
+	p.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	head := make([]byte, 16)
+	if _, err := io.ReadFull(p.conn, head); err != nil {
+		t.Errorf("peer: ping unanswered (read: %v)", err)
+		return
+	}
+	headMac := make([]byte, 16)
+	io.ReadFull(p.conn, headMac)
+	if n, err := codec.DecodeHeader(head, headMac); err == nil {
+		padded := n + (16-n%16)%16
+		enc := make([]byte, padded)
+		io.ReadFull(p.conn, enc)
+		mac := make([]byte, 16)
+		io.ReadFull(p.conn, mac)
+		if f, err := codec.DecodeBody(enc, mac, n); err == nil && f.MessageCode != ethwire.P2PPong {
+			t.Errorf("peer: ping answered with code 0x%02x, want Pong", f.MessageCode)
+		}
+	}
 }
 
-func startScriptedListener(t *testing.T, mangle bool) (addr string, bKey *ecdsa.PrivateKey, cleanup func()) {
+func startScriptedListener(t *testing.T, mangle bool) (addr string, bKey *ecdsa.PrivateKey, pongDone chan struct{}, cleanup func()) {
 	t.Helper()
 	bKey, err := crypto.GenerateKey()
 	if err != nil {
@@ -249,19 +289,24 @@ func startScriptedListener(t *testing.T, mangle bool) (addr string, bKey *ecdsa.
 	if err != nil {
 		t.Fatal(err)
 	}
+	pongDone = make(chan struct{})
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		(&scriptedPeer{
+		peer := &scriptedPeer{
 			t: t, conn: conn, key: bKey,
 			ethVersion: 68, networkID: 1,
 			genesis: chain.Mainnet().GenesisHash,
 			mangle:  mangle,
-		}).run()
+		}
+		if !mangle {
+			peer.pongDone = pongDone
+		}
+		peer.run()
 	}()
-	return ln.Addr().String(), bKey, func() { ln.Close() }
+	return ln.Addr().String(), bKey, pongDone, func() { ln.Close() }
 }
 
 func dialListener(t *testing.T, addr string, bKey *ecdsa.PrivateKey) (*Session, error) {
@@ -284,7 +329,7 @@ func dialListener(t *testing.T, addr string, bKey *ecdsa.PrivateKey) (*Session, 
 }
 
 func TestDialReachesReadyAndFetchesHeaders(t *testing.T) {
-	addr, bKey, lnCleanup := startScriptedListener(t, false)
+	addr, bKey, pongDone, lnCleanup := startScriptedListener(t, false)
 	defer lnCleanup()
 	sess, err := dialListener(t, addr, bKey)
 	if err != nil {
@@ -307,10 +352,19 @@ func TestDialReachesReadyAndFetchesHeaders(t *testing.T) {
 	if len(headers) != 1 || hex.EncodeToString(headers[0]) != "82babe" {
 		t.Fatalf("headers = %x", headers)
 	}
+	// The scripted peer pings after the headers; the session's background
+	// reader must answer with a Pong (the peer asserts it and closes
+	// pongDone either way — a silent close without the answer reads as a
+	// failed assertion on its side).
+	select {
+	case <-pongDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("session never answered the peer's post-handshake ping")
+	}
 }
 
 func TestDialRejectsForeignChain(t *testing.T) {
-	addr, bKey, lnCleanup := startScriptedListener(t, true)
+	addr, bKey, _, lnCleanup := startScriptedListener(t, true)
 	defer lnCleanup()
 	sess, err := dialListener(t, addr, bKey)
 	if err == nil {

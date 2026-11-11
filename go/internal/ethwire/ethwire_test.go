@@ -173,11 +173,18 @@ func TestBlockHeadersRoundTrip(t *testing.T) {
 	// [7, [header]] with one trivial (empty-list) header.
 	header := rlpcode.List()
 	body := rlpcode.List(rlpcode.Uint(7), rlpcode.List(header))
-	id, got, err := DecodeBlockHeaders(body)
+	id, got, err := DecodeBlockHeaders(body, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if id != 7 || len(got) != 1 || !bytes.Equal(got[0], []byte{0xc0}) {
 		t.Fatalf("id=%d headers=%x", id, got)
+	}
+
+	// The Rust-style bound: a 2-item answer to a 1-header request is
+	// refused before the walk allocates per item.
+	over := rlpcode.List(rlpcode.Uint(7), rlpcode.List(header, header))
+	if _, _, err := DecodeBlockHeaders(over, 1); err == nil {
+		t.Fatal("over-long BlockHeaders list must be refused")
 	}
 }
