@@ -19,16 +19,27 @@ Scope, deliberately small (owner's brief, 2026-11-10):
   lookups return better sets. Decision, not accident — see the
   `internal/discovery` package doc.
 
-Build blocks: the heavy, settled plumbing comes from go-ethereum (RLP, RLPx,
-discv4, EIP-1459, secp256k1, and the range-proof verifier for the snap part);
-everything that makes it *Myotis* — the message handling, verification
-policy, anchoring — is this module's own code, guided by `docs/spec/` and
-`rust/` as the reference.
+Build blocks: much of the heavy, settled plumbing comes from go-ethereum
+(RLP, discv4, EIP-1459, secp256k1, and the range-proof verifier for the snap
+part). The **RLPx wire layer is the deliberate exception** (hand-ported,
+PR #767): ECIES, the EIP-8 handshake and the frame codec are this module's
+own code, ported from `myotis-wire` and pinned byte-for-byte to the shared
+cross-language corpus in `rust/testdata/el/rlpx/` — which needs injectable
+entropy and exercises the raw-snappy fallback and the frame caps the
+library's `p2p/rlpx` does not expose. Whether to keep the port or wrap
+`go-ethereum/p2p/rlpx` instead is an open owner decision. Everything that
+makes it *Myotis* — the message handling, verification policy, anchoring —
+is this module's own code, guided by `docs/spec/` and `rust/` as the
+reference.
 
 ## Parts (feature/go-engine)
 
-1. discovery — discv4 + EIP-1459 DNS tree, candidate reporting (`this`)
-2. RLPx + eth handshake — ECIES, framed channel, Status/fork-id
+1. discovery — discv4 + EIP-1459 DNS tree, candidate reporting (PR #757)
+2. RLPx + eth handshake — ECIES, framed channel, Status/fork-id, and the
+   first verified read: a genesis header fetched from READY peers and hashed
+   against the pinned genesis hash (`internal/rlpx`, `internal/ethwire`,
+   `internal/transport`; the codec replays the shared conformance corpus in
+   `rust/testdata/el/rlpx` byte-for-byte)
 3. consensus light client — embedded checkpoint → BLS-verified finality anchors
 4. snap reads — GetAccountRange/GetStorageRanges/GetByteCodes verified against
    the anchor's state root; a `get-account`-style read
@@ -38,8 +49,10 @@ policy, anchoring — is this module's own code, guided by `docs/spec/` and
 
 ```bash
 cd go
-go run ./cmd/myotis-go -datadir ./data          # discover until Ctrl-C
+go run ./cmd/myotis-go -datadir ./data          # discover + dial until Ctrl-C
 go run ./cmd/myotis-go -run-for 90s              # smoke: report after 90s
+go run ./cmd/myotis-go -dial=false               # discovery only
+go run ./cmd/myotis-go -loglevel debug           # per-dial failure detail
 ```
 
 ## Test
