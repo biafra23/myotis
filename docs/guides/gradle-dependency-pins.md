@@ -92,10 +92,13 @@ Some artifacts exist once per **build host**:
 - aapt2's per-OS jar.
 
 A Linux machine never downloads the macOS ones, so it cannot pin them. The
-`gradle pins` workflow (`.github/workflows/gradle-pins.yml`) runs on the four
-hosts that run Gradle in CI: Linux x64, Linux arm64, macOS arm64 and Windows
-x64. They run in that chain order: Linux x64, Windows, Linux arm64, then
-macOS, so the merged file is written by a Unix host. Each host checks the
+`gradle pins` workflow (`.github/workflows/gradle-pins.yml`) runs on the five
+hosts that run Gradle in CI: Linux x64, Linux arm64, macOS arm64, macOS x64
+and Windows x64. A host is the JVM Gradle runs on, not the machine: the Intel
+dmg is built on an Apple Silicon runner by an x86_64 JDK under Rosetta 2, and
+that JDK resolves the `macos-x64` modules, so the chain has a leg that does
+the same. They run in this order: Linux x64, Windows, Linux arm64, macOS x64,
+then macOS arm64, so the merged file is written by a Unix host. Each host checks the
 committed pins, then adds its own entries to the previous host's file. A host
 whose predecessor uploaded nothing uploads nothing either, so a partial
 "merged" file never appears. The last upload, `verification-metadata-merged`,
