@@ -105,6 +105,7 @@ jobs:
       # Say which host this is, from the JVM's side: a JDK of the wrong
       # architecture would walk another host's graph and pin nothing new.
       - name: Check the JVM is the host this job is for
+        id: jvm
         if: ${{ inputs.java_architecture != '' }}
         env:
           WANT: ${{ inputs.java_architecture }}
@@ -204,9 +205,18 @@ jobs:
           name: ${{ inputs.previous }}
           path: gradle
 
+      # Not when this job could not establish the JVM it is for (the guard
+      # above failed, or was skipped because Rosetta or setup-java failed
+      # before it): the walk would then run on the runner's own JDK, add
+      # another host's entries, and hand the next host a file that looks like
+      # this host's contribution. Nothing is uploaded instead, and the chain
+      # stops here, as it does for a missing previous upload.
       - name: Add this host's hashes
         id: contribute
-        if: ${{ !cancelled() && (inputs.previous == '' || steps.previous.outcome == 'success') }}
+        if: >-
+          ${{ !cancelled()
+              && (inputs.java_architecture == '' || steps.jvm.outcome == 'success')
+              && (inputs.previous == '' || steps.previous.outcome == 'success') }}
         run: |
           for attempt in 1 2; do
             # shellcheck disable=SC2086
@@ -240,6 +250,6 @@ jobs:
                  "Once the whole chain has finished, run scripts/update_gradle_pins.sh --from-ci ${{ github.run_id }}, review the hash diff, and commit it."
           fi
           if [ "$CONTRIBUTE" != success ]; then
-            echo "::error::${{ inputs.host }} uploaded no metadata (previous host's upload missing, or the write failed), so this run has no complete merged file."
+            echo "::error::${{ inputs.host }} uploaded no metadata (previous host's upload missing, the JVM is not the one this host is for, or the write failed), so this run has no complete merged file."
           fi
           exit 1
