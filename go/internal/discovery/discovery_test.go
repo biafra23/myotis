@@ -31,7 +31,7 @@ func TestAddCandidateFiltersAndDedups(t *testing.T) {
 
 	good := node(t, "203.0.113.7", 30303, 30303)
 	s.addCandidate(SourceDNS, good)
-	s.addCandidate(SourceDNS, good) // dedup: same id, same endpoint, same rank → no second fire
+	s.addCandidate(SourceDNS, good)    // dedup: same id, same endpoint, same rank → no second fire
 	s.addCandidate(SourceDiscv4, good) // SAME endpoint but a SOURCE UPGRADE → re-fires once:
 	// the consumer needs "the table now proves what DNS only sampled" to
 	// reorder dial priorities; without this it never hears of this node
