@@ -57,7 +57,7 @@ reference.
    `eth2/1.0.0` protocol-version field; 3c builds the LC-server peer
    tier from the protocol lists it already collects), no LCSS
    snapshot persistence yet (cold start re-bootstraps).
-4. snap reads (PR pending) — the state trust anchor and the read path:
+4. snap reads (PR #772) — the state trust anchor and the read path:
    the MPT proof verifier (`internal/mpt`, replaying the shared
    `rust/testdata/el/mpt/` corpus), the snap wire + verify-on-fetch
    (`internal/snapwire`: dynamic codes per negotiated eth version, both
