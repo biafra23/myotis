@@ -716,7 +716,7 @@ asset workflow and a stronger action than the merge this file already forbids.
 
 6. **After the tag: a release is done when its two evidence runs are green.
    MANDATORY to check and report, not a question** (#734). A tag push starts
-   them by itself, next to the nine publishing workflows:
+   them by itself, next to the ten publishing workflows:
    - **`verify release`** waits for the publishers, then checks the finished
      release from the outside (`scripts/verify_release.sh <tag>`): its
      `SHA256SUMS` lists every asset and every hash matches, every asset has a
@@ -743,7 +743,7 @@ built; `actions/attest-build-provenance` attests those files
 (`subject-checksums` from the file the script writes; the job needs
 `id-token: write` and `attestations: write`); and
 `release-assets.sh --checksums <tag>`, last and with `if: ${{ !cancelled() }}`,
-keeps the release's one `SHA256SUMS` complete across the nine publishers. A
+keeps the release's one `SHA256SUMS` complete across the ten publishers. A
 new publisher has all three and joins the list in
 `release-version-guard.yml`'s header. `scripts/test_release_assets.sh` (run by
 CI) fails on a bare upload, or an upload without the checksums step, in any

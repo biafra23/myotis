@@ -219,6 +219,11 @@ check "a release published through the script verifies" \
 check "each asset is verified against the workflow that builds it, at the tag's commit" \
   '[ "$(sort "$STUB_DIR/signers" | tr "\n" " ")" = "owner/repo/.github/workflows/desktop-dmg.yml owner/repo/.github/workflows/desktop-linux-deb.yml " ]'
 
+published; printf '{}' > "$T/in/Myotis-v1-android.cdx.json"; bash $R v1 "$T/in/Myotis-v1-android.cdx.json" > /dev/null; bash $R --checksums v1 > /dev/null
+bash $V v1 > "$STUB_DIR/out" 2>&1; rc=$?
+check "an SBOM is verified against the workflow that generates it" \
+  '[ $rc = 0 ] && grep -qx "owner/repo/.github/workflows/sbom.yml" "$STUB_DIR/signers" && grep -q "3 asset(s) have a build-provenance attestation" "$STUB_DIR/out"'
+
 published; printf x > "$T/in/mystery.bin"; bash $R v1 "$T/in/mystery.bin" > /dev/null; bash $R --checksums v1 > /dev/null
 bash $V v1 > "$STUB_DIR/out" 2>&1; rc=$?
 check "an asset no release workflow is known to publish fails" '[ $rc = 1 ] && grep -q "no workflow is known to publish mystery.bin" "$STUB_DIR/out"'

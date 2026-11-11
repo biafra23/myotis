@@ -1,6 +1,6 @@
 # Verify a release's evidence about its own assets (#734, Part 5c).
 #
-# Nine workflows publish to a `v*` tag's release, with no ordering between
+# Ten workflows publish to a `v*` tag's release, with no ordering between
 # them. Each uploads through .github/release-assets.sh (which keeps the
 # release's SHA256SUMS complete) and attests what it uploaded. This workflow is
 # the check from the OUTSIDE, on the finished release, the way a user would:

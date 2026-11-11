@@ -19,7 +19,8 @@
 #      repository; the tag's own ref; the COMMIT the tag points at (a tag that
 #      was moved leaves assets of its earlier commit behind, under the same ref
 #      name); and the workflow that is supposed to build that asset (the APKs
-#      android-apk.yml, the debs desktop-linux-deb.yml, and so on). An asset
+#      android-apk.yml, the debs desktop-linux-deb.yml, the SBOMs sbom.yml, and
+#      so on). An asset
 #      uploaded from another ref (a workflow dispatched on a branch, onto an
 #      existing release) fails here: that is the point.
 #   3. The signed release APK is the unsigned one plus its signature and
@@ -119,6 +120,7 @@ workflow_of() {
     MyotisKit.xcframework.zip|MyotisKit.xcframework.zip.sha256) echo ios-framework.yml ;;
     MyotisEngine.xcframework.zip|MyotisEngine.xcframework.zip.sha256) echo ios-xcframework.yml ;;
     myotis-node.*) echo node-binding.yml ;;
+    Myotis-*.cdx.json) echo sbom.yml ;;
     *.jar) echo ci.yml ;;
     *) return 1 ;;
   esac
