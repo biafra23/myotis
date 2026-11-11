@@ -134,8 +134,10 @@ func acceptedForDial(n *enode.Node, want [4]byte) bool {
 	return ok
 }
 
-// parseMultiaddr / peerAddrInfo are thin seams (used by cmd and tests)
-// so callers never hand-roll multiaddr parsing errors.
+// parseMultiaddr / peerAddrInfo are the single multiaddr→peer parse
+// path: NewSyncer seeds the static peers through them and the
+// "every static peer parses" test covers that same code, so no
+// hand-rolled parsing (or second seam) exists beside it.
 func parseMultiaddr(s string) (ma.Multiaddr, error) { return ma.NewMultiaddr(s) }
 
 func peerAddrInfo(a ma.Multiaddr) (peer.AddrInfo, error) {

@@ -64,7 +64,9 @@ func TestFullDuplexAnswer(t *testing.T) {
 		t.Fatalf("ping reply: %v %x", err, res.Payload)
 	}
 
-	// Metadata v2: 17 zero bytes (no subscriptions), framed.
+	// Metadata v2: 17 zero bytes (no subscriptions), framed. Its
+	// expected size is 0 — the body is not parsed at all — so an empty
+	// request (whatever framing) must be answered, not reset.
 	raw, err = Request(ctx, cli, peer.AddrInfo{ID: srv.ID()}, clwire.MetadataV2,
 		clwire.EncodeRequest(nil), respTimeout)
 	if err != nil {
@@ -75,4 +77,27 @@ func TestFullDuplexAnswer(t *testing.T) {
 		t.Fatalf("metadata reply: %v len=%d", err, len(res.Payload))
 	}
 
+	// Goodbye: answered with the echoed reason (8 bytes), not an empty
+	// stream — the Rust twin's responder contract (reqresp.rs:2114).
+	raw, err = Request(ctx, cli, peer.AddrInfo{ID: srv.ID()}, clwire.Goodbye,
+		clwire.EncodeRequest([]byte{1, 0, 0, 0, 0, 0, 0, 0}), respTimeout)
+	if err != nil {
+		t.Fatalf("goodbye: %v", err)
+	}
+	res, err = clwire.DecodeResponse(raw, false)
+	if err != nil || len(res.Payload) != 8 || res.Payload[0] != 1 {
+		t.Fatalf("goodbye reply: %v %x", err, res.Payload)
+	}
+
+	// A ping whose declared size misses the pinned 8 bytes gets an
+	// InvalidRequest error chunk, not a silent reset.
+	bad := clwire.EncodeRequest([]byte{7, 7}) // declares 2, ping wants 8
+	raw, err = Request(ctx, cli, peer.AddrInfo{ID: srv.ID()}, clwire.Ping, bad, respTimeout)
+	if err != nil {
+		t.Fatalf("bad ping: %v", err)
+	}
+	res, err = clwire.DecodeResponse(raw, false)
+	if err == nil || res.ResultCode != clwire.ResultInvalidRequest {
+		t.Fatalf("bad ping: want InvalidRequest chunk, got %+v (%v)", res, err)
+	}
 }

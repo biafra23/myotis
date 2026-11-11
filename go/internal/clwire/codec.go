@@ -52,6 +52,13 @@ const (
 // a 16 MiB max-ratio snappy frame buys an attacker).
 const MaxUncompressedPayload = 10 * 1024 * 1024
 
+// MaxUpdatesByRange is MAX_REQUEST_LIGHT_CLIENT_UPDATES: the batch cap
+// servers honor on updates_by_range. One definition, used by the
+// catch-up loop's per-ask cap and the CLI's probe-range validation —
+// a spec bump must move both together or a truncating server reads as
+// a wiring bug.
+const MaxUpdatesByRange = 128
+
 var ErrCodec = errors.New("clwire: codec error")
 
 // WriteVarint appends a protobuf-style unsigned varint; 0 is one 0x00
@@ -206,6 +213,60 @@ func DecodeResponse(raw []byte, hasContext bool) (DecodeResult, error) {
 	return res, nil
 }
 
+// ParseRequestSsz decodes an inbound request body: varint(len) ||
+// snappy_frames → ssz bytes. Library-side on purpose (mirrors
+// parse_request_ssz, codec.rs:156): this is the exact code the live
+// responder runs, so the Java golden vectors pin it, not a test-local
+// copy. The Rust twin rejects the bare 0x00 (codec.rs:730) — with the
+// expected-size table below, an empty-body protocol is never parsed at
+// all, so no accepted path depends on 0x00 leniency.
+func ParseRequestSsz(raw []byte) ([]byte, error) {
+	return ParseRequestSszExpecting(raw, 0)
+}
+
+// ParseRequestSszExpecting is ParseRequestSsz refusing a declared
+// length that does not match what the protocol's request is defined to
+// be, BEFORE decompressing (parse_request_ssz_expecting, codec.rs:169):
+// without it a 1 KB frame declaring 10 MiB buys a 10 MiB allocation
+// per request — free amplification against a public responder. The
+// comparison happens at u64 width, before any narrowing. expected==0
+// means "no pin".
+func ParseRequestSszExpecting(raw []byte, expected uint64) ([]byte, error) {
+	if len(raw) < 2 {
+		return nil, ErrCodec
+	}
+	declared, snappyStart, err := ReadVarint(raw, 0)
+	if err != nil || declared == 0 || snappyStart >= len(raw) {
+		return nil, ErrCodec
+	}
+	if expected != 0 && declared != expected {
+		return nil, ErrCodec
+	}
+	return DecompressFramed(raw[snappyStart:], int(declared))
+}
+
+// ExpectedRequestSize is the exact request-body size per served
+// protocol (expected_request_size, protocols.rs:84-93 — the same table
+// the Java registerBinding calls pin): 0 means the body is not parsed
+// at all, either because the request has none (metadata) or the answer
+// does not depend on it.
+func ExpectedRequestSize(proto string) uint64 {
+	switch proto {
+	case StatusV2:
+		return 92
+	case StatusV1:
+		return 84
+	case Ping, Goodbye:
+		return 8
+	case Bootstrap:
+		return 32
+	case UpdatesByRange:
+		return 16
+	default: // metadata, finality_update, optimistic_update
+		return 0
+	}
+}
+
 // decodeErrorChunkMessage best-effort decodes an error chunk's message
 // at raw[start:]: varint(len) || snappy(msg), falling back to raw UTF-8
 // when the snappy frame is missing or corrupt. The eth2 spec caps error
@@ -224,9 +285,19 @@ func decodeErrorChunkMessage(raw []byte, start int) string {
 		if msg, err := DecompressFramed(raw[msgStart:], bound); err == nil {
 			return strings.TrimSpace(string(msg))
 		}
-		return "[raw] " + strings.TrimSpace(string(raw[msgStart:]))
 	}
-	return ""
+	// The [raw] fallback fires for corrupt framing AND for a declared
+	// 0 with leftover bytes — Rust surfaces "ServerError — [raw] …"
+	// there too, and "answered ServerError" vs "sent bytes that do not
+	// decode" is the census-grade distinction this function exists for.
+	return "[raw] " + strings.TrimSpace(string(raw[msgStart:]))
+}
+
+// EncodeErrorResponse builds an error response chunk: result ||
+// varint(len) || snappy(msg), no context bytes (error chunks never
+// carry them). Mirrors encode_error_response (codec.rs).
+func EncodeErrorResponse(result uint8, msg string) []byte {
+	return append([]byte{result}, EncodeRequest([]byte(msg))...)
 }
 
 // EncodeSuccessResponse builds a response chunk (the responder half —

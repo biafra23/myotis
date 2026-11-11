@@ -13,7 +13,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
-	ma "github.com/multiformats/go-multiaddr"
 )
 
 // ErrStaleAnchor is the weak-subjectivity start gate (docs/spec/01
@@ -61,12 +60,36 @@ func NewSyncer(c *chain.Consensus, h host.Host, logf func(string, ...any)) *Sync
 	if s.Logf == nil {
 		s.Logf = func(string, ...any) {}
 	}
+	// A connection that dies silently (idle drop, peer close not yet
+	// observed — nothing keep-alives us with identify off) must never
+	// be treated as "already statused": the next Request would re-dial
+	// internally and send light-client requests over a brand-new
+	// connection without the mandatory Status. Clearing the flag on
+	// Disconnected is the event-driven half of the Rust twin's
+	// per-ConnectionEstablished Status (reqresp.rs:1680-1688); the
+	// other half is ensureStatus re-exchanging whenever Connectedness
+	// says not-connected.
+	h.Network().Notify(&network.NotifyBundle{
+		DisconnectedF: func(_ network.Network, conn network.Conn) {
+			s.peersMu.Lock()
+			if p, ok := s.peers[conn.RemotePeer()]; ok {
+				p.statused = false
+			}
+			s.peersMu.Unlock()
+		},
+	})
 	for _, m := range MainnetStaticPeers {
-		pi, err := peer.AddrInfoFromP2pAddr(maMust(m))
+		a, err := parseMultiaddr(m)
 		if err != nil {
+			s.Logf("static peer %s: unparseable multiaddr: %v", m, err)
 			continue
 		}
-		s.AddPeer(*pi)
+		pi, err := peerAddrInfo(a)
+		if err != nil {
+			s.Logf("static peer %s: %v", m, err)
+			continue
+		}
+		s.AddPeer(pi)
 	}
 	return s
 }
@@ -145,10 +168,17 @@ func (s *Syncer) LocalStatus() *clwire.StatusMessage {
 // the same policy this repo's own servers apply. The exchange also
 // refreshes the peer's earliest_available_slot.
 func (s *Syncer) ensureStatus(ctx context.Context, p *peerState) error {
-	if s.H.Network().Connectedness(p.info.ID) == network.Connected && p.statused {
+	s.peersMu.Lock()
+	fresh := s.H.Network().Connectedness(p.info.ID) == network.Connected && p.statused
+	s.peersMu.Unlock()
+	if fresh {
 		return nil
 	}
+	// The exchange runs OUTSIDE the lock (network I/O); the Disconnected
+	// notifiee may fire across it and is idempotent with this writer.
 	st, err := ExchangeStatus(ctx, s.H, p.info, s.LocalStatus())
+	s.peersMu.Lock()
+	defer s.peersMu.Unlock()
 	if err != nil {
 		p.statused = false
 		return err
@@ -156,6 +186,14 @@ func (s *Syncer) ensureStatus(ctx context.Context, p *peerState) error {
 	p.earliest = st.EarliestAvailableSlot
 	p.statused = true
 	return nil
+}
+
+// markNotStatused forces the next ensureStatus to re-exchange (used
+// before bootstrap, where every peer is treated as fresh).
+func (s *Syncer) markNotStatused(p *peerState) {
+	s.peersMu.Lock()
+	p.statused = false
+	s.peersMu.Unlock()
 }
 
 // checkStartGate is weak-subjectivity layer 1: refuse a cold start
@@ -187,7 +225,7 @@ func (s *Syncer) RunBootstrap(ctx context.Context) (*lc.Store, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		p.statused = false
+		s.markNotStatused(p)
 		if err := s.ensureStatus(ctx, p); err != nil {
 			s.Logf("bootstrap: status with %s failed: %v", p.info.ID, err)
 			lastErr = err
@@ -237,18 +275,24 @@ func (s *Syncer) RunBootstrap(ctx context.Context) (*lc.Store, error) {
 // skipped still serves the round-robin pick rather than stalling — the
 // skip is a preference, as in the Rust candidate tiering (#291).
 func (s *Syncer) pickPeer(round int, startPeriod uint64) (*peerState, bool) {
-	peers := s.peerList()
-	if len(peers) == 0 {
+	// One lock = one snapshot: indexing and the earliest reads all see
+	// the same world (the pre-fix version took a snapshot, released the
+	// lock, and could panic or read a torn list; the earliest reads also
+	// race the Disconnected notifiee otherwise).
+	s.peersMu.Lock()
+	defer s.peersMu.Unlock()
+	n := len(s.order)
+	if n == 0 {
 		return nil, false
 	}
 	startSlot := startPeriod * chain.SlotsPerSyncCommitteePeriod
-	for i := range peers {
-		p := peers[(round+i)%len(peers)]
+	for i := range n {
+		p := s.peers[s.order[(round+i)%n]]
 		if p.earliest == 0 || p.earliest <= startSlot {
 			return p, true
 		}
 	}
-	return peers[round%len(peers)], false
+	return s.peers[s.order[round%n]], false
 }
 
 // RunCatchUp walks periods forward with updates_by_range until the
@@ -269,7 +313,7 @@ func (s *Syncer) RunCatchUp(ctx context.Context, store *lc.Store) error {
 			return fmt.Errorf("clsync: catch-up stalled at period %d (wall %d)", store.Period(), wallPeriod)
 		}
 		start := store.Period() + 1
-		count := min(wallPeriod-store.Period(), 128)
+		count := min(wallPeriod-store.Period(), clwire.MaxUpdatesByRange)
 		p, served := s.pickPeer(round, start)
 		if p == nil {
 			return errors.New("clsync: catch-up has no peers")
@@ -357,16 +401,6 @@ func (s *Syncer) PollFinality(ctx context.Context, store *lc.Store) (lc.Finality
 		return outcome, nil
 	}
 	return lc.Rejected, lastErr
-}
-
-// maMust parses a multiaddr literal (all ours are constants checked at
-// package init by the tests).
-func maMust(s string) ma.Multiaddr {
-	a, err := ma.NewMultiaddr(s)
-	if err != nil {
-		panic(err)
-	}
-	return a
 }
 
 // ProbeUpdates asks every known peer for the last n periods of

@@ -32,9 +32,10 @@ func main() {
 	probeRange := flag.Int("probe-range", 0, "after catch-up, ask peers for the last N periods of updates (wire probe)")
 	flag.Parse()
 	// Validate BEFORE any uint64 conversion: a negative would wrap to
-	// ~1.8e19 and a huge N exceeds the batch cap servers honor anyway.
-	if *probeRange < 0 || *probeRange > 128 {
-		log.Fatalf("-probe-range must be in [0, 128], got %d", *probeRange)
+	// ~1.8e19 and anything above the batch cap reads as a truncating
+	// server instead of a wiring bug.
+	if *probeRange < 0 || *probeRange > clwire.MaxUpdatesByRange {
+		log.Fatalf("-probe-range must be in [0, %d], got %d", clwire.MaxUpdatesByRange, *probeRange)
 	}
 
 	logger := log.New(os.Stderr, "", log.Ltime)

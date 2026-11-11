@@ -3,6 +3,7 @@ package clwire
 import (
 	"bytes"
 	"encoding/hex"
+	"strings"
 	"testing"
 
 	"github.com/biafra23/myotis/go/internal/chain"
@@ -24,14 +25,18 @@ func mustHex(t *testing.T, s string) []byte {
 // for compressible input, so our own encoder is pinned to round-trip,
 // not to byte-equality (the Rust twin makes exactly this split).
 func TestJavaGoldenRequestVectors(t *testing.T) {
+	// The vectors run through ParseRequestSszExpecting — the PRODUCTION
+	// responder decoder (host.go ServeInstall runs the same function),
+	// exactly as the Rust golden runs parse_request_ssz. A test-local
+	// copy would let the pinned decoder and the live one drift.
 	root := bytes.Repeat([]byte{0x11}, 32)
-	got, err := ParseRequest(mustHex(t, "20ff060000734e61507059000a00000eb49f4d2000117a0100"), 32)
+	got, err := ParseRequestSszExpecting(mustHex(t, "20ff060000734e61507059000a00000eb49f4d2000117a0100"), 32)
 	if err != nil || !bytes.Equal(got, root) {
 		t.Fatalf("32x0x11 root frame: %x, %v", got, err)
 	}
 
 	rangeSSZ := append(le64(1777), le64(16)...)
-	got, err = ParseRequest(mustHex(t, "10ff060000734e6150705901140000de50a893f1060000000000001000000000000000"), 16)
+	got, err = ParseRequestSszExpecting(mustHex(t, "10ff060000734e6150705901140000de50a893f1060000000000001000000000000000"), 16)
 	if err != nil || !bytes.Equal(got, rangeSSZ) {
 		t.Fatalf("updates_by_range(1777,16) frame: %x, %v", got, err)
 	}
@@ -41,41 +46,65 @@ func TestJavaGoldenRequestVectors(t *testing.T) {
 		statusSSZ[i] = byte(i)
 	}
 	javaStatus := append(mustHex(t, "5cff060000734e6150705901600000cf4ded1a"), statusSSZ...)
-	got, err = ParseRequest(javaStatus, 92)
+	got, err = ParseRequestSszExpecting(javaStatus, 92)
 	if err != nil || !bytes.Equal(got, statusSSZ) {
 		t.Fatalf("92-byte status frame: %x, %v", got, err)
 	}
 
 	// Our own encoder: round-trips through the Java-decodable framing.
 	for _, payload := range [][]byte{root, rangeSSZ, statusSSZ, bytes.Repeat([]byte{0xAB}, 25000)} {
-		back, err := ParseRequest(EncodeRequest(payload), len(payload))
+		back, err := ParseRequestSszExpecting(EncodeRequest(payload), uint64(len(payload)))
 		if err != nil || !bytes.Equal(back, payload) {
 			t.Fatalf("round-trip %d bytes: %v", len(payload), err)
 		}
 	}
-	// Empty request is the single byte 0x00, like the Java twin.
+	// Empty request is the single byte 0x00, like the Java twin — and
+	// the decoder REJECTS it (codec.rs:730 pins the same): a protocol
+	// with no request body is answered without parsing at all (see
+	// ExpectedRequestSize), so no accepted path relies on 0x00 leniency.
 	if enc := EncodeRequest(nil); len(enc) != 1 || enc[0] != 0x00 {
 		t.Fatalf("empty request = %x, want 00", enc)
 	}
+	if _, err := ParseRequestSsz(nil); err == nil {
+		t.Fatal("empty raw request must be refused")
+	}
+	if _, err := ParseRequestSsz([]byte{0x00}); err == nil {
+		t.Fatal("bare 0x00 must be refused by the decoder, like the Rust twin")
+	}
+	// A declared length that does not match the protocol's request is
+	// refused BEFORE decompression (the anti-amplification pre-check).
+	if _, err := ParseRequestSszExpecting(EncodeRequest(root), 16); err == nil {
+		t.Fatal("wrong declared length accepted despite expected-size pin")
+	}
 }
 
-// ParseRequest decodes an inbound request body: varint(len) || frames,
-// with the expected-length pre-check (the responder-side anti-amplification).
-func ParseRequest(raw []byte, expected int) ([]byte, error) {
-	if len(raw) < 2 {
-		return nil, ErrCodec
+// TestExpectedRequestSizeTable pins the per-protocol request sizes the
+// responder pre-checks (expected_request_size, protocols.rs:84-93 —
+// the same table the Java registerBinding calls pin).
+func TestExpectedRequestSizeTable(t *testing.T) {
+	want := map[string]uint64{
+		StatusV2: 92, StatusV1: 84, Ping: 8, Goodbye: 8,
+		Bootstrap: 32, UpdatesByRange: 16,
+		MetadataV2: 0, MetadataV3: 0, FinalityUpdate: 0, OptimisticUpdate: 0,
 	}
-	declared, snappyStart, err := ReadVarint(raw, 0)
-	if err != nil {
-		return nil, err
+	for proto, w := range want {
+		if got := ExpectedRequestSize(proto); got != w {
+			t.Fatalf("ExpectedRequestSize(%s) = %d, want %d", proto, got, w)
+		}
 	}
-	if declared == 0 || snappyStart >= len(raw) {
-		return nil, ErrCodec
+}
+
+// TestErrorResponseRoundTrip pins that a response we produce as a
+// server decodes, on the client side, as the same error class and
+// message a real peer's chunk surfaces (the census distinction the
+// decoder exists for).
+func TestErrorResponseRoundTrip(t *testing.T) {
+	wire := EncodeErrorResponse(ResultInvalidRequest, "InvalidRequest: unparseable body")
+	_, err := DecodeResponse(wire, false)
+	if err == nil || !strings.Contains(err.Error(), "InvalidRequest") ||
+		!strings.Contains(err.Error(), "unparseable body") {
+		t.Fatalf("error response round-trip: %v", err)
 	}
-	if expected >= 0 && declared != uint64(expected) {
-		return nil, ErrCodec
-	}
-	return DecompressFramed(raw[snappyStart:], int(declared))
 }
 
 func le64(v uint64) []byte {

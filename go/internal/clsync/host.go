@@ -84,8 +84,17 @@ func InstallGossipSubHold(h host.Host) {
 // instead of a protocol rejection, which Lighthouse scores against us.
 // statusFunc supplies our live Status (digest of the wall clock,
 // finalized header from the store); nil answers with nothing (close).
+//
+// The request body is handled per the Rust twin's table
+// (respond_inbound, reqresp.rs:2061-2075): a protocol whose expected
+// size is 0 (metadata) has its body NOT parsed at all — which is also
+// why an empty request never trips us, whatever framing the peer chose
+// — and a body that fails the pinned-size decode is answered with an
+// InvalidRequest error chunk, not a silent stream reset (a reset is
+// the "answered nothing" signal we ourselves treat as failure).
 func ServeInstall(h host.Host, statusFunc func() *clwire.StatusMessage) {
 	answer := func(proto string, handler func(req []byte) []byte) {
+		expected := clwire.ExpectedRequestSize(proto)
 		h.SetStreamHandler(protocol.ID(proto), func(s network.Stream) {
 			defer s.Reset()
 			_ = s.SetDeadline(time.Now().Add(respTimeout))
@@ -93,9 +102,15 @@ func ServeInstall(h host.Host, statusFunc func() *clwire.StatusMessage) {
 			if err != nil {
 				return
 			}
-			ssz, err := parseRequestSsz(req)
-			if err != nil {
-				return
+			var ssz []byte
+			if expected > 0 {
+				ssz, err = clwire.ParseRequestSszExpecting(req, expected)
+				if err != nil {
+					_, _ = s.Write(clwire.EncodeErrorResponse(clwire.ResultInvalidRequest,
+						"InvalidRequest: unparseable body"))
+					_ = s.Close()
+					return
+				}
 			}
 			if resp := handler(ssz); resp != nil {
 				// status/ping/metadata responses carry NO context bytes.
@@ -132,29 +147,17 @@ func ServeInstall(h host.Host, statusFunc func() *clwire.StatusMessage) {
 		// Lighthouse insists on (status.rs:93-108).
 		return append(clwire.MetadataV2LightClient(), 4, 0, 0, 0, 0, 0, 0, 0)
 	})
-	answer(clwire.Goodbye, func([]byte) []byte { return nil })
-}
-
-// parseRequestSsz decodes an inbound request body (varint || frames)
-// with no expected-length pin (we answer several protocols here). A
-// bare 0x00 is the ENCODING of an empty request (varint(0), no snappy
-// data — metadata/ping carry none), not a malformed one: rejecting it
-// stream-reset us in the eyes of any peer that asks politely.
-func parseRequestSsz(raw []byte) ([]byte, error) {
-	if len(raw) == 0 {
-		return nil, clwire.ErrCodec
-	}
-	if len(raw) == 1 && raw[0] == 0x00 {
-		return nil, nil
-	}
-	if len(raw) < 2 {
-		return nil, clwire.ErrCodec
-	}
-	declared, start, err := clwire.ReadVarint(raw, 0)
-	if err != nil || declared == 0 || start >= len(raw) {
-		return nil, clwire.ErrCodec
-	}
-	return clwire.DecompressFramed(raw[start:], int(declared))
+	// Goodbye: the request_response machinery expects a response, and
+	// the Rust twin answers by echoing the reason (reqresp.rs:2114-2124,
+	// "the caller of this function disconnects the peer"). Answering
+	// with nothing is the same "answered nothing" a reset would be.
+	answer(clwire.Goodbye, func(req []byte) []byte {
+		body := make([]byte, 8)
+		if len(req) == 8 {
+			copy(body, req)
+		}
+		return body
+	})
 }
 
 // ExchangeStatus performs the mandatory first Status exchange on a
@@ -227,7 +230,15 @@ func Request(ctx context.Context, h host.Host, info peer.AddrInfo, proto string,
 	if err := s.CloseWrite(); err != nil {
 		return nil, err
 	}
-	return readAllCapped(s, maxResponseBytes)
+	out, err := readAllCapped(s, maxResponseBytes)
+	if err != nil {
+		return nil, err
+	}
+	// Close cleanly on success — a fully-served request must not end in
+	// an RST_STREAM (the deferred Reset is the failure path only; the
+	// responder half of this very file has always closed properly).
+	_ = s.Close()
+	return out, nil
 }
 
 func readAllCapped(r io.Reader, cap int) ([]byte, error) {
