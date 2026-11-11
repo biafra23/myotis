@@ -42,6 +42,7 @@
 //! | `EEZ_DEPTHS` | comma-separated depths below the head for the serving-window sweep; empty = skip |
 //! | `EEZ_RETRY_PAUSE_SECS` | pause before a second connection (default 30) |
 //! | `CRAWL_SECS` | > 0: afterwards crawl discv4 from this peer alone and probe what it finds (default 0) |
+//! | `EEZ_CRAWL_ONLY` | set: skip the probe — no TCP connection to the target — and only crawl (needs `CRAWL_SECS`) |
 
 use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
@@ -54,6 +55,7 @@ use myotis_core::nodekey::NodeKey;
 use myotis_core::rlp;
 use myotis_core::trie::{AccountLeaf, EMPTY_CODE_HASH, EMPTY_TRIE_ROOT};
 use myotis_net::el::discv4::{Discv4Config, Discv4Service, TableEntry};
+use myotis_net::el::enrfilter::ForkFilter;
 use myotis_net::el::eth::messages::{self as eth, VerifiedHeader};
 use myotis_net::el::eth::session::{EthConfig, EthSession};
 use myotis_net::el::rlpx::transport::RlpxConnection;
@@ -129,6 +131,7 @@ struct Knobs {
     depths: Vec<u64>,
     retry_pause: Duration,
     crawl_secs: u64,
+    crawl_only: bool,
 }
 
 impl Knobs {
@@ -210,6 +213,7 @@ impl Knobs {
             depths,
             retry_pause: Duration::from_secs(num("EEZ_RETRY_PAUSE_SECS", 30)?),
             crawl_secs: num("CRAWL_SECS", 0)?,
+            crawl_only: var("EEZ_CRAWL_ONLY").is_some(),
         })
     }
 
@@ -311,6 +315,17 @@ async fn main() -> ExitCode {
         knobs.network_id,
         hex(&knobs.genesis)
     );
+
+    if knobs.crawl_only {
+        if knobs.crawl_secs == 0 {
+            eprintln!("eez_probe: EEZ_CRAWL_ONLY needs CRAWL_SECS > 0");
+            return ExitCode::from(2);
+        }
+        println!("\nEEZ_CRAWL_ONLY: no probe, no TCP connection to the target");
+        crawl(&key, &knobs).await;
+        println!("\n=== CRAWL ONLY ===");
+        return ExitCode::SUCCESS;
+    }
 
     let failed = (false, None);
     let (ok, skipped) = match probe_once(&key, &knobs).await {
@@ -993,8 +1008,9 @@ struct CrawlReport {
 }
 
 /// Can more nodes of this chain be found? A discv4 crawl seeded with ONLY the
-/// target, handshaking every other node it yields with the same Status and
-/// asking each for the account at its own head (unanchored, as above).
+/// target, handshaking every other node it yields — less those whose ENR puts
+/// them on another chain — with the same Status and asking each for the
+/// account at its own head (unanchored, as above).
 async fn crawl(key: &Arc<NodeKey>, knobs: &Knobs) {
     println!(
         "\n--- discv4 crawl from {} (UDP) alone, {} s ---",
@@ -1006,6 +1022,11 @@ async fn crawl(key: &Arc<NodeKey>, knobs: &Knobs) {
         Discv4Config {
             bind_port: 0,
             bootnodes: vec![knobs.discv4_addr],
+            // The seed sits in a public discv4 table, most of it other chains.
+            // The ENR pre-filter production uses (#539) drops a node whose ENR
+            // names another chain's fork id before it is dialled; one with no
+            // readable `eth` entry is still dialled and judged by its Status.
+            fork_filter: Some(ForkFilter::for_chain(knobs.fork_hash, knobs.fork_next)),
             ..Default::default()
         },
         tx,
@@ -1092,7 +1113,7 @@ async fn crawl(key: &Arc<NodeKey>, knobs: &Knobs) {
         .count();
     let serve = reports.iter().filter(|r| r.serves).count();
     println!(
-        "discv4 entries: {entries}; other nodes dialled: {}; on networkId {}: {on_chain}; of those sharing a snap version: {offer}, serving a verified proof: {serve}",
+        "discv4 entries past the ENR fork-id filter: {entries}; other nodes dialled: {}; on networkId {}: {on_chain}; of those sharing a snap version: {offer}, serving a verified proof: {serve}",
         reports.len(),
         knobs.network_id
     );
