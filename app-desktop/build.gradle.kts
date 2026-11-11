@@ -114,6 +114,11 @@ dependencies {
 // so wire the JUnit platform here like :app does.
 tasks.withType<Test> {
     useJUnitPlatform()
+    // Skips as well as failures: several cases here stand down on an assumption
+    // (macOS only; a file mode root can read through), and Gradle's default
+    // prints failed tests only, so a case that stopped running in CI (a job
+    // moved into a container, say) would leave no trace in a green log.
+    testLogging { events("failed", "skipped") }
 }
 
 // Headless check that the Desktop controller drives node-core (no display needed).
