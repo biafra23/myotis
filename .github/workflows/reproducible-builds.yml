@@ -45,15 +45,18 @@
 # assets` (the `published` job) waits for the release's Android assets and
 # compares leg a with them. Reported, not gated, like leg r.
 #
-# WHAT FAILS THE RUN (owner's decision, 2026-11-10: Android first): the Android
-# artifacts — the APKs (android/) and the engine library (maven-repo/: the AAR,
-# its jars, natives jars and metadata) — in `Compare linux` (a against b), and
-# a missing leg a or b. Everything
-# else is built twice, compared and REPORTED in the same way, marked "(not
-# gated)", and does not fail yet: the Linux .deb and host libraries, and all of
-# macOS/iOS and Windows. The first runs found them close but not there (the
-# desktop installers' payload, the macOS dylibs and the MyotisKit binaries);
-# they join the gate in a later part of #734, one `--gate` at a time below.
+# WHAT FAILS THE RUN (owner's decisions: Android first, 2026-11-10; everything
+# the two legs build, 2026-11-11): any difference between legs a and b, on
+# every platform, and a missing leg a or b. `Compare linux`: the APKs
+# (android/), the engine library (maven-repo/: the AAR, its jars, natives jars
+# and metadata), the .deb and the host libraries. `Compare macos`: the dmg's
+# .app, the dylibs, the Node addon and both xcframeworks. `Compare windows`:
+# the msi's files and the DLLs. The first runs had found the desktop and Apple
+# artifacts close but not there (the installers' payload, the macOS dylibs, the
+# MyotisKit binaries); Part 5d of #734 fixed those, and with a clean report on
+# all three platforms they joined the gate. What is REPORTED and does not fail
+# is the two comparisons that are not a against b: leg r, above, and on a tag
+# the published assets.
 #
 # Not on every pull request: a full rebuild of every platform, twice, is the
 # most expensive workflow in the repository, and what it checks moves only with
@@ -648,16 +651,17 @@ jobs:
       matrix:
         include:
           # Which two legs, and compare.py's gate: what FAILS the run. See the
-          # header.
+          # header. An empty gate is compare.py's default: everything the two
+          # legs produced is gated, and a missing leg fails the comparison.
           - name: linux
             platform: linux
             first: a
             second: b
-            gate: "--gate android/* --gate maven-repo/*"
+            gate: ""
           # The image build against a build on the hosted runner's toolchain
           # (leg r). REPORTED, NOT GATED: whether this comparison fails the run,
-          # and on which paths, is the owner's decision (the gate is Android
-          # first, legs a and b; CLAUDE.md). If it is gated one day, not on the
+          # and on which paths, is the owner's decision (the gate is legs a
+          # against b; CLAUDE.md). If it is gated one day, not on the
           # Linux natives jar: it carries a host library linked by the
           # builder's own gcc and glibc (the hosted image's moves with Ubuntu's
           # updates), and the RELEASE's Linux natives come from neither side
@@ -671,12 +675,12 @@ jobs:
             platform: macos
             first: a
             second: b
-            gate: "--report-only"
+            gate: ""
           - name: windows
             platform: windows
             first: a
             second: b
-            gate: "--report-only"
+            gate: ""
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -698,8 +702,8 @@ jobs:
           path: tars/b
 
       # -p: the modes as the leg recorded them, not this runner's umask.
-      # A missing leg fails a gated platform; on a report-only one its own
-      # build job is already red, and there is nothing to compare.
+      # A missing leg fails a gated comparison; on a report-only one (leg r)
+      # its own build job is already red, and there is nothing to compare.
       - name: Unpack both legs
         id: unpack
         env:

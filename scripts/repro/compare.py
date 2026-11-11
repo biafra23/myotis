@@ -25,8 +25,9 @@ the gate (it wins over --gate): for a comparison whose two sides are not
 expected to agree on them. --labels names the two legs in the output (default
 a and b). --report-only gates nothing (a platform whose
 artifacts are compared and reported but not yet held to reproducibility).
-reproducible-builds.yml gates the Android artifacts today (owner's decision,
-2026-11-10; desktop and Apple join in a later part of #734).
+reproducible-builds.yml gates everything in its three a-against-b comparisons
+(owner's decisions: Android first, 2026-11-10; all of it, 2026-11-11) and
+reports the two that have another second side.
 Stdlib only.
 """
 import fnmatch

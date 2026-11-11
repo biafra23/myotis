@@ -23,8 +23,8 @@ The first two say who built it. Only the third says **what** was built.
 as different users, in different time zones and locales and at different
 times, the result is identical, bit for bit. `reproducible-builds.yml` does
 exactly that on every `v*` tag, weekly on `main`, and before a pull request
-that can change a release build is merged, and fails when a gated artifact
-differs.
+that can change a release build is merged, and fails when the two builds
+differ in anything they produce ("gated", below).
 
 | Artifact | Release asset | Status |
 |---|---|---|
@@ -32,19 +32,27 @@ differs.
 | Android app, signed | `Myotis-<tag>-android.apk` | The unsigned APK plus a signature, and nothing else ([below](#the-signed-apk)). The signature itself needs the release key and is not reproducible by design. |
 | Android debug app | `Myotis-<tag>-android-debug.apk` | **Gated**, by payload: every entry of the APK. Its signature files are left out of the comparison. The signer is the one public debug key in the tree (`android-app/debug.keystore`), the same on every machine. |
 | Engine library | `myotis-engine-<tag>-android.aar`, `myotis-engine-<tag>-maven-repo.zip` | **Gated**, as staged: the AAR, its jars, poms and metadata. In the zip, the natives jars for macOS and Linux and the iOS module come from other builders (see below). |
-| Linux desktop | `Myotis-<tag>-<arch>.deb` | Compared and reported, not gated yet. |
-| macOS desktop | `Myotis-<tag>-<arch>.dmg` | Compared and reported, not gated yet. Unsigned, not notarized. |
-| Windows desktop | (no release asset yet) | Compared and reported, not gated yet. |
-| iOS frameworks | `MyotisEngine.xcframework.zip`, `MyotisKit.xcframework.zip` | Compared and reported, not gated yet. |
-| Node addon | `myotis-node.<platform>.node` | Compared and reported, not gated yet. |
+| Linux desktop | `Myotis-<tag>-<arch>.deb` | **Gated**, as a file and by its contents, as built in the builder image (the release's own `.deb` comes from another builder, see below). |
+| macOS desktop | `Myotis-<tag>-<arch>.dmg` | **Gated**, by content: every file of the `.app` in the image, not the dmg container. Packaged under umask 022 (see below). Unsigned, not notarized. |
+| Windows desktop | (no release asset yet) | **Gated**, by content: the files the msi installs. |
+| iOS frameworks | `MyotisEngine.xcframework.zip`, `MyotisKit.xcframework.zip` | **Gated.** Bit for bit, the zips and their trees. |
+| Node addon | `myotis-node.<platform>.node` | **Gated**, as each platform's two legs build it. |
 | Daemon jars | `*-SNAPSHOT.jar` | Not compared. |
 
-Android came first on purpose: it is the artifact that holds a wallet. The
-rest joins the gate as its remaining differences are fixed; the workflow's
-`Compare` jobs list them, with a diffoscope report per differing file, on
-every run.
+Android came first, on purpose: it is the artifact that holds a wallet. The
+desktop and Apple artifacts joined the gate on 2026-11-11, once their last
+differences were fixed and a comparison had come out clean on all three
+platforms. A difference now fails the run on any of them, with a diffoscope
+report per differing file.
 
-Two limits to state plainly:
+Three limits to state plainly:
+
+- **One step does not vary its umask: packaging the dmg.** jpackage creates
+  the directories inside the dmg with the umask of its own process, and
+  nothing can normalize them once the image exists. So the dmg is defined as
+  packaged under umask 022: the build refuses to package one under any other,
+  and both builds of the comparison run that one step under it. Everything
+  the dmg takes in is still built under two different umasks.
 
 - **The gate compares two rebuilds with each other.** That the *published*
   assets equal a rebuild is a separate comparison, made on every tag by the
