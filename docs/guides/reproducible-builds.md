@@ -221,6 +221,61 @@ Who signed it is a separate check: the signer certificate's SHA-256 is pinned
 in `android-app/release-signing-cert.sha256`
 ([android-release-signing.md](android-release-signing.md)).
 
+## What is inside: the SBOMs
+
+Each release also lists what its products are made of, as CycloneDX 1.5 JSON,
+one file per product:
+
+| File | Product |
+|---|---|
+| `Myotis-<tag>-android.cdx.json` | the Android app (the signed and the unsigned APK) |
+| `Myotis-<tag>-android-debug.cdx.json` | the Android debug app, whose classpath also has the Compose tooling |
+| `Myotis-<tag>-desktop.cdx.json` | the desktop app in its installers (dmg, deb, msi) |
+| `Myotis-<tag>-daemon.cdx.json` | what the daemon runs with (its jars are thin: none of it is inside them) |
+| `Myotis-<tag>-engine-library.cdx.json` | the engine library (AAR, desktop jar, natives jars, the iOS module) |
+| `Myotis-<tag>-ios.cdx.json` | `MyotisKit.xcframework.zip` and `MyotisEngine.xcframework.zip` |
+| `Myotis-<tag>-node.cdx.json` | the Node.js addon |
+
+They are **generated from the pins of the tagged tree, not from a build**
+(`scripts/sbom.py`): the Gradle lockfiles and `gradle/verification-metadata.xml`,
+`rust/Cargo.lock`, `.java-version` and `rust/rust-toolchain.toml`. So they say
+what the build is held to, and you can regenerate them from a checkout of the
+tag without building anything and compare (Python 3.11 or newer, nothing else):
+
+```bash
+git checkout v0.1.21
+SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) python3 scripts/sbom.py --tag v0.1.21 --out sbom
+sha256sum sbom/*.cdx.json    # the hashes SHA256SUMS lists for them
+```
+
+What that makes each part, and what is missing:
+
+- **Maven components are exact.** They are the modules the product's runtime
+  configuration is locked to (for example `android-app/gradle.lockfile`,
+  `releaseRuntimeClasspath`), and a build fails on any other version. For the
+  Android apps that includes `desugar_jdk_libs`, which is compiled into the
+  APK without being on the classpath; the rules file it is desugared by is
+  read by the build only, and each document names what it leaves out for that
+  reason (`myotis:sbom:left-out`). Each has
+  the SHA-256 the build verifies the file against, where the module has one
+  payload file; where it has several (variants, one per host), each pinned file
+  is named in the component's properties. The desktop app also lists the
+  Compose and skiko modules of each host its document names
+  (`myotis:sbom:hosts`): the hosts those modules are pinned for.
+- **Rust components are a superset.** `Cargo.lock` records one graph for all
+  targets and all kinds of dependency, so the list is every crate reachable
+  from the product's own crates: build dependencies, optional ones (Arti,
+  which only a Tor-enabled build links) and crates only another operating
+  system compiles are in it. Every crate that is linked is listed; not every
+  listed crate is linked.
+- **Two toolchain components** stand for code that comes from the toolchain
+  and ends up inside: the Rust standard library, and for the desktop app the
+  Eclipse Temurin JDK its installer bundles. Both carry a CPE.
+- **No licenses and no dependency graph.** A lockfile records neither. These
+  are inventories, which is what matching against security advisories needs.
+- The files describe the tag's pins. That the published binaries were built
+  from those pins is what the attestation and the rebuild above are for.
+
 ## For maintainers
 
 - The rule for merging is in `CLAUDE.md` (*No merge into `main` may break
@@ -240,3 +295,8 @@ in `android-app/release-signing-cert.sha256`
 - Every release asset is uploaded through `.github/release-assets.sh` and
   attested in the same job, whose last step
   (`release-assets.sh --checksums`) is what keeps `SHA256SUMS` complete.
+- The SBOMs need no upkeep for a dependency bump: they are read from the pins.
+  What they are read BY is the product table in `scripts/sbom.py` (which
+  project's which configuration, which crates). A configuration or crate that
+  was renamed fails the `sbom` workflow and `scripts/test_sbom.py` with the
+  name it looked for; a new shipped product gets a line there.
