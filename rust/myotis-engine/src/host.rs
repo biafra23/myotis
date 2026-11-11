@@ -102,6 +102,10 @@ struct EngineState {
     /// pool from scratch) and applied live to a running reader, exactly like
     /// [`EngineState::pending_served_window`]. Dies with the handle.
     pending_boot_enodes: Mutex<HashMap<i64, Vec<Enode>>>,
+    /// Per-handle P2P listen ports (`set_listen_ports`, ABI ≥ 57): read by
+    /// every spin_up (start AND resume), so a resume binds the same ports.
+    /// Absent = all OS-assigned, the wallet's default. Dies with the handle.
+    listen_ports: Mutex<HashMap<i64, ListenPorts>>,
     /// Serializes the two paths that hand a stashed seed list to a reader —
     /// a host's live push and the post-publish replay in `spin_up` — so the
     /// pool always ends up holding the LATEST list: without it a push could
@@ -197,6 +201,7 @@ fn engine() -> Option<&'static EngineState> {
                     next_id: AtomicI64::new(1),
                     pending_served_window: Mutex::new(HashMap::new()),
                     pending_boot_enodes: Mutex::new(HashMap::new()),
+                    listen_ports: Mutex::new(HashMap::new()),
                     boot_enodes_apply: Mutex::new(()),
                     log_index_runtime_bits: Mutex::new(HashMap::new()),
                     activity_watch: Mutex::new(HashMap::new()),
@@ -708,12 +713,12 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
     // Holding the map lock across block_on would serialize every other native
     // (status/stop/create) behind a potentially-slow start and invites deadlock on
     // future changes — even though SyncHandle::start is fast today (spawn + return).
-    let (config, read_stats) = {
+    let (config, read_stats, ports) = {
         let map = match engine.handles.lock() {
             Ok(m) => m,
             Err(_) => return false,
         };
-        match (from, map.get(&handle)) {
+        let (config, read_stats) = match (from, map.get(&handle)) {
             (SpinUpFrom::Created, Some(ChainEntry::Created(c))) => {
                 (Arc::clone(c), Arc::new(ReadStats::new()))
             }
@@ -722,7 +727,11 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
                 (Arc::clone(c), Arc::clone(stats))
             }
             _ => return false, // unknown id, or not in the expected state
-        }
+        };
+        // The host's pinned P2P ports (`set_listen_ports`; default all
+        // OS-assigned), read under the same lock the setter checks the state
+        // under (map, then stash — the setter's order).
+        (config, read_stats, listen_ports_for(engine, handle))
     };
     // The handle's CL fork watch rides into the loop on its config: created on
     // the first spin-up, reused (evidence intact) on every resume.
@@ -732,10 +741,17 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
     let sync = match engine.rt.block_on(async {
         let mut cfg = (*config).clone();
         cfg.cl_fork_watch = cl_watch;
+        cfg.discv5_port = ports.discv5;
+        cfg.libp2p_tcp_port = ports.libp2p_tcp;
+        cfg.libp2p_quic_port = ports.libp2p_quic;
         SyncHandle::start(cfg)
     }) {
         Ok(s) => s,
-        Err(_) => return false,
+        Err(e) => {
+            // E.g. a libp2p TCP port another process holds (`set_listen_ports`).
+            tracing::warn!(handle, error = %e, "sync loop failed to start");
+            return false;
+        }
     };
     // Start the EL reader against the sync loop's execution anchor (the CL→EL
     // bridge). A failure (e.g. a discv4 UDP bind error) is non-fatal: the CL
@@ -779,6 +795,7 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
             let cfg = myotis_net::el::reader::ElConfig {
                 log_index_path,
                 traffic: Arc::clone(&config.traffic),
+                discv4_port: ports.discv4,
                 ..cfg
             };
             // A poisoned carry map still gets a reader, over a carry of its own
@@ -1247,6 +1264,9 @@ pub fn stop(handle: i64) {
     if let Ok(mut pending) = engine.pending_boot_enodes.lock() {
         pending.remove(&handle);
     }
+    if let Ok(mut ports) = engine.listen_ports.lock() {
+        ports.remove(&handle);
+    }
     if let Ok(mut bits) = engine.log_index_runtime_bits.lock() {
         bits.remove(&handle);
     }
@@ -1421,6 +1441,91 @@ fn parse_boot_enodes_json(json: &str) -> Result<Vec<Enode>, String> {
     } else {
         Err(reasons.join("; "))
     }
+}
+
+/// The P2P sockets a handle opens, each `0` = OS-assigned (the wallet's
+/// default, so two engines on one machine never collide). The EL is dial-only:
+/// discv4 is its one listening socket; the CL has discv5 plus the libp2p
+/// req/resp host on TCP and on QUIC (UDP).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ListenPorts {
+    pub discv4: u16,
+    pub discv5: u16,
+    pub libp2p_tcp: u16,
+    pub libp2p_quic: u16,
+}
+
+/// Pure: the ports a host asked for, or why they cannot all be bound by one
+/// handle. A nonzero port may appear once per protocol family — discv4,
+/// discv5 and QUIC all bind UDP, so two of them on one port would fail the
+/// second bind; TCP is its own family.
+fn validate_listen_ports(p: ListenPorts) -> Result<ListenPorts, String> {
+    let udp = [("discv4", p.discv4), ("discv5", p.discv5), ("libp2p QUIC", p.libp2p_quic)];
+    for (i, (a, pa)) in udp.iter().enumerate() {
+        for (b, pb) in &udp[i + 1..] {
+            if *pa != 0 && pa == pb {
+                return Err(format!("{a} and {b} both ask for UDP port {pa}"));
+            }
+        }
+    }
+    Ok(p)
+}
+
+fn listen_ports_for(engine: &EngineState, handle: i64) -> ListenPorts {
+    engine
+        .listen_ports
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&handle).copied())
+        .unwrap_or_default()
+}
+
+/// `myotis_set_listen_ports` (ABI ≥ 57): pin the handle's P2P listen ports.
+/// Set semantics (a later call replaces an earlier one; all zeros = back to
+/// OS-assigned). Applied or refused, never accepted and ignored: accepted
+/// only BEFORE the sockets exist — a CREATED handle, or a PAUSED one (the
+/// resume binds them) — and refused for a RUNNING or unknown handle or a
+/// UDP port two protocols would share ([`validate_listen_ports`]), with one
+/// WARN naming the reason. A port another process holds fails at start like
+/// any bind: discv4, discv5 and QUIC drop to the degraded modes their bind
+/// errors already have (no EL reader, no discv5, no inbound QUIC); a libp2p
+/// TCP bind error fails the start.
+pub(crate) fn set_listen_ports(handle: i64, ports: ListenPorts) -> bool {
+    let Some(engine) = engine() else {
+        return false;
+    };
+    let ports = match validate_listen_ports(ports) {
+        Ok(p) => p,
+        Err(reason) => {
+            tracing::warn!(handle, %reason, "listen ports refused; nothing applied");
+            return false;
+        }
+    };
+    // Hosts set the ports between create() and start() (myotis-rpcd does).
+    // The state check and the stash run under the handle map, the lock
+    // spin_up reads the stash under. A call on another thread that races
+    // start() can still land after spin_up read the stash but before it
+    // publishes RUNNING; it would then bind only at the next resume, so a host
+    // must not race the two.
+    let map = match engine.handles.lock() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    match map.get(&handle) {
+        Some(ChainEntry::Created(_)) | Some(ChainEntry::Paused(..)) => {}
+        Some(ChainEntry::Running(..)) => {
+            tracing::warn!(handle, "listen ports refused: the handle is running (set them before start)");
+            return false;
+        }
+        None => return false,
+    }
+    let Ok(mut stash) = engine.listen_ports.lock() else {
+        return false;
+    };
+    stash.insert(handle, ports);
+    tracing::info!(handle, discv4 = ports.discv4, discv5 = ports.discv5, libp2p_tcp = ports.libp2p_tcp,
+        libp2p_quic = ports.libp2p_quic, "listen ports set (0 = OS-assigned)");
+    true
 }
 
 /// `myotis_set_boot_enodes` (ABI ≥ 31, #465): replace the handle's
@@ -4950,6 +5055,32 @@ mod tests {
         assert_eq!(keys[5].1, format!("0x0{}", "1".repeat(63)));
         assert_eq!(parse_proof_keys("  ").unwrap(), vec![]);
         assert_eq!(parse_proof_keys(r#"["0x0"]"#).unwrap(), vec![([0u8; 32], "0x0".to_string())]);
+    }
+
+    #[test]
+    fn listen_ports_refuse_a_udp_port_two_protocols_would_share() {
+        let p = |discv4, discv5, libp2p_tcp, libp2p_quic| ListenPorts { discv4, discv5, libp2p_tcp, libp2p_quic };
+        // Defaults and distinct ports pass unchanged.
+        assert_eq!(validate_listen_ports(ListenPorts::default()), Ok(ListenPorts::default()));
+        assert_eq!(validate_listen_ports(p(30305, 9005, 9105, 9106)), Ok(p(30305, 9005, 9105, 9106)));
+        // TCP is its own family: the libp2p TCP port may equal a UDP one.
+        assert!(validate_listen_ports(p(30305, 9005, 30305, 9106)).is_ok());
+        // Several protocols left at 0 (OS-assigned) never collide.
+        assert!(validate_listen_ports(p(0, 0, 0, 9106)).is_ok());
+        // Two UDP protocols on one port would fail the second bind: refused.
+        for (bad, names) in [
+            (p(9000, 9000, 0, 0), "discv4 and discv5"),
+            (p(9000, 0, 0, 9000), "discv4 and libp2p QUIC"),
+            (p(0, 9001, 0, 9001), "discv5 and libp2p QUIC"),
+        ] {
+            let err = validate_listen_ports(bad).unwrap_err();
+            assert!(err.contains(names), "{err}");
+        }
+    }
+
+    #[test]
+    fn listen_ports_are_refused_for_an_unknown_handle() {
+        assert!(!set_listen_ports(-42, ListenPorts { discv4: 30305, ..ListenPorts::default() }));
     }
 
     #[test]

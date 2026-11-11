@@ -402,7 +402,13 @@ uniffi::setup_scaffolding!();
 ///      payload extension, no signature change — bumped so a host that offers
 ///      "unmetered only" is never paired with an engine that would accept the
 ///      key and ignore it.
-pub const ABI_VERSION: i32 = 56;
+/// v57: `myotis_set_listen_ports` (plain C ABI only, like
+///      `myotis_create_with_checkpoint`): pin a created or paused handle's
+///      discv4, discv5, libp2p TCP and libp2p QUIC listen ports (0 =
+///      OS-assigned, the unchanged default). An additive function — bumped so
+///      a host that pins its ports (myotis-rpcd's port switches) is never
+///      paired with an engine that would leave them OS-assigned.
+pub const ABI_VERSION: i32 = 57;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

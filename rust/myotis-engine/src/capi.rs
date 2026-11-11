@@ -1123,6 +1123,26 @@ pub unsafe extern "C" fn myotis_set_boot_enodes(
     }
 }
 
+/// Pin the handle's P2P listen ports (ABI ≥ 57): discv4 (UDP), discv5 (UDP),
+/// the libp2p req/resp host's TCP port and its QUIC (UDP) port; 0 = OS-assigned,
+/// the default. Call between create and start (or while paused); refused for a
+/// running or unknown handle and for one UDP port shared by two protocols (see
+/// `host::set_listen_ports`). Plain C ABI only, like
+/// `myotis_create_with_checkpoint`: the JVM hosts keep their own port knobs.
+#[no_mangle]
+pub extern "C" fn myotis_set_listen_ports(
+    handle: i64,
+    discv4: u16,
+    discv5: u16,
+    libp2p_tcp: u16,
+    libp2p_quic: u16,
+) -> bool {
+    crate::host::set_listen_ports(
+        handle,
+        crate::host::ListenPorts { discv4, discv5, libp2p_tcp, libp2p_quic },
+    )
+}
+
 /// Log-index status JSON (see ffi::log_index_status_json).
 /// Returned string must be freed with `myotis_string_free`.
 #[no_mangle]

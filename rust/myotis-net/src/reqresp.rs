@@ -1149,9 +1149,20 @@ pub struct HostConfig {
 
 impl Default for HostConfig {
     fn default() -> Self {
+        Self::with_ports(0, 0)
+    }
+}
+
+impl HostConfig {
+    /// The wallet's shape, listening on `0.0.0.0` at the given TCP and QUIC (UDP)
+    /// ports. 0 lets the OS pick, which is what [`HostConfig::default`] does; a
+    /// host pins them to run beside another node or behind a firewall.
+    pub fn with_ports(tcp_port: u16, quic_port: u16) -> Self {
         Self {
-            listen: "/ip4/0.0.0.0/tcp/0".parse().expect("static multiaddr"),
-            listen_quic: Some("/ip4/0.0.0.0/udp/0/quic-v1".parse().expect("static multiaddr")),
+            listen: format!("/ip4/0.0.0.0/tcp/{tcp_port}").parse().expect("ip4/tcp multiaddr"),
+            listen_quic: Some(
+                format!("/ip4/0.0.0.0/udp/{quic_port}/quic-v1").parse().expect("ip4/udp/quic multiaddr"),
+            ),
             max_established_incoming: Some(64),
             keypair: None,
             lc_responder: None,
@@ -1312,9 +1323,21 @@ pub fn start_host_with(
         }
     };
 
-    swarm
-        .listen_on(config.listen)
-        .map_err(|e| format!("listen failed: {e}"))?;
+    let listen_addr = config.listen.clone();
+    swarm.listen_on(config.listen).map_err(|e| {
+        // libp2p's TransportError prints nothing of its own; the io error
+        // (e.g. "Address already in use") is in its source chain, repeated by
+        // each wrapping layer — keep each distinct message once.
+        let mut parts: Vec<String> = vec![e.to_string()];
+        let mut source = std::error::Error::source(&e);
+        while let Some(s) = source {
+            parts.push(s.to_string());
+            source = s.source();
+        }
+        parts.retain(|p| !p.is_empty());
+        parts.dedup();
+        format!("listen on {listen_addr} failed: {}", parts.join(": "))
+    })?;
     // Not fatal: a host that cannot bind a UDP socket still dials QUIC peers
     // (the transport opens a socket per dial) and still has TCP both ways.
     if let Some(quic) = config.listen_quic {
@@ -2466,6 +2489,26 @@ mod external_address_tests {
         let no_ip: Multiaddr = "/dns4/example.com/tcp/9105".parse().unwrap();
         assert_eq!(multiaddr_ip(&no_ip), None);
         assert_eq!(multiaddr_port(&addr), Some(54321));
+    }
+}
+
+#[cfg(test)]
+mod host_config_tests {
+    use super::*;
+
+    #[test]
+    fn default_listens_on_os_assigned_ports() {
+        let cfg = HostConfig::default();
+        assert_eq!(cfg.listen.to_string(), "/ip4/0.0.0.0/tcp/0");
+        assert_eq!(cfg.listen_quic.map(|a| a.to_string()).as_deref(), Some("/ip4/0.0.0.0/udp/0/quic-v1"));
+        assert_eq!(cfg.max_established_incoming, Some(64));
+    }
+
+    #[test]
+    fn with_ports_pins_tcp_and_quic_independently() {
+        let cfg = HostConfig::with_ports(9105, 9106);
+        assert_eq!(cfg.listen.to_string(), "/ip4/0.0.0.0/tcp/9105");
+        assert_eq!(cfg.listen_quic.map(|a| a.to_string()).as_deref(), Some("/ip4/0.0.0.0/udp/9106/quic-v1"));
     }
 }
 

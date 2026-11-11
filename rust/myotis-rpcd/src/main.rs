@@ -124,6 +124,28 @@ struct Args {
     /// only).
     #[arg(long, value_name = "ENODES|@FILE")]
     boot_enodes: Option<String>,
+    /// discv4 (EL discovery) UDP port. 0 = OS-assigned, the default. The EL
+    /// side only dials out, so this is its one listening socket.
+    #[arg(long, default_value_t = 0, value_name = "PORT")]
+    discv4_port: u16,
+    /// discv5 (CL discovery) UDP port. 0 = OS-assigned, the default.
+    #[arg(long, default_value_t = 0, value_name = "PORT")]
+    discv5_port: u16,
+    /// libp2p light-client host TCP port. 0 = OS-assigned, the default.
+    #[arg(long, default_value_t = 0, value_name = "PORT")]
+    libp2p_port: u16,
+    /// libp2p light-client host QUIC (UDP) port. 0 = OS-assigned, the default.
+    #[arg(long, default_value_t = 0, value_name = "PORT")]
+    libp2p_quic_port: u16,
+}
+
+impl Args {
+    /// The P2P ports asked for on the command line; `None` when all are 0, which
+    /// leaves every socket OS-assigned without asking the engine at all.
+    fn listen_ports(&self) -> Option<[u16; 4]> {
+        let ports = [self.discv4_port, self.discv5_port, self.libp2p_port, self.libp2p_quic_port];
+        ports.iter().any(|&p| p != 0).then_some(ports)
+    }
 }
 
 fn main() {
@@ -156,6 +178,7 @@ fn run(args: Args) -> Result<(), String> {
     let network = ffi::canonical_network_name(args.network.clone())
         .ok_or_else(|| format!("unknown network '{}'", args.network))?;
     let chain_id = chain_id_of(&network)?;
+    let listen_ports = args.listen_ports();
     let listen = match args.listen {
         Some(addr) => addr,
         None => default_listen(&network)?,
@@ -268,7 +291,23 @@ fn run(args: Args) -> Result<(), String> {
         seeds::push(handle, urls)?;
         eprintln!("myotis-rpcd: {} boot enode(s) pinned", urls.len());
     }
+    if let Some([discv4, discv5, libp2p_tcp, libp2p_quic]) = listen_ports {
+        print_engine_logs();
+        if !myotis_engine::capi::myotis_set_listen_ports(handle, discv4, discv5, libp2p_tcp, libp2p_quic) {
+            // The engine's WARN names the reason (e.g. a UDP port given twice).
+            print_engine_logs();
+            return Err("the engine refused the --discv4-port/--discv5-port/--libp2p-port/\
+                        --libp2p-quic-port set; nothing was bound"
+                .into());
+        }
+        eprintln!(
+            "myotis-rpcd: P2P ports pinned (0 = OS-assigned): discv4 udp/{discv4}, discv5 udp/{discv5}, \
+             libp2p tcp/{libp2p_tcp}, libp2p quic udp/{libp2p_quic}"
+        );
+    }
     if !ffi::start_handle(handle) {
+        // The engine's WARN says why (e.g. a --libp2p-port another process holds).
+        print_engine_logs();
         return Err("engine failed to start".into());
     }
     eprintln!(
@@ -452,4 +491,38 @@ fn spawn_log_index_install(handle: i64, cfg: String, imports: Vec<PathBuf>) {
             std::thread::sleep(Duration::from_secs(2));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(extra: &[&str]) -> Args {
+        Args::try_parse_from(["myotis-rpcd"].iter().chain(extra)).expect("valid arguments")
+    }
+
+    #[test]
+    fn port_switches_default_to_os_assigned_and_skip_the_engine_call() {
+        let args = parse(&[]);
+        assert_eq!(
+            [args.discv4_port, args.discv5_port, args.libp2p_port, args.libp2p_quic_port],
+            [0, 0, 0, 0]
+        );
+        assert_eq!(args.listen_ports(), None);
+    }
+
+    #[test]
+    fn any_port_switch_pins_all_four_in_engine_order() {
+        let args = parse(&["--discv4-port", "30305", "--libp2p-quic-port", "9106"]);
+        assert_eq!(args.listen_ports(), Some([30305, 0, 0, 9106]));
+        let all = parse(&[
+            "--discv4-port", "30305", "--discv5-port", "9005", "--libp2p-port", "9105", "--libp2p-quic-port", "9106",
+        ]);
+        assert_eq!(all.listen_ports(), Some([30305, 9005, 9105, 9106]));
+    }
+
+    #[test]
+    fn a_port_outside_u16_is_a_usage_error() {
+        assert!(Args::try_parse_from(["myotis-rpcd", "--discv4-port", "70000"]).is_err());
+    }
 }
