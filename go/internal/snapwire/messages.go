@@ -50,9 +50,21 @@ type Codes struct {
 }
 
 // NegotiatedCodes derives the code table: base = 0x10 +
-// eth_protocol_length. eth/67-68 has length 17 (base 0x21); eth/69
-// adds BlockRangeUpdate → 18 (0x22); eth/70 changes no message count;
-// eth/71 adds its BAL pair → 20 (0x24) (messages.rs:49-73).
+// eth_protocol_length. eth/69 adds BlockRangeUpdate → 18 (0x22);
+// eth/70 changes no message count; eth/71 adds its BAL pair → 20
+// (0x24) (messages.rs:49-73).
+//
+// eth/66 shares eth/67-68's 17-message lineup (base 0x21) — decided
+// here, noted on PR review against the real-world geth table where
+// eth/66 measures 15. docs/spec/02 §6.3 lists ONE absolute lineup for
+// the whole advertised range eth/66-71 (`0x10 Status … 0x20
+// Receipts` = 17 messages), and §7.1 introduces new counts only from
+// eth/69 ("adds BlockRangeUpdate 0x11") — if 66 measured 15, that
+// sentence would name 67 as the bump. This is the spec's protocol,
+// not historical geth's; all three engines implement `≤68 → 0x21`
+// (Java golden, Rust `..=68 => 0x21`, Go here), so the ladder is
+// cross-engine policy, not a Go slip. If the spec ever gives eth/66
+// its own count, change all three together.
 func NegotiatedCodes(ethVersion, snapVersion uint64) Codes {
 	var base uint64
 	switch {
@@ -76,7 +88,10 @@ func NegotiatedCodes(ethVersion, snapVersion uint64) Codes {
 	}
 }
 
-var fullLimitHash = [32]byte{
+// FullLimitHash is the "no upper bound" limit hash for range requests
+// (0xff…ff). Exported so readers and tests share ONE copy of the value
+// the request encoders actually send.
+var FullLimitHash = [32]byte{
 	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -100,7 +115,7 @@ func EncodeGetAccountRange(requestID uint64, stateRoot, startingHash, limitHash 
 // EncodeGetAccount is the single-account request over
 // [keccak(addr), 0xff…ff].
 func EncodeGetAccount(requestID uint64, stateRoot, accountHash [32]byte, responseBytes uint64) []byte {
-	return EncodeGetAccountRange(requestID, stateRoot, accountHash, fullLimitHash, responseBytes)
+	return EncodeGetAccountRange(requestID, stateRoot, accountHash, FullLimitHash, responseBytes)
 }
 
 // EncodeGetStorageRanges: [reqId, stateRoot, [accountHash],
@@ -119,7 +134,7 @@ func EncodeGetStorageRanges(requestID uint64, stateRoot, accountHash, startingHa
 // EncodeGetStorageSlot is the single-slot request over
 // [keccak(slot), 0xff…ff].
 func EncodeGetStorageSlot(requestID uint64, stateRoot, accountHash, slotHash [32]byte, responseBytes uint64) []byte {
-	return EncodeGetStorageRanges(requestID, stateRoot, accountHash, slotHash, fullLimitHash, responseBytes)
+	return EncodeGetStorageRanges(requestID, stateRoot, accountHash, slotHash, FullLimitHash, responseBytes)
 }
 
 // EncodeGetByteCodes: [reqId, [codeHash, …], responseBytes].

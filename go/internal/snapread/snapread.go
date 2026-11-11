@@ -53,12 +53,9 @@ const (
 	byteCodeResponseBytes = 256 * 1024
 )
 
-var fullLimit = [32]byte{
-	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-}
+// fullLimit is snapwire's documented no-upper-bound limit hash — one
+// copy, exported there because the request encoders send exactly it.
+var fullLimit = snapwire.FullLimitHash
 
 // FaultKind classifies why one peer failed a read — the three-way
 // taxonomy the Rust reader drives its pool policy from. The
@@ -130,8 +127,15 @@ func readAccount(peers []Peer, stateRoot [32]byte, address [20]byte) (Peer, snap
 		}
 		out, err := snapwire.VerifyAccount(stateRoot, address, ar)
 		if err != nil {
-			// Decoded but unverified: a proof-shaped failure, unless the
-			// decode itself spoke (both markers are checked the same way).
+			// VerifyAccount marks PROOF failures with "proof invalid"
+			// (→ pruned-root / bad-proof, both "ask elsewhere"). A leaf
+			// that HASHED but fails the strict leaf decode carries no
+			// marker ON PURPOSE: its bytes are committed by the proven
+			// path, so no other peer can answer differently — retrying
+			// elsewhere would just repay the round trip. That is the
+			// Rust twin's rule (fetch.rs lets decode_account_leaf's `?`
+			// escape outside the marker), and Classify maps it to
+			// transport-shaped propagation accordingly.
 			attempts = append(attempts, Attempt{p.ID(), Classify(err), err})
 			continue
 		}
@@ -150,6 +154,17 @@ func Slot(peers []Peer, stateRoot [32]byte, address [20]byte, slot [32]byte) ([]
 	if err != nil {
 		return nil, err
 	}
+	return SlotAt(peers, stateRoot, address, slot, acct)
+}
+
+// SlotAt performs ONLY the storage hop, against an account outcome the
+// caller already proved. A caller that reads account and slot for the
+// same address must share the proven outcome (and the same peer
+// slice, so the attempt cap sees one stable peer order) — otherwise
+// the account hop runs twice and the address reaches up to 3+3
+// distinct peers for what is one logical read, against the spirit of
+// the disclosure bound maxAttempts exists for.
+func SlotAt(peers []Peer, stateRoot [32]byte, address [20]byte, slot [32]byte, acct snapwire.AccountOutcome) ([]byte, error) {
 	if acct.Absent() || acct.Account.StorageRoot == mpt.EmptyTrieRoot {
 		return nil, nil // provably empty account / empty trie: every slot is zero
 	}

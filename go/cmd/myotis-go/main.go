@@ -197,6 +197,14 @@ func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, m
 			}
 			return nil
 		case err := <-lcFailure:
+			// Ctrl-C closes both arms' race honestly: the LC goroutine
+			// ends with context.Canceled exactly when ctx.Done fires,
+			// and select picks randomly — shutdown is the clean path,
+			// never a failure.
+			if ctx.Err() != nil {
+				report(disc, dialer, log)
+				return nil
+			}
 			// The LC gave up (bootstrap/catch-up refused within the
 			// budget): the read can never be VERIFIED, so neither can
 			// the command quietly succeed.
@@ -346,6 +354,16 @@ func verifiedRead(d *dialer, log *slog.Logger, a lcAnchor, addr common.Address, 
 	if out.Absent() {
 		attrs = append(attrs, "account", "PROVEN ABSENT (empty account)")
 		log.Info("verified account read", attrs...)
+		if wantSlot {
+			// Say so even though it needs no proof walk: an absent
+			// account has no storage, so the slot the operator asked
+			// for is provably zero. Silence here would leave "did it
+			// read the slot?" unanswered.
+			log.Info("verified storage read",
+				"account", addr.Hex(), "slot", fmt.Sprintf("0x%x", slot),
+				"value", "0x (provable: account is absent)",
+				"verifyMethod", "provenAbsent→zero")
+		}
 		return nil
 	}
 	a2 := out.Account
@@ -358,7 +376,11 @@ func verifiedRead(d *dialer, log *slog.Logger, a lcAnchor, addr common.Address, 
 	)
 	log.Info("verified account read", attrs...)
 	if wantSlot {
-		v, err := snapread.Slot(peers, a.stateRoot, addr, slot)
+		// SlotAt, not Slot: the account was just proven above — the
+		// storage hop must reuse that outcome and the SAME peer slice,
+		// so one logical read never widens the disclosure cap to 3+3
+		// peers or pays for the account request twice.
+		v, err := snapread.SlotAt(peers, a.stateRoot, addr, slot, out)
 		if err != nil {
 			return fmt.Errorf("slot read: %w", err)
 		}

@@ -235,6 +235,26 @@ func TestSlotAnchorsAtProvenStorageRoot(t *testing.T) {
 	}
 }
 
+func TestSlotAtReusesTheProvenAccount(t *testing.T) {
+	// The CLI's one-logical-read path: after Account, SlotAt must do
+	// ONLY the storage hop — no second account request, no widened
+	// address disclosure.
+	fx := newFixture(t)
+	var order []string
+	p := &fake{id: strings.Repeat("66", 16), snap: true, order: &order, ar: fx.ar, sr: fx.sr}
+	out, err := Account([]Peer{p}, fx.stateRoot, fx.address)
+	if err != nil || out.Absent() {
+		t.Fatalf("account: %+v %v", out, err)
+	}
+	v, err := SlotAt([]Peer{p}, fx.stateRoot, fx.address, fx.slot, out)
+	if err != nil || len(v) != 1 || v[0] != 0x2a {
+		t.Fatalf("slot: %x %v", v, err)
+	}
+	if len(order) != 2 {
+		t.Fatalf("want exactly account+storage, got %v", order)
+	}
+}
+
 func TestSlotEmptyTrieShortCircuits(t *testing.T) {
 	// Account whose storageRoot is the empty trie: Slot must answer
 	// zero WITHOUT a storage round trip.
