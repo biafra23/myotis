@@ -32,7 +32,16 @@
 #                      for a source tarball or a shallow clone.
 set -euo pipefail
 umask "${REPRO_UMASK:-022}"
-export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}"
+# Resolved before the export: `export X=$(cmd)` has export's status, and an
+# empty value would let the build stamp the wall clock (or fail late).
+if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
+    SOURCE_DATE_EPOCH=$(git log -1 --format=%ct 2>/dev/null) || SOURCE_DATE_EPOCH=""
+    [[ -n "$SOURCE_DATE_EPOCH" ]] || {
+        echo "build_linux.sh: no git history here: set SOURCE_DATE_EPOCH to the tagged commit's time" >&2
+        exit 1
+    }
+fi
+export SOURCE_DATE_EPOCH
 
 version=${1:-}
 if [[ -z "$version" && "${GITHUB_REF:-}" == refs/tags/v* ]]; then version=${GITHUB_REF_NAME#v}; fi

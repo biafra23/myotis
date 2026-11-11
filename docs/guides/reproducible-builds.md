@@ -199,7 +199,9 @@ released app shows>` in front of `scripts/repro/build_linux.sh` (inside
 `run.sh`, which passes no environment of yours: `run.sh -- env
 APP_VERSION=0.1.21 scripts/repro/build_linux.sh`). For the tag `v0.1.21` it is
 `0.1.21`; for a release-candidate tag, the version the published app shows,
-such as `0.1.20-1a2b3c`.
+such as `0.1.20-1a2b3c`. Without git history, `SOURCE_DATE_EPOCH` has to be
+stated the same way: the tagged commit's time, in seconds (`git log -1
+--format=%ct v0.1.21` on any clone that has the tag).
 
 The results:
 
@@ -307,6 +309,13 @@ What that makes each part, and what is missing:
   Eclipse Temurin JDK its installer bundles. Both carry a CPE.
 - **No licenses and no dependency graph.** A lockfile records neither. These
   are inventories, which is what matching against security advisories needs.
+- **The forks appear under their own coordinates.** Myotis builds on forks of
+  Hyperledger Besu (`com.github.biafra23.besu:*`) and of ConsenSys' discovery
+  library (`com.github.biafra23:discovery`), published through JitPack. The
+  documents list them as those modules, with nothing that ties them to the
+  upstream project, so an advisory against upstream Besu or discovery does not
+  match them by itself: check it against the fork's base version (the part of
+  its version before `-android`).
 - The files describe the tag's pins. That the published binaries were built
   from those pins is what the attestation and the rebuild above are for.
 

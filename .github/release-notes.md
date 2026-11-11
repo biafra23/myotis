@@ -3,7 +3,9 @@ Pre-release build of the Myotis wallet apps.
 **Checking a download** — `SHA256SUMS` lists the SHA-256 of every file on this page:
 `sha256sum -c SHA256SUMS --ignore-missing` next to what you downloaded. Each file also
 carries a build-provenance attestation that names the workflow run and the commit it
-was built from: `gh attestation verify <file> --repo biafra23/myotis`. What a rebuild
+was built from: `gh attestation verify <file> --repo biafra23/myotis --source-ref refs/tags/<this release's tag>`
+(the tag matters: without it any run of the repository would do), or the whole release at
+once with `scripts/verify_release.sh <tag>`. What a rebuild
 is checked against, and how to make one: docs/guides/reproducible-builds.md.
 
 **Android (`*-android.apk`)** — the Myotis app, signed with Myotis's own release key

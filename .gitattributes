@@ -8,3 +8,8 @@ rust/testdata/**/*.txt text eol=lf
 rust/testdata/**/*.bin binary
 rust/testdata/**/*.rlp binary
 rust/testdata/**/*.ssz binary
+
+# Shell scripts are run by bash on every platform, Git Bash on Windows
+# included (rust/repro-env.sh is sourced by the Windows legs; Gradle runs
+# rust/build-android.sh), and bash does not read `then\r` as a keyword (#734).
+*.sh text eol=lf

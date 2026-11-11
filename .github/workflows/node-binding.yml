@@ -60,6 +60,13 @@ jobs:
     permissions:
       contents: read
     steps:
+      # Git for Windows checks text files out with CRLF by default, and the
+      # build step sources rust/repro-env.sh under Git Bash (same step as
+      # desktop-windows-msi.yml; .gitattributes also keeps *.sh LF). A no-op
+      # elsewhere.
+      - name: Check out with LF line endings
+        shell: bash
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       # One Xcode for every macOS leg, from .xcode-version (#734).
       - name: Select the pinned Xcode

@@ -15,8 +15,8 @@
 # Cargo's own `trim-paths` would replace all this once it is stable.
 #
 # Limitation (the build still works, the paths are just not remapped): cargo
-# splits these variables on whitespace, so a CARGO_HOME or checkout path with a
-# space is skipped. Windows (Git Bash) goes through cygpath below; that path is
+# splits these variables on whitespace, so a mapping whose CARGO_HOME or
+# checkout path has a space is left out, with a warning. Windows (Git Bash) goes through cygpath below; that path is
 # not byte-compared in CI yet (Part 5).
 
 if [ "${MYOTIS_REPRO_ENV:-}" != "" ]; then
@@ -34,8 +34,15 @@ if command -v cygpath >/dev/null 2>&1; then
     _repro_rust=$(cygpath -w "$_repro_rust")
     _repro_cargo_home=$(cygpath -w "$_repro_cargo_home")
 fi
-_repro_rustflags="--remap-path-prefix=$_repro_cargo_home/registry/src=/cargo/registry/src --remap-path-prefix=$_repro_cargo_home/git/checkouts=/cargo/git/checkouts --remap-path-prefix=$_repro_rust=/myotis/rust"
-_repro_cflags="-ffile-prefix-map=$_repro_cargo_home/registry/src=/cargo/registry/src -ffile-prefix-map=$_repro_cargo_home/git/checkouts=/cargo/git/checkouts -ffile-prefix-map=$_repro_rust=/myotis/rust"
+_repro_rustflags="" _repro_cflags=""
+for _repro_map in "$_repro_cargo_home/registry/src=/cargo/registry/src" \
+    "$_repro_cargo_home/git/checkouts=/cargo/git/checkouts" "$_repro_rust=/myotis/rust"; do
+    case "$_repro_map" in
+        *[[:space:]]*) echo "repro-env.sh: '${_repro_map%=*}' has whitespace in it: not remapped (cargo splits these flags on it)" >&2 ;;
+        *) _repro_rustflags="${_repro_rustflags:+$_repro_rustflags }--remap-path-prefix=$_repro_map"
+           _repro_cflags="${_repro_cflags:+$_repro_cflags }-ffile-prefix-map=$_repro_map" ;;
+    esac
+done
 _repro_seen=" "  # the host is usually in the list too: visit it once, like Gradle's distinct()
 for _repro_t in $(rustc -vV 2>/dev/null | sed -n 's/^host: //p') \
     aarch64-linux-android x86_64-linux-android armv7-linux-androideabi \
@@ -43,6 +50,7 @@ for _repro_t in $(rustc -vV 2>/dev/null | sed -n 's/^host: //p') \
     aarch64-apple-darwin x86_64-apple-darwin \
     x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc \
     x86_64-unknown-none wasm32-unknown-unknown; do
+    [ -n "$_repro_rustflags" ] || break
     case "$_repro_seen" in *" $_repro_t "*) continue ;; esac
     _repro_seen="$_repro_seen$_repro_t "
     # Appended to an existing value, like Gradle's twin.
@@ -54,4 +62,4 @@ for _repro_t in $(rustc -vV 2>/dev/null | sed -n 's/^host: //p') \
            export "$_repro_k=${!_repro_k:+${!_repro_k} }$_repro_cflags" ;;
     esac
 done
-unset _repro_rust _repro_cargo_home _repro_rustflags _repro_cflags _repro_t _repro_k _repro_seen
+unset _repro_rust _repro_cargo_home _repro_rustflags _repro_cflags _repro_t _repro_k _repro_seen _repro_map

@@ -407,8 +407,11 @@ jobs:
           v="${GITHUB_REF_NAME#v}"
           for a in myotis-engine-ios myotis-engine-ios-iosarm64 myotis-engine-ios-iossimulatorarm64; do
             url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/eth/myotis/$a/$v/$a-$v.pom"
-            curl -fsS -o /dev/null -u "${GITHUB_ACTOR}:${GITHUB_TOKEN}" "$url" \
-              || { echo "::error::eth.myotis:$a:$v is not on GitHub Packages — re-run ALL jobs (the ios-engine job publishes it)"; exit 1; }
+            # Retried: this runs after the irrevocable publish, where a failed job
+            # cannot simply be re-run (see this job's header).
+            curl -fsS --retry 5 --retry-all-errors --retry-delay 3 --max-time 300 -o /dev/null \
+              -u "${GITHUB_ACTOR}:${GITHUB_TOKEN}" "$url" \
+              || { echo "::error::eth.myotis:$a:$v is not on GitHub Packages (or could not be fetched after 6 attempts) — re-run ALL jobs (the ios-engine job publishes it)"; exit 1; }
           done
 
       # Published == staged (#734 D8). The publish above is a SECOND Gradle run;
@@ -430,9 +433,13 @@ jobs:
           tmp=$(mktemp -d); n=0
           while IFS= read -r f; do
             rel=${f#build/maven-repo/}
-            curl -fsSL -u "${GITHUB_ACTOR}:${GITHUB_TOKEN}" -o "$tmp/x" \
+            # Retried (a transient 5xx, a timeout or a read-after-write 404), and a
+            # file that could not be fetched is reported as that, not as a
+            # difference: this runs after the irrevocable publish.
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 --max-time 300 \
+              -u "${GITHUB_ACTOR}:${GITHUB_TOKEN}" -o "$tmp/x" \
               "https://maven.pkg.github.com/${GITHUB_REPOSITORY}/$rel" \
-              || { echo "::error::$rel is not on GitHub Packages"; exit 1; }
+              || { echo "::error::$rel could not be fetched from GitHub Packages after 6 attempts (not a byte difference: the check did not get that far)"; exit 1; }
             cmp -s "$f" "$tmp/x" || { echo "::error::$rel on GitHub Packages differs from the staged, checked copy"; exit 1; }
             n=$((n + 1))
           done < <(find build/maven-repo/eth/myotis -path "*/$v/*" -type f ! -name 'maven-metadata*' \

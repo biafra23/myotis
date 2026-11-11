@@ -23,6 +23,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Read-only by default: the build job runs cargo build scripts. The release
+# job asks for what it writes.
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build MyotisEngine.xcframework

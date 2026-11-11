@@ -10,7 +10,7 @@
 # xcodebuild + lipo).
 #
 # One-time setup:
-#   rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+#   (cd rust && rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios)
 #
 # Then: rust/build-xcframework.sh
 #   -> rust/target/ios-xcframework/MyotisEngine.xcframework

@@ -466,16 +466,40 @@ jobs:
           bash .github/release-notes.sh create "$tag"
           # Upload, and check that the release serves these bytes.
           bash .github/release-assets.sh "$tag" "dmg/Myotis-${tag}-arm64.dmg" "dmg/Myotis-${tag}-x64.dmg"
-          if [ -f "dmg/Myotis-${tag}-bee-poc-arm64.dmg" ]; then
-            bash .github/release-assets.sh "$tag" "dmg/Myotis-${tag}-bee-poc-arm64.dmg"
-          else
-            echo "::warning::no Bee PoC dmg produced for this tag — release published without it"
-          fi
 
       - name: Attest the dmgs' build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
           subject-checksums: ${{ runner.temp }}/release-assets.SHA256SUMS
+
+      # The Bee PoC dmg after the standard ones are published AND attested, in
+      # steps of its own that may fail: on a tag no bundle may hold back the
+      # standard assets (CLAUDE.md), their attestation included. Its own
+      # subjects file, so its attestation names only it.
+      - name: Publish the Bee PoC dmg
+        id: bee
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_ASSETS_SUBJECTS: ${{ runner.temp }}/release-assets-bee.SHA256SUMS
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          if [ -f "dmg/Myotis-${tag}-bee-poc-arm64.dmg" ]; then
+            bash .github/release-assets.sh "$tag" "dmg/Myotis-${tag}-bee-poc-arm64.dmg"
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::no Bee PoC dmg produced for this tag — release published without it"
+          fi
+
+      # (Not hashFiles on the subjects file: it only sees the workspace.)
+      - name: Attest the Bee PoC dmg's build provenance
+        if: ${{ steps.bee.outputs.published == 'true' }}
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/release-assets-bee.SHA256SUMS
 
       # Last, and also when the attestation failed: SHA256SUMS is the one file
       # all publishers share, kept apart from this job's own upload and

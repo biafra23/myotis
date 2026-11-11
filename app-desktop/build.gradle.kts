@@ -12,6 +12,8 @@ import java.time.LocalDateTime
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
+import java.time.Instant
+import java.time.ZoneOffset
 
 plugins {
     alias(libs.plugins.kotlin.jvm)
@@ -43,6 +45,23 @@ val releaseVersion = project.version.toString().substringBefore('-')  // 0.1.4-S
 //     downgrade, and it only surfaces years later.
 // The +1 rule has no cliff and needs no revisiting at 1.0, so nothing here
 // depends on someone re-reading this comment before the transition.
+// The year of the commit being built, for the installers' copyright line
+// (nativeDistributions below): SOURCE_DATE_EPOCH when the build states it (the
+// release and comparison workflows do), else the commit's own time, and only
+// outside a git checkout the current year. UTC, so the zone of the builder
+// cannot move it across New Year.
+val commitYear: String = run {
+    val epoch = System.getenv("SOURCE_DATE_EPOCH")?.trim()?.toLongOrNull()
+        ?: runCatching {
+            providers.exec {
+                commandLine("git", "log", "-1", "--format=%ct")
+                workingDir = rootDir
+                isIgnoreExitValue = true
+            }.standardOutput.asText.get().trim().toLongOrNull()
+        }.getOrNull()
+    (epoch?.let { Instant.ofEpochSecond(it) } ?: Instant.now()).atZone(ZoneOffset.UTC).year.toString()
+}
+
 val macOsPackageVersion: String = releaseVersion.split('.').let { parts ->
     require(parts.size == 3 && parts.all { it.toIntOrNull() != null }) {
         "Unexpected project version '${project.version}': expected numeric MAJOR.MINOR.PATCH"
@@ -693,6 +712,13 @@ compose.desktop {
             // jpackage builds the deb's Maintainer field as "<vendor> <debMaintainer>",
             // so the human name lives here and debMaintainer stays a bare email.
             vendor = "Dirk Jäckel"
+            // Stated, not left to the packagers' defaults (#734): jpackage writes
+            // "Copyright (C) <the build's year>" into the .deb's copyright file and
+            // the Windows launcher, and the Compose plugin the same into the .app's
+            // Info.plist, from the CLOCK. Two builds on one day agree, and a
+            // rebuild of the same tag next year would not. The year of the
+            // commit instead: the same for every build of it.
+            copyright = "Copyright (C) $commitYear $vendor"
             // Bundle the FULL JDK module graph. jlink otherwise strips the runtime to the
             // modules it can statically detect, but the backend reaches them reflectively —
             // DNS (java.naming), JDBC-style lookups, EC TLS (jdk.crypto.ec), XML, etc. — so a

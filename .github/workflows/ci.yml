@@ -55,6 +55,7 @@ jobs:
           python3 scripts/repro/test_compare_signed_apk.py
           python3 scripts/repro/test_compare.py
           python3 scripts/test_normalize_xcframework.py
+          python3 scripts/test_check_pins_additive.py
           python3 scripts/test_sbom.py
 
       # The rustc rust/rust-toolchain.toml pins, like every Rust lane (#734).

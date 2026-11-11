@@ -794,11 +794,19 @@ val reproducibleRustEnv: Map<String, String> = run {
     val cargoHome = System.getenv("CARGO_HOME")?.takeIf { it.isNotBlank() }
         ?: File(System.getProperty("user.home"), ".cargo").path
     val rustDir = file("rust").absolutePath
-    val maps = listOf(
+    val allMaps = listOf(
         "$cargoHome${File.separator}registry${File.separator}src" to "/cargo/registry/src",
         "$cargoHome${File.separator}git${File.separator}checkouts" to "/cargo/git/checkouts",
         rustDir to "/myotis/rust",
     )
+    // Cargo splits these variables on whitespace (so does the cc crate), so a
+    // mapping whose path has a space would hand rustc half a flag and stop
+    // every cargo task. Such a mapping is left out: the build works, and that
+    // path is simply not remapped (rust/repro-env.sh does the same).
+    val maps = allMaps.filter { (from, _) -> from.none { it.isWhitespace() } }
+    (allMaps - maps.toSet()).forEach { (from, _) ->
+        logger.warn("[rust] '$from' has whitespace in it: not remapped, so the Rust libs built here keep that path (#734 D2)")
+    }
     val rustflags = maps.joinToString(" ") { (from, to) -> "--remap-path-prefix=$from=$to" }
     val cflags = maps.joinToString(" ") { (from, to) -> "-ffile-prefix-map=$from=$to" }
     val triples = (listOf(rustHostTriple) + listOf(
@@ -814,7 +822,8 @@ val reproducibleRustEnv: Map<String, String> = run {
         // Idempotent: a shell that sourced rust/repro-env.sh already carries the block.
         (System.getenv(key)?.takeIf { it.isNotBlank() }?.let { if (value in it) it else "$it $value" } ?: value)
     triples.flatMap { t ->
-        listOfNotNull(
+        if (maps.isEmpty()) emptyList()
+        else listOfNotNull(
             withExisting("CARGO_TARGET_${t.uppercase().replace('-', '_')}_RUSTFLAGS", rustflags),
             if (t.endsWith("-msvc")) null else withExisting("CFLAGS_${t.replace('-', '_')}", cflags),
         )
@@ -1272,7 +1281,7 @@ tasks.register("requireAndroidRustEngine") {
                         (if (rejectedNdks.isEmpty()) ")" else "; rejected: ${rejectedNdks.joinToString()})"),
                 )
                 val tgts = androidRustTargets.filterNot { it in installedRustupTargets }
-                if (tgts.isNotEmpty()) add("Android rustup targets (`rustup target add ${tgts.joinToString(" ")}`)")
+                if (tgts.isNotEmpty()) add("Android rustup targets (`(cd rust && rustup target add ${tgts.joinToString(" ")})`: inside rust/, where rust-toolchain.toml selects the pinned toolchain)")
             }
             throw GradleException(
                 "The Android app builds the Rust engine from source, but the toolchain is " +
@@ -1374,7 +1383,7 @@ tasks.register("verifyAndroidJniLibs") {
 // them over the plain C ABI (rust/include/myotis_engine.h), and the :app-ios
 // framework links them from there. One task per Apple triple; :myotis-engine-ios
 // wires each Kotlin/Native target's cinterop to the matching task. Self-skips
-// off-macOS or without the rustup target (rustup target add aarch64-apple-ios
+// off-macOS or without the rustup target ((cd rust && rustup target add aarch64-apple-ios
 // aarch64-apple-ios-sim).
 val isMacHost = System.getProperty("os.name").lowercase().contains("mac")
 fun registerCargoBuildIos(taskName: String, triple: String) =

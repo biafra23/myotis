@@ -54,7 +54,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # The Android engine library (:myotis-engine, the AAR the Android app consumes)
 # builds the Rust engine FROM SOURCE by default — cargo + the pinned cargo-ndk and
 # NDK (gradle/libs.versions.toml) +
-# `rustup target add aarch64-linux-android x86_64-linux-android` are REQUIRED to
+# `(cd rust && rustup target add aarch64-linux-android x86_64-linux-android)` are REQUIRED to
 # build it, and so :android-app. There is no committed .so (so nothing can drift);
 # an Android build also regenerates the committed UniFFI bindings (:myotis-engine-rust)
 # from source — other workflows do NOT, so regenerate them explicitly with
@@ -184,7 +184,10 @@ Key Gradle modules:
 ## Key Dependencies
 
 - **Every Gradle dependency is pinned by version AND hash** (#734): per-project
-  `gradle.lockfile`s plus `gradle/verification-metadata.xml`, both strict, so a
+  `gradle.lockfile`s plus `gradle/verification-metadata.xml` (verification is
+  strict; the locks run in Gradle's default mode, and STRICT's rule, no
+  configuration without lock state, is enforced by `resolveAllDependencies` in
+  the `gradle pins` check), so a
   new or bumped dependency fails the build until its pins are regenerated with
   `scripts/update_gradle_pins.sh` (then `--from-ci` for the macOS/Windows/arm64
   hashes the `gradle pins` workflow collects). Review the hash diff like code.
@@ -223,10 +226,11 @@ Key Gradle modules:
   give the same bytes. It is not gated (the gate is the owner's), and it is a
   proxy: the proof that a published artifact is the image's is a comparison
   with the published assets themselves. **The image is not the builder of the
-  Linux host libraries a release ships**: those come from `ubuntu-22.04`
-  runners on purpose (a glibc 2.35 floor), so their natives jars, the `.deb`
-  and the Node addon are outside what the image reproduces until #734's
-  desktop part pins a builder for them.
+  Linux host libraries a release ships**: the engine natives jars come from
+  `ubuntu-22.04` runners on purpose (a glibc 2.35 floor), the released `.deb`s
+  and the Linux Node addons from `ubuntu-26.04` / `ubuntu-24.04-arm`, so all of
+  them are outside what the image reproduces until a builder is pinned for
+  them.
   The image's apt packages are listed in `docker/builder/apt-packages.txt`,
   which `check.sh` compares with the built image: moving `APT_SNAPSHOT` or the
   package list moves that file in the same change, and its diff is reviewed

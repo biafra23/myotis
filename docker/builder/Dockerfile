@@ -1,6 +1,8 @@
 # The Myotis builder image (#734, Part 5b, decision D-c): the toolchain a
 # release build of the Linux and Android artifacts needs, and nothing that
-# moves. Everything in it is pinned by digest or hash:
+# moves. Everything in it is pinned, by digest or hash where the source
+# publishes one and by exact version where it does not (rustc, the NDK,
+# build-tools, cargo-ndk: those downloads are trusted to their HTTPS hosts):
 #
 #   base image            by digest (BASE_IMAGE)
 #   apt packages          from snapshot.ubuntu.com at one instant (APT_SNAPSHOT)

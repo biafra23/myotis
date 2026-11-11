@@ -93,6 +93,8 @@ on:
       - 'scripts/check_16k_alignment.py'
       - 'scripts/repro_zip.sh'
       - 'scripts/normalize_maven_metadata.py'
+      - 'scripts/normalize_xcframework.py'
+      - 'rust/repro-env.sh'
   schedule:
     - cron: "41 2 * * 1"  # Mondays 02:41 UTC
   workflow_dispatch:
@@ -104,8 +106,12 @@ permissions:
 # dispatch's run is never cancelled (each is a release's or a week's proof),
 # and the event is in the group so a dispatch on main cannot queue-cancel the
 # weekly run (GitHub keeps one pending run per group).
+#
+# Adding any OTHER label to a PR is a `labeled` event too: its run gets a group
+# of its own (so it cannot cancel a comparison that may be two hours in) and
+# its jobs skip (the label condition on each of them).
 concurrency:
-  group: reproducible-builds-${{ github.event_name }}-${{ github.ref }}
+  group: reproducible-builds-${{ github.event_name }}-${{ github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'reproducible-builds' && format('-label-{0}', github.event.label.name) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -122,7 +128,7 @@ jobs:
   # same image.
   builder-image:
     name: Builder image
-    if: ${{ github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds') }}
+    if: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds')) && (github.event.action != 'labeled' || github.event.label.name == 'reproducible-builds') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 75
     permissions:
@@ -187,11 +193,14 @@ jobs:
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
+          # Artifacts are immutable per run: without this, a re-run of this job
+          # fails here (409) instead of replacing its own upload.
+          overwrite: true
 
   linux:
     name: Linux + Android (leg ${{ matrix.leg }})
     needs: builder-image
-    if: ${{ github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds') }}
+    if: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds')) && (github.event.action != 'labeled' || github.event.label.name == 'reproducible-builds') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 150
     strategy:
@@ -268,6 +277,9 @@ jobs:
             ${{ runner.temp }}/repro-linux.tar
             ${{ runner.temp }}/repro-runner.txt
           if-no-files-found: error
+          # Artifacts are immutable per run: without this, a re-run of this job
+          # fails here (409) instead of replacing its own upload.
+          overwrite: true
 
   # Leg r: the same build on the hosted runner's toolchain, installed as
   # android-apk.yml and engine-library.yml install it. A PROXY for a release,
@@ -277,7 +289,7 @@ jobs:
   # the image.
   linux-release-toolchain:
     name: Linux + Android (leg r, runner toolchain)
-    if: ${{ github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds') }}
+    if: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds')) && (github.event.action != 'labeled' || github.event.label.name == 'reproducible-builds') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 150
     steps:
@@ -324,10 +336,13 @@ jobs:
             ${{ runner.temp }}/repro-linux.tar
             ${{ runner.temp }}/repro-runner.txt
           if-no-files-found: error
+          # Artifacts are immutable per run: without this, a re-run of this job
+          # fails here (409) instead of replacing its own upload.
+          overwrite: true
 
   macos:
     name: macOS + iOS (leg ${{ matrix.leg }})
-    if: ${{ github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds') }}
+    if: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds')) && (github.event.action != 'labeled' || github.event.label.name == 'reproducible-builds') }}
     runs-on: macos-15
     timeout-minutes: 150
     strategy:
@@ -419,10 +434,13 @@ jobs:
             ${{ runner.temp }}/repro-macos.tar
             ${{ runner.temp }}/repro-runner.txt
           if-no-files-found: error
+          # Artifacts are immutable per run: without this, a re-run of this job
+          # fails here (409) instead of replacing its own upload.
+          overwrite: true
 
   windows:
     name: Windows (leg ${{ matrix.leg }})
-    if: ${{ github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds') }}
+    if: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds')) && (github.event.action != 'labeled' || github.event.label.name == 'reproducible-builds') }}
     runs-on: windows-2025
     timeout-minutes: 150
     strategy:
@@ -513,6 +531,9 @@ jobs:
             ${{ runner.temp }}/repro-windows.tar
             ${{ runner.temp }}/repro-runner.txt
           if-no-files-found: error
+          # Artifacts are immutable per run: without this, a re-run of this job
+          # fails here (409) instead of replacing its own upload.
+          overwrite: true
 
   # A `v*` tag only: the rebuild in the builder image (leg a) against the
   # Android assets the tag's release PUBLISHED, which the release workflows
@@ -660,13 +681,16 @@ jobs:
           name: repro-report-linux-image-vs-published
           path: report
           if-no-files-found: ignore
+          # Artifacts are immutable per run: without this, a re-run of this job
+          # fails here (409) instead of replacing its own upload.
+          overwrite: true
 
   compare:
     name: Compare ${{ matrix.name }}
     needs: [ linux, linux-release-toolchain, macos, windows ]
     # Also when a build leg failed: its platform then fails here with "leg
     # missing" instead of the whole comparison quietly not running.
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds')) }}
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds')) && (github.event.action != 'labeled' || github.event.label.name == 'reproducible-builds') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 90
     strategy:
@@ -807,3 +831,6 @@ jobs:
           name: repro-report-${{ matrix.platform }}-${{ matrix.first }}-vs-${{ matrix.second }}
           path: report
           if-no-files-found: ignore
+          # Artifacts are immutable per run: without this, a re-run of this job
+          # fails here (409) instead of replacing its own upload.
+          overwrite: true
