@@ -29,10 +29,15 @@ func main() {
 		listenPort = flag.Int("port", chain.Mainnet().ListenPort, "discv4 UDP port (0 = network default, -1 = ephemeral)")
 		runFor     = flag.Duration("run-for", 0, "exit after this duration (0 = run until interrupted)")
 		quiet      = flag.Bool("quiet", false, "log only new peers, not the periodic summary")
+		debug      = flag.Bool("debug", false, "verbose logging (dial failures, peer reads)")
 	)
 	flag.Parse()
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	level := slog.LevelInfo
+	if *debug {
+		level = slog.LevelDebug
+	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
 	if err := run(*dataDir, *listenPort, *runFor, *quiet, log); err != nil {
 		log.Error("myotis-go: " + err.Error())
@@ -51,6 +56,13 @@ func run(dataDir string, listenPort int, runFor time.Duration, quiet bool, log *
 		"nodeId", fmt.Sprintf("%x", nodekey.NodeID(&key.PublicKey)),
 		"datadir", dataDir)
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	eth := newEthStage(key, netCfg, log)
+	go eth.run(ctx)
+	defer eth.Close()
+
 	disc, err := discovery.Start(discovery.Config{
 		DataDir:    dataDir,
 		Network:    netCfg,
@@ -62,15 +74,13 @@ func run(dataDir string, listenPort int, runFor time.Duration, quiet bool, log *
 				"id", c.ID.String(),
 				"addr", fmt.Sprintf("%s:%d", c.Node.IP(), c.Node.TCP()),
 				"via", c.Source)
+			eth.offer(c)
 		},
 	})
 	if err != nil {
 		return err
 	}
 	defer disc.Close()
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	var deadline <-chan time.Time
 	if runFor > 0 {
@@ -84,25 +94,26 @@ func run(dataDir string, listenPort int, runFor time.Duration, quiet bool, log *
 	for {
 		select {
 		case <-ctx.Done():
-			report(disc, log)
+			report(disc, eth, log)
 			return nil
 		case <-deadline:
-			report(disc, log)
+			report(disc, eth, log)
 			return nil
 		case <-summary.C:
 			if !quiet {
-				report(disc, log)
+				report(disc, eth, log)
 			}
 		}
 	}
 }
 
-func report(disc *discovery.Service, log *slog.Logger) {
+func report(disc *discovery.Service, eth *ethStage, log *slog.Logger) {
 	table, live, bySource := disc.Stats()
 	peers := make([]any, 0, len(bySource))
 	for src, n := range bySource {
 		peers = append(peers, slog.Any(string(src), n))
 	}
 	log.Info("discovery summary",
-		"tableNodes", table, "liveNodes", live, "dialablePeers", peers)
+		"tableNodes", table, "liveNodes", live, "dialablePeers", peers,
+		"ethPeers", eth.count())
 }
