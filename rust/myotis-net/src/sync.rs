@@ -238,7 +238,8 @@ pub struct ChainConfig {
     pub zk_sync: Option<crate::zksync::ZkSyncConfig>,
     /// Checkpoint-sync servers (`crate::checkpointz`) a host may ask for a fresh
     /// anchor at a STALE_ANCHOR park; only ever read on that explicit request.
-    /// Counted per operator, so list at least two operators' servers.
+    /// Every one that answers must agree (one outlier refuses), and at least
+    /// two operators must answer, so list at least two operators' servers.
     pub checkpointz_servers: Vec<String>,
     /// The consensus-layer fork watch this loop feeds — every discv5 ENR's
     /// `eth2` field and every peer Status (`cl_fork_watch`). Handle-owned by

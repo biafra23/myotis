@@ -515,8 +515,10 @@ private fun StaleAnchorDialog(
                     (if (s.engine == "java") "" else
                         "Or fetch a fresh checkpoint: Myotis asks independent checkpoint-sync " +
                         "servers for the block the chain finalized most recently and starts " +
-                        "over from it — only if servers of at least two different operators " +
-                        "agree. You then trust those servers for the starting point; " +
+                        "over from it — only if every server that answers names the same " +
+                        "block (at least two different operators). If even one differs, " +
+                        "nothing is applied and the dialog names it. You then trust those " +
+                        "servers for the starting point; " +
                         "everything after it is verified as usual. ") +
                     "Alternatively raise the bound in Settings, or sync " +
                     "anyway if you trust your network and peers — for this run only." +

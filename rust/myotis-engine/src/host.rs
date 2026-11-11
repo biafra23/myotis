@@ -1525,8 +1525,9 @@ pub fn accept_stale_anchor(handle: i64) -> bool {
 /// round to every server, ≤ ~15 s); call it off the UI thread.
 ///
 /// Applied only when the handle is RUNNING and PARKED in STALE_ANCHOR, and
-/// only when servers of at least two independent operators name the same
-/// finalized root (`myotis_net::checkpointz`). The root is those operators'
+/// only when EVERY server that answers names the same finalized checkpoint,
+/// at least two independent operators among them (`myotis_net::checkpointz`):
+/// one differing or unusable answer refuses, and the error names the outlier. The root is those operators'
 /// word — the engine cannot verify an anchor — so the result names them for
 /// the host to show. A root whose own period is past the bound, or in the
 /// future, is refused. Returns JSON: `{"applied":true,"root":"0x…","slot":n,

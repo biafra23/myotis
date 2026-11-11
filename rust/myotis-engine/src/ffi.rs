@@ -155,8 +155,8 @@ pub fn accept_stale_anchor(handle: i64) -> bool {
     crate::host::accept_stale_anchor(handle)
 }
 
-/// Recover a STALE_ANCHOR park from a fresh checkpoint two or more independent
-/// checkpoint-sync operators agree on. Blocking (HTTPS); JSON
+/// Recover a STALE_ANCHOR park from a fresh checkpoint every answering
+/// checkpoint-sync server names (two or more operators). Blocking (HTTPS); JSON
 /// `{"applied":true,"root","slot","epoch","operators"}` or
 /// `{"applied":false,"error"}` (see `host::refresh_anchor_from_checkpointz`).
 #[uniffi::export]

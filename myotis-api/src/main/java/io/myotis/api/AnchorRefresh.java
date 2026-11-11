@@ -4,8 +4,10 @@ import java.util.List;
 
 /**
  * Outcome of {@link ChainHandle#refreshAnchorFromCheckpointz()}: a fresh
- * finalized checkpoint that checkpoint-sync servers of at least two independent
- * operators agree on, handed to a stack parked in {@link BeaconState#STALE_ANCHOR}.
+ * finalized checkpoint that every answering checkpoint-sync server names (at
+ * least two independent operators among them), handed to a stack parked in
+ * {@link BeaconState#STALE_ANCHOR}. A single differing answer refuses it, and
+ * {@code error} then names the outlier.
  *
  * <p>The root is those operators' word — no engine can verify an anchor — so a
  * host shows {@code operators} with it. Everything synced from it is verified as

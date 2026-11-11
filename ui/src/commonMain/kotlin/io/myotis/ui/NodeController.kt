@@ -70,7 +70,8 @@ interface NodeController {
     /**
      * The stale-anchor dialog's "Fetch fresh checkpoint" action: ask [network]'s
      * checkpoint-sync servers for the chain's current finalized checkpoint and, when
-     * servers of at least two independent operators agree on it, re-anchor the parked
+     * every server that answers names the same one (two or more independent operators;
+     * one differing answer refuses and names the outlier), re-anchor the parked
      * network on it (the stale anchor is discarded, not synced forward from). BLOCKING —
      * one network round of up to ~15 s; call it off the main thread. The default
      * refuses, so a host or engine without it shows why instead of doing nothing.
@@ -807,8 +808,8 @@ data class FreshAnchorResult(val applied: Boolean, val message: String) {
             if (applied) {
                 FreshAnchorResult(
                     true,
-                    "Re-anchored on the checkpoint at slot $slot that ${operators.size} independent " +
-                        "operators agree on (${operators.joinToString()}). Syncing from it…",
+                    "Re-anchored on the checkpoint at slot $slot that every answering server named — " +
+                        "${operators.size} independent operators (${operators.joinToString()}). Syncing from it…",
                 )
             } else {
                 FreshAnchorResult(false, "No fresh checkpoint: ${error ?: "refused"}.")

@@ -254,9 +254,10 @@ public class CommandHandler {
 
     /**
      * The other way out of {@code STALE_ANCHOR}: re-anchor on a fresh finalized
-     * checkpoint that checkpoint-sync servers of at least two independent operators
-     * agree on (the stale anchor is discarded, not walked forward from). The engine
-     * refuses unless parked; the Java engine refuses outright.
+     * checkpoint that every answering checkpoint-sync server names (at least two operators;
+     * one differing answer refuses and names the outlier). The stale anchor is
+     * discarded, not walked forward from. The engine refuses unless parked; the
+     * Java engine refuses outright.
      */
     private String handleRefreshAnchor() {
         io.myotis.api.AnchorRefresh r = handle.refreshAnchorFromCheckpointz();

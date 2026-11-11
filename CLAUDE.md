@@ -805,8 +805,8 @@ that produced this note.
   committee proven by Colibri's ZK proof chain, which is cryptographically
   verified but anchored at Colibri's pinned anchor committee rather than the
   embedded checkpoint; and, only on the user's explicit request at a
-  `STALE_ANCHOR` park, a fresh checkpoint that at least two independent
-  checkpoint-sync operators agree on. Scope and limits: the carve-out under
+  `STALE_ANCHOR` park, a fresh checkpoint that every answering
+  checkpoint-sync server names (at least two independent operators). Scope and limits: the carve-out under
   *Data sources*.
 - **A parameter that can change the answer must be APPLIED or REFUSED — never
   accepted and silently ignored.** A well-formed result computed against
@@ -900,11 +900,12 @@ that produced this note.
   - **Checkpointz finalized roots**, ONLY on the user's explicit request at a
     `STALE_ANCHOR` park (`refreshAnchorFromCheckpointz`). Never automatic, and
     never applied to a store that is not parked. The root is accepted only when
-    a strict majority of the operators that answered, and at least 2
-    (registrable domains), name it, and no answer names a different root for
-    that epoch. This is weaker than `./gradlew refreshCheckpoint`, which requires
-    every responder to agree at one slot. It is their word, as the embedded
-    anchor is the release's, and the host must say so.
+    the vote is UNANIMOUS: every server that answers names the same finalized
+    epoch and root, spanning at least 2 operators (registrable domains). One
+    differing answer (another root or epoch, an `execution_optimistic` or
+    malformed answer) is an alarm: the fetch is refused and the outlier named,
+    never outvoted (owner's ruling, #761, 2026-11-11). It is their word, as the
+    embedded anchor is the release's, and the host must say so.
 
   Neither changes the **transport** of the wallet's reads: account, storage and
   call data still come only from devp2p peers. But every one of them is

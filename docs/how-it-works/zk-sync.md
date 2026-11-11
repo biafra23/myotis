@@ -174,16 +174,24 @@ It is stricter than Colibri's version (`rust/myotis-net/src/checkpointz.rs`):
 - It asks **every** configured server: checkpointz instances and public beacon
   APIs, the union of Colibri's list and the one `./gradlew refreshCheckpoint`
   uses.
-- It accepts the root named by the most operators, and only when that is
-  **a strict majority of the operators that answered and at least two**.
-  Operators are counted by registrable domain, so two hostnames of one operator
-  are one voice. A server one epoch behind is outvoted, not a conflict. A
-  minority naming another epoch can never override the rest.
-- It refuses the round outright if any two servers name **different** roots
-  for the same epoch, and it does not count an `execution_optimistic` answer.
-- This is weaker than `./gradlew refreshCheckpoint`, which makes every
-  responder return the same root at one slot. The on-device gate has to
-  tolerate a server that lags by an epoch.
+- It accepts a root only when the vote is **unanimous**. Every server that
+  answers must name the same finalized epoch and root, and those servers must
+  span at least two operators. Operators are counted by registrable domain, so
+  two hostnames of one operator are one voice.
+- **One differing answer refuses the fetch and names the outlier server**, with
+  what it said and what the others said. Nothing is applied and nothing
+  retries on its own; the user asks again. A differing answer is any of:
+  - another root or another epoch, including a server one epoch behind;
+  - an `execution_optimistic` answer;
+  - an answer that does not parse.
+- A different root for the same epoch is reported as an **alarm**: one side is
+  serving another chain. A server that does not answer at all (unreachable, an
+  HTTP error) names nothing and is only listed.
+  (Owner's ruling on #761, 2026-11-11: a differing source is alarm-worthy,
+  never something to outvote.)
+- In practice: on 2026-11-11 mainnet (8 operators), sepolia (3) and gnosis (2)
+  were unanimous. Chiado was refused, because `rpc-gbc.chiadochain.net` reported
+  a finalized epoch about 200 epochs older than the other two.
 - It refuses a root that is itself past the bound or ahead of the device's
   clock.
 - It applies only while the network is **parked**, so it never replaces a

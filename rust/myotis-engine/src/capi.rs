@@ -252,7 +252,7 @@ pub extern "C" fn myotis_accept_stale_anchor(handle: i64) -> bool {
 }
 
 /// Recover a STALE_ANCHOR park from a fresh checkpoint that checkpoint-sync
-/// servers of two or more independent operators agree on
+/// servers agree on unanimously, two or more operators among them
 /// (`nativeRefreshAnchorFromCheckpointz` twin). Blocking — one HTTPS round, up
 /// to ~15 s; never call from the UI thread. JSON
 /// `{"applied":true,"root","slot","epoch","operators"}` or

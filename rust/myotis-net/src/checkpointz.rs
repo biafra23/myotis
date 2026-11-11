@@ -5,14 +5,15 @@
 //! What Colibri does when it has no state is the same idea in its simplest
 //! form: ask one checkpointz server for `/eth/v1/beacon/states/head/finality_checkpoints`
 //! and trust the finalized root it names. This module asks EVERY configured
-//! server and accepts a root only when it is named by a strict majority of the
-//! operators that answered, and by at least [`MIN_AGREEING_OPERATORS`]
-//! (registrable domains — two hostnames of one operator are one voice); any two
-//! answers naming different roots for one epoch refuse the round, and an
-//! `execution_optimistic` answer does not count. `./gradlew refreshCheckpoint`
-//! is stricter still (every responder must return the same root at one slot);
-//! this gate tolerates a server one epoch behind, which a device asking at an
-//! arbitrary moment routinely meets.
+//! server and accepts a root only when the vote is UNANIMOUS: every server that
+//! answers names the same finalized epoch and root, and they span at least
+//! [`MIN_AGREEING_OPERATORS`] operators (registrable domains — two hostnames of
+//! one operator are one voice). One differing answer — another root, another
+//! epoch, an `execution_optimistic` node, an answer that does not parse — is
+//! an alarm, not a vote to outweigh: the round is refused and the outliers are
+//! named (owner's ruling on #761, 2026-11-11). Nothing retries on its own; the
+//! user asks again. A server that does not answer at all (unreachable, an HTTP
+//! error) names nothing and is only reported.
 //!
 //! **Trust.** The root is NOT verified by this engine — it cannot be, that is
 //! what an anchor is. It is the agreeing operators' word, exactly as the
@@ -54,33 +55,38 @@ pub async fn fetch_agreed(servers: &[String], slots_per_epoch: u64) -> Result<Fr
         (base.clone(), res)
     });
     let mut answers = Vec::new();
-    let mut failures = Vec::new();
+    let mut unusable = Vec::new();
+    let mut silent = Vec::new();
     for (base, res) in futures::future::join_all(futures).await {
         match res {
-            // An optimistic node has not verified its own head: its finality
-            // is not an answer.
+            // An optimistic node has not verified its own head: what it calls
+            // finalized is not an answer anyone may build on.
             Ok(r) if r.status == 200 && is_optimistic(&r.body) => {
-                failures.push(format!("{base}: execution_optimistic answer"))
+                unusable.push(format!("{base} (execution_optimistic)"))
             }
             Ok(r) if r.status == 200 => match parse_finalized(&r.body) {
                 Some((epoch, root)) => {
                     tracing::info!(server = %base, epoch, root = %hex(&root), "checkpointz answer");
-                    answers.push(Answer { operator: operator_of(&base), epoch, root });
+                    answers.push(Answer { server: base.clone(), operator: operator_of(&base), epoch, root });
                 }
-                None => failures.push(format!("{base}: unparseable answer")),
+                None => unusable.push(format!("{base} (unparseable answer)")),
             },
-            Ok(r) => failures.push(format!("{base}: HTTP {}", r.status)),
-            Err(e) => failures.push(format!("{base}: {e}")),
+            Ok(r) => silent.push(format!("{base}: HTTP {}", r.status)),
+            Err(e) => silent.push(format!("{base}: {e}")),
         }
     }
-    for f in &failures {
+    for f in &silent {
         tracing::info!(failure = %f, "checkpointz server did not answer");
     }
-    let (epoch, root, operators) = agree(&answers).map_err(|e| {
-        if failures.is_empty() {
+    let verdict = agree(&answers, &unusable);
+    if let Err(e) = &verdict {
+        tracing::error!(reason = %e, "checkpointz: no fresh checkpoint — the servers do not agree");
+    }
+    let (epoch, root, operators) = verdict.map_err(|e| {
+        if silent.is_empty() {
             e
         } else {
-            format!("{e} (unreachable: {})", failures.join("; "))
+            format!("{e} (no answer from: {})", silent.join("; "))
         }
     })?;
     let slot = epoch.checked_mul(slots_per_epoch).ok_or("epoch overflows")?;
@@ -89,61 +95,85 @@ pub async fn fetch_agreed(servers: &[String], slots_per_epoch: u64) -> Result<Fr
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Answer {
+    /// The server's base URL, as an outlier is named.
+    pub server: String,
     pub operator: String,
     pub epoch: u64,
     pub root: [u8; 32],
 }
 
-/// The (epoch, root) named by the most operators, accepted only when that is
-/// at least [`MIN_AGREEING_OPERATORS`] AND a strict majority of all the
-/// operators that answered. A lagging minority (a server one epoch behind) is
-/// tolerated; a minority naming another epoch can never override the rest —
-/// every answer votes against every other, not only those for the same epoch.
-/// Any epoch for which two answers name DIFFERENT roots refuses the whole
-/// round: one of them is lying or forked, and picking either would be a guess.
-pub(crate) fn agree(answers: &[Answer]) -> Result<(u64, [u8; 32], Vec<String>), String> {
+/// A finalized checkpoint as a server names it: (epoch, block root).
+type Checkpoint = (u64, [u8; 32]);
+
+/// The unanimity gate. Accepted only when there is no unusable answer, every
+/// answer names the same `(epoch, root)`, and the servers naming it span at
+/// least [`MIN_AGREEING_OPERATORS`] operators. Otherwise refused, naming each
+/// outlier: the servers outside the largest group, with what they named, or
+/// every group when no group is the largest. A different ROOT for an epoch some
+/// other server also names is called out on its own — that server, or the
+/// others, is serving another chain.
+pub(crate) fn agree(answers: &[Answer], unusable: &[String]) -> Result<(u64, [u8; 32], Vec<String>), String> {
+    if !unusable.is_empty() {
+        return Err(format!(
+            "REFUSED: unusable answer from {} — no fresh checkpoint is trusted while any \
+             server's answer cannot be checked against the others",
+            unusable.join(", ")
+        ));
+    }
+    if answers.is_empty() {
+        return Err("REFUSED: no checkpoint-sync server answered".into());
+    }
+    let mut groups: Vec<(Checkpoint, Vec<&Answer>)> = Vec::new();
     for a in answers {
-        if let Some(b) = answers.iter().find(|b| b.epoch == a.epoch && b.root != a.root) {
-            return Err(format!(
-                "servers disagree on epoch {}: {} says {}, {} says {}",
-                a.epoch, a.operator, hex(&a.root), b.operator, hex(&b.root)
-            ));
+        match groups.iter_mut().find(|(k, _)| *k == (a.epoch, a.root)) {
+            Some((_, members)) => members.push(a),
+            None => groups.push(((a.epoch, a.root), vec![a])),
         }
     }
-    let mut all_ops: Vec<&str> = answers.iter().map(|a| a.operator.as_str()).collect();
-    all_ops.sort_unstable();
-    all_ops.dedup();
-    let mut candidates: Vec<(u64, [u8; 32])> = answers.iter().map(|a| (a.epoch, a.root)).collect();
-    candidates.sort_unstable();
-    candidates.dedup();
-    let support = |c: &(u64, [u8; 32])| {
-        let mut ops: Vec<String> = answers
-            .iter()
-            .filter(|a| (a.epoch, a.root) == *c)
-            .map(|a| a.operator.clone())
-            .collect();
+    if let [((epoch, root), members)] = groups.as_slice() {
+        let mut ops: Vec<String> = members.iter().map(|a| a.operator.clone()).collect();
         ops.sort();
         ops.dedup();
-        ops
-    };
-    // Most supporters first; among equals, the newer epoch.
-    let best = candidates
-        .iter()
-        .map(|c| (c, support(c)))
-        .max_by(|(ca, oa), (cb, ob)| oa.len().cmp(&ob.len()).then(ca.0.cmp(&cb.0)));
-    match best {
-        Some((c, ops)) if ops.len() >= MIN_AGREEING_OPERATORS && ops.len() * 2 > all_ops.len() => {
-            Ok((c.0, c.1, ops))
+        if ops.len() < MIN_AGREEING_OPERATORS {
+            return Err(format!(
+                "REFUSED: only {} answered ({}) — at least {MIN_AGREEING_OPERATORS} independent \
+                 operators must agree",
+                if ops.len() == 1 { "one operator".to_string() } else { format!("{} operators", ops.len()) },
+                ops.join(", ")
+            ));
         }
-        Some((c, ops)) => Err(format!(
-            "no finalized checkpoint has a majority: the best, epoch {}, is named by {} of {} \
-             operators (needs at least {MIN_AGREEING_OPERATORS} and more than half) — servers \
-             may be between epochs, try again in a minute",
-            c.0,
-            ops.len(),
-            all_ops.len()
-        )),
-        None => Err("no checkpoint-sync server answered".into()),
+        return Ok((*epoch, *root, ops));
+    }
+
+    let describe = |(epoch, root): &Checkpoint| format!("epoch {epoch}, root {}", hex(root));
+    let servers = |members: &[&Answer]| members.iter().map(|a| a.server.as_str()).collect::<Vec<_>>().join(", ");
+    // Same epoch, different root: not lag, a fork or a lie.
+    let conflict = groups.iter().any(|((e, r), _)| groups.iter().any(|((e2, r2), _)| e == e2 && r != r2));
+    let headline = if conflict {
+        "REFUSED — ALARM: checkpoint-sync servers name DIFFERENT roots for the same finalized \
+         epoch; one side is serving another chain"
+    } else {
+        "REFUSED: checkpoint-sync servers do not all name the same finalized checkpoint"
+    };
+    groups.sort_by_key(|g| std::cmp::Reverse(g.1.len()));
+    let largest = groups[0].1.len();
+    if groups.iter().filter(|(_, m)| m.len() == largest).count() == 1 {
+        let (key, members) = &groups[0];
+        let outliers: Vec<String> = groups[1..]
+            .iter()
+            .map(|(k, m)| format!("{} ({})", servers(m), describe(k)))
+            .collect();
+        Err(format!(
+            "{headline}. Outlier{}: {} — against {} server{} naming {}",
+            if outliers.len() == 1 { "" } else { "s" },
+            outliers.join("; "),
+            members.len(),
+            if members.len() == 1 { "" } else { "s" },
+            describe(key)
+        ))
+    } else {
+        let all: Vec<String> = groups.iter().map(|(k, m)| format!("{} ({})", servers(m), describe(k))).collect();
+        Err(format!("{headline}, and no side has more servers. Answers: {}", all.join("; ")))
     }
 }
 
@@ -242,49 +272,69 @@ mod tests {
     }
 
     fn a(op: &str, epoch: u64, r: u8) -> Answer {
-        Answer { operator: op.into(), epoch, root: [r; 32] }
+        Answer { server: format!("https://cp.{op}"), operator: op.into(), epoch, root: [r; 32] }
     }
 
     #[test]
-    fn two_operators_must_agree() {
-        assert!(agree(&[a("x.io", 5, 1)]).is_err());
+    fn a_unanimous_vote_of_two_operators_is_accepted() {
+        assert_eq!(
+            agree(&[a("x.io", 5, 1), a("y.io", 5, 1)], &[]).unwrap(),
+            (5, [1; 32], vec!["x.io".into(), "y.io".into()])
+        );
+    }
+
+    #[test]
+    fn one_operator_is_not_enough() {
+        assert!(agree(&[a("x.io", 5, 1)], &[]).unwrap_err().contains("one operator"));
         // Two hostnames of one operator are one voice.
-        assert!(agree(&[a("x.io", 5, 1), a("x.io", 5, 1)]).is_err());
-        assert_eq!(agree(&[a("x.io", 5, 1), a("y.io", 5, 1)]).unwrap(), (5, [1; 32], vec!["x.io".into(), "y.io".into()]));
+        assert!(agree(&[a("x.io", 5, 1), a("x.io", 5, 1)], &[]).is_err());
+        assert!(agree(&[], &[]).unwrap_err().contains("no checkpoint-sync server answered"));
     }
 
     #[test]
-    fn a_majority_wins_and_a_lagging_server_is_not_a_conflict() {
-        let got = agree(&[a("x.io", 6, 2), a("y.io", 5, 1), a("z.io", 5, 1)]).unwrap();
-        assert_eq!((got.0, got.1), (5, [1; 32]));
-        let got = agree(&[a("x.io", 6, 2), a("y.io", 6, 2), a("z.io", 5, 1)]).unwrap();
-        assert_eq!((got.0, got.1), (6, [2; 32]));
+    fn a_single_differing_server_refuses_the_round_and_is_named() {
+        // Eight agree, one names the next epoch: refused, the one named.
+        let mut answers: Vec<Answer> = (0..8).map(|i| a(&format!("h{i}.io"), 5, 1)).collect();
+        answers.push(a("odd.io", 6, 2));
+        let err = agree(&answers, &[]).unwrap_err();
+        assert!(err.starts_with("REFUSED:"), "{err}");
+        assert!(err.contains("Outlier: https://cp.odd.io (epoch 6"), "{err}");
+        assert!(err.contains("against 8 servers naming epoch 5"), "{err}");
+        assert!(!err.contains("ALARM"), "an epoch apart is not a root conflict: {err}");
+        // A server one epoch BEHIND differs just the same.
+        let mut answers: Vec<Answer> = (0..8).map(|i| a(&format!("h{i}.io"), 5, 1)).collect();
+        answers.push(a("slow.io", 4, 3));
+        assert!(agree(&answers, &[]).unwrap_err().contains("Outlier: https://cp.slow.io (epoch 4"));
     }
 
     #[test]
-    fn a_minority_naming_another_epoch_cannot_override_the_rest() {
-        // #761 review: two operators at an epoch nobody else reports must not
-        // win over seven at the epoch before.
-        let mut answers: Vec<Answer> = (0..7).map(|i| a(&format!("h{i}.io"), 5, 1)).collect();
-        answers.push(a("evil1.io", 6, 9));
-        answers.push(a("evil2.io", 6, 9));
-        let got = agree(&answers).unwrap();
-        assert_eq!((got.0, got.1, got.2.len()), (5, [1; 32], 7));
-        // Two of five is no majority, even when they are the only pair.
-        let split = [a("v.io", 6, 2), a("w.io", 6, 2), a("x.io", 5, 1), a("y.io", 4, 3), a("z.io", 7, 4)];
-        assert!(agree(&split).unwrap_err().contains("majority"));
+    fn a_different_root_for_the_same_epoch_is_an_alarm() {
+        let err = agree(&[a("x.io", 5, 1), a("y.io", 5, 1), a("z.io", 5, 9)], &[]).unwrap_err();
+        assert!(err.contains("ALARM"), "{err}");
+        assert!(err.contains("Outlier: https://cp.z.io (epoch 5, root 0x0909"), "{err}");
+    }
+
+    #[test]
+    fn a_tie_names_every_side() {
+        let err = agree(&[a("w.io", 5, 1), a("x.io", 5, 1), a("y.io", 6, 2), a("z.io", 6, 2)], &[]).unwrap_err();
+        assert!(err.contains("no side has more servers"), "{err}");
+        assert!(err.contains("https://cp.w.io, https://cp.x.io (epoch 5") && err.contains("https://cp.y.io, https://cp.z.io (epoch 6"), "{err}");
+    }
+
+    #[test]
+    fn an_unusable_answer_refuses_even_a_unanimous_rest() {
+        let err = agree(
+            &[a("x.io", 5, 1), a("y.io", 5, 1)],
+            &["https://cp.z.io (execution_optimistic)".into()],
+        )
+        .unwrap_err();
+        assert!(err.contains("unusable answer from https://cp.z.io (execution_optimistic)"), "{err}");
     }
 
     #[test]
     fn optimistic_answers_are_recognised() {
         assert!(is_optimistic(br#"{"execution_optimistic": true,"data":{}}"#));
         assert!(!is_optimistic(BODY.as_bytes()));
-    }
-
-    #[test]
-    fn any_conflict_refuses_the_round() {
-        let err = agree(&[a("x.io", 5, 1), a("y.io", 5, 1), a("z.io", 5, 9)]).unwrap_err();
-        assert!(err.contains("disagree"), "{err}");
     }
 
     #[test]

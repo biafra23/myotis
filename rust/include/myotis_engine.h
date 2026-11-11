@@ -148,7 +148,8 @@ bool myotis_set_ws_bound_periods(int64_t handle, int64_t periods);
 bool myotis_accept_stale_anchor(int64_t handle);
 
 /* (ABI >= 57) Recover a STALE_ANCHOR park from a fresh finalized checkpoint
- * that checkpoint-sync servers of two or more independent operators agree on.
+ * that every answering checkpoint-sync server names, two or more independent
+ * operators among them; one differing answer refuses and names the outlier.
  * Blocking — one HTTPS round, up to ~15 s; never call from the UI thread.
  * Applied only to a RUNNING handle parked in STALE_ANCHOR. Returns JSON
  * {"applied":true,"root":"0x..","slot":n,"epoch":n,"operators":[".."]} or

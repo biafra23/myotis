@@ -405,8 +405,8 @@ uniffi::setup_scaffolding!();
 /// v57: ZK sync + the checkpointz recovery (docs/how-it-works/zk-sync.md).
 ///      `refresh_anchor_from_checkpointz` (UniFFI and the C ABI:
 ///      `myotis_refresh_anchor_from_checkpointz`): a STALE_ANCHOR park re-anchors
-///      on a finalized root that checkpoint-sync servers of ≥ 2 independent
-///      operators agree on. An additive function — bumped so a host that offers
+///      on a finalized root every answering checkpoint-sync server names
+///      (≥ 2 independent operators; any differing answer refuses). An additive function — bumped so a host that offers
 ///      "fetch a fresh checkpoint" is never paired with an engine that lacks it.
 ///      (ZK sync itself needs nothing from the host: on by default for mainnet,
 ///      sepolia and gnosis, `MYOTIS_ZK_SYNC=0` off.)

@@ -136,8 +136,9 @@ public interface ChainHandle {
     /**
      * The other way out of {@link BeaconState#STALE_ANCHOR}: fetch a fresh
      * finalized checkpoint from the network's checkpoint-sync servers and
-     * re-anchor on it — applied only when servers of at least two independent
-     * operators name the same root, and only while this stack is parked.
+     * re-anchor on it — applied only when every server that answers names the
+     * same root (at least two independent operators among them; one differing
+     * answer refuses, naming the outlier), and only while this stack is parked.
      * Unlike {@link #acceptStaleAnchor()} the stale anchor is discarded, not
      * walked forward from; the trust moves to the agreeing operators for the
      * anchor itself (see {@link AnchorRefresh}). Blocking (network round, up to
