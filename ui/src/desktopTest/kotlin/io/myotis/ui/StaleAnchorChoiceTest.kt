@@ -97,6 +97,39 @@ class StaleAnchorChoiceTest {
     }
 
     @Test
+    fun anUnavailableZkProofCanBeTriedAgain() {
+        val c = Parked(parked)
+        rule.setContent { NodeScreen(controller = c, settings = FakeSettings(), logs = NoLogs) }
+        rule.onNodeWithText("Fetch ZK proof").performClick()
+        rule.waitUntil(5_000) { c.calls.count { it == "zk:mainnet" } == 1 }
+        rule.waitForIdle()
+        rule.onNodeWithText("Try the ZK proof again").performClick()
+        rule.waitUntil(5_000) { c.calls.count { it == "zk:mainnet" } == 2 }
+    }
+
+    @Test
+    fun aProofHandedOverCanStillBeFetchedAgain() {
+        val c = Parked(parked, zk = FreshAnchorResult(true, "ZK proof of the committee of period 1419 verified."))
+        rule.setContent { NodeScreen(controller = c, settings = FakeSettings(), logs = NoLogs) }
+        rule.onNodeWithText("Fetch ZK proof").performClick()
+        rule.waitUntil(5_000) { c.calls.contains("zk:mainnet") }
+        rule.waitForIdle()
+        rule.onNodeWithText("Fetch ZK proof again").assertIsDisplayed()
+    }
+
+    @Test
+    fun aRememberedContinueSparesANetworkTheUserKeptPaused() {
+        val settings = FakeSettings()
+        val c = Parked(parked)
+        rule.setContent { NodeScreen(controller = c, settings = settings, logs = NoLogs) }
+        rule.onNodeWithText("Stay paused").performClick()
+        // Remembering "continue" afterwards (Settings) must not consent this park.
+        settings.staleChoice = StaleAnchorChoice.CONTINUE
+        rule.waitForIdle()
+        assert(!c.calls.contains("continue:mainnet")) { c.calls.toString() }
+    }
+
+    @Test
     fun theJavaEngineOffersOnlyContinue() {
         rule.setContent { NodeScreen(controller = Parked(parked.copy(engine = "java")), settings = FakeSettings(), logs = NoLogs) }
         rule.onNodeWithText("Fetch ZK proof").assertDoesNotExist()

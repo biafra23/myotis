@@ -2420,6 +2420,9 @@ async fn run_sync(
                     anchor_period = checkpoint_period.max(snap_period);
                     continue;
                 }
+                // The park may wait minutes for a finality update: let discv5's
+                // finds into the pool, not only the pins and cached peers.
+                drain_discovered(&mut peer_rx, &mut pool);
                 if let Some(fresh) = try_queued_zk_release(&config, &client, &mut pool,
                     &HashSet::new(), &mut zk_last_try).await
                 {
@@ -2887,14 +2890,16 @@ async fn try_queued_zk_release(
     hunt_confirmed: &HashSet<PeerId>,
     last_try: &mut Option<Instant>,
 ) -> Option<LightClientProcessor> {
+    // Throttle before touching the queue: the entry park cycles every second,
+    // and the committee (512 keys) is only worth copying when a try is due.
+    if last_try.is_some_and(|t| t.elapsed() < ZK_PARK_RETRY) {
+        return None;
+    }
     let proven = config.ws_policy.queued_zk_release()?;
     if proven.period != config.wall_clock_period() {
         config.ws_policy.clear_zk_release();
         tracing::warn!(period = proven.period,
             "ZK release dropped: the wall clock left the proven committee's period — ask again");
-        return None;
-    }
-    if last_try.is_some_and(|t| t.elapsed() < ZK_PARK_RETRY) {
         return None;
     }
     *last_try = Some(Instant::now());

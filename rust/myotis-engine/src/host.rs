@@ -1537,18 +1537,9 @@ pub fn accept_stale_anchor(handle: i64) -> bool {
 pub fn refresh_anchor_from_checkpointz(handle: i64) -> String {
     let refuse = |why: &str| format!("{{\"applied\":false,\"error\":{}}}", json_string(why));
     let Some(engine) = engine() else { return refuse("engine unavailable") };
-    let config = {
-        let Ok(map) = engine.handles.lock() else { return refuse("engine unavailable") };
-        match map.get(&handle) {
-            Some(ChainEntry::Running(c, sync, _)) => {
-                if sync.status().state != SyncState::StaleAnchor {
-                    return refuse("not parked at a stale anchor");
-                }
-                Arc::clone(c)
-            }
-            Some(_) => return refuse("network is not running"),
-            None => return refuse("unknown handle"),
-        }
+    let config = match parked_config(engine, handle) {
+        Ok(c) => c,
+        Err(why) => return refuse(why),
     };
     if config.checkpointz_servers.is_empty() {
         return refuse("no checkpoint-sync servers configured for this network");
@@ -1576,11 +1567,7 @@ pub fn refresh_anchor_from_checkpointz(handle: i64) -> String {
     // the loop then discards the anchor, so take it back and say so rather
     // than report a re-anchor that will not happen. A park ending after this
     // re-check is the loop's to discard, logged there.
-    let still_parked = engine.handles.lock().ok().is_some_and(|map| {
-        matches!(map.get(&handle), Some(ChainEntry::Running(_, sync, _))
-            if sync.status().state == SyncState::StaleAnchor)
-    });
-    if !still_parked {
+    if parked_config(engine, handle).is_err() {
         if let Ok(mut slot) = config.ws_policy.fresh_anchor.lock() {
             *slot = None;
         }

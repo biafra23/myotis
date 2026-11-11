@@ -266,7 +266,9 @@ fun NodeScreen(
             val parkedNets = snapshots.filterValues { it.beaconState == "STALE_ANCHOR" }.keys
             LaunchedEffect(parkedNets, savedChoice) {
                 if (savedChoice == StaleAnchorChoice.CONTINUE) {
-                    (parkedNets - autoContinued).forEach { net ->
+                    // Not a network the user told to stay paused (that includes one
+                    // whose own dialog just consented, so it is not asked twice).
+                    (parkedNets - autoContinued - staleDismissed).forEach { net ->
                         controller.acceptStaleAnchor(net)
                         autoContinued = autoContinued + net
                     }
@@ -498,7 +500,12 @@ internal const val READINESS_STRIP_TAG = "readiness-strip"
 private fun StaleAnchorChoiceSection(settings: Settings) {
     var choice by remember { mutableStateOf(settings.staleAnchorChoice()) }
     SettingsSection("When the sync anchor is too old")
-    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+    // Four chips outgrow a phone's width: scroll rather than clip the last one.
+    Row(
+        Modifier.horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         listOf(
             StaleAnchorChoice.ASK to "Ask me",
             StaleAnchorChoice.ZK_PROOF to "ZK proof",
@@ -518,8 +525,8 @@ private fun StaleAnchorChoiceSection(settings: Settings) {
             "dialog asks with the remaining choices. Fresh checkpoint: start over from the block " +
             "every answering checkpoint-sync server names — if one differs, the dialog shows " +
             "the outlier. Continue anyway: sync forward from the old anchor without asking " +
-            "(the long-range risk accepted every time). Applied when a network next parks; " +
-            "the app must be open for it.",
+            "(the long-range risk accepted every time). Applied while the app is open: at " +
+            "the next park, and to networks parked now unless you told them to stay paused.",
     )
 }
 
@@ -640,6 +647,12 @@ private fun StaleAnchorDialog(
                         "No ZK proof is available right now — choose one of the remaining options.",
                         fontWeight = FontWeight.SemiBold,
                     )
+                    // A proof can be minutes from publication (a new period) or one
+                    // prover hiccup away: the choice is withdrawn, not forbidden.
+                    TextButton(
+                        enabled = busy == null,
+                        onClick = { zkUnavailable = false; run(StaleAnchorChoice.ZK_PROOF, false) },
+                    ) { Text("Try the ZK proof again") }
                 }
                 status?.let { Text(it, fontWeight = FontWeight.SemiBold) }
                 if (busy != null) {
@@ -662,9 +675,11 @@ private fun StaleAnchorDialog(
         },
         confirmButton = {
             Column(horizontalAlignment = Alignment.End) {
-                if (!zkUnavailable && !zkApplied) {
+                // Still offered after a proof was handed over: the loop drops it when no
+                // peer serves a matching finality update before the period ends.
+                if (!zkUnavailable) {
                     TextButton(enabled = busy == null, onClick = { run(StaleAnchorChoice.ZK_PROOF, rememberChoice) }) {
-                        Text("Fetch ZK proof")
+                        Text(if (zkApplied) "Fetch ZK proof again" else "Fetch ZK proof")
                     }
                 }
                 if (fetchesOffered) {

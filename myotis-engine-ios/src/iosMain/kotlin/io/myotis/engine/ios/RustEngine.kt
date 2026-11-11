@@ -167,14 +167,16 @@ object RustEngine {
         return myotis_accept_stale_anchor(handle)
     }
 
-    /** Re-anchor a STALE_ANCHOR park on a checkpointz-agreed fresh checkpoint
-     *  (ABI >= 57). Blocking — never call from the main thread. */
+    /** Leave a STALE_ANCHOR park from Colibri's verified ZK proof of the current
+     *  committee (ABI >= 58). Blocking — never call from the main thread. */
     fun fetchZkProofForStaleAnchor(handle: Long): String {
         requireAbi()
         return take(myotis_fetch_zk_proof_for_stale_anchor(handle))
             ?: """{"applied":false,"error":"native failure"}"""
     }
 
+    /** Re-anchor a STALE_ANCHOR park on a fresh checkpoint every answering
+     *  checkpoint-sync server names (ABI >= 57). Blocking — never call from the main thread. */
     fun refreshAnchorFromCheckpointz(handle: Long): String {
         requireAbi()
         return take(myotis_refresh_anchor_from_checkpointz(handle))

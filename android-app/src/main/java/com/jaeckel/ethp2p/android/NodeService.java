@@ -587,7 +587,6 @@ public final class NodeService extends Service {
     public static void setStayAwakeWhileCharging(android.content.Context c, boolean v) {
         prefs(c).edit().putBoolean(K_STAY_AWAKE_CHARGING, v).apply();
     }
-    /** Expert mode (Logs/Index tabs, full Status rows, advanced settings). Off by default. */
     /** The remembered answer to a stale sync anchor, as a {@code StaleAnchorChoice} name
      *  ("ASK" when none is remembered). */
     public static String staleAnchorChoice(android.content.Context c) {
@@ -596,6 +595,7 @@ public final class NodeService extends Service {
     public static void setStaleAnchorChoice(android.content.Context c, String v) {
         prefs(c).edit().putString(K_STALE_ANCHOR_CHOICE, v).apply();
     }
+    /** Expert mode (Logs/Index tabs, full Status rows, advanced settings). Off by default. */
     public static boolean expertMode(android.content.Context c) {
         return prefs(c).getBoolean(K_EXPERT_MODE, false);
     }
@@ -886,8 +886,8 @@ public final class NodeService extends Service {
         }
     }
 
-    /** The stale-anchor dialog's "Fetch fresh checkpoint": re-anchor {@code network}'s
-     *  STALE_ANCHOR park on a checkpointz-agreed fresh checkpoint. Blocking (network
+    /** The stale-anchor dialog's "Fetch ZK proof": leave {@code network}'s STALE_ANCHOR
+     *  park from Colibri's verified proof of the current committee. Blocking (network
      *  round) — the handle is read under the lock, the call runs outside it. */
     public io.myotis.api.ZkRelease fetchZkProofForStaleAnchor(String network) {
         ChainHandle h;
@@ -898,6 +898,9 @@ public final class NodeService extends Service {
         return h.fetchZkProofForStaleAnchor();
     }
 
+    /** The stale-anchor dialog's "Fetch fresh checkpoint": re-anchor {@code network}'s
+     *  STALE_ANCHOR park on a checkpoint every answering checkpoint-sync server names.
+     *  Blocking (network round) — the handle is read under the lock, the call runs outside it. */
     public io.myotis.api.AnchorRefresh refreshAnchorFromCheckpointz(String network) {
         ChainHandle h;
         synchronized (handles) {
