@@ -137,6 +137,11 @@ class IosSettings : Settings {
         defaults.setObject(json, "$K_CUSTOM_TOKENS_PREFIX$network")
     override fun supportsCustomTokens(): Boolean = true   // NSUserDefaults, like the watch list
 
+    override fun staleAnchorChoice(): io.myotis.ui.StaleAnchorChoice =
+        io.myotis.ui.StaleAnchorChoice.parse(defaults.stringForKey(K_STALE_CHOICE))
+    override fun setStaleAnchorChoice(v: io.myotis.ui.StaleAnchorChoice) =
+        defaults.setObject(v.name, K_STALE_CHOICE)
+
     override fun expertMode(): Boolean = getBool(K_EXPERT_MODE, false)
     override fun setExpertMode(v: Boolean) = defaults.setBool(v, K_EXPERT_MODE)
 
@@ -165,5 +170,6 @@ class IosSettings : Settings {
         const val K_DEEP = "deepPool"
         const val K_STRICT = "strictStateFreshness"
         const val K_EXPERT_MODE = "expertMode"
+        const val K_STALE_CHOICE = "staleAnchorChoice"
     }
 }

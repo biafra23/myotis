@@ -80,6 +80,15 @@ interface NodeController {
         FreshAnchorResult(applied = false, message = "Not available with this engine.")
 
     /**
+     * The stale-anchor dialog's "Fetch ZK proof" action: fetch and verify Colibri's ZK
+     * proof of [network]'s current sync committee and leave the park from it. BLOCKING —
+     * call it off the main thread. Not applied means no usable proof is available now:
+     * the dialog then offers the remaining choices. The default refuses.
+     */
+    fun fetchZkProofForStaleAnchor(network: String): FreshAnchorResult =
+        FreshAnchorResult(applied = false, message = "No ZK proof: not available with this engine.")
+
+    /**
      * Re-apply the BLS backend to the process-global selector after [Settings.setNativeBlsEnabled]
      * flips the preference (Android: native blst ⇄ pure-Java Milagro). Takes effect immediately —
      * the decompressed-pubkey cache is process-global so the swap is cheap. Desktop currently has
@@ -436,6 +445,12 @@ interface Settings {
      *  operator knob, not a tuning parameter. Defaults keep hosts compiling. */
     fun wsBoundPeriods(): Int = 0
     fun setWsBoundPeriods(v: Int) {}
+    /** What to do when a network's sync anchor is past the weak-subjectivity bound:
+     *  ask every time ([StaleAnchorChoice.ASK], the default), or apply the choice the
+     *  user told the stale-anchor dialog to remember. Hosts persist it; the defaults
+     *  keep a host without storage on ASK. */
+    fun staleAnchorChoice(): StaleAnchorChoice = StaleAnchorChoice.ASK
+    fun setStaleAnchorChoice(v: StaleAnchorChoice) {}
 
     // --- network metadata (so commonMain need not reference the Java NetworkConfig) ---
     /** Human-facing name for the Settings row, e.g. "Gnosis Chain". */
@@ -814,5 +829,37 @@ data class FreshAnchorResult(val applied: Boolean, val message: String) {
             } else {
                 FreshAnchorResult(false, "No fresh checkpoint: ${error ?: "refused"}.")
             }
+
+        /** The one wording every host shows for the engine contract's `ZkRelease` fields. */
+        fun ofZk(applied: Boolean, period: Long, error: String?): FreshAnchorResult =
+            if (applied) {
+                FreshAnchorResult(
+                    true,
+                    "ZK proof of the committee of period $period verified. Leaving the park as " +
+                        "soon as a peer serves a finality update that committee signed…",
+                )
+            } else {
+                FreshAnchorResult(false, "No ZK proof available: ${error ?: "refused"}.")
+            }
+    }
+}
+
+/**
+ * The answers to a stale (past the weak-subjectivity bound) sync anchor, as the
+ * stale-anchor dialog offers them and as a remembered choice stores them (by [name]).
+ */
+enum class StaleAnchorChoice {
+    /** Show the dialog every time (the default). */
+    ASK,
+    /** Leave the park from Colibri's verified ZK proof of the current committee. */
+    ZK_PROOF,
+    /** Re-anchor on a finalized checkpoint every answering checkpoint-sync server names. */
+    CHECKPOINT,
+    /** Sync forward from the stale anchor anyway (the long-range risk accepted). */
+    CONTINUE;
+
+    companion object {
+        /** A stored name back to a choice; anything unknown reads as [ASK]. */
+        fun parse(stored: String?): StaleAnchorChoice = entries.firstOrNull { it.name == stored } ?: ASK
     }
 }

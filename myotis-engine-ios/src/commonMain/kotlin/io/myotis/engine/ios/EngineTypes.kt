@@ -65,6 +65,9 @@ enum class NetworkMetering { UNKNOWN, UNMETERED, METERED }
  * `AnchorRefresh`: when [applied], the parked network bootstraps from [root], a
  * finalized checkpoint the [operators] agree on; otherwise [error] says why not.
  */
+/** The outcome of [ChainHandle.fetchZkProofForStaleAnchor], the JVM contract's `ZkRelease`. */
+data class ZkRelease(val applied: Boolean, val period: Long, val error: String?)
+
 data class AnchorRefresh(
     val applied: Boolean,
     val root: String?,

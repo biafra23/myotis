@@ -2,9 +2,10 @@
 
 Two ways for the Rust engine to reach the chain's current sync committee
 without walking every light-client update from its anchor. **ZK sync** is
-automatic and replaces the walk. The **fresh checkpoint** is an explicit user
-choice at the weak-subjectivity (`STALE_ANCHOR`) prompt and replaces the anchor
-itself. Both come from [Colibri](https://github.com/corpus-core/colibri-stateless)
+automatic and replaces the walk. At the weak-subjectivity (`STALE_ANCHOR`)
+prompt it is also one of three explicit user choices, next to the **fresh
+checkpoint** (which replaces the anchor itself) and continuing anyway; any of
+them can be remembered. Both come from [Colibri](https://github.com/corpus-core/colibri-stateless)
 (corpus.core's stateless client). Myotis uses Colibri's proofs with the Colibri
 team's permission.
 
@@ -158,6 +159,40 @@ finality update that committee signed.
 anchors (a rotation restarts the recursion), must move in a reviewed release.
 Until then the new proofs are refused (`UnknownProgram`) and every install
 walks. Nothing breaks; it is just slower.
+
+## At a stale-anchor park: three choices
+
+When a network's own anchor is past the weak-subjectivity bound, it parks in
+`STALE_ANCHOR`, and the app asks the user to pick one of three ways forward:
+
+| choice | what happens | engine call / daemon command |
+|---|---|---|
+| **Fetch ZK proof** | Colibri's proof of the *current* period's committee is fetched and verified in the call. The parked loop then initializes a fresh store from it and the first finality update that committee signed, retrying every 15 s while peers are short, and leaves the park. The old anchor is neither walked from nor replaced; trust moves to Colibri's proof chain (*Trust* above). | `fetchZkProofForStaleAnchor()` / `myotis_fetch_zk_proof_for_stale_anchor` / `zk-anchor` |
+| **Fetch fresh checkpoint** | A finalized root every answering checkpoint-sync server names (below). | `refreshAnchorFromCheckpointz()` / `refresh-anchor` |
+| **Continue anyway** | Sync forward from the stale anchor, the long-range risk accepted (the existing consent). | `acceptStaleAnchor()` / `accept-stale-anchor` |
+
+- **No ZK proof available.** The proof is verified before the call returns, so
+  "not applied" means no usable proof right now: the period's proof is not
+  published yet, a prover is unreachable, the network has none (chiado), or ZK
+  is off for this run (`MYOTIS_ZK_SYNC=0`, a caller-supplied root). The dialog
+  then asks again with the two remaining choices.
+- **Remember my choice.** Every choice can be made permanent from the dialog
+  ("Remember my choice and apply it automatically next time"). The choice is
+  stored by the host (`Settings.staleAnchorChoice`) and can be changed under
+  Settings → *When the sync anchor is too old* (Ask me / ZK proof / Fresh
+  checkpoint / Continue anyway). At the next park:
+  - a remembered **continue** consents without showing the dialog;
+  - a remembered **ZK proof** or **checkpoint** runs as soon as the dialog
+    opens. If it fails (no proof, or the checkpoint servers do not all agree),
+    the dialog stays with the remaining choices, and any of those can be
+    remembered in its place.
+- **The app must be open** for a remembered choice to apply. The choice lives in
+  the shared UI, so a headless node (Android service with no UI open, the
+  daemon) stays parked until the app is opened or a daemon command is sent.
+- **Under Tor**, both fetches still run when the user picks them. They are
+  explicit requests, unlike the automatic ZK start, which Tor turns off; both
+  go out in the clear ([privacy-and-tor.md](privacy-and-tor.md) §2).
+- The **Java engine** has neither fetch: its dialog offers only "continue".
 
 ## Fresh checkpoint (the STALE_ANCHOR option)
 

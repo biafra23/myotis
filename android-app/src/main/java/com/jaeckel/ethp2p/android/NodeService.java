@@ -140,6 +140,7 @@ public final class NodeService extends Service {
     private static final String K_IDLE_PAUSE_MIN = "idlePauseMinutes";
     private static final String K_STAY_AWAKE_CHARGING = "stayAwakeWhileCharging";
     private static final String K_EXPERT_MODE = "expertMode";
+    private static final String K_STALE_ANCHOR_CHOICE = "staleAnchorChoice";
     private static final String K_WEB_ACCESS_MODE = "webAccess.mode";
     private static final String K_WEB_ACCESS_ORIGINS = "webAccess.origins";
     private static final String K_WATCH_LIST_PREFIX = "watch.list.";
@@ -587,6 +588,14 @@ public final class NodeService extends Service {
         prefs(c).edit().putBoolean(K_STAY_AWAKE_CHARGING, v).apply();
     }
     /** Expert mode (Logs/Index tabs, full Status rows, advanced settings). Off by default. */
+    /** The remembered answer to a stale sync anchor, as a {@code StaleAnchorChoice} name
+     *  ("ASK" when none is remembered). */
+    public static String staleAnchorChoice(android.content.Context c) {
+        return prefs(c).getString(K_STALE_ANCHOR_CHOICE, "ASK");
+    }
+    public static void setStaleAnchorChoice(android.content.Context c, String v) {
+        prefs(c).edit().putString(K_STALE_ANCHOR_CHOICE, v).apply();
+    }
     public static boolean expertMode(android.content.Context c) {
         return prefs(c).getBoolean(K_EXPERT_MODE, false);
     }
@@ -880,6 +889,15 @@ public final class NodeService extends Service {
     /** The stale-anchor dialog's "Fetch fresh checkpoint": re-anchor {@code network}'s
      *  STALE_ANCHOR park on a checkpointz-agreed fresh checkpoint. Blocking (network
      *  round) — the handle is read under the lock, the call runs outside it. */
+    public io.myotis.api.ZkRelease fetchZkProofForStaleAnchor(String network) {
+        ChainHandle h;
+        synchronized (handles) {
+            h = handles.get(network);
+        }
+        if (h == null) return io.myotis.api.ZkRelease.refused(network + " is not running");
+        return h.fetchZkProofForStaleAnchor();
+    }
+
     public io.myotis.api.AnchorRefresh refreshAnchorFromCheckpointz(String network) {
         ChainHandle h;
         synchronized (handles) {

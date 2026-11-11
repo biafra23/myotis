@@ -410,7 +410,13 @@ uniffi::setup_scaffolding!();
 ///      "fetch a fresh checkpoint" is never paired with an engine that lacks it.
 ///      (ZK sync itself needs nothing from the host: on by default for mainnet,
 ///      sepolia and gnosis, `MYOTIS_ZK_SYNC=0` off.)
-pub const ABI_VERSION: i32 = 57;
+/// v58: `fetch_zk_proof_for_stale_anchor` (UniFFI and the C ABI:
+///      `myotis_fetch_zk_proof_for_stale_anchor`): at a STALE_ANCHOR park the
+///      user may ask for Colibri's ZK proof of the current committee; verified
+///      in the call, then applied by the parked loop. An additive function —
+///      bumped so a host that offers "Fetch ZK proof" is never paired with an
+///      engine that lacks it.
+pub const ABI_VERSION: i32 = 58;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

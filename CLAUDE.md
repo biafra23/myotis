@@ -891,8 +891,12 @@ that produced this note.
     key (with `VK_ROOT` and the selector) and `PROGRAM_VKEY_HASH` (taken from
     Colibri v0.1.2; no reproducible build from source is recorded). A Colibri
     program rotation moves the pins in a reviewed release, never at runtime.
-    It does not run under Tor (#539's DNS rule), nor for a caller-supplied or
-    checkpointz root (the chosen root must be applied).
+    It does not run automatically under Tor (#539's DNS rule), nor for a
+    caller-supplied or checkpointz root (the chosen root must be applied). At a
+    `STALE_ANCHOR` park it is also an explicit user choice ("Fetch ZK proof",
+    `fetchZkProofForStaleAnchor`), next to the checkpointz fetch and continuing
+    anyway; the explicit fetches run even under Tor, and any of the three may be
+    remembered by the host (owner's request, 2026-11-11).
     `MYOTIS_ZK_SYNC=0` turns it off for a process whose environment someone
     controls, but it does not undo a store already persisted from a proof, and
     that snapshot is the file the Java engine also resumes. The cold-start

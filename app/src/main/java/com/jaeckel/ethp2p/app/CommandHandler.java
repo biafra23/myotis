@@ -99,6 +99,7 @@ public class CommandHandler {
                 case "beacon-status"           -> handleBeaconStatus();
                 case "accept-stale-anchor"     -> handleAcceptStaleAnchor();
                 case "refresh-anchor"          -> handleRefreshAnchor();
+                case "zk-anchor"               -> handleZkAnchor();
                 case "import-logindex"         -> handleImportLogIndex(jsonLine);
                 case "export-logindex"         -> handleExportLogIndex(jsonLine);
                 case "build-logindex"          -> handleBuildLogIndex(jsonLine);
@@ -274,6 +275,23 @@ public class CommandHandler {
                 + ",\"operators\":[" + ops + "]"
                 + ",\"note\":\"re-anchored on the checkpoint these operators agree on — the anchor"
                 + " is their word; everything after it is verified as usual\"}";
+    }
+
+    /**
+     * The third way out of {@code STALE_ANCHOR}: Colibri's ZK proof of the current
+     * period's committee, fetched and verified now, applied by the parked stack once
+     * a peer serves a finality update that committee signed. Not applied = no usable
+     * proof right now (use {@code refresh-anchor} or {@code accept-stale-anchor}).
+     */
+    private String handleZkAnchor() {
+        io.myotis.api.ZkRelease r = handle.fetchZkProofForStaleAnchor();
+        if (!r.applied()) {
+            return "{\"ok\":true,\"applied\":false,\"note\":" + jsonQuote(r.error()) + "}";
+        }
+        return "{\"ok\":true,\"applied\":true,\"period\":" + r.period()
+                + ",\"note\":\"ZK proof of the current committee verified; the node leaves the park"
+                + " once a peer serves a finality update that committee signed. Anchored at Colibri's"
+                + " anchor committee, not the stale one\"}";
     }
 
     private static String jsonQuote(String s) {

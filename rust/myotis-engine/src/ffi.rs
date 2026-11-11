@@ -164,6 +164,15 @@ pub fn refresh_anchor_from_checkpointz(handle: i64) -> String {
     crate::host::refresh_anchor_from_checkpointz(handle)
 }
 
+/// Resolve a STALE_ANCHOR park with Colibri's ZK proof of the current period's
+/// committee, on the user's request. Blocking (HTTPS); JSON
+/// `{"applied":true,"period"}` or `{"applied":false,"error"}` (see
+/// `host::fetch_zk_proof_for_stale_anchor`).
+#[uniffi::export]
+pub fn fetch_zk_proof_for_stale_anchor(handle: i64) -> String {
+    crate::host::fetch_zk_proof_for_stale_anchor(handle)
+}
+
 /// Live-set the eth/69 served-block window (the Settings knob). Clamped to
 /// [1, 4096]; applied immediately on a RUNNING handle's EL reader, stashed for
 /// the next spin_up when the handle isn't running. False only for an unknown

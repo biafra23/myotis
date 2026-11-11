@@ -149,6 +149,19 @@ public interface ChainHandle {
     }
 
     /**
+     * The third way out of {@link BeaconState#STALE_ANCHOR}: fetch and verify
+     * Colibri's ZK proof of the current period's sync committee and leave the
+     * park from it, neither walking from the stale anchor nor replacing it with a
+     * checkpoint. The proof chain is anchored at Colibri's pinned anchor committee
+     * (docs/how-it-works/zk-sync.md). Not applied means no usable proof right
+     * now: offer the remaining choices. Blocking (network round): never call from
+     * a UI thread. An engine without it refuses.
+     */
+    default ZkRelease fetchZkProofForStaleAnchor() {
+        return ZkRelease.refused("not supported by this engine");
+    }
+
+    /**
      * Clear the live dial bookkeeping — backoff entries and this session's
      * blacklist — so discovery re-dials from a fresh slate. On-disk peer-cache
      * FILES are host-owned; deleting those is the host's job.

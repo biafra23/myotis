@@ -276,6 +276,13 @@ class DesktopNodeController(
         engine.get(network)?.acceptStaleAnchor()
     }
 
+    override fun fetchZkProofForStaleAnchor(network: String): io.myotis.ui.FreshAnchorResult {
+        val handle = engine.get(network)
+            ?: return io.myotis.ui.FreshAnchorResult(false, "No ZK proof: $network is not running.")
+        val r = handle.fetchZkProofForStaleAnchor()
+        return io.myotis.ui.FreshAnchorResult.ofZk(r.applied(), r.period(), r.error())
+    }
+
     override fun refreshAnchorFromCheckpointz(network: String): io.myotis.ui.FreshAnchorResult {
         val handle = engine.get(network)
             ?: return io.myotis.ui.FreshAnchorResult(false, "No fresh checkpoint: $network is not running.")
@@ -1003,6 +1010,7 @@ class DesktopSettings(
     private var servedWindow = 32
     // Weak-subjectivity bound override (periods); 0 = each network's default.
     private var wsBound = 0
+    private var staleChoice = io.myotis.ui.StaleAnchorChoice.ASK
     private var deep = 16
     private var strict = true
     // Desktop has no bundled native blst yet (Milagro-only), so the honest default is off; the
@@ -1086,6 +1094,8 @@ class DesktopSettings(
     override fun wsBoundPeriods(): Int = synchronized(this) { wsBound }
     // 0 = per-network default; cap keeps a typo from storing an absurd bound.
     override fun setWsBoundPeriods(v: Int) = mutate { wsBound = v.coerceIn(0, 9999) }
+    override fun staleAnchorChoice(): io.myotis.ui.StaleAnchorChoice = synchronized(this) { staleChoice }
+    override fun setStaleAnchorChoice(v: io.myotis.ui.StaleAnchorChoice) = mutate { staleChoice = v }
     override fun logIndexEnabled(network: String): Boolean =
         synchronized(this) { logIndexOn[network] ?: false }
     override fun setLogIndexEnabled(network: String, on: Boolean) = mutate { logIndexOn[network] = on }
@@ -1198,6 +1208,7 @@ class DesktopSettings(
         p.getProperty(K_SNAP)?.toIntOrNull()?.let { snap = it.coerceIn(1, 128) }
         p.getProperty(K_SERVED_WINDOW)?.toIntOrNull()?.let { servedWindow = it.coerceIn(1, 4096) }
         p.getProperty(K_WS_BOUND)?.toIntOrNull()?.let { wsBound = it.coerceIn(0, 9999) }
+        staleChoice = io.myotis.ui.StaleAnchorChoice.parse(p.getProperty(K_STALE_CHOICE))
         p.getProperty(K_DEEP)?.toIntOrNull()?.let { deep = it.coerceIn(1, 128) }
         p.getProperty(K_STRICT)?.toBooleanStrictOrNull()?.let { strict = it }
         p.getProperty(K_NATIVE_BLS)?.toBooleanStrictOrNull()?.let { nativeBls = it }
@@ -1308,6 +1319,7 @@ class DesktopSettings(
         p.setProperty(K_SNAP, snap.toString())
         p.setProperty(K_SERVED_WINDOW, servedWindow.toString())
         p.setProperty(K_WS_BOUND, wsBound.toString())
+        p.setProperty(K_STALE_CHOICE, staleChoice.name)
         p.setProperty(K_DEEP, deep.toString())
         p.setProperty(K_STRICT, strict.toString())
         p.setProperty(K_NATIVE_BLS, nativeBls.toString())
@@ -1357,6 +1369,7 @@ class DesktopSettings(
         const val K_SNAP = "snapTarget"
         const val K_SERVED_WINDOW = "servedBlockWindow"
         const val K_WS_BOUND = "wsBoundPeriods"
+        const val K_STALE_CHOICE = "staleAnchorChoice"
         const val K_DEEP = "deepPool"
         const val K_STRICT = "strictStateFreshness"
         const val K_NATIVE_BLS = "nativeBls"

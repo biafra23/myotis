@@ -161,11 +161,29 @@ pub struct WsPolicy {
     /// checkpoint (Merkle-pinned to it, then BLS-verified forward). Ignored —
     /// left in place — by a loop that is not parked.
     pub fresh_anchor: std::sync::Mutex<Option<([u8; 32], u64)>>,
+    /// A committee the USER asked to be proven at a STALE_ANCHOR park (the
+    /// dialog's "Fetch ZK proof"), already fetched and verified by the host
+    /// call (`myotis_engine::host::fetch_zk_proof_for_stale_anchor`). The park
+    /// initializes a fresh store from it and the first finality update that
+    /// committee signed, retrying every [`ZK_PARK_RETRY`] while peers are
+    /// short; a committee whose period the wall clock has left is dropped.
+    /// Like `fresh_anchor`, dropped when the park ends some other way.
+    pub zk_release: std::sync::Mutex<Option<myotis_consensus::zk::ProvenCommittee>>,
 }
+
+/// How often a park retries a queued ZK release while no peer has yet served
+/// a finality update the proven committee signed.
+const ZK_PARK_RETRY: Duration = Duration::from_secs(15);
 
 impl WsPolicy {
     fn take_fresh_anchor(&self) -> Option<([u8; 32], u64)> {
         self.fresh_anchor.lock().ok()?.take()
+    }
+    fn queued_zk_release(&self) -> Option<myotis_consensus::zk::ProvenCommittee> {
+        self.zk_release.lock().ok()?.clone()
+    }
+    fn clear_zk_release(&self) -> bool {
+        self.zk_release.lock().ok().is_some_and(|mut q| q.take().is_some())
     }
 }
 
@@ -2355,6 +2373,11 @@ async fn run_sync(
     let mut resume = ResumeGuard::fresh();
     let mut zk_backoff = crate::zksync::ZkBackoff::new();
     let mut zk_proven: Option<myotis_consensus::zk::ProvenCommittee> = None;
+    // Set when the user's ZK proof released the entry park: the store is then
+    // already initialized (current period), and the stale snapshot must not be
+    // restored over it.
+    let mut zk_released = false;
+    let mut zk_park_last_try: Option<Instant> = None;
     // Deserialize the snapshot ONCE, up front: the weak-subjectivity gate below
     // must judge the BEST available anchor (embedded checkpoint vs persisted
     // snapshot) BEFORE anything is restored from it, and the strictly-newer
@@ -2384,6 +2407,7 @@ async fn run_sync(
             .unwrap_or(0);
         let mut anchor_period = checkpoint_period.max(snap_period);
         let mut parked = false;
+        let mut zk_last_try = None;
         loop {
             // A fresh anchor from the host's checkpointz recovery replaces the
             // embedded checkpoint for this run; the snapshot, older than it by
@@ -2395,6 +2419,14 @@ async fn run_sync(
                     last_persisted_period = embedded_checkpoint_period;
                     anchor_period = checkpoint_period.max(snap_period);
                     continue;
+                }
+                if let Some(fresh) = try_queued_zk_release(&config, &client, &mut pool,
+                    &HashSet::new(), &mut zk_last_try).await
+                {
+                    processor = fresh;
+                    zk_released = true;
+                    last_persisted_period = embedded_checkpoint_period;
+                    break;
                 }
             }
             let bound = config.effective_ws_bound_periods();
@@ -2418,7 +2450,12 @@ async fn run_sync(
             refresh_local_status(&config, &processor, &local_status);
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        if parked {
+        if parked && zk_released {
+            resume = ResumeGuard::fresh();
+            persist_snapshot(&config, &processor, &mut last_persisted_period);
+            refresh_local_status(&config, &processor, &local_status);
+            publish_status(&config, &client, &processor, &pool, &status_tx, &anchor, false).await;
+        } else if parked {
             discard_unused_fresh_anchor(&config);
             tracing::warn!(anchor_period,
                 "stale anchor released (bound raised or risk accepted) — syncing forward");
@@ -2430,7 +2467,9 @@ async fn run_sync(
         }
     }
 
-    if let Some(snap) = persisted_snap {
+    // A ZK release initialized the store already; the snapshot is the stale
+    // state the user chose to leave behind.
+    if let Some(snap) = persisted_snap.filter(|_| !zk_released) {
         if snap.current_sync_committee_period > checkpoint_period {
             last_persisted_period = snap.current_sync_committee_period;
             tracing::info!(period = snap.current_sync_committee_period,
@@ -2491,6 +2530,18 @@ async fn run_sync(
                 resume = ResumeGuard::fresh();
                 staged_updates.clear();
                 in_catchup = false;
+                publish_status(&config, &client, &processor, &pool, &status_tx, &anchor, hunt.hunting).await;
+                continue;
+            }
+            if let Some(fresh) = try_queued_zk_release(&config, &client, &mut pool,
+                &hunt.confirmed, &mut zk_park_last_try).await
+            {
+                processor = fresh;
+                resume = ResumeGuard::fresh();
+                staged_updates.clear();
+                in_catchup = false;
+                persist_snapshot(&config, &processor, &mut last_persisted_period);
+                refresh_local_status(&config, &processor, &local_status);
                 publish_status(&config, &client, &processor, &pool, &status_tx, &anchor, hunt.hunting).await;
                 continue;
             }
@@ -2821,6 +2872,48 @@ fn discard_unused_fresh_anchor(config: &ChainConfig) {
         tracing::info!(root = %hex_str(&root), slot,
             "discarding a fresh anchor that arrived after the park ended");
     }
+    if config.ws_policy.clear_zk_release() {
+        tracing::info!("discarding a ZK proof that arrived after the park ended");
+    }
+}
+
+/// A user-requested ZK release at a park: `Some(store)` when it initialized,
+/// `None` when nothing is queued, it is not due yet, or it failed this time
+/// (kept for the next try unless its period has passed).
+async fn try_queued_zk_release(
+    config: &ChainConfig,
+    client: &ReqRespClient,
+    pool: &mut PeerPool,
+    hunt_confirmed: &HashSet<PeerId>,
+    last_try: &mut Option<Instant>,
+) -> Option<LightClientProcessor> {
+    let proven = config.ws_policy.queued_zk_release()?;
+    if proven.period != config.wall_clock_period() {
+        config.ws_policy.clear_zk_release();
+        tracing::warn!(period = proven.period,
+            "ZK release dropped: the wall clock left the proven committee's period — ask again");
+        return None;
+    }
+    if last_try.is_some_and(|t| t.elapsed() < ZK_PARK_RETRY) {
+        return None;
+    }
+    *last_try = Some(Instant::now());
+    match init_from_proven(config, client, pool, hunt_confirmed, &proven).await {
+        Ok(fresh) => {
+            config.ws_policy.clear_zk_release();
+            tracing::warn!(period = proven.period,
+                "STALE ANCHOR resolved by the user's ZK proof: store initialized from the \
+                 proven committee of the current period (anchored at Colibri's anchor \
+                 committee, not the stale one)");
+            Some(fresh)
+        }
+        Err(why) => {
+            tracing::info!(reason = %why, retry_in_s = ZK_PARK_RETRY.as_secs(),
+                "ZK release queued at the park: waiting for a finality update the proven \
+                 committee signed");
+            None
+        }
+    }
 }
 
 fn persist_snapshot(
@@ -2909,7 +3002,30 @@ async fn try_zk_start(
     tracing::info!(period, attested_slot = proven.attested_header.slot,
         "ZK start: committee proven from the network's Colibri anchor — \
          asking peers for a finality update it signed");
+    match init_from_proven(config, client, pool, hunt_confirmed, &proven).await {
+        Ok(fresh) => Ok(fresh),
+        Err(why) => {
+            *proven_cache = Some(proven);
+            Err((why, crate::zksync::ZkBackoff::SHORT))
+        }
+    }
+}
 
+/// The second half of a ZK start: a fresh processor initialized from `proven`
+/// and the first finality update from a peer that this committee signed with
+/// its finalized header in the committee's period. Shared by the automatic ZK
+/// start and the user's "fetch a ZK proof" at a STALE_ANCHOR park.
+async fn init_from_proven(
+    config: &ChainConfig,
+    client: &ReqRespClient,
+    pool: &mut PeerPool,
+    hunt_confirmed: &HashSet<PeerId>,
+    proven: &myotis_consensus::zk::ProvenCommittee,
+) -> Result<LightClientProcessor, String> {
+    let period = proven.period;
+    if pool.is_empty() {
+        return Err("no peers yet".into());
+    }
     let mut prefer = client.lc_update_servers().await;
     prefer.extend(hunt_confirmed.iter().copied());
     let peers = pool.candidates(16, false, false, &prefer, &HashSet::new());
@@ -2954,14 +3070,10 @@ async fn try_zk_start(
             }
         }
     }
-    *proven_cache = Some(proven);
-    Err((
-        match last_reject {
-            Some(e) => format!("no usable finality update ({e})"),
-            None => "no peer answered a finality update".into(),
-        },
-        crate::zksync::ZkBackoff::SHORT,
-    ))
+    Err(match last_reject {
+        Some(e) => format!("no usable finality update ({e})"),
+        None => "no peer answered a finality update".into(),
+    })
 }
 
 /// Fan a bootstrap request out to a few peers; first VALID response wins.

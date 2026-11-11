@@ -38,6 +38,17 @@ class RustAnchorRefreshJsonTest {
     }
 
     @Test
+    void zkReleaseDecodes() {
+        io.myotis.api.ZkRelease r = RustChainHandle.parseZkRelease("{\"applied\":true,\"period\":1907}");
+        assertTrue(r.applied());
+        assertEquals(1907L, r.period());
+        assertNull(r.error());
+        io.myotis.api.ZkRelease no = RustChainHandle.parseZkRelease("{\"applied\":false,\"error\":\"unknown handle\"}");
+        assertFalse(no.applied());
+        assertEquals("unknown handle", no.error());
+    }
+
+    @Test
     void malformedIsARefusalNotACrash() {
         AnchorRefresh r = RustChainHandle.parseAnchorRefresh("not json");
         assertFalse(r.applied());

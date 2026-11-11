@@ -24,6 +24,8 @@ internal interface NativeEngine {
     fun acceptStaleAnchor(handle: Long): Boolean
     /** `myotis_refresh_anchor_from_checkpointz` (ABI >= 57): blocking, JSON. */
     fun refreshAnchorFromCheckpointz(handle: Long): String
+    /** `myotis_fetch_zk_proof_for_stale_anchor` (ABI >= 58): blocking, JSON. */
+    fun fetchZkProofForStaleAnchor(handle: Long): String
     fun statusJson(handle: Long): String
     /** `myotis_set_network_metering` (0 unknown, 1 unmetered, 2 metered); false for another code. */
     fun setNetworkMetering(code: Int): Boolean

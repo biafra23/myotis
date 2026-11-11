@@ -262,6 +262,16 @@ pub extern "C" fn myotis_refresh_anchor_from_checkpointz(handle: i64) -> *mut c_
     into_c(crate::host::refresh_anchor_from_checkpointz(handle))
 }
 
+/// Resolve a STALE_ANCHOR park with Colibri's ZK proof of the current period's
+/// committee, on the user's request (`nativeFetchZkProofForStaleAnchor` twin).
+/// Blocking — one HTTPS round; never call from the UI thread. JSON
+/// `{"applied":true,"period"}` or `{"applied":false,"error"}`; release with
+/// `myotis_string_free`.
+#[no_mangle]
+pub extern "C" fn myotis_fetch_zk_proof_for_stale_anchor(handle: i64) -> *mut c_char {
+    into_c(crate::host::fetch_zk_proof_for_stale_anchor(handle))
+}
+
 /// Verified account read (`nativeRequestAccountJson` twin). Blocking — may take
 /// up to ~90 s for a header-chain walk; never call from the UI thread. `block`
 /// (ABI ≥ 32) is the RPC block selector the engine applies or refuses: NULL or

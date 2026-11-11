@@ -119,6 +119,13 @@ class ChainHandle internal constructor(
     fun refreshAnchorFromCheckpointz(): AnchorRefresh =
         EngineDecoding.anchorRefresh(native.refreshAnchorFromCheckpointz(handle))
 
+    /** The third way out of [BeaconState.STALE_ANCHOR]: Colibri's ZK proof of the current
+     *  period's committee, fetched and verified, then applied by the parked network (the JVM
+     *  contract's `fetchZkProofForStaleAnchor`). Not [ZkRelease.applied] means no usable proof
+     *  now — offer the remaining choices. Blocking: never call it on the main thread. */
+    fun fetchZkProofForStaleAnchor(): ZkRelease =
+        EngineDecoding.zkRelease(native.fetchZkProofForStaleAnchor(handle))
+
     /**
      * A verified account read at the verified head. A verification failure is a result
      * with its `failReason` set; a transport or not-running failure throws
