@@ -208,7 +208,9 @@ fn genesis_fork_hash(genesis: &[u8; 32]) -> [u8; 4] {
 fn hex_fixed<const N: usize>(s: &str, pad: bool) -> Result<[u8; N], String> {
     let s = s.trim();
     let s = s.strip_prefix("0x").unwrap_or(s);
-    if !s.is_ascii() || s.is_empty() || s.len() > N * 2 || (!pad && s.len() != N * 2) {
+    // Digits checked here, not left to `from_str_radix`: it also takes a sign.
+    let all_hex = s.bytes().all(|b| b.is_ascii_hexdigit());
+    if !all_hex || s.is_empty() || s.len() > N * 2 || (!pad && s.len() != N * 2) {
         return Err(format!(
             "expected {}{} hex digits, got \"{}\"",
             if pad { "up to " } else { "" },
@@ -219,8 +221,7 @@ fn hex_fixed<const N: usize>(s: &str, pad: bool) -> Result<[u8; N], String> {
     let padded = format!("{s:0>width$}", width = N * 2);
     let mut out = [0u8; N];
     for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&padded[i * 2..i * 2 + 2], 16)
-            .map_err(|_| format!("not hex: \"{}\"", truncate(s, 80)))?;
+        *b = u8::from_str_radix(&padded[i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
     }
     Ok(out)
 }
@@ -311,9 +312,16 @@ async fn main() -> ExitCode {
         }
         Outcome::HandshakeFailed(e) => {
             println!("\nFAILED  eth handshake: {e}");
-            pause_before_reconnect(&knobs, "read the peer's Status without sending ours").await;
-            if let Err(e) = diagnose(&key, &knobs).await {
-                println!("FAILED  diagnostic pass: {e}");
+            // `EthSession::handshake`'s wording for a Disconnect in answer to
+            // our Hello (too many peers, already connected, …): the peer sent
+            // no Status and would send none to a second Hello either.
+            if e.starts_with("peer disconnected during handshake") {
+                println!("        The peer refused the connection at Hello; a second one would be refused the same way. Try again later.");
+            } else {
+                pause_before_reconnect(&knobs, "read the peer's Status without sending ours").await;
+                if let Err(e) = diagnose(&key, &knobs).await {
+                    println!("FAILED  diagnostic pass: {e}");
+                }
             }
             false
         }
@@ -411,17 +419,27 @@ async fn probe_once(key: &Arc<NodeKey>, knobs: &Knobs) -> Outcome {
         }
     );
 
-    let core = match core_reads(&mut session, knobs).await {
-        Ok(core) => core,
+    let head = match header_by_hash(&mut session, &status.best_hash, "head").await {
+        Ok(head) => head,
         // The handshake gates on network id + genesis only, so a peer that
-        // rejects our fork id shows as a dead session one request later.
-        Err(error) if !fork_matches => {
+        // rejects our fork id shows as a session that dies on the first
+        // request. Only that: an answer we could not use (a header layout
+        // Myotis does not decode, say) is a finding of its own, and a later
+        // failure is not about the fork id — neither is worth a reconnect.
+        Err(HeaderError::Session(error)) if !fork_matches => {
             return Outcome::ForkIdRejected {
                 peer_hash: status.fork_id_hash,
                 peer_next: status.fork_next,
                 error,
             }
         }
+        Err(e) => {
+            println!("FAILED  {}", e.into_string());
+            return Outcome::Ran { ok: false };
+        }
+    };
+    let core = match core_reads(&mut session, knobs, head).await {
+        Ok(core) => core,
         Err(e) => {
             println!("FAILED  {e}");
             return Outcome::Ran { ok: false };
@@ -472,40 +490,60 @@ struct Core {
     all_verified: bool,
 }
 
+/// Why a header could not be had — the two cases call for different next steps.
+enum HeaderError {
+    /// No usable session: a Disconnect, a transport error, no answer in time.
+    Session(String),
+    /// The peer answered, with something we cannot use.
+    Answer(String),
+}
+
+impl HeaderError {
+    fn into_string(self) -> String {
+        match self {
+            HeaderError::Session(e) | HeaderError::Answer(e) => e,
+        }
+    }
+}
+
 /// One header by hash, with the checks the session leaves to its caller: the
 /// peer answered, and with THE header asked for.
 async fn header_by_hash(
     session: &mut EthSession,
     hash: &[u8; 32],
     what: &str,
-) -> Result<VerifiedHeader, String> {
+) -> Result<VerifiedHeader, HeaderError> {
     let headers = session
         .get_block_headers_by_hash(hash, 1)
         .await
         .map_err(|e| {
+            // The session's own prefix for a response its decoder refused.
             if e.starts_with("BlockHeaders decode") {
-                format!("{what} header: {e}\n        FINDING: Myotis's BlockHeader decoder does not accept this chain's header layout")
+                HeaderError::Answer(format!("{what} header: {e}\n        FINDING: Myotis's BlockHeader decoder does not accept this chain's header layout"))
             } else {
-                format!("{what} header: {e}")
+                HeaderError::Session(format!("{what} header: {e}"))
             }
         })?;
-    let header = headers
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("{what} header: the peer returned none for 0x{}", hex(hash)))?;
+    let header = headers.into_iter().next().ok_or_else(|| {
+        HeaderError::Answer(format!(
+            "{what} header: the peer returned none for 0x{}",
+            hex(hash)
+        ))
+    })?;
     if &header.hash != hash {
-        return Err(format!(
+        return Err(HeaderError::Answer(format!(
             "{what} header: keccak mismatch — asked 0x{}, got 0x{}",
             hex(hash),
             hex(&header.hash)
-        ));
+        )));
     }
     Ok(header)
 }
 
 fn describe_header(what: &str, h: &VerifiedHeader) {
     // The field count places the header's fork without naming it: 15 = pre-
-    // London, 16 London, 17 Shanghai, 20 Cancun, 21 Prague, 22 Amsterdam.
+    // London, 16 London, 17 Shanghai, 20 Cancun, 21 Prague; more than 21 is
+    // past Prague.
     let fields = rlp::View::new(&h.raw_rlp)
         .and_then(|v| v.as_list())
         .map_or(0, |l| l.count());
@@ -521,19 +559,23 @@ fn describe_header(what: &str, h: &VerifiedHeader) {
     );
 }
 
-/// Head header, the optional anchor header, then account → storage → bytecode
+/// From the head header: the optional anchor header, then account → storage → bytecode
 /// at the proving root. `Err` = the header or the account could not be had at
 /// all; a storage or bytecode failure is reported and clears `all_verified`.
-async fn core_reads(session: &mut EthSession, knobs: &Knobs) -> Result<Core, String> {
-    let head_hash = session.peer_status.best_hash;
-    let head = header_by_hash(session, &head_hash, "head").await?;
+async fn core_reads(
+    session: &mut EthSession,
+    knobs: &Knobs,
+    head: VerifiedHeader,
+) -> Result<Core, String> {
     println!();
     describe_header("head", &head);
     let head_number = head.header.number;
 
     let (at, label) = match &knobs.anchor {
         Some(hash) => {
-            let anchor = header_by_hash(session, hash, "anchor").await?;
+            let anchor = header_by_hash(session, hash, "anchor")
+                .await
+                .map_err(HeaderError::into_string)?;
             describe_header("anchor", &anchor);
             println!(
                 "            {} blocks behind the peer's head; proving at the CALLER-SUPPLIED hash",
@@ -690,7 +732,9 @@ async fn sweep(session: &mut EthSession, knobs: &Knobs, head: u64, started: Inst
             },
             Err(e) => {
                 println!("{} depth {depth:>6}  #{number}: header: {e}", age(started));
-                if !e.contains("timed out") {
+                // No answer in time, or one the decoder refused: the session
+                // is still there. Anything else took it down.
+                if !(e.contains("timed out") || e.contains("decode")) {
                     session_lost(started);
                     return;
                 }
@@ -728,13 +772,27 @@ async fn sweep(session: &mut EthSession, knobs: &Knobs, head: u64, started: Inst
                     age(started)
                 )
             }
-            Err(e) => {
-                // Nethermind answers a root outside its serving window with a
-                // Disconnect, not with the empty proof geth sends.
+            // `EthSession`'s wording for a Disconnect frame. Observed on the
+            // default target (Nethermind): a Disconnect, reason 16, is what a
+            // root it does not serve gets — where geth sends an empty proof.
+            // Why it does not serve that root is not something this shows.
+            Err(e) if e.starts_with("peer disconnected") => {
                 println!(
                     "{} depth {depth:>6}  #{number}: NOT served — {e}, in place of an answer",
                     age(started)
                 );
+                session_lost(started);
+                return;
+            }
+            // The peer answered, undecodably: the session is still there.
+            Err(e) if e.contains("decode") => {
+                println!(
+                    "{} depth {depth:>6}  #{number}: unusable answer: {e}",
+                    age(started)
+                )
+            }
+            Err(e) => {
+                println!("{} depth {depth:>6}  #{number}: {e}", age(started));
                 session_lost(started);
                 return;
             }
@@ -999,7 +1057,9 @@ async fn crawl_peer(
         return Ok(());
     }
     let head_hash = session.peer_status.best_hash;
-    let head = header_by_hash(&mut session, &head_hash, "head").await?;
+    let head = header_by_hash(&mut session, &head_hash, "head")
+        .await
+        .map_err(HeaderError::into_string)?;
     r.verdict = match session
         .snap_get_account(&head.header.state_root, &knobs.account)
         .await
