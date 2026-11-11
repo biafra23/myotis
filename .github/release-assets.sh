@@ -27,7 +27,7 @@
 # finishing what is its own. Each form is idempotent, so "re-run failed jobs"
 # repairs whichever part failed.
 #
-# Why --checksums loops: there is no cross-workflow ordering, so nine
+# Why --checksums loops: there is no cross-workflow ordering, so ten
 # publishers write the same file, each from the asset list it saw. One that
 # listed before another's upload and wrote after it would drop that asset's
 # line. So each re-reads the release SETTLE seconds after its own write and

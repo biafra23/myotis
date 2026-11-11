@@ -1,6 +1,6 @@
 # Rehearse the release-asset path against GitHub itself (#734, Part 5c).
 #
-# The nine publishing jobs, `verify release` and their scripts run only on a
+# The ten publishing jobs, `verify release` and their scripts run only on a
 # `v*` tag, where a failure that needs a code change cannot be repaired by a
 # re-run: tag runs use the tagged tree. This workflow sends a dummy file
 # through the same steps, in the same order, without publishing anything:

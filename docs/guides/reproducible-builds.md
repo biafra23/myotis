@@ -221,6 +221,55 @@ Who signed it is a separate check: the signer certificate's SHA-256 is pinned
 in `android-app/release-signing-cert.sha256`
 ([android-release-signing.md](android-release-signing.md)).
 
+## What is inside: the SBOMs
+
+Each release also lists what its products are made of, as CycloneDX 1.5 JSON,
+one file per product:
+
+| File | Product |
+|---|---|
+| `Myotis-<tag>-android.cdx.json` | the Android app (all three APKs) |
+| `Myotis-<tag>-desktop.cdx.json` | the desktop app in its installers (dmg, deb, msi) |
+| `Myotis-<tag>-daemon.cdx.json` | the daemon and its library jars |
+| `Myotis-<tag>-engine-library.cdx.json` | the engine library (AAR, desktop jar, natives jars) |
+| `Myotis-<tag>-ios.cdx.json` | `MyotisKit.xcframework.zip` and `MyotisEngine.xcframework.zip` |
+| `Myotis-<tag>-node.cdx.json` | the Node.js addon |
+
+They are **generated from the pins of the tagged tree, not from a build**
+(`scripts/sbom.py`): the Gradle lockfiles and `gradle/verification-metadata.xml`,
+`rust/Cargo.lock`, `.java-version` and `rust/rust-toolchain.toml`. So they say
+what the build is held to, and you can regenerate them from a checkout of the
+tag without building anything and compare:
+
+```bash
+git checkout v0.1.21
+SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) python3 scripts/sbom.py --tag v0.1.21 --out sbom
+sha256sum sbom/*.cdx.json    # the hashes SHA256SUMS lists for them
+```
+
+What that makes each part, and what is missing:
+
+- **Maven components are exact.** They are the modules the product's runtime
+  configuration is locked to (for example `android-app/gradle.lockfile`,
+  `releaseRuntimeClasspath`), and a build fails on any other version. Each has
+  the SHA-256 the build verifies the file against, where the module has one
+  payload file; where it has several (variants, one per host), each pinned file
+  is named in the component's properties. The desktop app also lists the
+  Compose and skiko modules of every host it is built for.
+- **Rust components are a superset.** `Cargo.lock` records one graph for all
+  targets and all kinds of dependency, so the list is every crate reachable
+  from the product's own crates: build dependencies, optional ones (Arti,
+  which only a Tor-enabled build links) and crates only another operating
+  system compiles are in it. Every crate that is linked is listed; not every
+  listed crate is linked.
+- **Two toolchain components** stand for code that comes from the toolchain
+  and ends up inside: the Rust standard library, and for the desktop app the
+  Eclipse Temurin JDK its installer bundles. Both carry a CPE.
+- **No licenses and no dependency graph.** A lockfile records neither. These
+  are inventories, which is what matching against security advisories needs.
+- The files describe the tag's pins. That the published binaries were built
+  from those pins is what the attestation and the rebuild above are for.
+
 ## For maintainers
 
 - The rule for merging is in `CLAUDE.md` (*No merge into `main` may break
@@ -240,3 +289,8 @@ in `android-app/release-signing-cert.sha256`
 - Every release asset is uploaded through `.github/release-assets.sh` and
   attested in the same job, whose last step
   (`release-assets.sh --checksums`) is what keeps `SHA256SUMS` complete.
+- The SBOMs need no upkeep for a dependency bump: they are read from the pins.
+  What they are read BY is the product table in `scripts/sbom.py` (which
+  project's which configuration, which crates). A configuration or crate that
+  was renamed fails the `sbom` workflow and `scripts/test_sbom.py` with the
+  name it looked for; a new shipped product gets a line there.
