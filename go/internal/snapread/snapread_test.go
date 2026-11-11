@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/rlp"
 
 	"github.com/biafra23/myotis/go/internal/mpt"
 	"github.com/biafra23/myotis/go/internal/rlpcode"
@@ -124,7 +125,7 @@ func leafNode(t *testing.T, key [32]byte, value []byte) []byte {
 func TestAccountGoodProof(t *testing.T) {
 	fx := newFixture(t)
 	p := &fake{id: strings.Repeat("aa", 16), snap: true, ar: fx.ar}
-	out, err := Account([]Peer{p}, fx.stateRoot, fx.address)
+	_, out, err := Account([]Peer{p}, fx.stateRoot, fx.address)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +141,7 @@ func TestRetryAcrossPeers(t *testing.T) {
 	bad := &fake{id: strings.Repeat("bb", 16), snap: true, order: &order,
 		failAcc: errors.New("transport: timed out awaiting account range")}
 	good := &fake{id: strings.Repeat("cc", 16), snap: true, order: &order, ar: fx.ar}
-	if _, err := Account([]Peer{bad, good}, fx.stateRoot, fx.address); err != nil {
+	if _, _, err := Account([]Peer{bad, good}, fx.stateRoot, fx.address); err != nil {
 		t.Fatalf("want retry to succeed: %v", err)
 	}
 	if len(order) != 2 || order[1] != good.id {
@@ -160,7 +161,7 @@ func TestAttemptCapIsTheDisclosureBound(t *testing.T) {
 			failAcc: errors.New("transport: read: EOF"),
 		})
 	}
-	_, err := Account(peers, fx.stateRoot, fx.address)
+	_, _, err := Account(peers, fx.stateRoot, fx.address)
 	if err == nil {
 		t.Fatal("want aggregate failure")
 	}
@@ -180,13 +181,13 @@ func TestNonSnapPeersAreSkipped(t *testing.T) {
 		peers = append(peers, &fake{id: fmt.Sprintf("ethonly%d", i), snap: false, order: &order})
 	}
 	peers = append(peers, &fake{id: strings.Repeat("ee", 16), snap: true, order: &order, ar: fx.ar})
-	if _, err := Account(peers, fx.stateRoot, fx.address); err != nil {
+	if _, _, err := Account(peers, fx.stateRoot, fx.address); err != nil {
 		t.Fatal(err)
 	}
 	if len(order) != 1 {
 		t.Fatalf("non-snap peers were asked: %v", order)
 	}
-	if _, err := Account([]Peer{&fake{id: "x", snap: false}}, fx.stateRoot, fx.address); err == nil ||
+	if _, _, err := Account([]Peer{&fake{id: "x", snap: false}}, fx.stateRoot, fx.address); err == nil ||
 		!strings.Contains(err.Error(), "no snap-capable") {
 		t.Fatalf("want no-snap-capable error, got %v", err)
 	}
@@ -213,7 +214,7 @@ func TestAggregateNamesTheFaultKinds(t *testing.T) {
 		failAcc: fmt.Errorf("account %s: %s", snapwire.ProofInvalidMarker, snapwire.UnknownRootReason)}
 	p2 := &fake{id: strings.Repeat("22", 16), snap: true,
 		failAcc: fmt.Errorf("storage %s: malformed node RLP", snapwire.ProofInvalidMarker)}
-	_, err := Account([]Peer{p1, p2}, fx.stateRoot, fx.address)
+	_, _, err := Account([]Peer{p1, p2}, fx.stateRoot, fx.address)
 	if err == nil {
 		t.Fatal("want failure")
 	}
@@ -242,11 +243,11 @@ func TestSlotAtReusesTheProvenAccount(t *testing.T) {
 	fx := newFixture(t)
 	var order []string
 	p := &fake{id: strings.Repeat("66", 16), snap: true, order: &order, ar: fx.ar, sr: fx.sr}
-	out, err := Account([]Peer{p}, fx.stateRoot, fx.address)
+	_, out, err := Account([]Peer{p}, fx.stateRoot, fx.address)
 	if err != nil || out.Absent() {
 		t.Fatalf("account: %+v %v", out, err)
 	}
-	v, err := SlotAt([]Peer{p}, fx.stateRoot, fx.address, fx.slot, out)
+	v, err := SlotAt([]Peer{p}, fx.stateRoot, fx.address, fx.slot, out, p)
 	if err != nil || len(v) != 1 || v[0] != 0x2a {
 		t.Fatalf("slot: %x %v", v, err)
 	}
@@ -324,5 +325,88 @@ func TestCodeAttestedEOAShortCircuits(t *testing.T) {
 	}
 	if len(order) != 1 {
 		t.Fatalf("bytecode round trip for a proven EOA: %v", order)
+	}
+}
+
+func TestCodeAttestsAbsentAccountProvesNoCode(t *testing.T) {
+	// A trie holding a DIFFERENT address proves our address absent —
+	// and an absent account provably has no code (the Rust twin's
+	// get_code rule). That is a fact, not a transport fault: nil,nil
+	// with the single account round trip and nothing more.
+	var address [20]byte
+	copy(address[:], crypto.Keccak256([]byte("queried"))[:20])
+	other := crypto.Keccak256Hash([]byte("someone-else"))
+	leafValue := rlpcode.List(
+		rlpcode.Uint(1), rlpcode.Bytes([]byte{1}),
+		rlpcode.Bytes(mpt.EmptyTrieRoot[:]), rlpcode.Bytes(mpt.EmptyCodeHash[:]))
+	acctNode := leafNode(t, other, leafValue)
+	root := crypto.Keccak256Hash(acctNode)
+	ar, err := snapwire.DecodeAccountRange(rlpcode.List(
+		rlpcode.Uint(1), rlpcode.List(), rlpcode.List(rlpcode.Bytes(acctNode))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	p := &fake{id: strings.Repeat("ab", 16), snap: true, order: &order, ar: ar}
+	code, err := Code([]Peer{p}, root, address)
+	if err != nil || code != nil {
+		t.Fatalf("want proven-no-code, got %x %v", code, err)
+	}
+	if len(order) != 1 {
+		t.Fatalf("bytecode round trip for a proven-absent account: %v", order)
+	}
+}
+
+func TestUnmarkedLeafDecodeFailureIsNotRetried(t *testing.T) {
+	// A leaf that hashes into the proven path but fails the strict
+	// decode is committed bytes: no other peer can answer differently,
+	// so the reader returns at once (the Rust twin's `?` escape)
+	// instead of repaying the round trip twice more. The 0x00-byte
+	// nonce is exactly such a leaf (non-canonical integer, refused by
+	// rlpcode.U64 / scalar_u64 alike).
+	var address [20]byte
+	copy(address[:], crypto.Keccak256([]byte("zero-nonce"))[:20])
+	leafValue := rlpcode.List(
+		rlp.RawValue{0x00}, // NON-canonical zero: must die in the decoder
+		rlpcode.Bytes([]byte{1}),
+		rlpcode.Bytes(mpt.EmptyTrieRoot[:]), rlpcode.Bytes(mpt.EmptyCodeHash[:]))
+	acctNode := leafNode(t, crypto.Keccak256Hash(address[:]), leafValue)
+	root := crypto.Keccak256Hash(acctNode)
+	ar, err := snapwire.DecodeAccountRange(rlpcode.List(
+		rlpcode.Uint(1), rlpcode.List(), rlpcode.List(rlpcode.Bytes(acctNode))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	var peers []Peer
+	for i := 0; i < 3; i++ {
+		peers = append(peers, &fake{
+			id: fmt.Sprintf("z%d-%s", i, strings.Repeat("cd", 14)), snap: true, order: &order, ar: ar,
+		})
+	}
+	_, _, err = Account(peers, root, address)
+	if err == nil || !strings.Contains(err.Error(), "account leaf") {
+		t.Fatalf("want the leaf-decode verdict, got %v", err)
+	}
+	if len(order) != 1 {
+		t.Fatalf("committed bytes were re-asked of other peers: %v", order)
+	}
+}
+
+func TestSlotSecondHopStartsAtTheServingPeer(t *testing.T) {
+	// The account hop proved which peer holds this root; the storage
+	// hop must start there, not at the peer that just timed out.
+	fx := newFixture(t)
+	var order []string
+	a := &fake{id: strings.Repeat("a1", 16), snap: true, order: &order,
+		failAcc: errors.New("transport: read: EOF"), sr: fx.sr}
+	b := &fake{id: strings.Repeat("b2", 16), snap: true, order: &order, ar: fx.ar, sr: fx.sr}
+	v, err := Slot([]Peer{a, b}, fx.stateRoot, fx.address, fx.slot)
+	if err != nil || len(v) != 1 || v[0] != 0x2a {
+		t.Fatalf("slot: %x %v", v, err)
+	}
+	want := []string{a.id, b.id, b.id} // a's account failure, b serves account THEN storage
+	if len(order) != 3 || order[0] != want[0] || order[1] != want[1] || order[2] != want[2] {
+		t.Fatalf("hop order %v, want %v", order, want)
 	}
 }

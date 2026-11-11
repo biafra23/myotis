@@ -20,6 +20,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -165,6 +166,54 @@ func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, m
 	}
 	var latest lcAnchor
 	haveAnchor := false
+	// tried maps anchor → peer ids already asked AT that anchor. The
+	// 3-attempt cap bounds ONE snapread call; this ticker re-runs the
+	// read, so without memory a failed read would reach a fresh random
+	// three every 2 s (the ready map iterates arbitrarily) until the
+	// whole ready set — and every replacement session — had seen
+	// keccak(address). With it, one logical read (one anchor) discloses
+	// the address to each peer at most once, and peers READYing later
+	// are the only new ones the retries add.
+	tried := map[[32]byte]map[string]bool{}
+	// lastReadErr rides into the timeout error so "read window
+	// expired" names the cause instead of only the fact.
+	var lastReadErr error
+	// readRes carries the outcome of the in-flight verifiedRead; reads
+	// run in a goroutine because one can take maxAttempts ×
+	// request-timeout per hop, and neither Ctrl-C nor the deadline may
+	// wait that long (the sessions take no context; the select does).
+	readRes := make(chan error, 1)
+	readInFlight := false
+	startRead := func(a lcAnchor) {
+		if readInFlight {
+			return
+		}
+		peers := dialer.snapPeers()
+		untried := make([]snapread.Peer, 0, len(peers))
+		seen := tried[a.stateRoot]
+		if seen == nil {
+			seen = map[string]bool{}
+			tried[a.stateRoot] = seen
+		}
+		for _, p := range peers {
+			if !seen[p.ID()] {
+				untried = append(untried, p)
+			}
+		}
+		if len(untried) == 0 {
+			return // nothing new to ask at this anchor
+		}
+		if len(untried) > snapread.MaxAttempts {
+			untried = untried[:snapread.MaxAttempts] // what usable() will contact
+		}
+		for _, p := range untried {
+			seen[p.ID()] = true // the capped call contacts exactly these
+		}
+		readInFlight = true
+		go func() {
+			readRes <- verifiedRead(untried, log, a, wantAddr, wantSlot, slotHex != "")
+		}()
+	}
 
 	var deadline <-chan time.Time
 	if runFor > 0 {
@@ -193,6 +242,9 @@ func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, m
 		case <-deadline:
 			report(disc, dialer, log)
 			if getAccount != "" {
+				if lastReadErr != nil {
+					return fmt.Errorf("read window expired before %s could be served: last failure: %w", wantAddr.Hex(), lastReadErr)
+				}
 				return fmt.Errorf("read window expired before an anchor + snap peer could serve %s", wantAddr.Hex())
 			}
 			return nil
@@ -212,26 +264,30 @@ func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, m
 			return fmt.Errorf("light client: %w", err)
 		case a := <-anchors:
 			latest, haveAnchor = a, true
-			if getAccount == "" {
-				continue
+			if getAccount != "" {
+				startRead(a)
 			}
-			if err := verifiedRead(dialer, log, a, wantAddr, wantSlot, slotHex != ""); err != nil {
-				// Ordinary retry: the anchor may predate a peer's state
-				// window, or every dial so far lacked snap. The next
-				// poll cycle re-publishes and more peers arrive.
-				log.Debug("verified read deferred", "reason", err)
-				continue
+		case err := <-readRes:
+			readInFlight = false
+			if err == nil {
+				return nil
 			}
-			return nil
+			// Ordinary retry: the anchor may predate every peer's
+			// state window, or every dial so far lacked snap. The
+			// next poll cycle re-publishes and more peers arrive;
+			// the tried map keeps the retries from re-asking peers
+			// that already answered for this root.
+			lastReadErr = err
+			log.Debug("verified read deferred", "reason", err)
 		case <-reads.C:
 			// Re-try with the ALREADY-held anchor when new peers arrive
 			// between LC cycles: the anchor channel only fires on LC
 			// cycles, and a snap peer READYing right after one would
-			// otherwise wait a full slot.
+			// otherwise wait a full slot. startRead asks only peers
+			// not yet tried at this anchor and no-ops when there are
+			// none, or when a read is still running.
 			if getAccount != "" && haveAnchor {
-				if err := verifiedRead(dialer, log, latest, wantAddr, wantSlot, slotHex != ""); err == nil {
-					return nil
-				}
+				startRead(latest)
 			}
 		case <-summary.C:
 			if !quiet {
@@ -269,8 +325,10 @@ func publishAnchor(anchors chan lcAnchor, a lcAnchor) {
 // set myotis-lc dials), walks the committee chain, and keeps the
 // anchor fresh on the myotis-lc steady loop — every answer through
 // the part-3 processor (checkpoint pin, period gate, BLS, Merkle
-// branches). onAnchor fires after bootstrap/catch-up and after every
-// steady cycle. This is the same loop as cmd/myotis-lc's; when a
+// branches). Anchors are published only after a VERIFYING finality
+// poll (Advanced or Stale) — never the bootstrap/catch-up root, which
+// is routinely outside every peer's state window (see the loop).
+// This is the same loop as cmd/myotis-lc's; when a
 // second consumer appeared the honest move is to say so in a comment
 // and re-unify the two in 3c rather than contort the merged main.
 func runLightClient(ctx context.Context, logf func(string, ...any), anchors chan lcAnchor) error {
@@ -293,9 +351,15 @@ func runLightClient(ctx context.Context, logf func(string, ...any), anchors chan
 	if err := syncer.RunCatchUp(bootCtx, st); err != nil {
 		return fmt.Errorf("catch-up: %w", err)
 	}
-	publishAnchor(anchors, snapshot(st))
-
+	// NO publish yet: st.Finalized here is the embedded checkpoint (or
+	// the previous period's best-update header) — hours old in the
+	// ordinary case, and outside every peer's ~128-block state window,
+	// so a read aimed at it would disclose the account key to up to
+	// three peers that cannot answer it. An anchor becomes readable
+	// only once a finality poll has VERIFIED it (below), which is also
+	// what makes snapread's "the anchor is the fresh head" claim true.
 	for ctx.Err() == nil {
+		published := false
 		if err := syncer.RunCatchUp(ctx, st); err != nil {
 			logf("re-catch-up: %v", err)
 		} else if chain.SyncCommitteePeriod(syncer.Consensus.SlotAt(time.Now().Unix())) > st.Period() {
@@ -304,8 +368,14 @@ func runLightClient(ctx context.Context, logf func(string, ...any), anchors chan
 			logf("finality poll: %v", err)
 		} else {
 			logf("finality poll: outcome %v, finalized slot %d", outcome, st.Finalized.Slot)
+			// Advanced OR Stale both mean the store's finalized header
+			// passed the full BLS path THIS cycle (Stale = verified,
+			// just not newer); Rejected / poll errors publish nothing.
+			published = outcome == lc.Advanced || outcome == lc.Stale
 		}
-		publishAnchor(anchors, snapshot(st))
+		if published {
+			publishAnchor(anchors, snapshot(st))
+		}
 		select {
 		case <-ctx.Done():
 		case <-time.After(time.Duration(chain.SecondsPerSlot) * time.Second):
@@ -319,7 +389,11 @@ func snapshot(st *lc.Store) lcAnchor {
 }
 
 // snapPeers hands the reader the live snap-capable sessions
-// (cap-bounded by snapread itself).
+// (cap-bounded by snapread itself), SORTED by node id: ranging the
+// ready map hands out an arbitrary order per call, which would make
+// the cap's "first three" a fresh random three each tick — stable
+// order is what makes the tried-set and the disclosure bound mean the
+// same three peers across retries.
 func (d *dialer) snapPeers() []snapread.Peer {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -329,19 +403,24 @@ func (d *dialer) snapPeers() []snapread.Peer {
 			out = append(out, s)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID() < out[j].ID() })
 	return out
 }
 
 // verifiedRead fires once the read has both halves: an anchored state
 // root and at least one snap session. Its output NEVER includes a
 // peer's claim without saying so — every printed field comes from a
-// proof leaf, verified against the snapshot's root.
-func verifiedRead(d *dialer, log *slog.Logger, a lcAnchor, addr common.Address, slot [32]byte, wantSlot bool) error {
-	peers := d.snapPeers()
+// proof leaf, verified against the snapshot's root. Both result lines
+// print only once the WHOLE read is in hand (run after the slot hop):
+// logging the account line before a slot hop that then fails would
+// make one run answer twice, the second time at a newer anchor.
+// The caller runs this in a goroutine — hops cost up to
+// snapread.MaxAttempts × the request timeout each.
+func verifiedRead(peers []snapread.Peer, log *slog.Logger, a lcAnchor, addr common.Address, slot [32]byte, wantSlot bool) error {
 	if len(peers) == 0 {
 		return fmt.Errorf("no snap-capable READY peers yet (anchor is ready: slot %d)", a.slot)
 	}
-	out, err := snapread.Account(peers, a.stateRoot, addr)
+	servedBy, out, err := snapread.Account(peers, a.stateRoot, addr)
 	if err != nil {
 		return err
 	}
@@ -351,44 +430,51 @@ func verifiedRead(d *dialer, log *slog.Logger, a lcAnchor, addr common.Address, 
 		"lcFinalizedSlot", a.slot,
 		"peers", len(peers),
 	}
+	var slotAttrs []any
 	if out.Absent() {
-		attrs = append(attrs, "account", "PROVEN ABSENT (empty account)")
-		log.Info("verified account read", attrs...)
+		attrs = append(attrs, "accountState", "PROVEN ABSENT (empty account)")
 		if wantSlot {
 			// Say so even though it needs no proof walk: an absent
 			// account has no storage, so the slot the operator asked
 			// for is provably zero. Silence here would leave "did it
 			// read the slot?" unanswered.
-			log.Info("verified storage read",
+			slotAttrs = []any{
 				"account", addr.Hex(), "slot", fmt.Sprintf("0x%x", slot),
 				"value", "0x (provable: account is absent)",
-				"verifyMethod", "provenAbsent→zero")
+				"verifyMethod", "provenAbsent→zero",
+			}
 		}
-		return nil
+	} else {
+		a2 := out.Account
+		attrs = append(attrs,
+			"nonce", a2.Nonce,
+			"balanceWei", new(big.Int).SetBytes(a2.Balance).String(),
+			"storageRoot", fmt.Sprintf("0x%x", a2.StorageRoot),
+			"codeHash", fmt.Sprintf("0x%x", a2.CodeHash),
+			"verifyMethod", "snapProof→lcAnchor",
+		)
+		if wantSlot {
+			// SlotAt, not Slot: the account was just proven above — the
+			// storage hop must reuse that outcome and the SAME peer
+			// slice (starting at the serving peer), so one logical read
+			// never widens the disclosure cap to 3+3 peers, never pays
+			// for the account request twice, and never re-pays a first
+			// peer's timeout on the second hop.
+			v, err := snapread.SlotAt(peers, a.stateRoot, addr, slot, out, servedBy)
+			if err != nil {
+				return fmt.Errorf("slot read: %w", err)
+			}
+			slotAttrs = []any{
+				"account", addr.Hex(), "slot", fmt.Sprintf("0x%x", slot),
+				"value", fmt.Sprintf("0x%x", v),
+				"anchoredAt", fmt.Sprintf("0x%x", a2.StorageRoot), // the PROVEN one
+				"verifyMethod", "snapProof→provenStorageRoot",
+			}
+		}
 	}
-	a2 := out.Account
-	attrs = append(attrs,
-		"nonce", a2.Nonce,
-		"balanceWei", new(big.Int).SetBytes(a2.Balance).String(),
-		"storageRoot", fmt.Sprintf("0x%x", a2.StorageRoot),
-		"codeHash", fmt.Sprintf("0x%x", a2.CodeHash),
-		"verifyMethod", "snapProof→lcAnchor",
-	)
 	log.Info("verified account read", attrs...)
-	if wantSlot {
-		// SlotAt, not Slot: the account was just proven above — the
-		// storage hop must reuse that outcome and the SAME peer slice,
-		// so one logical read never widens the disclosure cap to 3+3
-		// peers or pays for the account request twice.
-		v, err := snapread.SlotAt(peers, a.stateRoot, addr, slot, out)
-		if err != nil {
-			return fmt.Errorf("slot read: %w", err)
-		}
-		log.Info("verified storage read",
-			"account", addr.Hex(), "slot", fmt.Sprintf("0x%x", slot),
-			"value", fmt.Sprintf("0x%x", v),
-			"anchoredAt", fmt.Sprintf("0x%x", a2.StorageRoot), // the PROVEN one
-			"verifyMethod", "snapProof→provenStorageRoot")
+	if slotAttrs != nil {
+		log.Info("verified storage read", slotAttrs...)
 	}
 	return nil
 }

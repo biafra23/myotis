@@ -69,10 +69,20 @@ reference.
    (`internal/snapread`: sequential attempts capped at 3 — the
    address-disclosure bound — storage anchored at the PROVEN
    storageRoot, code keccak-checked against the PROVEN codeHash,
-   transport / pruned-root / bad-proof taxonomy). `myotis-go
+   transport / pruned-root / bad-proof taxonomy; every peer-controlled
+   list is streamed, never materialized, so a hostile multi-MiB list
+   of one-byte items decodes in bounded memory — the #454 lesson,
+   pinned by test). `myotis-go
    -get-account <addr> [-slot <n>]` runs the light client in parallel
    with EL dialing and prints the account only once the proof verifies
-   against the LC-anchored finalized exec state root.
+   against the LC-anchored finalized exec state root. Two CLI policy
+   points: anchors are published only after a VERIFYING finality poll
+   (never the bootstrap/catch-up root, which is routinely outside
+   every peer's ~128-block state window — reading on it would
+   disclose the key to peers that cannot answer), and the 2 s retry
+   tick re-asks only peers not yet contacted **at that anchor**, so a
+   failed read walks the ready set instead of redrawing a random
+   three, and the address reaches each peer at most once per anchor.
    Deliberate cuts, documented in the code: FINALIZED-anchor reads only
    (the Rust twin's optimistic-head read — `ProcessOptimisticUpdate` +
    the optimistic-update poll — is the next increment; a peer on a

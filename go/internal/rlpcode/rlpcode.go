@@ -156,6 +156,14 @@ func U64(item []byte) (uint64, error) {
 	case 0:
 		return 0, nil
 	case 1:
+		// A single 0x00 byte is the non-canonical encoding of zero (zero
+		// encodes as the EMPTY string, 0x80). scalar_u64 (rlp.rs:90-102)
+		// rejects any content starting with a zero byte, single bytes
+		// included — a leaf nonce carried as 0x00 must fail HERE too, in
+		// one definition, not only in the leaf decoder.
+		if content[0] == 0 {
+			return 0, errors.New("rlpcode: non-canonical integer (leading zero)")
+		}
 		return uint64(content[0]), nil
 	default:
 		if len(content) > 8 {

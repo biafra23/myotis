@@ -207,15 +207,76 @@ type AccountRange struct {
 	Proof     [][]byte
 }
 
+// headItems reads the (up to) first n items of an already-validated
+// list WITHOUT materializing the rest. A hostile list — ten million
+// one-byte items inside the 10 MiB frame cap — is walked in O(n)
+// memory, which rlpcode.Items (one slice header per element, all of
+// them) is not: that is the #454 allocation lesson ethwire's
+// DecodeBlockHeaders already applies. Extra items past n are skipped,
+// as the Rust View consumers skip positional fields they do not read.
+func headItems(b []byte, n int) (items [][]byte, err error) {
+	kind, content, rest, err := rlp.Split(b)
+	if err != nil {
+		return nil, err
+	}
+	if kind != rlp.List {
+		return nil, errors.New("expected list")
+	}
+	if len(rest) != 0 {
+		return nil, errors.New("trailing bytes after list")
+	}
+	for len(content) > 0 && len(items) < n {
+		it, next, err := rlpcode.SplitItem(content)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, it)
+		content = next
+	}
+	return items, nil
+}
+
+// eachItem streams the elements of an already-validated list, calling
+// fn(index, item) with NO intermediate slice (#454: a multi-MiB list
+// of one-byte items must not become a multi-hundred-MB [][]byte
+// before the first per-entry check runs).
+func eachItem(list []byte, fn func(i int, item []byte) error) error {
+	kind, content, rest, err := rlp.Split(list)
+	if err != nil {
+		return err
+	}
+	if kind != rlp.List {
+		return errors.New("expected list")
+	}
+	if len(rest) != 0 {
+		return errors.New("trailing bytes after list")
+	}
+	for i := 0; len(content) > 0; i++ {
+		it, next, err := rlpcode.SplitItem(content)
+		if err != nil {
+			return err
+		}
+		if err := fn(i, it); err != nil {
+			return err
+		}
+		content = next
+	}
+	return nil
+}
+
 // DecodeAccountRange decodes [reqId, [[accountHash, slimBody], …],
 // [proofNode, …]]. The WHOLE message is validated first
 // (rlpcode.ValidateNode) so an entry past the keep-cap is checked
-// exactly as a kept one, whatever the walk ends up reading.
+// exactly as a kept one, whatever the walk ends up reading — and the
+// entries are then STREAMED (eachItem), so "checked but dropped" costs
+// no allocation (#454; ValidateNode's full-message walk is what does
+// the checking, exactly as the Rust ViewIter consumes without cloning
+// past the cap).
 func DecodeAccountRange(b []byte) (*AccountRange, error) {
 	if err := rlpcode.ValidateNode(b); err != nil {
 		return nil, err
 	}
-	items, err := rlpcode.Items(b)
+	items, err := headItems(b, 3)
 	if err != nil {
 		return nil, err
 	}
@@ -231,32 +292,32 @@ func DecodeAccountRange(b []byte) (*AccountRange, error) {
 	// from the third slot (the Rust iterator consumes field 2 either
 	// way — messages.rs:156-176).
 	if len(items) > 1 && isList(items[1]) {
-		pairs, err := rlpcode.Items(items[1])
-		if err != nil {
-			return nil, err
-		}
-		for i, pair := range pairs {
-			fields, err := rlpcode.Items(pair)
+		err := eachItem(items[1], func(_ int, pair []byte) error {
+			fields, err := headItems(pair, 2) // the pair's tail, if any, is not read
 			if err != nil {
-				return nil, err
+				return err
 			}
 			if len(fields) < 2 {
-				return nil, errors.New("AccountRange: malformed pair")
+				return errors.New("AccountRange: malformed pair")
 			}
 			hash, err := rlpcode.FixedBytes(fields[0], 32)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			slim, err := readSlimFields(fields[1])
 			if err != nil {
-				return nil, err
+				return err
 			}
-			if i < MaxRangeEntries {
+			if len(out.Accounts) < MaxRangeEntries {
 				var h [32]byte
 				copy(h[:], hash)
 				slim.AccountHash = h
 				out.Accounts = append(out.Accounts, *slim)
 			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
 	}
 	if len(items) > 2 {
@@ -287,7 +348,9 @@ func readSlimFields(body []byte) (*SlimAccount, error) {
 	if err := rlpcode.ValidateNode(inner); err != nil {
 		return nil, err
 	}
-	fields, err := rlpcode.Items(inner)
+	// Four fields are the whole slim shape; a hostile long tail is
+	// skipped positionally (headItems), not materialized (#454).
+	fields, err := headItems(inner, 4)
 	if err != nil {
 		return nil, err
 	}
@@ -351,12 +414,15 @@ type StorageRanges struct {
 }
 
 // DecodeStorageRanges decodes [reqId, [[slots-for-account-0], …],
-// [proofNode, …]].
+// [proofNode, …]]. Peer-controlled lists (per-account, slots, proof)
+// are streamed — headItems/eachItem — never materialized whole: a
+// 10 MiB frame of one-byte items must not become hundreds of MB of
+// slice headers before the first check runs (#454).
 func DecodeStorageRanges(b []byte) (*StorageRanges, error) {
 	if err := rlpcode.ValidateNode(b); err != nil {
 		return nil, err
 	}
-	items, err := rlpcode.Items(b)
+	items, err := headItems(b, 3)
 	if err != nil {
 		return nil, err
 	}
@@ -369,38 +435,41 @@ func DecodeStorageRanges(b []byte) (*StorageRanges, error) {
 	}
 	out := &StorageRanges{RequestID: requestID}
 	if len(items) > 1 && isList(items[1]) {
-		perAccount, err := rlpcode.Items(items[1])
+		// One account per ask, always: only the FIRST account's slot
+		// list is read; further ones are skipped positionally, exactly
+		// as the Rust consumer skips accounts it did not query.
+		perAccount, err := headItems(items[1], 1)
 		if err != nil {
 			return nil, err
 		}
 		if len(perAccount) > 0 && isList(perAccount[0]) {
-			pairs, err := rlpcode.Items(perAccount[0])
-			if err != nil {
-				return nil, err
-			}
-			for i, pair := range pairs {
-				fields, err := rlpcode.Items(pair)
+			err := eachItem(perAccount[0], func(_ int, pair []byte) error {
+				fields, err := headItems(pair, 2)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				if len(fields) < 2 {
-					return nil, errors.New("StorageRanges: malformed slot")
+					return errors.New("StorageRanges: malformed slot")
 				}
 				hash, err := rlpcode.FixedBytes(fields[0], 32)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				// fields[1] is the trie value: its bytes, one RLP
 				// layer already stripped by the item read.
 				value, err := rlpcode.LeafBytes(fields[1])
 				if err != nil {
-					return nil, err
+					return err
 				}
-				if i < MaxRangeEntries {
+				if len(out.Slots) < MaxRangeEntries {
 					var h [32]byte
 					copy(h[:], hash)
 					out.Slots = append(out.Slots, StorageSlot{SlotHash: h, RawTrieValue: value})
 				}
+				return nil
+			})
+			if err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -422,7 +491,7 @@ func DecodeByteCodes(b []byte, requested int) (uint64, [][]byte, error) {
 	if err := rlpcode.ValidateNode(b); err != nil {
 		return 0, nil, err
 	}
-	items, err := rlpcode.Items(b)
+	items, err := headItems(b, 2)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -435,41 +504,44 @@ func DecodeByteCodes(b []byte, requested int) (uint64, [][]byte, error) {
 	}
 	var codes [][]byte
 	if len(items) > 1 && isList(items[1]) {
-		list, err := rlpcode.Items(items[1])
-		if err != nil {
-			return 0, nil, err
-		}
-		for i, c := range list {
+		err := eachItem(items[1], func(i int, c []byte) error {
 			code, err := rlpcode.LeafBytes(c) // a list where a code must be fails, kept or dropped
 			if err != nil {
-				return 0, nil, err
+				return err
 			}
 			if i < kept(requested) {
 				codes = append(codes, code)
 			}
+			return nil
+		})
+		if err != nil {
+			return 0, nil, err
 		}
 	}
 	return requestID, codes, nil
 }
 
 // decodeProof returns the byte-string nodes of a proof list (list
-// elements are skipped), refusing more than MaxProofNodes.
+// elements are skipped), refusing more than MaxProofNodes. The cap
+// fires DURING the stream, not after materializing the whole list:
+// the million-node case must fail at node 1025 with O(1024) memory,
+// which is what the cap's comment promises (#454).
 func decodeProof(item []byte) ([][]byte, error) {
 	if item == nil || !isList(item) {
 		return nil, nil
 	}
-	nodes, err := rlpcode.Items(item)
-	if err != nil {
-		return nil, err
-	}
-	if len(nodes) > MaxProofNodes {
-		return nil, fmt.Errorf("proof has more than %d nodes", MaxProofNodes)
-	}
 	var out [][]byte
-	for _, n := range nodes {
+	err := eachItem(item, func(i int, n []byte) error {
+		if i >= MaxProofNodes {
+			return fmt.Errorf("proof has more than %d nodes", MaxProofNodes)
+		}
 		if b, err := rlpcode.LeafBytes(n); err == nil {
 			out = append(out, b)
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }

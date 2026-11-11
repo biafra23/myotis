@@ -8,7 +8,12 @@
 //     finalized exec state root, and there is NO fallback to a fresher
 //     head (the Rust engine's handshake-head fallback, #355, is a
 //     documented 3b-scope cut — the anchor is the fresh head here:
-//     the LC finality poll advances it every round).
+//     the CLI publishes an anchor only once a finality poll has
+//     verified it, and advances it every poll round; a
+//     bootstrap/catch-up root that no poll has confirmed yet is
+//     hours old and routinely outside every peer's state window, so
+//     reading on it would disclose the key to peers that cannot
+//     answer it).
 //   - Sequential peer attempts, capped at 3 — the address-disclosure
 //     bound the Rust twin puts on hedged reads (MAX_HEDGED_ATTEMPTS)
 //     applies the same way when one client IP would contact N peers
@@ -40,10 +45,13 @@ type Peer interface {
 	GetByteCodes(hashes [][32]byte, responseBytes uint64) ([][]byte, error)
 }
 
-// maxAttempts bounds one read's contact with distinct peers: the
+// MaxAttempts bounds one read's contact with distinct peers: the
 // address-disclosure bound, same constant and reason as the Rust
-// twin's MAX_HEDGED_ATTEMPTS.
-const maxAttempts = 3
+// twin's MAX_HEDGED_ATTEMPTS. Exported so a retrying caller can
+// account for exactly which peers a call could contact.
+const MaxAttempts = 3
+
+const maxAttempts = MaxAttempts
 
 const (
 	// accountResponseBytes: a single account plus its boundary proof
@@ -107,15 +115,16 @@ type Attempt struct {
 // Account reads address's account at the anchored finalized stateRoot,
 // trying up to maxAttempts snap-capable peers in order. The returned
 // fields are the proof-verified leaf's; outcome.Absent() is a
-// PROVEN absence (an empty account), not a failure.
-func Account(peers []Peer, stateRoot [32]byte, address [20]byte) (snapwire.AccountOutcome, error) {
-	_, out, err := readAccount(peers, stateRoot, address)
-	return out, err
+// PROVEN absence (an empty account), not a failure. It also returns
+// the serving peer, so a follow-up hop (SlotAt) can start there —
+// that peer is the one PROVEN to hold this root.
+func Account(peers []Peer, stateRoot [32]byte, address [20]byte) (Peer, snapwire.AccountOutcome, error) {
+	return readAccount(peers, stateRoot, address)
 }
 
 // readAccount is the one account implementation all three reads share
 // (Slot/Code need the proven leaf for their second hop); it also
-// returns the serving peer for reporting.
+// returns the serving peer for the follow-up hops.
 func readAccount(peers []Peer, stateRoot [32]byte, address [20]byte) (Peer, snapwire.AccountOutcome, error) {
 	accountHash := crypto.Keccak256Hash(address[:])
 	var attempts []Attempt
@@ -127,17 +136,22 @@ func readAccount(peers []Peer, stateRoot [32]byte, address [20]byte) (Peer, snap
 		}
 		out, err := snapwire.VerifyAccount(stateRoot, address, ar)
 		if err != nil {
-			// VerifyAccount marks PROOF failures with "proof invalid"
-			// (→ pruned-root / bad-proof, both "ask elsewhere"). A leaf
-			// that HASHED but fails the strict leaf decode carries no
-			// marker ON PURPOSE: its bytes are committed by the proven
-			// path, so no other peer can answer differently — retrying
-			// elsewhere would just repay the round trip. That is the
-			// Rust twin's rule (fetch.rs lets decode_account_leaf's `?`
-			// escape outside the marker), and Classify maps it to
-			// transport-shaped propagation accordingly.
-			attempts = append(attempts, Attempt{p.ID(), Classify(err), err})
-			continue
+			if snapwire.IsUnservableRootError(err) {
+				// Marked "proof invalid" → pruned-root / bad-proof:
+				// the ASK may be servable elsewhere, retry next peer.
+				attempts = append(attempts, Attempt{p.ID(), Classify(err), err})
+				continue
+			}
+			// UNMARKED failure = a leaf that HASHED into the proven
+			// path but fails the strict leaf decode. Return it NOW,
+			// not via attempts: its bytes are committed by the proof,
+			// so no other peer can answer differently and asking the
+			// rest would repay the round trip for the same verdict.
+			// That is the Rust twin's rule — fetch.rs lets
+			// decode_account_leaf's `?` escape the attempt loop
+			// outside the marker — and Classify maps the unmarked
+			// error to transport-shaped propagation (no strike).
+			return nil, snapwire.AccountOutcome{}, err
 		}
 		return p, out, nil
 	}
@@ -150,28 +164,32 @@ func readAccount(peers []Peer, stateRoot [32]byte, address [20]byte) (Peer, snap
 // An empty storage trie short-circuits to zero with no second round
 // trip — the proof that every slot of an empty trie is zero.
 func Slot(peers []Peer, stateRoot [32]byte, address [20]byte, slot [32]byte) ([]byte, error) {
-	_, acct, err := readAccount(peers, stateRoot, address)
+	servedBy, acct, err := readAccount(peers, stateRoot, address)
 	if err != nil {
 		return nil, err
 	}
-	return SlotAt(peers, stateRoot, address, slot, acct)
+	return SlotAt(peers, stateRoot, address, slot, acct, servedBy)
 }
 
 // SlotAt performs ONLY the storage hop, against an account outcome the
 // caller already proved. A caller that reads account and slot for the
-// same address must share the proven outcome (and the same peer
-// slice, so the attempt cap sees one stable peer order) — otherwise
-// the account hop runs twice and the address reaches up to 3+3
-// distinct peers for what is one logical read, against the spirit of
-// the disclosure bound maxAttempts exists for.
-func SlotAt(peers []Peer, stateRoot [32]byte, address [20]byte, slot [32]byte, acct snapwire.AccountOutcome) ([]byte, error) {
+// same address must share the proven outcome and the same peer slice
+// (so the attempt cap sees one stable peer order) — otherwise the
+// account hop runs twice and the address reaches up to 3+3 distinct
+// peers for what is one logical read, against the spirit of the
+// disclosure bound maxAttempts exists for. servedBy (may be nil) is
+// the peer that served the account proof: the storage hop starts
+// there, because that peer is PROVEN to hold this root — a first peer
+// that timed out or answered pruned-root on the account hop must not
+// be paid that timeout again on the storage hop.
+func SlotAt(peers []Peer, stateRoot [32]byte, address [20]byte, slot [32]byte, acct snapwire.AccountOutcome, servedBy Peer) ([]byte, error) {
 	if acct.Absent() || acct.Account.StorageRoot == mpt.EmptyTrieRoot {
 		return nil, nil // provably empty account / empty trie: every slot is zero
 	}
 	slotHash := crypto.Keccak256Hash(slot[:])
 	accountHash := crypto.Keccak256Hash(address[:])
 	var attempts []Attempt
-	for _, p := range usable(peers) {
+	for _, p := range usable(startAt(peers, servedBy)) {
 		sr, err := p.GetStorageRanges(stateRoot, accountHash, slotHash, fullLimit, accountResponseBytes)
 		if err != nil {
 			attempts = append(attempts, Attempt{p.ID(), Classify(err), err})
@@ -179,8 +197,11 @@ func SlotAt(peers []Peer, stateRoot [32]byte, address [20]byte, slot [32]byte, a
 		}
 		v, err := snapwire.VerifyStorage(acct.Account, slot, sr)
 		if err != nil {
-			attempts = append(attempts, Attempt{p.ID(), Classify(err), err})
-			continue
+			if snapwire.IsUnservableRootError(err) {
+				attempts = append(attempts, Attempt{p.ID(), Classify(err), err})
+				continue
+			}
+			return nil, err // committed leaf, same reasoning as readAccount
 		}
 		return v, nil
 	}
@@ -190,21 +211,25 @@ func SlotAt(peers []Peer, stateRoot [32]byte, address [20]byte, slot [32]byte, a
 // Code reads an account's bytecode: the account read proves the
 // codeHash, then GetByteCodes is asked for exactly that hash and
 // every returned code is keccak-checked (VerifyBytecode) — an
-// EOA's empty-code-hash short-circuits with no round trip.
+// EOA's empty-code-hash short-circuits with no round trip, and so
+// does a PROVEN ABSENT account: an account the trie proves absent
+// provably has no code (the Rust twin's get_code: "a verified EOA /
+// empty-code / absent account has provably empty code"), so nil,nil
+// is a fact here, not a failure dressed up as one.
 func Code(peers []Peer, stateRoot [32]byte, address [20]byte) ([]byte, error) {
-	_, acct, err := readAccount(peers, stateRoot, address)
+	servedBy, acct, err := readAccount(peers, stateRoot, address)
 	if err != nil {
 		return nil, err
 	}
 	if acct.Absent() {
-		return nil, errors.New("snapread: account is provably absent, it has no code")
+		return nil, nil // proven absent: no code, and the proof says so
 	}
 	codeHash := acct.Account.CodeHash
 	if codeHash == mpt.EmptyCodeHash {
 		return nil, nil // verified EOA: empty code, no request needed
 	}
 	var attempts []Attempt
-	for _, p := range usable(peers) {
+	for _, p := range usable(startAt(peers, servedBy)) {
 		codes, err := p.GetByteCodes([][32]byte{codeHash}, byteCodeResponseBytes)
 		if err != nil {
 			attempts = append(attempts, Attempt{p.ID(), Classify(err), err})
@@ -228,6 +253,30 @@ func Code(peers []Peer, stateRoot [32]byte, address [20]byte) ([]byte, error) {
 // elsewhere CAN succeed — the ask may be servable — but the miss is
 // not excused: honest peers serve what a finalized read asks for).
 const ProofMismatchMarker = "proof invalid: hash-mismatch"
+
+// startAt moves first (typically the peer that served the account
+// proof) to the front of the attempt order, leaving the rest as-is;
+// a nil or foreign first leaves the order untouched.
+func startAt(peers []Peer, first Peer) []Peer {
+	if first == nil {
+		return peers
+	}
+	out := make([]Peer, 0, len(peers))
+	for _, p := range peers {
+		if p == first {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return peers
+	}
+	for _, p := range peers {
+		if p != first {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 // usable filters to snap-capable peers and applies the
 // address-disclosure attempt cap.

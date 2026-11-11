@@ -396,7 +396,11 @@ func TestDecodeFuzzNoPanic(t *testing.T) {
 func TestCorpusReplay(t *testing.T) {
 	corpus := filepath.Join("..", "..", "..", "rust", "testdata", "el", "snap")
 	if _, err := os.Stat(corpus); err != nil {
-		t.Skipf("el/snap conformance corpus not present at %s: %v", corpus, err)
+		// FAIL CLOSED, same rule as the mpt replay and the rlpx/lc
+		// conformance tests: these goldens are the snap wire's only
+		// cross-engine pin; a missing corpus must break the build,
+		// not pass vacuously.
+		t.Fatalf("el/snap conformance corpus must be present at %s: %v", corpus, err)
 	}
 	expected := map[string]string{}
 	f, err := os.Open(filepath.Join(corpus, "expected.txt"))
@@ -585,4 +589,66 @@ func itoa(v uint64) string {
 		v /= 10
 	}
 	return string(d[i:])
+}
+
+// --- allocation bounds (#454) ----------------------------------------
+
+func TestHostileListsDecodeInBoundedMemory(t *testing.T) {
+	// A peer answers the single-key ask with a MULTI-MiB list of
+	// one-byte items at every peer-controlled position this codec
+	// reads. ValidateNode passes (valid RLP, under the frame cap);
+	// the decoders must stream past it — kept entries capped, the rest
+	// checked positionally and dropped — where rlpcode.Items would
+	// first build a ~24-bytes-per-item [][]byte before the first
+	// check ran.
+	items := make([]rlp.RawValue, 100_000)
+	for i := range items {
+		items[i] = rlp.RawValue{0x01}
+	}
+	bigList := []byte(rlpcode.List(items...))
+
+	// Accounts position: 100k [hash, body] pairs for a one-account ask.
+	pair := rlpcode.List(
+		rlpcode.Bytes(make([]byte, 32)),
+		rlpcode.List(rlpcode.Uint(1), rlpcode.Bytes(nil)),
+	)
+	accPairs := make([]rlp.RawValue, 100_000)
+	for i := range accPairs {
+		accPairs[i] = pair
+	}
+	accMsg := []byte(rlpcode.List(
+		rlpcode.Uint(7), rlpcode.List(accPairs...), rlpcode.List()))
+	ar, err := DecodeAccountRange(accMsg)
+	if err != nil {
+		t.Fatalf("account range: %v", err)
+	}
+	if len(ar.Accounts) > MaxRangeEntries {
+		t.Fatalf("kept %d accounts over the cap", len(ar.Accounts))
+	}
+
+	// Proof slot: a 100k-node list — refused AT the cap, mid-stream.
+	proofMsg := []byte(rlpcode.List(
+		rlpcode.Uint(7), rlpcode.List(), rlpcode.List(items...)))
+	if _, err := DecodeAccountRange(proofMsg); err == nil ||
+		!strings.Contains(err.Error(), "proof has more than") {
+		t.Fatalf("oversized proof must be refused at MaxProofNodes, got %v", err)
+	}
+
+	// ByteCodes position: 100k one-byte codes for a 1-hash ask.
+	bcMsg := []byte(rlpcode.List(rlpcode.Uint(8), bigList))
+	_, codes, err := DecodeByteCodes(bcMsg, 1)
+	if err != nil {
+		t.Fatalf("byte codes: %v", err)
+	}
+	if len(codes) != 2 { // kept(requested)=2; the other 99,998 checked, dropped
+		t.Fatalf("kept %d codes", len(codes))
+	}
+
+	// Top level: extra fields past the third are skipped, not read.
+	if _, _, err := DecodeByteCodes([]byte(rlpcode.List(
+		rlpcode.Uint(9), rlpcode.List(rlpcode.Bytes([]byte{0xaa})),
+		rlpcode.List(), rlpcode.List(),
+	)), 1); err != nil {
+		t.Fatalf("extra top-level fields must be skipped: %v", err)
+	}
 }

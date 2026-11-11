@@ -54,15 +54,30 @@ func IsUnknownRootError(err error) bool {
 	return IsUnservableRootError(err) && strings.Contains(err.Error(), UnknownRootReason)
 }
 
-// AccountOutcome is the verified outcome of an account lookup: a
-// non-nil Account holds the proof-verified fields (the account
-// exists); a nil Account is a provable absence (empty account).
+// AccountState is which verdict an AccountOutcome carries. Invalid is
+// the ZERO value (the lc.FinalityOutcome rule from the #769 review):
+// a "proven absent" account is a FACT handed to the caller, so a
+// half-built outcome must never read as one.
+type AccountState int
+
+const (
+	AccountInvalid      AccountState = iota // nothing proven
+	AccountFound                            // proof-verified leaf in Account
+	AccountProvenAbsent                     // proof shows the key is absent
+)
+
+// AccountOutcome is the verified outcome of an account lookup: State
+// says which verdict it is, and Account carries the proof-verified
+// fields when the account exists (nil otherwise — but STATE is what
+// distinguishes "provably absent" from "nothing proven", not a nil
+// that could mean either).
 type AccountOutcome struct {
+	State   AccountState
 	Account *mpt.AccountLeaf
 }
 
 // Absent reports the provable-absence outcome.
-func (o AccountOutcome) Absent() bool { return o.Account == nil }
+func (o AccountOutcome) Absent() bool { return o.State == AccountProvenAbsent }
 
 // VerifyAccount verifies an AccountRange response for address against
 // the trusted stateRoot. A single-account query (starting =
@@ -80,9 +95,9 @@ func accountOutcome(r mpt.Result) (AccountOutcome, error) {
 		if err != nil {
 			return AccountOutcome{}, err
 		}
-		return AccountOutcome{Account: leaf}, nil
+		return AccountOutcome{State: AccountFound, Account: leaf}, nil
 	case mpt.Absent:
-		return AccountOutcome{}, nil
+		return AccountOutcome{State: AccountProvenAbsent}, nil
 	default:
 		return AccountOutcome{}, fmt.Errorf("account %s: %s", ProofInvalidMarker, r.Reason)
 	}

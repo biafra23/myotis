@@ -40,9 +40,13 @@ var (
 type Status int
 
 const (
-	Found Status = iota
+	// Invalid is the ZERO value on purpose (the lc.FinalityOutcome rule
+	// from the #769 review, with more at stake): a verdict built
+	// without saying otherwise reads "nothing proven", never a
+	// confident "found/absent" fact.
+	Invalid Status = iota
+	Found
 	Absent
-	Invalid
 )
 
 func (s Status) String() string {

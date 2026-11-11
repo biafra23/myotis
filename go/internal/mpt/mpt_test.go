@@ -191,6 +191,20 @@ func TestAccountAndStorageLeafDecode(t *testing.T) {
 	if _, err := DecodeAccountLeaf(big); err == nil || !strings.Contains(err.Error(), "signed-64") {
 		t.Fatalf("want signed-64 refusal, got %v", err)
 	}
+	// A nonce encoded as the single byte 0x00 is NON-canonical zero
+	// (zero is the empty string, 0x80). scalar_u64 refuses any content
+	// starting with a zero byte, single bytes included — rlpcode.U64
+	// rejects it now too, in one definition for every integer reader.
+	zeroNonce := rlpcode.List(
+		rlp.RawValue{0x00},
+		rlpcode.Bytes(nil),
+		rlpcode.Bytes(EmptyTrieRoot[:]),
+		rlpcode.Bytes(EmptyCodeHash[:]),
+	)
+	if _, err := DecodeAccountLeaf(zeroNonce); err == nil ||
+		!strings.Contains(err.Error(), "leading zero") {
+		t.Fatalf("want leading-zero refusal for 0x00 nonce, got %v", err)
+	}
 
 	slot := rlpcode.Bytes([]byte{0x2a})
 	if v, err := DecodeStorageLeaf(slot); err != nil || !equalBytes(v, []byte{0x2a}) {
@@ -249,20 +263,75 @@ func TestValidateNodeStrictness(t *testing.T) {
 }
 
 func TestValidateNodeFuzzNoPanic(t *testing.T) {
-	// The Rust fuzz corpus doubles as a no-panic contract: random bytes,
-	// truncated and mutated, must yield a verdict or an error, never a
-	// crash or a hang.
+	// Random bytes must never crash ValidateNode.
 	rng := rand.New(rand.NewSource(1))
 	for i := 0; i < 4000; i++ {
 		n := rng.Intn(48)
 		b := make([]byte, n)
 		rng.Read(b)
-		if err := rlpcode.ValidateNode(b); err != nil {
+		_ = rlpcode.ValidateNode(b)
+	}
+}
+
+// randomItem builds RLP-shaped random data (the Rust differential
+// test's random_item): byte strings and nested lists, so the walk
+// actually sees branch- and extension-shaped inputs — a valid
+// 17-item list is vanishingly rare in 48 uniform bytes.
+func randomItem(rng *rand.Rand, depth int) rlp.RawValue {
+	if depth <= 0 || rng.Intn(3) == 0 {
+		b := make([]byte, rng.Intn(40))
+		rng.Read(b)
+		return rlpcode.Bytes(b)
+	}
+	k := rng.Intn(18) // 0..17: crosses the branch/short boundary
+	items := make([]rlp.RawValue, 0, k)
+	for i := 0; i < k; i++ {
+		items = append(items, randomItem(rng, depth-1))
+	}
+	return rlpcode.List(items...)
+}
+
+func TestVerifyProofFuzzReachesTheWalk(t *testing.T) {
+	// The no-panic contract the package doc promises ("an outcome is
+	// ALWAYS Found / Absent / Invalid"). The earlier shape of this
+	// test (root = first bytes of b, key = b) missed byHash on the
+	// first lookup and every iteration died at "missing node" — the
+	// walk itself was never fuzzed. Here the root IS keccak of the
+	// fed node, and half the inputs are proper leaves at the query
+	// key, so interpretBranch/interpretShort/classifyItem/hexPrefix
+	//Decode all run on hostile content.
+	rng := rand.New(rand.NewSource(2))
+	for i := 0; i < 3000; i++ {
+		key := make([]byte, 32)
+		rng.Read(key)
+		var proof [][]byte
+		if rng.Intn(2) == 0 {
+			compact := append([]byte{0x20}, key...)
+			leaf := rlpcode.List(rlpcode.Bytes(compact), randomItem(rng, 2))
+			proof = append(proof, leaf)
+			root := Keccak(leaf)
+			if rng.Intn(3) == 0 { // extra hostile proof nodes
+				proof = append(proof, randomItem(rng, 3))
+			}
+			checkFuzzVerdict(t, VerifyProof(root, key, proof))
 			continue
 		}
-		root := [32]byte{}
-		copy(root[:], b)
-		VerifyProof(root, b, [][]byte{b, append([]byte{}, b...)})
+		node := randomItem(rng, 4)
+		proof = append(proof, node)
+		root := Keccak(node)
+		checkFuzzVerdict(t, VerifyProof(root, key, proof))
+	}
+}
+
+func checkFuzzVerdict(t *testing.T, r Result) {
+	t.Helper()
+	switch r.Status {
+	case Found, Absent, Invalid:
+		if r.Status == Invalid && r.Reason == "" {
+			t.Fatalf("Invalid verdict without a reason: %+v", r)
+		}
+	default:
+		t.Fatalf("outcome outside Found/Absent/Invalid: %+v", r)
 	}
 }
 
@@ -271,7 +340,13 @@ func TestValidateNodeFuzzNoPanic(t *testing.T) {
 func TestCorpusReplay(t *testing.T) {
 	corpus := filepath.Join("..", "..", "..", "rust", "testdata", "el", "mpt")
 	if _, err := os.Stat(corpus); err != nil {
-		t.Skipf("el/mpt conformance corpus not present at %s: %v", corpus, err)
+		// FAIL CLOSED (review finding): these vectors are the MPT
+		// trust anchor's only conformance check, go-engine.yml
+		// triggers on rust/testdata/** for exactly this reason, and
+		// the rlpx/lc conformance tests in this module already fail —
+		// not skip — when the corpus tree is missing. A green no-op
+		// here would silently un-pin the verifier.
+		t.Fatalf("el/mpt conformance corpus must be present at %s: %v", corpus, err)
 	}
 	expected := map[string]string{}
 	f, err := os.Open(filepath.Join(corpus, "expected.txt"))
@@ -298,8 +373,12 @@ func TestCorpusReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	sort.Strings(names)
-	if len(names) == 0 {
-		t.Fatal("no proof vectors found")
+	// Floor, not equality: a directory PARTIALLY emptied (the failure
+	// this guards) must not replay green, while a future upstream
+	// vector needs no edit here — go-engine.yml re-runs this test on
+	// any rust/testdata change. 27 is the count as of this writing.
+	if len(names) < 27 {
+		t.Fatalf("corpus truncated: %d proof vectors, want ≥27", len(names))
 	}
 
 	actual := map[string]string{}
