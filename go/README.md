@@ -52,8 +52,10 @@ reference.
    answer goes through the part-3 processor — checkpoint pin, period gate,
    BLS, Merkle branches. Live-smoke verified against roost + Lighthouse pins.
    Deliberate 3b cuts, all documented: TCP+Noise+yamux only (no QUIC, no
-   mplex → Nimbus), identify disabled (eth2 servers answer it under
-   `eth2/1.0.0`; re-enabling it feeds the LC-server peer tier), no LCSS
+   mplex → Nimbus), identify's observed-address discovery off (the
+   identify service itself runs and answers, with the eth2 twin's
+   `eth2/1.0.0` protocol-version field; 3c builds the LC-server peer
+   tier from the protocol lists it already collects), no LCSS
    snapshot persistence yet (cold start re-bootstraps).
 4. snap reads — GetAccountRange/GetStorageRanges/GetByteCodes verified against
    the anchor's state root; a `get-account`-style read

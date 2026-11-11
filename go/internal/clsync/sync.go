@@ -46,13 +46,28 @@ type Syncer struct {
 	Consensus *chain.Consensus
 	H         host.Host
 	Logf      func(string, ...any)
+	// Now is the wall clock. Injectable (defaults to time.Now) because
+	// the whole point of the corpus in rust/testdata/lc is that the
+	// chain walk is reproducible: RunCatchUp's exit condition, the
+	// force-rotate slot and the weak-subjectivity checks all read
+	// wall time, and a test that replays the corpus must control it
+	// (expected.txt's input.currentSlotEstimate is that input).
+	Now func() time.Time
 
-	peersMu sync.Mutex
-	peers   map[peer.ID]*peerState
-	order   []peer.ID
+	peersMu   sync.Mutex
+	peers     map[peer.ID]*peerState
+	order     []peer.ID
+	pollRound int // rotates which peer is asked first
 
 	procMu sync.Mutex
 	store  *lc.Store
+}
+
+func (s *Syncer) now() time.Time {
+	if s.Now != nil {
+		return s.Now()
+	}
+	return time.Now()
 }
 
 func NewSyncer(c *chain.Consensus, h host.Host, logf func(string, ...any)) *Syncer {
@@ -121,7 +136,7 @@ func (s *Syncer) peerList() []*peerState {
 // ourDigest recomputes the accepted fork digest from the wall clock:
 // the ENR/Status filter follows the fork schedule without a restart.
 func (s *Syncer) ourDigest() [4]byte {
-	return clwire.CurrentForkDigest(s.Consensus, time.Now().Unix())
+	return clwire.CurrentForkDigest(s.Consensus, s.now().Unix())
 }
 
 // LocalStatus is the Status WE announce — inbound answer and outbound
@@ -199,7 +214,7 @@ func (s *Syncer) markNotStatused(p *peerState) {
 // checkStartGate is weak-subjectivity layer 1: refuse a cold start
 // whose anchor period is more than the bound behind the wall period.
 func (s *Syncer) checkStartGate() error {
-	wall := s.Consensus.SlotAt(time.Now().Unix())
+	wall := s.Consensus.SlotAt(s.now().Unix())
 	if chain.WsAnchorStale(chain.SyncCommitteePeriod(s.Consensus.CheckpointSlot),
 		chain.SyncCommitteePeriod(wall), chain.WsBoundPeriods) {
 		return fmt.Errorf("%w: checkpoint period %d, wall period %d, bound %d",
@@ -231,7 +246,7 @@ func (s *Syncer) RunBootstrap(ctx context.Context) (*lc.Store, error) {
 			lastErr = err
 			continue
 		}
-		resp, err := Request(ctx, s.H, p.info, clwire.Bootstrap, req, respTimeout)
+		resp, err := RequestOnConn(ctx, s.H, p.info, clwire.Bootstrap, req, respTimeout)
 		if err != nil {
 			s.Logf("bootstrap: request to %s failed: %v", p.info.ID, err)
 			lastErr = err
@@ -296,15 +311,29 @@ func (s *Syncer) pickPeer(round int, startPeriod uint64) (*peerState, bool) {
 }
 
 // RunCatchUp walks periods forward with updates_by_range until the
-// store's committee period reaches the wall period. Per docs/spec/01
-// §9.6 the ask starts at storePeriod+1 and is capped at 128 periods;
-// multi-chunk timeouts use the 60 s updates budget. Every applied
-// update goes through the SAME processor the corpus pins (period gate
-// before BLS), and force-rotation uses the wall-clock slot estimate.
+// store's committee period reaches the wall period. The ask starts at
+// the store's OWN committee period — not +1 (PR #770 review): the
+// first update the walk needs is the one for the store's own period,
+// because it is the only thing that can deliver next_sync_committee
+// for P+1, and a bootstrap never carries one. The Rust twin says it
+// directly ("Start from the committee's own period, NOT the finalized
+// slot's", sync.rs:3186-3199); docs/spec/01 §9.6 ("from the store's
+// committee period") and the corpus itself agree (bootstrap at period
+// 1777, the accepted chain 1777→1795, the Java golden request
+// updates_by_range(1777,16)). Asking +1 could never apply anything:
+// every answer is signed in a period whose committee the store does
+// not hold, so it would period-gate forever.
+//
+// The batch is capped at MaxUpdatesByRange periods, multi-chunk reads
+// get the 60 s updates budget, and a read that dies mid-batch keeps
+// the prefix that arrived (each applied update advances the store on
+// its own — a partial batch is progress). Every applied update goes
+// through the SAME processor the corpus pins (period gate before BLS);
+// force-rotation uses the wall-clock slot estimate.
 func (s *Syncer) RunCatchUp(ctx context.Context, store *lc.Store) error {
 	round := 0
 	for {
-		wallSlot := s.Consensus.SlotAt(time.Now().Unix())
+		wallSlot := s.Consensus.SlotAt(s.now().Unix())
 		wallPeriod := chain.SyncCommitteePeriod(wallSlot)
 		if store.Period() >= wallPeriod {
 			return nil
@@ -312,7 +341,16 @@ func (s *Syncer) RunCatchUp(ctx context.Context, store *lc.Store) error {
 		if round++; round > maxCatchUpRounds {
 			return fmt.Errorf("clsync: catch-up stalled at period %d (wall %d)", store.Period(), wallPeriod)
 		}
-		start := store.Period() + 1
+		// Weak subjectivity, in-run layer (§9.6 layer 3, sync.rs:2496-2523):
+		// a committee held in memory ages exactly like one on disk, so a
+		// long-running sync that fell WsBoundPeriods behind must stop
+		// walking forward on it, not hand off through past-bound
+		// committees when peers finally answer.
+		if chain.WsAnchorStale(store.Period(), wallPeriod, chain.WsBoundPeriods) {
+			return fmt.Errorf("%w: held committee period %d, wall period %d, bound %d",
+				ErrStaleAnchor, store.Period(), wallPeriod, chain.WsBoundPeriods)
+		}
+		start := store.Period()
 		count := min(wallPeriod-store.Period(), clwire.MaxUpdatesByRange)
 		p, served := s.pickPeer(round, start)
 		if p == nil {
@@ -326,15 +364,18 @@ func (s *Syncer) RunCatchUp(ctx context.Context, store *lc.Store) error {
 			continue
 		}
 		req := clwire.EncodeUpdatesByRangeRequest(start, uint64(count))
-		resp, err := Request(ctx, s.H, p.info, clwire.UpdatesByRange, req, updatesTimeout)
-		if err != nil {
+		resp, err := RequestOnConn(ctx, s.H, p.info, clwire.UpdatesByRange, req, updatesTimeout)
+		if err != nil && len(resp) == 0 {
 			s.Logf("catch-up: ask %s +%d×%d failed: %v", p.info.ID, start, count, err)
 			continue
 		}
-		chunks, err := clwire.DecodeMultiChunk(resp, int(count))
-		if err != nil {
-			s.Logf("catch-up: %s batch undecodable: %v", p.info.ID, err)
+		chunks, derr := clwire.DecodeMultiChunk(resp, int(count))
+		if derr != nil && len(chunks) == 0 {
+			s.Logf("catch-up: %s batch undecodable: %v", p.info.ID, derr)
 			continue
+		}
+		if derr != nil || err != nil {
+			s.Logf("catch-up: %s answer truncated (%v); salvaging %d whole chunks", p.info.ID, derr, len(chunks))
 		}
 		applied := 0
 		s.procMu.Lock()
@@ -362,21 +403,44 @@ func (s *Syncer) RunCatchUp(ctx context.Context, store *lc.Store) error {
 	}
 }
 
-// PollFinality asks one peer for the current finality update and runs
-// it through ProcessFinalityUpdate — which rotates committees on
-// period crossings and reports Advanced only when the store moved
-// (the stalled-server fix: a verified-but-stale answer must not count
-// as the win). Returns the outcome for the caller's bookkeeping.
+// PollFinality reads the current finality update from the peer pool —
+// one round over ALL of them, matching the Rust round's shape
+// (sync.rs:3976-3988): `Advanced` from the first peer that moves the
+// store ends the round; a `Stale` answer (verified, but behind what
+// the store holds) is NOT a win — the round keeps reading, because a
+// current server may still answer. Returning on the first verified
+// answer was the stalled-relay trap the roost carve-out names
+// ("Withholding is a liveness attack and this concentrates it"): the
+// pool is walked in a fixed order, so one server serving an
+// old-but-valid update would pin every poll to `Stale` while the
+// healthy pins went unasked. The start index rotates per poll so no
+// single pin carries every request. `Stale` is reported only when
+// somebody verified and nobody advanced; `Rejected` + the last error
+// when nothing verified.
 func (s *Syncer) PollFinality(ctx context.Context, store *lc.Store) (lc.FinalityOutcome, error) {
+	peers := s.peerList()
+	if len(peers) == 0 {
+		return lc.Rejected, errors.New("clsync: no peers to poll")
+	}
+	s.peersMu.Lock()
+	rot := s.pollRound % len(peers)
+	s.pollRound++
+	s.peersMu.Unlock()
+
 	var lastErr error
-	for _, p := range s.peerList() {
+	verified := false
+	for i := range peers {
+		p := peers[(rot+i)%len(peers)]
+		if err := ctx.Err(); err != nil {
+			return lc.Rejected, err
+		}
 		if err := s.ensureStatus(ctx, p); err != nil {
 			lastErr = err
 			continue
 		}
 		// finality_update requests carry NO bytes (write nothing,
 		// half-close) — nil request body.
-		resp, err := Request(ctx, s.H, p.info, clwire.FinalityUpdate, nil, respTimeout)
+		resp, err := RequestOnConn(ctx, s.H, p.info, clwire.FinalityUpdate, nil, respTimeout)
 		if err != nil {
 			lastErr = err
 			continue
@@ -398,7 +462,13 @@ func (s *Syncer) PollFinality(ctx context.Context, store *lc.Store) (lc.Finality
 			lastErr = err
 			continue
 		}
-		return outcome, nil
+		if outcome == lc.Advanced {
+			return lc.Advanced, nil
+		}
+		verified = true // Stale: not a win, not a strike — keep reading
+	}
+	if verified {
+		return lc.Stale, nil
 	}
 	return lc.Rejected, lastErr
 }
@@ -424,14 +494,14 @@ func (s *Syncer) ProbeUpdates(ctx context.Context, store *lc.Store, n uint64) {
 			s.Logf("probe: %s status: %v", p.info.ID, err)
 			continue
 		}
-		resp, err := Request(ctx, s.H, p.info, clwire.UpdatesByRange, req, updatesTimeout)
-		if err != nil {
+		resp, err := RequestOnConn(ctx, s.H, p.info, clwire.UpdatesByRange, req, updatesTimeout)
+		if err != nil && len(resp) == 0 {
 			s.Logf("probe: %s: %v", p.info.ID, err)
 			continue
 		}
-		chunks, err := clwire.DecodeMultiChunk(resp, int(n))
-		if err != nil {
-			s.Logf("probe: %s: batch undecodable: %v", p.info.ID, err)
+		chunks, derr := clwire.DecodeMultiChunk(resp, int(n))
+		if derr != nil && len(chunks) == 0 {
+			s.Logf("probe: %s: batch undecodable: %v", p.info.ID, derr)
 			continue
 		}
 		var decoded, periodGated, otherRejects, applied int

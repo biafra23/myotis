@@ -95,15 +95,34 @@ func main() {
 		syncer.ProbeUpdates(ctx, st, uint64(*probeRange))
 	}
 
-	// Finality poll: once per slot, the steady state of the Rust loop.
+	// Steady state, one slot per cycle, shaped by the Rust outer loop
+	// (sync.rs:2560-2592): EVERY cycle first re-runs catch-up (a no-op
+	// while current), and the finality poll is skipped while the
+	// committee is behind — the store's committee may go stale under
+	// this loop when the wall clock crosses a period boundary, and a
+	// finality update signed by the next committee cannot verify until
+	// catch-up delivers it (docs/spec/01 §9.4: the poll loop must
+	// re-fetch at every period crossing "or finality verifies fail
+	// indefinitely").
+	advanced := false
 	for ctx.Err() == nil {
-		outcome, err := syncer.PollFinality(ctx, st)
-		if err != nil {
-			logf("finality poll: %v", err)
+		if err := syncer.RunCatchUp(ctx, st); err != nil {
+			logf("re-catch-up: %v", err)
+		} else if chain.SyncCommitteePeriod(
+			syncer.Consensus.SlotAt(time.Now().Unix())) > st.Period() {
+			logf("committee behind wall clock after re-catch-up; skipping finality poll this cycle")
 		} else {
-			logf("finality poll: outcome %v, finalized slot %d", outcome, st.Finalized.Slot)
-			if outcome == lc.Advanced && *once {
-				break
+			outcome, err := syncer.PollFinality(ctx, st)
+			if err != nil {
+				logf("finality poll: %v", err)
+			} else {
+				logf("finality poll: outcome %v, finalized slot %d", outcome, st.Finalized.Slot)
+				if outcome == lc.Advanced {
+					advanced = true
+					if *once {
+						break
+					}
+				}
 			}
 		}
 		select {
@@ -114,6 +133,13 @@ func main() {
 
 	fmt.Printf("finalized_slot=%d\nfinalized_exec_state_root=%s\n",
 		st.Finalized.Slot, hex(st.FinalizedStateRoot()))
+
+	// A budget that ran out without one Advanced is a failure, not a
+	// quiet success: a smoke keying off the exit code must not pass
+	// vacuously when every poll errored.
+	if *once && !advanced {
+		log.Fatalf("budget expired without a finality advance (finalized slot %d)", st.Finalized.Slot)
+	}
 }
 
 func hex(b [32]byte) string {

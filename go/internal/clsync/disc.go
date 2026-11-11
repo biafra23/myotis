@@ -8,7 +8,6 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/p2p/enode"
-	"github.com/ethereum/go-ethereum/p2p/enr"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -39,21 +38,29 @@ func StartDiscV5(udpPort int, digestFunc func() [4]byte, out chan<- peer.AddrInf
 		return nil, err
 	}
 	local := enode.NewLocalNode(db, key)
-	// A LocalNode with no endpoint in its ENR makes geth's v5 handshake
-	// nil-deref on the ID-signature (v5wire/crypto.go:79 with a record
-	// whose identity was never re-signed after the endpoint went
-	// missing): bind our own declared endpoint explicitly.
-	local.Set(enr.IPv4(net.IPv4(127, 0, 0, 1)))
-	local.Set(enr.UDP(udpPort))
+	// Declare the endpoint through the fallback setters, not Set: geth's
+	// doc on LocalNode.Set says IP/UDP go through Set*IP / SetFallbackUDP
+	// "otherwise they'll be overwritten by the endpoint predictor" — a
+	// plain Set(enr.IPv4(...)) is re-derived away by the first endpoint
+	// statement (PR #770 review). Same posture as part 1's discv4 node
+	// (internal/discovery), and honest about what it is: a loopback
+	// placeholder for an outbound-only client with no public address.
+	local.SetFallbackIP(net.IPv4(127, 0, 0, 1))
+	local.SetFallbackUDP(udpPort)
 	var bootnodes []*enode.Node
 	for _, s := range MainnetBootstrapENRs {
 		if n, err := enode.Parse(enode.ValidSchemes, s); err == nil {
 			bootnodes = append(bootnodes, n)
 		}
 	}
-	// Config.PrivateKey is the codec's handshake-signing key — pass it
-	// or geth nil-derefs in makeIDSignature the first time a peer
-	// WHOAREYOUs us (live-verified: the v5 handshake panics without it).
+	// Config.PrivateKey is the codec's handshake-signing key — without
+	// it geth nil-derefs in makeIDSignature the first time a peer
+	// WHOAREYOUs us (live-verified panic). This is the single root cause
+	// of the crashes originally logged as two "landmines": geth signs
+	// the ID signature with THIS key, and both panics sat behind it
+	// (the endpoint setters above are hygiene, not the fix — PR #770
+	// review pointed this out, and part 1's discv4 setup passing the
+	// key with only SetFallbackUDP was the working precedent).
 	disc, err := discover.ListenV5(conn, local, discover.Config{
 		PrivateKey: key,
 		Bootnodes:  bootnodes,
@@ -77,13 +84,30 @@ func StartDiscV5(udpPort int, digestFunc func() [4]byte, out chan<- peer.AddrInf
 		// hunt-mode 2 s is a 3c refinement.
 		tick := time.NewTicker(15 * time.Second)
 		defer tick.Stop()
-		// First lookup as soon as the table has a chance to seed.
-		time.Sleep(2 * time.Second)
+		// First lookup after a short seed window — NOT after the first
+		// tick (a select-first loop would wait the full 15 s before any
+		// lookup existed; PR #770 review). RunBootstrap snapshots the
+		// pool early, so a first lookup at 2 s can still feed it.
+		seeded := make(chan struct{})
+		go func() {
+			time.Sleep(2 * time.Second)
+			close(seeded)
+		}()
+		first := true
 		for {
-			select {
-			case <-stop:
-				return
-			case <-tick.C:
+			if first {
+				select {
+				case <-stop:
+					return
+				case <-seeded:
+				}
+				first = false
+			} else {
+				select {
+				case <-stop:
+					return
+				case <-tick.C:
+				}
 			}
 			digest := digestFunc()
 			for _, n := range disc.Lookup(randomID()) {

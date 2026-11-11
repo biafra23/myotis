@@ -127,18 +127,24 @@ func EncodeBootstrapRequest(root [32]byte) []byte { return EncodeRequest(root[:]
 // uncompressed length: reads at most declared+1 bytes and rejects any
 // mismatch, so a forged length cannot force an unbounded allocation
 // (codec.rs:94-119).
-func DecompressFramed(input []byte, declared int) ([]byte, error) {
+// The declared length is peer-chosen (up to 35 bits through the varint
+// guard) and is BOUNDED AT U64 WIDTH before any narrowing: on a 32-bit
+// target int(declared) goes negative for 2^31..2^32 and would reach the
+// make() below as a negative size — a remote panic from one response
+// chunk (the lc package guards the same class, and codec.rs:178-181
+// names android armv7 as the target in mind).
+func DecompressFramed(input []byte, declared uint64) ([]byte, error) {
 	if declared == 0 || declared > MaxUncompressedPayload {
 		return nil, fmt.Errorf("%w: declared uncompressed length %d outside (0, %d]",
 			ErrCodec, declared, MaxUncompressedPayload)
 	}
 	r := snappy.NewReader(bytes.NewReader(input))
-	buf := make([]byte, declared+1)
+	buf := make([]byte, int(declared)+1)
 	n, err := io.ReadFull(r, buf)
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		return nil, fmt.Errorf("%w: snappy decompress failed: %v", ErrCodec, err)
 	}
-	if n != declared {
+	if n != int(declared) { // narrowing is safe: the bound above proved it
 		return nil, fmt.Errorf("%w: snappy output %d bytes != declared %d", ErrCodec, n, declared)
 	}
 	return buf[:n], nil
@@ -205,7 +211,7 @@ func DecodeResponse(raw []byte, hasContext bool) (DecodeResult, error) {
 	if pos >= len(raw) {
 		return res, fmt.Errorf("%w: response truncated: no compressed data after header", ErrCodec)
 	}
-	payload, err := DecompressFramed(raw[pos:], int(declared))
+	payload, err := DecompressFramed(raw[pos:], declared)
 	if err != nil {
 		return res, err
 	}
@@ -242,7 +248,7 @@ func ParseRequestSszExpecting(raw []byte, expected uint64) ([]byte, error) {
 	if expected != 0 && declared != expected {
 		return nil, ErrCodec
 	}
-	return DecompressFramed(raw[snappyStart:], int(declared))
+	return DecompressFramed(raw[snappyStart:], declared)
 }
 
 // ExpectedRequestSize is the exact request-body size per served
@@ -280,7 +286,7 @@ func decodeErrorChunkMessage(raw []byte, start int) string {
 	if err != nil || msgStart >= len(raw) {
 		return ""
 	}
-	bound := min(int(declared), 256)
+	bound := min(declared, 256) // u64 width; DecompressFramed re-bounds
 	if bound > 0 {
 		if msg, err := DecompressFramed(raw[msgStart:], bound); err == nil {
 			return strings.TrimSpace(string(msg))
@@ -316,9 +322,9 @@ func EncodeSuccessResponse(ssz []byte, digest *[4]byte) []byte {
 // e.g. the NEXT chunk's result byte — stops the scan). Ported from
 // skip_snappy_frames (codec.rs), including the truncated-frame behaviour
 // (consume to end) the multi-chunk salvage depends on.
-func skipSnappyFrames(data []byte, start, uncompressedLen int) int {
+func skipSnappyFrames(data []byte, start int, uncompressedLen uint64) int {
 	pos := start
-	decompressed := 0
+	var decompressed uint64
 	for pos < len(data) {
 		chunkType := data[pos]
 		if chunkType != 0xFF && chunkType != 0x00 && chunkType != 0x01 {
@@ -334,10 +340,10 @@ func skipSnappyFrames(data []byte, start, uncompressedLen int) int {
 		if frameLen > 4 {
 			switch chunkType {
 			case 0x01:
-				decompressed += frameLen - 4
+				decompressed += uint64(frameLen - 4)
 			case 0x00:
 				if v, _, err := ReadVarint(data, pos+8); err == nil {
-					decompressed += int(v)
+					decompressed += v
 				} else {
 					return pos // not a real snappy frame
 				}
@@ -392,11 +398,11 @@ func DecodeMultiChunk(raw []byte, expectedCount int) ([]ContextChunk, error) {
 			continue
 		}
 		start := pos
-		pos = skipSnappyFrames(raw, pos, int(declared))
+		pos = skipSnappyFrames(raw, pos, declared)
 		if pos <= start {
 			break
 		}
-		payload, err := DecompressFramed(raw[start:pos], int(declared))
+		payload, err := DecompressFramed(raw[start:pos], declared)
 		if err != nil {
 			if len(items) > 0 && len(raw)-pos < 4 {
 				break // tail cut mid-snappy — salvage
