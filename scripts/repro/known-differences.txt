@@ -10,8 +10,8 @@
 #
 # Format: <fnmatch pattern> TAB <reason>. `*` matches across `/`.
 
-# (none: every GATED artifact reproduces. What is gated is the workflow's
-# `compare` matrix, Android first; ungated differences are reported, not listed here.)
+# (none: every gated artifact reproduces. What is gated is the workflow's
+# `compare` matrix: everything legs a and b build, on all three platforms.)
 #
 # History: the Compose plugin's wall-clock jar rewrite (the skiko runtime jar
 # everywhere, every jar on macOS) was listed here until app-desktop's

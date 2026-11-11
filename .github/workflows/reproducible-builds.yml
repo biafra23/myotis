@@ -1,8 +1,10 @@
 # Reproducible builds: build every release artifact TWICE and compare (#734, Part 5a).
 #
-# Each platform builds in two legs, a and b, on two runners of the same pinned
-# image, and the legs differ in everything a reproducible build must not
-# depend on:
+# Each platform builds in two legs, a and b: on Linux in one builder image
+# named by digest, on macOS and Windows on two hosted runners of one image
+# label, with the toolchains pinned on them (the compare job names the image
+# version each leg got). The legs differ in everything a reproducible build
+# must not depend on:
 #   - the checkout path: a builds in $GITHUB_WORKSPACE, b in a fresh clone
 #     several directories deeper under $RUNNER_TEMP (so a leaked absolute path
 #     differs in length and content, not just a prefix);
@@ -45,15 +47,19 @@
 # assets` (the `published` job) waits for the release's Android assets and
 # compares leg a with them. Reported, not gated, like leg r.
 #
-# WHAT FAILS THE RUN (owner's decision, 2026-11-10: Android first): the Android
-# artifacts — the APKs (android/) and the engine library (maven-repo/: the AAR,
-# its jars, natives jars and metadata) — in `Compare linux` (a against b), and
-# a missing leg a or b. Everything
-# else is built twice, compared and REPORTED in the same way, marked "(not
-# gated)", and does not fail yet: the Linux .deb and host libraries, and all of
-# macOS/iOS and Windows. The first runs found them close but not there (the
-# desktop installers' payload, the macOS dylibs and the MyotisKit binaries);
-# they join the gate in a later part of #734, one `--gate` at a time below.
+# WHAT FAILS THE RUN (owner's decisions: Android first, 2026-11-10; everything
+# the two legs build, 2026-11-11): any difference between legs a and b, on
+# every platform, and a missing leg a or b. `Compare linux`: the APKs
+# (android/), the engine library (maven-repo/: the AAR, its jars, natives jars
+# and metadata) and the .deb. `Compare macos`: the dmg's .app and both
+# xcframeworks. `Compare windows`: the msi's files. And on each of the three,
+# host/: the engine library and the Node addon as that platform builds them
+# (.so, .dylib, .dll). The first runs had found the desktop and Apple
+# artifacts close but not there (the installers' payload, the macOS dylibs, the
+# MyotisKit binaries); Part 5d of #734 fixed those, and with a clean report on
+# all three platforms they joined the gate. What is REPORTED and does not fail
+# is the two comparisons that are not a against b: leg r, above, and on a tag
+# the published assets.
 #
 # Not on every pull request: a full rebuild of every platform, twice, is the
 # most expensive workflow in the repository, and what it checks moves only with
@@ -250,12 +256,17 @@ jobs:
           set -euo pipefail
           scripts/repro/collect.sh linux . "$RUNNER_TEMP/repro-out"
           tar -C "$RUNNER_TEMP/repro-out" -cf "$RUNNER_TEMP/repro-linux.tar" .
+          # Which hosted image this leg ran on, next to the tarball and outside
+          # the compared tree: the compare job names the pair.
+          printf 'ImageOS=%s\nImageVersion=%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}" > "$RUNNER_TEMP/repro-runner.txt"
 
       - name: Upload leg ${{ matrix.leg }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: repro-linux-${{ matrix.leg }}
-          path: ${{ runner.temp }}/repro-linux.tar
+          path: |
+            ${{ runner.temp }}/repro-linux.tar
+            ${{ runner.temp }}/repro-runner.txt
           if-no-files-found: error
 
   # Leg r: the same build on the hosted runner's toolchain, installed as
@@ -301,12 +312,17 @@ jobs:
           set -euo pipefail
           scripts/repro/collect.sh linux . "$RUNNER_TEMP/repro-out"
           tar -C "$RUNNER_TEMP/repro-out" -cf "$RUNNER_TEMP/repro-linux.tar" .
+          # Which hosted image this leg ran on, next to the tarball and outside
+          # the compared tree: the compare job names the pair.
+          printf 'ImageOS=%s\nImageVersion=%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}" > "$RUNNER_TEMP/repro-runner.txt"
 
       - name: Upload leg r
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: repro-linux-r
-          path: ${{ runner.temp }}/repro-linux.tar
+          path: |
+            ${{ runner.temp }}/repro-linux.tar
+            ${{ runner.temp }}/repro-runner.txt
           if-no-files-found: error
 
   macos:
@@ -391,12 +407,17 @@ jobs:
           set -euo pipefail
           scripts/repro/collect.sh macos . "$RUNNER_TEMP/repro-out"
           tar -C "$RUNNER_TEMP/repro-out" -cf "$RUNNER_TEMP/repro-macos.tar" .
+          # Which hosted image this leg ran on, next to the tarball and outside
+          # the compared tree: the compare job names the pair.
+          printf 'ImageOS=%s\nImageVersion=%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}" > "$RUNNER_TEMP/repro-runner.txt"
 
       - name: Upload leg ${{ matrix.leg }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: repro-macos-${{ matrix.leg }}
-          path: ${{ runner.temp }}/repro-macos.tar
+          path: |
+            ${{ runner.temp }}/repro-macos.tar
+            ${{ runner.temp }}/repro-runner.txt
           if-no-files-found: error
 
   windows:
@@ -480,12 +501,17 @@ jobs:
           # --force-local: Git Bash's GNU tar reads the colon in D:\a\_temp as
           # a remote host:file archive otherwise (actions/toolkit passes it too).
           tar --force-local -C "$RUNNER_TEMP/repro-out" -cf "$RUNNER_TEMP/repro-windows.tar" .
+          # Which hosted image this leg ran on, next to the tarball and outside
+          # the compared tree: the compare job names the pair.
+          printf 'ImageOS=%s\nImageVersion=%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}" > "$RUNNER_TEMP/repro-runner.txt"
 
       - name: Upload leg ${{ matrix.leg }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: repro-windows-${{ matrix.leg }}
-          path: ${{ runner.temp }}/repro-windows.tar
+          path: |
+            ${{ runner.temp }}/repro-windows.tar
+            ${{ runner.temp }}/repro-runner.txt
           if-no-files-found: error
 
   # A `v*` tag only: the rebuild in the builder image (leg a) against the
@@ -648,16 +674,18 @@ jobs:
       matrix:
         include:
           # Which two legs, and compare.py's gate: what FAILS the run. See the
-          # header.
+          # header. An empty gate is compare.py's default, everything the two
+          # legs produced is gated (scripts/repro/test_compare.py holds that
+          # default). A missing leg fails in the Unpack step below.
           - name: linux
             platform: linux
             first: a
             second: b
-            gate: "--gate android/* --gate maven-repo/*"
+            gate: ""
           # The image build against a build on the hosted runner's toolchain
           # (leg r). REPORTED, NOT GATED: whether this comparison fails the run,
-          # and on which paths, is the owner's decision (the gate is Android
-          # first, legs a and b; CLAUDE.md). If it is gated one day, not on the
+          # and on which paths, is the owner's decision (the gate is legs a
+          # against b; CLAUDE.md). If it is gated one day, not on the
           # Linux natives jar: it carries a host library linked by the
           # builder's own gcc and glibc (the hosted image's moves with Ubuntu's
           # updates), and the RELEASE's Linux natives come from neither side
@@ -671,12 +699,12 @@ jobs:
             platform: macos
             first: a
             second: b
-            gate: "--report-only"
+            gate: ""
           - name: windows
             platform: windows
             first: a
             second: b
-            gate: "--report-only"
+            gate: ""
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -697,9 +725,33 @@ jobs:
           name: repro-${{ matrix.platform }}-${{ matrix.second }}
           path: tars/b
 
+      # On Linux both legs build in one image named by digest, so a difference
+      # is a leak in the build. On macOS and Windows the legs run on hosted
+      # runners of one image LABEL (macos-15, windows-2025). Xcode, the JDK,
+      # rustc and WiX are pinned on them; the MSVC toolset, the Windows SDK and
+      # macOS's own tools (codesign) are whatever the image carries, and while
+      # GitHub rolls a new image out, two jobs of one run can get two versions.
+      # A comparison that fails for that reason is still a failure (the two
+      # builds differ), but its cause is not in the tree: name the pair here,
+      # so that case is recognizable in the run before anyone hunts for a leak.
+      - name: Name the runner image of each leg
+        env:
+          FIRST: ${{ matrix.first }}
+          SECOND: ${{ matrix.second }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          image() { if [ -f "$1" ]; then tr '\n' ' ' < "$1" | sed 's/ $//'; else echo "not recorded"; fi; }
+          a=$(image tars/a/repro-runner.txt) b=$(image tars/b/repro-runner.txt)
+          echo "leg $FIRST: $a"
+          echo "leg $SECOND: $b"
+          if [ "$a" != "$b" ]; then
+            echo "::warning::$PLATFORM: legs $FIRST and $SECOND ran on different runner images ($a / $b). If the comparison below differs in a file a tool of the image writes (a linker, codesign), look here first: re-run once both legs get the same image."
+          fi
+
       # -p: the modes as the leg recorded them, not this runner's umask.
-      # A missing leg fails a gated platform; on a report-only one its own
-      # build job is already red, and there is nothing to compare.
+      # A missing leg fails a gated comparison (this step); on a report-only
+      # one (leg r) its own build job is already red, and there is nothing to
+      # compare.
       - name: Unpack both legs
         id: unpack
         env:

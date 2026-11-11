@@ -471,20 +471,23 @@ into `main`** (owner ruling, 2026-11-10). "Reproducible" is what
 runners, different checkout path, `CARGO_HOME`, `GRADLE_USER_HOME`, time zone,
 locale, umask and wall clock, and on Linux, where both builds run in the
 builder image, another user — comes out bit-for-bit identical, apart from the
-entries in `scripts/repro/known-differences.txt` (none today).
+entries in `scripts/repro/known-differences.txt` (none today). The workflow's
+header has the exact list of what the two builds differ in, and the one step
+that does not vary (packaging the dmg).
 
-**The gate is Android first** (owner's decision, 2026-11-10): the unsigned
-release APK, the debug APK (by payload: its debug-key signature differs by
-design) and the engine library as staged (the AAR, its jars, natives jars,
-poms and metadata) — `android/` and `maven-repo/` in the Linux comparison.
-The rest is built twice and compared in the same run but only REPORTED,
-marked "(not gated)": the Linux `.deb` and host libraries, the Windows msi and
-DLLs, the macOS dmg and dylibs, the xcframeworks. They were close but not
-reproducible when the gate was set (the desktop installers' payload, the macOS
-dylibs, the MyotisKit binaries) and join it in a later part of #734, by adding
-a `--gate` in the workflow's `compare` matrix. Until then a difference there
-is information, not a blocker; do not widen or narrow the gate without the
-owner.
+**The gate is everything the two builds produce, on all three platforms**
+(owner's decisions: Android first, 2026-11-10; widened 2026-11-11, once the
+desktop and Apple artifacts had reproduced). `Compare linux`, `Compare macos`
+and `Compare windows` each fail on any difference between their legs a and b:
+the unsigned release APK, the debug APK (by payload: its debug-key signature
+differs by design), the engine library as staged (the AAR, its jars, natives
+jars, poms and metadata) and the `.deb`; the dmg (by its `.app`) and the two
+xcframeworks; the msi (by the files it installs); and on each platform the
+host libraries: the engine library and the Node addon. Two comparisons are
+REPORTED and do not fail, because their second side is not a second build of
+the same kind: `Compare linux image vs runner toolchain`, and on a tag the
+image build against the published assets. Do not widen or narrow the gate
+without the owner.
 
 - **Before reporting a PR into `main` "ready to merge", its head has a green
   `reproducible builds` run** whenever the PR can change what a release build
@@ -497,8 +500,8 @@ owner.
   resources). The workflow runs by itself on a PR that changes it or its
   scripts; for any other PR, dispatch it on the PR's branch (Actions tab, or
   `gh api repos/<owner>/<repo>/actions/workflows/reproducible-builds.yml/dispatches
-  -f ref=<branch>`) and wait for its `Compare` jobs (`Compare linux` carries the
-  gate). When unsure whether a
+  -f ref=<branch>`) and wait for its `Compare` jobs (`Compare linux`,
+  `Compare macos` and `Compare windows` carry the gate). When unsure whether a
   change can reach a release artifact, dispatch it. A PR that touches only
   docs, tests or CI that builds nothing shipped needs no run.
 - **A red comparison is a blocker, like red CI** (a gated artifact differs):
