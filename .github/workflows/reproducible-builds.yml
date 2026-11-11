@@ -51,9 +51,10 @@
 # the two legs build, 2026-11-11): any difference between legs a and b, on
 # every platform, and a missing leg a or b. `Compare linux`: the APKs
 # (android/), the engine library (maven-repo/: the AAR, its jars, natives jars
-# and metadata), the .deb and the host libraries. `Compare macos`: the dmg's
-# .app, the dylibs, the Node addon and both xcframeworks. `Compare windows`:
-# the msi's files and the DLLs. The first runs had found the desktop and Apple
+# and metadata) and the .deb. `Compare macos`: the dmg's .app and both
+# xcframeworks. `Compare windows`: the msi's files. And on each of the three,
+# host/: the engine library and the Node addon as that platform builds them
+# (.so, .dylib, .dll). The first runs had found the desktop and Apple
 # artifacts close but not there (the installers' payload, the macOS dylibs, the
 # MyotisKit binaries); Part 5d of #734 fixed those, and with a clean report on
 # all three platforms they joined the gate. What is REPORTED and does not fail
