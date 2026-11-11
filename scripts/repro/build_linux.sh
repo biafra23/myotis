@@ -27,6 +27,9 @@
 #                      GITHUB_REF, else the v* tag HEAD is exactly at, else the
 #                      bare release version of the tree.
 #   REPRO_UMASK        default 022
+#   APP_VERSION        the version the app shows (-PappVersion). Default: read
+#                      from git, which needs a clone with the tag; state it
+#                      for a source tarball or a shallow clone.
 set -euo pipefail
 umask "${REPRO_UMASK:-022}"
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}"
@@ -39,13 +42,15 @@ if [[ -z "$version" ]]; then
 fi
 flag=-PpublishRelease
 [[ -z "$version" ]] || flag="-PpublishRelease=$version"
+app_version=()
+[[ -z "${APP_VERSION:-}" ]] || app_version=("-PappVersion=$APP_VERSION")
 # No apostrophe inside ${...:-...}: bash versions disagree on whether one opens
 # a quote there, even within double quotes.
 echo "build_linux.sh: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH, engine library version: ${version:-the release version of the tree}"
 
 for attempt in 1 2 3; do
     rm -rf build/maven-repo
-    ./gradlew "$flag" cargoBuildHost \
+    ./gradlew "$flag" ${app_version[@]+"${app_version[@]}"} cargoBuildHost \
         :android-app:assembleRelease :android-app:assembleDebug \
         :app-desktop:packageDeb publishAllPublicationsToStagingRepository \
         --stacktrace && break

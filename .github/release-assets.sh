@@ -93,6 +93,9 @@ assets() {
 }
 
 if [ "$mode" = upload ]; then
+  # Each file's hash once: the loop below may poll a dozen times, and the
+  # attestation's subjects need the same values.
+  for f in "$@"; do printf '%s\t%s\n' "$(basename "$f")" "$(sha "$f")"; done > "$tmp/built"
   gh release upload "$tag" "$@" --clobber
 
   # The release serves the bytes this job built.
@@ -103,7 +106,7 @@ if [ "$mode" = upload ]; then
       name=$(basename "$f")
       got=$(awk -F'\t' -v n="$name" '$1 == n && $2 == "uploaded" { print $3 }' "$tmp/list")
       if [ -z "$got" ]; then pending="$pending $name"; continue; fi
-      want=$(sha "$f")
+      want=$(awk -F'\t' -v n="$name" '$1 == n { print $2 }' "$tmp/built")
       [ "$got" = "$want" ] \
         || fail "$name on the release of $tag has SHA-256 $got, the file this job built has $want"
     done
@@ -115,7 +118,7 @@ if [ "$mode" = upload ]; then
 
   # The subjects of this job's attestation.
   subjects=${RELEASE_ASSETS_SUBJECTS:-${RUNNER_TEMP:-.}/release-assets.SHA256SUMS}
-  for f in "$@"; do printf '%s  %s\n' "$(sha "$f")" "$(basename "$f")"; done >> "$subjects"
+  awk -F'\t' '{ print $2 "  " $1 }' "$tmp/built" >> "$subjects"
   exit 0
 fi
 

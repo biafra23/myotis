@@ -195,6 +195,7 @@ allprojects {
             val writingLocks = gradle.startParameter.isWriteDependencyLocks
             val pinFailures = mutableListOf<String>()
             confs.forEach { conf ->
+                val locks = if (conf in buildscriptConfs) buildscriptLocks else projectLocks
                 try {
                     // The graph (what the lock state records) …
                     conf.incoming.resolutionResult.root
@@ -211,7 +212,6 @@ allprojects {
                     // rule, enforced here). Checked only now: the graph walk above
                     // does not throw on an unresolvable dependency, the file
                     // resolution does.
-                    val locks = if (conf in buildscriptConfs) buildscriptLocks else projectLocks
                     if (!writingLocks && locks != null && conf.name !in locks) {
                         pinFailures += "${project.path}:${conf.name} — resolves, but has no lock state"
                     }
@@ -230,8 +230,22 @@ allprojects {
                             "dependency was locked to version" in it || "dependency lock state" in it
                         }
                     }
+                    // Not a pin failure, but the GRAPH may still have resolved
+                    // completely, and only the files could not be selected by this
+                    // generic walk (attributes it lacks, a task output it would
+                    // need). Such a configuration resolves in a real build, so
+                    // STRICT's rule holds for it too: no lock state is a failure,
+                    // not a skip. One whose graph did not resolve (an unresolvable
+                    // dependency on this host) is skipped as before.
+                    val graphResolved = runCatching {
+                        conf.incoming.resolutionResult.allDependencies
+                            .none { it is org.gradle.api.artifacts.result.UnresolvedDependencyResult }
+                    }.getOrDefault(false)
                     if (isPinFailure) {
                         pinFailures += "${project.path}:${conf.name} — $causes"
+                    } else if (graphResolved && !writingLocks && locks != null && conf.name !in locks) {
+                        pinFailures += "${project.path}:${conf.name} — its graph resolves, but it has no lock state " +
+                            "(its files could not be selected here: ${chain.firstOrNull()?.message.orEmpty().take(200)})"
                     } else {
                         logger.warn("resolveAllDependencies: ${project.path}:${conf.name} skipped — $causes")
                     }

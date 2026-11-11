@@ -51,6 +51,7 @@ repository=$(sed -n 's/^IMAGE_REPOSITORY=//p' "$here/pins.env")
 key=$("$here/build.sh" --print-key)
 ref="$repository:$key"
 locked_key=$( [[ -f "$lock" ]] && sed -n 's/^key=//p' "$lock" || true)
+locked_image=$( [[ -f "$lock" ]] && sed -n 's/^image=//p' "$lock" || true)
 pause=${PUBLISH_RETRY_PAUSE:-20}
 
 # Ask the registry for a reference. 0: it is there, and `digest` is its digest.
@@ -83,7 +84,15 @@ origin=""
 state=0; ask "$ref" || state=$?
 if [[ "$locked_key" == "$key" ]]; then
     case $state in
-        0) ;;
+        0)  # The tag of a locked key must still be the locked digest. If it is
+            # not, someone moved it: an image already published for a key is never
+            # replaced, so this is refused, not offered as a new lock to commit.
+            if [[ -n "$locked_image" && "$locked_image" != "$repository@$digest" ]]; then
+                echo "publish.sh: $ref now points to $digest, and image.lock names $locked_image." >&2
+                echo "            The tag of a published key was moved. Not locking the moved image: find out who" >&2
+                echo "            moved it, and keep the locked digest (pull.sh pulls by digest, so it still works)." >&2
+                exit 1
+            fi ;;
         1) no_answer "image.lock says $ref is published, and the registry says it does not exist. Not publishing again: the lock would name another image than the one it was committed for." ;;
         *) no_answer "image.lock says $ref is published, but the registry did not say so. Not publishing again; re-run. Its last answer:" ;;
     esac

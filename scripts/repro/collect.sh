@@ -76,8 +76,11 @@ linux)
     dpkg-deb --control "$deb" "$out/desktop/deb-payload/DEBIAN"
     # TZ=UTC: tar prints mtimes in local time, and leg b's zone is another.
     # No size column: the payload's bytes are compared file by file above.
+    # Sorted by path (field 5 to the end, once the size is gone), so a mode or
+    # mtime difference shows next to its file; the members' ORDER is compared
+    # where it matters, in the .deb itself.
     dpkg-deb --fsys-tarfile "$deb" | TZ=UTC tar -tvf - --full-time --numeric-owner \
-        | awk '{ $3 = ""; print }' | LC_ALL=C sort -k6 > "$out/desktop/deb-payload.entries"
+        | awk '{ $3 = ""; sub(/  /, " "); print }' | LC_ALL=C sort -k5 > "$out/desktop/deb-payload.entries"
     echo "  desktop/deb-payload/ (payload) + desktop/deb-payload.entries"
     put rust/target/release/libmyotis_engine.so host/libmyotis_engine.so
     put rust/target/x86_64-unknown-linux-gnu/release/libmyotis_node.so host/libmyotis_node.so

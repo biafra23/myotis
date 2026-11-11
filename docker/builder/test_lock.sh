@@ -107,8 +107,10 @@ lock "$KEY" "$R@$D1"; echo "$D2" > "$STUB/next_digest"
 "$B/publish.sh" > /dev/null 2>&1; rc=$?
 check "with the lock committed it passes, and the published image is not replaced" '[ $rc = 0 ] && [ "$(pushes)" = 1 ]'
 lock "$KEY" "$R@$D2"
-"$B/publish.sh" > /dev/null 2>&1; rc=$?
+"$B/publish.sh" > "$STUB/out" 2>&1; rc=$?
 check "a lock that names another digest fails" '[ $rc = 1 ] && [ "$(pushes)" = 1 ]'
+check "a moved tag is refused, not offered as a new lock" \
+  'grep -q "tag of a published key was moved" "$STUB/out" && ! grep -q "BEGIN image.lock" "$STUB/out"'
 lock "0000" "$R@$D1"
 "$B/publish.sh" > /dev/null 2>&1; rc=$?
 check "a lock for other pins fails" '[ $rc = 1 ]'

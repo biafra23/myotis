@@ -191,6 +191,16 @@ home and nothing of your environment. `build_linux.sh` takes the version from
 the tag and `SOURCE_DATE_EPOCH` from the tagged commit. The image is
 linux/amd64; on an Apple Silicon Mac it runs under emulation, slowly.
 
+The version the app shows is read from git: a full clone of the tag, as
+above, gives the tag's version, and so do the release builds. A checkout
+without the tags (a source tarball, a shallow clone) would give another one,
+and with it other bytes. State it instead: `APP_VERSION=<the version the
+released app shows>` in front of `scripts/repro/build_linux.sh` (inside
+`run.sh`, which passes no environment of yours: `run.sh -- env
+APP_VERSION=0.1.21 scripts/repro/build_linux.sh`). For the tag `v0.1.21` it is
+`0.1.21`; for a release-candidate tag, the version the published app shows,
+such as `0.1.20-1a2b3c`.
+
 The results:
 
 | Built | Compare with |

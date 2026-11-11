@@ -117,11 +117,13 @@ abstract class AppVersionSource : ValueSource<String, AppVersionSource.Params> {
 // tag says X.Y.Z, a source tarball says the root version (-SNAPSHOT), a shallow
 // clone without tags says <x>-<sha>. A rebuild that wants the release's bytes
 // states the version instead of depending on how the source was fetched
-// (docs/guides/reproducible-builds.md, Part 5). Shape-checked like the tags it stands
-// for, so it cannot inject into the generated Kotlin literal.
+// (docs/guides/reproducible-builds.md, "The commands"). Any value the derivation
+// can produce is accepted, so an rc tag's build (`0.1.20-1a2b3c`, the last release
+// plus the commit) can be stated too; the character set keeps it from injecting
+// into the generated Kotlin literal.
 val explicitAppVersion: String? = providers.gradleProperty("appVersion").orNull?.trim()?.also {
-    require(Regex("""^\d+(\.\d+)*$""").matches(it)) {
-        "-PappVersion=$it: expected a release version like 0.1.21 (no v prefix, no suffix)"
+    require(Regex("""^\d+(\.\d+)*(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$""").matches(it)) {
+        "-PappVersion=$it: expected a version as the app shows it, like 0.1.21 or 0.1.20-1a2b3c (no v prefix)"
     }
 }
 val uiAppVersion: Provider<String> = explicitAppVersion?.let { providers.provider { it } }
