@@ -90,28 +90,88 @@ class BeePocTest {
         assertTrue(Files.readString(data.resolve(gnosis.installedManifestFile)).contains("coveredHigh=48800000"))
     }
 
+    /** An installed v1 the engine has since rewritten, and a newer bundle to re-seed from. */
+    private fun installedThenNewer(dir: Path, data: Path): Path {
+        val v1 = stageBundle(dir, "seed-v1".toByteArray(), high = 48_262_676)
+        assertEquals(SeedOutcome.INSTALLED, install(v1, data))
+        Files.write(data.resolve(gnosis.seedFile), "engine-checkpoint".toByteArray())
+        return stageBundle(dir, "seed-v2".toByteArray(), high = 48_800_000)
+    }
+
+    // The two cases below fail the COPY, for every user on every OS: no permission
+    // bits involved, so nothing to skip for root or for Windows. A non-empty directory
+    // stands where the install has to write, which neither Files.copy(REPLACE_EXISTING)
+    // nor a rename can replace.
+
     @Test
-    fun `a failed re-seed keeps the previous index and leaves no temp file`(@TempDir dir: Path) {
+    fun `a re-seed whose copy fails keeps the previous index and its manifest`(@TempDir dir: Path) {
+        val data = dir.resolve("data")
+        val newer = installedThenNewer(dir, data)
+
+        // The seed's temp name is taken by a non-empty directory: the copy into it throws
+        // before the installed index is touched.
+        val blocked = data.resolve("${gnosis.seedFile}.tmp")
+        Files.createDirectories(blocked)
+        Files.write(blocked.resolve("in-the-way"), byteArrayOf(1))
+
+        assertEquals(SeedOutcome.FAILED, install(newer, data))
+        assertEquals("engine-checkpoint", Files.readString(data.resolve(gnosis.seedFile)))
+        assertTrue(Files.readString(data.resolve(gnosis.installedManifestFile)).contains("coveredHigh=48262676"))
+        assertFalse(Files.exists(data.resolve("${gnosis.installedManifestFile}.tmp")))
+        // The sweep after a failure removes temp FILES; what was staged here is not one
+        // and is not the install's to remove.
+        assertTrue(Files.isRegularFile(blocked.resolve("in-the-way")))
+    }
+
+    @Test
+    fun `a re-seed whose move fails sweeps the temp file it wrote`(@TempDir dir: Path) {
+        val data = dir.resolve("data")
+        val newer = installedThenNewer(dir, data)
+
+        // The index itself is replaced by a non-empty directory: the copy to the temp
+        // file succeeds, the move onto the directory cannot. This is the only staging
+        // here that leaves a temp file behind for the failure path to sweep.
+        val target = data.resolve(gnosis.seedFile)
+        Files.delete(target)
+        Files.createDirectories(target)
+        Files.write(target.resolve("in-the-way"), byteArrayOf(1))
+
+        assertEquals(SeedOutcome.FAILED, install(newer, data))
+        assertFalse(Files.exists(data.resolve("${gnosis.seedFile}.tmp")), "the temp file of the failed move is swept")
+        assertFalse(Files.exists(data.resolve("${gnosis.installedManifestFile}.tmp")))
+        assertTrue(Files.readString(data.resolve(gnosis.installedManifestFile)).contains("coveredHigh=48262676"))
+        assertTrue(Files.isRegularFile(target.resolve("in-the-way")), "what stood in the index's place is not deleted")
+    }
+
+    @Test
+    fun `an unreadable bundled seed fails before anything is copied`(@TempDir dir: Path) {
         org.junit.jupiter.api.Assumptions.assumeFalse(
             System.getProperty("os.name").lowercase().contains("win"),
             "relies on POSIX permissions to make the bundled seed unreadable",
         )
         val data = dir.resolve("data")
-        val v1 = stageBundle(dir, "seed-v1".toByteArray(), high = 48_262_676)
-        assertEquals(SeedOutcome.INSTALLED, install(v1, data))
-        Files.write(data.resolve(gnosis.seedFile), "engine-checkpoint".toByteArray())
+        val newer = installedThenNewer(dir, data)
 
-        // A newer bundle whose seed cannot be read (the manifest still matches its
-        // sha256, so the checksum gate passes and the copy itself fails).
-        val newer = stageBundle(dir, "seed-v2".toByteArray(), high = 48_800_000)
+        // A newer bundle whose seed cannot be read. Its sha256 is computed by streaming
+        // the file, so the install stops there, with FAILED, before the checksum is
+        // compared and before any copy. (The copy's own failures are the two cases above.)
         val newerSeed = newer.resolve(gnosis.seedFile)
         Files.setPosixFilePermissions(newerSeed, emptySet())
         try {
-            // sha256 is computed by streaming the file, which the permission denies too:
-            // that surfaces as FAILED via the checksum path or the copy path, and either
-            // way the previous index must survive.
-            val outcome = install(newer, data)
-            assertTrue(outcome == SeedOutcome.FAILED || outcome == SeedOutcome.BAD_CHECKSUM, "got $outcome")
+            // The permission only makes the file unreadable for a user it applies to.
+            // root (a container build, a CI image that runs as root) reads it anyway,
+            // the re-seed then SUCCEEDS, and the test would fail for a reason that has
+            // nothing to do with the code under test. So ask what the install will ask:
+            // open the file. (Not Files.isReadable: that is access(2), which answers for
+            // the real uid without its capabilities and can say "no" where an open
+            // succeeds.) Inside the try, so the mode is restored for @TempDir's cleanup
+            // either way.
+            val readable = runCatching { Files.newInputStream(newerSeed).use { } }.isSuccess
+            org.junit.jupiter.api.Assumptions.assumeFalse(
+                readable,
+                "this process can open a file with no permission bits (root?): the failure this test needs cannot be staged",
+            )
+            assertEquals(SeedOutcome.FAILED, install(newer, data))
             assertEquals("engine-checkpoint", Files.readString(data.resolve(gnosis.seedFile)))
             assertTrue(Files.readString(data.resolve(gnosis.installedManifestFile)).contains("coveredHigh=48262676"))
             assertFalse(Files.exists(data.resolve("${gnosis.seedFile}.tmp")))
