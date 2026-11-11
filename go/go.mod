@@ -5,6 +5,7 @@ go 1.27.3
 require (
 	github.com/ethereum/go-ethereum v1.16.8
 	github.com/golang/snappy v1.0.0
+	github.com/supranational/blst v0.3.16-0.20250831170142-f48500c1fdbe
 	golang.org/x/crypto v0.58.0
 )
 
