@@ -99,7 +99,7 @@ activity-compose = "1.9.3"
 # JSON-RPC server (:jsonrpc-server). Ktor server+client + kotlinx are chosen for
 # Android compatibility (no java.net.http / com.sun.net.httpserver) and to match
 # the project's Ktor/Compose-Multiplatform direction. Aligned with Kotlin 2.0.21.
-ktor = "3.0.3"
+ktor = "3.6.1"
 kotlinx-coroutines = "1.9.0"
 kotlinx-serialization = "1.7.3"
 # 0.6.2 = the compatibility release for the kotlin.time.Instant the 2.1.20+ stdlib
