@@ -98,8 +98,14 @@ policy, anchoring — is this module's own code, guided by `docs/spec/` and
    pinned by test). `myotis-go
    -get-account <addr> [-slot <n>]` runs the light client in parallel
    with EL dialing and prints the account only once the proof verifies
-   against the LC-anchored finalized exec state root. Two CLI policy
-   points: anchors are published only after a VERIFYING finality poll
+   against the LC-anchored finalized exec state root. (Since the
+   desktop-embed step-1 refactor this orchestration — dialer, LC loop,
+   anchor publishing, and the read with its per-anchor disclosure
+   memory — lives in `internal/engine`, the engine as a library; the
+   CLI is a thin driver over it, and `myotis-go -json` prints the same
+   verified read in the pinned engine-API result shape
+   (`internal/engine/eljson.go`: the eljson.rs key set and value
+   encodings, goldens included).) Two policy points: anchors are published only after a VERIFYING finality poll
    (never the bootstrap/catch-up root, which is routinely outside
    every peer's ~128-block state window — reading on it would
    disclose the key to peers that cannot answer), and the 2 s retry
@@ -154,6 +160,7 @@ go run ./cmd/myotis-go -dial=false               # discovery only
 go run ./cmd/myotis-go -loglevel debug           # per-dial failure detail
 go run ./cmd/myotis-go -get-account 0xd8dA…045   # light client + snap peer → VERIFIED account
 go run ./cmd/myotis-go -get-account 0xd8dA…045 -slot 0   # …and a two-hop storage read
+go run ./cmd/myotis-go -get-account 0xd8dA…045 -json     # …in the pinned engine-API JSON shape on stdout
 go run ./cmd/myotis-lc -once                     # LC alone: bootstrap → catch-up → one finality advance
 ```
 
