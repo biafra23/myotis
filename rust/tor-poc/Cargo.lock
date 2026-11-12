@@ -4109,7 +4109,7 @@ dependencies = [
  "async-trait",
  "discv5",
  "futures",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "hickory-resolver 0.26.3",
  "libp2p",
  "libp2p-mplex",
@@ -7613,7 +7613,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "arti-client",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "hex",
  "myotis-core",
  "myotis-net",
