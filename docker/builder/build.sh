@@ -42,6 +42,13 @@ done
     echo "          Move JDK_VERSION, JDK_BUILD and JDK_SHA256 there in the same change." >&2
     exit 1
 }
+# A `toolchain` line would make go-engine.yml's setup-go (and a developer's go
+# command) build with another release than the image's GOTOOLCHAIN=local one.
+go_tc=$(sed -n 's/^toolchain go\([0-9][0-9.]*\) *$/\1/p' "$root/go/go.mod")
+[[ -z "$go_tc" || "$go_tc" == "$go" ]] || {
+    echo "build.sh: go/go.mod names toolchain go$go_tc besides go $go: the image builds with one Go release only." >&2
+    exit 1
+}
 [[ "$go" == "$GO_VERSION" ]] || {
     echo "build.sh: go/go.mod says go $go, but docker/builder/pins.env has the hash of Go $GO_VERSION." >&2
     echo "          Move GO_VERSION and GO_SHA256 there in the same change." >&2

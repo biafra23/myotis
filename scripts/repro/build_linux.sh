@@ -82,7 +82,12 @@ python3 -I scripts/check_16k_alignment.py android-app/build/outputs/apk/release/
 # on: blst (BLS verification, the same C library the Rust engine links) has Go
 # bindings only through cgo, so the C compiler is a build input: the builder
 # image's, from the pinned apt snapshot (docker/builder/apt-packages.txt).
+# __BLST_PORTABLE__: blst's Go bindings compile with -D__ADX__ on amd64, i.e.
+# assume ADX/BMI2 and die with SIGILL on a CPU without them; portable detects
+# them at run time, as the Rust engine's blst does (its `portable` feature,
+# #734 D3). CGO_CFLAGS replaces Go's default, so -O2 -g stay in it.
 # Module sources come through GOPROXY and are checked against go/go.sum.
 rm -rf build/go
-(cd go && GOTOOLCHAIN=local CGO_ENABLED=1 GOFLAGS="-trimpath -mod=readonly -buildvcs=false" \
+(cd go && GOTOOLCHAIN=local CGO_ENABLED=1 CGO_CFLAGS="-O2 -g -D__BLST_PORTABLE__" \
+    GOFLAGS="-trimpath -mod=readonly -buildvcs=false" \
     go build -o ../build/go/ ./cmd/myotis-go ./cmd/myotis-lc)

@@ -173,10 +173,15 @@ build is the one `scripts/repro/build_linux.sh` runs in the builder image
 
 ```bash
 cd go
-GOTOOLCHAIN=local CGO_ENABLED=1 GOFLAGS="-trimpath -mod=readonly -buildvcs=false" \
+GOTOOLCHAIN=local CGO_ENABLED=1 CGO_CFLAGS="-O2 -g -D__BLST_PORTABLE__" \
+  GOFLAGS="-trimpath -mod=readonly -buildvcs=false" \
   go build -o ../build/go/ ./cmd/myotis-go ./cmd/myotis-lc
 ```
 
 cgo stays on: blst (the BLS library) has Go bindings only through cgo, so the C
-compiler is a build input too, the image's. Moving the `go` line in `go.mod`
-moves `GO_VERSION`/`GO_SHA256` in `docker/builder/pins.env` in the same change.
+compiler is a build input too, the image's. `__BLST_PORTABLE__` makes blst
+detect ADX/BMI2 at run time instead of assuming them (the Rust engine's blst
+does the same). Moving the `go` line in `go.mod` moves `GO_VERSION`/`GO_SHA256`
+in `docker/builder/pins.env` in the same change, and `docker/builder/image.lock`
+with them (the `builder image` workflow prints its lines); a `toolchain` line
+is refused unless it names that same release.

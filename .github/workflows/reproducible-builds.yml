@@ -596,9 +596,10 @@ jobs:
           tar -C legs/a -xpf tars/a/repro-linux.tar
           # Only what the published side can have: the Android artifacts and
           # the engine library. A leg also carries the .deb with its whole
-          # payload and the host libraries, which would fill the report with
-          # "only in image" lines ahead of the ones that matter.
-          rm -r legs/a/desktop legs/a/host
+          # payload, the host libraries and the Go engine's binaries (which no
+          # release publishes yet), which would fill the report with "only in
+          # image" lines ahead of the ones that matter.
+          rm -r legs/a/desktop legs/a/host legs/a/go
 
       # Before the wait, not after it: a missing tool should fail in the first
       # minute. unzip unpacks the Maven-repository zip (collect.sh published);

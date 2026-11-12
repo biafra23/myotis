@@ -58,6 +58,7 @@ on:
       - 'docker/builder/**'
       - '.java-version'
       - 'rust/rust-toolchain.toml'
+      - 'go/go.mod'
       - 'gradle/libs.versions.toml'
       - 'android-app/build.gradle.kts'
       - 'myotis-engine/build.gradle.kts'

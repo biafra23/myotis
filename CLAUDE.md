@@ -201,7 +201,9 @@ Key Gradle modules:
   `rust/rust-toolchain.toml`, `gradle/libs.versions.toml`). Bumping the JDK
   therefore also moves `JDK_VERSION` / `JDK_BUILD` / `JDK_SHA256` in
   `docker/builder/pins.env`, in the same change; `build.sh` refuses a mismatch
-  and the `builder image` workflow fails the PR. It is what a third party
+  and the `builder image` workflow fails the PR. The same holds for Go:
+  moving `go/go.mod`'s `go` line moves `GO_VERSION` / `GO_SHA256` there (the
+  image builds the Go engine's binaries, which the gate compares). It is what a third party
   rebuilds a release's ANDROID artifacts in (`docker/builder/build.sh`, then
   `docker/builder/run.sh -- scripts/repro/build_linux.sh`; `run.sh` gives the
   build its own HOME, cargo home and Gradle home and none of the caller's
