@@ -1090,7 +1090,7 @@ The **Rust engine** seeds from the same hardcoded bootnodes / CL pins and the sa
 - **Netty 4.2.x** (upstream) -- NIO transport. (The earlier Kotlin-transpiled tuweni/netty forks existed to explore a Kotlin-Multiplatform engine; multiplatform now comes from the Rust engine, so the forks were retired.)
 - **BouncyCastle** -- SECP256K1 crypto provider
 - **jvm-libp2p** -- beacon chain P2P networking (consensus module)
-- **dnsjava 3.6** -- TXT-record resolution for EIP-1459 ENR tree walks (Java engine; the Rust engine uses `hickory-resolver`, already part of its libp2p stack)
+- **dnsjava 3.6** -- TXT-record resolution for EIP-1459 ENR tree walks (Java engine; the Rust engine uses `hickory-resolver` on desktop and the daemon, and resolves libp2p's `/dns4/` dial addresses through the platform's resolver)
 
 ## License
 

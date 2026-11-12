@@ -553,26 +553,53 @@ fn shuffle<T>(items: &mut [T]) {
 /// Per-lookup timeout (the Java twin's).
 pub const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The platform's resolver configuration (`/etc/resolv.conf` on unix, the
-/// registry on Windows), one TXT query at a time. hickory is already compiled
-/// in through libp2p's DNS transport, so this adds no dependency.
+/// The platform's resolver configuration, one TXT query at a time, through
+/// hickory (the version pinned in Cargo.toml). hickory 0.26 reads it per platform:
+/// `/etc/resolv.conf` on Linux and the other non-Apple unixes, the registry on
+/// Windows, `SCDynamicStore` on macOS. Not on mobile: see [`SystemResolver::new`].
 pub struct SystemResolver {
+    // hickory is not a dependency on mobile (Cargo.toml): there the type has no
+    // resolver and `new` never builds one.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     inner: hickory_resolver::TokioResolver,
 }
 
 impl SystemResolver {
-    /// `Err` where the platform offers no resolver configuration — Android has
-    /// had no `/etc/resolv.conf` since Oreo (see `reqresp.rs`) — in which case
-    /// DNS discovery is simply unavailable, and says so once.
+    /// `Err` where there is no resolver configuration to read, in which case DNS
+    /// discovery is simply unavailable and says so once.
+    ///
+    /// Always `Err` on Android and iOS, where hickory is not even a dependency
+    /// (Cargo.toml). Neither host walks a tree through the system resolver (the
+    /// Android app supplies its own DNS servers, which turns the walk off in
+    /// `RustMyotisEngine`; iOS never turns it on), but an embedding app with no
+    /// `DnsServers` port reaches here on Android. hickory 0.26 reads Android's
+    /// configuration over JNI through `ndk_context::android_context()`, which
+    /// PANICS when no host registered a context, and nothing here does, so under
+    /// the release profile's `panic = "abort"` it would kill the app; 0.25 found
+    /// no `/etc/resolv.conf` (gone since Oreo, see `reqresp.rs`) and returned
+    /// `Err`. iOS has no `SCDynamicStore`, which 0.26 reads on Apple targets.
     pub fn new() -> Result<SystemResolver, String> {
-        let mut builder = hickory_resolver::TokioResolver::builder_tokio()
-            .map_err(|e| format!("system resolver: {e}"))?;
-        let opts = builder.options_mut();
-        opts.timeout = LOOKUP_TIMEOUT;
-        opts.attempts = 1;
-        Ok(SystemResolver {
-            inner: builder.build(),
-        })
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            Err(
+                "system resolver: not used on Android or iOS (the engine takes no host \
+                 DNS servers yet, so EIP-1459 discovery stays off here)"
+                    .to_string(),
+            )
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let mut builder = hickory_resolver::TokioResolver::builder_tokio()
+                .map_err(|e| format!("system resolver: {e}"))?;
+            let opts = builder.options_mut();
+            opts.timeout = LOOKUP_TIMEOUT;
+            opts.attempts = 1;
+            Ok(SystemResolver {
+                inner: builder
+                    .build()
+                    .map_err(|e| format!("system resolver: {e}"))?,
+            })
+        }
     }
 }
 
@@ -582,25 +609,47 @@ impl TxtLookup for SystemResolver {
         name: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + 'a>> {
         Box::pin(async move {
-            // Fully qualified: no search-list suffixing, one query.
-            let fqdn = format!("{name}.");
-            match self.inner.txt_lookup(fqdn).await {
-                // A record's segments concatenate (TXT strings are at most 255
-                // bytes, a long ENR is split over several).
-                Ok(lookup) => Ok(lookup
-                    .iter()
-                    .map(|txt| {
-                        txt.txt_data()
-                            .iter()
-                            .map(|seg| String::from_utf8_lossy(seg))
-                            .collect::<String>()
-                    })
-                    .collect()),
-                Err(e) if e.is_no_records_found() || e.is_nx_domain() => Ok(Vec::new()),
-                Err(e) => Err(e.to_string()),
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            {
+                // Unreachable: `new` never returns a resolver on mobile.
+                let _ = name;
+                Err("system resolver: not used on Android or iOS".to_string())
+            }
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                // Fully qualified: no search-list suffixing, one query.
+                let fqdn = format!("{name}.");
+                match self.inner.txt_lookup(fqdn).await {
+                    // A record's segments concatenate (TXT strings are at most
+                    // 255 bytes, a long ENR is split over several).
+                    Ok(lookup) => Ok(txt_strings(&lookup)),
+                    Err(e) if e.is_no_records_found() || e.is_nx_domain() => Ok(Vec::new()),
+                    Err(e) => Err(e.to_string()),
+                }
             }
         })
     }
+}
+
+/// One string per TXT record of a lookup's answers, its segments concatenated
+/// (TXT strings are at most 255 bytes, a long ENR is split over several).
+/// Only the TXT answers: a CNAME the resolver followed sits in the same
+/// section.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn txt_strings(lookup: &hickory_resolver::lookup::Lookup) -> Vec<String> {
+    lookup
+        .answers()
+        .iter()
+        .filter_map(|record| match &record.data {
+            hickory_resolver::proto::rr::RData::TXT(txt) => Some(
+                txt.txt_data
+                    .iter()
+                    .map(|seg| String::from_utf8_lossy(seg))
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -883,6 +932,34 @@ mod tests {
     use super::*;
     use myotis_core::nodekey::NodeKey;
     use std::collections::HashMap;
+
+    /// The system resolver's answer mapping (live lookups are covered by the
+    /// ignored `live_dns_tree` test): one string per TXT record, segments
+    /// joined in order, and a CNAME in the answer section skipped.
+    #[test]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn txt_strings_joins_segments_and_skips_other_records() {
+        use hickory_resolver::lookup::Lookup;
+        use hickory_resolver::proto::op::Query;
+        use hickory_resolver::proto::rr::rdata::{CNAME, TXT};
+        use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
+        let name = Name::from_ascii("all.mainnet.ethdisco.net.").unwrap();
+        let target = Name::from_ascii("tree.example.org.").unwrap();
+        let answers = vec![
+            Record::from_rdata(name.clone(), 60, RData::CNAME(CNAME(target.clone()))),
+            Record::from_rdata(
+                target.clone(),
+                60,
+                RData::TXT(TXT::new(vec!["enrtree-root:v1 ".into(), "e=ABC".into()])),
+            ),
+            Record::from_rdata(target, 60, RData::TXT(TXT::new(vec!["second".into()]))),
+        ];
+        let lookup = Lookup::new_with_max_ttl(Query::query(name, RecordType::TXT), answers);
+        assert_eq!(
+            txt_strings(&lookup),
+            vec!["enrtree-root:v1 e=ABC".to_string(), "second".to_string()]
+        );
+    }
 
     fn key(n: u8) -> NodeKey {
         let mut secret = [0u8; 32];
