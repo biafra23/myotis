@@ -193,6 +193,26 @@ allprojects {
             val buildscriptLocks =
                 if (project == rootProject) lockedIn(rootProject.file("buildscript-gradle.lockfile")) else null
             val writingLocks = gradle.startParameter.isWriteDependencyLocks
+            // Every throwable under a failure: cause, suppressed, and the causes
+            // of a multi-cause exception (by its public getCauses()).
+            fun everyThrowable(root: Throwable): List<Throwable> {
+                val seen = mutableListOf<Throwable>()
+                val queue = ArrayDeque(listOf(root))
+                while (queue.isNotEmpty()) {
+                    val t = queue.removeFirst()
+                    if (seen.any { it === t }) continue
+                    seen += t
+                    t.cause?.let(queue::add)
+                    queue.addAll(t.suppressed)
+                    runCatching { t.javaClass.getMethod("getCauses").invoke(t) as? List<*> }
+                        .getOrNull()?.filterIsInstance<Throwable>()?.let(queue::addAll)
+                }
+                return seen
+            }
+            fun isLockConflict(s: String) =
+                "dependency was locked to version" in s ||
+                    "dependency lock state" in s ||
+                    ("version constraints" in s && "enforced by dependency locking" in s.lowercase())
             val pinFailures = mutableListOf<String>()
             confs.forEach { conf ->
                 val locks = if (conf in buildscriptConfs) buildscriptLocks else projectLocks
@@ -217,51 +237,33 @@ allprojects {
                     }
                 } catch (e: Exception) {
                     val chain = generateSequence<Throwable>(e) { it.cause }.toList()
-                    val causes = chain.mapNotNull { it.message }.joinToString(" <- ")
                     // EVERY throwable under the failure, not only the `cause`
                     // chain: a resolution failure of several modules is a
                     // multi-cause exception (Gradle's internal MultiCauseException,
                     // reached by its public `getCauses()`), and since Gradle 9 the
                     // locking constraint's failure is a LATER cause — the first
                     // one is the bare "Could not resolve <the declared version>".
-                    fun everything(root: Throwable): List<Throwable> {
-                        val seen = mutableListOf<Throwable>()
-                        val queue = ArrayDeque(listOf(root))
-                        while (queue.isNotEmpty()) {
-                            val t = queue.removeFirst()
-                            if (seen.any { it === t }) continue
-                            seen += t
-                            t.cause?.let(queue::add)
-                            queue.addAll(t.suppressed)
-                            runCatching { t.javaClass.getMethod("getCauses").invoke(t) as? List<*> }
-                                .getOrNull()?.filterIsInstance<Throwable>()?.let(queue::addAll)
-                        }
-                        return seen.toList()
-                    }
+                    val all = everyThrowable(e)
                     // A wrong hash and an entry the lock lacks/has extra raise
                     // dedicated exceptions; a lock that pins a version the graph
                     // no longer accepts does NOT — it surfaces as an ordinary
-                    // "cannot find a version that satisfies the constraints"
-                    // failure, recognisable only by the lock's reason string:
-                    // "dependency was locked to version" up to Gradle 8,
-                    // "Dependency version enforced by Dependency Locking" from 9.
-                    // The graph records the same reason on the unresolved
-                    // dependency, which is checked too. The `gradle pins` canary
-                    // fails if a Gradle upgrade words it a third way.
-                    fun lockReason(s: String) =
-                        "dependency was locked to version" in s ||
-                            "dependency lock state" in s ||
-                            "enforced by dependency locking" in s.lowercase()
-                    val graphNamesLock = runCatching {
-                        conf.incoming.resolutionResult.allDependencies
-                            .filterIsInstance<org.gradle.api.artifacts.result.UnresolvedDependencyResult>()
-                            .any { d -> d.attemptedReason.descriptions.any { lockReason(it.description) } }
-                    }.getOrDefault(false)
-                    val isPinFailure = graphNamesLock || everything(e).any { t ->
+                    // version-constraint conflict whose constraint names the lock:
+                    // "dependency was locked to version" up to Gradle 8, "Dependency
+                    // version enforced by Dependency Locking" from 9. The reason
+                    // alone is not enough: every locked module carries it, so a
+                    // configuration unresolvable by design (KGP's CInterop inputs,
+                    // locked like any other) would count as a pin failure. The
+                    // `gradle pins` canary fails if an upgrade words it a third way.
+                    val lockFailure = all.firstOrNull { t ->
                         t.javaClass.simpleName.let {
                             it == "DependencyVerificationException" || it == "LockOutOfDateException"
-                        } || lockReason(t.message.orEmpty())
+                        } || isLockConflict(t.message.orEmpty())
                     }
+                    val isPinFailure = lockFailure != null
+                    val causes = listOfNotNull(
+                        chain.mapNotNull { it.message }.joinToString(" <- "),
+                        lockFailure?.takeIf { it !in chain }?.message,
+                    ).joinToString(" <- ")
                     // Not a pin failure, but the GRAPH may still have resolved
                     // completely, and only the files could not be selected by this
                     // generic walk (attributes it lacks, a task output it would
