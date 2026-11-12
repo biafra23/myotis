@@ -1,0 +1,75 @@
+name: Go engine
+
+on:
+  # Unlike ci.yml (push to main + tags only, to avoid double-building a branch
+  # that has an open PR), this workflow also builds pushes to the Go feature
+  # branch directly: there are no Gradle-heavy costs to duplicate here, and
+  # the branch gains its branch-protection signal before part PRs open.
+  # The path filter keeps Gradle/Rust work from paying for this job and vice
+  # versa. "feature/go-engine" becomes a dead entry when PR #773 merges and
+  # the branch is deleted — trim it to [ "main" ] in the first workflow touch
+  # after that merge (a stale branch name in branches: is harmless, just
+  # noise).
+  push:
+    branches: [ "main", "feature/go-engine" ]
+    paths:
+      - "go/**"
+      - ".github/workflows/go-engine.yml"
+      # The Go tests read these and no one else re-checks them for Go:
+      # TestCheckpointMatchesRustEngine compares against the Rust anchor
+      # (a release refresh MUST turn the Go build red on its own PR, not
+      # on the next unrelated go/ touch), and the lc/chain replays read
+      # the shared corpus.
+      - "rust/myotis-net/src/sync.rs"
+      - "rust/testdata/**"
+  # pull_request unscoped (any base branch), like every other workflow here:
+  # part PRs into feature/go-engine must get these checks too.
+  pull_request:
+    paths:
+      - "go/**"
+      - ".github/workflows/go-engine.yml"
+      - "rust/myotis-net/src/sync.rs"
+      - "rust/testdata/**"
+  workflow_dispatch:
+
+jobs:
+  build:
+    # Distinct from ci.yml's "Build and Test" — required-check matching is by
+    # name, and this job is path-filtered so it is absent on most PRs.
+    name: Go build and test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      - name: Check formatting
+        working-directory: go
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"; echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        working-directory: go
+        run: go vet ./...
+
+      - name: Build
+        working-directory: go
+        run: go build ./...
+
+      - name: Test
+        working-directory: go
+        # -race: the discovery package is goroutines + mutexes + a
+        # close/iterator handshake; keep the race detector on it.
+        run: go test -race ./...

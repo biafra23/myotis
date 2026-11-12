@@ -338,11 +338,11 @@ impl ChainConfig {
             // `./gradlew refreshCheckpoint` rewrites both from one fetch, and
             // `java_and_rust_checkpoints_agree` fails if they ever diverge.
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized mainnet block root (slot 15599168, 2026-11-07, period 1904)
+            // trusted checkpoint: recent finalized mainnet block root (slot 15632128, 2026-11-11, period 1908)
             checkpoint_root: hex32(
-                "935911763d6fcca100fd42f951f1407a9967414bf38ee85992c00e5e003ca373",
+                "90270c791df9079fb67d02077398bf7937274a1b2bfd54abc778a55fbe719e78",
             ),
-            checkpoint_slot: 15_599_168,
+            checkpoint_slot: 15_632_128,
             // @checkpoint:mainnet:end
             static_peers: MAINNET_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: MAINNET_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
@@ -4714,10 +4714,10 @@ mod tests {
         assert_eq!(c.fork_schedule.version_for_signature_slot(13_164_544), [5, 0, 0, 0]);
         assert_eq!(c.fork_schedule.version_for_signature_slot(13_164_545), [6, 0, 0, 0]);
         // @checkpoint:mainnet:test:begin — managed by `./gradlew refreshCheckpoint`
-        assert_eq!(c.checkpoint_slot, 15_599_168);
+        assert_eq!(c.checkpoint_slot, 15_632_128);
         assert_eq!(
             hex_str(&c.checkpoint_root),
-            "935911763d6fcca100fd42f951f1407a9967414bf38ee85992c00e5e003ca373"
+            "90270c791df9079fb67d02077398bf7937274a1b2bfd54abc778a55fbe719e78"
         );
         // @checkpoint:mainnet:test:end
         assert_eq!(

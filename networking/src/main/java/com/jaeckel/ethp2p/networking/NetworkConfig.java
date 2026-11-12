@@ -127,9 +127,9 @@ public record NetworkConfig(
             // genesis_validators_root (mainnet)
             Bytes.fromHexString("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95").toArrayUnsafe(),
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized mainnet block root (slot 15599168, 2026-11-07, period 1904)
-            Bytes.fromHexString("935911763d6fcca100fd42f951f1407a9967414bf38ee85992c00e5e003ca373").toArrayUnsafe(),
-            15599168L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
+            // trusted checkpoint: recent finalized mainnet block root (slot 15632128, 2026-11-11, period 1908)
+            Bytes.fromHexString("90270c791df9079fb67d02077398bf7937274a1b2bfd54abc778a55fbe719e78").toArrayUnsafe(),
+            15632128L, // checkpoint slot (epoch = slot/32). Must stay in sync with the root above.
             // @checkpoint:mainnet:end
             // Fork schedule — consensus-specs configs/mainnet.yaml *_FORK_EPOCH /
             // *_FORK_VERSION. Fulu activated at epoch 411392 = slot 13164544 (2025-12-03).

@@ -543,7 +543,10 @@ asset workflow and a stronger action than the merge this file already forbids.
    `./gradlew refreshCheckpoint -Pnetwork=<net>` writes both engines from one
    fetch) age toward the weak-subjectivity bound (13 periods on mainnet, 3 on
    gnosis). A fresh install past the bound parks in `STALE_ANCHOR` until the
-   host consents.
+   host consents. The Go engine (`go/internal/chain/lc.go`, mainnet only)
+   carries a third copy that the task does NOT write: move it by hand in the
+   same commit — the `go test ./internal/chain` drift test
+   (`TestCheckpointMatchesRustEngine`) fails the Go CI if the copy lags.
 
    **A shipped anchor's remaining freshness is NOT a release deadline, and
    nothing may gate a tag on it** (owner ruling, 2026-09-24). Gnosis periods are
@@ -571,7 +574,9 @@ asset workflow and a stronger action than the merge this file already forbids.
 2. **Re-sync the mainnet discv4 bootnodes from go-ethereum?** Source of
    truth is geth's `params/bootnodes.go` `MainnetBootnodes`. Pin sites:
    `NetworkConfig.MAINNET`, `ElConfig::mainnet()`
-   (`rust/myotis-net/src/el/reader.rs`), `rust/tor-poc` (with pubkeys), and
+   (`rust/myotis-net/src/el/reader.rs`), `rust/tor-poc` (with pubkeys),
+   `go/internal/chain/chain.go` (with its `TestMainnetPins`; run
+   `go test ./...` under `go/` after the edit — Gradle CI doesn't), and
    any other verbatim copy — do not trust this list, `grep -rn` the tree for
    one of the current addresses before and after the edit until zero copies
    of the old ones remain. Since #414 the `myotis-net` live tests read
