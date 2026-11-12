@@ -236,7 +236,7 @@ network-id: 1
 blockchain-rpc-endpoint: http://127.0.0.1:8546
 storage-incentives-enable: false # true only once you stake; the agent runs at zero stake but IsPlaying reverts
 resolver-options: []
-cors-allowed-origins:            # only if you run Bee Dashboard (npx @ethersphere/bee-dashboard) against it
+cors-allowed-origins:            # only if you run a Bee Dashboard against it
   - http://localhost:8080
 ```
 

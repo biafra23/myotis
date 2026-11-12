@@ -14,8 +14,11 @@
 # android-build-tools / cargo-ndk, .java-version, .xcode-version, the runner
 # image labels, and the test-only interpreters that still float on purpose
 # (setup-python `3.x` in mm-replay-tests.yml, Node `20` in smoke-gate-tests.yml:
-# neither touches a shipped artifact), and docs/tour/workbook/solution/Cargo.toml,
-# whose `=` pins of tokio and futures follow the workspace's by hand.
+# neither touches a shipped artifact), docs/tour/workbook/solution/Cargo.toml,
+# whose `=` pins of tokio and futures follow the workspace's by hand, the Go
+# engine's go/go.mod + go.sum, and scripts/swarm-cli/package-lock.json (the
+# swarm-cli that scripts/publish_site_swarm.mjs runs, which pulls in
+# @ethersphere/bee-js; security updates only).
 # claude-review.yml is excluded (see the github-actions entry).
 #
 # Grouped, and Cargo and Gradle monthly, so the routine moves arrive as a
@@ -61,6 +64,22 @@
 # the shared rust/myotis-net/Cargo.toml from one workspace, so the other two
 # locks need `cargo update --workspace` by hand before `cargo locks` passes.
 # The actions get none at all (see above).
+#
+# Cooldown: a version update waits until its release is 7 days old (owner's
+# decision, 2026-11-12, after the Ethersphere bee-js / Swarm Desktop supply-
+# chain attack of 2026-11-09: a malicious release published from a stolen CI
+# credential, with valid provenance, pulled within hours). Such releases are
+# usually caught and yanked within days, so the wait keeps Dependabot from
+# proposing one. Dependabot's own default is 3 days; this makes it longer and
+# visible. It does not delay SECURITY updates (Dependabot never applies a
+# cooldown to them). On GitHub Actions only `default-days` exists. The same
+# 7 days hold for a HAND bump of the trees above that no entry covers: never
+# regenerate a lock onto a release younger than that (`npm install`, `npm
+# update`, `go get` take whatever is newest that minute). It filters the
+# version Dependabot proposes, not the transitives a lock regeneration picks
+# that day (the lock and hash diff stays the check for those). For the actions
+# it delays the fix as well, since they get no security updates: when an
+# advisory names an action used here, move its SHA by hand.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -77,6 +96,8 @@ updates:
       - dependency-name: "anthropics/claude-code-action"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     groups:
       github-actions:
         patterns: ["*"]
@@ -88,6 +109,8 @@ updates:
       - "/rust/tor-poc"
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     groups:
       cargo-patch:
@@ -100,6 +123,8 @@ updates:
     directory: "/"
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     groups:
       gradle-minor-patch:
