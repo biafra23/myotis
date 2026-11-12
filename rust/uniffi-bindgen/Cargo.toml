@@ -23,4 +23,4 @@ name = "uniffi-bindgen"
 path = "src/main.rs"
 
 [dependencies]
-uniffi = { version = "0.32", features = ["cli"] }
+uniffi = { version = "0.32.2", features = ["cli"] }
