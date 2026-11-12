@@ -50,7 +50,7 @@ alloy-rlp = "=0.3.16"
 hickory-resolver = { version = "=0.25.2", default-features = false, features = ["system-config", "tokio"] }
 snap = "=1.1.1"
 tracing = "=0.1.44"
-futures = "=0.3.32"
+futures = "=0.3.34"
 async-trait = "=0.1.89"
 # EL discv4 (el::discv4): SO_RCVBUF sizing on the UDP socket (the Android
 # NEIGHBORS-truncation trap — docs/spec/02 §9.10) and entropy for
