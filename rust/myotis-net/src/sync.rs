@@ -2237,7 +2237,8 @@ async fn run_sync(
             true
         }
         Err(e) => {
-            tracing::warn!(error = %e, "discv5 unavailable — will retry (static peers meanwhile)");
+            tracing::warn!(port = discovery_cfg.listen_port, error = %e,
+                "discv5 unavailable — will retry (static peers meanwhile)");
             false
         }
     };

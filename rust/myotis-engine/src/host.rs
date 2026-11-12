@@ -1480,6 +1480,12 @@ fn listen_ports_for(engine: &EngineState, handle: i64) -> ListenPorts {
         .unwrap_or_default()
 }
 
+/// The ports the handle's next spin_up will bind (all 0 when none were set).
+#[cfg(test)]
+pub(crate) fn listen_ports_of(handle: i64) -> ListenPorts {
+    engine().map(|e| listen_ports_for(e, handle)).unwrap_or_default()
+}
+
 /// `myotis_set_listen_ports` (ABI ≥ 57): pin the handle's P2P listen ports.
 /// Set semantics (a later call replaces an earlier one; all zeros = back to
 /// OS-assigned). Applied or refused, never accepted and ignored: accepted

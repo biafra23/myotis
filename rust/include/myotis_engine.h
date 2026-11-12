@@ -511,8 +511,15 @@ bool myotis_set_boot_enodes(int64_t handle, const char *enodes_json);
  * same nonzero UDP port. A port another process holds fails like any bind at
  * start: discv4, discv5 and QUIC fall back to their existing degraded modes
  * (no EL reader / no discv5 / no inbound QUIC), a libp2p TCP bind error fails
- * myotis_start. The EL is dial-only (no RLPx listener),
- * so these four are every P2P socket a handle opens. */
+ * myotis_start. A pinned TCP port is held exclusively: libp2p listens with
+ * SO_REUSEPORT, so the engine first tries a plain bind and fails the start if
+ * any other socket (another Myotis included) has the port. Pinned UDP ports
+ * and pause: a pause does not wait for the libp2p and discv5 tasks to close
+ * their sockets, so a resume issued straight after a pause can find its own
+ * pinned QUIC or discv5 port still taken (QUIC then has no listener until the
+ * next resume; discv5 retries once a minute). Port 0 cannot hit this. The EL
+ * is dial-only (no RLPx listener), so these four are every P2P socket a handle
+ * opens. */
 bool myotis_set_listen_ports(int64_t handle, uint16_t discv4, uint16_t discv5,
                              uint16_t libp2p_tcp, uint16_t libp2p_quic);
 

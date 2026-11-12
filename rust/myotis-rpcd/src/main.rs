@@ -310,6 +310,18 @@ fn run(args: Args) -> Result<(), String> {
         print_engine_logs();
         return Err("engine failed to start".into());
     }
+    // A discv4 bind failure is not fatal to the engine: it runs CL-only, with no
+    // EL reader until a pause/resume, which rpcd never does — so every state read
+    // would fail for the life of the process. With a pinned --discv4-port that is
+    // the expected operator error (a port another node holds), so fail the start
+    // the way a taken --listen or --libp2p-port does. The reader is built inside
+    // start, so the status already says whether it came up.
+    if matches!(listen_ports, Some([discv4, ..]) if discv4 != 0) && !el_reader_available(handle) {
+        print_engine_logs();
+        return Err("the EL reader did not start (the engine's WARN above says why, e.g. a \
+                    --discv4-port another process holds); no state read could be served"
+            .into());
+    }
     eprintln!(
         "myotis-rpcd {}: {network} (chain {chain_id}), data {}, serving http://{}",
         env!("CARGO_PKG_VERSION"),
@@ -432,6 +444,14 @@ fn spawn_log_drain(stopping: Arc<AtomicBool>) {
             std::thread::sleep(Duration::from_millis(500));
         }
     });
+}
+
+/// Whether the handle's status reports a live EL reader (`elReaderAvailable`).
+fn el_reader_available(handle: i64) -> bool {
+    serde_json::from_str::<serde_json::Value>(&ffi::status_json(handle))
+        .ok()
+        .and_then(|v| v["elReaderAvailable"].as_bool())
+        .unwrap_or(false)
 }
 
 fn print_engine_logs() {

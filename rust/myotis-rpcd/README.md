@@ -200,9 +200,16 @@ geth or Nethermind, share a machine without colliding.
 Pin them to open named ports in a firewall, or to keep them out of a range
 another service uses. discv4, discv5 and QUIC all bind UDP, so two of them on
 the same nonzero port is refused before anything starts. A port another
-process already holds fails like any bind at start: discv4, discv5 and QUIC
-carry on without that socket (no EL reader, no discv5, no inbound QUIC, as for
-any bind error), and a taken libp2p TCP port stops the daemon.
+process already holds:
+
+- `--discv4-port`: the daemon exits, since without its discv4 socket the
+  engine has no EL reader and could not serve a single state read.
+- `--libp2p-port`: the daemon exits. This holds for another Myotis too:
+  libp2p listens with `SO_REUSEPORT`, which would let two of them share the
+  port without an error, so the engine checks with a plain bind first.
+- `--discv5-port` and `--libp2p-quic-port`: the daemon carries on without that
+  socket (discv5 retries about once a minute; QUIC still dials out) and logs a
+  WARN naming the port.
 
 ```bash
 myotis-rpcd --network mainnet --listen 127.0.0.1:8549 \

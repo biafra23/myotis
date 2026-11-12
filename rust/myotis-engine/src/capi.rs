@@ -940,6 +940,27 @@ mod tests {
         myotis_stop(handle);
     }
 
+    /// `myotis_set_listen_ports` (ABI 57) on a created handle: accepted and
+    /// stashed in argument order; a set with a shared UDP port refused with the
+    /// earlier set left in place; gone with the handle; refused once unknown.
+    #[test]
+    fn listen_ports_are_applied_or_refused_across_the_c_abi() {
+        use crate::host::{listen_ports_of, ListenPorts};
+        let dir = std::env::temp_dir().join("myotis-capi-listen-ports-test");
+        let dir = CString::new(dir.to_str().unwrap()).unwrap();
+        let handle = unsafe { myotis_create(c"mainnet".as_ptr(), dir.as_ptr()) };
+        assert!(handle >= 1, "create failed: {handle}");
+        let set = ListenPorts { discv4: 30305, discv5: 9005, libp2p_tcp: 9105, libp2p_quic: 9106 };
+        assert_eq!(listen_ports_of(handle), ListenPorts::default());
+        assert!(myotis_set_listen_ports(handle, 30305, 9005, 9105, 9106));
+        assert_eq!(listen_ports_of(handle), set);
+        assert!(!myotis_set_listen_ports(handle, 9000, 9000, 0, 0));
+        assert_eq!(listen_ports_of(handle), set, "a refused set changes nothing");
+        myotis_stop(handle);
+        assert_eq!(listen_ports_of(handle), ListenPorts::default());
+        assert!(!myotis_set_listen_ports(handle, 30305, 9005, 9105, 9106));
+    }
+
     /// How the state reads' `block` crosses the C ABI (ABI 32): NULL is the
     /// head; `finalized` is its own anchor; a selector no retry can serve is
     /// refused as invalid params, never read as the head.
