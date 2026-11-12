@@ -59,12 +59,15 @@ async-trait = "=0.1.89"
 # sans-I/O rules.
 socket2 = "=0.5.10"
 # OS entropy for everything random in the EL and sync code. Some uses are
-# SECURITY-CRITICAL: RLPx ECIES ephemeral nonces and auth padding
-# (el::rlpx::transport) and node-key generation (el::reader). Others are not:
-# FindNode targets and peer sampling (el::discv4), the pool's seeds and Tor-reserve
-# salt, the DNS-walk shuffle, the finality-poll jitter (sync). Never swap it
-# for a weaker source. getrandom::fill: the syscall on Android/Linux,
-# CCRandomGenerateBytes on iOS.
+# SECURITY-CRITICAL: the RLPx handshake's two ephemeral secret keys (ECDH and
+# ECIES), its nonce and its IV (el::rlpx::transport), node-key generation
+# (el::reader), and the Tor-reserve salt (el::pool: a per-process secret that
+# decides which peers this wallet reaches only over Tor). Others are not: the
+# EIP-8 auth padding, FindNode targets and peer sampling (el::discv4), the
+# pool's per-call seed, the DNS-walk shuffle, the finality-poll jitter (sync).
+# Never swap it for a weaker source. getrandom::fill: the getrandom syscall on
+# Android/Linux (/dev/urandom as its fallback), CCRandomGenerateBytes on iOS,
+# getentropy on macOS, ProcessPrng on Windows.
 getrandom = "=0.4.3"
 # RLPx's crypto (ECIES, the frame codec's AES/HMAC/Keccak, constant-time MAC
 # compare) moved to myotis-wire with the code that uses it (#505).
