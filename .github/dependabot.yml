@@ -126,6 +126,17 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    # Compose waits for AGP 9 (owner's decision, 2026-11-12). androidx
+    # Compose 1.12 (which Compose Multiplatform 1.12 brings) requires AGP
+    # 9.1+ and compileSdk 37; this build is on AGP 8.7.3 / compileSdk 35, so
+    # #800's group failed AGP's AAR-metadata check and held back every other
+    # update in it. Compose patches still arrive. The AGP 9 migration (#805,
+    # after Gradle 9.6+) moves Compose itself and removes these two entries.
+    ignore:
+      - dependency-name: "org.jetbrains.compose*"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "androidx.compose*"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
     groups:
       gradle-minor-patch:
         update-types: ["minor", "patch"]
