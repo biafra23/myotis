@@ -14,7 +14,53 @@
 # android-build-tools / cargo-ndk, .java-version, .xcode-version, the runner
 # image labels, and the test-only interpreters that still float on purpose
 # (setup-python `3.x` in mm-replay-tests.yml, Node `20` in smoke-gate-tests.yml:
-# neither touches a shipped artifact). claude-review.yml is excluded (see the github-actions entry).
+# neither touches a shipped artifact), and docs/tour/workbook/solution/Cargo.toml,
+# whose `=` pins of tokio and futures follow the workspace's by hand.
+# claude-review.yml is excluded (see the github-actions entry).
+#
+# Grouped, and Cargo and Gradle monthly, so the routine moves arrive as a
+# handful of PRs instead of one per dependency: every PR runs the whole PR workflow set (and a
+# Gradle one the pin regeneration), and, moving a pin, needs a dispatched
+# `reproducible builds` run before it merges — per dependency, that cost
+# multiplied by every crate and library in the tree. A group without
+# `group-by` is ONE PR across all directories of its entry, so the three
+# Cargo workspaces, which share myotis-net by path, move together and their
+# three locks with them.
+#
+# One routine group per ecosystem holds what should not break; every update
+# that may break comes as a PR of its own (owner's decision, 2026-11-12), so
+# one migration never waits on another. Where the line falls differs per
+# ecosystem, because Dependabot classifies an update by the first version
+# segment that moves, not by the ecosystem's compatibility rule:
+# - Gradle: minor + patch grouped; each major its own PR. The Gradle wrapper
+#   is out of the group: it is the build tool itself (the pin regeneration
+#   runs under it, and its move needs its own `reproducible builds` run), so
+#   its minors come as a PR of their own too.
+# - Cargo: patches grouped; each minor or major its own PR. Cargo treats a
+#   0.x minor (0.11 -> 0.12) as breaking, and most of this tree's `=` pins
+#   are 0.x (libp2p, discv5, k256, sha2, sha3, aes, hmac, Arti ...). 1.x
+#   minors come one by one with them. `group-by: dependency-name` makes each
+#   one PR across the three workspaces; left ungrouped, a crate would move
+#   in three PRs, each regenerating one lock of three.
+#
+# The actions stay weekly and in one group: GitHub raises no Dependabot
+# alerts for actions pinned by SHA, which every action here is, so this run
+# is the only path by which a bad action gets replaced.
+#
+# To defer a major, add an `ignore:` entry with
+# `update-types: ["version-update:semver-major"]` to its entry here, like the
+# claude-code-action one, rather than a `@dependabot ignore` comment: the
+# decision stays in the tree and in review, and the dependency's in-major
+# line keeps arriving in the routine group (an outstanding major otherwise
+# takes it out of that group).
+#
+# Security updates are on, and so is "Grouped security updates" (repository
+# settings, Advanced Security; checked 2026-11-12). The groups here cover
+# version updates only, so that setting decides: security updates come
+# off-schedule, one PR per package manager and directory. A Cargo one edits
+# the shared rust/myotis-net/Cargo.toml from one workspace, so the other two
+# locks need `cargo update --workspace` by hand before `cargo locks` passes.
+# The actions get none at all (see above).
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -41,11 +87,21 @@ updates:
       - "/rust/roost"
       - "/rust/tor-poc"
     schedule:
-      interval: weekly
+      interval: monthly
     open-pull-requests-limit: 5
+    groups:
+      cargo-patch:
+        update-types: ["patch"]
+      cargo-minor-major:
+        update-types: ["minor", "major"]
+        group-by: dependency-name
 
   - package-ecosystem: gradle
     directory: "/"
     schedule:
-      interval: weekly
+      interval: monthly
     open-pull-requests-limit: 5
+    groups:
+      gradle-minor-patch:
+        update-types: ["minor", "patch"]
+        exclude-patterns: ["gradle-wrapper"]

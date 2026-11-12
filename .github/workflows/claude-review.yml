@@ -56,6 +56,14 @@
 #   - Drafts are skipped until marked ready.
 #   - Fork PRs are skipped: `pull_request` runs from forks get no secrets, so
 #     the job could only fail there. Same-repo PRs are the review target.
+#   - Runs Dependabot starts are skipped (owner's decision, 2026-11-12): the
+#     action refuses a bot actor unless it is in `allowed_bots`, and such a
+#     run gets only Dependabot secrets, so CLAUDE_CODE_OAUTH_TOKEN would have
+#     to become one, reaching every workflow a Dependabot PR starts. A
+#     dependency PR is reviewed by a person reading its lockfile and hash
+#     diff, which this reviewer cannot check anyway. The test is the run's
+#     actor, not the PR's author: a person reopening a Dependabot PR gets a
+#     review, since that run has the repository's secrets.
 #   - Where the reviewer's instructions come from. A same-repo branch is not
 #     necessarily trusted (a prompt-injected Claude Code session can push one
 #     and open a PR from it), so the prompt file is read from the PR's base
@@ -136,7 +144,8 @@ jobs:
   review:
     if: >
       github.event.pull_request.head.repo.full_name == github.repository &&
-      !github.event.pull_request.draft
+      !github.event.pull_request.draft &&
+      github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
       contents: read
