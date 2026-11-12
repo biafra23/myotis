@@ -64,7 +64,7 @@ jvm-libp2p = "1.3.2-RELEASE"
 # JitPack built it (https://jitpack.io/api/builds/com.github.biafra23/trueblocks-kotlin
 # lists "<10-hex>": "ok"), then rerun scripts/update_gradle_pins.sh.
 trueblocks-kotlin = "d2223849c1"
-dnsjava = "3.6.2"
+dnsjava = "3.7.1"
 # Hyperledger Besu (myotis-evm). NOTE: 25.7+ RENAMED the maven artifactIds
 # (evm → besu-evm; internal:algorithms → internal:besu-crypto-algorithms) —
 # probing the old names 404s and looks like publishing stopped; it didn't.
