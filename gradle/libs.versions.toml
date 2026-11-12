@@ -75,7 +75,7 @@ besu = "26.4.0"
 # JNA (the UniFFI bindings' loader). 5.18.1 matches Besu's transitive jna so the
 # jar and Android @aar can't drift apart under conflict resolution.
 jna = "5.18.1"
-agp = "8.7.3"
+agp = "9.5.1"
 # Android NATIVE toolchain, pinned exactly (#734, Part 2). The single source for
 # Gradle (ndkVersion/buildToolsVersion in :android-app and :myotis-engine, and the
 # root cargoNdkAndroid gate), for CI (.github/actions/android-native-toolchain
