@@ -61,6 +61,15 @@
 # the shared rust/myotis-net/Cargo.toml from one workspace, so the other two
 # locks need `cargo update --workspace` by hand before `cargo locks` passes.
 # The actions get none at all (see above).
+#
+# Cooldown: a version update waits until its release is 7 days old (owner's
+# decision, 2026-11-12, after the Ethersphere bee-js / Swarm Desktop supply-
+# chain attack of 2026-11-09: a malicious release published from a stolen CI
+# credential, with valid provenance, pulled within hours). Such releases are
+# usually caught and yanked within days, so the wait keeps Dependabot from
+# proposing one. Dependabot's own default is 3 days; this makes it longer and
+# visible. It does not delay SECURITY updates (Dependabot never applies a
+# cooldown to them). On GitHub Actions only `default-days` exists.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -77,6 +86,8 @@ updates:
       - dependency-name: "anthropics/claude-code-action"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     groups:
       github-actions:
         patterns: ["*"]
@@ -88,6 +99,8 @@ updates:
       - "/rust/tor-poc"
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     groups:
       cargo-patch:
@@ -100,6 +113,8 @@ updates:
     directory: "/"
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     groups:
       gradle-minor-patch:
