@@ -170,5 +170,20 @@ echo "$D1" > "$STUB/registry/published"
 check "pull.sh pulls the locked digest and tags it" \
   '[ $rc = 0 ] && grep -q "^docker pull --platform linux/amd64 $R@$D1$" "$STUB/log" && grep -q "^docker tag $R@$D1 myotis-builder:local$" "$STUB/log"'
 
+# build.sh's Go pin: the go line must equal GO_VERSION, and any toolchain line
+# must be exactly `toolchain go<that version>`, or no key comes out at all.
+gomod="$root/go/go.mod"; cp "$gomod" "$T/go.mod.orig"
+gv=$(sed -n 's/^go \([0-9][0-9.]*\) *$/\1/p' "$T/go.mod.orig")
+keyok() { "$B/build.sh" --print-key > /dev/null 2>&1; }
+cp "$T/go.mod.orig" "$gomod"; printf 'toolchain go%s\n' "$gv" >> "$gomod"
+check "a toolchain line naming the go line's release is accepted" 'keyok'
+for tc in "go1.0.0" "go${gv}rc1" "go${gv} // why"; do
+    cp "$T/go.mod.orig" "$gomod"; printf 'toolchain %s\n' "$tc" >> "$gomod"
+    check "toolchain $tc is refused" '! keyok'
+done
+cp "$T/go.mod.orig" "$gomod"; sed -i.bak "s/^go $gv\$/go 1.0.0/" "$gomod"
+check "a go line other than GO_VERSION is refused" '! keyok'
+cp "$T/go.mod.orig" "$gomod"
+
 echo "passed=$pass failed=$failed"
 [ "$failed" = 0 ]
