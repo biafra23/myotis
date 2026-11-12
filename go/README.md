@@ -100,17 +100,15 @@ reference.
    (verifyMethod=snapProof→lcAnchor), its empty storageRoot then
    short-circuiting the `-slot 0` read to a provable zero anchored at
    the PROVEN storageRoot, with no JSON-RPC anywhere in sight.
-   Re-smoked on the post-review head (2026-11-12, two full windows):
-   the restructured CLI path showed the FAILURE half of the design
-   live — poll-verified publishing (outcome 1 = Advanced), the
-   per-anchor disclosure memory (each peer asked at most once per
-   root), the taxonomy rotating past every pruned-root, and the
-   cause-carrying window expiry (`last failure: … [id=pruned-root]`,
-   exit 1) — but that night's home-network peer set was exclusively
-   hash-state nodes that had pruned the finalized root, so the
-   success half on that head rests on the unit tests above; the
-   pre-review head's success run stands as the live proof of the
-   verified-read path itself.
+   Re-smoked on the post-review head (2026-11-12): the restructured
+   CLI path proved BOTH halves live — a first window ended in the
+   honest failure shape (poll-verified publishing, per-anchor
+   disclosure memory, taxonomy rotating past pruned-roots,
+   cause-carrying window expiry with exit 1) when the peer set was
+   exclusively state-pruned nodes, and a longer window then served
+   the read: `verifiedAt=0xe04f511b… lcFinalizedSlot=15634912`,
+   nonce/balance from the MPT leaf and the storage read anchored at
+   the PROVEN empty storageRoot.
 5. final integration PR to `main`
 
 ## Run
