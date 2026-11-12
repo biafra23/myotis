@@ -151,7 +151,8 @@ GitHub Actions pins. Weekly, one PR for all action moves. Monthly, one PR for
 Gradle's minor + patch moves and one for Cargo's patches, covering all three
 Cargo workspaces; every update that may break comes as a PR of its own: each
 Gradle major, each Cargo minor or major (Cargo treats a 0.x minor as
-breaking), and the Gradle wrapper. Security updates come one per advisory. A
+breaking), and the Gradle wrapper. Security updates come off-schedule, one PR per package manager and directory
+(the repository's "Grouped security updates" setting). A
 Gradle PR changes the catalog but not the pins, so
 `gradle-pins-dependabot.yml` runs `scripts/update_gradle_pins.sh` on Linux and
 pushes the regenerated lockfiles and hashes to the PR branch:

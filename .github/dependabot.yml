@@ -54,11 +54,13 @@
 # line keeps arriving in the routine group (an outstanding major otherwise
 # takes it out of that group).
 #
-# Security updates, where the repository settings enable them, are not
-# grouped: they come one PR per advisory and directory, off-schedule. A Cargo
-# one edits the shared rust/myotis-net/Cargo.toml from one workspace, so the
-# other two locks need `cargo update --workspace` by hand before `cargo locks`
-# passes. The actions get none at all (see above).
+# Security updates are on, and so is "Grouped security updates" (repository
+# settings, Advanced Security; checked 2026-11-12). The groups here cover
+# version updates only, so that setting decides: security updates come
+# off-schedule, one PR per package manager and directory. A Cargo one edits
+# the shared rust/myotis-net/Cargo.toml from one workspace, so the other two
+# locks need `cargo update --workspace` by hand before `cargo locks` passes.
+# The actions get none at all (see above).
 version: 2
 updates:
   - package-ecosystem: github-actions
