@@ -50,14 +50,6 @@ discv5 = "=0.11.0"
 # itself arrives through discv5, alloy-rlp is the codec it implements. Already
 # in the lock via enr — no new download.
 alloy-rlp = "=0.3.16"
-# The EIP-1459 DNS tree walk (#539, part 3): TXT lookups over the system
-# resolver. 0.26.3 for the 0.26.2 security release (DNS response parsing,
-# UDP spoofing and resource-exhaustion fixes). The only hickory that is BUILT:
-# libp2p goes without its `dns` feature (see above). 0.25.2 and libp2p-dns
-# still appear in the locks, because Cargo locks every optional dependency
-# whatever features are on; `cargo tree --target all -i hickory-proto@0.25.2`
-# prints nothing, so a lockfile-based alert for it is code that is not used.
-hickory-resolver = { version = "=0.26.3", default-features = false, features = ["system-config", "tokio"] }
 snap = "=1.1.1"
 tracing = "=0.1.44"
 futures = "=0.3.32"
@@ -84,6 +76,23 @@ getrandom = "=0.2.17"
 # plus a feature, because tor-rtcompat silently prefers native-tls whenever both
 # are on. `static-sqlite` (Android only) bundles SQLite for Arti's directory
 # cache: the NDK has no libsqlite3 to link and apps may not load the platform's.
+# Not on mobile: neither host walks a tree through the system resolver, and
+# hickory 0.26's Android configuration reader goes through
+# ndk_context::android_context(), which panics (an abort under the release
+# profile) when no host registered a context. Gated here so it is not in the
+# Android or iOS graph at all, nor its second `jni` and `ndk-context`
+# (`SystemResolver` refuses there). A walk on Android through a DnsServers port
+# lifts this gate with whatever builds the resolver from explicit servers.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+# The EIP-1459 DNS tree walk (#539, part 3): TXT lookups over the system
+# resolver. 0.26.3 for the 0.26.2 security release (DNS response parsing,
+# UDP spoofing and resource-exhaustion fixes). The only hickory that is BUILT:
+# libp2p goes without its `dns` feature (see above). 0.25.2 and libp2p-dns
+# still appear in the locks, because Cargo locks every optional dependency
+# whatever features are on; `cargo tree --target all -i hickory-proto@0.25.2`
+# prints nothing, so a lockfile-based alert for it is code that is not used.
+hickory-resolver = { version = "=0.26.3", default-features = false, features = ["system-config", "tokio"] }
+
 [target.'cfg(not(target_os = "android"))'.dependencies]
 arti-client = { version = "0.44", default-features = false, features = ["tokio", "native-tls"], optional = true }
 tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio", "native-tls"], optional = true }

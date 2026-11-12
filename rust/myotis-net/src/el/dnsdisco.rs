@@ -558,7 +558,9 @@ pub const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 /// `/etc/resolv.conf` on Linux and the other non-Apple unixes, the registry on
 /// Windows, `SCDynamicStore` on macOS. Not on mobile: see [`SystemResolver::new`].
 pub struct SystemResolver {
-    #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
+    // hickory is not a dependency on mobile (Cargo.toml): there the type has no
+    // resolver and `new` never builds one.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     inner: hickory_resolver::TokioResolver,
 }
 
@@ -566,21 +568,22 @@ impl SystemResolver {
     /// `Err` where there is no resolver configuration to read, in which case DNS
     /// discovery is simply unavailable and says so once.
     ///
-    /// Always `Err` on Android and iOS, before hickory is touched. Neither host
-    /// walks a tree through the system resolver (Android supplies its own DNS
-    /// servers, which turns the walk off in `RustMyotisEngine`; iOS never turns
-    /// it on), but an embedding app with no `DnsServers` port reaches here on
-    /// Android. hickory 0.26 reads Android's configuration over JNI through
-    /// `ndk_context::android_context()`, which PANICS when no host registered a
-    /// context, and nothing here does, so under the release profile's
-    /// `panic = "abort"` that would kill the app; 0.25 found no
-    /// `/etc/resolv.conf` (gone since Oreo, see `reqresp.rs`) and returned
+    /// Always `Err` on Android and iOS, where hickory is not even a dependency
+    /// (Cargo.toml). Neither host walks a tree through the system resolver (the
+    /// Android app supplies its own DNS servers, which turns the walk off in
+    /// `RustMyotisEngine`; iOS never turns it on), but an embedding app with no
+    /// `DnsServers` port reaches here on Android. hickory 0.26 reads Android's
+    /// configuration over JNI through `ndk_context::android_context()`, which
+    /// PANICS when no host registered a context, and nothing here does, so under
+    /// the release profile's `panic = "abort"` it would kill the app; 0.25 found
+    /// no `/etc/resolv.conf` (gone since Oreo, see `reqresp.rs`) and returned
     /// `Err`. iOS has no `SCDynamicStore`, which 0.26 reads on Apple targets.
     pub fn new() -> Result<SystemResolver, String> {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             Err(
-                "system resolver: not read on mobile (the host supplies DNS servers there)"
+                "system resolver: not used on Android or iOS (the engine takes no host \
+                 DNS servers yet, so EIP-1459 discovery stays off here)"
                     .to_string(),
             )
         }
@@ -606,14 +609,23 @@ impl TxtLookup for SystemResolver {
         name: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + 'a>> {
         Box::pin(async move {
-            // Fully qualified: no search-list suffixing, one query.
-            let fqdn = format!("{name}.");
-            match self.inner.txt_lookup(fqdn).await {
-                // A record's segments concatenate (TXT strings are at most 255
-                // bytes, a long ENR is split over several).
-                Ok(lookup) => Ok(txt_strings(&lookup)),
-                Err(e) if e.is_no_records_found() || e.is_nx_domain() => Ok(Vec::new()),
-                Err(e) => Err(e.to_string()),
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            {
+                // Unreachable: `new` never returns a resolver on mobile.
+                let _ = name;
+                Err("system resolver: not used on Android or iOS".to_string())
+            }
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                // Fully qualified: no search-list suffixing, one query.
+                let fqdn = format!("{name}.");
+                match self.inner.txt_lookup(fqdn).await {
+                    // A record's segments concatenate (TXT strings are at most
+                    // 255 bytes, a long ENR is split over several).
+                    Ok(lookup) => Ok(txt_strings(&lookup)),
+                    Err(e) if e.is_no_records_found() || e.is_nx_domain() => Ok(Vec::new()),
+                    Err(e) => Err(e.to_string()),
+                }
             }
         })
     }
@@ -623,6 +635,7 @@ impl TxtLookup for SystemResolver {
 /// (TXT strings are at most 255 bytes, a long ENR is split over several).
 /// Only the TXT answers: a CNAME the resolver followed sits in the same
 /// section.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn txt_strings(lookup: &hickory_resolver::lookup::Lookup) -> Vec<String> {
     lookup
         .answers()
@@ -924,6 +937,7 @@ mod tests {
     /// ignored `live_dns_tree` test): one string per TXT record, segments
     /// joined in order, and a CNAME in the answer section skipped.
     #[test]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn txt_strings_joins_segments_and_skips_other_records() {
         use hickory_resolver::lookup::Lookup;
         use hickory_resolver::proto::op::Query;
