@@ -302,12 +302,13 @@ func parseLCHeader(region []byte) (*lcHeader, error) {
 		return nil, err
 	}
 	// execHeaderRoot succeeded, so region[off:] is at least the fixed
-	// section: the reads below (up to offset 472+32) are in bounds by the
-	// same guarantee the merkleization itself relies on.
+	// section: the reads below (up to offset 472+32 — block_hash per the
+	// layout table above; 440 is base_fee, NOT the hash) are in bounds
+	// by the same guarantee the merkleization itself relies on.
 	eph := region[off:]
 	var execState, execHash hash32
 	copy(execState[:], eph[52:])
-	copy(execHash[:], eph[440:])
+	copy(execHash[:], eph[472:])
 	return &lcHeader{
 		Beacon: beacon, Exec: exec, ExecStateRoot: execState, Branch: branch,
 		ExecNumber:    binary.LittleEndian.Uint64(eph[404:]),

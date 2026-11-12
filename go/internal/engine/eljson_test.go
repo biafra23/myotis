@@ -211,6 +211,29 @@ func TestStorageJSONKeySet(t *testing.T) {
 	}
 }
 
+// TestBeaconSyncedRustParity pins the gate to sync.rs:4293 —
+// finalized + slack ≥ wall, NO lower bound. The lower bound a
+// previous cut added would report beaconSynced=false where Rust and
+// Java report true for the identical anchor (host clock a hair behind
+// its own LC), and a cross-engine shape may not diverge on a key.
+func TestBeaconSyncedRustParity(t *testing.T) {
+	wall := chain.ConsensusMainnet().SlotAt(testNow)
+	for _, tc := range []struct {
+		name string
+		slot uint64
+		want bool
+	}{
+		{"fresh", wall - 4, true},
+		{"exactly at the slack", wall - SyncedSlackSlots, true},
+		{"one slot past the slack", wall - SyncedSlackSlots - 1, false},
+		{"anchor ahead of the wall clock", wall + 5, true},
+	} {
+		if got := beaconSynced(tc.slot, testNow); got != tc.want {
+			t.Errorf("%s: beaconSynced(%d @ wall %d) = %v, want %v", tc.name, tc.slot, wall, got, tc.want)
+		}
+	}
+}
+
 func TestBeToDecimal(t *testing.T) {
 	for in, want := range map[string]string{
 		"":         "0", // empty = zero, like eljson.rs be_to_decimal

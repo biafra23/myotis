@@ -299,6 +299,19 @@ func (e *Engine) Anchor() (anchor, bool) {
 // the disclosure budget.
 func (e *Engine) SnapPeers() []snapread.Peer { return e.dial.snapPeers() }
 
+// LCError reports that the light client gave up, so the read can never
+// be VERIFIED. It is its own type (not just a wrapped error) because
+// the LC's own budgets carry their own context deadline — a bootstrap
+// timeout wraps context.DeadlineExceeded, and a caller classifying by
+// that sentinel would report "the READ window expired" for a light
+// client that died minutes earlier. The old main loop kept these arms
+// separate (lcFailure vs deadline); the type keeps them separate
+// across the library seam.
+type LCError struct{ Err error }
+
+func (e *LCError) Error() string { return "light client: " + e.Err.Error() }
+func (e *LCError) Unwrap() error { return e.Err }
+
 // ReadError says the wait for a verified read ended without one. Reason
 // is why the wait ended (deadline or cancellation); LastAttempt is the
 // last deferred per-anchor failure, so "the window expired" can name
@@ -437,6 +450,15 @@ func (e *Engine) Account(ctx context.Context, addr common.Address, slot [32]byte
 		case <-ctx.Done():
 			return nil, &ReadError{Reason: ctx.Err(), LastAttempt: lastAttempt}
 		case <-e.dead:
+			// Ctrl-C closes both arms' race honestly (the old main
+			// loop's rule): the LC loop ends with context.Canceled
+			// exactly when ctx ends too, and select picks randomly —
+			// shutdown is the clean path, never a failure, and library
+			// consumers (StartLC's promise) must not have to re-check
+			// ctx to know that.
+			if ctx.Err() != nil {
+				return nil, &ReadError{Reason: ctx.Err(), LastAttempt: lastAttempt}
+			}
 			// The LC gave up (bootstrap/catch-up refused within the
 			// budget): the read can never be VERIFIED, so the wait
 			// fails too — a verified read is the only success this
@@ -444,7 +466,7 @@ func (e *Engine) Account(ctx context.Context, addr common.Address, slot [32]byte
 			e.mu.Lock()
 			err := e.lcErr
 			e.mu.Unlock()
-			return nil, fmt.Errorf("light client: %w", err)
+			return nil, &LCError{err}
 		case res := <-readRes:
 			inFlight = false
 			if res.err != nil {

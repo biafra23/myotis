@@ -272,7 +272,11 @@ func strPtr(s string) *string { return &s }
 
 func beaconSynced(finalizedSlot uint64, nowUnix int64) bool {
 	wall := chain.ConsensusMainnet().SlotAt(nowUnix)
-	return wall >= finalizedSlot && wall-finalizedSlot <= SyncedSlackSlots
+	// Rust parity (sync.rs:4293): finalized + slack ≥ wall, with NO
+	// lower bound — an anchor AHEAD of the wall clock (host clock a
+	// second behind its own LC) is SYNCED there and must be SYNCED
+	// here; the cross-engine shapes cannot diverge on this key.
+	return finalizedSlot+SyncedSlackSlots >= wall
 }
 
 func isUint64Key(k [32]byte) bool {

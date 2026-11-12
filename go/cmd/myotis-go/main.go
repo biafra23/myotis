@@ -51,12 +51,11 @@ func main() {
 		jsonOut    = flag.Bool("json", false, "with -get-account: print the read in the engine-API result shape (eljson; one JSON line for the account, plus one for the slot with -slot) to stdout instead of log lines")
 	)
 	flag.Parse()
+	logFat := func(a ...any) { fmt.Fprintln(os.Stderr, a...); os.Exit(2) }
 	if *slot != "" && *getAccount == "" {
-		logFat := func(a ...any) { fmt.Fprintln(os.Stderr, a...); os.Exit(2) }
 		logFat("-slot requires -get-account")
 	}
 	if *jsonOut && *getAccount == "" {
-		logFat := func(a ...any) { fmt.Fprintln(os.Stderr, a...); os.Exit(2) }
 		logFat("-json requires -get-account")
 	}
 
@@ -129,7 +128,14 @@ func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, m
 	go func() {
 		defer close(sumDone)
 		if quiet {
-			<-ctx.Done()
+			// Exit on window/shutdown OR on the read settling: with
+			// -run-for 0 the outer ctx never ends by itself, and a
+			// quiet goroutine waiting only on it would deadlock the
+			// driver at <-sumDone after a successful read.
+			select {
+			case <-ctx.Done():
+			case <-readDone:
+			}
 			return
 		}
 		t := time.NewTicker(30 * time.Second)
@@ -175,24 +181,35 @@ func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, m
 	<-sumDone
 	if err != nil {
 		e.Report()
-		if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
-			// The window named the cause when there was one, instead of
-			// only the fact — kept from the old loop's wording.
-			var re *engine.ReadError
+		// The old loop's exit taxonomy, arm by arm, in its order:
+		var lce *engine.LCError
+		var re *engine.ReadError
+		switch {
+		case errors.As(err, &lce):
+			// lcFailure: the light client died (bootstrap/catch-up
+			// refused). Checked FIRST because the LC's own budgets
+			// wrap their own DeadlineExceeded — classifying by the
+			// sentinel first would report "read window expired" for an
+			// LC that died minutes before the window (PR #819 review).
+			return err
+		case errors.Is(err, context.DeadlineExceeded):
+			// The read window expired — either the -run-for one (which
+			// times out the parent too) or the default 10-minute one
+			// (readCtx only; the parent outlives it). Both are
+			// exit-1 with the cause named, as the old loop's deadline
+			// arm. (The review caught that gating this on
+			// ctx.Err() == nil turned -run-for expiries into exit 0.)
 			if errors.As(err, &re) && re.LastAttempt != nil {
 				return fmt.Errorf("read window expired before %s could be served: last failure: %w", wantAddr.Hex(), re.LastAttempt)
 			}
 			return fmt.Errorf("read window expired before an anchor + snap peer could serve %s", wantAddr.Hex())
-		}
-		if ctx.Err() != nil {
+		case ctx.Err() != nil:
 			// Ctrl-C closes the race honestly: the read was aborted by
 			// shutdown, not by a failure — the clean exit, as before.
 			return nil
+		default:
+			return err
 		}
-		// The LC gave up (or the read otherwise failed for real): the
-		// answer could never be VERIFIED, so the command cannot quietly
-		// succeed.
-		return err
 	}
 
 	if jsonOut {
