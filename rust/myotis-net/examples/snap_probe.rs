@@ -27,10 +27,14 @@ use myotis_net::el::eth::messages as eth;
 use myotis_net::el::rlpx::transport::RlpxConnection;
 use myotis_net::el::snap::fetch::{verify_account, AccountOutcome};
 use myotis_net::el::snap::messages::{decode_account_range, encode_get_account, SnapCodes};
-use myotis_wire::rlpx::hello::{
-    decode_hello, encode_hello, Hello, P2P_DISCONNECT, P2P_HELLO, P2P_PING, P2P_PONG,
-};
+use myotis_wire::rlpx::hello::{decode_hello, encode_hello, P2P_DISCONNECT, P2P_HELLO};
 use tokio::sync::{Mutex, Semaphore};
+
+#[path = "probe_common/mod.rs"]
+mod probe_common;
+use probe_common::{
+    caps_line, disconnect_reason, fresh_node_key, negotiate, read_status, recv_frame, truncate,
+};
 
 /// Target chains: (network id, name, probe address with known state).
 const TARGETS: &[(u64, &str, &str)] = &[
@@ -85,15 +89,7 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(300);
 
-    // A fresh node id per run: a fixed one would carry any peer's throttle or
-    // ban of an earlier run into every later census, from every host.
-    let key = Arc::new(loop {
-        let mut secret = [0u8; 32];
-        getrandom::getrandom(&mut secret).expect("OS entropy");
-        if let Ok(k) = NodeKey::from_secret_bytes(&secret) {
-            break k;
-        }
-    });
+    let key = fresh_node_key();
     let mut boot_enodes: Vec<(SocketAddr, [u8; 64])> = Vec::new();
     for e in BOR_BOOT.iter().chain(SCROLL_BOOT) {
         let enode = myotis_net::el::reader::parse_enode(e).expect("bootnode enode");
@@ -240,14 +236,6 @@ async fn main() {
     }
 }
 
-fn truncate(s: &str, n: usize) -> String {
-    s.chars()
-        .take(n)
-        .collect::<String>()
-        .escape_debug()
-        .to_string()
-}
-
 async fn probe_peer(key: Arc<NodeKey>, addr: SocketAddr, pubkey: [u8; 64]) -> PeerReport {
     let mut r = PeerReport {
         addr: addr.to_string(),
@@ -275,92 +263,6 @@ async fn probe_peer(key: Arc<NodeKey>, addr: SocketAddr, pubkey: [u8; 64]) -> Pe
     r
 }
 
-/// Receive the next non-Ping frame, answering Pings and politely refusing any
-/// eth Get* request with an empty response (we serve nothing).
-async fn recv_frame(conn: &mut RlpxConnection, secs: u64) -> Result<(u64, Vec<u8>), String> {
-    let fut = async {
-        loop {
-            let f = conn.recv().await?;
-            match f.message_code {
-                P2P_PING => conn.send(P2P_PONG, &[0xc0]).await?,
-                eth::GET_BLOCK_HEADERS | eth::GET_BLOCK_BODIES | eth::GET_RECEIPTS => {
-                    if let Some(id) = eth::leading_request_id(&f.payload) {
-                        conn.send(f.message_code + 1, &eth::encode_empty_response(id))
-                            .await?;
-                    }
-                }
-                code => return Ok((code, f.payload)),
-            }
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(secs), fut)
-        .await
-        .map_err(|_| "recv timeout".to_string())?
-}
-
-/// Highest eth / snap version both sides advertise. Our side is read back from
-/// the very Hello we send (`encode_hello`), so this can never disagree with it.
-fn negotiate(ours: &Hello, theirs: &Hello) -> (Option<u64>, Option<u64>) {
-    let common = |name: &str| {
-        theirs
-            .capabilities
-            .iter()
-            .filter(|c| {
-                c.name == name
-                    && ours
-                        .capabilities
-                        .iter()
-                        .any(|o| o.name == name && o.version == c.version)
-            })
-            .map(|c| c.version)
-            .max()
-    };
-    (common("eth"), common("snap"))
-}
-
-/// Lenient Status read: network id is always field 1. The head hash is the
-/// standard field when the strict decoder accepts the Status; otherwise (Bor's
-/// eth/69 keeps a TD field) pick by layout: eth/66-68 `[ver, nid, td,
-/// bestHash, genesis, forkId]` → field 3; eth/69+ → the last field
-/// (`latestHash`).
-fn read_status(payload: &[u8], eth_version: u64) -> Result<(u64, [u8; 32], Option<u64>), String> {
-    if let Ok(s) = eth::decode_status(payload, eth_version) {
-        return Ok((s.network_id, s.best_hash, s.latest_block));
-    }
-    let top = rlp::decode(payload).map_err(|e| e.0)?;
-    let items = top.as_list().map_err(|e| e.0)?;
-    let nid = items
-        .get(1)
-        .ok_or("short status")?
-        .as_u64()
-        .map_err(|e| e.0)?;
-    let head = if eth_version >= 69 {
-        items.last()
-    } else {
-        items.get(3)
-    };
-    let head = head.ok_or("short status")?.as_bytes().map_err(|e| e.0)?;
-    let head: [u8; 32] = head
-        .try_into()
-        .map_err(|_| format!("status: head hash is {} bytes", head.len()))?;
-    Ok((nid, head, None))
-}
-
-/// A p2p Disconnect's reason code — `[reason]` or a bare byte, both seen in
-/// the wild — so the verdict histogram groups by reason, not by encoding.
-fn disconnect_reason(payload: &[u8]) -> String {
-    let reason = rlp::decode(payload)
-        .ok()
-        .and_then(|item| match item.as_list() {
-            Ok(list) => list.first().and_then(|r| r.as_u64().ok()),
-            Err(_) => item.as_u64().ok(),
-        });
-    match reason {
-        Some(r) => format!("reason {r}"),
-        None => format!("undecodable ({} bytes)", payload.len()),
-    }
-}
-
 async fn probe_inner(
     key: Arc<NodeKey>,
     addr: SocketAddr,
@@ -384,18 +286,7 @@ async fn probe_inner(
     let hello = decode_hello(&payload)?;
     r.stage = "hello";
     r.client = hello.client_id.clone();
-    // Capability names are peer-controlled bytes (`from_utf8_lossy` in
-    // `decode_hello`): escape and bound them like the client id before they
-    // reach the terminal.
-    r.caps = truncate(
-        &hello
-            .capabilities
-            .iter()
-            .map(|c| format!("{}/{}", c.name, c.version))
-            .collect::<Vec<_>>()
-            .join(","),
-        120,
-    );
+    r.caps = caps_line(&hello);
     let (eth_v, snap_v) = negotiate(&decode_hello(&our_hello)?, &hello);
     r.eth = eth_v;
     r.snap = snap_v;
