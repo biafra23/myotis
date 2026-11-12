@@ -9,11 +9,13 @@
 # solution/Cargo.lock is checked here and whose starter/ is generated from
 # solution/ by make_starter.py — `--check` fails if the two differ, lock
 # included. Learners run it with `cargo test --offline --locked`.
-# Only roost.yml builds with --locked; every other cargo invocation in CI and
-# Gradle runs unlocked, so a lock that stops matching its manifests fails
-# nothing until someone's local cargo run silently repairs it and the fix lands
-# in whatever commit happens to be open (tor-poc's lock drifted that way for
-# nine days after 4a72430a). This job is the one place a stale lock fails.
+# Since #734 (Part 2) every cargo build, test, run, clippy and doc invocation in
+# CI, in Gradle and in rust/build-*.sh passes --locked, so a lock that stops
+# matching its manifests already fails the first build that uses it. This job
+# stays as the belt to those braces: it checks every lock above on every change
+# to a manifest or lock, including tor-poc's and the workbook's, which nothing
+# else in CI builds (tor-poc's lock once drifted for nine days after 4a72430a,
+# before any build was locked).
 #
 # `cargo update --workspace --locked` resolves against the registry INDEX only:
 # no crate is downloaded, nothing is compiled, and it exits non-zero with
@@ -24,8 +26,8 @@
 # tree, which rust/Cargo.toml says must never burden CI.)
 #
 # Trigger shape as the other workflows: push scoped to main + release tags so a
-# branch push with an open PR runs once (under pull_request), and tags because
-# the tag builds themselves run unlocked.
+# branch push with an open PR runs once (under pull_request), and tags so a
+# release's three locks are checked together, tor-poc's included.
 name: cargo locks
 
 on:
@@ -37,12 +39,16 @@ on:
       - "rust/**/Cargo.lock"
       - "docs/tour/workbook/**"
       - ".github/workflows/cargo-locks.yml"
+      - ".github/actions/rust-toolchain/**"
+      - "rust/rust-toolchain.toml"
   pull_request:
     paths:
       - "rust/**/Cargo.toml"
       - "rust/**/Cargo.lock"
       - "docs/tour/workbook/**"
       - ".github/workflows/cargo-locks.yml"
+      - ".github/actions/rust-toolchain/**"
+      - "rust/rust-toolchain.toml"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -51,13 +57,13 @@ concurrency:
 jobs:
   locked:
     name: Cargo.lock files resolve under --locked
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: ./.github/actions/rust-toolchain
       - name: Resolve every lock without changing it
         run: |
           set -eu

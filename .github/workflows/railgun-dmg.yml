@@ -40,7 +40,7 @@ jobs:
   # went green without one would be worse than a red one.
   seed:
     name: Check the seed assets
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     env:
       SEED_URL: ${{ vars.RAILGUN_SEED_URL || format('https://github.com/{0}/releases/download/railgun-seed/railgun-seed.tar.gz', github.repository) }}
       SEPOLIA_SEED_URL: ${{ vars.RAILGUN_SEPOLIA_SEED_URL || format('https://github.com/{0}/releases/download/railgun-seed/railgun-seed-sepolia.tar.gz', github.repository) }}
@@ -89,12 +89,15 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           submodules: recursive
           # Full history: :ui stamps the app's on-screen version from the nearest
           # v* tag, and `git describe` needs HEAD's history to REACH that tag.
           fetch-depth: 0
+      # One Xcode for every macOS leg, from .xcode-version (#734).
+      - name: Select the pinned Xcode
+        uses: ./.github/actions/select-xcode
 
       # The dmg's name carries the version only on a release, per the owner's
       # request. On main it stays unversioned so the "latest build" link is
@@ -178,26 +181,26 @@ jobs:
           fetch sepolia "$SEPOLIA_SEED_URL" "$SEPOLIA_SEED_SHA256_URL" "${SEPOLIA_SEED_SHA256:-}" "$SEPOLIA_SEED_ROOT" SEPOLIA_SEED_DIR
 
       - name: Set up JDK 21 (aarch64)
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4.9.1
         with:
-          java-version: '21'
+          java-version-file: .java-version  # exact Temurin release, one place (#734)
           distribution: 'temurin'
           architecture: aarch64
 
       # The packaged app bundles the Rust engine (appResources); prepareRustAppResources
       # fails the build if the lib is missing, so this is REQUIRED.
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/rust-toolchain
         with:
           targets: aarch64-apple-darwin
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: rust
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a  # v4.4.3
 
       - name: Make gradlew executable
         run: chmod +x gradlew
@@ -211,6 +214,9 @@ jobs:
           RUST_TARGET: aarch64-apple-darwin
         run: |
           GRADLE_ARGS="-Porg.gradle.java.installations.auto-detect=false -Porg.gradle.java.installations.auto-download=false -Porg.gradle.java.installations.paths=$JAVA_HOME"
+          # Stated, not inherited (#734): jpackage creates the .app's directories
+          # for the dmg with the umask it runs under (see desktop-dmg.yml).
+          umask 022
           for attempt in 1 2 3; do
             ./gradlew :app-desktop:packageDmg --stacktrace $GRADLE_ARGS \
               -PrailgunPoc -PrailgunSeedDir="$SEED_DIR" -PrailgunSepoliaSeedDir="$SEPOLIA_SEED_DIR" && exit 0
@@ -319,7 +325,7 @@ jobs:
           [ -z "$stray" ] || { echo "::error::the railgun-poc dmg carries Bee PoC files ($stray)"; exit 1; }
 
       - name: Upload DMG
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: myotis-railgun-poc-dmg-arm64-${{ github.sha }}
           path: app-desktop/build/compose/binaries/main/dmg/*.dmg
@@ -343,25 +349,31 @@ jobs:
     name: Publish railgun dmg to release
     needs: [build, version-guard]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
+      # The build-provenance attestation of the uploaded assets (#734): an OIDC
+      # token for the Sigstore certificate, and the attestation's storage.
+      id-token: write
+      attestations: write
     steps:
-      # Only the shared release notes and the script that writes them
-      # (.github/release-notes.*), from the commit being released. First, so
+      # Only the shared release notes, the script that writes them
+      # (.github/release-notes.*) and the one that uploads
+      # (.github/release-assets.sh), from the commit being released. First, so
       # the artifacts below land in the checked-out workspace, not under it.
       - name: Check out the release notes
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           sparse-checkout: |
             .github/release-notes.md
             .github/release-notes.sh
+            .github/release-assets.sh
           sparse-checkout-cone-mode: false
           # gh takes the token from the publish step's env; keep the job's
           # write token out of .git/config.
           persist-credentials: false
       - name: Download the dmg artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: myotis-railgun-poc-dmg-arm64-${{ github.sha }}
           path: dmg
@@ -383,5 +395,21 @@ jobs:
           # Create the release with the master notes (.github/release-notes.md),
           # unless another publisher already did — see .github/release-notes.sh.
           bash .github/release-notes.sh create "$tag"
-          gh release upload "$tag" "$dmg" --clobber
+          # Upload, and check that the release serves these bytes.
+          bash .github/release-assets.sh "$tag" "$dmg"
           echo "uploaded $dmg to $tag"
+
+      - name: Attest the RAILGUN PoC dmg's build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/release-assets.SHA256SUMS
+
+      # Last, and also when the attestation failed: SHA256SUMS is the one file
+      # all publishers share, kept apart from this job's own upload and
+      # attestation (.github/release-assets.sh).
+      - name: List the release's assets in SHA256SUMS
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: bash .github/release-assets.sh --checksums "${GITHUB_REF_NAME}"

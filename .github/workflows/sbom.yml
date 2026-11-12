@@ -1,0 +1,171 @@
+# SBOMs: one CycloneDX document per shipped product, as release assets (#734,
+# Part 5e).
+#
+# scripts/sbom.py writes them from the pins the tree already carries: the
+# Gradle lockfiles and gradle/verification-metadata.xml, rust/Cargo.lock,
+# .java-version and rust/rust-toolchain.toml. Nothing is built and nothing is
+# downloaded, so this job needs no toolchain and no network: a checkout and
+# the runner's python3. The documents say exactly what the pins say (the
+# script's header has what that makes exact and what a superset), and the same
+# tree gives the same bytes.
+#
+# On a pull request and on `main` the job generates them and runs the script's
+# tests, so a pin change that the generator cannot read (a product's
+# configuration renamed, a module the verification metadata does not pin)
+# fails here and not at a tag. On a `v*` tag the release job attaches them to
+# the tag's release like every other publisher: through
+# .github/release-assets.sh, attested, listed in SHA256SUMS
+# (release-version-guard.yml has the list of publishers; this is one of them).
+name: sbom
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  # Any base branch: a part PR into a feature branch moves pins too.
+  pull_request:
+    paths:
+      - ".github/workflows/sbom.yml"
+      - "scripts/sbom.py"
+      - "scripts/test_sbom.py"
+      - "**/gradle.lockfile"
+      - "gradle/verification-metadata.xml"
+      - "rust/Cargo.lock"
+      - "rust/rust-toolchain.toml"
+      - ".java-version"
+      - "build.gradle.kts"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    name: Generate the SBOMs
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Test the generator
+        run: python3 scripts/test_sbom.py
+      # Named after the tag on a tag, after the tree's version otherwise. The
+      # timestamp is the commit's, so a re-run writes the same bytes.
+      - name: Generate
+        run: |
+          set -euo pipefail
+          # Assigned, then exported: `export X=$(cmd)` has export's status, and
+          # a failed git log would leave the documents without a timestamp.
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          args=()
+          [ "$GITHUB_REF_TYPE" != tag ] || args=(--tag "$GITHUB_REF_NAME")
+          python3 scripts/sbom.py --out sbom "${args[@]}"
+          # Twice, into another directory: the same bytes, or the documents
+          # depend on something that is not in the tree.
+          python3 scripts/sbom.py --out sbom-again "${args[@]}" >/dev/null
+          diff -r sbom sbom-again
+          {
+            echo "### SBOMs"
+            echo
+            echo "| file | components |"
+            echo "|---|---|"
+            for f in sbom/*.cdx.json; do
+              echo "| \`$(basename "$f")\` | $(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["components"]))' "$f") |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom/*.cdx.json
+          if-no-files-found: error
+          retention-days: 30
+          # Artifacts are immutable per run; without this, "re-run all jobs" on
+          # a tag 409s here and the release job never runs.
+          overwrite: true
+
+  # Refuse to publish when the pushed tag disagrees with the version in the
+  # tree: the files are named after the tag, and what they describe (the
+  # product's version, its pins) comes from the tree. See
+  # release-version-guard.yml.
+  version-guard:
+    name: Release version guard
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/release-version-guard.yml
+
+  # Attach to the tag's GitHub Release. Every publisher targets the same
+  # release for the same tag; whichever job runs first creates it and the
+  # others add their assets. Gated on the REF, not the event, so a
+  # workflow_dispatch targeting a tag ref is the manual republish path.
+  release:
+    name: Publish the SBOMs to the release
+    needs: [generate, version-guard]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+      # The build-provenance attestation of the uploaded assets (#734): an OIDC
+      # token for the Sigstore certificate, and the attestation's storage.
+      id-token: write
+      attestations: write
+    steps:
+      # The release scripts, from the commit being released.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/release-notes.md
+            .github/release-notes.sh
+            .github/release-assets.sh
+          sparse-checkout-cone-mode: false
+      - name: Download the SBOMs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          section=$(mktemp)
+          cat > "$section" <<'SECTION'
+          **SBOMs (`Myotis-v<version>-<product>.cdx.json`)** — what each product is
+          made of, as CycloneDX 1.5: `android`, `android-debug`, `desktop`,
+          `daemon`, `engine-library`, `ios`, `node`. Generated from the pins of this tag (the
+          Gradle lockfiles and verification metadata, `Cargo.lock`, the JDK and Rust
+          versions), not from a build: the Maven components are exactly the locked
+          runtime classpath, each with the SHA-256 the build verifies; the Rust
+          components are every crate the lock allows the product's crates to pull
+          in, which is more than is linked. No licenses. See
+          docs/guides/reproducible-builds.md.
+          SECTION
+          # Create the release with the master notes plus this section, unless
+          # another publisher already did; upload; then make sure the notes
+          # carry this section exactly once (.github/release-notes.sh explains
+          # the race).
+          bash .github/release-notes.sh create "$tag" "$section"
+          # Upload, and check that the release serves these bytes.
+          bash .github/release-assets.sh "$tag" sbom/Myotis-"$tag"-*.cdx.json
+          bash .github/release-notes.sh append "$tag" "$section"
+
+      - name: Attest the SBOMs' build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/release-assets.SHA256SUMS
+
+      # Last, and also when the attestation failed: SHA256SUMS is the one file
+      # all publishers share, kept apart from this job's own upload and
+      # attestation (.github/release-assets.sh).
+      - name: List the release's assets in SHA256SUMS
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: bash .github/release-assets.sh --checksums "${GITHUB_REF_NAME}"

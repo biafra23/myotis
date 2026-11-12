@@ -1,0 +1,14 @@
+# The published builder image for this tree's pins (#734).
+#
+# key    `docker/builder/build.sh --print-key`: the SHA-256 of the resolved
+#        build args and the Dockerfile, i.e. of everything the image is made
+#        from.
+# image  the image built from exactly those pins, by digest.
+#
+# Read by docker/builder/pull.sh. Never edited by hand: when a pin moves, the
+# `builder image` workflow builds and publishes the new image and fails with
+# the two lines to put here (docker/builder/publish.sh), and it fails whenever
+# these lines do not name what the registry serves for the key.
+# Built and published by https://github.com/biafra23/myotis/actions/runs/43100247845 at commit 2751facbed210bf8131ba2d27adf4efe52029449.
+key=769a57507482e0b15dc92033b5dff22ea23bd13d49e2f0dde3e6af557405c76e
+image=ghcr.io/biafra23/myotis-builder@sha256:d57b28af5a74c6c2ffa4eb832d773cc92e2c9110e820a5da6edaa237385eb05e

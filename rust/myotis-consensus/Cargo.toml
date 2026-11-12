@@ -32,4 +32,5 @@ std = ["sha2/std", "tracing/std", "myotis-bls/std"]
 [dev-dependencies]
 # Signing side of BLS for the synthetic fork-boundary test (tests/fork_boundary.rs).
 # Already in the lock file via myotis-bls, so no new dependency tree.
-blst = "0.3"
+# `portable` like myotis-bls's (#734 D3: no build-host CPU detection).
+blst = { version = "0.3", features = ["portable"] }

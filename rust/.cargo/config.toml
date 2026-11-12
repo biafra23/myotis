@@ -34,3 +34,15 @@ rustflags = ["--cfg", "aes_force_soft"]
 
 [target.aarch64-unknown-uefi]
 rustflags = ["--cfg", "aes_force_soft"]
+
+# Windows (MSVC): /Brepro makes link.exe derive the PE header's TimeDateStamp,
+# the debug directory's timestamps and the PDB GUID from the image's content
+# instead of the clock, so a rebuild of the same tree gives the same .dll
+# (#734, Part 5a: the only bytes the two rebuild legs' myotis_engine.dll and
+# myotis_node.dll differed in). Cargo merges these per-target flags with the
+# CARGO_TARGET_*_RUSTFLAGS path remaps (rust/repro-env.sh, the root build).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/Brepro"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/Brepro"]

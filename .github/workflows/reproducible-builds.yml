@@ -1,0 +1,836 @@
+# Reproducible builds: build every release artifact TWICE and compare (#734, Part 5a).
+#
+# Each platform builds in two legs, a and b: on Linux in one builder image
+# named by digest, on macOS and Windows on two hosted runners of one image
+# label, with the toolchains pinned on them (the compare job names the image
+# version each leg got). The legs differ in everything a reproducible build
+# must not depend on:
+#   - the checkout path: a builds in $GITHUB_WORKSPACE, b in a fresh clone
+#     several directories deeper under $RUNNER_TEMP (so a leaked absolute path
+#     differs in length and content, not just a prefix);
+#   - CARGO_HOME and GRADLE_USER_HOME: b gets empty ones of its own, so the
+#     crate sources and the Gradle caches sit at other paths;
+#   - on Linux, the user: both legs build in the builder image
+#     (docker/builder/), leg b as another uid with another home;
+#   - the time zone (UTC vs. Asia/Kathmandu, +05:45: a local-time stamp shows),
+#     the locale and the umask (022 vs. 002; Windows has no umask, and its leg
+#     b sets the system time zone instead of TZ). One step is exempt from the
+#     umask: jpackage's dmg takes its directory modes from the umask of the
+#     process and nothing can normalize them afterwards, so the dmg is DEFINED
+#     as packaged under 022 (the build refuses another), and both macOS legs
+#     run that one task under it. Everything the dmg takes in is still built
+#     under the leg's own umask;
+#   - the wall clock: the two jobs start, build and finish at different times.
+# On macOS and Windows the user is not varied: there the toolchains are
+# installed for the runner account.
+#
+# What is compared (issue #734, decision D-d):
+#   tier 1, bit-for-bit — the unsigned release APK; the engine library as
+#     staged (AAR, jars, natives jars, poms, modules, metadata); the Rust host
+#     libraries (.so / .dylib / .dll) and the Node addon; the Linux .deb; the
+#     two xcframeworks, as their release zips and as trees.
+#   by payload — the debug APK (its debug-key signature differs by design: the
+#     entries and their bytes are compared), the macOS dmg (its .app) and the
+#     Windows msi (its files, extracted by an administrative install).
+# The verdict is a SHA-256 manifest per platform (scripts/repro/compare.py);
+# diffoscope only explains a difference, as an HTML report per differing file
+# in the run's `repro-report-<platform>-<leg>-vs-<leg>` artifact.
+#
+# Linux has a third leg, r: the same build on the hosted runner's toolchain, as
+# android-apk.yml and engine-library.yml install it, not in the image.
+# `Compare linux image vs runner toolchain` (a against r) REPORTS whether the
+# image and that toolchain give the same bytes. It is a proxy for "what a tag
+# publishes is what a third party rebuilds in the image", not the proof: the
+# release workflows run other Gradle invocations and stage natives from four
+# runners. The proof is the image build against the published assets
+# themselves: on a `v*` tag, `Compare the image build with the published
+# assets` (the `published` job) waits for the release's Android assets and
+# compares leg a with them. Reported, not gated, like leg r.
+#
+# WHAT FAILS THE RUN (owner's decisions: Android first, 2026-11-10; everything
+# the two legs build, 2026-11-11): any difference between legs a and b, on
+# every platform, and a missing leg a or b. `Compare linux`: the APKs
+# (android/), the engine library (maven-repo/: the AAR, its jars, natives jars
+# and metadata) and the .deb. `Compare macos`: the dmg's .app and both
+# xcframeworks. `Compare windows`: the msi's files. And on each of the three,
+# host/: the engine library and the Node addon as that platform builds them
+# (.so, .dylib, .dll). The first runs had found the desktop and Apple
+# artifacts close but not there (the installers' payload, the macOS dylibs, the
+# MyotisKit binaries); Part 5d of #734 fixed those, and with a clean report on
+# all three platforms they joined the gate. What is REPORTED and does not fail
+# is the two comparisons that are not a against b: leg r, above, and on a tag
+# the published assets.
+#
+# Not on every pull request: a full rebuild of every platform, twice, is the
+# most expensive workflow in the repository, and what it checks moves only with
+# the build. It runs on v* tags (the release's own proof), weekly on main (so a
+# regression surfaces within a week, not at the next tag), on dispatch (a PR
+# that touches the build dispatches it on its branch), and on a PR that changes
+# this machinery itself (the workflow or scripts/repro/), which must prove it
+# still compares before it lands. That PR trigger is also the only way to run a
+# NEW copy of this file: GitHub dispatches only workflows on the default branch.
+# Like the other artifact builds (CLAUDE.md, multi-PR plans), it skips a PR
+# whose base is not main, unless the PR carries the `reproducible-builds`
+# label: the explicit per-PR opt-in that stands in for the dispatch a part PR
+# would otherwise use, which a workflow that is not on main yet cannot get.
+# The label reaches only a PR that also matches the paths below (a `labeled`
+# event is path-filtered too): a part PR that changes other build inputs (the
+# root build, rust/.cargo/config.toml, rust/build-*.sh, repro-env.sh) gets a
+# run once this file is on main and can be dispatched, or by touching one of
+# these paths. Not widened: every PR into main would then run it.
+name: reproducible builds
+
+on:
+  push:
+    tags: [ "v*" ]
+  pull_request:
+    # `labeled` so adding the opt-in label below starts a run.
+    types: [ opened, synchronize, reopened, labeled ]
+    paths:
+      - '.github/workflows/reproducible-builds.yml'
+      - 'scripts/repro/**'
+      - 'docker/builder/**'
+      - 'scripts/check_16k_alignment.py'
+      - 'scripts/repro_zip.sh'
+      - 'scripts/normalize_maven_metadata.py'
+      - 'scripts/normalize_xcframework.py'
+      - 'rust/repro-env.sh'
+  schedule:
+    - cron: "41 2 * * 1"  # Mondays 02:41 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A PR's newer push supersedes its older run; a tag's, the schedule's or a
+# dispatch's run is never cancelled (each is a release's or a week's proof),
+# and the event is in the group so a dispatch on main cannot queue-cancel the
+# weekly run (GitHub keeps one pending run per group).
+#
+# Adding any OTHER label to a PR is a `labeled` event too: its run gets a group
+# of its own (so it cannot cancel a comparison that may be two hours in) and
+# its jobs skip (the label condition on each of them).
+concurrency:
+  group: reproducible-builds-${{ github.event_name }}-${{ github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'reproducible-builds' && format('-label-{0}', github.event.label.name) || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # No daemon: every Gradle run is a fresh JVM on a fresh home, with nothing to
+  # cache. The macOS leg relies on it: it runs Gradle a second time under
+  # another umask, which a daemon kept from the first run would not have (the
+  # dmg task checks, so that would fail the leg, not skew the comparison).
+  GRADLE_OPTS: -Dorg.gradle.daemon=false
+
+jobs:
+  # The builder image (#734 D-c): ONE image per run, the published one for
+  # these pins (the steps below say why not a build), checked against the pins,
+  # and handed to Linux legs a and b as an artifact, so both build in the very
+  # same image.
+  builder-image:
+    name: Builder image
+    if: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds')) && (github.event.action != 'labeled' || github.event.label.name == 'reproducible-builds') }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      # Reads ghcr.io/<owner>/myotis-builder.
+      packages: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      # The image published for these pins, by the digest docker/builder/
+      # image.lock names (pull.sh), not a build: a build needs
+      # snapshot.ubuntu.com, which refuses requests for minutes at a time (two
+      # of the first five builds died on its 503s), and this comparison is a
+      # condition of merging into main. Only when the pins have moved and the
+      # lock has not followed yet (pull.sh exits 3: a PR in the middle of
+      # moving a pin) is it built here. Pulled or built, check.sh holds it to
+      # the pins, apt package list included. That the image still BUILDS from
+      # its pins is the `builder image` workflow's question.
+      - name: Log in to the registry
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          # Not fatal: a login the registry did not answer shows up as a failed
+          # pull below, which builds instead (and a public package pulls without it).
+          printf '%s' "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin \
+            || echo "::warning::could not log in to ghcr.io; trying the pull without it"
+
+      # A locked image that cannot be pulled (pull.sh tries three times; a
+      # fork may not be able to read the package at all) is built too, with a
+      # warning: a tag's proof should not hinge on the registry's minute any
+      # more than on the snapshot service's. That the lock is pullable is the
+      # `builder image` workflow's check, where it is an error.
+      - name: Pull the image for these pins, or build it
+        run: |
+          set -euo pipefail
+          rc=0; docker/builder/pull.sh || rc=$?
+          case "$rc" in
+            0) ;;
+            3) docker/builder/build.sh ;;
+            *) echo "::warning::the published builder image could not be pulled; building it from its pins instead"
+               docker/builder/build.sh ;;
+          esac
+
+      - name: Check the image against its pins
+        run: docker/builder/check.sh
+
+      - name: Save the image
+        run: |
+          set -euo pipefail
+          docker save myotis-builder:local | zstd -T0 -3 -q -o "$RUNNER_TEMP/builder-image.tar.zst"
+          ls -lh "$RUNNER_TEMP/builder-image.tar.zst"
+          docker image inspect --format '{{.Id}}' myotis-builder:local | tee "$RUNNER_TEMP/builder-image.id"
+
+      - name: Upload the image
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: builder-image
+          path: |
+            ${{ runner.temp }}/builder-image.tar.zst
+            ${{ runner.temp }}/builder-image.id
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          # Artifacts are immutable per run: without this, a re-run of this job
+          # fails here (409) instead of replacing its own upload.
+          overwrite: true
+
+  linux:
+    name: Linux + Android (leg ${{ matrix.leg }})
+    needs: builder-image
+    if: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds')) && (github.event.action != 'labeled' || github.event.label.name == 'reproducible-builds') }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both build in the builder image and differ in everything else.
+        leg: [ a, b ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          # Full history: :ui stamps the version from the nearest v* tag.
+          fetch-depth: 0
+
+      # The toolchain is the builder image (#734 D-c), not this runner's: the
+      # JDK, rustc, the NDK, build-tools and cargo-ndk, each by digest or hash
+      # (docker/builder/), as the builder-image job built and checked it.
+      - name: Download the builder image
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: builder-image
+          path: ${{ runner.temp }}/builder-image
+
+      - name: Load the builder image
+        run: |
+          set -euo pipefail
+          zstd -dc "$RUNNER_TEMP/builder-image/builder-image.tar.zst" | docker load
+          rm "$RUNNER_TEMP/builder-image/builder-image.tar.zst"
+          want=$(cat "$RUNNER_TEMP/builder-image/builder-image.id")
+          got=$(docker image inspect --format '{{.Id}}' myotis-builder:local)
+          [ "$got" = "$want" ] || { echo "::error::loaded image $got, the builder-image job built $want"; exit 1; }
+          echo "builder image $got"
+
+      # From here on the legs differ in path, homes, user, time zone, locale
+      # and umask.
+      - name: Set up leg ${{ matrix.leg }}
+        id: leg
+        env:
+          LEG: ${{ matrix.leg }}
+        run: scripts/repro/setup_leg.sh "$LEG"
+
+      # Inside the image, as the leg's uid and user name, with the checkout at
+      # its own path. The main checkout is mounted too: leg b's worktree keeps
+      # its git data there (:ui reads the version from git). Only what is
+      # named here reaches the build (docker/builder/run.sh).
+      - name: Build
+        working-directory: ${{ steps.leg.outputs.src }}
+        run: |
+          "$GITHUB_WORKSPACE/docker/builder/run.sh" --user "$REPRO_RUN_AS" --name "$REPRO_USER_NAME" \
+            --home "$REPRO_HOME" --cargo-home "$CARGO_HOME" --gradle-home "$GRADLE_USER_HOME" \
+            --mount "$GITHUB_WORKSPACE" \
+            --env "TZ=$TZ" --env "LANG=$LANG" --env "LC_ALL=$LC_ALL" --env "REPRO_UMASK=$REPRO_UMASK" \
+            --env "GITHUB_REF=$GITHUB_REF" --env "GITHUB_REF_NAME=$GITHUB_REF_NAME" \
+            --env "GRADLE_OPTS=$GRADLE_OPTS" \
+            -- scripts/repro/build_linux.sh
+
+      # As a tarball: an uploaded artifact keeps neither file modes nor
+      # symlinks, and the comparison checks both.
+      - name: Collect
+        working-directory: ${{ steps.leg.outputs.src }}
+        run: |
+          set -euo pipefail
+          scripts/repro/collect.sh linux . "$RUNNER_TEMP/repro-out"
+          tar -C "$RUNNER_TEMP/repro-out" -cf "$RUNNER_TEMP/repro-linux.tar" .
+          # Which hosted image this leg ran on, next to the tarball and outside
+          # the compared tree: the compare job names the pair.
+          printf 'ImageOS=%s\nImageVersion=%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}" > "$RUNNER_TEMP/repro-runner.txt"
+
+      - name: Upload leg ${{ matrix.leg }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: repro-linux-${{ matrix.leg }}
+          path: |
+            ${{ runner.temp }}/repro-linux.tar
+            ${{ runner.temp }}/repro-runner.txt
+          if-no-files-found: error
+          # Artifacts are immutable per run: without this, a re-run of this job
+          # fails here (409) instead of replacing its own upload.
+          overwrite: true
+
+  # Leg r: the same build on the hosted runner's toolchain, installed as
+  # android-apk.yml and engine-library.yml install it. A PROXY for a release,
+  # not a release: those workflows run other Gradle invocations, with caches,
+  # and stage the natives of four runners. Its comparison with leg a is
+  # reported, not gated (see the compare matrix). No `needs`: it does not use
+  # the image.
+  linux-release-toolchain:
+    name: Linux + Android (leg r, runner toolchain)
+    if: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds')) && (github.event.action != 'labeled' || github.event.label.name == 'reproducible-builds') }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 150
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4.9.1
+        with:
+          java-version-file: .java-version
+          distribution: 'temurin'
+
+      - name: Set up Rust (host + Android targets)
+        uses: ./.github/actions/rust-toolchain
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Install the pinned NDK, build-tools and cargo-ndk
+        uses: ./.github/actions/android-native-toolchain
+
+      - name: Set up leg r
+        id: leg
+        run: scripts/repro/setup_leg.sh r
+
+      - name: Build
+        run: scripts/repro/build_linux.sh
+
+      - name: Collect
+        run: |
+          set -euo pipefail
+          scripts/repro/collect.sh linux . "$RUNNER_TEMP/repro-out"
+          tar -C "$RUNNER_TEMP/repro-out" -cf "$RUNNER_TEMP/repro-linux.tar" .
+          # Which hosted image this leg ran on, next to the tarball and outside
+          # the compared tree: the compare job names the pair.
+          printf 'ImageOS=%s\nImageVersion=%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}" > "$RUNNER_TEMP/repro-runner.txt"
+
+      - name: Upload leg r
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: repro-linux-r
+          path: |
+            ${{ runner.temp }}/repro-linux.tar
+            ${{ runner.temp }}/repro-runner.txt
+          if-no-files-found: error
+          # Artifacts are immutable per run: without this, a re-run of this job
+          # fails here (409) instead of replacing its own upload.
+          overwrite: true
+
+  macos:
+    name: macOS + iOS (leg ${{ matrix.leg }})
+    if: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds')) && (github.event.action != 'labeled' || github.event.label.name == 'reproducible-builds') }}
+    runs-on: macos-15
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [ a, b ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Select the pinned Xcode
+        uses: ./.github/actions/select-xcode
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4.9.1
+        with:
+          java-version-file: .java-version
+          distribution: 'temurin'
+
+      # The three build-xcframework.sh builds (device, arm64 and x86_64
+      # simulator), as ios-xcframework.yml installs them.
+      - name: Set up Rust (host + iOS targets)
+        uses: ./.github/actions/rust-toolchain
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Set up leg ${{ matrix.leg }}
+        id: leg
+        env:
+          LEG: ${{ matrix.leg }}
+        run: scripts/repro/setup_leg.sh "$LEG"
+
+      # The same tasks and heap as the release legs: desktop-dmg.yml's arm64
+      # dmg (JDK pinned through JAVA_HOME), ios-framework.yml's release
+      # MyotisKit (4 GB: the release link no longer fits -Xmx2g) and
+      # ios-xcframework.yml's MyotisEngine.
+      - name: Build
+        working-directory: ${{ steps.leg.outputs.src }}
+        run: |
+          set -euo pipefail
+          umask "$REPRO_UMASK"
+          chmod +x gradlew
+          gradle() {
+            for attempt in 1 2 3; do
+              ./gradlew -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g" \
+                -Porg.gradle.java.installations.auto-detect=false \
+                -Porg.gradle.java.installations.auto-download=false \
+                "-Porg.gradle.java.installations.paths=$JAVA_HOME" \
+                "$@" --stacktrace && return 0
+              [ "$attempt" -lt 3 ] || { echo "::error::build failed after 3 attempts"; exit 1; }
+              echo "::warning::build attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
+              sleep 25
+            done
+          }
+          gradle cargoBuildHost :app-desktop:createDistributable :app-ios:assembleMyotisKitReleaseXCFramework
+          # The dmg itself under umask 022, on both legs, as desktop-dmg.yml
+          # builds it: jpackage creates the .app's directories and its
+          # app/.package afresh for the dmg, with whatever umask it runs under
+          # (775 and 664 under leg b's 002), and nothing after it can put them
+          # right inside the image. Everything packageDmg takes in was built
+          # above, under the leg's own umask, and stays that way: the image
+          # task is excluded, so this run can only read the image, never
+          # rebuild it under 022. A second Gradle run, and a new JVM for it
+          # (GRADLE_OPTS above: no daemon), because a JVM cannot change its
+          # umask; the dmg task checks the one it runs under.
+          (umask 022 && gradle :app-desktop:packageDmg -x :app-desktop:createDistributable)
+          rust/build-xcframework.sh
+          (cd rust && . ./repro-env.sh && cargo build --locked -p myotis-node --release --target aarch64-apple-darwin)
+
+      # As a tarball: an uploaded artifact keeps neither file modes nor
+      # symlinks, and the comparison checks both.
+      - name: Collect
+        working-directory: ${{ steps.leg.outputs.src }}
+        run: |
+          set -euo pipefail
+          scripts/repro/collect.sh macos . "$RUNNER_TEMP/repro-out"
+          tar -C "$RUNNER_TEMP/repro-out" -cf "$RUNNER_TEMP/repro-macos.tar" .
+          # Which hosted image this leg ran on, next to the tarball and outside
+          # the compared tree: the compare job names the pair.
+          printf 'ImageOS=%s\nImageVersion=%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}" > "$RUNNER_TEMP/repro-runner.txt"
+
+      - name: Upload leg ${{ matrix.leg }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: repro-macos-${{ matrix.leg }}
+          path: |
+            ${{ runner.temp }}/repro-macos.tar
+            ${{ runner.temp }}/repro-runner.txt
+          if-no-files-found: error
+          # Artifacts are immutable per run: without this, a re-run of this job
+          # fails here (409) instead of replacing its own upload.
+          overwrite: true
+
+  windows:
+    name: Windows (leg ${{ matrix.leg }})
+    if: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds')) && (github.event.action != 'labeled' || github.event.label.name == 'reproducible-builds') }}
+    runs-on: windows-2025
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [ a, b ]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # As in desktop-windows-msi.yml: no CRLF conversion, so gradlew runs and
+      # the packaged app carries the same bytes as on the other platforms.
+      - name: Check out with LF line endings
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21 (x64)
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4.9.1
+        with:
+          java-version-file: .java-version
+          distribution: 'temurin'
+          architecture: x64
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-toolchain
+
+      # The same pinned WiX as desktop-windows-msi.yml (by sha256).
+      - name: Install WiX Toolset 3.14
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip'
+          $sha = '6ac824e1642d6f7277d0ed7ea09411a508f6116ba6fae0aa5f2c7daa2ff43d31'
+          $zip = Join-Path $env:RUNNER_TEMP 'wix314-binaries.zip'
+          $dir = Join-Path $env:RUNNER_TEMP 'wix314'
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $got = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
+          if ($got -ne $sha) {
+            Write-Output "::error::wix314-binaries.zip has sha256 $got, expected $sha"
+            exit 1
+          }
+          Expand-Archive -Path $zip -DestinationPath $dir
+          Add-Content -Path $env:GITHUB_PATH -Value $dir
+
+      - name: Set up leg ${{ matrix.leg }}
+        id: leg
+        env:
+          LEG: ${{ matrix.leg }}
+        run: scripts/repro/setup_leg.sh "$LEG"
+
+      - name: Build
+        working-directory: ${{ steps.leg.outputs.src }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            ./gradlew -Porg.gradle.java.installations.auto-detect=false \
+              -Porg.gradle.java.installations.auto-download=false \
+              "-Porg.gradle.java.installations.paths=$JAVA_HOME" \
+              cargoBuildHost :app-desktop:packageMsi --stacktrace && break
+            [ "$attempt" -lt 3 ] || { echo "::error::build failed after 3 attempts"; exit 1; }
+            echo "::warning::build attempt $attempt failed; retrying in 25s (transient dependency resolution?)"
+            sleep 25
+          done
+          (cd rust && . ./repro-env.sh && cargo build --locked -p myotis-node --release --target x86_64-pc-windows-msvc)
+
+      # As a tarball: an uploaded artifact keeps neither file modes nor
+      # symlinks, and the comparison checks both.
+      - name: Collect
+        working-directory: ${{ steps.leg.outputs.src }}
+        run: |
+          set -euo pipefail
+          scripts/repro/collect.sh windows . "$RUNNER_TEMP/repro-out"
+          # --force-local: Git Bash's GNU tar reads the colon in D:\a\_temp as
+          # a remote host:file archive otherwise (actions/toolkit passes it too).
+          tar --force-local -C "$RUNNER_TEMP/repro-out" -cf "$RUNNER_TEMP/repro-windows.tar" .
+          # Which hosted image this leg ran on, next to the tarball and outside
+          # the compared tree: the compare job names the pair.
+          printf 'ImageOS=%s\nImageVersion=%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}" > "$RUNNER_TEMP/repro-runner.txt"
+
+      - name: Upload leg ${{ matrix.leg }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: repro-windows-${{ matrix.leg }}
+          path: |
+            ${{ runner.temp }}/repro-windows.tar
+            ${{ runner.temp }}/repro-runner.txt
+          if-no-files-found: error
+          # Artifacts are immutable per run: without this, a re-run of this job
+          # fails here (409) instead of replacing its own upload.
+          overwrite: true
+
+  # A `v*` tag only: the rebuild in the builder image (leg a) against the
+  # Android assets the tag's release PUBLISHED, which the release workflows
+  # built on the hosted runner (android-apk.yml, engine-library.yml). This is
+  # the comparison the header calls the proof: not "two rebuilds agree" but
+  # "what people download is what the image builds". The unsigned release APK,
+  # the debug APK's payload and the engine library as staged are laid out like
+  # a leg's (collect.sh published) and compared by compare.py.
+  #
+  # REPORTED, NOT GATED, like the leg r comparison and for the same reason:
+  # what fails a run is the owner's decision (CLAUDE.md). The Maven-repository
+  # zip also carries what a linux leg does not build (the other platforms'
+  # natives jars, the iOS module), listed as "only in published", and a Linux
+  # natives jar from another builder (ubuntu-22.04). The job still FAILS when
+  # the comparison cannot be made: no leg a, or the assets never appear.
+  # The release's checksums and attestations are `verify release`'s job.
+  published:
+    name: Compare the image build with the published assets
+    needs: [ linux ]
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      # To see when the two publishing workflows are done (the wait below).
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Download leg a
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        continue-on-error: true
+        with:
+          name: repro-linux-a
+          path: tars/a
+
+      - name: Unpack leg a
+        run: |
+          set -euo pipefail
+          [ -f tars/a/repro-linux.tar ] \
+            || { echo "::error::leg a produced no artifacts (its build failed): nothing to set next to the published assets"; exit 1; }
+          mkdir -p legs/a
+          tar -C legs/a -xpf tars/a/repro-linux.tar
+          # Only what the published side can have: the Android artifacts and
+          # the engine library. A leg also carries the .deb with its whole
+          # payload and the host libraries, which would fill the report with
+          # "only in image" lines ahead of the ones that matter.
+          rm -r legs/a/desktop legs/a/host
+
+      # Before the wait, not after it: a missing tool should fail in the first
+      # minute. unzip unpacks the Maven-repository zip (collect.sh published);
+      # diffoscope only explains a difference, the verdict is the hash manifest.
+      - name: Install unzip and diffoscope
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends diffoscope-minimal unzip >/dev/null
+          diffoscope --version
+
+      # The three assets come from two workflows (Android APK, Engine library)
+      # with no ordering between them or with this one. SHA256SUMS lists an
+      # asset once its publisher has uploaded it, checked the release serves
+      # its bytes, and run its last step (.github/release-assets.sh). Polled
+      # once a minute, for up to four hours, but not past the point where the
+      # answer is known: once both workflows' runs for this tag are done and
+      # an asset is still not listed, it is not coming (a tag the version
+      # guard refused, a signing job that refused, a failed publish).
+      - name: Wait for the release's Android assets
+        run: |
+          set -euo pipefail
+          want="Myotis-$TAG-android-unsigned.apk Myotis-$TAG-android-debug.apk myotis-engine-$TAG-maven-repo.zip"
+          missing_now() {
+            local sums name
+            sums=$(gh release download "$TAG" --pattern SHA256SUMS --output - 2>/dev/null || true)
+            missing=""
+            for name in $want; do
+              printf '%s\n' "$sums" | grep -qF "  $name" || missing="$missing $name"
+            done
+          }
+          for minute in $(seq 1 240); do
+            missing_now
+            [ -n "$missing" ] || { echo "all three are published"; exit 0; }
+            # Not in the first minutes: the tag's other runs may not be listed yet.
+            if [ "$minute" -ge 5 ] && runs=$(gh api --paginate "repos/$GH_REPO/actions/runs?head_sha=$GITHUB_SHA&event=push&per_page=100" \
+                 --jq ".workflow_runs[] | select(.head_branch == \"$TAG\" and (.name == \"Android APK\" or .name == \"Engine library\")) | [.name, .status] | @tsv"); then
+              done_runs=$(printf '%s\n' "$runs" | awk -F'\t' '$2 == "completed" { print $1 }' | sort -u | wc -l)
+              running=$(printf '%s\n' "$runs" | awk -F'\t' '$1 != "" && $2 != "completed"' | wc -l)
+              if [ "$done_runs" -eq 2 ] && [ "$running" -eq 0 ]; then
+                missing_now   # once more: the last step of a run that just ended
+                [ -n "$missing" ] || { echo "all three are published"; exit 0; }
+                echo "::error::the Android APK and Engine library runs of $TAG are done, and the release still lacks:$missing"
+                exit 1
+              fi
+            fi
+            [ $((minute % 10)) -ne 1 ] || echo "minute $minute: not in the release's SHA256SUMS yet:$missing"
+            sleep 60
+          done
+          echo "::error::never published for $TAG:$missing"
+          exit 1
+
+      - name: Download them and lay them out like a leg
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --dir published-assets --pattern SHA256SUMS \
+            --pattern "Myotis-$TAG-android-unsigned.apk" --pattern "Myotis-$TAG-android-debug.apk" \
+            --pattern "myotis-engine-$TAG-maven-repo.zip"
+          (cd published-assets && sha256sum -c --ignore-missing SHA256SUMS)
+          scripts/repro/collect.sh published published-assets legs/published
+
+      - name: Compare the image build with the published assets
+        run: |
+          python3 -I scripts/repro/compare.py legs/a legs/published report scripts/repro/known-differences.txt \
+            --labels image published --report-only
+          # The two answers this job exists for, spelled out from the two
+          # manifests (compare.py writes "<sha256> <mode>  <path>" lines), ahead
+          # of the full list.
+          verdict() { # LABEL PATH-REGEX
+            local a b
+            a=$(awk -v g="$2" '{ p = $0; sub(/^[^ ]+ [^ ]+  /, "", p) } p ~ g { print $1 }' report/SHA256SUMS.a | sort -u)
+            b=$(awk -v g="$2" '{ p = $0; sub(/^[^ ]+ [^ ]+  /, "", p) } p ~ g { print $1 }' report/SHA256SUMS.b | sort -u)
+            if [ -z "$a" ] || [ -z "$b" ]; then echo "- **$1: not compared** (missing on one side)"
+            elif [ "$a" = "$b" ]; then echo "- **$1: identical** (\`$a\`)"
+            else echo "- **$1: DIFFERENT** (image \`$a\`, published \`$b\`)"; fi
+          }
+          {
+            echo "### The image build of $TAG against its published Android assets (not gated)"
+            verdict "Unsigned release APK" '^android/app-release-unsigned[.]apk$'
+            verdict "Engine library AAR" '^maven-repo/eth/myotis/myotis-engine-android/[^/]+/myotis-engine-android-[^/]+[.]aar$'
+            echo
+            echo '```'
+            head -n 80 report/summary.txt
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: repro-report-linux-image-vs-published
+          path: report
+          if-no-files-found: ignore
+          # Artifacts are immutable per run: without this, a re-run of this job
+          # fails here (409) instead of replacing its own upload.
+          overwrite: true
+
+  compare:
+    name: Compare ${{ matrix.name }}
+    needs: [ linux, linux-release-toolchain, macos, windows ]
+    # Also when a build leg failed: its platform then fails here with "leg
+    # missing" instead of the whole comparison quietly not running.
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'reproducible-builds')) && (github.event.action != 'labeled' || github.event.label.name == 'reproducible-builds') }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Which two legs, and compare.py's gate: what FAILS the run. See the
+          # header. An empty gate is compare.py's default, everything the two
+          # legs produced is gated (scripts/repro/test_compare.py holds that
+          # default). A missing leg fails in the Unpack step below.
+          - name: linux
+            platform: linux
+            first: a
+            second: b
+            gate: ""
+          # The image build against a build on the hosted runner's toolchain
+          # (leg r). REPORTED, NOT GATED: whether this comparison fails the run,
+          # and on which paths, is the owner's decision (the gate is legs a
+          # against b; CLAUDE.md). If it is gated one day, not on the
+          # Linux natives jar: it carries a host library linked by the
+          # builder's own gcc and glibc (the hosted image's moves with Ubuntu's
+          # updates), and the RELEASE's Linux natives come from neither side
+          # here but from ubuntu-22.04 (engine-library.yml, a glibc 2.35 floor).
+          - name: linux image vs runner toolchain
+            platform: linux
+            first: a
+            second: r
+            gate: "--report-only"
+          - name: macos
+            platform: macos
+            first: a
+            second: b
+            gate: ""
+          - name: windows
+            platform: windows
+            first: a
+            second: b
+            gate: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      # Into tars/a and tars/b whichever legs they are: compare.py's "leg a"
+      # is matrix.first and its "leg b" is matrix.second.
+      - name: Download leg ${{ matrix.first }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        continue-on-error: true
+        with:
+          name: repro-${{ matrix.platform }}-${{ matrix.first }}
+          path: tars/a
+
+      - name: Download leg ${{ matrix.second }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        continue-on-error: true
+        with:
+          name: repro-${{ matrix.platform }}-${{ matrix.second }}
+          path: tars/b
+
+      # On Linux both legs build in one image named by digest, so a difference
+      # is a leak in the build. On macOS and Windows the legs run on hosted
+      # runners of one image LABEL (macos-15, windows-2025). Xcode, the JDK,
+      # rustc and WiX are pinned on them; the MSVC toolset, the Windows SDK and
+      # macOS's own tools (codesign) are whatever the image carries, and while
+      # GitHub rolls a new image out, two jobs of one run can get two versions.
+      # A comparison that fails for that reason is still a failure (the two
+      # builds differ), but its cause is not in the tree: name the pair here,
+      # so that case is recognizable in the run before anyone hunts for a leak.
+      - name: Name the runner image of each leg
+        env:
+          FIRST: ${{ matrix.first }}
+          SECOND: ${{ matrix.second }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          image() { if [ -f "$1" ]; then tr '\n' ' ' < "$1" | sed 's/ $//'; else echo "not recorded"; fi; }
+          a=$(image tars/a/repro-runner.txt) b=$(image tars/b/repro-runner.txt)
+          echo "leg $FIRST: $a"
+          echo "leg $SECOND: $b"
+          if [ "$a" != "$b" ]; then
+            echo "::warning::$PLATFORM: legs $FIRST and $SECOND ran on different runner images ($a / $b). If the comparison below differs in a file a tool of the image writes (a linker, codesign), look here first: re-run once both legs get the same image."
+          fi
+
+      # -p: the modes as the leg recorded them, not this runner's umask.
+      # A missing leg fails a gated comparison (this step); on a report-only
+      # one (leg r) its own build job is already red, and there is nothing to
+      # compare.
+      - name: Unpack both legs
+        id: unpack
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          GATE: ${{ matrix.gate }}
+          FIRST: ${{ matrix.first }}
+          SECOND: ${{ matrix.second }}
+        run: |
+          set -euo pipefail
+          # tars/a holds leg $FIRST, tars/b leg $SECOND.
+          for pair in "a:$FIRST" "b:$SECOND"; do
+            dir=${pair%%:*} leg=${pair##*:}
+            tar="tars/$dir/repro-$PLATFORM.tar"
+            if [ ! -f "$tar" ]; then
+              if [ "$GATE" = "--report-only" ]; then
+                echo "::warning::leg $leg of $PLATFORM produced no artifacts (its build failed): nothing to compare"
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "::error::leg $leg of $PLATFORM produced no artifacts (its build failed)"; exit 1
+            fi
+            mkdir -p "legs/$dir"
+            tar -C "legs/$dir" -xpf "$tar"
+          done
+
+      # The archive's diffoscope: only to explain a difference, so the runner
+      # image's version is fine — the verdict is the hash manifest, not this.
+      - name: Install diffoscope
+        run: |
+          sudo apt-get update -qq
+          # llvm: llvm-readobj and llvm-objdump, with which diffoscope names a
+          # Mach-O difference by load command instead of as a hex dump.
+          sudo apt-get install -y -qq --no-install-recommends diffoscope-minimal unzip llvm >/dev/null
+          diffoscope --version
+
+      # $GATE unquoted on purpose: it is a list of compare.py arguments. set -f
+      # keeps the shell from expanding the globs in it.
+      - name: Compare the two legs
+        if: ${{ steps.unpack.outputs.skip != 'true' }}
+        env:
+          GATE: ${{ matrix.gate }}
+          FIRST: ${{ matrix.first }}
+          SECOND: ${{ matrix.second }}
+        run: |
+          set -f
+          python3 -I scripts/repro/compare.py legs/a legs/b report scripts/repro/known-differences.txt \
+            --labels "$FIRST" "$SECOND" $GATE
+
+      - name: Upload the report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: repro-report-${{ matrix.platform }}-${{ matrix.first }}-vs-${{ matrix.second }}
+          path: report
+          if-no-files-found: ignore
+          # Artifacts are immutable per run: without this, a re-run of this job
+          # fails here (409) instead of replacing its own upload.
+          overwrite: true

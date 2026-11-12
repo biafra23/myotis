@@ -16,22 +16,36 @@ on:
   push:
     branches: [ "main" ]
     tags: [ "v*" ]
-    paths: ['rust/**', '.github/workflows/ios-xcframework.yml']
+    paths: ['rust/**', '.github/workflows/ios-xcframework.yml', '.github/actions/rust-toolchain/**', '.github/actions/select-xcode/**', '.xcode-version']
   workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Read-only by default: the build job runs cargo build scripts. The release
+# job asks for what it writes.
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build MyotisEngine.xcframework
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
-      - name: Install iOS rust targets
-        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      # One Xcode for every macOS leg, from .xcode-version (#734).
+      - name: Select the pinned Xcode
+        uses: ./.github/actions/select-xcode
+      # The pinned toolchain (rust/rust-toolchain.toml, #734) WITH the iOS
+      # targets. A bare `rustup target add` from the repo root adds them to the
+      # image's DEFAULT toolchain, while build-xcframework.sh builds in rust/,
+      # where the pin selects 1.99.1 — which then has no iOS std the day the
+      # image's stable moves on.
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: rust
       - name: Build xcframework
@@ -40,13 +54,15 @@ jobs:
         run: |
           set -eu
           cd rust/target/ios-xcframework
-          # ditto preserves the framework bundle structure the way Xcode and
-          # SwiftPM binaryTarget consumers expect (plain zip loses resource
-          # forks / symlink layout on some setups).
-          ditto -c -k --sequesterRsrc --keepParent \
-            MyotisEngine.xcframework MyotisEngine.xcframework.zip
+          # Reproducibly (#734 D7), not with ditto: ditto records each file's
+          # build-time mtime as a LOCAL-time DOS stamp, the builder's uid/gid
+          # and any xattrs. repro_zip.sh keeps the bundle layout SwiftPM
+          # binaryTarget consumers expect: the .xcframework directory at the
+          # archive root, symlinks stored as links (zip -y). The framework
+          # carries no resource forks for ditto's --sequesterRsrc to keep.
+          ../../../scripts/repro_zip.sh . MyotisEngine.xcframework MyotisEngine.xcframework.zip
           shasum -a 256 MyotisEngine.xcframework.zip | tee MyotisEngine.xcframework.zip.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: MyotisEngine.xcframework.zip
           path: |
@@ -81,15 +97,19 @@ jobs:
     # skipped underneath it — both run on a tag ref, both skip otherwise.
     needs: [build, version-guard]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
+      # The build-provenance attestation of the uploaded assets (#734): an OIDC
+      # token for the Sigstore certificate, and the attestation's storage.
+      id-token: write
+      attestations: write
     steps:
       # Checked out because the ABI version is read from its source of truth
       # in myotis-engine; this also gives gh its repo context.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - name: Download xcframework artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: MyotisEngine.xcframework.zip
           path: dist
@@ -117,7 +137,23 @@ jobs:
           # another publisher created the release, re-appended when a concurrent
           # edit dropped it (.github/release-notes.sh explains the race).
           bash .github/release-notes.sh create "$tag" "$section"
-          gh release upload "$tag" --clobber \
+          # Upload, and check that the release serves these bytes.
+          bash .github/release-assets.sh "$tag" \
             dist/MyotisEngine.xcframework.zip \
             dist/MyotisEngine.xcframework.zip.sha256
           bash .github/release-notes.sh append "$tag" "$section"
+
+      - name: Attest the MyotisEngine xcframework's build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/release-assets.SHA256SUMS
+
+      # Last, and also when the attestation failed: SHA256SUMS is the one file
+      # all publishers share, kept apart from this job's own upload and
+      # attestation (.github/release-assets.sh).
+      - name: List the release's assets in SHA256SUMS
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: bash .github/release-assets.sh --checksums "${GITHUB_REF_NAME}"

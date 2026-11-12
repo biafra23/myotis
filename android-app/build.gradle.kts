@@ -80,7 +80,6 @@ val rpcUpstream: String = run {
     if (lp.exists()) lp.inputStream().use { props.load(it) }
     props.getProperty("rpc.upstream", "")
 }
-
 // Derived from the project version so a release sweep can't leave the app
 // reporting a stale version in Settings → Apps, the same way :app-desktop
 // derives its installer versions. 0.1.4-SNAPSHOT -> 0.1.4.
@@ -96,6 +95,12 @@ val derivedVersionCode: Int = rootProject.extra["releaseBuildNumber"] as Int
 android {
     namespace = "com.jaeckel.ethp2p.android"
     compileSdk = 35
+    // Pinned exactly (#734): AGP strips the packaged .so files with this NDK's
+    // llvm-strip (an unpinned NDK leaves them unstripped or strips them with
+    // whatever is installed), and build-tools is the same version
+    // scripts/sign_release_apk.sh signs with. Both from gradle/libs.versions.toml.
+    ndkVersion = libs.versions.android.ndk.get()
+    buildToolsVersion = libs.versions.android.build.tools.get()
     // The app has NO jniLibs of its own: every native lib it ships (the engine,
     // native BLS, JNA's dispatcher) arrives inside the engine library's AAR. Said
     // explicitly because AGP's default src/main/jniLibs is where cargoNdkAndroid
@@ -111,7 +116,11 @@ android {
         targetSdk = 34
         versionCode = derivedVersionCode // see derivedVersionCode above
         versionName = releaseVersion
-        buildConfigField("String", "RPC_UPSTREAM", "\"$rpcUpstream\"")
+        // Empty by default: a RELEASE never carries a proxy (#734 D5). The
+        // value comes from a builder's gitignored local.properties, so in a
+        // release it would make the APK differ from every other build of the
+        // commit — and ship an unverified upstream. Debug builds get it below.
+        buildConfigField("String", "RPC_UPSTREAM", "\"\"")
         // -PtorEngine (root build.gradle.kts): whether these jniLibs were built with
         // Arti. Lets a Tor-less APK answer "no Tor" without loading the engine library.
         buildConfigField("boolean", "TOR_ENGINE", (rootProject.extra["torEngine"] as Boolean).toString())
@@ -168,6 +177,8 @@ android {
         debug {
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
+            // local.properties' rpc.upstream, debug-only (see defaultConfig).
+            buildConfigField("String", "RPC_UPSTREAM", "\"$rpcUpstream\"")
         }
         // No signingConfig ON PURPOSE: assembleRelease writes
         // android-app-release-unsigned.apk, and only the tag-only signing job in
@@ -177,7 +188,25 @@ android {
         // cargo build, third-party plugins and build scripts included.
         release {
             isMinifyEnabled = false
+            // AGP writes META-INF/version-control-info.textproto from the git
+            // checkout: the commit in a clone, `NO_VALID_GIT_FOUND` in a source
+            // tarball or a git worktree. So the APK's bytes depended on HOW the
+            // tree was checked out, which a rebuilder cannot be asked to match
+            // (#734, Part 5a: the two legs differed in exactly this file). The
+            // commit is the release's; its provenance is the release
+            // attestation, not a file inside the APK.
+            vcsInfo { include = false }
         }
+    }
+
+    // AGP otherwise embeds an encrypted block of dependency information, signed
+    // with a Google key, in the APK and the bundle: bytes no one else can
+    // reproduce or read (#734 D5; F-Droid's reproducible-build verifier rejects
+    // it for the same reason). The dependency list is public anyway — the
+    // lockfiles and verification metadata pin it.
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
     }
 
     testOptions {

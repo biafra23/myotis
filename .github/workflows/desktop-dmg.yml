@@ -116,7 +116,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           submodules: recursive
           # Full history: :ui stamps the app's on-screen version from the nearest
@@ -133,6 +133,9 @@ jobs:
           # base) and lose the integration signal. The base version is still right,
           # since the merge commit reaches the tag through its base parent.
           fetch-depth: 0
+      # One Xcode for every macOS leg, from .xcode-version (#734).
+      - name: Select the pinned Xcode
+        uses: ./.github/actions/select-xcode
 
       # Rosetta 2 lets the x86_64 JDK (and the jlink/jpackage it drives) execute on the arm64
       # runner. Needed only for the cross-built x64 job. We deliberately do NOT blanket `|| true`:
@@ -156,9 +159,9 @@ jobs:
       # Installs a JDK 21 of the requested architecture and points JAVA_HOME at it. For x64 this
       # is the x86_64 Temurin build (run via Rosetta); for arm64 the native aarch64 build.
       - name: Set up JDK 21 (${{ matrix.java-arch }})
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4.9.1
         with:
-          java-version: '21'
+          java-version-file: .java-version  # exact Temurin release, one place (#734)
           distribution: 'temurin'
           architecture: ${{ matrix.java-arch }}
 
@@ -166,7 +169,7 @@ jobs:
       # source here. prepareRustAppResources fails the build if the lib is
       # missing, so this step is REQUIRED, not optional.
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/rust-toolchain
         with:
           # Both matrix legs run on arm64 macos-15; the x64 leg is a Rosetta
           # cross-build. cargo builds its HOST triple regardless of the JVM's
@@ -175,12 +178,12 @@ jobs:
           targets: ${{ matrix.arch == 'x64' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin' }}
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: rust
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a  # v4.4.3
 
       - name: Make gradlew executable
         run: chmod +x gradlew
@@ -204,6 +207,11 @@ jobs:
           # down the arm64 leg's first CI run).
           RUST_TARGET: ${{ matrix.arch == 'x64' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin' }}
         run: |
+          # Stated, not inherited (#734): jpackage creates the .app's directories
+          # for the dmg with the umask it runs under, so the umask is an input of
+          # the dmg. 022 is what the runner has anyway, and what
+          # reproducible-builds.yml packages both its legs with.
+          umask 022
           GRADLE_ARGS="-Porg.gradle.java.installations.auto-detect=false -Porg.gradle.java.installations.auto-download=false -Porg.gradle.java.installations.paths=$JAVA_HOME"
           FLAVOR_ARGS="${{ matrix.gradle-args }}"
           for attempt in 1 2 3; do
@@ -348,7 +356,7 @@ jobs:
           echo "OK: the ${{ matrix.flavor }} dmg carries no RAILGUN PoC seed"
 
       - name: Upload DMG
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: ${{ matrix.artifact }}-${{ github.sha }}
           path: app-desktop/build/compose/binaries/main/dmg/*.dmg
@@ -383,20 +391,26 @@ jobs:
     # skipped underneath it — on a tag push both run, otherwise both are skipped.
     needs: [build, version-guard]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       # gh release create/upload needs write access to Releases (repo contents).
       contents: write
+      # The build-provenance attestation of the uploaded assets (#734): an OIDC
+      # token for the Sigstore certificate, and the attestation's storage.
+      id-token: write
+      attestations: write
     steps:
-      # Only the shared release notes and the script that writes them
-      # (.github/release-notes.*), from the commit being released. First, so
+      # Only the shared release notes, the script that writes them
+      # (.github/release-notes.*) and the one that uploads
+      # (.github/release-assets.sh), from the commit being released. First, so
       # the artifacts below land in the checked-out workspace, not under it.
       - name: Check out the release notes
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           sparse-checkout: |
             .github/release-notes.md
             .github/release-notes.sh
+            .github/release-assets.sh
           sparse-checkout-cone-mode: false
           # gh takes the token from the publish step's env; keep the job's
           # write token out of .git/config.
@@ -404,7 +418,7 @@ jobs:
       # Both matrix jobs' artifacts (Myotis-arm64.dmg, Myotis-x64.dmg) land under
       # dmg/ — they were already arch-tagged and verified in the build job.
       - name: Download dmg artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           # Both standard dmgs plus, when its leg succeeded, the Bee PoC dmg.
           pattern: myotis-*-dmg-*-${{ github.sha }}
@@ -450,9 +464,49 @@ jobs:
           # Create the release with the master notes (.github/release-notes.md),
           # unless another publisher already did — see .github/release-notes.sh.
           bash .github/release-notes.sh create "$tag"
-          gh release upload "$tag" "dmg/Myotis-${tag}-arm64.dmg" "dmg/Myotis-${tag}-x64.dmg" --clobber
+          # Upload, and check that the release serves these bytes.
+          bash .github/release-assets.sh "$tag" "dmg/Myotis-${tag}-arm64.dmg" "dmg/Myotis-${tag}-x64.dmg"
+
+      - name: Attest the dmgs' build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/release-assets.SHA256SUMS
+
+      # The Bee PoC dmg after the standard ones are published AND attested, in
+      # steps of its own that may fail: on a tag no bundle may hold back the
+      # standard assets (CLAUDE.md), their attestation included. Its own
+      # subjects file, so its attestation names only it.
+      - name: Publish the Bee PoC dmg
+        id: bee
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_ASSETS_SUBJECTS: ${{ runner.temp }}/release-assets-bee.SHA256SUMS
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
           if [ -f "dmg/Myotis-${tag}-bee-poc-arm64.dmg" ]; then
-            gh release upload "$tag" "dmg/Myotis-${tag}-bee-poc-arm64.dmg" --clobber
+            bash .github/release-assets.sh "$tag" "dmg/Myotis-${tag}-bee-poc-arm64.dmg"
+            echo "published=true" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::no Bee PoC dmg produced for this tag — release published without it"
           fi
+
+      # (Not hashFiles on the subjects file: it only sees the workspace.)
+      - name: Attest the Bee PoC dmg's build provenance
+        if: ${{ steps.bee.outputs.published == 'true' }}
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/release-assets-bee.SHA256SUMS
+
+      # Last, and also when the attestation failed: SHA256SUMS is the one file
+      # all publishers share, kept apart from this job's own upload and
+      # attestation (.github/release-assets.sh).
+      - name: List the release's assets in SHA256SUMS
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: bash .github/release-assets.sh --checksums "${GITHUB_REF_NAME}"

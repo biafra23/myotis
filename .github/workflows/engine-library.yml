@@ -43,7 +43,15 @@ on:
       - 'rust/**'
       - 'scripts/check_engine_library.sh'
       - 'scripts/merge_maven_repo.py'
+      - 'scripts/normalize_maven_metadata.py'
+      - 'scripts/check_16k_alignment.py'
+      - 'scripts/repro_zip.sh'
       - '.github/workflows/engine-library.yml'
+      - '.java-version'
+      - '.xcode-version'
+      - '.github/actions/select-xcode/**'
+      - '.github/actions/android-native-toolchain/**'
+      - '.github/actions/rust-toolchain/**'
       - '.github/actions/stage-engine-library/**'
       - '.github/workflows/release-version-guard.yml'
   workflow_dispatch:
@@ -82,21 +90,24 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      # One Xcode for every macOS leg, from .xcode-version (#734).
+      - name: Select the pinned Xcode
+        uses: ./.github/actions/select-xcode
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4.9.1
         with:
-          java-version: '21'
+          java-version-file: .java-version  # exact Temurin release, one place (#734)
           distribution: 'temurin'
 
       - name: Set up Rust (${{ matrix.target }})
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/rust-toolchain
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: rust
           shared-key: engine-natives-${{ matrix.prefix }}
@@ -104,7 +115,7 @@ jobs:
           save-if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a  # v4.4.3
 
       - name: Build the host library
         env:
@@ -129,7 +140,7 @@ jobs:
           file "build/engine-natives/${{ matrix.prefix }}/${{ matrix.library }}"
 
       - name: Upload the host library
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: engine-natives-${{ matrix.prefix }}-${{ github.sha }}
           path: build/engine-natives
@@ -168,22 +179,25 @@ jobs:
       packages: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      # One Xcode for every macOS leg, from .xcode-version (#734).
+      - name: Select the pinned Xcode
+        uses: ./.github/actions/select-xcode
 
       - name: Set up JDK 21 (aarch64)
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4.9.1
         with:
-          java-version: '21'
+          java-version-file: .java-version  # exact Temurin release, one place (#734)
           distribution: 'temurin'
           architecture: 'aarch64'
 
       - name: Set up Rust (iOS targets)
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/rust-toolchain
         with:
           targets: aarch64-apple-ios, aarch64-apple-ios-sim
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: rust
           shared-key: engine-ios
@@ -191,7 +205,7 @@ jobs:
           save-if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a  # v4.4.3
 
       - name: Stage the iOS module
         run: |
@@ -249,7 +263,7 @@ jobs:
         run: ./gradlew "$STAGE_FLAG" :myotis-engine-ios:publishAllPublicationsToGitHubPackagesRepository --stacktrace
 
       - name: Upload the staged iOS module
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: engine-ios-${{ github.sha }}
           path: build/maven-repo
@@ -270,7 +284,7 @@ jobs:
     if: >-
       ${{ !cancelled() && !startsWith(github.ref, 'refs/tags/v')
           && needs.host-natives.result == 'success' && needs.ios-engine.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # A wedged cargo-ndk or Gradle daemon must not hold the runner for the
     # 6-hour default (android-apk.yml's budget for the same build).
     timeout-minutes: 60
@@ -278,17 +292,17 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
       - name: Download the host libraries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           pattern: engine-natives-*-${{ github.sha }}
           path: build/engine-natives
           merge-multiple: true
 
       - name: Download the staged iOS module
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: engine-ios-${{ github.sha }}
           path: build/engine-ios
@@ -300,7 +314,7 @@ jobs:
           ios-dir: build/engine-ios
 
       - name: Upload the staged repository
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: engine-library-maven-repo-${{ github.sha }}
           path: build/maven-repo
@@ -326,32 +340,34 @@ jobs:
   # repository's Packages page. Then "Re-run all jobs", not "Re-run failed
   # jobs": eth.myotis:myotis-engine-ios is published by the ios-engine job,
   # which a failed-jobs re-run leaves out (the step after the Gradle publish
-  # fails the run if the module is missing). The release assets re-upload
-  # with --clobber.
+  # fails the run if the module is missing). The release assets are NOT part
+  # of that: the `release` job below attaches them from the staged repository
+  # this job uploads, and "Re-run failed jobs" re-runs it alone.
   publish:
-    name: Publish to GitHub Packages and the release
+    name: Publish to GitHub Packages
     needs: [version-guard, host-natives, ios-engine]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     permissions:
-      # gh release create/upload/edit needs write access to Releases; the Maven
-      # publish needs write access to Packages.
-      contents: write
+      # Read-only on the repository: the release upload and its attestation
+      # are the `release` job's, which runs no build (#734). The Maven publish
+      # needs write access to Packages.
+      contents: read
       packages: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
       - name: Download the host libraries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           pattern: engine-natives-*-${{ github.sha }}
           path: build/engine-natives
           merge-multiple: true
 
       - name: Download the staged iOS module
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: engine-ios-${{ github.sha }}
           path: build/engine-ios
@@ -391,27 +407,123 @@ jobs:
           v="${GITHUB_REF_NAME#v}"
           for a in myotis-engine-ios myotis-engine-ios-iosarm64 myotis-engine-ios-iossimulatorarm64; do
             url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/eth/myotis/$a/$v/$a-$v.pom"
-            curl -fsS -o /dev/null -u "${GITHUB_ACTOR}:${GITHUB_TOKEN}" "$url" \
-              || { echo "::error::eth.myotis:$a:$v is not on GitHub Packages — re-run ALL jobs (the ios-engine job publishes it)"; exit 1; }
+            # Retried: this runs after the irrevocable publish, where a failed job
+            # cannot simply be re-run (see this job's header).
+            curl -fsS --retry 5 --retry-all-errors --retry-delay 3 --max-time 300 -o /dev/null \
+              -u "${GITHUB_ACTOR}:${GITHUB_TOKEN}" "$url" \
+              || { echo "::error::eth.myotis:$a:$v is not on GitHub Packages (or could not be fetched after 6 attempts) — re-run ALL jobs (the ios-engine job publishes it)"; exit 1; }
           done
 
+      # Published == staged (#734 D8). The publish above is a SECOND Gradle run;
+      # it uploads the staged bytes only as long as nothing re-ran in between.
+      # Read every published artifact back and compare it with the staged copy
+      # that the checks above passed and that the zip and the maven-repo branch
+      # carry. Primary files only (jars, aars, poms, modules, klibs): the
+      # registry keeps its own maven-metadata, and checksum sidecars derive
+      # from the files (GitHub Packages need not store .sha256/.sha512). After
+      # the iOS check, so a missing iOS module still gets that step's hint.
+      # Before the upload below on purpose: a version whose published bytes
+      # are not the checked ones does not go onto the maven-repo branch.
+      - name: Check the published bytes are the staged ones
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF_NAME#v}"
+          tmp=$(mktemp -d); n=0
+          while IFS= read -r f; do
+            rel=${f#build/maven-repo/}
+            # Retried (a transient 5xx, a timeout or a read-after-write 404), and a
+            # file that could not be fetched is reported as that, not as a
+            # difference: this runs after the irrevocable publish.
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 --max-time 300 \
+              -u "${GITHUB_ACTOR}:${GITHUB_TOKEN}" -o "$tmp/x" \
+              "https://maven.pkg.github.com/${GITHUB_REPOSITORY}/$rel" \
+              || { echo "::error::$rel could not be fetched from GitHub Packages after 6 attempts (not a byte difference: the check did not get that far)"; exit 1; }
+            cmp -s "$f" "$tmp/x" || { echo "::error::$rel on GitHub Packages differs from the staged, checked copy"; exit 1; }
+            n=$((n + 1))
+          done < <(find build/maven-repo/eth/myotis -path "*/$v/*" -type f ! -name 'maven-metadata*' \
+                     ! -name '*.md5' ! -name '*.sha1' ! -name '*.sha256' ! -name '*.sha512' | LC_ALL=C sort)
+          [ "$n" -gt 0 ] || { echo "::error::no staged files for $v"; exit 1; }
+          echo "all $n published files match the staged publication"
+
       # The staged repository, for the maven-repo job below — uploaded the
-      # moment the version is irrevocably on GitHub Packages, so "the artifact
-      # exists" means exactly "this version is published and belongs on the
-      # branch": a failure later in this job (a release upload blip) still gets
+      # moment the version is irrevocably on GitHub Packages and its bytes are
+      # checked, so "the artifact exists" means exactly "this version is
+      # published and belongs on the branch": a failure later in this job (a release upload blip) still gets
       # the branch published, and a failure earlier does not. Overwritable: a
       # re-run of this job (after deleting the package versions, see the job's
       # note) uploads it again under the same run. Kept the default 90 days:
       # that is how long "re-run failed jobs" can repair the branch job alone.
       - name: Upload the staged repository for the maven-repo branch
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: engine-library-maven-repo-release-${{ github.sha }}
           path: build/maven-repo
           if-no-files-found: error
           overwrite: true
 
+  # The release's assets: the AAR, the Maven-repository zip and their checksum
+  # file, with their build-provenance attestation (#734).
+  #
+  # Its own job, like maven-repo-branch below and for the same reason: it is
+  # keyed on the staged repository the publish job uploads once the version is
+  # on GitHub Packages, so it runs whenever that job got that far, and a
+  # failure HERE (a release upload blip, Sigstore having a bad minute) is
+  # repaired with "re-run failed jobs", which re-runs this job alone and never
+  # the Packages publish that would refuse its own version. And it runs no
+  # build: the job that holds the attestation permissions only downloads an
+  # artifact, zips it and uploads, as the other publishers' release jobs do.
+  # The zip is made here, from the same tree: repro_zip.sh gives every entry
+  # one mtime and fixed modes, so it does not matter that an artifact carries
+  # neither.
+  release:
+    name: Attach the engine library to the release
+    needs: publish
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    permissions:
+      # gh release create/upload/edit needs write access to Releases.
+      contents: write
+      # The build-provenance attestation of the uploaded assets (#734): an OIDC
+      # token for the Sigstore certificate, and the attestation's storage.
+      id-token: write
+      attestations: write
+    steps:
+      # The release notes and the scripts that write them and upload, plus the
+      # zip script, from the commit being released (its commit time is the
+      # zip's one mtime).
+      - name: Check out the release scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          sparse-checkout: |
+            .github/release-notes.md
+            .github/release-notes.sh
+            .github/release-assets.sh
+            scripts/repro_zip.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      # Absent when the publish job failed before the version reached GitHub
+      # Packages: then there is nothing to attach, and this job says so
+      # instead of failing. After a SUCCESSFUL publish a download failure is a
+      # real error and fails the job, for "re-run failed jobs" to retry.
+      - name: Download the staged repository
+        id: staged
+        continue-on-error: ${{ needs.publish.result != 'success' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: engine-library-maven-repo-release-${{ github.sha }}
+          path: build/maven-repo
+
+      - name: Nothing to attach
+        if: steps.staged.outcome != 'success'
+        run: |
+          echo "the publish job did not reach GitHub Packages for ${GITHUB_REF_NAME} (its result: ${{ needs.publish.result }}); no engine-library assets go on the release" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Assemble the release assets
+        if: steps.staged.outcome == 'success'
         run: |
           set -euo pipefail
           # The tag goes into the asset file names (as for the APK and the dmg).
@@ -426,12 +538,17 @@ jobs:
              "assets/myotis-engine-${GITHUB_REF_NAME}-android.aar"
           # The whole staged repository: unzip it and point Gradle at the
           # directory, and no GitHub token is needed (docs/guides/android-library.md).
-          (cd build/maven-repo && zip -qr "../../assets/myotis-engine-${GITHUB_REF_NAME}-maven-repo.zip" eth)
+          # Zipped reproducibly (#734 D7): one mtime, sorted entries, fixed
+          # modes; its content too, since the staging action normalized
+          # maven-metadata.xml's <lastUpdated> (scripts/normalize_maven_metadata.py).
+          scripts/repro_zip.sh build/maven-repo eth "assets/myotis-engine-${GITHUB_REF_NAME}-maven-repo.zip"
           (cd assets && sha256sum myotis-engine-*.aar myotis-engine-*.zip > myotis-engine.SHA256SUMS && cat myotis-engine.SHA256SUMS)
 
       - name: Publish to GitHub Release
+        if: steps.staged.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -eu
           tag="${GITHUB_REF_NAME}"
@@ -459,9 +576,26 @@ jobs:
           # another publisher created the release, re-appended when a concurrent
           # edit dropped it (.github/release-notes.sh explains the race).
           bash .github/release-notes.sh create "$tag" "$section"
-          gh release upload "$tag" \
-            assets/myotis-engine-*.aar assets/myotis-engine-*.zip assets/myotis-engine.SHA256SUMS --clobber
+          # Upload, and check that the release serves these bytes.
+          bash .github/release-assets.sh "$tag" \
+            assets/myotis-engine-*.aar assets/myotis-engine-*.zip assets/myotis-engine.SHA256SUMS
           bash .github/release-notes.sh append "$tag" "$section"
+
+      - name: Attest the engine library's build provenance
+        if: steps.staged.outcome == 'success'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/release-assets.SHA256SUMS
+
+      # Last, and also when the attestation failed: SHA256SUMS is the one file
+      # all publishers share, kept apart from this job's own upload and
+      # attestation (.github/release-assets.sh).
+      - name: List the release's assets in SHA256SUMS
+        if: ${{ !cancelled() && steps.staged.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: bash .github/release-assets.sh --checksums "${GITHUB_REF_NAME}"
 
   # The same staged repository as a Maven repository URL that needs no token:
   # merged into the `maven-repo` branch (an orphan branch holding nothing but
@@ -486,7 +620,7 @@ jobs:
     # still gets its branch publish; the tag test keeps the job off every
     # other event, where `publish` is skipped.
     if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: write
@@ -494,7 +628,7 @@ jobs:
       # Only scripts/merge_maven_repo.py is needed from the tree; the branch
       # itself is cloned separately.
       - name: Checkout the merge script
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           sparse-checkout: scripts/merge_maven_repo.py
           sparse-checkout-cone-mode: false
@@ -508,7 +642,7 @@ jobs:
       - name: Download the staged repository
         id: staged
         continue-on-error: ${{ needs.publish.result != 'success' }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: engine-library-maven-repo-release-${{ github.sha }}
           path: build/maven-repo

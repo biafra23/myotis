@@ -65,7 +65,7 @@ on:
 jobs:
   wait:
     name: Wait for claude-review
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # See FAIL-OPEN above: a failure here must not stop the jobs behind it.
     continue-on-error: true
     # A backstop above the script's own bound (MAX_WAIT_SECONDS plus a few slow
