@@ -32,13 +32,19 @@ toml() { sed -n "s/^$1 *= *\"\([^\"]*\)\".*/\1/p" "$root/gradle/libs.versions.to
 jdk=$(tr -d '[:space:]' < "$root/.java-version")
 rust=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' "$root/rust/rust-toolchain.toml")
 ndk=$(toml android-ndk) build_tools=$(toml android-build-tools) cargo_ndk=$(toml cargo-ndk)
-for name in jdk rust ndk build_tools cargo_ndk; do
+go=$(sed -n 's/^go \([0-9][0-9.]*\) *$/\1/p' "$root/go/go.mod")
+for name in jdk rust ndk build_tools cargo_ndk go; do
     [[ -n "${!name}" ]] || { echo "build.sh: could not read the $name pin" >&2; exit 1; }
 done
 
 [[ "$jdk" == "$JDK_VERSION" ]] || {
     echo "build.sh: .java-version says $jdk, but docker/builder/pins.env has the build number and hash of $JDK_VERSION." >&2
     echo "          Move JDK_VERSION, JDK_BUILD and JDK_SHA256 there in the same change." >&2
+    exit 1
+}
+[[ "$go" == "$GO_VERSION" ]] || {
+    echo "build.sh: go/go.mod says go $go, but docker/builder/pins.env has the hash of Go $GO_VERSION." >&2
+    echo "          Move GO_VERSION and GO_SHA256 there in the same change." >&2
     exit 1
 }
 for f in android-app/build.gradle.kts myotis-engine/build.gradle.kts ui/build.gradle.kts; do
@@ -60,6 +66,7 @@ args=(
     "ANDROID_NDK=$ndk" "ANDROID_BUILD_TOOLS=$build_tools"
     "ANDROID_PLATFORM=$ANDROID_PLATFORM" "ANDROID_PLATFORM_REVISION=$ANDROID_PLATFORM_REVISION"
     "ANDROID_PLATFORM_ARCHIVE=$ANDROID_PLATFORM_ARCHIVE" "ANDROID_PLATFORM_SHA256=$ANDROID_PLATFORM_SHA256"
+    "GO_VERSION=$GO_VERSION" "GO_SHA256=$GO_SHA256"
 )
 if $print_only; then
     printf '%s\n' "${args[@]}"

@@ -66,6 +66,8 @@ fi
 check "apt sources (the only ones)" "https://snapshot.ubuntu.com/ubuntu/$(want APT_SNAPSHOT)" \
     "$(in_image 'cat /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null | sed -n "s/^URIs: //p; s/^deb [^ ]* \([^ ]*\).*/\1/p" | sort -u | tr "\n" " " | sed "s/ $//"')"
 check "en_US.UTF-8 locale" "en_US.utf8" "$(in_image 'locale -a | grep -ix "en_US.utf8"')"
+check "Go" "go version go$(want GO_VERSION) linux/amd64" "$(in_image 'go version')"
+check "Go toolchain is local only" "local" "$(in_image 'go env GOTOOLCHAIN')"
 check "fakeroot + dpkg-deb + cc" "ok" "$(in_image 'command -v fakeroot >/dev/null && command -v dpkg-deb >/dev/null && command -v cc >/dev/null && echo ok')"
 
 [[ $fail -eq 0 ]] || { echo "check.sh: $tag does not match its pins" >&2; exit 1; }

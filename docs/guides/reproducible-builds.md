@@ -37,6 +37,7 @@ differ in anything they produce ("gated", below).
 | Windows desktop | (no release asset yet) | **Gated**, by content: the files the msi installs. |
 | iOS frameworks | `MyotisEngine.xcframework.zip`, `MyotisKit.xcframework.zip` | **Gated.** Bit for bit, the zips and their trees. |
 | Node addon | `myotis-node.<platform>.node` | **Gated** for three of the five published: Linux x64, macOS arm64, Windows x64. Linux arm64 and macOS x64 are not rebuilt. |
+| Go engine | (no release asset yet) | **Gated** for Linux x64: `myotis-go` and `myotis-lc`, bit for bit, built in the builder image (`-trimpath`, cgo on for blst). |
 | Daemon jars | `*-SNAPSHOT.jar` | Not compared. |
 
 Android came first, on purpose: it is the artifact that holds a wallet. The
@@ -150,13 +151,15 @@ The reference toolchain for the Android artifacts is a container image,
 | rustup, rustc | SHA-256 of `rustup-init`; exact rustc from `rust/rust-toolchain.toml` |
 | Android command-line tools, platform | SHA-256 of the archives |
 | NDK, build-tools, cargo-ndk | exact versions from `gradle/libs.versions.toml` |
+| Go | SHA-256 of go.dev's archive; version from `go/go.mod` |
 
 `docker/builder/pins.env` holds the pins that exist only for the image; every
 other version is read from the one file that pins it for the build itself. The
 build's dependencies are pinned separately, by version and by hash: Gradle's
 in `gradle.lockfile`s and `gradle/verification-metadata.xml`
 ([gradle-dependency-pins.md](gradle-dependency-pins.md)), Cargo's in the three
-`Cargo.lock` files, used with `--locked`.
+`Cargo.lock` files, used with `--locked`; the Go engine's in `go/go.sum`, with
+`-mod=readonly`.
 
 ### The commands
 

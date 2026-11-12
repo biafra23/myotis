@@ -162,3 +162,21 @@ go run ./cmd/myotis-lc -once                     # LC alone: bootstrap → catch
 ```bash
 go test ./...
 ```
+
+## Reproducible build
+
+The two binaries are part of the reproducible-builds gate (`reproducible-builds.yml`,
+`Compare linux`): built twice, from different paths, homes, time zones and
+locales, as different users, they must come out bit for bit identical. The
+build is the one `scripts/repro/build_linux.sh` runs in the builder image
+(`docker/builder/`, which carries Go at `go.mod`'s exact version, by hash):
+
+```bash
+cd go
+GOTOOLCHAIN=local CGO_ENABLED=1 GOFLAGS="-trimpath -mod=readonly -buildvcs=false" \
+  go build -o ../build/go/ ./cmd/myotis-go ./cmd/myotis-lc
+```
+
+cgo stays on: blst (the BLS library) has Go bindings only through cgo, so the C
+compiler is a build input too, the image's. Moving the `go` line in `go.mod`
+moves `GO_VERSION`/`GO_SHA256` in `docker/builder/pins.env` in the same change.

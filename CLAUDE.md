@@ -485,8 +485,9 @@ desktop and Apple artifacts had reproduced). `Compare linux`, `Compare macos`
 and `Compare windows` each fail on any difference between their legs a and b:
 the unsigned release APK, the debug APK (by payload: its debug-key signature
 differs by design), the engine library as staged (the AAR, its jars, natives
-jars, poms and metadata) and the `.deb`; the dmg (by its `.app`) and the two
-xcframeworks; the msi (by the files it installs); and on each platform the
+jars, poms and metadata), the `.deb` and the Go engine's two binaries
+(`myotis-go`, `myotis-lc`; Linux only, owner's decision 2026-11-12); the dmg
+(by its `.app`) and the two xcframeworks; the msi (by the files it installs); and on each platform the
 host libraries: the engine library and the Node addon. Two comparisons are
 REPORTED and do not fail, because their second side is not a second build of
 the same kind: `Compare linux image vs runner toolchain`, and on a tag the

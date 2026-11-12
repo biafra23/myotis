@@ -28,7 +28,8 @@
 #   tier 1, bit-for-bit — the unsigned release APK; the engine library as
 #     staged (AAR, jars, natives jars, poms, modules, metadata); the Rust host
 #     libraries (.so / .dylib / .dll) and the Node addon; the Linux .deb; the
-#     two xcframeworks, as their release zips and as trees.
+#     two xcframeworks, as their release zips and as trees; on Linux, the Go
+#     engine's two binaries (go/: myotis-go, myotis-lc).
 #   by payload — the debug APK (its debug-key signature differs by design: the
 #     entries and their bytes are compared), the macOS dmg (its .app) and the
 #     Windows msi (its files, extracted by an administrative install).
@@ -51,7 +52,8 @@
 # the two legs build, 2026-11-11): any difference between legs a and b, on
 # every platform, and a missing leg a or b. `Compare linux`: the APKs
 # (android/), the engine library (maven-repo/: the AAR, its jars, natives jars
-# and metadata) and the .deb. `Compare macos`: the dmg's .app and both
+# and metadata), the .deb, and the Go engine's binaries (go/; owner's
+# decision, 2026-11-12: Linux only, cgo on because blst needs it). `Compare macos`: the dmg's .app and both
 # xcframeworks. `Compare windows`: the msi's files. And on each of the three,
 # host/: the engine library and the Node addon as that platform builds them
 # (.so, .dylib, .dll). The first runs had found the desktop and Apple
@@ -311,6 +313,14 @@ jobs:
 
       - name: Install the pinned NDK, build-tools and cargo-ndk
         uses: ./.github/actions/android-native-toolchain
+
+      # The Go engine's toolchain, at go/go.mod's exact version (the image
+      # has it by hash). No cache: leg r is a clean build like the others.
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: go/go.mod
+          cache: false
 
       - name: Set up leg r
         id: leg

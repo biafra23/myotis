@@ -15,11 +15,11 @@ trap 'rm -rf "$T"' EXIT
 
 # The copy sits two levels below a fake root that links the files build.sh reads.
 root="$T/root"; B="$root/docker/builder"
-mkdir -p "$B" "$root/gradle" "$root/rust" "$root/android-app" "$root/myotis-engine" "$root/ui"
+mkdir -p "$B" "$root/gradle" "$root/rust" "$root/android-app" "$root/myotis-engine" "$root/ui" "$root/go"
 cp "$here"/*.sh "$here/Dockerfile" "$here/pins.env" "$B/"
 repo=$(cd "$here/../.." && pwd)
 cp "$repo/.java-version" "$root/"; cp "$repo/rust/rust-toolchain.toml" "$root/rust/"
-cp "$repo/gradle/libs.versions.toml" "$root/gradle/"
+cp "$repo/gradle/libs.versions.toml" "$root/gradle/"; cp "$repo/go/go.mod" "$root/go/"
 for m in android-app myotis-engine ui; do cp "$repo/$m/build.gradle.kts" "$root/$m/"; done
 
 # The stub: $STUB/registry/<ref with / and : and @ as _> holds that ref's digest.

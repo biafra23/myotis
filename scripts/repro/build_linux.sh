@@ -9,9 +9,12 @@
 # library as staged (the AAR and its jars, poms and metadata).
 # scripts/repro/collect.sh gathers them afterwards.
 #
-# It also builds the Linux host libraries, the Node addon, the .deb and a
-# Linux natives jar, which the comparison of two such builds holds to the same
-# bytes like everything else. Those are NOT the release's
+# It also builds the Linux host libraries, the Node addon, the .deb, a Linux
+# natives jar and the Go engine's two binaries (go/cmd/myotis-go,
+# go/cmd/myotis-lc, into build/go/), which the comparison of two such builds
+# holds to the same bytes like everything else. Nothing publishes the Go
+# binaries yet: they are compared so that the day something does, it ships
+# bytes a third party can rebuild. Those are NOT the release's
 # bytes when built in the image: a release builds its Linux host libraries on
 # ubuntu-22.04 (engine-library.yml, for a glibc 2.35 floor) and stages the
 # natives of four platforms, and jpackage derives the .deb's Depends from the
@@ -70,3 +73,16 @@ done
 python3 -I scripts/normalize_maven_metadata.py build/maven-repo
 (cd rust && . ./repro-env.sh && cargo build --locked -p myotis-node --release --target x86_64-unknown-linux-gnu)
 python3 -I scripts/check_16k_alignment.py android-app/build/outputs/apk/release/*.apk
+
+# The Go engine. -trimpath keeps the checkout path and the module cache's
+# location out of the binary; -buildvcs=false keeps the VCS stamp out (a dirty
+# flag or a different HEAD would change the bytes); -mod=readonly refuses a
+# go.mod/go.sum the build would have to change; GOTOOLCHAIN=local refuses a
+# toolchain other than the installed one instead of downloading it. cgo stays
+# on: blst (BLS verification, the same C library the Rust engine links) has Go
+# bindings only through cgo, so the C compiler is a build input: the builder
+# image's, from the pinned apt snapshot (docker/builder/apt-packages.txt).
+# Module sources come through GOPROXY and are checked against go/go.sum.
+rm -rf build/go
+(cd go && GOTOOLCHAIN=local CGO_ENABLED=1 GOFLAGS="-trimpath -mod=readonly -buildvcs=false" \
+    go build -o ../build/go/ ./cmd/myotis-go ./cmd/myotis-lc)
