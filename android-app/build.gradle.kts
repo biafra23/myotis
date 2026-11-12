@@ -140,10 +140,6 @@ android {
         isCoreLibraryDesugaringEnabled = true
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-
     buildFeatures {
         compose = true
         buildConfig = true
@@ -312,6 +308,13 @@ android {
 //      and we don't admit Java 18+ language features.
 kotlin {
     jvmToolchain(21)
+    // The bytecode target, matching compileOptions above. Here rather than in
+    // `android { kotlinOptions { } }`: Kotlin 2.4 makes `kotlinOptions.jvmTarget`
+    // a compile error ("Please migrate to the compilerOptions DSL"), and this form
+    // works on the Kotlin the catalog pins today too (:myotis-engine-rust uses it).
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    }
 }
 
 // The Rust engine, its jniLibs and JNA's Android dispatcher all arrive through
