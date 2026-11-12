@@ -14,8 +14,11 @@
 # android-build-tools / cargo-ndk, .java-version, .xcode-version, the runner
 # image labels, and the test-only interpreters that still float on purpose
 # (setup-python `3.x` in mm-replay-tests.yml, Node `20` in smoke-gate-tests.yml:
-# neither touches a shipped artifact), and docs/tour/workbook/solution/Cargo.toml,
-# whose `=` pins of tokio and futures follow the workspace's by hand.
+# neither touches a shipped artifact), docs/tour/workbook/solution/Cargo.toml,
+# whose `=` pins of tokio and futures follow the workspace's by hand, the Go
+# engine's go/go.mod + go.sum, and scripts/swarm-cli/package-lock.json (the
+# swarm-cli that scripts/publish_site_swarm.mjs runs, which pulls in
+# @ethersphere/bee-js; security updates only).
 # claude-review.yml is excluded (see the github-actions entry).
 #
 # Grouped, and Cargo and Gradle monthly, so the routine moves arrive as a
@@ -69,7 +72,10 @@
 # usually caught and yanked within days, so the wait keeps Dependabot from
 # proposing one. Dependabot's own default is 3 days; this makes it longer and
 # visible. It does not delay SECURITY updates (Dependabot never applies a
-# cooldown to them). On GitHub Actions only `default-days` exists.
+# cooldown to them). On GitHub Actions only `default-days` exists. The same
+# 7 days hold for a HAND bump of the trees above that no entry covers: never
+# regenerate a lock onto a release younger than that (`npm install`, `npm
+# update`, `go get` take whatever is newest that minute).
 version: 2
 updates:
   - package-ecosystem: github-actions
