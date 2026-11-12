@@ -94,7 +94,7 @@ kotlin = "2.2.21"
 compose-bom = "2024.11.00"
 # Compose Multiplatform (shared UI for Android + Desktop + iOS). 1.9.x pairs with
 # Kotlin 2.2.20+. Uses the bundled compose-compiler plugin.
-compose-multiplatform = "1.9.3"
+compose-multiplatform = "1.12.2"
 activity-compose = "1.9.3"
 # JSON-RPC server (:jsonrpc-server). Ktor server+client + kotlinx are chosen for
 # Android compatibility (no java.net.http / com.sun.net.httpserver) and to match
