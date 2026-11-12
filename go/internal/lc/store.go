@@ -37,8 +37,15 @@ type Store struct {
 	optimisticSigSlot uint64
 
 	// finalizedLC keeps the finalized LightClientHeader so the payload's
-	// own state_root field stays reachable (FinalizedStateRoot).
+	// own state_root field stays reachable (FinalizedStateRoot), and the
+	// engine-API result shapes can report the anchor block's PROVEN
+	// number/timestamp/hash (lcHeader.Exec*).
 	finalizedLC *lcHeader
+	// optimisticLC likewise for the attested header — the engine-API
+	// shapes' optimisticBlockNumber is the attested payload's own number,
+	// never a stand-in. Same verification as finalizedLC (the update's
+	// execution branch checked it into the attested state).
+	optimisticLC *lcHeader
 }
 
 // NewFromBootstrap runs docs/spec/01 §9.1 in full before adopting
@@ -84,6 +91,7 @@ func NewFromBootstrap(b *Bootstrap, fork *ForkSchedule, c *chain.Consensus, trus
 		finalizedLC:      b.Header,
 		Optimistic:       b.Header.Beacon,
 		OptimisticExec:   b.Header.Exec,
+		optimisticLC:     b.Header,
 		// store.rs bootstrap init: optimistic_slot = header.beacon.slot
 		// (store.rs:67) — there is no signature slot at bootstrap.
 		optimisticSigSlot: b.Header.Beacon.Slot,
@@ -102,6 +110,28 @@ func (s *Store) FinalizedStateRoot() hash32 {
 		return hash32{}
 	}
 	return s.finalizedLC.ExecStateRoot
+}
+
+// FinalizedExecInfo returns the finalized anchor block's PROVEN exec-block
+// coordinates (number, timestamp, hash) — the lcHeader.Exec* fields read
+// out of the attested execution payload header. ok=false before any
+// finalized header is held. These back the engine-API result shapes'
+// blockNumber/blockTimestamp/blockHash/finalizedBlockNumber keys (eljson.rs).
+func (s *Store) FinalizedExecInfo() (number, timestamp uint64, hash hash32, ok bool) {
+	if s.finalizedLC == nil {
+		return 0, 0, hash32{}, false
+	}
+	return s.finalizedLC.ExecNumber, s.finalizedLC.ExecTimestamp, s.finalizedLC.ExecBlockHash, true
+}
+
+// OptimisticExecInfo is FinalizedExecInfo for the attested (optimistic)
+// header, backing the shapes' optimisticBlockNumber. ok=false until an
+// attested header is held.
+func (s *Store) OptimisticExecInfo() (number, timestamp uint64, hash hash32, ok bool) {
+	if s.optimisticLC == nil {
+		return 0, 0, hash32{}, false
+	}
+	return s.optimisticLC.ExecNumber, s.optimisticLC.ExecTimestamp, s.optimisticLC.ExecBlockHash, true
 }
 
 // committeeFor is Rust's committee_for (store.rs:460-470): the store's
@@ -194,6 +224,7 @@ func (s *Store) ProcessUpdate(u *Update) error {
 	}
 	if u.SignatureSlot > s.optimisticSigSlot {
 		s.Optimistic, s.OptimisticExec, s.optimisticSigSlot = u.Attested.Beacon, u.Attested.Exec, u.SignatureSlot
+		s.optimisticLC = u.Attested
 	}
 	s.applyNextWhenPeriodChanges(oldFinalized, s.Finalized.Slot)
 	return nil
@@ -290,6 +321,7 @@ func (s *Store) ProcessFinalityUpdate(u *FinalityUpdate) (FinalityOutcome, error
 	}
 	if u.SignatureSlot > s.optimisticSigSlot {
 		s.Optimistic, s.OptimisticExec, s.optimisticSigSlot = u.Attested.Beacon, u.Attested.Exec, u.SignatureSlot
+		s.optimisticLC = u.Attested
 	}
 	s.applyNextWhenPeriodChanges(oldFinalized, s.Finalized.Slot)
 	if s.Finalized.Slot > oldFinalized || s.optimisticSigSlot > oldOptSig {
