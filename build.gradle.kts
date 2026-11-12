@@ -194,7 +194,12 @@ allprojects {
                 if (project == rootProject) lockedIn(rootProject.file("buildscript-gradle.lockfile")) else null
             val writingLocks = gradle.startParameter.isWriteDependencyLocks
             // Every throwable under a failure: cause, suppressed, and the causes
-            // of a multi-cause exception (by its public getCauses()).
+            // of a multi-cause exception (by its public getCauses()). The
+            // reflective call fails QUIETLY if a Gradle release drops the method,
+            // leaving only the first cause, which hides a lock conflict again
+            // (Gradle 9 puts it in a later cause). Only the `gradle pins` canary
+            // notices, which is why it holds one case per pin-failure shape:
+            // keep them all.
             fun everyThrowable(root: Throwable): List<Throwable> {
                 val seen = mutableListOf<Throwable>()
                 val queue = ArrayDeque(listOf(root))
@@ -249,11 +254,14 @@ allprojects {
                     // no longer accepts does NOT — it surfaces as an ordinary
                     // version-constraint conflict whose constraint names the lock:
                     // "dependency was locked to version" up to Gradle 8, "Dependency
-                    // version enforced by Dependency Locking" from 9. The reason
-                    // alone is not enough: every locked module carries it, so a
-                    // configuration unresolvable by design (KGP's CInterop inputs,
-                    // locked like any other) would count as a pin failure. The
-                    // `gradle pins` canary fails if an upgrade words it a third way.
+                    // version enforced by Dependency Locking" from 9. It counts only
+                    // inside a version-constraint conflict, the shape a stale lock
+                    // version produces: every locked module carries the lock as a
+                    // constraint, so a locked configuration that fails for another
+                    // reason on this host (an unreachable repository, a variant
+                    // this walk cannot select) can name it in its message tree too.
+                    // The `gradle pins` canary fails if an upgrade words it a
+                    // third way.
                     val lockFailure = all.firstOrNull { t ->
                         t.javaClass.simpleName.let {
                             it == "DependencyVerificationException" || it == "LockOutOfDateException"
@@ -281,7 +289,15 @@ allprojects {
                         pinFailures += "${project.path}:${conf.name} — its graph resolves, but it has no lock state " +
                             "(its files could not be selected here: ${chain.firstOrNull()?.message.orEmpty().take(200)})"
                     } else {
-                        logger.warn("resolveAllDependencies: ${project.path}:${conf.name} skipped — $causes")
+                        // A skipped configuration WITH lock state is lock and hash
+                        // state this host does not check; say so, so a tool bump
+                        // that moves one into this branch shows in the log (the
+                        // KGP *DependenciesMetadata ones are skipped by design).
+                        val locked = locks != null && conf.name in locks
+                        logger.warn(
+                            "resolveAllDependencies: ${project.path}:${conf.name} skipped" +
+                                (if (locked) " (has lock state, not checked here)" else "") + " — $causes",
+                        )
                     }
                 }
             }
