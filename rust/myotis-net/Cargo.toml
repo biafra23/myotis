@@ -49,11 +49,11 @@ discv5 = "=0.11.0"
 # The ENR wire codec, for the discv4 fork-id pre-filter (#539): the `enr` crate
 # itself arrives through discv5, alloy-rlp is the codec it implements. Already
 # in the lock via enr — no new download.
-alloy-rlp = "=0.3.16"
-snap = "=1.1.1"
+alloy-rlp = "=0.3.17"
+snap = "=1.1.2"
 tracing = "=0.1.44"
-futures = "=0.3.32"
-async-trait = "=0.1.89"
+futures = "=0.3.34"
+async-trait = "=0.1.92"
 # EL discv4 (el::discv4): SO_RCVBUF sizing on the UDP socket (the Android
 # NEIGHBORS-truncation trap — docs/spec/02 §9.10) and entropy for
 # FindNode random targets. Both are I/O-crate concerns by the sans-I/O rules.
