@@ -553,29 +553,51 @@ fn shuffle<T>(items: &mut [T]) {
 /// Per-lookup timeout (the Java twin's).
 pub const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The platform's resolver configuration (`/etc/resolv.conf` on unix, the
-/// registry on Windows), one TXT query at a time, through hickory (the
-/// version pinned in Cargo.toml, newer than the one libp2p's DNS transport
-/// pins; see there).
+/// The platform's resolver configuration, one TXT query at a time, through
+/// hickory (the version pinned in Cargo.toml, newer than the one libp2p's DNS
+/// transport pins; see there). hickory 0.26 reads it per platform:
+/// `/etc/resolv.conf` on Linux and the other non-Apple unixes, the registry on
+/// Windows, `SCDynamicStore` on macOS. Not on mobile: see [`SystemResolver::new`].
 pub struct SystemResolver {
+    #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
     inner: hickory_resolver::TokioResolver,
 }
 
 impl SystemResolver {
-    /// `Err` where the platform offers no resolver configuration — Android has
-    /// had no `/etc/resolv.conf` since Oreo (see `reqresp.rs`) — in which case
-    /// DNS discovery is simply unavailable, and says so once.
+    /// `Err` where there is no resolver configuration to read, in which case DNS
+    /// discovery is simply unavailable and says so once.
+    ///
+    /// Always `Err` on Android and iOS, before hickory is touched. Neither host
+    /// walks a tree through the system resolver (Android supplies its own DNS
+    /// servers, which turns the walk off in `RustMyotisEngine`; iOS never turns
+    /// it on), but an embedding app with no `DnsServers` port reaches here on
+    /// Android. hickory 0.26 reads Android's configuration over JNI through
+    /// `ndk_context::android_context()`, which PANICS when no host registered a
+    /// context, and nothing here does, so under the release profile's
+    /// `panic = "abort"` that would kill the app; 0.25 found no
+    /// `/etc/resolv.conf` (gone since Oreo, see `reqresp.rs`) and returned
+    /// `Err`. iOS has no `SCDynamicStore`, which 0.26 reads on Apple targets.
     pub fn new() -> Result<SystemResolver, String> {
-        let mut builder = hickory_resolver::TokioResolver::builder_tokio()
-            .map_err(|e| format!("system resolver: {e}"))?;
-        let opts = builder.options_mut();
-        opts.timeout = LOOKUP_TIMEOUT;
-        opts.attempts = 1;
-        Ok(SystemResolver {
-            inner: builder
-                .build()
-                .map_err(|e| format!("system resolver: {e}"))?,
-        })
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            Err(
+                "system resolver: not read on mobile (the host supplies DNS servers there)"
+                    .to_string(),
+            )
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let mut builder = hickory_resolver::TokioResolver::builder_tokio()
+                .map_err(|e| format!("system resolver: {e}"))?;
+            let opts = builder.options_mut();
+            opts.timeout = LOOKUP_TIMEOUT;
+            opts.attempts = 1;
+            Ok(SystemResolver {
+                inner: builder
+                    .build()
+                    .map_err(|e| format!("system resolver: {e}"))?,
+            })
+        }
     }
 }
 
