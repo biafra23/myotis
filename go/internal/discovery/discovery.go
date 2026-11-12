@@ -348,6 +348,7 @@ func (s *Service) walkDNSTree() {
 		}
 
 		sampled, fresh := 0, 0
+		walked := false // the sweep ran to the quiet-window break (a full sweep)
 		lastNew := time.Now()
 		for it.Next() {
 			sampled++
@@ -355,6 +356,7 @@ func (s *Service) walkDNSTree() {
 				fresh++
 				lastNew = time.Now()
 			} else if time.Since(lastNew) > dnsIdleNoNew {
+				walked = true
 				break // a full sweep delivered nothing new: walk done
 			}
 		}
@@ -362,9 +364,15 @@ func (s *Service) walkDNSTree() {
 		it.Close()
 		s.log.Info("dns tree sweep finished", "sampled", sampled, "newCandidates", fresh)
 
+		// Walked-out with new nodes → the long re-walk. Ended for any
+		// other reason (iterator exhausted or errored) WITH fresh nodes
+		// still arriving → the tree may have more the walk never
+		// reached: retry soon. (The pre-fix condition `sampled >=
+		// fresh` was always true — both counters only increment
+		// together — so this arm never distinguished the two cases.)
 		retry := dnsRewalkEvery
-		if fresh > 0 && sampled >= fresh {
-			retry = dnsRetryAfter // the iterator ended early while the tree still fed us new nodes
+		if fresh > 0 && !walked {
+			retry = dnsRetryAfter
 		}
 		if !s.sleep(retry) {
 			return

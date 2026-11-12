@@ -266,6 +266,24 @@ func (s *Store) ProcessFinalityUpdate(u *FinalityUpdate) (FinalityOutcome, error
 	// its own signature-slot guard, apply_next_when_period_changes — then
 	// the outcome is decided by comparing store slots before/after, NOT
 	// by the update's own numbers.
+	//
+	// NOTE on u.SignatureSlot here and in ProcessUpdate: it is only ever
+	// used UNAUTHENTICATED, to SELECT the committee period (the gate) and
+	// the signing fork domain (Gate 4) — the BLS signature itself is
+	// verified against the ATTESTED beacon header (VerifySyncAggregate's
+	// signing root), not against the signature slot. So the three-way
+	// ordering the spec's validate_light_client_update implies between
+	// signature_slot, attested.slot and finalized.slot, and the
+	// signature_slot ≤ wall-slot bound, are NOT enforced here — they
+	// would bind the signature to signature_slot, which the ported
+	// signature scheme does not do. The practical consequence is bounded
+	// (a peer cannot forge the finalized header either way — it is
+	// Merkle-checked into the attested state, which is what the
+	// committee signed): it is a stale-update-rejection sharp edge, not
+	// a forgery path. This is deliberately IDENTICAL to the Rust twin
+	// (store.rs notes the same) and the Java engine, so a fix is a
+	// three-way coordinated change, not a Go-side patch — tracked as
+	// issue #774, not silently diverged here (PR #773 review).
 	oldFinalized, oldOptSig := s.Finalized.Slot, s.optimisticSigSlot
 	if u.Finalized.Beacon.Slot > s.Finalized.Slot {
 		s.Finalized, s.FinalizedExec, s.finalizedLC = u.Finalized.Beacon, u.Finalized.Exec, u.Finalized

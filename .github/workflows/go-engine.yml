@@ -6,7 +6,10 @@ on:
   # branch directly: there are no Gradle-heavy costs to duplicate here, and
   # the branch gains its branch-protection signal before part PRs open.
   # The path filter keeps Gradle/Rust work from paying for this job and vice
-  # versa.
+  # versa. "feature/go-engine" becomes a dead entry when PR #773 merges and
+  # the branch is deleted — trim it to [ "main" ] in the first workflow touch
+  # after that merge (a stale branch name in branches: is harmless, just
+  # noise).
   push:
     branches: [ "main", "feature/go-engine" ]
     paths:

@@ -35,7 +35,27 @@ type peerState struct {
 	// statused marks "Status exchanged on the CURRENT connection" —
 	// cleared implicitly by tracking Connectedness (see ensureStatus).
 	statused bool
+	// singlePeriod marks a peer learned to answer
+	// updates_by_range(count>1) with a truncated stream — Lighthouse
+	// closes the stream after the first chunk (~30 ms), because a
+	// count=N ask costs N request tokens against a 1-token/10 s rate
+	// bucket (the same behavior the Rust twin documents in sync.rs,
+	// which is why it asks Lighthouse one period at a time). Such a
+	// peer is worth asking, just not with a batch: the catch-up loop
+	// drops the count to 1 for it.
+	singlePeriod bool
+	// coolUntil is when the next ask to this peer may start (see
+	// singlePeriodCooldown): the Rust twin's ~11 s between asks to a
+	// single-period server, so a pool of rate-limited pins is walked
+	// at their pace instead of re-hammering one server per round.
+	coolUntil time.Time
 }
+
+// singlePeriodCooldown is the minimum spacing between asks to a peer
+// learned to be a single-period server (see peerState.singlePeriod);
+// the Rust twin's Lighthouse loop uses ~11 s for exactly the token
+// bucket cited there.
+const singlePeriodCooldown = 11 * time.Second
 
 // Syncer runs the light-client loop over a peer pool. It owns the
 // store: RunBootstrap installs it, the loops mutate it, and
@@ -313,9 +333,17 @@ func (s *Syncer) RunBootstrap(ctx context.Context) (*lc.Store, error) {
 		if swept == 0 {
 			// Every known peer swept, none answered: wait to see
 			// whether discovery brings more before the budget ends.
+			// Then FORGET whom we swept: myotis-go -get-account and
+			// plain myotis-lc never start discv5, so for them the
+			// pool stays the five static pins forever and a
+			// permanent tried-set would turn this window into five
+			// asks and a dead wait. Transient failures (a peer
+			// restarting, a dial racing its own listen port) deserve
+			// the retry; this pause IS the backoff.
 			select {
 			case <-ctx.Done():
 			case <-time.After(2 * time.Second):
+				tried = map[peer.ID]bool{}
 			}
 		}
 	}
@@ -359,11 +387,26 @@ func (s *Syncer) pickPeer(round int, startPeriod uint64) (*peerState, bool) {
 		return nil, false
 	}
 	startSlot := startPeriod * chain.SlotsPerSyncCommitteePeriod
+	now := s.now()
+	var cooling *peerState
 	for i := range n {
 		p := s.peers[s.order[(round+i)%n]]
 		if p.earliest == 0 || p.earliest <= startSlot {
+			// A peer inside its single-period cooldown is still a
+			// valid answer for the range — it is only deprioritized
+			// while a peer at full pace is available (the caller
+			// drops its batch to one period for it, see RunCatchUp).
+			if now.Before(p.coolUntil) {
+				if cooling == nil {
+					cooling = p
+				}
+				continue
+			}
 			return p, true
 		}
+	}
+	if cooling != nil {
+		return cooling, true
 	}
 	return s.peers[s.order[round%n]], false
 }
@@ -396,7 +439,7 @@ func (s *Syncer) RunCatchUp(ctx context.Context, store *lc.Store) error {
 		if store.Period() >= wallPeriod {
 			return nil
 		}
-		if round++; round > maxCatchUpRounds {
+		if round >= maxCatchUpRounds {
 			return fmt.Errorf("clsync: catch-up stalled at period %d (wall %d)", store.Period(), wallPeriod)
 		}
 		// Weak subjectivity, in-run layer (§9.6 layer 3, sync.rs:2496-2523):
@@ -410,30 +453,60 @@ func (s *Syncer) RunCatchUp(ctx context.Context, store *lc.Store) error {
 		}
 		start := store.Period()
 		count := min(wallPeriod-store.Period(), clwire.MaxUpdatesByRange)
+		// `round` indexes the rotation and is incremented AFTER the
+		// pick, so the first ask goes to order[0] — roost, the one
+		// pin that serves real batches. Pre-incrementing started the
+		// walk at order[1], asking roost only in the fifth round,
+		// straight into the Lighthouse pins that truncate a
+		// multi-period ask to one chunk.
 		p, served := s.pickPeer(round, start)
+		round++
 		if p == nil {
 			return errors.New("clsync: catch-up has no peers")
 		}
 		if !served {
 			s.Logf("catch-up: all peers pruned before period %d; asking %s anyway", start, p.info.ID)
 		}
+		if p.singlePeriod {
+			// A peer learned to ration multi-period asks gets one
+			// period per ask instead of a batch it would truncate
+			// after the first chunk, re-spaced at the cooldown so a
+			// pool of rate-limited pins is walked at their pace.
+			count = 1
+			s.markSinglePeriod(p)
+		}
 		if err := s.ensureStatus(ctx, p); err != nil {
 			s.Logf("catch-up: status with %s failed: %v", p.info.ID, err)
+			s.pause(ctx)
 			continue
 		}
 		req := clwire.EncodeUpdatesByRangeRequest(start, uint64(count))
 		resp, err := RequestOnConn(ctx, s.H, p.info, clwire.UpdatesByRange, req, updatesTimeout)
 		if err != nil && len(resp) == 0 {
 			s.Logf("catch-up: ask %s +%d×%d failed: %v", p.info.ID, start, count, err)
+			s.pause(ctx)
 			continue
 		}
 		chunks, derr := clwire.DecodeMultiChunk(resp, int(count))
 		if derr != nil && len(chunks) == 0 {
 			s.Logf("catch-up: %s batch undecodable: %v", p.info.ID, derr)
+			s.pause(ctx)
 			continue
 		}
 		if derr != nil || err != nil {
 			s.Logf("catch-up: %s answer truncated (%v); salvaging %d whole chunks", p.info.ID, derr, len(chunks))
+			if count > 1 {
+				// The close-mid-batch IS the server class: a
+				// Lighthouse node ends a multi-count stream after
+				// the first chunk because count=N asks cost N
+				// tokens against its 1-token/10 s bucket (the Rust
+				// twin asks those pins one period at a time for
+				// exactly this). Learn it once instead of paying a
+				// truncation per batch, and space the asks.
+				s.markSinglePeriod(p)
+				s.Logf("catch-up: %s is a single-period server: one period per ask, %s apart",
+					p.info.ID, singlePeriodCooldown)
+			}
 		}
 		applied := 0
 		s.procMu.Lock()
@@ -460,9 +533,30 @@ func (s *Syncer) RunCatchUp(ctx context.Context, store *lc.Store) error {
 		s.Logf("catch-up: %s +%d×%d → %d/%d applied, store period %d, finalized slot %d",
 			p.info.ID, start, count, applied, len(chunks), store.Period(), store.Finalized.Slot)
 		if applied == 0 {
-			time.Sleep(time.Second) // pace the retry, don't hammer
+			s.pause(ctx) // pace the retry, don't hammer
 		}
 	}
+}
+
+// pause spaces the catch-up retries without ignoring cancellation —
+// the loop's failure arms run against peers that may be down for the
+// window, and a tight retry loop hammers them (and outlives the
+// caller's budget) exactly when nothing is working.
+func (s *Syncer) pause(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+	}
+}
+
+// markSinglePeriod records that p is a single-period server (see
+// peerState.singlePeriod) and re-spaces its next ask. Locks peersMu
+// like every other peerState mutation.
+func (s *Syncer) markSinglePeriod(p *peerState) {
+	s.peersMu.Lock()
+	defer s.peersMu.Unlock()
+	p.singlePeriod = true
+	p.coolUntil = s.now().Add(singlePeriodCooldown)
 }
 
 // PollFinality reads the current finality update from the peer pool —

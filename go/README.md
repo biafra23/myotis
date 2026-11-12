@@ -19,18 +19,31 @@ Scope, deliberately small (owner's brief, 2026-11-10):
   lookups return better sets. Decision, not accident — see the
   `internal/discovery` package doc.
 
-Build blocks: much of the heavy, settled plumbing comes from go-ethereum
-(RLP, discv4, EIP-1459, secp256k1, and the range-proof verifier for the snap
-part). The **RLPx wire layer is the deliberate exception** (hand-ported,
-PR #767): ECIES, the EIP-8 handshake and the frame codec are this module's
-own code, ported from `myotis-wire` and pinned byte-for-byte to the shared
-cross-language corpus in `rust/testdata/el/rlpx/` — which needs injectable
-entropy and exercises the raw-snappy fallback and the frame caps the
-library's `p2p/rlpx` does not expose. Whether to keep the port or wrap
-`go-ethereum/p2p/rlpx` instead is an open owner decision. Everything that
-makes it *Myotis* — the message handling, verification policy, anchoring —
-is this module's own code, guided by `docs/spec/` and `rust/` as the
-reference.
+Build blocks — where each piece comes from, honestly (PR #773 review):
+
+- **From go-ethereum**: the RLP *encoder/list-splitter* (`rlp` — encoding and
+  `Split` only; every *validation* of a decoded item is this module's),
+  discv4 and discv5 (the DHT/UDP engines), EIP-1459 DNS trees, secp256k1,
+  enode/ENR records, and libp2p (transport + host for the CL side).
+- **Hand-ported from the Rust twins, deliberately** — the parts whose
+  verification policy the library either lacks or implements with different
+  rules: the **RLPx wire layer** (ECIES, the EIP-8 handshake, the frame
+  codec — PR #767, pinned byte-for-byte to `rust/testdata/el/rlpx/`, which
+  needs injectable entropy and exercises the raw-snappy fallback and the
+  frame caps `p2p/rlpx` does not expose; keep-vs-wrap stays an open owner
+  decision), the **strict RLP validator** (`internal/rlpcode` — the
+  canonical-form refusals geth's decoder does not make, e.g. leading-zero
+  integers), the **MPT range-proof verifier** for the snap part
+  (`internal/mpt` — geth's `triangle` verifier serves its *own* full-node
+  proofs and is not wired here; this is the ported Rust verifier, replaying
+  `rust/testdata/el/mpt/`), the **SSZ containers + light-client processor**
+  (`internal/lc`/`internal/ssz`, replaying `rust/testdata/lc/mainnet`), and
+  the **eth2 req/resp codec** (`internal/clwire`, pinned to the Java golden
+  vectors).
+
+Everything that makes it *Myotis* — the message handling, verification
+policy, anchoring — is this module's own code, guided by `docs/spec/` and
+`rust/` as the reference.
 
 ## Parts (feature/go-engine)
 
@@ -93,6 +106,13 @@ reference.
    tick re-asks only peers not yet contacted **at that anchor**, so a
    failed read walks the ready set instead of redrawing a random
    three, and the address reaches each peer at most once per anchor.
+   Read mode (`-get-account`) also gates the EL ready set on capability:
+   a READY peer without snap can never serve the read and a READY
+   session has no other way out of the set, so it is closed at the door
+   and the backlog dials in its place. Residual cut, documented: a peer
+   that answers with a pruned state stays in the set (it *can* serve
+   snap, just not at this root) — the reader rotates past it per attempt
+   rather than evicting it.
    Deliberate cuts, documented in the code: FINALIZED-anchor reads only
    (the Rust twin's optimistic-head read — `ProcessOptimisticUpdate` +
    the optimistic-update poll — is the next increment; a peer on a
@@ -119,7 +139,10 @@ reference.
    the read: `verifiedAt=0xe04f511b… lcFinalizedSlot=15634912`,
    nonce/balance from the MPT leaf and the storage read anchored at
    the PROVEN empty storageRoot.
-5. final integration PR to `main`
+5. final integration PR to `main` (PR #773 — once it merges and the
+   feature branch is deleted, this section is history, and the
+   `feature/go-engine` entry in `go-engine.yml`'s push trigger can go
+   with it)
 
 ## Run
 

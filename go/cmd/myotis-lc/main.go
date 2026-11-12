@@ -82,7 +82,13 @@ func main() {
 	}
 
 	if err := syncer.RunCatchUp(ctx, st); err != nil {
-		log.Fatalf("catch-up: %v", err)
+		// NOT fatal (PR #773 review): the steady loop below
+		// re-runs catch-up every slot cycle and tolerates this
+		// error; exiting here let one bad round — every pin down,
+		// or all of them mid-rate-limit — kill a run that had a
+		// full budget of retries left. -once still fails at the
+		// budget's end if nothing ever advanced.
+		logf("catch-up: %v (the steady loop retries it each slot)", err)
 	}
 
 	// -probe-range N exercises the updates_by_range wire against live

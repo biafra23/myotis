@@ -120,7 +120,7 @@ func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, m
 		advertiseTCP = uint16(listenPort)
 	}
 
-	dialer := newDialer(key, netCfg, maxDials, maxReady, advertiseTCP, log)
+	dialer := newDialer(key, netCfg, maxDials, maxReady, advertiseTCP, getAccount != "", log)
 	// LIFO matters: register dialer.close BEFORE disc's defer so disc.Close
 	// runs first — discovery must stop firing OnDiscovered before the dialer
 	// queue closes (enqueue's closed-flag is the second belt on that).
@@ -375,7 +375,13 @@ func runLightClient(ctx context.Context, logf func(string, ...any), anchors chan
 		return fmt.Errorf("bootstrap: %w", err)
 	}
 	if err := syncer.RunCatchUp(bootCtx, st); err != nil {
-		return fmt.Errorf("catch-up: %w", err)
+		// NOT fatal (PR #773 review): a pin that is down or
+		// rate-limiting us today is up in the next slot, and the
+		// steady loop below re-runs catch-up every cycle exactly for
+		// that. Killing the light client here instead would expire
+		// -get-account's whole read window on one bad round — the
+		// failure the loop right below already tolerates.
+		logf("catch-up: %v (the steady loop retries it each slot)", err)
 	}
 	// NO publish yet: st.Finalized here is the embedded checkpoint (or
 	// the previous period's best-update header) — hours old in the
@@ -531,6 +537,17 @@ type dialer struct {
 	tcpPort  uint16
 	maxReady int // cap live sessions; the CLI is a demo, not a peer pool
 
+	// requireSnap is read mode (-get-account): a READY session without
+	// the snap capability can never serve the read, so it is closed at
+	// the door instead of parking in one of the maxReady slots the
+	// snap-capable backlog candidates need — without this, a run whose
+	// first maxReady peers are all full/light nodes starves the read
+	// forever, since a READY non-snap peer has no path out of the set
+	// short of hanging up (work()'s dequeue gate and the insert cap
+	// both key off len(d.ready) alone). Set once at construction,
+	// before any worker starts.
+	requireSnap bool
+
 	// ctx is cancelled by close(); workers and every dial derive from it,
 	// so shutdown stops the dial wall instead of draining a queued 256
 	// candidates through 30-second handshakes after the report printed.
@@ -560,7 +577,7 @@ type dialer struct {
 // the backlog is what makes "wait until a slot frees" true.
 const backlogCap = 512
 
-func newDialer(key *ecdsa.PrivateKey, netCfg *chain.Network, workers, maxReady int, tcpPort uint16, log *slog.Logger) *dialer {
+func newDialer(key *ecdsa.PrivateKey, netCfg *chain.Network, workers, maxReady int, tcpPort uint16, requireSnap bool, log *slog.Logger) *dialer {
 	if workers < 1 {
 		log.Warn("max-concurrent-dials < 1 makes no dials; using 4", "requested", workers)
 		workers = 4
@@ -573,8 +590,9 @@ func newDialer(key *ecdsa.PrivateKey, netCfg *chain.Network, workers, maxReady i
 		key:       key,
 		network:   netCfg,
 		log:       log.With("component", "dialer"),
-		tcpPort:   tcpPort,
-		maxReady:  maxReady,
+		tcpPort:     tcpPort,
+		maxReady:    maxReady,
+		requireSnap: requireSnap,
 		ctx:       ctx,
 		cancel:    cancel,
 		wake:      make(chan struct{}, 1),
@@ -686,6 +704,20 @@ func (d *dialer) dialOnce(node *enode.Node) {
 		d.log.Warn("ready peer failed the genesis probe", "id", node.ID().String(),
 			"reason", fmt.Sprintf("got %d header(s), keccak(rlp) %s", len(headers), hashOf(headers)))
 		sess.Close()
+		return
+	}
+
+	// Read mode: a peer without snap cannot serve the read, and a READY
+	// session has no other way out of the ready set short of the peer
+	// hanging up — so it would park a slot the snap-capable backlog
+	// needs (see dialer.requireSnap). Close it at the door and wake the
+	// workers so the backlog drains into the freed slot.
+	if d.requireSnap && !sess.HasSnap() {
+		d.mu.Lock()
+		d.failures["ready-without-snap"]++
+		d.mu.Unlock()
+		sess.Close()
+		d.signal()
 		return
 	}
 
