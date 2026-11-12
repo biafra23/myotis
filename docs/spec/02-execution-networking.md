@@ -155,7 +155,7 @@ own signature is verified (the `enr` crate's decoder). Leaves go through the dis
 (`enrfilter.rs`) first; a leaf naming no TCP port is a discv4 seed, never a dial candidate (geth
 `errNoPort`). Children are walked in random order (EIP-1459's advice), so a tree larger than one
 walk's budget is seen in a different part each walk. Transport: the system resolver through
-`hickory-resolver` (its own `=` pin, 0.26: newer than the 0.25 libp2p 0.56's DNS transport pins),
+`hickory-resolver` (its own `=` pin, 0.26; libp2p is built without its DNS transport),
 2 s per lookup, one attempt; no host-supplied server IPs and no public fallbacks yet, and never the
 system resolver on Android or iOS (`SystemResolver::new` refuses there), so the walk runs only where
 a host allows it

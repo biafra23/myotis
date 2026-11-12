@@ -30,7 +30,13 @@ tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "time", 
 # TCP is the fallback, consensus-specs#5330). QUIC carries its own TLS 1.3
 # handshake and stream multiplexing, so neither noise nor a muxer is negotiated
 # on it — see `reqresp::build_swarm`.
-libp2p = { version = "=0.56.0", features = ["tokio", "tcp", "quic", "dns", "noise", "yamux", "identify", "request-response", "gossipsub", "secp256k1", "macros"] }
+# No `dns`: its transport pinned hickory-resolver 0.25.2 (advisories fixed in
+# 0.26.2), and /dns4/ dial addresses are resolved before the swarm anyway
+# (`reqresp::resolve_dial_addrs`, the platform's getaddrinfo). The libp2p
+# release that takes hickory 0.26 (0.57) makes libp2p-quic require quinn's
+# aws-lc-rs backend: a C library (aws-lc-sys, built with cmake) on every
+# target, beside ring, which leaves rustls with two providers.
+libp2p = { version = "=0.56.0", features = ["tokio", "tcp", "quic", "noise", "yamux", "identify", "request-response", "gossipsub", "secp256k1", "macros"] }
 # mplex, the TCP stream multiplexer the consensus p2p spec makes MANDATORY
 # ("clients that support the TCP transport MUST support mplex and MAY support
 # yamux", phase0/p2p-interface.md). rust-libp2p dropped it from the `libp2p`
@@ -46,9 +52,11 @@ discv5 = "=0.11.0"
 alloy-rlp = "=0.3.16"
 # The EIP-1459 DNS tree walk (#539, part 3): TXT lookups over the system
 # resolver. 0.26.3 for the 0.26.2 security release (DNS response parsing,
-# UDP spoofing and resource-exhaustion fixes); libp2p 0.56's `dns` transport
-# still pins 0.25.2, so both versions sit in the lock until libp2p moves to
-# 0.57, whose libp2p-dns takes 0.26.
+# UDP spoofing and resource-exhaustion fixes). The only hickory that is BUILT:
+# libp2p goes without its `dns` feature (see above). 0.25.2 and libp2p-dns
+# still appear in the locks, because Cargo locks every optional dependency
+# whatever features are on; `cargo tree --target all -i hickory-proto@0.25.2`
+# prints nothing, so a lockfile-based alert for it is code that is not used.
 hickory-resolver = { version = "=0.26.3", default-features = false, features = ["system-config", "tokio"] }
 snap = "=1.1.1"
 tracing = "=0.1.44"

@@ -554,8 +554,7 @@ fn shuffle<T>(items: &mut [T]) {
 pub const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The platform's resolver configuration, one TXT query at a time, through
-/// hickory (the version pinned in Cargo.toml, newer than the one libp2p's DNS
-/// transport pins; see there). hickory 0.26 reads it per platform:
+/// hickory (the version pinned in Cargo.toml). hickory 0.26 reads it per platform:
 /// `/etc/resolv.conf` on Linux and the other non-Apple unixes, the registry on
 /// Windows, `SCDynamicStore` on macOS. Not on mobile: see [`SystemResolver::new`].
 pub struct SystemResolver {
