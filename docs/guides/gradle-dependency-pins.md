@@ -147,9 +147,12 @@ the update script there, or run that build once with
 ### Dependabot
 
 Dependabot (`.github/dependabot.yml`) opens monthly, grouped PRs for Gradle,
-Cargo and the GitHub Actions pins: per configured directory, one PR for all
-action moves, and for Gradle and Cargo one for minor + patch moves and one for
-majors (security updates still come one per advisory). A Gradle PR changes the catalog but not the pins, so
+Cargo and the GitHub Actions pins: one PR for all action moves; for Gradle one
+for minor + patch moves and one for majors; for Cargo one for patches and one
+for minor + major moves, since Cargo treats a 0.x minor as breaking. A group's
+PR covers every directory of its entry, so the three Cargo workspaces move in
+one PR (security updates still come one per advisory). A Gradle PR changes the
+catalog but not the pins, so
 `gradle-pins-dependabot.yml` runs `scripts/update_gradle_pins.sh` on Linux and
 pushes the regenerated lockfiles and hashes to the PR branch:
 

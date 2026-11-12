@@ -20,10 +20,22 @@
 # of one per dependency: every PR runs the whole PR workflow set (and a
 # Gradle one the pin regeneration), and, moving a pin, needs a dispatched
 # `reproducible builds` run before it merges — per dependency, that cost
-# multiplied by every crate and library in the tree. Cargo and
-# Gradle split majors from minor + patch, so a breaking major cannot hold the
-# routine bumps back. Security updates are not grouped: they still come one
-# PR per advisory, off-schedule.
+# multiplied by every crate and library in the tree. Each group is ONE PR
+# across all directories of its entry (no `group-by`), so the three Cargo
+# workspaces, which share myotis-net by path, move together and their three
+# locks with them.
+#
+# The routine group holds only what should not break, and the line is not the
+# same per ecosystem, because Dependabot classifies an update by the first
+# version segment that moves, not by the ecosystem's compatibility rule:
+# - Gradle: majors apart from minor + patch.
+# - Cargo: patches apart from minor + major. Cargo treats a 0.x minor
+#   (0.11 -> 0.12) as breaking, and most of this tree's `=` pins are 0.x
+#   (libp2p, discv5, k256, sha2, sha3, aes, hmac, Arti ...), so a "minor"
+#   group would carry breaking bumps. 1.x minors wait with them, the price
+#   of keeping the routine PR green.
+# Security updates are not grouped: they still come one PR per advisory,
+# off-schedule.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -53,10 +65,10 @@ updates:
       interval: monthly
     open-pull-requests-limit: 5
     groups:
-      cargo-minor-patch:
-        update-types: ["minor", "patch"]
-      cargo-major:
-        update-types: ["major"]
+      cargo-patch:
+        update-types: ["patch"]
+      cargo-minor-major:
+        update-types: ["minor", "major"]
 
   - package-ecosystem: gradle
     directory: "/"
