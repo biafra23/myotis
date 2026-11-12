@@ -56,7 +56,7 @@ async-trait = "=0.1.89"
 # NEIGHBORS-truncation trap — docs/spec/02 §9.10) and entropy for
 # FindNode random targets. Both are I/O-crate concerns by the sans-I/O rules.
 socket2 = "=0.5.10"
-getrandom = "=0.2.17"
+getrandom = "=0.4.3"
 # RLPx's crypto (ECIES, the frame codec's AES/HMAC/Keccak, constant-time MAC
 # compare) moved to myotis-wire with the code that uses it (#505).
 
