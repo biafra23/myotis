@@ -175,6 +175,8 @@ func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, m
 	// the address to each peer at most once, and peers READYing later
 	// are the only new ones the retries add.
 	tried := map[[32]byte]map[string]bool{}
+	var lastTriedRoot [32]byte
+	haveTriedRoot := false
 	// lastReadErr rides into the timeout error so "read window
 	// expired" names the cause instead of only the fact.
 	var lastReadErr error
@@ -192,8 +194,21 @@ func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, m
 		untried := make([]snapread.Peer, 0, len(peers))
 		seen := tried[a.stateRoot]
 		if seen == nil {
+			// Finalized roots advance all the time; a long-running
+			// read would otherwise accumulate a peer set per root
+			// forever. Keep only the current root plus the previous
+			// one (a read launched against it may still be in
+			// flight) — older roots will never be read again.
+			if haveTriedRoot && lastTriedRoot != a.stateRoot {
+				for r := range tried {
+					if r != a.stateRoot && r != lastTriedRoot {
+						delete(tried, r)
+					}
+				}
+			}
 			seen = map[string]bool{}
 			tried[a.stateRoot] = seen
+			lastTriedRoot, haveTriedRoot = a.stateRoot, true
 		}
 		for _, p := range peers {
 			if !seen[p.ID()] {
@@ -206,8 +221,19 @@ func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, m
 		if len(untried) > snapread.MaxAttempts {
 			untried = untried[:snapread.MaxAttempts] // what usable() will contact
 		}
+		// Marking happens BEFORE the read runs: "contacts exactly
+		// these" holds for every failure path except one — the
+		// unmarked leaf-decode early return inside snapread can stop
+		// at the first peer. That peer's later siblings go untried at
+		// this root, and that is right: the failed leaf is COMMITTED
+		// by a proof that verified against this root, so every honest
+		// peer serving this root serves the same bytes and the same
+		// verdict — asking the rest is the "repaying the round trip"
+		// snapread's decode rule exists to skip. Every other failure
+		// (transport, marked proof-invalid) walks all ≤3, so the
+		// disclosure accounting stays exact.
 		for _, p := range untried {
-			seen[p.ID()] = true // the capped call contacts exactly these
+			seen[p.ID()] = true
 		}
 		readInFlight = true
 		go func() {
@@ -673,6 +699,18 @@ func (d *dialer) dialOnce(node *enode.Node) {
 		sess.Close()
 		d.signal() // a dial slot freed; another worker may proceed
 		return
+	}
+	// A peer whose ENR moved (DHCP/CNAME hosting) can reach READY a
+	// second time under the SAME id while its old session still lives:
+	// overwriting the map entry without closing the old session leaks
+	// its socket and reader goroutine, and the eviction watcher's
+	// cur == s check can never remove the superseded session, so it
+	// lives until the peer itself hangs up. Close it here, where
+	// "replaced" is decided.
+	if old, ok := d.ready[node.ID()]; ok && old != sess {
+		d.log.Debug("peer reached READY at a new endpoint, closing its previous session",
+			"id", node.ID().String())
+		old.Close()
 	}
 	d.ready[node.ID()] = sess
 	d.clients[sess.ClientID]++

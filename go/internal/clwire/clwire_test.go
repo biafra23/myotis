@@ -142,6 +142,29 @@ func TestForkDigestGolden(t *testing.T) {
 	}
 }
 
+func TestKnownForkDigestsCoversEveryPinnableAnswer(t *testing.T) {
+	c := chain.ConsensusMainnet()
+	known := KnownForkDigests(c)
+	// The current-wall-clock digest must be in the set — otherwise the
+	// chunk gate would refuse the network we are actually on.
+	if !known[CurrentForkDigest(c, 1794355200)] {
+		t.Fatal("current digest missing from KnownForkDigests")
+	}
+	// Every pinned fork's plain digest too (a response about a
+	// pre-BPO period carries the unfolded form).
+	for _, f := range c.Forks {
+		if !known[ForkDigest(f.Version, c.GenesisValidatorsRoot)] {
+			t.Fatalf("pinned fork %x plain digest missing", f.Version)
+		}
+	}
+	// And a digest from a fork NO pinned schedule produces is refused —
+	// the misdecode this gate exists to prevent.
+	bogus := [4]byte{0xde, 0xad, 0xbe, 0xef}
+	if known[bogus] {
+		t.Fatal("bogus digest accepted")
+	}
+}
+
 func TestStatusRoundTripBothVersions(t *testing.T) {
 	s := StatusMessage{
 		ForkDigest:            [4]byte{0x8C, 0x9F, 0x62, 0xFE},

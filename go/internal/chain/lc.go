@@ -57,9 +57,13 @@ func ConsensusMainnet() *Consensus {
 		BlobParamsMaxBlobs: 21,
 		// Epoch → version (EIP-7801 names aside, these are the fork
 		// versions mainnet actually activates; Fulu epoch 411392 is the
-		// head). Mainnet has NO scheduled Gloas epoch — the shape switch
-		// stays pre-Gloas until one is pinned (Sepolia's is epoch 353024,
-		// version 90000076, in the Rust config as the example).
+		// head). Mainnet has NO scheduled Gloas epoch. Pinning one into
+		// THIS build is not just a line here: the Go lc has no Gloas
+		// geometry, so DecodeUpdate would (by design) refuse every
+		// Gloas-era update until the Gloas increment lands (lc/geomAtSlot
+		// comment, go/README §deliberate cuts). Sepolia's Gloas is
+		// epoch 353024, version 90000076, in the Rust config as the
+		// example.
 		Forks: []ForkAt{
 			{Epoch: 0, Version: [4]byte{0x00, 0x00, 0x00, 0x00}},
 			{Epoch: 74240, Version: [4]byte{0x01, 0x00, 0x00, 0x00}},

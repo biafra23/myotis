@@ -64,7 +64,13 @@ func (f *ForkSchedule) geomAtSlot(slot uint64) branchGeom {
 		return geomElectra // Electra and Fulu
 	}
 	return geomDeneb
-	// geomGloas activates when a Gloas epoch is pinned (see chain/lc.go).
+	// NO Gloas tier on purpose: this build has no Gloas geometry and
+	// DecodeUpdate refuses a Gloas-shaped update (see its switch), so
+	// pinning a Gloas epoch on an UNCHANGED build refuses updates
+	// loudly instead of misparsing them. Gloas support (a geomGloas
+	// row here, the 9+11 decode family, and the already-ported
+	// verifyNormalizedMerkleBranch) is one documented increment —
+	// go/README §"deliberate cuts" — not a variable flip.
 }
 
 func (f *ForkSchedule) epochOfVersion(head byte) uint64 {
@@ -355,9 +361,21 @@ func DecodeUpdate(b []byte) (*Update, error) {
 	}
 	attOff := int(binary.LittleEndian.Uint32(b[0:4]))
 	totalBranch := attOff - (4 + syncCommitteeSizeBytes + 4 + 160 + 8)
+	// Only the geometries this build decodes (the geomAtSlot families:
+	// Deneb 5+6, Electra/Fulu 6+7). Anything else — a Gloas-era 9+11
+	// above all — is REFUSED, not defaulted to 5+6: silently reading a
+	// Gloas update's next-committee branch as the finality branch
+	// would misparse the object into plausible wrong values (a review
+	// finding; go/README lists Gloas geometry as a deliberate cut —
+	// mainnet pins no Gloas epoch, so refusing is unreachable today
+	// and honest the day one is pinned).
 	scNodes, finNodes := 5, 6
-	if totalBranch == 6*32+7*32 {
+	switch totalBranch {
+	case 5*32 + 6*32:
+	case 6*32 + 7*32:
 		scNodes, finNodes = 6, 7
+	default:
+		return nil, fmt.Errorf("lc: update branch geometry %d bytes matches no geometry this build decodes (Gloas 9+11 is a documented cut)", totalBranch)
 	}
 	pos := 4
 	next, err := decodeSyncCommittee(b[pos : pos+syncCommitteeSizeBytes])

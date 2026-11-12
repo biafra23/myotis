@@ -522,10 +522,16 @@ func DecodeByteCodes(b []byte, requested int) (uint64, [][]byte, error) {
 }
 
 // decodeProof returns the byte-string nodes of a proof list (list
-// elements are skipped), refusing more than MaxProofNodes. The cap
-// fires DURING the stream, not after materializing the whole list:
-// the million-node case must fail at node 1025 with O(1024) memory,
-// which is what the cap's comment promises (#454).
+// elements are SKIPPED — deliberate, not sloppy: the Rust twin writes
+// the same drop as filter_map(as_bytes().ok()) at messages.rs:593, so
+// a proof of nothing-but-lists shrinks to the excused "empty proof
+// for non-empty root" case in both engines alike. Making that a
+// bad-proof strike would be a cross-engine POLICY change — Java and
+// Rust move too, all three together, per the eth/66 precedent — not a
+// Go fix), refusing more than MaxProofNodes. The cap fires DURING the
+// stream, not after materializing the whole list: the million-node
+// case must fail at node 1025 with O(1024) memory, which is what the
+// cap's comment promises (#454).
 func decodeProof(item []byte) ([][]byte, error) {
 	if item == nil || !isList(item) {
 		return nil, nil

@@ -52,6 +52,28 @@ func ForkDigestBPO(forkVersion [4]byte, gvr [32]byte, blobEpoch, maxBlobs uint64
 	return [4]byte{base[0] ^ h[0], base[1] ^ h[1], base[2] ^ h[2], base[3] ^ h[3]}
 }
 
+// KnownForkDigests lists every fork digest THIS build's pinned schedule
+// can produce: each pinned fork version's plain digest, and — when a BPO
+// epoch is pinned — the same versions under the EIP-7892 fold (pre-BPO
+// answers carry the plain form, post-BPO ones the folded form; both are
+// honest context bytes). A chunk whose context bytes match none of these
+// names a fork past every fork this build can speak — the digest
+// selects the wire shape (the Rust twin dispatches Gloas on it,
+// sync.rs:657-666), so this engine REFUSES an unknown one rather than
+// silently decoding a Gloas-shaped object in a pre-Gloas parser
+// (CLAUDE.md: applied or refused, never accepted-and-ignored).
+func KnownForkDigests(c *chain.Consensus) map[[4]byte]bool {
+	out := make(map[[4]byte]bool, 2*len(c.Forks))
+	for _, f := range c.Forks {
+		out[ForkDigest(f.Version, c.GenesisValidatorsRoot)] = true
+		if c.BlobParamsEpoch != 0 {
+			out[ForkDigestBPO(f.Version, c.GenesisValidatorsRoot,
+				c.BlobParamsEpoch, c.BlobParamsMaxBlobs)] = true
+		}
+	}
+	return out
+}
+
 // CurrentForkDigest is the digest THIS engine accepts at the wall clock:
 // the fork version active at the current epoch, with the network's BPO
 // blob params folded once the BPO epoch has passed (the

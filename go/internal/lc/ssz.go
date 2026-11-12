@@ -154,6 +154,13 @@ func verifyMerkleBranch(leaf hash32, branch []hash32, index uint64, root hash32)
 // proof.) This is how a Gloas-carried pre-Gloas header pads a shallower
 // proof — the Deneb block hash at gindex 812 is depth 9 inside an 11-node
 // vector (spec.rs:33-36), so ANY number of pads must pass, not just one.
+//
+// PRE-WIRED, NOT DEAD: no production call site yet — this build refuses
+// Gloas-shaped updates at DecodeUpdate (types.go's geometry switch;
+// mainnet pins no Gloas epoch), so nothing here receives a padded
+// branch today. It is fuzz-pinned (normalized_fuzz_test.go) so the
+// Gloas increment wires a verifier that is already proven, rather than
+// porting one under deadline.
 func verifyNormalizedMerkleBranch(leaf hash32, branch []hash32, gindex uint64, root hash32) bool {
 	if gindex < 2 {
 		return false // gindex 1 is the root itself; 0 names nothing

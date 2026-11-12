@@ -215,11 +215,13 @@ func (s *Syncer) markNotStatused(p *peerState) {
 // whose anchor period is more than the bound behind the wall period.
 func (s *Syncer) checkStartGate() error {
 	wall := s.Consensus.SlotAt(s.now().Unix())
-	if chain.WsAnchorStale(chain.SyncCommitteePeriod(s.Consensus.CheckpointSlot),
-		chain.SyncCommitteePeriod(wall), chain.WsBoundPeriods) {
+	// lc.CheckpointPeriod, not an inline SyncCommitteePeriod(CheckpointSlot):
+	// the anchor of all three weak-subjectivity gates gets ONE definition
+	// (verify.go), so no gate can drift from it by re-deriving.
+	cp := lc.CheckpointPeriod(s.Consensus)
+	if chain.WsAnchorStale(cp, chain.SyncCommitteePeriod(wall), chain.WsBoundPeriods) {
 		return fmt.Errorf("%w: checkpoint period %d, wall period %d, bound %d",
-			ErrStaleAnchor, chain.SyncCommitteePeriod(s.Consensus.CheckpointSlot),
-			chain.SyncCommitteePeriod(wall), chain.WsBoundPeriods)
+			ErrStaleAnchor, cp, chain.SyncCommitteePeriod(wall), chain.WsBoundPeriods)
 	}
 	return nil
 }
@@ -236,51 +238,107 @@ func (s *Syncer) RunBootstrap(ctx context.Context) (*lc.Store, error) {
 	}
 	req := clwire.EncodeBootstrapRequest(s.Consensus.CheckpointRoot)
 	var lastErr error
-	for _, p := range s.peerList() {
+	// One-SHOT peer snapshots were the bug this loop shape fixes: at
+	// entry the pool holds only the static pins, while discv5's first
+	// lookup lands seconds later and keeps adding eth2-filtered peers.
+	// Sweeping a dead snapshot and declaring "exhausted all peers"
+	// made five down pins fatal while healthy peers were still
+	// arriving. So: sweep, remember whom we swept, and re-sweep the
+	// pool as it grows, sleeping between empty sweeps, until the
+	// caller's bootstrap budget (ctx) runs out — THAT is the real
+	// deadline the callers' log.Fatalf treats as fatal.
+	tried := map[peer.ID]bool{}
+	for {
 		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return nil, fmt.Errorf("clsync: bootstrap window ended after every peer seen (%d): %w", len(tried), lastErr)
+			}
 			return nil, err
 		}
-		s.markNotStatused(p)
-		if err := s.ensureStatus(ctx, p); err != nil {
-			s.Logf("bootstrap: status with %s failed: %v", p.info.ID, err)
-			lastErr = err
-			continue
+		swept := 0
+		for _, p := range s.peerList() {
+			if tried[p.info.ID] {
+				continue
+			}
+			tried[p.info.ID] = true
+			swept++
+			if err := ctx.Err(); err != nil {
+				break
+			}
+			s.markNotStatused(p)
+			if err := s.ensureStatus(ctx, p); err != nil {
+				s.Logf("bootstrap: status with %s failed: %v", p.info.ID, err)
+				lastErr = err
+				continue
+			}
+			resp, err := RequestOnConn(ctx, s.H, p.info, clwire.Bootstrap, req, respTimeout)
+			if err != nil {
+				s.Logf("bootstrap: request to %s failed: %v", p.info.ID, err)
+				lastErr = err
+				continue
+			}
+			chunk, err := clwire.DecodeResponse(resp, true)
+			if err != nil {
+				s.Logf("bootstrap: %s answered an error: %v", p.info.ID, err)
+				lastErr = err
+				continue
+			}
+			if err := s.checkChunkDigest(chunk.ForkDigest, "bootstrap"); err != nil {
+				s.Logf("bootstrap: %s: %v", p.info.ID, err)
+				lastErr = err
+				continue
+			}
+			boot, err := lc.DecodeBootstrap(chunk.Payload)
+			if err != nil {
+				s.Logf("bootstrap: %s sent undecodable bytes: %v", p.info.ID, err)
+				lastErr = err
+				continue
+			}
+			store, err := lc.NewFromBootstrap(boot, lc.NewForkSchedule(s.Consensus), s.Consensus,
+				s.Consensus.CheckpointRoot)
+			if err != nil {
+				// The pin/rejection: a peer can answer a by-root request with
+				// anything; only our embedded root makes it trusted.
+				s.Logf("bootstrap: %s answer rejected: %v", p.info.ID, err)
+				lastErr = err
+				continue
+			}
+			s.procMu.Lock()
+			s.store = store
+			s.procMu.Unlock()
+			s.Logf("bootstrap ok from %s: slot %d period %d", p.info.ID,
+				boot.Header.Beacon.Slot, store.Period())
+			return store, nil
 		}
-		resp, err := RequestOnConn(ctx, s.H, p.info, clwire.Bootstrap, req, respTimeout)
-		if err != nil {
-			s.Logf("bootstrap: request to %s failed: %v", p.info.ID, err)
-			lastErr = err
-			continue
+		if swept == 0 {
+			// Every known peer swept, none answered: wait to see
+			// whether discovery brings more before the budget ends.
+			select {
+			case <-ctx.Done():
+			case <-time.After(2 * time.Second):
+			}
 		}
-		chunk, err := clwire.DecodeResponse(resp, true)
-		if err != nil {
-			s.Logf("bootstrap: %s answered an error: %v", p.info.ID, err)
-			lastErr = err
-			continue
-		}
-		boot, err := lc.DecodeBootstrap(chunk.Payload)
-		if err != nil {
-			s.Logf("bootstrap: %s sent undecodable bytes: %v", p.info.ID, err)
-			lastErr = err
-			continue
-		}
-		store, err := lc.NewFromBootstrap(boot, lc.NewForkSchedule(s.Consensus), s.Consensus,
-			s.Consensus.CheckpointRoot)
-		if err != nil {
-			// The pin/rejection: a peer can answer a by-root request with
-			// anything; only our embedded root makes it trusted.
-			s.Logf("bootstrap: %s answer rejected: %v", p.info.ID, err)
-			lastErr = err
-			continue
-		}
-		s.procMu.Lock()
-		s.store = store
-		s.procMu.Unlock()
-		s.Logf("bootstrap ok from %s: slot %d period %d", p.info.ID,
-			boot.Header.Beacon.Slot, store.Period())
-		return store, nil
 	}
-	return nil, fmt.Errorf("clsync: bootstrap exhausted all peers: %w", lastErr)
+}
+
+// checkChunkDigest applies a light-client response's 4 context bytes:
+// they must name a fork this build's pinned schedule can produce
+// (clwire.KnownForkDigests). The Status exchange already gated the
+// peer's live digest (host.go), so an unknown digest here means the
+// ANSWER came from a fork past every pinned one — a wire shape this
+// parser would misread into wrong values. Refused, not ignored;
+// recovery needs a build that pins the newer fork, so this is a
+// per-answer rejection, not a peer fault.
+func (s *Syncer) checkChunkDigest(digest []byte, what string) error {
+	if len(digest) != 4 {
+		return fmt.Errorf("clsync: %s response carries no fork-digest context bytes", what)
+	}
+	var d [4]byte
+	copy(d[:], digest)
+	if !clwire.KnownForkDigests(s.Consensus)[d] {
+		return fmt.Errorf("clsync: %s response digest %x is not any fork this build pins (refused rather than misdecoded)", what, d)
+	}
+	return nil
 }
 
 // pickPeer round-robins through ONE snapshot (no double-snapshot race)
@@ -380,6 +438,10 @@ func (s *Syncer) RunCatchUp(ctx context.Context, store *lc.Store) error {
 		applied := 0
 		s.procMu.Lock()
 		for _, ch := range chunks {
+			if err := s.checkChunkDigest(ch.ForkDigest[:], "updates-by-range"); err != nil {
+				s.Logf("catch-up: %s: %v", p.info.ID, err)
+				continue
+			}
 			u, err := lc.DecodeUpdate(ch.Payload)
 			if err != nil {
 				s.Logf("catch-up: %s update undecodable: %v", p.info.ID, err)
@@ -450,6 +512,10 @@ func (s *Syncer) PollFinality(ctx context.Context, store *lc.Store) (lc.Finality
 			lastErr = err
 			continue
 		}
+		if err := s.checkChunkDigest(chunk.ForkDigest, "finality-update"); err != nil {
+			lastErr = err
+			continue
+		}
 		u, err := lc.DecodeFinalityUpdate(chunk.Payload)
 		if err != nil {
 			lastErr = err
@@ -507,6 +573,9 @@ func (s *Syncer) ProbeUpdates(ctx context.Context, store *lc.Store, n uint64) {
 		var decoded, periodGated, otherRejects, applied int
 		s.procMu.Lock()
 		for _, ch := range chunks {
+			if err := s.checkChunkDigest(ch.ForkDigest[:], "probe updates"); err != nil {
+				continue
+			}
 			u, err := lc.DecodeUpdate(ch.Payload)
 			if err != nil {
 				s.Logf("probe: %s: update undecodable: %v", p.info.ID, err)

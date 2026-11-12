@@ -56,7 +56,17 @@ reference.
    identify service itself runs and answers, with the eth2 twin's
    `eth2/1.0.0` protocol-version field; 3c builds the LC-server peer
    tier from the protocol lists it already collects), no LCSS
-   snapshot persistence yet (cold start re-bootstraps).
+   snapshot persistence yet (cold start re-bootstraps), and no Gloas
+   geometry — the decoders carry the Deneb and Electra/Fulu branch
+   families only, and an unknown family (a Gloas update above all) is
+   REFUSED by name at `DecodeUpdate`, never misparsed into the Deneb
+   shape; mainnet pins no Gloas epoch, so this is unreachable today
+   and honest the day one is (the normalized-branch verifier the Gloas
+   proofs need is already ported and fuzz-pinned, waiting for that
+   increment). LC responses carry their fork digest in the context
+   bytes and the reader APPLIES it: an answer whose digest matches no
+   digest this build's fork schedule can produce is refused, not
+   silently decoded in the wrong-shape parser.
 4. snap reads (PR #772) — the state trust anchor and the read path:
    the MPT proof verifier (`internal/mpt`, replaying the shared
    `rust/testdata/el/mpt/` corpus), the snap wire + verify-on-fetch
