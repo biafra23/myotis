@@ -1149,9 +1149,21 @@ pub struct HostConfig {
 
 impl Default for HostConfig {
     fn default() -> Self {
+        Self::with_ports(0, 0)
+    }
+}
+
+impl HostConfig {
+    /// The wallet's shape, listening on `0.0.0.0` at the given TCP and QUIC (UDP)
+    /// ports. 0 lets the OS pick, which is what [`HostConfig::default`] does; a
+    /// host pins them to run beside another node or behind a firewall.
+    pub fn with_ports(tcp_port: u16, quic_port: u16) -> Self {
+        use libp2p::multiaddr::Protocol;
+        // Built from typed parts: no parse, so nothing on the start path can panic.
+        let any = Protocol::Ip4(std::net::Ipv4Addr::UNSPECIFIED);
         Self {
-            listen: "/ip4/0.0.0.0/tcp/0".parse().expect("static multiaddr"),
-            listen_quic: Some("/ip4/0.0.0.0/udp/0/quic-v1".parse().expect("static multiaddr")),
+            listen: Multiaddr::empty().with(any.clone()).with(Protocol::Tcp(tcp_port)),
+            listen_quic: Some(Multiaddr::empty().with(any).with(Protocol::Udp(quic_port)).with(Protocol::QuicV1)),
             max_established_incoming: Some(64),
             keypair: None,
             lc_responder: None,
@@ -1159,6 +1171,43 @@ impl Default for HostConfig {
             traffic: None,
         }
     }
+}
+
+/// An error and its source chain as one line. libp2p's `TransportError` prints
+/// nothing of its own; the io error (e.g. "Address already in use") is in its
+/// source chain, repeated by each wrapping layer — keep each distinct message once.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut parts: Vec<String> = vec![e.to_string()];
+    let mut source = e.source();
+    while let Some(s) = source {
+        parts.push(s.to_string());
+        source = s.source();
+    }
+    parts.retain(|p| !p.is_empty());
+    parts.dedup();
+    parts.join(": ")
+}
+
+/// Refuse a pinned TCP listen port that another socket already holds.
+///
+/// libp2p-tcp listens with `SO_REUSEPORT` on unix, so a second process of the
+/// same user that also listens through rust-libp2p (a second Myotis, say) binds
+/// the same port without an error and the kernel splits inbound connections
+/// between the two. A plain bind (no `SO_REUSEPORT`) fails against any socket
+/// on that port, so it is tried, and released, first. Port 0 (OS-assigned)
+/// cannot collide and is not probed; nor is an address that is not ip4/tcp.
+fn probe_exclusive_tcp_port(addr: &Multiaddr) -> Result<(), String> {
+    use libp2p::multiaddr::Protocol;
+    let mut it = addr.iter();
+    let (Some(Protocol::Ip4(ip)), Some(Protocol::Tcp(port))) = (it.next(), it.next()) else {
+        return Ok(());
+    };
+    if port == 0 {
+        return Ok(());
+    }
+    std::net::TcpListener::bind((ip, port))
+        .map(drop)
+        .map_err(|e| format!("listen on {addr} failed: {e}"))
 }
 
 /// Start the libp2p host and its event-loop task. Returns the request client;
@@ -1312,14 +1361,17 @@ pub fn start_host_with(
         }
     };
 
+    let listen_addr = config.listen.clone();
+    probe_exclusive_tcp_port(&listen_addr)?;
     swarm
         .listen_on(config.listen)
-        .map_err(|e| format!("listen failed: {e}"))?;
+        .map_err(|e| format!("listen on {listen_addr} failed: {}", error_chain(&e)))?;
     // Not fatal: a host that cannot bind a UDP socket still dials QUIC peers
     // (the transport opens a socket per dial) and still has TCP both ways.
     if let Some(quic) = config.listen_quic {
+        let quic_addr = quic.clone();
         if let Err(e) = swarm.listen_on(quic) {
-            tracing::warn!(error = %e,
+            tracing::warn!(addr = %quic_addr, error = %error_chain(&e),
                 "QUIC listen failed — continuing without inbound QUIC; dialing QUIC and TCP are unaffected");
         }
     }
@@ -2466,6 +2518,71 @@ mod external_address_tests {
         let no_ip: Multiaddr = "/dns4/example.com/tcp/9105".parse().unwrap();
         assert_eq!(multiaddr_ip(&no_ip), None);
         assert_eq!(multiaddr_port(&addr), Some(54321));
+    }
+}
+
+#[cfg(test)]
+mod host_config_tests {
+    use super::*;
+
+    #[test]
+    fn default_listens_on_os_assigned_ports() {
+        let cfg = HostConfig::default();
+        assert_eq!(cfg.listen.to_string(), "/ip4/0.0.0.0/tcp/0");
+        assert_eq!(cfg.listen_quic.map(|a| a.to_string()).as_deref(), Some("/ip4/0.0.0.0/udp/0/quic-v1"));
+        assert_eq!(cfg.max_established_incoming, Some(64));
+    }
+
+    #[test]
+    fn with_ports_pins_tcp_and_quic_independently() {
+        let cfg = HostConfig::with_ports(9105, 9106);
+        assert_eq!(cfg.listen.to_string(), "/ip4/0.0.0.0/tcp/9105");
+        assert_eq!(cfg.listen_quic.map(|a| a.to_string()).as_deref(), Some("/ip4/0.0.0.0/udp/9106/quic-v1"));
+    }
+
+    fn free_tcp_port() -> u16 {
+        std::net::TcpListener::bind("0.0.0.0:0").unwrap().local_addr().unwrap().port()
+    }
+
+    fn free_udp_port() -> u16 {
+        std::net::UdpSocket::bind("0.0.0.0:0").unwrap().local_addr().unwrap().port()
+    }
+
+    fn status() -> Arc<LocalStatus> {
+        LocalStatus::new(StatusMessage {
+            fork_digest: [0; 4],
+            finalized_root: [0; 32],
+            finalized_epoch: 0,
+            head_root: [0; 32],
+            head_slot: 0,
+            earliest_available_slot: 0,
+        })
+    }
+
+    /// The pinned TCP port is the TCP listener and the pinned QUIC port the UDP
+    /// one (a transposition would compile), and a second host on the same TCP
+    /// port is refused although libp2p-tcp listens with SO_REUSEPORT.
+    #[tokio::test]
+    async fn pinned_ports_are_bound_and_held_exclusively() {
+        let (tcp, quic) = (free_tcp_port(), free_udp_port());
+        let (first, _, _) = start_host_with(status(), HostConfig::with_ports(tcp, quic)).expect("first host");
+        // listen_on registers the listeners; give the swarm task a moment to bind.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::net::UdpSocket::bind(("0.0.0.0", quic)).is_ok() {
+            assert!(std::time::Instant::now() < deadline, "QUIC never bound udp/{quic}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(std::net::TcpListener::bind(("0.0.0.0", tcp)).is_err(), "tcp/{tcp} is not held");
+
+        let err = start_host_with(status(), HostConfig::with_ports(tcp, 0)).err().expect("second host refused");
+        assert!(err.contains(&format!("/tcp/{tcp}")), "{err}");
+        first.shutdown().await;
+    }
+
+    #[test]
+    fn os_assigned_and_non_tcp_addresses_are_not_probed() {
+        assert!(probe_exclusive_tcp_port(&"/ip4/0.0.0.0/tcp/0".parse().unwrap()).is_ok());
+        assert!(probe_exclusive_tcp_port(&"/ip4/0.0.0.0/udp/9/quic-v1".parse().unwrap()).is_ok());
     }
 }
 

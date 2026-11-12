@@ -201,6 +201,14 @@ pub struct ChainConfig {
     pub bootstrap_enrs: Vec<String>,
     /// discv5 UDP listen port (0 = OS-assigned; use when running next to a Java daemon).
     pub discv5_port: u16,
+    /// libp2p (light-client req/resp) TCP listen port on `0.0.0.0` (0 = OS-assigned,
+    /// the wallet's default). A host pins it to run beside another node or behind
+    /// a firewall that only opens named ports.
+    pub libp2p_tcp_port: u16,
+    /// libp2p QUIC listen port (UDP) on `0.0.0.0` (0 = OS-assigned). Dialing QUIC
+    /// never needs it (the transport opens a socket per dial); it only fixes the
+    /// port inbound QUIC and the shared dial socket use.
+    pub libp2p_quic_port: u16,
     /// Persisted verified-store snapshot path (`sync-state[-net].snapshot`) —
     /// the SAME file, SAME format ("LCSS" v1) as the Java engine, so state
     /// survives restarts and engine switches. None = no persistence.
@@ -347,6 +355,8 @@ impl ChainConfig {
             static_peers: MAINNET_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: MAINNET_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
             discv5_port: 0,
+            libp2p_tcp_port: 0,
+            libp2p_quic_port: 0,
             snapshot_path: None,
             cl_peer_cache_path: None,
             ws_bound_periods: 13, // spec WS plateau 3532 epochs / 256 = 13.8 -> floor 13 (~14.7 days)
@@ -414,6 +424,8 @@ impl ChainConfig {
             static_peers: SEPOLIA_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: SEPOLIA_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
             discv5_port: 0,
+            libp2p_tcp_port: 0,
+            libp2p_quic_port: 0,
             snapshot_path: None,
             cl_peer_cache_path: None,
             ws_bound_periods: 13, // permissioned validator set; mainnet-preset bound kept as hygiene
@@ -485,6 +497,8 @@ impl ChainConfig {
             static_peers: GNOSIS_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: GNOSIS_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
             discv5_port: 0,
+            libp2p_tcp_port: 0,
+            libp2p_quic_port: 0,
             snapshot_path: None,
             cl_peer_cache_path: None,
             ws_bound_periods: 3, // short churn window (see NetworkConfig.wsBoundPeriods) — pragmatic floor
@@ -546,6 +560,8 @@ impl ChainConfig {
             static_peers: CHIADO_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: CHIADO_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
             discv5_port: 0,
+            libp2p_tcp_port: 0,
+            libp2p_quic_port: 0,
             snapshot_path: None,
             cl_peer_cache_path: None,
             // Gnosis's preset over ~2.6k validators: the spec window is 388-521
@@ -1393,7 +1409,7 @@ impl SyncHandle {
             reqresp::HostConfig {
                 cl_fork_watch: config.cl_fork_watch.clone(),
                 traffic: Some(Arc::clone(&config.traffic)),
-                ..reqresp::HostConfig::default()
+                ..reqresp::HostConfig::with_ports(config.libp2p_tcp_port, config.libp2p_quic_port)
             },
         )
         .map(|(client, _, _)| client)?;
@@ -2221,7 +2237,8 @@ async fn run_sync(
             true
         }
         Err(e) => {
-            tracing::warn!(error = %e, "discv5 unavailable — will retry (static peers meanwhile)");
+            tracing::warn!(port = discovery_cfg.listen_port, error = %e,
+                "discv5 unavailable — will retry (static peers meanwhile)");
             false
         }
     };
