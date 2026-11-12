@@ -22,6 +22,7 @@ import (
 	"github.com/biafra23/myotis/go/internal/clsync"
 	"github.com/biafra23/myotis/go/internal/discovery"
 	"github.com/biafra23/myotis/go/internal/lc"
+	"github.com/biafra23/myotis/go/internal/mpt"
 	"github.com/biafra23/myotis/go/internal/nodekey"
 	"github.com/biafra23/myotis/go/internal/snapread"
 	"github.com/ethereum/go-ethereum/common"
@@ -52,20 +53,26 @@ type Config struct {
 // usable. Close releases everything (sockets, goroutines, the libp2p
 // host).
 type Engine struct {
-	log    *slog.Logger
-	netCfg *chain.Network
-	disc   *discovery.Service
-	dial   *dialer
+	log  *slog.Logger
+	disc *discovery.Service
+	dial *dialer
 
 	// LC state. latest is the newest VERIFYING-poll anchor (nil until
 	// the first one); dead closes exactly when the LC loop gave up for a
 	// non-shutdown reason, with lcErr recorded under mu. anchorSig is a
-	// broadcast nudge ("a newer anchor is published, look again") — the
-	// payload lives in latest, not the channel.
+	// real broadcast — publish() closes it and installs a fresh one
+	// under mu, so EVERY blocked reader wakes (a 1-buffered signal
+	// would wake one) — the payload lives in latest, not the channel,
+	// and readers re-arm on the new channel each loop. lcDone closes
+	// when the loop goroutine returns (its defer h.Close() released
+	// the libp2p host), which is what lets Close honor the type doc
+	// for an embedded stop-and-restart host.
 	lcStart   sync.Once
 	lcCancel  context.CancelFunc
+	lcStarted bool // a loop goroutine exists; guards the lcDone wait
+	lcDone    chan struct{}
 	mu        sync.Mutex
-	latest    *anchor
+	latest    *Anchor
 	lcErr     error
 	dead      chan struct{}
 	anchorSig chan struct{}
@@ -106,10 +113,10 @@ func New(cfg Config) (*Engine, error) {
 
 	e := &Engine{
 		log:       log,
-		netCfg:    netCfg,
 		dial:      newDialer(key, netCfg, cfg.MaxDials, cfg.MaxReady, advertiseTCP, cfg.RequireSnap, log),
 		dead:      make(chan struct{}),
-		anchorSig: make(chan struct{}, 1),
+		lcDone:    make(chan struct{}),
+		anchorSig: make(chan struct{}),
 	}
 	// Discovery is started LAST and the dialer FIRST so OnDiscovered can
 	// capture a live dialer; Close's order (discovery first, then the
@@ -159,6 +166,9 @@ func (e *Engine) StartLC(ctx context.Context) {
 		// Ownership of cancel transfers to Close (stored in e.lcCancel);
 		// this is also what tells vet the value is not leaked here.
 		_ = cancel
+		e.mu.Lock()
+		e.lcStarted = true
+		e.mu.Unlock()
 		go e.runLightClient(lcCtx)
 	})
 }
@@ -168,6 +178,7 @@ func (e *Engine) StartLC(ctx context.Context) {
 // nothing: shutdown is the clean path, never a failure (the same
 // honesty the CLI's lcFailure arm applied).
 func (e *Engine) runLightClient(ctx context.Context) {
+	defer close(e.lcDone)
 	logf := func(f string, a ...any) { e.log.Info(fmt.Sprintf(f, a...)) }
 	err := e.lcLoop(ctx, logf)
 	if ctx.Err() != nil {
@@ -248,26 +259,25 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 	return ctx.Err()
 }
 
-// publish keeps the freshest anchor as THE anchor and nudges every
-// waiting reader. Unlike the old single-consumer channel there is no
-// stale queue to drain: latest is overwritten in place, so a reader
-// that wakes late reads the newest root by construction.
-func (e *Engine) publish(a anchor) {
+// publish keeps the freshest anchor as THE anchor and wakes EVERY
+// waiting reader — close-and-replace, because a buffered nudge wakes
+// one receiver and concurrent readers must not wait out their 2 s
+// tick to learn the anchor moved. A reader that woke late reads the
+// newest root by construction (latest is overwritten in place).
+func (e *Engine) publish(a Anchor) {
 	e.mu.Lock()
 	e.latest = &a
+	close(e.anchorSig)
+	e.anchorSig = make(chan struct{})
 	e.mu.Unlock()
-	select {
-	case e.anchorSig <- struct{}{}:
-	default: // a pending nudge already promises a re-look
-	}
 }
 
 // snapshot reads one trust position out of the verified store,
 // including the PROVEN exec coordinates the result shapes report
 // (lc.Store.FinalizedExecInfo / OptimisticExecInfo — fields of the
 // attested execution payload headers, not peer claims).
-func snapshot(st *lc.Store) anchor {
-	a := anchor{
+func snapshot(st *lc.Store) Anchor {
+	a := Anchor{
 		BeaconSlot: st.Finalized.Slot,
 		StateRoot:  st.FinalizedStateRoot(),
 	}
@@ -285,11 +295,11 @@ func snapshot(st *lc.Store) anchor {
 
 // Anchor is the newest verified anchor the LC has published (ok=false
 // before the first one).
-func (e *Engine) Anchor() (anchor, bool) {
+func (e *Engine) Anchor() (Anchor, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.latest == nil {
-		return anchor{}, false
+		return Anchor{}, false
 	}
 	return *e.latest, true
 }
@@ -352,11 +362,37 @@ type readResult struct {
 // answer, because "answered" is the CALLER's event, not the engine's.
 //
 // Concurrency: each call is one logical read with its own disclosure
-// memory (each peer learns the address at most once PER anchor PER
-// read). Concurrent calls are independent — they may each contact up
-// to snapread.MaxAttempts peers at the same anchor, which is the same
-// per-request bound every surface of this engine documents.
-func (e *Engine) Account(ctx context.Context, addr common.Address, slot [32]byte, wantSlot bool) (*AccountRead, error) {
+// memory. The bound is per ATTEMPT, not per call: every retry asks
+// only peers not yet contacted AT THE CURRENT ANCHOR (up to
+// snapread.MaxAttempts of them per attempt), so across a long call on
+// one anchor the address can reach every snap peer that goes READY
+// during the call — each exactly once, which is what the tried-set
+// guarantees. Concurrent calls are independent replicas of that
+// statement, each under its own memory.
+//
+// The address arrives as the caller's string and is echoed back in the
+// result shapes EXACTLY as given (the cross-engine contract —
+// host.rs passes the request's address_hex straight through); the
+// engine parses it here and refuses a malformed one rather than
+// accepting a parameter it cannot apply.
+func (e *Engine) Account(ctx context.Context, address string, slot [32]byte, wantSlot bool) (*AccountRead, error) {
+	if !common.IsHexAddress(address) {
+		return nil, fmt.Errorf("engine: %q is not a hex address", address)
+	}
+	addr := common.HexToAddress(address)
+	// Fail fast, honestly (the C ABI in part 1b would otherwise block
+	// a host thread forever): without the light client there is no
+	// anchor and never will be on this Engine (lcStart is once-only).
+	e.mu.Lock()
+	closed, started := e.closed, e.lcStarted
+	sig := e.anchorSig
+	e.mu.Unlock()
+	if closed {
+		return nil, fmt.Errorf("engine: closed")
+	}
+	if !started {
+		return nil, fmt.Errorf("engine: light client not started (StartLC)")
+	}
 	// tried maps anchor → peer ids already asked AT that anchor. The
 	// 3-attempt cap bounds ONE snapread call; this ticker re-runs the
 	// read, so without memory a failed read would reach a fresh random
@@ -375,7 +411,7 @@ func (e *Engine) Account(ctx context.Context, addr common.Address, slot [32]byte
 	// sessions take no context; the select does).
 	readRes := make(chan readResult, 1)
 	inFlight := false
-	attempt := func(a *anchor) {
+	attempt := func(a *Anchor) {
 		if inFlight {
 			return
 		}
@@ -426,7 +462,7 @@ func (e *Engine) Account(ctx context.Context, addr common.Address, slot [32]byte
 		}
 		inFlight = true
 		go func() {
-			r, err := attemptRead(a, untried, addr, slot, wantSlot)
+			r, err := attemptRead(a, untried, address, addr, slot, wantSlot)
 			readRes <- readResult{r, err}
 		}()
 	}
@@ -442,6 +478,7 @@ func (e *Engine) Account(ctx context.Context, addr common.Address, slot [32]byte
 	for {
 		e.mu.Lock()
 		a := e.latest
+		sig = e.anchorSig // re-arm on the current broadcast channel
 		e.mu.Unlock()
 		if a != nil {
 			attempt(a)
@@ -480,7 +517,7 @@ func (e *Engine) Account(ctx context.Context, addr common.Address, slot [32]byte
 				continue
 			}
 			return res.read, nil
-		case <-e.anchorSig: // anchor already re-read at the top of the loop
+		case <-sig: // anchor already re-read at the top of the loop
 		case <-reads.C:
 		}
 	}
@@ -492,7 +529,7 @@ func (e *Engine) Account(ctx context.Context, addr common.Address, slot [32]byte
 // payload header that root was read at. The caller runs this in a
 // goroutine — hops cost up to snapread.MaxAttempts × the request
 // timeout each.
-func attemptRead(a *anchor, peers []snapread.Peer, addr common.Address, slot [32]byte, wantSlot bool) (*AccountRead, error) {
+func attemptRead(a *Anchor, peers []snapread.Peer, address string, addr common.Address, slot [32]byte, wantSlot bool) (*AccountRead, error) {
 	if len(peers) == 0 {
 		return nil, fmt.Errorf("no snap-capable READY peers yet (anchor is ready: slot %d)", a.BeaconSlot)
 	}
@@ -501,17 +538,20 @@ func attemptRead(a *anchor, peers []snapread.Peer, addr common.Address, slot [32
 		return nil, err
 	}
 	rd := &AccountRead{
-		Address: addr,
-		Anchor:  *a,
-		Peers:   len(peers),
-		Outcome: out,
+		Address:    addr,
+		AddressHex: address, // echoed as supplied, as the Rust twin
+		Anchor:     *a,
+		Peers:      len(peers),
+		Outcome:    out,
 	}
 	if wantSlot {
 		if out.Absent() {
 			// An absent account has no storage: the slot is provably
 			// zero with no walk to do, and the JSON says so (exists
 			// false, null value) rather than staying silent about it.
-			rd.Slot = &SlotRead{Key: slot}
+			// The root both engines report for it is the empty-trie
+			// root (reader.rs:6996), not zeros.
+			rd.Slot = &SlotRead{Key: slot, StorageRoot: mpt.EmptyTrieRoot}
 		} else {
 			// SlotAt, not Slot: the account was just proven above — the
 			// storage hop must reuse that outcome and the SAME peer
@@ -557,5 +597,15 @@ func (e *Engine) Close() {
 		}
 		e.disc.Close()
 		e.dial.close()
+		// Wait for the LC goroutine's defer (h.Close, the libp2p host)
+		// before claiming release: an embedded host that restarts the
+		// engine must not find the old host still listening. Bounded —
+		// the loop's waits are all cancellable on this very ctx.
+		e.mu.Lock()
+		started := e.lcStarted
+		e.mu.Unlock()
+		if started {
+			<-e.lcDone
+		}
 	})
 }

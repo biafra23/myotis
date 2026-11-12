@@ -17,6 +17,7 @@ import (
 	"math/big"
 
 	"github.com/biafra23/myotis/go/internal/chain"
+	"github.com/biafra23/myotis/go/internal/mpt"
 	"github.com/biafra23/myotis/go/internal/snapwire"
 	"github.com/ethereum/go-ethereum/crypto"
 )
@@ -27,7 +28,7 @@ import (
 // attested execution payload header whose root the LC's execution branch
 // verified (lc.lcHeader.Exec*), so they carry the same proof as the state
 // root the read ran against — not peer claims.
-type anchor struct {
+type Anchor struct {
 	BeaconSlot       uint64
 	StateRoot        [32]byte
 	ExecNumber       uint64
@@ -42,9 +43,13 @@ type anchor struct {
 // trie, so no leaf walk was needed (or possible); both are proofs, not
 // gaps, and the JSON says exists=false with a null value.
 type SlotRead struct {
-	Key         [32]byte
-	Value       []byte
-	StorageRoot [32]byte // the PROVEN storageRoot the hop anchored at
+	Key   [32]byte
+	Value []byte
+	// StorageRoot is the PROVEN storageRoot the hop anchored at; for
+	// the absent-account short-circuit it is mpt.EmptyTrieRoot — what
+	// both engines report for an account with no storage
+	// (reader.rs:6996), not zeros.
+	StorageRoot [32]byte
 }
 
 // AccountRead is one verified account read: the proof-verified outcome at
@@ -52,12 +57,20 @@ type SlotRead struct {
 // the PROVEN storageRoot of the same read (one disclosure budget, never
 // 3+3 peers — see snapread.SlotAt).
 type AccountRead struct {
-	// Address is the 20 bytes the proof ran against (the parse of the
-	// caller's string) — the honest source for accountHashHex, so the
-	// JSON never re-parses a string that already fed the proof.
+	// Address is the 20 bytes the proof ran against — the honest source
+	// for accountHashHex (keccak of THESE bytes, never of a re-parsed
+	// string).
 	Address [20]byte
-	Anchor  anchor
-	Peers   int // snap peers contacted by the attempt that served it
+	// AddressHex is the caller's address string EXACTLY as supplied:
+	// host.rs:1682 hands the request's address_hex straight to
+	// account_json (storage_json's addressHex likewise,
+	// host.rs:1733-1739), and AccountProofResult.address documents
+	// "as given". Echoing is the cross-engine contract; the bytes
+	// above keep the proofs honest, this string keeps request/result
+	// matching stable between engines.
+	AddressHex string
+	Anchor     Anchor
+	Peers      int // snap peers contacted by the attempt that served it
 	// Outcome is the proof-verified verdict: AccountFound carries the
 	// decoded leaf, AccountProvenAbsent proves the key is not in the
 	// trie. AccountInvalid never reaches here (the read fails instead).
@@ -123,10 +136,7 @@ func (r *AccountRead) AccountJSON(nowUnix int64) (string, error) {
 func (r *AccountRead) buildAccount(nowUnix int64) (accountJSON, error) {
 	a := r.Anchor
 	c := accountJSON{
-		// Re-encoded from the proof's address bytes, lowercase — the
-		// Rust twin hexes the bytes it read, it does not echo the
-		// caller's string (eljson.rs hex0x_var).
-		Address:              hex0x(r.Address[:]),
+		Address:              r.AddressHex,
 		PeerStateRootHex:     hexHash(a.StateRoot),
 		PeerProofValid:       true,
 		BeaconChainVerified:  true,
@@ -153,12 +163,16 @@ func (r *AccountRead) buildAccount(nowUnix int64) (accountJSON, error) {
 		c.StorageRootHex = hexHash(l.StorageRoot)
 		c.CodeHashHex = hexHash(l.CodeHash)
 	case snapwire.AccountProvenAbsent:
-		// Proven absent: nonce -1 / balance null (Java convention), roots
-		// the zero value the proof's empty slot committed to.
+		// Proven absent: nonce -1 / balance null (the Java engine's
+		// VerifiedAccountQuery convention), and the roots the Rust twin
+		// reports — build_verified_account starts at EMPTY_TRIE_ROOT /
+		// EMPTY_CODE_HASH (reader.rs:6643-6644). NOT zeros: an
+		// exclusion proof commits to no leaf, and 0x00…00 is not the
+		// root of any trie.
 		c.Exists = false
 		c.Nonce = -1
-		c.StorageRootHex = hexHash([32]byte{})
-		c.CodeHashHex = hexHash([32]byte{})
+		c.StorageRootHex = hexHash(mpt.EmptyTrieRoot)
+		c.CodeHashHex = hexHash(mpt.EmptyCodeHash)
 	default:
 		// AccountInvalid must not reach the emitter (the read fails
 		// before assembling an AccountRead); belt-and-braces so a future
@@ -205,12 +219,19 @@ type storageJSON struct {
 // proven storageRoot) — the shapes describe one logical read's two hops.
 func (r *AccountRead) StorageJSON(nowUnix int64) (string, error) {
 	if r.Slot == nil {
-		return "", fmt.Errorf("engine: no slot read to render (address %s)", hex0x(r.Address[:]))
+		return "", fmt.Errorf("engine: no slot read to render (address %s)", r.AddressHex)
+	}
+	if r.Outcome.State == snapwire.AccountInvalid {
+		// The same refusal buildAccount makes: verifyMethod
+		// "stateRootMatch" below is a VERIFIED mark, and a zero
+		// Outcome must not render one any more than the account shape
+		// renders proven absence from it.
+		return "", fmt.Errorf("engine: refusing to emit storage result for unverified outcome state %d", r.Outcome.State)
 	}
 	a := r.Anchor
 	s := r.Slot
 	out := storageJSON{
-		AddressHex:           hex0x(r.Address[:]),
+		AddressHex:           r.AddressHex, // echoed as supplied, as the twin
 		HolderHex:            nil,
 		StorageKeyHex:        hexHash(s.Key),
 		StorageKeyHashHex:    hexKeccak(s.Key[:]),
@@ -242,7 +263,12 @@ func (r *AccountRead) StorageJSON(nowUnix int64) (string, error) {
 		}
 		out.Slot = n
 	}
-	if s.Value != nil {
+	// exists is the twin's `found` rule (reader.rs:7044): a NON-EMPTY
+	// value. A zero-length-but-non-nil slice — what DecodeStorageLeaf
+	// yields for an RLP empty string — reads as unset, exactly as
+	// reader.rs' `!value.is_empty()`. "nil vs empty" must not leak
+	// into a cross-engine shape.
+	if len(s.Value) > 0 {
 		out.Exists = true
 		out.SlotsReturned = 1
 		out.ValueHex = strPtr(hex0x(s.Value))

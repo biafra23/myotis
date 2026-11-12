@@ -176,7 +176,7 @@ func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, m
 	}
 	e.StartLC(readCtx)
 
-	rd, err := e.Account(readCtx, wantAddr, wantSlot, slotHex != "")
+	rd, err := e.Account(readCtx, getAccount, wantSlot, slotHex != "")
 	close(readDone)
 	<-sumDone
 	if err != nil {

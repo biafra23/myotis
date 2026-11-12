@@ -25,9 +25,9 @@ import (
 // goldens is constant forever: mainnet's beacon constants are pinned.
 const testNow = 1_800_000_100
 
-func testAnchor() anchor {
+func testAnchor() Anchor {
 	wall := chain.ConsensusMainnet().SlotAt(testNow)
-	return anchor{
+	return Anchor{
 		BeaconSlot:       wall - 10, // inside the 5-epoch slack → beaconSynced true
 		StateRoot:        fill(0x11),
 		ExecNumber:       23_456_789,
@@ -54,8 +54,13 @@ func foundRead(t *testing.T) *AccountRead {
 	}
 	return &AccountRead{
 		Address: common.HexToAddress("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"),
-		Anchor:  testAnchor(),
-		Peers:   3,
+		// The caller's checksummed form: the shapes echo it EXACTLY as
+		// supplied (eljson.rs address_echo, host.rs:1682) — a test
+		// that passed lowercase would pin the wrong half of the
+		// contract (PR #819 review).
+		AddressHex: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+		Anchor:     testAnchor(),
+		Peers:      3,
 		Outcome: snapwire.AccountOutcome{
 			State: snapwire.AccountFound,
 			Account: &mpt.AccountLeaf{
@@ -73,7 +78,7 @@ func TestAccountJSONGoldenFound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `{"address":"0xd8da6bf26964af9d7eed9e03e53415d37aa96045","exists":true,"nonce":42,"balanceWei":"12345678901234567890123","storageRootHex":"0x2222222222222222222222222222222222222222222222222222222222222222","codeHashHex":"0x3333333333333333333333333333333333333333333333333333333333333333","blockNumber":23456789,"blockTimestamp":1800000076,"blockHash":"0xabababababababababababababababababababababababababababababababab","peerStateRootHex":"0x1111111111111111111111111111111111111111111111111111111111111111","peerProofValid":true,"beaconChainVerified":true,"blsVerified":true,"matchedBeaconSlot":16097996,"verifyMethod":"stateRootMatch","failReason":null,"accountHashHex":"0x06e120c2c3547c60ee47f712d32e5acf38b35d1cc62e23b055a69bb88284c281","proofNodesHex":[],"beaconSynced":true,"finalizedPeriod":1965,"wallClockPeriod":1965,"finalizedBlockNumber":23456789,"optimisticBlockNumber":23456801,"anchor":"finalized"}`
+	const want = `{"address":"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045","exists":true,"nonce":42,"balanceWei":"12345678901234567890123","storageRootHex":"0x2222222222222222222222222222222222222222222222222222222222222222","codeHashHex":"0x3333333333333333333333333333333333333333333333333333333333333333","blockNumber":23456789,"blockTimestamp":1800000076,"blockHash":"0xabababababababababababababababababababababababababababababababab","peerStateRootHex":"0x1111111111111111111111111111111111111111111111111111111111111111","peerProofValid":true,"beaconChainVerified":true,"blsVerified":true,"matchedBeaconSlot":16097996,"verifyMethod":"stateRootMatch","failReason":null,"accountHashHex":"0x06e120c2c3547c60ee47f712d32e5acf38b35d1cc62e23b055a69bb88284c281","proofNodesHex":[],"beaconSynced":true,"finalizedPeriod":1965,"wallClockPeriod":1965,"finalizedBlockNumber":23456789,"optimisticBlockNumber":23456801,"anchor":"finalized"}`
 	if got != want {
 		t.Errorf("account JSON drifted:\n got %s\nwant %s", got, want)
 	}
@@ -86,10 +91,12 @@ func TestAccountJSONGoldenAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The eljson/Java convention for a proven-absent account: exists
-	// false, nonce -1, balance null, roots the zero value — never a
-	// missing key, never a fabricated leaf.
-	const want = `{"address":"0xd8da6bf26964af9d7eed9e03e53415d37aa96045","exists":false,"nonce":-1,"balanceWei":null,"storageRootHex":"0x0000000000000000000000000000000000000000000000000000000000000000","codeHashHex":"0x0000000000000000000000000000000000000000000000000000000000000000","blockNumber":23456789,"blockTimestamp":1800000076,"blockHash":"0xabababababababababababababababababababababababababababababababab","peerStateRootHex":"0x1111111111111111111111111111111111111111111111111111111111111111","peerProofValid":true,"beaconChainVerified":true,"blsVerified":true,"matchedBeaconSlot":16097996,"verifyMethod":"stateRootMatch","failReason":null,"accountHashHex":"0x06e120c2c3547c60ee47f712d32e5acf38b35d1cc62e23b055a69bb88284c281","proofNodesHex":[],"beaconSynced":true,"finalizedPeriod":1965,"wallClockPeriod":1965,"finalizedBlockNumber":23456789,"optimisticBlockNumber":23456801,"anchor":"finalized"}`
+	// The convention for a proven-absent account: exists false, nonce
+	// -1, balance null (Java's VerifiedAccountQuery), and the roots the
+	// Rust twin reports — EMPTY_TRIE_ROOT / EMPTY_CODE_HASH
+	// (reader.rs:6643-6644). Not zeros: 0x00…00 is not the root of any
+	// trie (PR #819 review).
+	const want = `{"address":"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045","exists":false,"nonce":-1,"balanceWei":null,"storageRootHex":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","codeHashHex":"0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470","blockNumber":23456789,"blockTimestamp":1800000076,"blockHash":"0xabababababababababababababababababababababababababababababababab","peerStateRootHex":"0x1111111111111111111111111111111111111111111111111111111111111111","peerProofValid":true,"beaconChainVerified":true,"blsVerified":true,"matchedBeaconSlot":16097996,"verifyMethod":"stateRootMatch","failReason":null,"accountHashHex":"0x06e120c2c3547c60ee47f712d32e5acf38b35d1cc62e23b055a69bb88284c281","proofNodesHex":[],"beaconSynced":true,"finalizedPeriod":1965,"wallClockPeriod":1965,"finalizedBlockNumber":23456789,"optimisticBlockNumber":23456801,"anchor":"finalized"}`
 	if got != want {
 		t.Errorf("absent-account JSON drifted:\n got %s\nwant %s", got, want)
 	}
@@ -112,7 +119,7 @@ func TestStorageJSONGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `{"addressHex":"0xd8da6bf26964af9d7eed9e03e53415d37aa96045","slot":7,"holderHex":null,"storageKeyHex":"0x0000000000000000000000000000000000000000000000000000000000000007","storageKeyHashHex":"0xa66cc928b5edb82af9bd49922954155ab7b0942694bea4ce44661d9a8736c688","exists":true,"valueHex":"0x2a","valueDecimal":"42","slotsReturned":1,"storageRootHex":"0x2222222222222222222222222222222222222222222222222222222222222222","proofNodesHex":[],"storageProofValid":true,"beaconSynced":true,"beaconChainVerified":true,"blsVerified":true,"matchedBeaconSlot":16097996,"verifyMethod":"stateRootMatch","failReason":null,"peerBlockNumber":23456789,"finalizedBlockNumber":23456789,"optimisticBlockNumber":23456801,"finalizedSlot":16097996,"optimisticSlot":16098008,"maxHeaderChainGap":8192,"anchor":"finalized"}`
+	const want = `{"addressHex":"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045","slot":7,"holderHex":null,"storageKeyHex":"0x0000000000000000000000000000000000000000000000000000000000000007","storageKeyHashHex":"0xa66cc928b5edb82af9bd49922954155ab7b0942694bea4ce44661d9a8736c688","exists":true,"valueHex":"0x2a","valueDecimal":"42","slotsReturned":1,"storageRootHex":"0x2222222222222222222222222222222222222222222222222222222222222222","proofNodesHex":[],"storageProofValid":true,"beaconSynced":true,"beaconChainVerified":true,"blsVerified":true,"matchedBeaconSlot":16097996,"verifyMethod":"stateRootMatch","failReason":null,"peerBlockNumber":23456789,"finalizedBlockNumber":23456789,"optimisticBlockNumber":23456801,"finalizedSlot":16097996,"optimisticSlot":16098008,"maxHeaderChainGap":8192,"anchor":"finalized"}`
 	if got != want {
 		t.Errorf("storage JSON drifted:\n got %s\nwant %s", got, want)
 	}
@@ -182,6 +189,35 @@ func TestAccountJSONKeySet(t *testing.T) {
 // failReason, peerBlockNumber, finalizedBlockNumber,
 // optimisticBlockNumber, finalizedSlot, optimisticSlot,
 // maxHeaderChainGap) plus anchor.
+func TestStorageJSONUnverifiedOutcomeRefused(t *testing.T) {
+	r := foundRead(t)
+	r.Outcome = snapwire.AccountOutcome{} // AccountInvalid
+	r.Slot = &SlotRead{Key: [32]byte{31: 1}}
+	if _, err := r.StorageJSON(testNow); err == nil {
+		t.Fatal("an unverified outcome must not render verifyMethod=stateRootMatch (PR #819 review)")
+	}
+}
+
+func TestStorageJSONEmptyValueIsNotExists(t *testing.T) {
+	// reader.rs:7044 found rule is !value.is_empty(): an RLP-empty-
+	// string leaf (zero-length, non-nil — what DecodeStorageLeaf
+	// yields) reads as unset, and nil-vs-empty must not leak into the
+	// cross-engine shape.
+	r := foundRead(t)
+	r.Slot = &SlotRead{Key: [32]byte{31: 2}, Value: []byte{}, StorageRoot: fill(0x22)}
+	got, err := r.StorageJSON(testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(got), &m); err != nil {
+		t.Fatal(err)
+	}
+	if string(m["exists"]) != "false" || string(m["slotsReturned"]) != "0" {
+		t.Errorf("empty value must read as unset (reader.rs:7044), got %s", got)
+	}
+}
+
 func TestStorageJSONKeySet(t *testing.T) {
 	r := foundRead(t)
 	r.Slot = &SlotRead{Key: [32]byte{}, Value: []byte{1}, StorageRoot: fill(0x22)}
