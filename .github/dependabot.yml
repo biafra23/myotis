@@ -15,6 +15,15 @@
 # image labels, and the test-only interpreters that still float on purpose
 # (setup-python `3.x` in mm-replay-tests.yml, Node `20` in smoke-gate-tests.yml:
 # neither touches a shipped artifact). claude-review.yml is excluded (see the github-actions entry).
+#
+# Monthly and grouped, so a month's moves arrive as a handful of PRs instead
+# of one per dependency: every PR runs the whole PR workflow set (and a
+# Gradle one the pin regeneration), and, moving a pin, needs a dispatched
+# `reproducible builds` run before it merges — per dependency, that cost
+# multiplied by every crate and library in the tree. Cargo and
+# Gradle split majors from minor + patch, so a breaking major cannot hold the
+# routine bumps back. Security updates are not grouped: they still come one
+# PR per advisory, off-schedule.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -30,7 +39,7 @@ updates:
     ignore:
       - dependency-name: "anthropics/claude-code-action"
     schedule:
-      interval: weekly
+      interval: monthly
     groups:
       github-actions:
         patterns: ["*"]
@@ -41,11 +50,21 @@ updates:
       - "/rust/roost"
       - "/rust/tor-poc"
     schedule:
-      interval: weekly
+      interval: monthly
     open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+      cargo-major:
+        update-types: ["major"]
 
   - package-ecosystem: gradle
     directory: "/"
     schedule:
-      interval: weekly
+      interval: monthly
     open-pull-requests-limit: 5
+    groups:
+      gradle-minor-patch:
+        update-types: ["minor", "patch"]
+      gradle-major:
+        update-types: ["major"]
