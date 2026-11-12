@@ -1,17 +1,11 @@
 name: Go engine
 
 on:
-  # Unlike ci.yml (push to main + tags only, to avoid double-building a branch
-  # that has an open PR), this workflow also builds pushes to the Go feature
-  # branch directly: there are no Gradle-heavy costs to duplicate here, and
-  # the branch gains its branch-protection signal before part PRs open.
-  # The path filter keeps Gradle/Rust work from paying for this job and vice
-  # versa. "feature/go-engine" becomes a dead entry when PR #773 merges and
-  # the branch is deleted — trim it to [ "main" ] in the first workflow touch
-  # after that merge (a stale branch name in branches: is harmless, just
-  # noise).
+  # Pushes to main. (It also built feature/go-engine, whose work landed with
+  # #773; that entry is dropped.) The path filter keeps Gradle/Rust work from
+  # paying for this job and vice versa.
   push:
-    branches: [ "main", "feature/go-engine" ]
+    branches: [ "main" ]
     paths:
       - "go/**"
       - ".github/workflows/go-engine.yml"
@@ -37,7 +31,9 @@ jobs:
     # Distinct from ci.yml's "Build and Test" — required-check matching is by
     # name, and this job is path-filtered so it is absent on most PRs.
     name: Go build and test
-    runs-on: ubuntu-latest
+    # A fixed runner image and SHA-pinned actions, like every other workflow:
+    # a tag or `-latest` label moves under the build without a commit here.
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     # The blst the reproducible-builds gate compares (scripts/repro/build_linux.sh
@@ -48,10 +44,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version-file: go/go.mod
           cache-dependency-path: go/go.sum
