@@ -18,27 +18,34 @@
 # whose `=` pins of tokio and futures follow the workspace's by hand.
 # claude-review.yml is excluded (see the github-actions entry).
 #
-# Monthly and grouped, so a month's moves arrive as a handful of PRs instead
-# of one per dependency: every PR runs the whole PR workflow set (and a
+# Grouped, and Cargo and Gradle monthly, so the routine moves arrive as a
+# handful of PRs instead of one per dependency: every PR runs the whole PR workflow set (and a
 # Gradle one the pin regeneration), and, moving a pin, needs a dispatched
 # `reproducible builds` run before it merges — per dependency, that cost
-# multiplied by every crate and library in the tree. Each group is ONE PR
-# across all directories of its entry (no `group-by`), so the three Cargo
-# workspaces, which share myotis-net by path, move together and their three
-# locks with them.
+# multiplied by every crate and library in the tree. A group without
+# `group-by` is ONE PR across all directories of its entry, so the three
+# Cargo workspaces, which share myotis-net by path, move together and their
+# three locks with them.
 #
-# The routine group holds only what should not break, and the line is not the
-# same per ecosystem, because Dependabot classifies an update by the first
-# version segment that moves, not by the ecosystem's compatibility rule:
-# - Gradle: majors apart from minor + patch. The Gradle wrapper is in
-#   neither group: it is the build tool itself (the pin regeneration runs
-#   under it, and its move needs its own `reproducible builds` run), so it
-#   comes as a PR of its own.
-# - Cargo: patches apart from minor + major. Cargo treats a 0.x minor
-#   (0.11 -> 0.12) as breaking, and most of this tree's `=` pins are 0.x
-#   (libp2p, discv5, k256, sha2, sha3, aes, hmac, Arti ...), so a "minor"
-#   group would carry breaking bumps. 1.x minors wait with them, the price
-#   of keeping the routine PR green.
+# One routine group per ecosystem holds what should not break; every update
+# that may break comes as a PR of its own (owner's decision, 2026-11-12), so
+# one migration never waits on another. Where the line falls differs per
+# ecosystem, because Dependabot classifies an update by the first version
+# segment that moves, not by the ecosystem's compatibility rule:
+# - Gradle: minor + patch grouped; each major its own PR. The Gradle wrapper
+#   is out of the group: it is the build tool itself (the pin regeneration
+#   runs under it, and its move needs its own `reproducible builds` run), so
+#   its minors come as a PR of their own too.
+# - Cargo: patches grouped; each minor or major its own PR. Cargo treats a
+#   0.x minor (0.11 -> 0.12) as breaking, and most of this tree's `=` pins
+#   are 0.x (libp2p, discv5, k256, sha2, sha3, aes, hmac, Arti ...). 1.x
+#   minors come one by one with them. `group-by: dependency-name` makes each
+#   one PR across the three workspaces; left ungrouped, a crate would move
+#   in three PRs, each regenerating one lock of three.
+#
+# The actions stay weekly and in one group: GitHub raises no Dependabot
+# alerts for actions pinned by SHA, which every action here is, so this run
+# is the only path by which a bad action gets replaced.
 #
 # To defer a major, add an `ignore:` entry with
 # `update-types: ["version-update:semver-major"]` to its entry here, like the
@@ -51,8 +58,7 @@
 # grouped: they come one PR per advisory and directory, off-schedule. A Cargo
 # one edits the shared rust/myotis-net/Cargo.toml from one workspace, so the
 # other two locks need `cargo update --workspace` by hand before `cargo locks`
-# passes. GitHub raises no Dependabot alerts for actions pinned by SHA, which
-# every action here is, so for the actions this monthly run is the only path.
+# passes. The actions get none at all (see above).
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -68,7 +74,7 @@ updates:
     ignore:
       - dependency-name: "anthropics/claude-code-action"
     schedule:
-      interval: monthly
+      interval: weekly
     groups:
       github-actions:
         patterns: ["*"]
@@ -86,6 +92,7 @@ updates:
         update-types: ["patch"]
       cargo-minor-major:
         update-types: ["minor", "major"]
+        group-by: dependency-name
 
   - package-ecosystem: gradle
     directory: "/"
@@ -95,7 +102,4 @@ updates:
     groups:
       gradle-minor-patch:
         update-types: ["minor", "patch"]
-        exclude-patterns: ["gradle-wrapper"]
-      gradle-major:
-        update-types: ["major"]
         exclude-patterns: ["gradle-wrapper"]
