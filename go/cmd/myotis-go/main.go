@@ -565,6 +565,7 @@ type dialer struct {
 	failures  map[string]int // dial-failure reason class → count
 	dialed    int            // candidates actually dialed
 	dropped   int            // candidates discarded with a full backlog
+	refused   int            // READY sessions closed at the door in read mode (handshake SUCCEEDED — counting these as failures would read as a broken dial wall)
 	gone      int            // READY sessions evicted after the peer died
 
 	wg        sync.WaitGroup
@@ -685,6 +686,25 @@ func (d *dialer) dialOnce(node *enode.Node) {
 		return
 	}
 
+	// Read mode: a peer without snap cannot serve the read, and a READY
+	// session has no other way out of the ready set short of the peer
+	// hanging up — so it would park a slot the snap-capable backlog
+	// needs (see dialer.requireSnap). Close it at the door and wake the
+	// workers so the backlog drains into the freed slot. Checked BEFORE
+	// the genesis probe: the capability is already known from Hello/
+	// Status negotiation (transport sets Snap there, synchronously
+	// inside Dial), and the probe only matters for sessions we keep —
+	// probing a session we are about to close spends a request
+	// timeout's worth of waiting for nothing.
+	if d.requireSnap && !sess.HasSnap() {
+		d.mu.Lock()
+		d.refused++
+		d.mu.Unlock()
+		sess.Close()
+		d.signal()
+		return
+	}
+
 	// Genesis probe: pull the header the pinned hash names and check
 	// keccak256(rlp) == the pin (docs/spec/02 §6.4: peers are checked,
 	// never trusted — this is the first instance of that in the Go engine).
@@ -704,20 +724,6 @@ func (d *dialer) dialOnce(node *enode.Node) {
 		d.log.Warn("ready peer failed the genesis probe", "id", node.ID().String(),
 			"reason", fmt.Sprintf("got %d header(s), keccak(rlp) %s", len(headers), hashOf(headers)))
 		sess.Close()
-		return
-	}
-
-	// Read mode: a peer without snap cannot serve the read, and a READY
-	// session has no other way out of the ready set short of the peer
-	// hanging up — so it would park a slot the snap-capable backlog
-	// needs (see dialer.requireSnap). Close it at the door and wake the
-	// workers so the backlog drains into the freed slot.
-	if d.requireSnap && !sess.HasSnap() {
-		d.mu.Lock()
-		d.failures["ready-without-snap"]++
-		d.mu.Unlock()
-		sess.Close()
-		d.signal()
 		return
 	}
 
@@ -810,6 +816,7 @@ func (d *dialer) stats() (ready int, outcome []string, clients []string) {
 	outcome = append(outcome,
 		fmt.Sprintf("dialed=%d", d.dialed),
 		fmt.Sprintf("failed=%d", sum(d.failures)),
+		fmt.Sprintf("refusedNoSnap=%d", d.refused),
 		fmt.Sprintf("died=%d", d.gone),
 		fmt.Sprintf("backlog=%d", len(d.order)),
 		fmt.Sprintf("backlogDropped=%d", d.dropped),

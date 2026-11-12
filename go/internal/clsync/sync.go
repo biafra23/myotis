@@ -268,6 +268,17 @@ func (s *Syncer) RunBootstrap(ctx context.Context) (*lc.Store, error) {
 	// caller's bootstrap budget (ctx) runs out — THAT is the real
 	// deadline the callers' log.Fatalf treats as fatal.
 	tried := map[peer.ID]bool{}
+	// Backoff between empty sweeps. A flat 2 s re-sweep (the first fix
+	// for "a pin that failed once is never re-asked") retried every
+	// pin ~95 times over the 4-minute budget — the same third-party
+	// Lighthouse token buckets this file paces catch-up at 11 s to
+	// respect, and these nodes answer sustained over-asking with 12 h
+	// IP bans (CLAUDE.md: "that ban IS #422"). Doubling to a 30 s cap
+	// keeps the retry (a restarting pin returns within the window) at
+	// ~a dozen asks per pin; any non-empty sweep resets it, so a pool
+	// that is still GROWING (discv5 adding) is never slowed.
+	backoff := 2 * time.Second
+	const backoffCap = 30 * time.Second
 	for {
 		if err := ctx.Err(); err != nil {
 			if lastErr != nil {
@@ -339,12 +350,20 @@ func (s *Syncer) RunBootstrap(ctx context.Context) (*lc.Store, error) {
 			// permanent tried-set would turn this window into five
 			// asks and a dead wait. Transient failures (a peer
 			// restarting, a dial racing its own listen port) deserve
-			// the retry; this pause IS the backoff.
+			// the retry; this pause IS the backoff (doubled, see
+			// above).
 			select {
 			case <-ctx.Done():
-			case <-time.After(2 * time.Second):
+			case <-time.After(backoff):
 				tried = map[peer.ID]bool{}
+				if backoff *= 2; backoff > backoffCap {
+					backoff = backoffCap
+				}
 			}
+		} else {
+			// Discovery brought new peers since the last sweep: the
+			// pool is growing, stay at full re-sweep pace.
+			backoff = 2 * time.Second
 		}
 	}
 }
@@ -375,7 +394,16 @@ func (s *Syncer) checkChunkDigest(digest []byte, what string) error {
 // range's start slot means "cannot answer"). A pool where everyone is
 // skipped still serves the round-robin pick rather than stalling — the
 // skip is a preference, as in the Rust candidate tiering (#291).
-func (s *Syncer) pickPeer(round int, startPeriod uint64) (*peerState, bool) {
+// pickPeer returns the peer to ask, whether one can provably serve the
+// range (false = all are pruned below startPeriod, ask anyway), and the
+// time its single-period cooldown expires (zero = ask now). The caller
+// MUST wait out a non-zero third return before asking — the fallback
+// that returns a cooling peer when every candidate is cooling keeps
+// progress possible, but querying it immediately would defeat the whole
+// point of the cooldown (PR #773 review round 2: in a pool of only
+// Lighthouse pins, every ask landed ~2 s after the peer's last one,
+// straight into the 1-token/10 s bucket the pacing exists for).
+func (s *Syncer) pickPeer(round int, startPeriod uint64) (*peerState, bool, time.Time) {
 	// One lock = one snapshot: indexing and the earliest reads all see
 	// the same world (the pre-fix version took a snapshot, released the
 	// lock, and could panic or read a torn list; the earliest reads also
@@ -384,7 +412,7 @@ func (s *Syncer) pickPeer(round int, startPeriod uint64) (*peerState, bool) {
 	defer s.peersMu.Unlock()
 	n := len(s.order)
 	if n == 0 {
-		return nil, false
+		return nil, false, time.Time{}
 	}
 	startSlot := startPeriod * chain.SlotsPerSyncCommitteePeriod
 	now := s.now()
@@ -397,18 +425,18 @@ func (s *Syncer) pickPeer(round int, startPeriod uint64) (*peerState, bool) {
 			// while a peer at full pace is available (the caller
 			// drops its batch to one period for it, see RunCatchUp).
 			if now.Before(p.coolUntil) {
-				if cooling == nil {
-					cooling = p
+				if cooling == nil || p.coolUntil.Before(cooling.coolUntil) {
+					cooling = p // the one whose cooldown clears soonest
 				}
 				continue
 			}
-			return p, true
+			return p, true, time.Time{}
 		}
 	}
 	if cooling != nil {
-		return cooling, true
+		return cooling, true, cooling.coolUntil
 	}
-	return s.peers[s.order[round%n]], false
+	return s.peers[s.order[round%n]], false, time.Time{}
 }
 
 // RunCatchUp walks periods forward with updates_by_range until the
@@ -459,7 +487,7 @@ func (s *Syncer) RunCatchUp(ctx context.Context, store *lc.Store) error {
 		// walk at order[1], asking roost only in the fifth round,
 		// straight into the Lighthouse pins that truncate a
 		// multi-period ask to one chunk.
-		p, served := s.pickPeer(round, start)
+		p, served, coolUntil := s.pickPeer(round, start)
 		round++
 		if p == nil {
 			return errors.New("clsync: catch-up has no peers")
@@ -468,11 +496,24 @@ func (s *Syncer) RunCatchUp(ctx context.Context, store *lc.Store) error {
 			s.Logf("catch-up: all peers pruned before period %d; asking %s anyway", start, p.info.ID)
 		}
 		if p.singlePeriod {
-			// A peer learned to ration multi-period asks gets one
-			// period per ask instead of a batch it would truncate
-			// after the first chunk, re-spaced at the cooldown so a
-			// pool of rate-limited pins is walked at their pace.
-			count = 1
+			count = 1 // one period per ask — a batch it would truncate anyway
+		}
+		if wait := coolUntil.Sub(s.now()); wait > 0 {
+			// Every candidate is mid-rate-limit: this is THE case the
+			// cooldown exists for (a pool of nothing but Lighthouse
+			// pins), so wait for the soonest one to clear instead of
+			// asking it ~2 s after its last ask.
+			s.Logf("catch-up: every candidate rate-spacing; waiting %s for %s",
+				wait.Round(time.Second), p.info.ID)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(wait):
+			}
+		}
+		if p.singlePeriod {
+			// Re-space the NEXT ask to this peer from now (the pick
+			// above only paced this one).
 			s.markSinglePeriod(p)
 		}
 		if err := s.ensureStatus(ctx, p); err != nil {

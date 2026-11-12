@@ -111,6 +111,13 @@ func main() {
 	// re-fetch at every period crossing "or finality verifies fail
 	// indefinitely").
 	advanced := false
+	// verified = a finality poll ran the full BLS path THIS run
+	// (Advanced or Stale — Stale is verified, just not newer). The
+	// exit-code honesty at the end needs it: with the first catch-up
+	// no longer fatal (PR #773 review), a run where nothing ever
+	// verified must not exit 0 with an hours-old checkpoint anchor
+	// printed as if it were this run's work.
+	verified := false
 	for ctx.Err() == nil {
 		if err := syncer.RunCatchUp(ctx, st); err != nil {
 			logf("re-catch-up: %v", err)
@@ -123,6 +130,9 @@ func main() {
 				logf("finality poll: %v", err)
 			} else {
 				logf("finality poll: outcome %v, finalized slot %d", outcome, st.Finalized.Slot)
+				if outcome == lc.Advanced || outcome == lc.Stale {
+					verified = true
+				}
 				if outcome == lc.Advanced {
 					advanced = true
 					if *once {
@@ -142,9 +152,16 @@ func main() {
 
 	// A budget that ran out without one Advanced is a failure, not a
 	// quiet success: a smoke keying off the exit code must not pass
-	// vacuously when every poll errored.
+	// vacuously when every poll errored. And in NON-once mode the bar
+	// is now "something verified at all" (not -once-gated): since the
+	// first catch-up stopped being fatal, a run whose pins all refused
+	// would otherwise print the hours-old checkpoint anchor and exit 0,
+	// indistinguishable from a healthy run.
 	if *once && !advanced {
 		log.Fatalf("budget expired without a finality advance (finalized slot %d)", st.Finalized.Slot)
+	}
+	if !verified {
+		log.Fatalf("nothing verified this run (finalized slot %d is the embedded checkpoint, advanced by neither catch-up nor a poll)", st.Finalized.Slot)
 	}
 }
 

@@ -14,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 	"testing"
 )
@@ -27,7 +26,13 @@ func rustConstStrings(t *testing.T, src, name string) []string {
 	}
 	// Comments quote prose ("Unexpected peer ID", "connection closed")
 	// that the naive literal scan would swallow — strip them first.
-	body := regexp.MustCompile(`(?m)//[^\n]*`).ReplaceAllString(m[1], "")
+	// Anchored to whole-line comments on purpose: an unanchored `//`
+	// strip would also cut inside a literal, so a future pin containing
+	// `//` (an enrtree:// seed, say) would be truncated mid-URL and the
+	// failure message would point at the wrong thing. These Rust arrays
+	// keep comments on their own lines — hold that style if a pin ever
+	// grows a trailing comment, or upgrade the parser here.
+	body := regexp.MustCompile(`(?m)^[ \t]*//[^\n]*`).ReplaceAllString(m[1], "")
 	var out []string
 	for _, lit := range regexp.MustCompile(`"([^"]+)"`).FindAllStringSubmatch(body, -1) {
 		out = append(out, lit[1])
@@ -35,25 +40,26 @@ func rustConstStrings(t *testing.T, src, name string) []string {
 	if len(out) == 0 {
 		t.Fatalf("const %s parsed empty", name)
 	}
-	sort.Strings(out)
 	return out
 }
 
 func checkSameSet(t *testing.T, name string, rust, goList []string) {
 	t.Helper()
-	goSorted := append([]string(nil), goList...)
-	sort.Strings(goSorted)
+	goSet := make(map[string]bool, len(goList))
+	for _, s := range goList {
+		goSet[s] = true
+	}
+	var onlyRust, onlyGo []string
+	for _, s := range rust {
+		if !goSet[s] {
+			onlyRust = append(onlyRust, s)
+		}
+	}
 	rustSet := make(map[string]bool, len(rust))
 	for _, s := range rust {
 		rustSet[s] = true
 	}
-	var onlyRust, onlyGo []string
-	for _, s := range rust {
-		if !contains(goSorted, s) {
-			onlyRust = append(onlyRust, s)
-		}
-	}
-	for _, s := range goSorted {
+	for _, s := range goList {
 		if !rustSet[s] {
 			onlyGo = append(onlyGo, s)
 		}
@@ -62,11 +68,6 @@ func checkSameSet(t *testing.T, name string, rust, goList []string) {
 		t.Errorf("%s drifted between rust/myotis-net/src/sync.rs and internal/clsync/peers.go — move both together (a re-census must not leave one engine dialing retired pins):\n  only in rust: %s\n  only in go:   %s",
 			name, strings.Join(onlyRust, ", "), strings.Join(onlyGo, ", "))
 	}
-}
-
-func contains(s []string, v string) bool {
-	i := sort.SearchStrings(s, v)
-	return i < len(s) && s[i] == v
 }
 
 func TestMainnetCLPinsMatchRustEngine(t *testing.T) {
