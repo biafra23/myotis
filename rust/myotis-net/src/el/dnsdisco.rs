@@ -554,8 +554,9 @@ fn shuffle<T>(items: &mut [T]) {
 pub const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The platform's resolver configuration (`/etc/resolv.conf` on unix, the
-/// registry on Windows), one TXT query at a time. hickory is already compiled
-/// in through libp2p's DNS transport, so this adds no dependency.
+/// registry on Windows), one TXT query at a time, through hickory (the
+/// version pinned in Cargo.toml, newer than the one libp2p's DNS transport
+/// pins; see there).
 pub struct SystemResolver {
     inner: hickory_resolver::TokioResolver,
 }
@@ -571,7 +572,9 @@ impl SystemResolver {
         opts.timeout = LOOKUP_TIMEOUT;
         opts.attempts = 1;
         Ok(SystemResolver {
-            inner: builder.build(),
+            inner: builder
+                .build()
+                .map_err(|e| format!("system resolver: {e}"))?,
         })
     }
 }
@@ -587,20 +590,32 @@ impl TxtLookup for SystemResolver {
             match self.inner.txt_lookup(fqdn).await {
                 // A record's segments concatenate (TXT strings are at most 255
                 // bytes, a long ENR is split over several).
-                Ok(lookup) => Ok(lookup
-                    .iter()
-                    .map(|txt| {
-                        txt.txt_data()
-                            .iter()
-                            .map(|seg| String::from_utf8_lossy(seg))
-                            .collect::<String>()
-                    })
-                    .collect()),
+                Ok(lookup) => Ok(txt_strings(&lookup)),
                 Err(e) if e.is_no_records_found() || e.is_nx_domain() => Ok(Vec::new()),
                 Err(e) => Err(e.to_string()),
             }
         })
     }
+}
+
+/// One string per TXT record of a lookup's answers, its segments concatenated
+/// (TXT strings are at most 255 bytes, a long ENR is split over several).
+/// Only the TXT answers: a CNAME the resolver followed sits in the same
+/// section.
+fn txt_strings(lookup: &hickory_resolver::lookup::Lookup) -> Vec<String> {
+    lookup
+        .answers()
+        .iter()
+        .filter_map(|record| match &record.data {
+            hickory_resolver::proto::rr::RData::TXT(txt) => Some(
+                txt.txt_data
+                    .iter()
+                    .map(|seg| String::from_utf8_lossy(seg))
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -883,6 +898,33 @@ mod tests {
     use super::*;
     use myotis_core::nodekey::NodeKey;
     use std::collections::HashMap;
+
+    /// The system resolver's answer mapping (live lookups are covered by the
+    /// ignored `live_dns_tree` test): one string per TXT record, segments
+    /// joined in order, and a CNAME in the answer section skipped.
+    #[test]
+    fn txt_strings_joins_segments_and_skips_other_records() {
+        use hickory_resolver::lookup::Lookup;
+        use hickory_resolver::proto::op::Query;
+        use hickory_resolver::proto::rr::rdata::{CNAME, TXT};
+        use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
+        let name = Name::from_ascii("all.mainnet.ethdisco.net.").unwrap();
+        let target = Name::from_ascii("tree.example.org.").unwrap();
+        let answers = vec![
+            Record::from_rdata(name.clone(), 60, RData::CNAME(CNAME(target.clone()))),
+            Record::from_rdata(
+                target.clone(),
+                60,
+                RData::TXT(TXT::new(vec!["enrtree-root:v1 ".into(), "e=ABC".into()])),
+            ),
+            Record::from_rdata(target, 60, RData::TXT(TXT::new(vec!["second".into()]))),
+        ];
+        let lookup = Lookup::new_with_max_ttl(Query::query(name, RecordType::TXT), answers);
+        assert_eq!(
+            txt_strings(&lookup),
+            vec!["enrtree-root:v1 e=ABC".to_string(), "second".to_string()]
+        );
+    }
 
     fn key(n: u8) -> NodeKey {
         let mut secret = [0u8; 32];

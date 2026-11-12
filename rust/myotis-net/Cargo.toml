@@ -45,9 +45,11 @@ discv5 = "=0.11.0"
 # in the lock via enr — no new download.
 alloy-rlp = "=0.3.16"
 # The EIP-1459 DNS tree walk (#539, part 3): TXT lookups over the system
-# resolver. Already in every lock through libp2p's `dns` transport with these
-# same features — no new download.
-hickory-resolver = { version = "=0.25.2", default-features = false, features = ["system-config", "tokio"] }
+# resolver. 0.26.3 for the 0.26.2 security release (DNS response parsing,
+# UDP spoofing and resource-exhaustion fixes); libp2p 0.56's `dns` transport
+# still pins 0.25.2, so both versions sit in the lock until libp2p moves to
+# 0.57, whose libp2p-dns takes 0.26.
+hickory-resolver = { version = "=0.26.3", default-features = false, features = ["system-config", "tokio"] }
 snap = "=1.1.1"
 tracing = "=0.1.44"
 futures = "=0.3.32"
