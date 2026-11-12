@@ -40,6 +40,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # The blst the reproducible-builds gate compares (scripts/repro/build_linux.sh
+    # defines these flags): portable, run-time ADX/BMI2 dispatch, as the Rust
+    # engine's. Without them the tests would run the bindings' -D__ADX__ build.
+    env:
+      CGO_CFLAGS: "-O2 -g -D__BLST_PORTABLE__"
 
     steps:
       - name: Checkout code

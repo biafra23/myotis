@@ -3,7 +3,8 @@
 #
 # docker/builder/ pins the toolchain of the Android release builds (base image
 # by digest, apt by snapshot, the JDK / rustup / Android command-line tools by
-# SHA-256, rustc / the NDK / build-tools / cargo-ndk by exact version).
+# SHA-256, rustc / the NDK / build-tools / cargo-ndk by exact version, Go by
+# SHA-256 for the Go engine).
 # docker/builder/check.sh compares each tool in an image, run as an
 # unprivileged uid, with `build.sh --print-args`.
 #

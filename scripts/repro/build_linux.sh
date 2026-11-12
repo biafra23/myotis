@@ -60,6 +60,19 @@ app_version=()
 # a quote there, even within double quotes.
 echo "build_linux.sh: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH, engine library version: ${version:-the release version of the tree}"
 
+# The Go engine's modules first, with the same retries as the Gradle build
+# below: the module proxy is the one network step of its build, and a go.sum
+# mismatch should fail in the first minute, not after the Gradle build.
+# -modcacherw: Go leaves its module cache read-only, which makes the build's
+# HOME undeletable for the next run (no effect on the output).
+export GOTOOLCHAIN=local GOFLAGS="-trimpath -mod=readonly -buildvcs=false -modcacherw"
+for attempt in 1 2 3; do
+    (cd go && go mod download) && break
+    [[ $attempt -lt 3 ]] || { echo "::error::go mod download failed after 3 attempts"; exit 1; }
+    echo "::warning::go mod download attempt $attempt failed; retrying in 25s"
+    sleep 25
+done
+
 for attempt in 1 2 3; do
     rm -rf build/maven-repo
     ./gradlew "$flag" ${app_version[@]+"${app_version[@]}"} cargoBuildHost \
@@ -88,6 +101,10 @@ python3 -I scripts/check_16k_alignment.py android-app/build/outputs/apk/release/
 # #734 D3). CGO_CFLAGS replaces Go's default, so -O2 -g stay in it.
 # Module sources come through GOPROXY and are checked against go/go.sum.
 rm -rf build/go
-(cd go && GOTOOLCHAIN=local CGO_ENABLED=1 CGO_CFLAGS="-O2 -g -D__BLST_PORTABLE__" \
-    GOFLAGS="-trimpath -mod=readonly -buildvcs=false" \
+# GOTOOLCHAIN and GOFLAGS are exported above. go-engine.yml tests with the same
+# CGO_CFLAGS, so the blst the gate compares is the blst the tests run.
+# The binaries link glibc dynamically (cgo): the image's, 2.43. Before anything
+# publishes them, record the symbol versions they need (objdump -T), as the
+# release does for its host libraries' 2.35 floor.
+(cd go && CGO_ENABLED=1 CGO_CFLAGS="-O2 -g -D__BLST_PORTABLE__" \
     go build -o ../build/go/ ./cmd/myotis-go ./cmd/myotis-lc)
