@@ -2402,7 +2402,7 @@ async fn run_sync(
     // Where in each slot the steady-state finality poll fires (drawn once per run).
     let poll_offset_ms = {
         let mut b = [0u8; 8];
-        let random = getrandom::getrandom(&mut b).map(|()| u64::from_le_bytes(b)).unwrap_or(0);
+        let random = getrandom::fill(&mut b).map(|()| u64::from_le_bytes(b)).unwrap_or(0);
         finality_poll_offset_ms(config.seconds_per_slot, random)
     };
 

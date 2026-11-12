@@ -1730,7 +1730,7 @@ impl PeerPool {
         // A fresh order among equals for each call: successive reads spread
         // over the reserve instead of all reaching its first few nodes.
         let mut seed = [0u8; 8];
-        let _ = getrandom::getrandom(&mut seed);
+        let _ = getrandom::fill(&mut seed);
         let cached = self
             .inner
             .tor_reserve
@@ -2139,7 +2139,7 @@ impl ContactLog {
 static TOR_RESERVE_SALT: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
     let mut salt = [0u8; 32];
     // No entropy: an all-zero salt still fills the reserve, in a guessable order.
-    let _ = getrandom::getrandom(&mut salt);
+    let _ = getrandom::fill(&mut salt);
     salt
 });
 
