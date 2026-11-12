@@ -75,7 +75,11 @@
 # cooldown to them). On GitHub Actions only `default-days` exists. The same
 # 7 days hold for a HAND bump of the trees above that no entry covers: never
 # regenerate a lock onto a release younger than that (`npm install`, `npm
-# update`, `go get` take whatever is newest that minute).
+# update`, `go get` take whatever is newest that minute). It filters the
+# version Dependabot proposes, not the transitives a lock regeneration picks
+# that day (the lock and hash diff stays the check for those). For the actions
+# it delays the fix as well, since they get no security updates: when an
+# advisory names an action used here, move its SHA by hand.
 version: 2
 updates:
   - package-ecosystem: github-actions
