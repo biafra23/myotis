@@ -587,20 +587,20 @@ func newDialer(key *ecdsa.PrivateKey, netCfg *chain.Network, workers, maxReady i
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &dialer{
-		key:       key,
-		network:   netCfg,
-		log:       log.With("component", "dialer"),
+		key:         key,
+		network:     netCfg,
+		log:         log.With("component", "dialer"),
 		tcpPort:     tcpPort,
 		maxReady:    maxReady,
 		requireSnap: requireSnap,
-		ctx:       ctx,
-		cancel:    cancel,
-		wake:      make(chan struct{}, 1),
-		attempted: map[string]bool{},
-		backlog:   map[enode.ID]*enode.Node{},
-		ready:     map[enode.ID]*transport.Session{},
-		clients:   map[string]int{},
-		failures:  map[string]int{},
+		ctx:         ctx,
+		cancel:      cancel,
+		wake:        make(chan struct{}, 1),
+		attempted:   map[string]bool{},
+		backlog:     map[enode.ID]*enode.Node{},
+		ready:       map[enode.ID]*transport.Session{},
+		clients:     map[string]int{},
+		failures:    map[string]int{},
 	}
 	for i := 0; i < workers; i++ {
 		d.wg.Add(1)

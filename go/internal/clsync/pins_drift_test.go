@@ -21,7 +21,7 @@ import (
 
 func rustConstStrings(t *testing.T, src, name string) []string {
 	t.Helper()
-	m := regexp.MustCompile(`(?s)const `+name+`:[^=]*= &\[(.*?)\];`).FindStringSubmatch(src)
+	m := regexp.MustCompile(`(?s)const ` + name + `:[^=]*= &\[(.*?)\];`).FindStringSubmatch(src)
 	if m == nil {
 		t.Fatalf("const %s not found in rust/myotis-net/src/sync.rs — the pin list was renamed or restructured; update this test and peers.go together", name)
 	}
