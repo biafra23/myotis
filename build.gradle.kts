@@ -1037,16 +1037,23 @@ tasks.register<Exec>("uniffiGenerateKotlin") {
     // upgrade that drops the mask, or changes this output shape, must be looked at.
     doLast {
         val text = bindingsFile.readText()
-        val declared = Regex("""fun \w+_checksum_\w+\(""").findAll(text).count()
-        val masked = Regex("""if \(\(lib\.\w+_checksum_\w+\(\) and 0xFFFF\) != \d+\)""")
-            .findAll(text).count()
+        // By NAME, not by count: each declared function exactly once among the
+        // masked comparisons, so a duplicate for one cannot hide a missing other.
+        val declared = Regex("""fun (\w+_checksum_\w+)\(""").findAll(text)
+            .map { it.groupValues[1] }.toList()
+        val masked = Regex("""if \(\(lib\.(\w+_checksum_\w+)\(\) and 0xFFFF\) != \d+\)""")
+            .findAll(text).map { it.groupValues[1] }.toList()
         val unmasked = Regex("""_checksum_\w+\(\)\s*!=""").findAll(text).count()
-        check(declared > 0 && masked == declared && unmasked == 0) {
-            "uniffiGenerateKotlin: $declared checksum functions declared, $masked masked " +
-                "comparisons, $unmasked unmasked in $bindingsFile — UniFFI's output " +
-                "changed; check whether it still masks the u16 checksums it reads as Int"
+        check(
+            declared.isNotEmpty() && masked.sorted() == declared.sorted() &&
+                masked.toSet().size == masked.size && unmasked == 0
+        ) {
+            "uniffiGenerateKotlin: ${declared.size} checksum functions declared, " +
+                "${masked.size} masked comparisons (missing: ${declared - masked.toSet()}), " +
+                "$unmasked unmasked in $bindingsFile — UniFFI's output changed; check " +
+                "whether it still masks the u16 checksums it reads as Int"
         }
-        logger.lifecycle("uniffiGenerateKotlin: all $masked checksum comparisons masked to 16 bits")
+        logger.lifecycle("uniffiGenerateKotlin: all ${masked.size} checksum comparisons masked to 16 bits")
     }
 }
 
