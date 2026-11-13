@@ -1301,6 +1301,19 @@ impl PoolInner {
     async fn dial_one(self: &Arc<PoolInner>, addr: SocketAddr, pubkey: [u8; 64], bal_only: bool) {
         let conn = match RlpxConnection::dial_metered(Arc::clone(&self.key), addr, pubkey, Some(Arc::clone(&self.traffic))).await {
             Ok(conn) => conn,
+            Err(e) if crate::el::rlpx::transport::is_local_entropy_failure(&e) => {
+                // OUR randomness is missing (early boot, a seccomp sandbox): no
+                // handshake can run against anyone, and it is not this peer's
+                // doing — no cache strike. The address still cools off, like
+                // every other dial that ends outside the pool: the peer accepted
+                // our TCP connection, so its inbound throttle is armed
+                // (`PEER_INBOUND_THROTTLE`) and a re-dial inside it would only
+                // buy the strike this arm avoids.
+                tracing::warn!(%addr, error = %e, "el dial: no OS entropy, handshake skipped");
+                self.record_backoff(addr, BackoffKind::Transient, Instant::now()).await;
+                self.attempted.lock().await.remove(&addr);
+                return;
+            }
             Err(e) => {
                 // Transport-level failure (refused/timeout/ECIES) — the peer is
                 // GONE, not incompatible. Streaks of these demote and eventually
