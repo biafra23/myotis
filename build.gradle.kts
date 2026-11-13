@@ -1024,33 +1024,36 @@ tasks.register<Exec>("uniffiGenerateKotlin") {
     val bindingsFile = project(":myotis-engine-rust").projectDir
         .resolve("src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt")
     outputs.files(bindingsFile)
-    // UniFFI 0.32's Kotlin generator reads each u16 API checksum through a 32-bit
-    // `Int` (JNA direct mapping) and compares it UNMASKED, so the integrity check
-    // passes only while the native side happens to leave the upper 16 bits zero —
-    // which the x86-64 ABIs do not promise. A debug Linux build returns 0x5DB5166E
-    // for checksum 5742 (0x166E), and the Windows msi's engine failed every check,
-    // so the app fell back to the Java engine (desktop-windows-msi.yml). The checksum
-    // is the low 16 bits, so compare those. Applied here, at generation, because the
-    // APK workflow regenerates the committed file and fails on any drift. Fail-loud:
-    // a UniFFI upgrade that changes this output shape must be looked at, not skipped.
+    // Each u16 API checksum is read through a 32-bit `Int` (JNA direct mapping), so
+    // the integrity check must compare only its low 16 bits: the x86-64 ABIs do not
+    // promise zeroed upper bits. UniFFI 0.32.0 compared UNMASKED — a debug Linux
+    // build returned 0x5DB5166E for checksum 5742 (0x166E), and the Windows msi's
+    // engine failed every check, so the app fell back to the Java engine
+    // (desktop-windows-msi.yml) — and this task rewrote each comparison. UniFFI
+    // 0.32.2 masks them itself (mozilla/uniffi-rs#2935, the same `and 0xFFFF`), so
+    // the task now only CHECKS: every declared checksum function has exactly one
+    // masked comparison and none is unmasked. Fail-loud, at generation, because the
+    // APK workflow regenerates the committed file and fails on any drift: a UniFFI
+    // upgrade that drops the mask, or changes this output shape, must be looked at.
     doLast {
-        val unmasked = Regex("""if \(lib\.(\w+_checksum_\w+)\(\) != (\d+)\)""")
         val text = bindingsFile.readText()
-        val count = unmasked.findAll(text).count()
-        val masked = unmasked.replace(text) { m ->
-            "if ((lib.${m.groupValues[1]}() and 0xFFFF) != ${m.groupValues[2]})"
+        // By NAME, not by count: each declared function exactly once among the
+        // masked comparisons, so a duplicate for one cannot hide a missing other.
+        val declared = Regex("""fun (\w+_checksum_\w+)\(""").findAll(text)
+            .map { it.groupValues[1] }.toList()
+        val masked = Regex("""if \(\(lib\.(\w+_checksum_\w+)\(\) and 0xFFFF\) != \d+\)""")
+            .findAll(text).map { it.groupValues[1] }.toList()
+        val unmasked = Regex("""_checksum_\w+\(\)\s*!=""").findAll(text).count()
+        check(
+            declared.isNotEmpty() && masked.sorted() == declared.sorted() &&
+                masked.toSet().size == masked.size && unmasked == 0
+        ) {
+            "uniffiGenerateKotlin: ${declared.size} checksum functions declared, " +
+                "${masked.size} masked comparisons (missing: ${declared - masked.toSet()}), " +
+                "$unmasked unmasked in $bindingsFile — UniFFI's output changed; check " +
+                "whether it still masks the u16 checksums it reads as Int"
         }
-        // Every declared checksum function must have exactly one comparison, and it
-        // must now be masked: a partly changed output shape must not pass as success.
-        val declared = Regex("""fun \w+_checksum_\w+\(""").findAll(masked).count()
-        val leftover = Regex("""_checksum_\w+\(\)\s*!=""").findAll(masked).count()
-        check(count > 0 && count == declared && leftover == 0) {
-            "uniffiGenerateKotlin: $count checksum comparisons rewritten, $declared checksum " +
-                "functions declared, $leftover comparisons left unmasked in $bindingsFile — " +
-                "UniFFI's output changed; check whether it still reads u16 checksums as Int"
-        }
-        bindingsFile.writeText(masked)
-        logger.lifecycle("uniffiGenerateKotlin: masked $count checksum comparisons to 16 bits")
+        logger.lifecycle("uniffiGenerateKotlin: all ${masked.size} checksum comparisons masked to 16 bits")
     }
 }
 
