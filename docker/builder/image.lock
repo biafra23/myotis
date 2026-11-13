@@ -9,6 +9,6 @@
 # `builder image` workflow builds and publishes the new image and fails with
 # the two lines to put here (docker/builder/publish.sh), and it fails whenever
 # these lines do not name what the registry serves for the key.
-# Built and published by https://github.com/biafra23/myotis/actions/runs/43232828011 at commit ed34945b2e3d6ac9cfb2f10aa6f8523eca15fe94.
-key=fb9b84a97a690305b350f374406f6646eef7381ad5539215ec8aaeff97c0171c
-image=ghcr.io/biafra23/myotis-builder@sha256:83344dbdf60594376ee26dd86ecc0493720181351404a11770c4e0ba19cf0871
+# Built and published by https://github.com/biafra23/myotis/actions/runs/43432400507 at commit f0a1b472a7e9e40e4829fa11033e637243f9e81f.
+key=723fa333fe5ab095deee683799823b6ca90d32fcfd8953605a9aa6f4151187a0
+image=ghcr.io/biafra23/myotis-builder@sha256:926b968e81168bf69390e811f0668e6b5867952ea2f79e3d3b75f37596bdc7d2
