@@ -938,6 +938,10 @@ tasks.withType<org.jetbrains.compose.desktop.application.tasks.AbstractJPackageT
 // without the Rust engine until the packaging PR.
 tasks.withType<JavaExec>().matching { it.name == "run" || it.name == "syncSmoke" }.configureEach {
     dependsOn(rootProject.tasks.named("cargoBuildHost"))
+    // The Go engine's c-shared lib (desktop-only engine, -Pengine=go): the build
+    // self-skips without the go toolchain, and the doFirst below only injects the
+    // path when the file exists — so a go-less dev box stays on the other engines.
+    dependsOn(rootProject.tasks.named("goBuildCShared"))
     // Compose's run passes the macOS icon as -Xdock:icon=<file>: a string, so no task edge.
     if (isMacHost && name == "run") dependsOn(generateMacIcon)
     // Compose names only the packaged app (-Xdock:name), so the macOS menu bar named a dev run
@@ -946,7 +950,7 @@ tasks.withType<JavaExec>().matching { it.name == "run" || it.name == "syncSmoke"
     // Cmd-Tab still says "java": macOS names a bundle-less process after its executable, and
     // JavaExec always runs the toolchain's own `java`. runDistributable runs the real bundle.
     if (isMacHost && name == "run") systemProperty("apple.awt.application.name", appName)
-    // -Pengine=java|rust|auto → -Dmyotis.engine (same knob as :app run).
+    // -Pengine=java|rust|go|auto → -Dmyotis.engine (same knob as :app run).
     (project.findProperty("engine") as String?)?.let { systemProperty("myotis.engine", it) }
     // -Ptor=true → -Dmyotis.tor (dev knob to force Tor routing on at boot; needs the
     // engine dylib built with -PtorEngine to actually route — docs/how-it-works/privacy-and-tor.md).
@@ -960,6 +964,16 @@ tasks.withType<JavaExec>().matching { it.name == "run" || it.name == "syncSmoke"
         }
         rootProject.file("rust/target/release/$lib").takeIf { it.exists() }?.let {
             systemProperty("myotis.engine.lib", it.absolutePath)
+        }
+        // The Go engine's lib by absolute path (GoEngineNative's twin of the
+        // myotis.engine.lib contract; only read when -Pengine=go routes it).
+        val goLib = when {
+            os.contains("mac") -> "libmyotis_engine_go.dylib"
+            os.contains("win") -> "myotis_engine_go.dll"
+            else -> "libmyotis_engine_go.so"
+        }
+        rootProject.file("go/build/$goLib").takeIf { it.exists() }?.let {
+            systemProperty("myotis.engine.go.lib", it.absolutePath)
         }
     }
 }

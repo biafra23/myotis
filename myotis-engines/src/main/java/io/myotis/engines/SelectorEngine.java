@@ -7,6 +7,7 @@ import io.myotis.api.MyotisEngine;
 import io.myotis.api.NetworkInfo;
 import io.myotis.api.NetworkMetering;
 import io.myotis.api.ports.EnginePorts;
+import io.myotis.engines.go.GoMyotisEngine;
 import io.myotis.engines.rust.RustMyotisEngine;
 import io.myotis.node.api.JavaMyotisEngine;
 import org.slf4j.Logger;
@@ -18,10 +19,13 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * A {@link MyotisEngine} that routes to the Java or Rust engine per the current
- * {@link Engines} choice: {@code create()} goes to the engine the choice resolves to
+ * A {@link MyotisEngine} that routes to the Java, Rust, or Go engine per the
+ * current {@link Engines} choice: {@code create()} goes to the engine the choice resolves to
  * <em>at that moment</em>; {@code get}/{@code stop} go to whichever engine owns the
- * network (recorded at create); {@code shutdownAll} fans out to both.
+ * network (recorded at create); {@code shutdownAll} fans out to all three.
+ * The Go engine is reachable only through the explicit {@code go} choice —
+ * {@code auto} resolves between Rust and Java alone (the Go engine is
+ * desktop-only until it reaches parity).
  *
  * <p>{@code auto} semantics: prefer Rust, and fall back to Java WITH A LOG when the
  * Rust engine is unavailable or its {@code create} fails (in R0 it always does — the
@@ -36,6 +40,10 @@ public final class SelectorEngine implements MyotisEngine {
     private final JavaMyotisEngine java = new JavaMyotisEngine();
     /** Lazily built: constructing it requires the native library to be loadable. */
     private volatile RustMyotisEngine rust;
+    /** Lazily built, same reason; the Go engine is only ever reached via the
+     *  explicit {@code go} choice (auto never routes to it — Rust stays the
+     *  auto engine until the Go engine reaches parity). */
+    private volatile GoMyotisEngine go;
     /** Which engine owns each hosted network (recorded when create() succeeds). */
     private final Map<String, MyotisEngine> owners = new ConcurrentHashMap<>();
 
@@ -64,6 +72,20 @@ public final class SelectorEngine implements MyotisEngine {
         return r;
     }
 
+    private GoMyotisEngine goEngine() {
+        GoMyotisEngine g = go;
+        if (g == null) {
+            synchronized (this) {
+                // The same host-side listener the Rust handles get — LoopbackRpc
+                // is the shared port (it lives in :myotis-engine-common precisely
+                // so the Go engine needs no dependency on the Rust module).
+                if (go == null) go = new GoMyotisEngine(KtorLoopbackRpc::new);
+                g = go;
+            }
+        }
+        return g;
+    }
+
     /** The engine that should answer catalog queries / receive create() right now. */
     private MyotisEngine resolve() {
         return resolveFor(Engines.choice());
@@ -78,6 +100,14 @@ public final class SelectorEngine implements MyotisEngine {
                             + "failed the ABI handshake)");
                 }
                 yield rustEngine();
+            }
+            case "go" -> {
+                if (!GoMyotisEngine.isAvailable()) {
+                    throw new EngineException("myotis.engine=go but libmyotis_engine_go is not "
+                            + "available on this host (not built via goBuildCShared, not on "
+                            + "java.library.path, or failed the ABI handshake)");
+                }
+                yield goEngine();
             }
             case "auto" -> {
                 if (RustMyotisEngine.isAvailable()) yield rustEngine();
@@ -109,16 +139,17 @@ public final class SelectorEngine implements MyotisEngine {
         // deciding fallback behavior must not turn an in-flight auto-create into a hard
         // failure (or vice versa).
         String choice = Engines.choice();
-        if (!"rust".equals(choice)) return createFor(choice, config, ports);
-        // Explicit rust: never a fallback, and every failure must arrive as the
-        // EngineException this class promises. Resolving the engine, canonicalizing the
-        // name and creating the network all cross the native boundary, so a LinkageError
-        // from any of them is wrapped here instead of taking the host process down.
-        // Android below API 33 runs on this path by default (no Java engine there).
+        if (!"rust".equals(choice) && !"go".equals(choice)) return createFor(choice, config, ports);
+        // An explicit native choice (rust or go): never a fallback, and every
+        // failure must arrive as the EngineException this class promises.
+        // Resolving the engine, canonicalizing the name and creating the network
+        // all cross the native boundary, so a LinkageError from any of them is
+        // wrapped here instead of taking the host process down. Android below
+        // API 33 runs on the rust path by default (no Java engine there).
         try {
             return createFor(choice, config, ports);
         } catch (LinkageError e) {
-            throw new EngineException("Rust engine failed to link while creating "
+            throw new EngineException(choice + " engine failed to link while creating "
                     + config.networkName() + ": " + e, e);
         }
     }
@@ -173,8 +204,8 @@ public final class SelectorEngine implements MyotisEngine {
 
     /**
      * Which engine hosts {@code networkName} right now: {@code "java"}, {@code "rust"},
-     * or {@code null} when the network isn't hosted. Display-only (the Status screen's
-     * engine badge) — routing stays on {@link #owners} via get/stop.
+     * {@code "go"}, or {@code null} when the network isn't hosted. Display-only (the
+     * Status screen's engine badge) — routing stays on {@link #owners} via get/stop.
      */
     String ownerKind(String networkName) {
         if (networkName == null) return null;
@@ -190,7 +221,9 @@ public final class SelectorEngine implements MyotisEngine {
             }
         }
         if (owner == null) return null;
-        return owner instanceof RustMyotisEngine ? "rust" : "java";
+        if (owner instanceof RustMyotisEngine) return "rust";
+        if (owner instanceof GoMyotisEngine) return "go";
+        return "java";
     }
 
     @Override
@@ -210,6 +243,12 @@ public final class SelectorEngine implements MyotisEngine {
                 if (!out.contains(n)) out.add(n);
             }
         }
+        GoMyotisEngine g = go;
+        if (g != null) {
+            for (String n : g.hostedNetworks()) {
+                if (!out.contains(n)) out.add(n);
+            }
+        }
         return out;
     }
 
@@ -224,6 +263,8 @@ public final class SelectorEngine implements MyotisEngine {
             java.stop(networkName);
             RustMyotisEngine r = rust;
             if (r != null) r.stop(networkName);
+            GoMyotisEngine g = go;
+            if (g != null) g.stop(networkName);
         }
     }
 
@@ -233,6 +274,8 @@ public final class SelectorEngine implements MyotisEngine {
         java.shutdownAll();
         RustMyotisEngine r = rust;
         if (r != null) r.shutdownAll();
+        GoMyotisEngine g = go;
+        if (g != null) g.shutdownAll();
     }
 
     /** Both engines hear it: a network created later on either one must count
@@ -244,6 +287,7 @@ public final class SelectorEngine implements MyotisEngine {
     public void setNetworkMetering(NetworkMetering metering) {
         if (metering == null) throw new EngineException("metering is required");
         if (RustMyotisEngine.isAvailable()) rustEngine().setNetworkMetering(metering);
+        if (GoMyotisEngine.isAvailable()) goEngine().setNetworkMetering(metering);
         java.setNetworkMetering(metering);
     }
 

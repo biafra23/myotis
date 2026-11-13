@@ -196,8 +196,34 @@ zeros, marked in the struct. `myotis_set_ws_bound_periods` and
 them at every weak-subjectivity gate and a parked bootstrap
 restarts — while `myotis_set_served_block_window` records its value
 (a dial-only engine serves no blocks, so no answer depends on it;
-`capabilities` makes that explicit). The JVM-side loader + selector
-(`:myotis-engine-go`) is the next part.
+`capabilities` makes that explicit).
+
+## Desktop embed (`:myotis-engine-go`, feature/go-desktop-embed part 1c)
+
+The JVM side is the `:myotis-engine-go` Gradle module: `GoEngineNative`
+(plain JNA direct mapping over this same header — the Go twin of
+`RustEngineNative`, same `java.library.path`→`jna.library.path` mirroring,
+same ABI-57 handshake, `myotis_string_free` after every returned string),
+and `GoMyotisEngine`/`GoChainHandle`/`GoVerifiedReads` behind the
+`:myotis-api` contract. The selector routes it via `myotis.engine=go`
+(`-Pengine=go` on the daemon/desktop run tasks, the Settings toggle too) —
+`auto` never picks it: the Go engine is desktop-only and explicit until the
+engine-parity step (owner's brief, 2026-11). The library is built by the
+root `goBuildCShared` task (self-skips without the go toolchain) into
+`go/build/libmyotis_engine_go.{so,dylib,dll}`; the desktop run task injects
+it via `-Dmyotis.engine.go.lib`, the daemon via `java.library.path`.
+
+Honest gaps the wrapper surfaces rather than fakes (all engine-parity
+items): no idle sleep (`pause()` refuses, lifecycle is RUNNING/STOPPED),
+reads ONLY at the finalized anchor (`latest`/numbers are refused, never
+answered from finalized state — and the hosts' 45 s readiness dot
+therefore reads amber, because the read state really is finality-old),
+no EVM/block/tx/code reads, no ENS (the `EnsApi` throws one named
+refusal), no broadcast path. `myotis_drain_logs` lines are drained by
+`Engines.drainRustLogs` next to the Rust engine's ring, so the hosts'
+log pipeline is engine-agnostic. The catalog lists only the runnable
+network (mainnet, its entry golden-pinned), while the canonical-name
+table matches Rust's for all four.
 
 ## Test
 

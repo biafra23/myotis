@@ -287,6 +287,12 @@ class DesktopNodeController(
         // back to Java with a log, so a host without the native library still boots.
         // Applies to networks (re)started afterwards — live ones keep their engine
         // (reboot the network from Settings to switch it).
+        // A startup `-Dmyotis.engine=go` (the desktop-only Go engine) survives
+        // this: "go" is a launch-time choice the Settings toggle cannot express,
+        // and silently rewriting it to auto here would quietly route the Go
+        // experiment back to Rust/Java (owner's brief, 2026-11 — the Bee
+        // direction). java|auto toggling is unaffected.
+        if (Engines.choice() == "go") return
         Engines.select(if (settings.preferJavaEngine()) "java" else "auto")
     }
 

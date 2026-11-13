@@ -1000,6 +1000,45 @@ tasks.register<Exec>("cargoBuildHost") {
     outputs.files(hostLibNames.map { file("$rustReleaseDir/$it") })
 }
 
+// -------------------------------------------------------------------------
+// Optional Go build (go/ — the Go engine's C-ABI library that :myotis-engine-go
+// loads via JNA). Optional in the same shape as the Rust block above: without
+// the go toolchain the task self-skips with a note and the pure-JVM build is
+// untouched; the selector then simply reports the Go engine unavailable (it is
+// only ever routed by an explicit -Pengine=go — auto prefers Rust). Go
+// dependencies are pinned by go/go.mod + go/go.sum and go verifies the module
+// hashes on every build, the Go twin of the Gradle/Cargo pins. NOT a release
+// artifact yet (the engine ships desktop-only, opt-in): goBuildCShared stays
+// outside the builder image and the reproducibility gate until Go artifacts
+// ship in a release.
+// -------------------------------------------------------------------------
+val goVersion = providers.of(ToolProbe::class) {
+    parameters.command.set(listOf("go", "version"))
+    parameters.workingDir.set(file("go"))
+}.get()
+val goAvailable = Regex("""go version go\d+\.\d+""").containsMatchIn(goVersion)
+val goEngineLibName = when {
+    isWindowsHost -> "myotis_engine_go.dll"
+    System.getProperty("os.name").lowercase().contains("mac") -> "libmyotis_engine_go.dylib"
+    else -> "libmyotis_engine_go.so"
+}
+
+tasks.register<Exec>("goBuildCShared") {
+    group = "go"
+    description = "go build -buildmode=c-shared for the Go engine (self-skips when go is missing)"
+    onlyIf { goAvailable }
+    workingDir = file("go")
+    commandLine("go", "build", "-buildmode=c-shared", "-o", "build/$goEngineLibName", "./cmd/myotis-capi")
+    // The library's own output dir and the engine's runtime peer caches stay out
+    // of the inputs (output-inside-input); everything else under go/ is source.
+    inputs.files(fileTree("go") { exclude("build/**", "data/**") })
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+    // Toolchain identity is an input, as for cargoBuildHost: a go upgrade with
+    // unchanged sources must rebuild.
+    inputs.property("goVersion", goVersion)
+    outputs.files(file("go/build/$goEngineLibName"))
+}
+
 // Regenerate the UniFFI Kotlin bindings for the Rust engine into :myotis-engine-rust's
 // source tree. The generated file is COMMITTED (like the Android jniLibs) so
 // cargo-less machines still compile the pure-Java/Kotlin build; re-run this task
