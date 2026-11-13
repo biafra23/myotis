@@ -3,8 +3,11 @@ package io.myotis.engines.go;
 import io.myotis.api.AccountProofResult;
 import io.myotis.api.BeaconState;
 import io.myotis.api.BeaconStatus;
+import io.myotis.api.CallResult;
 import io.myotis.api.DataUsage;
 import io.myotis.api.EngineException;
+import io.myotis.api.EstimateResult;
+import io.myotis.api.SendResult;
 import io.myotis.api.NetworkMetering;
 import io.myotis.api.StatusSnapshot;
 import io.myotis.api.StorageProofResult;
@@ -216,6 +219,46 @@ class GoStatusJsonTest {
         assertEquals("42", r.valueDecimal());
         assertEquals("storageRootMatch", r.verifyMethod());
         assertEquals(8192, r.maxHeaderChainGap());
+    }
+
+    // ---- storage VALUE width (PR #832 review: the Go reader's value is MINIMAL
+    // big-endian — mpt.DecodeStorageLeaf rejects a leading zero byte — so slot 42
+    // arrives as "0x2a"; the contract's word is 32 bytes, so the adapter pads) ----
+
+    @Test
+    void minimalBigEndianValuesAreLeftPaddedIntoWords() {
+        byte[] fortyTwo = GoVerifiedReads.toWord("0x2a");
+        assertEquals(32, fortyTwo.length);
+        for (int i = 0; i < 31; i++) assertEquals(0, fortyTwo[i], "byte " + i + " must be zero");
+        assertEquals(0x2a, fortyTwo[31] & 0xff);
+        // "0x" (RLP-empty = value zero) → the all-zero word, not a refusal.
+        assertEquals(32, GoVerifiedReads.toWord("0x").length);
+        // A full word passes through untouched.
+        String full = "0x" + "ab".repeat(32);
+        assertEquals(full, io.myotis.engines.common.Hex.formatHexPrefixed(GoVerifiedReads.toWord(full)));
+        // WIDER than a word is shape drift — refused, never truncated (#314).
+        assertNull(GoVerifiedReads.toWord("0x" + "cd".repeat(33)));
+    }
+
+    // ---- detailed refusals (PR #314 line: permanent refusals must not arrive
+    // as the router's RETRYABLE -32000; the detailed channel is the honest one) ----
+
+    @Test
+    void unimplementedReadsRefusePermanentlyOnTheDetailedChannel() {
+        // No native round-trip: these overrides answer from the engine's shape,
+        // so a handle that never crossed the FFI is enough (same trick the
+        // pure-parse helpers above use).
+        GoVerifiedReads reads = new GoVerifiedReads(new GoChainHandle(0L, "mainnet", 1L, 0, null));
+        assertEquals(CallResult.Status.REFUSED,
+                reads.callDetailed(null, new byte[20], new byte[]{1}, null, "finalized", null).status());
+        assertEquals(EstimateResult.Status.REFUSED,
+                reads.estimateGasDetailed(null, new byte[20], null, null).status());
+        assertEquals(SendResult.Status.REFUSED,
+                reads.sendRawTransactionDetailed(new byte[]{1, 2, 3}).status());
+        // …while the plain reads keep their null contract ("cannot answer").
+        assertNull(reads.call(null, new byte[20], null, null, "finalized"));
+        assertNull(reads.estimateGas(null, new byte[20], null, null));
+        assertNull(reads.sendRawTransaction(new byte[]{1}));
     }
 
     // ---- selector rule ----

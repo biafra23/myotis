@@ -79,11 +79,43 @@ public final class SelectorEngine implements MyotisEngine {
                 // The same host-side listener the Rust handles get — LoopbackRpc
                 // is the shared port (it lives in :myotis-engine-common precisely
                 // so the Go engine needs no dependency on the Rust module).
-                if (go == null) go = new GoMyotisEngine(KtorLoopbackRpc::new);
+                if (go == null) {
+                    go = new GoMyotisEngine(KtorLoopbackRpc::new);
+                    // Built LATE (a metering push never builds it — see
+                    // setNetworkMetering): seed the device's current metering
+                    // before this engine's first network counts a byte, or the
+                    // first Go-hosted network would run under the default.
+                    try {
+                        go.setNetworkMetering(java.networkMetering());
+                    } catch (RuntimeException | LinkageError e) {
+                        log.warn("[engines] could not seed the Go engine's metering "
+                                + "({}); it keeps the library default", e.toString());
+                    }
+                }
                 g = go;
             }
         }
         return g;
+    }
+
+    /**
+     * The {@link Engines#drainRustLogs} routing decision, kept here because it
+     * needs the lazy engine fields: touch a native ring ONLY where this
+     * selector actually runs that engine. Probing {@code GoMyotisEngine.drainLogs}
+     * class-loads the Go binding and maps its library, so under auto/rust/java
+     * (where auto never routes to Go) the Go ring is drained only once a Go
+     * engine exists here — i.e. a Go network was or is hosted (PR #832 review).
+     */
+    String drainNativeLogs(int max) {
+        // The java choice has no native ring (unchanged rule); rust keeps its
+        // existing semantics, incl. a rust network surviving a later flip.
+        String rust = "java".equals(Engines.choice()) ? "" : RustMyotisEngine.drainLogs(max);
+        GoMyotisEngine g = go;
+        String go = (g != null || "go".equals(Engines.choice()))
+                ? GoMyotisEngine.drainLogs(max) : "";
+        if (rust.isEmpty()) return go;
+        if (go.isEmpty()) return rust;
+        return rust + "\n" + go;
     }
 
     /** The engine that should answer catalog queries / receive create() right now. */
@@ -278,17 +310,21 @@ public final class SelectorEngine implements MyotisEngine {
         if (g != null) g.shutdownAll();
     }
 
-    /** Every engine hears it (Java, Rust, Go when its library is present): a
-     *  network created later on any one must count
+    /** Every engine that RUNS here hears it (Java, Rust, and Go once a Go
+     *  engine exists): a network created later on any one must count
      *  under the device's current metering from its first byte. The native
      *  engines first: {@link #networkMetering()} reads the Java one, so a Rust
      *  or Go failure leaves it reporting the OLD value and a host that pushes
-     *  only on a change retries. */
+     *  only on a change retries. Go is pushed only when ALREADY built —
+     *  probing/building it here would map libmyotis_engine_go on hosts whose
+     *  choice never routes to it (PR #832 review); a Go engine built later is
+     *  seeded with this value by {@link #goEngine()}. */
     @Override
     public void setNetworkMetering(NetworkMetering metering) {
         if (metering == null) throw new EngineException("metering is required");
         if (RustMyotisEngine.isAvailable()) rustEngine().setNetworkMetering(metering);
-        if (GoMyotisEngine.isAvailable()) goEngine().setNetworkMetering(metering);
+        GoMyotisEngine g = go;
+        if (g != null) g.setNetworkMetering(metering);
         java.setNetworkMetering(metering);
     }
 

@@ -8,7 +8,9 @@ import org.slf4j.LoggerFactory;
 
 /**
  * The FFI boundary to {@code libmyotis_engine_go} ({@code go/cmd/myotis-capi}, built
- * by the root {@code goBuildCShared} task): plain JNA direct mapping over the
+ * by the root {@code goBuildCShared} task): plain JNA INTERFACE mapping
+ * ({@code Native.load(name, Interface.class)} — symbols resolve LAZILY at the
+ * first call that touches one, not at load; PR #832 review) over the
  * engine's C ABI — the SAME {@code rust/include/myotis_engine.h} contract the Rust
  * engine exports (the Go engine re-implements it in Go), so the ABI handshake, the
  * handle sentinels, the JSON-over-FFI convention and the free contract
@@ -83,8 +85,9 @@ final class GoEngineNative {
             lib = null;
         } catch (Throwable t) {
             // Library found but something else failed (a renamed symbol surfaces
-            // here on first touch under direct mapping) — louder than the missing
-            // case on purpose, and name the rebuild command.
+            // LATER, on the first call touching it — interface mapping resolves
+            // symbols lazily; callers contain that LinkageError) — louder than
+            // the missing case on purpose, and name the rebuild command.
             log.warn("[engines] libmyotis_engine_go failed to initialize ({}); Go engine "
                     + "unavailable — rebuild it (goBuildCShared)", t.toString(), t);
             lib = null;

@@ -48,15 +48,20 @@ import java.util.List;
  *       root: {@link #requestAccount} passes the {@code "finalized"} selector
  *       (the Rust twin passes head), {@code finalized} is the only selector
  *       {@link GoVerifiedReads} serves, and the status's verified-head age ages
- *       by FINALIZED-block advance — on mainnet that finality tick is ~2–4 min,
- *       so the hosts' 45 s readiness dot reads amber for a Go-hosted network.
- *       That is honest (the read state IS older by design), not a regression to
- *       paper over with a constant.</li>
+ *       by FINALIZED-block advance — and mainnet finalization is slow by
+ *       construction: the beacon finalizes ~2–3 epochs (≈13–19 min at 12 s
+ *       slots) behind the head, and the checkpoint the Go reader follows moves
+ *       only ~once per epoch (≈6.4 min), so the age sits in that band between
+ *       ticks and the hosts' 45 s readiness dot reads amber for a Go-hosted
+ *       network. That is honest (the read state IS older by design), not a
+ *       regression to paper over with a constant.</li>
  *   <li><b>No EVM, no block/tx/receipt reads, no ENS, no log index.</b> The
  *       operator queries throw {@link EngineException} (the Rust twin's
  *       NOT_AVAILABLE rule), {@link #ens()} answers an API that throws the same
- *       named refusal, and the unimplemented VerifiedReads methods answer
- *       {@code null} ("cannot answer verified") via the interface defaults.</li>
+ *       named refusal, and {@link GoVerifiedReads} overrides the unimplemented
+ *       methods explicitly: {@code null} ("cannot answer verified") on the
+ *       plain reads, {@code refused(...)} on the detailed call/estimate/send
+ *       channel (see its class doc for the retryable-status reasoning).</li>
  * </ul>
  *
  * <p>{@link #reads()} and the loopback listener follow the Rust twin exactly:
@@ -189,6 +194,15 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
         inFlight.incrementAndGet();
         try {
             return nativeCall.get();
+        } catch (LinkageError e) {
+            // JNA's INTERFACE mapping resolves symbols LAZILY, at the first call
+            // (not at class-load, and not "direct" as an earlier doc claimed —
+            // PR #832 review): a stale or misbuilt libmyotis_engine_go surfaces
+            // as UnsatisfiedLinkError HERE. Wrap it into the EngineException this
+            // class promises for every failure instead of taking the host down.
+            throw new EngineException("the Go engine failed to link on a call for "
+                    + networkName + " (stale libmyotis_engine_go? rebuild it via "
+                    + "goBuildCShared): " + e, e);
         } finally {
             inFlight.decrementAndGet();
         }

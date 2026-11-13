@@ -44,22 +44,17 @@ public final class Engines {
      * available). Covers BOTH native rings — the Rust engine's and the Go
      * engine's — so one host pump feeds its log pipeline whichever engine is
      * routed (Android: LogBuffer -> Logs tab + logcat; desktop: slf4j); the
-     * ring of whichever engine did not run is empty by construction, so
-     * draining both costs nothing. An internal observability seam, deliberately
-     * not on the engine API (like the BLS backend toggle). The name predates the
-     * Go engine and stays (CLAUDE.md documents it under this name).
+     * ring of an engine that never ran is empty by construction — but the pump
+     * must not PROBE one that never ran either: touching {@code GoMyotisEngine}
+     * class-loads the Go binding and maps its library (PR #832 review), so the
+     * routing decision lives in {@link SelectorEngine#drainNativeLogs}, which
+     * only touches a ring the selector itself has built or routes to. An
+     * internal observability seam, deliberately not on the engine API (like the
+     * BLS backend toggle). The name predates the Go engine and stays (CLAUDE.md
+     * documents it under this name).
      */
     public static String drainRustLogs(int max) {
-        // Same lazy-load protection as select(): under the java choice the
-        // native library may never have been loaded — probing availability
-        // would class-load the native binding and map it just to drain a ring
-        // that is empty by construction. rust/go/auto choices already probed.
-        if ("java".equals(choice)) return "";
-        String rust = RustMyotisEngine.drainLogs(max);
-        String go = GoMyotisEngine.drainLogs(max);
-        if (rust.isEmpty()) return go;
-        if (go.isEmpty()) return rust;
-        return rust + "\n" + go;
+        return ENGINE.drainNativeLogs(max);
     }
 
     /**
@@ -100,9 +95,16 @@ public final class Engines {
             // the native binding and maps the library — pure-Java users
             // (Android re-applies the choice on every boot) shouldn't pay that.
             log.info("[engines] engine choice set to java");
+        } else if ("go".equals(normalized)) {
+            // Same rule mirrored: only the Go choice probes the Go binding —
+            // under auto/rust, auto never routes to Go and rust never uses it,
+            // so touching GoMyotisEngine would map libmyotis_engine_go on hosts
+            // that will never run it (PR #832 review).
+            log.info("[engines] engine choice set to go (go available: {})",
+                    GoMyotisEngine.isAvailable());
         } else {
-            log.info("[engines] engine choice set to {} (rust available: {}, go available: {})",
-                    normalized, RustMyotisEngine.isAvailable(), GoMyotisEngine.isAvailable());
+            log.info("[engines] engine choice set to {} (rust available: {})",
+                    normalized, RustMyotisEngine.isAvailable());
         }
     }
 

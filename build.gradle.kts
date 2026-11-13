@@ -1050,12 +1050,24 @@ tasks.register<Exec>("goBuildCShared") {
             logger.warn("[go] goBuildCShared failed (exit {}) — the Go engine will report itself"
                     + " unavailable and the JVM build continues. A -buildmode=c-shared build needs"
                     + " a C compiler (cgo) and, on first run, module downloads.")
+            // A failed `go build` can leave the PREVIOUS library untouched (go
+            // writes the output only at the end) — which, combined with the
+            // up-to-date check below, would silently keep a stale lib serving
+            // the host after a source change. Delete what a failed build did
+            // not rewrite, so the next run (or the loader's ABI handshake) sees
+            // the truth, not last week's bytes (PR #832 review).
+            delete(file("go/build/$goEngineLibName"), file("go/build/myotis_engine_go.lib"))
         }
     }
-    // The library's own output dir and the engine's runtime peer caches stay out
-    // of the inputs (output-inside-input); everything else under go/ is source.
-    inputs.files(fileTree("go") { exclude("build/**", "data/**") })
-        .withPathSensitivity(PathSensitivity.RELATIVE)
+    // Source allowlist, not "everything under go/": READMEs, docs and the test
+    // fixtures' churn must not force a rebuild, and a broad tree drags in
+    // everything the exclude list forgets. The C header lives OUTSIDE go/
+    // (go/cmd/myotis-capi/main.go #includes ../../../rust/include/…), so it is
+    // an input too — an ABI-header change must rebuild the library.
+    inputs.files(
+        fileTree("go") { include("**/*.go", "go.mod", "go.sum") },
+        file("rust/include/myotis_engine.h"),
+    ).withPathSensitivity(PathSensitivity.RELATIVE)
     // Toolchain identity is an input, as for cargoBuildHost: a go upgrade with
     // unchanged sources must rebuild.
     inputs.property("goVersion", goVersion)
@@ -1066,6 +1078,11 @@ tasks.register<Exec>("goBuildCShared") {
         add(file("go/build/$goEngineLibName"))
         if (isWindowsHost) add(file("go/build/myotis_engine_go.lib"))
     })
+    // …but only UP-TO-DATE while the library actually EXISTS: declaring outputs
+    // Gradle never produced (first run on a cgo-less box) would otherwise mark
+    // the task UP-TO-DATE on later runs and never retry the build even once go
+    // or a C compiler shows up (PR #832 review).
+    outputs.upToDateWhen { file("go/build/$goEngineLibName").exists() }
 }
 
 // Regenerate the UniFFI Kotlin bindings for the Rust engine into :myotis-engine-rust's

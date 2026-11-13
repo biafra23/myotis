@@ -201,7 +201,7 @@ restarts — while `myotis_set_served_block_window` records its value
 ## Desktop embed (`:myotis-engine-go`, feature/go-desktop-embed part 1c)
 
 The JVM side is the `:myotis-engine-go` Gradle module: `GoEngineNative`
-(plain JNA direct mapping over this same header — the Go twin of
+(plain JNA interface mapping over this same header, lazy symbol resolution — the Go twin of
 `RustEngineNative`, same `java.library.path`→`jna.library.path` mirroring,
 same ABI-57 handshake, `myotis_string_free` after every returned string),
 and `GoMyotisEngine`/`GoChainHandle`/`GoVerifiedReads` behind the

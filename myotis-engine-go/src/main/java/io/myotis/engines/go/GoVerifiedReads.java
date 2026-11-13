@@ -1,6 +1,9 @@
 package io.myotis.engines.go;
 
 import io.myotis.api.AccountProofResult;
+import io.myotis.api.CallResult;
+import io.myotis.api.EstimateResult;
+import io.myotis.api.SendResult;
 import io.myotis.api.StorageProofResult;
 import io.myotis.api.SyncState;
 import io.myotis.api.VerifiedReads;
@@ -32,8 +35,20 @@ import org.slf4j.LoggerFactory;
  *       and {@code sendRawTransaction} answer {@code null}: "cannot answer
  *       verified" is exactly their truth, and every capability flag
  *       ({@code supportsStateOverrides} etc.) keeps its false default so hosts
- *       refuse before waking anything.</li>
+ *       refuse before waking anything. The DETAILED variants of {@code call},
+ *       {@code estimateGas} and {@code sendRawTransaction} answer
+ *       {@code refused(...)} instead of the default's {@code unavailable}: the
+ *       router maps a plain null to the RETRYABLE -32000, and an engine with no
+ *       EVM will not grow one between retries — REFUSED is the honest channel
+ *       (the #314 apply-or-refuse rule, wire side).</li>
  * </ul>
+ *
+ * <p>Refused SELECTORS ({@code latest}/a number) still reach the wire as the
+ * retryable -32000 the router maps from null: a permanent refusal for the plain
+ * nullable reads would need a refused-channel on {@code getBalance}/{@code
+ * getStorageAt} themselves — an {@code :myotis-api} change, the owner's call
+ * (PR #832 review), not this module's. Meanwhile the refusal is honest at the
+ * detailed-method channel and every capability flag says "no head state here".
  *
  * <p><b>Never throws</b> — the router's {@code tryVerified} dispatch is not
  * exception-guarded, so every native failure (transport, pruned-root rotation,
@@ -58,13 +73,18 @@ final class GoVerifiedReads implements VerifiedReads {
     @Override
     public Long headBlockNumber() {
         // The Go engine has no optimistic head yet; its eth_blockNumber answer is
-        // the beacon-FINALIZED execution block — verified, never reorged, ~2-4
-        // min behind the tip. Wallets tolerate the lag like the standard
-        // light-client skew; 0 (no anchor yet) → null per the contract.
+        // the beacon-FINALIZED execution block — verified, never reorged, but
+        // materially further behind the tip than a node's "latest": mainnet
+        // finality lags the head by ~2-3 epochs (~13-19 min at 12s slots) before
+        // it moves at all, and the checkpoint it rides advances only ~once per
+        // epoch (~6.4 min). A wallet reading balances here sees confirmations and
+        // nonce lag of that order — more than the usual light-client skew, and
+        // something the engine-parity step (an optimistic anchor) will shrink;
+        // honest for a desktop Bee integration meanwhile. 0 (no anchor) → null.
         try {
             long fin = handle.status().finalizedBlockNumber();
             return fin > 0 ? fin : null;
-        } catch (RuntimeException e) {
+        } catch (RuntimeException | LinkageError e) {
             log.debug("[engines] headBlockNumber unavailable on the Go engine: {}", e.getMessage());
             return null;
         }
@@ -79,9 +99,12 @@ final class GoVerifiedReads implements VerifiedReads {
                 case STARTING, SYNCING -> SyncState.SYNCING;
                 case STALE_ANCHOR -> SyncState.STALE_ANCHOR;
             };
-        } catch (RuntimeException e) {
+        } catch (RuntimeException | LinkageError e) {
             // Never throw from the read surface: an unreadable status reads as
-            // "not synced yet" (the Rust adapter's containment rule).
+            // "not synced yet" (the Rust adapter's containment rule). LinkageError
+            // too: JNA resolves interface-mapping symbols LAZILY, at the FIRST
+            // CALL, so a missing symbol on a stale library surfaces here as
+            // UnsatisfiedLinkError, not at class-load (PR #832 review).
             log.debug("[engines] syncState fell back to SYNCING on the Go engine: {}",
                     e.getMessage());
             return SyncState.SYNCING;
@@ -100,6 +123,15 @@ final class GoVerifiedReads implements VerifiedReads {
     @Override
     public byte[] call(byte[] from, byte[] to, byte[] data, String valueWei, String block) {
         return null; // no EVM on this engine yet (engine-parity increment)
+    }
+
+    /** REFUSED, not the default's UNAVAILABLE (which the router maps to the
+     *  retryable -32000): this engine has no EVM and will not grow one between
+     *  retries, so a permanent refusal is the honest status (#314, wire side). */
+    @Override
+    public CallResult callDetailed(byte[] from, byte[] to, byte[] data, String valueWei,
+                                   String block, String stateOverridesJson) {
+        return CallResult.refused("the Go engine has no EVM yet (engine-parity increment)");
     }
 
     @Override
@@ -151,18 +183,43 @@ final class GoVerifiedReads implements VerifiedReads {
             // A proven-zero / proven-absent slot is 32 zero bytes (the Rust
             // adapter's rule); a present slot carries its word.
             if (!r.exists() || r.valueHex() == null) return new byte[32];
-            byte[] v = GoChainHandle.hexToBytes(r.valueHex());
-            return v.length == 32 ? v : null; // shape drift: refuse, never pad
-        } catch (RuntimeException e) {
+            return toWord(r.valueHex());
+        } catch (RuntimeException | LinkageError e) {
             log.info("[engines] verified storage read unavailable on the Go engine: {}",
                     e.getMessage());
             return null;
         }
     }
 
+    /**
+     * The Go engine's storage value hex → the 32-byte word the contract returns.
+     * The Go reader emits the value MINIMAL big-endian — {@code hex0x(s.Value)}
+     * straight off RLP-decoded bytes, and its {@code mpt.DecodeStorageLeaf}
+     * REJECTS a leading zero byte ({@code helpers.go}), so slot 42 arrives as
+     * {@code "0x2a"}, not {@code "0x00…2a"}. The contract's word is 32 bytes, so
+     * left-pad; a value WIDER than 32 bytes is shape drift (a storage word cannot
+     * be wider) — refuse it, never truncate into a different word. This is the
+     * apply-or-refuse rule (#314) applied to the value's own width.
+     */
+    static byte[] toWord(String valueHex) {
+        byte[] v = GoChainHandle.hexToBytes(valueHex);
+        if (v.length > 32) return null;
+        byte[] word = new byte[32];
+        System.arraycopy(v, 0, word, 32 - v.length, v.length);
+        return word;
+    }
+
     @Override
     public byte[] sendRawTransaction(byte[] rawTx) {
         return null; // the Go engine is dial-only with no broadcast path yet
+    }
+
+    /** REFUSED (permanent, named) — see {@link #callDetailed} for why not the
+     *  default's retryable UNAVAILABLE. */
+    @Override
+    public SendResult sendRawTransactionDetailed(byte[] rawTx) {
+        return SendResult.refused("the Go engine has no transaction broadcast path yet "
+                + "(dial-only; engine-parity increment)");
     }
 
     @Override
@@ -210,6 +267,12 @@ final class GoVerifiedReads implements VerifiedReads {
         return null; // no EVM
     }
 
+    /** REFUSED (permanent, named) — see {@link #callDetailed}. */
+    @Override
+    public EstimateResult estimateGasDetailed(byte[] from, byte[] to, byte[] data, String valueWei) {
+        return EstimateResult.refused("the Go engine has no EVM to estimate against yet");
+    }
+
     // ---- internals ----
 
     /** Only the exact {@code finalized} tag (trimmed, case-insensitive); a
@@ -226,10 +289,12 @@ final class GoVerifiedReads implements VerifiedReads {
         if (address == null || address.length != 20) return null;
         try {
             return handle.accountVerified(toHex(address), block);
-        } catch (RuntimeException e) {
+        } catch (RuntimeException | LinkageError e) {
             // Contain every unchecked failure (the error-envelope
             // EngineException — pruned root, stale-anchor park, not-started —
-            // included) as "can't answer verified right now".
+            // and the LinkageError JNA's lazy interface-mapping symbol
+            // resolution can throw on the first call against a stale library)
+            // as "can't answer verified right now".
             log.info("[engines] verified account read unavailable on the Go engine: {}",
                     e.getMessage());
             return null;

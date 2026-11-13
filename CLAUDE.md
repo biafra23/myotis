@@ -132,7 +132,7 @@ Key Gradle modules:
 - **myotis-engine-go** — the GO engine behind the contract (`GoMyotisEngine`/
   `GoChainHandle`/`GoVerifiedReads`): `go/cmd/myotis-capi`'s c-shared library
   (the same `rust/include/myotis_engine.h` ABI the Rust engine exports) over
-  plain JNA direct mapping (`GoEngineNative`; root task `goBuildCShared`,
+  plain JNA interface mapping (`GoEngineNative`, lazy symbol resolution; root task `goBuildCShared`,
   self-skips without the go toolchain; `-Dmyotis.engine.go.lib` override).
   Desktop-only and select-only, never `auto` (owner's brief, 2026-11: the
   Bee-integration engine, to be used before it is embedded deeper). Mainnet
