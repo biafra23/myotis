@@ -1,0 +1,8 @@
+=============== Nov 13, 2026 (CET) ===============
+09:53:10.082959 log@legend F·NumFile S·FileSize N·Entry C·BadEntry B·BadBlock Ke·KeyError D·DroppedEntry L·Level Q·SeqNum T·TimeElapsed
+09:53:10.087705 db@open opening
+09:53:10.088007 version@stat F·[] S·0B[] Sc·[]
+09:53:10.089165 db@janitor F·2 G·0
+09:53:10.089183 db@open done T·1.463558ms
+10:06:41.183345 db@close closing
+10:06:41.183755 db@close done T·409.365µs

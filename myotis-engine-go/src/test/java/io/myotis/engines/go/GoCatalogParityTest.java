@@ -10,6 +10,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
@@ -60,6 +61,15 @@ class GoCatalogParityTest {
             assertThrows(EngineException.class, () -> engine.canonicalNetworkName(unknown),
                     "alias table drifted: '" + unknown + "' resolved on the Go engine");
         }
+        // The known-but-not-runnable refusal (PR #827-round review of part 1c):
+        // a canonical network the catalog lacks must name the multichain step,
+        // not "unknown network" — the distinction the selector and the operator
+        // both act on differently.
+        EngineException notYet = assertThrows(EngineException.class, () -> engine.create(
+                new io.myotis.api.EngineConfig("gnosis", 42303, 42900, 42545, null, 0, true,
+                        null), null));
+        assertTrue(notYet.getMessage().contains("does not host gnosis yet"),
+                "wrong refusal shape: " + notYet.getMessage());
     }
 
     @Test

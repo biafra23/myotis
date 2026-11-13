@@ -1002,9 +1002,12 @@ tasks.register<Exec>("cargoBuildHost") {
 
 // -------------------------------------------------------------------------
 // Optional Go build (go/ — the Go engine's C-ABI library that :myotis-engine-go
-// loads via JNA). Optional in the same shape as the Rust block above: without
-// the go toolchain the task self-skips with a note and the pure-JVM build is
-// untouched; the selector then simply reports the Go engine unavailable (it is
+// loads via JNA). Optional in the same shape as the Rust block above, with one
+// widening: not only a missing go toolchain but a FAILED cgo build (no C
+// compiler, offline module fetch) degrades to a warning — a machine with plain
+// Go installed is common and its run tasks must keep working; in every degrade
+// case the pure-JVM build is untouched and the selector simply reports the Go
+// engine unavailable (it is
 // only ever routed by an explicit -Pengine=go — auto prefers Rust). Go
 // dependencies are pinned by go/go.mod + go/go.sum and go verifies the module
 // hashes on every build, the Go twin of the Gradle/Cargo pins. NOT a release
@@ -1025,10 +1028,30 @@ val goEngineLibName = when {
 
 tasks.register<Exec>("goBuildCShared") {
     group = "go"
-    description = "go build -buildmode=c-shared for the Go engine (self-skips when go is missing)"
+    description = "go build -buildmode=c-shared for the Go engine (self-skips when go is" +
+        " missing; a FAILED cgo build degrades to a warning, keeping the JVM build untouched)"
     onlyIf { goAvailable }
     workingDir = file("go")
     commandLine("go", "build", "-buildmode=c-shared", "-o", "build/$goEngineLibName", "./cmd/myotis-capi")
+    // Unlike cargoBuildHost (where a cargo probe implies a working toolchain),
+    // `go` present does NOT imply `-buildmode=c-shared` works: cgo needs a C
+    // compiler (absent on many plain-Go Windows boxes) and the first build may
+    // need module downloads (offline). A hard failure there would take down
+    // `:app:run`/`:app-desktop:run` on hosts that never touch the Go engine —
+    // so the exit code degrades to a loud warning and the engine reports
+    // itself unavailable at load (the loader's UnsatisfiedLinkError path).
+    // Correctness of the Go tree stays CI's job (go-engine.yml builds and
+    // tests it unconditionally); a -Pengine=go run on such a box fails with
+    // the loader's named error, not silently.
+    isIgnoreExitValue = true
+    doLast {
+        val exit = executionResult.get().exitValue
+        if (exit != 0) {
+            logger.warn("[go] goBuildCShared failed (exit {}) — the Go engine will report itself"
+                    + " unavailable and the JVM build continues. A -buildmode=c-shared build needs"
+                    + " a C compiler (cgo) and, on first run, module downloads.")
+        }
+    }
     // The library's own output dir and the engine's runtime peer caches stay out
     // of the inputs (output-inside-input); everything else under go/ is source.
     inputs.files(fileTree("go") { exclude("build/**", "data/**") })
@@ -1036,7 +1059,13 @@ tasks.register<Exec>("goBuildCShared") {
     // Toolchain identity is an input, as for cargoBuildHost: a go upgrade with
     // unchanged sources must rebuild.
     inputs.property("goVersion", goVersion)
-    outputs.files(file("go/build/$goEngineLibName"))
+    // c-shared emits an import library next to the DLL on Windows; declared so
+    // the up-to-date check sees it (missing outputs are tolerated on the other
+    // platforms and on a degraded build).
+    outputs.files(buildList {
+        add(file("go/build/$goEngineLibName"))
+        if (isWindowsHost) add(file("go/build/myotis_engine_go.lib"))
+    })
 }
 
 // Regenerate the UniFFI Kotlin bindings for the Rust engine into :myotis-engine-rust's

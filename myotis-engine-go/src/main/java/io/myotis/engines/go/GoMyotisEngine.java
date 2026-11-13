@@ -158,15 +158,22 @@ public final class GoMyotisEngine implements MyotisEngine {
         String canonical = canonicalNetworkName(config.networkName());
         NetworkInfo net = networkInfo(canonical);
         if (net == null) {
-            throw new EngineException("unknown network: " + config.networkName());
+            // canonicalNetworkName succeeded but the catalog (which lists only
+            // what the Go build can RUN — mainnet for now) lacks it: this is the
+            // known-but-not-runnable refusal the class doc promises, NOT an
+            // unknown name (the canonical table knows all four).
+            throw new EngineException("the Go engine does not host " + canonical
+                    + " yet (mainnet-only until the multichain step)");
         }
         // The host's listener BEFORE the native handle: a throwing factory must not
         // leak a running Go network host (goroutines + UDP listeners).
         LoopbackRpc rpc = rpcFactory != null ? rpcFactory.create() : null;
         long id = GoEngineNative.nativeCreate(canonical, config.dataDir());
         if (id == GoEngineNative.UNSUPPORTED_NETWORK) {
-            // The Go build carries mainnet pins only (go/internal/chain); the
-            // multichain step adds Gnosis (the Bee direction), then the rest.
+            // The same refusal as above: by construction the catalog-only
+            // create makes this unreachable today (the catalog is what Go's
+            // Create can run); it stays as the drift guard for the multichain
+            // step, when a catalog entry could out-land its Create pins.
             throw new EngineException("the Go engine does not host " + canonical
                     + " yet (mainnet-only until the multichain step)");
         }
@@ -175,18 +182,28 @@ public final class GoMyotisEngine implements MyotisEngine {
                     + " or create the dataDir for " + canonical
                     + " (empty dataDir and a dataDir held by another live handle are refused)");
         }
-        // EIP-1459 DNS discovery, the same process-global switch and the same rule
-        // as the Rust engine: a host without a DnsServers port uses the system
-        // resolver (the Go walk runs over it), a host that supplies servers keeps
-        // DNS off (the Go walk has no port for custom servers yet).
-        boolean dnsDiscovery = ports == null || ports.dnsServers() == null;
-        int previous = DNS_DISCOVERY.getAndSet(dnsDiscovery ? 1 : 0);
-        if (previous >= 0 && (previous == 1) != dnsDiscovery) {
+        // EIP-1459 DNS discovery: same process-global switch as the Rust engine,
+        // but the Go build's walk has NO off-switch yet (go/internal/capi pins
+        // system-resolver discovery and reports the state IN FORCE in the
+        // return value, precisely so this call site can see the refusal). So the
+        // EFFECTIVE state — never the requested one — is what gets recorded and
+        // an `off` request is surfaced, not silently stored (apply-or-refuse,
+        // #314). Today's routing (desktop, always `on`) never hits the refusal;
+        // a host that brings a DnsServers port must not believe its servers are
+        // consulted on this engine.
+        boolean requested = ports == null || ports.dnsServers() == null;
+        boolean effective = GoEngineNative.nativeSetDnsDiscovery(requested);
+        if (effective != requested) {
+            log.warn("[engines] the Go engine keeps EIP-1459 DNS discovery {} (its walk has no"
+                    + " switch yet): a host expecting system-resolver discovery to be off does"
+                    + " NOT get that on this engine", effective ? "on" : "off");
+        }
+        int previous = DNS_DISCOVERY.getAndSet(effective ? 1 : 0);
+        if (previous >= 0 && (previous == 1) != effective) {
             log.warn("[engines] the create of {} switched EIP-1459 DNS discovery {} for every"
                     + " hosted network: the switch is process-global and the last create wins",
-                    canonical, dnsDiscovery ? "on" : "off");
+                    canonical, effective ? "on" : "off");
         }
-        GoEngineNative.nativeSetDnsDiscovery(dnsDiscovery);
         // Honour a host-supplied RPC port, else the network's catalog default.
         int rpcPort = config.rpcPort() > 0 ? config.rpcPort() : net.defaultRpcPort();
         GoChainHandle handle = new GoChainHandle(id, canonical, net.chainId(), rpcPort, rpc);

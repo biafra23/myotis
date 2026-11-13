@@ -7,8 +7,6 @@ import io.myotis.api.VerifiedReads;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.Arrays;
-
 /**
  * The Go engine's {@link VerifiedReads} adapter — the read surface the host's
  * {@code LoopbackRpc} listener serves on {@code 127.0.0.1:rpcPort}. It is the
@@ -243,12 +241,10 @@ final class GoVerifiedReads implements VerifiedReads {
         return r.verifyMethod() != null;
     }
 
+    /** Fixed-width bytes → lowercase 0x-hex: the ONE definition
+     *  ({@code :myotis-engine-common}'s Hex — same call the Rust adapter makes;
+     *  not {@code java.util.HexFormat}, which is Android API 34). */
     private static String toHex(byte[] bytes) {
-        StringBuilder sb = new StringBuilder(2 + bytes.length * 2);
-        sb.append("0x");
-        for (byte b : Arrays.copyOf(bytes, bytes.length)) {
-            sb.append(Character.forDigit((b >> 4) & 0xf, 16)).append(Character.forDigit(b & 0xf, 16));
-        }
-        return sb.toString();
+        return io.myotis.engines.common.Hex.formatHexPrefixed(bytes);
     }
 }

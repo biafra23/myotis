@@ -291,8 +291,15 @@ class DesktopNodeController(
         // this: "go" is a launch-time choice the Settings toggle cannot express,
         // and silently rewriting it to auto here would quietly route the Go
         // experiment back to Rust/Java (owner's brief, 2026-11 — the Bee
-        // direction). java|auto toggling is unaffected.
-        if (Engines.choice() == "go") return
+        // direction). java|auto toggling is unaffected. Surfaced, not silently
+        // ignored (apply-or-refuse): the persisted toggle stays truthful for the
+        // next launch WITHOUT the flag — which is when it applies again.
+        if (Engines.choice() == "go") {
+            log.info("[engines] this run started with -Dmyotis.engine=go: the engine setting"
+                    + " (currently {}) does not apply to it — it applies again on a launch"
+                    + " without the flag", if (settings.preferJavaEngine()) "java" else "auto")
+            return
+        }
         Engines.select(if (settings.preferJavaEngine()) "java" else "auto")
     }
 
