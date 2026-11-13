@@ -3,7 +3,7 @@ module github.com/biafra23/myotis/go
 go 1.27.3
 
 require (
-	github.com/ethereum/go-ethereum v1.16.8
+	github.com/ethereum/go-ethereum v1.16.9
 	github.com/golang/snappy v1.0.0
 	github.com/libp2p/go-libp2p v0.51.0
 	github.com/multiformats/go-multiaddr v0.16.1
