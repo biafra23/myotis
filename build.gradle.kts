@@ -154,6 +154,16 @@ allprojects {
         description = "Resolve every configuration (for scripts/update_gradle_pins.sh)."
         notCompatibleWithConfigurationCache("walks every configuration of the project")
         doLast {
+            // The lint plugin (com.android.lint, on the KMP modules) adds the
+            // dependencies of its `*ForLint` configurations only when its tasks
+            // are configured. Unrealized, those configurations hold nothing but
+            // the lock's own constraints, and the walk reports every locked
+            // module as "Did not resolve … part of the dependency lock state"
+            // while a lint run resolves them all. Realizing the lint tasks first
+            // gives the walk the graph lint resolves, so ONE lock state is right
+            // for both. Only the lint tasks: realizing every task would configure
+            // host-specific ones on all five pin hosts.
+            project.tasks.names.filter { it.startsWith("lint") }.forEach { project.tasks.named(it).get() }
             val buildscriptConfs = project.buildscript.configurations.filter { it.isCanBeResolved }
             val confs = buildscriptConfs + project.configurations.filter { it.isCanBeResolved }
             // Lock state as committed: every configuration named in a lockfile
