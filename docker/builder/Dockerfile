@@ -156,7 +156,34 @@ RUN curl -fsSL --retry 5 -o /tmp/platform.zip \
  && props="$ANDROID_HOME/platforms/android-${ANDROID_PLATFORM}/source.properties" \
  && rev=$(sed -n 's/^Pkg.Revision *= *//p' "$props" | tr -d '\r ') \
  && { [ "$rev" = "${ANDROID_PLATFORM_REVISION}" ] \
-      || { echo "${ANDROID_PLATFORM_ARCHIVE} unpacked to revision '$rev' at $props, pins.env says ${ANDROID_PLATFORM_REVISION}" >&2; exit 1; }; }
+      || { echo "${ANDROID_PLATFORM_ARCHIVE} unpacked to revision '$rev' at $props, pins.env says ${ANDROID_PLATFORM_REVISION}" >&2; exit 1; }; } \
+ && api=$(sed -n 's/^AndroidVersion.ApiLevel *= *//p' "$props" | tr -d '\r ') \
+ && ext=$(sed -n 's/^AndroidVersion.ExtensionLevel *= *//p' "$props" | tr -d '\r ') \
+ && layoutlib=$(sed -n 's/^Layoutlib.Api *= *//p' "$props" | tr -d '\r ') \
+ && [ "$api" = "${ANDROID_PLATFORM}" ] \
+ && printf '%s\n' \
+      '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' \
+      '<ns2:repository xmlns:ns2="http://schemas.android.com/repository/android/common/02" xmlns:ns6="http://schemas.android.com/sdk/android/repo/repository2/04" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">' \
+      "  <localPackage path=\"platforms;android-${api}\" obsolete=\"false\">" \
+      '    <type-details xsi:type="ns6:platformDetailsType">' \
+      "      <api-level>${api}</api-level>" \
+      '      <codename></codename>' \
+      "      <extension-level>${ext}</extension-level>" \
+      '      <base-extension>true</base-extension>' \
+      "      <layoutlib api=\"${layoutlib}\"/>" \
+      '    </type-details>' \
+      "    <revision><major>${rev}</major></revision>" \
+      "    <display-name>Android SDK Platform ${api}</display-name>" \
+      '  </localPackage>' \
+      '</ns2:repository>' \
+      > "$ANDROID_HOME/platforms/android-${ANDROID_PLATFORM}/package.xml"
+
+# The package.xml written above is what sdkmanager would have written for this
+# platform, every value read from the archive's own source.properties. The
+# Android Gradle plugin 9 needs it for a platform with a minor API level
+# (android-37.0): from source.properties alone it does not recognise the
+# directory as platforms;android-37.0, tries to install the package again
+# and fails on the read-only SDK (#818). AGP 8.x managed without it.
 
 # --- Go -----------------------------------------------------------------------
 # The Go engine's toolchain, by the SHA-256 of go.dev's archive. GOTOOLCHAIN=local:
@@ -180,8 +207,8 @@ RUN curl -fsSL --retry 5 -o /tmp/go.tar.gz "https://go.dev/dl/go${GO_VERSION}.li
 #
 # Two warnings from the Android Gradle plugin are expected in this image and
 # harmless: "Exception while marshalling .../platforms/android-NN/package.xml.
-# Probably the SDK is read-only" (the platform is unpacked from its archive, so
-# it has no package.xml, and the plugin cannot write one), and "platform-tools
+# Probably the SDK is read-only" (if the plugin wants to rewrite the package.xml
+# written above and cannot), and "platform-tools
 # package is not installed, and automatic installation failed" (adb is no
 # build input, and the image cannot be installed into, by design).
 ENV PATH=/opt/jdk/bin:/opt/cargo/bin:/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
