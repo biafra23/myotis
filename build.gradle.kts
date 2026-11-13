@@ -193,6 +193,31 @@ allprojects {
             val buildscriptLocks =
                 if (project == rootProject) lockedIn(rootProject.file("buildscript-gradle.lockfile")) else null
             val writingLocks = gradle.startParameter.isWriteDependencyLocks
+            // Every throwable under a failure: cause, suppressed, and the causes
+            // of a multi-cause exception (by its public getCauses()). The
+            // reflective call fails QUIETLY if a Gradle release drops the method,
+            // leaving only the first cause, which hides a lock conflict again
+            // (Gradle 9 puts it in a later cause). Only the `gradle pins` canary
+            // notices, which is why it holds one case per pin-failure shape:
+            // keep them all.
+            fun everyThrowable(root: Throwable): List<Throwable> {
+                val seen = mutableListOf<Throwable>()
+                val queue = ArrayDeque(listOf(root))
+                while (queue.isNotEmpty()) {
+                    val t = queue.removeFirst()
+                    if (seen.any { it === t }) continue
+                    seen += t
+                    t.cause?.let(queue::add)
+                    queue.addAll(t.suppressed)
+                    runCatching { t.javaClass.getMethod("getCauses").invoke(t) as? List<*> }
+                        .getOrNull()?.filterIsInstance<Throwable>()?.let(queue::addAll)
+                }
+                return seen
+            }
+            fun isLockConflict(s: String) =
+                "dependency was locked to version" in s ||
+                    "dependency lock state" in s ||
+                    ("version constraints" in s && "enforced by dependency locking" in s.lowercase())
             val pinFailures = mutableListOf<String>()
             confs.forEach { conf ->
                 val locks = if (conf in buildscriptConfs) buildscriptLocks else projectLocks
@@ -217,19 +242,36 @@ allprojects {
                     }
                 } catch (e: Exception) {
                     val chain = generateSequence<Throwable>(e) { it.cause }.toList()
-                    val causes = chain.mapNotNull { it.message }.joinToString(" <- ")
+                    // EVERY throwable under the failure, not only the `cause`
+                    // chain: a resolution failure of several modules is a
+                    // multi-cause exception (Gradle's internal MultiCauseException,
+                    // reached by its public `getCauses()`), and since Gradle 9 the
+                    // locking constraint's failure is a LATER cause — the first
+                    // one is the bare "Could not resolve <the declared version>".
+                    val all = everyThrowable(e)
                     // A wrong hash and an entry the lock lacks/has extra raise
                     // dedicated exceptions; a lock that pins a version the graph
                     // no longer accepts does NOT — it surfaces as an ordinary
-                    // "cannot find a version that satisfies the constraints"
-                    // failure, recognisable only by the lock's reason string.
-                    val isPinFailure = chain.any { t ->
+                    // version-constraint conflict whose constraint names the lock:
+                    // "dependency was locked to version" up to Gradle 8, "Dependency
+                    // version enforced by Dependency Locking" from 9. It counts only
+                    // inside a version-constraint conflict, the shape a stale lock
+                    // version produces: every locked module carries the lock as a
+                    // constraint, so a locked configuration that fails for another
+                    // reason on this host (an unreachable repository, a variant
+                    // this walk cannot select) can name it in its message tree too.
+                    // The `gradle pins` canary fails if an upgrade words it a
+                    // third way.
+                    val lockFailure = all.firstOrNull { t ->
                         t.javaClass.simpleName.let {
                             it == "DependencyVerificationException" || it == "LockOutOfDateException"
-                        } || t.message.orEmpty().let {
-                            "dependency was locked to version" in it || "dependency lock state" in it
-                        }
+                        } || isLockConflict(t.message.orEmpty())
                     }
+                    val isPinFailure = lockFailure != null
+                    val causes = listOfNotNull(
+                        chain.mapNotNull { it.message }.joinToString(" <- "),
+                        lockFailure?.takeIf { it !in chain }?.message,
+                    ).joinToString(" <- ")
                     // Not a pin failure, but the GRAPH may still have resolved
                     // completely, and only the files could not be selected by this
                     // generic walk (attributes it lacks, a task output it would
@@ -247,7 +289,15 @@ allprojects {
                         pinFailures += "${project.path}:${conf.name} — its graph resolves, but it has no lock state " +
                             "(its files could not be selected here: ${chain.firstOrNull()?.message.orEmpty().take(200)})"
                     } else {
-                        logger.warn("resolveAllDependencies: ${project.path}:${conf.name} skipped — $causes")
+                        // A skipped configuration WITH lock state is lock and hash
+                        // state this host does not check; say so, so a tool bump
+                        // that moves one into this branch shows in the log (the
+                        // KGP *DependenciesMetadata ones are skipped by design).
+                        val locked = locks != null && conf.name in locks
+                        logger.warn(
+                            "resolveAllDependencies: ${project.path}:${conf.name} skipped" +
+                                (if (locked) " (has lock state, not checked here)" else "") + " — $causes",
+                        )
                     }
                 }
             }

@@ -162,8 +162,13 @@ jobs:
 
       # The check classifies Gradle's failures partly by message text (a lock
       # that pins a version the graph rejects has no exception type of its
-      # own), so a Gradle bump that rewords it must fail HERE, not turn the
-      # check into a silent pass. One wrong hash, one wrong lock version.
+      # own) and reaches some of them only through a multi-cause exception's
+      # later causes, so a Gradle bump that rewords or reorders them must fail
+      # HERE, not turn the check into a silent pass. One case per shape the
+      # classifier recognises: a wrong lock version, a module the lock lacks,
+      # a module it has extra, a wrong hash. Each must fail AS that pin
+      # failure: the pattern is looked for in the pin-failure list only, not
+      # in the skip warnings, which repeat a failure's causes too.
       - name: Canary — tampered pins must fail the check
         if: ${{ inputs.canary }}
         run: |
@@ -176,18 +181,41 @@ jobs:
               echo "::error::$1 passed the check — the pin-failure classifier in build.gradle.kts no longer matches"
               exit 1
             fi
-            grep -q 'Dependency pins do not match' <<<"$out" || {
+            pins=$(sed -n '/Dependency pins do not match/,$p' <<<"$out")
+            grep -Eq -- "$2" <<<"$pins" || {
               echo "$out" | tail -40
-              echo "::error::$1 failed, but not as a pin failure"
+              echo "::error::$1 failed, but not as the pin failure it should be (no match for: $2)"
               exit 1
             }
             git checkout -- tx-history/gradle.lockfile gradle/verification-metadata.xml
           }
-          sed -i 's/kethereum:model:0\.86\.0=/kethereum:model:0.85.0=/' tx-history/gradle.lockfile
-          git diff --quiet tx-history/gradle.lockfile && { echo "::error::canary edit did not apply"; exit 1; }
-          expect_failure "a lock pinning another version"
+          lock=tx-history/gradle.lockfile
+          applied() { git diff --quiet "$lock" gradle/verification-metadata.xml && { echo "::error::canary edit did not apply: $1"; exit 1; }; true; }
+
+          sed -i 's/kethereum:model:0\.86\.0=/kethereum:model:0.85.0=/' "$lock"
+          applied "a lock pinning another version"
+          expect_failure "a lock pinning another version" \
+            '(enforced by Dependency Locking|locked to version)'
+
+          sed -i '/^com\.github\.komputing\.kethereum:model:0\.86\.0=/d' "$lock"
+          applied "a module the lock lacks"
+          expect_failure "a module the lock lacks" \
+            "kethereum:model:0\.86\.0' which is not part of the dependency lock state"
+
+          python3 - "$lock" <<'EOF'
+          import sys
+          p = sys.argv[1]
+          lines = open(p).read().splitlines()
+          extra = "org.example.canary:absent:1.0=compileClasspath"
+          at = next((i for i, l in enumerate(lines) if l.startswith("empty=")), len(lines))
+          lines.insert(at, extra)
+          open(p, "w").write("\n".join(lines) + "\n")
+          EOF
+          applied "a module the lock has extra"
+          expect_failure "a module the lock has extra" \
+            "org\.example\.canary:absent:1\.0' which is part of the dependency lock state"
+
           python3 - <<'EOF'
-          import re
           p = "gradle/verification-metadata.xml"
           s = open(p).read()
           i = s.index('name="trueblocks-kotlin-')
@@ -195,7 +223,8 @@ jobs:
           s = s[:j] + ("1" if s[j] == "0" else "0") + s[j + 1:]
           open(p, "w").write(s)
           EOF
-          expect_failure "a wrong trueblocks-kotlin hash"
+          applied "a wrong trueblocks-kotlin hash"
+          expect_failure "a wrong trueblocks-kotlin hash" 'trueblocks-kotlin'
 
       - name: Start from the previous host's metadata
         id: previous
