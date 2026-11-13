@@ -195,8 +195,27 @@ def load_api_versions(sdk):
         f"platforms;android-36.1 or newer stable (see DB_CANARIES in this script)")
 
 
+def platform_class_names(sdk):
+    """Every class any installed platform database names (membership only).
+
+    The levels come from load_api_versions' oldest passing database; this is
+    the wider question "is this a platform class at all", which needs the
+    NEWEST one: D8's API stubs are cut from the compileSdk platform (android-37
+    holds android.crypto.hpke.AeadParameterSpec, the 36.1 database does not).
+    That platform is installed wherever an APK was just built against it."""
+    names = set()
+    pdir = os.path.join(sdk, "platforms")
+    for name in os.listdir(pdir):
+        xml = os.path.join(pdir, name, "data", "api-versions.xml")
+        if os.path.exists(xml):
+            with open(xml, encoding="utf-8", errors="replace") as f:
+                names.update(re.findall(r'<class name="([^"]+)"', f.read()))
+    return names
+
+
 CLASS_RE = re.compile(r"Class descriptor\s*:\s*'L([\w/$\-]+);'")
 SUPER_RE = re.compile(r"Superclass\s*:\s*'L([\w/$\-]+);'")
+CLASS_FLAGS_RE = re.compile(r"^\s*Access flags\s*:\s*0x[0-9a-fA-F]+\s*\(([^)]*)\)")
 IFACE_RE = re.compile(r"^\s+#\d+\s+:\s+'L([\w/$\-]+);'")
 DEF_NAME_RE = re.compile(r"^\s+name\s+:\s+'([^']+)'")
 DEF_TYPE_RE = re.compile(r"^\s+type\s+:\s+'([^']+)'")
@@ -223,6 +242,9 @@ class DexModel:
         # (synthetic class, method) -> {(caller class, caller method)}
         self.synthetic_callers = defaultdict(set)
         self.method_headers = 0   # METHOD_HDR_RE matches; 0 = header format drift
+        # Classes whose CLASS access flags carry SYNTHETIC (dexdump's
+        # "Access flags : 0x1001 (PUBLIC SYNTHETIC)" after the descriptor).
+        self.synthetic_classes = set()
 
     def merge(self, other):
         self.supers.update(other.supers)
@@ -236,6 +258,7 @@ class DexModel:
         for k, v in other.synthetic_callers.items():
             self.synthetic_callers[k] |= v
         self.method_headers += other.method_headers
+        self.synthetic_classes |= other.synthetic_classes
 
     def resolve_synthetics(self):
         """Charge each synthetic class's references to the real classes behind it.
@@ -283,6 +306,7 @@ def parse_dexdump(dexdump, dex_path):
     cur_synthetic = False
     in_ifaces = False
     pending_name = None
+    class_flags_pending = False
 
     def add_ref(owner, member, kind):
         if cur_synthetic:
@@ -325,7 +349,16 @@ def parse_dexdump(dexdump, dex_path):
                 cur, in_ifaces, pending_name = m.group(1), False, None
                 cur_method, cur_synthetic = "?", bool(SYNTHETIC_RE.search(cur))
                 model.supers.setdefault(cur, [])
+                class_flags_pending = True
                 continue
+        # The class's own access flags come on the line right after its
+        # descriptor; method and field flags come later, after a member name.
+        if class_flags_pending and "Access flags" in line:
+            class_flags_pending = False
+            m = CLASS_FLAGS_RE.match(line)
+            if m and "SYNTHETIC" in m.group(1).split():
+                model.synthetic_classes.add(cur)
+            continue
         # A synthetic class's own extends/implements is charged like its other
         # references: as a type ref of site (cur, "?"), which no one calls by
         # name, so it goes to the class's users (main() skips synthetics in its
@@ -478,6 +511,7 @@ def main():
     if not dexdump or not os.path.exists(dexdump):
         die("no build-tools/*/dexdump in SDK")
     classes = load_api_versions(sdk)
+    platform_names = platform_class_names(sdk)
     allow = load_allowlist(args.allowlist)
     min_api = args.min_api if args.min_api is not None \
         else apk_min_sdk(os.path.join(bt, "aapt"), args.apk)
@@ -520,6 +554,20 @@ def main():
     # Synthetic classes' supertypes went through resolve_synthetics instead.
     for cls, supers in model.supers.items():
         if SYNTHETIC_RE.search(cls):
+            continue
+        # D8's API stubs: AGP 9 dexes a debug build with a "universal" global
+        # synthetics dex holding a SYNTHETIC stub for every platform class newer
+        # than minSdk (android.crypto.hpke.*, android.net.ipsec.*, ...), whether
+        # or not anything uses it. A stub carries the platform's name, so on a
+        # device that has the class the boot classpath's wins; on one that
+        # lacks it, the stub loads only when program code references it, and
+        # every program reference to java/javax is still checked below. So its
+        # OWN supertypes (hpke's *ParameterSpec extend NamedParameterSpec, API
+        # 33) are no crash of ours. Only a synthetic class that bears the name
+        # of a platform class in an installed API database counts as a stub: a
+        # library's own (non-synthetic) copy of a platform class, or a
+        # synthetic class no platform names, is still checked.
+        if cls in model.synthetic_classes and cls.startswith("android/") and cls in platform_names:
             continue
         for sup in supers:
             if sup.startswith(("java/", "javax/")):
