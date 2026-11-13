@@ -126,6 +126,25 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    # Compose waits for AGP 9 (owner's decision, 2026-11-12). androidx
+    # Compose 1.12 (which Compose Multiplatform 1.12 brings) requires AGP
+    # 9.1+ and compileSdk 37; this build is on AGP 8.7.3 / compileSdk 35, so
+    # #800's group failed AGP's AAR-metadata check and held back every other
+    # update in it. Compose Multiplatform patches still arrive; the androidx
+    # Compose BOM is held entirely, its calendar version (2024.11.00) making
+    # every newer release a minor or a major here, so the migration moves it by hand.
+    # kotlinx-datetime waits with Compose: the catalog keeps it in sync with
+    # what Compose ships (a 0.x line whose last minor broke binaries, and the
+    # mismatch failed at run time on desktop). The AGP 9 migration (#818,
+    # after Gradle 9.6+) moves all three and removes these entries; Dependabot
+    # shows nothing for an ignored update, so that issue is the reminder.
+    ignore:
+      - dependency-name: "org.jetbrains.compose*"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "androidx.compose*"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "org.jetbrains.kotlinx:kotlinx-datetime"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
     groups:
       gradle-minor-patch:
         update-types: ["minor", "patch"]
