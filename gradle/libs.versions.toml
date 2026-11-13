@@ -128,6 +128,9 @@ android-application = { id = "com.android.application", version.ref = "agp" }
 # AGP 9's Android target for Kotlin Multiplatform modules (:ui, :myotis-engine);
 # replaces com.android.library + androidTarget() there.
 android-kotlin-multiplatform-library = { id = "com.android.kotlin.multiplatform.library", version.ref = "agp" }
+# The KMP Android library plugin registers no lint tasks of its own (AGP 9):
+# the standalone lint plugin gives :ui and :myotis-engine their lint again.
+android-lint        = { id = "com.android.lint",        version.ref = "agp" }
 kotlin-jvm          = { id = "org.jetbrains.kotlin.jvm",             version.ref = "kotlin" }
 kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
 compose-compiler    = { id = "org.jetbrains.kotlin.plugin.compose",  version.ref = "kotlin" }

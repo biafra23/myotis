@@ -6,6 +6,7 @@ androidx.databinding:databinding-compiler-common:9.5.1=classpath
 com.android.application:com.android.application.gradle.plugin:9.5.1=classpath
 com.android.databinding:baseLibrary:9.5.1=classpath
 com.android.kotlin.multiplatform.library:com.android.kotlin.multiplatform.library.gradle.plugin:9.5.1=classpath
+com.android.lint:com.android.lint.gradle.plugin:9.5.1=classpath
 com.android.tools.analytics-library:crash:32.5.1=classpath
 com.android.tools.analytics-library:protos:32.5.1=classpath
 com.android.tools.analytics-library:shared:32.5.1=classpath

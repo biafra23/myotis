@@ -26,6 +26,8 @@ plugins {
     // AGP 9's Android target for KMP (#818), replacing com.android.library +
     // androidTarget(): one (release-shaped) variant, configured in kotlin { android { } }.
     alias(libs.plugins.android.kotlin.multiplatform.library)
+    // Lint: the KMP Android library plugin registers none of its own (AGP 9).
+    alias(libs.plugins.android.lint)
 }
 
 // The root build parses -PskipRustEngine once (same truthy rules everywhere) and
@@ -62,8 +64,8 @@ kotlin {
         buildToolsVersion = libs.versions.android.build.tools.get()
         minSdk = 29
         // The consumer contract the com.android.library AAR had (v0.1.20's
-        // aar-metadata.properties: minCompileSdk=1). This plugin otherwise writes
-        // its own compileSdk there (37), which would make every consumer's
+        // aar-metadata.properties: minCompileSdk=1). AGP 9 otherwise writes the
+        // library's compileSdk there (37; android.aar.metadata.defaultMinCompileSdkToCompileSdk), which would make every consumer's
         // checkAarMetadata refuse the AAR below compileSdk 37, though nothing
         // in the library needs a newer compile SDK than before.
         aarMetadata.minCompileSdk = 1

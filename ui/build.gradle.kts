@@ -11,6 +11,8 @@ plugins {
     alias(libs.plugins.kotlin.multiplatform)
     // AGP 9's Android target for KMP (#818), replacing com.android.library + androidTarget().
     alias(libs.plugins.android.kotlin.multiplatform.library)
+    // Lint: the KMP Android library plugin registers none of its own (AGP 9).
+    alias(libs.plugins.android.lint)
     alias(libs.plugins.compose.multiplatform)
     alias(libs.plugins.compose.compiler)
 }
