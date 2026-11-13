@@ -167,14 +167,14 @@ object RustEngine {
         return myotis_accept_stale_anchor(handle)
     }
 
-    /** The remembered stale-anchor answer (ABI >= 58): 0 ask, 1 checkpoint, 2 continue. */
+    /** The remembered stale-anchor answer (ABI >= 59): 0 ask, 1 checkpoint, 2 continue. */
     fun setStaleAnchorPolicy(handle: Long, policy: Int): Boolean {
         requireAbi()
         return myotis_set_stale_anchor_policy(handle, policy)
     }
 
     /** Re-anchor a STALE_ANCHOR park on a fresh checkpoint every answering
-     *  checkpoint-sync server names (ABI >= 57). Blocking — never call from the main thread. */
+     *  checkpoint-sync server names (ABI >= 58). Blocking — never call from the main thread. */
     fun refreshAnchorFromCheckpointz(handle: Long): String {
         requireAbi()
         return take(myotis_refresh_anchor_from_checkpointz(handle))

@@ -60,13 +60,13 @@ jobs:
   build:
     name: Build APKs (debug + unsigned release)
     needs: review-gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           submodules: recursive
           # Full history: :ui stamps the app's on-screen version from the nearest
@@ -85,15 +85,15 @@ jobs:
           fetch-depth: 0
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78  # v6.2.0
         with:
-          java-version: '21'
+          java-version-file: .java-version  # exact Temurin release, one place (#734)
           distribution: 'temurin'
 
       # Robust Gradle dependency + plugin caching (restores the base-branch cache
       # so AGP / Besu / JitPack-fork artifacts come from cache, not flaky repos).
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c  # v6.4.1
 
       - name: Make gradlew executable
         run: chmod +x gradlew
@@ -103,26 +103,24 @@ jobs:
       # binary (the recurring failure mode: an ABI-compatible but feature-stale
       # .so that fails UniFFI validation on-device and silently falls back to
       # Java). This job provides the required toolchain: the Android rustup
-      # targets below, cargo-ndk, and the runner's preinstalled NDK (found via
-      # ANDROID_NDK_HOME / $ANDROID_HOME/ndk). No -PskipRustEngine here — the
-      # shipped APK must carry the engine.
+      # targets below, and the NDK, build-tools and cargo-ndk versions pinned in
+      # gradle/libs.versions.toml (#734 — not the image's default NDK). No
+      # -PskipRustEngine here — the shipped APK must carry the engine.
       - name: Set up Rust (Android targets)
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/rust-toolchain
         with:
           targets: aarch64-linux-android,x86_64-linux-android
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: rust
           # Shared with boot-smoke-api29 (same toolchain, same preBuild chain);
           # only this job saves it, so the smoke job adds no second cache.
           shared-key: android-rust
 
-      - name: Install cargo-ndk
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-ndk
+      - name: Install the pinned NDK, build-tools and cargo-ndk
+        uses: ./.github/actions/android-native-toolchain
 
       # The assemble step below already builds the engine via preBuild, but run it
       # explicitly first so a toolchain problem fails here with a clear step name.
@@ -160,7 +158,7 @@ jobs:
             exit 1
           }
 
-      # The ubuntu-latest runner ships an Android SDK via $ANDROID_HOME, which
+      # The ubuntu-26.04 runner ships an Android SDK via $ANDROID_HOME, which
       # AGP picks up automatically when local.properties is absent. No extra
       # sdkmanager calls needed for compileSdk 34.
 
@@ -215,6 +213,19 @@ jobs:
             done <<< "$engines"
           done
 
+      # Every .so the APKs ship (the Rust engine and JNA's dispatcher) must have
+      # 16 KB-aligned LOAD segments, or Android 15+ devices with 16 KB pages
+      # refuse to load it. rust/build-android.sh checked this, but the Gradle
+      # cargoNdkAndroid path the APKs are built from had no check, and since
+      # #734 Part 4b the alignment flag reaches the linker through a MERGE of
+      # per-target rustflags, which a RUSTFLAGS would silently replace.
+      - name: Verify the APKs' native libraries are 16 KB aligned
+        run: |
+          set -euo pipefail
+          python3 -I scripts/check_16k_alignment.py \
+            "$(ls android-app/build/outputs/apk/debug/*.apk | head -n1)" \
+            "$(ls android-app/build/outputs/apk/release/*.apk | head -n1)"
+
       # minSdk JDK-API gate — enforcement for CLAUDE.md's "minSdk 29 JDK-API
       # budget"; the script's docstring is the full story. The platform install
       # feeds its api-versions canary: pre-36.1 databases don't record every
@@ -232,7 +243,7 @@ jobs:
           done
 
       - name: Upload the debug APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: android-app-debug-${{ github.sha }}
           path: android-app/build/outputs/apk/debug/*.apk
@@ -245,8 +256,9 @@ jobs:
           # fix since it hit exactly that.)
           overwrite: true
 
-      # sign_release_apk.sh otherwise first runs on a hosted runner at a real
-      # tag. Rehearse it on every run with a throwaway key, so runner-image drift
+      # sign_release_apk.sh, and the release job's signed-against-unsigned
+      # check, otherwise first run on a hosted runner at a real
+      # tag. Rehearse them on every run with a throwaway key, so runner-image drift
       # (which build-tools dir it picks, apksigner's --alignment-preserved,
       # aapt2's badging format, the JDK behind apksigner) fails here instead.
       # The throwaway pin goes in through ANDROID_RELEASE_CERT_PIN_FILE, so the
@@ -268,6 +280,11 @@ jobs:
           ANDROID_RELEASE_KEYSTORE_PASSWORD="$REHEARSAL_PW" \
           ANDROID_RELEASE_KEY_ALIAS=rehearsal \
             scripts/sign_release_apk.sh "$apk" "$t/signed.apk"
+          # And the check the release job makes between the two APKs it
+          # publishes (#734): the signed one is the unsigned one plus its
+          # signature and nothing else. Here it meets the pinned apksigner's
+          # real output on every run, not first at a tag.
+          python3 scripts/repro/compare_signed_apk.py "$t/signed.apk" "$apk"
           rm -rf "$t"
 
       # sign-release refuses a tag whose tree has no pinned release certificate,
@@ -282,7 +299,7 @@ jobs:
       # so on a PR or main it would only be dead artifact storage.
       - name: Upload the unsigned release APK
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: android-app-release-unsigned-${{ github.sha }}
           path: android-app/build/outputs/apk/release/*.apk
@@ -316,7 +333,7 @@ jobs:
     # cold. It also spends no emulator time on a commit whose build is broken.
     # The cost is wall-clock: it starts only once the build job finishes.
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     # Skip on release tags: nothing consumes this job's result there (release
@@ -348,9 +365,9 @@ jobs:
       # probe degrades to its fallback label instead of failing without it.
       # (No `chmod +x gradlew` either — the executable bit is committed.)
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      # The emulator needs hardware virtualization; ubuntu-latest runners expose
+      # The emulator needs hardware virtualization; ubuntu-26.04 runners expose
       # /dev/kvm but root-only by default. This is the standard "enable KVM" udev
       # rule from the android-emulator-runner docs.
       - name: Enable KVM
@@ -360,23 +377,23 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78  # v6.2.0
         with:
-          java-version: '21'
+          java-version-file: .java-version  # exact Temurin release, one place (#734)
           distribution: 'temurin'
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c  # v6.4.1
 
       # The Rust engine, same toolchain as the build job: the app's preBuild runs
       # cargoNdkAndroid for both APK ABIs (the device itself is x86_64).
       - name: Set up Rust (Android targets)
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/rust-toolchain
         with:
           targets: aarch64-linux-android,x86_64-linux-android
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: rust
           # The build job's cache, saved by that job earlier in this same run
@@ -385,10 +402,8 @@ jobs:
           shared-key: android-rust
           save-if: false
 
-      - name: Install cargo-ndk
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-ndk
+      - name: Install the pinned NDK, build-tools and cargo-ndk
+        uses: ./.github/actions/android-native-toolchain
 
       # AGP's managed-device setup downloads the emulator + the API-29 system
       # image (several hundred MB, a couple of minutes) into the runner's
@@ -453,7 +468,7 @@ jobs:
       # the device) should say so, not vanish.
       - name: Upload managed-device test results
         if: failure() || cancelled()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: api29-boot-smoke-results-${{ github.sha }}
           path: |
@@ -501,23 +516,36 @@ jobs:
     name: Sign the release APK
     needs: [build, version-guard]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     environment: android-release
     permissions:
       contents: read
     steps:
-      - name: Check out the signing script and the pinned certificate only
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - name: Check out the signing script, the pinned certificate and the version catalog only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          # The catalog only for its android-build-tools pin, which the script
+          # reads with sed (#734): data, not code that runs here.
           sparse-checkout: |
             scripts/sign_release_apk.sh
             android-app/release-signing-cert.sha256
+            gradle/libs.versions.toml
           sparse-checkout-cone-mode: false
           # Nothing here talks to git again: keep the token out of .git/config.
           persist-credentials: false
 
+      # The signer is the PINNED build-tools (gradle/libs.versions.toml), not
+      # whatever the image ships: the runner's own sdkmanager, no action.
+      - name: Install the pinned build-tools
+        run: |
+          set -euo pipefail
+          v=$(sed -n 's/^android-build-tools *= *"\([^"]*\)".*/\1/p' gradle/libs.versions.toml)
+          [ -n "$v" ] || { echo "::error::no android-build-tools pin in gradle/libs.versions.toml"; exit 1; }
+          # Licences from a process substitution: `yes |` fails under pipefail.
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;$v" >/dev/null < <(yes)
+
       - name: Download the unsigned release APK
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: android-app-release-unsigned-${{ github.sha }}
           path: unsigned
@@ -538,7 +566,7 @@ jobs:
           scripts/sign_release_apk.sh "${apks[0]}" signed/android-app-release.apk
 
       - name: Upload the signed release APK
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: android-app-release-${{ github.sha }}
           path: signed/android-app-release.apk
@@ -559,37 +587,71 @@ jobs:
     # otherwise all three are skipped.
     needs: [build, sign-release, version-guard]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       # gh release create/upload needs write access to Releases (repo contents).
       contents: write
+      # The build-provenance attestation of the three APKs (#734): an OIDC
+      # token for the Sigstore certificate, and the attestation's storage.
+      id-token: write
+      attestations: write
     steps:
-      # Only the shared release notes and the script that writes them
-      # (.github/release-notes.*), from the commit being released. First, so
+      # Only the shared release notes, the script that writes them
+      # (.github/release-notes.*) and the one that uploads
+      # (.github/release-assets.sh), from the commit being released. First, so
       # the artifacts below land in the checked-out workspace, not under it.
       - name: Check out the release notes
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          # Plus the version catalog, for the pinned android-build-tools the
+          # badging check below reads with sed (#734).
           sparse-checkout: |
             .github/release-notes.md
             .github/release-notes.sh
+            .github/release-assets.sh
+            scripts/repro/compare_signed_apk.py
+            gradle/libs.versions.toml
           sparse-checkout-cone-mode: false
           # gh takes the token from the publish step's env; keep the job's
           # write token out of .git/config.
           persist-credentials: false
       - name: Download the debug APK
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: android-app-debug-${{ github.sha }}
           path: apk/debug
 
       - name: Download the signed release APK
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: android-app-release-${{ github.sha }}
           path: apk/release
 
-      - name: Check both APKs' package ids and give them stable, versioned asset names
+      # The APK as the build left it, before sign-release added the signature.
+      # It installs nowhere (Android refuses an unsigned APK); it is published
+      # because it is the artifact a rebuild reproduces bit for bit, and the
+      # signed app is this file plus a signing block (#734;
+      # docs/guides/reproducible-builds.md shows both comparisons).
+      - name: Download the unsigned release APK
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: android-app-release-unsigned-${{ github.sha }}
+          path: apk/unsigned
+
+      # The signed app is what people install, the unsigned one is what a
+      # rebuild reproduces: tie them together before either is published. The
+      # signed APK must be the unsigned APK's bytes, in place, plus signature
+      # files and a signing block, and nothing else.
+      - name: Check the signed APK is the unsigned APK plus its signature
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          signed=(apk/release/*.apk) unsigned=(apk/unsigned/*.apk)
+          [ "${#signed[@]}" -eq 1 ] && [ "${#unsigned[@]}" -eq 1 ] \
+            || { echo "::error::expected exactly 1 signed and 1 unsigned apk, found ${#signed[@]} and ${#unsigned[@]}"; exit 1; }
+          python3 scripts/repro/compare_signed_apk.py "${signed[0]}" "${unsigned[0]}"
+
+      - name: Check the APKs' package ids and give them stable, versioned asset names
         run: |
           set -euo pipefail
           # The tag goes into the asset file names, so check its shape the way the
@@ -599,9 +661,14 @@ jobs:
           # otherwise create the release in the next step and then fail its upload.
           printf '%s' "${GITHUB_REF_NAME}" | grep -Eq '^v[A-Za-z0-9._-]+$' \
             || { echo "::error::'${GITHUB_REF_NAME}' is not a valid release tag (expected v<version>)"; exit 1; }
-          # Numbered stable releases only (not rc builds or a `current` symlink).
-          build_tools=$(ls -d "$ANDROID_HOME"/build-tools/*/ \
-            | grep -E '/[0-9]+\.[0-9]+\.[0-9]+/$' | sort -V | tail -n1)
+          # The pinned build-tools (gradle/libs.versions.toml, #734), the same
+          # version that signed the APK — not the newest the image happens to ship.
+          bt_version=$(sed -n 's/^android-build-tools *= *"\([^"]*\)".*/\1/p' gradle/libs.versions.toml)
+          [ -n "$bt_version" ] || { echo "::error::no android-build-tools pin in gradle/libs.versions.toml"; exit 1; }
+          build_tools="$ANDROID_HOME/build-tools/$bt_version/"
+          # Licences from a process substitution: `yes |` fails under pipefail.
+          [ -x "${build_tools}aapt2" ] \
+            || "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;$bt_version" >/dev/null < <(yes)
           aapt2="${build_tools}aapt2"
           shopt -s nullglob
           # variant, expected package, asset suffix. The package check is the
@@ -622,6 +689,7 @@ jobs:
             echo "  ok: $variant = $package -> Myotis-${GITHUB_REF_NAME}-${suffix}.apk"
           done <<'APKS'
           release com.jaeckel.ethp2p.android android
+          unsigned com.jaeckel.ethp2p.android android-unsigned
           debug com.jaeckel.ethp2p.android.debug android-debug
           APKS
 
@@ -639,4 +707,20 @@ jobs:
           # Create the release with the master notes (.github/release-notes.md),
           # unless another publisher already did — see .github/release-notes.sh.
           bash .github/release-notes.sh create "$tag"
-          gh release upload "$tag" apk/Myotis-*.apk --clobber
+          # Upload, and check that the release serves these bytes.
+          bash .github/release-assets.sh "$tag" apk/Myotis-*.apk
+
+      - name: Attest the APKs' build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/release-assets.SHA256SUMS
+
+      # Last, and also when the attestation failed: SHA256SUMS is the one file
+      # all publishers share, kept apart from this job's own upload and
+      # attestation (.github/release-assets.sh).
+      - name: List the release's assets in SHA256SUMS
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: bash .github/release-assets.sh --checksums "${GITHUB_REF_NAME}"

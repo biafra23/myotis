@@ -1,0 +1,18 @@
+# Artifacts that do NOT reproduce yet, with the reason (#734).
+#
+# Read by scripts/repro/compare.py: a path (relative to a leg's collected tree,
+# see scripts/repro/collect.sh) that matches a pattern here is reported as KNOWN
+# and does not fail the comparison; every other difference still does. A
+# pattern that no longer matches any difference is reported, so remove it when
+# its fix lands. Keep each entry as NARROW as the cause: a whole artifact is
+# listed only where its payload is compared file by file next to it, so a new
+# difference inside it still fails.
+#
+# Format: <fnmatch pattern> TAB <reason>. `*` matches across `/`.
+
+# (none: every gated artifact reproduces. What is gated is the workflow's
+# `compare` matrix: everything legs a and b build, on all three platforms.)
+#
+# History: the Compose plugin's wall-clock jar rewrite (the skiko runtime jar
+# everywhere, every jar on macOS) was listed here until app-desktop's
+# normalizeAppImage fixed it in our build (#734, Part 5a).

@@ -1,188 +1,94 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code (claude.ai/code) in this repository.
+
+**This file is the always-loaded core.** Each section is a summary; the full,
+binding text lives in `.claude/agent/`. When a task matches a row below, **read
+that file in full BEFORE acting** — a summary here never overrides the full text.
+A rule is changed or added in its `.claude/agent/` file AND in its summary here,
+in the same commit; an edit to only one of the two is incomplete. The files
+live under `.claude/` because `claude-review` restores that tree, like this
+file, from the PR's base branch: a PR cannot edit the rules it is reviewed
+against. Do not move them out of `.claude/`, and not into `.claude/rules/`
+(loaded on every request).
+
+| Before you…                                                                 | Read in full                      |
+|---|---|
+| build for Android or iOS, or a build fails on a missing toolchain             | `.claude/agent/build.md`             |
+| add or move a module, or touch host ↔ engine wiring or its exemptions         | `.claude/agent/architecture.md`      |
+| start a work item tied to an issue (session title), or open a PR (monitoring) | `.claude/agent/workflow.md`          |
+| plan, resume or continue multi-PR work: a part, a merge, the final PR         | `.claude/agent/multi-pr-plans.md`    |
+| write a PR description, answer review comments, or handle a fork PR           | `.claude/agent/pull-requests.md`     |
+| do any release work: tag, version, checkpoints, bootnodes, seeds, assets, bundles | `.claude/agent/releases.md`      |
+| add or bump a dependency, move a toolchain pin, touch build scripts or packaging | `.claude/agent/reproducibility.md` |
+| use a JDK API newer than Java 8 in Android-consumed code, or add HTTP         | `.claude/agent/platform.md`          |
+| add a data source, or touch roost, log-index seeds, `:tx-history`, Portal     | `.claude/agent/data-sources.md`      |
 
 ## Build & Run
 
+Full reference with toolchain notes: `.claude/agent/build.md`.
+
 ```bash
-# Build all modules. NOTE: :android-app builds the Rust engine from source by
-# default, so a full build needs the Android Rust toolchain (cargo + cargo-ndk +
-# NDK r28+ + the aarch64/x86_64-linux-android rustup targets). Without it, add
-# -PskipRustEngine to build the app on the Java engine, which boots only on
-# Android 13 / API 33+ (see the Rust section below).
-./gradlew build                  # add -PskipRustEngine without the Android Rust toolchain
-
-# Compile only (no tests)
-./gradlew compileJava
-
-# Run tests (all modules) — same toolchain note as `build`; :android-app's test
-# tasks also go through its preBuild gate.
-./gradlew test                   # add -PskipRustEngine without the Android Rust toolchain
-
-# Run a single test class
+./gradlew build          # needs the Android Rust toolchain; without it add -PskipRustEngine
+./gradlew compileJava    # compile only
+./gradlew test           # same toolchain note as build
 ./gradlew :networking:test --tests "com.jaeckel.ethp2p.networking.rlpx.HandshakeRoundTripTest"
 
-# Start daemon (mainnet, blocks until stopped)
-./gradlew :app:run
+./gradlew :app:run                                 # daemon, mainnet (blocks until stopped)
+./gradlew :app:run -Pnetwork=gnosis                # also sepolia, chiado (holesky is retired)
+./gradlew :app:run -Pnetwork=gnosis -Pport=30304   # second network alongside mainnet
+./gradlew :app:run -Pargs=status                   # IPC: status | peers | "get-headers 21000000 3" | stop | purge-cache
 
-# Start daemon on another network
-./gradlew :app:run -Pnetwork=gnosis     # Gnosis Chain (chainId 100, its own beacon chain)
-./gradlew :app:run -Pnetwork=sepolia    # Ethereum testnet
-./gradlew :app:run -Pnetwork=chiado     # Gnosis testnet (chainId 10200, Gnosis beacon preset)
-# (holesky was retired — the EF shut it down in Oct 2025: no peers, no checkpoint servers)
-
-# Run a second network alongside mainnet (separate daemon, separate port + socket)
-./gradlew :app:run -Pnetwork=gnosis -Pport=30304
-
-# Send IPC commands to running daemon
-./gradlew :app:run -Pargs=status
-./gradlew :app:run -Pargs=peers
-./gradlew :app:run -Pargs="get-headers 21000000 3"
-./gradlew :app:run -Pargs=stop
-./gradlew :app:run -Pargs=purge-cache
-
-# Rust workspace (rust/ — native BLS + the growing Rust engine). OPTIONAL for the
-# JVM hosts (daemon/desktop): without cargo these self-skip with one note and the
-# pure-Java build is unaffected. The ANDROID app is the exception — it requires the
-# toolchain by default (see below), or -PskipRustEngine to opt out.
-./gradlew cargoBuildHost   # cargo build --release (auto-runs before :app:run / :consensus:test)
-./gradlew cargoTest        # cargo test --workspace (part of `check`)
-./gradlew cargoBuildNoStd  # no_std canary: cargo build -p myotis-core --no-default-features for x86_64-unknown-none (part of `check`; self-skips without that rustup target)
-./gradlew cargoNdkAndroid  # Android jniLibs, built from source (needs cargo-ndk + NDK + Android rustup targets)
-
-# The Android engine library (:myotis-engine, the AAR the Android app consumes)
-# builds the Rust engine FROM SOURCE by default — cargo + cargo-ndk + NDK r28+ +
-# `rustup target add aarch64-linux-android x86_64-linux-android` are REQUIRED to
-# build it, and so :android-app. There is no committed .so (so nothing can drift);
-# an Android build also regenerates the committed UniFFI bindings (:myotis-engine-rust)
-# from source — other workflows do NOT, so regenerate them explicitly with
-# `./gradlew uniffiGenerateKotlin` after changing the Rust FFI. Opt out when you
-# lack the toolchain — the build tells you about the switch — with:
-./gradlew :android-app:assembleDebug -PskipRustEngine  # Java engine only (no Rust engine / native BLS); boots on API 33+ only
-
-# iOS (macOS only; needs Xcode 26+ and the rustup targets on the toolchain the
-# workspace's rust-toolchain.toml selects — i.e.
-# `rustup target add --toolchain stable aarch64-apple-ios aarch64-apple-ios-sim`).
-# Cargo stays optional here too: without the toolchain (and with no previously
-# built libmyotis_engine.a) :myotis-engine-ios and :app-ios disable their tasks with a warning
-# instead of failing the build — the full toolchain is required only to actually
-# build the iOS app.
-./gradlew cargoBuildIosSim                              # libmyotis_engine.a for the arm64 simulator
-./gradlew cargoBuildIosDevice                           # libmyotis_engine.a for arm64 devices
-./gradlew :app-ios:linkDebugFrameworkIosSimulatorArm64  # MyotisKit.framework (runs cargo first)
-# The app itself builds from ios-app/ (Xcode project, regenerable with `xcodegen generate`):
-#   cd ios-app && xcodebuild -project Myotis.xcodeproj -scheme Myotis \
-#     -destination 'platform=iOS Simulator,name=<device>' build
+./gradlew cargoBuildHost    # cargo build --release (auto-runs before :app:run / :consensus:test)
+./gradlew cargoTest         # cargo test --workspace (part of `check`)
+./gradlew cargoBuildNoStd   # no_std canary (part of `check`)
+./gradlew cargoNdkAndroid   # Android jniLibs from source
+./gradlew uniffiGenerateKotlin   # REQUIRED after changing the Rust FFI (only Android builds do it implicitly)
+./gradlew :android-app:assembleDebug -PskipRustEngine   # Java engine only; boots on API 33+ only
+./gradlew cargoBuildIosSim  # also cargoBuildIosDevice, :app-ios:linkDebugFrameworkIosSimulatorArm64
 ```
+
+The Rust workspace (`rust/`) is optional for the JVM hosts (daemon/desktop self-skip
+without cargo). The Android app requires it by default.
 
 ## Architecture
 
-Key Gradle modules:
+One line per module; detail and protocol flow: `.claude/agent/architecture.md`.
 
-- **myotis-engine** — THE ENGINE LIBRARY: a Kotlin Multiplatform module (jvm +
-  android targets, no UI) that packages the Rust engine for the hosts — the
-  Android AAR (the Myotis app and a separate wallet product) and the desktop jar.
-  Published as `eth.myotis:myotis-engine` with its upstream modules (`myotis-api`,
-  `myotis-engine-rust`, `myotis-engine-common`, `myotis-engine-ports`,
-  `myotis-rpc-policy`; not `:core`, whose Tuweni + BouncyCastle would ride into
-  every consumer
-  — the root build's `Publishing` section): GitHub Packages and the token-free
-  `maven-repo` branch on every `v*` tag plus the AAR and a Maven-repository zip
-  as release assets
-  (`engine-library.yml`; `publishAllPublicationsToStagingRepository` +
-  `scripts/check_engine_library.sh` verify the set; `publishToMavenLocal` for a
-  consumer under development). docs/guides/android-library.md is the consumer page.
-  `io.myotis.engine.Myotis` is the entry point (`newEngine()`: the Rust engine
-  with no loopback listener, for an in-process consumer); it re-exports
-  `:myotis-api`, keeping `:myotis-engine-rust` implementation-only (host
-  seams re-exported on `Myotis`). Its androidMain owns the jniLibs
-  (`cargoNdkAndroid` builds them there from source) and JNA's Android dispatcher,
-  so a consumer's APK is complete with the AAR alone. The Myotis apps consume the
-  Rust engine through it and keep the Java engine via the selector.
-- **myotis-engine-natives** — the desktop half the jar lacks: the Rust engine's
-  host library as `eth.myotis:myotis-engine-natives-<platform>`, one plain jar
-  per line of its `platforms.txt` (macOS arm64/x64, Linux x64/arm64; Windows
-  later), the library at JNA's classpath path. Built by `engine-library.yml`'s
-  `host-natives` matrix, one runner per platform, staged with
-  `-PengineNativesDir`; without it, this host's own from `cargoBuildHost`.
-- **myotis-engine-ios** — the engine library's iOS module
-  (`eth.myotis:myotis-engine-ios`; iosArm64 + iosSimulatorArm64): the cinterop of
-  the RUST engine's plain C ABI (`rust/include/myotis_engine.h`), with
-  libmyotis_engine.a absorbed into each target's cinterop klib,
-  `io.myotis.engine.ios.RustEngine` over it — the only code that imports
-  `io.myotis.engine.capi` — and, in commonMain over a `NativeEngine` seam, the
-  typed API with `io.myotis.api`'s names (`Myotis.newEngine()` → `MyotisEngine` /
-  `ChainHandle` / `VerifiedReads` / `EnsApi`), its JSON decoding pinned by the
-  JVM side's golden shapes and tested on the simulator (`ios-framework.yml`).
-  macOS only (disabled elsewhere), so
-  `engine-library.yml` stages it on a macOS runner and merges it into the set.
-- **myotis-engines** — the engine SELECTOR (`Engines`/`SelectorEngine`): hosts'
-  composition roots call `Engines.engine()`; `myotis.engine=java|rust|auto` routes
-  each network (re)start to the Java engine (node-core) or the Rust one.
-- **myotis-engine-rust** — the RUST engine behind the contract on its own
-  (`RustMyotisEngine`/`RustChainHandle`/`RustVerifiedReads`/`RustEnsApi`, the Tor
-  seam): `rust/myotis-engine` over UniFFI-generated Kotlin bindings + JNA (committed
-  in this module, regenerated via `uniffiGenerateKotlin`; compound values as JSON
-  pinned by golden tests both sides). Java 17, and it depends on nothing from the
-  Java engine and carries no HTTP server: the loopback JSON-RPC listener is a PORT
-  (`LoopbackRpc`). The selector fills it with the Ktor server (`KtorLoopbackRpc` in
-  `:myotis-engines`), so the daemon, the desktop app and the Android app keep the
-  listener they always had; an in-process consumer of the engine library (the
-  Android AAR's wallet) constructs the engine with no factory and gets a handle that
-  answers `reads()` in-process with nothing listening.
-- **myotis-engine-common** — the lifecycle primitives both engines' handles wire
-  (`WakeGate`, `SleepMetrics`); Java 17 over `:myotis-api` and slf4j.
-- **myotis-engine-ports** — the engine library's DEFAULT port actuals
-  (`io.myotis.engine.ports`): the node-key file, the file-backed EL and CL peer
-  caches, the `HttpURLConnection` CCIP-Read gateway and the per-network file
-  layout (`NetworkFiles`), assembled by `DefaultEnginePorts.forNetwork` /
-  `Myotis.defaultPorts`. The Android app's former `NodeService` actuals, moved
-  here so a consumer of the AAR gets a working engine from two directories; the
-  daemon and desktop keep their twins in `:app` for now. Java 17, minSdk-29-safe,
-  over `:myotis-api` and slf4j; re-exported (`api`) by `:myotis-engine`.
-- **myotis-rpc-policy** — the JSON-RPC serving policy with no server attached
-  (`RpcBlockWindow`, the block-selector window of #366; `WebAccessPolicy` /
-  `WebOrigins`, the web-page policy's pure half of #502): a dependency-free Kotlin
-  Multiplatform module, one definition for the Rust engine, the router in
-  `:jsonrpc-server`, the iOS backend and the UI's normalizer parity test.
-- **myotis-logindex-presets** — the log index's PREDEFINED CONTRACTS
-  (`io.myotis.logindex`: `LogIndexPresets` — RAILGUN, Swarm, Privacy Pools,
-  Tornado Cash per network, each from its creation block — and
-  `LogIndexDownloads`: download/disk estimates, "cheaper together", the config
-  push): dependency-free Kotlin Multiplatform like `:myotis-rpc-policy`, one
-  catalog for the Index tab (`:ui`) and for embedding apps (`api` of
-  `:myotis-engine` and `:myotis-engine-ios`; `Myotis.LogIndex` is the JVM
-  trigger). docs/how-it-works/log-index-presets.md.
-- **myotis-api** — THE ENGINE CONTRACT: zero-dependency Java-17 interfaces
-  (`io.myotis.api` + `io.myotis.api.ports`) every host consumes exclusively.
-  FFI-portable types only (byte[], String, long, double[], enums, flat records;
-  blocking methods). Implemented by **node-core**'s `io.myotis.node.api` adapters
-  (`JavaMyotisEngine`/`JavaChainHandle` over `ChainStack`/`NodeRegistry`). Designed so a Rust engine can replace the Java one behind the same
-  surface — see docs/spec/05-engine-api-bindings.md.
-- **core** — Cryptographic identity (`NodeKey`), data types (`BlockHeader`), ENR decoding
-- **networking** — Three protocol layers, all Netty-based:
-  - `discv4` — UDP peer discovery using Kademlia DHT (ping/pong/findnode/neighbors)
-  - `rlpx` — TCP transport: EIP-8 ECIES handshake → AES-256-CTR framed channel
-  - `eth` — eth/66-69 sub-protocol on top of RLPx (hello → status → ready)
-- **consensus** — Sync-committee light client (libp2p, BLS, SSZ)
-- **app** — Daemon/CLI entry point, Unix domain socket IPC server, peer caching
-- **myotis-evm** — Local EVM execution (Besu) against SNAP-verified state for view calls and gas estimation
-- **ui** — Shared Compose Multiplatform screens + the pure-Kotlin seams
-  (`NodeController`/`Settings`/`LogSource`/`NetworkStatus`/`QueryHistory`);
-  targets Android + Desktop JVM + iOS. Hosts supply the seam actuals.
-- **app-ios** — The iOS host: Kotlin/Native framework (`MyotisKit`) bundling `:ui`
-  with iOS seam actuals over the Rust engine, through `:myotis-engine-ios` (whose
-  libmyotis_engine.a the framework links). The JVM engine never runs on iOS. The Xcode shell lives in
-  `ios-app/` (regenerate with `xcodegen generate`).
-
-**Protocol flow**: `DiscV4Service` discovers peers → `Main` dials them via `RLPxConnector.connect()` → `RLPxHandler` performs ECIES handshake (state machine: HANDSHAKE_WRITE → HANDSHAKE_READ → FRAMED) → fires `RLPX_READY` event → `EthHandler` runs eth handshake (AWAITING_HELLO → AWAITING_STATUS → READY) → block header requests available.
-
-**Daemon vs Client mode**: `Main` checks if the Unix socket (`/tmp/ethp2p.sock`) is already listening. No args = daemon mode (discovery + RLPx + IPC server). With args = client mode (send JSON command and exit).
+- **myotis-api** — THE ENGINE CONTRACT: zero-dependency Java-17 interfaces every host consumes exclusively; FFI-portable types only.
+- **myotis-engine** — THE ENGINE LIBRARY (KMP, jvm + android): packages the Rust engine as the Android AAR and desktop jar; entry point `io.myotis.engine.Myotis`.
+- **myotis-engine-rust** — the Rust engine behind the contract (UniFFI Kotlin bindings + JNA over `rust/myotis-engine`); no HTTP server.
+- **myotis-engines** — the engine SELECTOR (`Engines.engine()`; `myotis.engine=java|rust|auto`).
+- **myotis-engine-common** — lifecycle primitives both engines share (`WakeGate`, `SleepMetrics`).
+- **myotis-engine-ports** — the library's default port actuals (`Myotis.defaultPorts`).
+- **myotis-engine-natives** — per-platform desktop native jars of the Rust engine.
+- **myotis-engine-ios** — iOS module: cinterop of the Rust engine's C ABI plus the typed API.
+- **myotis-rpc-policy** — JSON-RPC serving policy, dependency-free KMP.
+- **myotis-logindex-presets** — the log index's predefined contracts, dependency-free KMP.
+- **node-core** — the Java engine (`io.myotis.node.api` adapters over `ChainStack`/`NodeRegistry`).
+- **core** — `NodeKey`, `BlockHeader`, ENR decoding.
+- **networking** — Netty: `discv4` (UDP discovery), `rlpx` (ECIES + framed TCP), `eth` (eth/66-69).
+- **consensus** — sync-committee light client (libp2p, BLS, SSZ).
+- **app** — daemon/CLI, Unix-socket IPC server (`/tmp/ethp2p.sock`), peer caching. No args = daemon; with args = client.
+- **myotis-evm** — local EVM execution (Besu) against SNAP-verified state.
+- **ui** — shared Compose Multiplatform screens + pure-Kotlin seams (Android, Desktop JVM, iOS).
+- **app-ios** — the iOS host (`MyotisKit`) over the Rust engine; Xcode shell in `ios-app/`. The JVM engine never runs on iOS.
 
 ## Key Dependencies
 
-- **Tuweni 2.7.2** (upstream `io.consensys.tuweni`, Maven Central; original `org.apache.tuweni` packages) — RLP encoding, SECP256K1, byte utilities.
-- **Netty 4.2.x** — NIO-only (no epoll/kqueue). 4-thread `NioEventLoopGroup` for RLPx.
+Full text, including the builder image: `.claude/agent/reproducibility.md`.
+
+- **Every Gradle dependency is pinned by version AND hash** (#734). A new or
+  bumped dependency fails the build until its pins are regenerated with
+  `scripts/update_gradle_pins.sh`. Review the hash diff like code. **Never "fix"
+  a verification failure you did not cause by re-pinning** — bytes changed
+  under a pinned version.
+- **The builder image (`docker/builder/`) is the reference toolchain** for the
+  Linux and Android artifacts. Moving a pin (JDK, Go, apt snapshot, …) moves
+  `pins.env` / `image.lock` / `apt-packages.txt` in the same change. Never
+  install or upgrade a tool inside an image build of the artifacts.
+- **Tuweni 2.7.2** (`io.consensys.tuweni`) — RLP encoding, SECP256K1, byte utilities.
+- **Netty 4.2.x** — NIO-only (no epoll/kqueue).
 - **BouncyCastle** — SECP256K1 crypto provider
 
 ## Conventions
@@ -193,728 +99,162 @@ Key Gradle modules:
 - IPC uses JSON-Lines over Unix domain sockets with Java 21 virtual threads
 - Network configs (genesis hash, fork ID, bootnodes) live in `NetworkConfig`
 - **Hosts talk ONLY to `:myotis-api`** (`MyotisEngine`/`ChainHandle`): host runtime
-  paths in the daemon, desktop, and Android don't import engine internals
-  (node-core/networking/consensus types). Composition roots use the `:myotis-engines`
-  selector (`Engines.engine()`; `myotis.engine=java|rust|auto`, default auto —
-  `-Pengine=…` on run tasks), which routes to the Java engine (node-core) or the
-  Rust engine (rust/myotis-engine via UniFFI + JSON). The engine library's default
-  port actuals (`io.myotis.engine.ports`, `:myotis-engine-ports` — `Myotis.defaultPorts`)
-  are part of the library's public surface, not engine internals: a host may build its
-  `EnginePorts` from them, as the Android app does. Documented exemptions: the
-  single `Engines.engine()` line at each composition root; the TrueBlocks
-  transaction-history scan in `:tx-history` (`TxHistoryService` wraps the raw
-  `RLPxConnector`; UNVERIFIED, Java-engine + mainnet only), consumed by the daemon's
-  `get-transactions` debug stream (`DebugCommands`), the desktop Query tab
-  (`DesktopNodeController.transactionHistory`), and the Android Query tab
-  (`NodeService.txHistoryService`) — all reach the connector via
-  `SelectorEngine.javaDelegate().debugStack` at their composition roots;
-  the Settings toggles for the BLS backend (`BlsBackends`), the
-  engine (`Engines`), and Tor routing of account reads and of the wallet's
-  own transaction broadcast (`Tor` —
-  docs/how-it-works/privacy-and-tor.md; Rust-engine-only, gated behind the Rust-engine
-  toggle, and behind the `-PtorEngine` build flag that links Arti into the host
-  dylib and the Android jniLibs), the Rust log drain (`Engines.drainRustLogs` —
-  hosts pump the engine's tracing ring into their log pipeline), and the Status
-  screen's per-network engine badge (`Engines.engineKindFor`) — internal
-  seams, deliberately not on the API; and `:app`'s
-  `testing/MainnetPeerBootstrap` (an integration-test fixture).
-  The iOS host (`:app-ios`) is the JVM-free analogue: it consumes the same
-  engine contract over the Rust engine's plain C ABI (`RustEngine.kt` mirrors
-  `RustEngineNative`; same JSON shapes, pinned by the same golden tests) and
-  never touches engine internals either.
+  paths in the daemon, desktop, Android and iOS do not import engine internals
+  (node-core/networking/consensus types). Composition roots use the
+  `:myotis-engines` selector. The documented exemptions are a closed list in
+  `.claude/agent/architecture.md` — read it before adding any import that crosses
+  this line; a new exemption is the owner's call.
 
 ## Workflow — the mandatory steps for EVERY work item
 
-Every change to this repository goes through this sequence, in order, with **no
-step skipped and none treated as optional or "only if asked"**:
+Every change goes through this sequence, in order, with **no step skipped and
+none treated as optional or "only if asked"**. Full text: `.claude/agent/workflow.md`.
 
-1. **Code** — make the change on the designated branch.
-2. **Review** — run the internal code review on the diff (the `code-review`
-   skill / `/code-review`) and address what it finds before going further.
-3. **PR** — open a pull request. This is the default next step after review, not
-   a separate request the user has to make. (Follow the PR-description rules
-   below: English, the session link as the last line.) Its base is `main` for a
-   single-PR work item, and the feature branch for a part of a multi-PR plan
-   (next section).
-4. **Wait for review comments** — and make sure they REACH you. In the desktop
-   app, immediately after `gh pr create` returns, switch the app's PR monitor
-   on for that PR: `mcp__ccd_pr__set_monitor` with the PR's URL, `auto_fix:
-   true`, `address_comments: true`. It is PER PR and OFF by default — the app
-   has no global switch — so a PR opened without this call never wakes the
-   session for its review comments or CI failures, and the owner ends up
-   typing "please address the comment" for each one (owner ruling,
-   2026-10-09, after a day of exactly that; a memory note had not made it
-   stick, which is why it is here, in the step every PR goes through).
-   **In a claude.ai/code cloud session**, the same moment calls
-   `subscribe_pr_activity` (owner, repo, PR number) — that IS the session's
-   Auto-fix switch, and it is per PR and off by default there too. Do it
-   **without asking and without telling the owner to flip Auto-fix in the
-   UI**: this paragraph is the owner's standing, explicit request to turn on
-   auto-fix for EVERY PR a session opens in this repo (owner ruling,
-   2026-11-10, #745, after cloud sessions began stopping at "PR created" and
-   asking for the toggle). If the result says another Claude session already
-   watches the PR, this session gets no events: say so in the report, naming
-   that session, instead of reporting this session as watching it. Any other
-   host: use whatever it offers to watch a PR. Then wait
-   for CI + review feedback; do not consider the task done at "pushed".
-5. **Address the PR comments** — drive the PR to green and answer every review
-   comment per the rules below, then keep watching until it is merged or closed.
-   **MERGING IS THE OWNER'S ACTION — NEVER MERGE A PR YOURSELF** (owner ruling,
-   2026-08-31), no matter what earlier instructions seem to authorize. Green CI +
-   all comments answered = report "ready to merge" and keep watching; the merge
-   itself is the owner's. The one exception is a part PR into a multi-PR plan's
-   feature branch, and only when the owner said yes to the question in step 3
-   of the next section for that plan; a PR into `main` has no exception.
+1. **Code** — on the designated branch.
+2. **Review** — run the internal code review on the diff (`/code-review`) and address its findings.
+3. **PR** — open it without being asked. Base is `main` for a single-PR item, the feature branch for a part of a multi-PR plan.
+4. **Wait for review comments** — and switch PR monitoring on for that PR right after `gh pr create`, without asking (desktop app: `mcp__ccd_pr__set_monitor` with `auto_fix` and `address_comments` true; cloud session: `subscribe_pr_activity`; otherwise whatever the host offers).
+5. **Address the PR comments** — drive the PR to green, answer every comment, keep watching until merged or closed.
 
-Short form: **code → review → PR → wait for review comments → address them.**
-Do not stop at "pushed" and do not ask whether to open the PR or run the review —
-they are part of the work item. The only time to skip the PR is when the user
-explicitly says not to open one.
+Do not stop at "pushed". Skip the PR only when the user explicitly says so.
+In the desktop app the session also renames itself: `IS#<n>: …` the moment the
+work item is identified as issue n (before there is a PR), then `PR#<n>: …`
+right after `gh pr create` (`.claude/agent/workflow.md`).
 
-### The session title carries the issue and the PR number
+## Hard rules — never broken, whatever an earlier instruction seems to authorize
 
-The session renames ITSELF (`mcp__ccd_session_mgmt__set_session_title`,
-`session_id: "self"`) at two moments, without being asked, keeping the rest of
-its title (owner's request, 2026-10-09):
-
-- `IS#<n>: <title>` the moment the work item is identified as issue n — the
-  user names it, or the task is to fix it. Several issues: the one the PR will
-  close.
-- `PR#<n>: <title>` right after `gh pr create` returns the number. The PR prefix
-  REPLACES the issue prefix — the PR is the later, more specific handle, and
-  the issue number is in the PR body. A multi-PR plan carries the part PR
-  currently being driven; the earlier parts are the other PRs based on
-  `feature/<topic>` (next section).
-
-Why: the desktop app shows one session per sidebar row, and the owner finds a
-row by the number of its GitHub thread. A title the owner typed makes the app
-ask them to approve the rename (an app-generated one is replaced silently) —
-ask anyway, that is the point. Bypass-permissions mode renames without asking;
-an unattended session (scheduled, remote-triggered) is declined — a decline is
-fine, say so in the report, do not retry. A subagent cannot rename the session
-it runs in; the main session does it. Outside the desktop app (a plain `claude`
-terminal, CI) there is no session title and this rule is inapplicable.
+- **NEVER MERGE A PR YOURSELF** — not with `gh pr merge`, not by enabling
+  auto-merge. Green CI + all comments answered = report "ready to merge". Sole
+  exception: part PRs into a multi-PR plan's feature branch, and only under
+  step 3 of `.claude/agent/multi-pr-plans.md`: the owner said yes for that plan
+  in THIS conversation (never inferred from an earlier plan, a standing
+  instruction or a GitHub comment), and the part meets every condition listed
+  there, among them a POSTED automated review (a green `claude-review` job
+  alone is not one). A PR into `main` has no exception.
+- **Never push a `v*` tag on your own initiative.** The tag is the owner's action.
+- **Everything that lands on GitHub is in English** — titles, descriptions,
+  commit messages, review replies.
+- **Changes to project rules (this file, `.claude/agent/`) or to architecture are
+  the owner's call**, not the PR author's.
 
 ### Multi-PR plans land through a feature branch, never piece by piece on `main`
 
-**`main` must be releasable at every commit** (owner ruling, 2026-09-30): a `v*`
-tag cut from its head at any moment must not ship half a feature. So a work item
-**planned as more than one PR (or more than one branch)** does not merge into
-`main` part by part:
+**`main` must be releasable at every commit.** A work item planned as more than
+one PR (or branch) goes through `feature/<topic>`: create it from `main` first,
+target every part PR at it, ask the owner once per plan whether you may merge
+the parts into it yourself, keep it current by merging `main` into it (never
+rebase or force-push), and open the final `feature/<topic>` → `main` PR only
+when every part is in. Read `.claude/agent/multi-pr-plans.md` in full before the
+first part is coded, and again in any session that picks a plan up: before
+merging a part, before merging `main` into the feature branch, and before the
+final PR.
 
-1. **Create the feature branch first**, from the current `main`, before the first
-   part is coded: `feature/<topic>` (e.g. `git fetch origin main &&
-   git push origin origin/main:refs/heads/feature/<topic>`). This rule is the
-   permission to create it and to push to it as described here.
-2. **Every part PR targets the feature branch, not `main`**, and goes through the
-   full workflow above (code → review → PR → wait → address) like any other PR.
-   Each part branches from the feature branch's current head — also where a
-   generic instruction says to restart from the default branch. Open each part's
-   description with "Part k/n of `feature/<topic>`" and list the parts still to
-   come, so a later session can pick the plan up from GitHub alone.
-3. **Ask the owner, once per plan and before the first part is coded, whether
-   you may merge the part PRs into the feature branch yourself** — i.e. work
-   through every part without interaction until the last one is merged into
-   `feature/<topic>` (owner ruling, 2026-09-30). Ask it together with the plan
-   itself. The answer covers that one plan: never infer it from an earlier
-   plan's answer, a standing instruction, or a comment on GitHub. It lives in
-   the conversation where the owner gave it, so a later session resuming the
-   plan without that answer in its own conversation treats it as "no answer
-   yet" and may ask again — "once per plan" bounds repeat asking within a
-   conversation, not a resumed plan's first question.
-   - **Yes** → merge each part into `feature/<topic>` yourself (a merge commit,
-     as on `main`; not by enabling auto-merge) once it is done under the
-     workflow above: CI green on its current head, no merge conflict, the
-     internal review addressed, the automated review POSTED on the PR and its
-     findings handled, every review comment answered on its thread, and no open
-     changes-requested review. A green `claude-review` job alone is not a
-     review: the action skips and still goes green when the PR's copy of
-     `claude-review.yml` differs from `main`'s — a feature branch lagging `main`
-     on that file is enough (see the file's header). Nor is a review of a head
-     that has since moved beyond fixes for its findings and the other review
-     comments: it runs once per PR (not on push), and a re-run replays the
-     original commit, so it describes code that is no longer there. A part
-     without a posted review, or whose head moved like that after it, is not
-     yours to merge: report it "ready to merge" with that noted and let the
-     owner decide. Otherwise branch the next part from the new feature head and
-     carry on.
-   - **No, or no answer yet** → the owner merges each part. Report a green,
-     answered part as "ready to merge into `feature/<topic>`"; the next part
-     that depends on it waits for that merge.
-   - Either way, **a PR into `main` is never yours to merge** — the final PR of
-     step 5 included.
-4. **Keep the feature branch current with `main`** by merging `main` into it,
-   never by rebase or force-push (open part PRs are based on it), whenever
-   `main` moves in a way the feature has to absorb. A merge that went through
-   **cleanly** may be pushed straight to the feature branch: it adds nothing
-   `main` doesn't already carry. "Cleanly" means more than "no conflict
-   markers": a textually clean merge of two changes to the same file can still
-   fail to compile (#587: `main` gave a constructor a fourth argument, the
-   feature's test helper still passed three), so build the merged tree and run
-   the affected tests locally BEFORE pushing it. This is the only direct push
-   THIS STEP allows, and the restriction is on how `main` reaches the feature
-   branch — a merge, never a rebase or force-push; a resolution reviewed — not
-   on the feature branch in general: the final PR's review fixes are pushed
-   straight to it (step 5).
-   A merge that needed **conflict resolution** — or that compiles or passes
-   its affected tests only with a change, which is the same thing — goes
-   through a PR into the feature
-   branch like a part, because the resolution is new code — and, like
-   a part, it gets no artifact build (the exception below): a resolution in
-   `rust/` or a host module is cross-compiled only at the final PR unless the
-   merge PR dispatches the APK / dmg / iOS workflow on its branch. Build and
-   Test (`ci.yml`) and nearly every other push trigger fire only on `main`
-   (path-filtered `roost.yml` is the exception), so a clean merge is first
-   fully tested on the next PR into or out of the feature branch — when a part
-   PR goes red in code it did not touch, check the last `main` merge before
-   blaming the part. A fix the feature needs in code `main` also carries lands
-   on `main` as its own single PR and reaches the feature through this merge,
-   not as a feature-only patch.
-5. **Only when every planned part is merged into the feature branch**, open the
-   final PR `feature/<topic>` → `main`. It is an ordinary PR under the workflow
-   above — internal review of the whole combined diff, CI, reviewer comments,
-   "ready to merge" — and the merge into `main` is the owner's. Its description
-   links every part PR. **Its review comments are fixed on `feature/<topic>`
-   itself** (step 4's exception for a bug in code `main` also carries aside):
-   commit on the feature branch, push, answer each thread with the
-   commit — exactly as on any PR's own branch — and NEVER through another part
-   PR (owner ruling, 2026-10-09: #590 did that for #588's review and only added
-   a merge-ordering trap, the final PR being mergeable without its own fixes).
-   The final PR's review and CI cover what lands on the branch; the clean-merge
-   sentence in step 4 does not forbid this push. Its review is the real gate,
-   not a formality over parts already reviewed: `claude-review` reads its
-   prompt and `CLAUDE.md` from the PR's base, so part PRs were reviewed under
-   the feature branch's copies, and this is the one PR held to `main`'s (see
-   the header of `claude-review.yml`).
+## No merge into `main` may break reproducibility
 
-A **single-PR** fix or plan still targets `main` directly; none of the above
-applies. If a single-PR task grows a second PR before its first has merged,
-switch: create the feature branch from `main` and retarget the open PR's base to
-it. If a first part has already landed on `main` and left it unreleasable, tell
-the owner rather than stacking more parts on `main`. Skipping the feature branch
-for a multi-PR plan is the owner's call for that task, never the author's.
-Releases are unaffected: the release PR is a single PR against `main`, and
-whatever is still on a feature branch is simply not in that release. This rests
-on the PR workflows' `pull_request` triggers being unscoped (any base branch —
-see the comments in `ci.yml`, `android-apk.yml` and siblings), which is what
-gives part PRs the tests, clippy, the lockfile check and the Claude review; do
-not narrow them to `main`. **The artifact builds are the exception** (owner
-ruling, 2026-10-09): the Android APK + emulator smoke, the macOS dmg and the
-iOS framework skip a PR whose base is not `main` (a job-level `if` in those
-workflows — the checks show as skipped, not absent), because a packaging leg
-per part costs more than it tells; the final `feature/<topic>` → `main` PR
-builds everything, and a part that touches what those legs alone check (the
-Rust engine's Android/iOS cross-compiles, the engine's C ABI, the minSdk-29
-budget — `check_apk_min_api.py` runs only in the APK workflow) can dispatch
-the workflow on its branch from the Actions tab. A PR retargeted to `main`
-after it was opened keeps its skipped checks — a base change is an `edited`
-event, which these workflows do not run on — so push a commit or dispatch the
-three workflows before it merges, or the first artifact build of that head is
-the post-merge run on `main`.
+Full text: `.claude/agent/reproducibility.md`.
+
+- Before reporting a PR into `main` "ready to merge", its head has a green
+  `reproducible builds` run whenever the PR can change what a release build
+  produces (build scripts, dependencies and pins, toolchain pins, Cargo
+  manifests and locks, packaging, release workflows, build-time code). When
+  unsure, dispatch it on the PR's branch.
+- A red comparison is a blocker, like red CI. **Never make it green by adding a
+  pattern to `known-differences.txt` or by loosening `scripts/repro/compare.py`
+  / `collect.sh`** — that is the owner's call.
+- Do not widen or narrow the gate without the owner.
 
 ## Releases — ask before cutting one
 
-When the user asks for a release (a `v*` tag, a version bump, "cut a release"),
-**ask these three questions first and act only on what they choose** (owner
-rulings, 2026-09-02 and 2026-09-11), then **move the version pins — step 4
-below, mandatory, never asked about** (owner ruling, 2026-09-24) — and
-**refresh the PoC seeds, step 5, mandatory too** (2026-10-13). Everything a
-release needs goes into ONE release PR. **The tag is the owner's action**: after
-the merge the owner pushes it, or explicitly asks for it to be pushed — never
-push a `v*` tag on your own initiative, it is the publish trigger for every
-asset workflow and a stronger action than the merge this file already forbids.
-(v0.1.12 is the one exception to the one-PR rule: #484 carried steps 1–3 and
-#485 the bump and this rule. From v0.1.13 on, one PR.)
-
-1. **Refresh the trust checkpoints?** The embedded checkpoints (`@checkpoint:*`
-   blocks in `NetworkConfig.java`, mirrored in `rust/myotis-net/src/sync.rs`;
-   `./gradlew refreshCheckpoint -Pnetwork=<net>` writes both engines from one
-   fetch) age toward the weak-subjectivity bound (13 periods on mainnet, 3 on
-   gnosis). A fresh install past the bound parks in `STALE_ANCHOR` until the
-   host consents.
-
-   **A shipped anchor's remaining freshness is NOT a release deadline, and
-   nothing may gate a tag on it** (owner ruling, 2026-09-24). Gnosis periods are
-   8192 slots of 5 s — 11.4 h — so its 3-period bound gives a fresh install at
-   least a **~34-hour** window from the anchor's slot, and at most ~45.5 h: the
-   gate is period-granular (`ws_anchor_stale`: `wall - anchor > bound`), so an
-   anchor expires only when the wall clock ENTERS period `anchor + 4`, never
-   mid-period, and a refresh at head lands anywhere in its period. No release cadence can stay inside that: holding the
-   tag to it would mean daily releases, and daily releases would mean expecting
-   users to update daily, which trains them to click through updates without
-   reading them. Mainnet's 13 periods of 27.3 h (~15 days) is the same
-   phenomenon with a kinder constant. Quote the floor, not a fixed width — the
-   v0.1.12 tag message quoted an expiry to the second, which is how a
-   period-granular bound turns into a deadline nobody can meet.
-
-   So: refresh the anchors because a fresher one serves more installs, never
-   because a clock is running out. Do not compute, quote or act on an
-   "anchor goes stale at <time>" deadline when preparing a release, and do NOT
-   build the `verifyReleaseAnchorFresh` tag gate a review proposed for exactly
-   this (#485) — it would refuse correct releases on a schedule no release
-   process can meet. On gnosis in particular, `STALE_ANCHOR` on a fresh install
-   is the ORDINARY case within two days of any release, not an incident: the
-   consent path is the product surface that has to be good, and that is a
-   separate design question from how often we tag.
-2. **Re-sync the mainnet discv4 bootnodes from go-ethereum?** Source of
-   truth is geth's `params/bootnodes.go` `MainnetBootnodes`. Pin sites:
-   `NetworkConfig.MAINNET`, `ElConfig::mainnet()`
-   (`rust/myotis-net/src/el/reader.rs`), `rust/tor-poc` (with pubkeys), and
-   any other verbatim copy — do not trust this list, `grep -rn` the tree for
-   one of the current addresses before and after the edit until zero copies
-   of the old ones remain. Since #414 the `myotis-net` live tests read
-   `ElConfig::mainnet()` and `mainnet_config_pins_known_values` pins the
-   list as strings, so a partial re-sync fails in the fast lib test.
-   Mainnet has no pinned enodes and, in the Rust engine, an EIP-1459 DNS
-   fallback only where the host allows DNS (desktop and daemon since #539;
-   not mobile, not under Tor — the Java engine has one everywhere), so a
-   fresh profile with a stale list never seeds EL discovery and never holds
-   a snap peer there (#414, 2026-09-02).
-   Warm profiles and the dispatched smoke job hide this because they dial
-   their peer cache directly.
-3. **Run the cold-start checks?** (owner ruling, 2026-09-11.) Three live
-   tests, all `#[ignore]`d so nothing else ever runs them, and together the
-   only coverage of what a FRESH INSTALL does. Ordinary CI, the emulator smoke
-   and the dispatched node smoke all dial a warm peer cache or a release-fresh
-   anchor, which is exactly what hides this class of failure — in #422 a
-   shipped build could not catch up at all while every automated check was
-   green. Dispatch the `cold-start regression` workflow from the Actions tab
-   (preferred — a CI runner is a clean host, see the caveat below), or locally:
-
-   ```bash
-   cd rust
-   # 3a. are the shipped pins and bootnodes alive? (seconds when healthy)
-   NET=gnosis cargo test --release -p myotis-net --test live_pins_alive -- \
-       --ignored --nocapture --test-threads=1
-   # 3b. dead pins: every pinned CL server configured but unreachable
-   NET=gnosis cargo test --release -p myotis-net --test live_cold_start -- \
-       --ignored --nocapture cold_start_with_every_pinned_peer_unreachable
-   # 3c. deep catch-up: an anchor further behind than the network's ws bound
-   NET=gnosis MYOTIS_TEST_ANCHOR_ROOT=<64 hex> MYOTIS_TEST_ANCHOR_SLOT=<slot> \
-     cargo test --release -p myotis-net --test live_cold_start -- \
-       --ignored --nocapture cold_start_from_an_old_anchor
-   ```
-
-   Run each for every network you are shipping (`NET=mainnet|sepolia|gnosis`).
-   The workflow takes a `scope`: `full` is the release check and REFUSES to run
-   without an anchor rather than skipping the deep walk green; `pins-only` is
-   for when you deliberately want just 3a and 3b.
-
-   **3a is the one that would have caught #422 before it shipped**, and it is
-   the one whose OUTPUT you read rather than just its exit code. It asks every
-   pinned CL peer for a `light_client_bootstrap` at this build's own embedded
-   anchor and applies the SAME acceptance the production path does (checkpoint
-   pin plus both Merkle branches), then asks for the anchor's period of
-   `updates_by_range` and runs it through the production processor, and — once
-   the chain has left that period — for the current period's, which must be
-   attested in it, in its fork's wire shape and above the 2/3 bar. So a pin
-   counts as alive only if a fresh install would accept what it serves AND
-   could follow the chain from it: an anchor embedded before a server stopped
-   (Sepolia's Lighthouse pins at the Gloas fork) no longer hides that. Then it checks the
-   bootnodes can seed discv5 at all. It gates on a FLOOR (at least two pins serving), not a clean
-   sweep, because these are third-party hosts and demanding perfection makes a
-   check people skip. Individual dead pins are a re-census signal
-   (`examples/period_census.rs`; the workflow's `census` scope runs it from a
-   clean runner), not automatically a blocker.
-
-   **Caveat that will bite you: the result is only as good as the host.** A
-   Lighthouse node that has banned your IP reports as `dial failed` while being
-   perfectly healthy for everyone else — and any machine that ran a
-   pre-gossipsub build carries those bans for 12 h (that ban IS #422). Measured
-   2026-09-11 from a dev box: 18 of 23 gnosis pins looked dead from home and
-   answered fine through a VPN minutes earlier. So prefer the dispatched
-   workflow, and before believing a bad census, check whether your host is the
-   outlier.
-
-   The old-anchor run needs an anchor from a release OLDER than the current
-   one — the newest tag is usually the release whose checkpoint is already on
-   `main`, so it proves nothing, and the test refuses an anchor within the
-   network's weak-subjectivity bound:
-
-   ```bash
-   prev=$(git tag --sort=-v:refname | sed -n 2p)
-   git show "$prev":rust/myotis-net/src/sync.rs | grep -A6 '@checkpoint:gnosis:begin'
-   ```
-
-   Run them AFTER any checkpoint refresh from question 1, so the build under
-   test is the one being shipped. A failure here is release-blocking: it means
-   a fresh install cannot sync, which is the one thing a wallet must do.
-
-4. **Move the version pins. MANDATORY — not a question, and part of the SAME
-   release PR as steps 1–3** (owner ruling, 2026-09-24). Every release from
-   v0.1.8 to v0.1.11 did this inside its one release PR, but only by precedent;
-   the v0.1.12 checkpoint PR (#484) followed this list to the letter, answered
-   the three questions, and shipped no bump — `main` still declared 0.1.11, and
-   the tag would have been refused. There is no command for it yet (review
-   follow-up: a `setReleaseVersion` task); until there is, it is these six
-   files (a previous sweep commit touches these plus step 1's two checkpoint
-   files, so do not copy its file list blindly):
-
-   | file | what moves |
-   |---|---|
-   | `build.gradle.kts` | `version = "X.Y.Z-SNAPSHOT"` (root `allprojects`) |
-   | `rust/Cargo.toml` | the workspace `version` |
-   | `ios-app/Myotis/Version.xcconfig` | `MARKETING_VERSION = X.Y.Z` and `CURRENT_PROJECT_VERSION` = the root build's `releaseBuildNumber`, i.e. `X*1_000_000 + Y*1_000 + Z` (0.1.12 → 1012, 0.2.0 → 2000, 1.0.0 → 1000000; `verifyIosVersion` prints the expected value on a mismatch) |
-   | `rust/Cargo.lock`, `rust/roost/Cargo.lock`, `rust/tor-poc/Cargo.lock` | `cargo update --workspace` in each of the three manifests, so the workspace crates' own entries follow |
-
-   And, ONLY when step 3's deep walk (3c) ran from `oldest-servable.properties`'
-   entries — the dispatched workflow's default, not the `pins-only` scope and
-   not a local run from the previous tag's anchor — note in that file's comment
-   that this release's run walked from these roots. It is a servability record
-   the cold-start test trusts instead of re-probing; a note about a walk nobody
-   observed makes it lie.
-
-   Then verify. The first command is the SAME query the tag guard makes; the
-   rest cover the pins the guard does NOT see:
-
-   ```bash
-   ./gradlew -q :printReleaseVersion verifyCrateVersions verifyIosVersion   # must print releaseVersion=X.Y.Z
-   for m in rust rust/roost rust/tor-poc; do cargo update --workspace --locked --manifest-path $m/Cargo.toml; done
-   ```
-
-   `releaseVersion` must equal the tag's version core — the guard accepts
-   `vX.Y.Z` and `vX.Y.Z-<suffix>` (rc/hotfix shapes), nothing else. Know what
-   catches what: the guard refuses the tag ONLY for the Gradle pin, because it
-   compares the tag to `project.version` and nothing more. The other five are
-   PR-time failures — `./gradlew check` for the crate and iOS pins, the
-   `cargo-locks` workflow for the locks — so run them before asking for the
-   merge, or the release PR goes red after the fact. A stale `rust/Cargo.toml`
-   that slipped past both would ship a Rust engine whose devp2p and libp2p agent
-   strings advertise the previous release. The macOS dmg version is derived
-   (major + 1) and needs no edit.
-
-5. **Refresh the PoC log-index seeds. MANDATORY — not a question, and part of
-   the SAME release PR** (owner's request, 2026-10-13). Each seed is usable for
-   500,000 blocks above its top (`MAX_GAP`): ~29 days on Gnosis, ~69 on mainnet
-   and Sepolia. A release built on an older one ships a PoC that starts far
-   behind and, past the limit, never catches up: before this step, a Bee PoC
-   build started ~365,000 blocks behind. One command, on zbox, when the release
-   PR is otherwise ready (the shelf life runs from the fetch):
-
-   ```bash
-   scripts/refresh_poc_seeds.py
-   ```
-
-   It tops up all three incrementally — only the blocks above each seed's top,
-   fetched from zbox's geths to `finalized` and appended — and checks each
-   result frames the way the build frames it. The **Bee** seed is rewritten in
-   `data/bee/gnosis/`: commit it in the release PR. The two **RAILGUN** seeds
-   are published straight to the `railgun-seed` release (a safe swap; the old
-   asset stays until the new one is verified), which the tag's `railgun-dmg`
-   build downloads, so they are done before the tag with nothing to commit.
-   Why not a workflow: zbox's nodes are the seeds' only source, and no GitHub
-   runner can reach them. The reminder is one: on a PR that changes the root
-   `version`, the `PoC seeds` check (`poc-seeds.yml`) stays red until every
-   seed was fetched within 72 hours — re-run it by hand after the RAILGUN
-   publish, which makes no commit. Details: docs/guides/railgun-poc.md (*Refreshing the seed*),
-   docs/guides/bee-rpc-service.md (*seeding from a full node*).
-
-## Demo bundles build on merge to `main`, never on PRs
-
-The demo / PoC installers — the RAILGUN PoC dmg (`railgun-dmg.yml`), the Bee
-PoC dmg (the `bee-poc` leg of `desktop-dmg.yml`) and any bundle added later —
-build on every push to `main` and on `v*` tags, and NOT on pull requests
-(owner ruling, 2026-10-01). A merge to `main` is what refreshes the artifact a
-demo machine pulls, so nothing waits for a release; a PR build would only add a
-macOS runner leg per push, because a change that breaks a bundle without
-failing a test is next to impossible — what a bundle adds over the standard app
-(a seed, its manifest, warm peer caches) are build inputs, not code paths, and
-the standard dmg leg already proves jpackage on every PR into `main`. A bundle-only
-regression therefore surfaces on the next `main` run, where it is a hard gate.
-A bundle whose seed lives OUTSIDE the tree (RAILGUN's, on the `railgun-seed`
-release) also takes `workflow_dispatch`, so a refreshed seed can be rebuilt
-without a commit; a seed committed in the tree (Bee's, `data/bee/gnosis/`)
-needs none, since its refresh is itself a push to `main`. On a tag no bundle
-may hold back the standard assets: the Bee leg is `continue-on-error` there,
-and the RAILGUN dmg is its own workflow, so its failure leaves only itself
-red. Give a new bundle the same trigger set, and say so in its doc.
+Read `.claude/agent/releases.md` in full before any release work. In outline:
+**ask three questions first** (1. refresh the trust checkpoints? 2. re-sync the
+mainnet bootnodes? 3. run the cold-start checks?), then the mandatory steps
+(4. move the version pins, 5. refresh the PoC log-index seeds), all in ONE
+release PR. The tag is the owner's action. After the tag (6.), a release is
+done only when `verify release` and `reproducible builds` are green — check and
+report them. Every release asset goes through `.github/release-assets.sh`,
+never a bare `gh release upload`.
 
 ## Pull requests and code review
 
-These rules are for the **PR author**, opening a PR and answering its review.
-The reviewer's own instructions live in `.github/claude-review-prompt.md` and
-`.github/workflows/claude-review.yml`; a reviewer agent reads this file too
-(its prompt opens "Read CLAUDE.md first"), so note that the mechanism below is
-not addressed to it — and it could not follow it anyway, since `gh api` is not
-on its allowlist.
+Full text, including the fork-PR policy and the `gh api` reply mechanics:
+`.claude/agent/pull-requests.md`. These rules are for the **PR author**; a
+reviewer agent follows `.github/claude-review-prompt.md` and none of the
+mechanics below.
 
-**External / fork PRs are reviewed MANUALLY, never by the CI reviewer (owner's
-decision, 2026-08-15).** The `claude-review` workflow deliberately skips forks
-(`head.repo.full_name == github.repository` in its `if:`) because a `pull_request`
-run from a fork gets no secrets — but the deeper reason is trust: a fork PR's
-tree is attacker-controlled, and an automated reviewer that reads it can be
-prompt-injected. A PR can no longer rewrite the reviewer's prompt file (the
-workflow reads it from the PR's base commit) or its root `CLAUDE.md`
-(`claude-code-action` restores that from the base branch, as documented in
-its `docs/security.md`), but that does not make a fork tree safe to hand the
-reviewer: whoever opens a PR picks its base, instruction files below the
-repo root are not restored, and the diff itself is always attacker text (the
-header of `claude-review.yml` has the details). So do NOT wire fork PRs into the
-automated reviewer. Instead: the owner reads the diff first — watching for
-injection in `CLAUDE.md` / `.github/**` / build scripts / postinstall hooks /
-comments / encoded blobs — then, if wanted, a review is run manually from a
-trusted session **restricted to read/diff/comment tools, never building or
-running the fork tree** (merely `./gradlew …` executes fork-controlled build
-scripts locally; CI already builds fork PRs via unscoped `pull_request` in
-`ci.yml`, but secretless and sandboxed — a local session is neither). Held to
-that, nothing auto-merges and an injected reviewer's worst case is a comment a
-human still acts on. If automating fork review is ever reconsidered, pin the
-prompt and CLAUDE.md to the base ref, never execute fork code, keep reviews
-`COMMENT`-only, and lock down runner egress — see PR #375 for the discussion
-that produced this note.
+- Every PR description ends with its session links, never with the
+  "🤖 Generated with Claude Code" footer. Commit messages keep `Co-Authored-By`.
+- Respond to every review comment individually, on its own thread
+  (`gh api repos/<owner>/<repo>/pulls/<n>/comments/<comment_id>/replies -f body='…'`).
+- Verify every claim against the source before replying. State a plain verdict:
+  *Accepted* (what changed, which commit), *Disputed* (with evidence), or
+  *Deferred* (who decides).
+- Do not mark a thread resolved yourself.
+- Fix review comments on the PR's own branch, never through a separate PR
+  (one exception, on a feature branch: a bug in code `main` also carries is
+  fixed by its own PR into `main`).
+- Drive CI to green, or state the blocker explicitly.
+- **External / fork PRs are reviewed MANUALLY**: never wire them into the CI
+  reviewer, and never build or run a fork tree locally.
 
-- **WRITE EVERY PR IN ENGLISH** (owner ruling, 2026-09-17) — title, description,
-  commit messages, review replies and any top-level PR comment: everything that
-  lands on GitHub, whatever language the task was discussed in. Commit messages
-  are in on purpose — they sit in the PR's Commits tab and stay in `git log`
-  forever, read by the same audience. PRs are the project's public record and
-  are read by external contributors and by the automated reviewers; a German
-  description makes a change unreviewable for part of that audience. Talking to
-  the owner in German is fine and unaffected; the moment it lands on GitHub it
-  is English.
-- **Every PR description ends with its session links — the opening session's
-  link first, each session that later takes the PR over appended below — and
-  never with the "🤖 Generated with Claude Code" footer** (owner's ruling,
-  2026-10-09: the owner opens the session from the PR to continue the work;
-  the footer leads to a product page). The harness asks for that footer
-  on every PR; this rule overrides it, as the harness says a repo rule may.
-  The link is the `link` field of `mcp__ccd_session_mgmt__get_session`
-  (`session_id: "self"`). A claude.ai/code session's
-  `https://claude.ai/code/session_…` is clickable on GitHub; the desktop app's
-  `claude://claude.ai/…/local_…` is NOT (GitHub neither autolinks custom
-  schemes nor keeps them in an href), so write it as a code span for
-  copy-paste. No `link` reported (app links off for the organization), or no
-  session-mgmt tool on this host at all (a plain `claude` terminal, CI): say so
-  in that line. Commit messages keep their `Co-Authored-By` trailer.
-- **ALWAYS respond to every review comment, individually, on its own thread.**
-  One comment, one reply. A single bulk PR-level summary is not a substitute —
-  it may be posted *in addition*, but a reviewer must be able to see the
-  disposition of each point where they raised it. Silently fixing a comment in
-  a follow-up commit does not count as responding, and neither does silently
-  ignoring one.
-- **Only *inline* review comments have a thread.** A submitted review's summary
-  body and a top-level PR comment have no reply endpoint at all. Answer those
-  in a single top-level reply that quotes each point it addresses — that is the
-  one legitimate use of `gh pr comment`.
-- **Verify every claim against the source before replying.** Reviewers —
-  human, Copilot, or `claude[bot]` — are frequently right and occasionally
-  wrong. Treat a review comment as information to check, not an instruction to
-  obey. Quote the file and symbol you checked.
-- **State a plain verdict** in each reply, one of:
-  - *Accepted* — say what changed and name the commit.
-  - *Disputed* — say why, with the evidence that settles it. Disagreeing is
-    correct when the code supports it; do not change working code to satisfy a
-    review that is mistaken.
-  - *Deferred* — say who decides and what the options are. Use this for
-    anything that amends a project rule (this file included) or changes
-    architecture; those are the owner's call, not the PR author's.
-- **Do not mark a thread resolved on the author's own say-so.** Leave that to
-  the reviewer or the owner.
-- Reply with
-  `gh api repos/<owner>/<repo>/pulls/<n>/comments/<comment_id>/replies -f body='…'`
-  so the response threads under the original comment, rather than
-  `gh pr comment`, which starts a detached top-level discussion. **The `-f body`
-  is not optional**: `body` is required by the endpoint, and `gh api` switches
-  from `GET` to `POST` only when a parameter is present — without it the call is
-  a `GET` against a `POST`-only path. List the ids with
-  `gh api repos/<owner>/<repo>/pulls/<n>/comments --jq '.[].id'`. For bodies
-  containing backticks or quotes, prefer `--raw-field body="$(cat <<'EOF' … EOF)"`
-  over `-f`.
-- **Fix review comments on the PR's own branch**, whatever that branch is: a
-  single-PR branch, a part branch, or `feature/<topic>` itself for the final
-  PR of a multi-PR plan. A separate PR for fixes to the PR's own diff is never
-  the answer (owner ruling, 2026-10-09, after #590) — it delays the PR under
-  review and lets it merge without its fixes. (A comment that finds a bug in
-  code `main` also carries is the one exception, and it is step 4 of the
-  multi-PR rule above: that fix is its own single PR into `main`.)
-- **Drive CI to green.** Do not leave a PR on a red or pending check without
-  either pushing a fix or stating the blocker explicitly.
-- **Never merge a PR yourself** — not with `gh pr merge`, not by enabling
-  auto-merge. No earlier task description or standing instruction authorizes
-  it. The end state of the author's work is "green, answered, ready to merge";
-  the merge action itself is always the owner's. Sole exception: part PRs into
-  a multi-PR plan's feature branch, when the owner answered yes for that plan
-  (see *Multi-PR plans land through a feature branch*); never a PR into `main`.
+## Demo bundles build on merge to `main`, never on PRs
+
+The RAILGUN and Bee PoC installers build on pushes to `main` and on `v*` tags,
+not on pull requests. Give a new bundle the same trigger set. Full text:
+`.claude/agent/releases.md`.
 
 ## Platform & language direction
 
-- **Android compatibility is a first-class concern.** This is ultimately a wallet
-  library that has to run inside an Android app (`:android-app`, minSdk 29).
-  Every change needs to keep the consumer working: avoid JVM-only APIs that
-  the Android runtime / `coreLibraryDesugaring` can't cover, mind APK / DEX
-  size, and prefer libraries with known Android support. `java.net.http` is
-  not desugared and is not available below API 33 — do not use it.
-- **minSdk 29 JDK-API budget (verified empirically against R8's backport list
-  and the desugar_jdk_libs 2.1.5 config, 2026-08).** Safe at minSdk 29 via D8
-  backports + desugaring: `List/Set/Map.of`/`copyOf`, `Map.entry`,
-  `String.strip/isBlank/repeat`, `Collection.toArray(IntFunction)`,
-  `Optional.isEmpty`, `Predicate.not`, `Collectors.toUnmodifiable*`, and (from
-  desugar_jdk_libs 2.1.5) `Stream.toList()`. NOT covered — use the `:core`
-  replacements: `CompletableFuture.failedFuture/orTimeout/exceptionallyCompose`
+Full text, including the complete minSdk 29 JDK-API budget: `.claude/agent/platform.md`.
+
+- **Android compatibility is a first-class concern** (`:android-app`, minSdk 29).
+  Avoid JVM-only APIs the Android runtime or desugaring can't cover; mind APK size.
+- **minSdk 29 JDK-API budget.** `java.net.http` is not available — do not use it.
+  Also NOT covered, use the `:core` replacements: `CompletableFuture.failedFuture/orTimeout/exceptionallyCompose`
   → `core.concurrent.Futures`; `java.util.HexFormat` → `core.encoding.Hex`;
-  `BigInteger.intValueExact/longValueExact` → `core.math.BigIntegers`;
-  `Path.of` → `Paths.get`; `InputStream.readAllBytes/readNBytes/transferTo`
-  and `Files.readString/writeString` → a manual drain loop /
-  `Files.readAllBytes` + `Files.write`. Hosts (android-app/app/app-desktop)
-  don't import the `:core` helpers — they inline the few lines instead (hosts
-  talk only to `:myotis-api`). The ENFORCEMENT is
-  `scripts/check_apk_min_api.py`, run by the android-apk workflow against the
-  built APK's dex — the post-desugaring ground truth — on pushes to `main`, on
-  PRs into `main` and on dispatch; a part PR into a feature branch does not
-  build the APK (see the multi-PR section), so for a feature plan this check
-  first runs at the final PR unless a part dispatches the workflow. It also resolves calls
-  that reach a JDK method through a third-party subclass, which lint-style
-  source checks and a naive api-versions.xml lookup both miss (that is exactly
-  how `SnappyFramedInputStream.readAllBytes()` once slipped through), plus
-  class-level references (extends/checkcast of a post-29 `java.*` class). It
-  is deliberately fail-closed: pre-36.1 platform databases don't record every
-  policed API (`Files.readString` first appears in the android-36.1 database),
-  so the script refuses to scan against a database that cannot resolve its
-  canary APIs rather than passing vacuously.
-- **JVM 17 is the default source/target.** New modules should compile to
-  Java 17 class files (`sourceCompatibility = JavaVersion.VERSION_17`,
-  `targetCompatibility = JavaVersion.VERSION_17`) so they're consumable from
-  the Android module. The toolchain may run on Java 21, and existing modules
-  ship 21 class files only for transitive reasons (`:networking` because of
-  ConsenSys discv5 26.4.0; `:myotis-evm` because of Besu's `evm` module both
-  publishing Gradle module metadata declaring a JVM-21 floor). Only diverge
-  when a transitive forces it, and document the reason in the module's
-  build file.
-- **Long-term direction is Kotlin + Compose Multiplatform.** New code can
-  still land in Java where it lowers risk, but expect a migration to Kotlin
-  to enable Compose Multiplatform consumers (Android + desktop + iOS). Public
-  APIs should not depend on Java-only types that block Kotlin/Native or JS
-  targets later. Avoid leaking `CompletableFuture` into shared APIs designed
-  for multiplatform; expose suspending or library-neutral shapes instead.
-- **HTTP client: Ktor.** When a feature needs HTTP (e.g. CCIP-Read gateways
-  in `myotis-evm`), use Ktor — not OkHttp, not `java.net.http`. Ktor has
-  Multiplatform-ready engines and runs on Android.
+  `BigInteger.intValueExact/longValueExact` → `core.math.BigIntegers`; `Path.of`
+  → `Paths.get`; `InputStream.readAllBytes/readNBytes/transferTo` and
+  `Files.readString/writeString` → a manual drain loop / `Files.readAllBytes` +
+  `Files.write`. Hosts inline these few lines instead of importing `:core`.
+  Enforced by `scripts/check_apk_min_api.py` in the android-apk workflow.
+- **JVM 17 is the default source/target** for new modules; diverge only when a
+  transitive forces it, and document why in the module's build file.
+- **Long-term direction is Kotlin + Compose Multiplatform.** Do not leak
+  `CompletableFuture` or other Java-only types into shared APIs.
+- **HTTP client: Ktor** — not OkHttp, not `java.net.http`.
 
 ## Trust
 
 - Peer trusted is never an option everything has to be cryptographically verified
 - The only trust anchors are sync committee signatures and  the embedded pre-Merge historical hashes accumulator and the Bellatrix-era historical roots accumulator
-- **One bounded exception to the two rules above (owner's decision,
-  2026-09-25):** a seeded log history of a root-committing protocol is served
-  on its publisher's word. The client's on-chain root check keeps forged
-  leaves out of its tree; it does not surface a withheld or altered one, so
-  the wallet's displayed balance rests on the publisher. Scope and limits: the
-  carve-out under *Data sources*.
-- **One more, on the owner's request (2026-11-10), Rust engine (its persisted
-  store is the snapshot the Java engine also resumes):** only at a
-  `STALE_ANCHOR` park and only on the user's request (explicit, or a choice
-  the user told the app to remember), a fresh checkpoint that every answering
-  checkpoint-sync server names (at least two independent operators). Scope and
-  limits: the carve-out under *Data sources*.
+- One bounded exception (owner's decision, 2026-09-25): a seeded log history of
+  a root-committing protocol is served on its publisher's word. Scope and
+  limits: `.claude/agent/data-sources.md`.
+- One more (owner's request, 2026-11-10): only at a `STALE_ANCHOR` park and
+  only on the user's request (explicit or remembered), a fresh checkpoint that
+  every answering checkpoint-sync server names. Scope and limits:
+  `.claude/agent/data-sources.md`.
 - **A parameter that can change the answer must be APPLIED or REFUSED — never
-  accepted and silently ignored.** A well-formed result computed against
-  something other than what the caller asked for is indistinguishable from a
-  correct one, so the caller cannot detect it, retry it, or work around it. This
-  is the same rule the log index applies to an out-of-coverage range (an error,
-  never a misleading `[]`). It was learned the hard way: `eth_call` accepted the
-  state-override parameter and dropped it, which silently broke a wallet's
-  account-state reads and cost hours to trace back (#314). When refusing, use a
-  PERMANENT error code (`-32602`) — `-32000` is documented as retryable and a
-  client will spin on it.
+  accepted and silently ignored.** When refusing, use a PERMANENT error code
+  (`-32602`); `-32000` is documented as retryable and a client will spin on it.
+  An out-of-coverage range is an error, never a misleading `[]`.
 
 ## Data sources
-- the only sources for data are devp2p and libp2p calling a local client via http may only be used for debugging purposes it is not an option for production
-- **Carve-out for myotis-operated serving infrastructure (owner's decision,
-  2026-08-08).** The rule above governs the **wallet**. `roost`, the dedicated
-  light-client server (`rust/roost`, docs/design-history/lc-server-design.md), MAY source
-  *self-verifying* consensus objects — LC bootstrap, updates, finality and
-  optimistic updates — from a local beacon node over loopback REST, and does
-  NOT verify them itself. The verification happens in myotis: a bootstrap is
-  anchored to the checkpoint root the wallet already pins, and every update is
-  checked against sync-committee BLS signatures by the wallet receiving it. A
-  relay can withhold, but it cannot forge.
-  Two boundaries this carve-out does **not** cross:
-  - **"Self-verifying" is load-bearing.** It does not widen into "roost may
-    serve anything it read over REST". Any path relaying something a wallet
-    cannot check against sync-committee signatures — proxying
-    `beacon_blocks_by_range` is the live example — needs its own decision.
-  - **Withholding is a liveness attack and this concentrates it.** It is
-    *detected*, not silently wrong: both engines' SYNCED gate needs the
-    finalized header within 5 epochs of the wall clock
-    (`SYNCED_SLOT_SLACK_EPOCHS` in `BeaconSyncState` and `sync.rs`), so a
-    stalled relay drops the beacon status to `CATCHING_UP` once its last
-    finality is more than 5 epochs old (32 min on mainnet, ~7 min on gnosis)
-    and the hosts show "not ready". Reads do NOT start failing with
-    `beaconNotSynced` — that token only fires before the first finalized root
-    lands after a start — they keep answering against the last anchor until
-    peers can no longer prove against it or the header chain passes 8192
-    blocks (`headerChainGapTooLarge`). The signal is the beacon status, not a
-    read error.
-- **Carve-out for seeded log histories of root-committing protocols (owner's
-  decision, 2026-09-25).** The log index MAY serve a contract's history from an
-  imported seed myotis did not walk, on the word of the protocol maintainers
-  who publish and vouch for it, when the protocol's client rebuilds its
-  note-commitment tree from the logs and checks the root on-chain. Myotis
-  walks and verifies everything above the seed's top, as for any import. This
-  is publisher trust for the DISPLAYED BALANCE, with one hard bound: a client
-  that inserts leaves only under a root the contract held never holds a
-  forged leaf, so no spend is built on a fake tree. It does not make tampering
-  visible. RAILGUN's contract keeps every root a tree ever had (`rootHistory`)
-  and its stock engine stops quietly at the first bad or missing leaf, so a
-  seed that withholds or alters a commitment understates the balance with no
-  error; a replaced Shield ciphertext or a withheld nullifier overstates it.
-  Detail, the client-side checks that would close most of it, and the
-  preconditions: docs/how-it-works/seeded-log-histories.md.
-  Two boundaries this carve-out does **not** cross:
-  - **The client's root check is load-bearing, and must actually run.** No
-    on-chain root, or a client that skips the check, keeps the walk — kohaku's
-    Tornado Cash client ships with it off.
-  - **The check is the client's, not the index's.** Any other consumer reading
-    the span over `eth_getLogs` cannot tell seeded logs from walked ones, so a
-    seed is not a production path until the index marks its provenance. Nor
-    does this rule let this repo's own tooling GENERATE a seed from a node
-    over JSON-RPC — that stays open, and the RAILGUN PoC's seed stays DEBUG /
-    DEMO (docs/guides/railgun-poc.md).
-- **Carve-out for fresh checkpoints at a stale anchor (owner's request,
-  2026-11-10; docs/how-it-works/stale-anchor.md).** The Rust engine reads one
-  HTTPS source beside its peers, through its one HTTP client
-  (`rust/myotis-net/src/https.rs`: pinned URLs, no redirects, Mozilla roots).
-  (Colibri's ZK proofs of the committee chain were in an earlier revision of
-  #761 and removed before merging, owner's decision 2026-11-13: they attest the
-  walk from Colibri's pinned anchor committee, older than the weak-subjectivity
-  bound, so they add no answer to a stale anchor — the doc's last section.)
-  - **Checkpointz finalized roots**, ONLY at a `STALE_ANCHOR` park and ONLY
-    on the user's request: the explicit "Fetch fresh checkpoint"
-    (`refreshAnchorFromCheckpointz`), or that choice remembered by the user and
-    then applied by the engine itself at each park, also headless, but never
-    unattended under Tor (owner's request, 2026-11-11). Never otherwise
-    automatic, and never applied to a store that is not parked. The root is accepted only when
-    the vote is UNANIMOUS: every server that answers names the same finalized
-    epoch and root, spanning at least 2 operators (registrable domains). One
-    differing answer (another root or epoch, an `execution_optimistic` or
-    malformed answer) is an alarm: the fetch is refused and the outlier named,
-    never outvoted (owner's ruling, #761, 2026-11-11). It is their word, as the
-    embedded anchor is the release's, and the host must say so.
 
-  It does not change the **transport** of the wallet's reads: account, storage
-  and call data still come only from devp2p peers. But every one of them is
-  verified against the store this source initializes, so for the root of
-  trust it does count.
-- **TrueBlocks Unchained Index mainnet publishing appears stalled.** The designated
-  publisher (`publisher.unchainedindex.eth`) last published a mainnet manifest indexed
-  to ~block 23.0M (mid-2025); as of mid-2026 that is ~a year behind the head, and the
-  only newer on-chain entry is from an undesignated wallet whose content is not
-  retrievable from IPFS. The `:tx-history` scan (debug-only) therefore misses all
-  recent history — both its surfaces warn loudly about the gap. PLAN: the user intends
-  to run their own index (TrueBlocks scraper) and add its IPFS peer address to Myotis;
-  if you find evidence upstream publishing has resumed (a fresh manifest under the
-  ENS-designated publisher), flag it to the user.
-- **Portal Network is effectively dead.** Its reference clients are abandoned:
-  the EF's own Trin client README states "THIS PROJECT IS NO LONGER ACTIVELY
-  MAINTAINED" (https://github.com/ethereum/trin), and no one is actively
-  continuing the network. (Note: ethereum.org docs may still list Trin/Fluffy as
-  active — that is stale and not reliable.) Do NOT treat Portal as available
-  infrastructure — anything Portal would have solved (deep historical
-  state/blocks, a distributed state network as a SNAP fallback, etc.) must be
-  solved another way. If you ever come across credible evidence that Portal has
-  been revived or that someone is actively continuing it, FLAG IT TO THE USER
-  IMMEDIATELY and prominently — the user wants to know right away because it would
-  cover a lot of wallet needs.
+Full text of the rule, both carve-outs and their boundaries: `.claude/agent/data-sources.md`.
+
+- the only sources for data are devp2p and libp2p calling a local client via http may only be used for debugging purposes it is not an option for production
+- Three bounded carve-outs exist, each an owner's decision: `roost` may relay
+  *self-verifying* consensus objects from a local beacon node, the log index
+  may serve a seeded history of a root-committing protocol, and at a
+  `STALE_ANCHOR` park the user may re-anchor on a fresh checkpoint that every
+  answering checkpoint-sync server names. None widens by analogy — anything
+  outside their stated boundaries needs its own decision.
+- **TrueBlocks Unchained Index mainnet publishing appears stalled**; the
+  `:tx-history` scan is debug-only and misses recent history. If you find
+  evidence publishing has resumed, flag it to the user.
+- **Portal Network is effectively dead.** Do NOT treat it as available
+  infrastructure. If you find credible evidence it has been revived, FLAG IT TO
+  THE USER IMMEDIATELY and prominently.
 
 ## Integration-Test
 - When './gradlew :app:run -Pargs=beacon-status' returns "state":"SYNCED" then './gradlew :app:run -Pargs="get-storage 0x1A5F9352Af8aF974bFC03399e3767DF6370d82e4 1 0x308686553a1EAC2fE721Ac8B814De638975a276e"'  and './gradlew  :app:run -Pargs="get-account 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"' should return "verifyMethod":"headerChain"

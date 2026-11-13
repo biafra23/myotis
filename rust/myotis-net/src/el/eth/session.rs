@@ -119,6 +119,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
             // The peer's first framed message must be Hello (or Disconnect).
             let first = conn.recv().await?;
             if first.message_code == P2P_DISCONNECT {
+                // `examples/eez_probe.rs` (`session_err`) matches this prefix.
                 return Err(format!(
                     "peer disconnected during handshake: {}",
                     describe_disconnect(&first.payload)
@@ -290,6 +291,12 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> EthSession<S> {
 
     /// Read frames until the expected response code arrives with the matching
     /// request id, answering Ping and ignoring gossip in between.
+    ///
+    /// The error prefixes `timed out awaiting` and `peer disconnected: `, here
+    /// and in [`Self::await_snap_response`], are also matched by
+    /// `examples/eez_probe.rs` (`session_err`) — as are the callers'
+    /// `BlockHeaders decode` and `AccountRange decode`. Nothing else pins that
+    /// wording: change both sides together.
     async fn await_response(&mut self, want_code: u64, want_id: u64) -> Result<Vec<u8>, String> {
         let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
         loop {

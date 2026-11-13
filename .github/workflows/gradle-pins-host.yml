@@ -1,0 +1,284 @@
+# One host of the `gradle pins` chain (gradle-pins.yml has the narrative).
+#
+# 1. CHECK: resolve every configuration with the COMMITTED pins in force.
+#    Fails on a hash this host needs that gradle/verification-metadata.xml does
+#    not carry (or carries wrong), on a graph that left its gradle.lockfile, and
+#    on a configuration that resolves with no lock state at all.
+# 2. CONTRIBUTE: whatever the check said, start from the previous host's
+#    metadata (or the committed file on the first host), add this host's
+#    entries with --write-verification-metadata, and upload the result for the
+#    next host. The last host's upload is the union every host needs, which
+#    `scripts/update_gradle_pins.sh --from-ci` downloads. If the previous
+#    host's upload is missing, nothing is uploaded here: a "merged" file built
+#    from the committed one would silently drop that host's entries.
+# 3. Fail the job if step 1 failed — after the upload, so the fix is attached.
+name: gradle pins (host)
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        required: true
+        type: string
+      host:
+        description: Short host name, used in messages
+        required: true
+        type: string
+      previous:
+        description: Artifact to start step 2 from ('' = the committed file)
+        required: false
+        type: string
+        default: ''
+      upload_as:
+        required: true
+        type: string
+      extra_tasks:
+        description: >-
+          Tasks run alongside the walk, for tools AGP resolves through detached
+          configurations only while a task runs (aapt2 has a jar per OS)
+        required: false
+        type: string
+        default: ''
+      canary:
+        description: Also prove that tampered pins fail the check
+        required: false
+        type: boolean
+        default: false
+      java_architecture:
+        description: >-
+          Architecture of the JDK Gradle runs on, when it is not the runner's:
+          'x64' on an Apple Silicon runner is the Intel-Mac host (the JDK runs
+          under Rosetta 2, as in desktop-dmg.yml's x64 leg). '' = the runner's.
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  pins:
+    name: ${{ inputs.host }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      EXTRA_TASKS: ${{ inputs.extra_tasks }}
+      # This job resolves dependencies and never runs cargo, but Gradle's
+      # configuration probes `cargo --version` in rust/, where the pinned
+      # toolchain would be auto-installed on an image whose stable differs.
+      # Off: the probe then reports "no cargo" and the Rust tasks skip (#746).
+      RUSTUP_AUTO_INSTALL: '0'
+    steps:
+      # Git for Windows checks text files out with CRLF by default, and the
+      # bash steps run ./gradlew, whose shebang would then end in \r (same
+      # step as desktop-windows-msi.yml). A no-op elsewhere.
+      - name: Check out with LF line endings
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # An x86_64 JDK on an Apple Silicon runner needs Rosetta 2. Same step as
+      # desktop-dmg.yml's x64 leg, and for its reason: fail HERE and loudly if
+      # Rosetta is unavailable, tolerating only the already-installed answer.
+      - name: Install Rosetta 2
+        if: ${{ inputs.java_architecture == 'x64' && runner.os == 'macOS' }}
+        run: |
+          set -o pipefail
+          if ! softwareupdate --install-rosetta --agree-to-license 2>&1 | tee /tmp/rosetta.log; then
+            grep -qiE "already installed|already been installed" /tmp/rosetta.log \
+              || { echo "::error::Rosetta 2 install failed"; exit 1; }
+            echo "Rosetta 2 already installed, continuing."
+          fi
+
+      # The host of a Gradle build is the JVM it runs on, not the machine:
+      # Compose's `currentOs` reads os.arch, so an x64 JDK here resolves the
+      # macos-x64 modules. An empty architecture is the runner's own.
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78  # v6.2.0
+        with:
+          java-version-file: .java-version  # exact Temurin release, one place (#734)
+          distribution: 'temurin'
+          architecture: ${{ inputs.java_architecture }}
+
+      # Say which host this is, from the JVM's side: a JDK of the wrong
+      # architecture would walk another host's graph and pin nothing new.
+      - name: Check the JVM is the host this job is for
+        id: jvm
+        if: ${{ inputs.java_architecture != '' }}
+        env:
+          WANT: ${{ inputs.java_architecture }}
+        run: |
+          arch=$(java -XshowSettings:properties -version 2>&1 | sed -n 's/^ *os\.arch = //p')
+          echo "os.arch of the JDK Gradle will run on: $arch"
+          case "$WANT:$arch" in
+            x64:x86_64|x64:amd64|aarch64:aarch64) ;;
+            *) echo "::error::the JDK is $arch, and this host is meant to be $WANT"; exit 1 ;;
+          esac
+
+      # COLD cache, deliberately. Gradle reads a parent POM or an imported BOM
+      # only while it first parses a module's POM, then caches the parsed
+      # result, so a warm cache never touches those files again: a check run
+      # there cannot notice that they are unpinned (13 such files when this was
+      # set up — every one failed the first fresh runner). Only a cold check
+      # proves a fresh checkout verifies; the write step after it re-parses
+      # with --refresh-dependencies for the same reason.
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c  # v6.4.1
+        with:
+          cache-disabled: true
+
+      # extra_tasks runs an Android resource task, which needs an SDK. Only
+      # ubuntu-26.04 is documented to ship one (android-apk.yml), so provision
+      # it explicitly instead of trusting each image: without it the check AND
+      # the contribute step fail here, and on the last host that means no
+      # merged file at all. AGP installs the missing platform/build-tools
+      # itself once the licenses are accepted, which this action does. Hosts
+      # without extra_tasks need none: the walk skips the Android
+      # configurations when no SDK is present.
+      - name: Set up the Android SDK
+        if: ${{ inputs.extra_tasks != '' }}
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd  # v4.0.4
+        with:
+          # The action's default also asks for `tools`, which current SDK
+          # repositories no longer carry (sdkmanager: "Failed to find package
+          # 'tools'"), failing the step.
+          packages: platform-tools
+
+      # -PskipRustEngine: no Android Rust toolchain needed to RESOLVE; it
+      # changes no dependency. Retried once for transient repository errors —
+      # a pin failure fails both attempts the same way.
+      - name: Check the committed pins on this host
+        id: check
+        continue-on-error: true
+        run: |
+          for attempt in 1 2; do
+            # shellcheck disable=SC2086 # EXTRA_TASKS is a task list
+            ./gradlew resolveAllDependencies $EXTRA_TASKS -PskipRustEngine --console=plain && exit 0
+            echo "::warning::attempt $attempt failed; retrying in 20s"
+            sleep 20
+          done
+          exit 1
+
+      # The check classifies Gradle's failures partly by message text (a lock
+      # that pins a version the graph rejects has no exception type of its
+      # own) and reaches some of them only through a multi-cause exception's
+      # later causes, so a Gradle bump that rewords or reorders them must fail
+      # HERE, not turn the check into a silent pass. One case per shape the
+      # classifier recognises: a wrong lock version, a module the lock lacks,
+      # a module it has extra, a wrong hash. Each must fail AS that pin
+      # failure: the pattern is looked for in the pin-failure list only, not
+      # in the skip warnings, which repeat a failure's causes too.
+      - name: Canary — tampered pins must fail the check
+        if: ${{ inputs.canary }}
+        run: |
+          set -u
+          # Restore on ANY exit: if the canary itself fails, the tampered files
+          # must not reach the contribute/upload steps that follow.
+          trap 'git checkout -- tx-history/gradle.lockfile gradle/verification-metadata.xml' EXIT
+          expect_failure() {
+            if out=$(./gradlew :tx-history:resolveAllDependencies -PskipRustEngine --console=plain 2>&1); then
+              echo "::error::$1 passed the check — the pin-failure classifier in build.gradle.kts no longer matches"
+              exit 1
+            fi
+            pins=$(sed -n '/Dependency pins do not match/,$p' <<<"$out")
+            grep -Eq -- "$2" <<<"$pins" || {
+              echo "$out" | tail -40
+              echo "::error::$1 failed, but not as the pin failure it should be (no match for: $2)"
+              exit 1
+            }
+            git checkout -- tx-history/gradle.lockfile gradle/verification-metadata.xml
+          }
+          lock=tx-history/gradle.lockfile
+          applied() { git diff --quiet "$lock" gradle/verification-metadata.xml && { echo "::error::canary edit did not apply: $1"; exit 1; }; true; }
+
+          sed -i 's/kethereum:model:0\.86\.0=/kethereum:model:0.85.0=/' "$lock"
+          applied "a lock pinning another version"
+          expect_failure "a lock pinning another version" \
+            '(enforced by Dependency Locking|locked to version)'
+
+          sed -i '/^com\.github\.komputing\.kethereum:model:0\.86\.0=/d' "$lock"
+          applied "a module the lock lacks"
+          expect_failure "a module the lock lacks" \
+            "kethereum:model:0\.86\.0' which is not part of the dependency lock state"
+
+          python3 - "$lock" <<'EOF'
+          import sys
+          p = sys.argv[1]
+          lines = open(p).read().splitlines()
+          extra = "org.example.canary:absent:1.0=compileClasspath"
+          at = next((i for i, l in enumerate(lines) if l.startswith("empty=")), len(lines))
+          lines.insert(at, extra)
+          open(p, "w").write("\n".join(lines) + "\n")
+          EOF
+          applied "a module the lock has extra"
+          expect_failure "a module the lock has extra" \
+            "org\.example\.canary:absent:1\.0' which is part of the dependency lock state"
+
+          python3 - <<'EOF'
+          p = "gradle/verification-metadata.xml"
+          s = open(p).read()
+          i = s.index('name="trueblocks-kotlin-')
+          j = s.index('value="', i) + len('value="')
+          s = s[:j] + ("1" if s[j] == "0" else "0") + s[j + 1:]
+          open(p, "w").write(s)
+          EOF
+          applied "a wrong trueblocks-kotlin hash"
+          expect_failure "a wrong trueblocks-kotlin hash" 'trueblocks-kotlin'
+
+      - name: Start from the previous host's metadata
+        id: previous
+        if: ${{ !cancelled() && inputs.previous != '' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: ${{ inputs.previous }}
+          path: gradle
+
+      # Not when this job could not establish the JVM it is for (the guard
+      # above failed, or was skipped because Rosetta or setup-java failed
+      # before it): the walk would then run on the runner's own JDK, add
+      # another host's entries, and hand the next host a file that looks like
+      # this host's contribution. Nothing is uploaded instead, and the chain
+      # stops here, as it does for a missing previous upload.
+      - name: Add this host's hashes
+        id: contribute
+        if: >-
+          ${{ !cancelled()
+              && (inputs.java_architecture == '' || steps.jvm.outcome == 'success')
+              && (inputs.previous == '' || steps.previous.outcome == 'success') }}
+        run: |
+          for attempt in 1 2; do
+            # shellcheck disable=SC2086
+            # --refresh-dependencies: the check above just warmed this job's
+            # cache, and a warm cache never re-reads the parent POMs / BOMs it
+            # parsed, so without it this write would miss them (see the
+            # cache note on setup-gradle).
+            ./gradlew resolveAllDependencies $EXTRA_TASKS --write-verification-metadata sha256 \
+              --refresh-dependencies -PskipRustEngine --console=plain && exit 0
+            sleep 20
+          done
+          exit 1
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        if: ${{ !cancelled() && steps.contribute.outcome == 'success' }}
+        with:
+          name: ${{ inputs.upload_as }}
+          path: gradle/verification-metadata.xml
+          if-no-files-found: error
+
+      - name: Fail if the committed pins are incomplete for this host
+        if: ${{ !cancelled() && (steps.check.outcome != 'success' || steps.contribute.outcome != 'success') }}
+        env:
+          CHECK: ${{ steps.check.outcome }}
+          CONTRIBUTE: ${{ steps.contribute.outcome }}
+        run: |
+          if [ "$CHECK" = skipped ]; then
+            echo "::error::the pin check never ran on ${{ inputs.host }}: a setup step before it failed."
+          elif [ "$CHECK" != success ]; then
+            echo "::error::the committed Gradle pins do not cover ${{ inputs.host }} (see the check step)." \
+                 "Once the whole chain has finished, run scripts/update_gradle_pins.sh --from-ci ${{ github.run_id }}, review the hash diff, and commit it."
+          fi
+          if [ "$CONTRIBUTE" != success ]; then
+            echo "::error::${{ inputs.host }} uploaded no metadata (previous host's upload missing, the JVM is not the one this host is for, or the write failed), so this run has no complete merged file."
+          fi
+          exit 1

@@ -310,7 +310,7 @@ A consumer that uses the module from a shared `iosMain`, as above, sets
 `kotlin.mpp.enableCInteropCommonization=true` in its `gradle.properties`, as this
 repository does, so the cinterop declarations behind the module's own `iosMain`
 resolve there. There is no x86_64 simulator. Building it yourself needs a Mac with Xcode and
-`rustup target add --toolchain stable aarch64-apple-ios aarch64-apple-ios-sim`:
+`(cd rust && rustup target add aarch64-apple-ios aarch64-apple-ios-sim)`:
 `./gradlew :myotis-engine-ios:publishToMavenLocal`. Anywhere else the module
 disables itself.
 

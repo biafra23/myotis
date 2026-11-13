@@ -45,6 +45,7 @@ on:
       - "rust/.cargo/**"
       - "rust/rust-toolchain.toml"
       - ".github/workflows/no-std-canary.yml"
+      - ".github/actions/rust-toolchain/**"
   pull_request:
     paths:
       - "rust/myotis-core/**"
@@ -56,6 +57,7 @@ on:
       - "rust/.cargo/**"
       - "rust/rust-toolchain.toml"
       - ".github/workflows/no-std-canary.yml"
+      - ".github/actions/rust-toolchain/**"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -64,39 +66,39 @@ concurrency:
 jobs:
   no-std:
     name: myotis-core, myotis-wire, myotis-consensus build without std
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: ./.github/actions/rust-toolchain
         with:
           targets: x86_64-unknown-none, x86_64-unknown-uefi
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: rust
       - name: x86_64-unknown-none — no std exists, so any std leak fails here
         working-directory: rust
-        run: cargo build -p myotis-core --no-default-features --target x86_64-unknown-none
+        run: cargo build --locked -p myotis-core --no-default-features --target x86_64-unknown-none
       - name: x86_64-unknown-uefi — the firmware embedding the feature is for
         working-directory: rust
-        run: cargo build -p myotis-core --no-default-features --target x86_64-unknown-uefi
+        run: cargo build --locked -p myotis-core --no-default-features --target x86_64-unknown-uefi
       - name: host, default features off — the crate's tests in the no_std configuration
         working-directory: rust
-        run: cargo test -p myotis-core --no-default-features
+        run: cargo test --locked -p myotis-core --no-default-features
       - name: myotis-wire (execution layer only) — x86_64-unknown-none and UEFI
         working-directory: rust
         run: |
-          cargo build -p myotis-wire --no-default-features --target x86_64-unknown-none
-          cargo build -p myotis-wire --no-default-features --target x86_64-unknown-uefi
+          cargo build --locked -p myotis-wire --no-default-features --target x86_64-unknown-none
+          cargo build --locked -p myotis-wire --no-default-features --target x86_64-unknown-uefi
       # x86_64-unknown-none cannot take these: myotis-bls's cdylib crate type needs
       # a panic handler there. UEFI drops the cdylib, and is the embedding anyway.
       - name: myotis-wire with eth2, myotis-consensus, myotis-bls — UEFI
         working-directory: rust
-        run: cargo build -p myotis-wire -p myotis-consensus -p myotis-bls --no-default-features --features myotis-wire/eth2 --target x86_64-unknown-uefi
+        run: cargo build --locked -p myotis-wire -p myotis-consensus -p myotis-bls --no-default-features --features myotis-wire/eth2 --target x86_64-unknown-uefi
       - name: host, myotis-wire's tests in its no_std configurations
         working-directory: rust
         run: |
-          cargo test -p myotis-wire --no-default-features
-          cargo test -p myotis-wire --no-default-features --features eth2
+          cargo test --locked -p myotis-wire --no-default-features
+          cargo test --locked -p myotis-wire --no-default-features --features eth2

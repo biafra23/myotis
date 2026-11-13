@@ -35,12 +35,12 @@ concurrency:
 jobs:
   fresh:
     name: PoC seeds refreshed for this release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Is this a release PR?
         id: release

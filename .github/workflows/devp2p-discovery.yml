@@ -10,7 +10,7 @@ on:
 jobs:
   discover:
     name: Peer Discovery (UDP allowed)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Cold-cache days (post-outage evictions) compile the whole Rust workspace
     # (~12 min) before Gradle even reaches the 5-min discovery run — 15 min
     # guaranteed a timeout there. Warm runs stay well under the old budget.
@@ -18,32 +18,32 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Java 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78  # v6.2.0
         with:
           distribution: temurin
-          java-version: "21"
-
+          java-version-file: .java-version  # exact Temurin release, one place (#734)
       - name: Set up Rust
-        # Pin to real stable like the sibling Rust workflows — the runner
-        # image's preinstalled rustc lags on its own schedule, keys the cache
-        # to a different compiler, and if it ever fell below the Gradle
-        # probe's floor, cargoBuildHost would silently self-skip and this
-        # workflow would quietly stop exercising the Rust build.
-        uses: dtolnay/rust-toolchain@stable
+        # The rustc rust/rust-toolchain.toml pins, like every Rust lane
+        # (#734) — not the runner image's preinstalled rustc, which lags on
+        # its own schedule, keys the cache to a different compiler, and if it
+        # ever fell below the Gradle probe's floor, cargoBuildHost would
+        # silently self-skip and this workflow would quietly stop exercising
+        # the Rust build.
+        uses: ./.github/actions/rust-toolchain
 
       - name: Cache Rust build
         # The :app build compiles the Rust workspace (cargoBuildHost auto-runs
         # before :app:run); without this cache a cold run eats the whole job
         # budget in cargo. Same action/config as the other Rust workflows.
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: rust
 
       - name: Cache Gradle
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: |
             ~/.gradle/caches
@@ -79,7 +79,7 @@ jobs:
 
       - name: Upload discovery log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: discovery-log
           path: discovery.log

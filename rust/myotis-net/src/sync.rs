@@ -249,6 +249,14 @@ pub struct ChainConfig {
     pub bootstrap_enrs: Vec<String>,
     /// discv5 UDP listen port (0 = OS-assigned; use when running next to a Java daemon).
     pub discv5_port: u16,
+    /// libp2p (light-client req/resp) TCP listen port on `0.0.0.0` (0 = OS-assigned,
+    /// the wallet's default). A host pins it to run beside another node or behind
+    /// a firewall that only opens named ports.
+    pub libp2p_tcp_port: u16,
+    /// libp2p QUIC listen port (UDP) on `0.0.0.0` (0 = OS-assigned). Dialing QUIC
+    /// never needs it (the transport opens a socket per dial); it only fixes the
+    /// port inbound QUIC and the shared dial socket use.
+    pub libp2p_quic_port: u16,
     /// Persisted verified-store snapshot path (`sync-state[-net].snapshot`) —
     /// the SAME file, SAME format ("LCSS" v1) as the Java engine, so state
     /// survives restarts and engine switches. None = no persistence.
@@ -391,15 +399,17 @@ impl ChainConfig {
             // `./gradlew refreshCheckpoint` rewrites both from one fetch, and
             // `java_and_rust_checkpoints_agree` fails if they ever diverge.
             // @checkpoint:mainnet:begin — managed by `./gradlew refreshCheckpoint`
-            // trusted checkpoint: recent finalized mainnet block root (slot 15599168, 2026-11-07, period 1904)
+            // trusted checkpoint: recent finalized mainnet block root (slot 15632128, 2026-11-11, period 1908)
             checkpoint_root: hex32(
-                "935911763d6fcca100fd42f951f1407a9967414bf38ee85992c00e5e003ca373",
+                "90270c791df9079fb67d02077398bf7937274a1b2bfd54abc778a55fbe719e78",
             ),
-            checkpoint_slot: 15_599_168,
+            checkpoint_slot: 15_632_128,
             // @checkpoint:mainnet:end
             static_peers: MAINNET_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: MAINNET_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
             discv5_port: 0,
+            libp2p_tcp_port: 0,
+            libp2p_quic_port: 0,
             snapshot_path: None,
             cl_peer_cache_path: None,
             ws_bound_periods: 13, // spec WS plateau 3532 epochs / 256 = 13.8 -> floor 13 (~14.7 days)
@@ -478,6 +488,8 @@ impl ChainConfig {
             static_peers: SEPOLIA_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: SEPOLIA_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
             discv5_port: 0,
+            libp2p_tcp_port: 0,
+            libp2p_quic_port: 0,
             snapshot_path: None,
             cl_peer_cache_path: None,
             ws_bound_periods: 13, // permissioned validator set; mainnet-preset bound kept as hygiene
@@ -555,6 +567,8 @@ impl ChainConfig {
             static_peers: GNOSIS_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: GNOSIS_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
             discv5_port: 0,
+            libp2p_tcp_port: 0,
+            libp2p_quic_port: 0,
             snapshot_path: None,
             cl_peer_cache_path: None,
             ws_bound_periods: 3, // short churn window (see NetworkConfig.wsBoundPeriods) — pragmatic floor
@@ -621,6 +635,8 @@ impl ChainConfig {
             static_peers: CHIADO_STATIC_PEERS.iter().map(|s| s.to_string()).collect(),
             bootstrap_enrs: CHIADO_BOOTSTRAP_ENRS.iter().map(|s| s.to_string()).collect(),
             discv5_port: 0,
+            libp2p_tcp_port: 0,
+            libp2p_quic_port: 0,
             snapshot_path: None,
             cl_peer_cache_path: None,
             // Gnosis's preset over ~2.6k validators: the spec window is 388-521
@@ -1476,7 +1492,7 @@ impl SyncHandle {
             reqresp::HostConfig {
                 cl_fork_watch: config.cl_fork_watch.clone(),
                 traffic: Some(Arc::clone(&config.traffic)),
-                ..reqresp::HostConfig::default()
+                ..reqresp::HostConfig::with_ports(config.libp2p_tcp_port, config.libp2p_quic_port)
             },
         )
         .map(|(client, _, _)| client)?;
@@ -2304,7 +2320,8 @@ async fn run_sync(
             true
         }
         Err(e) => {
-            tracing::warn!(error = %e, "discv5 unavailable — will retry (static peers meanwhile)");
+            tracing::warn!(port = discovery_cfg.listen_port, error = %e,
+                "discv5 unavailable — will retry (static peers meanwhile)");
             false
         }
     };
@@ -2488,7 +2505,7 @@ async fn run_sync(
     // Where in each slot the steady-state finality poll fires (drawn once per run).
     let poll_offset_ms = {
         let mut b = [0u8; 8];
-        let random = getrandom::getrandom(&mut b).map(|()| u64::from_le_bytes(b)).unwrap_or(0);
+        let random = getrandom::fill(&mut b).map(|()| u64::from_le_bytes(b)).unwrap_or(0);
         finality_poll_offset_ms(config.seconds_per_slot, random)
     };
 
@@ -4929,10 +4946,10 @@ mod tests {
         assert_eq!(c.fork_schedule.version_for_signature_slot(13_164_544), [5, 0, 0, 0]);
         assert_eq!(c.fork_schedule.version_for_signature_slot(13_164_545), [6, 0, 0, 0]);
         // @checkpoint:mainnet:test:begin — managed by `./gradlew refreshCheckpoint`
-        assert_eq!(c.checkpoint_slot, 15_599_168);
+        assert_eq!(c.checkpoint_slot, 15_632_128);
         assert_eq!(
             hex_str(&c.checkpoint_root),
-            "935911763d6fcca100fd42f951f1407a9967414bf38ee85992c00e5e003ca373"
+            "90270c791df9079fb67d02077398bf7937274a1b2bfd54abc778a55fbe719e78"
         );
         // @checkpoint:mainnet:test:end
         assert_eq!(

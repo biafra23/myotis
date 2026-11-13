@@ -17,14 +17,14 @@
 # and Test (ci.yml) and the other Linux checks stay ungated on purpose: they are
 # the test signal, and holding them for the review would only delay it.
 #
-# WHEN IT WAITS. For a same-repo, non-draft PR (the ones claude-review.yml's job
-# `if:` reviews), while a claude-review run of the PR's branch that started in
+# WHEN IT WAITS. For a same-repo, non-draft PR in a run a person started (the
+# ones claude-review.yml's job `if:` reviews: it skips Dependabot's), while a claude-review run of the PR's branch that started in
 # the hour before this event has not completed. `opened` and `reopened` start a
 # review (that file's `types:`; its third, `ready_for_review`, never reaches the
 # callers), so on those it first waits for that run to appear. The first builds
 # of a PR therefore wait for its review, and so does a push that lands while
 # the review is still running. A push after the review, a push to main, a tag,
-# a fork and a draft PR pass in seconds. A run's conclusion does not matter: a
+# a fork, a draft PR and a Dependabot run pass in seconds. A run's conclusion does not matter: a
 # failed review says nothing about the code, and its own check reports it.
 #
 # FAIL-OPEN. Once it runs, it may only delay the builds, never block them.
@@ -65,7 +65,7 @@ on:
 jobs:
   wait:
     name: Wait for claude-review
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # See FAIL-OPEN above: a failure here must not stop the jobs behind it.
     continue-on-error: true
     # A backstop above the script's own bound (MAX_WAIT_SECONDS plus a few slow
@@ -103,13 +103,17 @@ jobs:
               exit 0
               ;;
           esac
-          # The two skips in claude-review.yml's job `if:`.
+          # The three skips in claude-review.yml's job `if:`.
           if [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]; then
             echo "PR from a fork: claude-review skips those; nothing to wait for."
             exit 0
           fi
           if [ "$IS_DRAFT" = true ]; then
             echo "Draft PR: claude-review runs once it is marked ready; nothing to wait for."
+            exit 0
+          fi
+          if [ "$GITHUB_ACTOR" = "dependabot[bot]" ]; then
+            echo "Run started by Dependabot: claude-review skips those; nothing to wait for."
             exit 0
           fi
           [ -n "$PR_BRANCH" ] || proceed "The PR has no head branch name."

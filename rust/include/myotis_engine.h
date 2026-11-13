@@ -36,7 +36,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 58
+#define MYOTIS_ABI_VERSION 59
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -147,7 +147,7 @@ bool myotis_set_ws_bound_periods(int64_t handle, int64_t periods);
  * run; never persisted. False only for an unknown handle. */
 bool myotis_accept_stale_anchor(int64_t handle);
 
-/* (ABI >= 57) Recover a STALE_ANCHOR park from a fresh finalized checkpoint
+/* (ABI >= 58) Recover a STALE_ANCHOR park from a fresh finalized checkpoint
  * that every answering checkpoint-sync server names, two or more independent
  * operators among them; one differing answer refuses and names the outlier.
  * Blocking — one HTTPS round, up to ~15 s; never call from the UI thread.
@@ -157,7 +157,7 @@ bool myotis_accept_stale_anchor(int64_t handle);
  * those operators' word, not verified by the engine: say so to the user. */
 char *myotis_refresh_anchor_from_checkpointz(int64_t handle);
 
-/* (ABI >= 58) The user's remembered answer to a STALE_ANCHOR park, applied by
+/* (ABI >= 59) The user's remembered answer to a STALE_ANCHOR park, applied by
  * the sync loop itself at every park (no UI needed): 0 ask (default), 1 fresh
  * checkpoint, 2 continue anyway. A checkpoint fetch that fails leaves the park
  * for the user and is retried every 10 minutes. Live; settable before start.
@@ -518,6 +518,27 @@ char *myotis_export_log_index(int64_t handle, const char *path);
  * connection runs snap/2 (EIP-8189). Informational only — never gate on it;
  * reads are the same on snap/1 and snap/2. */
 bool myotis_set_boot_enodes(int64_t handle, const char *enodes_json);
+
+/* Pin the handle's P2P listen ports (ABI >= 57): discv4 (UDP), discv5 (UDP),
+ * and the libp2p light-client host's TCP port and QUIC (UDP) port. 0 =
+ * OS-assigned, which is what a handle uses when this is never called. Call
+ * between myotis_create* and myotis_start (or while paused: the resume binds
+ * them); a later call replaces an earlier one. Applied or refused: false for
+ * a running or unknown handle, or when two of discv4 / discv5 / QUIC name the
+ * same nonzero UDP port. A port another process holds fails like any bind at
+ * start: discv4, discv5 and QUIC fall back to their existing degraded modes
+ * (no EL reader / no discv5 / no inbound QUIC), a libp2p TCP bind error fails
+ * myotis_start. A pinned TCP port is held exclusively: libp2p listens with
+ * SO_REUSEPORT, so the engine first tries a plain bind and fails the start if
+ * any other socket (another Myotis included) has the port. Pinned UDP ports
+ * and pause: a pause does not wait for the libp2p and discv5 tasks to close
+ * their sockets, so a resume issued straight after a pause can find its own
+ * pinned QUIC or discv5 port still taken (QUIC then has no listener until the
+ * next resume; discv5 retries once a minute). Port 0 cannot hit this. The EL
+ * is dial-only (no RLPx listener), so these four are every P2P socket a handle
+ * opens. */
+bool myotis_set_listen_ports(int64_t handle, uint16_t discv4, uint16_t discv5,
+                             uint16_t libp2p_tcp, uint16_t libp2p_quic);
 
 #ifdef __cplusplus
 }

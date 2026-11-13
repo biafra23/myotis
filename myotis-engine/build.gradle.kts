@@ -103,6 +103,12 @@ kotlin {
 android {
     namespace = "io.myotis.engine"
     compileSdk = 35
+    // Pinned exactly (#734): AGP strips the packaged .so files with this NDK's
+    // llvm-strip (an unpinned NDK leaves them unstripped or strips them with
+    // whatever is installed), and build-tools is the same version
+    // scripts/sign_release_apk.sh signs with. Both from gradle/libs.versions.toml.
+    ndkVersion = libs.versions.android.ndk.get()
+    buildToolsVersion = libs.versions.android.build.tools.get()
     defaultConfig {
         minSdk = 29
     }

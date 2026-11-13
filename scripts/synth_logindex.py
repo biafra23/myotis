@@ -82,7 +82,6 @@ import hashlib
 import json
 import struct
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 MAGIC = b"MLIX"
@@ -518,7 +517,9 @@ def main() -> int:
             f"logs={stats['logs_kept']}",
             f"sha256={hashlib.sha256(data).hexdigest()}",
             f"source={Path(args.meta).name if args.meta else '-'}",
-            f"builtAtUtc={datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')}",
+            # No build timestamp (#734 D6): this runs inside the desktop build,
+            # and a wall-clock builtAtUtc made every PoC dmg differ. Nothing
+            # read it; the fields above say what the seed covers.
         ]
         Path(args.manifest).write_text("\n".join(lines) + "\n", encoding="utf-8")
         print(f"wrote {args.manifest}", file=sys.stderr)

@@ -14,7 +14,10 @@ on:
   # this workflow existed, without moving the tag). Note the assets then come
   # from the dispatched branch tip, not the tag commit — which is why such a
   # backfill names them after the version they were built as, not after the
-  # tag (see the publish job).
+  # tag (see the publish job). Since #734 the release's evidence shows it too:
+  # the debs' attestation names the dispatched ref, and `verify release`, which
+  # accepts only assets built from the tag's own ref, fails for that release
+  # afterwards. The publish step warns.
   workflow_dispatch:
     inputs:
       release-tag:
@@ -37,7 +40,7 @@ jobs:
     name: Build Linux .deb (${{ matrix.arch }})
     # jpackage is host-OS-bound (a .deb can only be produced on Linux) and bundles a
     # single-architecture jlink runtime, so one job per arch on a matching-arch runner:
-    #   x64   → ubuntu-latest (x86_64)
+    #   x64   → ubuntu-26.04 (x86_64)
     #   arm64 → ubuntu-24.04-arm (GitHub's arm64 runner, free for public repos)
     # No cross-build gymnastics needed here (unlike the macOS x64-under-Rosetta job):
     # each runner's native JDK matches the target arch.
@@ -46,7 +49,7 @@ jobs:
       matrix:
         include:
           - arch: x64
-            runner: ubuntu-latest
+            runner: ubuntu-26.04
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
@@ -55,7 +58,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           submodules: recursive
           # Full history: :ui stamps the app's on-screen version from the nearest
@@ -67,27 +70,34 @@ jobs:
           fetch-depth: 0
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78  # v6.2.0
         with:
-          java-version: '21'
+          java-version-file: .java-version  # exact Temurin release, one place (#734)
           distribution: 'temurin'
 
       # The packaged app bundles the Rust engine (appResources): build it from
       # source here. prepareRustAppResources fails the build if the lib is
       # missing, so this step is REQUIRED, not optional.
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/rust-toolchain
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: rust
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c  # v6.4.1
 
       - name: Make gradlew executable
         run: chmod +x gradlew
+
+      # The commit time: dpkg-deb (which jpackage drives) clamps every member's
+      # mtime in the .deb to it, instead of stamping the build's wall clock, so
+      # a rebuild of the tag produces the same package metadata (#734, Part 5a;
+      # reproducible-builds.yml sets the same value).
+      - name: Pin SOURCE_DATE_EPOCH to the commit time
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
 
       # Compose Desktop's packageDeb wraps jpackage (jlink'd JRE + app → .deb).
       # NON-minified (main, not main-release): the Java backend (Netty / Besu /
@@ -164,10 +174,23 @@ jobs:
           echo "bundled rust engine: $rustinfo"
           echo "$rustinfo" | grep -q "$want_elf" \
             || { echo "::error::rust engine ELF arch mismatch: expected $want_elf in: $rustinfo"; exit 1; }
+          # The menu entry (#734, Part 5d). jpackage writes it only for a
+          # launcher with an icon of its own, and the deb is built from the app
+          # image, where the Compose plugin no longer passes --icon by itself
+          # (app-desktop/build.gradle.kts passes it): without it the package
+          # still builds, installs and starts, and no application menu lists it.
+          desktop=$(find "$ex" -type f -name '*.desktop' | head -n1 || true)
+          [ -n "$desktop" ] || { echo "::error::no .desktop file in the deb: the app would have no menu entry"; exit 1; }
+          icon=$(sed -n 's/^Icon=//p' "$desktop")
+          [ -n "$icon" ] && [ -f "$ex$icon" ] \
+            || { echo "::error::$(basename "$desktop") names the icon '$icon', which the deb does not carry"; exit 1; }
+          dpkg-deb --field "$deb" Depends | tr ',' '\n' | grep -qx ' *xdg-utils' \
+            || { echo "::error::the deb registers a menu entry but does not depend on xdg-utils"; exit 1; }
+          echo "menu entry: $(basename "$desktop"), icon $icon"
           echo "OK: ${{ matrix.arch }} deb is $want_deb/$want_elf (rust engine bundled)"
 
       - name: Upload DEB
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: myotis-desktop-deb-${{ matrix.arch }}-${{ github.sha }}
           path: app-desktop/build/compose/binaries/main/deb/*.deb
@@ -235,26 +258,32 @@ jobs:
       && (needs.version-guard.result == 'success'
           || (needs.version-guard.result == 'skipped' && github.event_name == 'workflow_dispatch'))
       && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       # gh release create/upload needs write access to Releases (repo contents).
       contents: write
+      # The build-provenance attestation of the uploaded assets (#734): an OIDC
+      # token for the Sigstore certificate, and the attestation's storage.
+      id-token: write
+      attestations: write
     steps:
-      # Only the shared release notes and the script that writes them
-      # (.github/release-notes.*), from the commit being released. First, so
+      # Only the shared release notes, the script that writes them
+      # (.github/release-notes.*) and the one that uploads
+      # (.github/release-assets.sh), from the commit being released. First, so
       # the artifacts below land in the checked-out workspace, not under it.
       - name: Check out the release notes
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           sparse-checkout: |
             .github/release-notes.md
             .github/release-notes.sh
+            .github/release-assets.sh
           sparse-checkout-cone-mode: false
           # gh takes the token from the publish step's env; keep the job's
           # write token out of .git/config.
           persist-credentials: false
       - name: Download deb artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           pattern: myotis-desktop-deb-*-${{ github.sha }}
           path: deb
@@ -285,6 +314,12 @@ jobs:
           # to gh, so a stray value (e.g. leading '-') can't be parsed as a flag.
           printf '%s' "$tag" | grep -Eq '^v[A-Za-z0-9._-]+$' \
             || { echo "::error::'$tag' is not a valid release tag (expected v<version>)"; exit 1; }
+          # A backfill from another ref is not the tag's build, and the release's
+          # evidence says so (#734): these debs are attested for THIS ref, and
+          # `verify release` accepts only assets built from the tag's own ref.
+          if [ "${GITHUB_REF}" != "refs/tags/$tag" ]; then
+            echo "::warning title=Backfill from another ref::these debs are built from ${GITHUB_REF}, not refs/tags/$tag. Their attestation names that ref, so \`verify release\` fails for $tag from now on (on a release older than SHA256SUMS it fails anyway). Dispatch on the tag itself to republish the tag's own build."
+          fi
           # When the version guard RAN, it validated GITHUB_REF_NAME — so its
           # green verdict only covers an upload to that same tag. Assert that
           # identity here, in shell, where the comparison is case-SENSITIVE like
@@ -335,4 +370,27 @@ jobs:
           # (On workflow_dispatch the release for the given tag normally already
           # exists, so this is view-then-upload.)
           bash .github/release-notes.sh create "$tag"
-          gh release upload "$tag" "${debs[@]}" --clobber
+          # Upload, and check that the release serves these bytes.
+          bash .github/release-assets.sh "$tag" "${debs[@]}"
+
+      - name: Attest the debs' build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/release-assets.SHA256SUMS
+
+      # Last, and also when the attestation failed: SHA256SUMS is the one file
+      # all publishers share, kept apart from this job's own upload and
+      # attestation (.github/release-assets.sh).
+      - name: List the release's assets in SHA256SUMS
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG_INPUT: ${{ inputs.release-tag }}
+        run: |
+          set -eu
+          # The same tag as the publish step, checked the same way.
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then tag="${RELEASE_TAG_INPUT}"; else tag="${GITHUB_REF_NAME}"; fi
+          printf '%s' "$tag" | grep -Eq '^v[A-Za-z0-9._-]+$' \
+            || { echo "::error::'$tag' is not a valid release tag (expected v<version>)"; exit 1; }
+          bash .github/release-assets.sh --checksums "$tag"

@@ -1447,7 +1447,7 @@ where
     Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
 {
     if targets.is_empty() {
-        return Err(NO_TOR_PEER.into());
+        return Err(no_tor_route().into());
     }
     let tried = targets.len();
     let written = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1794,6 +1794,18 @@ const TOR_MAX_CANDIDATES: usize = 5;
 const NO_TOR_PEER: &str = "tor: no peer of the Tor reserve is ready to reach over Tor \
     (fail-closed; the reserve fills from verified peers while Tor mode is on, and a node \
     is ready ten minutes after its last direct connection)";
+/// The same empty list while this host has no OS entropy: the Tor reserve's
+/// secrets have no fallback value (#823), so the cause and the remedy differ.
+#[cfg(any(test, feature = "tor"))]
+const NO_TOR_ENTROPY: &str = "tor: no OS entropy, so the Tor reserve's order cannot be drawn \
+    (fail-closed; Tor reads and sends resume once the OS supplies randomness again)";
+
+/// Why a Tor read or send found no peer: [`NO_TOR_ENTROPY`] during an entropy
+/// outage, [`NO_TOR_PEER`] otherwise.
+#[cfg(any(test, feature = "tor"))]
+fn no_tor_route() -> &'static str {
+    if crate::el::pool::tor_entropy_missing() { NO_TOR_ENTROPY } else { NO_TOR_PEER }
+}
 #[cfg(feature = "tor")]
 const TOR_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
 
@@ -6700,8 +6712,8 @@ impl ElReader {
         // (a bad-exit walk); fail-closed on the deadline.
         let candidates = tor_candidates(&self.pool.tor_candidates(true).await, 0);
         if candidates.is_empty() {
-            tracing::info!("tor: account read failed — no peer of the Tor reserve is ready");
-            return Err(NO_TOR_PEER.into());
+            tracing::info!("tor: account read failed — {}", no_tor_route());
+            return Err(no_tor_route().into());
         }
         // One log line per Tor read, served or failed — never naming the
         // address read (the log is exportable).
@@ -6782,8 +6794,8 @@ impl ElReader {
         }
         if !claimed_any {
             // Every candidate was dialed directly while the list was walked.
-            tracing::info!("tor: account read failed — no peer of the Tor reserve is ready");
-            return Err(NO_TOR_PEER.into());
+            tracing::info!("tor: account read failed — {}", no_tor_route());
+            return Err(no_tor_route().into());
         }
         let ms = read_started.elapsed().as_millis() as u64;
         match fallback {
@@ -11788,7 +11800,7 @@ impl ElCarry {
 pub fn generate_node_key() -> Result<Arc<NodeKey>, String> {
     for _ in 0..8 {
         let mut secret = [0u8; 32];
-        getrandom::getrandom(&mut secret).map_err(|e| format!("OS entropy: {e}"))?;
+        getrandom::fill(&mut secret).map_err(|e| format!("OS entropy: {e}"))?;
         if let Ok(key) = NodeKey::from_secret_bytes(&secret) {
             return Ok(Arc::new(key));
         }

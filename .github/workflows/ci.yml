@@ -10,24 +10,27 @@ on:
   # Build and Test on PRs that don't target main — e.g. the rust-engine
   # integration branch, whose checkpoint PRs previously skipped this job.
   pull_request:
+  # Dispatched by gradle-pins-dependabot.yml on the commit it pushes (a
+  # GITHUB_TOKEN push starts no pull_request run), and by hand.
+  workflow_dispatch:
 
 jobs:
   build:
     name: Build and Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           submodules: recursive
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78  # v6.2.0
         with:
-          java-version: '21'
+          java-version-file: .java-version  # exact Temurin release, one place (#734)
           distribution: 'temurin'
 
       # Robust Gradle dependency + plugin caching. Restores the base-branch cache
@@ -35,18 +38,33 @@ jobs:
       # the JitPack Besu fork — come from cache instead of being re-fetched
       # from flaky external repos on every run.
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c  # v6.4.1
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      # Current stable, like every other Rust lane. The Gradle gate skips any
-      # toolchain below the workspace rust-version (rust/Cargo.toml), and that
-      # floor moves with the dependency graph. Leaning on the image's preinstalled
-      # Rust would let a floor bump that outpaces the image turn cargoTest and
-      # verifyRustVersionFloor into a quiet skip here, with `build` still green.
+      # The two scripts every release publisher goes through (.github/
+      # release-notes.sh, .github/release-assets.sh) and the release verifier,
+      # against a stubbed `gh`, and the signed-against-unsigned APK check on
+      # synthetic APKs. Their failure modes otherwise surface only on a real
+      # tag. Seconds.
+      - name: Test the release scripts
+        run: |
+          scripts/test_release_notes.sh
+          scripts/test_release_assets.sh
+          python3 scripts/repro/test_compare_signed_apk.py
+          python3 scripts/repro/test_compare.py
+          python3 scripts/test_normalize_xcframework.py
+          python3 scripts/test_check_pins_additive.py
+          python3 scripts/test_sbom.py
+
+      # The rustc rust/rust-toolchain.toml pins, like every Rust lane (#734).
+      # Not the image's preinstalled Rust: the Gradle gate skips any toolchain
+      # below the workspace rust-version (rust/Cargo.toml), so a floor bump that
+      # outpaced the image would turn cargoTest and verifyRustVersionFloor into
+      # a quiet skip here, with `build` still green.
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/rust-toolchain
 
       # The Android launcher / status-bar icons are GENERATED from assets/myotis_logo.svg
       # and committed (android-app/src/main/res: ic_launcher_foreground, ic_stat_myotis,
@@ -98,30 +116,35 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     uses: ./.github/workflows/release-version-guard.yml
 
-  release:
-    name: Release
-    runs-on: ubuntu-latest
+  # The tag's jars, built with a read-only token. Publishing them is the
+  # `release` job's, which runs no build: the job that may write to the release
+  # and attest provenance only downloads what this one built (#734; the split
+  # sign-release and the APK's release job have, for the same reason).
+  release-build:
+    name: Build the release jars
+    runs-on: ubuntu-26.04
     # version-guard carries the same `if` as this job, so it is never merely
     # skipped underneath it — on a tag push both run, otherwise both are skipped.
     needs: [build, version-guard]
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
-      contents: write
+      contents: read
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78  # v6.2.0
         with:
-          java-version: '21'
+          java-version-file: .java-version  # exact Temurin release, one place (#734)
           distribution: 'temurin'
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c  # v6.4.1
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
@@ -136,14 +159,81 @@ jobs:
           echo "::error::Gradle build failed after 3 attempts"
           exit 1
 
-      - name: Release
-        uses: softprops/action-gh-release@v2
+      # The paths keep their directories below the workspace: the release job
+      # finds them as jars/<module>/build/libs/*.jar.
+      - name: Upload the jars for the release job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          generate_release_notes: true
-          files: |
+          name: release-jars-${{ github.sha }}
+          path: |
             app/build/libs/*.jar
             core/build/libs/*.jar
             networking/build/libs/*.jar
             consensus/build/libs/*.jar
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true  # a re-run of this job uploads again under the same run
+
+  release:
+    name: Release
+    runs-on: ubuntu-26.04
+    needs: [release-build, version-guard]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+      # The build-provenance attestation of the uploaded assets (#734): an OIDC
+      # token for the Sigstore certificate, and the attestation's storage.
+      id-token: write
+      attestations: write
+
+    steps:
+      # Only the upload script, from the commit being released.
+      - name: Check out the release script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          sparse-checkout: .github/release-assets.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Download the jars
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: release-jars-${{ github.sha }}
+          path: jars
+
+      # Creates the release (or adds its generated notes to the one another
+      # publisher created). The jars go up in the next step, through the script
+      # every publisher uploads with (#734).
+      - name: Release
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3  # v3.0.4
+        with:
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload the jars
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          jars=(jars/*/build/libs/*.jar)
+          [ "${#jars[@]}" -gt 0 ] || { echo "::error::no jars to publish"; exit 1; }
+          # Upload, and check that the release serves these bytes.
+          bash .github/release-assets.sh "${GITHUB_REF_NAME}" "${jars[@]}"
+
+      - name: Attest the jars' build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/release-assets.SHA256SUMS
+
+      # Last, and also when the attestation failed: SHA256SUMS is the one file
+      # all publishers share, kept apart from this job's own upload and
+      # attestation (.github/release-assets.sh).
+      - name: List the release's assets in SHA256SUMS
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: bash .github/release-assets.sh --checksums "${GITHUB_REF_NAME}"
