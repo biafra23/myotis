@@ -871,10 +871,7 @@ impl PoolInner {
             // nodes already in the reserve stay usable, and the next fill
             // draws again.
             match tor_reserve_salt() {
-                Some(salt) => {
-                    tor_entropy_recovered();
-                    picks.sort_by_key(|c| tor_reserve_draw_with(&salt, &c.pubkey));
-                }
+                Some(salt) => picks.sort_by_key(|c| tor_reserve_draw_with(&salt, &c.pubkey)),
                 None => picks.clear(),
             }
             let need = target.saturating_sub(reserve.len());
@@ -1745,7 +1742,6 @@ impl PeerPool {
         let Some(seed) = draw_secret::<8>(getrandom::fill) else {
             return Vec::new();
         };
-        tor_entropy_recovered();
         let cached = self
             .inner
             .tor_reserve
@@ -2174,7 +2170,10 @@ fn draw_secret<const N: usize>(
 ) -> Option<[u8; N]> {
     let mut b = [0u8; N];
     match fill(&mut b) {
-        Ok(()) => Some(b),
+        Ok(()) => {
+            tor_entropy_recovered();
+            Some(b)
+        }
         Err(e) => {
             warn_no_tor_entropy(&e);
             None
@@ -2182,15 +2181,15 @@ fn draw_secret<const N: usize>(
     }
 }
 
-/// One WARN per outage, not one per call: set on a failed draw, cleared by the
-/// next successful one ([`tor_entropy_recovered`]).
+/// One WARN per outage, not one per call: set on a failed draw, cleared only by
+/// the next successful DRAW ([`tor_entropy_recovered`]), never by a cached salt.
 static TOR_ENTROPY_MISSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn warn_no_tor_entropy(e: &getrandom::Error) {
     if !TOR_ENTROPY_MISSING.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::warn!(
             error = %e,
-            "tor: no OS entropy; the Tor reserve takes in no node and Tor reads fail closed until it returns"
+            "tor: no OS entropy; the Tor reserve takes in no node and Tor reads and sends fail closed until it returns"
         );
     }
 }
