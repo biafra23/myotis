@@ -25,8 +25,9 @@ rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
 # Cargo feature to turn that off -- only a cfg, which 0.9 renamed:
 # `aes_backend = "soft"` for aes 0.9 (myotis-wire), `aes_force_soft` for the
 # aes 0.8 still in the tree through aes-gcm (discv5) and snow (libp2p-noise),
-# which an embedder building those crates for these targets needs. With only
-# the old cfg, aes 0.9 builds its AES-NI backend and the canary crashes LLVM. Per-target here rather than
+# which an embedder building those crates for these targets needs (nothing in
+# this tree builds them there). With only the old cfg, aes 0.9 builds its
+# AES-NI backend and the canary crashes LLVM. Per-target here rather than
 # RUSTFLAGS in CI, so every cargo invocation on these targets gets it (the
 # no_std canary, `./gradlew cargoBuildNoStd`, an embedder building in-tree)
 # and the env never changes the rustc fingerprint for other builds.
