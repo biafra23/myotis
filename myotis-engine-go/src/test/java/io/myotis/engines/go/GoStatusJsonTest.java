@@ -330,6 +330,44 @@ class GoStatusJsonTest {
         assertEquals("0xd8dA6BF2", held.holderHex());
     }
 
+    // ---- a non-null holder is VALIDATED before the FFI (PR #832 round-4
+    // review): the Go fold skips a blank holder silently (TrimSpace != "") and
+    // gostrC maps NULL and "" alike, so ""/whitespace/an nz()-blanked
+    // surrogate would read the plain slot and have it labelled with the holder
+    // sent. The Rust twin refuses the same three (host.rs "invalid holder"). ----
+
+    @Test
+    void holderShapeIsWhatTheGoFoldFolds() {
+        assertTrue(GoChainHandle.isHolderShape("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"));
+        assertTrue(GoChainHandle.isHolderShape(
+                "d8dA6BF26964aF9D7eEd9e03E53415D37aA96045"), "bare hex, Go TrimPrefixes 0x");
+        assertTrue(GoChainHandle.isHolderShape(
+                "0x" + "ab".repeat(32)), "a 32-byte word holder folds too");
+        assertFalse(GoChainHandle.isHolderShape(""), "blank means no-holder Go-side — refuse");
+        assertFalse(GoChainHandle.isHolderShape("   "), "TrimSpace blanks this too");
+        assertFalse(GoChainHandle.isHolderShape("0x"), "0x alone is zero bytes");
+        assertFalse(GoChainHandle.isHolderShape("0Xd8dA6BF2"), "Go trims 0x only, 0X must fail");
+        assertFalse(GoChainHandle.isHolderShape(
+                "d8dA6BF26964aF9D7eEd9e03E53415D37aA9604"), "odd length never decodes");
+        assertFalse(GoChainHandle.isHolderShape("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA9604" + "g"),
+                "non-hex must fail like Go's decoder does");
+        assertFalse(GoChainHandle.isHolderShape("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045\uD800"),
+                "the surrogate nz() blanks to \"\" must be refused, not blanked");
+    }
+
+    @Test
+    void blankHolderIsRefusedByNameBeforeTheFfi() {
+        // handle 0 + blank holder: the refusal must arrive as the named
+        // EngineException, not reach the native call (so this holds with or
+        // without the library built, like the other no-native tests).
+        GoChainHandle h = new GoChainHandle(0L, "mainnet", 1L, 0, null);
+        for (String bad : new String[]{"", "   ", "0xD800\uD800"}) {
+            io.myotis.api.EngineException e = assertThrows(io.myotis.api.EngineException.class,
+                    () -> h.getStorageProof("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", 1L, bad));
+            assertTrue(e.getMessage().contains("holder_hex"), "named refusal: " + e.getMessage());
+        }
+    }
+
     // ---- the JSON-string reads carry the router-visible PERMANENT refusal
     // (`{"error":…,"code":-32602}` — RpcRouter.orEngineThrow/permanentCode),
     // where a bare null would be the retryable -32000 forever ----

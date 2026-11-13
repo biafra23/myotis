@@ -1026,8 +1026,35 @@ tasks.register<Exec>("cargoBuildHost") {
 // skips with one note when it is older than go/go.mod's `go` line — never
 // fetches silently. CI's Build and Test installs the pinned toolchain
 // (setup-go, go-version-file: go/go.mod), like go-engine.yml already does.
+// goToolBinDir / goToolPath — the Go twin of rustToolBinDir above, same story
+// (PR #832 round-4 review): a GUI-launched IDE daemon can lack the shell's go
+// on its PATH, and the bare `go` here would then probe as missing on a machine
+// where a terminal build finds it fine — silently skipping the build while the
+// stale library stays in force (see the onlyIf note below). Candidates after
+// the daemon's PATH: the official tarball's standard /usr/local/go/bin,
+// $GOROOT/bin, and the ~/go/bin where go-install'd toolchain shims land.
+val goToolBinDir: File? = run {
+    val exe = if (isWindowsHost) "go.exe" else "go"
+    fun executableIn(dir: File) = dir.resolve(exe).let { it.isFile && it.canExecute() }
+    (System.getenv("PATH") ?: "").split(File.pathSeparator)
+        .firstOrNull { it.isNotEmpty() && executableIn(File(it)) }
+        ?.let { return@run File(it) }
+    listOfNotNull(
+        // Set-but-empty means unset, same rule as CARGO_HOME above.
+        System.getenv("GOROOT")?.takeIf { it.isNotBlank() }?.let { File(it) },
+        File("/usr/local/go"),
+        File(System.getProperty("user.home"), "go"),
+    )
+        .map { it.resolve("bin") }
+        .firstOrNull { executableIn(it) }
+        ?.also { logger.info("[go] go is not on the daemon's PATH; using $it") }
+}
+val goToolPath: String = goToolBinDir
+    ?.resolve(if (isWindowsHost) "go.exe" else "go")
+    ?.takeIf { it.isFile }?.absolutePath ?: "go"
+
 val goVersion = providers.of(ToolProbe::class) {
-    parameters.command.set(listOf("go", "version"))
+    parameters.command.set(listOf(goToolPath, "version"))
     parameters.workingDir.set(file("go"))
     parameters.environment.put("GOTOOLCHAIN", "local")
 }.get()
@@ -1063,23 +1090,46 @@ val goEngineLibName = when {
 tasks.register<Exec>("goBuildCShared") {
     group = "go"
     description = "go build -buildmode=c-shared for the Go engine (self-skips when go is" +
-        " missing or older than go/go.mod's line; a FAILED cgo build degrades to a warning," +
+        " missing or older than go/go.mod's line, deleting any previously built library" +
+        " it can no longer keep current; a FAILED cgo build degrades to a warning," +
         " keeping the JVM build untouched; builds the portable blst, never a newer toolchain)"
     onlyIf {
-        if (goAvailable && !goVersionUsable) {
-            // One note, at the moment the task would have run — the skip stays
-            // visible without spamming every configuration phase (PR #832 review:
-            // "skipping with one note when the local Go is older than go.mod's,
-            // as the Rust block does for an old rustc").
-            logger.lifecycle("[go] goBuildCShared skipped: local ${goLocalVersion} is older than"
-                    + " go/go.mod's `go ${goModVersion}` and the task builds with GOTOOLCHAIN=local"
-                    + " (it never downloads a toolchain); install ${goModVersion} — CI gets it from"
-                    + " setup-go — to build the Go engine on this host.")
+        // A SKIP is a stale-library risk, so it gets the same treatment as a
+        // failed build below (PR #832 round-4 review): every consumer gates on
+        // the library's EXISTENCE alone (app-desktop's run task, the
+        // `go/build` entry in :app:run's java.library.path, this module's test
+        // doFirst), so once a library exists and this gate later turns false,
+        // -Pengine=go and the native-backed tests run the OLD bytes against
+        // NEW sources — and the ABI handshake cannot tell (it is 57 across a
+        // go-ethereum bump like #838, which changes only go.mod/go.sum). So:
+        // delete what this run cannot rebuild, and say so in the note. Both
+        // notes print at the moment the task would have run, never per
+        // configuration phase; the missing-`go` case used to print nothing.
+        val willRun = goAvailable && goVersionUsable
+        if (!willRun) {
+            val why = if (!goAvailable) {
+                "[go] goBuildCShared skipped: no go toolchain found (PATH, /usr/local/go/bin," +
+                    " \$GOROOT/bin or ~/go/bin)."
+            } else {
+                "[go] goBuildCShared skipped: local $goLocalVersion is older than" +
+                    " go/go.mod's `go $goModVersion` and the task builds with GOTOOLCHAIN=local" +
+                    " (it never downloads a toolchain); install $goModVersion — CI gets it from" +
+                    " setup-go — to build the Go engine on this host."
+            }
+            val lib = file("go/build/$goEngineLibName")
+            val removed = if (lib.exists()) {
+                lib.delete()
+                " Deleted the previously built $lib so it cannot serve sources it was not" +
+                    " built for (the next run with a usable toolchain rebuilds it)."
+            } else {
+                ""
+            }
+            logger.lifecycle(why + removed)
         }
-        goAvailable && goVersionUsable
+        willRun
     }
     workingDir = file("go")
-    commandLine("go", "build", "-buildmode=c-shared", "-o", "build/$goEngineLibName", "./cmd/myotis-capi")
+    commandLine(goToolPath, "build", "-buildmode=c-shared", "-o", "build/$goEngineLibName", "./cmd/myotis-capi")
     // Portable blst, like the Rust workspace builds it (#734 D3); go-engine.yml
     // switched to it in the same PR that added it here (PR #832 review — it
     // built bare before). The blst Go binding compiles ADX paths on amd64 and

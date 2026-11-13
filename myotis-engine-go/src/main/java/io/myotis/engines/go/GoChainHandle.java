@@ -645,11 +645,54 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
         // reader's storage_key (pinned there by reader.rs, here by
         // TestStorageRequestShapes) — and a malformed holder is refused by name,
         // never folded from wrong bytes.
+        //
+        // The by-name refusal must happen HERE, before the FFI (PR #832
+        // round-4 review): the Go fold SKIPS a blank holder silently
+        // (`if h := strings.TrimSpace(holder); h != ""`, capi.go) and gostrC
+        // maps NULL and "" alike, so a non-null-but-blank holder — "" straight
+        // from the daemon's CommandHandler on `"holder":""`, whitespace-only,
+        // or an unpaired surrogate that nz() rewrites to "" — read the PLAIN
+        // slot and got it back labelled with the holder that was sent (since
+        // the round-2 move of the labels to the request, silently plausible).
+        // The Rust twin refuses all three (`invalid holder (expected 20-byte
+        // hex)`, host.rs); accepting-and-ignoring is the #314 case, so the
+        // shape the Go storageKey would fold is validated up front and
+        // anything else is refused, never skipped.
+        if (holderHexOrNull != null && !isHolderShape(holderHexOrNull)) {
+            throw new EngineException("go engine: holder_hex must be a 20-byte address "
+                    + "or 32-byte word in hex, or null (got " + describeHolder(holderHexOrNull) + ")");
+        }
         JsonObject o = parseResultOrThrow(
                 gated(() -> GoEngineNative.nativeGetStorageProofJson(
                         handle, hexAddress, slot, holderHexOrNull)),
                 "storage");
         return storageFromJson(hexAddress, slot, holderHexOrNull, o);
+    }
+
+    /** The holder shape the Go {@code storageKey} folds: an optional {@code 0x}
+     *  prefix (exactly that one — its TrimPrefix does not cut {@code 0X}, and
+     *  the hex decoder rejects everything but even-length hex), then 20 or 32
+     *  bytes. Blank and whitespace-only fail on length, so neither can ride
+     *  through as "no holder". */
+    static boolean isHolderShape(String holder) {
+        String hex = holder.startsWith("0x") ? holder.substring(2) : holder;
+        if (hex.length() != 40 && hex.length() != 64) {
+            return false;
+        }
+        for (int i = 0; i < hex.length(); i++) {
+            char c = hex.charAt(i);
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Quotable form of a refused holder — blank and control characters stay
+     *  legible in the message instead of rendering as nothing. */
+    private static String describeHolder(String holder) {
+        return "\"" + (holder.length() <= 12 ? holder : holder.substring(0, 12) + "…")
+                + "\" (" + holder.length() + " chars)";
     }
 
     // ---- operator queries the Go engine does not serve yet ----

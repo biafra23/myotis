@@ -53,8 +53,12 @@ final class GoEngineNative {
     private static final Logger log = LoggerFactory.getLogger(GoEngineNative.class);
 
     /** Must match {@code MYOTIS_ABI_VERSION} in rust/include/myotis_engine.h (the
-     *  contract BOTH engine libraries implement; the Go side pins it too via
-     *  TestABIVersionMatchesHeader in go/internal/capi). */
+     *  contract BOTH engine libraries implement). Pinned HERE by
+     *  {@code GoAbiVersionMirrorTest} — a pure header-text read that cannot
+     *  self-skip. {@code TestABIVersionMatchesHeader} in go/internal/capi pins
+     *  the GO constant against the header, NOT this mirror (PR #832 round-4
+     *  review): a stale copy here reads a current library as "ABI mismatch →
+     *  unavailable" with every native-backed test skipping green. */
     static final int EXPECTED_ABI_VERSION = 57;
 
     /** {@code myotis_create} sentinel: canonical network this build does not host
