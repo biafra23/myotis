@@ -164,6 +164,41 @@ go run ./cmd/myotis-go -get-account 0xd8dA…045 -json     # …in the pinned en
 go run ./cmd/myotis-lc -once                     # LC alone: bootstrap → catch-up → one finality advance
 ```
 
+## C ABI (desktop embed)
+
+`cmd/myotis-capi` builds the engine as a c-shared library exporting the
+full `rust/include/myotis_engine.h` surface: the read-engine functions
+(lifecycle, verified account/storage reads, status, log drain) are
+functional, every other export answers an honest refusal (permanent
+`-32602` JSON / `false` / the contract's own "not in build" codes),
+and `myotis_go_capabilities_json` answers the split at runtime.
+
+```bash
+go build -buildmode=c-shared -o build/libmyotis_engine_go.so ./cmd/myotis-capi
+scripts/check_capi_symbols.sh   # every header symbol must be exported (CI runs both)
+```
+
+The handle contract matches the header: `myotis_create` allocates a
+NOT-YET-STARTED engine (the CLI starts its network right away; a C-ABI
+host starts it at `myotis_start`), an empty `data_dir` is refused with
+`-1` rather than defaulting to the process cwd, and the discv4 UDP
+port is OS-assigned (the header's own default) unless the
+undocumented-until-now override `MYOTIS_GO_LISTEN_PORT` says otherwise
+(`0` = the network's `30303`, `-1` = ephemeral — the default). The block
+selector is applied-or-refused: only `"finalized"` runs; the head tags
+are refused with the way forward named. `myotis_status_json` answers
+with the Rust engine's KEY SET (`host.rs` `status_object`: same names,
+same types — the string `networkMetering`, the 0x-less
+`finalizedRootHex`) plus three Go-only keys (`engine`, `myotisAbi`,
+`capabilities`); keys whose machinery this engine lacks carry honest
+zeros, marked in the struct. `myotis_set_ws_bound_periods` and
+`myotis_accept_stale_anchor` are APPLIED live — the LC loop reads
+them at every weak-subjectivity gate and a parked bootstrap
+restarts — while `myotis_set_served_block_window` records its value
+(a dial-only engine serves no blocks, so no answer depends on it;
+`capabilities` makes that explicit). The JVM-side loader + selector
+(`:myotis-engine-go`) is the next part.
+
 ## Test
 
 ```bash

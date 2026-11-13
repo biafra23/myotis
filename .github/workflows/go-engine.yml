@@ -16,6 +16,10 @@ on:
       # the shared corpus.
       - "rust/myotis-net/src/sync.rs"
       - "rust/testdata/**"
+      # cmd/myotis-capi's cgo preamble INCLUDES the C ABI header, so a
+      # prototype added there MUST turn the Go build red on its own PR
+      # (PR #827 review: the symbol check alone compares names).
+      - "rust/include/myotis_engine.h"
   # pull_request unscoped (any base branch), like every other workflow here:
   # part PRs into feature/go-engine must get these checks too.
   pull_request:
@@ -24,6 +28,7 @@ on:
       - ".github/workflows/go-engine.yml"
       - "rust/myotis-net/src/sync.rs"
       - "rust/testdata/**"
+      - "rust/include/myotis_engine.h"
   workflow_dispatch:
 
 jobs:
@@ -69,3 +74,13 @@ jobs:
         # -race: the discovery package is goroutines + mutexes + a
         # close/iterator handshake; keep the race detector on it.
         run: go test -race ./...
+
+      - name: c-shared C ABI
+        working-directory: go
+        # The part 1b contract: the c-shared build links AND exports
+        # every symbol myotis_engine.h declares (functional or honest
+        # refusal), so the JVM binding in part 1c is a library-name
+        # swap — see go/scripts/check_capi_symbols.sh.
+        run: |
+          go build -buildmode=c-shared -o build/libmyotis_engine_go.so ./cmd/myotis-capi
+          scripts/check_capi_symbols.sh
