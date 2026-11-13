@@ -1,11 +1,13 @@
 // :myotis-engines — the engine SELECTOR: the one module hosts point their composition
 // roots at instead of naming a concrete engine. `Engines.engine()` returns a
-// SelectorEngine that routes create() to the Java engine (node-core) or the Rust
-// engine (:myotis-engine-rust, over the UniFFI bindings) per
-// `myotis.engine=java|rust|auto` (default auto), and routes get/stop by recorded
+// SelectorEngine that routes create() to the Java engine (node-core), the Rust
+// engine (:myotis-engine-rust, over the UniFFI bindings) or — explicit choice
+// only, never under auto — the Go engine (:myotis-engine-go, over the Go build's
+// c-shared C ABI) per
+// `myotis.engine=java|rust|go|auto` (default auto), and routes get/stop by recorded
 // ownership. The Rust engine itself lives in :myotis-engine-rust so that it can be
 // packaged without the Java engine (the Android library); this module is the
-// composition of the two.
+// composition of the selectable engines.
 
 plugins {
     `java-library`
@@ -29,6 +31,13 @@ dependencies {
     // itself, so the engine does not land on every host's compile classpath by
     // way of the selector.
     implementation(project(":myotis-engine-rust"))
+    // The Go engine — the desktop-only third selectable engine (myotis.engine=go;
+    // never under auto). `implementation` for the same reason as the other two.
+    implementation(project(":myotis-engine-go"))
+    // The shared LoopbackRpc port now lives here (moved out of
+    // :myotis-engine-rust when the Go engine needed it too); KtorLoopbackRpc
+    // implements it, so the selector needs it on its own compile path.
+    implementation(project(":myotis-engine-common"))
     // The Java engine (JavaMyotisEngine) — the other selectable engine.
     implementation(project(":node-core"))
     // The loopback JSON-RPC listener the selector attaches to every Rust handle

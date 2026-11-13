@@ -1,5 +1,6 @@
 package io.myotis.engines.rust;
 
+import io.myotis.engines.common.LoopbackRpc;
 import com.eclipsesource.json.Json;
 import com.eclipsesource.json.JsonArray;
 import com.eclipsesource.json.JsonObject;
