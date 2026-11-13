@@ -84,7 +84,7 @@ kotlin {
         // The app adds its own exclude on the same flag as a second line, at the
         // APK merge.
         if (skipRustEngine) {
-            packaging.jniLibs.excludes += setOf("**/libmyotis_engine.so", "**/libmyotis_bls.so")
+            packaging.jniLibs.excludes += setOf("**/libmyotis_*.so")
         }
     }
     jvm {

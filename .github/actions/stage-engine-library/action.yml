@@ -5,7 +5,7 @@
 # release). One definition, so a fix to
 # the staging retry or the verification never has to be applied twice.
 #
-# The AAR builds the Rust engine FROM SOURCE (:myotis-engine's preBuild chain),
+# The AAR builds the Rust engine FROM SOURCE (:myotis-engine's androidPreBuild chain),
 # so this sets up the Android rustup targets and the pinned NDK, build-tools and
 # cargo-ndk as android-apk.yml does. No -PskipRustEngine — a published AAR without the
 # engine is a library that loads nothing.

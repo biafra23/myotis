@@ -126,6 +126,16 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    # Moved BY HAND, with Compose Multiplatform (gradle/libs.versions.toml):
+    # the androidx Compose BOM, whose calendar version makes every release a
+    # minor or major here, has to match the androidx Compose line Compose
+    # Multiplatform brings; kotlinx-datetime has to match what Compose's
+    # material3 ships (a mismatch once failed at run time on desktop). Left to
+    # Dependabot, either would move out of step in the group (#818).
+    ignore:
+      - dependency-name: "androidx.compose:compose-bom"
+      - dependency-name: "org.jetbrains.kotlinx:kotlinx-datetime"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
     groups:
       gradle-minor-patch:
         update-types: ["minor", "patch"]
