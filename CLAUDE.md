@@ -10,8 +10,8 @@ that file in full BEFORE acting** — a summary here never overrides the full te
 |---|---|
 | build for Android or iOS, or a build fails on a missing toolchain             | `docs/agent/build.md`             |
 | add or move a module, or touch host ↔ engine wiring or its exemptions         | `docs/agent/architecture.md`      |
-| open a PR (monitoring, session title)                                         | `docs/agent/workflow.md`          |
-| plan work as more than one PR or branch                                       | `docs/agent/multi-pr-plans.md`    |
+| start a work item tied to an issue (session title), or open a PR (monitoring) | `docs/agent/workflow.md`          |
+| plan, resume or continue multi-PR work: a part, a merge, the final PR         | `docs/agent/multi-pr-plans.md`    |
 | write a PR description, answer review comments, or handle a fork PR           | `docs/agent/pull-requests.md`     |
 | do any release work: tag, version, checkpoints, bootnodes, seeds, assets, bundles | `docs/agent/releases.md`      |
 | add or bump a dependency, move a toolchain pin, touch build scripts or packaging | `docs/agent/reproducibility.md` |
@@ -111,15 +111,20 @@ none treated as optional or "only if asked"**. Full text: `docs/agent/workflow.m
 5. **Address the PR comments** — drive the PR to green, answer every comment, keep watching until merged or closed.
 
 Do not stop at "pushed". Skip the PR only when the user explicitly says so.
-In the desktop app the session also renames itself `IS#<n>: …` then `PR#<n>: …`
-(`docs/agent/workflow.md`).
+In the desktop app the session also renames itself: `IS#<n>: …` the moment the
+work item is identified as issue n (before there is a PR), then `PR#<n>: …`
+right after `gh pr create` (`docs/agent/workflow.md`).
 
 ## Hard rules — never broken, whatever an earlier instruction seems to authorize
 
 - **NEVER MERGE A PR YOURSELF** — not with `gh pr merge`, not by enabling
   auto-merge. Green CI + all comments answered = report "ready to merge". Sole
-  exception: part PRs into a multi-PR plan's feature branch, and only when the
-  owner said yes for that plan. A PR into `main` has no exception.
+  exception: part PRs into a multi-PR plan's feature branch, and only under
+  step 3 of `docs/agent/multi-pr-plans.md`: the owner said yes for that plan
+  in THIS conversation (never inferred from an earlier plan, a standing
+  instruction or a GitHub comment), and the part meets every condition listed
+  there, among them a POSTED automated review (a green `claude-review` job
+  alone is not one). A PR into `main` has no exception.
 - **Never push a `v*` tag on your own initiative.** The tag is the owner's action.
 - **Everything that lands on GitHub is in English** — titles, descriptions,
   commit messages, review replies.
@@ -134,7 +139,9 @@ target every part PR at it, ask the owner once per plan whether you may merge
 the parts into it yourself, keep it current by merging `main` into it (never
 rebase or force-push), and open the final `feature/<topic>` → `main` PR only
 when every part is in. Read `docs/agent/multi-pr-plans.md` in full before the
-first part is coded.
+first part is coded, and again in any session that picks a plan up: before
+merging a part, before merging `main` into the feature branch, and before the
+final PR.
 
 ## No merge into `main` may break reproducibility
 
