@@ -822,6 +822,13 @@ impl PoolInner {
     /// claim lock, so no direct dial of a node is claimed while it moves; the
     /// common case, a reserve already at its share, costs a count.
     async fn balance_tor_reserve(&self, grow: bool) {
+        self.balance_tor_reserve_with(grow, tor_reserve_salt).await
+    }
+
+    /// [`Self::balance_tor_reserve`] with the fill salt's source as a
+    /// parameter, so a test can take it away. Drawn only when the reserve has
+    /// to take nodes in.
+    async fn balance_tor_reserve_with(&self, grow: bool, salt: impl FnOnce() -> Option<[u8; 32]>) {
         let target = {
             let cache = self.cache.lock().await;
             let reserve = self.tor_reserve.lock().unwrap_or_else(|p| p.into_inner());
@@ -868,9 +875,10 @@ impl PoolInner {
                 .collect();
             // No salt, no fill: an all-zero salt would set aside the same,
             // computable peers in every wallet whose draw failed (#823). The
-            // nodes already in the reserve stay usable, and the next fill
-            // draws again.
-            match tor_reserve_salt() {
+            // nodes already in the reserve stay in it, and the next fill draws
+            // again. (While the seed draw fails too, no read or send reaches
+            // them: see `tor_candidates`.)
+            match salt() {
                 Some(salt) => picks.sort_by_key(|c| tor_reserve_draw_with(&salt, &c.pubkey)),
                 None => picks.clear(),
             }
@@ -1732,14 +1740,20 @@ impl PeerPool {
     /// each went on a `tor_reserve_handle`. Empty means the Tor path
     /// fails closed: it never falls back to a peer that sees our IP.
     pub async fn tor_candidates(&self, snap_only: bool) -> Vec<(SocketAddr, [u8; 64])> {
+        // A fresh order among equals for each call: successive reads spread
+        // over the reserve instead of all reaching its first few nodes.
+        self.tor_candidates_with(snap_only, draw_secret::<8>(getrandom::fill)).await
+    }
+
+    /// [`Self::tor_candidates`] with the per-call seed as a parameter, so a
+    /// test can take it away. No seed, no candidates: a fixed order would
+    /// send every Tor read and send of this process to the same, computable
+    /// node first (#823). Empty is the fail-closed answer the Tor path already
+    /// handles; [`tor_entropy_missing`] tells the caller why.
+    async fn tor_candidates_with(&self, snap_only: bool, seed: Option<[u8; 8]>) -> Vec<(SocketAddr, [u8; 64])> {
         self.inner.prune_closed().await;
         self.inner.balance_tor_reserve(true).await;
-        // A fresh order among equals for each call: successive reads spread
-        // over the reserve instead of all reaching its first few nodes. No
-        // seed, no candidates: a fixed order would send every Tor read of this
-        // process to the same, computable node first (#823). Empty is the
-        // fail-closed answer the Tor path already handles.
-        let Some(seed) = draw_secret::<8>(getrandom::fill) else {
+        let Some(seed) = seed else {
             return Vec::new();
         };
         let cached = self
@@ -2152,7 +2166,9 @@ impl ContactLog {
 static TOR_RESERVE_SALT: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
 
 /// This process's reserve salt, drawn on first use; `None` while the OS cannot
-/// supply entropy (early boot, a seccomp sandbox), so the caller fails closed.
+/// supply entropy, so the caller fails closed. (Not early boot: getrandom then
+/// blocks until the kernel's pool is ready. A failure is e.g. an Android
+/// seccomp filter answering EPERM, or no usable /dev for the fallback.)
 fn tor_reserve_salt() -> Option<[u8; 32]> {
     if let Some(salt) = TOR_RESERVE_SALT.get() {
         return Some(*salt);
@@ -2192,6 +2208,13 @@ fn warn_no_tor_entropy(e: &getrandom::Error) {
             "tor: no OS entropy; the Tor reserve takes in no node and Tor reads and sends fail closed until it returns"
         );
     }
+}
+
+/// Whether the last draw of a Tor-reserve secret failed: an empty
+/// [`PeerPool::tor_candidates`] is then the OS's missing entropy, not a
+/// reserve with no ready node, and the caller's error says so.
+pub(crate) fn tor_entropy_missing() -> bool {
+    TOR_ENTROPY_MISSING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn tor_entropy_recovered() {
@@ -3715,6 +3738,30 @@ mod tests {
             assert_eq!(again.tor_reserve_len(), 3);
             assert_eq!(try_dial_verdict(&again.inner, dead(230), [30; 64]).await, DialVerdict::Skipped);
             again.stop().await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn without_entropy_the_reserve_takes_in_nothing_and_offers_nothing() {
+            // The two fail-closed branches of #823, with the secrets' sources
+            // taken away: no salt, no fill (the cache stays as it is); no seed,
+            // no candidate — and with them back, both work as usual.
+            let dir = cache_dir("no-entropy");
+            let mut cache = ElPeerCache::load(dir.join("peers-test.cache"));
+            for i in 0..9u8 {
+                cache.add(dead(200 + u16::from(i)), &[i; 64], true);
+            }
+            let pool = fixture_with(b"reserve-no-entropy", cache, Vec::new());
+            pool.inner.balance_tor_reserve_with(true, || None).await;
+            assert_eq!(pool.tor_reserve_len(), 0, "no salt: nothing set aside");
+            assert_eq!(pool.inner.cache.lock().await.peers().len(), 9, "the cache untouched");
+            pool.inner.balance_tor_reserve_with(true, || Some([5u8; 32])).await;
+            assert_eq!(pool.tor_reserve_len(), 3);
+            // A ready reserved node: offered with a seed, not without one.
+            pool.inner.tor_reserve.lock().unwrap().insert([30; 64], reserved(dead(230), 0));
+            assert!(pool.tor_candidates_with(false, None).await.is_empty(), "no seed: no candidate");
+            assert_eq!(pool.tor_candidates_with(false, Some([1u8; 8])).await, vec![(dead(230), [30; 64])]);
+            pool.stop().await;
             let _ = std::fs::remove_dir_all(dir);
         }
 
