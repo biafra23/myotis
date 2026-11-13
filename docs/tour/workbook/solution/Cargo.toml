@@ -8,7 +8,7 @@ publish = false
 # in your local cargo cache (~/.cargo/registry) with no network.
 [dependencies]
 tokio = { version = "=1.52.3", features = ["macros", "rt", "time"] }
-futures = "=0.3.32"
+futures = "=0.3.34"
 
 [dev-dependencies]
 tokio = { version = "=1.52.3", features = ["macros", "rt", "time", "test-util"] }
