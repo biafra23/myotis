@@ -61,6 +61,24 @@ cargo ndk -t arm64-v8a -t x86_64 -o "$jniLibs" build --locked --release -p myoti
 # libc/libm/libdl). Keep jniLibs to exactly the libs we ship.
 find "$jniLibs" -name '*.so' ! -name 'libmyotis_*.so' -print -delete
 
+# Strip the shipped libraries with the pinned NDK's llvm-strip, as the AGP
+# library plugin used to when it packaged the AAR (`--strip-unneeded`, AGP's
+# StripDebugSymbols): the KMP Android library plugin (AGP 9) has no strip
+# step and puts jniLibs into the AAR as built, symbol tables included (#837:
+# jni/ 33.2 MB instead of 26.2 MB). Stripped here, the AAR carries what it
+# always did, and what a consumer ships no longer depends on whether its own
+# build has an NDK to strip with. The Myotis APK strips again; a stripped
+# library comes out of that unchanged.
+strip_tool=""
+for candidate in "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-strip \
+                 "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-strip.exe; do
+    if [ -x "$candidate" ]; then strip_tool="$candidate"; break; fi
+done
+[ -n "$strip_tool" ] || { echo "no llvm-strip under $ANDROID_NDK_HOME/toolchains/llvm/prebuilt" >&2; exit 1; }
+find "$jniLibs" -name 'libmyotis_*.so' -print0 | while IFS= read -r -d '' lib; do
+    "$strip_tool" --strip-unneeded "$lib"
+done
+
 echo "built:"
 find "$jniLibs" -name 'libmyotis_*.so' -exec ls -la {} \;
 
