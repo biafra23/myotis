@@ -32,13 +32,30 @@ toml() { sed -n "s/^$1 *= *\"\([^\"]*\)\".*/\1/p" "$root/gradle/libs.versions.to
 jdk=$(tr -d '[:space:]' < "$root/.java-version")
 rust=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' "$root/rust/rust-toolchain.toml")
 ndk=$(toml android-ndk) build_tools=$(toml android-build-tools) cargo_ndk=$(toml cargo-ndk)
-for name in jdk rust ndk build_tools cargo_ndk; do
+go=$(sed -n 's/^go \([0-9][0-9.]*\) *$/\1/p' "$root/go/go.mod")
+for name in jdk rust ndk build_tools cargo_ndk go; do
     [[ -n "${!name}" ]] || { echo "build.sh: could not read the $name pin" >&2; exit 1; }
 done
 
 [[ "$jdk" == "$JDK_VERSION" ]] || {
     echo "build.sh: .java-version says $jdk, but docker/builder/pins.env has the build number and hash of $JDK_VERSION." >&2
     echo "          Move JDK_VERSION, JDK_BUILD and JDK_SHA256 there in the same change." >&2
+    exit 1
+}
+# A `toolchain` line would make go-engine.yml's setup-go (and a developer's go
+# command) build with another release than the image's GOTOOLCHAIN=local one.
+# Fail closed: ANY `toolchain` line must be exactly `toolchain go<the go line>`;
+# one this cannot parse (an rc, a trailing comment) is refused, not ignored.
+if grep -q '^[[:space:]]*toolchain\b' "$root/go/go.mod"; then
+    go_tc=$(sed -n 's/^toolchain go\([0-9][0-9.]*\)[[:space:]]*$/\1/p' "$root/go/go.mod")
+    [[ "$go_tc" == "$go" ]] || {
+        echo "build.sh: go/go.mod has a toolchain line other than 'toolchain go$go': the image builds with one Go release only." >&2
+        exit 1
+    }
+fi
+[[ "$go" == "$GO_VERSION" ]] || {
+    echo "build.sh: go/go.mod says go $go, but docker/builder/pins.env has the hash of Go $GO_VERSION." >&2
+    echo "          Move GO_VERSION and GO_SHA256 there in the same change." >&2
     exit 1
 }
 for f in android-app/build.gradle.kts myotis-engine/build.gradle.kts ui/build.gradle.kts; do
@@ -60,6 +77,7 @@ args=(
     "ANDROID_NDK=$ndk" "ANDROID_BUILD_TOOLS=$build_tools"
     "ANDROID_PLATFORM=$ANDROID_PLATFORM" "ANDROID_PLATFORM_REVISION=$ANDROID_PLATFORM_REVISION"
     "ANDROID_PLATFORM_ARCHIVE=$ANDROID_PLATFORM_ARCHIVE" "ANDROID_PLATFORM_SHA256=$ANDROID_PLATFORM_SHA256"
+    "GO_VERSION=$GO_VERSION" "GO_SHA256=$GO_SHA256"
 )
 if $print_only; then
     printf '%s\n' "${args[@]}"

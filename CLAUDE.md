@@ -195,13 +195,15 @@ Key Gradle modules:
   changed under a pinned version. docs/guides/gradle-dependency-pins.md.
 - **The builder image is the reference toolchain for the Linux and Android
   artifacts** (`docker/builder/`, #734): base image by digest, apt from one
-  snapshot, the JDK / rustup / Android command-line tools by SHA-256, and
+  snapshot, the JDK / rustup / Android command-line tools / Go by SHA-256, and
   rustc, the NDK, build-tools and cargo-ndk at the versions the build pins,
   which `build.sh` reads from their one source each (`.java-version`,
-  `rust/rust-toolchain.toml`, `gradle/libs.versions.toml`). Bumping the JDK
+  `rust/rust-toolchain.toml`, `gradle/libs.versions.toml`, `go/go.mod`). Bumping the JDK
   therefore also moves `JDK_VERSION` / `JDK_BUILD` / `JDK_SHA256` in
   `docker/builder/pins.env`, in the same change; `build.sh` refuses a mismatch
-  and the `builder image` workflow fails the PR. It is what a third party
+  and the `builder image` workflow fails the PR. The same holds for Go:
+  moving `go/go.mod`'s `go` line moves `GO_VERSION` / `GO_SHA256` there (the
+  image builds the Go engine's binaries, which the gate compares). It is what a third party
   rebuilds a release's ANDROID artifacts in (`docker/builder/build.sh`, then
   `docker/builder/run.sh -- scripts/repro/build_linux.sh`; `run.sh` gives the
   build its own HOME, cargo home and Gradle home and none of the caller's
@@ -485,8 +487,9 @@ desktop and Apple artifacts had reproduced). `Compare linux`, `Compare macos`
 and `Compare windows` each fail on any difference between their legs a and b:
 the unsigned release APK, the debug APK (by payload: its debug-key signature
 differs by design), the engine library as staged (the AAR, its jars, natives
-jars, poms and metadata) and the `.deb`; the dmg (by its `.app`) and the two
-xcframeworks; the msi (by the files it installs); and on each platform the
+jars, poms and metadata), the `.deb` and the Go engine's two binaries
+(`myotis-go`, `myotis-lc`; Linux only, owner's decision 2026-11-12); the dmg
+(by its `.app`) and the two xcframeworks; the msi (by the files it installs); and on each platform the
 host libraries: the engine library and the Node addon. Two comparisons are
 REPORTED and do not fail, because their second side is not a second build of
 the same kind: `Compare linux image vs runner toolchain`, and on a tag the

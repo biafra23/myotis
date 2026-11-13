@@ -11,6 +11,7 @@
 #   Android cmdline-tools by SHA-256; the NDK and build-tools by exact version;
 #                         the platform's archive by SHA-256
 #   cargo-ndk             by exact version, built --locked
+#   Go                    by SHA-256 (the Go engine, go/)
 #
 # Do not `docker build` this by hand: docker/builder/build.sh passes the build
 # args, reading the versions from the files that pin them for the build itself
@@ -21,7 +22,8 @@
 # (`build.sh --print-key`), so image.lock moves with it.
 #
 # linux/amd64 only: the artifacts built in it are the Android APKs and engine
-# library, the Linux x86_64 host libraries and the .deb.
+# library, the Linux x86_64 host libraries, the .deb and the Go engine's
+# binaries.
 #
 # The image has no user of its own: run it as any uid (`docker run --user`),
 # with HOME, CARGO_HOME and GRADLE_USER_HOME pointing at writable directories.
@@ -156,6 +158,20 @@ RUN curl -fsSL --retry 5 -o /tmp/platform.zip \
  && { [ "$rev" = "${ANDROID_PLATFORM_REVISION}" ] \
       || { echo "${ANDROID_PLATFORM_ARCHIVE} unpacked to revision '$rev' at $props, pins.env says ${ANDROID_PLATFORM_REVISION}" >&2; exit 1; }; }
 
+# --- Go -----------------------------------------------------------------------
+# The Go engine's toolchain, by the SHA-256 of go.dev's archive. GOTOOLCHAIN=local:
+# a go.mod naming a newer toolchain must fail the build, not have the go command
+# download that toolchain (the image is read-only at run time anyway). GOPATH,
+# GOCACHE and GOMODCACHE stay the caller's (under its HOME), like CARGO_HOME.
+ARG GO_VERSION
+ARG GO_SHA256
+ENV GOROOT=/opt/go
+ENV GOTOOLCHAIN=local
+RUN curl -fsSL --retry 5 -o /tmp/go.tar.gz "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+ && echo "${GO_SHA256}  /tmp/go.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/go.tar.gz -C /opt \
+ && rm /tmp/go.tar.gz
+
 # No `chmod -R a+rX /opt` layer of its own: it would copy every file under
 # /opt into a second layer and double the image. tar and unzip keep the
 # archives' modes under root's umask 022; the one installer that does not
@@ -168,10 +184,10 @@ RUN curl -fsSL --retry 5 -o /tmp/platform.zip \
 # it has no package.xml, and the plugin cannot write one), and "platform-tools
 # package is not installed, and automatic installation failed" (adb is no
 # build input, and the image cannot be installed into, by design).
-ENV PATH=/opt/jdk/bin:/opt/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV PATH=/opt/jdk/bin:/opt/cargo/bin:/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENV LANG=C.UTF-8
 
 # Where the published image comes from (ghcr.io links a package to the
 # repository this names).
 LABEL org.opencontainers.image.source="https://github.com/biafra23/myotis" \
-      org.opencontainers.image.description="Myotis builder image: the pinned toolchain of the Android release artifacts (docker/builder)"
+      org.opencontainers.image.description="Myotis builder image: the pinned toolchain of the Android release artifacts and the Go engine (docker/builder)"
