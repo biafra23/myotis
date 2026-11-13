@@ -125,10 +125,10 @@ don't write locks on that host.
 ### What resolveAllDependencies does not see
 
 An artifact that a plugin resolves through a *detached* configuration while a
-task runs isn't covered by the walk. AGP does this for aapt2 and for the lint
-override (`android.experimental.lint.version` in `gradle.properties`): 43
-components in all when this was set up. Compose does it for its JDK version
-probe in `:app-desktop:checkRuntime`, which every dmg, deb and msi build runs.
+task runs isn't covered by the walk. AGP does this for aapt2 (and did for the
+lint-version override the AGP 8.7 build carried, gone since AGP 9). Compose
+does it for its JDK version probe in `:app-desktop:checkRuntime`, which every
+dmg, deb and msi build runs.
 So the update script also runs `assemble lint :app-desktop:checkRuntime` in
 write mode (`--quick` skips that). In the chain:
 - aapt2 has a jar **per OS**, so the Linux x64, Windows and macOS arm64 jobs

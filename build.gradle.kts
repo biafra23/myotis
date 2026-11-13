@@ -13,33 +13,10 @@ import java.util.Properties
 import javax.inject.Inject
 import org.gradle.process.ExecOperations
 
-// R8/D8 override: AGP 8.7.3 bundles R8 8.7.18, which predates Kotlin 2.2 and
-// cannot parse this build's Kotlin 2.2.21 metadata — every Android dex step
-// then warns "An error occurred when parsing kotlin metadata" per Kotlin
-// class, and an R8-minified build ships stale/dropped @Metadata (visible to
-// kotlin-reflect). The remedy while AGP is older than the Kotlin toolchain is
-// pinning a newer R8 on the root buildscript classpath (the R8 project's
-// documented override; the compatible versions come from
-// developer.android.com/studio/build/kotlin-d8-r8-versions): 8.13.19 is that
-// table's Kotlin 2.3 row (AGP 8.2.2-8.13, which includes 8.7.3) — a superset
-// of the Kotlin 2.2 row's 8.10.21 (AGP 7.3.1-8.10), so it reads this build's
-// 2.2 metadata and already covers a Kotlin 2.3 bump. Drop this whole block
-// when AGP moves past 8.10 while Kotlin is 2.2 (the bundled R8 then reads 2.2
-// natively); if Kotlin bumps to 2.3 first, the pin is still needed up to AGP 8.13.
 buildscript {
-    repositories {
-        google {
-            // Filtered per the convention for special-purpose repos in
-            // settings.gradle.kts: this entry exists only to serve the R8 pin.
-            content { includeGroup("com.android.tools") }
-        }
-    }
-    dependencies {
-        classpath("com.android.tools:r8:8.13.19")
-    }
-    // The root buildscript classpath (this R8 pin plus every plugin the
-    // `plugins {}` block below loads) is locked like the project
-    // configurations, in buildscript-gradle.lockfile (#734).
+    // The root buildscript classpath (every plugin the `plugins {}` block
+    // below loads) is locked like the project configurations, in
+    // buildscript-gradle.lockfile (#734).
     configurations.classpath {
         resolutionStrategy.activateDependencyLocking()
     }
@@ -51,8 +28,7 @@ plugins {
     // subprojects that apply them via alias don't each load their own copy — required once a
     // Kotlin-Multiplatform module (:ui) is in the build, which fails hard on duplicate loads.
     alias(libs.plugins.android.application) apply false
-    alias(libs.plugins.android.library) apply false
-    alias(libs.plugins.kotlin.android) apply false
+    alias(libs.plugins.android.kotlin.multiplatform.library) apply false
     alias(libs.plugins.kotlin.jvm) apply false
     alias(libs.plugins.kotlin.multiplatform) apply false
     alias(libs.plugins.kotlin.serialization) apply false
@@ -484,14 +460,14 @@ subprojects {
     // These bring their own plugins (Android Gradle Plugin / Kotlin Multiplatform /
     // Compose), which are incompatible with the `java` plugin applied below:
     //   android-app  → com.android.application
-    //   ui           → kotlin-multiplatform + com.android.library + compose
+    //   ui           → kotlin-multiplatform + com.android.kotlin.multiplatform.library + compose
     //   app-desktop  → kotlin.jvm + compose (desktop)
     //   app-ios      → kotlin-multiplatform + compose (iOS framework)
     //   myotis-engine-ios → kotlin-multiplatform (the engine library's iOS cinterop)
     //   jsonrpc-server → kotlin-multiplatform (JVM hosts + the iOS RPC listener)
     //   myotis-rpc-policy → kotlin-multiplatform (the serving policy those share)
     //   myotis-logindex-presets → kotlin-multiplatform (the log index's predefined contracts)
-    //   myotis-engine  → kotlin-multiplatform + com.android.library (the engine library: AAR + desktop jar)
+    //   myotis-engine  → kotlin-multiplatform + com.android.kotlin.multiplatform.library (the engine library: AAR + desktop jar)
     // Excludes shared by EVERY module (Android plugin modules included):
     // - native Netty transports, for Android compatibility;
     // - Besu 26.4's log4j: it drags log4j-slf4j2-impl — a SECOND slf4j
@@ -720,7 +696,7 @@ configure(subprojects.filter { it.name in publishedArtifactIds }) {
 //   cargoTest       → cargo test --workspace; wired into root `check`
 //   cargoNdkAndroid → Android jniLibs (engine + native BLS) via
 //                     rust/build-android.sh; built from source (no committed
-//                     .so) and wired into :myotis-engine preBuild. Required by
+//                     .so) and wired into :myotis-engine androidPreBuild. Required by
 //                     default; -PskipRustEngine opts out.
 // -------------------------------------------------------------------------
 
@@ -1303,7 +1279,7 @@ tasks.register<Exec>("cargoNdkAndroid") {
 // Build-time contract for :myotis-engine (and so :android-app): the Rust engine
 // is built from source by default (cargoNdkAndroid), so a MISSING toolchain must
 // fail loudly and name the escape hatch — never silently produce a Java-only
-// app. Wired into :myotis-engine:preBuild (see its build file).
+// app. Wired into :myotis-engine:androidPreBuild (see its build file).
 // `-PskipRustEngine` is the opt-out.
 tasks.register("requireAndroidRustEngine") {
     group = "verification"

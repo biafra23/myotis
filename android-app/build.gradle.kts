@@ -2,7 +2,6 @@ import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.compose.compiler)
 }
 
@@ -94,7 +93,7 @@ val derivedVersionCode: Int = rootProject.extra["releaseBuildNumber"] as Int
 
 android {
     namespace = "com.jaeckel.ethp2p.android"
-    compileSdk = 35
+    compileSdk = 37
     // Pinned exactly (#734): AGP strips the packaged .so files with this NDK's
     // llvm-strip (an unpinned NDK leaves them unstripped or strips them with
     // whatever is installed), and build-tools is the same version

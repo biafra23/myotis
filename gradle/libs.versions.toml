@@ -75,7 +75,12 @@ besu = "26.4.0"
 # JNA (the UniFFI bindings' loader). 5.18.1 matches Besu's transitive jna so the
 # jar and Android @aar can't drift apart under conflict resolution.
 jna = "5.18.1"
-agp = "8.7.3"
+# AGP 9 (#818): needs Gradle 9.6+ (the wrapper is 9.9), brings built-in Kotlin
+# (no org.jetbrains.kotlin.android plugin) and the KMP Android library plugin
+# (com.android.kotlin.multiplatform.library) for :ui and :myotis-engine. Its
+# bundled R8 and lint read Kotlin 2.4 metadata and sources, so the R8 classpath
+# pin and the lint-version override the 8.7 build needed are gone.
+agp = "9.5.1"
 # Android NATIVE toolchain, pinned exactly (#734, Part 2). The single source for
 # Gradle (ndkVersion/buildToolsVersion in :android-app and :myotis-engine, and the
 # root cargoNdkAndroid gate), for CI (.github/actions/android-native-toolchain
@@ -90,11 +95,15 @@ android-build-tools = "37.0.0"
 cargo-ndk = "4.1.2"
 # Kotlin 2.2.21 is the FLOOR for the iOS target: it's the first release whose
 # Kotlin/Native supports Xcode 26 (required to link against the iOS 26 SDK).
-kotlin = "2.2.21"
-compose-bom = "2024.11.00"
-# Compose Multiplatform (shared UI for Android + Desktop + iOS). 1.9.x pairs with
-# Kotlin 2.2.20+. Uses the bundled compose-compiler plugin.
-compose-multiplatform = "1.9.3"
+kotlin = "2.4.21"
+# The androidx Compose BOM, moved BY HAND (its calendar version makes every newer
+# release a minor or a major to Dependabot): the release whose androidx Compose
+# line is the one Compose Multiplatform below brings (1.12.x).
+compose-bom = "2026.09.00"
+# Compose Multiplatform (shared UI for Android + Desktop + iOS). 1.12.x brings
+# androidx Compose 1.12, which requires AGP 9.1+ and compileSdk 37. Uses the
+# bundled compose-compiler plugin.
+compose-multiplatform = "1.12.2"
 activity-compose = "1.9.3"
 # JSON-RPC server (:jsonrpc-server). Ktor server+client + kotlinx are chosen for
 # Android compatibility (no java.net.http / com.sun.net.httpserver) and to match
@@ -116,8 +125,9 @@ minimal-json = "0.9.5"
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
-android-library     = { id = "com.android.library",     version.ref = "agp" }
-kotlin-android      = { id = "org.jetbrains.kotlin.android",         version.ref = "kotlin" }
+# AGP 9's Android target for Kotlin Multiplatform modules (:ui, :myotis-engine);
+# replaces com.android.library + androidTarget() there.
+android-kotlin-multiplatform-library = { id = "com.android.kotlin.multiplatform.library", version.ref = "agp" }
 kotlin-jvm          = { id = "org.jetbrains.kotlin.jvm",             version.ref = "kotlin" }
 kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
 compose-compiler    = { id = "org.jetbrains.kotlin.plugin.compose",  version.ref = "kotlin" }
