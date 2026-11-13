@@ -312,13 +312,19 @@ func myotis_export_log_index(h C.int64_t, path *C.char) *C.char {
 func myotis_set_boot_enodes(h C.int64_t, enodes *C.char) C.bool { return C.bool(false) }
 
 //export myotis_set_served_block_window
-func myotis_set_served_block_window(h C.int64_t, blocks C.int32_t) C.bool { return C.bool(false) }
+func myotis_set_served_block_window(h C.int64_t, blocks C.int32_t) C.bool {
+	return C.bool(capi.SetServedBlockWindow(int64(h), int32(blocks)))
+}
 
 //export myotis_set_ws_bound_periods
-func myotis_set_ws_bound_periods(h C.int64_t, periods C.int64_t) C.bool { return C.bool(false) }
+func myotis_set_ws_bound_periods(h C.int64_t, periods C.int64_t) C.bool {
+	return C.bool(capi.SetWsBoundPeriods(int64(h), int64(periods)))
+}
 
 //export myotis_accept_stale_anchor
-func myotis_accept_stale_anchor(h C.int64_t) C.bool { return C.bool(false) }
+func myotis_accept_stale_anchor(h C.int64_t) C.bool {
+	return C.bool(capi.AcceptStaleAnchor(int64(h)))
+}
 
 //export myotis_set_listen_ports
 func myotis_set_listen_ports(h C.int64_t, d4, d5, tcp, quic C.uint16_t) C.bool { return C.bool(false) }

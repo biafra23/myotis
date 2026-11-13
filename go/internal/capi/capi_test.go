@@ -1,15 +1,18 @@
 package capi
 
 // The C ABI contract, tested on the Go side of the seam (part 1b):
-// return codes, refusal shapes, and the apply-or-refuse discipline of
-// the block selector. The reads themselves are the engine's tested
-// path — what these tests pin is what a JNA host sees BEFORE a read
-// can run (handle states, selector policy) and the exact shape of the
+// return codes, refusal shapes, the apply-or-refuse discipline of
+// the block selector, the status JSON's KEY SET pinned to the Rust
+// engine's status_object, and the catalog pinned to the committed
+// golden file. The reads themselves are the engine's tested path —
+// what these tests pin is what a JNA host sees BEFORE a read can run
+// (handle states, selector policy) and the exact shape of the
 // refusals it sees instead.
 
 import (
 	"encoding/json"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -39,23 +42,93 @@ func decode(t *testing.T, s string) map[string]any {
 	return m
 }
 
+// rustStatusKeys is the key set of host.rs status_object /
+// NOT_STARTED_FALLBACK — the keys the Java RustChainHandle parses.
+// A Go status must answer every one of them with the same TYPE; the
+// three Go additions (engine/myotisAbi/capabilities) are the only
+// extras, and divergences in MEANING live in marked fields
+// (honest zeros for machinery this engine lacks), never in missing
+// or retyped keys (PR #827 review).
+var rustStatusKeys = []string{
+	"running", "paused", "network", "beaconState", "bootstrapped",
+	"finalizedSlot", "optimisticSlot", "currentPeriod", "targetPeriod",
+	"peerCount", "servedPeersLastMinute", "discv5TableSize",
+	"syncStartPeriod", "lcHunting", "wsBoundPeriods", "finalizedRootHex",
+	"elReaderAvailable", "snapPeers", "snapServingPeers",
+	"snap2ServingPeers", "readyPeers", "discoveredPeers", "attemptedDials",
+	"backedOffPeers", "blacklistedPeers", "optimisticBlockNumber",
+	"finalizedBlockNumber", "peerHeaderRequests",
+	"peerHeaderRequestsServed", "peerBodyRequests",
+	"peerBodyRequestsServed", "executionBlockNumber", "elHunting",
+	"upgradeAdvisory", "dataUsage", "networkMetering",
+}
+
+func TestStatusCarriesTheRustKeySet(t *testing.T) {
+	h := newStartedHandle(t)
+	st := decode(t, StatusJSON(h))
+	got := map[string]bool{}
+	for k := range st {
+		got[k] = true
+	}
+	for _, k := range rustStatusKeys {
+		if !got[k] {
+			t.Errorf("status is missing Rust contract key %q", k)
+		}
+	}
+	for k := range got {
+		switch k {
+		case "engine", "myotisAbi", "capabilities":
+		default:
+			found := false
+			for _, r := range rustStatusKeys {
+				if r == k {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("status carries unexplained extra key %q", k)
+			}
+		}
+	}
+	// Types the Rust side fixes (NOT_STARTED_FALLBACK shows the
+	// shapes): beaconState/network/networkMetering are STRINGS —
+	// networkMetering especially, it serializes Metering::as_str over
+	// there, not the numeric code of myotis_set_network_metering.
+	if _, ok := st["networkMetering"].(string); !ok {
+		t.Errorf("networkMetering must be a string, got %T %v", st["networkMetering"], st["networkMetering"])
+	}
+	if root, ok := st["finalizedRootHex"].(string); !ok || len(root) != 64 || strings.HasPrefix(root, "0x") {
+		t.Errorf("finalizedRootHex must be 64 hex chars WITHOUT 0x (host.rs hex32), got %v", st["finalizedRootHex"])
+	}
+	if st["syncStartPeriod"] != float64(-1) { // the Rust initial value; Go has no hunt phase
+		t.Errorf("syncStartPeriod = %v, want -1", st["syncStartPeriod"])
+	}
+	if st["wsBoundPeriods"] != float64(13) {
+		t.Errorf("wsBoundPeriods = %v, want the enforced bound 13", st["wsBoundPeriods"])
+	}
+	if st["engine"] != "go" || st["network"] != "mainnet" || st["running"] != true {
+		t.Errorf("status identity wrong: %v", st)
+	}
+	caps, _ := st["capabilities"].(map[string]any)
+	if caps["reads"] != true || caps["evm"] != false {
+		t.Errorf("capabilities wrong: %v", caps)
+	}
+
+	// A reported metering shows up in the Rust STRING shape.
+	if !SetNetworkMetering(2) {
+		t.Fatal("metering 2 refused")
+	}
+	defer SetNetworkMetering(0)
+	if got := decode(t, StatusJSON(h))["networkMetering"]; got != "METERED" {
+		t.Errorf("networkMetering after code 2 = %v, want METERED", got)
+	}
+}
+
 func TestLifecycleAndRefusals(t *testing.T) {
 	h := newStartedHandle(t)
 
 	if Start(h) {
 		t.Error("second Start must be false (already-running handle)")
-	}
-
-	st := decode(t, StatusJSON(h))
-	if st["engine"] != "go" || st["network"] != "mainnet" || st["running"] != true {
-		t.Errorf("status identity wrong: %v", st)
-	}
-	if _, ok := st["anchor"]; !ok {
-		t.Error("status must carry the anchor key (null until the first verified anchor)")
-	}
-	caps, _ := st["capabilities"].(map[string]any)
-	if caps["reads"] != true || caps["evm"] != false {
-		t.Errorf("capabilities wrong: %v", caps)
 	}
 
 	// Block-selector policy WITHOUT touching the network: everything
@@ -98,10 +171,25 @@ func TestCreateReturnCodes(t *testing.T) {
 	if h := Create("gnosis", t.TempDir()); h != -2 {
 		t.Errorf("canonical-but-unsupported network = %d, want -2 (multichain is step 4)", h)
 	}
-	if h := Create("1", t.TempDir()); h < 1 { // alias → mainnet
-		t.Errorf("alias \"1\" = %d, want handle >= 1", h)
-	} else {
-		Stop(h)
+	// The alias table is catalog.rs's, NOT a Go invention: only
+	// gbc/xdai alias gnosis — "ethereum"/"1" answer -1 HERE exactly
+	// as canonical_network_name makes them unknown to Rust.
+	if h := Create("1", t.TempDir()); h != -1 {
+		t.Errorf("chain-id string \"1\" = %d, want -1 (not a Rust alias)", h)
+	}
+	if h := Create("Xdai", t.TempDir()); h != -2 {
+		t.Errorf("alias \"Xdai\" = %d, want -2 (canonicalizes to gnosis)", h)
+	}
+	// An empty data_dir must be REFUSED (-1), not defaulted: passing
+	// "" would otherwise write nodekey.key into the host process's
+	// cwd (PR #827 review — Rust's canonicalize("") fails the same
+	// way and answers -1).
+	if h := Create("mainnet", ""); h != -1 {
+		t.Errorf("empty data_dir = %d, want -1", h)
+	}
+	cwd, _ := os.Getwd()
+	if _, err := os.Stat(cwd + "/nodekey.key"); err == nil {
+		t.Errorf(`Create("") must not touch the cwd (found nodekey.key there)`)
 	}
 	// The Go engine reads only its embedded checkpoint: a
 	// caller-supplied root cannot be applied, so it is refused rather
@@ -111,6 +199,46 @@ func TestCreateReturnCodes(t *testing.T) {
 	}
 	if h := CreateWithCheckpoint("gnosis", t.TempDir(), "0x11"); h != -2 {
 		t.Errorf("CreateWithCheckpoint(gnosis) = %d, want -2", h)
+	}
+}
+
+func TestStopWakesInFlightRead(t *testing.T) {
+	// PR #827 review, CONFIRMED against the old code: myotis_stop
+	// during a read left the JNA thread blocked for the whole 90 s
+	// ReadBudget (the cancelled LC loop closed nothing). A Stop must
+	// answer the pending read NOW — retryable, since a new handle
+	// could serve a re-ask.
+	t.Setenv("MYOTIS_GO_LISTEN_PORT", "-1")
+	h := Create("mainnet", t.TempDir())
+	if h < 1 {
+		t.Fatalf("Create = %d", h)
+	}
+	if !Start(h) {
+		t.Fatal("Start = false")
+	}
+	res := make(chan string, 1)
+	go func() {
+		res <- RequestAccountJSON(h, "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", "finalized")
+	}()
+	time.Sleep(400 * time.Millisecond) // let the reader reach its wait
+	stopDone := make(chan struct{})
+	go func() { Stop(h); close(stopDone) }()
+	select {
+	case <-stopDone:
+	case <-time.After(20 * time.Second):
+		t.Fatal("Stop itself did not return")
+	}
+	select {
+	case out := <-res:
+		m := decode(t, out)
+		if _, has := m["error"]; !has {
+			t.Errorf("stopped read must answer an error, got %v", m)
+		}
+		if _, has := m["code"]; has {
+			t.Errorf("stop-abort is retryable (host may re-ask on a new handle), got %v", m)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("in-flight read still blocked long after Stop (the 90 s budget bug)")
 	}
 }
 
@@ -154,15 +282,23 @@ func TestNotStartedHandleIsRetryable(t *testing.T) {
 	if !strings.Contains(m["error"].(string), "myotis_start") {
 		t.Errorf("not-started error must name the fix: %v", m["error"])
 	}
-	if s := decode(t, StatusJSON(h)); s["running"] != false {
+	s := decode(t, StatusJSON(h))
+	if s["running"] != false {
 		t.Errorf("created-but-unstarted status.running = %v, want false", s["running"])
+	}
+	// The Rust not-started shape's beaconState literal, same string.
+	if s["beaconState"] != "STARTING" {
+		t.Errorf("created-but-unstarted beaconState = %v, want STARTING", s["beaconState"])
+	}
+	if s["elReaderAvailable"] != false {
+		t.Errorf("unstarted elReaderAvailable = %v, want false", s["elReaderAvailable"])
 	}
 }
 
 func TestLogRingDrain(t *testing.T) {
 	// drain: oldest first, newline-joined, removed on read, "" when
 	// idle — the header's drain_logs semantics.
-	r := &ringHandler{}
+	r := newRingHandler()
 	log := slog.New(r)
 	log.Info("one")
 	log.Warn("two")
@@ -183,13 +319,31 @@ func TestLogRingDrain(t *testing.T) {
 	}
 }
 
+func TestRingKeepsDerivedLoggerAttrs(t *testing.T) {
+	// A derived logger with a component attr (how the dialer logs:
+	// log.With("component","dialer")) must land in the ring WITH the
+	// attr — dropping it loses the marker hosts filter on (PR #827
+	// review), and the view must still share the one buffer.
+	r := newRingHandler()
+	dial := slog.New(r.WithAttrs([]slog.Attr{slog.String("component", "dialer")}))
+	dial.Info("dialed")
+	if got := r.drain(10); !strings.Contains(got, "component=dialer") || !strings.Contains(got, "msg=dialed") {
+		t.Errorf("derived attr dropped: drain = %q", got)
+	}
+	grouped := slog.New(r.WithGroup("el").WithAttrs([]slog.Attr{slog.String("kind", "pool")}))
+	grouped.Info("pooled")
+	if got := r.drain(10); !strings.Contains(got, "el.kind=pool") {
+		t.Errorf("group must prefix attr names like the text handler: %q", got)
+	}
+}
+
 func TestRingOverflowKeepsNewest(t *testing.T) {
-	r := &ringHandler{}
+	r := newRingHandler()
 	for range ringCap + 10 {
 		_ = r.Handle(t.Context(), slog.NewRecord(time.Time{}, slog.LevelInfo, "filler", 0))
 	}
-	if len(r.lines) != ringCap {
-		t.Fatalf("ring len = %d, want cap %d", len(r.lines), ringCap)
+	if len(r.buf.lines) != ringCap {
+		t.Fatalf("ring len = %d, want cap %d", len(r.buf.lines), ringCap)
 	}
 }
 
@@ -206,9 +360,44 @@ func TestProcessGlobals(t *testing.T) {
 	if !SetNetworkMetering(2) || NetworkMetering() != 2 {
 		t.Error("metering 2 must be recorded and readable")
 	}
+	SetNetworkMetering(0)
 	// Tor: the contract's own codes — false / 0 mean "not in build".
 	if SetTorEnabled(true) || TorStatus() != 0 || SetTorStorageDirs("/a", "/b") {
 		t.Error("a Tor-less build must answer false/0 as the contract prescribes")
+	}
+}
+
+func TestHandleStateSetters(t *testing.T) {
+	// The three per-handle setters whose contract says "False only for
+	// an unknown handle": a known handle gets true (the value is
+	// APPLIED — ws-bound/stale-anchor through the engine's live gates;
+	// the served window is recorded, inert in a dial-only engine and
+	// disclosed as such via capabilities).
+	t.Setenv("MYOTIS_GO_LISTEN_PORT", "-1")
+	if SetServedBlockWindow(9999, 64) || SetWsBoundPeriods(9999, 20) || AcceptStaleAnchor(9999) {
+		t.Error("unknown handle must answer false on all three")
+	}
+	h := newStartedHandle(t)
+	if !SetServedBlockWindow(h, 100_000) { // clamped, still accepted
+		t.Error("known handle must answer true (contract: false ONLY for unknown)")
+	}
+	if !SetWsBoundPeriods(h, 20) {
+		t.Error("ws-bound 20 must be applied")
+	}
+	if got := decode(t, StatusJSON(h))["wsBoundPeriods"]; got != float64(20) {
+		t.Errorf("status wsBoundPeriods must report the ENFORCED override, got %v", got)
+	}
+	if SetWsBoundPeriods(h, -1) {
+		t.Error("a negative bound cannot be applied and must be refused")
+	}
+	if !SetWsBoundPeriods(h, 0) { // the contract's "restore the default"
+		t.Error("0 must restore the default")
+	}
+	if got := decode(t, StatusJSON(h))["wsBoundPeriods"]; got != float64(13) {
+		t.Errorf("after 0, bound must be back to 13, got %v", got)
+	}
+	if !AcceptStaleAnchor(h) {
+		t.Error("stale-anchor consent must be recorded for a known handle")
 	}
 }
 
@@ -226,25 +415,89 @@ func TestPendingNonceOverlay(t *testing.T) {
 	}
 }
 
-func TestCapabilitiesJSONAndCatalog(t *testing.T) {
+func TestCapabilitiesJSON(t *testing.T) {
 	m := decode(t, CapabilitiesJSON())
 	if m["engine"] != "go" || m["myotisAbi"] != float64(MyotisABIVersion) || m["readBlock"] != "finalized" {
 		t.Errorf("capabilities identity wrong: %v", m)
 	}
-	var nets []map[string]any
-	if err := json.Unmarshal([]byte(AvailableNetworksJSON()), &nets); err != nil {
+	caps, _ := m["capabilities"].(map[string]any)
+	if caps["wsBoundOverride"] != true || caps["staleAnchorConsent"] != true {
+		t.Errorf("the live setters are applied now; capabilities must say so: %v", caps)
+	}
+}
+
+func TestCatalogMatchesGolden(t *testing.T) {
+	// The catalog SHAPE is a cross-language contract: the committed
+	// golden (rust/testdata/networks_catalog.json, asserted
+	// byte-for-byte by catalog.rs and parsed by Java's
+	// NetworksJsonGoldenTest) defines the NetworkInfo objects. The Go
+	// library lists only what it can RUN (mainnet), but every key and
+	// value for that entry must equal the golden's.
+	goldenRaw, err := os.ReadFile("../../../rust/testdata/networks_catalog.json")
+	if err != nil {
+		t.Fatalf("golden catalog: %v", err)
+	}
+	var golden []map[string]any
+	if err := json.Unmarshal(goldenRaw, &golden); err != nil {
+		t.Fatalf("golden not JSON: %v", err)
+	}
+	var want map[string]any
+	for _, n := range golden {
+		if n["name"] == "mainnet" {
+			want = n
+		}
+	}
+	if want == nil {
+		t.Fatal("golden has no mainnet entry")
+	}
+	var gotList []map[string]any
+	if err := json.Unmarshal([]byte(AvailableNetworksJSON()), &gotList); err != nil {
 		t.Fatalf("catalog not a JSON array: %v", err)
 	}
-	if len(nets) != 1 || nets[0]["name"] != "mainnet" || nets[0]["supported"] != true {
-		t.Errorf("catalog = %v, want exactly mainnet/supported", nets)
+	if len(gotList) != 1 || gotList[0]["name"] != "mainnet" {
+		t.Fatalf("catalog = %v, want exactly one mainnet entry", gotList)
 	}
-	if c, ok := CanonicalNetworkName("Ethereum"); !ok || c != "mainnet" {
-		t.Errorf("canonical(Ethereum) = %q %v", c, ok)
+	got := gotList[0]
+	if len(got) != len(want) {
+		t.Errorf("key count diverges from golden: go=%v golden=%v", keys(got), keys(want))
 	}
-	if _, ok := CanonicalNetworkName("gnosis"); ok {
-		t.Error("gnosis is not in THIS library's catalog (Create says -2)")
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("catalog key %q: go=%v golden=%v", k, got[k], v)
+		}
 	}
-	if _, ok := CanonicalNetworkName("dogecoin"); ok {
-		t.Error("dogecoin must be unknown")
+}
+
+func keys(m map[string]any) []string {
+	var out []string
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+func TestCanonicalNameMatchesRustTable(t *testing.T) {
+	// catalog.rs canonical_network_name, entry by entry.
+	cases := map[string]string{
+		"mainnet": "mainnet", "MAINNET": "mainnet",
+		"gnosis": "gnosis", "gbc": "gnosis", "xdai": "gnosis", "XDAI": "gnosis",
+		"sepolia": "sepolia", "chiado": "chiado",
+	}
+	for in, want := range cases {
+		if c, ok := CanonicalNetworkName(in); !ok || c != want {
+			t.Errorf("canonical(%q) = %q %v, want %q", in, c, ok, want)
+		}
+	}
+	// Unknowns — INCLUDING the Go draft's invented aliases, which the
+	// Rust table does not carry and this library must not either.
+	for _, in := range []string{"ethereum", "eth", "1", "holesky", "", " mainnet"} {
+		if c, ok := CanonicalNetworkName(in); ok {
+			t.Errorf("canonical(%q) = %q, want unknown (Rust table)", in, c)
+		}
+	}
+	// A canonicalized-but-unsupported network still canonicalizes
+	// (Create is what says -2); same as Rust.
+	if c, ok := CanonicalNetworkName("gnosis"); !ok || c != "gnosis" {
+		t.Errorf("gnosis must canonicalize even though Create refuses it: %q %v", c, ok)
 	}
 }

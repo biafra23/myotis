@@ -180,10 +180,21 @@ scripts/check_capi_symbols.sh   # every header symbol must be exported (CI runs 
 
 The handle contract matches the header: `myotis_create` allocates a
 NOT-YET-STARTED engine (the CLI starts its network right away; a C-ABI
-host starts it at `myotis_start`). The block selector is applied-or-
-refused: only `"finalized"` runs; the head tags are refused with the
-way forward named. The JVM-side loader + selector (`:myotis-engine-go`)
-is the next part.
+host starts it at `myotis_start`), and an empty `data_dir` is refused
+with `-1` rather than defaulting to the process cwd. The block
+selector is applied-or-refused: only `"finalized"` runs; the head tags
+are refused with the way forward named. `myotis_status_json` answers
+with the Rust engine's KEY SET (`host.rs` `status_object`: same names,
+same types — the string `networkMetering`, the 0x-less
+`finalizedRootHex`) plus three Go-only keys (`engine`, `myotisAbi`,
+`capabilities`); keys whose machinery this engine lacks carry honest
+zeros, marked in the struct. `myotis_set_ws_bound_periods` and
+`myotis_accept_stale_anchor` are APPLIED live — the LC loop reads
+them at every weak-subjectivity gate and a parked bootstrap
+restarts — while `myotis_set_served_block_window` records its value
+(a dial-only engine serves no blocks, so no answer depends on it;
+`capabilities` makes that explicit). The JVM-side loader + selector
+(`:myotis-engine-go`) is the next part.
 
 ## Test
 

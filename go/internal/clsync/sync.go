@@ -74,6 +74,22 @@ type Syncer struct {
 	// (expected.txt's input.currentSlotEstimate is that input).
 	Now func() time.Time
 
+	// WsBound overrides the weak-subjectivity bound (periods), read
+	// LIVE at every gate: myotis_set_ws_bound_periods promises that a
+	// handle parked past the bound "re-evaluates within a second",
+	// which needs the gate to consult the setter rather than a value
+	// captured at construction. nil → chain.WsBoundPeriods (the
+	// network default). Values < 1 fall back to the default too (a
+	// bound of 0 periods would refuse every anchor including a fresh
+	// one; the C ABI's 0 means "restore the default").
+	WsBound func() uint64
+	// StaleAccepted is the host's one-shot consent to the embedded
+	// anchor's age (myotis_accept_stale_anchor). True suppresses the
+	// ErrStaleAnchor refusals — the start gate and the in-run layer —
+	// for the rest of the loop's life, exactly as the contract says
+	// ("for the rest of this run; never persisted"). nil → never.
+	StaleAccepted func() bool
+
 	peersMu   sync.Mutex
 	peers     map[peer.ID]*peerState
 	order     []peer.ID
@@ -88,6 +104,37 @@ func (s *Syncer) now() time.Time {
 		return s.Now()
 	}
 	return time.Now()
+}
+
+// boundPeriods is the weak-subjectivity bound IN FORCE right now —
+// the live override if one is set, the network default otherwise
+// (0/negative means "no override" per the WsBound field's contract).
+func (s *Syncer) boundPeriods() uint64 {
+	if s.WsBound != nil {
+		if b := s.WsBound(); b >= 1 {
+			return b
+		}
+	}
+	return chain.WsBoundPeriods
+}
+
+// staleAccepted reports the host's consent to anchor age, if any.
+func (s *Syncer) staleAccepted() bool {
+	return s.StaleAccepted != nil && s.StaleAccepted()
+}
+
+// staleGate is the ONE weak-subjectivity check both layers share
+// (start gate + in-run layer): refused unless the host consented to
+// the age, and judged against the bound in force at this instant.
+func (s *Syncer) staleGate(anchorPeriod, wallPeriod uint64, what string) error {
+	if s.staleAccepted() {
+		return nil
+	}
+	if chain.WsAnchorStale(anchorPeriod, wallPeriod, s.boundPeriods()) {
+		return fmt.Errorf("%w: %s period %d, wall period %d, bound %d",
+			ErrStaleAnchor, what, anchorPeriod, wallPeriod, s.boundPeriods())
+	}
+	return nil
 }
 
 func NewSyncer(c *chain.Consensus, h host.Host, logf func(string, ...any)) *Syncer {
@@ -138,6 +185,15 @@ func (s *Syncer) AddPeer(info peer.AddrInfo) {
 	}
 	s.peers[info.ID] = &peerState{info: info}
 	s.order = append(s.order, info.ID)
+}
+
+// PeerCount is the admitted libp2p peer count, for status surfaces
+// (the Rust status' "peerCount" is the light-client peer count, not
+// the EL pool's).
+func (s *Syncer) PeerCount() int {
+	s.peersMu.Lock()
+	defer s.peersMu.Unlock()
+	return len(s.peers)
 }
 
 // peerList returns a stable snapshot; callers must index THIS slice
@@ -239,11 +295,7 @@ func (s *Syncer) checkStartGate() error {
 	// the anchor of all three weak-subjectivity gates gets ONE definition
 	// (verify.go), so no gate can drift from it by re-deriving.
 	cp := lc.CheckpointPeriod(s.Consensus)
-	if chain.WsAnchorStale(cp, chain.SyncCommitteePeriod(wall), chain.WsBoundPeriods) {
-		return fmt.Errorf("%w: checkpoint period %d, wall period %d, bound %d",
-			ErrStaleAnchor, cp, chain.SyncCommitteePeriod(wall), chain.WsBoundPeriods)
-	}
-	return nil
+	return s.staleGate(cp, chain.SyncCommitteePeriod(wall), "checkpoint")
 }
 
 // RunBootstrap fetches the bootstrap for the EMBEDDED checkpoint root
@@ -475,9 +527,8 @@ func (s *Syncer) RunCatchUp(ctx context.Context, store *lc.Store) error {
 		// long-running sync that fell WsBoundPeriods behind must stop
 		// walking forward on it, not hand off through past-bound
 		// committees when peers finally answer.
-		if chain.WsAnchorStale(store.Period(), wallPeriod, chain.WsBoundPeriods) {
-			return fmt.Errorf("%w: held committee period %d, wall period %d, bound %d",
-				ErrStaleAnchor, store.Period(), wallPeriod, chain.WsBoundPeriods)
+		if err := s.staleGate(store.Period(), wallPeriod, "held committee"); err != nil {
+			return err
 		}
 		start := store.Period()
 		count := min(wallPeriod-store.Period(), clwire.MaxUpdatesByRange)

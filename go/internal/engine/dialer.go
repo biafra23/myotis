@@ -413,3 +413,29 @@ func (d *dialer) snapPeers() []snapread.Peer {
 	sort.Slice(out, func(i, j int) bool { return out[i].ID() < out[j].ID() })
 	return out
 }
+
+// attemptedCount is the count of candidates actually dialed (the
+// Rust status' "attemptedDials" — attempts made, not candidates
+// seen: backlog drops never dialed anything). Named apart from the
+// `attempted` map, which keys (id, endpoint) pairs for dedupe.
+func (d *dialer) attemptedCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.dialed
+}
+
+// snapCounts reports live snap sessions and how many negotiated
+// snap/2 (the status' snapServingPeers / snap2ServingPeers split).
+func (d *dialer) snapCounts() (snap, snap2 int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, s := range d.ready {
+		if s.HasSnap() {
+			snap++
+			if s.Snap != nil && *s.Snap == 2 {
+				snap2++
+			}
+		}
+	}
+	return snap, snap2
+}
