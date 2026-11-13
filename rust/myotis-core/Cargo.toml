@@ -36,7 +36,7 @@ sha3 = { version = "=0.10.9", default-features = false }
 # elliptic-curve/std → rand_core/std → getrandom, which doesn't build for plain
 # wasm32-unknown-unknown and would kill the sans-I/O canary (this crate needs no
 # entropy — key GENERATION lives in the I/O crates).
-k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa", "ecdh"] }
+k256 = { version = "=0.14.0", default-features = false, features = ["ecdsa", "ecdh"] }
 
 # Bare-metal targets: UEFI firmware and x86_64-unknown-none. sha2 arrives
 # transitively — k256's `ecdsa` feature turns on its `sha256` feature — and its
