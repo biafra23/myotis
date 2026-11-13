@@ -366,7 +366,7 @@ async fn read_ack<S: AsyncReadExt + Unpin>(stream: &mut S) -> Result<Vec<u8>, St
 /// handshake's secret keys, nonce and IV come from here (#823).
 fn random_bytes<const N: usize>() -> Result<[u8; N], String> {
     let mut b = [0u8; N];
-    getrandom::fill(&mut b).map_err(|e| format!("rlpx: OS entropy unavailable: {e}"))?;
+    fill_entropy(&mut b)?;
     Ok(b)
 }
 
@@ -375,8 +375,23 @@ fn random_padding() -> Result<Vec<u8>, String> {
     let [len_byte] = random_bytes::<1>()?;
     let len = 100 + usize::from(len_byte) % 201; // 100..=300, matching the reference
     let mut pad = vec![0u8; len];
-    getrandom::fill(&mut pad).map_err(|e| format!("rlpx: OS entropy unavailable: {e}"))?;
+    fill_entropy(&mut pad)?;
     Ok(pad)
+}
+
+/// The text every handshake entropy failure carries, so a caller can tell OUR
+/// missing randomness from a peer that failed ([`is_local_entropy_failure`]).
+const ENTROPY_UNAVAILABLE: &str = "rlpx: OS entropy unavailable";
+
+fn fill_entropy(dest: &mut [u8]) -> Result<(), String> {
+    getrandom::fill(dest).map_err(|e| format!("{ENTROPY_UNAVAILABLE}: {e}"))
+}
+
+/// Whether a dial or handshake error is this host's missing entropy, not the
+/// peer's doing. Such an error must not count against the peer: no strike, no
+/// eviction from the warm-start cache, no "unreachable" verdict over Tor.
+pub(crate) fn is_local_entropy_failure(error: &str) -> bool {
+    error.contains(ENTROPY_UNAVAILABLE)
 }
 
 
@@ -385,7 +400,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn handshake_entropy_is_fallible_and_well_shaped() {
+    fn handshake_entropy_is_well_shaped_and_attributable() {
         // The failure path cannot be forced without a custom getrandom backend;
         // the type is what guarantees it: these return Result, so a missing
         // source becomes a failed dial, not a panic (#823).
@@ -396,6 +411,10 @@ mod tests {
             let pad = random_padding().expect("entropy on the test host");
             assert!((100..=300).contains(&pad.len()), "EIP-8 padding length {}", pad.len());
         }
+        // A failure, however a caller wraps it, is recognisable as ours.
+        let wrapped = format!("tor rlpx handshake to 1.2.3.4:30303: {ENTROPY_UNAVAILABLE}: errno 38");
+        assert!(is_local_entropy_failure(&wrapped));
+        assert!(!is_local_entropy_failure("rlpx read ack body: connection reset"));
     }
 
     #[test]

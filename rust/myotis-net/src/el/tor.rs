@@ -252,6 +252,10 @@ fn peer_side(kind: arti_client::ErrorKind) -> bool {
 /// side's Tor (bootstrap, configuration, no circuit, a local network down:
 /// "tor circuit …") or a session that opened and then failed.
 pub(crate) fn is_peer_unreachable(error: &str) -> bool {
+    // A handshake that never started for lack of OUR entropy is this side's fault.
+    if crate::el::rlpx::transport::is_local_entropy_failure(error) {
+        return false;
+    }
     ["tor addr ", "tor connect ", "tor rlpx handshake", "tor eth handshake"]
         .iter()
         .any(|prefix| error.starts_with(prefix))
