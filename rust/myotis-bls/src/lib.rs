@@ -90,7 +90,7 @@ pub fn fast_aggregate_verify_with_dst(
 mod jni_shim {
     use jni::objects::{JByteArray, JClass};
     use jni::sys::{jboolean, jint, JNI_FALSE, JNI_TRUE};
-    use jni::JNIEnv;
+    use jni::{Env, EnvUnowned, Outcome};
 
     /// JNI entry: `NativeBlsBackend.nativeFastAggregateVerify(byte[] pubkeys48xN, int n, byte[] msg, byte[] sig)`.
     /// `pubkeys` is the committee flattened into one contiguous `48*n` buffer — one
@@ -99,21 +99,27 @@ mod jni_shim {
     pub extern "system" fn Java_com_jaeckel_ethp2p_consensus_bls_NativeBlsBackend_nativeFastAggregateVerify<
         'local,
     >(
-        mut env: JNIEnv<'local>,
+        mut env: EnvUnowned<'local>,
         _class: JClass<'local>,
         pubkeys: JByteArray<'local>,
         count: jint,
         message: JByteArray<'local>,
         signature: JByteArray<'local>,
     ) -> jboolean {
-        match verify(&mut env, pubkeys, count, message, signature) {
-            Some(true) => JNI_TRUE,
+        // Any failure is a plain `false`, never a Java exception, as before
+        // jni 0.22: a JNI error, a malformed input, or a panic `with_env`
+        // caught (under panic = "abort" there is none to catch).
+        let outcome = env.with_env(|env| -> jni::errors::Result<Option<bool>> {
+            Ok(verify(env, pubkeys, count, message, signature))
+        });
+        match outcome.into_outcome() {
+            Outcome::Ok(Some(true)) => JNI_TRUE,
             _ => JNI_FALSE,
         }
     }
 
     fn verify(
-        env: &mut JNIEnv,
+        env: &mut Env,
         pubkeys: JByteArray,
         count: jint,
         message: JByteArray,
