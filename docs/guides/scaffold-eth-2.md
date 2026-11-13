@@ -11,9 +11,9 @@ like the wallet's confirm screen, rather than taken on a provider's word.
 Scope: **mainnet and Sepolia**, the Ethereum networks Myotis serves that
 Scaffold-ETH 2 targets. The local `hardhat`/`anvil` chain is not involved (it
 is already yours), and L2s (Base, Arbitrum, Optimism) are not served (see
-[base-l2-evaluation.md](base-l2-evaluation.md)). The background, and why a
+[base-l2-evaluation.md](../ideas/base-l2-evaluation.md)). The background, and why a
 dApp's own reads normally bypass the wallet's RPC, is in
-[dapp-browser-design.md §2](dapp-browser-design.md#2-how-a-dapp-gets-its-data).
+[dapp-browser-design.md §2](../ideas/dapp-browser-design.md#2-how-a-dapp-gets-its-data).
 This page is the developer's side of that: you own the frontend, so you can
 point it at Myotis yourself.
 
@@ -49,7 +49,7 @@ it cannot answer from verified data:
 Each of those becomes a request to a public endpoint, and the page shows the
 answer. Nothing on screen tells a verified number from a substituted one.
 That is the fall-through policy *dapp-browser-design.md* §8 rules out ("never
-B"). It is also the trap the [Trust](../CLAUDE.md) rule warns about: an answer
+B"). It is also the trap the [Trust](../../CLAUDE.md) rule warns about: an answer
 the caller cannot tell apart from the one it asked for.
 
 So **replace** the transport for the chains Myotis serves; don't just add to it.
@@ -112,7 +112,7 @@ matter to you.
 ## 3. Run the node, and allow the page's origin
 
 The JSON-RPC listener refuses web pages until you allow them
-([web-page-access.md](web-page-access.md)). The Scaffold-ETH 2 dev server's
+([web-page-access.md](../how-it-works/web-page-access.md)). The Scaffold-ETH 2 dev server's
 origin is `http://localhost:3000`. Note the `http://`: a bare domain is read as
 `https://`. Origins match exactly: if you open the page as
 `http://127.0.0.1:3000`, or Next picks another port because 3000 is busy,
@@ -161,7 +161,7 @@ before any history appears. `useScaffoldWatchContractEvent` polls through viem, 
 uses `eth_newFilter`/`eth_getFilterChanges` and falls back to `eth_getLogs`.
 Myotis serves all of these **only from the log index**, which covers just the
 contracts you put on its watch-list
-([eth-getlogs-design.md](eth-getlogs-design.md)). The index exists **only on
+([eth-getlogs-design.md](../design-history/eth-getlogs-design.md)). The index exists **only on
 the Rust engine**. The default `auto` selection picks it, but where the Rust
 engine cannot load (a desktop build without cargo), `auto` runs the Java
 engine. That engine answers every log query with `-32000`, and
