@@ -82,7 +82,7 @@ jna = "5.18.1"
 # pin and the lint-version override the 8.7 build needed are gone.
 agp = "9.5.1"
 # Android NATIVE toolchain, pinned exactly (#734, Part 2). The single source for
-# Gradle (ndkVersion/buildToolsVersion in :android-app and :myotis-engine, and the
+# Gradle (ndkVersion/buildToolsVersion in :android-app, and the
 # root cargoNdkAndroid gate), for CI (.github/actions/android-native-toolchain
 # installs these) and for scripts/sign_release_apk.sh. A floating NDK or
 # cargo-ndk changes the shipped .so bytes, a floating build-tools the signer.
