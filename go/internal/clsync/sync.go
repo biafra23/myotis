@@ -273,7 +273,7 @@ func (s *Syncer) RunBootstrap(ctx context.Context) (*lc.Store, error) {
 	// pin ~95 times over the 4-minute budget — the same third-party
 	// Lighthouse token buckets this file paces catch-up at 11 s to
 	// respect, and these nodes answer sustained over-asking with 12 h
-	// IP bans (CLAUDE.md: "that ban IS #422"). Doubling to a 30 s cap
+	// IP bans (.claude/agent/releases.md: "that ban IS #422"). Doubling to a 30 s cap
 	// keeps the retry (a restarting pin returns within the window) at
 	// ~a dozen asks per pin; any non-empty sweep resets it, so a pool
 	// that is still GROWING (discv5 adding) is never slowed.
