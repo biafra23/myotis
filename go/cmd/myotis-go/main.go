@@ -110,6 +110,11 @@ func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, m
 		return err
 	}
 	defer e.Close()
+	// The CLI always runs the network; the C ABI host defers this call
+	// to myotis_start (the handle-then-start contract).
+	if err := e.StartNetwork(); err != nil {
+		return err
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

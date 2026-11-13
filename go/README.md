@@ -164,6 +164,27 @@ go run ./cmd/myotis-go -get-account 0xd8dA…045 -json     # …in the pinned en
 go run ./cmd/myotis-lc -once                     # LC alone: bootstrap → catch-up → one finality advance
 ```
 
+## C ABI (desktop embed)
+
+`cmd/myotis-capi` builds the engine as a c-shared library exporting the
+full `rust/include/myotis_engine.h` surface: the read-engine functions
+(lifecycle, verified account/storage reads, status, log drain) are
+functional, every other export answers an honest refusal (permanent
+`-32602` JSON / `false` / the contract's own "not in build" codes),
+and `myotis_go_capabilities_json` answers the split at runtime.
+
+```bash
+go build -buildmode=c-shared -o build/libmyotis_engine_go.so ./cmd/myotis-capi
+scripts/check_capi_symbols.sh   # every header symbol must be exported (CI runs both)
+```
+
+The handle contract matches the header: `myotis_create` allocates a
+NOT-YET-STARTED engine (the CLI starts its network right away; a C-ABI
+host starts it at `myotis_start`). The block selector is applied-or-
+refused: only `"finalized"` runs; the head tags are refused with the
+way forward named. The JVM-side loader + selector (`:myotis-engine-go`)
+is the next part.
+
 ## Test
 
 ```bash

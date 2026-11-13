@@ -13,6 +13,7 @@ package engine
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -54,8 +55,13 @@ type Config struct {
 // host).
 type Engine struct {
 	log  *slog.Logger
-	disc *discovery.Service
+	disc *discovery.Service // set by StartNetwork, not by New
 	dial *dialer
+	key  *ecdsa.PrivateKey
+	cfg  Config // kept for StartNetwork
+
+	netOnce sync.Once
+	netErr  error
 
 	// LC state. latest is the newest VERIFYING-poll anchor (nil until
 	// the first one); dead closes exactly when the LC loop gave up for a
@@ -114,36 +120,45 @@ func New(cfg Config) (*Engine, error) {
 	e := &Engine{
 		log:       log,
 		dial:      newDialer(key, netCfg, cfg.MaxDials, cfg.MaxReady, advertiseTCP, cfg.RequireSnap, log),
+		key:       key,
+		cfg:       cfg,
 		dead:      make(chan struct{}),
 		lcDone:    make(chan struct{}),
 		anchorSig: make(chan struct{}),
 	}
-	// Discovery is started LAST and the dialer FIRST so OnDiscovered can
-	// capture a live dialer; Close's order (discovery first, then the
-	// dialer) is the mirror image — discovery must stop firing
-	// OnDiscovered before the dialer queue closes (enqueue's closed-flag
-	// is the second belt on that).
-	e.disc, err = discovery.Start(discovery.Config{
-		DataDir:    cfg.DataDir,
-		Network:    netCfg,
-		Key:        key,
-		ListenPort: cfg.ListenPort,
-		Logger:     log,
-		OnDiscovered: func(c discovery.Candidate) {
-			log.Info("peer discovered",
-				"id", c.ID.String(),
-				"addr", fmt.Sprintf("%s:%d", c.Node.IP(), c.Node.TCP()),
-				"via", c.Source)
-			if cfg.DialPeers {
-				e.dial.enqueue(c.Node)
-			}
-		},
-	})
-	if err != nil {
-		e.dial.close()
-		return nil, err
-	}
 	return e, nil
+}
+
+// StartNetwork begins EL discovery (and, through it, dialing). New does
+// NOT start it: the C ABI's contract (myotis_engine.h) is that
+// myotis_create allocates a NOT-YET-STARTED handle and myotis_start
+// begins the sync loop, so the embedder — not the allocator — decides
+// when the process starts sending packets. The CLI calls this right
+// after New, which reproduces the old always-on behaviour exactly.
+// Idempotent; a failed first attempt may be retried.
+func (e *Engine) StartNetwork() error {
+	e.netOnce.Do(func() {
+		e.disc, e.netErr = discovery.Start(discovery.Config{
+			DataDir:    e.cfg.DataDir,
+			Network:    chain.Mainnet(), // the same pin New derived from
+			Key:        e.key,
+			ListenPort: e.cfg.ListenPort,
+			Logger:     e.log,
+			OnDiscovered: func(c discovery.Candidate) {
+				e.log.Info("peer discovered",
+					"id", c.ID.String(),
+					"addr", fmt.Sprintf("%s:%d", c.Node.IP(), c.Node.TCP()),
+					"via", c.Source)
+				if e.cfg.DialPeers {
+					e.dial.enqueue(c.Node)
+				}
+			},
+		})
+		if e.netErr != nil {
+			e.netOnce = sync.Once{} // retryable, as the doc promises
+		}
+	})
+	return e.netErr
 }
 
 // StartLC starts the beacon light client once (later calls are no-ops):
@@ -303,6 +318,10 @@ func (e *Engine) Anchor() (Anchor, bool) {
 	}
 	return *e.latest, true
 }
+
+// ReadyPeerCount is the number of live READY sessions (the same count
+// the summary line reports; status surfaces use it).
+func (e *Engine) ReadyPeerCount() int { return e.dial.readyCount() }
 
 // SnapPeers are the live snap-capable sessions, sorted by node id —
 // exposed for status surfaces; readers go through Account, which owns
@@ -572,7 +591,13 @@ func attemptRead(a *Anchor, peers []snapread.Peer, address string, addr common.A
 // Report logs the discovery/dial summary line — the same accounting the
 // CLI's 30-second ticker and every exit path printed.
 func (e *Engine) Report() {
-	table, live, bySource := e.disc.Stats()
+	var (
+		table, live int
+		bySource    map[discovery.Source]int
+	)
+	if e.disc != nil { // StartNetwork may never have run
+		table, live, bySource = e.disc.Stats()
+	}
 	peers := make([]any, 0, len(bySource))
 	for src, n := range bySource {
 		peers = append(peers, slog.Any(string(src), n))
@@ -595,7 +620,9 @@ func (e *Engine) Close() {
 		if cancel != nil {
 			cancel()
 		}
-		e.disc.Close()
+		if e.disc != nil { // New-then-Close without StartNetwork
+			e.disc.Close()
+		}
 		e.dial.close()
 		// Wait for the LC goroutine's defer (h.Close, the libp2p host)
 		// before claiming release: an embedded host that restarts the

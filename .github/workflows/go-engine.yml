@@ -69,3 +69,13 @@ jobs:
         # -race: the discovery package is goroutines + mutexes + a
         # close/iterator handshake; keep the race detector on it.
         run: go test -race ./...
+
+      - name: c-shared C ABI
+        working-directory: go
+        # The part 1b contract: the c-shared build links AND exports
+        # every symbol myotis_engine.h declares (functional or honest
+        # refusal), so the JVM binding in part 1c is a library-name
+        # swap — see go/scripts/check_capi_symbols.sh.
+        run: |
+          go build -buildmode=c-shared -o build/libmyotis_engine_go.so ./cmd/myotis-capi
+          scripts/check_capi_symbols.sh

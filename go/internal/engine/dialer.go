@@ -304,6 +304,12 @@ func hashOf(headers [][]byte) string {
 	return fmt.Sprintf("%x", h[:8])
 }
 
+func (d *dialer) readyCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.ready)
+}
+
 func (d *dialer) stats() (ready int, outcome []string, clients []string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
