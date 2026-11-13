@@ -1,11 +1,9 @@
-//! A minimal HTTPS GET — the engine's only HTTP client, for the two sources
-//! that are not devp2p/libp2p peers (CLAUDE.md *Data sources* carve-outs):
-//!
-//! - Colibri's ZK sync proofs ([`crate::zksync`]) — self-verifying, so this
-//!   transport is trusted for nothing but availability;
-//! - checkpointz finalized roots ([`crate::checkpointz`]) — NOT self-verifying,
-//!   which is why that module cross-validates several independent operators and
-//!   why the certificate check here is not optional.
+//! A minimal HTTPS GET — the engine's only HTTP client, for the one source that
+//! is not a devp2p/libp2p peer (CLAUDE.md *Data sources* carve-out): the
+//! checkpointz finalized roots a user may ask for at a STALE_ANCHOR park
+//! ([`crate::checkpointz`]). They are NOT self-verifying, which is why that
+//! module requires several independent operators to agree and why the
+//! certificate check here is not optional.
 //!
 //! Deliberately small: HTTP/1.1, `Connection: close`, no redirects (a 3xx is a
 //! failure — every URL is pinned), no compression, a hard body cap, and a
@@ -257,8 +255,8 @@ mod tests {
     #[test]
     fn urls_parse_strictly() {
         assert_eq!(
-            parse_url("https://Mainnet.colibri-proof.tech/period_store/1/zk_proof.ssz"),
-            Some(("mainnet.colibri-proof.tech".into(), 443, "/period_store/1/zk_proof.ssz".into()))
+            parse_url("https://Mainnet.Checkpoint.sigp.io/eth/v1/beacon/states/head/finality_checkpoints"),
+            Some(("mainnet.checkpoint.sigp.io".into(), 443, "/eth/v1/beacon/states/head/finality_checkpoints".into()))
         );
         assert_eq!(parse_url("https://h:8443"), Some(("h".into(), 8443, "/".into())));
         assert_eq!(parse_url("http://h/x"), None);

@@ -15,12 +15,6 @@ sha2 = { version = "0.10", default-features = false }
 # Diagnostics only (debug-level rejection reasons in store.rs): the tracing
 # facade is I/O-free and wasm-safe, so the sans-I/O canary is unaffected.
 tracing = { version = "=0.1.44", default-features = false }
-# BN254 for the ZK sync path's Groth16 check (src/zk.rs). Already in every
-# engine build through revm-precompile with exactly these features, so no new
-# crate is compiled into the engine; pure Rust, no_std-clean.
-ark-bn254 = { version = "0.6", default-features = false, features = ["curve"] }
-ark-ec = { version = "0.6", default-features = false }
-ark-ff = { version = "0.6", default-features = false }
 
 # Bare-metal targets (UEFI firmware, x86_64-unknown-none): the same sha2 steer
 # as myotis-core -- its x86 backend enables SSE per function, which these

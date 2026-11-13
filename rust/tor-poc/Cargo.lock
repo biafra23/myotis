@@ -3947,9 +3947,6 @@ dependencies = [
 name = "myotis-consensus"
 version = "0.1.20"
 dependencies = [
- "ark-bn254",
- "ark-ec",
- "ark-ff 0.6.0",
  "myotis-bls",
  "sha2 0.10.9",
  "tracing",

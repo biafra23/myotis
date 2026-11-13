@@ -642,14 +642,4 @@ class EngineDecodingTest {
         assertEquals("unknown handle", r.error)
         assertTrue(r.operators.isEmpty())
     }
-
-    @Test
-    fun aZkReleaseDecodes() {
-        val r = EngineDecoding.zkRelease("""{"applied":true,"period":1907}""")
-        assertTrue(r.applied)
-        assertEquals(1907L, r.period)
-        val no = EngineDecoding.zkRelease("""{"applied":false,"error":"unknown handle"}""")
-        assertFalse(no.applied)
-        assertEquals("unknown handle", no.error)
-    }
 }

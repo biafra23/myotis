@@ -418,8 +418,8 @@ public final class Main {
                 try {
                     p = io.myotis.api.StaleAnchorPolicy.valueOf(stalePolicy.trim().toUpperCase(java.util.Locale.ROOT));
                 } catch (IllegalArgumentException e) {
-                    System.err.println("-Dmyotis.beacon.staleAnchorPolicy must be ask, zk_proof, "
-                            + "checkpoint or continue (got '" + stalePolicy + "')");
+                    System.err.println("-Dmyotis.beacon.staleAnchorPolicy must be ask, checkpoint "
+                            + "or continue (got '" + stalePolicy + "')");
                     engine.shutdownAll();
                     closeAll(servers);
                     releaseAll(fileLocks, lockChannels);
@@ -427,7 +427,7 @@ public final class Main {
                 }
                 if (!handle.setStaleAnchorPolicy(p)) {
                     System.err.println("-Dmyotis.beacon.staleAnchorPolicy=" + p + ": this engine "
-                            + "cannot apply it (the ZK proof and checkpoint fetches are Rust-engine only)");
+                            + "cannot apply it (the checkpoint fetch is Rust-engine only)");
                     engine.shutdownAll();
                     closeAll(servers);
                     releaseAll(fileLocks, lockChannels);

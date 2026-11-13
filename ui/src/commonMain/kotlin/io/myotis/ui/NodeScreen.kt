@@ -292,7 +292,6 @@ fun NodeScreen(
                         controller.acceptStaleAnchor(staleNet)
                         staleDismissed = staleDismissed + staleNet
                     },
-                    onFetchZk = { controller.fetchZkProofForStaleAnchor(staleNet) },
                     onFetchFresh = { controller.refreshAnchorFromCheckpointz(staleNet) },
                     onDismiss = { staleDismissed = staleDismissed + staleNet },
                 )
@@ -503,7 +502,7 @@ internal const val READINESS_STRIP_TAG = "readiness-strip"
 private fun StaleAnchorChoiceSection(settings: Settings, controller: NodeController) {
     var choice by remember { mutableStateOf(settings.staleAnchorChoice()) }
     SettingsSection("When the sync anchor is too old")
-    // Four chips outgrow a phone's width: scroll rather than clip the last one.
+    // Three chips can outgrow a narrow phone: scroll rather than clip the last one.
     Row(
         Modifier.horizontalScroll(rememberScrollState()),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -511,7 +510,6 @@ private fun StaleAnchorChoiceSection(settings: Settings, controller: NodeControl
     ) {
         listOf(
             StaleAnchorChoice.ASK to "Ask me",
-            StaleAnchorChoice.ZK_PROOF to "ZK proof",
             StaleAnchorChoice.CHECKPOINT to "Fresh checkpoint",
             StaleAnchorChoice.CONTINUE to "Continue anyway",
         ).forEach { (c, label) ->
@@ -527,32 +525,31 @@ private fun StaleAnchorChoiceSection(settings: Settings, controller: NodeControl
         }
     }
     SettingsNote(
-        "Ask me (default): a dialog offers the choices each time. ZK proof: continue from " +
-            "Colibri's verified proof of today's sync committee — when none is available, the " +
-            "dialog asks with the remaining choices. Fresh checkpoint: start over from the block " +
-            "every answering checkpoint-sync server names — if one differs, the dialog shows " +
-            "the outlier. Continue anyway: sync forward from the old anchor without asking " +
-            "(the long-range risk accepted every time). Applied by the node itself, also with " +
-            "the app in the background: at the next park, and to networks parked now. A " +
-            "remembered fetch that fails is retried every 10 minutes until you choose otherwise.",
+        "Ask me (default): a dialog offers the choices each time. Fresh checkpoint " +
+            "(recommended): start over from the block every answering checkpoint-sync server " +
+            "names — if one differs, nothing is applied and the dialog shows the outlier. " +
+            "Continue anyway: sync forward from the old anchor without asking (the long-range " +
+            "risk accepted every time). Applied by the node itself, also with the app in the " +
+            "background: at the next park, and to networks parked now. A remembered checkpoint " +
+            "that fails is retried every 10 minutes until you choose otherwise.",
     )
 }
 
 /**
  * The stale-anchor dialog — the interactive half of the weak-subjectivity gate. Shown
  * while a network is parked in STALE_ANCHOR (its sync anchor is older than the bound).
- * Three ways forward, each of which can be remembered and then applied automatically
- * at the next park ([StaleAnchorChoice], Settings → "When the sync anchor is too old"):
+ * Two ways forward, each of which can be remembered and then applied automatically at
+ * the next park ([StaleAnchorChoice], Settings → "When the sync anchor is too old"):
  *
- * - **Fetch ZK proof** — Colibri's verified proof of the current committee. When no proof
- *   is available the dialog asks again with the remaining two choices.
- * - **Fetch fresh checkpoint** — a finalized root every answering server names.
+ * - **Fetch fresh checkpoint** (recommended) — a finalized root every answering server
+ *   names: a NEW anchor from outside the chain, the only answer to the weak-subjectivity
+ *   problem itself.
  * - **Continue anyway** — sync forward from the stale anchor, the risk accepted.
  *
- * A remembered ZK proof or checkpoint runs as soon as the dialog opens; if it fails,
- * the remaining choices are offered (and may be remembered instead). A remembered
- * "continue" never shows the dialog (NodeScreen consents directly). The Java engine
- * has neither fetch, so it offers only "continue".
+ * A remembered checkpoint runs as soon as the dialog opens; if it is refused, the dialog
+ * stays with both choices (and the other may be remembered instead). A remembered
+ * "continue" never shows the dialog (NodeScreen consents directly). The Java engine has
+ * no fetch, so it offers only "continue".
  */
 @Composable
 private fun StaleAnchorDialog(
@@ -561,20 +558,15 @@ private fun StaleAnchorDialog(
     savedChoice: StaleAnchorChoice,
     onRemember: (StaleAnchorChoice) -> Unit,
     onContinue: () -> Unit,
-    // Both fetches block on a network round: run off the main thread, outcome shown in
-    // place. An applied result releases the park, which closes the dialog on its own.
-    onFetchZk: () -> FreshAnchorResult,
+    // Blocks on a network round: run off the main thread, outcome shown in place. An
+    // applied result releases the park, which closes the dialog on its own.
     onFetchFresh: () -> FreshAnchorResult,
     onDismiss: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
-    val fetchesOffered = s.engine != "java"
-    var busy by remember(network) { mutableStateOf<StaleAnchorChoice?>(null) }
+    val fetchOffered = s.engine != "java"
+    var busy by remember(network) { mutableStateOf(false) }
     var status by remember(network) { mutableStateOf<String?>(null) }
-    // Set once a ZK proof turned out unavailable for this park: the choice is then
-    // withdrawn and the dialog asks again with the remaining two.
-    var zkUnavailable by remember(network) { mutableStateOf(!fetchesOffered) }
-    var zkApplied by remember(network) { mutableStateOf(false) }
     var rememberChoice by remember(network) { mutableStateOf(false) }
 
     fun run(choice: StaleAnchorChoice, remembered: Boolean) {
@@ -583,27 +575,18 @@ private fun StaleAnchorDialog(
             onContinue()
             return
         }
-        busy = choice
+        busy = true
         status = null
         scope.launch {
-            val r = withContext(Dispatchers.Default) {
-                if (choice == StaleAnchorChoice.ZK_PROOF) onFetchZk() else onFetchFresh()
-            }
-            if (choice == StaleAnchorChoice.ZK_PROOF) {
-                if (r.applied) zkApplied = true else zkUnavailable = true
-            }
+            val r = withContext(Dispatchers.Default) { onFetchFresh() }
             status = r.message
-            busy = null
+            busy = false
         }
     }
 
     // A remembered fetch runs once, when the dialog opens for this park.
     LaunchedEffect(network) {
-        when (savedChoice) {
-            StaleAnchorChoice.ZK_PROOF -> if (fetchesOffered) run(StaleAnchorChoice.ZK_PROOF, false)
-            StaleAnchorChoice.CHECKPOINT -> if (fetchesOffered) run(StaleAnchorChoice.CHECKPOINT, false)
-            else -> {}
-        }
+        if (savedChoice == StaleAnchorChoice.CHECKPOINT && fetchOffered) run(StaleAnchorChoice.CHECKPOINT, false)
     }
 
     val agePeriods = (s.syncTargetPeriod - s.syncCurrentPeriod).coerceAtLeast(0)
@@ -612,11 +595,7 @@ private fun StaleAnchorDialog(
     // (Gnosis Chain and its testnet Chiado) ~11.4 h.
     val hoursPerPeriod = if (network == "gnosis" || network == "chiado") 11.4 else 27.3
     val ageDays = ((agePeriods * hoursPerPeriod) / 24.0).toInt()
-    val savedNote = when {
-        savedChoice == StaleAnchorChoice.ASK -> ""
-        busy == savedChoice -> "Applying your remembered choice…\n\n"
-        else -> ""
-    }
+    val savedNote = if (savedChoice == StaleAnchorChoice.CHECKPOINT && busy) "Applying your remembered choice…\n\n" else ""
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Sync anchor too old — ${network.replaceFirstChar { it.uppercase() }}") },
@@ -632,40 +611,19 @@ private fun StaleAnchorDialog(
                         "continuation that signature checks alone cannot tell from the real one. " +
                         "Syncing is paused until you choose:",
                 )
-                if (!zkUnavailable) {
+                if (fetchOffered) {
                     Text(
-                        "• ZK proof — fetch a zero-knowledge proof (Colibri) of today's sync " +
-                            "committee and continue from it. Trusts Colibri's proof chain and " +
-                            "its anchor, not the old one.",
-                    )
-                }
-                if (fetchesOffered) {
-                    Text(
-                        "• Fresh checkpoint — start over from the block the chain finalized most " +
-                            "recently, only if every checkpoint-sync server that answers names " +
-                            "the same one (at least two operators). If even one differs, nothing " +
-                            "is applied and the outlier is named.",
+                        "• Fresh checkpoint (recommended) — start over from the block the chain " +
+                            "finalized most recently, only if every checkpoint-sync server that " +
+                            "answers names the same one (at least two operators). If even one " +
+                            "differs, nothing is applied and the outlier is named.",
                     )
                 }
                 Text(
                     "• Continue anyway — sync forward from the old anchor and accept the risk.",
                 )
-                if (zkUnavailable && fetchesOffered && !zkApplied) {
-                    Text(
-                        "No ZK proof is available right now — choose one of the remaining options.",
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    // A proof can be minutes from publication (a new period) or one
-                    // prover hiccup away: the choice is withdrawn, not forbidden.
-                    TextButton(
-                        enabled = busy == null,
-                        onClick = { zkUnavailable = false; run(StaleAnchorChoice.ZK_PROOF, false) },
-                    ) { Text("Try the ZK proof again") }
-                }
                 status?.let { Text(it, fontWeight = FontWeight.SemiBold) }
-                if (busy != null) {
-                    Text(if (busy == StaleAnchorChoice.ZK_PROOF) "Fetching the ZK proof…" else "Asking checkpoint-sync servers…")
-                }
+                if (busy) Text("Asking checkpoint-sync servers…")
                 // The ROW is the toggleable (the box has no handler of its own), so
                 // the label ticks it too and a screen reader announces one checkbox.
                 Row(
@@ -683,19 +641,12 @@ private fun StaleAnchorDialog(
         },
         confirmButton = {
             Column(horizontalAlignment = Alignment.End) {
-                // Still offered after a proof was handed over: the loop drops it when no
-                // peer serves a matching finality update before the period ends.
-                if (!zkUnavailable) {
-                    TextButton(enabled = busy == null, onClick = { run(StaleAnchorChoice.ZK_PROOF, rememberChoice) }) {
-                        Text(if (zkApplied) "Fetch ZK proof again" else "Fetch ZK proof")
-                    }
-                }
-                if (fetchesOffered) {
-                    TextButton(enabled = busy == null, onClick = { run(StaleAnchorChoice.CHECKPOINT, rememberChoice) }) {
+                if (fetchOffered) {
+                    TextButton(enabled = !busy, onClick = { run(StaleAnchorChoice.CHECKPOINT, rememberChoice) }) {
                         Text("Fetch fresh checkpoint")
                     }
                 }
-                TextButton(enabled = busy == null, onClick = { run(StaleAnchorChoice.CONTINUE, rememberChoice) }) {
+                TextButton(enabled = !busy, onClick = { run(StaleAnchorChoice.CONTINUE, rememberChoice) }) {
                     Text("Continue anyway (accept risk)")
                 }
             }

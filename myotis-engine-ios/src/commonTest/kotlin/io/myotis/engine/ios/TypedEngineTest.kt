@@ -67,7 +67,6 @@ class TypedEngineTest {
         var anchorRefreshJson = """{"applied":false,"error":"not parked at a stale anchor"}"""
         override fun refreshAnchorFromCheckpointz(handle: Long) = anchorRefreshJson
         override fun setStaleAnchorPolicy(handle: Long, policy: Int) = true
-        override fun fetchZkProofForStaleAnchor(handle: Long) = """{"applied":false,"error":"not parked at a stale anchor"}"""
         override fun statusJson(handle: Long) = status
         var metering = 0
         override fun setNetworkMetering(code: Int): Boolean {

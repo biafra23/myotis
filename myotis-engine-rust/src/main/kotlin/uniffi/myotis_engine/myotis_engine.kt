@@ -710,8 +710,6 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_myotis_engine_checksum_func_fee_history_json(
     ): Int
-    external fun uniffi_myotis_engine_checksum_func_fetch_zk_proof_for_stale_anchor(
-    ): Int
     external fun uniffi_myotis_engine_checksum_func_get_block_by_hash_json(
     ): Int
     external fun uniffi_myotis_engine_checksum_func_get_block_by_number_json(
@@ -838,8 +836,6 @@ internal object UniffiLib {
     external fun uniffi_myotis_engine_fn_func_fee_estimate_json(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_fee_history_json(`handle`: Long,`blockCount`: Long,`newestBlockTag`: RustBuffer.ByValue,`percentilesJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_myotis_engine_fn_func_fetch_zk_proof_for_stale_anchor(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_get_block_by_hash_json(`handle`: Long,`blockHashHex`: RustBuffer.ByValue,`fullTransactions`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1093,9 +1089,6 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_myotis_engine_checksum_func_fee_history_json() and 0xFFFF) != 17955) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if ((lib.uniffi_myotis_engine_checksum_func_fetch_zk_proof_for_stale_anchor() and 0xFFFF) != 32480) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
     if ((lib.uniffi_myotis_engine_checksum_func_get_block_by_hash_json() and 0xFFFF) != 52442) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1183,7 +1176,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_myotis_engine_checksum_func_set_served_block_window() and 0xFFFF) != 15483) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if ((lib.uniffi_myotis_engine_checksum_func_set_stale_anchor_policy() and 0xFFFF) != 12025) {
+    if ((lib.uniffi_myotis_engine_checksum_func_set_stale_anchor_policy() and 0xFFFF) != 43543) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_set_tor_enabled() and 0xFFFF) != 54390) {
@@ -1801,23 +1794,6 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     
 
         /**
-         * Resolve a STALE_ANCHOR park with Colibri's ZK proof of the current period's
-         * committee, on the user's request. Blocking (HTTPS); JSON
-         * `{"applied":true,"period"}` or `{"applied":false,"error"}` (see
-         * `host::fetch_zk_proof_for_stale_anchor`).
-         */ fun `fetchZkProofForStaleAnchor`(`handle`: kotlin.Long): kotlin.String {
-            return FfiConverterString.lift(
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_myotis_engine_fn_func_fetch_zk_proof_for_stale_anchor(
-    
-        
-        FfiConverterLong.lower(`handle`),_status)
-}
-    )
-    }
-    
-
-        /**
          * Verified `eth_getBlockByHash` (hashes this engine has already verified).
          */ fun `getBlockByHashJson`(`handle`: kotlin.Long, `blockHashHex`: kotlin.String, `fullTransactions`: kotlin.Boolean): kotlin.String {
             return FfiConverterString.lift(
@@ -2311,7 +2287,7 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
 
         /**
          * The remembered answer to a STALE_ANCHOR park, applied by the sync loop even
-         * with no UI open: 0 ask, 1 ZK proof, 2 fresh checkpoint, 3 continue anyway.
+         * with no UI open: 0 ask, 1 fresh checkpoint, 2 continue anyway.
          * False for an unknown handle or code.
          */ fun `setStaleAnchorPolicy`(`handle`: kotlin.Long, `policy`: kotlin.Int): kotlin.Boolean {
             return FfiConverterBoolean.lift(

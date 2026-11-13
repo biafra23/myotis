@@ -43,6 +43,5 @@ pub mod reqresp;
 pub mod status;
 pub mod sync;
 pub mod traffic;
-pub mod zksync;
 
 pub use sync::{ChainConfig, SyncHandle, SyncState, SyncStatus};

@@ -903,18 +903,6 @@ public final class NodeService extends Service {
         }
     }
 
-    /** The stale-anchor dialog's "Fetch ZK proof": leave {@code network}'s STALE_ANCHOR
-     *  park from Colibri's verified proof of the current committee. Blocking (network
-     *  round) — the handle is read under the lock, the call runs outside it. */
-    public io.myotis.api.ZkRelease fetchZkProofForStaleAnchor(String network) {
-        ChainHandle h;
-        synchronized (handles) {
-            h = handles.get(network);
-        }
-        if (h == null) return io.myotis.api.ZkRelease.refused(network + " is not running");
-        return h.fetchZkProofForStaleAnchor();
-    }
-
     /** The stale-anchor dialog's "Fetch fresh checkpoint": re-anchor {@code network}'s
      *  STALE_ANCHOR park on a checkpoint every answering checkpoint-sync server names.
      *  Blocking (network round) — the handle is read under the lock, the call runs outside it. */

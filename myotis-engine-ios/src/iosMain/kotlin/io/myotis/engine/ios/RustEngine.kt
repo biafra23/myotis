@@ -44,7 +44,6 @@ import io.myotis.engine.capi.myotis_request_account_json
 import io.myotis.engine.capi.myotis_resolve_block_hash_json
 import io.myotis.engine.capi.myotis_resume
 import io.myotis.engine.capi.myotis_accept_stale_anchor
-import io.myotis.engine.capi.myotis_fetch_zk_proof_for_stale_anchor
 import io.myotis.engine.capi.myotis_refresh_anchor_from_checkpointz
 import io.myotis.engine.capi.myotis_set_network_metering
 import io.myotis.engine.capi.myotis_set_stale_anchor_policy
@@ -168,18 +167,10 @@ object RustEngine {
         return myotis_accept_stale_anchor(handle)
     }
 
-    /** The remembered stale-anchor answer (ABI >= 59): 0 ask, 1 ZK proof, 2 checkpoint, 3 continue. */
+    /** The remembered stale-anchor answer (ABI >= 58): 0 ask, 1 checkpoint, 2 continue. */
     fun setStaleAnchorPolicy(handle: Long, policy: Int): Boolean {
         requireAbi()
         return myotis_set_stale_anchor_policy(handle, policy)
-    }
-
-    /** Leave a STALE_ANCHOR park from Colibri's verified ZK proof of the current
-     *  committee (ABI >= 58). Blocking — never call from the main thread. */
-    fun fetchZkProofForStaleAnchor(handle: Long): String {
-        requireAbi()
-        return take(myotis_fetch_zk_proof_for_stale_anchor(handle))
-            ?: """{"applied":false,"error":"native failure"}"""
     }
 
     /** Re-anchor a STALE_ANCHOR park on a fresh checkpoint every answering

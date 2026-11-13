@@ -489,17 +489,6 @@ internal object EngineDecoding {
         }
     }
 
-    /** `{"applied":true,"period"}` or `{"applied":false,"error"}`. */
-    fun zkRelease(payload: String?): ZkRelease {
-        val o = parseObject(payload, "ZK release")
-        val applied = (o["applied"] as? JsonPrimitive)?.booleanOrNull ?: false
-        if (!applied) {
-            val why = (o["error"] as? JsonPrimitive)?.takeIf { it.isString }?.content ?: "refused"
-            return ZkRelease(false, 0, why)
-        }
-        return fields("ZK release") { ZkRelease(true, o.requiredLong("period"), null) }
-    }
-
     // ---- the envelope ----
 
     private fun parse(payload: String?, what: String): JsonElement {

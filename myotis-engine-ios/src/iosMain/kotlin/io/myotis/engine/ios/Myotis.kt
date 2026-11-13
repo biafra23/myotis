@@ -39,7 +39,6 @@ internal object RustNativeEngine : NativeEngine {
     override fun setWsBoundPeriods(handle: Long, periods: Long) = RustEngine.setWsBoundPeriods(handle, periods)
     override fun acceptStaleAnchor(handle: Long) = RustEngine.acceptStaleAnchor(handle)
     override fun refreshAnchorFromCheckpointz(handle: Long) = RustEngine.refreshAnchorFromCheckpointz(handle)
-    override fun fetchZkProofForStaleAnchor(handle: Long) = RustEngine.fetchZkProofForStaleAnchor(handle)
     override fun setStaleAnchorPolicy(handle: Long, policy: Int) = RustEngine.setStaleAnchorPolicy(handle, policy)
     override fun statusJson(handle: Long) = RustEngine.statusJson(handle)
     override fun setNetworkMetering(code: Int) = RustEngine.setNetworkMetering(code)

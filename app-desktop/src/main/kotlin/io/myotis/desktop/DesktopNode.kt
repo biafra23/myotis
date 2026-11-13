@@ -288,13 +288,6 @@ class DesktopNodeController(
 
     private fun stalePolicyOf(c: io.myotis.ui.StaleAnchorChoice) = io.myotis.api.StaleAnchorPolicy.valueOf(c.name)
 
-    override fun fetchZkProofForStaleAnchor(network: String): io.myotis.ui.FreshAnchorResult {
-        val handle = engine.get(network)
-            ?: return io.myotis.ui.FreshAnchorResult(false, "No ZK proof: $network is not running.")
-        val r = handle.fetchZkProofForStaleAnchor()
-        return io.myotis.ui.FreshAnchorResult.ofZk(r.applied(), r.period(), r.error())
-    }
-
     override fun refreshAnchorFromCheckpointz(network: String): io.myotis.ui.FreshAnchorResult {
         val handle = engine.get(network)
             ?: return io.myotis.ui.FreshAnchorResult(false, "No fresh checkpoint: $network is not running.")

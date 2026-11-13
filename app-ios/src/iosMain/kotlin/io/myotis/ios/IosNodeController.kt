@@ -410,19 +410,6 @@ class IosNodeController(
     }
 
     // Blocking (one HTTPS round); the dialog calls it off the main thread.
-    override fun fetchZkProofForStaleAnchor(network: String): io.myotis.ui.FreshAnchorResult {
-        val net = canonical(network)
-        val handle = locked { handles[net] }
-            ?: return io.myotis.ui.FreshAnchorResult(false, "No ZK proof: $network is not running.")
-        val o = runCatching { engineJson.parseToJsonElement(RustEngine.fetchZkProofForStaleAnchor(handle)).jsonObject }
-            .getOrElse { return io.myotis.ui.FreshAnchorResult(false, "No ZK proof: malformed engine reply.") }
-        val applied = (o["applied"] as? JsonPrimitive)?.booleanOrNull == true
-        val period = (o["period"] as? JsonPrimitive)?.longOrNull ?: 0L
-        val error = (o["error"] as? JsonPrimitive)?.content
-        return io.myotis.ui.FreshAnchorResult.ofZk(applied, period, error)
-    }
-
-    // Blocking (one HTTPS round); the dialog calls it off the main thread.
     override fun refreshAnchorFromCheckpointz(network: String): io.myotis.ui.FreshAnchorResult {
         val net = canonical(network)
         val handle = locked { handles[net] }

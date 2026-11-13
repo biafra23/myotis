@@ -49,9 +49,9 @@ alloy-rlp = "=0.3.16"
 # same features — no new download.
 hickory-resolver = { version = "=0.25.2", default-features = false, features = ["system-config", "tokio"] }
 snap = "=1.1.1"
-# HTTPS for the two non-p2p sources the engine reads (src/https.rs): Colibri's
-# ZK sync proofs (self-verifying — src/zksync.rs) and the checkpointz finalized
-# roots a host may ask for at a STALE_ANCHOR park (src/checkpointz.rs). rustls
+# HTTPS for the one non-p2p source the engine reads (src/https.rs): the
+# checkpointz finalized roots a user may ask for at a STALE_ANCHOR park
+# (src/checkpointz.rs). rustls
 # with ring is already in every target's tree through libp2p-quic, at exactly
 # these features; webpki-roots (Mozilla's root store, data only) is the one new
 # crate. On Android it is ALSO the rustls tor-rtcompat links:

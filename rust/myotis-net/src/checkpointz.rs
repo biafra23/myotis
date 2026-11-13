@@ -1,5 +1,5 @@
 //! A fresh trust anchor from checkpoint-sync servers — the recovery a host may
-//! offer at a `STALE_ANCHOR` park, next to "Sync anyway" (docs/how-it-works/zk-sync.md,
+//! offer at a `STALE_ANCHOR` park, next to "Sync anyway" (docs/how-it-works/stale-anchor.md,
 //! *Fresh checkpoint*).
 //!
 //! What Colibri does when it has no state is the same idea in its simplest
@@ -28,6 +28,23 @@ use crate::https;
 
 /// Distinct operators that must name the same finalized root.
 pub const MIN_AGREEING_OPERATORS: usize = 2;
+
+/// Whether a fetch may run with nobody looking (a remembered choice applied by
+/// the sync loop): never while Tor routing is on. The fetch resolves every
+/// server through the system resolver and names it in clear SNI, the same
+/// disclosure of "this node runs network X" that #539 keeps the EIP-1459 DNS
+/// walk from making under Tor (`el::dnsdisco::allowed`). An explicit click is
+/// the user accepting that; an unattended fetch is not.
+pub fn unattended_allowed() -> bool {
+    #[cfg(feature = "tor")]
+    {
+        !crate::el::tor::is_enabled()
+    }
+    #[cfg(not(feature = "tor"))]
+    {
+        true
+    }
+}
 
 const FETCH_DEADLINE: Duration = Duration::from_secs(15);
 const MAX_BODY: usize = 16 * 1024;

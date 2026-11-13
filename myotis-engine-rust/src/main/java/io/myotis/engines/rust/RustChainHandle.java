@@ -865,24 +865,6 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         return ok;
     }
 
-    @Override
-    public io.myotis.api.ZkRelease fetchZkProofForStaleAnchor() {
-        return parseZkRelease(RustEngineNative.nativeFetchZkProofForStaleAnchor(handle));
-    }
-
-    /** The engine's {@code fetch_zk_proof_for_stale_anchor} JSON as the API record. */
-    static io.myotis.api.ZkRelease parseZkRelease(String json) {
-        try {
-            JsonObject o = Json.parse(json).asObject();
-            if (!o.getBoolean("applied", false)) {
-                return io.myotis.api.ZkRelease.refused(o.getString("error", "refused"));
-            }
-            return new io.myotis.api.ZkRelease(true, o.getLong("period", 0), null);
-        } catch (RuntimeException e) {
-            return io.myotis.api.ZkRelease.refused("malformed engine answer: " + e.getMessage());
-        }
-    }
-
     /** The engine's {@code refresh_anchor_from_checkpointz} JSON as the API record. */
     static io.myotis.api.AnchorRefresh parseAnchorRefresh(String json) {
         try {

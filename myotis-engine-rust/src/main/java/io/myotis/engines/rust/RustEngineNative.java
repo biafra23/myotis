@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 59; // 59: set_stale_anchor_policy; 58: fetch_zk_proof_for_stale_anchor; 57: refresh_anchor_from_checkpointz (ZK sync + checkpointz recovery); 56: log-index allowMetered + meteredHold (metered-download hold); 55: simulate_v1_json (#716); 54: debug_trace_call_json (#716); 53: get_raw_transaction_by_hash_json + get_raw_transaction_by_block_json (#715); 52: account and call JSON carry the proven blockHash; 51: set_activity_watch + address_activity_json (#691); 50: dataUsage + networkMetering in the status, set_network_metering; 49: ens offchain envelope carries reverseClaim; 48: log-index topic entries (#673); 47: resolve_block_hash_json, get_proof_json takes a block hash; 46: get_proof_json; 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
+    static final int EXPECTED_ABI_VERSION = 58; // 58: set_stale_anchor_policy; 57: refresh_anchor_from_checkpointz (checkpointz recovery); 56: log-index allowMetered + meteredHold (metered-download hold); 55: simulate_v1_json (#716); 54: debug_trace_call_json (#716); 53: get_raw_transaction_by_hash_json + get_raw_transaction_by_block_json (#715); 52: account and call JSON carry the proven blockHash; 51: set_activity_watch + address_activity_json (#691); 50: dataUsage + networkMetering in the status, set_network_metering; 49: ens offchain envelope carries reverseClaim; 48: log-index topic entries (#673); 47: resolve_block_hash_json, get_proof_json takes a block hash; 46: get_proof_json; 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
 
     private static final boolean AVAILABLE = load();
 
@@ -284,18 +284,9 @@ final class RustEngineNative {
         return Myotis_engineKt.refreshAnchorFromCheckpointz(handle);
     }
 
-    /**
-     * Resolve a STALE_ANCHOR park with a verified ZK proof of the current
-     * committee. Blocking (HTTPS). JSON {@code {"applied":true,"period"}} or
-     * {@code {"applied":false,"error"}}.
-     */
-    /** The remembered stale-anchor answer (0 ask, 1 ZK proof, 2 checkpoint, 3 continue). */
+    /** The remembered stale-anchor answer (0 ask, 1 checkpoint, 2 continue). */
     static boolean nativeSetStaleAnchorPolicy(long handle, int policy) {
         return Myotis_engineKt.setStaleAnchorPolicy(handle, policy);
-    }
-
-    static String nativeFetchZkProofForStaleAnchor(long handle) {
-        return Myotis_engineKt.fetchZkProofForStaleAnchor(handle);
     }
 
     /** Up to {@code max} buffered engine tracing lines (oldest first, newline-joined). */

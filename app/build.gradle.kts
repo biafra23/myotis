@@ -105,13 +105,13 @@ tasks.register<JavaExec>("run") {
     // sites, none — every browser page refused; wallet apps and curl are unaffected.
     (project.findProperty("webAccess") as? String)?.takeIf { it.isNotBlank() }
         ?.let { systemProperty("myotis.rpc.webAccess", it) }
-    // -PstaleAnchorPolicy=ask|zk_proof|checkpoint|continue → -Dmyotis.beacon.staleAnchorPolicy:
-    // what the engine does by itself at a STALE_ANCHOR park (docs/how-it-works/zk-sync.md).
+    // -PstaleAnchorPolicy=ask|checkpoint|continue → -Dmyotis.beacon.staleAnchorPolicy:
+    // what the engine does by itself at a STALE_ANCHOR park (docs/how-it-works/stale-anchor.md).
     // Validated here so a typo fails the run instead of silently parking.
     (project.findProperty("staleAnchorPolicy") as? String)?.takeIf { it.isNotBlank() }?.let { raw ->
         val v = raw.trim().uppercase()
-        if (v !in listOf("ASK", "ZK_PROOF", "CHECKPOINT", "CONTINUE")) {
-            throw GradleException("-PstaleAnchorPolicy must be ask, zk_proof, checkpoint or continue (got '$raw')")
+        if (v !in listOf("ASK", "CHECKPOINT", "CONTINUE")) {
+            throw GradleException("-PstaleAnchorPolicy must be ask, checkpoint or continue (got '$raw')")
         }
         systemProperty("myotis.beacon.staleAnchorPolicy", v)
     }

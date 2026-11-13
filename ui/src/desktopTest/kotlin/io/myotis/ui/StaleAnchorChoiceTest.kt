@@ -11,9 +11,8 @@ import org.junit.Rule
 import org.junit.Test
 
 /**
- * The stale-anchor dialog's three answers (ZK proof, fresh checkpoint, continue), the
- * "remember my choice" box, the re-ask without ZK when no proof is available, and a
- * remembered choice applied at the next park.
+ * The stale-anchor dialog's two answers (fresh checkpoint, continue), the "remember my
+ * choice" box, and a remembered choice applied at the next park.
  */
 class StaleAnchorChoiceTest {
 
@@ -27,37 +26,21 @@ class StaleAnchorChoiceTest {
 
     private class Parked(
         private val s: NodeSnapshot,
-        private val zk: FreshAnchorResult = FreshAnchorResult(false, "No ZK proof available: HTTP 404."),
         private val checkpoint: FreshAnchorResult = FreshAnchorResult(false, "No fresh checkpoint: REFUSED."),
     ) : FakeController() {
         val calls = mutableListOf<String>()
         override val running: Boolean = true
         override fun snapshots(): Flow<Map<String, NodeSnapshot>> = flowOf(mapOf("mainnet" to s))
         override fun acceptStaleAnchor(network: String) { calls += "continue:$network" }
-        override fun fetchZkProofForStaleAnchor(network: String): FreshAnchorResult { calls += "zk:$network"; return zk }
         override fun refreshAnchorFromCheckpointz(network: String): FreshAnchorResult { calls += "checkpoint:$network"; return checkpoint }
     }
 
     @Test
-    fun allThreeChoicesAreOffered() {
+    fun bothChoicesAreOffered() {
         rule.setContent { NodeScreen(controller = Parked(parked), settings = FakeSettings(), logs = NoLogs) }
-        rule.onNodeWithText("Fetch ZK proof").assertIsDisplayed()
         rule.onNodeWithText("Fetch fresh checkpoint").assertIsDisplayed()
         rule.onNodeWithText("Continue anyway (accept risk)").assertIsDisplayed()
         rule.onNodeWithText("Remember my choice and apply it automatically next time").assertIsDisplayed()
-    }
-
-    @Test
-    fun noZkProofAsksAgainWithTheRemainingChoices() {
-        val c = Parked(parked)
-        rule.setContent { NodeScreen(controller = c, settings = FakeSettings(), logs = NoLogs) }
-        rule.onNodeWithText("Fetch ZK proof").performClick()
-        rule.waitUntil(5_000) { c.calls.contains("zk:mainnet") }
-        rule.waitForIdle()
-        rule.onNodeWithText("Fetch ZK proof").assertDoesNotExist()
-        rule.onNodeWithText("No ZK proof is available right now — choose one of the remaining options.").assertIsDisplayed()
-        rule.onNodeWithText("Fetch fresh checkpoint").assertIsDisplayed()
-        rule.onNodeWithText("Continue anyway (accept risk)").assertIsDisplayed()
     }
 
     @Test
@@ -81,40 +64,19 @@ class StaleAnchorChoiceTest {
     }
 
     @Test
-    fun aRememberedZkProofRunsAtOnceAndFallsBackToTheRemainingChoices() {
-        val settings = FakeSettings().apply { staleChoice = StaleAnchorChoice.ZK_PROOF }
+    fun aRememberedCheckpointRunsAtOnceAndARefusalLeavesBothChoices() {
+        val settings = FakeSettings().apply { staleChoice = StaleAnchorChoice.CHECKPOINT }
         val c = Parked(parked)
         rule.setContent { NodeScreen(controller = c, settings = settings, logs = NoLogs) }
-        rule.waitUntil(5_000) { c.calls.contains("zk:mainnet") }
+        rule.waitUntil(5_000) { c.calls.contains("checkpoint:mainnet") }
         rule.waitForIdle()
-        rule.onNodeWithText("Fetch ZK proof").assertDoesNotExist()
+        rule.onNodeWithText("No fresh checkpoint: REFUSED.").assertIsDisplayed()
         rule.onNodeWithText("Fetch fresh checkpoint").assertIsDisplayed()
-        // Remembering the fallback replaces the remembered ZK proof.
+        // Remembering the other choice replaces the remembered checkpoint.
         rule.onNodeWithText("Remember my choice and apply it automatically next time").performClick()
         rule.onNodeWithText("Continue anyway (accept risk)").performClick()
         assertEquals(StaleAnchorChoice.CONTINUE, settings.staleChoice)
         assert(c.calls.contains("continue:mainnet"))
-    }
-
-    @Test
-    fun anUnavailableZkProofCanBeTriedAgain() {
-        val c = Parked(parked)
-        rule.setContent { NodeScreen(controller = c, settings = FakeSettings(), logs = NoLogs) }
-        rule.onNodeWithText("Fetch ZK proof").performClick()
-        rule.waitUntil(5_000) { c.calls.count { it == "zk:mainnet" } == 1 }
-        rule.waitForIdle()
-        rule.onNodeWithText("Try the ZK proof again").performClick()
-        rule.waitUntil(5_000) { c.calls.count { it == "zk:mainnet" } == 2 }
-    }
-
-    @Test
-    fun aProofHandedOverCanStillBeFetchedAgain() {
-        val c = Parked(parked, zk = FreshAnchorResult(true, "ZK proof of the committee of period 1419 verified."))
-        rule.setContent { NodeScreen(controller = c, settings = FakeSettings(), logs = NoLogs) }
-        rule.onNodeWithText("Fetch ZK proof").performClick()
-        rule.waitUntil(5_000) { c.calls.contains("zk:mainnet") }
-        rule.waitForIdle()
-        rule.onNodeWithText("Fetch ZK proof again").assertIsDisplayed()
     }
 
     @Test
@@ -132,7 +94,6 @@ class StaleAnchorChoiceTest {
     @Test
     fun theJavaEngineOffersOnlyContinue() {
         rule.setContent { NodeScreen(controller = Parked(parked.copy(engine = "java")), settings = FakeSettings(), logs = NoLogs) }
-        rule.onNodeWithText("Fetch ZK proof").assertDoesNotExist()
         rule.onNodeWithText("Fetch fresh checkpoint").assertDoesNotExist()
         rule.onNodeWithText("Continue anyway (accept risk)").assertIsDisplayed()
     }

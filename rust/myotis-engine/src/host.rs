@@ -485,10 +485,6 @@ pub fn create_with_checkpoint(
     }
     config.checkpoint_root = root;
     config.checkpoint_slot = checkpoint_slot;
-    // The caller chose its trust root: the store must descend from it. A ZK
-    // start would initialize from Colibri's proof chain instead and never
-    // request this root (#761 review) — accepted and not applied.
-    config.zk_sync = None;
     register(engine, config)
 }
 
@@ -1497,7 +1493,7 @@ pub fn set_ws_bound_periods(handle: i64, periods: i64) -> bool {
 }
 
 /// `nativeSetStaleAnchorPolicy`: the user's remembered answer to a STALE_ANCHOR
-/// park — 0 ask (default), 1 ZK proof, 2 fresh checkpoint, 3 continue anyway —
+/// park — 0 ask (default), 1 fresh checkpoint, 2 continue anyway —
 /// applied by the sync loop itself at every park, so it works with no UI open
 /// (`myotis_net::sync::StalePolicy`). Same shared-`WsPolicy` reach as the bound
 /// setter: live on a running or parked loop, kept across pause/resume, settable
@@ -1549,7 +1545,7 @@ pub fn accept_stale_anchor(handle: i64) -> bool {
 /// `nativeRefreshAnchorFromCheckpointz`: the third answer to a STALE_ANCHOR
 /// park, next to "raise the bound" and "sync anyway" — fetch a fresh finalized
 /// checkpoint from the network's checkpoint-sync servers and re-anchor on it
-/// (docs/how-it-works/zk-sync.md, *Fresh checkpoint*). Blocking (one HTTPS
+/// (docs/how-it-works/stale-anchor.md, *Fresh checkpoint*). Blocking (one HTTPS
 /// round to every server, ≤ ~15 s); call it off the UI thread.
 ///
 /// Applied only when the handle is RUNNING and PARKED in STALE_ANCHOR, and
@@ -1590,51 +1586,6 @@ pub fn refresh_anchor_from_checkpointz(handle: i64) -> String {
     tracing::warn!(handle, slot = fresh.slot, operators = ?fresh.operators,
         "fresh anchor from checkpointz agreement handed to the parked sync loop");
     anchor_refresh_json(&fresh)
-}
-
-/// `nativeFetchZkProofForStaleAnchor`: the third answer to a STALE_ANCHOR park
-/// (docs/how-it-works/zk-sync.md, *At a stale-anchor park*): the user asks for
-/// Colibri's ZK proof of the CURRENT period's committee instead of walking from
-/// the stale anchor or replacing it with a checkpoint. Blocking (one HTTPS
-/// round, ≤ ~20 s per prover); call it off the UI thread.
-///
-/// The proof is fetched and fully verified here, so `applied: false` means no
-/// usable proof exists right now — the host then offers the remaining choices.
-/// `applied: true` hands the verified committee to the parked loop, which
-/// initializes a fresh store from it and the first finality update that
-/// committee signed (retrying while peers are short), and leaves the park.
-/// Runs on the user's explicit request even with Tor routing on, like the
-/// checkpointz round. Refused when the network has no proof source this run
-/// (chiado, `MYOTIS_ZK_SYNC=0`, a caller-supplied root). JSON:
-/// `{"applied":true,"period":n}` or `{"applied":false,"error":"…"}`.
-pub fn fetch_zk_proof_for_stale_anchor(handle: i64) -> String {
-    let refuse = |why: &str| format!("{{\"applied\":false,\"error\":{}}}", json_string(why));
-    let Some(engine) = engine() else { return refuse("engine unavailable") };
-    let config = match parked_config(engine, handle) {
-        Ok(c) => c,
-        Err(why) => return refuse(why),
-    };
-    let Some(zk) = config.zk_sync.clone() else {
-        return refuse("no ZK proof source for this network on this run");
-    };
-    let period = config.wall_clock_period();
-    let proven = match engine.rt.block_on(myotis_net::zksync::fetch_proven_committee(&config, &zk, period)) {
-        Ok(p) => p,
-        Err(e) => return refuse(&format!("no ZK proof available for period {period}: {e}")),
-    };
-    match config.ws_policy.zk_release.lock() {
-        Ok(mut q) => *q = Some(proven),
-        Err(_) => return refuse("engine unavailable"),
-    }
-    if parked_config(engine, handle).is_err() {
-        if let Ok(mut q) = config.ws_policy.zk_release.lock() {
-            *q = None;
-        }
-        return refuse("the stale-anchor park ended while the proof was fetched");
-    }
-    tracing::warn!(handle, period,
-        "user-requested ZK proof verified and handed to the parked sync loop");
-    format!("{{\"applied\":true,\"period\":{period}}}")
 }
 
 /// The config of a RUNNING handle parked in STALE_ANCHOR, or why not.
@@ -5311,14 +5262,6 @@ mod tests {
             }
         );
         assert_eq!(json_string("a\"b\\c\n"), r#""a\"b\\c\u000a""#);
-        assert_eq!(
-            fetch_zk_proof_for_stale_anchor(987_654_321),
-            if engine().is_some() {
-                r#"{"applied":false,"error":"unknown handle"}"#
-            } else {
-                r#"{"applied":false,"error":"engine unavailable"}"#
-            }
-        );
     }
 
     #[test]

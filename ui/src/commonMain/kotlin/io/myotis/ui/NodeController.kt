@@ -80,15 +80,6 @@ interface NodeController {
         FreshAnchorResult(applied = false, message = "Not available with this engine.")
 
     /**
-     * The stale-anchor dialog's "Fetch ZK proof" action: fetch and verify Colibri's ZK
-     * proof of [network]'s current sync committee and leave the park from it. BLOCKING —
-     * call it off the main thread. Not applied means no usable proof is available now:
-     * the dialog then offers the remaining choices. The default refuses.
-     */
-    fun fetchZkProofForStaleAnchor(network: String): FreshAnchorResult =
-        FreshAnchorResult(applied = false, message = "No ZK proof: not available with this engine.")
-
-    /**
      * Hand the remembered stale-anchor choice ([Settings.staleAnchorChoice], persisted by
      * the caller first) to every running network's engine, which then applies it at each
      * park ITSELF — with no UI open, as in a background service. Hosts also apply the
@@ -838,18 +829,6 @@ data class FreshAnchorResult(val applied: Boolean, val message: String) {
             } else {
                 FreshAnchorResult(false, "No fresh checkpoint: ${error ?: "refused"}.")
             }
-
-        /** The one wording every host shows for the engine contract's `ZkRelease` fields. */
-        fun ofZk(applied: Boolean, period: Long, error: String?): FreshAnchorResult =
-            if (applied) {
-                FreshAnchorResult(
-                    true,
-                    "ZK proof of the committee of period $period verified. Leaving the park as " +
-                        "soon as a peer serves a finality update that committee signed…",
-                )
-            } else {
-                FreshAnchorResult(false, "No ZK proof available: ${error ?: "refused"}.")
-            }
     }
 }
 
@@ -860,8 +839,6 @@ data class FreshAnchorResult(val applied: Boolean, val message: String) {
 enum class StaleAnchorChoice {
     /** Show the dialog every time (the default). */
     ASK,
-    /** Leave the park from Colibri's verified ZK proof of the current committee. */
-    ZK_PROOF,
     /** Re-anchor on a finalized checkpoint every answering checkpoint-sync server names. */
     CHECKPOINT,
     /** Sync forward from the stale anchor anyway (the long-range risk accepted). */

@@ -800,14 +800,12 @@ that produced this note.
   leaves out of its tree; it does not surface a withheld or altered one, so
   the wallet's displayed balance rests on the publisher. Scope and limits: the
   carve-out under *Data sources*.
-- **Two more, on the owner's request (2026-11-10), Rust engine (its persisted
-  store is the snapshot the Java engine also resumes):** a sync
-  committee proven by Colibri's ZK proof chain, which is cryptographically
-  verified but anchored at Colibri's pinned anchor committee rather than the
-  embedded checkpoint; and, only on the user's explicit request at a
-  `STALE_ANCHOR` park, a fresh checkpoint that every answering
-  checkpoint-sync server names (at least two independent operators). Scope and limits: the carve-out under
-  *Data sources*.
+- **One more, on the owner's request (2026-11-10), Rust engine (its persisted
+  store is the snapshot the Java engine also resumes):** only at a
+  `STALE_ANCHOR` park and only on the user's request (explicit, or a choice
+  the user told the app to remember), a fresh checkpoint that every answering
+  checkpoint-sync server names (at least two independent operators). Scope and
+  limits: the carve-out under *Data sources*.
 - **A parameter that can change the answer must be APPLIED or REFUSED — never
   accepted and silently ignored.** A well-formed result computed against
   something other than what the caller asked for is indistinguishable from a
@@ -872,39 +870,20 @@ that produced this note.
     does this rule let this repo's own tooling GENERATE a seed from a node
     over JSON-RPC — that stays open, and the RAILGUN PoC's seed stays DEBUG /
     DEMO (docs/guides/railgun-poc.md).
-- **Carve-out for ZK sync and fresh checkpoints (owner's request,
-  2026-11-10; docs/how-it-works/zk-sync.md).** The Rust engine reads two
-  HTTPS sources beside its peers, through its one HTTP client
-  (`rust/myotis-net/src/https.rs`: pinned URLs, no redirects, Mozilla roots):
-  - **Colibri's ZK sync proofs** (`<net>.colibri-proof.tech`, used with the
-    Colibri team's permission). They are self-verifying: the SP1 program, the
-    Groth16 key, the anchor committee, the period, the committee root and the
-    signing domain are all pinned or recomputed locally, so a server can
-    withhold a proof but never forge one, and every failure falls back to the
-    light-client update walk. The trade is the anchor. The proof chain starts
-    at Colibri's anchor committee, which is older than the weak-subjectivity
-    bound, so a long-range forgery signed by an old committee's exited keys is
-    exposure the walk from the embedded checkpoint does not have. ZK sync runs
-    only past the WS gate on Myotis's own anchor, but that gate is a staleness
-    check, not a bound: on this path the embedded checkpoint root is not
-    applied at all. The roots of trust become `zk::anchors::*`, the SP1 Groth16
-    key (with `VK_ROOT` and the selector) and `PROGRAM_VKEY_HASH` (taken from
-    Colibri v0.1.2; no reproducible build from source is recorded). A Colibri
-    program rotation moves the pins in a reviewed release, never at runtime.
-    It does not run automatically under Tor (#539's DNS rule), nor for a
-    caller-supplied or checkpointz root (the chosen root must be applied). At a
-    `STALE_ANCHOR` park it is also an explicit user choice ("Fetch ZK proof",
-    `fetchZkProofForStaleAnchor`), next to the checkpointz fetch and continuing
-    anyway; the explicit fetches run even under Tor, and any of the three may be
-    remembered and is then applied by the engine itself, also headless — a
-    remembered fetch never unattended under Tor (owner's request, 2026-11-11).
-    `MYOTIS_ZK_SYNC=0` turns it off for a process whose environment someone
-    controls, but it does not undo a store already persisted from a proof, and
-    that snapshot is the file the Java engine also resumes. The cold-start
-    release checks always turn it off (they test the walk).
-  - **Checkpointz finalized roots**, ONLY on the user's explicit request at a
-    `STALE_ANCHOR` park (`refreshAnchorFromCheckpointz`). Never automatic, and
-    never applied to a store that is not parked. The root is accepted only when
+- **Carve-out for fresh checkpoints at a stale anchor (owner's request,
+  2026-11-10; docs/how-it-works/stale-anchor.md).** The Rust engine reads one
+  HTTPS source beside its peers, through its one HTTP client
+  (`rust/myotis-net/src/https.rs`: pinned URLs, no redirects, Mozilla roots).
+  (Colibri's ZK proofs of the committee chain were in an earlier revision of
+  #761 and removed before merging, owner's decision 2026-11-13: they attest the
+  walk from Colibri's pinned anchor committee, older than the weak-subjectivity
+  bound, so they add no answer to a stale anchor — the doc's last section.)
+  - **Checkpointz finalized roots**, ONLY at a `STALE_ANCHOR` park and ONLY
+    on the user's request: the explicit "Fetch fresh checkpoint"
+    (`refreshAnchorFromCheckpointz`), or that choice remembered by the user and
+    then applied by the engine itself at each park, also headless, but never
+    unattended under Tor (owner's request, 2026-11-11). Never otherwise
+    automatic, and never applied to a store that is not parked. The root is accepted only when
     the vote is UNANIMOUS: every server that answers names the same finalized
     epoch and root, spanning at least 2 operators (registrable domains). One
     differing answer (another root or epoch, an `execution_optimistic` or
@@ -912,10 +891,10 @@ that produced this note.
     never outvoted (owner's ruling, #761, 2026-11-11). It is their word, as the
     embedded anchor is the release's, and the host must say so.
 
-  Neither changes the **transport** of the wallet's reads: account, storage and
-  call data still come only from devp2p peers. But every one of them is
-  verified against the store these sources initialize, so for the root of
-  trust they do count.
+  It does not change the **transport** of the wallet's reads: account, storage
+  and call data still come only from devp2p peers. But every one of them is
+  verified against the store this source initializes, so for the root of
+  trust it does count.
 - **TrueBlocks Unchained Index mainnet publishing appears stalled.** The designated
   publisher (`publisher.unchainedindex.eth`) last published a mainnet manifest indexed
   to ~block 23.0M (mid-2025); as of mid-2026 that is ~a year behind the head, and the

@@ -156,7 +156,7 @@ pub fn accept_stale_anchor(handle: i64) -> bool {
 }
 
 /// The remembered answer to a STALE_ANCHOR park, applied by the sync loop even
-/// with no UI open: 0 ask, 1 ZK proof, 2 fresh checkpoint, 3 continue anyway.
+/// with no UI open: 0 ask, 1 fresh checkpoint, 2 continue anyway.
 /// False for an unknown handle or code.
 #[uniffi::export]
 pub fn set_stale_anchor_policy(handle: i64, policy: i32) -> bool {
@@ -170,15 +170,6 @@ pub fn set_stale_anchor_policy(handle: i64, policy: i32) -> bool {
 #[uniffi::export]
 pub fn refresh_anchor_from_checkpointz(handle: i64) -> String {
     crate::host::refresh_anchor_from_checkpointz(handle)
-}
-
-/// Resolve a STALE_ANCHOR park with Colibri's ZK proof of the current period's
-/// committee, on the user's request. Blocking (HTTPS); JSON
-/// `{"applied":true,"period"}` or `{"applied":false,"error"}` (see
-/// `host::fetch_zk_proof_for_stale_anchor`).
-#[uniffi::export]
-pub fn fetch_zk_proof_for_stale_anchor(handle: i64) -> String {
-    crate::host::fetch_zk_proof_for_stale_anchor(handle)
 }
 
 /// Live-set the eth/69 served-block window (the Settings knob). Clamped to

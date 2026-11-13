@@ -8,8 +8,6 @@ package io.myotis.api;
 public enum StaleAnchorPolicy {
     /** Wait for the user (the default). */
     ASK,
-    /** Fetch the ZK proof of the current committee and leave the park from it. */
-    ZK_PROOF,
     /** Re-anchor on a checkpoint every answering checkpoint-sync server names. */
     CHECKPOINT,
     /** Sync forward from the stale anchor (consent given in advance). */

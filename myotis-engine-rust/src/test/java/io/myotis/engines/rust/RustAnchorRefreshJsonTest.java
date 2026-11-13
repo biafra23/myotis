@@ -37,24 +37,12 @@ class RustAnchorRefreshJsonTest {
         assertTrue(r.operators().isEmpty());
     }
 
-    @Test
-    void zkReleaseDecodes() {
-        io.myotis.api.ZkRelease r = RustChainHandle.parseZkRelease("{\"applied\":true,\"period\":1907}");
-        assertTrue(r.applied());
-        assertEquals(1907L, r.period());
-        assertNull(r.error());
-        io.myotis.api.ZkRelease no = RustChainHandle.parseZkRelease("{\"applied\":false,\"error\":\"unknown handle\"}");
-        assertFalse(no.applied());
-        assertEquals("unknown handle", no.error());
-    }
-
     /** The ordinals ARE the engine's codes (myotis-net `StalePolicy`): pinned. */
     @Test
     void stalePolicyOrdinalsAreTheEngineCodes() {
         assertEquals(0, io.myotis.api.StaleAnchorPolicy.ASK.ordinal());
-        assertEquals(1, io.myotis.api.StaleAnchorPolicy.ZK_PROOF.ordinal());
-        assertEquals(2, io.myotis.api.StaleAnchorPolicy.CHECKPOINT.ordinal());
-        assertEquals(3, io.myotis.api.StaleAnchorPolicy.CONTINUE.ordinal());
+        assertEquals(1, io.myotis.api.StaleAnchorPolicy.CHECKPOINT.ordinal());
+        assertEquals(2, io.myotis.api.StaleAnchorPolicy.CONTINUE.ordinal());
     }
 
     @Test
