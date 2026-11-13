@@ -1,7 +1,7 @@
 # Pull requests and code review
 
 > Moved verbatim from `CLAUDE.md` (the always-loaded core keeps a summary and points here).
-> "The multi-PR rule above" / *Multi-PR plans land through a feature branch* mean `multi-pr-plans.md`.
+> "The multi-PR rule above" / *Multi-PR plans land through a feature branch* mean `multi-pr-plans.md`. "This file" means `CLAUDE.md` together with the `docs/agent/` files.
 
 ## Pull requests and code review
 

@@ -5,6 +5,8 @@ Guidance for Claude Code (claude.ai/code) in this repository.
 **This file is the always-loaded core.** Each section is a summary; the full,
 binding text lives in `docs/agent/`. When a task matches a row below, **read
 that file in full BEFORE acting** — a summary here never overrides the full text.
+A rule is changed or added in its `docs/agent/` file AND in its summary here,
+in the same commit; an edit to only one of the two is incomplete.
 
 | Before you…                                                                 | Read in full                      |
 |---|---|
@@ -171,7 +173,9 @@ never a bare `gh release upload`.
 ## Pull requests and code review
 
 Full text, including the fork-PR policy and the `gh api` reply mechanics:
-`docs/agent/pull-requests.md`.
+`docs/agent/pull-requests.md`. These rules are for the **PR author**; a
+reviewer agent follows `.github/claude-review-prompt.md` and none of the
+mechanics below.
 
 - Every PR description ends with its session links, never with the
   "🤖 Generated with Claude Code" footer. Commit messages keep `Co-Authored-By`.
@@ -181,7 +185,9 @@ Full text, including the fork-PR policy and the `gh api` reply mechanics:
   *Accepted* (what changed, which commit), *Disputed* (with evidence), or
   *Deferred* (who decides).
 - Do not mark a thread resolved yourself.
-- Fix review comments on the PR's own branch, never through a separate PR.
+- Fix review comments on the PR's own branch, never through a separate PR
+  (one exception, on a feature branch: a bug in code `main` also carries is
+  fixed by its own PR into `main`).
 - Drive CI to green, or state the blocker explicitly.
 - **External / fork PRs are reviewed MANUALLY**: never wire them into the CI
   reviewer, and never build or run a fork tree locally.
