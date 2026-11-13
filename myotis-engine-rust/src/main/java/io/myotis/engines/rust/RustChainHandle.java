@@ -854,8 +854,8 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
     }
 
     @Override
-    public io.myotis.api.AnchorRefresh refreshAnchorFromCheckpointz() {
-        return parseAnchorRefresh(RustEngineNative.nativeRefreshAnchorFromCheckpointz(handle));
+    public io.myotis.api.AnchorRefresh refreshAnchorFromCheckpointz(boolean allowUnconfirmed) {
+        return parseAnchorRefresh(RustEngineNative.nativeRefreshAnchorFromCheckpointz(handle, allowUnconfirmed));
     }
 
     @Override
@@ -865,20 +865,26 @@ final class RustChainHandle implements ChainHandle, NodeStatusReads, io.myotis.a
         return ok;
     }
 
+    private static List<String> strings(JsonValue arr) {
+        List<String> out = new java.util.ArrayList<>();
+        if (arr != null && arr.isArray()) {
+            for (JsonValue v : arr.asArray()) out.add(v.asString());
+        }
+        return out;
+    }
+
     /** The engine's {@code refresh_anchor_from_checkpointz} JSON as the API record. */
     static io.myotis.api.AnchorRefresh parseAnchorRefresh(String json) {
         try {
             JsonObject o = Json.parse(json).asObject();
+            boolean unconfirmed = o.getBoolean("unconfirmed", false);
             if (!o.getBoolean("applied", false)) {
-                return io.myotis.api.AnchorRefresh.refused(o.getString("error", "refused"));
-            }
-            List<String> ops = new java.util.ArrayList<>();
-            JsonValue arr = o.get("operators");
-            if (arr != null && arr.isArray()) {
-                for (JsonValue v : arr.asArray()) ops.add(v.asString());
+                return new io.myotis.api.AnchorRefresh(false, null, 0, 0, List.of(), List.of(),
+                        unconfirmed, o.getString("error", "refused"));
             }
             return new io.myotis.api.AnchorRefresh(true, o.getString("root", null),
-                    o.getLong("slot", 0), o.getLong("epoch", 0), ops, null);
+                    o.getLong("slot", 0), o.getLong("epoch", 0), strings(o.get("operators")),
+                    strings(o.get("confirmedBy")), unconfirmed, null);
         } catch (RuntimeException e) {
             return io.myotis.api.AnchorRefresh.refused("malformed engine answer: " + e.getMessage());
         }

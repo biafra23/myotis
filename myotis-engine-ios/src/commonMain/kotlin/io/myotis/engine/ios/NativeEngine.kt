@@ -23,7 +23,7 @@ internal interface NativeEngine {
     fun setWsBoundPeriods(handle: Long, periods: Long): Boolean
     fun acceptStaleAnchor(handle: Long): Boolean
     /** `myotis_refresh_anchor_from_checkpointz` (ABI >= 58): blocking, JSON. */
-    fun refreshAnchorFromCheckpointz(handle: Long): String
+    fun refreshAnchorFromCheckpointz(handle: Long, allowUnconfirmed: Boolean): String
     /** `myotis_set_stale_anchor_policy` (ABI >= 59): 0 ask, 1 checkpoint, 2 continue. */
     fun setStaleAnchorPolicy(handle: Long, policy: Int): Boolean
     fun statusJson(handle: Long): String

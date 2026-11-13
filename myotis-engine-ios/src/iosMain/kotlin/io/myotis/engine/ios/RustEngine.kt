@@ -174,10 +174,12 @@ object RustEngine {
     }
 
     /** Re-anchor a STALE_ANCHOR park on a fresh checkpoint every answering
-     *  checkpoint-sync server names (ABI >= 58). Blocking — never call from the main thread. */
-    fun refreshAnchorFromCheckpointz(handle: Long): String {
+     *  checkpoint-sync server names and a long-known peer confirms (ABI >= 58);
+     *  [allowUnconfirmed] is the user's explicit "use it anyway". Blocking — never call
+     *  from the main thread. */
+    fun refreshAnchorFromCheckpointz(handle: Long, allowUnconfirmed: Boolean): String {
         requireAbi()
-        return take(myotis_refresh_anchor_from_checkpointz(handle))
+        return take(myotis_refresh_anchor_from_checkpointz(handle, allowUnconfirmed))
             ?: """{"applied":false,"error":"native failure"}"""
     }
 

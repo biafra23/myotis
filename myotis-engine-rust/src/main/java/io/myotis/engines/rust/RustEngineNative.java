@@ -276,12 +276,14 @@ final class RustEngineNative {
     }
 
     /**
-     * Recover a STALE_ANCHOR park from a checkpointz-agreed fresh checkpoint.
-     * Blocking (HTTPS). JSON {@code {"applied":true,"root","slot","epoch","operators"}}
-     * or {@code {"applied":false,"error"}}.
+     * Recover a STALE_ANCHOR park from a checkpointz-agreed fresh checkpoint that
+     * long-known peers confirm ({@code allowUnconfirmed}: the user's "use it
+     * anyway"). Blocking (HTTPS + peers). JSON {@code {"applied":true,"root",
+     * "slot","epoch","operators","confirmedBy","unconfirmed"}} or
+     * {@code {"applied":false,"error","unconfirmed"}}.
      */
-    static String nativeRefreshAnchorFromCheckpointz(long handle) {
-        return Myotis_engineKt.refreshAnchorFromCheckpointz(handle);
+    static String nativeRefreshAnchorFromCheckpointz(long handle, boolean allowUnconfirmed) {
+        return Myotis_engineKt.refreshAnchorFromCheckpointz(handle, allowUnconfirmed);
     }
 
     /** The remembered stale-anchor answer (0 ask, 1 checkpoint, 2 continue). */

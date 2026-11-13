@@ -409,19 +409,21 @@ class IosNodeController(
         locked { handles[net] }?.let { RustEngine.acceptStaleAnchor(it) }
     }
 
-    // Blocking (one HTTPS round); the dialog calls it off the main thread.
-    override fun refreshAnchorFromCheckpointz(network: String): io.myotis.ui.FreshAnchorResult {
+    // Blocking (HTTPS + long-known peers); the dialog calls it off the main thread.
+    override fun refreshAnchorFromCheckpointz(network: String, allowUnconfirmed: Boolean): io.myotis.ui.FreshAnchorResult {
         val net = canonical(network)
         val handle = locked { handles[net] }
             ?: return io.myotis.ui.FreshAnchorResult(false, "No fresh checkpoint: $network is not running.")
-        val o = runCatching { engineJson.parseToJsonElement(RustEngine.refreshAnchorFromCheckpointz(handle)).jsonObject }
-            .getOrElse { return io.myotis.ui.FreshAnchorResult(false, "No fresh checkpoint: malformed engine reply.") }
+        val o = runCatching {
+            engineJson.parseToJsonElement(RustEngine.refreshAnchorFromCheckpointz(handle, allowUnconfirmed)).jsonObject
+        }.getOrElse { return io.myotis.ui.FreshAnchorResult(false, "No fresh checkpoint: malformed engine reply.") }
         val applied = (o["applied"] as? JsonPrimitive)?.booleanOrNull == true
-        val operators = (o["operators"] as? kotlinx.serialization.json.JsonArray)
+        fun strings(key: String) = (o[key] as? kotlinx.serialization.json.JsonArray)
             ?.mapNotNull { (it as? JsonPrimitive)?.content } ?: emptyList()
         val slot = (o["slot"] as? JsonPrimitive)?.longOrNull ?: 0L
         val error = (o["error"] as? JsonPrimitive)?.content
-        return io.myotis.ui.FreshAnchorResult.of(applied, operators, slot, error)
+        val unconfirmed = (o["unconfirmed"] as? JsonPrimitive)?.booleanOrNull == true
+        return io.myotis.ui.FreshAnchorResult.of(applied, strings("operators"), slot, error, strings("confirmedBy"), unconfirmed)
     }
 
     // blst is compiled into the engine and the Rust engine is the only engine

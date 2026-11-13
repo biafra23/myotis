@@ -877,7 +877,7 @@ internal object UniffiLib {
     ): Long
     external fun uniffi_myotis_engine_fn_func_read_stats_json(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    external fun uniffi_myotis_engine_fn_func_refresh_anchor_from_checkpointz(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_myotis_engine_fn_func_refresh_anchor_from_checkpointz(`handle`: Long,`allowUnconfirmed`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_myotis_engine_fn_func_request_account_json(`handle`: Long,`address`: RustBuffer.ByValue,`block`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1147,7 +1147,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_myotis_engine_checksum_func_read_stats_json() and 0xFFFF) != 12379) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if ((lib.uniffi_myotis_engine_checksum_func_refresh_anchor_from_checkpointz() and 0xFFFF) != 46259) {
+    if ((lib.uniffi_myotis_engine_checksum_func_refresh_anchor_from_checkpointz() and 0xFFFF) != 47774) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_myotis_engine_checksum_func_request_account_json() and 0xFFFF) != 48343) {
@@ -2106,16 +2106,20 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
 
         /**
          * Recover a STALE_ANCHOR park from a fresh checkpoint every answering
-         * checkpoint-sync server names (two or more operators). Blocking (HTTPS); JSON
-         * `{"applied":true,"root","slot","epoch","operators"}` or
-         * `{"applied":false,"error"}` (see `host::refresh_anchor_from_checkpointz`).
-         */ fun `refreshAnchorFromCheckpointz`(`handle`: kotlin.Long): kotlin.String {
+         * checkpoint-sync server names (two or more operators), confirmed by a
+         * long-known peer; `allow_unconfirmed` is the user's explicit "use it anyway".
+         * Blocking (HTTPS + peers); JSON `{"applied":true,"root","slot","epoch",
+         * "operators","confirmedBy","unconfirmed"}` or
+         * `{"applied":false,"error","unconfirmed"}` (see
+         * `host::refresh_anchor_from_checkpointz`).
+         */ fun `refreshAnchorFromCheckpointz`(`handle`: kotlin.Long, `allowUnconfirmed`: kotlin.Boolean): kotlin.String {
             return FfiConverterString.lift(
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_myotis_engine_fn_func_refresh_anchor_from_checkpointz(
     
         
-        FfiConverterLong.lower(`handle`),_status)
+        FfiConverterLong.lower(`handle`),
+        FfiConverterBoolean.lower(`allowUnconfirmed`),_status)
 }
     )
     }

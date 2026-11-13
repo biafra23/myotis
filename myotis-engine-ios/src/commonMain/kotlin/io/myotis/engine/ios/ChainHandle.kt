@@ -114,10 +114,12 @@ class ChainHandle internal constructor(
     /** The other way out of [BeaconState.STALE_ANCHOR]: re-anchor on a fresh finalized
      *  checkpoint that every answering checkpoint-sync server names (at least two operators
      *  among them; one differing answer refuses, naming the outlier — the JVM contract's `refreshAnchorFromCheckpointz`). The root is those
-     *  operators' word — show [AnchorRefresh.operators] with it. Blocking (a network
-     *  round, up to ~15 s): never call it on the main thread. */
-    fun refreshAnchorFromCheckpointz(): AnchorRefresh =
-        EngineDecoding.anchorRefresh(native.refreshAnchorFromCheckpointz(handle))
+     *  operators' word — show [AnchorRefresh.operators] with it. A long-known peer must
+     *  confirm it too; without one it is refused as [AnchorRefresh.unconfirmed] unless
+     *  [allowUnconfirmed] — pass true only on the user's explicit "use it anyway".
+     *  Blocking (up to about a minute): never call it on the main thread. */
+    fun refreshAnchorFromCheckpointz(allowUnconfirmed: Boolean = false): AnchorRefresh =
+        EngineDecoding.anchorRefresh(native.refreshAnchorFromCheckpointz(handle, allowUnconfirmed))
 
     /** The user's remembered answer to a stale-anchor park, applied by the engine at every
      *  park, also with no UI open (the JVM contract's `setStaleAnchorPolicy`). Live; may be

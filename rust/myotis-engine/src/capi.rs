@@ -252,14 +252,16 @@ pub extern "C" fn myotis_accept_stale_anchor(handle: i64) -> bool {
 }
 
 /// Recover a STALE_ANCHOR park from a fresh checkpoint that checkpoint-sync
-/// servers agree on unanimously, two or more operators among them
-/// (`nativeRefreshAnchorFromCheckpointz` twin). Blocking — one HTTPS round, up
-/// to ~15 s; never call from the UI thread. JSON
-/// `{"applied":true,"root","slot","epoch","operators"}` or
-/// `{"applied":false,"error"}`; release with `myotis_string_free`.
+/// servers agree on unanimously, two or more operators among them, and that a
+/// long-known peer confirms (`nativeRefreshAnchorFromCheckpointz` twin).
+/// `allow_unconfirmed` applies it without that confirmation — only on the
+/// user's explicit "use it anyway". Blocking — up to ~1 min; never call from
+/// the UI thread. JSON `{"applied":true,"root","slot","epoch","operators",
+/// "confirmedBy","unconfirmed"}` or `{"applied":false,"error","unconfirmed"}`;
+/// release with `myotis_string_free`.
 #[no_mangle]
-pub extern "C" fn myotis_refresh_anchor_from_checkpointz(handle: i64) -> *mut c_char {
-    into_c(crate::host::refresh_anchor_from_checkpointz(handle))
+pub extern "C" fn myotis_refresh_anchor_from_checkpointz(handle: i64, allow_unconfirmed: bool) -> *mut c_char {
+    into_c(crate::host::refresh_anchor_from_checkpointz(handle, allow_unconfirmed))
 }
 
 /// The remembered answer to a STALE_ANCHOR park (`nativeSetStaleAnchorPolicy`

@@ -292,7 +292,7 @@ fun NodeScreen(
                         controller.acceptStaleAnchor(staleNet)
                         staleDismissed = staleDismissed + staleNet
                     },
-                    onFetchFresh = { controller.refreshAnchorFromCheckpointz(staleNet) },
+                    onFetchFresh = { anyway -> controller.refreshAnchorFromCheckpointz(staleNet, anyway) },
                     onDismiss = { staleDismissed = staleDismissed + staleNet },
                 )
             }
@@ -546,6 +546,11 @@ private fun StaleAnchorChoiceSection(settings: Settings, controller: NodeControl
  *   problem itself.
  * - **Continue anyway** — sync forward from the stale anchor, the risk accepted.
  *
+ * The checkpoint must also be confirmed by a long-known peer (pinned in the release, or
+ * known to this device for a week) — the eclipse guard. When none could be reached, the
+ * dialog warns and offers "Use it anyway", which is never remembered; when they answered
+ * and disagree, nothing is offered.
+ *
  * A remembered checkpoint runs as soon as the dialog opens; if it is refused, the dialog
  * stays with both choices (and the other may be remembered instead). A remembered
  * "continue" never shows the dialog (NodeScreen consents directly). The Java engine has
@@ -559,8 +564,9 @@ private fun StaleAnchorDialog(
     onRemember: (StaleAnchorChoice) -> Unit,
     onContinue: () -> Unit,
     // Blocks on a network round: run off the main thread, outcome shown in place. An
-    // applied result releases the park, which closes the dialog on its own.
-    onFetchFresh: () -> FreshAnchorResult,
+    // applied result releases the park, which closes the dialog on its own. The flag is
+    // the user's explicit "use it anyway" for a checkpoint no long-known peer confirmed.
+    onFetchFresh: (allowUnconfirmed: Boolean) -> FreshAnchorResult,
     onDismiss: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
@@ -568,8 +574,11 @@ private fun StaleAnchorDialog(
     var busy by remember(network) { mutableStateOf(false) }
     var status by remember(network) { mutableStateOf<String?>(null) }
     var rememberChoice by remember(network) { mutableStateOf(false) }
+    // Set when the servers agreed but no long-known peer confirmed: the eclipse warning
+    // and the explicit override are shown.
+    var unconfirmed by remember(network) { mutableStateOf(false) }
 
-    fun run(choice: StaleAnchorChoice, remembered: Boolean) {
+    fun run(choice: StaleAnchorChoice, remembered: Boolean, allowUnconfirmed: Boolean = false) {
         if (remembered) onRemember(choice)
         if (choice == StaleAnchorChoice.CONTINUE) {
             onContinue()
@@ -578,8 +587,9 @@ private fun StaleAnchorDialog(
         busy = true
         status = null
         scope.launch {
-            val r = withContext(Dispatchers.Default) { onFetchFresh() }
+            val r = withContext(Dispatchers.Default) { onFetchFresh(allowUnconfirmed) }
             status = r.message
+            unconfirmed = !r.applied && r.unconfirmed
             busy = false
         }
     }
@@ -615,15 +625,27 @@ private fun StaleAnchorDialog(
                     Text(
                         "• Fresh checkpoint (recommended) — start over from the block the chain " +
                             "finalized most recently, only if every checkpoint-sync server that " +
-                            "answers names the same one (at least two operators). If even one " +
-                            "differs, nothing is applied and the outlier is named.",
+                            "answers names the same one (at least two operators) and a long-known " +
+                            "peer (pinned in this release, or known to this device for a week) " +
+                            "confirms it. If even one differs, nothing is applied and the outlier " +
+                            "is named.",
                     )
                 }
                 Text(
                     "• Continue anyway — sync forward from the old anchor and accept the risk.",
                 )
                 status?.let { Text(it, fontWeight = FontWeight.SemiBold) }
-                if (busy) Text("Asking checkpoint-sync servers…")
+                if (unconfirmed && !busy) {
+                    Text(
+                        "Warning: no peer this node has long known could be reached to confirm " +
+                            "this checkpoint. If " +
+                            "your network connection is controlled by an attacker (an eclipse " +
+                            "attack), the servers and every peer you reach could be theirs. Use it " +
+                            "only if you trust this network connection.",
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+                if (busy) Text("Asking checkpoint-sync servers and long-known peers…")
                 // The ROW is the toggleable (the box has no handler of its own), so
                 // the label ticks it too and a screen reader announces one checkbox.
                 Row(
@@ -644,6 +666,12 @@ private fun StaleAnchorDialog(
                 if (fetchOffered) {
                     TextButton(enabled = !busy, onClick = { run(StaleAnchorChoice.CHECKPOINT, rememberChoice) }) {
                         Text("Fetch fresh checkpoint")
+                    }
+                }
+                // Never remembered: an unconfirmed checkpoint takes this click every time.
+                if (fetchOffered && unconfirmed) {
+                    TextButton(enabled = !busy, onClick = { run(StaleAnchorChoice.CHECKPOINT, false, allowUnconfirmed = true) }) {
+                        Text("Use it anyway (eclipse not ruled out)")
                     }
                 }
                 TextButton(enabled = !busy, onClick = { run(StaleAnchorChoice.CONTINUE, rememberChoice) }) {

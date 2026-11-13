@@ -1653,40 +1653,55 @@ pub fn accept_stale_anchor(handle: i64) -> bool {
     }
 }
 
-/// `nativeRefreshAnchorFromCheckpointz`: the third answer to a STALE_ANCHOR
-/// park, next to "raise the bound" and "sync anyway" — fetch a fresh finalized
-/// checkpoint from the network's checkpoint-sync servers and re-anchor on it
-/// (docs/how-it-works/stale-anchor.md, *Fresh checkpoint*). Blocking (one HTTPS
-/// round to every server, ≤ ~15 s); call it off the UI thread.
+/// `nativeRefreshAnchorFromCheckpointz`: the answer to a STALE_ANCHOR park
+/// that brings a NEW anchor — a fresh finalized checkpoint the network's
+/// checkpoint-sync servers name, confirmed by long-known peers
+/// (docs/how-it-works/stale-anchor.md, *Fresh checkpoint* and *Confirmed by
+/// long-known peers*). Blocking (one HTTPS round to every server, ≤ ~15 s,
+/// plus a Status from each long-known peer, ≤ 15 s, asked once more after
+/// 20 s when peers only sat at another epoch); call it off the UI thread.
 ///
-/// Applied only when the handle is RUNNING and PARKED in STALE_ANCHOR, and
-/// only when EVERY server that answers names the same finalized checkpoint,
-/// at least two independent operators among them (`myotis_net::checkpointz`):
-/// one differing or unusable answer refuses, and the error names the outlier. The root is those operators'
-/// word — the engine cannot verify an anchor — so the result names them for
-/// the host to show. A root whose own period is past the bound, or in the
-/// future, is refused. Returns JSON: `{"applied":true,"root":"0x…","slot":n,
-/// "epoch":n,"operators":["…"]}` or `{"applied":false,"error":"…"}`. The park
-/// takes it within a second; status then leaves STALE_ANCHOR for
-/// BOOTSTRAPPING.
-pub fn refresh_anchor_from_checkpointz(handle: i64) -> String {
-    let refuse = |why: &str| format!("{{\"applied\":false,\"error\":{}}}", json_string(why));
+/// Applied only when the handle is RUNNING and PARKED in STALE_ANCHOR, when
+/// EVERY server that answers names the same finalized checkpoint, at least two
+/// independent operators among them (`myotis_net::checkpointz`: one differing
+/// or unusable answer refuses and the error names the outlier), and when at
+/// least one LONG-KNOWN peer — pinned in this release, or in this device's
+/// peer cache for a week — names the same epoch and root in its Status
+/// (`myotis_net::known_peers`: one naming another root for that epoch is an
+/// ALARM and refuses, no override). With no confirming peer the answer is
+/// refused as `"unconfirmed":true` — an eclipse cannot be ruled out — unless
+/// `allow_unconfirmed`, the user's explicit "use it anyway". A root whose own
+/// period is past the bound, or in the future, is refused. Returns JSON:
+/// `{"applied":true,"root":"0x…","slot":n,"epoch":n,"operators":["…"],
+/// "confirmedBy":["…"],"unconfirmed":false}` or
+/// `{"applied":false,"error":"…","unconfirmed":bool}`. The park takes it
+/// within a second; status then leaves STALE_ANCHOR for BOOTSTRAPPING.
+pub fn refresh_anchor_from_checkpointz(handle: i64, allow_unconfirmed: bool) -> String {
+    let refuse = |why: &str| format!("{{\"applied\":false,\"error\":{},\"unconfirmed\":false}}", json_string(why));
     let Some(engine) = engine() else { return refuse("engine unavailable") };
-    let config = match parked_config(engine, handle) {
-        Ok(c) => c,
+    let (config, client, ours) = match parked_peers(engine, handle) {
+        Ok(p) => p,
         Err(why) => return refuse(why),
     };
-    let fresh = match engine.rt.block_on(myotis_net::checkpointz::fetch_checked(&config)) {
-        Ok(f) => f,
-        Err(e) => return refuse(&e),
+    let confirmed = match engine.rt.block_on(myotis_net::known_peers::fetch_confirmed(
+        &config, &client, &ours, allow_unconfirmed, true,
+    )) {
+        Ok(c) => c,
+        Err(r) => {
+            return format!(
+                "{{\"applied\":false,\"error\":{},\"unconfirmed\":{}}}",
+                json_string(&r.reason),
+                r.unconfirmed
+            )
+        }
     };
     match config.ws_policy.fresh_anchor.lock() {
-        Ok(mut slot) => *slot = Some((fresh.root, fresh.slot)),
+        Ok(mut slot) => *slot = Some((confirmed.fresh.root, confirmed.fresh.slot)),
         Err(_) => return refuse("engine unavailable"),
     }
-    // The park may have ended during the HTTPS round (consent, a raised bound):
-    // the loop then discards the anchor, so take it back and say so rather
-    // than report a re-anchor that will not happen. A park ending after this
+    // The park may have ended during the round (consent, a raised bound): the
+    // loop then discards the anchor, so take it back and say so rather than
+    // report a re-anchor that will not happen. A park ending after this
     // re-check is the loop's to discard, logged there.
     if parked_config(engine, handle).is_err() {
         if let Ok(mut slot) = config.ws_policy.fresh_anchor.lock() {
@@ -1694,9 +1709,27 @@ pub fn refresh_anchor_from_checkpointz(handle: i64) -> String {
         }
         return refuse("the stale-anchor park ended while the servers were asked");
     }
-    tracing::warn!(handle, slot = fresh.slot, operators = ?fresh.operators,
+    tracing::warn!(handle, slot = confirmed.fresh.slot, operators = ?confirmed.fresh.operators,
+        confirmed_by = ?confirmed.confirmed_by,
         "fresh anchor from checkpointz agreement handed to the parked sync loop");
-    anchor_refresh_json(&fresh)
+    anchor_refresh_json(&confirmed.fresh, &confirmed.confirmed_by)
+}
+
+/// The config, req/resp client and current Status of a RUNNING handle parked
+/// in STALE_ANCHOR — what the long-known-peer round speaks with — or why not.
+fn parked_peers(
+    engine: &EngineState,
+    handle: i64,
+) -> Result<(Arc<ChainConfig>, myotis_net::reqresp::ReqRespClient, myotis_net::status::StatusMessage), &'static str> {
+    let map = engine.handles.lock().map_err(|_| "engine unavailable")?;
+    match map.get(&handle) {
+        Some(ChainEntry::Running(c, sync, _)) if sync.status().state == SyncState::StaleAnchor => {
+            Ok((Arc::clone(c), sync.client(), sync.local_status()))
+        }
+        Some(ChainEntry::Running(..)) => Err("not parked at a stale anchor"),
+        Some(_) => Err("network is not running"),
+        None => Err("unknown handle"),
+    }
 }
 
 /// The config of a RUNNING handle parked in STALE_ANCHOR, or why not.
@@ -1713,14 +1746,17 @@ fn parked_config(engine: &EngineState, handle: i64) -> Result<Arc<ChainConfig>, 
 /// The applied shape of [`refresh_anchor_from_checkpointz`] — pinned by
 /// `anchor_refresh_json_shape` and decoded by the JVM (`RustChainHandle.parseAnchorRefresh`)
 /// and iOS (`EngineDecoding.anchorRefresh`) sides from the same literal.
-fn anchor_refresh_json(fresh: &myotis_net::checkpointz::FreshCheckpoint) -> String {
+fn anchor_refresh_json(fresh: &myotis_net::checkpointz::FreshCheckpoint, confirmed_by: &[String]) -> String {
     let ops: Vec<String> = fresh.operators.iter().map(|o| json_string(o)).collect();
+    let peers: Vec<String> = confirmed_by.iter().map(|p| json_string(p)).collect();
     format!(
-        "{{\"applied\":true,\"root\":\"0x{}\",\"slot\":{},\"epoch\":{},\"operators\":[{}]}}",
+        "{{\"applied\":true,\"root\":\"0x{}\",\"slot\":{},\"epoch\":{},\"operators\":[{}],\"confirmedBy\":[{}],\"unconfirmed\":{}}}",
         fresh.root.iter().map(|b| format!("{b:02x}")).collect::<String>(),
         fresh.slot,
         fresh.epoch,
-        ops.join(",")
+        ops.join(","),
+        peers.join(","),
+        confirmed_by.is_empty()
     )
 }
 
@@ -5386,16 +5422,18 @@ mod tests {
             operators: vec!["attestant.io".into(), "sigp.io".into()],
         };
         assert_eq!(
-            anchor_refresh_json(&fresh),
-            r#"{"applied":true,"root":"0x1111111111111111111111111111111111111111111111111111111111111111","slot":15626560,"epoch":488330,"operators":["attestant.io","sigp.io"]}"#
+            anchor_refresh_json(&fresh, &["pinned 12D3Ko…abcdef".to_string()]),
+            r#"{"applied":true,"root":"0x1111111111111111111111111111111111111111111111111111111111111111","slot":15626560,"epoch":488330,"operators":["attestant.io","sigp.io"],"confirmedBy":["pinned 12D3Ko…abcdef"],"unconfirmed":false}"#
         );
+        // Applied on the user's "use it anyway" with no confirming peer.
+        assert!(anchor_refresh_json(&fresh, &[]).ends_with(r#""confirmedBy":[],"unconfirmed":true}"#));
         // Refusals: an unknown handle is refused before any network I/O.
         assert_eq!(
-            refresh_anchor_from_checkpointz(987_654_321),
+            refresh_anchor_from_checkpointz(987_654_321, false),
             if engine().is_some() {
-                r#"{"applied":false,"error":"unknown handle"}"#
+                r#"{"applied":false,"error":"unknown handle","unconfirmed":false}"#
             } else {
-                r#"{"applied":false,"error":"engine unavailable"}"#
+                r#"{"applied":false,"error":"engine unavailable","unconfirmed":false}"#
             }
         );
         assert_eq!(json_string("a\"b\\c\n"), r#""a\"b\\c\u000a""#);

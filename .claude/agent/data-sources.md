@@ -103,7 +103,15 @@
     `execution_optimistic` or malformed answer) is an alarm: the fetch is
     refused and the outlier named, never outvoted (owner's ruling, #761,
     2026-11-11). It is their word, as the embedded anchor is the release's,
-    and the host must say so.
+    and the host must say so. It must ALSO be confirmed by at least one
+    LONG-KNOWN libp2p peer — pinned by peer ID in the release, or in this
+    device's CL peer cache for at least a week — naming the same epoch and root
+    in its Status (the eclipse guard; owner's ruling, #761, 2026-11-13). One
+    naming another root for that epoch, or long-known peers that answer but
+    never at the servers' epoch, refuse with no override. Only when no
+    long-known peer answered at all is it refused as UNCONFIRMED and flagged;
+    then only the user's explicit "use it anyway", every time, applies it —
+    never a remembered choice.
 
   It does not change the **transport** of the wallet's reads: account, storage
   and call data still come only from devp2p peers. But every one of them is

@@ -904,15 +904,16 @@ public final class NodeService extends Service {
     }
 
     /** The stale-anchor dialog's "Fetch fresh checkpoint": re-anchor {@code network}'s
-     *  STALE_ANCHOR park on a checkpoint every answering checkpoint-sync server names.
+     *  STALE_ANCHOR park on a checkpoint every answering checkpoint-sync server names and a
+     *  long-known peer confirms ({@code allowUnconfirmed}: the user's "use it anyway").
      *  Blocking (network round) — the handle is read under the lock, the call runs outside it. */
-    public io.myotis.api.AnchorRefresh refreshAnchorFromCheckpointz(String network) {
+    public io.myotis.api.AnchorRefresh refreshAnchorFromCheckpointz(String network, boolean allowUnconfirmed) {
         ChainHandle h;
         synchronized (handles) {
             h = handles.get(network);
         }
         if (h == null) return io.myotis.api.AnchorRefresh.refused(network + " is not running");
-        return h.refreshAnchorFromCheckpointz();
+        return h.refreshAnchorFromCheckpointz(allowUnconfirmed);
     }
 
     /** Currently live networks (a chip per entry), in display order. */

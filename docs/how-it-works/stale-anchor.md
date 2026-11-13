@@ -17,7 +17,7 @@ it in `STALE_ANCHOR` and the app asks the user what to do.
 
 | choice | what happens | engine call / daemon command |
 |---|---|---|
-| **Fetch fresh checkpoint** (recommended) | A finalized root every answering checkpoint-sync server names (below). The stale state is discarded and the node bootstraps from the new root. | `refreshAnchorFromCheckpointz()` / `myotis_refresh_anchor_from_checkpointz` / `refresh-anchor` |
+| **Fetch fresh checkpoint** (recommended) | A finalized root every answering checkpoint-sync server names and a long-known peer confirms (below). The stale state is discarded and the node bootstraps from the new root. | `refreshAnchorFromCheckpointz()` / `myotis_refresh_anchor_from_checkpointz` / `refresh-anchor` (`refresh-anchor-unconfirmed` for "use it anyway") |
 | **Continue anyway** | Sync forward from the stale anchor, the long-range risk accepted. | `acceptStaleAnchor()` / `accept-stale-anchor` |
 
 The fresh checkpoint is the one that addresses the problem: it is a new anchor
@@ -31,8 +31,10 @@ exactly what the bound exists to stop.
   Continue anyway). At the next park:
   - a remembered **continue** consents without showing the dialog;
   - a remembered **checkpoint** is fetched at once. If it is refused (the
-    servers do not all agree), the dialog stays with both choices, and the
-    other can be remembered in its place.
+    servers do not all agree, or no long-known peer confirms it), the dialog
+    stays with both choices, and the other can be remembered in its place. A
+    remembered checkpoint never applies an UNCONFIRMED one: "use it anyway" is
+    a click every time.
 - **Headless: the engine applies it.** The host hands the remembered choice to
   the engine (`ChainHandle.setStaleAnchorPolicy` / `myotis_set_stale_anchor_policy`)
   before each network starts and whenever it changes, and the sync loop applies
@@ -90,8 +92,53 @@ The parked loop then discards the stale state and bootstraps from the new root,
 exactly as from the embedded checkpoint: Merkle-pinned to the root, then
 BLS-verified forward. Its verified state is persisted, so a restart resumes it.
 
+### Confirmed by long-known peers (the eclipse guard)
+
+The servers are reached over HTTPS, and every libp2p peer this node meets
+during a park is whoever answers: an attacker who controls this device's
+network connection — an eclipse — can be all of them. What such an attacker
+cannot do is answer as a peer whose identity this node already knew. A libp2p
+peer ID is the hash of the node's public key, and the Noise handshake proves
+possession of that key, so a known ID can only be spoken for by its owner.
+
+So the checkpoint the servers agree on must also be confirmed by at least one
+**long-known peer** (`rust/myotis-net/src/known_peers.rs`; owner's ruling on
+#761, 2026-11-13):
+
+- **Who is long-known.** The light-client peers this release **pins** by peer
+  ID (reviewed, and known before the anchor was embedded; mainnet 5, Sepolia 2,
+  Gnosis 8, Chiado none — the compiled-in list, not a `MYOTIS_CL_STATIC_PEERS`
+  override), and the peers in this device's **CL peer cache** whose
+  ID it first saw **at least a week ago**. The cache records that time as an
+  `s<unix seconds>` token, kept by both engines; an entry written before the
+  token existed is stamped when first loaded, so it ages from the upgrade on.
+- **What is asked.** Each long-known peer's `Status` — asked fresh, right after
+  the servers answered — carries its finalized epoch and root. A peer naming
+  the **same epoch and root** confirms. A peer naming **another root for the
+  same epoch** is an **alarm**: the round is refused, the peer named, and there
+  is no override. A peer at another epoch (finality moved during the round, or
+  it lags) does not confirm; when that is all there is, the round is asked once
+  more after 20 seconds, and if the long-known peers that answered still name
+  other epochs, the checkpoint is **refused with no override**: the servers and
+  the peers this node trusts most disagree (an attacker answering the HTTPS
+  round can name an epoch the honest peers never reach).
+- **No long-known peer answered** — none known, none reachable — refuses the
+  checkpoint as **UNCONFIRMED** and the app flags it: *an eclipse attack cannot
+  be ruled out.* The user may still apply it with **"Use it
+  anyway (eclipse not ruled out)"** (`allowUnconfirmed`, the daemon's
+  `refresh-anchor-unconfirmed`) — an explicit choice each time, never
+  remembered, never applied by the engine on its own. A remembered checkpoint
+  asks the peers once per try (no 20-second re-ask, so the park is not held)
+  and tries again every 10 minutes. A fresh Chiado install
+  has no pins, so it is flagged until its cache has a week-old peer.
+- **What it does not cover.** A long-known peer that has itself been
+  compromised, or an attacker who has been answering as a light-client server
+  in this device's cache for over a week. The pins are the release's word, as
+  the embedded checkpoint is.
+
 **Trust.** This *is* a trust decision. No engine can verify an anchor, so the
-root is the agreeing operators' word. That is the same standing as the
+root is the agreeing operators' word, cross-checked against peers this node
+already knew. That is the same standing as the
 embedded checkpoint, which is the release's word, cross-checked the same way
 when it was refreshed. The dialog says so and names the operators. It is opt-in
 per park, or remembered by the user.

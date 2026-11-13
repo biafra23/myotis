@@ -288,11 +288,11 @@ class DesktopNodeController(
 
     private fun stalePolicyOf(c: io.myotis.ui.StaleAnchorChoice) = io.myotis.api.StaleAnchorPolicy.valueOf(c.name)
 
-    override fun refreshAnchorFromCheckpointz(network: String): io.myotis.ui.FreshAnchorResult {
+    override fun refreshAnchorFromCheckpointz(network: String, allowUnconfirmed: Boolean): io.myotis.ui.FreshAnchorResult {
         val handle = engine.get(network)
             ?: return io.myotis.ui.FreshAnchorResult(false, "No fresh checkpoint: $network is not running.")
-        val r = handle.refreshAnchorFromCheckpointz()
-        return io.myotis.ui.FreshAnchorResult.of(r.applied(), r.operators(), r.slot(), r.error())
+        val r = handle.refreshAnchorFromCheckpointz(allowUnconfirmed)
+        return io.myotis.ui.FreshAnchorResult.of(r.applied(), r.operators(), r.slot(), r.error(), r.confirmedBy(), r.unconfirmed())
     }
 
     override fun applyBlsBackend() {

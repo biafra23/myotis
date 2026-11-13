@@ -71,12 +71,15 @@ interface NodeController {
      * The stale-anchor dialog's "Fetch fresh checkpoint" action: ask [network]'s
      * checkpoint-sync servers for the chain's current finalized checkpoint and, when
      * every server that answers names the same one (two or more independent operators;
-     * one differing answer refuses and names the outlier), re-anchor the parked
-     * network on it (the stale anchor is discarded, not synced forward from). BLOCKING —
-     * one network round of up to ~15 s; call it off the main thread. The default
-     * refuses, so a host or engine without it shows why instead of doing nothing.
+     * one differing answer refuses and names the outlier) AND a long-known peer confirms
+     * it, re-anchor the parked network on it (the stale anchor is discarded, not synced
+     * forward from). With no confirming long-known peer the result is
+     * [FreshAnchorResult.unconfirmed] — the dialog flags it and offers "use it anyway",
+     * which calls this again with [allowUnconfirmed]. BLOCKING — up to about a minute;
+     * call it off the main thread. The default refuses, so a host or engine without it
+     * shows why instead of doing nothing.
      */
-    fun refreshAnchorFromCheckpointz(network: String): FreshAnchorResult =
+    fun refreshAnchorFromCheckpointz(network: String, allowUnconfirmed: Boolean = false): FreshAnchorResult =
         FreshAnchorResult(applied = false, message = "Not available with this engine.")
 
     /**
@@ -814,20 +817,34 @@ data class PeerRow(
 
 /**
  * The outcome of [NodeController.refreshAnchorFromCheckpointz], ready for the dialog:
- * [message] names the agreeing operators when [applied], the reason otherwise.
+ * [message] names the agreeing operators and confirming peers when [applied], the
+ * reason otherwise. [unconfirmed] when not applied: the servers agreed but no
+ * long-known peer confirmed — the dialog flags it and offers "use it anyway".
  */
-data class FreshAnchorResult(val applied: Boolean, val message: String) {
+data class FreshAnchorResult(val applied: Boolean, val message: String, val unconfirmed: Boolean = false) {
     companion object {
         /** The one wording every host shows, from the engine contract's `AnchorRefresh` fields. */
-        fun of(applied: Boolean, operators: List<String>, slot: Long, error: String?): FreshAnchorResult =
+        fun of(
+            applied: Boolean,
+            operators: List<String>,
+            slot: Long,
+            error: String?,
+            confirmedBy: List<String> = emptyList(),
+            unconfirmed: Boolean = false,
+        ): FreshAnchorResult =
             if (applied) {
                 FreshAnchorResult(
                     true,
                     "Re-anchored on the checkpoint at slot $slot that every answering server named — " +
-                        "${operators.size} independent operators (${operators.joinToString()}). Syncing from it…",
+                        "${operators.size} independent operators (${operators.joinToString()})" +
+                        (if (confirmedBy.isNotEmpty()) {
+                            ", confirmed by ${confirmedBy.size} long-known peer(s) (${confirmedBy.joinToString()})"
+                        } else {
+                            ", NOT confirmed by any long-known peer (applied at your request)"
+                        }) + ". Syncing from it…",
                 )
             } else {
-                FreshAnchorResult(false, "No fresh checkpoint: ${error ?: "refused"}.")
+                FreshAnchorResult(false, "No fresh checkpoint: ${error ?: "refused"}", unconfirmed)
             }
     }
 }

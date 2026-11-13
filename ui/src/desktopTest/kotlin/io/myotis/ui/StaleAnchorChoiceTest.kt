@@ -26,13 +26,16 @@ class StaleAnchorChoiceTest {
 
     private class Parked(
         private val s: NodeSnapshot,
-        private val checkpoint: FreshAnchorResult = FreshAnchorResult(false, "No fresh checkpoint: REFUSED."),
+        private val checkpoint: FreshAnchorResult = FreshAnchorResult(false, "No fresh checkpoint: REFUSED"),
     ) : FakeController() {
         val calls = mutableListOf<String>()
         override val running: Boolean = true
         override fun snapshots(): Flow<Map<String, NodeSnapshot>> = flowOf(mapOf("mainnet" to s))
         override fun acceptStaleAnchor(network: String) { calls += "continue:$network" }
-        override fun refreshAnchorFromCheckpointz(network: String): FreshAnchorResult { calls += "checkpoint:$network"; return checkpoint }
+        override fun refreshAnchorFromCheckpointz(network: String, allowUnconfirmed: Boolean): FreshAnchorResult {
+            calls += if (allowUnconfirmed) "anyway:$network" else "checkpoint:$network"
+            return if (allowUnconfirmed) FreshAnchorResult(true, "Re-anchored, NOT confirmed.") else checkpoint
+        }
     }
 
     @Test
@@ -70,13 +73,42 @@ class StaleAnchorChoiceTest {
         rule.setContent { NodeScreen(controller = c, settings = settings, logs = NoLogs) }
         rule.waitUntil(5_000) { c.calls.contains("checkpoint:mainnet") }
         rule.waitForIdle()
-        rule.onNodeWithText("No fresh checkpoint: REFUSED.").assertIsDisplayed()
+        rule.onNodeWithText("No fresh checkpoint: REFUSED").assertIsDisplayed()
         rule.onNodeWithText("Fetch fresh checkpoint").assertIsDisplayed()
         // Remembering the other choice replaces the remembered checkpoint.
         rule.onNodeWithText("Remember my choice and apply it automatically next time").performClick()
         rule.onNodeWithText("Continue anyway (accept risk)").performClick()
         assertEquals(StaleAnchorChoice.CONTINUE, settings.staleChoice)
         assert(c.calls.contains("continue:mainnet"))
+    }
+
+    @Test
+    fun anUnconfirmedCheckpointIsFlaggedAndCanBeUsedAnywayExplicitly() {
+        val settings = FakeSettings()
+        val c = Parked(
+            parked,
+            checkpoint = FreshAnchorResult(false, "No fresh checkpoint: UNCONFIRMED: …", unconfirmed = true),
+        )
+        rule.setContent { NodeScreen(controller = c, settings = settings, logs = NoLogs) }
+        rule.onNodeWithText("Use it anyway (eclipse not ruled out)").assertDoesNotExist()
+        rule.onNodeWithText("Remember my choice and apply it automatically next time").performClick()
+        rule.onNodeWithText("Fetch fresh checkpoint").performClick()
+        rule.waitUntil(5_000) { c.calls.contains("checkpoint:mainnet") }
+        rule.waitForIdle()
+        rule.onNodeWithText("Use it anyway (eclipse not ruled out)").assertIsDisplayed().performClick()
+        rule.waitUntil(5_000) { c.calls.contains("anyway:mainnet") }
+        // Remembered: the checkpoint choice — never the override.
+        assertEquals(StaleAnchorChoice.CHECKPOINT, settings.staleChoice)
+    }
+
+    @Test
+    fun aConfirmedRefusalOffersNoOverride() {
+        val c = Parked(parked)
+        rule.setContent { NodeScreen(controller = c, settings = FakeSettings(), logs = NoLogs) }
+        rule.onNodeWithText("Fetch fresh checkpoint").performClick()
+        rule.waitUntil(5_000) { c.calls.contains("checkpoint:mainnet") }
+        rule.waitForIdle()
+        rule.onNodeWithText("Use it anyway (eclipse not ruled out)").assertDoesNotExist()
     }
 
     @Test

@@ -141,11 +141,21 @@ public interface ChainHandle {
      * answer refuses, naming the outlier), and only while this stack is parked.
      * Unlike {@link #acceptStaleAnchor()} the stale anchor is discarded, not
      * walked forward from; the trust moves to the agreeing operators for the
-     * anchor itself (see {@link AnchorRefresh}). Blocking (network round, up to
-     * ~15 s): never call from a UI thread. An engine without it refuses.
+     * anchor itself (see {@link AnchorRefresh}). It must also be confirmed by at
+     * least one LONG-KNOWN peer (pinned in the release, or known to this device
+     * for a week); without one it is refused as {@link AnchorRefresh#unconfirmed()}
+     * — an eclipse cannot be ruled out — unless {@code allowUnconfirmed}, which a
+     * host passes only on the user's explicit "use it anyway". Blocking (network
+     * round, up to about a minute): never call from a UI thread. An engine
+     * without it refuses.
      */
-    default AnchorRefresh refreshAnchorFromCheckpointz() {
+    default AnchorRefresh refreshAnchorFromCheckpointz(boolean allowUnconfirmed) {
         return AnchorRefresh.refused("not supported by this engine");
+    }
+
+    /** {@link #refreshAnchorFromCheckpointz(boolean)} requiring long-known peer confirmation. */
+    default AnchorRefresh refreshAnchorFromCheckpointz() {
+        return refreshAnchorFromCheckpointz(false);
     }
 
     /**

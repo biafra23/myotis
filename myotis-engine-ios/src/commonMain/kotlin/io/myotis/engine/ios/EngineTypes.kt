@@ -67,8 +67,10 @@ enum class StaleAnchorPolicy { ASK, CHECKPOINT, CONTINUE }
 /**
  * The outcome of [ChainHandle.refreshAnchorFromCheckpointz], the JVM contract's
  * `AnchorRefresh`: when [applied], the parked network bootstraps from [root], a
- * finalized checkpoint every answering server names ([operators]); otherwise
- * [error] says why not, naming any outlier.
+ * finalized checkpoint every answering server names ([operators]) and long-known
+ * peers confirm ([confirmedBy]); otherwise [error] says why not, naming any
+ * outlier. [unconfirmed]: no long-known peer confirmed it — flag it (an eclipse
+ * cannot be ruled out); when applied, the user chose "use it anyway".
  */
 data class AnchorRefresh(
     val applied: Boolean,
@@ -76,6 +78,8 @@ data class AnchorRefresh(
     val slot: Long,
     val epoch: Long,
     val operators: List<String>,
+    val confirmedBy: List<String>,
+    val unconfirmed: Boolean,
     val error: String?,
 )
 

@@ -133,10 +133,10 @@ class AndroidNodeController(
     override fun applyWebAccess() { serviceProvider()?.applyWebAccess() }
     override fun acceptStaleAnchor(network: String) { serviceProvider()?.acceptStaleAnchor(network) }
     override fun applyStaleAnchorChoice(choice: io.myotis.ui.StaleAnchorChoice) { serviceProvider()?.applyStaleAnchorChoice() }
-    override fun refreshAnchorFromCheckpointz(network: String): io.myotis.ui.FreshAnchorResult {
-        val r = serviceProvider()?.refreshAnchorFromCheckpointz(network)
+    override fun refreshAnchorFromCheckpointz(network: String, allowUnconfirmed: Boolean): io.myotis.ui.FreshAnchorResult {
+        val r = serviceProvider()?.refreshAnchorFromCheckpointz(network, allowUnconfirmed)
             ?: return io.myotis.ui.FreshAnchorResult(false, "No fresh checkpoint: the node service is not running.")
-        return io.myotis.ui.FreshAnchorResult.of(r.applied(), r.operators(), r.slot(), r.error())
+        return io.myotis.ui.FreshAnchorResult.of(r.applied(), r.operators(), r.slot(), r.error(), r.confirmedBy(), r.unconfirmed())
     }
     override fun applyLogIndex(network: String) { serviceProvider()?.applyLogIndex(network) }
 

@@ -164,12 +164,15 @@ pub fn set_stale_anchor_policy(handle: i64, policy: i32) -> bool {
 }
 
 /// Recover a STALE_ANCHOR park from a fresh checkpoint every answering
-/// checkpoint-sync server names (two or more operators). Blocking (HTTPS); JSON
-/// `{"applied":true,"root","slot","epoch","operators"}` or
-/// `{"applied":false,"error"}` (see `host::refresh_anchor_from_checkpointz`).
+/// checkpoint-sync server names (two or more operators), confirmed by a
+/// long-known peer; `allow_unconfirmed` is the user's explicit "use it anyway".
+/// Blocking (HTTPS + peers); JSON `{"applied":true,"root","slot","epoch",
+/// "operators","confirmedBy","unconfirmed"}` or
+/// `{"applied":false,"error","unconfirmed"}` (see
+/// `host::refresh_anchor_from_checkpointz`).
 #[uniffi::export]
-pub fn refresh_anchor_from_checkpointz(handle: i64) -> String {
-    crate::host::refresh_anchor_from_checkpointz(handle)
+pub fn refresh_anchor_from_checkpointz(handle: i64, allow_unconfirmed: bool) -> String {
+    crate::host::refresh_anchor_from_checkpointz(handle, allow_unconfirmed)
 }
 
 /// Live-set the eth/69 served-block window (the Settings knob). Clamped to
