@@ -1050,6 +1050,10 @@ fun goVersionAtLeast(local: String, want: String): Boolean {
 val goLocalVersion = Regex("""go version (go\d+\.\d+(?:\.\d+)?)""").find(goVersion)
     ?.groupValues?.get(1) ?: ""
 val goVersionUsable = goVersionAtLeast(goLocalVersion, goModVersion)
+// Portable-blst CGO flags, ONE definition (the task's environment() and its
+// declared input must never disagree).
+val goCgoCflags = "-O2 -D__BLST_PORTABLE__"
+
 val goEngineLibName = when {
     isWindowsHost -> "myotis_engine_go.dll"
     System.getProperty("os.name").lowercase().contains("mac") -> "libmyotis_engine_go.dylib"
@@ -1076,14 +1080,16 @@ tasks.register<Exec>("goBuildCShared") {
     }
     workingDir = file("go")
     commandLine("go", "build", "-buildmode=c-shared", "-o", "build/$goEngineLibName", "./cmd/myotis-capi")
-    // Portable blst, like the Rust workspace builds it (#734 D3) and like
-    // go-engine.yml and the Go repro line already build (PR #832 review): the
-    // blst Go binding compiles ADX paths on amd64 and its load-time constructor
-    // answers SIGILL with _exit(128+11) — on a pre-Broadwell/pre-Zen CPU that
-    // would EXIT the JVM inside GoEngineNative's static initializer, past every
+    // Portable blst, like the Rust workspace builds it (#734 D3); go-engine.yml
+    // switched to it in the same PR that added it here (PR #832 review — it
+    // built bare before). The blst Go binding compiles ADX paths on amd64 and
+    // its load-time constructor answers SIGILL with _exit(128+4) = 132 (SIGILL
+    // is 4, not 11) — on a pre-Broadwell/pre-Zen CPU that would EXIT the JVM
+    // inside GoEngineNative's static initializer, past every
     // UnsatisfiedLinkError handler here. The binding's own README names this
-    // switch. Env vars are Exec inputs, so flipping it rebuilds.
-    environment("CGO_CFLAGS", "-O2 -D__BLST_PORTABLE__")
+    // switch. Exec.environment is @Internal to Gradle, so the value is ALSO
+    // declared as a task input below — editing it rebuilds.
+    environment("CGO_CFLAGS", goCgoCflags)
     // Same never-fetch discipline as the probe: the pinned toolchain is an
     // explicit host requirement (go/go.mod's `go` line), not a build-time
     // download hidden in a task.
@@ -1126,6 +1132,10 @@ tasks.register<Exec>("goBuildCShared") {
     // Toolchain identity is an input, as for cargoBuildHost: a go upgrade with
     // unchanged sources must rebuild.
     inputs.property("goVersion", goVersion)
+    // Exec.environment is @Internal — NOT a Gradle input — so the portable-blst
+    // flag would otherwise be invisible to the up-to-date check; declared as a
+    // property, editing it in this file rebuilds (PR #832 round-3 review).
+    inputs.property("cgoCflags", goCgoCflags)
     // c-shared emits an import library next to the DLL on Windows; declared so
     // the up-to-date check sees it (missing outputs are tolerated on the other
     // platforms and on a degraded build).
@@ -1133,11 +1143,15 @@ tasks.register<Exec>("goBuildCShared") {
         add(file("go/build/$goEngineLibName"))
         if (isWindowsHost) add(file("go/build/myotis_engine_go.lib"))
     })
-    // …but only UP-TO-DATE while the library actually EXISTS: declaring outputs
-    // Gradle never produced (first run on a cgo-less box) would otherwise mark
-    // the task UP-TO-DATE on later runs and never retry the build even once go
-    // or a C compiler shows up (PR #832 review).
-    outputs.upToDateWhen { file("go/build/$goEngineLibName").exists() }
+    // NO `outputs.upToDateWhen { lib.exists() }` (PR #832 round 2 added one to
+    // retry the build once a missing cgo toolchain shows up; round 3 removed
+    // it after measuring on the pinned Gradle): the predicate is only consulted
+    // when the inputs already look unchanged, so it never forced anything — an
+    // edited .go file rebuilt WITH it in place, and a deleted library rebuilt
+    // WITHOUT it (a missing declared output is out-of-date on its own). The
+    // inputs/outputs declarations above carry the whole policy; the
+    // `engineLibPresent` input property this measurement also tried was
+    // dropped for the same reason (a missing output already forces a rerun).
 }
 
 // Regenerate the UniFFI Kotlin bindings for the Rust engine into :myotis-engine-rust's

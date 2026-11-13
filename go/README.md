@@ -174,7 +174,10 @@ functional, every other export answers an honest refusal (permanent
 and `myotis_go_capabilities_json` answers the split at runtime.
 
 ```bash
-go build -buildmode=c-shared -o build/libmyotis_engine_go.so ./cmd/myotis-capi
+# CGO_CFLAGS as goBuildCShared and go-engine.yml set them (portable blst —
+# see the build note at the bottom of this document)
+CGO_CFLAGS="-O2 -D__BLST_PORTABLE__" \
+  go build -buildmode=c-shared -o build/libmyotis_engine_go.so ./cmd/myotis-capi
 scripts/check_capi_symbols.sh   # every header symbol must be exported (CI runs both)
 ```
 
@@ -206,7 +209,8 @@ The JVM side is the `:myotis-engine-go` Gradle module: `GoEngineNative`
 same ABI-57 handshake, `myotis_string_free` after every returned string),
 and `GoMyotisEngine`/`GoChainHandle`/`GoVerifiedReads` behind the
 `:myotis-api` contract. The selector routes it via `myotis.engine=go`
-(`-Pengine=go` on the daemon/desktop run tasks, the Settings toggle too) —
+(`-Pengine=go` on the daemon/desktop run tasks only — the Settings engine
+toggle is a java/rust switch and cannot select it) —
 `auto` never picks it: the Go engine is desktop-only and explicit until the
 engine-parity step (owner's brief, 2026-11). The library is built by the
 root `goBuildCShared` task (self-skips without the go toolchain) into
@@ -220,9 +224,14 @@ answered from finalized state — and the hosts' 45 s readiness dot
 therefore reads amber, because the read state really is finality-old;
 `eth_blockNumber` answers the FINALIZED block, not a head, while the
 engine has no optimistic anchor — an open owner decision, PR #832),
-storage reads reach slots below 2^63 only (the ABI's `int64_t`; every
-hashed mapping slot is declined with the engine's refusal — the Go
-reader itself takes the full 32-byte key), no EVM/block/tx/code reads,
+storage reads reach positions below 2^64 only (the ABI names the slot as
+an `int64_t`; positions ≥ 2^63 cross as their two's-complement pattern,
+pinned by the slot-echo test, while positions beyond 8 significant bytes
+cannot be named by the ABI at all and are refused before the FFI — as the
+engine's generic retryable null, which is why every hashed mapping slot
+gets a retryable code for a request no retry can serve; the fix is the
+ABI slot width, not the reader — the Go reader itself takes the full
+32-byte key), no EVM/block/tx/code reads,
 no ENS (the `EnsApi` throws one named refusal), no broadcast path,
 no Tor (account reads leave from the host's real IP; the desktop logs
 the mismatch instead of pretending the switch applies). The JSON-string
@@ -240,9 +249,11 @@ settings' other networks (and it keeps this engine's `nodekey`/`nodedb`
 off the regular profile too).
 
 `goBuildCShared` builds with `CGO_CFLAGS="-O2 -D__BLST_PORTABLE__"`
-(portable blst, like the Rust workspace and this repo's own
-`go-engine.yml`: the ADX build's load-time constructor `_exit`s the
-host process on a pre-Broadwell/pre-Zen CPU) and `GOTOOLCHAIN=local`
+(portable blst, like the Rust workspace and — since this PR's review —
+`go-engine.yml`, which built bare before: the ADX build's load-time
+constructor answers SIGILL with `_exit(128+4)` and kills whatever process
+dlopens the library on a pre-Broadwell/pre-Zen CPU, past every
+`UnsatisfiedLinkError` handler) and `GOTOOLCHAIN=local`
 (it skips with a note when the local toolchain is older than `go.mod`'s
 line rather than downloading one mid-build; CI installs it via
 `setup-go`).

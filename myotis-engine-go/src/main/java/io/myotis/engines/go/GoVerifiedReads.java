@@ -48,8 +48,16 @@ import org.slf4j.LoggerFactory;
  * </ul>
  *
  * <p>What still reaches the wire as the retryable -32000: refused SELECTORS on
- * the typed state reads ({@code getBalance(addr, "latest")} etc. answer null)
- * and {@code getCode}. A permanent refusal for those needs a refused-channel on
+ * the typed state reads ({@code getBalance(addr, "latest")} etc. answer null),
+ * {@code getCode}, {@code gasPrice}, {@code maxPriorityFeePerGas} — and
+ * storage positions at or above 2^64, which {@link #getStorageAt} refuses
+ * before the FFI (the ABI names a slot in eight bytes; slots from 2^63 to
+ * 2^64-1 DO cross, as their two's-complement pattern, pinned by the
+ * slot-echo test). That last group means every hashed mapping slot — mappings,
+ * dynamic arrays, EIP-1967 implementation slots — gets the generic retryable
+ * code for a request no retry can serve; the Go reader itself takes the full
+ * 32-byte key, so the fix is the ABI slot width, not the reader. A permanent
+ * refusal for all of these needs a refused-channel on
  * the typed methods themselves — an {@code :myotis-api} change, the owner's call
  * (PR #832 review), not this module's. {@code supportsFinalizedTag()} true is
  * what lets {@code finalized} reach this adapter at all (the router would
@@ -277,6 +285,19 @@ final class GoVerifiedReads implements VerifiedReads {
     @Override
     public String feeHistory(long blockCount, String newestBlock, double[] rewardPercentiles) {
         return permanentRefusalJson("fee-history");
+    }
+
+    /** The Go build has no log index and will not grow one between retries
+     *  ({@code capabilities} reports logs/logIndex false; the native
+     *  {@code myotis_get_logs_json} answers {@code Unsupported}), so this
+     *  JSON-string read belongs on the same permanent channel as the six above
+     *  (PR #832 round-3 review). Through the filter backend this also moves
+     *  {@code eth_newFilter}/{@code eth_getFilterLogs} from the retryable
+     *  "no log index right now, block filters are served" -32000 to the
+     *  permanent -32602 — honest, because block filters are NOT served here. */
+    @Override
+    public String getLogs(String filterJson) {
+        return permanentRefusalJson("logs");
     }
 
     @Override

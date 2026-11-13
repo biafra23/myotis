@@ -43,6 +43,8 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum  # without this the action hashes the
+          # root (Gradle) tree for its module-cache key — same line go-engine.yml uses
 
       # Robust Gradle dependency + plugin caching. Restores the base-branch cache
       # (read-only on PRs) so artifacts that already built on main — Besu, AGP,
@@ -117,6 +119,14 @@ jobs:
           done
           echo "::error::Gradle build failed after 3 attempts"
           exit 1
+
+      # goBuildCShared degrades a FAILED cgo build to a warning (by design, for
+      # cgo-less dev hosts), and the native-backed tests then self-skip — green
+      # CI with zero Go-engine coverage. On this runner go + cgo are guaranteed
+      # (steps above), so the library MUST exist here; fail loudly otherwise
+      # (PR #832 round-3 review).
+      - name: The Go engine library was built (GoCatalogParityTest ran against it)
+        run: test -s go/build/libmyotis_engine_go.so
 
   # Refuse to publish when the pushed tag disagrees with the version in the tree
   # (see release-version-guard.yml). Not strictly needed for the jar names here,

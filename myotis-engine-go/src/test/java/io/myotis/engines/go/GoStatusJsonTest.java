@@ -343,7 +343,11 @@ class GoStatusJsonTest {
                 reads.getTransactionReceipt(new byte[32]),
                 reads.getTransactionByHash(new byte[32]),
                 reads.getBlockReceipts("finalized"),
-                reads.feeHistory(5, "finalized", new double[]{50.0})}) {
+                reads.feeHistory(5, "finalized", new double[]{50.0}),
+                // logs too (PR #832 round-3): the Go build has no log index and
+                // will not grow one between retries, so the retryable -32000
+                // the router default would give is the wrong promise.
+                reads.getLogs("{\"fromBlock\":\"finalized\"}")}) {
             // The router's discriminator, re-implemented: starts with the
             // envelope, parses to a 2-key {"error","code"} object, code the
             // PERMANENT one (an integer, not a string).

@@ -249,7 +249,14 @@ final class GoEngineNative {
         return LIB.myotis_network_metering();
     }
 
-    /** Direct-mapped view of the exported C symbols. */
+    /**
+     * Interface-mapped view of the exported C symbols (plain JNA interface
+     * mapping, NOT direct mapping — symbols resolve LAZILY at each first
+     * call, which is why callers catch {@link LinkageError} around the
+     * wrapper methods, and why String arguments go through the explicit
+     * UTF-8 {@code OPTION_STRING_ENCODING} option at the {@code Native.load}
+     * sites instead of the platform charset).
+     */
     interface GoEngineLibrary extends Library {
         int myotis_init();
         Pointer myotis_drain_logs(int max);

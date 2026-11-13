@@ -35,10 +35,41 @@ import java.nio.file.Path
  * `gnosis`/`sepolia` and their `rpcPort.<net>` overrides from the shared
  * `~/.myotis` profile, with nothing logged. The Go engine's `nodekey` and
  * `nodedb/` stay off the regular profile the same way. A PoC flavour wins
- * over the engine flag (its directory also carries its seeds).
+ * over the engine flag (its directory also carries its seeds) — though main()
+ * REFUSES that combination outright (see [flavourOnGoRefusal]), so the
+ * precedence is only the function's total-function fallback.
  */
 internal fun desktopDataDir(pocDir: Path?, engineProp: String?, home: String): Path =
-    pocDir ?: Path.of(home, if (engineProp?.trim()?.lowercase() == "go") ".myotis-go" else ".myotis")
+    pocDir ?: Path.of(home, if (engineChoiceIsGo(engineProp)) ".myotis-go" else ".myotis")
+
+/**
+ * Whether the `-Dmyotis.engine` launch flag (the `-Pengine=…` dev knob) selects
+ * the Go engine. Trimmed + lowercased like the selector's own parsing. The
+ * persisted Settings toggle cannot select `go` — it is a java/rust switch —
+ * so this property is the ONLY way a desktop process ends up on the Go engine.
+ */
+internal fun engineChoiceIsGo(engineProp: String?): Boolean =
+    engineProp?.trim()?.lowercase() == "go"
+
+/**
+ * Why a PoC flavour and `-Pengine=go` cannot run together (PR #832 round-3
+ * review): each PoC's sole network is the one the Go engine's shrunken
+ * catalog prunes — Bee runs gnosis only, the RAILGUN PoC sepolia only — and
+ * [DesktopSettings] load prunes saved enabled-networks the running engine's
+ * catalog lacks, rewriting the whole settings file from the pruned state. The
+ * combo would boot a PoC profile with its network silently gone: an empty
+ * app, not an error. Non-null return is the refusal message; null = the pair
+ * is fine.
+ */
+internal fun flavourOnGoRefusal(pocFlavour: String?, engineProp: String?): String? =
+    if (pocFlavour != null && engineChoiceIsGo(engineProp)) {
+        "myotis: the $pocFlavour flavour cannot run on the Go engine (-Dmyotis.engine=go):" +
+            " the Go engine's catalog is mainnet-only, so this flavour's network would be" +
+            " pruned from its own settings on first start. Launch the flavour without" +
+            " -Pengine=go (or run the Go engine on a regular build)."
+    } else {
+        null
+    }
 
 fun main() {
     // PACKAGED apps: Compose ships appResources inside the bundle and exposes
@@ -63,15 +94,32 @@ fun main() {
     // data dir and seeds its networks' log indexes from the bundle before anything reads
     // that dir. Null for a regular build, which is every build that sets neither property.
     val poc = Poc.active()
+    // NOTE (PR #832 round-3 review): Engines.PROP is a `static final String`
+    // compile-time constant, and Kotlin INLINES such constants at the use site —
+    // this expression does NOT class-load Engines. That is deliberate (this file
+    // must not initialize the selector before the engine-library probe above
+    // has settled `myotis.engine.lib`); if the constant ever stops being
+    // compile-time, this line silently gains an early class-load.
+    val engineProp = System.getProperty(io.myotis.engines.Engines.PROP)
+    flavourOnGoRefusal(poc?.label, engineProp)?.let {
+        System.err.println(it)
+        kotlin.system.exitProcess(2)
+    }
     val dataDir = desktopDataDir(
         pocDir = poc?.dataDir(),
-        engineProp = System.getProperty(io.myotis.engines.Engines.PROP),
+        engineProp = engineProp,
         home = System.getProperty("user.home"),
     )
-    // Keep the PoC's logs in its own data dir too. logback-desktop.xml reads
-    // myotis.logdir when the first logger is created, so this must precede
-    // every log call (PocFlavour's logger is lazy for exactly this reason).
-    if (poc != null && System.getProperty("myotis.logdir") == null) {
+    // Keep ISOLATED profiles' logs with their profile: PoC flavours and the
+    // `-Pengine=go` profile alike (PR #832 round-3 review — the first version
+    // redirected PoC launches only, so a Go run drained its engine logs into
+    // the shared profile's logs next to regular runs). logback-desktop.xml
+    // reads myotis.logdir when the first logger is created, so this must
+    // precede every log call (PocFlavour's logger is lazy for exactly this
+    // reason). An explicit -Dmyotis.logdir still wins.
+    if (dataDir != Path.of(System.getProperty("user.home"), ".myotis") &&
+        System.getProperty("myotis.logdir") == null
+    ) {
         System.setProperty("myotis.logdir", dataDir.resolve("logs").toString())
     }
     val settingsFile = dataDir.resolve("settings.properties")
@@ -108,9 +156,24 @@ fun main() {
     // on the Rust engine it requires. Unlike the engine choice (which SelectorEngine reads
     // directly), the Rust Tor flag must be PUSHED to the native library — so always call it,
     // with an explicit -Dmyotis.tor winning over the persisted toggle.
-    System.getProperty(io.myotis.engines.rust.Tor.PROP)?.let {
-        io.myotis.engines.rust.Tor.select(it.toBoolean())
-    } ?: controller.applyTorMode()
+    // An explicit -Dmyotis.tor must pass the SAME Go gate DesktopNode.applyTorMode
+    // applies to the persisted toggle (PR #832 round-3 review): Tor is
+    // Rust-engine-only, and Tor.select under a Go-engine run would report
+    // success while the Go engine's account reads leave from the real IP —
+    // the accepted-and-ignored privacy switch.
+    val torProp = System.getProperty(io.myotis.engines.rust.Tor.PROP)
+    when {
+        io.myotis.engines.Engines.choice() == "go" ->
+            if (torProp?.toBoolean() == true) {
+                org.slf4j.LoggerFactory.getLogger("io.myotis.desktop.Main").warn(
+                    "[desktop] -Dmyotis.tor requested but this run is the Go engine,"
+                            + " which has no Tor: account reads leave from this host's real IP."
+                            + " The switch applies again on a launch without -Dmyotis.engine=go",
+                )
+            }
+        torProp != null -> io.myotis.engines.rust.Tor.select(torProp.toBoolean())
+        else -> controller.applyTorMode()
+    }
     val history = DesktopQueryHistory(dataDir.resolve("query-history.tsv"))
     settings.enabledNetworks().forEach(controller::startNetwork)
 
