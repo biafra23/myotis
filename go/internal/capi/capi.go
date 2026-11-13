@@ -34,6 +34,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -43,7 +44,9 @@ import (
 	"time"
 
 	"github.com/biafra23/myotis/go/internal/chain"
+	"github.com/biafra23/myotis/go/internal/clsync"
 	"github.com/biafra23/myotis/go/internal/engine"
+	"github.com/ethereum/go-ethereum/crypto"
 )
 
 // MyotisABIVersion is the myotis_engine.h ABI whose subset this library
@@ -80,10 +83,18 @@ var (
 // so).
 type entry struct {
 	eng *engine.Engine
-	// cancel stops the LC loop; set by Start under mu, read by Stop
-	// after removing the entry (a removed entry takes no more
-	// Start writes, so the handoff is ordered by the map delete).
+	// ctx is the handle's lifetime context, created by Start; every
+	// READ derives from it (PR #827 review: reads derived from
+	// context.Background() outlived myotis_stop by up to the whole
+	// ReadBudget — the header asks Stop to "signal pending readers,
+	// drain registered work", which needs both the derivation and
+	// the reads waitgroup). cancel stops the LC loop too; set by
+	// Start under mu, read by Stop after removing the entry (a
+	// removed entry takes no more Start writes, so the handoff is
+	// ordered by the map delete).
+	ctx     context.Context
 	cancel  context.CancelFunc
+	reads   sync.WaitGroup // reads that began while the handle lived
 	started bool
 	// servedWindow is the myotis_set_served_block_window value in
 	// force, clamped as the contract prescribes. This engine dials and
@@ -92,7 +103,8 @@ type entry struct {
 	servedWindow int32
 }
 
-// lookup snapshots a handle's shared state under mu.
+// lookup snapshots a handle's shared state under mu (non-blocking
+// reads: status, setters, the nonce overlay).
 func lookup(handle int64) (eng *engine.Engine, started bool, ok bool) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -101,6 +113,51 @@ func lookup(handle int64) (eng *engine.Engine, started bool, ok bool) {
 		return nil, false, false
 	}
 	return e.eng, e.started, true
+}
+
+// beginRead registers a blocking read against a STARTED handle under
+// mu, returning the handle's lifetime context; Stop's Wait is what
+// makes "synchronous" true. The caller must defer e.reads.Done().
+func beginRead(handle int64) (e *entry, started bool, exists bool) {
+	mu.Lock()
+	defer mu.Unlock()
+	en, found := table[handle]
+	if !found {
+		return nil, false, false
+	}
+	if !en.started || en.ctx == nil {
+		// ctx==nil with started==true only happens for a handle a
+		// test forged; a real Start always sets both. Treating it as
+		// "not started" keeps a nil-parent panic out of the reads.
+		return nil, false, true
+	}
+	en.reads.Add(1)
+	return en, true, true
+}
+
+// classifyReadErr maps an Engine.Account failure to the contract's
+// two error shapes. The distinction is the host's retry rule, so it
+// is typed, not prose-parsed (PR #827 review: a flat retryable made
+// a state no retry on the handle can clear look retryable forever):
+//   - stale-anchor park → retryable, because THIS handle can clear
+//     it — myotis_accept_stale_anchor / myotis_set_ws_bound_periods
+//     restart the loop (and status says STALE_ANCHOR meanwhile);
+//   - any other LC death → PERMANENT -32602: the loop is gone and
+//     only stop-and-recreate revives it;
+//   - everything else (budget expiry, proof-side deferrals, unknown
+//     handle) → retryable, as before.
+func classifyReadErr(what string, err error) string {
+	var lce *engine.LCError
+	if errors.As(err, &lce) {
+		if errors.Is(err, clsync.ErrStaleAnchor) {
+			return retryableErr("go engine: " + what + ": " + err.Error() +
+				" — consent to the anchor's age with myotis_accept_stale_anchor" +
+				" or widen the bound with myotis_set_ws_bound_periods")
+		}
+		return permanentErr("go engine: " + what + ": " + err.Error() +
+			" — this handle's light client stopped; myotis_stop it and myotis_create a new one")
+	}
+	return retryableErr("go engine: " + what + ": " + err.Error())
 }
 
 // Init installs the log ring and returns the ABI version — the
@@ -206,14 +263,20 @@ func AvailableNetworksJSON() string {
 
 // listenPortEnv lets a host (and the tests) move the discv4 UDP port
 // without inventing a Go-only setter before myotis_set_listen_ports is
-// functional: -1 ephemeral, 0 network default.
+// functional: -1 ephemeral, 0 network default. The DEFAULT is
+// ephemeral (PR #827 review): the header fixes OS-assigned as the
+// port a handle uses when myotis_set_listen_ports was never called,
+// and pinning :30303 by default collides with any local execution
+// client, the daemon, or a second handle — and a bind failure fails
+// myotis_start here, where Rust degrades instead. The bound port is
+// still advertised in the ENR, so discovery is unaffected.
 func listenPortEnv() int {
 	if v := os.Getenv("MYOTIS_GO_LISTEN_PORT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
 		}
 	}
-	return 0
+	return -1
 }
 
 // Create allocates a NOT-YET-STARTED handle (>= 1): discovery and the
@@ -367,7 +430,7 @@ func Start(handle int64) bool {
 	}
 	e.started = true
 	ctx, cancel := context.WithCancel(context.Background())
-	e.cancel = cancel
+	e.ctx, e.cancel = ctx, cancel
 	mu.Unlock()
 	if err := e.eng.StartNetwork(); err != nil {
 		mu.Lock()
@@ -387,12 +450,14 @@ func Stop(handle int64) {
 	e, ok := table[handle]
 	delete(table, handle)
 	mu.Unlock()
-	if ok {
-		if e.cancel != nil {
-			e.cancel()
-		}
-		e.eng.Close()
+	if !ok {
+		return
 	}
+	if e.cancel != nil {
+		e.cancel() // signals readers (their ctx derives from the handle's) AND the LC loop
+	}
+	e.reads.Wait() // "drain registered work" — synchronous means the JNA threads are out
+	e.eng.Close()
 }
 
 // statusJSON carries EXACTLY the Rust status_object key set (host.rs),
@@ -565,50 +630,69 @@ func accountBlockErr(block string) (string, bool) {
 // account) is a normal result shape with failReason, not an error —
 // exactly as the header's comment prescribes.
 func RequestAccountJSON(handle int64, address, block string) string {
-	eng, started, ok := lookup(handle)
-	if !ok {
+	// Selector BEFORE the handle lookup, as the twin's
+	// parse_read_block does: a request whose selector no retry can
+	// serve is the REQUEST's fault and gets its permanent refusal
+	// whatever state the handle is in (the old order handed a
+	// retryable "not started" first to a request that would never
+	// have been servable anyway).
+	if msg, refused := accountBlockErr(block); refused {
+		return msg
+	}
+	e, started, exists := beginRead(handle)
+	if !exists {
 		return retryableErr("go engine: unknown handle")
 	}
 	if !started {
 		return retryableErr("go engine: handle not started (myotis_start)")
 	}
-	if msg, refused := accountBlockErr(block); refused {
-		return msg
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), ReadBudget)
+	defer e.reads.Done()
+	ctx, cancel := context.WithTimeout(e.ctx, ReadBudget)
 	defer cancel()
-	rd, err := eng.Account(ctx, address, [32]byte{}, false)
+	rd, err := e.eng.Account(ctx, address, [32]byte{}, false)
 	if err != nil {
-		return retryableErr("go engine: account read: " + err.Error())
+		return classifyReadErr("account read", err)
 	}
 	out, err := rd.AccountJSON(time.Now().Unix())
 	if err != nil {
-		return retryableErr("go engine: account read: " + err.Error())
+		return classifyReadErr("account read", err)
 	}
 	return out
 }
 
 // GetStorageProofJSON runs the two-hop account→slot read (the slot
 // anchored at the PROVEN storageRoot of the same read). holder_hex is
-// the ERC-20-delegation selector; the Go engine has no delegated-code
-// resolution, so a non-empty holder is refused permanently rather than
-// ignored.
+// the ERC-20 MAPPING KEY, exactly as the twin applies it
+// (reader.rs storage_key: keccak256(pad32(holder) ‖ pad32(slot)) —
+// the shape that reads a balance at a token contract, the repo's own
+// `get-storage <token> <slot> <holder>` integration). A slot index at
+// or above 2^63 arrives as a negative int64 and is recovered by bit
+// pattern, as host.rs documents — clamping it would silently query a
+// different slot. Deliberate divergence from the twin, marked in the
+// result: the twin proves this read at the verified HEAD; this engine
+// has no head read, so it proves at the finalized anchor and the
+// result says so ("anchor":"finalized").
+// storageKey is the twin's storage_key(slot, Some(holder)) derivation
+// (reader.rs): keccak256(pad32(holder) ‖ pad32(slot)). ok=false only
+// for a holder that is neither a hex 20-byte address nor a hex
+// 32-byte word — refused by name, never applied "close enough".
+func storageKey(holder string, slotKey [32]byte) ([32]byte, bool) {
+	hexStr := strings.TrimPrefix(holder, "0x")
+	b, err := hex.DecodeString(hexStr)
+	if err != nil || len(hexStr)%2 != 0 || (len(b) != 20 && len(b) != 32) {
+		return [32]byte{}, false
+	}
+	var word [32]byte
+	copy(word[32-len(b):], b)
+	var pre [64]byte
+	copy(pre[:32], word[:])
+	copy(pre[32:], slotKey[:])
+	return [32]byte(crypto.Keccak256Hash(pre[:])), true
+}
+
 func GetStorageProofJSON(handle int64, address string, slot int64, holder string) string {
-	eng, started, ok := lookup(handle)
-	if !ok {
-		return retryableErr("go engine: unknown handle")
-	}
-	if !started {
-		return retryableErr("go engine: handle not started (myotis_start)")
-	}
-	if strings.TrimSpace(holder) != "" {
-		return permanentErr("go engine: holder_hex (delegated storage) is not supported; pass null")
-	}
-	if slot < 0 {
-		return permanentErr("go engine: slot must be >= 0")
-	}
 	var key [32]byte
-	u := uint64(slot)
+	u := uint64(slot) // negative int64 → its top bit set: the twin's recovery
 	key[24] = byte(u >> 56)
 	key[25] = byte(u >> 48)
 	key[26] = byte(u >> 40)
@@ -617,15 +701,31 @@ func GetStorageProofJSON(handle int64, address string, slot int64, holder string
 	key[29] = byte(u >> 16)
 	key[30] = byte(u >> 8)
 	key[31] = byte(u)
-	ctx, cancel := context.WithTimeout(context.Background(), ReadBudget)
+	if h := strings.TrimSpace(holder); h != "" {
+		var ok bool
+		if key, ok = storageKey(h, key); !ok {
+			return permanentErr("go engine: holder_hex must be a 20-byte address or 32-byte word in hex, or null")
+		}
+	}
+	// Request-shape faults are refused before the handle lookup (the
+	// twin's ordering); handle-state faults stay retryable.
+	e, started, exists := beginRead(handle)
+	if !exists {
+		return retryableErr("go engine: unknown handle")
+	}
+	if !started {
+		return retryableErr("go engine: handle not started (myotis_start)")
+	}
+	defer e.reads.Done()
+	ctx, cancel := context.WithTimeout(e.ctx, ReadBudget)
 	defer cancel()
-	rd, err := eng.Account(ctx, address, key, true)
+	rd, err := e.eng.Account(ctx, address, key, true)
 	if err != nil {
-		return retryableErr("go engine: storage read: " + err.Error())
+		return classifyReadErr("storage read", err)
 	}
 	out, err := rd.StorageJSON(time.Now().Unix())
 	if err != nil {
-		return retryableErr("go engine: storage read: " + err.Error())
+		return classifyReadErr("storage read", err)
 	}
 	return out
 }

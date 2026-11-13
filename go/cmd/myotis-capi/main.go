@@ -20,6 +20,16 @@ package main
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+// The CONTRACT itself, compiled in: cgo re-declares every //export
+// next to this preamble, so a signature that drifts from the header
+// becomes a C "conflicting types" BUILD error, not a silent ABI lie
+// the name-only symbol check would wave through (PR #827 review —
+// four stubs had drifted prototypes that way). The include path is
+// relative to this package dir, matching what the go-engine workflow
+// builds with (working-directory go/).
+#include "../../../rust/include/myotis_engine.h"
+// const char* under a name cgo can name as a parameter type.
+typedef const char cchar_t;
 */
 import "C"
 
@@ -35,12 +45,14 @@ func main() {} // c-shared entry point; never runs
 // free via myotis_string_free (the header's ownership contract).
 func cstr(s string) *C.char { return C.CString(s) }
 
-// gostr reads a possibly-NULL C string as a Go string.
-func gostr(p *C.char) string {
+// gostrC reads a possibly-NULL C string — the header's char*
+// parameters are all const char*, which the preamble's typedef makes
+// *C.cchar_t for cgo — as a Go string.
+func gostrC(p *C.cchar_t) string {
 	if p == nil {
 		return ""
 	}
-	return C.GoString(p)
+	return C.GoString((*C.char)(unsafe.Pointer(p)))
 }
 
 // ---- availability + handshake ----
@@ -55,8 +67,8 @@ func myotis_drain_logs(max C.int32_t) *C.char { return cstr(capi.DrainLogs(int(m
 func myotis_available_networks_json() *C.char { return cstr(capi.AvailableNetworksJSON()) }
 
 //export myotis_canonical_network_name
-func myotis_canonical_network_name(name *C.char) *C.char {
-	c, ok := capi.CanonicalNetworkName(gostr(name))
+func myotis_canonical_network_name(name *C.cchar_t) *C.char {
+	c, ok := capi.CanonicalNetworkName(gostrC(name))
 	if !ok {
 		return nil // NULL for unknown, per the header
 	}
@@ -71,14 +83,14 @@ func myotis_go_capabilities_json() *C.char { return cstr(capi.CapabilitiesJSON()
 // ---- lifecycle ----
 
 //export myotis_create
-func myotis_create(network, dataDir *C.char) C.int64_t {
-	return C.int64_t(capi.Create(gostr(network), gostr(dataDir)))
+func myotis_create(network, dataDir *C.cchar_t) C.int64_t {
+	return C.int64_t(capi.Create(gostrC(network), gostrC(dataDir)))
 }
 
 //export myotis_create_with_checkpoint
-func myotis_create_with_checkpoint(network, dataDir, root *C.char, slot C.uint64_t) C.int64_t {
+func myotis_create_with_checkpoint(network, dataDir, root *C.cchar_t, slot C.uint64_t) C.int64_t {
 	_ = slot
-	return C.int64_t(capi.CreateWithCheckpoint(gostr(network), gostr(dataDir), gostr(root)))
+	return C.int64_t(capi.CreateWithCheckpoint(gostrC(network), gostrC(dataDir), gostrC(root)))
 }
 
 //export myotis_start
@@ -105,8 +117,8 @@ func myotis_set_tor_enabled(on C.bool) C.bool { return C.bool(capi.SetTorEnabled
 func myotis_tor_status() C.int32_t { return C.int32_t(capi.TorStatus()) } // 0 = no Tor support in this build
 
 //export myotis_set_tor_storage_dirs
-func myotis_set_tor_storage_dirs(stateDir, cacheDir *C.char) C.bool {
-	return C.bool(capi.SetTorStorageDirs(gostr(stateDir), gostr(cacheDir)))
+func myotis_set_tor_storage_dirs(stateDir, cacheDir *C.cchar_t) C.bool {
+	return C.bool(capi.SetTorStorageDirs(gostrC(stateDir), gostrC(cacheDir)))
 }
 
 //export myotis_set_dns_discovery
@@ -123,13 +135,13 @@ func myotis_network_metering() C.int32_t { return C.int32_t(capi.NetworkMetering
 // ---- verified reads ----
 
 //export myotis_request_account_json
-func myotis_request_account_json(handle C.int64_t, address, block *C.char) *C.char {
-	return cstr(capi.RequestAccountJSON(int64(handle), gostr(address), gostr(block)))
+func myotis_request_account_json(handle C.int64_t, address, block *C.cchar_t) *C.char {
+	return cstr(capi.RequestAccountJSON(int64(handle), gostrC(address), gostrC(block)))
 }
 
 //export myotis_get_storage_proof_json
-func myotis_get_storage_proof_json(handle C.int64_t, address *C.char, slot C.int64_t, holder *C.char) *C.char {
-	return cstr(capi.GetStorageProofJSON(int64(handle), gostr(address), int64(slot), gostr(holder)))
+func myotis_get_storage_proof_json(handle C.int64_t, address *C.cchar_t, slot C.int64_t, holder *C.cchar_t) *C.char {
+	return cstr(capi.GetStorageProofJSON(int64(handle), gostrC(address), int64(slot), gostrC(holder)))
 }
 
 // ---- memory ----
@@ -143,112 +155,112 @@ func myotis_string_free(s *C.char) { C.free(unsafe.Pointer(s)) }
 // exact call site. Each name is the refusal message. ----
 
 //export myotis_get_code_json
-func myotis_get_code_json(h C.int64_t, a, b *C.char) *C.char {
+func myotis_get_code_json(h C.int64_t, a, b *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_get_code_json"))
 }
 
 //export myotis_get_storage_at_json
-func myotis_get_storage_at_json(h C.int64_t, a, p, b *C.char) *C.char {
+func myotis_get_storage_at_json(h C.int64_t, a, p, b *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_get_storage_at_json"))
 }
 
 //export myotis_get_proof_json
-func myotis_get_proof_json(h C.int64_t, a, k, b *C.char) *C.char {
+func myotis_get_proof_json(h C.int64_t, a, k, b *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_get_proof_json"))
 }
 
 //export myotis_eth_call_json
-func myotis_eth_call_json(h C.int64_t, f, t, d, v, b *C.char) *C.char {
+func myotis_eth_call_json(h C.int64_t, f, t, d, v, b *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_eth_call_json"))
 }
 
 //export myotis_eth_call_overrides_json
-func myotis_eth_call_overrides_json(h C.int64_t, f, t, d, v, b, o *C.char) *C.char {
+func myotis_eth_call_overrides_json(h C.int64_t, f, t, d, v, b, o *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_eth_call_overrides_json"))
 }
 
 //export myotis_eth_call_tx_json
-func myotis_eth_call_tx_json(h C.int64_t, tx, b, o *C.char) *C.char {
+func myotis_eth_call_tx_json(h C.int64_t, tx, b, o *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_eth_call_tx_json"))
 }
 
 //export myotis_estimate_gas_json
-func myotis_estimate_gas_json(h C.int64_t, f, t, d, v *C.char) *C.char {
+func myotis_estimate_gas_json(h C.int64_t, f, t, d, v *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_estimate_gas_json"))
 }
 
 //export myotis_estimate_gas_tx_json
-func myotis_estimate_gas_tx_json(h C.int64_t, tx, b, o *C.char) *C.char {
+func myotis_estimate_gas_tx_json(h C.int64_t, tx, b, o *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_estimate_gas_tx_json"))
 }
 
 //export myotis_create_access_list_json
-func myotis_create_access_list_json(h C.int64_t, tx, b, o *C.char) *C.char {
+func myotis_create_access_list_json(h C.int64_t, tx, b, o *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_create_access_list_json"))
 }
 
 //export myotis_resolve_ens_json
-func myotis_resolve_ens_json(h C.int64_t, name *C.char) *C.char {
+func myotis_resolve_ens_json(h C.int64_t, name *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_resolve_ens_json"))
 }
 
 //export myotis_ens_record_json
-func myotis_ens_record_json(h C.int64_t, params *C.char) *C.char {
+func myotis_ens_record_json(h C.int64_t, params *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_ens_record_json"))
 }
 
 //export myotis_get_block_by_number_json
-func myotis_get_block_by_number_json(h C.int64_t, tag *C.char, full C.bool) *C.char {
+func myotis_get_block_by_number_json(h C.int64_t, tag *C.cchar_t, full C.bool) *C.char {
 	return cstr(capi.Unsupported("myotis_get_block_by_number_json"))
 }
 
 //export myotis_get_block_by_hash_json
-func myotis_get_block_by_hash_json(h C.int64_t, hash *C.char, full C.bool) *C.char {
+func myotis_get_block_by_hash_json(h C.int64_t, hash *C.cchar_t, full C.bool) *C.char {
 	return cstr(capi.Unsupported("myotis_get_block_by_hash_json"))
 }
 
 //export myotis_get_block_receipts_json
-func myotis_get_block_receipts_json(h C.int64_t, sel *C.char) *C.char {
+func myotis_get_block_receipts_json(h C.int64_t, sel *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_get_block_receipts_json"))
 }
 
 //export myotis_pending_nonce_overlay
-func myotis_pending_nonce_overlay(h C.int64_t, a *C.char, mined C.int64_t) C.int64_t {
-	return C.int64_t(capi.PendingNonceOverlay(int64(h), gostr(a), int64(mined)))
+func myotis_pending_nonce_overlay(h C.int64_t, a *C.cchar_t, mined C.int64_t) C.int64_t {
+	return C.int64_t(capi.PendingNonceOverlay(int64(h), gostrC(a), int64(mined)))
 }
 
 //export myotis_get_transaction_receipt_json
-func myotis_get_transaction_receipt_json(h C.int64_t, hash *C.char) *C.char {
+func myotis_get_transaction_receipt_json(h C.int64_t, hash *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_get_transaction_receipt_json"))
 }
 
 //export myotis_get_transaction_by_hash_json
-func myotis_get_transaction_by_hash_json(h C.int64_t, hash *C.char, full C.bool) *C.char {
+func myotis_get_transaction_by_hash_json(h C.int64_t, hash *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_get_transaction_by_hash_json"))
 }
 
 //export myotis_resolve_block_hash_json
-func myotis_resolve_block_hash_json(h C.int64_t, sel *C.char) *C.char {
+func myotis_resolve_block_hash_json(h C.int64_t, sel *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_resolve_block_hash_json"))
 }
 
 //export myotis_debug_trace_call_json
-func myotis_debug_trace_call_json(h C.int64_t, tx, b *C.char) *C.char {
+func myotis_debug_trace_call_json(h C.int64_t, tx, b, ov, tr *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_debug_trace_call_json"))
 }
 
 //export myotis_simulate_v1_json
-func myotis_simulate_v1_json(h C.int64_t, opts, ctx *C.char) *C.char {
+func myotis_simulate_v1_json(h C.int64_t, opts, ctx *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_simulate_v1_json"))
 }
 
 //export myotis_get_raw_transaction_by_hash_json
-func myotis_get_raw_transaction_by_hash_json(h C.int64_t, hash *C.char) *C.char {
+func myotis_get_raw_transaction_by_hash_json(h C.int64_t, hash *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_get_raw_transaction_by_hash_json"))
 }
 
 //export myotis_get_raw_transaction_by_block_json
-func myotis_get_raw_transaction_by_block_json(h C.int64_t, sel *C.char, idx C.int64_t) *C.char {
+func myotis_get_raw_transaction_by_block_json(h C.int64_t, sel *C.cchar_t, idx C.uint64_t) *C.char {
 	return cstr(capi.Unsupported("myotis_get_raw_transaction_by_block_json"))
 }
 
@@ -258,27 +270,27 @@ func myotis_fee_estimate_json(h C.int64_t) *C.char {
 }
 
 //export myotis_fee_history_json
-func myotis_fee_history_json(h C.int64_t, count C.int64_t, newer, older *C.char, bp *C.char) *C.char {
+func myotis_fee_history_json(h C.int64_t, count C.int64_t, newest, percentiles *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_fee_history_json"))
 }
 
 //export myotis_send_raw_transaction_json
-func myotis_send_raw_transaction_json(h C.int64_t, raw *C.char) *C.char {
+func myotis_send_raw_transaction_json(h C.int64_t, raw *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_send_raw_transaction_json"))
 }
 
 //export myotis_check_raw_transaction_json
-func myotis_check_raw_transaction_json(raw *C.char) *C.char {
+func myotis_check_raw_transaction_json(raw *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_check_raw_transaction_json"))
 }
 
 //export myotis_get_logs_json
-func myotis_get_logs_json(h C.int64_t, filter *C.char) *C.char {
+func myotis_get_logs_json(h C.int64_t, filter *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_get_logs_json"))
 }
 
 //export myotis_set_log_index_config
-func myotis_set_log_index_config(h C.int64_t, cfg *C.char) C.bool { return C.bool(false) }
+func myotis_set_log_index_config(h C.int64_t, cfg *C.cchar_t) C.bool { return C.bool(false) }
 
 //export myotis_log_index_status_json
 func myotis_log_index_status_json(h C.int64_t) *C.char {
@@ -286,7 +298,7 @@ func myotis_log_index_status_json(h C.int64_t) *C.char {
 }
 
 //export myotis_set_activity_watch
-func myotis_set_activity_watch(h C.int64_t, cfg *C.char) C.bool { return C.bool(false) }
+func myotis_set_activity_watch(h C.int64_t, cfg *C.cchar_t) C.bool { return C.bool(false) }
 
 //export myotis_address_activity_json
 func myotis_address_activity_json(h C.int64_t, after C.int64_t) *C.char {
@@ -299,17 +311,17 @@ func myotis_read_stats_json(h C.int64_t) *C.char {
 }
 
 //export myotis_import_log_index_files
-func myotis_import_log_index_files(h C.int64_t, paths *C.char) *C.char {
+func myotis_import_log_index_files(h C.int64_t, paths *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_import_log_index_files"))
 }
 
 //export myotis_export_log_index
-func myotis_export_log_index(h C.int64_t, path *C.char) *C.char {
+func myotis_export_log_index(h C.int64_t, path *C.cchar_t) *C.char {
 	return cstr(capi.Unsupported("myotis_export_log_index"))
 }
 
 //export myotis_set_boot_enodes
-func myotis_set_boot_enodes(h C.int64_t, enodes *C.char) C.bool { return C.bool(false) }
+func myotis_set_boot_enodes(h C.int64_t, enodes *C.cchar_t) C.bool { return C.bool(false) }
 
 //export myotis_set_served_block_window
 func myotis_set_served_block_window(h C.int64_t, blocks C.int32_t) C.bool {

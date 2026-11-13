@@ -169,11 +169,20 @@ func New(cfg Config) (*Engine, error) {
 // when the process starts sending packets. The CLI calls this right
 // after New, which reproduces the old always-on behaviour exactly.
 // Idempotent; a failed first attempt may be retried.
+// After Close it is an error, not a silent success: a discovery
+// service started behind a closed Engine would never be closed again
+// (the same guard StartLC applies).
 func (e *Engine) StartNetwork() error {
 	e.netMu.Lock()
 	defer e.netMu.Unlock()
 	if e.netStarted {
 		return nil
+	}
+	e.mu.Lock()
+	closed := e.closed
+	e.mu.Unlock()
+	if closed {
+		return fmt.Errorf("engine: closed")
 	}
 	disc, err := discovery.Start(discovery.Config{
 		DataDir:    e.cfg.DataDir,
@@ -446,17 +455,43 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 	clsync.InstallGossipSubHold(h)
 	clsync.ServeInstall(h, syncer.LocalStatus)
 
-	bootCtx, cancel := context.WithTimeout(ctx, 4*time.Minute)
-	defer cancel()
-	st, err := syncer.RunBootstrap(bootCtx)
-	if err != nil {
-		return fmt.Errorf("bootstrap: %w", err)
+	// Bootstrap RETRIES (PR #827 review): a laptop asleep at launch,
+	// a pin rate-limiting us, a 4-minute window that just lapses —
+	// none of those is "this handle is dead forever", which is what
+	// returning made them behind a long-lived handle (the loop was
+	// one-shot, so the zombie answered retryable forever). The Rust
+	// twin likewise keeps working rather than parking; the ONE state
+	// it parks in is STALE_ANCHOR, and that is the only bootstrap
+	// failure this loop still exits on — the consent path
+	// (AcceptStale / SetWsBoundPeriods) is what releases it.
+	var st *lc.Store
+	for {
+		bootCtx, cancel := context.WithTimeout(ctx, 4*time.Minute)
+		var err error
+		st, err = syncer.RunBootstrap(bootCtx)
+		cancel()
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if errors.Is(err, clsync.ErrStaleAnchor) {
+			return fmt.Errorf("bootstrap: %w", err) // park; beaconState reports it
+		}
+		e.log.Warn("bootstrap failed, retrying", "err", err, "retryIn", "30s")
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(30 * time.Second):
+		}
 	}
 	e.mu.Lock()
 	e.bootstrapped = true
 	e.lcPeers = syncer.PeerCount()
 	e.mu.Unlock()
-	if err := syncer.RunCatchUp(bootCtx, st); err != nil {
+	catchCtx, catchCancel := context.WithTimeout(ctx, 4*time.Minute)
+	if err := syncer.RunCatchUp(catchCtx, st); err != nil {
 		// NOT fatal (PR #773 review): a pin that is down or
 		// rate-limiting us today is up in the next slot, and the
 		// steady loop below re-runs catch-up every cycle exactly for
@@ -465,6 +500,7 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 		// right below already tolerates.
 		logf("catch-up: %v (the steady loop retries it each slot)", err)
 	}
+	catchCancel()
 	// NO publish yet: st.Finalized here is the embedded checkpoint (or
 	// the previous period's best-update header) — hours old in the
 	// ordinary case, and outside every peer's ~128-block state window,

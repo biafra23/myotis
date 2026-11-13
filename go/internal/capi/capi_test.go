@@ -10,26 +10,43 @@ package capi
 // refusals it sees instead.
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
+// newStartedHandle makes a handle whose `started` is true WITHOUT a
+// real Start (PR #827 review: the pure-policy tests need an entry in
+// that state, not a mainnet join — discovery, dials and the libp2p
+// host would put live network in every hermetic unit run). The
+// engine behind it never began, so any read that got past the
+// request-shape refusals fails fast ("light client not started")
+// rather than reaching the network. TestLifecycleAndRefusals keeps
+// the one real Start in the file.
 func newStartedHandle(t *testing.T) int64 {
 	t.Helper()
-	// Ephemeral UDP: tests must not fight a running daemon for :30303.
-	t.Setenv("MYOTIS_GO_LISTEN_PORT", "-1")
 	h := Create("mainnet", t.TempDir())
 	if h < 1 {
 		t.Fatalf("Create(mainnet) = %d, want handle >= 1", h)
 	}
-	if !Start(h) {
-		t.Fatalf("Start(%d) = false", h)
-	}
-	t.Cleanup(func() { Stop(h) })
+	mu.Lock()
+	table[h].started = true
+	mu.Unlock()
+	t.Cleanup(func() {
+		mu.Lock()
+		e := table[h]
+		delete(table, h)
+		mu.Unlock()
+		if e != nil {
+			e.eng.Close()
+		}
+	})
 	return h
 }
 
@@ -131,10 +148,20 @@ func TestLifecycleAndRefusals(t *testing.T) {
 		t.Error("second Start must be false (already-running handle)")
 	}
 
-	// Block-selector policy WITHOUT touching the network: everything
-	// but "finalized" is refused permanently, the empty selector named
-	// as the head tag the header says it is, and the refusal names the
-	// way forward.
+	// (This loop runs against a never-created handle on purpose: the
+	// selector is validated BEFORE the handle lookup, as the twin's
+	// parse_read_block does, so the permanent refusal must not wait
+	// for handle state.)
+	for _, sel := range []string{"", "latest", "head", "safe", "pending", "123", "0x1c7c4"} {
+		m := decode(t, RequestAccountJSON(424242, "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", sel))
+		if m["code"] != float64(-32602) {
+			t.Errorf("selector %q on an UNKNOWN handle: want the permanent refusal first, got %v", sel, m)
+		}
+	}
+
+	// Block-selector policy: everything but "finalized" is refused
+	// permanently, the empty selector named as the head tag the
+	// header says it is, and the refusal names the way forward.
 	for _, sel := range []string{"", "latest", "head", "safe", "pending", "123", "0x1c7c4"} {
 		m := decode(t, RequestAccountJSON(h, "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", sel))
 		if m["code"] != float64(-32602) {
@@ -242,16 +269,43 @@ func TestStopWakesInFlightRead(t *testing.T) {
 	}
 }
 
-func TestStorageRefusals(t *testing.T) {
+func TestStorageRequestShapes(t *testing.T) {
 	h := newStartedHandle(t)
 	addr := "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+	// A malformed holder is refused permanently, BY NAME, before any
+	// handle or network state (the mapping-key parameter is the
+	// request's own fault when malformed).
 	m := decode(t, GetStorageProofJSON(h, addr, 7, "0xdead"))
 	if m["code"] != float64(-32602) || !strings.Contains(m["error"].(string), "holder_hex") {
-		t.Errorf("holder must be refused permanently by name: %v", m)
+		t.Errorf("malformed holder must be refused permanently by name: %v", m)
 	}
-	m = decode(t, GetStorageProofJSON(h, addr, -5, ""))
-	if m["code"] != float64(-32602) {
-		t.Errorf("negative slot must be refused: %v", m)
+	// A WELL-FORMED holder is APPLIED, not refused (it is the ERC-20
+	// mapping key, reader.rs storage_key): the answer moves past the
+	// request shape to the handle's state — here the fast
+	// not-started retryable, since this test's engine never started.
+	m = decode(t, GetStorageProofJSON(h, addr, 1, "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"))
+	if _, has := m["code"]; has {
+		t.Errorf("a valid holder must not be refused as a request fault: %v", m)
+	}
+	// A slot ≥ 2^63 (negative int64) is a VALID slot recovered by
+	// bit pattern, per host.rs — not malformed, not clamped.
+	m = decode(t, GetStorageProofJSON(h, addr, -1, ""))
+	if _, has := m["code"]; has {
+		t.Errorf("negative int64 slot is a valid high slot, refused must be permanent-only: %v", m)
+	}
+	// The derivation itself, pinned: keccak(pad32(Vitalik) ‖ pad32(1))
+	// — the exact shape the repo's integration test reads (its value
+	// here is the pin, computed with the same keccak the read uses; a
+	// derivation that stops matching reader.rs fails HERE, not in a
+	// wallet balance read).
+	var one [32]byte
+	one[31] = 1
+	got, ok := storageKey("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", one)
+	if !ok || hex.EncodeToString(got[:]) != "b931be0b3d1fb06daf0d92e2b8dfe49ead9172e102b3af1e07a10cc29003beb2" {
+		t.Errorf("storage_key derivation drifted from reader.rs: %x ok=%v", got, ok)
+	}
+	if _, ok := storageKey("0xd8dA6BF26964", one); ok { // 15 bytes: neither form
+		t.Error("short holder must be refused")
 	}
 }
 
@@ -414,6 +468,35 @@ func TestPendingNonceOverlay(t *testing.T) {
 		t.Errorf("negative mined nonce = %d, want -1", got)
 	}
 }
+
+func TestABIVersionMatchesHeader(t *testing.T) {
+	// The header's own instruction ("Gate on this macro — do not copy
+	// the number") applied to Go: a bump to MYOTIS_ABI_VERSION must
+	// turn THIS test red on the PR that bumps it (the workflow's paths
+	// now include rust/include/myotis_engine.h), not silently leave
+	// the Go library answering the old handshake. Same discipline as
+	// TestCheckpointMatchesRustEngine reading sync.rs.
+	raw, err := os.ReadFile("../../../rust/include/myotis_engine.h")
+	if err != nil {
+		t.Fatalf("header: %v", err)
+	}
+	m := abiDefine.FindSubmatch(raw)
+	if m == nil {
+		t.Fatal("no #define MYOTIS_ABI_VERSION in the header")
+	}
+	want, err := strconv.Atoi(string(m[1]))
+	if err != nil {
+		t.Fatalf("define not a number: %v", err)
+	}
+	if MyotisABIVersion != want {
+		t.Errorf("MyotisABIVersion = %d, header says %d — bump the Go constant in this PR", MyotisABIVersion, want)
+	}
+	if got := Init(); got != int32(want) {
+		t.Errorf("Init() = %d, want %d", got, want)
+	}
+}
+
+var abiDefine = regexp.MustCompile("(?m)^#define MYOTIS_ABI_VERSION (\\d+)$")
 
 func TestCapabilitiesJSON(t *testing.T) {
 	m := decode(t, CapabilitiesJSON())
