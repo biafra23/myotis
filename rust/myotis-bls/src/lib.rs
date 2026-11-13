@@ -106,9 +106,10 @@ mod jni_shim {
         message: JByteArray<'local>,
         signature: JByteArray<'local>,
     ) -> jboolean {
-        // Any failure is a plain `false`, never a Java exception, as before
-        // jni 0.22: a JNI error, a malformed input, or a panic `with_env`
-        // caught (under panic = "abort" there is none to catch).
+        // Any failure returns `false`, as before jni 0.22: a JNI error, a
+        // malformed input, or a panic `with_env` caught (under panic = "abort"
+        // there is none to catch). A Java exception a failed JNI call left
+        // pending stays pending, as it did; NativeBlsBackend maps it to false.
         let outcome = env.with_env(|env| -> jni::errors::Result<Option<bool>> {
             Ok(verify(env, pubkeys, count, message, signature))
         });

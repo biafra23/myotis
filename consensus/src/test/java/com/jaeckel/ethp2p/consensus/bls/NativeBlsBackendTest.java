@@ -40,6 +40,7 @@ class NativeBlsBackendTest {
             pubkeys.add(BlsVerifier.serializeG1(pk));
             sum.add(sk);
         }
+        sum.norm();
         byte[] message = new byte[32];
         for (int i = 0; i < message.length; i++) message[i] = (byte) (i + 1);
         ECP2 h = HashToCurve.hashToG2(message, POP_DST);
