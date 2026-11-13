@@ -1,0 +1,151 @@
+# Dependency updates as reviewed PRs (#734, Part 3, decision D-e). Every pin in
+# this repo is exact — actions by commit SHA, crates by Cargo.lock, Gradle
+# modules by lockfile + verification-metadata.xml — so nothing moves on its own;
+# this is how the pins move ON PURPOSE.
+#
+# Gradle PRs need their pins regenerated (Dependabot edits the catalog but not
+# the lockfiles or the hash list): gradle-pins-dependabot.yml does that on the
+# Linux host and pushes the result to the PR branch; per-host hashes, if a bump
+# needs any, come from the `gradle pins` check's merged artifact
+# (scripts/update_gradle_pins.sh --from-ci). Review the hash diff like code.
+#
+# Not covered by any ecosystem here, so bumped by hand in a reviewed PR:
+# rust/rust-toolchain.toml, gradle/libs.versions.toml's android-ndk /
+# android-build-tools / cargo-ndk, .java-version, .xcode-version, the runner
+# image labels, and the test-only interpreters that still float on purpose
+# (setup-python `3.x` in mm-replay-tests.yml, Node `20` in smoke-gate-tests.yml:
+# neither touches a shipped artifact), docs/tour/workbook/solution/Cargo.toml,
+# whose `=` pins of tokio and futures follow the workspace's by hand, the Go
+# engine's go/go.mod + go.sum, and scripts/swarm-cli/package-lock.json (the
+# swarm-cli that scripts/publish_site_swarm.mjs runs, which pulls in
+# @ethersphere/bee-js; security updates only).
+# claude-review.yml is excluded (see the github-actions entry).
+#
+# Grouped, and Cargo and Gradle monthly, so the routine moves arrive as a
+# handful of PRs instead of one per dependency: every PR runs the whole PR workflow set (and a
+# Gradle one the pin regeneration), and, moving a pin, needs a dispatched
+# `reproducible builds` run before it merges — per dependency, that cost
+# multiplied by every crate and library in the tree. A group without
+# `group-by` is ONE PR across all directories of its entry, so the three
+# Cargo workspaces, which share myotis-net by path, move together and their
+# three locks with them.
+#
+# One routine group per ecosystem holds what should not break; every update
+# that may break comes as a PR of its own (owner's decision, 2026-11-12), so
+# one migration never waits on another. Where the line falls differs per
+# ecosystem, because Dependabot classifies an update by the first version
+# segment that moves, not by the ecosystem's compatibility rule:
+# - Gradle: minor + patch grouped; each major its own PR. The Gradle wrapper
+#   is out of the group: it is the build tool itself (the pin regeneration
+#   runs under it, and its move needs its own `reproducible builds` run), so
+#   its minors come as a PR of their own too.
+# - Cargo: patches grouped; each minor or major its own PR. Cargo treats a
+#   0.x minor (0.11 -> 0.12) as breaking, and most of this tree's `=` pins
+#   are 0.x (libp2p, discv5, k256, sha2, sha3, aes, hmac, Arti ...). 1.x
+#   minors come one by one with them. `group-by: dependency-name` makes each
+#   one PR across the three workspaces; left ungrouped, a crate would move
+#   in three PRs, each regenerating one lock of three.
+#
+# The actions stay weekly and in one group: GitHub raises no Dependabot
+# alerts for actions pinned by SHA, which every action here is, so this run
+# is the only path by which a bad action gets replaced.
+#
+# To defer a major, add an `ignore:` entry with
+# `update-types: ["version-update:semver-major"]` to its entry here, like the
+# claude-code-action one, rather than a `@dependabot ignore` comment: the
+# decision stays in the tree and in review, and the dependency's in-major
+# line keeps arriving in the routine group (an outstanding major otherwise
+# takes it out of that group).
+#
+# Security updates are on, and so is "Grouped security updates" (repository
+# settings, Advanced Security; checked 2026-11-12). The groups here cover
+# version updates only, so that setting decides: security updates come
+# off-schedule, one PR per package manager and directory. A Cargo one edits
+# the shared rust/myotis-net/Cargo.toml from one workspace, so the other two
+# locks need `cargo update --workspace` by hand before `cargo locks` passes.
+# The actions get none at all (see above).
+#
+# Cooldown: a version update waits until its release is 7 days old (owner's
+# decision, 2026-11-12, after the Ethersphere bee-js / Swarm Desktop supply-
+# chain attack of 2026-11-09: a malicious release published from a stolen CI
+# credential, with valid provenance, pulled within hours). Such releases are
+# usually caught and yanked within days, so the wait keeps Dependabot from
+# proposing one. Dependabot's own default is 3 days; this makes it longer and
+# visible. It does not delay SECURITY updates (Dependabot never applies a
+# cooldown to them). On GitHub Actions only `default-days` exists. The same
+# 7 days hold for a HAND bump of the trees above that no entry covers: never
+# regenerate a lock onto a release younger than that (`npm install`, `npm
+# update`, `go get` take whatever is newest that minute). It filters the
+# version Dependabot proposes, not the transitives a lock regeneration picks
+# that day (the lock and hash diff stays the check for those). For the actions
+# it delays the fix as well, since they get no security updates: when an
+# advisory names an action used here, move its SHA by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directories:
+      - "/"
+      - "/.github/actions/*"
+    # claude-review.yml must equal main's copy or the automated review skips
+    # the PR (its header) — so a grouped bump that touched it would land every
+    # other action move unreviewed. Its actions are moved by hand, in their
+    # own PR into main.
+    exclude-paths:
+      - ".github/workflows/claude-review.yml"
+    ignore:
+      - dependency-name: "anthropics/claude-code-action"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directories:
+      - "/rust"
+      - "/rust/roost"
+      - "/rust/tor-poc"
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      cargo-patch:
+        update-types: ["patch"]
+      cargo-minor-major:
+        update-types: ["minor", "major"]
+        group-by: dependency-name
+
+  - package-ecosystem: gradle
+    directory: "/"
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    # Compose waits for AGP 9 (owner's decision, 2026-11-12). androidx
+    # Compose 1.12 (which Compose Multiplatform 1.12 brings) requires AGP
+    # 9.1+ and compileSdk 37; this build is on AGP 8.7.3 / compileSdk 35, so
+    # #800's group failed AGP's AAR-metadata check and held back every other
+    # update in it. Compose Multiplatform patches still arrive; the androidx
+    # Compose BOM is held entirely, its calendar version (2024.11.00) making
+    # every newer release a minor or a major here, so the migration moves it by hand.
+    # kotlinx-datetime waits with Compose: the catalog keeps it in sync with
+    # what Compose ships (a 0.x line whose last minor broke binaries, and the
+    # mismatch failed at run time on desktop). The AGP 9 migration (#818,
+    # after Gradle 9.6+) moves all three and removes these entries; Dependabot
+    # shows nothing for an ignored update, so that issue is the reminder.
+    ignore:
+      - dependency-name: "org.jetbrains.compose*"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "androidx.compose*"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "org.jetbrains.kotlinx:kotlinx-datetime"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+    groups:
+      gradle-minor-patch:
+        update-types: ["minor", "patch"]
+        exclude-patterns: ["gradle-wrapper"]

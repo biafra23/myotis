@@ -10,7 +10,7 @@
 # xcodebuild + lipo).
 #
 # One-time setup:
-#   rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+#   (cd rust && rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios)
 #
 # Then: rust/build-xcframework.sh
 #   -> rust/target/ios-xcframework/MyotisEngine.xcframework
@@ -25,6 +25,8 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
+# Fixed source-path prefixes in the shipped libs (#734 D2; the file says why).
+. "$here/repro-env.sh"
 out="$here/target/ios-xcframework"
 hdrs="$out/headers"
 framework="$out/MyotisEngine.xcframework"
@@ -44,7 +46,7 @@ echo "==> Building release staticlibs"
 # slices, which is the documented path (see the Cargo.toml comment).
 for t in "$DEVICE" "$SIM_ARM" "$SIM_X86"; do
   echo "    - $t"
-  cargo rustc -p myotis-engine --release --crate-type staticlib --target "$t"
+  cargo rustc --locked -p myotis-engine --release --crate-type staticlib --target "$t"
 done
 
 echo "==> Staging header + modulemap"
@@ -75,5 +77,7 @@ xcodebuild -create-xcframework \
   -library "$here/target/$DEVICE/release/$libname" -headers "$hdrs" \
   -library "$out/sim/$libname" -headers "$hdrs" \
   -output "$framework"
+# xcodebuild lists the slices in no fixed order (#734, Part 5a).
+python3 -I "$here/../scripts/normalize_xcframework.py" "$framework"
 
 echo "==> Done: $framework"

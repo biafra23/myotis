@@ -969,6 +969,27 @@ mod tests {
         myotis_stop(handle);
     }
 
+    /// `myotis_set_listen_ports` (ABI 57) on a created handle: accepted and
+    /// stashed in argument order; a set with a shared UDP port refused with the
+    /// earlier set left in place; gone with the handle; refused once unknown.
+    #[test]
+    fn listen_ports_are_applied_or_refused_across_the_c_abi() {
+        use crate::host::{listen_ports_of, ListenPorts};
+        let dir = std::env::temp_dir().join("myotis-capi-listen-ports-test");
+        let dir = CString::new(dir.to_str().unwrap()).unwrap();
+        let handle = unsafe { myotis_create(c"mainnet".as_ptr(), dir.as_ptr()) };
+        assert!(handle >= 1, "create failed: {handle}");
+        let set = ListenPorts { discv4: 30305, discv5: 9005, libp2p_tcp: 9105, libp2p_quic: 9106 };
+        assert_eq!(listen_ports_of(handle), ListenPorts::default());
+        assert!(myotis_set_listen_ports(handle, 30305, 9005, 9105, 9106));
+        assert_eq!(listen_ports_of(handle), set);
+        assert!(!myotis_set_listen_ports(handle, 9000, 9000, 0, 0));
+        assert_eq!(listen_ports_of(handle), set, "a refused set changes nothing");
+        myotis_stop(handle);
+        assert_eq!(listen_ports_of(handle), ListenPorts::default());
+        assert!(!myotis_set_listen_ports(handle, 30305, 9005, 9105, 9106));
+    }
+
     /// How the state reads' `block` crosses the C ABI (ABI 32): NULL is the
     /// head; `finalized` is its own anchor; a selector no retry can serve is
     /// refused as invalid params, never read as the head.
@@ -1150,6 +1171,26 @@ pub unsafe extern "C" fn myotis_set_boot_enodes(
         Some(j) => crate::host::set_boot_enodes_json(handle, &j),
         None => false,
     }
+}
+
+/// Pin the handle's P2P listen ports (ABI ≥ 57): discv4 (UDP), discv5 (UDP),
+/// the libp2p req/resp host's TCP port and its QUIC (UDP) port; 0 = OS-assigned,
+/// the default. Call between create and start (or while paused); refused for a
+/// running or unknown handle and for one UDP port shared by two protocols (see
+/// `host::set_listen_ports`). Plain C ABI only, like
+/// `myotis_create_with_checkpoint`: the JVM hosts keep their own port knobs.
+#[no_mangle]
+pub extern "C" fn myotis_set_listen_ports(
+    handle: i64,
+    discv4: u16,
+    discv5: u16,
+    libp2p_tcp: u16,
+    libp2p_quic: u16,
+) -> bool {
+    crate::host::set_listen_ports(
+        handle,
+        crate::host::ListenPorts { discv4, discv5, libp2p_tcp, libp2p_quic },
+    )
 }
 
 /// Log-index status JSON (see ffi::log_index_status_json).

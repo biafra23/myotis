@@ -139,12 +139,14 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> RlpxConnection<S> {
         peer_pubkey: [u8; 64],
         traffic: Option<Arc<TrafficMeter>>,
     ) -> Result<RlpxConnection<S>, String> {
-        // Fresh entropy for this handshake.
-        let eph_secret = random32();
-        let local_nonce = random32();
-        let ecies_eph = random32();
-        let ecies_iv = random16();
-        let padding = random_padding();
+        // Fresh entropy for this handshake. No entropy, no handshake: the dial
+        // fails like any other (the caller tries another peer); it never panics,
+        // which under the release profile's `panic = "abort"` would kill the host.
+        let eph_secret = random_bytes::<32>()?;
+        let local_nonce = random_bytes::<32>()?;
+        let ecies_eph = random_bytes::<32>()?;
+        let ecies_iv = random_bytes::<16>()?;
+        let padding = random_padding()?;
 
         let mut initiator = Initiator::new(&local_key, peer_pubkey, &eph_secret, local_nonce)
             .map_err(|e| format!("rlpx init: {}", e.0))?;
@@ -359,32 +361,61 @@ async fn read_ack<S: AsyncReadExt + Unpin>(stream: &mut S) -> Result<Vec<u8>, St
     Ok(wire)
 }
 
-fn random32() -> [u8; 32] {
-    let mut b = [0u8; 32];
-    getrandom::getrandom(&mut b).expect("OS entropy");
-    b
-}
-
-fn random16() -> [u8; 16] {
-    let mut b = [0u8; 16];
-    getrandom::getrandom(&mut b).expect("OS entropy");
-    b
+/// `N` bytes of OS entropy, or the reason there are none (early boot, a
+/// seccomp sandbox that blocks the syscall). An error, never a panic: the
+/// handshake's secret keys, nonce and IV come from here (#823).
+fn random_bytes<const N: usize>() -> Result<[u8; N], String> {
+    let mut b = [0u8; N];
+    fill_entropy(&mut b)?;
+    Ok(b)
 }
 
 /// EIP-8 padding: 100-300 random bytes (a trailing auth-body list element).
-fn random_padding() -> Vec<u8> {
-    let mut len_byte = [0u8; 1];
-    getrandom::getrandom(&mut len_byte).expect("OS entropy");
-    let len = 100 + usize::from(len_byte[0]) % 201; // 100..=300, matching the reference
+fn random_padding() -> Result<Vec<u8>, String> {
+    let [len_byte] = random_bytes::<1>()?;
+    let len = 100 + usize::from(len_byte) % 201; // 100..=300, matching the reference
     let mut pad = vec![0u8; len];
-    getrandom::getrandom(&mut pad).expect("OS entropy");
-    pad
+    fill_entropy(&mut pad)?;
+    Ok(pad)
+}
+
+/// The text every handshake entropy failure carries, so a caller can tell OUR
+/// missing randomness from a peer that failed ([`is_local_entropy_failure`]).
+const ENTROPY_UNAVAILABLE: &str = "rlpx: OS entropy unavailable";
+
+fn fill_entropy(dest: &mut [u8]) -> Result<(), String> {
+    getrandom::fill(dest).map_err(|e| format!("{ENTROPY_UNAVAILABLE}: {e}"))
+}
+
+/// Whether a dial or handshake error is this host's missing entropy, not the
+/// peer's doing. Such an error must not count against the peer: no strike, no
+/// eviction from the warm-start cache, no "unreachable" verdict over Tor.
+pub(crate) fn is_local_entropy_failure(error: &str) -> bool {
+    error.contains(ENTROPY_UNAVAILABLE)
 }
 
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handshake_entropy_is_well_shaped_and_attributable() {
+        // The failure path cannot be forced without a custom getrandom backend;
+        // the type is what guarantees it: these return Result, so a missing
+        // source becomes a failed dial, not a panic (#823).
+        let a = random_bytes::<32>().expect("entropy on the test host");
+        let b = random_bytes::<32>().expect("entropy on the test host");
+        assert_ne!(a, b, "two 32-byte draws collided");
+        for _ in 0..64 {
+            let pad = random_padding().expect("entropy on the test host");
+            assert!((100..=300).contains(&pad.len()), "EIP-8 padding length {}", pad.len());
+        }
+        // A failure, however a caller wraps it, is recognisable as ours.
+        let wrapped = format!("tor rlpx handshake to 1.2.3.4:30303: {ENTROPY_UNAVAILABLE}: errno 38");
+        assert!(is_local_entropy_failure(&wrapped));
+        assert!(!is_local_entropy_failure("rlpx read ack body: connection reset"));
+    }
 
     #[test]
     fn hello_round_trip() {

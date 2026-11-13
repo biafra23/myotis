@@ -9,17 +9,22 @@
 #
 # Called as a job by every workflow that uploads assets to a `v*` tag's release:
 # android-apk, ci, desktop-dmg, desktop-linux-deb, engine-library, ios-framework,
-# ios-xcframework, node-binding, railgun-dmg. Each one gates the call on startsWith(github.ref, 'refs/tags/v')
+# ios-xcframework, node-binding, railgun-dmg, sbom. Each one gates the call on startsWith(github.ref, 'refs/tags/v')
 # and makes its publishing job needs: it, so a mismatch fails the run before
 # anything is uploaded. Because it is a separate job it runs in PARALLEL with the
 # builds, and the whole step is ~30s, so the verdict lands long before a
 # 40-minute dmg leg. (Those legs still run to completion — Actions has no
 # cross-job fail-fast.)
 #
-# Keep that list exhaustive: every workflow that uploads to a release (`gh release
-# upload`, `gh release create <tag> <files>`, action-gh-release) belongs in it and
-# must call this guard. An audit reads this list — while it was stale,
-# ios-xcframework published unguarded.
+# Keep that list exhaustive: every workflow that uploads to a release belongs in
+# it and must call this guard. An audit reads this list — while it was stale,
+# ios-xcframework published unguarded. Each of them uploads through
+# .github/release-assets.sh, never with a bare `gh release upload`, `gh release
+# create <tag> <files>` or action-gh-release `files:` (#734): the script checks
+# that the release serves the bytes the job built, the job then attests the
+# uploaded files' provenance, and its last step (`release-assets.sh
+# --checksums`) keeps the release's SHA256SUMS complete.
+# scripts/test_release_assets.sh fails on a bare upload in any workflow.
 #
 # GitHub has no cross-workflow job dependencies, so "one shared guard" means one
 # shared *definition*: this file is the single source of the check, instantiated
@@ -46,7 +51,7 @@ on:
 jobs:
   verify:
     name: Verify tag matches project version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # This job gates every release upload, so a wedged Gradle configuration must
     # not hold the release hostage for the 6-hour default. Generous enough that
     # three COLD attempts plus their two 25s sleeps still end in the explicit
@@ -54,21 +59,27 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    env:
+      # :printReleaseVersion needs no Rust, but configuring the build probes
+      # `cargo --version` in rust/, where rustup would auto-install the pinned
+      # toolchain on an image whose stable differs (#734/#746). Off, the probe
+      # reports "no cargo" and the Rust tasks skip.
+      RUSTUP_AUTO_INSTALL: '0'
 
     steps:
       # No `submodules: recursive` (unlike the sibling build jobs): the repo has
       # none, and this job only ever reads the build scripts.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78  # v6.2.0
         with:
-          java-version: '21'
+          java-version-file: .java-version  # exact Temurin release, one place (#734)
           distribution: 'temurin'
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c  # v6.4.1
 
       - name: Make gradlew executable
         run: chmod +x gradlew

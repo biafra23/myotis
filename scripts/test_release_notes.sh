@@ -137,7 +137,7 @@ bash $R create v1 "$sec" extra 2> /dev/null; rc=$?
 check "an extra argument is a usage error" '[ $rc = 2 ]'
 
 # The sections the workflows write: each yields a label, none in the master.
-for wf in ios-framework ios-xcframework node-binding engine-library; do
+for wf in ios-framework ios-xcframework node-binding engine-library sbom; do
   awk '/cat > "\$section" <<.SECTION./ { on = 1; next } on && /^ *SECTION$/ { exit } on { sub(/^          /, ""); print }' \
     ".github/workflows/$wf.yml" > "$T/$wf.md"
   label=$(sed -n '1s/^\(\*\*[^*][^*]*\*\*\).*$/\1/p' "$T/$wf.md")
