@@ -140,11 +140,11 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> RlpxConnection<S> {
         traffic: Option<Arc<TrafficMeter>>,
     ) -> Result<RlpxConnection<S>, String> {
         // Fresh entropy for this handshake.
-        let eph_secret = random32();
-        let local_nonce = random32();
-        let ecies_eph = random32();
-        let ecies_iv = random16();
-        let padding = random_padding();
+        let eph_secret = random32()?;
+        let local_nonce = random32()?;
+        let ecies_eph = random32()?;
+        let ecies_iv = random16()?;
+        let padding = random_padding()?;
 
         let mut initiator = Initiator::new(&local_key, peer_pubkey, &eph_secret, local_nonce)
             .map_err(|e| format!("rlpx init: {}", e.0))?;
@@ -359,26 +359,26 @@ async fn read_ack<S: AsyncReadExt + Unpin>(stream: &mut S) -> Result<Vec<u8>, St
     Ok(wire)
 }
 
-fn random32() -> [u8; 32] {
+fn random32() -> Result<[u8; 32], String> {
     let mut b = [0u8; 32];
-    getrandom::fill(&mut b).expect("OS entropy");
-    b
+    getrandom::getrandom(&mut b).map_err(|e| format!("OS entropy: {e}"))?;
+    Ok(b)
 }
 
-fn random16() -> [u8; 16] {
+fn random16() -> Result<[u8; 16], String> {
     let mut b = [0u8; 16];
-    getrandom::fill(&mut b).expect("OS entropy");
-    b
+    getrandom::getrandom(&mut b).map_err(|e| format!("OS entropy: {e}"))?;
+    Ok(b)
 }
 
 /// EIP-8 padding: 100-300 random bytes (a trailing auth-body list element).
-fn random_padding() -> Vec<u8> {
+fn random_padding() -> Result<Vec<u8>, String> {
     let mut len_byte = [0u8; 1];
-    getrandom::fill(&mut len_byte).expect("OS entropy");
+    getrandom::getrandom(&mut len_byte).map_err(|e| format!("OS entropy: {e}"))?;
     let len = 100 + usize::from(len_byte[0]) % 201; // 100..=300, matching the reference
     let mut pad = vec![0u8; len];
-    getrandom::fill(&mut pad).expect("OS entropy");
-    pad
+    getrandom::getrandom(&mut pad).map_err(|e| format!("OS entropy: {e}"))?;
+    Ok(pad)
 }
 
 

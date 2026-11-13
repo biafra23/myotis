@@ -822,6 +822,10 @@ impl PoolInner {
     /// claim lock, so no direct dial of a node is claimed while it moves; the
     /// common case, a reserve already at its share, costs a count.
     async fn balance_tor_reserve(&self, grow: bool) {
+        // Fail closed if entropy for Tor reserve salt is unavailable.
+        if !tor_reserve_salt_valid() {
+            return;
+        }
         let target = {
             let cache = self.cache.lock().await;
             let reserve = self.tor_reserve.lock().unwrap_or_else(|p| p.into_inner());
@@ -1287,6 +1291,12 @@ impl PoolInner {
         let conn = match RlpxConnection::dial_metered(Arc::clone(&self.key), addr, pubkey, Some(Arc::clone(&self.traffic))).await {
             Ok(conn) => conn,
             Err(e) => {
+                // Local entropy failure: do not penalize peers for OS-level issues.
+                if e.contains("OS entropy") {
+                    tracing::warn!(%addr, error = %e, "el dial: local entropy unavailable");
+                    self.attempted.lock().await.remove(&addr);
+                    return;
+                }
                 // Transport-level failure (refused/timeout/ECIES) — the peer is
                 // GONE, not incompatible. Streaks of these demote and eventually
                 // evict it from the warm-start cache. (Deliberately broader than
@@ -1730,7 +1740,9 @@ impl PeerPool {
         // A fresh order among equals for each call: successive reads spread
         // over the reserve instead of all reaching its first few nodes.
         let mut seed = [0u8; 8];
-        let _ = getrandom::fill(&mut seed);
+        if let Err(e) = getrandom::fill(&mut seed) {
+            tracing::debug!(error = %e, "Tor reserve seed entropy unavailable: using zero");
+        }
         let cached = self
             .inner
             .tor_reserve
@@ -2135,13 +2147,21 @@ impl ContactLog {
 
 /// A per-process secret that orders the reserve's fill, so which peers a
 /// wallet sets aside for Tor is its own: with a fleet-wide order, every Myotis
-/// node would reach the same peers only over Tor.
+/// node would reach the same peers only over Tor. SECURITY-CRITICAL: a
+/// predictable salt allows an attacker to grind node IDs to the front of every
+/// wallet's reserve.
 static TOR_RESERVE_SALT: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
     let mut salt = [0u8; 32];
-    // No entropy: an all-zero salt still fills the reserve, in a guessable order.
-    let _ = getrandom::fill(&mut salt);
+    if let Err(e) = getrandom::fill(&mut salt) {
+        tracing::warn!(error = %e, "Tor reserve salt entropy unavailable: using zero");
+    }
     salt
 });
+
+/// Check if the Tor reserve salt is valid (non-zero).
+fn tor_reserve_salt_valid() -> bool {
+    TOR_RESERVE_SALT != [0u8; 32]
+}
 
 /// Pure: `node`'s place in the fill order drawn with `salt`.
 fn tor_reserve_draw_with(salt: &[u8; 32], node: &[u8; 64]) -> u64 {
