@@ -38,8 +38,9 @@ under a temporary name, checked against GitHub's own digest of it, and only
 then swapped in, so the release never lacks an archive while a slow upload runs.
 
 Runs where a synced full node per network answers JSON-RPC: zbox, whose geths
-serve on loopback (Gnosis 8562, mainnet 8561, Sepolia 8560; ``--rpc`` overrides
-them). That is also why this is a script and not a workflow: no GitHub runner
+serve on loopback (Gnosis 8562, Sepolia 8560) except mainnet's, which listens on
+zbox's tailscale address only (100.108.254.12:8561) so the tailnet can reach it;
+``--rpc`` overrides any of them. That is also why this is a script and not a workflow: no GitHub runner
 can reach those nodes, and they are the seeds' only source. Resumable — run it
 again after an interruption and each delta fetch continues where it stopped.
 """
@@ -98,7 +99,7 @@ SEEDS = {s.name: s for s in (
     Seed("railgun-sepolia", "sepolia", 11_155_111, "0xecfcf3b4ec647c4ca6d49108b311b7a7c9543fea", 5_784_774,
          "http://127.0.0.1:8560", "railgun-logs", 0, "railgun-seed-sepolia.tar.gz", "Sepolia"),
     Seed("railgun-mainnet", "mainnet", 1, "0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9", 14_737_691,
-         "http://127.0.0.1:8561", "railgun-logs", 0, "railgun-seed.tar.gz", "Mainnet"),
+         "http://100.108.254.12:8561", "railgun-logs", 0, "railgun-seed.tar.gz", "Mainnet"),
 )}
 
 
@@ -651,7 +652,7 @@ def main():
                     help="build and check the RAILGUN archives but do not touch the release "
                          "(the Bee seed is still written into the tree, where git shows the change)")
     ap.add_argument("--rpc", action="append", default=[], metavar="NETWORK=URL",
-                    help="a network's JSON-RPC endpoint (default: zbox's loopback ports)")
+                    help="a network's JSON-RPC endpoint (default: zbox's geths, see above)")
     ap.add_argument("--state-dir", default="~/myotis-node/poc-seeds",
                     help="the published RAILGUN archives, the delta fetches and the scratch space "
                          "(default %(default)s; put a copy of a published archive at "
