@@ -1289,8 +1289,13 @@ impl PoolInner {
             Err(e) if crate::el::rlpx::transport::is_local_entropy_failure(&e) => {
                 // OUR randomness is missing (early boot, a seccomp sandbox): no
                 // handshake can run against anyone, and it is not this peer's
-                // doing — no cache strike, no backoff against it.
+                // doing — no cache strike. The address still cools off, like
+                // every other dial that ends outside the pool: the peer accepted
+                // our TCP connection, so its inbound throttle is armed
+                // (`PEER_INBOUND_THROTTLE`) and a re-dial inside it would only
+                // buy the strike this arm avoids.
                 tracing::warn!(%addr, error = %e, "el dial: no OS entropy, handshake skipped");
+                self.record_backoff(addr, BackoffKind::Transient, Instant::now()).await;
                 self.attempted.lock().await.remove(&addr);
                 return;
             }
