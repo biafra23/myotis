@@ -866,7 +866,17 @@ impl PoolInner {
                         && !cache.is_bal_server(c.addr)
                 })
                 .collect();
-            picks.sort_by_key(|c| tor_reserve_draw(&c.pubkey));
+            // No salt, no fill: an all-zero salt would set aside the same,
+            // computable peers in every wallet whose draw failed (#823). The
+            // nodes already in the reserve stay usable, and the next fill
+            // draws again.
+            match tor_reserve_salt() {
+                Some(salt) => {
+                    tor_entropy_recovered();
+                    picks.sort_by_key(|c| tor_reserve_draw_with(&salt, &c.pubkey));
+                }
+                None => picks.clear(),
+            }
             let need = target.saturating_sub(reserve.len());
             for c in picks.into_iter().take(need) {
                 let Some(peer) = cache.remove(c.addr) else { continue };
@@ -1728,9 +1738,14 @@ impl PeerPool {
         self.inner.prune_closed().await;
         self.inner.balance_tor_reserve(true).await;
         // A fresh order among equals for each call: successive reads spread
-        // over the reserve instead of all reaching its first few nodes.
-        let mut seed = [0u8; 8];
-        let _ = getrandom::fill(&mut seed);
+        // over the reserve instead of all reaching its first few nodes. No
+        // seed, no candidates: a fixed order would send every Tor read of this
+        // process to the same, computable node first (#823). Empty is the
+        // fail-closed answer the Tor path already handles.
+        let Some(seed) = draw_secret::<8>(getrandom::fill) else {
+            return Vec::new();
+        };
+        tor_entropy_recovered();
         let cached = self
             .inner
             .tor_reserve
@@ -2135,23 +2150,61 @@ impl ContactLog {
 
 /// A per-process secret that orders the reserve's fill, so which peers a
 /// wallet sets aside for Tor is its own: with a fleet-wide order, every Myotis
-/// node would reach the same peers only over Tor.
-static TOR_RESERVE_SALT: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
-    let mut salt = [0u8; 32];
-    // No entropy: an all-zero salt still fills the reserve, in a guessable order.
-    let _ = getrandom::fill(&mut salt);
-    salt
-});
+/// node would reach the same peers only over Tor. Set once, by the first
+/// successful draw; never a fallback value (#823): while the OS has no entropy
+/// the reserve takes in no node, and the next fill draws again.
+static TOR_RESERVE_SALT: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+/// This process's reserve salt, drawn on first use; `None` while the OS cannot
+/// supply entropy (early boot, a seccomp sandbox), so the caller fails closed.
+fn tor_reserve_salt() -> Option<[u8; 32]> {
+    if let Some(salt) = TOR_RESERVE_SALT.get() {
+        return Some(*salt);
+    }
+    let drawn = draw_secret::<32>(getrandom::fill)?;
+    Some(*TOR_RESERVE_SALT.get_or_init(|| drawn))
+}
+
+/// `N` bytes from `fill`, or `None` if it fails: the Tor reserve's secrets
+/// (the fill salt, the per-call seed) have no fallback value. An all-zero
+/// value would be a fleet-wide, computable order (#823). `fill` is a parameter
+/// so the failure path is testable.
+fn draw_secret<const N: usize>(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), getrandom::Error>,
+) -> Option<[u8; N]> {
+    let mut b = [0u8; N];
+    match fill(&mut b) {
+        Ok(()) => Some(b),
+        Err(e) => {
+            warn_no_tor_entropy(&e);
+            None
+        }
+    }
+}
+
+/// One WARN per outage, not one per call: set on a failed draw, cleared by the
+/// next successful one ([`tor_entropy_recovered`]).
+static TOR_ENTROPY_MISSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn warn_no_tor_entropy(e: &getrandom::Error) {
+    if !TOR_ENTROPY_MISSING.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            error = %e,
+            "tor: no OS entropy; the Tor reserve takes in no node and Tor reads fail closed until it returns"
+        );
+    }
+}
+
+fn tor_entropy_recovered() {
+    if TOR_ENTROPY_MISSING.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!("tor: OS entropy is back");
+    }
+}
 
 /// Pure: `node`'s place in the fill order drawn with `salt`.
 fn tor_reserve_draw_with(salt: &[u8; 32], node: &[u8; 64]) -> u64 {
     let h = myotis_core::keccak::keccak256_concat(salt, node);
     u64::from_le_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]])
-}
-
-/// `node`'s place in this process's fill order ([`tor_reserve_draw_with`]).
-fn tor_reserve_draw(node: &[u8; 64]) -> u64 {
-    tor_reserve_draw_with(&TOR_RESERVE_SALT, node)
 }
 
 /// `node`'s place in one call's order among equally ranked reserve nodes.
@@ -2389,6 +2442,25 @@ mod tor_eligible_tests {
         let (a, b) = ([1u8; 32], [2u8; 32]);
         assert_eq!(order(&a), order(&a));
         assert_ne!(order(&a)[..10], order(&b)[..10], "another wallet sets other peers aside");
+    }
+
+    #[test]
+    fn a_failed_draw_yields_no_secret_never_a_zero_one() {
+        // The fail-closed contract of the reserve's salt and seed (#823): a
+        // failing source gives None, so the caller takes in no node / returns
+        // no candidate, never an all-zero, fleet-wide order.
+        let failing = |_: &mut [u8]| Err(getrandom::Error::UNSUPPORTED);
+        assert_eq!(draw_secret::<32>(failing), None);
+        assert_eq!(draw_secret::<8>(failing), None);
+        let filled = draw_secret::<8>(|b: &mut [u8]| {
+            b.fill(7);
+            Ok(())
+        });
+        assert_eq!(filled, Some([7u8; 8]));
+        // On this host the real source works, and the salt is drawn once.
+        let salt = tor_reserve_salt().expect("entropy on the test host");
+        assert_ne!(salt, [0u8; 32]);
+        assert_eq!(tor_reserve_salt(), Some(salt), "one salt per process");
     }
 
     #[test]
