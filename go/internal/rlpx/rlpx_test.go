@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ecdsa"
 	"encoding/hex"
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/crypto"
@@ -338,4 +339,29 @@ func mustEphPub(t *testing.T, secret []byte) []byte {
 		t.Fatal(err)
 	}
 	return pub64(k)
+}
+
+// TestEcdhXRefusesOutOfRangeCoordinate pins the property the
+// go-ethereum v1.16.8 -> v1.16.9 bump (PR #838) bought: a peer point whose
+// coordinate is a NON-CANONICAL encoding — x = P+1 satisfies y^2 = x^3+7
+// (mod P) but is not a field element, so it re-encodes the valid point (1, y).
+// go-ethereum <= v1.16.8 checked the equation mod P only (CVE-2026-26314) and
+// accepted it, which is the same shape that made enode.NewV4 panic on a discv4
+// Neighbors reply; v1.16.9 added the range check and refuses it.
+//
+// Without this vector nothing in go/ fails if go.mod drifts back to v1.16.8 or
+// a curve swap reopens the gap: the fix lives in a hand-maintained pin, and
+// the other EcdhX tests only cover truncation and wrong-AAD. (The bx == nil
+// branch in ecies.go is the belt for THIS module's own path; it cannot be
+// reached through EcdhX because the on-curve check runs first, so this test
+// guards the point-validation step that check relies on.)
+func TestEcdhXRefusesOutOfRangeCoordinate(t *testing.T) {
+	// Arithmetic verified against secp256k1's own parameters (x == P+1, x >= P,
+	// y in range, y^2 == x^3+7 mod P) before it was wired to the crypto here.
+	x, _ := hex.DecodeString("fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc30") // P+1
+	y, _ := hex.DecodeString("4218f20ae6c646b363db68605822fb14264ca8d2587fdd6fbc750d587e76a7ee") // sqrt(8) mod P
+	_, err := EcdhX(mustKey(t, "ecdh:range"), append(x, y...))
+	if err == nil || !strings.Contains(err.Error(), "not on secp256k1") {
+		t.Fatalf("out-of-range peer point must be refused at the on-curve check, got %v", err)
+	}
 }
