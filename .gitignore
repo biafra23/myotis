@@ -46,6 +46,10 @@ app/peers.cache
 # committed because these were only ignored under /go/.
 nodekey
 nodedb/
+# …but not the Go source package of that name (PR #832 review: an unanchored
+# `nodekey` ignores the whole directory, so new files there vanish from
+# `git status`/`git add -A` — the exact failure that committed the key).
+!/go/internal/nodekey/
 /go/myotis-go-data/
 /go/myotis-go
 /go/myotis-lc

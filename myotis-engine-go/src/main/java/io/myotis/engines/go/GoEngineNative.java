@@ -2,9 +2,12 @@ package io.myotis.engines.go;
 
 import com.sun.jna.Library;
 import com.sun.jna.Native;
+import com.sun.jna.Library;
 import com.sun.jna.Pointer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.util.Map;
 
 /**
  * The FFI boundary to {@code libmyotis_engine_go} ({@code go/cmd/myotis-capi}, built
@@ -103,9 +106,20 @@ final class GoEngineNative {
     }
 
     private static GoEngineLibrary loadLibrary() {
+        // UTF-8 for String ARGUMENTS, pinned (PR #832 review): JNA's default is
+        // jna.encoding → native.encoding → the platform charset, while the Go side
+        // reads every char* as UTF-8 (C.GoString) and take() below decodes returns
+        // as UTF-8 explicitly. Left to the default, a non-ASCII dataDir
+        // ("C:\\Users\\Jäckel\\.myotis" on a Windows ANSI code page, or any
+        // unmappable name under a C/POSIX locale service unit) crosses as cp1252
+        // bytes or '?' substitutions — the replacement-byte collision wellFormed()
+        // exists to keep off this boundary, arriving as a create() failure or a
+        // silently different directory. UniFFI (the Rust twin) passes UTF-8
+        // buffers natively, so only this side needed the option.
+        Map<String, Object> options = Map.of(Library.OPTION_STRING_ENCODING, "UTF-8");
         String explicit = System.getProperty("myotis.engine.go.lib");
         if (explicit != null && !explicit.isBlank()) {
-            return Native.load(explicit, GoEngineLibrary.class);
+            return Native.load(explicit, GoEngineLibrary.class, options);
         }
         // JNA searches jna.library.path, NOT java.library.path — mirror it when
         // unset, exactly as RustEngineNative does for the Rust library.
@@ -115,7 +129,7 @@ final class GoEngineNative {
                 System.setProperty("jna.library.path", jlp);
             }
         }
-        return Native.load("myotis_engine_go", GoEngineLibrary.class);
+        return Native.load("myotis_engine_go", GoEngineLibrary.class, options);
     }
 
     /** Read a returned {@code char*} and release it per the header contract

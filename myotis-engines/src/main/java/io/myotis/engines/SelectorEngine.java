@@ -107,11 +107,19 @@ public final class SelectorEngine implements MyotisEngine {
      * engine exists here — i.e. a Go network was or is hosted (PR #832 review).
      */
     String drainNativeLogs(int max) {
-        // The java choice has no native ring (unchanged rule); rust keeps its
-        // existing semantics, incl. a rust network surviving a later flip.
-        String rust = "java".equals(Engines.choice()) ? "" : RustMyotisEngine.drainLogs(max);
+        // Symmetric rule (PR #832 review): touch a native ring only where this
+        // selector has BUILT that engine or the choice routes to it. Under
+        // "go" the first statement used to class-load the Rust binding on every
+        // pump of a run that never routes to it; under "java"/"rust" the Go
+        // binding must stay unmapped the same way. An engine that was built
+        // once always keeps being drained (its hosted networks survive a later
+        // choice flip and keep filling their ring).
+        String choice = Engines.choice();
+        RustMyotisEngine r = rust;
+        String rust = (r != null || "rust".equals(choice) || "auto".equals(choice))
+                ? RustMyotisEngine.drainLogs(max) : "";
         GoMyotisEngine g = go;
-        String go = (g != null || "go".equals(Engines.choice()))
+        String go = (g != null || "go".equals(choice))
                 ? GoMyotisEngine.drainLogs(max) : "";
         if (rust.isEmpty()) return go;
         if (go.isEmpty()) return rust;

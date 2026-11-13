@@ -137,13 +137,21 @@ Key Gradle modules:
   Desktop-only and select-only, never `auto` (owner's brief, 2026-11: the
   Bee-integration engine, to be used before it is embedded deeper). Mainnet
   only until the multichain step; reads ONLY at the finalized anchor (`latest`
-  is refused, never answered from finalized state); no idle sleep, EVM, block/
-  tx reads, ENS or broadcast yet — each refused by name, not faked (the
-  GoChainHandle class doc is the list). Java 17, depends on nothing from the
+  is refused, never answered from finalized state, and `eth_blockNumber` answers
+  the finalized block — an open owner decision; storage slots only below 2^63,
+  the ABI's int64); no idle sleep, EVM, block/
+  tx reads, ENS, broadcast or Tor yet — each refused by name, not faked (the
+  GoChainHandle class doc is the list; JSON-string reads carry the permanent
+  -32602 envelope, typed reads the retryable null). A `-Pengine=go` desktop
+  launch runs on its own `~/.myotis-go` profile (the shrunken catalog would
+  otherwise prune the shared settings' other networks). Java 17, depends on
+  nothing from the
   Java engine; like `:myotis-engine-rust` it carries no HTTP server and takes
   the loopback listener through the shared `LoopbackRpc` port
   (`:myotis-engine-common`, which hosts it precisely so neither engine module
-  depends on the other). go/README.md §Desktop embed.
+  depends on the other). `goBuildCShared` builds portable blst and with
+  `GOTOOLCHAIN=local` (skips with a note on an old toolchain; CI's Build and
+  Test installs the pinned one via setup-go). go/README.md §Desktop embed.
 - **myotis-engine-rust** — the RUST engine behind the contract on its own
   (`RustMyotisEngine`/`RustChainHandle`/`RustVerifiedReads`/`RustEnsApi`, the Tor
   seam): `rust/myotis-engine` over UniFFI-generated Kotlin bindings + JNA (committed

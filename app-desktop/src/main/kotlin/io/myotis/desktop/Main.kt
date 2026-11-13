@@ -23,6 +23,23 @@ import java.nio.file.Path
  * launch (runtime start — booting must not rewrite the enabled flags) so the Status
  * view fills in as they sync.
  */
+/**
+ * Which profile directory this desktop process runs in (PR #832 review).
+ * PoC flavours already live apart; a `-Pengine=go` launch (the desktop-only
+ * Go engine) gets the same isolation — `~/.myotis-go` — because the Go
+ * engine's catalog lists only what it can RUN, while DesktopSettings treats
+ * the running engine's catalog as the list of every network there is: its
+ * load prunes saved enabled-networks the catalog lacks, and every settings
+ * write rewrites the whole file from the pruned state. Without this, one
+ * `-Pengine=go` launch plus any setting change would silently drop
+ * `gnosis`/`sepolia` and their `rpcPort.<net>` overrides from the shared
+ * `~/.myotis` profile, with nothing logged. The Go engine's `nodekey` and
+ * `nodedb/` stay off the regular profile the same way. A PoC flavour wins
+ * over the engine flag (its directory also carries its seeds).
+ */
+internal fun desktopDataDir(pocDir: Path?, engineProp: String?, home: String): Path =
+    pocDir ?: Path.of(home, if (engineProp?.trim()?.lowercase() == "go") ".myotis-go" else ".myotis")
+
 fun main() {
     // PACKAGED apps: Compose ships appResources inside the bundle and exposes
     // the dir via this property — point the engine loader at the bundled Rust
@@ -46,7 +63,11 @@ fun main() {
     // data dir and seeds its networks' log indexes from the bundle before anything reads
     // that dir. Null for a regular build, which is every build that sets neither property.
     val poc = Poc.active()
-    val dataDir = poc?.dataDir() ?: Path.of(System.getProperty("user.home"), ".myotis")
+    val dataDir = desktopDataDir(
+        pocDir = poc?.dataDir(),
+        engineProp = System.getProperty(io.myotis.engines.Engines.PROP),
+        home = System.getProperty("user.home"),
+    )
     // Keep the PoC's logs in its own data dir too. logback-desktop.xml reads
     // myotis.logdir when the first logger is created, so this must precede
     // every log call (PocFlavour's logger is lazy for exactly this reason).

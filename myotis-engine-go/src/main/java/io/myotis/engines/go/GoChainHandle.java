@@ -47,13 +47,15 @@ import java.util.List;
  *       machinery yet, so every verified read runs at the beacon-FINALIZED state
  *       root: {@link #requestAccount} passes the {@code "finalized"} selector
  *       (the Rust twin passes head), {@code finalized} is the only selector
- *       {@link GoVerifiedReads} serves, and the status's verified-head age ages
- *       by FINALIZED-block advance — and mainnet finalization is slow by
- *       construction: the beacon finalizes ~2–3 epochs (≈13–19 min at 12 s
- *       slots) behind the head, and the checkpoint the Go reader follows moves
- *       only ~once per epoch (≈6.4 min), so the age sits in that band between
- *       ticks and the hosts' 45 s readiness dot reads amber for a Go-hosted
- *       network. That is honest (the read state IS older by design), not a
+ *       {@link GoVerifiedReads} serves, and the status's verified-head age is
+ *       the anchor's TRUE wall-clock age — seconds since the finalized slot's
+ *       wall time, from the catalog's CL genesis (PR #832 review). Mainnet
+ *       finalization is slow by construction: the beacon finalizes ~2–3 epochs
+ *       (≈13–19 min at 12 s slots) behind the head, so that age sits in that
+ *       band continuously and the hosts' 45 s readiness dot reads amber
+ *       continuously for a Go-hosted network (an earlier revision aged by
+ *       "since last advance", which let the dot go green for 45 s of every
+ *       epoch). That is honest (the read state IS older by design), not a
  *       regression to paper over with a constant.</li>
  *   <li><b>No EVM, no block/tx/receipt reads, no ENS, no log index.</b> The
  *       operator queries throw {@link EngineException} (the Rust twin's
@@ -98,9 +100,20 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
     private volatile long startedAtNs;
     private volatile boolean started;
 
-    /** Finalized-anchor freshness for verifiedHeadAgeMs (see class doc): the last
-     *  finalized block number seen and the monotonic time it was first seen,
-     *  guarded so concurrent status() callers cannot tear the pair. */
+    /** The network's CL slot clock (from the catalog entry, via create):
+     *  {@code clGenesisTime} unix-seconds and the slot width. With them the
+     *  verified-head age is the TRUE wall-clock age of the finalized anchor
+     *  (PR #832 review — aging by "time since this handle last saw a finalized
+     *  advance" restarts at 0 on every advance, so the hosts' 45 s readiness dot
+     *  read green for the first 45 s of every ~6.4 min epoch for state that was
+     *  13-19 minutes behind). Zero means "no catalog wired" (test seams): the
+     *  age then falls back to the advance-stamp clock. */
+    private final long clGenesisTime;
+    private final int secondsPerSlot;
+
+    /** Fallback age bookkeeping (no catalog values): the last finalized block
+     *  number seen and the monotonic time it was first seen, guarded so
+     *  concurrent status() callers cannot tear the pair. */
     private final Object headAgeLock = new Object();
     private long lastFinalizedBlock = -1L;
     private long lastFinalizeAdvanceNanos;
@@ -119,11 +132,18 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
             new java.util.concurrent.atomic.AtomicInteger();
 
     GoChainHandle(long handle, String networkName, long chainId, int rpcPort, LoopbackRpc rpc) {
+        this(handle, networkName, chainId, rpcPort, rpc, 0L, 0);
+    }
+
+    GoChainHandle(long handle, String networkName, long chainId, int rpcPort, LoopbackRpc rpc,
+                  long clGenesisTime, int secondsPerSlot) {
         this.handle = handle;
         this.networkName = networkName;
         this.chainId = chainId;
         this.rpcPort = rpcPort;
         this.rpc = rpc;
+        this.clGenesisTime = clGenesisTime;
+        this.secondsPerSlot = secondsPerSlot;
     }
 
     @Override public String networkName() { return networkName; }
@@ -399,6 +419,13 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
         return new GoChainHandle(0L, network, 1L, 0, null).status(ParsedStatus.parse(json));
     }
 
+    /** Test seam with the catalog slot clock: exercises the TRUE-age path. */
+    static io.myotis.api.StatusSnapshot statusFromJson(String network, String json,
+                                                       long clGenesisTime, int secondsPerSlot) {
+        return new GoChainHandle(0L, network, 1L, 0, null, clGenesisTime, secondsPerSlot)
+                .status(ParsedStatus.parse(json));
+    }
+
     /** Package-private test seam: JSON→{@link BeaconStatus} without JNA. */
     static BeaconStatus beaconStatusFromJson(String network, String json) {
         return new GoChainHandle(0L, network, 1L, 0, null).beaconStatus(ParsedStatus.parse(json));
@@ -407,26 +434,34 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
     private io.myotis.api.StatusSnapshot status(ParsedStatus s) {
         int peers = (int) Math.min(s.peerCount(), Integer.MAX_VALUE);
         long targetPeriod = Math.max(s.targetPeriod(), s.currentPeriod());
-        // verifiedHeadAgeMs on this engine ages by FINALIZED-block advance — the
-        // anchor every Go read actually runs at (class doc: honest amber on the
-        // hosts' 45 s dot, not a constant green). The advance clock pins to "now"
-        // while not serveable, so a serving stretch starts fresh instead of
-        // leaking the outage gap in (Rust-twin rule).
+        // verifiedHeadAgeMs is the TRUE wall-clock age of the finalized anchor —
+        // the slot's wall time from the catalog's CL genesis (PR #832 review):
+        // the anchor every Go read runs at is 13-19 minutes behind the head even
+        // when everything is healthy, and the hosts' 45 s readiness dot must say
+        // so continuously (aging by "since last advance" went green for 45 s of
+        // every epoch). Without catalog values (test seams) the age falls back to
+        // the Rust-twin advance-stamp clock: pinning to "now" while not serveable
+        // so a serving stretch starts fresh instead of leaking the outage gap in.
         long fin = s.finalizedBlockNumber();
-        long nowNanos = System.nanoTime();
         boolean serveable = serveable(s);
         long verifiedHeadAgeMs;
-        synchronized (headAgeLock) {
-            if (!serveable) {
-                lastFinalizedBlock = fin;
-                lastFinalizeAdvanceNanos = nowNanos;
-                verifiedHeadAgeMs = Long.MAX_VALUE;
-            } else {
-                if (fin != lastFinalizedBlock) {
+        if (serveable && clGenesisTime > 0 && secondsPerSlot > 0 && s.finalizedSlot() > 0) {
+            long slotWallMs = (clGenesisTime + s.finalizedSlot() * (long) secondsPerSlot) * 1000L;
+            verifiedHeadAgeMs = Math.max(0L, System.currentTimeMillis() - slotWallMs);
+        } else {
+            long nowNanos = System.nanoTime();
+            synchronized (headAgeLock) {
+                if (!serveable) {
                     lastFinalizedBlock = fin;
                     lastFinalizeAdvanceNanos = nowNanos;
+                    verifiedHeadAgeMs = Long.MAX_VALUE;
+                } else {
+                    if (fin != lastFinalizedBlock) {
+                        lastFinalizedBlock = fin;
+                        lastFinalizeAdvanceNanos = nowNanos;
+                    }
+                    verifiedHeadAgeMs = Math.max(0L, (nowNanos - lastFinalizeAdvanceNanos) / 1_000_000L);
                 }
-                verifiedHeadAgeMs = Math.max(0L, (nowNanos - lastFinalizeAdvanceNanos) / 1_000_000L);
             }
         }
         return new io.myotis.api.StatusSnapshot(
@@ -614,7 +649,7 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
                 gated(() -> GoEngineNative.nativeGetStorageProofJson(
                         handle, hexAddress, slot, holderHexOrNull)),
                 "storage");
-        return storageFromJson(hexAddress, slot, o);
+        return storageFromJson(hexAddress, slot, holderHexOrNull, o);
     }
 
     // ---- operator queries the Go engine does not serve yet ----
@@ -678,15 +713,33 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
 
     /** Package-private test seam: JSON → {@link StorageProofResult} without JNA. */
     static StorageProofResult storageFromJson(String hexAddress, long slot, String json) {
-        return storageFromJson(hexAddress, slot, parseResultOrThrow(json, "storage"));
+        return storageFromJson(hexAddress, slot, null, parseResultOrThrow(json, "storage"));
     }
 
-    private static StorageProofResult storageFromJson(String hexAddress, long slot, JsonObject o) {
+    /** Seam with the request's holder (the record labels slot/holder from the
+     *  request, never from the echo — see {@code storageFromJson}'s comment). */
+    static StorageProofResult storageFromJson(String hexAddress, long slot,
+                                              String holderHexOrNull, String json) {
+        return storageFromJson(hexAddress, slot, holderHexOrNull, parseResultOrThrow(json, "storage"));
+    }
+
+    private static StorageProofResult storageFromJson(String hexAddress, long slot,
+                                                      String holderHexOrNull, JsonObject o) {
         try {
             return new StorageProofResult(
                     o.getString("addressHex", hexAddress),
-                    o.getLong("slot", slot),
-                    stringOrNull(o, "holderHex"),
+                    // The slot and holder come from the REQUEST, not the echo
+                    // (PR #832 review): the Go build echoes the slot as an
+                    // UNSIGNED decimal (eljson.go `Slot uint64`), so a slot at or
+                    // above 2^63 would throw in Long.parseLong and discard a
+                    // fully-ran verified read as "malformed", and for a holder
+                    // read it reports slot:0 / holderHex:null (the folded mapping
+                    // key is not a uint64). The two's-complement long we sent is
+                    // the truth about what was asked (the Go side recovers it —
+                    // pinned by TestStorageRequestShapes), and storageKeyHex (the
+                    // key the proof actually walked) stays the verified field.
+                    slot,
+                    holderHexOrNull,
                     stringOrNull(o, "storageKeyHex"),
                     stringOrNull(o, "storageKeyHashHex"),
                     o.getBoolean("exists", false),

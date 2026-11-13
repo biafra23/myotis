@@ -33,6 +33,17 @@ jobs:
           java-version-file: .java-version  # exact Temurin release, one place (#734)
           distribution: 'temurin'
 
+      # The Go toolchain go/go.mod pins (same action+pin and go-version-file as
+      # go-engine.yml), so `./gradlew build` here runs the Go engine's cgo build
+      # and GoCatalogParityTest against it on EVERY PR — the runner image's own
+      # Go is older than the module line, and goBuildCShared (GOTOOLCHAIN=local,
+      # PR #832 review) skips with a note instead of silently downloading 325 MB
+      # mid-build, which would leave the native-backed tests silently skipped.
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: go/go.mod
+
       # Robust Gradle dependency + plugin caching. Restores the base-branch cache
       # (read-only on PRs) so artifacts that already built on main — Besu, AGP,
       # the JitPack Besu fork — come from cache instead of being re-fetched

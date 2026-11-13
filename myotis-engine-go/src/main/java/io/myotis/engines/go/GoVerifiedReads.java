@@ -32,23 +32,30 @@ import org.slf4j.LoggerFactory;
  *   <li>The EVM reads ({@code call}, {@code estimateGas} — the engine has no
  *       EVM), the block/tx/receipt reads, {@code getCode}, {@code gasPrice},
  *       {@code maxPriorityFeePerGas}, {@code feeHistory}, {@code getBlockReceipts}
- *       and {@code sendRawTransaction} answer {@code null}: "cannot answer
- *       verified" is exactly their truth, and every capability flag
+ *       and {@code sendRawTransaction} cannot answer verified — but the
+ *       refusal arrives through whichever channel says PERMANENT: the JSON-string
+ *       reads answer the {@code {"error":…,"code":-32602}} envelope the router
+ *       serves as a non-retryable -32602 (no API change needed for them — the
+ *       shape the Go capi's {@code Unsupported} builds natively), the detailed
+ *       variants of {@code call}/{@code estimateGas}/{@code sendRawTransaction}
+ *       answer {@code refused(...)}, and only the genuinely typed reads
+ *       ({@code getCode}, {@code gasPrice}, {@code maxPriorityFeePerGas}) stay
+ *       {@code null}. A plain null becomes the RETRYABLE -32000, and an engine
+ *       missing whole subsystems will not grow them between retries — the #314
+ *       apply-or-refuse rule, wire side. Every capability flag
  *       ({@code supportsStateOverrides} etc.) keeps its false default so hosts
- *       refuse before waking anything. The DETAILED variants of {@code call},
- *       {@code estimateGas} and {@code sendRawTransaction} answer
- *       {@code refused(...)} instead of the default's {@code unavailable}: the
- *       router maps a plain null to the RETRYABLE -32000, and an engine with no
- *       EVM will not grow one between retries — REFUSED is the honest channel
- *       (the #314 apply-or-refuse rule, wire side).</li>
+ *       refuse before waking anything.</li>
  * </ul>
  *
- * <p>Refused SELECTORS ({@code latest}/a number) still reach the wire as the
- * retryable -32000 the router maps from null: a permanent refusal for the plain
- * nullable reads would need a refused-channel on {@code getBalance}/{@code
- * getStorageAt} themselves — an {@code :myotis-api} change, the owner's call
- * (PR #832 review), not this module's. Meanwhile the refusal is honest at the
- * detailed-method channel and every capability flag says "no head state here".
+ * <p>What still reaches the wire as the retryable -32000: refused SELECTORS on
+ * the typed state reads ({@code getBalance(addr, "latest")} etc. answer null)
+ * and {@code getCode}. A permanent refusal for those needs a refused-channel on
+ * the typed methods themselves — an {@code :myotis-api} change, the owner's call
+ * (PR #832 review), not this module's. {@code supportsFinalizedTag()} true is
+ * what lets {@code finalized} reach this adapter at all (the router would
+ * otherwise refuse it up front); with the envelope above,
+ * {@code eth_getBlockByNumber("finalized")} is now a permanent refusal too,
+ * while {@code eth_getCode(addr, "finalized")} waits on the API channel.
  *
  * <p><b>Never throws</b> — the router's {@code tryVerified} dispatch is not
  * exception-guarded, so every native failure (transport, pruned-root rotation,
@@ -222,44 +229,54 @@ final class GoVerifiedReads implements VerifiedReads {
                 + "(dial-only; engine-parity increment)");
     }
 
+    // The JSON-string reads answer the engine's PERMANENT-REFUSAL envelope —
+    // the same `{"error":…,"code":-32602}` shape the Go capi's Unsupported
+    // builds natively — because the router unwraps it into a -32602 the wallet
+    // stops retrying (RpcRouter.orEngineThrow/permanentCode), while a bare null
+    // becomes the generic retryable -32000 that a client repeats forever
+    // against an engine with no block/tx/receipt reads at all (PR #832 review;
+    // same reasoning as callDetailed). The typed reads (gasPrice,
+    // maxPriorityFeePerGas, getBalance, …) have no JSON channel to carry the
+    // code — those stay null until the :myotis-api refused-channel decision.
+
     @Override
     public String getTransactionReceipt(byte[] txHash) {
-        return null;
+        return permanentRefusalJson("transaction-receipt");
     }
 
     @Override
     public String getTransactionByHash(byte[] txHash) {
-        return null;
+        return permanentRefusalJson("transaction");
     }
 
     @Override
     public String getBlockByNumber(String block, boolean fullTransactions) {
-        return null;
+        return permanentRefusalJson("block");
     }
 
     @Override
     public String getBlockByHash(byte[] blockHash32, boolean fullTransactions) {
-        return null;
+        return permanentRefusalJson("block");
     }
 
     @Override
     public String getBlockReceipts(String blockSelector) {
-        return null;
+        return permanentRefusalJson("block-receipts");
     }
 
     @Override
     public String gasPrice() {
-        return null;
+        return null; // typed read: no JSON channel for the code (see above)
     }
 
     @Override
     public String maxPriorityFeePerGas() {
-        return null;
+        return null; // typed read: no JSON channel for the code (see above)
     }
 
     @Override
     public String feeHistory(long blockCount, String newestBlock, double[] rewardPercentiles) {
-        return null;
+        return permanentRefusalJson("fee-history");
     }
 
     @Override
@@ -274,6 +291,19 @@ final class GoVerifiedReads implements VerifiedReads {
     }
 
     // ---- internals ----
+
+    /** The router-visible permanent refusal: the exact
+     *  {@code {"error":…,"code":-32602}} shape the router's
+     *  {@code orEngineThrow}/{@code permanentCode} serve as a non-retryable
+     *  -32602 — built through minimal-json, like the Go capi's
+     *  {@code permanentErr}, so a message can never break the document. */
+    static String permanentRefusalJson(String what) {
+        return new com.eclipsesource.json.JsonObject()
+                .add("error", "go engine: the " + what
+                        + " read is not served by this build yet (engine-parity increment)")
+                .add("code", -32602)
+                .toString();
+    }
 
     /** Only the exact {@code finalized} tag (trimmed, case-insensitive); a
      *  missing/empty selector means the caller asked for the head — which this

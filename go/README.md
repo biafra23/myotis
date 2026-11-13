@@ -217,13 +217,35 @@ Honest gaps the wrapper surfaces rather than fakes (all engine-parity
 items): no idle sleep (`pause()` refuses, lifecycle is RUNNING/STOPPED),
 reads ONLY at the finalized anchor (`latest`/numbers are refused, never
 answered from finalized state — and the hosts' 45 s readiness dot
-therefore reads amber, because the read state really is finality-old),
-no EVM/block/tx/code reads, no ENS (the `EnsApi` throws one named
-refusal), no broadcast path. `myotis_drain_logs` lines are drained by
+therefore reads amber, because the read state really is finality-old;
+`eth_blockNumber` answers the FINALIZED block, not a head, while the
+engine has no optimistic anchor — an open owner decision, PR #832),
+storage reads reach slots below 2^63 only (the ABI's `int64_t`; every
+hashed mapping slot is declined with the engine's refusal — the Go
+reader itself takes the full 32-byte key), no EVM/block/tx/code reads,
+no ENS (the `EnsApi` throws one named refusal), no broadcast path,
+no Tor (account reads leave from the host's real IP; the desktop logs
+the mismatch instead of pretending the switch applies). The JSON-string
+reads (block/tx/receipt/fee-history) answer the `{"error":…,
+"code":-32602}` envelope so the wallet gets a permanent refusal, not a
+retryable one. `myotis_drain_logs` lines are drained by
 `Engines.drainRustLogs` next to the Rust engine's ring, so the hosts'
-log pipeline is engine-agnostic. The catalog lists only the runnable
-network (mainnet, its entry golden-pinned), while the canonical-name
-table matches Rust's for all four.
+log pipeline is engine-agnostic (Go's slog lines are normalized to the
+level-first shape the pumps classify by, carrying a `go` marker). The
+catalog lists only the runnable network (mainnet, its entry
+golden-pinned), while the canonical-name table matches Rust's for all
+four. A `-Pengine=go` desktop launch runs on its own `~/.myotis-go`
+profile — the shrunken catalog would otherwise prune the shared
+settings' other networks (and it keeps this engine's `nodekey`/`nodedb`
+off the regular profile too).
+
+`goBuildCShared` builds with `CGO_CFLAGS="-O2 -D__BLST_PORTABLE__"`
+(portable blst, like the Rust workspace and this repo's own
+`go-engine.yml`: the ADX build's load-time constructor `_exit`s the
+host process on a pre-Broadwell/pre-Zen CPU) and `GOTOOLCHAIN=local`
+(it skips with a note when the local toolchain is older than `go.mod`'s
+line rather than downloading one mid-build; CI installs it via
+`setup-go`).
 
 ## Test
 

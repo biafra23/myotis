@@ -66,10 +66,50 @@ public final class GoMyotisEngine implements MyotisEngine {
         if (!GoEngineNative.isAvailable()) return "";
         try {
             String batch = GoEngineNative.nativeDrainLogs(max);
-            return batch != null ? batch : "";
+            return batch != null ? normalizeForHostPumps(batch) : "";
         } catch (Throwable t) {
             return ""; // observability must never take the host down
         }
+    }
+
+    /**
+     * Rewrite the Go ring's slog lines into the level-first shape the hosts'
+     * log pumps classify by ({@code startsWith("ERROR")}/{@code "WARN")} in
+     * {@code app}'s Main and the desktop's DesktopNode — the Rust tracing
+     * format's shape (PR #832 review). A raw slog line starts with
+     * {@code time=… level=WARN msg=…}, so every Go WARN and ERROR used to fall
+     * through the pumps' else-branch to INFO — dropping exactly the refusal and
+     * stall lines of the engine under test from a level-filtered view.
+     *
+     * <p>{@code "<LEVEL> go <original line>"}: level first for the classifier,
+     * a {@code go} marker because the pumps print their own {@code rust} label
+     * (their wording predates this engine and the hosts are not touched here),
+     * and the original line intact after it — the slog fields stay greppable.
+     * A line with no parsable level gets INFO (the slog default) rather than
+     * being dropped.
+     */
+    static String normalizeForHostPumps(String batch) {
+        StringBuilder out = new StringBuilder(batch.length() + 32);
+        for (String line : batch.split("\n", -1)) {
+            if (!line.isEmpty()) {
+                out.append(levelFirst(line)).append('\n');
+            }
+        }
+        if (out.length() > 0) out.setLength(out.length() - 1); // no trailing newline
+        return out.toString();
+    }
+
+    private static String levelFirst(String line) {
+        // slog TextHandler writes `time=<RFC3339> level=<lvl> msg=… k=v …`;
+        // the RFC3339 timestamp carries no spaces, so a token scan is exact.
+        String level = "INFO";
+        for (String tok : line.split(" ")) {
+            if (tok.startsWith("level=")) {
+                level = tok.substring("level=".length()).toUpperCase(java.util.Locale.ROOT);
+                break;
+            }
+        }
+        return level + " go " + line;
     }
 
     /** @throws EngineException when libmyotis_engine_go is not available on this host */
@@ -206,7 +246,11 @@ public final class GoMyotisEngine implements MyotisEngine {
         }
         // Honour a host-supplied RPC port, else the network's catalog default.
         int rpcPort = config.rpcPort() > 0 ? config.rpcPort() : net.defaultRpcPort();
-        GoChainHandle handle = new GoChainHandle(id, canonical, net.chainId(), rpcPort, rpc);
+        // The catalog's CL slot clock rides along: it is what makes the status's
+        // verifiedHeadAgeMs the anchor's TRUE age, not the age of the last tick
+        // (PR #832 review; see GoChainHandle's slot-clock comment).
+        GoChainHandle handle = new GoChainHandle(id, canonical, net.chainId(), rpcPort, rpc,
+                net.clGenesisTime(), net.secondsPerSlot());
         // Atomic claim (Rust-twin parity): reject a re-create rather than orphan the
         // previous handle's native entry; release ours on a lost race.
         if (hosted.putIfAbsent(canonical, handle) != null) {

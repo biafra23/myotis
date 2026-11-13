@@ -261,6 +261,104 @@ class GoStatusJsonTest {
         assertNull(reads.sendRawTransaction(new byte[]{1}));
     }
 
+    // ---- verifiedHeadAgeMs: the TRUE slot-clock age once the catalog is wired
+    // (PR #832 review: aging by "since last advance" let the hosts' 45 s dot go
+    // green for 45 s of every epoch for a 13-19-minute-old anchor) ----
+
+    @Test
+    void verifiedHeadAgeIsTheTrueSlotClockAgeWhenTheCatalogIsWired() {
+        long genesis = 1_000_000_000L; // synthetic CL genesis (unix seconds)
+        int slotSeconds = 12;
+        long slot = (System.currentTimeMillis() / 1000L - genesis) / slotSeconds - 100; // 1200 s back
+        String json = goStatus("SYNCED", 26404150, 3, "METERED")
+                .replace("\"finalizedSlot\":15634912", "\"finalizedSlot\":" + slot);
+
+        StatusSnapshot s = GoChainHandle.statusFromJson("mainnet", json, genesis, slotSeconds);
+        assertTrue(s.verifiedHeadAgeMs() >= 1_190_000L && s.verifiedHeadAgeMs() <= 1_215_000L,
+                "true slot age must be ~1200 s (100 slots back), got " + s.verifiedHeadAgeMs());
+        // The no-catalog seam keeps the fallback clock (pinned fresh on a first
+        // serveable read) — the existing serveableStatusMapsEverySnapshotField
+        // asserts exactly that; this one proves the catalog path replaces it.
+        assertTrue(GoChainHandle.statusFromJson("mainnet", json).verifiedHeadAgeMs() < 10_000L);
+        // Not serveable → sentinel, whatever the clock:
+        String stalled = goStatus("CATCHING_UP", 26404150, 0, "METERED")
+                .replace("\"finalizedSlot\":15634912", "\"finalizedSlot\":" + slot);
+        assertEquals(Long.MAX_VALUE,
+                GoChainHandle.statusFromJson("mainnet", stalled, genesis, slotSeconds)
+                        .verifiedHeadAgeMs());
+    }
+
+    // ---- the slot/holder labels come from the REQUEST, not the Go echo
+    // (PR #832 review: eljson.go echoes Slot as an UNSIGNED decimal — a slot at
+    // or above 2^63 used to throw in Long.parseLong and discard a fully-ran
+    // verified read; a holder read is echoed slot:0 / holderHex:null) ----
+
+    @Test
+    void slotAndHolderLabelsComeFromTheRequestNotTheEcho() {
+        // Slot 2^63: sent as the two's-complement long (negative), echoed as
+        // the unsigned decimal 9223372036854775808 (Long.parseLong: throws).
+        long twoPow63 = Long.parseUnsignedLong("9223372036854775808");
+        StorageProofResult big = GoChainHandle.storageFromJson("0xdead", twoPow63, "{"
+                + "\"addressHex\":\"0xdead\",\"slot\":9223372036854775808,"
+                + "\"holderHex\":null,\"storageKeyHex\":\"0xa5\",\"storageKeyHashHex\":\"0xb9\","
+                + "\"exists\":true,\"valueHex\":\"0x01\",\"valueDecimal\":\"1\","
+                + "\"slotsReturned\":1,\"storageRootHex\":\"0x56\",\"proofNodesHex\":[],"
+                + "\"storageProofValid\":true,\"beaconSynced\":true,\"beaconChainVerified\":true,"
+                + "\"blsVerified\":true,\"matchedBeaconSlot\":15634912,"
+                + "\"verifyMethod\":\"storageRootMatch\",\"failReason\":null,"
+                + "\"peerBlockNumber\":26404150,\"finalizedBlockNumber\":26404150,"
+                + "\"optimisticBlockNumber\":0,\"finalizedSlot\":15634912,\"optimisticSlot\":0,"
+                + "\"maxHeaderChainGap\":8192}");
+        assertEquals(twoPow63, big.slot(), "echo must not label a >=2^63 slot");
+        assertEquals("0xa5", big.storageKeyHex());
+
+        // Holder read: the Go fold reports slot:0 / holderHex:null; the record
+        // must carry the requested pair (the integration query
+        // `get-storage <token> 1 <holder>` is labelled by these fields).
+        StorageProofResult held = GoChainHandle.storageFromJson("0xtoken", 1L, "0xd8dA6BF2", "{"
+                + "\"addressHex\":\"0xtoken\",\"slot\":0,"
+                + "\"holderHex\":null,\"storageKeyHex\":\"0xf3\",\"storageKeyHashHex\":\"0x77\","
+                + "\"exists\":true,\"valueHex\":\"0x2a\",\"valueDecimal\":\"42\","
+                + "\"slotsReturned\":1,\"storageRootHex\":\"0x56\",\"proofNodesHex\":[],"
+                + "\"storageProofValid\":true,\"beaconSynced\":true,\"beaconChainVerified\":true,"
+                + "\"blsVerified\":true,\"matchedBeaconSlot\":15634912,"
+                + "\"verifyMethod\":\"storageRootMatch\",\"failReason\":null,"
+                + "\"peerBlockNumber\":26404150,\"finalizedBlockNumber\":26404150,"
+                + "\"optimisticBlockNumber\":0,\"finalizedSlot\":15634912,\"optimisticSlot\":0,"
+                + "\"maxHeaderChainGap\":8192}");
+        assertEquals(1L, held.slot(), "folded-key echo slot:0 must not label a holder read");
+        assertEquals("0xd8dA6BF2", held.holderHex());
+    }
+
+    // ---- the JSON-string reads carry the router-visible PERMANENT refusal
+    // (`{"error":…,"code":-32602}` — RpcRouter.orEngineThrow/permanentCode),
+    // where a bare null would be the retryable -32000 forever ----
+
+    @Test
+    void jsonReadsAnswerThePermanentRefusalEnvelope() {
+        GoVerifiedReads reads = new GoVerifiedReads(new GoChainHandle(0L, "mainnet", 1L, 0, null));
+        for (String env : new String[]{
+                reads.getBlockByNumber("finalized", false),
+                reads.getBlockByHash(new byte[32], false),
+                reads.getTransactionReceipt(new byte[32]),
+                reads.getTransactionByHash(new byte[32]),
+                reads.getBlockReceipts("finalized"),
+                reads.feeHistory(5, "finalized", new double[]{50.0})}) {
+            // The router's discriminator, re-implemented: starts with the
+            // envelope, parses to a 2-key {"error","code"} object, code the
+            // PERMANENT one (an integer, not a string).
+            assertTrue(env.startsWith("{\"error\""), "envelope shape: " + env);
+            com.eclipsesource.json.JsonObject o = com.eclipsesource.json.Json.parse(env).asObject();
+            assertEquals(2, o.size(), "envelope must stay {error,code}: " + env);
+            assertEquals(-32602, o.get("code").asInt(), "permanent code: " + env);
+        }
+        // Typed reads keep null — no JSON channel carries the code there yet
+        // (the :myotis-api refused-channel decision, owner's call).
+        assertNull(reads.getCode(new byte[20], "finalized"));
+        assertNull(reads.gasPrice());
+        assertNull(reads.maxPriorityFeePerGas());
+    }
+
     // ---- selector rule ----
 
     @Test

@@ -681,6 +681,7 @@ abstract class ToolProbe : ValueSource<String, ToolProbe.Params> {
         val command: ListProperty<String>
         val workingDir: Property<File>
         val path: Property<String> // optional PATH override (see rustToolchainPath)
+        val environment: MapProperty<String, String> // env overrides for the probe
     }
 
     @get:Inject abstract val execOperations: ExecOperations
@@ -691,6 +692,7 @@ abstract class ToolProbe : ValueSource<String, ToolProbe.Params> {
             commandLine(parameters.command.get())
             workingDir = parameters.workingDir.get()
             parameters.path.orNull?.let { environment("PATH", it) }
+            parameters.environment.orNull?.forEach { (k, v) -> environment(k, v) }
             standardOutput = out
             errorOutput = ByteArrayOutputStream()
             isIgnoreExitValue = true
@@ -1015,11 +1017,39 @@ tasks.register<Exec>("cargoBuildHost") {
 // outside the builder image and the reproducibility gate until Go artifacts
 // ship in a release.
 // -------------------------------------------------------------------------
+// GOTOOLCHAIN=local on the probe (PR #832 review): a module-directory `go`
+// command with the default GOTOOLCHAIN=auto DOWNLOADS the go.mod-required
+// toolchain — on hosted runners (Go preinstalled older than go/go.mod's line)
+// that was a 325 MB fetch inside the CONFIGURATION phase of every Gradle
+// invocation of every workflow, whichever task was asked for. The probe only
+// reports the local toolchain now; goBuildCShared likewise builds local and
+// skips with one note when it is older than go/go.mod's `go` line — never
+// fetches silently. CI's Build and Test installs the pinned toolchain
+// (setup-go, go-version-file: go/go.mod), like go-engine.yml already does.
 val goVersion = providers.of(ToolProbe::class) {
     parameters.command.set(listOf("go", "version"))
     parameters.workingDir.set(file("go"))
+    parameters.environment.put("GOTOOLCHAIN", "local")
 }.get()
 val goAvailable = Regex("""go version go\d+\.\d+""").containsMatchIn(goVersion)
+/** go/go.mod's `go` directive — the toolchain the module requires ("" when the
+ *  file or line is missing, in which case the local toolchain is taken as good). */
+val goModVersion = runCatching {
+    Regex("""(?m)^go (\d+\.\d+(?:\.\d+)?)""").find(file("go/go.mod").readText())
+        ?.groupValues?.get(1) ?: ""
+}.getOrDefault("")
+/** Triple-wise numeric compare (a local `go1.26.x` against a required `1.27.3`). */
+fun goVersionAtLeast(local: String, want: String): Boolean {
+    if (want.isEmpty()) return true
+    fun tri(s: String) = (s.removePrefix("go").split('.') + listOf("0", "0", "0"))
+        .take(3).map { it.takeWhile(Char::isDigit).toIntOrNull() ?: 0 }
+    val l = tri(local); val w = tri(want)
+    for (i in 0..2) if (l[i] != w[i]) return l[i] > w[i]
+    return true
+}
+val goLocalVersion = Regex("""go version (go\d+\.\d+(?:\.\d+)?)""").find(goVersion)
+    ?.groupValues?.get(1) ?: ""
+val goVersionUsable = goVersionAtLeast(goLocalVersion, goModVersion)
 val goEngineLibName = when {
     isWindowsHost -> "myotis_engine_go.dll"
     System.getProperty("os.name").lowercase().contains("mac") -> "libmyotis_engine_go.dylib"
@@ -1029,10 +1059,35 @@ val goEngineLibName = when {
 tasks.register<Exec>("goBuildCShared") {
     group = "go"
     description = "go build -buildmode=c-shared for the Go engine (self-skips when go is" +
-        " missing; a FAILED cgo build degrades to a warning, keeping the JVM build untouched)"
-    onlyIf { goAvailable }
+        " missing or older than go/go.mod's line; a FAILED cgo build degrades to a warning," +
+        " keeping the JVM build untouched; builds the portable blst, never a newer toolchain)"
+    onlyIf {
+        if (goAvailable && !goVersionUsable) {
+            // One note, at the moment the task would have run — the skip stays
+            // visible without spamming every configuration phase (PR #832 review:
+            // "skipping with one note when the local Go is older than go.mod's,
+            // as the Rust block does for an old rustc").
+            logger.lifecycle("[go] goBuildCShared skipped: local ${goLocalVersion} is older than"
+                    + " go/go.mod's `go ${goModVersion}` and the task builds with GOTOOLCHAIN=local"
+                    + " (it never downloads a toolchain); install ${goModVersion} — CI gets it from"
+                    + " setup-go — to build the Go engine on this host.")
+        }
+        goAvailable && goVersionUsable
+    }
     workingDir = file("go")
     commandLine("go", "build", "-buildmode=c-shared", "-o", "build/$goEngineLibName", "./cmd/myotis-capi")
+    // Portable blst, like the Rust workspace builds it (#734 D3) and like
+    // go-engine.yml and the Go repro line already build (PR #832 review): the
+    // blst Go binding compiles ADX paths on amd64 and its load-time constructor
+    // answers SIGILL with _exit(128+11) — on a pre-Broadwell/pre-Zen CPU that
+    // would EXIT the JVM inside GoEngineNative's static initializer, past every
+    // UnsatisfiedLinkError handler here. The binding's own README names this
+    // switch. Env vars are Exec inputs, so flipping it rebuilds.
+    environment("CGO_CFLAGS", "-O2 -D__BLST_PORTABLE__")
+    // Same never-fetch discipline as the probe: the pinned toolchain is an
+    // explicit host requirement (go/go.mod's `go` line), not a build-time
+    // download hidden in a task.
+    environment("GOTOOLCHAIN", "local")
     // Unlike cargoBuildHost (where a cargo probe implies a working toolchain),
     // `go` present does NOT imply `-buildmode=c-shared` works: cgo needs a C
     // compiler (absent on many plain-Go Windows boxes) and the first build may
@@ -1049,7 +1104,7 @@ tasks.register<Exec>("goBuildCShared") {
         if (exit != 0) {
             logger.warn("[go] goBuildCShared failed (exit {}) — the Go engine will report itself"
                     + " unavailable and the JVM build continues. A -buildmode=c-shared build needs"
-                    + " a C compiler (cgo) and, on first run, module downloads.")
+                    + " a C compiler (cgo) and, on first run, module downloads.", exit)
             // A failed `go build` can leave the PREVIOUS library untouched (go
             // writes the output only at the end) — which, combined with the
             // up-to-date check below, would silently keep a stale lib serving
