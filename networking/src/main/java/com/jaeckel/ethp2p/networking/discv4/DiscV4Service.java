@@ -63,7 +63,7 @@ public final class DiscV4Service implements AutoCloseable {
     private volatile com.jaeckel.ethp2p.core.traffic.TrafficMeter.Counter trafficCounter;
 
     /** Count every datagram's payload into {@code counter} (the stack's data
-     *  usage, docs/data-usage.md). Before {@link #start}. */
+     *  usage, docs/how-it-works/data-usage.md). Before {@link #start}. */
     public void setTrafficCounter(com.jaeckel.ethp2p.core.traffic.TrafficMeter.Counter counter) {
         this.trafficCounter = counter;
     }

@@ -25,7 +25,7 @@ use futures::prelude::*;
 use libp2p::identify;
 use libp2p::request_response::{self, InboundRequestId, OutboundRequestId, ProtocolSupport};
 use libp2p::connection_limits::{self, ConnectionLimits};
-use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
+use libp2p::swarm::{ConnectionId, NetworkBehaviour, SwarmEvent};
 use libp2p::{gossipsub, Multiaddr, PeerId, StreamProtocol, Swarm};
 use tokio::sync::{mpsc, oneshot};
 
@@ -514,6 +514,58 @@ fn client_label(agents: &AgentMap, peer: &PeerId) -> String {
         .unwrap_or_else(|| "?".to_string())
 }
 
+/// Peers dialed at TCP before QUIC — against the spec's order, which
+/// `sync::Peer::dial_addrs` hands over and [`ReqRespClient::request_raw_at`]
+/// turns round for these (that `dial_addrs` doc has the evidence). A peer
+/// lands here, for the rest of the process, when:
+/// - its QUIC dial failed and TCP then reached it (UDP not forwarded — about
+///   a third of QUIC-advertising mainnet peers; each redial would otherwise
+///   pay QUIC's 5 s handshake timeout first),
+/// - a request timed out on its QUIC connection, which is then closed
+///   (`demote_stalled_quic`), or
+/// - its Identify agent is Nimbus, the one client measured to stall over QUIC
+///   (a QUIC connection it identified on is closed, once — see the Identify
+///   handler).
+///
+/// Shared between the client (reads it to order a dial, writes it on a QUIC
+/// dial failure) and the swarm task (writes it on the other two), like
+/// [`AgentMap`]. Never cleared — unlike the agent map it must outlive the
+/// connection, since it decides the NEXT one — so it is capped at
+/// `TCP_FIRST_CAP` peers; past that a peer keeps the spec's order, which is
+/// a slower dial, never a wrong answer.
+pub type TcpFirst = Arc<std::sync::RwLock<HashSet<PeerId>>>;
+
+/// Bound on [`TcpFirst`]: the pool holds far fewer peers than this, so the cap
+/// only matters to a long-running process that has seen thousands.
+const TCP_FIRST_CAP: usize = 4096;
+
+/// Put `peer` on TCP first (see [`TcpFirst`]); `true` when it was not there.
+fn prefer_tcp(set: &TcpFirst, peer: PeerId) -> bool {
+    let mut set = set.write().unwrap_or_else(|e| e.into_inner());
+    set.len() < TCP_FIRST_CAP && set.insert(peer)
+}
+
+/// The caller's address order for `peer`, with its TCP addresses moved to the
+/// front when it is on [`TcpFirst`]. Stable: the order within each transport
+/// (resolver candidates, IPv4 before IPv6) stays the caller's.
+fn dial_order(set: &TcpFirst, peer: &PeerId, addrs: &mut [Multiaddr]) {
+    if set.read().unwrap_or_else(|e| e.into_inner()).contains(peer) {
+        addrs.sort_by_key(is_quic);
+    }
+}
+
+/// Whether a dial address is QUIC (`/udp/<port>/quic-v1`).
+fn is_quic(addr: &Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    addr.iter().any(|p| matches!(p, Protocol::QuicV1 | Protocol::Quic))
+}
+
+/// Whether an Identify agent is Nimbus's (`nimbus-eth2/v…`, or plain `nimbus`
+/// from older builds) — the client [`TcpFirst`] keeps on TCP first.
+fn is_nimbus_agent(agent: &str) -> bool {
+    agent.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("nimbus"))
+}
+
 /// Cheap-to-clone client for issuing eth2 req/resp calls against the running
 /// swarm task. Independent instances of the whole stack are independent — no
 /// globals anywhere in this crate.
@@ -522,6 +574,9 @@ pub struct ReqRespClient {
     tx: mpsc::Sender<Command>,
     /// See [`AgentMap`]; read by [`ReqRespClient::client_of`].
     agents: AgentMap,
+    /// See [`TcpFirst`]; read by [`ReqRespClient::request_raw_at`] to order a
+    /// dial, written there on a QUIC dial failure.
+    tcp_first: TcpFirst,
     /// Last answer seen per DNS name, so repeat resolutions can log at DEBUG
     /// while a CHANGE still logs at INFO.
     ///
@@ -553,8 +608,9 @@ impl ReqRespClient {
     }
 
     /// [`request_raw`](Self::request_raw) with every address the peer is known
-    /// at, in preference order (TCP before QUIC for a discovered peer — see
-    /// `sync::Peer::dial_addrs` for why not the spec's order). The order
+    /// at, in preference order — the spec's QUIC first, TCP as the fallback,
+    /// for a discovered peer (`sync::Peer::dial_addrs`) — except that a peer
+    /// on [`TcpFirst`] has its TCP addresses moved to the front. The order
     /// decides which connection this node OPENS; a connection that already
     /// exists, on either transport, carries the request (same doc). The
     /// addresses are tried ONE AT A TIME, and the next is tried only when the
@@ -563,30 +619,84 @@ impl ReqRespClient {
     /// a reason to try the same peer over another transport. The swarm could
     /// dial them all at once instead — libp2p's dial concurrency factor — but
     /// then whichever handshake completes first wins, and that is QUIC's
-    /// 1-RTT more often than not, which is the connection this order exists
-    /// to avoid landing on.
+    /// 1-RTT more often than not, so a TCP-first peer would land on QUIC
+    /// anyway.
+    ///
+    /// A QUIC dial that fails where a later TCP attempt then reaches the peer
+    /// puts it on [`TcpFirst`]: its UDP port is most likely not forwarded, and
+    /// the next dial should not wait out the QUIC handshake timeout again. A
+    /// request lost to a QUIC connection the swarm closed meanwhile (see
+    /// `demote_stalled_quic`) is retried once, TCP first.
     pub async fn request_raw_at(
         &self,
         peer: PeerId,
         addrs: Vec<Multiaddr>,
         protocol: &'static str,
-        mut wire: Vec<u8>,
+        wire: Vec<u8>,
     ) -> Result<Vec<u8>, RequestError> {
         // An empty list would work exactly as long as the peer happens to be
         // connected and fail the moment it is not — a contract violation that
         // must not depend on connection state to show itself.
         debug_assert!(!addrs.is_empty(), "request_raw_at needs at least one address");
+        let demoted_before = self.is_tcp_first(&peer);
+        let (outcome, demoted_here) =
+            self.request_in_order(peer, addrs.clone(), protocol, wire.clone()).await;
+        match outcome {
+            // The swarm put the peer on TCP first while this request was out —
+            // a QUIC connection it closed (a request timed out on it, or it
+            // turned out to be Nimbus's). This request was lost to that close,
+            // not answered: retry it ONCE, now TCP first, rather than charge
+            // the peer a failure for a connection this node took down.
+            Err(RequestError::Timeout | RequestError::ConnectionClosed)
+                if !demoted_before && !demoted_here && self.is_tcp_first(&peer) =>
+            {
+                tracing::debug!(peer = %peer, protocol,
+                    "request lost to a QUIC connection this node closed — retrying, TCP first");
+                self.request_in_order(peer, addrs, protocol, wire).await.0
+            }
+            outcome => outcome,
+        }
+    }
+
+    fn is_tcp_first(&self, peer: &PeerId) -> bool {
+        self.tcp_first.read().unwrap_or_else(|e| e.into_inner()).contains(peer)
+    }
+
+    /// The address walk behind [`request_raw_at`](Self::request_raw_at): in
+    /// [`dial_order`], one at a time, on to the next only on a dial failure.
+    /// Also reports whether THIS walk put the peer on [`TcpFirst`] — a QUIC
+    /// dial failed and a later TCP attempt then reached the peer. Demoting
+    /// only then, not on the QUIC failure alone, keeps a blip that fails
+    /// every dial (no network, a local connection limit) from moving a
+    /// healthy QUIC peer off the spec's order for good.
+    async fn request_in_order(
+        &self,
+        peer: PeerId,
+        mut addrs: Vec<Multiaddr>,
+        protocol: &'static str,
+        wire: Vec<u8>,
+    ) -> (Result<Vec<u8>, RequestError>, bool) {
+        dial_order(&self.tcp_first, &peer, &mut addrs);
         let count = addrs.len();
+        let mut quic_dial_failed = false;
+        let mut demoted = false;
         for (i, addr) in addrs.into_iter().enumerate() {
             let is_last = i + 1 == count;
-            // The bytes are cloned only while another attempt may follow.
-            let bytes = if is_last { std::mem::take(&mut wire) } else { wire.clone() };
-            match self.request_raw_once(peer, addr, protocol, bytes).await {
-                Err(RequestError::DialFailure) if !is_last => continue,
-                outcome => return outcome,
+            let quic = is_quic(&addr);
+            let outcome = self.request_raw_once(peer, addr, protocol, wire.clone()).await;
+            let dial_failed = outcome == Err(RequestError::DialFailure);
+            if quic_dial_failed && !quic && !dial_failed && prefer_tcp(&self.tcp_first, peer) {
+                demoted = true;
+                tracing::debug!(peer = %peer,
+                    "QUIC dial failed where TCP reached the peer — dialing it at TCP first from now on");
             }
+            if dial_failed && !is_last {
+                quic_dial_failed |= quic;
+                continue;
+            }
+            return (outcome, demoted);
         }
-        Err(RequestError::DialFailure)
+        (Err(RequestError::DialFailure), demoted)
     }
 
     /// One attempt at one address — after DNS resolution, which can yield
@@ -600,10 +710,10 @@ impl ReqRespClient {
         wire: Vec<u8>,
     ) -> Result<Vec<u8>, RequestError> {
         // Resolve HERE, per request, in async context. The swarm task's dial
-        // path is synchronous, so it cannot await a lookup — and libp2p's own
-        // DNS transport is not always present (Android has no /etc/resolv.conf,
-        // so `build_swarm` falls back to plain TCP and a /dns4/ address is
-        // rejected outright with "Multiaddr is not supported").
+        // path is synchronous, so it cannot await a lookup — and the swarm has
+        // no DNS layer of its own (`build_swarm`), so a /dns4/ address that
+        // reached it would be rejected outright with "Multiaddr is not
+        // supported").
         let dns_name = multiaddr_dns_name(&addr);
         // Never empty: a resolver failure yields the original address, so an
         // already-connected peer is unaffected by a transient DNS blip.
@@ -640,6 +750,10 @@ impl ReqRespClient {
     ///
     /// Fire-and-forget: dial failures are logged, not returned. Probing is a
     /// best-effort background concern and must never fail a caller's real work.
+    ///
+    /// The addresses must be concrete `/ip4/`/`/ip6/` ones: they go to the swarm
+    /// unresolved, and the swarm has no DNS layer (`build_swarm`), so a `/dns4/`
+    /// one is rejected. roost's probe passes routable IPs only.
     pub async fn observe_via(&self, peers: Vec<(PeerId, Multiaddr)>) {
         if peers.is_empty() {
             return;
@@ -869,12 +983,13 @@ fn multiaddr_dns_name(addr: &Multiaddr) -> Option<String> {
 ///
 /// Returns the input unchanged when there is no name to resolve.
 ///
-/// **Why we resolve rather than letting libp2p do it.** `build_swarm` layers in
-/// libp2p's DNS transport when a system resolver is configured, but that reads
-/// `/etc/resolv.conf`, which Android has not had since Oreo. There the swarm
-/// falls back to plain TCP and rejects a `/dns4/` address outright — "Multiaddr
-/// is not supported" — before any connection is attempted. `getaddrinfo`, which
-/// `lookup_host` uses, works on every platform we ship.
+/// **Why we resolve rather than letting libp2p do it.** libp2p's DNS transport
+/// read `/etc/resolv.conf`, which Android has not had since Oreo, and it pinned
+/// a hickory-resolver with open advisories; the swarm has none (`build_swarm`)
+/// and rejects a `/dns4/` address outright — "Multiaddr is not supported" —
+/// before any connection is attempted. `getaddrinfo`, which `lookup_host` uses,
+/// works on every platform we ship. A `/dnsaddr/` address (TXT-based, not
+/// resolved here) therefore cannot be dialed at all; nothing pins one.
 ///
 /// **Order is load-bearing.** `getaddrinfo` already sorts by RFC 6724
 /// destination-address selection, and every candidate is passed on in that
@@ -1039,9 +1154,21 @@ pub struct HostConfig {
 
 impl Default for HostConfig {
     fn default() -> Self {
+        Self::with_ports(0, 0)
+    }
+}
+
+impl HostConfig {
+    /// The wallet's shape, listening on `0.0.0.0` at the given TCP and QUIC (UDP)
+    /// ports. 0 lets the OS pick, which is what [`HostConfig::default`] does; a
+    /// host pins them to run beside another node or behind a firewall.
+    pub fn with_ports(tcp_port: u16, quic_port: u16) -> Self {
+        use libp2p::multiaddr::Protocol;
+        // Built from typed parts: no parse, so nothing on the start path can panic.
+        let any = Protocol::Ip4(std::net::Ipv4Addr::UNSPECIFIED);
         Self {
-            listen: "/ip4/0.0.0.0/tcp/0".parse().expect("static multiaddr"),
-            listen_quic: Some("/ip4/0.0.0.0/udp/0/quic-v1".parse().expect("static multiaddr")),
+            listen: Multiaddr::empty().with(any.clone()).with(Protocol::Tcp(tcp_port)),
+            listen_quic: Some(Multiaddr::empty().with(any).with(Protocol::Udp(quic_port)).with(Protocol::QuicV1)),
             max_established_incoming: Some(64),
             keypair: None,
             lc_responder: None,
@@ -1049,6 +1176,43 @@ impl Default for HostConfig {
             traffic: None,
         }
     }
+}
+
+/// An error and its source chain as one line. libp2p's `TransportError` prints
+/// nothing of its own; the io error (e.g. "Address already in use") is in its
+/// source chain, repeated by each wrapping layer — keep each distinct message once.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut parts: Vec<String> = vec![e.to_string()];
+    let mut source = e.source();
+    while let Some(s) = source {
+        parts.push(s.to_string());
+        source = s.source();
+    }
+    parts.retain(|p| !p.is_empty());
+    parts.dedup();
+    parts.join(": ")
+}
+
+/// Refuse a pinned TCP listen port that another socket already holds.
+///
+/// libp2p-tcp listens with `SO_REUSEPORT` on unix, so a second process of the
+/// same user that also listens through rust-libp2p (a second Myotis, say) binds
+/// the same port without an error and the kernel splits inbound connections
+/// between the two. A plain bind (no `SO_REUSEPORT`) fails against any socket
+/// on that port, so it is tried, and released, first. Port 0 (OS-assigned)
+/// cannot collide and is not probed; nor is an address that is not ip4/tcp.
+fn probe_exclusive_tcp_port(addr: &Multiaddr) -> Result<(), String> {
+    use libp2p::multiaddr::Protocol;
+    let mut it = addr.iter();
+    let (Some(Protocol::Ip4(ip)), Some(Protocol::Tcp(port))) = (it.next(), it.next()) else {
+        return Ok(());
+    };
+    if port == 0 {
+        return Ok(());
+    }
+    std::net::TcpListener::bind((ip, port))
+        .map(drop)
+        .map_err(|e| format!("listen on {addr} failed: {e}"))
 }
 
 /// Start the libp2p host and its event-loop task. Returns the request client;
@@ -1070,16 +1234,19 @@ pub fn start_host(local_status: Arc<LocalStatus>) -> Result<ReqRespClient, Strin
 /// notices: the caller's `ReqRespClient` still exists and background pollers
 /// keep polling. A supervisor cannot help with a process that never exits, so
 /// detecting it is the owner's job. See `roost::serve`, which exits non-zero.
-/// Build the swarm, optionally with the DNS resolution layer.
-///
-/// Two near-identical chains rather than one with a branch: `with_dns()`
-/// consumes the builder and does not hand it back on failure, so recovering
-/// from a failed DNS setup means building again from the identity.
+/// Build the swarm: TCP (noise + mplex/yamux) or'ed with QUIC, and no DNS
+/// layer. A `/dns4/` dial address is resolved before it reaches the swarm
+/// (`resolve_dial_addrs`, every dial, through the platform's resolver), so the
+/// transport only ever sees concrete `/ip4/`/`/ip6/` addresses. libp2p's own
+/// DNS transport (the `dns` feature) is not linked: it read
+/// `/etc/resolv.conf`, which Android has not had since Oreo, so it never ran
+/// there, and on the desktop it pulled in hickory-resolver 0.25, whose DNS
+/// response parsing has the advisories 0.26.2 fixed — libp2p moves to 0.26
+/// only in 0.57, which brings aws-lc-sys with it (see Cargo.toml).
 fn build_swarm(
     keypair: libp2p::identity::Keypair,
     serving: bool,
     max_incoming: Option<u32>,
-    dns: bool,
     traffic: Arc<crate::traffic::TrafficMeter>,
 ) -> Result<Swarm<Behaviour>, String> {
     let base = libp2p::SwarmBuilder::with_existing_identity(keypair).with_tokio();
@@ -1110,13 +1277,14 @@ fn build_swarm(
     //
     // QUIC beside TCP: the spec's PRIMARY transport since consensus-specs#5330
     // ("QUIC MUST be supported", TCP is the fallback), and what every client
-    // listens on by default now (Nimbus `--quic-port`, Lighthouse, Teku,
-    // Lodestar, Prysm behind a flag). It brings its own TLS 1.3 handshake
-    // (libp2p-tls, peer id in the certificate) and stream multiplexing, so
-    // noise and the muxers above apply to TCP only. Addresses are
-    // `/ip4/<ip>/udp/<port>/quic-v1`; a peer known at both is dialed at TCP
-    // first, QUIC only when the TCP dial fails — one at a time, never
-    // concurrently (see `ReqRespClient::request_raw_at` for why).
+    // listens on by default now (Lighthouse since v4.5, Prysm since v5.2.0,
+    // Lodestar since v1.42, Teku in 26.9, Nimbus `--quic-port`). It brings
+    // its own TLS 1.3 handshake (libp2p-tls, peer id in the certificate) and
+    // stream multiplexing, so noise and the muxers above apply to TCP only.
+    // Addresses are `/ip4/<ip>/udp/<port>/quic-v1`; a peer known at both is
+    // dialed at QUIC first, TCP only when the QUIC dial fails — one at a
+    // time, never concurrently, and TCP first for a peer on `TcpFirst` (see
+    // `ReqRespClient::request_raw_at` and `sync::Peer::dial_addrs`).
     let transport = |key: &libp2p::identity::Keypair| -> Result<_, Box<dyn std::error::Error + Send + Sync>> {
         use libp2p::core::muxing::StreamMuxerBox;
         use libp2p::core::upgrade::{SelectUpgrade, Version};
@@ -1141,25 +1309,13 @@ fn build_swarm(
         );
         Ok(tcp.or_transport(quic).map(|either, _| either.into_inner()))
     };
-    if dns {
-        Ok(base
-            .with_other_transport(transport)
-            .map_err(|e| format!("tcp/noise/muxer setup failed: {e}"))?
-            .with_dns()
-            .map_err(|e| format!("dns transport setup failed: {e}"))?
-            .with_behaviour(behaviour)
-            .map_err(|e| format!("behaviour setup failed: {e}"))?
-            .with_swarm_config(idle)
-            .build())
-    } else {
-        Ok(base
-            .with_other_transport(transport)
-            .map_err(|e| format!("tcp/noise/muxer setup failed: {e}"))?
-            .with_behaviour(behaviour)
-            .map_err(|e| format!("behaviour setup failed: {e}"))?
-            .with_swarm_config(idle)
-            .build())
-    }
+    Ok(base
+        .with_other_transport(transport)
+        .map_err(|e| format!("tcp/noise/muxer setup failed: {e}"))?
+        .with_behaviour(behaviour)
+        .map_err(|e| format!("behaviour setup failed: {e}"))?
+        .with_swarm_config(idle)
+        .build())
 }
 
 pub fn start_host_with(
@@ -1174,41 +1330,26 @@ pub fn start_host_with(
         .unwrap_or_else(libp2p::identity::Keypair::generate_secp256k1);
     let serving = config.lc_responder.is_some();
     let max_incoming = config.max_established_incoming;
-    // DNS is layered in so `/dns4/host/tcp/port/p2p/<id>` peers resolve AT DIAL
-    // TIME, every dial, honouring the record's TTL. That is what lets a server
-    // on a dynamic residential address be pinned by NAME instead of by a literal
-    // IP that goes stale (rust/roost).
-    //
-    // It must not be load-bearing, because it CANNOT be relied on everywhere:
-    // the system resolver is configured from /etc/resolv.conf, which Android has
-    // not had since Oreo (DNS goes through netd), so this legitimately fails
-    // there. Android is a first-class consumer (CLAUDE.md, Platform & language
-    // direction), and failing the whole host over an optional transport layer
-    // would take out `/ip4/` peers — every peer we pin today — on the default
-    // Android path.
-    //
-    // So: try with DNS, fall back to plain TCP with a warning. The degraded mode
-    // is exactly today's behaviour, and the warning names what stops working.
+    // `/dns4/host/tcp/port/p2p/<id>` peers resolve AT DIAL TIME, every dial,
+    // honouring the record's TTL — what lets a server on a dynamic residential
+    // address be pinned by NAME instead of by a literal IP that goes stale
+    // (rust/roost). That happens before the swarm, in `resolve_dial_addrs`, on
+    // every platform; the swarm itself has no DNS layer (see `build_swarm`).
     // No meter: count into one nobody reads (tools, roost, tests).
     let traffic = config.traffic.clone().unwrap_or_default();
-    let mut swarm = match build_swarm(keypair.clone(), serving, max_incoming, true, Arc::clone(&traffic)) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e,
-                "no system DNS resolver — continuing WITHOUT the DNS transport; \
-                 /ip4/ peers are unaffected but /dns4/ peers cannot be dialed");
-            build_swarm(keypair, serving, max_incoming, false, traffic)?
-        }
-    };
+    let mut swarm = build_swarm(keypair, serving, max_incoming, traffic)?;
 
+    let listen_addr = config.listen.clone();
+    probe_exclusive_tcp_port(&listen_addr)?;
     swarm
         .listen_on(config.listen)
-        .map_err(|e| format!("listen failed: {e}"))?;
+        .map_err(|e| format!("listen on {listen_addr} failed: {}", error_chain(&e)))?;
     // Not fatal: a host that cannot bind a UDP socket still dials QUIC peers
     // (the transport opens a socket per dial) and still has TCP both ways.
     if let Some(quic) = config.listen_quic {
+        let quic_addr = quic.clone();
         if let Err(e) = swarm.listen_on(quic) {
-            tracing::warn!(error = %e,
+            tracing::warn!(addr = %quic_addr, error = %error_chain(&e),
                 "QUIC listen failed — continuing without inbound QUIC; dialing QUIC and TCP are unaffected");
         }
     }
@@ -1218,6 +1359,7 @@ pub fn start_host_with(
 
     let (tx, rx) = mpsc::channel(256);
     let agents: AgentMap = Arc::default();
+    let tcp_first: TcpFirst = Arc::default();
     let task = tokio::spawn(run_swarm(
         swarm,
         rx,
@@ -1225,8 +1367,9 @@ pub fn start_host_with(
         config.lc_responder,
         config.cl_fork_watch,
         agents.clone(),
+        tcp_first.clone(),
     ));
-    Ok((ReqRespClient { tx, agents, last_resolved: Arc::default() }, peer_id, task))
+    Ok((ReqRespClient { tx, agents, tcp_first, last_resolved: Arc::default() }, peer_id, task))
 }
 
 /// What a pending outbound request id maps back to.
@@ -1275,6 +1418,13 @@ struct SwarmCtx {
     /// and the sync loop's log lines read it through [`ReqRespClient::client_of`]
     /// (shared handle; see [`AgentMap`]).
     peer_agents: AgentMap,
+    /// See [`TcpFirst`] — the swarm's half: a timeout on a QUIC connection and
+    /// a Nimbus agent put a peer there.
+    tcp_first: TcpFirst,
+    /// The open connections that run over QUIC, so a request that times out
+    /// on one can be told from one that timed out on TCP
+    /// ([`demote_stalled_quic`]). Bounded by the open connections.
+    quic_conns: HashSet<ConnectionId>,
     /// Peers whose current connection delivered a Goodbye, so the close that
     /// follows is theirs by announcement, not a drop. Cleared with the close.
     goodbye_from: HashSet<PeerId>,
@@ -1313,6 +1463,7 @@ impl SwarmCtx {
         lc: Option<Arc<dyn LcResponder>>,
         cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
         agents: AgentMap,
+        tcp_first: TcpFirst,
     ) -> Self {
         Self {
             cl_fork_watch,
@@ -1324,6 +1475,8 @@ impl SwarmCtx {
             lc_servers: HashSet::new(),
             peer_earliest: HashMap::new(),
             peer_agents: agents,
+            tcp_first,
+            quic_conns: HashSet::new(),
             goodbye_from: HashSet::new(),
             local_status,
             lc,
@@ -1342,8 +1495,9 @@ async fn run_swarm(
     lc: Option<Arc<dyn LcResponder>>,
     cl_fork_watch: Option<Arc<crate::cl_fork_watch::ClForkWatch>>,
     agents: AgentMap,
+    tcp_first: TcpFirst,
 ) {
-    let mut ctx = SwarmCtx::new(local_status, lc, cl_fork_watch, agents);
+    let mut ctx = SwarmCtx::new(local_status, lc, cl_fork_watch, agents, tcp_first);
     loop {
         tokio::select! {
             cmd = rx.recv() => match cmd {
@@ -1525,7 +1679,10 @@ fn mark_status_done(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, peer: Peer
 
 fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: SwarmEvent<BehaviourEvent>) {
     match event {
-        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+        SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
+            if is_quic(endpoint.get_remote_address()) {
+                ctx.quic_conns.insert(connection_id);
+            }
             // Remember where this peer reached us from: the external-address
             // tally dedupes on it, so a host cannot vote more than once by
             // minting extra peer ids.
@@ -1560,7 +1717,8 @@ fn handle_swarm_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: S
                     Pending::AutoStatusV2(peer_id));
             }
         }
-        SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
+        SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, cause, .. } => {
+            ctx.quic_conns.remove(&connection_id);
             if num_established == 0 {
                 ctx.connected.remove(&peer_id);
                 let said_goodbye = ctx.goodbye_from.remove(&peer_id);
@@ -1631,7 +1789,7 @@ fn remote_drop_without_goodbye(
 fn handle_behaviour_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, event: BehaviourEvent) {
     use BehaviourEvent as E;
     match event {
-        E::Identify(identify::Event::Received { peer_id, info, .. }) => {
+        E::Identify(identify::Event::Received { peer_id, info, connection_id }) => {
             let lc = info
                 .protocols
                 .iter()
@@ -1657,6 +1815,25 @@ fn handle_behaviour_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, even
             let agent = crate::el::pool::log_client_id(&info.agent_version);
             tracing::debug!(peer = %peer_id, agent = ?agent,
                 protocols = info.protocols.len(), lc_updates = lc, "identify received");
+            // Nimbus is dialed at TCP first from here on (see `TcpFirst`), and a
+            // QUIC connection it identified on is closed — ONCE, when the peer
+            // is newly demoted: the requests riding it are retried TCP first
+            // (`request_raw_at`), and if they land on QUIC again because TCP
+            // is refused, that connection is the only one there is and stays.
+            // Closing up front costs a reconnect; waiting costs the measured
+            // stall's first timeout (10 s, 60 s for updates_by_range).
+            // Matched on the RAW agent, not the display form above: that one
+            // is never compared (`log_client_id`'s contract), so a change to
+            // the sanitizer cannot silently stop Nimbus detection.
+            if is_nimbus_agent(&info.agent_version) && prefer_tcp(&ctx.tcp_first, peer_id) {
+                if ctx.quic_conns.remove(&connection_id) {
+                    tracing::debug!(peer = %peer_id, agent = ?agent,
+                        "Nimbus peer on QUIC — closing that connection; dialed at TCP first from now on");
+                    swarm.close_connection(connection_id);
+                } else {
+                    tracing::debug!(peer = %peer_id, agent = ?agent, "Nimbus peer — dialed at TCP first from now on");
+                }
+            }
             ctx.peer_agents.write().unwrap_or_else(|e| e.into_inner()).insert(peer_id, agent);
         }
         E::Identify(_) => {}
@@ -1729,7 +1906,10 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
                 }
             }
         },
-        request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
+        request_response::Event::OutboundFailure { peer, connection_id, request_id, error } => {
+            if matches!(error, request_response::OutboundFailure::Timeout) {
+                demote_stalled_quic(swarm, ctx, peer, connection_id, protocol);
+            }
             let mapped = match &error {
                 request_response::OutboundFailure::Timeout => RequestError::Timeout,
                 request_response::OutboundFailure::UnsupportedProtocols => {
@@ -1754,6 +1934,41 @@ fn on_rr_event(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, protocol: &'sta
             release_in_flight(ctx, protocol, request_id);
         }
     }
+}
+
+/// A request timed out on `connection`: if that connection is QUIC, close it
+/// and dial the peer at TCP first from now on (see [`TcpFirst`]).
+///
+/// Closing is the point. Requests ride whichever connection to the peer
+/// exists, and libp2p's request-response cannot steer one to another
+/// transport, so a QUIC connection that stopped opening streams — the stall
+/// measured against Nimbus v26.9.1, where every stream open after the first
+/// handful hung — would otherwise carry every later request into the same
+/// timeout until the peer gave up on it (~70 s there; never, once lsquic's
+/// no-progress abort is off, as in nim-lsquic 0.11.2). The next request then
+/// dials afresh, TCP first; a QUIC-only peer is redialed over QUIC, which
+/// costs one handshake. Other requests in flight on the connection fail with
+/// `ConnectionClosed` — on a stalled connection they were not going to be
+/// answered either.
+///
+/// A timeout on TCP is the peer's answer and changes nothing here.
+fn demote_stalled_quic(
+    swarm: &mut Swarm<Behaviour>,
+    ctx: &mut SwarmCtx,
+    peer: PeerId,
+    connection: ConnectionId,
+    protocol: &'static str,
+) {
+    // Removed here, not only on the close event, so the requests still in
+    // flight on this connection — whose timeouts may follow in the same
+    // poll — do not close it, or log, a second time.
+    if !ctx.quic_conns.remove(&connection) {
+        return;
+    }
+    prefer_tcp(&ctx.tcp_first, peer);
+    tracing::info!(peer = %peer, client = ?client_label(&ctx.peer_agents, &peer), protocol,
+        "request timed out over QUIC — closing that connection; this peer is dialed at TCP first from now on");
+    swarm.close_connection(connection);
 }
 
 fn complete(
@@ -2285,6 +2500,71 @@ mod external_address_tests {
 }
 
 #[cfg(test)]
+mod host_config_tests {
+    use super::*;
+
+    #[test]
+    fn default_listens_on_os_assigned_ports() {
+        let cfg = HostConfig::default();
+        assert_eq!(cfg.listen.to_string(), "/ip4/0.0.0.0/tcp/0");
+        assert_eq!(cfg.listen_quic.map(|a| a.to_string()).as_deref(), Some("/ip4/0.0.0.0/udp/0/quic-v1"));
+        assert_eq!(cfg.max_established_incoming, Some(64));
+    }
+
+    #[test]
+    fn with_ports_pins_tcp_and_quic_independently() {
+        let cfg = HostConfig::with_ports(9105, 9106);
+        assert_eq!(cfg.listen.to_string(), "/ip4/0.0.0.0/tcp/9105");
+        assert_eq!(cfg.listen_quic.map(|a| a.to_string()).as_deref(), Some("/ip4/0.0.0.0/udp/9106/quic-v1"));
+    }
+
+    fn free_tcp_port() -> u16 {
+        std::net::TcpListener::bind("0.0.0.0:0").unwrap().local_addr().unwrap().port()
+    }
+
+    fn free_udp_port() -> u16 {
+        std::net::UdpSocket::bind("0.0.0.0:0").unwrap().local_addr().unwrap().port()
+    }
+
+    fn status() -> Arc<LocalStatus> {
+        LocalStatus::new(StatusMessage {
+            fork_digest: [0; 4],
+            finalized_root: [0; 32],
+            finalized_epoch: 0,
+            head_root: [0; 32],
+            head_slot: 0,
+            earliest_available_slot: 0,
+        })
+    }
+
+    /// The pinned TCP port is the TCP listener and the pinned QUIC port the UDP
+    /// one (a transposition would compile), and a second host on the same TCP
+    /// port is refused although libp2p-tcp listens with SO_REUSEPORT.
+    #[tokio::test]
+    async fn pinned_ports_are_bound_and_held_exclusively() {
+        let (tcp, quic) = (free_tcp_port(), free_udp_port());
+        let (first, _, _) = start_host_with(status(), HostConfig::with_ports(tcp, quic)).expect("first host");
+        // listen_on registers the listeners; give the swarm task a moment to bind.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::net::UdpSocket::bind(("0.0.0.0", quic)).is_ok() {
+            assert!(std::time::Instant::now() < deadline, "QUIC never bound udp/{quic}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(std::net::TcpListener::bind(("0.0.0.0", tcp)).is_err(), "tcp/{tcp} is not held");
+
+        let err = start_host_with(status(), HostConfig::with_ports(tcp, 0)).err().expect("second host refused");
+        assert!(err.contains(&format!("/tcp/{tcp}")), "{err}");
+        first.shutdown().await;
+    }
+
+    #[test]
+    fn os_assigned_and_non_tcp_addresses_are_not_probed() {
+        assert!(probe_exclusive_tcp_port(&"/ip4/0.0.0.0/tcp/0".parse().unwrap()).is_ok());
+        assert!(probe_exclusive_tcp_port(&"/ip4/0.0.0.0/udp/9/quic-v1".parse().unwrap()).is_ok());
+    }
+}
+
+#[cfg(test)]
 mod dial_resolution_tests {
     use super::*;
 
@@ -2304,9 +2584,9 @@ mod dial_resolution_tests {
         // A's meter also pins the transport's counting: the TCP socket's
         // bytes (noise handshake, muxer, gossipsub) land in its CL layer.
         let meter_a = crate::traffic::TrafficMeter::new();
-        let mut a = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Arc::clone(&meter_a))
+        let mut a = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, Arc::clone(&meter_a))
             .expect("swarm a");
-        let mut b = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+        let mut b = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, Default::default())
             .expect("swarm b");
         b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
         let addr = loop {
@@ -2457,7 +2737,7 @@ mod dial_resolution_tests {
     /// the yamux-only host died.
     #[tokio::test]
     async fn the_host_connects_to_an_mplex_only_peer_like_nimbus() {
-        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, Default::default())
             .expect("swarm");
         dial_outcome(host, mplex_only_peer(), "/ip4/127.0.0.1/tcp/0")
             .await
@@ -2469,7 +2749,7 @@ mod dial_resolution_tests {
     /// no noise, no muxer negotiation, the TLS handshake carries the peer id.
     #[tokio::test]
     async fn the_host_connects_to_a_quic_only_peer() {
-        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, Default::default())
             .expect("swarm");
         dial_outcome(host, quic_only_peer(), "/ip4/127.0.0.1/udp/0/quic-v1")
             .await
@@ -2480,7 +2760,7 @@ mod dial_resolution_tests {
     /// wallet's `HostConfig::default` opens one on an ephemeral port).
     #[tokio::test]
     async fn a_quic_only_peer_reaches_the_host() {
-        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, Default::default())
             .expect("swarm");
         dial_outcome(quic_only_peer(), host, "/ip4/127.0.0.1/udp/0/quic-v1")
             .await
@@ -2491,7 +2771,7 @@ mod dial_resolution_tests {
     /// context its event loop needs, so a test can drive `handle_swarm_event`
     /// — responder included — against a real peer.
     fn host_with_ctx() -> (Swarm<Behaviour>, SwarmCtx) {
-        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, Default::default())
             .expect("swarm");
         let ctx = SwarmCtx::new(
             LocalStatus::new(StatusMessage {
@@ -2506,6 +2786,9 @@ mod dial_resolution_tests {
             None,
             // The agent map `ReqRespClient::client_of` reads (#584); nothing
             // here asks for a client name, so an empty one.
+            Arc::default(),
+            // The TCP-first set the client orders dials by; this test peer
+            // dials nobody, so a private one.
             Arc::default(),
         );
         (host, ctx)
@@ -2672,6 +2955,56 @@ mod dial_resolution_tests {
         assert_eq!(decoded.ssz_payload.len(), StatusMessage::SSZ_SIZE_V2);
     }
 
+    /// The spec's order end to end: a peer known at a dead QUIC address (a
+    /// UDP port nobody forwards — about a third of QUIC-advertising mainnet
+    /// peers) and a live TCP one is answered over TCP, and is put on TCP
+    /// first, so the next dial does not wait out the QUIC handshake again.
+    /// (Takes up to QUIC's 5 s handshake timeout: quinn does not act on ICMP
+    /// port-unreachable, which is also why a filtered UDP port costs that
+    /// much in production.)
+    #[tokio::test]
+    async fn a_dead_quic_address_falls_through_to_tcp_and_puts_the_peer_on_tcp_first() {
+        let (mut peer, mut ctx) = host_with_ctx();
+        peer.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+        let tcp = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = peer.select_next_some().await {
+                break address;
+            }
+        };
+        let peer_id = *peer.local_peer_id();
+        tokio::spawn(async move {
+            loop {
+                let ev = peer.select_next_some().await;
+                handle_swarm_event(&mut peer, &mut ctx, ev);
+            }
+        });
+
+        let status = StatusMessage {
+            fork_digest: [0; 4],
+            finalized_root: [0; 32],
+            finalized_epoch: 0,
+            head_root: [0; 32],
+            head_slot: 0,
+            earliest_available_slot: 0,
+        };
+        let wire = codec::encode_request(&status.encode());
+        let client = start_host(LocalStatus::new(status)).expect("the wallet host");
+        // A UDP port nothing listens on — bound and released just now.
+        let dead_port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let dead: Multiaddr = format!("/ip4/127.0.0.1/udp/{dead_port}/quic-v1").parse().unwrap();
+        assert!(!client.tcp_first.read().unwrap().contains(&peer_id));
+        let answer = client
+            .request_raw_at(peer_id, vec![dead.clone(), tcp.clone()], protocols::STATUS_V2, wire)
+            .await
+            .expect("answered over TCP");
+        assert_eq!(codec::decode_response(&answer, false).expect("a status chunk").result_code,
+            codec::RESULT_SUCCESS);
+        assert!(client.tcp_first.read().unwrap().contains(&peer_id), "the failed QUIC dial demoted it");
+        let mut next = vec![dead.clone(), tcp.clone()];
+        dial_order(&client.tcp_first, &peer_id, &mut next);
+        assert_eq!(next, vec![tcp, dead], "the next dial goes to TCP first");
+    }
+
     /// A name-pinned QUIC address resolves the same way a TCP one does: the
     /// `/udp/<port>/quic-v1/p2p/<id>` tail survives on every candidate.
     #[tokio::test]
@@ -2710,8 +3043,8 @@ mod dial_resolution_tests {
         assert!(!out.is_empty(), "localhost must resolve");
         for m in &out {
             // No DNS component survives — that is the whole point: the swarm's
-            // transport may have no DNS layer at all (Android), where a /dns4/
-            // address is rejected with "Multiaddr is not supported".
+            // transport has no DNS layer (`build_swarm`), so a /dns4/ address
+            // is rejected there with "Multiaddr is not supported".
             assert!(multiaddr_dns_name(m).is_none(), "{m} still carries a name");
             assert!(multiaddr_ip(m).is_some(), "{m} has no IP");
             assert_eq!(multiaddr_port(m), Some(9105), "port must survive");
@@ -2733,6 +3066,47 @@ mod dial_resolution_tests {
             .parse()
             .unwrap();
         assert_eq!(resolve_dial_addrs(&a, &memo()).await, vec![a.clone()]);
+    }
+
+    /// The swarm has no DNS layer: libp2p's `dns` feature stays off (it pinned
+    /// hickory-resolver 0.25, see Cargo.toml), so a name reaching the swarm is
+    /// refused there, and resolution is `resolve_dial_addrs`'s alone. Re-adding
+    /// the DNS transport fails this test.
+    #[tokio::test]
+    async fn the_swarm_has_no_dns_transport() {
+        let mut swarm =
+            build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, Default::default())
+                .expect("swarm");
+        let peer = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+        let named: Multiaddr = "/dns4/localhost/tcp/9105".parse().unwrap();
+        let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer)
+            .addresses(vec![named])
+            .build();
+        let unsupported = |e: &libp2p::swarm::DialError| match e {
+            libp2p::swarm::DialError::Transport(errs) => errs.iter().all(|(a, e)| {
+                // The swarm appends /p2p/<id>, so match the name, not the address.
+                multiaddr_dns_name(a).as_deref() == Some("localhost")
+                    && matches!(e, libp2p::TransportError::MultiaddrNotSupported(_))
+            }),
+            _ => false,
+        };
+        match swarm.dial(opts) {
+            Err(e) => assert!(unsupported(&e), "unexpected dial error: {e}"),
+            Ok(()) => {
+                let err = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if let SwarmEvent::OutgoingConnectionError { error, .. } =
+                            swarm.select_next_some().await
+                        {
+                            break error;
+                        }
+                    }
+                })
+                .await
+                .expect("the dial of a /dns4/ address resolves to an error");
+                assert!(unsupported(&err), "unexpected dial error: {err}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -2810,14 +3184,13 @@ mod pending_request_tests {
     use super::*;
     use libp2p::core::transport::PortUse;
     use libp2p::core::{ConnectedPoint, Endpoint};
-    use libp2p::swarm::ConnectionId;
     use std::num::NonZeroU32;
     use tokio::sync::oneshot::error::TryRecvError;
 
     fn host() -> (Swarm<Behaviour>, SwarmCtx) {
-        let swarm = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+        let swarm = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, Default::default())
             .expect("swarm");
-        (swarm, SwarmCtx::new(LocalStatus::new(status(0)), None, None, Arc::default()))
+        (swarm, SwarmCtx::new(LocalStatus::new(status(0)), None, None, Arc::default(), Arc::default()))
     }
 
     fn peer() -> PeerId {
@@ -2876,6 +3249,170 @@ mod pending_request_tests {
         ConnectedPoint::Dialer { address: addr(), role_override: Endpoint::Dialer, port_use: PortUse::Reuse }
     }
 
+    /// The TCP-first reorder moves TCP addresses to the front only for a peer
+    /// on the list, and keeps the order within each transport.
+    #[test]
+    fn dial_order_moves_tcp_first_only_for_a_demoted_peer() {
+        let set = TcpFirst::default();
+        let (demoted, other) = (peer(), peer());
+        let q4: Multiaddr = "/ip4/10.0.0.1/udp/9001/quic-v1".parse().unwrap();
+        let q6: Multiaddr = "/ip6/2001:db8::1/udp/9001/quic-v1".parse().unwrap();
+        let t4: Multiaddr = "/ip4/10.0.0.1/tcp/9000".parse().unwrap();
+        let t6: Multiaddr = "/ip6/2001:db8::1/tcp/9000".parse().unwrap();
+        let spec = vec![q4.clone(), q6.clone(), t4.clone(), t6.clone()];
+        assert!(prefer_tcp(&set, demoted));
+        assert!(!prefer_tcp(&set, demoted), "already there");
+
+        let mut a = spec.clone();
+        dial_order(&set, &other, &mut a);
+        assert_eq!(a, spec, "not demoted: the spec's order, untouched");
+        let mut b = spec.clone();
+        dial_order(&set, &demoted, &mut b);
+        assert_eq!(b, vec![t4, t6, q4, q6]);
+    }
+
+    #[test]
+    fn nimbus_agents_are_recognized_in_either_spelling() {
+        assert!(is_nimbus_agent("nimbus-eth2/v26.10.2-abcdef"));
+        assert!(is_nimbus_agent("nimbus"));
+        assert!(is_nimbus_agent("Nimbus/v26.9.1"));
+        assert!(!is_nimbus_agent("Lighthouse/v8.2.3"));
+        assert!(!is_nimbus_agent("nim"));
+        assert!(!is_nimbus_agent(""));
+    }
+
+    /// A request timeout on a QUIC connection closes it — once, however many
+    /// of its requests time out together — and puts the peer on TCP first; a
+    /// timeout on a TCP connection changes nothing.
+    #[tokio::test]
+    async fn a_timeout_on_quic_closes_that_connection_and_demotes_the_peer() {
+        let (mut swarm, mut ctx) = host();
+        let (over_quic, over_tcp) = (peer(), peer());
+        let quic_point = ConnectedPoint::Dialer {
+            address: "/ip4/127.0.0.1/udp/9001/quic-v1".parse().unwrap(),
+            role_override: Endpoint::Dialer,
+            port_use: PortUse::Reuse,
+        };
+        for (peer_id, id, endpoint) in
+            [(over_quic, 7, quic_point), (over_tcp, 8, dialer())]
+        {
+            handle_swarm_event(&mut swarm, &mut ctx, SwarmEvent::ConnectionEstablished {
+                peer_id,
+                connection_id: ConnectionId::new_unchecked(id),
+                endpoint,
+                num_established: NonZeroU32::MIN,
+                concurrent_dial_errors: None,
+                established_in: Duration::ZERO,
+            });
+        }
+        assert!(ctx.quic_conns.contains(&ConnectionId::new_unchecked(7)));
+        assert!(!ctx.quic_conns.contains(&ConnectionId::new_unchecked(8)), "TCP is not tracked");
+
+        demote_stalled_quic(&mut swarm, &mut ctx, over_tcp, ConnectionId::new_unchecked(8), protocols::PING);
+        assert!(!ctx.tcp_first.read().unwrap().contains(&over_tcp), "a TCP timeout is the peer's answer");
+
+        demote_stalled_quic(&mut swarm, &mut ctx, over_quic, ConnectionId::new_unchecked(7), protocols::PING);
+        assert!(ctx.tcp_first.read().unwrap().contains(&over_quic));
+        assert!(!ctx.quic_conns.contains(&ConnectionId::new_unchecked(7)), "closed once, not again");
+        // A second timeout on the same connection is a no-op.
+        demote_stalled_quic(&mut swarm, &mut ctx, over_quic, ConnectionId::new_unchecked(7), protocols::PING);
+    }
+
+    /// A Nimbus peer identified on a QUIC connection is put on TCP first and
+    /// that connection closed — once: a later QUIC connection (TCP refused,
+    /// so QUIC is all there is) is left alone.
+    #[tokio::test]
+    async fn a_nimbus_peer_on_quic_is_closed_once_and_put_on_tcp_first() {
+        let (mut swarm, mut ctx) = host();
+        let key = libp2p::identity::Keypair::generate_secp256k1();
+        let p = key.public().to_peer_id();
+        let quic_point = || ConnectedPoint::Dialer {
+            address: "/ip4/127.0.0.1/udp/9001/quic-v1".parse().unwrap(),
+            role_override: Endpoint::Dialer,
+            port_use: PortUse::Reuse,
+        };
+        let identify_on = |id: usize| BehaviourEvent::Identify(identify::Event::Received {
+            connection_id: ConnectionId::new_unchecked(id),
+            peer_id: p,
+            info: identify::Info {
+                public_key: key.public(),
+                protocol_version: "eth2/1.0.0".into(),
+                agent_version: "nimbus-eth2/v26.9.1".into(),
+                listen_addrs: Vec::new(),
+                protocols: Vec::new(),
+                observed_addr: addr(),
+                signed_peer_record: None,
+            },
+        });
+        for id in [11, 12] {
+            handle_swarm_event(&mut swarm, &mut ctx, SwarmEvent::ConnectionEstablished {
+                peer_id: p,
+                connection_id: ConnectionId::new_unchecked(id),
+                endpoint: quic_point(),
+                num_established: NonZeroU32::MIN,
+                concurrent_dial_errors: None,
+                established_in: Duration::ZERO,
+            });
+        }
+        handle_behaviour_event(&mut swarm, &mut ctx, identify_on(11));
+        assert!(ctx.tcp_first.read().unwrap().contains(&p));
+        assert!(!ctx.quic_conns.contains(&ConnectionId::new_unchecked(11)), "closed");
+        handle_behaviour_event(&mut swarm, &mut ctx, identify_on(12));
+        assert!(ctx.quic_conns.contains(&ConnectionId::new_unchecked(12)), "already demoted: left open");
+    }
+
+    /// A request lost to a QUIC connection the swarm closed — the peer went
+    /// on TCP first while it was out — is retried once, TCP first; a failure
+    /// that demoted nobody is returned as it is.
+    #[tokio::test]
+    async fn a_request_lost_to_a_demotion_is_retried_once_tcp_first() {
+        let (tx, mut rx) = mpsc::channel::<Command>(4);
+        let tcp_first: TcpFirst = Arc::default();
+        let client = ReqRespClient {
+            tx,
+            agents: Arc::default(),
+            tcp_first: tcp_first.clone(),
+            last_resolved: Arc::default(),
+        };
+        let (demoted, plain) = (peer(), peer());
+        let quic: Multiaddr = "/ip4/127.0.0.1/udp/9001/quic-v1".parse().unwrap();
+        let tcp: Multiaddr = "/ip4/127.0.0.1/tcp/9000".parse().unwrap();
+        // A stand-in swarm task: the demoted peer's first request is closed
+        // under it (and the peer demoted, as `demote_stalled_quic` does), its
+        // second answered; the other peer's request is closed with no demotion.
+        let seen = Arc::new(Mutex::new(Vec::<(PeerId, Vec<Multiaddr>)>::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                if let Command::Request { peer, addrs, reply, .. } = cmd {
+                    let first = !log.lock().unwrap().iter().any(|(p, _)| *p == peer);
+                    log.lock().unwrap().push((peer, addrs));
+                    let answer = if peer == demoted && first {
+                        prefer_tcp(&tcp_first, peer);
+                        Err(RequestError::ConnectionClosed)
+                    } else if peer == demoted {
+                        Ok(vec![1])
+                    } else {
+                        Err(RequestError::ConnectionClosed)
+                    };
+                    let _ = reply.send(answer);
+                }
+            }
+        });
+
+        let got = client
+            .request_raw_at(demoted, vec![quic.clone(), tcp.clone()], protocols::PING, vec![0])
+            .await;
+        assert_eq!(got, Ok(vec![1]), "retried and answered");
+        let got = client.request_raw_at(plain, vec![quic.clone(), tcp.clone()], protocols::PING, vec![0]).await;
+        assert_eq!(got, Err(RequestError::ConnectionClosed), "no demotion, no retry");
+
+        let seen = seen.lock().unwrap();
+        let attempts: Vec<_> = seen.iter().filter(|(p, _)| *p == demoted).map(|(_, a)| a.clone()).collect();
+        assert_eq!(attempts, vec![vec![quic.clone()], vec![tcp.clone()]], "QUIC first, then the retry at TCP");
+        assert_eq!(seen.iter().filter(|(p, _)| *p == plain).count(), 1);
+    }
+
     /// A new connection, which is what starts a peer's auto-Status.
     fn connect(swarm: &mut Swarm<Behaviour>, ctx: &mut SwarmCtx, peer_id: PeerId) {
         let event = SwarmEvent::ConnectionEstablished {
@@ -2909,10 +3446,11 @@ mod pending_request_tests {
     #[tokio::test]
     async fn client_label_follows_identify_goodbye_and_the_last_close() {
         let agents: AgentMap = Arc::default();
-        let mut swarm = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+        let mut swarm = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, Default::default())
             .expect("swarm");
-        let mut ctx = SwarmCtx::new(LocalStatus::new(status(0)), None, None, agents.clone());
-        let client = ReqRespClient { tx: mpsc::channel(1).0, agents: agents.clone(), last_resolved: Arc::default() };
+        let tcp_first: TcpFirst = Arc::default();
+        let mut ctx = SwarmCtx::new(LocalStatus::new(status(0)), None, None, agents.clone(), tcp_first.clone());
+        let client = ReqRespClient { tx: mpsc::channel(1).0, agents: agents.clone(), tcp_first, last_resolved: Arc::default() };
         let key = libp2p::identity::Keypair::generate_secp256k1();
         let p = key.public().to_peer_id();
 
@@ -2936,6 +3474,7 @@ mod pending_request_tests {
         }));
         let shown = "nimbus-eth2/v26.7.0 INFO forged=1[31m";
         assert_eq!(client.client_of(&p), shown, "after Identify, sanitized");
+        assert!(ctx.tcp_first.read().unwrap().contains(&p), "a Nimbus agent puts the peer on TCP first");
         assert_eq!(client_label(&ctx.peer_agents, &p), shown, "swarm side sees the same map");
 
         respond_inbound(&mut ctx, protocols::GOODBYE, p, &codec::encode_request(&129u64.to_le_bytes()));

@@ -352,6 +352,18 @@ public final class NodeService extends Service {
         prefs(c).edit().putBoolean("logIndex.backfillPaused." + canonicalNetwork(network), on).apply();
     }
 
+    /** Whether the log index's backfill walk may download on a metered network (see
+     *  {@code Settings.logIndexAllowMetered}). Off by default: "unmetered only" — this
+     *  host reports metering to the engine (NET_CAPABILITY_NOT_METERED), which holds the
+     *  walk on mobile data unless this is on. */
+    public static boolean logIndexAllowMetered(android.content.Context c, String network) {
+        return prefs(c).getBoolean("logIndex.allowMetered." + canonicalNetwork(network), false);
+    }
+
+    public static void setLogIndexAllowMetered(android.content.Context c, String network, boolean on) {
+        prefs(c).edit().putBoolean("logIndex.allowMetered." + canonicalNetwork(network), on).apply();
+    }
+
     public static void setLogIndexEnabled(android.content.Context c, String network, boolean on) {
         prefs(c).edit().putBoolean("logIndex." + canonicalNetwork(network), on).apply();
     }
@@ -378,7 +390,7 @@ public final class NodeService extends Service {
     }
 
     /** The read-fetch shadow-cache counters JSON for the Status tab's Reads
-     *  rows (docs/read-stats.md), or null when the network isn't hosted. A
+     *  rows (docs/how-it-works/read-stats.md), or null when the network isn't hosted. A
      *  status probe like the log-index one: not gated on readiness. */
     public String readStatsJsonOrNull(String network) {
         String net = canonicalNetwork(network);
@@ -490,7 +502,8 @@ public final class NodeService extends Service {
             boolean enabled = logIndexEnabled(this, net);
             String json = io.myotis.ui.LogIndexWatch.configJson(
                     logIndexWatchJson(this, net), enabled, logIndexMaxSpeed(this, net),
-                    logIndexConfigured(this, net), logIndexBackfillPaused(this, net));
+                    logIndexConfigured(this, net), logIndexBackfillPaused(this, net),
+                    logIndexAllowMetered(this, net));
             if (json == null) {
                 return; // nothing to say (no entries, never configured) — engine stays honestly unconfigured
             }
@@ -638,7 +651,7 @@ public final class NodeService extends Service {
      *  native lib out when debugging (e.g. a 16 KB-alignment load failure) or to compare
      *  behavior. Mapped to the {@code myotis.bls.backend} property via {@link #blsBackendChoice}
      *  and applied live by {@link #applyBlsBackend} (also re-applied on each node start).
-     *  See docs/bls-rust-acceleration.md. */
+     *  See docs/design-history/bls-rust-acceleration.md. */
     public static boolean nativeBlsEnabled(android.content.Context c) {
         return prefs(c).getBoolean(K_NATIVE_BLS, true);
     }
@@ -703,7 +716,7 @@ public final class NodeService extends Service {
         return choice;
     }
     /** Settings toggle: route account (balance/nonce) reads and the broadcast of the wallet's
-     *  own transactions over Tor (docs/privacy-and-tor.md). Default off. Experimental and
+     *  own transactions over Tor (docs/how-it-works/privacy-and-tor.md). Default off. Experimental and
      *  Rust-engine-only, and only a {@code -PtorEngine} build can honour it
      *  ({@link #torSupported}) — the Settings row is shown only there, so a Tor-less build
      *  never offers a privacy switch it would ignore. Applied by {@link #applyTorMode}. */
@@ -1437,7 +1450,7 @@ public final class NodeService extends Service {
     }
 
     /** The device's current network as the engine's data-usage figures label it
-     *  (docs/data-usage.md): no active network (or a read error) is UNKNOWN. */
+     *  (docs/how-it-works/data-usage.md): no active network (or a read error) is UNKNOWN. */
     static io.myotis.api.NetworkMetering meteringNow(android.content.Context c) {
         android.net.NetworkCapabilities caps = activeNetworkCapabilities(c);
         if (caps == null) return io.myotis.api.NetworkMetering.UNKNOWN;
@@ -1890,7 +1903,7 @@ public final class NodeService extends Service {
 
     /** {@code [short, line]} for the notification — {@code "12.4 MB today"} and
      *  {@code "Data today 12.4 MB · 4.1 MB metered · 8.3 MB unmetered"}: today's usage of every
-     *  hosted network, running or asleep, added up (docs/data-usage.md). Two empty strings —
+     *  hosted network, running or asleep, added up (docs/how-it-works/data-usage.md). Two empty strings —
      *  no data line at all, never a wrong figure — before any network is hosted or when one
      *  network's status could not be read. Only the latest local day's figures are added: just
      *  after midnight a network whose ledger has not ticked yet still reports yesterday's. */
@@ -2086,7 +2099,7 @@ public final class NodeService extends Service {
             // Fork watch: peers announce (or already activated) a network upgrade this
             // build doesn't support; null = none / not watched here. Kept while paused.
             io.myotis.api.UpgradeAdvisory upgradeAdvisory,
-            // This network's bytes on the wire, since start and today (docs/data-usage.md);
+            // This network's bytes on the wire, since start and today (docs/how-it-works/data-usage.md);
             // kept while paused.
             io.myotis.api.DataUsage dataUsage,
             // The device network's metering as last pushed to the engine (debugging aid).

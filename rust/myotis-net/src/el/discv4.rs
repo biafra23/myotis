@@ -1,5 +1,5 @@
 //! discv4 — UDP Kademlia peer discovery (EL-A3), twin of the Java
-//! `networking.discv4` package (docs/reimplementation/02 §2).
+//! `networking.discv4` package (docs/spec/02 §2).
 //!
 //! Wire format:
 //! ```text
@@ -376,7 +376,7 @@ impl Drop for Discv4Service {
 
 /// discv4 NEIGHBORS packets run to the 1280-byte spec cap; a fixed 4096-byte
 /// read buffer keeps any allocator from truncating them, and a 1 MiB
-/// SO_RCVBUF absorbs reply bursts (docs/reimplementation/02 §2.3 — the
+/// SO_RCVBUF absorbs reply bursts (docs/spec/02 §2.3 — the
 /// Android/ART truncation trap).
 const RECV_BUF: usize = 4096;
 
@@ -1383,7 +1383,7 @@ impl ServiceLoop {
             .map(|f| f.load(Ordering::Relaxed));
         let fan_out = fan_out(&mut self.wide, below, tokio::time::Instant::now());
         let mut random_target = [0u8; 64];
-        let _ = getrandom::getrandom(&mut random_target);
+        let _ = getrandom::fill(&mut random_target);
         let now = tokio::time::Instant::now();
         for entry in sample(&peers, fan_out) {
             let Some(addr) = to_socket_addr(&entry.ip, entry.udp_port) else {
@@ -1505,7 +1505,7 @@ fn sample(peers: &[TableEntry], k: usize) -> Vec<TableEntry> {
     let mut indices: Vec<usize> = (0..n).collect();
     let mut rnd = [0u8; 8];
     for i in 0..take {
-        let _ = getrandom::getrandom(&mut rnd);
+        let _ = getrandom::fill(&mut rnd);
         let j = i + (u64::from_le_bytes(rnd) as usize) % (n - i);
         indices.swap(i, j);
     }

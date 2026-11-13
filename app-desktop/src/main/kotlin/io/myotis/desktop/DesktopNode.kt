@@ -464,7 +464,7 @@ class DesktopNodeController(
 
     override fun applyTorMode() {
         // Push the persisted Tor preference to the process-global Rust-engine flag
-        // (docs/privacy-and-tor.md). Tor is Rust-engine-only and experimental: Tor.select
+        // (docs/how-it-works/privacy-and-tor.md). Tor is Rust-engine-only and experimental: Tor.select
         // returns whether the loaded engine build actually supports it, which we log so a
         // silently-unsupported build is visible. Unlike the engine choice, the Tor flag is
         // LIVE — ElReader checks it per read, so a flip takes effect on the next read of an
@@ -908,7 +908,7 @@ class DesktopNodeController(
         engine.hostedNetworks().mapNotNull { name -> engine.get(name)?.let { webOriginRows(name, it) } }
 
     /**
-     * Tor routing state for the Status row (docs/privacy-and-tor.md), or null when it
+     * Tor routing state for the Status row (docs/how-it-works/privacy-and-tor.md), or null when it
      * doesn't apply: Tor is a Rust-engine-only capability, and a Rust build without
      * `--features tor` reports no support (status bit0 clear). Otherwise: "off" (supported
      * but disabled), "on" (enabled, circuit still bootstrapping), "active" (circuit ready).
@@ -938,6 +938,7 @@ internal fun logIndexConfigJson(settings: Settings, network: String): String? =
         settings.logIndexMaxSpeed(network),
         configured = settings.logIndexConfigured(network),
         backfillPaused = settings.logIndexBackfillPaused(network),
+        allowMetered = settings.logIndexAllowMetered(network),
     )
 
 /** Between the desktop's scheduled balance checks of a network. */
@@ -1003,7 +1004,7 @@ class DesktopSettings(
     // Default off = the selector's `auto` mode (Rust engine where it can serve, Java
     // fallback). On = force the Java engine — the opt-out, now that Rust is primary.
     private var preferJava = false
-    // Tor verified-read routing (docs/privacy-and-tor.md) — experimental, Rust-engine-only,
+    // Tor verified-read routing (docs/how-it-works/privacy-and-tor.md) — experimental, Rust-engine-only,
     // off by default. Persists independently; applyTorMode() pushes it to the Rust engine.
     private var torRouting = false
     // Expert mode (Logs/Index tabs, full Status rows, advanced settings); off by default.
@@ -1021,6 +1022,10 @@ class DesktopSettings(
     // Per-network backfill OFF switch; see Settings.logIndexBackfillPaused. Absent
     // means "use the flavour default" — the Bee PoC ships paused (BeePoc.kt).
     private val logIndexPaused = HashMap<String, Boolean>()
+    // Per-network "download on metered networks too"; see Settings.logIndexAllowMetered.
+    // The desktop reports no metering to the engine, so nothing here is ever held for
+    // it, but the choice is kept so a host that learns to report it honours it.
+    private val logIndexMetered = HashMap<String, Boolean>()
     // Per-network watched contracts, as LogIndexWatch's JSON array (Settings.logIndexWatchJson).
     private val logIndexWatch = HashMap<String, String>()
     // Per-network user-added tokens, as CustomTokens' JSON array (Settings.customTokensJson).
@@ -1083,6 +1088,9 @@ class DesktopSettings(
     override fun logIndexBackfillPaused(network: String): Boolean =
         synchronized(this) { logIndexPaused[network] ?: (Poc.active()?.backfillPausedDefault() ?: false) }
     override fun setLogIndexBackfillPaused(network: String, on: Boolean) = mutate { logIndexPaused[network] = on }
+    override fun logIndexAllowMetered(network: String): Boolean =
+        synchronized(this) { logIndexMetered[network] ?: false }
+    override fun setLogIndexAllowMetered(network: String, on: Boolean) = mutate { logIndexMetered[network] = on }
     override fun logIndexConfigured(network: String): Boolean =
         synchronized(this) { logIndexOn.containsKey(network) }
     override fun logIndexWatchJson(network: String): String =
@@ -1214,6 +1222,10 @@ class DesktopSettings(
             p.getProperty(k)?.toBooleanStrictOrNull()
                 ?.let { logIndexPaused[k.removePrefix(K_LOG_INDEX_PAUSED_PREFIX)] = it }
         }
+        p.stringPropertyNames().filter { it.startsWith(K_LOG_INDEX_METERED_PREFIX) }.forEach { k ->
+            p.getProperty(k)?.toBooleanStrictOrNull()
+                ?.let { logIndexMetered[k.removePrefix(K_LOG_INDEX_METERED_PREFIX)] = it }
+        }
         p.stringPropertyNames().filter { it.startsWith(K_LOG_INDEX_SPEED_PREFIX) }.forEach { k ->
             p.getProperty(k)?.toBooleanStrictOrNull()
                 ?.let { logIndexMax[k.removePrefix(K_LOG_INDEX_SPEED_PREFIX)] = it }
@@ -1237,6 +1249,7 @@ class DesktopSettings(
                 it.startsWith(K_LOG_INDEX_PREFIX) &&
                     !it.startsWith(K_LOG_INDEX_SPEED_PREFIX) &&
                     !it.startsWith(K_LOG_INDEX_PAUSED_PREFIX) &&
+                    !it.startsWith(K_LOG_INDEX_METERED_PREFIX) &&
                     !it.startsWith(K_LOG_INDEX_WATCH_PREFIX)
             }
             .forEach { k ->
@@ -1301,6 +1314,7 @@ class DesktopSettings(
         logIndexOn.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_PREFIX$net", on.toString()) }
         logIndexMax.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_SPEED_PREFIX$net", on.toString()) }
         logIndexPaused.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_PAUSED_PREFIX$net", on.toString()) }
+        logIndexMetered.forEach { (net, on) -> p.setProperty("$K_LOG_INDEX_METERED_PREFIX$net", on.toString()) }
         logIndexWatch.forEach { (net, json) -> p.setProperty("$K_LOG_INDEX_WATCH_PREFIX$net", json) }
         customTokens.forEach { (net, json) -> p.setProperty("$K_CUSTOM_TOKENS_PREFIX$net", json) }
         watchLists.forEach { (net, json) -> p.setProperty("$K_WATCH_LIST_PREFIX$net", json) }
@@ -1353,6 +1367,7 @@ class DesktopSettings(
         // startsWith filter must exclude them (see load()).
         const val K_LOG_INDEX_SPEED_PREFIX = "logIndex.maxSpeed."
         const val K_LOG_INDEX_PAUSED_PREFIX = "logIndex.backfillPaused."
+        const val K_LOG_INDEX_METERED_PREFIX = "logIndex.allowMetered."
         const val K_LOG_INDEX_WATCH_PREFIX = "logIndex.watch."
         const val K_CUSTOM_TOKENS_PREFIX = "tokens.custom."
         const val K_WATCH_LIST_PREFIX = "watch.list."

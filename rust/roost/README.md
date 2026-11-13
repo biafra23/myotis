@@ -1,6 +1,6 @@
 # roost — dedicated light-client server
 
-Design: [`docs/lc-server-design.md`](../../docs/lc-server-design.md).
+Design: [`docs/design-history/lc-server-design.md`](../../docs/design-history/lc-server-design.md).
 
 A myotis wallet needs a beacon node that will still have a free slot when it
 dials, and that it can find without hard-coding an address. A general-purpose
@@ -18,7 +18,8 @@ Nimbus over loopback REST and relays them verbatim, without decoding them. It
 verifies nothing and does not need to: a wallet checks every update against
 sync-committee signatures chained from its own anchor, so a relay can withhold
 but cannot forge. That carve-out is recorded in
-[`CLAUDE.md`](../../CLAUDE.md) under **Data sources**.
+[`.claude/agent/data-sources.md`](../../.claude/agent/data-sources.md)
+(summary in [`CLAUDE.md`](../../CLAUDE.md) under **Data sources**).
 
 One thing roost relays is **not** self-verifying, and is worth naming so the
 boundary is not widened by accident: the `status` handshake, built from REST
@@ -46,7 +47,7 @@ peer. The **Java engine is untested against roost**; `myotis.engine` defaults
 to *auto*, which picks the Rust engine wherever it can serve, so the untested
 gap is the fallback path rather than the default one: `MYOTIS_CL_STATIC_PEERS`
 exists only on the Rust side, and pointing a Java-engine wallet at roost means
-editing `NetworkConfig` and rebuilding. `docs/lc-server-design.md` rollout step 2
+editing `NetworkConfig` and rebuilding. `docs/design-history/lc-server-design.md` rollout step 2
 asks for both engines and for saying which is which; this is the which.
 
 **Context bytes are computed, not guessed.** Since EIP-7892 one fork name has as
@@ -125,7 +126,7 @@ data:
 ```
 
 `--rest` is **off by default** and was added to the running sepolia node on
-2026-08-08 (`docs/lc-server-design.md` §Rollout). Check your unit actually has
+2026-08-08 (`docs/design-history/lc-server-design.md` §Rollout). Check your unit actually has
 it before installing roost: without it roost fails on its first upstream call,
 and under `Restart=on-failure` that is a restart loop rather than a clear error.
 

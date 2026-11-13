@@ -1,5 +1,17 @@
-# Track stable. The minimum rustc is `rust-version` in Cargo.toml [workspace.package],
-# which the Gradle probe (root build.gradle.kts) enforces; pinning an exact version here would force rustup downloads on machines that
-# already have a new-enough stable, which fights the "Rust is optional" build design.
+# The EXACT rustc every build of this workspace uses (#734, decision D-a): local
+# builds through rustup, the Gradle cargo tasks (they run in this directory), and
+# CI — every workflow installs this version through .github/actions/rust-toolchain,
+# which reads it from this line, so CI and local builds cannot drift apart. A
+# floating `stable` meant a tag built on a different day got a different rustc,
+# i.e. different bytes.
+#
+# rustup installs this toolchain the first time a build on a machine needs it
+# (once per machine). Machines without cargo are unaffected — Rust stays optional
+# for the JVM hosts. `rust-version` in Cargo.toml [workspace.package] stays the
+# FLOOR for cargo installs that are not managed by rustup.
+#
+# Bumping it is a reviewed PR like any dependency bump: change this line (the
+# x.y.z form is required — the CI action refuses a channel name) and let CI build
+# every target with it.
 [toolchain]
-channel = "stable"
+channel = "1.99.1"

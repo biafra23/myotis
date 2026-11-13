@@ -3,7 +3,7 @@
 # site/ is a plain static page for people who USE the apps, not for developers:
 # no build step, no generator, no third-party requests. Keep it that way: the
 # same directory is meant to be uploaded unchanged to Swarm and served as
-# myotis.eth (and myotis.eth.limo for ordinary browsers) — see docs/website.md —
+# myotis.eth (and myotis.eth.limo for ordinary browsers) — see docs/how-it-works/website.md —
 # and a page that needs a build or pulls in a CDN would not survive that move.
 #
 # One-time setup, by a repository admin (this workflow cannot do it itself; the
@@ -33,7 +33,7 @@ concurrency:
 jobs:
   deploy:
     name: Publish site/ to GitHub Pages
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -43,10 +43,10 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d  # v6.0.0
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5.0.0
         with:
           path: site
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346  # v5.0.1

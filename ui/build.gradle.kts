@@ -112,10 +112,25 @@ abstract class AppVersionSource : ValueSource<String, AppVersionSource.Params> {
     }
 }
 
-val uiAppVersion: Provider<String> = providers.of(AppVersionSource::class) {
-    parameters.repoDir.fileValue(rootDir)
-    parameters.projectVersion.set(project.version.toString())
+// -PappVersion=X.Y.Z overrides the git-derived value (#734 D4). The derivation
+// above is deterministic per checkout KIND, not per commit: a full clone of a
+// tag says X.Y.Z, a source tarball says the root version (-SNAPSHOT), a shallow
+// clone without tags says <x>-<sha>. A rebuild that wants the release's bytes
+// states the version instead of depending on how the source was fetched
+// (docs/guides/reproducible-builds.md, "The commands"). Any value the derivation
+// can produce is accepted, so an rc tag's build (`0.1.20-1a2b3c`, the last release
+// plus the commit) can be stated too; the character set keeps it from injecting
+// into the generated Kotlin literal.
+val explicitAppVersion: String? = providers.gradleProperty("appVersion").orNull?.trim()?.also {
+    require(Regex("""^\d+(\.\d+)*(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$""").matches(it)) {
+        "-PappVersion=$it: expected a version as the app shows it, like 0.1.21 or 0.1.20-1a2b3c (no v prefix)"
+    }
 }
+val uiAppVersion: Provider<String> = explicitAppVersion?.let { providers.provider { it } }
+    ?: providers.of(AppVersionSource::class) {
+        parameters.repoDir.fileValue(rootDir)
+        parameters.projectVersion.set(project.version.toString())
+    }
 
 val generateUiBuildInfo by tasks.registering {
     val outDir = layout.buildDirectory.dir("generated/buildInfo/kotlin")
@@ -177,6 +192,9 @@ kotlin {
                 // new artifact in any host — :jsonrpc-server, which all three bundle, already
                 // ships it.
                 implementation(libs.kotlinx.serialization.json)
+                // The Index tab's predefined contracts and their download estimates —
+                // one catalog with the engine library's, so the from-blocks cannot drift.
+                implementation(project(":myotis-logindex-presets"))
             }
         }
         // CacheFileStats' stat/read actuals are plain java.nio, identical on the
@@ -209,6 +227,10 @@ kotlin {
 android {
     namespace = "io.myotis.ui"
     compileSdk = 35
+    // The pinned build-tools, as :android-app and :myotis-engine (#734): without
+    // this AGP falls back to its own default version, which the hosted runner
+    // happens to preinstall and the builder image (docker/builder/) does not.
+    buildToolsVersion = libs.versions.android.build.tools.get()
     defaultConfig {
         minSdk = 29
     }

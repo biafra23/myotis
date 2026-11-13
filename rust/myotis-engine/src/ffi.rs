@@ -72,7 +72,7 @@ pub fn start_handle(handle: i64) -> bool {
     crate::host::start(handle)
 }
 
-/// Toggle Tor verified-read routing (docs/privacy-and-tor.md). Returns true iff
+/// Toggle Tor verified-read routing (docs/how-it-works/privacy-and-tor.md). Returns true iff
 /// this build supports Tor (`--features tor`); a Tor-less build returns false and
 /// no-ops. Process-global, not per-handle.
 #[uniffi::export]
@@ -108,7 +108,7 @@ pub fn set_dns_discovery(on: bool) -> bool {
 }
 
 /// The host's word on the device's current network, for the data-usage
-/// figures (docs/data-usage.md): 0 unknown, 1 unmetered, 2 metered. Bytes
+/// figures (docs/how-it-works/data-usage.md): 0 unknown, 1 unmetered, 2 metered. Bytes
 /// moved from now on count as metered while it is 2. False — nothing
 /// recorded — for any other code. Process-global, not per-handle.
 #[uniffi::export]
@@ -492,7 +492,7 @@ pub fn address_activity_json(handle: i64, after_block: i64) -> String {
 
 /// Read-fetch shadow-cache counters as JSON (schema 1: `account` / `storage`
 /// / `code` fetch, repeat and avoidable-cost counters plus age buckets; see
-/// docs/read-stats.md). `{"error":…}` when the handle has no EL reader.
+/// docs/how-it-works/read-stats.md). `{"error":…}` when the handle has no EL reader.
 #[uniffi::export]
 pub fn read_stats_json(handle: i64) -> String {
     crate::host::read_stats_json(handle)

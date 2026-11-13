@@ -1,0 +1,7 @@
+# build outputs and the extracted snapshot (source/build.py, epub.py)
+source/out/
+source/.cache/
+source/__pycache__/
+# the workbook's cargo output, and the learner's own copy (cp -R starter mine)
+workbook/*/target/
+workbook/mine/

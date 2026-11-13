@@ -2,7 +2,7 @@
 //!
 //! Wire form `RLP([signature, seq, k, v, k, v, …])`; the text form is
 //! `enr:` + base64url (no padding). Matching the Java decoder
-//! (docs/reimplementation/02 §1.3): the SIGNATURE IS NOT VERIFIED on this
+//! (docs/spec/02 §1.3): the SIGNATURE IS NOT VERIFIED on this
 //! path — nor on the Java twin's (`Enr.decode` skips it too; the Java EIP-1459
 //! DNS walk verifies only the tree's ROOT record against the tree pubkey).
 //! The Rust engine's own DNS walk (`myotis-net`'s `el/dnsdisco.rs`, #539)

@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 940 270" role="img" fill="currentColor" aria-label="The sync to async bridge of eth_call. Top lane: tokio worker threads, where the async ElReader method builds a PoolOracle and the hedged snap requests run. Bottom lane: a blocking-pool thread, where request::blocking runs the revm executor. revm calls PoolOracle fetch methods synchronously; each one calls wait, which uses Handle::block_on to drive a hedged race over the call's peers. The verified value comes back down to revm. When revm finishes, the async reader receives the result by awaiting the blocking task's JoinHandle." width="940" height="270">
+    <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="940.0" height="270.0" fill="#f8fafb" /><defs>
+      <marker id="m-13-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+      </marker>
+    </defs>
+    <rect x="10" y="22" width="920" height="102" rx="10" style="fill:var(--jvm-wash)" />
+    <text x="24" y="40" font-size="11" font-weight="700" style="fill:var(--jvm-ink)">tokio worker threads · async</text>
+    <rect x="10" y="150" width="920" height="102" rx="10" style="fill:var(--oxide-wash)" />
+    <text x="24" y="244" font-size="11" font-weight="700" style="fill:var(--oxide-ink)">one blocking-pool thread · synchronous</text>
+
+    <rect x="30" y="52" width="220" height="56" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+    <text x="140" y="75" text-anchor="middle" font-size="12.5" font-weight="700" class="mono">ElReader::eth_call_*</text>
+    <text x="140" y="94" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">snapshots peers, builds PoolOracle</text>
+
+    <rect x="610" y="52" width="300" height="56" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+    <text x="760" y="75" text-anchor="middle" font-size="12.5" font-weight="700" class="mono">hedged_race → snap_get_*</text>
+    <text x="760" y="94" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">peer sockets, timers, proof checks</text>
+
+    <rect x="30" y="166" width="200" height="56" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--oxide)" />
+    <text x="130" y="189" text-anchor="middle" font-size="12.5" font-weight="700">revm executor</text>
+    <text x="130" y="208" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">myotis-evm, never awaits</text>
+
+    <rect x="300" y="166" width="220" height="56" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--oxide)" />
+    <text x="410" y="189" text-anchor="middle" font-size="12.5" font-weight="700" class="mono">PoolOracle::fetch_*</text>
+    <text x="410" y="208" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">impl SnapStateOracle</text>
+
+    <rect x="590" y="166" width="220" height="56" rx="8" stroke-width="1.4" style="fill:var(--surface);stroke:var(--oxide)" />
+    <text x="700" y="189" text-anchor="middle" font-size="12.5" font-weight="700" class="mono">wait() · block_on</text>
+    <text x="700" y="208" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">this thread polls the future</text>
+
+    <line x1="110" y1="110" x2="110" y2="163" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-13-arrow)" />
+    <text x="104" y="140" text-anchor="end" font-size="10.5">request::blocking</text>
+    <line x1="190" y1="163" x2="190" y2="111" stroke-width="1.4" stroke-dasharray="5 4" style="stroke:var(--ink-3)" marker-end="url(#m-13-arrow)" />
+    <text x="198" y="140" font-size="10.5" style="fill:var(--ink-2)">JoinHandle.await</text>
+
+    <line x1="232" y1="194" x2="297" y2="194" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-13-arrow)" />
+    <text x="264" y="186" text-anchor="middle" font-size="10">sync call</text>
+    <line x1="522" y1="194" x2="587" y2="194" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-13-arrow)" />
+
+    <line x1="680" y1="163" x2="680" y2="111" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-13-arrow)" />
+    <text x="672" y="140" text-anchor="end" font-size="10.5">drives the race</text>
+    <line x1="780" y1="111" x2="780" y2="163" stroke-width="1.4" style="stroke:var(--ok)" marker-end="url(#m-13-arrow)" />
+    <text x="788" y="140" font-size="10.5" style="fill:var(--ok-ink)">verified leaf / value</text>
+  </svg>

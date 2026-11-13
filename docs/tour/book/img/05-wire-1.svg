@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 880 360" role="img" fill="currentColor" aria-label="Dependency graph. myotis-net, which owns tokio, sockets and OS entropy, and any other host with its own event loop both depend on myotis-wire. myotis-net re-exports it at the old paths. myotis-wire depends on myotis-core always, and on myotis-consensus, and through it myotis-bls and the blst C library, only with the eth2 feature." width="880" height="360">
+      <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="880.0" height="360.0" fill="#f8fafb" /><defs>
+        <marker id="m-stop05-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+        </marker>
+      </defs>
+      <rect x="40" y="20" width="320" height="76" rx="10" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="56" y="44" font-size="12.5" font-weight="700" class="mono">myotis-net</text>
+      <text x="56" y="64" font-size="11" style="fill:var(--ink-2)">tokio · sockets · timers · OS entropy</text>
+      <text x="56" y="82" font-size="10.5" style="fill:var(--ink-3)">sessions, pool, discovery services, shims</text>
+
+      <rect x="500" y="20" width="340" height="76" rx="10" stroke-width="1.4" stroke-dasharray="5 4" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="516" y="44" font-size="12.5" font-weight="700">a host with its own event loop</text>
+      <text x="516" y="64" font-size="11" style="fill:var(--ink-2)">UEFI firmware · wasm32 · a blocking client</text>
+      <text x="516" y="82" font-size="10.5" style="fill:var(--ink-3)">brings its own socket, clock and randomness</text>
+
+      <rect x="150" y="146" width="580" height="88" rx="10" stroke-width="1.6" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="168" y="170" font-size="12.5" font-weight="700" class="mono">myotis-wire</text>
+      <text x="168" y="190" font-size="11" class="mono" style="fill:var(--ink-2)">discv4 · rlpx::{ecies, handshake, frame, hello} · eth · snap::{messages, fetch} · snappy</text>
+      <text x="168" y="210" font-size="11" class="mono" style="fill:var(--oxide-ink)">eth2::{codec, status, protocols}   (feature "eth2")</text>
+      <text x="168" y="226" font-size="10.5" style="fill:var(--ink-3)">no_std + alloc without "std"</text>
+
+      <rect x="60" y="284" width="320" height="60" rx="10" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="76" y="308" font-size="12.5" font-weight="700" class="mono">myotis-core</text>
+      <text x="76" y="328" font-size="11" style="fill:var(--ink-2)">keccak · RLP · NodeKey · header · trie</text>
+
+      <rect x="500" y="284" width="340" height="60" rx="10" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="516" y="308" font-size="12.5" font-weight="700" class="mono">myotis-consensus → myotis-bls</text>
+      <text x="516" y="328" font-size="11" style="fill:var(--ink-2)">SSZ helpers; blst, a C library</text>
+
+      <line x1="200" y1="96" x2="300" y2="144" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop05-arrow)" />
+      <text x="262" y="116" font-size="10.5" style="fill:var(--ink-3)">re-exports at the old paths</text>
+      <line x1="670" y1="96" x2="580" y2="144" stroke="currentColor" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#m-stop05-arrow)" />
+      <line x1="300" y1="234" x2="230" y2="282" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop05-arrow)" />
+      <line x1="580" y1="234" x2="660" y2="282" stroke="currentColor" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#m-stop05-arrow)" />
+      <text x="636" y="258" font-size="10.5" class="mono" style="fill:var(--oxide-ink)">only with "eth2"</text>
+    </svg>

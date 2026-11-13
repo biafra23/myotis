@@ -30,7 +30,13 @@ tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "time", 
 # TCP is the fallback, consensus-specs#5330). QUIC carries its own TLS 1.3
 # handshake and stream multiplexing, so neither noise nor a muxer is negotiated
 # on it — see `reqresp::build_swarm`.
-libp2p = { version = "=0.56.0", features = ["tokio", "tcp", "quic", "dns", "noise", "yamux", "identify", "request-response", "gossipsub", "secp256k1", "macros"] }
+# No `dns`: its transport pinned hickory-resolver 0.25.2 (advisories fixed in
+# 0.26.2), and /dns4/ dial addresses are resolved before the swarm anyway
+# (`reqresp::resolve_dial_addrs`, the platform's getaddrinfo). The libp2p
+# release that takes hickory 0.26 (0.57) makes libp2p-quic require quinn's
+# aws-lc-rs backend: a C library (aws-lc-sys, built with cmake) on every
+# target, beside ring, which leaves rustls with two providers.
+libp2p = { version = "=0.56.0", features = ["tokio", "tcp", "quic", "noise", "yamux", "identify", "request-response", "gossipsub", "secp256k1", "macros"] }
 # mplex, the TCP stream multiplexer the consensus p2p spec makes MANDATORY
 # ("clients that support the TCP transport MUST support mplex and MAY support
 # yamux", phase0/p2p-interface.md). rust-libp2p dropped it from the `libp2p`
@@ -43,24 +49,33 @@ discv5 = "=0.11.0"
 # The ENR wire codec, for the discv4 fork-id pre-filter (#539): the `enr` crate
 # itself arrives through discv5, alloy-rlp is the codec it implements. Already
 # in the lock via enr — no new download.
-alloy-rlp = "=0.3.16"
-# The EIP-1459 DNS tree walk (#539, part 3): TXT lookups over the system
-# resolver. Already in every lock through libp2p's `dns` transport with these
-# same features — no new download.
-hickory-resolver = { version = "=0.25.2", default-features = false, features = ["system-config", "tokio"] }
-snap = "=1.1.1"
+alloy-rlp = "=0.3.17"
+snap = "=1.1.2"
 tracing = "=0.1.44"
-futures = "=0.3.32"
-async-trait = "=0.1.89"
+futures = "=0.3.34"
+async-trait = "=0.1.92"
 # EL discv4 (el::discv4): SO_RCVBUF sizing on the UDP socket (the Android
-# NEIGHBORS-truncation trap — docs/reimplementation/02 §9.10) and entropy for
-# FindNode random targets. Both are I/O-crate concerns by the sans-I/O rules.
+# NEIGHBORS-truncation trap — docs/spec/02 §9.10). An I/O-crate concern by the
+# sans-I/O rules.
 socket2 = "=0.5.10"
-getrandom = "=0.2.17"
+# OS entropy for everything random in the EL and sync code. Some uses are
+# SECURITY-CRITICAL: the RLPx handshake's two ephemeral secret keys (ECDH and
+# ECIES), its nonce and its IV (el::rlpx::transport), node-key generation
+# (el::reader), and the Tor reserve's two secrets (el::pool): the fill salt,
+# a per-process secret that decides which peers this wallet reaches only over
+# Tor, and the per-call seed that orders which of them is asked first. Those
+# have no fallback value: without entropy the Tor path fails closed (#823).
+# Others may degrade: the EIP-8 auth padding, FindNode targets and peer
+# sampling (el::discv4), the DNS-walk shuffle, the finality-poll jitter (sync).
+# Never swap it for a weaker source. getrandom::fill: the getrandom syscall on
+# Android/Linux (/dev/urandom as its fallback), CCRandomGenerateBytes on iOS,
+# getentropy on macOS, ProcessPrng on Windows. It blocks until the kernel's
+# pool is ready; it fails only where the source is refused or missing.
+getrandom = "=0.4.3"
 # RLPx's crypto (ECIES, the frame codec's AES/HMAC/Keccak, constant-time MAC
 # compare) moved to myotis-wire with the code that uses it (#505).
 
-# Tor (docs/privacy-and-tor.md) — OPTIONAL, off by default. Only a build with
+# Tor (docs/how-it-works/privacy-and-tor.md) — OPTIONAL, off by default. Only a build with
 # `--features tor` (`-PtorEngine`: the desktop engine dylib, the Android
 # jniLibs) pulls the Arti dependency tree; the iOS/daemon builds and every
 # build without the flag are byte-for-byte unaffected.
@@ -74,6 +89,23 @@ getrandom = "=0.2.17"
 # plus a feature, because tor-rtcompat silently prefers native-tls whenever both
 # are on. `static-sqlite` (Android only) bundles SQLite for Arti's directory
 # cache: the NDK has no libsqlite3 to link and apps may not load the platform's.
+# Not on mobile: neither host walks a tree through the system resolver, and
+# hickory 0.26's Android configuration reader goes through
+# ndk_context::android_context(), which panics (an abort under the release
+# profile) when no host registered a context. Gated here so it is not in the
+# Android or iOS graph at all, nor its second `jni` and `ndk-context`
+# (`SystemResolver` refuses there). A walk on Android through a DnsServers port
+# lifts this gate with whatever builds the resolver from explicit servers.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+# The EIP-1459 DNS tree walk (#539, part 3): TXT lookups over the system
+# resolver. 0.26.3 for the 0.26.2 security release (DNS response parsing,
+# UDP spoofing and resource-exhaustion fixes). The only hickory that is BUILT:
+# libp2p goes without its `dns` feature (see above). 0.25.2 and libp2p-dns
+# still appear in the locks, because Cargo locks every optional dependency
+# whatever features are on; `cargo tree --target all -i hickory-proto@0.25.2`
+# prints nothing, so a lockfile-based alert for it is code that is not used.
+hickory-resolver = { version = "=0.26.3", default-features = false, features = ["system-config", "tokio"] }
+
 [target.'cfg(not(target_os = "android"))'.dependencies]
 arti-client = { version = "0.44", default-features = false, features = ["tokio", "native-tls"], optional = true }
 tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio", "native-tls"], optional = true }

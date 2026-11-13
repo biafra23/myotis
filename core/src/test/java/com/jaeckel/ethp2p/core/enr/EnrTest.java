@@ -44,6 +44,26 @@ class EnrTest {
         assertTrue(peerId.matches("[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]+"));
     }
 
+    /**
+     * A record with no {@code tcp} field falls back to its {@code udp} port
+     * as TCP — unless it advertises {@code quic}: then it is QUIC-only and
+     * yields no multiaddr rather than a fabricated dead TCP one. Both records
+     * reuse {@link #ENR_STRING}'s key, minus its {@code tcp} field, with a
+     * zero signature (decoding does not verify it).
+     */
+    @Test
+    void aQuicOnlyRecordYieldsNoFabricatedTcpAddress() {
+        Enr quicOnly = Enr.fromEnrString(
+            "enr:-Iy4QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgmlkgnY0gmlwhAOTJQCEcXVpY4IjKYlzZWNwMjU2azGhAhl1kPq0NimSkR9WjluCJTwwZGOFw6YcYPacSsrRQpGsg3VkcIIjKA");
+        assertTrue(quicOnly.tcpAddress().isEmpty());
+        assertTrue(quicOnly.udpAddress().isPresent());
+        assertTrue(quicOnly.toLibp2pMultiaddr().isEmpty());
+
+        Enr udpOnly = Enr.fromEnrString(
+            "enr:-IS4QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgmlkgnY0gmlwhAOTJQCJc2VjcDI1NmsxoQIZdZD6tDYpkpEfVo5bgiU8MGRjhcOmHGD2nErK0UKRrIN1ZHCCIyg");
+        assertTrue(udpOnly.toLibp2pMultiaddr().orElseThrow().startsWith("/ip4/3.147.37.0/tcp/9000/p2p/"));
+    }
+
     @Test
     void base58EncodeKnownValue() {
         // Base58("Hello World!") = "2NEpo7TZRRrLZSi2U"

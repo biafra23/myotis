@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 900 230" role="img" fill="currentColor" aria-label="Hedged read timeline over seconds. Peer A starts at 0 seconds and is slow. At 3 seconds, the hedge delay, peer B is started alongside A. B fails at 3.5 seconds, which immediately starts peer C. A answers with a verdict at 4 seconds and is accepted; C, still in flight, is dropped and cancelled without being counted as good, bad or outpaced. B gets a strike, A is recorded as served." width="900" height="230">
+      <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="900.0" height="230.0" fill="#f8fafb" /><defs>
+        <marker id="m-14-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+        </marker>
+      </defs>
+      <g font-size="10.5" style="fill:var(--ink-3)">
+        <line x1="100" y1="190" x2="860" y2="190" stroke-width="1" style="stroke:var(--rule)" />
+        <line x1="100" y1="186" x2="100" y2="194" style="stroke:var(--rule)" /><text x="100" y="208" text-anchor="middle">0 s</text>
+        <line x1="200" y1="186" x2="200" y2="194" style="stroke:var(--rule)" /><text x="200" y="208" text-anchor="middle">1</text>
+        <line x1="300" y1="186" x2="300" y2="194" style="stroke:var(--rule)" /><text x="300" y="208" text-anchor="middle">2</text>
+        <line x1="400" y1="186" x2="400" y2="194" style="stroke:var(--rule)" /><text x="400" y="208" text-anchor="middle">3</text>
+        <line x1="500" y1="186" x2="500" y2="194" style="stroke:var(--rule)" /><text x="500" y="208" text-anchor="middle">4</text>
+        <line x1="600" y1="186" x2="600" y2="194" style="stroke:var(--rule)" /><text x="600" y="208" text-anchor="middle">5</text>
+        <line x1="700" y1="186" x2="700" y2="194" style="stroke:var(--rule)" /><text x="700" y="208" text-anchor="middle">6</text>
+      </g>
+      <text x="20" y="62" font-size="12" font-weight="700">peer A</text>
+      <text x="20" y="112" font-size="12" font-weight="700">peer B</text>
+      <text x="20" y="162" font-size="12" font-weight="700">peer C</text>
+
+      <line x1="400" y1="24" x2="400" y2="184" stroke-width="1" stroke-dasharray="4 4" style="stroke:var(--oxide)" />
+      <text x="404" y="34" font-size="10.5" style="fill:var(--oxide-ink)">HEDGE_DELAY: start one more</text>
+      <line x1="500" y1="44" x2="500" y2="184" stroke-width="1" stroke-dasharray="4 4" style="stroke:var(--ok)" />
+
+      <rect x="100" y="50" width="400" height="16" rx="3" style="fill:var(--ok-wash)" />
+      <rect x="100" y="50" width="400" height="16" rx="3" stroke-width="1.2" style="fill:none;stroke:var(--ok)" />
+      <text x="508" y="62" font-size="11" style="fill:var(--ok)">answers with a verdict → accepted, record_snap_served</text>
+
+      <rect x="400" y="100" width="50" height="16" rx="3" style="fill:var(--bad-wash)" />
+      <rect x="400" y="100" width="50" height="16" rx="3" stroke-width="1.2" style="fill:none;stroke:var(--bad)" />
+      <text x="458" y="112" font-size="11" style="fill:var(--bad)">fails → missed (a strike), and the loop starts C at once</text>
+
+      <rect x="450" y="150" width="50" height="16" rx="3" stroke-width="1.2" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <rect x="500" y="150" width="110" height="16" rx="3" stroke-width="1.2" stroke-dasharray="4 3" style="fill:none;stroke:var(--ink-3)" />
+      <text x="618" y="162" font-size="11" style="fill:var(--ink-2)">dropped when A wins: cancelled, in no list</text>
+    </svg>

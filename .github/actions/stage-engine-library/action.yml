@@ -6,8 +6,8 @@
 # the staging retry or the verification never has to be applied twice.
 #
 # The AAR builds the Rust engine FROM SOURCE (:myotis-engine's preBuild chain),
-# so this sets up the Android rustup targets, cargo-ndk and the runner's NDK as
-# android-apk.yml does. No -PskipRustEngine — a published AAR without the
+# so this sets up the Android rustup targets and the pinned NDK, build-tools and
+# cargo-ndk as android-apk.yml does. No -PskipRustEngine — a published AAR without the
 # engine is a library that loads nothing.
 name: Stage the engine library
 description: Build the eth.myotis publication into build/maven-repo and check it
@@ -44,34 +44,32 @@ runs:
   using: composite
   steps:
     - name: Set up JDK 21
-      uses: actions/setup-java@v4
+      uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78  # v6.2.0
       with:
-        java-version: '21'
+        java-version-file: .java-version  # exact Temurin release, one place (#734)
         distribution: 'temurin'
 
     - name: Set up Gradle
-      uses: gradle/actions/setup-gradle@v4
+      uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c  # v6.4.1
 
     - name: Make gradlew executable
       shell: bash
       run: chmod +x gradlew
 
     - name: Set up Rust (Android targets)
-      uses: dtolnay/rust-toolchain@stable
+      uses: ./.github/actions/rust-toolchain
       with:
         targets: aarch64-linux-android,x86_64-linux-android
 
     - name: Cache Rust build
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
       with:
         workspaces: rust
         shared-key: engine-library-rust
         save-if: ${{ inputs.save-rust-cache }}
 
-    - name: Install cargo-ndk
-      uses: taiki-e/install-action@v2
-      with:
-        tool: cargo-ndk
+    - name: Install the pinned NDK, build-tools and cargo-ndk
+      uses: ./.github/actions/android-native-toolchain
 
     # Retry to ride out transient dependency-resolution blips, as the APK build
     # does. The staging repository is wiped first: Gradle's publish only adds,
@@ -139,6 +137,26 @@ runs:
     - name: Check the staged publication
       shell: bash
       run: scripts/check_engine_library.sh build/maven-repo
+
+    # The AAR's jniLibs are what a consumer's APK ships: 16 KB-aligned LOAD
+    # segments, or Android 15+ devices with 16 KB pages refuse to load them
+    # (#734 Part 5a; the alignment flag rides a rustflags MERGE since Part 4b).
+    - name: Check the AAR's native libraries are 16 KB aligned
+      shell: bash
+      run: |
+        set -euo pipefail
+        mapfile -t aars < <(find build/maven-repo/eth/myotis -name '*.aar' | LC_ALL=C sort)
+        [ "${#aars[@]}" -gt 0 ] || { echo "::error::no AAR in build/maven-repo"; exit 1; }
+        python3 -I scripts/check_16k_alignment.py "${aars[@]}"
+
+    # Gradle stamps every maven-metadata.xml with the publish's wall-clock
+    # <lastUpdated> (and checksum sidecars of it), the one thing that made the
+    # staged repository differ between two builds of one tag (#734 D8; two
+    # local release stagings were byte-identical in all 310 files after this).
+    # Before anything consumes build/maven-repo: the zip, the maven-repo branch.
+    - name: Make the staged metadata deterministic
+      shell: bash
+      run: python3 -I scripts/normalize_maven_metadata.py build/maven-repo
 
     # What a desktop consumer gets: the engine jar and this runner's natives jar
     # (linux-x86-64, from the staged set, not a local build) on the classpath and

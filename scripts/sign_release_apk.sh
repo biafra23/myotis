@@ -8,7 +8,7 @@
 # environment, which only v* tags may use, and that job checks out nothing but
 # this script and the pinned certificate, so no Gradle, plugin or cargo code ever
 # runs next to the key. Setup, rotation and what to do on loss:
-# docs/android-release-signing.md.
+# docs/guides/android-release-signing.md.
 #
 # Inputs, all from the environment (the job maps the secrets of the same names):
 #   ANDROID_RELEASE_KEYSTORE_BASE64    the keystore file (PKCS12 or JKS), base64
@@ -21,8 +21,10 @@
 #                                      job's signing REHEARSAL sets it (a throwaway
 #                                      key's pin); sign-release never does.
 #   ANDROID_BUILD_TOOLS                optional: the build-tools dir with apksigner +
-#                                      zipalign; default the newest STABLE one under
-#                                      $ANDROID_HOME (35.0.0+: --alignment-preserved).
+#                                      zipalign; default $ANDROID_HOME/build-tools/<v>,
+#                                      <v> being gradle/libs.versions.toml's pinned
+#                                      android-build-tools (#734; 35.0.0+ for
+#                                      --alignment-preserved).
 #
 # Refuses (non-zero, nothing written) when: a secret is missing; the pinned
 # certificate (android-app/release-signing-cert.sha256) is missing, malformed or
@@ -49,7 +51,7 @@ debug_cert=760390cd58e698e9fdad45a053ec109e117f952ed355f2eab5b1ad0d5900e995
 
 # --- the pinned release certificate --------------------------------------------
 [ -f "$pin_file" ] \
-  || die "no pinned release certificate ($pin_file): commit its SHA-256 as android-app/release-signing-cert.sha256 (docs/android-release-signing.md)"
+  || die "no pinned release certificate ($pin_file): commit its SHA-256 as android-app/release-signing-cert.sha256 (docs/guides/android-release-signing.md)"
 # First line that is not a comment; keytool prints AB:CD:…, apksigner abcd…: accept both.
 pin=$(grep -v '^[[:space:]]*#' "$pin_file" | grep -m1 '[^[:space:]]' | tr -d ': \t\r' | tr 'A-F' 'a-f' || true)
 [[ "$pin" =~ ^[0-9a-f]{64}$ ]] \
@@ -60,7 +62,7 @@ pin=$(grep -v '^[[:space:]]*#' "$pin_file" | grep -m1 '[^[:space:]]' | tr -d ': 
 # --- the secrets -----------------------------------------------------------------
 for v in ANDROID_RELEASE_KEYSTORE_BASE64 ANDROID_RELEASE_KEYSTORE_PASSWORD ANDROID_RELEASE_KEY_ALIAS; do
   [ -n "${!v:-}" ] \
-    || die "$v is not set — add it to the android-release environment's secrets (docs/android-release-signing.md)"
+    || die "$v is not set — add it to the android-release environment's secrets (docs/guides/android-release-signing.md)"
 done
 # apksigner reads the passwords from the environment (env:NAME), never from argv,
 # where any process on the runner could list them.
@@ -69,10 +71,14 @@ export ANDROID_RELEASE_KEY_PASSWORD="${ANDROID_RELEASE_KEY_PASSWORD:-$ANDROID_RE
 # --- the tools -------------------------------------------------------------------
 if [ -z "${ANDROID_BUILD_TOOLS:-}" ]; then
   [ -n "${ANDROID_HOME:-}" ] || die "neither ANDROID_BUILD_TOOLS nor ANDROID_HOME is set"
-  # Numbered stable releases only: an SDK may also hold rc builds and a `current`
-  # symlink (one dev Mac's points at 31.0.0), and `sort -V` ranks those last.
-  ANDROID_BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null \
-    | grep -E '/[0-9]+\.[0-9]+\.[0-9]+/$' | sort -V | tail -n1 || true)
+  # The PINNED build-tools (#734), not the newest one installed: the signer is
+  # part of what a release ships, so it must not change with the runner image.
+  catalog="$root/gradle/libs.versions.toml"
+  pinned=$(sed -n 's/^android-build-tools *= *"\([^"]*\)".*/\1/p' "$catalog")
+  [ -n "$pinned" ] || die "no android-build-tools version in $catalog"
+  ANDROID_BUILD_TOOLS="$ANDROID_HOME/build-tools/$pinned"
+  [ -d "$ANDROID_BUILD_TOOLS" ] \
+    || die "build-tools $pinned (pinned in gradle/libs.versions.toml) is not installed: sdkmanager \"build-tools;$pinned\""
 fi
 bt=${ANDROID_BUILD_TOOLS%/}
 apksigner="$bt/apksigner" zipalign="$bt/zipalign" aapt2="$bt/aapt2"

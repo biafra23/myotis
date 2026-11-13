@@ -192,7 +192,7 @@ class AndroidNodeController(
     override fun applyEngineChoice() { NodeService.applyEngineChoice(appContext) }
     override fun applyTorMode() { NodeService.applyTorMode(appContext) }
 
-    // Only a -PtorEngine APK links Arti into libmyotis_engine.so (docs/privacy-and-tor.md).
+    // Only a -PtorEngine APK links Arti into libmyotis_engine.so (docs/how-it-works/privacy-and-tor.md).
     // Every other APK answers from BuildConfig and never loads the engine library on this
     // (main) thread just to learn that; a Tor build confirms it with the loaded library.
     // Cached — the answer cannot change within a process, and the Settings row reads it
@@ -347,7 +347,7 @@ class AndroidNetworkStatus(private val ctx: Context) : NetworkStatus {
 }
 
 /**
- * Tor routing state for the Status row (docs/privacy-and-tor.md), or null when it
+ * Tor routing state for the Status row (docs/how-it-works/privacy-and-tor.md), or null when it
  * doesn't apply — the desktop's `torModeFor`: Tor is a Rust-engine-only capability, and
  * a build without `-PtorEngine` reports no support (status bit0 clear). Otherwise "off"
  * (supported but disabled), "on" (enabled, circuit still bootstrapping), "active"
@@ -447,6 +447,10 @@ class AndroidSettings(private val ctx: Context) : Settings {
         NodeService.logIndexBackfillPaused(ctx, network)
     override fun setLogIndexBackfillPaused(network: String, on: Boolean) =
         NodeService.setLogIndexBackfillPaused(ctx, network, on)
+    override fun logIndexAllowMetered(network: String): Boolean =
+        NodeService.logIndexAllowMetered(ctx, network)
+    override fun setLogIndexAllowMetered(network: String, on: Boolean) =
+        NodeService.setLogIndexAllowMetered(ctx, network, on)
     override fun logIndexConfigured(network: String): Boolean = NodeService.logIndexConfigured(ctx, network)
     override fun logIndexWatchJson(network: String): String = NodeService.logIndexWatchJson(ctx, network)
     override fun setLogIndexWatchJson(network: String, json: String) =

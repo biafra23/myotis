@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 960 400" role="img" fill="currentColor" aria-label="Four host routes into the engine. The JVM calls ffi.rs through UniFFI-generated Kotlin over JNA. myotis-rpcd calls ffi.rs by Rust path. iOS calls capi.rs through a C header and cinterop. Node and Electron call capi.rs by Rust path from myotis-node. ffi.rs and capi.rs both call host.rs with strings and integers. host.rs blocks the calling thread in rt.block_on while the tokio runtime's own threads run the sync loop, EL reader and appender tasks; results are serialized by eljson.rs, data usage is kept by usage.rs, and the answer returns as a JSON string, bool or negative sentinel." width="960" height="400">
+    <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="960.0" height="400.0" fill="#f8fafb" /><defs>
+      <marker id="m-stop16-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+      </marker>
+    </defs>
+    <g font-size="12">
+      <rect x="20" y="20" width="200" height="62" rx="8" stroke-width="1.5" style="fill:var(--jvm-wash);stroke:var(--jvm)" />
+      <text x="120" y="42" text-anchor="middle" font-weight="700" style="fill:var(--jvm-ink)">JVM: apps + engine AAR/jar</text>
+      <text x="120" y="60" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">RustEngineNative →</text>
+      <text x="120" y="74" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">generated Kotlin</text>
+
+      <rect x="20" y="110" width="200" height="62" rx="8" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="120" y="136" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">myotis-rpcd</text>
+      <text x="120" y="154" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">Rust daemon, no JVM</text>
+
+      <rect x="20" y="200" width="200" height="62" rx="8" stroke-width="1.5" style="fill:var(--jvm-wash);stroke:var(--jvm)" />
+      <text x="120" y="226" text-anchor="middle" font-weight="700" style="fill:var(--jvm-ink)">iOS</text>
+      <text x="120" y="244" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">myotis-engine-ios (cinterop)</text>
+
+      <rect x="20" y="290" width="200" height="62" rx="8" stroke-width="1.5" style="fill:var(--surface);stroke:var(--ink-3)" />
+      <text x="120" y="316" text-anchor="middle" font-weight="700">Node / Electron</text>
+      <text x="120" y="334" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">myotis-node (napi-rs)</text>
+
+      <rect x="300" y="60" width="170" height="58" rx="8" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="385" y="84" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">ffi.rs</text>
+      <text x="385" y="102" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">#[uniffi::export] × 55</text>
+
+      <rect x="300" y="230" width="170" height="58" rx="8" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="385" y="254" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">capi.rs</text>
+      <text x="385" y="272" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">extern "C" × 58</text>
+
+      <rect x="540" y="130" width="180" height="120" rx="8" stroke-width="2" style="fill:var(--surface);stroke:var(--oxide)" />
+      <text x="630" y="158" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">host.rs</text>
+      <text x="630" y="178" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">static ENGINE</text>
+      <text x="630" y="194" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">Mutex&lt;HashMap&lt;id, ChainEntry&gt;&gt;</text>
+      <text x="630" y="220" text-anchor="middle" font-size="11" font-weight="700">rt.block_on(…)</text>
+
+      <rect x="790" y="40" width="150" height="80" rx="8" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)" />
+      <text x="865" y="64" text-anchor="middle" font-weight="700">tokio runtime</text>
+      <text x="865" y="82" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">sync loop, EL reader,</text>
+      <text x="865" y="98" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">appenders, ticker</text>
+
+      <rect x="790" y="160" width="150" height="58" rx="8" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)" />
+      <text x="865" y="184" text-anchor="middle" font-weight="700">eljson.rs</text>
+      <text x="865" y="202" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">result → JSON</text>
+
+      <rect x="790" y="250" width="150" height="58" rx="8" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)" />
+      <text x="865" y="274" text-anchor="middle" font-weight="700">usage.rs</text>
+      <text x="865" y="292" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">day ledger per handle</text>
+    </g>
+    <g stroke-width="1.5" fill="none" style="stroke:currentColor">
+      <line x1="220" y1="51" x2="296" y2="78" marker-end="url(#m-stop16-arrow)" />
+      <line x1="220" y1="141" x2="296" y2="104" marker-end="url(#m-stop16-arrow)" />
+      <line x1="220" y1="231" x2="296" y2="252" marker-end="url(#m-stop16-arrow)" />
+      <line x1="220" y1="321" x2="296" y2="272" marker-end="url(#m-stop16-arrow)" />
+      <path d="M470,89 C505,89 510,160 536,168" marker-end="url(#m-stop16-arrow)" />
+      <path d="M470,259 C505,259 510,222 536,214" marker-end="url(#m-stop16-arrow)" />
+      <line x1="720" y1="160" x2="786" y2="90" marker-end="url(#m-stop16-arrow)" />
+      <line x1="720" y1="190" x2="786" y2="189" marker-end="url(#m-stop16-arrow)" />
+      <line x1="720" y1="225" x2="786" y2="275" marker-end="url(#m-stop16-arrow)" />
+    </g>
+    <path d="M600,250 C560,380 380,380 300,345" stroke-width="1.3" stroke-dasharray="5 4" fill="none" marker-end="url(#m-stop16-arrow)" style="stroke:var(--ok)" />
+    <g font-size="10.5" style="fill:var(--ink-3)">
+      <text x="258" y="56" text-anchor="middle">JNA</text>
+      <text x="258" y="114" text-anchor="middle">Rust path</text>
+      <text x="258" y="234" text-anchor="middle">C header</text>
+      <text x="258" y="310" text-anchor="middle">Rust path</text>
+      <text x="503" y="130" text-anchor="middle">&amp;str, i64</text>
+      <text x="760" y="114" text-anchor="middle">waits</text>
+      <text x="760" y="182" text-anchor="middle">serialize</text>
+      <text x="760" y="242" text-anchor="middle">ticks</text>
+      <text x="470" y="392" text-anchor="middle" style="fill:var(--ok)">JSON String · bool · i64 sentinel</text>
+    </g>
+  </svg>

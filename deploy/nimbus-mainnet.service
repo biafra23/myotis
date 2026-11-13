@@ -18,7 +18,7 @@ User=nimbus
 #
 # NO --history FLAG, so the default (prune) applies. This matters most on
 # mainnet: archive mode here is a multi-terabyte, multi-day trustedNodeSync with
-# --reindex, and docs/lc-server-design.md argues against it explicitly — "Don't.
+# --reindex, and docs/design-history/lc-server-design.md argues against it explicitly — "Don't.
 # Archive in the LC server instead." roost holds periods below this node's floor
 # in its own append-only archive at roughly 36 MB, which is the whole reason it
 # has one.

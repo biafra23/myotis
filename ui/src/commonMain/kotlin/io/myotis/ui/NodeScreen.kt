@@ -85,6 +85,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.myotis.logindex.LogIndexDownloads
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -1264,7 +1265,7 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         )
         StatusRow("Beacon", s.beaconState, help = StatusHelp.BEACON)
         StatusRow("EL block", s.executionBlockNumber.toString(), help = StatusHelp.EL_BLOCK)
-        // Tor verified-read routing (docs/privacy-and-tor.md) — shown only when it
+        // Tor verified-read routing (docs/how-it-works/privacy-and-tor.md) — shown only when it
         // applies (Rust engine + a Tor-capable build); see NodeSnapshot.tor.
         s.logIndex?.let { StatusRow("Log index", it, help = StatusHelp.LOG_INDEX) }
         s.tor?.let { mode ->
@@ -1355,7 +1356,7 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
         // the Reads rows follow.
         Spacer(Modifier.height(8.dp))
 
-        // The read-fetch shadow cache (docs/read-stats.md): verified state
+        // The read-fetch shadow cache (docs/how-it-works/read-stats.md): verified state
         // fetches this run, the share a sound cache keying would have served
         // (storage-root keyed slots, per-block accounts, content-addressed
         // code) with the storage time it would have saved, and how often a
@@ -1397,7 +1398,7 @@ private fun StatusView(s: NodeSnapshot, hostSleeps: Boolean) {
             help = StatusHelp.HEAD_AGE,
         )
         StatusRow("Uptime", "${s.uptimeSeconds}s", help = StatusHelp.UPTIME)
-        // Data usage (docs/data-usage.md): this network's bytes on the wire.
+        // Data usage (docs/how-it-works/data-usage.md): this network's bytes on the wire.
         s.dataUsage?.let { u ->
             val today = DataUsageText.Today(u.todayIn, u.todayOut, u.todayMeteredIn, u.todayMeteredOut)
             StatusRow(
@@ -2550,7 +2551,7 @@ internal fun elPeersValue(ready: Int, snap: Int, serving: Int, snap2Serving: Int
 
 /**
  * Status-tab help text, one entry per on-screen item — the in-app twin of
- * docs/status-screen.md. **Keep both in sync**: a behavior change to
+ * docs/how-it-works/status-screen.md. **Keep both in sync**: a behavior change to
  * [StatusView]/[ReadinessStrip]/[StatusTab] that changes what a row means
  * must update its string here AND the matching row in that doc.
  */
@@ -2594,7 +2595,7 @@ private object StatusHelp {
     const val BLK_ASKS = "GetBlockBodies requests other peers sent us. Served is always 0 by " +
         "design — this light client holds no bodies."
     const val READS = "Verified account/storage/code fetches that crossed the network since " +
-        "start (the read-fetch shadow cache — docs/read-stats.md)."
+        "start (the read-fetch shadow cache — docs/how-it-works/read-stats.md)."
     const val CACHEABLE = "Share of each kind's fetches a SOUND cache keying would have served " +
         "for free (storage-root for slots, per-block for accounts, content-addressing for " +
         "code), with the time it would have saved."
@@ -2928,6 +2929,8 @@ private fun IndexTab(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         var collecting by remember(network) { mutableStateOf(settings.logIndexEnabled(network)) }
+        // Hoisted: the preset section above the switch reads it too.
+        var backfillPaused by remember(network) { mutableStateOf(settings.logIndexBackfillPaused(network)) }
         // The persisted watch store. The tab is not its only writer — a host
         // changes it from its own thread (an import's contracts are added, a
         // delivered removal's marker dropped; see LogIndexWatch) — so it is
@@ -3036,6 +3039,48 @@ private fun IndexTab(
                 "against receipt roots, backfilled to the block you set. Runs on the Rust " +
                 "engine only.",
         )
+
+        // ---- Predefined contracts: a protocol's history in one step. ----
+        // Adding one is adding its contracts to the list below, then the same
+        // verified backfill as for a contract typed in by hand. It is the opt-in:
+        // collection switches on, like an import.
+        // An address the engine indexes under a topic restriction counts as present:
+        // the presets carry no topics, so pushing it unrestricted would be a topic
+        // conflict, which the engine answers by replacing the whole index (the same
+        // reason "Add contract" refuses one below).
+        // Address → the fromBlock it is listed (or restricted-indexed) from, so a
+        // preset contract typed in from a LATER block reads as only partly covered.
+        val presetListed = remember(watch, parsed) {
+            parsed?.entries.orEmpty().filter { it.restricted }.associate { it.address to it.fromBlock } +
+                watch.associate { it.address.lowercase() to it.fromBlock }
+        }
+        LogIndexPresetSection(
+            settings = settings,
+            network = network,
+            listed = presetListed,
+            indexHoldsContracts = watch.isNotEmpty() || parsed?.entries?.isNotEmpty() == true,
+            headBlock = snapshot?.executionBlockNumber?.takeIf { it > 0 },
+            networkMetering = snapshot?.networkMetering,
+            backfillPaused = backfillPaused,
+            onAllowMeteredChanged = { on ->
+                settings.setLogIndexAllowMetered(network, on)
+                // A runtime bit like the pause: re-pushed, coverage untouched.
+                if (collecting || settings.logIndexConfigured(network)) controller.applyLogIndex(network)
+            },
+            onAdd = { presets ->
+                val entries = LogIndexDownloads.watchEntries(presets, presetListed.keys)
+                edit { json ->
+                    entries.fold(json) { acc, c -> LogIndexWatch.watch(acc, LogIndexWatch.Entry(c.address, c.fromBlock)) }
+                }
+                if (!collecting) {
+                    collecting = true
+                    settings.setLogIndexEnabled(network, true)
+                }
+                controller.applyLogIndex(network)
+                onLogIndexChanged()
+            },
+        )
+        HorizontalDivider()
 
         // ---- The watch list: the user's entries, persisted host-side. ----
         watch.forEach { entry ->
@@ -3201,9 +3246,6 @@ private fun IndexTab(
                 if (maxSpeed) "Backfills as fast as peers serve — heavier on network and battery."
                 else "Nice background pace — one small batch every few seconds.",
             )
-            var backfillPaused by remember(network) {
-                mutableStateOf(settings.logIndexBackfillPaused(network))
-            }
             SwitchRow(
                 label = "Pause backfill on $network",
                 checked = backfillPaused,

@@ -1,4 +1,4 @@
-# roost — the dedicated light-client server (docs/lc-server-design.md).
+# roost — the dedicated light-client server (docs/design-history/lc-server-design.md).
 #
 # It needs its own workflow because it is deliberately NOT a workspace member
 # (rust/Cargo.toml `exclude`), so `cargo test --workspace` in node-binding.yml
@@ -25,6 +25,8 @@ on:
       - "rust/myotis-core/**"
       - "rust/myotis-evm/**"
       - ".github/workflows/roost.yml"
+      - ".github/actions/rust-toolchain/**"
+      - "rust/rust-toolchain.toml"
   pull_request:
     paths:
       - "rust/roost/**"
@@ -34,18 +36,25 @@ on:
       - "rust/myotis-core/**"
       - "rust/myotis-evm/**"
       - ".github/workflows/roost.yml"
+      - ".github/actions/rust-toolchain/**"
+      - "rust/rust-toolchain.toml"
 
 jobs:
   test:
     name: roost build and tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      # clippy explicitly: the pinned toolchain is a fresh minimal install
+      # (rustc, cargo, rust-std), where @stable reused the image's toolchain,
+      # which happened to carry clippy.
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: rust/roost
       - name: Build
@@ -53,7 +62,7 @@ jobs:
       - name: Tests
         run: cargo test --manifest-path rust/roost/Cargo.toml --locked
       - name: Clippy
-        run: cargo clippy --manifest-path rust/roost/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --locked --manifest-path rust/roost/Cargo.toml --all-targets -- -D warnings
       # Neither build, test nor clippy checks rustdoc links, so a broken
       # intra-doc link is invisible to CI — one shipped in #328 and was caught by
       # a human reading the diff rather than by a machine. The class matters here

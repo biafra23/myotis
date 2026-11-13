@@ -8,7 +8,7 @@
 // Everything goes through a Swarm FEED: its manifest address never changes, so
 // myotis.eth's content hash is set once (one ENS transaction) and every later
 // publish only updates the feed. The setup, the postage batch and the ENS step
-// are in docs/website.md.
+// are in docs/how-it-works/website.md.
 //
 // What goes live is a clean `git archive` of origin/main's site/, never the
 // working tree: an edit, an unmerged branch or a file git ignores (a Finder
@@ -238,7 +238,7 @@ async function checkBatches(current, record) {
     if (!b.immutableFlag) {
       // A mutable batch that fills up overwrites its oldest chunks, the feed's
       // included, and the site then disappears from myotis.eth without an error.
-      throw new Fail(`postage batch ${id} is mutable; a feed needs an immutable batch (see docs/website.md)`);
+      throw new Fail(`postage batch ${id} is mutable; a feed needs an immutable batch (see docs/how-it-works/website.md)`);
     }
     if (fill >= 80) console.log("           ! Nearly full: dilute it (swarm-cli stamp dilute); an immutable batch refuses uploads once full.");
   }
@@ -247,7 +247,7 @@ async function checkBatches(current, record) {
 
 async function findIdentity() {
   const hint =
-    `If you have not created it yet (and backed it up) as docs/website.md describes:\n` +
+    `If you have not created it yet (and backed it up) as docs/how-it-works/website.md describes:\n` +
     `  node scripts/publish_site_swarm.mjs cli identity create ${IDENTITY}`;
   let out;
   try {
@@ -346,7 +346,7 @@ async function reportEns(manifest) {
 async function publish() {
   const stamp = (process.env.SWARM_STAMP || "").toLowerCase();
   if (!/^[0-9a-f]{64}$/.test(stamp)) {
-    throw new Fail("set SWARM_STAMP to the id of an immutable postage batch (64 hex characters). docs/website.md says how to buy one.");
+    throw new Fail("set SWARM_STAMP to the id of an immutable postage batch (64 hex characters). docs/how-it-works/website.md says how to buy one.");
   }
   const record = readFeedRecord();
   const site = siteSource();
@@ -358,7 +358,7 @@ async function publish() {
       if (process.env.SWARM_NEW_BATCH !== "1") {
         throw new Fail(
           `the feed has so far been published with ${record.batches.map(short).join(", ")} (scripts/site_swarm_feed.json).\n` +
-            "  Keep using that batch (top it up or dilute it, see docs/website.md), or set SWARM_NEW_BATCH=1 to add this one.",
+            "  Keep using that batch (top it up or dilute it, see docs/how-it-works/website.md), or set SWARM_NEW_BATCH=1 to add this one.",
         );
       }
       console.log(`Batch      ! adding ${short(stamp)} (SWARM_NEW_BATCH=1); keep the earlier ones alive too`);
@@ -458,7 +458,7 @@ async function cli() {
 const command = process.argv[2];
 const commands = { publish, status, cli };
 if (!commands[command]) {
-  console.log("Usage: node scripts/publish_site_swarm.mjs publish|status|cli <swarm-cli args>   (see the comment at the top, and docs/website.md)");
+  console.log("Usage: node scripts/publish_site_swarm.mjs publish|status|cli <swarm-cli args>   (see the comment at the top, and docs/how-it-works/website.md)");
   process.exit(command ? 2 : 0);
 }
 commands[command]().catch((e) => {

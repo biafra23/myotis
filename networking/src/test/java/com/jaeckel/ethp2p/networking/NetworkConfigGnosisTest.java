@@ -113,7 +113,7 @@ class NetworkConfigGnosisTest {
         // Gnosis publishes no EL enrtree, so it ships full enode://<pubkey>@host:port seeds
         // for direct RLPx dialing. Sepolia HAS an enrtree but pins one entry anyway: the
         // dedicated myotis-serving node, which admits wallets past its peer cap
-        // (docs/dedicated-sepolia-node.md) — direct-dialing it beats waiting for discovery
+        // (docs/guides/dedicated-sepolia-node.md) — direct-dialing it beats waiting for discovery
         // to surface it on a saturated testnet. Mainnet ships none.
         assertTrue(NetworkConfig.MAINNET.elBootEnodes().isEmpty(), "mainnet has an enrtree");
 

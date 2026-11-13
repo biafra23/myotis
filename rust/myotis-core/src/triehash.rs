@@ -3,7 +3,7 @@
 //! `receiptsRoot`: a trie mapping `key = RLP(index)` (UN-hashed) to the
 //! item's consensus encoding, built bottom-up so a full body/receipt list can
 //! be verified against a trusted header without trusting the peer
-//! (docs/reimplementation/03 §2, README §11.11).
+//! (docs/spec/03 §2, README §11.11).
 
 use alloc::{vec::Vec};
 use crate::keccak::keccak256;

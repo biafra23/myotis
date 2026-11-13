@@ -1,0 +1,181 @@
+/* Myotis Rust Tour — ebook stylesheet.
+   Text inherits the reader's theme (light, sepia, night). Code and diagrams are
+   "plates" with their own light ground and ink, so they read the same in every theme. */
+
+@namespace epub "http://www.idpf.org/2007/ops";
+
+/* Embedded JetBrains Mono (SIL OFL 1.1, fonts/OFL.txt) so code is monospaced in every reader;
+   Apple Books honours it because the package sets ibooks:specified-fonts. */
+@font-face { font-family: "JetBrains Mono"; font-style: normal; font-weight: normal; src: url("../fonts/JetBrainsMono-Regular.ttf"); }
+@font-face { font-family: "JetBrains Mono"; font-style: normal; font-weight: bold; src: url("../fonts/JetBrainsMono-Bold.ttf"); }
+@font-face { font-family: "JetBrains Mono"; font-style: italic; font-weight: normal; src: url("../fonts/JetBrainsMono-Italic.ttf"); }
+
+
+
+body { margin: 0 4%; line-height: 1.5; widows: 2; orphans: 2; }
+h1, h2, h3, h4 { font-family: "Avenir Next", "Helvetica Neue", Helvetica, sans-serif; line-height: 1.2;
+  page-break-after: avoid; break-after: avoid; }
+h1 { font-size: 1.6em; margin: 0.4em 0 0.5em; }
+h2 { font-size: 1.25em; margin: 1.6em 0 0.5em; }
+h3 { font-size: 1.05em; margin: 1.3em 0 0.4em; }
+p { margin: 0.55em 0; }
+a { color: #b4441a; text-decoration: none; }
+code { font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.86em; }
+ul, ol { padding-left: 1.4em; }
+li { margin: 0.2em 0; }
+hr { border: 0; border-top: 1px solid rgba(127, 127, 127, 0.4); margin: 1.5em 0; }
+
+/* ---- stop header ---- */
+.stop { page-break-before: always; break-before: page; }
+.stop-head { margin-bottom: 1.2em; }
+.eyebrow { font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.72em; letter-spacing: 0.04em; text-transform: uppercase;
+  color: #b4441a; margin-bottom: 0.4em; }
+.eyebrow span { display: block; color: #6b7784; text-transform: none; letter-spacing: 0; margin-top: 0.2em; }
+.eyebrow code { font-size: 1em; }
+.lede { font-size: 1.05em; }
+
+/* ---- "Rust you will practise" ---- */
+.learn { border: 1px solid rgba(127, 127, 127, 0.45); border-radius: 4px; padding: 0.4em 0.8em 0.6em; margin: 1em 0; }
+.learn h2 { font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.08em; margin: 0.4em 0; }
+.learn div { margin: 0.45em 0; font-size: 0.95em; }
+.learn b { display: block; font-family: "Avenir Next", "Helvetica Neue", sans-serif; }
+
+/* ---- file entries ---- */
+article.file { margin-top: 2em; padding-top: 0.6em; border-top: 2px solid rgba(127, 127, 127, 0.5); }
+.file-head { margin-bottom: 0.5em; }
+.file-path { margin: 0; font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.95em; word-wrap: break-word; }
+.file-path a { color: inherit; }
+.file-path .dir { color: #6b7784; font-weight: normal; }
+.chips { margin-top: 0.3em; font-size: 0.75em; }
+.chip { display: inline-block; border: 1px solid rgba(127, 127, 127, 0.5); border-radius: 3px; padding: 0 0.4em;
+  margin: 0 0.3em 0.2em 0; font-family: "JetBrains Mono", Menlo, "Courier New", monospace; }
+.chip.kind { border-color: #b4441a; color: #b4441a; }
+.chip.twin { border-color: #6a4bd8; color: #6a4bd8; }
+.purpose { font-style: italic; }
+.code-note { font-size: 0.95em; }
+.mono { font-family: "JetBrains Mono", Menlo, "Courier New", monospace; }
+.section-title { font-size: 1.15em; }
+
+/* ---- concept chips ---- */
+.tags { font-size: 0.7em; }
+.tag { display: inline-block; font-family: "Avenir Next", "Helvetica Neue", sans-serif; text-transform: uppercase;
+  letter-spacing: 0.05em; border: 1px solid #b4441a; border-radius: 3px; padding: 0 0.35em; margin-right: 0.3em; }
+ul.concepts { list-style: none; padding-left: 0; }
+ul.concepts li { margin: 0.6em 0; }
+
+/* ---- callouts ---- */
+.callout { border-left: 4px solid #9a620a; padding: 0.3em 0 0.3em 0.8em; margin: 1em 0; }
+.callout.jvm { border-left-color: #6a4bd8; }
+.callout.rust { border-left-color: #b4441a; }
+.callout > .k { font-family: "Avenir Next", "Helvetica Neue", sans-serif; font-weight: bold; font-size: 0.8em;
+  text-transform: uppercase; letter-spacing: 0.06em; }
+.callout.watch > .k { color: #9a620a; }
+.callout.jvm > .k { color: #6a4bd8; }
+.callout.rust > .k { color: #b4441a; }
+
+/* ---- deep dives (were collapsible) ---- */
+.deep { border: 1px dashed rgba(127, 127, 127, 0.6); border-radius: 4px; padding: 0.3em 0.8em 0.5em; margin: 1em 0; }
+p.deep-sum { font-family: "Avenir Next", "Helvetica Neue", sans-serif; font-weight: bold; margin-top: 0.4em; }
+
+/* ---- tables ---- */
+.table-wrap { margin: 1em 0; }
+table { border-collapse: collapse; width: 100%; font-size: 0.8em; line-height: 1.35; }
+th, td { border: 1px solid rgba(127, 127, 127, 0.45); padding: 0.25em 0.4em; vertical-align: top; text-align: left; }
+th { font-family: "Avenir Next", "Helvetica Neue", sans-serif; }
+td code, th code { word-wrap: break-word; }
+
+/* ---- code plates ---- */
+figure { margin: 1em 0; }
+figure.code { page-break-inside: auto; }
+figure.code figcaption { font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.68em; margin-bottom: 0.25em; word-wrap: break-word; }
+figure.code figcaption .rng { color: #6b7784; }
+pre.code { margin: 0; padding: 0.5em 0.6em; background: #f3f5f7; color: #1b2530; border: 1px solid #d3dae1;
+  border-radius: 4px; font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.66em; line-height: 1.4;
+  white-space: pre-wrap; word-wrap: break-word; }
+pre.code code { font-size: 1em; color: #1b2530; }
+pre.code .row { display: block; }
+pre.code .ln { color: #8a96a3; }
+pre.code.w1 .row { padding-left: 2ch; text-indent: -2ch; }
+pre.code.w2 .row { padding-left: 3ch; text-indent: -3ch; }
+pre.code.w3 .row { padding-left: 4ch; text-indent: -4ch; }
+pre.code.w4 .row { padding-left: 5ch; text-indent: -5ch; }
+pre.code.w5 .row { padding-left: 6ch; text-indent: -6ch; }
+pre { white-space: pre-wrap; word-wrap: break-word; font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.75em; }
+.tk-k { color: #9b3412; }
+.tk-t { color: #1d5f8a; }
+.tk-s { color: #2e6b2f; }
+.tk-n { color: #8a4b00; }
+.tk-c { color: #6f7b87; font-style: italic; }
+.tk-f { color: #5a3fbf; }
+.tk-a { color: #6b5a1f; }
+.tk-m { color: #9c2c6b; }
+.tk-l { color: #6b5a1f; font-style: italic; }
+
+/* ---- diagram plates ---- */
+.diagram { margin: 1.2em 0; page-break-inside: avoid; break-inside: avoid; }
+.diagram svg { display: block; width: 100%; height: auto; background: #f8fafb; color: #121a22;
+  border: 1px solid #d3dae1; border-radius: 4px;
+  --ground: #eef1f4; --ground-2: #e6eaee; --surface: #f8fafb; --ink: #121a22; --ink-2: #47525f; --ink-3: #6b7784;
+  --rule: #d3dae1; --rule-strong: #b7c1cb; --oxide: #b4441a; --oxide-ink: #8f3310; --oxide-wash: #f6e4dc;
+  --jvm: #6a4bd8; --jvm-ink: #4f33b3; --jvm-wash: #ebe6fb; --ok: #1f7a4d; --ok-ink: #1f7a4d; --ok-wash: #dcefe4;
+  --warn: #9a620a; --warn-ink: #7a4d08; --warn-wash: #f5ead3; --bad: #b42335; --bad-ink: #8f1c2a; --bad-wash: #f7dfe2; }
+.diagram svg text { font-family: "Avenir Next", "Helvetica Neue", sans-serif; }
+.diagram svg .mono { font-family: "JetBrains Mono", Menlo, "Courier New", monospace; }
+.diagram svg .muted { color: #6b7784; }
+.diagram figcaption, figure > figcaption { font-size: 0.85em; font-style: italic; margin-top: 0.4em; }
+
+/* ---- workbook ---- */
+.exercise { margin-top: 1.5em; padding-top: 0.5em; border-top: 1px solid rgba(127, 127, 127, 0.45); }
+ol.flight li { margin: 0.4em 0; }
+
+/* ---- file index ---- */
+.index-crate { font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.95em; }
+.index-crate span { font-weight: normal; color: #6b7784; font-size: 0.85em; }
+ul.toc-files { list-style: none; padding-left: 0.5em; font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.75em; }
+ul.toc-files span { color: #6b7784; }
+
+/* ---- checkpoints ---- */
+.checkpoint { margin-top: 2.5em; padding-top: 0.6em; border-top: 3px double rgba(127, 127, 127, 0.6); }
+ol.quiz { list-style: none; padding-left: 0; }
+li.question { margin: 1.2em 0; page-break-inside: avoid; break-inside: avoid; }
+.qhead { font-family: "Avenir Next", "Helvetica Neue", sans-serif; font-size: 0.8em; text-transform: uppercase;
+  letter-spacing: 0.05em; color: #b4441a; margin-bottom: 0.2em; }
+.answers .qhead { text-transform: none; letter-spacing: 0; font-size: 0.85em; color: inherit; }
+.answers .qhead b { color: #b4441a; }
+ol.opts { list-style-type: upper-alpha; }
+ol.opts li { margin: 0.3em 0; }
+.write { font-style: italic; font-size: 0.92em; }
+.to-answer, .back { font-family: "Avenir Next", "Helvetica Neue", sans-serif; font-size: 0.85em; }
+.answer { margin: 1.2em 0; padding-bottom: 0.6em; border-bottom: 1px solid rgba(127, 127, 127, 0.35); }
+.verdict b { color: #1f7a4d; }
+.pts-head { font-weight: bold; font-size: 0.9em; margin-bottom: 0; }
+
+/* ---- reading list ---- */
+.concept { margin: 1em 0; }
+.concept h3 { margin-bottom: 0.2em; }
+.note { color: #6b7784; font-size: 0.92em; }
+ul.library li { margin: 0.7em 0; }
+ul.library small { display: block; font-size: 0.9em; }
+.hint, .offline-ok { font-size: 0.8em; color: #6b7784; margin-left: 0.4em; }
+
+/* ---- title page & cover ---- */
+.titlepage { text-align: left; margin-top: 20%; }
+.t-kicker { font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.08em; color: #6b7784; }
+.t-title { font-size: 2.6em; line-height: 1; margin: 0.4em 0; }
+.t-title span { color: #b4441a; }
+.t-sub { font-size: 1.15em; font-style: italic; }
+.t-meta { font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.75em; color: #6b7784; margin-top: 2em; }
+body.cover { margin: 0; padding: 0; text-align: center; }
+.cover img { max-width: 100%; max-height: 100%; }
+nav[epub|type~="landmarks"] { display: none; }
+
+/* full reading route (Stop 0) */
+ol.route-legs { list-style: none; padding-left: 0; }
+ol.route-legs > li { border-left: 3px solid #b4441a; padding-left: 0.7em; margin: 1em 0; }
+ol.route-legs > li > b { font-family: "Avenir Next", "Helvetica Neue", sans-serif; }
+ol.route-legs .t { font-family: "JetBrains Mono", Menlo, "Courier New", monospace; font-size: 0.75em; color: #6b7784; }
+ol.route-legs ul { margin-top: 0.3em; font-size: 0.95em; }
+
+/* every piece of code, whatever the reader's chosen body font */
+code, pre, kbd, samp, pre.code, pre.code code, pre.code .row, pre.code span { font-family: "JetBrains Mono", Menlo, "Courier New", monospace; }
+pre.code, pre.code code { font-variant-ligatures: none; }

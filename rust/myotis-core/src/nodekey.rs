@@ -1,7 +1,7 @@
 //! The node's secp256k1 identity — twin of `core.crypto.NodeKey` (Java).
 //!
 //! Used for: ENR identity, RLPx ECIES handshake, discv4 packet signing.
-//! Wire conventions (docs/reimplementation/02 §1.1, §9):
+//! Wire conventions (docs/spec/02 §1.1, §9):
 //! - public key crosses as 64 bytes uncompressed WITHOUT the `0x04` prefix;
 //! - `nodeId = keccak256(pubkey64)` (the Kademlia node ID / enode id);
 //! - signatures are 65 bytes `r(32) ‖ s(32) ‖ v(1)` with `v` = recovery id
@@ -106,7 +106,7 @@ pub fn recover_public_key(hash: &[u8; 32], sig65: &[u8; 65]) -> Result<[u8; 64],
 }
 
 /// Decompress a 33-byte SEC1 compressed public key to the 64-byte form
-/// (ENRs store keys compressed — docs/reimplementation/02 §1.3).
+/// (ENRs store keys compressed — docs/spec/02 §1.3).
 pub fn decompress_public_key(compressed33: &[u8]) -> Result<[u8; 64], CoreError> {
     if compressed33.len() != 33 {
         return err(format!(

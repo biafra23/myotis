@@ -9,7 +9,7 @@ package com.jaeckel.ethp2p.android;
  * <p>Power alone is not enough — the active network must also be UNMETERED. Plugged in on
  * mobile data or a metered hotspot the node sleeps on the ordinary idle timer: kept awake
  * until unplugged it would run at the awake per-minute rate
- * (docs/disk-and-network-usage.md §3.2) on the user's data plan. Plugged in but offline it
+ * (docs/how-it-works/disk-and-network-usage.md §3.2) on the user's data plan. Plugged in but offline it
  * sleeps too: there is nothing to sync over.
  */
 final class StayAwakePolicy {

@@ -29,11 +29,16 @@ const RESEED_EMPTY_ROUNDS: u32 = 4;
 #[derive(Debug, Clone)]
 pub struct DiscoveredPeer {
     pub peer_id: PeerId,
-    /// `/ip4/<ip>/tcp/<port>` (no `/p2p` suffix; the peer id travels separately).
+    /// `/ip4/<ip>/tcp/<port>` (no `/p2p` suffix; the peer id travels
+    /// separately) — or, for a QUIC-only record (no `tcp` field), its
+    /// `/ip4/<ip>/udp/<port>/quic-v1`. This is the peer's identity in the
+    /// shared CL peer cache, so a TCP-capable peer keeps its TCP address here
+    /// whatever its record later says about QUIC.
     pub addr: Multiaddr,
     /// `/ip4/<ip>/udp/<port>/quic-v1` when the record carries a `quic` (`quic6`)
-    /// field — the spec's primary transport. Dialed after `addr`: TCP first,
-    /// QUIC only when the TCP dial fails (see `sync::Peer::dial_addrs`).
+    /// field BESIDE a TCP endpoint — the spec's primary transport, dialed
+    /// before `addr` (see `sync::Peer::dial_addrs`). `None` for a QUIC-only
+    /// record, whose QUIC address is `addr` itself.
     pub quic: Option<Multiaddr>,
 }
 
@@ -493,7 +498,7 @@ async fn consume_discovered(
 enum Heard {
     /// Pinned (the lookup path's seq gate owns it) or already emitted.
     Skip,
-    /// Off-fork or no TCP endpoint: never a candidate, record it so it is
+    /// Off-fork or no dialable endpoint: never a candidate, record it so it is
     /// never re-checked.
     NeverCandidate,
     /// A fresh fork-matched node — emit, and record it once the pool has it.
@@ -519,37 +524,45 @@ fn classify_heard(
     }
 }
 
-/// ENR → dial candidate, applying the same gates the Java discv5 callback does:
-/// must carry an `eth2` field whose fork digest is in our accepted set, a TCP
-/// endpoint, and a secp256k1 key we can turn into a libp2p PeerId.
+/// ENR → dial candidate: must carry an `eth2` field whose fork digest is in our
+/// accepted set, an IP with a TCP or a QUIC port, and a secp256k1 key we can
+/// turn into a libp2p PeerId. (The Java discv5 callback applies the same gates
+/// but needs TCP, its only transport.)
 fn filter_candidate(enr: &Enr, accepted_digests: &[[u8; 4]]) -> Option<DiscoveredPeer> {
     use libp2p::multiaddr::Protocol;
     let digest = enr_eth2_fork_digest(enr)?;
     let match_idx = accepted_digests.iter().position(|d| *d == digest)?;
 
-    // A TCP endpoint stays the entry ticket: every client listens on TCP, and
-    // the spec's QUIC port is an ADDITIONAL field (`quic` for the IPv4
-    // endpoint, `quic6` for IPv6 — fulu/p2p-interface.md). A record with QUIC
-    // but no TCP is not something the spec produces, so it is not a candidate.
-    let (ip, tcp_port, quic_key): (IpAddr, u16, &[u8]) =
-        if let (Some(ip4), Some(tcp4)) = (enr.ip4(), enr.tcp4()) {
-            (IpAddr::V4(ip4), tcp4, b"quic")
-        } else if let (Some(ip6), Some(tcp6)) = (enr.ip6(), enr.tcp6()) {
-            (IpAddr::V6(ip6), tcp6, b"quic6")
-        } else {
-            return None;
-        };
-
-    let peer_id = enr_to_peer_id(enr)?;
-    let addr = Multiaddr::empty().with(ip.into()).with(Protocol::Tcp(tcp_port));
+    // An endpoint is an IP plus at least one transport: TCP (`tcp`/`tcp6`),
+    // the spec's QUIC port (`quic` for IPv4, `quic6` for IPv6 —
+    // fulu/p2p-interface.md), or both. QUIC has been the spec's primary
+    // transport since consensus-specs#5330 (merged 2026-07-06: QUIC MUST, TCP
+    // only SHOULD), so a record with QUIC and no TCP is a valid peer — a
+    // QUIC-only one, whose QUIC address becomes its `addr`. IPv4 wins whenever
+    // it carries either transport; IPv6 is the fallback, as before.
+    //
     // Port 0 means "no QUIC listener" the way an absent field does; and a
     // field that does not decode as a port is ignored, not a reason to drop
     // the peer — its TCP endpoint is still good.
-    let quic = enr
-        .get_decodable::<u16>(quic_key)
-        .and_then(|r| r.ok())
-        .filter(|port| *port != 0)
+    let quic_port = |key: &[u8]| {
+        enr.get_decodable::<u16>(key).and_then(|r| r.ok()).filter(|port| *port != 0)
+    };
+    let endpoint = |ip: Option<IpAddr>, tcp: Option<u16>, quic: Option<u16>| {
+        ip.filter(|_| tcp.is_some() || quic.is_some()).map(|ip| (ip, tcp, quic))
+    };
+    let (ip, tcp_port, quic_port) =
+        endpoint(enr.ip4().map(IpAddr::V4), enr.tcp4(), quic_port(b"quic"))
+            .or_else(|| endpoint(enr.ip6().map(IpAddr::V6), enr.tcp6(), quic_port(b"quic6")))?;
+
+    let peer_id = enr_to_peer_id(enr)?;
+    let tcp = tcp_port.map(|port| Multiaddr::empty().with(ip.into()).with(Protocol::Tcp(port)));
+    let quic = quic_port
         .map(|port| Multiaddr::empty().with(ip.into()).with(Protocol::Udp(port)).with(Protocol::QuicV1));
+    let (addr, quic) = match (tcp, quic) {
+        (Some(tcp), quic) => (tcp, quic),
+        (None, Some(quic)) => (quic, None),
+        (None, None) => return None, // `endpoint` admits neither
+    };
     tracing::debug!(peer = %peer_id, %addr, ?quic, prior_fork = match_idx > 0, "CL peer discovered");
     Some(DiscoveredPeer { peer_id, addr, quic })
 }
@@ -847,6 +860,51 @@ mod server_enr_tests {
             v6.quic.as_ref().map(|q| q.to_string()).as_deref(),
             Some("/ip6/2001:db8::1/udp/9002/quic-v1")
         );
+    }
+
+    /// A record with a QUIC port and no TCP one is a QUIC-only peer — valid
+    /// since consensus-specs#5330 made QUIC the transport a client MUST
+    /// support and TCP only a SHOULD. Its QUIC address is the candidate's
+    /// `addr`, with no second address beside it. A record with neither
+    /// transport (or only QUIC port 0) is still no candidate.
+    #[test]
+    fn a_quic_only_record_is_a_candidate_dialed_at_its_quic_address() {
+        let digest = [0x74u8, 0xd0, 0x14, 0x59];
+        let key = CombinedKey::generate_secp256k1();
+        let v4 = |quic: Option<u16>| {
+            let mut builder = Enr::builder();
+            builder.ip4("87.154.209.161".parse().unwrap()).udp4(9000);
+            builder.add_value(b"eth2".as_slice(), &eth2_field().as_slice());
+            if let Some(port) = quic {
+                builder.add_value(b"quic".as_slice(), &port);
+            }
+            builder.build(&key).unwrap()
+        };
+
+        let only = filter_candidate(&v4(Some(9001)), &[digest]).expect("a QUIC-only candidate");
+        assert_eq!(only.addr.to_string(), "/ip4/87.154.209.161/udp/9001/quic-v1");
+        assert!(only.quic.is_none(), "the QUIC address is `addr`, not a second one");
+
+        assert!(filter_candidate(&v4(None), &[digest]).is_none(), "no transport at all");
+        assert!(filter_candidate(&v4(Some(0)), &[digest]).is_none(), "port 0 is no listener");
+
+        // IPv6 QUIC-only reads `quic6`.
+        let mut builder = Enr::builder();
+        builder.ip6("2001:db8::1".parse().unwrap()).udp6(9000);
+        builder.add_value(b"eth2".as_slice(), &eth2_field().as_slice());
+        builder.add_value(b"quic6".as_slice(), &9002u16);
+        let v6 = filter_candidate(&builder.build(&key).unwrap(), &[digest]).expect("a candidate");
+        assert_eq!(v6.addr.to_string(), "/ip6/2001:db8::1/udp/9002/quic-v1");
+
+        // An IPv4 endpoint with QUIC only still wins over an IPv6 one with TCP:
+        // the family order is unchanged, and QUIC is dialable on its own.
+        let mut builder = Enr::builder();
+        builder.ip4("87.154.209.161".parse().unwrap()).udp4(9000);
+        builder.ip6("2001:db8::1".parse().unwrap()).tcp6(9104);
+        builder.add_value(b"eth2".as_slice(), &eth2_field().as_slice());
+        builder.add_value(b"quic".as_slice(), &9001u16);
+        let mixed = filter_candidate(&builder.build(&key).unwrap(), &[digest]).expect("a candidate");
+        assert_eq!(mixed.addr.to_string(), "/ip4/87.154.209.161/udp/9001/quic-v1");
     }
 
     #[test]

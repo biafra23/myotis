@@ -10,7 +10,7 @@
 //! where the length covers *digest + update*. Chunks vary in size by a few
 //! bytes because `ExecutionPayloadHeader.extra_data` is variable-length, so
 //! **the length prefix is the only authority for chunk boundaries** — never
-//! assume a uniform stride (docs/lc-server-design.md, "The one framing detail").
+//! assume a uniform stride (docs/design-history/lc-server-design.md, "The one framing detail").
 //!
 //! Converting to the libp2p response is then per chunk:
 //! `encode_success_response(update_ssz, Some(fork_digest))`, concatenated. That

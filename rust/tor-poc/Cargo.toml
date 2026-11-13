@@ -1,4 +1,4 @@
-# Tor integration PROOF OF CONCEPT for docs/privacy-and-tor.md.
+# Tor integration PROOF OF CONCEPT for docs/how-it-works/privacy-and-tor.md.
 #
 # Standalone crate (its own workspace root, own Cargo.lock) — deliberately NOT a
 # member of ../Cargo.toml's workspace so the Arti dependency tree never lands in
@@ -35,4 +35,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 hex = "0.4"
-getrandom = "0.2"
+getrandom = "0.4"

@@ -1,0 +1,245 @@
+<!--meta {"id":"stop-02","num":2,"title":"The workspace: crates, features and profiles","short":"The workspace","sub":"Cargo.toml · features","part":"Orientation"} -->
+<header class="stop-head">
+  <div class="eyebrow">Stop 2 · Orientation <span>14 manifests and config files · about 70 minutes</span></div>
+  <h1>The workspace: crates, features and profiles</h1>
+  <p class="lede">Before any <code>.rs</code> file, read the manifests. They answer the questions Gradle answers on the JVM side: what gets built, from what, into which kind of artefact, and with which switches. A few lines here explain whole files later.</p>
+</header>
+
+<div class="learn">
+  <h2>Rust you will practise</h2>
+  <div><b>Crates and artefacts</b>Read a <code>Cargo.toml</code> and tell a library from a binary, and a <code>cdylib</code> from an <code>rlib</code>.</div>
+  <div><b>Features</b>Follow a feature such as <code>tor</code> or <code>std</code> from a manifest down to the <code>#[cfg]</code> lines it switches on or off.</div>
+  <div><b>Profiles and workspaces</b>Explain why <code>panic = "abort"</code> is set once, why <code>myotis-rpcd</code> lives under it and why <code>roost</code> and <code>tor-poc</code> live outside.</div>
+</div>
+
+<section class="prose">
+  <h2>Cargo in Gradle terms</h2>
+  <p>A <strong>package</strong> (one <code>Cargo.toml</code>) builds one or more <strong>crates</strong>: at most one library (<code>src/lib.rs</code>) plus any number of binaries, examples, tests and benches. A <strong>workspace</strong> is a multi-project build with one shared <code>Cargo.lock</code> and one <code>target/</code> directory, like a Gradle root project with <code>include(...)</code>. Dependencies are declared by name and version (<code>tokio = "=1.52.3"</code>) or by path to a sibling crate (<code>myotis-net = { path = "../myotis-net" }</code>). The Gradle build in this repo calls cargo (<code>cargoBuildHost</code>, <code>cargoTest</code>, <code>cargoNdkAndroid</code>, the two canaries), so both worlds meet in the root <code>build.gradle.kts</code>.</p>
+  <p>A <strong>feature</strong> is a named compile-time switch. It has no Gradle twin. The closest picture is a set of Java source folders that exist only when a flag is set. In code, <code>#[cfg(feature = "x")]</code> on an item removes that item entirely when the feature is off: the compiler never type-checks it. A feature can also turn on an optional dependency (<code>"dep:jni"</code>) or a feature of another crate (<code>"myotis-net/tor"</code>). Features are additive: if any crate in the build turns a feature on, it is on for everyone who depends on that crate.</p>
+</section>
+
+<div class="table-wrap"><table class="map">
+  <thead><tr><th>Crate</th><th>Artefact</th><th>Notable switches</th><th>Stop</th></tr></thead>
+  <tbody>
+    <tr><td><code>myotis-bls</code></td><td>cdylib + rlib</td><td><code>jni</code>, <code>std</code> (both default)</td><td><a href="#stop-03">3</a></td></tr>
+    <tr><td><code>myotis-core</code></td><td>lib</td><td><code>std</code> (default); no_std canary</td><td><a href="#stop-04">4</a></td></tr>
+    <tr><td><code>myotis-wire</code></td><td>lib</td><td><code>std</code>, <code>eth2</code> (default), <code>test-util</code>; no_std canary</td><td><a href="#stop-05">5</a></td></tr>
+    <tr><td><code>myotis-consensus</code></td><td>lib</td><td><code>std</code> (default)</td><td><a href="#stop-06">6</a></td></tr>
+    <tr><td><code>myotis-evm</code></td><td>lib</td><td><code>fixture</code> (test tooling)</td><td><a href="#stop-07">7</a></td></tr>
+    <tr><td><code>myotis-net</code></td><td>lib + example</td><td><code>tor</code>, <code>fixture-recorder</code></td><td><a href="#stop-09">9</a>–<a href="#stop-15">15</a></td></tr>
+    <tr><td><code>myotis-engine</code></td><td>cdylib + rlib (+ staticlib for iOS)</td><td><code>tor</code></td><td><a href="#stop-16">16</a></td></tr>
+    <tr><td><code>uniffi-bindgen</code></td><td>bin (tool)</td><td>none</td><td><a href="#stop-17">17</a></td></tr>
+    <tr><td><code>myotis-node</code></td><td>cdylib</td><td>none</td><td><a href="#stop-18">18</a></td></tr>
+    <tr><td><code>myotis-rpcd</code></td><td>bin</td><td>none</td><td><a href="#stop-19">19</a></td></tr>
+    <tr><td><code>roost</code> (excluded)</td><td>bin</td><td>own profile: <code>panic = "unwind"</code></td><td><a href="#stop-20">20</a></td></tr>
+    <tr><td><code>tor-poc</code> (excluded)</td><td>bin</td><td>Arti always on</td><td><a href="#stop-21">21</a></td></tr>
+  </tbody>
+</table></div>
+
+<x-file path="rust/Cargo.toml" kind="workspace manifest">
+  <p class="purpose">The workspace root. It lists the ten member crates, excludes the two standalone ones, pins one release version and one minimum compiler for all members, and owns the release profile. The long header comment (lines 1–41) describes the crates in one paragraph each; it is the best short description of the architecture in the repo.</p>
+  <x-code src="Cargo.toml" from="43" to="56" lang="toml"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo</x-tags> <strong>Resolver 2.</strong> <code>resolver = "2"</code> resolves features per target and per dependency kind. A <code>[dev-dependencies]</code> feature cannot leak into the shipped library, and a feature asked for under <code>[target.'cfg(...)'.dependencies]</code> stays on that target. Several manifests below rely on both rules.</li>
+    <li><x-tags>modules-cargo</x-tags> <strong>Members and exclusions.</strong> Since the September tour two members joined: <code>myotis-wire</code>, the sans-I/O protocol code split out of <code>myotis-net</code>, and <code>myotis-rpcd</code>, the JSON-RPC daemon. <code>exclude</code> keeps <code>tor-poc</code> and <code>roost</code> out of <code>cargo build --workspace</code>, even though they sit in the same directory tree.</li>
+  </ul>
+  <x-code src="Cargo.toml" from="72" to="82" lang="toml"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo</x-tags> <strong>Inherited package fields.</strong> Each member writes <code>version.workspace = true</code> and <code>rust-version.workspace = true</code>, so all of them are <code>0.1.20</code> and need rustc 1.91 or newer. Gradle stays the source of truth for the version: <code>verifyCrateVersions</code> fails <code>check</code> if this line disagrees with the root <code>build.gradle.kts</code>, or if a <code>myotis-*</code> manifest stops inheriting it. The Gradle toolchain probe reads <code>rust-version</code> to decide whether an installed cargo is new enough, and <code>verifyRustVersionFloor</code> fails <code>check</code> when a lock update pulls in a crate that needs a newer compiler.</li>
+    <li><x-tags>modules-cargo error-handling</x-tags> <strong>Profiles belong to the workspace.</strong> A member's own <code>[profile.*]</code> is ignored. So <code>panic = "abort"</code> applies to every member: a panic ends the process at once instead of unwinding the stack. The roost manifest calls it the right FFI rule for the engine: a Rust panic must not unwind out through a C or JVM frame (depending on the ABI that is undefined behaviour or an abort anyway), so ending at once is the predictable choice. <code>roost</code>, which wants <code>unwind</code>, must therefore be its own workspace root. <code>lto = true</code> plus <code>codegen-units = 1</code> trade build time for smaller, faster binaries, which matters on mobile.</li>
+    <li><x-tags>modules-cargo</x-tags> <strong>Why <code>myotis-rpcd</code> is a member.</strong> The daemon links the engine in-process. The engine already lives under <code>panic = "abort"</code>, so the daemon gains nothing from a separate profile, and it adds only <code>tiny_http</code> and <code>clap</code> to the build.</li>
+  </ul>
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments</span>
+    <p>The header comment's member list (lines 3–38) describes every member except <code>myotis-node</code>, which is in <code>members</code> on line 45.</p>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-bls/Cargo.toml" kind="crate manifest">
+  <p class="purpose">One crate, two artefact kinds, and two features: one decides whether the JNI glue is compiled at all, the other whether the crate links the standard library.</p>
+  <x-code src="myotis-bls/Cargo.toml" from="9" to="27" lang="toml"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo unsafe-ffi</x-tags> <strong><code>cdylib</code> and <code>rlib</code>.</strong> A <code>cdylib</code> is a C-compatible dynamic library (<code>.so</code>/<code>.dylib</code>/<code>.dll</code>) that a JVM or Node can <code>dlopen</code>. An <code>rlib</code> is Rust's own library format, used when another crate in the workspace depends on this one. <code>myotis-engine</code> is also built as a <code>staticlib</code> (<code>.a</code>) for iOS, through <code>cargo rustc --crate-type staticlib</code>.</li>
+    <li><x-tags>modules-cargo</x-tags> <strong>Optional dependency plus feature.</strong> <code>jni</code> is compiled only when the <code>jni</code> feature is on (<code>"dep:jni"</code>), and turning on <code>jni</code> also turns on <code>std</code>. Both are on by default, so the cdylib the Java engine loads has the shim. <code>std = []</code> enables no dependency: it exists only so that the code can test <code>cfg(feature = "std")</code>.</li>
+  </ul>
+  <p class="code-note"><x-tags>modules-cargo</x-tags> <code>myotis-consensus</code> opts out of the defaults and forwards its own <code>std</code> feature down:</p>
+  <x-code src="myotis-consensus/Cargo.toml" from="9" to="11" lang="toml"></x-code>
+  <x-code src="myotis-consensus/Cargo.toml" from="25" to="30" lang="toml"></x-code>
+  <p class="code-note">So a default build of <code>myotis-consensus</code> gets the BLS verify core with <code>std</code> but without JNI. A <code>--no-default-features</code> build of consensus gets the verify core with neither.</p>
+</x-file>
+
+<x-file path="rust/myotis-core/Cargo.toml" kind="crate manifest">
+  <p class="purpose">The execution-layer primitives crate promises to build without the standard library. The manifest shows how that promise is kept: a <code>std</code> feature that forwards to the dependencies' own <code>std</code> features, dependencies with <code>default-features = false</code>, and a dependency that exists only on bare-metal targets.</p>
+  <x-code src="myotis-core/Cargo.toml" from="23" to="39" lang="toml"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo</x-tags> <strong><code>no_std</code> + <code>alloc</code>.</strong> Rust's standard library comes in layers. <code>core</code> has no allocation and no OS. <code>alloc</code> adds <code>Vec</code>, <code>String</code> and <code>Box</code> on top of any allocator. <code>std</code> adds files, threads, sockets and the clock. A crate marked <code>#![no_std]</code> links only the first two, so it can run in firmware. On the JVM there is no equivalent: the class library is always there.</li>
+    <li><x-tags>modules-cargo</x-tags> <strong>Why every dependency says <code>default-features = false</code>.</strong> Most crates turn on their own <code>std</code> by default. One dependency with its defaults left on would pull <code>std</code> into the whole graph, so each one is opted out and gets <code>std</code> back only through this crate's <code>std = ["sha3/std"]</code>.</li>
+  </ul>
+  <x-code src="myotis-core/Cargo.toml" from="52" to="53" lang="toml"></x-code>
+  <p class="code-note"><x-tags>modules-cargo</x-tags> A <code>[target.'cfg(...)'.dependencies]</code> table applies only when building for a matching target. Here it does not add a crate; it adds a <em>feature</em> (<code>force-soft</code>) to <code>sha2</code>, which already arrives through <code>k256</code>. Under resolver 2 that feature stays on the bare-metal targets, so every other build keeps the fast SIMD backend.</p>
+  <p class="code-note"><x-tags>testing</x-tags> The promise is tested by the <strong>no_std canary</strong>, a Gradle task wired into <code>check</code>. <code>x86_64-unknown-none</code> ships no <code>std</code> at all, so any leak fails here and nowhere else. It builds <code>myotis-wire</code> too:</p>
+  <x-code src="repo:build.gradle.kts" from="880" to="892" lang="kotlin"></x-code>
+  <p class="code-note">A second canary, <code>cargoCheckWasm</code>, runs <code>cargo check</code> for <code>wasm32-unknown-unknown</code> on <code>myotis-consensus</code>, <code>myotis-core</code> and <code>myotis-wire</code>. It proves those crates stayed sans-I/O, because tokio and libp2p do not build for plain wasm32. It needs clang, because blst compiles its C sources for wasm.</p>
+</x-file>
+
+<x-file path="rust/myotis-wire/Cargo.toml" kind="crate manifest">
+  <p class="purpose">The wire protocols without an async runtime (<a href="#stop-05">Stop 5</a>). Its features let a host take only the execution-layer half and skip the consensus crate, and with it the blst C library.</p>
+  <x-code src="myotis-wire/Cargo.toml" from="17" to="41" lang="toml"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo</x-tags> <strong>A weak feature: <code>"myotis-consensus?/std"</code>.</strong> The <code>?</code> means "turn on <code>std</code> in <code>myotis-consensus</code>, but only if that optional dependency is already enabled". Without the <code>?</code>, enabling <code>std</code> would also pull in <code>myotis-consensus</code>, and an execution-layer-only host could no longer leave it out.</li>
+    <li><x-tags>modules-cargo</x-tags> <strong><code>eth2</code> gates a whole module.</strong> In <code>lib.rs</code>, <code>#[cfg(feature = "eth2")] pub mod eth2;</code> means the module does not exist without the feature. The no_std canary builds with <code>--no-default-features</code>, so it builds neither <code>std</code> nor <code>eth2</code>, and therefore no consensus code.</li>
+    <li><x-tags>modules-cargo testing</x-tags> <strong>A feature for other crates' tests.</strong> <code>test-util</code> exposes helpers under <code>#[cfg(any(test, feature = "test-util"))]</code>. <code>cfg(test)</code> is true only when this crate's own tests are compiled, so another crate's tests need the feature. <code>myotis-net</code> asks for it in its <code>[dev-dependencies]</code>.</li>
+  </ul>
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments</span>
+    <p>Lines 43–46 say that bare-metal builds must set <code>RUSTFLAGS="--cfg aes_force_soft"</code>. <code>rust/.cargo/config.toml</code> now sets that cfg per target, so any cargo invocation inside <code>rust/</code> gets it without an environment variable. Only an embedder building outside this tree still has to set it.</p>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-net/Cargo.toml" kind="crate manifest">
+  <p class="purpose">The I/O crate. Its runtime and networking dependencies are pinned <em>exactly</em> (<code>=</code>), because interop with live peers depends on wire-level behaviour of those versions. RLPx's crypto moved to <code>myotis-wire</code> with the code that uses it. Tor support is optional and chooses its TLS backend per target.</p>
+  <x-code src="myotis-net/Cargo.toml" from="24" to="28" lang="toml"></x-code>
+  <p class="code-note"><x-tags>modules-cargo</x-tags> <code>"=1.52.3"</code> means exactly this version. A plain <code>"1.52"</code> would mean "any compatible 1.x at or above 1.52", like a Gradle dynamic version. <code>features = [...]</code> picks which parts of tokio to compile; tokio has almost nothing on by default.</p>
+  <x-code src="myotis-net/Cargo.toml" from="77" to="97" lang="toml"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo</x-tags> <strong>One optional dependency, two target tables.</strong> <code>arti-client</code> is declared twice, once for every target except Android (native-tls) and once for Android (rustls plus bundled SQLite). Both are <code>optional = true</code>, and the single <code>tor</code> feature enables whichever one the current target has. The comment on lines 68–76 explains why it is not one table plus a feature: tor-rtcompat silently prefers native-tls when both are on.</li>
+    <li><x-tags>modules-cargo</x-tags> <strong><code>fixture-recorder</code> forwards to another crate's feature</strong> (<code>myotis-evm/fixture</code>), so turning it on here compiles test tooling in both crates.</li>
+  </ul>
+  <x-code src="myotis-net/Cargo.toml" from="99" to="114" lang="toml"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo testing</x-tags> <strong><code>[dev-dependencies]</code> is Gradle's <code>testImplementation</code>.</strong> Here it adds tokio's <code>test-util</code>, which enables <code>#[tokio::test(start_paused = true)]</code>: tests run on a <em>virtual clock</em> that jumps forward instantly whenever every task is waiting.</li>
+    <li><x-tags>modules-cargo testing</x-tags> <strong>A crate that depends on itself.</strong> <code>myotis-net = { path = ".", features = ["fixture-recorder"] }</code> under <code>[dev-dependencies]</code> is a known Cargo idiom. It turns on one of the crate's own features for its tests and examples only. The library that the engine links is built without it.</li>
+    <li><x-tags>modules-cargo</x-tags> <strong><code>[[example]]</code></strong> declares a runnable demo in <code>examples/</code> (<code>cargo run --example live_sync</code>). Cargo also discovers the other files in <code>examples/</code> on its own; the table only matters when a target needs settings.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/myotis-engine/Cargo.toml" kind="crate manifest">
+  <p class="purpose">The engine library forwards a feature to its dependency: turning on <code>myotis-engine/tor</code> turns on <code>myotis-net/tor</code>, which pulls in Arti. Only the desktop host library and the Android jniLibs are built that way, and only with <code>-PtorEngine</code>.</p>
+  <x-code src="myotis-engine/Cargo.toml" from="9" to="23" lang="toml"></x-code>
+  <div class="callout rust">
+    <span class="k">Follow the feature</span>
+    <p><code>-PtorEngine</code> (Gradle) → <code>cargoBuildHost</code> appends <code>--features myotis-engine/tor</code> (the package/feature form, because a bare <code>--features tor</code> with <code>--workspace</code> would apply to every member), and <code>build-android.sh</code> does the same for <code>cargo ndk</code> → <code>myotis-engine</code>'s <code>tor = ["myotis-net/tor"]</code> → <code>myotis-net</code>'s <code>tor = ["dep:arti-client", "dep:tor-rtcompat", "dep:rustls"]</code> → the compiler now sees <code>#[cfg(feature = "tor")] pub mod tor;</code> in <code>el/mod.rs</code> and the first block of <code>set_tor_enabled</code> in <code>host.rs</code>. Without the feature, those lines do not exist for the compiler, and the function returns <code>false</code>.</p>
+  </div>
+  <x-code src="myotis-engine/src/host.rs" from="233" to="244"></x-code>
+  <p class="code-note"><x-tags>macros modules-cargo</x-tags> <code>#[cfg]</code> on a block keeps or deletes that block before type checking. Exactly one of the two blocks survives, and it becomes the function's tail expression. <code>let _ = on;</code> uses the parameter in the Tor-less build so the compiler does not warn about an unused variable.</p>
+  <x-code src="myotis-engine/Cargo.toml" from="50" to="61" lang="toml"></x-code>
+  <p class="code-note"><x-tags>modules-cargo testing</x-tags> <code>[target.'cfg(unix)'.dependencies]</code> adds <code>libc</code> only on Unix-like targets. The dev-dependency on <code>myotis-evm</code> with <code>features = ["fixture"]</code> is how the engine's own tests reach the EVM's in-memory oracle, while the shipped library is built without it.</p>
+</x-file>
+
+<x-file path="rust/myotis-evm/Cargo.toml" kind="crate manifest">
+  <p class="purpose">revm is pinned exactly and trimmed with <code>default-features = false</code>, which drops its C-based precompile backends in favour of pure-Rust ones. The <code>optional_*</code> features expose switches an <code>eth_call</code> needs (no balance check, no base fee, and so on). The <code>fixture</code> feature lets downstream <em>tests</em> use an in-memory oracle and recorded-world files without shipping them in the engine binary.</p>
+  <x-code src="myotis-evm/Cargo.toml" from="31" to="53" lang="toml"></x-code>
+  <p class="code-note"><x-tags>modules-cargo testing</x-tags> In code this becomes <code>#[cfg(any(test, feature = "fixture"))]</code> on <code>pub mod fixture;</code> and on <code>FixtureSnapStateOracle</code>: compiled for the crate's own tests, or when a dependent crate asks for <code>features = ["fixture"]</code>. <code>serde_json</code> appears twice: once optional (pulled in only by <code>fixture</code>) and once as a dev-dependency for the crate's own tests.</p>
+</x-file>
+
+<x-file path="rust/myotis-node/Cargo.toml" kind="crate manifest">
+  <p class="purpose">The Node addon is a <code>cdylib</code> only (<a href="#stop-18">Stop 18</a>). It links <code>myotis-engine</code> as a Rust library for its C-ABI symbols and adds napi-rs. <code>[build-dependencies]</code> are used by <code>build.rs</code>, a small program cargo compiles and runs <em>before</em> building the crate.</p>
+  <x-code src="myotis-node/Cargo.toml" from="9" to="23" lang="toml"></x-code>
+</x-file>
+
+<x-file path="rust/myotis-rpcd/Cargo.toml" kind="crate manifest">
+  <p class="purpose">The JSON-RPC daemon (<a href="#stop-19">Stop 19</a>). It has no <code>[lib]</code> table and no <code>[[bin]]</code> table: a package with <code>src/main.rs</code> is a binary by convention. Its dependency list is short on purpose.</p>
+  <x-code src="myotis-rpcd/Cargo.toml" from="9" to="29" lang="toml"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo concurrency</x-tags> <strong>No async stack.</strong> The engine owns its tokio runtime, and every engine read blocks. So the daemon uses a blocking HTTP server (<code>tiny_http</code>) with a fixed pool of worker threads, like a classic servlet container, and does not depend on tokio itself.</li>
+    <li><x-tags>modules-cargo cli</x-tags> <strong>Trimming features to trim the lock file.</strong> <code>clap</code> is already in the lock through <code>uniffi</code>. Turning its defaults off and listing only the needed features avoids the <code>color</code> feature, which would add six crates.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/roost/Cargo.toml" kind="standalone manifest">
+  <p class="purpose">An empty <code>[workspace]</code> table makes this package its own workspace root, with its own <code>Cargo.lock</code> and its own profile. That is the whole trick behind "excluded". It still depends on <code>myotis-net</code> and <code>myotis-consensus</code> by path, so a dependency change in <code>rust/</code> must update this lock file too.</p>
+  <x-code src="roost/Cargo.toml" from="27" to="32" lang="toml"></x-code>
+  <x-code src="roost/Cargo.toml" from="57" to="63" lang="toml"></x-code>
+  <p class="code-note"><x-tags>modules-cargo cli error-handling</x-tags> <code>[[bin]]</code> declares an executable target. With <code>panic = "unwind"</code>, a panic unwinds only the tokio task it happens in, and the task's <code>JoinHandle</code> reports it as an error value (<code>JoinError::is_panic()</code>) instead of the process dying on the spot. Be precise about what that buys. The manifest header (lines 15–16) says a malformed chunk "kills one connection", but roost's README corrects this: requests are answered inline on the single libp2p <em>swarm</em> task, so a panic there ends every connection. <code>serve</code> notices the dead task, logs it and exits non-zero, and systemd restarts the daemon (<a href="#stop-20">Stop 20</a>). The gain is a controlled, observable restart, not per-connection isolation.</p>
+</x-file>
+
+<x-file path="rust/tor-poc/Cargo.toml" kind="standalone manifest">
+  <p class="purpose">The Tor proof of concept (<a href="#stop-21">Stop 21</a>) uses the same empty-<code>[workspace]</code> trick, for a different reason: it always links Arti, and the Arti tree must never burden the engine build or CI. Unlike <code>myotis-net</code>, it pins only native-tls, because it runs on desktop only.</p>
+  <x-code src="tor-poc/Cargo.toml" from="15" to="31" lang="toml"></x-code>
+  <p class="code-note"><x-tags>modules-cargo</x-tags> Both standalone crates are pinned at <code>0.0.0</code>. They are not release artefacts, and <code>verifyCrateVersions</code> only checks manifests that match <code>myotis-*/Cargo.toml</code>.</p>
+</x-file>
+
+<x-file path="rust/uniffi-bindgen/Cargo.toml" kind="tool manifest">
+  <p class="purpose">The smallest crate in the repo: a binary whose three-line <code>main</code> calls <code>uniffi::uniffi_bindgen_main()</code> (<a href="#stop-17">Stop 17</a>). It exists so that the generator version always matches the <code>uniffi</code> version the engine links against. It sets its own <code>version</code> instead of inheriting the workspace one, because it is a pinned tool, not a release artefact.</p>
+  <x-code src="uniffi-bindgen/Cargo.toml" from="8" to="26" lang="toml"></x-code>
+  <div class="callout watch">
+    <span class="k">Worth remembering</span>
+    <p>UniFFI embeds a checksum per exported function in the scaffolding, and the generated Kotlin verifies it at load time. Any change to <code>ffi.rs</code>, even a doc comment, changes a checksum, so the committed bindings must be regenerated afterwards. Regenerate them through Gradle's <code>uniffiGenerateKotlin</code>, not a direct <code>cargo run</code>: the Gradle task also masks the generated checksum comparisons to 16 bits, and the APK workflow's drift check fails on unmasked bindings.</p>
+  </div>
+</x-file>
+
+<x-file path="rust/.cargo/config.toml" kind="cargo config">
+  <p class="purpose">Per-target compiler flags, applied to every cargo invocation inside <code>rust/</code>. The first three tables serve Android: Android 15+ devices can use 16 KB memory pages, and a library linked with 4 KB-aligned segments fails to <code>dlopen</code> there. The last three serve the bare-metal targets of the no_std promise.</p>
+  <x-code src=".cargo/config.toml" from="13" to="20" lang="toml"></x-code>
+  <x-code src=".cargo/config.toml" from="29" to="36" lang="toml"></x-code>
+  <p class="code-note"><x-tags>modules-cargo</x-tags> <code>-C link-arg=...</code> passes a flag through to the linker. <code>--cfg aes_force_soft</code> defines a custom configuration flag for the compiler, which the <code>aes</code> crate tests with <code>#[cfg(aes_force_soft)]</code>. The <code>aes</code> crate has no Cargo feature for this, so a cfg flag is the only switch. Putting it here rather than in a CI <code>RUSTFLAGS</code> variable means the no_std canary, an embedder building in-tree and a developer at the shell all get the same flags.</p>
+</x-file>
+
+<x-file path="rust/rust-toolchain.toml" kind="toolchain pin">
+  <p class="purpose">Tells <code>rustup</code> which compiler to use inside <code>rust/</code>: the current stable. The minimum version is <code>rust-version</code> in the workspace manifest, enforced by the Gradle probe, rather than an exact pin here, because Rust is optional for most developers and an exact pin would force downloads. The file applies only under <code>rust/</code>; cargo run from the repo root uses rustup's default toolchain.</p>
+  <x-code src="rust-toolchain.toml" from="1" to="5" lang="toml"></x-code>
+</x-file>
+
+<section class="prose">
+  <h2>The rest of <code>rust/</code></h2>
+  <ul>
+    <li><code>Cargo.lock</code>: exact resolved versions of every transitive dependency. Committed, because this workspace produces shipped binaries. <code>roost/</code> and <code>tor-poc/</code> each have their own.</li>
+    <li><code>include/myotis_engine.h</code>: the hand-written C header for <code>capi.rs</code>. A unit test pins its <code>MYOTIS_ABI_VERSION</code> (55 at this snapshot) to <code>lib.rs</code>'s <code>ABI_VERSION</code> (<a href="#stop-16">Stop 16</a>).</li>
+    <li><code>build-android.sh</code> / <code>build-xcframework.sh</code>: cross-compilation helpers (cargo-ndk for the Android ABIs, with <code>MYOTIS_TOR_ENGINE</code> adding the <code>tor</code> feature; device and simulator slices packed into an xcframework for Swift hosts).</li>
+    <li><code>bench/sync_bench.sh</code>: the Rust-vs-JVM cold-sync benchmark (wall time, RSS, CPU).</li>
+    <li><code>testdata/</code>: conformance corpora generated from the Java engine (<code>el/</code>, <code>lc/</code>), recorded EVM worlds (<code>evm/</code>), a golden snapshot, anchor fixtures and the network catalog. Both engines replay the same bytes (<a href="#stop-15">Stop 15</a>).</li>
+  </ul>
+</section>
+
+<x-quiz>[
+  {"id":"ws-q1","type":"mcq","tags":["modules-cargo","unsafe-ffi"],
+   "q":"<code>crate-type = [\"cdylib\", \"rlib\"]</code> in <code>myotis-bls</code> produces…",
+   "options":["two copies of the same Rust library","a C-compatible shared library the JVM can load, and a Rust library other workspace crates link against","a static library for iOS and a WebAssembly module","an executable and a library"],
+   "answer":1,
+   "explain":"<code>cdylib</code> is for foreign loaders such as JNI, JNA or <code>process.dlopen</code>. <code>rlib</code> is Rust-to-Rust linking, which is how <code>myotis-consensus</code> calls the verify core directly. The iOS <code>staticlib</code> of the engine is produced separately with <code>cargo rustc --crate-type staticlib</code>."},
+  {"id":"ws-q2","type":"mcq","tags":["modules-cargo"],
+   "q":"<code>myotis-bls</code> has <code>default = [\"jni\", \"std\"]</code>. <code>myotis-consensus</code> depends on it with <code>default-features = false</code> and has <code>std = [\"sha2/std\", \"tracing/std\", \"myotis-bls/std\"]</code> as a default feature. What does a default build of consensus get from <code>myotis-bls</code>?",
+   "options":["Nothing; the dependency is disabled","The BLS verify core with <code>std</code>, but without the JNI shim and without the <code>jni</code> crate","The JNI shim only","Both <code>jni</code> and <code>std</code>, because defaults cannot be disabled"],
+   "answer":1,
+   "explain":"Turning the defaults off removes <code>jni</code> and <code>std</code>. Consensus's own default <code>std</code> feature then turns <code>myotis-bls/std</code> back on. <code>jni</code> stays off, so the optional <code>jni</code> crate and every <code>#[cfg(feature = \"jni\")]</code> item disappear from the build."},
+  {"id":"ws-q3","type":"mcq","tags":["modules-cargo","error-handling"],
+   "q":"Why can't <code>roost</code> simply be a workspace member with its own <code>panic = \"unwind\"</code>?",
+   "options":["Binaries may not set panic strategies","Cargo ignores <code>[profile.*]</code> in member crates; only the workspace root's profile applies, and that one says <code>abort</code>","<code>unwind</code> is only available on Linux","Because <code>roost</code> uses <code>anyhow</code>"],
+   "answer":1,
+   "explain":"Profiles are workspace-wide. The only way to get a different panic strategy is a separate workspace root, which an empty <code>[workspace]</code> table in <code>roost/Cargo.toml</code> creates."},
+  {"id":"ws-q4","type":"mcq","tags":["modules-cargo","testing"],
+   "q":"<code>myotis-net</code> lists itself under <code>[dev-dependencies]</code> as <code>myotis-net = { path = \".\", features = [\"fixture-recorder\"] }</code>. What is the effect?",
+   "options":["A build error: a crate cannot depend on itself","The feature is on for the crate's tests and examples, and off in the library that the engine links","The feature is on everywhere, because features are additive","It makes <code>cargo publish</code> include the examples"],
+   "answer":1,
+   "explain":"Dev-dependencies apply only to tests, examples and benches, and under resolver 2 their features do not leak into the normal build. So the fixture recorder example compiles in every <code>cargo test</code>, while the shipped library never carries the seam."},
+  {"id":"ws-q5","type":"open","tags":["modules-cargo","macros"],
+   "q":"Trace what happens, from the Gradle flag to the source code, when the desktop host library is built with Tor support.",
+   "model":"<code>-PtorEngine</code> makes <code>cargoBuildHost</code> run <code>cargo build --release --workspace --features myotis-engine/tor</code>. The package/feature form is used because a bare <code>--features tor</code> with <code>--workspace</code> would apply to every member. <code>myotis-engine</code>'s <code>tor = [\"myotis-net/tor\"]</code> turns on the <code>tor</code> feature of <code>myotis-net</code>, which enables the optional dependencies <code>arti-client</code>, <code>tor-rtcompat</code> and <code>rustls</code> (<code>dep:</code> syntax); on a desktop target, the non-Android table's native-tls variants are the ones that exist. With the feature on, items guarded by <code>#[cfg(feature = \"tor\")]</code> are compiled: the <code>el::tor</code> module and the first block of <code>host::set_tor_enabled</code>. Without it, those items do not exist, and the <code>#[cfg(not(feature = \"tor\"))]</code> block that returns <code>false</code> is compiled instead.",
+   "points":["Gradle passes --features myotis-engine/tor to cargo (package/feature form because of --workspace)","the engine feature forwards to myotis-net/tor","the net feature enables the optional Arti dependencies through dep: entries, from the target table that matches the build","#[cfg(feature = \"tor\")] items (el::tor, the real set_tor_enabled block) are compiled; otherwise the fallback block that returns false"],
+   "context":"build.gradle.kts cargoBuildHost: if (torEngine) addAll(listOf(\"--features\", \"myotis-engine/tor\")). myotis-engine/Cargo.toml: tor = [\"myotis-net/tor\"]. myotis-net/Cargo.toml: tor = [\"dep:arti-client\", \"dep:tor-rtcompat\", \"dep:rustls\"], arti deps optional = true in cfg(not(target_os = \"android\")) and cfg(target_os = \"android\") tables. el/mod.rs: #[cfg(feature = \"tor\")] pub mod tor;. host.rs set_tor_enabled has #[cfg(feature = \"tor\")] and #[cfg(not(feature = \"tor\"))] blocks."},
+  {"id":"ws-q6","type":"mcq","tags":["modules-cargo"],
+   "q":"What does <code>.cargo/config.toml</code> change, and for whom?",
+   "options":["It sets the release version for every crate","It adds a 16 KB page-alignment linker flag for the Android targets and an <code>aes_force_soft</code> cfg for the bare-metal targets, and nothing for host builds","It enables the <code>tor</code> feature everywhere","It pins the Rust compiler version"],
+   "answer":1,
+   "explain":"The <code>[target.&lt;triple&gt;]</code> tables apply only to those targets. Host builds and tests are untouched. The compiler comes from <code>rust-toolchain.toml</code> (stable), and the minimum version from <code>rust-version</code> in the workspace manifest."},
+  {"id":"ws-q7","type":"mcq","tags":["modules-cargo"],
+   "q":"<code>myotis-wire</code> has <code>std = [\"myotis-core/std\", \"myotis-consensus?/std\", ...]</code>. What does the <code>?</code> do?",
+   "options":["It makes the whole <code>std</code> feature optional","It enables <code>std</code> on <code>myotis-consensus</code> only if that optional dependency is already enabled by something else, such as the <code>eth2</code> feature","It marks the dependency as deprecated","It tells cargo to ignore errors in <code>myotis-consensus</code>"],
+   "answer":1,
+   "explain":"This is a weak dependency feature. Without the <code>?</code>, enabling <code>std</code> would also enable the optional <code>myotis-consensus</code> dependency, so an execution-layer-only host with <code>std</code> but without <code>eth2</code> could not leave consensus and blst out."},
+  {"id":"ws-q8","type":"open","tags":["modules-cargo","testing"],
+   "q":"<code>myotis-core</code> promises to build without the standard library. Name the manifest techniques that keep the promise, and explain how the project tests it.",
+   "model":"The crate has a <code>std</code> feature (on by default) that forwards to its dependencies' <code>std</code> features (<code>std = [\"sha3/std\"]</code>), and each dependency is declared with <code>default-features = false</code> so none of them turns its own <code>std</code> on behind the crate's back. k256 is used without its <code>std</code> feature at all. For bare-metal targets, a <code>[target.'cfg(...)'.dependencies]</code> table adds sha2's <code>force-soft</code> feature, which resolver 2 keeps on those targets only. The no_std canary (<code>cargoBuildNoStd</code>, part of <code>check</code>, and a CI workflow) runs <code>cargo build --no-default-features</code> for <code>x86_64-unknown-none</code>, a target that ships no std, so any leak fails to build there.",
+   "points":["a std feature that forwards to the dependencies' std features","default-features = false on dependencies so none of them pulls std on its own","a target-specific dependency table for the bare-metal sha2 backend","the canary builds with --no-default-features for x86_64-unknown-none, which has no std at all"],
+   "context":"myotis-core/Cargo.toml: [features] default = [\"std\"], std = [\"sha3/std\"]; sha3 and k256 with default-features = false; [target.'cfg(any(target_os = \"uefi\", target_os = \"none\"))'.dependencies] sha2 force-soft. build.gradle.kts cargoBuildNoStd: cargo build --target x86_64-unknown-none -p myotis-core -p myotis-wire --no-default-features."},
+  {"id":"ws-q9","type":"mcq","tags":["modules-cargo","concurrency"],
+   "q":"Why does <code>myotis-rpcd</code> not depend on tokio, even though it serves HTTP?",
+   "options":["tokio does not support HTTP","The engine owns its own tokio runtime and every read it offers blocks, so the daemon uses a blocking HTTP server with a fixed worker pool","tokio is forbidden under <code>panic = \"abort\"</code>","It gets tokio through clap"],
+   "answer":1,
+   "explain":"The manifest comments say so directly: the engine owns its runtime and log ring, and the daemon only calls blocking functions. A synchronous server (<code>tiny_http</code>) with worker threads is the whole design."},
+  {"id":"ws-q10","type":"open","tags":["modules-cargo","error-handling"],
+   "q":"The root manifest sets <code>panic = \"abort\"</code>. Explain why that is the right rule for the engine and for <code>myotis-rpcd</code>, and what <code>roost</code>'s <code>panic = \"unwind\"</code> does and does not buy it.",
+   "model":"The engine is called across FFI from the JVM, Node and Swift. A Rust panic must not unwind out through a foreign frame (depending on the ABI that is undefined behaviour or an abort anyway), so ending the process at once is the predictable rule. <code>myotis-rpcd</code> links the engine in-process and already lives under that contract, so it gains nothing from a separate profile and stays a member. <code>roost</code> is a server daemon. With <code>unwind</code>, a panic ends only the tokio task it happens in, and the task's <code>JoinHandle</code> reports it as an error. But requests are handled inline on the single swarm task, so such a panic still ends every connection. <code>serve</code> notices, logs and exits non-zero, and systemd restarts it: a controlled, observable restart, not per-connection isolation.",
+   "points":["abort avoids a panic unwinding out through FFI frames, which is not allowed","rpcd links the engine in-process, so the abort contract already applies to it","unwind lets a panic end only its tokio task, reported through JoinHandle/JoinError::is_panic","in roost the swarm task handles requests, so a panic there still drops every connection; the gain is a logged non-zero exit that systemd restarts"],
+   "context":"rust/Cargo.toml [profile.release] panic = \"abort\"; header on myotis-rpcd being a member. roost/Cargo.toml [profile.release] panic = \"unwind\", header claims a malformed chunk kills one connection. roost/README.md 'Why it is not a workspace member': request handling runs inline on the single swarm task; serve exits non-zero for the supervisor."}
+]</x-quiz>

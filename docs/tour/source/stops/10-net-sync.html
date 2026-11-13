@@ -1,0 +1,471 @@
+<!--meta {"id":"stop-10","num":10,"title":"myotis-net, part 2: the light-client sync loop","short":"net · sync loop","sub":"7 files · 8,380 lines","part":"myotis-net: all the I/O"} -->
+<header class="stop-head">
+  <div class="eyebrow">Stop 10 · crate <code>myotis-net</code> <span>7 files · 8,380 lines · about 180 minutes</span></div>
+  <h1>myotis-net, part 2: the light-client sync loop</h1>
+  <p class="lede"><code>sync.rs</code> conducts the consensus side. It defines each chain, starts the libp2p host and one long-lived task that bootstraps from the trusted checkpoint (or resumes a snapshot), walks the sync committee up to the present, then polls finality once per slot. It refuses to start from an anchor older than the weak-subjectivity bound. A new neighbour, <code>cl_fork_watch.rs</code>, listens to what consensus peers advertise and raises an "update required" advisory when the network has moved to a fork this build does not know. The five example binaries reuse these parts as operator tools.</p>
+</header>
+
+<div class="learn">
+  <h2>Rust you will practise</h2>
+  <div><b>Owning a whole state machine in one task</b>Fanning out requests as futures (<code>join_all</code>, <code>FuturesUnordered</code>, <code>select!</code>, <code>join!</code>) while one task lends its state as <code>&amp;mut</code>, with no locks.</div>
+  <div><b>Shared knobs across clones</b><code>Arc&lt;WsPolicy&gt;</code> of atomics and <code>Arc&lt;ClForkWatch&gt;</code> with a <code>Mutex</code> inside a <code>Clone</code> config, and a <code>watch</code> channel as a <code>StateFlow</code>.</div>
+  <div><b>Lifecycle and scopes</b><code>stop(self)</code>, abort-then-await, a <code>Drop</code> guard that frees a UDP port, and a lock guard scoped so logging happens after the lock is released.</div>
+</div>
+
+<section class="prose">
+  <h2>How the pieces run</h2>
+  <p><code>SyncHandle::start</code> creates four kinds of concurrent work. The <strong>swarm task</strong> (started by <code>reqresp::start_host_with</code>, <a href="#stop-09">Stop 9</a>) owns the libp2p <code>Swarm</code>; everyone else talks to it through a cloneable <code>ReqRespClient</code>, which is just an <code>mpsc::Sender&lt;Command&gt;</code> plus a few shared maps, with a <code>oneshot</code> reply per request. The <strong>discovery task</strong> owns <code>Discv5</code> and pushes fork-matched peers into an <code>mpsc</code> channel. The <strong><code>run_sync</code> task</strong> owns every piece of sync state. And the <strong>request futures</strong> that <code>run_sync</code> creates are not tasks at all: they are futures polled by <code>run_sync</code> itself.</p>
+  <p>State that more than one of them must see lives behind an <code>Arc</code>: the Status the host serves to peers (<code>Arc&lt;LocalStatus&gt;</code>, a <code>std::sync::Mutex</code>), the CL→EL bridge (<code>Arc&lt;ExecAnchor&gt;</code>), the weak-subjectivity knobs (<code>Arc&lt;WsPolicy&gt;</code>, two atomics), the hunt boost (<code>Arc&lt;AtomicBool&gt;</code>), the discv5 table size (<code>Arc&lt;AtomicUsize&gt;</code>), the byte counters (<code>Arc&lt;TrafficMeter&gt;</code>), and now the fork watch (<code>Arc&lt;ClForkWatch&gt;</code>). Everything else is owned by exactly one task.</p>
+</section>
+
+<figure class="diagram">
+  <div class="svg-wrap">
+  <svg class="wide-diagram" viewBox="0 0 940 450" role="img" fill="currentColor" xmlns="http://www.w3.org/2000/svg"
+       aria-label="Ownership across tasks. The engine host owns the SyncHandle, writes the WsPolicy atomics that the run_sync task reads, and keeps one Arc ClForkWatch per handle whose advisory it reads at status time. SyncHandle holds a watch receiver, a ReqRespClient, the run_sync JoinHandle and an Arc ExecAnchor. The run_sync task exclusively owns the peer pool, the light-client processor, the CL peer cache, staged updates, hunt state and the resume guard, and sends SyncStatus over the watch channel. It talks to the swarm task through mpsc commands and a shared Arc LocalStatus, receives discovered peers from the discovery task over an mpsc channel, shares an Arc AtomicBool hunt boost with it and aborts it on drop, and feeds the EL reader through an Arc ExecAnchor. The swarm task feeds peer Status digests and the discovery task feeds ENR eth2 fields into the ClForkWatch.">
+    <defs>
+      <marker id="m-stop10-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+      </marker>
+    </defs>
+    <rect x="20" y="20" width="230" height="200" rx="10" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+    <text x="34" y="44" font-size="13" font-weight="700">SyncHandle</text>
+    <text x="34" y="60" font-size="10.5" style="fill:var(--ink-3)">held by the engine host</text>
+    <g font-size="11.5" class="mono">
+      <text x="34" y="88">status_rx: watch::Receiver</text>
+      <text x="34" y="112">client: ReqRespClient</text>
+      <text x="34" y="136">tasks: Vec&lt;JoinHandle&gt;</text>
+      <text x="34" y="160">exec_anchor: Arc&lt;ExecAnchor&gt;</text>
+    </g>
+    <text x="34" y="200" font-size="10.5" style="fill:var(--ink-3)">stop(self): shutdown → abort → await</text>
+
+    <rect x="330" y="20" width="280" height="250" rx="10" stroke-width="1.6" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+    <text x="344" y="44" font-size="13" font-weight="700">run_sync task</text>
+    <text x="344" y="60" font-size="10.5" style="fill:var(--ink-2)">sole owner, lent out as &amp;mut, no locks</text>
+    <g font-size="11.5" class="mono">
+      <text x="344" y="86">PeerPool</text>
+      <text x="344" y="104">LightClientProcessor (store)</text>
+      <text x="344" y="122">ClPeerCache · staged updates</text>
+      <text x="344" y="140">HuntState · ResumeGuard</text>
+    </g>
+    <line x1="344" y1="154" x2="596" y2="154" stroke-width="1" style="stroke:var(--rule)"/>
+    <text x="344" y="172" font-size="10.5" style="fill:var(--ink-2)">also holds:</text>
+    <g font-size="11.5" class="mono">
+      <text x="344" y="192">ChainConfig · status_tx · client</text>
+      <text x="344" y="210">Arc&lt;LocalStatus&gt; · Arc&lt;ExecAnchor&gt;</text>
+      <text x="344" y="228">DiscoveryGuard(JoinHandle)</text>
+      <text x="344" y="246">peer_rx · peer_tx (for respawns)</text>
+    </g>
+
+    <rect x="690" y="20" width="200" height="96" rx="10" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+    <text x="704" y="44" font-size="13" font-weight="700">swarm task</text>
+    <text x="704" y="64" font-size="11" style="fill:var(--ink-2)">owns Swarm + SwarmCtx</text>
+    <text x="704" y="82" font-size="11" style="fill:var(--ink-2)">answers inbound Status</text>
+    <text x="704" y="98" font-size="11" style="fill:var(--ink-2)">from LocalStatus</text>
+
+    <rect x="690" y="150" width="200" height="100" rx="10" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+    <text x="704" y="174" font-size="13" font-weight="700">discovery task</text>
+    <text x="704" y="194" font-size="11" style="fill:var(--ink-2)">owns Discv5 (+ consumer task)</text>
+    <text x="704" y="212" font-size="11" class="mono" style="fill:var(--ink-2)">Arc&lt;AtomicUsize&gt; table</text>
+    <text x="704" y="230" font-size="11" class="mono" style="fill:var(--ink-2)">Arc&lt;AtomicBool&gt; boost</text>
+
+    <rect x="690" y="320" width="230" height="110" rx="10" stroke-width="1.4" style="fill:var(--jvm-wash);stroke:var(--jvm)"/>
+    <text x="704" y="344" font-size="13" font-weight="700">ClForkWatch</text>
+    <text x="704" y="362" font-size="11" class="mono" style="fill:var(--ink-2)">Arc, Mutex&lt;Inner&gt; inside</text>
+    <text x="704" y="380" font-size="11" style="fill:var(--ink-2)">one vote per /24 source</text>
+    <text x="704" y="398" font-size="11" style="fill:var(--ink-2)">one per handle, survives pause</text>
+
+    <rect x="330" y="300" width="280" height="60" rx="10" stroke-width="1.4" stroke-dasharray="5 4" style="fill:none;stroke:var(--ink-3)"/>
+    <text x="470" y="326" text-anchor="middle" font-size="13" font-weight="700">EL reader (Stop 14)</text>
+    <text x="470" y="346" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">anchors every verified read on ExecAnchor</text>
+
+    <rect x="20" y="300" width="230" height="130" rx="10" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)"/>
+    <text x="34" y="324" font-size="13" font-weight="700">engine host (Stop 16)</text>
+    <text x="34" y="344" font-size="11" style="fill:var(--ink-2)">owns the SyncHandle</text>
+    <text x="34" y="362" font-size="11" style="fill:var(--ink-2)">writes WsPolicy atomics</text>
+    <text x="34" y="380" font-size="11" style="fill:var(--ink-2)">keeps Arc&lt;ClForkWatch&gt; per handle</text>
+    <text x="34" y="398" font-size="11" style="fill:var(--ink-2)">merges EL + CL advisories</text>
+
+    <line x1="330" y1="88" x2="253" y2="88" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop10-arrow)"/>
+    <text x="291" y="80" text-anchor="middle" font-size="10.5">watch</text>
+    <line x1="250" y1="136" x2="327" y2="136" stroke="currentColor" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#m-stop10-arrow)"/>
+    <text x="289" y="128" text-anchor="middle" font-size="10.5">abort()</text>
+
+    <line x1="610" y1="50" x2="687" y2="50" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop10-arrow)"/>
+    <text x="650" y="42" text-anchor="middle" font-size="10.5">mpsc</text>
+    <line x1="610" y1="90" x2="687" y2="90" stroke-width="1.4" style="stroke:var(--oxide)" marker-end="url(#m-stop10-arrow)"/>
+    <text x="650" y="82" text-anchor="middle" font-size="10.5" style="fill:var(--oxide-ink)">set()</text>
+
+    <line x1="690" y1="176" x2="613" y2="176" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop10-arrow)"/>
+    <text x="650" y="168" text-anchor="middle" font-size="10.5">peers</text>
+    <line x1="610" y1="208" x2="687" y2="208" stroke-width="1.4" style="stroke:var(--oxide)" marker-end="url(#m-stop10-arrow)"/>
+    <text x="650" y="200" text-anchor="middle" font-size="10.5" style="fill:var(--oxide-ink)">boost</text>
+    <line x1="610" y1="238" x2="687" y2="238" stroke="currentColor" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#m-stop10-arrow)"/>
+    <text x="650" y="258" text-anchor="middle" font-size="10.5">abort on drop</text>
+
+    <line x1="470" y1="270" x2="470" y2="297" stroke-width="1.4" style="stroke:var(--oxide)" marker-end="url(#m-stop10-arrow)"/>
+    <text x="478" y="290" font-size="10.5" style="fill:var(--oxide-ink)">update_exec_anchor()</text>
+
+    <line x1="790" y1="250" x2="790" y2="317" stroke-width="1.4" style="stroke:var(--oxide)" marker-end="url(#m-stop10-arrow)"/>
+    <text x="798" y="290" font-size="10.5" style="fill:var(--oxide-ink)">observe_enr</text>
+    <path d="M890,68 H912 V317" fill="none" stroke-width="1.4" style="stroke:var(--oxide)" marker-end="url(#m-stop10-arrow)"/>
+    <text x="905" y="140" font-size="10.5" text-anchor="end" style="fill:var(--oxide-ink)" transform="rotate(-90 905 140)">observe_status</text>
+
+    <line x1="135" y1="300" x2="135" y2="223" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop10-arrow)"/>
+    <text x="143" y="266" font-size="10.5">owns</text>
+    <path d="M250,320 H292 V255 H327" fill="none" stroke-width="1.4" style="stroke:var(--oxide)" marker-end="url(#m-stop10-arrow)"/>
+    <text x="296" y="290" font-size="10.5" style="fill:var(--oxide-ink)">store()</text>
+    <line x1="250" y1="415" x2="687" y2="415" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop10-arrow)"/>
+    <text x="470" y="408" text-anchor="middle" font-size="10.5">advisory() at status time</text>
+  </svg>
+  </div>
+  <figcaption>Solid black arrows are channels or method calls, oxide arrows are writes to shared state behind an <code>Arc</code> (a <code>std</code> <code>Mutex</code> or an atomic), and dashed arrows are cancellations. Everything inside the oxide box is plain data that a single task owns. The fan-out requests are futures polled by that same task, not threads. The swarm task has no entry in <code>tasks</code>: its <code>JoinHandle</code> is dropped at start, and it ends when <code>stop</code> sends it <code>Command::Shutdown</code>.</figcaption>
+</figure>
+
+<x-file path="rust/myotis-net/src/sync.rs" kind="library" twin="BeaconLightClient + NetworkConfig">
+  <p class="purpose">The consensus-layer light-client driver. It defines each supported chain (<code>ChainConfig</code>: trust anchor, fork schedule, pinned LC servers, discv5 bootnodes, weak-subjectivity bound), now four of them with Chiado. <code>SyncHandle::start</code> launches the host and one long-lived <code>run_sync</code> task. That task bootstraps or resumes, walks the committee with <code>light_client_updates_by_range</code>, polls <code>light_client_finality_update</code> once per slot at a jittered point just past a third of the slot, publishes a <code>SyncStatus</code>, keeps the Status served to peers honest, and feeds the CL→EL <code>ExecAnchor</code>. It does not call the fork watch itself; it only threads the <code>Arc&lt;ClForkWatch&gt;</code> from its config into the host and discovery.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–34</td><td>Module doc (the clock policy) and imports.</td></tr>
+      <tr><td>36–141</td><td><code>ws_anchor_stale</code>; the finality-poll schedule: constants, the pure <code>finality_poll_offset_ms</code> and <code>delay_to_next_poll</code>, and <code>now_unix_ms</code>, the one clock read.</td></tr>
+      <tr><td>143–230</td><td><code>WsPolicy</code> and the <code>ChainConfig</code> struct.</td></tr>
+      <tr><td>232–711</td><td><code>impl ChainConfig</code>: the geometry check, env overrides (<code>MYOTIS_CL_STATIC_PEERS</code>, <code>MYOTIS_CL_DISABLE_DISCV5</code>), <code>mainnet()</code> / <code>sepolia()</code> / <code>gnosis()</code> / <code>chiado()</code> with the <code>@checkpoint</code> blocks, <code>for_genesis</code>, fork-digest helpers, <code>lc_fork_of_chunk</code> (Gloas wire format), clock helpers.</td></tr>
+      <tr><td>713–1260</td><td><code>hex32</code>, then pinned data: static LC peers and bootstrap ENRs per network, with census evidence and pruning history in comments.</td></tr>
+      <tr><td>1262–1346</td><td><code>SyncState</code> and <code>SyncStatus</code>.</td></tr>
+      <tr><td>1348–1460</td><td><code>SyncHandle</code>: start, exec_anchor, status, watch, stop.</td></tr>
+      <tr><td>1462–2165</td><td><code>Peer</code> (QUIC-then-TCP <code>dial_addrs</code>), the <code>PeerPool</code>: fields, tuning constants, credit and eviction, <code>add_inner</code>, candidate tiers, <code>explore_candidates</code>, <code>parse_static_peer</code>.</td></tr>
+      <tr><td>2167–2613</td><td><code>run_sync</code>: setup, the entry weak-subjectivity gate, snapshot resume, the main loop.</td></tr>
+      <tr><td>2615–2814</td><td><code>persist_snapshot</code>, <code>drain_discovered</code>, <code>try_bootstrap</code>.</td></tr>
+      <tr><td>2816–3073</td><td><code>ResumeGuard</code>, <code>StagedChunk</code> / <code>stage_chunk</code>, catch-up limits, LC-hunt tuning and the pure <code>hunt_due</code>.</td></tr>
+      <tr><td>3075–3661</td><td>The <code>catch_up</code> pipeline.</td></tr>
+      <tr><td>3663–3857</td><td><code>HuntState</code>, <code>throughput_bound_verdict</code>, <code>next_single_target</code>, <code>apply_staged_step</code>, <code>agent_serves_one_period</code>, <code>StepOutcome</code>.</td></tr>
+      <tr><td>3859–4148</td><td><code>poll_finality</code> / <code>FinalityPoll</code>, <code>hunt_round</code>.</td></tr>
+      <tr><td>4150–4386</td><td><code>refresh_local_status</code>, <code>update_exec_anchor</code>, the SYNCED gate (<code>light_client_current</code>, <code>sync_state_at</code>, <code>feed_exec_anchor</code>), <code>publish_stale_anchor</code>, <code>publish_status</code>.</td></tr>
+      <tr><td>4388–6124</td><td>44 unit tests: agent classification, the WS gate, exec-anchor feeding (including Gloas), config parity with Java for all four networks, checkpoint markers, the poll schedule, hunt triggers, pool policy, staging.</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments</span>
+    <p>The module doc (lines 8–11) says this module "is the only place wall-clock time is read". That holds for the light-client path (it keeps <code>myotis-consensus</code> clock-free), but not for the crate: <code>cl_fork_watch.rs</code> reads the clock through <code>el::fork_watch::wall_clock_secs</code>, and several <code>el/</code> modules call <code>SystemTime::now</code> too. Also, the doc comment at lines 256–260 ("Mainnet — values duplicated verbatim from the Java <code>NetworkConfig.MAINNET</code>") is glued to <code>env_static_peers</code>, not to <code>mainnet()</code>, which has no doc comment of its own.</p>
+  </div>
+
+  <h4>Configuration shared across clones</h4>
+  <x-code src="myotis-net/src/sync.rs" from="40" to="46"></x-code>
+  <x-code src="myotis-net/src/sync.rs" from="143" to="156"></x-code>
+  <x-code src="myotis-net/src/sync.rs" from="211" to="230"></x-code>
+  <ul class="concepts">
+    <li><x-tags>smart-pointers interior-mutability</x-tags> <strong>Three fields are shared, the rest are copied.</strong> <code>ChainConfig</code> derives <code>Clone</code>. Cloning deep-copies its <code>Vec&lt;String&gt;</code>s and arrays, but for <code>ws_policy: Arc&lt;WsPolicy&gt;</code>, <code>cl_fork_watch: Option&lt;Arc&lt;ClForkWatch&gt;&gt;</code> and <code>traffic: Arc&lt;TrafficMeter&gt;</code> it only bumps a reference count. The engine's copy and the loop's copy therefore point at the same atomics, the same watch and the same counters. A host click on "accept stale anchor" (<code>store(true, Relaxed)</code>) is seen by the parked loop, which re-reads the flag every second.</li>
+    <li><x-tags>interior-mutability</x-tags> <code>AtomicU64</code> and <code>AtomicBool</code> are mutated through <code>&amp;self</code>, with no <code>mut</code> and no lock: Java's <code>volatile</code> plus <code>AtomicLong</code>. <code>#[derive(Default)]</code> works because both atomics implement <code>Default</code> (zero and <code>false</code>). <code>Relaxed</code> ordering is enough: each flag is read on its own, and nothing else has to become visible together with it.</li>
+    <li><x-tags>domain</x-tags> <code>saturating_sub</code> in <code>ws_anchor_stale</code> makes a wall clock <em>behind</em> the anchor read as fresh, not as a huge unsigned age. The comparison is <code>&gt;</code>: an age equal to the bound is still fresh.</li>
+  </ul>
+  <x-code src="myotis-net/src/sync.rs" from="337" to="357"></x-code>
+  <p class="code-note"><x-tags>domain methods</x-tags> The embedded trust anchor. <code>./gradlew refreshCheckpoint</code> rewrites the text between <code>@checkpoint:mainnet:begin</code> and <code>…:end</code> in this file <em>and</em> in <code>NetworkConfig.java</code> from one fetch, and the test <code>java_and_rust_checkpoints_agree</code> fails if the two ever drift (it even panics, rather than skipping, when it runs inside a checkout where the Java file has moved). <code>ws_bound_periods: 13</code> is the mainnet weak-subjectivity bound; Sepolia also uses 13, Gnosis 3 and Chiado 1. <code>.with_env_overrides()</code> is a consuming builder step: it takes the struct by value (<code>mut self</code>) and returns it, so every constructor applies the env overrides on its way out.</p>
+
+  <h4>The finality-poll schedule</h4>
+  <x-code src="myotis-net/src/sync.rs" from="111" to="134"></x-code>
+  <p class="code-note"><x-tags>domain</x-tags> New since September. The old loop slept one fixed slot after each round, so its poll drifted through the slot. Now each process draws one point per run (a third of the slot, plus a 500 ms margin, plus random jitter of up to a quarter slot, capped at two thirds; <code>finality_poll_offset_ms</code>, fed by <code>getrandom</code>) and sleeps until that point in the next slot. A third of the way in is the attestation and sync-message deadline: the sync aggregate that attests the previous block is out by then, and servers rebuild their latest update as they import it. <code>delay_to_next_poll</code> is pure: it takes "now" as a parameter instead of reading the clock, so the tests can drive it with any time. The clamp in <code>poll_slot_ms</code> plus the saturating operations keep every sum in range for any input. On 12 s slots it also waits at least 11 s after the previous poll started, because Lighthouse serves each light-client protocol once per 10 s per peer.</p>
+
+  <h4>Status and the handle</h4>
+  <x-code src="myotis-net/src/sync.rs" from="1266" to="1291"></x-code>
+  <p class="code-note"><x-tags>enums-patterns traits-generics</x-tags> <code>SyncState</code> is <code>Copy</code>: a plain tag with no data, copied like an <code>int</code>. <code>Display</code> maps each variant to the API string the hosts show. <code>StaleAnchor</code> means "fail closed and wait for a raised bound or explicit consent". The <code>SyncStatus</code> struct below it carries the numbers: since #658 its <code>optimistic_slot</code> is the attested block's own slot, not the signature slot the store tracks.</p>
+  <x-code src="myotis-net/src/sync.rs" from="1363" to="1390"></x-code>
+  <x-code src="myotis-net/src/sync.rs" from="1392" to="1431"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async concurrency</x-tags> <code>watch::channel(SyncStatus::initial())</code> holds the <em>latest</em> value, like Kotlin's <code>StateFlow</code>. The sender goes into the task; the receiver stays in the handle.</li>
+    <li><x-tags>error-handling enums-patterns</x-tags> <code>start_host_with</code> returns <code>Result&lt;(ReqRespClient, PeerId, JoinHandle), String&gt;</code>. <code>.map(|(client, _, _)| client)?</code> destructures the tuple in the closure's parameter, keeps the client and drops the other two. Dropping a <code>JoinHandle</code> does not stop the task, it only detaches it. <code>?</code> returns early with the <code>String</code> error, which matches <code>start</code>'s own error type.</li>
+    <li><x-tags>smart-pointers iterators-closures</x-tags> <code>accepted_fork_digests</code> is built from a <code>move</code> closure that owns a <em>clone</em> of the whole config, wrapped as <code>AcceptedForkDigests::Dynamic(Arc&lt;dyn Fn() -&gt; …&gt;)</code>. The discovery task calls it for every candidate ENR, so the filter follows the fork schedule at the wall clock without a restart. The inner block <code>{ let chain = …; … }</code> is an expression: its last line is the field's value.</li>
+    <li><x-tags>async ownership</x-tags> <code>tokio::spawn(run_sync(config, client.clone(), …))</code> <em>moves</em> the config, the <code>LocalStatus</code> <code>Arc</code>, the watch sender and the discovery config into the task, because a spawned future must own its data (<code>'static</code>). <code>config</code> cannot be used after that line, which is why the closure above had to take its own clone first.</li>
+    <li><x-tags>domain</x-tags> The same <code>config.cl_fork_watch.clone()</code> goes to two places: <code>HostConfig</code> (the swarm task records every peer's Status digest) and <code>DiscoveryConfig</code> (the discovery task records every routing-table ENR). That is the whole connection between this file and <code>cl_fork_watch.rs</code>.</li>
+  </ul>
+  <x-code src="myotis-net/src/sync.rs" from="1434" to="1460"></x-code>
+  <ul class="concepts">
+    <li><x-tags>borrowing</x-tags> <code>status()</code> calls <code>self.status_rx.borrow().clone()</code>. <code>borrow()</code> returns a guard that holds a read lock on the channel's value; the guard lives only until the end of that statement, and <code>.clone()</code> copies the value out first. Holding the guard longer would block the sender.</li>
+    <li><x-tags>ownership async</x-tags> <strong><code>stop(self)</code> consumes the handle</strong>, so the compiler rejects any later use. It first tells the swarm task to shut down. The first loop then <em>borrows</em> the handles (<code>&amp;self.tasks</code>) to abort them, and the second <em>moves</em> each <code>JoinHandle</code> out, because <code>.await</code> consumes it. Awaiting an aborted task yields <code>Err(JoinError::Cancelled)</code>, which <code>let _ =</code> discards.</li>
+  </ul>
+  <div class="callout watch">
+    <span class="k">Gotcha</span>
+    <p>Dropping a <code>SyncHandle</code> <em>without</em> calling <code>stop()</code> stops nothing. <code>SyncHandle</code> has no <code>Drop</code> impl, and a dropped <code>JoinHandle</code> merely detaches its task. <code>run_sync</code> has no exit path at all; <code>abort()</code> is the shutdown signal. That is why the engine host always calls <code>sync.stop().await</code>.</p>
+  </div>
+
+  <h4>The loop: setup</h4>
+  <x-code src="myotis-net/src/sync.rs" from="2171" to="2230"></x-code>
+  <ul class="concepts">
+    <li><x-tags>smart-pointers async</x-tags> <strong><code>DiscoveryGuard</code></strong> is a struct defined <em>inside</em> the function, whose <code>Drop</code> aborts the discovery task. When <code>SyncHandle::stop</code> aborts <code>run_sync</code>, tokio drops the future and every local in it, this guard included. The discovery task stops at once and its UDP port is released, so a fast stop→start on a fixed port works. <code>self.0.as_ref()</code> borrows the handle inside the <code>Option</code> instead of moving it out of <code>&amp;mut self</code>.</li>
+    <li><x-tags>ownership concurrency</x-tags> <code>discovery_cfg.clone()</code> and <code>peer_tx.clone()</code> keep originals so a <em>respawned</em> discovery (retried about every sixth loop iteration after a failure) can reuse them. The <code>hunt_boost</code> <code>Arc</code> inside the config is shared, so a boost survives the restart. Because the loop keeps one <code>peer_tx</code>, <code>peer_rx</code> never reports "closed", even while discovery is down.</li>
+    <li><x-tags>modules-cargo</x-tags> <code>LightClientStore::new(config.slots_per_period())</code> and <code>LightClientProcessor::new(…)</code>: the sans-I/O core from <a href="#stop-06">Stop 6</a>, owned by this task. <code>config.fork_schedule.clone()</code> gives the processor its own copy of the schedule, which it consults for every signature.</li>
+  </ul>
+
+  <h4>The weak-subjectivity gate</h4>
+  <p>A light client trusts sync-committee signatures. Validators can leave, though, and once enough members of an old committee have exited, they can sign a forged chain at no cost to themselves. Their signatures would still verify against the old committee. So a light client must not walk forward from an anchor older than the network's weak-subjectivity bound. Here the bound is counted in sync-committee periods (8192 slots: about 27 hours on mainnet, about 11 hours on Gnosis).</p>
+  <x-code src="myotis-net/src/sync.rs" from="2296" to="2341"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain interior-mutability</x-tags> <strong>Entry gate.</strong> The anchor is the newer of the embedded checkpoint and the persisted snapshot. When it is past the bound, the loop parks in <code>StaleAnchor</code> and re-checks once per second, until the host raises the bound (<code>effective_ws_bound_periods</code> reads the override atomic), gives consent (<code>accept_stale_anchor.load(Relaxed)</code>), or aborts the task. Consent is per run and never persisted. While parked it still keeps the served Status's fork digest in step with the schedule.</li>
+    <li><x-tags>async</x-tags> <code>tokio::time::sleep(…).await</code> yields the worker thread, so a parked loop costs nothing. It is also a cancellation point: <code>abort()</code> takes effect at the next <code>.await</code>.</li>
+    <li><x-tags>domain</x-tags> <code>publish_stale_anchor</code> sends a status built from <code>SyncStatus::initial()</code> with only <code>state</code>, <code>period</code> (the refused anchor's) and <code>ws_bound_periods</code> filled in, and tells the <code>ExecAnchor</code> that its finality is no longer current.</li>
+  </ul>
+  <x-code src="myotis-net/src/sync.rs" from="2343" to="2362"></x-code>
+  <p class="code-note"><x-tags>ownership</x-tags> Note the two uses of <code>persisted_snap</code>. The gate above only <em>looked</em> at it: <code>persisted_snap.as_ref().map(|s| s.current_sync_committee_period)</code> turns <code>&amp;Option&lt;Snapshot&gt;</code> into <code>Option&lt;&amp;Snapshot&gt;</code> and copies one <code>u64</code> out. Here <code>if let Some(snap) = persisted_snap</code> <em>moves</em> the snapshot out of the <code>Option</code>, and <code>processor.store.restore(snap)</code> moves it again into the store. After this block <code>persisted_snap</code> is gone; the compiler would reject any later use. A restored store starts on probation (<code>ResumeGuard::resumed()</code>) until an update verifies against it.</p>
+  <x-code src="myotis-net/src/sync.rs" from="2496" to="2514"></x-code>
+  <p class="code-note"><x-tags>domain borrowing</x-tags> <strong>The gate runs in two more places.</strong> Before a re-bootstrap (lines 2434–2448: reachable when a poisoned snapshot was discarded, so the older checkpoint becomes the anchor again), and here, while running: a committee held in memory ages exactly like a snapshot on disk, so a node that was peer-starved for longer than the bound must not walk forward when peers return. Both of these park in 5 s steps. <code>status_tx.borrow().state</code> reads the value the loop itself last sent, so the warning is logged only when the state changes.</p>
+
+  <h4>The loop: one iteration</h4>
+  <x-code src="myotis-net/src/sync.rs" from="2516" to="2529"></x-code>
+  <x-code src="myotis-net/src/sync.rs" from="2582" to="2613"></x-code>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Each iteration</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1 · housekeeping</td><td>Drain discovered peers without waiting (<code>try_recv</code> in <code>drain_discovered</code>), track progress, decide whether to hunt for LC servers (<code>hunt_due</code>), retry discv5 about every sixth iteration while it is down.</td></tr>
+      <tr><td>2 · bootstrap</td><td>If the store is not initialized: WS gate on the checkpoint, then <code>try_bootstrap</code> (8 peers, 16 when hunting). On failure: an optional hunt round, refresh the served Status, publish, sleep 5 s, <code>continue</code>.</td></tr>
+      <tr><td>3 · in-run gate</td><td>If the held committee is past the bound: publish <code>StaleAnchor</code>, sleep 5 s, <code>continue</code>.</td></tr>
+      <tr><td>4 · catch-up</td><td>If the wall-clock period is ahead of the store: the <code>catch_up</code> pipeline. A poisoned resume deletes the snapshot and resets the store. Still behind: sleep one slot and skip finality, since finality updates cannot verify against a stale committee.</td></tr>
+      <tr><td>5 · finality</td><td><code>poll_finality</code> (16 peers, first verified advance wins), confirm a resumed snapshot, maybe a hunt round, flush the peer cache, persist, refresh the served Status, publish, sleep until this process's poll point in the next slot.</td></tr>
+    </tbody>
+  </table></div>
+  <p class="code-note"><x-tags>borrowing</x-tags> <code>catch_up(&amp;config, &amp;client, &amp;mut pool, &amp;mut processor, …)</code> lends all the task-owned state at once, twelve arguments. Because <em>this task</em> owns it, the helpers can take <code>&amp;mut</code> with no synchronization, and each borrow ends when the call returns. <code>let _ = std::fs::remove_file(path);</code> ignores the result deliberately. There is no optimistic-update poll: the optimistic head comes from each finality update's attested header.</p>
+
+  <h4>Verification before trust: bootstrap</h4>
+  <x-code src="myotis-net/src/sync.rs" from="2688" to="2714"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async ownership</x-tags> One <code>async move</code> block per candidate, each owning its own client clone, wire bytes, peer id and dial addresses. <code>futures::future::join_all(futures).await</code> waits for <em>every</em> reply. Then the first valid one, in candidate order, wins.</li>
+    <li><x-tags>borrowing iterators-closures</x-tags> <code>let fail = |pool: &amp;mut PeerPool, buf: &amp;mut Vec&lt;String&gt;, id| …</code> takes the pool as a <em>parameter</em> instead of capturing it. A captured <code>&amp;mut pool</code> would stay borrowed for as long as the closure lives, and later code (<code>pool.mark_proven(peer)</code>) could not touch the pool. The closure does capture <code>peers</code>, but only by shared reference, which does not conflict with anything below.</li>
+  </ul>
+  <x-code src="myotis-net/src/sync.rs" from="2751" to="2758"></x-code>
+  <x-code src="myotis-net/src/sync.rs" from="2785" to="2808"></x-code>
+  <p class="code-note"><x-tags>domain error-handling</x-tags> "The peer chose the payload, WE chose the root." The bootstrap header must hash to the embedded checkpoint root. Then <code>processor.verify_bootstrap</code> (new since September; the branches used to be checked inline here) checks that the shape matches the header's fork, that the current sync committee is in the header's state, and that the execution branch binds the execution data to the body, each at the generalized index of the header's fork, so Gloas is covered. It returns <code>Result&lt;(), BootstrapReject&gt;</code>; <code>if let Err(reason) = …</code> handles only the failure. Only after all of that does the peer earn credit (<code>mark_proven</code>, <code>note_served</code>). Credit always follows verification, never mere delivery.</p>
+
+  <h4>The catch-up pipeline</h4>
+  <x-code src="myotis-net/src/sync.rs" from="3141" to="3157"></x-code>
+  <x-code src="myotis-net/src/sync.rs" from="3373" to="3380"></x-code>
+  <x-code src="myotis-net/src/sync.rs" from="3446" to="3458"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async smart-pointers lifetimes</x-tags> <code>FuturesUnordered&lt;BoxFuture&lt;'static, Answer&gt;&gt;</code> is a set of futures that yields each result as soon as it finishes. <code>BoxFuture</code> is <code>Pin&lt;Box&lt;dyn Future&lt;Output = Answer&gt; + Send + 'static&gt;&gt;</code>: a heap-allocated future whose concrete type is erased, so the set's element type can be written down in the declaration, long before the first push. <code>'static</code> forces each future to <em>own</em> its client clone, peer and wire bytes; it may not borrow the pool. The pin gives the future a fixed heap address, which an async state machine that may borrow from itself needs once it has been polled.</li>
+    <li><x-tags>async</x-tags> <code>tokio::select!</code> races "next answer" against "the earliest per-peer quota refill". If the timer wins, the <code>next()</code> future is dropped, but the requests stay inside <code>in_flight</code>, so nothing is lost; <code>continue</code> goes back to the top-up. <code>let Some(…) = next else { continue };</code> destructures the 5-tuple answer.</li>
+    <li><x-tags>domain</x-tags> The pipeline keeps at most 32 asks outstanding, at most 4 of them batch asks of up to 128 periods. Lighthouse-class peers (one update per 10 s each) each get a different look-ahead period, while the prefix period is asked at least twice. Out-of-order answers are staged with up to 3 alternates per period, and the pipeline backs off 5→10→20→25 s after idle waves. A peer whose multi-period answer applies two or more periods is promoted to "batch server" and leads selection afterwards.</li>
+  </ul>
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments</span>
+    <p>The comment on <code>in_flight</code> (lines 3150–3151) says it is "Boxed because each top-up's async block is its own anonymous type." That is not quite how the type system works. Each <code>async</code> block <em>in the source</em> has its own type, but every future one source location creates, however many loop iterations run it, has that same type. <code>catch_up</code> has a single push site (line 3375), so an inferred <code>FuturesUnordered&lt;_&gt;</code> would compile, as it does in <code>poll_finality</code>. The box is a choice (a nameable type, room for a second push site later), not a requirement.</p>
+  </div>
+  <x-code src="myotis-net/src/sync.rs" from="3424" to="3431"></x-code>
+  <p class="code-note"><x-tags>async borrowing</x-tags> When every server is inside its quota window and the walk is slow, the wait itself is used to look for more servers. <code>tokio::join!</code> polls both futures on <em>this</em> task until both finish. <code>hunt_round</code> borrows <code>pool</code>, <code>processor</code> and <code>clcache</code> mutably; <code>sleep</code> borrows nothing, so there is no conflict. Two futures that both wanted <code>&amp;mut pool</code> would not compile. <code>timeout</code> drops the hunt future at the deadline; results it already recorded stay recorded.</p>
+  <x-code src="myotis-net/src/sync.rs" from="3584" to="3634"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain</x-tags> <code>apply_staged_step</code> verifies at most one update, the one for the store's current period, trying the leader and then each alternate. Each applied period is credited to the peer whose response <em>staged</em> it (<code>applied_from</code>), and each rejected copy is charged to whoever served it, found by its cache key.</li>
+    <li><x-tags>borrowing</x-tags> <code>publish_status(…, &amp;*pool, …)</code>: <code>pool</code> is a <code>&amp;mut PeerPool</code> here, and <code>publish_status</code> wants <code>&amp;PeerPool</code>. <code>&amp;*pool</code> reborrows it as shared for the duration of the call. (Writing <code>pool</code> would also work, through implicit coercion; the explicit form makes it visible.)</li>
+    <li><x-tags>async</x-tags> <code>tokio::task::yield_now().await</code> hands the worker thread back to the scheduler between BLS verifications, so a long drain does not starve the swarm task that shares the runtime.</li>
+  </ul>
+  <x-code src="myotis-net/src/sync.rs" from="3785" to="3805"></x-code>
+  <p class="code-note"><x-tags>ownership iterators-closures</x-tags> <code>staged.remove(&amp;target_period)</code> returns the <code>StagedChunk</code> by value: the map no longer owns it. <code>std::iter::once((chunk.ssz, chunk.fork, chunk.from)).chain(chunk.alternates)</code> then moves the struct's fields out one by one (a <em>partial move</em>, allowed because <code>StagedChunk</code> has no <code>Drop</code> impl) and chains the leader in front of the alternates, so one <code>for</code> loop tries them in order. <code>let Some(chunk) = … else { return … };</code> is <code>let-else</code>: bind or leave.</p>
+
+  <h4>Finality polling</h4>
+  <x-code src="myotis-net/src/sync.rs" from="3887" to="3917"></x-code>
+  <x-code src="myotis-net/src/sync.rs" from="3947" to="3999"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async error-handling</x-tags> <code>while let Some((peer, res)) = in_flight.next().await</code> consumes answers in completion order. <code>break</code> on the first advance drops the remaining futures, so their replies are no longer awaited. Here the futures are not boxed: they all come from one <code>map</code> closure, so they share one anonymous type, and <code>FuturesUnordered&lt;_&gt;</code> lets the compiler infer it.</li>
+    <li><x-tags>enums-patterns domain</x-tags> <code>FinalityOutcome</code> is new: <code>Advanced</code> (verified and moved the store), <code>Stale</code> (verified but not newer), <code>Rejected</code>. A stale answer is not a win, so the round keeps reading and a hunting loop may still probe this cycle. It is not a strike either: it sets <code>verified</code>, which confirms a resumed snapshot and spares the round's losers.</li>
+    <li><x-tags>domain</x-tags> The round-scoped failure buffer is a lesson from a real device: striking all 15 speculative losers every slot emptied the peer cache of every proven server (<code>peers=209, catch_up_servers=0</code>). Now the shared cache strikes them only when nothing verified at all.</li>
+  </ul>
+  <x-code src="myotis-net/src/sync.rs" from="3663" to="3693"></x-code>
+  <p class="code-note"><x-tags>smart-pointers</x-tags> <code>HuntState</code> is owned by the loop and lent to <code>catch_up</code>. Its <code>boost</code> is the same <code>Arc&lt;AtomicBool&gt;</code> the discovery task holds, so <code>set_hunting</code> is the single place where the loop's view and discovery's lookup cadence change together.</p>
+
+  <h4>Publishing and the SYNCED gate</h4>
+  <x-code src="myotis-net/src/sync.rs" from="4209" to="4225"></x-code>
+  <p class="code-note"><x-tags>enums-patterns domain</x-tags> <code>update_exec_anchor</code> is the CL→EL trust bridge. A match guard (<code>Payload(e) if e.block_hash != [0u8; 32]</code>) tests the variant and a condition at once; a zero block hash (pre-Merge or absent) falls through to <code>_ =&gt; {}</code>. <code>e</code> is a <code>&amp;Box&lt;ExecutionPayloadHeader&gt;</code>, and <code>e.block_hash</code> auto-dereferences through both. Gloas headers carry only the execution block hash (<code>HeaderExecution::BlockHash</code>), so the anchor records it as pending until the EL fetches the header whose hash it is. The optimistic header is fed the same way in lines 4226–4243.</p>
+  <x-code src="myotis-net/src/sync.rs" from="4246" to="4268"></x-code>
+  <x-code src="myotis-net/src/sync.rs" from="4301" to="4321"></x-code>
+  <x-code src="myotis-net/src/sync.rs" from="4349" to="4386"></x-code>
+  <ul class="concepts">
+    <li><x-tags>domain</x-tags> SYNCED means the store is initialized, the wall-clock period equals the store period, and the finalized slot is within 5 epochs of the wall slot (32 minutes on mainnet, about 7 minutes on Gnosis). From Gloas on, <code>feed_exec_anchor</code> adds one more condition: the anchor's own finality, which needs the EL header resolved, must be within the same slack. The verdict is written into the anchor too (<code>set_finality_current</code>), so the EL log index can tell a restored finality from a current one.</li>
+    <li><x-tags>async</x-tags> <code>publish_status</code> is <code>async</code> only because it asks the swarm task for the peer count. <code>let _ = status_tx.send(status);</code> ignores the error that occurs when every receiver is gone.</li>
+  </ul>
+
+  <h4>Two borrow-checker details in the pool</h4>
+  <x-code src="myotis-net/src/sync.rs" from="1750" to="1761"></x-code>
+  <p class="code-note"><x-tags>borrowing</x-tags> <strong>Non-lexical lifetimes and disjoint fields.</strong> <code>n</code> is a <code>&amp;mut u32</code> into <code>self.fail_counts</code>. Reading <code>self.proven</code> while <code>n</code> is alive is fine, because the borrow checker tracks fields separately. <code>self.evict(&amp;id)</code> needs all of <code>self</code>, and it compiles because <code>n</code>'s borrow ended at its last use in the <code>if</code> condition. <code>PeerId</code> is <code>Copy</code>, so <code>id</code> survives being passed to <code>entry(id)</code>.</p>
+  <x-code src="myotis-net/src/sync.rs" from="1512" to="1524"></x-code>
+  <p class="code-note"><x-tags>borrowing enums-patterns</x-tags> New since September: QUIC. A peer may advertise a QUIC address beside its TCP one, and the spec says to dial QUIC first. <code>if let Some(quic) = &amp;self.quic</code> borrows the <code>Option</code>'s content instead of moving it out of <code>&amp;self</code>; <code>quic.clone()</code> then makes the owned <code>Multiaddr</code> the <code>Vec</code> needs. <code>self.quic.as_ref() != Some(&amp;self.addr)</code> compares <code>Option&lt;&amp;Multiaddr&gt;</code> values without cloning, so a QUIC-only peer is not dialed twice.</p>
+
+  <h4>A test</h4>
+  <x-code src="myotis-net/src/sync.rs" from="4443" to="4467"></x-code>
+  <p class="code-note"><x-tags>testing smart-pointers</x-tags> The test proves the sharing claim from the top of this entry: it stores into <code>config.ws_policy</code> and reads the change through <code>clone</code>. <code>#[test]</code> functions inside <code>mod tests</code> (under <code>#[cfg(test)]</code>) can reach the module's private items, such as <code>PeerPool</code> or <code>hunt_due</code>, through <code>use super::*</code>.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/src/cl_fork_watch.rs" kind="library" twin="networking.discv5.ClForkWatch">
+  <p class="purpose">New since September. A stale-software detector for the consensus layer, the CL twin of <code>el/fork_watch.rs</code> (same vote rules and constants, shared test vectors). It watches what consensus peers advertise and raises an advisory when the network has scheduled, or already activated, a fork that this build's <code>ForkSchedule</code> does not carry. It is advisory only: nothing in verification reads it. A wrong advisory is a banner in the UI, never a wrong answer.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–49</td><td>Module doc: the two kinds of evidence (Announced, Placed), the vote, the time rules.</td></tr>
+      <tr><td>51–88</td><td>Imports, <code>FAR_FUTURE_EPOCH</code>, <code>source_of</code> (the EL watch's vote key), <code>merge_advisories</code>.</td></tr>
+      <tr><td>90–135</td><td>Observation types, <code>Inner</code> (the mutable state), <code>Vote</code>, the <code>ClForkWatch</code> struct and a hand-written <code>Debug</code>.</td></tr>
+      <tr><td>137–305</td><td><code>new</code> (precomputes every digest the schedule can produce), <code>observe_enr</code> / <code>observe_status</code> and their <code>_at</code> twins, <code>advisory</code> / <code>evaluate</code>, and <code>update</code>, which mutates, re-evaluates and logs on change.</td></tr>
+      <tr><td>307–338</td><td>Clock helpers: wall epoch, activation time with a 400-day horizon, known transitions.</td></tr>
+      <tr><td>340–527</td><td><code>evaluate_locked</code>: age out, pass 1 (ENR votes), pass 2 (place bare digests), tally, rank, decide phase and fork id.</td></tr>
+      <tr><td>530–554</td><td><code>evict_oldest</code> (the 512-source bound), <code>same_fork</code>.</td></tr>
+      <tr><td>556–1055</td><td>20 tests on Sepolia's real Fulu→Gloas transition, run against a "pre-Gloas build" schedule with Gloas removed; one test checks the constants against <code>testdata/lc/fork_watch/params.txt</code>, which the Java twin's test reads too.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Some domain first. Each consensus client advertises an <code>eth2</code> field in its discv5 ENR: the 4-byte <em>fork digest</em> of its current fork (a truncated hash of the fork version, the genesis validators root and, since Fulu, the blob parameters), the version of the <em>next</em> fork it knows about, and that fork's activation epoch (or <code>FAR_FUTURE_EPOCH</code> for none). A Status message carries only the digest. From that, the watch collects two kinds of evidence. <strong>Announced</strong>: a peer on one of our digests names a next-fork epoch our schedule does not know. <strong>Placed</strong>: a peer on a digest we do not know, whose advertised version reproduces that digest under our genesis root and is newer than ours, so it is on a later fork of this chain. A bare digest (a Status) can also be placed against a version some other source announced.</p>
+
+  <h4>Connected to the sync loop by two feeds and one reader</h4>
+  <x-code src="myotis-net/src/discovery.rs" from="599" to="611"></x-code>
+  <x-code src="myotis-net/src/reqresp.rs" from="2002" to="2013"></x-code>
+  <x-code src="myotis-engine/src/host.rs" from="1196" to="1215"></x-code>
+  <ul class="concepts">
+    <li><x-tags>smart-pointers domain</x-tags> <strong>Who owns it.</strong> The engine host keeps one <code>Arc&lt;ClForkWatch&gt;</code> per handle in a <code>Mutex&lt;HashMap&lt;i64, Arc&lt;ClForkWatch&gt;&gt;&gt;</code> and puts a clone into the <code>ChainConfig</code> at every spin-up. <code>entry(handle).or_insert_with(…)</code> creates it only the first time, so a pause and resume keeps the evidence. <code>SyncHandle::start</code> hands clones to the swarm task and the discovery task. At status time the host calls <code>advisory()</code> and merges it with the EL watch's.</li>
+    <li><x-tags>enums-patterns</x-tags> Both feeds are short <code>let-else</code> chains. <code>let Some(watch) = watch else { return };</code> turns <code>&amp;Option&lt;Arc&lt;…&gt;&gt;</code> into <code>&amp;Arc&lt;…&gt;</code> through match ergonomics. In <code>note_peer_status</code>, <code>if let (Some(watch), Some((ip, _))) = (…, …)</code> matches two options at once. The discovery feed reads routing-table entries only, never records relayed in NODES responses: a table entry held a session with us at its address, while a relayed record costs its author nothing.</li>
+    <li><x-tags>domain</x-tags> The vote key is the source <em>network</em> (IPv4 /24, IPv6 /48), not the node id, because node ids are free to mint. One host's EL and CL records count as the same source in both detectors.</li>
+  </ul>
+
+  <h4>Interior mutability and a scoped lock</h4>
+  <x-code src="myotis-net/src/cl_fork_watch.rs" from="116" to="127"></x-code>
+  <x-code src="myotis-net/src/cl_fork_watch.rs" from="274" to="305"></x-code>
+  <ul class="concepts">
+    <li><x-tags>interior-mutability concurrency</x-tags> Every method takes <code>&amp;self</code>, because the watch is shared behind an <code>Arc</code> by three tasks and the host. The mutable part sits in <code>inner: Mutex&lt;Inner&gt;</code>; the configuration fields beside it are never written after <code>new</code>, so they need no lock. This is the Rust shape of a Java class whose mutable fields are all guarded by one <code>synchronized</code> lock.</li>
+    <li><x-tags>concurrency borrowing</x-tags> <strong>The lock is held only inside the inner block.</strong> <code>let Ok(mut inner) = self.inner.lock() else { return; };</code> takes the guard. It is dropped at the block's closing brace, before the <code>match current</code> that logs. Logging under the lock would make every other observer wait for the log sink. A poisoned lock (a panic while it was held) silently skips the update; <code>evaluate</code> returns <code>None</code> in that case through <code>.ok()?</code>.</li>
+    <li><x-tags>iterators-closures traits-generics</x-tags> <code>mutation: impl FnOnce(&amp;mut Inner)</code> lets <code>observe_enr_at</code> and <code>observe_status_at</code> pass in their own change as a closure, which is called exactly once. <code>mutation(&amp;mut inner)</code> passes a <code>&amp;mut MutexGuard&lt;Inner&gt;</code>, which deref coercion turns into the <code>&amp;mut Inner</code> the closure expects.</li>
+    <li><x-tags>ownership</x-tags> <code>inner.last_logged = current;</code> followed by returning <code>current</code> would be a use after move for most types. It compiles because <code>Advisory</code> derives <code>Copy</code>, and so <code>Option&lt;Advisory&gt;</code> is <code>Copy</code> too.</li>
+  </ul>
+
+  <h4>The vote</h4>
+  <x-code src="myotis-net/src/cl_fork_watch.rs" from="340" to="363"></x-code>
+  <p class="code-note"><x-tags>lifetimes borrowing iterators-closures</x-tags> <code>retain</code> needs <code>&amp;mut</code> access to the maps, so it runs first. After that the function only reads. <code>votes: BTreeMap&lt;&amp;str, Vote&gt;</code> borrows its keys from the <code>String</code>s in <code>inner.enr_by_source</code> and <code>inner.status_by_source</code>: no string is copied, and the compiler ensures <code>votes</code> does not outlive <code>inner</code>. Calling <code>retain</code> again while <code>votes</code> is alive would not compile. The closure <code>newer_self_consistent</code> captures <code>self</code> and <code>current_version</code> by reference. <code>BTreeMap</code> rather than <code>HashMap</code> gives a fixed iteration order, so a tie resolves the same way on every evaluation and in both engines.</p>
+  <x-code src="myotis-net/src/cl_fork_watch.rs" from="480" to="512"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics</x-tags> <code>rank</code> returns a tuple. Tuples implement <code>Ord</code> lexicographically when every element does, <code>false &lt; true</code> for <code>bool</code>, and <code>std::cmp::Reverse</code> flips one element's order. One <code>&gt;</code> therefore encodes the whole tie-break list from the comment: more support, then more placed peers, a known epoch, the earliest epoch, and the lowest version.</li>
+    <li><x-tags>domain</x-tags> An advisory needs at least <code>MIN_PEERS</code> (3) sources behind one fork <em>and</em> more of them than sources on our chain that announce nothing unknown. It is <code>Active</code> once its activation time has passed or three sources were placed on it, else <code>Scheduled</code>. <code>best.is_none_or(…)</code> (a recent <code>Option</code> method) reads "no best yet, or this one ranks higher".</li>
+  </ul>
+  <x-code src="myotis-net/src/cl_fork_watch.rs" from="75" to="88"></x-code>
+  <p class="code-note"><x-tags>enums-patterns</x-tags> <code>merge_advisories</code> matches a tuple of two options. <code>(None, cl) =&gt; cl</code> binds the second element whatever it is, so the first two arms cover every case where at least one side is <code>None</code>; only <code>(Some, Some)</code> reaches the ranking. The ranking reuses the tuple trick: active beats scheduled, a known time beats an unknown one, then more peers, and on a full tie the EL advisory wins.</p>
+</x-file>
+
+<section class="prose">
+  <h2>The examples</h2>
+  <p><code>examples/*.rs</code> are extra executables that Cargo discovers automatically; run one with <code>cargo run -p myotis-net --example live_sync</code>. Each is compiled as its own crate that links the library. It sees only <code>pub</code> items (which is why several re-implement the private <code>parse_static_peer</code>) and may use dev-dependencies such as <code>tracing-subscriber</code>. <code>cargo test</code> builds examples but does not run them. Every example now accepts <code>chiado</code> as a network.</p>
+</section>
+
+<x-file path="rust/myotis-net/examples/live_sync.rs" kind="example binary">
+  <p class="purpose">The smallest complete user of the public API. It picks a chain from <code>NET</code>, starts a <code>SyncHandle</code>, and logs the status whenever it changes. With <code>--once</code> it exits 0 at SYNCED, or 1 after a 1500 s budget (<code>ONCE_BUDGET</code>). <code>roost</code>'s README uses it to test a candidate server.</p>
+  <x-code src="myotis-net/examples/live_sync.rs" from="51" to="80"></x-code>
+  <ul class="concepts">
+    <li><x-tags>async macros cli</x-tags> <code>#[tokio::main]</code> turns <code>async fn main</code> into a real <code>main</code> that builds a runtime, which <code>SyncHandle::start</code> requires. The <em>binary</em> installs the log subscriber; the library only emits events.</li>
+    <li><x-tags>ownership</x-tags> <code>last_status.as_ref() != Some(&amp;s)</code> compares without moving, then <code>s.clone()</code> keeps a copy, because <code>s</code> is still needed below.</li>
+    <li><x-tags>ownership</x-tags> <code>handle.stop().await</code> <em>moves</em> the handle inside a <code>loop</code>. Normally that fails with "value moved here, in previous iteration of loop". It compiles because <code>std::process::exit</code> returns the never type <code>!</code>, so no later iteration can reach the moved handle.</li>
+  </ul>
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments</span>
+    <p>The header (lines 9–14) says SYNCED means "finalized within a couple of epochs of wall clock"; the gate is 5 epochs (<code>SYNCED_SLOT_SLACK_EPOCHS</code>). It also says the sync "staggers disjoint sub-ranges across the fan-out", but <code>catch_up</code>'s own doc records that the disjoint-range experiment was dropped: the prefix period is asked redundantly and only look-ahead periods are spread.</p>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-net/examples/probe_updates.rs" kind="example binary">
+  <p class="purpose">A diagnostic: start a bare libp2p host with the same pre-bootstrap Status, and ask each pinned mainnet peer in turn for <code>updates_by_range(checkpoint period, 16)</code>, logging wire bytes, chunk count, chunk sizes and timing. It has no sync loop and no discovery. It still hard-codes <code>8192</code> slots per period instead of calling <code>slots_per_period()</code> (correct on mainnet, the only network it uses), and the old batch size of 16 where the loop now asks up to 128.</p>
+  <x-code src="myotis-net/examples/probe_updates.rs" from="58" to="81"></x-code>
+  <p class="code-note"><x-tags>async error-handling</x-tags> Calling the <code>async fn request_raw</code> only <em>creates</em> a future. The single <code>.await</code> on <code>timeout(…)</code> drives both. If 60 s pass first, the inner future is dropped. The result is nested (<code>Result&lt;Result&lt;Vec&lt;u8&gt;, RequestError&gt;, Elapsed&gt;</code>), hence the three arms <code>Ok(Ok(raw))</code>, <code>Ok(Err(e))</code> and <code>Err(_)</code>. <code>let Some(peer) = peer else { continue };</code> skips pins without a <code>/p2p/</code> id.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/examples/lc_crawl.rs" kind="example binary">
+  <p class="purpose">A one-shot census of light-client <em>finality</em> servers. It crawls the discv5 DHT for 420 s (<code>CRAWL_SECS</code>), probes every fork-matched peer (pinned first) with a finality request, at most 24 (<code>PROBES</code>) at a time, and prints a verdict histogram plus each server's finalized-slot age and round-trip time. <code>NET</code> defaults to sepolia. Answers are now decoded in the right wire format for Gloas through <code>lc_fork_of_chunk</code>.</p>
+  <x-code src="myotis-net/examples/lc_crawl.rs" from="118" to="145"></x-code>
+  <ul class="concepts">
+    <li><x-tags>concurrency smart-pointers</x-tags> <code>sem.acquire_owned()</code> on an <code>Arc&lt;Semaphore&gt;</code> returns a permit that borrows nothing, so it can live inside a spawned task. <code>let _permit = …</code> keeps it until the task ends. <code>let _ = …</code> would drop it immediately and limit nothing.</li>
+    <li><x-tags>async ownership</x-tags> One clone per spawned task (client, semaphore, result sender, wire, config), moved in by <code>async move</code>: a <code>'static</code> task cannot borrow what the closure captured. Each task sends on its own <code>res_tx</code> clone into a single receiver.</li>
+    <li><x-tags>borrowing iterators-closures</x-tags> <code>seen</code> and <code>spawned</code> are closure <em>parameters</em>, not captures, so the loop can still read them later. <code>seen.insert(key)</code> moves the <code>String</code> into the set and returns <code>false</code> for duplicates.</li>
+    <li><x-tags>domain</x-tags> Finality requests carry an <em>empty</em> body. <code>encode_request(&amp;[])</code> would add a stray length byte that strict servers reject.</li>
+  </ul>
+  <p class="code-note"><x-tags>async</x-tags> In the crawl loop below the excerpt, the <code>select!</code> arm <code>Some(r) = res_rx.recv()</code> uses a pattern: if <code>recv()</code> yields <code>None</code>, that arm is disabled for the rest of that <code>select!</code> call instead of matching.</p>
+</x-file>
+
+<x-file path="rust/myotis-net/examples/period_census.rs" kind="example binary">
+  <p class="purpose">An operator tool: does anyone serve a plausible update for period N? Every peer gets <code>updates_by_range(PERIOD, 1)</code>. Each answer is read the way the catch-up reads it, up to but not including BLS: error answers are filed by result code, an update attested outside the period is <code>wrong-period</code>, one whose headers are in the wrong fork's shape is <code>wrong-fork-shape</code>, and the rest are compared with the 2/3 participation bar (342 of 512). Answers are also grouped by the client name Identify reported, which separates "one release refuses this fork" from "a few sick nodes". Pinned peers are asked first, one at a time, with a retry after 11 s. CLAUDE.md's release step 3a and <code>tests/live_pins_alive.rs</code> point here for a re-census. Grew from 422 to 649 lines since September, mostly for Sepolia's Gloas fork.</p>
+  <x-code src="myotis-net/examples/period_census.rs" from="120" to="136"></x-code>
+  <p class="code-note"><x-tags>enums-patterns</x-tags> An exhaustive <code>match</code> on <code>&amp;Verdict</code>, like Kotlin's <code>when</code> on a sealed class. Match ergonomics bind <code>bits</code> as <code>&amp;u64</code>, hence <code>*bits</code>. The guarded arm must come first, since arms are tried in order. <code>Serves(..)</code> ignores all fields. Returning <code>&amp;'static str</code> works because the literals live for the whole program; <code>error_bucket(*code)</code> returns one too.</p>
+  <x-code src="myotis-net/examples/period_census.rs" from="404" to="429"></x-code>
+  <p class="code-note"><x-tags>ownership</x-tags> <code>std::mem::replace(&amp;mut ask, retry)</code> stores the retry result and hands back the old value in one step. With a plain local, <code>let first = ask; ask = retry;</code> would work too. <code>mem::replace</code> is <em>required</em> when all you hold is a <code>&amp;mut</code>, because you cannot move a value out through a reference without putting something back. <code>let (verdict, secs) = ask;</code> then destructures the tuple and moves both parts into the <code>Probed</code> record.</p>
+  <x-code src="myotis-net/examples/period_census.rs" from="447" to="457"></x-code>
+  <p class="code-note"><x-tags>concurrency ownership</x-tags> Compare with <code>lc_crawl</code>'s <code>let _permit</code>. Here the permit is named <code>permit</code> and released early with <code>drop(permit)</code>, because the Identify poll that follows needs only the swarm, not a probe slot. <code>drop</code> is an ordinary function that takes ownership and lets the value go out of scope. Line 316 shows a related rule: in <code>match std::env::var("NET").unwrap_or_default().trim() { … }</code> the temporary <code>String</code> lives until the end of the <code>match</code>, so borrowing it with <code>trim()</code> is fine.</p>
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments</span>
+    <p>The header (lines 43–46) still says reqresp "keys its outbound bookkeeping by request id alone", which is why pins are probed one at a time and why the crawl's negative buckets should be read with care. <code>reqresp.rs</code> now keys pending requests by <code>(protocol, id)</code> (its lines 1364–1372), so that caveat no longer applies; sequential pin probing still gives each pin a clean line. Also, the variable <code>finality_wire</code> (line 382) holds an <code>updates_by_range</code> request; the name was copied from <code>lc_crawl</code>.</p>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-net/examples/enr_lookup.rs" kind="example binary">
+  <p class="purpose">A <code>roost</code> operator tool that checks inbound UDP. A node only gets into third-party routing tables after those nodes complete an inbound endpoint proof, so if other nodes return the target's ENR, inbound UDP works. It seeds the chain's bootstrap ENRs (skipping the target itself, since a self-answer proves nothing), runs 5 <code>find_node</code> rounds 10 s apart, and prints <code>FOUND</code> (exit 0). On failure it runs a direct FINDNODE against the target's advertised endpoint as a diagnostic, deliberately last so it cannot affect the verdict, then prints <code>NOT FOUND</code> (exit 1). The only change since September is the <code>chiado</code> option.</p>
+  <x-code src="myotis-net/examples/enr_lookup.rs" from="18" to="30"></x-code>
+  <p class="code-note"><x-tags>enums-patterns cli traits-generics</x-tags> A <code>match</code> on a tuple of two <code>Option&lt;String&gt;</code>s, where <code>n</code> and <code>t</code> take ownership of the strings. The fallback arm ends in <code>exit(2)</code>, whose type <code>!</code> fits any type. <code>Enr&lt;CombinedKey&gt;</code> is a generic type, and <code>target.parse()</code> infers what to parse into from the annotation. The verdict goes to stdout (<code>println!</code>) and progress to stderr (<code>eprintln!</code>).</p>
+</x-file>
+
+<x-quiz>[
+  {"id":"sync-q1","type":"mcq","tags":["smart-pointers","interior-mutability","concurrency"],
+   "q":"The host calls “accept stale anchor” <em>after</em> <code>run_sync</code> received its own clone of <code>ChainConfig</code>. How does the parked loop notice?",
+   "options":["It does not; the loop must be restarted","Through <code>LocalStatus</code>","<code>ws_policy</code> is an <code>Arc&lt;WsPolicy&gt;</code>; cloning the config only copied the pointer, so both copies share the same <code>AtomicBool</code>, which the loop re-reads every second","The host sends a message on the watch channel"],
+   "answer":2,
+   "explain":"A <code>Clone</code> struct can contain shared parts. The atomics give lock-free, cross-thread visibility, like a Java <code>volatile</code> field. The test <code>ws_gate_staleness_and_bound_precedence</code> checks exactly this through a clone."},
+  {"id":"sync-q2","type":"open","tags":["ownership","borrowing","concurrency","async"],
+   "q":"Bootstrap, catch-up and finality polling all fire many network requests concurrently, yet <code>PeerPool</code> and <code>LightClientProcessor</code> are plain structs without any <code>Mutex</code>. Explain why this is safe.",
+   "model":"Only the <code>run_sync</code> task owns them, and it lends them to helpers as <code>&amp;mut</code>. The concurrent requests are <em>futures</em> that the same task polls (<code>join_all</code>, <code>FuturesUnordered</code>, <code>select!</code>). Each future owns only a cloned <code>ReqRespClient</code>, the peer and the wire bytes, never a reference to the pool or the processor (the <code>'static</code> bound on <code>BoxFuture</code> enforces this in <code>catch_up</code>). Responses are handled one at a time in the task's loop, with exclusive <code>&amp;mut</code> access. The borrow checker guarantees there is never a second mutable accessor, so no lock is needed. Concurrency comes from interleaved futures on one task, not from threads sharing memory.",
+   "points":["single owner: the run_sync task, which lends the state as &mut","request futures capture only clones (client, peer, bytes), not the pool or processor","responses are processed sequentially by the owner as futures complete","compiler-enforced exclusivity replaces locks; the concurrency is interleaved futures, not threads sharing memory"],
+   "context":"myotis-net/src/sync.rs: run_sync owns PeerPool, LightClientProcessor, ClPeerCache, staged updates, HuntState; try_bootstrap uses join_all over async move blocks capturing client clones (L2688-2714); catch_up uses FuturesUnordered&lt;BoxFuture&lt;'static, Answer>> (L3141-3157, push at L3373-3380); poll_finality uses FuturesUnordered (L3887-3917)."},
+  {"id":"sync-q3","type":"mcq","tags":["async","lifetimes","smart-pointers"],
+   "q":"<code>catch_up</code> declares <code>in_flight: FuturesUnordered&lt;BoxFuture&lt;'static, Answer&gt;&gt;</code> and pushes <code>Box::pin(async move { … })</code> blocks that each own a <code>client.clone()</code>, the peer and the wire bytes. What does the <code>'static</code> bound force, and why?",
+   "options":["Each future must live for the whole program","Each future may not borrow anything from <code>catch_up</code>'s stack (such as <code>pool</code>); it must own what it uses, because the set outlives any single top-up and the pool is mutated while the requests are in flight","The futures must be <code>Copy</code>","The futures run on separate threads and need <code>Sync</code>"],
+   "answer":1,
+   "explain":"<code>'static</code> on a type means it contains no non-<code>'static</code> borrows, not that the value lives forever. The <code>move</code> makes each block own its clones. If a request future borrowed <code>pool</code>, the loop could not take <code>&amp;mut pool</code> to process answers while the request was still in the set."},
+  {"id":"sync-q4","type":"mcq","tags":["ownership","async"],
+   "q":"<code>pub async fn stop(self)</code> runs <code>for task in &amp;self.tasks { task.abort(); }</code> and then <code>for task in self.tasks { let _ = task.await; }</code>. Why two different loops?",
+   "options":["Style only","Aborting twice is safer","The first only needs to borrow the handles to signal abort; <code>.await</code> consumes a <code>JoinHandle</code>, so the second must move each handle out of <code>self</code>","The first loop is for discovery tasks"],
+   "answer":2,
+   "explain":"Borrow for what does not consume, move for what does. Moving a field out of <code>self</code> is allowed because <code>SyncHandle</code> implements no <code>Drop</code>."},
+  {"id":"sync-q5","type":"mcq","tags":["smart-pointers","async"],
+   "q":"What does <code>DiscoveryGuard</code> achieve that simply storing the discovery <code>JoinHandle</code> in a local would not?",
+   "options":["Nothing","It restarts discovery after a failure","It makes discovery faster","When <code>run_sync</code> is aborted, its locals are dropped and the guard's <code>Drop</code> aborts the discovery task immediately, freeing its UDP port. A dropped <code>JoinHandle</code> would only detach the task"],
+   "answer":3,
+   "explain":"RAII turns “the sync task was cancelled” into “discovery stops now”. The comment explains why it matters: a fast stop→start on a fixed port would otherwise fail."},
+  {"id":"sync-q6","type":"mcq","tags":["domain","error-handling"],
+   "q":"What must hold before <code>try_bootstrap</code> calls <code>store.initialize(…)</code> with a peer's bootstrap?",
+   "options":["The peer must be pinned","The header's <code>hash_tree_root</code> must equal the embedded checkpoint root, and <code>processor.verify_bootstrap</code> must accept it: shape matching the header's fork, the sync-committee branch, and the execution branch","At least two peers must return the same bootstrap","The bootstrap must be the fastest reply"],
+   "answer":1,
+   "explain":"“The peer chose the payload, WE chose the root.” The checkpoint is a trust anchor, so the peer earns credit (<code>mark_proven</code>) only after these checks. A slot mismatch is only logged, because the root, not the slot, is what is verified."},
+  {"id":"sync-q7","type":"mcq","tags":["borrowing","iterators-closures"],
+   "q":"<code>let fail = |pool: &amp;mut PeerPool, buf: &amp;mut Vec&lt;String&gt;, id: PeerId| { … }</code>. Why is the pool a parameter instead of being captured by the closure?",
+   "options":["A captured <code>&amp;mut pool</code> would stay borrowed for the closure's whole lifetime, blocking later uses like <code>pool.mark_proven(peer)</code>; passing it per call keeps each borrow short","Closures cannot capture mutable references","Parameters are faster","To make the closure <code>Send</code>"],
+   "answer":0,
+   "explain":"A common Rust idiom: pass the mutable state into the closure at each call rather than capturing it, so other code can use it between calls. <code>PeerPool::candidates</code> uses the same trick with its <code>ok</code> closure."},
+  {"id":"sync-q8","type":"open","tags":["domain","error-handling","interior-mutability"],
+   "q":"Explain the weak-subjectivity (STALE_ANCHOR) gate: what attack does it prevent, where in <code>run_sync</code> does it run, and how is it released?",
+   "model":"A light client trusts sync-committee signatures. Once an anchor (checkpoint, snapshot or the committee held in memory) is older than the weak-subjectivity bound, enough validators of that old committee may have exited to sign a forged continuation that still BLS-verifies. So if the anchor's period is more than the effective bound behind the wall-clock period (<code>ws_anchor_stale</code>, 13 periods on mainnet, 3 on Gnosis, a host override if set), the loop refuses to sync and publishes <code>StaleAnchor</code> (fail closed). It runs at entry on the newer of checkpoint and snapshot (re-checking every second), before a re-bootstrap from the checkpoint after a poisoned resume, and in the main loop on the held committee (both re-checking every 5 s). It is released when the host raises the bound or gives per-run consent through the shared <code>WsPolicy</code> atomics (never persisted), or when the task is aborted.",
+   "points":["exited validators of an old committee can sign a forged chain that still verifies","fires when wall period minus anchor period exceeds the effective bound (13 mainnet, 3 gnosis, or the host override)","parks fail-closed in StaleAnchor and publishes that status (entry: every 1 s; pre-bootstrap and in-run: every 5 s)","runs at entry (best of checkpoint and snapshot), before a re-bootstrap, and in-run on the held committee","released by a raised bound or per-run consent through the WsPolicy atomics, or by aborting the task"],
+   "context":"myotis-net/src/sync.rs L40-46 ws_anchor_stale; L143-156 WsPolicy; L679-688 effective_ws_bound_periods; L2296-2341 entry gate (1 s sleep); L2434-2448 pre-bootstrap gate (5 s); L2496-2514 in-run gate (5 s); L4327-4339 publish_stale_anchor. mainnet ws_bound_periods 13, gnosis 3, sepolia 13, chiado 1."},
+  {"id":"sync-q9","type":"open","tags":["ownership","borrowing"],
+   "q":"In <code>run_sync</code>, the entry gate reads the snapshot with <code>persisted_snap.as_ref().map(|s| s.current_sync_committee_period)</code>, and a few lines later the code says <code>if let Some(snap) = persisted_snap { … processor.store.restore(snap); }</code>. Explain what each form does with ownership, and why the gate must use the first.",
+   "model":"<code>as_ref()</code> turns <code>&amp;Option&lt;Snapshot&gt;</code> into <code>Option&lt;&amp;Snapshot&gt;</code>, so the closure sees a reference and copies out one <code>u64</code>; <code>persisted_snap</code> still owns the snapshot afterwards. <code>if let Some(snap) = persisted_snap</code> matches the <code>Option</code> by value and moves the snapshot into <code>snap</code>; <code>restore(snap)</code> then moves it into the store. After that, <code>persisted_snap</code> can no longer be used. If the gate had used <code>persisted_snap.map(…)</code> without <code>as_ref()</code>, it would have consumed the snapshot, and the later resume would not compile (use of a moved value).",
+   "points":["as_ref() borrows: Option&lt;&Snapshot>, only a u64 is copied out","persisted_snap still owns the snapshot after the gate","if let Some(snap) = persisted_snap moves the snapshot out, restore(snap) moves it into the store","without as_ref() the gate would consume the Option and the later resume would be a use of a moved value"],
+   "context":"myotis-net/src/sync.rs L2285-2294 deserialize once into persisted_snap; L2304-2308 gate uses persisted_snap.as_ref().map(|s| s.current_sync_committee_period).unwrap_or(0); L2343-2362 if let Some(snap) = persisted_snap { ... processor.store.restore(snap); resume = ResumeGuard::resumed(); }"},
+  {"id":"sync-q10","type":"mcq","tags":["concurrency","borrowing"],
+   "q":"In <code>ClForkWatch::update</code>, the lock is taken inside an inner block <code>let current = { let Ok(mut inner) = self.inner.lock() else { return; }; … current };</code> and the <code>tracing::warn!</code> calls come after that block. What does that structure achieve?",
+   "options":["It makes the log messages appear in order","The <code>MutexGuard</code> is dropped at the block's closing brace, so logging happens after the lock is released and other observers do not wait on the log sink","It is required because <code>tracing</code> macros cannot be called while a lock is held","It avoids a poisoned lock by unlocking twice"],
+   "answer":1,
+   "explain":"A guard unlocks when it goes out of scope. Ending the scope early is the idiomatic way to keep a critical section short. <code>current</code> can leave the block because <code>Option&lt;Advisory&gt;</code> is <code>Copy</code>; it is not a reference into the locked data."},
+  {"id":"sync-q11","type":"open","tags":["domain","smart-pointers","interior-mutability"],
+   "q":"Describe what <code>cl_fork_watch.rs</code> does and how it connects to <code>sync.rs</code>: who creates and owns the watch, who feeds it with what, who reads it, and what it can and cannot affect.",
+   "model":"It detects that consensus peers have scheduled or activated a fork this build's <code>ForkSchedule</code> does not know, and produces an <code>Advisory</code> (Scheduled or Active). The engine host creates one <code>Arc&lt;ClForkWatch&gt;</code> per handle on first spin-up and keeps it across pause/resume; it puts a clone into <code>ChainConfig::cl_fork_watch</code>. <code>SyncHandle::start</code> hands clones to the swarm task (via <code>HostConfig</code>: every peer Status <code>fork_digest</code>, through <code>observe_status</code>) and to the discovery task (via <code>DiscoveryConfig</code>: every routing-table ENR's <code>eth2</code> field, through <code>observe_enr</code>). <code>run_sync</code> itself never calls it. Votes are one per source network (/24 or /48) and need at least three sources and more than the dissent. The host reads <code>advisory()</code> at status time and merges it with the EL watch's. It is advisory only: verification never reads it, so it can show a banner but cannot change any answer.",
+   "points":["detects an unknown scheduled or active fork from peer advertisements and yields an Advisory","engine host creates one Arc per handle, reused across pause/resume, passed in via ChainConfig.cl_fork_watch","fed by the swarm task (Status fork_digest, observe_status) and the discovery task (routing-table ENR eth2 field, observe_enr); run_sync only threads it","votes keyed by source network, needs 3 sources and more than the dissent","read by the host at status time and merged with the EL advisory; never used by verification"],
+   "context":"myotis-net/src/cl_fork_watch.rs module doc L1-49, update L274-305, evaluate_locked L340-527; sync.rs L221-225 field, L1380-1408 cloned into HostConfig and DiscoveryConfig; discovery.rs L602-611 note_enr; reqresp.rs L2005-2013 note_peer_status; myotis-engine/src/host.rs L1201-1215 cl_fork_watch_for, L1035-1051 merge_advisories at status time."},
+  {"id":"sync-q12","type":"mcq","tags":["enums-patterns","domain"],
+   "q":"In <code>poll_finality</code>, a response comes back <code>FinalityOutcome::Stale</code>: it verified against the held committee but did not advance the store. What does the round do with it?",
+   "options":["Treats it as the round's winner and breaks","Strikes the peer in the shared cache","Sets <code>verified = true</code> and keeps reading: it is not a win (so <code>advanced</code> stays false and a hunt may still run) and not a strike, and it spares the round's losers from cache strikes","Evicts the peer from the pool"],
+   "answer":2,
+   "explain":"Only <code>Advanced</code> breaks the loop and earns <code>mark_proven</code>. <code>verified</code> also confirms a resumed snapshot in <code>run_sync</code> (<code>resume.confirm()</code>), since a stale update proves the committee just as well."},
+  {"id":"sync-q13","type":"open","tags":["concurrency","ownership"],
+   "q":"<code>lc_crawl</code> writes <code>let _permit = sem.acquire_owned().await…;</code> while <code>period_census</code> writes <code>let permit = …;</code> and later <code>drop(permit);</code>. Explain what each does, why <code>let _ = sem.acquire_owned().await…</code> would be a bug, and why <code>acquire_owned</code> rather than <code>acquire</code>.",
+   "model":"A semaphore permit returns its slot when it is dropped. <code>let _permit</code> binds the permit to a named (if unused) variable, so it lives until the end of the task's block: the whole probe holds a slot. <code>let _ =</code> does not bind at all, so the permit is dropped immediately and the semaphore limits nothing. <code>period_census</code> drops the permit explicitly after the probe, because the following Identify poll does not need a probe slot; <code>drop</code> takes ownership and ends the value's life early. <code>acquire_owned</code> works on an <code>Arc&lt;Semaphore&gt;</code> and returns an <code>OwnedSemaphorePermit</code> that borrows nothing, so it can live inside a <code>'static</code> spawned task; <code>acquire</code> returns a permit that borrows the semaphore.",
+   "points":["a permit releases its slot when dropped","let _permit keeps it to the end of the task; let _ = drops it at once, so nothing is limited","drop(permit) releases it early, after the probe, before the Identify poll","acquire_owned on Arc&lt;Semaphore> yields a permit with no borrow, usable in a 'static spawned task"],
+   "context":"myotis-net/examples/lc_crawl.rs L139-140: tokio::spawn(async move { let _permit = sem.acquire_owned().await.expect(\"semaphore\"); ... }); examples/period_census.rs L447-452: let permit = sem.acquire_owned().await...; let (verdict, secs) = probe(...).await; drop(permit); then identify(&client, peer_id).await."},
+  {"id":"sync-q14","type":"open","tags":["async","borrowing"],
+   "q":"In <code>catch_up</code>'s quota wait, the code runs <code>tokio::join!(tokio::time::sleep(wait), tokio::time::timeout(probe_budget, hunt_round(config, client, pool, processor, clcache, …)))</code>. Explain how the two futures run, why the borrow checker accepts <code>hunt_round</code> borrowing <code>pool</code> mutably here, and what happens to the hunt when the budget runs out.",
+   "model":"<code>join!</code> polls both futures concurrently on the current task (no new task, no thread) and completes when both are done, so the wait is at least <code>wait</code> long. Only <code>hunt_round</code> holds borrows of <code>pool</code>, <code>processor</code> and <code>clcache</code> (all <code>&amp;mut</code>, reborrowed from <code>catch_up</code>'s parameters); <code>sleep</code> borrows nothing, so there is no second mutable borrow and the code compiles. Two futures in one <code>join!</code> that both needed <code>&amp;mut pool</code> would be rejected. When <code>probe_budget</code> elapses, <code>timeout</code> drops the <code>hunt_round</code> future; its in-flight probes are abandoned, but whatever it already recorded in the pool, the cache and <code>hunt.probed</code>/<code>hunt.confirmed</code> stays. The borrows end when <code>join!</code> returns, and the result tuple is discarded with <code>let (_, _)</code>.",
+   "points":["join! polls both futures on the same task and finishes when both finish","only hunt_round borrows pool/processor/clcache mutably; sleep borrows nothing, so no conflict","two futures both needing &mut pool in one join! would not compile","timeout drops the hunt future at the budget; results already recorded remain"],
+   "context":"myotis-net/src/sync.rs L3414-3431 in catch_up: hunt.engage_throughput(...); if hunt.throughput_bound { let probe_budget = wait.max(HUNT_PROBE_MIN); let (_, _) = tokio::join!(tokio::time::sleep(wait), tokio::time::timeout(probe_budget, hunt_round(config, client, pool, processor, clcache, &mut hunt.probed, &mut hunt.confirmed))); }"}
+]</x-quiz>

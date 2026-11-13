@@ -1,5 +1,5 @@
 //! RLPx — the TCP transport under the `eth`/`snap` sub-protocols (EL-A4),
-//! twin of the Java `networking.rlpx` package (docs/reimplementation/02 §5).
+//! twin of the Java `networking.rlpx` package (docs/spec/02 §5).
 //!
 //! - [`ecies`] — ECIES for the auth/ack messages (`EciesCodec`).
 //! - [`handshake`] — EIP-8 auth/ack + session-secret derivation (`AuthHandshake`).

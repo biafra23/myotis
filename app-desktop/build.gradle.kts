@@ -4,6 +4,16 @@
 
 import org.gradle.api.tasks.PathSensitivity
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
+import java.nio.file.FileSystems
+import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermissions
+import java.security.MessageDigest
+import java.time.LocalDateTime
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+import java.util.zip.ZipOutputStream
+import java.time.Instant
+import java.time.ZoneOffset
 
 plugins {
     alias(libs.plugins.kotlin.jvm)
@@ -35,6 +45,23 @@ val releaseVersion = project.version.toString().substringBefore('-')  // 0.1.4-S
 //     downgrade, and it only surfaces years later.
 // The +1 rule has no cliff and needs no revisiting at 1.0, so nothing here
 // depends on someone re-reading this comment before the transition.
+// The year of the commit being built, for the installers' copyright line
+// (nativeDistributions below): SOURCE_DATE_EPOCH when the build states it (the
+// release and comparison workflows do), else the commit's own time, and only
+// outside a git checkout the current year. UTC, so the zone of the builder
+// cannot move it across New Year.
+val commitYear: String = run {
+    val epoch = System.getenv("SOURCE_DATE_EPOCH")?.trim()?.toLongOrNull()
+        ?: runCatching {
+            providers.exec {
+                commandLine("git", "log", "-1", "--format=%ct")
+                workingDir = rootDir
+                isIgnoreExitValue = true
+            }.standardOutput.asText.get().trim().toLongOrNull()
+        }.getOrNull()
+    (epoch?.let { Instant.ofEpochSecond(it) } ?: Instant.now()).atZone(ZoneOffset.UTC).year.toString()
+}
+
 val macOsPackageVersion: String = releaseVersion.split('.').let { parts ->
     require(parts.size == 3 && parts.all { it.toIntOrNull() != null }) {
         "Unexpected project version '${project.version}': expected numeric MAJOR.MINOR.PATCH"
@@ -114,6 +141,11 @@ dependencies {
 // so wire the JUnit platform here like :app does.
 tasks.withType<Test> {
     useJUnitPlatform()
+    // Skips as well as failures: several cases here stand down on an assumption
+    // (macOS only; a file mode root can read through), and Gradle's default
+    // prints failed tests only, so a case that stopped running in CI (a job
+    // moved into a container, say) would leave no trace in a green log.
+    testLogging { events("failed", "skipped") }
 }
 
 // Headless check that the Desktop controller drives node-core (no display needed).
@@ -170,7 +202,7 @@ val beePoc: Boolean = flavourFlag("beePoc")
 // The RAILGUN PoC flavour flag (-PrailgunPoc): bundles the mainnet and Sepolia
 // RailgunSmartWallet log-index seeds so the RAILGUN Terminal Wallet can use the
 // app instead of a public RPC provider from the first minute (RailgunPoc.kt,
-// docs/railgun-poc.md). Same accept-or-refuse rule as -PbeePoc.
+// docs/guides/railgun-poc.md). Same accept-or-refuse rule as -PbeePoc.
 val railgunPoc: Boolean = flavourFlag("railgunPoc")
 
 // Exactly one flavour, or none. The two disagree about which network to enable
@@ -316,7 +348,7 @@ val prepareJnaBootLib = tasks.register("prepareJnaBootLib") {
 // ---------------------------------------------------------------------------
 // Bee PoC flavour (-PbeePoc): bundle the Gnosis PostageStamp log-index seed so
 // a Swarm Bee full node can use the app from the first minute (BeePoc.kt;
-// docs/bee-rpc-service.md, "Bee PoC desktop build"). The seed is synthesized
+// docs/guides/bee-rpc-service.md, "Bee PoC desktop build"). The seed is synthesized
 // at build time from the committed data set by scripts/synth_logindex.py and
 // staged into appResources/common/ (Compose flattens common/ next to the
 // os-arch dir) beside a manifest — coverage, expiry, sha256 — that the app
@@ -399,7 +431,7 @@ val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
 // ---------------------------------------------------------------------------
 // RAILGUN PoC flavour (-PrailgunPoc): bundle the RailgunSmartWallet log-index
 // seeds for mainnet AND Sepolia so the RAILGUN Terminal Wallet can be pointed at
-// this app instead of a public RPC provider (RailgunPoc.kt; docs/railgun-poc.md).
+// this app instead of a public RPC provider (RailgunPoc.kt; docs/guides/railgun-poc.md).
 //
 // The seed data is NOT committed, unlike the Bee flavour's. The Bee set is a
 // 3.2 MB gzip (24 MB raw) of ~39k logs; RAILGUN's mainnet one is ~438k logs over 11.4M blocks
@@ -407,7 +439,7 @@ val prepareBeePocSeed = tasks.register("prepareBeePocSeed") {
 // network's fetch from a directory given by a property — -PrailgunSeedDir for
 // mainnet (default ~/myotis-node/railgun), -PrailgunSepoliaSeedDir for Sepolia
 // (default ~/myotis-node/railgun-sepolia) — produced by the fetch described in
-// docs/railgun-poc.md, and fails with that instruction when either is not there.
+// docs/guides/railgun-poc.md, and fails with that instruction when either is not there.
 // A missing seed must never degrade into a silently seedless "RAILGUN PoC" build
 // that then backfills for days.
 // ---------------------------------------------------------------------------
@@ -433,7 +465,7 @@ fun railgunSeedDir(property: String, default: String): File = providers.gradlePr
 
 // `from_block` is the engine's "no logs below here" assertion, so a watch block above
 // the real deployment turns real history into plausible empty answers
-// (docs/railgun-poc.md spells this out).
+// (docs/guides/railgun-poc.md spells this out).
 val railgunSeeds = listOf(
     // The REAL deployment block, and the chain agrees: the proxy's first log is at
     // exactly 14737691 and a sweep from genesis found none below it.
@@ -500,7 +532,7 @@ val prepareRailgunPocSeed = tasks.register("prepareRailgunPocSeed") {
         // minute, and a missing or swapped Sepolia dir should not wait for it to say so.
         val fetches = seeds.map { s ->
             check(s.dir.isDirectory) {
-                "railgun-poc: no ${s.network} seed data at ${s.dir}. Fetch it first (docs/railgun-poc.md, " +
+                "railgun-poc: no ${s.network} seed data at ${s.dir}. Fetch it first (docs/guides/railgun-poc.md, " +
                     "\"Building the seed\"), or point -P${s.dirProperty} at a directory holding the " +
                     "fetch's .jsonl and .meta.json."
             }
@@ -680,6 +712,13 @@ compose.desktop {
             // jpackage builds the deb's Maintainer field as "<vendor> <debMaintainer>",
             // so the human name lives here and debMaintainer stays a bare email.
             vendor = "Dirk Jäckel"
+            // Stated, not left to the packagers' defaults (#734): jpackage writes
+            // "Copyright (C) <the build's year>" into the .deb's copyright file and
+            // the Windows launcher, and the Compose plugin the same into the .app's
+            // Info.plist, from the CLOCK. Two builds on one day agree, and a
+            // rebuild of the same tag next year would not. The year of the
+            // commit instead: the same for every build of it.
+            copyright = "Copyright (C) $commitYear $vendor"
             // Bundle the FULL JDK module graph. jlink otherwise strips the runtime to the
             // modules it can statically detect, but the backend reaches them reflectively —
             // DNS (java.naming), JDBC-style lookups, EC TLS (jdk.crypto.ec), XML, etc. — so a
@@ -737,6 +776,162 @@ compose.desktop {
     }
 }
 
+// === Reproducible app image (#734, Part 5a) ==================================
+// Every installer (dmg, deb, msi) is jpackage'd from createDistributable's app
+// image (the plugin wires the dmg to it; the deb and the msi are wired below),
+// and that image was not reproducible:
+//   - The plugin REWRITES jars into it: the skiko runtime jar on every OS (to
+//     take its native library out) and, on macOS, every jar (to sign the native
+//     libraries inside). Its copyZipEntry builds each entry as
+//     `new ZipEntry(name)`, so ZipOutputStream stamps the wall clock, in local
+//     time; and the skiko jar's file name is a hash of that content.
+//   - jpackage writes the image under the builder's umask.
+// Found by reproducible-builds.yml's two legs. So, before any installer is made:
+// every jar is rewritten with Gradle's own fixed entry time (names, contents,
+// order and compression unchanged), the skiko jar is renamed by the hash of its
+// now-stable content (the plugin's own naming) with the launcher .cfg line that
+// lists it, modes are normalized to 644/755, and on macOS the bundle's ad-hoc
+// signature, which seals the jars, is applied again and verified.
+val reproducibleZipTime: LocalDateTime =
+    LocalDateTime.of(1980, 2, 1, 0, 0) // Gradle's constant for reproducible archives
+
+fun rewriteJarWithFixedTimes(jar: File) {
+    val tmp = File(jar.parentFile, jar.name + ".repro-tmp")
+    ZipFile(jar).use { zin ->
+        ZipOutputStream(tmp.outputStream().buffered()).use { zout ->
+            for (entry in zin.entries()) {
+                val copy = ZipEntry(entry.name).apply {
+                    // setTimeLocal, not setTime: no time-zone conversion, no
+                    // extended-timestamp field.
+                    setTimeLocal(reproducibleZipTime)
+                    comment = entry.comment
+                    extra = entry.extra
+                    method = entry.method
+                    if (entry.method == ZipEntry.STORED) {
+                        size = entry.size
+                        compressedSize = entry.compressedSize
+                        crc = entry.crc
+                    }
+                }
+                zout.putNextEntry(copy)
+                zin.getInputStream(entry).use { it.copyTo(zout) }
+                zout.closeEntry()
+            }
+        }
+    }
+    if (!jar.delete() || !tmp.renameTo(jar)) throw GradleException("could not replace $jar")
+}
+
+// The Compose plugin's name hash: MD5 of the content, each byte as unpadded hex.
+fun composeContentHash(f: File): String =
+    MessageDigest.getInstance("MD5").digest(f.readBytes())
+        .joinToString("") { Integer.toHexString(it.toInt() and 0xff) }
+
+fun normalizeAppImage(root: File, isMac: Boolean, logger: org.gradle.api.logging.Logger) {
+    val jars = root.walkTopDown().filter { it.isFile && it.name.endsWith(".jar") }.toList()
+    jars.forEach(::rewriteJarWithFixedTimes)
+
+    val skiko = Regex("""(skiko-awt-runtime-[a-z0-9-]+?-[0-9][0-9.]*)-[0-9a-f]{20,40}\.jar""")
+    val renamed = mutableMapOf<String, String>()
+    jars.filter { skiko.matches(it.name) }.forEach { jar ->
+        val stable = skiko.matchEntire(jar.name)!!.groupValues[1] + "-" + composeContentHash(jar) + ".jar"
+        if (stable != jar.name) {
+            if (!jar.renameTo(File(jar.parentFile, stable))) throw GradleException("could not rename $jar")
+            renamed[jar.name] = stable
+        }
+    }
+    root.walkTopDown().filter { it.isFile && it.name.endsWith(".cfg") }.forEach { cfg ->
+        var text = cfg.readText()
+        renamed.forEach { (old, new) -> text = text.replace(old, new) }
+        cfg.writeText(text)
+    }
+
+    // POSIX modes where the file system has them (not the msi's NTFS image).
+    if (FileSystems.getDefault().supportedFileAttributeViews().contains("posix")) {
+        val dirMode = PosixFilePermissions.fromString("rwxr-xr-x")
+        val fileMode = PosixFilePermissions.fromString("rw-r--r--")
+        root.walkTopDown().forEach { f ->
+            val p = f.toPath()
+            if (Files.isSymbolicLink(p)) return@forEach
+            Files.setPosixFilePermissions(
+                p, if (f.isDirectory || f.canExecute()) dirMode else fileMode,
+            )
+        }
+    }
+
+    if (isMac) {
+        root.listFiles { f -> f.isDirectory && f.name.endsWith(".app") }.orEmpty().forEach { app ->
+            fun run(vararg cmd: String) {
+                val proc = ProcessBuilder(*cmd).redirectErrorStream(true).start()
+                val out = proc.inputStream.bufferedReader().readText()
+                if (proc.waitFor() != 0) throw GradleException("${cmd.joinToString(" ")} failed:\n$out")
+            }
+            // Ad-hoc, as jpackage signed it: no identity is configured (macOS.signing
+            // stays off; notarization is a follow-up), so this restores the same seal.
+            run("codesign", "--force", "--deep", "--sign", "-", app.absolutePath)
+            run("codesign", "--verify", "--deep", "--strict", app.absolutePath)
+        }
+    }
+    logger.lifecycle("reproducible app image: ${jars.size} jars normalized, ${renamed.size} renamed, in $root")
+}
+
+tasks.withType<org.jetbrains.compose.desktop.application.tasks.AbstractJPackageTask>().configureEach {
+    if (targetFormat == TargetFormat.AppImage) {
+        val mac = isMacHost
+        doLast { normalizeAppImage(destinationDir.get().asFile, mac, logger) }
+    }
+    // The plugin packages the dmg from that image, but the deb and the msi from
+    // scratch (`--input`, its own working dir), rewriting the skiko jar again:
+    // the plugin sets appImage only for macOS. Point them at the normalized
+    // image too, so every installer carries the same, reproducible payload
+    // (jpackage builds a deb or an msi from an app image like a dmg).
+    if (targetFormat == TargetFormat.Deb || targetFormat == TargetFormat.Msi) {
+        val image = tasks.named<org.jetbrains.compose.desktop.application.tasks.AbstractJPackageTask>(
+            if (name.contains("Release")) "createReleaseDistributable" else "createDistributable",
+        )
+        dependsOn(image)
+        appImage.set(image.flatMap { it.destinationDir.dir(appName) })
+    }
+    // What the plugin leaves out with an app image, and the deb needs: --icon.
+    // jpackage writes the launcher's .desktop file (and with it the xdg-utils
+    // dependency and the menu registration in postinst) only for a launcher
+    // with an icon of its own or an explicit shortcut, and the plugin passes
+    // --icon only when it builds from scratch. Without this line the deb
+    // installs an app no application menu lists; with it, its contents are
+    // those of the from-scratch deb. (The msi takes its icons from the .ico
+    // files in the image, and its shortcuts from options the plugin passes in
+    // both cases.) Quoted like the plugin's own arguments: they go through an
+    // @argfile.
+    if (targetFormat == TargetFormat.Deb) {
+        freeArgs.addAll(iconFile.map { listOf("--icon", "\"${it.asFile.absolutePath}\"") })
+    }
+    // The umask is an input of the dmg, so it is checked, not assumed: jpackage
+    // creates the .app's directories and its app/.package afresh for the dmg,
+    // with the umask of the process that runs it (775 and 664 under 002), and
+    // nothing can put them right inside the finished image. Probed here, in the
+    // JVM that starts jpackage: a daemon keeps the umask it was started with,
+    // whatever the shell that calls it says. Every other task's output is
+    // normalized or carries no modes, so this is the one place the umask shows.
+    if (targetFormat == TargetFormat.Dmg) {
+        doFirst {
+            val probe = temporaryDir.resolve("umask-probe").toPath()
+            Files.deleteIfExists(probe)
+            Files.createDirectory(probe)
+            val mode = PosixFilePermissions.toString(
+                Files.getPosixFilePermissions(probe),
+            )
+            Files.delete(probe)
+            if (mode != "rwxr-xr-x") {
+                throw GradleException(
+                    "$path needs umask 022: jpackage creates the dmg's directories with the umask " +
+                        "of this Gradle process, which creates them $mode. Run `umask 022` first " +
+                        "(and stop a Gradle daemon started under another umask: ./gradlew --stop).",
+                )
+            }
+        }
+    }
+}
+
 // Dev runs load the Rust engine lib via an ABSOLUTE path (-Dmyotis.engine.lib), set
 // only on these JavaExec tasks — deliberately NOT via compose.desktop jvmArgs, which
 // would bake a dev-machine path into packaged apps. Packaged desktop builds ship
@@ -754,7 +949,7 @@ tasks.withType<JavaExec>().matching { it.name == "run" || it.name == "syncSmoke"
     // -Pengine=java|rust|auto → -Dmyotis.engine (same knob as :app run).
     (project.findProperty("engine") as String?)?.let { systemProperty("myotis.engine", it) }
     // -Ptor=true → -Dmyotis.tor (dev knob to force Tor routing on at boot; needs the
-    // engine dylib built with -PtorEngine to actually route — docs/privacy-and-tor.md).
+    // engine dylib built with -PtorEngine to actually route — docs/how-it-works/privacy-and-tor.md).
     (project.findProperty("tor") as String?)?.let { systemProperty("myotis.tor", it) }
     doFirst {
         val os = System.getProperty("os.name").lowercase()

@@ -49,7 +49,7 @@ kotlin {
     // Android app with no toolchain two-step.
     androidTarget {
         // The AAR a consumer gets: the release variant — eth.myotis:myotis-engine-android
-        // (root build.gradle.kts, `Publishing`; docs/android-library.md).
+        // (root build.gradle.kts, `Publishing`; docs/guides/android-library.md).
         publishLibraryVariants("release")
         compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) }
     }
@@ -76,6 +76,10 @@ kotlin {
                 // none of its own (the node-key file, the peer caches, the CCIP
                 // gateway; io.myotis.engine.ports) — `api`, since a host names them.
                 api(project(":myotis-engine-ports"))
+                // …and the log index's predefined contracts (io.myotis.logindex): the
+                // catalog, its download/disk estimates and the config push an
+                // embedding app sends to start one — `api`, since it names them.
+                api(project(":myotis-logindex-presets"))
                 // …over the Rust engine, which stays an implementation detail: its
                 // classes, the UniFFI bindings and the JSON shapes are not a consumer's
                 // compile classpath. The few host seams beside the contract (the Tor
@@ -99,6 +103,12 @@ kotlin {
 android {
     namespace = "io.myotis.engine"
     compileSdk = 35
+    // Pinned exactly (#734): AGP strips the packaged .so files with this NDK's
+    // llvm-strip (an unpinned NDK leaves them unstripped or strips them with
+    // whatever is installed), and build-tools is the same version
+    // scripts/sign_release_apk.sh signs with. Both from gradle/libs.versions.toml.
+    ndkVersion = libs.versions.android.ndk.get()
+    buildToolsVersion = libs.versions.android.build.tools.get()
     defaultConfig {
         minSdk = 29
     }

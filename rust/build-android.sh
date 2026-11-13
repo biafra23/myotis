@@ -2,30 +2,36 @@
 # Cross-compile the workspace's Android cdylibs (myotis-bls today; myotis-engine once
 # it grows a real JNI surface) for Android ABIs into the engine library's jniLibs, so
 # NativeBlsBackend.isAvailable() is true on-device and the ~4-15x faster BLS verify
-# kicks in. See docs/bls-rust-acceleration.md.
+# kicks in. See docs/design-history/bls-rust-acceleration.md.
 #
 # One-time setup:
-#   rustup target add aarch64-linux-android x86_64-linux-android armv7-linux-androideabi
-#   cargo install cargo-ndk
-#   export ANDROID_NDK_HOME=<sdk>/ndk/<version>   # r28+ recommended, e.g. 28.2.13676358
+#   rustup target add aarch64-linux-android x86_64-linux-android   (inside rust/)
+#   cargo install cargo-ndk --version <cargo-ndk> --locked
+#   sdkmanager "ndk;<android-ndk>"; export ANDROID_NDK_HOME=<sdk>/ndk/<android-ndk>
+# with <cargo-ndk> and <android-ndk> the EXACT versions pinned in
+# gradle/libs.versions.toml (#734). `./gradlew cargoNdkAndroid` finds and checks
+# both itself and refuses any other version; run directly, this script uses
+# whatever ANDROID_NDK_HOME and cargo-ndk you give it.
 #
-# Prefer NDK r28 or newer: it defaults to 16 KB-aligned LOAD segments (required by
-# Android 15+ devices with 16 KB memory pages). On older NDKs .cargo/config.toml still
-# forces the alignment via -Wl,-z,max-page-size=16384, and the check at the end of this
+# The pinned NDK is r28 or newer, which defaults to 16 KB-aligned LOAD segments
+# (required by Android 15+ devices with 16 KB memory pages). .cargo/config.toml forces
+# the alignment too via -Wl,-z,max-page-size=16384, and the check at the end of this
 # script fails the build if anything slips through.
 #
 # Then: rust/build-android.sh
 #
 # MYOTIS_TOR_ENGINE=1 also compiles Tor into the engine (`--features
 # myotis-engine/tor`: Arti on rustls + ring, SQLite bundled — see the TLS note in
-# myotis-net/Cargo.toml and docs/privacy-and-tor.md). It adds megabytes per ABI,
+# myotis-net/Cargo.toml and docs/how-it-works/privacy-and-tor.md). It adds megabytes per ABI,
 # so it stays off unless asked for; Gradle sets it for `-PtorEngine`.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
+# Fixed source-path prefixes in the shipped libs (#734 D2; the file says why).
+. "$here/repro-env.sh"
 jniLibs="$here/../myotis-engine/src/androidMain/jniLibs"
 
-: "${ANDROID_NDK_HOME:?set ANDROID_NDK_HOME to your NDK path (e.g. \$ANDROID_SDK/ndk/27.0.11718014)}"
+: "${ANDROID_NDK_HOME:?set ANDROID_NDK_HOME to the pinned NDK (\$ANDROID_SDK/ndk/<android-ndk from gradle/libs.versions.toml>)}"
 
 # arm64-v8a covers all modern phones; x86_64 covers the emulator. Add armeabi-v7a for
 # very old 32-bit devices if you still target them.
@@ -47,7 +53,7 @@ case "${MYOTIS_TOR_ENGINE:-0}" in
     *) echo "MYOTIS_TOR_ENGINE must be 0 or 1 (got '${MYOTIS_TOR_ENGINE}')" >&2; exit 1 ;;
 esac
 # shellcheck disable=SC2086 # $tor_features is empty or two words, split on purpose
-cargo ndk -t arm64-v8a -t x86_64 -o "$jniLibs" build --release -p myotis-bls -p myotis-engine $tor_features
+cargo ndk -t arm64-v8a -t x86_64 -o "$jniLibs" build --locked --release -p myotis-bls -p myotis-engine $tor_features
 
 # cargo-ndk copies EVERY dynamic library the build graph produces, including
 # hash-named dependency artifacts (e.g. libif_watch-<hash>.so) that
@@ -60,48 +66,8 @@ find "$jniLibs" -name 'libmyotis_*.so' -exec ls -la {} \;
 
 # Fail loudly if any PT_LOAD segment is <16 KB aligned — a 4 KB-aligned .so is
 # rejected by the dynamic linker on 16 KB-page devices, and the symptom (BLS
-# silently falling back to the slow JVM backend) is easy to miss. Guards against
-# an NDK/flag regression silently shipping a misaligned lib.
+# silently falling back to the slow JVM backend) is easy to miss. Every .so that
+# survives the prune above is checked, and an empty jniLibs fails. The same
+# script checks the APKs in android-apk.yml (#734).
 echo "checking 16 KB alignment:"
-python3 - "$jniLibs" <<'PY'
-import struct, sys, glob, os
-bad = []
-# *.so, not libmyotis_*.so: anything that survives the prune above must at
-# least pass the alignment gate rather than ship unchecked.
-files = glob.glob(os.path.join(sys.argv[1], "*", "*.so"))
-if not files:
-    # Zero matches means jniLibs is empty/stale (wrong path, or cargo-ndk's
-    # output layout changed) — a vacuous pass here would green-light a build
-    # with no libs at all.
-    sys.exit(f"FAIL: no .so files found under {sys.argv[1]}")
-for f in files:
-    with open(f, "rb") as fh:
-        d = fh.read()
-    if d[:4] != b"\x7fELF":
-        sys.exit(f"not an ELF file: {f}")
-    end = "<" if d[5] == 1 else ">"
-    # Handle both classes: arm64-v8a / x86_64 are ELF64, but armeabi-v7a (32-bit,
-    # mentioned in the build comments) is ELF32 with different header offsets.
-    if d[4] == 2:   # ELFCLASS64
-        phoff = struct.unpack_from(end + "Q", d, 0x20)[0]
-        phentsize = struct.unpack_from(end + "H", d, 0x36)[0]
-        phnum = struct.unpack_from(end + "H", d, 0x38)[0]
-        align_off, align_fmt = 0x30, end + "Q"   # p_align in Elf64_Phdr
-    else:           # ELFCLASS32
-        phoff = struct.unpack_from(end + "I", d, 0x1C)[0]
-        phentsize = struct.unpack_from(end + "H", d, 0x2A)[0]
-        phnum = struct.unpack_from(end + "H", d, 0x2C)[0]
-        align_off, align_fmt = 0x1C, end + "I"     # p_align in Elf32_Phdr
-    aligns = [struct.unpack_from(align_fmt, d, phoff + i * phentsize + align_off)[0]
-              for i in range(phnum)
-              if struct.unpack_from(end + "I", d, phoff + i * phentsize)[0] == 1]  # PT_LOAD
-    ok = all(a >= 0x4000 for a in aligns)
-    abi = os.path.basename(os.path.dirname(f))
-    print(f"  {abi}: LOAD align {[hex(a) for a in aligns]} -> {'OK' if ok else 'NOT 16 KB'}")
-    if not ok:
-        bad.append(abi)
-if bad:
-    sys.exit(f"FAIL: not 16 KB aligned: {bad}. "
-             "Ensure NDK is installed and .cargo/config.toml is in effect.")
-print("  all 16 KB aligned")
-PY
+python3 -I "$here/../scripts/check_16k_alignment.py" "$jniLibs"

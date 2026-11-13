@@ -102,6 +102,10 @@ struct EngineState {
     /// pool from scratch) and applied live to a running reader, exactly like
     /// [`EngineState::pending_served_window`]. Dies with the handle.
     pending_boot_enodes: Mutex<HashMap<i64, Vec<Enode>>>,
+    /// Per-handle P2P listen ports (`set_listen_ports`, ABI ≥ 57): read by
+    /// every spin_up (start AND resume), so a resume binds the same ports.
+    /// Absent = all OS-assigned, the wallet's default. Dies with the handle.
+    listen_ports: Mutex<HashMap<i64, ListenPorts>>,
     /// Serializes the two paths that hand a stashed seed list to a reader —
     /// a host's live push and the post-publish replay in `spin_up` — so the
     /// pool always ends up holding the LATEST list: without it a push could
@@ -110,7 +114,7 @@ struct EngineState {
     /// (host threads only; no runtime task takes it).
     boot_enodes_apply: Mutex<()>,
     /// Per-handle LAST-PUSHED log-index runtime bits, as
-    /// `(enabled, max_speed, backfill_paused)`. None of the three is in the
+    /// `(enabled, max_speed, backfill_paused, allow_metered)`. None of them is in the
     /// portable snapshot, and a pause drops the EL reader with the index in it,
     /// so a resume re-activates from disk at the ACTIVATION defaults — enabled,
     /// walk paused — no matter what the host last said, and no host re-pushes on
@@ -118,7 +122,7 @@ struct EngineState {
     /// for, and re-enables an index a host turned off. Re-applied by every
     /// spin_up (start AND resume) after activation, exactly like
     /// [`Engine::pending_served_window`]. Dies with the handle.
-    log_index_runtime_bits: Mutex<HashMap<i64, (bool, bool, bool)>>,
+    log_index_runtime_bits: Mutex<HashMap<i64, (bool, bool, bool, bool)>>,
     /// Per-handle address-activity watch list (#691), as the pushes left it.
     /// The list lives in the EL reader, which a pause drops, and no host
     /// re-pushes on resume: re-applied by every spin_up (start AND resume),
@@ -197,6 +201,7 @@ fn engine() -> Option<&'static EngineState> {
                     next_id: AtomicI64::new(1),
                     pending_served_window: Mutex::new(HashMap::new()),
                     pending_boot_enodes: Mutex::new(HashMap::new()),
+                    listen_ports: Mutex::new(HashMap::new()),
                     boot_enodes_apply: Mutex::new(()),
                     log_index_runtime_bits: Mutex::new(HashMap::new()),
                     activity_watch: Mutex::new(HashMap::new()),
@@ -227,7 +232,7 @@ fn config_for(network_name: &str) -> Option<ChainConfig> {
 }
 
 /// `nativeSetTorEnabled`: turn Tor verified-read routing on/off
-/// (docs/privacy-and-tor.md). Returns `true` when this engine build actually
+/// (docs/how-it-works/privacy-and-tor.md). Returns `true` when this engine build actually
 /// supports Tor (`--features tor`), `false` when it doesn't — so a host can grey
 /// out the toggle rather than pretend it works. A no-op when Tor isn't compiled.
 pub fn set_tor_enabled(on: bool) -> bool {
@@ -708,12 +713,12 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
     // Holding the map lock across block_on would serialize every other native
     // (status/stop/create) behind a potentially-slow start and invites deadlock on
     // future changes — even though SyncHandle::start is fast today (spawn + return).
-    let (config, read_stats) = {
+    let (config, read_stats, ports) = {
         let map = match engine.handles.lock() {
             Ok(m) => m,
             Err(_) => return false,
         };
-        match (from, map.get(&handle)) {
+        let (config, read_stats) = match (from, map.get(&handle)) {
             (SpinUpFrom::Created, Some(ChainEntry::Created(c))) => {
                 (Arc::clone(c), Arc::new(ReadStats::new()))
             }
@@ -722,7 +727,11 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
                 (Arc::clone(c), Arc::clone(stats))
             }
             _ => return false, // unknown id, or not in the expected state
-        }
+        };
+        // The host's pinned P2P ports (`set_listen_ports`; default all
+        // OS-assigned), read under the same lock the setter checks the state
+        // under (map, then stash — the setter's order).
+        (config, read_stats, listen_ports_for(engine, handle))
     };
     // The handle's CL fork watch rides into the loop on its config: created on
     // the first spin-up, reused (evidence intact) on every resume.
@@ -732,10 +741,17 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
     let sync = match engine.rt.block_on(async {
         let mut cfg = (*config).clone();
         cfg.cl_fork_watch = cl_watch;
+        cfg.discv5_port = ports.discv5;
+        cfg.libp2p_tcp_port = ports.libp2p_tcp;
+        cfg.libp2p_quic_port = ports.libp2p_quic;
         SyncHandle::start(cfg)
     }) {
         Ok(s) => s,
-        Err(_) => return false,
+        Err(e) => {
+            // E.g. a libp2p TCP port another process holds (`set_listen_ports`).
+            tracing::warn!(handle, error = %e, "sync loop failed to start");
+            return false;
+        }
     };
     // Start the EL reader against the sync loop's execution anchor (the CL→EL
     // bridge). A failure (e.g. a discv4 UDP bind error) is non-fatal: the CL
@@ -752,7 +768,7 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
         .and_then(|p| p.parent())
         .map(|dir| dir.join(format!("peers{el_suffix}.cache")));
     // The eth_getLogs watch-list index, same dataDir + suffix convention
-    // (docs/eth-getlogs-design.md). None (no dataDir) → memory-only index.
+    // (docs/design-history/eth-getlogs-design.md). None (no dataDir) → memory-only index.
     let log_index_path = config
         .snapshot_path
         .as_deref()
@@ -779,6 +795,7 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
             let cfg = myotis_net::el::reader::ElConfig {
                 log_index_path,
                 traffic: Arc::clone(&config.traffic),
+                discv4_port: ports.discv4,
                 ..cfg
             };
             // A poisoned carry map still gets a reader, over a carry of its own
@@ -823,8 +840,9 @@ fn spin_up(handle: i64, from: SpinUpFrom) -> bool {
         // an index the host turned off — the latter silently, since a disabled
         // index leaves its file in place for activation to find.
         if let Ok(bits) = engine.log_index_runtime_bits.lock() {
-            if let Some(&(enabled, max_speed, backfill_paused)) = bits.get(&handle) {
+            if let Some(&(enabled, max_speed, backfill_paused, allow_metered)) = bits.get(&handle) {
                 reader.apply_log_index_runtime_bits(enabled, max_speed, backfill_paused);
+                reader.set_log_index_allow_metered(allow_metered);
             }
         }
         // And the activity watch list: the resumed reader starts empty, and
@@ -1246,6 +1264,9 @@ pub fn stop(handle: i64) {
     if let Ok(mut pending) = engine.pending_boot_enodes.lock() {
         pending.remove(&handle);
     }
+    if let Ok(mut ports) = engine.listen_ports.lock() {
+        ports.remove(&handle);
+    }
     if let Ok(mut bits) = engine.log_index_runtime_bits.lock() {
         bits.remove(&handle);
     }
@@ -1330,6 +1351,9 @@ pub fn set_network_metering(code: i32) -> bool {
         tick_all_ledgers(engine);
     }
     crate::usage::set_metering(m);
+    // The log index's backfill walk holds on a metered network unless the
+    // host's push allowed it (`allowMetered`, ElReader::log_index_metered_hold).
+    myotis_net::el::reader::set_device_metered(m == Metering::Metered);
     true
 }
 
@@ -1417,6 +1441,97 @@ fn parse_boot_enodes_json(json: &str) -> Result<Vec<Enode>, String> {
     } else {
         Err(reasons.join("; "))
     }
+}
+
+/// The P2P sockets a handle opens, each `0` = OS-assigned (the wallet's
+/// default, so two engines on one machine never collide). The EL is dial-only:
+/// discv4 is its one listening socket; the CL has discv5 plus the libp2p
+/// req/resp host on TCP and on QUIC (UDP).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ListenPorts {
+    pub discv4: u16,
+    pub discv5: u16,
+    pub libp2p_tcp: u16,
+    pub libp2p_quic: u16,
+}
+
+/// Pure: the ports a host asked for, or why they cannot all be bound by one
+/// handle. A nonzero port may appear once per protocol family — discv4,
+/// discv5 and QUIC all bind UDP, so two of them on one port would fail the
+/// second bind; TCP is its own family.
+fn validate_listen_ports(p: ListenPorts) -> Result<ListenPorts, String> {
+    let udp = [("discv4", p.discv4), ("discv5", p.discv5), ("libp2p QUIC", p.libp2p_quic)];
+    for (i, (a, pa)) in udp.iter().enumerate() {
+        for (b, pb) in &udp[i + 1..] {
+            if *pa != 0 && pa == pb {
+                return Err(format!("{a} and {b} both ask for UDP port {pa}"));
+            }
+        }
+    }
+    Ok(p)
+}
+
+fn listen_ports_for(engine: &EngineState, handle: i64) -> ListenPorts {
+    engine
+        .listen_ports
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&handle).copied())
+        .unwrap_or_default()
+}
+
+/// The ports the handle's next spin_up will bind (all 0 when none were set).
+#[cfg(test)]
+pub(crate) fn listen_ports_of(handle: i64) -> ListenPorts {
+    engine().map(|e| listen_ports_for(e, handle)).unwrap_or_default()
+}
+
+/// `myotis_set_listen_ports` (ABI ≥ 57): pin the handle's P2P listen ports.
+/// Set semantics (a later call replaces an earlier one; all zeros = back to
+/// OS-assigned). Applied or refused, never accepted and ignored: accepted
+/// only BEFORE the sockets exist — a CREATED handle, or a PAUSED one (the
+/// resume binds them) — and refused for a RUNNING or unknown handle or a
+/// UDP port two protocols would share ([`validate_listen_ports`]), with one
+/// WARN naming the reason. A port another process holds fails at start like
+/// any bind: discv4, discv5 and QUIC drop to the degraded modes their bind
+/// errors already have (no EL reader, no discv5, no inbound QUIC); a libp2p
+/// TCP bind error fails the start.
+pub(crate) fn set_listen_ports(handle: i64, ports: ListenPorts) -> bool {
+    let Some(engine) = engine() else {
+        return false;
+    };
+    let ports = match validate_listen_ports(ports) {
+        Ok(p) => p,
+        Err(reason) => {
+            tracing::warn!(handle, %reason, "listen ports refused; nothing applied");
+            return false;
+        }
+    };
+    // Hosts set the ports between create() and start() (myotis-rpcd does).
+    // The state check and the stash run under the handle map, the lock
+    // spin_up reads the stash under. A call on another thread that races
+    // start() can still land after spin_up read the stash but before it
+    // publishes RUNNING; it would then bind only at the next resume, so a host
+    // must not race the two.
+    let map = match engine.handles.lock() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    match map.get(&handle) {
+        Some(ChainEntry::Created(_)) | Some(ChainEntry::Paused(..)) => {}
+        Some(ChainEntry::Running(..)) => {
+            tracing::warn!(handle, "listen ports refused: the handle is running (set them before start)");
+            return false;
+        }
+        None => return false,
+    }
+    let Ok(mut stash) = engine.listen_ports.lock() else {
+        return false;
+    };
+    stash.insert(handle, ports);
+    tracing::info!(handle, discv4 = ports.discv4, discv5 = ports.discv5, libp2p_tcp = ports.libp2p_tcp,
+        libp2p_quic = ports.libp2p_quic, "listen ports set (0 = OS-assigned)");
+    true
 }
 
 /// `myotis_set_boot_enodes` (ABI ≥ 31, #465): replace the handle's
@@ -3909,7 +4024,7 @@ fn status_object(
             None => serde_json::Value::Null,
         },
     );
-    // Data usage (docs/data-usage.md): this handle's bytes since it was
+    // Data usage (docs/how-it-works/data-usage.md): this handle's bytes since it was
     // created, by layer, and the local day's figures with their metered part.
     obj.insert(
         "dataUsage".into(),
@@ -4949,6 +5064,32 @@ mod tests {
     }
 
     #[test]
+    fn listen_ports_refuse_a_udp_port_two_protocols_would_share() {
+        let p = |discv4, discv5, libp2p_tcp, libp2p_quic| ListenPorts { discv4, discv5, libp2p_tcp, libp2p_quic };
+        // Defaults and distinct ports pass unchanged.
+        assert_eq!(validate_listen_ports(ListenPorts::default()), Ok(ListenPorts::default()));
+        assert_eq!(validate_listen_ports(p(30305, 9005, 9105, 9106)), Ok(p(30305, 9005, 9105, 9106)));
+        // TCP is its own family: the libp2p TCP port may equal a UDP one.
+        assert!(validate_listen_ports(p(30305, 9005, 30305, 9106)).is_ok());
+        // Several protocols left at 0 (OS-assigned) never collide.
+        assert!(validate_listen_ports(p(0, 0, 0, 9106)).is_ok());
+        // Two UDP protocols on one port would fail the second bind: refused.
+        for (bad, names) in [
+            (p(9000, 9000, 0, 0), "discv4 and discv5"),
+            (p(9000, 0, 0, 9000), "discv4 and libp2p QUIC"),
+            (p(0, 9001, 0, 9001), "discv5 and libp2p QUIC"),
+        ] {
+            let err = validate_listen_ports(bad).unwrap_err();
+            assert!(err.contains(names), "{err}");
+        }
+    }
+
+    #[test]
+    fn listen_ports_are_refused_for_an_unknown_handle() {
+        assert!(!set_listen_ports(-42, ListenPorts { discv4: 30305, ..ListenPorts::default() }));
+    }
+
+    #[test]
     fn boot_enodes_json_is_applied_or_refused_as_a_whole() {
         let key = "ab".repeat(64);
         let pin = |host: &str| format!("enode://{key}@{host}");
@@ -5282,7 +5423,7 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// eth_getLogs (docs/eth-getlogs-design.md): watch-list config install, index
+// eth_getLogs (docs/design-history/eth-getlogs-design.md): watch-list config install, index
 // status, and the coverage-honest query. All JSON in / JSON out, panic-free.
 // ---------------------------------------------------------------------------
 
@@ -5335,8 +5476,17 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
         );
         return false;
     };
+    // Whether the backfill walk may run on a metered network. Absent = false:
+    // the walk is the index's one bulk download, so "unmetered only" is the
+    // default (a host that never reports metering — the daemon, the desktop —
+    // is never metered, so nothing changes there). Strict like the other
+    // bits: a malformed value refuses the push rather than defaulting.
+    let Some(allow_metered) = strict_bool(&v, "allowMetered", false) else {
+        tracing::warn!("log-index config refused: `allowMetered` is not a boolean; ignoring the push");
+        return false;
+    };
     let enabled = config.enabled;
-    let bits = (config.enabled, config.max_speed, config.backfill_paused);
+    let bits = (config.enabled, config.max_speed, config.backfill_paused, allow_metered);
     let Some(engine) = engine() else {
         return false;
     };
@@ -5353,6 +5503,7 @@ pub fn set_log_index_config_json(handle: i64, config_json: &str) -> bool {
     }
     let installed = reader.set_log_index_config(config);
     if installed {
+        reader.set_log_index_allow_metered(allow_metered);
         // Remember what the host asked for, so a resume re-applies it instead of
         // the activation defaults (see `Engine::log_index_runtime_bits`). Written
         // under the handles lock, and only while the handle is still Running, so a
@@ -5588,7 +5739,11 @@ pub fn log_index_status_json(handle: i64) -> String {
     // gap to finality instead would show "caught up" through the whole band
     // where queries still fail.
     let head = reader.head_block_number().unwrap_or(0);
-    let status = reader.with_log_index(|ix| build_log_index_status(ix, rate_bps, head));
+    let metered = MeteredBits {
+        allow_metered: reader.log_index_allow_metered(),
+        hold: reader.log_index_metered_hold(),
+    };
+    let status = reader.with_log_index(|ix| build_log_index_status(ix, rate_bps, head, metered));
     status.unwrap_or_else(|| "{\"enabled\":false,\"logCount\":0,\"entries\":[]}".to_string())
 }
 
@@ -5731,12 +5886,22 @@ pub fn read_stats_json(handle: i64) -> String {
     }
 }
 
+/// The metered-download state the status reports (ABI 56): whether the host
+/// allowed the backfill walk on a metered network, and whether it is held for
+/// one right now.
+#[derive(Clone, Copy, Debug, Default)]
+struct MeteredBits {
+    allow_metered: bool,
+    hold: bool,
+}
+
 /// Pure status serializer (unit-tested): fixed key order, no whitespace —
 /// the Kotlin LogIndexStatus parser and its golden test pin this shape.
 fn build_log_index_status(
     ix: &myotis_net::el::logindex::LogIndex,
     rate_bps: Option<f64>,
     head: u64,
+    metered: MeteredBits,
 ) -> String {
     {
         let mut s = String::from("{\"enabled\":");
@@ -5751,6 +5916,10 @@ fn build_log_index_status(
         s.push_str(if ix.config().max_speed { "true" } else { "false" });
         s.push_str(",\"backfillPaused\":");
         s.push_str(if ix.config().backfill_paused { "true" } else { "false" });
+        s.push_str(",\"allowMetered\":");
+        s.push_str(if metered.allow_metered { "true" } else { "false" });
+        s.push_str(",\"meteredHold\":");
+        s.push_str(if metered.hold { "true" } else { "false" });
         // Backfill progress for the hosts' Index tab: the walk target, blocks
         // remaining to it, and — once the walker has a measured rate — an ETA.
         // All optional-by-context so the shape stays honest: nothing indexed
@@ -6213,7 +6382,7 @@ fn get_logs_json_impl(handle: i64, filter_json: &str) -> String {
 
 #[cfg(test)]
 mod log_index_json_tests {
-    use super::{build_log_index_status, parse_log_index_config, parse_log_index_unwatch};
+    use super::{build_log_index_status, parse_log_index_config, parse_log_index_unwatch, strict_bool, MeteredBits};
 
     fn cfg(json: &str) -> Option<myotis_net::el::logindex::LogIndexConfig> {
         parse_log_index_config(&serde_json::from_str(json).unwrap())
@@ -6314,7 +6483,7 @@ mod log_index_json_tests {
         };
         let mut ix = LogIndex::new(LogIndexConfig { enabled: true, watch: vec![w], ..Default::default() }).unwrap();
         ix.append_block(3, [0; 32], vec![]).unwrap();
-        let json = build_log_index_status(&ix, None, 3);
+        let json = build_log_index_status(&ix, None, 3, MeteredBits::default());
         assert!(
             json.contains(&format!(
                 r#"{{"topic":"0x{}","positions":[1,2],"fromBlock":3,"name":"me","coveredLow":3,"coveredHigh":3,"restricted":true}}"#,
@@ -6401,10 +6570,49 @@ mod log_index_json_tests {
         // Status carries the name for named entries and omits the key for
         // unnamed ones (shape-stable for pre-name hosts).
         let ix = myotis_net::el::logindex::LogIndex::new(named).unwrap();
-        let s = build_log_index_status(&ix, None, 0);
+        let s = build_log_index_status(&ix, None, 0, MeteredBits::default());
         assert!(s.contains("\"name\":\"tornado.registry.eth\""), "{s}");
         let ix = myotis_net::el::logindex::LogIndex::new(unnamed).unwrap();
-        assert!(!build_log_index_status(&ix, None, 0).contains("\"name\""));
+        assert!(!build_log_index_status(&ix, None, 0, MeteredBits::default()).contains("\"name\""));
+    }
+
+    #[test]
+    fn status_json_carries_the_metered_download_state() {
+        let w = myotis_net::el::logindex::WatchEntry {
+            key: myotis_net::el::logindex::WatchKey::Address([0x11; 20]),
+            positions: vec![],
+            from_block: 100,
+            topic0s: vec![],
+            name: String::new(),
+        };
+        let cfg = myotis_net::el::logindex::LogIndexConfig {
+            enabled: true,
+            max_speed: false,
+            backfill_paused: false,
+            watch: vec![w],
+        };
+        let ix = myotis_net::el::logindex::LogIndex::new(cfg).unwrap();
+        // Default: unmetered only, nothing held — and the keys sit right after
+        // backfillPaused in the fixed order the Kotlin parser reads.
+        let s = build_log_index_status(&ix, None, 0, MeteredBits::default());
+        assert!(
+            s.contains("\"backfillPaused\":false,\"allowMetered\":false,\"meteredHold\":false"),
+            "{s}"
+        );
+        let held = build_log_index_status(&ix, None, 0, MeteredBits { allow_metered: false, hold: true });
+        assert!(held.contains("\"meteredHold\":true"), "{held}");
+        let allowed = build_log_index_status(&ix, None, 0, MeteredBits { allow_metered: true, hold: false });
+        assert!(allowed.contains("\"allowMetered\":true,\"meteredHold\":false"), "{allowed}");
+    }
+
+    #[test]
+    fn allow_metered_is_strict_and_defaults_to_unmetered_only() {
+        let v = |j: &str| serde_json::from_str::<serde_json::Value>(j).unwrap();
+        assert_eq!(strict_bool(&v(r#"{"enabled":true}"#), "allowMetered", false), Some(false));
+        assert_eq!(strict_bool(&v(r#"{"allowMetered":true}"#), "allowMetered", false), Some(true));
+        assert_eq!(strict_bool(&v(r#"{"allowMetered":null}"#), "allowMetered", false), Some(false));
+        // A string is refused (the push is ignored), never read as a default.
+        assert_eq!(strict_bool(&v(r#"{"allowMetered":"true"}"#), "allowMetered", false), None);
     }
 
     #[test]
@@ -6424,7 +6632,7 @@ mod log_index_json_tests {
         };
         let mut ix = myotis_net::el::logindex::LogIndex::new(cfg).unwrap();
         ix.cursor = Some((600, [0u8; 32]));
-        let s = build_log_index_status(&ix, Some(9.44), 0);
+        let s = build_log_index_status(&ix, Some(9.44), 0, MeteredBits::default());
         assert!(s.contains("\"maxSpeed\":true"), "{s}");
         // The pause bit rides next to maxSpeed in the fixed key order the
         // Kotlin parser and its golden test pin.
@@ -6435,7 +6643,7 @@ mod log_index_json_tests {
         // eta = 500 / 9.44 = 52.966 -> 53
         assert!(s.contains("\"etaSeconds\":53"), "{s}");
         // No rate -> no ETA keys, remaining still present.
-        let s2 = build_log_index_status(&ix, None, 0);
+        let s2 = build_log_index_status(&ix, None, 0, MeteredBits::default());
         assert!(s2.contains("\"blocksRemaining\":500"), "{s2}");
         assert!(!s2.contains("etaSeconds"), "{s2}");
         // An unrestricted entry's shape is untouched by the `restricted` key.
@@ -6462,7 +6670,7 @@ mod log_index_json_tests {
         };
         let mut ix = myotis_net::el::logindex::LogIndex::new(cfg).unwrap();
         ix.append_block(200, [2; 32], vec![]).unwrap();
-        let s = build_log_index_status(&ix, None, 0);
+        let s = build_log_index_status(&ix, None, 0, MeteredBits::default());
         assert!(
             s.ends_with(
                 "\"entries\":[{\"address\":\"0x1111111111111111111111111111111111111111\",\"fromBlock\":100,\
@@ -6505,7 +6713,7 @@ mod log_index_json_tests {
         // seeded it near the head sometime after the seed installed (the seed
         // itself ships no cursor; see the doc comment above).
         ix.cursor = Some((5000, [0u8; 32]));
-        let s = build_log_index_status(&ix, Some(9.44), 0);
+        let s = build_log_index_status(&ix, Some(9.44), 0, MeteredBits::default());
         assert!(s.contains("\"targetLow\":100"), "{s}");
         assert!(s.contains("\"blocksRemaining\":0"), "{s}");
         // Nothing left to estimate a rate or an ETA for.
@@ -6559,7 +6767,7 @@ mod log_index_json_tests {
         assert_eq!(ix.coverage_of(&myotis_net::el::logindex::WatchKey::Address(addr_a)).unwrap().span, Some((1, 20)), "sanity: A still complete");
         assert_eq!(ix.coverage_of(&myotis_net::el::logindex::WatchKey::Address(addr_b)).unwrap().span, Some((20, 20)), "sanity: B seeded, not backfilled");
 
-        let s = build_log_index_status(&ix, None, 0);
+        let s = build_log_index_status(&ix, None, 0, MeteredBits::default());
         // targetLow is unaffected — still the minimum from_block over every
         // entry (its meaning is pinned in LogIndexStatus.kt).
         assert!(s.contains("\"targetLow\":1"), "{s}");

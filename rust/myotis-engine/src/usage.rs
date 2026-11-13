@@ -1,6 +1,6 @@
 //! Data usage per handle: today's bytes in and out, how much of it went over
 //! a metered network, and the network's current metering as the host reported
-//! it (docs/data-usage.md).
+//! it (docs/how-it-works/data-usage.md).
 //!
 //! The byte counts come from the handle's [`TrafficMeter`]
 //! (`myotis_net::traffic`), which only ever grows. A [`UsageLedger`] turns it

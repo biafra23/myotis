@@ -1,0 +1,905 @@
+# Privacy & Tor — design sketch
+
+> **Status: the core transport path is in production, feature-gated and
+> experimental.** `-PtorEngine` links Arti into the Rust engine
+> (`rust/myotis-net/src/el/tor.rs`), and a Settings toggle routes **account
+> (balance/nonce) reads** — the routing switch sits in `get_account`
+> (`reader.rs`) — over per-address isolated circuits with ephemeral RLPx
+> keys, and **the broadcast of the wallet's own transactions** — the switch
+> sits in `send_judged`; `tor_broadcast` — under a fresh isolation token per
+> send (its circuits carry nothing else), each push confirmed by its peer's
+> Pong, failing closed: a send no peer took over Tor is refused, never sent
+> from the real IP (one that landed on a stream but got no Pong counts as
+> sent — it may be out), and one that went over Tor is never pushed from the
+> real IP again: not rebroadcast, and not re-pushed when the wallet
+> re-submits it, even after Tor is switched off — for as long as the engine
+> still holds its bytes (in memory only, per network: the last 256 sends,
+> `SENT_TX_CACHE_MAX`; a restart, a stop or a pause — Android's idle pause
+> after 5 minutes included — forgets which sends went over Tor).
+> Wired up on the desktop and Android hosts (iOS not yet; on Android
+> `-PtorEngine` reaches the jniLibs — see the Android bullet in
+> [§3](#3-tor-client-library-arti-in-the-rust-engine)); storage/token
+> reads, `eth_call`/gas estimation (a plain transfer's included: the hosts no
+> longer pre-check its recipient through `get_code`, the engine's state oracle
+> reads it), receipt polling, the CL fetch, and discovery
+> still use the real IP, while contract-code reads are a hybrid: `get_code`
+> anchors through the same `get_account`, so its address-carrying account
+> query follows the Tor toggle and only the content-addressed bytecode fetch
+> stays clearnet. Tor reads and sends go only to the **Tor reserve**
+> (`el::torreserve`, the `peers-tor[-net].cache` sidecar of §5): verified
+> snap servers moved out of the peer cache — about a third of them, at most
+> 24, in a per-process random order, never a pin — while Tor mode is on. The
+> pool never dials a reserved node directly again, with Tor on or off and
+> across restarts, so the reserve's nodes see this wallet only over Tor. A
+> node is ready for Tor ten minutes after its last direct contact, saved with
+> it in the file (no earlier than the process start for a node this process
+> never saw: the run before may have just dialed it). Tor results keep the
+> file current: a verified read confirms a node; three Tor dials in a row
+> that it refuses (the exit reports the peer's side failing — never a local
+> or circuit failure) send it back to the peer cache, and this process does
+> not take it again; a reserve over its share — the cache shrank — hands its
+> weakest nodes back, Tor on or off. Among equally good nodes each read draws
+> a fresh order, so reads spread over the reserve. Both orders need OS entropy:
+> without it the reserve takes in no node and a read or send gets no
+> candidate, so it fails closed rather than fall back to a fixed, computable
+> order (#823). Both directions are also guarded
+> in-process by node id: a node reached over Tor is left undialed directly
+> until ten minutes past the Tor operation's end, claimed under the same lock
+> as a direct dial; with no ready node the read or send fails closed
+> (`PeerPool::tor_candidates` / `claim_for_tor`, `TOR_DIRECT_SEPARATION`).
+> Tor-side Hellos name the software without its version (`myotis`, §6.3).
+> That is a first step toward §5, not the design: no days-long randomized
+> quarantine, no batch rotation, discovery's UDP pings still reach many nodes
+> from the real IP, the Java engine (no Tor mode) shares the peer cache but
+> not the reserve — a node it dials while reserved leaves the reserve on the
+> Rust engine's next start — an operator running many nodes can pool what
+> they see, and a host without a data directory has no reserve, so Tor always
+> fails closed there — a network-privacy win, not yet the full §5
+> unlinkability. The runnable proof
+> of concept
+> (`rust/tor-poc`, see [§9](#9-proof-of-concept--what-was-validated)) validated
+> the transport against live mainnet and its measurements are folded back in
+> below (marked **PoC:**). The full quarantined peer pool, multi-source
+> promotion, and request-shape hardening remain unimplemented proposals —
+> everything about them beyond the ten-minute separation above is design, not
+> shipped behavior.
+
+Companion docs: [Disk & Network Usage](disk-and-network-usage.md) (traffic volumes
+this design would route), [Optimisations & Limitations](../../OPTIMISATIONS_AND_LIMITATIONS.md)
+(why round-trip latency is the binding performance constraint).
+
+---
+
+## 1. What leaks today (threat model)
+
+Myotis verifies everything cryptographically — a peer can never *lie* to us. But
+peers, and anyone observing traffic, can *learn* from what we ask. Ranked by
+sensitivity:
+
+| Flow | What an observer/peer learns | Severity |
+|---|---|---|
+| **snap queries** (`GetAccountRange`/`GetStorageRanges`) | The request carries `keccak(address)` and storage-key hashes. Hashing hides nothing: keccak of every known-active address is trivially precomputed, so every snap peer we query learns **address ↔ IP**, plus which tokens/contracts the user cares about. | **High — the core leak** |
+| **Transaction broadcast** | The signed tx is pushed directly to ~32 peers from the user's IP (`RLPxConnector.broadcastTransaction`) — the classic "first spy" deanonymization setup: **tx ↔ IP**. Note broadcast is the one flow where relaying through anything costs *zero* trust — Myotis' trust model protects reads; a broadcast can't be forged, only censored. | **High** |
+| Receipt tracking | Which blocks' bodies we fetch while watching a send. Weak signal — whole bodies are decent cover. | Low |
+| **CL light client** (finality/committee updates) | Content is public chain data, identical for every client — nothing user-specific. It does *fingerprint* the IP as running an Ethereum CL light client, with wake/sleep timing that mirrors app usage. | Low (content-benign) |
+| **Discovery** (discv4/discv5) | The IP participates in the Ethereum DHTs — i.e. runs a client. No addresses involved. | Low |
+
+> **Disclosure set widens under read hedging (clearnet).** Interactive verified reads hedge across peers to survive a silent one (`HEDGE_DELAY`, myotis #320): an address-carrying read whose first peer is slower than the hedge delay discloses `keccak(address)` to up to `MAX_HEDGED_ATTEMPTS` (3) peers, not one, even when the first peer goes on to answer. Sequential rotation disclosed to a new peer only on failure; hedging discloses on slowness. This is a clearnet-only tradeoff — the Tor read path routes each address over its own circuit *before* hedging, so it is unaffected. `eth_call` and gas estimation hedge their account, storage and bytecode reads through the same race (the state oracle, `evm.rs`), so on the oracle's serial path the accounts and storage-key hashes a call touches reach up to three peers under the same condition — and those reads have no Tor path at all (see Status above), so the Tor toggle does not narrow them. Block and receipt reads are hedged too; they carry no address, but *which* blocks a send is being watched in (the Receipt tracking row above) now reaches up to three peers the same way. Accepted deliberately: the alternative (excluding address-carrying reads from hedging) would leave exactly the slow-link case this leak's worst environment — mobile/congested — stalling.
+
+The design goal is therefore precise: **unlink the snap-query and tx-broadcast
+flows from the user's IP**, without breaking the trust model, and without paying
+Tor's latency on flows that don't need it.
+
+## 2. Transport inventory — what can and cannot cross Tor
+
+Tor carries **TCP streams only**. Myotis' transports:
+
+| Layer | Transport | Tor-able? |
+|---|---|---|
+| RLPx / eth / snap (port 30303) | TCP | Yes (Arti data stream) |
+| CL libp2p req/resp (port 9000) | TCP | Yes — but content-benign, may not need it |
+| CL libp2p req/resp over QUIC (`/udp/<port>/quic-v1`; the Rust engine listens on an ephemeral UDP port, dials a peer's QUIC address FIRST — the spec's order — and reaches a QUIC-only peer over QUIC alone) | UDP | **No** — if CL traffic is ever routed over Tor, QUIC has to be off for it (`HostConfig.listen_quic = None`, no QUIC dial, QUIC-only candidates dropped), or most CL peers are reached in the clear |
+| discv4 (EL discovery) | UDP | **No** |
+| discv5 (CL discovery) | UDP | **No** |
+| EIP-1459 ENR trees | DNS TXT (dnsjava; hickory in the Rust engine) | Not directly; needs DoH over a Tor stream. The Rust engine's walk is **skipped while Tor is enabled** (#539): a system-resolver query for `all.mainnet.ethdisco.net` tells the local resolver which network this node is on |
+| CCIP-Read gateways | HTTPS | Yes (standard) |
+
+Myotis is effectively **outbound-only** (a light client that dials), which is
+Tor-friendly: no inbound reachability, no onion service needed.
+
+**Exit policies.** Tor's default exit policy does **not** block 30303 or 9000
+(its reject list is SMTP/NetBIOS/BitTorrent-ranges/etc.), so default-policy exits
+carry them. However, a large fraction of exits run the "reduced exit policy"
+(~65 web/mail/IRC/Bitcoin ports), which excludes both. Tor selects exits whose
+policy permits the destination port automatically — connections succeed, but from
+a smaller, often more loaded exit pool. This should be measured (see Open
+questions) before committing.
+
+> **PoC:** confirmed real, not just theoretical. A fraction of circuit builds to
+> `:30303` fail with Arti's `Failed to obtain exit circuit for ports` (the reduced
+> policy at work), and others reach the peer but time out at the exit. The port is
+> reachable — most attempts do get a stream — but the exit pool for it is visibly
+> smaller and lossier than for web ports. Quantifying the exact fraction is still
+> open (§8.1); the qualitative answer is "usable with retries, not free."
+
+**Latency.** Per the Optimisations doc, round-trip time — not bandwidth — is what
+makes or breaks the wallet experience, and Tor adds ~0.5–1.5 s per round trip
+plus ~1 s+ per circuit build. This is the strongest argument for routing **only
+the sensitive flows** through Tor and keeping bulk/benign flows direct.
+
+> **PoC:** measured, and the variance is the story. Arti cold bootstrap is a
+> one-time ~11–12 s. Once bootstrapped, a full verified snap account read (Tor
+> connect + RLPx handshake + eth Status + head-header fetch + GetAccountRange)
+> was **~0.75 s on a good circuit but up to ~18 s on a slow/lossy one** — the
+> single account fetch alone hit 14 s through a bad exit. The mean is tolerable;
+> the tail is not, and it lands exactly on the confirm-screen path. This
+> sharpens §8.5: the Tor mode needs its own serve-stale / timeout-and-retry
+> policy, not just the clearnet budget.
+
+## 3. Tor client library: Arti, in the Rust engine
+
+Per-identity circuit isolation ("stream isolation") is a first-class Tor concept.
+The proposal targets **Arti** (the Tor Project's official Rust implementation,
+embeddable as a plain library) inside the **Rust engine** — and only there:
+
+- Isolation is an explicit API: an `IsolationToken` attached to `StreamPrefs`
+  per stream — streams with different tokens never share a circuit — plus
+  `TorClient::isolated_client()` for a fully isolated handle. **One token per
+  wallet address** gives exactly the property we want: any single exit node
+  ever sees queries for one address, not the user's whole portfolio.
+- **Android is covered by the same code.** The Rust engine already crosses to
+  Android as jniLibs (`cargoNdkAndroid`); Arti compiles for the same NDK
+  targets and embeds in the engine, so the Android host needs no separate Tor
+  integration (no bundled daemon, no Orbot dependency). Likewise iOS, where the
+  Rust engine is the only engine (not wired yet). **Shipped on Android behind
+  `-PtorEngine`** (`./gradlew :android-app:assembleDebug -PtorEngine`, which
+  sets `MYOTIS_TOR_ENGINE=1` for `rust/build-android.sh`), with three
+  Android-only differences:
+  - *TLS backend.* Off Android Arti runs on native-tls; on Android that means
+    OpenSSL, which the NDK does not ship, so the Android jniLibs take Arti's
+    rustls backend with the **ring** provider — already linked there through
+    libp2p-quic — and `el/tor.rs` installs it as the process default before
+    the first bootstrap (Arti's rustls backend panics without one). The two
+    are separate per-target dependency tables in `myotis-net/Cargo.toml`
+    because tor-rtcompat silently prefers native-tls when both are on.
+  - *SQLite is bundled* (`arti-client/static-sqlite`) for Arti's directory
+    cache: the NDK has no libsqlite3 to link and apps may not load the
+    platform's.
+  - *Storage directories are named by the host.* Arti's defaults derive from
+    `$HOME`, which an app process has no usable value for, so the engine
+    refuses an unconfigured Android bootstrap; `NodeService.applyTorMode`
+    names `noBackupFilesDir/arti/state` (guard state — never backed up) and
+    `cacheDir/arti` (the re-downloadable directory cache) through
+    `Tor.configureStorage` → `set_tor_storage_dirs` (ABI 43) before it turns
+    routing on. The directories cannot move once a bootstrap holds them; a
+    different pair after that is refused, not ignored.
+
+  Checked at build level so far (both ABIs cross-compile; the engine's only
+  NEEDED libraries stay libc/libm/libdl); an on-device bootstrap has not been
+  observed yet.
+
+  Arti adds ~9.3 MB per ABI to `libmyotis_engine.so` (arm64-v8a 15.4 →
+  24.8 MB, measured 2026-10-10), stored uncompressed in the APK, so — as on
+  desktop — no CI or release build passes the flag. The Settings row appears
+  only in a build that did: `supportsTor` reads `BuildConfig.TOR_ENGINE` first,
+  so a Tor-less APK never loads the engine library just to learn it cannot
+  route, and a Tor build confirms it with the loaded library.
+- **The Java engine gets no Tor mode for now.** A Java path would mean bundling
+  a Tor daemon and driving it over SOCKS — deliberately out of scope; hosts
+  that want private mode select the Rust engine (`myotis.engine=rust`). This
+  also keeps the privacy machinery in one implementation instead of two
+  parity-tracked ones.
+
+Two properties to keep in mind:
+
+- **Isolation cost**: each isolated circuit is a fresh 3-hop build (~1 s+).
+  Per-address isolation (circuits reused across that address's fetches) is
+  affordable; per-*connection* isolation on a 32-peer dial wave is not.
+- **The guard doesn't change.** Isolation varies middle + exit; the entry guard
+  stays pinned (Tor's Sybil defense). Isolated circuits unlink addresses from
+  each other at the exit — they are not "completely new paths."
+
+> **PoC:** validated. `arti_client::TorClient` bootstraps and runs entirely
+> in-process (no bundled `tor`, no Orbot), and `StreamPrefs::set_isolation(token)`
+> with one `IsolationToken` per address drives distinct circuits. The PoC dials
+> real mainnet peers on `:30303` and completes RLPx + eth/66-69 + snap/1 through
+> them. **The one production change needed was making the RLPx transport generic
+> over the byte stream** (`RlpxConnection<S = TcpStream>` / `EthSession<S>` +
+> `handshake_over()`); the default type parameter keeps every clearnet caller
+> untouched, so the *same* handshake/frame/eth/snap code drives both a `TcpStream`
+> and an Arti `DataStream`. No protocol logic changed.
+>
+> **Implementation gotcha (cost us the whole path until found):** Arti's
+> `DataStream` **buffers writes and requires an explicit `flush()`** to emit
+> cells onto the circuit, whereas `TcpStream` sends eagerly. Without a flush after
+> writing the auth/frames the peer never sees them and FINs, surfacing as a
+> misleading "early eof" reading the RLPx ack. The production Tor path must flush
+> after every write (a harmless no-op on TCP).
+>
+> **Bound the handshake explicitly.** The clearnet `dial()` wrapped the whole
+> handshake in a timeout; the extracted `handshake_over()` is deliberately
+> unbounded so the caller can pick a Tor-appropriate budget. A Tor peer that
+> accepts the stream but never sends the ack will otherwise hang the task and
+> leak a circuit slot — so every Tor-side caller MUST wrap it in a timeout
+> (retrying on a fresh circuit is the natural response, given exit variance).
+
+## 4. The proposed split: clearnet background, Tor foreground
+
+Route by sensitivity, not wholesale:
+
+**Stays clearnet (real IP):**
+
+1. **Discovery** — discv4/discv5 are UDP and can't cross Tor anyway; they reveal
+   only "this IP runs a client." The EIP-1459 DNS walk is the exception that
+   does NOT stay on: the Rust engine skips it while Tor is enabled, since a
+   clearnet TXT query for a network's tree names the network to the local
+   resolver (open question 8, DoH over Tor, is what would bring it back).
+2. **Snap capability/quality validation** — probing a discovered peer with
+   `GetAccountRange` at **random** account hashes / random ranges reveals nothing
+   about the wallet and looks like ordinary state-sync traffic. This feeds the
+   existing quality cache (`snapok`/`snapbad` in `peers.cache` —
+   `app/.../PeerCache.java`).
+3. **CL light client** — content-benign (§1); paying Tor latency on the per-slot
+   finality fan-out buys little. (Optionally proxied later; see Open questions.)
+
+**Goes over Tor:**
+
+4. **Real snap queries** for the user's addresses — per-address circuit
+   isolation (§3) and **ephemeral RLPx node keys** (§6.1).
+5. **Transaction broadcast** — over Tor to the proven peer pool; zero trust cost
+   by construction. **Shipped:** up to five pool peers at once under one
+   isolation token fresh to the send, each push a fresh RLPx identity
+   confirmed by the peer's Pong (`EthSession::await_pong`); the send answers
+   at the first confirmed push, counts a push that landed without a Pong as
+   sent (it may be out), and fails closed when none landed. Rebroadcasts
+   follow the same route, one round at a time per network, each walking on to
+   the next five eligible peers; a Tor send is never re-pushed in the clear, a
+   wallet's re-submit of it included (while the engine still holds its
+   bytes: in memory only, forgotten on a restart, a stop or a pause — see the
+   status note above). The peers are nodes of the Tor reserve,
+   ready ten minutes after their last direct contact (status note above); Tor sessions advertise
+   no listen port and the client id `myotis` without its version (§6.3).
+
+## 5. The quarantined peer pool (delayed use)
+
+The link an adversarial peer could still make is: "IP X discovered/probed me,
+and *some Tor client* later queried address A through me." The proposal breaks
+the pairing with a **randomized aging window between the last clearnet contact
+with a peer and the first real (Tor-side) use of that peer** — on the order of
+**days**.
+
+Timeline per peer:
+
+```
+discover (clearnet, UDP)
+   └─> validate immediately (clearnet, random-range snap probe)
+          └─> cache entry stamped lastClearnetContact = now
+                 └─> QUARANTINE: not Tor-usable until
+                     now + randomized threshold (days)
+                        └─> Tor-side dial ranking may select it
+                            (fresh RLPx identity, per-address circuit)
+```
+
+Design rules:
+
+- **The clock runs from the *last* clearnet contact, not the first.** Peer
+  quality decays over days, and re-validating in the clear is always allowed
+  (random ranges stay non-sensitive) — but every clearnet contact restarts that
+  peer's quarantine, otherwise "days of silence before Tor use" quietly erodes
+  to hours. This naturally pushes toward **rotating batches**: validate batch A,
+  let it quarantine untouched while batch B is being probed; use aged batch A
+  over Tor; retire and re-probe it later.
+- **Every background clearnet loop must respect the quarantine.** This is not
+  automatic: today's peer maintenance re-dials cached peers in the clear all the
+  time (`ChainStack.maintainSnapPeers` tops up the active pool from the cache
+  every 10 s; discovery re-pings table peers every 15 s). Left unmodified, those
+  loops would keep touching quarantining peers and perpetually reset their
+  clocks — no peer would ever mature. So quarantine membership must be a hard
+  filter on *all* clearnet contact, not just on probing: the maintainer and
+  dial ranking draw only from the active (clearnet) batch, quarantining peers
+  are excluded from clearnet dialing entirely, and the Tor-side pool is the only
+  consumer that ever contacts them again. (Unsolicited *inbound* contact — a
+  quarantined peer pinging us via discv4 — doesn't reset the clock: the property
+  is about what our IP initiates toward that peer.)
+- **Fail closed.** When the aged, multi-source-confirmed pool runs dry, the
+  Tor-side path must error or wait for the pool to refill — never fall back to
+  freshly discovered peers, or the property silently evaporates exactly when
+  it's under stress. (Same philosophy as the existing verified-reads posture:
+  honest error over degraded answer.)
+
+- **Tor-reachability is a first-class selection criterion — this is the PoC's
+  biggest surprise.** The design assumed "reach a good snap peer" was the same
+  problem over Tor as over clearnet. It is not. **Most synced full nodes drop
+  inbound connections from Tor exit IPs** — either an immediate FIN right after
+  our auth, or a `reason=4` "Too Many Peers" disconnect — because they are
+  inbound-saturated and the whole Tor network arrives from a small, busy set of
+  exit IPs. Empirically the peers that *do* accept Tor inbound skew toward
+  *less-busy* nodes, which are disproportionately **poorly-synced or stuck at
+  genesis** (they have free slots precisely because nobody else wants them). A
+  peer that completes the handshake over Tor but advertises head #0 cannot serve
+  a snap query at a fresh retained state root — so "accepts Tor inbound AND is
+  synced" must be an explicit promotion gate for the Tor pool, validated (like
+  snap quality) during the clearnet probe and re-checked over Tor. Selecting on
+  clearnet snap-quality alone is not enough.
+- **Bootstrap via popular peers.** A strict quarantine would mean no private
+  queries for days after first install. The escape is the *popularity* property:
+  peers on the public EIP-1459 DNS ENR tree (mainnet pins
+  `all.mainnet.ethdisco.net`) and the hardcoded bootnode-adjacent set are known
+  to every client in existence — dialing them over Tor reveals nothing about how
+  *you* found them, so they are Tor-usable on day one with **zero aging**. The
+  personally-discovered, quality-validated pool matures in quarantine and
+  gradually takes over.
+- **Implementation is small — but in a separate file, not a new `peers.cache`
+  column.** `peers.cache` is shared byte-identically between the Java and Rust
+  engines, and each engine's rewrite path serializes only the columns it knows
+  (`PeerCache.java`, `peercache.rs`) — since the Java engine gets no Tor mode
+  (§3), a Java-side rewrite would silently strip a Tor-only column. Quarantine
+  metadata (`lastClearnetContact`, discovery-source confirmations) therefore
+  lives in a **Tor-only sidecar** (e.g. `peers-tor<suffix>.cache`) keyed by the
+  peer's public key, owned exclusively by the Rust engine's Tor mode. The
+  Tor-side dial ranking joins it against the shared cache and filters on
+  `now − lastClearnetContact > randomizedThreshold` before the existing
+  `snapok` preference. (Entries whose peer disappears from `peers.cache` are
+  pruned; a missing sidecar just means an empty Tor pool — fail closed, §5.)
+
+  > **Shipped (a first step):** the sidecar exists as `peers-tor[-net].cache`
+  > (`el::torreserve`), but holds the reserved nodes themselves rather than
+  > metadata joined against `peers.cache`: a reserved node moves out of the
+  > shared cache, so neither the direct pool nor a Java-side rewrite sees it,
+  > and its `lastClearnetContact` is the `direct=` column. The threshold is a
+  > fixed ten minutes, not a randomized days-long one, and there are no
+  > discovery-source confirmations yet (status note at the top).
+
+## 6. Attacks the delay does NOT stop (each needs its own fix)
+
+The aging window defeats **timing correlation** — with days in between and
+thousands of other clients contacting the same peer, proximity-pairing is noise.
+Three linkage channels survive arbitrary delay:
+
+### 6.1 Node identity reuse — fatal if unfixed
+
+Myotis has one persistent secp256k1 node key (`nodekey.hex`,
+`app/.../FileNodeKeyStore.java`) used for discovery ENRs **and** RLPx handshakes.
+If a Tor-side handshake presents the public key a peer already saw from the
+user's real IP during probing, the peer links them instantly — delay irrelevant.
+**Tor-side connections must generate ephemeral RLPx keys** (per address, matching
+the circuit isolation). Cheap: Myotis is outbound-only, so nothing depends on our
+identity persisting.
+
+### 6.2 Poisoned discovery results as tracking tags
+
+A malicious discovery node can hand **each querier a unique enode** in its
+NEIGHBORS/discv5 responses. Whoever later dials that unique peer — via Tor, days
+later — is identified as the querier from IP X. This is *set-membership*
+correlation; delay never helps. Mitigation: a peer is promoted into the
+Tor-usable pool only when confirmed from **multiple independent sources**
+(several disjoint FINDNODE paths, and ideally the DNS ENR tree). Popularity
+breaks linkage more fundamentally than delay: delay handles timing, popularity
+handles membership.
+
+### 6.3 Client fingerprinting — anonymity bounded by the user base
+
+The Hello advertises a `myotis/<version>` client id (Java engine:
+`HelloMessage.java`; Rust engine — the one that serves this Tor path — derives
+it from the `myotis-net` crate version), and even with a spoofed clientId the
+request shape is distinctive (single-account ranges with full-range limit and
+the 4 KiB response cap, the characteristic header probe).
+A peer can plausibly tag both the clearnet prober and the Tor-side client as "a
+Myotis instance." With many Myotis users, fine — the delay plus a large
+anonymity set prevents pairing *which* instance. With very few users, the
+correlation is strong regardless of delay. Structural today; dissolves with
+adoption. It argues for making Tor-side request shapes as generic as practical,
+and for not shipping a unique clientId on the Tor path.
+
+> **Shipped:** the Tor-side Hello says `myotis`, without the version
+> (`el::tor::TOR_CLIENT_ID`), so a peer cannot match a Tor session to a direct
+> one by version; it still names the software (an owner's choice over
+> borrowing another client's id), and the request shapes are unchanged.
+
+## 7. What each mechanism buys — summary
+
+| Mechanism | Defeats |
+|---|---|
+| Tor + per-address isolation (§3, §4) | address ↔ IP linkage at snap peers; tx ↔ IP at broadcast; cross-address linkage at exits |
+| Ephemeral Tor-side RLPx keys (§6.1) | identity-based pairing of clearnet probe ↔ Tor use |
+| Quarantine delay (§5) | timing correlation between clearnet contact and Tor use |
+| Multi-source / popularity promotion (§6.2) | per-querier poisoned-peer tracking tags |
+| Generic Tor-side request shapes (§6.3) | (partially) client-fingerprint pairing; fully only with adoption |
+| Fail-closed pool (§5) | silent property loss under peer starvation |
+| Tor-reachability + synced gate (§5, PoC) | selecting peers that clearnet-validate but drop Tor inbound / are unsynced → a dry Tor pool at query time |
+| Bucketed reads + one peer per bucket (§11, proposal) | (partially) address disclosure to the serving peer itself — k-anonymity within an aligned bucket, which Tor alone does not give |
+
+## 8. Open questions for review
+
+1. **Exit-pool health for port 30303/9000** — what fraction of exit bandwidth
+   permits them in practice, and what does that do to circuit build success and
+   latency? Needs measurement before committing.
+   > **PoC:** partially answered — `:30303` is reachable over Tor but from a
+   > visibly smaller/lossier exit pool; some builds fail outright on the reduced
+   > exit policy. The exact usable-bandwidth fraction is still unquantified.
+2. **Delay distribution** — uniform over what range? Per-peer independent draws?
+   Is there an analysis that pins how much delay is enough given peer contact
+   rates observed from crawlers?
+3. **Pool sizing** — how large must the quarantined pool be to absorb days of
+   churn and still hold N healthy snap peers at query time?
+   > **PoC:** the constraint is tighter than churn alone — the pool must hold N
+   > peers that are *both* synced *and* Tor-inbound-accepting (see §5), a
+   > materially smaller fraction of discovered snap peers than expected.
+4. **Should the CL side eventually be proxied too?** Content-benign, but it
+   fingerprints wake/sleep timing at the real IP. A later phase could route it
+   through the same machinery at low priority.
+5. **Latency budget** — with per-address circuit reuse and the batched snap
+   fetches (`BATCH_PATHSET_CHUNK`), is a Tor-routed balance read acceptable on
+   the confirm-screen path, or does the Tor mode need its own serve-stale
+   policy?
+   > **PoC:** measured ~0.75 s (good circuit) to ~18 s (slow/lossy) for a full
+   > verified read — the tail is too slow for a synchronous confirm screen, so
+   > the Tor mode almost certainly needs its own serve-stale + retry policy.
+6. **Tx broadcast fan-out over Tor** — one circuit to a few aged peers, or
+   several isolated circuits to disjoint peer subsets (stronger against a
+   listening peer, more circuit builds)?
+   > **Shipped as:** one isolation token per send (its circuits carry no
+   > other send and no read), up to five nodes of the Tor reserve (no direct
+   > contact for ten minutes, never dialed directly again); each rebroadcast
+   > round walks on to the next five. The
+   > days-long aging of §5 is not built, so the stronger options remain open.
+7. **Mobile cost** — the embedded Arti client keeps a
+   guard connection alive; interaction with idle-pause and battery needs design
+   (probably: Tor client lifecycle == stack awake lifecycle).
+8. **DoH-over-Tor for the ENR tree walk** — which resolver, and does that
+   introduce its own linkage?
+9. **Peer-side Tor-exit rejection (new, from the PoC)** — synced full nodes
+   widely drop inbound from Tor exit IPs (immediate FIN or `reason=4`), and the
+   nodes that *do* accept skew toward unsynced ones (§5). How large is the
+   population of synced, snap-serving, Tor-accepting mainnet peers really, and is
+   it stable enough to sustain a fail-closed pool? This gates everything and is
+   the first thing to measure at scale. If it proves fatal, the first
+   alternative to measure is a VPN-style overlay whose exit IPs are not the
+   Tor exit set — see §10.
+10. **Bucketed reads (§11)** — the real account count per network and the
+    real per-block change rate (they set `b` and how much timing leaks), the
+    response caps of the snap peers actually reached (how many replies a
+    bucket takes), whether whole-bucket requests can be shaped like snap-sync
+    range requests (§6.3), and whether the Tor reserve can hold one operator
+    per bucket for a realistic wallet (§11.6).
+
+## 9. Proof of concept — what was validated
+
+A runnable PoC lives at `rust/tor-poc` (standalone crate, excluded from the Rust
+workspace so Arti's dependency tree never touches the pure-engine build). It
+reuses the real `myotis-net` RLPx + eth/snap stack by path and runs it over Tor
+against live mainnet. See `rust/tor-poc/README.md` for how to run it.
+
+**Validated end-to-end:**
+
+- Arti embeds and bootstraps in-process (§3) — no bundled `tor`, no Orbot.
+- Per-address stream isolation (§3): one `IsolationToken` per address → distinct
+  circuits; the PoC reads two addresses each over its own isolated circuit.
+- Ephemeral Tor-side RLPx keys (§6.1): a fresh random node key per connection.
+- The existing RLPx + eth/66-69 + snap/1 stack runs **unmodified** over an Arti
+  `DataStream` (§4) — the only production change was making the transport
+  generic over the stream type (default `TcpStream`). A clearnet baseline runs
+  the identical code over `TcpStream` for comparison.
+- The §1 "core leak" flow itself: a real `GetAccountRange` for a user address,
+  MPT-verified, returned over Tor with the IP behind three hops (e.g. a verified
+  balance for `d8dA…6045` against a synced peer's head state root).
+
+**Deliberately out of scope (still proposals):** the quarantined peer pool and
+its aging window (§5; a first step, the `peers-tor` reserve, has shipped since),
+multi-source popularity
+promotion (§6.2), generic request-shape hardening (§6.3), tx-broadcast fan-out
+(§8.6), and — importantly — **the beacon-anchored trust root**: the PoC anchors
+the snap proof to the peer's *own claimed* fresh head, not the sync-committee
+anchor. It proves the transport, not a trust-model change; its `VERIFIED` output
+means "MPT-consistent with a peer-claimed head," which is strictly weaker than
+the wallet's real verified-read guarantee (see the "Trust" section of
+`CLAUDE.md`). Any productionization must anchor to the beacon chain.
+
+**Key learnings folded into the sections above:** the `DataStream` flush
+requirement and mandatory handshake timeout (§3), the measured latency tail
+(§2/§8.5), the reduced-exit-policy reality for `:30303` (§2/§8.1), and the
+dominant blocker — peer-side rejection of Tor exit IPs, which promotes
+"Tor-reachable + synced" to a first-class peer-selection gate (§5/§8.9).
+
+## 10. Alternatives considered: HOPR / Gnosis VPN (assessment, 2026-08-10)
+
+Would the [HOPR mixnet](https://hoprnet.org) or
+[Gnosis VPN](https://vpn.gnosis.eth.limo) (a VPN built on it, funded by
+GnosisDAO) serve the §1 goal better than Tor? Short answer: **not instead —
+possibly alongside.** Arti stays the embedded transport; Gnosis VPN is worth
+recommending to desktop users as a system-level complement once it is
+generally available; direct HOPR integration is a dead end today.
+
+### The facts (as of 2026-08)
+
+**HOPR** — incentivized Sphinx mixnet; relays are paid in tickets settled on
+Gnosis Chain:
+
+- No embeddable client library exists. Using the mixnet means running a
+  `hoprd` node: operator onboarding is permissioned (waitlist), with a 30k
+  wxHOPR minimum stake (10k with an early-supporter NFT) behind a Safe, per
+  HOPR's node docs.
+- The Sessions API — TCP **and UDP** tunneling over 0–3 hops — is the right
+  shape for a wallet, but it is an API *of a running hoprd*, not a library.
+- HOPR's own productization of exactly this use case — **RPCh**, "private RPC
+  for wallets" — is officially paused (the `hoprnet/RPCh` repo is flagged
+  "-development paused-").
+- The relay network is on the order of hundreds of nodes with modest traffic;
+  whatever the mixing theory says, the practical anonymity set is orders of
+  magnitude below Tor's (~7–8k relays, millions of daily users).
+
+**Gnosis VPN** — a system-level VPN over the HOPR mixnet:
+
+- Not a library: a Rust system service (root routing daemon + worker + control
+  CLI) that owns system routing and DNS. No SDK, no SOCKS interface — nothing
+  an engine could link, and nothing it could drive per-connection.
+- Status per its published roadmap (fetched 2026-08-10): the current beta
+  ("El Dorado") is **desktop-only — macOS and Linux builds, explicitly not
+  Windows or mobile**; **multi-hop routing only arrives with
+  "Shangri-La" (Sep 2026)** — until then a relay/exit can see both the user's
+  IP and the destination, i.e. trust-the-operator VPN privacy, not mixnet
+  privacy; six exit locations; **on-chain metered payments**; broader
+  platform/OS support is a 2027 milestone ("Xanadu").
+
+### Why neither replaces the embedded Arti path
+
+| Axis | Arti/Tor (embedded) | HOPR direct | Gnosis VPN |
+|---|---|---|---|
+| Embeddable in the engine | Yes — in-process library (§3) | No — needs a staked, waitlisted hoprd | No — root-owned system service |
+| Mobile | Compiles for the same NDK/iOS targets (§3) | No | No (2027 roadmap) |
+| Per-address unlinkability | Yes — one `IsolationToken` per address (§3) | Conceivable via per-address Sessions | **No — current interface is one tunnel, one exit identity** |
+| Anonymity set | ~7–8k relays, millions of users | Hundreds of nodes | Its (beta) user base |
+| Cost to use | Free | On-chain ticket payments | On-chain metered payments; planned Circles-identity onboarding |
+| Maturity | ~20 years in production | Mixnet live; the wallet product (RPCh) paused | Closed beta |
+
+Two of these rows are decisive:
+
+- **Per-address unlinkability.** The §1 core leak is not only address ↔ IP but
+  the clustering of one user's addresses. Per-address isolation guarantees
+  different addresses never share a circuit, so any one circuit's exit-side
+  view covers one address — independently built circuits can still land on
+  the same exit relay, so this sharply reduces cross-address linkability
+  rather than guaranteeing a distinct exit IP per address. Gnosis VPN's
+  current single-tunnel interface cannot express even that much: it hides the
+  home IP but presents one exit identity for everything, so a peer can still
+  cluster every queried address as "same user."
+- **Payment bootstrap circularity.** Both HOPR and Gnosis VPN charge on-chain.
+  A wallet would need chain access — and would leave a linkable on-chain
+  payment trail — to buy the privacy layer that is supposed to protect its
+  chain access. Tor is free and leaves no such footprint.
+
+### What Gnosis VPN is genuinely good for (complementary, user-operated)
+
+Run *underneath* Myotis by the user, a system VPN covers, with zero Myotis
+code, everything the embedded Tor path does not:
+
+- **The UDP surfaces** — discv4/discv5 discovery can never cross Tor (§2).
+- **Every not-yet-routed flow** — storage/token reads, `eth_call`, receipt
+  polling, the CL fetch, and the host-side HTTP/DNS surfaces (DNS ENR walk,
+  CCIP-Read, the tx-history debug fetch) — on both engines, plus the tx
+  broadcast whenever Tor mode is off.
+- **A path around §8.9.** Synced peers drop Tor exits because the whole Tor
+  network arrives from one small, saturated, widely blocklisted set of exit
+  IPs. Gnosis VPN's exits are today ordinary, low-traffic addresses that
+  devp2p peers treat like any VPN customer — though a six-location fleet would
+  recreate the same funnel if its adoption grew.
+
+The properties are weaker (table above: one exit identity, operator-visible
+until multi-hop ships, beta-sized anonymity set) but the *coverage* is total,
+and the two compose: the engine's Tor mode keeps per-address isolation for
+account reads while the VPN blankets everything else. (Running Arti through a
+VPN is unremarkable — the guard then sees the VPN exit instead of the home IP;
+the exit-side story of §3–§5 is unchanged.)
+
+### Revisit triggers
+
+Re-evaluate when any of these becomes true:
+
+1. **Gnosis VPN ships something embeddable** — an SDK, a SOCKS/local-proxy
+   interface, or mobile support ("Xanadu", 2027, is the earliest plausible
+   date). A local-proxy interface would slot in as a second `S` behind the
+   generic `RlpxConnection<S>`/`EthSession<S>` seam (§3), same as Arti did.
+2. **HOPR Sessions become permissionless** — usable without a staked,
+   waitlisted hoprd, with a payment story that doesn't leave an on-chain
+   trail.
+3. **§8.9 proves fatal at scale** — if the synced-and-Tor-accepting peer
+   population cannot sustain a fail-closed pool, Gnosis VPN's exit fleet is
+   the first alternative to measure.
+
+## 11. Bucketed reads: hiding the address inside a range (proposal, 2026-11)
+
+> **Status: design only — nothing in this section is implemented.** Today
+> every address-carrying snap read asks for exactly one account
+> (`starting = keccak(address)`, full-range limit, small response cap —
+> §6.3), so the serving peer learns `keccak(address)` and hence the address
+> (§1). Tor (§3–§5) unlinks that from the IP; it does not hide the address
+> from the peer. This section is about hiding the address itself.
+
+### 11.1 Why not PIR (yet)
+
+Private information retrieval would hide the query entirely, and the Ethereum
+Foundation runs a workstream on it (the "Private Reads" track: the sharded-PIR
+design, ethresear.ch post 24552; the `inspire-gpu-serving` reference server and
+Rust client). As of 2026-11 it does not fit Myotis:
+
+- **Answers are unverified.** The served records are `delegate ‖ balance ‖
+  nonce`, without a proof; the EF's wallet guide states that the wallet trusts
+  the server and that answers are not checked against the state root.
+  "Verifiable PIR" (private Merkle-proof retrieval) is listed as research for
+  Q1 2027. Under *Trust* in `CLAUDE.md` that is not usable, and a PIR server
+  over HTTPS is also outside the devp2p/libp2p data-source rule.
+- **Asking for the proof separately would undo it.** Fetching the proof
+  afterwards (snap, `eth_getProof`) names the account again. A verified PIR
+  read has to carry the proof INSIDE the PIR record (the post's "Baseline 2"),
+  or fetch it level by level with one PIR query per trie level. Either needs no
+  new cryptography, but an MPT account proof is ~4.8 KB against a 60 B record
+  today, ~80× the database and roughly the server work. That cost, not
+  privacy, is why it does not exist yet. The closest academic work,
+  *Authenticated PIR* (Colombo et al., USENIX Security 2023), has a prototype
+  and costs 30–100× unauthenticated single-server PIR.
+- **A proof stops a forged answer, not a selective-failure attack.** A server
+  that corrupts some records and watches whether a client retries, falls back
+  or changes its schedule learns whether the client's record was among them.
+  Any verified PIR path must fail with the same network-visible behaviour as a
+  success: no retry, no fallback, same cadence. The same rule applies to the
+  bucket scheme below.
+
+So PIR stays a revisit item: when the EF ships proof-carrying records (or
+per-level lookups) for the MPT account trie, Myotis is well placed to consume
+it, because it already holds a verified state root per block and the proof
+verifier (`verify_account_proof`). Until then, the scheme below works against
+today's snap peers and keeps every answer verified.
+
+### 11.2 The bucket rule
+
+The account trie has (almost) no empty leaves — EIP-161 removes empty
+accounts — so the number of accounts in a range IS the anonymity set, and a
+range with one account in it hides nothing. `keccak(address)` is uniform, so a
+range covering a fraction `w` of the 256-bit key space holds about `N·w`
+accounts, with `N` the network's account count.
+
+- **Fixed, aligned buckets — never a window around the address.** A range
+  centred on `keccak(address)` names the address by its middle. Split the key
+  space into `2^b` buckets by the first `b` bits of the hash and always request
+  a WHOLE bucket: origin `prefix ‖ 00…0`, limit `prefix ‖ ff…f`. The peer learns
+  the `b`-bit prefix, which every account in the bucket shares.
+- **Size by count, not width:** `b = floor(log2(N / k))` for a target set
+  size `k`. With `N ≈ 2.7×10⁸` (an assumption, to be measured) and roughly 65 B
+  per account on the wire:
+
+  | b | buckets | accounts / bucket | reply |
+  |---|---|---|---|
+  | 14 | 16 384 | ~16 000 | ~1 MB |
+  | 16 | 65 536 | ~4 000 | ~260 KB |
+  | 18 | 262 144 | ~1 000 | ~65 KB |
+
+  Bucket sizes stay close to the mean: ±1.5 % is one standard deviation at
+  4 000, and the extremes across 65 536 buckets reach roughly ±7 %, which is
+  what the "fits in one or two replies" sizing below has to allow for.
+- **Measure `N` per network, at runtime.** Gnosis and Sepolia are far smaller
+  than mainnet, so a hard-coded `b` would give them tiny buckets. Any verified
+  account page gives an estimate: `N ≈ count · 2²⁵⁶ / (last_hash − origin)`.
+  The Rust engine has no source for such pages yet: its account requests are
+  single-key with a 4 KiB budget, and its snap quality comes from served reads
+  (`ElPeerCache::record_snap_served`), not from random-range probes (§4 item 2
+  describes the Java engine's). So the estimate starts from a conservative
+  compiled-in value per network and is refined from the bucket pages
+  themselves (thousands of accounts each), or from new random-range probes,
+  which leak nothing; one 4 KiB page (~60 accounts) alone is too noisy.
+- **Pin an address's bucket for its lifetime.** A refined `N` can move `b`
+  across a power of two. Re-bucketing an address from `b` to `b + 1` swaps
+  its bucket for one of the two halves, and whoever sees both — the old
+  peer, or one operator group across a peer switch (§11.4 rule 3 is only a
+  heuristic) — learns which half holds the account, the same intersection
+  §11.3 warns about for re-drawn decoys. So an address's `(b, prefix)` is
+  fixed when it is first assigned and kept; only addresses added later use
+  the refined `b`. (The other direction, `b − 1`, is the parent bucket and
+  leaks nothing, at double the reply size — the one safe correction when an
+  early estimate proves too small.)
+- **Always fetch the whole bucket.** When a bucket spans several replies, page
+  to its end even after the target account has arrived: stopping early tells
+  the peer where the account sits. Choose `b` so a bucket usually fits in one
+  or two replies of the peers actually reached (their response caps differ by
+  client and have to be measured).
+- **Verify the whole page.** Today the reader checks a single-account boundary
+  proof only (`verify_account`, `rust/myotis-wire/src/snap/fetch.rs`). Proving
+  that the target sits inside a returned page — and that the page omits
+  nothing — needs a full snap range-proof check (both boundary proofs plus
+  every leaf rebuilt to the root, as geth's `VerifyRangeProof` does). Myotis
+  has none yet; it is the first piece of code this design needs.
+- **Storage reads are buckets too, inside each contract's storage trie.** A
+  token balance read (`GetStorageRanges`) names the token contract — which
+  stays disclosed — and buckets the storage-trie path by the same rule: for a
+  mapping entry the slot index is `keccak(pad(addr) ‖ pad(slot))`, and the
+  trie (and so `GetStorageRanges`) is keyed by `keccak(slot index)`, so it is
+  that second hash whose prefix picks the bucket. `N` is the contract's slot
+  count (estimated the same way). A small token's trie may need to be fetched
+  whole, and its anonymity set is then its holder count.
+
+### 11.3 What `k` is really worth
+
+`k` is an upper bound. Three things shrink it:
+
+1. **Plausibility.** `N` counts every account, contracts included, and a
+   contract is rarely the wallet's address, so the EOA share of a bucket is
+   the first discount. A chain-analytics adversary then weights the remaining
+   accounts by activity. If ~5 % of a bucket's accounts are recently active
+   EOAs (illustrative), a bucket of 4 000 is a set of ~200.
+2. **Timing — the dominant leak.** Mainnet changes on the order of a thousand
+   accounts per block (order of magnitude, to be measured), so a 4 000-account
+   bucket sees ~0.02 changed accounts per block. A read the wallet makes
+   BECAUSE something happened — a refresh after an incoming transfer, a nonce
+   poll after its own send — is answered by "the one account in this bucket
+   that just changed". The send case re-links the sender to the IP that Tor
+   broadcast (§4 item 5) keeps apart. **Rule: a bucket read's timing must not
+   depend on the account's activity.** Each bucket is read on its own fixed
+   schedule (§11.4 rule 5), never on an event.
+3. **Linked addresses.** A wallet's five addresses are five buckets; the five
+   accounts, one per bucket, that fund each other on-chain are usually unique.
+   Each address keeps its own Tor isolation (§3), and a wallet's buckets are
+   not queried back to back.
+
+**Decoy buckets** multiply the set by `d + 1` at `(d + 1)×` the cost, but only
+if they are drawn ONCE per address and kept: decoys re-drawn per query are
+intersected away, since the real bucket is the one that recurs.
+
+### 11.4 Peer separation: one peer, one bucket
+
+Spreading reads across peers helps only in the right form. A time window alone
+("one thing per peer per N minutes") does little over clearnet: a peer
+recognises the requester by IP and by RLPx node key — the persistent
+`nodekey.hex` key on the direct path (§6.1); only the Tor path uses a fresh key
+per connection (`el::tor`) — so address A today and address B tomorrow from
+the same IP or key are linked however far apart they are.
+
+Worse, **different queries about the SAME address multiply**. A peer that sees
+an account bucket of ~4 000 accounts and, from the same identity, a USDC
+storage bucket computes each of those 4 000 accounts' USDC slot hash and keeps
+the ones inside the storage bucket. If that bucket covers ~1/8 000 of USDC's
+slots, the real account survives (its slot is why the bucket was asked for)
+plus ~0.5 false positives: ~1.5 candidates, the address all but identified.
+Repeating the SAME bucket, by contrast, tells the peer nothing new.
+
+The rules:
+
+1. **Each bucket gets a sticky peer** (guard-style), and that peer only ever
+   sees that bucket. Together with the backup set of rule 4, which a slow read
+   discloses the bucket to (§1: hedging discloses on slowness), that is the
+   bucket's disclosure set from the start; it grows further only when one of
+   them leaves.
+2. **No identity ever shows one peer two different buckets.** Over Tor that
+   means not from the same circuit and ephemeral key, and not close enough in
+   time for connection timing to link them. On the direct path the IP and
+   the persistent key never change, so it would mean one bucket per peer for
+   the life of the install, with a network observer seeing every dial (§11.7)
+   — **bucket mode is therefore Tor-only**: the direct path keeps today's
+   single-account reads, and a bucket read with no Tor route fails closed.
+3. **The unit is the operator, not the node.** One operator running many nodes
+   pools what they see. Group peers by IP prefix / ASN (a heuristic — operators
+   are not visible) and count a group as one peer.
+4. **Hedging stays inside the bucket's own peers.** The read hedge
+   (`HEDGE_DELAY`, up to `MAX_HEDGED_ATTEMPTS` peers, §1) may go only to a small
+   fixed backup set for that bucket; a hedge to arbitrary peers turns slowness
+   into disclosure.
+5. **A fixed schedule per bucket, not one global queue.** Under rules 1–2 a
+   bucket's peer sees only that bucket, so a global paced queue whose idle
+   slots go to a decoy bucket hides nothing from it: the real bucket's peer
+   would still get a request only when the wallet has a reason to read, and
+   that reason lines up with on-chain changes in the bucket. Instead each
+   bucket — real or decoy — is read at its own fixed interval (with jitter
+   that ignores activity) whether or not a read is needed, and a real need
+   waits for its bucket's next slot. A new address's schedule starts after a
+   random delay, so its first request does not mark when it was added or
+   funded. This is what §11.3's timing rule needs, and it is the main cost
+   driver (§11.6).
+
+**Fail closed**, as everywhere in this document: no eligible peer for a bucket
+means the read waits or fails, never that it goes to an ineligible peer or to
+a single-account query.
+
+### 11.5 Interplay with the activity follower
+
+The activity follower (#691, `el::activity`) already removes most repeat reads:
+it fetches the verified block access list (EIP-7928) of EVERY kept block —
+nothing address-specific is requested — and answers a watched account at the
+head from them (`ElReader::followed_account`, `verifyMethod`
+`blockAccessList`), seeded from one earlier proof. So the ANSWER needs a
+bucket read only to anchor: the first read of an address, and a re-read after
+a follower gap (window passed, a BAL no peer served, a block before
+Amsterdam). The per-bucket schedule of §11.4 rule 5 still runs regardless.
+
+Three consequences:
+
+- **Gaps are not activity-driven** (a fetch failure, a window overrun), so a
+  re-anchor after one leaks little — provided it waits for its bucket's slot
+  (§11.4 rule 5) like any other bucket read.
+- **Without BALs, re-reads ARE activity-driven.** Where a host re-proves an
+  address only when a block's `logsBloom` hits it (the follower's `log`
+  coverage), the re-read's timing is exactly the leak of §11.3 item 2. In
+  bucket mode such re-proofs must also wait for the bucket's own slot,
+  decoupled from the bloom hit, at the cost of a staler balance.
+- **The per-bucket schedule runs even while the follower answers.** A bucket
+  whose peer is asked only when the follower has a gap would leak the gaps'
+  timing; the follower makes most scheduled reads REDUNDANT for the answer,
+  not unnecessary for the cover.
+
+### 11.6 Cost
+
+- **Peers.** Rules 1, 2 and 4 make every peer that sees a bucket exclusive to
+  it, the backup set included: `buckets × (1 + backups)` separate peers
+  (operators), with `buckets = addresses × (1 + tokens tracked per address)`
+  plus decoys. The Tor reserve holds at most `TOR_RESERVE_CAP` = 24 nodes,
+  about a third of the verified snap servers (`el::torreserve`). Three
+  addresses with five tokens each are 18 buckets: 18 peers with no backup at
+  all, 36 with one backup each — past the reserve before the first decoy. So
+  as specified the scheme does not fit today's reserve for a realistic
+  wallet: either the reserve grows well past 24, or a bucket gets no backup
+  (and a slow read waits rather than hedges). Churn slowly widens each
+  bucket's disclosure set.
+- **Latency.** A real read waits for its bucket's next slot, and a new
+  address's first slot comes after a random delay, each on its own peer and
+  circuit; with §8.5's Tor tail latency, the first full balance view is slow.
+  The interval trades this against bandwidth.
+- **Bandwidth.** ~260 KB per bucket read at `k ≈ 4 000` — the same order as
+  the EF's PIR lookup (~742 KB up, ~277 KB down per account) — and, because
+  the schedule runs whether or not a read is needed (§11.4 rule 5), it is a
+  constant `buckets × reply / interval`: 18 buckets read hourly are ~4.7 MB/h,
+  ~110 MB a day, whatever the wallet does. That belongs in
+  [Disk & Network Usage](disk-and-network-usage.md) once built, and it is the
+  reason for a long interval on mobile.
+- **Fingerprint.** Prefix-aligned whole-bucket requests are a new, distinctive
+  request shape (§6.3). Whether they can be made to look like snap-sync range
+  requests is open (§8.10).
+
+### 11.7 Limits
+
+- Colluding peers, or one large operator behind many IP ranges, undo §11.4.
+  Grouping by IP prefix / ASN is a heuristic, not a guarantee.
+- On the direct path a network observer sees which peers are dialled and when,
+  though not what is asked — another reason for bucket reads to go over Tor.
+- It is k-anonymity with, realistically, a few hundred plausible accounts per
+  bucket. It makes linking expensive; it does not make it impossible, as PIR
+  would.
+
+### 11.8 Implementation sketch (when picked up)
+
+1. A snap range-proof verifier in `myotis-wire` (`snap/fetch.rs`), with
+   conformance tests against geth-produced pages.
+2. A per-network `N` estimator (account trie, and per-contract storage tries),
+   starting from a compiled-in value and fed by the bucket pages and by new
+   random-range probes (the Rust engine has none today, §11.2).
+3. Bucket requests (`b` from `N` and a configured `k`, `(b, prefix)` pinned per
+   address at assignment), whole-bucket paging.
+4. A bucket → peer assignment in the Tor reserve (`el::torreserve`), with
+   operator grouping and per-bucket backup sets for hedging.
+5. The per-bucket scheduler (a fixed, jittered interval per real and sticky
+   decoy bucket, random first slot), which anchoring reads and
+   bloom-triggered re-proofs wait on instead of reading on demand.
+6. A host toggle, Rust-engine-only and gated behind the Tor toggle like the
+   existing Tor modes.
+
+Sources for §11.1: [Sharded PIR design for the Ethereum state
+(ethresear.ch)](https://ethresear.ch/t/sharded-pir-design-for-the-ethereum-state/24552),
+[EF Private Reads roadmap](https://reads.ethereum.foundation/roadmap/),
+[EF PIR wallet guide](https://reads.ethereum.foundation/projects/pir/wallets/),
+[inspire-gpu-serving](https://github.com/keewoolee/inspire-gpu-serving),
+[Authenticated PIR (USENIX Security '23)](https://www.usenix.org/conference/usenixsecurity23/presentation/colombo).
+
+## Code pointers (current behavior this design touches)
+
+- Node key: `app/.../FileNodeKeyStore.java`, `core/.../crypto/NodeKey.java`
+- Peer cache + quality tokens: `app/.../PeerCache.java`,
+  `rust/myotis-net/src/el/peercache.rs`
+- Dial ranking / peer maintenance: `node-core/.../ChainStack.java`
+  (`dialCachedPeers`, `snapDialRank`, `maintainSnapPeers`)
+- snap request shapes: `networking/.../eth/EthHandler.java`
+  (`SNAP_RESPONSE_BYTES`, GetAccountRange/GetStorageRanges senders)
+- Tx broadcast: `networking/.../rlpx/RLPxConnector.java`
+  (`broadcastTransaction`); Rust: `rust/myotis-net/src/el/reader.rs`
+  (`send_judged`, `tor_broadcast`, `rebroadcast_route`),
+  `rust/myotis-net/src/el/tor.rs` (`push_transaction`)
+- DNS ENR trees: `networking/dns/DnsEnrResolver`, `NetworkConfig.elEnrTreeUrls`
+- Tor transport + Arti setup: `rust/myotis-net/src/el/tor.rs`; host seams:
+  `myotis-engine-rust/.../Tor.java`, desktop `DesktopNode.applyTorMode`, Android
+  `NodeService.applyTorMode`
+- Hello clientId: `networking/.../HelloMessage.java`

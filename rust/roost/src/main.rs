@@ -1,4 +1,4 @@
-//! roost — a dedicated light-client server (docs/lc-server-design.md).
+//! roost — a dedicated light-client server (docs/design-history/lc-server-design.md).
 //!
 //! Status: **in progress.** `serve` runs the server — the libp2p responder over
 //! the light-client store, the chain-view poller behind `status`, ingestion in

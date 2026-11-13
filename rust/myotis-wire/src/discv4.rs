@@ -1,5 +1,5 @@
 //! discv4 — UDP Kademlia peer discovery (EL-A3), twin of the Java
-//! `networking.discv4` package (docs/reimplementation/02 §2).
+//! `networking.discv4` package (docs/spec/02 §2).
 //!
 //! Wire format:
 //! ```text

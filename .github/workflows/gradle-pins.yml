@@ -1,0 +1,128 @@
+# Gradle dependency pins (#734, Part 1): every CI host resolves its full graph
+# against the committed lockfiles and gradle/verification-metadata.xml.
+#
+# Why one job per host: some artifacts exist per build host — Compose desktop's
+# skiko natives, Kotlin/Native's compiler bundle, aapt2 — so a pin written on
+# one machine cannot cover the others, and a host the metadata misses fails its
+# FIRST Gradle build closed (verification is strict). The five hosts here are
+# the five that run Gradle in CI: Linux x64 and arm64 (deb, engine natives),
+# macOS arm64 (dmg, iOS framework, engine natives), macOS x64 (the Intel dmg)
+# and Windows x64 (msi). A host is the JVM Gradle runs on: the Intel dmg is
+# built on an Apple Silicon runner by an x86_64 JDK under Rosetta 2
+# (desktop-dmg.yml), and that JDK resolves the macos-x64 Compose and skiko
+# modules. That leg runs only on `main` and on tags, so nothing else in CI
+# would show a missing pin of it before a merge: this chain is what does.
+#
+# Why a chain and not a matrix: each host adds its entries to the previous
+# host's file, so the last upload (`verification-metadata-merged`) is the
+# union, which `scripts/update_gradle_pins.sh --from-ci` downloads. Every host
+# still CHECKS the committed file first and fails on its own gaps; `!cancelled()`
+# keeps the chain going past a failed check so the union stays complete. A host
+# that uploads nothing stops the uploads after it (gradle-pins-host.yml).
+#
+# What the walk does not see: an artifact resolved only while a task RUNS (a
+# plugin's detached configuration). aapt2 is the per-host one, covered by
+# `extra_tasks` below; the lint override and Compose's JDK version probe are
+# host-independent and come from the update script's task pass (ci.yml's Build
+# and Test proves lint on every PR; the desktop packaging workflows, the probe). Anything new of this kind fails the host's own build
+# workflow — pin it from there the same way.
+#
+# Triggers: the files that can change the graph or its pins. Push scoped to
+# main so a branch push with an open PR runs once (under pull_request), as in
+# the other workflows; pull_request unscoped, so part PRs into feature branches
+# get it too (CLAUDE.md's multi-PR rule relies on that).
+name: gradle pins
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "gradle/**"
+      - "**/*.gradle.kts"
+      - "**/*.lockfile"
+      - "gradle.properties"
+      - "scripts/update_gradle_pins.sh"
+      - ".github/workflows/gradle-pins.yml"
+      - ".github/workflows/gradle-pins-host.yml"
+  pull_request:
+    # Same list as push (kept literal: no YAML anchors in this repo's workflows).
+    paths:
+      - "gradle/**"
+      - "**/*.gradle.kts"
+      - "**/*.lockfile"
+      - "gradle.properties"
+      - "scripts/update_gradle_pins.sh"
+      - ".github/workflows/gradle-pins.yml"
+      - ".github/workflows/gradle-pins-host.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # aapt2 (AGP's resource compiler) is a jar PER OS, resolved through a
+  # detached configuration only while a resource task runs, so one host per OS
+  # runs one such task alongside the walk: Linux x64, Windows and macOS arm64.
+  # Linux arm64 has no aapt2 build and no SDK on its image; macOS x64 needs
+  # none of its own, the jar being per OS and not per architecture.
+  linux-x64:
+    uses: ./.github/workflows/gradle-pins-host.yml
+    with:
+      runner: ubuntu-26.04
+      host: linux-x64
+      upload_as: verification-metadata-linux-x64
+      extra_tasks: ":android-app:processDebugResources"
+      canary: true
+
+  windows-x64:
+    needs: linux-x64
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/gradle-pins-host.yml
+    with:
+      runner: windows-2025
+      host: windows-x64
+      previous: verification-metadata-linux-x64
+      upload_as: verification-metadata-windows-x64
+      extra_tasks: ":android-app:processDebugResources"
+
+  linux-arm64:
+    needs: windows-x64
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/gradle-pins-host.yml
+    with:
+      runner: ubuntu-24.04-arm
+      host: linux-arm64
+      previous: verification-metadata-windows-x64
+      upload_as: verification-metadata-linux-arm64
+
+  # The Intel-Mac host: the same runner as macos-arm64, with an x86_64 JDK
+  # (see the header). No aapt2 task: its jar is per OS, not per architecture,
+  # and macos-arm64 below pins it.
+  macos-x64:
+    needs: linux-arm64
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/gradle-pins-host.yml
+    with:
+      runner: macos-15
+      host: macos-x64
+      java_architecture: x64
+      previous: verification-metadata-linux-arm64
+      upload_as: verification-metadata-macos-x64
+
+  # Last on a Unix host on purpose: Gradle rewrites the whole file on every
+  # --write-verification-metadata run, so the merged upload carries LF line
+  # endings whatever Windows wrote (update_gradle_pins.sh strips \r as well).
+  macos-arm64:
+    needs: macos-x64
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/gradle-pins-host.yml
+    with:
+      runner: macos-15
+      host: macos-arm64
+      previous: verification-metadata-macos-x64
+      upload_as: verification-metadata-merged
+      extra_tasks: ":android-app:processDebugResources"

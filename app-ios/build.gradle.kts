@@ -85,3 +85,27 @@ if (!(rootProject.extra["myotis.iosFrameworkBuildable"] as Boolean)) {
         if (name != "clean" && group != "help") enabled = false
     }
 }
+
+// A reproducible MyotisKit.xcframework (#734, Part 5a): xcodebuild lists its
+// slices in no fixed order, and the Kotlin/Native link stamps the static
+// framework's archive members with the build time and the builder's umask.
+// Normalized as part of every XCFramework assemble, so the release zip
+// (ios-framework.yml) and a rebuild get the same bytes.
+tasks.configureEach {
+    if (name.startsWith("assembleMyotisKit") && name.endsWith("XCFramework")) {
+        val xcfDir = layout.buildDirectory.dir("XCFrameworks")
+        val script = rootProject.file("scripts/normalize_xcframework.py")
+        doLast {
+            val frameworks = xcfDir.get().asFile.walkTopDown()
+                .filter { it.isDirectory && it.name == "MyotisKit.xcframework" }.toList()
+            if (frameworks.isEmpty()) throw GradleException("no MyotisKit.xcframework under ${xcfDir.get()}")
+            frameworks.forEach { xcf ->
+                val proc = ProcessBuilder("python3", "-I", script.absolutePath, xcf.absolutePath)
+                    .redirectErrorStream(true).start()
+                val out = proc.inputStream.bufferedReader().readText()
+                if (proc.waitFor() != 0) throw GradleException("normalize_xcframework.py failed:\n$out")
+                logger.lifecycle(out.trim())
+            }
+        }
+    }
+}

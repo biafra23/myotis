@@ -225,7 +225,7 @@ class ElCoreVectorConformanceTest {
     // -------------------------------------------------------------------------
 
     private static void generateVectors() throws Exception {
-        // Headers across the fork eras (docs/reimplementation/02 §1.2), plus
+        // Headers across the fork eras (docs/spec/02 §1.2), plus
         // tolerance and negative cases.
         writeVector("001-header-frontier.rlp", header("frontier", 15));
         writeVector("002-header-london.rlp", header("london", 16));
@@ -368,7 +368,7 @@ class ElCoreVectorConformanceTest {
     /**
      * Synthetic EL ENR carrying the list-valued {@code eth} fork-id field (EIP-868):
      * {@code eth = [[fork_hash, fork_next]]}. Signature bytes are dummies — the
-     * decode path deliberately does not verify them (docs/reimplementation/02 §1.3).
+     * decode path deliberately does not verify them (docs/spec/02 §1.3).
      */
     private static String syntheticElEnr() {
         NodeKey key1 = NodeKey.fromSecretKey(SECP256K1.SecretKey.fromBytes(SECRET_1));

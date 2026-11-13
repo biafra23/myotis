@@ -1,0 +1,135 @@
+<!--meta {"id":"stop-21","num":21,"title":"tor-poc: the same stack over Tor","short":"tor-poc · generics","sub":"1 file · 544 lines","part":"Boundaries & binaries"} -->
+<header class="stop-head">
+  <div class="eyebrow">Stop 21 · standalone crate <code>tor-poc</code> <span>1 file · 544 lines · about 60 minutes</span></div>
+  <h1>tor-poc: the same stack over Tor</h1>
+  <p class="lede">A proof of concept for <code>docs/privacy-and-tor.md</code>, run by hand against live mainnet. It boots an embedded Arti Tor client and runs the <em>unmodified</em> RLPx + eth + snap stack from <code>myotis-net</code> over a Tor stream. Each wallet address gets its own circuit and a fresh throwaway node key, followed by one proof-verified account read. The production change it needed is the most instructive idea in this stop: making the connection types <strong>generic over the byte stream</strong>.</p>
+</header>
+
+<div class="learn">
+  <h2>Rust you will practise</h2>
+  <div><b>Generics with defaults</b><code>RlpxConnection&lt;S = TcpStream&gt;</code>, trait bounds, and monomorphisation compared with Java's erased generics.</div>
+  <div><b>Ownership down the layers</b>Stream → RLPx connection → eth session, each owning the one below.</div>
+  <div><b>Explicit lifetimes</b>Why <code>fn f&lt;'a&gt;(…, peers: &amp;'a [Peer], …) -&gt; Option&lt;&amp;'a Peer&gt;</code> needs the annotation.</div>
+</div>
+
+<section class="prose">
+  <h3>The production change <x-tags>traits-generics async</x-tags></h3>
+  <p>The clearnet code was written against <code>tokio::net::TcpStream</code>. To run it over Arti's <code>DataStream</code>, the two connection types became generic over the stream, with a <em>default type parameter</em> so that every existing clearnet caller compiles unchanged. The code lives in <code>myotis-net/src/el/rlpx/transport.rs</code> (<a href="#stop-11">Stop 11</a> covers it in full):</p>
+  <x-code src="myotis-net/src/el/rlpx/transport.rs" from="45" to="63" title="myotis-net/src/el/rlpx/transport.rs"></x-code>
+  <x-code src="myotis-net/src/el/rlpx/transport.rs" from="119" to="132" title="myotis-net/src/el/rlpx/transport.rs"></x-code>
+  <p><code>impl&lt;S: AsyncReadExt + AsyncWriteExt + Unpin&gt;</code> reads as "for any tokio byte stream that may be moved between polls". The extension traits are implemented for every <code>AsyncRead</code>/<code>AsyncWrite</code> type, and Arti's <code>DataStream</code> implements those when its <code>tokio</code> feature is enabled. <code>dial</code> stays in a separate <code>impl RlpxConnection&lt;TcpStream&gt;</code> block (line 65), because only TCP can be dialled that way. Since the September tour the struct also carries <code>traffic: Option&lt;Arc&lt;TrafficMeter&gt;&gt;</code>, the data-usage counter; <code>handshake_over</code> passes <code>None</code> to the new <code>handshake_metered</code>, so tor-poc counts nothing.</p>
+  <div class="callout jvm">
+    <span class="k">JVM lens</span>
+    <p>It is like a protocol class written against <code>InputStream</code>/<code>OutputStream</code> that you hand a Tor socket's streams, with one difference. Java erases generics to one implementation that dispatches at run time; Rust <em>monomorphises</em>, compiling a specialised copy of the handshake for <code>S = DataStream</code> next to the <code>TcpStream</code> one, with no virtual calls. The default parameter (<code>S = TcpStream</code>) is something Java generics cannot express.</p>
+  </div>
+  <p>Generic code is not automatically behaviour-neutral. A <code>TcpStream</code> sends each write at once; a <code>DataStream</code> buffers until it is flushed. The handshake therefore flushes before it waits for the peer's answer:</p>
+  <x-code src="myotis-net/src/el/rlpx/transport.rs" from="154" to="168" title="myotis-net/src/el/rlpx/transport.rs"></x-code>
+  <p class="code-note"><x-tags>async error-handling</x-tags> <code>write_all</code> and <code>flush</code> come from <code>AsyncWriteExt</code>, the bound on <code>S</code>. Each returns a future of <code>io::Result&lt;()&gt;</code>; <code>.await</code> drives it, <code>.map_err(…)</code> turns the <code>io::Error</code> into the function's <code>String</code> error, and <code>?</code> returns early. On TCP the flush is a no-op. The tor-poc README records what happened without it: the peer never saw the auth message, and every Tor attempt ended with "early eof" while reading the ack.</p>
+</section>
+
+<x-file path="rust/tor-poc/src/main.rs" kind="binary · proof of concept">
+  <p class="purpose">It boots Arti, measures a clearnet baseline over the same stack (so a later Tor failure can be blamed on the Tor path), probes peers over Tor, and then performs per-address isolated, proof-verified snap reads. It is <em>not</em> production code: there is no quarantined peer pool, and the state root is the peer's <em>claimed</em> head, not a beacon-anchored one. It is fully sequential, with no <code>tokio::spawn</code> anywhere. <code>#[tokio::main]</code> is still required, because Arti uses the current runtime.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–44</td><td>Crate docs (the design claims it tests) and imports.</td></tr>
+      <tr><td>46–64</td><td><code>mainnet_eth_config</code>: an inline copy of the mainnet EL parameters.</td></tr>
+      <tr><td>66–132</td><td><code>Peer</code>, its <code>TorAddr</code>, the peers from the clearnet daemon's <code>peers.cache</code>, and the four legacy geth bootnodes as a fallback.</td></tr>
+      <tr><td>134–164</td><td>Demo addresses and <code>ephemeral_key</code>.</td></tr>
+      <tr><td>166–264</td><td><code>query_over_tor</code>: one isolated circuit, RLPx, eth, head header, one verified <code>GetAccountRange</code>.</td></tr>
+      <tr><td>266–367</td><td><code>eth_handshake_over_tor</code>, <code>head_number</code> and <code>pick_working_peer</code>.</td></tr>
+      <tr><td>369–401</td><td><code>probe_clearnet</code>: the same stack over <code>TcpStream</code>.</td></tr>
+      <tr><td>403–520</td><td><code>main</code>: boot Arti, baseline, Tor probe, per-address reads.</td></tr>
+      <tr><td>522–544</td><td>Hex helpers.</td></tr>
+    </tbody>
+  </table></div>
+  <x-code src="tor-poc/src/main.rs" from="1" to="31"></x-code>
+  <x-code src="tor-poc/Cargo.toml" from="22" to="38" lang="toml" title="tor-poc/Cargo.toml"></x-code>
+  <p class="code-note"><x-tags>modules-cargo</x-tags> Its own <code>[workspace]</code> root (like roost, <a href="#stop-02">Stop 2</a>), so Arti's large dependency tree never enters the engine build or CI. <code>default-features = false, features = ["tokio", "native-tls"]</code>: Arti's <code>tokio</code> feature is what compiles the tokio <code>AsyncRead</code>/<code>AsyncWrite</code> implementations for <code>DataStream</code>, the hinge of this whole proof. <code>native-tls</code> avoids rustls's process-wide crypto-provider choice. The engine's optional <code>tor</code> feature in <code>myotis-net</code> now takes the same Arti crates into production builds, with rustls on Android.</p>
+
+  <h4>The core flow</h4>
+  <x-code src="tor-poc/src/main.rs" from="168" to="216"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics async</x-tags> <strong>Inference picks the type.</strong> <code>stream</code> is an Arti <code>DataStream</code>, so <code>handshake_over(stream, …)</code> is instantiated with <code>S = DataStream</code>, and <code>conn</code> is a <code>RlpxConnection&lt;DataStream&gt;</code>. No type is written anywhere.</li>
+    <li><x-tags>ownership smart-pointers</x-tags> <strong>Ownership down the layers.</strong> <code>stream</code> moves into the RLPx connection, and <code>conn</code> moves into the eth session. Each layer owns the one below, like wrapping Java streams, except that the old variable becomes unusable. <code>Arc::clone(&amp;key)</code> hands one reference-counted handle to <code>handshake_over</code>, and the original <code>key</code> stays usable for <code>key.public_key_bytes()</code>, which auto-derefs through the <code>Arc</code>. <code>peer.pubkey</code>, a <code>[u8; 64]</code>, is copied.</li>
+    <li><x-tags>error-handling async</x-tags> <strong>Two error layers.</strong> <code>timeout(…)</code> wraps the handshake, so the result is <code>Result&lt;Result&lt;…, String&gt;, Elapsed&gt;</code>. The first <code>map_err(…)?</code> handles the timeout, and the second handles the handshake's <code>String</code> error. On timeout, the inner future and the stream it owns are dropped, which closes the circuit.</li>
+    <li><x-tags>iterators-closures borrowing</x-tags> <strong>An <code>FnMut</code> closure.</strong> <code>since</code> updates its captured <code>mark</code>, so calling it needs <code>&amp;mut since</code>, hence <code>let mut since</code>. While <code>since</code> is still going to be called, <code>mark</code> is mutably borrowed by it and cannot be used elsewhere. <code>Instant</code> is <code>Copy</code>, so <code>mark = t0</code> copies.</li>
+    <li><x-tags>traits-generics</x-tags> <strong>A conversion into a trait object.</strong> <code>prefs.set_isolation(isolation)</code> is declared as <code>fn set_isolation&lt;T: Into&lt;Box&lt;dyn Isolation&gt;&gt;&gt;(…)</code>, so the <code>Copy</code> <code>IsolationToken</code> is converted into a boxed trait object inside Arti. One token per address means one circuit per address.</li>
+    <li><x-tags>domain</x-tags> <strong>The fourth argument.</strong> <code>EthSession::handshake(conn, &amp;…, eth_cfg, None)</code>: the <code>None</code> is <code>served_range</code>, the block range a serving node would advertise. tor-poc is outbound-only and serves nothing.</li>
+  </ul>
+  <x-code src="tor-poc/src/main.rs" from="270" to="304"></x-code>
+  <p class="code-note"><x-tags>traits-generics borrowing</x-tags> <code>EthSession&lt;arti_client::DataStream&gt;</code> names the generic type explicitly in a return position. <code>head_number&lt;S: …&gt;</code> repeats the <code>impl</code>'s bounds so it can call <code>EthSession&lt;S&gt;</code>'s methods, and takes <code>&amp;mut</code> because requests change the session's state (the request id and the frame codec). <code>.map_err(|e| anyhow!("{e}"))</code> turns <code>myotis-net</code>'s <code>String</code> errors into <code>anyhow::Error</code>, because <code>String</code> does not implement <code>std::error::Error</code>.</p>
+
+  <h4>Choosing a peer: an explicit lifetime</h4>
+  <x-code src="tor-poc/src/main.rs" from="311" to="367"></x-code>
+  <ul class="concepts">
+    <li><x-tags>lifetimes borrowing</x-tags> <strong>Why <code>'a</code>.</strong> The function returns a reference but takes <em>several</em> reference parameters (<code>tor</code>, <code>peers</code>, <code>eth_cfg</code>), so the elision rules cannot guess which one the result borrows from. <code>'a</code> says: from <code>peers</code>. The caller must then keep the slice's owner alive while it uses the result.</li>
+    <li><x-tags>enums-patterns error-handling</x-tags> <strong>Nested results in one <code>match</code>.</strong> <code>Ok(Ok(mut session))</code> / <code>Ok(Err(e))</code> / <code>Err(_)</code> peels the nested timeout result; the <code>mut</code> inside the pattern makes the binding mutable. <code>best.map_or(true, |(_, h)| head &gt; h)</code> means "no best yet, or better than the best". <code>best</code> is an <code>Option&lt;(&amp;Peer, u64)&gt;</code>, which is <code>Copy</code>, so <code>map_or</code> consumes a copy and <code>best</code> stays usable.</li>
+    <li><x-tags>ownership async</x-tags> <strong>Where the session goes.</strong> <code>session</code> is owned by the match arm. When the arm ends, it is dropped, and with it the RLPx connection and the Tor stream. The function returns only the <code>&amp;Peer</code>; <code>query_over_tor</code> later opens a new circuit to it.</li>
+  </ul>
+  <x-code src="tor-poc/src/main.rs" from="446" to="458"></x-code>
+  <p class="code-note"><x-tags>borrowing ownership</x-tags> <strong><code>&amp;[&amp;Peer]</code> is not <code>&amp;[Peer]</code>.</strong> <code>ordered</code> is a <code>Vec&lt;&amp;Peer&gt;</code>, but <code>pick_working_peer</code> wants a slice of <em>owned</em> <code>Peer</code>s. <code>Peer</code> is not <code>Clone</code>, so <code>ordered_owned</code> rebuilds them field by field (<code>name.clone()</code>, plus copies of the <code>Copy</code> fields), and the <code>&amp;Peer</code> that comes back borrows from <code>ordered_owned</code>. That is the <code>'a</code> above in action. <code>live.clone()</code> copies only the vector of references, not the peers.</p>
+
+  <h4>The configuration copy</h4>
+  <x-code src="tor-poc/src/main.rs" from="46" to="64"></x-code>
+  <p class="code-note"><x-tags>methods modules-cargo</x-tags> A struct literal must name every field unless it ends with <code>..base</code>. When <code>EthConfig</code> gained <code>genesis_header_rlp</code>, this function stopped compiling, and because tor-poc is excluded from the workspace, CI did not notice. The September tour reported exactly that error. The field is now set to <code>None</code> (the comment says why: no peer pool, so no serve window to seed), and <code>EthConfig</code>'s own doc comment now warns the next person who adds a field:</p>
+  <x-code src="myotis-net/src/el/eth/session.rs" from="35" to="56" title="myotis-net/src/el/eth/session.rs"></x-code>
+  <div class="callout watch">
+    <span class="k">Status at this snapshot</span>
+    <p>It compiles again. A <code>cargo check --offline --locked --manifest-path rust/tor-poc/Cargo.toml</code> of this snapshot (rustc 1.99.0, run while writing this stop) finished without errors or warnings. It was not run against the network. The values in <code>mainnet_eth_config</code> still match <code>ElConfig::mainnet()</code> in <code>reader.rs</code> (network id 1, the genesis hash, fork id <code>07c9462e</code> with no next fork), but nothing checks that they stay in step. Also: <code>let _ = advertised;</code> near the end of <code>query_over_tor</code> (line 256) is a leftover that does nothing; <code>advertised</code> is an <code>Option&lt;u64&gt;</code> that was already used.</p>
+  </div>
+  <p class="code-note"><x-tags>domain</x-tags> The fallback bootnodes (lines 111–132) are the four "legacy" geth mainnet bootnodes, with pubkeys. Since geth moved to EF NodeOps nodes given as ENRs without a <code>tcp</code> key, tor-poc has nothing newer to dial over TCP; the doc comment notes that once geth drops the legacy four, the fallback has no upstream list left to mirror.</p>
+</x-file>
+
+<x-quiz>[
+  {"id":"tor-q1","type":"mcq","tags":["traits-generics","async"],
+   "q":"What change let the existing RLPx and eth code run over a Tor stream?",
+   "options":["A new Tor-specific handshake","<code>RlpxConnection</code> and <code>EthSession</code> became generic over the stream type <code>S</code> (default <code>TcpStream</code>, bounded by tokio's async read/write traits plus <code>Unpin</code>), and <code>handshake_over</code> accepts an already-connected stream. Arti's <code>DataStream</code> meets those bounds","Arti converts Tor streams into <code>TcpStream</code>s","The code uses <code>dyn Any</code> casts"],
+   "answer":1,
+   "explain":"The default type parameter kept every clearnet caller unchanged; the compiler emits a separate copy of the handshake for <code>DataStream</code>."},
+  {"id":"tor-q2","type":"mcq","tags":["traits-generics"],
+   "q":"How does Rust compile <code>RlpxConnection::handshake_over</code> for both <code>TcpStream</code> and <code>DataStream</code>, compared with Java generics?",
+   "options":["Same as Java: one erased implementation","Monomorphisation: the compiler generates a specialised copy per concrete <code>S</code>, with static calls and no boxing. Java erases generics to a single implementation that dispatches at run time","Rust picks one type at link time","It uses reflection"],
+   "answer":1,
+   "explain":"<code>dyn Trait</code> is the opt-in for Java-like dynamic dispatch."},
+  {"id":"tor-q3","type":"mcq","tags":["lifetimes","borrowing"],
+   "q":"Why does <code>pick_working_peer</code> need the explicit lifetime <code>'a</code>?",
+   "options":["All async functions need lifetimes","It returns a reference but has several reference parameters, so elision cannot tell which input the result borrows from. <code>'a</code> ties the returned <code>&amp;Peer</code> to <code>peers</code>","<code>'a</code> makes the result <code>'static</code>","To allow mutation of <code>peers</code>"],
+   "answer":1,
+   "explain":"With exactly one reference input (or <code>&amp;self</code>), elision picks it automatically."},
+  {"id":"tor-q4","type":"mcq","tags":["ownership","smart-pointers"],
+   "q":"<code>RlpxConnection::handshake_over(stream, Arc::clone(&amp;key), peer.pubkey)</code>: what happens to each argument?",
+   "options":["All three are borrowed","<code>stream</code> is moved into the connection. The <code>Arc</code> handle is cloned (a reference-count bump), so <code>key</code> stays usable afterwards. <code>peer.pubkey</code>, a <code>[u8; 64]</code>, is copied","All three are deep-copied","<code>key</code> is moved and cannot be used any more"],
+   "answer":1,
+   "explain":"Move, share, copy: the three ways values cross a function boundary."},
+  {"id":"tor-q5","type":"mcq","tags":["modules-cargo","methods"],
+   "q":"In September, tor-poc failed to compile because <code>EthConfig</code> had gained a field that <code>mainnet_eth_config()</code> did not set. Why did CI not catch it?",
+   "options":["CI ignores compile errors","<code>tor-poc</code> is its own workspace root, excluded from the main workspace, so <code>cargo build/test --workspace</code> (and the Gradle tasks built on it) never compile it","The field was optional, so it compiled","Rust only checks struct literals at run time"],
+   "answer":1,
+   "explain":"Excluded crates buy build speed and independence at the price of silent drift. A struct literal must list every field (or use <code>..base</code>). The fix is in now, and <code>EthConfig</code>'s doc comment tells the next author to run <code>cargo check --manifest-path tor-poc/Cargo.toml</code>."},
+  {"id":"tor-q6","type":"open","tags":["async","traits-generics"],
+   "q":"The handshake works over <code>TcpStream</code> without the <code>flush()</code> after writing the auth message, but over Arti's <code>DataStream</code> it failed with \"early eof\" until the flush was added. Explain why, and what this says about writing code generic over a stream type.",
+   "model":"A <code>TcpStream</code> hands each write to the kernel at once, so the auth bytes go out immediately. Arti's <code>DataStream</code> keeps written bytes in its own buffer until it is flushed. Without the flush, the handshake waits for the peer's ack while the auth is still sitting in the buffer; the peer sees nothing, gives up and closes the connection, and the read of the ack ends with an early EOF. The trait bound <code>AsyncWriteExt</code> only promises the operations, not when bytes leave: generic code has to follow the trait's contract (flush when the other side must see the data), not the behaviour of the one implementation it was first written against. On TCP the flush is a harmless no-op.",
+   "points":["TcpStream sends writes immediately; DataStream buffers until flush","without flush the peer never receives the auth and closes, so reading the ack hits EOF","the flush comes before blocking on the ack","generic code must rely on the trait contract, not on one implementation's behaviour; the flush is a no-op on TCP"],
+   "context":"myotis-net/src/el/rlpx/transport.rs L154-168 handshake_metered: stream.write_all(&auth_wire).await...; comment 'Flush before blocking on the ack: a plain TcpStream sends immediately, but a buffered stream (Arti's Tor DataStream) holds the auth in its write buffer until flushed — without this the peer never sees our auth and FINs, surfacing as an \"early eof\" reading the ack.' stream.flush().await. tor-poc README: Flush after every write."},
+  {"id":"tor-q7","type":"mcq","tags":["iterators-closures","borrowing"],
+   "q":"<code>let mut since = || { let d = mark.elapsed().as_millis(); mark = Instant::now(); d };</code> Why must <code>since</code> be declared <code>mut</code>?",
+   "options":["Closures are always mutable","The closure assigns to its captured <code>mark</code>, so it is <code>FnMut</code>; calling an <code>FnMut</code> needs a mutable borrow of the closure itself","Because <code>Instant</code> is not <code>Copy</code>","So that it can be passed to another thread"],
+   "answer":1,
+   "explain":"A closure that mutates captured state borrows that state mutably, and each call mutates the closure's own captured reference, so the binding must be <code>mut</code>. While the closure is still in use, <code>mark</code> cannot be touched directly."},
+  {"id":"tor-q8","type":"open","tags":["ownership","async","error-handling"],
+   "q":"In <code>pick_working_peer</code>, a peer that completes the handshake is matched as <code>Ok(Ok(mut session))</code>. Follow the <code>session</code> value: who owns it, what happens to the Tor circuit when the arm ends, and what the function returns instead. Why can <code>best</code> be read with <code>map_or</code> and still be used afterwards?",
+   "model":"<code>eth_handshake_over_tor</code> returns an owned <code>EthSession&lt;DataStream&gt;</code>, which owns the RLPx connection, which owns the Tor <code>DataStream</code>. The pattern moves it into the arm's binding <code>session</code> (made mutable so <code>head_number(&amp;mut session)</code> can send a request). When the arm ends, <code>session</code> goes out of scope and is dropped, closing the connection and the stream. The function returns only <code>Some(peer)</code>, a <code>&amp;'a Peer</code> borrowed from the input slice; the caller opens a fresh circuit later. <code>best</code> is an <code>Option&lt;(&amp;Peer, u64)&gt;</code>; shared references and <code>u64</code> are <code>Copy</code>, so the tuple and the option are <code>Copy</code>, and <code>map_or</code> consumes a copy.",
+   "points":["the session owns the RLPx connection, which owns the Tor stream","the match arm binds it mutably so head_number can borrow it with &mut","at the end of the arm the session is dropped, closing the circuit","the function returns a &'a Peer from the input slice, not the session","Option&lt;(&Peer, u64)> is Copy, so map_or uses a copy"],
+   "context":"tor-poc/src/main.rs L311-367 pick_working_peer: match tokio::time::timeout(..., eth_handshake_over_tor(tor, peer, eth_cfg)).await { Ok(Ok(mut session)) => { ... let head = head_number(&mut session).await; if head >= SYNCED_HEAD { return Some(peer); } if best.map_or(true, |(_, h)| head > h) { best = Some((peer, head)); } break; } ... }. eth_handshake_over_tor returns Result&lt;EthSession&lt;arti_client::DataStream>>."},
+  {"id":"tor-q9","type":"mcq","tags":["borrowing","ownership"],
+   "q":"<code>main</code> builds <code>ordered_owned: Vec&lt;Peer&gt;</code> from <code>ordered: Vec&lt;&amp;Peer&gt;</code> before calling <code>pick_working_peer</code>. Why?",
+   "options":["To sort the peers","<code>pick_working_peer</code> takes <code>&amp;[Peer]</code>, and a <code>Vec&lt;&amp;Peer&gt;</code> derefs to <code>&amp;[&amp;Peer]</code>, a different type. <code>Peer</code> is not <code>Clone</code>, so the code rebuilds each one field by field","Because references cannot be stored in a <code>Vec</code>","To move the peers onto another thread"],
+   "answer":1,
+   "explain":"A slice of references and a slice of values are different types. The returned <code>&amp;Peer</code> then borrows from <code>ordered_owned</code>, which lives until the end of <code>main</code>."},
+  {"id":"tor-q10","type":"mcq","tags":["domain"],
+   "q":"Which trust shortcut makes tor-poc a networking proof rather than a production read path?",
+   "options":["It skips the Merkle proof of the account","It verifies the snap proof against the state root of the peer's own claimed head header, not against a beacon-verified anchor","It trusts the Tor exit node","It uses a fixed, hard-coded state root"],
+   "answer":1,
+   "explain":"The proof is checked (the account is MPT-verified), but the root it is checked against comes from the same peer. The crate docs say so: production anchors to the beacon chain, which is the wallet's real trust root."}
+]</x-quiz>

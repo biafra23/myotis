@@ -36,7 +36,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 55
+#define MYOTIS_ABI_VERSION 57
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -82,7 +82,7 @@ int64_t myotis_create_with_checkpoint(const char *network, const char *data_dir,
 /* Start the sync loop. False for an unknown/already-running handle. */
 bool myotis_start(int64_t handle);
 
-/* Toggle Tor verified-read routing (docs/privacy-and-tor.md). Returns true iff
+/* Toggle Tor verified-read routing (docs/how-it-works/privacy-and-tor.md). Returns true iff
  * this build supports Tor (built with `--features tor`); a Tor-less build
  * returns false and no-ops. Process-global, not per-handle. */
 bool myotis_set_tor_enabled(bool on);
@@ -108,7 +108,7 @@ bool myotis_set_tor_storage_dirs(const char *state_dir, const char *cache_dir);
 bool myotis_set_dns_discovery(bool on);
 
 /* The host's word on the device's current network, for the status JSON's
- * data-usage figures (docs/data-usage.md): 0 unknown, 1 unmetered, 2 metered.
+ * data-usage figures (docs/how-it-works/data-usage.md): 0 unknown, 1 unmetered, 2 metered.
  * Bytes moved from now on count as metered while it is 2. Returns false, and
  * records nothing, for any other code. Process-global, not per-handle. */
 bool myotis_set_network_metering(int32_t code);
@@ -393,7 +393,7 @@ char *myotis_check_raw_transaction_json(const char *raw_tx_hex);
 /* Release any char* returned by the functions above. NULL is a no-op. */
 void myotis_string_free(char *s);
 
-/* v21: the opt-in eth_getLogs watch-list index (docs/eth-getlogs-design.md).
+/* v21: the opt-in eth_getLogs watch-list index (docs/design-history/eth-getlogs-design.md).
  * get_logs answers only inside indexed coverage; anything else is an
  * {"error": ...} JSON — never an empty array for unindexed ranges. A filter
  * that fails to parse (malformed, a `safe` or hash selector, no address and
@@ -462,7 +462,7 @@ char *myotis_log_index_status_json(int64_t handle);
 bool myotis_set_activity_watch(int64_t handle, const char *config_json);
 char *myotis_address_activity_json(int64_t handle, int64_t after_block);
 
-/* v28: the read-fetch shadow-cache counters (docs/read-stats.md): how much of
+/* v28: the read-fetch shadow-cache counters (docs/how-it-works/read-stats.md): how much of
  * the verified account / storage / bytecode fetch traffic a cache would have
  * served, by keying, with the wall-clock it would have saved. Counts only —
  * nothing is served from it. {"error": ...} when the handle has no EL reader. */
@@ -501,6 +501,27 @@ char *myotis_export_log_index(int64_t handle, const char *path);
  * connection runs snap/2 (EIP-8189). Informational only — never gate on it;
  * reads are the same on snap/1 and snap/2. */
 bool myotis_set_boot_enodes(int64_t handle, const char *enodes_json);
+
+/* Pin the handle's P2P listen ports (ABI >= 57): discv4 (UDP), discv5 (UDP),
+ * and the libp2p light-client host's TCP port and QUIC (UDP) port. 0 =
+ * OS-assigned, which is what a handle uses when this is never called. Call
+ * between myotis_create* and myotis_start (or while paused: the resume binds
+ * them); a later call replaces an earlier one. Applied or refused: false for
+ * a running or unknown handle, or when two of discv4 / discv5 / QUIC name the
+ * same nonzero UDP port. A port another process holds fails like any bind at
+ * start: discv4, discv5 and QUIC fall back to their existing degraded modes
+ * (no EL reader / no discv5 / no inbound QUIC), a libp2p TCP bind error fails
+ * myotis_start. A pinned TCP port is held exclusively: libp2p listens with
+ * SO_REUSEPORT, so the engine first tries a plain bind and fails the start if
+ * any other socket (another Myotis included) has the port. Pinned UDP ports
+ * and pause: a pause does not wait for the libp2p and discv5 tasks to close
+ * their sockets, so a resume issued straight after a pause can find its own
+ * pinned QUIC or discv5 port still taken (QUIC then has no listener until the
+ * next resume; discv5 retries once a minute). Port 0 cannot hit this. The EL
+ * is dial-only (no RLPx listener), so these four are every P2P socket a handle
+ * opens. */
+bool myotis_set_listen_ports(int64_t handle, uint16_t discv4, uint16_t discv5,
+                             uint16_t libp2p_tcp, uint16_t libp2p_quic);
 
 #ifdef __cplusplus
 }

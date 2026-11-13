@@ -2,7 +2,7 @@
 """Measure how many state-trie nodes a block (or a run of blocks) rewrites.
 
 RESEARCH ONLY: it reads a node over JSON-RPC and verifies nothing. It backs
-the numbers in docs/state-on-swarm.md.
+the numbers in docs/ideas/state-on-swarm.md.
 
 For each block it collects the changed keys:
 

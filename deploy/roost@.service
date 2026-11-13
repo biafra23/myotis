@@ -30,7 +30,7 @@ ExecStart=/usr/local/bin/roost serve \
   $ROOST_EXTRA_ARGS
 Restart=on-failure
 RestartSec=5
-# Explicit per docs/lc-server-design.md §8: the shell default is 2048 and roost's
+# Explicit per docs/design-history/lc-server-design.md §8: the shell default is 2048 and roost's
 # inbound cap is 1024 connections, so 2048 would bind before the cap does.
 LimitNOFILE=65536
 TimeoutStopSec=30

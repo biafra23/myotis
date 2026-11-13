@@ -1,0 +1,33 @@
+<section class="stop" id="progress" aria-label="Progress and reading list">
+  <header class="stop-head">
+    <div class="eyebrow">After the tour <span>updates as you answer</span></div>
+    <h1>Progress &amp; reading list</h1>
+    <p class="lede">Every checkpoint question is tagged with the Rust concepts it tests. This page adds up your answers by concept. Where you struggle, it points you to the chapter that fixes it. Every item marked “offline” opens without a network.</p>
+  </header>
+  <div id="progress-body" class="stack"></div>
+
+  <h2 class="section-title">Your offline library</h2>
+  <p class="code-note">Two kinds of book work without a network: your own ebooks, and the Rust documentation that rustup installs with every toolchain. When this page was built on a machine with those docs, the links below open the local copies; otherwise they point to doc.rust-lang.org. If a link doesn't open, run <code>rustup doc --book</code> (or <code>--std</code>, <code>--rust-by-example</code>, <code>--nomicon</code>) in a terminal. It opens the same pages from whichever toolchain is current.</p>
+  <ul class="library">
+    <li><b>The Rust Programming Language</b><a href="rustdoc:book/index.html" target="_blank" rel="noopener">local copy <span class="offline-ok">offline</span></a>
+      <small>The current edition. Chapter numbers here follow it: 4 ownership, 10 generics, traits and lifetimes, 15 smart pointers, 16 concurrency, 17 async, 18 trait objects, 19 patterns, 20 unsafe code and macros.</small></li>
+    <li><b>Rust by Example</b><a href="rustdoc:rust-by-example/index.html" target="_blank" rel="noopener">local copy <span class="offline-ok">offline</span></a>
+      <small>Short runnable pages. “Scoping rules” (RAII, moves, borrowing, lifetimes) is the memory-model core.</small></li>
+    <li><b>The standard library docs</b><a href="rustdoc:std/index.html" target="_blank" rel="noopener">local copy <span class="offline-ok">offline</span></a>
+      <small>For the exact types this code uses: Arc, Mutex, atomics, CString, Future. The search box works offline too.</small></li>
+    <li><b>The Rustonomicon</b><a href="rustdoc:nomicon/index.html" target="_blank" rel="noopener">local copy <span class="offline-ok">offline</span></a>
+      <small>The book on unsafe Rust. Read “FFI” and “Ownership Based Resource Management” after Stops 16 and 17.</small></li>
+    <li><b>Rust for Rustaceans</b> (Jon Gjengset)<span class="hint">EPUB · complete · <span class="offline-ok">offline</span></span>
+      <small>Written for experienced programmers. Chapter 1 “Foundations” is the best single read on the memory model. Chapters 8, 10 and 11 cover async, concurrency and FFI.</small></li>
+    <li><b>Hands-on Rust</b> (Herbert Wolverson)<span class="hint">EPUB · complete · <span class="offline-ok">offline</span></span>
+      <small>A game-building book. Chapter 2 is a gentle introduction to structs, vectors and enums, and Chapter 3 shows an enum-driven state machine.</small></li>
+    <li><b>Command-Line Rust</b> and <b>Systems Programming with Rust</b> (Ken Youens-Clark)<span class="hint">EPUB · early release, ch. 1–10 · <span class="offline-ok">offline</span></span>
+      <small>These are the same book: “Systems Programming with Rust” was the early-release title. Both of your copies stop at chapter 10, so only chapters 1–10 are recommended.</small></li>
+    <li><b>Programming Rust, 2nd Edition</b> (Blandy, Orendorff, Tindall)<span class="hint">EPUB · early release, ch. 1–2 · <span class="offline-ok">offline</span></span>
+      <small>Your copy contains only “Why Rust?” and “Basic Types”. “Basic Types” is still useful here: its sections on pointer types, slices and byte strings come up throughout this code.</small></li>
+    <li><b>The Myotis docs</b><a href="repodoc:README.md" target="_blank" rel="noopener">on GitHub, and under docs/ in your checkout</a>
+      <small>The documents the code refers to, grouped by kind: <code>spec/</code> (the re-implementation specification), <code>how-it-works/privacy-and-tor.md</code>, <code>design-history/lc-server-design.md</code>, <code>guides/android-library.md</code>. The tour quotes the code at <code>5263a421</code>, when these lived directly under <code>docs/</code>; your checkout is newer.</small></li>
+    <li><b>Command Line Applications in Rust</b><span class="hint">online only</span>
+      <small>rust-cli.github.io/book: argument parsing, anyhow errors, signal handling. Relevant for roost, rpcd and tor-poc. It is not installed locally.</small></li>
+  </ul>
+</section>

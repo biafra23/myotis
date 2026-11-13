@@ -5,7 +5,7 @@ DEBUG / DEMO ONLY. Every field is read back from the node that served the logs.
 ``toBlockTag`` is the one the operator asserts, so it is VERIFIED against the
 node's current ``finalized`` height before being recorded — it is the field the
 build reads to decide whether the seed may be framed with no reorg margin. See
-docs/railgun-poc.md.
+docs/guides/railgun-poc.md.
 
     ./scripts/write_logs_meta.py \\
         --rpc http://127.0.0.1:8545 \\

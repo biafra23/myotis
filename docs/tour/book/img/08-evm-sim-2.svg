@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 900 250" role="img" fill="currentColor" aria-label="Recording: the example syncs the light client, gets a verified head and a snap-proof oracle from ElReader, wraps it in a RecordingOracle, and runs measure over an executor with empty caches. The recorded world becomes an EvmFixture, which is replayed by a ReplayOracle; measure runs again and the recording fails unless the measurements match. The fixture is then written as JSON to rust/testdata. Replay in tests: the JSON file is read, a ReplayOracle serves it, measure runs, and the result is compared with the measurements stored in the file." width="900" height="250">
+      <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="900.0" height="250.0" fill="#f8fafb" /><text x="20" y="22" font-size="12" font-weight="700" style="fill:var(--ink-2)">record (example binary, live mainnet)</text>
+      <rect x="20" y="34" width="150" height="58" rx="9" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="95" y="58" text-anchor="middle" font-size="12" font-weight="700">ElReader</text>
+      <text x="95" y="76" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">verified head + snap oracle</text>
+      <rect x="200" y="34" width="150" height="58" rx="9" stroke-width="1.4" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="275" y="58" text-anchor="middle" font-size="12" font-weight="700">RecordingOracle</text>
+      <text x="275" y="76" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">keeps every answer</text>
+      <rect x="380" y="34" width="150" height="58" rx="9" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="455" y="58" text-anchor="middle" font-size="12" font-weight="700">measure()</text>
+      <text x="455" y="76" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">estimates, runs, bisections</text>
+      <rect x="560" y="34" width="150" height="58" rx="9" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="635" y="58" text-anchor="middle" font-size="12" font-weight="700">EvmFixture</text>
+      <text x="635" y="76" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">world + request + measured</text>
+      <rect x="740" y="34" width="140" height="58" rx="9" stroke-width="1.4" style="fill:var(--ok-wash);stroke:var(--ok)" />
+      <text x="810" y="58" text-anchor="middle" font-size="12" font-weight="700">JSON file</text>
+      <text x="810" y="76" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">rust/testdata/evm/</text>
+      <line x1="170" y1="63" x2="197" y2="63" stroke="currentColor" stroke-width="1.3" marker-end="url(#m-08-arrow)" />
+      <line x1="350" y1="63" x2="377" y2="63" stroke="currentColor" stroke-width="1.3" marker-end="url(#m-08-arrow)" />
+      <line x1="530" y1="63" x2="557" y2="63" stroke="currentColor" stroke-width="1.3" marker-end="url(#m-08-arrow)" />
+      <line x1="710" y1="63" x2="737" y2="63" stroke="currentColor" stroke-width="1.3" marker-end="url(#m-08-arrow)" />
+      <path d="M635 92 V120 H455 V95" fill="none" stroke="currentColor" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#m-08-arrow)" />
+      <text x="545" y="136" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">self-check: replay the world, measurements must match</text>
+
+      <text x="20" y="172" font-size="12" font-weight="700" style="fill:var(--ink-2)">replay (cargo test, no network)</text>
+      <rect x="20" y="184" width="150" height="50" rx="9" stroke-width="1.4" style="fill:var(--ok-wash);stroke:var(--ok)" />
+      <text x="95" y="214" text-anchor="middle" font-size="12" font-weight="700">JSON file</text>
+      <rect x="200" y="184" width="150" height="50" rx="9" stroke-width="1.4" style="fill:var(--jvm-wash);stroke:var(--jvm)" />
+      <text x="275" y="206" text-anchor="middle" font-size="12" font-weight="700">ReplayOracle</text>
+      <text x="275" y="223" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">unrecorded read = error</text>
+      <rect x="380" y="184" width="150" height="50" rx="9" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="455" y="214" text-anchor="middle" font-size="12" font-weight="700">measure()</text>
+      <rect x="560" y="184" width="320" height="50" rx="9" stroke-width="1.4" style="fill:var(--surface);stroke:var(--ink-2)" />
+      <text x="720" y="206" text-anchor="middle" font-size="12" font-weight="700">assert_eq!(replayed, recorded)</text>
+      <text x="720" y="223" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">+ #509 checks, wave counts, call trace vs full node</text>
+      <line x1="170" y1="209" x2="197" y2="209" stroke="currentColor" stroke-width="1.3" marker-end="url(#m-08-arrow)" />
+      <line x1="350" y1="209" x2="377" y2="209" stroke="currentColor" stroke-width="1.3" marker-end="url(#m-08-arrow)" />
+      <line x1="530" y1="209" x2="557" y2="209" stroke="currentColor" stroke-width="1.3" marker-end="url(#m-08-arrow)" />
+    </svg>

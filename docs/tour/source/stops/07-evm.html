@@ -1,0 +1,498 @@
+<!--meta {"id":"stop-07","num":7,"title":"myotis-evm: an EVM over verified state","short":"myotis-evm","sub":"13 files · 10,227 lines","part":"Pure foundations"} -->
+<header class="stop-head">
+  <div class="eyebrow">Stop 7 · crate <code>myotis-evm</code> <span>13 files · 10,227 lines · about 3 hours</span></div>
+  <h1>myotis-evm: an EVM over verified state</h1>
+  <p class="lede">The Rust engine's EVM: <code>eth_call</code>, <code>eth_estimateGas</code>, <code>eth_createAccessList</code>, <code>debug_traceCall</code> and ENS resolution, executed by revm. Every piece of state revm reads, <code>BLOCKHASH</code> included, comes through one trait whose implementations may return only <em>proven</em> data. The crate still does no I/O. It is where you meet <strong>shared ownership</strong> (<code>Arc&lt;dyn Trait&gt;</code>) and <strong>interior mutability</strong> in earnest, in both of its forms: a <code>Mutex</code> where the type must be shareable across threads, a <code>RefCell</code> where it never leaves one.</p>
+</header>
+
+<div class="learn">
+  <h2>Rust you will practise</h2>
+  <div><b>Borrowed views, copied handles</b><code>Option&lt;&amp;'a T&gt;</code> fields, small <code>Copy</code> structs passed by value, <code>let … else</code> that copies a value out of <code>&amp;self</code>.</div>
+  <div><b>Interior mutability, two ways</b><code>Mutex</code> guards that end at <code>;</code> or <code>}</code>, <code>RefCell</code> for one-thread recorders, <code>AtomicU64</code> counters behind <code>&amp;self</code>.</div>
+  <div><b>Closures and ownership</b>an <code>FnMut</code> callback that borrows, a <code>Copy</code> closure used twice, boxed <code>Fn</code> handlers that must clone what they captured.</div>
+</div>
+
+<div class="prose">
+  <h2>The shape of a call</h2>
+  <p>A host asks <code>myotis-net</code>'s <code>ElReader</code> (<a href="#stop-14">stop 14</a>) for an answer. The reader builds a <code>BlockContext</code> from the verified head and an <code>EvmExecutor</code> over a fresh network-backed oracle plus long-lived shared caches, and runs it on a blocking thread. Inside this crate, <code>spec_for</code> picks the fork rules. A per-call <code>OracleDatabase</code> answers each revm read from four layers in order: <strong>caller overrides → per-call view cache → cross-call proof cache → verified oracle fetch</strong>. A “prefetch convergence loop” keeps the number of slow, one-at-a-time network round-trips small.</p>
+  <p>The executor now has two families of entry points. The <em>view-call</em> family (<code>call_view</code>, <code>call_view_from</code>, <code>call_view_overridden</code>, <code>create_view</code>, <code>estimate_gas</code>) takes a target, calldata and value. The <em>transaction-object</em> family (<code>call_tx</code>, <code>estimate_tx</code>, <code>create_access_list</code>, <code>trace_call</code>) takes a whole <code>TxRequest</code>: gas, fees, nonce, access list, EIP-7702 authorizations. Every field the request names is applied, or the request is refused. <code>TxRequest</code> itself, the tracers and <code>eth_simulateV1</code> live in the files of <a href="#stop-08">stop 8</a>. This stop covers the foundation they all stand on.</p>
+  <div class="callout jvm">
+    <span class="k">What changed since September</span>
+    <p>The crate grew from 12 files and 4,873 lines to 26 files and 15,187. Half of that is stop 8's. In this stop's files: the error set went from 8 variants to 25, each sorted as a <em>refusal</em> or an <em>infeasible</em> answer for the JSON-RPC layer. The prefetch loop's cap went from 4 to 12, the oracle now bounds discovery in time, and waves follow the code of called contracts (issue #532). <code>BLOCKHASH</code>, which always failed before, is served from verified data (#664). The fork table gained Chiado, Osaka and Sepolia's Amsterdam rung. ENS gained Genome's <code>.gno</code> names on Gnosis, ownership reads, and ENSv2 awareness (#671).</p>
+  </div>
+</div>
+
+<x-file path="rust/myotis-evm/src/lib.rs" kind="crate root" twin="io.myotis.evm module">
+  <p class="purpose">The crate root: the module tree, the re-exports, and about 430 lines of unit tests for <code>OracleDatabase</code>. The crate doc states the architecture: revm behind a synchronous <code>SnapStateOracle</code>, with the async bridge living in the I/O crate that implements it. The old doc's stale “following slices” list is gone; the current one lists what exists (the executor with its prefetch loop, overrides, <code>tx</code>, the fork table for four chains, ENS).</p>
+  <x-code src="myotis-evm/src/lib.rs" from="53" to="77"></x-code>
+  <ul class="concepts">
+    <li><x-tags>modules-cargo</x-tags> <code>pub use</code> re-exports items at a shorter path (a facade). Re-exporting revm's <code>U256</code> lets downstream crates name it without depending on revm directly. <code>pub use ens::refusal as ens_refusal;</code> also <em>renames</em>: outside the crate the function is <code>myotis_evm::ens_refusal</code>, which reads better at a call site than a bare <code>refusal</code>. <code>overrides</code>, <code>simulate</code> and <code>trace</code> are public modules but not flattened, so callers write <code>myotis_evm::overrides::StateOverrides</code>.</li>
+    <li><x-tags>testing modules-cargo</x-tags> <code>#[cfg(any(test, feature = "fixture"))]</code> (lines 76–77, and on <code>pub mod fixture</code> at lines 44–45): <code>cfg(test)</code> is set only while compiling <em>this</em> crate's tests, so other crates must opt in through the <code>fixture</code> feature, much like Gradle's <code>testFixtures</code>.</li>
+  </ul>
+  <x-code src="myotis-evm/src/lib.rs" from="433" to="456"></x-code>
+  <p class="code-note"><x-tags>smart-pointers ownership</x-tags> A test that reads like a memory-model lesson. <code>Arc::clone(&amp;oracle) as Arc&lt;dyn SnapStateOracle&gt;</code> makes a second, interface-typed pointer to the same object while the test keeps the concrete one. <code>d1</code> and its per-call cache die at the closing <code>}</code> on line 447, but the shared proof cache survives because <code>proofs</code> still points at it. On line 450, <code>oracle</code> and <code>proofs</code> are <em>moved</em> rather than cloned, because neither is needed afterwards. The test oracle counts calls with an <code>AtomicUsize</code>: its methods take <code>&amp;self</code> and the trait requires <code>Sync</code>, so a <code>Cell</code> would not compile.</p>
+</x-file>
+
+<x-file path="rust/myotis-evm/src/error.rs" kind="library" twin="EvmExecutionError">
+  <p class="purpose"><code>EvmError</code> is the closed set of ways an EVM request can end other than with success bytes: oracle failure, revert (with raw data), out of gas, other halt, fork too old, unsupported chain, rejected envelope, a loop that did not converge, and seventeen newer variants for transaction objects, estimates, access lists and simulations. Most of the new ones carry geth's exact wording in <code>Display</code>, because wallets match on those strings. Two classifier methods tell a host how to serve each one.</p>
+  <x-code src="myotis-evm/src/error.rs" from="132" to="174"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns</x-tags> <code>matches!(value, pattern)</code> is a macro that expands to a <code>match</code> returning <code>true</code> or <code>false</code>. The pattern uses <code>|</code> to list alternatives and <code>{ .. }</code> to ignore fields. It can reach into a nested enum: line 144 matches only the <code>BlockHashUnsupported</code> arm of the wrapped <code>OracleError</code>.</li>
+    <li><x-tags>domain error-handling</x-tags> <strong>Three classes of failure.</strong> A <em>refusal</em> can never be answered on this build (a request no transaction could be, an Amsterdam block the fork table does not know), so hosts serve the permanent JSON-RPC code −32602. An <em>infeasible</em> request was understood, and the answer is that it fails within the caller's own limits (gas, funds, fee cap); hosts serve −32000 with geth's message. Everything else (a revert, state that could not be fetched) goes to the host's ordinary mapping. This is the <code>CLAUDE.md</code> rule “apply or refuse” turned into types.</li>
+    <li><x-tags>error-handling traits-generics</x-tags> <code>impl From&lt;OracleError&gt; for EvmError</code> (lines 170–174) is what lets <code>?</code> turn an oracle error into an <code>EvmError</code> automatically. The <a href="#primer-error-handling">primer</a> walks through this mechanism.</li>
+  </ul>
+  <p class="code-note"><x-tags>smart-pointers enums-patterns</x-tags> Two variants wrap another <code>EvmError</code>: <code>FailedWithGas { gas, error: Box&lt;EvmError&gt; }</code> and <code>CallFailed { supplied_gas, error: Box&lt;EvmError&gt; }</code> (lines 95 and 110). An enum's size is the size of its largest variant, so an enum that contained itself directly would need infinite size. The <code>Box</code> puts the inner error on the heap and leaves a pointer in the variant. <code>kind()</code> (lines 176–209) returns a <code>&amp;'static str</code>, a string literal that lives for the whole program, so the caller gets a name it can log without owning anything. Its arm <code>EvmError::FailedWithGas { error, .. } | EvmError::CallFailed { error, .. } =&gt; error.kind()</code> binds the same name in both alternatives, which Rust allows only when the types agree. <code>kind()</code> exists so an info-level log line names the error without its values (an address, a balance; #532 review).</p>
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments</span>
+    <p>The <code>ForkTooOld</code> doc (line 25) and its message (line 222, “pre-London blocks are not supported”) describe only mainnet. On Sepolia, Gnosis and Chiado the floor is Shanghai (see <a href="#f-myotis-evm-src-fork-rs">fork.rs</a>). The old <code>UnsupportedChain</code> text that said “mainnet-only” has been fixed.</p>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-evm/src/oracle.rs" kind="library" twin="io.myotis.evm.world.SnapStateOracle">
+  <p class="purpose">The trust boundary of the whole engine: the <code>SnapStateOracle</code> trait (the EVM's only source of state), <code>OracleAccount</code>, the closed <code>OracleError</code>, <code>WireCost</code>, and the in-memory test oracle. Accounts and storage must be proven against <code>state_root</code>, bytecode must hash to its code hash, and a block hash must be proven by a header chain; otherwise the oracle returns an error. It never returns unverified data.</p>
+  <x-code src="myotis-evm/src/oracle.rs" from="184" to="230"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics</x-tags> <strong>Required and provided methods.</strong> Only the three <code>fetch_*</code> methods without a body are required. <code>check_request</code>, <code>wire_cost</code>, <code>keep_discovering</code>, and below <code>fetch_block_hash</code> and <code>prefetch_batch</code>, have default bodies, like Java interface <code>default</code> methods. A test fixture implements three methods and inherits sensible behaviour for the rest: never cancelled, nothing measured, discovery unbounded, no header source, no batch warm-up.</li>
+    <li><x-tags>async traits-generics</x-tags> <strong>Why synchronous?</strong> revm's database interface is synchronous, and an async trait would drag a runtime into this crate. So implementations may <em>block</em>, and the caller must run the EVM on a worker thread. The production bridge is <code>PoolOracle</code> in <code>myotis-net/src/el/evm.rs</code> (<a href="#stop-13">stop 13</a>), whose waits use <code>Handle::block_on</code>.</li>
+    <li><x-tags>concurrency traits-generics</x-tags> <code>SnapStateOracle: Send + Sync</code> (line 186) makes <code>Arc&lt;dyn SnapStateOracle&gt;</code> itself <code>Send</code>, so an executor holding one can be moved into a blocking task.</li>
+    <li><x-tags>domain</x-tags> <strong>The oracle owns the clock.</strong> <code>keep_discovering(pass)</code> lets the oracle stop the prefetch loop's discovery passes after a time budget. This crate holds no clock (it is sans-I/O), so the decision is delegated. <code>PoolOracle</code>'s version records an <code>Instant</code> at pass 0 and compares against its budget. The doc is explicit that the answer never depends on it: past the bound the loop simply fetches what is left one read at a time.</li>
+    <li><x-tags>enums-patterns domain</x-tags> The return type <code>Result&lt;Option&lt;OracleAccount&gt;, OracleError&gt;</code> encodes three outcomes: proven present (<code>Ok(Some)</code>), proven absent (<code>Ok(None)</code>), and unprovable (<code>Err</code>).</li>
+  </ul>
+  <p class="code-note"><x-tags>domain error-handling</x-tags> Below the excerpt, <code>fetch_block_hash(anchor_number, anchor_hash, number)</code> (lines 242–249) asks for a block hash proven by a header chain that links down from the call block's parent. Its default returns <code>BlockHashUnsupported</code>, never zero. <code>prefetch_batch</code> (lines 257–265) is the best-effort parallel warm-up: it writes verified results into the two cache “sinks” and is silent on failure, because the per-item path refetches whatever is missing.</p>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns error-handling</x-tags> <code>OracleError</code> (lines 63–96) has six variants. <code>InvalidProof</code> is flagged as security-critical: a peer served data inconsistent with the anchored root. <code>BlockHashUnsupported</code> (no source can ever serve it, a refusal) and <code>BlockHashUnavailable</code> (no peer served the header chain this time, retryable) are kept apart so a host can tell “never” from “not now”.</li>
+    <li><x-tags>traits-generics lifetimes</x-tags> revm requires its database error type to implement <code>DBErrorMarker</code> (line 153), which in turn needs <code>Error + Send + Sync + 'static</code>. That is why <code>OracleError</code> implements <code>std::error::Error</code>, and why it owns its <code>String</code>s instead of borrowing them.</li>
+    <li><x-tags>enums-patterns</x-tags> <code>kind()</code> (lines 137–147) uses a <strong>match guard</strong>: <code>Cancelled { reason } if reason == "request deadline exceeded" =&gt; …</code> takes that arm only when the condition holds, and otherwise falls to the next <code>Cancelled { .. }</code> arm. Matching on <code>&amp;self</code> binds <code>reason</code> as a <code>&amp;String</code>, which compares with a <code>&amp;str</code> literal directly.</li>
+    <li><x-tags>bytes-strings</x-tags> <code>hex()</code> (lines 155–164) writes into one preallocated <code>String</code> with <code>write!</code>, avoiding a temporary <code>String</code> per byte. <code>let _ = write!(…)</code> discards a <code>Result</code> that cannot be an error for a <code>String</code> target.</li>
+  </ul>
+  <p class="code-note"><x-tags>ownership</x-tags> The fixture's builders show two styles. <code>with_account(mut self, …) -&gt; Self</code> and <code>with_block_hash(mut self, …) -&gt; Self</code> take the builder by value and hand it back, for chaining. <code>with_bytecode(&amp;mut self, …) -&gt; [u8; 32]</code> borrows instead, because it returns the computed code hash.</p>
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments</span>
+    <p>The <code>OracleError</code> doc (lines 60–62) says the execution arms (Reverted, OutOfGas, …) are “added in a later Milestone-C slice”. They exist, in <code>EvmError</code>.</p>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-evm/src/cache.rs" kind="library" twin="StateProofCache.inMemory">
+  <p class="purpose">Two pluggable cache tiers, unchanged since September. <code>StateProofCache</code> is keyed by state root, which makes it safe to share across calls, since state at a fixed root never changes. Its <code>get_account</code> returns <code>Option&lt;Option&lt;OracleAccount&gt;&gt;</code>: the outer <code>None</code> is a cache miss, while <code>Some(None)</code> is a cached, <em>proven absence</em>, two kinds of “nothing” kept apart by the type system. <code>BytecodeCache</code> is keyed by code hash and never evicts. The file also has <code>Lru</code>, a small bounded map the EL reader reuses for its block-hash → number map.</p>
+  <x-code src="myotis-evm/src/cache.rs" from="95" to="101"></x-code>
+  <ul class="concepts">
+    <li><x-tags>interior-mutability</x-tags> The struct's fields are <code>accounts: Mutex&lt;Lru&lt;…&gt;&gt;</code> and <code>storage: Mutex&lt;Lru&lt;…&gt;&gt;</code>. The <code>Mutex</code> owns the map, which is reachable only through a guard: a compiler-enforced <code>synchronized</code>. <code>.unwrap()</code> on <code>lock()</code> panics only if another thread panicked while holding the lock (a <em>poisoned</em> lock).</li>
+    <li><x-tags>borrowing lifetimes</x-tags> Line 97, <code>self.accounts.lock().unwrap().get(&amp;(*root, *addr)).cloned()</code>: the guard is a temporary that dies at the <code>;</code>, and a reference into the map may not outlive it. So the value is <code>.cloned()</code> out. Returning <code>Option&lt;&amp;OracleAccount&gt;</code> would not compile. <code>*root</code> and <code>*addr</code> copy the arrays into the tuple key.</li>
+  </ul>
+  <x-code src="myotis-evm/src/cache.rs" from="180" to="222"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics</x-tags> The surrounding <code>impl&lt;K: Hash + Eq + Clone, V&gt; Lru&lt;K, V&gt;</code> (line 171) means the methods exist only for key types satisfying those bounds. <code>Clone</code> is needed for the eviction trick below.</li>
+    <li><x-tags>interior-mutability</x-tags> <code>get(&amp;mut self)</code> takes <em>exclusive</em> access because reading updates recency. That is why the caches use <code>Mutex</code>, not <code>RwLock</code>: there are no pure reads.</li>
+    <li><x-tags>borrowing</x-tags> In <code>evict_lru</code>, <code>self.map.iter()</code> is a shared borrow of the map. <code>.map(|(k, _)| k.clone())</code> copies the victim key <em>out</em>, which ends the iterator's borrow, so <code>self.map.remove(&amp;victim)</code> may borrow mutably. Removing while iterating, the Java <code>ConcurrentModificationException</code>, is prevented at compile time.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/myotis-evm/src/block.rs" kind="library" twin="BlockContext">
+  <p class="purpose">One call's verified block inputs: the state root (which world to read), the number and timestamp (which fork applies), the opcode inputs (base fee, coinbase, prevrandao, chain id, gas limit) and two optional fields added since September. <code>parent_hash: Option&lt;[u8; 32]&gt;</code> is what <code>BLOCKHASH(N-1)</code> returns and where a header walk starts; <code>None</code> only for a fixture recorded before the field existed. <code>slot_number: Option&lt;u64&gt;</code> is the EIP-7843 slot that Amsterdam headers carry for the new <code>SLOTNUM</code> opcode. Every field must come from the verified header, never from the local clock, because a local timestamp could select different fork rules than the network.</p>
+  <x-code src="myotis-evm/src/block.rs" from="67" to="79"></x-code>
+  <p class="code-note"><x-tags>ownership</x-tags> <code>..BlockEnv::default()</code> fills the remaining fields, like Kotlin's <code>copy()</code>. <code>self.prev_randao</code> is a <code>Copy</code> array, so reading it through <code>&amp;self</code> copies it. <code>self.slot_number.unwrap_or(0)</code> reads an <code>Option&lt;u64&gt;</code>, which is also <code>Copy</code>, so nothing is moved out of <code>self</code>. The doc above the method explains why the <code>0</code> is never observable: before Amsterdam <code>SLOTNUM</code> is an invalid opcode, and from Amsterdam on the executor has already refused a context without a slot. <code>BlockContext</code> derives <code>Clone</code> but not <code>Copy</code>, so callers pass it by reference.</p>
+</x-file>
+
+<x-file path="rust/myotis-evm/src/database.rs" kind="library" twin="SyncStateView + AccessTracker">
+  <p class="purpose"><code>OracleDatabase</code> is how revm reads state: a <code>DatabaseRef</code> implementation over the oracle and the caches, pinned to one <code>state_root</code> and built per call. A read tries the caller's overrides, then the per-call view cache, then the cross-call proof cache, then a verified fetch (stored into both caches). For the prefetch loop it has a <em>sentinel mode</em>, which returns a counted, uncached zero placeholder instead of fetching, and it records every account, slot and code hash a run touched in an <code>AccessSet</code>. New since September: the overrides live here, and <code>BLOCKHASH</code> is answered from verified data.</p>
+  <x-code src="myotis-evm/src/database.rs" from="162" to="179"></x-code>
+  <ul class="concepts">
+    <li><x-tags>smart-pointers</x-tags> Three <code>Arc&lt;dyn …&gt;</code> fields share the oracle and caches with the executor and with other calls. <code>view</code> and <code>track</code> are this call's own mutable state, wrapped in <code>Mutex</code>. A <code>RefCell</code> would make the type non-<code>Sync</code>, and revm's <code>&amp;self</code> database is shared by reference.</li>
+    <li><x-tags>ownership</x-tags> <code>overrides: StateOverrides</code> is <em>owned</em> by the database: the caller hands its overrides over at construction and they die with the database at the end of the call. The doc comment states the trust rule: an override is consulted ahead of every tier and never written back into any of them.</li>
+  </ul>
+  <x-code src="myotis-evm/src/database.rs" from="239" to="286"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership interior-mutability</x-tags> <code>std::mem::take(&amp;mut self.track.lock().unwrap().set)</code> (line 241) moves the access set out through the guard and leaves an empty one. In Java that is a <code>synchronized</code> block doing <code>var s = set; set = new AccessSet(); return s;</code>.</li>
+    <li><x-tags>interior-mutability borrowing</x-tags> <strong>Where each guard dies.</strong> Line 248: at the <code>;</code>. Line 250: in an <code>if let</code>, the temporary guard lives through the body (edition 2021 rules, which this crate uses), so <code>cached</code> may point into the map, and it is cloned before returning. Lines 266–272: an explicit block <code>{ … }</code> releases the lock <em>before</em> the potentially slow network fetch on line 277.</li>
+    <li><x-tags>concurrency</x-tags> A Rust <code>Mutex</code> is <strong>not reentrant</strong>. Locking it again on the same thread while holding it deadlocks, unlike Java's <code>synchronized</code>. That is another reason to keep guard scopes tiny.</li>
+    <li><x-tags>ownership</x-tags> <code>fetched.clone()</code> goes into both caches, then the original is moved out as the return value on line 285.</li>
+  </ul>
+  <x-code src="myotis-evm/src/database.rs" from="317" to="350"></x-code>
+  <div class="callout rust">
+    <span class="k">Why <code>DatabaseRef</code> and not <code>Database</code></span>
+    <p>revm's <code>Database</code> trait takes <code>&amp;mut self</code>; <code>DatabaseRef</code> has the same methods on <code>&amp;self</code>, and revm implements it for <code>&amp;T</code> and <code>Arc&lt;T&gt;</code> too. With <code>&amp;self</code>, the executor keeps ownership of <em>one</em> database and <em>lends</em> it to every loop iteration, so everything learned in iteration 1 is still there in iteration 2. The price is what you saw above: internal state must use interior mutability. <code>type Error = OracleError;</code> is an <strong>associated type</strong>: each implementor picks its own error type.</p>
+  </div>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns borrowing</x-tags> <code>let Some(over) = over else { return …; };</code> (line 324) is <strong>let-else</strong>: bind the pattern or run the <code>else</code> block, which must leave the function. <code>over</code> is an <code>Option&lt;&amp;AccountOverride&gt;</code> borrowed from <code>self.overrides</code>, so nothing is copied.</li>
+    <li><x-tags>iterators-closures borrowing</x-tags> <code>self.account(addr)?.as_ref().map(to_account_info)</code>: <code>as_ref</code> turns <code>Option&lt;OracleAccount&gt;</code> into <code>Option&lt;&amp;OracleAccount&gt;</code>, which matches <code>to_account_info(acc: &amp;OracleAccount)</code>, and the function's name is passed where a closure would go.</li>
+    <li><x-tags>domain</x-tags> An override makes the account <em>exist</em> even when the chain has none (geth does the same), which is how a wallet runs a helper contract it never deployed. Overridden code sets both <code>code_hash</code> and <code>code</code>, because revm may run the inline code or look it up by hash.</li>
+  </ul>
+  <h4>BLOCKHASH from verified data</h4>
+  <p>The call runs on block N's post-state, so <code>BLOCKHASH(k)</code> is defined for N−256 ≤ k &lt; N and zero elsewhere. Before #664 the adapter refused every <code>BLOCKHASH</code>. Now it answers from three proven sources:</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Block k</th><th>Source</th><th>When it cannot be proven</th></tr></thead>
+    <tbody>
+      <tr><td>outside the window</td><td>zero, by the opcode's definition</td><td>(always answerable)</td></tr>
+      <tr><td>N−1</td><td>the header's <code>parentHash</code></td><td><code>BlockHashUnsupported</code> when the context has none</td></tr>
+      <tr><td>from Prague on</td><td>the EIP-2935 history contract's storage at slot <code>k % 8191</code>, read like any <code>SLOAD</code> (proven, cached by root, prefetched in waves)</td><td>a zero slot means “never written”, so it falls through to the walk</td></tr>
+      <tr><td>otherwise</td><td>a header walk down from N−1, proven by <code>SnapStateOracle::fetch_block_hash</code></td><td><code>BlockHashUnavailable</code> (retryable), or <code>BlockHashUnsupported</code> without a parent hash</td></tr>
+    </tbody>
+  </table></div>
+  <x-code src="myotis-evm/src/database.rs" from="418" to="454"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership borrowing</x-tags> Line 419, <code>let Some(source) = self.block_hashes else { … }</code>: the method has only <code>&amp;self</code>, and you cannot move a field out of a borrow. This compiles because <code>BlockHashes</code> derives <code>Copy</code> (line 70), so the pattern <em>copies</em> the 32-byte hash, the number and the flag into <code>source</code>. Remove <code>Copy</code> from the derive and the line fails with “cannot move out of <code>self.block_hashes</code>”.</li>
+    <li><x-tags>interior-mutability</x-tags> Line 437 copies the miss counter (<code>u64</code>) out and drops the guard at the <code>;</code>. Line 447 compares it with a fresh read. If the counter moved, the zero on line 438 was a discovery-pass placeholder: the slot is already in the access set, the next wave fetches it, and the real run will read the true value. If it did not move, the zero is proven, and the walk runs.</li>
+    <li><x-tags>error-handling domain</x-tags> Line 438's <code>?</code> propagates an <code>InvalidProof</code> on the history slot. It does <em>not</em> fall back to the header walk: a failed proof is an attack signal, not a gap to paper over. The test <code>a_history_value_that_fails_its_proof_fails_the_call</code> in <a href="#f-myotis-evm-src-executor-tests-blockhash-rs">the BLOCKHASH tests</a> pins exactly this.</li>
+  </ul>
+  <p class="code-note"><x-tags>error-handling</x-tags> Also in this file: the access set is gas-bounded (a 30 M run touches at most about 14k slots, says the <code>AccessSet</code> doc). <code>verified_storage</code> (lines 460–493) is the three-tier slot read without overrides; <code>BLOCKHASH</code> uses it so a caller's override of the history contract cannot change a block hash, since <code>BLOCKHASH</code> reads the chain, not the hypothesis. Bytecode is re-hashed after the oracle's own check, so it is verified twice. <code>to_bytecode</code> (lines 300–302) loads bytecode starting with <code>0xEF01</code> that is not a valid EIP-7702 delegation as legacy code instead of calling revm's panicking constructor; under the workspace's <code>panic = "abort"</code> a panic would kill the host.</p>
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments</span>
+    <p>The <code>ViewCache</code> doc (lines 94–98) says in-flight deduplication “arrives with the async prefetch layer (a later Milestone-C slice)”. The prefetch layer (<code>prefetch_batch</code>) exists now; whether it deduplicates in flight is decided in <code>myotis-net</code>, not here, so the sentence is at least out of date. The module doc's “three tiers” (line 5) leaves out the override layer, which the struct doc on line 171 describes.</p>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-evm/src/overrides.rs" kind="library">
+  <p class="purpose"><code>eth_call</code> state overrides: caller-supplied code, balance, nonce or storage, layered over verified state for exactly one call. The doc explains why this is not a hole in the trust model (the answer is explicitly hypothetical, and is never cached or persisted) and why it is needed. Ambire and Kohaku call undeployed helper contracts, and issue #314 was an engine that silently ignored the parameter and gave plausible wrong answers. That incident is the origin of the “apply or refuse, never silently ignore” rule in <code>CLAUDE.md</code>.</p>
+  <x-code src="myotis-evm/src/overrides.rs" from="32" to="56"></x-code>
+  <x-code src="myotis-evm/src/overrides.rs" from="95" to="103"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns</x-tags> <code>state: Option&lt;HashMap&lt;…&gt;&gt;</code> separates “not given” from “given but empty”, which geth treats differently (empty means every slot is zero).</li>
+    <li><x-tags>borrowing lifetimes</x-tags> <code>code_by_hash(&amp;self, …) -&gt; Option&lt;&amp;[u8]&gt;</code>: elision ties the result to <code>&amp;self</code>. The returned slice points into a <code>Vec</code> the overrides own, and nothing is copied.</li>
+    <li><x-tags>iterators-closures error-handling</x-tags> <code>find_map</code> with a <code>?</code> <em>inside the closure</em>: the <code>?</code> leaves only the closure (returning <code>None</code> for that account), not the method. <code>.then_some(code)</code> is fine here because <code>code</code> is already computed and cheap.</li>
+  </ul>
+  <p class="code-note"><x-tags>borrowing iterators-closures</x-tags> New since September: <code>sorted()</code> (lines 89–93) returns <code>Vec&lt;(&amp;[u8; 20], &amp;AccountOverride)&gt;</code>, references into the map, ordered by address, because geth applies overrides in that order. <code>sort_by(|a, b| a.0.cmp(b.0))</code> compares byte arrays, which implement <code>Ord</code> lexicographically. The vector cannot outlive the <code>StateOverrides</code> it borrows from.</p>
+</x-file>
+
+<x-file path="rust/myotis-evm/src/fork.rs" kind="library" twin="EvmFactory fork tables">
+  <p class="purpose">Maps <code>(chain_id, block_number, timestamp)</code> to revm's <code>SpecId</code>, the fork rules, for mainnet, Sepolia, Gnosis and (new) Chiado. Other chains get <code>UnsupportedChain</code>. Pre-London blocks on mainnet and pre-Shanghai blocks elsewhere get <code>ForkTooOld</code>. Post-Merge forks activate by timestamp, which is checked first. Every table ends at Osaka. Sepolia alone has an Amsterdam date: revm can price Amsterdam, so this table <em>serves</em> it, while the Java engine's Besu cannot and <em>refuses</em> the same blocks. The tests pin each constant in both decimal and hex, a guard against a past decimal slip on Gnosis.</p>
+  <x-code src="myotis-evm/src/fork.rs" from="61" to="76"></x-code>
+  <p class="code-note"><x-tags>enums-patterns</x-tags> <code>match</code> on integers, with <code>other =&gt; …</code> binding everything else. <code>11_155_111</code> uses digit separators. The <code>match</code> is the function's value, with no <code>return</code>. Each per-chain function (lines 80–184) is an <code>if</code>/<code>else if</code> chain that is itself the tail expression; in three of them the newest rung (Osaka, or Amsterdam on Sepolia) is checked first with an early <code>return</code>.</p>
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments</span>
+    <p>The module doc (lines 7–8) says “Everything below London throws”. That is true for mainnet only; the other three chains fail below Shanghai.</p>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-evm/src/executor.rs" kind="library" twin="PrefetchingEvmExecutor">
+  <p class="purpose"><code>EvmExecutor</code> is the public entry point to the EVM. Each request runs against a fresh <code>OracleDatabase</code>, and nothing is committed. A view call runs with revm's transaction-level checks switched off (balance, nonce, base fee, EIP-3607, block gas limit) because it is not a real transaction; the transaction-object entry points put geth's checks back themselves, before the run, in geth's order and geth's words. The call is non-static, so a simulated <code>SSTORE</code> is journaled and discarded. Of its 4,508 lines, the first 1,666 are code and the rest are tests.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–47</td><td>Module docs and imports.</td></tr>
+      <tr><td>49–183</td><td><code>RequestInspector</code>: revm's per-instruction hook. Cancellation, discovery bookkeeping, and the access-list, trace and simulation recorders.</td></tr>
+      <tr><td>185–302</td><td><code>AccessListRecorder</code> (geth's access-list tracer), <code>CreatedAccessList</code>, <code>ACCESS_LIST_ROUNDS</code> = 10.</td></tr>
+      <tr><td>304–371</td><td>Constants: <code>VIEW_CALL_GAS</code> = 30 M, <code>PREFETCH_ITERATION_CAP</code> = 12, the 21,000 transfer, the call stipend, the 1.5 % search ratio, the precompile range, the zero-address view caller.</td></tr>
+      <tr><td>373–411</td><td>The struct, <code>CallCost</code>, <code>new</code>, <code>cost</code>.</td></tr>
+      <tr><td>413–501</td><td>The view-call API: <code>call_view</code>, <code>call_view_from</code>, <code>call_view_overridden</code>, <code>create_view</code>, <code>estimate_gas</code>.</td></tr>
+      <tr><td>503–722</td><td><code>estimate_tx</code>: the ceiling, the fee and funds checks, the 21,000 shortcut (before Amsterdam only), the run, and geth's search for the lowest working gas limit.</td></tr>
+      <tr><td>724–836</td><td><code>call_tx</code>, <code>run_tx</code> (fixture-only), <code>call_tx_capped</code>, <code>prepare_tx_call</code>.</td></tr>
+      <tr><td>838–934</td><td><code>create_access_list</code>: trace, rerun with the list, repeat until it stops changing.</td></tr>
+      <tr><td>936–1044</td><td><code>trace_call</code> (call tracer and prestate tracer; <a href="#stop-08">stop 8</a>), <code>delegate_of</code>.</td></tr>
+      <tr><td>1046–1122</td><td><code>database_for_with</code>, <code>execute_with_db</code>, <code>execute_recording</code>: one revm run.</td></tr>
+      <tr><td>1124–1231</td><td>The view-call path into the loop: <code>call</code>, <code>call_capped(_with)</code>, <code>run_converged</code>, <code>converge</code> (primes the target).</td></tr>
+      <tr><td>1233–1379</td><td>The prefetch convergence loop: <code>converge_runs</code>, <code>prefetch_wave</code>, <code>first_wave</code>.</td></tr>
+      <tr><td>1381–1607</td><td>Free helpers: error wording, <code>spec_for_context</code> (the <code>SLOTNUM</code> refusals), <code>view_cfg</code>, <code>tx_env</code>, <code>check_tx</code>, <code>check_fee_cap</code>, <code>buy_gas_shortfall</code>, <code>with_sender_nonce</code>.</td></tr>
+      <tr><td>1609–1665</td><td><code>output_bytes</code>, the 1.15 buffer, <code>map_halt</code>, <code>map_evm_error</code>, a compile-time assertion.</td></tr>
+      <tr><td>1667–1716</td><td>Tests: imports, the two submodule files (<code>relay_adapt_7702_shield</code> in <a href="#stop-08">stop 8</a>, <code>blockhash</code> below), cancellation.</td></tr>
+      <tr><td>1717–2098</td><td>Tests: overrides and creation, opcodes, reverts, out of gas, the 21,000 shortcut.</td></tr>
+      <tr><td>2099–2642</td><td>Tests: the convergence loop and its waves (#532).</td></tr>
+      <tr><td>2644–3139</td><td>Tests: estimates, the gas search, EIP-7702 authorizations, access lists in estimates.</td></tr>
+      <tr><td>3140–3426</td><td>Tests: <code>trace_call</code>, including goldens from a full node's call tracer.</td></tr>
+      <tr><td>3428–3637</td><td>Tests: <code>create_access_list</code>.</td></tr>
+      <tr><td>3639–3867</td><td>Tests: estimate ceilings, fee caps, the Osaka transaction cap, refused requests.</td></tr>
+      <tr><td>3869–4189</td><td>Tests: <code>call_tx</code> over the full transaction object (#509).</td></tr>
+      <tr><td>4191–4508</td><td>Tests: chains, Amsterdam and <code>SLOTNUM</code>, the fork floor, an absent target.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>The inspector: one hook, several recorders</h4>
+  <x-code src="myotis-evm/src/executor.rs" from="49" to="73"></x-code>
+  <ul class="concepts">
+    <li><x-tags>lifetimes smart-pointers</x-tags> Every field is a <em>borrowed</em> reference. <code>&amp;'a dyn SnapStateOracle</code> is a trait object behind a plain reference, not an <code>Arc</code>: the inspector never owns the oracle. The lifetime <code>'a</code> proves the inspector, and therefore the EVM that owns it, cannot outlive the things it points at. <code>Option&lt;&amp;'a T&gt;</code> is the idiomatic “maybe a recorder”: it is pointer-sized (Rust uses the null value for <code>None</code>) and <code>Copy</code>.</li>
+    <li><x-tags>interior-mutability</x-tags> <code>CodeNeeded</code> (line 50) is a type alias for <code>RefCell&lt;HashSet&lt;[u8; 20]&gt;&gt;</code>. The inspector holds only a shared <code>&amp;CodeNeeded</code>, yet inserts into it: <code>RefCell</code> moves the borrow check to run time (<code>borrow_mut()</code> panics if another borrow is active). It is enough here because one EVM run happens on one thread. The database needs a <code>Mutex</code> for the same job because its type must be <code>Sync</code>; a <code>RefCell</code> is never <code>Sync</code>, so the compiler would refuse to share it across threads.</li>
+  </ul>
+  <x-code src="myotis-evm/src/executor.rs" from="84" to="123"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics</x-tags> <code>impl&lt;CTX: ContextTr&gt; Inspector&lt;CTX&gt; for RequestInspector&lt;'_&gt;</code> is generic over revm's context type, and <code>'_</code> says “some lifetime, I don't need to name it”. <code>step</code> runs before every instruction.</li>
+    <li><x-tags>domain</x-tags> <strong>Cancellation per instruction.</strong> If the oracle says the request is cancelled, <code>set_action</code> makes the interpreter return with <code>Stop</code>, even mid-way through a loop that reads only cached state. The executor checks again after the run (line 1120), so the stop surfaces as <code>Cancelled</code>, not as a short answer.</li>
+    <li><x-tags>domain borrowing</x-tags> <strong>What code did the run need?</strong> On a discovery pass, <code>EXTCODESIZE</code> and <code>EXTCODECOPY</code> record the inspected address (its low 20 bytes of the stack's top word), and the <code>call</code> hook (line 127) records each call's code address. Solidity guards a call with an <code>EXTCODESIZE</code>, and against a placeholder (no code) that guard fails before the call runs, so the target shows up here one pass earlier. <code>if let Some(code_needed) = self.code_needed</code> copies the <code>Option&lt;&amp;…&gt;</code> out of <code>&amp;mut self</code>, which is fine because it is <code>Copy</code>.</li>
+  </ul>
+  <x-code src="myotis-evm/src/executor.rs" from="373" to="411"></x-code>
+  <p class="code-note"><x-tags>concurrency interior-mutability</x-tags> <code>runs: AtomicU64</code> counts EVM runs behind <code>&amp;self</code>. An atomic is the cheapest interior mutability for a single number, like Java's <code>AtomicLong</code>. <code>Ordering::Relaxed</code> guarantees only that the count itself is not torn or lost; it orders nothing else, which is enough for a statistic. <code>cost()</code> returns <code>CallCost</code> by value: it derives <code>Copy</code>, so the caller gets its own snapshot. The host logs this per call (#532).</p>
+
+  <h4>One run</h4>
+  <x-code src="myotis-evm/src/executor.rs" from="1083" to="1122"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership</x-tags> Line 1097 <em>shadows</em> the parameter: <code>let tx = tx_env(tx, …)?;</code> builds revm's <code>TxEnv</code> from the borrowed <code>&amp;TxRequest</code> and reuses the name. From there on <code>tx</code> means the owned <code>TxEnv</code>, which line 1117 moves into <code>inspect_tx</code>. Kotlin allows a similar pattern only in nested scopes; Rust allows it in the same block.</li>
+    <li><x-tags>borrowing ownership</x-tags> <code>Context::mainnet().with_ref_db(db).with_block(…).with_cfg(cfg)…</code> is a consuming builder: each call takes the builder by value and returns a new one. The EVM <em>borrows</em> the database (<code>db: &amp;OracleDatabase</code>) and, through the inspector, the oracle (<code>self.oracle.as_ref()</code> borrows a plain <code>&amp;dyn SnapStateOracle</code> out of the <code>Arc</code>), so it cannot escape this function. <code>cfg</code> and the block env are <em>moved</em> in. <code>let mut evm</code> is needed because <code>inspect_tx</code> takes <code>&amp;mut self</code>.</li>
+    <li><x-tags>error-handling</x-tags> Line 1121, <code>Ok(result.map_err(map_evm_error)?.result)</code>, converts revm's error type, propagates it with <code>?</code>, and keeps only the <code>.result</code> field. A success, a revert and a halt all come back as <code>Ok(ExecutionResult)</code>; each caller decides what they mean.</li>
+    <li><x-tags>domain</x-tags> <code>view_cfg</code> (lines 1439–1458) builds the config: revm's per-spec defaults, Amsterdam's two gas-model flags set to exactly “is this Amsterdam”, the five relaxations, and <code>tx_gas_limit_cap = Some(VIEW_CALL_GAS)</code> so the Osaka per-transaction cap (2<sup>24</sup>) does not clip a 30 M view call. <code>tx_env</code> (lines 1465–1527) always sets the node's chain id; a comment records the live bug where revm's default (mainnet) rejected every call on Sepolia.</li>
+  </ul>
+
+  <h4>The prefetch convergence loop</h4>
+  <figure class="diagram">
+    <div class="svg-wrap">
+    <svg class="wide-diagram" viewBox="0 0 900 300" role="img" fill="currentColor" xmlns="http://www.w3.org/2000/svg"
+         aria-label="Prefetch loop. Run revm, in sentinel mode while still discovering, where missing state becomes a counted zero placeholder. A sentinel run that handed out no placeholder and did not fail is the answer at once. Otherwise diff the accessed state against what was already seen. If nothing new was touched, a real run returns its answer and a sentinel run ends discovery. Otherwise fetch all fresh reads, plus the code of contracts the run called or inspected, in one parallel verified wave into the shared caches, and run again. At most twelve iterations; discovery also ends at the oracle's time bound or two runs before the cap. Hitting the cap fails with IterationLimitExceeded.">
+      <defs>
+        <marker id="m-stop07-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+      <rect x="20" y="80" width="210" height="76" rx="10" stroke-width="1.5" style="fill:var(--surface);stroke:var(--ink-2)"/>
+      <text x="125" y="106" text-anchor="middle" font-size="13" font-weight="700">run revm</text>
+      <text x="125" y="125" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">sentinel while discovering:</text>
+      <text x="125" y="141" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">miss → zero, counted, uncached</text>
+
+      <rect x="280" y="80" width="190" height="76" rx="10" stroke-width="1.5" style="fill:var(--surface);stroke:var(--ink-2)"/>
+      <text x="375" y="106" text-anchor="middle" font-size="13" font-weight="700">diff accesses</text>
+      <text x="375" y="125" text-anchor="middle" font-size="11" class="mono" style="fill:var(--ink-2)">fresh = touched − seen</text>
+      <text x="375" y="141" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">accounts · slots · code</text>
+
+      <path d="M580 80 L640 118 L580 156 L520 118 Z" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)"/>
+      <text x="580" y="114" text-anchor="middle" font-size="11.5" font-weight="700">fresh</text>
+      <text x="580" y="129" text-anchor="middle" font-size="11.5" font-weight="700">empty?</text>
+
+      <rect x="690" y="80" width="190" height="76" rx="10" stroke-width="1.5" style="fill:var(--surface);stroke:var(--ink-2)"/>
+      <text x="785" y="104" text-anchor="middle" font-size="13" font-weight="700">prefetch wave</text>
+      <text x="785" y="122" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">fresh reads + code of called</text>
+      <text x="785" y="137" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">contracts, in parallel, verified,</text>
+      <text x="785" y="151" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">into the shared caches</text>
+
+      <rect x="490" y="226" width="180" height="46" rx="10" stroke-width="1.5" style="fill:var(--ok-wash);stroke:var(--ok)"/>
+      <text x="580" y="254" text-anchor="middle" font-size="12.5" font-weight="700">answer (result / revert)</text>
+
+      <line x1="230" y1="118" x2="277" y2="118" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop07-arrow)"/>
+      <line x1="470" y1="118" x2="517" y2="118" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop07-arrow)"/>
+      <line x1="640" y1="118" x2="687" y2="118" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop07-arrow)"/>
+      <text x="664" y="110" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">no</text>
+      <line x1="580" y1="156" x2="580" y2="223" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop07-arrow)"/>
+      <text x="590" y="182" font-size="11" style="fill:var(--ink-2)">yes · real run: answer</text>
+      <text x="590" y="198" font-size="11" style="fill:var(--ink-2)">(sentinel run: discovery ends)</text>
+      <path d="M125 156 V249 H487" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop07-arrow)"/>
+      <text x="140" y="196" font-size="11" style="fill:var(--ink-2)">sentinel run with no placeholder</text>
+      <text x="140" y="212" font-size="11" style="fill:var(--ink-2)">and no error: answer at once</text>
+      <path d="M785 80 V46 H125 V77" fill="none" stroke="currentColor" stroke-width="1.4" marker-end="url(#m-stop07-arrow)"/>
+      <text x="455" y="38" text-anchor="middle" font-size="11" style="fill:var(--ink-2)">next iteration · at most 12 · discovery stops at an empty diff, at the oracle's time bound, or two runs before the cap</text>
+      <text x="20" y="290" font-size="11" style="fill:var(--ink-3)">a real run's error is the answer · cap reached →</text>
+      <text x="292" y="290" font-size="11" class="mono" style="fill:var(--bad)">IterationLimitExceeded</text>
+    </svg>
+    </div>
+    <figcaption>Sentinel runs discover which state a call needs without waiting on the network, so the unknown reads can be fetched as <em>one</em> parallel wave instead of one round-trip per <code>SLOAD</code>. Answers only ever come from a real run, or from a sentinel run that read nothing unverified.</figcaption>
+  </figure>
+  <p>Before the loop, <code>converge</code> (lines 1208–1231) primes the target's account and code with sentinel off, so the first pass runs the real top-level code. The transaction-object entry points also make a <code>first_wave</code> (lines 1373–1378): the sender, the target and each EIP-7702 delegate, plus their code, in one batch. A discovery pass would otherwise see a delegate only one pass late. Why 12 and not 4? The constant's doc (lines 320–329) gives the measurement: a wallet's recorded RelayAdapt7702 shield transaction made 48 of its 57 reads one round-trip at a time behind the old cap of four.</p>
+  <x-code src="myotis-evm/src/executor.rs" from="1240" to="1263"></x-code>
+  <ul class="concepts">
+    <li><x-tags>iterators-closures traits-generics</x-tags> <code>converge_runs&lt;T&gt;</code> takes the run as <code>mut run: impl FnMut(Option&lt;&amp;CodeNeeded&gt;) -&gt; Result&lt;T, EvmError&gt;</code>. <code>FnMut</code> means the closure may mutate what it captured, so calling it needs <code>&amp;mut</code> access, hence <code>mut run</code>. The loop does not care what a run is: for a call it is one transaction, for <code>eth_simulateV1</code> (<a href="#stop-08">stop 8</a>) a whole simulated block sequence. Both go through the same <code>db</code>, so the access set is the run's.</li>
+    <li><x-tags>borrowing</x-tags> <code>let code_needed = CodeNeeded::default();</code> is a fresh, owned set per iteration. <code>sentinel.then_some(&amp;code_needed)</code> lends it to the run only on a discovery pass. The loan ends when <code>run</code> returns; nothing in <code>T</code> can hold on to it, because the closure's argument lifetime is chosen per call.</li>
+    <li><x-tags>domain</x-tags> Line 1256: <code>discovering</code> can only go from true to false. The <code>&amp;&amp;</code> short-circuits, so <code>keep_discovering</code> is not even asked once discovery has ended. <code>iter + 2 &lt; cap</code> reserves the last two iterations for real runs.</li>
+  </ul>
+  <x-code src="myotis-evm/src/executor.rs" from="1265" to="1310"></x-code>
+  <ul class="concepts">
+    <li><x-tags>interior-mutability</x-tags> Every <code>db.*</code> call uses a <em>shared</em> reference, yet changes the database's sentinel flag, counters and access set. This is interior mutability as an API style.</li>
+    <li><x-tags>ownership borrowing</x-tags> Lines 1292–1293: <code>self.prefetch_wave(ctx, &amp;fresh, &amp;code_needed.into_inner());</code> <em>borrows</em> <code>fresh</code>, then <code>seen.merge(fresh);</code> <em>moves</em> it. Swap the two lines and the compiler reports “borrow of moved value”. <code>code_needed.into_inner()</code> consumes the <code>RefCell</code> and returns the <code>HashSet</code> it held; that is allowed only because the run's loan of <code>code_needed</code> has ended.</li>
+    <li><x-tags>error-handling</x-tags> A selective <code>?</code>: a real run's error propagates (<code>outcome?</code>, line 1298), while a sentinel run's error is tolerated. Zero placeholders can legitimately trip a <code>require()</code>.</li>
+    <li><x-tags>domain</x-tags> Lines 1284–1288 are the hit-only fast path: a discovery pass that handed out no placeholder read only verified state, so it <em>is</em> a real run and is returned at once. A warm call is therefore exactly one EVM run and no wave (the test <code>a_warm_call_is_its_one_discovery_pass</code> pins it).</li>
+  </ul>
+  <x-code src="myotis-evm/src/executor.rs" from="1318" to="1341"></x-code>
+  <ul class="concepts">
+    <li><x-tags>iterators-closures borrowing</x-tags> <code>let batch = |accounts, code_hashes| { … }</code> captures <code>self</code> and <code>root</code> by shared reference. It only reads them, so it is an <code>Fn</code> closure and can be called twice (lines 1341 and 1362). A Kotlin lambda does the same, but there the compiler does not check that the captured objects outlive it.</li>
+    <li><x-tags>smart-pointers</x-tags> <code>&amp;*self.proof_cache</code>: <code>*</code> dereferences the <code>Arc&lt;dyn StateProofCache&gt;</code> to the <code>dyn StateProofCache</code> inside, and <code>&amp;</code> borrows it again as the <code>&amp;dyn StateProofCache</code> the oracle method wants. No reference count changes.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>by_account.entry(*addr).or_default().push(*slot)</code> is the entry API: find or insert an empty <code>Vec</code>, then push. <code>by_account.into_iter()</code> consumes the map, so the filtered pairs are moved into <code>items</code>, not copied. What the caches already hold is left out, and an empty wave is not sent.</li>
+  </ul>
+  <p class="code-note"><x-tags>domain</x-tags> The rest of <code>prefetch_wave</code> (lines 1342–1362) is the code-following step: for each account the wave fetched whose code the pass needed (from <code>code_needed</code>), it fetches that code too, in a second batch. A newly reached contract then runs in the next pass instead of costing one pass just to learn its code hash. An account that was only read (<code>BALANCE</code>, <code>EXTCODEHASH</code>) is not followed.</p>
+
+  <h4>Transaction objects and the gas search</h4>
+  <x-code src="myotis-evm/src/executor.rs" from="800" to="836"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership</x-tags> The function returns <code>(SpecId, OracleDatabase, u64)</code>. The database is created on line 811 and <em>moved</em> out to the caller in the tuple on line 835, so <code>call_tx_capped</code>, <code>create_access_list_within</code> and <code>trace_call</code> each own the one database their runs share.</li>
+    <li><x-tags>iterators-closures ownership</x-tags> Line 813, <code>let supplied = |error: EvmError| supplied_gas(gas_limit, error);</code>, captures <code>gas_limit</code> by reference. A closure whose captures are all <code>Copy</code> is itself <code>Copy</code>, and a shared reference is <code>Copy</code>. That is why <code>map_err(supplied)</code> on line 814, which takes the closure by value, does not use it up, and line 823 can call it again.</li>
+    <li><x-tags>domain error-handling</x-tags> The order is geth's: request refusals (<code>check_tx</code>, a nonce contradicting an override), the fee cap against the base fee, then <code>buyGas</code> (the sender must hold <code>gas × fee cap + value</code>). Lines 830–834 refuse a price revm cannot represent: revm computes <code>gas × price</code> in <code>u128</code> and <code>expect</code>s no overflow, and with its balance check off nothing else stops a state override from getting there. A panic would abort the host.</li>
+  </ul>
+  <x-code src="myotis-evm/src/executor.rs" from="669" to="703"></x-code>
+  <p class="code-note"><x-tags>ownership domain</x-tags> <code>mut hi: u64</code> in the parameter list: an integer argument is copied in, and <code>mut</code> lets the function change its own copy. The caller's value is untouched. The algorithm is geth's estimator: a first “optimistic” probe at what the run drew plus the call stipend, times 64/63 (a nested call withholds 1/64 of its gas), then a bisection skewed low that stops within 1.5 %. Each probe (<code>succeeds_with</code>) is a full EVM run against the same database, so it reads only cached, verified state. <code>estimate_tx</code> (lines 521–647) then adds the 1.15 buffer and never answers above the ceiling. Before Amsterdam, an empty-calldata transfer to a codeless, non-precompile account is still exactly 21,000 with no run and no buffer; from Amsterdam on (EIP-2780, EIP-8037) that shortcut would be wrong, so the search prices it.</p>
+  <x-code src="myotis-evm/src/executor.rs" from="1592" to="1607"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership</x-tags> <code>with_sender_nonce(mut overrides: StateOverrides, …) -&gt; Result&lt;StateOverrides, EvmError&gt;</code> takes the overrides <em>by value</em>, edits them, and hands them back: an owned value passing through a function. The caller writes <code>with_sender_nonce(overrides, tx)?</code> and can no longer use the old name, which prevents using a stale copy.</li>
+    <li><x-tags>borrowing</x-tags> Line 1596, <code>overrides.get(&amp;tx.from).cloned().unwrap_or_default()</code>: <code>get</code> returns a reference into the map, and <code>.cloned()</code> turns it into an owned <code>AccountOverride</code>. Without the clone, <code>entry</code> would borrow <code>overrides</code> immutably, and the <code>overrides.insert</code> on line 1605 (a mutable borrow) would not compile.</li>
+    <li><x-tags>domain</x-tags> A state override naming a <em>different</em> nonce for the sender asks a contradictory question, so it is refused rather than one of the two being picked silently.</li>
+  </ul>
+
+  <h4>Guards at the edges</h4>
+  <p><code>spec_for_context</code> (lines 1411–1425) wraps <code>spec_for</code> with a pair of refusals for EIP-7843. An Amsterdam-spec context without a slot number would run <code>SLOTNUM</code> against a made-up zero, so it is <code>MissingSlotNumber</code>. A pre-Amsterdam context <em>with</em> a slot number means the network moved the fork after this build shipped, so running it under the older rules would be a well-formed wrong answer: <code>UnexpectedSlotNumber</code>. Both happen before any state is read. <code>map_evm_error</code> (lines 1633–1658) is generic over revm's database error type <code>E: DBErrorMarker + Into&lt;EvmError&gt;</code>, so <code>EVMError::Database(e) =&gt; e.into()</code> works for whatever the database's error is.</p>
+  <x-code src="myotis-evm/src/executor.rs" from="1660" to="1665"></x-code>
+  <p class="code-note"><x-tags>traits-generics</x-tags> A <strong>static assertion</strong>: an unnamed constant holding a closure that never runs. The compiler still type-checks it, so if <code>OracleError</code> stopped satisfying those bounds, the crate would stop compiling. It has no run-time cost.</p>
+  <div class="callout watch">
+    <span class="k">Stale or inaccurate comments</span>
+    <p>Line 1661 says the assertion makes “<code>run</code> stop compiling”. No function named <code>run</code> exists any more (there is a closure parameter <code>run</code> in <code>converge_runs</code>, which is not what is meant). The module doc (lines 10–17) says the sender need not “hold a balance, or pay the base fee”; that is true of the view-call family, while the transaction-object family now checks the fee cap and the sender's funds itself. The test <code>sepolia_context_executes_with_its_chain_id</code> (line 4208) blames <code>build_fill()</code>; the code now uses <code>build()</code>, whose own comment (line 1518) is correct.</p>
+  </div>
+</x-file>
+
+<x-file path="rust/myotis-evm/src/executor/tests/blockhash.rs" kind="unit tests (child module)">
+  <p class="purpose">Thirteen tests for <code>BLOCKHASH</code> from verified data (#664): the parent hash for N−1, the history contract from Prague on (on mainnet, Sepolia and Gnosis), the header walk before Prague or for a block the ring never held, zero outside the window, and refusals. A test contract built from raw opcodes returns <code>blockhash(number - d)</code> for each depth <code>d</code>. The <code>world</code> helper decides which sources hold which hash, and the answer shows which source ran.</p>
+  <p>The file is declared as <code>mod blockhash;</code> inside <code>mod tests</code> in <code>executor.rs</code> (line 1679). Because <code>executor.rs</code> is not a <code>mod.rs</code> file, the compiler looks for its child modules in a directory with its name: <code>executor/tests/blockhash.rs</code>. Its first line, <code>use super::*;</code>, imports everything visible in the parent test module, including <em>private</em> items (child modules may see their ancestors' private items) and the parent's own <code>use</code> imports. That is how the file can use <code>ctx</code>, <code>ROOT</code>, <code>TARGET</code>, <code>PARENT</code>, the <code>WaveFilling</code> oracle, <code>Arc</code> and <code>U256</code> without importing them.</p>
+  <x-code src="myotis-evm/src/executor/tests/blockhash.rs" from="152" to="171"></x-code>
+  <ul class="concepts">
+    <li><x-tags>traits-generics testing</x-tags> <code>struct ForgedHistory(FixtureSnapStateOracle);</code> is a <strong>newtype</strong>: a one-field tuple struct wrapping another type to give it different behaviour. Each method forwards to <code>self.0</code> except <code>fetch_storage</code> on the history contract, which reports a failed proof. Rust has no implementation inheritance, so wrapping and forwarding is how you override one method.</li>
+    <li><x-tags>traits-generics lifetimes</x-tags> The helper above it, <code>fn exec_over(oracle: impl SnapStateOracle + 'static) -&gt; EvmExecutor</code> (line 59), accepts any oracle type. <code>Arc::new(oracle)</code> then coerces to <code>Arc&lt;dyn SnapStateOracle&gt;</code>. The <code>'static</code> bound is needed because a <code>dyn Trait</code> in an <code>Arc</code> means <code>dyn Trait + 'static</code> by default: the oracle may not contain short-lived borrows.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/myotis-evm/src/ens/name.rs" kind="library" twin="Namehash / DnsEncoder">
+  <p class="purpose"><code>namehash</code> (ENSIP-1), <code>namehash_from</code> and <code>dns_encode</code> (the ENSIP-10 wire format). <code>namehash_from</code> is new: it starts the recurrence at a given root node instead of 32 zero bytes, which Genome's <code>.gno</code> tree on Gnosis needs. Names are only lowercased; there is no UTS-46 normalisation, a documented gap relative to Java. Trailing dots are treated exactly as Java treats them, which makes such names resolve to “no record”.</p>
+  <x-code src="myotis-evm/src/ens/name.rs" from="28" to="68"></x-code>
+  <ul class="concepts">
+    <li><x-tags>ownership</x-tags> Line 29: <code>let mut node = *root;</code> copies the 32-byte array out of the borrowed <code>&amp;[u8; 32]</code>. Arrays of <code>Copy</code> elements are <code>Copy</code>, so the function works on its own copy and the caller's root is unchanged.</li>
+    <li><x-tags>lifetimes bytes-strings</x-tags> Line 35: <code>name.to_lowercase()</code> creates a <em>temporary</em> <code>String</code>, and <code>split('.')</code> borrows from it. A temporary in a <code>for</code> loop's iterator expression lives for the whole loop, so the borrowed labels stay valid.</li>
+    <li><x-tags>borrowing</x-tags> Lines 49–50: <code>trimmed</code> borrows from <code>lower</code>, so <code>lower</code> needs its own <code>let</code> binding to live long enough. <code>unwrap_or(&amp;lower)</code> relies on <code>&amp;String</code> automatically coercing to <code>&amp;str</code>.</li>
+    <li><x-tags>error-handling</x-tags> <code>InvalidName("empty label")</code> carries a <code>&amp;'static str</code>: a literal, with no allocation. <code>bytes.len() as u8</code> on line 63 is safe because the length was checked to be ≤ 63 first.</li>
+  </ul>
+</x-file>
+
+<x-file path="rust/myotis-evm/src/ens/abi.rs" kind="library (private module)" twin="AbiEncoder / AbiDecoder">
+  <p class="purpose">A small hand-written Solidity ABI codec, covering only what ENS needs. The decoders never panic on untrusted data, and offsets or lengths above 64 MiB are rejected, so a forged length cannot force a giant allocation. The module is private (<code>mod abi;</code>), so only <code>ens</code> can use it. New since September: encoders for a single <code>bytes</code> argument and for no-argument calls, and <code>decode_u64</code>, all for the ownership reads below.</p>
+  <x-code src="myotis-evm/src/ens/abi.rs" from="142" to="161"></x-code>
+  <ul class="concepts">
+    <li><x-tags>error-handling borrowing</x-tags> <code>data.get(pos..pos.checked_add(32)?)?</code> (line 156) uses two <code>?</code> in an <code>Option</code>-returning function: one for arithmetic overflow, one for an out-of-range slice. <code>&amp;data[a..b]</code> would panic instead, and a panic aborts the engine.</li>
+    <li><x-tags>bytes-strings</x-tags> <strong>Check before casting.</strong> On 32-bit Android (armeabi-v7a), <code>v as usize</code> truncates silently (2<sup>32</sup> → 0) and would bypass the size guard. So the bound is checked while the value is still a <code>u64</code>, and <code>then_some</code> turns the boolean into <code>Some(v as usize)</code> or <code>None</code>.</li>
+    <li><x-tags>iterators-closures</x-tags> <code>decode_dynamic_bytes</code> (lines 201–207) ends with <code>.map(&lt;[u8]&gt;::to_vec)</code>, which passes a method where a closure would go, like Kotlin's <code>::toList</code>.</li>
+  </ul>
+  <p class="code-note"><x-tags>domain</x-tags> This file encodes <code>dnsRecord(bytes32,bytes,uint16)</code> (selector <code>0xee8de1f7</code>), which was copied from the Java engine. It is <em>not</em> mainnet PublicResolver's <code>dnsRecord(bytes32,bytes32,uint16)</code>; the doc on lines 89–93 says so. The module doc (lines 1–4) still lists only <code>bytes32</code>, <code>bytes4</code>, <code>address</code>, <code>bool</code> and <code>bytes</code>; the file also handles strings, string arrays and <code>u64</code> words.</p>
+</x-file>
+
+<x-file path="rust/myotis-evm/src/ens/mod.rs" kind="library" twin="EnsResolver / ReverseLookup">
+  <p class="purpose">Name resolution over verified <code>eth_call</code>s: forward records (address, text, contenthash, multicoin, pubkey, ABI, dnsRecord, interface implementer), ownership (registry, registrar, NameWrapper), reverse resolution confirmed by a forward lookup, and the in-EVM half of CCIP-Read (ERC-3668). Like Java, it walks the registry directly instead of using ENS's Universal Resolver. All calls go through the <code>EthCaller</code> trait, so the tests need no node. There is no HTTP here: an <code>OffchainLookup</code> revert reaches the host as a distinct error, and the host performs the gateway request and calls back.</p>
+  <div class="table-wrap"><table class="map">
+    <thead><tr><th>Lines</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td>1–33</td><td>Docs, submodules, imports.</td></tr>
+      <tr><td>35–121</td><td>Pinned addresses: the ENS registry, the Universal Resolver, the BaseRegistrar, <code>ensv1_mirror()</code> and <code>name_wrapper()</code> per chain, and Genome's registry, registrar and root on Gnosis.</td></tr>
+      <tr><td>123–219</td><td><code>Namespace</code> (which name tree a chain resolves) and <code>refusal()</code>, the check a host makes before any EVM setup.</td></tr>
+      <tr><td>221–323</td><td><code>EnsError</code>, the refusal strings, <code>OffchainLookup</code>, <code>Display</code>.</td></tr>
+      <tr><td>325–377</td><td><code>EnsOwnership</code>, the <code>EthCaller</code> trait, the <code>ExecutorCaller</code> adapter.</td></tr>
+      <tr><td>379–402</td><td><code>ResolverInfo</code>, <code>resolve_address</code>.</td></tr>
+      <tr><td>404–550</td><td><code>resolve_ownership</code>, <code>v1_decides</code> (ENSv2), <code>call_address</code>, <code>call_u64</code>.</td></tr>
+      <tr><td>552–667</td><td>The other record types: one function each, all over <code>resolve_record</code>.</td></tr>
+      <tr><td>669–793</td><td>Reverse lookup (exact <code>&lt;hex&gt;.addr.reverse</code> resolver, else a wildcard resolver higher up), forward verification, the reverse name.</td></tr>
+      <tr><td>795–827</td><td>Public answer decoders, shared with the CCIP-Read continuation.</td></tr>
+      <tr><td>829–883</td><td><code>resolve_record</code> (ENSIP-10 wildcard support), <code>call_wrapped</code>.</td></tr>
+      <tr><td>885–955</td><td>CCIP-Read: <code>ccip_callback</code>, <code>revert_outcome</code>, <code>decode_offchain_lookup</code> (≤ 32 URLs).</td></tr>
+      <tr><td>957–1005</td><td>Registry walk: <code>find_resolver</code>, <code>supports_interface</code>.</td></tr>
+      <tr><td>1007–1079</td><td>Tests: the scripted <code>MockCaller</code> and ABI helpers.</td></tr>
+      <tr><td>1080–1222</td><td>Tests: Genome on Gnosis, and chains without a name tree.</td></tr>
+      <tr><td>1223–1544</td><td>Tests: selectors, the resolver walk, every record type.</td></tr>
+      <tr><td>1545–1934</td><td>Tests: reverse resolution and CCIP-Read rounds.</td></tr>
+      <tr><td>1936–2081</td><td>Tests: ownership.</td></tr>
+      <tr><td>2083–2257</td><td>Tests: ENSv2 (#671).</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Which tree, and refusing early</h4>
+  <x-code src="myotis-evm/src/ens/mod.rs" from="150" to="172"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns</x-tags> <code>1 | 11_155_111 | 17_000 =&gt;</code> is an or-pattern over integers. <code>Namespace</code> derives <code>Copy</code> (line 126): its fields are byte arrays, <code>&amp;'static str</code> and <code>Option</code>s of those, all <code>Copy</code>, so a whole namespace is copied around like an integer.</li>
+    <li><x-tags>domain</x-tags> <strong>No tree is a refusal, not a fallback.</strong> Mainnet's registry address holds nothing on another chain, so resolving there would answer a well-formed “no record”. Chiado, for instance, gets <code>NO_NAME_SERVICE</code>. On Gnosis only <code>.gno</code> names resolve, under Genome's root node; <code>vitalik.eth</code> there is refused with <code>ONLY_GNO_NAMES</code> rather than hashed into the wrong tree, and reverse lookups are refused too.</li>
+  </ul>
+  <x-code src="myotis-evm/src/ens/mod.rs" from="230" to="266"></x-code>
+  <ul class="concepts">
+    <li><x-tags>error-handling domain</x-tags> “No record” is <code>Ok(None)</code>, not an error. An offchain name <em>is</em> an error, because answering “no record” for a name that exists offchain would be wrong. <code>wrapped</code> remembers whether the original call went through the ENSIP-10 <code>resolve()</code> wrapper, and <code>reverse_claim</code> (new) remembers that the round is a reverse lookup's forward check, so the host's continuation compares the answer with the queried address.</li>
+    <li><x-tags>smart-pointers</x-tags> <code>lookup: Option&lt;Box&lt;OffchainLookup&gt;&gt;</code>: the code does not say why the lookup is boxed. A common reason is that an enum is as large as its largest variant, and a <code>Box</code> keeps this variant small; the lookup carries vectors and a URL list. <code>Unsupported(&amp;'static str)</code> carries one of the constant refusal strings defined right below.</li>
+  </ul>
+  <x-code src="myotis-evm/src/ens/mod.rs" from="349" to="377"></x-code>
+  <ul class="concepts">
+    <li><x-tags>lifetimes</x-tags> <code>ExecutorCaller&lt;'a&gt;</code> is just two references, and <code>'a</code> stops it from outliving the executor or the context. <code>ElReader</code> builds one inside a <code>move</code> closure that owns both and runs on a blocking thread.</li>
+    <li><x-tags>concurrency traits-generics</x-tags> <code>EthCaller</code> has <em>no</em> <code>Send + Sync</code> bound (it is used as <code>&amp;dyn EthCaller</code> on one thread), so the test mock may count calls with a non-thread-safe <code>RefCell</code>. Compare <code>SnapStateOracle</code>, whose bound rules that out.</li>
+    <li><x-tags>domain</x-tags> <code>chain_id()</code> is a required method with no default. The doc's reason: no caller can then silently hash a Gnosis name into the ENS tree.</li>
+  </ul>
+
+  <h4>ENSv2: when v1 no longer speaks for a name</h4>
+  <p>ENSv2 is ENS's new registry design, live on Sepolia during its beta (issue #671). For a name that ENSv2 decides, the v1 registry and BaseRegistrar this file reads no longer speak for its ownership: their entries may be empty (a name registered only in ENSv2) or stale (an expired v1 entry). So <code>resolve_ownership</code> first asks ENSv2's Universal Resolver whether v1 still decides the name, and refuses if it does not. The record reads are not gated this way.</p>
+  <x-code src="myotis-evm/src/ens/mod.rs" from="504" to="528"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns error-handling</x-tags> Two <code>let … else</code> statements in a row. Each binds a value or returns <code>Ok(false)</code>: no mirror pinned for this chain, or a Universal Resolver that could not walk the name (“unknown is not a yes”). Note what is <em>not</em> folded into “false”: <code>call_address</code> maps only a <em>revert</em> to <code>None</code>; a halt or unavailable state comes back through <code>?</code> as <code>EnsError::Call</code>, so missing state cannot turn into “v1 decides”.</li>
+    <li><x-tags>domain</x-tags> <strong>Pinned, not recognised.</strong> The mirror must be the pinned address <em>and</em> its <code>REGISTRY_V1()</code> must name this registry. A name's ENSv2 owner sets its resolver and could deploy one that answers <code>REGISTRY_V1()</code> correctly; trusting the getter alone would let any owner make an ENSv2 name read as unowned (the #672 review). Where ENSv2 is live but no mirror is pinned (mainnet right after activation), every ownership read is refused.</li>
+  </ul>
+
+  <h4>Reverse resolution and CCIP-Read</h4>
+  <p><code>reverse_resolve</code> reads the claimed primary name from the resolver of the exact <code>&lt;hex&gt;.addr.reverse</code> node, calling <code>name(bytes32)</code> directly with no <code>supportsInterface</code> probe: old reverse resolvers predate ERC-165 and halt on the probe. Only an address without its own reverse resolver walks up to a wildcard resolver on <code>addr.reverse</code> or <code>reverse</code> (new, #671), which is how ENSv2 primary names on Sepolia answer. Either way the claim is then checked forward.</p>
+  <x-code src="myotis-evm/src/ens/mod.rs" from="761" to="774"></x-code>
+  <ul class="concepts">
+    <li><x-tags>enums-patterns ownership</x-tags> The <code>match</code> works on the <em>owned</em> result of <code>resolve_address</code>, so its patterns can move values out. <code>Ok(Some(fwd)) if fwd == address</code> is a guarded arm. <code>Ok(_) | Err(EnsError::InvalidName(_))</code> folds a mismatch and a malformed claim into “no verified name”, so a malicious reverse record cannot force an error. The <code>OffchainLookup</code> arm moves <code>lookup</code> (the <code>Box</code>) and <code>wrapped</code> out of the old error into a new one that also carries the claim.</li>
+    <li><x-tags>ownership</x-tags> <code>claimed: String</code> is taken by value. The first arm moves it into <code>Some(claimed)</code>, the third into <code>reverse_claim</code>; only one arm runs, so the compiler accepts both moves.</li>
+  </ul>
+  <div class="callout jvm">
+    <span class="k">CCIP-Read, end to end</span>
+    <p>The resolver reverts with <code>OffchainLookup</code>. <code>revert_outcome</code> (lines 925–935) checks the 4-byte selector after a length check, so <code>data[..4]</code> cannot panic, and decodes the tuple; any other revert is “no record”. <code>ElReader</code> reports an “offchain” outcome. The JVM host's <code>CcipDriver</code> (in <code>myotis-engine-rust</code>) performs the gateway request and calls back with <code>method:"ccipCallback"</code>. <code>ccip_callback</code> then runs the verified <code>sender.callbackFunction(response, extraData)</code> call and unwraps the result only if <code>wrapped</code>. A second <code>OffchainLookup</code> keeps the original <code>wrapped</code> flag, and the host enforces the recursion cap.</p>
+  </div>
+
+  <h4>The test mock</h4>
+  <x-code src="myotis-evm/src/ens/mod.rs" from="1014" to="1036"></x-code>
+  <ul class="concepts">
+    <li><x-tags>iterators-closures smart-pointers lifetimes</x-tags> Every closure has its own anonymous type, so a <code>Vec</code> of closures needs <code>Box&lt;dyn Fn …&gt;</code>. <code>on(mut self, f: impl Fn(…) + 'static) -&gt; Self</code> is a consuming, chainable builder, and <code>'static</code> forbids the closure from borrowing short-lived locals, since it will be stored.</li>
+    <li><x-tags>iterators-closures ownership</x-tags> The tests' handlers are <code>move</code> closures. Because the field type is <code>Fn</code> (callable many times through <code>&amp;self</code>), a handler may not give away what it captured. A handler that returns a captured <code>Vec</code> therefore writes <code>.then(|| Ok(claimed.clone()))</code>: the inner closure borrows <code>claimed</code> from the outer one and returns a fresh copy each time.</li>
+    <li><x-tags>interior-mutability</x-tags> <code>calls: RefCell&lt;usize&gt;</code> counts calls inside <code>eth_call(&amp;self, …)</code> with <code>*self.calls.borrow_mut() += 1</code>. Tests assert the count to prove, for example, that a subname's ownership asked only three questions.</li>
+  </ul>
+</x-file>
+
+<x-quiz>[
+  {"id":"evm-q1","type":"mcq","tags":["concurrency","traits-generics","smart-pointers"],
+   "q":"What would break if <code>SnapStateOracle</code> were declared without <code>: Send + Sync</code>?",
+   "options":["Nothing; the bounds are documentation","revm would reject the database","<code>Arc&lt;dyn SnapStateOracle&gt;</code> would not be <code>Send</code>, so an executor holding it could not be moved to a blocking thread or shared across threads","The oracle could no longer return <code>Result</code>"],
+   "answer":2,
+   "explain":"<code>Arc&lt;T&gt;</code> is <code>Send</code> only if <code>T: Send + Sync</code>. With a bare <code>dyn SnapStateOracle</code> the compiler cannot know that, so every cross-thread use would be rejected."},
+  {"id":"evm-q2","type":"mcq","tags":["interior-mutability","borrowing","lifetimes"],
+   "q":"<code>InMemoryStateProofCache::get_account</code> returns <code>…get(&amp;key).cloned()</code> rather than a reference into the map. Why?",
+   "options":["The map is only reachable through a <code>MutexGuard</code> that dies at the end of the statement; a reference into the map cannot outlive that guard","Clones are faster than references","<code>HashMap::get</code> always returns an owned value","To allow the caller to mutate the cache"],
+   "answer":0,
+   "explain":"A reference derived from the guard borrows the guard. Returning it would let the caller read the map after the lock is released, which is exactly the data race the compiler forbids. Copying the value out is the sound option."},
+  {"id":"evm-q3","type":"open","tags":["interior-mutability","concurrency"],
+   "q":"In <code>OracleDatabase::account</code>, the sentinel check sits in its own <code>{ … }</code> block before the network fetch. What does the block do, and what could go wrong without it?",
+   "model":"The block limits the lifetime of the <code>MutexGuard</code> (<code>let mut track = self.track.lock().unwrap();</code>). At the closing brace the guard is dropped and the lock released, so it is not held during <code>self.oracle.fetch_account(…)</code>, which may block on the network for a long time. Without the block the guard would live to the end of the function, so the lock would be held across the slow fetch. Anything else that needs <code>track</code> during that time would wait, and any nested lock of it on the same thread (for example from code added later in the function) would deadlock, because Rust mutexes are not reentrant.",
+   "points":["the block scopes the MutexGuard; the lock is released at the closing brace","the lock is not held across the potentially blocking oracle fetch","without the block the guard lives until the end of the function","risk: other users of track wait for the whole fetch, and a nested lock on the same thread deadlocks because Mutex is not reentrant"],
+   "context":"myotis-evm/src/database.rs L266-277: { let mut track = self.track.lock().unwrap(); if track.sentinel { track.misses += 1; return Ok(None); } } // Tier 3 — a fresh verified fetch. The lock is NOT held across it ... let fetched = self.oracle.fetch_account(&self.state_root, addr)?;"},
+  {"id":"evm-q4","type":"mcq","tags":["traits-generics","borrowing"],
+   "q":"Why does <code>OracleDatabase</code> implement revm's <code>DatabaseRef</code> (<code>&amp;self</code>) rather than <code>Database</code> (<code>&amp;mut self</code>)?",
+   "options":["<code>Database</code> is deprecated","Because <code>&amp;mut</code> is slower","Because revm requires <code>Send</code>","So the executor can keep ownership of one database and lend it to every loop iteration and every gas-search probe; the price is interior mutability inside"],
+   "answer":3,
+   "explain":"revm implements <code>DatabaseRef</code> for <code>&amp;T</code>, so <code>execute_recording</code> passes <code>with_ref_db(db)</code> each time, and everything learned in one run stays in the view cache for the next."},
+  {"id":"evm-q5","type":"mcq","tags":["ownership","borrowing"],
+   "q":"In <code>converge_runs</code>, <code>self.prefetch_wave(ctx, &amp;fresh, …);</code> is followed by <code>seen.merge(fresh);</code>. What happens if you swap the two lines?",
+   "options":["It still compiles; order does not matter","Compile error: <code>merge</code> takes <code>fresh</code> by value (moves it), so the later <code>&amp;fresh</code> uses a moved value","Runtime panic","The wave fetches nothing"],
+   "answer":1,
+   "explain":"Borrow first, then move. Once a value has been moved into <code>merge</code>, the name <code>fresh</code> is dead."},
+  {"id":"evm-q6","type":"open","tags":["domain","iterators-closures"],
+   "q":"Explain how the prefetch convergence loop decides when to stop, and why an answer can never come from a placeholder.",
+   "model":"Each iteration runs the EVM. While still discovering, the run is a sentinel pass: a read that would need the network gets an uncached zero placeholder and bumps a miss counter, and the database records every account, slot and code hash touched. After each run the loop diffs the touched set against what it has seen. A sentinel run that handed out no placeholder and did not fail read only verified state, so it is returned at once. A sentinel run with an empty diff ends discovery. Otherwise the fresh accesses (plus the code of contracts the pass called or inspected) are fetched in one parallel verified wave into the shared caches. Discovery also ends when the oracle's <code>keep_discovering</code> time bound says no, or when only two iterations of the cap (12) are left. A real run's error propagates; a real run with an empty diff is the answer; a real run that still touched something new triggers another wave. Hitting the cap is <code>IterationLimitExceeded</code>. Placeholders only appear in sentinel runs, and a sentinel run is returned only when its miss counter did not move.",
+   "points":["sentinel passes hand out counted, uncached zero placeholders and record accesses","fresh = touched minus seen; non-empty fresh is fetched in one parallel verified wave","a sentinel run is returned only if it handed out no placeholder and did not fail","discovery ends at an empty diff, at the oracle's keep_discovering bound, or two iterations before the cap; real runs then answer","cap reached gives IterationLimitExceeded (fail closed)"],
+   "context":"myotis-evm/src/executor.rs L1240-1310 converge_runs: discovering = discovering && iter + 2 &lt; cap && self.oracle.keep_discovering(iter); db.set_sentinel(sentinel); ... let fresh = db.take_access_set().minus(&seen); if sentinel { if db.sentinel_misses() == misses_before { if let Ok(result) = outcome { return Ok(result); } } if fresh.is_empty() { discovering = false; } else { self.prefetch_wave(ctx, &fresh, &code_needed.into_inner()); seen.merge(fresh); } } else { let result = outcome?; if fresh.is_empty() { return Ok(result); } self.prefetch_wave(...); seen.merge(fresh); } Err(EvmError::IterationLimitExceeded { cap }). PREFETCH_ITERATION_CAP = 12."},
+  {"id":"evm-q7","type":"mcq","tags":["interior-mutability","concurrency"],
+   "q":"<code>RequestInspector</code> records needed code into a <code>&amp;RefCell&lt;HashSet&lt;…&gt;&gt;</code>, while <code>OracleDatabase</code> keeps its access set in a <code>Mutex</code>. Why the difference?",
+   "options":["<code>RefCell</code> is faster, and the database author did not know about it","The database's type must be <code>Sync</code> (it is reached through a shared reference that the type system lets cross threads), and a <code>RefCell</code> is never <code>Sync</code>; the inspector's set is a local of one run on one thread, where a run-time borrow check is enough","A <code>Mutex</code> cannot hold a <code>HashSet</code>","revm forbids <code>Mutex</code> inside inspectors"],
+   "answer":1,
+   "explain":"Both give mutation behind a shared reference. <code>RefCell</code> checks borrows at run time on one thread; <code>Mutex</code> also makes the type safe to share between threads. Use the cheaper one only when the compiler lets you."},
+  {"id":"evm-q8","type":"mcq","tags":["domain","interior-mutability"],
+   "q":"During a discovery pass, <code>block_hash_ref</code> reads the EIP-2935 history slot for block k and gets zero, and the miss counter has moved. What does it do?",
+   "options":["Returns zero as the block hash, because a written slot is never zero","Walks the header chain at once","Returns zero as a placeholder: the slot is in the access set, the next wave fetches it, and the real run reads the true value","Returns <code>BlockHashUnsupported</code>"],
+   "answer":2,
+   "explain":"Lines 437–449: a moved counter means the zero was a sentinel placeholder, not a proven value. Only a proven zero (counter unchanged) means the ring never wrote the slot, and then the header walk runs."},
+  {"id":"evm-q9","type":"mcq","tags":["bytes-strings","error-handling"],
+   "q":"<code>read_index</code> checks <code>v &lt;= MAX_INDEX as u64</code> <em>before</em> <code>v as usize</code>. Why does the order matter?",
+   "options":["On 32-bit targets <code>as usize</code> truncates silently (2<sup>32</sup> → 0), which would bypass the guard","It does not","<code>as usize</code> panics on overflow","Because <code>u64</code> comparisons are faster"],
+   "answer":0,
+   "explain":"<code>as</code> casts never fail; they wrap or truncate. Checking in the wider type first keeps the guard meaningful on armeabi-v7a devices."},
+  {"id":"evm-q10","type":"mcq","tags":["error-handling","domain"],
+   "q":"Why is an ERC-3668 <code>OffchainLookup</code> revert reported as <code>Err(EnsError::OffchainLookup{…})</code> instead of <code>Ok(None)</code>?",
+   "options":["Because all reverts are errors","Because the tuple cannot be decoded","To make tests easier","The record exists, just offchain. “No record” would be a well-formed but wrong answer, so the host must be told to perform the gateway round"],
+   "answer":3,
+   "explain":"The same principle behind #314 and the log index: never return a plausible answer computed from something other than what was asked. A plain revert means “no record”; <code>OffchainLookup</code> means “ask the gateway”."},
+  {"id":"evm-q11","type":"mcq","tags":["smart-pointers","enums-patterns"],
+   "q":"<code>EvmError::FailedWithGas</code> holds <code>error: Box&lt;EvmError&gt;</code>. What would happen with <code>error: EvmError</code> instead?",
+   "options":["It would compile but use more stack","Compile error: a recursive type has infinite size, because an enum is as large as its largest variant and this variant would contain the whole enum","It would compile, and <code>Clone</code> would become a deep copy","The <code>Display</code> impl would recurse forever"],
+   "answer":1,
+   "explain":"The <code>Box</code> stores the inner error on the heap and leaves a pointer-sized field in the variant, which breaks the size recursion. Java never meets this because every object field is already a reference."},
+  {"id":"evm-q12","type":"open","tags":["ownership","borrowing"],
+   "q":"<code>with_sender_nonce(mut overrides: StateOverrides, tx: &amp;TxRequest) -&gt; Result&lt;StateOverrides, EvmError&gt;</code> starts its edit with <code>let mut entry = overrides.get(&amp;tx.from).cloned().unwrap_or_default();</code>. Explain the ownership of <code>overrides</code> through this function, and why the <code>.cloned()</code> is needed.",
+   "model":"The caller moves its <code>StateOverrides</code> into the function; <code>mut</code> on the parameter lets the function change the value it now owns, and it moves the edited value back in <code>Ok(overrides)</code>, so the caller cannot keep using a stale copy. <code>overrides.get(…)</code> returns a reference into the map. <code>.cloned()</code> turns it into an owned <code>AccountOverride</code>, so <code>entry</code> does not borrow <code>overrides</code>. That matters because the function later calls <code>overrides.insert(tx.from, entry)</code>, which needs a mutable borrow of the map; with an active shared borrow from <code>entry</code> it would not compile. A nonce in the override that differs from the request's is refused as <code>InvalidRequest</code>.",
+   "points":["the overrides are moved in by value and moved back out in the Ok result","mut on a by-value parameter only allows the function to change its own value","get returns a reference into the map; cloned makes an owned copy","without the clone, the later insert (mutable borrow) would conflict with entry's shared borrow","a contradictory override nonce is refused, not overwritten"],
+   "context":"myotis-evm/src/executor.rs L1592-1607: fn with_sender_nonce(mut overrides: StateOverrides, tx: &TxRequest) -> Result&lt;StateOverrides, EvmError> { let Some(nonce) = tx.nonce else { return Ok(overrides); }; let mut entry = overrides.get(&tx.from).cloned().unwrap_or_default(); if let Some(overridden) = entry.nonce.filter(|n| *n != nonce) { return Err(EvmError::InvalidRequest{..}); } entry.nonce = Some(nonce); overrides.insert(tx.from, entry); Ok(overrides) }"},
+  {"id":"evm-q13","type":"open","tags":["domain","error-handling"],
+   "q":"<code>v1_decides</code> decides whether ENS v1 still speaks for a name. Why does <code>resolve_ownership</code> refuse instead of answering from v1 when it is unsure, and why is the v1 mirror pinned by address rather than recognised by its <code>REGISTRY_V1()</code> getter?",
+   "model":"For a name that ENSv2 decides, the v1 registry and registrar may hold no owner or a stale one, so a v1 answer would show an ENSv2 name as unowned or name a previous holder: a well-formed wrong answer the caller cannot detect. So any doubt leads to <code>Unsupported(ENSV2_OWNERSHIP)</code>: no pinned mirror where ENSv2 is live, a Universal Resolver that cannot walk the name, or a resolver other than the mirror. A name's ENSv2 owner can set its own resolver and make it answer <code>REGISTRY_V1()</code> with the v1 registry; trusting the getter would let anyone make their ENSv2 name read as v1-owned. Pinning the mirror's address, and also requiring its getter to name this registry, closes that. Only a revert is read as \"no\"; a halt or unavailable state propagates as <code>EnsError::Call</code>.",
+   "points":["answering from v1 for an ENSv2 name gives a well-formed wrong owner (unowned or stale)","any doubt (no pinned mirror, unwalkable name, other resolver) is a refusal, not v1's answer","a name owner controls its resolver and could fake REGISTRY_V1(), so the getter alone proves nothing","the mirror must be the pinned address AND name this registry","only reverts read as none; other call failures propagate as errors"],
+   "context":"myotis-evm/src/ens/mod.rs L504-528 v1_decides: if ROOT_REGISTRY() is none → Ok(true); let Some(mirror) = ensv1_mirror(chain) else { return Ok(false) }; let Some(resolver) = findResolver(dns) else { return Ok(false) }; if resolver != mirror { return Ok(false) }; REGISTRY_V1() == Some(registry). resolve_ownership L443-447 returns Err(EnsError::Unsupported(ENSV2_OWNERSHIP)) when !v1_decides. call_address L531-541 maps only Reverted to None."},
+  {"id":"evm-q14","type":"open","tags":["iterators-closures","ownership"],
+   "q":"<code>MockCaller</code> stores handlers as <code>Vec&lt;Box&lt;dyn Fn([u8; 20], &amp;[u8]) -&gt; Option&lt;Result&lt;Vec&lt;u8&gt;, EvmError&gt;&gt;&gt;&gt;</code>, added with <code>on(mut self, f: impl Fn(…) + 'static) -&gt; Self</code>. A test handler that returns a captured byte vector is written <code>move |t, cd| (…).then(|| Ok(claimed.clone()))</code>. Explain the <code>Box&lt;dyn …&gt;</code>, the <code>'static</code>, and the <code>.clone()</code>.",
+   "model":"Each closure has its own unnamed type, so a vector holding several different closures must store them behind a pointer to a trait object: <code>Box&lt;dyn Fn …&gt;</code>. The handler is stored in the mock and called later, so it must not borrow locals that die before it; <code>'static</code> forbids such borrows, and <code>move</code> makes the closure own <code>claimed</code>. Because the bound is <code>Fn</code>, the handler can be called many times through a shared reference and may not give away what it owns. Returning <code>claimed</code> itself would move it out on the first call. The inner closure borrows <code>claimed</code> and returns a fresh clone each time.",
+   "points":["closures have unique anonymous types, so a Vec of them needs Box&lt;dyn Fn>","'static means the stored closure contains no short-lived borrows","move transfers ownership of the captured vector into the closure","Fn closures may be called repeatedly and cannot move captured values out","clone returns a new copy per call while the closure keeps the original"],
+   "context":"myotis-evm/src/ens/mod.rs L1014-1036: struct MockCaller { handlers: Vec&lt;Box&lt;dyn Fn([u8; 20], &[u8]) -> Option&lt;Result&lt;Vec&lt;u8>, EvmError>>>>, calls: RefCell&lt;usize>, chain: u64 } fn on(mut self, f: impl Fn(...) + 'static) -> Self { self.handlers.push(Box::new(f)); self }. Test at L1664: .on(move |t, cd| (t == OLD_REVERSE && sel(cd) == name_sel).then(|| Ok(claimed.clone())))"}
+]</x-quiz>

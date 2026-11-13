@@ -3,7 +3,7 @@
 ``eth_getLogs`` output. DEBUG / DEMO ONLY — NOT A PRODUCTION DATA PATH.
 
 The engine's own generator walks history over devp2p and verifies every log
-against receipt roots (docs/eth-getlogs-design.md). This script does none of
+against receipt roots (docs/design-history/eth-getlogs-design.md). This script does none of
 that: it takes logs a full node returned over JSON-RPC and frames them in the
 exact byte layout ``LogIndex::serialize_impl`` writes
 (rust/myotis-net/src/el/logindex.rs), so the engine's portable import path
@@ -82,7 +82,6 @@ import hashlib
 import json
 import struct
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 MAGIC = b"MLIX"
@@ -508,7 +507,7 @@ def main() -> int:
         # The engine's head bridge maps at most MAX_GAP = 500_000 blocks above a
         # file's top (el/reader.rs); beyond that a seed never catches up.
         lines = [
-            "# Log-index seed manifest — written by scripts/synth_logindex.py (see docs/bee-rpc-service.md)",
+            "# Log-index seed manifest — written by scripts/synth_logindex.py (see docs/guides/bee-rpc-service.md)",
             f"network={ {100: 'gnosis', 1: 'mainnet', 11155111: 'sepolia'}.get(info['network_id'], info['network_id']) }",
             f"address=0x{address.hex()}",
             f"deploymentBlock={deploy}",
@@ -518,7 +517,9 @@ def main() -> int:
             f"logs={stats['logs_kept']}",
             f"sha256={hashlib.sha256(data).hexdigest()}",
             f"source={Path(args.meta).name if args.meta else '-'}",
-            f"builtAtUtc={datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')}",
+            # No build timestamp (#734 D6): this runs inside the desktop build,
+            # and a wall-clock builtAtUtc made every PoC dmg differ. Nothing
+            # read it; the fields above say what the seed covers.
         ]
         Path(args.manifest).write_text("\n".join(lines) + "\n", encoding="utf-8")
         print(f"wrote {args.manifest}", file=sys.stderr)

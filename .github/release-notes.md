@@ -1,9 +1,24 @@
 Pre-release build of the Myotis wallet apps.
 
+**Checking a download** — `SHA256SUMS` lists the SHA-256 of every file on this page:
+`sha256sum -c SHA256SUMS --ignore-missing` next to what you downloaded. Each file also
+carries a build-provenance attestation that names the workflow run and the commit it
+was built from: `gh attestation verify <file> --repo biafra23/myotis --source-ref refs/tags/<this release's tag>`
+(the tag matters: without it any run of the repository would do), or the whole release at
+once with `scripts/verify_release.sh <tag>`. What a rebuild
+is checked against, and how to make one: docs/guides/reproducible-builds.md.
+
 **Android (`*-android.apk`)** — the Myotis app, signed with Myotis's own release key
 (its certificate's SHA-256 is in `android-app/release-signing-cert.sha256` in the
 repository). Install via "Install unknown apps" and switch that off again afterwards;
 only ever install Myotis, and its updates, from this releases page.
+
+**Android unsigned (`*-android-unsigned.apk`)** — not installable: Android refuses an
+unsigned APK. It is the release app as the build left it, before the signature was
+added, published so the build can be checked: it is the file a rebuild of this tag
+in the pinned builder image is meant to reproduce bit for bit, and the signed app is
+this file plus its signature. Whether the rebuild matched for this release is in the
+summary of the tag's `reproducible builds` run (docs/guides/reproducible-builds.md).
 
 **Android debug (`*-android-debug.apk`)** — a separate test app ("Myotis Debug", amber
 icon, package `com.jaeckel.ethp2p.android.debug`), signed with the publicly known debug
@@ -30,7 +45,7 @@ seed and warm peer caches. Demo/debug artefact — the seed is RPC-sourced and
 served unverified (only the backfill walk would re-check it, and the app ships
 with that walk switched off), and it stops catching up about 29
 days after its fetch (the Index tab shows the block it is usable until). See
-docs/bee-rpc-service.md.
+docs/guides/bee-rpc-service.md.
 
 **RAILGUN PoC (`Myotis-v<version>-railgun-poc-arm64.dmg`, when present)** — a separate
 app ("Myotis RAILGUN PoC", own data dir) that the RAILGUN Terminal Wallet CLI can use as
@@ -41,7 +56,7 @@ serves mainnet on port 8555 and Sepolia on 8557, not the regular app's 8545 and 
 point the wallet at `http://127.0.0.1:8555` or `http://127.0.0.1:8557`. Debug/demo
 artefact, not a production path — the seeds are RPC-sourced and unverified (no
 receipt-root proof), and each stops catching up about 69 days after its fetch (the
-Index tab shows the block it is usable until). See docs/railgun-poc.md.
+Index tab shows the block it is usable until). See docs/guides/railgun-poc.md.
 
 **Desktop Linux (`Myotis-v<version>-<arch>.deb`)** — install with
 `sudo apt install ./Myotis-v<version>-<arch>.deb` (x64 for Intel/AMD, arm64 for

@@ -1,5 +1,5 @@
 //! Tor transport for the verified-read path and the transaction broadcast
-//! (`docs/privacy-and-tor.md`).
+//! (`docs/how-it-works/privacy-and-tor.md`).
 //!
 //! Feature-gated (`tor`): only a host that builds `myotis-net` with
 //! `--features tor` (`-PtorEngine`: the desktop dylib, the Android jniLibs)
@@ -45,7 +45,7 @@ use crate::el::rlpx::transport::RlpxConnection;
 
 /// The client id a Tor-side Hello advertises: the software's name without its
 /// version, so a peer cannot match a Tor session to a direct one (which says
-/// `myotis/<version>`) by version — docs/privacy-and-tor.md §6.3.
+/// `myotis/<version>`) by version — docs/how-it-works/privacy-and-tor.md §6.3.
 pub const TOR_CLIENT_ID: &str = "myotis";
 
 /// Process-wide Tor on/off, flipped by the host (JNI `myotis_set_tor_enabled`).
@@ -252,6 +252,16 @@ fn peer_side(kind: arti_client::ErrorKind) -> bool {
 /// side's Tor (bootstrap, configuration, no circuit, a local network down:
 /// "tor circuit …") or a session that opened and then failed.
 pub(crate) fn is_peer_unreachable(error: &str) -> bool {
+    // A handshake that never started for lack of OUR entropy is this side's fault.
+    // Anchored to the RLPx stage, the only one that draws entropy, whose errors
+    // are literals plus OS text: a later stage echoes the peer's Hello client id
+    // (`no common eth version with …`), so a bare substring match could be
+    // steered by a node that names itself after the marker.
+    if error.starts_with("tor rlpx handshake to ")
+        && crate::el::rlpx::transport::is_local_entropy_failure(error)
+    {
+        return false;
+    }
     ["tor addr ", "tor connect ", "tor rlpx handshake", "tor eth handshake"]
         .iter()
         .any(|prefix| error.starts_with(prefix))
@@ -357,6 +367,10 @@ mod tests {
         assert!(!peer("tor circuit for 10.0.0.1:30303: no exit available"));
         assert!(!peer("tor: no storage directory configured — the host must call set_storage_dirs"));
         assert!(!peer("timed out awaiting the peer's Pong"));
+        // Our missing entropy is not the peer's doing — but only at the RLPx
+        // stage: a client id that spells the marker cannot launder a strike.
+        assert!(!peer("tor rlpx handshake to 10.0.0.1:30303: rlpx: OS entropy unavailable: errno 38"));
+        assert!(peer("tor eth handshake to 10.0.0.1:30303: no common eth version with \"rlpx: OS entropy unavailable\""));
     }
 
     use super::*;

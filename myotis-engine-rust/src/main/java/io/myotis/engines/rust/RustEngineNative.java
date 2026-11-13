@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 55; // 55: simulate_v1_json (#716); 54: debug_trace_call_json (#716); 53: get_raw_transaction_by_hash_json + get_raw_transaction_by_block_json (#715); 52: account and call JSON carry the proven blockHash; 51: set_activity_watch + address_activity_json (#691); 50: dataUsage + networkMetering in the status, set_network_metering; 49: ens offchain envelope carries reverseClaim; 48: log-index topic entries (#673); 47: resolve_block_hash_json, get_proof_json takes a block hash; 46: get_proof_json; 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
+    static final int EXPECTED_ABI_VERSION = 57; // 57: myotis_set_listen_ports (C ABI only; P2P listen ports); 56: log-index allowMetered + meteredHold (metered-download hold); 55: simulate_v1_json (#716); 54: debug_trace_call_json (#716); 53: get_raw_transaction_by_hash_json + get_raw_transaction_by_block_json (#715); 52: account and call JSON carry the proven blockHash; 51: set_activity_watch + address_activity_json (#691); 50: dataUsage + networkMetering in the status, set_network_metering; 49: ens offchain envelope carries reverseClaim; 48: log-index topic entries (#673); 47: resolve_block_hash_json, get_proof_json takes a block hash; 46: get_proof_json; 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
 
     private static final boolean AVAILABLE = load();
 
@@ -175,7 +175,7 @@ final class RustEngineNative {
     }
 
     /**
-     * Toggle Tor verified-read routing (docs/privacy-and-tor.md). Returns true iff
+     * Toggle Tor verified-read routing (docs/how-it-works/privacy-and-tor.md). Returns true iff
      * the loaded library was built with Tor support ({@code --features tor}); a
      * Tor-less library returns false and no-ops. Process-global, not per-handle.
      */
@@ -214,7 +214,7 @@ final class RustEngineNative {
 
     /**
      * The host's word on the device's current network, for the status JSON's data
-     * usage (docs/data-usage.md): 0 unknown, 1 unmetered, 2 metered. False, and
+     * usage (docs/how-it-works/data-usage.md): 0 unknown, 1 unmetered, 2 metered. False, and
      * nothing recorded, for any other code. Process-global, not per-handle.
      */
     static boolean nativeSetNetworkMetering(int code) {
@@ -490,7 +490,7 @@ final class RustEngineNative {
         return Myotis_engineKt.addressActivityJson(handle, afterBlock);
     }
 
-    /** Read-fetch shadow-cache counters JSON (docs/read-stats.md). */
+    /** Read-fetch shadow-cache counters JSON (docs/how-it-works/read-stats.md). */
     static String nativeReadStatsJson(long handle) {
         return Myotis_engineKt.readStatsJson(handle);
     }

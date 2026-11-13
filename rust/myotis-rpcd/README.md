@@ -7,7 +7,7 @@ fall back on.
 The wallet API the README describes is the Kotlin `jsonrpc-server`, so serving
 it has meant running one of the JVM hosts. myotis-rpcd is for hosts that can't
 or won't: a server, a container, a Raspberry Pi, or a service such as a Swarm
-Bee node ([docs/bee-rpc-service.md](../../docs/bee-rpc-service.md)) that only
+Bee node ([docs/guides/bee-rpc-service.md](../../docs/guides/bee-rpc-service.md)) that only
 needs an RPC endpoint on localhost. It links the engine as a library and puts a
 thin HTTP layer in front of it.
 
@@ -38,6 +38,8 @@ myotis-rpcd [--network gnosis|mainnet|sepolia]     # default gnosis
             [--import-log-index FILE]...           # snapshot(s) imported after the config
             [--checkpoint-root 0x… --checkpoint-slot N]
             [--boot-enodes enode://…,…|@FILE]      # EL peers to dial at start
+            [--discv4-port N] [--discv5-port N]    # P2P UDP ports (default 0 = OS-assigned)
+            [--libp2p-port N] [--libp2p-quic-port N]  # light-client host TCP / QUIC-UDP ports
             [--accept-stale-anchor] [--ws-bound-periods N]
             [--log-calls FILE] [--access-log]
             [--ready-wait 90] [--workers 16]
@@ -159,7 +161,7 @@ second after start.
 ### eth_getLogs
 
 `eth_getLogs` needs the opt-in log index
-([docs/eth-getlogs-design.md](../../docs/eth-getlogs-design.md)).
+([docs/design-history/eth-getlogs-design.md](../../docs/design-history/eth-getlogs-design.md)).
 `--log-index-config` takes the engine's watch-list JSON, installed as soon as
 the engine's EL reader is up:
 
@@ -179,7 +181,40 @@ the engine's reason.
 the config is installed — e.g. a seed from `scripts/synth_logindex.py`. The
 import is all-or-nothing, and its logs are served as the snapshot claims them,
 so a seed is only as good as its source
-([docs/seeded-log-histories.md](../../docs/seeded-log-histories.md)).
+([docs/how-it-works/seeded-log-histories.md](../../docs/how-it-works/seeded-log-histories.md)).
+
+### Ports
+
+Every socket the daemon opens can be named on the command line. The JSON-RPC
+listener is `--listen`; the P2P sockets are below. Each defaults to 0, which
+lets the OS pick a free port: that is how two Myotis nodes, or Myotis next to
+geth or Nethermind, share a machine without colliding.
+
+| Flag | Socket | Used for |
+|---|---|---|
+| `--discv4-port` | UDP | EL peer discovery (discv4). The EL side only dials out, so this is its one listening socket. |
+| `--discv5-port` | UDP | CL peer discovery (discv5) |
+| `--libp2p-port` | TCP | the light-client libp2p host (req/resp) |
+| `--libp2p-quic-port` | UDP | the same host over QUIC |
+
+Pin them to open named ports in a firewall, or to keep them out of a range
+another service uses. discv4, discv5 and QUIC all bind UDP, so two of them on
+the same nonzero port is refused before anything starts. A port another
+process already holds:
+
+- `--discv4-port`: the daemon exits, since without its discv4 socket the
+  engine has no EL reader and could not serve a single state read.
+- `--libp2p-port`: the daemon exits. This holds for another Myotis too:
+  libp2p listens with `SO_REUSEPORT`, which would let two of them share the
+  port without an error, so the engine checks with a plain bind first.
+- `--discv5-port` and `--libp2p-quic-port`: the daemon carries on without that
+  socket (discv5 retries about once a minute; QUIC still dials out) and logs a
+  WARN naming the port.
+
+```bash
+myotis-rpcd --network mainnet --listen 127.0.0.1:8549 \
+  --discv4-port 30310 --discv5-port 9010 --libp2p-port 9110 --libp2p-quic-port 9111
+```
 
 ### --log-calls
 

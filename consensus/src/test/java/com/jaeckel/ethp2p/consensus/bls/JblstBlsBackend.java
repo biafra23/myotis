@@ -14,7 +14,7 @@ import java.util.List;
  * replaced jblst with Milagro for Android portability), but with the correct POP DST.
  *
  * <p>jblst ships desktop/JVM natives only; an Android build needs an NDK-compiled blst
- * (see docs/bls-rust-acceleration.md). The {@link BlsBackend} seam is what lets either
+ * (see docs/design-history/bls-rust-acceleration.md). The {@link BlsBackend} seam is what lets either
  * native impl drop in behind the portable Milagro fallback.
  */
 public final class JblstBlsBackend implements BlsBackend {

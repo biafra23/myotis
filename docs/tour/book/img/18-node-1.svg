@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="wide-diagram" viewBox="0 0 960 270" role="img" fill="currentColor" aria-label="A verified read in myotis-node. On the JS thread, submit creates a Promise, pushes a Job and notifies the workers, then returns the Promise at once so the event loop keeps running. On a Myotis worker thread, take_ready waits on the Condvar until a job whose handle is free is available, then submitted runs the closure, which checks the arguments, calls the C ABI and the engine's block_on. finish posts the result through a thread-safe function without blocking, and on the JS thread complete takes the boxed result back and resolves the Promise." width="960" height="270">
+    <style>svg{color:#121a22;--ground:#eef1f4;--ground-2:#e6eaee;--surface:#f8fafb;--ink:#121a22;--ink-2:#47525f;--ink-3:#6b7784;--rule:#d3dae1;--rule-strong:#b7c1cb;--oxide:#b4441a;--oxide-ink:#8f3310;--oxide-wash:#f6e4dc;--jvm:#6a4bd8;--jvm-ink:#4f33b3;--jvm-wash:#ebe6fb;--ok:#1f7a4d;--ok-ink:#1f7a4d;--ok-wash:#dcefe4;--warn:#9a620a;--warn-ink:#7a4d08;--warn-wash:#f5ead3;--bad:#b42335;--bad-ink:#8f1c2a;--bad-wash:#f7dfe2}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.muted{color:#6b7784}</style><rect x="0.0" y="0.0" width="960.0" height="270.0" fill="#f8fafb" /><defs>
+      <marker id="m-node-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+      </marker>
+    </defs>
+    <rect x="110" y="28" width="835" height="84" rx="10" stroke-width="1" style="fill:var(--surface);stroke:var(--rule)" />
+    <rect x="110" y="160" width="835" height="84" rx="10" stroke-width="1" style="fill:var(--surface);stroke:var(--rule)" />
+    <g font-size="12" font-weight="700">
+      <text x="20" y="74">JS thread</text>
+      <text x="20" y="198">Myotis</text>
+      <text x="20" y="214">worker ×2</text>
+    </g>
+    <g font-size="12">
+      <rect x="125" y="45" width="200" height="50" rx="7" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)" />
+      <text x="225" y="66" text-anchor="middle" font-weight="700">submit()</text>
+      <text x="225" y="83" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">Promise · push Job · notify_all</text>
+
+      <rect x="735" y="45" width="195" height="50" rx="7" stroke-width="1.5" style="fill:var(--ground-2);stroke:var(--ink-3)" />
+      <text x="832" y="66" text-anchor="middle" font-weight="700">complete()</text>
+      <text x="832" y="83" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">Box::from_raw · resolve</text>
+
+      <rect x="200" y="177" width="180" height="50" rx="7" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="290" y="198" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">take_ready()</text>
+      <text x="290" y="215" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">Condvar wait: free handle</text>
+
+      <rect x="420" y="177" width="200" height="50" rx="7" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="520" y="198" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">submitted(sub, run)</text>
+      <text x="520" y="215" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">checks → capi → block_on</text>
+
+      <rect x="735" y="177" width="195" height="50" rx="7" stroke-width="1.5" style="fill:var(--oxide-wash);stroke:var(--oxide)" />
+      <text x="832" y="198" text-anchor="middle" font-weight="700" style="fill:var(--oxide-ink)">finish()</text>
+      <text x="832" y="215" text-anchor="middle" font-size="10.5" style="fill:var(--ink-2)">Box::into_raw → TSFN</text>
+    </g>
+    <g stroke-width="1.5" fill="none" style="stroke:currentColor">
+      <line x1="245" y1="95" x2="275" y2="173" marker-end="url(#m-node-arrow)" />
+      <line x1="380" y1="202" x2="416" y2="202" marker-end="url(#m-node-arrow)" />
+      <line x1="620" y1="202" x2="731" y2="202" marker-end="url(#m-node-arrow)" />
+      <line x1="832" y1="177" x2="832" y2="99" marker-end="url(#m-node-arrow)" />
+    </g>
+    <line x1="325" y1="70" x2="731" y2="70" stroke-width="1.3" stroke-dasharray="5 4" marker-end="url(#m-node-arrow)" style="stroke:var(--ok)" />
+    <g font-size="10.5" style="fill:var(--ink-3)">
+      <text x="268" y="140">Job: Box&lt;dyn FnOnce + Send&gt;</text>
+      <text x="530" y="62" text-anchor="middle" style="fill:var(--ok)">Promise returned at once; the event loop keeps running</text>
+      <text x="842" y="142">non-blocking</text>
+    </g>
+  </svg>
