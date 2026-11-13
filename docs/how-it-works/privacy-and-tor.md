@@ -39,7 +39,10 @@
 > or circuit failure) send it back to the peer cache, and this process does
 > not take it again; a reserve over its share — the cache shrank — hands its
 > weakest nodes back, Tor on or off. Among equally good nodes each read draws
-> a fresh order, so reads spread over the reserve. Both directions are also guarded
+> a fresh order, so reads spread over the reserve. Both orders need OS entropy:
+> without it the reserve takes in no node and a read or send gets no
+> candidate, so it fails closed rather than fall back to a fixed, computable
+> order (#823). Both directions are also guarded
 > in-process by node id: a node reached over Tor is left undialed directly
 > until ten minutes past the Tor operation's end, claimed under the same lock
 > as a direct dial; with no ready node the read or send fails closed
