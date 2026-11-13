@@ -1,5 +1,5 @@
 Review this pull request as an independent reviewer with no prior
-context. Read CLAUDE.md first, then the docs/agent/ files its table
+context. Read CLAUDE.md first, then the .claude/agent/ files its table
 names for the areas this diff touches (CLAUDE.md is the summary, they
 are the full rules), and hold the diff against the repo's
 standing rules, especially:
@@ -12,7 +12,7 @@ standing rules, especially:
 - API boundary: hosts talk ONLY to :myotis-api — engine internals
   (node-core/networking/consensus types) must not leak into host
   runtime paths outside the documented exemptions in
-  docs/agent/architecture.md.
+  .claude/agent/architecture.md.
 - Android first: no JVM-only APIs desugaring can't cover, no
   java.net.http, HTTP via Ktor; Java 17 target unless a module
   documents why it needs 21.

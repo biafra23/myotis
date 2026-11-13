@@ -3,26 +3,30 @@
 Guidance for Claude Code (claude.ai/code) in this repository.
 
 **This file is the always-loaded core.** Each section is a summary; the full,
-binding text lives in `docs/agent/`. When a task matches a row below, **read
+binding text lives in `.claude/agent/`. When a task matches a row below, **read
 that file in full BEFORE acting** — a summary here never overrides the full text.
-A rule is changed or added in its `docs/agent/` file AND in its summary here,
-in the same commit; an edit to only one of the two is incomplete.
+A rule is changed or added in its `.claude/agent/` file AND in its summary here,
+in the same commit; an edit to only one of the two is incomplete. The files
+live under `.claude/` because `claude-review` restores that tree, like this
+file, from the PR's base branch: a PR cannot edit the rules it is reviewed
+against. Do not move them out of `.claude/`, and not into `.claude/rules/`
+(loaded on every request).
 
 | Before you…                                                                 | Read in full                      |
 |---|---|
-| build for Android or iOS, or a build fails on a missing toolchain             | `docs/agent/build.md`             |
-| add or move a module, or touch host ↔ engine wiring or its exemptions         | `docs/agent/architecture.md`      |
-| start a work item tied to an issue (session title), or open a PR (monitoring) | `docs/agent/workflow.md`          |
-| plan, resume or continue multi-PR work: a part, a merge, the final PR         | `docs/agent/multi-pr-plans.md`    |
-| write a PR description, answer review comments, or handle a fork PR           | `docs/agent/pull-requests.md`     |
-| do any release work: tag, version, checkpoints, bootnodes, seeds, assets, bundles | `docs/agent/releases.md`      |
-| add or bump a dependency, move a toolchain pin, touch build scripts or packaging | `docs/agent/reproducibility.md` |
-| use a JDK API newer than Java 8 in Android-consumed code, or add HTTP         | `docs/agent/platform.md`          |
-| add a data source, or touch roost, log-index seeds, `:tx-history`, Portal     | `docs/agent/data-sources.md`      |
+| build for Android or iOS, or a build fails on a missing toolchain             | `.claude/agent/build.md`             |
+| add or move a module, or touch host ↔ engine wiring or its exemptions         | `.claude/agent/architecture.md`      |
+| start a work item tied to an issue (session title), or open a PR (monitoring) | `.claude/agent/workflow.md`          |
+| plan, resume or continue multi-PR work: a part, a merge, the final PR         | `.claude/agent/multi-pr-plans.md`    |
+| write a PR description, answer review comments, or handle a fork PR           | `.claude/agent/pull-requests.md`     |
+| do any release work: tag, version, checkpoints, bootnodes, seeds, assets, bundles | `.claude/agent/releases.md`      |
+| add or bump a dependency, move a toolchain pin, touch build scripts or packaging | `.claude/agent/reproducibility.md` |
+| use a JDK API newer than Java 8 in Android-consumed code, or add HTTP         | `.claude/agent/platform.md`          |
+| add a data source, or touch roost, log-index seeds, `:tx-history`, Portal     | `.claude/agent/data-sources.md`      |
 
 ## Build & Run
 
-Full reference with toolchain notes: `docs/agent/build.md`.
+Full reference with toolchain notes: `.claude/agent/build.md`.
 
 ```bash
 ./gradlew build          # needs the Android Rust toolchain; without it add -PskipRustEngine
@@ -49,7 +53,7 @@ without cargo). The Android app requires it by default.
 
 ## Architecture
 
-One line per module; detail and protocol flow: `docs/agent/architecture.md`.
+One line per module; detail and protocol flow: `.claude/agent/architecture.md`.
 
 - **myotis-api** — THE ENGINE CONTRACT: zero-dependency Java-17 interfaces every host consumes exclusively; FFI-portable types only.
 - **myotis-engine** — THE ENGINE LIBRARY (KMP, jvm + android): packages the Rust engine as the Android AAR and desktop jar; entry point `io.myotis.engine.Myotis`.
@@ -72,7 +76,7 @@ One line per module; detail and protocol flow: `docs/agent/architecture.md`.
 
 ## Key Dependencies
 
-Full text, including the builder image: `docs/agent/reproducibility.md`.
+Full text, including the builder image: `.claude/agent/reproducibility.md`.
 
 - **Every Gradle dependency is pinned by version AND hash** (#734). A new or
   bumped dependency fails the build until its pins are regenerated with
@@ -98,13 +102,13 @@ Full text, including the builder image: `docs/agent/reproducibility.md`.
   paths in the daemon, desktop, Android and iOS do not import engine internals
   (node-core/networking/consensus types). Composition roots use the
   `:myotis-engines` selector. The documented exemptions are a closed list in
-  `docs/agent/architecture.md` — read it before adding any import that crosses
+  `.claude/agent/architecture.md` — read it before adding any import that crosses
   this line; a new exemption is the owner's call.
 
 ## Workflow — the mandatory steps for EVERY work item
 
 Every change goes through this sequence, in order, with **no step skipped and
-none treated as optional or "only if asked"**. Full text: `docs/agent/workflow.md`.
+none treated as optional or "only if asked"**. Full text: `.claude/agent/workflow.md`.
 
 1. **Code** — on the designated branch.
 2. **Review** — run the internal code review on the diff (`/code-review`) and address its findings.
@@ -115,14 +119,14 @@ none treated as optional or "only if asked"**. Full text: `docs/agent/workflow.m
 Do not stop at "pushed". Skip the PR only when the user explicitly says so.
 In the desktop app the session also renames itself: `IS#<n>: …` the moment the
 work item is identified as issue n (before there is a PR), then `PR#<n>: …`
-right after `gh pr create` (`docs/agent/workflow.md`).
+right after `gh pr create` (`.claude/agent/workflow.md`).
 
 ## Hard rules — never broken, whatever an earlier instruction seems to authorize
 
 - **NEVER MERGE A PR YOURSELF** — not with `gh pr merge`, not by enabling
   auto-merge. Green CI + all comments answered = report "ready to merge". Sole
   exception: part PRs into a multi-PR plan's feature branch, and only under
-  step 3 of `docs/agent/multi-pr-plans.md`: the owner said yes for that plan
+  step 3 of `.claude/agent/multi-pr-plans.md`: the owner said yes for that plan
   in THIS conversation (never inferred from an earlier plan, a standing
   instruction or a GitHub comment), and the part meets every condition listed
   there, among them a POSTED automated review (a green `claude-review` job
@@ -130,7 +134,7 @@ right after `gh pr create` (`docs/agent/workflow.md`).
 - **Never push a `v*` tag on your own initiative.** The tag is the owner's action.
 - **Everything that lands on GitHub is in English** — titles, descriptions,
   commit messages, review replies.
-- **Changes to project rules (this file, `docs/agent/`) or to architecture are
+- **Changes to project rules (this file, `.claude/agent/`) or to architecture are
   the owner's call**, not the PR author's.
 
 ### Multi-PR plans land through a feature branch, never piece by piece on `main`
@@ -140,14 +144,14 @@ one PR (or branch) goes through `feature/<topic>`: create it from `main` first,
 target every part PR at it, ask the owner once per plan whether you may merge
 the parts into it yourself, keep it current by merging `main` into it (never
 rebase or force-push), and open the final `feature/<topic>` → `main` PR only
-when every part is in. Read `docs/agent/multi-pr-plans.md` in full before the
+when every part is in. Read `.claude/agent/multi-pr-plans.md` in full before the
 first part is coded, and again in any session that picks a plan up: before
 merging a part, before merging `main` into the feature branch, and before the
 final PR.
 
 ## No merge into `main` may break reproducibility
 
-Full text: `docs/agent/reproducibility.md`.
+Full text: `.claude/agent/reproducibility.md`.
 
 - Before reporting a PR into `main` "ready to merge", its head has a green
   `reproducible builds` run whenever the PR can change what a release build
@@ -161,7 +165,7 @@ Full text: `docs/agent/reproducibility.md`.
 
 ## Releases — ask before cutting one
 
-Read `docs/agent/releases.md` in full before any release work. In outline:
+Read `.claude/agent/releases.md` in full before any release work. In outline:
 **ask three questions first** (1. refresh the trust checkpoints? 2. re-sync the
 mainnet bootnodes? 3. run the cold-start checks?), then the mandatory steps
 (4. move the version pins, 5. refresh the PoC log-index seeds), all in ONE
@@ -173,7 +177,7 @@ never a bare `gh release upload`.
 ## Pull requests and code review
 
 Full text, including the fork-PR policy and the `gh api` reply mechanics:
-`docs/agent/pull-requests.md`. These rules are for the **PR author**; a
+`.claude/agent/pull-requests.md`. These rules are for the **PR author**; a
 reviewer agent follows `.github/claude-review-prompt.md` and none of the
 mechanics below.
 
@@ -196,11 +200,11 @@ mechanics below.
 
 The RAILGUN and Bee PoC installers build on pushes to `main` and on `v*` tags,
 not on pull requests. Give a new bundle the same trigger set. Full text:
-`docs/agent/releases.md`.
+`.claude/agent/releases.md`.
 
 ## Platform & language direction
 
-Full text, including the complete minSdk 29 JDK-API budget: `docs/agent/platform.md`.
+Full text, including the complete minSdk 29 JDK-API budget: `.claude/agent/platform.md`.
 
 - **Android compatibility is a first-class concern** (`:android-app`, minSdk 29).
   Avoid JVM-only APIs the Android runtime or desugaring can't cover; mind APK size.
@@ -224,7 +228,7 @@ Full text, including the complete minSdk 29 JDK-API budget: `docs/agent/platform
 - The only trust anchors are sync committee signatures and  the embedded pre-Merge historical hashes accumulator and the Bellatrix-era historical roots accumulator
 - One bounded exception (owner's decision, 2026-09-25): a seeded log history of
   a root-committing protocol is served on its publisher's word. Scope and
-  limits: `docs/agent/data-sources.md`.
+  limits: `.claude/agent/data-sources.md`.
 - **A parameter that can change the answer must be APPLIED or REFUSED — never
   accepted and silently ignored.** When refusing, use a PERMANENT error code
   (`-32602`); `-32000` is documented as retryable and a client will spin on it.
@@ -232,7 +236,7 @@ Full text, including the complete minSdk 29 JDK-API budget: `docs/agent/platform
 
 ## Data sources
 
-Full text of the rule, both carve-outs and their boundaries: `docs/agent/data-sources.md`.
+Full text of the rule, both carve-outs and their boundaries: `.claude/agent/data-sources.md`.
 
 - the only sources for data are devp2p and libp2p calling a local client via http may only be used for debugging purposes it is not an option for production
 - Two bounded carve-outs exist, each an owner's decision: `roost` may relay

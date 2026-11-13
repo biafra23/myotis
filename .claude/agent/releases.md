@@ -1,7 +1,7 @@
 # Releases and demo bundles
 
 > Moved verbatim from `CLAUDE.md` (the always-loaded core keeps a summary and points here).
-> Read in full before any release work: a `v*` tag, a version bump, checkpoints, bootnodes, PoC seeds, release assets, or a bundle workflow. "The section above" (the reproducibility gate) is `reproducibility.md`. "This file" means `CLAUDE.md` together with the `docs/agent/` files.
+> Read in full before any release work: a `v*` tag, a version bump, checkpoints, bootnodes, PoC seeds, release assets, or a bundle workflow. "The section above" (the reproducibility gate) is `reproducibility.md`. "This file" means `CLAUDE.md` together with the `.claude/agent/` files.
 
 ## Releases — ask before cutting one
 
