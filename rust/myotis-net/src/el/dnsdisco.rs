@@ -540,7 +540,7 @@ fn judge(node: DnsNode, filter: &ForkFilter, now_secs: u64, report: &mut WalkRep
 fn shuffle<T>(items: &mut [T]) {
     let mut rnd = [0u8; 8];
     for i in (1..items.len()).rev() {
-        let _ = getrandom::getrandom(&mut rnd);
+        let _ = getrandom::fill(&mut rnd);
         let j = (u64::from_le_bytes(rnd) % (i as u64 + 1)) as usize;
         items.swap(i, j);
     }

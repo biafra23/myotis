@@ -155,7 +155,7 @@ fn ephemeral_key() -> Result<Arc<NodeKey>> {
     // probability; retry the vanishingly rare zero/overflow case.
     for _ in 0..8 {
         let mut secret = [0u8; 32];
-        getrandom::getrandom(&mut secret).map_err(|e| anyhow!("OS entropy: {e}"))?;
+        getrandom::fill(&mut secret).map_err(|e| anyhow!("OS entropy: {e}"))?;
         if let Ok(k) = NodeKey::from_secret_bytes(&secret) {
             return Ok(Arc::new(k));
         }

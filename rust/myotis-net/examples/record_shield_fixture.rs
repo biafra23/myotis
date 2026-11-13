@@ -283,7 +283,7 @@ fn fresh_key() -> Result<NodeKey, String> {
 
 fn random_bytes() -> Result<[u8; 32], String> {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).map_err(|e| format!("OS entropy: {e}"))?;
+    getrandom::fill(&mut bytes).map_err(|e| format!("OS entropy: {e}"))?;
     Ok(bytes)
 }
 

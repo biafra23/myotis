@@ -23,7 +23,7 @@ use myotis_wire::rlpx::hello::{Hello, P2P_PING, P2P_PONG};
 pub fn fresh_node_key() -> Arc<NodeKey> {
     Arc::new(loop {
         let mut secret = [0u8; 32];
-        getrandom::getrandom(&mut secret).expect("OS entropy");
+        getrandom::fill(&mut secret).expect("OS entropy");
         if let Ok(k) = NodeKey::from_secret_bytes(&secret) {
             break k;
         }

@@ -1899,7 +1899,7 @@ B 24, C 38.
   daemon; `pub` and `pub(crate)` used interchangeably in a `[[bin]]`-only crate;
   only SIGINT handled; no advisory lock on the archive file; tor-poc's
   `map_or(true, ..)` (`:349`), a dead `let _ = advertised;` (`:256`),
-  `getrandom = "0.2"` two majors behind.
+  `getrandom = "0.2"` two majors behind (since moved to 0.4, with myotis-net).
 - **Positives**: `Fail` → `fail_parts` as the single mapping point; the
   `Budget`/`Gate` one-hold-per-body design pinned by timing tests
   (`rpc/tests.rs:1157–1175`); `floor_char_boundary` for safe truncation

@@ -11788,7 +11788,7 @@ impl ElCarry {
 pub fn generate_node_key() -> Result<Arc<NodeKey>, String> {
     for _ in 0..8 {
         let mut secret = [0u8; 32];
-        getrandom::getrandom(&mut secret).map_err(|e| format!("OS entropy: {e}"))?;
+        getrandom::fill(&mut secret).map_err(|e| format!("OS entropy: {e}"))?;
         if let Ok(key) = NodeKey::from_secret_bytes(&secret) {
             return Ok(Arc::new(key));
         }
