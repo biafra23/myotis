@@ -139,12 +139,14 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> RlpxConnection<S> {
         peer_pubkey: [u8; 64],
         traffic: Option<Arc<TrafficMeter>>,
     ) -> Result<RlpxConnection<S>, String> {
-        // Fresh entropy for this handshake.
-        let eph_secret = random32();
-        let local_nonce = random32();
-        let ecies_eph = random32();
-        let ecies_iv = random16();
-        let padding = random_padding();
+        // Fresh entropy for this handshake. No entropy, no handshake: the dial
+        // fails like any other (the caller tries another peer); it never panics,
+        // which under the release profile's `panic = "abort"` would kill the host.
+        let eph_secret = random_bytes::<32>()?;
+        let local_nonce = random_bytes::<32>()?;
+        let ecies_eph = random_bytes::<32>()?;
+        let ecies_iv = random_bytes::<16>()?;
+        let padding = random_padding()?;
 
         let mut initiator = Initiator::new(&local_key, peer_pubkey, &eph_secret, local_nonce)
             .map_err(|e| format!("rlpx init: {}", e.0))?;
@@ -359,32 +361,42 @@ async fn read_ack<S: AsyncReadExt + Unpin>(stream: &mut S) -> Result<Vec<u8>, St
     Ok(wire)
 }
 
-fn random32() -> [u8; 32] {
-    let mut b = [0u8; 32];
-    getrandom::fill(&mut b).expect("OS entropy");
-    b
-}
-
-fn random16() -> [u8; 16] {
-    let mut b = [0u8; 16];
-    getrandom::fill(&mut b).expect("OS entropy");
-    b
+/// `N` bytes of OS entropy, or the reason there are none (early boot, a
+/// seccomp sandbox that blocks the syscall). An error, never a panic: the
+/// handshake's secret keys, nonce and IV come from here (#823).
+fn random_bytes<const N: usize>() -> Result<[u8; N], String> {
+    let mut b = [0u8; N];
+    getrandom::fill(&mut b).map_err(|e| format!("rlpx: OS entropy unavailable: {e}"))?;
+    Ok(b)
 }
 
 /// EIP-8 padding: 100-300 random bytes (a trailing auth-body list element).
-fn random_padding() -> Vec<u8> {
-    let mut len_byte = [0u8; 1];
-    getrandom::fill(&mut len_byte).expect("OS entropy");
-    let len = 100 + usize::from(len_byte[0]) % 201; // 100..=300, matching the reference
+fn random_padding() -> Result<Vec<u8>, String> {
+    let [len_byte] = random_bytes::<1>()?;
+    let len = 100 + usize::from(len_byte) % 201; // 100..=300, matching the reference
     let mut pad = vec![0u8; len];
-    getrandom::fill(&mut pad).expect("OS entropy");
-    pad
+    getrandom::fill(&mut pad).map_err(|e| format!("rlpx: OS entropy unavailable: {e}"))?;
+    Ok(pad)
 }
 
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handshake_entropy_is_fallible_and_well_shaped() {
+        // The failure path cannot be forced without a custom getrandom backend;
+        // the type is what guarantees it: these return Result, so a missing
+        // source becomes a failed dial, not a panic (#823).
+        let a = random_bytes::<32>().expect("entropy on the test host");
+        let b = random_bytes::<32>().expect("entropy on the test host");
+        assert_ne!(a, b, "two 32-byte draws collided");
+        for _ in 0..64 {
+            let pad = random_padding().expect("entropy on the test host");
+            assert!((100..=300).contains(&pad.len()), "EIP-8 padding length {}", pad.len());
+        }
+    }
 
     #[test]
     fn hello_round_trip() {
