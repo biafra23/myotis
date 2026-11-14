@@ -80,17 +80,23 @@ public final class SelectorEngine implements MyotisEngine {
                 // is the shared port (it lives in :myotis-engine-common precisely
                 // so the Go engine needs no dependency on the Rust module).
                 if (go == null) {
-                    go = new GoMyotisEngine(KtorLoopbackRpc::new);
+                    GoMyotisEngine fresh = new GoMyotisEngine(KtorLoopbackRpc::new);
                     // Built LATE (a metering push never builds it — see
                     // setNetworkMetering): seed the device's current metering
                     // before this engine's first network counts a byte, or the
                     // first Go-hosted network would run under the default.
+                    // Seed BEFORE publishing the field (PR #832 round-5,
+                    // "minor, no thread"): setNetworkMetering is not under
+                    // this monitor, so publishing first let a concurrent push
+                    // slip between the field write and the seeding read and
+                    // get overwritten with the older java value.
                     try {
-                        go.setNetworkMetering(java.networkMetering());
+                        fresh.setNetworkMetering(java.networkMetering());
                     } catch (RuntimeException | LinkageError e) {
                         log.warn("[engines] could not seed the Go engine's metering "
                                 + "({}); it keeps the library default", e.toString());
                     }
+                    go = fresh;
                 }
                 g = go;
             }
