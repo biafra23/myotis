@@ -27,6 +27,7 @@ import java.util.function.Supplier;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -674,13 +675,14 @@ class SnapBackedStateOracleTest {
         var oracle1 = new SnapBackedStateOracle(() -> peer, BytecodeCache.inMemory(),
                 SnapBackedStateOracle.DEFAULT_MAX_ATTEMPTS, shared);
         assertEquals(value, oracle1.fetchStorage(accountTrie.root.toArrayUnsafe(), addr, slot).get());
-        // The oracle promotes a verified account to the shared cache in a
-        // whenCompleteAsync callback, AFTER the read's future completes, so `get()`
-        // above can return before the account is there. A loaded runner then loses
-        // the race: oracle 2 misses the account, asks its dead peer, and fails with
-        // its IOException (main at 02bf4b2d). The test below sidesteps the same race
-        // with putAccount; this one waits, because the promotion is what it tests.
-        awaitCachedAccount(shared, accountTrie.root.toArrayUnsafe(), addr.toByteArray());
+        // The verified account is banked BEFORE the read's future completes, so it is
+        // in the shared cache the moment get() returns: no wait, no race. (It used to
+        // be promoted in a whenCompleteAsync callback after completion, which a
+        // loaded runner lost on main at 02bf4b2d; #842 worked around that here.)
+        var banked = shared.getAccount(accountTrie.root.toArrayUnsafe(), addr.toByteArray());
+        assertTrue(banked.isPresent(), "the verified account is in the shared cache once the read completes");
+        assertArrayEquals(storageTrie.root.toArrayUnsafe(), banked.get().storageRoot(),
+                "banked under the account's proven storage root");
 
         SnapPeer deadPeer = new SnapPeer() {
             @Override public CompletableFuture<List<Bytes>> getTrieNodes(Bytes32 r, List<PathSet> p) {
@@ -696,14 +698,73 @@ class SnapBackedStateOracleTest {
                 "second oracle must serve the slot from the shared cache, no peer round-trip");
     }
 
-    /** Waits (bounded) until the asynchronous promotion has put the account in {@code cache}. */
-    private static void awaitCachedAccount(StateProofCache cache, byte[] stateRoot, byte[] address)
-            throws InterruptedException {
-        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
-        while (cache.getAccount(stateRoot, address).isEmpty()) {
-            assertTrue(System.nanoTime() < deadline, "the account never reached the shared cache");
-            Thread.sleep(5);
-        }
+    @Test
+    void accountIsBankedInTheVerifyingStageBeforeTheReadCompletes() throws Exception {
+        // Deterministic guard for the ordering the test above relies on. FixturePeer
+        // answers inline, so the verifying stage runs on this test thread; a promotion
+        // deferred past completion (as the old whenCompleteAsync one was) runs on
+        // another thread, or after get() has returned. Recording the thread putAccount
+        // runs on checks the ordering itself, independent of the common pool's size
+        // (with parallelism 1, CompletableFuture swaps commonPool() for a thread per
+        // task, so holding the pool's workers would hold nothing back).
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        Bytes accountValue = encodeAccount(3L, BigInteger.valueOf(42), TrieFixture.EMPTY_TRIE_ROOT,
+                Bytes32.wrap(Hash.keccak256(Bytes.EMPTY).toArrayUnsafe()));
+        var accountTrie = TrieFixture.singleLeaf(keccak(addr.toByteArray()), accountValue);
+        FixturePeer peer = new FixturePeer();
+        peer.addAccountProof(accountTrie.root, accountTrie.proof);
+
+        StateProofCache inner = StateProofCache.inMemory(1024);
+        var bankedOn = new java.util.concurrent.atomic.AtomicReference<Thread>();
+        StateProofCache shared = new StateProofCache() {
+            @Override public java.util.Optional<BigInteger> getStorage(byte[] r, BigInteger s) { return inner.getStorage(r, s); }
+            @Override public void putStorage(byte[] r, BigInteger s, BigInteger v) { inner.putStorage(r, s, v); }
+            @Override public java.util.Optional<AccountEntry> getAccount(byte[] r, byte[] a) { return inner.getAccount(r, a); }
+            @Override public void putAccount(byte[] r, byte[] a, AccountEntry e) {
+                bankedOn.set(Thread.currentThread());
+                inner.putAccount(r, a, e);
+            }
+        };
+        var oracle = new SnapBackedStateOracle(() -> peer, BytecodeCache.inMemory(),
+                SnapBackedStateOracle.DEFAULT_MAX_ATTEMPTS, shared);
+
+        assertEquals(BigInteger.valueOf(42),
+                oracle.fetchAccount(accountTrie.root.toArrayUnsafe(), addr)
+                        .get(10, java.util.concurrent.TimeUnit.SECONDS).balance());
+        assertSame(Thread.currentThread(), bankedOn.get(),
+                "banked in the verifying stage, on the thread that completed the read");
+        var banked = shared.getAccount(accountTrie.root.toArrayUnsafe(), addr.toByteArray());
+        assertTrue(banked.isPresent(), "banked before the read completed");
+        assertEquals(BigInteger.valueOf(42), banked.get().account().balance());
+    }
+
+    @Test
+    void aCacheThatCannotStoreDoesNotFailAProvenRead() throws Exception {
+        // bankAccount / bankStorage contain a cache failure: the record is already
+        // proven, so the read that proved it returns it instead of failing (or
+        // rotating to another peer) because the cache threw.
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        BigInteger slot = BigInteger.valueOf(7);
+        BigInteger value = new BigInteger("1234567890123456789");
+        Bytes32 slotHash = Bytes32.wrap(Hash.keccak256(paddedSlot(slot)).toArrayUnsafe());
+        var storageTrie = TrieFixture.singleLeaf(slotHash, RLP.encode(w -> w.writeBigInteger(value)));
+        Bytes accountValue = encodeAccount(0L, BigInteger.ZERO, storageTrie.root,
+                Bytes32.wrap(Hash.keccak256(Bytes.EMPTY).toArrayUnsafe()));
+        var accountTrie = TrieFixture.singleLeaf(keccak(addr.toByteArray()), accountValue);
+        FixturePeer peer = new FixturePeer();
+        peer.addAccountProof(accountTrie.root, accountTrie.proof);
+        peer.addStorageProof(accountTrie.root, storageTrie.proof);
+
+        StateProofCache throwing = new StateProofCache() {
+            @Override public java.util.Optional<BigInteger> getStorage(byte[] r, BigInteger s) { return java.util.Optional.empty(); }
+            @Override public void putStorage(byte[] r, BigInteger s, BigInteger v) { throw new IllegalStateException("cache full"); }
+            @Override public java.util.Optional<AccountEntry> getAccount(byte[] r, byte[] a) { return java.util.Optional.empty(); }
+            @Override public void putAccount(byte[] r, byte[] a, AccountEntry e) { throw new IllegalStateException("cache full"); }
+        };
+        var oracle = new SnapBackedStateOracle(() -> peer, BytecodeCache.inMemory(),
+                SnapBackedStateOracle.DEFAULT_MAX_ATTEMPTS, throwing);
+        assertEquals(value, oracle.fetchStorage(accountTrie.root.toArrayUnsafe(), addr, slot).get(),
+                "a proven slot is returned although the cache throws on every write");
     }
 
     @Test
@@ -819,8 +880,6 @@ class SnapBackedStateOracleTest {
         // slot before its future completes, so this is race-free.
         assertEquals(value, oracle.fetchStorage(worldA.root.toArrayUnsafe(), addr, slot).get());
         // Bank the account at root B directly (what the head-build priming does).
-        // Going through fetchAccount here would be racy: its promotion to the shared
-        // cache runs async after the future completes.
         shared.putAccount(worldB.root.toArrayUnsafe(), addr.toByteArray(),
                 new StateProofCache.AccountEntry(
                         new AccountState(addr, 2L, BigInteger.TEN,
