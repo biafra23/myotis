@@ -52,7 +52,7 @@ internal sealed interface BodyRead {
  * within the cap is decoded straight from the read buffer, in [charset].
  */
 internal suspend fun readRequestBody(
-    open: () -> ByteReadChannel,
+    open: suspend () -> ByteReadChannel,
     declaredLength: Long?,
     maxBytes: Long = RpcRequestBody.MAX_BYTES,
     timeoutMs: Long = RpcRequestBody.TIMEOUT_MS,
