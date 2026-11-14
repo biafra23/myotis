@@ -265,7 +265,8 @@ line rather than downloading one mid-build; CI installs it via
 deletes a previously built library, since consumers gate on existence alone —
 but only one this task wrote (the stamp above), never a hand-built one
 (PR #832 rounds 4-5). And a FAILED build is never recorded up-to-date while
-the library is absent: the task retries on every later build, so installing a
+the task does not own the library on disk (absent, or there without a
+matching stamp): the task retries on every later build, so installing a
 C compiler or coming back online is all it takes.
 
 ## Test

@@ -1110,8 +1110,8 @@ fun goLibIsOurs(): Boolean {
 tasks.register<Exec>("goBuildCShared") {
     group = "go"
     description = "go build -buildmode=c-shared for the Go engine (self-skips when go is" +
-        " missing or older than go/go.mod's line, deleting any previously built library" +
-        " it can no longer keep current; a FAILED cgo build degrades to a warning," +
+        " missing or older than go/go.mod's line, deleting a library IT built that it can" +
+        " no longer keep current; a FAILED cgo build degrades to a warning," +
         " keeping the JVM build untouched; builds the portable blst, never a newer toolchain)"
     onlyIf {
         // A SKIP is a stale-library risk, so it gets the same treatment as a
