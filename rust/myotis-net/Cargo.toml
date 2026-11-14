@@ -25,7 +25,7 @@ myotis-evm = { path = "../myotis-evm" }
 # depends on wire-level behavior of these exact versions (noise/yamux framing,
 # discv5 packet format). Cargo.lock would pin them anyway; the `=` makes the
 # intent explicit and survives lockfile regeneration.
-tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net", "io-util"] }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net", "io-util"] }
 # `quic`: the consensus p2p spec's PRIMARY transport (QUIC MUST be supported;
 # TCP is the fallback, consensus-specs#5330). QUIC carries its own TLS 1.3
 # handshake and stream multiplexing, so neither noise nor a muxer is negotiated
@@ -149,7 +149,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # test-util only: `#[tokio::test(start_paused = true)]` drives the interactive
 # read HEDGING on the paused clock, so the timing invariants are asserted
 # exactly and instantly instead of by sleeping in real time.
-tokio = { version = "=1.52.3", features = ["test-util", "macros", "rt-multi-thread", "time"] }
+tokio = { version = "=1.54.1", features = ["test-util", "macros", "rt-multi-thread", "time"] }
 
 [[example]]
 name = "live_sync"
