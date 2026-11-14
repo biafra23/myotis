@@ -38,7 +38,7 @@ class RpcRequestBodyTest {
                 channel.writeFully(ByteArray(size) { 'a'.code.toByte() })
                 channel.flushAndClose()
             }
-            assertEquals(size, body(readRequestBody(channel, size.toLong(), max, 5_000)).length)
+            assertEquals(size, body(readRequestBody({ channel }, size.toLong(), max, 5_000)).length)
         }
     }
 
@@ -47,8 +47,10 @@ class RpcRequestBodyTest {
         val channel = ByteChannel()
         channel.writeFully(ByteArray(16))
         channel.flushAndClose()
-        val read = readRequestBody(channel, RpcRequestBody.MAX_BYTES + 1)
+        var opened = false
+        val read = readRequestBody({ opened = true; channel }, RpcRequestBody.MAX_BYTES + 1)
         assertEquals(BodyRead.TooLarge(0), read)
+        assertTrue(!opened, "the body was never received (no 100 Continue)")
         assertEquals(16, channel.readRemaining().readByteArray().size, "nothing was read")
     }
 
@@ -63,7 +65,7 @@ class RpcRequestBodyTest {
                 channel.flush()
             }
         }
-        val read = readRequestBody(channel, null, max, 5_000)
+        val read = readRequestBody({ channel }, null, max, 5_000)
         writer.cancel()
         assertEquals(BodyRead.TooLarge(max + 1), read, "read exactly cap + 1 bytes, then stopped")
     }
@@ -79,7 +81,7 @@ class RpcRequestBodyTest {
             }
         }
         val started = System.nanoTime()
-        val read = readRequestBody(channel, null, 1024, 300)
+        val read = readRequestBody({ channel }, null, 1024, 300)
         writer.cancel()
         assertEquals(BodyRead.TimedOut, read)
         assertTrue((System.nanoTime() - started) / 1_000_000 < 3_000, "cut off near the timeout")
@@ -108,7 +110,9 @@ class RpcRequestBodyTest {
         val running = server ?: throw AssertionError("listener did not come up")
         try {
             // Announce one byte past the cap and send no body at all: a server that read
-            // before checking would wait for the body; this one answers at once.
+            // before checking would wait for the body; this one answers at once. The
+            // socket stays open afterwards (Ktor drains the announced body), so the
+            // answer is read by its Content-Length, not to EOF.
             val (status, _) = exchange(port,
                 "POST / HTTP/1.1\r\nContent-Type: application/json\r\n" +
                     "Content-Length: ${RpcRequestBody.MAX_BYTES + 1}\r\n", null)
@@ -124,7 +128,9 @@ class RpcRequestBodyTest {
         }
     }
 
-    /** One request over a raw socket; `head` ends with its last header line. */
+    /** One request over a raw socket; `head` ends with its last header line. The answer
+     *  is read by its `Content-Length` (or to EOF without one), never waiting for the
+     *  server to close the socket. */
     private fun exchange(port: Int, head: String, body: String?): Pair<Int, String> =
         Socket("127.0.0.1", port).use { s ->
             s.soTimeout = 10_000
@@ -133,9 +139,32 @@ class RpcRequestBodyTest {
                 if (body != null) write(body.toByteArray())
                 flush()
             }
-            val raw = s.getInputStream().readBytes().toString(Charsets.ISO_8859_1)
-            val split = raw.indexOf("\r\n\r\n")
-            require(split > 0) { "no header block in: $raw" }
-            raw.substring(0, split).lines()[0].split(" ")[1].toInt() to raw.substring(split + 4)
+            val input = s.getInputStream()
+            val raw = java.io.ByteArrayOutputStream()
+            var split = -1
+            while (split < 0) {
+                val b = input.read()
+                require(b >= 0) { "EOF before the header block ended: ${raw.toString(Charsets.ISO_8859_1)}" }
+                raw.write(b)
+                split = raw.toString(Charsets.ISO_8859_1).indexOf("\r\n\r\n")
+            }
+            val headers = raw.toString(Charsets.ISO_8859_1).substring(0, split).lines()
+            val status = headers[0].split(" ")[1].toInt()
+            val length = headers.drop(1)
+                .firstOrNull { it.substringBefore(":").trim().equals("Content-Length", ignoreCase = true) }
+                ?.substringAfter(":")?.trim()?.toInt()
+            val reply = if (length != null) {
+                val bytes = ByteArray(length)
+                var off = 0
+                while (off < length) {
+                    val n = input.read(bytes, off, length - off)
+                    require(n >= 0) { "EOF inside the body" }
+                    off += n
+                }
+                bytes
+            } else {
+                input.readBytes()
+            }
+            status to reply.toString(Charsets.UTF_8)
         }
 }

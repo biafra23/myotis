@@ -17,8 +17,13 @@ object RpcRequestBody {
      *  request: a maximal `eth_sendRawTransaction`, or a big batch of `eth_call`s. */
     const val MAX_BYTES: Long = 5L * 1024 * 1024
 
-    /** Total time to receive one body. A client that drips its upload slower than
-     *  that is cut off instead of holding the connection open indefinitely. */
+    /** Total time the handler waits for one body. A client that drips its upload
+     *  slower than that is answered 408 and no longer holds a handler or its
+     *  buffer. The connection itself is Ktor's: after any answer, its engine
+     *  pipeline drains and drops what the client still sends (no size or time
+     *  limit, but no memory either), and CIO honours only the request's own
+     *  `Connection: close`, so the socket stays open while the client keeps
+     *  sending. The response says `Connection: close` for clients that listen. */
     const val TIMEOUT_MS: Long = 10_000L
 }
 
@@ -38,14 +43,16 @@ internal sealed interface BodyRead {
 
 /**
  * Read a request body under [maxBytes] and [timeoutMs]. A [declaredLength] over the
- * cap is refused before a byte is read. Any other body, chunked or unannounced
+ * cap is refused before [open] is called, so the body is never received: in
+ * particular CIO never answers an `Expect: 100-continue` with `100 Continue`, which
+ * it does when the body is first received. Any other body, chunked or unannounced
  * included, is read at most `maxBytes + 1` bytes far: one byte past the cap is
  * enough to know it is too large, so memory stays bounded whatever the client sends,
  * and nothing is buffered whole before the check runs (`receiveText` would). A body
  * within the cap is decoded straight from the read buffer, in [charset].
  */
 internal suspend fun readRequestBody(
-    channel: ByteReadChannel,
+    open: () -> ByteReadChannel,
     declaredLength: Long?,
     maxBytes: Long = RpcRequestBody.MAX_BYTES,
     timeoutMs: Long = RpcRequestBody.TIMEOUT_MS,
@@ -53,7 +60,7 @@ internal suspend fun readRequestBody(
 ): BodyRead {
     if (declaredLength != null && declaredLength > maxBytes) return BodyRead.TooLarge(0)
     return withTimeoutOrNull(timeoutMs) {
-        val source = channel.readRemaining(maxBytes + 1)
+        val source = open().readRemaining(maxBytes + 1)
         if (source.request(maxBytes + 1)) BodyRead.TooLarge(maxBytes + 1)
         else BodyRead.Body(source.readText(charset))
     } ?: BodyRead.TimedOut

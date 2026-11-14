@@ -222,12 +222,14 @@ class MyotisRpcServer(
                 get("/health") { call.respondText("ok") }
                 post("/") {
                     // Bounded read (#667): a body past RpcRequestBody.MAX_BYTES is refused
-                    // with 413 (unread when Content-Length announces it), and one that does
-                    // not arrive within RpcRequestBody.TIMEOUT_MS with 408. receiveText()
-                    // buffered any body whole, so one multi-GB request could OOM the app.
+                    // with 413 (never received when Content-Length announces it), and one
+                    // that does not arrive within RpcRequestBody.TIMEOUT_MS with 408.
+                    // receiveText() buffered any body whole, so one multi-GB request could
+                    // OOM the app. After either refusal Ktor's engine still drains and drops
+                    // the rest of the upload; memory stays bounded (see RpcRequestBody).
                     val req = call.request
                     val read = readRequestBody(
-                        call.receiveChannel(),
+                        { call.receiveChannel() },
                         req.headers[HttpHeaders.ContentLength]?.toLongOrNull(),
                         charset = req.contentCharset() ?: Charsets.UTF_8,
                     )
