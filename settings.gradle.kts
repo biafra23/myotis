@@ -49,11 +49,10 @@ dependencyResolutionManagement {
                 includeGroup("com.github.multiformats")
             }
         }
-        // Still needed for two tech.pegasys artifacts Maven Central does not
+        // Still needed for one tech.pegasys artifact Maven Central does not
         // serve: noise-java 22.1.0 (jvm-libp2p transitive; no other declared
-        // repo has it — it alone keeps this repo alive) and jblst 0.3.15
-        // (:consensus BLS benchmark; Central carries only 0.3.17+, so a bump
-        // may move jblst to Central — noise-java still pins the repo).
+        // repo has it). jblst moved to Central with 0.3.18 (#864), which
+        // mavenCentral() above resolves first.
         // io.consensys.protocols:discovery moved to Maven Central and is gone
         // from here.
         maven {
