@@ -125,11 +125,11 @@ hickory-resolver = { version = "=0.26.3", default-features = false, features = [
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 arti-client = { version = "0.44", default-features = false, features = ["tokio", "native-tls"], optional = true }
-tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio", "native-tls"], optional = true }
+tor-rtcompat = { version = "0.47", default-features = false, features = ["tokio", "native-tls"], optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 arti-client = { version = "0.44", default-features = false, features = ["tokio", "rustls", "static-sqlite"], optional = true }
-tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio", "rustls"], optional = true }
+tor-rtcompat = { version = "0.47", default-features = false, features = ["tokio", "rustls"], optional = true }
 [features]
 tor = ["dep:arti-client", "dep:tor-rtcompat"]
 # The EVM fixture recorder's seam (`ElReader::head_evm_oracle`) and
