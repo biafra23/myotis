@@ -1188,23 +1188,41 @@ tasks.register<Exec>("goBuildCShared") {
     doLast {
         val exit = executionResult.get().exitValue
         if (exit != 0) {
-            logger.warn("[go] goBuildCShared failed (exit {}) — the Go engine will report itself"
-                    + " unavailable and the JVM build continues. A -buildmode=c-shared build needs"
-                    + " a C compiler (cgo) and, on first run, module downloads. The task will"
-                    + " RETRY on the next build (it is never recorded up-to-date while the"
-                    + " library is absent), so installing a C compiler or coming back online is"
-                    + " all it takes.", exit)
-            // A failed `go build` can leave the PREVIOUS library untouched (go
-            // writes the output only at the end) — which, combined with the
-            // up-to-date check below, would silently keep a stale lib serving
-            // the host after a source change. Delete what a failed build did
-            // not rewrite, so the next run (or the loader's ABI handshake) sees
-            // the truth, not last week's bytes (PR #832 review). The stamp goes
-            // too: after a failure this task owns no library any more.
-            delete(file("go/build/$goEngineLibName"), file("go/build/myotis_engine_go.lib"),
-                file(goBuildStampPath))
+            // Same ownership rule as the skip path (PR #832 round-5 review):
+            // delete what a failed build did not rewrite ONLY when that
+            // library is this task's own (the stamp). A failed Gradle build on
+            // a cgo-broken box must not destroy the manual-recipe library —
+            // that host runs the Go engine on it and owns its freshness; the
+            // task's own retry discipline is to stop owning a stale library,
+            // not to unwrite someone else's file.
+            val lib = file("go/build/$goEngineLibName")
+            val ours = file(goBuildStampPath).exists()
+            logger.warn("[go] goBuildCShared failed (exit {}) — the JVM build continues."
+                    + " A -buildmode=c-shared build needs a C compiler (cgo) and, on first run,"
+                    + " module downloads." + when {
+                        ours -> " The library this task last built is stale against these sources" +
+                            " and is deleted; the task RETRIES on the next build (it is never" +
+                            " recorded up-to-date while the library is absent), so installing a" +
+                            " C compiler or coming back online is all it takes."
+                        lib.exists() -> " go/build/$goEngineLibName was not built by this task and" +
+                            " stays in place — the Go engine keeps running on it, and keeping it" +
+                            " fresh against these sources is the manual build's own duty."
+                        else -> " The task RETRIES on the next build (it is never recorded" +
+                            " up-to-date while the library is absent), so installing a C compiler" +
+                            " or coming back online is all it takes."
+                    }, exit)
+            if (ours) {
+                // After a failure this task owns no library any more: the
+                // stale library (which `go build` left untouched — it writes
+                // the output only at the end) and the stamp go together, so
+                // the next run retries and the loader never sees last week's
+                // bytes (PR #832 review, round 2).
+                delete(lib, file("go/build/myotis_engine_go.lib"), file(goBuildStampPath))
+            }
         } else {
-            // Mark the library as this task's own (see goBuildStampPath).
+            // Mark the library as this task's own (see goBuildStampPath). A
+            // successful Gradle build has just replaced anything that was
+            // there, so the stamp is honest even over a hand-built file.
             file(goBuildStampPath).writeText("built by goBuildCShared\n")
         }
     }
