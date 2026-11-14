@@ -4371,7 +4371,7 @@ dependencies = [
  "rustls",
  "serde_json",
  "snap",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "tokio",
  "tor-rtcompat",
  "tracing",
