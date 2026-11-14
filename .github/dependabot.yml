@@ -180,6 +180,23 @@ updates:
       - dependency-name: "androidx.compose:compose-bom"
       - dependency-name: "org.jetbrains.kotlinx:kotlinx-datetime"
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # Moved BY HAND, in lockstep with the library whose version they match
+      # (owner's decision, 2026-11-14, #850): netty with jvm-libp2p's netty
+      # constraint (one netty everywhere), log4j with Besu's log4j-bom, and jna
+      # with Besu's transitive jna (so the jar and the Android @aar cannot drift
+      # apart under conflict resolution). Each pin's catalog comment names its
+      # partner. Every update type is held, patches too: the lockstep is an exact
+      # version. The partners themselves are NOT held, so a Dependabot bump of
+      # jvm-libp2p or Besu arrives without these: complete it by hand (move the
+      # partner pins in that PR, and for Besu the fork steps its catalog comment
+      # lists) or close it.
+      # `ignore` applies to security updates too (alerts still show): advisories
+      # against these versions come from the owner's weekly "held pins" check, a
+      # scheduled Claude task outside this repo, and are bumped by hand, answering
+      # the lockstep question then.
+      - dependency-name: "io.netty:*"
+      - dependency-name: "org.apache.logging.log4j:*"
+      - dependency-name: "net.java.dev.jna:*"
     groups:
       gradle-minor-patch:
         update-types: ["minor", "patch"]
