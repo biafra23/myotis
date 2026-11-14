@@ -7425,7 +7425,9 @@ impl ElReader {
         chain_id: u64,
         overrides: myotis_evm::overrides::StateOverrides,
     ) -> Result<CallAnswer, String> {
-        let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "eth_call (create)").await?;
+        // The sender or nobody: the calldata is init code, not a call's arguments.
+        let affinity = call_affinity(from, &[]);
+        let (ctx, executor) = self.evm_setup_at_for(anchor, chain_id, "eth_call (create)", affinity).await?;
         let block_number = ctx.block_number;
         let state_root = ctx.state_root;
         let joined = super::request::blocking(move || {
@@ -7614,7 +7616,8 @@ impl ElReader {
         overrides: myotis_evm::overrides::StateOverrides,
     ) -> Result<AccessListAnswer, String> {
         let started = Instant::now();
-        let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "createAccessList").await?;
+        let affinity = call_affinity(Some(tx.from), &tx.data);
+        let (ctx, executor) = self.evm_setup_at_for(anchor, chain_id, "createAccessList", affinity).await?;
         let setup = started.elapsed();
         let block_number = ctx.block_number;
         let joined = super::request::blocking(move || {
@@ -7654,7 +7657,8 @@ impl ElReader {
         tracer: myotis_evm::trace::Tracer,
     ) -> Result<TraceAnswer, String> {
         let started = Instant::now();
-        let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "traceCall").await?;
+        let affinity = call_affinity(Some(tx.from), &tx.data);
+        let (ctx, executor) = self.evm_setup_at_for(anchor, chain_id, "traceCall", affinity).await?;
         let setup = started.elapsed();
         let block_number = ctx.block_number;
         let joined = super::request::blocking(move || {

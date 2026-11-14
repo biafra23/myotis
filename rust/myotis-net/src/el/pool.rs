@@ -1819,18 +1819,7 @@ impl PeerPool {
     /// retry loop with its transient bench, plus the head and proof keys #465
     /// added. Prunes closed peers first.
     pub async fn snap_peers(&self) -> Vec<Arc<ManagedPeer>> {
-        self.inner.prune_closed().await;
-        let now = Instant::now();
-        let peers = self.inner.peers.lock().await;
-        let newest_first: Vec<&PooledPeer> = peers.iter().rev().collect();
-        let keys: Vec<LadderKey> = newest_first
-            .iter()
-            .map(|p| LadderKey::new(p.is_benched(now), p.peer.coverage(), p.unproven()))
-            .collect();
-        ladder_order(&keys)
-            .into_iter()
-            .map(|i| Arc::clone(&newest_first[i].peer))
-            .collect()
+        self.ordered_snap_peers(None).await
     }
 
     /// [`Self::snap_peers`] for a read that names `address` (an account read,
@@ -1859,6 +1848,13 @@ impl PeerPool {
     /// 1/P. It does not unlink the reads from this node's IP or its node key;
     /// Tor mode does that.
     pub async fn snap_peers_for(&self, address: &[u8; 20]) -> Vec<Arc<ManagedPeer>> {
+        self.ordered_snap_peers(Some(address)).await
+    }
+
+    /// The one body of [`Self::snap_peers`] and [`Self::snap_peers_for`], so
+    /// both always rank by the same [`LadderKey`]s: `None` is the plain
+    /// ladder, an address its own order within each tier.
+    async fn ordered_snap_peers(&self, address: Option<&[u8; 20]>) -> Vec<Arc<ManagedPeer>> {
         self.inner.prune_closed().await;
         let now = Instant::now();
         let peers = self.inner.peers.lock().await;
@@ -1867,11 +1863,17 @@ impl PeerPool {
             .iter()
             .map(|p| LadderKey::new(p.is_benched(now), p.peer.coverage(), p.unproven()))
             .collect();
-        let weights: Vec<u64> = newest_first
-            .iter()
-            .map(|p| affinity_weight(&self.inner.affinity_salt, address, &p.peer.peer_pubkey()))
-            .collect();
-        affine_ladder_order(&keys, &weights)
+        let order = match address {
+            None => ladder_order(&keys),
+            Some(a) => {
+                let weights: Vec<u64> = newest_first
+                    .iter()
+                    .map(|p| affinity_weight(&self.inner.affinity_salt, a, &p.peer.peer_pubkey()))
+                    .collect();
+                affine_ladder_order(&keys, &weights)
+            }
+        };
+        order
             .into_iter()
             .map(|i| Arc::clone(&newest_first[i].peer))
             .collect()
