@@ -195,18 +195,24 @@ func (s *Store) ProcessUpdate(u *Update) error {
 	if u.SignatureSlot > s.optimisticSigSlot {
 		s.Optimistic, s.OptimisticExec, s.optimisticSigSlot = u.Attested.Beacon, u.Attested.Exec, u.SignatureSlot
 	}
-	s.applyNextWhenPeriodChanges(oldFinalized, s.Finalized.Slot)
+	s.applyNextWhenPeriodChanges(s.Finalized.Slot)
 	return nil
 }
 
-// applyNextWhenPeriodChanges promotes the held next committee when the
-// finalized slot crossed into a new period — ONE period per crossing
-// (store.rs apply_next_when_period_changes).
-func (s *Store) applyNextWhenPeriodChanges(oldFinalized, newFinalized uint64) {
+// applyNextWhenPeriodChanges promotes the held next committee once the
+// finalized slot lies in a period past the store's own — ONE period per
+// call (store.rs apply_next_when_period_changes). Compared with
+// StorePeriod, not with the previous finalized slot's period: in catch-up
+// ForceRotateIfPastPeriod may already have rotated into the period this
+// update finalizes, and a second rotation would put the store a period
+// ahead of its finalized header (#737). Without a force-rotation
+// StorePeriod is the previous finalized slot's period, so the verdict is
+// the old crossing rule's.
+func (s *Store) applyNextWhenPeriodChanges(newFinalized uint64) {
 	if s.NextCommittee == nil {
 		return
 	}
-	if chain.SyncCommitteePeriod(newFinalized) > chain.SyncCommitteePeriod(oldFinalized) {
+	if chain.SyncCommitteePeriod(newFinalized) > s.StorePeriod {
 		s.CurrentCommittee = s.NextCommittee
 		s.NextCommittee = nil
 		s.StorePeriod++
@@ -291,7 +297,7 @@ func (s *Store) ProcessFinalityUpdate(u *FinalityUpdate) (FinalityOutcome, error
 	if u.SignatureSlot > s.optimisticSigSlot {
 		s.Optimistic, s.OptimisticExec, s.optimisticSigSlot = u.Attested.Beacon, u.Attested.Exec, u.SignatureSlot
 	}
-	s.applyNextWhenPeriodChanges(oldFinalized, s.Finalized.Slot)
+	s.applyNextWhenPeriodChanges(s.Finalized.Slot)
 	if s.Finalized.Slot > oldFinalized || s.optimisticSigSlot > oldOptSig {
 		return Advanced, nil
 	}

@@ -82,17 +82,51 @@ unsafe extern "C" fn complete(
     context: *mut c_void,
     data: *mut c_void,
 ) {
-    if data.is_null() {
+    // SAFETY: `data` is the item Node hands this callback once (see `claim`).
+    let Some(completion) = (unsafe { claim(env, data) }) else {
         return;
-    }
-    let completion = unsafe { Box::from_raw(data.cast::<Completion>()) };
+    };
+    // SAFETY: `claim` returned the completion only for a live `env`, so the
+    // TSFN has not been finalized and the `Box<Arc<State>>` its finalizer
+    // frees is still alive.
     let state = unsafe { &*context.cast::<Arc<State>>() };
     deliver_completion(env, state, *completion);
 }
 
+/// Take ownership of a queued item, and say whether it may be delivered.
+///
+/// Node drains a TSFN aborted at environment teardown by calling `complete`
+/// with a null `env` (and callback). On Node 20.x, 22.x and 24.0-24.15 it does
+/// so AFTER the finalizer has freed the context (`ThreadSafeFunction::Finalize`
+/// in `src/node_api.cc`: finalizer first, then `EmptyQueueAndDelete`; 24.16 and
+/// later drain first). So with a null `env` the item is dropped here and
+/// `None` returned, and `complete` never reads the context (#455). Nothing is
+/// lost: the environment is gone, so the promise can never be settled, and the
+/// pending count dies with the state. napi-rs guards its own TSFN trampoline
+/// the same way ("env and/or callback can be null when shutting down"). This
+/// takes no context on purpose: the decision cannot depend on freed memory.
+///
+/// # Safety
+/// `data` is null or the `Box<Completion>` that `post_completion` leaked into
+/// this TSFN call, not yet reclaimed.
+unsafe fn claim(env: sys::napi_env, data: *mut c_void) -> Option<Box<Completion>> {
+    if data.is_null() {
+        return None;
+    }
+    // SAFETY: per this function's contract.
+    let completion = unsafe { Box::from_raw(data.cast::<Completion>()) };
+    if env.is_null() {
+        drop(completion);
+        return None;
+    }
+    Some(completion)
+}
+
 fn deliver_completion(env: sys::napi_env, state: &State, completion: Completion) {
-    // Node drains aborted TSFN items with null env. Account the item but never
-    // call Node-API; the TSFN context remains owned until its finalizer.
+    // `complete` filters the null-env teardown drain out before the context is
+    // read (#455); the null check stays as a guard for any other caller. A
+    // closing state still delivers no settlement: account the item but never
+    // call Node-API for it.
     if env.is_null()
         || state
             .inner
@@ -743,4 +777,27 @@ fn fatal_completion() -> ! {
     }
     // Node documents fatal_error as non-returning; the FFI signature is void.
     std::process::abort()
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A completion counting its drops, to show the teardown drain frees the item.
+    #[test]
+    fn the_null_env_teardown_drain_drops_the_item_undelivered() {
+        let item = |value: &str| Box::into_raw(Box::new(Completion { deferred: 0, value: value.into() }));
+        // SAFETY: each pointer is a fresh leaked `Box<Completion>`, claimed once.
+        unsafe {
+            // The teardown drain (#455): dropped here, nothing to deliver, so
+            // `complete` returns before it reads the context.
+            assert!(claim(std::ptr::null_mut(), item("late").cast()).is_none());
+            assert!(claim(std::ptr::null_mut(), std::ptr::null_mut()).is_none());
+            // A live env (any non-null pointer stands in): handed on for delivery.
+            let env = std::ptr::NonNull::<c_void>::dangling().as_ptr().cast();
+            let claimed = claim(env, item("ready").cast()).expect("delivered with a live env");
+            assert_eq!(claimed.value, "ready");
+        }
+    }
 }
