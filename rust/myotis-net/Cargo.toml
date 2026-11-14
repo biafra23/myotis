@@ -44,7 +44,7 @@ libp2p = { version = "=0.56.0", features = ["tokio", "tcp", "quic", "noise", "ya
 # against (its dev-dependency). Nimbus speaks ONLY mplex on TCP since 2024
 # (status-im/nimbus-eth2#6636), which is why a yamux-only host could never
 # reach a Nimbus node — see `reqresp::build_swarm`.
-libp2p-mplex = "=0.43.1"
+libp2p-mplex = "=0.44.0"
 discv5 = "=0.11.0"
 # The ENR wire codec, for the discv4 fork-id pre-filter (#539): the `enr` crate
 # itself arrives through discv5, alloy-rlp is the codec it implements. Already
