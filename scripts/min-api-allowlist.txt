@@ -84,6 +84,16 @@ com/github/benmanes/caffeine/ java/lang/invoke/VarHandle#storeStoreFence()V
 com/github/benmanes/caffeine/ java/util/concurrent/CompletableFuture#delayedExecutor(JLjava/util/concurrent/TimeUnit;Ljava/util/concurrent/Executor;)Ljava/util/concurrent/Executor;
 com/github/benmanes/caffeine/ java/util/stream/Stream#takeWhile(Ljava/util/function/Predicate;)Ljava/util/stream/Stream;
 
+# netty 4.2.20 (#864): the JCTools queues netty shades
+# (io/netty/util/internal/shaded/org/jctools/queues/varhandle/) use VarHandle
+# (API 33). netty selects them only when PlatformDependent.hasJctoolsVarHandle()
+# holds (javaVersion() >= 11), and PlatformDependent0.javaVersion0() reports 6
+# on Android, so it takes the Unsafe/atomic queues there instead [guarded].
+# netty also runs only in the Java engine, which EngineGate disables below
+# API 33 [dormant on 29-32]; from 33 the APIs exist.
+io/netty/util/internal/shaded/org/jctools/ java/lang/invoke/MethodHandles#arrayElementVarHandle(Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;
+io/netty/util/internal/shaded/org/jctools/ java/lang/invoke/MethodHandles$Lookup#findVarHandle(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;
+
 # Guava (JRE variant, deliberately — see android-app/build.gradle.kts). All
 # hits are its capability-probing enum holders (AbstractFutureState atomic
 # helpers, UnsignedBytes comparator, LittleEndianByteArray, FuturesGetChecked),
