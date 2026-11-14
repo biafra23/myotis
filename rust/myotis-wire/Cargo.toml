@@ -31,9 +31,9 @@ myotis-core = { path = "../myotis-core", default-features = false }
 myotis-consensus = { path = "../myotis-consensus", default-features = false, optional = true }
 # Diagnostics in the eth2 multi-chunk decoder (I/O-free facade).
 tracing = { version = "=0.1.44", default-features = false, optional = true }
-aes = { version = "=0.8.4", default-features = false }
-ctr = { version = "=0.9.2", default-features = false }
-cipher = { version = "=0.4.4", default-features = false }
+aes = { version = "=0.9.4", default-features = false }
+ctr = { version = "=0.10.1", default-features = false }
+cipher = { version = "=0.5.2", default-features = false }
 hmac = { version = "=0.12.1", default-features = false }
 sha2 = { version = "=0.10.9", default-features = false }
 sha3 = { version = "=0.10.9", default-features = false }
@@ -43,6 +43,7 @@ snap = { version = "=1.1.2", optional = true }
 # Same steer as myotis-core: sha2's x86 backend enables SSE per function, which
 # bare-metal targets (UEFI, x86_64-unknown-none) cannot codegen. `aes` (RLPx) has
 # the same problem but no Cargo feature to steer it: on those targets build with
-# RUSTFLAGS="--cfg aes_force_soft" (the no_std canary does; so must embedders).
+# --cfg aes_backend="soft" (aes 0.9; 0.8's aes_force_soft is ignored by it).
+# rust/.cargo/config.toml sets it per target in this tree; embedders must too.
 [target.'cfg(any(target_os = "uefi", target_os = "none"))'.dependencies]
 sha2 = { version = "=0.10.9", default-features = false, features = ["force-soft"] }
