@@ -27,6 +27,7 @@ import java.util.function.Supplier;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -698,43 +699,43 @@ class SnapBackedStateOracleTest {
     }
 
     @Test
-    void accountIsBankedBeforeTheReadCompletesEvenWithTheCommonPoolBusy() throws Exception {
-        // Deterministic guard for the ordering the test above relies on: every
-        // ForkJoinPool common-pool thread is held for the whole read, so anything the
-        // oracle defers to the pool (as the old whenCompleteAsync promotion did)
-        // cannot have run when get() returns. Only a record banked in the verifying
-        // stage itself is in the cache at that point.
+    void accountIsBankedInTheVerifyingStageBeforeTheReadCompletes() throws Exception {
+        // Deterministic guard for the ordering the test above relies on. FixturePeer
+        // answers inline, so the verifying stage runs on this test thread; a promotion
+        // deferred past completion (as the old whenCompleteAsync one was) runs on
+        // another thread, or after get() has returned. Recording the thread putAccount
+        // runs on checks the ordering itself, independent of the common pool's size
+        // (with parallelism 1, CompletableFuture swaps commonPool() for a thread per
+        // task, so holding the pool's workers would hold nothing back).
         Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
-        Bytes accountValue = encodeAccount(3L, BigInteger.valueOf(42),
-                TrieFixture.EMPTY_TRIE_ROOT,
+        Bytes accountValue = encodeAccount(3L, BigInteger.valueOf(42), TrieFixture.EMPTY_TRIE_ROOT,
                 Bytes32.wrap(Hash.keccak256(Bytes.EMPTY).toArrayUnsafe()));
         var accountTrie = TrieFixture.singleLeaf(keccak(addr.toByteArray()), accountValue);
         FixturePeer peer = new FixturePeer();
         peer.addAccountProof(accountTrie.root, accountTrie.proof);
-        StateProofCache shared = StateProofCache.inMemory(1024);
+
+        StateProofCache inner = StateProofCache.inMemory(1024);
+        var bankedOn = new java.util.concurrent.atomic.AtomicReference<Thread>();
+        StateProofCache shared = new StateProofCache() {
+            @Override public java.util.Optional<BigInteger> getStorage(byte[] r, BigInteger s) { return inner.getStorage(r, s); }
+            @Override public void putStorage(byte[] r, BigInteger s, BigInteger v) { inner.putStorage(r, s, v); }
+            @Override public java.util.Optional<AccountEntry> getAccount(byte[] r, byte[] a) { return inner.getAccount(r, a); }
+            @Override public void putAccount(byte[] r, byte[] a, AccountEntry e) {
+                bankedOn.set(Thread.currentThread());
+                inner.putAccount(r, a, e);
+            }
+        };
         var oracle = new SnapBackedStateOracle(() -> peer, BytecodeCache.inMemory(),
                 SnapBackedStateOracle.DEFAULT_MAX_ATTEMPTS, shared);
 
-        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
-        int threads = java.util.concurrent.ForkJoinPool.getCommonPoolParallelism();
-        java.util.concurrent.CountDownLatch held = new java.util.concurrent.CountDownLatch(threads);
-        for (int i = 0; i < threads; i++) {
-            java.util.concurrent.ForkJoinPool.commonPool().execute(() -> {
-                held.countDown();
-                try { release.await(); } catch (InterruptedException ignored) { }
-            });
-        }
-        assertTrue(held.await(10, java.util.concurrent.TimeUnit.SECONDS), "common pool held");
-        try {
-            assertEquals(BigInteger.valueOf(42),
-                    oracle.fetchAccount(accountTrie.root.toArrayUnsafe(), addr)
-                            .get(10, java.util.concurrent.TimeUnit.SECONDS).balance());
-            var banked = shared.getAccount(accountTrie.root.toArrayUnsafe(), addr.toByteArray());
-            assertTrue(banked.isPresent(), "banked before the read completed, with the pool busy");
-            assertEquals(BigInteger.valueOf(42), banked.get().account().balance());
-        } finally {
-            release.countDown();
-        }
+        assertEquals(BigInteger.valueOf(42),
+                oracle.fetchAccount(accountTrie.root.toArrayUnsafe(), addr)
+                        .get(10, java.util.concurrent.TimeUnit.SECONDS).balance());
+        assertSame(Thread.currentThread(), bankedOn.get(),
+                "banked in the verifying stage, on the thread that completed the read");
+        var banked = shared.getAccount(accountTrie.root.toArrayUnsafe(), addr.toByteArray());
+        assertTrue(banked.isPresent(), "banked before the read completed");
+        assertEquals(BigInteger.valueOf(42), banked.get().account().balance());
     }
 
     @Test
