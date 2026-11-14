@@ -193,6 +193,13 @@ updates:
       #   jar/native mismatch fails only at run time, and CI builds the APK
       #   without running it. Unwatched: a Besu BOM that raises jna above the
       #   catalog moves the desktop jar without the stub.
+      # - snappy because 0.5 cannot run on Android: it is a rewrite that calls
+      #   sun.misc.Unsafe.copyMemory(Object, long, Object, long, long), which
+      #   ART does not provide, and it dropped 0.4's pure-Java fallback. RLPx
+      #   frames and libp2p req/resp decompress with it, and no gate sees it
+      #   (check_apk_min_api.py polices java.*, not sun.misc). The pin's
+      #   comment in gradle/libs.versions.toml says the same (#864). Held on
+      #   every update type until a release runs on ART again.
       # Besu is served from Hyperledger's Artifactory, which Dependabot does not
       # query, so its releases are watched by the owner's weekly "held pins"
       # check (a scheduled Claude task outside this repo), not by a PR here.
@@ -204,10 +211,11 @@ updates:
       # workflow here submits one, so unless the repository's automatic
       # dependency submission is on, Gradle modules get no Dependabot alerts or
       # security PRs at all, held or not. The weekly check covers them either
-      # way, and for these two it is the only path: an ignore entry holds a
+      # way, and for these three it is the only path: an ignore entry holds a
       # security PR as well.
       - dependency-name: "org.apache.logging.log4j:*"
       - dependency-name: "net.java.dev.jna:*"
+      - dependency-name: "org.iq80.snappy:snappy"
     groups:
       gradle-minor-patch:
         update-types: ["minor", "patch"]
