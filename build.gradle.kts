@@ -138,6 +138,28 @@ allprojects {
         // state is a pin failure there.
     }
 
+    // === One version per library family (#859) ==============================
+    // Gradle resolves each module on its own, so a family whose modules arrive
+    // through different routes can end up on different versions. Two families
+    // here did:
+    // - BouncyCastle: the catalog's bcprov and the bcpkix / bcutil / bctls that
+    //   jvm-libp2p and Besu bring. bcprov 1.86 ships a class
+    //   (org.bouncycastle.asn1.iana.IANAObjectIdentifiers) that bcutil 1.83
+    //   also ships, which fails Android's duplicate-class check.
+    // - netty: the catalog's transport / codec / handler, while the HTTP
+    //   codecs, socks, proxy and DNS modules followed Besu's netty-bom, or
+    //   the 4.1 set vertx-core 4.5 brings through tuweni where Besu is absent
+    //   (:consensus, :core).
+    // FamilyAlignment (end of this file) puts each family on its highest
+    // version IN EACH GRAPH: BouncyCastle's jdk18on modules through a virtual
+    // platform, netty through its own published netty-bom, whose constraints
+    // name the modules that exist at that version. So a graph holding the
+    // catalog's netty modules (every host's: app, android-app, app-desktop)
+    // runs every netty module at the catalog version; a library module whose
+    // graph lacks them (:core, :myotis-evm's own classpaths) aligns at the
+    // highest netty it does see.
+    dependencies.components.all<FamilyAlignment>()
+
     // Resolves every resolvable configuration of this project (and of its
     // buildscript), so ONE invocation sees the whole graph — what
     // `--write-locks` and `--write-verification-metadata` need to write complete
@@ -2095,3 +2117,24 @@ tasks.register("refreshCheckpoint") {
     }
 }
 
+// One version per library family (see "One version per library family" in
+// allprojects). A ComponentMetadataRule must be a class with an injectable
+// constructor, so it lives here rather than as a lambda.
+abstract class FamilyAlignment : ComponentMetadataRule {
+    override fun execute(ctx: ComponentMetadataContext) {
+        val id = ctx.details.id
+        when {
+            // Only the jdk18on line: the jdk15on artifacts stop at 1.70 and
+            // would have no member at a jdk18on version.
+            id.group == "org.bouncycastle" && id.name.endsWith("-jdk18on") ->
+                ctx.details.belongsTo("org.bouncycastle:bouncycastle-jdk18on-platform:${id.version}")
+            // netty's own modules (4.x.y.Final); tcnative and the incubator
+            // modules have version lines of their own.
+            id.group == "io.netty" && id.name.startsWith("netty-") &&
+                !id.name.startsWith("netty-tcnative") && id.name != "netty-bom" &&
+                !id.name.startsWith("netty-incubator") && id.name != "netty-jni-util" &&
+                id.version.startsWith("4.") ->
+                ctx.details.belongsTo("io.netty:netty-bom:${id.version}", false)
+        }
+    }
+}
