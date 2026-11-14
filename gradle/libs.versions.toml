@@ -41,19 +41,19 @@ tuweni = "2.7.2"
 discovery = "26.4.0-android.1"
 # Upstream Netty (NIO-only usage; Android-safe). Replaces the netty-kotlin
 # transpile PoC — same io.netty.* FQCNs, so this is a coordinate swap.
-netty = "4.2.10.Final"  # matches jvm-libp2p 1.3.2's netty constraint (one netty everywhere)
-bouncycastle = "1.78.1"
+netty = "4.2.20.Final"  # matches jvm-libp2p 1.3.2's netty constraint (one netty everywhere)
+bouncycastle = "1.86"
 junit = "6.1.3"
-slf4j = "2.0.12"
-log4j = "2.25.3"  # matches Besu 26.4's log4j-bom; bump in lockstep with Besu
-logback = "1.5.6"
-snappy = "0.4"
+slf4j = "2.0.20"
+log4j = "2.26.1"  # matches Besu 26.4's log4j-bom; bump in lockstep with Besu
+logback = "1.6.6"
+snappy = "0.5"
 milagro = "0.4.0"
 # jblst: Supranational's blst BLS12-381 lib with JNI bindings (Teku ships this).
 # Used only in a benchmark today (consensus test scope) to measure the speedup vs
 # the pure-Java Milagro path before a production swap. Desktop/JVM natives only —
 # Android needs an NDK-built blst (see docs/design-history/bls-rust-acceleration.md).
-jblst = "0.3.15"
+jblst = "0.3.18"
 jvm-libp2p = "1.3.2-RELEASE"
 # JitPack build of biafra23/trueblocks-kotlin commit d2223849c1 (main's head when
 # this was pinned, 2026-11-09). A commit-hash version, never a branch build
@@ -64,7 +64,7 @@ jvm-libp2p = "1.3.2-RELEASE"
 # JitPack built it (https://jitpack.io/api/builds/com.github.biafra23/trueblocks-kotlin
 # lists "<10-hex>": "ok"), then rerun scripts/update_gradle_pins.sh.
 trueblocks-kotlin = "d2223849c1"
-dnsjava = "3.6.2"
+dnsjava = "3.7.1"
 # Hyperledger Besu (myotis-evm). NOTE: 25.7+ RENAMED the maven artifactIds
 # (evm → besu-evm; internal:algorithms → internal:besu-crypto-algorithms) —
 # probing the old names 404s and looks like publishing stopped; it didn't.
@@ -74,7 +74,7 @@ dnsjava = "3.6.2"
 besu = "26.4.0"
 # JNA (the UniFFI bindings' loader). 5.18.1 matches Besu's transitive jna so the
 # jar and Android @aar can't drift apart under conflict resolution.
-jna = "5.18.1"
+jna = "5.19.1"
 agp = "8.7.3"
 # Android NATIVE toolchain, pinned exactly (#734, Part 2). The single source for
 # Gradle (ndkVersion/buildToolsVersion in :android-app and :myotis-engine, and the
@@ -90,7 +90,7 @@ android-build-tools = "37.0.0"
 cargo-ndk = "4.1.2"
 # Kotlin 2.2.21 is the FLOOR for the iOS target: it's the first release whose
 # Kotlin/Native supports Xcode 26 (required to link against the iOS 26 SDK).
-kotlin = "2.2.21"
+kotlin = "2.4.21"
 compose-bom = "2024.11.00"
 # Compose Multiplatform (shared UI for Android + Desktop + iOS). 1.9.x pairs with
 # Kotlin 2.2.20+. Uses the bundled compose-compiler plugin.
@@ -99,9 +99,9 @@ activity-compose = "1.9.3"
 # JSON-RPC server (:jsonrpc-server). Ktor server+client + kotlinx are chosen for
 # Android compatibility (no java.net.http / com.sun.net.httpserver) and to match
 # the project's Ktor/Compose-Multiplatform direction. Aligned with Kotlin 2.0.21.
-ktor = "3.0.3"
-kotlinx-coroutines = "1.9.0"
-kotlinx-serialization = "1.7.3"
+ktor = "3.6.1"
+kotlinx-coroutines = "1.11.0"
+kotlinx-serialization = "1.12.0"
 # 0.6.2 = the compatibility release for the kotlin.time.Instant the 2.1.20+ stdlib
 # introduced. The iOS (klib) compile still resolves the experimental stdlib Instant
 # in :ui's formatLogTime — see the local @OptIn there.
@@ -178,7 +178,7 @@ androidx-compose-ui-tooling       = { module = "androidx.compose.ui:ui-tooling" 
 androidx-compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview" }
 androidx-compose-material3        = { module = "androidx.compose.material3:material3" }
 # Java-only Worker (no -ktx needed): the daily beacon catch-up job while the node sleeps.
-androidx-work-runtime             = { module = "androidx.work:work-runtime", version = "2.9.1" }
+androidx-work-runtime             = { module = "androidx.work:work-runtime", version = "2.12.0" }
 # Instrumented-test stack for :android-app's minSdk boot smoke test (androidTest
 # only — never in the APK). Versions from the same androidx.test release train.
 androidx-test-core                = { module = "androidx.test:core",       version = "1.6.1" }
