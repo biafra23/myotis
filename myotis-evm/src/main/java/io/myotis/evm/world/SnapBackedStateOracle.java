@@ -342,8 +342,7 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
             } else {
                 awr = verifyAndDecodeAccount(root, it.accountHash(), it.address(), nodes);
                 verifiedAny = true;
-                stateCache.putAccount(stateRoot, it.addr(),
-                        new StateProofCache.AccountEntry(awr.account(), awr.storageRoot().toArrayUnsafe()));
+                bankAccount(stateRoot, it.addr(), awr);
                 seenAccounts.add(new ReadStats.AccountObs(it.addr(), factOf(awr)));
             }
             Bytes32 storageRoot = awr.storageRoot();
@@ -401,6 +400,21 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
     }
 
     /**
+     * Banks a VERIFIED account record in the cross-call {@link StateProofCache}. A cache
+     * failure is logged and swallowed: the record is already proven, so the read that
+     * proved it must not fail, nor rotate to another peer, because a cache could not
+     * store it. It only costs a later read a refetch.
+     */
+    private void bankAccount(byte[] stateRoot, byte[] addr, AccountWithStorageRoot awr) {
+        try {
+            stateCache.putAccount(stateRoot, addr,
+                    new StateProofCache.AccountEntry(awr.account(), awr.storageRoot().toArrayUnsafe()));
+        } catch (RuntimeException e) {
+            log.debug("[snap-oracle] state cache could not bank an account: {}", e.toString());
+        }
+    }
+
+    /**
      * Internal helper: fetch the account record AND its storage root, since
      * {@link AccountState} doesn't expose the latter publicly. The MPT proof
      * verification happens inside the retry loop so a peer that returns a
@@ -439,10 +453,7 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
                         // context) finds it instead of re-proving it. stateCache is not
                         // the map computeIfAbsent runs on, so this is safe when the peer
                         // answers inline, inside computeIfAbsent.
-                        if (awr != null) {
-                            stateCache.putAccount(stateRoot, addr,
-                                    new StateProofCache.AccountEntry(awr.account(), awr.storageRoot().toArrayUnsafe()));
-                        }
+                        bankAccount(stateRoot, addr, awr);
                         return awr;
                     }));
             // Evict failed fetches so a later read can retry across peers. *Async so the
