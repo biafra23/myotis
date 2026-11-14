@@ -112,6 +112,21 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    ignore:
+      # k256 0.14 is held (owner's decision, 2026-11-14, #834, #844). Only
+      # myotis-core pins k256 directly; alloy, revm, discv5 (via enr) and
+      # libp2p-identity stay on 0.13, so moving myotis-core alone would ship a
+      # second copy of the elliptic-curve stack (ecdsa 0.17, elliptic-curve
+      # 0.14, crypto-bigint 0.7, ...) and give the node key a different
+      # secp256k1 implementation than the networking stack, for no gain.
+      # Lift this when those crates move to 0.14: the "One k256 per lock" step
+      # of cargo-locks.yml fails in the PR that brings a second k256 in.
+      # Dependabot's Cargo classifier follows Cargo's pre-1.0 rule: 0.13 -> 0.14
+      # is semver-major to it (dependabot-core #13349, #13710), so that type
+      # alone covers >= 0.14; semver-minor, the same range for a 0.x crate, is
+      # listed as a guard. 0.13.x patches still arrive.
+      - dependency-name: "k256"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
     groups:
       cargo-patch:
         update-types: ["patch"]
