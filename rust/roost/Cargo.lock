@@ -3415,7 +3415,7 @@ dependencies = [
  "myotis-wire",
  "rustls",
  "snap",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tokio",
  "tracing",
  "webpki-roots",
