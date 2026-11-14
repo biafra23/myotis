@@ -489,8 +489,61 @@ fn affine_ladder_order(keys: &[LadderKey], weights: &[u64]) -> Vec<usize> {
     order
 }
 
-/// The pool's secret salt for [`affinity_weight`], from its node key under a
-/// domain tag: never the key itself, and nothing a peer can derive.
+/// The pool's secret salt for [`affinity_weight`]: the one kept beside the
+/// peer cache at `cache_path` ([`affinity_salt_path`]), drawn from OS entropy
+/// and written there the first time. A new salt every run would hand each
+/// address a new, independent order over largely the same peers (the cache's
+/// Confirmed peers and the pins come back), so a long-lived peer would lead
+/// most addresses at one start or another. Where the salt cannot be kept (no
+/// cache file, an unwritable one, no entropy) it is the node key's
+/// ([`affinity_salt_of`]): per run, which is no worse than before.
+fn load_affinity_salt(cache_path: Option<&std::path::Path>, key: &NodeKey) -> [u8; 32] {
+    let Some(path) = affinity_salt_path(cache_path) else {
+        return affinity_salt_of(key);
+    };
+    if let Some(salt) = std::fs::read_to_string(&path).ok().as_deref().and_then(parse_salt) {
+        return salt;
+    }
+    let mut salt = [0u8; 32];
+    if getrandom::fill(&mut salt).is_err() {
+        return affinity_salt_of(key);
+    }
+    let hex: String = salt.iter().map(|b| format!("{b:02x}")).collect();
+    if std::fs::write(&path, format!("{hex}\n")).is_err() {
+        tracing::warn!(path = %path.display(), "could not keep the read-affinity salt; using a per-run one");
+        return affinity_salt_of(key);
+    }
+    salt
+}
+
+/// Where the salt goes beside the peer cache at `cache_path` (`peers.cache`
+/// → `peers-affinity.cache`, `peers-gnosis.cache` → `peers-affinity-gnosis.cache`,
+/// as the Tor reserve's sidecar is named); none when the cache has no file.
+fn affinity_salt_path(cache_path: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    let p = cache_path?;
+    let name = p.file_name()?.to_str()?;
+    let sidecar = match name.strip_prefix("peers") {
+        Some(rest) => format!("peers-affinity{rest}"),
+        None => format!("affinity-{name}"),
+    };
+    Some(p.with_file_name(sidecar))
+}
+
+/// A kept salt: exactly 64 hex digits, surrounding whitespace aside.
+fn parse_salt(text: &str) -> Option<[u8; 32]> {
+    let text = text.trim();
+    if text.len() != 64 || !text.is_ascii() {
+        return None;
+    }
+    let mut salt = [0u8; 32];
+    for (i, b) in salt.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(salt)
+}
+
+/// The per-run salt: the node key's under a domain tag, never the key itself
+/// and nothing a peer can derive.
 fn affinity_salt_of(key: &NodeKey) -> [u8; 32] {
     let mut secret = key.secret_bytes();
     let salt = myotis_core::keccak::keccak256_concat(b"myotis/read-affinity/v1", &secret);
@@ -669,10 +722,10 @@ impl QualityOutcome {
 struct PoolInner {
     tasks: super::tasks::Tasks,
     key: Arc<NodeKey>,
-    /// The secret salt of [`PeerPool::snap_peers_for`]'s per-address order,
-    /// derived from the node key: it lives exactly as long as the identity
-    /// peers already see (kept across a pause, new after a stop), and nobody
-    /// who lacks the key can compute which peer an address goes to.
+    /// The secret salt of [`PeerPool::snap_peers_for`]'s per-address order
+    /// ([`load_affinity_salt`]): kept for the life of the install beside the
+    /// peer cache, so an address keeps its peers across restarts too; per
+    /// run (from the node key) only where there is no cache file to keep it.
     affinity_salt: [u8; 32],
     /// Every RLPx session this pool dials counts its bytes here (EL layer).
     traffic: Arc<crate::traffic::TrafficMeter>,
@@ -1654,7 +1707,7 @@ impl PeerPool {
         }
         let mut cache = cache;
         let tor_reserve = load_tor_reserve(&mut cache, &boot_enodes);
-        let affinity_salt = affinity_salt_of(&key);
+        let affinity_salt = load_affinity_salt(cache.path(), &key);
         let inner = Arc::new(PoolInner {
             tasks: super::tasks::Tasks::default(),
             affinity_salt,
@@ -1792,9 +1845,19 @@ impl PeerPool {
     /// within milliseconds, so that one peer links them all. In the address's
     /// own order each healthy peer is the first for about 1/P of the addresses,
     /// and the same address keeps going to the same peers (its hedges
-    /// included) while they stay pooled, so what any peer learns over time is
-    /// its own share rather than the whole set. It does not unlink the reads
-    /// from this node's IP or its node key; Tor mode does that.
+    /// included) while they stay pooled, across restarts too (the salt is
+    /// kept, [`load_affinity_salt`]), so what any peer learns over time is
+    /// its own share rather than the whole set.
+    ///
+    /// Limits: P is the number of peers in the top tier AT THAT MOMENT. A
+    /// cold start (no cache-Confirmed peers) begins with a top tier of one or
+    /// two, the first to serve anything, and every address leads with them
+    /// until the rest are proven, as before this order. And a peer that drops
+    /// a tier (a bench, a stale word) hands its addresses to their next peer
+    /// by weight, so over a run an address reaches its top two or three peers
+    /// (the ones its hedges use anyway): a peer's share is nearer k/P than
+    /// 1/P. It does not unlink the reads from this node's IP or its node key;
+    /// Tor mode does that.
     pub async fn snap_peers_for(&self, address: &[u8; 20]) -> Vec<Arc<ManagedPeer>> {
         self.inner.prune_closed().await;
         let now = Instant::now();
@@ -4174,8 +4237,10 @@ mod tests {
     /// a keyed per-address order within each, spread over the pool.
     mod read_affinity {
         use super::super::{
-            affine_ladder_order, affinity_salt_of, affinity_weight, ladder_order, Coverage, LadderKey,
+            affine_ladder_order, affinity_salt_of, affinity_salt_path, affinity_weight, ladder_order,
+            load_affinity_salt, parse_salt, Coverage, LadderKey,
         };
+        use std::path::Path;
         use myotis_core::nodekey::NodeKey;
 
         fn node(i: u8) -> [u8; 64] {
@@ -4261,6 +4326,48 @@ mod tests {
                 (0..20).any(|i| order(&SALT, &address(i)) != order(&other, &address(i))),
                 "a peer could compute the order without the salt"
             );
+        }
+
+        #[test]
+        fn the_salt_is_kept_beside_the_peer_cache_across_restarts() {
+            let dir = std::env::temp_dir().join(format!("myotis-pool-affinity-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let cache = dir.join("peers-gnosis.cache");
+            let salt_file = dir.join("peers-affinity-gnosis.cache");
+            let _ = std::fs::remove_file(&salt_file);
+            // Two runs, two node keys: one salt, the kept one, never either key's.
+            let first = NodeKey::from_secret_bytes(&[1u8; 32]).unwrap();
+            let second = NodeKey::from_secret_bytes(&[2u8; 32]).unwrap();
+            let kept = load_affinity_salt(Some(&cache), &first);
+            assert!(salt_file.exists());
+            assert_eq!(load_affinity_salt(Some(&cache), &second), kept);
+            assert_ne!(kept, affinity_salt_of(&first));
+            // A torn file is replaced, not trusted.
+            std::fs::write(&salt_file, "not a salt").unwrap();
+            let fresh = load_affinity_salt(Some(&cache), &first);
+            assert_eq!(load_affinity_salt(Some(&cache), &second), fresh);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn with_no_cache_file_the_salt_is_the_runs() {
+            let key = NodeKey::from_secret_bytes(&[3u8; 32]).unwrap();
+            assert_eq!(load_affinity_salt(None, &key), affinity_salt_of(&key));
+        }
+
+        #[test]
+        fn the_salts_file_is_named_like_the_tor_reserves() {
+            assert_eq!(
+                affinity_salt_path(Some(Path::new("/data/peers.cache"))).as_deref(),
+                Some(Path::new("/data/peers-affinity.cache"))
+            );
+            assert_eq!(
+                affinity_salt_path(Some(Path::new("/data/peers-gnosis.cache"))).as_deref(),
+                Some(Path::new("/data/peers-affinity-gnosis.cache"))
+            );
+            assert_eq!(parse_salt(&"ab".repeat(32)), Some([0xab; 32]));
+            assert_eq!(parse_salt(&"ab".repeat(31)), None);
+            assert_eq!(parse_salt(&format!("{}zz", "ab".repeat(31))), None);
         }
 
         #[test]
