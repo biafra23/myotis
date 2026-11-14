@@ -179,10 +179,13 @@ embeddable as a plain library) inside the **Rust engine** — and only there:
 
   Checked at build level with Arti 0.44 (both ABIs cross-compiled; the
   engine's only NEEDED libraries stayed libc/libm/libdl). Arti 0.47 (#860)
-  has NOT been cross-compiled for Android yet: it compiles the Counter Galois
-  Onion relay crypto (polyval 0.7, universal-hash 0.6) unconditionally, which
-  no Android build here has built. Only its host build and the one-rustls
-  check above `rustls` in myotis-net's Cargo.toml were run. An on-device
+  and 0.48 have NOT been cross-compiled for Android yet:
+  0.47 compiles the Counter Galois Onion relay crypto (polyval 0.7,
+  universal-hash 0.6) unconditionally, and 0.48 adds a second generation of
+  the Ed25519/X25519 stack (ed25519-dalek 3, curve25519-dalek 5,
+  x25519-dalek 3, hmac 0.13, sha3 0.12); no Android build here has built
+  either. Only their host builds and the one-rustls check above `rustls` in
+  myotis-net's Cargo.toml were run. An on-device
   bootstrap has not been observed yet.
 
   Arti adds ~9.3 MB per ABI to `libmyotis_engine.so` (arm64-v8a 15.4 →
