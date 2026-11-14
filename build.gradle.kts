@@ -681,6 +681,7 @@ abstract class ToolProbe : ValueSource<String, ToolProbe.Params> {
         val command: ListProperty<String>
         val workingDir: Property<File>
         val path: Property<String> // optional PATH override (see rustToolchainPath)
+        val environment: MapProperty<String, String> // env overrides for the probe
     }
 
     @get:Inject abstract val execOperations: ExecOperations
@@ -691,6 +692,7 @@ abstract class ToolProbe : ValueSource<String, ToolProbe.Params> {
             commandLine(parameters.command.get())
             workingDir = parameters.workingDir.get()
             parameters.path.orNull?.let { environment("PATH", it) }
+            parameters.environment.orNull?.forEach { (k, v) -> environment(k, v) }
             standardOutput = out
             errorOutput = ByteArrayOutputStream()
             isIgnoreExitValue = true
@@ -998,6 +1000,208 @@ tasks.register<Exec>("cargoBuildHost") {
     // The Tor feature flips the artifact's contents, so it must key UP-TO-DATE too.
     inputs.property("torEngine", torEngine)
     outputs.files(hostLibNames.map { file("$rustReleaseDir/$it") })
+}
+
+// -------------------------------------------------------------------------
+// Optional Go build (go/ — the Go engine's C-ABI library that :myotis-engine-go
+// loads via JNA). Optional in the same shape as the Rust block above, with one
+// widening: not only a missing go toolchain but a FAILED cgo build (no C
+// compiler, offline module fetch) degrades to a warning — a machine with plain
+// Go installed is common and its run tasks must keep working; in every degrade
+// case the pure-JVM build is untouched and the selector simply reports the Go
+// engine unavailable (it is
+// only ever routed by an explicit -Pengine=go — auto prefers Rust). Go
+// dependencies are pinned by go/go.mod + go/go.sum and go verifies the module
+// hashes on every build, the Go twin of the Gradle/Cargo pins. NOT a release
+// artifact yet (the engine ships desktop-only, opt-in): goBuildCShared stays
+// outside the builder image and the reproducibility gate until Go artifacts
+// ship in a release.
+// -------------------------------------------------------------------------
+// GOTOOLCHAIN=local on the probe (PR #832 review): a module-directory `go`
+// command with the default GOTOOLCHAIN=auto DOWNLOADS the go.mod-required
+// toolchain — on hosted runners (Go preinstalled older than go/go.mod's line)
+// that was a 325 MB fetch inside the CONFIGURATION phase of every Gradle
+// invocation of every workflow, whichever task was asked for. The probe only
+// reports the local toolchain now; goBuildCShared likewise builds local and
+// skips with one note when it is older than go/go.mod's `go` line — never
+// fetches silently. CI's Build and Test installs the pinned toolchain
+// (setup-go, go-version-file: go/go.mod), like go-engine.yml already does.
+// goToolBinDir / goToolPath — the Go twin of rustToolBinDir above, same story
+// (PR #832 round-4 review): a GUI-launched IDE daemon can lack the shell's go
+// on its PATH, and the bare `go` here would then probe as missing on a machine
+// where a terminal build finds it fine — silently skipping the build while the
+// stale library stays in force (see the onlyIf note below). Candidates after
+// the daemon's PATH: the official tarball's standard /usr/local/go/bin,
+// $GOROOT/bin, and the ~/go/bin where go-install'd toolchain shims land.
+val goToolBinDir: File? = run {
+    val exe = if (isWindowsHost) "go.exe" else "go"
+    fun executableIn(dir: File) = dir.resolve(exe).let { it.isFile && it.canExecute() }
+    (System.getenv("PATH") ?: "").split(File.pathSeparator)
+        .firstOrNull { it.isNotEmpty() && executableIn(File(it)) }
+        ?.let { return@run File(it) }
+    listOfNotNull(
+        // Set-but-empty means unset, same rule as CARGO_HOME above.
+        System.getenv("GOROOT")?.takeIf { it.isNotBlank() }?.let { File(it) },
+        File("/usr/local/go"),
+        File(System.getProperty("user.home"), "go"),
+    )
+        .map { it.resolve("bin") }
+        .firstOrNull { executableIn(it) }
+        ?.also { logger.info("[go] go is not on the daemon's PATH; using $it") }
+}
+val goToolPath: String = goToolBinDir
+    ?.resolve(if (isWindowsHost) "go.exe" else "go")
+    ?.takeIf { it.isFile }?.absolutePath ?: "go"
+
+val goVersion = providers.of(ToolProbe::class) {
+    parameters.command.set(listOf(goToolPath, "version"))
+    parameters.workingDir.set(file("go"))
+    parameters.environment.put("GOTOOLCHAIN", "local")
+}.get()
+val goAvailable = Regex("""go version go\d+\.\d+""").containsMatchIn(goVersion)
+/** go/go.mod's `go` directive — the toolchain the module requires ("" when the
+ *  file or line is missing, in which case the local toolchain is taken as good). */
+val goModVersion = runCatching {
+    Regex("""(?m)^go (\d+\.\d+(?:\.\d+)?)""").find(file("go/go.mod").readText())
+        ?.groupValues?.get(1) ?: ""
+}.getOrDefault("")
+/** Triple-wise numeric compare (a local `go1.26.x` against a required `1.27.3`). */
+fun goVersionAtLeast(local: String, want: String): Boolean {
+    if (want.isEmpty()) return true
+    fun tri(s: String) = (s.removePrefix("go").split('.') + listOf("0", "0", "0"))
+        .take(3).map { it.takeWhile(Char::isDigit).toIntOrNull() ?: 0 }
+    val l = tri(local); val w = tri(want)
+    for (i in 0..2) if (l[i] != w[i]) return l[i] > w[i]
+    return true
+}
+val goLocalVersion = Regex("""go version (go\d+\.\d+(?:\.\d+)?)""").find(goVersion)
+    ?.groupValues?.get(1) ?: ""
+val goVersionUsable = goVersionAtLeast(goLocalVersion, goModVersion)
+// Portable-blst CGO flags, ONE definition (the task's environment() and its
+// declared input must never disagree).
+val goCgoCflags = "-O2 -D__BLST_PORTABLE__"
+
+val goEngineLibName = when {
+    isWindowsHost -> "myotis_engine_go.dll"
+    System.getProperty("os.name").lowercase().contains("mac") -> "libmyotis_engine_go.dylib"
+    else -> "libmyotis_engine_go.so"
+}
+
+tasks.register<Exec>("goBuildCShared") {
+    group = "go"
+    description = "go build -buildmode=c-shared for the Go engine (self-skips when go is" +
+        " missing or older than go/go.mod's line, deleting any previously built library" +
+        " it can no longer keep current; a FAILED cgo build degrades to a warning," +
+        " keeping the JVM build untouched; builds the portable blst, never a newer toolchain)"
+    onlyIf {
+        // A SKIP is a stale-library risk, so it gets the same treatment as a
+        // failed build below (PR #832 round-4 review): every consumer gates on
+        // the library's EXISTENCE alone (app-desktop's run task, the
+        // `go/build` entry in :app:run's java.library.path, this module's test
+        // doFirst), so once a library exists and this gate later turns false,
+        // -Pengine=go and the native-backed tests run the OLD bytes against
+        // NEW sources — and the ABI handshake cannot tell (it is 57 across a
+        // go-ethereum bump like #838, which changes only go.mod/go.sum). So:
+        // delete what this run cannot rebuild, and say so in the note. Both
+        // notes print at the moment the task would have run, never per
+        // configuration phase; the missing-`go` case used to print nothing.
+        val willRun = goAvailable && goVersionUsable
+        if (!willRun) {
+            val why = if (!goAvailable) {
+                "[go] goBuildCShared skipped: no go toolchain found (PATH, /usr/local/go/bin," +
+                    " \$GOROOT/bin or ~/go/bin)."
+            } else {
+                "[go] goBuildCShared skipped: local $goLocalVersion is older than" +
+                    " go/go.mod's `go $goModVersion` and the task builds with GOTOOLCHAIN=local" +
+                    " (it never downloads a toolchain); install $goModVersion — CI gets it from" +
+                    " setup-go — to build the Go engine on this host."
+            }
+            val lib = file("go/build/$goEngineLibName")
+            val removed = if (lib.exists()) {
+                lib.delete()
+                " Deleted the previously built $lib so it cannot serve sources it was not" +
+                    " built for (the next run with a usable toolchain rebuilds it)."
+            } else {
+                ""
+            }
+            logger.lifecycle(why + removed)
+        }
+        willRun
+    }
+    workingDir = file("go")
+    commandLine(goToolPath, "build", "-buildmode=c-shared", "-o", "build/$goEngineLibName", "./cmd/myotis-capi")
+    // Portable blst, like the Rust workspace builds it (#734 D3); go-engine.yml
+    // switched to it in the same PR that added it here (PR #832 review — it
+    // built bare before). The blst Go binding compiles ADX paths on amd64 and
+    // its load-time constructor answers SIGILL with _exit(128+4) = 132 (SIGILL
+    // is 4, not 11) — on a pre-Broadwell/pre-Zen CPU that would EXIT the JVM
+    // inside GoEngineNative's static initializer, past every
+    // UnsatisfiedLinkError handler here. The binding's own README names this
+    // switch. Exec.environment is @Internal to Gradle, so the value is ALSO
+    // declared as a task input below — editing it rebuilds.
+    environment("CGO_CFLAGS", goCgoCflags)
+    // Same never-fetch discipline as the probe: the pinned toolchain is an
+    // explicit host requirement (go/go.mod's `go` line), not a build-time
+    // download hidden in a task.
+    environment("GOTOOLCHAIN", "local")
+    // Unlike cargoBuildHost (where a cargo probe implies a working toolchain),
+    // `go` present does NOT imply `-buildmode=c-shared` works: cgo needs a C
+    // compiler (absent on many plain-Go Windows boxes) and the first build may
+    // need module downloads (offline). A hard failure there would take down
+    // `:app:run`/`:app-desktop:run` on hosts that never touch the Go engine —
+    // so the exit code degrades to a loud warning and the engine reports
+    // itself unavailable at load (the loader's UnsatisfiedLinkError path).
+    // Correctness of the Go tree stays CI's job (go-engine.yml builds and
+    // tests it unconditionally); a -Pengine=go run on such a box fails with
+    // the loader's named error, not silently.
+    isIgnoreExitValue = true
+    doLast {
+        val exit = executionResult.get().exitValue
+        if (exit != 0) {
+            logger.warn("[go] goBuildCShared failed (exit {}) — the Go engine will report itself"
+                    + " unavailable and the JVM build continues. A -buildmode=c-shared build needs"
+                    + " a C compiler (cgo) and, on first run, module downloads.", exit)
+            // A failed `go build` can leave the PREVIOUS library untouched (go
+            // writes the output only at the end) — which, combined with the
+            // up-to-date check below, would silently keep a stale lib serving
+            // the host after a source change. Delete what a failed build did
+            // not rewrite, so the next run (or the loader's ABI handshake) sees
+            // the truth, not last week's bytes (PR #832 review).
+            delete(file("go/build/$goEngineLibName"), file("go/build/myotis_engine_go.lib"))
+        }
+    }
+    // Source allowlist, not "everything under go/": READMEs, docs and the test
+    // fixtures' churn must not force a rebuild, and a broad tree drags in
+    // everything the exclude list forgets. The C header lives OUTSIDE go/
+    // (go/cmd/myotis-capi/main.go #includes ../../../rust/include/…), so it is
+    // an input too — an ABI-header change must rebuild the library.
+    inputs.files(
+        fileTree("go") { include("**/*.go", "go.mod", "go.sum") },
+        file("rust/include/myotis_engine.h"),
+    ).withPathSensitivity(PathSensitivity.RELATIVE)
+    // Toolchain identity is an input, as for cargoBuildHost: a go upgrade with
+    // unchanged sources must rebuild.
+    inputs.property("goVersion", goVersion)
+    // Exec.environment is @Internal — NOT a Gradle input — so the portable-blst
+    // flag would otherwise be invisible to the up-to-date check; declared as a
+    // property, editing it in this file rebuilds (PR #832 round-3 review).
+    inputs.property("cgoCflags", goCgoCflags)
+    // c-shared emits an import library next to the DLL on Windows; declared so
+    // the up-to-date check sees it (missing outputs are tolerated on the other
+    // platforms and on a degraded build).
+    outputs.files(buildList {
+        add(file("go/build/$goEngineLibName"))
+        if (isWindowsHost) add(file("go/build/myotis_engine_go.lib"))
+    })
+    // NO `outputs.upToDateWhen { lib.exists() }` (PR #832 round 2 added one to
+    // retry the build once a missing cgo toolchain shows up; round 3 removed
+    // it after measuring on the pinned Gradle): the predicate is only consulted
+    // when the inputs already look unchanged, so it never forced anything — an
+    // edited .go file rebuilt WITH it in place, and a deleted library rebuilt
+    // WITHOUT it (a missing declared output is out-of-date on its own). The
+    // inputs/outputs declarations above carry the whole policy; the
+    // `engineLibPresent` input property this measurement also tried was
+    // dropped for the same reason (a missing output already forces a rerun).
 }
 
 // Regenerate the UniFFI Kotlin bindings for the Rust engine into :myotis-engine-rust's

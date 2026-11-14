@@ -287,6 +287,19 @@ class DesktopNodeController(
         // back to Java with a log, so a host without the native library still boots.
         // Applies to networks (re)started afterwards — live ones keep their engine
         // (reboot the network from Settings to switch it).
+        // A startup `-Dmyotis.engine=go` (the desktop-only Go engine) survives
+        // this: "go" is a launch-time choice the Settings toggle cannot express,
+        // and silently rewriting it to auto here would quietly route the Go
+        // experiment back to Rust/Java (owner's brief, 2026-11 — the Bee
+        // direction). java|auto toggling is unaffected. Surfaced, not silently
+        // ignored (apply-or-refuse): the persisted toggle stays truthful for the
+        // next launch WITHOUT the flag — which is when it applies again.
+        if (Engines.choice() == "go") {
+            log.info("[engines] this run started with -Dmyotis.engine=go: the engine setting"
+                    + " (currently {}) does not apply to it — it applies again on a launch"
+                    + " without the flag", if (settings.preferJavaEngine()) "java" else "auto")
+            return
+        }
         Engines.select(if (settings.preferJavaEngine()) "java" else "auto")
     }
 
@@ -469,6 +482,22 @@ class DesktopNodeController(
         // silently-unsupported build is visible. Unlike the engine choice, the Tor flag is
         // LIVE — ElReader checks it per read, so a flip takes effect on the next read of an
         // already-running Rust-engine network (no restart needed).
+        //
+        // Under a `-Dmyotis.engine=go` launch the flag has no engine to be live on
+        // (the Go engine has no Tor — capabilities.tor false, PR #832 review):
+        // pushing it would report success while account reads leave from the real
+        // IP, the accepted-and-ignored privacy switch. Surface it like
+        // applyEngineChoice does; the setting applies again on a launch without
+        // the flag. (The Settings row's enabled state is the broader UI fix and
+        // belongs with the engine-parity step's capability surfacing.)
+        if (Engines.choice() == "go") {
+            if (settings.torEnabled()) {
+                log.warn("[desktop] Tor routing is saved but this run is the Go engine,"
+                        + " which has no Tor: account reads leave from this host's real IP."
+                        + " The setting applies again on a launch without -Dmyotis.engine=go")
+            }
+            return
+        }
         val on = settings.torEnabled()
         val supported = Tor.select(on)
         if (on && !supported) {

@@ -233,8 +233,9 @@ public final class Main {
         }
 
         // The selector replaces the old `new JavaMyotisEngine()` composition-root line:
-        // -Dmyotis.engine=java|rust|auto picks the engine (default auto — Rust where it
-        // can serve, Java fallback; `./gradlew :app:run -Pengine=java` passes it through).
+        // -Dmyotis.engine=java|rust|go|auto picks the engine (default auto — Rust where it
+        // can serve, Java fallback; `./gradlew :app:run -Pengine=java` passes it through;
+        // `go` is the desktop-only Go engine, explicit choice only).
         MyotisEngine engine = Engines.engine();
 
         // Client commands / purge target a single network — the first listed. Canonicalize

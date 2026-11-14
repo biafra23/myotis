@@ -39,6 +39,17 @@ app/peers.cache
 # Go engine: runtime data dirs (nodekey = the secp256k1 secret + enode leveldb)
 # and the binary a plain `go build ./cmd/myotis-go` drops next to it.
 /go/data/
+/go/build/
+# The Go engine's data-dir layout wherever a HOST points it (the daemon's working
+# dir under :app:run, the desktop's data dir): nodekey = the secp256k1 secret,
+# nodedb/ = the discv4 enode leveldb. PR #832 review: a smoke run's artifacts got
+# committed because these were only ignored under /go/.
+nodekey
+nodedb/
+# …but not the Go source package of that name (PR #832 review: an unanchored
+# `nodekey` ignores the whole directory, so new files there vanish from
+# `git status`/`git add -A` — the exact failure that committed the key).
+!/go/internal/nodekey/
 /go/myotis-go-data/
 /go/myotis-go
 /go/myotis-lc

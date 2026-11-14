@@ -1,4 +1,4 @@
-package io.myotis.engines.rust;
+package io.myotis.engines.common;
 
 import io.myotis.api.NodeLifecycle;
 import io.myotis.api.NodeStatusReads;
@@ -10,12 +10,14 @@ import java.io.IOException;
 import java.util.List;
 
 /**
- * The loopback JSON-RPC listener a host attaches to one Rust-hosted network — a
- * PORT, so this module carries no HTTP server: the engine library (the Android AAR,
- * the desktop jar) ships the engine without the listener (owner's request,
+ * The loopback JSON-RPC listener a host attaches to one engine-hosted network — a
+ * PORT, so the engine modules carry no HTTP server: the engine library (the Android
+ * AAR, the desktop jar) ships the engine without the listener (owner's request,
  * 2026-10-15), and the {@code :myotis-engines} selector supplies the Ktor one the
  * JVM hosts have always had ({@code KtorLoopbackRpc} there, over
- * {@code jsonrpc-server}). A handle created with no listener answers
+ * {@code jsonrpc-server}). It lives in :myotis-engine-common so both engine
+ * wrappers ({@code :myotis-engine-rust}, {@code :myotis-engine-go}) share it
+ * without depending on each other. A handle created with no listener answers
  * {@link io.myotis.api.ChainHandle#reads()} in-process once started and judges no
  * web origin ({@link #setWebAccessPolicy} has nothing to install on).
  *

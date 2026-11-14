@@ -5,7 +5,7 @@ import io.myotis.api.NodeStatusReads;
 import io.myotis.api.VerifiedReads;
 import io.myotis.api.WebAccessPolicy;
 import io.myotis.api.WebOrigin;
-import io.myotis.engines.rust.LoopbackRpc;
+import io.myotis.engines.common.LoopbackRpc;
 import io.myotis.jsonrpc.MyotisRpc;
 import io.myotis.jsonrpc.MyotisRpcServer;
 import io.myotis.jsonrpc.WebAccess;

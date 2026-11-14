@@ -42,6 +42,16 @@ jobs:
     permissions:
       contents: read
 
+    # Portable blst, like the Gradle task (goBuildCShared) and the Rust
+    # workspace build it (#734 D3): the blst Go binding compiles ADX paths on
+    # amd64, and its load-time constructor answers SIGILL with _exit(132) —
+    # which would KILL whatever process dlopens the c-shared library, on a
+    # pre-Broadwell/pre-Zen machine, past every UnsatisfiedLinkError handler.
+    # Job-level so `go test -race` exercises the same object code the artifact
+    # ships (PR #832 round-3 review — this workflow built bare before).
+    env:
+      CGO_CFLAGS: "-O2 -D__BLST_PORTABLE__"
+
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

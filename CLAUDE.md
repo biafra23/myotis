@@ -51,6 +51,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ./gradlew cargoBuildNoStd  # no_std canary: cargo build -p myotis-core --no-default-features for x86_64-unknown-none (part of `check`; self-skips without that rustup target)
 ./gradlew cargoNdkAndroid  # Android jniLibs, built from source (needs cargo-ndk + NDK + Android rustup targets)
 
+# Go engine (go/ — the desktop-only third engine, :myotis-engine-go). OPTIONAL
+# like the Rust block: without the go toolchain goBuildCShared self-skips. The
+# daemon/desktop run tasks depend on it (and only load the result when
+# -Pengine=go routes it).
+./gradlew goBuildCShared   # go build -buildmode=c-shared -> go/build/libmyotis_engine_go.so
+./gradlew :app:run -Pengine=go   # daemon on the Go engine (mainnet only; go-engine.yml CI)
+
 # The Android engine library (:myotis-engine, the AAR the Android app consumes)
 # builds the Rust engine FROM SOURCE by default — cargo + the pinned cargo-ndk and
 # NDK (gradle/libs.versions.toml) +
@@ -119,21 +126,49 @@ Key Gradle modules:
   macOS only (disabled elsewhere), so
   `engine-library.yml` stages it on a macOS runner and merges it into the set.
 - **myotis-engines** — the engine SELECTOR (`Engines`/`SelectorEngine`): hosts'
-  composition roots call `Engines.engine()`; `myotis.engine=java|rust|auto` routes
-  each network (re)start to the Java engine (node-core) or the Rust one.
+  composition roots call `Engines.engine()`; `myotis.engine=java|rust|go|auto`
+  routes each network (re)start to the Java engine (node-core), the Rust one,
+  or (explicitly only — `auto` never picks it) the Go one.
+- **myotis-engine-go** — the GO engine behind the contract (`GoMyotisEngine`/
+  `GoChainHandle`/`GoVerifiedReads`): `go/cmd/myotis-capi`'s c-shared library
+  (the same `rust/include/myotis_engine.h` ABI the Rust engine exports) over
+  plain JNA interface mapping (`GoEngineNative`, lazy symbol resolution; root task `goBuildCShared`,
+  self-skips without the go toolchain, deleting a stale library rather than
+  letting existence alone keep it in force; `-Dmyotis.engine.go.lib` override).
+  Desktop-only and select-only, never `auto` (owner's brief, 2026-11: the
+  Bee-integration engine, to be used before it is embedded deeper). Mainnet
+  only until the multichain step; reads ONLY at the finalized anchor (`latest`
+  is refused, never answered from finalized state, and `eth_blockNumber` answers
+  the finalized block — an open owner decision; storage positions only below
+  2^64, the ABI's int64 slot — ≥2^63 crosses as two's complement, pinned by
+  test); no idle sleep, EVM, block/
+  tx reads, ENS, broadcast or Tor yet — each refused by name, not faked (the
+  GoChainHandle class doc is the list; JSON-string reads carry the permanent
+  -32602 envelope, typed reads the retryable null). A `-Pengine=go` desktop
+  launch runs on its own `~/.myotis-go` profile (the shrunken catalog would
+  otherwise prune the shared settings' other networks). Java 17, depends on
+  nothing from the
+  Java engine; like `:myotis-engine-rust` it carries no HTTP server and takes
+  the loopback listener through the shared `LoopbackRpc` port
+  (`:myotis-engine-common`, which hosts it precisely so neither engine module
+  depends on the other). `goBuildCShared` builds portable blst and with
+  `GOTOOLCHAIN=local` (skips with a note on an old toolchain; CI's Build and
+  Test installs the pinned one via setup-go). go/README.md §Desktop embed.
 - **myotis-engine-rust** — the RUST engine behind the contract on its own
   (`RustMyotisEngine`/`RustChainHandle`/`RustVerifiedReads`/`RustEnsApi`, the Tor
   seam): `rust/myotis-engine` over UniFFI-generated Kotlin bindings + JNA (committed
   in this module, regenerated via `uniffiGenerateKotlin`; compound values as JSON
   pinned by golden tests both sides). Java 17, and it depends on nothing from the
   Java engine and carries no HTTP server: the loopback JSON-RPC listener is a PORT
-  (`LoopbackRpc`). The selector fills it with the Ktor server (`KtorLoopbackRpc` in
+  (`LoopbackRpc`, in `:myotis-engine-common`). The selector fills it with the Ktor server (`KtorLoopbackRpc` in
   `:myotis-engines`), so the daemon, the desktop app and the Android app keep the
   listener they always had; an in-process consumer of the engine library (the
   Android AAR's wallet) constructs the engine with no factory and gets a handle that
   answers `reads()` in-process with nothing listening.
 - **myotis-engine-common** — the lifecycle primitives both engines' handles wire
-  (`WakeGate`, `SleepMetrics`); Java 17 over `:myotis-api` and slf4j.
+  (`WakeGate`, `SleepMetrics`) and the shared `LoopbackRpc` listener PORT (moved
+  out of `:myotis-engine-rust` when `:myotis-engine-go` needed it too, so
+  neither engine module depends on the other); Java 17 over `:myotis-api` and slf4j.
 - **myotis-engine-ports** — the engine library's DEFAULT port actuals
   (`io.myotis.engine.ports`): the node-key file, the file-backed EL and CL peer
   caches, the `HttpURLConnection` CCIP-Read gateway and the per-network file
@@ -250,7 +285,7 @@ Key Gradle modules:
 - **Hosts talk ONLY to `:myotis-api`** (`MyotisEngine`/`ChainHandle`): host runtime
   paths in the daemon, desktop, and Android don't import engine internals
   (node-core/networking/consensus types). Composition roots use the `:myotis-engines`
-  selector (`Engines.engine()`; `myotis.engine=java|rust|auto`, default auto —
+  selector (`Engines.engine()`; `myotis.engine=java|rust|go|auto`, default auto —
   `-Pengine=…` on run tasks), which routes to the Java engine (node-core) or the
   Rust engine (rust/myotis-engine via UniFFI + JSON). The engine library's default
   port actuals (`io.myotis.engine.ports`, `:myotis-engine-ports` — `Myotis.defaultPorts`)
