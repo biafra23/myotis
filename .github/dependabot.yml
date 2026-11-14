@@ -112,6 +112,18 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    ignore:
+      # k256 0.14 is held (owner's decision, 2026-11-14, #834). Only
+      # myotis-core pins k256 directly; alloy, revm, discv5 (via enr) and
+      # libp2p-identity stay on 0.13, so moving myotis-core alone would ship a
+      # second copy of the elliptic-curve stack (19 crates: ecdsa 0.17,
+      # elliptic-curve 0.14, crypto-bigint 0.7, ...) and give the node key a
+      # different secp256k1 implementation than the networking stack, for no
+      # gain. Lift this when those crates move to 0.14. For a 0.x crate
+      # 0.13 -> 0.14 is a semver-minor update to Dependabot, so minor and major
+      # are ignored and 0.13.x patches still arrive.
+      - dependency-name: "k256"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
     groups:
       cargo-patch:
         update-types: ["patch"]
