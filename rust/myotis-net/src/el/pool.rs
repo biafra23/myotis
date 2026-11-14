@@ -478,6 +478,37 @@ fn ladder_order(keys: &[LadderKey]) -> Vec<usize> {
     order
 }
 
+/// [`ladder_order`] with each tier in a per-address order: within one
+/// [`LadderKey`], the heavier [`affinity_weight`] first (rendezvous hashing:
+/// a peer joining or leaving the pool moves only the addresses whose top
+/// peer it is). Pure, pinned by tests.
+fn affine_ladder_order(keys: &[LadderKey], weights: &[u64]) -> Vec<usize> {
+    debug_assert_eq!(keys.len(), weights.len());
+    let mut order: Vec<usize> = (0..keys.len()).collect();
+    order.sort_by_key(|&i| (keys[i], std::cmp::Reverse(weights[i])));
+    order
+}
+
+/// The pool's secret salt for [`affinity_weight`], from its node key under a
+/// domain tag: never the key itself, and nothing a peer can derive.
+fn affinity_salt_of(key: &NodeKey) -> [u8; 32] {
+    let mut secret = key.secret_bytes();
+    let salt = myotis_core::keccak::keccak256_concat(b"myotis/read-affinity/v1", &secret);
+    secret.fill(0);
+    salt
+}
+
+/// How strongly `address` prefers the peer `node`: the first 8 bytes of
+/// `keccak(salt ‖ address ‖ node)`. Keyed, so a peer cannot tell from its own
+/// node id which addresses it would be first for.
+fn affinity_weight(salt: &[u8; 32], address: &[u8; 20], node: &[u8; 64]) -> u64 {
+    let mut input = [0u8; 20 + 64];
+    input[..20].copy_from_slice(address);
+    input[20..].copy_from_slice(node);
+    let h = myotis_core::keccak::keccak256_concat(salt, &input);
+    u64::from_le_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]])
+}
+
 /// Pure: whether a peer is spared an eviction as the pool's one BAL server
 /// (#691) — BALs are wanted, it served a verified one within
 /// [`BAL_SHIELD_FOR`], and no other pooled peer did. One peer at most, so a
@@ -638,6 +669,11 @@ impl QualityOutcome {
 struct PoolInner {
     tasks: super::tasks::Tasks,
     key: Arc<NodeKey>,
+    /// The secret salt of [`PeerPool::snap_peers_for`]'s per-address order,
+    /// derived from the node key: it lives exactly as long as the identity
+    /// peers already see (kept across a pause, new after a stop), and nobody
+    /// who lacks the key can compute which peer an address goes to.
+    affinity_salt: [u8; 32],
     /// Every RLPx session this pool dials counts its bytes here (EL layer).
     traffic: Arc<crate::traffic::TrafficMeter>,
     local_pubkey: [u8; 64],
@@ -1618,8 +1654,10 @@ impl PeerPool {
         }
         let mut cache = cache;
         let tor_reserve = load_tor_reserve(&mut cache, &boot_enodes);
+        let affinity_salt = affinity_salt_of(&key);
         let inner = Arc::new(PoolInner {
             tasks: super::tasks::Tasks::default(),
+            affinity_salt,
             key,
             local_pubkey,
             cfg,
@@ -1737,6 +1775,40 @@ impl PeerPool {
             .map(|p| LadderKey::new(p.is_benched(now), p.peer.coverage(), p.unproven()))
             .collect();
         ladder_order(&keys)
+            .into_iter()
+            .map(|i| Arc::clone(&newest_first[i].peer))
+            .collect()
+    }
+
+    /// [`Self::snap_peers`] for a read that names `address` (an account read,
+    /// a storage read about it or about its holder, a proof of it): the same
+    /// tiers in the same order — health first, so a read never trades a
+    /// serving peer for privacy — but within each tier the peers in this
+    /// address's own order, by a keyed hash of the address and the peer's
+    /// node id ([`affinity_weight`]).
+    ///
+    /// Why (punicus #253, WalletBeat's *multi-address correlation*): with the
+    /// plain ladder every address of the wallet goes to the same first peer,
+    /// within milliseconds, so that one peer links them all. In the address's
+    /// own order each healthy peer is the first for about 1/P of the addresses,
+    /// and the same address keeps going to the same peers (its hedges
+    /// included) while they stay pooled, so what any peer learns over time is
+    /// its own share rather than the whole set. It does not unlink the reads
+    /// from this node's IP or its node key; Tor mode does that.
+    pub async fn snap_peers_for(&self, address: &[u8; 20]) -> Vec<Arc<ManagedPeer>> {
+        self.inner.prune_closed().await;
+        let now = Instant::now();
+        let peers = self.inner.peers.lock().await;
+        let newest_first: Vec<&PooledPeer> = peers.iter().rev().collect();
+        let keys: Vec<LadderKey> = newest_first
+            .iter()
+            .map(|p| LadderKey::new(p.is_benched(now), p.peer.coverage(), p.unproven()))
+            .collect();
+        let weights: Vec<u64> = newest_first
+            .iter()
+            .map(|p| affinity_weight(&self.inner.affinity_salt, address, &p.peer.peer_pubkey()))
+            .collect();
+        affine_ladder_order(&keys, &weights)
             .into_iter()
             .map(|i| Arc::clone(&newest_first[i].peer))
             .collect()
@@ -4095,6 +4167,109 @@ mod tests {
                 assert!(attempted || backed_off, "{addr} was offered to the dialer");
             }
             pool.stop().await;
+        }
+    }
+
+    /// The per-address read order (punicus #253): tiers as the plain ladder,
+    /// a keyed per-address order within each, spread over the pool.
+    mod read_affinity {
+        use super::super::{
+            affine_ladder_order, affinity_salt_of, affinity_weight, ladder_order, Coverage, LadderKey,
+        };
+        use myotis_core::nodekey::NodeKey;
+
+        fn node(i: u8) -> [u8; 64] {
+            let mut n = [0u8; 64];
+            n[0] = i;
+            n[63] = i.wrapping_mul(31);
+            n
+        }
+
+        fn address(i: u16) -> [u8; 20] {
+            let mut a = [0u8; 20];
+            a[..2].copy_from_slice(&i.to_be_bytes());
+            a
+        }
+
+        const SALT: [u8; 32] = [7u8; 32];
+
+        #[test]
+        fn tiers_keep_the_plain_ladders_order() {
+            // A behind peer stays last and a benched one behind the healthy,
+            // whatever the weights say: health first, privacy within a tier.
+            let keys = [
+                LadderKey::new(false, Coverage::Behind, false),
+                LadderKey::new(true, Coverage::Covers, false),
+                LadderKey::new(false, Coverage::Covers, false),
+            ];
+            assert_eq!(affine_ladder_order(&keys, &[u64::MAX, u64::MAX, 0]), vec![2, 1, 0]);
+            assert_eq!(affine_ladder_order(&keys, &[0, 0, 0]), ladder_order(&keys));
+        }
+
+        #[test]
+        fn within_a_tier_the_heavier_weight_leads() {
+            let keys = [LadderKey::new(false, Coverage::Covers, false); 3];
+            assert_eq!(affine_ladder_order(&keys, &[1, 3, 2]), vec![1, 2, 0]);
+        }
+
+        #[test]
+        fn the_same_address_keeps_its_order_and_others_spread_over_the_pool() {
+            let nodes: Vec<[u8; 64]> = (0..8).map(node).collect();
+            let keys = [LadderKey::new(false, Coverage::Covers, false); 8];
+            let first = |a: &[u8; 20]| {
+                let w: Vec<u64> = nodes.iter().map(|n| affinity_weight(&SALT, a, n)).collect();
+                affine_ladder_order(&keys, &w)[0]
+            };
+            // Stable: one address goes to the same peer read after read.
+            assert_eq!(first(&address(1)), first(&address(1)));
+            // Spread: 400 addresses over 8 peers, every peer first for some
+            // and none for more than a fair share's double (expected 50).
+            let mut counts = [0usize; 8];
+            for i in 0..400 {
+                counts[first(&address(i))] += 1;
+            }
+            assert!(counts.iter().all(|&c| c > 0 && c < 100), "uneven spread: {counts:?}");
+        }
+
+        #[test]
+        fn a_peer_leaving_moves_only_the_addresses_it_led() {
+            // Rendezvous hashing: dropping peer 0 changes the first peer only
+            // of the addresses peer 0 was first for.
+            let nodes: Vec<[u8; 64]> = (0..6).map(node).collect();
+            let top = |a: &[u8; 20], pool: &[[u8; 64]]| -> [u8; 64] {
+                *pool.iter().max_by_key(|n| affinity_weight(&SALT, a, n)).unwrap()
+            };
+            for i in 0..200 {
+                let a = address(i);
+                let before = top(&a, &nodes);
+                if before != nodes[0] {
+                    assert_eq!(top(&a, &nodes[1..]), before);
+                }
+            }
+        }
+
+        #[test]
+        fn the_order_depends_on_the_secret_salt() {
+            let nodes: Vec<[u8; 64]> = (0..8).map(node).collect();
+            let order = |salt: &[u8; 32], a: &[u8; 20]| -> Vec<usize> {
+                let keys = [LadderKey::new(false, Coverage::Covers, false); 8];
+                let w: Vec<u64> = nodes.iter().map(|n| affinity_weight(salt, a, n)).collect();
+                affine_ladder_order(&keys, &w)
+            };
+            let other = [8u8; 32];
+            assert!(
+                (0..20).any(|i| order(&SALT, &address(i)) != order(&other, &address(i))),
+                "a peer could compute the order without the salt"
+            );
+        }
+
+        #[test]
+        fn the_salt_is_derived_from_the_node_key_and_is_not_the_key() {
+            let a = NodeKey::from_secret_bytes(&[1u8; 32]).unwrap();
+            let b = NodeKey::from_secret_bytes(&[2u8; 32]).unwrap();
+            assert_eq!(affinity_salt_of(&a), affinity_salt_of(&a));
+            assert_ne!(affinity_salt_of(&a), affinity_salt_of(&b));
+            assert_ne!(affinity_salt_of(&a), a.secret_bytes());
         }
     }
 

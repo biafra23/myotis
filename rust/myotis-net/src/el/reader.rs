@@ -1588,6 +1588,64 @@ mod rotated_take_tests {
     }
 }
 
+/// The address a call is about, for its oracle's peer order (punicus #253):
+/// its sender when it names one, else the one argument of a call that takes
+/// exactly one address (`balanceOf(holder)`, `nonces(owner)`, …: a 4-byte
+/// selector and one word whose top 12 bytes are zero), else `None` — the
+/// plain ladder. The zero address (a from-less call's sender) names nobody.
+pub(crate) fn call_affinity(from: Option<[u8; 20]>, data: &[u8]) -> Option<[u8; 20]> {
+    let names = |a: &[u8; 20]| *a != [0u8; 20];
+    if let Some(from) = from.filter(names) {
+        return Some(from);
+    }
+    let word = data.get(4..)?;
+    if word.len() != 32 || word[..12].iter().any(|&b| b != 0) {
+        return None;
+    }
+    let mut arg = [0u8; 20];
+    arg.copy_from_slice(&word[12..]);
+    names(&arg).then_some(arg)
+}
+
+#[cfg(test)]
+mod call_affinity_tests {
+    use super::call_affinity;
+
+    fn one_address_call(selector: [u8; 4], a: [u8; 20]) -> Vec<u8> {
+        let mut d = selector.to_vec();
+        d.extend_from_slice(&[0u8; 12]);
+        d.extend_from_slice(&a);
+        d
+    }
+
+    #[test]
+    fn a_named_sender_is_the_affinity() {
+        let data = one_address_call([0x70, 0xa0, 0x82, 0x31], [2u8; 20]);
+        assert_eq!(call_affinity(Some([1u8; 20]), &data), Some([1u8; 20]));
+    }
+
+    #[test]
+    fn a_from_less_balance_of_goes_by_its_holder() {
+        let data = one_address_call([0x70, 0xa0, 0x82, 0x31], [2u8; 20]);
+        assert_eq!(call_affinity(None, &data), Some([2u8; 20]));
+        assert_eq!(call_affinity(Some([0u8; 20]), &data), Some([2u8; 20]));
+    }
+
+    #[test]
+    fn anything_else_keeps_the_plain_ladder() {
+        // No argument, two words, a word that is not an address, the zero address.
+        assert_eq!(call_affinity(None, &[0x31, 0x3c, 0xe5, 0x67]), None);
+        let mut two = one_address_call([1, 2, 3, 4], [2u8; 20]);
+        two.extend_from_slice(&[0u8; 32]);
+        assert_eq!(call_affinity(None, &two), None);
+        let mut wide = one_address_call([1, 2, 3, 4], [2u8; 20]);
+        wide[4] = 1;
+        assert_eq!(call_affinity(None, &wide), None);
+        assert_eq!(call_affinity(None, &one_address_call([1, 2, 3, 4], [0u8; 20])), None);
+        assert_eq!(call_affinity(None, &[]), None);
+    }
+}
+
 /// Race `make(peer)` across `peers` with hedging: start the first, and every
 /// `delay` without an answer start one more (up to [`MAX_HEDGED_ATTEMPTS`] in
 /// flight), stopping at the first result `accept` approves. A slow peer keeps
@@ -6244,7 +6302,9 @@ impl ElReader {
             return self.get_account_over_tor(address).await;
         }
         let fin = self.finalized_anchor_for(anchor, "a finalized account read")?;
-        let peers = self.pool.snap_peers().await;
+        // This address's own peer order (punicus #253): the wallet's addresses
+        // spread over the pool instead of all reaching its first peer.
+        let peers = self.pool.snap_peers_for(&address).await;
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
         }
@@ -6920,7 +6980,10 @@ impl ElReader {
         storage_key: [u8; 32],
     ) -> Result<VerifiedStorage, String> {
         let fin = self.finalized_anchor_for(anchor, "a finalized storage read")?;
-        let peers = self.pool.snap_peers().await;
+        // The holder's peer order when the key names one (a token balance goes
+        // where the holder's own account read goes), else the contract's
+        // (punicus #253).
+        let peers = self.pool.snap_peers_for(holder.as_ref().unwrap_or(&address)).await;
         if peers.is_empty() {
             return Err("no snap peer available".to_string());
         }
@@ -7153,7 +7216,8 @@ impl ElReader {
             |n| recent.filter(|(m, _)| *m == n).map(|(_, root)| root),
             |hash| self.anchor.attested_block_of(hash),
         )?;
-        let peers = self.pool.snap_peers().await;
+        // This address's own peer order, as for an account read (punicus #253).
+        let peers = self.pool.snap_peers_for(&address).await;
         if peers.is_empty() {
             return Err(ProofError::Unavailable("no snap peer available".to_string()));
         }
@@ -7419,7 +7483,8 @@ impl ElReader {
         chain_id: u64,
         overrides: myotis_evm::overrides::StateOverrides,
     ) -> Result<CallAnswer, String> {
-        let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "eth_call").await?;
+        let affinity = call_affinity(from, &data);
+        let (ctx, executor) = self.evm_setup_at_for(anchor, chain_id, "eth_call", affinity).await?;
         let block_number = ctx.block_number;
         let state_root = ctx.state_root;
         // Run the SYNCHRONOUS executor off the runtime worker so the oracle's
@@ -7460,7 +7525,8 @@ impl ElReader {
         overrides: myotis_evm::overrides::StateOverrides,
     ) -> Result<CallAnswer, String> {
         let started = Instant::now();
-        let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "eth_call").await?;
+        let affinity = call_affinity(Some(tx.from), &tx.data);
+        let (ctx, executor) = self.evm_setup_at_for(anchor, chain_id, "eth_call", affinity).await?;
         let setup = started.elapsed();
         let block_number = ctx.block_number;
         let state_root = ctx.state_root;
@@ -7504,7 +7570,8 @@ impl ElReader {
         overrides: myotis_evm::overrides::StateOverrides,
     ) -> Result<GasOutcome, String> {
         let started = Instant::now();
-        let (ctx, executor) = self.evm_setup_at(anchor, chain_id, "estimateGas").await?;
+        let affinity = call_affinity(Some(tx.from), &tx.data);
+        let (ctx, executor) = self.evm_setup_at_for(anchor, chain_id, "estimateGas", affinity).await?;
         let setup = started.elapsed();
         let joined = super::request::blocking(move || {
             let joined = executor.estimate_tx(&tx, &ctx, overrides);
@@ -7671,7 +7738,7 @@ impl ElReader {
         if let Some(refused) = myotis_evm::ens_refusal(chain_id, Some(&name)) {
             return Err(refused.to_string());
         }
-        let (ctx, executor) = self.evm_setup(chain_id, "resolve-ens").await?;
+        let (ctx, executor) = self.evm_setup(chain_id, "resolve-ens", None).await?;
         let (block_number, block_timestamp) = (ctx.block_number, ctx.timestamp);
         let walk = super::request::blocking(move || {
             let caller = ExecutorCaller { executor: &executor, ctx: &ctx };
@@ -7858,9 +7925,23 @@ impl ElReader {
         chain_id: u64,
         what: &str,
     ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
+        self.evm_setup_at_for(anchor, chain_id, what, None).await
+    }
+
+    /// [`Self::evm_setup_at`] for a run about one address (`affinity`, see
+    /// [`call_affinity`]): its oracle takes the peers in that address's own
+    /// order ([`PeerPool::snap_peers_for`], punicus #253). `None` is the
+    /// plain read ladder.
+    async fn evm_setup_at_for(
+        &self,
+        anchor: ReadAnchor,
+        chain_id: u64,
+        what: &str,
+        affinity: Option<[u8; 20]>,
+    ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
         match anchor {
-            ReadAnchor::Head => self.evm_setup(chain_id, what).await,
-            ReadAnchor::Finalized => self.evm_setup_finalized(chain_id, what).await,
+            ReadAnchor::Head => self.evm_setup(chain_id, what, affinity).await,
+            ReadAnchor::Finalized => self.evm_setup_finalized(chain_id, what, affinity).await,
         }
     }
 
@@ -7878,7 +7959,7 @@ impl ElReader {
             ReadAnchor::Finalized => self.finalized_header(what).await?,
         };
         let ctx = block_context(&header, chain_id)?;
-        let (ctx, executor) = self.evm_executor_for(ctx, what, anchor == ReadAnchor::Finalized).await?;
+        let (ctx, executor) = self.evm_executor_for(ctx, what, anchor == ReadAnchor::Finalized, None).await?;
         Ok((hash, header, ctx, executor))
     }
 
@@ -7899,10 +7980,11 @@ impl ElReader {
         &self,
         chain_id: u64,
         what: &str,
+        affinity: Option<[u8; 20]>,
     ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
         let (_, header) = self.finalized_header(what).await?;
         let ctx = block_context(&header, chain_id)?;
-        self.evm_executor_for(ctx, what, true).await
+        self.evm_executor_for(ctx, what, true, affinity).await
     }
 
     /// The beacon-finalized execution block's verified header and its hash,
@@ -7951,10 +8033,11 @@ impl ElReader {
         &self,
         chain_id: u64,
         what: &str,
+        affinity: Option<[u8; 20]>,
     ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
         let (_, header) = self.head_header(what).await?;
         let ctx = block_context(&header, chain_id)?;
-        self.evm_executor_for(ctx, what, false).await
+        self.evm_executor_for(ctx, what, false, affinity).await
     }
 
     /// The executor half of the EVM setup: a fresh snap-peer snapshot + the
@@ -7966,8 +8049,9 @@ impl ElReader {
         ctx: myotis_evm::BlockContext,
         what: &str,
         finalized: bool,
+        affinity: Option<[u8; 20]>,
     ) -> Result<(myotis_evm::BlockContext, EvmExecutor), String> {
-        let oracle = self.snap_oracle(what, finalized).await?;
+        let oracle = self.snap_oracle(what, finalized, affinity).await?;
         // Bind the concrete Arc types first, then let the unsizing coercion to the
         // trait objects happen at the constructor call (a coercion directly on
         // `Arc::clone` would instead infer `Arc<dyn Trait>` and fail to type-check).
@@ -7978,9 +8062,19 @@ impl ElReader {
     }
 
     /// A verified-state oracle over a fresh snap-peer snapshot: one consistent
-    /// peer set for the whole call. `finalized` as for [`PoolOracle::new`].
-    async fn snap_oracle(&self, what: &str, finalized: bool) -> Result<Arc<PoolOracle>, String> {
-        let peers = self.pool.snap_peers().await;
+    /// peer set for the whole call. `finalized` as for [`PoolOracle::new`];
+    /// `affinity`, the address the run is about: that address's own peer
+    /// order ([`PeerPool::snap_peers_for`]), else the plain ladder.
+    async fn snap_oracle(
+        &self,
+        what: &str,
+        finalized: bool,
+        affinity: Option<[u8; 20]>,
+    ) -> Result<Arc<PoolOracle>, String> {
+        let peers = match affinity {
+            Some(address) => self.pool.snap_peers_for(&address).await,
+            None => self.pool.snap_peers().await,
+        };
         if peers.is_empty() {
             return Err(format!("no snap peer available for {what}"));
         }
@@ -8011,7 +8105,7 @@ impl ElReader {
             return Err("no verified head to record against".to_string());
         };
         let ctx = block_context(&header, chain_id)?;
-        let oracle = self.snap_oracle("the fixture recorder", false).await?;
+        let oracle = self.snap_oracle("the fixture recorder", false, None).await?;
         Ok((hash, ctx, oracle))
     }
 
