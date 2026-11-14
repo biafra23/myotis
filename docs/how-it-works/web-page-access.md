@@ -153,6 +153,19 @@ without a response, so the choice was made for us; what the page can learn is
 The recent list is **in memory only** — it is browsing history — and is never
 served over JSON-RPC (any local app could read it).
 
+## Request size and time limits
+
+Every POST body, from a page the gate admitted or from a native client, is read
+under the same limits as `rust/myotis-rpcd`'s (#667): at most **5 MiB** (geth's
+`--http` default, `RpcRequestBody.MAX_BYTES`), received within **10 s**
+(`RpcRequestBody.TIMEOUT_MS`). A `Content-Length` past the cap is answered
+`413 Payload Too Large` before a byte of the body is read; a chunked or
+unannounced body is read at most one byte past the cap, then refused the same
+way, so memory stays bounded whatever a client sends. A body that does not
+arrive in time is answered `408 Request Timeout`. Both close the connection and
+log the refusal (size, Host and Origin, never the body). The gate itself runs
+before the body is read, so a refused page never reaches these limits.
+
 ## What this does not cover
 
 Another native app on the device. `Origin` protects anything only because

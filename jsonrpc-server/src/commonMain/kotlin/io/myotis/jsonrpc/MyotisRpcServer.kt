@@ -12,7 +12,9 @@ import io.ktor.server.engine.connector
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.SupervisorJob
 import io.ktor.server.request.httpMethod
-import io.ktor.server.request.receiveText
+import io.ktor.server.request.contentCharset
+import io.ktor.server.request.receiveChannel
+import io.ktor.utils.io.charsets.Charsets
 import io.ktor.server.response.respond
 import io.ktor.server.response.respondBytesWriter
 import io.ktor.server.response.respondText
@@ -219,7 +221,37 @@ class MyotisRpcServer(
             routing {
                 get("/health") { call.respondText("ok") }
                 post("/") {
-                    val body = call.receiveText()
+                    // Bounded read (#667): a body past RpcRequestBody.MAX_BYTES is refused
+                    // with 413 (unread when Content-Length announces it), and one that does
+                    // not arrive within RpcRequestBody.TIMEOUT_MS with 408. receiveText()
+                    // buffered any body whole, so one multi-GB request could OOM the app.
+                    val req = call.request
+                    val read = readRequestBody(
+                        call.receiveChannel(),
+                        req.headers[HttpHeaders.ContentLength]?.toLongOrNull(),
+                        charset = req.contentCharset() ?: Charsets.UTF_8,
+                    )
+                    val body = when (read) {
+                        is BodyRead.Body -> read.text
+                        is BodyRead.TooLarge -> {
+                            rpcLogInfo(LOGGER, "[rpc] refused body over ${RpcRequestBody.MAX_BYTES} bytes: " +
+                                "content-length=${req.headers[HttpHeaders.ContentLength]} read=${read.bytes} " +
+                                "host=${req.headers[HttpHeaders.Host]} origin=${req.headers[HttpHeaders.Origin]}")
+                            call.response.headers.append(HttpHeaders.Connection, "close")
+                            call.respondText("Request body over ${RpcRequestBody.MAX_BYTES} bytes.\n",
+                                status = HttpStatusCode.PayloadTooLarge)
+                            return@post
+                        }
+                        BodyRead.TimedOut -> {
+                            rpcLogInfo(LOGGER, "[rpc] refused body not received within " +
+                                "${RpcRequestBody.TIMEOUT_MS} ms: host=${req.headers[HttpHeaders.Host]} " +
+                                "origin=${req.headers[HttpHeaders.Origin]}")
+                            call.response.headers.append(HttpHeaders.Connection, "close")
+                            call.respondText("Request body not received in time.\n",
+                                status = HttpStatusCode.RequestTimeout)
+                            return@post
+                        }
+                    }
                     // Heartbeat-streamed response: compute the answer concurrently and,
                     // while it's pending, trickle a whitespace byte every few seconds on
                     // the (chunked) response. JSON permits leading whitespace before the
