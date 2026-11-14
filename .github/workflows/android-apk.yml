@@ -432,26 +432,40 @@ jobs:
             --stacktrace
 
       - name: Adjudicate the device-side test verdict
+        # AGP 9 writes the device-side results as test-result.pb (binary) plus
+        # a JUnit TEST-<device>.xml next to it, where AGP 8 wrote
+        # test-result.textproto. The verdict is read from the XML; the .pb must
+        # exist beside it, as the sign the device side wrote its results (a run
+        # that never reached the device leaves neither).
         run: |
           set -eu
-          mapfile -t protos < <(find android-app/build/outputs/androidTest-results/managedDevice \
-            -name 'test-result.textproto' 2>/dev/null)
-          if [ "${#protos[@]}" -eq 0 ]; then
-            echo "::error::no test-result.textproto was written — the run produced no device-side verdict (infra/build failure; see the gradle step above)"
+          dir=android-app/build/outputs/androidTest-results/managedDevice
+          mapfile -t pbs < <(find "$dir" -name 'test-result.pb' 2>/dev/null)
+          mapfile -t xmls < <(find "$dir" -name 'TEST-*.xml' 2>/dev/null)
+          if [ "${#pbs[@]}" -eq 0 ] || [ "${#xmls[@]}" -eq 0 ]; then
+            echo "::error::no device-side results (test-result.pb + TEST-*.xml) were written — infra/build failure; see the gradle step above"
             exit 1
           fi
-          for p in "${protos[@]}"; do
-            if grep -qE 'test_status: (FAILED|ERROR|ABORTED|CANCELLED)' "$p"; then
-              echo "::error::device-side verdict is a failure in $p:"
-              grep -m1 -A12 'error_message' "$p" || true
-              exit 1
-            fi
-          done
+          python3 -I - "${xmls[@]}" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          cases = []
+          for path in sys.argv[1:]:
+              for tc in ET.parse(path).getroot().iter("testcase"):
+                  bad = [c.tag for c in tc if c.tag in ("failure", "error", "skipped")]
+                  cases.append((tc.get("classname", "") + "." + tc.get("name", ""), bad, tc, path))
+          for name, bad, tc, path in cases:
+              if bad:
+                  print(f"::error::device-side verdict for {name} is {bad[0]} ({path}):")
+                  for c in tc:
+                      if c.tag in ("failure", "error"):
+                          print((c.get("message") or "") + "\n" + (c.text or "")[:2000])
+                  sys.exit(1)
           # An empty or foreign suite must not pass as "our test was fine".
-          grep -q 'NodeBootSmokeTest' "${protos[@]}" \
-            || { echo "::error::NodeBootSmokeTest is missing from the device-side results"; exit 1; }
-          grep -q 'test_status: PASSED' "${protos[@]}" \
-            || { echo "::error::no PASSED verdict recorded"; exit 1; }
+          if not any(".NodeBootSmokeTest." in n for n, _, _, _ in cases):
+              print("::error::NodeBootSmokeTest is missing from the device-side results")
+              sys.exit(1)
+          print(f"{len(cases)} device-side test(s) passed")
+          PY
           if [ "${{ steps.gmd.outcome }}" != "success" ]; then
             echo "::warning title=UTP results transport failed::the gradle task failed only in the UTP results stream (known AGP/UTP gRPC bug, issue 335857362); the device-side verdict is PASSED"
           fi

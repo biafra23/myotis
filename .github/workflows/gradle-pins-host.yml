@@ -146,15 +146,25 @@ jobs:
           packages: platform-tools
 
       # -PskipRustEngine: no Android Rust toolchain needed to RESOLVE; it
-      # changes no dependency. Retried once for transient repository errors —
-      # a pin failure fails both attempts the same way.
+      # changes no dependency. Retried once for transient repository errors,
+      # NEVER for a pin failure: the first attempt warms the cache, and a
+      # second one on it no longer needs a parent POM or BOM the committed pins
+      # lack, so a retried pin failure could pass while a cold host fails
+      # (owner's decision, 2026-11-13, after #837's linux-x64 check went green
+      # on its retry over a missing junit-bom POM).
       - name: Check the committed pins on this host
         id: check
         continue-on-error: true
         run: |
           for attempt in 1 2; do
+            log="$RUNNER_TEMP/pins-check-$attempt.log"
             # shellcheck disable=SC2086 # EXTRA_TASKS is a task list
-            ./gradlew resolveAllDependencies $EXTRA_TASKS -PskipRustEngine --console=plain && exit 0
+            ./gradlew resolveAllDependencies $EXTRA_TASKS -PskipRustEngine --console=plain 2>&1 | tee "$log" \
+              && exit 0
+            if grep -qE 'Dependency pins do not match|failed verification|not part of the dependency lock state' "$log"; then
+              echo "::error::a pin failure on attempt $attempt: not retried (a warm cache would hide a missing pin)"
+              exit 1
+            fi
             echo "::warning::attempt $attempt failed; retrying in 20s"
             sleep 20
           done

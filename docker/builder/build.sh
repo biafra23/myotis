@@ -60,7 +60,8 @@ fi
 }
 for f in android-app/build.gradle.kts myotis-engine/build.gradle.kts ui/build.gradle.kts; do
     sdk=$(sed -n 's/^ *compileSdk *= *\([0-9]*\).*/\1/p' "$root/$f" | head -n1)
-    [[ "$sdk" == "$ANDROID_PLATFORM" ]] || {
+    # compileSdk = N names platform N.0 (the platform's own name from 36.1 on).
+    [[ "$sdk" == "$ANDROID_PLATFORM" || "$sdk.0" == "$ANDROID_PLATFORM" ]] || {
         echo "build.sh: $f has compileSdk $sdk, but pins.env's ANDROID_PLATFORM is $ANDROID_PLATFORM" >&2
         exit 1
     }

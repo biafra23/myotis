@@ -2,7 +2,6 @@ import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.compose.compiler)
 }
 
@@ -94,7 +93,7 @@ val derivedVersionCode: Int = rootProject.extra["releaseBuildNumber"] as Int
 
 android {
     namespace = "com.jaeckel.ethp2p.android"
-    compileSdk = 35
+    compileSdk = 37
     // Pinned exactly (#734): AGP strips the packaged .so files with this NDK's
     // llvm-strip (an unpinned NDK leaves them unstripped or strips them with
     // whatever is installed), and build-tools is the same version
@@ -245,11 +244,12 @@ android {
     }
 
     packaging {
-        // -PskipRustEngine: the engine library already keeps its jniLibs directory
-        // out of the build then (its source set is gated on the root's flag), so no
-        // libmyotis_*.so should reach this merge at all. This exclude is the second
-        // line, authoritative at the APK merge whatever a library-side mechanism
-        // covers: the APK the flag describes carries no Rust engine.
+        // -PskipRustEngine: the engine library already excludes libmyotis_*.so from
+        // its own packaging then (its jniLibs directory is always a source under
+        // the KMP Android plugin, so the gate is that exclude), and none should
+        // reach this merge. This exclude is the second line, authoritative at the
+        // APK merge whatever a library-side mechanism covers: the APK the flag
+        // describes carries no Rust engine.
         if (rootProject.extra["myotis.skipRustEngine"] as Boolean) {
             jniLibs {
                 excludes += setOf("**/libmyotis_engine.so", "**/libmyotis_bls.so")

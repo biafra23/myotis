@@ -17,13 +17,17 @@
 // The Android app's Rust-engine build contract used to live in android-app; it
 // lives here now, where the artifact is produced: requireAndroidRustEngine,
 // cargoNdkAndroid, uniffiGenerateKotlin and verifyAndroidJniLibs hang off this
-// module's preBuild (root build.gradle.kts owns the tasks), and -PskipRustEngine
+// module's androidPreBuild (root build.gradle.kts owns the tasks), and -PskipRustEngine
 // builds the AAR without the engine (the Myotis app then runs the Java engine,
 // API 33+ only — EngineGate).
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
-    alias(libs.plugins.android.library)
+    // AGP 9's Android target for KMP (#818), replacing com.android.library +
+    // androidTarget(): one (release-shaped) variant, configured in kotlin { android { } }.
+    alias(libs.plugins.android.kotlin.multiplatform.library)
+    // Lint: the KMP Android library plugin registers none of its own (AGP 9).
+    alias(libs.plugins.android.lint)
 }
 
 // The root build parses -PskipRustEngine once (same truthy rules everywhere) and
@@ -47,11 +51,43 @@ kotlin {
     // Java 17 class files on both targets (CLAUDE.md's default): every dependency
     // here is 17 or dependency-free, and the AAR must be consumable by a plain
     // Android app with no toolchain two-step.
-    androidTarget {
-        // The AAR a consumer gets: the release variant — eth.myotis:myotis-engine-android
-        // (root build.gradle.kts, `Publishing`; docs/guides/android-library.md).
-        publishLibraryVariants("release")
+    android {
+        // The AAR a consumer gets — eth.myotis:myotis-engine-android (root
+        // build.gradle.kts, `Publishing`; docs/guides/android-library.md). The KMP
+        // Android plugin has one variant, so there is no variant to select.
+        namespace = "io.myotis.engine"
+        compileSdk = 37
+        // The pinned build-tools (gradle/libs.versions.toml, #734). The NDK pin
+        // (ndkVersion) is not part of this plugin's DSL: the AAR packages the .so
+        // files as cargoNdkAndroid built them, and the app strips them at the APK
+        // merge with its own pinned NDK (android-app/build.gradle.kts).
+        buildToolsVersion = libs.versions.android.build.tools.get()
+        minSdk = 29
+        // The consumer contract the com.android.library AAR had (v0.1.20's
+        // aar-metadata.properties: minCompileSdk=1). AGP 9 otherwise writes the
+        // library's compileSdk there (37; android.aar.metadata.defaultMinCompileSdkToCompileSdk), which would make every consumer's
+        // checkAarMetadata refuse the AAR below compileSdk 37, though nothing
+        // in the library needs a newer compile SDK than before.
+        aarMetadata.minCompileSdk = 1
         compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) }
+        // cargoNdkAndroid's output, <abi>/libmyotis_engine.so + libmyotis_bls.so,
+        // lands in src/androidMain/jniLibs: the KMP Android plugin's own jniLibs
+        // directory for androidMain, packaged by convention. -PskipRustEngine
+        // means "no Rust engine in this AAR", so then both libraries are
+        // excluded here. The libs live in the source tree, outside build/, so a
+        // lib left there by an earlier toolchain build is not removed by
+        // `clean`, by .gitignore, or by cargoNdkAndroid being skipped — packaged,
+        // it would fail UniFFI validation on-device (bindings vs a stale .so)
+        // and silently fall back to Java. This plugin cannot drop a convention
+        // source directory, so the exclude is the gate (the com.android.library
+        // build gated the source instead); it applies to the AAR AND to the
+        // intermediate JNI artifact a project dependency (the Myotis app) is fed
+        // from — both checked with a planted leftover when this was migrated.
+        // The app adds its own exclude on the same flag as a second line, at the
+        // APK merge.
+        if (skipRustEngine) {
+            packaging.jniLibs.excludes += setOf("**/libmyotis_*.so")
+        }
     }
     jvm {
         compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) }
@@ -97,38 +133,6 @@ kotlin {
                 runtimeOnly(libs.logback.classic)
             }
         }
-    }
-}
-
-android {
-    namespace = "io.myotis.engine"
-    compileSdk = 35
-    // Pinned exactly (#734): AGP strips the packaged .so files with this NDK's
-    // llvm-strip (an unpinned NDK leaves them unstripped or strips them with
-    // whatever is installed), and build-tools is the same version
-    // scripts/sign_release_apk.sh signs with. Both from gradle/libs.versions.toml.
-    ndkVersion = libs.versions.android.ndk.get()
-    buildToolsVersion = libs.versions.android.build.tools.get()
-    defaultConfig {
-        minSdk = 29
-    }
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
-    }
-    sourceSets.getByName("main") {
-        // cargoNdkAndroid's output: <abi>/libmyotis_engine.so + libmyotis_bls.so.
-        // -PskipRustEngine means "no Rust engine in this AAR": the directory is then
-        // NOT a source at all. The libs live in the source tree, outside build/, so
-        // a lib left there by an earlier toolchain build is not removed by `clean`,
-        // by .gitignore, or by cargoNdkAndroid being skipped — AGP would happily
-        // package it, and on-device it would fail UniFFI validation (bindings vs a
-        // stale .so) and silently fall back to Java. Gating the SOURCE (rather than
-        // a packaging exclude) keeps a leftover out of every consumer's merge — the
-        // bundled AAR and a project dependency alike, which AGP feeds from this
-        // module's intermediate JNI artifact, not from the AAR. The app adds its
-        // own exclude on the same flag as a second line, at the APK merge.
-        if (!skipRustEngine) jniLibs.srcDir("src/androidMain/jniLibs")
     }
 }
 
@@ -224,8 +228,13 @@ val extractJnaAndroidNatives = tasks.register<Sync>("extractJnaAndroidNatives") 
     }
 }
 
-android {
-    sourceSets.getByName("main").jniLibs.srcDir(extractJnaAndroidNatives)
+// The extracted dispatcher joins the one variant's jniLibs sources (the KMP
+// Android plugin has no android.sourceSets DSL to add a directory to).
+androidComponents {
+    onVariants { variant ->
+        val jniLibs = checkNotNull(variant.sources.jniLibs) { "AGP gave the ${variant.name} variant no jniLibs sources" }
+        jniLibs.addStaticSourceDirectory(layout.buildDirectory.dir("jna-android-natives").get().asFile.path)
+    }
 }
 
 // === The Rust engine, built from source into this module's jniLibs ===========
@@ -239,13 +248,14 @@ android {
 // myotis-engine-rust/build.gradle.kts), and CI enforces bindings freshness for
 // everyone via the regenerate-and-diff step in android-apk.yml. Root
 // build.gradle.kts owns the tasks.
-tasks.matching { it.name == "preBuild" }.configureEach {
-    // JNA's Android dispatcher (the extraction task is defined above):
-    // srcDir(<TaskProvider>) registers the DIRECTORY but does NOT carry a task
-    // dependency through AGP's source sets, so on a clean build the jniLib merge
-    // would run before anything has extracted and the AAR would silently ship
-    // without libjnidispatch.so. preBuild runs ahead of every merge/assemble/
-    // bundle path.
+// The KMP Android plugin's preBuild is `androidPreBuild` (there is no `preBuild`
+// in this module since AGP 9: a hook on that name would silently wire nothing).
+tasks.matching { it.name == "androidPreBuild" }.configureEach {
+    // JNA's Android dispatcher (the extraction task is defined above): its
+    // output is added as a STATIC jniLibs directory, which carries no task
+    // dependency, so on a clean build the jniLib merge would run before anything
+    // has extracted and the AAR would silently ship without libjnidispatch.so.
+    // androidPreBuild runs ahead of every merge/assemble/bundle path.
     dependsOn(extractJnaAndroidNatives)
     // Always run the gate: with -PskipRustEngine it just logs the opt-out.
     dependsOn(rootProject.tasks.named("requireAndroidRustEngine"))

@@ -44,6 +44,14 @@ check "build-tools run (aapt2, d8, apksigner)" "ok" \
 check "/opt open to any uid" "" \
     "$(in_image 'find /opt ! -type l \( ! -perm -o=r -o \( -perm -u=x ! -perm -o=x \) \) -print 2>&1 | head -5 | tr "\n" " "' || true)"
 check "platform revision" "$(want ANDROID_PLATFORM_REVISION)" "$(revision "\$ANDROID_HOME/platforms/android-$(want ANDROID_PLATFORM)")"
+# And the Android Gradle plugin must SEE it as that package: from an unpacked
+# archive (no package.xml), sdklib's legacy loader parses the API level as an
+# integer, so a platform with a minor level (android-37.0) was no platform to
+# AGP 9, which tried to install one into this read-only SDK and failed every
+# Android build while every check above was green (#837). The Dockerfile writes
+# the package.xml; this holds it to the package id the build asks for.
+check "platform package id (what AGP sees)" "platforms;android-$(want ANDROID_PLATFORM)" \
+    "$(in_image 'sed -n "s/.*<localPackage path=\"\([^\"]*\)\".*/\1/p" "$ANDROID_HOME/platforms/android-'"$(want ANDROID_PLATFORM)"'/package.xml" 2>/dev/null')"
 # What apt INSTALLED, not only where it points: every package and version in
 # the image against the committed list. A package from another state of the
 # archive (the bootstrap fetch runs without TLS verification), or a toolchain

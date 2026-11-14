@@ -113,8 +113,13 @@ consumer and for nothing else.
 
 ## What the AAR is
 
-- **minSdk 29**, Java 17 class files, `compileSdk 35`. ABIs: `arm64-v8a` and
+- **minSdk 29**, Java 17 class files, `compileSdk 37`. ABIs: `arm64-v8a` and
   `x86_64` (the emulator); an app that ships other ABIs gets no engine there.
+- **Kotlin 2.3 or newer** to compile against it. The library is built with
+  Kotlin 2.4 (its class files carry Kotlin 2.4 metadata, and its Gradle module
+  requires `kotlin-stdlib` 2.4.x), which an older compiler cannot read. The iOS
+  module's klibs likewise need a Kotlin/Native at least as new as the one that
+  built them.
 - **The Rust engine only.** The Myotis app itself can still fall back to the
   Java engine on API 33+; the library has no Java engine, so a device the Rust
   engine cannot load on has no engine at all. `Myotis.isAvailable()` says
