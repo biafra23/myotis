@@ -1087,11 +1087,31 @@ val goEngineLibName = when {
     else -> "libmyotis_engine_go.so"
 }
 
+// Written next to the library on a SUCCESSFUL goBuildCShared run — the library's
+// size and mtime, so ownership holds only while the stamped file is still the
+// file on disk (PR #832 round-5 review + follow-up): the skip path and the
+// failure path may delete only what this rule calls ours, a hand-built file
+// written OVER a stamped one is foreign again, and every library predating the
+// stamp always was.
+val goBuildStampPath = "go/build/.libmyotis_engine_go.built-by-gradle"
+
+/** The ONE definition of "the library on disk is this task's own", shared by
+ *  the skip path, the failure path and the up-to-date predicate so the three
+ *  cannot drift apart (PR #832 round-5 follow-up review). */
+fun goLibIsOurs(): Boolean {
+    val lib = file("go/build/$goEngineLibName")
+    val stamp = file(goBuildStampPath)
+    if (!lib.isFile || !stamp.isFile) return false
+    val rec = runCatching { stamp.readText().trim().split(":") }.getOrNull() ?: return false
+    return rec.size == 2 &&
+        rec[0] == lib.length().toString() && rec[1] == lib.lastModified().toString()
+}
+
 tasks.register<Exec>("goBuildCShared") {
     group = "go"
     description = "go build -buildmode=c-shared for the Go engine (self-skips when go is" +
-        " missing or older than go/go.mod's line, deleting any previously built library" +
-        " it can no longer keep current; a FAILED cgo build degrades to a warning," +
+        " missing or older than go/go.mod's line, deleting a library IT built that it can" +
+        " no longer keep current; a FAILED cgo build degrades to a warning," +
         " keeping the JVM build untouched; builds the portable blst, never a newer toolchain)"
     onlyIf {
         // A SKIP is a stale-library risk, so it gets the same treatment as a
@@ -1116,15 +1136,39 @@ tasks.register<Exec>("goBuildCShared") {
                     " (it never downloads a toolchain); install $goModVersion — CI gets it from" +
                     " setup-go — to build the Go engine on this host."
             }
+            // Only delete what THIS task built, by identity — see goLibIsOurs()
+            // (PR #832 round-5 review + follow-up): the documented manual
+            // recipe (go/README) builds the library with GOTOOLCHAIN=auto on
+            // exactly the machines that take this skip branch (local go below
+            // the module line), and Gradle deleting a file it never wrote
+            // would make that recipe permanently unusable through the run
+            // tasks. A hand-built file written over a stamped one is foreign
+            // again — the stamp records the library's size and mtime.
             val lib = file("go/build/$goEngineLibName")
-            val removed = if (lib.exists()) {
-                lib.delete()
-                " Deleted the previously built $lib so it cannot serve sources it was not" +
-                    " built for (the next run with a usable toolchain rebuilds it)."
-            } else {
-                ""
+            val stamp = file(goBuildStampPath)
+            val outcome = when {
+                !lib.exists() -> {
+                    stamp.delete() // a stamp for a library that is gone proves nothing
+                    ""
+                }
+                !goLibIsOurs() -> " Left $lib alone — it was not built by this task, and" +
+                    " keeping it fresh against new sources is the manual build's own duty."
+                (lib.delete() || !lib.exists()).also { ok ->
+                    if (ok) file("go/build/myotis_engine_go.lib").delete()
+                } -> {
+                    stamp.delete()
+                    " Deleted the previously built $lib that this task wrote, so it cannot" +
+                        " serve sources it was not built for (the next run with a usable" +
+                        " toolchain rebuilds it)."
+                }
+                else -> {
+                    // A Windows host still running the engine maps the DLL and
+                    // the delete cannot go through — the note must not lie.
+                    " Could NOT delete $lib (a running host may still have it mapped) —" +
+                        " stop any running -Pengine=go host and delete it before the next build."
+                }
             }
-            logger.lifecycle(why + removed)
+            logger.lifecycle(why + outcome)
         }
         willRun
     }
@@ -1158,16 +1202,53 @@ tasks.register<Exec>("goBuildCShared") {
     doLast {
         val exit = executionResult.get().exitValue
         if (exit != 0) {
-            logger.warn("[go] goBuildCShared failed (exit {}) — the Go engine will report itself"
-                    + " unavailable and the JVM build continues. A -buildmode=c-shared build needs"
-                    + " a C compiler (cgo) and, on first run, module downloads.", exit)
-            // A failed `go build` can leave the PREVIOUS library untouched (go
-            // writes the output only at the end) — which, combined with the
-            // up-to-date check below, would silently keep a stale lib serving
-            // the host after a source change. Delete what a failed build did
-            // not rewrite, so the next run (or the loader's ABI handshake) sees
-            // the truth, not last week's bytes (PR #832 review).
-            delete(file("go/build/$goEngineLibName"), file("go/build/myotis_engine_go.lib"))
+            // Ownership rule as in the skip path (PR #832 round-5 review):
+            // delete what a failed build left stale ONLY when that library is
+            // this task's own (goLibIsOurs). A failed Gradle build on a
+            // cgo-broken box must not destroy the manual-recipe library.
+            //
+            // The delete is attempted with File.delete() (boolean, never
+            // throws) BEFORE the message, not Project.delete() (round-5
+            // follow-up review): Project.delete THROWS on an undeletable file
+            // — a Windows host still mapping the DLL makes a failed `go build`
+            // fail :app:run/:app-desktop:run, against "the JVM build
+            // continues" — and the stamp goes only if the library actually
+            // did, so a refused delete keeps ownership intact (the next run
+            // retries and re-attempts).
+            val lib = file("go/build/$goEngineLibName")
+            val ours = goLibIsOurs()
+            val deleted = ours && (lib.delete() || !lib.exists())
+            if (deleted) {
+                file("go/build/myotis_engine_go.lib").delete()
+                file(goBuildStampPath).delete()
+            }
+            logger.warn("[go] goBuildCShared failed (exit {}) — the JVM build continues."
+                    + " A -buildmode=c-shared build needs a C compiler (cgo) and, on first run,"
+                    + " module downloads." + when {
+                        deleted -> " The library this task last built is stale against these" +
+                            " sources and is deleted; the task RETRIES on the next build (it is" +
+                            " never up-to-date while it owns no library), so installing a C" +
+                            " compiler or coming back online is all it takes."
+                        ours -> " Could NOT delete go/build/$goEngineLibName (a running" +
+                            " -Pengine=go host may still have it mapped), so it and its stamp" +
+                            " stay put and the next run retries the delete; the stale library" +
+                            " serves until then."
+                        lib.exists() -> " go/build/$goEngineLibName was not built by this task and" +
+                            " stays in place — the Go engine keeps running on it, and keeping it" +
+                            " fresh against these sources is the manual build's own duty."
+                        else -> " The task RETRIES on the next build (it is never up-to-date" +
+                            " while it owns no library), so installing a C compiler or coming" +
+                            " back online is all it takes."
+                    }, exit)
+        } else {
+            // Mark the library as this task's own by identity (see
+            // goBuildStampPath / goLibIsOurs): size + mtime, so a hand-built
+            // file written over this one later is foreign again rather than
+            // silently inheriting the stamp.
+            val lib = file("go/build/$goEngineLibName")
+            if (lib.isFile) {
+                file(goBuildStampPath).writeText("${lib.length()}:${lib.lastModified()}\n")
+            }
         }
     }
     // Source allowlist, not "everything under go/": READMEs, docs and the test
@@ -1193,15 +1274,31 @@ tasks.register<Exec>("goBuildCShared") {
         add(file("go/build/$goEngineLibName"))
         if (isWindowsHost) add(file("go/build/myotis_engine_go.lib"))
     })
-    // NO `outputs.upToDateWhen { lib.exists() }` (PR #832 round 2 added one to
-    // retry the build once a missing cgo toolchain shows up; round 3 removed
-    // it after measuring on the pinned Gradle): the predicate is only consulted
-    // when the inputs already look unchanged, so it never forced anything — an
-    // edited .go file rebuilt WITH it in place, and a deleted library rebuilt
-    // WITHOUT it (a missing declared output is out-of-date on its own). The
-    // inputs/outputs declarations above carry the whole policy; the
-    // `engineLibPresent` input property this measurement also tried was
-    // dropped for the same reason (a missing output already forces a rerun).
+    // The predicate is load-bearing for the FAILED-build case, which the plain
+    // inputs/outputs snapshot does NOT cover (PR #832 round-5 review, measured
+    // on a scratch Gradle project): with `isIgnoreExitValue = true` a failed
+    // `go build` is a SUCCESSFUL execution, and its doLast deletes the library,
+    // so the recorded output snapshot is "absent". On the next run the inputs
+    // are unchanged and the output is still absent — unchanged since the last
+    // execution — so Gradle would mark it UP-TO-DATE and never retry, even once
+    // a C compiler is installed or the network is back. `upToDateWhen` is
+    // consulted exactly when the inputs look unchanged, which is that case, so
+    // gating it forces the retry. (Round 3 removed a predicate I had added for
+    // this on the reasoning that a deleted output is out-of-date on its own —
+    // true for a library deleted after a SUCCESSFUL build, which is what round
+    // 3 measured, but NOT for the absent-snapshot failure case.)
+    //
+    // And it must ask "is this OUR library", not "does some library exist"
+    // (round-5 follow-up review, measured): a foreign library left in place by
+    // the failure path would otherwise satisfy existence and re-close the
+    // retry — most pointedly for EVERY library built before the stamp existed,
+    // and the #838 absorption is exactly a go.mod change whose first build can
+    // fail once on the module download. Cost: a host whose Gradle-side cgo
+    // cannot work but which hand-builds (go/README) re-attempts and re-warns
+    // on every run — which is what the README promises ("retries on every
+    // later build"), and the rebuild rewrites the file, so it self-resolves
+    // the moment the toolchain works.
+    outputs.upToDateWhen { goLibIsOurs() }
 }
 
 // Regenerate the UniFFI Kotlin bindings for the Rust engine into :myotis-engine-rust's

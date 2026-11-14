@@ -213,10 +213,11 @@ and `GoMyotisEngine`/`GoChainHandle`/`GoVerifiedReads` behind the
 toggle is a java/rust switch and cannot select it) —
 `auto` never picks it: the Go engine is desktop-only and explicit until the
 engine-parity step (owner's brief, 2026-11). The library is built by the
-root `goBuildCShared` task (without the go toolchain it skips and DELETES any
-previously built library — the run tasks and native-backed tests gate on the
-file's existence alone, and old bytes must not keep serving new sources;
-PR #832 round-4) into
+root `goBuildCShared` task (without the go toolchain it skips, and deletes a
+library IT built — stamped on success — so old bytes cannot keep serving new
+sources through the run tasks' existence-only gating; a library YOU built with
+the recipe above is left alone and stays your own responsibility;
+PR #832 rounds 4-5) into
 `go/build/libmyotis_engine_go.{so,dylib,dll}`; the desktop run task injects
 it via `-Dmyotis.engine.go.lib`, the daemon via `java.library.path`.
 
@@ -261,8 +262,12 @@ dlopens the library on a pre-Broadwell/pre-Zen CPU, past every
 line rather than downloading one mid-build; CI installs it via
 `setup-go`). A skip — missing `go` (resolved like `cargo`, incl.
 `/usr/local/go/bin` for PATH-blind IDE daemons) or an old toolchain — also
-deletes a previously built library, since consumers gate on existence alone
-(PR #832 round-4).
+deletes a previously built library, since consumers gate on existence alone —
+but only one this task wrote (the stamp above), never a hand-built one
+(PR #832 rounds 4-5). And a FAILED build is never recorded up-to-date while
+the task does not own the library on disk (absent, or there without a
+matching stamp): the task retries on every later build, so installing a
+C compiler or coming back online is all it takes.
 
 ## Test
 

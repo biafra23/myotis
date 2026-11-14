@@ -80,17 +80,27 @@ public final class SelectorEngine implements MyotisEngine {
                 // is the shared port (it lives in :myotis-engine-common precisely
                 // so the Go engine needs no dependency on the Rust module).
                 if (go == null) {
-                    go = new GoMyotisEngine(KtorLoopbackRpc::new);
+                    GoMyotisEngine fresh = new GoMyotisEngine(KtorLoopbackRpc::new);
                     // Built LATE (a metering push never builds it — see
                     // setNetworkMetering): seed the device's current metering
                     // before this engine's first network counts a byte, or the
                     // first Go-hosted network would run under the default.
+                    // The whole seed-and-publish runs under THIS monitor, and
+                    // setNetworkMetering takes it too (PR #832 round-5 +
+                    // follow-up review): either the push completes first and
+                    // the seed reads the NEW java value, or this section
+                    // completes first and the push sees the published engine.
+                    // Seed BEFORE publish as well — with the monitor both
+                    // orders are safe, and it keeps a later reader that skips
+                    // the monitor from ever seeing a published-but-unseeded
+                    // engine.
                     try {
-                        go.setNetworkMetering(java.networkMetering());
+                        fresh.setNetworkMetering(java.networkMetering());
                     } catch (RuntimeException | LinkageError e) {
                         log.warn("[engines] could not seed the Go engine's metering "
                                 + "({}); it keeps the library default", e.toString());
                     }
+                    go = fresh;
                 }
                 g = go;
             }
@@ -326,14 +336,25 @@ public final class SelectorEngine implements MyotisEngine {
      *  only on a change retries. Go is pushed only when ALREADY built —
      *  probing/building it here would map libmyotis_engine_go on hosts whose
      *  choice never routes to it (PR #832 review); a Go engine built later is
-     *  seeded with this value by {@link #goEngine()}. */
+     *  seeded with this value by {@link #goEngine()}. The Go-read + Java-write
+     *  pair runs under {@code goEngine()}'s monitor (PR #832 round-5 follow-up
+     *  review): without it, a push arriving mid-build read {@code go == null},
+     *  skipped Go, and landed in Java AFTER the seed had read Java — leaving
+     *  Go on the OLD value while {@link #networkMetering()} reported the NEW
+     *  one, unretried by a host that pushes only on a change. Today only the
+     *  Android host pushes and it never routes to Go, so the interleaving is
+     *  latent, not live; a push then waits behind an in-flight Go construction
+     *  (native load) — unreachable on the pushing host, and worth the one
+     *  lock rather than a second one to reason about. */
     @Override
     public void setNetworkMetering(NetworkMetering metering) {
         if (metering == null) throw new EngineException("metering is required");
         if (RustMyotisEngine.isAvailable()) rustEngine().setNetworkMetering(metering);
-        GoMyotisEngine g = go;
-        if (g != null) g.setNetworkMetering(metering);
-        java.setNetworkMetering(metering);
+        synchronized (this) { // the monitor goEngine() seeds and publishes under
+            GoMyotisEngine g = go;
+            if (g != null) g.setNetworkMetering(metering);
+            java.setNetworkMetering(metering);
+        }
     }
 
     @Override
