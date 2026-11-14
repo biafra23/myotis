@@ -133,7 +133,11 @@ updates:
       # discv5 0.12 needs enr 0.14, which requires k256 0.14. alloy and revm
       # stay on k256 0.13 even at their latest releases, so taking it now ships
       # the second elliptic-curve stack the k256 hold above avoids. Lift both
-      # holds together, in one migration, once alloy and revm move to k256 0.14.
+      # holds together, in one migration, once alloy and revm move to k256 0.14
+      # (the "One k256 per lock" step of cargo-locks.yml fails when they do).
+      # For libp2p that is not the only gate: 0.57's libp2p-quic needs quinn's
+      # aws-lc-rs backend beside ring (rust/myotis-net/Cargo.toml, the `dns`
+      # note), a decision of its own.
       # hmac, sha2 and sha3 wait with it because none can go green as a
       # Dependabot PR on its own (the digest 0.11 generation itself is already
       # in the tree, through revm and alloy): hmac 0.13 and sha2 0.11 move
