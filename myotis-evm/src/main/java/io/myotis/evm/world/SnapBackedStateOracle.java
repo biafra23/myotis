@@ -432,18 +432,26 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
                                 verifyAndDecodeAccount(root, accountHash, address, nodes);
                         credit(peer);
                         readStats.observeAccount(addr, stateRoot, factOf(awr), System.nanoTime() - started);
+                        // Bank the verified record in the cross-call cache HERE, before
+                        // the future completes, as fetchStorage and the batch path
+                        // already do: "future complete" then means "record banked",
+                        // so a read right after this one (another oracle, a later head
+                        // context) finds it instead of re-proving it. stateCache is not
+                        // the map computeIfAbsent runs on, so this is safe when the peer
+                        // answers inline, inside computeIfAbsent.
+                        if (awr != null) {
+                            stateCache.putAccount(stateRoot, addr,
+                                    new StateProofCache.AccountEntry(awr.account(), awr.storageRoot().toArrayUnsafe()));
+                        }
                         return awr;
                     }));
-            // Evict failed fetches so a later read can retry across peers; on success
-            // promote the verified record to the cross-call cache. Use *Async so
-            // neither runs synchronously inside computeIfAbsent (a reentrant map
-            // mutation); the value-conditional remove keeps a racing re-fetch intact.
+            // Evict failed fetches so a later read can retry across peers. *Async so the
+            // remove never runs synchronously inside computeIfAbsent (a reentrant
+            // mutation of accountCache itself); the value-conditional remove keeps a
+            // racing re-fetch intact.
             f.whenCompleteAsync((v, e) -> {
                 if (e != null) {
                     accountCache.remove(k, f);
-                } else if (v != null) {
-                    stateCache.putAccount(stateRoot, addr,
-                            new StateProofCache.AccountEntry(v.account(), v.storageRoot().toArrayUnsafe()));
                 }
             }, java.util.concurrent.ForkJoinPool.commonPool());
             return f;
