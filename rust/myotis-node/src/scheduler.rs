@@ -85,14 +85,34 @@ unsafe extern "C" fn complete(
     if data.is_null() {
         return;
     }
+    // SAFETY: `data` is the `Box<Completion>` that `post_completion` leaked
+    // into this TSFN call; Node hands each queued item to this callback once.
     let completion = unsafe { Box::from_raw(data.cast::<Completion>()) };
+    // Node drains a TSFN aborted at environment teardown by calling this with a
+    // null `env` (and callback). On Node 20.x, 22.x and 24.0-24.15 it does so
+    // AFTER the finalizer has freed `context` (`ThreadSafeFunction::Finalize`
+    // in `src/node_api.cc`: finalizer first, drain second; 24.16 and later
+    // drain first). So with a null `env` the context must not be touched at
+    // all: drop the completion and return (#455). Nothing is lost — the
+    // environment is gone, so the promise can never be settled, and the
+    // pending count dies with the state. napi-rs guards its own TSFN
+    // trampoline the same way ("env and/or callback can be null when
+    // shutting down").
+    if env.is_null() {
+        drop(completion);
+        return;
+    }
+    // SAFETY: with a live `env` the TSFN has not been finalized, so the
+    // `Box<Arc<State>>` its finalizer frees is still alive.
     let state = unsafe { &*context.cast::<Arc<State>>() };
     deliver_completion(env, state, *completion);
 }
 
 fn deliver_completion(env: sys::napi_env, state: &State, completion: Completion) {
-    // Node drains aborted TSFN items with null env. Account the item but never
-    // call Node-API; the TSFN context remains owned until its finalizer.
+    // `complete` filters the null-env teardown drain out before the context is
+    // read (#455); the null check stays as a guard for any other caller. A
+    // closing state still delivers no settlement: account the item but never
+    // call Node-API for it.
     if env.is_null()
         || state
             .inner
