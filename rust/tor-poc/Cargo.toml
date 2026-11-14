@@ -27,8 +27,8 @@ myotis-core = { path = "../myotis-core" }
 # Arti — the Tor Project's official embeddable Rust client (docs §3). native-tls
 # (macOS Security.framework / system trust store) sidesteps the rustls 0.23
 # process-wide CryptoProvider selection; tokio matches the engine's runtime.
-arti-client = { version = "0.44", default-features = false, features = ["tokio", "native-tls"] }
-tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio", "native-tls"] }
+arti-client = { version = "0.47", default-features = false, features = ["tokio", "native-tls"] }
+tor-rtcompat = { version = "0.47", default-features = false, features = ["tokio", "native-tls"] }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time"] }
 tracing = "0.1"
