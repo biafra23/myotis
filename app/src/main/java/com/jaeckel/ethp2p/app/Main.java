@@ -408,6 +408,33 @@ public final class Main {
                         + "will be accepted WITHOUT the interactive warning", network);
                 handle.acceptStaleAnchor();
             }
+            // The headless form of the apps' remembered stale-anchor choice: the engine
+            // applies it at every park of this run by itself (a fetch that fails is
+            // retried every 10 minutes). Unknown values refuse the start rather than
+            // fall back to parking silently.
+            String stalePolicy = System.getProperty("myotis.beacon.staleAnchorPolicy");
+            if (stalePolicy != null && !stalePolicy.isBlank()) {
+                io.myotis.api.StaleAnchorPolicy p;
+                try {
+                    p = io.myotis.api.StaleAnchorPolicy.valueOf(stalePolicy.trim().toUpperCase(java.util.Locale.ROOT));
+                } catch (IllegalArgumentException e) {
+                    System.err.println("-Dmyotis.beacon.staleAnchorPolicy must be ask, checkpoint "
+                            + "or continue (got '" + stalePolicy + "')");
+                    engine.shutdownAll();
+                    closeAll(servers);
+                    releaseAll(fileLocks, lockChannels);
+                    return;
+                }
+                if (!handle.setStaleAnchorPolicy(p)) {
+                    System.err.println("-Dmyotis.beacon.staleAnchorPolicy=" + p + ": this engine "
+                            + "cannot apply it (the checkpoint fetch is Rust-engine only)");
+                    engine.shutdownAll();
+                    closeAll(servers);
+                    releaseAll(fileLocks, lockChannels);
+                    return;
+                }
+                log.warn("[{}] stale-anchor policy: {} (applied by the engine at every park)", network, p);
+            }
             // Log-index backfill OFF switch as a BOOT default. The engine holds the
             // bit at runtime only (it is not in the portable snapshot), and the
             // daemon has no settings file, so without this a restart resumes the

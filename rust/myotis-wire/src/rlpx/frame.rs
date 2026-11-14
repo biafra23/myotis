@@ -21,7 +21,7 @@
 
 #[allow(unused_imports)]
 use alloc::{borrow::ToOwned, format, string::{String, ToString}, vec, vec::Vec};
-use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::cipher::{BlockCipherEncrypt, KeyInit};
 use aes::Aes256;
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use sha3::{Digest, Keccak256};

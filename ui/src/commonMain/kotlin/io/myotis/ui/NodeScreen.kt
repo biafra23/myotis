@@ -28,6 +28,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
@@ -63,6 +64,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -255,18 +257,42 @@ fun NodeScreen(
             staleDismissed = staleDismissed.filterTo(mutableSetOf()) {
                 snapshots[it]?.beaconState == "STALE_ANCHOR"
             }
+            // A remembered "continue anyway" needs no dialog: consent once per park.
+            var autoContinued by remember { mutableStateOf(setOf<String>()) }
+            autoContinued = autoContinued.filterTo(mutableSetOf()) {
+                snapshots[it]?.beaconState == "STALE_ANCHOR"
+            }
+            val savedChoice = settings.staleAnchorChoice()
+            val parkedNets = snapshots.filterValues { it.beaconState == "STALE_ANCHOR" }.keys
+            LaunchedEffect(parkedNets, savedChoice) {
+                if (savedChoice == StaleAnchorChoice.CONTINUE) {
+                    // Not a network the user told to stay paused (that includes one
+                    // whose own dialog just consented, so it is not asked twice).
+                    (parkedNets - autoContinued - staleDismissed).forEach { net ->
+                        controller.acceptStaleAnchor(net)
+                        autoContinued = autoContinued + net
+                    }
+                }
+            }
             val staleNet = snapshots.entries.firstOrNull {
-                it.value.beaconState == "STALE_ANCHOR" && it.key !in staleDismissed
+                it.value.beaconState == "STALE_ANCHOR" && it.key !in staleDismissed &&
+                    it.key !in autoContinued && savedChoice != StaleAnchorChoice.CONTINUE
             }?.key
             val staleSnap = staleNet?.let { snapshots[it] }
             if (staleNet != null && staleSnap != null) {
                 StaleAnchorDialog(
                     network = staleNet,
                     s = staleSnap,
-                    onAccept = {
+                    savedChoice = savedChoice,
+                    onRemember = {
+                        settings.setStaleAnchorChoice(it)
+                        controller.applyStaleAnchorChoice(it)
+                    },
+                    onContinue = {
                         controller.acceptStaleAnchor(staleNet)
                         staleDismissed = staleDismissed + staleNet
                     },
+                    onFetchFresh = { anyway -> controller.refreshAnchorFromCheckpointz(staleNet, anyway) },
                     onDismiss = { staleDismissed = staleDismissed + staleNet },
                 )
             }
@@ -471,45 +497,188 @@ internal fun ReadinessStrip(r: Readiness, catchUp: CatchUpProgress?) {
 
 internal const val READINESS_STRIP_TAG = "readiness-strip"
 
+/** Settings: what to do when a network's sync anchor is past the weak-subjectivity bound. */
+@Composable
+private fun StaleAnchorChoiceSection(settings: Settings, controller: NodeController) {
+    var choice by remember { mutableStateOf(settings.staleAnchorChoice()) }
+    SettingsSection("When the sync anchor is too old")
+    // Three chips can outgrow a narrow phone: scroll rather than clip the last one.
+    Row(
+        Modifier.horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        listOf(
+            StaleAnchorChoice.ASK to "Ask me",
+            StaleAnchorChoice.CHECKPOINT to "Fresh checkpoint",
+            StaleAnchorChoice.CONTINUE to "Continue anyway",
+        ).forEach { (c, label) ->
+            FilterChip(
+                selected = choice == c,
+                onClick = {
+                    choice = c
+                    settings.setStaleAnchorChoice(c)
+                    controller.applyStaleAnchorChoice(c)
+                },
+                label = { Text(label) },
+            )
+        }
+    }
+    SettingsNote(
+        "Ask me (default): a dialog offers the choices each time. Fresh checkpoint " +
+            "(recommended): start over from the block every answering checkpoint-sync server " +
+            "names — if one differs, nothing is applied and the dialog shows the outlier. " +
+            "Continue anyway: sync forward from the old anchor without asking (the long-range " +
+            "risk accepted every time). Applied by the node itself, also with the app in the " +
+            "background: at the next park, and to networks parked now. A remembered checkpoint " +
+            "that fails is retried every 10 minutes until you choose otherwise.",
+    )
+}
+
 /**
- * The stale-anchor consent dialog — the interactive half of the weak-subjectivity
- * gate. Shown while a network is parked in STALE_ANCHOR: the engine refuses to
- * sync from an anchor older than the bound until the user updates the app,
- * raises the bound (Settings), or accepts the risk here. "Sync anyway" applies
- * to THIS RUN only; the engine never persists the consent.
+ * The stale-anchor dialog — the interactive half of the weak-subjectivity gate. Shown
+ * while a network is parked in STALE_ANCHOR (its sync anchor is older than the bound).
+ * Two ways forward, each of which can be remembered and then applied automatically at
+ * the next park ([StaleAnchorChoice], Settings → "When the sync anchor is too old"):
+ *
+ * - **Fetch fresh checkpoint** (recommended) — a finalized root every answering server
+ *   names: a NEW anchor from outside the chain, the only answer to the weak-subjectivity
+ *   problem itself.
+ * - **Continue anyway** — sync forward from the stale anchor, the risk accepted.
+ *
+ * The checkpoint must also be confirmed by a long-known peer (pinned in the release, or
+ * known to this device for a week) — the eclipse guard. When none could be reached, the
+ * dialog warns and offers "Use it anyway", which is never remembered; when they answered
+ * and disagree, nothing is offered.
+ *
+ * A remembered checkpoint runs as soon as the dialog opens; if it is refused, the dialog
+ * stays with both choices (and the other may be remembered instead). A remembered
+ * "continue" never shows the dialog (NodeScreen consents directly). The Java engine has
+ * no fetch, so it offers only "continue".
  */
 @Composable
 private fun StaleAnchorDialog(
     network: String,
     s: NodeSnapshot,
-    onAccept: () -> Unit,
+    savedChoice: StaleAnchorChoice,
+    onRemember: (StaleAnchorChoice) -> Unit,
+    onContinue: () -> Unit,
+    // Blocks on a network round: run off the main thread, outcome shown in place. An
+    // applied result releases the park, which closes the dialog on its own. The flag is
+    // the user's explicit "use it anyway" for a checkpoint no long-known peer confirmed.
+    onFetchFresh: (allowUnconfirmed: Boolean) -> FreshAnchorResult,
     onDismiss: () -> Unit,
 ) {
+    val scope = rememberCoroutineScope()
+    val fetchOffered = s.engine != "java"
+    var busy by remember(network) { mutableStateOf(false) }
+    var status by remember(network) { mutableStateOf<String?>(null) }
+    var rememberChoice by remember(network) { mutableStateOf(false) }
+    // Set when the servers agreed but no long-known peer confirmed: the eclipse warning
+    // and the explicit override are shown.
+    var unconfirmed by remember(network) { mutableStateOf(false) }
+
+    fun run(choice: StaleAnchorChoice, remembered: Boolean, allowUnconfirmed: Boolean = false) {
+        if (remembered) onRemember(choice)
+        if (choice == StaleAnchorChoice.CONTINUE) {
+            onContinue()
+            return
+        }
+        busy = true
+        status = null
+        scope.launch {
+            val r = withContext(Dispatchers.Default) { onFetchFresh(allowUnconfirmed) }
+            status = r.message
+            unconfirmed = !r.applied && r.unconfirmed
+            busy = false
+        }
+    }
+
+    // A remembered fetch runs once, when the dialog opens for this park.
+    LaunchedEffect(network) {
+        if (savedChoice == StaleAnchorChoice.CHECKPOINT && fetchOffered) run(StaleAnchorChoice.CHECKPOINT, false)
+    }
+
     val agePeriods = (s.syncTargetPeriod - s.syncCurrentPeriod).coerceAtLeast(0)
     // Rough period length per chain, for a human-scale age (exact math stays in
     // periods — this is display only): mainnet preset ~27.3 h, the Gnosis preset
     // (Gnosis Chain and its testnet Chiado) ~11.4 h.
     val hoursPerPeriod = if (network == "gnosis" || network == "chiado") 11.4 else 27.3
     val ageDays = ((agePeriods * hoursPerPeriod) / 24.0).toInt()
+    val savedNote = if (savedChoice == StaleAnchorChoice.CHECKPOINT && busy) "Applying your remembered choice…\n\n" else ""
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Sync anchor too old — ${network.replaceFirstChar { it.uppercase() }}") },
         text = {
-            Text(
-                "The newest trust anchor this node has (its built-in checkpoint or last " +
-                    "verified sync state) is $agePeriods sync-committee periods old" +
-                    (if (ageDays > 0) " (~$ageDays days)" else "") +
-                    ", past the weak-subjectivity bound of ${s.wsBoundPeriods} periods.\n\n" +
-                    "Beyond this window, validators who have since exited could sign a fake " +
-                    "chain continuation (a long-range attack), and signature verification " +
-                    "alone cannot tell it from the real chain. Syncing is paused, and " +
-                    "verified reads stay unavailable, until you decide.\n\n" +
-                    "Safest: update the app (a fresh build carries a fresh checkpoint). " +
-                    "Alternatively raise the bound in Settings, or sync anyway if you " +
-                    "trust your network and peers — for this run only.",
-            )
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    savedNote +
+                        "The newest trust anchor this node has (its built-in checkpoint or last " +
+                        "verified sync state) is $agePeriods sync-committee periods old" +
+                        (if (ageDays > 0) " (~$ageDays days)" else "") +
+                        ", past the weak-subjectivity bound of ${s.wsBoundPeriods} periods. " +
+                        "Beyond it, validators who have since exited could sign a fake chain " +
+                        "continuation that signature checks alone cannot tell from the real one. " +
+                        "Syncing is paused until you choose:",
+                )
+                if (fetchOffered) {
+                    Text(
+                        "• Fresh checkpoint (recommended) — start over from the block the chain " +
+                            "finalized most recently, only if every checkpoint-sync server that " +
+                            "answers names the same one (at least two operators) and a long-known " +
+                            "peer (pinned in this release, or known to this device for a week) " +
+                            "confirms it. If even one differs, nothing is applied and the outlier " +
+                            "is named.",
+                    )
+                }
+                Text(
+                    "• Continue anyway — sync forward from the old anchor and accept the risk.",
+                )
+                status?.let { Text(it, fontWeight = FontWeight.SemiBold) }
+                if (unconfirmed && !busy) {
+                    Text(
+                        "Warning: no peer this node has long known could be reached to confirm " +
+                            "this checkpoint. If " +
+                            "your network connection is controlled by an attacker (an eclipse " +
+                            "attack), the servers and every peer you reach could be theirs. Use it " +
+                            "only if you trust this network connection.",
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+                if (busy) Text("Asking checkpoint-sync servers and long-known peers…")
+                // The ROW is the toggleable (the box has no handler of its own), so
+                // the label ticks it too and a screen reader announces one checkbox.
+                Row(
+                    Modifier.fillMaxWidth().toggleable(
+                        value = rememberChoice,
+                        role = Role.Checkbox,
+                        onValueChange = { rememberChoice = it },
+                    ),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Checkbox(checked = rememberChoice, onCheckedChange = null)
+                    Text("Remember my choice and apply it automatically next time")
+                }
+            }
         },
-        confirmButton = { TextButton(onClick = onAccept) { Text("Sync anyway (accept risk)") } },
+        confirmButton = {
+            Column(horizontalAlignment = Alignment.End) {
+                if (fetchOffered) {
+                    TextButton(enabled = !busy, onClick = { run(StaleAnchorChoice.CHECKPOINT, rememberChoice) }) {
+                        Text("Fetch fresh checkpoint")
+                    }
+                }
+                // Never remembered: an unconfirmed checkpoint takes this click every time.
+                if (fetchOffered && unconfirmed) {
+                    TextButton(enabled = !busy, onClick = { run(StaleAnchorChoice.CHECKPOINT, false, allowUnconfirmed = true) }) {
+                        Text("Use it anyway (eclipse not ruled out)")
+                    }
+                }
+                TextButton(enabled = !busy, onClick = { run(StaleAnchorChoice.CONTINUE, rememberChoice) }) {
+                    Text("Continue anyway (accept risk)")
+                }
+            }
+        },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Stay paused") } },
     )
 }
@@ -620,6 +789,12 @@ private fun SettingsTab(
             HorizontalDivider()
             TokenSettings(controller, settings, network, snapshots)
         }
+
+        // The remembered answer to a stale sync anchor (the stale-anchor dialog's
+        // "Remember my choice"): in both modes, because a user who ticked it must be
+        // able to undo it. Applies at the next park; persisted at once.
+        HorizontalDivider()
+        StaleAnchorChoiceSection(settings, controller)
 
         // Power: the rows that trade responsiveness for battery or CPU, one per host that
         // has such a knob — macOS App Nap, Android's idle controller. Linux has neither

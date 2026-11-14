@@ -13,6 +13,11 @@
 //!   - `<low>-<high>`  proven catch-up served sync-committee period range
 //!   - `b<period>`     LightClientBootstrap period served (deepest kept)
 //!   - `lc` / `nolc`   light-client protocol support confirmed / denied
+//!   - `s<unix secs>`  first seen: when this address first entered the cache
+//!     (the earliest wins on merge). It is what makes a peer LONG-KNOWN for the
+//!     stale-anchor recovery's eclipse guard (`crate::known_peers`). An entry
+//!     loaded without one (written before the token existed) is stamped with
+//!     the load time, so it ages from the upgrade on.
 //!   - bare integer    legacy floor — loaded as the degenerate range `[p, p]`
 //!
 //! Ranges WIDEN on merge (union), never overwrite — matching the Java parser.
@@ -34,6 +39,8 @@ pub struct ClPeerCache {
     lc: HashSet<String>,
     nolc: HashSet<String>,
     failures: HashMap<String, u32>,
+    /// When each address first entered the cache (unix seconds).
+    first_seen: HashMap<String, u64>,
     /// Unflushed changes. Mutators only mark; [`Self::flush`] writes — so the
     /// sync loop batches one write per round instead of one per peer event.
     dirty: bool,
@@ -66,6 +73,14 @@ impl ClPeerCache {
                     cache.lc.insert(addr.clone());
                 } else if tok == "nolc" {
                     cache.nolc.insert(addr.clone());
+                } else if let Some(t) = tok.strip_prefix('s') {
+                    if let Ok(secs) = t.parse::<u64>() {
+                        cache
+                            .first_seen
+                            .entry(addr.clone())
+                            .and_modify(|cur| *cur = (*cur).min(secs))
+                            .or_insert(secs);
+                    }
                 } else if let Some(b) = tok.strip_prefix('b') {
                     if let Ok(period) = b.parse::<u64>() {
                         // Deepest kept = HIGHEST period (Java Math::max merge).
@@ -82,6 +97,14 @@ impl ClPeerCache {
                 } else if let Ok(p) = tok.parse::<u64>() {
                     cache.widen(&addr, p, p); // legacy bare floor
                 }
+            }
+        }
+        // Entries from before the first-seen token: they age from now on.
+        let now = unix_now();
+        for a in &cache.peers {
+            if !cache.first_seen.contains_key(a) {
+                cache.first_seen.insert(a.clone(), now);
+                cache.dirty = true;
             }
         }
         tracing::info!(
@@ -129,6 +152,11 @@ impl ClPeerCache {
             }
         });
         out
+    }
+
+    /// Every cached address with its first-seen time (unix seconds).
+    pub fn first_seen_all(&self) -> Vec<(String, u64)> {
+        self.peers.iter().filter_map(|a| self.first_seen.get(a).map(|t| (a.clone(), *t))).collect()
     }
 
     pub fn served_range(&self, addr: &str) -> Option<(u64, u64)> {
@@ -247,6 +275,7 @@ impl ClPeerCache {
             self.lc.remove(&a);
             self.nolc.remove(&a);
             self.failures.remove(&a);
+            self.first_seen.remove(&a);
             self.dirty = true;
         }
     }
@@ -270,6 +299,7 @@ impl ClPeerCache {
             return false;
         }
         self.peers.push(addr.to_string());
+        self.first_seen.entry(addr.to_string()).or_insert_with(unix_now);
         true
     }
 
@@ -297,6 +327,10 @@ impl ClPeerCache {
             } else if self.nolc.contains(p) {
                 out.push_str("\tnolc");
             }
+            if let Some(t) = self.first_seen.get(p) {
+                out.push('\t');
+                out.push_str(&format!("s{t}"));
+            }
             out.push('\n');
         }
         let tmp = PathBuf::from(format!("{}.tmp.{}", path.display(), std::process::id()));
@@ -308,9 +342,59 @@ impl ClPeerCache {
     }
 }
 
+/// The `s<secs>` first-seen tokens of a cache file, read-only — for the
+/// stale-anchor recovery's long-known-peer check (`crate::known_peers`), which
+/// must not stamp, mark dirty or log a load. An address with no token is left
+/// out: it has not been seen long enough to count.
+pub fn read_first_seen(path: &std::path::Path) -> Vec<(String, u64)> {
+    let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
+    let mut out: HashMap<String, u64> = HashMap::new();
+    for line in text.lines() {
+        let mut fields = line.trim().split('\t');
+        let Some(addr) = fields.next().filter(|a| a.starts_with('/')) else { continue };
+        for tok in fields {
+            if let Some(secs) = tok.strip_prefix('s').and_then(|t| t.parse::<u64>().ok()) {
+                out.entry(addr.to_string()).and_modify(|cur| *cur = (*cur).min(secs)).or_insert(secs);
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_seen_is_kept_stamped_and_the_earliest_wins() {
+        let path = tmp_path("first-seen");
+        std::fs::write(
+            &path,
+            "/ip4/1.1.1.1/tcp/1/p2p/A\t1-2\ts1000\ts900\n/ip4/2.2.2.2/tcp/1/p2p/B\tlc\n",
+        )
+        .unwrap();
+        let mut c = ClPeerCache::load(path.clone());
+        let all: HashMap<String, u64> = c.first_seen_all().into_iter().collect();
+        assert_eq!(all["/ip4/1.1.1.1/tcp/1/p2p/A"], 900, "earliest of two tokens");
+        let b = all["/ip4/2.2.2.2/tcp/1/p2p/B"];
+        assert!(b > 1_700_000_000, "an untokened entry is stamped at load");
+        c.flush();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\ts900"), "{text}");
+        assert!(text.contains(&format!("\ts{b}")), "the stamp is persisted, so it ages: {text}");
+        let read_only: HashMap<String, u64> = read_first_seen(&path).into_iter().collect();
+        assert_eq!(read_only["/ip4/1.1.1.1/tcp/1/p2p/A"], 900);
+        let again = ClPeerCache::load(path.clone());
+        assert_eq!(again.first_seen_all().into_iter().collect::<HashMap<_, _>>()["/ip4/2.2.2.2/tcp/1/p2p/B"], b);
+        let _ = std::fs::remove_file(&path);
+    }
 
     fn tmp_path(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();

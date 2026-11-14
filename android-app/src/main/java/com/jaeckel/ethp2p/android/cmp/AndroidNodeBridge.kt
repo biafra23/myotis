@@ -132,6 +132,12 @@ class AndroidNodeController(
     override fun setWsBoundPeriods(periods: Int) { serviceProvider()?.setWsBoundPeriods(periods) }
     override fun applyWebAccess() { serviceProvider()?.applyWebAccess() }
     override fun acceptStaleAnchor(network: String) { serviceProvider()?.acceptStaleAnchor(network) }
+    override fun applyStaleAnchorChoice(choice: io.myotis.ui.StaleAnchorChoice) { serviceProvider()?.applyStaleAnchorChoice() }
+    override fun refreshAnchorFromCheckpointz(network: String, allowUnconfirmed: Boolean): io.myotis.ui.FreshAnchorResult {
+        val r = serviceProvider()?.refreshAnchorFromCheckpointz(network, allowUnconfirmed)
+            ?: return io.myotis.ui.FreshAnchorResult(false, "No fresh checkpoint: the node service is not running.")
+        return io.myotis.ui.FreshAnchorResult.of(r.applied(), r.operators(), r.slot(), r.error(), r.confirmedBy(), r.unconfirmed())
+    }
     override fun applyLogIndex(network: String) { serviceProvider()?.applyLogIndex(network) }
 
     override val canImportLogIndex: Boolean get() = pickFiles != null
@@ -469,6 +475,9 @@ class AndroidSettings(private val ctx: Context) : Settings {
     override fun servedBlockWindow(): Int = NodeService.servedBlockWindow(ctx)
     override fun setServedBlockWindow(v: Int) = NodeService.setServedBlockWindowPref(ctx, v)
     override fun wsBoundPeriods(): Int = NodeService.wsBoundPeriods(ctx)
+    override fun staleAnchorChoice(): io.myotis.ui.StaleAnchorChoice =
+        io.myotis.ui.StaleAnchorChoice.parse(NodeService.staleAnchorChoice(ctx))
+    override fun setStaleAnchorChoice(v: io.myotis.ui.StaleAnchorChoice) = NodeService.setStaleAnchorChoice(ctx, v.name)
     override fun setWsBoundPeriods(v: Int) = NodeService.setWsBoundPeriodsPref(ctx, v)
 
     override fun displayName(network: String): String = NodeService.displayName(network)
