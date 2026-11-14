@@ -129,13 +129,17 @@ updates:
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
       # The libp2p 0.57 / discv5 0.12 line is held too (owner's decision,
       # 2026-11-14, #845, #847, #848). It cannot move piece by piece:
-      # libp2p-mplex 0.44 needs libp2p-core 0.44 (all of libp2p 0.57), discv5
-      # 0.12 needs enr 0.14 and libp2p-identity 0.3, and hmac 0.13 needs digest
-      # 0.11, which sha2 0.11 / sha3 0.12 belong to. That line moves to k256 0.14
-      # (enr 0.14, libp2p-identity 0.3) while alloy and revm stay on k256 0.13
-      # even at their latest releases, so taking it now ships the second
-      # elliptic-curve and digest stack the k256 hold above avoids. Lift both
+      # libp2p-mplex 0.44 needs libp2p-core 0.44 (all of libp2p 0.57), and
+      # discv5 0.12 needs enr 0.14, which requires k256 0.14. alloy and revm
+      # stay on k256 0.13 even at their latest releases, so taking it now ships
+      # the second elliptic-curve stack the k256 hold above avoids. Lift both
       # holds together, in one migration, once alloy and revm move to k256 0.14.
+      # hmac, sha2 and sha3 wait with it because none can go green as a
+      # Dependabot PR on its own (the digest 0.11 generation itself is already
+      # in the tree, through revm and alloy): hmac 0.13 and sha2 0.11 move
+      # together (Hmac<Sha256> in myotis-wire's ECIES), sha2 0.11 drops the
+      # `force-soft` feature myotis-core's bare-metal pin steers k256's copy
+      # with, and sha3 0.12 drops the `std` feature myotis-core forwards.
       # Same update types as k256: for these 0.x crates a breaking move is
       # semver-major to Dependabot, and their patches keep arriving.
       - dependency-name: "libp2p*"
