@@ -173,3 +173,28 @@ fn invalid_required_proof_branches_are_rejected_in_both_periods() {
     assert!(!processor().process_update(&first));
 }
 
+
+/// #737: catch-up with a wall clock ahead of the store. The caller
+/// force-rotates after each applied update (as `apply_staged_step` does); a
+/// following update whose finalized header enters the period the store has
+/// already rotated into must not rotate it again, or the store ends a period
+/// ahead of its finalized header and refuses the updates signed in between.
+#[test]
+fn catch_up_force_rotation_then_a_crossing_update_rotates_once() {
+    let mut p = with_next();
+    assert_eq!(spec::compute_sync_committee_period(p.store.finalized_slot()), 1777);
+    p.store.force_rotate_if_past_period(14_704_714);
+    assert_eq!(p.store.current_period(), 1778);
+    let rotated_into = p.store.current_sync_committee().unwrap().hash_tree_root();
+    let second = update("002-update.ssz");
+    assert_eq!(spec::compute_sync_committee_period(second.finalized_header.beacon.slot), 1778);
+    assert!(p.process_update(&second));
+    assert_eq!(p.store.current_period(), 1778, "rotated twice into one period");
+    assert_eq!(
+        p.store.current_period(),
+        spec::compute_sync_committee_period(p.store.finalized_slot())
+    );
+    assert_eq!(p.store.current_sync_committee().unwrap().hash_tree_root(), rotated_into);
+    // The P+2 committee the update carries is held as next, ready for 1779.
+    assert!(p.store.next_sync_committee().is_some());
+}

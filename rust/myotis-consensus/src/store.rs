@@ -95,13 +95,20 @@ impl LightClientStore {
         self.next_sync_committee = Some(next);
     }
 
-    pub fn apply_next_when_period_changes(&mut self, old_finalized_slot: u64, new_finalized_slot: u64) {
+    /// Rotate next → current once the finalized header has entered a period
+    /// past the store's. Compared with the store's period, not with the
+    /// previous finalized header's: in catch-up `force_rotate_if_past_period`
+    /// may already have rotated into the period this update finalizes, and a
+    /// second rotation would leave the store a period ahead of its finalized
+    /// header, refusing every update signed in the period it is really in
+    /// (#737). Without a force-rotation the store's period is the old
+    /// finalized header's, so the verdict is the same as before.
+    pub fn apply_next_when_period_changes(&mut self, new_finalized_slot: u64) {
         if self.next_sync_committee.is_none() {
             return;
         }
-        let old_period = self.period_of(old_finalized_slot);
         let new_period = self.period_of(new_finalized_slot);
-        if new_period > old_period {
+        if new_period > self.current_sync_committee_period {
             self.current_sync_committee = self.next_sync_committee.take();
             self.current_sync_committee_period += 1;
         }
@@ -446,11 +453,10 @@ impl LightClientProcessor {
                 .update_next_sync_committee(update.next_sync_committee.clone());
         }
 
-        let old_finalized = self.store.finalized_slot();
         let finalized_slot = update.finalized_header.beacon.slot;
         self.store.update_finalized(&update.finalized_header, finalized_slot);
         self.store.update_optimistic(&update.attested_header, update.signature_slot);
-        self.store.apply_next_when_period_changes(old_finalized, finalized_slot);
+        self.store.apply_next_when_period_changes(finalized_slot);
         true
     }
 
@@ -525,11 +531,10 @@ impl LightClientProcessor {
             return false;
         }
 
-        let old_finalized = self.store.finalized_slot();
         let finalized_slot = update.finalized_header.beacon.slot;
         self.store.update_finalized(&update.finalized_header, finalized_slot);
         self.store.update_optimistic(&update.attested_header, update.signature_slot);
-        self.store.apply_next_when_period_changes(old_finalized, finalized_slot);
+        self.store.apply_next_when_period_changes(finalized_slot);
         true
     }
 
