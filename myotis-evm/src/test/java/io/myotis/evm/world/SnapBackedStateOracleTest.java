@@ -674,6 +674,13 @@ class SnapBackedStateOracleTest {
         var oracle1 = new SnapBackedStateOracle(() -> peer, BytecodeCache.inMemory(),
                 SnapBackedStateOracle.DEFAULT_MAX_ATTEMPTS, shared);
         assertEquals(value, oracle1.fetchStorage(accountTrie.root.toArrayUnsafe(), addr, slot).get());
+        // The oracle promotes a verified account to the shared cache in a
+        // whenCompleteAsync callback, AFTER the read's future completes, so `get()`
+        // above can return before the account is there. A loaded runner then loses
+        // the race: oracle 2 misses the account, asks its dead peer, and fails with
+        // its IOException (main at 02bf4b2d). The test below sidesteps the same race
+        // with putAccount; this one waits, because the promotion is what it tests.
+        awaitCachedAccount(shared, accountTrie.root.toArrayUnsafe(), addr.toByteArray());
 
         SnapPeer deadPeer = new SnapPeer() {
             @Override public CompletableFuture<List<Bytes>> getTrieNodes(Bytes32 r, List<PathSet> p) {
@@ -687,6 +694,16 @@ class SnapBackedStateOracleTest {
                 SnapBackedStateOracle.DEFAULT_MAX_ATTEMPTS, shared);
         assertEquals(value, oracle2.fetchStorage(accountTrie.root.toArrayUnsafe(), addr, slot).get(),
                 "second oracle must serve the slot from the shared cache, no peer round-trip");
+    }
+
+    /** Waits (bounded) until the asynchronous promotion has put the account in {@code cache}. */
+    private static void awaitCachedAccount(StateProofCache cache, byte[] stateRoot, byte[] address)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+        while (cache.getAccount(stateRoot, address).isEmpty()) {
+            assertTrue(System.nanoTime() < deadline, "the account never reached the shared cache");
+            Thread.sleep(5);
+        }
     }
 
     @Test
