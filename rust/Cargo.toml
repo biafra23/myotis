@@ -66,12 +66,13 @@ exclude = ["tor-poc", "roost"]
 # ONE minimum rustc (`rust-version.workspace = true` in each member), and the
 # single source of it: the root build.gradle.kts reads this line to decide
 # whether a toolchain builds the workspace or skips it like a missing cargo.
-# The dependency graph sets it — today revm 43 and alloy-eips 2.1 need 1.91 —
-# and `verifyRustVersionFloor` fails `check` when a lock update pulls in a
-# crate that needs more.
+# The dependency graph sets it — today Arti 0.47 (the `tor` feature's
+# arti-client / tor-rtcompat tree) needs 1.92; without it, revm 43 and
+# alloy-eips 2.1 would set 1.91 — and `verifyRustVersionFloor` fails `check`
+# when a lock update pulls in a crate that needs more.
 [workspace.package]
 version = "0.1.20"
-rust-version = "1.91"
+rust-version = "1.92"
 
 # Release profile is workspace-owned (crate-level [profile.*] is ignored in a
 # workspace): same tuning myotis-bls always shipped with.
