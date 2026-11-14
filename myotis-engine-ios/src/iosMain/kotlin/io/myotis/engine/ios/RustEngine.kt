@@ -44,7 +44,9 @@ import io.myotis.engine.capi.myotis_request_account_json
 import io.myotis.engine.capi.myotis_resolve_block_hash_json
 import io.myotis.engine.capi.myotis_resume
 import io.myotis.engine.capi.myotis_accept_stale_anchor
+import io.myotis.engine.capi.myotis_refresh_anchor_from_checkpointz
 import io.myotis.engine.capi.myotis_set_network_metering
+import io.myotis.engine.capi.myotis_set_stale_anchor_policy
 import io.myotis.engine.capi.myotis_set_ws_bound_periods
 import io.myotis.engine.capi.myotis_simulate_v1_json
 import io.myotis.engine.capi.myotis_start
@@ -163,6 +165,22 @@ object RustEngine {
     fun acceptStaleAnchor(handle: Long): Boolean {
         requireAbi()
         return myotis_accept_stale_anchor(handle)
+    }
+
+    /** The remembered stale-anchor answer (ABI >= 59): 0 ask, 1 checkpoint, 2 continue. */
+    fun setStaleAnchorPolicy(handle: Long, policy: Int): Boolean {
+        requireAbi()
+        return myotis_set_stale_anchor_policy(handle, policy)
+    }
+
+    /** Re-anchor a STALE_ANCHOR park on a fresh checkpoint every answering
+     *  checkpoint-sync server names and a long-known peer confirms (ABI >= 58);
+     *  [allowUnconfirmed] is the user's explicit "use it anyway". Blocking — never call
+     *  from the main thread. */
+    fun refreshAnchorFromCheckpointz(handle: Long, allowUnconfirmed: Boolean): String {
+        requireAbi()
+        return take(myotis_refresh_anchor_from_checkpointz(handle, allowUnconfirmed))
+            ?: """{"applied":false,"error":"native failure"}"""
     }
 
     /** Replace this handle's host-supplied EL seed pins (ABI >= 31, #465): a

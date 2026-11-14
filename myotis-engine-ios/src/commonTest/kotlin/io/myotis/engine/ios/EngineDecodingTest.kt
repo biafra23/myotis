@@ -618,4 +618,39 @@ class EngineDecodingTest {
         val e = assertFailsWith<EngineException> { EngineDecoding.ensAddress("a.eth", """{"error":"no snap peer"}""") }
         assertTrue(e.message!!.contains("no snap peer"))
     }
+
+    // ---- the checkpointz recovery (host.rs anchor_refresh_json_shape's literal) ----
+
+    @Test
+    fun anAppliedAnchorRefreshDecodes() {
+        val r = EngineDecoding.anchorRefresh(
+            """{"applied":true,"root":"0x1111111111111111111111111111111111111111111111111111111111111111",""" +
+                """"slot":15626560,"epoch":488330,"operators":["attestant.io","sigp.io"],""" +
+                """"confirmedBy":["pinned 12D3Ko…abcdef"],"unconfirmed":false}""",
+        )
+        assertTrue(r.applied)
+        assertEquals("0x" + "11".repeat(32), r.root)
+        assertEquals(15626560L, r.slot)
+        assertEquals(488330L, r.epoch)
+        assertEquals(listOf("attestant.io", "sigp.io"), r.operators)
+        assertEquals(listOf("pinned 12D3Ko…abcdef"), r.confirmedBy)
+        assertFalse(r.unconfirmed)
+        assertNull(r.error)
+    }
+
+    @Test
+    fun aRefusedAnchorRefreshCarriesItsReason() {
+        val r = EngineDecoding.anchorRefresh("""{"applied":false,"error":"unknown handle","unconfirmed":false}""")
+        assertFalse(r.applied)
+        assertEquals("unknown handle", r.error)
+        assertTrue(r.operators.isEmpty())
+        assertFalse(r.unconfirmed)
+    }
+
+    @Test
+    fun anUnconfirmedRefusalIsFlagged() {
+        val r = EngineDecoding.anchorRefresh("""{"applied":false,"error":"UNCONFIRMED: …","unconfirmed":true}""")
+        assertFalse(r.applied)
+        assertTrue(r.unconfirmed)
+    }
 }

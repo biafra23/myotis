@@ -13,6 +13,12 @@
   leaves out of its tree; it does not surface a withheld or altered one, so
   the wallet's displayed balance rests on the publisher. Scope and limits: the
   carve-out under *Data sources*.
+- **One more, on the owner's request (2026-11-10), Rust engine (its persisted
+  store is the snapshot the Java engine also resumes):** only at a
+  `STALE_ANCHOR` park and only on the user's request (explicit, or a choice
+  the user told the app to remember), a fresh checkpoint that every answering
+  checkpoint-sync server names (at least two independent operators). Scope and
+  limits: the carve-out under *Data sources*.
 - **A parameter that can change the answer must be APPLIED or REFUSED — never
   accepted and silently ignored.** A well-formed result computed against
   something other than what the caller asked for is indistinguishable from a
@@ -77,6 +83,40 @@
     does this rule let this repo's own tooling GENERATE a seed from a node
     over JSON-RPC — that stays open, and the RAILGUN PoC's seed stays DEBUG /
     DEMO (docs/guides/railgun-poc.md).
+- **Carve-out for fresh checkpoints at a stale anchor (owner's request,
+  2026-11-10; docs/how-it-works/stale-anchor.md).** The Rust engine reads one
+  HTTPS source beside its peers, through its one HTTP client
+  (`rust/myotis-net/src/https.rs`: pinned URLs, no redirects, Mozilla roots).
+  (Colibri's ZK proofs of the committee chain were in an earlier revision of
+  #761 and removed before merging, owner's decision 2026-11-13: they attest the
+  walk from Colibri's pinned anchor committee, older than the weak-subjectivity
+  bound, so they add no answer to a stale anchor — the doc's last section.)
+  - **Checkpointz finalized roots**, ONLY at a `STALE_ANCHOR` park and ONLY
+    on the user's request: the explicit "Fetch fresh checkpoint"
+    (`refreshAnchorFromCheckpointz`), or that choice remembered by the user and
+    then applied by the engine itself at each park, also headless, but never
+    unattended under Tor (owner's request, 2026-11-11). Never otherwise
+    automatic, and never applied to a store that is not parked. The root is
+    accepted only when the vote is UNANIMOUS: every server that answers names
+    the same finalized epoch and root, spanning at least 2 operators
+    (registrable domains). One differing answer (another root or epoch, an
+    `execution_optimistic` or malformed answer) is an alarm: the fetch is
+    refused and the outlier named, never outvoted (owner's ruling, #761,
+    2026-11-11). It is their word, as the embedded anchor is the release's,
+    and the host must say so. It must ALSO be confirmed by at least one
+    LONG-KNOWN libp2p peer — pinned by peer ID in the release, or in this
+    device's CL peer cache for at least a week — naming the same epoch and root
+    in its Status (the eclipse guard; owner's ruling, #761, 2026-11-13). One
+    naming another root for that epoch, or long-known peers that answer but
+    never at the servers' epoch, refuse with no override. Only when no
+    long-known peer answered at all is it refused as UNCONFIRMED and flagged;
+    then only the user's explicit "use it anyway", every time, applies it —
+    never a remembered choice.
+
+  It does not change the **transport** of the wallet's reads: account, storage
+  and call data still come only from devp2p peers. But every one of them is
+  verified against the store this source initializes, so for the root of
+  trust it does count.
 - **TrueBlocks Unchained Index mainnet publishing appears stalled.** The designated
   publisher (`publisher.unchainedindex.eth`) last published a mainnet manifest indexed
   to ~block 23.0M (mid-2025); as of mid-2026 that is ~a year behind the head, and the

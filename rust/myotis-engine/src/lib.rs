@@ -408,7 +408,19 @@ uniffi::setup_scaffolding!();
 ///      OS-assigned, the unchanged default). An additive function — bumped so
 ///      a host that pins its ports (myotis-rpcd's port switches) is never
 ///      paired with an engine that would leave them OS-assigned.
-pub const ABI_VERSION: i32 = 57;
+/// v58: the checkpointz recovery (docs/how-it-works/stale-anchor.md).
+///      `refresh_anchor_from_checkpointz` (UniFFI and the C ABI:
+///      `myotis_refresh_anchor_from_checkpointz`): a STALE_ANCHOR park re-anchors
+///      on a finalized root every answering checkpoint-sync server names
+///      (≥ 2 independent operators; any differing answer refuses). An additive
+///      function — bumped so a host that offers "fetch a fresh checkpoint" is
+///      never paired with an engine that lacks it.
+/// v59: `set_stale_anchor_policy` (UniFFI and the C ABI:
+///      `myotis_set_stale_anchor_policy`): the remembered answer to a
+///      STALE_ANCHOR park, applied by the sync loop itself, so it works with no
+///      UI open. An additive function — bumped so a host that pushes it is never
+///      paired with an engine that would not apply it.
+pub const ABI_VERSION: i32 = 59;
 
 // Keep the workspace edge alive so `cargo build -p myotis-engine` type-checks the
 // consensus crate too.

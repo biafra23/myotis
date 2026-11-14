@@ -36,7 +36,7 @@ extern "C" {
  * rust/myotis-engine/src/lib.rs and is pinned to it by a capi.rs unit test
  * (header_pins_the_current_abi_version), so a bump that forgets this file
  * fails `cargo test`. Gate on this macro — do not copy the number. */
-#define MYOTIS_ABI_VERSION 57
+#define MYOTIS_ABI_VERSION 59
 
 /* Availability + ABI handshake. Installs the log ring subscriber (idempotent)
  * and returns the engine's ABI version; refuse to call anything else if it
@@ -146,6 +146,29 @@ bool myotis_set_ws_bound_periods(int64_t handle, int64_t periods);
  * weak-subjectivity bound — releases a STALE_ANCHOR park for the rest of this
  * run; never persisted. False only for an unknown handle. */
 bool myotis_accept_stale_anchor(int64_t handle);
+
+/* (ABI >= 58) Recover a STALE_ANCHOR park from a fresh finalized checkpoint
+ * that every answering checkpoint-sync server names, two or more independent
+ * operators among them (one differing answer refuses and names the outlier),
+ * AND that at least one long-known peer — pinned in this release, or in this
+ * device's peer cache for a week — names in its Status (one naming another
+ * root for that epoch is an ALARM and refuses). With no confirming peer the
+ * answer is refused with "unconfirmed":true (an eclipse cannot be ruled out)
+ * unless allow_unconfirmed: the user's explicit "use it anyway", never a
+ * remembered choice. Blocking — up to ~1 min; never call from the UI thread.
+ * Applied only to a RUNNING handle parked in STALE_ANCHOR. Returns JSON
+ * {"applied":true,"root":"0x..","slot":n,"epoch":n,"operators":[".."],
+ * "confirmedBy":[".."],"unconfirmed":bool} or
+ * {"applied":false,"error":"..","unconfirmed":bool}; release with
+ * myotis_string_free. The root is those operators' word: say so to the user. */
+char *myotis_refresh_anchor_from_checkpointz(int64_t handle, bool allow_unconfirmed);
+
+/* (ABI >= 59) The user's remembered answer to a STALE_ANCHOR park, applied by
+ * the sync loop itself at every park (no UI needed): 0 ask (default), 1 fresh
+ * checkpoint, 2 continue anyway. A checkpoint fetch that fails leaves the park
+ * for the user and is retried every 10 minutes. Live; settable before start.
+ * False for an unknown handle or code. */
+bool myotis_set_stale_anchor_policy(int64_t handle, int32_t policy);
 
 /* Verified reads — JSON results; {"error": "..."} on transport/not-running/
  * bad-input failures; verification failures carry a `failReason` inside the

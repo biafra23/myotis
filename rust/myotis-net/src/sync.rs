@@ -153,6 +153,54 @@ pub struct WsPolicy {
     /// One-shot consent to sync forward from a stale anchor. Per-run: never
     /// persisted, so a restart with a still-stale anchor parks again.
     pub accept_stale_anchor: AtomicBool,
+    /// A fresh anchor (block root, slot) for a loop parked in STALE_ANCHOR to
+    /// re-anchor on — the checkpointz recovery (`crate::checkpointz`), set by
+    /// the host only after the agreement gate and only while the loop is
+    /// parked. The loop takes it at its next park re-check, discards whatever
+    /// store it held, and bootstraps from this root like from the embedded
+    /// checkpoint (Merkle-pinned to it, then BLS-verified forward). Ignored —
+    /// left in place — by a loop that is not parked.
+    pub fresh_anchor: std::sync::Mutex<Option<([u8; 32], u64)>>,
+    /// The user's remembered answer to a STALE_ANCHOR park ([`StalePolicy`] as
+    /// a `u8`), applied BY THE LOOP at every park, so it works with no UI open
+    /// (an Android service in the background, the daemon). The host pushes it
+    /// from its stored setting; 0 = ask (the default: wait for the user).
+    pub stale_policy: std::sync::atomic::AtomicU8,
+}
+
+/// What the loop does by itself when it parks in STALE_ANCHOR — the user's
+/// remembered choice (docs/how-it-works/stale-anchor.md, *Remember my choice*).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StalePolicy {
+    /// Wait for the user (the default).
+    Ask = 0,
+    /// Re-anchor on a checkpoint every answering checkpoint-sync server names.
+    Checkpoint = 1,
+    /// Sync forward from the stale anchor (the consent, given in advance).
+    Continue = 2,
+}
+
+impl StalePolicy {
+    pub fn from_code(code: i64) -> Option<Self> {
+        match code {
+            0 => Some(Self::Ask),
+            1 => Some(Self::Checkpoint),
+            2 => Some(Self::Continue),
+            _ => None,
+        }
+    }
+}
+
+/// How often a park retries a remembered checkpoint fetch that failed —
+/// servers can disagree for a while (one lagging behind the others).
+/// Meanwhile the park stays, and an open UI offers the other choices.
+const AUTO_RESOLVE_RETRY: Duration = Duration::from_secs(10 * 60);
+
+impl WsPolicy {
+    fn take_fresh_anchor(&self) -> Option<([u8; 32], u64)> {
+        self.fresh_anchor.lock().ok()?.take()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +274,11 @@ pub struct ChainConfig {
     /// Live host overrides for the bound + the stale-anchor consent (see
     /// [`WsPolicy`]). Shared across config clones.
     pub ws_policy: Arc<WsPolicy>,
+    /// Checkpoint-sync servers (`crate::checkpointz`) a host may ask for a fresh
+    /// anchor at a STALE_ANCHOR park; only ever read on that explicit request.
+    /// Every one that answers must agree (one outlier refuses), and at least
+    /// two operators must answer, so list at least two operators' servers.
+    pub checkpointz_servers: Vec<String>,
     /// The consensus-layer fork watch this loop feeds — every discv5 ENR's
     /// `eth2` field and every peer Status (`cl_fork_watch`). Handle-owned by
     /// the engine host so its evidence survives pause/resume; None (the
@@ -361,6 +414,17 @@ impl ChainConfig {
             cl_peer_cache_path: None,
             ws_bound_periods: 13, // spec WS plateau 3532 epochs / 256 = 13.8 -> floor 13 (~14.7 days)
             ws_policy: Arc::new(WsPolicy::default()),
+            checkpointz_servers: vec![
+                "https://sync-mainnet.beaconcha.in".to_string(),
+                "https://mainnet.checkpoint.sigp.io".to_string(),
+                "https://mainnet-checkpoint-sync.attestant.io".to_string(),
+                "https://beaconstate-mainnet.chainsafe.io".to_string(),
+                "https://mainnet-checkpoint-sync.stakely.io".to_string(),
+                "https://checkpointz.pietjepuk.net".to_string(),
+                "https://beaconstate.ethstaker.cc".to_string(),
+                "https://beaconstate.info".to_string(),
+                "https://ethereum-beacon-api.publicnode.com".to_string(),
+            ],
             traffic: crate::traffic::TrafficMeter::new(),
             cl_fork_watch: None,
         }
@@ -430,6 +494,12 @@ impl ChainConfig {
             cl_peer_cache_path: None,
             ws_bound_periods: 13, // permissioned validator set; mainnet-preset bound kept as hygiene
             ws_policy: Arc::new(WsPolicy::default()),
+            checkpointz_servers: vec![
+                "https://checkpoint-sync.sepolia.ethpandaops.io".to_string(),
+                "https://beaconstate-sepolia.chainsafe.io".to_string(),
+                "https://sepolia.beaconstate.info".to_string(),
+                "https://ethereum-sepolia-beacon-api.publicnode.com".to_string(),
+            ],
             traffic: crate::traffic::TrafficMeter::new(),
             cl_fork_watch: None,
         }
@@ -503,6 +573,11 @@ impl ChainConfig {
             cl_peer_cache_path: None,
             ws_bound_periods: 3, // short churn window (see NetworkConfig.wsBoundPeriods) — pragmatic floor
             ws_policy: Arc::new(WsPolicy::default()),
+            checkpointz_servers: vec![
+                "https://checkpoint.gnosischain.com".to_string(),
+                "https://rpc-gbc.gnosischain.com".to_string(),
+                "https://gnosis-beacon-api.publicnode.com".to_string(),
+            ],
             traffic: crate::traffic::TrafficMeter::new(),
             cl_fork_watch: None,
         }
@@ -568,6 +643,14 @@ impl ChainConfig {
             // epochs, about one period (derivation in NetworkConfig.wsBoundPeriods).
             ws_bound_periods: 1,
             ws_policy: Arc::new(WsPolicy::default()),
+            checkpointz_servers: vec![
+                // Not rpc-gbc.chiadochain.net: on 2026-11-10/11 it reported a finalized
+                // epoch ~200 epochs behind the other two, so the unanimous gate refused
+                // every chiado fetch (#761, owner's call). Same operator as the
+                // checkpoint host anyway, so it never added a voice.
+                "https://checkpoint.chiadochain.net".to_string(),
+                "https://gnosis-chiado-beacon-api.publicnode.com".to_string(),
+            ],
             traffic: crate::traffic::TrafficMeter::new(),
             cl_fork_watch: None,
         }
@@ -1383,6 +1466,9 @@ pub struct SyncHandle {
     /// The CL→EL bridge: the verified beacon loop feeds finalized/optimistic
     /// execution into this, and the EL verified-read ladder reads it.
     exec_anchor: Arc<ExecAnchor>,
+    /// The Status this node serves and sends (`known_peers` asks peers for
+    /// theirs with it).
+    local_status: Arc<LocalStatus>,
 }
 
 impl SyncHandle {
@@ -1447,13 +1533,13 @@ impl SyncHandle {
         let sync_task = tokio::spawn(run_sync(
             config,
             client.clone(),
-            local_status,
+            Arc::clone(&local_status),
             status_tx,
             discovery_cfg,
             Arc::clone(&exec_anchor),
         ));
 
-        Ok(SyncHandle { status_rx, client, tasks: vec![sync_task], exec_anchor })
+        Ok(SyncHandle { status_rx, client, tasks: vec![sync_task], exec_anchor, local_status })
     }
 
     /// The EL execution anchor fed by this beacon sync loop — the CL→EL trust
@@ -1465,6 +1551,18 @@ impl SyncHandle {
 
     pub fn status(&self) -> SyncStatus {
         self.status_rx.borrow().clone()
+    }
+
+    /// The req/resp client this loop dials with — for a host-side round that
+    /// must speak to peers as this node (the stale-anchor recovery's
+    /// long-known-peer check, `crate::known_peers`).
+    pub fn client(&self) -> ReqRespClient {
+        self.client.clone()
+    }
+
+    /// The Status this node currently sends.
+    pub fn local_status(&self) -> crate::status::StatusMessage {
+        self.local_status.get()
     }
 
     /// A watch receiver for callers that want to await state changes.
@@ -2173,6 +2271,20 @@ fn is_quic_addr(addr: &Multiaddr) -> bool {
     addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::QuicV1 | libp2p::multiaddr::Protocol::Quic))
 }
 
+/// The light-client peers this RELEASE pins for `network`, by peer ID — the
+/// compiled-in list, before any `MYOTIS_CL_STATIC_PEERS` override. The
+/// stale-anchor recovery's eclipse guard counts these as long-known
+/// (`crate::known_peers`): a runtime override must not choose its confirmers.
+pub fn release_pins(network: &str) -> &'static [&'static str] {
+    match network {
+        "mainnet" => MAINNET_STATIC_PEERS,
+        "sepolia" => SEPOLIA_STATIC_PEERS,
+        "gnosis" => GNOSIS_STATIC_PEERS,
+        "chiado" => CHIADO_STATIC_PEERS,
+        _ => &[],
+    }
+}
+
 fn parse_static_peer(multiaddr: &str) -> Option<Peer> {
     let addr: Multiaddr = multiaddr.parse().ok()?;
     let mut base = Multiaddr::empty();
@@ -2194,7 +2306,7 @@ fn parse_static_peer(multiaddr: &str) -> Option<Peer> {
 // -------------------------------------------------------------------------
 
 async fn run_sync(
-    config: ChainConfig,
+    mut config: ChainConfig,
     client: ReqRespClient,
     local_status: Arc<LocalStatus>,
     status_tx: watch::Sender<SyncStatus>,
@@ -2291,7 +2403,7 @@ async fn run_sync(
     // reads/writes the identical file). Anything else → fresh bootstrap. A
     // restored store stays on probation (ResumeGuard) until one update
     // BLS-verifies against it; see RESUME_REJECTS_MAX.
-    let checkpoint_period =
+    let mut checkpoint_period =
         spec::compute_sync_committee_period_with(config.checkpoint_slot, config.slots_per_period());
     let mut in_catchup = false;
     // Floor the persist throttle at the CHECKPOINT period: a snapshot at (or
@@ -2303,7 +2415,13 @@ async fn run_sync(
     // snapshot with a dead 1777 one). Only periods verified PAST the
     // checkpoint are worth writing.
     let mut last_persisted_period = checkpoint_period;
+    // The EMBEDDED checkpoint's period, kept when a checkpointz recovery moves
+    // `checkpoint_period`: it is what a restart judges a snapshot against, so a
+    // re-anchored store must be persisted from this floor, not the new one —
+    // otherwise the restart finds only the stale state and parks again.
+    let embedded_checkpoint_period = checkpoint_period;
     let mut resume = ResumeGuard::fresh();
+    let mut auto_last_try: Option<Instant> = None;
     // Deserialize the snapshot ONCE, up front: the weak-subjectivity gate below
     // must judge the BEST available anchor (embedded checkpoint vs persisted
     // snapshot) BEFORE anything is restored from it, and the strictly-newer
@@ -2331,9 +2449,22 @@ async fn run_sync(
             .as_ref()
             .map(|s| s.current_sync_committee_period)
             .unwrap_or(0);
-        let anchor_period = checkpoint_period.max(snap_period);
+        let mut anchor_period = checkpoint_period.max(snap_period);
         let mut parked = false;
         loop {
+            // A fresh anchor from the host's checkpointz recovery replaces the
+            // embedded checkpoint for this run; the snapshot, older than it by
+            // construction (it is what parked us), is then refused by the
+            // strictly-newer resume rule below.
+            if parked {
+                auto_resolve_park(&config, &client, &local_status, &mut auto_last_try).await;
+                if let Some((root, slot)) = config.ws_policy.take_fresh_anchor() {
+                    checkpoint_period = reanchor(&mut config, root, slot);
+                    last_persisted_period = embedded_checkpoint_period;
+                    anchor_period = checkpoint_period.max(snap_period);
+                    continue;
+                }
+            }
             let bound = config.effective_ws_bound_periods();
             let wall_period = config.wall_clock_period();
             let stale = ws_anchor_stale(anchor_period, wall_period, bound);
@@ -2356,6 +2487,7 @@ async fn run_sync(
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         if parked {
+            discard_unused_fresh_anchor(&config);
             tracing::warn!(anchor_period,
                 "stale anchor released (bound raised or risk accepted) — syncing forward");
             // Replace the lingering StaleAnchor on the status watch IMMEDIATELY:
@@ -2411,6 +2543,29 @@ async fn run_sync(
     // behind, finality polling in steady state.
     loop {
         drain_discovered(&mut peer_rx, &mut pool);
+
+        // The checkpointz recovery, for a loop parked by one of the in-run
+        // weak-subjectivity gates below: drop the held store — its committee
+        // is the stale anchor — and bootstrap from the fresh root.
+        if status_tx.borrow().state == SyncState::StaleAnchor {
+            auto_resolve_park(&config, &client, &local_status, &mut auto_last_try).await;
+            if let Some((root, slot)) = config.ws_policy.take_fresh_anchor() {
+                checkpoint_period = reanchor(&mut config, root, slot);
+                last_persisted_period = embedded_checkpoint_period;
+                processor = LightClientProcessor::new(
+                    LightClientStore::new(config.slots_per_period()),
+                    config.fork_schedule.clone(),
+                    config.genesis_validators_root,
+                );
+                resume = ResumeGuard::fresh();
+                staged_updates.clear();
+                in_catchup = false;
+                publish_status(&config, &client, &processor, &pool, &status_tx, &anchor, hunt.hunting).await;
+                continue;
+            }
+        } else {
+            discard_unused_fresh_anchor(&config);
+        }
 
         let seen = (processor.store.current_period(), processor.store.finalized_slot());
         if seen != last_seen_progress {
@@ -2649,6 +2804,84 @@ async fn run_sync(
 /// imports them before updateSyncState and simply ages them out), while a
 /// deleted sidecar would cost Java FILL_THRESHOLD extra finality polls to
 /// reach SYNCED after an engine switch back.
+/// Point this run at a fresh anchor (the checkpointz recovery): the bootstrap
+/// requests `root`, and the weak-subjectivity gates judge `slot`'s period.
+/// Returns that period. Only the in-memory config moves; the caller drops the
+/// persist floor to the embedded checkpoint's period, so the bootstrapped
+/// store is written at once and a restart resumes it (strictly newer than the
+/// embedded checkpoint) instead of parking on the stale state again.
+fn reanchor(config: &mut ChainConfig, root: [u8; 32], slot: u64) -> u64 {
+    tracing::warn!(root = %hex_str(&root), slot,
+        "STALE ANCHOR: re-anchoring on the host-supplied fresh checkpoint \
+         (checkpointz agreement) — discarding the stale state, bootstrapping from it");
+    config.checkpoint_root = root;
+    config.checkpoint_slot = slot;
+    spec::compute_sync_committee_period_with(slot, config.slots_per_period())
+}
+
+/// A fresh anchor the host queued for a park that then ended some other way
+/// (consent, a raised bound) answers a question nobody is asking any more:
+/// drop it, so a later, unrelated park never re-anchors without a new request.
+fn discard_unused_fresh_anchor(config: &ChainConfig) {
+    if let Some((root, slot)) = config.ws_policy.take_fresh_anchor() {
+        tracing::info!(root = %hex_str(&root), slot,
+            "discarding a fresh anchor that arrived after the park ended");
+    }
+}
+
+/// Apply the user's remembered choice at a park ([`WsPolicy::stale_policy`]):
+/// `Continue` consents; `Checkpoint` runs the same round as the explicit FFI
+/// call — the servers' unanimous checkpoint, confirmed by long-known peers
+/// (`crate::known_peers`) — and queues the result for the park to consume (the
+/// same `fresh_anchor` slot). It never applies an UNCONFIRMED checkpoint: that
+/// takes the user's explicit "use it anyway". A failure leaves the park in
+/// place — the user decides — and is retried every [`AUTO_RESOLVE_RETRY`].
+async fn auto_resolve_park(
+    config: &ChainConfig,
+    client: &ReqRespClient,
+    local_status: &LocalStatus,
+    last_try: &mut Option<Instant>,
+) {
+    let policy = StalePolicy::from_code(config.ws_policy.stale_policy.load(Ordering::Relaxed) as i64);
+    match policy {
+        Some(StalePolicy::Continue) => {
+            if !config.ws_policy.accept_stale_anchor.swap(true, Ordering::Relaxed) {
+                tracing::warn!("STALE ANCHOR: the user's remembered choice is 'continue anyway' — \
+                    syncing forward from the stale anchor");
+            }
+        }
+        Some(StalePolicy::Checkpoint) => {
+            if last_try.is_some_and(|t| t.elapsed() < AUTO_RESOLVE_RETRY) {
+                return;
+            }
+            *last_try = Some(Instant::now());
+            // Under Tor the fetch never runs unattended: it resolves and names its
+            // hosts in the clear (#539), and only an explicit click may accept that
+            // (docs/how-it-works/privacy-and-tor.md). The park waits for the user.
+            if !crate::checkpointz::unattended_allowed() {
+                tracing::warn!("STALE ANCHOR: remembered 'fresh checkpoint' not applied while Tor \
+                    routing is on (the fetch would leave in the clear) — waiting for the user");
+                return;
+            }
+            match crate::known_peers::fetch_confirmed(config, client, &local_status.get(), false, false).await {
+                Ok(c) => {
+                    if let Ok(mut slot) = config.ws_policy.fresh_anchor.lock() {
+                        *slot = Some((c.fresh.root, c.fresh.slot));
+                    }
+                    tracing::warn!(slot = c.fresh.slot, operators = ?c.fresh.operators,
+                        confirmed_by = ?c.confirmed_by,
+                        "STALE ANCHOR: remembered choice 'fresh checkpoint' — re-anchoring");
+                }
+                Err(r) => tracing::warn!(error = %r.reason, unconfirmed = r.unconfirmed,
+                    retry_in_s = AUTO_RESOLVE_RETRY.as_secs(),
+                    "STALE ANCHOR: remembered choice 'fresh checkpoint' refused — waiting \
+                     for the user"),
+            }
+        }
+        _ => {}
+    }
+}
+
 fn persist_snapshot(
     config: &ChainConfig,
     processor: &LightClientProcessor,
@@ -4414,6 +4647,35 @@ async fn publish_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_policy_codes_round_trip_and_refuse_unknowns() {
+        for p in [StalePolicy::Ask, StalePolicy::Checkpoint, StalePolicy::Continue] {
+            assert_eq!(StalePolicy::from_code(p as u8 as i64), Some(p));
+        }
+        assert_eq!(StalePolicy::from_code(3), None);
+        assert_eq!(StalePolicy::from_code(-1), None);
+    }
+
+    #[tokio::test]
+    async fn a_remembered_continue_consents_at_the_park_and_ask_does_nothing() {
+        let config = ChainConfig::chiado();
+        let status = LocalStatus::new(crate::status::StatusMessage {
+            fork_digest: [0; 4],
+            finalized_root: [0; 32],
+            finalized_epoch: 0,
+            head_root: [0; 32],
+            head_slot: 0,
+            earliest_available_slot: 0,
+        });
+        let client = crate::reqresp::start_host(Arc::clone(&status)).expect("host");
+        let mut last = None;
+        auto_resolve_park(&config, &client, &status, &mut last).await;
+        assert!(!config.ws_policy.accept_stale_anchor.load(Ordering::Relaxed), "ask waits for the user");
+        config.ws_policy.stale_policy.store(StalePolicy::Continue as u8, Ordering::Relaxed);
+        auto_resolve_park(&config, &client, &status, &mut last).await;
+        assert!(config.ws_policy.accept_stale_anchor.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn lighthouse_agents_get_single_period_requests() {

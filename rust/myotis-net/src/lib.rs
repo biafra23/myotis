@@ -31,10 +31,13 @@
 // surface.
 pub use libp2p::{identity, multiaddr, Multiaddr, PeerId};
 
+pub mod checkpointz;
 pub mod cl_fork_watch;
 pub mod clcache;
 pub mod codec;
 pub mod discovery;
+pub mod https;
+pub mod known_peers;
 pub mod el;
 pub mod protocols;
 pub mod reqresp;

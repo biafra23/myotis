@@ -191,6 +191,9 @@ class DesktopNodeController(
                         // Weak-subjectivity bound override rides the same pre-start
                         // apply + lock: the cold-start gate must judge with it.
                         handle.setWsBoundPeriods(settings.wsBoundPeriods().toLong())
+                        // The remembered stale-anchor answer too: the engine applies it
+                        // at the cold-start park itself, with or without the window open.
+                        handle.setStaleAnchorPolicy(stalePolicyOf(settings.staleAnchorChoice()))
                         // Web page access (#502) too: the listener's first request must
                         // already be judged by the persisted policy, never the default.
                         applyWebAccessTo(handle)
@@ -274,6 +277,22 @@ class DesktopNodeController(
 
     override fun acceptStaleAnchor(network: String) {
         engine.get(network)?.acceptStaleAnchor()
+    }
+
+    override fun applyStaleAnchorChoice(choice: io.myotis.ui.StaleAnchorChoice) {
+        // Same lock as the boot path's pre-start apply (see setWsBoundPeriods).
+        synchronized(servedWindowApplyLock) {
+            engine.hostedNetworks().forEach { engine.get(it)?.setStaleAnchorPolicy(stalePolicyOf(choice)) }
+        }
+    }
+
+    private fun stalePolicyOf(c: io.myotis.ui.StaleAnchorChoice) = io.myotis.api.StaleAnchorPolicy.valueOf(c.name)
+
+    override fun refreshAnchorFromCheckpointz(network: String, allowUnconfirmed: Boolean): io.myotis.ui.FreshAnchorResult {
+        val handle = engine.get(network)
+            ?: return io.myotis.ui.FreshAnchorResult(false, "No fresh checkpoint: $network is not running.")
+        val r = handle.refreshAnchorFromCheckpointz(allowUnconfirmed)
+        return io.myotis.ui.FreshAnchorResult.of(r.applied(), r.operators(), r.slot(), r.error(), r.confirmedBy(), r.unconfirmed())
     }
 
     override fun applyBlsBackend() {
@@ -996,6 +1015,7 @@ class DesktopSettings(
     private var servedWindow = 32
     // Weak-subjectivity bound override (periods); 0 = each network's default.
     private var wsBound = 0
+    private var staleChoice = io.myotis.ui.StaleAnchorChoice.ASK
     private var deep = 16
     private var strict = true
     // Desktop has no bundled native blst yet (Milagro-only), so the honest default is off; the
@@ -1079,6 +1099,8 @@ class DesktopSettings(
     override fun wsBoundPeriods(): Int = synchronized(this) { wsBound }
     // 0 = per-network default; cap keeps a typo from storing an absurd bound.
     override fun setWsBoundPeriods(v: Int) = mutate { wsBound = v.coerceIn(0, 9999) }
+    override fun staleAnchorChoice(): io.myotis.ui.StaleAnchorChoice = synchronized(this) { staleChoice }
+    override fun setStaleAnchorChoice(v: io.myotis.ui.StaleAnchorChoice) = mutate { staleChoice = v }
     override fun logIndexEnabled(network: String): Boolean =
         synchronized(this) { logIndexOn[network] ?: false }
     override fun setLogIndexEnabled(network: String, on: Boolean) = mutate { logIndexOn[network] = on }
@@ -1191,6 +1213,7 @@ class DesktopSettings(
         p.getProperty(K_SNAP)?.toIntOrNull()?.let { snap = it.coerceIn(1, 128) }
         p.getProperty(K_SERVED_WINDOW)?.toIntOrNull()?.let { servedWindow = it.coerceIn(1, 4096) }
         p.getProperty(K_WS_BOUND)?.toIntOrNull()?.let { wsBound = it.coerceIn(0, 9999) }
+        staleChoice = io.myotis.ui.StaleAnchorChoice.parse(p.getProperty(K_STALE_CHOICE))
         p.getProperty(K_DEEP)?.toIntOrNull()?.let { deep = it.coerceIn(1, 128) }
         p.getProperty(K_STRICT)?.toBooleanStrictOrNull()?.let { strict = it }
         p.getProperty(K_NATIVE_BLS)?.toBooleanStrictOrNull()?.let { nativeBls = it }
@@ -1301,6 +1324,7 @@ class DesktopSettings(
         p.setProperty(K_SNAP, snap.toString())
         p.setProperty(K_SERVED_WINDOW, servedWindow.toString())
         p.setProperty(K_WS_BOUND, wsBound.toString())
+        p.setProperty(K_STALE_CHOICE, staleChoice.name)
         p.setProperty(K_DEEP, deep.toString())
         p.setProperty(K_STRICT, strict.toString())
         p.setProperty(K_NATIVE_BLS, nativeBls.toString())
@@ -1350,6 +1374,7 @@ class DesktopSettings(
         const val K_SNAP = "snapTarget"
         const val K_SERVED_WINDOW = "servedBlockWindow"
         const val K_WS_BOUND = "wsBoundPeriods"
+        const val K_STALE_CHOICE = "staleAnchorChoice"
         const val K_DEEP = "deepPool"
         const val K_STRICT = "strictStateFreshness"
         const val K_NATIVE_BLS = "nativeBls"

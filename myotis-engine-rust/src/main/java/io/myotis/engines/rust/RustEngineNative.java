@@ -37,7 +37,7 @@ final class RustEngineNative {
     private static final Logger log = LoggerFactory.getLogger(RustEngineNative.class);
 
     /** Must match {@code ABI_VERSION} in rust/myotis-engine/src/lib.rs. */
-    static final int EXPECTED_ABI_VERSION = 57; // 57: myotis_set_listen_ports (C ABI only; P2P listen ports); 56: log-index allowMetered + meteredHold (metered-download hold); 55: simulate_v1_json (#716); 54: debug_trace_call_json (#716); 53: get_raw_transaction_by_hash_json + get_raw_transaction_by_block_json (#715); 52: account and call JSON carry the proven blockHash; 51: set_activity_watch + address_activity_json (#691); 50: dataUsage + networkMetering in the status, set_network_metering; 49: ens offchain envelope carries reverseClaim; 48: log-index topic entries (#673); 47: resolve_block_hash_json, get_proof_json takes a block hash; 46: get_proof_json; 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
+    static final int EXPECTED_ABI_VERSION = 59; // 59: set_stale_anchor_policy; 58: refresh_anchor_from_checkpointz (checkpointz recovery); 57: myotis_set_listen_ports (C ABI only; P2P listen ports); 56: log-index allowMetered + meteredHold (metered-download hold); 55: simulate_v1_json (#716); 54: debug_trace_call_json (#716); 53: get_raw_transaction_by_hash_json + get_raw_transaction_by_block_json (#715); 52: account and call JSON carry the proven blockHash; 51: set_activity_watch + address_activity_json (#691); 50: dataUsage + networkMetering in the status, set_network_metering; 49: ens offchain envelope carries reverseClaim; 48: log-index topic entries (#673); 47: resolve_block_hash_json, get_proof_json takes a block hash; 46: get_proof_json; 45: check_raw_transaction_json; 44: send_raw_transaction_json refuses non-transactions (-32602)
 
     private static final boolean AVAILABLE = load();
 
@@ -273,6 +273,22 @@ final class RustEngineNative {
      */
     static boolean nativeAcceptStaleAnchor(long handle) {
         return Myotis_engineKt.acceptStaleAnchor(handle);
+    }
+
+    /**
+     * Recover a STALE_ANCHOR park from a checkpointz-agreed fresh checkpoint that
+     * long-known peers confirm ({@code allowUnconfirmed}: the user's "use it
+     * anyway"). Blocking (HTTPS + peers). JSON {@code {"applied":true,"root",
+     * "slot","epoch","operators","confirmedBy","unconfirmed"}} or
+     * {@code {"applied":false,"error","unconfirmed"}}.
+     */
+    static String nativeRefreshAnchorFromCheckpointz(long handle, boolean allowUnconfirmed) {
+        return Myotis_engineKt.refreshAnchorFromCheckpointz(handle, allowUnconfirmed);
+    }
+
+    /** The remembered stale-anchor answer (0 ask, 1 checkpoint, 2 continue). */
+    static boolean nativeSetStaleAnchorPolicy(long handle, int policy) {
+        return Myotis_engineKt.setStaleAnchorPolicy(handle, policy);
     }
 
     /** Up to {@code max} buffered engine tracing lines (oldest first, newline-joined). */
