@@ -58,9 +58,12 @@
 # takes it out of that group).
 #
 # Security updates are on, and so is "Grouped security updates" (repository
-# settings, Advanced Security; checked 2026-11-12). The groups here cover
-# version updates only, so that setting decides: security updates come
-# off-schedule, one PR per package manager and directory. A Cargo one edits
+# settings, Advanced Security; checked 2026-11-12). They reach Cargo; Gradle
+# only if the repository's automatic dependency submission is on, since
+# GitHub builds no dependency graph from Gradle files and no workflow here
+# submits one (the gradle entry's ignore comment). The groups here cover version
+# updates only, so that setting decides: security updates come off-schedule,
+# one PR per package manager and directory. A Cargo one edits
 # the shared rust/myotis-net/Cargo.toml from one workspace, so the other two
 # locks need `cargo update --workspace` by hand before `cargo locks` passes.
 # The actions get none at all (see above).
@@ -180,21 +183,29 @@ updates:
       - dependency-name: "androidx.compose:compose-bom"
       - dependency-name: "org.jetbrains.kotlinx:kotlinx-datetime"
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
-      # Moved BY HAND, in lockstep with the library whose version they match
-      # (owner's decision, 2026-11-14, #850): netty with jvm-libp2p's netty
-      # constraint (one netty everywhere), log4j with Besu's log4j-bom, and jna
-      # with Besu's transitive jna (so the jar and the Android @aar cannot drift
-      # apart under conflict resolution). Each pin's catalog comment names its
-      # partner. Every update type is held, patches too: the lockstep is an exact
-      # version. The partners themselves are NOT held, so a Dependabot bump of
-      # jvm-libp2p or Besu arrives without these: complete it by hand (move the
-      # partner pins in that PR, and for Besu the fork steps its catalog comment
-      # lists) or close it.
-      # `ignore` applies to security updates too (alerts still show): advisories
-      # against these versions come from the owner's weekly "held pins" check, a
-      # scheduled Claude task outside this repo, and are bumped by hand, answering
-      # the lockstep question then.
-      - dependency-name: "io.netty:*"
+      # Moved BY HAND (owner's decision, 2026-11-14, #850, #857):
+      # - log4j with Besu: the catalog's log4j-to-slf4j matches the log4j-bom
+      #   Besu 26.4's BOM brings (log4j-api comes from that BOM). Every update
+      #   type is held, patches too: the match is an exact version.
+      # - jna because a move needs a run on a device: the jar and the Android
+      #   natives both follow the catalog entry (the force in android-app, the
+      #   `strictly` in myotis-engine, the staged stub in app-desktop), but a
+      #   jar/native mismatch fails only at run time, and CI builds the APK
+      #   without running it. Unwatched: a Besu BOM that raises jna above the
+      #   catalog moves the desktop jar without the stub.
+      # Besu is served from Hyperledger's Artifactory, which Dependabot does not
+      # query, so its releases are watched by the owner's weekly "held pins"
+      # check (a scheduled Claude task outside this repo), not by a PR here.
+      # netty is NOT held: its 4.2.10 was inside published advisories when this
+      # was decided, and it is on Maven Central, so it moves through the group.
+      # Its HTTP codecs follow Besu's netty-bom, not the catalog, until the
+      # build gets a netty-bom platform of its own.
+      # Advisories: GitHub builds no dependency graph from Gradle files and no
+      # workflow here submits one, so unless the repository's automatic
+      # dependency submission is on, Gradle modules get no Dependabot alerts or
+      # security PRs at all, held or not. The weekly check covers them either
+      # way, and for these two it is the only path: an ignore entry holds a
+      # security PR as well.
       - dependency-name: "org.apache.logging.log4j:*"
       - dependency-name: "net.java.dev.jna:*"
     groups:
