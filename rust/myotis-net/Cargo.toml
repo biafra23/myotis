@@ -74,6 +74,17 @@ async-trait = "=0.1.92"
 # EL discv4 (el::discv4): SO_RCVBUF sizing on the UDP socket (the Android
 # NEIGHBORS-truncation trap — docs/spec/02 §9.10). An I/O-crate concern by the
 # sans-I/O rules.
+# On the 0.6 line this pin also fixes the socket2 under every other crate on
+# that line, because a graph holds one 0.6.x: tokio, discv5, libp2p-tcp, quinn,
+# quinn-udp, hyper-util and ipconfig in all three locks, and tor-rtcompat in
+# the two that hold Arti (rust/, tor-poc).
+# 0.5.10 stays locked for libp2p-quic 0.13, and quinn, quinn-udp and hyper-util
+# accept both lines (`>=0.5, <0.7`; hyper-util from 0.5.9), so a re-resolve
+# after moving this pin can put them on 0.5.10 while `cargo locks` still passes
+# (#858). `cargo update -p socket2@<old> --precise <new>` in each workspace
+# keeps every edge on the 0.6 line. After a move, check in each lock that
+# `socket2 0.5.10` is a dependency of libp2p-quic, libp2p-mdns and hickory-proto
+# 0.25.2 only (the last two are locked, not built).
 socket2 = "=0.6.5"
 # OS entropy for everything random in the EL and sync code. Some uses are
 # SECURITY-CRITICAL: the RLPx handshake's two ephemeral secret keys (ECDH and
