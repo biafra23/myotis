@@ -739,6 +739,35 @@ class SnapBackedStateOracleTest {
     }
 
     @Test
+    void aCacheThatCannotStoreDoesNotFailAProvenRead() throws Exception {
+        // bankAccount / bankStorage contain a cache failure: the record is already
+        // proven, so the read that proved it returns it instead of failing (or
+        // rotating to another peer) because the cache threw.
+        Address addr = Address.fromHex("0xabcdef0102030405060708090a0b0c0d0e0f1011");
+        BigInteger slot = BigInteger.valueOf(7);
+        BigInteger value = new BigInteger("1234567890123456789");
+        Bytes32 slotHash = Bytes32.wrap(Hash.keccak256(paddedSlot(slot)).toArrayUnsafe());
+        var storageTrie = TrieFixture.singleLeaf(slotHash, RLP.encode(w -> w.writeBigInteger(value)));
+        Bytes accountValue = encodeAccount(0L, BigInteger.ZERO, storageTrie.root,
+                Bytes32.wrap(Hash.keccak256(Bytes.EMPTY).toArrayUnsafe()));
+        var accountTrie = TrieFixture.singleLeaf(keccak(addr.toByteArray()), accountValue);
+        FixturePeer peer = new FixturePeer();
+        peer.addAccountProof(accountTrie.root, accountTrie.proof);
+        peer.addStorageProof(accountTrie.root, storageTrie.proof);
+
+        StateProofCache throwing = new StateProofCache() {
+            @Override public java.util.Optional<BigInteger> getStorage(byte[] r, BigInteger s) { return java.util.Optional.empty(); }
+            @Override public void putStorage(byte[] r, BigInteger s, BigInteger v) { throw new IllegalStateException("cache full"); }
+            @Override public java.util.Optional<AccountEntry> getAccount(byte[] r, byte[] a) { return java.util.Optional.empty(); }
+            @Override public void putAccount(byte[] r, byte[] a, AccountEntry e) { throw new IllegalStateException("cache full"); }
+        };
+        var oracle = new SnapBackedStateOracle(() -> peer, BytecodeCache.inMemory(),
+                SnapBackedStateOracle.DEFAULT_MAX_ATTEMPTS, throwing);
+        assertEquals(value, oracle.fetchStorage(accountTrie.root.toArrayUnsafe(), addr, slot).get(),
+                "a proven slot is returned although the cache throws on every write");
+    }
+
+    @Test
     void storageCacheReusedAcrossBlocksWhenStorageRootUnchanged() throws Exception {
         // The cross-BLOCK reuse the storageRoot keying buys: a slot verified at world
         // root A must be served from cache at world root B — zero storage round-trips —
