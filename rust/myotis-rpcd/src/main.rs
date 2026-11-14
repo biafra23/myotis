@@ -346,19 +346,33 @@ fn run(args: Args) -> Result<(), String> {
         limits.queue = q;
     }
     limits.body_timeout = Duration::from_secs(args.http_body_timeout);
+    // A listener whose accept thread died (#737) stops the process the way a
+    // signal does, so the engine still persists its state, and run() then
+    // fails: the exit status is non-zero and a supervisor restarts rpcd.
+    let mut signals = StopSignals::install()?;
+    let listener = http::Listener::new(|| {
+        let _ = signal_hook::low_level::raise(signal_hook::consts::SIGTERM);
+    });
     let receivers = http::spawn(
         server.clone(),
         Arc::new(router),
         vhosts,
         args.workers,
         limits,
+        listener.clone(),
     );
 
     // Graceful stop: stop accepting, shut the engine handle down (it persists
     // its sync state), flush the log ring. Workers still blocked in an engine
     // read are not waited for; the handle they hold is gone.
-    if let Some(sig) = wait_for_stop_signal()? {
-        eprintln!("myotis-rpcd: signal {sig}, stopping");
+    let sig = signals.wait();
+    // One step: from here no recv() error counts as a failure, and a failure
+    // recorded before it (even after the signal) is returned, never lost.
+    let failure = listener.stop();
+    match (&failure, sig) {
+        (Some(f), _) => eprintln!("myotis-rpcd: {f}, stopping"),
+        (None, Some(sig)) => eprintln!("myotis-rpcd: signal {sig}, stopping"),
+        (None, None) => {}
     }
     for _ in 0..receivers {
         server.unblock();
@@ -366,18 +380,33 @@ fn run(args: Args) -> Result<(), String> {
     drop(guard);
     stopping.store(true, Ordering::SeqCst);
     print_engine_logs();
-    Ok(())
+    match failure {
+        Some(f) => Err(f),
+        None => Ok(()),
+    }
 }
 
-/// Block until a stop is requested; the signal's number (`None`: the
-/// iterator closed without one). Unix: SIGINT or SIGTERM, through
-/// signal-hook's self-pipe iterator.
+/// The stop signals, registered before the listener starts: its failure hook
+/// raises SIGTERM (#737), which must find a handler, never the default action
+/// that would kill the process before the engine persists its state.
+/// [`StopSignals::wait`] blocks until one arrives and returns its number
+/// (`None`: the iterator closed without one). Unix: SIGINT or SIGTERM,
+/// through signal-hook's self-pipe iterator.
 #[cfg(unix)]
-fn wait_for_stop_signal() -> Result<Option<i32>, String> {
-    use signal_hook::consts::{SIGINT, SIGTERM};
-    let mut signals =
-        signal_hook::iterator::Signals::new([SIGINT, SIGTERM]).map_err(|e| e.to_string())?;
-    Ok(signals.forever().next())
+struct StopSignals(signal_hook::iterator::Signals);
+
+#[cfg(unix)]
+impl StopSignals {
+    fn install() -> Result<StopSignals, String> {
+        use signal_hook::consts::{SIGINT, SIGTERM};
+        signal_hook::iterator::Signals::new([SIGINT, SIGTERM])
+            .map(StopSignals)
+            .map_err(|e| e.to_string())
+    }
+
+    fn wait(&mut self) -> Option<i32> {
+        self.0.forever().next()
+    }
 }
 
 /// Windows has no signal iterator (signal-hook builds it only off Windows):
@@ -385,18 +414,26 @@ fn wait_for_stop_signal() -> Result<Option<i32>, String> {
 /// SIGTERM can be raised in-process, so each records its number in a flag the
 /// main thread polls. Shutdown is no more prompt than that needs to be.
 #[cfg(windows)]
-fn wait_for_stop_signal() -> Result<Option<i32>, String> {
-    use signal_hook::consts::{SIGBREAK, SIGINT, SIGTERM};
-    use std::sync::atomic::AtomicUsize;
-    let caught = Arc::new(AtomicUsize::new(0));
-    for sig in [SIGINT, SIGTERM, SIGBREAK] {
-        signal_hook::flag::register_usize(sig, caught.clone(), sig as usize)
-            .map_err(|e| e.to_string())?;
+struct StopSignals(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(windows)]
+impl StopSignals {
+    fn install() -> Result<StopSignals, String> {
+        use signal_hook::consts::{SIGBREAK, SIGINT, SIGTERM};
+        let caught = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for sig in [SIGINT, SIGTERM, SIGBREAK] {
+            signal_hook::flag::register_usize(sig, caught.clone(), sig as usize)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(StopSignals(caught))
     }
-    loop {
-        match caught.load(Ordering::SeqCst) {
-            0 => std::thread::sleep(Duration::from_millis(100)),
-            sig => return Ok(Some(sig as i32)),
+
+    fn wait(&mut self) -> Option<i32> {
+        loop {
+            match self.0.load(Ordering::SeqCst) {
+                0 => std::thread::sleep(Duration::from_millis(100)),
+                sig => return Some(sig as i32),
+            }
         }
     }
 }

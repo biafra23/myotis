@@ -131,6 +131,52 @@ impl Limits {
     }
 }
 
+/// The listener's health, shared by the intake threads and the caller.
+///
+/// tiny_http's `recv()` errs in two cases: a shutdown `unblock()`, and its
+/// accept thread ending on an `accept()` error such as `EMFILE` (tiny_http
+/// 0.12 `lib.rs`: the error is queued once and the accept thread breaks out
+/// of its loop). In the second case nothing accepts connections again, and
+/// the intake threads still in `recv()` would block forever on a process that
+/// looks alive (#737). So an error that arrives before [`Listener::stop`]
+/// is a failure of the whole listener: it is recorded once and handed to the
+/// caller's hook, which stops the process so a supervisor can restart it.
+pub struct Listener {
+    /// `(stopping, failure)`, under one lock so that a failure is either seen by
+    /// [`Listener::stop`] or not recorded at all.
+    state: Mutex<(bool, Option<String>)>,
+    on_failure: Box<dyn Fn() + Send + Sync>,
+}
+
+impl Listener {
+    /// `on_failure` runs once, on the intake thread that saw the failure, under
+    /// the listener's lock (so it must not call back into the listener).
+    pub fn new(on_failure: impl Fn() + Send + Sync + 'static) -> Arc<Listener> {
+        Arc::new(Listener {
+            state: Mutex::new((false, None)),
+            on_failure: Box::new(on_failure),
+        })
+    }
+
+    /// Begin the shutdown: call it BEFORE `server.unblock()`, so the errors the
+    /// unblocks produce are not taken for a failure. Returns the failure that
+    /// ended intake before it, if one did.
+    pub fn stop(&self) -> Option<String> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.0 = true;
+        state.1.clone()
+    }
+
+    fn recv_failed(&self, e: std::io::Error) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.0 || state.1.is_some() {
+            return;
+        }
+        state.1 = Some(format!("HTTP listener stopped accepting connections: {e}"));
+        (self.on_failure)();
+    }
+}
+
 /// Bodies received at once on body-reader threads. Past it a body is refused
 /// `503` without being read, so at most this many bodies (up to
 /// [`MAX_BODY_BYTES`] each) are in memory on the way in.
@@ -158,6 +204,7 @@ pub fn spawn<E: Engine + 'static>(
     vhosts: VHosts,
     workers: usize,
     limits: Limits,
+    listener: Arc<Listener>,
 ) -> usize {
     // Bounded: a request that finds every worker busy and the queue full is
     // refused, so a flood of gated reads cannot grow memory without limit.
@@ -182,10 +229,11 @@ pub fn spawn<E: Engine + 'static>(
         body_reads: AtomicUsize::new(0),
     });
     for _ in 0..INTAKE_THREADS {
-        let (server, shared) = (server.clone(), shared.clone());
-        std::thread::spawn(move || {
-            while let Ok(req) = server.recv() {
-                intake(req, &shared);
+        let (server, shared, listener) = (server.clone(), shared.clone(), listener.clone());
+        std::thread::spawn(move || loop {
+            match server.recv() {
+                Ok(req) => intake(req, &shared),
+                Err(e) => return listener.recv_failed(e),
             }
         });
     }
@@ -502,6 +550,62 @@ mod tests {
         )
     }
 
+    /// #737: an accept error ends tiny_http's accept thread for good, and the
+    /// one intake thread that sees it must stop the process (once), while the
+    /// errors of a shutdown's `unblock()`s are no failure at all.
+    #[test]
+    fn a_recv_error_before_the_shutdown_stops_the_process_once() {
+        let fired = Arc::new(AtomicUsize::new(0));
+        let hook = fired.clone();
+        let listener = Listener::new(move || {
+            hook.fetch_add(1, Ordering::SeqCst);
+        });
+        let emfile = || std::io::Error::other("Too many open files (os error 24)");
+        listener.recv_failed(emfile());
+        listener.recv_failed(emfile());
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        let failure = listener.stop().expect("recorded");
+        assert!(failure.contains("Too many open files"), "{failure}");
+
+        let fired = Arc::new(AtomicUsize::new(0));
+        let hook = fired.clone();
+        let listener = Listener::new(move || {
+            hook.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(listener.stop(), None);
+        listener.recv_failed(std::io::Error::other("thread unblocked"));
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+        assert_eq!(listener.stop(), None);
+    }
+
+    /// The shutdown's unblocks end every intake thread without a failure.
+    #[test]
+    fn unblocking_after_stopping_is_no_failure() {
+        let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+        let addr = server.server_addr().to_ip().unwrap();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let hook = fired.clone();
+        let listener = Listener::new(move || {
+            hook.fetch_add(1, Ordering::SeqCst);
+        });
+        let router = Arc::new(Router::new(Fake::new()));
+        let receivers = spawn(
+            server.clone(),
+            router,
+            VHosts::new(None, addr),
+            1,
+            Limits::new(1),
+            listener.clone(),
+        );
+        assert_eq!(listener.stop(), None);
+        for _ in 0..receivers {
+            server.unblock();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+        assert_eq!(listener.stop(), None);
+    }
+
     /// A node that never becomes ready, one read worker, and a long hold: the
     /// worker is stuck in the hold, and everything non-blocking still answers.
     #[test]
@@ -517,6 +621,7 @@ mod tests {
             VHosts::new(None, addr),
             1,
             Limits::new(1),
+            Listener::new(|| {}),
         );
 
         let held = std::thread::spawn(move || {
@@ -568,7 +673,7 @@ mod tests {
         let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
         let addr = server.server_addr().to_ip().unwrap();
         let router = Arc::new(Router::new(Fake::new()));
-        spawn(server, router, VHosts::new(None, addr), 1, Limits::new(1));
+        spawn(server, router, VHosts::new(None, addr), 1, Limits::new(1), Listener::new(|| {}));
         let rpc = r#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId"}"#;
 
         let (code, _) = exchange(
@@ -605,7 +710,7 @@ mod tests {
             queue: 1,
             ..Limits::new(1)
         };
-        spawn(server, router, VHosts::new(None, addr), 1, limits);
+        spawn(server, router, VHosts::new(None, addr), 1, limits, Listener::new(|| {}));
 
         let gated = |id: u32| {
             std::thread::spawn(move || {
@@ -658,7 +763,7 @@ mod tests {
             body_timeout: Duration::from_millis(500),
             ..Limits::new(1)
         };
-        spawn(server, router, VHosts::new(None, addr), 1, limits);
+        spawn(server, router, VHosts::new(None, addr), 1, limits, Listener::new(|| {}));
 
         // Larger than tiny_http buffers itself, so the body is read from the
         // socket; only half of it is sent.
