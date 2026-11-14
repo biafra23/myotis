@@ -71,6 +71,20 @@ class RpcRequestBodyTest {
     }
 
     @Test
+    fun `a body cut off by a connection error fails instead of being routed`() = runBlocking {
+        val channel = ByteChannel()
+        channel.writeFully(ByteArray(8) { '['.code.toByte() })
+        channel.flush()
+        channel.cancel(java.io.IOException("connection reset mid-body"))
+        val outcome = try {
+            readRequestBody({ channel }, null, 1024, 2_000)
+        } catch (e: Throwable) {
+            null
+        }
+        assertEquals(null, outcome, "a truncated body must not come back as BodyRead.Body")
+    }
+
+    @Test
     fun `a slow-drip body is cut off at the timeout`() = runBlocking {
         val channel = ByteChannel()
         val writer = launch {

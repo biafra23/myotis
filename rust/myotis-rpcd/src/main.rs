@@ -370,7 +370,8 @@ fn run(args: Args) -> Result<(), String> {
     // recorded before it (even after the signal) is returned, never lost.
     let failure = listener.stop();
     match (&failure, sig) {
-        (Some(f), _) => eprintln!("myotis-rpcd: {f}, stopping"),
+        // The failure itself is printed last, by main(), from run()'s error.
+        (Some(_), _) => eprintln!("myotis-rpcd: HTTP listener failed, stopping"),
         (None, Some(sig)) => eprintln!("myotis-rpcd: signal {sig}, stopping"),
         (None, None) => {}
     }

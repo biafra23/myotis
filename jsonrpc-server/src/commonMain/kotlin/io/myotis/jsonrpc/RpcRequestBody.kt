@@ -60,8 +60,17 @@ internal suspend fun readRequestBody(
 ): BodyRead {
     if (declaredLength != null && declaredLength > maxBytes) return BodyRead.TooLarge(0)
     return withTimeoutOrNull(timeoutMs) {
-        val source = open().readRemaining(maxBytes + 1)
-        if (source.request(maxBytes + 1)) BodyRead.TooLarge(maxBytes + 1)
-        else BodyRead.Body(source.readText(charset))
+        val channel = open()
+        val source = channel.readRemaining(maxBytes + 1)
+        if (source.request(maxBytes + 1)) {
+            BodyRead.TooLarge(maxBytes + 1)
+        } else {
+            // readRemaining(max) returns once the channel is closed, also when it was
+            // closed by an error (a client reset mid-body, bad chunk framing); unlike
+            // the overload receiveText() used, it does not rethrow. A cut-off body
+            // must fail as it did, never be routed as if it were whole.
+            channel.closedCause?.let { throw it }
+            BodyRead.Body(source.readText(charset))
+        }
     } ?: BodyRead.TimedOut
 }
