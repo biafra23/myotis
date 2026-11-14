@@ -7811,7 +7811,7 @@ impl ElReader {
         let (block_number, block_timestamp) = (ctx.block_number, ctx.timestamp);
         let walk = super::request::blocking(move || {
             let caller = ExecutorCaller { executor: &executor, ctx: &ctx };
-            run_ens_query(&caller, &query, chain_id)
+            run_ens_query(&caller, &query)
         });
         // The attempt scope drains this worker before AUTO can start another root.
         let joined = walk.await?;
@@ -11882,11 +11882,10 @@ fn ens_query_name(query: &EnsQuery) -> Option<&str> {
 fn run_ens_query(
     caller: &dyn myotis_evm::EthCaller,
     query: &EnsQuery,
-    chain_id: u64,
 ) -> Result<Option<EnsRecordValue>, EnsError> {
     Ok(match query {
         EnsQuery::Ownership { name } => {
-            myotis_evm::resolve_ownership(caller, name, chain_id)?.map(EnsRecordValue::Ownership)
+            myotis_evm::resolve_ownership(caller, name)?.map(EnsRecordValue::Ownership)
         }
         EnsQuery::Addr { name } => {
             myotis_evm::resolve_address(caller, name)?.map(EnsRecordValue::Address)
