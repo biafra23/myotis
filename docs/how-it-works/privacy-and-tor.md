@@ -175,9 +175,13 @@ embeddable as a plain library) inside the **Rust engine** — and only there:
     routing on. The directories cannot move once a bootstrap holds them; a
     different pair after that is refused, not ignored.
 
-  Checked at build level so far (both ABIs cross-compile; the engine's only
-  NEEDED libraries stay libc/libm/libdl); an on-device bootstrap has not been
-  observed yet.
+  Checked at build level with Arti 0.44 (both ABIs cross-compiled; the
+  engine's only NEEDED libraries stayed libc/libm/libdl). Arti 0.47 (#860)
+  has NOT been cross-compiled for Android yet: it compiles the Counter Galois
+  Onion relay crypto (polyval 0.7, universal-hash 0.6) unconditionally, which
+  no Android build here has built. Only its host build and the one-rustls
+  check above `rustls` in myotis-net's Cargo.toml were run. An on-device
+  bootstrap has not been observed yet.
 
   Arti adds ~9.3 MB per ABI to `libmyotis_engine.so` (arm64-v8a 15.4 →
   24.8 MB, measured 2026-10-10), stored uncompressed in the APK, so — as on
