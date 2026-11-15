@@ -70,8 +70,11 @@
 #   has no `--fallback-model`, which would answer an overloaded Fable with
 #   Opus, and a step after it fails the job when the transcript names any
 #   other model; an overloaded Fable fails the job, re-run it. Billing on the
-#   API has no usage limit, only spend, so that attempt is capped per review
-#   (`--max-budget-usd`, and the job's `timeout-minutes`). Three attempts in a row can outlast the builds' gate
+#   API has no usage limit, only spend, so that attempt runs at `--effort
+#   high`, not the subscription attempts' `max` (owner's decision,
+#   2026-11-15: Anthropic's starting point for Fable 5.2, whose gains above
+#   it are uneven), and is capped per review (`--max-budget-usd`, and the
+#   job's `timeout-minutes`). Three attempts in a row can outlast the builds' gate
 #   (wait-for-claude-review.yml), which gives up after an hour: the builds
 #   may then start before the paid review is posted, fail-open as ever.
 #
@@ -610,7 +613,8 @@ jobs:
 
       # The same Fable alias as the review job's attempt (see there), billed
       # to the API key instead of the subscription: the newest Fable, with no
-      # fallback model (see Model strategy). Keep it that way: no
+      # fallback model, at `high` effort to spend less (see Model strategy).
+      # Keep it that way: no
       # --fallback-model here, and no ANTHROPIC_DEFAULT_FABLE_MODEL anywhere.
       - name: Review (latest Fable — API credits)
         id: api
@@ -620,7 +624,7 @@ jobs:
           prompt: ${{ needs.review.outputs.prompt }}
           claude_args: |
             --model fable
-            --effort max
+            --effort high
             --max-budget-usd 15
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
