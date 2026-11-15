@@ -12,8 +12,8 @@ and issues of this repository.
 A release candidate's entry lists what it adds over the release before it; the
 final release lists only what came after its last candidate. The **engine ABI**
 is the number an embedder gates on (`init()` in the Node addon,
-`myotis_init()` over the C ABI): each entry names the one it ships when it
-moved. The entries up to 0.1.20 were written after the fact from the GitHub
+`myotis_init()` over the C ABI): from 0.1.3 on, each entry names the one it
+ships when it moved. The entries up to 0.1.20 were written after the fact from the GitHub
 release notes; those notes stay the full record of each release, including
 its trust anchors and release checks.
 
@@ -54,9 +54,8 @@ its trust anchors and release checks.
 - Log index: backfill batches are fetched from several peers at once (#743).
 - Build: AGP 9.5.1, Kotlin 2.4.21, Compose Multiplatform 1.12.2 and
   compileSdk 37 (#837, #808); Gradle 9.9.0 (#814).
-- Rust: the minimum version is 1.92 (#860). Arti 0.48 (#860, #867), uniffi
-  0.32.2 (#807), socket2 0.6.5 (#858, #865), jni 0.22.4 (#841), getrandom
-  0.4.3 (#822), aes 0.9.4, ctr 0.10.1 and cipher 0.5.2 (#840).
+- Rust: the minimum version is 1.92 (#860). Tor runs on Arti 0.48 (#860,
+  #867).
 - One netty, one BouncyCastle and Ktor 3.6 across the build (#864).
 - Engine ABI 59 (0.1.20 shipped 55).
 
@@ -502,6 +501,7 @@ PoC seeds (#706).
 ### Changed
 
 - Gnosis catch-up: 23 LC-serving peers pinned (#302).
+- Engine ABI 22.
 
 ### Fixed
 
@@ -529,6 +529,7 @@ PoC seeds (#706).
 ### Changed
 
 - The Rust engine moved from hand-written JNI to UniFFI bindings (#264).
+- Engine ABI 21.
 - Back to upstream Tuweni 2.7.2 and Netty 4.2.10 (#227).
 
 ## [0.1.2] - 2026-07-12
