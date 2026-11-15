@@ -2,8 +2,13 @@
 # Gemini Code Assist reviews).
 #
 # Setup (one-time, repo admin):
-#   1. Install the Claude GitHub App on this repo (github.com/apps/claude, or
-#      run /install-github-app from the Claude Code CLI).
+#   1. Nothing for GitHub itself: the action posts with this run's own
+#      GITHUB_TOKEN (`github_token: ${{ github.token }}` on each attempt), so
+#      the review comes from github-actions[bot]. The Claude GitHub App's
+#      token exchange is not used: Anthropic's endpoint refuses the OIDC token
+#      of a `pull_request_target` run (`401 Unauthorized - Invalid OIDC
+#      token`), which left #861, #875 and #862 without a review after #874
+#      moved this workflow to that event.
 #   2. Add the CLAUDE_CODE_OAUTH_TOKEN repo secret (from `claude setup-token`) —
 #      the first two attempts bill the Claude subscription and share its usage
 #      limits.
@@ -133,13 +138,11 @@
 #       `pull_request`, with the repository's secrets.
 #   - A PR that edits THIS FILE is reviewed by the base branch's copy, like
 #     any other PR; its own changes to it take effect, and are first
-#     exercised, once merged. The action does need the copy that runs to
-#     match the default branch's: Anthropic's token exchange refuses the
-#     Claude App's token otherwise, and the action skips, and the job still
-#     goes green, with a warning that there is no review. On this event that
-#     happens only where the PR's base branch lags the default branch on
-#     this file, such as a feature branch that has not merged a change to
-#     it.
+#     exercised, once merged. With the App's token exchange, the copy that
+#     runs also had to match the default branch's, or the action skipped
+#     with no review; the run's own token (Setup, step 1) has no such check,
+#     so the "Does this workflow match" step and its warning are kept only
+#     for a return to the App.
 name: claude-review
 
 # pull_request_target: the base branch's copy of this file runs, never the
@@ -160,13 +163,13 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # The login claude-code-action posts as with this setup (the Claude GitHub
-  # App, see Setup). Only its comments count as review feedback in the checks
-  # below, so a person or another bot (Copilot posts inline findings)
+  # The login claude-code-action posts as with this setup (the run's own
+  # GITHUB_TOKEN, see Setup). Only its comments count as review feedback in
+  # the checks below, so a person or another bot (Copilot posts inline findings)
   # commenting while the review runs can neither pass for a review nor
   # suppress the fallback. A different token setup posts under a different
   # login: change this with it, or every review reads as empty.
-  REVIEWER_LOGIN: claude[bot]
+  REVIEWER_LOGIN: github-actions[bot]
   # What each job prints after its attempt (see "What the first attempt was
   # refused, and how it ended"), from the transcript the action writes to
   # its execution file: how the run ended, each refused tool call with the
@@ -202,7 +205,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      id-token: write
     # What the fallback job needs from this one.
     outputs:
       fallback: ${{ steps.unposted.outputs.safe }}
@@ -347,6 +349,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
           prompt: ${{ steps.prompt.outputs.text }}
           claude_args: |
             --model fable
@@ -494,7 +497,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      id-token: write
     # What the api job needs from this one.
     outputs:
       api: ${{ steps.unposted.outputs.api }}
@@ -559,6 +561,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
           prompt: ${{ needs.review.outputs.prompt }}
           claude_args: |
             --model opus
@@ -692,7 +695,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      id-token: write
     steps:
       # The base branch: the working directory, where Claude Code reads its
       # rules (pull_request_target checks it out by default). No token is
@@ -755,6 +757,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
           prompt: ${{ needs.review.outputs.prompt }}
           claude_args: |
             --model fable
