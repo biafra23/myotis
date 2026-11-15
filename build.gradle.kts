@@ -1092,20 +1092,30 @@ val goEngineLibName = when {
 // file on disk (PR #832 round-5 review + follow-up): the skip path and the
 // failure path may delete only what this rule calls ours, a hand-built file
 // written OVER a stamped one is foreign again, and every library predating the
-// stamp always was.
+// stamp always was. A third field, `:stale`, is appended when a FAILED build
+// could not delete its own library (PR #861 round-2 finding, measured): the
+// file stays and ownership holds, but the stamp says it is known-stale so the
+// failed run is never recorded up-to-date (see upToDateWhen below).
 val goBuildStampPath = "go/build/.libmyotis_engine_go.built-by-gradle"
 
-/** The ONE definition of "the library on disk is this task's own", shared by
+/** The stamp's fields when the stamped identity matches the file on disk, else
+ *  null: `size:mtime` = ours and fresh; `size:mtime:stale` = ours but a failed
+ *  build's delete was refused, so it is known stale against current sources.
+ *  The ONE definition of "the library on disk is this task's own", shared by
  *  the skip path, the failure path and the up-to-date predicate so the three
  *  cannot drift apart (PR #832 round-5 follow-up review). */
-fun goLibIsOurs(): Boolean {
+fun goLibStamp(): List<String>? {
     val lib = file("go/build/$goEngineLibName")
     val stamp = file(goBuildStampPath)
-    if (!lib.isFile || !stamp.isFile) return false
-    val rec = runCatching { stamp.readText().trim().split(":") }.getOrNull() ?: return false
-    return rec.size == 2 &&
-        rec[0] == lib.length().toString() && rec[1] == lib.lastModified().toString()
+    if (!lib.isFile || !stamp.isFile) return null
+    val rec = runCatching { stamp.readText().trim().split(":") }.getOrNull() ?: return null
+    if (rec.size !in 2..3) return null
+    if (rec.size == 3 && rec[2] != "stale") return null // unknown form: not ours
+    return if (rec[0] == lib.length().toString() && rec[1] == lib.lastModified().toString()) rec else null
 }
+
+/** Ours, in either stamp form — the delete paths accept the stale mark too. */
+fun goLibIsOurs(): Boolean = goLibStamp() != null
 
 tasks.register<Exec>("goBuildCShared") {
     group = "go"
@@ -1213,8 +1223,12 @@ tasks.register<Exec>("goBuildCShared") {
             // — a Windows host still mapping the DLL makes a failed `go build`
             // fail :app:run/:app-desktop:run, against "the JVM build
             // continues" — and the stamp goes only if the library actually
-            // did, so a refused delete keeps ownership intact (the next run
-            // retries and re-attempts).
+            // did, so a refused delete keeps ownership intact. A REFUSED
+            // delete marks the stamp stale (round-2 follow-up, measured): the
+            // library and stamp both staying would otherwise satisfy the
+            // predicate AND the output snapshot, recording this failed run
+            // up-to-date and retrying nothing — the very stale-in-force state
+            // the delete exists to prevent.
             val lib = file("go/build/$goEngineLibName")
             val ours = goLibIsOurs()
             val deleted = ours && (lib.delete() || !lib.exists())
@@ -1222,6 +1236,15 @@ tasks.register<Exec>("goBuildCShared") {
                 file("go/build/myotis_engine_go.lib").delete()
                 file(goBuildStampPath).delete()
             }
+            // The stale mark itself is attempted with a guarded write: a
+            // go/build the user cannot write at all would otherwise throw
+            // HERE and fail the task, breaking the "the JVM build continues"
+            // promise this branch exists for. An unmarked stale library keeps
+            // the old (worse) behavior — retried when an input changes —
+            // rather than a crashing build.
+            val markedStale = !deleted && ours && runCatching {
+                file(goBuildStampPath).writeText("${lib.length()}:${lib.lastModified()}:stale\n")
+            }.isSuccess
             logger.warn("[go] goBuildCShared failed (exit {}) — the JVM build continues."
                     + " A -buildmode=c-shared build needs a C compiler (cgo) and, on first run,"
                     + " module downloads." + when {
@@ -1229,10 +1252,14 @@ tasks.register<Exec>("goBuildCShared") {
                             " sources and is deleted; the task RETRIES on the next build (it is" +
                             " never up-to-date while it owns no library), so installing a C" +
                             " compiler or coming back online is all it takes."
-                        ours -> " Could NOT delete go/build/$goEngineLibName (a running" +
-                            " -Pengine=go host may still have it mapped), so it and its stamp" +
-                            " stay put and the next run retries the delete; the stale library" +
-                            " serves until then."
+                        markedStale -> " Could NOT delete go/build/$goEngineLibName (a running" +
+                            " -Pengine=go host may still have it mapped): it stays and its" +
+                            " stamp is marked STALE, so the next build re-attempts the" +
+                            " delete and the build rather than trusting these bytes."
+                        ours -> " Could NOT delete go/build/$goEngineLibName and could not" +
+                            " mark its stamp stale (neither delete nor stamp write went" +
+                            " through — is go/build writable?) — the stale library serves until" +
+                            " a source change or a working delete."
                         lib.exists() -> " go/build/$goEngineLibName was not built by this task and" +
                             " stays in place — the Go engine keeps running on it, and keeping it" +
                             " fresh against these sources is the manual build's own duty."
@@ -1257,7 +1284,14 @@ tasks.register<Exec>("goBuildCShared") {
     // (go/cmd/myotis-capi/main.go #includes ../../../rust/include/…), so it is
     // an input too — an ABI-header change must rebuild the library.
     inputs.files(
-        fileTree("go") { include("**/*.go", "go.mod", "go.sum") },
+        // build/ is EXCLUDED (PR #861 round-2 summary, reproduced on this
+        // tree): it is the task's own OUTPUT directory, yet a bare
+        // fileTree("go") snapshots the directory itself, so the first build's
+        // creation of go/build reads as an input change ("Input property
+        // '$1' file …/go/build has been added") and a fresh checkout executes
+        // `go build` once more on the second run. No source ever lives there,
+        // so the exclusion loses nothing.
+        fileTree("go") { include("**/*.go", "go.mod", "go.sum"); exclude("build/**") },
         file("rust/include/myotis_engine.h"),
     ).withPathSensitivity(PathSensitivity.RELATIVE)
     // Toolchain identity is an input, as for cargoBuildHost: a go upgrade with
@@ -1281,12 +1315,16 @@ tasks.register<Exec>("goBuildCShared") {
     // so the recorded output snapshot is "absent". On the next run the inputs
     // are unchanged and the output is still absent — unchanged since the last
     // execution — so Gradle would mark it UP-TO-DATE and never retry, even once
-    // a C compiler is installed or the network is back. `upToDateWhen` is
-    // consulted exactly when the inputs look unchanged, which is that case, so
-    // gating it forces the retry. (Round 3 removed a predicate I had added for
-    // this on the reasoning that a deleted output is out-of-date on its own —
-    // true for a library deleted after a SUCCESSFUL build, which is what round
-    // 3 measured, but NOT for the absent-snapshot failure case.)
+    // a C compiler is installed or the network is back. Measured on the pinned
+    // Gradle (round-2 follow-up): the predicate is evaluated FIRST, whatever
+    // the inputs did — a false predicate executes the task regardless of the
+    // snapshot, a true one leaves the decision to the input/output comparison.
+    // Gating it on ownership therefore forces the retry for exactly the case
+    // above, and costs nothing where the snapshot already rebuilds. (Round 3
+    // removed a predicate I had added for this on the reasoning that a deleted
+    // output is out-of-date on its own — true for a library deleted after a
+    // SUCCESSFUL build, which is what round 3 measured, but NOT for the
+    // absent-snapshot failure case.)
     //
     // And it must ask "is this OUR library", not "does some library exist"
     // (round-5 follow-up review, measured): a foreign library left in place by
@@ -1298,7 +1336,17 @@ tasks.register<Exec>("goBuildCShared") {
     // on every run — which is what the README promises ("retries on every
     // later build"), and the rebuild rewrites the file, so it self-resolves
     // the moment the toolchain works.
-    outputs.upToDateWhen { goLibIsOurs() }
+    //
+    // And it takes the FRESH stamp form only — a STALE-marked library (a
+    // failed build whose delete was refused, see the failure path above) is
+    // ours but known-stale, and must not read up-to-date either (round-2
+    // finding, measured): it satisfied the predicate AND the output snapshot,
+    // so nothing re-attempted the delete or the build until some tracked input
+    // happened to change again. Requiring the two-field form makes the next
+    // run re-execute; a success restamps fresh, a refused delete re-marks
+    // stale, and the skip path still deletes the stale-marked library (it
+    // asks goLibIsOurs, which accepts both forms).
+    outputs.upToDateWhen { goLibStamp()?.size == 2 }
 }
 
 // Regenerate the UniFFI Kotlin bindings for the Rust engine into :myotis-engine-rust's

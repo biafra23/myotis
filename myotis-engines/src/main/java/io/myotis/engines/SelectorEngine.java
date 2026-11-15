@@ -336,21 +336,31 @@ public final class SelectorEngine implements MyotisEngine {
      *  only on a change retries. Go is pushed only when ALREADY built —
      *  probing/building it here would map libmyotis_engine_go on hosts whose
      *  choice never routes to it (PR #832 review); a Go engine built later is
-     *  seeded with this value by {@link #goEngine()}. The Go-read + Java-write
-     *  pair runs under {@code goEngine()}'s monitor (PR #832 round-5 follow-up
-     *  review): without it, a push arriving mid-build read {@code go == null},
-     *  skipped Go, and landed in Java AFTER the seed had read Java — leaving
-     *  Go on the OLD value while {@link #networkMetering()} reported the NEW
-     *  one, unretried by a host that pushes only on a change. Today only the
-     *  Android host pushes and it never routes to Go, so the interleaving is
-     *  latent, not live; a push then waits behind an in-flight Go construction
-     *  (native load) — unreachable on the pushing host, and worth the one
-     *  lock rather than a second one to reason about. */
+     *  seeded with this value by {@link #goEngine()}. The WHOLE push — Rust,
+     *  Go-read, Java-write — runs under {@code goEngine()}'s monitor (PR #832
+     *  round-5 follow-up review + its round-2 follow-up): without it on the
+     *  Go side, a push arriving mid-build read {@code go == null}, skipped
+     *  Go, and landed in Java AFTER the seed had read Java — leaving Go on the
+     *  OLD value while {@link #networkMetering()} reported the NEW one,
+     *  unretried by a host that pushes only on a change. The Rust write lives
+     *  in here too (round-2 follow-up): with it outside, two overlapping
+     *  pushes could interleave their Rust writes against each other's Java
+     *  writes and leave Rust on the OLDER reading while
+     *  {@link #networkMetering()} reports the newer one — the same
+     *  unretried-stale state, on the engine Android runs by default (the
+     *  interleaving predates this PR; the lock had widened its window). One
+     *  push, one step, all three engines. The monitor is also the one
+     *  {@link #create} holds (a {@code synchronized} method), so a push can
+     *  wait behind an in-flight network create — or behind an in-flight Go
+     *  construction (native load) — which is fine for the threads involved:
+     *  pushes ride the host's query pool, creates its boot workers, and
+     *  creates hold this lock only for their fast bookkeeping (the slow
+     *  start() is the host's call, not this method's). */
     @Override
     public void setNetworkMetering(NetworkMetering metering) {
         if (metering == null) throw new EngineException("metering is required");
-        if (RustMyotisEngine.isAvailable()) rustEngine().setNetworkMetering(metering);
-        synchronized (this) { // the monitor goEngine() seeds and publishes under
+        synchronized (this) { // the monitor goEngine() seeds under and create() holds
+            if (RustMyotisEngine.isAvailable()) rustEngine().setNetworkMetering(metering);
             GoMyotisEngine g = go;
             if (g != null) g.setNetworkMetering(metering);
             java.setNetworkMetering(metering);
