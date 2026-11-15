@@ -20,7 +20,9 @@ asset workflow and a stronger action than the merge this file already forbids.
 Ask the owner too whether any merge since the last tag is an embargoed
 security fix: the release PR and the release notes then stay neutral until
 the advisory is published (`security-fixes.md`, steps 8 and 9; owner's
-request, 2026-11-15, on #870).
+request, 2026-11-15, on #870). `git log <last tag>..origin/main
+--grep='^Merge pull request from GHSA-'` lists the advisory merges, so the
+question does not rest on memory.
 
 1. **Refresh the trust checkpoints?** The embedded checkpoints (`@checkpoint:*`
    blocks in `NetworkConfig.java`, mirrored in `rust/myotis-net/src/sync.rs`;

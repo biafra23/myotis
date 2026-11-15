@@ -23,7 +23,7 @@ against. Do not move them out of `.claude/`, and not into `.claude/rules/`
 | add or bump a dependency, move a toolchain pin, touch build scripts or packaging | `.claude/agent/reproducibility.md` |
 | use a JDK API newer than Java 8 in Android-consumed code, or add HTTP         | `.claude/agent/platform.md`          |
 | add a data source, or touch roost, log-index seeds, `:tx-history`, Portal     | `.claude/agent/data-sources.md`      |
-| work on a security issue that is not public yet (a private advisory)        | `.claude/agent/security-fixes.md`    |
+| work on, or come across, a security issue that is not public yet             | `.claude/agent/security-fixes.md`    |
 
 ## Build & Run
 
@@ -126,8 +126,10 @@ right after `gh pr create` (`.claude/agent/workflow.md`).
 ## Embargoed security fixes
 
 Full text: `.claude/agent/security-fixes.md` (owner's request, 2026-11-15, on #870).
-A vulnerability that is not public yet (reported through `SECURITY.md`) does
-NOT take Workflow steps 3-5. **Until the owner has merged the fix, nothing
+A vulnerability that is not public yet (reported through `SECURITY.md`, handed
+over in private, or found by you in shipped code: then tell the owner in the
+conversation first, before it appears anywhere on GitHub) does NOT take
+Workflow steps 3-5. **Until the owner has merged the fix, nothing
 leaves the machine**: no push to any branch of this repo, the designated one
 included, and no PR, issue or comment about it. From the merge until the
 advisory is published, pushes and PRs are normal again but neutrally worded.
@@ -175,6 +177,9 @@ Full text: `.claude/agent/reproducibility.md`.
   produces (build scripts, dependencies and pins, toolchain pins, Cargo
   manifests and locks, packaging, release workflows, build-time code). When
   unsure, dispatch it on the PR's branch.
+- An embargoed security fix has no run before its advisory merge: its local
+  Linux comparison and the run on `main` before any tag are in
+  `.claude/agent/security-fixes.md`.
 - A red comparison is a blocker, like red CI. **Never make it green by adding a
   pattern to `known-differences.txt` or by loosening `scripts/repro/compare.py`
   / `collect.sh`** — that is the owner's call.

@@ -1,14 +1,19 @@
 # Fixing a privately reported vulnerability
 
 > Read in full before you start work on a security issue that is not public
-> yet: a report received through `SECURITY.md` (a private advisory), or one
-> the owner hands you in private. The owner's request, 2026-11-15, on #870.
+> yet: a report received through `SECURITY.md` (a private advisory), one the
+> owner hands you in private, or **one you come across yourself** in code
+> `main` already ships, during other work or a review. For that last one,
+> stop and tell the owner in the conversation before it appears anywhere on
+> GitHub: in a commit, a PR or a review reply. The owner's request,
+> 2026-11-15, on #870.
 
 `SECURITY.md` promises a reporter that the discussion stays in the private
 advisory and that the advisory is published once a fixed release is out.
 The standing Workflow points the other way: every work item gets a public PR,
 and PRs are the project's public record. This procedure replaces steps 3 to 5
-of the Workflow for an embargoed fix and nothing else. Every other rule in
+of the Workflow for an embargoed fix, and step 1's branch (a local one, never
+pushed), and nothing else. Every other rule in
 `CLAUDE.md` still applies, the hard rules first.
 
 ## When it applies
@@ -47,12 +52,18 @@ again (steps 7 to 9 need them), but every one of them stays neutral:
 
 ## Steps
 
-1. **Check that the build runs here, before you code.** Run `./gradlew help`
-   (and `cargo --version` for Rust work). If the session cannot build (no
+1. **Check that the build runs here, before you code.** Run a quick compile
+   that resolves dependencies (`./gradlew :core:compileJava`; `./gradlew help`
+   resolves none, so a blocked repository would not show). For Rust work, run
+   `(cd rust && cargo --version)`: the build probes from `rust/`, where the
+   pinned toolchain applies and rustup fetches it, and `cargo --version` at
+   the root reports rustup's default instead. If the session cannot build (no
    toolchain, a proxy that blocks a repository), say so to the owner at once:
    the fix is then built and tested where it can be (a local session, the
    owner's machine) before the patch goes into the private fork.
 2. **Code** the fix on a local branch off the current `main`. Do not push it.
+   Its commit messages, code comments and test names become permanent in
+   `git log` at the merge: word them neutrally from the start (below).
 3. **Run what CI would run, locally.** GitHub runs no CI and no status
    checks in an advisory's temporary private fork, and no integration (the
    CI reviewer among them) can reach it. A PR into `main` is checked by more
@@ -60,7 +71,16 @@ again (steps 7 to 9 need them), but every one of them stays neutral:
    - `./gradlew build` (or with `-PskipRustEngine`, saying so), and
      `./gradlew cargoTest` for Rust changes, with the clippy and no_std
      checks of `rust-clippy.yml` and `no-std-canary.yml`.
-   - A test that fails without the fix and passes with it.
+   - A test that fails without the fix and passes with it. That test is the
+     reproduction, and it lands on public `main` with the merge, before the
+     fixed release. Whether it ships with the fix or follows as a second patch
+     once the advisory is published is the owner's disclosure decision: ask,
+     and keep it as a separate commit either way.
+   - **A task Gradle skipped is "not run", never "passed".** `cargoTest`,
+     `cargoBuildNoStd` and `verifyRustVersionFloor` skip without the pinned
+     toolchain and the build still ends in BUILD SUCCESSFUL (one `[rust] …
+     skipping` note); `ci.yml` installs the toolchain to avoid exactly that.
+     Read the output for skip notes before you report.
    - `android-apk.yml`: the minSdk 29 gate, which runs nowhere else. Build
      the APKs and run `python3 scripts/check_apk_min_api.py --apk <apk>` on
      each.
@@ -110,7 +130,12 @@ again (steps 7 to 9 need them), but every one of them stays neutral:
    collaborators the owner adds can review it.
 6. **The owner merges** the fork's PR into `main` from the advisory. That
    merge is the owner's action, as every merge is. Never merge, and never
-   enable auto-merge.
+   enable auto-merge. GitHub titles that merge commit `Merge pull request
+   from GHSA-…`, which no neutral wording reaches, and enforces none of
+   `main`'s protection rules for it: from that moment `main` shows a marked
+   security fix with no fixed release out. So the report of step 5 says what
+   the release will need (step 8), so the owner can prepare it and merge when
+   the release can follow directly. The timing is the owner's.
 7. **After the merge, before the release.** The fix is public from the merge
    on. The owner, or a session the owner asks, checks every workflow run on
    the merge commit, not `CI` alone (`android-apk.yml`, `gradle-pins.yml`,

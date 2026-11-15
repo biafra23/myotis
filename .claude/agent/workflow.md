@@ -8,7 +8,8 @@
 Every change to this repository goes through this sequence, in order, with **no
 step skipped and none treated as optional or "only if asked"**:
 
-1. **Code** — make the change on the designated branch.
+1. **Code** — make the change on the designated branch (an embargoed security
+   fix: a local branch, never pushed; `security-fixes.md`).
 2. **Review** — run the internal code review on the diff (the `code-review`
    skill / `/code-review`) and address what it finds before going further.
 3. **PR** — open a pull request. This is the default next step after review, not
