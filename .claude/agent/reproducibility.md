@@ -67,7 +67,10 @@
 ## No merge into `main` may break reproducibility
 
 **A PR whose merge would make a release build non-reproducible does not merge
-into `main`** (owner ruling, 2026-11-10). "Reproducible" is what
+into `main`** (owner ruling, 2026-11-10). An embargoed security fix reaches `main` through
+its advisory, where the workflow cannot run before the merge: its local
+Linux comparison and the run on `main` before any tag are in
+`security-fixes.md` (owner's request, 2026-11-15, on #870). "Reproducible" is what
 `reproducible-builds.yml` GATES (#734): the artifact built twice — two
 runners, different checkout path, `CARGO_HOME`, `GRADLE_USER_HOME`, time zone,
 locale, umask and wall clock, and on Linux, where both builds run in the
