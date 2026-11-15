@@ -241,8 +241,8 @@ public final class SelectorEngine implements MyotisEngine {
      *  leaves it reporting the OLD value and a host that pushes only on a change
      *  retries.
      *
-     *  <p>The Rust-read/write and the Java-write run under {@code this} monitor
-     *  (the same one {@link #rustEngine} initializes under and {@link #create}
+     *  <p>The Rust write and the Java write run under {@code this} monitor (the
+     *  same one {@link #rustEngine} initializes under and {@link #create}
      *  holds) so a push is one ATOMIC step for both engines. Without it, two
      *  overlapping pushes could interleave their Rust and Java writes and leave
      *  the two engines on DIFFERENT values — e.g. Rust on push A's reading,
