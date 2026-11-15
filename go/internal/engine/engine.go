@@ -501,6 +501,10 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 	}
 	defer h.Close()
 	syncer := clsync.NewSyncer(c, h, logf)
+	// Trust-decision lines (the stale-anchor waiver) go out at WARN,
+	// matching the Rust twin's tracing::warn! and surviving the hosts'
+	// WARN-filtered pump view (PR #877 round 4).
+	syncer.Warnf = func(f string, a ...any) { e.log.Warn(fmt.Sprintf(f, a...)) }
 	// The C ABI's live setters reach the weak-subjectivity gates
 	// through these hooks (read at every check, not captured):
 	// myotis_set_ws_bound_periods and myotis_accept_stale_anchor.

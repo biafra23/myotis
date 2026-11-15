@@ -719,15 +719,17 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
         boolean ok = linked(() -> GoEngineNative.nativeSetStaleAnchorPolicy(handle, policy.ordinal()));
         if (!ok) {
             if (policy == io.myotis.api.StaleAnchorPolicy.CHECKPOINT) {
-                // CHECKPOINT is refused for its missing fetch — but the
-                // refusal still withdraws a remembered CONTINUE (the
-                // engine un-arms on any replacement, host.rs), so say
-                // that: a reader of this line must not assume an earlier
-                // "continue anyway" still holds (PR #877 round 3).
+                // CHECKPOINT is refused for its missing fetch. The
+                // refusal withdraws a REMEMBERED CONTINUE (the engine
+                // un-arms on any replacement, host.rs) but NOT a
+                // one-shot AcceptStale (stalePolicy stays 0 there, so
+                // the withdrawal line does not fire) — the wording has
+                // to hold for both, and for a dead handle where
+                // nothing moved at all (PR #877 rounds 3-4).
                 log.warn("[engines] setStaleAnchorPolicy(CHECKPOINT) not applied: the Go "
-                        + "engine has no checkpoint fetch — and any previously remembered "
-                        + "'continue anyway' IS withdrawn by this refusal, so stale anchors "
-                        + "are back on 'ask'");
+                        + "engine has no checkpoint fetch. A remembered 'continue anyway', if "
+                        + "there was one, IS withdrawn by this refusal; a one-shot accept given "
+                        + "earlier this run still holds");
             } else {
                 log.warn("[engines] setStaleAnchorPolicy({}) not applied: unknown handle, or "
                         + "a closed engine", policy);

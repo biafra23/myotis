@@ -74,11 +74,16 @@ func TestStaticParsesEveryStaticPeer(t *testing.T) {
 }
 
 // TestStaleGateConsentWaiverIsLogged pins the audit trail PR #877
-// round 3 asked for: waiving the weak-subjectivity bound on the host's
-// consent is the one trust decision in this flow, so it must leave a
-// line in the log the hosts drain — once per loop, naming what it
-// waived — while a refusal keeps its error and stays silent here (the
-// refusal is reported by the caller that parks on it).
+// rounds 3-4 asked for: waiving the weak-subjectivity bound on the
+// host's consent is the one trust decision in this flow, so it must
+// leave a line in the log the hosts drain — once per loop, naming
+// what it waived, and at WARN: the Rust twins are tracing::warn!
+// (sync.rs:2478/2849/2491) and normalizeForHostPumps promises the
+// hosts' WARN-filtered view keeps exactly this class of line, so a
+// waiver logged at INFO would be dropped from it. Capture therefore
+// goes through the Warnf hook, pinning the routing; a second case
+// pins the nil-Warnf fallback reaching Logf. A refusal stays silent
+// here — it is reported by the caller that parks on it.
 func TestStaleGateConsentWaiverIsLogged(t *testing.T) {
 	const bound = 13
 	cases := []struct {
@@ -95,9 +100,10 @@ func TestStaleGateConsentWaiverIsLogged(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var lines []string
+			var warnLines []string
 			s := &Syncer{
-				Logf:          func(f string, a ...any) { lines = append(lines, fmt.Sprintf(f, a...)) },
+				Logf:          func(string, ...any) { t.Fatal("waiver must not reach the plain log hook") },
+				Warnf:         func(f string, a ...any) { warnLines = append(warnLines, fmt.Sprintf(f, a...)) },
 				WsBound:       func() uint64 { return bound },
 				StaleAccepted: func() bool { return tc.accepted },
 			}
@@ -106,15 +112,21 @@ func TestStaleGateConsentWaiverIsLogged(t *testing.T) {
 			if tc.stale {
 				anchor, wall = bound+1, 2*bound+2 // gap bound+1 > bound
 			}
+			// Both passes' verdicts are asserted — the second pass
+			// only proves no repeat line (round-4 nit: an earlier
+			// version overwrote the first err unchecked).
 			err := s.staleGate(anchor, wall, "held committee")
-			err = s.staleGate(anchor, wall, "held committee") // second pass: no repeat
 			if tc.wantErr != (errors.Is(err, ErrStaleAnchor)) {
-				t.Fatalf("err = %v, wantErr = %v", err, tc.wantErr)
+				t.Fatalf("first pass err = %v, wantErr = %v", err, tc.wantErr)
 			}
-			if len(lines) != tc.wantLogs {
-				t.Fatalf("logged %d lines %q, want %d", len(lines), lines, tc.wantLogs)
+			err = s.staleGate(anchor, wall, "held committee")
+			if tc.wantErr != (errors.Is(err, ErrStaleAnchor)) {
+				t.Fatalf("second pass err = %v, wantErr = %v", err, tc.wantErr)
 			}
-			for _, l := range lines {
+			if len(warnLines) != tc.wantLogs {
+				t.Fatalf("logged %d lines %q, want %d", len(warnLines), warnLines, tc.wantLogs)
+			}
+			for _, l := range warnLines {
 				for _, want := range []string{"STALE ANCHOR", "period 14", "wall period 28", "bound 13", "waives"} {
 					if !strings.Contains(l, want) {
 						t.Errorf("waiver line %q missing %q", l, want)
@@ -123,4 +135,19 @@ func TestStaleGateConsentWaiverIsLogged(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("nil Warnf falls back to Logf", func(t *testing.T) {
+		var lines []string
+		s := &Syncer{
+			Logf:          func(f string, a ...any) { lines = append(lines, fmt.Sprintf(f, a...)) },
+			WsBound:       func() uint64 { return bound },
+			StaleAccepted: func() bool { return true },
+		}
+		if err := s.staleGate(bound+1, 2*bound+2, "best anchor"); err != nil {
+			t.Fatalf("consented gate refused: %v", err)
+		}
+		if len(lines) != 1 || !strings.Contains(lines[0], "waives") {
+			t.Fatalf("fallback logged %q, want the one waiver line", lines)
+		}
+	})
 }

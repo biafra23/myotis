@@ -89,6 +89,13 @@ type Syncer struct {
 	// for the rest of the loop's life, exactly as the contract says
 	// ("for the rest of this run; never persisted"). nil → never.
 	StaleAccepted func() bool
+	// Warnf carries trust-decision lines the Rust twin logs at WARN
+	// (the stale-anchor waiver, sync.rs:2478/2849/2491 — all
+	// tracing::warn!). The engine wires it to its WARN ring so the
+	// hosts' WARN-filtered views keep the line (normalizeForHostPumps
+	// promises exactly that); nil falls back to Logf so a Syncer
+	// built without it — tests, future callers — still logs.
+	Warnf func(string, ...any)
 
 	peersMu   sync.Mutex
 	peers     map[peer.ID]*peerState
@@ -131,6 +138,16 @@ func (s *Syncer) staleAccepted() bool {
 	return s.StaleAccepted != nil && s.StaleAccepted()
 }
 
+// warnf picks the WARN hook, falling back to the plain log hook —
+// split out so the waiver line cannot silently regress to INFO when
+// the fallback is what a caller wired (PR #877 round 4).
+func (s *Syncer) warnf() func(string, ...any) {
+	if s.Warnf != nil {
+		return s.Warnf
+	}
+	return s.Logf
+}
+
 // staleGate is the ONE weak-subjectivity check both layers share
 // (start gate + in-run layer): refused unless the host consented to
 // the age, and judged against the bound in force at this instant.
@@ -143,7 +160,7 @@ func (s *Syncer) staleGate(anchorPeriod, wallPeriod uint64, what string) error {
 	}
 	if s.staleAccepted() {
 		s.staleWaiveOnce.Do(func() {
-			s.Logf("STALE ANCHOR: %s period %d is past the weak-subjectivity bound "+
+			s.warnf()("STALE ANCHOR: %s period %d is past the weak-subjectivity bound "+
 				"(wall period %d, bound %d) — the host's stale-anchor consent waives "+
 				"the gate; syncing forward from the stale anchor",
 				what, anchorPeriod, wallPeriod, s.boundPeriods())
