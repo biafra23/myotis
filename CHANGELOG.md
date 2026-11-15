@@ -28,7 +28,9 @@ its trust anchors and release checks.
   `refreshAnchorFromCheckpointz`, `setStaleAnchorPolicy`, `AnchorRefresh`,
   `StaleAnchorPolicy` (#761).
 - The Go engine: a minimal Myotis engine in Go with discovery, RLPx + eth, the
-  light client and snap reads (#773).
+  light client and snap reads (#773), on go-ethereum v1.16.9, where a crafted
+  discovery reply can no longer panic the host process (#838). No release
+  carried the Go engine before this one.
 - Log index: predefined contracts (RAILGUN, Swarm, Privacy Pools, Tornado
   Cash) with download and disk estimates, downloaded on unmetered networks
   only by default (#753).
@@ -45,8 +47,10 @@ its trust anchors and release checks.
 
 - Rust engine: each address gets its own snap peers. Account, storage,
   `eth_getProof` and address-keyed `eth_call` / `eth_estimateGas` reads rank
-  the peers in each health tier by a salted per-address hash, so one peer no
-  longer sees every address of a wallet (#863, biafra23/punicus#253).
+  the peers in each health tier by a salted per-address hash, so a wallet's
+  addresses are spread over its peers instead of all leading with the same
+  one (#863, biafra23/punicus#253; limits, such as a cold start, in
+  docs/how-it-works/privacy-and-tor.md).
 - Log index: backfill batches are fetched from several peers at once (#743).
 - Build: AGP 9.5.1, Kotlin 2.4.21, Compose Multiplatform 1.12.2 and
   compileSdk 37 (#837, #808); Gradle 9.9.0 (#814).
@@ -61,18 +65,28 @@ its trust anchors and release checks.
 - `myotis-node`: a use-after-free at teardown (#455, #852).
 - The JSON-RPC servers bound a request body instead of reading it whole
   (#667, #852).
-- The findings of the Rust tour's review (#737, #852).
-- myotis-evm: a verified account is banked before its read completes (#849),
-  and a race in the shared state cache (#842).
+- The light client could rotate its sync committee twice after a catch-up
+  force-rotation and then refuse updates signed in the real period; fixed in
+  the Java, Rust and Go engines (#737, #852).
+- `myotis-rpcd` exits non-zero when its listener thread dies, so a supervisor
+  restarts it (#737, #852).
+- A result that arrives on the same poll as a late cancellation is returned,
+  not reported as a failure (#737, #852).
+- myotis-evm: a verified account is banked before its read completes, so a
+  read right after it no longer re-proves it from a peer (#849).
 - A missing entropy source fails the RLPx dial, not the process (#826).
 
 ### Security
 
-- The Tor reserve fails closed without entropy: no salt and no seed (#829).
-- go-ethereum v1.16.9 for the Go engine: a peer packet could kill any host
-  process (#838).
-- hickory-resolver 0.26.3 and rustls 0.23.46, and libp2p without its DNS
-  transport (#806).
+- Tor mode on a host without OS entropy (early boot, a seccomp sandbox): the
+  Tor reserve's fill salt and per-read seed fell back to zeros, which made the
+  order of Tor peers computable. The Tor path now fails closed instead (#823,
+  #829).
+- hickory-resolver 0.26.3, for its 0.26.2 security release (DNS response
+  parsing panics, UDP spoofing, resource exhaustion). It is used by the
+  EIP-1459 DNS walk on desktop, the daemon and `myotis-rpcd`, not on Android
+  or iOS. Also rustls 0.23.46, and libp2p is built without its DNS transport
+  (#806).
 
 ## [0.1.20] - 2026-11-07
 

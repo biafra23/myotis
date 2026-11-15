@@ -209,12 +209,18 @@ asset workflow and a stronger action than the merge this file already forbids.
 6. **Add the release to `CHANGELOG.md`. MANDATORY — not a question, and part
    of the SAME release PR** (owner's request, 2026-11-15, mirroring Punicus
    #281). `CHANGELOG.md` follows Keep a Changelog. The release PR turns
-   `## [Unreleased]` into `## [X.Y.Z] - <date of the PR>` (the tag's version,
-   its suffix included for a release candidate such as `0.1.21-rc1`), starts a
-   new empty `## [Unreleased]` above it, and updates the compare links at the
-   bottom (`[X.Y.Z]` compares the previous tag with `vX.Y.Z`; `[Unreleased]`
-   compares `vX.Y.Z` with `HEAD`). Check the entry against the merged PRs since
-   the last tag (`git log --first-parent <last tag>..main`): every change a
+   `## [Unreleased]` into `## [X.Y.Z] - <date>` (the exact version of the tag
+   the owner will push, its suffix included for a release candidate such as
+   `0.1.21-rc1`; when the tag's shape is still open, ask the owner which tag it
+   will be), starts a new empty `## [Unreleased]` above it, and updates the
+   compare links at the bottom (`[X.Y.Z]` compares the previous tag with
+   `vX.Y.Z`; `[Unreleased]` compares `vX.Y.Z` with `HEAD`). The date is the day the tag is expected;
+   if it lands on another day, the next release PR corrects it, so a date
+   always means the day the tag's release was published. **Every `v*` tag gets
+   a PR that does at least this step**, a further candidate or a final release
+   after a candidate included, even when step 4 has nothing to move (as for
+   `v0.1.19-rc2`, whose version core was already 0.1.19). Check the entry
+   against the merged PRs since the last tag (`git log --first-parent <last tag>..main`): every change a
    user, an embedder or a packager would notice, under Added, Changed,
    Fixed, Removed or Security, with its PR and issue numbers. A fix to a
    vulnerability, such as #611, goes under Security and says who was
