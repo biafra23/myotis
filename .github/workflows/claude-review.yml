@@ -49,7 +49,10 @@
 #   the same way. After each attempt, a step prints what it was refused and
 #   how it ended, so a silent attempt explains itself.
 #
-#   Subscription first, API credits last. When the subscription's own limit
+#   Subscription first, API credits last (owner's decision, 2026-11-15):
+#   with Fable's limit spent but Opus's not, the review is Opus on the
+#   subscription, not paid Fable, so the credits are still there once the
+#   whole subscription is spent. When the subscription's own limit
 #   (the 5-hour or weekly one every model shares) is spent, the Opus attempt
 #   is rejected too, and a third attempt (the `api` job) runs latest Fable
 #   billed to ANTHROPIC_API_KEY instead. It runs only when the Opus attempt
