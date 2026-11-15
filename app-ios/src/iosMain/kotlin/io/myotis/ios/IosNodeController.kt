@@ -288,6 +288,8 @@ class IosNodeController(
         // Weak-subjectivity bound override lands BEFORE start() so the cold-start
         // gate judges with it (0 = the network default, applied engine-side).
         RustEngine.setWsBoundPeriods(handle, settings.wsBoundPeriods().toLong())
+        // The remembered stale-anchor answer, applied by the engine at the park itself.
+        RustEngine.setStaleAnchorPolicy(handle, stalePolicyCode(settings.staleAnchorChoice()))
         if (!RustEngine.start(handle)) {
             RustEngine.stop(handle)
             logs.append("ERROR failed to start the $net stack")
@@ -393,9 +395,35 @@ class IosNodeController(
         }
     }
 
+    override fun applyStaleAnchorChoice(choice: io.myotis.ui.StaleAnchorChoice) {
+        val code = stalePolicyCode(choice)
+        locked { handles.values.toList() }.forEach { RustEngine.setStaleAnchorPolicy(it, code) }
+    }
+
+    /** By name, so the UI enum and the engine's codes cannot drift by reordering. */
+    private fun stalePolicyCode(c: io.myotis.ui.StaleAnchorChoice) =
+        io.myotis.engine.ios.StaleAnchorPolicy.valueOf(c.name).ordinal
+
     override fun acceptStaleAnchor(network: String) {
         val net = canonical(network)
         locked { handles[net] }?.let { RustEngine.acceptStaleAnchor(it) }
+    }
+
+    // Blocking (HTTPS + long-known peers); the dialog calls it off the main thread.
+    override fun refreshAnchorFromCheckpointz(network: String, allowUnconfirmed: Boolean): io.myotis.ui.FreshAnchorResult {
+        val net = canonical(network)
+        val handle = locked { handles[net] }
+            ?: return io.myotis.ui.FreshAnchorResult(false, "No fresh checkpoint: $network is not running.")
+        val o = runCatching {
+            engineJson.parseToJsonElement(RustEngine.refreshAnchorFromCheckpointz(handle, allowUnconfirmed)).jsonObject
+        }.getOrElse { return io.myotis.ui.FreshAnchorResult(false, "No fresh checkpoint: malformed engine reply.") }
+        val applied = (o["applied"] as? JsonPrimitive)?.booleanOrNull == true
+        fun strings(key: String) = (o[key] as? kotlinx.serialization.json.JsonArray)
+            ?.mapNotNull { (it as? JsonPrimitive)?.content } ?: emptyList()
+        val slot = (o["slot"] as? JsonPrimitive)?.longOrNull ?: 0L
+        val error = (o["error"] as? JsonPrimitive)?.content
+        val unconfirmed = (o["unconfirmed"] as? JsonPrimitive)?.booleanOrNull == true
+        return io.myotis.ui.FreshAnchorResult.of(applied, strings("operators"), slot, error, strings("confirmedBy"), unconfirmed)
     }
 
     // blst is compiled into the engine and the Rust engine is the only engine

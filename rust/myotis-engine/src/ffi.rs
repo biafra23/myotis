@@ -155,6 +155,26 @@ pub fn accept_stale_anchor(handle: i64) -> bool {
     crate::host::accept_stale_anchor(handle)
 }
 
+/// The remembered answer to a STALE_ANCHOR park, applied by the sync loop even
+/// with no UI open: 0 ask, 1 fresh checkpoint, 2 continue anyway.
+/// False for an unknown handle or code.
+#[uniffi::export]
+pub fn set_stale_anchor_policy(handle: i64, policy: i32) -> bool {
+    crate::host::set_stale_anchor_policy(handle, policy)
+}
+
+/// Recover a STALE_ANCHOR park from a fresh checkpoint every answering
+/// checkpoint-sync server names (two or more operators), confirmed by a
+/// long-known peer; `allow_unconfirmed` is the user's explicit "use it anyway".
+/// Blocking (HTTPS + peers); JSON `{"applied":true,"root","slot","epoch",
+/// "operators","confirmedBy","unconfirmed"}` or
+/// `{"applied":false,"error","unconfirmed"}` (see
+/// `host::refresh_anchor_from_checkpointz`).
+#[uniffi::export]
+pub fn refresh_anchor_from_checkpointz(handle: i64, allow_unconfirmed: bool) -> String {
+    crate::host::refresh_anchor_from_checkpointz(handle, allow_unconfirmed)
+}
+
 /// Live-set the eth/69 served-block window (the Settings knob). Clamped to
 /// [1, 4096]; applied immediately on a RUNNING handle's EL reader, stashed for
 /// the next spin_up when the handle isn't running. False only for an unknown

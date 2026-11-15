@@ -53,6 +53,10 @@ public final class CLPeerCache {
     private final Map<String, Range> servedRange = new ConcurrentHashMap<>();
     /** multiaddr -> the sync-committee period of a LightClientBootstrap it served (deepest kept). */
     private final Map<String, Long> bootstrapPeriod = new ConcurrentHashMap<>();
+    /** When each address first entered the cache (unix seconds, token {@code s<secs>};
+     *  the earliest wins). The Rust engine's stale-anchor recovery counts a peer known for
+     *  a week as LONG-KNOWN (its eclipse guard), so this is kept across engine switches. */
+    private final Map<String, Long> firstSeen = new ConcurrentHashMap<>();
     /** Peers whose Identify confirmed light_client protocol support — dial these first. */
     private final Set<String> lcConfirmed = ConcurrentHashMap.newKeySet();
     /** Peers proven NOT to serve light_client (no LC protocols / negotiation failure) — dial last. */
@@ -81,11 +85,12 @@ public final class CLPeerCache {
         if (multiaddr == null || multiaddr.isEmpty()) return;
         failures.remove(multiaddr);
         if (!seen.add(multiaddr)) return;
+        long since = firstSeen.computeIfAbsent(multiaddr, k -> System.currentTimeMillis() / 1000);
 
         try {
             // Shares the monitor with rewriteFile() so an append can't interleave
             // with a truncate+rewrite from a concurrent eviction.
-            Files.writeString(cacheFile, multiaddr + "\n",
+            Files.writeString(cacheFile, multiaddr + SEP + "s" + since + "\n",
                     StandardOpenOption.CREATE, StandardOpenOption.APPEND);
             log.info("[cl-cache] Saved responsive CL peer: {}", multiaddr);
         } catch (IOException e) {
@@ -106,6 +111,7 @@ public final class CLPeerCache {
                 failures.remove(multiaddr);
                 servedRange.remove(multiaddr);
                 bootstrapPeriod.remove(multiaddr);
+                firstSeen.remove(multiaddr);
                 lcConfirmed.remove(multiaddr);
                 lcDenied.remove(multiaddr);
                 rewriteFile();
@@ -242,7 +248,10 @@ public final class CLPeerCache {
                     String tok = parts[i].strip();
                     if (tok.equals("lc")) lcConfirmed.add(multiaddr);
                     else if (tok.equals("nolc")) lcDenied.add(multiaddr);
-                    else if (tok.startsWith("b")) {
+                    else if (tok.startsWith("s")) {
+                        try { firstSeen.merge(multiaddr, Long.parseLong(tok.substring(1)), Math::min); }
+                        catch (NumberFormatException ignored) {}
+                    } else if (tok.startsWith("b")) {
                         // Keep the deepest bootstrap period if a line carries more than one.
                         try { bootstrapPeriod.merge(multiaddr, Long.parseLong(tok.substring(1)), Math::max); }
                         catch (NumberFormatException ignored) {}
@@ -312,6 +321,7 @@ public final class CLPeerCache {
             // served period when known so it survives the rewrite.
             List<String> peers = new ArrayList<>(seen);
             java.util.Collections.sort(peers);
+            long nowSecs = System.currentTimeMillis() / 1000;
             StringBuilder sb = new StringBuilder();
             for (String p : peers) {
                 sb.append(p);
@@ -321,6 +331,7 @@ public final class CLPeerCache {
                 if (bp != null) sb.append(SEP).append('b').append(bp);
                 if (lcConfirmed.contains(p)) sb.append(SEP).append("lc");
                 else if (lcDenied.contains(p)) sb.append(SEP).append("nolc");
+                sb.append(SEP).append('s').append(firstSeen.computeIfAbsent(p, k -> nowSecs));
                 sb.append('\n');
             }
             Files.writeString(cacheFile, sb.toString());

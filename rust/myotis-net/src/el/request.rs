@@ -120,11 +120,13 @@ impl Operation {
         tokio::pin!(future);
         loop {
             tokio::select! {
+                // `biased` polls the arms in source order, so the future comes
+                // first: ready is a committed result, including side effects.
+                // A late cancellation seen on the same poll must not replace
+                // it with a false failure (#737).
                 biased;
-                _ = tokio::time::sleep(Duration::from_millis(10)) => self.check()?,
-                // Ready is a committed result, including side effects. A late
-                // cancellation must not replace it with a false failure.
                 value = &mut future => return Ok(value),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => self.check()?,
             }
         }
     }
@@ -367,6 +369,25 @@ mod tests {
         .await;
         assert!(committed.load(Ordering::Acquire));
         assert_eq!(result.unwrap(), "committed transaction hash");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_prefers_a_ready_future_over_a_cancellation_seen_on_the_same_tick() {
+        // #737: the 10 ms check tick and the wrapped future become ready on the
+        // same poll, after the operation was cancelled. The ready result wins.
+        let op = Operation::new(watch::channel(false).1, REQUEST_BUDGET);
+        let canceller = Arc::clone(&op);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            canceller.cancel();
+        });
+        let result = op
+            .wait(async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                "sent"
+            })
+            .await;
+        assert_eq!(result.unwrap(), "sent");
     }
 
     #[tokio::test]

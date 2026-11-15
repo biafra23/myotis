@@ -252,6 +252,16 @@ fn peer_side(kind: arti_client::ErrorKind) -> bool {
 /// side's Tor (bootstrap, configuration, no circuit, a local network down:
 /// "tor circuit …") or a session that opened and then failed.
 pub(crate) fn is_peer_unreachable(error: &str) -> bool {
+    // A handshake that never started for lack of OUR entropy is this side's fault.
+    // Anchored to the RLPx stage, the only one that draws entropy, whose errors
+    // are literals plus OS text: a later stage echoes the peer's Hello client id
+    // (`no common eth version with …`), so a bare substring match could be
+    // steered by a node that names itself after the marker.
+    if error.starts_with("tor rlpx handshake to ")
+        && crate::el::rlpx::transport::is_local_entropy_failure(error)
+    {
+        return false;
+    }
     ["tor addr ", "tor connect ", "tor rlpx handshake", "tor eth handshake"]
         .iter()
         .any(|prefix| error.starts_with(prefix))
@@ -357,6 +367,10 @@ mod tests {
         assert!(!peer("tor circuit for 10.0.0.1:30303: no exit available"));
         assert!(!peer("tor: no storage directory configured — the host must call set_storage_dirs"));
         assert!(!peer("timed out awaiting the peer's Pong"));
+        // Our missing entropy is not the peer's doing — but only at the RLPx
+        // stage: a client id that spells the marker cannot launder a strike.
+        assert!(!peer("tor rlpx handshake to 10.0.0.1:30303: rlpx: OS entropy unavailable: errno 38"));
+        assert!(peer("tor eth handshake to 10.0.0.1:30303: no common eth version with \"rlpx: OS entropy unavailable\""));
     }
 
     use super::*;

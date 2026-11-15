@@ -418,7 +418,6 @@ pub fn resolve_address(
 pub fn resolve_ownership(
     caller: &dyn EthCaller,
     name: &str,
-    chain_id: u64,
 ) -> Result<Option<EnsOwnership>, EnsError> {
     // The record reads' own validation (an empty label, more than one trailing dot)
     // and their node: namehash lowercases as it hashes, and keeps a trailing dot as
@@ -428,14 +427,10 @@ pub fn resolve_ownership(
     let lower = name.to_lowercase();
     let labels: Vec<&str> = lower.split('.').collect();
     // The tree and the wrapper come from the CALLER's chain, like every other
-    // read here: the caller's executor is the state being read, so a `chain_id`
-    // argument that disagreed with it would hash the name into one tree and read
-    // through another chain's state — a well-formed wrong answer.
-    debug_assert_eq!(
-        chain_id,
-        caller.chain_id(),
-        "resolve_ownership: chain_id disagrees with the caller"
-    );
+    // read here: the caller's executor is the state being read. There is no
+    // separate chain id argument (#737): one that disagreed with the caller
+    // would either be silently ignored or hash the name into one tree and read
+    // through another chain's state, a well-formed wrong answer.
     let chain_id = caller.chain_id();
     let ns = Namespace::of_chain(chain_id)?;
     let node = ns.node(name)?;
@@ -1138,7 +1133,7 @@ mod tests {
         let mock = MockCaller::new().on_chain(10_200);
         let refused = Some(EnsError::Unsupported(NO_NAME_SERVICE));
         assert_eq!(resolve_address(&mock, "vitalik.eth").err(), refused);
-        assert_eq!(resolve_ownership(&mock, "vitalik.eth", 10_200).err(), refused);
+        assert_eq!(resolve_ownership(&mock, "vitalik.eth").err(), refused);
         assert_eq!(reverse_resolve(&mock, [0x11; 20]).err(), refused);
         assert_eq!(*mock.calls.borrow(), 0, "refused before any call");
     }
@@ -1148,7 +1143,7 @@ mod tests {
         let mock = MockCaller::new().on_chain(100);
         assert_eq!(resolve_address(&mock, "vitalik.eth"), Err(EnsError::Unsupported(ONLY_GNO_NAMES)));
         assert_eq!(
-            resolve_ownership(&mock, "vitalik.eth", 100),
+            resolve_ownership(&mock, "vitalik.eth"),
             Err(EnsError::Unsupported(ONLY_GNO_NAMES))
         );
         assert_eq!(refusal(100, Some("vitalik.eth")), Some(EnsError::Unsupported(ONLY_GNO_NAMES)));
@@ -1211,7 +1206,7 @@ mod tests {
             .on(move |t, cd| (t == GENOME_REGISTRAR && sel(cd) == grace_sel).then(|| Ok(g.clone())))
             // Genome has no ENSv2: its ownership never asks ENS's Universal Resolver.
             .on(|t, _| (t == UNIVERSAL_RESOLVER).then(|| panic!("Universal Resolver read on Gnosis")));
-        let o = resolve_ownership(&mock, "levvv.gno", 100).unwrap().unwrap();
+        let o = resolve_ownership(&mock, "levvv.gno").unwrap().unwrap();
         assert_eq!(o.registrant, Some(user));
         assert_eq!(o.manager, Some(user));
         assert!(!o.wrapped);
@@ -1996,7 +1991,7 @@ mod tests {
     #[test]
     fn ownership_of_an_unwrapped_eth_name() {
         let caller = ownership_caller(USER, Some(USER), 1_823_155_031);
-        let o = resolve_ownership(&caller, "Myotis.eth", 1).unwrap().unwrap();
+        let o = resolve_ownership(&caller, "Myotis.eth").unwrap().unwrap();
         assert_eq!(o.registrant, Some(USER));
         assert_eq!(o.manager, Some(USER));
         assert!(!o.wrapped);
@@ -2010,14 +2005,14 @@ mod tests {
         // Registry owner and registrar token owner are both the NameWrapper; the
         // wrapper's own ownerOf(node) names the user.
         let caller = ownership_caller(WRAPPER_MAINNET, Some(WRAPPER_MAINNET), 1_823_155_031);
-        let o = resolve_ownership(&caller, "myotis.eth", 1).unwrap().unwrap();
+        let o = resolve_ownership(&caller, "myotis.eth").unwrap().unwrap();
         assert!(o.wrapped);
         assert_eq!(o.manager, Some(USER));
         assert_eq!(o.registrant, Some(USER));
         // On a chain without a known wrapper the same answers are taken as they are.
         let caller = ownership_caller(WRAPPER_MAINNET, Some(WRAPPER_MAINNET), 1_823_155_031)
             .on_chain(17000);
-        let o = resolve_ownership(&caller, "myotis.eth", 17000).unwrap().unwrap();
+        let o = resolve_ownership(&caller, "myotis.eth").unwrap().unwrap();
         assert!(!o.wrapped);
         assert_eq!(o.manager, Some(WRAPPER_MAINNET));
         assert_eq!(o.registrant, Some(WRAPPER_MAINNET));
@@ -2026,7 +2021,7 @@ mod tests {
     #[test]
     fn a_subname_has_a_manager_but_no_registrar_entry() {
         let caller = ownership_caller(USER, Some(USER), 1_823_155_031);
-        let o = resolve_ownership(&caller, "sub.myotis.eth", 1).unwrap().unwrap();
+        let o = resolve_ownership(&caller, "sub.myotis.eth").unwrap().unwrap();
         assert_eq!(o.manager, Some(USER));
         assert_eq!(o.registrant, None);
         assert_eq!(o.expires_at, None);
@@ -2040,7 +2035,7 @@ mod tests {
     fn an_expired_name_in_its_grace_period_keeps_its_expiry_but_no_registrant() {
         // ownerOf reverts from the expiry on; the registry still lists the old owner.
         let caller = ownership_caller(USER, None, 1_700_000_000);
-        let o = resolve_ownership(&caller, "myotis.eth", 1).unwrap().unwrap();
+        let o = resolve_ownership(&caller, "myotis.eth").unwrap().unwrap();
         assert_eq!(o.registrant, None);
         assert_eq!(o.manager, Some(USER));
         assert_eq!(o.expires_at, Some(1_700_000_000));
@@ -2050,11 +2045,11 @@ mod tests {
     #[test]
     fn an_unregistered_name_is_none_and_a_malformed_name_an_error() {
         let caller = ownership_caller_with_resolver([0u8; 20], [0u8; 20], None, 0);
-        assert_eq!(resolve_ownership(&caller, "nobody-has-this.eth", 1).unwrap(), None);
+        assert_eq!(resolve_ownership(&caller, "nobody-has-this.eth").unwrap(), None);
         // What the record reads reject (dns_encode), this rejects.
-        assert!(matches!(resolve_ownership(&caller, "x..eth", 1), Err(EnsError::InvalidName(_))));
-        assert!(matches!(resolve_ownership(&caller, ".eth", 1), Err(EnsError::InvalidName(_))));
-        assert!(matches!(resolve_ownership(&caller, "x.eth..", 1), Err(EnsError::InvalidName(_))));
+        assert!(matches!(resolve_ownership(&caller, "x..eth"), Err(EnsError::InvalidName(_))));
+        assert!(matches!(resolve_ownership(&caller, ".eth"), Err(EnsError::InvalidName(_))));
+        assert!(matches!(resolve_ownership(&caller, "x.eth.."), Err(EnsError::InvalidName(_))));
     }
 
     #[test]
@@ -2062,7 +2057,7 @@ mod tests {
         // setOwner(node, 0) after setting the resolver — immutable records: the
         // records still resolve, so "nothing on chain" would contradict them.
         let caller = ownership_caller([0u8; 20], None, 0);
-        let o = resolve_ownership(&caller, "fixed.myotis.eth", 1).unwrap().unwrap();
+        let o = resolve_ownership(&caller, "fixed.myotis.eth").unwrap().unwrap();
         assert_eq!(o.manager, None);
         assert_eq!(o.registrant, None);
         assert_eq!(o.resolver, Some(RESOLVER));
@@ -2074,7 +2069,7 @@ mod tests {
         // namehash("myotis.eth.") keeps the empty label, as the record reads do, so
         // the registrar (two-label .eth names only) is not asked.
         let caller = ownership_caller(USER, Some(USER), 1_823_155_031);
-        let o = resolve_ownership(&caller, "myotis.eth.", 1).unwrap().unwrap();
+        let o = resolve_ownership(&caller, "myotis.eth.").unwrap().unwrap();
         assert_eq!(o.registrant, None);
         assert_eq!(o.expires_at, None);
         assert_eq!(*caller.calls.borrow(), 3);
@@ -2128,7 +2123,7 @@ mod tests {
             (t == REGISTRY || t == BASE_REGISTRAR).then(|| panic!("v1 read for an ENSv2 name"))
         });
         assert_eq!(
-            resolve_ownership(&caller, "Myotis.eth", 11_155_111),
+            resolve_ownership(&caller, "Myotis.eth"),
             Err(EnsError::Unsupported(ENSV2_OWNERSHIP))
         );
     }
@@ -2145,7 +2140,7 @@ mod tests {
             Some(USER),
             1_823_155_031,
         );
-        let o = resolve_ownership(&caller, "ens.eth", 11_155_111).unwrap().unwrap();
+        let o = resolve_ownership(&caller, "ens.eth").unwrap().unwrap();
         assert_eq!(o.registrant, Some(USER));
         assert_eq!(o.resolver, Some(RESOLVER));
         assert_eq!(o.expires_at, Some(1_823_155_031));
@@ -2181,7 +2176,7 @@ mod tests {
             (t == REGISTRY || t == BASE_REGISTRAR).then(|| panic!("v1 read for an ENSv2 name"))
         });
         assert_eq!(
-            resolve_ownership(&caller, "myotis.eth", 11_155_111),
+            resolve_ownership(&caller, "myotis.eth"),
             Err(EnsError::Unsupported(ENSV2_OWNERSHIP))
         );
     }
@@ -2196,7 +2191,7 @@ mod tests {
             (t == REGISTRY || t == BASE_REGISTRAR).then(|| panic!("v1 read for an ENSv2 name"))
         });
         assert_eq!(
-            resolve_ownership(&caller, "ens.eth", 1),
+            resolve_ownership(&caller, "ens.eth"),
             Err(EnsError::Unsupported(ENSV2_OWNERSHIP))
         );
     }
@@ -2212,7 +2207,7 @@ mod tests {
             .on(move |t, cd| (t == MIRROR && sel(cd) == v1_sel).then(|| Ok(addr_word([0x77; 20]))));
         let caller = ensv2_chain(caller, dns, MIRROR);
         assert_eq!(
-            resolve_ownership(&caller, "ens.eth", 11_155_111),
+            resolve_ownership(&caller, "ens.eth"),
             Err(EnsError::Unsupported(ENSV2_OWNERSHIP))
         );
     }
@@ -2232,7 +2227,7 @@ mod tests {
                 (t == REGISTRY || t == BASE_REGISTRAR).then(|| panic!("v1 read after a failed check"))
             });
         assert!(matches!(
-            resolve_ownership(&caller, "myotis.eth", 11_155_111),
+            resolve_ownership(&caller, "myotis.eth"),
             Err(EnsError::Call(EvmError::Halted { .. }))
         ));
     }
@@ -2250,7 +2245,7 @@ mod tests {
             1_785_054_756,
         );
         assert_eq!(
-            resolve_ownership(&caller, "alice.eth", 11_155_111),
+            resolve_ownership(&caller, "alice.eth"),
             Err(EnsError::Unsupported(ENSV2_OWNERSHIP))
         );
     }

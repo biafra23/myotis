@@ -98,6 +98,8 @@ public class CommandHandler {
                 case "stop"                    -> handleStop();
                 case "beacon-status"           -> handleBeaconStatus();
                 case "accept-stale-anchor"     -> handleAcceptStaleAnchor();
+                case "refresh-anchor"          -> handleRefreshAnchor(false);
+                case "refresh-anchor-unconfirmed" -> handleRefreshAnchor(true);
                 case "import-logindex"         -> handleImportLogIndex(jsonLine);
                 case "export-logindex"         -> handleExportLogIndex(jsonLine);
                 case "build-logindex"          -> handleBuildLogIndex(jsonLine);
@@ -249,6 +251,46 @@ public class CommandHandler {
                 + ",\"note\":\"syncing forward from the stale anchor for THIS RUN — the"
                 + " long-range-attack guarantee is weakened until the store catches up"
                 + " under BLS verification\"}";
+    }
+
+    /**
+     * The other way out of {@code STALE_ANCHOR}: re-anchor on a fresh finalized
+     * checkpoint that every answering checkpoint-sync server names (at least two operators;
+     * one differing answer refuses and names the outlier) and a long-known peer confirms.
+     * {@code refresh-anchor-unconfirmed} is the operator's explicit "use it anyway" when no
+     * long-known peer could confirm it (an eclipse cannot then be ruled out). The stale
+     * anchor is discarded, not walked forward from. The engine refuses unless parked; the
+     * Java engine refuses outright.
+     */
+    private String handleRefreshAnchor(boolean allowUnconfirmed) {
+        io.myotis.api.AnchorRefresh r = handle.refreshAnchorFromCheckpointz(allowUnconfirmed);
+        if (!r.applied()) {
+            String hint = r.unconfirmed()
+                    ? ",\"unconfirmed\":true,\"hint\":\"no long-known peer confirmed it; if you trust this"
+                            + " network connection, refresh-anchor-unconfirmed applies it anyway\""
+                    : "";
+            return "{\"ok\":true,\"applied\":false,\"note\":" + jsonQuote(r.error()) + hint + "}";
+        }
+        return "{\"ok\":true,\"applied\":true,\"root\":" + jsonQuote(r.root())
+                + ",\"slot\":" + r.slot() + ",\"epoch\":" + r.epoch()
+                + ",\"operators\":" + jsonList(r.operators())
+                + ",\"confirmedBy\":" + jsonList(r.confirmedBy())
+                + ",\"unconfirmed\":" + r.unconfirmed()
+                + ",\"note\":\"re-anchored on the checkpoint these operators agree on — the anchor"
+                + " is their word; everything after it is verified as usual\"}";
+    }
+
+    private static String jsonList(java.util.List<String> items) {
+        StringBuilder sb = new StringBuilder("[");
+        for (String item : items) {
+            if (sb.length() > 1) sb.append(',');
+            sb.append(jsonQuote(item));
+        }
+        return sb.append(']').toString();
+    }
+
+    private static String jsonQuote(String s) {
+        return s == null ? "null" : "\"" + escapeJson(s) + "\"";
     }
 
     private String handleBeaconStatus() {

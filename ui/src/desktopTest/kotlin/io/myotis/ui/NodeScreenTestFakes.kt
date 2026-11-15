@@ -44,6 +44,9 @@ internal class FakeSettings(
 ) : Settings {
     override fun expertMode(): Boolean = expert
     override fun setExpertMode(v: Boolean) { expert = v }
+    var staleChoice: StaleAnchorChoice = StaleAnchorChoice.ASK
+    override fun staleAnchorChoice(): StaleAnchorChoice = staleChoice
+    override fun setStaleAnchorChoice(v: StaleAnchorChoice) { staleChoice = v }
     override fun enabledNetworks(): List<String> = listOf(network)
     override fun primaryNetwork(): String = network
     override fun allNetworks(): List<String> = listOf(network)

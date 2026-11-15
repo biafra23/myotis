@@ -74,3 +74,26 @@ jobs:
           done
       - name: The workbook's starter/ matches solution/ (sources and lock)
         run: python3 docs/tour/workbook/make_starter.py --check
+      # The k256 and libp2p holds (.github/dependabot.yml, cargo `ignore`):
+      # myotis-core pins k256 0.13, and so do alloy, revm, enr (discv5 0.11) and
+      # libp2p-identity (libp2p 0.56), the last two held on that line by the
+      # libp2p hold. Dependabot proposes none of their 0.14 moves, so it says
+      # nothing when an unheld one (revm, or the alloy crates it brings) moves
+      # and its bump brings k256 0.14 in next to the rest. That is the
+      # two-copies state the holds exist to avoid, and the node key's secret
+      # reaches enr's copy (enrfilter.rs, local_enr_rlp). This step fails in the
+      # PR that adds the second version, which is the moment to lift both holds.
+      - name: One k256 per lock (lift the dependabot.yml hold when this fails)
+        run: |
+          set -eu
+          fail=0
+          for lock in rust/Cargo.lock rust/roost/Cargo.lock rust/tor-poc/Cargo.lock; do
+            versions=$(awk '/^\[\[package\]\]/{n=""} /^name = /{n=$3} /^version = /{if (n=="\"k256\"") print $3}' "$lock" | tr -d '"' | sort -u)
+            count=$(printf '%s\n' "$versions" | grep -c . || true)
+            echo "$lock: k256 $(echo ${versions:-none})"
+            if [ "$count" -gt 1 ]; then
+              echo "::error file=$lock::$lock holds $count k256 versions ($(echo $versions)). An upstream crate moved to a new k256 line: lift the k256 AND libp2p holds in .github/dependabot.yml together, and move myotis-core's pin, discv5 and libp2p to that line, so there is one copy again."
+              fail=1
+            fi
+          done
+          exit $fail

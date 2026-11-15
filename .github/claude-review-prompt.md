@@ -1,5 +1,7 @@
 Review this pull request as an independent reviewer with no prior
-context. Read CLAUDE.md first and hold the diff against the repo's
+context. Read CLAUDE.md first, then the .claude/agent/ files its table
+names for the areas this diff touches (CLAUDE.md is the summary, they
+are the full rules), and hold the diff against the repo's
 standing rules, especially:
 - Trust model: peer data is NEVER trusted — everything must be
   cryptographically verified (sync-committee signatures + the
@@ -9,7 +11,8 @@ standing rules, especially:
   client is debugging-only. No trusted-RPC fallbacks.
 - API boundary: hosts talk ONLY to :myotis-api — engine internals
   (node-core/networking/consensus types) must not leak into host
-  runtime paths outside the documented exemptions in CLAUDE.md.
+  runtime paths outside the documented exemptions in
+  .claude/agent/architecture.md.
 - Android first: no JVM-only APIs desugaring can't cover, no
   java.net.http, HTTP via Ktor; Java 17 target unless a module
   documents why it needs 21.
@@ -20,7 +23,8 @@ Then review on the usual merits: real defects first (correctness,
 concurrency, resource leaks, security), then maintainability. Rank
 findings by severity and skip style nits a formatter would catch.
 
-The PR branch is checked out in the working directory. Use
+Where the PR's files are checked out is stated under CHECKOUT at
+the end of this prompt. Use
 `gh pr comment` for the overall review summary and
 `mcp__github_inline_comment__create_inline_comment` (with
 `confirmed: true`) for line-specific findings. Only post GitHub

@@ -54,6 +54,17 @@
 # step tells you to run when a pin stops serving — from a host whose IP no
 # Lighthouse node has banned — and the way to look for new pins. Diagnostics,
 # not a check: it ends green whatever it finds, so read the report.
+#
+# The `dns-tree` job walks the network's EIP-1459 node lists (the ENR trees
+# `ElConfig::enr_tree_urls` names: mainnet and sepolia; gnosis and chiado
+# publish none) through the SYSTEM resolver: tests/live_dns_tree.rs, on a Linux
+# AND a macOS runner. It is the one check of the resolver the desktop and the
+# daemon use for a fresh profile's first EL peers (#539): a failure there is a
+# single `warn!` and an empty candidate pool in the app, invisible to every
+# other check. Two hosts because hickory-resolver reads its configuration per
+# platform (/etc/resolv.conf on Linux, SCDynamicStore on macOS since 0.26,
+# #806). It runs in the `full` scope on those two networks, and on its own as
+# the `dns-tree` scope: dispatch that after a resolver bump.
 name: cold-start regression
 
 on:
@@ -68,9 +79,9 @@ on:
         options: [gnosis, mainnet, sepolia, chiado]
         default: gnosis
       scope:
-        description: "full = all three checks (release). pins-only = skip the deep walk. census = only the DHT period census (no checks)."
+        description: "full = all three checks, plus the DNS tree walk on mainnet/sepolia (release). pins-only = skip the deep walk. census = only the DHT period census (no checks). dns-tree = only the DNS tree walk, Linux + macOS (mainnet/sepolia)."
         type: choice
-        options: [full, pins-only, census]
+        options: [full, pins-only, census, dns-tree]
         default: full
       anchor_root:
         description: "Optional override: old anchor block root (64 hex). Default: this network's entry in rust/testdata/anchors/oldest-servable.properties."
@@ -90,10 +101,10 @@ on:
         default: "900"
 
 # Keyed by network as well as ref: these are dispatched by hand, and running
-# gnosis then mainnet must not silently kill the first run. A census gets its
-# own group, so looking for new pins never cancels a release check.
+# gnosis then mainnet must not silently kill the first run. A census and a
+# DNS tree walk get their own groups, so neither cancels a release check.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.network }}${{ inputs.scope == 'census' && '-census' || '' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.network }}${{ (inputs.scope == 'census' || inputs.scope == 'dns-tree') && format('-{0}', inputs.scope) || '' }}
   cancel-in-progress: true
 
 permissions:
@@ -102,6 +113,7 @@ permissions:
 jobs:
   cold-start:
     name: ${{ inputs.scope == 'census' && 'period census' || 'cold start' }} (${{ inputs.network }}, ${{ inputs.scope }})
+    if: inputs.scope != 'dns-tree'
     runs-on: ubuntu-26.04
     # Both budgets plus the build, with headroom: the old-anchor test alone
     # allows 30 minutes of walking.
@@ -198,3 +210,43 @@ jobs:
         run: |
           cargo test --locked --release -p myotis-net --test live_cold_start -- \
             --ignored --nocapture cold_start_from_an_old_anchor
+
+  # See the header: the EIP-1459 tree walk through the system resolver, per
+  # platform. Not on gnosis or chiado, which publish no tree (the test asserts
+  # the network has one, so it would fail there by design).
+  dns-tree:
+    name: DNS tree walk (${{ inputs.network }}, ${{ matrix.os }})
+    if: >-
+      (inputs.scope == 'full' || inputs.scope == 'dns-tree') &&
+      (inputs.network == 'mainnet' || inputs.network == 'sepolia')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    # A walk is bounded at 15 s per tree (WalkLimits); the rest is the build.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          workspaces: rust
+
+      - name: Build the test
+        working-directory: rust
+        run: cargo test --locked --release -p myotis-net --test live_dns_tree --no-run
+
+      # The report line per tree ([live_dns_tree <net>] <domain> seq= lookups=
+      # leaves= candidates= …) is the thing to read; the test fails on no
+      # leaves, no dial candidate, a record that does not hash to its label,
+      # or a walk past its deadline.
+      - name: Walk the network's DNS trees through the system resolver
+        working-directory: rust
+        env:
+          NET: ${{ inputs.network }}
+        run: cargo test --locked --release -p myotis-net --test live_dns_tree -- --ignored --nocapture

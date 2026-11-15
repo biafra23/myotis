@@ -139,7 +139,7 @@ PRODUCTS = {
         "description": "eth.myotis:myotis-engine as published: the Android AAR, the desktop jar, the natives "
                        "jars and the iOS module (myotis-engine-<tag>-android.aar, "
                        "myotis-engine-<tag>-maven-repo.zip).",
-        "gradle": [("myotis-engine", ["releaseRuntimeClasspath", "jvmRuntimeClasspath"]),
+        "gradle": [("myotis-engine", ["androidRuntimeClasspath", "jvmRuntimeClasspath"]),
                    ("myotis-engine-ios", ["iosArm64CompileKlibraries", "iosSimulatorArm64CompileKlibraries"])],
         "cargo": [("rust/Cargo.lock", ["myotis-engine", "myotis-bls"])],
     },

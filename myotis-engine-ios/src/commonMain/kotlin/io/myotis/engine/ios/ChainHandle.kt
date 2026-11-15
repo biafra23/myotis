@@ -111,6 +111,21 @@ class ChainHandle internal constructor(
      *  only for a handle the engine no longer knows. */
     fun acceptStaleAnchor(): Boolean = native.acceptStaleAnchor(handle)
 
+    /** The other way out of [BeaconState.STALE_ANCHOR]: re-anchor on a fresh finalized
+     *  checkpoint that every answering checkpoint-sync server names (at least two operators
+     *  among them; one differing answer refuses, naming the outlier — the JVM contract's `refreshAnchorFromCheckpointz`). The root is those
+     *  operators' word — show [AnchorRefresh.operators] with it. A long-known peer must
+     *  confirm it too; without one it is refused as [AnchorRefresh.unconfirmed] unless
+     *  [allowUnconfirmed] — pass true only on the user's explicit "use it anyway".
+     *  Blocking (up to about a minute): never call it on the main thread. */
+    fun refreshAnchorFromCheckpointz(allowUnconfirmed: Boolean = false): AnchorRefresh =
+        EngineDecoding.anchorRefresh(native.refreshAnchorFromCheckpointz(handle, allowUnconfirmed))
+
+    /** The user's remembered answer to a stale-anchor park, applied by the engine at every
+     *  park, also with no UI open (the JVM contract's `setStaleAnchorPolicy`). Live; may be
+     *  set before start. False only for a handle the engine no longer knows. */
+    fun setStaleAnchorPolicy(policy: StaleAnchorPolicy): Boolean = native.setStaleAnchorPolicy(handle, policy.ordinal)
+
     /**
      * A verified account read at the verified head. A verification failure is a result
      * with its `failReason` set; a transport or not-running failure throws

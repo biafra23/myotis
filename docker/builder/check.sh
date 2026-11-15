@@ -44,6 +44,14 @@ check "build-tools run (aapt2, d8, apksigner)" "ok" \
 check "/opt open to any uid" "" \
     "$(in_image 'find /opt ! -type l \( ! -perm -o=r -o \( -perm -u=x ! -perm -o=x \) \) -print 2>&1 | head -5 | tr "\n" " "' || true)"
 check "platform revision" "$(want ANDROID_PLATFORM_REVISION)" "$(revision "\$ANDROID_HOME/platforms/android-$(want ANDROID_PLATFORM)")"
+# And the Android Gradle plugin must SEE it as that package: from an unpacked
+# archive (no package.xml), sdklib's legacy loader parses the API level as an
+# integer, so a platform with a minor level (android-37.0) was no platform to
+# AGP 9, which tried to install one into this read-only SDK and failed every
+# Android build while every check above was green (#837). The Dockerfile writes
+# the package.xml; this holds it to the package id the build asks for.
+check "platform package id (what AGP sees)" "platforms;android-$(want ANDROID_PLATFORM)" \
+    "$(in_image 'sed -n "s/.*<localPackage path=\"\([^\"]*\)\".*/\1/p" "$ANDROID_HOME/platforms/android-'"$(want ANDROID_PLATFORM)"'/package.xml" 2>/dev/null')"
 # What apt INSTALLED, not only where it points: every package and version in
 # the image against the committed list. A package from another state of the
 # archive (the bootstrap fetch runs without TLS verification), or a toolchain
@@ -66,6 +74,8 @@ fi
 check "apt sources (the only ones)" "https://snapshot.ubuntu.com/ubuntu/$(want APT_SNAPSHOT)" \
     "$(in_image 'cat /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null | sed -n "s/^URIs: //p; s/^deb [^ ]* \([^ ]*\).*/\1/p" | sort -u | tr "\n" " " | sed "s/ $//"')"
 check "en_US.UTF-8 locale" "en_US.utf8" "$(in_image 'locale -a | grep -ix "en_US.utf8"')"
+check "Go" "go version go$(want GO_VERSION) linux/amd64" "$(in_image 'go version')"
+check "Go toolchain is local only" "local" "$(in_image 'go env GOTOOLCHAIN')"
 check "fakeroot + dpkg-deb + cc" "ok" "$(in_image 'command -v fakeroot >/dev/null && command -v dpkg-deb >/dev/null && command -v cc >/dev/null && echo ok')"
 
 [[ $fail -eq 0 ]] || { echo "check.sh: $tag does not match its pins" >&2; exit 1; }

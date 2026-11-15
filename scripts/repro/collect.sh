@@ -88,6 +88,9 @@ linux)
     # metadata included), i.e. what the Maven-repository zip and the
     # maven-repo branch carry.
     mkdir -p "$out/maven-repo" && cp -R build/maven-repo/. "$out/maven-repo/" && echo "  maven-repo/"
+    # The Go engine's binaries (build_linux.sh), as built.
+    put build/go/myotis-go go/myotis-go
+    put build/go/myotis-lc go/myotis-lc
     ;;
 macos)
     put rust/target/release/libmyotis_engine.dylib host/libmyotis_engine.dylib

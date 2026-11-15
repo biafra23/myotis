@@ -9,7 +9,10 @@ import org.gradle.process.ExecOperations
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
-    alias(libs.plugins.android.library)
+    // AGP 9's Android target for KMP (#818), replacing com.android.library + androidTarget().
+    alias(libs.plugins.android.kotlin.multiplatform.library)
+    // Lint: the KMP Android library plugin registers none of its own (AGP 9).
+    alias(libs.plugins.android.lint)
     alias(libs.plugins.compose.multiplatform)
     alias(libs.plugins.compose.compiler)
 }
@@ -165,7 +168,18 @@ val generateUiBuildInfo by tasks.registering {
 kotlin {
     jvmToolchain(21)
 
-    androidTarget()
+    android {
+        namespace = "io.myotis.ui"
+        compileSdk = 37
+        // The pinned build-tools, as :android-app and :myotis-engine (#734): without
+        // this AGP falls back to its own default version, which the hosted runner
+        // happens to preinstall and the builder image (docker/builder/) does not.
+        buildToolsVersion = libs.versions.android.build.tools.get()
+        minSdk = 29
+        // Java 21 class files, as the com.android.library build compiled them
+        // (compileOptions 21; nothing here is consumed outside this build's APK).
+        compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21) }
+    }
     jvm("desktop")
     iosArm64()
     iosSimulatorArm64()
@@ -221,21 +235,5 @@ kotlin {
                 implementation(compose.desktop.currentOs)
             }
         }
-    }
-}
-
-android {
-    namespace = "io.myotis.ui"
-    compileSdk = 35
-    // The pinned build-tools, as :android-app and :myotis-engine (#734): without
-    // this AGP falls back to its own default version, which the hosted runner
-    // happens to preinstall and the builder image (docker/builder/) does not.
-    buildToolsVersion = libs.versions.android.build.tools.get()
-    defaultConfig {
-        minSdk = 29
-    }
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_21
-        targetCompatibility = JavaVersion.VERSION_21
     }
 }

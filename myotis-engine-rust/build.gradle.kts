@@ -43,7 +43,7 @@ tasks.withType<JavaCompile>().configureEach {
 // (via cargoBuildHost) in front of every JVM host's Kotlin compile and make a
 // broken rust/ break the JVM build — violating "Rust is OPTIONAL for the JVM
 // hosts". Auto-regeneration is scoped to the Android build (:myotis-engine's
-// preBuild, where cargo is already required); CI enforces freshness everywhere
+// androidPreBuild, where cargo is already required); CI enforces freshness everywhere
 // via the regenerate-and-diff step in android-apk.yml; regenerate manually
 // elsewhere with `./gradlew uniffiGenerateKotlin`.
 //

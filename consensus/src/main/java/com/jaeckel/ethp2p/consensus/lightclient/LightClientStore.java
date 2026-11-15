@@ -79,22 +79,24 @@ public class LightClientStore {
     }
 
     /**
-     * If {@code newFinalizedSlot} crosses a sync committee period boundary relative to
-     * {@code oldFinalizedSlot}, rotate nextSyncCommittee → currentSyncCommittee.
+     * Rotate nextSyncCommittee → currentSyncCommittee once {@code newFinalizedSlot} lies in a
+     * period past the store's own ({@link #getCurrentSyncCommitteePeriod}).
      *
-     * <p>The caller must pass the finalized slot <b>before</b> {@link #updateFinalized}
-     * was called, so the period comparison is correct.
+     * <p>Compared with the store's period, not with the previous finalized slot's: in catch-up
+     * {@link #forceRotateIfPastPeriod} may already have rotated into the period this update
+     * finalizes, and a second rotation would leave the store a period ahead of its finalized
+     * header, refusing every update signed in the period it is really in (#737). Without a
+     * force-rotation the store's period is the previous finalized slot's, so the verdict is the
+     * one the old crossing rule gave. Rust twin: {@code LightClientStore::apply_next_when_period_changes}.
      *
-     * @param oldFinalizedSlot the finalized slot before the current update
      * @param newFinalizedSlot the newly finalized slot
      */
-    public synchronized void applyNextSyncCommitteeWhenPeriodChanges(long oldFinalizedSlot, long newFinalizedSlot) {
+    public synchronized void applyNextSyncCommitteeWhenPeriodChanges(long newFinalizedSlot) {
         if (nextSyncCommittee == null) {
             return;
         }
-        long oldPeriod = BeaconChainSpec.computeSyncCommitteePeriod(oldFinalizedSlot);
         long newPeriod = BeaconChainSpec.computeSyncCommitteePeriod(newFinalizedSlot);
-        if (newPeriod > oldPeriod) {
+        if (newPeriod > currentSyncCommitteePeriod) {
             currentSyncCommittee = nextSyncCommittee;
             nextSyncCommittee = null;
             currentSyncCommitteePeriod++;

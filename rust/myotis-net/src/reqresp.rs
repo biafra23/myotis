@@ -710,10 +710,10 @@ impl ReqRespClient {
         wire: Vec<u8>,
     ) -> Result<Vec<u8>, RequestError> {
         // Resolve HERE, per request, in async context. The swarm task's dial
-        // path is synchronous, so it cannot await a lookup — and libp2p's own
-        // DNS transport is not always present (Android has no /etc/resolv.conf,
-        // so `build_swarm` falls back to plain TCP and a /dns4/ address is
-        // rejected outright with "Multiaddr is not supported").
+        // path is synchronous, so it cannot await a lookup — and the swarm has
+        // no DNS layer of its own (`build_swarm`), so a /dns4/ address that
+        // reached it would be rejected outright with "Multiaddr is not
+        // supported").
         let dns_name = multiaddr_dns_name(&addr);
         // Never empty: a resolver failure yields the original address, so an
         // already-connected peer is unaffected by a transient DNS blip.
@@ -750,6 +750,10 @@ impl ReqRespClient {
     ///
     /// Fire-and-forget: dial failures are logged, not returned. Probing is a
     /// best-effort background concern and must never fail a caller's real work.
+    ///
+    /// The addresses must be concrete `/ip4/`/`/ip6/` ones: they go to the swarm
+    /// unresolved, and the swarm has no DNS layer (`build_swarm`), so a `/dns4/`
+    /// one is rejected. roost's probe passes routable IPs only.
     pub async fn observe_via(&self, peers: Vec<(PeerId, Multiaddr)>) {
         if peers.is_empty() {
             return;
@@ -979,12 +983,13 @@ fn multiaddr_dns_name(addr: &Multiaddr) -> Option<String> {
 ///
 /// Returns the input unchanged when there is no name to resolve.
 ///
-/// **Why we resolve rather than letting libp2p do it.** `build_swarm` layers in
-/// libp2p's DNS transport when a system resolver is configured, but that reads
-/// `/etc/resolv.conf`, which Android has not had since Oreo. There the swarm
-/// falls back to plain TCP and rejects a `/dns4/` address outright — "Multiaddr
-/// is not supported" — before any connection is attempted. `getaddrinfo`, which
-/// `lookup_host` uses, works on every platform we ship.
+/// **Why we resolve rather than letting libp2p do it.** libp2p's DNS transport
+/// read `/etc/resolv.conf`, which Android has not had since Oreo, and it pinned
+/// a hickory-resolver with open advisories; the swarm has none (`build_swarm`)
+/// and rejects a `/dns4/` address outright — "Multiaddr is not supported" —
+/// before any connection is attempted. `getaddrinfo`, which `lookup_host` uses,
+/// works on every platform we ship. A `/dnsaddr/` address (TXT-based, not
+/// resolved here) therefore cannot be dialed at all; nothing pins one.
 ///
 /// **Order is load-bearing.** `getaddrinfo` already sorts by RFC 6724
 /// destination-address selection, and every candidate is passed on in that
@@ -1229,16 +1234,19 @@ pub fn start_host(local_status: Arc<LocalStatus>) -> Result<ReqRespClient, Strin
 /// notices: the caller's `ReqRespClient` still exists and background pollers
 /// keep polling. A supervisor cannot help with a process that never exits, so
 /// detecting it is the owner's job. See `roost::serve`, which exits non-zero.
-/// Build the swarm, optionally with the DNS resolution layer.
-///
-/// Two near-identical chains rather than one with a branch: `with_dns()`
-/// consumes the builder and does not hand it back on failure, so recovering
-/// from a failed DNS setup means building again from the identity.
+/// Build the swarm: TCP (noise + mplex/yamux) or'ed with QUIC, and no DNS
+/// layer. A `/dns4/` dial address is resolved before it reaches the swarm
+/// (`resolve_dial_addrs`, every dial, through the platform's resolver), so the
+/// transport only ever sees concrete `/ip4/`/`/ip6/` addresses. libp2p's own
+/// DNS transport (the `dns` feature) is not linked: it read
+/// `/etc/resolv.conf`, which Android has not had since Oreo, so it never ran
+/// there, and on the desktop it pulled in hickory-resolver 0.25, whose DNS
+/// response parsing has the advisories 0.26.2 fixed — libp2p moves to 0.26
+/// only in 0.57, which brings aws-lc-sys with it (see Cargo.toml).
 fn build_swarm(
     keypair: libp2p::identity::Keypair,
     serving: bool,
     max_incoming: Option<u32>,
-    dns: bool,
     traffic: Arc<crate::traffic::TrafficMeter>,
 ) -> Result<Swarm<Behaviour>, String> {
     let base = libp2p::SwarmBuilder::with_existing_identity(keypair).with_tokio();
@@ -1301,25 +1309,13 @@ fn build_swarm(
         );
         Ok(tcp.or_transport(quic).map(|either, _| either.into_inner()))
     };
-    if dns {
-        Ok(base
-            .with_other_transport(transport)
-            .map_err(|e| format!("tcp/noise/muxer setup failed: {e}"))?
-            .with_dns()
-            .map_err(|e| format!("dns transport setup failed: {e}"))?
-            .with_behaviour(behaviour)
-            .map_err(|e| format!("behaviour setup failed: {e}"))?
-            .with_swarm_config(idle)
-            .build())
-    } else {
-        Ok(base
-            .with_other_transport(transport)
-            .map_err(|e| format!("tcp/noise/muxer setup failed: {e}"))?
-            .with_behaviour(behaviour)
-            .map_err(|e| format!("behaviour setup failed: {e}"))?
-            .with_swarm_config(idle)
-            .build())
-    }
+    Ok(base
+        .with_other_transport(transport)
+        .map_err(|e| format!("tcp/noise/muxer setup failed: {e}"))?
+        .with_behaviour(behaviour)
+        .map_err(|e| format!("behaviour setup failed: {e}"))?
+        .with_swarm_config(idle)
+        .build())
 }
 
 pub fn start_host_with(
@@ -1334,32 +1330,14 @@ pub fn start_host_with(
         .unwrap_or_else(libp2p::identity::Keypair::generate_secp256k1);
     let serving = config.lc_responder.is_some();
     let max_incoming = config.max_established_incoming;
-    // DNS is layered in so `/dns4/host/tcp/port/p2p/<id>` peers resolve AT DIAL
-    // TIME, every dial, honouring the record's TTL. That is what lets a server
-    // on a dynamic residential address be pinned by NAME instead of by a literal
-    // IP that goes stale (rust/roost).
-    //
-    // It must not be load-bearing, because it CANNOT be relied on everywhere:
-    // the system resolver is configured from /etc/resolv.conf, which Android has
-    // not had since Oreo (DNS goes through netd), so this legitimately fails
-    // there. Android is a first-class consumer (CLAUDE.md, Platform & language
-    // direction), and failing the whole host over an optional transport layer
-    // would take out `/ip4/` peers — every peer we pin today — on the default
-    // Android path.
-    //
-    // So: try with DNS, fall back to plain TCP with a warning. The degraded mode
-    // is exactly today's behaviour, and the warning names what stops working.
+    // `/dns4/host/tcp/port/p2p/<id>` peers resolve AT DIAL TIME, every dial,
+    // honouring the record's TTL — what lets a server on a dynamic residential
+    // address be pinned by NAME instead of by a literal IP that goes stale
+    // (rust/roost). That happens before the swarm, in `resolve_dial_addrs`, on
+    // every platform; the swarm itself has no DNS layer (see `build_swarm`).
     // No meter: count into one nobody reads (tools, roost, tests).
     let traffic = config.traffic.clone().unwrap_or_default();
-    let mut swarm = match build_swarm(keypair.clone(), serving, max_incoming, true, Arc::clone(&traffic)) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e,
-                "no system DNS resolver — continuing WITHOUT the DNS transport; \
-                 /ip4/ peers are unaffected but /dns4/ peers cannot be dialed");
-            build_swarm(keypair, serving, max_incoming, false, traffic)?
-        }
-    };
+    let mut swarm = build_swarm(keypair, serving, max_incoming, traffic)?;
 
     let listen_addr = config.listen.clone();
     probe_exclusive_tcp_port(&listen_addr)?;
@@ -2606,9 +2584,9 @@ mod dial_resolution_tests {
         // A's meter also pins the transport's counting: the TCP socket's
         // bytes (noise handshake, muxer, gossipsub) land in its CL layer.
         let meter_a = crate::traffic::TrafficMeter::new();
-        let mut a = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Arc::clone(&meter_a))
+        let mut a = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, Arc::clone(&meter_a))
             .expect("swarm a");
-        let mut b = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+        let mut b = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, Default::default())
             .expect("swarm b");
         b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
         let addr = loop {
@@ -2759,7 +2737,7 @@ mod dial_resolution_tests {
     /// the yamux-only host died.
     #[tokio::test]
     async fn the_host_connects_to_an_mplex_only_peer_like_nimbus() {
-        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, Default::default())
             .expect("swarm");
         dial_outcome(host, mplex_only_peer(), "/ip4/127.0.0.1/tcp/0")
             .await
@@ -2771,7 +2749,7 @@ mod dial_resolution_tests {
     /// no noise, no muxer negotiation, the TLS handshake carries the peer id.
     #[tokio::test]
     async fn the_host_connects_to_a_quic_only_peer() {
-        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, Default::default())
             .expect("swarm");
         dial_outcome(host, quic_only_peer(), "/ip4/127.0.0.1/udp/0/quic-v1")
             .await
@@ -2782,7 +2760,7 @@ mod dial_resolution_tests {
     /// wallet's `HostConfig::default` opens one on an ephemeral port).
     #[tokio::test]
     async fn a_quic_only_peer_reaches_the_host() {
-        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, Default::default())
             .expect("swarm");
         dial_outcome(quic_only_peer(), host, "/ip4/127.0.0.1/udp/0/quic-v1")
             .await
@@ -2793,7 +2771,7 @@ mod dial_resolution_tests {
     /// context its event loop needs, so a test can drive `handle_swarm_event`
     /// — responder included — against a real peer.
     fn host_with_ctx() -> (Swarm<Behaviour>, SwarmCtx) {
-        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+        let host = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, Default::default())
             .expect("swarm");
         let ctx = SwarmCtx::new(
             LocalStatus::new(StatusMessage {
@@ -3065,8 +3043,8 @@ mod dial_resolution_tests {
         assert!(!out.is_empty(), "localhost must resolve");
         for m in &out {
             // No DNS component survives — that is the whole point: the swarm's
-            // transport may have no DNS layer at all (Android), where a /dns4/
-            // address is rejected with "Multiaddr is not supported".
+            // transport has no DNS layer (`build_swarm`), so a /dns4/ address
+            // is rejected there with "Multiaddr is not supported".
             assert!(multiaddr_dns_name(m).is_none(), "{m} still carries a name");
             assert!(multiaddr_ip(m).is_some(), "{m} has no IP");
             assert_eq!(multiaddr_port(m), Some(9105), "port must survive");
@@ -3088,6 +3066,47 @@ mod dial_resolution_tests {
             .parse()
             .unwrap();
         assert_eq!(resolve_dial_addrs(&a, &memo()).await, vec![a.clone()]);
+    }
+
+    /// The swarm has no DNS layer: libp2p's `dns` feature stays off (it pinned
+    /// hickory-resolver 0.25, see Cargo.toml), so a name reaching the swarm is
+    /// refused there, and resolution is `resolve_dial_addrs`'s alone. Re-adding
+    /// the DNS transport fails this test.
+    #[tokio::test]
+    async fn the_swarm_has_no_dns_transport() {
+        let mut swarm =
+            build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, Default::default())
+                .expect("swarm");
+        let peer = libp2p::identity::Keypair::generate_secp256k1().public().to_peer_id();
+        let named: Multiaddr = "/dns4/localhost/tcp/9105".parse().unwrap();
+        let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer)
+            .addresses(vec![named])
+            .build();
+        let unsupported = |e: &libp2p::swarm::DialError| match e {
+            libp2p::swarm::DialError::Transport(errs) => errs.iter().all(|(a, e)| {
+                // The swarm appends /p2p/<id>, so match the name, not the address.
+                multiaddr_dns_name(a).as_deref() == Some("localhost")
+                    && matches!(e, libp2p::TransportError::MultiaddrNotSupported(_))
+            }),
+            _ => false,
+        };
+        match swarm.dial(opts) {
+            Err(e) => assert!(unsupported(&e), "unexpected dial error: {e}"),
+            Ok(()) => {
+                let err = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if let SwarmEvent::OutgoingConnectionError { error, .. } =
+                            swarm.select_next_some().await
+                        {
+                            break error;
+                        }
+                    }
+                })
+                .await
+                .expect("the dial of a /dns4/ address resolves to an error");
+                assert!(unsupported(&err), "unexpected dial error: {err}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -3169,7 +3188,7 @@ mod pending_request_tests {
     use tokio::sync::oneshot::error::TryRecvError;
 
     fn host() -> (Swarm<Behaviour>, SwarmCtx) {
-        let swarm = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+        let swarm = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, Default::default())
             .expect("swarm");
         (swarm, SwarmCtx::new(LocalStatus::new(status(0)), None, None, Arc::default(), Arc::default()))
     }
@@ -3427,7 +3446,7 @@ mod pending_request_tests {
     #[tokio::test]
     async fn client_label_follows_identify_goodbye_and_the_last_close() {
         let agents: AgentMap = Arc::default();
-        let mut swarm = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, false, Default::default())
+        let mut swarm = build_swarm(libp2p::identity::Keypair::generate_secp256k1(), false, None, Default::default())
             .expect("swarm");
         let tcp_first: TcpFirst = Arc::default();
         let mut ctx = SwarmCtx::new(LocalStatus::new(status(0)), None, None, agents.clone(), tcp_first.clone());

@@ -315,7 +315,7 @@ from its period to the wall clock's.
        (EL stateRoot/blockHash) is bound to it SOLELY by this branch. Skipping it lets a peer
        pair a genuine signed beacon header with a forged execution payload.
 5. store.updateFinalized(finalizedHeader); store.updateOptimistic(attestedHeader)
-6. store.applyNextSyncCommitteeWhenPeriodChanges(oldFinalizedSlot, finalizedSlot)
+6. store.applyNextSyncCommitteeWhenPeriodChanges(finalizedSlot)
 7. memoize (signature, signatureSlot)
 ```
 
@@ -346,8 +346,11 @@ when the update carries a next committee the store doesn't yet hold, and stores 
 The store tracks `currentSyncCommitteePeriod` **separately** from the finalized slot's period
 (finality lags ~2 epochs, and wall-clock can cross a period boundary before finality catches up).
 
-- `applyNextSyncCommitteeWhenPeriodChanges(old, new)`: if `period(new) > period(old)` and a next
-  committee is held → `current = next; next = null; period++`.
+- `applyNextSyncCommitteeWhenPeriodChanges(new)`: if `period(new) > currentSyncCommitteePeriod`
+  and a next committee is held → `current = next; next = null; period++`. Compared with the
+  store's period, not the previous finalized slot's: after a `forceRotateIfPastPeriod` the store
+  is already in the period the next update finalizes, and rotating again would put it a period
+  ahead of its finalized header (#737).
 - `forceRotateIfPastPeriod(wallClockSlot)` (catch-up): rotate when wall-clock period exceeds the
   held committee period, even before finality crosses — so the next finality update (signed by the
   new committee) verifies.

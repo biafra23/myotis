@@ -68,6 +68,30 @@ interface NodeController {
     fun acceptStaleAnchor(network: String) {}
 
     /**
+     * The stale-anchor dialog's "Fetch fresh checkpoint" action: ask [network]'s
+     * checkpoint-sync servers for the chain's current finalized checkpoint and, when
+     * every server that answers names the same one (two or more independent operators;
+     * one differing answer refuses and names the outlier) AND a long-known peer confirms
+     * it, re-anchor the parked network on it (the stale anchor is discarded, not synced
+     * forward from). With no confirming long-known peer the result is
+     * [FreshAnchorResult.unconfirmed] — the dialog flags it and offers "use it anyway",
+     * which calls this again with [allowUnconfirmed]. BLOCKING — up to about a minute;
+     * call it off the main thread. The default refuses, so a host or engine without it
+     * shows why instead of doing nothing.
+     */
+    fun refreshAnchorFromCheckpointz(network: String, allowUnconfirmed: Boolean = false): FreshAnchorResult =
+        FreshAnchorResult(applied = false, message = "Not available with this engine.")
+
+    /**
+     * Hand the remembered stale-anchor choice ([Settings.staleAnchorChoice], persisted by
+     * the caller first) to every running network's engine, which then applies it at each
+     * park ITSELF — with no UI open, as in a background service. Hosts also apply the
+     * persisted choice before each network starts. The default does nothing (a host
+     * without the engine seam keeps the dialog-only behaviour).
+     */
+    fun applyStaleAnchorChoice(choice: StaleAnchorChoice) {}
+
+    /**
      * Re-apply the BLS backend to the process-global selector after [Settings.setNativeBlsEnabled]
      * flips the preference (Android: native blst ⇄ pure-Java Milagro). Takes effect immediately —
      * the decompressed-pubkey cache is process-global so the swap is cheap. Desktop currently has
@@ -424,6 +448,12 @@ interface Settings {
      *  operator knob, not a tuning parameter. Defaults keep hosts compiling. */
     fun wsBoundPeriods(): Int = 0
     fun setWsBoundPeriods(v: Int) {}
+    /** What to do when a network's sync anchor is past the weak-subjectivity bound:
+     *  ask every time ([StaleAnchorChoice.ASK], the default), or apply the choice the
+     *  user told the stale-anchor dialog to remember. Hosts persist it; the defaults
+     *  keep a host without storage on ASK. */
+    fun staleAnchorChoice(): StaleAnchorChoice = StaleAnchorChoice.ASK
+    fun setStaleAnchorChoice(v: StaleAnchorChoice) {}
 
     // --- network metadata (so commonMain need not reference the Java NetworkConfig) ---
     /** Human-facing name for the Settings row, e.g. "Gnosis Chain". */
@@ -784,3 +814,55 @@ data class PeerRow(
     val snapSupported: Boolean,
     val clientId: String?,          // null until the peer sends Hello
 )
+
+/**
+ * The outcome of [NodeController.refreshAnchorFromCheckpointz], ready for the dialog:
+ * [message] names the agreeing operators and confirming peers when [applied], the
+ * reason otherwise. [unconfirmed] when not applied: the servers agreed but no
+ * long-known peer confirmed — the dialog flags it and offers "use it anyway".
+ */
+data class FreshAnchorResult(val applied: Boolean, val message: String, val unconfirmed: Boolean = false) {
+    companion object {
+        /** The one wording every host shows, from the engine contract's `AnchorRefresh` fields. */
+        fun of(
+            applied: Boolean,
+            operators: List<String>,
+            slot: Long,
+            error: String?,
+            confirmedBy: List<String> = emptyList(),
+            unconfirmed: Boolean = false,
+        ): FreshAnchorResult =
+            if (applied) {
+                FreshAnchorResult(
+                    true,
+                    "Re-anchored on the checkpoint at slot $slot that every answering server named — " +
+                        "${operators.size} independent operators (${operators.joinToString()})" +
+                        (if (confirmedBy.isNotEmpty()) {
+                            ", confirmed by ${confirmedBy.size} long-known peer(s) (${confirmedBy.joinToString()})"
+                        } else {
+                            ", NOT confirmed by any long-known peer (applied at your request)"
+                        }) + ". Syncing from it…",
+                )
+            } else {
+                FreshAnchorResult(false, "No fresh checkpoint: ${error ?: "refused"}", unconfirmed)
+            }
+    }
+}
+
+/**
+ * The answers to a stale (past the weak-subjectivity bound) sync anchor, as the
+ * stale-anchor dialog offers them and as a remembered choice stores them (by [name]).
+ */
+enum class StaleAnchorChoice {
+    /** Show the dialog every time (the default). */
+    ASK,
+    /** Re-anchor on a finalized checkpoint every answering checkpoint-sync server names. */
+    CHECKPOINT,
+    /** Sync forward from the stale anchor anyway (the long-range risk accepted). */
+    CONTINUE;
+
+    companion object {
+        /** A stored name back to a choice; anything unknown reads as [ASK]. */
+        fun parse(stored: String?): StaleAnchorChoice = entries.firstOrNull { it.name == stored } ?: ASK
+    }
+}
