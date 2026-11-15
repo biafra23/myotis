@@ -1116,8 +1116,10 @@ reporting:
    published once a fixed release is out.
 
 Wallets built on Myotis, such as [Punicus](https://github.com/biafra23/punicus),
-have their own repositories. A problem that lies in the wallet rather than in
-the engine goes to that wallet's repository.
+have their own repositories. A security issue that lies in the wallet rather
+than in the engine is reported to that wallet's repository, privately as well
+(Punicus takes reports through its own
+[new advisory form](https://github.com/biafra23/punicus/security/advisories/new)).
 
 ## License
 
