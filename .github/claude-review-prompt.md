@@ -23,7 +23,8 @@ Then review on the usual merits: real defects first (correctness,
 concurrency, resource leaks, security), then maintainability. Rank
 findings by severity and skip style nits a formatter would catch.
 
-The PR branch is checked out in the working directory. Use
+Where the PR's files are checked out is stated under CHECKOUT at
+the end of this prompt. Use
 `gh pr comment` for the overall review summary and
 `mcp__github_inline_comment__create_inline_comment` (with
 `confirmed: true`) for line-specific findings. Only post GitHub

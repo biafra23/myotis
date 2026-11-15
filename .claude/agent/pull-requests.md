@@ -14,8 +14,9 @@ on its allowlist.
 
 **External / fork PRs are reviewed MANUALLY, never by the CI reviewer (owner's
 decision, 2026-08-15).** The `claude-review` workflow deliberately skips forks
-(`head.repo.full_name == github.repository` in its `if:`) because a `pull_request`
-run from a fork gets no secrets — but the deeper reason is trust: a fork PR's
+(`head.repo.full_name == github.repository` in its `if:`). It runs on
+`pull_request_target`, which hands a fork's run the repository's secrets, so
+that `if:` is also what keeps them from forks — but the deeper reason is trust: a fork PR's
 tree is attacker-controlled, and an automated reviewer that reads it can be
 prompt-injected. A PR can no longer rewrite the reviewer's prompt file (the
 workflow reads it from the PR's base commit) or its root `CLAUDE.md`

@@ -90,8 +90,11 @@
 #     replays the ORIGINAL commit and workflow file, so it cannot pick up a
 #     workflow change; close/reopen is the way to get a fresh one.
 #   - Drafts are skipped until marked ready.
-#   - Fork PRs are skipped: `pull_request` runs from forks get no secrets, so
-#     the job could only fail there. Same-repo PRs are the review target.
+#   - Fork PRs are skipped (owner's decision, 2026-08-15): a fork's tree is
+#     attacker-controlled, and they are reviewed by hand. On
+#     `pull_request_target` the job `if:` is also what keeps the repository's
+#     secrets from a fork's run, which this event would otherwise get. Same-
+#     repo PRs are the review target.
 #   - Runs Dependabot starts are skipped (owner's decision, 2026-11-12): the
 #     action refuses a bot actor unless it is in `allowed_bots`, and such a
 #     run gets only Dependabot secrets, so CLAUDE_CODE_OAUTH_TOKEN would have
@@ -103,33 +106,46 @@
 #   - Where the reviewer's instructions come from. A same-repo branch is not
 #     necessarily trusted (a prompt-injected Claude Code session can push one
 #     and open a PR from it), so the prompt file is read from the PR's base
-#     commit, never from its checkout (see "Assemble review prompt"), and
-#     claude-code-action restores the root CLAUDE.md, CLAUDE.local.md and
-#     .claude/ from the base branch's tip (its docs/security.md). Limits:
+#     commit, never from its tree (see "Assemble review prompt"), and the
+#     working directory, where Claude Code reads CLAUDE.md and .claude/, is
+#     the base branch's tip (claude-code-action also restores those from the
+#     base, its docs/security.md). Limits:
 #     * Whoever opens the PR picks its base. Only a PR into main is held to
 #       main's prompt and config; one into another branch — which that same
 #       session can push — gets that branch's.
-#     * CLAUDE.md, CLAUDE.local.md and .claude/rules/ in a subdirectory are
-#       not restored, and Claude Code loads them once the reviewer reads a
-#       file there. That includes .claude-pr/, where the action keeps the
-#       PR's own copies of the root files.
+#     * The PR's own CLAUDE.md, CLAUDE.local.md and .claude/ files, at any
+#       depth, are removed from its checkout (see the job's steps), so none
+#       is loaded when the reviewer reads a file next to one.
 #     * The diff, title and description are the PR author's text regardless.
+#     * This workflow runs on `pull_request_target`, so GitHub runs the
+#       base branch's copy of THIS file, never the PR's (owner's request,
+#       2026-11-15): a PR cannot change how it is itself reviewed. The
+#       working directory is the base branch too, where Claude Code reads
+#       its rules; the PR's files are checked out for reading only, outside
+#       it, with every CLAUDE.md, CLAUDE.local.md, .claude/, .mcp.json and
+#       .claude.json removed, and passed with --add-dir (the pattern in
+#       claude-code-action's docs/security.md). Nothing here runs the PR's
+#       code. The fork test in the job `if:` matters more on this event: a
+#       `pull_request_target` run gets the repository's secrets even for a
+#       fork's PR.
 #     * None of this binds an author who can push workflow changes: a
-#       same-repo PR runs its own copy of this file, with the repo's secrets.
-#   - A PR that edits THIS FILE cannot review itself: the action requires the
-#     workflow to match the default branch and skips, and the job still goes
-#     green, with a warning that there is no review. The same skip hits any
-#     branch whose copy differs from the default branch's, such as a feature
-#     branch that has not merged a change to this file; the warning shows
-#     only where that copy carries this check. The steps before the action do
-#     run from the PR's copy, so a broken prompt step shows up there, and so
-#     does the check after it, which takes its skip branch. The review itself,
-#     the comment counts, the fallback and api jobs and the steps that fail a
-#     job are only exercised once merged to main.
+#       same-repo PR can add a workflow of its own that runs on
+#       `pull_request`, with the repository's secrets.
+#   - A PR that edits THIS FILE is reviewed by the base branch's copy, like
+#     any other PR; its own changes to it take effect, and are first
+#     exercised, once merged. The action does need the copy that runs to
+#     match the default branch's: Anthropic's token exchange refuses the
+#     Claude App's token otherwise, and the action skips, and the job still
+#     goes green, with a warning that there is no review. On this event that
+#     happens only where the PR's base branch lags the default branch on
+#     this file, such as a feature branch that has not merged a change to
+#     it.
 name: claude-review
 
+# pull_request_target: the base branch's copy of this file runs, never the
+# PR's (see "Where the reviewer's instructions come from" above).
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, reopened, ready_for_review]
 
 # One review at a time per PR: the checks below credit this run with what the
@@ -192,26 +208,61 @@ jobs:
       fallback: ${{ steps.unposted.outputs.safe }}
       prompt: ${{ steps.prompt.outputs.text }}
     steps:
+      # The base branch: the working directory, where Claude Code reads its
+      # rules (pull_request_target checks it out by default). No token is
+      # left in its .git/config, where the reviewer could read it: the repo
+      # is public, so the fetches below need none, and the action sets up its
+      # own.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          persist-credentials: false
+
+      # The PR's files, for reading only, outside the working directory and
+      # without any file Claude Code would take instructions or config from
+      # (see "Where the reviewer's instructions come from" above). The
+      # reviewer sees the PR's changes to those files in `gh pr diff`. Keep
+      # the three jobs' copies of these two steps identical. The prompt names
+      # this path as the review job resolved it, and the fallback and api
+      # jobs pass their own to --add-dir: the same while all three run on
+      # the same `runs-on`.
+      - name: Check out the PR's files
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-head
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Move the PR's files out of the working directory
+        run: |
+          set -euo pipefail
+          mv pr-head "$RUNNER_TEMP/pr-head"
+          # A symlink could point the reviewer at a file outside the PR's
+          # tree (/proc/self/environ, the base checkout): none is kept.
+          find "$RUNNER_TEMP/pr-head" -type l -delete
+          find "$RUNNER_TEMP/pr-head" \( -name CLAUDE.md -o -name CLAUDE.local.md -o -name .claude \
+            -o -name .mcp.json -o -name .claude.json \) -prune -exec rm -rf {} +
 
       # Both attempts send the identical prompt, so it lives in one file and is
       # assembled once here; the fallback job receives it through this job's
       # outputs.
       #
       # The file comes from the base commit GitHub recorded for the PR
-      # (pull_request.base.sha), never from the checkout, which is the PR's own
-      # tree (see "Where the reviewer's instructions come from" above). A PR
-      # that edits the prompt is therefore reviewed with the base version until
-      # it is merged — intended. The recorded base can be older than the base
-      # the checkout was merged onto (GitHub keeps it across plain pushes and
-      # ready_for_review), and a re-run replays it.
+      # (pull_request.base.sha), never from the PR's tree (see "Where the
+      # reviewer's instructions come from" above). A PR that edits the prompt
+      # is therefore reviewed with the base version until it is merged —
+      # intended. The recorded base can be older than the base branch's tip
+      # this run checked out (GitHub keeps it across plain pushes and
+      # ready_for_review), and a re-run replays it. Where the PR's files are
+      # is appended here, by this workflow, so that it always matches the
+      # checkout steps above whatever that prompt file says.
       - name: Assemble review prompt
         id: prompt
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           prompt_path=.github/claude-review-prompt.md
@@ -220,8 +271,8 @@ jobs:
           # ":<path>" — the index, i.e. the PR's own copy.
           [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] \
             || { echo "::error::Unexpected base SHA: '$BASE_SHA'"; exit 1; }
-          # The checkout is a depth-1 clone of the merge commit, which does not
-          # include the base commit itself.
+          # The checkout is a depth-1 clone of the base branch's tip, which
+          # need not include the recorded base commit.
           git fetch --no-tags --no-recurse-submodules --depth=1 origin "$BASE_SHA"
           # Only a regular file is a prompt: for a symlink or a directory,
           # `git show` prints the link text or a listing and exits 0.
@@ -237,11 +288,22 @@ jobs:
             echo "PR NUMBER: $PR_NUMBER"
             echo
             printf '%s\n' "$prompt"
+            echo
+            echo "CHECKOUT (this overrides anything above about where the code is):"
+            echo "- The working directory is the base branch ($BASE_REF). Its CLAUDE.md"
+            echo "  and .claude/agent/ files are the rules to hold the PR against."
+            echo "- The PR's own files (head $HEAD_SHA) are in $RUNNER_TEMP/pr-head."
+            echo "  Read the code under review there. Its CLAUDE.md, CLAUDE.local.md,"
+            echo "  .claude/, .mcp.json and .claude.json files were removed: read the"
+            echo "  PR's changes to those in \`gh pr diff\`."
+            echo "- Inline comments take paths relative to the repository root, as"
+            echo "  \`gh pr diff\` shows them, never with the $RUNNER_TEMP/pr-head prefix."
             echo 'CLAUDE_PROMPT_EOF'
           } >> "$GITHUB_OUTPUT"
 
-      # Whether this run's copy of this file is the default branch's. When it
-      # is not, the action skips without starting Claude (see Scope
+      # Whether this run's copy of this file — the base branch's, checked out
+      # here — is the default branch's. When it is not, the action skips
+      # without starting Claude (see Scope
       # decisions), and the check after the first attempt has to tell that
       # skip from an attempt that left nothing. Asked here, before the action
       # runs: the action points origin at its app token and revokes the token
@@ -289,6 +351,7 @@ jobs:
           claude_args: |
             --model fable
             --effort max
+            --add-dir ${{ runner.temp }}/pr-head
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
       # What the attempt was refused, and how it ended. The action keeps the
@@ -412,11 +475,10 @@ jobs:
   # one job share state that the action never resets between them: its buffer
   # of unconfirmed inline comments (/tmp/inline-comments-buffer.jsonl, which
   # its post-session step reads and never clears, so a second run would post
-  # the first one's leftovers), and the working tree, where the first run has
-  # already swapped the base branch's CLAUDE.md and .claude/ in, so the second
-  # one's .claude-pr/ snapshot of the PR's copies would hold the base's. A
-  # fresh runner and checkout start the fallback where the first attempt
-  # started.
+  # the first one's leftovers), and the working tree, which the first run has
+  # already rewritten (it restores the base's CLAUDE.md and .claude/ and
+  # keeps copies under .claude-pr/). A fresh runner and checkout start the
+  # fallback where the first attempt started.
   #
   # While this job waits for a runner, the run counts as in progress, so the
   # builds' gate (wait-for-claude-review.yml) waits too: its 5-minute escape
@@ -437,9 +499,40 @@ jobs:
     outputs:
       api: ${{ steps.unposted.outputs.api }}
     steps:
+      # The base branch: the working directory, where Claude Code reads its
+      # rules (pull_request_target checks it out by default). No token is
+      # left in its .git/config, where the reviewer could read it: the repo
+      # is public, so the fetches below need none, and the action sets up its
+      # own.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          persist-credentials: false
+
+      # The PR's files, for reading only, outside the working directory and
+      # without any file Claude Code would take instructions or config from
+      # (see "Where the reviewer's instructions come from" above). The
+      # reviewer sees the PR's changes to those files in `gh pr diff`. Keep
+      # the three jobs' copies of these two steps identical. The prompt names
+      # this path as the review job resolved it, and the fallback and api
+      # jobs pass their own to --add-dir: the same while all three run on
+      # the same `runs-on`.
+      - name: Check out the PR's files
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-head
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Move the PR's files out of the working directory
+        run: |
+          set -euo pipefail
+          mv pr-head "$RUNNER_TEMP/pr-head"
+          # A symlink could point the reviewer at a file outside the PR's
+          # tree (/proc/self/environ, the base checkout): none is kept.
+          find "$RUNNER_TEMP/pr-head" -type l -delete
+          find "$RUNNER_TEMP/pr-head" \( -name CLAUDE.md -o -name CLAUDE.local.md -o -name .claude \
+            -o -name .mcp.json -o -name .claude.json \) -prune -exec rm -rf {} +
 
       # As in the review job, but this job's own start: the review job's
       # would credit a re-run of this job with what an earlier run posted.
@@ -470,6 +563,7 @@ jobs:
           claude_args: |
             --model opus
             --effort max
+            --add-dir ${{ runner.temp }}/pr-head
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
       # The review job's report, for this attempt; keep the copies identical.
@@ -600,9 +694,40 @@ jobs:
       pull-requests: write
       id-token: write
     steps:
+      # The base branch: the working directory, where Claude Code reads its
+      # rules (pull_request_target checks it out by default). No token is
+      # left in its .git/config, where the reviewer could read it: the repo
+      # is public, so the fetches below need none, and the action sets up its
+      # own.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          persist-credentials: false
+
+      # The PR's files, for reading only, outside the working directory and
+      # without any file Claude Code would take instructions or config from
+      # (see "Where the reviewer's instructions come from" above). The
+      # reviewer sees the PR's changes to those files in `gh pr diff`. Keep
+      # the three jobs' copies of these two steps identical. The prompt names
+      # this path as the review job resolved it, and the fallback and api
+      # jobs pass their own to --add-dir: the same while all three run on
+      # the same `runs-on`.
+      - name: Check out the PR's files
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-head
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Move the PR's files out of the working directory
+        run: |
+          set -euo pipefail
+          mv pr-head "$RUNNER_TEMP/pr-head"
+          # A symlink could point the reviewer at a file outside the PR's
+          # tree (/proc/self/environ, the base checkout): none is kept.
+          find "$RUNNER_TEMP/pr-head" -type l -delete
+          find "$RUNNER_TEMP/pr-head" \( -name CLAUDE.md -o -name CLAUDE.local.md -o -name .claude \
+            -o -name .mcp.json -o -name .claude.json \) -prune -exec rm -rf {} +
 
       # A missing secret would otherwise surface as the action's generic
       # "no credentials" error.
@@ -635,6 +760,7 @@ jobs:
             --model fable
             --effort high
             --max-budget-usd 15
+            --add-dir ${{ runner.temp }}/pr-head
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
       # The review job's report, for this attempt; keep the copies identical.
@@ -654,7 +780,8 @@ jobs:
           jq -r "$REPORT_JQ" "$EXECUTION_FILE" 2>&1 | sed 's/^/| /'
 
       # The newest Fable or no review (see Model strategy): every model the
-      # transcript names, at start-up and per answer, must be a Fable. A
+      # transcript names, at start-up and per top-level answer, must be a
+      # Fable. A
       # catalog that resolved `fable` to something else, or a fallback model
       # added later, turns the job red instead of passing for a Fable review.
       - name: Was it Fable?
@@ -664,8 +791,10 @@ jobs:
         run: |
           set -euo pipefail
           [ -f "$EXECUTION_FILE" ] || { echo "::error::No transcript at '$EXECUTION_FILE', so the model is unknown."; exit 1; }
+          # Claude's own answers only: a subagent it starts (parent_tool_use_id
+          # set) may run on another model, and its work is not the review.
           models=$(jq -r '[.[] | (select(.type == "system" and .subtype == "init") | .model),
-            (select(.type == "assistant") | .message.model)] | map(select(. != null and . != "<synthetic>")) | unique | .[]' "$EXECUTION_FILE")
+            (select(.type == "assistant" and .parent_tool_use_id == null) | .message.model)] | map(select(. != null and . != "<synthetic>")) | unique | .[]' "$EXECUTION_FILE")
           echo "Models in the transcript: ${models:-none}"
           [ -n "$models" ] || { echo "::error::The transcript names no model, so this cannot be shown to be a Fable review."; exit 1; }
           # A here-string, not a pipe, as in the fallback job's limit check.
