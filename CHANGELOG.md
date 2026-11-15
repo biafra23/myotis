@@ -19,6 +19,8 @@ its trust anchors and release checks.
 
 ## [Unreleased]
 
+## [0.1.21-rc1] - 2026-11-15
+
 ### Added
 
 - Stale anchor: at a `STALE_ANCHOR` park, the user can re-anchor on a fresh
@@ -559,7 +561,8 @@ MetaMask; ENS with CCIP-Read; mainnet and Gnosis Chain; the Android app, the
 shared Compose Multiplatform UI and the macOS dmg; and `:myotis-api`, the
 engine contract (#1 to #123).
 
-[Unreleased]: https://github.com/biafra23/myotis/compare/v0.1.20...HEAD
+[Unreleased]: https://github.com/biafra23/myotis/compare/v0.1.21-rc1...HEAD
+[0.1.21-rc1]: https://github.com/biafra23/myotis/compare/v0.1.20...v0.1.21-rc1
 [0.1.20]: https://github.com/biafra23/myotis/compare/v0.1.20-rc1...v0.1.20
 [0.1.20-rc1]: https://github.com/biafra23/myotis/compare/v0.1.19...v0.1.20-rc1
 [0.1.19]: https://github.com/biafra23/myotis/compare/v0.1.19-rc2...v0.1.19
