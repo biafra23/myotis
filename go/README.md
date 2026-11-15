@@ -269,12 +269,14 @@ its own library is stale: absent, there without a matching stamp, or there
 carrying the stamp's `:stale` mark (a delete the OS refused — e.g. a running
 host mapping the DLL; PR #861 round 2) — the task retries on every later
 build, so installing a C compiler or coming back online is all it takes.
-The one residue (PR #861 round 3, measured): a `go/build` this task can
+The one residue (PR #861 rounds 3 & 5, measured): a `go/build` this task can
 neither delete nor write — the classic Linux/macOS case is files owned by
 another user after a `sudo` or container build — has an unwritable stamp
-too, so that failed run does record up-to-date and the retry waits for a
-source change (the warning names it); fix the ownership and the normal
-rules apply again.
+too, so that failed run does record up-to-date (the warning names it). Fixing
+the ownership alone does NOT retry it — the recorded stamp still matches the
+library, so the task sees nothing to do; only a Go source change re-runs it.
+To force a rebuild now, `chown` `go/build` back AND delete it (or run
+`./gradlew goBuildCShared --rerun-tasks`).
 
 ## Test
 

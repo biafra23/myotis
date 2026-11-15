@@ -87,10 +87,14 @@ type entry struct {
 	// context.Background() outlived myotis_stop by up to the whole
 	// ReadBudget — the header asks Stop to "signal pending readers,
 	// drain registered work", which needs both the derivation and
-	// the reads waitgroup). cancel stops the LC loop too; set by
-	// Start under mu, read by Stop after removing the entry (a
-	// removed entry takes no more Start writes, so the handoff is
-	// ordered by the map delete).
+	// the reads waitgroup). cancel stops the LC loop too. Both fields
+	// are guarded by mu on EVERY access now (PR #861 round-4/5): Start
+	// writes them under mu, beginRead hands the ctx out under mu (the
+	// readers never re-read the field after the lock is gone), and
+	// Stop takes the cancel under mu before unlocking. An earlier doc
+	// said Stop read cancel after removing the entry, ordered by the
+	// map delete — that held only because nothing else wrote the field;
+	// with the Start-failure retry path it no longer did.
 	ctx     context.Context
 	cancel  context.CancelFunc
 	reads   sync.WaitGroup // reads that began while the handle lived
@@ -477,8 +481,13 @@ func Stop(handle int64) {
 		// Take the cancel under mu (PR #861 round-4 review): the entry
 		// doc promises every field except eng is mu-guarded, and this
 		// used to read e.cancel after unlocking. Deleting the entry
-		// first means no later Start can write it; nil-ing the field
-		// makes a double-Stop a no-op instead of a second cancel call.
+		// first means no later Start can write it; a second Stop finds
+		// no entry and returns before this point. Nil-ing the field
+		// serves the one real interleaving: a Start still inside
+		// StartNetwork when Stop runs reaches its failure path after
+		// the delete, sees nil, and skips cancelling an already-
+		// cancelled ctx (idempotent anyway, but the nil makes the
+		// handoff explicit at the reads of e.cancel).
 		cancel = e.cancel
 		e.cancel = nil
 		delete(table, handle)

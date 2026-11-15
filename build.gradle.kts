@@ -1260,10 +1260,13 @@ tasks.register<Exec>("goBuildCShared") {
                             " the run tasks gate on existence)."
                         ours -> " Could NOT delete go/build/$goEngineLibName and could not" +
                             " mark its stamp stale (neither the delete nor the stamp write" +
-                            " went through — go/build is probably not yours, e.g. left by a" +
-                            " sudo or container build): this failed run WILL record" +
-                            " up-to-date, and the retry waits for a source change or for" +
-                            " chown to fix the ownership."
+                            " went through — go/build is probably owned by another user," +
+                            " e.g. left by a sudo or container build). This failed run WILL" +
+                            " record up-to-date, and fixing the ownership alone will NOT" +
+                            " retry it (the recorded stamp still matches the library, so the" +
+                            " task sees nothing to do — measured, round-5 review). Only a" +
+                            " Go source change re-runs it; to force it now, chown go/build" +
+                            " back AND delete it (or run 'goBuildCShared --rerun-tasks')."
                         lib.exists() -> " go/build/$goEngineLibName was not built by this task and" +
                             " stays in place — the Go engine keeps running on it, and keeping it" +
                             " fresh against these sources is the manual build's own duty."
@@ -1278,7 +1281,25 @@ tasks.register<Exec>("goBuildCShared") {
             // silently inheriting the stamp.
             val lib = file("go/build/$goEngineLibName")
             if (lib.isFile) {
-                file(goBuildStampPath).writeText("${lib.length()}:${lib.lastModified()}\n")
+                // Never fail a SUCCESSFUL build over the stamp (round-5 review,
+                // measured on the pinned Gradle): a stamp another user created —
+                // a sudo or container run inside a go/build the developer owns —
+                // is unopenable-for-write here even though go build itself
+                // succeeded, and an unguarded writeText would then fail every
+                // later :app:run / :app-desktop:run / :myotis-engine-go:test on
+                // a host whose Go build works, against "the JVM build
+                // continues". Delete first: a directory owner can delete a file
+                // it cannot write, which covers the common case; the guard
+                // covers a stamp that is neither writable nor deletable. An
+                // unstamped library only means "not ours" — one wasted rebuild,
+                // never a crash (see goLibIsOurs).
+                val stamp = file(goBuildStampPath)
+                stamp.delete()
+                if (runCatching { stamp.writeText("${lib.length()}:${lib.lastModified()}\n") }.isFailure) {
+                    logger.warn("[go] built go/build/$goEngineLibName but could not write" +
+                        " $goBuildStampPath: the library is not marked as this task's own," +
+                        " so the next run rebuilds it.")
+                }
             }
         }
     }

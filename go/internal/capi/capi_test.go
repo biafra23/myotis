@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log/slog"
+	"net"
 	"os"
 	"regexp"
 	"strconv"
@@ -267,6 +268,98 @@ func TestStopWakesInFlightRead(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("in-flight read still blocked long after Stop (the 90 s budget bug)")
 	}
+}
+
+func TestStartFailureRetryWithConcurrentRead(t *testing.T) {
+	// PR #861 round-5 review: the Start FAILURE path (StartNetwork
+	// bind error → started reset, ctx cancelled, retryable via
+	// another Start) had never been executed — the lifecycle tests
+	// forged a started handle or started successfully, and the
+	// engine-level busy-port test never entered this function. One
+	// intermediate state of that path could panic the host process
+	// (a nil lifetime context reaching context.WithTimeout, which
+	// nothing under go/ recovers from), and that was found by
+	// reading. This test makes -race (go-engine.yml) the keeper of
+	// the beginRead "hand the ctx out under mu" rule: a reader that
+	// goes back to e.ctx after the lock shows up there.
+	//
+	// Pin the discv4 UDP port the way the engine test does, so
+	// StartNetwork's bind fails:
+	sock, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("pinning a UDP port: %v", err)
+	}
+	port := sock.LocalAddr().(*net.UDPAddr).Port
+	t.Setenv("MYOTIS_GO_LISTEN_PORT", strconv.Itoa(port))
+	h := Create("mainnet", t.TempDir())
+	if h < 1 {
+		t.Fatalf("Create = %d", h)
+	}
+	stopped := false
+	t.Cleanup(func() {
+		if !stopped {
+			Stop(h)
+		}
+	})
+
+	// A reader hammering the handle across the WHOLE sequence —
+	// fail / fail / free / succeed / Stop — so its beginRead and the
+	// Start paths' mu-guarded writes genuinely overlap under -race
+	// (a fixed-iteration loop can finish before the first Start even
+	// runs, testing nothing). Every answer must stay retryable: an
+	// error WITHOUT a code — "not started" while the bind fails,
+	// "unknown handle" after the Stop; never a permanent code, never
+	// a panic.
+	stopReads := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stopReads:
+				return
+			default:
+			}
+			out := RequestAccountJSON(h, "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", "finalized")
+			// (no decode() here: it t.Fatalfes, and this is not the
+			// test goroutine) every answer is an error envelope;
+			// retryable = `{"error":…}` with NO code key.
+			var m map[string]any
+			if err := json.Unmarshal([]byte(out), &m); err != nil {
+				t.Errorf("read answer not JSON (%v): %s", err, out)
+				return
+			}
+			if _, has := m["error"]; !has {
+				t.Errorf("read across the failed-Start window must answer a retryable error, got %s", out)
+				return
+			}
+			if _, has := m["code"]; has {
+				t.Errorf("read across the failed-Start window must stay retryable (no code), got %s", out)
+				return
+			}
+		}
+	}()
+	if Start(h) {
+		t.Fatal("Start onto the busy UDP port returned true, want false")
+	}
+	if Start(h) {
+		t.Fatal("retry #1 onto the still-busy port returned true, want false (retryable per the header)")
+	}
+	if err := sock.Close(); err != nil { // free the port
+		t.Fatalf("freeing the port: %v", err)
+	}
+	if !Start(h) {
+		t.Fatal("Start after freeing the port returned false; the failed attempts must not poison the handle")
+	}
+	closeErr := make(chan struct{})
+	go func() { Stop(h); stopped = true; close(closeErr) }()
+	select {
+	case <-closeErr:
+	case <-time.After(20 * time.Second):
+		t.Fatal("Stop after the retried Start did not return")
+	}
+	close(stopReads)
+	<-done
 }
 
 func TestStorageRequestShapes(t *testing.T) {
