@@ -2,8 +2,13 @@
 # Gemini Code Assist reviews).
 #
 # Setup (one-time, repo admin):
-#   1. Install the Claude GitHub App on this repo (github.com/apps/claude, or
-#      run /install-github-app from the Claude Code CLI).
+#   1. Nothing for GitHub itself: the action posts with this run's own
+#      GITHUB_TOKEN (`github_token: ${{ github.token }}` on each attempt), so
+#      the review comes from github-actions[bot]. The Claude GitHub App's
+#      token exchange is not used: Anthropic's endpoint refuses the OIDC token
+#      of a `pull_request_target` run (`401 Unauthorized - Invalid OIDC
+#      token`), which left #861, #875 and #862 without a review after #874
+#      moved this workflow to that event.
 #   2. Add the CLAUDE_CODE_OAUTH_TOKEN repo secret (from `claude setup-token`) —
 #      the first two attempts bill the Claude subscription and share its usage
 #      limits.
@@ -46,7 +51,8 @@
 #   result. A run in which the action never started Claude because this file
 #   differs from the default branch's is not an attempt (see Scope
 #   decisions): it stays green with a warning, since a fallback would skip
-#   the same way. After each attempt, a step prints what it was refused and
+#   the same way. (Only the App's token exchange skips like that; with the
+#   run's own token, Setup step 1, it does not happen.) After each attempt, a step prints what it was refused and
 #   how it ended, so a silent attempt explains itself.
 #
 #   Subscription first, API credits last (owner's decision, 2026-11-15):
@@ -133,13 +139,11 @@
 #       `pull_request`, with the repository's secrets.
 #   - A PR that edits THIS FILE is reviewed by the base branch's copy, like
 #     any other PR; its own changes to it take effect, and are first
-#     exercised, once merged. The action does need the copy that runs to
-#     match the default branch's: Anthropic's token exchange refuses the
-#     Claude App's token otherwise, and the action skips, and the job still
-#     goes green, with a warning that there is no review. On this event that
-#     happens only where the PR's base branch lags the default branch on
-#     this file, such as a feature branch that has not merged a change to
-#     it.
+#     exercised, once merged. With the App's token exchange, the copy that
+#     runs also had to match the default branch's, or the action skipped
+#     with no review; the run's own token (Setup, step 1) has no such check,
+#     so the "Does this workflow match" step and its warning are kept only
+#     for a return to the App.
 name: claude-review
 
 # pull_request_target: the base branch's copy of this file runs, never the
@@ -160,13 +164,16 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # The login claude-code-action posts as with this setup (the Claude GitHub
-  # App, see Setup). Only its comments count as review feedback in the checks
-  # below, so a person or another bot (Copilot posts inline findings)
+  # The login claude-code-action posts as with this setup (the run's own
+  # GITHUB_TOKEN, see Setup). Only its comments count as review feedback in
+  # the checks below, so a person or another bot (Copilot posts inline findings)
   # commenting while the review runs can neither pass for a review nor
-  # suppress the fallback. A different token setup posts under a different
-  # login: change this with it, or every review reads as empty.
-  REVIEWER_LOGIN: claude[bot]
+  # suppress the fallback. github-actions[bot] is every workflow's login,
+  # though: no other workflow here comments on PRs, so today only this one
+  # counts, but one that starts to (a PR can add one) would pass for a
+  # review. A different token setup posts under a different login: change
+  # this with it, or every review reads as empty.
+  REVIEWER_LOGIN: github-actions[bot]
   # What each job prints after its attempt (see "What the first attempt was
   # refused, and how it ended"), from the transcript the action writes to
   # its execution file: how the run ended, each refused tool call with the
@@ -202,7 +209,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      id-token: write
     # What the fallback job needs from this one.
     outputs:
       fallback: ${{ steps.unposted.outputs.safe }}
@@ -306,8 +312,8 @@ jobs:
       # without starting Claude (see Scope
       # decisions), and the check after the first attempt has to tell that
       # skip from an attempt that left nothing. Asked here, before the action
-      # runs: the action points origin at its app token and revokes the token
-      # on its way out, so a fetch after it would fail.
+      # runs: the action points origin at its token (with the App's, it also
+      # revoked it on its way out), so a fetch after it could fail.
       - name: Does this workflow match the default branch's?
         id: workflow
         env:
@@ -347,6 +353,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
           prompt: ${{ steps.prompt.outputs.text }}
           claude_args: |
             --model fable
@@ -411,9 +418,10 @@ jobs:
             || { echo "::error::Unexpected start time: '$SINCE'"; exit 1; }
           # The reviewer's comments posted or edited since the start, summary
           # and inline; three tries before it gives up. Inline comments also
-          # count from github-actions[bot]: the action posts its buffered ones
-          # with this job's token when its run step died before handing over
-          # the app's, and no other workflow here comments on PRs. Each listing
+          # count from github-actions[bot] (with the App's token, the action
+          # posted its buffered ones with this job's token when its run step
+          # died before handing the App's over); with the job's own token
+          # (Setup, step 1) that is REVIEWER_LOGIN itself. Each listing
           # is assigned on its own, never inside an echo or an arithmetic
           # expansion, where a failed gh api would still exit 0. The fallback
           # job's "Did the fallback leave a review?" and the api job's "Fail
@@ -494,7 +502,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      id-token: write
     # What the api job needs from this one.
     outputs:
       api: ${{ steps.unposted.outputs.api }}
@@ -559,6 +566,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
           prompt: ${{ needs.review.outputs.prompt }}
           claude_args: |
             --model opus
@@ -692,7 +700,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      id-token: write
     steps:
       # The base branch: the working directory, where Claude Code reads its
       # rules (pull_request_target checks it out by default). No token is
@@ -755,6 +762,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
           prompt: ${{ needs.review.outputs.prompt }}
           claude_args: |
             --model fable
