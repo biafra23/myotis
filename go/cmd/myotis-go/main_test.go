@@ -18,8 +18,13 @@ import (
 // error matches os.ErrDeadlineExceeded but NOT context.DeadlineExceeded
 // (only dial timeouts match the sentinel), so an errors.Is(err,
 // DeadlineExceeded) classifier was right only by accident of which
-// errors happened to arrive. Every case below therefore carries a
-// LastAttempt chosen to PROVOKE the old classifier in both directions.
+// errors happened to arrive. The discriminating row is the cancelled
+// read whose LastAttempt DOES Is-match the sentinel (a dial-timeout
+// shape): the old errors.Is classifier turned it into "read window
+// expired" (exit 1), this one exits clean — the rows are only a
+// regression test if at least one separates the two classifiers
+// (round-4 review: run the table against the removed switch and
+// everything but this row agrees).
 
 func TestClassifyReadFailure(t *testing.T) {
 	addr := common.HexToAddress("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")
@@ -27,11 +32,18 @@ func TestClassifyReadFailure(t *testing.T) {
 	t.Cleanup(cancel)
 	cancelled, cancelNow := context.WithCancel(context.Background())
 	cancelNow()
-	// A socket-read deadline error: matches os.ErrDeadlineExceeded,
-	// must NOT Is-match context.DeadlineExceeded (pinned below).
-	sockTimeout := fmt.Errorf("read tcp 10.0.0.5:41912->3.15.200.12:30303: i/o timeout")
+	// A socket-read deadline error as net really returns it: wraps
+	// os.ErrDeadlineExceeded, must NOT Is-match context.DeadlineExceeded
+	// (premise pinned below).
+	sockTimeout := fmt.Errorf("read tcp 10.0.0.5:41912->3.15.200.12:30303: %w", os.ErrDeadlineExceeded)
+	if !errors.Is(sockTimeout, os.ErrDeadlineExceeded) || errors.Is(sockTimeout, context.DeadlineExceeded) {
+		t.Fatal("fixture premise broken: a wrapped socket deadline must match os.ErrDeadlineExceeded only")
+	}
 	// A transport timeout on an established session (snapread's shape).
 	transportTimeout := errors.New("transport: timed out awaiting GetAccountRange")
+	// A dial timeout — the shape that DOES Is-match the sentinel, and
+	// the only fixture here the removed errors.Is classifier got wrong.
+	dialTimeout := fmt.Errorf("dial: %w", context.DeadlineExceeded)
 
 	if errors.Is(os.ErrDeadlineExceeded, context.DeadlineExceeded) {
 		t.Fatal("premise moved: a socket deadline now Is-matches context.DeadlineExceeded;" +
@@ -42,20 +54,25 @@ func TestClassifyReadFailure(t *testing.T) {
 		name  string
 		ctx   context.Context
 		err   error
-		want  error // nil = clean exit; errWant = returned unchanged
-		match string
+		match string // "" = the clean exit (nil), else the exact message
 	}{
 		{
 			name: "cancelled read with a socket-timeout last attempt is the clean exit",
 			ctx:  cancelled,
 			err:  &engine.ReadError{Reason: context.Canceled, LastAttempt: sockTimeout},
-			want: nil,
 		},
 		{
 			name: "cancelled read with a transport-timeout last attempt is the clean exit",
 			ctx:  cancelled,
 			err:  &engine.ReadError{Reason: context.Canceled, LastAttempt: transportTimeout},
-			want: nil,
+		},
+		{
+			// THE discriminating row: old classifier (errors.Is through
+			// Unwrap) said "read window expired" / exit 1 here; the
+			// Reason-based one must exit clean.
+			name: "cancelled read whose last attempt Is-matches the deadline sentinel is still the clean exit",
+			ctx:  cancelled,
+			err:  &engine.ReadError{Reason: context.Canceled, LastAttempt: dialTimeout},
 		},
 		{
 			name:  "expired window names the last attempt",
@@ -73,7 +90,6 @@ func TestClassifyReadFailure(t *testing.T) {
 			name: "a shutdown the engine never saw is still the clean exit",
 			ctx:  cancelled,
 			err:  errors.New("engine: closed"),
-			want: nil,
 		},
 		{
 			name:  "a real failure with a live context passes through",
@@ -85,12 +101,16 @@ func TestClassifyReadFailure(t *testing.T) {
 	for _, c := range tbl {
 		t.Run(c.name, func(t *testing.T) {
 			got := classifyReadFailure(c.ctx, c.err, addr)
-			if c.want != nil || got == nil {
-				if !errors.Is(got, c.want) && got != c.want {
-					t.Fatalf("classifyReadFailure = %v, want %v", got, c.want)
+			if c.match == "" {
+				// The clean-exit rows: a non-nil return MUST fail here
+				// (round-4 review: the old `if c.want != nil || got ==
+				// nil` shape let every nil-want row pass vacuously).
+				if got != nil {
+					t.Fatalf("classifyReadFailure = %v, want the clean exit (nil)", got)
 				}
+				return
 			}
-			if c.match != "" && (got == nil || got.Error() != c.match) {
+			if got == nil || got.Error() != c.match {
 				t.Fatalf("classifyReadFailure = %v, want message %q", got, c.match)
 			}
 		})

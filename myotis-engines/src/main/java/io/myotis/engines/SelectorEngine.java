@@ -355,7 +355,18 @@ public final class SelectorEngine implements MyotisEngine {
      *  construction (native load) — which is fine for the threads involved:
      *  pushes ride the host's query pool, creates its boot workers, and
      *  creates hold this lock only for their fast bookkeeping (the slow
-     *  start() is the host's call, not this method's). */
+     *  start() is the host's call, not this method's).
+     *
+     *  <p>What the lock guarantees, exactly (PR #861 round-4 review): the
+     *  engines always AGREE WITH EACH OTHER — every engine present at a
+     *  push ends on that push's value, never on a mix. It does NOT order
+     *  two concurrent pushes by how fresh their reading is: the host reads
+     *  the device's state BEFORE arriving here, so the older reading can
+     *  still win the lock last and land last — on every engine at once.
+     *  That case self-heals at the next connectivity callback, because
+     *  {@link #networkMetering()} then differs from the device again; the
+     *  fix for true recency ordering would be a monotonic push sequence
+     *  through {@code :myotis-api}, not more locking here. */
     @Override
     public void setNetworkMetering(NetworkMetering metering) {
         if (metering == null) throw new EngineException("metering is required");

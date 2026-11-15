@@ -1294,10 +1294,16 @@ tasks.register<Exec>("goBuildCShared") {
         // creation of go/build reads as an input change ("Input property
         // '$1' file …/go/build has been added") and a fresh checkout executes
         // `go build` once more on the second run. No source ever lives there,
-        // so the exclusion loses nothing.
+        // so the exclusion loses nothing. AND ignoreEmptyDirectories() on top
+        // (round-4 review): with an include filter EVERY directory under go/
+        // is part of the snapshot even when nothing in it matches, so ANY new
+        // directory an editor or tool leaves (go/.idea, go/bin, go/vendor)
+        // costs a cgo rebuild — the exclusion was one instance, this is the
+        // cause. A .go appearing anywhere new still rebuilds: the directory
+        // is no longer what changed, the file inside it is.
         fileTree("go") { include("**/*.go", "go.mod", "go.sum"); exclude("build/**") },
         file("rust/include/myotis_engine.h"),
-    ).withPathSensitivity(PathSensitivity.RELATIVE)
+    ).withPathSensitivity(PathSensitivity.RELATIVE).ignoreEmptyDirectories()
     // Toolchain identity is an input, as for cargoBuildHost: a go upgrade with
     // unchanged sources must rebuild.
     inputs.property("goVersion", goVersion)
