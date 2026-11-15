@@ -1,6 +1,9 @@
 package clsync
 
 import (
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/biafra23/myotis/go/internal/chain"
@@ -67,5 +70,57 @@ func TestStaticParsesEveryStaticPeer(t *testing.T) {
 		if err != nil || info.ID == "" {
 			t.Fatalf("static peer %s: %v", m, err)
 		}
+	}
+}
+
+// TestStaleGateConsentWaiverIsLogged pins the audit trail PR #877
+// round 3 asked for: waiving the weak-subjectivity bound on the host's
+// consent is the one trust decision in this flow, so it must leave a
+// line in the log the hosts drain — once per loop, naming what it
+// waived — while a refusal keeps its error and stays silent here (the
+// refusal is reported by the caller that parks on it).
+func TestStaleGateConsentWaiverIsLogged(t *testing.T) {
+	const bound = 13
+	cases := []struct {
+		name     string
+		accepted bool
+		stale    bool
+		wantErr  bool
+		wantLogs int
+	}{
+		{"consent waives a stale anchor, once per loop", true, true, false, 1},
+		{"no consent refuses a stale anchor", false, true, true, 0},
+		{"fresh anchor needs no consent", false, false, false, 0},
+		{"fresh anchor ignores consent", true, false, false, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var lines []string
+			s := &Syncer{
+				Logf:          func(f string, a ...any) { lines = append(lines, fmt.Sprintf(f, a...)) },
+				WsBound:       func() uint64 { return bound },
+				StaleAccepted: func() bool { return tc.accepted },
+			}
+			// Staleness is period-granular (wall - anchor > bound).
+			anchor, wall := uint64(bound), uint64(bound)
+			if tc.stale {
+				anchor, wall = bound+1, 2*bound+2 // gap bound+1 > bound
+			}
+			err := s.staleGate(anchor, wall, "held committee")
+			err = s.staleGate(anchor, wall, "held committee") // second pass: no repeat
+			if tc.wantErr != (errors.Is(err, ErrStaleAnchor)) {
+				t.Fatalf("err = %v, wantErr = %v", err, tc.wantErr)
+			}
+			if len(lines) != tc.wantLogs {
+				t.Fatalf("logged %d lines %q, want %d", len(lines), lines, tc.wantLogs)
+			}
+			for _, l := range lines {
+				for _, want := range []string{"STALE ANCHOR", "period 14", "wall period 28", "bound 13", "waives"} {
+					if !strings.Contains(l, want) {
+						t.Errorf("waiver line %q missing %q", l, want)
+					}
+				}
+			}
+		})
 	}
 }

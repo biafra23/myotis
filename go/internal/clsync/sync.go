@@ -97,6 +97,14 @@ type Syncer struct {
 
 	procMu sync.Mutex
 	store  *lc.Store
+
+	// staleWaiveOnce emits the consent-waiver line at most once per
+	// loop: the steady loop re-enters staleGate every slot, and the
+	// waiver is ONE trust decision, not one line per slot (the line
+	// itself is PR #877 round 3 — waiving weak subjectivity is the one
+	// trust decision in this flow and must not pass unlogged; Rust's
+	// twin logs it at every park, sync.rs:2478/2849).
+	staleWaiveOnce sync.Once
 }
 
 func (s *Syncer) now() time.Time {
@@ -127,14 +135,23 @@ func (s *Syncer) staleAccepted() bool {
 // (start gate + in-run layer): refused unless the host consented to
 // the age, and judged against the bound in force at this instant.
 func (s *Syncer) staleGate(anchorPeriod, wallPeriod uint64, what string) error {
-	if s.staleAccepted() {
+	// Staleness is computed BEFORE the consent is consulted — not to
+	// change the verdict (consent still waives, refusal is unchanged)
+	// but because the waiver has to be able to name what it waived.
+	if !chain.WsAnchorStale(anchorPeriod, wallPeriod, s.boundPeriods()) {
 		return nil
 	}
-	if chain.WsAnchorStale(anchorPeriod, wallPeriod, s.boundPeriods()) {
-		return fmt.Errorf("%w: %s period %d, wall period %d, bound %d",
-			ErrStaleAnchor, what, anchorPeriod, wallPeriod, s.boundPeriods())
+	if s.staleAccepted() {
+		s.staleWaiveOnce.Do(func() {
+			s.Logf("STALE ANCHOR: %s period %d is past the weak-subjectivity bound "+
+				"(wall period %d, bound %d) — the host's stale-anchor consent waives "+
+				"the gate; syncing forward from the stale anchor",
+				what, anchorPeriod, wallPeriod, s.boundPeriods())
+		})
+		return nil
 	}
-	return nil
+	return fmt.Errorf("%w: %s period %d, wall period %d, bound %d",
+		ErrStaleAnchor, what, anchorPeriod, wallPeriod, s.boundPeriods())
 }
 
 func NewSyncer(c *chain.Consensus, h host.Host, logf func(string, ...any)) *Syncer {

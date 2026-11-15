@@ -78,12 +78,19 @@ import java.util.List;
  *       answer, which today is always the {@code applied:false} refusal — the
  *       one-shot {@link #acceptStaleAnchor} is the way forward until the fetch
  *       lands (engine-parity; the parse already handles the applied shape).
- *       Related engine-parity gap, recorded not fixed (PR #877 round-2): the
- *       "asks again at a later park" promise holds at the bootstrap gate
- *       only — after bootstrap, an in-run {@code ErrStaleAnchor} from
- *       catch-up retries logs and keeps running instead of republishing
- *       {@code STALE_ANCHOR} the way the Rust loop does, so a mid-run
- *       withdrawal re-asks only via the dialog the bootstrap park opened.</li>
+ *       Related engine-parity gap, recorded not fixed (PR #877 rounds 2-3):
+ *       the "asks again at a later park" promise holds at the bootstrap
+ *       gate only. After bootstrap, an in-run {@code ErrStaleAnchor} from
+ *       catch-up retries leaves the loop running but STALLED — it refuses
+ *       at the in-run gate every slot, so {@code PollFinality} never runs
+ *       and no anchor is published; {@code BeaconState} reports
+ *       {@code STALE_ANCHOR} only when the loop itself died, so the status
+ *       stays {@code SYNCING}/{@code CATCHING_UP} and NO dialog opens
+ *       (the bootstrap park's dialog was already answered, or a pre-start
+ *       CONTINUE meant there never was one). The only trace is the
+ *       per-slot "re-catch-up:" log; the ways out are choosing CONTINUE
+ *       again in Settings or a restart, which parks at the bootstrap
+ *       gate and asks.</li>
  * </ul>
  *
  * <p>{@link #reads()} and the loopback listener follow the Rust twin exactly:
@@ -711,8 +718,20 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
         // get (PR #877 review).
         boolean ok = linked(() -> GoEngineNative.nativeSetStaleAnchorPolicy(handle, policy.ordinal()));
         if (!ok) {
-            log.warn("[engines] setStaleAnchorPolicy({}) not applied: unknown handle, or "
-                    + "an answer the Go engine does not implement (CHECKPOINT has no fetch)", policy);
+            if (policy == io.myotis.api.StaleAnchorPolicy.CHECKPOINT) {
+                // CHECKPOINT is refused for its missing fetch — but the
+                // refusal still withdraws a remembered CONTINUE (the
+                // engine un-arms on any replacement, host.rs), so say
+                // that: a reader of this line must not assume an earlier
+                // "continue anyway" still holds (PR #877 round 3).
+                log.warn("[engines] setStaleAnchorPolicy(CHECKPOINT) not applied: the Go "
+                        + "engine has no checkpoint fetch — and any previously remembered "
+                        + "'continue anyway' IS withdrawn by this refusal, so stale anchors "
+                        + "are back on 'ask'");
+            } else {
+                log.warn("[engines] setStaleAnchorPolicy({}) not applied: unknown handle, or "
+                        + "a closed engine", policy);
+            }
         }
         return ok;
     }

@@ -252,7 +252,19 @@ ABI slot width, not the reader — the Go reader itself takes the full
 32-byte key), no EVM/block/tx/code reads,
 no ENS (the `EnsApi` throws one named refusal), no broadcast path,
 no Tor (account reads leave from the host's real IP; the desktop logs
-the mismatch instead of pretending the switch applies). The JSON-string
+the mismatch instead of pretending the switch applies),
+no checkpoint-anchor refresh (ABI 58 refuses by name,
+`capabilities.anchorRefresh:false`). One stale-anchor gap needs naming
+plainly (PR #877 round 3): the weak-subjectivity **re-check while
+running** differs from the Rust loop. After bootstrap, an in-run
+refusal (a long sleep, or Settings moving off "continue anyway")
+stalls the steady loop silently — every slot refuses at the in-run
+gate, so no finality poll runs and no anchor is published, the status
+stays `SYNCING`/`CATCHING_UP` (it reports `STALE_ANCHOR` only when the
+loop itself died) and **no dialog opens**; the only trace is the
+per-slot `re-catch-up:` log, and the ways out are choosing CONTINUE
+again in Settings or a restart, which parks at the bootstrap gate and
+asks. The Rust loop instead re-publishes `STALE_ANCHOR` and re-asks. The JSON-string
 reads (block/tx/receipt/fee-history) answer the `{"error":…,
 "code":-32602}` envelope so the wallet gets a permanent refusal, not a
 retryable one. `myotis_drain_logs` lines are drained by
