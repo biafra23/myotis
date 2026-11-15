@@ -145,10 +145,14 @@ again (steps 7 to 9 need them), but every one of them stays neutral:
    `main`, in the neutral wording above. No `v*` tag goes on a commit whose
    runs are red.
 8. **Release.** The release follows `.claude/agent/releases.md` as usual, in
-   the neutral wording above. The tag is the owner's action.
+   the neutral wording above. The tag is the owner's action. The fix's PR
+   lives in the advisory's fork, so its `CHANGELOG.md` entry has no PR
+   number to cite; it cites the merge commit instead.
 9. **Publish.** Publishing the advisory, and requesting a CVE for it, are the
-   owner's actions, after the fixed release is out. The release notes may
-   then link the advisory; editing them is the owner's call.
+   owner's actions, after the fixed release is out. Then a normal PR adds the
+   advisory's id (`GHSA-…`) to that release's `CHANGELOG.md` entry under
+   Security, for the owner to merge. The release notes may link the advisory
+   too; editing them is the owner's call.
 
 ## Why it is shaped this way
 

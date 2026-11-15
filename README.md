@@ -19,6 +19,7 @@ There are **two interchangeable engines** behind the same zero-dependency API (`
 
 ## Documentation
 
+- [Changelog](CHANGELOG.md) — What changed in each release, newest first.
 - [Architecture](docs/how-it-works/architecture-doc.md) — Describes the target design for how the library will obtain and cryptographically verify all Ethereum data without relying on JSON-RPC providers; not all parts are implemented yet.
 - [How Verification Works](docs/how-it-works/verification.md) — The chain of checks behind every answer, from the embedded checkpoint and the sync committee's signatures down to SNAP-served Merkle-Patricia proofs, with what is not verified.
 - [Benefits](docs/how-it-works/benefits-doc.md) — Explains why a trustless wallet matters and what risks centralized RPC providers pose to users.
@@ -1097,6 +1098,12 @@ The **Rust engine** seeds from the same hardcoded bootnodes / CL pins and the sa
 - **BouncyCastle** -- SECP256K1 crypto provider
 - **jvm-libp2p** -- beacon chain P2P networking (consensus module)
 - **dnsjava 3.6** -- TXT-record resolution for EIP-1459 ENR tree walks (Java engine; the Rust engine uses `hickory-resolver` on desktop and the daemon, and resolves libp2p's `/dns4/` dial addresses through the platform's resolver)
+
+## Reporting a security issue
+
+Please do **not** report a security issue in a public issue, pull request or
+discussion. Report it privately through GitHub's private vulnerability
+reporting, as described in [SECURITY.md](SECURITY.md).
 
 ## License
 
