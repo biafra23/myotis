@@ -221,19 +221,20 @@ func AnchorRefreshUnsupported() string {
 }
 
 // SetStaleAnchorPolicy answers myotis_set_stale_anchor_policy (ABI >= 59):
-// the user's REMEMBERED answer, re-applied by the sync loop at every park.
-// This engine has the one-shot consent (AcceptStaleAnchor) but not the
-// remembered re-application, so per apply-or-refuse: ASK is accepted (a
-// parked-and-waiting engine IS what ASK asks for), and the two fetch-backed
-// answers are refused with false — the contract's own "not applied" — never
-// accepted and silently ignored. False for an unknown handle, as said.
-// Mapping CONTINUE onto the one-shot consent is an engine-parity item.
+// the user's REMEMBERED answer, honored by the sync loop at every park.
+// Engine.SetStaleAnchorPolicy is the one semantics (ASK posture +
+// WITHDRAWAL of a replaced CONTINUE, mirroring host.rs; CONTINUE applied
+// through the same sticky consent the one-shot setter uses); only the
+// fetch-backed CHECKPOINT answer is refused here and at the engine door
+// alike (capabilities anchorRefresh:false — never accepted and ignored).
+// False for an unknown handle, as the contract says; settable before
+// start.
 func SetStaleAnchorPolicy(handle int64, policy int32) bool {
-	_, _, ok := lookup(handle)
+	eng, _, ok := lookup(handle)
 	if !ok {
 		return false
 	}
-	return policy == 0 // ASK only; 1 = fresh checkpoint, 2 = continue-remembered
+	return eng.SetStaleAnchorPolicy(policy)
 }
 
 // permanentErr: the -32602 shape, built by json.Marshal so a message
@@ -651,7 +652,17 @@ func StatusJSON(handle int64) string {
 			st.FinalizedBlockNumber = a.ExecNumber
 			st.ExecutionBlockNumber = a.ExecNumber
 		} else {
-			st.TargetPeriod = wallPeriod
+			// Contract of the STALE_ANCHOR shape (host.rs status_object,
+			// mirrored): while parked, currentPeriod is the period of the
+			// REFUSED anchor — with no proven anchor yet, the embedded
+			// checkpoint's. Leaving 0 here made the dialog's age read as
+			// the whole chain history (~1900 periods) instead of the
+			// anchor's real ~14 (PR #877 review). A loop that merely
+			// hasn't bootstrapped yet keeps reporting 0.
+			if st.BeaconState == "STALE_ANCHOR" {
+				st.CurrentPeriod = chain.SyncCommitteePeriod(c.CheckpointSlot)
+			}
+			st.TargetPeriod = max(st.CurrentPeriod, wallPeriod)
 		}
 	}
 	b, err := json.Marshal(st)
@@ -672,12 +683,14 @@ func capabilities() map[string]bool {
 		// Engine.AcceptStale (gates read them per check, and a parked
 		// loop restarts): these are true in the full sense.
 		"wsBoundOverride": true, "staleAnchorConsent": true,
-		// The ABI-58/59 stale-anchor additions: the checkpoint fetch
-		// (refresh_anchor_from_checkpointz) and the REMEMBERED policy
-		// the sync loop re-applies at every park are not implemented —
-		// both refused by name (applied:false / false), never faked.
-		// The one-shot consent above stays the way forward.
-		"anchorRefresh": false, "staleAnchorPolicy": false,
+		// The ABI-58 checkpoint fetch is not implemented (refusal in the
+		// contract's own applied:false shape — the one-shot consent above
+		// stays the way forward). The ABI-59 policy IS honoured for the
+		// answers this engine can apply (ASK posture, CONTINUE through the
+		// sticky consent, withdrawal of a replaced CONTINUE — Engine.
+		// SetStaleAnchorPolicy); only the policy's CHECKPOINT code is
+		// refused, and that gap is this false.
+		"anchorRefresh": false, "staleAnchorPolicy": true,
 		// Recorded + contract-answered, but inert while this engine
 		// never serves blocks to peers (it is the dial-only side of
 		// the split that blocks:false already declares):

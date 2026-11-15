@@ -600,6 +600,62 @@ func TestCapabilitiesJSON(t *testing.T) {
 	if caps["wsBoundOverride"] != true || caps["staleAnchorConsent"] != true {
 		t.Errorf("the live setters are applied now; capabilities must say so: %v", caps)
 	}
+	// The ABI-58/59 stale-anchor additions: the checkpoint fetch is not
+	// implemented, the remembered policy is honoured for the answers this
+	// engine can act on. Both must be disclosed (PR #877 review).
+	if caps["anchorRefresh"] != false || caps["staleAnchorPolicy"] != true {
+		t.Errorf("capabilities must disclose the refresh refusal and the policy support: %v", caps)
+	}
+}
+
+func TestStaleAnchorRefreshRefusalShape(t *testing.T) {
+	// ABI-58 refusal in the contract's OWN key set (not the generic
+	// permanentErr envelope): exactly applied/error/unconfirmed, applied
+	// false, and the reason names the function so a host can tell "no
+	// fetch" from a transient. Rust pins the same shape side.
+	m := decode(t, AnchorRefreshUnsupported())
+	if len(m) != 3 || m["applied"] != false || m["unconfirmed"] != false {
+		t.Fatalf("refresh refusal must be {applied:false,error,unconfirmed:false}: %v", m)
+	}
+	if s, _ := m["error"].(string); !strings.Contains(s, "myotis_refresh_anchor_from_checkpointz") {
+		t.Errorf("refusal must name the function: %v", m["error"])
+	}
+}
+
+func TestStaleAnchorPolicyApplyOrRefuse(t *testing.T) {
+	// ABI-59 apply-or-refuse, pinned against the engine (mirrors host.rs):
+	// ASK and CONTINUE are APPLIED (CONTINUE through the same sticky
+	// consent the one-shot setter uses), CHECKPOINT is REFUSED (no fetch),
+	// and unknown codes / a dead handle are refused — never accepted and
+	// silently ignored.
+	if SetStaleAnchorPolicy(9999, 0) {
+		t.Error("unknown handle must answer false")
+	}
+	h := newStartedHandle(t)
+	if !SetStaleAnchorPolicy(h, 0) {
+		t.Error("ASK (0) must be applied")
+	}
+	if SetStaleAnchorPolicy(h, 1) {
+		t.Error("CHECKPOINT (1) must be refused — no checkpoint fetch (anchorRefresh:false)")
+	}
+	if !SetStaleAnchorPolicy(h, 2) {
+		t.Error("CONTINUE (2) must be applied (sticky consent)")
+	}
+	for _, p := range []int32{3, -1, 100} {
+		if SetStaleAnchorPolicy(h, p) {
+			t.Errorf("unknown policy code %d must be refused, not accepted and ignored", p)
+		}
+	}
+	// Settable before start too, as the header says — a created, unstarted
+	// handle applies ASK rather than refusing on "not running".
+	u := Create("mainnet", t.TempDir())
+	if u < 1 {
+		t.Fatalf("Create = %d", u)
+	}
+	defer Stop(u)
+	if !SetStaleAnchorPolicy(u, 0) {
+		t.Error("ASK must apply on a created, not-yet-started handle")
+	}
 }
 
 func TestCatalogMatchesGolden(t *testing.T) {

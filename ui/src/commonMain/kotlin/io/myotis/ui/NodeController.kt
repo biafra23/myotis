@@ -684,9 +684,11 @@ data class NodeSnapshot(
     val lifecycle: String,          // RUNNING / PAUSED / STOPPED — PAUSED = idle sleep
                                     // (networking off, RPC listening, wakes on request)
     val network: String,
-    val engine: String? = null,     // "java" | "rust" — which engine hosts this network
-                                    // (null = host didn't say); Status shows it as a
-                                    // one-letter suffix on the network chip
+    val engine: String? = null,     // "java" | "rust" | "go" — which engine hosts this
+                                    // network (null = host didn't say); Status shows it as
+                                    // a one-letter suffix on the network chip, and the
+                                    // stale-anchor dialog reads it to decide whether the
+                                    // checkpoint fetch exists (java and go: "continue" only)
     val beaconState: String,        // STOPPED / SYNCING / CATCHING_UP / SYNCED
     val connectedPeers: Int,
     val readyPeers: Int,

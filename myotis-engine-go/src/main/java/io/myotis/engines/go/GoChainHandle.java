@@ -64,17 +64,20 @@ import java.util.List;
  *       methods explicitly: {@code null} ("cannot answer verified") on the
  *       plain reads, {@code refused(...)} on the detailed call/estimate/send
  *       channel (see its class doc for the retryable-status reasoning).</li>
- *   <li><b>No checkpoint-anchor refresh yet (ABI 58/59).</b>
- *       {@link #refreshAnchorFromCheckpointz} keeps the {@link ChainHandle}
- *       default — refused by name, "not supported by this engine" — and the C
- *       export answers the contract's own {@code applied:false} shape, so the
- *       refusal is identical in-process and over the ABI.
- *       {@link #setStaleAnchorPolicy} also keeps the default, which is the
- *       honest maximum here: it maps CONTINUE onto {@link #acceptStaleAnchor}
- *       (one-shot consent, genuinely applied) and accepts ASK, which is what a
- *       parked Go engine already does; the REMEMBERED policy the sync loop
- *       re-applies at every later park is an engine-parity item (the C export
- *       accepts only ASK for exactly that reason).</li>
+ *   <li><b>ABI 58/59, applied where the engine can and refused where it
+ *       can't.</b> {@link #setStaleAnchorPolicy} routes to the engine (not the
+ *       {@code :myotis-api} default) so the return is the engine's own answer,
+ *       identical to what a C-ABI host sees: ASK and CONTINUE are APPLIED —
+ *       CONTINUE through the same sticky consent {@link #acceptStaleAnchor}
+ *       uses, re-read at every weak-subjectivity gate and withdrawn when a
+ *       later policy replaces it (exactly host.rs's rule) — while the
+ *       CHECKPOINT code is REFUSED (false): the Go engine has no checkpoint
+ *       fetch, so it does not accept a policy it cannot act on
+ *       ({@code capabilities.anchorRefresh:false}). {@link
+ *       #refreshAnchorFromCheckpointz} parses the C export's contract-shaped
+ *       answer, which today is always the {@code applied:false} refusal — the
+ *       one-shot {@link #acceptStaleAnchor} is the way forward until the fetch
+ *       lands (engine-parity; the parse already handles the applied shape).</li>
  * </ul>
  *
  * <p>{@link #reads()} and the loopback listener follow the Rust twin exactly:
@@ -642,6 +645,71 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
         if (!linked(() -> GoEngineNative.nativeAcceptStaleAnchor(handle))) {
             log.warn("[engines] acceptStaleAnchor dropped: unknown handle {}", handle);
         }
+    }
+
+    @Override
+    public io.myotis.api.AnchorRefresh refreshAnchorFromCheckpointz(boolean allowUnconfirmed) {
+        // Parsed from the C export's own answer (as RustChainHandle does), so the
+        // reason the host shows is the engine's word, not the :myotis-api
+        // default's generic one. Today the Go export always refuses — no
+        // checkpoint fetch (capabilities anchorRefresh:false) — but the shape is
+        // the contract's, and a later fetch implementation flows through here
+        // with no JVM change.
+        String json = linked(() -> GoEngineNative.nativeRefreshAnchorFromCheckpointz(handle, allowUnconfirmed));
+        boolean applied = false;
+        String root = null;
+        long slot = 0;
+        long epoch = 0;
+        boolean unconfirmed = false;
+        String error = "no answer from the engine";
+        List<String> operators = List.of();
+        List<String> confirmedBy = List.of();
+        try {
+            JsonObject o = Json.parse(json).asObject();
+            applied = o.getBoolean("applied", false);
+            unconfirmed = o.getBoolean("unconfirmed", false);
+            if (applied) {
+                root = o.getString("root", null);
+                slot = o.getLong("slot", 0);
+                epoch = o.getLong("epoch", 0);
+                operators = strings(o.get("operators"));
+                confirmedBy = strings(o.get("confirmedBy"));
+                error = null;
+            } else {
+                error = o.getString("error", error);
+            }
+        } catch (RuntimeException malformed) {
+            // A non-JSON answer stays a refusal with the raw text as the reason.
+            error = "malformed refresh answer: " + json;
+        }
+        return new io.myotis.api.AnchorRefresh(applied, root, slot, epoch, operators, confirmedBy,
+                unconfirmed, error);
+    }
+
+    private static List<String> strings(JsonValue v) {
+        List<String> out = new java.util.ArrayList<>();
+        if (v != null && v.isArray()) {
+            for (JsonValue e : v.asArray()) out.add(e.asString());
+        }
+        return out;
+    }
+
+    @Override
+    public boolean setStaleAnchorPolicy(io.myotis.api.StaleAnchorPolicy policy) {
+        // The engine's answer, verbatim — not the :myotis-api default's mapping.
+        // That default would report CONTINUE applied unconditionally and ASK
+        // applied even after a CONTINUE; here the engine says so: CONTINUE is
+        // APPLIED (the sticky consent re-read at every weak-subjectivity gate,
+        // a replaced CONTINUE withdrawn exactly like host.rs), ASK is applied or
+        // reports the dead handle, and CHECKPOINT answers false for its lack of
+        // a fetch (capabilities anchorRefresh:false). Same truth C-ABI hosts
+        // get (PR #877 review).
+        boolean ok = linked(() -> GoEngineNative.nativeSetStaleAnchorPolicy(handle, policy.ordinal()));
+        if (!ok) {
+            log.warn("[engines] setStaleAnchorPolicy({}) not applied: unknown handle, or "
+                    + "an answer the Go engine does not implement (CHECKPOINT has no fetch)", policy);
+        }
+        return ok;
     }
 
     @Override

@@ -207,6 +207,14 @@ final class GoEngineNative {
         return take(LIB.myotis_status_json(handle));
     }
 
+    /** ABI-58 checkpoint-anchor refresh. The Go library answers the contract's
+     *  {@code applied:false} refusal for every handle (no checkpoint fetch yet,
+     *  capabilities anchorRefresh:false); the wrapper relays the engine's own
+     *  reason instead of the {@code :myotis-api} default's generic line. */
+    static String nativeRefreshAnchorFromCheckpointz(long handle, boolean allowUnconfirmed) {
+        return take(LIB.myotis_refresh_anchor_from_checkpointz(handle, (byte) (allowUnconfirmed ? 1 : 0)));
+    }
+
     /** Up to {@code max} buffered tracing lines, oldest first, newline-joined. */
     static String nativeDrainLogs(int max) {
         return take(LIB.myotis_drain_logs(max));
@@ -240,6 +248,16 @@ final class GoEngineNative {
         return LIB.myotis_accept_stale_anchor(handle) != 0;
     }
 
+    /** ABI-59 remembered stale-anchor answer (code = {@code
+     *  StaleAnchorPolicy.ordinal()}: ASK 0, CHECKPOINT 1, CONTINUE 2 — the
+     *  ABI codes are pinned with RustChainHandle's identical mapping by
+     *  main's RustAnchorRefreshJsonTest). The Go engine applies ASK and
+     *  CONTINUE and REFUSES CHECKPOINT (no checkpoint fetch) — false here
+     *  means one of those, never a swallowed accept. */
+    static boolean nativeSetStaleAnchorPolicy(long handle, int policy) {
+        return LIB.myotis_set_stale_anchor_policy(handle, policy) != 0;
+    }
+
     static boolean nativeSetDnsDiscovery(boolean on) {
         return LIB.myotis_set_dns_discovery((byte) (on ? 1 : 0)) != 0;
     }
@@ -265,6 +283,7 @@ final class GoEngineNative {
         Pointer myotis_drain_logs(int max);
         Pointer myotis_available_networks_json();
         Pointer myotis_canonical_network_name(String nameOrAlias);
+        Pointer myotis_refresh_anchor_from_checkpointz(long handle, byte allowUnconfirmed);
         long myotis_create(String network, String dataDir);
         byte myotis_start(long handle);
         void myotis_stop(long handle);
@@ -275,6 +294,7 @@ final class GoEngineNative {
         byte myotis_set_served_block_window(long handle, int blocks);
         byte myotis_set_ws_bound_periods(long handle, long periods);
         byte myotis_accept_stale_anchor(long handle);
+        byte myotis_set_stale_anchor_policy(long handle, int policy);
         byte myotis_set_dns_discovery(byte on);
         byte myotis_set_network_metering(int code);
         int myotis_network_metering();

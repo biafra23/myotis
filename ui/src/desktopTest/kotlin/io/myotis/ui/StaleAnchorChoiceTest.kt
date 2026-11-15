@@ -130,6 +130,16 @@ class StaleAnchorChoiceTest {
         rule.onNodeWithText("Continue anyway (accept risk)").assertIsDisplayed()
     }
 
+    @Test
+    fun theGoEngineOffersOnlyContinue() {
+        // The Go engine refuses the checkpoint fetch by name (the :myotis-api
+        // default; its capabilities answer anchorRefresh:false), so the dialog
+        // must not offer it — the same rule as the Java engine, PR #877 review.
+        rule.setContent { NodeScreen(controller = Parked(parked.copy(engine = "go")), settings = FakeSettings(), logs = NoLogs) }
+        rule.onNodeWithText("Fetch fresh checkpoint").assertDoesNotExist()
+        rule.onNodeWithText("Continue anyway (accept risk)").assertIsDisplayed()
+    }
+
     private object NoLogs : LogSource {
         override fun version(): Long = 0
         override fun snapshot(): List<LogLine> = emptyList()
