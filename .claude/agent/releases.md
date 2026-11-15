@@ -9,8 +9,9 @@ When the user asks for a release (a `v*` tag, a version bump, "cut a release"),
 **ask these three questions first and act only on what they choose** (owner
 rulings, 2026-09-02 and 2026-09-11), then **move the version pins — step 4
 below, mandatory, never asked about** (owner ruling, 2026-09-24) — and
-**refresh the PoC seeds, step 5, mandatory too** (2026-10-13). Everything a
-release needs goes into ONE release PR. **The tag is the owner's action**: after
+**refresh the PoC seeds, step 5, mandatory too** (2026-10-13) — and **add the
+release to `CHANGELOG.md`, step 6, mandatory as well** (owner's request,
+2026-11-15). Everything a release needs goes into ONE release PR. **The tag is the owner's action**: after
 the merge the owner pushes it, or explicitly asks for it to be pushed — never
 push a `v*` tag on your own initiative, it is the publish trigger for every
 asset workflow and a stronger action than the merge this file already forbids.
@@ -205,7 +206,35 @@ asset workflow and a stronger action than the merge this file already forbids.
    publish, which makes no commit. Details: docs/guides/railgun-poc.md (*Refreshing the seed*),
    docs/guides/bee-rpc-service.md (*seeding from a full node*).
 
-6. **After the tag: a release is done when its two evidence runs are green.
+6. **Add the release to `CHANGELOG.md`. MANDATORY — not a question, and part
+   of the SAME release PR** (owner's request, 2026-11-15, mirroring Punicus
+   #281). `CHANGELOG.md` follows Keep a Changelog. The release PR turns
+   `## [Unreleased]` into `## [X.Y.Z] - <date>` (the exact version of the tag
+   the owner will push, its suffix included for a release candidate such as
+   `0.1.21-rc1`; when the tag's shape is still open, ask the owner which tag it
+   will be), starts a new empty `## [Unreleased]` above it, and updates the
+   compare links at the bottom (`[X.Y.Z]` compares the previous tag with
+   `vX.Y.Z`; `[Unreleased]` compares `vX.Y.Z` with `HEAD`). The date is the day the tag is expected;
+   if it lands on another day, the next release PR corrects it, so a date
+   always means the day the tag's release was published. **Every `v*` tag gets
+   a PR that does at least this step**, a further candidate or a final release
+   after a candidate included, even when step 4 has nothing to move (as for
+   `v0.1.19-rc2`, whose version core was already 0.1.19). Check the entry
+   against the merged PRs since the last tag (`git log --first-parent <last tag>..main`): every change a
+   user, an embedder or a packager would notice, under Added, Changed,
+   Fixed, Removed or Security, with its PR and issue numbers. A fix to a
+   vulnerability, such as #611, goes under Security and says who was
+   affected. When the engine ABI moved (`ABI_VERSION` in
+   `rust/myotis-engine/src/lib.rs`), the entry names the one the release
+   ships, because every embedder gates on it. A final release after one or
+   more candidates lists only what came after its last candidate. Pure CI,
+   docs and dependency-pin churn stays out unless someone outside the
+   repository would notice it. The GitHub release notes may link to the entry;
+   they stay the place for the trust anchors and the release checks. A PR that
+   is not a release may add its own line under `[Unreleased]`; the release PR
+   still checks the whole entry.
+
+7. **After the tag: a release is done when its two evidence runs are green.
    MANDATORY to check and report, not a question** (#734). A tag push starts
    them by itself, next to the ten publishing workflows:
    - **`verify release`** waits for the publishers, then checks the finished

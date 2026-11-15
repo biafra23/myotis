@@ -19,6 +19,7 @@ There are **two interchangeable engines** behind the same zero-dependency API (`
 
 ## Documentation
 
+- [Changelog](CHANGELOG.md) — What changed in each release, newest first.
 - [Architecture](docs/how-it-works/architecture-doc.md) — Describes the target design for how the library will obtain and cryptographically verify all Ethereum data without relying on JSON-RPC providers; not all parts are implemented yet.
 - [How Verification Works](docs/how-it-works/verification.md) — The chain of checks behind every answer, from the embedded checkpoint and the sync committee's signatures down to SNAP-served Merkle-Patricia proofs, with what is not verified.
 - [Benefits](docs/how-it-works/benefits-doc.md) — Explains why a trustless wallet matters and what risks centralized RPC providers pose to users.

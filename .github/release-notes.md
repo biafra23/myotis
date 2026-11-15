@@ -1,5 +1,7 @@
 Pre-release build of the Myotis wallet apps.
 
+What changed in this release, and in every earlier one: [CHANGELOG.md](https://github.com/biafra23/myotis/blob/main/CHANGELOG.md).
+
 **Checking a download** — `SHA256SUMS` lists the SHA-256 of every file on this page:
 `sha256sum -c SHA256SUMS --ignore-missing` next to what you downloaded. Each file also
 carries a build-provenance attestation that names the workflow run and the commit it
