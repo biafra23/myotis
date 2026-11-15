@@ -239,12 +239,31 @@ public final class SelectorEngine implements MyotisEngine {
      *  under the device's current metering from its first byte. The Rust engine
      *  first: {@link #networkMetering()} reads the Java one, so a Rust failure
      *  leaves it reporting the OLD value and a host that pushes only on a change
-     *  retries. */
+     *  retries.
+     *
+     *  <p>The Rust write and the Java write run under {@code this} monitor (the
+     *  same one {@link #rustEngine} initializes under and {@link #create}
+     *  holds) so a push is one ATOMIC step for both engines. Without it, two
+     *  overlapping pushes could interleave their Rust and Java writes and leave
+     *  the two engines on DIFFERENT values — e.g. Rust on push A's reading,
+     *  Java (and so {@link #networkMetering()}) on push B's — with neither
+     *  corrected, because {@link #networkMetering()} reports Java and a
+     *  push-on-change host sees Java already matching the device and never
+     *  re-pushes to fix Rust. On Android this is not theoretical:
+     *  {@code NodeService.pushNetworkMetering} fires from three connectivity
+     *  callbacks on the shared {@code QUERY_POOL}, so concurrent pushes are the
+     *  normal case, and Rust is the engine Android runs by default. The lock
+     *  makes the two engines agree; it does not order two racing pushes by how
+     *  fresh their reading is (the host reads the device state before arriving),
+     *  but the disagree state it prevents was the one nothing healed, whereas a
+     *  stale-but-agreeing pair self-heals at the next callback. */
     @Override
     public void setNetworkMetering(NetworkMetering metering) {
         if (metering == null) throw new EngineException("metering is required");
-        if (RustMyotisEngine.isAvailable()) rustEngine().setNetworkMetering(metering);
-        java.setNetworkMetering(metering);
+        synchronized (this) { // the monitor rustEngine() initializes under and create() holds
+            if (RustMyotisEngine.isAvailable()) rustEngine().setNetworkMetering(metering);
+            java.setNetworkMetering(metering);
+        }
     }
 
     @Override
