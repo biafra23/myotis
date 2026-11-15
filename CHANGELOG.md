@@ -204,11 +204,12 @@ PoC seeds (#706).
 
 ### Security
 
-- A single malicious peer could forge verified account reads. The
+- A single malicious peer could forge verified account and storage reads. The
   `headerChain` check walked the header chain upward from the finalized block,
   which pins nothing above it; both engines now walk down from an attested
   block (#611). Affected: the Java engine in every earlier release; the Rust
-  engine since 0.1.7 when a peer claimed it could not serve the attested root;
+  engine in every earlier release that carried it, on every read up to 0.1.6
+  and, since 0.1.7, when a peer claimed it could not serve the attested root;
   Rust Tor account reads since 0.1.3.
 - The Java engine's `get-storage` / `get-account` report only what the proof
   proves (#626).
