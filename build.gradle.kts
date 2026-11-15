@@ -1255,11 +1255,15 @@ tasks.register<Exec>("goBuildCShared") {
                         markedStale -> " Could NOT delete go/build/$goEngineLibName (a running" +
                             " -Pengine=go host may still have it mapped): it stays and its" +
                             " stamp is marked STALE, so the next build re-attempts the" +
-                            " delete and the build rather than trusting these bytes."
+                            " delete and the build rather than trusting these bytes from" +
+                            " then on (a host started by THIS invocation still maps them —" +
+                            " the run tasks gate on existence)."
                         ours -> " Could NOT delete go/build/$goEngineLibName and could not" +
-                            " mark its stamp stale (neither delete nor stamp write went" +
-                            " through — is go/build writable?) — the stale library serves until" +
-                            " a source change or a working delete."
+                            " mark its stamp stale (neither the delete nor the stamp write" +
+                            " went through — go/build is probably not yours, e.g. left by a" +
+                            " sudo or container build): this failed run WILL record" +
+                            " up-to-date, and the retry waits for a source change or for" +
+                            " chown to fix the ownership."
                         lib.exists() -> " go/build/$goEngineLibName was not built by this task and" +
                             " stays in place — the Go engine keeps running on it, and keeping it" +
                             " fresh against these sources is the manual build's own duty."

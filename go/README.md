@@ -264,11 +264,17 @@ line rather than downloading one mid-build; CI installs it via
 `/usr/local/go/bin` for PATH-blind IDE daemons) or an old toolchain — also
 deletes a previously built library, since consumers gate on existence alone —
 but only one this task wrote (the stamp above), never a hand-built one
-(PR #832 rounds 4-5). And a FAILED build is never recorded up-to-date while
+(PR #832 rounds 4-5). And a FAILED build is not recorded up-to-date while
 its own library is stale: absent, there without a matching stamp, or there
 carrying the stamp's `:stale` mark (a delete the OS refused — e.g. a running
 host mapping the DLL; PR #861 round 2) — the task retries on every later
 build, so installing a C compiler or coming back online is all it takes.
+The one residue (PR #861 round 3, measured): a `go/build` this task can
+neither delete nor write — the classic Linux/macOS case is files owned by
+another user after a `sudo` or container build — has an unwritable stamp
+too, so that failed run does record up-to-date and the retry waits for a
+source change (the warning names it); fix the ownership and the normal
+rules apply again.
 
 ## Test
 

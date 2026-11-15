@@ -186,49 +186,8 @@ func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, m
 	<-sumDone
 	if err != nil {
 		e.Report()
-		// The old loop's exit taxonomy, arm by arm, in its order:
-		var lce *engine.LCError
-		var re *engine.ReadError
-		switch {
-		case errors.As(err, &lce):
-			// lcFailure: the light client died (bootstrap/catch-up
-			// refused). Checked FIRST because the LC's own budgets
-			// wrap their own DeadlineExceeded — classifying by the
-			// sentinel first would report "read window expired" for an
-			// LC that died minutes before the window (PR #819 review).
-			return err
-		case ctx.Err() == context.Canceled:
-			// Ctrl-C closes the race honestly: the read was aborted by
-			// shutdown, not by a failure — the clean exit, as before.
-			// Checked BEFORE the DeadlineExceeded arm (PR #861 internal
-			// review): ReadError.Unwrap exposes LastAttempt, and a plain
-			// socket timeout (os.ErrDeadlineExceeded) errors.Is-matches
-			// context.DeadlineExceeded — so a Ctrl-C'd read whose LAST
-			// attempt had timed out used to be misclassified as "read
-			// window expired" (exit 1). Cancellation is decisive: the
-			// user interrupted, whatever the last attempt's error was.
-			// The parent's OWN -run-for expiry still lands in the arm
-			// below (WithTimeout yields DeadlineExceeded, not Canceled),
-			// keeping that exit-1 path intact.
-			return nil
-		case errors.Is(err, context.DeadlineExceeded):
-			// The read window expired — either the -run-for one (which
-			// times out the parent too) or the default 10-minute one
-			// (readCtx only; the parent outlives it). Both are
-			// exit-1 with the cause named, as the old loop's deadline
-			// arm. (The review caught that gating this on
-			// ctx.Err() == nil turned -run-for expiries into exit 0.)
-			if errors.As(err, &re) && re.LastAttempt != nil {
-				return fmt.Errorf("read window expired before %s could be served: last failure: %w", wantAddr.Hex(), re.LastAttempt)
-			}
-			return fmt.Errorf("read window expired before an anchor + snap peer could serve %s", wantAddr.Hex())
-		case ctx.Err() != nil:
-			// A shutdown that is not Cancel (nothing produces it today;
-			// kept as the honest catch-all for future cancel causes).
-			return nil
-		default:
-			return err
-		}
+		// The old loop's exit taxonomy, arm by arm, in its order.
+		return classifyReadFailure(ctx, err, wantAddr)
 	}
 
 	if jsonOut {
@@ -249,6 +208,56 @@ func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, m
 	}
 	printRead(log, rd)
 	return nil
+}
+
+// classifyReadFailure maps an engine.Account failure onto the old
+// loop's exit taxonomy. The end-of-wait cause is read from
+// ReadError.Reason — what the engine recorded from the read context's
+// Err() at the moment its wait ended (engine.go) — never from
+// errors.Is(err, sentinel): ReadError.Unwrap exposes LastAttempt too,
+// and classification must not depend on what a wrapped per-anchor
+// error happens to Is-match (PR #861 round-3 review: on Go ≥1.16 a
+// socket-read deadline error matches os.ErrDeadlineExceeded and NOT
+// context.DeadlineExceeded — only dial timeouts match the sentinel —
+// so the errors.Is route works only by accident of which errors
+// arrive, and an earlier comment here claimed a mechanism through
+// LastAttempt that does not hold).
+func classifyReadFailure(ctx context.Context, err error, addr common.Address) error {
+	var lce *engine.LCError
+	var re *engine.ReadError
+	switch {
+	case errors.As(err, &lce):
+		// lcFailure: the light client died (bootstrap/catch-up
+		// refused). Checked FIRST because the LC's own budgets
+		// wrap their own DeadlineExceeded — classifying by the
+		// sentinel first would report "read window expired" for an
+		// LC that died minutes before the window (PR #819 review).
+		return err
+	case errors.As(err, &re) && re.Reason == context.Canceled:
+		// Ctrl-C closes the race honestly: the read's own wait was
+		// cancelled — an interruption, not a failure — the clean
+		// exit, whatever the last attempt's error was. The parent's
+		// -run-for expiry lands in the arm below instead (a
+		// WithTimeout yields DeadlineExceeded, not Canceled),
+		// keeping that exit-1 path intact.
+		return nil
+	case errors.As(err, &re) && re.Reason == context.DeadlineExceeded:
+		// The read window expired — either the -run-for one (which
+		// times out the parent too) or the default 10-minute one
+		// (readCtx only; the parent outlives it). Both are exit-1
+		// with the cause named, as the old loop's deadline arm.
+		if re.LastAttempt != nil {
+			return fmt.Errorf("read window expired before %s could be served: last failure: %w", addr.Hex(), re.LastAttempt)
+		}
+		return fmt.Errorf("read window expired before an anchor + snap peer could serve %s", addr.Hex())
+	case ctx.Err() != nil:
+		// A shutdown that ended the wait before the engine could
+		// record a Reason (nothing produces it today; the honest
+		// catch-all for future paths that return early errors).
+		return nil
+	default:
+		return err
+	}
 }
 
 // printRead prints the verified read's human lines. Both lines print

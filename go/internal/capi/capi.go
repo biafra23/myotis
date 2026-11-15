@@ -436,16 +436,23 @@ func Start(handle int64) bool {
 	if err := e.eng.StartNetwork(); err != nil {
 		mu.Lock()
 		e.started = false
-		// Drop the ctx this attempt made (PR #861 internal review): the
-		// header contract makes a failed Start retryable via another
-		// Start, which would overwrite e.ctx/e.cancel and orphan this
-		// Background-derived context (and its timer registration) until
-		// process exit. Clearing also keeps Stop's `cancel != nil` from
-		// firing on a handle this code treats as unstarted. Reads cannot
-		// observe the gap: they gate on started.
+		// Cancel the ctx this attempt made (PR #861 internal review,
+		// corrected by round-3): the header contract makes a failed Start
+		// retryable via another Start, and cancelling stops reads that
+		// slipped past beginRead during the half-started window from
+		// burning a full ReadBudget against a dead network. What matters
+		// is the CANCEL, not the clearing: a Background-derived context
+		// registers nothing and holds no timer, so an overwritten one was
+		// always plain garbage (round-3 review) — and storing nil here
+		// would be actively wrong, because RequestAccountJSON/
+		// GetStorageProofJSON read e.ctx UNLOCKED after beginRead, and
+		// context.WithTimeout(nil) panics, and nothing under go/ recovers:
+		// an interleaving of this branch with a read would end the host
+		// process. The field's invariant stays "never nil once set"; the
+		// retried Start overwrites both fields, and Stop's `cancel != nil`
+		// keeps working (cancel is idempotent).
 		if e.cancel != nil {
 			e.cancel()
-			e.ctx, e.cancel = nil, nil
 		}
 		mu.Unlock()
 		return false
