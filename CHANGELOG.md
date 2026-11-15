@@ -42,7 +42,8 @@ its trust anchors and release checks.
   `release rehearsal` workflows (#734, #771); the Go engine joins the Linux
   gate (#813).
 - `eez_probe`, a compatibility probe for a foreign-chain snap peer (#768).
-- Docs: Scaffold-ETH 2 dApps on Myotis (#735); the Myotis Rust Tour (#738).
+- Docs: Scaffold-ETH 2 dApps on Myotis (#735); the Myotis Rust Tour (#738);
+  `SECURITY.md`, how to report a vulnerability privately (#870).
 - This changelog.
 
 ### Changed
