@@ -197,6 +197,20 @@ func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, m
 			// sentinel first would report "read window expired" for an
 			// LC that died minutes before the window (PR #819 review).
 			return err
+		case ctx.Err() == context.Canceled:
+			// Ctrl-C closes the race honestly: the read was aborted by
+			// shutdown, not by a failure — the clean exit, as before.
+			// Checked BEFORE the DeadlineExceeded arm (PR #861 internal
+			// review): ReadError.Unwrap exposes LastAttempt, and a plain
+			// socket timeout (os.ErrDeadlineExceeded) errors.Is-matches
+			// context.DeadlineExceeded — so a Ctrl-C'd read whose LAST
+			// attempt had timed out used to be misclassified as "read
+			// window expired" (exit 1). Cancellation is decisive: the
+			// user interrupted, whatever the last attempt's error was.
+			// The parent's OWN -run-for expiry still lands in the arm
+			// below (WithTimeout yields DeadlineExceeded, not Canceled),
+			// keeping that exit-1 path intact.
+			return nil
 		case errors.Is(err, context.DeadlineExceeded):
 			// The read window expired — either the -run-for one (which
 			// times out the parent too) or the default 10-minute one
@@ -209,8 +223,8 @@ func run(dataDir string, listenPort int, runFor time.Duration, dialPeers bool, m
 			}
 			return fmt.Errorf("read window expired before an anchor + snap peer could serve %s", wantAddr.Hex())
 		case ctx.Err() != nil:
-			// Ctrl-C closes the race honestly: the read was aborted by
-			// shutdown, not by a failure — the clean exit, as before.
+			// A shutdown that is not Cancel (nothing produces it today;
+			// kept as the honest catch-all for future cancel causes).
 			return nil
 		default:
 			return err

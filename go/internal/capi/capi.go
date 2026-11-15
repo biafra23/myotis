@@ -64,8 +64,7 @@ var (
 	table = map[int64]*entry{}
 	next  int64
 
-	initOnce sync.Once
-	ring     = newRingHandler()
+	ring = newRingHandler()
 
 	// Process-global toggles, as the header marks them. dnsDiscovery is
 	// FIXED in the Go engine (the DNS sweep is core discovery there),
@@ -160,10 +159,12 @@ func classifyReadErr(what string, err error) string {
 	return retryableErr("go engine: " + what + ": " + err.Error())
 }
 
-// Init installs the log ring and returns the ABI version — the
-// handshake myotis_engine.h prescribes before any other call.
+// Init answers the ABI-version handshake myotis_engine.h prescribes
+// before any other call. It installs nothing: the drain ring rides with
+// package load (the `ring` var above), so there is no per-Init step —
+// an empty sync.Once here once suggested one that did not exist
+// (PR #861 internal review).
 func Init() int32 {
-	initOnce.Do(func() {})
 	return MyotisABIVersion
 }
 
@@ -435,6 +436,17 @@ func Start(handle int64) bool {
 	if err := e.eng.StartNetwork(); err != nil {
 		mu.Lock()
 		e.started = false
+		// Drop the ctx this attempt made (PR #861 internal review): the
+		// header contract makes a failed Start retryable via another
+		// Start, which would overwrite e.ctx/e.cancel and orphan this
+		// Background-derived context (and its timer registration) until
+		// process exit. Clearing also keeps Stop's `cancel != nil` from
+		// firing on a handle this code treats as unstarted. Reads cannot
+		// observe the gap: they gate on started.
+		if e.cancel != nil {
+			e.cancel()
+			e.ctx, e.cancel = nil, nil
+		}
 		mu.Unlock()
 		return false
 	}

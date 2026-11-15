@@ -210,14 +210,14 @@ class GoStatusJsonTest {
                 + "\"slotsReturned\":1,\"storageRootHex\":\"0x56e8\",\"proofNodesHex\":[],"
                 + "\"storageProofValid\":true,\"beaconSynced\":true,\"beaconChainVerified\":true,"
                 + "\"blsVerified\":true,\"matchedBeaconSlot\":15634912,"
-                + "\"verifyMethod\":\"storageRootMatch\",\"failReason\":null,"
+                + "\"verifyMethod\":\"stateRootMatch\",\"failReason\":null,"
                 + "\"peerBlockNumber\":26404150,\"finalizedBlockNumber\":26404150,"
                 + "\"optimisticBlockNumber\":0,\"finalizedSlot\":15634912,\"optimisticSlot\":0,"
                 + "\"maxHeaderChainGap\":8192,\"anchor\":\"finalized\"}");
         assertEquals(1L, r.slot());
         assertEquals("0xb931be0b", r.storageKeyHashHex());
         assertEquals("42", r.valueDecimal());
-        assertEquals("storageRootMatch", r.verifyMethod());
+        assertEquals("stateRootMatch", r.verifyMethod());
         assertEquals(8192, r.maxHeaderChainGap());
     }
 
@@ -305,7 +305,7 @@ class GoStatusJsonTest {
                 + "\"slotsReturned\":1,\"storageRootHex\":\"0x56\",\"proofNodesHex\":[],"
                 + "\"storageProofValid\":true,\"beaconSynced\":true,\"beaconChainVerified\":true,"
                 + "\"blsVerified\":true,\"matchedBeaconSlot\":15634912,"
-                + "\"verifyMethod\":\"storageRootMatch\",\"failReason\":null,"
+                + "\"verifyMethod\":\"stateRootMatch\",\"failReason\":null,"
                 + "\"peerBlockNumber\":26404150,\"finalizedBlockNumber\":26404150,"
                 + "\"optimisticBlockNumber\":0,\"finalizedSlot\":15634912,\"optimisticSlot\":0,"
                 + "\"maxHeaderChainGap\":8192}");
@@ -322,7 +322,7 @@ class GoStatusJsonTest {
                 + "\"slotsReturned\":1,\"storageRootHex\":\"0x56\",\"proofNodesHex\":[],"
                 + "\"storageProofValid\":true,\"beaconSynced\":true,\"beaconChainVerified\":true,"
                 + "\"blsVerified\":true,\"matchedBeaconSlot\":15634912,"
-                + "\"verifyMethod\":\"storageRootMatch\",\"failReason\":null,"
+                + "\"verifyMethod\":\"stateRootMatch\",\"failReason\":null,"
                 + "\"peerBlockNumber\":26404150,\"finalizedBlockNumber\":26404150,"
                 + "\"optimisticBlockNumber\":0,\"finalizedSlot\":15634912,\"optimisticSlot\":0,"
                 + "\"maxHeaderChainGap\":8192}");

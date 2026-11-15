@@ -181,14 +181,8 @@ func TestAccountJSONKeySet(t *testing.T) {
 	}
 }
 
-// TestStorageJSONKeySet is the storage_json counterpart
-// (eljson.rs storage_json: addressHex, slot, holderHex, storageKeyHex,
-// storageKeyHashHex, exists, valueHex, valueDecimal, slotsReturned,
-// storageRootHex, proofNodesHex, storageProofValid, beaconSynced,
-// beaconChainVerified, blsVerified, matchedBeaconSlot, verifyMethod,
-// failReason, peerBlockNumber, finalizedBlockNumber,
-// optimisticBlockNumber, finalizedSlot, optimisticSlot,
-// maxHeaderChainGap) plus anchor.
+// TestStorageJSONUnverifiedOutcomeRefused: a read whose account outcome
+// did not verify must not render a VERIFIED mark (PR #819 review).
 func TestStorageJSONUnverifiedOutcomeRefused(t *testing.T) {
 	r := foundRead(t)
 	r.Outcome = snapwire.AccountOutcome{} // AccountInvalid
@@ -218,6 +212,14 @@ func TestStorageJSONEmptyValueIsNotExists(t *testing.T) {
 	}
 }
 
+// TestStorageJSONKeySet is the storage_json counterpart
+// (eljson.rs storage_json: addressHex, slot, holderHex, storageKeyHex,
+// storageKeyHashHex, exists, valueHex, valueDecimal, slotsReturned,
+// storageRootHex, proofNodesHex, storageProofValid, beaconSynced,
+// beaconChainVerified, blsVerified, matchedBeaconSlot, verifyMethod,
+// failReason, peerBlockNumber, finalizedBlockNumber,
+// optimisticBlockNumber, finalizedSlot, optimisticSlot,
+// maxHeaderChainGap) plus anchor.
 func TestStorageJSONKeySet(t *testing.T) {
 	r := foundRead(t)
 	r.Slot = &SlotRead{Key: [32]byte{}, Value: []byte{1}, StorageRoot: fill(0x22)}

@@ -2,7 +2,6 @@ package io.myotis.engines.go;
 
 import com.sun.jna.Library;
 import com.sun.jna.Native;
-import com.sun.jna.Library;
 import com.sun.jna.Pointer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;

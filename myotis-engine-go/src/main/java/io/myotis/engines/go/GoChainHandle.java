@@ -153,7 +153,7 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
     @Override
     public synchronized boolean start() {
         long startRequestNs = System.nanoTime();
-        boolean ok = GoEngineNative.nativeStart(handle);
+        boolean ok = gated(() -> GoEngineNative.nativeStart(handle));
         if (ok) {
             if (!started) { startedAtNs = startRequestNs; started = true; }
             startRpc();
@@ -168,7 +168,7 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
             rpcStarted = false;
         }
         started = false;
-        GoEngineNative.nativeStop(handle);
+        gated(() -> { GoEngineNative.nativeStop(handle); return null; });
     }
 
     // ---- lifecycle (no idle sleep yet; see class doc) ----
@@ -208,7 +208,14 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
     }
 
     /** The Go twin of the Rust handle's {@code gated()}, minus the wake gate
-     *  (there is no pause to wake from): stamp activity, mark in flight, run. */
+     *  (there is no pause to wake from): stamp activity, mark in flight, run.
+     *  EVERY native call in this class goes through it — lifecycle and
+     *  setters included (PR #861 internal review: start/stop/status/the
+     *  setters used to call GoEngineNative directly, so a missing symbol on
+     *  a stale library threw a raw UnsatisfiedLinkError out of, say,
+     *  {@code shutdownAll}'s fan-out instead of this class's documented
+     *  EngineException — lazy per-call symbol resolution makes every site
+     *  equally exposed). */
     private <T> T gated(java.util.function.Supplier<T> nativeCall) {
         lastActivityMs.set(System.currentTimeMillis());
         inFlight.incrementAndGet();
@@ -263,7 +270,7 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
 
     /** Parse the native status JSON; a null/empty payload → an unknown/dead handle. */
     private ParsedStatus readStatus() {
-        String json = GoEngineNative.nativeStatusJson(handle);
+        String json = gated(() -> GoEngineNative.nativeStatusJson(handle));
         return ParsedStatus.parse(json);
     }
 
@@ -574,7 +581,7 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
         // The Go ABI records the value and clamps it ([1,4096]); the dial-only
         // engine serves no blocks, so no answer depends on it (capabilities say
         // so). False only for an unknown handle — log it, same rule as the twin.
-        if (!GoEngineNative.nativeSetServedBlockWindow(handle, blocks)) {
+        if (!gated(() -> GoEngineNative.nativeSetServedBlockWindow(handle, blocks))) {
             log.warn("[engines] setServedBlockWindow({}) dropped: unknown handle {}", blocks, handle);
         }
     }
@@ -583,7 +590,7 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
     public void setWsBoundPeriods(long periods) {
         // APPLIED live on the Go engine: the LC loop re-reads the bound at every
         // weak-subjectivity gate and a parked bootstrap restarts within a second.
-        if (!GoEngineNative.nativeSetWsBoundPeriods(handle, periods)) {
+        if (!gated(() -> GoEngineNative.nativeSetWsBoundPeriods(handle, periods))) {
             log.warn("[engines] setWsBoundPeriods({}) dropped: unknown handle {}", periods, handle);
         }
     }
@@ -607,7 +614,7 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
     @Override
     public void acceptStaleAnchor() {
         // APPLIED live: releases a STALE_ANCHOR park and stays armed this run.
-        if (!GoEngineNative.nativeAcceptStaleAnchor(handle)) {
+        if (!gated(() -> GoEngineNative.nativeAcceptStaleAnchor(handle))) {
             log.warn("[engines] acceptStaleAnchor dropped: unknown handle {}", handle);
         }
     }
