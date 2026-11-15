@@ -451,6 +451,9 @@ public record NetworkConfig(
             // Release check for v0.1.20 (2026-11-07), slot 11523360 (refreshed):
             // run 42324482192, 2 of 2, both cold starts SYNCED again; the Nimbus
             // was back at 60 of 60 right after. Details in the Rust twin.
+            // Release check for v0.1.21-rc1 (2026-11-15), slot 11583488 (refreshed):
+            // run 43701513476, 2 of 2, both cold starts SYNCED; the Nimbus had 48
+            // of 60 peers right after. Details in the Rust twin.
             // Keep this list identical to SEPOLIA_STATIC_PEERS in
             // rust/myotis-net/src/sync.rs (both parity tests pin it).
             List.of(
