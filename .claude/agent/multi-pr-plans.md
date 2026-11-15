@@ -36,9 +36,10 @@ tag cut from its head at any moment must not ship half a feature. So a work item
      internal review addressed, the automated review POSTED on the PR and its
      findings handled, every review comment answered on its thread, and no open
      changes-requested review. A green `claude-review` job alone is not a
-     review: the action skips and still goes green when the PR's copy of
-     `claude-review.yml` differs from `main`'s — a feature branch lagging `main`
-     on that file is enough (see the file's header). Nor is a review of a head
+     review: the action skips and still goes green when the copy of
+     `claude-review.yml` that runs — the PR's base branch's — differs from
+     `main`'s, so a feature branch lagging `main` on that file is enough (see
+     the file's header). Nor is a review of a head
      that has since moved beyond fixes for its findings and the other review
      comments: it runs once per PR (not on push), and a re-run replays the
      original commit, so it describes code that is no longer there. A part
@@ -103,8 +104,9 @@ the owner rather than stacking more parts on `main`. Skipping the feature branch
 for a multi-PR plan is the owner's call for that task, never the author's.
 Releases are unaffected: the release PR is a single PR against `main`, and
 whatever is still on a feature branch is simply not in that release. This rests
-on the PR workflows' `pull_request` triggers being unscoped (any base branch —
-see the comments in `ci.yml`, `android-apk.yml` and siblings), which is what
+on the PR workflows' `pull_request` triggers (`pull_request_target` for
+`claude-review.yml`) being unscoped (any base branch — see the comments in
+`ci.yml`, `android-apk.yml` and siblings), which is what
 gives part PRs the tests, clippy, the lockfile check and the Claude review; do
 not narrow them to `main`. **The artifact builds are the exception** (owner
 ruling, 2026-10-09): the Android APK + emulator smoke, the macOS dmg and the
