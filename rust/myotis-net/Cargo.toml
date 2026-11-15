@@ -105,8 +105,17 @@ getrandom = "=0.4.3"
 
 # Tor (docs/how-it-works/privacy-and-tor.md) — OPTIONAL, off by default. Only a build with
 # `--features tor` (`-PtorEngine`: the desktop engine dylib, the Android
-# jniLibs) pulls the Arti dependency tree; the iOS/daemon builds and every
-# build without the flag are byte-for-byte unaffected.
+# jniLibs) pulls the Arti dependency tree into the BUILD; the iOS/daemon
+# builds and every build without the flag compile none of it.
+# That is not true of the LOCK, which all builds share: Arti's minimum
+# requirements choose versions of crates the default build links too. #867
+# (0.47 -> 0.48) moved 19 of them (cfg-if, rand, sha2, smallvec, time,
+# tokio-util, tinystr, ...), added one (a second synstructure) and widened
+# the features of one that did not move (syn 3); #860 (0.44 -> 0.47) changed
+# nothing. After an Arti bump, diff the default graph before and after, with
+# features (`cargo tree --locked --workspace --target all -e normal,build
+# -f '{p} {f}'`), name what changed in the PR, and dispatch
+# `reproducible builds`.
 #
 # Arti's TLS backend is chosen per target. Off Android it is native-tls, which
 # avoids the rustls 0.23 process-wide CryptoProvider dance (macOS
