@@ -13,7 +13,8 @@ reporting:
 2. Describe the issue: the affected component (engine, platform, version or
    commit), how to reproduce it, and what an attacker gains (for example, a
    way to make the node accept unverified data).
-3. Submit. Only you and the maintainer can see the report. The discussion
+3. Submit. Only you, the maintainer and anyone the maintainer adds to the
+   advisory to help fix it can see the report. The discussion
    stays in that private advisory, and the advisory is published once a fixed
    release is out.
 
