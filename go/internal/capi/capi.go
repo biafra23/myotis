@@ -46,15 +46,18 @@ import (
 	"github.com/biafra23/myotis/go/internal/chain"
 	"github.com/biafra23/myotis/go/internal/clsync"
 	"github.com/biafra23/myotis/go/internal/engine"
+	"github.com/biafra23/myotis/go/internal/lc"
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
 // MyotisABIVersion is the myotis_engine.h ABI whose subset this library
 // implements; myotis_init returns it so a host gated on the header's
-// MYOTIS_ABI_VERSION macro gates identically on Go and Rust. The ABI-58/59
-// additions (checkpoint-anchor refresh, remembered stale-anchor policy) are
-// exported and honestly refused, not left unlinked (58 =
-// myotis_refresh_anchor_from_checkpointz, 59 = myotis_set_stale_anchor_policy).
+// MYOTIS_ABI_VERSION macro gates identically on Go and Rust. Both ABI-58/59
+// additions are exported, not left unlinked: the checkpoint refresh
+// (58 = myotis_refresh_anchor_from_checkpointz) is honestly refused (no
+// fetch), the remembered stale-anchor policy (59 =
+// myotis_set_stale_anchor_policy) is APPLIED for ASK and CONTINUE and
+// refused only for its fetch-backed CHECKPOINT code.
 const MyotisABIVersion = 59
 
 // ReadBudget is the wall-clock cap on one blocking verified read — the
@@ -608,6 +611,34 @@ func meteringString(code int32) string {
 	}
 }
 
+// statusPeriods computes the (currentPeriod, targetPeriod) pair for the
+// status JSON — pulled out of StatusJSON as a pure function so the
+// parked-anchor age is pinned by a table test rather than by parking a
+// live loop (PR #877 round-2). The cases, per the host.rs status_object
+// contract:
+//
+//   - anchor held: current is the anchor's period (the dialog ages from it);
+//   - parked with no anchor (STALE_ANCHOR at the bootstrap gate): current is
+//     the embedded checkpoint's period — the period the gate REFUSED, which
+//     is what the contract says a parked status reports (leaving 0 made the
+//     dialog read the age as the whole chain history, ~1900 periods);
+//   - still bootstrapping: 0 — nothing was refused yet.
+//
+// target is max(current, wall) either way. The checkpoint period arrives
+// through lc.CheckpointPeriod — the ONE definition of the anchor all three
+// weak-subjectivity gates refuse (clsync's checkStartGate comment), so the
+// status can never drift from what the gates actually compared.
+func statusPeriods(beaconState string, anchorSlot uint64, haveAnchor bool, checkpointPeriod, wallPeriod uint64) (uint64, uint64) {
+	current := uint64(0)
+	switch {
+	case haveAnchor:
+		current = chain.SyncCommitteePeriod(anchorSlot)
+	case beaconState == "STALE_ANCHOR":
+		current = checkpointPeriod
+	}
+	return current, max(current, wallPeriod)
+}
+
 func StatusJSON(handle int64) string {
 	eng, started, ok := lookup(handle)
 	if !ok {
@@ -642,28 +673,19 @@ func StatusJSON(handle int64) string {
 		st.SnapServingPeers = snap
 		st.Snap2ServingPeers = snap2
 		st.ReadyPeers = eng.ReadyPeerCount()
-		if a, ok := eng.Anchor(); ok {
+		a, haveAnchor := eng.Anchor()
+		var anchorSlot uint64
+		if haveAnchor {
+			anchorSlot = a.BeaconSlot
 			st.FinalizedSlot = a.BeaconSlot
 			st.OptimisticSlot = a.OptimisticSlot
-			st.CurrentPeriod = chain.SyncCommitteePeriod(a.BeaconSlot)
-			st.TargetPeriod = max(st.CurrentPeriod, wallPeriod)
 			st.FinalizedRootHex = hex.EncodeToString(a.StateRoot[:]) // no 0x, like hex32
 			st.OptimisticBlockNumber = a.OptimisticExecNo
 			st.FinalizedBlockNumber = a.ExecNumber
 			st.ExecutionBlockNumber = a.ExecNumber
-		} else {
-			// Contract of the STALE_ANCHOR shape (host.rs status_object,
-			// mirrored): while parked, currentPeriod is the period of the
-			// REFUSED anchor — with no proven anchor yet, the embedded
-			// checkpoint's. Leaving 0 here made the dialog's age read as
-			// the whole chain history (~1900 periods) instead of the
-			// anchor's real ~14 (PR #877 review). A loop that merely
-			// hasn't bootstrapped yet keeps reporting 0.
-			if st.BeaconState == "STALE_ANCHOR" {
-				st.CurrentPeriod = chain.SyncCommitteePeriod(c.CheckpointSlot)
-			}
-			st.TargetPeriod = max(st.CurrentPeriod, wallPeriod)
 		}
+		st.CurrentPeriod, st.TargetPeriod =
+			statusPeriods(st.BeaconState, anchorSlot, haveAnchor, lc.CheckpointPeriod(c), wallPeriod)
 	}
 	b, err := json.Marshal(st)
 	if err != nil {

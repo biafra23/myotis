@@ -622,6 +622,34 @@ func TestStaleAnchorRefreshRefusalShape(t *testing.T) {
 	}
 }
 
+func TestStatusPeriodsCases(t *testing.T) {
+	// The three period lines of the status JSON, pinned as a table (PR #877
+	// round-2): dropping the parked case silently restores the "park is
+	// ~1900 periods old" dialog with CI green, and parking a real loop in
+	// tests needs engine internals a table does not.
+	const cp, wall = uint64(1908), uint64(1922)
+	anchorSlot := uint64(8192 * 1910) // period 1910 by the contract's own math
+	for _, c := range []struct {
+		name             string
+		state            string
+		slot             uint64
+		have             bool
+		cp, wall         uint64
+		wantCur, wantTgt uint64
+	}{
+		{"anchor held", "SYNCED", anchorSlot, true, cp, wall, 1910, 1922},
+		{"parked without anchor", "STALE_ANCHOR", 0, false, cp, wall, 1908, 1922},
+		{"bootstrapping", "SYNCING", 0, false, cp, wall, 0, 1922},
+		{"wall behind anchor", "SYNCED", anchorSlot, true, cp, 1900, 1910, 1910},
+		{"wall behind park", "STALE_ANCHOR", 0, false, cp, 1900, 1908, 1908},
+	} {
+		gotCur, gotTgt := statusPeriods(c.state, c.slot, c.have, c.cp, c.wall)
+		if gotCur != c.wantCur || gotTgt != c.wantTgt {
+			t.Errorf("%s: statusPeriods = (%d,%d), want (%d,%d)", c.name, gotCur, gotTgt, c.wantCur, c.wantTgt)
+		}
+	}
+}
+
 func TestStaleAnchorPolicyApplyOrRefuse(t *testing.T) {
 	// ABI-59 apply-or-refuse, pinned against the engine (mirrors host.rs):
 	// ASK and CONTINUE are APPLIED (CONTINUE through the same sticky

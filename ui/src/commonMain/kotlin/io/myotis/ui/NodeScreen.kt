@@ -572,9 +572,10 @@ private fun StaleAnchorDialog(
 ) {
     val scope = rememberCoroutineScope()
     // Engines without the checkpoint fetch offer only "continue": the Java
-    // engine never has it, and the Go engine's refreshAnchorFromCheckpointz is
-    // the :myotis-api default refusal, so a "Fresh checkpoint" button there
-    // could only ever answer "not supported by this engine" (PR #877 review).
+    // engine never has it, and the Go engine refuses it by name
+    // (GoChainHandle.refreshAnchorFromCheckpointz relays the library's own
+    // no-fetch refusal, capabilities anchorRefresh:false), so a "Fresh
+    // checkpoint" button there could only ever fail (PR #877 review).
     val fetchOffered = s.engine != "java" && s.engine != "go"
     var busy by remember(network) { mutableStateOf(false) }
     var status by remember(network) { mutableStateOf<String?>(null) }

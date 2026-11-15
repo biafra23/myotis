@@ -77,7 +77,13 @@ import java.util.List;
  *       #refreshAnchorFromCheckpointz} parses the C export's contract-shaped
  *       answer, which today is always the {@code applied:false} refusal — the
  *       one-shot {@link #acceptStaleAnchor} is the way forward until the fetch
- *       lands (engine-parity; the parse already handles the applied shape).</li>
+ *       lands (engine-parity; the parse already handles the applied shape).
+ *       Related engine-parity gap, recorded not fixed (PR #877 round-2): the
+ *       "asks again at a later park" promise holds at the bootstrap gate
+ *       only — after bootstrap, an in-run {@code ErrStaleAnchor} from
+ *       catch-up retries logs and keeps running instead of republishing
+ *       {@code STALE_ANCHOR} the way the Rust loop does, so a mid-run
+ *       withdrawal re-asks only via the dialog the bootstrap park opened.</li>
  * </ul>
  *
  * <p>{@link #reads()} and the loopback listener follow the Rust twin exactly:
@@ -655,35 +661,34 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
         // checkpoint fetch (capabilities anchorRefresh:false) — but the shape is
         // the contract's, and a later fetch implementation flows through here
         // with no JVM change.
-        String json = linked(() -> GoEngineNative.nativeRefreshAnchorFromCheckpointz(handle, allowUnconfirmed));
-        boolean applied = false;
-        String root = null;
-        long slot = 0;
-        long epoch = 0;
-        boolean unconfirmed = false;
-        String error = "no answer from the engine";
-        List<String> operators = List.of();
-        List<String> confirmedBy = List.of();
+        return parseAnchorRefresh(
+                linked(() -> GoEngineNative.nativeRefreshAnchorFromCheckpointz(handle, allowUnconfirmed)));
+    }
+
+    /**
+     * The engine's {@code refresh_anchor_from_checkpointz} JSON as the API
+     * record — the mirror of {@code RustChainHandle.parseAnchorRefresh}
+     * (same shape, pinned engine-side by {@code RustAnchorRefreshJsonTest}
+     * and here by {@code GoAnchorRefreshJsonTest}): the applied record is
+     * built only when EVERY member parses, and anything unreadable is a
+     * refusal — never a half-built {@code applied:true} that keeps an
+     * error, which would break the record's own "error: null when applied"
+     * contract (PR #877 round-2).
+     */
+    static io.myotis.api.AnchorRefresh parseAnchorRefresh(String json) {
         try {
             JsonObject o = Json.parse(json).asObject();
-            applied = o.getBoolean("applied", false);
-            unconfirmed = o.getBoolean("unconfirmed", false);
-            if (applied) {
-                root = o.getString("root", null);
-                slot = o.getLong("slot", 0);
-                epoch = o.getLong("epoch", 0);
-                operators = strings(o.get("operators"));
-                confirmedBy = strings(o.get("confirmedBy"));
-                error = null;
-            } else {
-                error = o.getString("error", error);
+            boolean unconfirmed = o.getBoolean("unconfirmed", false);
+            if (!o.getBoolean("applied", false)) {
+                return new io.myotis.api.AnchorRefresh(false, null, 0, 0, List.of(), List.of(),
+                        unconfirmed, o.getString("error", "refused"));
             }
-        } catch (RuntimeException malformed) {
-            // A non-JSON answer stays a refusal with the raw text as the reason.
-            error = "malformed refresh answer: " + json;
+            return new io.myotis.api.AnchorRefresh(true, o.getString("root", null),
+                    o.getLong("slot", 0), o.getLong("epoch", 0), strings(o.get("operators")),
+                    strings(o.get("confirmedBy")), unconfirmed, null);
+        } catch (RuntimeException e) {
+            return io.myotis.api.AnchorRefresh.refused("malformed engine answer: " + e.getMessage());
         }
-        return new io.myotis.api.AnchorRefresh(applied, root, slot, epoch, operators, confirmedBy,
-                unconfirmed, error);
     }
 
     private static List<String> strings(JsonValue v) {

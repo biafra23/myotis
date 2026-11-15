@@ -350,28 +350,38 @@ func (e *Engine) AcceptStale() bool {
 // STALE_ANCHOR park (myotis_set_stale_anchor_policy, ABI 59), storing it
 // so every LATER park honors it — the contract's "applied by the sync
 // loop itself at every park". Codes: 0 ASK, 1 fresh checkpoint, 2
-// continue. CONTINUE is applied through the same consent machinery as
-// AcceptStale (sticky this run, re-read at every weak-subjectivity
-// gate); ASK is the default posture and, like host.rs
-// set_stale_anchor_policy, WITHDRAWS a CONTINUE it replaces — leaving a
-// remembered "continue" un-arms the consent it gave this run, so a later
-// park asks instead. CHECKPOINT (1) is REFUSED, not stored: this engine
-// has no checkpoint fetch (capabilities anchorRefresh:false), and an
-// accepted-and-ignored answer is what apply-or-refuse forbids. True =
-// applied; false for a closed engine, the fetch-backed code, or an
-// unknown code.
+// continue. Codes, in host.rs's order: LEAVING a remembered CONTINUE for
+// ANY other answer first withdraws the consent it armed (that policy is
+// no longer the user's word, whatever replaces it — host.rs
+// set_stale_anchor_policy swaps first and un-arms on was==Continue),
+// putting the engine back on the fail-closed ASK posture; then CONTINUE
+// (2) arms the same sticky consent AcceptStale uses (re-read at every
+// weak-subjectivity gate), and CHECKPOINT (1) is REFUSED (false, not
+// stored): this engine has no checkpoint fetch (capabilities
+// anchorRefresh:false) and an accepted-and-ignored answer is what
+// apply-or-refuse forbids — the withdrawal above still happened, so the
+// refused answer never leaves a CONTINUE's consent silently armed. A
+// refused write with NO prior CONTINUE disturbs nothing, so a one-shot
+// AcceptStale consent survives it (host.rs agrees: its swap sees
+// was!=Continue). True = applied; false for a closed engine, the
+// fetch-backed code, or an unknown code.
 func (e *Engine) SetStaleAnchorPolicy(policy int32) bool {
 	e.mu.Lock()
-	if e.closed || policy < 0 || policy > 2 || policy == 1 {
+	if e.closed || policy < 0 || policy > 2 {
 		e.mu.Unlock()
 		return false
 	}
-	withdrew := e.stalePolicy == 2 && policy != 2 // leaving CONTINUE (mirrors host.rs)
+	if e.stalePolicy == 2 && policy != 2 { // leaving CONTINUE, whatever replaces it (host.rs)
+		e.acceptStale = false
+		e.stalePolicy = 0
+	}
+	if policy == 1 { // no checkpoint fetch: refused; the engine is back on ASK
+		e.mu.Unlock()
+		return false
+	}
 	e.stalePolicy = policy
 	if policy == 2 {
 		e.acceptStale = true
-	} else if withdrew {
-		e.acceptStale = false
 	}
 	e.mu.Unlock()
 	if policy == 2 {

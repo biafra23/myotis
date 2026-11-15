@@ -199,16 +199,21 @@ zeros, marked in the struct. `myotis_set_ws_bound_periods` and
 them at every weak-subjectivity gate and a parked bootstrap
 restarts — while `myotis_set_served_block_window` records its value
 (a dial-only engine serves no blocks, so no answer depends on it;
-`capabilities` makes that explicit). The ABI-58/59 additions are
-exported and REFUSED by name, not left unlinked:
+`capabilities` makes that explicit). The ABI-58/59 additions are both
+exported, applied where the engine can and refused where it cannot —
+never unlinked, never silently accepted:
 `myotis_refresh_anchor_from_checkpointz` answers the contract's own
-`{"applied":false,…}` shape (no checkpoint-fetch yet), and
-`myotis_set_stale_anchor_policy` accepts only ASK — the remembered
-re-application the sync loop would owe at every later park is not
-implemented, so the fetch-backed answers get the contract's `false`
-("not applied") rather than a silent accept (the one-shot
-`myotis_accept_stale_anchor` is the way forward, and the JVM side
-maps CONTINUE onto it via the `:myotis-api` default).
+`{"applied":false,…}` refusal (no checkpoint fetch yet; capabilities
+`anchorRefresh:false`, the one-shot `myotis_accept_stale_anchor` is the
+way forward). `myotis_set_stale_anchor_policy` IS the remembered
+answer the sync loop honors at every park: CONTINUE arms the same
+sticky consent the one-shot export uses (re-read at every
+weak-subjectivity gate), leaving a remembered CONTINUE for anything
+else withdraws it (host.rs's rule), and the CHECKPOINT code is refused
+with the contract's `false` for the missing fetch. `GoChainHandle`
+routes both through the native exports, so the JVM and C-ABI hosts get
+the identical answer (`capabilities.staleAnchorPolicy:true` marks the
+policy applied for its two supported codes).
 
 ## Desktop embed (`:myotis-engine-go`, feature/go-desktop-embed part 1c)
 

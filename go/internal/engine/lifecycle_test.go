@@ -96,4 +96,18 @@ func TestSetStaleAnchorPolicyWithdrawalMirrorsRust(t *testing.T) {
 	if !e.StaleAccepted() {
 		t.Error("a REFUSED policy write must not withdraw an armed consent (apply-or-refuse)")
 	}
+	// The 2 → 1 sequence specifically (PR #877 round-2): replacing a
+	// remembered CONTINUE with CHECKPOINT withdraws the CONTINUE's consent
+	// FIRST (host.rs swaps before it refuses), so the refused answer never
+	// leaves a stale consent armed — ASK, the fail-closed posture, is what
+	// the refused CHECKPOINT falls back to.
+	if !e.SetStaleAnchorPolicy(2) {
+		t.Fatal("CONTINUE must apply")
+	}
+	if e.SetStaleAnchorPolicy(1) {
+		t.Error("CHECKPOINT still refuses")
+	}
+	if e.StaleAccepted() {
+		t.Error("CONTINUE→CHECKPOINT must withdraw the consent (the host.rs rule, any replacement)")
+	}
 }
