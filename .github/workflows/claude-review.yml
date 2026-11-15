@@ -51,7 +51,8 @@
 #   result. A run in which the action never started Claude because this file
 #   differs from the default branch's is not an attempt (see Scope
 #   decisions): it stays green with a warning, since a fallback would skip
-#   the same way. After each attempt, a step prints what it was refused and
+#   the same way. (Only the App's token exchange skips like that; with the
+#   run's own token, Setup step 1, it does not happen.) After each attempt, a step prints what it was refused and
 #   how it ended, so a silent attempt explains itself.
 #
 #   Subscription first, API credits last (owner's decision, 2026-11-15):
@@ -167,8 +168,11 @@ env:
   # GITHUB_TOKEN, see Setup). Only its comments count as review feedback in
   # the checks below, so a person or another bot (Copilot posts inline findings)
   # commenting while the review runs can neither pass for a review nor
-  # suppress the fallback. A different token setup posts under a different
-  # login: change this with it, or every review reads as empty.
+  # suppress the fallback. github-actions[bot] is every workflow's login,
+  # though: no other workflow here comments on PRs, so today only this one
+  # counts, but one that starts to (a PR can add one) would pass for a
+  # review. A different token setup posts under a different login: change
+  # this with it, or every review reads as empty.
   REVIEWER_LOGIN: github-actions[bot]
   # What each job prints after its attempt (see "What the first attempt was
   # refused, and how it ended"), from the transcript the action writes to
@@ -308,8 +312,8 @@ jobs:
       # without starting Claude (see Scope
       # decisions), and the check after the first attempt has to tell that
       # skip from an attempt that left nothing. Asked here, before the action
-      # runs: the action points origin at its app token and revokes the token
-      # on its way out, so a fetch after it would fail.
+      # runs: the action points origin at its token (with the App's, it also
+      # revoked it on its way out), so a fetch after it could fail.
       - name: Does this workflow match the default branch's?
         id: workflow
         env:
@@ -414,9 +418,10 @@ jobs:
             || { echo "::error::Unexpected start time: '$SINCE'"; exit 1; }
           # The reviewer's comments posted or edited since the start, summary
           # and inline; three tries before it gives up. Inline comments also
-          # count from github-actions[bot]: the action posts its buffered ones
-          # with this job's token when its run step died before handing over
-          # the app's, and no other workflow here comments on PRs. Each listing
+          # count from github-actions[bot] (with the App's token, the action
+          # posted its buffered ones with this job's token when its run step
+          # died before handing the App's over); with the job's own token
+          # (Setup, step 1) that is REVIEWER_LOGIN itself. Each listing
           # is assigned on its own, never inside an echo or an arithmetic
           # expansion, where a failed gh api would still exit 0. The fallback
           # job's "Did the fallback leave a review?" and the api job's "Fail
