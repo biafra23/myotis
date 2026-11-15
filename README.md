@@ -1,6 +1,6 @@
 # Myotis engine library — Maven repository
 
-The `eth.myotis` artifacts of every release (docs/android-library.md on `main`),
+The `eth.myotis` artifacts of every release (docs/guides/android-library.md on `main`),
 laid out as a Maven repository and served by raw.githubusercontent.com, so a
 build needs no GitHub token:
 

@@ -1,0 +1,201 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "eth.myotis",
+    "module": "myotis-engine",
+    "version": "0.1.21-rc1",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "9.9.0"
+    }
+  },
+  "variants": [
+    {
+      "name": "metadataApiElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-metadata",
+        "org.jetbrains.kotlin.platform.type": "common"
+      },
+      "dependencies": [
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-stdlib",
+          "version": {
+            "requires": "2.4.21"
+          }
+        },
+        {
+          "group": "eth.myotis",
+          "module": "myotis-api",
+          "version": {
+            "requires": "0.1.21-rc1"
+          }
+        },
+        {
+          "group": "eth.myotis",
+          "module": "myotis-engine-ports",
+          "version": {
+            "requires": "0.1.21-rc1"
+          }
+        },
+        {
+          "group": "eth.myotis",
+          "module": "myotis-logindex-presets",
+          "version": {
+            "requires": "0.1.21-rc1"
+          }
+        }
+      ],
+      "dependencyConstraints": [
+        {
+          "group": "net.java.dev.jna",
+          "module": "jna",
+          "version": {
+            "strictly": "5.18.1",
+            "requires": "5.18.1"
+          },
+          "reason": "libjnidispatch.so inside the AAR is jna 5.18.1; JNA refuses a mismatched jar"
+        }
+      ],
+      "files": [
+        {
+          "name": "myotis-engine-metadata-0.1.21-rc1.jar",
+          "url": "myotis-engine-0.1.21-rc1.jar",
+          "size": 755,
+          "sha512": "c1124fe9a1e76364e4b247f9d29618493163200007bec56eae99148bec588c342bffc659a7e7bb4575e114c9700834be8e0cbf305760db8ee4ea452da25392df",
+          "sha256": "014a4e8de850426db967b7d104e3f9d75160e7821f9a822e214e883d34a9dcdb",
+          "sha1": "03c5d38b9dfc3a4dcc6723ccf0943e26e676c024",
+          "md5": "b4db83bf8173c9a9b75ad31150a01d5d"
+        }
+      ]
+    },
+    {
+      "name": "metadataSourcesElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-runtime",
+        "org.jetbrains.kotlin.platform.type": "common"
+      },
+      "files": [
+        {
+          "name": "myotis-engine-kotlin-0.1.21-rc1-sources.jar",
+          "url": "myotis-engine-0.1.21-rc1-sources.jar",
+          "size": 4218,
+          "sha512": "060e1a793a1603a3a9d7ae5e095f622f08a8a10b46c142a69ad0c55f114ea311893d1c697ed2bcf026f16d9df721c565631e8732f1765984c5516e3a356ecb83",
+          "sha256": "4089b430a12c2b0e8850f4e8309905396a0667fd068a00c8c579676b24807e7b",
+          "sha1": "bcd6a1c5706052b18619d6d7670bb9faa1e3836c",
+          "md5": "7056e4d0d8f53c8f8eaee7bd424dcdbe"
+        }
+      ]
+    },
+    {
+      "name": "androidApiElements-published",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "android",
+        "org.gradle.libraryelements": "aar",
+        "org.gradle.usage": "java-api",
+        "org.jetbrains.kotlin.platform.type": "androidJvm"
+      },
+      "available-at": {
+        "url": "../../myotis-engine-android/0.1.21-rc1/myotis-engine-android-0.1.21-rc1.module",
+        "group": "eth.myotis",
+        "module": "myotis-engine-android",
+        "version": "0.1.21-rc1"
+      }
+    },
+    {
+      "name": "androidRuntimeElements-published",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "android",
+        "org.gradle.libraryelements": "aar",
+        "org.gradle.usage": "java-runtime",
+        "org.jetbrains.kotlin.platform.type": "androidJvm"
+      },
+      "available-at": {
+        "url": "../../myotis-engine-android/0.1.21-rc1/myotis-engine-android-0.1.21-rc1.module",
+        "group": "eth.myotis",
+        "module": "myotis-engine-android",
+        "version": "0.1.21-rc1"
+      }
+    },
+    {
+      "name": "androidSourcesElements-published",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.jvm.environment": "android",
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime",
+        "org.jetbrains.kotlin.platform.type": "androidJvm"
+      },
+      "available-at": {
+        "url": "../../myotis-engine-android/0.1.21-rc1/myotis-engine-android-0.1.21-rc1.module",
+        "group": "eth.myotis",
+        "module": "myotis-engine-android",
+        "version": "0.1.21-rc1"
+      }
+    },
+    {
+      "name": "jvmApiElements-published",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "standard-jvm",
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-api",
+        "org.jetbrains.kotlin.platform.type": "jvm"
+      },
+      "available-at": {
+        "url": "../../myotis-engine-jvm/0.1.21-rc1/myotis-engine-jvm-0.1.21-rc1.module",
+        "group": "eth.myotis",
+        "module": "myotis-engine-jvm",
+        "version": "0.1.21-rc1"
+      }
+    },
+    {
+      "name": "jvmRuntimeElements-published",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "standard-jvm",
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime",
+        "org.jetbrains.kotlin.platform.type": "jvm"
+      },
+      "available-at": {
+        "url": "../../myotis-engine-jvm/0.1.21-rc1/myotis-engine-jvm-0.1.21-rc1.module",
+        "group": "eth.myotis",
+        "module": "myotis-engine-jvm",
+        "version": "0.1.21-rc1"
+      }
+    },
+    {
+      "name": "jvmSourcesElements-published",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.jvm.environment": "standard-jvm",
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime",
+        "org.jetbrains.kotlin.platform.type": "jvm"
+      },
+      "available-at": {
+        "url": "../../myotis-engine-jvm/0.1.21-rc1/myotis-engine-jvm-0.1.21-rc1.module",
+        "group": "eth.myotis",
+        "module": "myotis-engine-jvm",
+        "version": "0.1.21-rc1"
+      }
+    }
+  ]
+}

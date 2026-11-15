@@ -1,0 +1,219 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "eth.myotis",
+    "module": "myotis-logindex-presets",
+    "version": "0.1.21-rc1",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "9.9.0"
+    }
+  },
+  "variants": [
+    {
+      "name": "metadataApiElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-metadata",
+        "org.jetbrains.kotlin.platform.type": "common"
+      },
+      "dependencies": [
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-stdlib",
+          "version": {
+            "requires": "2.4.21"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "myotis-logindex-presets-metadata-0.1.21-rc1.jar",
+          "url": "myotis-logindex-presets-0.1.21-rc1.jar",
+          "size": 4538,
+          "sha512": "c57743f9814045a3f286a8377c02dd3b3d5b8c825bf55b64636ea8e26e3f705014b076eae74717060cca84fc75dbd429b2c5350b547a1a325e58f7229905e1a2",
+          "sha256": "dd652226e39ed4bb0a3809c9c476e5e87ea04fbe2108668c7903401832050291",
+          "sha1": "c87e0f7fc0124983e76a6dbca25a164db1205ae3",
+          "md5": "a883003e4b6a52fc76ee1aab380e2b1e"
+        }
+      ]
+    },
+    {
+      "name": "metadataSourcesElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-runtime",
+        "org.jetbrains.kotlin.platform.type": "common"
+      },
+      "files": [
+        {
+          "name": "myotis-logindex-presets-kotlin-0.1.21-rc1-sources.jar",
+          "url": "myotis-logindex-presets-0.1.21-rc1-sources.jar",
+          "size": 11238,
+          "sha512": "e26abe22d881e0faae47fae7a8e073aa3af8e299de26889389b2608da332b445af445264c5761a536ac3e5b0a6f96e753c10129e858452f9b43706919bda5998",
+          "sha256": "27cee63d760b43c2049893056e78fb941c803829b472e0d401c5fefa6fb0f7df",
+          "sha1": "d73919ec1931613032b6008ef0a602711f7325fc",
+          "md5": "92f245adb59b80cf1a253a8d76ca3dfc"
+        }
+      ]
+    },
+    {
+      "name": "iosArm64ApiElements-published",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-api",
+        "org.jetbrains.kotlin.native.target": "ios_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "available-at": {
+        "url": "../../myotis-logindex-presets-iosarm64/0.1.21-rc1/myotis-logindex-presets-iosarm64-0.1.21-rc1.module",
+        "group": "eth.myotis",
+        "module": "myotis-logindex-presets-iosarm64",
+        "version": "0.1.21-rc1"
+      }
+    },
+    {
+      "name": "iosArm64SourcesElements-published",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-runtime",
+        "org.jetbrains.kotlin.native.target": "ios_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "available-at": {
+        "url": "../../myotis-logindex-presets-iosarm64/0.1.21-rc1/myotis-logindex-presets-iosarm64-0.1.21-rc1.module",
+        "group": "eth.myotis",
+        "module": "myotis-logindex-presets-iosarm64",
+        "version": "0.1.21-rc1"
+      }
+    },
+    {
+      "name": "iosArm64MetadataElements-published",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-metadata",
+        "org.jetbrains.kotlin.native.target": "ios_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "available-at": {
+        "url": "../../myotis-logindex-presets-iosarm64/0.1.21-rc1/myotis-logindex-presets-iosarm64-0.1.21-rc1.module",
+        "group": "eth.myotis",
+        "module": "myotis-logindex-presets-iosarm64",
+        "version": "0.1.21-rc1"
+      }
+    },
+    {
+      "name": "iosSimulatorArm64ApiElements-published",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-api",
+        "org.jetbrains.kotlin.native.target": "ios_simulator_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "available-at": {
+        "url": "../../myotis-logindex-presets-iossimulatorarm64/0.1.21-rc1/myotis-logindex-presets-iossimulatorarm64-0.1.21-rc1.module",
+        "group": "eth.myotis",
+        "module": "myotis-logindex-presets-iossimulatorarm64",
+        "version": "0.1.21-rc1"
+      }
+    },
+    {
+      "name": "iosSimulatorArm64SourcesElements-published",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-runtime",
+        "org.jetbrains.kotlin.native.target": "ios_simulator_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "available-at": {
+        "url": "../../myotis-logindex-presets-iossimulatorarm64/0.1.21-rc1/myotis-logindex-presets-iossimulatorarm64-0.1.21-rc1.module",
+        "group": "eth.myotis",
+        "module": "myotis-logindex-presets-iossimulatorarm64",
+        "version": "0.1.21-rc1"
+      }
+    },
+    {
+      "name": "iosSimulatorArm64MetadataElements-published",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "non-jvm",
+        "org.gradle.usage": "kotlin-metadata",
+        "org.jetbrains.kotlin.native.target": "ios_simulator_arm64",
+        "org.jetbrains.kotlin.platform.type": "native"
+      },
+      "available-at": {
+        "url": "../../myotis-logindex-presets-iossimulatorarm64/0.1.21-rc1/myotis-logindex-presets-iossimulatorarm64-0.1.21-rc1.module",
+        "group": "eth.myotis",
+        "module": "myotis-logindex-presets-iossimulatorarm64",
+        "version": "0.1.21-rc1"
+      }
+    },
+    {
+      "name": "jvmApiElements-published",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "standard-jvm",
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-api",
+        "org.jetbrains.kotlin.platform.type": "jvm"
+      },
+      "available-at": {
+        "url": "../../myotis-logindex-presets-jvm/0.1.21-rc1/myotis-logindex-presets-jvm-0.1.21-rc1.module",
+        "group": "eth.myotis",
+        "module": "myotis-logindex-presets-jvm",
+        "version": "0.1.21-rc1"
+      }
+    },
+    {
+      "name": "jvmRuntimeElements-published",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.jvm.environment": "standard-jvm",
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime",
+        "org.jetbrains.kotlin.platform.type": "jvm"
+      },
+      "available-at": {
+        "url": "../../myotis-logindex-presets-jvm/0.1.21-rc1/myotis-logindex-presets-jvm-0.1.21-rc1.module",
+        "group": "eth.myotis",
+        "module": "myotis-logindex-presets-jvm",
+        "version": "0.1.21-rc1"
+      }
+    },
+    {
+      "name": "jvmSourcesElements-published",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.jvm.environment": "standard-jvm",
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime",
+        "org.jetbrains.kotlin.platform.type": "jvm"
+      },
+      "available-at": {
+        "url": "../../myotis-logindex-presets-jvm/0.1.21-rc1/myotis-logindex-presets-jvm-0.1.21-rc1.module",
+        "group": "eth.myotis",
+        "module": "myotis-logindex-presets-jvm",
+        "version": "0.1.21-rc1"
+      }
+    }
+  ]
+}
