@@ -19,7 +19,7 @@ against. Do not move them out of `.claude/`, and not into `.claude/rules/`
 | start a work item tied to an issue (session title), or open a PR (monitoring) | `.claude/agent/workflow.md`          |
 | plan, resume or continue multi-PR work: a part, a merge, the final PR         | `.claude/agent/multi-pr-plans.md`    |
 | write a PR description, answer review comments, or handle a fork PR           | `.claude/agent/pull-requests.md`     |
-| do any release work: tag, version, checkpoints, bootnodes, seeds, assets, bundles | `.claude/agent/releases.md`      |
+| do any release work: tag, version, changelog, checkpoints, bootnodes, seeds, assets, bundles | `.claude/agent/releases.md` |
 | add or bump a dependency, move a toolchain pin, touch build scripts or packaging | `.claude/agent/reproducibility.md` |
 | use a JDK API newer than Java 8 in Android-consumed code, or add HTTP         | `.claude/agent/platform.md`          |
 | add a data source, or touch roost, log-index seeds, `:tx-history`, Portal     | `.claude/agent/data-sources.md`      |
@@ -168,8 +168,9 @@ Full text: `.claude/agent/reproducibility.md`.
 Read `.claude/agent/releases.md` in full before any release work. In outline:
 **ask three questions first** (1. refresh the trust checkpoints? 2. re-sync the
 mainnet bootnodes? 3. run the cold-start checks?), then the mandatory steps
-(4. move the version pins, 5. refresh the PoC log-index seeds), all in ONE
-release PR. The tag is the owner's action. After the tag (6.), a release is
+(4. move the version pins, 5. refresh the PoC log-index seeds, 6. turn
+`[Unreleased]` in `CHANGELOG.md` into the release's entry), all in ONE release
+PR. The tag is the owner's action. After the tag (7.), a release is
 done only when `verify release` and `reproducible builds` are green — check and
 report them. Every release asset goes through `.github/release-assets.sh`,
 never a bare `gh release upload`.
