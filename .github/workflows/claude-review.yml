@@ -544,16 +544,25 @@ jobs:
           fi
           if [ "$OUTCOME" = failure ]; then
             # Only an exhausted subscription earns the paid attempt: the
-            # rejection text Claude Code reports for it, in the final result,
-            # its errors, or the message it shows in place of an answer.
+            # rejection text Claude Code reports for it. Read only where an
+            # error is reported, never the model's own prose (a review that
+            # discusses rate limits must not unlock credits): an error-marked
+            # final result and its errors, and the messages Claude Code
+            # writes itself in place of an answer (model "<synthetic>", or an
+            # `error` field), with that field's value.
             limit='hit your ([a-z]+ )?limit|usage limit|rate[ _]limit'
             said=""
             if [ -n "$EXECUTION_FILE" ] && [ -f "$EXECUTION_FILE" ]; then
-              said=$(jq -r '([.[] | select(.type == "result")] | last | (.result // ""), ((.errors // [])[] | tostring)),
-                (.[] | select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text)' \
+              said=$(jq -r '([.[] | select(.type == "result")] | last | select(. != null and .is_error == true)
+                  | (.result // ""), ((.errors // [])[] | tostring)),
+                (.[] | select(.type == "assistant" and (.message.model == "<synthetic>" or .error != null))
+                  | ((.error // empty) | tostring), (.message.content[]? | select(.type == "text") | .text))' \
                 "$EXECUTION_FILE" 2>/dev/null) || said=""
             fi
-            if printf '%s' "$said" | grep -qiE "$limit"; then
+            # A here-string, not a pipe: grep -q stops reading at its first
+            # match, and under pipefail the writer's SIGPIPE would read as
+            # no match.
+            if grep -qiE "$limit" <<<"$said"; then
               echo "api=true" >> "$GITHUB_OUTPUT"
               echo "::warning::The Opus fallback was refused for a usage limit and left no review: the subscription is exhausted — running the API-credit attempt. The step before this one shows how it ended."
               exit 0
@@ -659,7 +668,8 @@ jobs:
             (select(.type == "assistant") | .message.model)] | map(select(. != null and . != "<synthetic>")) | unique | .[]' "$EXECUTION_FILE")
           echo "Models in the transcript: ${models:-none}"
           [ -n "$models" ] || { echo "::error::The transcript names no model, so this cannot be shown to be a Fable review."; exit 1; }
-          if printf '%s\n' "$models" | grep -qv '^claude-fable-'; then
+          # A here-string, not a pipe, as in the fallback job's limit check.
+          if grep -qv '^claude-fable-' <<<"$models"; then
             echo "::error::The API-credit review was not Fable alone: $(echo $models). It must be the newest Fable (see Model strategy in this workflow)."
             exit 1
           fi
