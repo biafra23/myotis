@@ -84,7 +84,7 @@ With no populated cache it falls back to the go-ethereum bootnodes, which are
 usually discovery-only and won't serve snap — a fresh `peers.cache` from a
 short `./gradlew :app:run` is the reliable source of live snap peers.
 
-Arti 0.47 needs rustc 1.92+. `rust/rust-toolchain.toml` pins the exact
+Arti 0.48 needs rustc 1.92+. `rust/rust-toolchain.toml` pins the exact
 toolchain, but rustup looks that file up from the *current directory*, not from
 `--manifest-path`: from the repo root your default toolchain applies, and an
 older one fails with "requires rustc 1.92". `cd rust` first (then
