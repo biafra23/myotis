@@ -261,10 +261,12 @@ refusal (a long sleep, or Settings moving off "continue anyway")
 stalls the steady loop silently — every slot refuses at the in-run
 gate, so no finality poll runs and no anchor is published, the status
 stays `SYNCING`/`CATCHING_UP` (it reports `STALE_ANCHOR` only when the
-loop itself died) and **no dialog opens**; the only trace is the
-per-slot `re-catch-up:` log, and the ways out are choosing CONTINUE
-again in Settings or a restart, which parks at the bootstrap gate and
-asks. The Rust loop instead re-publishes `STALE_ANCHOR` and re-asks. The JSON-string
+loop itself died) and **no dialog opens**; the stall logs once at WARN
+(`STALE ANCHOR: held committee aged ... while running`, re-warned per
+new stall, so the hosts' WARN-filtered view keeps it) besides the
+per-slot INFO `re-catch-up:` line, and the ways out are choosing
+CONTINUE again in Settings or a restart, which parks at the bootstrap
+gate and asks. The Rust loop instead re-publishes `STALE_ANCHOR` and re-asks. The JSON-string
 reads (block/tx/receipt/fee-history) answer the `{"error":…,
 "code":-32602}` envelope so the wallet gets a permanent refusal, not a
 retryable one. `myotis_drain_logs` lines are drained by

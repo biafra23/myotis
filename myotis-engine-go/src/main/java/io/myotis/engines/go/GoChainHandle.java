@@ -87,10 +87,13 @@ import java.util.List;
  *       {@code STALE_ANCHOR} only when the loop itself died, so the status
  *       stays {@code SYNCING}/{@code CATCHING_UP} and NO dialog opens
  *       (the bootstrap park's dialog was already answered, or a pre-start
- *       CONTINUE meant there never was one). The only trace is the
- *       per-slot "re-catch-up:" log; the ways out are choosing CONTINUE
- *       again in Settings or a restart, which parks at the bootstrap
- *       gate and asks.</li>
+ *       CONTINUE meant there never was one). The stall makes itself seen
+ *       once at WARN — "STALE ANCHOR: held committee aged ... while
+ *       running" at the stall onset, re-warned when a new stall begins,
+ *       in the hosts' WARN-filtered view (PR #877 round 5) — beside the
+ *       per-slot INFO "re-catch-up:" line; the ways out are choosing
+ *       CONTINUE again in Settings or a restart, which parks at the
+ *       bootstrap gate and asks.</li>
  * </ul>
  *
  * <p>{@link #reads()} and the loopback listener follow the Rust twin exactly:

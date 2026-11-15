@@ -136,6 +136,36 @@ func TestStaleGateConsentWaiverIsLogged(t *testing.T) {
 		})
 	}
 
+	t.Run("consent re-armed after a withdrawal is a new waiver", func(t *testing.T) {
+		// Round 5: the steady loop re-enters the gate every slot, so a
+		// per-loop once hid the SECOND consent — withdraw via Settings
+		// "ask me", the stalled loop refuses, "continue anyway" arms
+		// again, and that re-arm is its own trust decision (Rust logs
+		// every accept_stale_anchor.swap that flips, sync.rs:2848).
+		var lines []string
+		consent := true
+		s := &Syncer{
+			Logf:          func(string, ...any) { t.Fatal("waiver must not reach the plain log hook") },
+			Warnf:         func(f string, a ...any) { lines = append(lines, fmt.Sprintf(f, a...)) },
+			WsBound:       func() uint64 { return bound },
+			StaleAccepted: func() bool { return consent },
+		}
+		if err := s.staleGate(bound+1, 2*bound+2, "held committee"); err != nil {
+			t.Fatalf("waived gate refused: %v", err)
+		}
+		consent = false // Settings -> "ask me"
+		if err := s.staleGate(bound+1, 2*bound+2, "held committee"); !errors.Is(err, ErrStaleAnchor) {
+			t.Fatalf("withdrawn consent did not refuse: %v", err)
+		}
+		consent = true // Settings -> "continue again": new decision
+		if err := s.staleGate(bound+1, 2*bound+2, "held committee"); err != nil {
+			t.Fatalf("re-armed gate refused: %v", err)
+		}
+		if len(lines) != 2 {
+			t.Fatalf("logged %d lines %q, want the waiver logged again for the re-arm", len(lines), lines)
+		}
+	})
+
 	t.Run("nil Warnf falls back to Logf", func(t *testing.T) {
 		var lines []string
 		s := &Syncer{

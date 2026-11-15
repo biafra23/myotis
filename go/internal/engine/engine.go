@@ -553,6 +553,22 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 	e.lcPeers = syncer.PeerCount()
 	e.mu.Unlock()
 	catchCtx, catchCancel := context.WithTimeout(ctx, 4*time.Minute)
+	// A stale-refusal STALL warns once at WARN per refused streak
+	// (PR #877 round 5): the per-slot lines go through logf — INFO —
+	// and the docs name that line the stall's only trace, which the
+	// hosts' WARN-filtered pump view would otherwise drop entirely.
+	// Re-arms on a cycle that gets past the gate, so a later stall is
+	// a new decision and warns again; Rust's twin likewise warns once
+	// per in-run park, guarded by the state transition (sync.rs:2685).
+	stallWarned := false
+	stallWarn := func(err error) {
+		if errors.Is(err, clsync.ErrStaleAnchor) && !stallWarned {
+			stallWarned = true
+			syncer.WarnLine("STALE ANCHOR: held committee aged past the weak-subjectivity bound "+
+				"while running (%v) — the steady loop retries every slot but publishes no anchor; "+
+				"reads stay on the last one until a 'continue anyway' is granted again or the bound is raised", err)
+		}
+	}
 	if err := syncer.RunCatchUp(catchCtx, st); err != nil {
 		// NOT fatal (PR #773 review): a pin that is down or
 		// rate-limiting us today is up in the next slot, and the
@@ -561,6 +577,7 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 		// the read window on one bad round — the failure the loop
 		// right below already tolerates.
 		logf("catch-up: %v (the steady loop retries it each slot)", err)
+		stallWarn(err)
 	}
 	catchCancel()
 	// NO publish yet: st.Finalized here is the embedded checkpoint (or
@@ -577,16 +594,20 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 		e.mu.Unlock()
 		if err := syncer.RunCatchUp(ctx, st); err != nil {
 			logf("re-catch-up: %v", err)
-		} else if chain.SyncCommitteePeriod(syncer.Consensus.SlotAt(time.Now().Unix())) > st.Period() {
-			logf("committee behind wall clock after re-catch-up; skipping finality poll this cycle")
-		} else if outcome, err := syncer.PollFinality(ctx, st); err != nil {
-			logf("finality poll: %v", err)
+			stallWarn(err)
 		} else {
-			logf("finality poll: outcome %v, finalized slot %d", outcome, st.Finalized.Slot)
-			// Advanced OR Stale both mean the store's finalized header
-			// passed the full BLS path THIS cycle (Stale = verified,
-			// just not newer); Rejected / poll errors publish nothing.
-			published = outcome == lc.Advanced || outcome == lc.Stale
+			stallWarned = false // past the gate again: the next stall is new
+			if chain.SyncCommitteePeriod(syncer.Consensus.SlotAt(time.Now().Unix())) > st.Period() {
+				logf("committee behind wall clock after re-catch-up; skipping finality poll this cycle")
+			} else if outcome, err := syncer.PollFinality(ctx, st); err != nil {
+				logf("finality poll: %v", err)
+			} else {
+				logf("finality poll: outcome %v, finalized slot %d", outcome, st.Finalized.Slot)
+				// Advanced OR Stale both mean the store's finalized header
+				// passed the full BLS path THIS cycle (Stale = verified,
+				// just not newer); Rejected / poll errors publish nothing.
+				published = outcome == lc.Advanced || outcome == lc.Stale
+			}
 		}
 		if published {
 			e.publish(snapshot(st))

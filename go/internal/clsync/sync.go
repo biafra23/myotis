@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/biafra23/myotis/go/internal/chain"
@@ -105,13 +106,15 @@ type Syncer struct {
 	procMu sync.Mutex
 	store  *lc.Store
 
-	// staleWaiveOnce emits the consent-waiver line at most once per
-	// loop: the steady loop re-enters staleGate every slot, and the
-	// waiver is ONE trust decision, not one line per slot (the line
-	// itself is PR #877 round 3 — waiving weak subjectivity is the one
-	// trust decision in this flow and must not pass unlogged; Rust's
-	// twin logs it at every park, sync.rs:2478/2849).
-	staleWaiveOnce sync.Once
+	// staleWaived emits the consent-waiver line once per
+	// refused→waived TRANSITION: the steady loop re-enters staleGate
+	// every slot (one decision, not one line per slot — PR #877 round
+	// 3), but a consent re-armed after a withdrawal is a NEW trust
+	// decision and must log again — a sync.Once hid exactly that
+	// (round 5; Rust's auto_resolve_park logs every
+	// accept_stale_anchor.swap that flips, sync.rs:2848). Each
+	// transition costs the user a setting change, so this cannot spam.
+	staleWaived atomic.Bool
 }
 
 func (s *Syncer) now() time.Time {
@@ -148,6 +151,12 @@ func (s *Syncer) warnf() func(string, ...any) {
 	return s.Logf
 }
 
+// WarnLine emits one trust-decision line through the WARN hook (with
+// the warnf fallback) — exported so the engine's loop can put the
+// STALL onset, whose only other trace is a per-slot INFO line, into
+// the WARN ring the hosts filter (PR #877 round 5).
+func (s *Syncer) WarnLine(f string, a ...any) { s.warnf()(f, a...) }
+
 // staleGate is the ONE weak-subjectivity check both layers share
 // (start gate + in-run layer): refused unless the host consented to
 // the age, and judged against the bound in force at this instant.
@@ -159,14 +168,15 @@ func (s *Syncer) staleGate(anchorPeriod, wallPeriod uint64, what string) error {
 		return nil
 	}
 	if s.staleAccepted() {
-		s.staleWaiveOnce.Do(func() {
+		if s.staleWaived.CompareAndSwap(false, true) {
 			s.warnf()("STALE ANCHOR: %s period %d is past the weak-subjectivity bound "+
 				"(wall period %d, bound %d) — the host's stale-anchor consent waives "+
 				"the gate; syncing forward from the stale anchor",
 				what, anchorPeriod, wallPeriod, s.boundPeriods())
-		})
+		}
 		return nil
 	}
+	s.staleWaived.Store(false) // the next waiver is a new decision
 	return fmt.Errorf("%w: %s period %d, wall period %d, bound %d",
 		ErrStaleAnchor, what, anchorPeriod, wallPeriod, s.boundPeriods())
 }
