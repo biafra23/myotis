@@ -51,7 +51,8 @@ Do not stop at "pushed" and do not ask whether to open the PR or run the review 
 they are part of the work item. The only time to skip the PR is when the user
 explicitly says not to open one.
 An embargoed security fix (a vulnerability that is not public yet) takes
-`security-fixes.md` instead of steps 3 to 5: no public PR and no push.
+`security-fixes.md` instead of steps 3 to 5: no PR and no push before the
+owner has merged the fix.
 
 ### The session title carries the issue and the PR number
 

@@ -20,20 +20,30 @@ of the Workflow for an embargoed fix and nothing else. Every other rule in
   dependency, an issue someone opened), takes the normal Workflow. Ask when
   unsure; never assume "not embargoed".
 
-## Nothing public before the advisory is published
+## Two periods: before the merge, and until the advisory is published
 
-- No public PR, issue, discussion, comment, review reply or release note that
-  describes the vulnerability, its fix or its affected code.
+**Until the owner has merged the fix, nothing leaves the machine** but the
+patch and report sent to the owner (step 4).
+
 - **No push to any branch of this repository.** The session's designated
   branch is public too: a pushed commit is a disclosure, whatever its message
   says. This overrides the harness's "commit and push when done".
-- Do not post the fix, the report or a reproduction to any external service:
-  no gist, no paste site, no issue tracker of a dependency. Reporting a
-  dependency's own bug upstream is the owner's call, through that project's
-  private channel.
-- A branch name, commit message or code comment written for the fix becomes
-  public when it merges. Keep them neutral ("validate X before Y"), with no
-  word of exploit, impact or reporter.
+- No PR, issue, discussion, comment or review reply about it, on GitHub or
+  anywhere else.
+- Nothing goes to an external service: no gist, no paste site, no issue
+  tracker of a dependency. Reporting a dependency's bug upstream is the
+  owner's call, through that project's private channel.
+
+**From the merge until the advisory is published, only the wording is held
+back.** The code is public from the merge on, so pushes and PRs are normal
+again (steps 6 and 7 need them), but every one of them stays neutral:
+
+- A branch name, commit message, code comment, PR, changelog entry or
+  release note says what changed ("validate X before Y"). It never says that it
+  was a vulnerability, how it is exploited, what it exposes or who reported
+  it.
+- The release PR and its changelog follow `.claude/agent/releases.md` as
+  usual, in that neutral wording.
 
 ## Steps
 

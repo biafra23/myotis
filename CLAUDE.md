@@ -127,12 +127,14 @@ right after `gh pr create` (`.claude/agent/workflow.md`).
 
 Full text: `.claude/agent/security-fixes.md` (owner's request, 2026-11-15, on #870).
 A vulnerability that is not public yet (reported through `SECURITY.md`) does
-NOT take Workflow steps 3-5: no public PR, issue or comment about it, and **no
-push to any branch of this repo**, the designated one included, before the
-advisory is published. Fix it on a local branch, run the CI checks locally
-(the advisory's private fork runs no CI; for a release-output change, the
-Linux reproducibility comparison too), `/code-review` locally, and send the
-owner a `git format-patch` for the private fork. The owner merges, releases
+NOT take Workflow steps 3-5. **Until the owner has merged the fix, nothing
+leaves the machine**: no push to any branch of this repo, the designated one
+included, and no PR, issue or comment about it. From the merge until the
+advisory is published, pushes and PRs are normal again but neutrally worded.
+Fix it on a local branch, run the CI checks locally (the advisory's private
+fork runs no CI; for a release-output change, the Linux reproducibility
+comparison too), `/code-review` locally, and send the owner a
+`git format-patch` for the private fork. The owner merges, releases
 and publishes the advisory; no tag goes on a `main` with red CI or a red
 required `reproducible builds` run.
 
