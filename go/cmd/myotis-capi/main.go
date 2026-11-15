@@ -1,5 +1,5 @@
 // Command myotis-capi is the Go engine as a c-shared library: the C ABI
-// of rust/include/myotis_engine.h (ABI 57), implemented over
+// of rust/include/myotis_engine.h (ABI 59), implemented over
 // internal/capi for JVM JNA consumers (desktop-embed step 1, part 1b).
 //
 // Every symbol the header declares is exported — functional for the
@@ -336,6 +336,19 @@ func myotis_set_ws_bound_periods(h C.int64_t, periods C.int64_t) C.bool {
 //export myotis_accept_stale_anchor
 func myotis_accept_stale_anchor(h C.int64_t) C.bool {
 	return C.bool(capi.AcceptStaleAnchor(int64(h)))
+}
+
+//export myotis_refresh_anchor_from_checkpointz
+func myotis_refresh_anchor_from_checkpointz(h C.int64_t, allowUnconfirmed C.bool) *C.char {
+	// Refused in the contract's own applied:false shape regardless of
+	// allowUnconfirmed — there is no fetch whose confirmation this could
+	// waive (engine-parity item; capabilities say so).
+	return cstr(capi.AnchorRefreshUnsupported())
+}
+
+//export myotis_set_stale_anchor_policy
+func myotis_set_stale_anchor_policy(h C.int64_t, policy C.int32_t) C.bool {
+	return C.bool(capi.SetStaleAnchorPolicy(int64(h), int32(policy)))
 }
 
 //export myotis_set_listen_ports

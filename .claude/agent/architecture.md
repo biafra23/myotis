@@ -61,8 +61,9 @@ Key Gradle modules:
   is refused, never answered from finalized state, and `eth_blockNumber` answers
   the finalized block — an open owner decision; storage positions only below
   2^64, the ABI's int64 slot — ≥2^63 crosses as two's complement, pinned by
-  test); no idle sleep, EVM, block/tx reads, ENS, broadcast or Tor yet — each
-  refused by name, not faked (the GoChainHandle class doc is the list;
+  test); no idle sleep, EVM, block/tx reads, ENS, broadcast, Tor or
+  checkpoint-anchor refresh (ABI 58/59) yet — each refused by name, not faked
+  (the GoChainHandle class doc is the list;
   JSON-string reads carry the permanent -32602 envelope, typed reads the
   retryable null). A `-Pengine=go` desktop launch runs on its own `~/.myotis-go`
   profile (the shrunken catalog would otherwise prune the shared settings'

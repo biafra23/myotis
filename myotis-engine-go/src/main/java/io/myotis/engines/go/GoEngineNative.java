@@ -58,7 +58,7 @@ final class GoEngineNative {
      *  the GO constant against the header, NOT this mirror (PR #832 round-4
      *  review): a stale copy here reads a current library as "ABI mismatch →
      *  unavailable" with every native-backed test skipping green. */
-    static final int EXPECTED_ABI_VERSION = 57;
+    static final int EXPECTED_ABI_VERSION = 59;
 
     /** {@code myotis_create} sentinel: canonical network this build does not host
      *  (the Go build: everything but mainnet, until the multichain step). Matches

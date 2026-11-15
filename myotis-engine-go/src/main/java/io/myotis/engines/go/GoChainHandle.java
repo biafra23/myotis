@@ -64,6 +64,17 @@ import java.util.List;
  *       methods explicitly: {@code null} ("cannot answer verified") on the
  *       plain reads, {@code refused(...)} on the detailed call/estimate/send
  *       channel (see its class doc for the retryable-status reasoning).</li>
+ *   <li><b>No checkpoint-anchor refresh yet (ABI 58/59).</b>
+ *       {@link #refreshAnchorFromCheckpointz} keeps the {@link ChainHandle}
+ *       default — refused by name, "not supported by this engine" — and the C
+ *       export answers the contract's own {@code applied:false} shape, so the
+ *       refusal is identical in-process and over the ABI.
+ *       {@link #setStaleAnchorPolicy} also keeps the default, which is the
+ *       honest maximum here: it maps CONTINUE onto {@link #acceptStaleAnchor}
+ *       (one-shot consent, genuinely applied) and accepts ASK, which is what a
+ *       parked Go engine already does; the REMEMBERED policy the sync loop
+ *       re-applies at every later park is an engine-parity item (the C export
+ *       accepts only ASK for exactly that reason).</li>
  * </ul>
  *
  * <p>{@link #reads()} and the loopback listener follow the Rust twin exactly:

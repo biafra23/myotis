@@ -2,7 +2,7 @@
 // part 1b): the handle table, lifecycle, and JSON plumbing that
 // cmd/myotis-capi exports as a c-shared library for JVM JNA consumers.
 //
-// The contract is rust/include/myotis_engine.h (ABI 57). The Go engine
+// The contract is rust/include/myotis_engine.h (ABI 59). The Go engine
 // is the READ engine of that contract: the lifecycle functions, the
 // account/storage verified reads, status, and the log drain are
 // FUNCTIONAL; every other exported symbol exists (so the host's
@@ -51,8 +51,11 @@ import (
 
 // MyotisABIVersion is the myotis_engine.h ABI whose subset this library
 // implements; myotis_init returns it so a host gated on the header's
-// MYOTIS_ABI_VERSION macro gates identically on Go and Rust.
-const MyotisABIVersion = 57
+// MYOTIS_ABI_VERSION macro gates identically on Go and Rust. The ABI-58/59
+// additions (checkpoint-anchor refresh, remembered stale-anchor policy) are
+// exported and honestly refused, not left unlinked (58 =
+// myotis_refresh_anchor_from_checkpointz, 59 = myotis_set_stale_anchor_policy).
+const MyotisABIVersion = 59
 
 // ReadBudget is the wall-clock cap on one blocking verified read — the
 // same ~90 s budget the Rust twin gives its reads, so a host's JNA
@@ -198,6 +201,39 @@ func Unsupported(name string) string {
 func retryableErr(msg string) string {
 	b, _ := json.Marshal(map[string]string{"error": msg})
 	return string(b)
+}
+
+// AnchorRefreshUnsupported is the refusal of
+// myotis_refresh_anchor_from_checkpointz (ABI >= 58) in the JSON shape that
+// function's own contract documents — the generic permanentErr envelope
+// carries the wrong key set for it. The one-shot consent path
+// (myotis_accept_stale_anchor) stays available; the checkpoint fetch with
+// its long-known-peer confirmation is an engine-parity item.
+func AnchorRefreshUnsupported() string {
+	b, _ := json.Marshal(map[string]any{
+		"applied": false,
+		"error": "go engine: checkpoint-anchor refresh " +
+			"(myotis_refresh_anchor_from_checkpointz) is not implemented by this " +
+			"engine; the stale anchor stays parked — myotis_accept_stale_anchor still applies",
+		"unconfirmed": false,
+	})
+	return string(b)
+}
+
+// SetStaleAnchorPolicy answers myotis_set_stale_anchor_policy (ABI >= 59):
+// the user's REMEMBERED answer, re-applied by the sync loop at every park.
+// This engine has the one-shot consent (AcceptStaleAnchor) but not the
+// remembered re-application, so per apply-or-refuse: ASK is accepted (a
+// parked-and-waiting engine IS what ASK asks for), and the two fetch-backed
+// answers are refused with false — the contract's own "not applied" — never
+// accepted and silently ignored. False for an unknown handle, as said.
+// Mapping CONTINUE onto the one-shot consent is an engine-parity item.
+func SetStaleAnchorPolicy(handle int64, policy int32) bool {
+	_, _, ok := lookup(handle)
+	if !ok {
+		return false
+	}
+	return policy == 0 // ASK only; 1 = fresh checkpoint, 2 = continue-remembered
 }
 
 // permanentErr: the -32602 shape, built by json.Marshal so a message
@@ -636,6 +672,12 @@ func capabilities() map[string]bool {
 		// Engine.AcceptStale (gates read them per check, and a parked
 		// loop restarts): these are true in the full sense.
 		"wsBoundOverride": true, "staleAnchorConsent": true,
+		// The ABI-58/59 stale-anchor additions: the checkpoint fetch
+		// (refresh_anchor_from_checkpointz) and the REMEMBERED policy
+		// the sync loop re-applies at every park are not implemented —
+		// both refused by name (applied:false / false), never faked.
+		// The one-shot consent above stays the way forward.
+		"anchorRefresh": false, "staleAnchorPolicy": false,
 		// Recorded + contract-answered, but inert while this engine
 		// never serves blocks to peers (it is the dial-only side of
 		// the split that blocks:false already declares):

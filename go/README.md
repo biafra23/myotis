@@ -199,14 +199,23 @@ zeros, marked in the struct. `myotis_set_ws_bound_periods` and
 them at every weak-subjectivity gate and a parked bootstrap
 restarts — while `myotis_set_served_block_window` records its value
 (a dial-only engine serves no blocks, so no answer depends on it;
-`capabilities` makes that explicit).
+`capabilities` makes that explicit). The ABI-58/59 additions are
+exported and REFUSED by name, not left unlinked:
+`myotis_refresh_anchor_from_checkpointz` answers the contract's own
+`{"applied":false,…}` shape (no checkpoint-fetch yet), and
+`myotis_set_stale_anchor_policy` accepts only ASK — the remembered
+re-application the sync loop would owe at every later park is not
+implemented, so the fetch-backed answers get the contract's `false`
+("not applied") rather than a silent accept (the one-shot
+`myotis_accept_stale_anchor` is the way forward, and the JVM side
+maps CONTINUE onto it via the `:myotis-api` default).
 
 ## Desktop embed (`:myotis-engine-go`, feature/go-desktop-embed part 1c)
 
 The JVM side is the `:myotis-engine-go` Gradle module: `GoEngineNative`
 (plain JNA interface mapping over this same header, lazy symbol resolution — the Go twin of
 `RustEngineNative`, same `java.library.path`→`jna.library.path` mirroring,
-same ABI-57 handshake, `myotis_string_free` after every returned string),
+the ABI-version handshake (GoAbiVersionMirrorTest pins the mirror), `myotis_string_free` after every returned string),
 and `GoMyotisEngine`/`GoChainHandle`/`GoVerifiedReads` behind the
 `:myotis-api` contract. The selector routes it via `myotis.engine=go`
 (`-Pengine=go` on the daemon/desktop run tasks only — the Settings engine
