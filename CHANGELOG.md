@@ -65,8 +65,12 @@ its trust anchors and release checks.
 ### Fixed
 
 - `myotis-node`: a use-after-free at teardown (#455, #852).
-- The JSON-RPC servers bound a request body instead of reading it whole
-  (#667, #852).
+- The loopback JSON-RPC server of the Android app, the desktop app and the
+  daemon read a request body whole, so one oversized request could exhaust
+  the memory of the app hosting the node. A body is now capped at 5 MiB (413)
+  and must arrive within 10 s (408), the limits `myotis-rpcd` already had.
+  Any local process (on Android, any app with network access) or a web origin
+  the user allowed could send it (#667, #852).
 - The light client could rotate its sync committee twice after a catch-up
   force-rotation and then refuse updates signed in the real period; fixed in
   the Java, Rust and Go engines (#737, #852).
