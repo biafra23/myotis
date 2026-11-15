@@ -64,8 +64,7 @@ var (
 	table = map[int64]*entry{}
 	next  int64
 
-	initOnce sync.Once
-	ring     = newRingHandler()
+	ring = newRingHandler()
 
 	// Process-global toggles, as the header marks them. dnsDiscovery is
 	// FIXED in the Go engine (the DNS sweep is core discovery there),
@@ -88,10 +87,14 @@ type entry struct {
 	// context.Background() outlived myotis_stop by up to the whole
 	// ReadBudget — the header asks Stop to "signal pending readers,
 	// drain registered work", which needs both the derivation and
-	// the reads waitgroup). cancel stops the LC loop too; set by
-	// Start under mu, read by Stop after removing the entry (a
-	// removed entry takes no more Start writes, so the handoff is
-	// ordered by the map delete).
+	// the reads waitgroup). cancel stops the LC loop too. Both fields
+	// are guarded by mu on EVERY access now (PR #861 round-4/5): Start
+	// writes them under mu, beginRead hands the ctx out under mu (the
+	// readers never re-read the field after the lock is gone), and
+	// Stop takes the cancel under mu before unlocking. An earlier doc
+	// said Stop read cancel after removing the entry, ordered by the
+	// map delete — that held only because nothing else wrote the field;
+	// with the Start-failure retry path it no longer did.
 	ctx     context.Context
 	cancel  context.CancelFunc
 	reads   sync.WaitGroup // reads that began while the handle lived
@@ -118,21 +121,30 @@ func lookup(handle int64) (eng *engine.Engine, started bool, ok bool) {
 // beginRead registers a blocking read against a STARTED handle under
 // mu, returning the handle's lifetime context; Stop's Wait is what
 // makes "synchronous" true. The caller must defer e.reads.Done().
-func beginRead(handle int64) (e *entry, started bool, exists bool) {
+//
+// The context is RETURNED here (PR #861 round-4 review), under the
+// same mu that guards the field: the readers must not re-read e.ctx
+// after the lock is gone. context.WithTimeout(nil) panics, nothing
+// under go/ recovers, and a retried Start writes e.ctx under mu while
+// an earlier read still holds the handle — handing the value out under
+// the lock makes both the panic and the unsynchronized interface read
+// unreachable by construction, whatever a later edit stores in the
+// field.
+func beginRead(handle int64) (e *entry, lifetime context.Context, started bool, exists bool) {
 	mu.Lock()
 	defer mu.Unlock()
 	en, found := table[handle]
 	if !found {
-		return nil, false, false
+		return nil, nil, false, false
 	}
 	if !en.started || en.ctx == nil {
 		// ctx==nil with started==true only happens for a handle a
 		// test forged; a real Start always sets both. Treating it as
 		// "not started" keeps a nil-parent panic out of the reads.
-		return nil, false, true
+		return nil, nil, false, true
 	}
 	en.reads.Add(1)
-	return en, true, true
+	return en, en.ctx, true, true
 }
 
 // classifyReadErr maps an Engine.Account failure to the contract's
@@ -160,10 +172,12 @@ func classifyReadErr(what string, err error) string {
 	return retryableErr("go engine: " + what + ": " + err.Error())
 }
 
-// Init installs the log ring and returns the ABI version — the
-// handshake myotis_engine.h prescribes before any other call.
+// Init answers the ABI-version handshake myotis_engine.h prescribes
+// before any other call. It installs nothing: the drain ring rides with
+// package load (the `ring` var above), so there is no per-Init step —
+// an empty sync.Once here once suggested one that did not exist
+// (PR #861 internal review).
 func Init() int32 {
-	initOnce.Do(func() {})
 	return MyotisABIVersion
 }
 
@@ -435,6 +449,20 @@ func Start(handle int64) bool {
 	if err := e.eng.StartNetwork(); err != nil {
 		mu.Lock()
 		e.started = false
+		// Cancel the ctx this failed attempt made (PR #861 internal
+		// review): cheap hygiene for a context the retried Start will
+		// overwrite, and it also releases whatever the WithCancel chain
+		// holds if Stop arrives before that retry. It aborts NO read —
+		// none can wait on this context, because StartLC runs only
+		// after StartNetwork succeeded and Engine.Account returns
+		// "light client not started" outright meanwhile (round-4
+		// review; an earlier comment here claimed it saved a
+		// ReadBudget). Not clearing e.ctx/e.cancel: nothing reads them
+		// unlocked any more (beginRead hands the lifetime ctx out
+		// under mu), and Stop's `cancel != nil` stays meaningful.
+		if e.cancel != nil {
+			e.cancel()
+		}
 		mu.Unlock()
 		return false
 	}
@@ -448,13 +476,28 @@ func Start(handle int64) bool {
 func Stop(handle int64) {
 	mu.Lock()
 	e, ok := table[handle]
-	delete(table, handle)
+	var cancel context.CancelFunc
+	if ok {
+		// Take the cancel under mu (PR #861 round-4 review): the entry
+		// doc promises every field except eng is mu-guarded, and this
+		// used to read e.cancel after unlocking. Deleting the entry
+		// first means no later Start can write it; a second Stop finds
+		// no entry and returns before this point. Nil-ing the field
+		// serves the one real interleaving: a Start still inside
+		// StartNetwork when Stop runs reaches its failure path after
+		// the delete, sees nil, and skips cancelling an already-
+		// cancelled ctx (idempotent anyway, but the nil makes the
+		// handoff explicit at the reads of e.cancel).
+		cancel = e.cancel
+		e.cancel = nil
+		delete(table, handle)
+	}
 	mu.Unlock()
 	if !ok {
 		return
 	}
-	if e.cancel != nil {
-		e.cancel() // signals readers (their ctx derives from the handle's) AND the LC loop
+	if cancel != nil {
+		cancel() // signals readers (their ctx derives from the handle's) AND the LC loop
 	}
 	e.reads.Wait() // "drain registered work" — synchronous means the JNA threads are out
 	e.eng.Close()
@@ -639,7 +682,7 @@ func RequestAccountJSON(handle int64, address, block string) string {
 	if msg, refused := accountBlockErr(block); refused {
 		return msg
 	}
-	e, started, exists := beginRead(handle)
+	e, lifetime, started, exists := beginRead(handle)
 	if !exists {
 		return retryableErr("go engine: unknown handle")
 	}
@@ -647,7 +690,7 @@ func RequestAccountJSON(handle int64, address, block string) string {
 		return retryableErr("go engine: handle not started (myotis_start)")
 	}
 	defer e.reads.Done()
-	ctx, cancel := context.WithTimeout(e.ctx, ReadBudget)
+	ctx, cancel := context.WithTimeout(lifetime, ReadBudget)
 	defer cancel()
 	rd, err := e.eng.Account(ctx, address, [32]byte{}, false)
 	if err != nil {
@@ -709,7 +752,7 @@ func GetStorageProofJSON(handle int64, address string, slot int64, holder string
 	}
 	// Request-shape faults are refused before the handle lookup (the
 	// twin's ordering); handle-state faults stay retryable.
-	e, started, exists := beginRead(handle)
+	e, lifetime, started, exists := beginRead(handle)
 	if !exists {
 		return retryableErr("go engine: unknown handle")
 	}
@@ -717,7 +760,7 @@ func GetStorageProofJSON(handle int64, address string, slot int64, holder string
 		return retryableErr("go engine: handle not started (myotis_start)")
 	}
 	defer e.reads.Done()
-	ctx, cancel := context.WithTimeout(e.ctx, ReadBudget)
+	ctx, cancel := context.WithTimeout(lifetime, ReadBudget)
 	defer cancel()
 	rd, err := e.eng.Account(ctx, address, key, true)
 	if err != nil {

@@ -133,9 +133,29 @@ public final class GoMyotisEngine implements MyotisEngine {
         }
     }
 
+    /** Engine-level twin of {@code GoChainHandle.linked()}: JNA's INTERFACE
+     *  mapping resolves symbols LAZILY per call, so a stale libmyotis_engine_go
+     *  (one that clears the ABI handshake but lacks an export — a hand-swap of
+     *  the .so) surfaces as UnsatisfiedLinkError at whichever native call runs
+     *  next. The selector wraps {@link #create}'s LinkageError, but
+     *  {@code availableNetworks}/{@code canonicalNetworkName}/metering route
+     *  through {@code resolve()}/{@code setNetworkMetering} which do NOT, so
+     *  without this a missing catalog symbol would take the host down instead
+     *  of surfacing as the documented {@link EngineException} (PR #861 round-5
+     *  review — the promise the handle's wrapper set, extended to the engine's
+     *  own calls). */
+    private <T> T linked(java.util.function.Supplier<T> nativeCall) {
+        try {
+            return nativeCall.get();
+        } catch (LinkageError e) {
+            throw new EngineException("the Go engine failed to link on a call "
+                    + "(stale libmyotis_engine_go? rebuild it via goBuildCShared): " + e, e);
+        }
+    }
+
     @Override
     public List<NetworkInfo> availableNetworks() {
-        String json = GoEngineNative.nativeAvailableNetworksJson();
+        String json = linked(GoEngineNative::nativeAvailableNetworksJson);
         if (json == null) throw new EngineException("Go engine returned no network catalog");
         return parseNetworks(json);
     }
@@ -169,7 +189,7 @@ public final class GoMyotisEngine implements MyotisEngine {
     @Override
     public String canonicalNetworkName(String nameOrAlias) {
         if (nameOrAlias == null) throw new EngineException("network name is required");
-        String canonical = GoEngineNative.nativeCanonicalNetworkName(nameOrAlias);
+        String canonical = linked(() -> GoEngineNative.nativeCanonicalNetworkName(nameOrAlias));
         if (canonical == null) {
             // Same message shape as the Java/Rust engines (the Go catalog table
             // mirrors catalog.rs: these four names + the gbc/xdai aliases).
@@ -293,14 +313,14 @@ public final class GoMyotisEngine implements MyotisEngine {
             case UNMETERED -> 1;
             case METERED -> 2;
         };
-        if (!GoEngineNative.nativeSetNetworkMetering(code)) {
+        if (!linked(() -> GoEngineNative.nativeSetNetworkMetering(code))) {
             throw new EngineException("the Go engine refused network metering " + metering);
         }
     }
 
     @Override
     public NetworkMetering networkMetering() {
-        return meteringOf(GoEngineNative.nativeNetworkMetering());
+        return meteringOf(linked(GoEngineNative::nativeNetworkMetering));
     }
 
     /** A native metering code → the API enum; unknown reads as UNKNOWN (display-only). */

@@ -80,17 +80,27 @@ public final class SelectorEngine implements MyotisEngine {
                 // is the shared port (it lives in :myotis-engine-common precisely
                 // so the Go engine needs no dependency on the Rust module).
                 if (go == null) {
-                    go = new GoMyotisEngine(KtorLoopbackRpc::new);
+                    GoMyotisEngine fresh = new GoMyotisEngine(KtorLoopbackRpc::new);
                     // Built LATE (a metering push never builds it — see
                     // setNetworkMetering): seed the device's current metering
                     // before this engine's first network counts a byte, or the
                     // first Go-hosted network would run under the default.
+                    // The whole seed-and-publish runs under THIS monitor, and
+                    // setNetworkMetering takes it too (PR #832 round-5 +
+                    // follow-up review): either the push completes first and
+                    // the seed reads the NEW java value, or this section
+                    // completes first and the push sees the published engine.
+                    // Seed BEFORE publish as well — with the monitor both
+                    // orders are safe, and it keeps a later reader that skips
+                    // the monitor from ever seeing a published-but-unseeded
+                    // engine.
                     try {
-                        go.setNetworkMetering(java.networkMetering());
+                        fresh.setNetworkMetering(java.networkMetering());
                     } catch (RuntimeException | LinkageError e) {
                         log.warn("[engines] could not seed the Go engine's metering "
                                 + "({}); it keeps the library default", e.toString());
                     }
+                    go = fresh;
                 }
                 g = go;
             }
@@ -326,14 +336,46 @@ public final class SelectorEngine implements MyotisEngine {
      *  only on a change retries. Go is pushed only when ALREADY built —
      *  probing/building it here would map libmyotis_engine_go on hosts whose
      *  choice never routes to it (PR #832 review); a Go engine built later is
-     *  seeded with this value by {@link #goEngine()}. */
+     *  seeded with this value by {@link #goEngine()}. The WHOLE push — Rust,
+     *  Go-read, Java-write — runs under {@code goEngine()}'s monitor (PR #832
+     *  round-5 follow-up review + its round-2 follow-up): without it on the
+     *  Go side, a push arriving mid-build read {@code go == null}, skipped
+     *  Go, and landed in Java AFTER the seed had read Java — leaving Go on the
+     *  OLD value while {@link #networkMetering()} reported the NEW one,
+     *  unretried by a host that pushes only on a change. The Rust write lives
+     *  in here too (round-2 follow-up): with it outside, two overlapping
+     *  pushes could interleave their Rust writes against each other's Java
+     *  writes and leave Rust on the OLDER reading while
+     *  {@link #networkMetering()} reports the newer one — the same
+     *  unretried-stale state, on the engine Android runs by default (the
+     *  interleaving predates this PR; the lock had widened its window). One
+     *  push, one step, all three engines. The monitor is also the one
+     *  {@link #create} holds (a {@code synchronized} method), so a push can
+     *  wait behind an in-flight network create — or behind an in-flight Go
+     *  construction (native load) — which is fine for the threads involved:
+     *  pushes ride the host's query pool, creates its boot workers, and
+     *  creates hold this lock only for their fast bookkeeping (the slow
+     *  start() is the host's call, not this method's).
+     *
+     *  <p>What the lock guarantees, exactly (PR #861 round-4 review): the
+     *  engines always AGREE WITH EACH OTHER — every engine present at a
+     *  push ends on that push's value, never on a mix. It does NOT order
+     *  two concurrent pushes by how fresh their reading is: the host reads
+     *  the device's state BEFORE arriving here, so the older reading can
+     *  still win the lock last and land last — on every engine at once.
+     *  That case self-heals at the next connectivity callback, because
+     *  {@link #networkMetering()} then differs from the device again; the
+     *  fix for true recency ordering would be a monotonic push sequence
+     *  through {@code :myotis-api}, not more locking here. */
     @Override
     public void setNetworkMetering(NetworkMetering metering) {
         if (metering == null) throw new EngineException("metering is required");
-        if (RustMyotisEngine.isAvailable()) rustEngine().setNetworkMetering(metering);
-        GoMyotisEngine g = go;
-        if (g != null) g.setNetworkMetering(metering);
-        java.setNetworkMetering(metering);
+        synchronized (this) { // the monitor goEngine() seeds under and create() holds
+            if (RustMyotisEngine.isAvailable()) rustEngine().setNetworkMetering(metering);
+            GoMyotisEngine g = go;
+            if (g != null) g.setNetworkMetering(metering);
+            java.setNetworkMetering(metering);
+        }
     }
 
     @Override
