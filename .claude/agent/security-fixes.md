@@ -71,12 +71,27 @@ again (steps 7 to 9 need them), but every one of them stays neutral:
    - **Reproducibility.** If the fix can change what a release build
      produces (`.claude/agent/reproducibility.md`), the rule "no merge into
      `main` may break reproducibility" still binds the advisory merge. The
-     workflow cannot run before it, so build the Linux artifacts twice in the
-     builder image (`docker/builder/run.sh -- scripts/repro/build_linux.sh`,
-     from two checkouts at different paths) and compare them with
-     `scripts/repro/compare.py`. The macOS and Windows legs cannot run in
-     private: name them as not run. Merging without them is the owner's
-     decision, made before the merge, never assumed.
+     workflow cannot run before it, so run its Linux comparison by hand, as
+     its *Build* and *Collect* steps do (`reproducible-builds.yml`):
+     1. `docker/builder/pull.sh`, then `docker/builder/check.sh`: `run.sh`
+        builds only in the pinned image.
+     2. Two checkouts at different paths. Build each with
+        `docker/builder/run.sh … -- scripts/repro/build_linux.sh`, giving each
+        its own `--home`, `--cargo-home` and `--gradle-home`. Leg b also gets
+        leg b's other user, user name, time zone, locale and umask: take the
+        values from `scripts/repro/setup_leg.sh`, which itself runs only in
+        GitHub Actions, and chown leg b's checkout and homes to its uid as
+        that script does. Without them the two builds differ in their path
+        alone.
+     3. `scripts/repro/collect.sh linux <checkout> <out>` on each, so a
+        missing artifact fails instead of comparing as identical.
+     4. `scripts/repro/compare.py <out-a> <out-b> <report-dir>
+        scripts/repro/known-differences.txt`.
+
+     The report names each way leg b did not differ from leg a, if any. The
+     macOS and Windows legs cannot run in private: name them as not run.
+     Merging without them is the owner's decision, made before the merge,
+     never assumed.
    - What needs macOS or Windows (the iOS framework, the dmg, the msi): name
      it as not run unless the session is on one.
 4. **Review** the diff with `/code-review`, locally (never `--comment`), and
