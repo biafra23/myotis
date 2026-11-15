@@ -17,6 +17,11 @@ asset workflow and a stronger action than the merge this file already forbids.
 (v0.1.12 is the one exception to the one-PR rule: #484 carried steps 1–3 and
 #485 the bump and this rule. From v0.1.13 on, one PR.)
 
+Ask the owner too whether any merge since the last tag is an embargoed
+security fix: the release PR and the release notes then stay neutral until
+the advisory is published (`security-fixes.md`, steps 8 and 9; owner's
+request, 2026-11-15, on #870).
+
 1. **Refresh the trust checkpoints?** The embedded checkpoints (`@checkpoint:*`
    blocks in `NetworkConfig.java`, mirrored in `rust/myotis-net/src/sync.rs`;
    `./gradlew refreshCheckpoint -Pnetwork=<net>` writes both engines from one
