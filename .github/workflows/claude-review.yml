@@ -61,12 +61,14 @@
 #   does an Opus attempt that ends cleanly having posted nothing (#523): it
 #   still fails the job, as before. An attempt that failed after posting
 #   suppresses every later one, at each tier, for the same duplicate-review
-#   reason as above. The API attempt also passes `--fallback-model opus`,
-#   for the case that flag does cover: Fable overloaded or not available on
-#   the API. Billing on the API has no usage limit, only spend, so that
-#   attempt is capped per review (`--max-budget-usd`, and the job's
-#   `timeout-minutes`); lower its `--effort` or put `opus` in its `--model`
-#   to spend less. Three attempts in a row can outlast the builds' gate
+#   reason as above. The API attempt is the newest Fable and nothing else
+#   (owner's requirement, 2026-11-15: it is the review that counts while the
+#   owner works with an open-weights model, the subscription spent). So it
+#   has no `--fallback-model`, which would answer an overloaded Fable with
+#   Opus, and a step after it fails the job when the transcript names any
+#   other model; an overloaded Fable fails the job, re-run it. Billing on the
+#   API has no usage limit, only spend, so that attempt is capped per review
+#   (`--max-budget-usd`, and the job's `timeout-minutes`). Three attempts in a row can outlast the builds' gate
 #   (wait-for-claude-review.yml), which gives up after an hour: the builds
 #   may then start before the paid review is posted, fail-open as ever.
 #
@@ -604,9 +606,9 @@ jobs:
         run: echo "at=$(date -u -d '-2 seconds' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       # The same Fable alias as the review job's attempt (see there), billed
-      # to the API key instead of the subscription. `--fallback-model opus`
-      # covers Fable overloaded or not available on the API; it never sees a
-      # usage limit here, which API billing does not have.
+      # to the API key instead of the subscription: the newest Fable, with no
+      # fallback model (see Model strategy). Keep it that way: no
+      # --fallback-model here, and no ANTHROPIC_DEFAULT_FABLE_MODEL anywhere.
       - name: Review (latest Fable — API credits)
         id: api
         uses: anthropics/claude-code-action@v1
@@ -615,7 +617,6 @@ jobs:
           prompt: ${{ needs.review.outputs.prompt }}
           claude_args: |
             --model fable
-            --fallback-model opus
             --effort max
             --max-budget-usd 15
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
@@ -635,6 +636,26 @@ jobs:
           # The text is the model's: the prefix keeps every line of it from
           # acting as a workflow command (::…::) or a log marker (##[…]).
           jq -r "$REPORT_JQ" "$EXECUTION_FILE" 2>&1 | sed 's/^/| /'
+
+      # The newest Fable or no review (see Model strategy): every model the
+      # transcript names, at start-up and per answer, must be a Fable. A
+      # catalog that resolved `fable` to something else, or a fallback model
+      # added later, turns the job red instead of passing for a Fable review.
+      - name: Was it Fable?
+        if: ${{ !cancelled() && steps.api.outputs.execution_file != '' }}
+        env:
+          EXECUTION_FILE: ${{ steps.api.outputs.execution_file }}
+        run: |
+          set -euo pipefail
+          [ -f "$EXECUTION_FILE" ] || { echo "::error::No transcript at '$EXECUTION_FILE', so the model is unknown."; exit 1; }
+          models=$(jq -r '[.[] | (select(.type == "system" and .subtype == "init") | .model),
+            (select(.type == "assistant") | .message.model)] | map(select(. != null and . != "<synthetic>")) | unique | .[]' "$EXECUTION_FILE")
+          echo "Models in the transcript: ${models:-none}"
+          [ -n "$models" ] || { echo "::error::The transcript names no model, so this cannot be shown to be a Fable review."; exit 1; }
+          if printf '%s\n' "$models" | grep -qv '^claude-fable-'; then
+            echo "::error::The API-credit review was not Fable alone: $(echo $models). It must be the newest Fable (see Model strategy in this workflow)."
+            exit 1
+          fi
 
       # The last attempt must have left a review. A failed one already fails
       # the job (this step is then skipped); this catches one that ended
