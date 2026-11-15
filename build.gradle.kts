@@ -39,7 +39,7 @@ plugins {
 
 allprojects {
     group = "com.jaeckel.ethp2p"
-    version = "0.1.20-SNAPSHOT"
+    version = "0.1.21-SNAPSHOT"
 
     // === Reproducible archives (#734, Part 4) ================================
     // Every Gradle archive — jars, the AAR bundle, the natives jars, sources
