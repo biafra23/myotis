@@ -5,9 +5,15 @@
 #   1. Install the Claude GitHub App on this repo (github.com/apps/claude, or
 #      run /install-github-app from the Claude Code CLI).
 #   2. Add the CLAUDE_CODE_OAUTH_TOKEN repo secret (from `claude setup-token`) —
-#      reviews bill the Claude subscription and share its usage limits. To bill
-#      API credits instead, swap the input below for
-#      anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}.
+#      the first two attempts bill the Claude subscription and share its usage
+#      limits.
+#   3. Add the ANTHROPIC_API_KEY repo secret (an Anthropic Console API key) —
+#      only the third attempt uses it, once the subscription is exhausted (see
+#      Model strategy), and it bills API credits. Without it that attempt fails
+#      with an error naming the missing secret; the first two are unaffected.
+#      Give it a spend limit in the Console (a workspace of its own with a
+#      monthly limit): any branch that edits a workflow can run it (see Scope
+#      decisions), and unlike the OAuth token nothing else caps what it spends.
 #
 # Model strategy — latest Fable first, latest Opus when its limit is exhausted:
 #   Usage limits are PER MODEL, so an exhausted Fable limit leaves Opus
@@ -43,7 +49,37 @@
 #   the same way. After each attempt, a step prints what it was refused and
 #   how it ended, so a silent attempt explains itself.
 #
-#   NOT --fallback-model: that flag only covers "overloaded or not available".
+#   Subscription first, API credits last (owner's decision, 2026-11-15):
+#   with Fable's limit spent but Opus's not, the review is Opus on the
+#   subscription, not paid Fable, so the credits are still there once the
+#   whole subscription is spent. When the subscription's own limit
+#   (the 5-hour or weekly one every model shares) is spent, the Opus attempt
+#   is rejected too, and a third attempt (the `api` job) runs latest Fable
+#   billed to ANTHROPIC_API_KEY instead. It runs only when the Opus attempt
+#   FAILED, left nothing, and its transcript names a usage limit ("hit your
+#   limit", "usage limit", a 429 rate_limit_error). Any other failure (an
+#   expired or revoked OAuth token, an action error, a timeout) fails the job
+#   instead: a paid retry would likely end the same way, and an expired token
+#   must show as a red check, not move every review onto API credits. Nor
+#   does an Opus attempt that ends cleanly having posted nothing (#523): it
+#   still fails the job, as before. An attempt that failed after posting
+#   suppresses every later one, at each tier, for the same duplicate-review
+#   reason as above. The API attempt is the newest Fable and nothing else
+#   (owner's requirement, 2026-11-15: it is the review that counts while the
+#   owner works with an open-weights model, the subscription spent). So it
+#   has no `--fallback-model`, which would answer an overloaded Fable with
+#   Opus, and a step after it fails the job when the transcript names any
+#   other model; an overloaded Fable fails the job, re-run it. Billing on the
+#   API has no usage limit, only spend, so that attempt runs at `--effort
+#   high`, not the subscription attempts' `max` (owner's decision,
+#   2026-11-15: Anthropic's starting point for Fable 5.2, whose gains above
+#   it are uneven), and is capped per review (`--max-budget-usd`, and the
+#   job's `timeout-minutes`). Three attempts in a row can outlast the builds' gate
+#   (wait-for-claude-review.yml), which gives up after an hour: the builds
+#   may then start before the paid review is posted, fail-open as ever.
+#
+#   NOT --fallback-model for usage limits: that flag only covers "overloaded
+#   or not available".
 #   Verified against a live exhausted limit — it falls back correctly from a
 #   retired model, but a usage-limit rejection does not trigger it.
 #
@@ -54,8 +90,11 @@
 #     replays the ORIGINAL commit and workflow file, so it cannot pick up a
 #     workflow change; close/reopen is the way to get a fresh one.
 #   - Drafts are skipped until marked ready.
-#   - Fork PRs are skipped: `pull_request` runs from forks get no secrets, so
-#     the job could only fail there. Same-repo PRs are the review target.
+#   - Fork PRs are skipped (owner's decision, 2026-08-15): a fork's tree is
+#     attacker-controlled, and they are reviewed by hand. On
+#     `pull_request_target` the job `if:` is also what keeps the repository's
+#     secrets from a fork's run, which this event would otherwise get. Same-
+#     repo PRs are the review target.
 #   - Runs Dependabot starts are skipped (owner's decision, 2026-11-12): the
 #     action refuses a bot actor unless it is in `allowed_bots`, and such a
 #     run gets only Dependabot secrets, so CLAUDE_CODE_OAUTH_TOKEN would have
@@ -67,33 +106,46 @@
 #   - Where the reviewer's instructions come from. A same-repo branch is not
 #     necessarily trusted (a prompt-injected Claude Code session can push one
 #     and open a PR from it), so the prompt file is read from the PR's base
-#     commit, never from its checkout (see "Assemble review prompt"), and
-#     claude-code-action restores the root CLAUDE.md, CLAUDE.local.md and
-#     .claude/ from the base branch's tip (its docs/security.md). Limits:
+#     commit, never from its tree (see "Assemble review prompt"), and the
+#     working directory, where Claude Code reads CLAUDE.md and .claude/, is
+#     the base branch's tip (claude-code-action also restores those from the
+#     base, its docs/security.md). Limits:
 #     * Whoever opens the PR picks its base. Only a PR into main is held to
 #       main's prompt and config; one into another branch — which that same
 #       session can push — gets that branch's.
-#     * CLAUDE.md, CLAUDE.local.md and .claude/rules/ in a subdirectory are
-#       not restored, and Claude Code loads them once the reviewer reads a
-#       file there. That includes .claude-pr/, where the action keeps the
-#       PR's own copies of the root files.
+#     * The PR's own CLAUDE.md, CLAUDE.local.md and .claude/ files, at any
+#       depth, are removed from its checkout (see the job's steps), so none
+#       is loaded when the reviewer reads a file next to one.
 #     * The diff, title and description are the PR author's text regardless.
+#     * This workflow runs on `pull_request_target`, so GitHub runs the
+#       base branch's copy of THIS file, never the PR's (owner's request,
+#       2026-11-15): a PR cannot change how it is itself reviewed. The
+#       working directory is the base branch too, where Claude Code reads
+#       its rules; the PR's files are checked out for reading only, outside
+#       it, with every CLAUDE.md, CLAUDE.local.md, .claude/, .mcp.json and
+#       .claude.json removed, and passed with --add-dir (the pattern in
+#       claude-code-action's docs/security.md). Nothing here runs the PR's
+#       code. The fork test in the job `if:` matters more on this event: a
+#       `pull_request_target` run gets the repository's secrets even for a
+#       fork's PR.
 #     * None of this binds an author who can push workflow changes: a
-#       same-repo PR runs its own copy of this file, with the repo's secrets.
-#   - A PR that edits THIS FILE cannot review itself: the action requires the
-#     workflow to match the default branch and skips, and the job still goes
-#     green, with a warning that there is no review. The same skip hits any
-#     branch whose copy differs from the default branch's, such as a feature
-#     branch that has not merged a change to this file; the warning shows
-#     only where that copy carries this check. The steps before the action do
-#     run from the PR's copy, so a broken prompt step shows up there, and so
-#     does the check after it, which takes its skip branch. The review itself,
-#     the comment counts, the fallback job and the steps that fail a job are
-#     only exercised once merged to main.
+#       same-repo PR can add a workflow of its own that runs on
+#       `pull_request`, with the repository's secrets.
+#   - A PR that edits THIS FILE is reviewed by the base branch's copy, like
+#     any other PR; its own changes to it take effect, and are first
+#     exercised, once merged. The action does need the copy that runs to
+#     match the default branch's: Anthropic's token exchange refuses the
+#     Claude App's token otherwise, and the action skips, and the job still
+#     goes green, with a warning that there is no review. On this event that
+#     happens only where the PR's base branch lags the default branch on
+#     this file, such as a feature branch that has not merged a change to
+#     it.
 name: claude-review
 
+# pull_request_target: the base branch's copy of this file runs, never the
+# PR's (see "Where the reviewer's instructions come from" above).
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, reopened, ready_for_review]
 
 # One review at a time per PR: the checks below credit this run with what the
@@ -156,26 +208,61 @@ jobs:
       fallback: ${{ steps.unposted.outputs.safe }}
       prompt: ${{ steps.prompt.outputs.text }}
     steps:
+      # The base branch: the working directory, where Claude Code reads its
+      # rules (pull_request_target checks it out by default). No token is
+      # left in its .git/config, where the reviewer could read it: the repo
+      # is public, so the fetches below need none, and the action sets up its
+      # own.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          persist-credentials: false
+
+      # The PR's files, for reading only, outside the working directory and
+      # without any file Claude Code would take instructions or config from
+      # (see "Where the reviewer's instructions come from" above). The
+      # reviewer sees the PR's changes to those files in `gh pr diff`. Keep
+      # the three jobs' copies of these two steps identical. The prompt names
+      # this path as the review job resolved it, and the fallback and api
+      # jobs pass their own to --add-dir: the same while all three run on
+      # the same `runs-on`.
+      - name: Check out the PR's files
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-head
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Move the PR's files out of the working directory
+        run: |
+          set -euo pipefail
+          mv pr-head "$RUNNER_TEMP/pr-head"
+          # A symlink could point the reviewer at a file outside the PR's
+          # tree (/proc/self/environ, the base checkout): none is kept.
+          find "$RUNNER_TEMP/pr-head" -type l -delete
+          find "$RUNNER_TEMP/pr-head" \( -name CLAUDE.md -o -name CLAUDE.local.md -o -name .claude \
+            -o -name .mcp.json -o -name .claude.json \) -prune -exec rm -rf {} +
 
       # Both attempts send the identical prompt, so it lives in one file and is
       # assembled once here; the fallback job receives it through this job's
       # outputs.
       #
       # The file comes from the base commit GitHub recorded for the PR
-      # (pull_request.base.sha), never from the checkout, which is the PR's own
-      # tree (see "Where the reviewer's instructions come from" above). A PR
-      # that edits the prompt is therefore reviewed with the base version until
-      # it is merged — intended. The recorded base can be older than the base
-      # the checkout was merged onto (GitHub keeps it across plain pushes and
-      # ready_for_review), and a re-run replays it.
+      # (pull_request.base.sha), never from the PR's tree (see "Where the
+      # reviewer's instructions come from" above). A PR that edits the prompt
+      # is therefore reviewed with the base version until it is merged —
+      # intended. The recorded base can be older than the base branch's tip
+      # this run checked out (GitHub keeps it across plain pushes and
+      # ready_for_review), and a re-run replays it. Where the PR's files are
+      # is appended here, by this workflow, so that it always matches the
+      # checkout steps above whatever that prompt file says.
       - name: Assemble review prompt
         id: prompt
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           prompt_path=.github/claude-review-prompt.md
@@ -184,8 +271,8 @@ jobs:
           # ":<path>" — the index, i.e. the PR's own copy.
           [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] \
             || { echo "::error::Unexpected base SHA: '$BASE_SHA'"; exit 1; }
-          # The checkout is a depth-1 clone of the merge commit, which does not
-          # include the base commit itself.
+          # The checkout is a depth-1 clone of the base branch's tip, which
+          # need not include the recorded base commit.
           git fetch --no-tags --no-recurse-submodules --depth=1 origin "$BASE_SHA"
           # Only a regular file is a prompt: for a symlink or a directory,
           # `git show` prints the link text or a listing and exits 0.
@@ -201,11 +288,22 @@ jobs:
             echo "PR NUMBER: $PR_NUMBER"
             echo
             printf '%s\n' "$prompt"
+            echo
+            echo "CHECKOUT (this overrides anything above about where the code is):"
+            echo "- The working directory is the base branch ($BASE_REF). Its CLAUDE.md"
+            echo "  and .claude/agent/ files are the rules to hold the PR against."
+            echo "- The PR's own files (head $HEAD_SHA) are in $RUNNER_TEMP/pr-head."
+            echo "  Read the code under review there. Its CLAUDE.md, CLAUDE.local.md,"
+            echo "  .claude/, .mcp.json and .claude.json files were removed: read the"
+            echo "  PR's changes to those in \`gh pr diff\`."
+            echo "- Inline comments take paths relative to the repository root, as"
+            echo "  \`gh pr diff\` shows them, never with the $RUNNER_TEMP/pr-head prefix."
             echo 'CLAUDE_PROMPT_EOF'
           } >> "$GITHUB_OUTPUT"
 
-      # Whether this run's copy of this file is the default branch's. When it
-      # is not, the action skips without starting Claude (see Scope
+      # Whether this run's copy of this file — the base branch's, checked out
+      # here — is the default branch's. When it is not, the action skips
+      # without starting Claude (see Scope
       # decisions), and the check after the first attempt has to tell that
       # skip from an attempt that left nothing. Asked here, before the action
       # runs: the action points origin at its app token and revokes the token
@@ -253,6 +351,7 @@ jobs:
           claude_args: |
             --model fable
             --effort max
+            --add-dir ${{ runner.temp }}/pr-head
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
       # What the attempt was refused, and how it ended. The action keeps the
@@ -263,7 +362,7 @@ jobs:
       # (see env above), the refused calls cut to 200 characters and the final
       # message to 2000. Only a report: it never stops the job, or a broken
       # report would skip the check below and with it the fallback. The
-      # fallback job's copy of this step must stay identical.
+      # fallback and api jobs' copies of this step must stay identical.
       - name: What the first attempt was refused, and how it ended
         continue-on-error: true
         env:
@@ -317,9 +416,10 @@ jobs:
           # the app's, and no other workflow here comments on PRs. Each listing
           # is assigned on its own, never inside an echo or an arithmetic
           # expansion, where a failed gh api would still exit 0. The fallback
-          # job's "Fail when no review was posted" carries the same function: a
-          # helper shared by the two would come from the PR's own checkout or
-          # escape actionlint's shellcheck, so keep the two copies identical.
+          # job's "Did the fallback leave a review?" and the api job's "Fail
+          # when no review was posted" carry the same function: a helper shared
+          # by the three would come from the PR's own checkout or escape
+          # actionlint's shellcheck, so keep the three copies identical.
           count() {
             local query="since=$SINCE&per_page=100" try summaries inlines
             local by_reviewer=".[] | select(.user.login == \"$REVIEWER_LOGIN\" and .updated_at >= \"$SINCE\") | .id"
@@ -375,11 +475,10 @@ jobs:
   # one job share state that the action never resets between them: its buffer
   # of unconfirmed inline comments (/tmp/inline-comments-buffer.jsonl, which
   # its post-session step reads and never clears, so a second run would post
-  # the first one's leftovers), and the working tree, where the first run has
-  # already swapped the base branch's CLAUDE.md and .claude/ in, so the second
-  # one's .claude-pr/ snapshot of the PR's copies would hold the base's. A
-  # fresh runner and checkout start the fallback where the first attempt
-  # started.
+  # the first one's leftovers), and the working tree, which the first run has
+  # already rewritten (it restores the base's CLAUDE.md and .claude/ and
+  # keeps copies under .claude-pr/). A fresh runner and checkout start the
+  # fallback where the first attempt started.
   #
   # While this job waits for a runner, the run counts as in progress, so the
   # builds' gate (wait-for-claude-review.yml) waits too: its 5-minute escape
@@ -396,10 +495,44 @@ jobs:
       contents: read
       pull-requests: write
       id-token: write
+    # What the api job needs from this one.
+    outputs:
+      api: ${{ steps.unposted.outputs.api }}
     steps:
+      # The base branch: the working directory, where Claude Code reads its
+      # rules (pull_request_target checks it out by default). No token is
+      # left in its .git/config, where the reviewer could read it: the repo
+      # is public, so the fetches below need none, and the action sets up its
+      # own.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          persist-credentials: false
+
+      # The PR's files, for reading only, outside the working directory and
+      # without any file Claude Code would take instructions or config from
+      # (see "Where the reviewer's instructions come from" above). The
+      # reviewer sees the PR's changes to those files in `gh pr diff`. Keep
+      # the three jobs' copies of these two steps identical. The prompt names
+      # this path as the review job resolved it, and the fallback and api
+      # jobs pass their own to --add-dir: the same while all three run on
+      # the same `runs-on`.
+      - name: Check out the PR's files
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-head
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Move the PR's files out of the working directory
+        run: |
+          set -euo pipefail
+          mv pr-head "$RUNNER_TEMP/pr-head"
+          # A symlink could point the reviewer at a file outside the PR's
+          # tree (/proc/self/environ, the base checkout): none is kept.
+          find "$RUNNER_TEMP/pr-head" -type l -delete
+          find "$RUNNER_TEMP/pr-head" \( -name CLAUDE.md -o -name CLAUDE.local.md -o -name .claude \
+            -o -name .mcp.json -o -name .claude.json \) -prune -exec rm -rf {} +
 
       # As in the review job, but this job's own start: the review job's
       # would credit a re-run of this job with what an earlier run posted.
@@ -418,8 +551,11 @@ jobs:
       # 2026-09-25 with action v1.0.234 / Claude Code 2.1.282: `opus` resolves
       # to claude-opus-5-5; each run's "Claude Code initialized" log line names
       # the model it got. To pin one Opus instead, put its full ID here.
+      # continue-on-error so an exhausted subscription falls through to the
+      # api job instead of failing this one.
       - name: Review (latest Opus — Fable left no review)
         id: opus
+        continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -427,12 +563,11 @@ jobs:
           claude_args: |
             --model opus
             --effort max
+            --add-dir ${{ runner.temp }}/pr-head
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
-      # The review job's report, for this attempt; keep the two identical.
-      # It runs after a failed attempt too, which the check below does not.
+      # The review job's report, for this attempt; keep the copies identical.
       - name: What the fallback was refused, and how it ended
-        if: ${{ !cancelled() }}
         continue-on-error: true
         env:
           EXECUTION_FILE: ${{ steps.opus.outputs.execution_file }}
@@ -445,7 +580,230 @@ jobs:
           # acting as a workflow command (::…::) or a log marker (##[…]).
           jq -r "$REPORT_JQ" "$EXECUTION_FILE" 2>&1 | sed 's/^/| /'
 
-      # The fallback must have left a review. A failed fallback already fails
+      # Whether the fallback left a review. A clean attempt that left nothing
+      # fails the job here, as before: it is not an exhausted subscription
+      # (see Model strategy). A FAILED attempt that left nothing is how an
+      # exhausted subscription looks, and hands over to the api job. A failed
+      # attempt that posted is caught by the step after this one.
+      - name: Did the fallback leave a review?
+        id: unposted
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SINCE: ${{ steps.start.outputs.at }}
+          OUTCOME: ${{ steps.opus.outcome }}
+          CLAUDE_SESSION: ${{ steps.opus.outputs.session_id }}
+          EXECUTION_FILE: ${{ steps.opus.outputs.execution_file }}
+        run: |
+          set -euo pipefail
+          [[ "$SINCE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+            || { echo "::error::Unexpected start time: '$SINCE'"; exit 1; }
+          # The same count as "Did the first attempt leave a review?" in the
+          # review job; keep the three copies identical. Anything since this
+          # job's start is the fallback's.
+          count() {
+            local query="since=$SINCE&per_page=100" try summaries inlines
+            local by_reviewer=".[] | select(.user.login == \"$REVIEWER_LOGIN\" and .updated_at >= \"$SINCE\") | .id"
+            local by_action=".[] | select((.user.login == \"$REVIEWER_LOGIN\" or .user.login == \"github-actions[bot]\") and .updated_at >= \"$SINCE\") | .id"
+            for try in 1 2 3; do
+              [ "$try" -eq 1 ] || sleep $((try * 10))
+              summaries=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?$query" --jq "$by_reviewer" | wc -l) || continue
+              inlines=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/comments?$query" --jq "$by_action" | wc -l) || continue
+              echo $((summaries + inlines))
+              return 0
+            done
+            return 1
+          }
+          counted=false
+          if left=$(count); then
+            # As in the review job: a zero starts a paid review or fails this
+            # job, so count it again.
+            if [ "$left" -gt 0 ] || { sleep 30; left=$(count); }; then counted=true; fi
+          fi
+          if [ "$counted" = false ]; then
+            # As in the review job, a clean attempt is taken at its word.
+            if [ "$OUTCOME" = success ] && [ -n "$CLAUDE_SESSION" ]; then
+              echo "::warning::Listing the PR's comments failed 3 times. The Opus fallback ended cleanly, so this assumes it left its review. Check the PR, and re-run this job if it has none."
+              exit 0
+            fi
+            echo "::error::Listing the PR's comments failed 3 times, so whether the Opus fallback left a review is unknown. Check the PR before re-running: a re-run starts a new review."
+            exit 1
+          fi
+          echo "Opus fallback: $OUTCOME; reviewer comments posted or edited since $SINCE: $left"
+          if [ "$left" -gt 0 ]; then
+            if [ "$OUTCOME" = failure ]; then
+              echo "::warning::The Opus fallback failed after posting $left comment(s) — suppressing the API-credit attempt so the PR does not get two overlapping reviews."
+            fi
+            exit 0
+          fi
+          if [ "$OUTCOME" = failure ]; then
+            # Only an exhausted subscription earns the paid attempt: the
+            # rejection text Claude Code reports for it. Read only where an
+            # error is reported, never the model's own prose (a review that
+            # discusses rate limits must not unlock credits): an error-marked
+            # final result and its errors, and the messages Claude Code
+            # writes itself in place of an answer (model "<synthetic>", or an
+            # `error` field), with that field's value.
+            limit='hit your ([a-z]+ )?limit|usage limit|rate[ _]limit'
+            said=""
+            if [ -n "$EXECUTION_FILE" ] && [ -f "$EXECUTION_FILE" ]; then
+              said=$(jq -r '([.[] | select(.type == "result")] | last | select(. != null and .is_error == true)
+                  | (.result // ""), ((.errors // [])[] | tostring)),
+                (.[] | select(.type == "assistant" and (.message.model == "<synthetic>" or .error != null))
+                  | ((.error // empty) | tostring), (.message.content[]? | select(.type == "text") | .text))' \
+                "$EXECUTION_FILE" 2>/dev/null) || said=""
+            fi
+            # A here-string, not a pipe: grep -q stops reading at its first
+            # match, and under pipefail the writer's SIGPIPE would read as
+            # no match.
+            if grep -qiE "$limit" <<<"$said"; then
+              echo "api=true" >> "$GITHUB_OUTPUT"
+              echo "::warning::The Opus fallback was refused for a usage limit and left no review: the subscription is exhausted — running the API-credit attempt. The step before this one shows how it ended."
+              exit 0
+            fi
+            echo "::error::Neither Fable nor the Opus fallback posted a review, so this PR has none. The Opus fallback failed, but not for a usage limit (an expired CLAUDE_CODE_OAUTH_TOKEN, an action error, a timeout?), so no API-credit attempt runs. The step before this one shows how it ended. Fix the cause, then re-run this workflow (it replays the same commit)."
+            exit 1
+          fi
+          echo "::error::Neither Fable nor the Opus fallback posted a review, so this PR has none, and the Opus fallback ended cleanly, so the subscription was not the cause and no API-credit attempt runs. Each job's report step shows what its attempt was refused and how it ended. Re-run this workflow for another pass (it replays the same commit)."
+          exit 1
+
+      # As in the review job: suppressing the next attempt must not look like
+      # a clean review.
+      - name: Fail when the review was left incomplete
+        if: steps.opus.outcome == 'failure' && steps.unposted.outputs.api != 'true'
+        run: |
+          echo "::error::The Opus fallback failed partway through, after already posting to the PR. The API-credit attempt was suppressed to avoid a duplicate review, so this PR has only partial feedback — close/reopen it for a clean pass."
+          exit 1
+
+  # The third attempt, billed to API credits: the subscription is exhausted
+  # (see Model strategy). Its own runner, for the reasons above the fallback
+  # job. The builds' gate waits for this job as it does for the fallback, up
+  # to its hour (see Model strategy).
+  # Re-running this job alone starts a new paid review, and its check counts
+  # only what that run posts.
+  api:
+    name: Fallback review (API credits)
+    needs: [review, fallback]
+    if: needs.fallback.outputs.api == 'true'
+    runs-on: ubuntu-latest
+    # A bound on what one paid review can spend in time, next to the
+    # --max-budget-usd bound on what it spends in credits.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      # The base branch: the working directory, where Claude Code reads its
+      # rules (pull_request_target checks it out by default). No token is
+      # left in its .git/config, where the reviewer could read it: the repo
+      # is public, so the fetches below need none, and the action sets up its
+      # own.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      # The PR's files, for reading only, outside the working directory and
+      # without any file Claude Code would take instructions or config from
+      # (see "Where the reviewer's instructions come from" above). The
+      # reviewer sees the PR's changes to those files in `gh pr diff`. Keep
+      # the three jobs' copies of these two steps identical. The prompt names
+      # this path as the review job resolved it, and the fallback and api
+      # jobs pass their own to --add-dir: the same while all three run on
+      # the same `runs-on`.
+      - name: Check out the PR's files
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-head
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Move the PR's files out of the working directory
+        run: |
+          set -euo pipefail
+          mv pr-head "$RUNNER_TEMP/pr-head"
+          # A symlink could point the reviewer at a file outside the PR's
+          # tree (/proc/self/environ, the base checkout): none is kept.
+          find "$RUNNER_TEMP/pr-head" -type l -delete
+          find "$RUNNER_TEMP/pr-head" \( -name CLAUDE.md -o -name CLAUDE.local.md -o -name .claude \
+            -o -name .mcp.json -o -name .claude.json \) -prune -exec rm -rf {} +
+
+      # A missing secret would otherwise surface as the action's generic
+      # "no credentials" error.
+      - name: Is the API key configured?
+        env:
+          HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          if [ "$HAS_KEY" != true ]; then
+            echo "::error::The subscription is exhausted and the ANTHROPIC_API_KEY repo secret is not set, so this PR has no review. Add the secret (see Setup in this workflow), then re-run this job."
+            exit 1
+          fi
+
+      # As in the other jobs: this job's own start.
+      - name: Note when the API attempt starts
+        id: start
+        run: echo "at=$(date -u -d '-2 seconds' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      # The same Fable alias as the review job's attempt (see there), billed
+      # to the API key instead of the subscription: the newest Fable, with no
+      # fallback model, at `high` effort to spend less (see Model strategy).
+      # Keep it that way: no
+      # --fallback-model here, and no ANTHROPIC_DEFAULT_FABLE_MODEL anywhere.
+      - name: Review (latest Fable — API credits)
+        id: api
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: ${{ needs.review.outputs.prompt }}
+          claude_args: |
+            --model fable
+            --effort high
+            --max-budget-usd 15
+            --add-dir ${{ runner.temp }}/pr-head
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+
+      # The review job's report, for this attempt; keep the copies identical.
+      # It runs after a failed attempt too, which the check below does not.
+      - name: What the API attempt was refused, and how it ended
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          EXECUTION_FILE: ${{ steps.api.outputs.execution_file }}
+        run: |
+          if [ -z "$EXECUTION_FILE" ] || [ ! -f "$EXECUTION_FILE" ]; then
+            echo "No transcript: the action did not run Claude."
+            exit 0
+          fi
+          # The text is the model's: the prefix keeps every line of it from
+          # acting as a workflow command (::…::) or a log marker (##[…]).
+          jq -r "$REPORT_JQ" "$EXECUTION_FILE" 2>&1 | sed 's/^/| /'
+
+      # The newest Fable or no review (see Model strategy): every model the
+      # transcript names, at start-up and per top-level answer, must be a
+      # Fable. A
+      # catalog that resolved `fable` to something else, or a fallback model
+      # added later, turns the job red instead of passing for a Fable review.
+      - name: Was it Fable?
+        if: ${{ !cancelled() && steps.api.outputs.execution_file != '' }}
+        env:
+          EXECUTION_FILE: ${{ steps.api.outputs.execution_file }}
+        run: |
+          set -euo pipefail
+          [ -f "$EXECUTION_FILE" ] || { echo "::error::No transcript at '$EXECUTION_FILE', so the model is unknown."; exit 1; }
+          # Claude's own answers only: a subagent it starts (parent_tool_use_id
+          # set) may run on another model, and its work is not the review.
+          models=$(jq -r '[.[] | (select(.type == "system" and .subtype == "init") | .model),
+            (select(.type == "assistant" and .parent_tool_use_id == null) | .message.model)] | map(select(. != null and . != "<synthetic>")) | unique | .[]' "$EXECUTION_FILE")
+          echo "Models in the transcript: ${models:-none}"
+          [ -n "$models" ] || { echo "::error::The transcript names no model, so this cannot be shown to be a Fable review."; exit 1; }
+          # A here-string, not a pipe, as in the fallback job's limit check.
+          if grep -qv '^claude-fable-' <<<"$models"; then
+            echo "::error::The API-credit review was not Fable alone: $(echo $models). It must be the newest Fable (see Model strategy in this workflow)."
+            exit 1
+          fi
+
+      # The last attempt must have left a review. A failed one already fails
       # the job (this step is then skipped); this catches one that ended
       # cleanly having posted nothing, which would otherwise end the job green
       # with no review on the PR.
@@ -454,13 +812,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           SINCE: ${{ steps.start.outputs.at }}
+          CLAUDE_SESSION: ${{ steps.api.outputs.session_id }}
         run: |
           set -euo pipefail
           [[ "$SINCE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
             || { echo "::error::Unexpected start time: '$SINCE'"; exit 1; }
           # The same count as "Did the first attempt leave a review?" in the
-          # review job; keep the two copies identical. Anything since this
-          # job's start is the fallback's.
+          # review job; keep the three copies identical. Anything since this
+          # job's start is the API attempt's.
           count() {
             local query="since=$SINCE&per_page=100" try summaries inlines
             local by_reviewer=".[] | select(.user.login == \"$REVIEWER_LOGIN\" and .updated_at >= \"$SINCE\") | .id"
@@ -480,12 +839,17 @@ jobs:
             if [ "$left" -gt 0 ] || { sleep 30; left=$(count); }; then counted=true; fi
           fi
           if [ "$counted" = false ]; then
-            # As in the review job, a clean attempt is taken at its word.
-            echo "::warning::Listing the PR's comments failed 3 times. The Opus fallback ended cleanly, so this assumes it left its review. Check the PR, and re-run this job if it has none."
-            exit 0
+            # As in the review job, a clean attempt is taken at its word, but
+            # only one in which Claude ran.
+            if [ -n "$CLAUDE_SESSION" ]; then
+              echo "::warning::Listing the PR's comments failed 3 times. The API-credit attempt ended cleanly, so this assumes it left its review. Check the PR, and re-run this job if it has none."
+              exit 0
+            fi
+            echo "::error::Listing the PR's comments failed 3 times, and the API-credit attempt ended without starting Claude, so whether this PR has a review is unknown. Check the PR before re-running: a re-run starts a new paid review."
+            exit 1
           fi
           echo "Reviewer comments posted or edited since $SINCE: $left"
           if [ "$left" -eq 0 ]; then
-            echo "::error::Neither Fable nor the Opus fallback posted a review, so this PR has none. Each job's report step shows what its attempt was refused and how it ended. Re-run this workflow for another pass (it replays the same commit)."
+            echo "::error::No attempt posted a review (Fable and Opus on the subscription, then the API-credit attempt), so this PR has none. Each job's report step shows what its attempt was refused and how it ended. Re-run this workflow for another pass (it replays the same commit)."
             exit 1
           fi

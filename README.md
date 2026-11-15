@@ -1099,6 +1099,12 @@ The **Rust engine** seeds from the same hardcoded bootnodes / CL pins and the sa
 - **jvm-libp2p** -- beacon chain P2P networking (consensus module)
 - **dnsjava 3.6** -- TXT-record resolution for EIP-1459 ENR tree walks (Java engine; the Rust engine uses `hickory-resolver` on desktop and the daemon, and resolves libp2p's `/dns4/` dial addresses through the platform's resolver)
 
+## Reporting a security issue
+
+Please do **not** report a security issue in a public issue, pull request or
+discussion. Report it privately through GitHub's private vulnerability
+reporting, as described in [SECURITY.md](SECURITY.md).
+
 ## License
 
 Myotis is licensed under the [Apache License, Version 2.0](LICENSE).

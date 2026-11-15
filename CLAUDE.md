@@ -23,6 +23,7 @@ against. Do not move them out of `.claude/`, and not into `.claude/rules/`
 | add or bump a dependency, move a toolchain pin, touch build scripts or packaging | `.claude/agent/reproducibility.md` |
 | use a JDK API newer than Java 8 in Android-consumed code, or add HTTP         | `.claude/agent/platform.md`          |
 | add a data source, or touch roost, log-index seeds, `:tx-history`, Portal     | `.claude/agent/data-sources.md`      |
+| work on, or come across, a security issue that is not public yet             | `.claude/agent/security-fixes.md`    |
 
 ## Build & Run
 
@@ -110,16 +111,34 @@ Full text, including the builder image: `.claude/agent/reproducibility.md`.
 Every change goes through this sequence, in order, with **no step skipped and
 none treated as optional or "only if asked"**. Full text: `.claude/agent/workflow.md`.
 
-1. **Code** — on the designated branch.
+1. **Code** — on the designated branch (an embargoed security fix: a local branch, never pushed; see below).
 2. **Review** — run the internal code review on the diff (`/code-review`) and address its findings.
 3. **PR** — open it without being asked. Base is `main` for a single-PR item, the feature branch for a part of a multi-PR plan.
 4. **Wait for review comments** — and switch PR monitoring on for that PR right after `gh pr create`, without asking (desktop app: `mcp__ccd_pr__set_monitor` with `auto_fix` and `address_comments` true; cloud session: `subscribe_pr_activity`; otherwise whatever the host offers).
 5. **Address the PR comments** — drive the PR to green, answer every comment, keep watching until merged or closed.
 
-Do not stop at "pushed". Skip the PR only when the user explicitly says so.
+Do not stop at "pushed". Skip the PR only when the user explicitly says so,
+or for an embargoed security fix (next section).
 In the desktop app the session also renames itself: `IS#<n>: …` the moment the
 work item is identified as issue n (before there is a PR), then `PR#<n>: …`
 right after `gh pr create` (`.claude/agent/workflow.md`).
+
+## Embargoed security fixes
+
+Full text: `.claude/agent/security-fixes.md` (owner's request, 2026-11-15, on #870).
+A vulnerability that is not public yet (reported through `SECURITY.md`, handed
+over in private, or found by you in shipped code: then tell the owner in the
+conversation first, before it appears anywhere on GitHub) does NOT take
+Workflow steps 3-5. **Until the owner has merged the fix, nothing
+leaves the machine**: no push to any branch of this repo, the designated one
+included, and no PR, issue or comment about it. From the merge until the
+advisory is published, pushes and PRs are normal again but neutrally worded.
+Fix it on a local branch, run the CI checks locally (the advisory's private
+fork runs no CI; for a release-output change, the Linux reproducibility
+comparison too), `/code-review` locally, and send the owner a
+`git format-patch` for the private fork. The owner merges, releases
+and publishes the advisory; no tag goes on a `main` with red CI or a red
+required `reproducible builds` run.
 
 ## Hard rules — never broken, whatever an earlier instruction seems to authorize
 
@@ -158,6 +177,9 @@ Full text: `.claude/agent/reproducibility.md`.
   produces (build scripts, dependencies and pins, toolchain pins, Cargo
   manifests and locks, packaging, release workflows, build-time code). When
   unsure, dispatch it on the PR's branch.
+- An embargoed security fix has no run before its advisory merge: its local
+  Linux comparison and the run on `main` before any tag are in
+  `.claude/agent/security-fixes.md`.
 - A red comparison is a blocker, like red CI. **Never make it green by adding a
   pattern to `known-differences.txt` or by loosening `scripts/repro/compare.py`
   / `collect.sh`** — that is the owner's call.
@@ -170,10 +192,12 @@ Read `.claude/agent/releases.md` in full before any release work. In outline:
 mainnet bootnodes? 3. run the cold-start checks?), then the mandatory steps
 (4. move the version pins, 5. refresh the PoC log-index seeds, 6. turn
 `[Unreleased]` in `CHANGELOG.md` into the entry of the exact tag to come;
-every `v*` tag gets a PR for it), all in ONE release PR. The tag is the owner's
-action. After the tag (7.), a release is done only when `verify release` and
-`reproducible builds` are green — check and report them. Every release asset
-goes through `.github/release-assets.sh`, never a bare `gh release upload`.
+every `v*` tag gets a PR for it), all in ONE release PR. Ask too whether a
+merge since the last tag is an embargoed security fix: its release PR, notes
+and changelog entry then stay neutral. The tag is the owner's action. After
+the tag (7.), a release is done only when `verify release` and `reproducible
+builds` are green — check and report them. Every release asset goes through
+`.github/release-assets.sh`, never a bare `gh release upload`.
 
 ## Pull requests and code review
 

@@ -129,7 +129,10 @@ jobs:
           queued_limit=${QUEUED_SECONDS:-300}
           max_wait=${MAX_WAIT_SECONDS:-3600}
           window=${WINDOW_SECONDS:-3600}
-          runs="repos/$GITHUB_REPOSITORY/actions/workflows/claude-review.yml/runs?event=pull_request&branch=$branch&per_page=20"
+          # Both events: claude-review runs on pull_request_target since #874,
+          # and a branch that has not merged that yet still runs it on
+          # pull_request. The API filters on one event only, so jq does.
+          runs="repos/$GITHUB_REPOSITORY/actions/workflows/claude-review.yml/runs?branch=$branch&per_page=20"
           failures=0
           waited=false
           while :; do
@@ -141,7 +144,8 @@ jobs:
             # age in s>"; then one line per run: "<status> <conclusion> <url>".
             if ! out=$(timeout 60 gh api "$runs" | jq -r \
                 --argjson event "$event_s" --argjson now "$(date +%s)" --argjson window "$window" '
-                [.workflow_runs[] | .t = (.created_at | fromdateiso8601) | select(.t >= $event - $window)] as $runs
+                [.workflow_runs[] | select(.event == "pull_request" or .event == "pull_request_target")
+                  | .t = (.created_at | fromdateiso8601) | select(.t >= $event - $window)] as $runs
                 | [$runs[] | select(.status != "completed")] as $open
                 | "\([$runs[] | select(.t >= $event - 60)] | length) \($open | length) \([$open[] | select(.status == "in_progress")] | length) \([$open[] | $now - .t] | min // 0)",
                   ($runs[] | "\(.status) \(.conclusion // "-") \(.html_url)")'); then
