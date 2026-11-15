@@ -102,7 +102,9 @@ again (steps 7 to 9 need them), but every one of them stays neutral:
         values from `scripts/repro/setup_leg.sh`, which itself runs only in
         GitHub Actions, and chown leg b's checkout and homes to its uid as
         that script does. Without them the two builds differ in their path
-        alone.
+        alone. A leg that is a `git worktree`, as `setup_leg.sh` makes it,
+        also needs the main checkout mounted (`--mount`, as the workflow's
+        *Build* step does): its git data lives there.
      3. `scripts/repro/collect.sh linux <checkout> <out>` on each, so a
         missing artifact fails instead of comparing as identical.
      4. `scripts/repro/compare.py <out-a> <out-b> <report-dir>

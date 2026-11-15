@@ -194,9 +194,10 @@ mainnet bootnodes? 3. run the cold-start checks?), then the mandatory steps
 `[Unreleased]` in `CHANGELOG.md` into the entry of the exact tag to come;
 every `v*` tag gets a PR for it), all in ONE release PR. Ask too whether a
 merge since the last tag is an embargoed security fix: its release PR, notes
-and changelog entry then stay neutral. The tag is the owner's action. After the tag (7.), a release is done only when `verify release` and
-`reproducible builds` are green — check and report them. Every release asset
-goes through `.github/release-assets.sh`, never a bare `gh release upload`.
+and changelog entry then stay neutral. The tag is the owner's action. After
+the tag (7.), a release is done only when `verify release` and `reproducible
+builds` are green — check and report them. Every release asset goes through
+`.github/release-assets.sh`, never a bare `gh release upload`.
 
 ## Pull requests and code review
 
