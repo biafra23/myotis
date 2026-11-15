@@ -469,7 +469,6 @@ PoC seeds (#706).
 ### Changed
 
 - Android builds the Rust engine from source by default (#324).
-- Engine ABI 22.
 
 ### Fixed
 
