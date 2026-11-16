@@ -19,6 +19,12 @@ its trust anchors and release checks.
 
 ## [Unreleased]
 
+### Fixed
+
+- `scripts/verify_release.sh` resolves the commit of a release tag again.
+  Its copy in v0.1.21-rc1 stops at the attestation step with HTTP 422
+  ("No commit found for SHA: tags/…"); use the one on `main` (#878).
+
 ## [0.1.21-rc1] - 2026-11-15
 
 ### Added
