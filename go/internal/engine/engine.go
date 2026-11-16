@@ -557,13 +557,11 @@ func (w *stallWatcher) note(err error) {
 // cannot see a withdraw-and-re-grant that lands entirely BETWEEN two
 // calls — both samples see consent armed, neither sees the absence —
 // exactly round 8's gap, and the only thing a missing assignment
-// costs (round 12; earlier rounds of this comment overstated it as
-// round 3's once-per-loop logging). Round 9 caught
+// costs. Round 9 of PR #879 caught
 // such an assignment missing with no test noticing, hence this method
 // and TestWireSyncerHooksTrackEngineState, which fails on a nil hook.
 // The consent and generation hooks are the engine's own accessors —
-// one definition of the locked read each, as WsBound already is (the
-// closures here repeated them; round 12).
+// one definition of the locked read each, as WsBound already is.
 func (e *Engine) wireSyncerHooks(s *clsync.Syncer) {
 	s.Warnf = func(f string, a ...any) { e.log.Warn(fmt.Sprintf(f, a...)) }
 	s.WsBound = e.EffectiveWsBound

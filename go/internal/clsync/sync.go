@@ -207,11 +207,8 @@ func (s *Syncer) staleGate(anchorPeriod, wallPeriod uint64, what string) error {
 		// finds consent absent re-arms the waiver line. The next
 		// waiver then needs an arming the line has not seen — either
 		// a new generation, or, with no hook, the absence just
-		// observed — so it cannot go unlogged, and no caller-shaped
-		// special case is left to misdescribe (round 12: the two
-		// `StaleGeneration == nil` guards this replaced had their
-		// behaviour stated wrongly in three rounds of comments while
-		// the tests stayed green).
+		// observed — so it cannot go unlogged. (This one rule
+		// replaced two caller-shaped special cases, PR #879 round 12.)
 		s.waiveGenValid = false
 	}
 	if !chain.WsAnchorStale(anchorPeriod, wallPeriod, s.boundPeriods()) {

@@ -767,9 +767,8 @@ func TestCanonicalNameMatchesRustTable(t *testing.T) {
 // json.Marshal emits it (sorted keys). This is the cross-check PR #879
 // round 10 said was missing: capabilities() drifting from the golden
 // fails HERE, the single point of enforcement — the JVM fixture
-// splices this same file, so it can never be a stale hand-copy (it
-// asserts only the three ABI-58/59 keys themselves; round-11
-// corrected this comment's "fails its fixture ... both sides").
+// splices this same file, so it can never be a stale hand-copy (the
+// JVM asserts only the three ABI-58/59 keys it interprets).
 // Cross-read pattern per GoAbiVersionMirrorTest.
 func TestCapabilitiesGolden(t *testing.T) {
 	golden, err := os.ReadFile("testdata/capabilities.json")

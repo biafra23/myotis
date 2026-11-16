@@ -61,8 +61,7 @@ jobs:
     # -g, which adds debug info and no instructions; whether its objects
     # match CI's instruction-for-instruction depends on the compiler being
     # the same, which the task does not promise (it uses the local one).
-    # (PR #832 round-3 review added this block, which built bare before;
-    # PR #879's reviews corrected this comment's parity claims.)
+    # (PR #832 round-3 review added this block, which built bare before.)
     env:
       CGO_CFLAGS: "-O2 -g -D__BLST_PORTABLE__"
 
