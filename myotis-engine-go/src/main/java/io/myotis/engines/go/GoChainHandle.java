@@ -78,33 +78,17 @@ import java.util.List;
  *       answer, which today is always the {@code applied:false} refusal — the
  *       one-shot {@link #acceptStaleAnchor} is the way forward until the fetch
  *       lands (engine-parity; the parse already handles the applied shape).
- *       Related engine-parity gap, recorded not fixed (PR #877 rounds 2-3):
- *       the "asks again at a later park" promise holds at the bootstrap
- *       gate only. After bootstrap, an in-run {@code ErrStaleAnchor} from
- *       catch-up retries leaves the loop running but STALLED — it refuses
- *       at the in-run gate every slot, so {@code PollFinality} never runs
- *       and no anchor is published; {@code BeaconState} reports
- *       {@code STALE_ANCHOR} only when the loop itself died, so the status
- *       stays {@code SYNCING}/{@code CATCHING_UP} and NO dialog opens
- *       (the bootstrap park's dialog was already answered, or a pre-start
- *       CONTINUE meant there never was one). The stall makes itself seen
- *       once at WARN — "STALE ANCHOR: held committee aged ... while
- *       running" at the stall onset, re-warned when a new stall begins,
- *       in the hosts' WARN-filtered view (PR #877 round 5) — beside the
- *       per-slot INFO "re-catch-up:" line; the ways out are choosing
- *       CONTINUE again in Settings or a restart, which parks at the
- *       bootstrap gate and asks. The parity fix likely needs NO
- *       status-contract change (PR #877 round 6 corrected the
- *       round-5 note that claimed one): Rust re-publishes the park
- *       every 5 s from its still-running loop ({@code sync.rs:2691}),
- *       so {@code STALE_ANCHOR} from a live loop is the contract both
- *       engines already share — a flag set on an in-run
- *       {@code ErrStaleAnchor} and cleared on any other outcome, with
- *       {@code BeaconState} reporting {@code STALE_ANCHOR} while set,
- *       re-opens the dialog within a slot and keeps the walked-forward
- *       store, which returning the error (and re-bootstrapping) would
- *       throw away. Owner's call; recorded here as the parity step's
- *       input.</li>
+ *       Related engine-parity gap, recorded not fixed: the "asks again at a
+ *       later park" promise holds at the bootstrap gate only — after
+ *       bootstrap an in-run {@code ErrStaleAnchor} STALLS the loop (refuses
+ *       every slot, publishes no anchor, status stays
+ *       {@code SYNCING}/{@code CATCHING_UP}, no dialog opens) instead of
+ *       re-parking {@code STALE_ANCHOR} the way the Rust loop does. The
+ *       stall warns once at WARN per refused streak beside the per-slot
+ *       INFO lines, so it is never silent to a WARN-filtered host view.
+ *       go/README.md §Desktop embed is the CANONICAL record — the stall's
+ *       full behaviour, the ways out, and the likely flag-shaped parity fix
+ *       awaiting the owner's call (PR #877 rounds 2-8).</li>
  * </ul>
  *
  * <p>{@link #reads()} and the loopback listener follow the Rust twin exactly:
@@ -733,22 +717,21 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
         boolean ok = linked(() -> GoEngineNative.nativeSetStaleAnchorPolicy(handle, policy.ordinal()));
         if (!ok) {
             if (policy == io.myotis.api.StaleAnchorPolicy.CHECKPOINT) {
-                // CHECKPOINT is refused for its missing fetch. The
-                // refusal withdraws a REMEMBERED CONTINUE (the engine
-                // un-arms on any replacement, host.rs); a one-shot
-                // AcceptStale alone survives it (stalePolicy stays 0,
-                // so the withdrawal line does not fire) — but the two
-                // consents share ONE acceptStale flag, so a remembered
-                // CONTINUE given AFTER a one-shot takes the one-shot
-                // down with it when replaced (PR #877 round 7; Rust
-                // behaves identically, one accept_stale_anchor,
-                // host.rs:1625-1627). The wording has to hold for
-                // all four cases: dead handle, one-shot only,
-                // remembered only, one-shot then remembered.
+                // CHECKPOINT is refused for its missing fetch. On a LIVE
+                // engine the refusal also withdraws a remembered CONTINUE
+                // (the engine un-arms on any replacement, host.rs) — and a
+                // one-shot accept armed before it goes with it, both being
+                // the same acceptStale flag (PR #877 round 7; Rust
+                // identical, one accept_stale_anchor, host.rs:1625-1627).
+                // An UNKNOWN or CLOSED handle mutates nothing at all (the
+                // C lookup / closed check returns false before the
+                // withdrawal, internal review) — so the warn states the
+                // withdrawal conditionally instead of asserting it.
                 log.warn("[engines] setStaleAnchorPolicy(CHECKPOINT) not applied: the Go "
-                        + "engine has no checkpoint fetch. A remembered 'continue anyway', if "
-                        + "there was one, IS withdrawn by this refusal, together with any one-shot "
-                        + "accept (they share one consent); a one-shot accept alone still holds");
+                        + "engine has no checkpoint fetch. On a live engine this refusal also "
+                        + "withdraws a remembered 'continue anyway' if one was set (together "
+                        + "with any one-shot accept — they share one consent); a one-shot "
+                        + "accept alone survives it; an unknown or closed handle changed nothing");
             } else {
                 log.warn("[engines] setStaleAnchorPolicy({}) not applied: unknown handle, or "
                         + "a closed engine", policy);

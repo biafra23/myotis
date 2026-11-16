@@ -52,9 +52,33 @@ class GoStatusJsonTest {
                 + "\"executionBlockNumber\":" + finalizedBlock + ",\"elHunting\":false,"
                 + "\"upgradeAdvisory\":null,\"dataUsage\":null,\"networkMetering\":\"" + metering + "\","
                 + "\"engine\":\"go\",\"myotisAbi\":59,"
-                + "\"capabilities\":{\"wsBoundOverride\":true,\"staleAnchorConsent\":true,"
-                + "\"servedBlockWindow\":true}"
+                + "\"capabilities\":{\"anchorRefresh\":false,\"servedBlockWindow\":true,\"staleAnchorConsent\":true,\"staleAnchorPolicy\":true,\"wsBoundOverride\":true}"
                 + "}";
+    }
+
+    /** The ABI-58/59 disclosure keys (anchorRefresh:false,
+     *  staleAnchorPolicy:true) ship in every status from
+     *  go/internal/capi's capabilities() — the apply-or-refuse audit
+     *  surface. No JVM consumer reads them from the status today (the
+     *  Go-side golden TestCapabilitiesJSON pins their values); this
+     *  fixture carries them so the promise "the JVM reads exactly what
+     *  the Go build writes" includes them, and the reader must keep
+     *  tolerating them (internal review of the merged PR #877). */
+    @Test
+    void capabilityDisclosureKeysAreToleratedNotInvented() {
+        String raw = goStatus("SYNCED", 26404150, 3, "METERED");
+        assertTrue(raw.contains("\"anchorRefresh\":false"),
+                "fixture must carry the ABI-58 refusal disclosure");
+        assertTrue(raw.contains("\"staleAnchorPolicy\":true"),
+                "fixture must carry the ABI-59 policy disclosure");
+        // And the JVM reader neither invents nor requires them: the same
+        // status parses identically with the keys stripped.
+        String stripped = raw.replace("\"anchorRefresh\":false,", "")
+                .replace(",\"staleAnchorPolicy\":true", "");
+        StatusSnapshot a = GoChainHandle.statusFromJson("mainnet", raw);
+        StatusSnapshot b = GoChainHandle.statusFromJson("mainnet", stripped);
+        assertEquals(a.beaconState(), b.beaconState());
+        assertEquals(a.finalizedBlockNumber(), b.finalizedBlockNumber());
     }
 
     @Test

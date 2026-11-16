@@ -174,8 +174,9 @@ functional, every other export answers an honest refusal (permanent
 and `myotis_go_capabilities_json` answers the split at runtime.
 
 ```bash
-# CGO_CFLAGS as goBuildCShared and go-engine.yml set them (portable blst —
-# see the build note at the bottom of this document)
+# CGO_CFLAGS as goBuildCShared sets them (portable blst; the CI workflow
+# and the reproducible-builds gate additionally pass -g — see the build
+# note at the bottom of this document)
 CGO_CFLAGS="-O2 -D__BLST_PORTABLE__" \
   go build -buildmode=c-shared -o build/libmyotis_engine_go.so ./cmd/myotis-capi
 scripts/check_capi_symbols.sh   # every header symbol must be exported (CI runs both)
@@ -294,7 +295,10 @@ off the regular profile too).
 `go-engine.yml`, which built bare before: the ADX build's load-time
 constructor answers SIGILL with `_exit(128+4)` and kills whatever process
 dlopens the library on a pre-Broadwell/pre-Zen CPU, past every
-`UnsatisfiedLinkError` handler) and `GOTOOLCHAIN=local`
+`UnsatisfiedLinkError` handler; `go-engine.yml` and the gate's
+`scripts/repro/build_linux.sh` additionally pass `-g` — debug info only,
+their blst objects are what the gate compares, and this task's `.so`
+differs from theirs by no instruction) and `GOTOOLCHAIN=local`
 (it skips with a note when the local toolchain is older than `go.mod`'s
 line rather than downloading one mid-build; CI installs it via
 `setup-go`). A skip — missing `go` (resolved like `cargo`, incl.

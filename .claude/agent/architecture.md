@@ -65,7 +65,9 @@ Key Gradle modules:
   checkpoint-anchor refresh (ABI 58) yet — each refused by name, not
   faked; the ABI-59 stale-anchor policy IS applied for ASK/CONTINUE
   (withdraw-on-replace like host.rs), refused only for its CHECKPOINT
-  code (the GoChainHandle class doc is the list;
+  code; the in-run stale-refusal STALLS the loop rather than
+  re-parking it — go/README.md §Desktop embed is the canonical gap
+  record (the GoChainHandle class doc points there;
   JSON-string reads carry the permanent -32602 envelope, typed reads the
   retryable null). A `-Pengine=go` desktop launch runs on its own `~/.myotis-go`
   profile (the shrunken catalog would otherwise prune the shared settings'
