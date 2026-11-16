@@ -355,10 +355,15 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
           prompt: ${{ steps.prompt.outputs.text }}
+          # --permission-mode default in all three attempts: the action's
+          # default is auto mode, where a safety review can let through calls
+          # --allowedTools does not list. This reviewer holds secrets and reads
+          # PR-controlled text, so --allowedTools must be a strict list.
           claude_args: |
             --model fable
             --effort max
             --add-dir ${{ runner.temp }}/pr-head
+            --permission-mode default
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
       # What the attempt was refused, and how it ended. The action keeps the
@@ -572,6 +577,7 @@ jobs:
             --model opus
             --effort max
             --add-dir ${{ runner.temp }}/pr-head
+            --permission-mode default
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
       # The review job's report, for this attempt; keep the copies identical.
@@ -769,6 +775,7 @@ jobs:
             --effort high
             --max-budget-usd 15
             --add-dir ${{ runner.temp }}/pr-head
+            --permission-mode default
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
       # The review job's report, for this attempt; keep the copies identical.
