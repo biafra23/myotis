@@ -44,16 +44,24 @@ jobs:
     # ONE env block for the job (a merge of main's and the feature's — the
     # file carried two `env:` keys between the two merges and the workflow
     # parser rejects a duplicate mapping key, which silently cost this PR its
-    # Go CI). The flags are the reproducible-builds gate's
-    # (scripts/repro/build_linux.sh defines them), so the blst this workflow
-    # tests is the blst the gate compares. And like the Gradle task
-    # (goBuildCShared) and the Rust workspace it mirrors (#734 D3): the blst
-    # Go binding compiles ADX paths on amd64, and its load-time constructor
-    # answers SIGILL with _exit(132) — which would KILL whatever process
-    # dlopens the c-shared library, on a pre-Broadwell/pre-Zen machine, past
-    # every UnsatisfiedLinkError handler. Job-level so `go test -race`
-    # exercises the same object code the artifact ships (PR #832 round-3
-    # review — this workflow built bare before).
+    # Go CI). These are the reproducible-builds gate's own CGO_CFLAGS:
+    # scripts/repro/build_linux.sh pairs them with this workflow by name, so
+    # the blst CONFIGURATION tested here is the one the gate builds and
+    # compares between its two legs — the same flags, not the same bytes
+    # (the gate additionally builds with -trimpath and the builder image's
+    # pinned gcc, both of which change object bytes; build_linux.sh:95-97
+    # calls the C compiler a build input for exactly that reason). The
+    # PORTABLE define is the cross-build constant (#734 D3) — blst's Go
+    # binding compiles ADX paths on amd64, and its load-time constructor
+    # answers SIGILL with _exit(132), which would KILL whatever process
+    # dlopens the c-shared library on a pre-Broadwell/pre-Zen machine, past
+    # every UnsatisfiedLinkError handler; goBuildCShared, the Rust workspace
+    # and the gate all carry it. goBuildCShared (whose library the desktop
+    # launches — not yet a release artifact, build.gradle.kts notes) omits
+    # -g, which adds debug info and no instructions; whether its objects
+    # match CI's instruction-for-instruction depends on the compiler being
+    # the same, which the task does not promise (it uses the local one).
+    # (PR #832 round-3 review added this block, which built bare before.)
     env:
       CGO_CFLAGS: "-O2 -g -D__BLST_PORTABLE__"
 

@@ -449,9 +449,12 @@ func SetWsBoundPeriods(handle int64, periods int64) bool {
 
 // AcceptStaleAnchor is the one-shot consent to the embedded anchor's
 // age (myotis_accept_stale_anchor): suppresses both weak-subjectivity
-// layers for the rest of this handle's life, never persisted, and
-// releases a bootstrap that had already parked. False only for an
-// unknown handle, as the contract says.
+// layers for the rest of the run — read live at every gate, so it
+// ends early whenever a remembered CONTINUE is replaced while it is
+// armed, whichever of the two came first (one shared flag;
+// host.rs:1625-1627 behaves the same) —
+// never persisted, and releases a bootstrap that had already parked.
+// False only for an unknown handle, as the contract says.
 func AcceptStaleAnchor(handle int64) bool {
 	eng, _, ok := lookup(handle)
 	if !ok {

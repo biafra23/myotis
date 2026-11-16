@@ -28,6 +28,7 @@ import (
 	"github.com/biafra23/myotis/go/internal/nodekey"
 	"github.com/biafra23/myotis/go/internal/snapread"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/libp2p/go-libp2p/core/host"
 )
 
 // Config is what a host decides about an engine; everything else
@@ -77,6 +78,16 @@ type Engine struct {
 	// check rather than needing the process restarted.
 	wsOverride  uint64 // 0 = the network default (the contract's 0)
 	acceptStale bool
+	// staleGen counts consent ARMS: bumped on every acceptStale
+	// false→true transition (one-shot accept or remembered CONTINUE —
+	// each is one user action). The syncer's waiver line is keyed to
+	// this generation, not to a consent flag it samples, because a
+	// current store consults the gate only at period boundaries, so a
+	// withdraw-and-regrant between samples would erase a
+	// flag-remembered waiver (PR #877 round 8). Rust logs the same
+	// event: auto_resolve_park warns on every accept_stale_anchor
+	// swap that flips (sync.rs:2848).
+	staleGen uint64
 	// stalePolicy is the remembered answer from myotis_set_stale_anchor_policy
 	// (0 ask / 2 continue; 1 checkpoint is refused at the door), read through
 	// SetStaleAnchorPolicy only. Default 0 = ask, the contract's default.
@@ -332,13 +343,19 @@ func (e *Engine) SetWsBoundPeriods(periods uint64) bool {
 
 // AcceptStale records the host's one-shot consent to the embedded
 // anchor's age (myotis_accept_stale_anchor): suppresses both
-// weak-subjectivity layers for the rest of this Engine's life, never
+// weak-subjectivity layers for the rest of the run — read live at
+// every gate, so it ends early whenever a remembered CONTINUE is
+// replaced while it is armed, whichever of the two came first (one
+// shared flag; host.rs:1625-1627 behaves the same) — never
 // persisted, and releases a bootstrap that had already parked.
 func (e *Engine) AcceptStale() bool {
 	e.mu.Lock()
 	if e.closed {
 		e.mu.Unlock()
 		return false
+	}
+	if !e.acceptStale { // a new arming is a new trust decision (round 8)
+		e.staleGen++
 	}
 	e.acceptStale = true
 	e.mu.Unlock()
@@ -381,6 +398,9 @@ func (e *Engine) SetStaleAnchorPolicy(policy int32) bool {
 	}
 	e.stalePolicy = policy
 	if policy == 2 {
+		if !e.acceptStale { // same arming event as a one-shot accept (round 8)
+			e.staleGen++
+		}
 		e.acceptStale = true
 	}
 	e.mu.Unlock()
@@ -390,14 +410,28 @@ func (e *Engine) SetStaleAnchorPolicy(policy int32) bool {
 	return true
 }
 
-// StaleAccepted reports the consent the weak-subjectivity gates read
-// (the same value the syncer's StaleAccepted hook returns) — exposed for
-// the policy test to observe what SetStaleAnchorPolicy armed and what a
-// replaced CONTINUE withdrew.
+// StaleAccepted reports the consent the weak-subjectivity gates read.
+// Since round 12 this is the PRODUCTION read: wireSyncerHooks wires
+// this very method as the syncer's StaleAccepted hook, so every gate
+// sample of consent comes through here. The policy tests observe the
+// same value the loop acts on (what SetStaleAnchorPolicy armed and
+// what a replaced CONTINUE withdrew) rather than a parallel accessor
+// that could drift from it.
 func (e *Engine) StaleAccepted() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.acceptStale
+}
+
+// StaleGeneration reports the consent-arming count (staleGen) that
+// the syncer's waiver line follows: at most one WARN per arming (at
+// the first stale gate that uses it — an arming no stale gate meets
+// stays unlogged), whatever the
+// gate's sampling does in between (PR #877 round 8).
+func (e *Engine) StaleGeneration() uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.staleGen
 }
 
 // restartIfParked re-spawns the LC loop when it died (and was not
@@ -483,16 +517,6 @@ func (e *Engine) EffectiveWsBound() uint64 {
 	return chain.WsBoundPeriods
 }
 
-// lcLoop bootstraps the LC over libp2p (static pins, the same
-// set myotis-lc dials), walks the committee chain, and keeps the
-// anchor fresh on the myotis-lc steady loop — every answer through
-// the part-3 processor (checkpoint pin, period gate, BLS, Merkle
-// branches). Anchors are published only after a VERIFYING finality
-// poll (Advanced or Stale) — never the bootstrap/catch-up root, which
-// is routinely outside every peer's state window (see the loop).
-// This is the same loop as cmd/myotis-lc's; when a
-// second consumer appeared the honest move is to say so in a comment
-// and re-unify the two in 3c rather than contort the merged main.
 // stallWatcher decides when a stalled light-client loop gets its
 // WARN line: once per refused streak. A stale refusal warns on the
 // first pass of the streak only; ANY other RunCatchUp outcome — nil
@@ -523,6 +547,53 @@ func (w *stallWatcher) note(err error) {
 	}
 }
 
+// wireSyncerHooks connects one syncer to this engine's live consent,
+// bound and log state: the C ABI's setters (myotis_set_ws_bound_periods,
+// myotis_accept_stale_anchor, myotis_set_stale_anchor_policy) mutate
+// the engine, and the gates must see every mutation at their next
+// check — so these are live reads, never captured values. The
+// StaleGeneration hook is what carries the round-8 waiver fix: a
+// silently missing assignment leaves clsync on its constant
+// generation, which re-arms on every consent-absent gate call but
+// cannot see a withdraw-and-re-grant that lands entirely BETWEEN two
+// calls — both samples see consent armed, neither sees the absence —
+// exactly round 8's gap, and the only thing a missing assignment
+// costs. Round 9 of PR #879 caught
+// such an assignment missing with no test noticing, hence this method
+// and TestWireSyncerHooksTrackEngineState, which fails on a nil hook.
+// The consent and generation hooks are the engine's own accessors —
+// one definition of the locked read each, as WsBound already is.
+func (e *Engine) wireSyncerHooks(s *clsync.Syncer) {
+	s.Warnf = func(f string, a ...any) { e.log.Warn(fmt.Sprintf(f, a...)) }
+	s.WsBound = e.EffectiveWsBound
+	s.StaleAccepted = e.StaleAccepted
+	s.StaleGeneration = e.StaleGeneration
+}
+
+// newLoopSyncer is the ONE way lcLoop gets a Syncer: built and wired
+// in a single step, so an unwired loop syncer is a different call
+// rather than a missing line. TestWireSyncerHooksTrackEngineState
+// takes its Syncer from THIS constructor, so deleting the wiring line
+// below fails the test's nil check (rounds 18-19: round 18 moved the
+// untested wiring from lcLoop to here; round 19 moved the test to
+// here too — the only wiring left unexercised is lcLoop's single
+// expression calling this function).
+func (e *Engine) newLoopSyncer(c *chain.Consensus, h host.Host, logf func(string, ...any)) *clsync.Syncer {
+	s := clsync.NewSyncer(c, h, logf)
+	e.wireSyncerHooks(s)
+	return s
+}
+
+// lcLoop bootstraps the LC over libp2p (static pins, the same
+// set myotis-lc dials), walks the committee chain, and keeps the
+// anchor fresh on the myotis-lc steady loop — every answer through
+// the part-3 processor (checkpoint pin, period gate, BLS, Merkle
+// branches). Anchors are published only after a VERIFYING finality
+// poll (Advanced or Stale) — never the bootstrap/catch-up root, which
+// is routinely outside every peer's state window (see the loop).
+// This is the same loop as cmd/myotis-lc's; when a
+// second consumer appeared the honest move is to say so in a comment
+// and re-unify the two in 3c rather than contort the merged main.
 func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 	c := chain.ConsensusMainnet()
 	h, err := clsync.NewHost()
@@ -530,20 +601,11 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 		return fmt.Errorf("libp2p host: %w", err)
 	}
 	defer h.Close()
-	syncer := clsync.NewSyncer(c, h, logf)
-	// Trust-decision lines (the stale-anchor waiver) go out at WARN,
-	// matching the Rust twin's tracing::warn! and surviving the hosts'
-	// WARN-filtered pump view (PR #877 round 4).
-	syncer.Warnf = func(f string, a ...any) { e.log.Warn(fmt.Sprintf(f, a...)) }
-	// The C ABI's live setters reach the weak-subjectivity gates
-	// through these hooks (read at every check, not captured):
-	// myotis_set_ws_bound_periods and myotis_accept_stale_anchor.
-	syncer.WsBound = e.EffectiveWsBound
-	syncer.StaleAccepted = func() bool {
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		return e.acceptStale
-	}
+	// Built AND wired in one step (see newLoopSyncer); the hooks put
+	// trust-decision lines at WARN, matching the Rust twin's
+	// tracing::warn! and surviving the hosts' WARN-filtered pump
+	// view (PR #877 round 4).
+	syncer := e.newLoopSyncer(c, h, logf)
 	clsync.InstallGossipSubHold(h)
 	clsync.ServeInstall(h, syncer.LocalStatus)
 

@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -30,8 +31,35 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class GoStatusJsonTest {
 
+    /** The REAL capabilities object, read from the Go package's golden
+     *  (go/internal/capi/testdata/capabilities.json) — NOT hand-copied.
+     *  TestCapabilitiesGolden (Go side) pins that file to
+     *  capabilities() byte-for-byte as json.Marshal emits it, so this
+     *  fixture can never again be a hand-copy that silently falls
+     *  behind — it always carries the full current map. Drift of
+     *  capabilities() from the golden fails the GO test; this class
+     *  asserts only the three keys whose values the ABI-58/59 story
+     *  depends on (anchorRefresh, staleAnchorPolicy, and
+     *  wsBoundOverride as the reader-tolerance anchor) — the other
+     *  20 ride through as fixture content, JVM-side, by design, as
+     *  statusFromJson ignores the subtree (PR #879 rounds 10-11;
+     *  the GoAbiVersionMirrorTest cross-read pattern). */
+    private static final String CAPABILITIES_JSON;
+    static {
+        try {
+            CAPABILITIES_JSON = java.nio.file.Files.readString(
+                    java.nio.file.Path.of("..", "go", "internal", "capi", "testdata",
+                            "capabilities.json")).trim();
+        } catch (java.io.IOException e) {
+            throw new AssertionError(
+                    "go/internal/capi/testdata/capabilities.json must exist and be readable "
+                            + "from the module root (it is the shared capabilities golden)", e);
+        }
+    }
+
     /** A serveable Go status: SYNCED, finalized anchor, snap servers.
-     *  Field order mirrors the Go struct; the Go-only keys come last. */
+     *  Field order mirrors the Go struct; the Go-only keys come last,
+     *  capabilities included verbatim from the golden. */
     private static String goStatus(String beaconState, long finalizedBlock, int snapServing,
                                    String metering) {
         return "{"
@@ -52,9 +80,47 @@ class GoStatusJsonTest {
                 + "\"executionBlockNumber\":" + finalizedBlock + ",\"elHunting\":false,"
                 + "\"upgradeAdvisory\":null,\"dataUsage\":null,\"networkMetering\":\"" + metering + "\","
                 + "\"engine\":\"go\",\"myotisAbi\":59,"
-                + "\"capabilities\":{\"wsBoundOverride\":true,\"staleAnchorConsent\":true,"
-                + "\"servedBlockWindow\":true}"
+                + "\"capabilities\":" + CAPABILITIES_JSON
                 + "}";
+    }
+
+    /** The fixture's capabilities object is the FULL map
+     *  go/internal/capi's capabilities() writes (Go marshals maps
+     *  sorted, so this is key-for-key what StatusJSON emits — the
+     *  round-9 review caught it being a 5-of-23 subset while the
+     *  class doc promised field-for-field). What the JVM reader owes
+     *  that subtree is tolerance, not interpretation: ParsedStatus
+     *  has no capabilities field, so the assertions here are (a) the
+     *  ABI-58/59 disclosure keys are present in the fixture because
+     *  the Go build emits them, (b) the strips really strip, and
+     *  (c) an UNKNOWN future key parses like the known ones — the
+     *  tolerance a future ABI addition actually needs (PR #879
+     *  round-9). The VALUES' truth is pinned go-side by
+     *  TestCapabilitiesJSON, not here — but the KEY SET and shape are
+     *  now cross-checked: the fixture splices the golden file that
+     *  Go's TestCapabilitiesGolden pins to capabilities() itself. */
+    @Test
+    void capabilitySubtreeIsToleratedNotInterpreted() {
+        String raw = goStatus("SYNCED", 26404150, 3, "METERED");
+        assertTrue(raw.contains("\"anchorRefresh\":false"),
+                "fixture must carry the ABI-58 refusal disclosure");
+        assertTrue(raw.contains("\"staleAnchorPolicy\":true"),
+                "fixture must carry the ABI-59 policy disclosure");
+        StatusSnapshot full = GoChainHandle.statusFromJson("mainnet", raw);
+        String stripped = raw.replace("\"anchorRefresh\":false,", "")
+                .replace(",\"staleAnchorPolicy\":true", "");
+        assertNotEquals(raw, stripped, "the strips must actually strip");
+        String widened = raw.replace("\"wsBoundOverride\":true",
+                "\"wsBoundOverride\":true,\"zfutureCapability\":true");
+        assertNotEquals(raw, widened, "the widen must actually widen");
+        // Same snapshot with the disclosures gone and an unknown key
+        // added: the reader ignores the whole subtree.
+        for (String variant : new String[] { stripped, widened }) {
+            StatusSnapshot v = GoChainHandle.statusFromJson("mainnet", variant);
+            assertEquals(full.beaconState(), v.beaconState());
+            assertEquals(full.finalizedBlockNumber(), v.finalizedBlockNumber());
+            assertEquals(full.finalizedSlot(), v.finalizedSlot());
+        }
     }
 
     @Test

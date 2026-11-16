@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/biafra23/myotis/go/internal/chain"
@@ -84,12 +83,35 @@ type Syncer struct {
 	// bound of 0 periods would refuse every anchor including a fresh
 	// one; the C ABI's 0 means "restore the default").
 	WsBound func() uint64
-	// StaleAccepted is the host's one-shot consent to the embedded
-	// anchor's age (myotis_accept_stale_anchor). True suppresses the
-	// ErrStaleAnchor refusals — the start gate and the in-run layer —
-	// for the rest of the loop's life, exactly as the contract says
-	// ("for the rest of this run; never persisted"). nil → never.
+	// StaleAccepted is the host's consent to the anchor's age, armed
+	// by the one-shot accept (myotis_accept_stale_anchor) or by a
+	// remembered CONTINUE (myotis_set_stale_anchor_policy) — one
+	// shared flag on the engine. Read LIVE at every gate; it is
+	// withdrawn when a remembered CONTINUE is replaced, taking an
+	// armed one-shot accept with it (host.rs:1625-1627). Never
+	// persisted, so "for the rest of the run" holds only while the
+	// consent itself does — the ABI-59 withdrawal made that literal
+	// wording false (PR #877 round 8). nil → never.
 	StaleAccepted func() bool
+	// StaleGeneration is the engine's count of consent ARMS (each
+	// false→true arming — one user action — increments it). The
+	// waiver line follows this count rather than the sampled flag:
+	// at most one line per arming, at the first STALE gate call that
+	// uses it — and an arming that lands between gate samples is
+	// still logged at the next stale one. While the store
+	// is current the gate runs only at period boundaries
+	// (RunCatchUp returns before it once caught up), so sampling a
+	// boolean missed exactly that (round 8). nil → constant
+	// generation, which still cannot mute a re-armed waiver: every
+	// gate call that finds consent absent re-arms the line (see
+	// staleGate), so the next waiver logs again. What a missing hook
+	// does lose is a withdraw-and-re-grant that lands entirely
+	// between two gate calls, so both calls see consent armed and
+	// neither sees the absence — the round-8 case, which is why the
+	// engine wires this. (An arming OF an unarmed consent is always
+	// preceded by an absence some earlier call could see; the blind
+	// spot is only the absence that is itself between two samples.)
+	StaleGeneration func() uint64
 	// Warnf carries trust-decision lines the Rust twin logs at WARN
 	// (the stale-anchor waiver, sync.rs:2478/2849/2491 — all
 	// tracing::warn!). The engine wires it to its WARN ring so the
@@ -106,21 +128,30 @@ type Syncer struct {
 	procMu sync.Mutex
 	store  *lc.Store
 
-	// staleWaived emits the consent-waiver line once per waiver
-	// STREAK: while a stale gate keeps waiving, one line (PR #877
-	// round 3), but a consent re-armed after a withdrawal is a NEW
-	// trust decision and must log again — a sync.Once hid exactly
-	// that (round 5; Rust's auto_resolve_park logs every
-	// accept_stale_anchor.swap that flips, sync.rs:2848). The flag
-	// re-arms on EVERY gate call that finds consent absent — the
-	// refusal AND a fresh-anchor pass — because a current store
-	// reaches this gate only at period boundaries (RunCatchUp
-	// returns before it once caught up), so re-arming on refusals
-	// alone left a withdrawal made while current unseen, and the
-	// waiver after a sleep past the bound passed unlogged (round 7).
-	// Every re-arm still costs the user a setting change, so this
-	// cannot spam.
-	staleWaived atomic.Bool
+	// The waiver line follows the engine's consent-generation count
+	// (waiveGen = the generation last given a line; waiveGenValid =
+	// a line went out since consent was last seen absent — every
+	// consent-absent gate call clears it, see staleGate). AT MOST one
+	// WARN per arming, at the first stale gate call that uses it — an
+	// arming that never meets a stale gate gets no line, and two
+	// armings between two samples share one (the compare sees only
+	// that the generation moved). Each arming costs the user one
+	// action, so it cannot spam — and a
+	// withdraw-and-regrant between gate samples still logs, the gap
+	// the sampled boolean of rounds 5/7 missed (round 8; Rust logs
+	// every accept_stale_anchor.swap that flips, sync.rs:2848).
+	//
+	// CONFINED to the goroutine that drives this Syncer, deliberately
+	// unguarded. staleGate is reached from RunBootstrap (through
+	// checkStartGate) and from RunCatchUp, and every caller runs both
+	// on one goroutine, one call at a time: engine.lcLoop builds its
+	// OWN Syncer on every loop run, so a restarted loop never shares
+	// these fields with the one it replaces, and cmd/myotis-lc drives
+	// its Syncer from main. A second concurrent caller — a parity
+	// fix that samples the gate off-loop, say — must put these behind
+	// a mutex or take its own, or it races them.
+	waiveGen      uint64
+	waiveGenValid bool
 }
 
 func (s *Syncer) now() time.Time {
@@ -167,25 +198,35 @@ func (s *Syncer) WarnLine(f string, a ...any) { s.warnf()(f, a...) }
 // (start gate + in-run layer): refused unless the host consented to
 // the age, and judged against the bound in force at this instant.
 func (s *Syncer) staleGate(anchorPeriod, wallPeriod uint64, what string) error {
-	// Staleness is computed BEFORE the consent is consulted — not to
-	// change the verdict (consent still waives, refusal is unchanged)
-	// but because the waiver has to be able to name what it waived.
-	// Consent is read on the fresh path too: any gate call that finds
-	// it absent re-arms the waiver line, so a withdrawal seen while
-	// the store is current still re-arms (round 7 — with one
-	// boundary pass per period at the latest, "ask me" then "continue
-	// anyway" while current, then a sleep past the bound, would
-	// otherwise waive the wake-up unlogged where Rust parks with a
-	// WARN and re-asks with another — sync.rs:2684-2691, 2848-2850).
+	// Consent is READ first, on every call, so that a fresh pass can
+	// see it absent and re-arm the waiver line (the block below). It
+	// DECIDES nothing until staleness has been judged: the verdict is
+	// unchanged (consent still waives, refusal is unchanged), and the
+	// waiver has to be able to name what it waived.
 	consented := s.staleAccepted()
+	if !consented {
+		// One rule for every caller, hooked or not: a gate call that
+		// finds consent absent re-arms the waiver line. The next
+		// waiver then needs an arming the line has not seen — either
+		// a new generation, or, with no hook, the absence just
+		// observed — so it cannot go unlogged. (This one rule
+		// replaced two caller-shaped special cases, PR #879 round 12.)
+		s.waiveGenValid = false
+	}
 	if !chain.WsAnchorStale(anchorPeriod, wallPeriod, s.boundPeriods()) {
-		if !consented {
-			s.staleWaived.Store(false)
-		}
 		return nil
 	}
 	if consented {
-		if s.staleWaived.CompareAndSwap(false, true) {
+		// At most one line per consent GENERATION (round 8): an
+		// arming the gate never sampled between calls still changes
+		// the count, so the next STALE pass logs it; repeats of the
+		// same arming stay silent however long the waiver runs.
+		gen := uint64(0)
+		if s.StaleGeneration != nil {
+			gen = s.StaleGeneration()
+		}
+		if !s.waiveGenValid || gen != s.waiveGen {
+			s.waiveGenValid, s.waiveGen = true, gen
 			s.warnf()("STALE ANCHOR: %s period %d is past the weak-subjectivity bound "+
 				"(wall period %d, bound %d) — the host's stale-anchor consent waives "+
 				"the gate; syncing forward from the stale anchor",
@@ -193,7 +234,6 @@ func (s *Syncer) staleGate(anchorPeriod, wallPeriod uint64, what string) error {
 		}
 		return nil
 	}
-	s.staleWaived.Store(false) // the next waiver is a new decision
 	return fmt.Errorf("%w: %s period %d, wall period %d, bound %d",
 		ErrStaleAnchor, what, anchorPeriod, wallPeriod, s.boundPeriods())
 }

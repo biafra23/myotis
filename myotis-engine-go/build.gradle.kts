@@ -52,6 +52,29 @@ tasks.test {
     // these tests; inputs.files tolerates the missing output on go-less machines,
     // where those tests self-skip via assumeTrue.
     inputs.files(rootProject.tasks.named("goBuildCShared")).withPropertyName("nativeGoLibs")
+    // GoStatusJsonTest splices go/internal/capi/testdata/capabilities.json
+    // (the shared capabilities golden) into its fixture, so the golden is a
+    // test input too — declared NOT optional, because that read fails hard on
+    // a missing file. Without this, a golden edit could leave the task
+    // UP-TO-DATE on a warm cache that never saw the new bytes (PR #879
+    // round-13 review).
+    inputs.file(rootProject.file("go/internal/capi/testdata/capabilities.json"))
+        .withPropertyName("capabilitiesGolden")
+    // The same holds for the module's two older cross-reads:
+    // GoAbiVersionMirrorTest reads the C ABI header it mirrors
+    // unconditionally (that is the test's point — it cannot
+    // self-skip), and GoCatalogParityTest reads the catalog golden
+    // once the library is loaded (after its availability assumption,
+    // so on a go-less machine it skips before reading). Both files
+    // are committed, hence not optional. Before this the header
+    // reached the task only through the built library, whose bytes
+    // need not change when a comment in it does, so a warm local
+    // build could report UP-TO-DATE past an edit to either
+    // (invisible to CI, which starts from a fresh checkout).
+    inputs.file(rootProject.file("rust/include/myotis_engine.h"))
+        .withPropertyName("abiHeaderMirror")
+    inputs.file(rootProject.file("rust/testdata/networks_catalog.json"))
+        .withPropertyName("networksCatalogGolden")
     doFirst {
         val nativeDir = rootProject.file("go/build")
         if (nativeDir.exists()) {

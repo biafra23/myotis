@@ -174,8 +174,9 @@ functional, every other export answers an honest refusal (permanent
 and `myotis_go_capabilities_json` answers the split at runtime.
 
 ```bash
-# CGO_CFLAGS as goBuildCShared and go-engine.yml set them (portable blst —
-# see the build note at the bottom of this document)
+# CGO_CFLAGS as goBuildCShared sets them (portable blst; the CI workflow
+# and the reproducible-builds gate additionally pass -g — see the build
+# note at the bottom of this document)
 CGO_CFLAGS="-O2 -D__BLST_PORTABLE__" \
   go build -buildmode=c-shared -o build/libmyotis_engine_go.so ./cmd/myotis-capi
 scripts/check_capi_symbols.sh   # every header symbol must be exported (CI runs both)
@@ -258,15 +259,18 @@ no checkpoint-anchor refresh (ABI 58 refuses by name,
 plainly (PR #877 round 3): the weak-subjectivity **re-check while
 running** differs from the Rust loop. After bootstrap, an in-run
 refusal (a long sleep, or Settings moving off "continue anyway")
-stalls the steady loop silently — every slot refuses at the in-run
-gate, so no finality poll runs and no anchor is published, the status
-stays `SYNCING`/`CATCHING_UP` (it reports `STALE_ANCHOR` only when the
-loop itself died) and **no dialog opens**; the stall logs once at WARN
+stalls the steady loop — every slot refuses at the in-run gate, so no
+finality poll runs and no anchor is published, the status stays
+`SYNCING`/`CATCHING_UP` (it reports `STALE_ANCHOR` only when the loop
+itself died) and **no dialog opens**; the stall is not silent: it logs
+once at WARN
 (`STALE ANCHOR: held committee aged ... while running`, re-warned per
 new stall, so the hosts' WARN-filtered view keeps it) besides the
 per-slot INFO `re-catch-up:` line, and the ways out are choosing
-CONTINUE again in Settings or a restart, which parks at the bootstrap
-gate and asks. The Rust loop instead re-publishes `STALE_ANCHOR` and re-asks.
+CONTINUE again in Settings, **raising the weak-subjectivity bound in
+Settings** (applied live — the gate re-reads the bound every slot, so
+the stall ends without a restart, as the WARN line itself says), or a
+restart, which parks at the bootstrap gate and asks. The Rust loop instead re-publishes `STALE_ANCHOR` and re-asks.
 The parity fix likely needs no status-contract change (PR #877
 round 6): Rust re-publishes that park every 5 s from its
 still-running loop (`sync.rs:2691`), so `STALE_ANCHOR` from a live
@@ -294,7 +298,13 @@ off the regular profile too).
 `go-engine.yml`, which built bare before: the ADX build's load-time
 constructor answers SIGILL with `_exit(128+4)` and kills whatever process
 dlopens the library on a pre-Broadwell/pre-Zen CPU, past every
-`UnsatisfiedLinkError` handler) and `GOTOOLCHAIN=local`
+`UnsatisfiedLinkError` handler; `go-engine.yml` and the gate's
+`scripts/repro/build_linux.sh` additionally pass `-g` — debug info, no
+instructions — and the gate pairs its flags with the workflow so the blst
+CONFIGURATION CI tests is the one it compares (same flags, not same
+bytes: the gate also builds with `-trimpath` and the image's pinned
+gcc, while this task compiles with the local compiler, so this task's
+objects carry no byte- or instruction-level promise against theirs)) and `GOTOOLCHAIN=local`
 (it skips with a note when the local toolchain is older than `go.mod`'s
 line rather than downloading one mid-build; CI installs it via
 `setup-go`). A skip — missing `go` (resolved like `cargo`, incl.

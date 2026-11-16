@@ -7,10 +7,14 @@ package engine
 // pin the failure path itself.
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"github.com/biafra23/myotis/go/internal/chain"
 	"github.com/biafra23/myotis/go/internal/clsync"
+	"log/slog"
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -87,9 +91,10 @@ func TestSetStaleAnchorPolicyWithdrawalMirrorsRust(t *testing.T) {
 	if e.StaleAccepted() {
 		t.Error("replacing CONTINUE with ASK must withdraw the consent CONTINUE armed")
 	}
-	// CHECKPOINT (1) is refused at this door too (the fetch is the engine-
-	// parity gap; capabilities anchorRefresh:false) and a refused policy
-	// must not disturb an armed consent (a one-shot accept stays armed).
+	// Then a one-shot arming, and CHECKPOINT (1) refused at this door too
+	// (the fetch is the engine-parity gap; capabilities anchorRefresh:false)
+	// — a refused policy must not disturb an armed consent (the one-shot
+	// stays armed).
 	if !e.AcceptStale() {
 		t.Fatal("AcceptStale (one-shot) must arm")
 	}
@@ -98,6 +103,27 @@ func TestSetStaleAnchorPolicyWithdrawalMirrorsRust(t *testing.T) {
 	}
 	if !e.StaleAccepted() {
 		t.Error("a REFUSED policy write must not withdraw an armed consent (apply-or-refuse)")
+	}
+	// The APPLIED-ASK case the round-10 comment claimed was pinned but
+	// was not: a bare one-shot must survive an ASK write (withdrawal
+	// fires only when a remembered CONTINUE is replaced). Reachable on
+	// every click of the Settings "Ask me" chip (NodeScreen re-sends
+	// ASK unconditionally) — without this case, "ASK always withdraws"
+	// passed the whole suite (round 11).
+	if !e.SetStaleAnchorPolicy(0) {
+		t.Fatal("ASK must apply")
+	}
+	if !e.StaleAccepted() {
+		t.Error("ASK over a bare one-shot must not withdraw it (only a replaced CONTINUE does)")
+	}
+	// The consent GENERATION the waiver line follows (PR #877 round 8):
+	// one bump per arming, none per refusal or refused write. Fresh
+	// engine 0 → CONTINUE arms 1 → ASK withdraws, still 1 → one-shot
+	// arms 2 → refused CHECKPOINT disturbs nothing, still 2 → applied
+	// ASK over that one-shot disturbs nothing, still 2 (the three
+	// writes above run in exactly this order).
+	if g := e.StaleGeneration(); g != 2 {
+		t.Errorf("staleGen = %d, want 2 (one bump per arming, none per withdrawal or refusal)", g)
 	}
 	// The 2 → 1 sequence specifically (PR #877 round-2): replacing a
 	// remembered CONTINUE with CHECKPOINT withdraws the CONTINUE's consent
@@ -145,5 +171,132 @@ func TestStallWatcherReArmsOnAnyGatePass(t *testing.T) {
 		if lines != tc.lines {
 			t.Fatalf("step %d (%s): lines = %d, want %d", i, tc.why, lines, tc.lines)
 		}
+	}
+}
+
+// TestWireSyncerHooksTrackEngineState pins the wiring the round-8
+// generation fix depends on and that no other test covers (PR #879
+// round-9 review: deleting the StaleGeneration assignment left every
+// test green while production took clsync's constant-generation
+// fallback). The hooks must be live reads of engine state, not
+// captures: mutate the engine, and the syncer's hooks answer
+// differently on the next call. The Syncer is taken from
+// newLoopSyncer — the loop's own constructor — so the wiring line
+// inside it is pinned too (round 19); what remains untested is only
+// lcLoop's single expression calling the constructor, where skipping
+// it means writing a different call entirely.
+func TestWireSyncerHooksTrackEngineState(t *testing.T) {
+	var logBuf bytes.Buffer // must receive the WARN the hook promises (round 14)
+	e, err := New(Config{DataDir: t.TempDir(), ListenPort: -1,
+		Logger: slog.New(slog.NewTextHandler(&logBuf, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	// Take the Syncer from the LOOP's own constructor, not a hand-built
+	// zero value: `newLoopSyncer` is what round 18's seam made testable,
+	// and the deleted-wiring-line mutant (the whole point of the seam)
+	// only fails here if the syncer comes from newLoopSyncer — a
+	// hand-built one calls wireSyncerHooks itself and never sees the
+	// deletion (round 19: the seam moved the unpinned line one frame
+	// down, it did not pin it). NewHost has no listen address and dials
+	// nothing, so this is construction only — ~10ms, CI-safe.
+	h, err := clsync.NewHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	s := e.newLoopSyncer(chain.ConsensusMainnet(), h, nil)
+	if s.Warnf == nil || s.WsBound == nil || s.StaleAccepted == nil || s.StaleGeneration == nil {
+		t.Fatalf("wireSyncerHooks left a hook nil: warn=%v bound=%v consent=%v gen=%v",
+			s.Warnf != nil, s.WsBound != nil, s.StaleAccepted != nil, s.StaleGeneration != nil)
+	}
+	// The WARN LEVEL of the Warnf hook is the last unpinned link of the
+	// trail: clsync pins that the waiver routes through Warnf (not Logf),
+	// capi pins how the ring renders level=WARN, GoLogDrainTest pins the
+	// JVM normalization — only this test can pin that the engine's hook
+	// LOGS at WARN. An e.log.Info here passes every other test while
+	// dropping the waiver AND the stall line out of the hosts'
+	// WARN-filtered view — the round-4 regression, one remove (round 14).
+	s.Warnf("waiver probe %d", 7)
+	if got := logBuf.String(); !strings.Contains(got, `level=WARN msg="waiver probe 7"`) {
+		t.Fatalf("the Warnf hook must log at WARN, got %q", got)
+	}
+	if s.StaleAccepted() {
+		t.Fatal("fresh engine: consent must start disarmed")
+	}
+	if g := s.StaleGeneration(); g != 0 {
+		t.Fatalf("fresh engine: generation = %d, want 0", g)
+	}
+	b := s.WsBound()
+	if b < 1 {
+		t.Fatalf("WsBound hook returned %d, want the network default (>= 1)", b)
+	}
+	// The bound hook must be LIVE like the consent hooks, not a value
+	// captured at wiring time (round 15). Nothing else can pin this:
+	// StatusJSON reads Engine.EffectiveWsBound directly (capi.go:659),
+	// so capi's setter test passes with a hook that stopped following
+	// the setter, and no test asserts a gate after a bound change made
+	// through this wiring. In production that mutant is the
+	// accepted-and-ignored shape the Trust rules forbid — the setter
+	// answers true and the status reports the new bound while the
+	// running loop keeps judging by the bound captured when the loop
+	// started — and it hides well, because releasing a PARKED loop
+	// rebuilds the Syncer and captures afresh, so only the in-run path
+	// goes wrong: raising the bound to end a stall (a way out the
+	// stall WARN itself names), or lowering it.
+	if !e.SetWsBoundPeriods(b + 7) {
+		t.Fatal("SetWsBoundPeriods must apply on an open engine")
+	}
+	if got := s.WsBound(); got != b+7 {
+		t.Fatalf("WsBound hook = %d after SetWsBoundPeriods(%d): a capture, not a live read", got, b+7)
+	}
+	// The override stays set: nothing below reads the bound, and
+	// restartIfParked returns at !e.lcStarted, so it disturbs nothing.
+	if !e.AcceptStale() {
+		t.Fatal("AcceptStale failed")
+	}
+	if !s.StaleAccepted() {
+		t.Fatal("hook captured a snapshot instead of reading live consent")
+	}
+	if g := s.StaleGeneration(); g != e.StaleGeneration() || g != 1 {
+		t.Fatalf("hook generation = %d, engine = %d, want both 1", g, e.StaleGeneration())
+	}
+	// The round-7 shared-flag case, end to end through the hook: a
+	// remembered CONTINUE after a one-shot, then ASK replacing it,
+	// withdraws the one consent both armed. (A bare one-shot SURVIVES
+	// an ASK write — withdrawal only fires when a remembered CONTINUE
+	// is replaced; that case is pinned in
+	// TestSetStaleAnchorPolicyWithdrawalMirrorsRust, which now writes
+	// ASK over a bare one-shot too.)
+	if !e.SetStaleAnchorPolicy(2) { // CONTINUE (already armed: no bump)
+		t.Fatal("CONTINUE must apply")
+	}
+	if g := s.StaleGeneration(); g != 1 {
+		t.Fatalf("re-arming an armed consent must not bump the generation (got %d)", g)
+	}
+	// The one-shot twin of the no-bump rule, in the order the park
+	// dialog's "continue anyway" with "remember" ticked produces it
+	// (NodeScreen.kt:587-591: onRemember then onContinue, i.e.
+	// SetStaleAnchorPolicy(CONTINUE) then accept). Consent is armed
+	// here and the generation is 1, so this accept must change
+	// neither — an unconditional bump would turn that one click into
+	// two generations, and the waiver log into two lines for one
+	// user action (round 12; the CONTINUE guard above was pinned,
+	// this twin was not).
+	if !e.AcceptStale() {
+		t.Fatal("AcceptStale on an armed consent must still answer true")
+	}
+	if g := s.StaleGeneration(); g != 1 {
+		t.Fatalf("a one-shot accept on an armed consent must not bump the generation (got %d)", g)
+	}
+	if !e.SetStaleAnchorPolicy(0) { // ASK replaces CONTINUE -> withdrawal
+		t.Fatal("ASK must apply")
+	}
+	if s.StaleAccepted() {
+		t.Fatal("withdrawal did not reach the syncer's hook")
+	}
+	if g := s.StaleGeneration(); g != 1 {
+		t.Fatalf("withdrawal must not bump the generation (got %d)", g)
 	}
 }
