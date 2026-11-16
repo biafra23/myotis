@@ -175,6 +175,28 @@ class NextCommitteeSelectionTest {
         assertFalse(f.processor().processFinalityUpdate(fin));
     }
 
+    /**
+     * #737: catch-up with a wall clock ahead of the store. The caller force-rotates after
+     * each applied update; a following update whose finalized header enters the period
+     * the store already rotated into must not rotate it again. Twin of the Rust
+     * {@code catch_up_force_rotation_then_a_crossing_update_rotates_once}.
+     */
+    @Test
+    void catchUpForceRotationThenACrossingUpdateRotatesOnce() throws IOException {
+        Fixture f = withNext();
+        f.store().forceRotateIfPastPeriod(14_704_714L);
+        assertEquals(1778, f.store().getCurrentSyncCommitteePeriod());
+        byte[] rotatedInto = f.store().getCurrentSyncCommittee().hashTreeRoot();
+        LightClientUpdate second = LightClientUpdate.decode(corpus("002-update.ssz"));
+        assertEquals(1778, BeaconChainSpec.computeSyncCommitteePeriod(second.finalizedHeader().beacon().slot()));
+        assertTrue(f.processor().processUpdate(second));
+        assertEquals(1778, f.store().getCurrentSyncCommitteePeriod(), "rotated twice into one period");
+        assertEquals(BeaconChainSpec.computeSyncCommitteePeriod(f.store().getFinalizedSlot()),
+                f.store().getCurrentSyncCommitteePeriod());
+        assertTrue(Arrays.equals(rotatedInto, f.store().getCurrentSyncCommittee().hashTreeRoot()));
+        assertTrue(f.store().getNextSyncCommittee() != null, "the P+2 committee is held as next");
+    }
+
     @Test
     void corruptedSignaturesAreRejectedInBothPeriods() throws IOException {
         for (String name : new String[] {"001-update.ssz", "002-update.ssz"}) {

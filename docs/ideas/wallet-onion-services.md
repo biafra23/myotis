@@ -334,15 +334,13 @@ a secp256k1 key is not an onion key.)
 ## The Tor side
 
 The Rust engine embeds Arti as a client (`rust/myotis-net/Cargo.toml`:
-`arti-client` 0.44 with `default-features = false`, `tokio` + TLS, behind
+`arti-client` 0.48 with `default-features = false`, `tokio` + TLS, behind
 `-PtorEngine`). Even *reading* from the overlay needs a feature today's build
 lacks: `onion-service-client` is not enabled (`rust/Cargo.lock` has no
 `tor-hsclient`), so every reading wallet needs it, and its size belongs next
 to the ~9.3 MB per ABI Arti already adds to the APK (`../how-it-works/privacy-and-tor.md`
-§3). Hosting needs `onion-service-service` as well, which is opt-in, and very
-likely an
-Arti upgrade first — with the Android and iOS build work that brings — since
-what follows describes the current release, not the pinned one. Current Arti
+§3). Hosting needs `onion-service-service` as well, which is opt-in. What
+follows was written against Arti 0.47 (#860); the engine pins 0.48 now. Current Arti
 docs (arti 2.7.0, tor-hsservice 0.47.0, October 2026) list onion-service hosting,
 vanguards on by default, and restricted discovery as experimental;
 `tor-hsservice` still calls itself "a low-level implementation … that may not

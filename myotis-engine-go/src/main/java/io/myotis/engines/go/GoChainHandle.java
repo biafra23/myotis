@@ -64,6 +64,47 @@ import java.util.List;
  *       methods explicitly: {@code null} ("cannot answer verified") on the
  *       plain reads, {@code refused(...)} on the detailed call/estimate/send
  *       channel (see its class doc for the retryable-status reasoning).</li>
+ *   <li><b>ABI 58/59, applied where the engine can and refused where it
+ *       can't.</b> {@link #setStaleAnchorPolicy} routes to the engine (not the
+ *       {@code :myotis-api} default) so the return is the engine's own answer,
+ *       identical to what a C-ABI host sees: ASK and CONTINUE are APPLIED —
+ *       CONTINUE through the same sticky consent {@link #acceptStaleAnchor}
+ *       uses, re-read at every weak-subjectivity gate and withdrawn when a
+ *       later policy replaces it (exactly host.rs's rule) — while the
+ *       CHECKPOINT code is REFUSED (false): the Go engine has no checkpoint
+ *       fetch, so it does not accept a policy it cannot act on
+ *       ({@code capabilities.anchorRefresh:false}). {@link
+ *       #refreshAnchorFromCheckpointz} parses the C export's contract-shaped
+ *       answer, which today is always the {@code applied:false} refusal — the
+ *       one-shot {@link #acceptStaleAnchor} is the way forward until the fetch
+ *       lands (engine-parity; the parse already handles the applied shape).
+ *       Related engine-parity gap, recorded not fixed (PR #877 rounds 2-3):
+ *       the "asks again at a later park" promise holds at the bootstrap
+ *       gate only. After bootstrap, an in-run {@code ErrStaleAnchor} from
+ *       catch-up retries leaves the loop running but STALLED — it refuses
+ *       at the in-run gate every slot, so {@code PollFinality} never runs
+ *       and no anchor is published; {@code BeaconState} reports
+ *       {@code STALE_ANCHOR} only when the loop itself died, so the status
+ *       stays {@code SYNCING}/{@code CATCHING_UP} and NO dialog opens
+ *       (the bootstrap park's dialog was already answered, or a pre-start
+ *       CONTINUE meant there never was one). The stall makes itself seen
+ *       once at WARN — "STALE ANCHOR: held committee aged ... while
+ *       running" at the stall onset, re-warned when a new stall begins,
+ *       in the hosts' WARN-filtered view (PR #877 round 5) — beside the
+ *       per-slot INFO "re-catch-up:" line; the ways out are choosing
+ *       CONTINUE again in Settings or a restart, which parks at the
+ *       bootstrap gate and asks. The parity fix likely needs NO
+ *       status-contract change (PR #877 round 6 corrected the
+ *       round-5 note that claimed one): Rust re-publishes the park
+ *       every 5 s from its still-running loop ({@code sync.rs:2691}),
+ *       so {@code STALE_ANCHOR} from a live loop is the contract both
+ *       engines already share — a flag set on an in-run
+ *       {@code ErrStaleAnchor} and cleared on any other outcome, with
+ *       {@code BeaconState} reporting {@code STALE_ANCHOR} while set,
+ *       re-opens the dialog within a slot and keeps the walked-forward
+ *       store, which returning the error (and re-bootstrapping) would
+ *       throw away. Owner's call; recorded here as the parity step's
+ *       input.</li>
  * </ul>
  *
  * <p>{@link #reads()} and the loopback listener follow the Rust twin exactly:
@@ -631,6 +672,89 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
         if (!linked(() -> GoEngineNative.nativeAcceptStaleAnchor(handle))) {
             log.warn("[engines] acceptStaleAnchor dropped: unknown handle {}", handle);
         }
+    }
+
+    @Override
+    public io.myotis.api.AnchorRefresh refreshAnchorFromCheckpointz(boolean allowUnconfirmed) {
+        // Parsed from the C export's own answer (as RustChainHandle does), so the
+        // reason the host shows is the engine's word, not the :myotis-api
+        // default's generic one. Today the Go export always refuses — no
+        // checkpoint fetch (capabilities anchorRefresh:false) — but the shape is
+        // the contract's, and a later fetch implementation flows through here
+        // with no JVM change.
+        return parseAnchorRefresh(
+                linked(() -> GoEngineNative.nativeRefreshAnchorFromCheckpointz(handle, allowUnconfirmed)));
+    }
+
+    /**
+     * The engine's {@code refresh_anchor_from_checkpointz} JSON as the API
+     * record — the mirror of {@code RustChainHandle.parseAnchorRefresh}
+     * (same shape, pinned engine-side by {@code RustAnchorRefreshJsonTest}
+     * and here by {@code GoAnchorRefreshJsonTest}): the applied record is
+     * built only when EVERY member parses, and anything unreadable is a
+     * refusal — never a half-built {@code applied:true} that keeps an
+     * error, which would break the record's own "error: null when applied"
+     * contract (PR #877 round-2).
+     */
+    static io.myotis.api.AnchorRefresh parseAnchorRefresh(String json) {
+        try {
+            JsonObject o = Json.parse(json).asObject();
+            boolean unconfirmed = o.getBoolean("unconfirmed", false);
+            if (!o.getBoolean("applied", false)) {
+                return new io.myotis.api.AnchorRefresh(false, null, 0, 0, List.of(), List.of(),
+                        unconfirmed, o.getString("error", "refused"));
+            }
+            return new io.myotis.api.AnchorRefresh(true, o.getString("root", null),
+                    o.getLong("slot", 0), o.getLong("epoch", 0), strings(o.get("operators")),
+                    strings(o.get("confirmedBy")), unconfirmed, null);
+        } catch (RuntimeException e) {
+            return io.myotis.api.AnchorRefresh.refused("malformed engine answer: " + e.getMessage());
+        }
+    }
+
+    private static List<String> strings(JsonValue v) {
+        List<String> out = new java.util.ArrayList<>();
+        if (v != null && v.isArray()) {
+            for (JsonValue e : v.asArray()) out.add(e.asString());
+        }
+        return out;
+    }
+
+    @Override
+    public boolean setStaleAnchorPolicy(io.myotis.api.StaleAnchorPolicy policy) {
+        // The engine's answer, verbatim — not the :myotis-api default's mapping.
+        // That default would report CONTINUE applied unconditionally and ASK
+        // applied even after a CONTINUE; here the engine says so: CONTINUE is
+        // APPLIED (the sticky consent re-read at every weak-subjectivity gate,
+        // a replaced CONTINUE withdrawn exactly like host.rs), ASK is applied or
+        // reports the dead handle, and CHECKPOINT answers false for its lack of
+        // a fetch (capabilities anchorRefresh:false). Same truth C-ABI hosts
+        // get (PR #877 review).
+        boolean ok = linked(() -> GoEngineNative.nativeSetStaleAnchorPolicy(handle, policy.ordinal()));
+        if (!ok) {
+            if (policy == io.myotis.api.StaleAnchorPolicy.CHECKPOINT) {
+                // CHECKPOINT is refused for its missing fetch. The
+                // refusal withdraws a REMEMBERED CONTINUE (the engine
+                // un-arms on any replacement, host.rs); a one-shot
+                // AcceptStale alone survives it (stalePolicy stays 0,
+                // so the withdrawal line does not fire) — but the two
+                // consents share ONE acceptStale flag, so a remembered
+                // CONTINUE given AFTER a one-shot takes the one-shot
+                // down with it when replaced (PR #877 round 7; Rust
+                // behaves identically, one accept_stale_anchor,
+                // host.rs:1625-1627). The wording has to hold for
+                // all four cases: dead handle, one-shot only,
+                // remembered only, one-shot then remembered.
+                log.warn("[engines] setStaleAnchorPolicy(CHECKPOINT) not applied: the Go "
+                        + "engine has no checkpoint fetch. A remembered 'continue anyway', if "
+                        + "there was one, IS withdrawn by this refusal, together with any one-shot "
+                        + "accept (they share one consent); a one-shot accept alone still holds");
+            } else {
+                log.warn("[engines] setStaleAnchorPolicy({}) not applied: unknown handle, or "
+                        + "a closed engine", policy);
+            }
+        }
+        return ok;
     }
 
     @Override

@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"encoding/hex"
 	"log/slog"
 	"net"
 	"strconv"
@@ -8,8 +9,32 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/p2p/discover/v4wire"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 )
+
+// TestDecodePubkeyRefusesOutOfRangePoint pins the exact discv4 crash path the
+// go-ethereum v1.16.8 -> v1.16.9 bump (PR #838) closes: a Neighbors entry
+// carrying a NON-CANONICAL pubkey — x = P+1, a re-encoding of the valid point
+// (1, y) that satisfies y^2 = x^3+7 (mod P) but is not a field element. On
+// v1.16.8 v4wire.DecodePubkey's IsOnCurve checked the equation mod P only
+// (CVE-2026-26314) and accepted it, and the accepted point then panicked in
+// enode.NewV4 on the discovery goroutine — killing this process. v1.16.9's
+// range check makes DecodePubkey refuse it here, before NewV4 is reached.
+// v4wire is a dependency already (discovery.go builds/reads v4 messages), so
+// this costs no go.sum line. The vector arithmetic is verified in the rlpx
+// package's TestEcdhXRefusesOutOfRangeCoordinate comment.
+func TestDecodePubkeyRefusesOutOfRangePoint(t *testing.T) {
+	x, _ := hex.DecodeString("fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc30") // P+1
+	y, _ := hex.DecodeString("4218f20ae6c646b363db68605822fb14264ca8d2587fdd6fbc750d587e76a7ee") // sqrt(8) mod P
+	var pk v4wire.Pubkey
+	copy(pk[:32], x)
+	copy(pk[32:], y)
+	if _, err := v4wire.DecodePubkey(crypto.S256(), pk); err == nil {
+		t.Fatal("out-of-range Neighbors pubkey accepted by DecodePubkey " +
+			"(go-ethereum pin backslid to <= v1.16.8; enode.NewV4 would panic on it)")
+	}
+}
 
 func node(t *testing.T, ip string, tcp, udp int) *enode.Node {
 	t.Helper()

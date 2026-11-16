@@ -2,7 +2,7 @@
 // part 1b): the handle table, lifecycle, and JSON plumbing that
 // cmd/myotis-capi exports as a c-shared library for JVM JNA consumers.
 //
-// The contract is rust/include/myotis_engine.h (ABI 57). The Go engine
+// The contract is rust/include/myotis_engine.h (ABI 59). The Go engine
 // is the READ engine of that contract: the lifecycle functions, the
 // account/storage verified reads, status, and the log drain are
 // FUNCTIONAL; every other exported symbol exists (so the host's
@@ -46,13 +46,19 @@ import (
 	"github.com/biafra23/myotis/go/internal/chain"
 	"github.com/biafra23/myotis/go/internal/clsync"
 	"github.com/biafra23/myotis/go/internal/engine"
+	"github.com/biafra23/myotis/go/internal/lc"
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
 // MyotisABIVersion is the myotis_engine.h ABI whose subset this library
 // implements; myotis_init returns it so a host gated on the header's
-// MYOTIS_ABI_VERSION macro gates identically on Go and Rust.
-const MyotisABIVersion = 57
+// MYOTIS_ABI_VERSION macro gates identically on Go and Rust. Both ABI-58/59
+// additions are exported, not left unlinked: the checkpoint refresh
+// (58 = myotis_refresh_anchor_from_checkpointz) is honestly refused (no
+// fetch), the remembered stale-anchor policy (59 =
+// myotis_set_stale_anchor_policy) is APPLIED for ASK and CONTINUE and
+// refused only for its fetch-backed CHECKPOINT code.
+const MyotisABIVersion = 59
 
 // ReadBudget is the wall-clock cap on one blocking verified read — the
 // same ~90 s budget the Rust twin gives its reads, so a host's JNA
@@ -198,6 +204,40 @@ func Unsupported(name string) string {
 func retryableErr(msg string) string {
 	b, _ := json.Marshal(map[string]string{"error": msg})
 	return string(b)
+}
+
+// AnchorRefreshUnsupported is the refusal of
+// myotis_refresh_anchor_from_checkpointz (ABI >= 58) in the JSON shape that
+// function's own contract documents — the generic permanentErr envelope
+// carries the wrong key set for it. The one-shot consent path
+// (myotis_accept_stale_anchor) stays available; the checkpoint fetch with
+// its long-known-peer confirmation is an engine-parity item.
+func AnchorRefreshUnsupported() string {
+	b, _ := json.Marshal(map[string]any{
+		"applied": false,
+		"error": "go engine: checkpoint-anchor refresh " +
+			"(myotis_refresh_anchor_from_checkpointz) is not implemented by this " +
+			"engine; the stale anchor stays parked — myotis_accept_stale_anchor still applies",
+		"unconfirmed": false,
+	})
+	return string(b)
+}
+
+// SetStaleAnchorPolicy answers myotis_set_stale_anchor_policy (ABI >= 59):
+// the user's REMEMBERED answer, honored by the sync loop at every park.
+// Engine.SetStaleAnchorPolicy is the one semantics (ASK posture +
+// WITHDRAWAL of a replaced CONTINUE, mirroring host.rs; CONTINUE applied
+// through the same sticky consent the one-shot setter uses); only the
+// fetch-backed CHECKPOINT answer is refused here and at the engine door
+// alike (capabilities anchorRefresh:false — never accepted and ignored).
+// False for an unknown handle, as the contract says; settable before
+// start.
+func SetStaleAnchorPolicy(handle int64, policy int32) bool {
+	eng, _, ok := lookup(handle)
+	if !ok {
+		return false
+	}
+	return eng.SetStaleAnchorPolicy(policy)
 }
 
 // permanentErr: the -32602 shape, built by json.Marshal so a message
@@ -571,6 +611,34 @@ func meteringString(code int32) string {
 	}
 }
 
+// statusPeriods computes the (currentPeriod, targetPeriod) pair for the
+// status JSON — pulled out of StatusJSON as a pure function so the
+// parked-anchor age is pinned by a table test rather than by parking a
+// live loop (PR #877 round-2). The cases, per the host.rs status_object
+// contract:
+//
+//   - anchor held: current is the anchor's period (the dialog ages from it);
+//   - parked with no anchor (STALE_ANCHOR at the bootstrap gate): current is
+//     the embedded checkpoint's period — the period the gate REFUSED, which
+//     is what the contract says a parked status reports (leaving 0 made the
+//     dialog read the age as the whole chain history, ~1900 periods);
+//   - still bootstrapping: 0 — nothing was refused yet.
+//
+// target is max(current, wall) either way. The checkpoint period arrives
+// through lc.CheckpointPeriod — the ONE definition of the anchor all three
+// weak-subjectivity gates refuse (clsync's checkStartGate comment), so the
+// status can never drift from what the gates actually compared.
+func statusPeriods(beaconState string, anchorSlot uint64, haveAnchor bool, checkpointPeriod, wallPeriod uint64) (uint64, uint64) {
+	current := uint64(0)
+	switch {
+	case haveAnchor:
+		current = chain.SyncCommitteePeriod(anchorSlot)
+	case beaconState == "STALE_ANCHOR":
+		current = checkpointPeriod
+	}
+	return current, max(current, wallPeriod)
+}
+
 func StatusJSON(handle int64) string {
 	eng, started, ok := lookup(handle)
 	if !ok {
@@ -605,18 +673,19 @@ func StatusJSON(handle int64) string {
 		st.SnapServingPeers = snap
 		st.Snap2ServingPeers = snap2
 		st.ReadyPeers = eng.ReadyPeerCount()
-		if a, ok := eng.Anchor(); ok {
+		a, haveAnchor := eng.Anchor()
+		var anchorSlot uint64
+		if haveAnchor {
+			anchorSlot = a.BeaconSlot
 			st.FinalizedSlot = a.BeaconSlot
 			st.OptimisticSlot = a.OptimisticSlot
-			st.CurrentPeriod = chain.SyncCommitteePeriod(a.BeaconSlot)
-			st.TargetPeriod = max(st.CurrentPeriod, wallPeriod)
 			st.FinalizedRootHex = hex.EncodeToString(a.StateRoot[:]) // no 0x, like hex32
 			st.OptimisticBlockNumber = a.OptimisticExecNo
 			st.FinalizedBlockNumber = a.ExecNumber
 			st.ExecutionBlockNumber = a.ExecNumber
-		} else {
-			st.TargetPeriod = wallPeriod
 		}
+		st.CurrentPeriod, st.TargetPeriod =
+			statusPeriods(st.BeaconState, anchorSlot, haveAnchor, lc.CheckpointPeriod(c), wallPeriod)
 	}
 	b, err := json.Marshal(st)
 	if err != nil {
@@ -636,6 +705,14 @@ func capabilities() map[string]bool {
 		// Engine.AcceptStale (gates read them per check, and a parked
 		// loop restarts): these are true in the full sense.
 		"wsBoundOverride": true, "staleAnchorConsent": true,
+		// The ABI-58 checkpoint fetch is not implemented (refusal in the
+		// contract's own applied:false shape — the one-shot consent above
+		// stays the way forward). The ABI-59 policy IS honoured for the
+		// answers this engine can apply (ASK posture, CONTINUE through the
+		// sticky consent, withdrawal of a replaced CONTINUE — Engine.
+		// SetStaleAnchorPolicy); only the policy's CHECKPOINT code is
+		// refused, and that gap is this false.
+		"anchorRefresh": false, "staleAnchorPolicy": true,
 		// Recorded + contract-answered, but inert while this engine
 		// never serves blocks to peers (it is the dial-only side of
 		// the split that blocks:false already declares):

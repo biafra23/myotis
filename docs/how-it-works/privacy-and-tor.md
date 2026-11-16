@@ -39,7 +39,10 @@
 > or circuit failure) send it back to the peer cache, and this process does
 > not take it again; a reserve over its share — the cache shrank — hands its
 > weakest nodes back, Tor on or off. Among equally good nodes each read draws
-> a fresh order, so reads spread over the reserve. Both directions are also guarded
+> a fresh order, so reads spread over the reserve. Both orders need OS entropy:
+> without it the reserve takes in no node and a read or send gets no
+> candidate, so it fails closed rather than fall back to a fixed, computable
+> order (#823). Both directions are also guarded
 > in-process by node id: a node reached over Tor is left undialed directly
 > until ten minutes past the Tor operation's end, claimed under the same lock
 > as a direct dial; with no ready node the read or send fails closed
@@ -83,6 +86,8 @@ sensitivity:
 
 > **Disclosure set widens under read hedging (clearnet).** Interactive verified reads hedge across peers to survive a silent one (`HEDGE_DELAY`, myotis #320): an address-carrying read whose first peer is slower than the hedge delay discloses `keccak(address)` to up to `MAX_HEDGED_ATTEMPTS` (3) peers, not one, even when the first peer goes on to answer. Sequential rotation disclosed to a new peer only on failure; hedging discloses on slowness. This is a clearnet-only tradeoff — the Tor read path routes each address over its own circuit *before* hedging, so it is unaffected. `eth_call` and gas estimation hedge their account, storage and bytecode reads through the same race (the state oracle, `evm.rs`), so on the oracle's serial path the accounts and storage-key hashes a call touches reach up to three peers under the same condition — and those reads have no Tor path at all (see Status above), so the Tor toggle does not narrow them. Block and receipt reads are hedged too; they carry no address, but *which* blocks a send is being watched in (the Receipt tracking row above) now reaches up to three peers the same way. Accepted deliberately: the alternative (excluding address-carrying reads from hedging) would leave exactly the slow-link case this leak's worst environment — mobile/congested — stalling.
 
+> **Each address has its own peers (clearnet, Rust engine).** In the Rust engine (the Java engine keeps its single order, `RLPxConnector.trySnapPeer`), address-carrying snap reads — an account read, a storage read (keyed on the holder when it names one, so a token balance goes where its holder's account read goes, else on the contract), an `eth_getProof`, and the EVM oracle of an `eth_call`, a gas estimate, an `eth_createAccessList` or a `debug_traceCall` that names a sender (a deployless `eth_call`: its sender only) or takes one address as its only argument (a token's `balanceOf(holder)`; by that address) — take the pool's peers in a per-address order (`PeerPool::snap_peers_for`, punicus #253): the read ladder's tiers unchanged (health first: behind, benched, coverage, unproven), but within each tier the peers ranked by `keccak(salt ‖ address ‖ node id)`, rendezvous-style, under a secret salt kept for the life of the install beside the peer cache (`peers-affinity[-net].cache`; a host without a data directory falls back to a per-run salt from the node key). Kept, because the cache's Confirmed peers and the pins come back on every start: a new order per run would let a long-lived peer lead most addresses at one start or another. Before, every address of the wallet went to the same first peer within milliseconds, and that peer could link them all; now each healthy peer is first for about 1/P of the addresses, and one address keeps going to the same peers, its hedges included, so what a peer learns over time is its share, not the set. P there is the number of peers in the ladder's top tier at that moment: a cold start (no cache-Confirmed peers, as on a fresh install or a restored wallet) begins with a top tier of one or two, and every address leads with them until the rest are proven, as before; and a peer that drops a tier hands its addresses to their next peer by weight, so over a run an address reaches its top two or three peers (those its hedges use anyway) and a peer's share is nearer k/P than 1/P. It does not unlink reads from the IP or the node key — peers that pool what they see, or one that is first for several of the wallet's addresses, still link those — and any other call keeps the plain ladder. Tor mode is unaffected: it routes before this order is used.
+
 The design goal is therefore precise: **unlink the snap-query and tx-broadcast
 flows from the user's IP**, without breaking the trust model, and without paying
 Tor's latency on flows that don't need it.
@@ -98,6 +103,7 @@ Tor carries **TCP streams only**. Myotis' transports:
 | CL libp2p req/resp over QUIC (`/udp/<port>/quic-v1`; the Rust engine listens on an ephemeral UDP port, dials a peer's QUIC address FIRST — the spec's order — and reaches a QUIC-only peer over QUIC alone) | UDP | **No** — if CL traffic is ever routed over Tor, QUIC has to be off for it (`HostConfig.listen_quic = None`, no QUIC dial, QUIC-only candidates dropped), or most CL peers are reached in the clear |
 | discv4 (EL discovery) | UDP | **No** |
 | discv5 (CL discovery) | UDP | **No** |
+| HTTPS to checkpoint-sync servers, at a stale-anchor park on the user's request ([stale-anchor.md](stale-anchor.md)) | TCP | Could be, but is **not** routed: its system-resolver lookups and clear SNI name the network, the disclosure #539 keeps the DNS walk from making under Tor. The user's explicit "Fetch fresh checkpoint" still runs and goes out in the clear; a REMEMBERED checkpoint is NOT applied by the engine while Tor is on — the park waits for the click. It carries no address. |
 | EIP-1459 ENR trees | DNS TXT (dnsjava; hickory in the Rust engine) | Not directly; needs DoH over a Tor stream. The Rust engine's walk is **skipped while Tor is enabled** (#539): a system-resolver query for `all.mainnet.ethdisco.net` tells the local resolver which network this node is on |
 | CCIP-Read gateways | HTTPS | Yes (standard) |
 
@@ -171,9 +177,16 @@ embeddable as a plain library) inside the **Rust engine** — and only there:
     routing on. The directories cannot move once a bootstrap holds them; a
     different pair after that is refused, not ignored.
 
-  Checked at build level so far (both ABIs cross-compile; the engine's only
-  NEEDED libraries stay libc/libm/libdl); an on-device bootstrap has not been
-  observed yet.
+  Checked at build level with Arti 0.44 (both ABIs cross-compiled; the
+  engine's only NEEDED libraries stayed libc/libm/libdl). Arti 0.47 (#860)
+  and 0.48 have NOT been cross-compiled for Android yet:
+  0.47 compiles the Counter Galois Onion relay crypto (polyval 0.7,
+  universal-hash 0.6) unconditionally, and 0.48 adds a second generation of
+  the Ed25519/X25519 stack (ed25519-dalek 3, curve25519-dalek 5,
+  x25519-dalek 3, hmac 0.13, sha3 0.12); no Android build here has built
+  either. Only their host builds and the one-rustls check above `rustls` in
+  myotis-net's Cargo.toml were run. An on-device
+  bootstrap has not been observed yet.
 
   Arti adds ~9.3 MB per ABI to `libmyotis_engine.so` (arm64-v8a 15.4 →
   24.8 MB, measured 2026-10-10), stored uncompressed in the APK, so — as on

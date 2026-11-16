@@ -121,6 +121,22 @@ class FileClPeerCacheTest {
     }
 
     @Test
+    void firstSeenSurvivesARewriteAndTheEarliestWins(@TempDir Path dir) throws Exception {
+        // The Rust engine's stale-anchor recovery reads s<secs> to tell a long-known peer
+        // (its eclipse guard): a Java rewrite must keep it, not reset it to "now".
+        Path file = dir.resolve("cl-peers.cache");
+        write(file, MA + "\tlc\ts1700000000\ts1600000000\n");
+        FileClPeerCache cache = new FileClPeerCache(file);
+        cache.load();
+        cache.add(MB);
+        cache.recordServed(MA, 1, 2); // forces a rewrite
+        String text = read(file);
+        assertTrue(text.contains(MA + "\t1-2\tlc\ts1600000000"), text);
+        assertTrue(text.lines().anyMatch(l -> l.startsWith(MB) && l.matches(".*\\ts\\d{10}$")),
+                "a new peer is stamped: " + text);
+    }
+
+    @Test
     void evictionClearsRangeAndBootstrap(@TempDir Path dir) {
         FileClPeerCache cache = new FileClPeerCache(dir.resolve("c.cache"));
         cache.add(MA);

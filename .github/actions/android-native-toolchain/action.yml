@@ -2,7 +2,8 @@
 # exactly the NDK, build-tools and cargo-ndk versions pinned in
 # gradle/libs.versions.toml. The Gradle side accepts nothing else
 # (cargoNdkAndroid's gate in the root build.gradle.kts; ndkVersion /
-# buildToolsVersion in :android-app and :myotis-engine), so a runner image that
+# buildToolsVersion in :android-app — the KMP library plugin :myotis-engine
+# uses has no ndkVersion), so a runner image that
 # changes its default NDK — ANDROID_NDK_HOME points at it, and it was 27.3 when
 # this was written — no longer changes what CI compiles.
 #

@@ -2,8 +2,9 @@
 # the crates made no_std-capable after it: myotis-wire, myotis-consensus and
 # myotis-bls (#505). `aes` (myotis-wire's RLPx) can only be steered off its
 # AES-NI code by a cfg, not a feature: rust/.cargo/config.toml sets
-# `--cfg aes_force_soft` for the bare-metal targets, the same flag an embedder
-# outside this workspace needs.
+# `--cfg aes_backend="soft"` (aes 0.9) and `--cfg aes_force_soft` (aes 0.8) for
+# the bare-metal targets, the same flags an embedder outside this workspace
+# needs.
 #
 # `cargo build -p myotis-core --no-default-features` for x86_64-unknown-none, a
 # tier-2 target that ships NO std: a `std::` import, a HashMap, or a dependency

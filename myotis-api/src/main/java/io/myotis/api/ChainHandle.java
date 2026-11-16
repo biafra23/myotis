@@ -134,6 +134,46 @@ public interface ChainHandle {
     void acceptStaleAnchor();
 
     /**
+     * The other way out of {@link BeaconState#STALE_ANCHOR}: fetch a fresh
+     * finalized checkpoint from the network's checkpoint-sync servers and
+     * re-anchor on it — applied only when every server that answers names the
+     * same root (at least two independent operators among them; one differing
+     * answer refuses, naming the outlier), and only while this stack is parked.
+     * Unlike {@link #acceptStaleAnchor()} the stale anchor is discarded, not
+     * walked forward from; the trust moves to the agreeing operators for the
+     * anchor itself (see {@link AnchorRefresh}). It must also be confirmed by at
+     * least one LONG-KNOWN peer (pinned in the release, or known to this device
+     * for a week); without one it is refused as {@link AnchorRefresh#unconfirmed()}
+     * — an eclipse cannot be ruled out — unless {@code allowUnconfirmed}, which a
+     * host passes only on the user's explicit "use it anyway". Blocking (network
+     * round, up to about a minute): never call from a UI thread. An engine
+     * without it refuses.
+     */
+    default AnchorRefresh refreshAnchorFromCheckpointz(boolean allowUnconfirmed) {
+        return AnchorRefresh.refused("not supported by this engine");
+    }
+
+    /** {@link #refreshAnchorFromCheckpointz(boolean)} requiring long-known peer confirmation. */
+    default AnchorRefresh refreshAnchorFromCheckpointz() {
+        return refreshAnchorFromCheckpointz(false);
+    }
+
+    /**
+     * The user's remembered answer to a stale-anchor park, applied by the engine at
+     * every park, also when no UI is open. Live; may be set before {@code start()}.
+     * An engine without the fetches applies what it can: the default maps
+     * {@link StaleAnchorPolicy#CONTINUE} onto {@link #acceptStaleAnchor()} (which it
+     * cannot take back) and REFUSES the fetches it does not have.
+     *
+     * @return false when the policy is not applied (an engine without that fetch, or a
+     *     handle the engine no longer knows) — the caller must say so, never assume it.
+     */
+    default boolean setStaleAnchorPolicy(StaleAnchorPolicy policy) {
+        if (policy == StaleAnchorPolicy.CONTINUE) acceptStaleAnchor();
+        return policy == StaleAnchorPolicy.ASK || policy == StaleAnchorPolicy.CONTINUE;
+    }
+
+    /**
      * Clear the live dial bookkeeping — backoff entries and this session's
      * blacklist — so discovery re-dials from a fresh slate. On-disk peer-cache
      * FILES are host-owned; deleting those is the host's job.

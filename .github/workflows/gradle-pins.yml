@@ -22,9 +22,10 @@
 #
 # What the walk does not see: an artifact resolved only while a task RUNS (a
 # plugin's detached configuration). aapt2 is the per-host one, covered by
-# `extra_tasks` below; the lint override and Compose's JDK version probe are
-# host-independent and come from the update script's task pass (ci.yml's Build
-# and Test proves lint on every PR; the desktop packaging workflows, the probe). Anything new of this kind fails the host's own build
+# `extra_tasks` below; Compose's JDK version probe is host-independent and
+# comes from the update script's task pass (the desktop packaging workflows
+# prove it; ci.yml's Build and Test runs lint on every PR, with AGP's own lint
+# since AGP 9 dropped the need for a lint override). Anything new of this kind fails the host's own build
 # workflow — pin it from there the same way.
 #
 # Triggers: the files that can change the graph or its pins. Push scoped to

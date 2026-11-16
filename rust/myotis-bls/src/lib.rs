@@ -89,35 +89,42 @@ pub fn fast_aggregate_verify_with_dst(
 #[cfg(feature = "jni")]
 mod jni_shim {
     use jni::objects::{JByteArray, JClass};
-    use jni::sys::{jboolean, jint, JNI_FALSE, JNI_TRUE};
-    use jni::JNIEnv;
+    use jni::sys::{jboolean, jbyte, jint, jsize, JNI_FALSE, JNI_TRUE};
+    use jni::EnvUnowned;
 
     /// JNI entry: `NativeBlsBackend.nativeFastAggregateVerify(byte[] pubkeys48xN, int n, byte[] msg, byte[] sig)`.
     /// `pubkeys` is the committee flattened into one contiguous `48*n` buffer — one
     /// boundary crossing for the whole verify.
+    ///
+    /// The three arrays are read through the raw JNI function table rather than
+    /// `jni`'s `Env`: the shim needs `GetArrayLength`, `GetByteArrayRegion` and
+    /// `ExceptionCheck`, and the safe path (`EnvUnowned::with_env` plus
+    /// `Env::convert_byte_array`) kept `jni`'s attach-guard bookkeeping and its
+    /// exception-matching machinery reachable, +31% on this library (#841).
+    /// Every failure is `false`, and no Java exception is left pending.
     #[no_mangle]
     pub extern "system" fn Java_com_jaeckel_ethp2p_consensus_bls_NativeBlsBackend_nativeFastAggregateVerify<
         'local,
     >(
-        mut env: JNIEnv<'local>,
+        env: EnvUnowned<'local>,
         _class: JClass<'local>,
         pubkeys: JByteArray<'local>,
         count: jint,
         message: JByteArray<'local>,
         signature: JByteArray<'local>,
     ) -> jboolean {
-        match verify(&mut env, pubkeys, count, message, signature) {
+        match verify(&env, &pubkeys, count, &message, &signature) {
             Some(true) => JNI_TRUE,
             _ => JNI_FALSE,
         }
     }
 
     fn verify(
-        env: &mut JNIEnv,
-        pubkeys: JByteArray,
+        env: &EnvUnowned,
+        pubkeys: &JByteArray,
         count: jint,
-        message: JByteArray,
-        signature: JByteArray,
+        message: &JByteArray,
+        signature: &JByteArray,
     ) -> Option<bool> {
         let n = count.max(0) as usize;
         // Same cap the core enforces — checked here first so an absurd count is
@@ -125,9 +132,41 @@ mod jni_shim {
         if n == 0 || n > crate::MAX_PUBKEYS {
             return Some(false);
         }
-        let pk_bytes = env.convert_byte_array(&pubkeys).ok()?;
-        let msg = env.convert_byte_array(&message).ok()?;
-        let sig_bytes = env.convert_byte_array(&signature).ok()?;
+        // The core requires exactly these two lengths; checked before the copy.
+        let pk_bytes = bytes(env, pubkeys, Some(n * crate::PK_LEN))?;
+        let sig_bytes = bytes(env, signature, Some(crate::SIG_LEN))?;
+        let msg = bytes(env, message, None)?;
         Some(crate::fast_aggregate_verify(&pk_bytes, n, &msg, &sig_bytes))
+    }
+
+    /// The contents of a Java `byte[]`, or `None` for a null reference, a length
+    /// other than `want`, or a failed copy. A failed copy can only be an exception
+    /// `GetByteArrayRegion` raised: it is cleared here, so the native method
+    /// returns `false` with nothing pending.
+    fn bytes(env: &EnvUnowned, array: &JByteArray, want: Option<usize>) -> Option<Vec<u8>> {
+        let raw = env.as_raw();
+        let arr = array.as_raw();
+        if raw.is_null() || arr.is_null() {
+            return None;
+        }
+        // SAFETY: `raw` is the JNIEnv the JVM passed to this native call, valid on
+        // this thread for its duration, and `arr` is a local reference to a
+        // `byte[]` among its arguments (the Java declaration fixes the type).
+        // `GetArrayLength` throws nothing; the buffer is exactly `len` bytes, the
+        // region `GetByteArrayRegion` writes.
+        unsafe {
+            let table = &**raw;
+            let len: jsize = (table.v1_1.GetArrayLength)(raw, arr);
+            if len < 0 || want.is_some_and(|w| w != len as usize) {
+                return None;
+            }
+            let mut buf = vec![0u8; len as usize];
+            (table.v1_1.GetByteArrayRegion)(raw, arr, 0, len, buf.as_mut_ptr() as *mut jbyte);
+            if (table.v1_2.ExceptionCheck)(raw) {
+                (table.v1_1.ExceptionClear)(raw);
+                return None;
+            }
+            Some(buf)
+        }
     }
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/biafra23/myotis/go/internal/chain"
@@ -89,6 +90,13 @@ type Syncer struct {
 	// for the rest of the loop's life, exactly as the contract says
 	// ("for the rest of this run; never persisted"). nil → never.
 	StaleAccepted func() bool
+	// Warnf carries trust-decision lines the Rust twin logs at WARN
+	// (the stale-anchor waiver, sync.rs:2478/2849/2491 — all
+	// tracing::warn!). The engine wires it to its WARN ring so the
+	// hosts' WARN-filtered views keep the line (normalizeForHostPumps
+	// promises exactly that); nil falls back to Logf so a Syncer
+	// built without it — tests, future callers — still logs.
+	Warnf func(string, ...any)
 
 	peersMu   sync.Mutex
 	peers     map[peer.ID]*peerState
@@ -97,6 +105,22 @@ type Syncer struct {
 
 	procMu sync.Mutex
 	store  *lc.Store
+
+	// staleWaived emits the consent-waiver line once per waiver
+	// STREAK: while a stale gate keeps waiving, one line (PR #877
+	// round 3), but a consent re-armed after a withdrawal is a NEW
+	// trust decision and must log again — a sync.Once hid exactly
+	// that (round 5; Rust's auto_resolve_park logs every
+	// accept_stale_anchor.swap that flips, sync.rs:2848). The flag
+	// re-arms on EVERY gate call that finds consent absent — the
+	// refusal AND a fresh-anchor pass — because a current store
+	// reaches this gate only at period boundaries (RunCatchUp
+	// returns before it once caught up), so re-arming on refusals
+	// alone left a withdrawal made while current unseen, and the
+	// waiver after a sleep past the bound passed unlogged (round 7).
+	// Every re-arm still costs the user a setting change, so this
+	// cannot spam.
+	staleWaived atomic.Bool
 }
 
 func (s *Syncer) now() time.Time {
@@ -123,18 +147,55 @@ func (s *Syncer) staleAccepted() bool {
 	return s.StaleAccepted != nil && s.StaleAccepted()
 }
 
+// warnf picks the WARN hook, falling back to the plain log hook —
+// split out so the waiver line cannot silently regress to INFO when
+// the fallback is what a caller wired (PR #877 round 4).
+func (s *Syncer) warnf() func(string, ...any) {
+	if s.Warnf != nil {
+		return s.Warnf
+	}
+	return s.Logf
+}
+
+// WarnLine emits one trust-decision line through the WARN hook (with
+// the warnf fallback) — exported so the engine's loop can put the
+// STALL onset, whose only other trace is a per-slot INFO line, into
+// the WARN ring the hosts filter (PR #877 round 5).
+func (s *Syncer) WarnLine(f string, a ...any) { s.warnf()(f, a...) }
+
 // staleGate is the ONE weak-subjectivity check both layers share
 // (start gate + in-run layer): refused unless the host consented to
 // the age, and judged against the bound in force at this instant.
 func (s *Syncer) staleGate(anchorPeriod, wallPeriod uint64, what string) error {
-	if s.staleAccepted() {
+	// Staleness is computed BEFORE the consent is consulted — not to
+	// change the verdict (consent still waives, refusal is unchanged)
+	// but because the waiver has to be able to name what it waived.
+	// Consent is read on the fresh path too: any gate call that finds
+	// it absent re-arms the waiver line, so a withdrawal seen while
+	// the store is current still re-arms (round 7 — with one
+	// boundary pass per period at the latest, "ask me" then "continue
+	// anyway" while current, then a sleep past the bound, would
+	// otherwise waive the wake-up unlogged where Rust parks with a
+	// WARN and re-asks with another — sync.rs:2684-2691, 2848-2850).
+	consented := s.staleAccepted()
+	if !chain.WsAnchorStale(anchorPeriod, wallPeriod, s.boundPeriods()) {
+		if !consented {
+			s.staleWaived.Store(false)
+		}
 		return nil
 	}
-	if chain.WsAnchorStale(anchorPeriod, wallPeriod, s.boundPeriods()) {
-		return fmt.Errorf("%w: %s period %d, wall period %d, bound %d",
-			ErrStaleAnchor, what, anchorPeriod, wallPeriod, s.boundPeriods())
+	if consented {
+		if s.staleWaived.CompareAndSwap(false, true) {
+			s.warnf()("STALE ANCHOR: %s period %d is past the weak-subjectivity bound "+
+				"(wall period %d, bound %d) — the host's stale-anchor consent waives "+
+				"the gate; syncing forward from the stale anchor",
+				what, anchorPeriod, wallPeriod, s.boundPeriods())
+		}
+		return nil
 	}
-	return nil
+	s.staleWaived.Store(false) // the next waiver is a new decision
+	return fmt.Errorf("%w: %s period %d, wall period %d, bound %d",
+		ErrStaleAnchor, what, anchorPeriod, wallPeriod, s.boundPeriods())
 }
 
 func NewSyncer(c *chain.Consensus, h host.Host, logf func(string, ...any)) *Syncer {
@@ -325,7 +386,7 @@ func (s *Syncer) RunBootstrap(ctx context.Context) (*lc.Store, error) {
 	// pin ~95 times over the 4-minute budget — the same third-party
 	// Lighthouse token buckets this file paces catch-up at 11 s to
 	// respect, and these nodes answer sustained over-asking with 12 h
-	// IP bans (CLAUDE.md: "that ban IS #422"). Doubling to a 30 s cap
+	// IP bans (.claude/agent/releases.md: "that ban IS #422"). Doubling to a 30 s cap
 	// keeps the retry (a restarting pin returns within the window) at
 	// ~a dozen asks per pin; any non-empty sweep resets it, so a pool
 	// that is still GROWING (discv5 adding) is never slowed.

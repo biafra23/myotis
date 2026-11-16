@@ -130,7 +130,6 @@ args=(-PskipRustEngine --console=plain)
 # walk covers every configuration; `assemble lint :app-desktop:checkRuntime`
 # follows (unless --quick) because plugins resolve some tools through DETACHED
 # configurations only while a task runs, which no walk can see — AGP's aapt2
-# and the lint override (gradle.properties' android.experimental.lint.version),
 # and Compose's JDK version probe (checkRuntime, on every desktop package
 # build), are the known ones.
 # No test task runs.

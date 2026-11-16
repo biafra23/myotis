@@ -51,7 +51,7 @@ class GoStatusJsonTest {
                 + "\"peerBodyRequests\":0,\"peerBodyRequestsServed\":0,"
                 + "\"executionBlockNumber\":" + finalizedBlock + ",\"elHunting\":false,"
                 + "\"upgradeAdvisory\":null,\"dataUsage\":null,\"networkMetering\":\"" + metering + "\","
-                + "\"engine\":\"go\",\"myotisAbi\":57,"
+                + "\"engine\":\"go\",\"myotisAbi\":59,"
                 + "\"capabilities\":{\"wsBoundOverride\":true,\"staleAnchorConsent\":true,"
                 + "\"servedBlockWindow\":true}"
                 + "}";

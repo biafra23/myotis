@@ -74,6 +74,9 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
      *  a contract whose storage is unchanged re-proves only its account record per
      *  block, its slots replay from cache. */
     private final StateProofCache stateCache;
+    /** Set on the first cache write failure, so only that one is logged at WARN. */
+    private final java.util.concurrent.atomic.AtomicBoolean cacheFailureLogged =
+            new java.util.concurrent.atomic.AtomicBoolean();
     /** The read-fetch shadow cache ({@link ReadStats}): every verified fetch
      *  that crossed the network reports here with its wall-clock cost; cache
      *  hits above never reach it. Never null — a caller that doesn't measure
@@ -186,7 +189,7 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
                         return v;
                     }))
                     .thenApply(value -> {
-                        stateCache.putStorage(storageRootBytes, slot, value);
+                        bankStorage(storageRootBytes, slot, value);
                         readStats.observeStorage(address.toByteArray(), slotKey.toArray(),
                                 stateRoot, storageRootBytes, value, System.nanoTime() - started);
                         return value;
@@ -342,8 +345,7 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
             } else {
                 awr = verifyAndDecodeAccount(root, it.accountHash(), it.address(), nodes);
                 verifiedAny = true;
-                stateCache.putAccount(stateRoot, it.addr(),
-                        new StateProofCache.AccountEntry(awr.account(), awr.storageRoot().toArrayUnsafe()));
+                bankAccount(stateRoot, it.addr(), awr);
                 seenAccounts.add(new ReadStats.AccountObs(it.addr(), factOf(awr)));
             }
             Bytes32 storageRoot = awr.storageRoot();
@@ -357,7 +359,7 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
                 BigInteger value = verifyAndDecodeStorage(
                         storageRoot, it.slotHashes().get(s), it.address(), nodes);
                 verifiedAny = true;
-                stateCache.putStorage(storageRootBytes, slot, value);
+                bankStorage(storageRootBytes, slot, value);
                 seenSlots.add(new ReadStats.SlotObs(
                         it.addr(), paddedSlotKey(slot).toArray(), storageRootBytes, value));
             }
@@ -401,6 +403,45 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
     }
 
     /**
+     * Banks a VERIFIED account record in the cross-call {@link StateProofCache}. A cache
+     * failure is contained (see {@link #cacheFailed}): the record is already proven, so
+     * the read that proved it must not fail, nor rotate to another peer, because a cache
+     * could not store it. It only costs a later read a refetch.
+     */
+    private void bankAccount(byte[] stateRoot, byte[] addr, AccountWithStorageRoot awr) {
+        try {
+            stateCache.putAccount(stateRoot, addr,
+                    new StateProofCache.AccountEntry(awr.account(), awr.storageRoot().toArrayUnsafe()));
+        } catch (RuntimeException e) {
+            cacheFailed("account", e);
+        }
+    }
+
+    /** {@link #bankAccount}'s twin for a VERIFIED storage slot: same containment. */
+    private void bankStorage(byte[] storageRoot, BigInteger slot, BigInteger value) {
+        try {
+            stateCache.putStorage(storageRoot, slot, value);
+        } catch (RuntimeException e) {
+            cacheFailed("storage slot", e);
+        }
+    }
+
+    /**
+     * A cache that cannot store is swallowed per write, but not silently: the first
+     * failure is a WARN (the daemon logs this package at INFO), later ones DEBUG, so a
+     * persistently failing cache shows up once instead of every read quietly
+     * re-proving its records.
+     */
+    private void cacheFailed(String what, RuntimeException e) {
+        if (cacheFailureLogged.compareAndSet(false, true)) {
+            log.warn("[snap-oracle] state cache could not bank a verified {} ({}); reads re-prove "
+                    + "what it does not hold (further failures at DEBUG)", what, e.toString());
+        } else {
+            log.debug("[snap-oracle] state cache could not bank a verified {}: {}", what, e.toString());
+        }
+    }
+
+    /**
      * Internal helper: fetch the account record AND its storage root, since
      * {@link AccountState} doesn't expose the latter publicly. The MPT proof
      * verification happens inside the retry loop so a peer that returns a
@@ -432,18 +473,23 @@ public final class SnapBackedStateOracle implements SnapStateOracle {
                                 verifyAndDecodeAccount(root, accountHash, address, nodes);
                         credit(peer);
                         readStats.observeAccount(addr, stateRoot, factOf(awr), System.nanoTime() - started);
+                        // Bank the verified record in the cross-call cache HERE, before
+                        // the future completes, as fetchStorage and the batch path
+                        // already do: "future complete" then means "record banked",
+                        // so a read right after this one (another oracle, a later head
+                        // context) finds it instead of re-proving it. stateCache is not
+                        // the map computeIfAbsent runs on, so this is safe when the peer
+                        // answers inline, inside computeIfAbsent.
+                        bankAccount(stateRoot, addr, awr);
                         return awr;
                     }));
-            // Evict failed fetches so a later read can retry across peers; on success
-            // promote the verified record to the cross-call cache. Use *Async so
-            // neither runs synchronously inside computeIfAbsent (a reentrant map
-            // mutation); the value-conditional remove keeps a racing re-fetch intact.
+            // Evict failed fetches so a later read can retry across peers. *Async so the
+            // remove never runs synchronously inside computeIfAbsent (a reentrant
+            // mutation of accountCache itself); the value-conditional remove keeps a
+            // racing re-fetch intact.
             f.whenCompleteAsync((v, e) -> {
                 if (e != null) {
                     accountCache.remove(k, f);
-                } else if (v != null) {
-                    stateCache.putAccount(stateRoot, addr,
-                            new StateProofCache.AccountEntry(v.account(), v.storageRoot().toArrayUnsafe()));
                 }
             }, java.util.concurrent.ForkJoinPool.commonPool());
             return f;

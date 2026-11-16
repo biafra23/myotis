@@ -13,33 +13,10 @@ import java.util.Properties
 import javax.inject.Inject
 import org.gradle.process.ExecOperations
 
-// R8/D8 override: AGP 8.7.3 bundles R8 8.7.18, which predates Kotlin 2.2 and
-// cannot parse this build's Kotlin 2.2.21 metadata — every Android dex step
-// then warns "An error occurred when parsing kotlin metadata" per Kotlin
-// class, and an R8-minified build ships stale/dropped @Metadata (visible to
-// kotlin-reflect). The remedy while AGP is older than the Kotlin toolchain is
-// pinning a newer R8 on the root buildscript classpath (the R8 project's
-// documented override; the compatible versions come from
-// developer.android.com/studio/build/kotlin-d8-r8-versions): 8.13.19 is that
-// table's Kotlin 2.3 row (AGP 8.2.2-8.13, which includes 8.7.3) — a superset
-// of the Kotlin 2.2 row's 8.10.21 (AGP 7.3.1-8.10), so it reads this build's
-// 2.2 metadata and already covers a Kotlin 2.3 bump. Drop this whole block
-// when AGP moves past 8.10 while Kotlin is 2.2 (the bundled R8 then reads 2.2
-// natively); if Kotlin bumps to 2.3 first, the pin is still needed up to AGP 8.13.
 buildscript {
-    repositories {
-        google {
-            // Filtered per the convention for special-purpose repos in
-            // settings.gradle.kts: this entry exists only to serve the R8 pin.
-            content { includeGroup("com.android.tools") }
-        }
-    }
-    dependencies {
-        classpath("com.android.tools:r8:8.13.19")
-    }
-    // The root buildscript classpath (this R8 pin plus every plugin the
-    // `plugins {}` block below loads) is locked like the project
-    // configurations, in buildscript-gradle.lockfile (#734).
+    // The root buildscript classpath (every plugin the `plugins {}` block
+    // below loads) is locked like the project configurations, in
+    // buildscript-gradle.lockfile (#734).
     configurations.classpath {
         resolutionStrategy.activateDependencyLocking()
     }
@@ -51,8 +28,8 @@ plugins {
     // subprojects that apply them via alias don't each load their own copy — required once a
     // Kotlin-Multiplatform module (:ui) is in the build, which fails hard on duplicate loads.
     alias(libs.plugins.android.application) apply false
-    alias(libs.plugins.android.library) apply false
-    alias(libs.plugins.kotlin.android) apply false
+    alias(libs.plugins.android.kotlin.multiplatform.library) apply false
+    alias(libs.plugins.android.lint) apply false
     alias(libs.plugins.kotlin.jvm) apply false
     alias(libs.plugins.kotlin.multiplatform) apply false
     alias(libs.plugins.kotlin.serialization) apply false
@@ -161,6 +138,28 @@ allprojects {
         // state is a pin failure there.
     }
 
+    // === One version per library family (#859) ==============================
+    // Gradle resolves each module on its own, so a family whose modules arrive
+    // through different routes can end up on different versions. Two families
+    // here did:
+    // - BouncyCastle: the catalog's bcprov and the bcpkix / bcutil / bctls that
+    //   jvm-libp2p and Besu bring. bcprov 1.86 ships a class
+    //   (org.bouncycastle.asn1.iana.IANAObjectIdentifiers) that bcutil 1.83
+    //   also ships, which fails Android's duplicate-class check.
+    // - netty: the catalog's transport / codec / handler, while the HTTP
+    //   codecs, socks, proxy and DNS modules followed Besu's netty-bom, or
+    //   the 4.1 set vertx-core 4.5 brings through tuweni where Besu is absent
+    //   (:consensus, :core).
+    // FamilyAlignment (end of this file) puts each family on its highest
+    // version IN EACH GRAPH: BouncyCastle's jdk18on modules through a virtual
+    // platform, netty through its own published netty-bom, whose constraints
+    // name the modules that exist at that version. So a graph holding the
+    // catalog's netty modules (every host's: app, android-app, app-desktop)
+    // runs every netty module at the catalog version; a library module whose
+    // graph lacks them (:core, :myotis-evm's own classpaths) aligns at the
+    // highest netty it does see.
+    dependencies.components.all<FamilyAlignment>()
+
     // Resolves every resolvable configuration of this project (and of its
     // buildscript), so ONE invocation sees the whole graph — what
     // `--write-locks` and `--write-verification-metadata` need to write complete
@@ -177,6 +176,16 @@ allprojects {
         description = "Resolve every configuration (for scripts/update_gradle_pins.sh)."
         notCompatibleWithConfigurationCache("walks every configuration of the project")
         doLast {
+            // The lint plugin (com.android.lint, on the KMP modules) adds the
+            // dependencies of its `*ForLint` configurations only when its tasks
+            // are configured. Unrealized, those configurations hold nothing but
+            // the lock's own constraints, and the walk reports every locked
+            // module as "Did not resolve … part of the dependency lock state"
+            // while a lint run resolves them all. Realizing the lint tasks first
+            // gives the walk the graph lint resolves, so ONE lock state is right
+            // for both. Only the lint tasks: realizing every task would configure
+            // host-specific ones on all five pin hosts.
+            project.tasks.names.filter { it.startsWith("lint") }.forEach { project.tasks.named(it).get() }
             val buildscriptConfs = project.buildscript.configurations.filter { it.isCanBeResolved }
             val confs = buildscriptConfs + project.configurations.filter { it.isCanBeResolved }
             // Lock state as committed: every configuration named in a lockfile
@@ -193,6 +202,31 @@ allprojects {
             val buildscriptLocks =
                 if (project == rootProject) lockedIn(rootProject.file("buildscript-gradle.lockfile")) else null
             val writingLocks = gradle.startParameter.isWriteDependencyLocks
+            // Every throwable under a failure: cause, suppressed, and the causes
+            // of a multi-cause exception (by its public getCauses()). The
+            // reflective call fails QUIETLY if a Gradle release drops the method,
+            // leaving only the first cause, which hides a lock conflict again
+            // (Gradle 9 puts it in a later cause). Only the `gradle pins` canary
+            // notices, which is why it holds one case per pin-failure shape:
+            // keep them all.
+            fun everyThrowable(root: Throwable): List<Throwable> {
+                val seen = mutableListOf<Throwable>()
+                val queue = ArrayDeque(listOf(root))
+                while (queue.isNotEmpty()) {
+                    val t = queue.removeFirst()
+                    if (seen.any { it === t }) continue
+                    seen += t
+                    t.cause?.let(queue::add)
+                    queue.addAll(t.suppressed)
+                    runCatching { t.javaClass.getMethod("getCauses").invoke(t) as? List<*> }
+                        .getOrNull()?.filterIsInstance<Throwable>()?.let(queue::addAll)
+                }
+                return seen
+            }
+            fun isLockConflict(s: String) =
+                "dependency was locked to version" in s ||
+                    "dependency lock state" in s ||
+                    ("version constraints" in s && "enforced by dependency locking" in s.lowercase())
             val pinFailures = mutableListOf<String>()
             confs.forEach { conf ->
                 val locks = if (conf in buildscriptConfs) buildscriptLocks else projectLocks
@@ -217,19 +251,36 @@ allprojects {
                     }
                 } catch (e: Exception) {
                     val chain = generateSequence<Throwable>(e) { it.cause }.toList()
-                    val causes = chain.mapNotNull { it.message }.joinToString(" <- ")
+                    // EVERY throwable under the failure, not only the `cause`
+                    // chain: a resolution failure of several modules is a
+                    // multi-cause exception (Gradle's internal MultiCauseException,
+                    // reached by its public `getCauses()`), and since Gradle 9 the
+                    // locking constraint's failure is a LATER cause — the first
+                    // one is the bare "Could not resolve <the declared version>".
+                    val all = everyThrowable(e)
                     // A wrong hash and an entry the lock lacks/has extra raise
                     // dedicated exceptions; a lock that pins a version the graph
                     // no longer accepts does NOT — it surfaces as an ordinary
-                    // "cannot find a version that satisfies the constraints"
-                    // failure, recognisable only by the lock's reason string.
-                    val isPinFailure = chain.any { t ->
+                    // version-constraint conflict whose constraint names the lock:
+                    // "dependency was locked to version" up to Gradle 8, "Dependency
+                    // version enforced by Dependency Locking" from 9. It counts only
+                    // inside a version-constraint conflict, the shape a stale lock
+                    // version produces: every locked module carries the lock as a
+                    // constraint, so a locked configuration that fails for another
+                    // reason on this host (an unreachable repository, a variant
+                    // this walk cannot select) can name it in its message tree too.
+                    // The `gradle pins` canary fails if an upgrade words it a
+                    // third way.
+                    val lockFailure = all.firstOrNull { t ->
                         t.javaClass.simpleName.let {
                             it == "DependencyVerificationException" || it == "LockOutOfDateException"
-                        } || t.message.orEmpty().let {
-                            "dependency was locked to version" in it || "dependency lock state" in it
-                        }
+                        } || isLockConflict(t.message.orEmpty())
                     }
+                    val isPinFailure = lockFailure != null
+                    val causes = listOfNotNull(
+                        chain.mapNotNull { it.message }.joinToString(" <- "),
+                        lockFailure?.takeIf { it !in chain }?.message,
+                    ).joinToString(" <- ")
                     // Not a pin failure, but the GRAPH may still have resolved
                     // completely, and only the files could not be selected by this
                     // generic walk (attributes it lacks, a task output it would
@@ -247,7 +298,15 @@ allprojects {
                         pinFailures += "${project.path}:${conf.name} — its graph resolves, but it has no lock state " +
                             "(its files could not be selected here: ${chain.firstOrNull()?.message.orEmpty().take(200)})"
                     } else {
-                        logger.warn("resolveAllDependencies: ${project.path}:${conf.name} skipped — $causes")
+                        // A skipped configuration WITH lock state is lock and hash
+                        // state this host does not check; say so, so a tool bump
+                        // that moves one into this branch shows in the log (the
+                        // KGP *DependenciesMetadata ones are skipped by design).
+                        val locked = locks != null && conf.name in locks
+                        logger.warn(
+                            "resolveAllDependencies: ${project.path}:${conf.name} skipped" +
+                                (if (locked) " (has lock state, not checked here)" else "") + " — $causes",
+                        )
                     }
                 }
             }
@@ -434,14 +493,14 @@ subprojects {
     // These bring their own plugins (Android Gradle Plugin / Kotlin Multiplatform /
     // Compose), which are incompatible with the `java` plugin applied below:
     //   android-app  → com.android.application
-    //   ui           → kotlin-multiplatform + com.android.library + compose
+    //   ui           → kotlin-multiplatform + com.android.kotlin.multiplatform.library + compose
     //   app-desktop  → kotlin.jvm + compose (desktop)
     //   app-ios      → kotlin-multiplatform + compose (iOS framework)
     //   myotis-engine-ios → kotlin-multiplatform (the engine library's iOS cinterop)
     //   jsonrpc-server → kotlin-multiplatform (JVM hosts + the iOS RPC listener)
     //   myotis-rpc-policy → kotlin-multiplatform (the serving policy those share)
     //   myotis-logindex-presets → kotlin-multiplatform (the log index's predefined contracts)
-    //   myotis-engine  → kotlin-multiplatform + com.android.library (the engine library: AAR + desktop jar)
+    //   myotis-engine  → kotlin-multiplatform + com.android.kotlin.multiplatform.library (the engine library: AAR + desktop jar)
     // Excludes shared by EVERY module (Android plugin modules included):
     // - native Netty transports, for Android compatibility;
     // - Besu 26.4's log4j: it drags log4j-slf4j2-impl — a SECOND slf4j
@@ -670,7 +729,7 @@ configure(subprojects.filter { it.name in publishedArtifactIds }) {
 //   cargoTest       → cargo test --workspace; wired into root `check`
 //   cargoNdkAndroid → Android jniLibs (engine + native BLS) via
 //                     rust/build-android.sh; built from source (no committed
-//                     .so) and wired into :myotis-engine preBuild. Required by
+//                     .so) and wired into :myotis-engine androidPreBuild. Required by
 //                     default; -PskipRustEngine opts out.
 // -------------------------------------------------------------------------
 
@@ -1404,33 +1463,36 @@ tasks.register<Exec>("uniffiGenerateKotlin") {
     val bindingsFile = project(":myotis-engine-rust").projectDir
         .resolve("src/main/kotlin/uniffi/myotis_engine/myotis_engine.kt")
     outputs.files(bindingsFile)
-    // UniFFI 0.32's Kotlin generator reads each u16 API checksum through a 32-bit
-    // `Int` (JNA direct mapping) and compares it UNMASKED, so the integrity check
-    // passes only while the native side happens to leave the upper 16 bits zero —
-    // which the x86-64 ABIs do not promise. A debug Linux build returns 0x5DB5166E
-    // for checksum 5742 (0x166E), and the Windows msi's engine failed every check,
-    // so the app fell back to the Java engine (desktop-windows-msi.yml). The checksum
-    // is the low 16 bits, so compare those. Applied here, at generation, because the
-    // APK workflow regenerates the committed file and fails on any drift. Fail-loud:
-    // a UniFFI upgrade that changes this output shape must be looked at, not skipped.
+    // Each u16 API checksum is read through a 32-bit `Int` (JNA direct mapping), so
+    // the integrity check must compare only its low 16 bits: the x86-64 ABIs do not
+    // promise zeroed upper bits. UniFFI 0.32.0 compared UNMASKED — a debug Linux
+    // build returned 0x5DB5166E for checksum 5742 (0x166E), and the Windows msi's
+    // engine failed every check, so the app fell back to the Java engine
+    // (desktop-windows-msi.yml) — and this task rewrote each comparison. UniFFI
+    // 0.32.2 masks them itself (mozilla/uniffi-rs#2935, the same `and 0xFFFF`), so
+    // the task now only CHECKS: every declared checksum function has exactly one
+    // masked comparison and none is unmasked. Fail-loud, at generation, because the
+    // APK workflow regenerates the committed file and fails on any drift: a UniFFI
+    // upgrade that drops the mask, or changes this output shape, must be looked at.
     doLast {
-        val unmasked = Regex("""if \(lib\.(\w+_checksum_\w+)\(\) != (\d+)\)""")
         val text = bindingsFile.readText()
-        val count = unmasked.findAll(text).count()
-        val masked = unmasked.replace(text) { m ->
-            "if ((lib.${m.groupValues[1]}() and 0xFFFF) != ${m.groupValues[2]})"
+        // By NAME, not by count: each declared function exactly once among the
+        // masked comparisons, so a duplicate for one cannot hide a missing other.
+        val declared = Regex("""fun (\w+_checksum_\w+)\(""").findAll(text)
+            .map { it.groupValues[1] }.toList()
+        val masked = Regex("""if \(\(lib\.(\w+_checksum_\w+)\(\) and 0xFFFF\) != \d+\)""")
+            .findAll(text).map { it.groupValues[1] }.toList()
+        val unmasked = Regex("""_checksum_\w+\(\)\s*!=""").findAll(text).count()
+        check(
+            declared.isNotEmpty() && masked.sorted() == declared.sorted() &&
+                masked.toSet().size == masked.size && unmasked == 0
+        ) {
+            "uniffiGenerateKotlin: ${declared.size} checksum functions declared, " +
+                "${masked.size} masked comparisons (missing: ${declared - masked.toSet()}), " +
+                "$unmasked unmasked in $bindingsFile — UniFFI's output changed; check " +
+                "whether it still masks the u16 checksums it reads as Int"
         }
-        // Every declared checksum function must have exactly one comparison, and it
-        // must now be masked: a partly changed output shape must not pass as success.
-        val declared = Regex("""fun \w+_checksum_\w+\(""").findAll(masked).count()
-        val leftover = Regex("""_checksum_\w+\(\)\s*!=""").findAll(masked).count()
-        check(count > 0 && count == declared && leftover == 0) {
-            "uniffiGenerateKotlin: $count checksum comparisons rewritten, $declared checksum " +
-                "functions declared, $leftover comparisons left unmasked in $bindingsFile — " +
-                "UniFFI's output changed; check whether it still reads u16 checksums as Int"
-        }
-        bindingsFile.writeText(masked)
-        logger.lifecycle("uniffiGenerateKotlin: masked $count checksum comparisons to 16 bits")
+        logger.lifecycle("uniffiGenerateKotlin: all ${masked.size} checksum comparisons masked to 16 bits")
     }
 }
 
@@ -1630,7 +1692,7 @@ tasks.register<Exec>("cargoNdkAndroid") {
 // Build-time contract for :myotis-engine (and so :android-app): the Rust engine
 // is built from source by default (cargoNdkAndroid), so a MISSING toolchain must
 // fail loudly and name the escape hatch — never silently produce a Java-only
-// app. Wired into :myotis-engine:preBuild (see its build file).
+// app. Wired into :myotis-engine:androidPreBuild (see its build file).
 // `-PskipRustEngine` is the opt-out.
 tasks.register("requireAndroidRustEngine") {
     group = "verification"
@@ -2435,3 +2497,24 @@ tasks.register("refreshCheckpoint") {
     }
 }
 
+// One version per library family (see "One version per library family" in
+// allprojects). A ComponentMetadataRule must be a class with an injectable
+// constructor, so it lives here rather than as a lambda.
+abstract class FamilyAlignment : ComponentMetadataRule {
+    override fun execute(ctx: ComponentMetadataContext) {
+        val id = ctx.details.id
+        when {
+            // Only the jdk18on line: the jdk15on artifacts stop at 1.70 and
+            // would have no member at a jdk18on version.
+            id.group == "org.bouncycastle" && id.name.endsWith("-jdk18on") ->
+                ctx.details.belongsTo("org.bouncycastle:bouncycastle-jdk18on-platform:${id.version}")
+            // netty's own modules (4.x.y.Final); tcnative and the incubator
+            // modules have version lines of their own.
+            id.group == "io.netty" && id.name.startsWith("netty-") &&
+                !id.name.startsWith("netty-tcnative") && id.name != "netty-bom" &&
+                !id.name.startsWith("netty-incubator") && id.name != "netty-jni-util" &&
+                id.version.startsWith("4.") ->
+                ctx.details.belongsTo("io.netty:netty-bom:${id.version}", false)
+        }
+    }
+}

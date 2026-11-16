@@ -487,7 +487,7 @@ class LightClientProcessorTest {
 
         // finalizedSlot is still 100 (period 0). Calling with period 1 slot should rotate.
         long period1Slot = BeaconChainSpec.SLOTS_PER_SYNC_COMMITTEE_PERIOD + 10;
-        directStore.applyNextSyncCommitteeWhenPeriodChanges(directStore.getFinalizedSlot(), period1Slot);
+        directStore.applyNextSyncCommitteeWhenPeriodChanges(period1Slot);
 
         assertNull(directStore.getNextSyncCommittee());
         assertArrayEquals(nextCommittee.aggregatePubkey(), directStore.getCurrentSyncCommittee().aggregatePubkey());

@@ -18,7 +18,8 @@ Nimbus over loopback REST and relays them verbatim, without decoding them. It
 verifies nothing and does not need to: a wallet checks every update against
 sync-committee signatures chained from its own anchor, so a relay can withhold
 but cannot forge. That carve-out is recorded in
-[`CLAUDE.md`](../../CLAUDE.md) under **Data sources**.
+[`.claude/agent/data-sources.md`](../../.claude/agent/data-sources.md)
+(summary in [`CLAUDE.md`](../../CLAUDE.md) under **Data sources**).
 
 One thing roost relays is **not** self-verifying, and is worth naming so the
 boundary is not widened by accident: the `status` handshake, built from REST

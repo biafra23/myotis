@@ -125,10 +125,10 @@ don't write locks on that host.
 ### What resolveAllDependencies does not see
 
 An artifact that a plugin resolves through a *detached* configuration while a
-task runs isn't covered by the walk. AGP does this for aapt2 and for the lint
-override (`android.experimental.lint.version` in `gradle.properties`): 43
-components in all when this was set up. Compose does it for its JDK version
-probe in `:app-desktop:checkRuntime`, which every dmg, deb and msi build runs.
+task runs isn't covered by the walk. AGP does this for aapt2 (and did for the
+lint-version override the AGP 8.7 build carried, gone since AGP 9). Compose
+does it for its JDK version probe in `:app-desktop:checkRuntime`, which every
+dmg, deb and msi build runs.
 So the update script also runs `assemble lint :app-desktop:checkRuntime` in
 write mode (`--quick` skips that). In the chain:
 - aapt2 has a jar **per OS**, so the Linux x64, Windows and macOS arm64 jobs
@@ -152,8 +152,13 @@ Gradle's minor + patch moves and one for Cargo's patches, covering all three
 Cargo workspaces; every update that may break comes as a PR of its own: each
 Gradle major, each Cargo minor or major (Cargo treats a 0.x minor as
 breaking), and the Gradle wrapper. Security updates come off-schedule, one PR per package manager and directory
-(the repository's "Grouped security updates" setting). A
-Gradle PR changes the catalog but not the pins, so
+(the repository's "Grouped security updates" setting). No version update is
+proposed before its release is 7 days old (`cooldown`), so Dependabot does not
+bump to a compromised release that is yanked within days. That covers the
+version it proposes: not the transitives the resolver picks while the locks
+are regenerated, and not security updates, which are not delayed. For those
+the lock and hash diff is still the check. A Gradle PR changes the catalog but
+not the pins, so
 `gradle-pins-dependabot.yml` runs `scripts/update_gradle_pins.sh` on Linux and
 pushes the regenerated lockfiles and hashes to the PR branch:
 

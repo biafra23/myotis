@@ -77,6 +77,10 @@ type Engine struct {
 	// check rather than needing the process restarted.
 	wsOverride  uint64 // 0 = the network default (the contract's 0)
 	acceptStale bool
+	// stalePolicy is the remembered answer from myotis_set_stale_anchor_policy
+	// (0 ask / 2 continue; 1 checkpoint is refused at the door), read through
+	// SetStaleAnchorPolicy only. Default 0 = ask, the contract's default.
+	stalePolicy int32
 
 	// LC state. latest is the newest VERIFYING-poll anchor (nil until
 	// the first one). dead closes whenever the loop goroutine ENDS —
@@ -342,6 +346,60 @@ func (e *Engine) AcceptStale() bool {
 	return true
 }
 
+// SetStaleAnchorPolicy applies the user's remembered answer to a
+// STALE_ANCHOR park (myotis_set_stale_anchor_policy, ABI 59), storing it
+// so every LATER park honors it — the contract's "applied by the sync
+// loop itself at every park". Codes: 0 ASK, 1 fresh checkpoint, 2
+// continue. Codes, in host.rs's order: LEAVING a remembered CONTINUE for
+// ANY other answer first withdraws the consent it armed (that policy is
+// no longer the user's word, whatever replaces it — host.rs
+// set_stale_anchor_policy swaps first and un-arms on was==Continue),
+// putting the engine back on the fail-closed ASK posture; then CONTINUE
+// (2) arms the same sticky consent AcceptStale uses (re-read at every
+// weak-subjectivity gate), and CHECKPOINT (1) is REFUSED (false, not
+// stored): this engine has no checkpoint fetch (capabilities
+// anchorRefresh:false) and an accepted-and-ignored answer is what
+// apply-or-refuse forbids — the withdrawal above still happened, so the
+// refused answer never leaves a CONTINUE's consent silently armed. A
+// refused write with NO prior CONTINUE disturbs nothing, so a one-shot
+// AcceptStale consent survives it (host.rs agrees: its swap sees
+// was!=Continue). True = applied; false for a closed engine, the
+// fetch-backed code, or an unknown code.
+func (e *Engine) SetStaleAnchorPolicy(policy int32) bool {
+	e.mu.Lock()
+	if e.closed || policy < 0 || policy > 2 {
+		e.mu.Unlock()
+		return false
+	}
+	if e.stalePolicy == 2 && policy != 2 { // leaving CONTINUE, whatever replaces it (host.rs)
+		e.acceptStale = false
+		e.stalePolicy = 0
+	}
+	if policy == 1 { // no checkpoint fetch: refused; the engine is back on ASK
+		e.mu.Unlock()
+		return false
+	}
+	e.stalePolicy = policy
+	if policy == 2 {
+		e.acceptStale = true
+	}
+	e.mu.Unlock()
+	if policy == 2 {
+		e.restartIfParked()
+	}
+	return true
+}
+
+// StaleAccepted reports the consent the weak-subjectivity gates read
+// (the same value the syncer's StaleAccepted hook returns) — exposed for
+// the policy test to observe what SetStaleAnchorPolicy armed and what a
+// replaced CONTINUE withdrew.
+func (e *Engine) StaleAccepted() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.acceptStale
+}
+
 // restartIfParked re-spawns the LC loop when it died (and was not
 // merely cancelled by shutdown): the stale/override setters promise a
 // parked handle re-evaluates, and in this engine a park IS a loop
@@ -435,6 +493,36 @@ func (e *Engine) EffectiveWsBound() uint64 {
 // This is the same loop as cmd/myotis-lc's; when a
 // second consumer appeared the honest move is to say so in a comment
 // and re-unify the two in 3c rather than contort the merged main.
+// stallWatcher decides when a stalled light-client loop gets its
+// WARN line: once per refused streak. A stale refusal warns on the
+// first pass of the streak only; ANY other RunCatchUp outcome — nil
+// or a failure that came after a gate pass — re-arms it, because the
+// gate is reached at round 0 before anything else can fail
+// (clsync/sync.go), so "catch-up stalled", "no peers" and cooldown
+// cancels all prove that call walked past the gate (PR #877 round 6:
+// re-arming only on nil lost the re-warn exactly while a
+// re-consented node was still catching up — stall #2 with no line).
+// Each new streak costs a Settings change or a period boundary, so
+// this cannot spam. Extracted from lcLoop for the same reason
+// statusPeriods was: so the sequence is testable (round-6 note).
+type stallWatcher struct {
+	warn   func(f string, a ...any)
+	warned bool
+}
+
+func (w *stallWatcher) note(err error) {
+	if !errors.Is(err, clsync.ErrStaleAnchor) {
+		w.warned = false
+		return
+	}
+	if !w.warned {
+		w.warned = true
+		w.warn("STALE ANCHOR: held committee aged past the weak-subjectivity bound "+
+			"while running (%v) — the steady loop retries every slot but publishes no anchor; "+
+			"reads stay on the last one until a 'continue anyway' is granted again or the bound is raised", err)
+	}
+}
+
 func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 	c := chain.ConsensusMainnet()
 	h, err := clsync.NewHost()
@@ -443,6 +531,10 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 	}
 	defer h.Close()
 	syncer := clsync.NewSyncer(c, h, logf)
+	// Trust-decision lines (the stale-anchor waiver) go out at WARN,
+	// matching the Rust twin's tracing::warn! and surviving the hosts'
+	// WARN-filtered pump view (PR #877 round 4).
+	syncer.Warnf = func(f string, a ...any) { e.log.Warn(fmt.Sprintf(f, a...)) }
 	// The C ABI's live setters reach the weak-subjectivity gates
 	// through these hooks (read at every check, not captured):
 	// myotis_set_ws_bound_periods and myotis_accept_stale_anchor.
@@ -491,6 +583,14 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 	e.lcPeers = syncer.PeerCount()
 	e.mu.Unlock()
 	catchCtx, catchCancel := context.WithTimeout(ctx, 4*time.Minute)
+	// A stale-refusal STALL warns once at WARN per refused streak
+	// (PR #877 round 5): the per-slot lines go through logf — INFO —
+	// and the docs name that line the stall's only trace, which the
+	// hosts' WARN-filtered pump view would otherwise drop entirely.
+	// Re-arm and warn policy lives in stallWatcher (tested there);
+	// Rust's twin likewise warns once per in-run park, guarded by the
+	// state transition (sync.rs:2685).
+	stall := &stallWatcher{warn: syncer.WarnLine}
 	if err := syncer.RunCatchUp(catchCtx, st); err != nil {
 		// NOT fatal (PR #773 review): a pin that is down or
 		// rate-limiting us today is up in the next slot, and the
@@ -499,6 +599,7 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 		// the read window on one bad round — the failure the loop
 		// right below already tolerates.
 		logf("catch-up: %v (the steady loop retries it each slot)", err)
+		stall.note(err)
 	}
 	catchCancel()
 	// NO publish yet: st.Finalized here is the embedded checkpoint (or
@@ -515,16 +616,20 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 		e.mu.Unlock()
 		if err := syncer.RunCatchUp(ctx, st); err != nil {
 			logf("re-catch-up: %v", err)
-		} else if chain.SyncCommitteePeriod(syncer.Consensus.SlotAt(time.Now().Unix())) > st.Period() {
-			logf("committee behind wall clock after re-catch-up; skipping finality poll this cycle")
-		} else if outcome, err := syncer.PollFinality(ctx, st); err != nil {
-			logf("finality poll: %v", err)
+			stall.note(err)
 		} else {
-			logf("finality poll: outcome %v, finalized slot %d", outcome, st.Finalized.Slot)
-			// Advanced OR Stale both mean the store's finalized header
-			// passed the full BLS path THIS cycle (Stale = verified,
-			// just not newer); Rejected / poll errors publish nothing.
-			published = outcome == lc.Advanced || outcome == lc.Stale
+			stall.note(nil) // past the gate again: the next stall is new
+			if chain.SyncCommitteePeriod(syncer.Consensus.SlotAt(time.Now().Unix())) > st.Period() {
+				logf("committee behind wall clock after re-catch-up; skipping finality poll this cycle")
+			} else if outcome, err := syncer.PollFinality(ctx, st); err != nil {
+				logf("finality poll: %v", err)
+			} else {
+				logf("finality poll: outcome %v, finalized slot %d", outcome, st.Finalized.Slot)
+				// Advanced OR Stale both mean the store's finalized header
+				// passed the full BLS path THIS cycle (Stale = verified,
+				// just not newer); Rejected / poll errors publish nothing.
+				published = outcome == lc.Advanced || outcome == lc.Stale
+			}
 		}
 		if published {
 			e.publish(snapshot(st))

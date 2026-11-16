@@ -14,8 +14,11 @@
 # android-build-tools / cargo-ndk, .java-version, .xcode-version, the runner
 # image labels, and the test-only interpreters that still float on purpose
 # (setup-python `3.x` in mm-replay-tests.yml, Node `20` in smoke-gate-tests.yml:
-# neither touches a shipped artifact), and docs/tour/workbook/solution/Cargo.toml,
-# whose `=` pins of tokio and futures follow the workspace's by hand.
+# neither touches a shipped artifact), docs/tour/workbook/solution/Cargo.toml,
+# whose `=` pins of tokio and futures follow the workspace's by hand, the Go
+# engine's go/go.mod + go.sum, and scripts/swarm-cli/package-lock.json (the
+# swarm-cli that scripts/publish_site_swarm.mjs runs, which pulls in
+# @ethersphere/bee-js; security updates only).
 # claude-review.yml is excluded (see the github-actions entry).
 #
 # Grouped, and Cargo and Gradle monthly, so the routine moves arrive as a
@@ -55,12 +58,31 @@
 # takes it out of that group).
 #
 # Security updates are on, and so is "Grouped security updates" (repository
-# settings, Advanced Security; checked 2026-11-12). The groups here cover
-# version updates only, so that setting decides: security updates come
-# off-schedule, one PR per package manager and directory. A Cargo one edits
+# settings, Advanced Security; checked 2026-11-12). They reach Cargo; Gradle
+# only if the repository's automatic dependency submission is on, since
+# GitHub builds no dependency graph from Gradle files and no workflow here
+# submits one (the gradle entry's ignore comment). The groups here cover version
+# updates only, so that setting decides: security updates come off-schedule,
+# one PR per package manager and directory. A Cargo one edits
 # the shared rust/myotis-net/Cargo.toml from one workspace, so the other two
 # locks need `cargo update --workspace` by hand before `cargo locks` passes.
 # The actions get none at all (see above).
+#
+# Cooldown: a version update waits until its release is 7 days old (owner's
+# decision, 2026-11-12, after the Ethersphere bee-js / Swarm Desktop supply-
+# chain attack of 2026-11-09: a malicious release published from a stolen CI
+# credential, with valid provenance, pulled within hours). Such releases are
+# usually caught and yanked within days, so the wait keeps Dependabot from
+# proposing one. Dependabot's own default is 3 days; this makes it longer and
+# visible. It does not delay SECURITY updates (Dependabot never applies a
+# cooldown to them). On GitHub Actions only `default-days` exists. The same
+# 7 days hold for a HAND bump of the trees above that no entry covers: never
+# regenerate a lock onto a release younger than that (`npm install`, `npm
+# update`, `go get` take whatever is newest that minute). It filters the
+# version Dependabot proposes, not the transitives a lock regeneration picks
+# that day (the lock and hash diff stays the check for those). For the actions
+# it delays the fix as well, since they get no security updates: when an
+# advisory names an action used here, move its SHA by hand.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -77,6 +99,8 @@ updates:
       - dependency-name: "anthropics/claude-code-action"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     groups:
       github-actions:
         patterns: ["*"]
@@ -88,7 +112,53 @@ updates:
       - "/rust/tor-poc"
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
+    ignore:
+      # k256 0.14 is held (owner's decision, 2026-11-14, #834, #844). Only
+      # myotis-core pins k256 directly; alloy, revm, discv5 (via enr) and
+      # libp2p-identity stay on 0.13, so moving myotis-core alone would ship a
+      # second copy of the elliptic-curve stack (ecdsa 0.17, elliptic-curve
+      # 0.14, crypto-bigint 0.7, ...) and give the node key a different
+      # secp256k1 implementation than the networking stack, for no gain.
+      # Lift this when those crates move to 0.14: the "One k256 per lock" step
+      # of cargo-locks.yml fails in the PR that brings a second k256 in.
+      # Dependabot's Cargo classifier follows Cargo's pre-1.0 rule: 0.13 -> 0.14
+      # is semver-major to it (dependabot-core #13349, #13710), so that type
+      # alone covers >= 0.14; semver-minor, the same range for a 0.x crate, is
+      # listed as a guard. 0.13.x patches still arrive.
+      - dependency-name: "k256"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # The libp2p 0.57 / discv5 0.12 line is held too (owner's decision,
+      # 2026-11-14, #845, #847, #848). It cannot move piece by piece:
+      # libp2p-mplex 0.44 needs libp2p-core 0.44 (all of libp2p 0.57), and
+      # discv5 0.12 needs enr 0.14, which requires k256 0.14. alloy and revm
+      # stay on k256 0.13 even at their latest releases, so taking it now ships
+      # the second elliptic-curve stack the k256 hold above avoids. Lift both
+      # holds together, in one migration, once alloy and revm move to k256 0.14
+      # (the "One k256 per lock" step of cargo-locks.yml fails when they do).
+      # For libp2p that is not the only gate: 0.57's libp2p-quic needs quinn's
+      # aws-lc-rs backend beside ring (rust/myotis-net/Cargo.toml, the `dns`
+      # note), a decision of its own.
+      # hmac, sha2 and sha3 wait with it because none can go green as a
+      # Dependabot PR on its own (the digest 0.11 generation itself is already
+      # in the tree, through revm and alloy): hmac 0.13 and sha2 0.11 move
+      # together (Hmac<Sha256> in myotis-wire's ECIES), sha2 0.11 drops the
+      # `force-soft` feature myotis-core's bare-metal pin steers k256's copy
+      # with, and sha3 0.12 drops the `std` feature myotis-core forwards.
+      # Same update types as k256: for these 0.x crates a breaking move is
+      # semver-major to Dependabot, and their patches keep arriving.
+      - dependency-name: "libp2p*"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "discv5"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "hmac"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "sha2"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "sha3"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
     groups:
       cargo-patch:
         update-types: ["patch"]
@@ -100,7 +170,52 @@ updates:
     directory: "/"
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
+    # Moved BY HAND, with Compose Multiplatform (gradle/libs.versions.toml):
+    # the androidx Compose BOM, whose calendar version makes every release a
+    # minor or major here, has to match the androidx Compose line Compose
+    # Multiplatform brings; kotlinx-datetime has to match what Compose's
+    # material3 ships (a mismatch once failed at run time on desktop). Left to
+    # Dependabot, either would move out of step in the group (#818).
+    ignore:
+      - dependency-name: "androidx.compose:compose-bom"
+      - dependency-name: "org.jetbrains.kotlinx:kotlinx-datetime"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # Moved BY HAND (owner's decision, 2026-11-14, #850, #857):
+      # - log4j with Besu: the catalog's log4j-to-slf4j matches the log4j-bom
+      #   Besu 26.4's BOM brings (log4j-api comes from that BOM). Every update
+      #   type is held, patches too: the match is an exact version.
+      # - jna because a move needs a run on a device: the jar and the Android
+      #   natives both follow the catalog entry (the force in android-app, the
+      #   `strictly` in myotis-engine, the staged stub in app-desktop), but a
+      #   jar/native mismatch fails only at run time, and CI builds the APK
+      #   without running it. Unwatched: a Besu BOM that raises jna above the
+      #   catalog moves the desktop jar without the stub.
+      # - snappy because 0.5 cannot run on Android: it is a rewrite that calls
+      #   sun.misc.Unsafe.copyMemory(Object, long, Object, long, long), which
+      #   ART does not provide, and it dropped 0.4's pure-Java fallback. RLPx
+      #   frames and libp2p req/resp decompress with it, and no gate sees it
+      #   (check_apk_min_api.py polices java.*, not sun.misc). The pin's
+      #   comment in gradle/libs.versions.toml says the same (#864). Held on
+      #   every update type until a release runs on ART again.
+      # Besu is served from Hyperledger's Artifactory, which Dependabot does not
+      # query, so its releases are watched by the owner's weekly "held pins"
+      # check (a scheduled Claude task outside this repo), not by a PR here.
+      # netty is NOT held: its 4.2.10 was inside published advisories when this
+      # was decided, and it is on Maven Central, so it moves through the group.
+      # Its HTTP codecs follow Besu's netty-bom, not the catalog, until the
+      # build gets a netty-bom platform of its own.
+      # Advisories: GitHub builds no dependency graph from Gradle files and no
+      # workflow here submits one, so unless the repository's automatic
+      # dependency submission is on, Gradle modules get no Dependabot alerts or
+      # security PRs at all, held or not. The weekly check covers them either
+      # way, and for these three it is the only path: an ignore entry holds a
+      # security PR as well.
+      - dependency-name: "org.apache.logging.log4j:*"
+      - dependency-name: "net.java.dev.jna:*"
+      - dependency-name: "org.iq80.snappy:snappy"
     groups:
       gradle-minor-patch:
         update-types: ["minor", "patch"]

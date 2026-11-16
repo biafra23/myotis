@@ -199,14 +199,28 @@ zeros, marked in the struct. `myotis_set_ws_bound_periods` and
 them at every weak-subjectivity gate and a parked bootstrap
 restarts — while `myotis_set_served_block_window` records its value
 (a dial-only engine serves no blocks, so no answer depends on it;
-`capabilities` makes that explicit).
+`capabilities` makes that explicit). The ABI-58/59 additions are both
+exported, applied where the engine can and refused where it cannot —
+never unlinked, never silently accepted:
+`myotis_refresh_anchor_from_checkpointz` answers the contract's own
+`{"applied":false,…}` refusal (no checkpoint fetch yet; capabilities
+`anchorRefresh:false`, the one-shot `myotis_accept_stale_anchor` is the
+way forward). `myotis_set_stale_anchor_policy` IS the remembered
+answer the sync loop honors at every park: CONTINUE arms the same
+sticky consent the one-shot export uses (re-read at every
+weak-subjectivity gate), leaving a remembered CONTINUE for anything
+else withdraws it (host.rs's rule), and the CHECKPOINT code is refused
+with the contract's `false` for the missing fetch. `GoChainHandle`
+routes both through the native exports, so the JVM and C-ABI hosts get
+the identical answer (`capabilities.staleAnchorPolicy:true` marks the
+policy applied for its two supported codes).
 
 ## Desktop embed (`:myotis-engine-go`, feature/go-desktop-embed part 1c)
 
 The JVM side is the `:myotis-engine-go` Gradle module: `GoEngineNative`
 (plain JNA interface mapping over this same header, lazy symbol resolution — the Go twin of
 `RustEngineNative`, same `java.library.path`→`jna.library.path` mirroring,
-same ABI-57 handshake, `myotis_string_free` after every returned string),
+the ABI-version handshake (GoAbiVersionMirrorTest pins the mirror), `myotis_string_free` after every returned string),
 and `GoMyotisEngine`/`GoChainHandle`/`GoVerifiedReads` behind the
 `:myotis-api` contract. The selector routes it via `myotis.engine=go`
 (`-Pengine=go` on the daemon/desktop run tasks only — the Settings engine
@@ -238,7 +252,30 @@ ABI slot width, not the reader — the Go reader itself takes the full
 32-byte key), no EVM/block/tx/code reads,
 no ENS (the `EnsApi` throws one named refusal), no broadcast path,
 no Tor (account reads leave from the host's real IP; the desktop logs
-the mismatch instead of pretending the switch applies). The JSON-string
+the mismatch instead of pretending the switch applies),
+no checkpoint-anchor refresh (ABI 58 refuses by name,
+`capabilities.anchorRefresh:false`). One stale-anchor gap needs naming
+plainly (PR #877 round 3): the weak-subjectivity **re-check while
+running** differs from the Rust loop. After bootstrap, an in-run
+refusal (a long sleep, or Settings moving off "continue anyway")
+stalls the steady loop silently — every slot refuses at the in-run
+gate, so no finality poll runs and no anchor is published, the status
+stays `SYNCING`/`CATCHING_UP` (it reports `STALE_ANCHOR` only when the
+loop itself died) and **no dialog opens**; the stall logs once at WARN
+(`STALE ANCHOR: held committee aged ... while running`, re-warned per
+new stall, so the hosts' WARN-filtered view keeps it) besides the
+per-slot INFO `re-catch-up:` line, and the ways out are choosing
+CONTINUE again in Settings or a restart, which parks at the bootstrap
+gate and asks. The Rust loop instead re-publishes `STALE_ANCHOR` and re-asks.
+The parity fix likely needs no status-contract change (PR #877
+round 6): Rust re-publishes that park every 5 s from its
+still-running loop (`sync.rs:2691`), so `STALE_ANCHOR` from a live
+loop is the contract both engines already share — a flag set on an
+in-run refusal and cleared on any other outcome, with the status
+reporting `STALE_ANCHOR` while set, re-opens the dialog within a slot
+and keeps the walked-forward store, which returning the error would
+throw away to a re-bootstrap. Owner's call, like the gap itself. The
+JSON-string
 reads (block/tx/receipt/fee-history) answer the `{"error":…,
 "code":-32602}` envelope so the wallet gets a permanent refusal, not a
 retryable one. `myotis_drain_logs` lines are drained by
@@ -283,3 +320,28 @@ To force a rebuild now, `chown` `go/build` back AND delete it (or run
 ```bash
 go test ./...
 ```
+
+## Reproducible build
+
+The two binaries are part of the reproducible-builds gate (`reproducible-builds.yml`,
+`Compare linux`): built twice, from different paths, homes, time zones and
+locales, as different users, they must come out bit for bit identical. The
+build is the one `scripts/repro/build_linux.sh` runs in the builder image
+(`docker/builder/`, which carries Go at `go.mod`'s exact version, by hash):
+
+```bash
+cd go
+GOTOOLCHAIN=local CGO_ENABLED=1 CGO_CFLAGS="-O2 -g -D__BLST_PORTABLE__" \
+  GOFLAGS="-trimpath -mod=readonly -buildvcs=false -modcacherw" \
+  go build -o ../build/go/ ./cmd/myotis-go ./cmd/myotis-lc
+```
+
+cgo stays on: blst (the BLS library) has Go bindings only through cgo, so the C
+compiler is a build input too, the image's. `__BLST_PORTABLE__` makes blst
+detect ADX/BMI2 at run time instead of assuming them (the Rust engine's blst
+does the same; `go-engine.yml` tests with the same flags). The binaries link
+glibc dynamically, the image's: before they are published anywhere, record the
+glibc symbol versions they need (`objdump -T`). Moving the `go` line in `go.mod` moves `GO_VERSION`/`GO_SHA256`
+in `docker/builder/pins.env` in the same change, and `docker/builder/image.lock`
+with them (the `builder image` workflow prints its lines); a `toolchain` line
+is refused unless it names that same release.

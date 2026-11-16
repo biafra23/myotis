@@ -478,6 +478,90 @@ fn ladder_order(keys: &[LadderKey]) -> Vec<usize> {
     order
 }
 
+/// [`ladder_order`] with each tier in a per-address order: within one
+/// [`LadderKey`], the heavier [`affinity_weight`] first (rendezvous hashing:
+/// a peer joining or leaving the pool moves only the addresses whose top
+/// peer it is). Pure, pinned by tests.
+fn affine_ladder_order(keys: &[LadderKey], weights: &[u64]) -> Vec<usize> {
+    debug_assert_eq!(keys.len(), weights.len());
+    let mut order: Vec<usize> = (0..keys.len()).collect();
+    order.sort_by_key(|&i| (keys[i], std::cmp::Reverse(weights[i])));
+    order
+}
+
+/// The pool's secret salt for [`affinity_weight`]: the one kept beside the
+/// peer cache at `cache_path` ([`affinity_salt_path`]), drawn from OS entropy
+/// and written there the first time. A new salt every run would hand each
+/// address a new, independent order over largely the same peers (the cache's
+/// Confirmed peers and the pins come back), so a long-lived peer would lead
+/// most addresses at one start or another. Where the salt cannot be kept (no
+/// cache file, an unwritable one, no entropy) it is the node key's
+/// ([`affinity_salt_of`]): per run, which is no worse than before.
+fn load_affinity_salt(cache_path: Option<&std::path::Path>, key: &NodeKey) -> [u8; 32] {
+    let Some(path) = affinity_salt_path(cache_path) else {
+        return affinity_salt_of(key);
+    };
+    if let Some(salt) = std::fs::read_to_string(&path).ok().as_deref().and_then(parse_salt) {
+        return salt;
+    }
+    let mut salt = [0u8; 32];
+    if getrandom::fill(&mut salt).is_err() {
+        return affinity_salt_of(key);
+    }
+    let hex: String = salt.iter().map(|b| format!("{b:02x}")).collect();
+    if std::fs::write(&path, format!("{hex}\n")).is_err() {
+        tracing::warn!(path = %path.display(), "could not keep the read-affinity salt; using a per-run one");
+        return affinity_salt_of(key);
+    }
+    salt
+}
+
+/// Where the salt goes beside the peer cache at `cache_path` (`peers.cache`
+/// → `peers-affinity.cache`, `peers-gnosis.cache` → `peers-affinity-gnosis.cache`,
+/// as the Tor reserve's sidecar is named); none when the cache has no file.
+fn affinity_salt_path(cache_path: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    let p = cache_path?;
+    let name = p.file_name()?.to_str()?;
+    let sidecar = match name.strip_prefix("peers") {
+        Some(rest) => format!("peers-affinity{rest}"),
+        None => format!("affinity-{name}"),
+    };
+    Some(p.with_file_name(sidecar))
+}
+
+/// A kept salt: exactly 64 hex digits, surrounding whitespace aside.
+fn parse_salt(text: &str) -> Option<[u8; 32]> {
+    let text = text.trim();
+    if text.len() != 64 || !text.is_ascii() {
+        return None;
+    }
+    let mut salt = [0u8; 32];
+    for (i, b) in salt.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(salt)
+}
+
+/// The per-run salt: the node key's under a domain tag, never the key itself
+/// and nothing a peer can derive.
+fn affinity_salt_of(key: &NodeKey) -> [u8; 32] {
+    let mut secret = key.secret_bytes();
+    let salt = myotis_core::keccak::keccak256_concat(b"myotis/read-affinity/v1", &secret);
+    secret.fill(0);
+    salt
+}
+
+/// How strongly `address` prefers the peer `node`: the first 8 bytes of
+/// `keccak(salt ‖ address ‖ node)`. Keyed, so a peer cannot tell from its own
+/// node id which addresses it would be first for.
+fn affinity_weight(salt: &[u8; 32], address: &[u8; 20], node: &[u8; 64]) -> u64 {
+    let mut input = [0u8; 20 + 64];
+    input[..20].copy_from_slice(address);
+    input[20..].copy_from_slice(node);
+    let h = myotis_core::keccak::keccak256_concat(salt, &input);
+    u64::from_le_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]])
+}
+
 /// Pure: whether a peer is spared an eviction as the pool's one BAL server
 /// (#691) — BALs are wanted, it served a verified one within
 /// [`BAL_SHIELD_FOR`], and no other pooled peer did. One peer at most, so a
@@ -638,6 +722,11 @@ impl QualityOutcome {
 struct PoolInner {
     tasks: super::tasks::Tasks,
     key: Arc<NodeKey>,
+    /// The secret salt of [`PeerPool::snap_peers_for`]'s per-address order
+    /// ([`load_affinity_salt`]): kept for the life of the install beside the
+    /// peer cache, so an address keeps its peers across restarts too; per
+    /// run (from the node key) only where there is no cache file to keep it.
+    affinity_salt: [u8; 32],
     /// Every RLPx session this pool dials counts its bytes here (EL layer).
     traffic: Arc<crate::traffic::TrafficMeter>,
     local_pubkey: [u8; 64],
@@ -822,6 +911,13 @@ impl PoolInner {
     /// claim lock, so no direct dial of a node is claimed while it moves; the
     /// common case, a reserve already at its share, costs a count.
     async fn balance_tor_reserve(&self, grow: bool) {
+        self.balance_tor_reserve_with(grow, tor_reserve_salt).await
+    }
+
+    /// [`Self::balance_tor_reserve`] with the fill salt's source as a
+    /// parameter, so a test can take it away. Drawn only when the reserve has
+    /// to take nodes in.
+    async fn balance_tor_reserve_with(&self, grow: bool, salt: impl FnOnce() -> Option<[u8; 32]>) {
         let target = {
             let cache = self.cache.lock().await;
             let reserve = self.tor_reserve.lock().unwrap_or_else(|p| p.into_inner());
@@ -866,7 +962,15 @@ impl PoolInner {
                         && !cache.is_bal_server(c.addr)
                 })
                 .collect();
-            picks.sort_by_key(|c| tor_reserve_draw(&c.pubkey));
+            // No salt, no fill: an all-zero salt would set aside the same,
+            // computable peers in every wallet whose draw failed (#823). The
+            // nodes already in the reserve stay in it, and the next fill draws
+            // again. (While the seed draw fails too, no read or send reaches
+            // them: see `tor_candidates`.)
+            match salt() {
+                Some(salt) => picks.sort_by_key(|c| tor_reserve_draw_with(&salt, &c.pubkey)),
+                None => picks.clear(),
+            }
             let need = target.saturating_sub(reserve.len());
             for c in picks.into_iter().take(need) {
                 let Some(peer) = cache.remove(c.addr) else { continue };
@@ -1286,6 +1390,19 @@ impl PoolInner {
     async fn dial_one(self: &Arc<PoolInner>, addr: SocketAddr, pubkey: [u8; 64], bal_only: bool) {
         let conn = match RlpxConnection::dial_metered(Arc::clone(&self.key), addr, pubkey, Some(Arc::clone(&self.traffic))).await {
             Ok(conn) => conn,
+            Err(e) if crate::el::rlpx::transport::is_local_entropy_failure(&e) => {
+                // OUR randomness is missing (early boot, a seccomp sandbox): no
+                // handshake can run against anyone, and it is not this peer's
+                // doing — no cache strike. The address still cools off, like
+                // every other dial that ends outside the pool: the peer accepted
+                // our TCP connection, so its inbound throttle is armed
+                // (`PEER_INBOUND_THROTTLE`) and a re-dial inside it would only
+                // buy the strike this arm avoids.
+                tracing::warn!(%addr, error = %e, "el dial: no OS entropy, handshake skipped");
+                self.record_backoff(addr, BackoffKind::Transient, Instant::now()).await;
+                self.attempted.lock().await.remove(&addr);
+                return;
+            }
             Err(e) => {
                 // Transport-level failure (refused/timeout/ECIES) — the peer is
                 // GONE, not incompatible. Streaks of these demote and eventually
@@ -1590,8 +1707,10 @@ impl PeerPool {
         }
         let mut cache = cache;
         let tor_reserve = load_tor_reserve(&mut cache, &boot_enodes);
+        let affinity_salt = load_affinity_salt(cache.path(), &key);
         let inner = Arc::new(PoolInner {
             tasks: super::tasks::Tasks::default(),
+            affinity_salt,
             key,
             local_pubkey,
             cfg,
@@ -1700,6 +1819,42 @@ impl PeerPool {
     /// retry loop with its transient bench, plus the head and proof keys #465
     /// added. Prunes closed peers first.
     pub async fn snap_peers(&self) -> Vec<Arc<ManagedPeer>> {
+        self.ordered_snap_peers(None).await
+    }
+
+    /// [`Self::snap_peers`] for a read that names `address` (an account read,
+    /// a storage read about it or about its holder, a proof of it): the same
+    /// tiers in the same order — health first, so a read never trades a
+    /// serving peer for privacy — but within each tier the peers in this
+    /// address's own order, by a keyed hash of the address and the peer's
+    /// node id ([`affinity_weight`]).
+    ///
+    /// Why (punicus #253, WalletBeat's *multi-address correlation*): with the
+    /// plain ladder every address of the wallet goes to the same first peer,
+    /// within milliseconds, so that one peer links them all. In the address's
+    /// own order each healthy peer is the first for about 1/P of the addresses,
+    /// and the same address keeps going to the same peers (its hedges
+    /// included) while they stay pooled, across restarts too (the salt is
+    /// kept, [`load_affinity_salt`]), so what any peer learns over time is
+    /// its own share rather than the whole set.
+    ///
+    /// Limits: P is the number of peers in the top tier AT THAT MOMENT. A
+    /// cold start (no cache-Confirmed peers) begins with a top tier of one or
+    /// two, the first to serve anything, and every address leads with them
+    /// until the rest are proven, as before this order. And a peer that drops
+    /// a tier (a bench, a stale word) hands its addresses to their next peer
+    /// by weight, so over a run an address reaches its top two or three peers
+    /// (the ones its hedges use anyway): a peer's share is nearer k/P than
+    /// 1/P. It does not unlink the reads from this node's IP or its node key;
+    /// Tor mode does that.
+    pub async fn snap_peers_for(&self, address: &[u8; 20]) -> Vec<Arc<ManagedPeer>> {
+        self.ordered_snap_peers(Some(address)).await
+    }
+
+    /// The one body of [`Self::snap_peers`] and [`Self::snap_peers_for`], so
+    /// both always rank by the same [`LadderKey`]s: `None` is the plain
+    /// ladder, an address its own order within each tier.
+    async fn ordered_snap_peers(&self, address: Option<&[u8; 20]>) -> Vec<Arc<ManagedPeer>> {
         self.inner.prune_closed().await;
         let now = Instant::now();
         let peers = self.inner.peers.lock().await;
@@ -1708,7 +1863,17 @@ impl PeerPool {
             .iter()
             .map(|p| LadderKey::new(p.is_benched(now), p.peer.coverage(), p.unproven()))
             .collect();
-        ladder_order(&keys)
+        let order = match address {
+            None => ladder_order(&keys),
+            Some(a) => {
+                let weights: Vec<u64> = newest_first
+                    .iter()
+                    .map(|p| affinity_weight(&self.inner.affinity_salt, a, &p.peer.peer_pubkey()))
+                    .collect();
+                affine_ladder_order(&keys, &weights)
+            }
+        };
+        order
             .into_iter()
             .map(|i| Arc::clone(&newest_first[i].peer))
             .collect()
@@ -1725,12 +1890,22 @@ impl PeerPool {
     /// each went on a `tor_reserve_handle`. Empty means the Tor path
     /// fails closed: it never falls back to a peer that sees our IP.
     pub async fn tor_candidates(&self, snap_only: bool) -> Vec<(SocketAddr, [u8; 64])> {
-        self.inner.prune_closed().await;
-        self.inner.balance_tor_reserve(true).await;
         // A fresh order among equals for each call: successive reads spread
         // over the reserve instead of all reaching its first few nodes.
-        let mut seed = [0u8; 8];
-        let _ = getrandom::getrandom(&mut seed);
+        self.tor_candidates_with(snap_only, draw_secret::<8>(getrandom::fill)).await
+    }
+
+    /// [`Self::tor_candidates`] with the per-call seed as a parameter, so a
+    /// test can take it away. No seed, no candidates: a fixed order would
+    /// send every Tor read and send of this process to the same, computable
+    /// node first (#823). Empty is the fail-closed answer the Tor path already
+    /// handles; [`tor_entropy_missing`] tells the caller why.
+    async fn tor_candidates_with(&self, snap_only: bool, seed: Option<[u8; 8]>) -> Vec<(SocketAddr, [u8; 64])> {
+        self.inner.prune_closed().await;
+        self.inner.balance_tor_reserve(true).await;
+        let Some(seed) = seed else {
+            return Vec::new();
+        };
         let cached = self
             .inner
             .tor_reserve
@@ -2135,23 +2310,73 @@ impl ContactLog {
 
 /// A per-process secret that orders the reserve's fill, so which peers a
 /// wallet sets aside for Tor is its own: with a fleet-wide order, every Myotis
-/// node would reach the same peers only over Tor.
-static TOR_RESERVE_SALT: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
-    let mut salt = [0u8; 32];
-    // No entropy: an all-zero salt still fills the reserve, in a guessable order.
-    let _ = getrandom::getrandom(&mut salt);
-    salt
-});
+/// node would reach the same peers only over Tor. Set once, by the first
+/// successful draw; never a fallback value (#823): while the OS has no entropy
+/// the reserve takes in no node, and the next fill draws again.
+static TOR_RESERVE_SALT: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+/// This process's reserve salt, drawn on first use; `None` while the OS cannot
+/// supply entropy, so the caller fails closed. (Not early boot: getrandom then
+/// blocks until the kernel's pool is ready. A failure is e.g. an Android
+/// seccomp filter answering EPERM, or no usable /dev for the fallback.)
+fn tor_reserve_salt() -> Option<[u8; 32]> {
+    if let Some(salt) = TOR_RESERVE_SALT.get() {
+        return Some(*salt);
+    }
+    let drawn = draw_secret::<32>(getrandom::fill)?;
+    Some(*TOR_RESERVE_SALT.get_or_init(|| drawn))
+}
+
+/// `N` bytes from `fill`, or `None` if it fails: the Tor reserve's secrets
+/// (the fill salt, the per-call seed) have no fallback value. An all-zero
+/// value would be a fleet-wide, computable order (#823). `fill` is a parameter
+/// so the failure path is testable.
+fn draw_secret<const N: usize>(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), getrandom::Error>,
+) -> Option<[u8; N]> {
+    let mut b = [0u8; N];
+    match fill(&mut b) {
+        Ok(()) => {
+            tor_entropy_recovered();
+            Some(b)
+        }
+        Err(e) => {
+            warn_no_tor_entropy(&e);
+            None
+        }
+    }
+}
+
+/// One WARN per outage, not one per call: set on a failed draw, cleared only by
+/// the next successful DRAW ([`tor_entropy_recovered`]), never by a cached salt.
+static TOR_ENTROPY_MISSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn warn_no_tor_entropy(e: &getrandom::Error) {
+    if !TOR_ENTROPY_MISSING.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            error = %e,
+            "tor: no OS entropy; the Tor reserve takes in no node and Tor reads and sends fail closed until it returns"
+        );
+    }
+}
+
+/// Whether the last draw of a Tor-reserve secret failed: an empty
+/// [`PeerPool::tor_candidates`] is then the OS's missing entropy, not a
+/// reserve with no ready node, and the caller's error says so.
+pub(crate) fn tor_entropy_missing() -> bool {
+    TOR_ENTROPY_MISSING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn tor_entropy_recovered() {
+    if TOR_ENTROPY_MISSING.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!("tor: OS entropy is back");
+    }
+}
 
 /// Pure: `node`'s place in the fill order drawn with `salt`.
 fn tor_reserve_draw_with(salt: &[u8; 32], node: &[u8; 64]) -> u64 {
     let h = myotis_core::keccak::keccak256_concat(salt, node);
     u64::from_le_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]])
-}
-
-/// `node`'s place in this process's fill order ([`tor_reserve_draw_with`]).
-fn tor_reserve_draw(node: &[u8; 64]) -> u64 {
-    tor_reserve_draw_with(&TOR_RESERVE_SALT, node)
 }
 
 /// `node`'s place in one call's order among equally ranked reserve nodes.
@@ -2389,6 +2614,25 @@ mod tor_eligible_tests {
         let (a, b) = ([1u8; 32], [2u8; 32]);
         assert_eq!(order(&a), order(&a));
         assert_ne!(order(&a)[..10], order(&b)[..10], "another wallet sets other peers aside");
+    }
+
+    #[test]
+    fn a_failed_draw_yields_no_secret_never_a_zero_one() {
+        // The fail-closed contract of the reserve's salt and seed (#823): a
+        // failing source gives None, so the caller takes in no node / returns
+        // no candidate, never an all-zero, fleet-wide order.
+        let failing = |_: &mut [u8]| Err(getrandom::Error::UNSUPPORTED);
+        assert_eq!(draw_secret::<32>(failing), None);
+        assert_eq!(draw_secret::<8>(failing), None);
+        let filled = draw_secret::<8>(|b: &mut [u8]| {
+            b.fill(7);
+            Ok(())
+        });
+        assert_eq!(filled, Some([7u8; 8]));
+        // On this host the real source works, and the salt is drawn once.
+        let salt = tor_reserve_salt().expect("entropy on the test host");
+        assert_ne!(salt, [0u8; 32]);
+        assert_eq!(tor_reserve_salt(), Some(salt), "one salt per process");
     }
 
     #[test]
@@ -3648,6 +3892,30 @@ mod tests {
         }
 
         #[tokio::test(start_paused = true)]
+        async fn without_entropy_the_reserve_takes_in_nothing_and_offers_nothing() {
+            // The two fail-closed branches of #823, with the secrets' sources
+            // taken away: no salt, no fill (the cache stays as it is); no seed,
+            // no candidate — and with them back, both work as usual.
+            let dir = cache_dir("no-entropy");
+            let mut cache = ElPeerCache::load(dir.join("peers-test.cache"));
+            for i in 0..9u8 {
+                cache.add(dead(200 + u16::from(i)), &[i; 64], true);
+            }
+            let pool = fixture_with(b"reserve-no-entropy", cache, Vec::new());
+            pool.inner.balance_tor_reserve_with(true, || None).await;
+            assert_eq!(pool.tor_reserve_len(), 0, "no salt: nothing set aside");
+            assert_eq!(pool.inner.cache.lock().await.peers().len(), 9, "the cache untouched");
+            pool.inner.balance_tor_reserve_with(true, || Some([5u8; 32])).await;
+            assert_eq!(pool.tor_reserve_len(), 3);
+            // A ready reserved node: offered with a seed, not without one.
+            pool.inner.tor_reserve.lock().unwrap().insert([30; 64], reserved(dead(230), 0));
+            assert!(pool.tor_candidates_with(false, None).await.is_empty(), "no seed: no candidate");
+            assert_eq!(pool.tor_candidates_with(false, Some([1u8; 8])).await, vec![(dead(230), [30; 64])]);
+            pool.stop().await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[tokio::test(start_paused = true)]
         async fn a_node_dialed_while_reserved_leaves_the_reserve_and_a_pin_goes_back_to_the_cache() {
             let dir = cache_dir("reconcile");
             let mut reserve = TorReserve::beside(Some(dir.join("peers-test.cache").as_path()));
@@ -3964,6 +4232,153 @@ mod tests {
                 assert!(attempted || backed_off, "{addr} was offered to the dialer");
             }
             pool.stop().await;
+        }
+    }
+
+    /// The per-address read order (punicus #253): tiers as the plain ladder,
+    /// a keyed per-address order within each, spread over the pool.
+    mod read_affinity {
+        use super::super::{
+            affine_ladder_order, affinity_salt_of, affinity_salt_path, affinity_weight, ladder_order,
+            load_affinity_salt, parse_salt, Coverage, LadderKey,
+        };
+        use std::path::Path;
+        use myotis_core::nodekey::NodeKey;
+
+        fn node(i: u8) -> [u8; 64] {
+            let mut n = [0u8; 64];
+            n[0] = i;
+            n[63] = i.wrapping_mul(31);
+            n
+        }
+
+        fn address(i: u16) -> [u8; 20] {
+            let mut a = [0u8; 20];
+            a[..2].copy_from_slice(&i.to_be_bytes());
+            a
+        }
+
+        const SALT: [u8; 32] = [7u8; 32];
+
+        #[test]
+        fn tiers_keep_the_plain_ladders_order() {
+            // A behind peer stays last and a benched one behind the healthy,
+            // whatever the weights say: health first, privacy within a tier.
+            let keys = [
+                LadderKey::new(false, Coverage::Behind, false),
+                LadderKey::new(true, Coverage::Covers, false),
+                LadderKey::new(false, Coverage::Covers, false),
+            ];
+            assert_eq!(affine_ladder_order(&keys, &[u64::MAX, u64::MAX, 0]), vec![2, 1, 0]);
+            assert_eq!(affine_ladder_order(&keys, &[0, 0, 0]), ladder_order(&keys));
+        }
+
+        #[test]
+        fn within_a_tier_the_heavier_weight_leads() {
+            let keys = [LadderKey::new(false, Coverage::Covers, false); 3];
+            assert_eq!(affine_ladder_order(&keys, &[1, 3, 2]), vec![1, 2, 0]);
+        }
+
+        #[test]
+        fn the_same_address_keeps_its_order_and_others_spread_over_the_pool() {
+            let nodes: Vec<[u8; 64]> = (0..8).map(node).collect();
+            let keys = [LadderKey::new(false, Coverage::Covers, false); 8];
+            let first = |a: &[u8; 20]| {
+                let w: Vec<u64> = nodes.iter().map(|n| affinity_weight(&SALT, a, n)).collect();
+                affine_ladder_order(&keys, &w)[0]
+            };
+            // Stable: one address goes to the same peer read after read.
+            assert_eq!(first(&address(1)), first(&address(1)));
+            // Spread: 400 addresses over 8 peers, every peer first for some
+            // and none for more than a fair share's double (expected 50).
+            let mut counts = [0usize; 8];
+            for i in 0..400 {
+                counts[first(&address(i))] += 1;
+            }
+            assert!(counts.iter().all(|&c| c > 0 && c < 100), "uneven spread: {counts:?}");
+        }
+
+        #[test]
+        fn a_peer_leaving_moves_only_the_addresses_it_led() {
+            // Rendezvous hashing: dropping peer 0 changes the first peer only
+            // of the addresses peer 0 was first for.
+            let nodes: Vec<[u8; 64]> = (0..6).map(node).collect();
+            let top = |a: &[u8; 20], pool: &[[u8; 64]]| -> [u8; 64] {
+                *pool.iter().max_by_key(|n| affinity_weight(&SALT, a, n)).unwrap()
+            };
+            for i in 0..200 {
+                let a = address(i);
+                let before = top(&a, &nodes);
+                if before != nodes[0] {
+                    assert_eq!(top(&a, &nodes[1..]), before);
+                }
+            }
+        }
+
+        #[test]
+        fn the_order_depends_on_the_secret_salt() {
+            let nodes: Vec<[u8; 64]> = (0..8).map(node).collect();
+            let order = |salt: &[u8; 32], a: &[u8; 20]| -> Vec<usize> {
+                let keys = [LadderKey::new(false, Coverage::Covers, false); 8];
+                let w: Vec<u64> = nodes.iter().map(|n| affinity_weight(salt, a, n)).collect();
+                affine_ladder_order(&keys, &w)
+            };
+            let other = [8u8; 32];
+            assert!(
+                (0..20).any(|i| order(&SALT, &address(i)) != order(&other, &address(i))),
+                "a peer could compute the order without the salt"
+            );
+        }
+
+        #[test]
+        fn the_salt_is_kept_beside_the_peer_cache_across_restarts() {
+            let dir = std::env::temp_dir().join(format!("myotis-pool-affinity-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let cache = dir.join("peers-gnosis.cache");
+            let salt_file = dir.join("peers-affinity-gnosis.cache");
+            let _ = std::fs::remove_file(&salt_file);
+            // Two runs, two node keys: one salt, the kept one, never either key's.
+            let first = NodeKey::from_secret_bytes(&[1u8; 32]).unwrap();
+            let second = NodeKey::from_secret_bytes(&[2u8; 32]).unwrap();
+            let kept = load_affinity_salt(Some(&cache), &first);
+            assert!(salt_file.exists());
+            assert_eq!(load_affinity_salt(Some(&cache), &second), kept);
+            assert_ne!(kept, affinity_salt_of(&first));
+            // A torn file is replaced, not trusted.
+            std::fs::write(&salt_file, "not a salt").unwrap();
+            let fresh = load_affinity_salt(Some(&cache), &first);
+            assert_eq!(load_affinity_salt(Some(&cache), &second), fresh);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn with_no_cache_file_the_salt_is_the_runs() {
+            let key = NodeKey::from_secret_bytes(&[3u8; 32]).unwrap();
+            assert_eq!(load_affinity_salt(None, &key), affinity_salt_of(&key));
+        }
+
+        #[test]
+        fn the_salts_file_is_named_like_the_tor_reserves() {
+            assert_eq!(
+                affinity_salt_path(Some(Path::new("/data/peers.cache"))).as_deref(),
+                Some(Path::new("/data/peers-affinity.cache"))
+            );
+            assert_eq!(
+                affinity_salt_path(Some(Path::new("/data/peers-gnosis.cache"))).as_deref(),
+                Some(Path::new("/data/peers-affinity-gnosis.cache"))
+            );
+            assert_eq!(parse_salt(&"ab".repeat(32)), Some([0xab; 32]));
+            assert_eq!(parse_salt(&"ab".repeat(31)), None);
+            assert_eq!(parse_salt(&format!("{}zz", "ab".repeat(31))), None);
+        }
+
+        #[test]
+        fn the_salt_is_derived_from_the_node_key_and_is_not_the_key() {
+            let a = NodeKey::from_secret_bytes(&[1u8; 32]).unwrap();
+            let b = NodeKey::from_secret_bytes(&[2u8; 32]).unwrap();
+            assert_eq!(affinity_salt_of(&a), affinity_salt_of(&a));
+            assert_ne!(affinity_salt_of(&a), affinity_salt_of(&b));
+            assert_ne!(affinity_salt_of(&a), a.secret_bytes());
         }
     }
 

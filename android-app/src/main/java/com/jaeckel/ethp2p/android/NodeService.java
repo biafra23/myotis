@@ -140,6 +140,7 @@ public final class NodeService extends Service {
     private static final String K_IDLE_PAUSE_MIN = "idlePauseMinutes";
     private static final String K_STAY_AWAKE_CHARGING = "stayAwakeWhileCharging";
     private static final String K_EXPERT_MODE = "expertMode";
+    private static final String K_STALE_ANCHOR_CHOICE = "staleAnchorChoice";
     private static final String K_WEB_ACCESS_MODE = "webAccess.mode";
     private static final String K_WEB_ACCESS_ORIGINS = "webAccess.origins";
     private static final String K_WATCH_LIST_PREFIX = "watch.list.";
@@ -586,6 +587,14 @@ public final class NodeService extends Service {
     public static void setStayAwakeWhileCharging(android.content.Context c, boolean v) {
         prefs(c).edit().putBoolean(K_STAY_AWAKE_CHARGING, v).apply();
     }
+    /** The remembered answer to a stale sync anchor, as a {@code StaleAnchorChoice} name
+     *  ("ASK" when none is remembered). */
+    public static String staleAnchorChoice(android.content.Context c) {
+        return prefs(c).getString(K_STALE_ANCHOR_CHOICE, "ASK");
+    }
+    public static void setStaleAnchorChoice(android.content.Context c, String v) {
+        prefs(c).edit().putString(K_STALE_ANCHOR_CHOICE, v).apply();
+    }
     /** Expert mode (Logs/Index tabs, full Status rows, advanced settings). Off by default. */
     public static boolean expertMode(android.content.Context c) {
         return prefs(c).getBoolean(K_EXPERT_MODE, false);
@@ -875,6 +884,36 @@ public final class NodeService extends Service {
             ChainHandle h = handles.get(network);
             if (h != null) h.acceptStaleAnchor();
         }
+    }
+
+    /** Hand the persisted stale-anchor choice to every live stack (the caller persisted
+     *  it first); each engine applies it at its next park, and at a park now. */
+    public void applyStaleAnchorChoice() {
+        io.myotis.api.StaleAnchorPolicy p = stalePolicy(this);
+        synchronized (handles) {
+            for (ChainHandle h : handles.values()) h.setStaleAnchorPolicy(p);
+        }
+    }
+
+    private static io.myotis.api.StaleAnchorPolicy stalePolicy(android.content.Context c) {
+        try {
+            return io.myotis.api.StaleAnchorPolicy.valueOf(staleAnchorChoice(c));
+        } catch (IllegalArgumentException e) {
+            return io.myotis.api.StaleAnchorPolicy.ASK;
+        }
+    }
+
+    /** The stale-anchor dialog's "Fetch fresh checkpoint": re-anchor {@code network}'s
+     *  STALE_ANCHOR park on a checkpoint every answering checkpoint-sync server names and a
+     *  long-known peer confirms ({@code allowUnconfirmed}: the user's "use it anyway").
+     *  Blocking (network round) — the handle is read under the lock, the call runs outside it. */
+    public io.myotis.api.AnchorRefresh refreshAnchorFromCheckpointz(String network, boolean allowUnconfirmed) {
+        ChainHandle h;
+        synchronized (handles) {
+            h = handles.get(network);
+        }
+        if (h == null) return io.myotis.api.AnchorRefresh.refused(network + " is not running");
+        return h.refreshAnchorFromCheckpointz(allowUnconfirmed);
     }
 
     /** Currently live networks (a chip per entry), in display order. */
@@ -2674,6 +2713,9 @@ public final class NodeService extends Service {
                     // Weak-subjectivity bound override rides the same pre-start apply
                     // + monitor: the cold-start gate must judge with it.
                     handle.setWsBoundPeriods(wsBoundPeriods(this));
+                    // The remembered stale-anchor answer: the engine applies it at the
+                    // cold-start park itself, with or without an Activity on screen.
+                    handle.setStaleAnchorPolicy(stalePolicy(this));
                     // Web page access (#502) too: the listener's first request must be
                     // judged by the persisted policy, never the engine default.
                     applyWebAccessTo(handle);

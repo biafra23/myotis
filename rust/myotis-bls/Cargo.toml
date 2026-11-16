@@ -31,7 +31,7 @@ std = []
 # build that pulls in only one of them must still get it.
 blst = { version = "0.3", features = ["portable"] }
 # JNI bindings so the JVM/Android can call in (optional — see the `jni` feature).
-jni = { version = "0.21", default-features = false, optional = true }
+jni = { version = "0.22", default-features = false, optional = true }
 
 # NOTE: [profile.release] moved to the workspace root rust/Cargo.toml (crate-level
 # profiles are ignored inside a workspace).

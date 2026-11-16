@@ -245,9 +245,9 @@ jobs:
           # contract version and every API checksum. A mismatch makes the app fall
           # back to the Java engine silently, and the dmg/deb legs never load the
           # library at all. Each checksum is read the way the bindings read it (a
-          # 32-bit return) and compared on its low 16 bits, as the bindings do since
-          # uniffiGenerateKotlin masks them: the upper bits are not part of a u16
-          # return and are not zero on every build.
+          # 32-bit return) and compared on its low 16 bits, as the bindings do (UniFFI
+          # masks them since 0.32.2; uniffiGenerateKotlin checks it): the upper bits
+          # are not part of a u16 return and are not zero on every build.
           Add-Type -TypeDefinition @'
           using System;
           using System.Runtime.InteropServices;

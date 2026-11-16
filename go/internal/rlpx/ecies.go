@@ -36,6 +36,15 @@ func EcdhX(priv *ecdsa.PrivateKey, pub64 []byte) ([32]byte, error) {
 		return out, errors.New("ecies: peer point not on secp256k1")
 	}
 	bx, _ := crypto.S256().ScalarMult(x, y, priv.D.Bytes())
+	// Refuse a nil result by name (PR #832 review hardening): go-ethereum
+	// v1.16.9's ScalarMult returns nil for an out-of-range point — the
+	// IsOnCurve check above rejects those since that same version added the
+	// range check, so today's pairing is safe, but an unchecked nil landing
+	// on bx.Sign() would panic on a peer packet inside the host process. Do
+	// not rely on the pairing.
+	if bx == nil {
+		return out, errors.New("ecies: ECDH scalar multiplication failed")
+	}
 	if bx.Sign() == 0 {
 		return out, errors.New("ecies: ECDH produced the point at infinity")
 	}

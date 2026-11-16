@@ -41,16 +41,21 @@ jobs:
     runs-on: ubuntu-26.04
     permissions:
       contents: read
-
-    # Portable blst, like the Gradle task (goBuildCShared) and the Rust
-    # workspace build it (#734 D3): the blst Go binding compiles ADX paths on
-    # amd64, and its load-time constructor answers SIGILL with _exit(132) —
-    # which would KILL whatever process dlopens the c-shared library, on a
-    # pre-Broadwell/pre-Zen machine, past every UnsatisfiedLinkError handler.
-    # Job-level so `go test -race` exercises the same object code the artifact
-    # ships (PR #832 round-3 review — this workflow built bare before).
+    # ONE env block for the job (a merge of main's and the feature's — the
+    # file carried two `env:` keys between the two merges and the workflow
+    # parser rejects a duplicate mapping key, which silently cost this PR its
+    # Go CI). The flags are the reproducible-builds gate's
+    # (scripts/repro/build_linux.sh defines them), so the blst this workflow
+    # tests is the blst the gate compares. And like the Gradle task
+    # (goBuildCShared) and the Rust workspace it mirrors (#734 D3): the blst
+    # Go binding compiles ADX paths on amd64, and its load-time constructor
+    # answers SIGILL with _exit(132) — which would KILL whatever process
+    # dlopens the c-shared library, on a pre-Broadwell/pre-Zen machine, past
+    # every UnsatisfiedLinkError handler. Job-level so `go test -race`
+    # exercises the same object code the artifact ships (PR #832 round-3
+    # review — this workflow built bare before).
     env:
-      CGO_CFLAGS: "-O2 -D__BLST_PORTABLE__"
+      CGO_CFLAGS: "-O2 -g -D__BLST_PORTABLE__"
 
     steps:
       - name: Checkout code
