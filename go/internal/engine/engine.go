@@ -343,10 +343,10 @@ func (e *Engine) SetWsBoundPeriods(periods uint64) bool {
 // AcceptStale records the host's one-shot consent to the embedded
 // anchor's age (myotis_accept_stale_anchor): suppresses both
 // weak-subjectivity layers for the rest of the run — read live at
-// every gate, so it ends early when a remembered CONTINUE later
-// replaces and is itself replaced (one shared flag, host.rs:1625-1627
-// behaves the same) — never persisted, and releases a bootstrap that
-// had already parked.
+// every gate, so it ends early whenever a remembered CONTINUE is
+// replaced while it is armed, whichever of the two came first (one
+// shared flag; host.rs:1625-1627 behaves the same) — never
+// persisted, and releases a bootstrap that had already parked.
 func (e *Engine) AcceptStale() bool {
 	e.mu.Lock()
 	if e.closed {
