@@ -768,7 +768,9 @@ func TestCanonicalNameMatchesRustTable(t *testing.T) {
 // round 10 said was missing: capabilities() drifting from the golden
 // fails HERE, the single point of enforcement — the JVM fixture
 // splices this same file, so it can never be a stale hand-copy (the
-// JVM asserts only the three ABI-58/59 keys it interprets).
+// JVM reader interprets none of it: its test checks that the two
+// ABI-58/59 disclosures are in the fixture, and that the snapshot is
+// the same with them removed or an unknown key added).
 // Cross-read pattern per GoAbiVersionMirrorTest.
 func TestCapabilitiesGolden(t *testing.T) {
 	golden, err := os.ReadFile("testdata/capabilities.json")

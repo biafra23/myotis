@@ -572,11 +572,12 @@ func (e *Engine) wireSyncerHooks(s *clsync.Syncer) {
 
 // newLoopSyncer is the ONE way lcLoop gets a Syncer: built and wired
 // in a single step, so an unwired loop syncer is a different call
-// rather than a missing line (PR #879 round 18: deleting the wiring
-// call inside lcLoop kept every test green — TestWireSyncerHooksTrackEngineState
-// pins the method, but it drives its own Syncer, and no test reaches
-// the loop's call site cheaply because the start gate needs a clock
-// seam the loop does not have).
+// rather than a missing line. TestWireSyncerHooksTrackEngineState
+// takes its Syncer from THIS constructor, so deleting the wiring line
+// below fails the test's nil check (rounds 18-19: round 18 moved the
+// untested wiring from lcLoop to here; round 19 moved the test to
+// here too — the only wiring left unexercised is lcLoop's single
+// expression calling this function).
 func (e *Engine) newLoopSyncer(c *chain.Consensus, h host.Host, logf func(string, ...any)) *clsync.Syncer {
 	s := clsync.NewSyncer(c, h, logf)
 	e.wireSyncerHooks(s)

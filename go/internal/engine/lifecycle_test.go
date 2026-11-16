@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/biafra23/myotis/go/internal/chain"
 	"github.com/biafra23/myotis/go/internal/clsync"
 	"log/slog"
 	"net"
@@ -179,9 +180,11 @@ func TestStallWatcherReArmsOnAnyGatePass(t *testing.T) {
 // test green while production took clsync's constant-generation
 // fallback). The hooks must be live reads of engine state, not
 // captures: mutate the engine, and the syncer's hooks answer
-// differently on the next call. This pins the METHOD; the loop's call
-// site is enforced by construction (lcLoop takes its Syncer only from
-// newLoopSyncer, which builds and wires in one step — round 18).
+// differently on the next call. The Syncer is taken from
+// newLoopSyncer — the loop's own constructor — so the wiring line
+// inside it is pinned too (round 19); what remains untested is only
+// lcLoop's single expression calling the constructor, where skipping
+// it means writing a different call entirely.
 func TestWireSyncerHooksTrackEngineState(t *testing.T) {
 	var logBuf bytes.Buffer // must receive the WARN the hook promises (round 14)
 	e, err := New(Config{DataDir: t.TempDir(), ListenPort: -1,
@@ -190,8 +193,20 @@ func TestWireSyncerHooksTrackEngineState(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer e.Close()
-	s := &clsync.Syncer{} // zero value: wireSyncerHooks only assigns hooks
-	e.wireSyncerHooks(s)
+	// Take the Syncer from the LOOP's own constructor, not a hand-built
+	// zero value: `newLoopSyncer` is what round 18's seam made testable,
+	// and the deleted-wiring-line mutant (the whole point of the seam)
+	// only fails here if the syncer comes from newLoopSyncer — a
+	// hand-built one calls wireSyncerHooks itself and never sees the
+	// deletion (round 19: the seam moved the unpinned line one frame
+	// down, it did not pin it). NewHost has no listen address and dials
+	// nothing, so this is construction only — ~10ms, CI-safe.
+	h, err := clsync.NewHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	s := e.newLoopSyncer(chain.ConsensusMainnet(), h, nil)
 	if s.Warnf == nil || s.WsBound == nil || s.StaleAccepted == nil || s.StaleGeneration == nil {
 		t.Fatalf("wireSyncerHooks left a hook nil: warn=%v bound=%v consent=%v gen=%v",
 			s.Warnf != nil, s.WsBound != nil, s.StaleAccepted != nil, s.StaleGeneration != nil)
