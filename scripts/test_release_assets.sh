@@ -48,7 +48,7 @@ case "$1 ${2:-}" in
   "release view")
     [ -f "$d/exists" ] || { echo "release not found" >&2; exit 1; }
     echo 42 ;;
-  "api repos/"*"/commits/tags/"*) echo "$COMMIT" ;;
+  "api repos/"*"/commits/refs/tags/"*) echo "$COMMIT" ;;
   "api --paginate")
     case "$3" in "repos/"*"/releases/42/assets?per_page=100") ;; *) exit 97 ;; esac
     for f in "$d"/assets/*; do

@@ -136,7 +136,7 @@ if $attest; then
   # The commit the tag points at (peeled, for an annotated tag). A tag that
   # was moved leaves assets of its earlier commit behind: same ref name, other
   # commit, and --source-ref alone would accept them.
-  commit=$(gh api "repos/$repo/commits/tags/$tag" --jq .sha) \
+  commit=$(gh api "repos/$repo/commits/refs/tags/$tag" --jq .sha) \
     || { echo "verify_release.sh: cannot resolve the commit of tag $tag in $repo" >&2; exit 1; }
   n=0
   for f in $assets; do
