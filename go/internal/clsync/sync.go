@@ -126,18 +126,21 @@ type Syncer struct {
 
 	// The waiver line follows the engine's consent-generation count
 	// (waiveGen = the generation last given a line; waiveGenValid =
-	// whether any line went out yet). One WARN per arming event —
+	// a line went out since consent was last seen absent — every
+	// consent-absent gate call clears it, see staleGate). One WARN
+	// per arming event —
 	// each costs the user one action, so it cannot spam — and a
 	// withdraw-and-regrant between gate samples still logs, the gap
 	// the sampled boolean of rounds 5/7 missed (round 8; Rust logs
 	// every accept_stale_anchor.swap that flips, sync.rs:2848).
 	//
-	// CONFINED to the goroutine that runs staleGate, deliberately
-	// unguarded. staleGate is reached only from RunCatchUp, and one
-	// RunCatchUp runs at a time: the engine drives it from the single
-	// lcLoop goroutine and never re-enters (Close joins the loop
-	// before restartIfParked spawns another), while cmd/myotis-lc
-	// calls it once and exits. A second concurrent caller — a parity
+	// CONFINED to the goroutine that drives this Syncer, deliberately
+	// unguarded. staleGate is reached from RunBootstrap (through
+	// checkStartGate) and from RunCatchUp, and every caller runs both
+	// on one goroutine, one call at a time: engine.lcLoop builds its
+	// OWN Syncer on every loop run, so a restarted loop never shares
+	// these fields with the one it replaces, and cmd/myotis-lc drives
+	// its Syncer from main. A second concurrent caller — a parity
 	// fix that samples the gate off-loop, say — must put these behind
 	// a mutex or take its own, or it races them.
 	waiveGen      uint64
