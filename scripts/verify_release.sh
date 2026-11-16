@@ -136,7 +136,11 @@ if $attest; then
   # The commit the tag points at (peeled, for an annotated tag). A tag that
   # was moved leaves assets of its earlier commit behind: same ref name, other
   # commit, and --source-ref alone would accept them.
-  commit=$(gh api "repos/$repo/commits/refs/tags/$tag" --jq .sha) \
+  # The sha media type returns the 40 hex digits alone, not the whole commit
+  # with its diff (which GitHub may fail to build for a very large merge); the
+  # shape check keeps an empty or unexpected body from becoming the digest.
+  commit=$(gh api -H 'Accept: application/vnd.github.sha' "repos/$repo/commits/refs/tags/$tag") \
+    && printf '%s' "$commit" | grep -Eqx '[0-9a-f]{40}' \
     || { echo "verify_release.sh: cannot resolve the commit of tag $tag in $repo" >&2; exit 1; }
   n=0
   for f in $assets; do
