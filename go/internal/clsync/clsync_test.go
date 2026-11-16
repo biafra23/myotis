@@ -76,9 +76,9 @@ func TestStaticParsesEveryStaticPeer(t *testing.T) {
 // TestStaleGateConsentWaiverIsLogged pins the audit trail PR #877
 // rounds 3-4 asked for: waiving the weak-subjectivity bound on the
 // host's consent is the one trust decision in this flow, so it must
-// leave a line in the log the hosts drain — once per arming (the
-// consent generation, not the loop: one loop can hold many armings),
-// naming
+// leave a line in the log the hosts drain — at most one per arming
+// (the consent generation, not the loop: one loop can hold many
+// armings), at the first stale gate that uses it, naming
 // what it waived, and at WARN: the Rust twins are tracing::warn!
 // (sync.rs:2478/2849/2491) and normalizeForHostPumps promises the
 // hosts' WARN-filtered view keeps exactly this class of line, so a

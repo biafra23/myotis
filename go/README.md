@@ -267,8 +267,10 @@ once at WARN
 (`STALE ANCHOR: held committee aged ... while running`, re-warned per
 new stall, so the hosts' WARN-filtered view keeps it) besides the
 per-slot INFO `re-catch-up:` line, and the ways out are choosing
-CONTINUE again in Settings or a restart, which parks at the bootstrap
-gate and asks. The Rust loop instead re-publishes `STALE_ANCHOR` and re-asks.
+CONTINUE again in Settings, **raising the weak-subjectivity bound in
+Settings** (applied live — the gate re-reads the bound every slot, so
+the stall ends without a restart, as the WARN line itself says), or a
+restart, which parks at the bootstrap gate and asks. The Rust loop instead re-publishes `STALE_ANCHOR` and re-asks.
 The parity fix likely needs no status-contract change (PR #877
 round 6): Rust re-publishes that park every 5 s from its
 still-running loop (`sync.rs:2691`), so `STALE_ANCHOR` from a live

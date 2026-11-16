@@ -96,8 +96,9 @@ type Syncer struct {
 	// StaleGeneration is the engine's count of consent ARMS (each
 	// false→true arming — one user action — increments it). The
 	// waiver line follows this count rather than the sampled flag:
-	// one line per arming, and an arming that lands between gate
-	// samples still gets its line at the next one. While the store
+	// at most one line per arming, at the first STALE gate call that
+	// uses it — and an arming that lands between gate samples is
+	// still logged at the next stale one. While the store
 	// is current the gate runs only at period boundaries
 	// (RunCatchUp returns before it once caught up), so sampling a
 	// boolean missed exactly that (round 8). nil → constant
@@ -217,10 +218,10 @@ func (s *Syncer) staleGate(anchorPeriod, wallPeriod uint64, what string) error {
 		return nil
 	}
 	if consented {
-		// One line per consent GENERATION (round 8): an arming the
-		// gate never sampled between calls still changes the count,
-		// so the next pass logs it; repeats of the same arming stay
-		// silent however long the waiver runs.
+		// At most one line per consent GENERATION (round 8): an
+		// arming the gate never sampled between calls still changes
+		// the count, so the next STALE pass logs it; repeats of the
+		// same arming stay silent however long the waiver runs.
 		gen := uint64(0)
 		if s.StaleGeneration != nil {
 			gen = s.StaleGeneration()
