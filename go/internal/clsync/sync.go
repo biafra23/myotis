@@ -101,10 +101,12 @@ type Syncer struct {
 	// is current the gate runs only at period boundaries
 	// (RunCatchUp returns before it once caught up), so sampling a
 	// boolean missed exactly that (round 8). nil → constant
-	// generation with round 7's full re-arm kept on BOTH consent-
-	// absent paths — refusal and fresh pass (see staleGate; round 10
-	// caught that the refusal path alone is round 5's behaviour):
-	// one line per waiver streak, never round 3's once-per-loop.
+	// generation, which still cannot mute a re-armed waiver: every
+	// gate call that finds consent absent re-arms the line (see
+	// staleGate), so the next waiver logs again. What a missing hook
+	// does lose is an arming that lands between two gate calls while
+	// consent stays continuously armed — the round-8 case, which is
+	// why the engine wires this.
 	StaleGeneration func() uint64
 	// Warnf carries trust-decision lines the Rust twin logs at WARN
 	// (the stale-anchor waiver, sync.rs:2478/2849/2491 — all
@@ -129,6 +131,15 @@ type Syncer struct {
 	// withdraw-and-regrant between gate samples still logs, the gap
 	// the sampled boolean of rounds 5/7 missed (round 8; Rust logs
 	// every accept_stale_anchor.swap that flips, sync.rs:2848).
+	//
+	// CONFINED to the goroutine that runs staleGate, deliberately
+	// unguarded. staleGate is reached only from RunCatchUp, and one
+	// RunCatchUp runs at a time: the engine drives it from the single
+	// lcLoop goroutine and never re-enters (Close joins the loop
+	// before restartIfParked spawns another), while cmd/myotis-lc
+	// calls it once and exits. A second concurrent caller — a parity
+	// fix that samples the gate off-loop, say — must put these behind
+	// a mutex or take its own, or it races them.
 	waiveGen      uint64
 	waiveGenValid bool
 }
@@ -180,19 +191,23 @@ func (s *Syncer) staleGate(anchorPeriod, wallPeriod uint64, what string) error {
 	// Staleness is computed BEFORE the consent is consulted — not to
 	// change the verdict (consent still waives, refusal is unchanged)
 	// but because the waiver has to be able to name what it waived.
+	consented := s.staleAccepted()
+	if !consented {
+		// One rule for every caller, hooked or not: a gate call that
+		// finds consent absent re-arms the waiver line. The next
+		// waiver then needs an arming the line has not seen — either
+		// a new generation, or, with no hook, the absence just
+		// observed — so it cannot go unlogged, and no caller-shaped
+		// special case is left to misdescribe (round 12: the two
+		// `StaleGeneration == nil` guards this replaced had their
+		// behaviour stated wrongly in three rounds of comments while
+		// the tests stayed green).
+		s.waiveGenValid = false
+	}
 	if !chain.WsAnchorStale(anchorPeriod, wallPeriod, s.boundPeriods()) {
-		if s.StaleGeneration == nil && !s.staleAccepted() {
-			// Hookless caller: round 7's FRESH-path re-arm belongs
-			// here too — a current store reaches this gate only at
-			// period boundaries, so one consent-absent observation
-			// must re-arm the waiver line even without a refusal
-			// (round 10: resetting on refusals alone is round 5's
-			// behaviour, which round 7 existed to fix).
-			s.waiveGenValid = false
-		}
 		return nil
 	}
-	if s.staleAccepted() {
+	if consented {
 		// One line per consent GENERATION (round 8): an arming the
 		// gate never sampled between calls still changes the count,
 		// so the next pass logs it; repeats of the same arming stay
@@ -209,13 +224,6 @@ func (s *Syncer) staleGate(anchorPeriod, wallPeriod uint64, what string) error {
 				what, anchorPeriod, wallPeriod, s.boundPeriods())
 		}
 		return nil
-	}
-	if s.StaleGeneration == nil {
-		// Hookless caller: generations cannot distinguish two armings,
-		// so keep round 7's refusal-path re-arm alongside the fresh-
-		// path one above — otherwise the constant generation pins the
-		// first line for the loop's life (round 3's behaviour; round 9).
-		s.waiveGenValid = false
 	}
 	return fmt.Errorf("%w: %s period %d, wall period %d, bound %d",
 		ErrStaleAnchor, what, anchorPeriod, wallPeriod, s.boundPeriods())

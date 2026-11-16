@@ -259,10 +259,11 @@ no checkpoint-anchor refresh (ABI 58 refuses by name,
 plainly (PR #877 round 3): the weak-subjectivity **re-check while
 running** differs from the Rust loop. After bootstrap, an in-run
 refusal (a long sleep, or Settings moving off "continue anyway")
-stalls the steady loop silently — every slot refuses at the in-run
-gate, so no finality poll runs and no anchor is published, the status
-stays `SYNCING`/`CATCHING_UP` (it reports `STALE_ANCHOR` only when the
-loop itself died) and **no dialog opens**; the stall logs once at WARN
+stalls the steady loop — every slot refuses at the in-run gate, so no
+finality poll runs and no anchor is published, the status stays
+`SYNCING`/`CATCHING_UP` (it reports `STALE_ANCHOR` only when the loop
+itself died) and **no dialog opens**; the stall is not silent: it logs
+once at WARN
 (`STALE ANCHOR: held committee aged ... while running`, re-warned per
 new stall, so the hosts' WARN-filtered view keeps it) besides the
 per-slot INFO `re-catch-up:` line, and the ways out are choosing

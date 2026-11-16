@@ -546,24 +546,23 @@ func (w *stallWatcher) note(err error) {
 // myotis_accept_stale_anchor, myotis_set_stale_anchor_policy) mutate
 // the engine, and the gates must see every mutation at their next
 // check — so these are live reads, never captured values. The
-// StaleGeneration hook is what carries the round-8 waiver fix; a
-// silently missing assignment would take clsync's constant-generation
-// fallback and restore round 3's once-per-loop logging with every
-// test still green (PR #879 round-9 review), hence this method and
-// its test rather than inline assignments.
+// StaleGeneration hook is what carries the round-8 waiver fix: a
+// silently missing assignment leaves clsync on its constant
+// generation, which re-arms on every consent-absent gate call but
+// cannot see an arming that lands BETWEEN two calls while consent
+// stays armed — exactly round 8's gap, and the only thing a missing
+// assignment costs (round 12; earlier rounds of this comment
+// overstated it as round 3's once-per-loop logging). Round 9 caught
+// such an assignment missing with no test noticing, hence this method
+// and TestWireSyncerHooksTrackEngineState, which fails on a nil hook.
+// The consent and generation hooks are the engine's own accessors —
+// one definition of the locked read each, as WsBound already is (the
+// closures here repeated them; round 12).
 func (e *Engine) wireSyncerHooks(s *clsync.Syncer) {
 	s.Warnf = func(f string, a ...any) { e.log.Warn(fmt.Sprintf(f, a...)) }
 	s.WsBound = e.EffectiveWsBound
-	s.StaleAccepted = func() bool {
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		return e.acceptStale
-	}
-	s.StaleGeneration = func() uint64 {
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		return e.staleGen
-	}
+	s.StaleAccepted = e.StaleAccepted
+	s.StaleGeneration = e.StaleGeneration
 }
 
 // lcLoop bootstraps the LC over libp2p (static pins, the same

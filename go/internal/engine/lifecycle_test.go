@@ -217,6 +217,21 @@ func TestWireSyncerHooksTrackEngineState(t *testing.T) {
 	if g := s.StaleGeneration(); g != 1 {
 		t.Fatalf("re-arming an armed consent must not bump the generation (got %d)", g)
 	}
+	// The one-shot twin of the no-bump rule, in the order the park
+	// dialog's "continue anyway" with "remember" ticked produces it
+	// (NodeScreen.kt:587-591: onRemember then onContinue, i.e.
+	// SetStaleAnchorPolicy(CONTINUE) then accept). Consent is armed
+	// here and the generation is 1, so this accept must change
+	// neither — an unconditional bump would turn that one click into
+	// two generations, and the waiver log into two lines for one
+	// user action (round 12; the CONTINUE guard above was pinned,
+	// this twin was not).
+	if !e.AcceptStale() {
+		t.Fatal("AcceptStale on an armed consent must still answer true")
+	}
+	if g := s.StaleGeneration(); g != 1 {
+		t.Fatalf("a one-shot accept on an armed consent must not bump the generation (got %d)", g)
+	}
 	if !e.SetStaleAnchorPolicy(0) { // ASK replaces CONTINUE -> withdrawal
 		t.Fatal("ASK must apply")
 	}
