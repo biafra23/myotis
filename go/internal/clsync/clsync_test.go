@@ -143,12 +143,13 @@ func TestStaleGateConsentWaiverIsLogged(t *testing.T) {
 		// again, and that re-arm is its own trust decision (Rust logs
 		// every accept_stale_anchor.swap that flips, sync.rs:2848).
 		var lines []string
-		consent := true
+		consent, gen := true, uint64(1)
 		s := &Syncer{
-			Logf:          func(string, ...any) { t.Fatal("waiver must not reach the plain log hook") },
-			Warnf:         func(f string, a ...any) { lines = append(lines, fmt.Sprintf(f, a...)) },
-			WsBound:       func() uint64 { return bound },
-			StaleAccepted: func() bool { return consent },
+			Logf:            func(string, ...any) { t.Fatal("waiver must not reach the plain log hook") },
+			Warnf:           func(f string, a ...any) { lines = append(lines, fmt.Sprintf(f, a...)) },
+			WsBound:         func() uint64 { return bound },
+			StaleAccepted:   func() bool { return consent },
+			StaleGeneration: func() uint64 { return gen },
 		}
 		if err := s.staleGate(bound+1, 2*bound+2, "held committee"); err != nil {
 			t.Fatalf("waived gate refused: %v", err)
@@ -157,7 +158,7 @@ func TestStaleGateConsentWaiverIsLogged(t *testing.T) {
 		if err := s.staleGate(bound+1, 2*bound+2, "held committee"); !errors.Is(err, ErrStaleAnchor) {
 			t.Fatalf("withdrawn consent did not refuse: %v", err)
 		}
-		consent = true // Settings -> "continue again": new decision
+		consent, gen = true, 2 // Settings -> "continue again": new arming
 		if err := s.staleGate(bound+1, 2*bound+2, "held committee"); err != nil {
 			t.Fatalf("re-armed gate refused: %v", err)
 		}
@@ -166,34 +167,34 @@ func TestStaleGateConsentWaiverIsLogged(t *testing.T) {
 		}
 	})
 
-	t.Run("withdrawal seen while current re-arms the waiver", func(t *testing.T) {
-		// Round 7: a current store reaches the gate only at period
-		// boundaries (RunCatchUp returns before it once caught up),
-		// so re-arming the waiver line only on refusals left a
-		// withdraw-then-rearm made while current unseen — the next
-		// waiver, after a sleep past the bound, passed unlogged.
-		// Any gate call finding consent absent must re-arm.
+	// Round 8, the sequence round 7's fix still missed: while the store
+	// is current the gate runs only at period boundaries, so BOTH the
+	// withdrawal and the re-grant can land between samples and no gate
+	// call ever observes the gap. Generation-keyed logging catches it
+	// at the next pass; the reviewer's probe, run against this head.
+	t.Run("arming between gate samples still gets its line", func(t *testing.T) {
 		var lines []string
-		consent := true
+		consent, gen := true, uint64(1)
 		s := &Syncer{
-			Logf:          func(string, ...any) { t.Fatal("waiver must not reach the plain log hook") },
-			Warnf:         func(f string, a ...any) { lines = append(lines, fmt.Sprintf(f, a...)) },
-			WsBound:       func() uint64 { return bound },
-			StaleAccepted: func() bool { return consent },
+			Logf:            func(string, ...any) { t.Fatal("waiver must not reach the plain log hook") },
+			Warnf:           func(f string, a ...any) { lines = append(lines, fmt.Sprintf(f, a...)) },
+			WsBound:         func() uint64 { return bound },
+			StaleAccepted:   func() bool { return consent },
+			StaleGeneration: func() uint64 { return gen },
 		}
+		if err := s.staleGate(bound+1, 2*bound+2, "checkpoint"); err != nil {
+			t.Fatalf("bootstrap waiver refused: %v", err)
+		}
+		if err := s.staleGate(bound, bound, "held committee"); err != nil {
+			t.Fatalf("boundary pass refused: %v", err) // consent present, fresh: silent
+		}
+		consent = false            // "ask me"
+		consent, gen = true, gen+1 // "continue anyway", no gate call between
 		if err := s.staleGate(bound+1, 2*bound+2, "held committee"); err != nil {
-			t.Fatalf("waived gate refused: %v", err)
-		}
-		consent = false                                                     // "ask me", node current
-		if err := s.staleGate(bound, bound, "held committee"); err != nil { // fresh pass, no refusal
-			t.Fatalf("fresh gate refused: %v", err)
-		}
-		consent = true // "continue anyway"
-		if err := s.staleGate(bound+1, 2*bound+2, "held committee"); err != nil {
-			t.Fatalf("re-armed gate refused: %v", err)
+			t.Fatalf("post-sleep waiver refused: %v", err)
 		}
 		if len(lines) != 2 {
-			t.Fatalf("logged %d lines %q, want the post-current re-arm logged", len(lines), lines)
+			t.Fatalf("logged %d lines %q, want the re-granted consent logged", len(lines), lines)
 		}
 	})
 

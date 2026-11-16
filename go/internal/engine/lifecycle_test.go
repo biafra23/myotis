@@ -99,6 +99,13 @@ func TestSetStaleAnchorPolicyWithdrawalMirrorsRust(t *testing.T) {
 	if !e.StaleAccepted() {
 		t.Error("a REFUSED policy write must not withdraw an armed consent (apply-or-refuse)")
 	}
+	// The consent GENERATION the waiver line follows (PR #877 round 8):
+	// one bump per arming, none per refusal or refused write. Fresh
+	// engine 0 → CONTINUE arms 1 → ASK withdraws, still 1 → one-shot
+	// arms 2 → refused CHECKPOINT disturbs nothing, still 2.
+	if g := e.StaleGeneration(); g != 2 {
+		t.Errorf("staleGen = %d, want 2 (one bump per arming, none per withdrawal or refusal)", g)
+	}
 	// The 2 → 1 sequence specifically (PR #877 round-2): replacing a
 	// remembered CONTINUE with CHECKPOINT withdraws the CONTINUE's consent
 	// FIRST (host.rs swaps before it refuses), so the refused answer never

@@ -77,6 +77,16 @@ type Engine struct {
 	// check rather than needing the process restarted.
 	wsOverride  uint64 // 0 = the network default (the contract's 0)
 	acceptStale bool
+	// staleGen counts consent ARMS: bumped on every acceptStale
+	// false→true transition (one-shot accept or remembered CONTINUE —
+	// each is one user action). The syncer's waiver line is keyed to
+	// this generation, not to a consent flag it samples, because a
+	// current store consults the gate only at period boundaries, so a
+	// withdraw-and-regrant between samples would erase a
+	// flag-remembered waiver (PR #877 round 8). Rust logs the same
+	// event: auto_resolve_park warns on every accept_stale_anchor
+	// swap that flips (sync.rs:2848).
+	staleGen uint64
 	// stalePolicy is the remembered answer from myotis_set_stale_anchor_policy
 	// (0 ask / 2 continue; 1 checkpoint is refused at the door), read through
 	// SetStaleAnchorPolicy only. Default 0 = ask, the contract's default.
@@ -332,13 +342,19 @@ func (e *Engine) SetWsBoundPeriods(periods uint64) bool {
 
 // AcceptStale records the host's one-shot consent to the embedded
 // anchor's age (myotis_accept_stale_anchor): suppresses both
-// weak-subjectivity layers for the rest of this Engine's life, never
-// persisted, and releases a bootstrap that had already parked.
+// weak-subjectivity layers for the rest of the run — read live at
+// every gate, so it ends early when a remembered CONTINUE later
+// replaces and is itself replaced (one shared flag, host.rs:1625-1627
+// behaves the same) — never persisted, and releases a bootstrap that
+// had already parked.
 func (e *Engine) AcceptStale() bool {
 	e.mu.Lock()
 	if e.closed {
 		e.mu.Unlock()
 		return false
+	}
+	if !e.acceptStale { // a new arming is a new trust decision (round 8)
+		e.staleGen++
 	}
 	e.acceptStale = true
 	e.mu.Unlock()
@@ -381,6 +397,9 @@ func (e *Engine) SetStaleAnchorPolicy(policy int32) bool {
 	}
 	e.stalePolicy = policy
 	if policy == 2 {
+		if !e.acceptStale { // same arming event as a one-shot accept (round 8)
+			e.staleGen++
+		}
 		e.acceptStale = true
 	}
 	e.mu.Unlock()
@@ -398,6 +417,15 @@ func (e *Engine) StaleAccepted() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.acceptStale
+}
+
+// StaleGeneration reports the consent-arming count (staleGen) that
+// the syncer's waiver line follows: one WARN per arming, whatever the
+// gate's sampling does in between (PR #877 round 8).
+func (e *Engine) StaleGeneration() uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.staleGen
 }
 
 // restartIfParked re-spawns the LC loop when it died (and was not
@@ -483,16 +511,6 @@ func (e *Engine) EffectiveWsBound() uint64 {
 	return chain.WsBoundPeriods
 }
 
-// lcLoop bootstraps the LC over libp2p (static pins, the same
-// set myotis-lc dials), walks the committee chain, and keeps the
-// anchor fresh on the myotis-lc steady loop — every answer through
-// the part-3 processor (checkpoint pin, period gate, BLS, Merkle
-// branches). Anchors are published only after a VERIFYING finality
-// poll (Advanced or Stale) — never the bootstrap/catch-up root, which
-// is routinely outside every peer's state window (see the loop).
-// This is the same loop as cmd/myotis-lc's; when a
-// second consumer appeared the honest move is to say so in a comment
-// and re-unify the two in 3c rather than contort the merged main.
 // stallWatcher decides when a stalled light-client loop gets its
 // WARN line: once per refused streak. A stale refusal warns on the
 // first pass of the streak only; ANY other RunCatchUp outcome — nil
@@ -523,6 +541,16 @@ func (w *stallWatcher) note(err error) {
 	}
 }
 
+// lcLoop bootstraps the LC over libp2p (static pins, the same
+// set myotis-lc dials), walks the committee chain, and keeps the
+// anchor fresh on the myotis-lc steady loop — every answer through
+// the part-3 processor (checkpoint pin, period gate, BLS, Merkle
+// branches). Anchors are published only after a VERIFYING finality
+// poll (Advanced or Stale) — never the bootstrap/catch-up root, which
+// is routinely outside every peer's state window (see the loop).
+// This is the same loop as cmd/myotis-lc's; when a
+// second consumer appeared the honest move is to say so in a comment
+// and re-unify the two in 3c rather than contort the merged main.
 func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 	c := chain.ConsensusMainnet()
 	h, err := clsync.NewHost()
@@ -543,6 +571,11 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 		e.mu.Lock()
 		defer e.mu.Unlock()
 		return e.acceptStale
+	}
+	syncer.StaleGeneration = func() uint64 {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		return e.staleGen
 	}
 	clsync.InstallGossipSubHold(h)
 	clsync.ServeInstall(h, syncer.LocalStatus)
