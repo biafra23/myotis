@@ -198,6 +198,41 @@ func TestStaleGateConsentWaiverIsLogged(t *testing.T) {
 		}
 	})
 
+	// Round 9: the nil-StaleGeneration fallback must keep round 7's
+	// refusal re-arm, not round 3's once-per-loop — a hookless caller
+	// (tests, future non-engine users) must still see a re-armed
+	// consent log again after a withdrawal.
+	t.Run("nil StaleGeneration falls back to refusal re-arm", func(t *testing.T) {
+		var lines []string
+		consent := true
+		s := &Syncer{
+			Logf:          func(string, ...any) { t.Fatal("waiver must not reach the plain log hook") },
+			Warnf:         func(f string, a ...any) { lines = append(lines, fmt.Sprintf(f, a...)) },
+			WsBound:       func() uint64 { return bound },
+			StaleAccepted: func() bool { return consent },
+		}
+		if err := s.staleGate(bound+1, 2*bound+2, "held committee"); err != nil {
+			t.Fatalf("waived gate refused: %v", err)
+		}
+		if err := s.staleGate(bound+1, 2*bound+2, "held committee"); err != nil {
+			t.Fatalf("repeat waiver refused: %v", err)
+		}
+		if len(lines) != 1 {
+			t.Fatalf("streak logged %d lines %q, want one", len(lines), lines)
+		}
+		consent = false
+		if err := s.staleGate(bound+1, 2*bound+2, "held committee"); !errors.Is(err, ErrStaleAnchor) {
+			t.Fatalf("withdrawn consent did not refuse: %v", err)
+		}
+		consent = true
+		if err := s.staleGate(bound+1, 2*bound+2, "held committee"); err != nil {
+			t.Fatalf("re-armed gate refused: %v", err)
+		}
+		if len(lines) != 2 {
+			t.Fatalf("re-arm logged %d lines %q, want the second waiver", len(lines), lines)
+		}
+	})
+
 	t.Run("nil Warnf falls back to Logf", func(t *testing.T) {
 		var lines []string
 		s := &Syncer{

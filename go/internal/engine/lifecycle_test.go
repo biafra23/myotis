@@ -154,3 +154,63 @@ func TestStallWatcherReArmsOnAnyGatePass(t *testing.T) {
 		}
 	}
 }
+
+// TestWireSyncerHooksTrackEngineState pins the wiring the round-8
+// generation fix depends on and that no other test covers (PR #879
+// round-9 review: deleting the StaleGeneration assignment left every
+// test green while production took clsync's constant-generation
+// fallback). The hooks must be live reads of engine state, not
+// captures: mutate the engine, and the syncer's hooks answer
+// differently on the next call.
+func TestWireSyncerHooksTrackEngineState(t *testing.T) {
+	e, err := New(Config{DataDir: t.TempDir(), ListenPort: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	s := &clsync.Syncer{} // zero value: wireSyncerHooks only assigns hooks
+	e.wireSyncerHooks(s)
+	if s.Warnf == nil || s.WsBound == nil || s.StaleAccepted == nil || s.StaleGeneration == nil {
+		t.Fatalf("wireSyncerHooks left a hook nil: warn=%v bound=%v consent=%v gen=%v",
+			s.Warnf != nil, s.WsBound != nil, s.StaleAccepted != nil, s.StaleGeneration != nil)
+	}
+	if s.StaleAccepted() {
+		t.Fatal("fresh engine: consent must start disarmed")
+	}
+	if g := s.StaleGeneration(); g != 0 {
+		t.Fatalf("fresh engine: generation = %d, want 0", g)
+	}
+	if b := s.WsBound(); b < 1 {
+		t.Fatalf("WsBound hook returned %d, want the network default (>= 1)", b)
+	}
+	if !e.AcceptStale() {
+		t.Fatal("AcceptStale failed")
+	}
+	if !s.StaleAccepted() {
+		t.Fatal("hook captured a snapshot instead of reading live consent")
+	}
+	if g := s.StaleGeneration(); g != e.StaleGeneration() || g != 1 {
+		t.Fatalf("hook generation = %d, engine = %d, want both 1", g, e.StaleGeneration())
+	}
+	// The round-7 shared-flag case, end to end through the hook: a
+	// remembered CONTINUE after a one-shot, then ASK replacing it,
+	// withdraws the one consent both armed. (A bare one-shot SURVIVES
+	// an ASK write — withdrawal only fires when a remembered CONTINUE
+	// is replaced; that half is pinned in
+	// TestSetStaleAnchorPolicyWithdrawalMirrorsRust.)
+	if !e.SetStaleAnchorPolicy(2) { // CONTINUE (already armed: no bump)
+		t.Fatal("CONTINUE must apply")
+	}
+	if g := s.StaleGeneration(); g != 1 {
+		t.Fatalf("re-arming an armed consent must not bump the generation (got %d)", g)
+	}
+	if !e.SetStaleAnchorPolicy(0) { // ASK replaces CONTINUE -> withdrawal
+		t.Fatal("ASK must apply")
+	}
+	if s.StaleAccepted() {
+		t.Fatal("withdrawal did not reach the syncer's hook")
+	}
+	if g := s.StaleGeneration(); g != 1 {
+		t.Fatalf("withdrawal must not bump the generation (got %d)", g)
+	}
+}

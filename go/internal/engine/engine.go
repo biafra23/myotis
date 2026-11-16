@@ -551,6 +551,31 @@ func (w *stallWatcher) note(err error) {
 // This is the same loop as cmd/myotis-lc's; when a
 // second consumer appeared the honest move is to say so in a comment
 // and re-unify the two in 3c rather than contort the merged main.
+// wireSyncerHooks connects one syncer to this engine's live consent,
+// bound and log state: the C ABI's setters (myotis_set_ws_bound_periods,
+// myotis_accept_stale_anchor, myotis_set_stale_anchor_policy) mutate
+// the engine, and the gates must see every mutation at their next
+// check — so these are live reads, never captured values. The
+// StaleGeneration hook is what carries the round-8 waiver fix; a
+// silently missing assignment would take clsync's constant-generation
+// fallback and restore round 3's once-per-loop logging with every
+// test still green (PR #879 round-9 review), hence this method and
+// its test rather than inline assignments.
+func (e *Engine) wireSyncerHooks(s *clsync.Syncer) {
+	s.Warnf = func(f string, a ...any) { e.log.Warn(fmt.Sprintf(f, a...)) }
+	s.WsBound = e.EffectiveWsBound
+	s.StaleAccepted = func() bool {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		return e.acceptStale
+	}
+	s.StaleGeneration = func() uint64 {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		return e.staleGen
+	}
+}
+
 func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 	c := chain.ConsensusMainnet()
 	h, err := clsync.NewHost()
@@ -562,21 +587,7 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 	// Trust-decision lines (the stale-anchor waiver) go out at WARN,
 	// matching the Rust twin's tracing::warn! and surviving the hosts'
 	// WARN-filtered pump view (PR #877 round 4).
-	syncer.Warnf = func(f string, a ...any) { e.log.Warn(fmt.Sprintf(f, a...)) }
-	// The C ABI's live setters reach the weak-subjectivity gates
-	// through these hooks (read at every check, not captured):
-	// myotis_set_ws_bound_periods and myotis_accept_stale_anchor.
-	syncer.WsBound = e.EffectiveWsBound
-	syncer.StaleAccepted = func() bool {
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		return e.acceptStale
-	}
-	syncer.StaleGeneration = func() uint64 {
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		return e.staleGen
-	}
+	e.wireSyncerHooks(syncer)
 	clsync.InstallGossipSubHold(h)
 	clsync.ServeInstall(h, syncer.LocalStatus)
 

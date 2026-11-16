@@ -100,8 +100,12 @@ type Syncer struct {
 	// samples still gets its line at the next one. While the store
 	// is current the gate runs only at period boundaries
 	// (RunCatchUp returns before it once caught up), so sampling a
-	// boolean missed exactly that (round 8). nil → constant: one
-	// line per loop, the pre-round-8 behaviour.
+	// boolean missed exactly that (round 8). nil → constant
+	// generation with the refusal-path re-arm kept (see staleGate):
+	// one line per waiver streak, round 7's semantics for hookless
+	// callers — NOT round 3's once-per-loop, which round 5 rejected
+	// and which a bare constant generation would silently restore
+	// (round 9).
 	StaleGeneration func() uint64
 	// Warnf carries trust-decision lines the Rust twin logs at WARN
 	// (the stale-anchor waiver, sync.rs:2478/2849/2491 — all
@@ -197,6 +201,13 @@ func (s *Syncer) staleGate(anchorPeriod, wallPeriod uint64, what string) error {
 				what, anchorPeriod, wallPeriod, s.boundPeriods())
 		}
 		return nil
+	}
+	if s.StaleGeneration == nil {
+		// Hookless caller: generations cannot distinguish two armings,
+		// so re-arm on refusal the way round 7 did — otherwise the
+		// constant generation pins the first line for the loop's life
+		// (round 3's behaviour round 5 rejected; round 9).
+		s.waiveGenValid = false
 	}
 	return fmt.Errorf("%w: %s period %d, wall period %d, bound %d",
 		ErrStaleAnchor, what, anchorPeriod, wallPeriod, s.boundPeriods())

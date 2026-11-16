@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -52,33 +53,49 @@ class GoStatusJsonTest {
                 + "\"executionBlockNumber\":" + finalizedBlock + ",\"elHunting\":false,"
                 + "\"upgradeAdvisory\":null,\"dataUsage\":null,\"networkMetering\":\"" + metering + "\","
                 + "\"engine\":\"go\",\"myotisAbi\":59,"
-                + "\"capabilities\":{\"anchorRefresh\":false,\"servedBlockWindow\":true,\"staleAnchorConsent\":true,\"staleAnchorPolicy\":true,\"wsBoundOverride\":true}"
+                + "\"capabilities\":{\"accessList\":false,\"activityWatch\":false,\"anchorRefresh\":false,"
+                + "\"blocks\":false,\"bootEnodes\":false,\"ens\":false,\"evm\":false,\"fees\":false,"
+                + "\"listenPorts\":false,\"logDrain\":true,\"logIndex\":false,\"logs\":false,"
+                + "\"pauseResume\":false,\"proofs\":false,\"rawTx\":false,\"reads\":true,\"receipts\":false,"
+                + "\"servedBlockWindow\":true,\"staleAnchorConsent\":true,\"staleAnchorPolicy\":true,"
+                + "\"status\":true,\"tor\":false,\"wsBoundOverride\":true}"
                 + "}";
     }
 
-    /** The ABI-58/59 disclosure keys (anchorRefresh:false,
-     *  staleAnchorPolicy:true) ship in every status from
-     *  go/internal/capi's capabilities() — the apply-or-refuse audit
-     *  surface. No JVM consumer reads them from the status today (the
-     *  Go-side golden TestCapabilitiesJSON pins their values); this
-     *  fixture carries them so the promise "the JVM reads exactly what
-     *  the Go build writes" includes them, and the reader must keep
-     *  tolerating them (internal review of the merged PR #877). */
+    /** The fixture's capabilities object is the FULL map
+     *  go/internal/capi's capabilities() writes (Go marshals maps
+     *  sorted, so this is key-for-key what StatusJSON emits — the
+     *  round-9 review caught it being a 5-of-23 subset while the
+     *  class doc promised field-for-field). What the JVM reader owes
+     *  that subtree is tolerance, not interpretation: ParsedStatus
+     *  has no capabilities field, so the assertions here are (a) the
+     *  ABI-58/59 disclosure keys are present in the fixture because
+     *  the Go build emits them, (b) the strips really strip, and
+     *  (c) an UNKNOWN future key parses like the known ones — the
+     *  tolerance a future ABI addition actually needs (PR #879
+     *  round-9). The VALUES' truth is pinned go-side by
+     *  TestCapabilitiesJSON, not here. */
     @Test
-    void capabilityDisclosureKeysAreToleratedNotInvented() {
+    void capabilitySubtreeIsToleratedNotInterpreted() {
         String raw = goStatus("SYNCED", 26404150, 3, "METERED");
         assertTrue(raw.contains("\"anchorRefresh\":false"),
                 "fixture must carry the ABI-58 refusal disclosure");
         assertTrue(raw.contains("\"staleAnchorPolicy\":true"),
                 "fixture must carry the ABI-59 policy disclosure");
-        // And the JVM reader neither invents nor requires them: the same
-        // status parses identically with the keys stripped.
+        StatusSnapshot full = GoChainHandle.statusFromJson("mainnet", raw);
         String stripped = raw.replace("\"anchorRefresh\":false,", "")
                 .replace(",\"staleAnchorPolicy\":true", "");
-        StatusSnapshot a = GoChainHandle.statusFromJson("mainnet", raw);
-        StatusSnapshot b = GoChainHandle.statusFromJson("mainnet", stripped);
-        assertEquals(a.beaconState(), b.beaconState());
-        assertEquals(a.finalizedBlockNumber(), b.finalizedBlockNumber());
+        assertNotEquals(raw, stripped, "the strips must actually strip");
+        String widened = raw.replace("\"wsBoundOverride\":true",
+                "\"wsBoundOverride\":true,\"zfutureCapability\":true");
+        // Same snapshot with the disclosures gone and an unknown key
+        // added: the reader ignores the whole subtree.
+        for (String variant : new String[] { stripped, widened }) {
+            StatusSnapshot v = GoChainHandle.statusFromJson("mainnet", variant);
+            assertEquals(full.beaconState(), v.beaconState());
+            assertEquals(full.finalizedBlockNumber(), v.finalizedBlockNumber());
+            assertEquals(full.finalizedSlot(), v.finalizedSlot());
+        }
     }
 
     @Test

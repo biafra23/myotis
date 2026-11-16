@@ -44,20 +44,25 @@ jobs:
     # ONE env block for the job (a merge of main's and the feature's — the
     # file carried two `env:` keys between the two merges and the workflow
     # parser rejects a duplicate mapping key, which silently cost this PR its
-    # Go CI). These are the reproducible-builds gate's own flags:
+    # Go CI). These are the reproducible-builds gate's own CGO_CFLAGS:
     # scripts/repro/build_linux.sh pairs them with this workflow by name, so
-    # the blst tested here is byte-for-byte the blst the gate compares. The
+    # the blst CONFIGURATION tested here is the one the gate builds and
+    # compares between its two legs — the same flags, not the same bytes
+    # (the gate additionally builds with -trimpath and the builder image's
+    # pinned gcc, both of which change object bytes; build_linux.sh:95-97
+    # calls the C compiler a build input for exactly that reason). The
     # PORTABLE define is the cross-build constant (#734 D3) — blst's Go
     # binding compiles ADX paths on amd64, and its load-time constructor
     # answers SIGILL with _exit(132), which would KILL whatever process
     # dlopens the c-shared library on a pre-Broadwell/pre-Zen machine, past
     # every UnsatisfiedLinkError handler; goBuildCShared, the Rust workspace
-    # and the gate all carry it. goBuildCShared (whose .so the desktop
-    # launches) omits -g: that difference is debug info, not instructions —
-    # the code this workflow exercises is the code that ships, though not
-    # byte-identical to the Gradle task's (the internal review of the
-    # merged env made that nuance explicit; PR #832 round-3 review added
-    # this block, which built bare before).
+    # and the gate all carry it. goBuildCShared (whose library the desktop
+    # launches — not yet a release artifact, build.gradle.kts notes) omits
+    # -g, which adds debug info and no instructions; whether its objects
+    # match CI's instruction-for-instruction depends on the compiler being
+    # the same, which the task does not promise (it uses the local one).
+    # (PR #832 round-3 review added this block, which built bare before;
+    # PR #879's reviews corrected this comment's parity claims.)
     env:
       CGO_CFLAGS: "-O2 -g -D__BLST_PORTABLE__"
 

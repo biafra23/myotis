@@ -296,9 +296,12 @@ off the regular profile too).
 constructor answers SIGILL with `_exit(128+4)` and kills whatever process
 dlopens the library on a pre-Broadwell/pre-Zen CPU, past every
 `UnsatisfiedLinkError` handler; `go-engine.yml` and the gate's
-`scripts/repro/build_linux.sh` additionally pass `-g` — debug info only,
-their blst objects are what the gate compares, and this task's `.so`
-differs from theirs by no instruction) and `GOTOOLCHAIN=local`
+`scripts/repro/build_linux.sh` additionally pass `-g` — debug info, no
+instructions — and the gate pairs its flags with the workflow so the blst
+CONFIGURATION CI tests is the one it compares (same flags, not same
+bytes: the gate also builds with `-trimpath` and the image's pinned
+gcc, while this task compiles with the local compiler, so this task's
+objects carry no byte- or instruction-level promise against theirs)) and `GOTOOLCHAIN=local`
 (it skips with a note when the local toolchain is older than `go.mod`'s
 line rather than downloading one mid-build; CI installs it via
 `setup-go`). A skip — missing `go` (resolved like `cargo`, incl.
