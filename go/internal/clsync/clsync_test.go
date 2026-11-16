@@ -263,6 +263,33 @@ func TestStaleGateConsentWaiverIsLogged(t *testing.T) {
 		}
 	})
 
+	t.Run("hooked: repeats of one arming stay silent", func(t *testing.T) {
+		// The engine-shaped case: the hook answers a real generation
+		// (the table and the nil-hook subtests all sit at 0, where a
+		// stored generation and a forgotten one are the same value,
+		// so neither pins it — round 18). Without the generation
+		// being recorded, every catch-up pass from a stale anchor
+		// logs its own waiver WARN — the spam this block forbids,
+		// and enough lines to push older trust decisions out of the
+		// bounded drain ring.
+		var lines []string
+		s := &Syncer{
+			Logf:            func(string, ...any) { t.Fatal("waiver must not reach the plain log hook") },
+			Warnf:           func(f string, a ...any) { lines = append(lines, fmt.Sprintf(f, a...)) },
+			WsBound:         func() uint64 { return bound },
+			StaleAccepted:   func() bool { return true },
+			StaleGeneration: func() uint64 { return 1 },
+		}
+		for i := range 3 {
+			if err := s.staleGate(bound+1, 2*bound+2, "held committee"); err != nil {
+				t.Fatalf("pass %d refused: %v", i, err)
+			}
+		}
+		if len(lines) != 1 {
+			t.Fatalf("logged %d lines %q, want one line for one arming", len(lines), lines)
+		}
+	})
+
 	t.Run("nil Warnf falls back to Logf", func(t *testing.T) {
 		var lines []string
 		s := &Syncer{

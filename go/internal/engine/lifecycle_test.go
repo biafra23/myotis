@@ -179,7 +179,9 @@ func TestStallWatcherReArmsOnAnyGatePass(t *testing.T) {
 // test green while production took clsync's constant-generation
 // fallback). The hooks must be live reads of engine state, not
 // captures: mutate the engine, and the syncer's hooks answer
-// differently on the next call.
+// differently on the next call. This pins the METHOD; the loop's call
+// site is enforced by construction (lcLoop takes its Syncer only from
+// newLoopSyncer, which builds and wires in one step — round 18).
 func TestWireSyncerHooksTrackEngineState(t *testing.T) {
 	var logBuf bytes.Buffer // must receive the WARN the hook promises (round 14)
 	e, err := New(Config{DataDir: t.TempDir(), ListenPort: -1,

@@ -28,6 +28,7 @@ import (
 	"github.com/biafra23/myotis/go/internal/nodekey"
 	"github.com/biafra23/myotis/go/internal/snapread"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/libp2p/go-libp2p/core/host"
 )
 
 // Config is what a host decides about an engine; everything else
@@ -569,6 +570,19 @@ func (e *Engine) wireSyncerHooks(s *clsync.Syncer) {
 	s.StaleGeneration = e.StaleGeneration
 }
 
+// newLoopSyncer is the ONE way lcLoop gets a Syncer: built and wired
+// in a single step, so an unwired loop syncer is a different call
+// rather than a missing line (PR #879 round 18: deleting the wiring
+// call inside lcLoop kept every test green — TestWireSyncerHooksTrackEngineState
+// pins the method, but it drives its own Syncer, and no test reaches
+// the loop's call site cheaply because the start gate needs a clock
+// seam the loop does not have).
+func (e *Engine) newLoopSyncer(c *chain.Consensus, h host.Host, logf func(string, ...any)) *clsync.Syncer {
+	s := clsync.NewSyncer(c, h, logf)
+	e.wireSyncerHooks(s)
+	return s
+}
+
 // lcLoop bootstraps the LC over libp2p (static pins, the same
 // set myotis-lc dials), walks the committee chain, and keeps the
 // anchor fresh on the myotis-lc steady loop — every answer through
@@ -586,11 +600,11 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 		return fmt.Errorf("libp2p host: %w", err)
 	}
 	defer h.Close()
-	syncer := clsync.NewSyncer(c, h, logf)
-	// Trust-decision lines (the stale-anchor waiver) go out at WARN,
-	// matching the Rust twin's tracing::warn! and surviving the hosts'
-	// WARN-filtered pump view (PR #877 round 4).
-	e.wireSyncerHooks(syncer)
+	// Built AND wired in one step (see newLoopSyncer); the hooks put
+	// trust-decision lines at WARN, matching the Rust twin's
+	// tracing::warn! and surviving the hosts' WARN-filtered pump
+	// view (PR #877 round 4).
+	syncer := e.newLoopSyncer(c, h, logf)
 	clsync.InstallGossipSubHold(h)
 	clsync.ServeInstall(h, syncer.LocalStatus)
 

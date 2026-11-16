@@ -652,7 +652,9 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
 
     @Override
     public void acceptStaleAnchor() {
-        // APPLIED live: releases a STALE_ANCHOR park and stays armed this run.
+        // APPLIED live: releases a STALE_ANCHOR park; armed until a
+        // remembered CONTINUE is replaced (one shared flag, see the
+        // class doc).
         if (!linked(() -> GoEngineNative.nativeAcceptStaleAnchor(handle))) {
             log.warn("[engines] acceptStaleAnchor dropped: unknown handle {}", handle);
         }
