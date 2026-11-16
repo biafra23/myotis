@@ -55,6 +55,12 @@
 #   run's own token, Setup step 1, it does not happen.) After each attempt, a step prints what it was refused and
 #   how it ended, so a silent attempt explains itself.
 #
+#   One more red path skips the later attempts: an attempt whose transcript
+#   reports a permission mode other than `default` fails its job at the
+#   job's last step ("Did it run in default permission mode?"), so the
+#   fallback does not run in the same mode. Any review that attempt posted
+#   stays on the PR; the red check is about the mode, not a missing review.
+#
 #   Subscription first, API credits last (owner's decision, 2026-11-15):
 #   with Fable's limit spent but Opus's not, the review is Opus on the
 #   subscription, not paid Fable, so the credits are still there once the
@@ -176,20 +182,33 @@ env:
   REVIEWER_LOGIN: github-actions[bot]
   # What each job prints after its attempt (see "What the first attempt was
   # refused, and how it ended"), from the transcript the action writes to
-  # its execution file: how the run ended, each refused tool call with the
-  # checker's reason and the command's length, and the start of the final
-  # message. A refusal's reason comes from its permission_denied event; a
-  # run that stopped before its result message still lists those.
+  # its execution file: the permission mode the session started in (its init
+  # message; see "Did it run in default permission mode?"), how the run
+  # ended, each refused tool call with its reason where the transcript gives
+  # one and the command's length, and the start of the final message. In
+  # default mode a call --allowedTools does not list is refused without a
+  # prompt (the run is headless); the SDK records that as a permission_denied
+  # event, best-effort, and the result message's permission_denials is the
+  # authoritative list. A run that stopped before its result message lists
+  # only the events, and says the count is not known when there are none
+  # (rather than "0", which would read as "nothing was refused").
   REPORT_JQ: |
     [.[] | select(.type == "system" and .subtype == "permission_denied")] as $events
     | ($events | map({key: .tool_use_id, value: (.decision_reason // .message)}) | from_entries) as $why
     | ([.[] | select(.type == "result")] | last) as $r
-    | if $r == null then "No result message: the run stopped before Claude finished."
+    | ([.[] | select(.type == "system" and .subtype == "init") | .permissionMode] | map(select(. != null)) | unique) as $modes
+    | "Permission mode: \(if $modes == [] then "not reported" else ($modes | join(", ")) end)",
+      if $r == null then "No result message: the run stopped before Claude finished."
       else "Ended \($r.subtype)\(if $r.is_error then ", as an error" else "" end) (\($r.terminal_reason // "no terminal reason")) after \($r.num_turns) turns."
       end,
       (($r.errors // [])[] | "Error: \(tostring | .[:300])"),
       (($r.permission_denials // ($events | map({tool_name, tool_use_id, tool_input: null}))) as $refused
-        | "\($refused | length) refused tool call(s):",
+        | if $r == null and ($refused | length) == 0
+          then "Refused tool calls: not known (no result message, and no permission_denied event)."
+          elif $r == null
+          then "\($refused | length) refused tool call(s), from permission_denied events (the result message's full list is missing):"
+          else "\($refused | length) refused tool call(s):"
+          end,
           ($refused[]
             | "- \(.tool_name)\($why[.tool_use_id // ""] // "" | if . == "" then "" else " (\(.))" end)"
               + if .tool_input == null then ""
@@ -484,6 +503,37 @@ jobs:
           echo "::error::The Fable review failed partway through, after already posting to the PR. The Opus fallback was suppressed to avoid a duplicate review, so this PR has only partial feedback — close/reopen it for a clean pass."
           exit 1
 
+      # The permission mode the attempt ran in, from its transcript's init
+      # message. It must be default (see the comment at --permission-mode):
+      # claude-code-action puts its own --permission-mode auto before
+      # claude_args and the last value wins (src/modes/agent/index.ts and
+      # lastPermissionMode in base-action/src/parse-sdk-options.ts, checked
+      # 2026-11-17), but @v1 floats, so this turns the job red if that stops
+      # holding, instead of reviews passing silently in auto mode. A red job
+      # here also skips the later attempts, which would run in the same mode.
+      # A transcript without an init message only warns: an attempt that
+      # stopped before one must still reach the fallback. Last in the job, so
+      # it never changes the outputs the fallback decision reads. The review job's
+      # copy and the fallback and api jobs' copies must stay identical.
+      - name: Did it run in default permission mode?
+        if: ${{ !cancelled() && steps.fable.outputs.execution_file != '' }}
+        env:
+          EXECUTION_FILE: ${{ steps.fable.outputs.execution_file }}
+        run: |
+          set -euo pipefail
+          [ -f "$EXECUTION_FILE" ] || { echo "::warning::No transcript at '$EXECUTION_FILE', so the permission mode is unknown."; exit 0; }
+          modes=$(jq -r '[.[] | select(.type == "system" and .subtype == "init") | .permissionMode] | map(select(. != null)) | unique | .[]' "$EXECUTION_FILE") \
+            || { echo "::warning::The transcript could not be read as JSON (cut short?), so the permission mode is unknown."; exit 0; }
+          echo "Permission modes in the transcript: ${modes:-none}"
+          if [ -z "$modes" ]; then
+            echo "::warning::The transcript reports no permission mode, so default mode cannot be shown. Check that claude_args still sets --permission-mode default and that claude-code-action still lets the last value win."
+            exit 0
+          fi
+          if grep -qvx 'default' <<<"$modes"; then
+            echo "::error::This attempt ran in permission mode '$(echo $modes)', not default, so --allowedTools was not a strict list for it. claude_args sets --permission-mode default: check whether claude-code-action still lets the last value win. Any review this attempt posted is on the PR already: do not re-run this workflow to get one until the mode is fixed."
+            exit 1
+          fi
+
   # The second attempt runs on a runner of its own. Two runs of the action in
   # one job share state that the action never resets between them: its buffer
   # of unconfirmed inline comments (/tmp/inline-comments-buffer.jsonl, which
@@ -689,6 +739,26 @@ jobs:
           echo "::error::The Opus fallback failed partway through, after already posting to the PR. The API-credit attempt was suppressed to avoid a duplicate review, so this PR has only partial feedback — close/reopen it for a clean pass."
           exit 1
 
+      # As in the review job: the attempt must have run in default mode.
+      - name: Did it run in default permission mode?
+        if: ${{ !cancelled() && steps.opus.outputs.execution_file != '' }}
+        env:
+          EXECUTION_FILE: ${{ steps.opus.outputs.execution_file }}
+        run: |
+          set -euo pipefail
+          [ -f "$EXECUTION_FILE" ] || { echo "::warning::No transcript at '$EXECUTION_FILE', so the permission mode is unknown."; exit 0; }
+          modes=$(jq -r '[.[] | select(.type == "system" and .subtype == "init") | .permissionMode] | map(select(. != null)) | unique | .[]' "$EXECUTION_FILE") \
+            || { echo "::warning::The transcript could not be read as JSON (cut short?), so the permission mode is unknown."; exit 0; }
+          echo "Permission modes in the transcript: ${modes:-none}"
+          if [ -z "$modes" ]; then
+            echo "::warning::The transcript reports no permission mode, so default mode cannot be shown. Check that claude_args still sets --permission-mode default and that claude-code-action still lets the last value win."
+            exit 0
+          fi
+          if grep -qvx 'default' <<<"$modes"; then
+            echo "::error::This attempt ran in permission mode '$(echo $modes)', not default, so --allowedTools was not a strict list for it. claude_args sets --permission-mode default: check whether claude-code-action still lets the last value win. Any review this attempt posted is on the PR already: do not re-run this workflow to get one until the mode is fixed."
+            exit 1
+          fi
+
   # The third attempt, billed to API credits: the subscription is exhausted
   # (see Model strategy). Its own runner, for the reasons above the fallback
   # job. The builds' gate waits for this job as it does for the fallback, up
@@ -866,5 +936,25 @@ jobs:
           echo "Reviewer comments posted or edited since $SINCE: $left"
           if [ "$left" -eq 0 ]; then
             echo "::error::No attempt posted a review (Fable and Opus on the subscription, then the API-credit attempt), so this PR has none. Each job's report step shows what its attempt was refused and how it ended. Re-run this workflow for another pass (it replays the same commit)."
+            exit 1
+          fi
+
+      # As in the review job: the attempt must have run in default mode.
+      - name: Did it run in default permission mode?
+        if: ${{ !cancelled() && steps.api.outputs.execution_file != '' }}
+        env:
+          EXECUTION_FILE: ${{ steps.api.outputs.execution_file }}
+        run: |
+          set -euo pipefail
+          [ -f "$EXECUTION_FILE" ] || { echo "::warning::No transcript at '$EXECUTION_FILE', so the permission mode is unknown."; exit 0; }
+          modes=$(jq -r '[.[] | select(.type == "system" and .subtype == "init") | .permissionMode] | map(select(. != null)) | unique | .[]' "$EXECUTION_FILE") \
+            || { echo "::warning::The transcript could not be read as JSON (cut short?), so the permission mode is unknown."; exit 0; }
+          echo "Permission modes in the transcript: ${modes:-none}"
+          if [ -z "$modes" ]; then
+            echo "::warning::The transcript reports no permission mode, so default mode cannot be shown. Check that claude_args still sets --permission-mode default and that claude-code-action still lets the last value win."
+            exit 0
+          fi
+          if grep -qvx 'default' <<<"$modes"; then
+            echo "::error::This attempt ran in permission mode '$(echo $modes)', not default, so --allowedTools was not a strict list for it. claude_args sets --permission-mode default: check whether claude-code-action still lets the last value win. Any review this attempt posted is on the PR already: do not re-run this workflow to get one until the mode is fixed."
             exit 1
           fi
