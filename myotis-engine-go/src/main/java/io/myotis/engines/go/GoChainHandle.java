@@ -493,7 +493,20 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
         long verifiedHeadAgeMs;
         if (serveable && clGenesisTime > 0 && secondsPerSlot > 0 && s.finalizedSlot() > 0) {
             long slotWallMs = (clGenesisTime + s.finalizedSlot() * (long) secondsPerSlot) * 1000L;
-            verifiedHeadAgeMs = Math.max(0L, System.currentTimeMillis() - slotWallMs);
+            long wallAgeMs = System.currentTimeMillis() - slotWallMs;
+            // A FINALIZED slot's wall time cannot be in the future under an
+            // honest clock (finality trails the head by at least two epochs,
+            // ~13 min). slotWallMs ahead of now is therefore proof the HOST
+            // clock lags chain time — a sleeping laptop waking before NTP —
+            // and clamping that to 0 would read the clock-skew proof itself
+            // as "fresh": the one way this dot goes falsely green. MAX_VALUE
+            // (already the not-serveable answer, so hosts handle it) says
+            // "cannot claim freshness" instead. Residual the JVM cannot fix:
+            // a clock lagging by LESS than the anchor's true age still
+            // under-reports the age — the engine shares this host clock, so
+            // no side can see the true "now" to compare against.
+            // (Final-PR review, combined diff, finding 1.)
+            verifiedHeadAgeMs = wallAgeMs < 0 ? Long.MAX_VALUE : wallAgeMs;
         } else {
             long nowNanos = System.nanoTime();
             synchronized (headAgeLock) {

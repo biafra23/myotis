@@ -206,7 +206,11 @@ never unlinked, never silently accepted:
 `myotis_refresh_anchor_from_checkpointz` answers the contract's own
 `{"applied":false,…}` refusal (no checkpoint fetch yet; capabilities
 `anchorRefresh:false`, the one-shot `myotis_accept_stale_anchor` is the
-way forward). `myotis_set_stale_anchor_policy` IS the remembered
+way forward). `myotis_create_with_checkpoint` refuses with the
+contract's `-1` ("cannot create"): this engine bootstraps ONLY from its
+embedded checkpoint, so a caller-supplied root cannot be applied — and
+`-3` (anchor-generation mismatch) can never occur because there is no
+checkpoint generation to mismatch. `myotis_set_stale_anchor_policy` IS the remembered
 answer the sync loop honors at every park: CONTINUE arms the same
 sticky consent the one-shot export uses (re-read at every
 weak-subjectivity gate), leaving a remembered CONTINUE for anything

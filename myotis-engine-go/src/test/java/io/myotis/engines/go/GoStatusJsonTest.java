@@ -352,6 +352,18 @@ class GoStatusJsonTest {
         assertEquals(Long.MAX_VALUE,
                 GoChainHandle.statusFromJson("mainnet", stalled, genesis, slotSeconds)
                         .verifiedHeadAgeMs());
+        // A finalized slot whose wall time is in the FUTURE can only mean the
+        // host clock lags chain time (finality always trails the head) — the
+        // old clamp-to-0 read that as "fresh" and let the readiness dot go
+        // green for a stale anchor on a waking laptop. Sentinel instead
+        // (final-PR review finding 1):
+        long futureSlot = (System.currentTimeMillis() / 1000L - genesis) / slotSeconds + 100;
+        String aheadOfClock = goStatus("SYNCED", 26404150, 3, "METERED")
+                .replace("\"finalizedSlot\":15634912", "\"finalizedSlot\":" + futureSlot);
+        assertEquals(Long.MAX_VALUE,
+                GoChainHandle.statusFromJson("mainnet", aheadOfClock, genesis, slotSeconds)
+                        .verifiedHeadAgeMs(),
+                "a finalized slot ahead of the host clock must not read as fresh");
     }
 
     // ---- the slot/holder labels come from the REQUEST, not the Go echo
