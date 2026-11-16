@@ -99,6 +99,18 @@ func TestSetStaleAnchorPolicyWithdrawalMirrorsRust(t *testing.T) {
 	if !e.StaleAccepted() {
 		t.Error("a REFUSED policy write must not withdraw an armed consent (apply-or-refuse)")
 	}
+	// The APPLIED-ASK case the round-10 comment claimed was pinned but
+	// was not: a bare one-shot must survive an ASK write (withdrawal
+	// fires only when a remembered CONTINUE is replaced). Reachable on
+	// every click of the Settings "Ask me" chip (NodeScreen re-sends
+	// ASK unconditionally) — without this case, "ASK always withdraws"
+	// passed the whole suite (round 11).
+	if !e.SetStaleAnchorPolicy(0) {
+		t.Fatal("ASK must apply")
+	}
+	if !e.StaleAccepted() {
+		t.Error("ASK over a bare one-shot must not withdraw it (only a replaced CONTINUE does)")
+	}
 	// The consent GENERATION the waiver line follows (PR #877 round 8):
 	// one bump per arming, none per refusal or refused write. Fresh
 	// engine 0 → CONTINUE arms 1 → ASK withdraws, still 1 → one-shot
@@ -196,8 +208,9 @@ func TestWireSyncerHooksTrackEngineState(t *testing.T) {
 	// remembered CONTINUE after a one-shot, then ASK replacing it,
 	// withdraws the one consent both armed. (A bare one-shot SURVIVES
 	// an ASK write — withdrawal only fires when a remembered CONTINUE
-	// is replaced; that half is pinned in
-	// TestSetStaleAnchorPolicyWithdrawalMirrorsRust.)
+	// is replaced; that case is pinned in
+	// TestSetStaleAnchorPolicyWithdrawalMirrorsRust, which now writes
+	// ASK over a bare one-shot too.)
 	if !e.SetStaleAnchorPolicy(2) { // CONTINUE (already armed: no bump)
 		t.Fatal("CONTINUE must apply")
 	}

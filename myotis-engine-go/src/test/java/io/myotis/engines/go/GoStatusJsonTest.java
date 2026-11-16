@@ -35,10 +35,15 @@ class GoStatusJsonTest {
      *  (go/internal/capi/testdata/capabilities.json) — NOT hand-copied.
      *  TestCapabilitiesGolden (Go side) pins that file to
      *  capabilities() byte-for-byte as json.Marshal emits it, so this
-     *  fixture cannot silently become a subset again: a capability
-     *  added, dropped or flipped fails the Go test AND the reads here
-     *  (PR #879 round 10; the GoAbiVersionMirrorTest cross-read
-     *  pattern). */
+     *  fixture can never again be a hand-copy that silently falls
+     *  behind — it always carries the full current map. Drift of
+     *  capabilities() from the golden fails the GO test; this class
+     *  asserts only the three keys whose values the ABI-58/59 story
+     *  depends on (anchorRefresh, staleAnchorPolicy, and
+     *  wsBoundOverride as the reader-tolerance anchor) — the other
+     *  20 ride through as fixture content, JVM-side, by design, as
+     *  statusFromJson ignores the subtree (PR #879 rounds 10-11;
+     *  the GoAbiVersionMirrorTest cross-read pattern). */
     private static final String CAPABILITIES_JSON;
     static {
         try {

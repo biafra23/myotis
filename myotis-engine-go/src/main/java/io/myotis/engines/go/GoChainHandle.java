@@ -720,7 +720,9 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
                 // CHECKPOINT is refused for its missing fetch. On a LIVE
                 // engine the refusal also withdraws a remembered CONTINUE
                 // (the engine un-arms on any replacement, host.rs) — and a
-                // one-shot accept armed before it goes with it, both being
+                // one-shot accept goes with it however the two were
+                // ordered (the UI auto-continues exactly while CONTINUE
+                // is saved), both being
                 // the same acceptStale flag (PR #877 round 7; Rust
                 // identical, one accept_stale_anchor, host.rs:1625-1627).
                 // An UNKNOWN or CLOSED handle mutates nothing at all (the
