@@ -31,8 +31,30 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class GoStatusJsonTest {
 
+    /** The REAL capabilities object, read from the Go package's golden
+     *  (go/internal/capi/testdata/capabilities.json) — NOT hand-copied.
+     *  TestCapabilitiesGolden (Go side) pins that file to
+     *  capabilities() byte-for-byte as json.Marshal emits it, so this
+     *  fixture cannot silently become a subset again: a capability
+     *  added, dropped or flipped fails the Go test AND the reads here
+     *  (PR #879 round 10; the GoAbiVersionMirrorTest cross-read
+     *  pattern). */
+    private static final String CAPABILITIES_JSON;
+    static {
+        try {
+            CAPABILITIES_JSON = java.nio.file.Files.readString(
+                    java.nio.file.Path.of("..", "go", "internal", "capi", "testdata",
+                            "capabilities.json")).trim();
+        } catch (java.io.IOException e) {
+            throw new AssertionError(
+                    "go/internal/capi/testdata/capabilities.json must exist and be readable "
+                            + "from the module root (it is the shared capabilities golden)", e);
+        }
+    }
+
     /** A serveable Go status: SYNCED, finalized anchor, snap servers.
-     *  Field order mirrors the Go struct; the Go-only keys come last. */
+     *  Field order mirrors the Go struct; the Go-only keys come last,
+     *  capabilities included verbatim from the golden. */
     private static String goStatus(String beaconState, long finalizedBlock, int snapServing,
                                    String metering) {
         return "{"
@@ -53,12 +75,7 @@ class GoStatusJsonTest {
                 + "\"executionBlockNumber\":" + finalizedBlock + ",\"elHunting\":false,"
                 + "\"upgradeAdvisory\":null,\"dataUsage\":null,\"networkMetering\":\"" + metering + "\","
                 + "\"engine\":\"go\",\"myotisAbi\":59,"
-                + "\"capabilities\":{\"accessList\":false,\"activityWatch\":false,\"anchorRefresh\":false,"
-                + "\"blocks\":false,\"bootEnodes\":false,\"ens\":false,\"evm\":false,\"fees\":false,"
-                + "\"listenPorts\":false,\"logDrain\":true,\"logIndex\":false,\"logs\":false,"
-                + "\"pauseResume\":false,\"proofs\":false,\"rawTx\":false,\"reads\":true,\"receipts\":false,"
-                + "\"servedBlockWindow\":true,\"staleAnchorConsent\":true,\"staleAnchorPolicy\":true,"
-                + "\"status\":true,\"tor\":false,\"wsBoundOverride\":true}"
+                + "\"capabilities\":" + CAPABILITIES_JSON
                 + "}";
     }
 
@@ -74,7 +91,9 @@ class GoStatusJsonTest {
      *  (c) an UNKNOWN future key parses like the known ones — the
      *  tolerance a future ABI addition actually needs (PR #879
      *  round-9). The VALUES' truth is pinned go-side by
-     *  TestCapabilitiesJSON, not here. */
+     *  TestCapabilitiesJSON, not here — but the KEY SET and shape are
+     *  now cross-checked: the fixture splices the golden file that
+     *  Go's TestCapabilitiesGolden pins to capabilities() itself. */
     @Test
     void capabilitySubtreeIsToleratedNotInterpreted() {
         String raw = goStatus("SYNCED", 26404150, 3, "METERED");
@@ -88,6 +107,7 @@ class GoStatusJsonTest {
         assertNotEquals(raw, stripped, "the strips must actually strip");
         String widened = raw.replace("\"wsBoundOverride\":true",
                 "\"wsBoundOverride\":true,\"zfutureCapability\":true");
+        assertNotEquals(raw, widened, "the widen must actually widen");
         // Same snapshot with the disclosures gone and an unknown key
         // added: the reader ignores the whole subtree.
         for (String variant : new String[] { stripped, widened }) {

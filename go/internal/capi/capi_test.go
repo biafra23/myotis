@@ -761,3 +761,24 @@ func TestCanonicalNameMatchesRustTable(t *testing.T) {
 		t.Errorf("gnosis must canonicalize even though Create refuses it: %q %v", c, ok)
 	}
 }
+
+// TestCapabilitiesGolden pins the shared golden the JVM fixture splices
+// (testdata/capabilities.json) against the REAL map, byte-for-byte as
+// json.Marshal emits it (sorted keys). This is the cross-check PR #879
+// round 10 said was missing: capabilities() drifting from the golden
+// fails here, and the Java side then fails its fixture — the
+// GoAbiVersionMirrorTest pattern, one map pinned on both sides.
+func TestCapabilitiesGolden(t *testing.T) {
+	golden, err := os.ReadFile("testdata/capabilities.json")
+	if err != nil {
+		t.Fatalf("read golden: %v", err)
+	}
+	got, err := json.Marshal(capabilities())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.TrimSpace(string(golden)) != string(got) {
+		t.Errorf("capabilities() drifted from testdata/capabilities.json\n golden: %s\n    got: %s",
+			strings.TrimSpace(string(golden)), got)
+	}
+}

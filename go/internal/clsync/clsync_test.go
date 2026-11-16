@@ -233,6 +233,34 @@ func TestStaleGateConsentWaiverIsLogged(t *testing.T) {
 		}
 	})
 
+	// The round-7 subtest this PR had deleted, restored in hookless
+	// form (round 10): the fresh path must re-arm too — a withdrawal
+	// seen only on a fresh pass still precedes a re-armed waiver.
+	t.Run("hookless: withdrawal seen on a fresh pass re-arms", func(t *testing.T) {
+		var lines []string
+		consent := true
+		s := &Syncer{
+			Logf:          func(string, ...any) { t.Fatal("waiver must not reach the plain log hook") },
+			Warnf:         func(f string, a ...any) { lines = append(lines, fmt.Sprintf(f, a...)) },
+			WsBound:       func() uint64 { return bound },
+			StaleAccepted: func() bool { return consent },
+		}
+		if err := s.staleGate(bound+1, 2*bound+2, "checkpoint"); err != nil {
+			t.Fatalf("waived gate refused: %v", err)
+		}
+		consent = false
+		if err := s.staleGate(bound, bound, "held committee"); err != nil {
+			t.Fatalf("fresh pass refused: %v", err)
+		}
+		consent = true
+		if err := s.staleGate(bound+1, 2*bound+2, "held committee"); err != nil {
+			t.Fatalf("re-armed gate refused: %v", err)
+		}
+		if len(lines) != 2 {
+			t.Fatalf("logged %d lines %q, want the fresh-path re-arm honoured", len(lines), lines)
+		}
+	})
+
 	t.Run("nil Warnf falls back to Logf", func(t *testing.T) {
 		var lines []string
 		s := &Syncer{

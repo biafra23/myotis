@@ -101,11 +101,10 @@ type Syncer struct {
 	// is current the gate runs only at period boundaries
 	// (RunCatchUp returns before it once caught up), so sampling a
 	// boolean missed exactly that (round 8). nil → constant
-	// generation with the refusal-path re-arm kept (see staleGate):
-	// one line per waiver streak, round 7's semantics for hookless
-	// callers — NOT round 3's once-per-loop, which round 5 rejected
-	// and which a bare constant generation would silently restore
-	// (round 9).
+	// generation with round 7's full re-arm kept on BOTH consent-
+	// absent paths — refusal and fresh pass (see staleGate; round 10
+	// caught that the refusal path alone is round 5's behaviour):
+	// one line per waiver streak, never round 3's once-per-loop.
 	StaleGeneration func() uint64
 	// Warnf carries trust-decision lines the Rust twin logs at WARN
 	// (the stale-anchor waiver, sync.rs:2478/2849/2491 — all
@@ -182,6 +181,15 @@ func (s *Syncer) staleGate(anchorPeriod, wallPeriod uint64, what string) error {
 	// change the verdict (consent still waives, refusal is unchanged)
 	// but because the waiver has to be able to name what it waived.
 	if !chain.WsAnchorStale(anchorPeriod, wallPeriod, s.boundPeriods()) {
+		if s.StaleGeneration == nil && !s.staleAccepted() {
+			// Hookless caller: round 7's FRESH-path re-arm belongs
+			// here too — a current store reaches this gate only at
+			// period boundaries, so one consent-absent observation
+			// must re-arm the waiver line even without a refusal
+			// (round 10: resetting on refusals alone is round 5's
+			// behaviour, which round 7 existed to fix).
+			s.waiveGenValid = false
+		}
 		return nil
 	}
 	if s.staleAccepted() {
@@ -204,9 +212,9 @@ func (s *Syncer) staleGate(anchorPeriod, wallPeriod uint64, what string) error {
 	}
 	if s.StaleGeneration == nil {
 		// Hookless caller: generations cannot distinguish two armings,
-		// so re-arm on refusal the way round 7 did — otherwise the
-		// constant generation pins the first line for the loop's life
-		// (round 3's behaviour round 5 rejected; round 9).
+		// so keep round 7's refusal-path re-arm alongside the fresh-
+		// path one above — otherwise the constant generation pins the
+		// first line for the loop's life (round 3's behaviour; round 9).
 		s.waiveGenValid = false
 	}
 	return fmt.Errorf("%w: %s period %d, wall period %d, bound %d",

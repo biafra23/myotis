@@ -541,16 +541,6 @@ func (w *stallWatcher) note(err error) {
 	}
 }
 
-// lcLoop bootstraps the LC over libp2p (static pins, the same
-// set myotis-lc dials), walks the committee chain, and keeps the
-// anchor fresh on the myotis-lc steady loop — every answer through
-// the part-3 processor (checkpoint pin, period gate, BLS, Merkle
-// branches). Anchors are published only after a VERIFYING finality
-// poll (Advanced or Stale) — never the bootstrap/catch-up root, which
-// is routinely outside every peer's state window (see the loop).
-// This is the same loop as cmd/myotis-lc's; when a
-// second consumer appeared the honest move is to say so in a comment
-// and re-unify the two in 3c rather than contort the merged main.
 // wireSyncerHooks connects one syncer to this engine's live consent,
 // bound and log state: the C ABI's setters (myotis_set_ws_bound_periods,
 // myotis_accept_stale_anchor, myotis_set_stale_anchor_policy) mutate
@@ -576,6 +566,16 @@ func (e *Engine) wireSyncerHooks(s *clsync.Syncer) {
 	}
 }
 
+// lcLoop bootstraps the LC over libp2p (static pins, the same
+// set myotis-lc dials), walks the committee chain, and keeps the
+// anchor fresh on the myotis-lc steady loop — every answer through
+// the part-3 processor (checkpoint pin, period gate, BLS, Merkle
+// branches). Anchors are published only after a VERIFYING finality
+// poll (Advanced or Stale) — never the bootstrap/catch-up root, which
+// is routinely outside every peer's state window (see the loop).
+// This is the same loop as cmd/myotis-lc's; when a
+// second consumer appeared the honest move is to say so in a comment
+// and re-unify the two in 3c rather than contort the merged main.
 func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 	c := chain.ConsensusMainnet()
 	h, err := clsync.NewHost()
