@@ -735,15 +735,20 @@ final class GoChainHandle implements ChainHandle, NodeStatusReads, io.myotis.api
             if (policy == io.myotis.api.StaleAnchorPolicy.CHECKPOINT) {
                 // CHECKPOINT is refused for its missing fetch. The
                 // refusal withdraws a REMEMBERED CONTINUE (the engine
-                // un-arms on any replacement, host.rs) but NOT a
-                // one-shot AcceptStale (stalePolicy stays 0 there, so
-                // the withdrawal line does not fire) — the wording has
-                // to hold for both, and for a dead handle where
-                // nothing moved at all (PR #877 rounds 3-4).
+                // un-arms on any replacement, host.rs); a one-shot
+                // AcceptStale alone survives it (stalePolicy stays 0,
+                // so the withdrawal line does not fire) — but the two
+                // consents share ONE acceptStale flag, so a remembered
+                // CONTINUE given AFTER a one-shot takes the one-shot
+                // down with it when replaced (PR #877 round 7; Rust
+                // behaves identically, one accept_stale_anchor,
+                // host.rs:1625-1627). The wording has to hold for
+                // all four cases: dead handle, one-shot only,
+                // remembered only, one-shot then remembered.
                 log.warn("[engines] setStaleAnchorPolicy(CHECKPOINT) not applied: the Go "
                         + "engine has no checkpoint fetch. A remembered 'continue anyway', if "
-                        + "there was one, IS withdrawn by this refusal; a one-shot accept given "
-                        + "earlier this run still holds");
+                        + "there was one, IS withdrawn by this refusal, together with any one-shot "
+                        + "accept (they share one consent); a one-shot accept alone still holds");
             } else {
                 log.warn("[engines] setStaleAnchorPolicy({}) not applied: unknown handle, or "
                         + "a closed engine", policy);

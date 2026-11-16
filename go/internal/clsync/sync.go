@@ -106,14 +106,20 @@ type Syncer struct {
 	procMu sync.Mutex
 	store  *lc.Store
 
-	// staleWaived emits the consent-waiver line once per
-	// refused→waived TRANSITION: the steady loop re-enters staleGate
-	// every slot (one decision, not one line per slot — PR #877 round
-	// 3), but a consent re-armed after a withdrawal is a NEW trust
-	// decision and must log again — a sync.Once hid exactly that
-	// (round 5; Rust's auto_resolve_park logs every
-	// accept_stale_anchor.swap that flips, sync.rs:2848). Each
-	// transition costs the user a setting change, so this cannot spam.
+	// staleWaived emits the consent-waiver line once per waiver
+	// STREAK: while a stale gate keeps waiving, one line (PR #877
+	// round 3), but a consent re-armed after a withdrawal is a NEW
+	// trust decision and must log again — a sync.Once hid exactly
+	// that (round 5; Rust's auto_resolve_park logs every
+	// accept_stale_anchor.swap that flips, sync.rs:2848). The flag
+	// re-arms on EVERY gate call that finds consent absent — the
+	// refusal AND a fresh-anchor pass — because a current store
+	// reaches this gate only at period boundaries (RunCatchUp
+	// returns before it once caught up), so re-arming on refusals
+	// alone left a withdrawal made while current unseen, and the
+	// waiver after a sleep past the bound passed unlogged (round 7).
+	// Every re-arm still costs the user a setting change, so this
+	// cannot spam.
 	staleWaived atomic.Bool
 }
 
@@ -164,10 +170,21 @@ func (s *Syncer) staleGate(anchorPeriod, wallPeriod uint64, what string) error {
 	// Staleness is computed BEFORE the consent is consulted — not to
 	// change the verdict (consent still waives, refusal is unchanged)
 	// but because the waiver has to be able to name what it waived.
+	// Consent is read on the fresh path too: any gate call that finds
+	// it absent re-arms the waiver line, so a withdrawal seen while
+	// the store is current still re-arms (round 7 — with one
+	// boundary pass per period at the latest, "ask me" then "continue
+	// anyway" while current, then a sleep past the bound, would
+	// otherwise waive the wake-up unlogged where Rust parks with a
+	// WARN and re-asks with another — sync.rs:2684-2691, 2848-2850).
+	consented := s.staleAccepted()
 	if !chain.WsAnchorStale(anchorPeriod, wallPeriod, s.boundPeriods()) {
+		if !consented {
+			s.staleWaived.Store(false)
+		}
 		return nil
 	}
-	if s.staleAccepted() {
+	if consented {
 		if s.staleWaived.CompareAndSwap(false, true) {
 			s.warnf()("STALE ANCHOR: %s period %d is past the weak-subjectivity bound "+
 				"(wall period %d, bound %d) — the host's stale-anchor consent waives "+

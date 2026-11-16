@@ -166,6 +166,37 @@ func TestStaleGateConsentWaiverIsLogged(t *testing.T) {
 		}
 	})
 
+	t.Run("withdrawal seen while current re-arms the waiver", func(t *testing.T) {
+		// Round 7: a current store reaches the gate only at period
+		// boundaries (RunCatchUp returns before it once caught up),
+		// so re-arming the waiver line only on refusals left a
+		// withdraw-then-rearm made while current unseen — the next
+		// waiver, after a sleep past the bound, passed unlogged.
+		// Any gate call finding consent absent must re-arm.
+		var lines []string
+		consent := true
+		s := &Syncer{
+			Logf:          func(string, ...any) { t.Fatal("waiver must not reach the plain log hook") },
+			Warnf:         func(f string, a ...any) { lines = append(lines, fmt.Sprintf(f, a...)) },
+			WsBound:       func() uint64 { return bound },
+			StaleAccepted: func() bool { return consent },
+		}
+		if err := s.staleGate(bound+1, 2*bound+2, "held committee"); err != nil {
+			t.Fatalf("waived gate refused: %v", err)
+		}
+		consent = false                                                     // "ask me", node current
+		if err := s.staleGate(bound, bound, "held committee"); err != nil { // fresh pass, no refusal
+			t.Fatalf("fresh gate refused: %v", err)
+		}
+		consent = true // "continue anyway"
+		if err := s.staleGate(bound+1, 2*bound+2, "held committee"); err != nil {
+			t.Fatalf("re-armed gate refused: %v", err)
+		}
+		if len(lines) != 2 {
+			t.Fatalf("logged %d lines %q, want the post-current re-arm logged", len(lines), lines)
+		}
+	})
+
 	t.Run("nil Warnf falls back to Logf", func(t *testing.T) {
 		var lines []string
 		s := &Syncer{
