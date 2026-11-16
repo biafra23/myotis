@@ -52,6 +52,14 @@ tasks.test {
     // these tests; inputs.files tolerates the missing output on go-less machines,
     // where those tests self-skip via assumeTrue.
     inputs.files(rootProject.tasks.named("goBuildCShared")).withPropertyName("nativeGoLibs")
+    // GoStatusJsonTest splices go/internal/capi/testdata/capabilities.json
+    // (the shared capabilities golden) into its fixture, so the golden is a
+    // test input too — declared NOT optional, because that read fails hard on
+    // a missing file. Without this, a golden edit could leave the task
+    // UP-TO-DATE on a warm cache that never saw the new bytes (PR #879
+    // round-13 review).
+    inputs.file(rootProject.file("go/internal/capi/testdata/capabilities.json"))
+        .withPropertyName("capabilitiesGolden")
     doFirst {
         val nativeDir = rootProject.file("go/build")
         if (nativeDir.exists()) {

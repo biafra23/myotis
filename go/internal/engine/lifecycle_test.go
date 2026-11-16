@@ -114,7 +114,8 @@ func TestSetStaleAnchorPolicyWithdrawalMirrorsRust(t *testing.T) {
 	// The consent GENERATION the waiver line follows (PR #877 round 8):
 	// one bump per arming, none per refusal or refused write. Fresh
 	// engine 0 → CONTINUE arms 1 → ASK withdraws, still 1 → one-shot
-	// arms 2 → refused CHECKPOINT disturbs nothing, still 2.
+	// arms 2 → applied ASK over that one-shot disturbs nothing, still
+	// 2 → refused CHECKPOINT disturbs nothing, still 2.
 	if g := e.StaleGeneration(); g != 2 {
 		t.Errorf("staleGen = %d, want 2 (one bump per arming, none per withdrawal or refusal)", g)
 	}
