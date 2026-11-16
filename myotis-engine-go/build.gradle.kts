@@ -60,6 +60,18 @@ tasks.test {
     // round-13 review).
     inputs.file(rootProject.file("go/internal/capi/testdata/capabilities.json"))
         .withPropertyName("capabilitiesGolden")
+    // The same holds for the module's two older cross-reads, both of
+    // which use Files.readString and so fail hard on a missing file
+    // (hence not optional): GoAbiVersionMirrorTest reads the C ABI
+    // header it mirrors, and GoCatalogParityTest the catalog golden.
+    // Before this the header reached the task only through the built
+    // library, whose bytes need not change when a comment in it does,
+    // so a warm local build could report UP-TO-DATE past an edit to
+    // either (invisible to CI, which starts from a fresh checkout).
+    inputs.file(rootProject.file("rust/include/myotis_engine.h"))
+        .withPropertyName("abiHeaderMirror")
+    inputs.file(rootProject.file("rust/testdata/networks_catalog.json"))
+        .withPropertyName("networksCatalogGolden")
     doFirst {
         val nativeDir = rootProject.file("go/build")
         if (nativeDir.exists()) {

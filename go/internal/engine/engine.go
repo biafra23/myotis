@@ -409,10 +409,13 @@ func (e *Engine) SetStaleAnchorPolicy(policy int32) bool {
 	return true
 }
 
-// StaleAccepted reports the consent the weak-subjectivity gates read
-// (the same value the syncer's StaleAccepted hook returns) — exposed for
-// the policy test to observe what SetStaleAnchorPolicy armed and what a
-// replaced CONTINUE withdrew.
+// StaleAccepted reports the consent the weak-subjectivity gates read.
+// Since round 12 this is the PRODUCTION read: wireSyncerHooks wires
+// this very method as the syncer's StaleAccepted hook, so every gate
+// sample of consent comes through here. The policy tests observe the
+// same value the loop acts on (what SetStaleAnchorPolicy armed and
+// what a replaced CONTINUE withdrew) rather than a parallel accessor
+// that could drift from it.
 func (e *Engine) StaleAccepted() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()

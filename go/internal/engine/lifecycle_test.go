@@ -7,10 +7,13 @@ package engine
 // pin the failure path itself.
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"github.com/biafra23/myotis/go/internal/clsync"
+	"log/slog"
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -87,9 +90,10 @@ func TestSetStaleAnchorPolicyWithdrawalMirrorsRust(t *testing.T) {
 	if e.StaleAccepted() {
 		t.Error("replacing CONTINUE with ASK must withdraw the consent CONTINUE armed")
 	}
-	// CHECKPOINT (1) is refused at this door too (the fetch is the engine-
-	// parity gap; capabilities anchorRefresh:false) and a refused policy
-	// must not disturb an armed consent (a one-shot accept stays armed).
+	// Then a one-shot arming, and CHECKPOINT (1) refused at this door too
+	// (the fetch is the engine-parity gap; capabilities anchorRefresh:false)
+	// — a refused policy must not disturb an armed consent (the one-shot
+	// stays armed).
 	if !e.AcceptStale() {
 		t.Fatal("AcceptStale (one-shot) must arm")
 	}
@@ -114,8 +118,10 @@ func TestSetStaleAnchorPolicyWithdrawalMirrorsRust(t *testing.T) {
 	// The consent GENERATION the waiver line follows (PR #877 round 8):
 	// one bump per arming, none per refusal or refused write. Fresh
 	// engine 0 → CONTINUE arms 1 → ASK withdraws, still 1 → one-shot
-	// arms 2 → applied ASK over that one-shot disturbs nothing, still
-	// 2 → refused CHECKPOINT disturbs nothing, still 2.
+	// arms 2 → refused CHECKPOINT disturbs nothing, still 2 → applied
+	// ASK over that one-shot disturbs nothing, still 2 (the three
+	// writes below run in exactly this order; round-14 caught the
+	// comment listing the last two transposed).
 	if g := e.StaleGeneration(); g != 2 {
 		t.Errorf("staleGen = %d, want 2 (one bump per arming, none per withdrawal or refusal)", g)
 	}
@@ -176,7 +182,9 @@ func TestStallWatcherReArmsOnAnyGatePass(t *testing.T) {
 // captures: mutate the engine, and the syncer's hooks answer
 // differently on the next call.
 func TestWireSyncerHooksTrackEngineState(t *testing.T) {
-	e, err := New(Config{DataDir: t.TempDir(), ListenPort: -1})
+	var logBuf bytes.Buffer // must receive the WARN the hook promises (round 14)
+	e, err := New(Config{DataDir: t.TempDir(), ListenPort: -1,
+		Logger: slog.New(slog.NewTextHandler(&logBuf, nil))})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,6 +194,17 @@ func TestWireSyncerHooksTrackEngineState(t *testing.T) {
 	if s.Warnf == nil || s.WsBound == nil || s.StaleAccepted == nil || s.StaleGeneration == nil {
 		t.Fatalf("wireSyncerHooks left a hook nil: warn=%v bound=%v consent=%v gen=%v",
 			s.Warnf != nil, s.WsBound != nil, s.StaleAccepted != nil, s.StaleGeneration != nil)
+	}
+	// The WARN LEVEL of the Warnf hook is the last unpinned link of the
+	// trail: clsync pins that the waiver routes through Warnf (not Logf),
+	// capi pins how the ring renders level=WARN, GoLogDrainTest pins the
+	// JVM normalization — only this test can pin that the engine's hook
+	// LOGS at WARN. An e.log.Info here passes every other test while
+	// dropping the waiver AND the stall line out of the hosts'
+	// WARN-filtered view — the round-4 regression, one remove (round 14).
+	s.Warnf("waiver probe %d", 7)
+	if got := logBuf.String(); !strings.Contains(got, `level=WARN msg="waiver probe 7"`) {
+		t.Fatalf("the Warnf hook must log at WARN, got %q", got)
 	}
 	if s.StaleAccepted() {
 		t.Fatal("fresh engine: consent must start disarmed")
