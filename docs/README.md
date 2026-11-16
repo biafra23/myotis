@@ -72,6 +72,7 @@ that gets built moves to `design-history/`, and its user-facing behaviour gets a
 
 ## ideas/
 
+- [address-history-plan.md](ideas/address-history-plan.md): what is missing for Punicus to show any address's past transactions through Myotis, split into workstreams for implementation plans.
 - [base-l2-evaluation.md](ideas/base-l2-evaluation.md): Base (Coinbase's L2) on Myotis, an evaluation.
 - [dapp-browser-design.md](ideas/dapp-browser-design.md): a dApp browser and RPC interception (phase 0 built as #502).
 - [inbound-connections.md](ideas/inbound-connections.md): accepting inbound devp2p connections.
