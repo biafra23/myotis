@@ -120,7 +120,7 @@ func TestSetStaleAnchorPolicyWithdrawalMirrorsRust(t *testing.T) {
 	// engine 0 → CONTINUE arms 1 → ASK withdraws, still 1 → one-shot
 	// arms 2 → refused CHECKPOINT disturbs nothing, still 2 → applied
 	// ASK over that one-shot disturbs nothing, still 2 (the three
-	// writes below run in exactly this order; round-14 caught the
+	// writes above run in exactly this order; round-14 caught the
 	// comment listing the last two transposed).
 	if g := e.StaleGeneration(); g != 2 {
 		t.Errorf("staleGen = %d, want 2 (one bump per arming, none per withdrawal or refusal)", g)
@@ -212,9 +212,31 @@ func TestWireSyncerHooksTrackEngineState(t *testing.T) {
 	if g := s.StaleGeneration(); g != 0 {
 		t.Fatalf("fresh engine: generation = %d, want 0", g)
 	}
-	if b := s.WsBound(); b < 1 {
+	b := s.WsBound()
+	if b < 1 {
 		t.Fatalf("WsBound hook returned %d, want the network default (>= 1)", b)
 	}
+	// The bound hook must be LIVE like the consent hooks, not a value
+	// captured at wiring time (round 15). Nothing else can pin this:
+	// StatusJSON reads Engine.EffectiveWsBound directly (capi.go:659),
+	// so capi's setter test passes with a hook that stopped following
+	// the setter, and no test asserts a gate after a bound change made
+	// through this wiring. In production that mutant is the
+	// accepted-and-ignored shape the Trust rules forbid — the setter
+	// answers true and the status reports the new bound while the
+	// running loop keeps judging by the bound captured when the loop
+	// started — and it hides well, because releasing a PARKED loop
+	// rebuilds the Syncer and captures afresh, so only the in-run path
+	// goes wrong: raising the bound to end a stall (a way out the
+	// stall WARN itself names), or lowering it.
+	if !e.SetWsBoundPeriods(b + 7) {
+		t.Fatal("SetWsBoundPeriods must apply on an open engine")
+	}
+	if got := s.WsBound(); got != b+7 {
+		t.Fatalf("WsBound hook = %d after SetWsBoundPeriods(%d): a capture, not a live read", got, b+7)
+	}
+	// The override stays set: nothing below reads the bound, and
+	// restartIfParked returns at !e.lcStarted, so it disturbs nothing.
 	if !e.AcceptStale() {
 		t.Fatal("AcceptStale failed")
 	}

@@ -104,9 +104,12 @@ type Syncer struct {
 	// generation, which still cannot mute a re-armed waiver: every
 	// gate call that finds consent absent re-arms the line (see
 	// staleGate), so the next waiver logs again. What a missing hook
-	// does lose is an arming that lands between two gate calls while
-	// consent stays continuously armed — the round-8 case, which is
-	// why the engine wires this.
+	// does lose is a withdraw-and-re-grant that lands entirely
+	// between two gate calls, so both calls see consent armed and
+	// neither sees the absence — the round-8 case, which is why the
+	// engine wires this. (An arming OF an unarmed consent is always
+	// preceded by an absence some earlier call could see; the blind
+	// spot is only the absence that is itself between two samples.)
 	StaleGeneration func() uint64
 	// Warnf carries trust-decision lines the Rust twin logs at WARN
 	// (the stale-anchor waiver, sync.rs:2478/2849/2491 — all
@@ -127,9 +130,12 @@ type Syncer struct {
 	// The waiver line follows the engine's consent-generation count
 	// (waiveGen = the generation last given a line; waiveGenValid =
 	// a line went out since consent was last seen absent — every
-	// consent-absent gate call clears it, see staleGate). One WARN
-	// per arming event —
-	// each costs the user one action, so it cannot spam — and a
+	// consent-absent gate call clears it, see staleGate). AT MOST one
+	// WARN per arming, at the first stale gate call that uses it — an
+	// arming that never meets a stale gate gets no line, and two
+	// armings between two samples share one (the compare sees only
+	// that the generation moved). Each arming costs the user one
+	// action, so it cannot spam — and a
 	// withdraw-and-regrant between gate samples still logs, the gap
 	// the sampled boolean of rounds 5/7 missed (round 8; Rust logs
 	// every accept_stale_anchor.swap that flips, sync.rs:2848).

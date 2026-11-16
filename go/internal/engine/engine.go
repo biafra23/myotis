@@ -423,7 +423,9 @@ func (e *Engine) StaleAccepted() bool {
 }
 
 // StaleGeneration reports the consent-arming count (staleGen) that
-// the syncer's waiver line follows: one WARN per arming, whatever the
+// the syncer's waiver line follows: at most one WARN per arming (at
+// the first stale gate that uses it — an arming no stale gate meets
+// stays unlogged), whatever the
 // gate's sampling does in between (PR #877 round 8).
 func (e *Engine) StaleGeneration() uint64 {
 	e.mu.Lock()
@@ -552,10 +554,11 @@ func (w *stallWatcher) note(err error) {
 // StaleGeneration hook is what carries the round-8 waiver fix: a
 // silently missing assignment leaves clsync on its constant
 // generation, which re-arms on every consent-absent gate call but
-// cannot see an arming that lands BETWEEN two calls while consent
-// stays armed — exactly round 8's gap, and the only thing a missing
-// assignment costs (round 12; earlier rounds of this comment
-// overstated it as round 3's once-per-loop logging). Round 9 caught
+// cannot see a withdraw-and-re-grant that lands entirely BETWEEN two
+// calls — both samples see consent armed, neither sees the absence —
+// exactly round 8's gap, and the only thing a missing assignment
+// costs (round 12; earlier rounds of this comment overstated it as
+// round 3's once-per-loop logging). Round 9 caught
 // such an assignment missing with no test noticing, hence this method
 // and TestWireSyncerHooksTrackEngineState, which fails on a nil hook.
 // The consent and generation hooks are the engine's own accessors —
