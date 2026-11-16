@@ -23,7 +23,7 @@ its trust anchors and release checks.
 
 - Docs: verifying deep blocks, an analysis of reads beyond the 512-block
   window with a measured survey of which peers still serve old blocks
-  (docs/ideas/deep-block-verification.md).
+  (#882).
 
 ### Fixed
 

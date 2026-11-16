@@ -22,7 +22,7 @@ checkpoint table becomes a trust anchor is the owner's decision
 - **Verification is the obstacle**, and the cheapest fix is a **bundled table
   of every 1024th block hash**: 0.83 MB for all of mainnet's history, after
   which ANY block verifies with one `GetBlockHeaders` request of at most 1024
-  headers (≤ 0.57 MB, 0.29 MB on average) plus its body. No proof format, no
+  headers (about 0.66 MB at most, 0.33 MB on average) plus its body. No proof format, no
   total difficulty, nothing devp2p does not already serve.
 - **The table is a new trust anchor.** It must be derived by a verified walk
   from a beacon-attested block down to the genesis hash, committed as a pinned
@@ -54,10 +54,17 @@ the window, `myotis-rpcd` release build):
 
 A deeper block is refused with
 `block N is D behind the finalized block — beyond the 512-block verify window`.
-The engine marks that refusal permanent, but `myotis-rpcd` answers it with the
-retryable `-32000`: a block below the window never comes back into it, so by
-the rule in `CLAUDE.md` it should be the permanent `-32602`. That is a
-separate fix, whatever this document leads to.
+The engine hands that refusal to its hosts as the plain `{"error"}` envelope
+(`get_block_by_number_json`, `rust/myotis-engine/src/host.rs`), which every
+host answers with the retryable `-32000` — `myotis-rpcd` and the Kotlin
+`RpcRouter` alike; the receipts read has the same refusal
+and the same envelope, and the Java engine answers the case with `null` →
+`-32000` (`VerifiedRpcBackend`). A block below the window never comes back into
+it, so by the rule in `CLAUDE.md` it should be the permanent `-32602`. The fix
+belongs in the engines, not in a host: the reader returns `Result<_, String>`,
+so it first needs a way to tell this refusal from a transient failure, and the
+tri-state block and receipt reads need a permanent envelope their hosts unwrap.
+That is a separate fix, whatever this document leads to.
 
 ## The problem is verification, not availability
 
@@ -113,23 +120,52 @@ time, per network, 32 bytes each. The size is `blocks × 32 B / k`:
 | One hash every k blocks | Bundle (mainnet, 26.43 M blocks) | Download per lookup: worst / mean | Requests |
 |---|---|---|---|
 | 1 | 846 MB | header only | 1 |
-| 64 | 13.2 MB | 36 KB / 18 KB | 1 |
-| 256 | 3.3 MB | 143 KB / 72 KB | 1 |
-| **1024** | **0.83 MB** | **0.57 MB / 0.29 MB** | **1** |
-| 8192 | 0.10 MB | 4.6 MB / 2.3 MB | 8 / 4 |
+| 64 | 13.2 MB | ~41 KB / ~20 KB | 1 |
+| 256 | 3.3 MB | ~164 KB / ~82 KB | 1 |
+| **1024** | **0.83 MB** | **~0.66 MB / ~0.33 MB** | **1** |
+| 8192 | 0.10 MB | ~5.2 MB / ~2.6 MB | 8 / 4 |
+
+The download is counted at a current header (~640 B since Prague); older
+headers are smaller, so a pre-Merge walk costs less.
 
 **k = 1024** is the recommended point: it is geth's `GetBlockHeaders`
-response limit, so every lookup stays one request, and mainnet's table grows by
-~230 KB a year. Gnosis' 5 s blocks make its table grow about 2.4× as fast.
+response limit, so every lookup stays one request. Per network at k = 1024:
+
+| Network | Blocks (census head) | Table | Growth |
+|---|---|---|---|
+| mainnet (12 s) | 26.43 M | 0.83 MB | ~82 KB a year |
+| Gnosis (5 s) | 49.20 M | 1.54 MB | ~197 KB a year |
+| Sepolia (12 s) | 12.10 M | 0.38 MB | ~82 KB a year |
+
+The heads are the census heads of
+[log-index-presets.md](../how-it-works/log-index-presets.md) (mainnet: this
+document's own); Chiado is not counted. The apps offer every network, so their
+bundle is about 2.7 MB before Chiado.
 
 ### What a running node adds
 
-Each time the finalized block crosses a multiple of k, the node appends that
-block's hash to a local table — it is beacon-attested already, so this costs
-nothing (about seven entries a day on mainnet). Two gaps are closed once, with
-the same walk: from the first finalized block after start back to the last
-bundled entry (the time since the release), and over any downtime. Each costs
-about seven requests (~4 MB) per day of gap.
+Each time the finalized block passes a multiple of k, the node appends that
+block's hash to a local table: about seven entries a day on mainnet. The entry
+is not free. Finality advances an epoch at a time, and the light client holds
+one finalized execution block (`ExecAnchor::finalized_execution`), which lands
+exactly on a multiple of 1024 about once in 32 updates. Otherwise the entry's
+hash is known only after the window from it up to the new finalized block —
+about 32 headers, ~20 KB, more after a stretch without finality — has been
+fetched and hash-linked, as `fetch_anchored_window` does today. A hash seen
+while the block was only the optimistic head must not be recorded: that block
+can still be reorganized.
+
+Two gaps are closed with the same walk: from the first finalized block after
+start back to the last bundled entry (the time since the release), and over any
+downtime. Each costs about seven requests (~4–5 MB) per day of gap: about
+0.4 GB for an install started 90 days after its release, 1.5–1.7 GB after a
+year, per network, and 2.4× that on Gnosis. On a phone that is the larger cost,
+larger than the bundled table, so the walk should be:
+
+- **lazy**: run only when a read lands in the gap, and close only the part of
+  the gap between that read and the next entry above it (a single walk of at
+  most k headers); and
+- **held on a metered network**, as the log-index backfill is (`meteredHold`).
 
 ### Serving block N
 
@@ -149,8 +185,8 @@ about seven requests (~4 MB) per day of gap.
 
 Expected latency, from the measurements above: the unverified probe served a
 deep header and body at a median of 413 ms post-Merge and 712 ms pre-Merge,
-and the 300 KB window behind today's reads costs a median of 287 ms. A
-≤ 0.57 MB walk on top should land at roughly 0.5–1.5 s per deep block — an
+and the 300 KB window behind today's reads costs a median of 287 ms. A walk
+of about 0.66 MB at most on top should land at roughly 0.5–1.5 s per deep block — an
 estimate, not a measurement.
 
 ### Building the table
@@ -235,9 +271,11 @@ For the owner:
 1. **The checkpoint table as a trust anchor.** It adds a third embedded anchor
    next to the sync-committee checkpoint and the historical accumulators, and
    it is only as good as the walk that produced it.
-2. **k**, and whether the table ships in the mobile apps (0.83 MB at k = 1024)
-   or only in the daemon, the desktop app and `myotis-rpcd`.
+2. **k**, and whether the table ships in the mobile apps (about 2.7 MB for
+   mainnet, Gnosis and Sepolia at k = 1024, plus the gap walks above) or only
+   in the daemon, the desktop app and `myotis-rpcd`.
 3. **Pre-Merge bodies.** Served by archive peers only; whether that is enough
    to offer pre-Merge reads at all, or whether they stay refused.
-4. **The `-32000` → `-32602` fix** for reads below the window, independent of
+4. **The `-32000` → `-32602` fix** for block and receipt reads below the
+   window, in the engines' error envelope (both engines), independent of
    the rest.
