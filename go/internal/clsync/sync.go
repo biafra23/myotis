@@ -198,9 +198,11 @@ func (s *Syncer) WarnLine(f string, a ...any) { s.warnf()(f, a...) }
 // (start gate + in-run layer): refused unless the host consented to
 // the age, and judged against the bound in force at this instant.
 func (s *Syncer) staleGate(anchorPeriod, wallPeriod uint64, what string) error {
-	// Staleness is computed BEFORE the consent is consulted — not to
-	// change the verdict (consent still waives, refusal is unchanged)
-	// but because the waiver has to be able to name what it waived.
+	// Consent is READ first, on every call, so that a fresh pass can
+	// see it absent and re-arm the waiver line (the block below). It
+	// DECIDES nothing until staleness has been judged: the verdict is
+	// unchanged (consent still waives, refusal is unchanged), and the
+	// waiver has to be able to name what it waived.
 	consented := s.staleAccepted()
 	if !consented {
 		// One rule for every caller, hooked or not: a gate call that
