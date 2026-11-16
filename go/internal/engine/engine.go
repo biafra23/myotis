@@ -493,6 +493,36 @@ func (e *Engine) EffectiveWsBound() uint64 {
 // This is the same loop as cmd/myotis-lc's; when a
 // second consumer appeared the honest move is to say so in a comment
 // and re-unify the two in 3c rather than contort the merged main.
+// stallWatcher decides when a stalled light-client loop gets its
+// WARN line: once per refused streak. A stale refusal warns on the
+// first pass of the streak only; ANY other RunCatchUp outcome — nil
+// or a failure that came after a gate pass — re-arms it, because the
+// gate is reached at round 0 before anything else can fail
+// (clsync/sync.go), so "catch-up stalled", "no peers" and cooldown
+// cancels all prove that call walked past the gate (PR #877 round 6:
+// re-arming only on nil lost the re-warn exactly while a
+// re-consented node was still catching up — stall #2 with no line).
+// Each new streak costs a Settings change or a period boundary, so
+// this cannot spam. Extracted from lcLoop for the same reason
+// statusPeriods was: so the sequence is testable (round-6 note).
+type stallWatcher struct {
+	warn   func(f string, a ...any)
+	warned bool
+}
+
+func (w *stallWatcher) note(err error) {
+	if !errors.Is(err, clsync.ErrStaleAnchor) {
+		w.warned = false
+		return
+	}
+	if !w.warned {
+		w.warned = true
+		w.warn("STALE ANCHOR: held committee aged past the weak-subjectivity bound "+
+			"while running (%v) — the steady loop retries every slot but publishes no anchor; "+
+			"reads stay on the last one until a 'continue anyway' is granted again or the bound is raised", err)
+	}
+}
+
 func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 	c := chain.ConsensusMainnet()
 	h, err := clsync.NewHost()
@@ -557,18 +587,10 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 	// (PR #877 round 5): the per-slot lines go through logf — INFO —
 	// and the docs name that line the stall's only trace, which the
 	// hosts' WARN-filtered pump view would otherwise drop entirely.
-	// Re-arms on a cycle that gets past the gate, so a later stall is
-	// a new decision and warns again; Rust's twin likewise warns once
-	// per in-run park, guarded by the state transition (sync.rs:2685).
-	stallWarned := false
-	stallWarn := func(err error) {
-		if errors.Is(err, clsync.ErrStaleAnchor) && !stallWarned {
-			stallWarned = true
-			syncer.WarnLine("STALE ANCHOR: held committee aged past the weak-subjectivity bound "+
-				"while running (%v) — the steady loop retries every slot but publishes no anchor; "+
-				"reads stay on the last one until a 'continue anyway' is granted again or the bound is raised", err)
-		}
-	}
+	// Re-arm and warn policy lives in stallWatcher (tested there);
+	// Rust's twin likewise warns once per in-run park, guarded by the
+	// state transition (sync.rs:2685).
+	stall := &stallWatcher{warn: syncer.WarnLine}
 	if err := syncer.RunCatchUp(catchCtx, st); err != nil {
 		// NOT fatal (PR #773 review): a pin that is down or
 		// rate-limiting us today is up in the next slot, and the
@@ -577,7 +599,7 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 		// the read window on one bad round — the failure the loop
 		// right below already tolerates.
 		logf("catch-up: %v (the steady loop retries it each slot)", err)
-		stallWarn(err)
+		stall.note(err)
 	}
 	catchCancel()
 	// NO publish yet: st.Finalized here is the embedded checkpoint (or
@@ -594,9 +616,9 @@ func (e *Engine) lcLoop(ctx context.Context, logf func(string, ...any)) error {
 		e.mu.Unlock()
 		if err := syncer.RunCatchUp(ctx, st); err != nil {
 			logf("re-catch-up: %v", err)
-			stallWarn(err)
+			stall.note(err)
 		} else {
-			stallWarned = false // past the gate again: the next stall is new
+			stall.note(nil) // past the gate again: the next stall is new
 			if chain.SyncCommitteePeriod(syncer.Consensus.SlotAt(time.Now().Unix())) > st.Period() {
 				logf("committee behind wall clock after re-catch-up; skipping finality poll this cycle")
 			} else if outcome, err := syncer.PollFinality(ctx, st); err != nil {

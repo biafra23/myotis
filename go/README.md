@@ -266,7 +266,16 @@ loop itself died) and **no dialog opens**; the stall logs once at WARN
 new stall, so the hosts' WARN-filtered view keeps it) besides the
 per-slot INFO `re-catch-up:` line, and the ways out are choosing
 CONTINUE again in Settings or a restart, which parks at the bootstrap
-gate and asks. The Rust loop instead re-publishes `STALE_ANCHOR` and re-asks. The JSON-string
+gate and asks. The Rust loop instead re-publishes `STALE_ANCHOR` and re-asks.
+The parity fix likely needs no status-contract change (PR #877
+round 6): Rust re-publishes that park every 5 s from its
+still-running loop (`sync.rs:2691`), so `STALE_ANCHOR` from a live
+loop is the contract both engines already share — a flag set on an
+in-run refusal and cleared on any other outcome, with the status
+reporting `STALE_ANCHOR` while set, re-opens the dialog within a slot
+and keeps the walked-forward store, which returning the error would
+throw away to a re-bootstrap. Owner's call, like the gap itself. The
+JSON-string
 reads (block/tx/receipt/fee-history) answer the `{"error":…,
 "code":-32602}` envelope so the wallet gets a permanent refusal, not a
 retryable one. `myotis_drain_logs` lines are drained by

@@ -7,6 +7,9 @@ package engine
 // pin the failure path itself.
 
 import (
+	"errors"
+	"fmt"
+	"github.com/biafra23/myotis/go/internal/clsync"
 	"net"
 	"testing"
 )
@@ -109,5 +112,38 @@ func TestSetStaleAnchorPolicyWithdrawalMirrorsRust(t *testing.T) {
 	}
 	if e.StaleAccepted() {
 		t.Error("CONTINUE→CHECKPOINT must withdraw the consent (the host.rs rule, any replacement)")
+	}
+}
+
+// TestStallWatcherReArmsOnAnyGatePass pins the round-6 fix: the stall
+// WARN goes out once per refused streak, and EVERY outcome other than
+// a stale refusal re-arms it — nil or not, because a non-stale
+// RunCatchUp failure also came after a gate pass (the gate is reached
+// at round 0). Re-arming only on nil had lost the re-warn exactly in
+// the window where a re-consented node keeps ending in "catch-up
+// stalled": stall #2 there emitted no line.
+func TestStallWatcherReArmsOnAnyGatePass(t *testing.T) {
+	var lines int
+	w := &stallWatcher{warn: func(string, ...any) { lines++ }}
+	stale := fmt.Errorf("wrapped: %w", clsync.ErrStaleAnchor)
+	other := errors.New("clsync: catch-up stalled at period 1910 (wall 1930)")
+	seq := []struct {
+		err   error
+		lines int // expected total after this note
+		why   string
+	}{
+		{stale, 1, "first refusal of a streak warns"},
+		{stale, 1, "per-slot repeats stay silent"},
+		{other, 1, "a post-gate-pass failure re-arms silently"},
+		{stale, 2, "stall #2 after that pass warns again"},
+		{stale, 2, "and again stays silent"},
+		{nil, 2, "a nil cycle re-arms silently"},
+		{stale, 3, "stall #3 warns"},
+	}
+	for i, tc := range seq {
+		w.note(tc.err)
+		if lines != tc.lines {
+			t.Fatalf("step %d (%s): lines = %d, want %d", i, tc.why, lines, tc.lines)
+		}
 	}
 }

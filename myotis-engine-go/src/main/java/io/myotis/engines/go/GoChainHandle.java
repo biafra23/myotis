@@ -93,7 +93,18 @@ import java.util.List;
  *       in the hosts' WARN-filtered view (PR #877 round 5) — beside the
  *       per-slot INFO "re-catch-up:" line; the ways out are choosing
  *       CONTINUE again in Settings or a restart, which parks at the
- *       bootstrap gate and asks.</li>
+ *       bootstrap gate and asks. The parity fix likely needs NO
+ *       status-contract change (PR #877 round 6 corrected the
+ *       round-5 note that claimed one): Rust re-publishes the park
+ *       every 5 s from its still-running loop ({@code sync.rs:2691}),
+ *       so {@code STALE_ANCHOR} from a live loop is the contract both
+ *       engines already share — a flag set on an in-run
+ *       {@code ErrStaleAnchor} and cleared on any other outcome, with
+ *       {@code BeaconState} reporting {@code STALE_ANCHOR} while set,
+ *       re-opens the dialog within a slot and keeps the walked-forward
+ *       store, which returning the error (and re-bootstrapping) would
+ *       throw away. Owner's call; recorded here as the parity step's
+ *       input.</li>
  * </ul>
  *
  * <p>{@link #reads()} and the loopback listener follow the Rust twin exactly:
