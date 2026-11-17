@@ -19,6 +19,12 @@ its trust anchors and release checks.
 
 ## [Unreleased]
 
+### Added
+
+- Docs: verifying deep blocks, an analysis of reads beyond the 512-block
+  window with a measured survey of which peers still serve old blocks
+  (#882).
+
 ### Changed
 
 - Engine library: the shared `LoopbackRpc` JSON-RPC listener port moved from
